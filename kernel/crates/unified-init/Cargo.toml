@@ -10,5 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 unified-init-macros = { path = "macros" }
-linkme = "0.2"
+linkme = "=0.3.27"
 system_error = { path = "../system_error" }

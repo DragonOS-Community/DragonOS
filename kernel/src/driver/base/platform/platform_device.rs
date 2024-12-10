@@ -11,15 +11,15 @@ use crate::{
             bus::{Bus, BusState},
             device_manager,
             driver::Driver,
-            Device, DevicePrivateData, DeviceType, IdTable,
+            Device, DeviceCommonData, DevicePrivateData, DeviceType, IdTable,
         },
-        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+        kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
     },
     filesystem::kernfs::KernFSInode,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
-        spinlock::SpinLock,
+        spinlock::{SpinLock, SpinLockGuard},
     },
 };
 use system_error::SystemError;
@@ -27,7 +27,8 @@ use system_error::SystemError;
 use super::{super::device::DeviceState, platform_bus, platform_bus_device, CompatibleTable};
 
 /// 平台设备id分配器
-static PLATFORM_DEVID_IDA: IdAllocator = IdAllocator::new(0, i32::MAX as usize);
+static PLATFORM_DEVID_IDA: SpinLock<IdAllocator> =
+    SpinLock::new(IdAllocator::new(0, i32::MAX as usize).unwrap());
 
 #[inline(always)]
 pub fn platform_device_manager() -> &'static PlatformDeviceManager {
@@ -64,6 +65,7 @@ pub trait PlatformDevice: Device {
     /// @brief: 判断设备是否初始化
     /// @parameter: None
     /// @return: 如果已经初始化，返回true，否则，返回false
+    #[allow(dead_code)]
     fn is_initialized(&self) -> bool;
 
     /// @brief: 设置设备状态
@@ -78,9 +80,9 @@ pub struct PlatformDeviceManager;
 impl PlatformDeviceManager {
     /// platform_device_add - add a platform device to device hierarchy
     pub fn device_add(&self, pdev: Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
-        if pdev.parent().is_none() {
-            pdev.set_parent(Some(Arc::downgrade(
-                &(platform_bus_device() as Arc<dyn KObject>),
+        if pdev.dev_parent().is_none() {
+            pdev.set_dev_parent(Some(Arc::downgrade(
+                &(platform_bus_device() as Arc<dyn Device>),
             )));
         }
 
@@ -92,7 +94,10 @@ impl PlatformDeviceManager {
                 pdev.set_name(pdev.pdev_name().to_string());
             }
             PLATFORM_DEVID_AUTO => {
-                let id = PLATFORM_DEVID_IDA.alloc().ok_or(SystemError::EOVERFLOW)?;
+                let id = PLATFORM_DEVID_IDA
+                    .lock()
+                    .alloc()
+                    .ok_or(SystemError::EOVERFLOW)?;
                 pdev.set_pdev_id(id as i32);
                 pdev.set_pdev_id_auto(true);
                 pdev.set_name(format!("{}.{}.auto", pdev.pdev_name(), pdev.pdev_id().0));
@@ -111,7 +116,7 @@ impl PlatformDeviceManager {
             // failed
             let pdevid = pdev.pdev_id();
             if pdevid.1 {
-                PLATFORM_DEVID_IDA.free(pdevid.0 as usize);
+                PLATFORM_DEVID_IDA.lock().free(pdevid.0 as usize);
                 pdev.set_pdev_id(PLATFORM_DEVID_AUTO);
             }
 
@@ -135,10 +140,12 @@ impl PlatformBusDevice {
         data: DevicePrivateData,
         parent: Option<Weak<dyn KObject>>,
     ) -> Arc<PlatformBusDevice> {
-        return Arc::new(PlatformBusDevice {
-            inner: SpinLock::new(InnerPlatformBusDevice::new(data, parent)),
+        let platform_bus_device = Self {
+            inner: SpinLock::new(InnerPlatformBusDevice::new(data)),
             kobj_state: LockedKObjectState::new(None),
-        });
+        };
+        platform_bus_device.set_parent(parent);
+        return Arc::new(platform_bus_device);
     }
 
     /// @brief: 获取总线的匹配表
@@ -179,38 +186,30 @@ impl PlatformBusDevice {
         let state = self.inner.lock().state;
         return state;
     }
+
+    fn inner(&self) -> SpinLockGuard<InnerPlatformBusDevice> {
+        self.inner.lock()
+    }
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InnerPlatformBusDevice {
     name: String,
     data: DevicePrivateData,
-    state: BusState,                   // 总线状态
-    parent: Option<Weak<dyn KObject>>, // 总线的父对象
-
-    kernfs_inode: Option<Arc<KernFSInode>>,
-    /// 当前设备挂载到的总线
-    bus: Option<Weak<dyn Bus>>,
-    /// 当前设备已经匹配的驱动
-    driver: Option<Weak<dyn Driver>>,
-
-    ktype: Option<&'static dyn KObjType>,
-    kset: Option<Arc<KSet>>,
+    state: BusState, // 总线状态
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
 }
 
 impl InnerPlatformBusDevice {
-    pub fn new(data: DevicePrivateData, parent: Option<Weak<dyn KObject>>) -> Self {
+    pub fn new(data: DevicePrivateData) -> Self {
         Self {
             data,
             name: "platform".to_string(),
             state: BusState::NotInitialized,
-            parent,
-            kernfs_inode: None,
-            bus: None,
-            driver: None,
-            ktype: None,
-            kset: None,
+            kobject_common: KObjectCommonData::default(),
+            device_common: DeviceCommonData::default(),
         }
     }
 }
@@ -221,27 +220,27 @@ impl KObject for PlatformBusDevice {
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.lock().parent.clone()
+        self.inner().kobject_common.parent.clone()
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.lock().kernfs_inode.clone()
+        self.inner().kobject_common.kern_inode.clone()
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.lock().kernfs_inode = inode;
+        self.inner().kobject_common.kern_inode = inode;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().ktype
+        self.inner().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.lock().ktype = ktype;
+        self.inner().kobject_common.kobj_type = ktype;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.lock().kset.clone()
+        self.inner().kobject_common.kset.clone()
     }
 
     fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
@@ -257,19 +256,19 @@ impl KObject for PlatformBusDevice {
     }
 
     fn name(&self) -> String {
-        self.inner.lock().name.clone()
+        self.inner().name.clone()
     }
 
     fn set_name(&self, name: String) {
-        self.inner.lock().name = name;
+        self.inner().name = name;
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.lock().kset = kset;
+        self.inner().kobject_common.kset = kset;
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.lock().parent = parent;
+        self.inner().kobject_common.parent = parent;
     }
 }
 
@@ -287,15 +286,15 @@ impl Device for PlatformBusDevice {
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.lock().bus.clone()
+        self.inner().device_common.bus.clone()
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.lock().bus = bus;
+        self.inner().device_common.bus = bus;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner.lock().driver.clone()?.upgrade()
+        self.inner().device_common.driver.clone()?.upgrade()
     }
 
     #[inline]
@@ -304,7 +303,7 @@ impl Device for PlatformBusDevice {
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
-        self.inner.lock().driver = driver;
+        self.inner().device_common.driver = driver;
     }
 
     fn can_match(&self) -> bool {
@@ -319,7 +318,15 @@ impl Device for PlatformBusDevice {
         todo!()
     }
 
-    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
-        todo!()
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
+        self.inner().device_common.class = class;
+    }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = dev_parent;
     }
 }

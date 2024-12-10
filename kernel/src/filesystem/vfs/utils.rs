@@ -1,3 +1,7 @@
+use core::cmp::Ordering;
+use core::fmt::{self, Debug};
+use core::hash::Hash;
+
 use alloc::{string::String, sync::Arc};
 use system_error::SystemError;
 
@@ -71,4 +75,73 @@ pub fn user_path_at(
     }
 
     return Ok((inode, ret_path));
+}
+
+/// Directory Name
+/// 可以用来作为原地提取目录名及比较的
+/// Dentry的对标（x
+///
+/// 简单的生成一个新的DName，以实现简单的RCU
+#[derive(Debug)]
+pub struct DName(pub Arc<String>);
+
+impl PartialEq for DName {
+    fn eq(&self, other: &Self) -> bool {
+        return *self.0 == *other.0;
+    }
+}
+impl Eq for DName {}
+
+impl Hash for DName {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state)
+    }
+}
+
+impl PartialOrd for DName {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DName {
+    fn cmp(&self, other: &Self) -> Ordering {
+        return self.0.cmp(&other.0);
+    }
+}
+
+impl Default for DName {
+    fn default() -> Self {
+        Self(Arc::new(String::new()))
+    }
+}
+
+impl From<String> for DName {
+    fn from(value: String) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+impl From<&str> for DName {
+    fn from(value: &str) -> Self {
+        Self(Arc::from(String::from(value)))
+    }
+}
+
+impl Clone for DName {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl fmt::Display for DName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl AsRef<str> for DName {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
 }

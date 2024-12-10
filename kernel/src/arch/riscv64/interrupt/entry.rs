@@ -1,90 +1,17 @@
 use crate::arch::{
-    asm::csr::{
-        CSR_SCAUSE, CSR_SEPC, CSR_SSCRATCH, CSR_SSTATUS, CSR_STVAL, SR_FS_VS, SR_SPP, SR_SUM,
-    },
+    asm::csr::{CSR_SCAUSE, CSR_SEPC, CSR_SSCRATCH, CSR_SSTATUS, CSR_STVAL, SR_SPP},
     cpu::LocalContext,
     interrupt::TrapFrame,
 };
-use core::arch::asm;
+use asm_macros::{restore_from_x6_to_x31, save_from_x6_to_x31};
 use kdepends::memoffset::offset_of;
-
-/// 保存x6-x31寄存器
-macro_rules! save_from_x6_to_x31 {
-    () => {
-        concat!(
-            "
-            sd x6, {off_t1}(sp)
-            sd x7, {off_t2}(sp)
-            sd x8, {off_s0}(sp)
-            sd x9, {off_s1}(sp)
-            sd x10, {off_a0}(sp)
-            sd x11, {off_a1}(sp)
-            sd x12, {off_a2}(sp)
-            sd x13, {off_a3}(sp)
-            sd x14, {off_a4}(sp)
-            sd x15, {off_a5}(sp)
-            sd x16, {off_a6}(sp)
-            sd x17, {off_a7}(sp)
-            sd x18, {off_s2}(sp)
-            sd x19, {off_s3}(sp)
-            sd x20, {off_s4}(sp)
-            sd x21, {off_s5}(sp)
-            sd x22, {off_s6}(sp)
-            sd x23, {off_s7}(sp)
-            sd x24, {off_s8}(sp)
-            sd x25, {off_s9}(sp)
-            sd x26, {off_s10}(sp)
-            sd x27, {off_s11}(sp)
-            sd x28, {off_t3}(sp)
-            sd x29, {off_t4}(sp)
-            sd x30, {off_t5}(sp)
-            sd x31, {off_t6}(sp)
-
-        "
-        )
-    };
-}
-
-macro_rules! restore_from_x6_to_x31 {
-    () => {
-        concat!("
-        
-            ld x6, {off_t1}(sp)
-            ld x7, {off_t2}(sp)
-            ld x8, {off_s0}(sp)
-            ld x9, {off_s1}(sp)
-            ld x10, {off_a0}(sp)
-            ld x11, {off_a1}(sp)
-            ld x12, {off_a2}(sp)
-            ld x13, {off_a3}(sp)
-            ld x14, {off_a4}(sp)
-            ld x15, {off_a5}(sp)
-            ld x16, {off_a6}(sp)
-            ld x17, {off_a7}(sp)
-            ld x18, {off_s2}(sp)
-            ld x19, {off_s3}(sp)
-            ld x20, {off_s4}(sp)
-            ld x21, {off_s5}(sp)
-            ld x22, {off_s6}(sp)
-            ld x23, {off_s7}(sp)
-            ld x24, {off_s8}(sp)
-            ld x25, {off_s9}(sp)
-            ld x26, {off_s10}(sp)
-            ld x27, {off_s11}(sp)
-            ld x28, {off_t3}(sp)
-            ld x29, {off_t4}(sp)
-            ld x30, {off_t5}(sp)
-            ld x31, {off_t6}(sp)
-        ")
-    };
-}
 
 /// Riscv64中断处理入口
 #[naked]
 #[no_mangle]
 #[repr(align(4))]
 pub unsafe extern "C" fn handle_exception() -> ! {
-    asm!(
+    core::arch::naked_asm!(
         concat!("
         /*
 	        * If coming from userspace, preserve the user thread pointer and load
@@ -99,15 +26,14 @@ pub unsafe extern "C" fn handle_exception() -> ! {
             j {_restore_kernel_tpsp}
         "),
         csr_scratch = const CSR_SSCRATCH,
-        _restore_kernel_tpsp = sym _restore_kernel_tpsp,
-        options(noreturn),
+        _restore_kernel_tpsp = sym _restore_kernel_tpsp
     )
 }
 
 #[naked]
 #[no_mangle]
 unsafe extern "C" fn _restore_kernel_tpsp() -> ! {
-    asm!(
+    core::arch::naked_asm!(
         concat!("
             // 这次是从内核态进入中断
             // 从sscratch寄存器加载当前cpu的上下文
@@ -120,16 +46,14 @@ unsafe extern "C" fn _restore_kernel_tpsp() -> ! {
         "),
         csr_scratch = const CSR_SSCRATCH,
         lc_off_kernel_sp = const offset_of!(LocalContext, kernel_sp),
-        _save_context = sym _save_context,
-
-        options(noreturn),
+        _save_context = sym _save_context
     )
 }
 
 #[naked]
 #[no_mangle]
 unsafe extern "C" fn _save_context() -> ! {
-    asm!(
+    core::arch::naked_asm!(
         concat!("
 
 
@@ -230,20 +154,20 @@ unsafe extern "C" fn _save_context() -> ! {
         off_cause = const offset_of!(TrapFrame, cause),
         off_tp = const offset_of!(TrapFrame, tp),
         off_epc = const offset_of!(TrapFrame, epc),
-        sr_sum_and_fsvs = const (SR_FS_VS | SR_SUM),
+        sr_sum_and_fsvs = const (0), // 暂时在内核中不禁用FPU和Vector，以及不禁用用户内存访问
+        // sr_sum_and_fsvs = const (SR_FS_VS | SR_SUM),
         csr_status = const CSR_SSTATUS,
         csr_epc = const CSR_SEPC,
         csr_tval = const CSR_STVAL,
         csr_cause = const CSR_SCAUSE,
-        csr_scratch = const CSR_SSCRATCH,
-        options(noreturn),
+        csr_scratch = const CSR_SSCRATCH
     )
 }
 
 #[naked]
 #[no_mangle]
 pub unsafe extern "C" fn ret_from_exception() -> ! {
-    asm!(
+    core::arch::naked_asm!(
         concat!("
             ld s0, {off_status}(sp)
             andi s0, s0, {sr_spp}
@@ -320,8 +244,6 @@ pub unsafe extern "C" fn ret_from_exception() -> ! {
         off_t6 = const offset_of!(TrapFrame, t6),
         off_sp = const offset_of!(TrapFrame, sp),
         off_tp = const offset_of!(TrapFrame, tp),
-        off_epc = const offset_of!(TrapFrame, epc),
-
-        options(noreturn),
+        off_epc = const offset_of!(TrapFrame, epc)
     )
 }

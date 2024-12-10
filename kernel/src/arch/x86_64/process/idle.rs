@@ -1,9 +1,10 @@
 use core::hint::spin_loop;
 
+use log::error;
+
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    kBUG,
     process::{ProcessFlags, ProcessManager},
     sched::{SchedMode, __schedule},
 };
@@ -21,7 +22,7 @@ impl ProcessManager {
                     x86::halt();
                 }
             } else {
-                kBUG!("Idle process should not be scheduled with IRQs disabled.");
+                error!("Idle process should not be scheduled with IRQs disabled.");
                 spin_loop();
             }
         }

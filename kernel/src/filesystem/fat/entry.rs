@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 use core::{cmp::min, intrinsics::unlikely};
+use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},
-    kwarn,
     libs::vec_cursor::VecCursor,
 };
 use alloc::{
@@ -130,11 +130,9 @@ impl FATFile {
 
             //  从磁盘上读取数据
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_offset;
-            let r = fs.partition.disk().read_at_bytes(
-                offset as usize,
-                end_len,
-                &mut buf[start..start + end_len],
-            )?;
+            let r = fs
+                .gendisk
+                .read_at_bytes(&mut buf[start..start + end_len], offset as usize)?;
 
             // 更新偏移量计数信息
             read_ok += r;
@@ -195,14 +193,12 @@ impl FATFile {
                 buf.len() - write_ok,
             );
 
-            // 计算本次写入位置在磁盘上的偏移量
+            // 计算本次写入位置在分区上的偏移量
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_bytes_offset;
             // 写入磁盘
-            let w: usize = fs.partition.disk().write_at_bytes(
-                offset as usize,
-                end_len,
-                &buf[start..start + end_len],
-            )?;
+            let w = fs
+                .gendisk
+                .write_at_bytes(&buf[start..start + end_len], offset as usize)?;
 
             // 更新偏移量数据
             write_ok += w;
@@ -260,12 +256,11 @@ impl FATFile {
         // 如果还需要更多的簇
         if bytes_remain_in_cluster < extra_bytes {
             let clusters_to_allocate =
-                (extra_bytes - bytes_remain_in_cluster + fs.bytes_per_cluster() - 1)
-                    / fs.bytes_per_cluster();
+                (extra_bytes - bytes_remain_in_cluster).div_ceil(fs.bytes_per_cluster());
             let last_cluster = if let Some(c) = fs.get_last_cluster(self.first_cluster) {
                 c
             } else {
-                kwarn!("FAT: last cluster not found, File = {self:?}");
+                warn!("FAT: last cluster not found, File = {self:?}");
                 return Err(SystemError::EINVAL);
             };
             // 申请簇
@@ -282,7 +277,7 @@ impl FATFile {
             let start_cluster: Cluster = fs
                 .get_cluster_by_relative(self.first_cluster, start_cluster as usize)
                 .unwrap();
-            // 计算当前文件末尾在磁盘上的字节偏移量
+            // 计算当前文件末尾在分区上的字节偏移量
             let start_offset: u64 =
                 fs.cluster_bytes_offset(start_cluster) + self.size() % fs.bytes_per_cluster();
             // 扩展之前，最后一个簇内还剩下多少字节的空间
@@ -311,10 +306,10 @@ impl FATFile {
         return Ok(());
     }
 
-    /// @brief 把磁盘上[range_start, range_end)范围的数据清零
+    /// @brief 把分区上[range_start, range_end)范围的数据清零
     ///
-    /// @param range_start 磁盘上起始位置（单位：字节）
-    /// @param range_end 磁盘上终止位置（单位：字节）
+    /// @param range_start 分区上起始位置（单位：字节）
+    /// @param range_end 分区上终止位置（单位：字节）
     fn zero_range(
         &self,
         fs: &Arc<FATFileSystem>,
@@ -326,9 +321,8 @@ impl FATFile {
         }
 
         let zeroes: Vec<u8> = vec![0u8; (range_end - range_start) as usize];
-        fs.partition
-            .disk()
-            .write_at(range_start as usize, zeroes.len(), zeroes.as_slice())?;
+        fs.gendisk.write_at_bytes(&zeroes, range_start as usize)?;
+
         return Ok(());
     }
 
@@ -343,7 +337,7 @@ impl FATFile {
             return Ok(());
         }
 
-        let new_last_cluster = (new_size + fs.bytes_per_cluster() - 1) / fs.bytes_per_cluster();
+        let new_last_cluster = new_size.div_ceil(fs.bytes_per_cluster());
         if let Some(begin_delete) =
             fs.get_cluster_by_relative(self.first_cluster, new_last_cluster as usize)
         {
@@ -357,7 +351,7 @@ impl FATFile {
         }
 
         self.set_size(new_size as u32);
-        // 计算短目录项在磁盘内的字节偏移量
+        // 计算短目录项在分区内的字节偏移量
         let short_entry_offset = fs.cluster_bytes_offset((self.loc.1).0) + (self.loc.1).1;
         self.short_dir_entry.flush(fs, short_entry_offset)?;
 
@@ -370,7 +364,7 @@ impl FATFile {
 pub struct FATDir {
     /// 目录的第一个簇
     pub first_cluster: Cluster,
-    /// 该字段仅对FAT12、FAT16生效
+    /// 该字段仅对FAT12、FAT16生效，表示根目录在分区内的偏移量
     pub root_offset: Option<u64>,
     /// 文件夹名称
     pub dir_name: String,
@@ -450,7 +444,7 @@ impl FATDir {
 
                     free += 1;
                     if free == num_free {
-                        // kdebug!("first_free = {first_free:?}, current_free = ({current_cluster:?}, {offset})");
+                        // debug!("first_free = {first_free:?}, current_free = ({current_cluster:?}, {offset})");
                         return Ok(first_free);
                     }
                 }
@@ -468,11 +462,10 @@ impl FATDir {
 
         // 计算需要申请多少个簇
         let clusters_required =
-            (remain_entries * FATRawDirEntry::DIR_ENTRY_LEN + fs.bytes_per_cluster() - 1)
-                / fs.bytes_per_cluster();
+            (remain_entries * FATRawDirEntry::DIR_ENTRY_LEN).div_ceil(fs.bytes_per_cluster());
         let mut first_cluster = Cluster::default();
         let mut prev_cluster = current_cluster;
-        // kdebug!(
+        // debug!(
         //     "clusters_required={clusters_required}, prev_cluster={prev_cluster:?}, free ={free}"
         // );
         // 申请簇
@@ -592,7 +585,7 @@ impl FATDir {
     pub fn create_dir(&self, name: &str, fs: &Arc<FATFileSystem>) -> Result<FATDir, SystemError> {
         let r: Result<FATDirEntryOrShortName, SystemError> =
             self.check_existence(name, Some(true), fs.clone());
-        // kdebug!("check existence ok");
+        // debug!("check existence ok");
         // 检查错误码，如果能够表明目录项已经存在，则返回-EEXIST
         if let Err(err_val) = r {
             if err_val == (SystemError::EISDIR) || err_val == (SystemError::ENOTDIR) {
@@ -639,7 +632,7 @@ impl FATDir {
 
                 dot_dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
 
-                // kdebug!("to create dentries");
+                // debug!("to create dentries");
                 // 在当前目录下创建目标目录项
                 let res = self
                     .create_dir_entries(
@@ -652,7 +645,7 @@ impl FATDir {
                         fs.clone(),
                     )
                     .map(|e| e.to_dir())?;
-                // kdebug!("create dentries ok");
+                // debug!("create dentries ok");
                 return res;
             }
             FATDirEntryOrShortName::DirEntry(_) => {
@@ -732,7 +725,7 @@ impl FATDir {
             LongNameEntryGenerator::new(long_name, short_dentry.checksum());
         let num_entries = long_name_gen.num_entries() as u64;
 
-        // kdebug!("to find free entries");
+        // debug!("to find free entries");
         let free_entries: Option<(Cluster, u64)> =
             self.find_free_entries(num_entries, fs.clone())?;
         // 目录项开始位置
@@ -747,14 +740,14 @@ impl FATDir {
         for off in &offsets.as_slice()[..offsets.len() - 1] {
             // 获取生成的下一个长目录项
             let long_entry: LongDirEntry = long_name_gen.next().unwrap();
-            // 获取这个长目录项在磁盘内的字节偏移量
+            // 获取这个长目录项在分区内的字节偏移量
             let bytes_offset = fs.cluster_bytes_offset(off.0) + off.1;
             long_entry.flush(fs.clone(), bytes_offset)?;
         }
 
         let start: (Cluster, u64) = offsets[0];
         let end: (Cluster, u64) = *offsets.last().unwrap();
-        // 短目录项在磁盘上的字节偏移量
+        // 短目录项在分区内的字节偏移量
         let offset = fs.cluster_bytes_offset(end.0) + end.1;
         short_dentry.flush(&fs, offset)?;
 
@@ -827,10 +820,10 @@ impl FATDir {
                 .collect();
         // 逐个设置这些目录项为“空闲”状态
         for off in offsets {
-            let disk_bytes_offset = fs.cluster_bytes_offset(off.0) + off.1;
+            let gendisk_bytes_offset = fs.cluster_bytes_offset(off.0) + off.1;
             let mut short_entry = ShortDirEntry::default();
             short_entry.name[0] = 0xe5;
-            short_entry.flush(&fs, disk_bytes_offset)?;
+            short_entry.flush(&fs, gendisk_bytes_offset)?;
         }
         return Ok(());
     }
@@ -1119,7 +1112,7 @@ impl LongDirEntry {
                 | '^' | '#' | '&' => {}
                 '+' | ',' | ';' | '=' | '[' | ']' | '.' | ' ' => {}
                 _ => {
-                    kdebug!("error char: {}", c);
+                    debug!("error char: {}", c);
                     return Err(SystemError::EILSEQ);
                 }
             }
@@ -1130,20 +1123,20 @@ impl LongDirEntry {
     /// @brief 把当前长目录项写入磁盘
     ///
     /// @param fs 对应的文件系统
-    /// @param disk_bytes_offset 长目录项所在位置对应的在磁盘上的字节偏移量
+    /// @param disk_bytes_offset 长目录项所在位置对应的在分区内的字节偏移量
     ///
     /// @return Ok(())
     /// @return Err(SystemError) 错误码
-    pub fn flush(&self, fs: Arc<FATFileSystem>, disk_bytes_offset: u64) -> Result<(), SystemError> {
+    pub fn flush(
+        &self,
+        fs: Arc<FATFileSystem>,
+        gendisk_bytes_offset: u64,
+    ) -> Result<(), SystemError> {
         // 从磁盘读取数据
-        let blk_offset = fs.get_in_block_offset(disk_bytes_offset);
-        let lba = fs.get_lba_from_offset(
-            fs.bytes_to_sector(fs.get_in_partition_bytes_offset(disk_bytes_offset)),
-        );
+        let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
+        let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
         let mut v: Vec<u8> = vec![0; fs.lba_per_sector() * LBA_SIZE];
-        fs.partition
-            .disk()
-            .read_at(lba, fs.lba_per_sector(), &mut v)?;
+        fs.gendisk.read_at(&mut v, lba)?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
         // 切换游标到对应位置
@@ -1170,10 +1163,9 @@ impl LongDirEntry {
         }
 
         // 把修改后的长目录项刷入磁盘
-        fs.partition
-            .disk()
-            .write_at(lba, fs.lba_per_sector(), cursor.as_slice())?;
-        fs.partition.disk().sync()?;
+        fs.gendisk.write_at(cursor.as_slice(), lba)?;
+
+        fs.gendisk.sync()?;
 
         return Ok(());
     }
@@ -1328,6 +1320,7 @@ impl ShortDirEntry {
     }
 
     /// @brief 计算短目录项的名称的校验和
+    #[allow(clippy::manual_rotate)]
     fn checksum(&self) -> u8 {
         let mut result = 0;
 
@@ -1337,27 +1330,26 @@ impl ShortDirEntry {
         return result;
     }
 
-    /// @brief 把当前短目录项写入磁盘
+    /// # 把当前短目录项写入磁盘
     ///
-    /// @param fs 对应的文件系统
-    /// @param disk_bytes_offset 短目录项所在位置对应的在磁盘上的字节偏移量
+    /// ## 参数
     ///
-    /// @return Ok(())
-    /// @return Err(SystemError) 错误码
+    /// - fs 对应的文件系统
+    /// - gendisk_bytes_offset 短目录项所在位置对应的在分区内的字节偏移量
+    ///
+    /// # 返回值
+    /// - Ok(())
+    /// - Err(SystemError) 错误码
     pub fn flush(
         &self,
         fs: &Arc<FATFileSystem>,
-        disk_bytes_offset: u64,
+        gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
         // 从磁盘读取数据
-        let blk_offset = fs.get_in_block_offset(disk_bytes_offset);
-        let lba = fs.get_lba_from_offset(
-            fs.bytes_to_sector(fs.get_in_partition_bytes_offset(disk_bytes_offset)),
-        );
+        let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
+        let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
         let mut v: Vec<u8> = vec![0; fs.lba_per_sector() * LBA_SIZE];
-        fs.partition
-            .disk()
-            .read_at(lba, fs.lba_per_sector(), &mut v)?;
+        fs.gendisk.read_at(&mut v, lba)?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
         // 切换游标到对应位置
@@ -1376,10 +1368,9 @@ impl ShortDirEntry {
         cursor.write_u32(self.file_size)?;
 
         // 把修改后的长目录项刷入磁盘
-        fs.partition
-            .disk()
-            .write_at(lba, fs.lba_per_sector(), cursor.as_slice())?;
-        fs.partition.disk().sync()?;
+        fs.gendisk.write_at(cursor.as_slice(), lba)?;
+
+        fs.gendisk.sync()?;
 
         return Ok(());
     }
@@ -1491,7 +1482,7 @@ impl FATDirIter {
                 return Ok((self.current_cluster, self.offset, None));
             }
 
-            // 获取簇在磁盘内的字节偏移量
+            // 获取簇在分区内的字节偏移量
             let offset: u64 = self.fs.cluster_bytes_offset(self.current_cluster) + self.offset;
 
             // 从磁盘读取原始的dentry
@@ -1550,7 +1541,7 @@ impl FATDirIter {
                             break;
                         }
 
-                        // 获取簇在磁盘内的字节偏移量
+                        // 获取簇在分区内的字节偏移量
                         let offset: u64 =
                             self.fs.cluster_bytes_offset(self.current_cluster) + self.offset;
                         // 从磁盘读取原始的dentry
@@ -1574,7 +1565,7 @@ impl FATDirIter {
                             }
                         }
                     }
-                    // kdebug!("collect dentries done. long_name_entries={long_name_entries:?}");
+                    // debug!("collect dentries done. long_name_entries={long_name_entries:?}");
                     let dir_entry: Result<FATDirEntry, SystemError> = FATDirEntry::new(
                         long_name_entries,
                         (
@@ -1582,16 +1573,16 @@ impl FATDirIter {
                             (self.current_cluster, self.offset),
                         ),
                     );
-                    // kdebug!("dir_entry={:?}", dir_entry);
+                    // debug!("dir_entry={:?}", dir_entry);
                     match dir_entry {
                         Ok(d) => {
-                            // kdebug!("dir_entry ok");
+                            // debug!("dir_entry ok");
                             self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                             return Ok((self.current_cluster, self.offset, Some(d)));
                         }
 
                         Err(_) => {
-                            // kdebug!("dir_entry err,  e={}", e);
+                            // debug!("dir_entry err,  e={}", e);
                             self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                         }
                     }
@@ -2397,24 +2388,18 @@ impl Iterator for FATDirEntryOffsetIter {
     }
 }
 
-/// @brief 根据磁盘内字节偏移量，读取磁盘，并生成一个FATRawDirEntry对象
+/// 根据分区字节偏移量，读取磁盘，并生成一个FATRawDirEntry对象
 pub fn get_raw_dir_entry(
     fs: &Arc<FATFileSystem>,
-    in_disk_bytes_offset: u64,
+    gendisk_bytes_offset: u64,
 ) -> Result<FATRawDirEntry, SystemError> {
     // 块内偏移量
-    let blk_offset: u64 = fs.get_in_block_offset(in_disk_bytes_offset);
-    let lba = fs.get_lba_from_offset(
-        fs.bytes_to_sector(fs.get_in_partition_bytes_offset(in_disk_bytes_offset)),
-    );
+    let blk_offset: u64 = fs.get_in_block_offset(gendisk_bytes_offset);
+    let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
 
-    // let step1 = fs.get_in_partition_bytes_offset(in_disk_bytes_offset);
-    // let step2 = fs.bytes_to_sector(step1);
-    // let lba = fs.get_lba_from_offset(step2);
-    // kdebug!("step1={step1}, step2={step2}, lba={lba}");
     let mut v: Vec<u8> = vec![0; LBA_SIZE];
 
-    fs.partition.disk().read_at(lba, 1, &mut v)?;
+    fs.gendisk.read_at(&mut v, lba)?;
 
     let mut cursor: VecCursor = VecCursor::new(v);
     // 切换游标到对应位置

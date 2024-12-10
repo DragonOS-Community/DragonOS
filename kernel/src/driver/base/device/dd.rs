@@ -2,6 +2,7 @@ use core::intrinsics::unlikely;
 
 use alloc::{string::ToString, sync::Arc};
 use intertrait::cast::CastArc;
+use log::{debug, error, warn};
 
 use crate::{
     driver::base::kobject::KObject,
@@ -59,19 +60,23 @@ impl DeviceManager {
     ) -> Result<bool, SystemError> {
         if unlikely(allow_async) {
             // todo!("do_device_attach: allow_async")
-            kwarn!("do_device_attach: allow_async is true, but currently not supported");
+            warn!("do_device_attach: allow_async is true, but currently not supported");
         }
         if dev.is_dead() {
             return Ok(false);
         }
 
-        kwarn!("do_device_attach: dev: '{}'", dev.name());
+        warn!("do_device_attach: dev: '{}'", dev.name());
 
         let mut do_async = false;
         let mut r = Ok(false);
 
         if dev.driver().is_some() {
             if self.device_is_bound(dev) {
+                debug!(
+                    "do_device_attach: device '{}' is already bound.",
+                    dev.name()
+                );
                 return Ok(true);
             }
 
@@ -82,6 +87,7 @@ impl DeviceManager {
                 return Ok(false);
             }
         } else {
+            debug!("do_device_attach: device '{}' is not bound.", dev.name());
             let bus = dev
                 .bus()
                 .and_then(|bus| bus.upgrade())
@@ -111,7 +117,7 @@ impl DeviceManager {
                 // try them.
 
                 do_async = true;
-                kdebug!(
+                debug!(
                     "do_device_attach: try scheduling asynchronous probe for device: {}",
                     dev.name()
                 );
@@ -136,6 +142,7 @@ impl DeviceManager {
     /// - Ok(true): 匹配成功
     /// - Ok(false): 没有匹配成功
     /// - Err(SystemError): 匹配过程中出现意外错误,没有匹配成功
+    ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#899
     fn do_device_attach_driver(
         &self,
@@ -148,7 +155,7 @@ impl DeviceManager {
             if let Err(e) = r {
                 // 如果不是ENOSYS，则总线出错
                 if e != SystemError::ENOSYS {
-                    kdebug!(
+                    debug!(
                         "do_device_attach_driver: bus.match_device() failed, dev: '{}', err: {:?}",
                         data.dev.name(),
                         e
@@ -180,7 +187,7 @@ impl DeviceManager {
     ///
     /// 如果传递的设备已成功完成对驱动程序的探测，则返回true，否则返回false。
     pub fn device_is_bound(&self, dev: &Arc<dyn Device>) -> bool {
-        return dev.driver().is_some();
+        return driver_manager().driver_is_bound(dev);
     }
 
     /// 把一个驱动绑定到设备上
@@ -198,15 +205,22 @@ impl DeviceManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#496
     pub fn device_bind_driver(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         let r = driver_manager().driver_sysfs_add(dev);
-        if let Err(e) = r {
+        if r.is_ok() {
             self.device_links_force_bind(dev);
             driver_manager().driver_bound(dev);
-            return Err(e);
         } else if let Some(bus) = dev.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::DriverNotBound,
                 Some(dev),
                 None,
+            );
+        }
+
+        if let Err(e) = r.as_ref() {
+            error!(
+                "device_bind_driver: driver_sysfs_add failed, dev: '{}', err: {:?}",
+                dev.name(),
+                e
             );
         }
         return r;
@@ -389,7 +403,7 @@ impl DriverManager {
         device.set_driver(Some(Arc::downgrade(driver)));
 
         self.add_to_sysfs(device).map_err(|e| {
-            kerror!(
+            error!(
                 "really_probe: add_to_sysfs failed, dev: '{}', err: {:?}",
                 device.name(),
                 e
@@ -400,7 +414,7 @@ impl DriverManager {
         })?;
 
         self.call_driver_probe(device, driver).map_err(|e| {
-            kerror!(
+            error!(
                 "really_probe: call_driver_probe failed, dev: '{}', err: {:?}",
                 device.name(),
                 e
@@ -415,7 +429,7 @@ impl DriverManager {
         device_manager()
             .add_groups(device, driver.dev_groups())
             .map_err(|e| {
-                kerror!(
+                error!(
                     "really_probe: add_groups failed, dev: '{}', err: {:?}",
                     device.name(),
                     e
@@ -431,7 +445,7 @@ impl DriverManager {
         device_manager()
             .create_file(device, &DeviceAttrStateSynced)
             .map_err(|e| {
-                kerror!(
+                error!(
                     "really_probe: create_file failed, dev: '{}', err: {:?}",
                     device.name(),
                     e
@@ -471,17 +485,15 @@ impl DriverManager {
 
         sysfs_instance()
             .create_link(Some(&device_kobj), &driver_kobj, "driver".to_string())
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 fail_rm_dev_link();
-                e
             })?;
 
         device_manager()
             .create_file(device, &DeviceAttrCoredump)
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 sysfs_instance().remove_link(&device_kobj, "driver".to_string());
                 fail_rm_dev_link();
-                e
             })?;
 
         return Ok(());
@@ -502,8 +514,8 @@ impl DriverManager {
             .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
         let r = bus.probe(device);
-        if r == Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) {
-            kerror!(
+        if r == Err(SystemError::ENOSYS) {
+            error!(
                 "call_driver_probe: bus.probe() failed, dev: '{}', err: {:?}",
                 device.name(),
                 r
@@ -518,7 +530,7 @@ impl DriverManager {
         let err = r.unwrap_err();
         match err {
             SystemError::ENODEV | SystemError::ENXIO => {
-                kdebug!(
+                debug!(
                     "driver'{}': probe of {} rejects match {:?}",
                     driver.name(),
                     device.name(),
@@ -527,7 +539,7 @@ impl DriverManager {
             }
 
             _ => {
-                kwarn!(
+                warn!(
                     "driver'{}': probe of {} failed with error {:?}",
                     driver.name(),
                     device.name(),
@@ -543,7 +555,7 @@ impl DriverManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#393
     fn driver_bound(&self, device: &Arc<dyn Device>) {
         if self.driver_is_bound(device) {
-            kwarn!("driver_bound: device '{}' is already bound.", device.name());
+            warn!("driver_bound: device '{}' is already bound.", device.name());
             return;
         }
 
@@ -588,11 +600,11 @@ impl Attribute for DeviceAttrStateSynced {
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let dev = kobj.cast::<dyn Device>().map_err(|kobj| {
-            kerror!(
+            error!(
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let val = dev.state_synced();
@@ -606,7 +618,7 @@ impl Attribute for DeviceAttrStateSynced {
 }
 
 #[derive(Debug)]
-struct DeviceAttrCoredump;
+pub(super) struct DeviceAttrCoredump;
 
 impl Attribute for DeviceAttrCoredump {
     fn name(&self) -> &str {
@@ -623,11 +635,11 @@ impl Attribute for DeviceAttrCoredump {
 
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
         let dev = kobj.cast::<dyn Device>().map_err(|kobj| {
-            kerror!(
+            error!(
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let drv = dev.driver().ok_or(SystemError::EINVAL)?;

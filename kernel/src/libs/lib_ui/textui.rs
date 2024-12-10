@@ -1,10 +1,8 @@
 use crate::{
     driver::{
-        serial::serial8250::send_to_default_serial8250_port,
-        tty::{tty_port::tty_port, virtual_terminal::virtual_console::CURRENT_VCNUM},
+        serial::serial8250::send_to_default_serial8250_port, tty::virtual_terminal::vc_manager,
         video::video_refresh_manager,
     },
-    kdebug, kinfo,
     libs::{
         lib_ui::font::FONT_8x16,
         rwlock::RwLock,
@@ -20,6 +18,7 @@ use core::{
     ptr::copy_nonoverlapping,
     sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
+use log::{debug, info};
 use system_error::SystemError;
 
 use super::{
@@ -73,9 +72,9 @@ pub fn textui_framework() -> Arc<TextUiFramework> {
 /// 初始化TEXTUI_FRAMEWORK
 fn textui_framwork_init() {
     if unsafe { __TEXTUI_FRAMEWORK.is_none() } {
-        kinfo!("textuiframework init");
+        info!("textuiframework init");
         let metadata = ScmUiFrameworkMetadata::new("TextUI".to_string(), ScmFramworkType::Text);
-        kdebug!("textui metadata: {:?}", metadata);
+        debug!("textui metadata: {:?}", metadata);
         // 为textui框架生成第一个窗口
         let vlines_num = (metadata.buf_info().height() / TEXTUI_CHAR_HEIGHT) as usize;
 
@@ -106,7 +105,7 @@ fn textui_framwork_init() {
         };
 
         scm_register(textui_framework()).expect("register textui framework failed");
-        kdebug!("textui framework init success");
+        debug!("textui framework init success");
 
         send_to_default_serial8250_port("\ntext ui initialized\n\0".as_bytes());
         unsafe { TEXTUI_IS_INIT = true };
@@ -337,6 +336,7 @@ impl TextuiBuf<'_> {
             return self.guard.as_mut().unwrap().as_mut();
         }
     }
+
     pub fn put_color_in_pixel(&mut self, color: u32, index: usize) {
         let index = index as isize;
         match self.bit_depth {
@@ -363,7 +363,7 @@ impl TextuiBuf<'_> {
                 };
             }
             _ => {
-                panic!("不支持的位深度！")
+                panic!("bidepth unsupported!")
             }
         }
     }
@@ -373,6 +373,7 @@ impl TextuiBuf<'_> {
     pub fn get_index_by_x_y(x: usize, y: usize) -> usize {
         textui_framework().metadata.read().buf_info().width() as usize * y + x
     }
+
     pub fn get_start_index_by_lineid_lineindex(lineid: LineId, lineindex: LineIndex) -> usize {
         //   x 左上角列像素点位置
         //   y 左上角行像素点位置
@@ -510,9 +511,8 @@ impl TextuiCharChromatic {
                         )
                     };
                 }
-
                 unsafe {
-                    addr = addr.offset(1);
+                    addr = addr.add(byte_num_of_depth);
                 }
             }
         }
@@ -595,7 +595,6 @@ impl TextuiWindow {
     /// -flags 标志位
     /// -vlines_num 虚拟行的总数
     /// -chars_num 每行最大的字符数
-
     pub fn new(flags: WindowFlag, vlines_num: i32, chars_num: i32) -> Self {
         let mut initial_vlines = Vec::new();
 
@@ -622,7 +621,6 @@ impl TextuiWindow {
     /// - vline_id 要刷新的虚拟行号
     /// - start 起始字符号
     /// - count 要刷新的字符数量
-
     fn textui_refresh_characters(
         &mut self,
         vline_id: LineId,
@@ -668,10 +666,8 @@ impl TextuiWindow {
 
     /// 重新渲染某个窗口的某个虚拟行
     /// ## 参数
-
     /// - window 窗口结构体
     /// - vline_id 虚拟行号
-
     fn textui_refresh_vline(&mut self, vline_id: LineId) -> Result<(), SystemError> {
         if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             return self.textui_refresh_characters(
@@ -708,7 +704,6 @@ impl TextuiWindow {
     /// ## 参数
     /// - window 窗口结构体
     /// - vline_id 虚拟行号
-
     fn textui_new_line(&mut self) -> Result<i32, SystemError> {
         // todo: 支持在两个虚拟行之间插入一个新行
         let actual_line_sum = textui_framework().actual_line.load(Ordering::SeqCst);
@@ -753,7 +748,6 @@ impl TextuiWindow {
     /// ## 参数
     /// - window
     /// - character
-
     fn true_textui_putchar_window(
         &mut self,
         character: char,
@@ -791,12 +785,10 @@ impl TextuiWindow {
     }
     /// 根据输入的一个字符在窗口上输出
     /// ## 参数
-
     /// - window 窗口
     /// - character 字符
     /// - FRcolor 前景色（RGB）
     /// - BKcolor 背景色（RGB）
-
     fn textui_putchar_window(
         &mut self,
         character: char,
@@ -824,7 +816,7 @@ impl TextuiWindow {
         //进行换行操作
         if character == '\n' {
             // 换行时还需要输出\r
-            send_to_default_serial8250_port(&[b'\r']);
+            send_to_default_serial8250_port(b"\r");
             if is_enable_window {
                 self.textui_new_line()?;
             }
@@ -991,8 +983,8 @@ impl ScmUiFramework for TextUiFramework {
         let mut new_buf = textui_framework().metadata.read().buf_info();
 
         new_buf.copy_from_nonoverlapping(&old_buf);
-        kdebug!("textui change buf_info: old: {:?}", old_buf);
-        kdebug!("textui change buf_info: new: {:?}", new_buf);
+        debug!("textui change buf_info: old: {:?}", old_buf);
+        debug!("textui change buf_info: new: {:?}", new_buf);
 
         return Ok(0);
     }
@@ -1030,11 +1022,9 @@ where
 /// - character 字符
 /// - FRcolor 前景色（RGB）
 /// - BKcolor 背景色（RGB）
-
 #[no_mangle]
 pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32) -> i32 {
-    let current_vcnum = CURRENT_VCNUM.load(Ordering::SeqCst);
-    if current_vcnum != -1 {
+    if let Some(current_vc) = vc_manager().current_vc() {
         // tty已经初始化了之后才输出到屏幕
         let fr = (fr_color & 0x00ff0000) >> 16;
         let fg = (fr_color & 0x0000ff00) >> 8;
@@ -1046,12 +1036,11 @@ pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32)
             "\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{}\x1B[0m",
             character as char
         );
-        let port = tty_port(current_vcnum as usize);
+        let port = current_vc.port();
         let tty = port.port_data().internal_tty();
         if let Some(tty) = tty {
-            send_to_default_serial8250_port(&[character]);
             return tty
-                .write_without_serial(buf.as_bytes(), buf.len())
+                .write_to_core(buf.as_bytes(), buf.len())
                 .map(|_| 0)
                 .unwrap_or_else(|e| e.to_posix_errno());
         }

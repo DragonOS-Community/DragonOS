@@ -1,12 +1,12 @@
 //! 这个文件实现的是调度过程中涉及到的时钟
 //!
-use crate::{arch::CurrentTimeArch, time::TimeArch};
+use crate::{arch::CurrentTimeArch, smp::cpu::ProcessorId, time::TimeArch};
 
 pub struct SchedClock;
 
 impl SchedClock {
     #[inline]
-    pub fn sched_clock_cpu(_cpu: usize) -> u64 {
+    pub fn sched_clock_cpu(_cpu: ProcessorId) -> u64 {
         #[cfg(target_arch = "x86_64")]
         {
             if crate::arch::driver::tsc::TSCManager::cpu_khz() == 0 {

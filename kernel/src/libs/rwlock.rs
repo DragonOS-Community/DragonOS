@@ -16,7 +16,6 @@ use crate::{
 };
 
 ///RwLock读写锁
-
 /// @brief READER位占据从右往左数第三个比特位
 const READER: u32 = 1 << 2;
 
@@ -101,7 +100,7 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 获取实时的读者数并尝试加1,如果增加值成功则返回增加1后的读者数,否则panic
     fn current_reader(&self) -> Result<u32, SystemError> {
-        const MAX_READERS: u32 = core::u32::MAX >> READER_BIT >> 1; //右移3位
+        const MAX_READERS: u32 = u32::MAX >> READER_BIT >> 1; //右移3位
 
         let value = self.lock.fetch_add(READER, Ordering::Acquire);
         //value二进制形式的MSB不能为1, 否则导致溢出
@@ -371,6 +370,11 @@ impl<T> RwLock<T> {
     pub unsafe fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.get() }
     }
+
+    #[allow(dead_code)]
+    pub unsafe fn force_get_ref(&self) -> &T {
+        unsafe { &*self.data.get() }
+    }
 }
 
 impl<T: Default> Default for RwLock<T> {
@@ -543,7 +547,7 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
     }
 }
 
-impl<'rwlock, T> Deref for RwLockReadGuard<'rwlock, T> {
+impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -551,7 +555,7 @@ impl<'rwlock, T> Deref for RwLockReadGuard<'rwlock, T> {
     }
 }
 
-impl<'rwlock, T> Deref for RwLockUpgradableGuard<'rwlock, T> {
+impl<T> Deref for RwLockUpgradableGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -559,7 +563,7 @@ impl<'rwlock, T> Deref for RwLockUpgradableGuard<'rwlock, T> {
     }
 }
 
-impl<'rwlock, T> Deref for RwLockWriteGuard<'rwlock, T> {
+impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -567,13 +571,13 @@ impl<'rwlock, T> Deref for RwLockWriteGuard<'rwlock, T> {
     }
 }
 
-impl<'rwlock, T> DerefMut for RwLockWriteGuard<'rwlock, T> {
+impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         return unsafe { &mut *self.data };
     }
 }
 
-impl<'rwlock, T> Drop for RwLockReadGuard<'rwlock, T> {
+impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED) > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
@@ -581,7 +585,7 @@ impl<'rwlock, T> Drop for RwLockReadGuard<'rwlock, T> {
     }
 }
 
-impl<'rwlock, T> Drop for RwLockUpgradableGuard<'rwlock, T> {
+impl<T> Drop for RwLockUpgradableGuard<'_, T> {
     fn drop(&mut self) {
         debug_assert_eq!(
             self.inner.lock.load(Ordering::Relaxed) & (WRITER | UPGRADED),
@@ -593,7 +597,7 @@ impl<'rwlock, T> Drop for RwLockUpgradableGuard<'rwlock, T> {
     }
 }
 
-impl<'rwlock, T> Drop for RwLockWriteGuard<'rwlock, T> {
+impl<T> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
         debug_assert_eq!(self.inner.lock.load(Ordering::Relaxed) & WRITER, WRITER);
         self.inner

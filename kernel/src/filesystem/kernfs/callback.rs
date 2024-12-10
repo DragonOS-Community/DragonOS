@@ -70,7 +70,7 @@ impl<'a> KernCallbackData<'a> {
         if let Some(private_data) = private_data {
             return private_data.callback_read(buf, offset);
         }
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     pub fn callback_write(&self, buf: &[u8], offset: usize) -> Result<usize, SystemError> {
@@ -78,7 +78,7 @@ impl<'a> KernCallbackData<'a> {
         if let Some(private_data) = private_data {
             return private_data.callback_write(buf, offset);
         }
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 }
 

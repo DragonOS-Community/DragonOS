@@ -3,7 +3,7 @@ use crate::arch::mm::kernel_page_flags;
 use crate::arch::MMArch;
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{page_manager_lock_irqsave, PageFlags};
+use crate::mm::page::{page_manager_lock_irqsave, EntryFlags};
 use crate::mm::{
     allocator::page_frame::{
         allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
@@ -23,7 +23,9 @@ unsafe impl Hal for HalImpl {
         _direction: BufferDirection,
     ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
         let page_num = PageFrameCount::new(
-            ((pages * PAGE_SIZE + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE).next_power_of_two(),
+            (pages * PAGE_SIZE)
+                .div_ceil(MMArch::PAGE_SIZE)
+                .next_power_of_two(),
         );
         unsafe {
             let (paddr, count) =
@@ -32,7 +34,7 @@ unsafe impl Hal for HalImpl {
             // 清空这块区域，防止出现脏数据
             core::ptr::write_bytes(virt.data() as *mut u8, 0, count.data() * MMArch::PAGE_SIZE);
 
-            let dma_flags: PageFlags<MMArch> = PageFlags::mmio_flags();
+            let dma_flags: EntryFlags<MMArch> = EntryFlags::mmio_flags();
 
             let mut kernel_mapper = KernelMapper::lock();
             let kernel_mapper = kernel_mapper.as_mut().unwrap();
@@ -55,7 +57,9 @@ unsafe impl Hal for HalImpl {
         pages: usize,
     ) -> i32 {
         let page_count = PageFrameCount::new(
-            ((pages * PAGE_SIZE + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE).next_power_of_two(),
+            (pages * PAGE_SIZE)
+                .div_ceil(MMArch::PAGE_SIZE)
+                .next_power_of_two(),
         );
 
         // 恢复页面属性
@@ -79,8 +83,8 @@ unsafe impl Hal for HalImpl {
     /// @brief mmio物理地址转换为虚拟地址，不需要使用
     /// @param paddr 起始物理地址
     /// @return NonNull<u8> 虚拟地址的指针
-    unsafe fn mmio_phys_to_virt(_paddr: virtio_drivers::PhysAddr, _size: usize) -> NonNull<u8> {
-        NonNull::new((0) as _).unwrap()
+    unsafe fn mmio_phys_to_virt(paddr: virtio_drivers::PhysAddr, _size: usize) -> NonNull<u8> {
+        NonNull::new((MMArch::phys_2_virt(PhysAddr::new(paddr))).unwrap().data() as _).unwrap()
     }
     /// @brief 与真实物理设备共享
     /// @param buffer 要共享的buffer _direction：设备到driver或driver到设备
@@ -90,7 +94,7 @@ unsafe impl Hal for HalImpl {
         _direction: BufferDirection,
     ) -> virtio_drivers::PhysAddr {
         let vaddr = VirtAddr::new(buffer.as_ptr() as *mut u8 as usize);
-        //kdebug!("virt:{:x}", vaddr);
+        //debug!("virt:{:x}", vaddr);
         // Nothing to do, as the host already has access to all memory.
         return MMArch::virt_2_phys(vaddr).unwrap().data();
     }

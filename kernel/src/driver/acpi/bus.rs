@@ -111,6 +111,7 @@ impl Bus for AcpiBus {
 ///
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/acpi/acpi_bus.h#364
+#[allow(unused)]
 pub trait AcpiDevice: Device {}
 
 /// Acpi驱动应当实现的trait
@@ -120,4 +121,5 @@ pub trait AcpiDevice: Device {}
 /// todo: 仿照linux的acpi_driver去设计这个trait
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/acpi/acpi_bus.h#163
+#[allow(unused)]
 pub trait AcpiDriver: Driver {}

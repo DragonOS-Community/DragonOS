@@ -1,5 +1,6 @@
 use core::intrinsics::unlikely;
 
+use log::error;
 use system_error::SystemError;
 
 use crate::libs::{
@@ -88,7 +89,7 @@ impl MemBlockManager {
             .expect("Failed to count blocks to add!");
 
         if inner.initial_memory_regions_num + blocks_to_add > INITIAL_MEMORY_REGIONS_NUM {
-            kerror!("Too many memory regions!");
+            error!("Too many memory regions!");
             return Err(SystemError::ENOMEM);
         }
 
@@ -203,7 +204,7 @@ impl MemBlockManager {
 
                 if this.base + this.size != next_base || this.flags != next_flags {
                     if unlikely(this.base + this.size > next_base) {
-                        kBUG!("this->base + this->size > next->base");
+                        panic!("this->base + this->size > next->base");
                     }
                     i += 1;
                     continue;
@@ -352,6 +353,11 @@ impl MemBlockManager {
         return self.set_or_clear_flags(base, size, true, MemoryAreaAttr::NOMAP);
     }
 
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/mm/memblock.c?fi=memblock_mark_mirror#940
+    pub fn mark_mirror(&self, base: PhysAddr, size: usize) -> Result<(), SystemError> {
+        return self.set_or_clear_flags(base, size, true, MemoryAreaAttr::MIRROR);
+    }
+
     fn set_or_clear_flags(
         &self,
         mut base: PhysAddr,
@@ -467,7 +473,7 @@ pub struct MemBlockIter<'a> {
 }
 
 #[allow(dead_code)]
-impl<'a> MemBlockIter<'a> {
+impl MemBlockIter<'_> {
     /// 获取内存区域数量
     pub fn total_num(&self) -> usize {
         self.inner.initial_memory_regions_num
@@ -484,7 +490,7 @@ impl<'a> MemBlockIter<'a> {
     }
 }
 
-impl<'a> Iterator for MemBlockIter<'a> {
+impl Iterator for MemBlockIter<'_> {
     type Item = PhysMemoryArea;
 
     fn next(&mut self) -> Option<Self::Item> {

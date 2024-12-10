@@ -1,11 +1,11 @@
 use crate::{
     arch::kvm::vmx::ept::EptMapper,
-    kdebug,
     libs::mutex::Mutex,
-    mm::{page::PageFlags, syscall::ProtFlags},
+    mm::{page::EntryFlags, syscall::ProtFlags},
     virt::kvm::host_mem::{__gfn_to_pfn, kvm_vcpu_gfn_to_memslot, PAGE_MASK, PAGE_SHIFT},
 };
 use bitfield_struct::bitfield;
+use log::debug;
 use system_error::SystemError;
 
 use super::{
@@ -105,7 +105,7 @@ fn tdp_page_fault(
     error_code: u32,
     prefault: bool,
 ) -> Result<(), SystemError> {
-    kdebug!("tdp_page_fault");
+    debug!("tdp_page_fault");
     let gfn = gpa >> PAGE_SHIFT; // 物理地址右移12位得到物理页框号(相对于虚拟机而言)
                                  // 分配缓存池，为了避免在运行时分配空间失败，这里提前分配/填充足额的空间
     mmu_topup_memory_caches(vcpu)?;
@@ -211,14 +211,14 @@ pub fn __direct_map(
     pfn: u64,
     _prefault: bool,
 ) -> Result<u32, SystemError> {
-    kdebug!("gpa={}, pfn={}, root_hpa={:x}", gpa, pfn, vcpu.mmu.root_hpa);
+    debug!("gpa={}, pfn={}, root_hpa={:x}", gpa, pfn, vcpu.mmu.root_hpa);
     // 判断vcpu.mmu.root_hpa是否有效
     if vcpu.mmu.root_hpa == 0 {
         return Err(SystemError::KVM_HVA_ERR_BAD);
     }
     // 把gpa映射到hpa
     let mut ept_mapper = EptMapper::lock();
-    let page_flags = PageFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
+    let page_flags = EntryFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
     unsafe {
         assert!(ept_mapper.walk(gpa, pfn << PAGE_SHIFT, page_flags).is_ok());
     }

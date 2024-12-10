@@ -17,7 +17,7 @@ use crate::{
         MMArch,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    mm::{percpu::PerCpuVar, virt_2_phys, MemoryManagementArch, PhysAddr},
+    mm::{percpu::PerCpuVar, MemoryManagementArch, PhysAddr, VirtAddr},
     smp::cpu::ProcessorId,
 };
 
@@ -100,7 +100,9 @@ impl LockedVMControlStructure {
     pub fn new(shadow: bool) -> Arc<Self> {
         let mut vmcs = VMControlStructure::new();
 
-        let phys_addr = PhysAddr::new(virt_2_phys(vmcs.as_ref() as *const _ as usize));
+        let phys_addr = unsafe {
+            MMArch::virt_2_phys(VirtAddr::new(vmcs.as_ref() as *const _ as usize)).unwrap()
+        };
 
         vmcs.set_shadow_vmcs(shadow);
 
@@ -385,7 +387,7 @@ impl VmxMsrBitmap {
         let addr = data.data() as *const [usize] as *const usize as usize;
         Self {
             data,
-            phys_addr: virt_2_phys(addr),
+            phys_addr: unsafe { MMArch::virt_2_phys(VirtAddr::new(addr)).unwrap().data() },
         }
     }
 
@@ -414,11 +416,7 @@ impl VmxMsrBitmap {
         match action {
             VmxMsrBitmapAction::Test => {
                 let ret = self.data.get(msr + base);
-                if let Some(ret) = ret {
-                    ret
-                } else {
-                    false
-                }
+                ret.unwrap_or(false)
             }
             VmxMsrBitmapAction::Set => {
                 self.data.set(msr + base, true);

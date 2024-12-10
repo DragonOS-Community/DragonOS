@@ -1,6 +1,7 @@
 use core::{ffi::CStr, mem::size_of};
 
 use hashbrown::Equivalent;
+use log::{debug, error, info, warn};
 use system_error::SystemError;
 use uefi_raw::table::{
     boot::{MemoryAttribute, MemoryType},
@@ -20,7 +21,9 @@ use crate::{
 };
 
 use super::{
-    guid::{EFI_MEMORY_ATTRIBUTES_TABLE_GUID, EFI_MEMRESERVE_TABLE_GUID},
+    guid::{
+        EFI_MEMORY_ATTRIBUTES_TABLE_GUID, EFI_MEMRESERVE_TABLE_GUID, EFI_SYSTEM_RESOURCE_TABLE_GUID,
+    },
     EFIManager,
 };
 
@@ -29,6 +32,7 @@ static TABLE_PARSERS: &[&TableMatcher] = &[
     &TableMatcher::new(&MatchTableDragonStubPayloadEFI),
     &TableMatcher::new(&MatchTableMemoryAttributes),
     &TableMatcher::new(&MatchTableMemReserve),
+    &TableMatcher::new(&MatchTableEsrt),
 ];
 
 impl EFIManager {
@@ -63,16 +67,15 @@ impl EFIManager {
             }
 
             EarlyIoRemap::unmap(fw_ptr).map_err(|e|{
-                kerror!("report systable header: failed to unmap systable header, fw_ptr: {fw_ptr:?}, err: {e:?}");
+                error!("report systable header: failed to unmap systable header, fw_ptr: {fw_ptr:?}, err: {e:?}");
                 e
             }).ok();
         } else {
-            kwarn!("report systable header: failed to map systable header, err: {fw_ptr:?}");
+            warn!("report systable header: failed to map systable header, err: {fw_ptr:?}");
         }
 
-        let s = CStr::from_bytes_with_nul(&tmp_buf)
-            .unwrap_or_else(|_| CStr::from_bytes_with_nul(b"Unknown\0").unwrap());
-        kinfo!("EFI version: {:?}, vendor: {:?}", header.revision, s);
+        let s = CStr::from_bytes_with_nul(&tmp_buf).unwrap_or(c"Unknown");
+        info!("EFI version: {:?}, vendor: {:?}", header.revision, s);
     }
 
     /// 解析EFI config table
@@ -83,7 +86,7 @@ impl EFIManager {
                 if let Some(r) = parser.match_table(table) {
                     // 有匹配结果
                     if let Err(e) = r {
-                        kwarn!(
+                        warn!(
                             "Failed to parse cfg table: '{}', err: {e:?}",
                             parser.table.name()
                         );
@@ -94,17 +97,17 @@ impl EFIManager {
             }
 
             if !flag {
-                kwarn!("Cannot find parser for guid: {:?}", table.vendor_guid);
+                warn!("Cannot find parser for guid: {:?}", table.vendor_guid);
             }
         }
 
         // 如果存在mem reserve table
-        if let Some(mem_reserve) = efi_manager().inner.read().memreserve_table_paddr {
+        if let Some(mem_reserve) = efi_manager().inner_read().memreserve_table_paddr {
             let mut prev_paddr = mem_reserve;
             while !prev_paddr.is_null() {
                 let vaddr = EarlyIoRemap::map_not_aligned(prev_paddr, MMArch::PAGE_SIZE, true)
                     .map_err(|e| {
-                        kerror!(
+                        error!(
                             "Failed to map UEFI memreserve table, paddr: {prev_paddr:?}, err: {e:?}"
                         );
 
@@ -126,7 +129,7 @@ impl EFIManager {
                             + size_of::<LinuxEFIMemReserveEntry>() * psize,
                     )
                     .map_err(|e| {
-                        kerror!("Failed to reserve block, paddr: {prev_paddr:?}, err: {e:?}");
+                        error!("Failed to reserve block, paddr: {prev_paddr:?}, err: {e:?}");
                         EarlyIoRemap::unmap(vaddr).unwrap();
                         e
                     })?;
@@ -143,7 +146,7 @@ impl EFIManager {
                     mem_block_manager()
                         .reserve_block(PhysAddr::new(entry.base), entry.size)
                         .map_err(|e| {
-                            kerror!("Failed to reserve block, paddr: {prev_paddr:?}, err: {e:?}");
+                            error!("Failed to reserve block, paddr: {prev_paddr:?}, err: {e:?}");
                             EarlyIoRemap::unmap(vaddr).unwrap();
                             e
                         })?;
@@ -283,7 +286,7 @@ impl MatchTable for MatchTableDragonStubPayloadEFI {
         let vendor_table_vaddr = vendor_table_vaddr.unwrap();
         let data = unsafe { *(vendor_table_vaddr.data() as *const DragonStubPayloadEFI) };
 
-        efi_manager().inner.write().dragonstub_load_info = Some(data);
+        efi_manager().inner_write().dragonstub_load_info = Some(data);
 
         return Ok(());
     }
@@ -341,10 +344,37 @@ impl MatchTable for MatchTableMemReserve {
     ) -> Result<(), SystemError> {
         efi_manager().inner.write_irqsave().memreserve_table_paddr =
             Some(PhysAddr::new(table_raw.vendor_table as usize));
-        kdebug!(
+        debug!(
             "memreserve_table_paddr: {:#x}",
             table_raw.vendor_table as usize
         );
+        return Ok(());
+    }
+}
+
+struct MatchTableEsrt;
+
+impl MatchTable for MatchTableEsrt {
+    fn name(&self) -> &'static str {
+        "ESRT"
+    }
+
+    fn guid(&self) -> &'static uefi_raw::Guid {
+        &EFI_SYSTEM_RESOURCE_TABLE_GUID
+    }
+
+    fn map_size(&self) -> usize {
+        0
+    }
+
+    fn post_process(
+        &self,
+        _vendor_table_vaddr: Option<VirtAddr>,
+        table_raw: &ConfigurationTable,
+    ) -> Result<(), SystemError> {
+        efi_manager().inner.write_irqsave().esrt_table_paddr =
+            Some(PhysAddr::new(table_raw.vendor_table as usize));
+        debug!("esrt_table_paddr: {:#x}", table_raw.vendor_table as usize);
         return Ok(());
     }
 }

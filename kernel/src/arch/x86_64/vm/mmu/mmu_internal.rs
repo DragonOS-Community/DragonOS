@@ -1,6 +1,7 @@
-use crate::arch::vm::vmx::ept::debug_eptp;
+use crate::mm::page::EntryFlags;
 use alloc::sync::Arc;
 use core::{intrinsics::unlikely, ops::Index};
+use log::{debug, warn};
 use x86::vmx::vmcs::{guest, host};
 
 use system_error::SystemError;
@@ -10,14 +11,13 @@ use crate::{
         vm::{
             asm::VmxAsm,
             kvm_host::{EmulType, KVM_PFN_NOSLOT},
-            mmu::mmu::{PFRet, PageLevel},
+            mmu::kvm_mmu::{PFRet, PageLevel},
             mtrr::kvm_mtrr_check_gfn_range_consistency,
             vmx::{ept::EptPageMapper, PageFaultErr},
         },
         MMArch,
     },
-    kdebug, kwarn,
-    mm::{page::PageFlags, PhysAddr},
+    mm::PhysAddr,
     virt::{
         kvm::host_mem::PAGE_SHIFT,
         vm::kvm_host::{
@@ -29,8 +29,9 @@ use crate::{
     },
 };
 
-use super::mmu::{gfn_round_for_level, is_tdp_mmu_enabled, KvmMmuPageRole};
+use super::kvm_mmu::{gfn_round_for_level, is_tdp_mmu_enabled, KvmMmuPageRole};
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct KvmMmuPage {
     pub tdp_mmu_page: bool, // 标记是否为 TDP（Two-Dimensional Paging）页表页
@@ -46,7 +47,7 @@ pub struct KvmMmuPage {
     pub map_writable: bool,
     pub write_fault_to_shadow_pgtable: bool,
 }
-
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct KvmPageFault {
     // vcpu.do_page_fault 的参数
@@ -96,6 +97,7 @@ pub struct KvmPageFault {
     // 表示访客正在尝试写入包含用于翻译写入本身的一个或多个 PTE 的 gfn
     write_fault_to_shadow_pgtable: bool,
 }
+#[allow(dead_code)]
 impl KvmPageFault {
     pub fn pfn(&self) -> u64 {
         self.pfn
@@ -121,10 +123,10 @@ impl VirtCpu {
         _insn: Option<u64>,
         _insn_len: usize,
     ) -> Result<i32, SystemError> {
-        let mut emulation_type = EmulType::PF;
-        let direct = self.arch.mmu().root_role.get_direct();
+        let emulation_type = EmulType::PF;
+        let _direct = self.arch.mmu().root_role.get_direct();
         if error_code & PageFaultErr::PFERR_IMPLICIT_ACCESS.bits() != 0 {
-            kwarn!("Implicit access error code detected");
+            warn!("Implicit access error code detected");
             error_code &= !PageFaultErr::PFERR_IMPLICIT_ACCESS.bits();
         }
 
@@ -215,8 +217,8 @@ impl VirtCpu {
         //处理直接映射
         if self.arch.mmu().root_role.get_direct() {
             page_fault.gfn = (page_fault.addr.data() >> PAGE_SHIFT) as u64;
-            kdebug!("page_fault.addr.data() : 0x{:x}", page_fault.addr.data());
-            kdebug!("do_page_fault : gfn = 0x{:x}", page_fault.gfn);
+            debug!("page_fault.addr.data() : 0x{:x}", page_fault.addr.data());
+            debug!("do_page_fault : gfn = 0x{:x}", page_fault.gfn);
             page_fault.slot = self.gfn_to_memslot(page_fault.gfn, vm); //kvm_vcpu_gfn_to_memslot(vcpu, fault.gfn);没完成
         }
         //异步页面错误（Async #PF），也称为预取错误（prefetch faults），
@@ -244,7 +246,7 @@ impl VirtCpu {
             PFRet::Spurious => self.stat.pf_spurious += 1,
             _ => {}
         }
-        kdebug!("do_page_fault return r = {}", r);
+        debug!("do_page_fault return r = {}", r);
         Ok(r)
     }
 
@@ -301,7 +303,8 @@ impl VirtCpu {
             return Ok(r.into());
         }
 
-        r = PFRet::Retry;
+        //r = PFRet::Retry;
+
         //if self.is_page_fault_stale(page_fault) {return;}
 
         //实际的映射
@@ -313,19 +316,19 @@ impl VirtCpu {
     fn tdp_mmu_map(&self, page_fault: &mut KvmPageFault) -> Result<i32, SystemError> {
         // let ret = PFRet::Retry;//下面的逻辑和linux不一致，可能在判断返回值会有问题
         let mut mapper = EptPageMapper::lock();
-        kdebug!("{:?}", &page_fault);
+        debug!("{:?}", &page_fault);
         //flags ：rwx
-        let page_flags: PageFlags<MMArch> = unsafe { PageFlags::from_data(0xb77) };
+        let page_flags: EntryFlags<MMArch> = unsafe { EntryFlags::from_data(0xb77) };
         mapper.map(PhysAddr::new(page_fault.gpa() as usize), page_flags);
         //debug_eptp();
 
-        kdebug!("The ept_root_addr is {:?}", EptPageMapper::root_page_addr());
+        debug!("The ept_root_addr is {:?}", EptPageMapper::root_page_addr());
         //todo: 一些参数的更新
         Ok(PFRet::Fixed.into())
         //todo!()
     }
 
-    fn direct_page_fault(&self, page_fault: &KvmPageFault) -> Result<i32, SystemError> {
+    fn direct_page_fault(&self, _page_fault: &KvmPageFault) -> Result<i32, SystemError> {
         todo!()
     }
 
@@ -333,7 +336,7 @@ impl VirtCpu {
         &self,
         vm: &Vm,
         page_fault: &mut KvmPageFault,
-        access: u32,
+        _access: u32,
     ) -> Result<PFRet, SystemError> {
         page_fault.mmu_seq = vm.mmu_invalidate_seq;
         self.__kvm_faultin_pfn(page_fault)
@@ -372,13 +375,12 @@ impl VirtCpu {
         // 尝试将 GFN 转换为 PFN
         let guest_cr3 = VmxAsm::vmx_vmread(guest::CR3);
         let host_cr3 = VmxAsm::vmx_vmread(host::CR3);
-        kdebug!("guest_cr3={:x}, host_cr3={:x}", guest_cr3, host_cr3);
+        debug!("guest_cr3={:x}, host_cr3={:x}", guest_cr3, host_cr3);
         page_fault.pfn = __gfn_to_pfn_memslot(
             Some(&slot),
             page_fault.gfn,
+            (false, &mut is_async),
             false,
-            false,
-            &mut is_async,
             page_fault.write,
             &mut page_fault.map_writable,
             &mut page_fault.hva,

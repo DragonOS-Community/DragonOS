@@ -44,20 +44,14 @@ trigger_labels = [
     "regression-from-stable-to-nightly",
     "I-unsound",
 ]
-exclude_labels = [
-    "P-*",
-    "T-release",
-    "requires-nightly",
-]
+exclude_labels = ["P-*", "T-release", "requires-nightly"]
 
 [autolabel."T-doc"]
 trigger_files = [
     # Source code
     "doc",
 ]
-exclude_labels = [
-    "T-*",
-]
+exclude_labels = ["T-*"]
 
 
 [autolabel."A-meta"]
@@ -70,21 +64,15 @@ trigger_files = [
 ]
 
 [autolabel."A-fs"]
-trigger_files = [
-    "kernel/src/filesystem",
-]
+trigger_files = ["kernel/src/filesystem"]
 
 [autolabel."O-x86_64"]
-trigger_files = [
-    "kernel/src/arch/x86_64",
-]
+trigger_files = ["kernel/src/arch/x86_64"]
 
 [autolabel."O-riscv64"]
-trigger_files = [
-    "kernel/src/arch/riscv64",
-]
+trigger_files = ["kernel/src/arch/riscv64"]
 
-[autolabel."T-driver"]
+[autolabel."A-driver"]
 trigger_files = [
     "kernel/src/driver",
     "kernel/src/arch/x86_64/driver",
@@ -92,9 +80,14 @@ trigger_files = [
 ]
 
 [autolabel."T-virtulization"]
+trigger_files = ["kernel/src/virt", "kernel/src/arch/x86_64/kvm"]
+
+[autolabel."T-Obs and Test"]
 trigger_files = [
-    "kernel/src/virt",
-    "kernel/src/arch/x86_64/kvm"
+    "/kernel/crates/rbpf",
+    "/kernel/crates/kprobe",
+    "/kernel/src/debug/kprobe",
+    "/kernel/src/bpf",
 ]
 
 [autolabel."S-等待审查"]
@@ -102,15 +95,13 @@ new_pr = true
 
 [autolabel."needs-triage"]
 new_issue = true
-exclude_labels = [
-    "A-diagnostics",
-]
+exclude_labels = ["A-diagnostics"]
 
 [shortcut]
 
 [no-merges]
 exclude_titles = ["Rollup of", "subtree update", "Subtree update"]
-labels = ["S-等待作者修改"]
+labels = ["S-等待作者修改", "ambiguous"]
 
 [mentions."triagebot.toml"]
 message = "`triagebot.toml` has been modified, there may have been changes to the review queue."
@@ -124,56 +115,60 @@ cc = ["@fslongjin"]
 message = "tty驱动发生了更改，请进行审查"
 cc = ["@GnoCiYeH"]
 
+[mentions."kernel/src/bpf"]
+message = "BPF部分发生了更改，请进行审查"
+cc = ["@Godones"]
+
 
 [assign]
 warn_non_default_branch = true
-contributing_url = "https://docs.dragonos.org/zh-cn/latest/community/code_contribution/index.html"
+contributing_url = "https://community.dragonos.org/contributors/"
 users_on_vacation = []
 
 [assign.adhoc_groups]
 
 # 驱动程序
-driver = [
-    "@fslongjin",
-    "@YJwu2023",
-    "@GnoCiYeH"
+driver = ["@dragonos/main"]
+
+# SIG-MM
+sig-mm = ["@dragonos/mm"]
+
+sig-obs = [
+    "@dragonos/sig-observation-testing",
+    "@Chiichen",
+    "@Godones"
 ]
+
 
 # 虚拟化
-virtulization = [
-    "@fslongjin",
-    "@ZXXYy"
-]
+virtulization = ["@dragonos/virtualization"]
 
-filesystem = [
-    "@fslongjin"
-]
+main = [ "@dragonos/main" ]
+network = [ "@dragonos/network" ]
 
-riscv64 = [
-    "@fslongjin"
-]
+riscv64 = ["@fslongjin"]
 
-x86_64 = [
-    "@fslongjin",
-    "@GnoCiYeH",
-    "@Chiichen",
-]
+x86_64 = ["@fslongjin", "@GnoCiYeH", "@Chiichen"]
 
 # CI/CD
-infra-ci = [
-    "@fslongjin"
-]
+infra = ["@dragonos/infra"]
 
-bootstrap = [
-    "@fslongjin"
-]
 
 [assign.owners]
-"/.github/workflows" =                                   ["infra-ci"]
-"/kernel/src/driver" =                                   ["driver"]
-"/kernel/src/filesystem" =                               ["filesystem"]
-"/kernel/src/virt" =                                     ["virtulization"]
-"/kernel/src/arch/x86_64/kvm" =                          ["virtulization"]
-"/kernel/src/arch/x86_64"   =                            ["x86_64"]
-"/kernel/src/arch/riscv64"   =                           ["riscv64"]
-
+"/.github/workflows" = ["infra"]
+"/.github/actions" = ["infra"]
+"/triagebot.toml" = ["infra"]
+"/kernel/src/driver" = ["main"]
+"/kernel/src/filesystem" = ["main"]
+"/kernel/src/sched" = ["main"]
+"/kernel/src/process" = ["main"]
+"/kernel/src/net" = ["network"]
+"/kernel/src/virt" = ["virtulization"]
+"/kernel/src/arch/x86_64/kvm" = ["virtulization"]
+"/kernel/src/arch/x86_64" = ["x86_64"]
+"/kernel/src/arch/riscv64" = ["riscv64"]
+"/kernel/crates/rbpf" = ["sig-obs"]
+"/kernel/crates/kprobe" = ["sig-obs"]
+"/kernel/src/debug/kprobe" = ["sig-obs"]
+"/kernel/src/bpf" = ["sig-obs"]
+"/tools" = ["infra"]

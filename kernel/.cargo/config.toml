@@ -5,4 +5,8 @@
 [target.'cfg(target_os = "none")']
 runner = "bootimage runner"
 
+[build]
+rustflags = ["-Clink-args=-znostart-stop-gc"]
+rustdocflags = ["-Clink-args=-znostart-stop-gc"]
+
 [env]

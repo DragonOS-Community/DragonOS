@@ -1,26 +1,34 @@
 use core::ffi::c_void;
 
 use alloc::{
+    ffi::CString,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
+use log::error;
 use system_error::SystemError;
 
 use super::{
     abi::WaitOption,
+    cred::{Kgid, Kuid},
+    exec::{load_binary_file, ExecParam, ExecParamFlags},
     exit::kernel_wait4,
     fork::{CloneFlags, KernelCloneArgs},
     resource::{RLimit64, RLimitID, RUsage, RUsageWho},
     KernelStack, Pid, ProcessManager,
 };
 use crate::{
-    arch::{interrupt::TrapFrame, MMArch},
+    arch::{interrupt::TrapFrame, CurrentIrqArch, MMArch},
+    exception::InterruptArch,
     filesystem::{
         procfs::procfs_register_pid,
         vfs::{file::FileDescriptorVec, MAX_PATHLEN},
     },
-    mm::{ucontext::UserStack, verify_area, MemoryManagementArch, VirtAddr},
+    mm::{
+        ucontext::{AddressSpace, UserStack},
+        verify_area, MemoryManagementArch, VirtAddr,
+    },
     process::ProcessControlBlock,
     sched::completion::Completion,
     syscall::{
@@ -98,13 +106,13 @@ impl Syscall {
         envp: *const *const u8,
         frame: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        // kdebug!(
+        // debug!(
         //     "execve path: {:?}, argv: {:?}, envp: {:?}\n",
         //     path,
         //     argv,
         //     envp
         // );
-        // kdebug!(
+        // debug!(
         //     "before execve: strong count: {}",
         //     Arc::strong_count(&ProcessManager::current_pcb())
         // );
@@ -114,16 +122,16 @@ impl Syscall {
         }
 
         let x = || {
-            let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-            let argv: Vec<String> = check_and_clone_cstr_array(argv)?;
-            let envp: Vec<String> = check_and_clone_cstr_array(envp)?;
+            let path: CString = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+            let argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
+            let envp: Vec<CString> = check_and_clone_cstr_array(envp)?;
             Ok((path, argv, envp))
         };
-        let r: Result<(String, Vec<String>, Vec<String>), SystemError> = x();
-        if let Err(e) = r {
-            panic!("Failed to execve: {:?}", e);
-        }
-        let (path, argv, envp) = r.unwrap();
+        let (path, argv, envp) = x().inspect_err(|e: &SystemError| {
+            error!("Failed to execve: {:?}", e);
+        })?;
+
+        let path = path.into_string().map_err(|_| SystemError::EINVAL)?;
         ProcessManager::current_pcb()
             .basic_mut()
             .set_name(ProcessControlBlock::generate_name(&path, &argv));
@@ -133,12 +141,60 @@ impl Syscall {
         // 关闭设置了O_CLOEXEC的文件描述符
         let fd_table = ProcessManager::current_pcb().fd_table();
         fd_table.write().close_on_exec();
-        // kdebug!(
+        // debug!(
         //     "after execve: strong count: {}",
         //     Arc::strong_count(&ProcessManager::current_pcb())
         // );
 
         return Ok(());
+    }
+
+    pub fn do_execve(
+        path: String,
+        argv: Vec<CString>,
+        envp: Vec<CString>,
+        regs: &mut TrapFrame,
+    ) -> Result<(), SystemError> {
+        let address_space = AddressSpace::new(true).expect("Failed to create new address space");
+        // debug!("to load binary file");
+        let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC)?;
+        let old_vm = do_execve_switch_user_vm(address_space.clone());
+
+        // 加载可执行文件
+        let load_result = load_binary_file(&mut param).inspect_err(|_| {
+            if let Some(old_vm) = old_vm {
+                do_execve_switch_user_vm(old_vm);
+            }
+        })?;
+
+        // debug!("load binary file done");
+        // debug!("argv: {:?}, envp: {:?}", argv, envp);
+        param.init_info_mut().args = argv;
+        param.init_info_mut().envs = envp;
+
+        // 把proc_init_info写到用户栈上
+        let mut ustack_message = unsafe {
+            address_space
+                .write()
+                .user_stack_mut()
+                .expect("No user stack found")
+                .clone_info_only()
+        };
+        let (user_sp, argv_ptr) = unsafe {
+            param
+                .init_info()
+                .push_at(
+                    // address_space
+                    //     .write()
+                    //     .user_stack_mut()
+                    //     .expect("No user stack found"),
+                    &mut ustack_message,
+                )
+                .expect("Failed to push proc_init_info to user stack")
+        };
+        address_space.write().user_stack = Some(ustack_message);
+
+        Self::arch_do_execve(regs, &param, &load_result, user_sp, argv_ptr)
     }
 
     pub fn wait4(
@@ -190,7 +246,13 @@ impl Syscall {
     /// @brief 获取当前进程的pid
     pub fn getpid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        return Ok(current_pcb.tgid());
+        // if let Some(pid_ns) = &current_pcb.get_nsproxy().read().pid_namespace {
+        //     // 获取该进程在命名空间中的 PID
+        //     return Ok(current_pcb.pid_strcut().read().numbers[pid_ns.level].nr);
+        //     // 返回命名空间中的 PID
+        // }
+        // 默认返回 tgid
+        Ok(current_pcb.tgid())
     }
 
     /// @brief 获取指定进程的pgid
@@ -208,7 +270,7 @@ impl Syscall {
         return Ok(target_proc.basic().pgid());
     }
     /// @brief 获取当前进程的父进程id
-
+    ///
     /// 若为initproc则ppid设置为0   
     pub fn getppid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
@@ -289,23 +351,123 @@ impl Syscall {
     }
 
     pub fn getuid() -> Result<usize, SystemError> {
-        // todo: 增加credit功能之后，需要修改
-        return Ok(0);
+        let pcb = ProcessManager::current_pcb();
+        return Ok(pcb.cred.lock().uid.data());
     }
 
     pub fn getgid() -> Result<usize, SystemError> {
-        // todo: 增加credit功能之后，需要修改
-        return Ok(0);
+        let pcb = ProcessManager::current_pcb();
+        return Ok(pcb.cred.lock().gid.data());
     }
 
     pub fn geteuid() -> Result<usize, SystemError> {
-        // todo: 增加credit功能之后，需要修改
-        return Ok(0);
+        let pcb = ProcessManager::current_pcb();
+        return Ok(pcb.cred.lock().euid.data());
     }
 
     pub fn getegid() -> Result<usize, SystemError> {
-        // todo: 增加credit功能之后，需要修改
+        let pcb = ProcessManager::current_pcb();
+        return Ok(pcb.cred.lock().egid.data());
+    }
+
+    pub fn setuid(uid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if guard.uid.data() == 0 {
+            guard.setuid(uid);
+            guard.seteuid(uid);
+            guard.setsuid(uid);
+        } else if uid == guard.uid.data() || uid == guard.suid.data() {
+            guard.seteuid(uid);
+        } else {
+            return Err(SystemError::EPERM);
+        }
+
         return Ok(0);
+    }
+
+    pub fn setgid(gid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if guard.egid.data() == 0 {
+            guard.setgid(gid);
+            guard.setegid(gid);
+            guard.setsgid(gid);
+            guard.setfsgid(gid);
+        } else if guard.gid.data() == gid || guard.sgid.data() == gid {
+            guard.setegid(gid);
+            guard.setfsgid(gid);
+        } else {
+            return Err(SystemError::EPERM);
+        }
+
+        return Ok(0);
+    }
+
+    pub fn seteuid(euid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if euid == usize::MAX || (euid == guard.euid.data() && euid == guard.fsuid.data()) {
+            return Ok(0);
+        }
+
+        if euid != usize::MAX {
+            guard.seteuid(euid);
+        }
+
+        let euid = guard.euid.data();
+        guard.setfsuid(euid);
+
+        return Ok(0);
+    }
+
+    pub fn setegid(egid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if egid == usize::MAX || (egid == guard.egid.data() && egid == guard.fsgid.data()) {
+            return Ok(0);
+        }
+
+        if egid != usize::MAX {
+            guard.setegid(egid);
+        }
+
+        let egid = guard.egid.data();
+        guard.setfsgid(egid);
+
+        return Ok(0);
+    }
+
+    pub fn setfsuid(fsuid: usize) -> Result<usize, SystemError> {
+        let fsuid = Kuid::new(fsuid);
+
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+        let old_fsuid = guard.fsuid;
+
+        if fsuid == guard.uid || fsuid == guard.euid || fsuid == guard.suid {
+            guard.setfsuid(fsuid.data());
+        }
+
+        Ok(old_fsuid.data())
+    }
+
+    pub fn setfsgid(fsgid: usize) -> Result<usize, SystemError> {
+        let fsgid = Kgid::new(fsgid);
+
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+        let old_fsgid = guard.fsgid;
+
+        if fsgid == guard.gid || fsgid == guard.egid || fsgid == guard.sgid {
+            guard.setfsgid(fsgid.data());
+        }
+
+        Ok(old_fsgid.data())
     }
 
     pub fn get_rusage(who: i32, rusage: *mut RUsage) -> Result<usize, SystemError> {
@@ -394,4 +556,58 @@ impl Syscall {
 
         return Ok(0);
     }
+}
+
+/// 切换用户虚拟内存空间
+///
+/// 该函数用于在执行系统调用 `execve` 时切换用户进程的虚拟内存空间。
+///
+/// # 参数
+/// - `new_vm`: 新的用户地址空间，类型为 `Arc<AddressSpace>`。
+///
+/// # 返回值
+/// - 返回旧的用户地址空间的引用，类型为 `Option<Arc<AddressSpace>>`。
+///
+/// # 错误处理
+/// 如果地址空间切换失败，函数会触发断言失败，并输出错误信息。
+fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
+    // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    let pcb = ProcessManager::current_pcb();
+    // log::debug!(
+    //     "pid: {:?}  do_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
+    //     pcb.pid(),
+    //     path,
+    //     argv,
+    //     envp
+    // );
+
+    let mut basic_info = pcb.basic_mut();
+    // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
+    let old_address_space = basic_info.user_vm();
+
+    // 在pcb中原来的用户地址空间
+    unsafe {
+        basic_info.set_user_vm(None);
+    }
+    // 创建新的地址空间并设置为当前地址空间
+    unsafe {
+        basic_info.set_user_vm(Some(new_vm.clone()));
+    }
+
+    // to avoid deadlock
+    drop(basic_info);
+
+    assert!(
+        AddressSpace::is_current(&new_vm),
+        "Failed to set address space"
+    );
+    // debug!("Switch to new address space");
+
+    // 切换到新的用户地址空间
+    unsafe { new_vm.read().user_mapper.utable.make_current() };
+
+    drop(irq_guard);
+
+    old_address_space
 }

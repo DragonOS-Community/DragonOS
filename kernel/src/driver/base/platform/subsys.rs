@@ -3,8 +3,11 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use intertrait::cast::CastArc;
+use log::error;
 
-use super::{platform_device::PlatformDevice, platform_driver::PlatformDriver};
+use super::{
+    platform_bus_device, platform_device::PlatformDevice, platform_driver::PlatformDriver,
+};
 use crate::{
     driver::{
         acpi::acpi_manager,
@@ -58,12 +61,12 @@ impl Bus for PlatformBus {
     fn probe(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let drv = device.driver().ok_or(SystemError::EINVAL)?;
         let pdrv = drv.cast::<dyn PlatformDriver>().map_err(|_|{
-            kerror!("PlatformBus::probe() failed: device.driver() is not a PlatformDriver. Device: '{:?}'", device.name());
+            error!("PlatformBus::probe() failed: device.driver() is not a PlatformDriver. Device: '{:?}'", device.name());
             SystemError::EINVAL
         })?;
 
         let pdev = device.clone().cast::<dyn PlatformDevice>().map_err(|_| {
-            kerror!(
+            error!(
                 "PlatformBus::probe() failed: device is not a PlatformDevice. Device: '{:?}'",
                 device.name()
             );
@@ -139,6 +142,11 @@ impl Bus for PlatformBus {
 
         // 尝试根据设备名称匹配
         return Ok(device.name().eq(&driver.name()));
+    }
+
+    fn root_device(&self) -> Option<Weak<dyn Device>> {
+        let root_device = platform_bus_device() as Arc<dyn Device>;
+        return Some(Arc::downgrade(&root_device));
     }
 }
 

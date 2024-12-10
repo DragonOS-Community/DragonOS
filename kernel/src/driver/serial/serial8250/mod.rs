@@ -8,30 +8,39 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::error;
 use system_error::SystemError;
 
 use crate::{
-    driver::base::{
-        class::Class,
-        device::{
-            bus::Bus, device_manager, device_number::DeviceNumber, driver::Driver, Device,
-            DeviceKObjType, DeviceState, DeviceType, IdTable,
+    driver::{
+        base::{
+            class::Class,
+            device::{
+                bus::Bus, device_manager, device_number::Major, driver::Driver, Device,
+                DeviceCommonData, DeviceKObjType, DeviceState, DeviceType, IdTable,
+            },
+            kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
+            kset::KSet,
+            platform::{
+                platform_device::{platform_device_manager, PlatformDevice},
+                platform_driver::{platform_driver_manager, PlatformDriver},
+            },
         },
-        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
-        kset::KSet,
-        platform::{
-            platform_device::{platform_device_manager, PlatformDevice},
-            platform_driver::{platform_driver_manager, PlatformDriver},
-        },
+        tty::tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType},
     },
     filesystem::kernfs::KernFSInode,
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use self::serial8250_pio::{send_to_serial8250_pio_com1, serial8250_pio_port_early_init};
+#[cfg(target_arch = "x86_64")]
+use self::serial8250_pio::{
+    send_to_default_serial8250_pio_port, serial8250_pio_port_early_init,
+    serial_8250_pio_register_tty_devices, Serial8250PIOTtyDriverInner,
+};
 
-use super::{uart_manager, UartDriver, UartPort};
+use super::{uart_manager, UartDriver, UartManager, UartPort, TTY_SERIAL_DEFAULT_TERMIOS};
 
+#[cfg(target_arch = "x86_64")]
 mod serial8250_pio;
 
 static mut SERIAL8250_ISA_DEVICES: Option<Arc<Serial8250ISADevices>> = None;
@@ -61,6 +70,8 @@ static mut INITIALIZED: bool = false;
 pub(super) struct Serial8250Manager;
 
 impl Serial8250Manager {
+    pub const TTY_SERIAL_MINOR_START: u32 = 64;
+
     /// 初始化串口设备（在内存管理初始化之前）
     pub fn early_init(&self) -> Result<(), SystemError> {
         // todo: riscv64: 串口设备初始化
@@ -94,6 +105,10 @@ impl Serial8250Manager {
         // todo: 把驱动注册到uart层、tty层
         uart_manager().register_driver(&(serial8250_isa_driver.clone() as Arc<dyn UartDriver>))?;
 
+        // 把驱动注册到platform总线
+        platform_driver_manager()
+            .register(serial8250_isa_driver.clone() as Arc<dyn PlatformDriver>)?;
+
         // 注册isa设备到platform总线
         platform_device_manager()
             .device_add(serial8250_isa_dev.clone() as Arc<dyn PlatformDevice>)
@@ -104,15 +119,40 @@ impl Serial8250Manager {
                 return e;
             })?;
 
-        // 把驱动注册到platform总线
-        platform_driver_manager()
-            .register(serial8250_isa_driver.clone() as Arc<dyn PlatformDriver>)?;
-
+        self.serial_tty_init()?;
         unsafe {
             INITIALIZED = true;
         }
 
         return Ok(());
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn serial_tty_init(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn serial_tty_init(&self) -> Result<(), SystemError> {
+        let serial8250_tty_driver = TtyDriver::new(
+            UartManager::NR_TTY_SERIAL_MAX,
+            "ttyS",
+            0,
+            Major::TTY_MAJOR,
+            Self::TTY_SERIAL_MINOR_START,
+            TtyDriverType::Serial,
+            *TTY_SERIAL_DEFAULT_TERMIOS,
+            Arc::new(Serial8250PIOTtyDriverInner::new()),
+            None,
+        );
+
+        TtyDriverManager::tty_register_driver(serial8250_tty_driver)?;
+        if let Err(e) = serial_8250_pio_register_tty_devices() {
+            if e != SystemError::ENODEV {
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// 把uart端口与uart driver、uart device绑定
@@ -123,6 +163,7 @@ impl Serial8250Manager {
         uart_driver: &Arc<Serial8250ISADriver>,
         devs: &Arc<Serial8250ISADevices>,
     ) {
+        #[cfg(target_arch = "x86_64")]
         self.bind_pio_ports(uart_driver, devs);
     }
 
@@ -140,6 +181,7 @@ impl Serial8250Manager {
 }
 
 /// 所有的8250串口设备都应该实现的trait
+#[allow(dead_code)]
 trait Serial8250Port: UartPort {
     fn device(&self) -> Option<Arc<Serial8250ISADevices>> {
         None
@@ -210,11 +252,11 @@ impl Device for Serial8250ISADevices {
         false
     }
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.read().bus.clone()
+        self.inner.read().device_common.bus.clone()
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.write().bus = bus;
+        self.inner.write().device_common.bus = bus;
     }
 
     fn dev_type(&self) -> DeviceType {
@@ -226,19 +268,19 @@ impl Device for Serial8250ISADevices {
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner.read().driver.clone()?.upgrade()
+        self.inner.read().device_common.driver.clone()?.upgrade()
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
-        self.inner.write().driver = driver;
+        self.inner.write().device_common.driver = driver;
     }
 
     fn can_match(&self) -> bool {
-        self.inner.read().can_match
+        self.inner.read().device_common.can_match
     }
 
     fn set_can_match(&self, can_match: bool) {
-        self.inner.write().can_match = can_match;
+        self.inner.write().device_common.can_match = can_match;
     }
 
     fn state_synced(&self) -> bool {
@@ -248,6 +290,14 @@ impl Device for Serial8250ISADevices {
     fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         todo!()
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner.read().device_common.parent.clone()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner.write().device_common.parent = dev_parent;
+    }
 }
 
 impl KObject for Serial8250ISADevices {
@@ -256,27 +306,27 @@ impl KObject for Serial8250ISADevices {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.write().inode = inode;
+        self.inner.write().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.read().inode.clone()
+        self.inner.read().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.read().parent_kobj.clone()
+        self.inner.read().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.write().parent_kobj = parent;
+        self.inner.write().kobject_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.read().kset.clone()
+        self.inner.read().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.write().kset = kset;
+        self.inner.write().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
@@ -308,27 +358,17 @@ impl KObject for Serial8250ISADevices {
 
 #[derive(Debug)]
 struct InnerSerial8250ISADevices {
-    /// 当前设备所述的kset
-    kset: Option<Arc<KSet>>,
-    parent_kobj: Option<Weak<dyn KObject>>,
-    /// 当前设备所述的总线
-    bus: Option<Weak<dyn Bus>>,
-    inode: Option<Arc<KernFSInode>>,
-    driver: Option<Weak<dyn Driver>>,
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
     device_state: DeviceState,
-    can_match: bool,
 }
 
 impl InnerSerial8250ISADevices {
     fn new() -> Self {
         Self {
-            kset: None,
-            parent_kobj: None,
-            bus: None,
-            inode: None,
-            driver: None,
+            kobject_common: KObjectCommonData::default(),
+            device_common: DeviceCommonData::default(),
             device_state: DeviceState::NotInitialized,
-            can_match: false,
         }
     }
 }
@@ -394,10 +434,6 @@ impl Serial8250ISADriver {
 }
 
 impl UartDriver for Serial8250ISADriver {
-    fn device_number(&self) -> DeviceNumber {
-        todo!()
-    }
-
     fn max_devs_num(&self) -> i32 {
         todo!()
     }
@@ -410,7 +446,7 @@ impl PlatformDriver for Serial8250ISADriver {
             .arc_any()
             .downcast::<Serial8250ISADevices>()
             .map_err(|_| {
-                kerror!("Serial8250ISADriver::probe: device is not a Serial8250ISADevices");
+                error!("Serial8250ISADriver::probe: device is not a Serial8250ISADevices");
                 SystemError::EINVAL
             })?;
         isa_dev.set_driver(Some(self.self_ref.clone()));
@@ -522,14 +558,10 @@ impl KObject for Serial8250ISADriver {
 /// 临时函数，用于向默认的串口发送数据
 pub fn send_to_default_serial8250_port(s: &[u8]) {
     #[cfg(target_arch = "x86_64")]
-    send_to_serial8250_pio_com1(s);
+    send_to_default_serial8250_pio_port(s);
 
     #[cfg(target_arch = "riscv64")]
     {
-        if unsafe { INITIALIZED } {
-            todo!("riscv64: send_to_default_serial8250_port")
-        } else {
-            crate::arch::driver::sbi::console_putstr(s);
-        }
+        crate::arch::driver::sbi::console_putstr(s);
     }
 }

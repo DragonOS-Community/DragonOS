@@ -1,3 +1,5 @@
+use log::{debug, warn};
+
 /// @Author: longjin@dragonos.org
 /// @Author: kongweichao@dragonos.org
 /// @Date: 2023-03-28 16:03:47
@@ -7,7 +9,7 @@ use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr};
-use crate::{kdebug, kwarn};
+
 use core::cmp::min;
 use core::fmt::Debug;
 use core::intrinsics::{likely, unlikely};
@@ -78,8 +80,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
         let initial_free_pages = bump_allocator.usage().free();
         let total_memory = bump_allocator.usage().total();
-        kdebug!("Free pages before init buddy: {:?}", initial_free_pages);
-        kdebug!("Buddy entries: {}", Self::BUDDY_ENTRIES);
+        debug!("Free pages before init buddy: {:?}", initial_free_pages);
+        debug!("Buddy entries: {}", Self::BUDDY_ENTRIES);
 
         let mut free_area: [PhysAddr; MAX_ORDER - MIN_ORDER] =
             [PhysAddr::new(0); MAX_ORDER - MIN_ORDER];
@@ -118,7 +120,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             if remain_pages.data() == 0 {
                 continue;
             }
-            kdebug!("area: {area:?}, paddr: {paddr:#x}, remain_pages: {remain_pages:?}");
+            debug!("area: {area:?}, paddr: {paddr:#x}, remain_pages: {remain_pages:?}");
 
             total_pages_to_buddy += remain_pages;
 
@@ -128,7 +130,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
             // 先从低阶开始，尽可能地填满空闲链表
             for i in MIN_ORDER..MAX_ORDER {
-                // kdebug!("i {i}, remain pages={}", remain_pages.data());
+                // debug!("i {i}, remain pages={}", remain_pages.data());
                 if remain_pages.data() < (1 << (i - MIN_ORDER)) {
                     break;
                 }
@@ -175,7 +177,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             assert!(remain_bytes == 0);
         }
 
-        kdebug!("Total pages to buddy: {:?}", total_pages_to_buddy);
+        debug!("Total pages to buddy: {:?}", total_pages_to_buddy);
         allocator.total = total_memory;
 
         Some(allocator)
@@ -238,7 +240,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 if !next_page_list_addr.is_null() {
                     // 此时page_list已经没有空闲伙伴块了，又因为非唯一页，需要删除该page_list
                     self.free_area[Self::order2index(spec_order)] = next_page_list_addr;
-                    // kdebug!("FREE: page_list_addr={:b}", page_list_addr.data());
+                    // debug!("FREE: page_list_addr={:b}", page_list_addr.data());
                     unsafe {
                         self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8);
                     }
@@ -273,7 +275,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                         page_list.entry_num - 1
                     );
                 }
-                // kdebug!("entry={entry:?}");
+                // debug!("entry={entry:?}");
 
                 // 更新page_list的entry_num
                 page_list.entry_num -= 1;
@@ -302,7 +304,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             return None;
         };
         let result: Option<PhysAddr> = alloc_in_specific_order(order);
-        // kdebug!("result={:?}", result);
+        // debug!("result={:?}", result);
         if result.is_some() {
             return result;
         }
@@ -312,14 +314,14 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         let mut x: Option<PhysAddr> = None;
         while current_order < MAX_ORDER {
             x = alloc_in_specific_order(current_order as u8);
-            // kdebug!("current_order={:?}", current_order);
+            // debug!("current_order={:?}", current_order);
             if x.is_some() {
                 break;
             }
             current_order += 1;
         }
 
-        // kdebug!("x={:?}", x);
+        // debug!("x={:?}", x);
         // 如果找到一个大的块，就进行分裂
         if x.is_some() {
             // 分裂到order阶
@@ -328,8 +330,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 // 把后面那半块放回空闲链表
 
                 let buddy = *x.as_ref().unwrap() + (1 << current_order);
-                // kdebug!("x={:?}, buddy={:?}", x, buddy);
-                // kdebug!("current_order={:?}, buddy={:?}", current_order, buddy);
+                // debug!("x={:?}, buddy={:?}", x, buddy);
+                // debug!("current_order={:?}, buddy={:?}", current_order, buddy);
                 unsafe { self.buddy_free(buddy, current_order as u8) };
             }
             return x;
@@ -359,10 +361,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             return None;
         }
 
-        // kdebug!("buddy_alloc: order = {}", order);
+        // debug!("buddy_alloc: order = {}", order);
         // 获取该阶数的一个空闲页面
         let free_addr = self.pop_front(order);
-        // kdebug!(
+        // debug!(
         //     "buddy_alloc: order = {}, free_addr = {:?}",
         //     order,
         //     free_addr
@@ -378,7 +380,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     /// - `base` - 块的起始地址
     /// - `order` - 块的阶数
     unsafe fn buddy_free(&mut self, mut base: PhysAddr, order: u8) {
-        // kdebug!("buddy_free: base = {:?}, order = {}", base, order);
+        // debug!("buddy_free: base = {:?}, order = {}", base, order);
         let mut order = order as usize;
 
         while order < MAX_ORDER {
@@ -557,7 +559,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     (first_page_list_paddr, first_page_list)
                 };
 
-                // kdebug!("to write entry, page_list_base={paddr:?}, page_list.entry_num={}, value={base:?}", page_list.entry_num);
+                // debug!("to write entry, page_list_base={paddr:?}, page_list.entry_num={}, value={base:?}", page_list.entry_num);
                 assert!(page_list.entry_num < Self::BUDDY_ENTRIES);
                 // 把要归还的块，写入到链表项中
                 unsafe { A::write(Self::entry_virt_addr(paddr, page_list.entry_num), base) }
@@ -591,14 +593,14 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
     unsafe fn free(&mut self, base: PhysAddr, count: PageFrameCount) {
         // 要求count是2的幂
         if unlikely(!count.data().is_power_of_two()) {
-            kwarn!("buddy free: count is not power of two");
+            warn!("buddy free: count is not power of two");
         }
         let mut order = log2(count.data());
         if count.data() & ((1 << order) - 1) != 0 {
             order += 1;
         }
         let order = (order + MIN_ORDER) as u8;
-        // kdebug!("free: base={:?}, count={:?}", base, count);
+        // debug!("free: base={:?}, count={:?}", base, count);
         self.buddy_free(base, order);
     }
 

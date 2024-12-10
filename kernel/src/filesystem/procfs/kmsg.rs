@@ -8,6 +8,7 @@ use alloc::{borrow::ToOwned, string::ToString, vec::Vec};
 
 use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
 
+use log::info;
 use system_error::SystemError;
 
 /// 缓冲区容量
@@ -18,13 +19,13 @@ pub static mut KMSG: Option<SpinLock<Kmsg>> = None;
 
 /// 初始化KMSG
 pub fn kmsg_init() {
-    kinfo!("kmsg_init");
+    info!("kmsg_init");
     let kmsg = SpinLock::new(Kmsg::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { KMSG = Some(kmsg) };
     compiler_fence(Ordering::SeqCst);
-    kinfo!("kmsg_init done");
+    info!("kmsg_init done");
 }
 
 /// 日志

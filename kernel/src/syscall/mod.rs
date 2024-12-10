@@ -1,16 +1,14 @@
 use core::{
     ffi::{c_int, c_void},
-    ptr::null,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
-    mm::syscall::MremapFlags,
+    mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
@@ -21,6 +19,7 @@ use crate::{
     syscall::user_access::check_and_clone_cstr,
 };
 
+use log::{info, warn};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
@@ -29,11 +28,9 @@ use crate::{
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
-        syscall::{ModeType, PosixKstat},
+        syscall::{ModeType, PosixKstat, UtimensFlags},
         MAX_PATHLEN,
     },
-    include::bindings::bindings::PAGE_4K_SIZE,
-    kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
@@ -71,11 +68,25 @@ impl Syscall {
         if prev {
             panic!("Cannot initialize syscall more than once!");
         }
-        kinfo!("Initializing syscall...");
+        info!("Initializing syscall...");
         let r = crate::arch::syscall::arch_syscall_init();
-        kinfo!("Syscall init successfully!");
+        info!("Syscall init successfully!");
 
         return r;
+    }
+    /// 系统调用分发器，用于分发系统调用。
+    ///
+    /// 与[handle]不同，这个函数会捕获系统调用处理函数的panic，返回错误码。
+    #[cfg(feature = "backtrace")]
+    pub fn catch_handle(
+        syscall_num: usize,
+        args: &[usize],
+        frame: &mut TrapFrame,
+    ) -> Result<usize, SystemError> {
+        let res = unwinding::panic::catch_unwind(|| Self::handle(syscall_num, args, frame));
+        res.unwrap_or_else(|_| loop {
+            core::hint::spin_loop();
+        })
     }
     /// @brief 系统调用分发器，用于分发系统调用。
     ///
@@ -261,8 +272,8 @@ impl Syscall {
                 // 权限校验
                 if frame.is_from_user()
                     && (verify_area(virt_path_ptr, MAX_PATHLEN).is_err()
-                        || verify_area(virt_argv_ptr, PAGE_4K_SIZE as usize).is_err())
-                    || verify_area(virt_env_ptr, PAGE_4K_SIZE as usize).is_err()
+                        || verify_area(virt_argv_ptr, PAGE_4K_SIZE).is_err())
+                    || verify_area(virt_env_ptr, PAGE_4K_SIZE).is_err()
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -295,6 +306,13 @@ impl Syscall {
                 let mode = args[1];
 
                 Self::mkdir(path, mode)
+            }
+
+            SYS_MKDIRAT => {
+                let dirfd = args[0] as i32;
+                let path = args[1] as *const u8;
+                let mode = args[2];
+                Self::mkdir_at(dirfd, path, mode)
             }
 
             SYS_NANOSLEEP => {
@@ -342,6 +360,20 @@ impl Syscall {
             }
 
             #[cfg(target_arch = "x86_64")]
+            SYS_SYMLINK => {
+                let oldname = args[0] as *const u8;
+                let newname = args[1] as *const u8;
+                Self::symlink(oldname, newname)
+            }
+
+            SYS_SYMLINKAT => {
+                let oldname = args[0] as *const u8;
+                let newdfd = args[1] as i32;
+                let newname = args[2] as *const u8;
+                Self::symlinkat(oldname, newdfd, newname)
+            }
+
+            #[cfg(target_arch = "x86_64")]
             SYS_RMDIR => {
                 let path = args[0] as *const u8;
                 Self::rmdir(path)
@@ -371,7 +403,7 @@ impl Syscall {
             SYS_KILL => {
                 let pid = Pid::new(args[0]);
                 let sig = args[1] as c_int;
-                // kdebug!("KILL SYSCALL RECEIVED");
+                // debug!("KILL SYSCALL RECEIVED");
                 Self::kill(pid, sig)
             }
 
@@ -385,7 +417,7 @@ impl Syscall {
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
             SYS_SCHED => {
-                kwarn!("syscall sched");
+                warn!("syscall sched");
                 schedule(SchedMode::SM_NONE);
                 Ok(0)
             }
@@ -399,6 +431,13 @@ impl Syscall {
                 let oldfd: i32 = args[0] as c_int;
                 let newfd: i32 = args[1] as c_int;
                 Self::dup2(oldfd, newfd)
+            }
+
+            SYS_DUP3 => {
+                let oldfd: i32 = args[0] as c_int;
+                let newfd: i32 = args[1] as c_int;
+                let flags: u32 = args[2] as u32;
+                Self::dup3(oldfd, newfd, flags)
             }
 
             SYS_SOCKET => Self::socket(args[0], args[1], args[2]),
@@ -422,7 +461,7 @@ impl Syscall {
                 let virt_optlen = VirtAddr::new(optlen as usize);
                 let security_check = || {
                     // 验证optval的地址是否合法
-                    if verify_area(virt_optval, PAGE_4K_SIZE as usize).is_err() {
+                    if verify_area(virt_optval, PAGE_4K_SIZE).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
@@ -645,7 +684,7 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 };
 
-                // kdebug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
+                // debug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
                 res
             }
 
@@ -653,7 +692,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let len = args[1];
                 let res = Self::ftruncate(fd, len);
-                // kdebug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
+                // debug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
             }
 
@@ -663,7 +702,11 @@ impl Syscall {
                 let flags = args[1];
                 let dev_t = args[2];
                 let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-                Self::mknod(path as *const u8, flags, DeviceNumber::from(dev_t as u32))
+                Self::mknod(
+                    path as *const u8,
+                    flags,
+                    crate::driver::base::device::device_number::DeviceNumber::from(dev_t as u32),
+                )
             }
 
             SYS_CLONE => {
@@ -826,42 +869,49 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_POLL => {
-                kwarn!("SYS_POLL has not yet been implemented");
+                warn!("SYS_POLL has not yet been implemented");
                 Ok(0)
             }
 
             SYS_SETPGID => {
-                kwarn!("SYS_SETPGID has not yet been implemented");
+                warn!("SYS_SETPGID has not yet been implemented");
                 Ok(0)
             }
 
             SYS_RT_SIGPROCMASK => {
-                kwarn!("SYS_RT_SIGPROCMASK has not yet been implemented");
-                Ok(0)
+                let how = args[0] as i32;
+                let nset = args[1];
+                let oset = args[2];
+                let sigsetsize = args[3];
+                Self::rt_sigprocmask(how, nset, oset, sigsetsize)
             }
 
             SYS_TKILL => {
-                kwarn!("SYS_TKILL has not yet been implemented");
+                warn!("SYS_TKILL has not yet been implemented");
                 Ok(0)
             }
 
             SYS_SIGALTSTACK => {
-                kwarn!("SYS_SIGALTSTACK has not yet been implemented");
+                warn!("SYS_SIGALTSTACK has not yet been implemented");
                 Ok(0)
             }
 
             SYS_EXIT_GROUP => {
-                kwarn!("SYS_EXIT_GROUP has not yet been implemented");
+                warn!("SYS_EXIT_GROUP has not yet been implemented");
                 Ok(0)
             }
 
             SYS_MADVISE => {
-                // 这个太吵了，总是打印，先注释掉
-                // kwarn!("SYS_MADVISE has not yet been implemented");
-                Ok(0)
+                let addr = args[0];
+                let len = page_align_up(args[1]);
+                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::madvise(VirtAddr::new(addr), len, args[2])
+                }
             }
+
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
-            SYS_GETUID => Self::getuid(),
 
             SYS_SYSLOG => {
                 let syslog_action_type = args[0];
@@ -875,27 +925,29 @@ impl Syscall {
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
+            SYS_GETUID => Self::getuid(),
             SYS_GETGID => Self::getgid(),
-            SYS_SETUID => {
-                kwarn!("SYS_SETUID has not yet been implemented");
-                Ok(0)
-            }
-            SYS_SETGID => {
-                kwarn!("SYS_SETGID has not yet been implemented");
-                Ok(0)
-            }
-            SYS_SETSID => {
-                kwarn!("SYS_SETSID has not yet been implemented");
-                Ok(0)
-            }
+            SYS_SETUID => Self::setuid(args[0]),
+            SYS_SETGID => Self::setgid(args[0]),
+
             SYS_GETEUID => Self::geteuid(),
             SYS_GETEGID => Self::getegid(),
+            SYS_SETRESUID => Self::seteuid(args[1]),
+            SYS_SETRESGID => Self::setegid(args[1]),
+
+            SYS_SETFSUID => Self::setfsuid(args[0]),
+            SYS_SETFSGID => Self::setfsgid(args[0]),
+
+            SYS_SETSID => {
+                warn!("SYS_SETSID has not yet been implemented");
+                Ok(0)
+            }
+
             SYS_GETRUSAGE => {
                 let who = args[0] as c_int;
                 let rusage = args[1] as *mut RUsage;
                 Self::get_rusage(who, rusage)
             }
-
             #[cfg(target_arch = "x86_64")]
             SYS_READLINK => {
                 let path = args[0] as *const u8;
@@ -961,17 +1013,41 @@ impl Syscall {
             }
 
             SYS_FCHOWN => {
-                kwarn!("SYS_FCHOWN has not yet been implemented");
-                Ok(0)
+                let dirfd = args[0] as i32;
+                let uid = args[1];
+                let gid = args[2];
+                Self::fchown(dirfd, uid, gid)
+            }
+            #[cfg(target_arch = "x86_64")]
+            SYS_CHOWN => {
+                let pathname = args[0] as *const u8;
+                let uid = args[1];
+                let gid = args[2];
+                Self::chown(pathname, uid, gid)
+            }
+            #[cfg(target_arch = "x86_64")]
+            SYS_LCHOWN => {
+                let pathname = args[0] as *const u8;
+                let uid = args[1];
+                let gid = args[2];
+                Self::lchown(pathname, uid, gid)
+            }
+            SYS_FCHOWNAT => {
+                let dirfd = args[0] as i32;
+                let pathname = args[1] as *const u8;
+                let uid = args[2];
+                let gid = args[3];
+                let flag = args[4] as i32;
+                Self::fchownat(dirfd, pathname, uid, gid, flag)
             }
 
             SYS_FSYNC => {
-                kwarn!("SYS_FSYNC has not yet been implemented");
+                warn!("SYS_FSYNC has not yet been implemented");
                 Ok(0)
             }
 
             SYS_RSEQ => {
-                kwarn!("SYS_RSEQ has not yet been implemented");
+                warn!("SYS_RSEQ has not yet been implemented");
                 Ok(0)
             }
 
@@ -992,6 +1068,8 @@ impl Syscall {
                 let mode = args[2] as u32;
                 Self::fchmodat(dirfd, pathname, mode)
             }
+
+            SYS_SCHED_YIELD => Self::do_sched_yield(),
 
             SYS_SCHED_GETAFFINITY => {
                 let pid = args[0] as i32;
@@ -1028,8 +1106,18 @@ impl Syscall {
                 let source = args[0] as *const u8;
                 let target = args[1] as *const u8;
                 let filesystemtype = args[2] as *const u8;
-                return Self::mount(source, target, filesystemtype, 0, null());
+                let mountflags = args[3];
+                let data = args[4] as *const u8; // 额外的mount参数，实现自己的mountdata来获取
+                return Self::mount(source, target, filesystemtype, mountflags, data);
             }
+
+            SYS_UMOUNT2 => {
+                let target = args[0] as *const u8;
+                let flags = args[1] as i32;
+                Self::umount2(target, flags)?;
+                return Ok(0);
+            }
+
             SYS_NEWFSTATAT => {
                 // todo: 这个系统调用还没有实现
 
@@ -1040,6 +1128,17 @@ impl Syscall {
             SYS_UNAME => {
                 let name = args[0] as *mut PosixOldUtsName;
                 Self::uname(name)
+            }
+            SYS_PRCTL => {
+                // todo: 这个系统调用还没有实现
+
+                Err(SystemError::EINVAL)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            SYS_ALARM => {
+                let second = args[0] as u32;
+                Self::alarm(second)
             }
 
             SYS_SHMGET => {
@@ -1068,7 +1167,56 @@ impl Syscall {
 
                 Self::shmctl(id, cmd, user_buf, from_user)
             }
-
+            SYS_MSYNC => {
+                let start = page_align_up(args[0]);
+                let len = page_align_up(args[1]);
+                let flags = args[2];
+                Self::msync(VirtAddr::new(start), len, flags)
+            }
+            SYS_UTIMENSAT => Self::sys_utimensat(
+                args[0] as i32,
+                args[1] as *const u8,
+                args[2] as *const PosixTimeSpec,
+                args[3] as u32,
+            ),
+            #[cfg(target_arch = "x86_64")]
+            SYS_FUTIMESAT => {
+                let flags = UtimensFlags::empty();
+                Self::sys_utimensat(
+                    args[0] as i32,
+                    args[1] as *const u8,
+                    args[2] as *const PosixTimeSpec,
+                    flags.bits(),
+                )
+            }
+            #[cfg(target_arch = "x86_64")]
+            SYS_UTIMES => Self::sys_utimes(args[0] as *const u8, args[1] as *const PosixTimeval),
+            #[cfg(target_arch = "x86_64")]
+            SYS_EVENTFD => {
+                let initval = args[0] as u32;
+                Self::sys_eventfd(initval, 0)
+            }
+            SYS_EVENTFD2 => {
+                let initval = args[0] as u32;
+                let flags = args[1] as u32;
+                Self::sys_eventfd(initval, flags)
+            }
+            SYS_UNSHARE => Self::sys_unshare(args[0] as u64),
+            SYS_BPF => {
+                let cmd = args[0] as u32;
+                let attr = args[1] as *mut u8;
+                let size = args[2] as u32;
+                Self::sys_bpf(cmd, attr, size)
+            }
+            SYS_PERF_EVENT_OPEN => {
+                let attr = args[0] as *const u8;
+                let pid = args[1] as i32;
+                let cpu = args[2] as i32;
+                let group_fd = args[3] as i32;
+                let flags = args[4] as u32;
+                Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
+            }
+            SYS_SETRLIMIT => Ok(0),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 
@@ -1088,7 +1236,9 @@ impl Syscall {
         back_color: u32,
     ) -> Result<usize, SystemError> {
         // todo: 删除这个系统调用
-        let s = check_and_clone_cstr(s, Some(4096))?;
+        let s = check_and_clone_cstr(s, Some(4096))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         let fr = (front_color & 0x00ff0000) >> 16;
         let fg = (front_color & 0x0000ff00) >> 8;
         let fb = front_color & 0x000000ff;

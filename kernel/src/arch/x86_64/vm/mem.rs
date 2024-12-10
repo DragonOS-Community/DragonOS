@@ -1,12 +1,10 @@
 use alloc::sync::Arc;
+use log::warn;
 use system_error::SystemError;
 
-use crate::{
-    kwarn,
-    virt::vm::kvm_host::{
-        mem::{KvmMemoryChangeMode, LockedKvmMemSlot},
-        Vm,
-    },
+use crate::virt::vm::kvm_host::{
+    mem::{KvmMemoryChangeMode, LockedKvmMemSlot},
+    Vm,
 };
 
 #[allow(dead_code)]
@@ -20,7 +18,7 @@ impl Vm {
         _change: KvmMemoryChangeMode,
     ) -> Result<(), SystemError> {
         // todo
-        kwarn!("arch_prepare_memory_region TODO");
+        warn!("arch_prepare_memory_region TODO");
         Ok(())
     }
 }

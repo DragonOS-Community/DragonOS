@@ -48,10 +48,16 @@ qemu_trace_usb=trace:usb_xhci_reset,trace:usb_xhci_run,trace:usb_xhci_stop,trace
 
 # 根据架构设置qemu的加速方式
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
-    qemu_accel="kvm"
-    if [ $(uname) == Darwin ]; then
-        qemu_accel=hvf  
+  qemu_accel="kvm"
+  if [ $(uname) == Darwin ]; then
+    qemu_accel=hvf
+  else
+    # 判断系统kvm模块是否加载
+    if [ ! -e /dev/kvm ]; then
+      # kvm模块未加载，使用tcg加速
+      qemu_accel="tcg"
     fi
+  fi
 fi
 
 # uboot版本
@@ -59,7 +65,7 @@ UBOOT_VERSION="v2023.10"
 RISCV64_UBOOT_PATH="arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
 
 
-DISK_NAME="disk-${ARCH}.img"
+DISK_NAME="disk-image-${ARCH}.img"
 
 QEMU=qemu-system-${ARCH}
 QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
@@ -76,18 +82,32 @@ QEMU_SERIAL="-serial file:../serial_opt.txt"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
 QEMU_ARGUMENT=""
-
+QEMU_DEVICES=""
+BIOS_TYPE=""
+#这个变量为true则使用virtio磁盘
+VIRTIO_BLK_DEVICE=false
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
-    QEMU_ACCELARATE="-machine accel=${qemu_accel} -enable-kvm "
+    QEMU_ACCELARATE=" -machine accel=${qemu_accel} "
+  if [ "${qemu_accel}" == "kvm" ]; then
+    QEMU_ACCELARATE+=" -enable-kvm "
+  fi
 fi
 
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     QEMU_MACHINE=" -machine q35,memory-backend=${QEMU_MEMORY_BACKEND} "
     QEMU_CPU_FEATURES+="-cpu IvyBridge,apic,x2apic,+fpu,check,+vmx,${allflags}"
     QEMU_RTC_CLOCK+=" -rtc clock=host,base=localtime"
+    if [ ${VIRTIO_BLK_DEVICE} == false ]; then
+      QEMU_DEVICES_DISK+="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 "
+    else
+      QEMU_DEVICES_DISK="-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
+    fi
+
 else
     QEMU_MACHINE=" -machine virt,memory-backend=${QEMU_MEMORY_BACKEND} -cpu sifive-u54 "
+    QEMU_DEVICES_DISK="-device virtio-blk-device,drive=disk "
+
 fi
 
 if [ ${ARCH} == "riscv64" ]; then
@@ -98,10 +118,41 @@ if [ ${ARCH} == "riscv64" ]; then
     QEMU_SERIAL=""
 fi
 
+while true;do
+    case "$1" in
+        --bios) 
+        case "$2" in
+              uefi) #uefi启动新增ovmf.fd固件
+              BIOS_TYPE=uefi
+            ;;
+              legacy)
+              BIOS_TYPE=legacy
+              ;;
+        esac;shift 2;;
+        --display)
+        case "$2" in
+              vnc)
+              QEMU_ARGUMENT+=" -display vnc=:00 "
+              ;;
+              window)
+              ;;
+              nographic)
+              QEMU_SERIAL=" -serial mon:stdio "
+              QEMU_MONITOR=""
+              QEMU_ARGUMENT+=" --nographic "
+              QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+
+              ;;
+        esac;shift 2;;
+        *) break
+      esac 
+  done
+
 
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 "
-QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
+QEMU_DEVICES+="${QEMU_DEVICES_DISK} "
+QEMU_DEVICES+=" -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 # E1000E
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 QEMU_ARGUMENT+="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d ${QEMU_MONITOR} -d ${qemu_trace_std} "
@@ -137,28 +188,7 @@ install_riscv_uboot()
 
 
 if [ $flag_can_run -eq 1 ]; then
-  while true;do
-    case "$1" in
-        --bios) 
-        case "$2" in
-              uefi) #uefi启动新增ovmf.fd固件
-              BIOS_TYPE=uefi
-            ;;
-              legacy)
-              BIOS_TYPE=legacy
-              ;;
-        esac;shift 2;;
-        --display)
-        case "$2" in
-              vnc)
-              QEMU_ARGUMENT+=" -display vnc=:00"
-              ;;
-              window)
-              ;;
-        esac;shift 2;;
-        *) break
-      esac 
-  done 
+   
 
 # 删除共享内存
 sudo rm -rf ${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND}

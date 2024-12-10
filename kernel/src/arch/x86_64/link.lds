@@ -9,20 +9,24 @@ SECTIONS
 	//KERNEL_VMA = 0;
 	. = 0;
 	. = 0x100000;
-	
+	_default_kernel_load_base = .;
 	.boot.text :
 	{
 		KEEP(*(.multiboot_header))
+		KEEP(*(.multiboot2_header))
+		
 		*(.bootstrap)
 		*(.bootstrap.code64)
 		*(.bootstrap.data)
+		
 		. = ALIGN(4096);
 	}
 
-	. = 0x1000000;
-	. += KERNEL_VMA;
+
 	. = ALIGN(32768);
+	. += KERNEL_VMA;
 	text_start_pa = .;
+	__executable_start = .;
 	.text (text_start_pa): AT(text_start_pa - KERNEL_VMA)
 	{
 		_text = .;
@@ -34,6 +38,7 @@ SECTIONS
 		*(.text.*)
 
 		_etext = .;
+		__etext = .;
 	}
 	. = ALIGN(32768);
 	data_start_pa = .;
@@ -54,6 +59,9 @@ SECTIONS
 		_rodata = .;	
 		*(.rodata)
 		*(.rodata.*)
+		*(.note.gnu.*)
+		*(.fixup)
+		*(.gcc_except_table .gcc_except_table.*)
 		_erodata = .;
 	}
 

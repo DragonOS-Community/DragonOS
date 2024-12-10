@@ -402,7 +402,7 @@ int kvm(uint8_t code[], size_t code_len)
   int vmfd = ioctl(kvmfd, KVM_CREATE_VM, 0);
   printf("vmfd %d\n", vmfd);
   // step 3, set up user memory region
-  size_t mem_size = 0x10000; // size of user memory you want to assign
+  size_t mem_size = 0x100000; // size of user memory you want to assign
   void *mem = mmap(0, mem_size, PROT_READ | PROT_WRITE,
                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 

@@ -25,6 +25,7 @@ use alloc::{
 use core::{ffi::CStr, fmt::Debug, intrinsics::unlikely};
 use hashbrown::HashMap;
 use intertrait::cast::CastArc;
+use log::{debug, error, info};
 use system_error::SystemError;
 
 /// `/sys/bus`的kset
@@ -134,9 +135,9 @@ pub trait Bus: Debug + Send + Sync {
     ///
     /// ## 默认实现
     ///
-    /// 如果总线不支持该操作，返回`SystemError::EOPNOTSUPP_OR_ENOTSUP`
+    /// 如果总线不支持该操作，返回`SystemError::ENOSYS`
     fn probe(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError>;
     fn sync_state(&self, _device: &Arc<dyn Device>) {}
@@ -147,12 +148,12 @@ pub trait Bus: Debug + Send + Sync {
 
     fn resume(&self, device: &Arc<dyn Device>) -> Result<(), SystemError>;
 
-    /// match platform device to platform driver.
+    /// match device to driver.
     ///
     /// ## 参数
     ///
-    /// * `device` - platform device
-    /// * `driver` - platform driver
+    /// * `device` - device
+    /// * `driver` - driver
     ///
     /// ## 返回
     ///
@@ -296,11 +297,16 @@ impl BusManager {
             .bus()
             .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
-        kdebug!("bus '{}' add driver '{}'", bus.name(), driver.name());
+        debug!("bus '{}' add driver '{}'", bus.name(), driver.name());
 
-        driver.set_kobj_type(Some(&BusDriverKType));
+        // driver.set_kobj_type(Some(&BusDriverKType));
         let kobj = driver.clone() as Arc<dyn KObject>;
-        KObjectManager::add_kobj(kobj, bus.subsystem().drivers_kset())?;
+        // KObjectManager::add_kobj(kobj, bus.subsystem().drivers_kset())?;
+        KObjectManager::init_and_add_kobj(
+            kobj,
+            bus.subsystem().drivers_kset(),
+            Some(&BusDriverKType),
+        )?;
 
         bus.subsystem().add_driver_to_vec(driver)?;
         if bus.subsystem().drivers_autoprobe() {
@@ -314,7 +320,7 @@ impl BusManager {
         driver_manager()
             .add_groups(driver, bus.drv_groups())
             .map_err(|e| {
-                kerror!(
+                error!(
                     "BusManager::add_driver: driver '{:?}' add_groups failed, err: '{:?}",
                     driver.name(),
                     e
@@ -326,7 +332,7 @@ impl BusManager {
         if !driver.suppress_bind_attrs() {
             self.add_bind_files(driver)
                 .map_err(|e| {
-                    kerror!(
+                    error!(
                         "BusManager::add_driver: driver '{:?}' add_bind_files failed, err: '{:?}",
                         driver.name(),
                         e
@@ -450,6 +456,7 @@ impl BusManager {
         }
         let bus = bus.unwrap();
         if bus.subsystem().drivers_autoprobe() {
+            log::info!("MT bus '{}' autoprobe driver", bus.name());
             device_manager().device_initial_probe(dev).ok();
         }
         for interface in bus.subsystem().interfaces() {
@@ -477,9 +484,8 @@ impl BusManager {
 
         driver_manager()
             .create_attr_file(driver, &DriverAttrBind)
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 driver_manager().remove_attr_file(driver, &DriverAttrUnbind);
-                e
             })?;
 
         return Ok(());
@@ -580,7 +586,7 @@ pub fn bus_add_device(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
 ///
 /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_probe_device#478
 pub fn bus_probe_device(dev: &Arc<dyn Device>) {
-    kinfo!("bus_probe_device: dev: {:?}", dev.name());
+    info!("bus_probe_device: dev: {:?}", dev.name());
     bus_manager().probe_device(dev);
 }
 
@@ -746,11 +752,11 @@ impl Attribute for DriverAttrUnbind {
 
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
         let driver = kobj.cast::<dyn Driver>().map_err(|kobj| {
-            kerror!(
+            error!(
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let bus = driver
@@ -795,11 +801,11 @@ impl Attribute for DriverAttrBind {
      */
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
         let driver = kobj.cast::<dyn Driver>().map_err(|kobj| {
-            kerror!(
+            error!(
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let bus = driver

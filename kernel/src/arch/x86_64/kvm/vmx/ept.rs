@@ -1,7 +1,7 @@
 use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::mm::PageMapper;
 use crate::arch::MMArch;
-use crate::mm::page::PageFlags;
+use crate::mm::page::EntryFlags;
 use crate::mm::{PageTableKind, PhysAddr, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::AtomicProcessorId;
@@ -15,7 +15,7 @@ pub fn check_ept_features() -> Result<(), SystemError> {
     const MTRR_ENABLE_BIT: u64 = 1 << 11;
     let ia32_mtrr_def_type = unsafe { msr::rdmsr(msr::IA32_MTRR_DEF_TYPE) };
     if (ia32_mtrr_def_type & MTRR_ENABLE_BIT) == 0 {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     Ok(())
 }
@@ -92,7 +92,7 @@ impl EptMapper {
         &mut self,
         gpa: u64,
         hpa: u64,
-        flags: PageFlags<MMArch>,
+        flags: EntryFlags<MMArch>,
     ) -> Result<(), SystemError> {
         if self.readonly {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);

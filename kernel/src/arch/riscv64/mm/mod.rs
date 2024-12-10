@@ -1,4 +1,3 @@
-use acpi::address;
 use riscv::register::satp;
 use sbi_rt::{HartMask, SbiRet};
 use system_error::SystemError;
@@ -6,7 +5,6 @@ use system_error::SystemError;
 use crate::{
     arch::MMArch,
     driver::open_firmware::fdt::open_firmware_fdt_driver,
-    kdebug,
     libs::spinlock::SpinLock,
     mm::{
         allocator::{
@@ -14,14 +12,14 @@ use crate::{
             page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
         },
         kernel_mapper::KernelMapper,
-        page::{PageEntry, PageFlags, PAGE_1G_SHIFT},
+        page::{EntryFlags, PageEntry, PAGE_1G_SHIFT},
         ucontext::UserMapper,
-        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
+        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags,
     },
     smp::cpu::ProcessorId,
 };
 
-use self::init::riscv_mm_init;
+use self::init::{riscv_mm_init, INITIAL_PGTABLE_VALUE};
 
 pub mod bump;
 pub(super) mod init;
@@ -44,9 +42,8 @@ pub(self) static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = Spi
 pub struct RiscV64MMArch;
 
 impl RiscV64MMArch {
-    pub const ENTRY_FLAG_GLOBAL: usize = 1 << 5;
-
     /// 使远程cpu的TLB中，指定地址范围的页失效
+    #[allow(dead_code)]
     pub fn remote_invalidate_page(
         cpu: ProcessorId,
         address: VirtAddr,
@@ -61,6 +58,7 @@ impl RiscV64MMArch {
     }
 
     /// 使指定远程cpu的TLB中，所有范围的页失效
+    #[allow(dead_code)]
     pub fn remote_invalidate_all(cpu: ProcessorId) -> Result<(), SbiRet> {
         let r = Self::remote_invalidate_page(
             cpu,
@@ -87,6 +85,9 @@ const KERNEL_TOP_PAGE_ENTRY_NO: usize = (RiscV64MMArch::PHYS_OFFSET
     >> (RiscV64MMArch::ENTRY_ADDRESS_SHIFT - RiscV64MMArch::PAGE_ENTRY_SHIFT);
 
 impl MemoryManagementArch for RiscV64MMArch {
+    /// riscv64暂不支持缺页中断
+    const PAGE_FAULT_ENABLED: bool = false;
+
     const PAGE_SHIFT: usize = 12;
 
     const PAGE_ENTRY_SHIFT: usize = 9;
@@ -106,12 +107,14 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const ENTRY_FLAG_PRESENT: usize = 1 << 0;
 
-    const ENTRY_FLAG_READONLY: usize = 0;
+    const ENTRY_FLAG_READONLY: usize = (1 << 1);
+
+    const ENTRY_FLAG_WRITEABLE: usize = (1 << 2);
 
     const ENTRY_FLAG_READWRITE: usize = (1 << 2) | (1 << 1);
 
     const ENTRY_FLAG_USER: usize = (1 << 4);
-
+    const ENTRY_ADDRESS_MASK: usize = Self::ENTRY_ADDRESS_SIZE - (1 << 10);
     const ENTRY_FLAG_WRITE_THROUGH: usize = (2 << 61);
 
     const ENTRY_FLAG_CACHE_DISABLE: usize = (2 << 61);
@@ -121,6 +124,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     const ENTRY_FLAG_EXEC: usize = (1 << 3);
     const ENTRY_FLAG_ACCESSED: usize = (1 << 6);
     const ENTRY_FLAG_DIRTY: usize = (1 << 7);
+    const ENTRY_FLAG_GLOBAL: usize = (1 << 5);
 
     const PHYS_OFFSET: usize = 0xffff_ffc0_0000_0000;
     const KERNEL_LINK_OFFSET: usize = 0x1000000;
@@ -140,6 +144,8 @@ impl MemoryManagementArch for RiscV64MMArch {
     const MMIO_BASE: VirtAddr = VirtAddr::new(0xffff_ffff_8000_0000);
     /// 设置1g的MMIO空间
     const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
+
+    const ENTRY_FLAG_HUGE_PAGE: usize = Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_READWRITE;
 
     #[inline(never)]
     unsafe fn init() {
@@ -181,7 +187,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     }
 
     fn initial_page_table() -> PhysAddr {
-        todo!()
+        unsafe { INITIAL_PGTABLE_VALUE }
     }
 
     fn setup_new_usermapper() -> Result<UserMapper, SystemError> {
@@ -241,7 +247,82 @@ impl MemoryManagementArch for RiscV64MMArch {
         let r = ((ppn & ((1 << 54) - 1)) << 10) | page_flags;
         return r;
     }
+
+    fn vma_access_permitted(
+        _vma: alloc::sync::Arc<crate::mm::ucontext::LockedVMA>,
+        _write: bool,
+        _execute: bool,
+        _foreign: bool,
+    ) -> bool {
+        true
+    }
+
+    const PAGE_NONE: usize = Self::ENTRY_FLAG_GLOBAL | Self::ENTRY_FLAG_READONLY;
+
+    const PAGE_READ: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY;
+
+    const PAGE_WRITE: usize =
+        PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_WRITEABLE;
+
+    const PAGE_EXEC: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_EXEC;
+
+    const PAGE_READ_EXEC: usize =
+        PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_EXEC;
+
+    const PAGE_WRITE_EXEC: usize = PAGE_ENTRY_BASE
+        | Self::ENTRY_FLAG_READONLY
+        | Self::ENTRY_FLAG_EXEC
+        | Self::ENTRY_FLAG_WRITEABLE;
+
+    const PAGE_COPY: usize = Self::PAGE_READ;
+    const PAGE_COPY_EXEC: usize = Self::PAGE_READ_EXEC;
+    const PAGE_SHARED: usize = Self::PAGE_WRITE;
+    const PAGE_SHARED_EXEC: usize = Self::PAGE_WRITE_EXEC;
+
+    const PAGE_COPY_NOEXEC: usize = 0;
+    const PAGE_READONLY: usize = 0;
+    const PAGE_READONLY_EXEC: usize = 0;
+
+    const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 }
+
+const fn protection_map() -> [EntryFlags<MMArch>; 16] {
+    let mut map = [0; 16];
+    map[VmFlags::VM_NONE.bits()] = MMArch::PAGE_NONE;
+    map[VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
+    map[VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY;
+    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_COPY;
+    map[VmFlags::VM_EXEC.bits()] = MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+        MMArch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_SHARED.bits()] = MMArch::PAGE_NONE;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_SHARED;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+        MMArch::PAGE_SHARED;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits()] = MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
+        MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
+        MMArch::PAGE_SHARED_EXEC;
+    map[VmFlags::VM_SHARED.bits()
+        | VmFlags::VM_EXEC.bits()
+        | VmFlags::VM_WRITE.bits()
+        | VmFlags::VM_READ.bits()] = MMArch::PAGE_SHARED_EXEC;
+    let mut ret = [unsafe { EntryFlags::from_data(0) }; 16];
+    let mut index = 0;
+    while index < 16 {
+        ret[index] = unsafe { EntryFlags::from_data(map[index]) };
+        index += 1;
+    }
+    ret
+}
+
+const PAGE_ENTRY_BASE: usize = RiscV64MMArch::ENTRY_FLAG_PRESENT
+    | RiscV64MMArch::ENTRY_FLAG_ACCESSED
+    | RiscV64MMArch::ENTRY_FLAG_USER;
 
 impl VirtAddr {
     /// 判断虚拟地址是否合法
@@ -255,8 +336,8 @@ impl VirtAddr {
 }
 
 /// 获取内核地址默认的页面标志
-pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> PageFlags<A> {
-    PageFlags::from_data(RiscV64MMArch::ENTRY_FLAG_DEFAULT_PAGE)
+pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> EntryFlags<A> {
+    EntryFlags::from_data(RiscV64MMArch::ENTRY_FLAG_DEFAULT_PAGE)
         .set_user(false)
         .set_execute(true)
 }

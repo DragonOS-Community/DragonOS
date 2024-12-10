@@ -3,18 +3,6 @@
 #include <common/glib.h>
 #include <process/process.h>
 
-extern void rs_pseudo_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size);
-extern void rs_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size, uint64_t flags);
-extern uint64_t rs_unmap_at_low_addr();
-
-// 内核层的起始地址
-#define PAGE_OFFSET 0xffff800000000000UL
-#define KERNEL_BASE_LINEAR_ADDR 0xffff800000000000UL
-#define USER_MAX_LINEAR_ADDR 0x00007fffffffffffUL
-// MMIO虚拟地址空间：1TB
-#define MMIO_BASE 0xffffa10000000000UL
-#define MMIO_TOP 0xffffa20000000000UL
-
 #define PAGE_4K_SHIFT 12
 #define PAGE_2M_SHIFT 21
 #define PAGE_1G_SHIFT 30
@@ -30,19 +18,15 @@ extern uint64_t rs_unmap_at_low_addr();
 #define PAGE_2M_MASK (~(PAGE_2M_SIZE - 1))
 
 // 将addr按照x的上边界对齐
-#define PAGE_4K_ALIGN(addr) (((unsigned long)(addr) + PAGE_4K_SIZE - 1) & PAGE_4K_MASK)
-#define PAGE_2M_ALIGN(addr) (((unsigned long)(addr) + PAGE_2M_SIZE - 1) & PAGE_2M_MASK)
+#define PAGE_4K_ALIGN(addr)                                                    \
+  (((unsigned long)(addr) + PAGE_4K_SIZE - 1) & PAGE_4K_MASK)
+#define PAGE_2M_ALIGN(addr)                                                    \
+  (((unsigned long)(addr) + PAGE_2M_SIZE - 1) & PAGE_2M_MASK)
 
 // 虚拟地址与物理地址转换
 #define virt_2_phys(addr) ((unsigned long)(addr)-PAGE_OFFSET)
-#define phys_2_virt(addr) ((unsigned long *)((unsigned long)(addr) + PAGE_OFFSET))
-
-// 在这个地址以上的虚拟空间，用来进行特殊的映射
-#define SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE 0xffffa00000000000UL
-#define FRAME_BUFFER_MAPPING_OFFSET 0x3000000UL
-#define IO_APIC_MAPPING_OFFSET 0xfec00000UL
-#define LOCAL_APIC_MAPPING_OFFSET 0xfee00000UL
-#define AHCI_MAPPING_OFFSET 0xff200000UL // AHCI 映射偏移量,之后使用了4M的地址
+#define phys_2_virt(addr)                                                      \
+  ((unsigned long *)((unsigned long)(addr) + PAGE_OFFSET))
 
 // ===== 页面属性 =====
 // 页面在页表中已被映射 mapped=1 unmapped=0
@@ -123,22 +107,6 @@ extern uint64_t rs_unmap_at_low_addr();
 
 #define PAGE_USER_4K_PAGE (PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
-/**
- * @brief 刷新TLB的宏定义
- * 由于任何写入cr3的操作都会刷新TLB，因此这个宏定义可以刷新TLB
- */
-#define flush_tlb()                                  \
-    do                                               \
-    {                                                \
-        ul tmp;                                      \
-        io_mfence();                                 \
-        __asm__ __volatile__("movq %%cr3, %0\n\t"    \
-                             "movq %0, %%cr3\n\t"    \
-                             : "=r"(tmp)::"memory"); \
-                                                     \
-    } while (0);
-
-
 // 导出内核程序的几个段的起止地址
 extern char _text;
 extern char _etext;
@@ -149,22 +117,6 @@ extern char _erodata;
 extern char _bss;
 extern char _ebss;
 extern char _end;
-
-#if ARCH(I386) || ARCH(X86_64)
-/**
- * @brief 读取CR3寄存器的值（存储了页目录的基地址）
- *
- * @return unsigned*  cr3的值的指针
- */
-unsigned long *get_CR3()
-{
-    ul *tmp;
-    __asm__ __volatile__("movq %%cr3, %0\n\t"
-                         : "=r"(tmp)::"memory");
-    return tmp;
-}
-
-#endif
 
 /*
  *  vm_area_struct中的vm_flags的可选值

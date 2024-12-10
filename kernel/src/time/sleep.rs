@@ -6,7 +6,6 @@ use system_error::SystemError;
 use crate::{
     arch::{CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
-    include::bindings::bindings::useconds_t,
     process::ProcessManager,
     sched::{schedule, SchedMode},
     time::timekeeping::getnstimeofday,
@@ -62,43 +61,4 @@ pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError
     let rm_time: PosixTimeSpec = (sleep_time - real_sleep_time.into()).into();
 
     return Ok(rm_time);
-}
-
-/// @brief 休眠指定时间（单位：微秒）
-///
-///  @param usec 微秒
-///
-/// @return Ok(TimeSpec) 剩余休眠时间
-///
-/// @return Err(SystemError) 错误码
-pub fn usleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError> {
-    match nanosleep(sleep_time) {
-        Ok(value) => return Ok(value),
-        Err(err) => return Err(err),
-    };
-}
-
-//===== 以下为提供给C的接口 =====
-
-/// @brief 休眠指定时间（单位：微秒）（提供给C的接口）
-///
-///  @param usec 微秒
-///
-/// @return Ok(i32) 0
-///
-/// @return Err(SystemError) 错误码
-#[no_mangle]
-pub extern "C" fn rs_usleep(usec: useconds_t) -> i32 {
-    let sleep_time = PosixTimeSpec {
-        tv_sec: (usec / 1000000) as i64,
-        tv_nsec: ((usec % 1000000) * 1000) as i64,
-    };
-    match usleep(sleep_time) {
-        Ok(_) => {
-            return 0;
-        }
-        Err(err) => {
-            return err.to_posix_errno();
-        }
-    };
 }

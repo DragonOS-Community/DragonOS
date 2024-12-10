@@ -1,5 +1,3 @@
-#![feature(cfg_target_abi)]
-
 #[macro_use]
 extern crate lazy_static;
 extern crate cc;

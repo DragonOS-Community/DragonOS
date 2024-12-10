@@ -8,8 +8,8 @@ use crate::{
     driver::{
         base::{
             class::Class,
-            device::{bus::Bus, driver::Driver, Device, DeviceType, IdTable},
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+            device::{bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable},
+            kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         input::serio::serio_device::SerioDevice,
@@ -17,7 +17,7 @@ use crate::{
     filesystem::kernfs::KernFSInode,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
-        spinlock::SpinLock,
+        spinlock::{SpinLock, SpinLockGuard},
     },
 };
 
@@ -32,13 +32,8 @@ pub struct I8042AuxPort {
 
 #[derive(Debug)]
 pub struct InnerI8042AuxPort {
-    bus: Option<Weak<dyn Bus>>,
-    class: Option<Weak<dyn Class>>,
-    driver: Option<Weak<dyn Driver>>,
-    kern_inode: Option<Arc<KernFSInode>>,
-    parent: Option<Weak<dyn KObject>>,
-    kset: Option<Arc<KSet>>,
-    kobj_type: Option<&'static dyn KObjType>,
+    device_common: DeviceCommonData,
+    kobject_common: KObjectCommonData,
 }
 
 impl I8042AuxPort {
@@ -46,16 +41,15 @@ impl I8042AuxPort {
     pub fn new() -> Self {
         return Self {
             inner: SpinLock::new(InnerI8042AuxPort {
-                bus: None,
-                class: None,
-                driver: None,
-                kern_inode: None,
-                parent: None,
-                kset: None,
-                kobj_type: None,
+                device_common: DeviceCommonData::default(),
+                kobject_common: KObjectCommonData::default(),
             }),
             kobj_state: LockedKObjectState::new(None),
         };
+    }
+
+    fn inner(&self) -> SpinLockGuard<InnerI8042AuxPort> {
+        self.inner.lock()
     }
 }
 
@@ -69,32 +63,32 @@ impl Device for I8042AuxPort {
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.lock().bus.clone()
+        self.inner().device_common.bus.clone()
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.lock().bus = bus;
+        self.inner().device_common.bus = bus;
     }
 
     fn set_class(&self, class: Option<Weak<dyn Class>>) {
-        self.inner.lock().class = class;
+        self.inner().device_common.class = class;
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
-        let mut guard = self.inner.lock();
-        let r = guard.class.clone()?.upgrade();
+        let mut guard = self.inner();
+        let r = guard.device_common.class.clone()?.upgrade();
         if r.is_none() {
-            guard.class = None;
+            guard.device_common.class = None;
         }
         return r;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner.lock().driver.clone()?.upgrade()
+        self.inner().device_common.driver.clone()?.upgrade()
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
-        self.inner.lock().driver = driver;
+        self.inner().device_common.driver = driver;
     }
 
     fn is_dead(&self) -> bool {
@@ -110,6 +104,14 @@ impl Device for I8042AuxPort {
     fn state_synced(&self) -> bool {
         true
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = parent;
+    }
 }
 
 impl KObject for I8042AuxPort {
@@ -118,35 +120,35 @@ impl KObject for I8042AuxPort {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.lock().kern_inode = inode;
+        self.inner().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.lock().kern_inode.clone()
+        self.inner().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.lock().parent.clone()
+        self.inner().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.lock().parent = parent;
+        self.inner().kobject_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.lock().kset.clone()
+        self.inner().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.lock().kset = kset;
+        self.inner().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().kobj_type
+        self.inner().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.lock().kobj_type = ktype;
+        self.inner().kobject_common.kobj_type = ktype;
     }
 
     fn name(&self) -> String {

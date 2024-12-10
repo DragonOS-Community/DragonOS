@@ -22,8 +22,7 @@ use core::ops::Index;
 use core::ptr;
 
 use alloc::boxed::Box;
-
-use crate::kdebug;
+use log::debug;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Color {
@@ -287,7 +286,6 @@ impl<K: Ord + Clone + Debug, V: Clone + Debug> NodePtr<K, V> {
 
 /// A red black tree implemented with Rust
 /// It is required that the keys implement the [`Ord`] traits.
-
 /// # Examples
 /// ```rust
 /// use rbtree::RBTree;
@@ -303,7 +301,7 @@ impl<K: Ord + Clone + Debug, V: Clone + Debug> NodePtr<K, V> {
 ///
 /// // check for a specific one.
 /// if !book_reviews.contains_key(&"Les Misérables") {
-///     kdebug!(
+///     debug!(
 ///         "We've got {} reviews, but Les Misérables ain't one.",
 ///         book_reviews.len()
 ///     );
@@ -316,14 +314,14 @@ impl<K: Ord + Clone + Debug, V: Clone + Debug> NodePtr<K, V> {
 /// let to_find = ["Pride and Prejudice", "Alice's Adventure in Wonderland"];
 /// for book in &to_find {
 ///     match book_reviews.get(book) {
-///         Some(review) => kdebug!("{}: {}", book, review),
-///         None => kdebug!("{} is unreviewed.", book),
+///         Some(review) => debug!("{}: {}", book, review),
+///         None => debug!("{} is unreviewed.", book),
 ///     }
 /// }
 ///
 /// // iterate over everything.
 /// for (book, review) in book_reviews.iter() {
-///     kdebug!("{}: \"{}\"", book, review);
+///     debug!("{}: \"{}\"", book, review);
 /// }
 ///
 /// book_reviews.print_tree();
@@ -386,12 +384,12 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
         }
         if direction == 0 {
             unsafe {
-                kdebug!("'{:?}' is root node", (*node.0));
+                debug!("'{:?}' is root node", (*node.0));
             }
         } else {
             let direct = if direction == -1 { "left" } else { "right" };
             unsafe {
-                kdebug!(
+                debug!(
                     "{:?} is {:?}'s {:?} child ",
                     (*node.0),
                     *node.parent().0,
@@ -405,12 +403,12 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
 
     pub fn print_tree(&self) {
         if self.root.is_null() {
-            kdebug!("This is a empty tree");
+            debug!("This is a empty tree");
             return;
         }
-        kdebug!("This tree size = {:?}, begin:-------------", self.len());
+        debug!("This tree size = {:?}, begin:-------------", self.len());
         self.tree_print(self.root, 0);
-        kdebug!("end--------------------------");
+        debug!("end--------------------------");
     }
 }
 
@@ -432,7 +430,7 @@ where
 
 impl<K: Eq + Ord + Debug, V: Eq + Debug> Eq for RBTree<K, V> {}
 
-impl<'a, K: Ord + Debug, V: Debug> Index<&'a K> for RBTree<K, V> {
+impl<K: Ord + Debug, V: Debug> Index<&K> for RBTree<K, V> {
     type Output = V;
 
     #[inline]
@@ -483,7 +481,7 @@ impl<'a, K: Ord + Debug, V: Debug> Clone for Keys<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord + Debug, V: Debug> fmt::Debug for Keys<'a, K, V> {
+impl<K: Ord + Debug, V: Debug> fmt::Debug for Keys<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -528,7 +526,7 @@ impl<'a, K: Ord + Debug, V: Debug> Clone for Values<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord + Debug, V: Debug> fmt::Debug for Values<'a, K, V> {
+impl<K: Ord + Debug, V: Debug> fmt::Debug for Values<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -576,7 +574,7 @@ impl<'a, K: Ord + Debug, V: Debug> Clone for ValuesMut<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord + Debug, V: Debug> fmt::Debug for ValuesMut<'a, K, V> {
+impl<K: Ord + Debug, V: Debug> fmt::Debug for ValuesMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -720,7 +718,7 @@ impl<'a, K: Ord + Debug + 'a, V: Debug + 'a> Iterator for Iter<'a, K, V> {
 impl<'a, K: Ord + Debug + 'a, V: Debug + 'a> DoubleEndedIterator for Iter<'a, K, V> {
     #[inline]
     fn next_back(&mut self) -> Option<(&'a K, &'a V)> {
-        // kdebug!("len = {:?}", self.len);
+        // debug!("len = {:?}", self.len);
         if self.len == 0 {
             return None;
         }
@@ -1661,7 +1659,7 @@ mod tests {
         let vec = vec![(1, 1), (2, 2), (3, 3)];
         let mut map: RBTree<_, _> = vec.into_iter().collect();
         for value in map.values_mut() {
-            *value = (*value) * 2
+            *value *= 2
         }
         let values: Vec<_> = map.values().cloned().collect();
         assert_eq!(values.len(), 3);
@@ -1818,7 +1816,7 @@ mod tests {
         b.insert(2, "two");
         b.insert(3, "three");
 
-        a.extend(b.into_iter());
+        a.extend(b);
 
         assert_eq!(a.len(), 3);
         assert_eq!(a[&1], "one");
@@ -1828,6 +1826,7 @@ mod tests {
 
     #[test]
     fn test_rev_iter() {
+        use crate::libs::rbtree::RBTree;
         let mut a = RBTree::new();
         a.insert(1, 1);
         a.insert(2, 2);
@@ -1836,7 +1835,7 @@ mod tests {
         assert_eq!(a.len(), 3);
         let mut cache = vec![];
         for e in a.iter().rev() {
-            cache.push(e.0.clone());
+            cache.push(*e.0);
         }
         assert_eq!(&cache, &vec![3, 2, 1]);
     }

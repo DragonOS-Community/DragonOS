@@ -62,6 +62,7 @@ pub(super) struct LocalContext {
     pub user_sp: usize,
 }
 
+#[allow(dead_code)]
 impl LocalContext {
     pub fn new(cpu: ProcessorId) -> Self {
         Self {
@@ -131,7 +132,7 @@ pub(super) fn init_local_context() {
 }
 
 impl SmpCpuManager {
-    pub fn arch_init(boot_cpu: ProcessorId) {
+    pub fn arch_init(_boot_cpu: ProcessorId) {
         // todo: 读取所有可用的CPU
     }
 }

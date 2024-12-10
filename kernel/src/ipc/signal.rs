@@ -1,12 +1,12 @@
 use core::sync::atomic::compiler_fence;
 
 use alloc::sync::Arc;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
     ipc::signal_types::SigactionType,
-    kwarn,
     libs::spinlock::SpinLockGuard,
     process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
 };
@@ -16,6 +16,35 @@ use super::signal_types::{
 };
 
 impl Signal {
+    pub fn signal_pending_state(
+        interruptible: bool,
+        task_wake_kill: bool,
+        pcb: &Arc<ProcessControlBlock>,
+    ) -> bool {
+        if !interruptible && !task_wake_kill {
+            return false;
+        }
+
+        if !pcb.has_pending_signal() {
+            return false;
+        }
+
+        return interruptible || Self::fatal_signal_pending(pcb);
+    }
+
+    /// 判断当前进程是否收到了SIGKILL信号
+    pub fn fatal_signal_pending(pcb: &Arc<ProcessControlBlock>) -> bool {
+        let guard = pcb.sig_info_irqsave();
+        if guard
+            .sig_pending()
+            .signal()
+            .contains(Signal::SIGKILL.into())
+        {
+            return true;
+        }
+
+        return false;
+    }
     /// 向目标进程发送信号
     ///
     /// ## 参数
@@ -35,8 +64,8 @@ impl Signal {
         // 如果 pid 等于 -1，那么信号的发送范围是：调用进程有权将信号发往的每个目标进程，除去 init（进程 ID 为 1）和调用进程自身。如果特权级进程发起这一调用，那么会发送信号给系统中的所有进程，上述两个进程除外。显而易见，有时也将这种信号发送方式称之为广播信号
         // 如果并无进程与指定的 pid 相匹配，那么 kill() 调用失败，同时将 errno 置为 ESRCH（“查无此进程”）
         if pid.lt(&Pid::from(0)) {
-            kwarn!("Kill operation not support: pid={:?}", pid);
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            warn!("Kill operation not support: pid={:?}", pid);
+            return Err(SystemError::ENOSYS);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 检查sig是否符合要求，如果不符合要求，则退出。
@@ -47,7 +76,7 @@ impl Signal {
         let pcb = ProcessManager::find(pid);
 
         if pcb.is_none() {
-            kwarn!("No such process.");
+            warn!("No such process.");
             return retval;
         }
 
@@ -85,7 +114,7 @@ impl Signal {
         if !self.prepare_sianal(pcb.clone(), force_send) {
             return Err(SystemError::EINVAL);
         }
-        // kdebug!("force send={}", force_send);
+        // debug!("force send={}", force_send);
         let pcb_info = pcb.sig_info_irqsave();
         let pending = if matches!(pt, PidType::PID) {
             pcb_info.sig_shared_pending()
@@ -141,7 +170,7 @@ impl Signal {
     /// @param pt siginfo结构体中，pid字段代表的含义
     #[allow(clippy::if_same_then_else)]
     fn complete_signal(&self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
-        // kdebug!("complete_signal");
+        // debug!("complete_signal");
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // ===== 寻找需要wakeup的目标进程 =====
@@ -284,14 +313,14 @@ impl Signal {
 fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStruct>, fatal: bool) {
     // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
-    // kdebug!("signal_wake_up");
+    // debug!("signal_wake_up");
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
     let state = pcb.sched_info().inner_lock_read_irqsave().state();
     let mut wakeup_ok = true;
     if state.is_blocked_interruptable() {
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             wakeup_ok = false;
-            kwarn!(
+            warn!(
                 "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
                 ProcessManager::current_pcb().pid(),
                 pcb.pid(),
@@ -301,7 +330,7 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
     } else if state.is_stopped() {
         ProcessManager::wakeup_stop(&pcb).unwrap_or_else(|e| {
             wakeup_ok = false;
-            kwarn!(
+            warn!(
                 "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
                 ProcessManager::current_pcb().pid(),
                 pcb.pid(),
@@ -333,7 +362,7 @@ fn recalc_sigpending() {
 /// @param force_default 是否强制将sigaction恢复成默认状态
 pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
+    // debug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
     let actions = &mut pcb.sig_struct_irqsave().handlers;
 
     for sigaction in actions.iter_mut() {
@@ -412,18 +441,46 @@ pub(super) fn do_sigaction(
     return Ok(());
 }
 
-/// 设置当前进程的屏蔽信号 (sig_block)，待引入 [sigprocmask](https://man7.org/linux/man-pages/man2/sigprocmask.2.html) 系统调用后要删除这个散装函数
-///
-/// ## 参数
-///
-/// - `new_set` 新的屏蔽信号bitmap的值
-pub fn set_current_sig_blocked(new_set: &mut SigSet) {
-    let to_remove: SigSet =
-        <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
-    new_set.remove(to_remove);
-    //TODO 把这个散装函数用 sigsetops 替换掉
-    let pcb = ProcessManager::current_pcb();
+/// https://code.dragonos.org.cn/xref/linux-6.6.21/include/uapi/asm-generic/signal-defs.h#72
+/// 对应SIG_BLOCK，SIG_UNBLOCK，SIG_SETMASK
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigHow {
+    Block = 0,
+    Unblock = 1,
+    SetMask = 2,
+}
 
+impl TryFrom<i32> for SigHow {
+    type Error = SystemError;
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(SigHow::Block),
+            1 => Ok(SigHow::Unblock),
+            2 => Ok(SigHow::SetMask),
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+}
+
+fn __set_task_blocked(pcb: &Arc<ProcessControlBlock>, new_set: &SigSet) {
+    //todo 还有一个对线程组是否为空的判断，进程组、线程组实现之后，需要更改这里。
+    if pcb.has_pending_signal() {
+        let mut newblocked = *new_set;
+        let guard = pcb.sig_info_irqsave();
+        newblocked.remove(*guard.sig_block());
+        drop(guard);
+
+        // 从主线程开始去遍历
+        if let Some(group_leader) = pcb.threads_read_irqsave().group_leader() {
+            retarget_shared_pending(group_leader, newblocked);
+        }
+    }
+    *pcb.sig_info_mut().sig_block_mut() = *new_set;
+    recalc_sigpending();
+}
+
+fn __set_current_blocked(new_set: &SigSet) {
+    let pcb = ProcessManager::current_pcb();
     /*
         如果当前pcb的sig_blocked和新的相等，那么就不用改变它。
         请注意，一个进程的sig_blocked字段不能被其他进程修改！
@@ -431,12 +488,97 @@ pub fn set_current_sig_blocked(new_set: &mut SigSet) {
     if pcb.sig_info_irqsave().sig_block().eq(new_set) {
         return;
     }
-
     let guard = pcb.sig_struct_irqsave();
-    // todo: 当一个进程有多个线程后，在这里需要设置每个线程的block字段，并且 retarget_shared_pending（虽然我还没搞明白linux这部分是干啥的）
 
-    // 设置当前进程的sig blocked
-    *pcb.sig_info_mut().sig_block_mut() = *new_set;
-    recalc_sigpending();
+    __set_task_blocked(&pcb, new_set);
+
     drop(guard);
+}
+
+fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
+    let retarget = pcb.sig_info_irqsave().sig_shared_pending().signal();
+    retarget.intersects(which);
+    if retarget.is_empty() {
+        return;
+    }
+
+    // 对于线程组中的每一个线程都要执行的函数
+    let thread_handling_function = |pcb: Arc<ProcessControlBlock>, retarget: &SigSet| {
+        if retarget.is_empty() {
+            return;
+        }
+
+        if pcb.flags().contains(ProcessFlags::EXITING) {
+            return;
+        }
+
+        let blocked = pcb.sig_info_irqsave().sig_shared_pending().signal();
+        if retarget.difference(blocked).is_empty() {
+            return;
+        }
+
+        retarget.intersects(blocked);
+        if !pcb.has_pending_signal() {
+            let guard = pcb.sig_struct_irqsave();
+            signal_wake_up(pcb.clone(), guard, false);
+        }
+        // 之前的对retarget的判断移动到最前面，因为对于当前线程的线程的处理已经结束，对于后面的线程在一开始判断retarget为空即可结束处理
+
+        // debug!("handle done");
+    };
+
+    // 暴力遍历每一个线程，找到相同的tgid
+    let tgid = pcb.tgid();
+    for &pid in pcb.children_read_irqsave().iter() {
+        if let Some(child) = ProcessManager::find(pid) {
+            if child.tgid() == tgid {
+                thread_handling_function(child, &retarget);
+            }
+        }
+    }
+    // debug!("retarget_shared_pending done!");
+}
+
+/// 设置当前进程的屏蔽信号 (sig_block)
+///
+/// ## 参数
+///
+/// - `new_set` 新的屏蔽信号bitmap的值
+pub fn set_current_blocked(new_set: &mut SigSet) {
+    let to_remove: SigSet =
+        <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
+    new_set.remove(to_remove);
+    __set_current_blocked(new_set);
+}
+
+/// 设置当前进程的屏蔽信号 (sig_block)
+///
+/// ## 参数
+///
+/// - `how` 设置方式
+/// - `new_set` 新的屏蔽信号bitmap的值
+pub fn set_sigprocmask(how: SigHow, set: SigSet) -> Result<SigSet, SystemError> {
+    let pcb: Arc<ProcessControlBlock> = ProcessManager::current_pcb();
+    let guard = pcb.sig_info_irqsave();
+    let oset = *guard.sig_block();
+
+    let mut res_set = oset;
+    drop(guard);
+
+    match how {
+        SigHow::Block => {
+            // debug!("SIG_BLOCK\tGoing to insert is: {}", set.bits());
+            res_set.insert(set);
+        }
+        SigHow::Unblock => {
+            res_set.remove(set);
+        }
+        SigHow::SetMask => {
+            // debug!("SIG_SETMASK\tGoing to set is: {}", set.bits());
+            res_set = set;
+        }
+    }
+
+    __set_current_blocked(&res_set);
+    Ok(oset)
 }

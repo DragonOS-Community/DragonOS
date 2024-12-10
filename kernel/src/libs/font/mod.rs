@@ -2,6 +2,7 @@ use self::font_type::vga8x16::FONT_VGA_8X16;
 
 pub mod font_type;
 
+#[allow(dead_code)]
 pub struct FontDesc {
     pub index: usize,
     pub name: &'static str,
@@ -39,7 +40,7 @@ impl FontDesc {
         }
 
         for (first, last) in Self::DOUBLE_WIDTH_RANGE {
-            if ch > *first && ch < *last {
+            if ch >= *first && ch < *last {
                 return true;
             }
         }

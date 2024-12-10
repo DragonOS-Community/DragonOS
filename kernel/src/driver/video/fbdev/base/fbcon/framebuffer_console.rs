@@ -1,4 +1,5 @@
 use alloc::{sync::Arc, vec::Vec};
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -7,7 +8,7 @@ use crate::{
             console::ConsoleSwitch,
             virtual_terminal::{
                 virtual_console::{CursorOperation, ScrollDir, VcCursor, VirtualConsoleData},
-                Color,
+                Color, VirtConsole,
             },
         },
         video::fbdev::base::{
@@ -40,11 +41,11 @@ impl BlittingFbConsole {
         })
     }
 
-    pub fn fb(&self) -> Arc<dyn FrameBuffer> {
+    fn fb(&self) -> Arc<dyn FrameBuffer> {
         self.fb.lock().clone().unwrap()
     }
 
-    pub fn get_color(&self, vc_data: &VirtualConsoleData, c: u16, is_fg: bool) -> u32 {
+    fn get_color(&self, vc_data: &VirtualConsoleData, c: u16, is_fg: bool) -> u32 {
         let fb_info = self.fb();
         let mut color = 0;
 
@@ -104,7 +105,7 @@ impl BlittingFbConsole {
     }
 
     /// ## 计算单色调的函数
-    pub fn mono_color(&self) -> u32 {
+    fn mono_color(&self) -> u32 {
         let fb_info = self.fb();
         let mut max_len = fb_info
             .current_fb_var()
@@ -117,7 +118,7 @@ impl BlittingFbConsole {
         return (!(0xfff << max_len)) & 0xff;
     }
 
-    pub fn bit_put_string(
+    fn bit_put_string(
         &self,
         vc_data: &VirtualConsoleData,
         buf: &[u16],
@@ -173,6 +174,7 @@ impl BlittingFbConsole {
 impl ConsoleSwitch for BlittingFbConsole {
     fn con_init(
         &self,
+        _vc: &Arc<VirtConsole>,
         vc_data: &mut VirtualConsoleData,
         init: bool,
     ) -> Result<(), system_error::SystemError> {
@@ -183,10 +185,12 @@ impl ConsoleSwitch for BlittingFbConsole {
         }
         let fb = fb.unwrap();
         if fb.is_none() {
-            panic!(
+            log::warn!(
                 "The Framebuffer with FbID {} has not been initialized yet.",
                 vc_data.index
-            )
+            );
+
+            return Err(SystemError::ENODEV);
         }
 
         let fb = fb.as_ref().unwrap().clone();
@@ -200,7 +204,7 @@ impl ConsoleSwitch for BlittingFbConsole {
             vc_data.font.height = font.height;
             vc_data.font.count = font.char_count;
         } else {
-            kwarn!("The frontend Framebuffer is not implemented");
+            warn!("The frontend Framebuffer is not implemented");
         }
 
         vc_data.color_mode = fb.color_depth() != 1;

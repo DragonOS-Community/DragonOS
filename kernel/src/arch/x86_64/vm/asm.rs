@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 use alloc::slice;
+use log::{debug, error};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
@@ -14,9 +15,8 @@ use x86::{
 };
 
 use crate::{
-    arch::mm::barrier,
-    kdebug, kerror,
-    mm::{phys_2_virt, PhysAddr},
+    arch::{mm::barrier, MMArch},
+    mm::{MemoryManagementArch, PhysAddr},
 };
 
 use super::vmx::vmx_info;
@@ -73,13 +73,11 @@ impl KvmX86Asm {
         let base_mid = (descriptor & 0x0000_00FF_0000_0000) >> 16;
         let base_low = (descriptor & 0x0000_0000_FFFF_0000) >> 16;
         let segment_base = (base_high | base_mid | base_low) & 0xFFFFFFFF;
-        let virtaddr = phys_2_virt(segment_base.try_into().unwrap())
-            .try_into()
-            .unwrap();
-        kdebug!(
-            "segment_base={:x}",
-            phys_2_virt(segment_base.try_into().unwrap())
-        );
+        let virtaddr = unsafe {
+            MMArch::phys_2_virt(PhysAddr::new(segment_base as usize))
+                .unwrap()
+                .data() as u64
+        };
         return virtaddr;
     }
 }
@@ -88,7 +86,7 @@ pub struct VmxAsm;
 
 impl VmxAsm {
     pub fn vmclear(phys_addr: PhysAddr) {
-        kdebug!("vmclear addr {phys_addr:?}");
+        debug!("vmclear addr {phys_addr:?}");
         match unsafe { x86::bits64::vmx::vmclear(phys_addr.data() as u64) } {
             Ok(_) => {}
             Err(e) => {
@@ -128,7 +126,7 @@ impl VmxAsm {
             Self::vmx_set_lock_bit()?;
             Self::vmx_set_cr0_bits();
             Self::vmx_set_cr4_bits();
-            kdebug!("vmxon addr {phys_addr:?}");
+            debug!("vmxon addr {phys_addr:?}");
 
             vmxon(phys_addr.data() as u64).expect("[VMX] vmxon failed! reason");
 
@@ -143,16 +141,18 @@ impl VmxAsm {
     const VMX_VPID_EXTENT_SINGLE_CONTEXT: u64 = 1;
     #[allow(dead_code)]
     const VMX_VPID_EXTENT_ALL_CONTEXT: u64 = 2;
+    #[allow(dead_code)]
     const VMX_VPID_EXTENT_SINGLE_NON_GLOBAL: u64 = 3;
-
+    #[allow(dead_code)]
     const VMX_EPT_EXTENT_CONTEXT: u64 = 1;
     const VMX_EPT_EXTENT_GLOBAL: u64 = 2;
+    #[allow(dead_code)]
     const VMX_EPT_EXTENT_SHIFT: u64 = 24;
 
     pub fn ept_sync_global() {
         Self::invept(Self::VMX_EPT_EXTENT_GLOBAL, 0, 0);
     }
-
+    #[allow(dead_code)]
     pub fn ept_sync_context(eptp: u64) {
         if vmx_info().has_vmx_invept_context() {
             Self::invept(Self::VMX_EPT_EXTENT_CONTEXT, eptp, 0);
@@ -268,7 +268,7 @@ impl VmxAsm {
 #[no_mangle]
 unsafe extern "C" fn vmx_vmlaunch() {
     if let Err(e) = x86::bits64::vmx::vmlaunch() {
-        kerror!(
+        error!(
             "vmx_launch fail: {:?}, err code {}",
             e,
             VmxAsm::vmx_vmread(ro::VM_INSTRUCTION_ERROR)

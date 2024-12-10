@@ -5,25 +5,30 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use kdepends::xarray::XArray;
+use log::error;
 use system_error::SystemError;
 
+use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use crate::filesystem::eventfd::EventFdInode;
+use crate::libs::lazy_init::Lazy;
+use crate::perf::PerfEventInode;
 use crate::{
+    arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
-    kerror,
     libs::{rwlock::RwLock, spinlock::SpinLock},
+    mm::{page::Page, MemoryManagementArch},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
     },
-    process::ProcessManager,
+    process::{cred::Cred, ProcessManager},
 };
-
-use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -118,6 +123,76 @@ impl FileMode {
         return self.bits() & FileMode::O_ACCMODE.bits();
     }
 }
+
+/// 页面缓存
+pub struct PageCache {
+    xarray: SpinLock<XArray<Arc<Page>>>,
+    inode: Lazy<Weak<dyn IndexNode>>,
+}
+
+impl core::fmt::Debug for PageCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCache")
+            .field(
+                "xarray",
+                &self
+                    .xarray
+                    .lock()
+                    .range(0..((MMArch::PAGE_ADDRESS_SIZE >> MMArch::PAGE_SHIFT) as u64))
+                    .map(|(_, r)| (*r).clone())
+                    .collect::<Vec<Arc<Page>>>(),
+            )
+            .finish()
+    }
+}
+
+impl PageCache {
+    pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
+        let page_cache = Self {
+            xarray: SpinLock::new(XArray::new()),
+            inode: {
+                let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
+                if let Some(inode) = inode {
+                    v.init(inode);
+                }
+                v
+            },
+        };
+        Arc::new(page_cache)
+    }
+
+    pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {
+        self.inode.try_get().cloned()
+    }
+
+    pub fn add_page(&self, offset: usize, page: &Arc<Page>) {
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        cursor.store(page.clone());
+    }
+
+    pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        let page = cursor.load().map(|r| (*r).clone());
+        page
+    }
+
+    pub fn remove_page(&self, offset: usize) {
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        cursor.remove();
+    }
+
+    pub fn set_inode(&self, inode: Weak<dyn IndexNode>) -> Result<(), SystemError> {
+        if self.inode.initialized() {
+            return Err(SystemError::EINVAL);
+        }
+        self.inode.init(inode);
+        Ok(())
+    }
+}
+
 /// @brief 抽象文件结构体
 #[derive(Debug)]
 pub struct File {
@@ -131,6 +206,8 @@ pub struct File {
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
     readdir_subdirs_name: SpinLock<Vec<String>>,
     pub private_data: SpinLock<FilePrivateData>,
+    /// 文件的凭证
+    cred: Cred,
 }
 
 impl File {
@@ -154,8 +231,8 @@ impl File {
             file_type,
             readdir_subdirs_name: SpinLock::new(Vec::default()),
             private_data: SpinLock::new(FilePrivateData::default()),
+            cred: ProcessManager::current_pcb().cred(),
         };
-        // kdebug!("inode:{:?}",f.inode);
         f.inode.open(f.private_data.lock(), &mode)?;
 
         return Ok(f);
@@ -234,7 +311,14 @@ impl File {
 
         let len = self
             .inode
-            .read_at(offset, len, buf, self.private_data.lock())?;
+            .read_at(offset, len, buf, self.private_data.lock())
+            .map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
 
         if update_offset {
             self.offset
@@ -259,11 +343,24 @@ impl File {
 
         // 如果文件指针已经超过了文件大小，则需要扩展文件大小
         if offset > self.inode.metadata()?.size as usize {
-            self.inode.resize(offset)?;
+            self.inode.resize(offset).map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
         }
         let len = self
             .inode
-            .write_at(offset, len, buf, self.private_data.lock())?;
+            .write_at(offset, len, buf, self.private_data.lock())
+            .map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
 
         if update_offset {
             self.offset
@@ -350,7 +447,7 @@ impl File {
             *readdir_subdirs_name = inode.list()?;
             readdir_subdirs_name.sort();
         }
-        // kdebug!("sub_entries={sub_entries:?}");
+        // debug!("sub_entries={sub_entries:?}");
 
         // 已经读到末尾
         if offset == readdir_subdirs_name.len() {
@@ -361,7 +458,7 @@ impl File {
         let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
             Ok(i) => i,
             Err(e) => {
-                kerror!(
+                error!(
                     "Readdir error: Failed to find sub inode:{name:?}, file={self:?}, error={e:?}"
                 );
                 return Err(e);
@@ -409,6 +506,7 @@ impl File {
             file_type: self.file_type,
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
             private_data: SpinLock::new(self.private_data.lock().clone()),
+            cred: self.cred.clone(),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         if self
@@ -493,11 +591,7 @@ impl File {
                 return inode.inner().lock().add_epoll(epitem);
             }
             _ => {
-                let r = self.inode.ioctl(
-                    EventPoll::ADD_EPOLLITEM,
-                    &epitem as *const Arc<EPollItem> as usize,
-                    &self.private_data.lock(),
-                );
+                let r = self.inode.kernel_ioctl(epitem, &self.private_data.lock());
                 if r.is_err() {
                     return Err(SystemError::ENOSYS);
                 }
@@ -514,9 +608,23 @@ impl File {
                 let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
                 let mut socket = inode.inner();
 
-                return socket.remove_epoll(epoll);
+                socket.remove_epoll(epoll)
             }
-            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            FileType::Pipe => {
+                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
+                inode.inner().lock().remove_epoll(epoll)
+            }
+            _ => {
+                let inode = self.inode.downcast_ref::<EventFdInode>();
+                if let Some(inode) = inode {
+                    return inode.remove_epoll(epoll);
+                }
+                let inode = self
+                    .inode
+                    .downcast_ref::<PerfEventInode>()
+                    .ok_or(SystemError::ENOSYS)?;
+                return inode.remove_epoll(epoll);
+            }
         }
     }
 
@@ -530,7 +638,7 @@ impl Drop for File {
         let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
         // 打印错误信息
         if r.is_err() {
-            kerror!(
+            error!(
                 "pid: {:?} failed to close file: {:?}, errno={:?}",
                 ProcessManager::current_pcb().pid(),
                 self,
@@ -546,7 +654,11 @@ pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     fds: Vec<Option<Arc<File>>>,
 }
-
+impl Default for FileDescriptorVec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl FileDescriptorVec {
     pub const PROCESS_MAX_FD: usize = 1024;
 
@@ -572,6 +684,17 @@ impl FileDescriptorVec {
             }
         }
         return res;
+    }
+
+    /// 返回 `已经打开的` 文件描述符的数量
+    pub fn fd_open_count(&self) -> usize {
+        let mut size = 0;
+        for fd in &self.fds {
+            if fd.is_some() {
+                size += 1;
+            }
+        }
+        return size;
     }
 
     /// @brief 判断文件描述符序号是否合法
@@ -633,19 +756,12 @@ impl FileDescriptorVec {
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
-    pub fn drop_fd(&mut self, fd: i32) -> Result<(), SystemError> {
-        // 判断文件描述符的数字是否超过限制
-        if !FileDescriptorVec::validate_fd(fd) {
-            return Err(SystemError::EBADF);
-        }
-
+    pub fn drop_fd(&mut self, fd: i32) -> Result<Arc<File>, SystemError> {
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
-
-        assert!(Arc::strong_count(&file) == 1);
-        return Ok(());
+        return Ok(file);
     }
 
     #[allow(dead_code)]
@@ -659,7 +775,7 @@ impl FileDescriptorVec {
                 let to_drop = file.close_on_exec();
                 if to_drop {
                     if let Err(r) = self.drop_fd(i as i32) {
-                        kerror!(
+                        error!(
                             "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
                             ProcessManager::current_pcb().pid(),
                             i,
@@ -684,7 +800,7 @@ impl<'a> FileDescriptorIterator<'a> {
     }
 }
 
-impl<'a> Iterator for FileDescriptorIterator<'a> {
+impl Iterator for FileDescriptorIterator<'_> {
     type Item = (i32, Arc<File>);
 
     fn next(&mut self) -> Option<Self::Item> {

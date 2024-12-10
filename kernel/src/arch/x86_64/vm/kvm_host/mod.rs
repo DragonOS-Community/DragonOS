@@ -41,6 +41,7 @@ pub const RMODE_TSS_SIZE: usize = TSS_BASE_SIZE + TSS_REDIRECTION_SIZE + TSS_IOP
 
 pub const KVM_PFN_NOSLOT: u64 = 0x1 << 63;
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct X86KvmArch {
     /// 中断芯片模式
@@ -142,7 +143,7 @@ impl Default for KvmIrqChipMode {
         Self::None
     }
 }
-
+#[allow(dead_code)]
 pub trait KvmInitFunc {
     fn hardware_setup(&self) -> Result<(), SystemError>;
     fn handle_intel_pt_intr(&self) -> u32;
@@ -409,6 +410,7 @@ bitflags! {
         const WRITE_PF_TO_SP = 1 << 8;
     }
 }
+#[allow(dead_code)]
 #[derive(Default, Debug)]
 ///用于跟踪和记录VCPU的各种统计信息。
 pub struct KvmVcpuStat {
@@ -453,6 +455,7 @@ pub struct KvmVcpuStat {
 pub fn gfn_to_gpa(gfn: u64) -> u64 {
     gfn << 12
 }
+#[allow(dead_code)]
 #[inline]
 /// 将 GPA 转换为 GFN
 pub fn gpa_to_gfn(gfn: u64) -> u64 {

@@ -6,13 +6,13 @@ use alloc::{
 };
 use driver_base_macros::get_weak_or_clear;
 use intertrait::CastFromSync;
+use log::{debug, error};
 
 use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
     },
-    kerror,
     libs::{
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -146,7 +146,7 @@ impl SysFSOps for KObjectSysFSOps {
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         let r = attr.show(kobj, buf).map_err(|e| {
-            if e == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            if e == SystemError::ENOSYS {
                 SystemError::EIO
             } else {
                 e
@@ -163,7 +163,7 @@ impl SysFSOps for KObjectSysFSOps {
         buf: &[u8],
     ) -> Result<usize, SystemError> {
         let r = attr.store(kobj, buf).map_err(|e| {
-            if e == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            if e == SystemError::ENOSYS {
                 SystemError::EIO
             } else {
                 e
@@ -178,18 +178,17 @@ impl SysFSOps for KObjectSysFSOps {
 pub struct KObjectManager;
 
 impl KObjectManager {
-    #[allow(dead_code)]
     pub fn init_and_add_kobj(
         kobj: Arc<dyn KObject>,
         join_kset: Option<Arc<KSet>>,
+        kobj_type: Option<&'static dyn KObjType>,
     ) -> Result<(), SystemError> {
-        Self::kobj_init(&kobj);
+        Self::kobj_init(&kobj, kobj_type);
         Self::add_kobj(kobj, join_kset)
     }
 
-    #[allow(dead_code)]
-    pub fn kobj_init(kobj: &Arc<dyn KObject>) {
-        kobj.set_kobj_type(Some(&DynamicKObjKType));
+    pub fn kobj_init(kobj: &Arc<dyn KObject>, kobj_type: Option<&'static dyn KObjType>) {
+        kobj.set_kobj_type(kobj_type);
     }
 
     pub fn add_kobj(
@@ -213,7 +212,7 @@ impl KObjectManager {
             }
             kobj.set_parent(None);
             if e == SystemError::EEXIST {
-                kerror!("KObjectManager::add_kobj() failed with error: {e:?}, kobj:{kobj:?}");
+                error!("KObjectManager::add_kobj() failed with error: {e:?}, kobj:{kobj:?}");
             }
 
             return Err(e);
@@ -269,7 +268,7 @@ pub struct DynamicKObjKType;
 
 impl KObjType for DynamicKObjKType {
     fn release(&self, kobj: Arc<dyn KObject>) {
-        kdebug!("DynamicKObjKType::release() kobj:{:?}", kobj.name());
+        debug!("DynamicKObjKType::release() kobj:{:?}", kobj.name());
     }
 
     fn sysfs_ops(&self) -> Option<&dyn SysFSOps> {

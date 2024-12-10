@@ -4,16 +4,17 @@ use alloc::{
 };
 use bitmap::AllocBitmap;
 use hashbrown::HashMap;
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
-    arch::{vm::mmu::mmu::PAGE_SIZE, MMArch},
+    arch::{vm::mmu::kvm_mmu::PAGE_SIZE, MMArch},
     libs::{
         rbtree::RBTree,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{kernel_mapper::KernelMapper, page::PageFlags, MemoryManagementArch, VirtAddr},
+    mm::{kernel_mapper::KernelMapper, page::EntryFlags, MemoryManagementArch, VirtAddr},
     virt::{
         kvm::host_mem::PAGE_SHIFT,
         vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion},
@@ -161,6 +162,7 @@ pub struct KvmMemSlot {
 
     hva_node_key: [AddrRange; 2],
 }
+#[allow(dead_code)]
 impl KvmMemSlot {
     pub fn check_aligned_addr(&self, align: usize) -> bool {
         self.userspace_addr.data() % align == 0
@@ -329,7 +331,11 @@ impl Vm {
             if old_guard.npages == 0 {
                 change = KvmMemoryChangeMode::Create;
                 // 避免溢出
-                if self.nr_memslot_pages + (npages as usize) < self.nr_memslot_pages {
+                if let Some(new_pages) = self.nr_memslot_pages.checked_add(npages as usize) {
+                    if new_pages < self.nr_memslot_pages {
+                        return Err(SystemError::EINVAL);
+                    }
+                } else {
                     return Err(SystemError::EINVAL);
                 }
             } else {
@@ -351,7 +357,11 @@ impl Vm {
         } else {
             change = KvmMemoryChangeMode::Create;
             // 避免溢出
-            if self.nr_memslot_pages + (npages as usize) < self.nr_memslot_pages {
+            if let Some(new_pages) = self.nr_memslot_pages.checked_add(npages as usize) {
+                if new_pages < self.nr_memslot_pages {
+                    return Err(SystemError::EINVAL);
+                }
+            } else {
                 return Err(SystemError::EINVAL);
             }
         };
@@ -590,7 +600,7 @@ pub fn __gfn_to_hva_many(
     nr_pages: Option<&mut u64>,
     write: bool,
 ) -> Result<u64, SystemError> {
-    kdebug!("__gfn_to_hva_many");
+    debug!("__gfn_to_hva_many");
 
     // 检查内存槽是否为空
     if slot.is_none() {
@@ -642,9 +652,8 @@ fn __gfn_to_hva_memslot(slot: &KvmMemSlot, gfn: u64) -> u64 {
 pub fn __gfn_to_pfn_memslot(
     slot: Option<&KvmMemSlot>,
     gfn: u64,
-    atomic: bool,
+    atomic_or_async: (bool, &mut bool),
     interruptible: bool,
-    is_async: &mut bool,
     write: bool,
     writable: &mut bool,
     hva: &mut u64,
@@ -659,7 +668,7 @@ pub fn __gfn_to_pfn_memslot(
         *writable = false;
     }
 
-    let pfn = hva_to_pfn(addr, atomic, interruptible, is_async, write, writable)?;
+    let pfn = hva_to_pfn(addr, atomic_or_async, interruptible, write, writable)?;
     return Ok(pfn);
 }
 /// 将用户空间虚拟地址（HVA）转换为页帧号（PFN）。
@@ -677,20 +686,18 @@ pub fn __gfn_to_pfn_memslot(
 // 正确性待验证
 pub fn hva_to_pfn(
     addr: u64,
-    atomic: bool,
+    atomic_or_async: (bool, &mut bool),
     _interruptible: bool,
-    is_async: &mut bool,
     _write_fault: bool,
     _writable: &mut bool,
 ) -> Result<u64, SystemError> {
     // 我们可以原子地或异步地执行，但不能同时执行
-    assert!(!(atomic && *is_async), "Cannot be both atomic and async");
+    assert!(
+        !(atomic_or_async.0 && *atomic_or_async.1),
+        "Cannot be both atomic and async"
+    );
 
-    kdebug!("hva_to_pfn");
-    unsafe {
-        let raw = addr as *const i32;
-        kdebug!("raw={:x}", *raw);
-    }
+    debug!("hva_to_pfn");
     // let hpa = MMArch::virt_2_phys(VirtAddr::new(addr)).unwrap().data() as u64;
     let hva = VirtAddr::new(addr as usize);
     let mut mapper = KernelMapper::lock();
@@ -698,9 +705,9 @@ pub fn hva_to_pfn(
     if let Some((hpa, _)) = mapper.translate(hva) {
         return Ok(hpa.data() as u64 >> PAGE_SHIFT);
     }
-    kdebug!("hva_to_pfn NOT FOUND,try map a new pfn");
+    debug!("hva_to_pfn NOT FOUND,try map a new pfn");
     unsafe {
-        mapper.map(hva, PageFlags::mmio_flags());
+        mapper.map(hva, EntryFlags::mmio_flags());
     }
     let (hpa, _) = mapper.translate(hva).unwrap();
     return Ok(hpa.data() as u64 >> PAGE_SHIFT);

@@ -7,6 +7,7 @@ use crate::{
     init::initcall::INITCALL_CORE,
 };
 use alloc::{string::ToString, sync::Arc};
+use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -29,7 +30,7 @@ fn ksysfs_init() -> Result<(), SystemError> {
     sysfs_instance()
         .create_groups(&kernel_kset.as_kobject(), &[&KernelAttrGroup])
         .map_err(|e| {
-            kerror!("Failed to create sysfs groups for kernel kset: {:?}", e);
+            error!("Failed to create sysfs groups for kernel kset: {:?}", e);
             kernel_kset.unregister();
             SystemError::ENOMEM
         })?;

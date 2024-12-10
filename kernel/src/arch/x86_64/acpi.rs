@@ -1,8 +1,7 @@
-use system_error::SystemError;
-
-use crate::{driver::acpi::acpi_manager, kinfo, mm::percpu::PerCpu, smp::cpu::ProcessorId};
-
 use super::smp::SMP_BOOT_DATA;
+use crate::{driver::acpi::acpi_manager, mm::percpu::PerCpu, smp::cpu::ProcessorId};
+use log::info;
+use system_error::SystemError;
 
 pub(super) fn early_acpi_boot_init() -> Result<(), SystemError> {
     // 在这里解析madt，初始化smp boot data
@@ -26,7 +25,7 @@ pub(super) fn early_acpi_boot_init() -> Result<(), SystemError> {
         SMP_BOOT_DATA.set_cpu_count(cnt.data());
         SMP_BOOT_DATA.mark_initialized();
     }
-    kinfo!(
+    info!(
         "early_acpi_boot_init: cpu_count: {}\n",
         SMP_BOOT_DATA.cpu_count()
     );

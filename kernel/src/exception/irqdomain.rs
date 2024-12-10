@@ -6,19 +6,23 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::{info, warn};
 use system_error::SystemError;
 
 use crate::{
     driver::{base::device::Device, open_firmware::device_node::DeviceNode},
     exception::{irqdata::IrqLineStatus, irqdesc::irq_desc_manager, manage::irq_manager},
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        spinlock::SpinLock,
+    },
 };
 
 use super::{
     dummychip::no_irq_chip,
     irqchip::{IrqChip, IrqChipData, IrqChipGeneric, IrqGcFlags},
     irqdata::{IrqData, IrqHandlerData},
-    irqdesc::IrqFlowHandler,
+    irqdesc::{IrqDesc, IrqFlowHandler},
     HardwareIrqNumber, IrqNumber,
 };
 
@@ -107,8 +111,6 @@ impl IrqDomainManager {
 
         self.add_domain(domain.clone());
 
-        self.domain_associate_many(&domain, first_irq, first_hwirq, irq_size);
-
         return Some(domain);
     }
 
@@ -156,7 +158,7 @@ impl IrqDomainManager {
     ) {
         for i in 0..count {
             if let Err(e) = self.domain_associate(domain, first_irq + i, first_hwirq + i) {
-                kwarn!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), (first_hwirq + i).data(), (first_irq + i).data());
+                warn!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), (first_hwirq + i).data(), (first_irq + i).data());
             }
         }
     }
@@ -171,7 +173,7 @@ impl IrqDomainManager {
         hwirq: HardwareIrqNumber,
     ) -> Result<(), SystemError> {
         if hwirq >= domain.revmap.read_irqsave().hwirq_max {
-            kwarn!(
+            warn!(
                 "hwirq {} is out of range for domain {:?}",
                 hwirq.data(),
                 domain.name()
@@ -181,12 +183,12 @@ impl IrqDomainManager {
         let irq_data = irq_desc_manager()
             .lookup(irq)
             .ok_or_else(|| {
-                kwarn!("irq_desc not found for irq {}", irq.data());
+                warn!("irq_desc not found for irq {}", irq.data());
                 SystemError::EINVAL
             })?
             .irq_data();
         if irq_data.domain().is_some() {
-            kwarn!(
+            warn!(
                 "irq {} is already associated with domain {:?}",
                 irq.data(),
                 irq_data.domain().unwrap().name()
@@ -202,7 +204,7 @@ impl IrqDomainManager {
         if let Err(e) = r {
             if e != SystemError::ENOSYS {
                 if e != SystemError::EPERM {
-                    kinfo!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), hwirq.data(), irq.data());
+                    info!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), hwirq.data(), irq.data());
                 }
                 let mut irq_data_guard = irq_data.inner();
                 irq_data_guard.set_domain(None);
@@ -245,6 +247,10 @@ impl IrqDomainManager {
     /// 这是调用 domain_ops->activate 以编程中断控制器的第二步，以便中断实际上可以被传递。
     pub fn activate_irq(&self, irq_data: &Arc<IrqData>, reserve: bool) -> Result<(), SystemError> {
         let mut r = Ok(());
+        // debug!(
+        //     "activate_irq: irq_data.common_data().status().is_activated()={}",
+        //     irq_data.common_data().status().is_activated()
+        // );
         if !irq_data.common_data().status().is_activated() {
             r = self.do_activate_irq(Some(irq_data.clone()), reserve);
         }
@@ -265,7 +271,9 @@ impl IrqDomainManager {
         let mut r = Ok(());
 
         if let Some(irq_data) = irq_data {
+            // debug!("do_activate_irq: irq_data={:?}", irq_data);
             if let Some(domain) = irq_data.domain() {
+                // debug!("do_activate_irq: domain={:?}", domain.name());
                 let parent_data = irq_data.parent_data().and_then(|x| x.upgrade());
                 if let Some(parent_data) = parent_data.clone() {
                     r = self.do_activate_irq(Some(parent_data), reserve);
@@ -311,6 +319,7 @@ impl IrqDomainManager {
     /// - `handler_data`: 中断流处理程序数据
     /// - `handler_name`: 中断处理程序名称
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn domain_set_info(
         &self,
         domain: &Arc<IrqDomain>,
@@ -388,6 +397,48 @@ impl IrqDomainManager {
         }
 
         return None;
+    }
+
+    /// `resolve_irq_mapping` - 从硬件中断号找到中断号。
+    ///
+    /// ## 参数
+    ///
+    /// - `domain`: 拥有此硬件中断的域
+    /// - `hwirq`: 该域空间中的硬件中断号
+    /// - `irq`: 如果需要，可选的指针以返回Linux中断
+    ///
+    /// ## 返回
+    ///
+    /// 返回一个元组，包含中断描述符和中断号
+    pub fn resolve_irq_mapping(
+        &self,
+        mut domain: Option<Arc<IrqDomain>>,
+        hwirq: HardwareIrqNumber,
+    ) -> Result<(Arc<IrqDesc>, IrqNumber), SystemError> {
+        if domain.is_none() {
+            domain = Some(self.default_domain().ok_or(SystemError::EINVAL)?);
+        }
+
+        let domain = domain.unwrap();
+
+        if domain.no_map() {
+            if hwirq < domain.revmap_read_irqsave().hwirq_max {
+                let irq_desc = irq_desc_manager()
+                    .lookup(IrqNumber::new(hwirq.data()))
+                    .ok_or(SystemError::EINVAL)?;
+                if irq_desc.irq_data().hardware_irq() == hwirq {
+                    let irq = irq_desc.irq_data().irq();
+                    return Ok((irq_desc, irq));
+                }
+            }
+
+            return Err(SystemError::EINVAL);
+        }
+
+        let revmap = domain.revmap_read_irqsave();
+        let irq_data = revmap.lookup(hwirq).ok_or(SystemError::EINVAL)?;
+        let irq_desc = irq_data.irq_desc().unwrap();
+        return Ok((irq_desc, irq_data.irq()));
     }
 }
 
@@ -481,8 +532,18 @@ impl IrqDomain {
     }
 
     #[allow(dead_code)]
+    fn revmap_read_irqsave(&self) -> RwLockReadGuard<IrqDomainRevMap> {
+        self.revmap.read_irqsave()
+    }
+
+    #[allow(dead_code)]
+    fn revmap_write_irqsave(&self) -> RwLockWriteGuard<IrqDomainRevMap> {
+        self.revmap.write_irqsave()
+    }
+
+    #[allow(dead_code)]
     fn set_hwirq_max(&self, hwirq_max: HardwareIrqNumber) {
-        self.revmap.write_irqsave().hwirq_max = hwirq_max;
+        self.revmap_write_irqsave().hwirq_max = hwirq_max;
     }
 
     pub fn name(&self) -> Option<String> {
@@ -497,14 +558,17 @@ impl IrqDomain {
     }
 
     /// The number of mapped interrupts
+    #[allow(dead_code)]
     pub fn map_count(&self) -> u32 {
-        self.revmap.read().map.len() as u32
+        self.revmap_read_irqsave().map.len() as u32
     }
 
+    #[allow(dead_code)]
     pub fn host_data(&self) -> Option<Arc<dyn IrqChipData>> {
         self.inner.lock_irqsave().host_data.clone()
     }
 
+    #[allow(dead_code)]
     pub fn set_host_data(&self, host_data: Option<Arc<dyn IrqChipData>>) {
         self.inner.lock_irqsave().host_data = host_data;
     }
@@ -584,6 +648,7 @@ pub enum IrqDomainBusToken {
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irqdomain.h#107
 pub trait IrqDomainOps: Debug + Send + Sync {
     /// 匹配一个中断控制器设备节点到一个主机。
+    #[allow(dead_code)]
     fn match_node(
         &self,
         _irq_domain: &Arc<IrqDomain>,
@@ -607,6 +672,7 @@ pub trait IrqDomainOps: Debug + Send + Sync {
     }
 
     /// 删除一个虚拟中断号与一个硬件中断号之间的映射。
+    #[allow(dead_code)]
     fn unmap(&self, irq_domain: &Arc<IrqDomain>, virq: IrqNumber);
 
     fn activate(

@@ -66,7 +66,7 @@ macro_rules! unified_init {
     ($initializer_slice:ident) => {
         for initializer in $initializer_slice.iter() {
             initializer.call().unwrap_or_else(|e| {
-                kerror!("Failed to call initializer {}: {:?}", initializer.name(), e);
+                log::error!("Failed to call initializer {}: {:?}", initializer.name(), e);
             });
         }
     };

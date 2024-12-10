@@ -122,7 +122,7 @@ pub struct NTtyData {
     read_flags: StaticBitmap<NTTY_BUFSIZE>,
     char_map: StaticBitmap<256>,
 
-    tty: Option<Weak<TtyCore>>,
+    tty: Weak<TtyCore>,
 }
 
 impl NTtyData {
@@ -151,7 +151,7 @@ impl NTtyData {
             echo_buf: [0; NTTY_BUFSIZE],
             read_flags: StaticBitmap::new(),
             char_map: StaticBitmap::new(),
-            tty: None,
+            tty: Weak::default(),
             no_room: false,
         }
     }
@@ -388,9 +388,9 @@ impl NTtyData {
                 continue;
             }
 
-            if self.char_map.get(c as usize).unwrap() {
+            if ((c as usize) < self.char_map.size()) && self.char_map.get(c as usize).unwrap() {
                 // 特殊字符
-                self.receive_special_char(c, tty.clone(), lookahead_done)
+                self.receive_special_char(c, tty.clone(), lookahead_done);
             } else {
                 self.receive_char(c, tty.clone());
             }
@@ -785,14 +785,11 @@ impl NTtyData {
         signal: Signal,
     ) {
         // 先处理信号
-        let mut ctrl_info = tty.core().contorl_info_irqsave();
+        let ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
         if let Some(pg) = pg {
             let _ = Syscall::kill(pg, signal as i32);
         }
-
-        ctrl_info.pgid = None;
-        ctrl_info.session = None;
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {
             // 重置
@@ -1168,7 +1165,7 @@ impl NTtyData {
         nr: usize,
     ) -> Result<usize, SystemError> {
         let mut nr = nr;
-        let tty = self.tty.clone().unwrap().upgrade().unwrap();
+        let tty = self.tty.upgrade().unwrap();
         let space = tty.write_room(tty.core());
 
         // 如果读取数量大于了可用空间，则取最小的为真正的写入数量
@@ -1209,7 +1206,8 @@ impl NTtyData {
                     if termios.output_mode.contains(OutputMode::OCRNL) {
                         break;
                     }
-                    self.canon_cursor_column = self.cursor_column;
+                    self.cursor_column = 0;
+                    self.canon_cursor_column = 0;
                 }
                 '\t' => {
                     break;
@@ -1344,7 +1342,7 @@ impl NTtyData {
                                     tty.write(core, &[8], 1)?;
                                 }
                                 if tty.put_char(tty.core(), b' ').is_err() {
-                                    tty.write(core, &[b' '], 1)?;
+                                    tty.write(core, b" ", 1)?;
                                 }
                                 self.cursor_column -= 1;
                                 space -= 1;
@@ -1357,7 +1355,7 @@ impl NTtyData {
                                 }
 
                                 if tty.put_char(tty.core(), b'^').is_err() {
-                                    tty.write(core, &[b'^'], 1)?;
+                                    tty.write(core, b"^", 1)?;
                                 }
 
                                 if tty.put_char(tty.core(), ch ^ 0o100).is_err() {
@@ -1541,7 +1539,7 @@ impl NTtyData {
 impl TtyLineDiscipline for NTtyLinediscipline {
     fn open(&self, tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
         // 反向绑定tty到disc
-        self.disc_data().tty = Some(Arc::downgrade(&tty));
+        self.disc_data().tty = Arc::downgrade(&tty);
         // 特定的tty设备在这里可能需要取消端口节流
         return self.set_termios(tty, None);
     }

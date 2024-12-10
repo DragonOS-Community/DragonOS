@@ -2,98 +2,97 @@ name: Build Check
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master", "feat-*", "fix-*"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master", "feat-*", "fix-*"]
 
 jobs:
-  # ensure the toolchain is cached
-  ensure-toolchain:
-    uses: ./.github/workflows/cache-toolchain.yml
-  
   format-check:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    needs: [ensure-toolchain]
     continue-on-error: true
+    container: dragonos/dragonos-dev:v1.8
 
     strategy:
       matrix:
         arch: [x86_64, riscv64]
 
     steps:
-    - uses: actions/checkout@v3
+      - run: echo "Running in dragonos/dragonos-dev:v1.8"
+      - uses: actions/checkout@v3
 
-    - uses: ./.github/actions/import-toolchain
-
-    - name: Format check
-      env:
+      - name: Format check
+        env:
           ARCH: ${{ matrix.arch }}
-      run: |
-            printf "\n" >> kernel/src/include/bindings/bindings.rs
-            FMT_CHECK=1 make fmt
-  
+          HOME: /root
+        shell: bash -ileo pipefail {0}
+        run: |
+          printf "\n" >> kernel/src/include/bindings/bindings.rs
+          sed -i 's/arch = ".*"/arch = "${{ matrix.arch }}"/' dadk-manifest.toml
+          FMT_CHECK=1 make fmt
+
   kernel-static-test:
     name: Kernel static test ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    needs: [ensure-toolchain]
     continue-on-error: true
+    container: dragonos/dragonos-dev:v1.8
 
     strategy:
       matrix:
         arch: [x86_64, riscv64]
 
     steps:
-    - uses: actions/checkout@v3
+      - run: echo "Running in dragonos/dragonos-dev:v1.8"
 
-    - uses: ./.github/actions/import-toolchain
+      - uses: actions/checkout@v3
 
-    - name: Run kernel static test
-      shell: bash -ileo pipefail {0}
-      env:
+      - name: Run kernel static test
+        shell: bash -ileo pipefail {0}
+        env:
           ARCH: ${{ matrix.arch }}
-      run: bash -c "source ~/.cargo/env && cd kernel && make test"
-    
+          HOME: /root
+        run: bash -c "source /root/.cargo/env && cd kernel && make test && make test-rbpf"
+
   build-x86_64:
-
     runs-on: ubuntu-latest
-    needs: [ensure-toolchain]
+    container: dragonos/dragonos-dev:v1.8
 
     steps:
-    - uses: actions/checkout@v3
+      - run: echo "Running in dragonos/dragonos-dev:v1.8"
 
-    - uses: ./.github/actions/import-toolchain
-
-      
-    - name: build the DragonOS
-      env:
+      - uses: actions/checkout@v3
+      - name: build the DragonOS
+        env:
           ARCH: x86_64
-      shell: bash -ileo pipefail {0}
+          HOME: /root
+        shell: bash -ileo pipefail {0}
 
-      run: |
-        source ~/.bashrc
-        source ~/.cargo/env
-        export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
-        
-        make -j $(nproc)
+        run: |
+          source ~/.bashrc
+          source ~/.cargo/env
+          export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
+          sed -i 's/arch = ".*"/arch = "${{ env.ARCH }}"/' dadk-manifest.toml
 
-  
+          make all -j $(nproc)
+
   build-riscv64:
-
     runs-on: ubuntu-latest
-    needs: [ensure-toolchain]
+    container: dragonos/dragonos-dev:v1.8
 
     steps:
-    - uses: actions/checkout@v3
-      with:
-        submodules: 'recursive'
+      - run: echo "Running in dragonos/dragonos-dev:v1.8"
 
-    - uses: ./.github/actions/import-toolchain
+      - uses: actions/checkout@v3
+        with:
+          submodules: "recursive"
 
-    - name: build the DragonOS
-      shell: bash -ileo pipefail {0}
-      env:
+      - name: build the DragonOS
+        shell: bash -ileo pipefail {0}
+        env:
           ARCH: riscv64
+          HOME: /root
 
-      run: source ~/.bashrc && source ~/.cargo/env && make kernel -j $(nproc)
-
+        run: |
+          source ~/.bashrc && source ~/.cargo/env
+          sed -i 's/arch = ".*"/arch = "${{ env.ARCH }}"/' dadk-manifest.toml
+          make kernel -j $(nproc)

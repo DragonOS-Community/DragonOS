@@ -9,6 +9,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::debug;
 use mem::LockedKvmMemSlot;
 use system_error::SystemError;
 
@@ -255,10 +256,9 @@ pub fn search_memslots(
     //let(start,end)=(0,node.len()-1);
     for (_gfn_num, slot) in node.iter() {
         let slot_guard = slot.read();
-        kdebug!(
+        debug!(
             "gfn:{gfn},slot base_gfn: {},slot npages: {}",
-            slot_guard.base_gfn,
-            slot_guard.npages
+            slot_guard.base_gfn, slot_guard.npages
         );
         if gfn >= slot_guard.base_gfn && gfn < slot_guard.base_gfn + slot_guard.npages as u64 {
             return Some(slot.clone());

@@ -37,6 +37,7 @@ use super::{
     handle::bad_irq_handler,
     irqchip::IrqChip,
     irqdata::{IrqCommonData, IrqData, IrqHandlerData, IrqLineStatus, IrqStatus},
+    irqdomain::{irq_domain_manager, IrqDomain},
     sysfs::{irq_sysfs_del, IrqKObjType},
     HardwareIrqNumber, InterruptArch, IrqNumber,
 };
@@ -113,17 +114,19 @@ impl IrqDesc {
                 kern_inode: None,
                 kset: None,
                 parent_kobj: None,
+                threads_oneshot: 0,
             }),
             request_mutex: Mutex::new(()),
             handler: RwLock::new(None),
             kobj_state: LockedKObjectState::new(Some(KObjectState::INITIALIZED)),
             threads_active: AtomicI64::new(0),
         };
-
+        let irq_desc = Arc::new(irq_desc);
+        irq_desc.irq_data().set_irq_desc(Arc::downgrade(&irq_desc));
         irq_desc.set_handler(bad_irq_handler());
         irq_desc.inner().irq_data.irqd_set(irqd_flags);
 
-        return Arc::new(irq_desc);
+        return irq_desc;
     }
 
     /// 返回当前活跃的中断线程数量
@@ -283,6 +286,16 @@ impl IrqDesc {
         );
     }
 
+    #[allow(dead_code)]
+    pub fn set_probe(&self) {
+        self.modify_status(IrqLineStatus::IRQ_NOPROBE, IrqLineStatus::empty());
+    }
+
+    #[allow(dead_code)]
+    pub fn set_noprobe(&self) {
+        self.modify_status(IrqLineStatus::empty(), IrqLineStatus::IRQ_NOPROBE);
+    }
+
     pub fn modify_status(&self, clear: IrqLineStatus, set: IrqLineStatus) {
         let mut desc_guard = self.inner();
         desc_guard.line_status.remove(clear);
@@ -363,6 +376,8 @@ pub struct InnerIrqDesc {
     /// per-cpu affinity
     percpu_affinity: Option<CpuMask>,
     // wait_for_threads: EventWaitQueue
+    /// bitfield to handle shared oneshot threads
+    threads_oneshot: u64,
 }
 
 impl InnerIrqDesc {
@@ -403,6 +418,7 @@ impl InnerIrqDesc {
         self.line_status.insert(IrqLineStatus::IRQ_NOTHREAD);
     }
 
+    #[allow(dead_code)]
     pub fn clear_nothread(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_NOTHREAD);
     }
@@ -438,8 +454,13 @@ impl InnerIrqDesc {
         !self.line_status.contains(IrqLineStatus::IRQ_NOAUTOEN)
     }
 
+    #[allow(dead_code)]
     pub fn can_thread(&self) -> bool {
         !self.line_status.contains(IrqLineStatus::IRQ_NOTHREAD)
+    }
+
+    pub fn threads_oneshot(&self) -> u64 {
+        self.threads_oneshot
     }
 
     /// 中断是否可以设置CPU亲和性
@@ -469,6 +490,7 @@ impl InnerIrqDesc {
         self.actions.clear();
     }
 
+    #[allow(dead_code)]
     pub fn remove_action(&mut self, action: &Arc<IrqAction>) {
         self.actions.retain(|a| !Arc::ptr_eq(a, action));
     }
@@ -489,14 +511,17 @@ impl InnerIrqDesc {
         &self.common_data
     }
 
+    #[allow(dead_code)]
     pub fn depth(&self) -> u32 {
         self.depth
     }
 
+    #[allow(dead_code)]
     pub fn wake_depth(&self) -> u32 {
         self.wake_depth
     }
 
+    #[allow(dead_code)]
     pub fn set_depth(&mut self, depth: u32) {
         self.depth = depth;
     }
@@ -523,6 +548,7 @@ impl InnerIrqDesc {
         &mut self.percpu_enabled
     }
 
+    #[allow(dead_code)]
     pub fn percpu_affinity(&self) -> &Option<CpuMask> {
         &self.percpu_affinity
     }
@@ -952,6 +978,7 @@ impl IrqDescManager {
     }
 
     /// 设置指定irq的可用cpu为所有cpu
+    #[allow(dead_code)]
     pub fn set_percpu_devid_all(&self, irq: IrqNumber) -> Result<(), SystemError> {
         self.set_percpu_devid(irq, None)
     }
@@ -984,6 +1011,38 @@ impl IrqDescManager {
         drop(desc_inner);
 
         desc.set_percpu_devid_flags();
+
+        return Ok(());
+    }
+}
+
+pub struct GenericIrqHandler;
+
+#[allow(dead_code)]
+impl GenericIrqHandler {
+    /// `handle_domain_irq` - 调用属于某个中断域的硬件中断的处理程序
+    ///
+    /// # 参数
+    ///
+    /// * `domain`: 执行查找的域
+    /// * `hwirq`: 要转换为逻辑中断的硬件中断号
+    ///
+    /// # 返回
+    ///
+    /// 成功时返回 `Ok(())`，如果转换失败则返回 `Err(SystemError)`
+    ///
+    /// 此函数必须在初始化了中断寄存器的中断上下文中调用
+    ///
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/irq/irqdesc.c?fi=generic_handle_domain_irq#726
+    pub fn handle_domain_irq(
+        domain: Arc<IrqDomain>,
+        hwirq: HardwareIrqNumber,
+        trap_frame: &mut TrapFrame,
+    ) -> Result<(), SystemError> {
+        let (irq_desc, _) =
+            irq_domain_manager().resolve_irq_mapping(Some(domain.clone()), hwirq)?;
+
+        irq_desc.handler().unwrap().handle(&irq_desc, trap_frame);
 
         return Ok(());
     }

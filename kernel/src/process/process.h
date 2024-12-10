@@ -12,7 +12,6 @@
 #include "ptrace.h"
 #include <common/errno.h>
 #include <common/glib.h>
-#include <syscall/syscall.h>
 
 /**
  * @brief 进程退出时执行的函数
@@ -32,6 +31,6 @@ extern uint32_t rs_current_pcb_cpuid();
 extern uint32_t rs_current_pcb_pid();
 extern uint32_t rs_current_pcb_preempt_count();
 extern uint32_t rs_current_pcb_flags();
-extern int64_t rs_current_pcb_thread_rbp();
+extern uint64_t rs_current_pcb_thread_rbp();
 
 #define PF_NEED_SCHED (1UL << 1)

@@ -11,6 +11,7 @@ use crate::libs::{
 
 use super::{
     irqchip::{IrqChip, IrqChipData},
+    irqdesc::IrqDesc,
     irqdomain::IrqDomain,
     msi::MsiDesc,
     HardwareIrqNumber, IrqNumber,
@@ -43,7 +44,7 @@ impl IrqData {
             inner: SpinLock::new(InnerIrqData {
                 hwirq,
                 common_data,
-
+                desc: Weak::new(),
                 domain: None,
                 parent_data: None,
             }),
@@ -69,6 +70,19 @@ impl IrqData {
 
     pub fn irq(&self) -> IrqNumber {
         self.irq
+    }
+
+    pub fn irq_desc(&self) -> Option<Arc<IrqDesc>> {
+        self.inner.lock_irqsave().desc.upgrade()
+    }
+
+    pub fn set_irq_desc(&self, desc: Weak<IrqDesc>) {
+        self.inner.lock_irqsave().desc = desc;
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_irq_desc(&self) {
+        self.inner.lock_irqsave().desc = Weak::new();
     }
 
     pub fn hardware_irq(&self) -> HardwareIrqNumber {
@@ -133,6 +147,8 @@ pub struct InnerIrqData {
     /// 涉及的所有irqchip之间共享的数据
     common_data: Arc<IrqCommonData>,
 
+    desc: Weak<IrqDesc>,
+
     /// 中断域
     domain: Option<Arc<IrqDomain>>,
     /// 中断的父中断（如果具有中断域继承的话）
@@ -195,6 +211,7 @@ impl IrqCommonData {
             handler_data: None,
             msi_desc: None,
             affinity: CpuMask::new(),
+            effective_affinity: CpuMask::new(),
         };
         return IrqCommonData {
             inner: SpinLock::new(inner),
@@ -289,6 +306,11 @@ impl IrqCommonData {
         self.inner.lock_irqsave().affinity = affinity;
     }
 
+    #[allow(dead_code)]
+    pub fn set_effective_affinity(&self, affinity: CpuMask) {
+        self.inner.lock_irqsave().effective_affinity = affinity;
+    }
+
     pub fn inner(&self) -> SpinLockGuard<InnerIrqCommonData> {
         self.inner.lock_irqsave()
     }
@@ -303,6 +325,7 @@ pub struct InnerIrqCommonData {
     handler_data: Option<Arc<dyn IrqHandlerData>>,
     msi_desc: Option<Arc<MsiDesc>>,
     affinity: CpuMask,
+    effective_affinity: CpuMask,
 }
 
 impl InnerIrqCommonData {
@@ -322,6 +345,11 @@ impl InnerIrqCommonData {
     #[allow(dead_code)]
     pub fn handler_data(&self) -> Option<Arc<dyn IrqHandlerData>> {
         self.handler_data.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn effective_affinity(&self) -> &CpuMask {
+        &self.effective_affinity
     }
 }
 
@@ -409,6 +437,7 @@ impl IrqLineStatus {
     ///
     /// - 如果不是电平触发类型，则返回None
     /// - 如果是电平触发类型，则返回Some(bool)，当为true时表示高电平触发
+    #[allow(dead_code)]
     pub fn is_level_high(&self) -> Option<bool> {
         if !self.is_level_type() {
             return None;

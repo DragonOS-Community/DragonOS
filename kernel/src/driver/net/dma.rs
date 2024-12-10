@@ -3,7 +3,7 @@ use crate::arch::mm::kernel_page_flags;
 use crate::arch::MMArch;
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{page_manager_lock_irqsave, PageFlags};
+use crate::mm::page::{page_manager_lock_irqsave, EntryFlags};
 use crate::mm::{
     allocator::page_frame::{
         allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
@@ -17,7 +17,9 @@ const PAGE_SIZE: usize = 4096;
 /// @return PhysAddr 获得的内存页的初始物理地址
 pub fn dma_alloc(pages: usize) -> (usize, NonNull<u8>) {
     let page_num = PageFrameCount::new(
-        ((pages * PAGE_SIZE + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE).next_power_of_two(),
+        (pages * PAGE_SIZE)
+            .div_ceil(MMArch::PAGE_SIZE)
+            .next_power_of_two(),
     );
     unsafe {
         let (paddr, count) = allocate_page_frames(page_num).expect("e1000e: alloc page failed");
@@ -25,7 +27,7 @@ pub fn dma_alloc(pages: usize) -> (usize, NonNull<u8>) {
         // 清空这块区域，防止出现脏数据
         core::ptr::write_bytes(virt.data() as *mut u8, 0, count.data() * MMArch::PAGE_SIZE);
 
-        let dma_flags: PageFlags<MMArch> = PageFlags::mmio_flags();
+        let dma_flags: EntryFlags<MMArch> = EntryFlags::mmio_flags();
 
         let mut kernel_mapper = KernelMapper::lock();
         let kernel_mapper = kernel_mapper.as_mut().unwrap();
@@ -44,7 +46,9 @@ pub fn dma_alloc(pages: usize) -> (usize, NonNull<u8>) {
 /// @return i32 0表示成功
 pub unsafe fn dma_dealloc(paddr: usize, vaddr: NonNull<u8>, pages: usize) -> i32 {
     let page_count = PageFrameCount::new(
-        ((pages * PAGE_SIZE + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE).next_power_of_two(),
+        (pages * PAGE_SIZE)
+            .div_ceil(MMArch::PAGE_SIZE)
+            .next_power_of_two(),
     );
 
     // 恢复页面属性

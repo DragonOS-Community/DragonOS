@@ -59,6 +59,7 @@ impl TSSManager {
         x86::task::load_tr(selector);
     }
 
+    #[allow(static_mut_refs)]
     unsafe fn set_tss_descriptor(index: u16, vaddr: VirtAddr) {
         const LIMIT: u64 = 103;
         let gdt_vaddr = VirtAddr::new(&GDT_Table as *const _ as usize);

@@ -9,10 +9,10 @@ use super::{
 use crate::{
     driver::base::kobject::KObject,
     filesystem::vfs::ROOT_INODE,
-    kinfo, kwarn,
     libs::{casting::DowncastArc, once::Once},
 };
 use alloc::sync::Arc;
+use log::{info, warn};
 use system_error::SystemError;
 
 pub mod dir;
@@ -34,7 +34,7 @@ pub fn sysfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing SysFS...");
+        info!("Initializing SysFS...");
 
         // 创建 sysfs 实例
         // let sysfs: Arc<OldSysFS> = OldSysFS::new();
@@ -42,14 +42,14 @@ pub fn sysfs_init() -> Result<(), SystemError> {
         unsafe { SYSFS_INSTANCE = Some(sysfs) };
 
         // sysfs 挂载
-        let _t = ROOT_INODE()
-            .find("sys")
-            .expect("Cannot find /sys")
+        ROOT_INODE()
+            .mkdir("sys", ModeType::from_bits_truncate(0o755))
+            .expect("Unabled to find /sys")
             .mount(sysfs_instance().fs().clone())
-            .expect("Failed to mount sysfs");
-        kinfo!("SysFS mounted.");
+            .expect("Failed to mount at /sys");
+        info!("SysFS mounted.");
 
-        // kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
+        // debug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
         result = Some(Ok(()));
     });
 
@@ -74,7 +74,7 @@ impl SysFSKernPrivateData {
                 return Ok(len);
             }
             _ => {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         }
     }
@@ -86,7 +86,7 @@ impl SysFSKernPrivateData {
                 return file.callback_write(buf, offset);
             }
             _ => {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         }
     }
@@ -107,7 +107,13 @@ pub trait AttributeGroup: Debug + Send + Sync {
     ///
     /// 如果返回Some，则使用返回的权限。
     /// 如果要标识属性不可见，则返回Some(ModeType::empty())
-    fn is_visible(&self, kobj: Arc<dyn KObject>, attr: &'static dyn Attribute) -> Option<ModeType>;
+    fn is_visible(
+        &self,
+        _kobj: Arc<dyn KObject>,
+        attr: &'static dyn Attribute,
+    ) -> Option<ModeType> {
+        return Some(attr.mode());
+    }
 }
 
 /// sysfs只读属性文件的权限
@@ -125,11 +131,11 @@ pub trait Attribute: Debug + Send + Sync {
     fn support(&self) -> SysFSOpsSupport;
 
     fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 }
 
@@ -142,7 +148,7 @@ pub trait BinAttribute: Attribute {
         _buf: &[u8],
         _offset: usize,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn read(
@@ -151,7 +157,7 @@ pub trait BinAttribute: Attribute {
         _buf: &mut [u8],
         _offset: usize,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn size(&self) -> usize;
@@ -221,6 +227,6 @@ impl SysFS {
     /// 警告：重复的sysfs entry
     pub(self) fn warn_duplicate(&self, parent: &Arc<KernFSInode>, name: &str) {
         let path = self.kernfs_path(parent);
-        kwarn!("duplicate sysfs entry: {path}/{name}");
+        warn!("duplicate sysfs entry: {path}/{name}");
     }
 }

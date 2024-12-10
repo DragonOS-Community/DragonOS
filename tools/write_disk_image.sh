@@ -1,5 +1,5 @@
 ###############################################
-# 该脚本用于将disk_mount目录下的文件写入到disk-${ARCH}.img的第一个分区中，
+# 该脚本用于将文件拷贝到磁盘镜像中，
 #       并在磁盘镜像中安装grub引导程序
 #
 # 用法：bash write_disk_image.sh --bios legacy/uefi
@@ -11,15 +11,16 @@
 echo "ARCH=${ARCH}"
 # 给ARCH变量赋默认值
 export ARCH=${ARCH:=x86_64}
+export DADK=${DADK:=dadk}
 
-DISK_NAME=disk-${ARCH}.img
 
 # 内核映像
 root_folder=$(dirname $(pwd))
 kernel="${root_folder}/bin/kernel/kernel.elf"
-boot_folder="${root_folder}/bin/disk_mount/boot"
+mount_folder=$($DADK -w $root_folder rootfs show-mountpoint || exit 1)
+boot_folder="${mount_folder}/boot"
 GRUB_INSTALL_PATH="${boot_folder}/grub"
-mount_folder="${root_folder}/bin/disk_mount"
+
 ARGS=`getopt -o p -l bios: -- "$@"`
 eval set -- "${ARGS}"
 #echo formatted parameters=[$@]
@@ -67,34 +68,17 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     fi
 fi
 
-# 判断是否存在硬盘镜像文件，如果不存在，就创建一个(docker模式下，由于镜像中缺少qemu-img不会创建)
-if [ ! -f "${root_folder}/bin/${DISK_NAME}" ]; then
-    echo "创建硬盘镜像文件..."
-    case "$1" in
-        --bios) 
-        case "$2" in
-                uefi)
-            sudo ARCH=${ARCH} bash ./create_hdd_image.sh -P MBR #GPT分区    用GPT分区uefi启动不了 内核没有针对gpt分区表来做处理
-            ;;
-                legacy)
-            sudo ARCH=${ARCH} bash ./create_hdd_image.sh -P MBR #MBR分区
-            ;;
-            esac       
-        ;;
-    *)
-        # 默认创建MBR分区
-        sudo ARCH=${ARCH} bash ./create_hdd_image.sh -P MBR #MBR分区
-        ;;
-    esac
-fi
+# 判断是否存在硬盘镜像文件，如果不存在，就创建一个
+echo "创建硬盘镜像文件..."
+$DADK -w $root_folder rootfs create --skip-if-exists || exit 1
 
-# 拷贝程序到硬盘
-mkdir -p ${root_folder}/bin/disk_mount
-bash mount_virt_disk.sh || exit 1
+$DADK -w $root_folder rootfs mount || exit 1
 
-LOOP_DEVICE=$(lsblk | grep disk_mount|sed 's/.*\(loop[0-9]*\)p1.*/\1/1g'|awk 'END{print $0}')
+
+
+LOOP_DEVICE=$($DADK -w $root_folder rootfs show-loop-device || exit 1)
 echo $LOOP_DEVICE
-
+echo ${mount_folder}
 # mkdir -p ${GRUB_INSTALL_PATH}
 
 # 检测grub文件夹是否存在
@@ -107,28 +91,26 @@ fi
 
 
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
-    cp ${kernel} ${root_folder}/bin/disk_mount/boot/
+    cp ${kernel} ${mount_folder}/boot/
 fi
 
 # 拷贝用户程序到磁盘镜像
-mkdir -p ${root_folder}/bin/disk_mount/bin
-mkdir -p ${root_folder}/bin/disk_mount/dev
-mkdir -p ${root_folder}/bin/disk_mount/proc
-mkdir -p ${root_folder}/bin/disk_mount/usr
-touch ${root_folder}/bin/disk_mount/dev/keyboard.dev
-cp -r ${root_folder}/bin/sysroot/* ${root_folder}/bin/disk_mount/
+mkdir -p ${mount_folder}/bin
+mkdir -p ${mount_folder}/dev
+mkdir -p ${mount_folder}/proc
+mkdir -p ${mount_folder}/usr
+cp -r ${root_folder}/bin/sysroot/* ${mount_folder}/
 
 # 设置 grub 相关数据
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     
-    touch ${root_folder}/bin/disk_mount/boot/grub/grub.cfg
+    touch ${mount_folder}/boot/grub/grub.cfg
 cfg_content='set timeout=15
     set default=0
     insmod efi_gop
     menuentry "DragonOS" {
-    multiboot2 /boot/kernel.elf "KERNEL_ELF"
+    multiboot2 /boot/kernel.elf init=/bin/dragonreach
 }'
-
 # 增加insmod efi_gop防止32位uefi启动报错
 echo "echo '${cfg_content}' >  ${boot_folder}/grub/grub.cfg" | sh
 fi
@@ -155,7 +137,7 @@ if [ "${INSTALL_GRUB_TO_IMAGE}" = "1" ];then
                 ;;
                     legacy) #传统bios
                     if [ ${ARCH} == "x86_64" ];then
-                        ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
+                        ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} $LOOP_DEVICE
                     elif [ ${ARCH} == "riscv64" ];then
                         install_riscv64_efi
                     else
@@ -166,11 +148,12 @@ if [ "${INSTALL_GRUB_TO_IMAGE}" = "1" ];then
             ;;
         *)
         #传统bios
-        ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} /dev/$LOOP_DEVICE
+        ${GRUB_PATH_I386_LEGACY_INSTALL} --target=i386-pc --boot-directory=${boot_folder} $LOOP_DEVICE
         ;;
-            
+
     esac
 fi
 
 sync
-bash umount_virt_disk.sh
+
+$DADK -w $root_folder rootfs umount || exit 1

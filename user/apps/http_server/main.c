@@ -11,7 +11,7 @@
 #define MAX_REQUEST_SIZE 1500
 #define MAX_RESPONSE_SIZE 1500
 // 网页根目录
-#define WEB_ROOT "/wwwroot/First-WebPage-On-DragonOS"
+#define WEB_ROOT "/var/www/html/"
 #define EXIT_CODE 1
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
@@ -233,6 +233,8 @@ int main(int argc, char const *argv[])
         // 关闭客户端连接
         close(new_socket);
     }
+    // 关闭tcp socket
+    close(server_fd);
 
     return 0;
 }

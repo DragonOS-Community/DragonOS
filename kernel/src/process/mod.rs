@@ -1,4 +1,5 @@
 use core::{
+    fmt,
     hash::Hash,
     hint::spin_loop,
     intrinsics::{likely, unlikely},
@@ -7,11 +8,14 @@ use core::{
 };
 
 use alloc::{
+    ffi::CString,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
+use cred::INIT_CRED;
 use hashbrown::HashMap;
+use log::{debug, error, info, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -28,7 +32,6 @@ use crate::{
         vfs::{file::FileDescriptorVec, FileType},
     },
     ipc::signal_types::{SigInfo, SigPending, SignalStruct},
-    kdebug, kinfo,
     libs::{
         align::AlignedBox,
         casting::DowncastArc,
@@ -47,11 +50,11 @@ use crate::{
         ucontext::AddressSpace,
         VirtAddr,
     },
+    namespaces::{mnt_namespace::FsStruct, pid_namespace::PidStrcut, NsProxy},
     net::socket::SocketInode,
-    sched::completion::Completion,
     sched::{
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode,
-        WakeupFlags, __schedule,
+        completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
+        EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule,
     },
     smp::{
         core::smp_get_processor_id,
@@ -60,11 +63,13 @@ use crate::{
     },
     syscall::{user_access::clear_user, Syscall},
 };
+use timer::AlarmTimer;
 
-use self::kthread::WorkerPrivate;
+use self::{cred::Cred, kthread::WorkerPrivate};
 
 pub mod abi;
 pub mod c_adapter;
+pub mod cred;
 pub mod exec;
 pub mod exit;
 pub mod fork;
@@ -74,6 +79,7 @@ pub mod pid;
 pub mod resource;
 pub mod stdio;
 pub mod syscall;
+pub mod timer;
 pub mod utils;
 
 /// 系统中所有进程的pcb
@@ -84,7 +90,6 @@ pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 /// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
 static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 
-#[derive(Debug)]
 pub struct SwitchResult {
     pub prev_pcb: Option<Arc<ProcessControlBlock>>,
     pub next_pcb: Option<Arc<ProcessControlBlock>>,
@@ -114,24 +119,24 @@ impl ProcessManager {
 
         unsafe {
             compiler_fence(Ordering::SeqCst);
-            kdebug!("To create address space for INIT process.");
+            debug!("To create address space for INIT process.");
             // test_buddy();
             set_IDLE_PROCESS_ADDRESS_SPACE(
                 AddressSpace::new(true).expect("Failed to create address space for INIT process."),
             );
-            kdebug!("INIT process address space created.");
+            debug!("INIT process address space created.");
             compiler_fence(Ordering::SeqCst);
         };
 
         ALL_PROCESS.lock_irqsave().replace(HashMap::new());
         Self::init_switch_result();
         Self::arch_init();
-        kdebug!("process arch init done.");
+        debug!("process arch init done.");
         Self::init_idle();
-        kdebug!("process idle init done.");
+        debug!("process idle init done.");
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
-        kinfo!("Process Manager initialized.");
+        info!("Process Manager initialized.");
     }
 
     fn init_switch_result() {
@@ -145,6 +150,7 @@ impl ProcessManager {
     }
 
     /// 判断进程管理器是否已经初始化完成
+    #[allow(dead_code)]
     pub fn initialized() -> bool {
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE }
     }
@@ -152,7 +158,7 @@ impl ProcessManager {
     /// 获取当前进程的pcb
     pub fn current_pcb() -> Arc<ProcessControlBlock> {
         if unlikely(unsafe { !__PROCESS_MANAGEMENT_INIT_DONE }) {
-            kerror!("unsafe__PROCESS_MANAGEMENT_INIT_DONE == false");
+            error!("unsafe__PROCESS_MANAGEMENT_INIT_DONE == false");
             loop {
                 spin_loop();
             }
@@ -269,7 +275,12 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap().data() as usize);
+                let rq = cpu_rq(
+                    pcb.sched_info()
+                        .on_cpu()
+                        .unwrap_or(smp_get_processor_id())
+                        .data() as usize,
+                );
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();
@@ -359,7 +370,7 @@ impl ProcessManager {
             let parent_pcb = r.unwrap();
             let r = Syscall::kill(parent_pcb.pid(), Signal::SIGCHLD as i32);
             if r.is_err() {
-                kwarn!(
+                warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",
                     current.pid(),
                     parent_pcb.pid()
@@ -415,11 +426,20 @@ impl ProcessManager {
         }
         drop(thread);
         unsafe { pcb.basic_mut().set_user_vm(None) };
+        pcb.exit_files();
+
+        // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
+        // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
+        if let Some(tty) = pcb.sig_info_irqsave().tty() {
+            tty.core().contorl_info_irqsave().pgid = None;
+        }
+        pcb.sig_info_mut().set_tty(None);
+
         drop(pcb);
         ProcessManager::exit_notify();
         // unsafe { CurrentIrqArch::interrupt_enable() };
         __schedule(SchedMode::SM_NONE);
-        kerror!("pid {pid:?} exited but sched again!");
+        error!("pid {pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
         loop {
             spin_loop();
@@ -439,7 +459,7 @@ impl ProcessManager {
             // } else {
             //     // 如果不为1就panic
             //     let msg = format!("pcb '{:?}' is still referenced, strong count={}",pcb.pid(),  Arc::strong_count(&pcb));
-            //     kerror!("{}", msg);
+            //     error!("{}", msg);
             //     panic!()
             // }
 
@@ -449,7 +469,7 @@ impl ProcessManager {
 
     /// 上下文切换完成后的钩子函数
     unsafe fn switch_finish_hook() {
-        // kdebug!("switch_finish_hook");
+        // debug!("switch_finish_hook");
         let prev_pcb = PROCESS_SWITCH_RESULT
             .as_mut()
             .unwrap()
@@ -466,8 +486,13 @@ impl ProcessManager {
             .expect("next_pcb is None");
 
         // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
+        fence(Ordering::SeqCst);
+
         prev_pcb.arch_info.force_unlock();
+        fence(Ordering::SeqCst);
+
         next_pcb.arch_info.force_unlock();
+        fence(Ordering::SeqCst);
     }
 
     /// 如果目标进程正在目标CPU上运行，那么就让这个cpu陷入内核态
@@ -504,9 +529,9 @@ pub unsafe fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl ToString for Pid {
-    fn to_string(&self) -> String {
-        self.0.to_string()
+impl fmt::Display for Pid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -589,14 +614,14 @@ bitflags! {
         const RANDOMIZE = 1 << 8;
     }
 }
-
 #[derive(Debug)]
 pub struct ProcessControlBlock {
     /// 当前进程的pid
     pid: Pid,
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
     tgid: Pid,
-
+    /// 有关Pid的相关的信息
+    thread_pid: Arc<RwLock<PidStrcut>>,
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
@@ -634,8 +659,20 @@ pub struct ProcessControlBlock {
     /// 线程信息
     thread: RwLock<ThreadInfo>,
 
+    /// 进程文件系统的状态
+    fs: Arc<SpinLock<FsStruct>>,
+
+    ///闹钟定时器
+    alarm_timer: SpinLock<Option<AlarmTimer>>,
+
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
+
+    /// namespace的指针
+    nsproxy: Arc<RwLock<NsProxy>>,
+
+    /// 进程作为主体的凭证集
+    cred: SpinLock<Cred>,
 }
 
 impl ProcessControlBlock {
@@ -661,17 +698,33 @@ impl ProcessControlBlock {
         return Self::do_create_pcb(name, kstack, true);
     }
 
+    /// # 函数的功能
+    ///
+    /// 返回此函数是否是内核进程
+    ///
+    /// # 返回值
+    ///
+    /// 若进程是内核进程则返回true 否则返回false
+    pub fn is_kthread(&self) -> bool {
+        return matches!(self.flags(), &mut ProcessFlags::KTHREAD);
+    }
+
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
-        let (pid, ppid, cwd) = if is_idle {
-            (Pid(0), Pid(0), "/".to_string())
+        let (pid, ppid, cwd, cred, tty) = if is_idle {
+            let cred = INIT_CRED.clone();
+            (Pid(0), Pid(0), "/".to_string(), cred, None)
         } else {
             let ppid = ProcessManager::current_pcb().pid();
+            let mut cred = ProcessManager::current_pcb().cred();
+            cred.cap_permitted = cred.cap_ambient;
+            cred.cap_effective = cred.cap_ambient;
             let cwd = ProcessManager::current_pcb().basic().cwd();
-            (Self::generate_pid(), ppid, cwd)
+            let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
+            (Self::generate_pid(), ppid, cwd, cred, tty)
         };
 
-        let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
+        let basic_info = ProcessBasicInfo::new(Pid(0), ppid, Pid(0), name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
@@ -681,10 +734,10 @@ impl ProcessControlBlock {
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
-
         let pcb = Self {
             pid,
             tgid: pid,
+            thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
             basic: basic_info,
             preempt_count,
             flags,
@@ -701,8 +754,14 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
+            fs: Arc::new(SpinLock::new(FsStruct::new())),
+            alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
+            nsproxy: Arc::new(RwLock::new(NsProxy::new())),
+            cred: SpinLock::new(cred),
         };
+
+        pcb.sig_info.write().set_tty(tty);
 
         // 初始化系统调用栈
         #[cfg(target_arch = "x86_64")]
@@ -818,6 +877,10 @@ impl ProcessControlBlock {
         return self.kernel_stack.read();
     }
 
+    pub unsafe fn kernel_stack_force_ref(&self) -> &KernelStack {
+        self.kernel_stack.force_get_ref()
+    }
+
     #[inline(always)]
     #[allow(dead_code)]
     pub fn kernel_stack_mut(&self) -> RwLockWriteGuard<KernelStack> {
@@ -840,14 +903,29 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    pub fn pid_strcut(&self) -> Arc<RwLock<PidStrcut>> {
+        self.thread_pid.clone()
+    }
+
+    #[inline(always)]
     pub fn tgid(&self) -> Pid {
         return self.tgid;
+    }
+
+    #[inline(always)]
+    pub fn fs_struct(&self) -> Arc<SpinLock<FsStruct>> {
+        self.fs.clone()
     }
 
     /// 获取文件描述符表的Arc指针
     #[inline(always)]
     pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
         return self.basic.read().fd_table().unwrap();
+    }
+
+    #[inline(always)]
+    pub fn cred(&self) -> Cred {
+        self.cred.lock().clone()
     }
 
     /// 根据文件描述符序号，获取socket对象的Arc指针
@@ -894,11 +972,11 @@ impl ProcessControlBlock {
     }
 
     /// 生成进程的名字
-    pub fn generate_name(program_path: &str, args: &Vec<String>) -> String {
+    pub fn generate_name(program_path: &str, args: &Vec<CString>) -> String {
         let mut name = program_path.to_string();
         for arg in args {
             name.push(' ');
-            name.push_str(arg);
+            name.push_str(arg.to_string_lossy().as_ref());
         }
         return name;
     }
@@ -931,6 +1009,14 @@ impl ProcessControlBlock {
         return None;
     }
 
+    /// 判断当前进程是否有未处理的信号
+    pub fn has_pending_signal(&self) -> bool {
+        let sig_info = self.sig_info_irqsave();
+        let has_pending = sig_info.sig_pending().has_pending();
+        drop(sig_info);
+        return has_pending;
+    }
+
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
     }
@@ -957,6 +1043,31 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn set_robust_list(&self, new_robust_list: Option<RobustListHead>) {
         *self.robust_list.write_irqsave() = new_robust_list;
+    }
+
+    pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<Option<AlarmTimer>> {
+        return self.alarm_timer.lock_irqsave();
+    }
+
+    pub fn get_nsproxy(&self) -> Arc<RwLock<NsProxy>> {
+        self.nsproxy.clone()
+    }
+
+    pub fn set_nsproxy(&self, nsprsy: NsProxy) {
+        *self.nsproxy.write() = nsprsy;
+    }
+
+    /// Exit fd table when process exit
+    fn exit_files(&self) {
+        self.basic.write_irqsave().set_fd_table(None);
+    }
+
+    pub fn children_read_irqsave(&self) -> RwLockReadGuard<Vec<Pid>> {
+        self.children.read_irqsave()
+    }
+
+    pub fn threads_read_irqsave(&self) -> RwLockReadGuard<ThreadInfo> {
+        self.thread.read_irqsave()
     }
 }
 
@@ -989,6 +1100,12 @@ pub struct ThreadInfo {
     group_leader: Weak<ProcessControlBlock>,
 }
 
+impl Default for ThreadInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ThreadInfo {
     pub fn new() -> Self {
         Self {
@@ -1013,6 +1130,8 @@ pub struct ProcessBasicInfo {
     pgid: Pid,
     /// 当前进程的父进程的pid
     ppid: Pid,
+    /// 当前进程所属会话id
+    sid: Pid,
     /// 进程的名字
     name: String,
 
@@ -1031,6 +1150,7 @@ impl ProcessBasicInfo {
     pub fn new(
         pgid: Pid,
         ppid: Pid,
+        sid: Pid,
         name: String,
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
@@ -1039,6 +1159,7 @@ impl ProcessBasicInfo {
         return RwLock::new(Self {
             pgid,
             ppid,
+            sid,
             name,
             cwd,
             user_vm,
@@ -1052,6 +1173,10 @@ impl ProcessBasicInfo {
 
     pub fn ppid(&self) -> Pid {
         return self.ppid;
+    }
+
+    pub fn sid(&self) -> Pid {
+        return self.sid;
     }
 
     pub fn name(&self) -> &str {
@@ -1111,6 +1236,7 @@ pub struct ProcessSchedulerInfo {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct SchedInfo {
     /// 记录任务在特定 CPU 上运行的次数
     pub pcount: usize,
@@ -1123,6 +1249,7 @@ pub struct SchedInfo {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PrioData {
     pub prio: i32,
     pub static_prio: i32,
@@ -1348,7 +1475,7 @@ impl KernelStack {
 
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误
         if unlikely(unsafe { !(*stack_bottom_ptr).is_null() }) {
-            kerror!("kernel stack bottom is not null: {:p}", *stack_bottom_ptr);
+            error!("kernel stack bottom is not null: {:p}", *stack_bottom_ptr);
             return Err(SystemError::EPERM);
         }
         // 将pcb的地址放到内核栈的最低地址处
@@ -1458,8 +1585,8 @@ impl ProcessSignalInfo {
         self.tty.clone()
     }
 
-    pub fn set_tty(&mut self, tty: Arc<TtyCore>) {
-        self.tty = Some(tty);
+    pub fn set_tty(&mut self, tty: Option<Arc<TtyCore>>) {
+        self.tty = tty;
     }
 
     /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号

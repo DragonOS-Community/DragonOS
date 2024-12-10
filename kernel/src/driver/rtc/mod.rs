@@ -47,6 +47,7 @@ pub trait RtcDevice: Device {
     fn class_ops(&self) -> &'static dyn RtcClassOps;
 }
 
+#[allow(dead_code)]
 pub trait RtcClassOps: Send + Sync + Debug {
     fn read_time(&self, dev: &Arc<dyn RtcDevice>) -> Result<RtcTime, SystemError>;
     fn set_time(&self, dev: &Arc<dyn RtcDevice>, time: &RtcTime) -> Result<(), SystemError>;

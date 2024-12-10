@@ -8,3 +8,6 @@ endif
 ifeq ($(EMULATOR), )
 export EMULATOR=__NO_EMULATION__
 endif
+
+
+export DADK?=$(shell which dadk)

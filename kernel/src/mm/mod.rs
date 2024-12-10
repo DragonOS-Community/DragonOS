@@ -1,7 +1,8 @@
 use alloc::sync::Arc;
+use page::EntryFlags;
 use system_error::SystemError;
 
-use crate::{arch::MMArch, include::bindings::bindings::PAGE_OFFSET};
+use crate::arch::MMArch;
 
 use core::{
     cmp,
@@ -16,14 +17,16 @@ use self::{
     allocator::page_frame::{VirtPageFrame, VirtPageFrameIter},
     memblock::MemoryAreaAttr,
     page::round_up_to_page_size,
-    ucontext::{AddressSpace, UserMapper},
+    ucontext::{AddressSpace, LockedVMA, UserMapper},
 };
 
 pub mod allocator;
 pub mod c_adapter;
 pub mod early_ioremap;
+pub mod fault;
 pub mod init;
 pub mod kernel_mapper;
+pub mod madvise;
 pub mod memblock;
 pub mod mmio_buddy;
 pub mod no_init;
@@ -38,7 +41,7 @@ static mut __IDLE_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
 bitflags! {
     /// Virtual memory flags
     #[allow(clippy::bad_bit_mask)]
-    pub struct VmFlags:u32{
+    pub struct VmFlags:usize{
         const VM_NONE = 0x00000000;
 
         const VM_READ = 0x00000001;
@@ -73,6 +76,46 @@ bitflags! {
         const VM_WIPEONFORK = 0x02000000;
         const VM_DONTDUMP = 0x04000000;
     }
+
+    /// 描述页面错误处理过程中发生的不同情况或结果
+        pub struct VmFaultReason:u32 {
+        const VM_FAULT_OOM = 0x000001;
+        const VM_FAULT_SIGBUS = 0x000002;
+        const VM_FAULT_MAJOR = 0x000004;
+        const VM_FAULT_WRITE = 0x000008;
+        const VM_FAULT_HWPOISON = 0x000010;
+        const VM_FAULT_HWPOISON_LARGE = 0x000020;
+        const VM_FAULT_SIGSEGV = 0x000040;
+        const VM_FAULT_NOPAGE = 0x000100;
+        const VM_FAULT_LOCKED = 0x000200;
+        const VM_FAULT_RETRY = 0x000400;
+        const VM_FAULT_FALLBACK = 0x000800;
+        const VM_FAULT_DONE_COW = 0x001000;
+        const VM_FAULT_NEEDDSYNC = 0x002000;
+        const VM_FAULT_COMPLETED = 0x004000;
+        const VM_FAULT_HINDEX_MASK = 0x0f0000;
+        const VM_FAULT_ERROR = 0x000001 | 0x000002 | 0x000040 | 0x000010 | 0x000020 | 0x000800;
+    }
+
+    pub struct MsFlags:usize {
+        const MS_ASYNC = 1;
+        const MS_INVALIDATE = 2;
+        const MS_SYNC = 4;
+    }
+}
+
+impl core::ops::Index<VmFlags> for [usize] {
+    type Output = usize;
+
+    fn index(&self, index: VmFlags) -> &Self::Output {
+        &self[index.bits]
+    }
+}
+
+impl core::ops::IndexMut<VmFlags> for [usize] {
+    fn index_mut(&mut self, index: VmFlags) -> &mut Self::Output {
+        &mut self[index.bits]
+    }
 }
 
 /// 获取内核IDLE进程的用户地址空间结构体
@@ -98,18 +141,6 @@ pub unsafe fn set_IDLE_PROCESS_ADDRESS_SPACE(address_space: Arc<AddressSpace>) {
         panic!("IDLE_PROCESS_ADDRESS_SPACE is already initialized");
     }
     __IDLE_PROCESS_ADDRESS_SPACE = Some(address_space);
-}
-
-/// @brief 将内核空间的虚拟地址转换为物理地址
-#[inline(always)]
-pub fn virt_2_phys(addr: usize) -> usize {
-    addr - PAGE_OFFSET as usize
-}
-
-/// @brief 将物理地址转换为内核空间的虚拟地址
-#[inline(always)]
-pub fn phys_2_virt(addr: usize) -> usize {
-    addr + PAGE_OFFSET as usize
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -406,7 +437,10 @@ impl Default for PhysMemoryArea {
     }
 }
 
+#[allow(dead_code)]
 pub trait MemoryManagementArch: Clone + Copy + Debug {
+    /// 是否支持缺页中断
+    const PAGE_FAULT_ENABLED: bool;
     /// 页面大小的shift（假如页面4K，那么这个值就是12,因为2^12=4096）
     const PAGE_SHIFT: usize;
     /// 每个页表的页表项数目。（以2^n次幂来表示）假如有512个页表项，那么这个值就是9
@@ -424,6 +458,8 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const ENTRY_FLAG_PRESENT: usize;
     /// 页表项为read only时的值
     const ENTRY_FLAG_READONLY: usize;
+    /// 页表项的write bit
+    const ENTRY_FLAG_WRITEABLE: usize;
     /// 页表项为可读写状态的值
     const ENTRY_FLAG_READWRITE: usize;
     /// 页面项标记页面为user page的值
@@ -440,6 +476,10 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const ENTRY_FLAG_DIRTY: usize;
     /// 当该位为1时，代表这个页面被处理器访问过
     const ENTRY_FLAG_ACCESSED: usize;
+    /// 标记该页表项指向的页是否为大页
+    const ENTRY_FLAG_HUGE_PAGE: usize;
+    /// 当该位为1时，代表该页表项是全局的
+    const ENTRY_FLAG_GLOBAL: usize;
 
     /// 虚拟地址与物理地址的偏移量
     const PHYS_OFFSET: usize;
@@ -468,6 +508,9 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const PAGE_ENTRY_NUM: usize = 1 << Self::PAGE_ENTRY_SHIFT;
     /// 该字段用于根据虚拟地址，获取该虚拟地址在对应的页表中是第几个页表项
     const PAGE_ENTRY_MASK: usize = Self::PAGE_ENTRY_NUM - 1;
+    /// 内核页表在顶级页表的第一个页表项的索引
+    const PAGE_KERNEL_INDEX: usize = (Self::PHYS_OFFSET & Self::PAGE_ADDRESS_MASK)
+        >> (Self::PAGE_ADDRESS_SHIFT - Self::PAGE_ENTRY_SHIFT);
 
     const PAGE_NEGATIVE_MASK: usize = !((Self::PAGE_ADDRESS_SIZE) - 1);
 
@@ -578,7 +621,7 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// 创建页表项
     ///
-    /// 这是一个低阶api，用于根据物理地址以及指定好的pageflags，创建页表项
+    /// 这是一个低阶api，用于根据物理地址以及指定好的EntryFlags，创建页表项
     ///
     /// ## 参数
     ///
@@ -589,6 +632,69 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     ///
     /// 页表项的值
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize;
+
+    /// 判断一个VMA是否允许访问
+    ///
+    /// ## 参数
+    ///
+    /// - `vma`: 进行判断的VMA
+    /// - `write`: 是否需要写入权限（true 表示需要写权限）
+    /// - `execute`: 是否需要执行权限（true 表示需要执行权限）
+    /// - `foreign`: 是否是外部的（即非当前进程的）VMA
+    ///
+    /// ## 返回值
+    /// - `true`: VMA允许访问
+    /// - `false`: 错误的说明
+    fn vma_access_permitted(
+        _vma: Arc<LockedVMA>,
+        _write: bool,
+        _execute: bool,
+        _foreign: bool,
+    ) -> bool {
+        true
+    }
+
+    const PAGE_NONE: usize;
+    const PAGE_SHARED: usize;
+    const PAGE_SHARED_EXEC: usize;
+    const PAGE_COPY_NOEXEC: usize;
+    const PAGE_COPY_EXEC: usize;
+    const PAGE_COPY: usize;
+    const PAGE_READONLY: usize;
+    const PAGE_READONLY_EXEC: usize;
+
+    const PAGE_READ: usize;
+    const PAGE_READ_EXEC: usize;
+    const PAGE_WRITE: usize;
+    const PAGE_WRITE_EXEC: usize;
+    const PAGE_EXEC: usize;
+
+    const PROTECTION_MAP: [EntryFlags<Self>; 16];
+
+    /// 页面保护标志转换函数
+    /// ## 参数
+    ///
+    /// - `vm_flags`: VmFlags标志
+    ///
+    /// ## 返回值
+    /// - EntryFlags: 页面的保护位
+    fn vm_get_page_prot(vm_flags: VmFlags) -> EntryFlags<Self> {
+        let map = Self::PROTECTION_MAP;
+        let mut ret = map[vm_flags
+            .intersection(
+                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC | VmFlags::VM_SHARED,
+            )
+            .bits()];
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // 如果xd位被保留，那么将可执行性设置为true
+            if crate::arch::mm::X86_64MMArch::is_xd_reserved() {
+                ret = ret.set_execute(true);
+            }
+        }
+        ret
+    }
 }
 
 /// @brief 虚拟地址范围

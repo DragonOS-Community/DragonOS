@@ -1,5 +1,3 @@
-use core::usize;
-
 use system_error::SystemError;
 
 use crate::syscall::Syscall;
@@ -53,7 +51,6 @@ impl Syscall {
     /// - 成功，Ok(usize)
     /// - 失败，Err(SystemError) 操作失败，返回posix错误码
     ///
-
     pub fn do_syslog(
         syslog_action_type: usize,
         buf: &mut [u8],

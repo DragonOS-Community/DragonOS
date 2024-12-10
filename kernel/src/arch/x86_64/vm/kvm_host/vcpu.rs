@@ -3,6 +3,7 @@ use core::{arch::x86_64::_xsetbv, intrinsics::unlikely};
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use bitmap::{traits::BitMapOps, AllocBitmap, BitMapCore};
+use log::warn;
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::vmx::vmcs::guest;
@@ -17,7 +18,6 @@ use x86_64::registers::control::EferFlags;
 
 use crate::arch::vm::asm::VmxAsm;
 use crate::arch::vm::vmx::exit::ExitFastpathCompletion;
-use crate::kwarn;
 use crate::virt::vm::kvm_host::mem::KvmMmuMemoryCache;
 use crate::virt::vm::kvm_host::vcpu::VcpuMode;
 use crate::{
@@ -28,7 +28,7 @@ use crate::{
             asm::{hyperv, kvm_msr, KvmX86Asm, MiscEnable, MsrData, VcpuSegment},
             cpuid::KvmCpuidEntry2,
             kvm_host::KvmReg,
-            mmu::mmu::LockedKvmMmu,
+            mmu::kvm_mmu::LockedKvmMmu,
             uapi::{UapiKvmSegmentRegs, KVM_SYNC_X86_VALID_FIELDS},
             vmx::{vmcs::ControlsType, vmx_info},
             x86_kvm_manager, x86_kvm_manager_mut, x86_kvm_ops,
@@ -48,6 +48,7 @@ use crate::{
 
 use super::{lapic::KvmLapic, HFlags, KvmCommonRegs, KvmIrqChipMode};
 const MSR_IA32_CR_PAT_DEFAULT: u64 = 0x0007_0406_0007_0406;
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct X86VcpuArch {
     /// 最近一次尝试进入虚拟机的主机cpu
@@ -699,7 +700,7 @@ impl VirtCpu {
     fn enter_guest(&mut self, vm: &Vm) -> Result<(), SystemError> {
         let req_immediate_exit = false;
 
-        kwarn!("request {:?}", self.request);
+        warn!("request {:?}", self.request);
         if !self.request.is_empty() {
             if self.check_request(VirtCpuRequest::KVM_REQ_VM_DEAD) {
                 return Err(SystemError::EIO);
@@ -753,7 +754,7 @@ impl VirtCpu {
 
             if self.check_request(VirtCpuRequest::KVM_REQ_STEAL_UPDATE) {
                 // todo!()
-                kwarn!("VirtCpuRequest::KVM_REQ_STEAL_UPDATE TODO!");
+                warn!("VirtCpuRequest::KVM_REQ_STEAL_UPDATE TODO!");
             }
 
             if self.check_request(VirtCpuRequest::KVM_REQ_SMI) {
@@ -786,7 +787,7 @@ impl VirtCpu {
 
             if self.check_request(VirtCpuRequest::KVM_REQ_APIC_PAGE_RELOAD) {
                 // todo!()
-                kwarn!("VirtCpuRequest::KVM_REQ_APIC_PAGE_RELOAD TODO!");
+                warn!("VirtCpuRequest::KVM_REQ_APIC_PAGE_RELOAD TODO!");
             }
 
             if self.check_request(VirtCpuRequest::KVM_REQ_HV_CRASH) {
@@ -830,7 +831,7 @@ impl VirtCpu {
         self.kvm_mmu_reload(vm)?;
 
         x86_kvm_ops().prepare_switch_to_guest(self);
-        // kwarn!(
+        // warn!(
         //     "mode {:?} req {:?} mode_cond {} !is_empty {} cond {}",
         //     self.mode,
         //     self.request,
@@ -838,7 +839,7 @@ impl VirtCpu {
         //     !self.request.is_empty(),
         //     (self.mode == VcpuMode::ExitingGuestMode) || (!self.request.is_empty())
         // );
-        kwarn!(
+        warn!(
             "req bit {} empty bit {}",
             self.request.bits,
             VirtCpuRequest::empty().bits
@@ -1324,7 +1325,7 @@ impl VirtCpu {
 
         x86_kvm_ops().post_set_cr3(self, sregs.cr3);
 
-        //kdebug!("_set_segmenet_regs_common 2:: cr3: {:#x}", self.arch.cr3);
+        //debug!("_set_segmenet_regs_common 2:: cr3: {:#x}", self.arch.cr3);
 
         self.kvm_set_cr8(sregs.cr8);
 
@@ -1406,7 +1407,7 @@ impl VirtCpu {
 
     fn __kvm_is_valid_cr4(&self, cr4: Cr4) -> bool {
         if cr4.contains(self.arch.cr4_guest_rsvd_bits) {
-            //kdebug!("__kvm_is_valid_cr4::here");
+            //debug!("__kvm_is_valid_cr4::here");
             //return false;
         }
 
@@ -1506,7 +1507,7 @@ impl VirtCpu {
         VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[2]);
         VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[3]);
         //}else{
-        // kdebug!("load_pdptrs: not pae paging");
+        // debug!("load_pdptrs: not pae paging");
         //}
     }
 }

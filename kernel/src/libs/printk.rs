@@ -1,17 +1,12 @@
-use core::{
-    fmt::{self, Write},
-    sync::atomic::Ordering,
-};
+use core::fmt::{self, Write};
 
 use alloc::string::ToString;
+use log::{info, Level, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
-    driver::tty::{
-        tty_driver::TtyOperation, tty_port::tty_port,
-        virtual_terminal::virtual_console::CURRENT_VCNUM,
-    },
+    driver::tty::{tty_driver::TtyOperation, virtual_terminal::vc_manager},
     filesystem::procfs::{
         kmsg::KMSG,
         log::{LogLevel, LogMessage},
@@ -32,49 +27,6 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
-#[macro_export]
-macro_rules! kdebug {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(7,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
-    }
-}
-
-#[macro_export]
-macro_rules! kinfo {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(6,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
-    }
-}
-
-#[macro_export]
-macro_rules! kwarn {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(4,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[1;33m[ WARN ] \x1B[0m"));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-    }
-}
-
-#[macro_export]
-macro_rules! kerror {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(3,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[41m[ ERROR ] \x1B[0m"));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-    }
-}
-
-#[macro_export]
-macro_rules! kBUG {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(1,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[41m[ BUG ] \x1B[0m"));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-    }
-}
-
 pub struct PrintkWriter;
 
 impl PrintkWriter {
@@ -86,10 +38,9 @@ impl PrintkWriter {
     /// 并输出白底黑字
     /// @param str: 要写入的字符
     pub fn __write_string(&mut self, s: &str) {
-        let current_vcnum = CURRENT_VCNUM.load(Ordering::SeqCst);
-        if current_vcnum != -1 {
+        if let Some(current_vc) = vc_manager().current_vc() {
             // tty已经初始化了之后才输出到屏幕
-            let port = tty_port(current_vcnum as usize);
+            let port = current_vc.port();
             let tty = port.port_data().internal_tty();
             if let Some(tty) = tty {
                 let _ = tty.write(tty.core(), s.as_bytes(), s.len());
@@ -128,4 +79,103 @@ impl Logger {
             unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
         }
     }
+}
+
+/// 内核自定义日志器
+///
+/// todo: https://github.com/DragonOS-Community/DragonOS/issues/762
+struct KernelLogger;
+
+impl Log for KernelLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        // 这里可以自定义日志过滤规则
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            // todo: 接入kmsg
+            Self::kernel_log(record);
+            Self::iodisplay(record)
+        }
+    }
+
+    fn flush(&self) {
+        // 如果需要的话，可以在这里实现缓冲区刷新逻辑
+    }
+}
+
+impl KernelLogger {
+    fn iodisplay(record: &log::Record) {
+        match record.level() {
+            Level::Debug | Level::Info | Level::Trace => {
+                write!(PrintkWriter, "[ {} ] ", record.level(),)
+            }
+            Level::Error => {
+                write!(PrintkWriter, "\x1B[41m[ ERROR ] \x1B[0m",)
+            }
+            Level::Warn => {
+                write!(PrintkWriter, "\x1B[1;33m[ WARN ] \x1B[0m",)
+            }
+        }
+        .unwrap();
+        writeln!(
+            PrintkWriter,
+            "({}:{})\t {}",
+            record.file().unwrap_or(""),
+            record.line().unwrap_or(0),
+            record.args()
+        )
+        .unwrap();
+    }
+
+    fn kernel_log(record: &log::Record) {
+        match record.level() {
+            Level::Debug => Logger.log(
+                7,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Error => Logger.log(
+                3,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Info => Logger.log(
+                6,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Warn => Logger.log(
+                4,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Trace => {
+                todo!()
+            }
+        }
+    }
+}
+
+pub fn early_init_logging() {
+    log::set_logger(&KernelLogger).unwrap();
+    log::set_max_level(log::LevelFilter::Debug);
+    info!("Logging initialized");
 }

@@ -2,6 +2,7 @@ use core::{
     fmt::Debug,
     intrinsics::unlikely,
     sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
+    time::Duration,
 };
 
 use alloc::{
@@ -9,6 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::{error, info, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -17,7 +19,6 @@ use crate::{
         softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
     },
-    kerror, kinfo,
     libs::spinlock::{SpinLock, SpinLockGuard},
     process::{ProcessControlBlock, ProcessManager},
     sched::{schedule, SchedMode},
@@ -36,6 +37,51 @@ lazy_static! {
 /// 定时器要执行的函数的特征
 pub trait TimerFunction: Send + Sync + Debug {
     fn run(&mut self) -> Result<(), SystemError>;
+}
+// # Jiffies结构体（注意这是一段时间的jiffies数而不是某一时刻的定时器时间片）
+
+int_like!(Jiffies, u64);
+
+impl Jiffies {
+    /// ## 返回接下来的n_jiffies对应的定时器时间片
+    pub fn timer_jiffies(&self) -> u64 {
+        let result = TIMER_JIFFIES.load(Ordering::SeqCst) + self.data();
+        result
+    }
+}
+
+impl From<Jiffies> for Duration {
+    /// # Jiffies转Duration
+    ///
+    /// ## 参数
+    ///
+    /// jiffies： 一段时间的jiffies数
+    ///
+    /// ### 返回值
+    ///
+    /// Duration： 这段时间的Duration形式
+    fn from(jiffies: Jiffies) -> Self {
+        let ms = jiffies.data() / 1_000_000 * NSEC_PER_JIFFY as u64;
+        let result = Duration::from_millis(ms);
+        result
+    }
+}
+
+impl From<Duration> for Jiffies {
+    /// # Duration 转 Jiffies
+    ///
+    /// ## 参数
+    ///
+    /// ms： 表示一段时间的Duration类型
+    ///
+    /// ### 返回值
+    ///
+    /// Jiffies结构体： 这段时间的Jiffies数
+    fn from(ms: Duration) -> Self {
+        let jiffies = ms.as_millis() as u64 * 1_000_000 / NSEC_PER_JIFFY as u64;
+        let result = Jiffies::new(jiffies);
+        result
+    }
 }
 
 #[derive(Debug)]
@@ -114,7 +160,7 @@ impl Timer {
         let mut split_pos: usize = 0;
         for (pos, elt) in timer_list.iter().enumerate() {
             if Arc::ptr_eq(&self_arc, &elt.1) {
-                kwarn!("Timer already in list");
+                warn!("Timer already in list");
             }
             if elt.0 > expire_jiffies {
                 split_pos = pos;
@@ -134,7 +180,7 @@ impl Timer {
         drop(timer);
         let r = func.map(|mut f| f.run()).unwrap_or(Ok(()));
         if unlikely(r.is_err()) {
-            kerror!(
+            error!(
                 "Failed to run timer function: {self:?} {:?}",
                 r.as_ref().err().unwrap()
             );
@@ -200,7 +246,7 @@ impl SoftirqVec for DoTimerSoftirq {
         }
         // 最多只处理TIMER_RUN_CYCLE_THRESHOLD个计时器
         for _ in 0..TIMER_RUN_CYCLE_THRESHOLD {
-            // kdebug!("DoTimerSoftirq run");
+            // debug!("DoTimerSoftirq run");
             let timer_list = TIMER_LIST.try_lock_irqsave();
             if timer_list.is_err() {
                 continue;
@@ -212,7 +258,7 @@ impl SoftirqVec for DoTimerSoftirq {
             }
 
             let (front_jiffies, timer_list_front) = timer_list.first().unwrap().clone();
-            // kdebug!("to lock timer_list_front");
+            // debug!("to lock timer_list_front");
 
             if front_jiffies >= TIMER_JIFFIES.load(Ordering::SeqCst) {
                 break;
@@ -234,7 +280,7 @@ pub fn timer_init() {
     softirq_vectors()
         .register_softirq(SoftirqNumber::TIMER, do_timer_softirq)
         .expect("Failed to register timer softirq");
-    kinfo!("timer initialized successfully");
+    info!("timer initialized successfully");
 }
 
 /// 计算接下来n毫秒对应的定时器时间片
@@ -254,15 +300,15 @@ pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
 ///
 /// @return Err(SystemError) 错误码
 pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
-    // kdebug!("schedule_timeout");
+    // debug!("schedule_timeout");
     if timeout == MAX_TIMEOUT {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).ok();
         drop(irq_guard);
-        schedule(SchedMode::SM_PREEMPT);
+        schedule(SchedMode::SM_NONE);
         return Ok(MAX_TIMEOUT);
     } else if timeout < 0 {
-        kerror!("timeout can't less than 0");
+        error!("timeout can't less than 0");
         return Err(SystemError::EINVAL);
     } else {
         // 禁用中断，防止在这段期间发生调度，造成死锁
@@ -278,7 +324,7 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
 
         drop(irq_guard);
 
-        schedule(SchedMode::SM_PREEMPT);
+        schedule(SchedMode::SM_NONE);
         let time_remaining: i64 = timeout - TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         if time_remaining >= 0 {
             // 被提前唤醒，返回剩余时间
@@ -291,16 +337,16 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
 
 pub fn timer_get_first_expire() -> Result<u64, SystemError> {
     // FIXME
-    // kdebug!("rs_timer_get_first_expire,timer_jif = {:?}", TIMER_JIFFIES);
+    // debug!("rs_timer_get_first_expire,timer_jif = {:?}", TIMER_JIFFIES);
     for _ in 0..10 {
         match TIMER_LIST.try_lock_irqsave() {
             Ok(timer_list) => {
-                // kdebug!("rs_timer_get_first_expire TIMER_LIST lock successfully");
+                // debug!("rs_timer_get_first_expire TIMER_LIST lock successfully");
                 if timer_list.is_empty() {
-                    // kdebug!("timer_list is empty");
+                    // debug!("timer_list is empty");
                     return Ok(0);
                 } else {
-                    // kdebug!("timer_list not empty");
+                    // debug!("timer_list not empty");
                     return Ok(timer_list.first().unwrap().0);
                 }
             }
@@ -311,11 +357,26 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }
 
+/// 检查是否需要触发定时器软中断，如果需要则触发
+pub fn try_raise_timer_softirq() {
+    if let Ok(first_expire) = timer_get_first_expire() {
+        if first_expire <= clock() {
+            softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
+        }
+    }
+}
+
+/// 处理本地定时器中断
+pub fn run_local_timer() {
+    assert!(!CurrentIrqArch::is_irq_enabled());
+    try_raise_timer_softirq();
+}
+
 /// 更新系统时间片
-pub fn update_timer_jiffies(add_jiffies: u64, time_us: i64) -> u64 {
+pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);
     compiler_fence(Ordering::SeqCst);
-    update_wall_time(time_us);
+    update_wall_time();
 
     compiler_fence(Ordering::SeqCst);
     return prev + add_jiffies;

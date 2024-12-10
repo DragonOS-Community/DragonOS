@@ -3,6 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::debug;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -276,10 +277,10 @@ impl SerioDriver for Ps2MouseDriver {
 
 #[unified_init(INITCALL_DEVICE)]
 fn ps2_mouse_driver_init() -> Result<(), SystemError> {
-    kdebug!("Ps2_mouse_drive initializing...");
+    debug!("Ps2_mouse_drive initializing...");
     let driver = Ps2MouseDriver::new();
     serio_driver_manager().register(driver.clone())?;
     unsafe { PS2_MOUSE_DRIVER = Some(driver) };
-    kdebug!("Ps2_mouse_drive initialized!");
+    debug!("Ps2_mouse_drive initialized!");
     return Ok(());
 }

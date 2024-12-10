@@ -1,17 +1,19 @@
 use core::{intrinsics::unlikely, ops::BitAnd};
 
 use alloc::sync::Arc;
+use log::{debug, error, warn};
 use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, CurrentIrqArch},
-    exception::irqdesc::InnerIrqDesc,
+    exception::{irqchip::IrqChipFlags, irqdesc::InnerIrqDesc},
     libs::{once::Once, spinlock::SpinLockGuard},
     process::{ProcessFlags, ProcessManager},
     smp::core::smp_get_processor_id,
 };
 
 use super::{
+    irqchip::IrqChip,
     irqdata::{IrqData, IrqHandlerData, IrqStatus},
     irqdesc::{
         InnerIrqAction, IrqDesc, IrqDescState, IrqFlowHandler, IrqReturn, ThreadedHandlerFlags,
@@ -34,6 +36,7 @@ pub fn fast_eoi_irq_handler() -> &'static dyn IrqFlowHandler {
 
 /// 获取用于处理边沿触发中断的处理程序
 #[inline(always)]
+#[allow(dead_code)]
 pub fn edge_irq_handler() -> &'static dyn IrqFlowHandler {
     &EdgeIrqHandler
 }
@@ -55,9 +58,38 @@ impl IrqFlowHandler for HandleBadIrq {
 struct FastEOIIrqHandler;
 
 impl IrqFlowHandler for FastEOIIrqHandler {
-    fn handle(&self, _irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
-        // https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/chip.c?r=&mo=17578&fi=689#689
-        todo!("FastEOIIrqHandler");
+    /// https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/chip.c?r=&mo=17578&fi=689#689
+    fn handle(&self, irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
+        let chip = irq_desc.irq_data().chip_info_read_irqsave().chip();
+
+        let mut desc_inner = irq_desc.inner();
+        let out = |din: SpinLockGuard<InnerIrqDesc>| {
+            if !chip.flags().contains(IrqChipFlags::IRQCHIP_EOI_IF_HANDLED) {
+                chip.irq_eoi(din.irq_data());
+            }
+        };
+        if !irq_may_run(&desc_inner) {
+            out(desc_inner);
+            return;
+        }
+
+        desc_inner
+            .internal_state_mut()
+            .remove(IrqDescState::IRQS_REPLAY | IrqDescState::IRQS_WAITING);
+
+        if desc_inner.actions().is_empty() || desc_inner.common_data().disabled() {
+            desc_inner
+                .internal_state_mut()
+                .insert(IrqDescState::IRQS_PENDING);
+            mask_irq(desc_inner.irq_data());
+            out(desc_inner);
+            return;
+        }
+
+        desc_inner = handle_irq_event(irq_desc, desc_inner);
+        cond_unmask_eoi_irq(&desc_inner, &chip);
+
+        return;
     }
 }
 
@@ -69,7 +101,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
     fn handle(&self, irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
         let mut desc_inner_guard: SpinLockGuard<'_, InnerIrqDesc> = irq_desc.inner();
         if !irq_may_run(&desc_inner_guard) {
-            // kdebug!("!irq_may_run");
+            // debug!("!irq_may_run");
             desc_inner_guard
                 .internal_state_mut()
                 .insert(IrqDescState::IRQS_PENDING);
@@ -78,7 +110,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
         }
 
         if desc_inner_guard.common_data().disabled() {
-            // kdebug!("desc_inner_guard.common_data().disabled()");
+            // debug!("desc_inner_guard.common_data().disabled()");
             desc_inner_guard
                 .internal_state_mut()
                 .insert(IrqDescState::IRQS_PENDING);
@@ -92,7 +124,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
 
         loop {
             if unlikely(desc_inner_guard.actions().is_empty()) {
-                kdebug!("no action for irq {}", irq_data.irq().data());
+                debug!("no action for irq {}", irq_data.irq().data());
                 irq_manager().mask_irq(&irq_data);
                 return;
             }
@@ -105,24 +137,14 @@ impl IrqFlowHandler for EdgeIrqHandler {
             {
                 let status = desc_inner_guard.common_data().status();
                 if !status.disabled() && status.masked() {
-                    // kdebug!("re-enable irq");
+                    // debug!("re-enable irq");
                     irq_manager().unmask_irq(&desc_inner_guard);
                 }
             }
 
-            // kdebug!("handle_irq_event");
+            // debug!("handle_irq_event");
 
-            desc_inner_guard
-                .internal_state_mut()
-                .remove(IrqDescState::IRQS_PENDING);
-            desc_inner_guard.common_data().set_inprogress();
-
-            drop(desc_inner_guard);
-
-            let _r = do_handle_irq_event(irq_desc);
-
-            desc_inner_guard = irq_desc.inner();
-            desc_inner_guard.common_data().clear_inprogress();
+            desc_inner_guard = handle_irq_event(irq_desc, desc_inner_guard);
 
             if !desc_inner_guard
                 .internal_state()
@@ -160,6 +182,29 @@ pub(super) fn mask_ack_irq(irq_data: &Arc<IrqData>) {
     }
 }
 
+pub(super) fn mask_irq(irq_data: &Arc<IrqData>) {
+    if irq_data.common_data().masked() {
+        return;
+    }
+
+    let chip = irq_data.chip_info_read_irqsave().chip();
+    if chip.irq_mask(irq_data).is_ok() {
+        irq_data.irqd_set(IrqStatus::IRQD_IRQ_MASKED);
+    }
+}
+
+pub(super) fn unmask_irq(irq_data: &Arc<IrqData>) {
+    if !irq_data.common_data().masked() {
+        return;
+    }
+
+    let chip = irq_data.chip_info_read_irqsave().chip();
+
+    if chip.irq_unmask(irq_data).is_ok() {
+        irq_data.irqd_clear(IrqStatus::IRQD_IRQ_MASKED);
+    }
+}
+
 impl IrqManager {
     pub(super) fn do_irq_wake_thread(
         &self,
@@ -191,6 +236,24 @@ impl IrqManager {
     }
 }
 
+fn handle_irq_event<'a>(
+    irq_desc: &'a Arc<IrqDesc>,
+    mut desc_inner_guard: SpinLockGuard<'_, InnerIrqDesc>,
+) -> SpinLockGuard<'a, InnerIrqDesc> {
+    desc_inner_guard
+        .internal_state_mut()
+        .remove(IrqDescState::IRQS_PENDING);
+    desc_inner_guard.common_data().set_inprogress();
+
+    drop(desc_inner_guard);
+
+    let _r = do_handle_irq_event(irq_desc);
+
+    let desc_inner_guard = irq_desc.inner();
+    desc_inner_guard.common_data().clear_inprogress();
+
+    return desc_inner_guard;
+}
 /// 处理中断事件
 ///
 /// https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/handle.c?fi=handle_irq_event#139
@@ -206,7 +269,7 @@ fn do_handle_irq_event(desc: &Arc<IrqDesc>) -> Result<(), SystemError> {
 
     for action in actions {
         let mut action_inner: SpinLockGuard<'_, InnerIrqAction> = action.inner();
-        // kdebug!("do_handle_irq_event: action: {:?}", action_inner.name());
+        // debug!("do_handle_irq_event: action: {:?}", action_inner.name());
         let dynamic_data = action_inner
             .dev_id()
             .clone()
@@ -228,6 +291,47 @@ fn do_handle_irq_event(desc: &Arc<IrqDesc>) -> Result<(), SystemError> {
     return r.map(|_| ());
 }
 
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/chip.c?r=&mo=17578&fi=659
+fn cond_unmask_eoi_irq(
+    desc_inner_guard: &SpinLockGuard<'_, InnerIrqDesc>,
+    chip: &Arc<dyn IrqChip>,
+) {
+    if !desc_inner_guard
+        .internal_state()
+        .contains(IrqDescState::IRQS_ONESHOT)
+    {
+        chip.irq_eoi(desc_inner_guard.irq_data());
+        return;
+    }
+
+    /*
+     * We need to unmask in the following cases:
+     * - Oneshot irq which did not wake the thread (caused by a
+     *   spurious interrupt or a primary handler handling it
+     *   completely).
+     */
+
+    if !desc_inner_guard.common_data().disabled()
+        && desc_inner_guard.common_data().masked()
+        && desc_inner_guard.threads_oneshot() == 0
+    {
+        debug!(
+            "eoi unmask irq {}",
+            desc_inner_guard.irq_data().irq().data()
+        );
+        chip.irq_eoi(desc_inner_guard.irq_data());
+        unmask_irq(desc_inner_guard.irq_data());
+    } else if !chip.flags().contains(IrqChipFlags::IRQCHIP_EOI_THREADED) {
+        debug!("eoi irq {}", desc_inner_guard.irq_data().irq().data());
+        chip.irq_eoi(desc_inner_guard.irq_data());
+    } else {
+        warn!(
+            "irq {} eoi failed",
+            desc_inner_guard.irq_data().irq().data()
+        );
+    }
+}
+
 fn warn_no_thread(irq: IrqNumber, action_inner: &mut SpinLockGuard<'_, InnerIrqAction>) {
     // warn on once
     if action_inner
@@ -237,7 +341,7 @@ fn warn_no_thread(irq: IrqNumber, action_inner: &mut SpinLockGuard<'_, InnerIrqA
         return;
     }
 
-    kwarn!(
+    warn!(
         "irq {}, device {} returned IRQ_WAKE_THREAD, but no threaded handler",
         irq.data(),
         action_inner.name()
@@ -299,7 +403,7 @@ impl IrqFlowHandler for PerCpuDevIdIrqHandler {
             static ONCE: Once = Once::new();
 
             ONCE.call_once(|| {
-                kerror!(
+                error!(
                     "Spurious percpu irq {} on cpu {:?}, enabled: {}",
                     irq.data(),
                     cpu,

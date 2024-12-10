@@ -1,0 +1,7 @@
+[package]
+name = "wait_queue_macros"
+version = "0.1.0"
+edition = "2021"
+authors = ["longjin <longjin@dragonos.org>"]
+
+[dependencies]

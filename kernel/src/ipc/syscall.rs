@@ -3,6 +3,7 @@ use core::{
     sync::atomic::compiler_fence,
 };
 
+use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -15,12 +16,11 @@ use crate::{
         FilePrivateData,
     },
     ipc::shm::{shm_manager_lock, IPC_PRIVATE},
-    kerror, kwarn,
     libs::align::page_align_up,
     libs::spinlock::SpinLock,
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
-        page::{page_manager_lock_irqsave, PageFlags, PageFlushAll},
+        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
         syscall::ProtFlags,
         ucontext::{AddressSpace, VMA},
         VirtAddr, VmFlags,
@@ -35,6 +35,7 @@ use crate::{
 use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
     shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
+    signal::{set_sigprocmask, SigHow},
     signal_types::{
         SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
         USER_SIG_ERR, USER_SIG_IGN,
@@ -96,7 +97,7 @@ impl Syscall {
         let sig = Signal::from(sig);
         if sig == Signal::INVALID {
             // 传入的signal数值不合法
-            kwarn!("Not a valid signal number");
+            warn!("Not a valid signal number");
             return Err(SystemError::EINVAL);
         }
 
@@ -173,12 +174,12 @@ impl Syscall {
             }
 
             // TODO 如果为空，赋默认值？
-            // kdebug!("new_ka={:?}", new_ka);
+            // debug!("new_ka={:?}", new_ka);
             // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
             if new_ka.restorer().is_some() {
                 new_ka.flags_mut().insert(SigFlags::SA_RESTORER);
             } else if new_ka.action().is_customized() {
-                kerror!(
+                error!(
                 "pid:{:?}: in sys_sigaction: User must manually sprcify a sa_restorer for signal {}.",
                 ProcessManager::current_pcb().pid(),
                 sig
@@ -229,7 +230,7 @@ impl Syscall {
                     }
                 }
                 SigactionType::SaSigaction(_) => {
-                    kerror!("unsupported type: SaSigaction");
+                    error!("unsupported type: SaSigaction");
                     VirtAddr::new(USER_SIG_DFL as usize)
                 }
             };
@@ -261,8 +262,8 @@ impl Syscall {
     pub fn shmget(key: ShmKey, size: usize, shmflg: ShmFlags) -> Result<usize, SystemError> {
         // 暂不支持巨页
         if shmflg.contains(ShmFlags::SHM_HUGETLB) {
-            kerror!("shmget: not support huge page");
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            error!("shmget: not support huge page");
+            return Err(SystemError::ENOSYS);
         }
 
         let mut shm_manager_guard = shm_manager_lock();
@@ -324,8 +325,8 @@ impl Syscall {
                     .ok_or(SystemError::EINVAL)?;
                 let vm_flags = VmFlags::from(shmflg);
                 let destination = VirtPageFrame::new(region.start());
-                let page_flags: PageFlags<MMArch> =
-                    PageFlags::from_prot_flags(ProtFlags::from(vm_flags), true);
+                let page_flags: EntryFlags<MMArch> =
+                    EntryFlags::from_prot_flags(ProtFlags::from(vm_flags), true);
                 let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
 
                 // 将共享内存映射到对应虚拟区域
@@ -351,14 +352,14 @@ impl Syscall {
                     .mappings
                     .contains(vaddr)
                     .ok_or(SystemError::EINVAL)?;
-                if vma.lock().region().start() != vaddr {
+                if vma.lock_irqsave().region().start() != vaddr {
                     return Err(SystemError::EINVAL);
                 }
 
                 // 验证用户虚拟内存区域是否有效
                 let _ = UserBufferReader::new(vaddr.data() as *const u8, size, true)?;
 
-                // 必须在取消映射前获取到PageFlags
+                // 必须在取消映射前获取到EntryFlags
                 let page_flags = address_write_guard
                     .user_mapper
                     .utable
@@ -386,7 +387,8 @@ impl Syscall {
 
                     // 将vma加入到对应Page的anon_vma
                     page_manager_guard
-                        .get_mut(&phys.phys_address())
+                        .get_unwrap(&phys.phys_address())
+                        .write_irqsave()
                         .insert_vma(vma.clone());
 
                     phys = phys.next();
@@ -394,7 +396,7 @@ impl Syscall {
                 }
 
                 // 更新vma的映射状态
-                vma.lock().set_mapped(true);
+                vma.lock_irqsave().set_mapped(true);
 
                 vaddr.data()
             }
@@ -427,7 +429,7 @@ impl Syscall {
             .ok_or(SystemError::EINVAL)?;
 
         // 判断vaddr是否为起始地址
-        if vma.lock().region().start() != vaddr {
+        if vma.lock_irqsave().region().start() != vaddr {
             return Err(SystemError::EINVAL);
         }
 
@@ -440,9 +442,9 @@ impl Syscall {
             .0;
 
         // 如果物理页的shm_id为None，代表不是共享页
-        let page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock_irqsave();
         let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
-        let shm_id = page.shm_id().ok_or(SystemError::EINVAL)?;
+        let shm_id = page.read_irqsave().shm_id().ok_or(SystemError::EINVAL)?;
         drop(page_manager_guard);
 
         // 获取对应共享页管理信息
@@ -502,5 +504,67 @@ impl Syscall {
             // 无效操作码
             ShmCtlCmd::Default => Err(SystemError::EINVAL),
         }
+    }
+
+    /// # SYS_SIGPROCMASK系统调用函数，用于设置或查询当前进程的信号屏蔽字
+    ///
+    /// ## 参数
+    ///
+    /// - `how`: 指示如何修改信号屏蔽字
+    /// - `nset`: 新的信号屏蔽字
+    /// - `oset`: 旧的信号屏蔽字的指针，由于可以是NULL，所以用Option包装
+    /// - `sigsetsize`: 信号集的大小
+    ///
+    /// ## 返回值
+    ///
+    /// 成功：0
+    /// 失败：错误码
+    ///
+    /// ## 说明
+    /// 根据 https://man7.org/linux/man-pages/man2/sigprocmask.2.html ，传进来的oldset和newset都是指针类型，这里选择传入usize然后转换为u64的指针类型
+    pub fn rt_sigprocmask(
+        how: i32,
+        newset: usize,
+        oldset: usize,
+        sigsetsize: usize,
+    ) -> Result<usize, SystemError> {
+        // 对应oset传进来一个NULL的情况
+        let oset = if oldset == 0 { None } else { Some(oldset) };
+        let nset = if newset == 0 { None } else { Some(newset) };
+
+        if sigsetsize != size_of::<SigSet>() {
+            return Err(SystemError::EFAULT);
+        }
+
+        let sighow = SigHow::try_from(how)?;
+
+        let mut new_set = SigSet::default();
+        if let Some(nset) = nset {
+            let reader = UserBufferReader::new(
+                VirtAddr::new(nset).as_ptr::<u64>(),
+                core::mem::size_of::<u64>(),
+                true,
+            )?;
+
+            let nset = reader.read_one_from_user::<u64>(0)?;
+            new_set = SigSet::from_bits_truncate(*nset);
+            // debug!("Get Newset: {}", &new_set.bits());
+            let to_remove: SigSet =
+                <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
+            new_set.remove(to_remove);
+        }
+
+        let oldset_to_return = set_sigprocmask(sighow, new_set)?;
+        if let Some(oldset) = oset {
+            // debug!("Get Oldset to return: {}", &oldset_to_return.bits());
+            let mut writer = UserBufferWriter::new(
+                VirtAddr::new(oldset).as_ptr::<u64>(),
+                core::mem::size_of::<u64>(),
+                true,
+            )?;
+            writer.copy_one_to_user::<u64>(&oldset_to_return.bits(), 0)?;
+        }
+
+        Ok(0)
     }
 }

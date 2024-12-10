@@ -11,7 +11,7 @@ use crate::{
     process::ProcessManager,
     syscall::{Syscall, SYS_SCHED},
 };
-use alloc::string::String;
+use log::debug;
 use system_error::SystemError;
 
 use super::{
@@ -53,7 +53,7 @@ macro_rules! syscall_return {
 
         if $show {
             let pid = ProcessManager::current_pcb().pid();
-            crate::kdebug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
+            debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
         }
 
         unsafe {
@@ -88,14 +88,14 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     mfence();
     let pid = ProcessManager::current_pcb().pid();
     let show = false;
-    // let show = if syscall_num != SYS_SCHED && pid.data() > 3 {
+    // let show = if syscall_num != SYS_SCHED && pid.data() >= 7 {
     //     true
     // } else {
     //     false
     // };
 
     if show {
-        crate::kdebug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
+        debug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
     }
 
     // Arch specific syscall
@@ -117,33 +117,27 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         }
         _ => {}
     }
-    syscall_return!(
-        Syscall::handle(syscall_num, &args, frame).unwrap_or_else(|e| e.to_posix_errno() as usize)
-            as u64,
-        frame,
-        show
-    );
+    let mut syscall_handle = || -> u64 {
+        #[cfg(feature = "backtrace")]
+        {
+            Syscall::catch_handle(syscall_num, &args, frame)
+                .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
+        }
+        #[cfg(not(feature = "backtrace"))]
+        {
+            Syscall::handle(syscall_num, &args, frame)
+                .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
+        }
+    };
+    syscall_return!(syscall_handle(), frame, show);
 }
 
 /// 系统调用初始化
 pub fn arch_syscall_init() -> Result<(), SystemError> {
-    // kinfo!("arch_syscall_init\n");
+    // info!("arch_syscall_init\n");
     unsafe { set_system_trap_gate(0x80, 0, VirtAddr::new(syscall_int as usize)) }; // 系统调用门
     unsafe { init_syscall_64() };
     return Ok(());
-}
-
-/// 执行第一个用户进程的函数（只应该被调用一次）
-///
-/// 当进程管理重构完成后，这个函数应该被删除。调整为别的函数。
-#[no_mangle]
-pub extern "C" fn rs_exec_init_process(frame: &mut TrapFrame) -> usize {
-    let path = String::from("/bin/shell.elf");
-    let argv = vec![String::from("/bin/shell.elf")];
-    let envp = vec![String::from("PATH=/bin")];
-    let r = Syscall::do_execve(path, argv, envp, frame);
-    // kdebug!("rs_exec_init_process: r: {:?}\n", r);
-    return r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize);
 }
 
 /// syscall指令初始化函数

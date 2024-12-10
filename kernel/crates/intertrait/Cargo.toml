@@ -1,0 +1,27 @@
+[package]
+name = "intertrait"
+version = "0.2.2"
+authors = ["CodeChain Team <hi@codechain.io>"]
+license = "GPLv2(for code modified by dragonos) MIT OR Apache-2.0"
+description = "Allow for inter-trait casting"
+edition = "2018"
+repository = "https://github.com/CodeChain-io/intertrait"
+documentation = "https://docs.rs/intertrait"
+readme = "README.md"
+categories = ["rust-patterns"]
+keywords = ["trait", "cast", "any"]
+include = ["src/**/*", "Cargo.toml", "LICENSE-*", "README.md"]
+
+
+[dependencies]
+linkme = "=0.3.27"
+hashbrown = "0.13.2"
+intertrait-macros = { version = "=0.2.2", path = "macros" }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+once_cell = "1.4"
+
+[dev-dependencies]
+trybuild = "1.0"
+doc-comment = "0.3"
+

@@ -59,10 +59,10 @@ let x :Mutex<Vec<i32>>= Mutex::new(Vec::new());
         g.push(2);
         assert!(g.as_slice() == [1, 2, 2] || g.as_slice() == [2, 2, 1]);
         // 在此处，Mutex是加锁的状态
-        kdebug!("x={:?}", x);
+        debug!("x={:?}", x);
     }
     // 由于上方的变量`g`，也就是Mutex守卫的生命周期结束，自动释放了Mutex。因此，在此处，Mutex是放锁的状态
-    kdebug!("x={:?}", x);
+    debug!("x={:?}", x);
 ```
 
 &emsp;&emsp;对于结构体内部的变量，我们可以使用Mutex进行细粒度的加锁，也就是使用Mutex包裹需要细致加锁的成员变量，比如这样：

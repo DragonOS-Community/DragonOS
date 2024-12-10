@@ -1,16 +1,15 @@
 use core::{
-    arch::asm,
     hint::spin_loop,
     sync::atomic::{compiler_fence, fence, AtomicBool, Ordering},
 };
 
 use kdepends::memoffset::offset_of;
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
     arch::{mm::LowAddressRemapping, process::table::TSSManager, MMArch},
     exception::InterruptArch,
-    kdebug,
     libs::{cpumask::CpuMask, rwlock::RwLock},
     mm::{percpu::PerCpu, MemoryManagementArch, PhysAddr, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::ProcessManager,
@@ -46,11 +45,12 @@ struct ApStartStackInfo {
 #[no_mangle]
 unsafe extern "C" fn smp_ap_start() -> ! {
     CurrentIrqArch::interrupt_disable();
+
     let vaddr = if let Some(t) = smp_cpu_manager()
         .cpuhp_state(smp_get_processor_id())
         .thread()
     {
-        t.kernel_stack().stack_max_address().data() - 16
+        t.kernel_stack_force_ref().stack_max_address().data() - 16
     } else {
         // 没有设置ap核心的栈，那么就进入死循环。
         loop {
@@ -64,19 +64,18 @@ unsafe extern "C" fn smp_ap_start() -> ! {
 
 #[naked]
 unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
-    asm!(concat!("
+    core::arch::naked_asm!(concat!("
         mov rsp, [rdi + {off_rsp}]
         mov rbp, [rdi + {off_rsp}]
         jmp {stage1}
     "), 
         off_rsp = const(offset_of!(ApStartStackInfo, vaddr)),
-        stage1 = sym smp_ap_start_stage1,
-    options(noreturn));
+        stage1 = sym smp_ap_start_stage1);
 }
 
 unsafe extern "C" fn smp_ap_start_stage1() -> ! {
     let id = smp_get_processor_id();
-    kdebug!("smp_ap_start_stage1: id: {}\n", id.data());
+    debug!("smp_ap_start_stage1: id: {}\n", id.data());
     let current_idle = ProcessManager::idle_pcb()[smp_get_processor_id().data() as usize].clone();
 
     let tss = TSSManager::current_tss();
@@ -186,7 +185,7 @@ fn print_cpus(s: &str, mask: &CpuMask) {
         v.push(cpu.data());
     }
 
-    kdebug!("{s}: cpus: {v:?}\n");
+    debug!("{s}: cpus: {v:?}\n");
 }
 
 pub struct X86_64SMPArch;
@@ -214,15 +213,16 @@ impl SMPArch for X86_64SMPArch {
     }
 
     fn start_cpu(cpu_id: ProcessorId, _cpu_hpstate: &CpuHpCpuState) -> Result<(), SystemError> {
-        kdebug!("start_cpu: cpu_id: {:#x}\n", cpu_id.data());
-
         Self::copy_smp_start_code();
 
+        fence(Ordering::SeqCst);
         ipi_send_smp_init();
         fence(Ordering::SeqCst);
         ipi_send_smp_startup(cpu_id)?;
+
         fence(Ordering::SeqCst);
         ipi_send_smp_startup(cpu_id)?;
+
         fence(Ordering::SeqCst);
 
         return Ok(());
@@ -257,6 +257,7 @@ impl X86_64SMPArch {
 }
 
 impl SmpCpuManager {
+    #[allow(static_mut_refs)]
     pub fn arch_init(_boot_cpu: ProcessorId) {
         assert!(smp_get_processor_id().data() == 0);
         // 写入APU_START_CR3，这个值会在AP处理器启动时设置到CR3寄存器

@@ -64,6 +64,7 @@ pub struct SignalStruct {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct InnerSignalStruct {
     pub cnt: AtomicI64,
     /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
@@ -77,6 +78,12 @@ impl SignalStruct {
         Self {
             inner: Box::<InnerSignalStruct>::default(),
         }
+    }
+}
+
+impl Default for SignalStruct {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -290,7 +297,6 @@ pub struct UserSigaction {
  * siginfo中，根据signal的来源不同，该info中对应了不同的数据./=
  * 请注意，该info最大占用16字节
  */
-
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct SigInfo {
@@ -333,6 +339,7 @@ impl SigInfo {
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
     Kill(Pid),
+    Alarm(Pid),
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
@@ -429,7 +436,7 @@ impl SigPending {
     /// @brief 从当前进程的sigpending中取出下一个待处理的signal，并返回给调用者。（调用者应当处理这个信号）
     /// 请注意，进入本函数前，当前进程应当持有current_pcb().sighand.siglock
     pub fn dequeue_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
-        // kdebug!("dequeue signal");
+        // debug!("dequeue signal");
         // 获取下一个要处理的信号的编号
         let sig = self.next_signal(sig_mask);
 

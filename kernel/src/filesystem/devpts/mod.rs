@@ -7,6 +7,7 @@ use alloc::{
     vec::Vec,
 };
 use ida::IdAllocator;
+use log::info;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -21,7 +22,7 @@ use crate::{
             tty_device::{PtyType, TtyDevice, TtyType},
         },
     },
-    filesystem::vfs::{syscall::ModeType, FileType, ROOT_INODE},
+    filesystem::vfs::{core::do_mount_mkdir, syscall::ModeType, FileType},
     init::initcall::INITCALL_FS,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
@@ -40,7 +41,7 @@ const PTY_NR_LIMIT: usize = 4096;
 pub struct DevPtsFs {
     /// 根节点
     root_inode: Arc<LockedDevPtsFSInode>,
-    pts_ida: IdAllocator,
+    pts_ida: SpinLock<IdAllocator>,
     pts_count: AtomicU32,
 }
 
@@ -49,7 +50,7 @@ impl DevPtsFs {
         let root_inode = Arc::new(LockedDevPtsFSInode::new());
         let ret = Arc::new(Self {
             root_inode,
-            pts_ida: IdAllocator::new(1, NR_UNIX98_PTY_MAX as usize),
+            pts_ida: SpinLock::new(IdAllocator::new(0, NR_UNIX98_PTY_MAX as usize).unwrap()),
             pts_count: AtomicU32::new(0),
         });
 
@@ -59,7 +60,7 @@ impl DevPtsFs {
     }
 
     pub fn alloc_index(&self) -> Result<usize, SystemError> {
-        self.pts_ida.alloc().ok_or(SystemError::ENOSPC)
+        self.pts_ida.lock().alloc().ok_or(SystemError::ENOSPC)
     }
 }
 
@@ -274,17 +275,11 @@ impl IndexNode for LockedDevPtsFSInode {
 #[unified_init(INITCALL_FS)]
 #[inline(never)]
 pub fn devpts_init() -> Result<(), SystemError> {
-    let dev_inode = ROOT_INODE().find("dev")?;
-
-    let pts_inode = dev_inode.create("pts", FileType::Dir, ModeType::from_bits_truncate(0o755))?;
-
     // 创建 devptsfs 实例
     let ptsfs: Arc<DevPtsFs> = DevPtsFs::new();
 
-    // let mountfs = dev_inode.mount(ptsfs).expect("Failed to mount DevPtsFS");
-
-    pts_inode.mount(ptsfs).expect("Failed to mount DevPtsFS");
-    kinfo!("DevPtsFs mounted.");
+    do_mount_mkdir(ptsfs, "/dev/pts").expect("Failed to mount DevPtsFS");
+    info!("DevPtsFs mounted.");
 
     Ok(())
 }

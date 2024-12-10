@@ -13,3 +13,6 @@ musl-gcc -static -o hello hello.c
 
 在移植现有程序时，可能需要配置`CFLAGS`和`LDFLAGS`，以及`CPPFLAGS`，以便正确地编译，具体请以实际为准。
 
+## 配置dadk
+
+请参考：[Quick Start | DADK](https://docs.dragonos.org.cn/p/dadk/user-manual/quickstart.html)

@@ -1,20 +1,20 @@
 use crate::{
     arch::{mm::LockedFrameAllocator, rand::rand},
     libs::rand::GRandFlags,
-    mm::allocator::page_frame::FrameAllocator,
+    mm::allocator::{page_frame::FrameAllocator, slab::slab_usage},
 };
 use alloc::vec::Vec;
 use core::cmp;
+use log::warn;
 use system_error::SystemError;
 
 use super::{user_access::UserBufferWriter, Syscall};
-
-#[repr(C)]
 
 /// 系统信息
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/uapi/linux/sysinfo.h#8
 #[derive(Debug, Default, Copy, Clone)]
+#[repr(C)]
 pub struct SysInfo {
     uptime: u64,
     loads: [u64; 3],
@@ -38,10 +38,11 @@ impl Syscall {
         let mut sysinfo = SysInfo::default();
 
         let mem = unsafe { LockedFrameAllocator.usage() };
+        let slab_usage = unsafe { slab_usage() };
         sysinfo.uptime = 0;
         sysinfo.loads = [0; 3];
         sysinfo.totalram = mem.total().bytes() as u64;
-        sysinfo.freeram = mem.free().bytes() as u64;
+        sysinfo.freeram = mem.free().bytes() as u64 + slab_usage.free();
         sysinfo.sharedram = 0;
         sysinfo.bufferram = 0;
         sysinfo.totalswap = 0;
@@ -58,7 +59,7 @@ impl Syscall {
     }
 
     pub fn umask(_mask: u32) -> Result<usize, SystemError> {
-        kwarn!("SYS_UMASK has not yet been implemented\n");
+        warn!("SYS_UMASK has not yet been implemented\n");
         return Ok(0o777);
     }
 

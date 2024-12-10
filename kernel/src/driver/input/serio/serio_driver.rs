@@ -11,6 +11,7 @@ use super::{serio_bus, serio_device::SerioDevice};
 /// 实现该trait的设备驱动实例应挂载在serio总线上，同时应该实现Driver trait
 ///
 /// 参考:  https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/serio.h#67
+#[allow(dead_code)]
 pub trait SerioDriver: Driver {
     // 写入时唤醒设备
     fn write_wakeup(&self, device: &Arc<dyn SerioDevice>) -> Result<(), SystemError>;
@@ -44,8 +45,8 @@ pub trait SerioDriver: Driver {
     fn cleanup(&self, device: &Arc<dyn SerioDevice>) -> Result<(), SystemError>;
 }
 
-///todo: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#810
-
+/// todo: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#810
+#[allow(dead_code)]
 #[inline(always)]
 pub fn serio_driver_manager() -> &'static SerioDriverManager {
     &SerioDriverManager

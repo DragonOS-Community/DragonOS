@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -178,7 +179,7 @@ impl IndexNode for KernFSInode {
 
     fn set_metadata(&self, _metadata: &Metadata) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
@@ -193,22 +194,22 @@ impl IndexNode for KernFSInode {
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 应当通过kernfs的其它方法来创建文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn unlink(&self, _name: &str) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn move_to(
@@ -218,7 +219,7 @@ impl IndexNode for KernFSInode {
         _new_name: &str,
     ) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -281,12 +282,12 @@ impl IndexNode for KernFSInode {
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn truncate(&self, _len: usize) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn sync(&self) -> Result<(), SystemError> {
@@ -345,8 +346,8 @@ impl IndexNode for KernFSInode {
         }
 
         if self.callback.is_none() {
-            kwarn!("kernfs: callback is none");
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            warn!("kernfs: callback is none");
+            return Err(SystemError::ENOSYS);
         }
 
         let callback_data =
@@ -370,7 +371,7 @@ impl IndexNode for KernFSInode {
         }
 
         if self.callback.is_none() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
 
         let callback_data =
@@ -380,11 +381,6 @@ impl IndexNode for KernFSInode {
             .as_ref()
             .unwrap()
             .write(callback_data, &buf[..len], offset);
-    }
-
-    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
-        // 待实现
-        Err(SystemError::ENOSYS)
     }
 }
 
@@ -595,7 +591,7 @@ impl KernFSInode {
         target: &Arc<KernFSInode>,
         target_absolute_path: String,
     ) -> Result<Arc<KernFSInode>, SystemError> {
-        // kdebug!("kernfs add link: name:{name}, target path={target_absolute_path}");
+        // debug!("kernfs add link: name:{name}, target path={target_absolute_path}");
         let inode = self.inner_create(
             name,
             KernInodeType::SymLink,

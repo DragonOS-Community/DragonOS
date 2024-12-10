@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use log::error;
 use system_error::SystemError;
 use x86::apic::ApicId;
 
@@ -13,7 +14,6 @@ use crate::{
         irqdesc::{irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandler},
         HardwareIrqNumber, IrqNumber,
     },
-    kerror,
     smp::cpu::ProcessorId,
 };
 
@@ -122,14 +122,14 @@ impl From<ArchIpiTarget> for x86::apic::DestinationShorthand {
 
 #[inline(always)]
 pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
-    // kdebug!("send_ipi: {:?} {:?}", kind, target);
+    // debug!("send_ipi: {:?} {:?}", kind, target);
 
     let ipi_vec = ArchIpiKind::from(kind).into();
     let target = ArchIpiTarget::from(target);
     let shorthand: x86::apic::DestinationShorthand = target.into();
     let destination: x86::apic::ApicId = target.into();
     let icr = if CurrentApic.x2apic_enabled() {
-        // kdebug!("send_ipi: x2apic");
+        // debug!("send_ipi: x2apic");
         x86::apic::Icr::for_x2apic(
             ipi_vec,
             destination,
@@ -141,7 +141,7 @@ pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
             x86::apic::TriggerMode::Edge,
         )
     } else {
-        // kdebug!("send_ipi: xapic");
+        // debug!("send_ipi: xapic");
         x86::apic::Icr::for_xapic(
             ipi_vec,
             destination,
@@ -257,7 +257,7 @@ impl IrqFlowHandler for X86_64IpiIrqFlowHandler {
                 CurrentApic.send_eoi();
             }
             _ => {
-                kerror!("Unknown IPI: {}", irq.data());
+                error!("Unknown IPI: {}", irq.data());
                 CurrentApic.send_eoi();
             }
         }

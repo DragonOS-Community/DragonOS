@@ -3,14 +3,19 @@ use super::{
     Device, DeviceMatchName, DeviceMatcher, IdTable,
 };
 use crate::{
-    driver::base::kobject::KObject,
+    driver::base::{
+        device::{bus::BusNotifyEvent, dd::DeviceAttrCoredump, device_manager},
+        kobject::KObject,
+    },
     filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup},
 };
 use alloc::{
+    string::ToString,
     sync::{Arc, Weak},
     vec::Vec,
 };
 use core::fmt::Debug;
+use log::error;
 use system_error::SystemError;
 
 /// @brief: Driver error
@@ -189,7 +194,7 @@ impl DriverManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/driver.c#222
     pub fn register(&self, driver: Arc<dyn Driver>) -> Result<(), SystemError> {
         let bus = driver.bus().and_then(|bus| bus.upgrade()).ok_or_else(|| {
-            kerror!(
+            error!(
                 "DriverManager::register() failed: driver.bus() is None. Driver: '{:?}'",
                 driver.name()
             );
@@ -199,7 +204,7 @@ impl DriverManager {
         let drv_name = driver.name();
         let other = bus.find_driver_by_name(&drv_name);
         if other.is_some() {
-            kerror!(
+            error!(
                 "DriverManager::register() failed: driver '{}' already registered",
                 drv_name
             );
@@ -208,10 +213,10 @@ impl DriverManager {
 
         bus_manager().add_driver(&driver)?;
 
-        self.add_groups(&driver, driver.groups()).map_err(|e| {
-            bus_manager().remove_driver(&driver);
-            e
-        })?;
+        self.add_groups(&driver, driver.groups())
+            .inspect_err(|_e| {
+                bus_manager().remove_driver(&driver);
+            })?;
 
         // todo: 发送uevent
 
@@ -226,8 +231,38 @@ impl DriverManager {
     }
 
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#434
-    pub fn driver_sysfs_add(&self, _dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-        todo!("DriverManager::driver_sysfs_add()");
+    pub fn driver_sysfs_add(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+        if let Some(bus) = dev.bus().and_then(|bus| bus.upgrade()) {
+            bus.subsystem()
+                .bus_notifier()
+                .call_chain(BusNotifyEvent::BindDriver, Some(dev), None);
+        }
+        let driver_kobj = dev.driver().unwrap() as Arc<dyn KObject>;
+        let device_kobj = dev.clone() as Arc<dyn KObject>;
+
+        let err_remove_device = |e| {
+            sysfs_instance().remove_link(&driver_kobj, dev.name());
+            Err(e)
+        };
+
+        let err_remove_driver = |e| {
+            sysfs_instance().remove_link(&device_kobj, "driver".to_string());
+            err_remove_device(e)
+        };
+
+        sysfs_instance().create_link(Some(&driver_kobj), &device_kobj, device_kobj.name())?;
+
+        if let Err(e) =
+            sysfs_instance().create_link(Some(&device_kobj), &driver_kobj, "driver".to_string())
+        {
+            return err_remove_device(e);
+        }
+
+        if let Err(e) = device_manager().create_file(dev, &DeviceAttrCoredump) {
+            return err_remove_driver(e);
+        }
+
+        return Ok(());
     }
 
     pub fn add_groups(

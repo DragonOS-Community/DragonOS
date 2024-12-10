@@ -22,6 +22,7 @@ use super::{
         driver::Driver,
         Device,
     },
+    kobject::KObject,
     kset::KSet,
 };
 
@@ -80,6 +81,10 @@ impl SubSysPrivate {
             interfaces,
             bus_notifier: AtomicNotifierChain::new(),
         };
+    }
+
+    pub fn name(&self) -> String {
+        return self.subsys.name();
     }
 
     pub fn subsys(&self) -> Arc<KSet> {
@@ -201,7 +206,7 @@ pub trait SubSysInterface: Debug + Send + Sync {
     fn bus(&self) -> Option<Weak<dyn Bus>>;
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>);
     fn add_device(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     fn remove_device(&self, device: &Arc<dyn Device>);
 }

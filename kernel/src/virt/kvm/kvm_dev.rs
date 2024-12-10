@@ -1,4 +1,5 @@
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::generate_inode_id,
@@ -8,7 +9,6 @@ use crate::filesystem::vfs::{
 use crate::libs::spinlock::SpinLockGuard;
 use crate::process::ProcessManager;
 use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::PosixTimeSpec};
-use crate::{filesystem, kdebug};
 // use crate::virt::kvm::{host_stack};
 use super::push_vm;
 use crate::virt::kvm::vm_dev::LockedVmInode;
@@ -17,6 +17,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::debug;
 use system_error::SystemError;
 
 pub const KVM_API_VERSION: u32 = 12;
@@ -94,7 +95,7 @@ impl IndexNode for LockedKvmInode {
         _data: SpinLockGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
-        kdebug!("file private data:{:?}", _data);
+        debug!("file private data:{:?}", _data);
         return Ok(());
     }
 
@@ -111,7 +112,7 @@ impl IndexNode for LockedKvmInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
@@ -141,19 +142,19 @@ impl IndexNode for LockedKvmInode {
     ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
-                kdebug!("kvm ioctl");
+                debug!("kvm ioctl");
                 Ok(0)
             }
             KVM_GET_API_VERSION => Ok(KVM_API_VERSION as usize),
             KVM_CREATE_VM => {
-                kdebug!("kvm KVM_CREATE_VM");
+                debug!("kvm KVM_CREATE_VM");
                 kvm_dev_ioctl_create_vm(data)
             }
             KVM_CHECK_EXTENSION
             | KVM_GET_VCPU_MMAP_SIZE
             | KVM_TRACE_ENABLE
             | KVM_TRACE_PAUSE
-            | KVM_TRACE_DISABLE => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            | KVM_TRACE_DISABLE => Err(SystemError::ENOSYS),
             _ => KVMArch::kvm_arch_dev_ioctl(cmd, data),
         }
     }
@@ -165,7 +166,7 @@ impl IndexNode for LockedKvmInode {
         _buf: &mut [u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -176,7 +177,7 @@ impl IndexNode for LockedKvmInode {
         _buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 }
 

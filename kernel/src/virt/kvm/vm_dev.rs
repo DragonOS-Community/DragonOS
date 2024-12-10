@@ -1,4 +1,5 @@
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,
@@ -14,12 +15,12 @@ use crate::virt::kvm::update_vm;
 use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
 use crate::virt::kvm::vm;
 use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::PosixTimeSpec};
-use crate::{filesystem, kdebug};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::debug;
 use system_error::SystemError;
 
 // pub const KVM_API_VERSION:u32 = 12;
@@ -100,7 +101,7 @@ impl IndexNode for LockedVmInode {
         _data: SpinLockGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
-        kdebug!("file private data:{:?}", _data);
+        debug!("file private data:{:?}", _data);
         return Ok(());
     }
 
@@ -117,7 +118,7 @@ impl IndexNode for LockedVmInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
@@ -147,15 +148,15 @@ impl IndexNode for LockedVmInode {
     ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
-                kdebug!("kvm_vm ioctl");
+                debug!("kvm_vm ioctl");
                 Ok(0)
             }
             KVM_CREATE_VCPU => {
-                kdebug!("kvm_vcpu ioctl KVM_CREATE_VCPU");
+                debug!("kvm_vcpu ioctl KVM_CREATE_VCPU");
                 kvm_vm_ioctl_create_vcpu(data as u32)
             }
             KVM_SET_USER_MEMORY_REGION => {
-                kdebug!("kvm_vcpu ioctl KVM_SET_USER_MEMORY_REGION data={:x}", data);
+                debug!("kvm_vcpu ioctl KVM_SET_USER_MEMORY_REGION data={:x}", data);
                 let mut kvm_userspace_mem = KvmUserspaceMemoryRegion::default(); // = unsafe { (data as *const KvmUserspaceMemoryRegion).as_ref().unwrap() };
                 unsafe {
                     copy_from_user(
@@ -166,7 +167,7 @@ impl IndexNode for LockedVmInode {
                         VirtAddr::new(data),
                     )?;
                 }
-                kdebug!(
+                debug!(
                     "slot={}, flag={}, memory_size={:x}, guest_phys_addr={}, userspace_addr={}",
                     kvm_userspace_mem.slot,
                     kvm_userspace_mem.flags,
@@ -181,10 +182,10 @@ impl IndexNode for LockedVmInode {
                 Ok(0)
             }
             KVM_GET_DIRTY_LOG | KVM_IRQFD | KVM_IOEVENTFD | KVM_IRQ_LINE_STATUS => {
-                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+                Err(SystemError::ENOSYS)
             }
             _ => {
-                kdebug!("kvm_vm ioctl");
+                debug!("kvm_vm ioctl");
                 Ok(usize::MAX)
             }
         }
@@ -197,7 +198,7 @@ impl IndexNode for LockedVmInode {
         _buf: &mut [u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -208,7 +209,7 @@ impl IndexNode for LockedVmInode {
         _buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 }
 

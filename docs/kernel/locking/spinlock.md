@@ -65,10 +65,10 @@ let x :SpinLock<Vec<i32>>= SpinLock::new(Vec::new());
         g.push(2);
         assert!(g.as_slice() == [1, 2, 2] || g.as_slice() == [2, 2, 1]);
         // 在此处，SpinLock是加锁的状态
-        kdebug!("x={:?}", x);
+        debug!("x={:?}", x);
     }
     // 由于上方的变量`g`，也就是SpinLock守卫的生命周期结束，自动释放了SpinLock。因此，在此处，SpinLock是放锁的状态
-    kdebug!("x={:?}", x);
+    debug!("x={:?}", x);
 ```
 
 &emsp;&emsp;对于结构体内部的变量，我们可以使用SpinLock进行细粒度的加锁，也就是使用SpinLock包裹需要细致加锁的成员变量，比如这样：

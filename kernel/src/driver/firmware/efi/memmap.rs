@@ -1,5 +1,6 @@
 use core::{intrinsics::unlikely, mem::size_of};
 
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -66,7 +67,7 @@ impl<'a> EFIMemoryDescIter<'a> {
     }
 }
 
-impl<'a> Iterator for EFIMemoryDescIter<'a> {
+impl Iterator for EFIMemoryDescIter<'_> {
     type Item = MemoryDescriptor;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -110,7 +111,7 @@ impl EFIManager {
             let offset = paddr.data() - page_align_down(paddr.data());
             let map_size = data.mmap_size.unwrap() as usize + offset;
 
-            // kdebug!("do_efi_memmap_init: map_size={map_size:#x}");
+            // debug!("do_efi_memmap_init: map_size={map_size:#x}");
 
             // 映射内存
             let mut vaddr = EarlyIoRemap::map(
@@ -130,7 +131,7 @@ impl EFIManager {
         }
 
         if inner_guard.mmap.vaddr.is_none() {
-            kerror!("Cannot map the EFI memory map!");
+            error!("Cannot map the EFI memory map!");
             return Err(SystemError::ENOMEM);
         }
 

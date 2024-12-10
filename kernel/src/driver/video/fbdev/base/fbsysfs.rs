@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -85,7 +86,7 @@ impl Attribute for AttrBitsPerPixel {
     }
 
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        kwarn!("attr bits_per_pixel store not implemented");
+        warn!("attr bits_per_pixel store not implemented");
         return Err(SystemError::ENOSYS);
     }
 
@@ -116,7 +117,7 @@ impl Attribute for AttrBlank {
 
     // todo:  https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbsysfs.c#309
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        kwarn!("attr blank store not implemented");
+        warn!("attr blank store not implemented");
         return Err(SystemError::ENOSYS);
     }
 }

@@ -34,7 +34,7 @@ use crate::{
         spinlock::SpinLockGuard,
     },
     mm::VirtAddr,
-    net::event_poll::{EPollItem, EventPoll},
+    net::event_poll::{EPollItem, KernelIoctlData},
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -45,7 +45,7 @@ use super::{
     sysfs::sys_class_tty_instance,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
-    tty_driver::{TtyDriver, TtyDriverManager, TtyDriverSubType, TtyDriverType, TtyOperation},
+    tty_driver::{TtyDriverManager, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
     virtual_terminal::vty_init,
 };
@@ -126,6 +126,10 @@ impl TtyDevice {
     pub fn inner_write(&self) -> RwLockWriteGuard<InnerTtyDevice> {
         self.inner.write()
     }
+
+    pub fn name_ref(&self) -> &str {
+        &self.name
+    }
 }
 
 impl IndexNode for TtyDevice {
@@ -134,10 +138,10 @@ impl IndexNode for TtyDevice {
         mut data: SpinLockGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
+        if let FilePrivateData::Tty(_) = &*data {
+            return Ok(());
+        }
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
-            if let FilePrivateData::Tty(_) = &*data {
-                return Ok(());
-            }
             return ptmx_open(data, mode);
         }
         let dev_num = self.metadata()?.raw_dev;
@@ -145,7 +149,7 @@ impl IndexNode for TtyDevice {
         let (index, driver) =
             TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
 
-        let tty = TtyDriver::open_tty(index, driver)?;
+        let tty = driver.open_tty(Some(index))?;
 
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
@@ -308,6 +312,35 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
+    fn kernel_ioctl(
+        &self,
+        arg: Arc<dyn KernelIoctlData>,
+        data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        let epitem = arg
+            .arc_any()
+            .downcast::<EPollItem>()
+            .map_err(|_| SystemError::EFAULT)?;
+
+        let _ = UserBufferReader::new(
+            &epitem as *const Arc<EPollItem>,
+            core::mem::size_of::<Arc<EPollItem>>(),
+            false,
+        )?;
+
+        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
+            (tty_priv.tty(), tty_priv.mode)
+        } else {
+            return Err(SystemError::EIO);
+        };
+
+        let core = tty.core();
+
+        core.add_epitem(epitem.clone());
+
+        return Ok(0);
+    }
+
     fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
             (tty_priv.tty(), tty_priv.mode)
@@ -325,20 +358,6 @@ impl IndexNode for TtyDevice {
                 if cmd != TtyIoctlCmd::TIOCCBRK {
                     todo!()
                 }
-            }
-            EventPoll::ADD_EPOLLITEM => {
-                let _ = UserBufferReader::new(
-                    arg as *const Arc<EPollItem>,
-                    core::mem::size_of::<Arc<EPollItem>>(),
-                    false,
-                )?;
-                let epitem = unsafe { &*(arg as *const Arc<EPollItem>) };
-
-                let core = tty.core();
-
-                core.add_epitem(epitem.clone());
-
-                return Ok(0);
             }
             _ => {}
         }
@@ -359,6 +378,23 @@ impl IndexNode for TtyDevice {
                     return Err(SystemError::EFAULT);
                 }
                 return Ok(0);
+            }
+            TtyIoctlCmd::TIOCSWINSZ => {
+                let reader = UserBufferReader::new(
+                    arg as *const (),
+                    core::mem::size_of::<WindowSize>(),
+                    true,
+                )?;
+
+                let user_winsize = reader.read_one_from_user::<WindowSize>(0)?;
+
+                let ret = tty.resize(tty.clone(), *user_winsize);
+
+                if ret != Err(SystemError::ENOSYS) {
+                    return ret.map(|_| 0);
+                } else {
+                    return tty.tty_do_resize(*user_winsize).map(|_| 0);
+                }
             }
             _ => match TtyJobCtrlManager::job_ctrl_ioctl(tty.clone(), cmd, arg) {
                 Ok(_) => {
@@ -517,6 +553,17 @@ impl Device for TtyDevice {
     fn state_synced(&self) -> bool {
         true
     }
+
+    fn dev_parent(&self) -> Option<alloc::sync::Weak<dyn crate::driver::base::device::Device>> {
+        None
+    }
+
+    fn set_dev_parent(
+        &self,
+        _dev_parent: Option<alloc::sync::Weak<dyn crate::driver::base::device::Device>>,
+    ) {
+        todo!()
+    }
 }
 
 impl CharDevice for TtyDevice {
@@ -549,15 +596,6 @@ impl TtyFilePrivateData {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn tty_init() -> Result<(), SystemError> {
-    let tty = TtyDevice::new(
-        "tty0".to_string(),
-        IdTable::new(
-            String::from("tty0"),
-            Some(DeviceNumber::new(Major::TTY_MAJOR, 0)),
-        ),
-        TtyType::Tty,
-    );
-
     let console = TtyDevice::new(
         "console".to_string(),
         IdTable::new(
@@ -567,34 +605,8 @@ pub fn tty_init() -> Result<(), SystemError> {
         TtyType::Tty,
     );
 
-    // 注册tty设备
-    // CharDevOps::cdev_add(
-    //     tty.clone() as Arc<dyn CharDevice>,
-    // IdTable::new(
-    //     String::from("tty0"),
-    //     Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 0)),
-    // ),
-    //     1,
-    // )?;
-
-    // CharDevOps::register_chardev_region(DeviceNumber::new(Major::TTYAUX_MAJOR, 0), 1, "/dev/tty")?;
-
-    // 注册console设备
-    // CharDevOps::cdev_add(
-    //     console.clone() as Arc<dyn CharDevice>,
-    //     IdTable::new(
-    //         String::from("console"),
-    //         Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 1)),
-    //     ),
-    //     1,
-    // )?;
-
-    // CharDevOps::register_chardev_region(DeviceNumber::new(Major::TTYAUX_MAJOR, 1), 1, "/dev/tty")?;
-
-    // 将这两个设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
-    device_register(tty.clone())?;
+    // 将设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
     device_register(console.clone())?;
-    devfs_register(&tty.name.clone(), tty)?;
     devfs_register(&console.name.clone(), console)?;
 
     serial_init()?;

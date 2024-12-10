@@ -5,20 +5,16 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 
 use kdepends::memoffset::offset_of;
+use log::{error, warn};
 use system_error::SystemError;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
     arch::process::table::TSSManager,
     exception::InterruptArch,
-    kerror, kwarn,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
@@ -171,7 +167,7 @@ impl ArchPCBInfo {
     // 清空浮点寄存器
     pub fn clear_fp_state(&mut self) {
         if unlikely(self.fp_state.is_none()) {
-            kwarn!("fp_state is none");
+            warn!("fp_state is none");
             return;
         }
 
@@ -279,7 +275,7 @@ impl ProcessControlBlock {
         // 从内核栈的最低地址处取出pcb的地址
         let p = stack_base.data() as *const *const ProcessControlBlock;
         if unlikely((unsafe { *p }).is_null()) {
-            kerror!("p={:p}", p);
+            error!("p={:p}", p);
             panic!("current_pcb is null");
         }
         unsafe {
@@ -303,7 +299,7 @@ impl ProcessManager {
     pub fn copy_thread(
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
-        clone_args: KernelCloneArgs,
+        clone_args: &KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
@@ -410,7 +406,7 @@ impl ProcessManager {
         );
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
-        // kdebug!("switch tss ok");
+        // debug!("switch tss ok");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
@@ -429,7 +425,7 @@ impl ProcessManager {
 /// 保存上下文，然后切换进程，接着jmp到`switch_finish_hook`钩子函数
 #[naked]
 unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBInfo) {
-    asm!(
+    core::arch::naked_asm!(
         // As a quick reminder for those who are unfamiliar with the System V ABI (extern "C"):
         //
         // - the current parameters are passed in the registers `rdi`, `rsi`,
@@ -459,9 +455,6 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
 
         // mov fs, [rsi + {off_fs}]
         // mov gs, [rsi + {off_gs}]
-
-        push rbp
-        push rax
 
         mov [rdi + {off_rbp}], rbp
         mov rbp, [rsi + {off_rbp}]
@@ -505,24 +498,15 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
         off_gs = const(offset_of!(ArchPCBInfo, gs)),
 
         switch_hook = sym crate::process::switch_finish_hook,
-        options(noreturn),
     );
 }
 
-/// 从`switch_to_inner`返回后，执行这个函数
-///
-/// 也就是说，当进程再次被调度时，会从这里开始执行
-#[inline(never)]
-unsafe extern "sysv64" fn switch_back() {
-    asm!(concat!(
-        "
-        pop rax
-        pop rbp
-        "
-    ))
+#[naked]
+unsafe extern "sysv64" fn switch_back() -> ! {
+    core::arch::naked_asm!("ret");
 }
 
-pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<String>) -> ! {
+pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 以下代码不能发生中断
     CurrentIrqArch::interrupt_disable();
 
@@ -530,8 +514,7 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
     let trap_frame_vaddr = VirtAddr::new(
         current_pcb.kernel_stack().stack_max_address().data() - core::mem::size_of::<TrapFrame>(),
     );
-    // kdebug!("trap_frame_vaddr: {:?}", trap_frame_vaddr);
-    let new_rip = VirtAddr::new(ret_from_intr as usize);
+    // debug!("trap_frame_vaddr: {:?}", trap_frame_vaddr);
 
     assert!(
         (x86::current::registers::rsp() as usize) < trap_frame_vaddr.data(),
@@ -542,6 +525,7 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
         trap_frame_vaddr.data()
     );
 
+    let new_rip = VirtAddr::new(ret_from_intr as usize);
     let mut arch_guard = current_pcb.arch_info_irqsave();
     arch_guard.rsp = trap_frame_vaddr.data();
 
@@ -559,27 +543,10 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
 
     drop(arch_guard);
 
-    // 删除kthread的标志
-    current_pcb.flags().remove(ProcessFlags::KTHREAD);
-    current_pcb.worker_private().take();
-
-    *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
-
-    let mut trap_frame = TrapFrame::new();
-
-    compiler_fence(Ordering::SeqCst);
-    Syscall::do_execve(path, argv, envp, &mut trap_frame).unwrap_or_else(|e| {
-        panic!(
-            "arch_switch_to_user(): pid: {pid:?}, Failed to execve: , error: {e:?}",
-            pid = current_pcb.pid(),
-            e = e
-        );
-    });
+    drop(current_pcb);
     compiler_fence(Ordering::SeqCst);
 
     // 重要！在这里之后，一定要保证上面的引用计数变量、动态申请的变量、锁的守卫都被drop了，否则可能导致内存安全问题！
-
-    drop(current_pcb);
 
     compiler_fence(Ordering::SeqCst);
     ready_to_switch_to_user(trap_frame, trap_frame_vaddr.data(), new_rip.data());

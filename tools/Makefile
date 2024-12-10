@@ -6,4 +6,4 @@ clean:
 	@cargo clean
 
 check:
-	@cargo check --all
+	@cargo +nightly-2024-11-05 check --workspace --message-format=json

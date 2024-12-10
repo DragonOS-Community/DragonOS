@@ -2,17 +2,21 @@ use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicBool, Ordering};
 use exit::VmxExitHandlers;
+use log::debug;
+use log::error;
+use log::warn;
 use x86_64::registers::control::Cr3Flags;
 use x86_64::structures::paging::PhysFrame;
 
 use crate::arch::process::table::USER_DS;
-use crate::arch::vm::mmu::mmu::KvmMmu;
+use crate::arch::vm::mmu::kvm_mmu::KvmMmu;
 use crate::arch::vm::uapi::kvm_exit;
 use crate::arch::vm::uapi::{
     AC_VECTOR, BP_VECTOR, DB_VECTOR, GP_VECTOR, MC_VECTOR, NM_VECTOR, PF_VECTOR, UD_VECTOR,
 };
 use crate::arch::vm::vmx::vmcs::VmcsIntrHelper;
 use crate::libs::spinlock::SpinLockGuard;
+use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::virt::vm::kvm_host::vcpu::GuestDebug;
 use crate::{
@@ -25,11 +29,10 @@ use crate::{
         CurrentIrqArch, MMArch, VirtCpuArch,
     },
     exception::InterruptArch,
-    kdebug,
     libs::spinlock::SpinLock,
     mm::{
         percpu::{PerCpu, PerCpuVar},
-        virt_2_phys, MemoryManagementArch, PhysAddr,
+        MemoryManagementArch,
     },
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     virt::vm::{kvm_dev::kvm_init, kvm_host::vcpu::VirtCpu, user_api::UapiKvmSegment},
@@ -70,7 +73,6 @@ use crate::{
         vm::{vmx::vmcs::feat::VmxFeat, x86_kvm_manager_mut, McgCap},
         KvmArch,
     },
-    kerror, kwarn,
     libs::rwlock::RwLock,
     virt::vm::kvm_host::Vm,
 };
@@ -178,7 +180,7 @@ impl KvmInitFunc for VmxKvmInitFunc {
         // 是否启用了 EPT 并且检查 CPU 是否支持 Execute Disable（NX）功能
         // Execute Disable 是一种 CPU 功能，可以防止代码在数据内存区域上执行
         if !vmx_init.enable_ept && !cpu_extend_feature.has_execute_disable() {
-            kerror!("[KVM] NX (Execute Disable) not supported");
+            error!("[KVM] NX (Execute Disable) not supported");
             return Err(SystemError::ENOSYS);
         }
 
@@ -245,10 +247,10 @@ impl KvmInitFunc for VmxKvmInitFunc {
 
         if vmx_init.enable_ept {
             // TODO: mmu_set_ept_masks
-            kwarn!("mmu_set_ept_masks TODO!");
+            warn!("mmu_set_ept_masks TODO!");
         }
 
-        kwarn!("vmx_setup_me_spte_mask TODO!");
+        warn!("vmx_setup_me_spte_mask TODO!");
 
         KvmMmu::kvm_configure_mmu(
             vmx_init.enable_ept,
@@ -291,7 +293,7 @@ impl KvmInitFunc for VmxKvmInitFunc {
         init_vmx(vmx_init);
         self.setup_per_cpu();
 
-        kwarn!("hardware setup finish");
+        warn!("hardware setup finish");
         Ok(())
     }
 
@@ -359,7 +361,7 @@ impl VmxKvmFunc {
 
             vmx.loaded_vmcs.lock().cpu = cpu;
             let id = vmx.loaded_vmcs.lock().vmcs.lock().revision_id();
-            kdebug!(
+            debug!(
                 "revision_id {id} req {:?}",
                 VirtCpuRequest::KVM_REQ_TLB_FLUSH
             );
@@ -436,13 +438,14 @@ impl KvmFunc for VmxKvmFunc {
     fn hardware_enable(&self) -> Result<(), SystemError> {
         let vmcs = vmx_area().get().as_ref();
 
-        kdebug!("vmcs idx {}", vmcs.abort);
+        debug!("vmcs idx {}", vmcs.abort);
 
-        let phys_addr = virt_2_phys(vmcs as *const _ as usize);
+        let phys_addr =
+            unsafe { MMArch::virt_2_phys(VirtAddr::new(vmcs as *const _ as usize)).unwrap() };
 
         // TODO: intel_pt_handle_vmx(1);
 
-        VmxAsm::kvm_cpu_vmxon(PhysAddr::new(phys_addr))?;
+        VmxAsm::kvm_cpu_vmxon(phys_addr)?;
 
         Ok(())
     }
@@ -699,7 +702,7 @@ impl KvmFunc for VmxKvmFunc {
 
         vmx_info().vpid_sync_context(vcpu.vmx().vpid);
 
-        kwarn!("TODO: vmx_update_fb_clear_dis");
+        warn!("TODO: vmx_update_fb_clear_dis");
     }
 
     fn set_rflags(&self, vcpu: &mut VirtCpu, mut rflags: x86::bits64::rflags::RFlags) {
@@ -1083,7 +1086,7 @@ impl KvmFunc for VmxKvmFunc {
 
         if vmx_info().enable_preemption_timer {
             // todo!()
-            kwarn!("vmx_update_hv_timer TODO");
+            warn!("vmx_update_hv_timer TODO");
         }
 
         Vmx::vmx_vcpu_enter_exit(vcpu, vcpu.vmx().vmx_vcpu_run_flags());
@@ -1236,7 +1239,7 @@ impl KvmFunc for VmxKvmFunc {
                 todo!()
             } else if vcpu.arch.is_register_dirty(KvmReg::VcpuExregCr3) {
                 guest_cr3 = vcpu.arch.cr3;
-                kdebug!("load_mmu_pgd: guest_cr3 = {:#x}", guest_cr3);
+                debug!("load_mmu_pgd: guest_cr3 = {:#x}", guest_cr3);
             } else {
                 return;
             }
@@ -1460,14 +1463,14 @@ impl Vmx {
         if !cpu_based_2nd_exec_control.contains(SecondaryControls::ENABLE_EPT)
             && !vmx_cap.ept.is_empty()
         {
-            kwarn!("EPT CAP should not exist if not support. 1-setting enable EPT VM-execution control");
+            warn!("EPT CAP should not exist if not support. 1-setting enable EPT VM-execution control");
             return Err(SystemError::EIO);
         }
 
         if !cpu_based_2nd_exec_control.contains(SecondaryControls::ENABLE_VPID)
             && !vmx_cap.vpid.is_empty()
         {
-            kwarn!("VPID CAP should not exist if not support. 1-setting enable VPID VM-execution control");
+            warn!("VPID CAP should not exist if not support. 1-setting enable VPID VM-execution control");
             return Err(SystemError::EIO);
         }
 
@@ -1503,11 +1506,11 @@ impl Vmx {
             // if !(vmentry_control.bits() & n_ctrl.bits) == !(vmxexit_control.bits() & x_ctrl.bits) {
             //     continue;
             // }
-            if !(vmentry_control.contains(n_ctrl)) == !(vmxexit_control.contains(x_ctrl)) {
+            if (vmentry_control.contains(n_ctrl)) == (vmxexit_control.contains(x_ctrl)) {
                 continue;
             }
 
-            kwarn!(
+            warn!(
                 "Inconsistent VM-Entry/VM-Exit pair, entry = {:?}, exit = {:?}",
                 vmentry_control & n_ctrl,
                 vmxexit_control & x_ctrl,
@@ -1705,7 +1708,7 @@ impl Vmx {
         }
 
         if vmx_info().has_msr_bitmap() {
-            kdebug!(
+            debug!(
                 "msr_bitmap addr 0x{:x}",
                 vcpu.vmx().vmcs01.lock().msr_bitmap.phys_addr() as u64
             );
@@ -1751,18 +1754,22 @@ impl Vmx {
             VmxAsm::vmx_vmwrite(guest::INTERRUPT_STATUS, 0);
 
             VmxAsm::vmx_vmwrite(control::POSTED_INTERRUPT_NOTIFICATION_VECTOR, 0xf2);
-            VmxAsm::vmx_vmwrite(
-                control::POSTED_INTERRUPT_DESC_ADDR_FULL,
-                virt_2_phys(&vcpu.vmx().post_intr_desc as *const _ as usize) as u64,
-            )
+            VmxAsm::vmx_vmwrite(control::POSTED_INTERRUPT_DESC_ADDR_FULL, unsafe {
+                MMArch::virt_2_phys(VirtAddr::new(
+                    &vcpu.vmx().post_intr_desc as *const _ as usize,
+                ))
+                .unwrap()
+                .data() as u64
+            })
         }
 
         if self.enable_apicv && vcpu.arch.lapic_in_kernel() {
             // PID_POINTER_TABLE
-            VmxAsm::vmx_vmwrite(
-                0x2042,
-                virt_2_phys(kvm_vmx.pid_table().as_ptr() as usize) as u64,
-            );
+            VmxAsm::vmx_vmwrite(0x2042, unsafe {
+                MMArch::virt_2_phys(VirtAddr::new(kvm_vmx.pid_table().as_ptr() as usize))
+                    .unwrap()
+                    .data() as u64
+            });
             // LAST_PID_POINTER_INDEX
             VmxAsm::vmx_vmwrite(0x08, vm.arch.max_vcpu_ids as u64 - 1);
         }
@@ -1799,15 +1806,21 @@ impl Vmx {
 
         VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_STORE_COUNT, 0);
         VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_COUNT, 0);
-        VmxAsm::vmx_vmwrite(
-            control::VMEXIT_MSR_LOAD_ADDR_FULL,
-            virt_2_phys(vcpu.vmx().msr_autoload.host.val.as_ptr() as *const _ as usize) as u64,
-        );
+        VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_ADDR_FULL, unsafe {
+            MMArch::virt_2_phys(VirtAddr::new(
+                vcpu.vmx().msr_autoload.host.val.as_ptr() as *const _ as usize,
+            ))
+            .unwrap()
+            .data() as u64
+        });
         VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_COUNT, 0);
-        VmxAsm::vmx_vmwrite(
-            control::VMENTRY_MSR_LOAD_ADDR_FULL,
-            virt_2_phys(vcpu.vmx().msr_autoload.guest.val.as_ptr() as usize) as u64,
-        );
+        VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_ADDR_FULL, unsafe {
+            MMArch::virt_2_phys(VirtAddr::new(
+                vcpu.vmx().msr_autoload.guest.val.as_ptr() as usize
+            ))
+            .unwrap()
+            .data() as u64
+        });
 
         if self
             .vmcs_config
@@ -1847,10 +1860,11 @@ impl Vmx {
         }
 
         if self.enable_pml {
-            VmxAsm::vmx_vmwrite(
-                control::PML_ADDR_FULL,
-                virt_2_phys(vcpu.vmx().pml_pg.as_ref().as_ptr() as usize) as u64,
-            );
+            VmxAsm::vmx_vmwrite(control::PML_ADDR_FULL, unsafe {
+                MMArch::virt_2_phys(VirtAddr::new(vcpu.vmx().pml_pg.as_ref().as_ptr() as usize))
+                    .unwrap()
+                    .data() as u64
+            });
 
             VmxAsm::vmx_vmwrite(guest::PML_INDEX, VmxVCpuPriv::PML_ENTITY_NUM as u64 - 1);
         }
@@ -1869,10 +1883,11 @@ impl Vmx {
         if self.has_tpr_shadow() {
             VmxAsm::vmx_vmwrite(control::VIRT_APIC_ADDR_FULL, 0);
             if vcpu.arch.lapic_in_kernel() {
-                VmxAsm::vmx_vmwrite(
-                    control::VIRT_APIC_ADDR_FULL,
-                    virt_2_phys(vcpu.arch.lapic().regs.as_ptr() as usize) as u64,
-                );
+                VmxAsm::vmx_vmwrite(control::VIRT_APIC_ADDR_FULL, unsafe {
+                    MMArch::virt_2_phys(VirtAddr::new(vcpu.arch.lapic().regs.as_ptr() as usize))
+                        .unwrap()
+                        .data() as u64
+                });
             }
 
             VmxAsm::vmx_vmwrite(control::TPR_THRESHOLD, 0);
@@ -1915,50 +1930,50 @@ impl Vmx {
             todo!()
         }
 
-        kerror!(
+        error!(
             "VMCS addr: 0x{:x}, last attempted VM-entry on CPU {:?}",
             vcpu.vmx().loaded_vmcs().vmcs.lock().as_ref() as *const _ as usize,
             vcpu.arch.last_vmentry_cpu
         );
 
-        kerror!("--- GUEST STATE ---");
-        kerror!(
+        error!("--- GUEST STATE ---");
+        error!(
             "CR0: actual = 0x{:x}, shadow = 0x{:x}, gh_mask = 0x{:x}",
             self.vmread(guest::CR0),
             self.vmread(control::CR0_READ_SHADOW),
             self.vmread(control::CR0_GUEST_HOST_MASK)
         );
-        kerror!(
+        error!(
             "CR4: actual = 0x{:x}, shadow = 0x{:x}, gh_mask = 0x{:x}",
             self.vmread(guest::CR4),
             self.vmread(control::CR4_READ_SHADOW),
             self.vmread(control::CR4_GUEST_HOST_MASK)
         );
-        kerror!("CR3: actual = 0x{:x}", self.vmread(guest::CR3));
+        error!("CR3: actual = 0x{:x}", self.vmread(guest::CR3));
 
         if self.has_ept() {
-            kerror!(
+            error!(
                 "PDPTR0 = 0x{:x}, PDPTR1 = 0x{:x}",
                 self.vmread(guest::PDPTE0_FULL),
                 self.vmread(guest::PDPTE1_FULL)
             );
-            kerror!(
+            error!(
                 "PDPTR2 = 0x{:x}, PDPTR3 = 0x{:x}",
                 self.vmread(guest::PDPTE2_FULL),
                 self.vmread(guest::PDPTE3_FULL)
             );
         }
-        kerror!(
+        error!(
             "RSP = 0x{:x}, RIP = 0x{:x}",
             self.vmread(guest::RSP),
             self.vmread(guest::RIP)
         );
-        kerror!(
+        error!(
             "RFLAGS = 0x{:x}, DR7 = 0x{:x}",
             self.vmread(guest::RFLAGS),
             self.vmread(guest::DR7)
         );
-        kerror!(
+        error!(
             "Sysenter RSP = 0x{:x}, CS:RIP = 0x{:x}:0x{:x}",
             self.vmread(guest::IA32_SYSENTER_ESP),
             self.vmread(guest::IA32_SYSENTER_CS),
@@ -1984,29 +1999,29 @@ impl Vmx {
             .find_loadstore_msr_slot(msr::IA32_EFER);
 
         if vmentry_ctl.contains(EntryControls::LOAD_IA32_EFER) {
-            kerror!("EFER = 0x{:x}", self.vmread(guest::IA32_EFER_FULL));
+            error!("EFER = 0x{:x}", self.vmread(guest::IA32_EFER_FULL));
         } else if let Some(slot) = efer_slot {
-            kerror!(
+            error!(
                 "EFER = 0x{:x} (autoload)",
                 vcpu.vmx().msr_autoload.guest.val[slot].data
             );
         } else if vmentry_ctl.contains(EntryControls::IA32E_MODE_GUEST) {
-            kerror!(
+            error!(
                 "EFER = 0x{:x} (effective)",
                 vcpu.arch.efer | (EferFlags::LONG_MODE_ACTIVE | EferFlags::LONG_MODE_ENABLE)
             );
         } else {
-            kerror!(
+            error!(
                 "EFER = 0x{:x} (effective)",
                 vcpu.arch.efer & !(EferFlags::LONG_MODE_ACTIVE | EferFlags::LONG_MODE_ENABLE)
             );
         }
 
         if vmentry_ctl.contains(EntryControls::LOAD_IA32_PAT) {
-            kerror!("PAT = 0x{:x}", self.vmread(guest::IA32_PAT_FULL));
+            error!("PAT = 0x{:x}", self.vmread(guest::IA32_PAT_FULL));
         }
 
-        kerror!(
+        error!(
             "DebugCtl = 0x{:x}, DebugExceptions = 0x{:x}",
             self.vmread(guest::IA32_DEBUGCTL_FULL),
             self.vmread(guest::PENDING_DBG_EXCEPTIONS)
@@ -2015,24 +2030,24 @@ impl Vmx {
         if self.has_load_perf_global_ctrl()
             && vmentry_ctl.contains(EntryControls::LOAD_IA32_PERF_GLOBAL_CTRL)
         {
-            kerror!(
+            error!(
                 "PerfGlobCtl = 0x{:x}",
                 self.vmread(guest::IA32_PERF_GLOBAL_CTRL_FULL)
             );
         }
 
         if vmentry_ctl.contains(EntryControls::LOAD_IA32_BNDCFGS) {
-            kerror!("BndCfgS = 0x{:x}", self.vmread(guest::IA32_BNDCFGS_FULL));
+            error!("BndCfgS = 0x{:x}", self.vmread(guest::IA32_BNDCFGS_FULL));
         }
 
-        kerror!(
+        error!(
             "Interruptibility = 0x{:x}, ActivityState = 0x{:x}",
             self.vmread(guest::INTERRUPT_STATUS),
             self.vmread(guest::ACTIVITY_STATE)
         );
 
         if secondary_exec_control.contains(SecondaryControls::VIRTUAL_INTERRUPT_DELIVERY) {
-            kerror!(
+            error!(
                 "InterruptStatus = 0x{:x}",
                 self.vmread(guest::INTERRUPT_STATUS)
             );
@@ -2045,13 +2060,13 @@ impl Vmx {
             self.dump_msrs("guest autostore", &vcpu.vmx().msr_autostore);
         }
 
-        kerror!("\n--- HOST STATE ---");
-        kerror!(
+        error!("\n--- HOST STATE ---");
+        error!(
             "RIP = 0x{:x}, RSP = 0x{:x}",
             self.vmread(host::RIP),
             self.vmread(host::RSP)
         );
-        kerror!(
+        error!(
             "CS = 0x{:x}, SS = 0x{:x}, DS = 0x{:x}, ES = 0x{:x}, FS = 0x{:x}, GS = 0x{:x}, TR = 0x{:x}",
             self.vmread(host::CS_SELECTOR),
             self.vmread(host::SS_SELECTOR),
@@ -2061,24 +2076,24 @@ impl Vmx {
             self.vmread(host::GS_SELECTOR),
             self.vmread(host::TR_SELECTOR)
         );
-        kerror!(
+        error!(
             "FSBase = 0x{:x}, GSBase = 0x{:x}, TRBase = 0x{:x}",
             self.vmread(host::FS_BASE),
             self.vmread(host::GS_BASE),
             self.vmread(host::TR_BASE),
         );
-        kerror!(
+        error!(
             "GDTBase = 0x{:x}, IDTBase = 0x{:x}",
             self.vmread(host::GDTR_BASE),
             self.vmread(host::IDTR_BASE),
         );
-        kerror!(
+        error!(
             "CR0 = 0x{:x}, CR3 = 0x{:x}, CR4 = 0x{:x}",
             self.vmread(host::CR0),
             self.vmread(host::CR3),
             self.vmread(host::CR4),
         );
-        kerror!(
+        error!(
             "Sysenter RSP = 0x{:x}, CS:RIP=0x{:x}:0x{:x}",
             self.vmread(host::IA32_SYSENTER_ESP),
             self.vmread(host::IA32_SYSENTER_CS),
@@ -2086,17 +2101,17 @@ impl Vmx {
         );
 
         if vmexit_ctl.contains(ExitControls::LOAD_IA32_EFER) {
-            kerror!("EFER = 0x{:x}", self.vmread(host::IA32_EFER_FULL));
+            error!("EFER = 0x{:x}", self.vmread(host::IA32_EFER_FULL));
         }
 
         if vmexit_ctl.contains(ExitControls::LOAD_IA32_PAT) {
-            kerror!("PAT = 0x{:x}", self.vmread(host::IA32_PAT_FULL));
+            error!("PAT = 0x{:x}", self.vmread(host::IA32_PAT_FULL));
         }
 
         if self.has_load_perf_global_ctrl()
             && vmexit_ctl.contains(ExitControls::LOAD_IA32_PERF_GLOBAL_CTRL)
         {
-            kerror!(
+            error!(
                 "PerfGlobCtl = 0x{:x}",
                 self.vmread(host::IA32_PERF_GLOBAL_CTRL_FULL)
             );
@@ -2106,50 +2121,47 @@ impl Vmx {
             self.dump_msrs("host autoload", &vcpu.vmx().msr_autoload.host);
         }
 
-        kerror!("\n--- CONTROL STATE ---");
-        kerror!(
+        error!("\n--- CONTROL STATE ---");
+        error!(
             "\nCPUBased = {:?},\nSecondaryExec = 0x{:x},\nTertiaryExec = 0(Unused)",
-            cpu_based_exec_ctl,
-            secondary_exec_control,
+            cpu_based_exec_ctl, secondary_exec_control,
         );
-        kerror!(
+        error!(
             "\nPinBased = {:?},\nEntryControls = {:?},\nExitControls = {:?}",
-            pin_based_exec_ctl,
-            vmentry_ctl,
-            vmexit_ctl,
+            pin_based_exec_ctl, vmentry_ctl, vmexit_ctl,
         );
-        kerror!(
+        error!(
             "ExceptionBitmap = 0x{:x}, PFECmask = 0x{:x}, PFECmatch = 0x{:x}",
             self.vmread(control::EXCEPTION_BITMAP),
             self.vmread(control::PAGE_FAULT_ERR_CODE_MASK),
             self.vmread(control::PAGE_FAULT_ERR_CODE_MATCH),
         );
-        kerror!(
+        error!(
             "VMEntry: intr_info = 0x{:x}, errcode = 0x{:x}, ilen = 0x{:x}",
             self.vmread(control::VMENTRY_INTERRUPTION_INFO_FIELD),
             self.vmread(control::VMENTRY_EXCEPTION_ERR_CODE),
             self.vmread(control::VMENTRY_INSTRUCTION_LEN),
         );
-        kerror!(
+        error!(
             "VMExit: intr_info = 0x{:x}, errcode = 0x{:x}, ilen = 0x{:x}",
             self.vmread(ro::VMEXIT_INSTRUCTION_INFO),
             self.vmread(ro::VMEXIT_INTERRUPTION_ERR_CODE),
             self.vmread(ro::VMEXIT_INSTRUCTION_LEN),
         );
-        kerror!(
+        error!(
             "        reason = 0x{:x}, qualification = 0x{:x}",
             self.vmread(ro::EXIT_REASON),
             self.vmread(ro::EXIT_QUALIFICATION),
         );
-        kerror!(
+        error!(
             "IDTVectoring: info = 0x{:x}, errcode = 0x{:x}",
             self.vmread(ro::IDT_VECTORING_INFO),
             self.vmread(ro::IDT_VECTORING_ERR_CODE),
         );
-        kerror!("TSC Offset = 0x{:x}", self.vmread(control::TSC_OFFSET_FULL));
+        error!("TSC Offset = 0x{:x}", self.vmread(control::TSC_OFFSET_FULL));
 
         if secondary_exec_control.contains(SecondaryControls::USE_TSC_SCALING) {
-            kerror!(
+            error!(
                 "TSC Multiplier = 0x{:x}",
                 self.vmread(control::TSC_MULTIPLIER_FULL)
             );
@@ -2158,49 +2170,49 @@ impl Vmx {
         if cpu_based_exec_ctl.contains(PrimaryControls::USE_TPR_SHADOW) {
             if secondary_exec_control.contains(SecondaryControls::VIRTUAL_INTERRUPT_DELIVERY) {
                 let status = self.vmread(guest::INTERRUPT_STATUS);
-                kerror!("SVI|RVI = 0x{:x}|0x{:x}", status >> 8, status & 0xff);
+                error!("SVI|RVI = 0x{:x}|0x{:x}", status >> 8, status & 0xff);
             }
 
-            kerror!(
+            error!(
                 "TPR Threshold = 0x{:x}",
                 self.vmread(control::TPR_THRESHOLD)
             );
             if secondary_exec_control.contains(SecondaryControls::VIRTUALIZE_APIC) {
-                kerror!(
+                error!(
                     "APIC-access addr = 0x{:x}",
                     self.vmread(control::APIC_ACCESS_ADDR_FULL)
                 );
             }
-            kerror!(
+            error!(
                 "virt-APIC addr = 0x{:x}",
                 self.vmread(control::VIRT_APIC_ADDR_FULL)
             );
         }
 
         if pin_based_exec_ctl.contains(PinbasedControls::POSTED_INTERRUPTS) {
-            kerror!(
+            error!(
                 "PostedIntrVec = 0x{:x}",
                 self.vmread(control::POSTED_INTERRUPT_NOTIFICATION_VECTOR)
             );
         }
 
         if secondary_exec_control.contains(SecondaryControls::ENABLE_EPT) {
-            kerror!("EPT pointer = 0x{:x}", self.vmread(control::EPTP_FULL));
+            error!("EPT pointer = 0x{:x}", self.vmread(control::EPTP_FULL));
         }
         if secondary_exec_control.contains(SecondaryControls::PAUSE_LOOP_EXITING) {
-            kerror!(
+            error!(
                 "PLE Gap = 0x{:x}, Window = 0x{:x}",
                 self.vmread(control::PLE_GAP),
                 self.vmread(control::PLE_WINDOW)
             );
         }
         if secondary_exec_control.contains(SecondaryControls::ENABLE_VPID) {
-            kerror!("Virtual processor ID = 0x{:x}", self.vmread(control::VPID));
+            error!("Virtual processor ID = 0x{:x}", self.vmread(control::VPID));
         }
     }
 
     pub fn dump_sel(&self, name: &'static str, sel: u32) {
-        kerror!(
+        error!(
             "{name} sel = 0x{:x}, attr = 0x{:x}, limit = 0x{:x}, base = 0x{:x}",
             self.vmread(sel),
             self.vmread(sel + guest::ES_ACCESS_RIGHTS - guest::ES_SELECTOR),
@@ -2210,7 +2222,7 @@ impl Vmx {
     }
 
     pub fn dump_dtsel(&self, name: &'static str, limit: u32) {
-        kerror!(
+        error!(
             "{name} limit = 0x{:x}, base = 0x{:x}",
             self.vmread(limit),
             self.vmread(limit + guest::GDTR_BASE - guest::GDTR_LIMIT)
@@ -2218,9 +2230,9 @@ impl Vmx {
     }
 
     pub fn dump_msrs(&self, name: &'static str, msr: &VmxMsrs) {
-        kerror!("MSR {name}:");
+        error!("MSR {name}:");
         for (idx, msr) in msr.val.iter().enumerate() {
-            kerror!("{idx}: msr = 0x{:x}, value = 0x{:x}", msr.index, msr.data);
+            error!("{idx}: msr = 0x{:x}, value = 0x{:x}", msr.index, msr.data);
         }
     }
 
@@ -2524,7 +2536,7 @@ impl Vmx {
         // TODO: vmx_adjust_sec_exec_feature
 
         if self.has_rdtscp() {
-            kwarn!("adjust RDTSCP todo!");
+            warn!("adjust RDTSCP todo!");
             // todo!()
         }
 
@@ -2725,7 +2737,7 @@ impl Vmx {
             var.type_ = 0x3;
             var.avl = 0;
             if save.base & 0xf != 0 {
-                kwarn!("segment base is not paragraph aligned when entering protected mode (seg={seg:?})");
+                warn!("segment base is not paragraph aligned when entering protected mode (seg={seg:?})");
             }
         }
 
@@ -2987,10 +2999,10 @@ impl Vmx {
         // self.dump_vmcs(vcpu);
         {
             let reason = self.vmread(ro::EXIT_REASON);
-            kdebug!("vm_exit reason 0x{:x}\n", reason);
+            debug!("vm_exit reason 0x{:x}\n", reason);
         }
         let unexpected_vmexit = |vcpu: &mut VirtCpu| -> Result<i32, SystemError> {
-            kerror!("vmx: unexpected exit reason {:?}\n", exit_reason);
+            error!("vmx: unexpected exit reason {:?}\n", exit_reason);
 
             self.dump_vmcs(vcpu);
 
@@ -3061,7 +3073,7 @@ impl Vmx {
             VmxExitReasonBasic::from(exit_reason.basic()),
         ) {
             Some(Ok(r)) => {
-                kdebug!("vmx: handled exit return {:?}\n", r);
+                debug!("vmx: handled exit return {:?}\n", r);
                 return Ok(r);
             }
             Some(Err(_)) | None => unexpected_vmexit(vcpu),
@@ -3071,16 +3083,16 @@ impl Vmx {
     #[allow(unreachable_code)]
     pub fn handle_external_interrupt_irqoff(vcpu: &mut VirtCpu) {
         let intr_info = Vmx::vmx_get_intr_info(vcpu);
-        let vector = intr_info & IntrInfo::INTR_INFO_VECTOR_MASK;
+        let _vector = intr_info & IntrInfo::INTR_INFO_VECTOR_MASK;
         // let desc = vmx_info().host_idt_base + vector.bits() as u64;
         if !VmcsIntrHelper::is_external_intr(&intr_info) {
-            kerror!("unexpected VM-Exit interrupt info: {:?}", intr_info);
+            error!("unexpected VM-Exit interrupt info: {:?}", intr_info);
             return;
         }
 
         vcpu.arch.kvm_before_interrupt(KvmIntrType::Irq);
         // TODO
-        kwarn!("handle_external_interrupt_irqoff TODO");
+        warn!("handle_external_interrupt_irqoff TODO");
         vcpu.arch.kvm_after_interrupt();
 
         vcpu.arch.at_instruction_boundary = true;
@@ -3549,7 +3561,7 @@ impl VmxVCpuPriv {
         if (i.is_none() && m.guest.nr == VmxMsrs::MAX_NR_LOADSTORE_MSRS)
             || (j.is_none() && m.host.nr == VmxMsrs::MAX_NR_LOADSTORE_MSRS)
         {
-            kwarn!("Not enough msr switch entries. Can't add msr 0x{:x}", msr);
+            warn!("Not enough msr switch entries. Can't add msr 0x{:x}", msr);
             return;
         }
 
@@ -3747,7 +3759,7 @@ pub fn vmx_init() -> Result<(), SystemError> {
 
 #[no_mangle]
 unsafe extern "C" fn vmx_update_host_rsp(vcpu_vmx: &VmxVCpuPriv, host_rsp: usize) {
-    kwarn!("vmx_update_host_rsp");
+    warn!("vmx_update_host_rsp");
     let mut guard = vcpu_vmx.loaded_vmcs.lock();
     if unlikely(host_rsp != guard.host_state.rsp) {
         guard.host_state.rsp = host_rsp;
@@ -3758,5 +3770,5 @@ unsafe extern "C" fn vmx_update_host_rsp(vcpu_vmx: &VmxVCpuPriv, host_rsp: usize
 #[no_mangle]
 unsafe extern "C" fn vmx_spec_ctrl_restore_host(_vcpu_vmx: &VmxVCpuPriv, _flags: u32) {
     // TODO
-    kwarn!("vmx_spec_ctrl_restore_host todo!");
+    warn!("vmx_spec_ctrl_restore_host todo!");
 }

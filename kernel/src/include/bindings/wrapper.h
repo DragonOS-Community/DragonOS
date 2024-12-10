@@ -10,19 +10,3 @@
  */
 #pragma once
 
-
-#include <common/glib.h>
-#include <common/printk.h>
-#include <common/spinlock.h>
-#include <common/stdio.h>
-#include <common/string.h>
-#include <common/time.h>
-#include <common/unistd.h>
-#include <driver/multiboot2/multiboot2.h>
-#include <libs/lib_ui/textui.h>
-#include <mm/mm.h>
-#include <mm/mmio.h>
-#include <mm/slab.h>
-#include <process/process.h>
-#include <time/sleep.h>
-#include <common/errno.h>

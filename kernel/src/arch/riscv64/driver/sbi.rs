@@ -1,3 +1,5 @@
+use core::ptr::addr_of;
+
 /// 向控制台打印字符串。
 ///
 /// 该函数接受一个字节切片 `s` 作为输入，并迭代切片中的每个字节 `c`。
@@ -75,7 +77,7 @@ impl SbiDriver {
 
     /// 获取probe得到的SBI扩展信息。
     pub fn extensions() -> &'static SBIExtensions {
-        unsafe { &EXTENSIONS }
+        unsafe { addr_of!(EXTENSIONS).as_ref().unwrap() }
     }
 
     fn probe_extensions() -> SBIExtensions {

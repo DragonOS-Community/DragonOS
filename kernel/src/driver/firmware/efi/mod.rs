@@ -1,9 +1,14 @@
+use log::{error, warn};
 use system_error::SystemError;
 
-use crate::{libs::rwlock::RwLock, mm::PhysAddr};
+use crate::{
+    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    mm::PhysAddr,
+};
 
 use self::{guid::DragonStubPayloadEFI, memmap::EFIMemoryMapInfo};
 
+pub mod esrt;
 mod fdt;
 pub mod guid;
 pub mod init;
@@ -39,6 +44,8 @@ struct InnerEFIManager {
     pub memory_attribute_table_paddr: Option<PhysAddr>,
     /// uefi 内存保留表的物理地址
     pub memreserve_table_paddr: Option<PhysAddr>,
+    /// uefi esrt表的物理地址
+    pub esrt_table_paddr: Option<PhysAddr>,
 }
 
 impl EFIManager {
@@ -52,6 +59,7 @@ impl EFIManager {
                 dragonstub_load_info: None,
                 memory_attribute_table_paddr: None,
                 memreserve_table_paddr: None,
+                esrt_table_paddr: None,
             }),
         }
     }
@@ -83,19 +91,31 @@ impl EFIManager {
         min_major: u16,
     ) -> Result<(), SystemError> {
         if header.signature != uefi_raw::table::system::SystemTable::SIGNATURE {
-            kerror!("System table signature mismatch!");
+            error!("System table signature mismatch!");
             return Err(SystemError::EINVAL);
         }
 
         if header.revision.major() < min_major {
-            kwarn!(
+            warn!(
                 "System table version: {:?}, expected {}.00 or greater!",
-                header.revision,
-                min_major
+                header.revision, min_major
             );
         }
 
         return Ok(());
+    }
+
+    fn inner_read(&self) -> RwLockReadGuard<InnerEFIManager> {
+        self.inner.read()
+    }
+
+    fn inner_write(&self) -> RwLockWriteGuard<InnerEFIManager> {
+        self.inner.write()
+    }
+
+    /// 是否存在ESRT表
+    fn esrt_table_exists(&self) -> bool {
+        self.inner_read().esrt_table_paddr.is_some()
     }
 }
 

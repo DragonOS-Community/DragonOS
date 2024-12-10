@@ -1,17 +1,24 @@
 use fdt::node::FdtNode;
+use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
-    arch::{driver::sbi::SbiDriver, mm::init::mm_early_init},
+    arch::{
+        driver::sbi::SbiDriver,
+        init::boot::{early_boot_init, BootProtocol},
+        mm::init::mm_early_init,
+    },
     driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init::start_kernel},
-    kdebug, kinfo,
     mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
     print, println,
     smp::cpu::ProcessorId,
 };
 
 use super::{cpu::init_local_context, interrupt::entry::handle_exception};
+
+mod boot;
+mod dragonstub;
 
 #[derive(Debug)]
 pub struct ArchBootParams {
@@ -112,14 +119,14 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     arch_boot_params_guard.arch.fdt_paddr = fdt_paddr;
     arch_boot_params_guard.arch.fdt_size = fdt.total_size();
     arch_boot_params_guard.arch.boot_hartid = ProcessorId::new(hartid);
-
+    // debug!("fdt_paddr: {:?}, fdt_size: {}", fdt_paddr, fdt.total_size());
     drop(arch_boot_params_guard);
 
-    kinfo!(
+    info!(
         "DragonOS kernel is running on hart {}, fdt address:{:?}",
-        hartid,
-        fdt_paddr
+        hartid, fdt_paddr
     );
+    early_boot_init(BootProtocol::DragonStub).expect("Failed to init boot protocol!");
     mm_early_init();
 
     print_node(fdt.find_node("/").unwrap(), 0);
@@ -127,7 +134,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     unsafe { parse_dtb() };
 
     for x in mem_block_manager().to_iter() {
-        kdebug!("before efi: {x:?}");
+        debug!("before efi: {x:?}");
     }
 
     efi_init();

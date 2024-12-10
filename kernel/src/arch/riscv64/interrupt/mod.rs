@@ -1,8 +1,10 @@
+use core::any::Any;
+use kprobe::ProbeArgs;
 use riscv::register::{scause::Scause, sstatus::Sstatus};
 use system_error::SystemError;
 
 use crate::{
-    driver::irqchip::riscv_intc::riscv_intc_init,
+    driver::irqchip::{riscv_intc::riscv_intc_init, riscv_sifive_plic::riscv_sifive_plic_init},
     exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
     libs::align::align_up,
 };
@@ -17,6 +19,9 @@ pub struct RiscV64InterruptArch;
 
 impl InterruptArch for RiscV64InterruptArch {
     unsafe fn arch_irq_init() -> Result<(), SystemError> {
+        Self::interrupt_disable();
+        riscv_sifive_plic_init()?;
+        // 注意，intc的初始化必须在plic之后，不然会导致plic无法关联上中断
         riscv_intc_init()?;
 
         Ok(())
@@ -35,6 +40,7 @@ impl InterruptArch for RiscV64InterruptArch {
 
     unsafe fn save_and_disable_irq() -> IrqFlagsGuard {
         let sie = riscv::register::sstatus::read().sie();
+        riscv::register::sstatus::clear_sie();
         IrqFlagsGuard::new(IrqFlags::new(sie.into()))
     }
 
@@ -155,5 +161,22 @@ impl TrapFrame {
 
     pub fn set_return_value(&mut self, value: usize) {
         self.a0 = value;
+    }
+
+    /// 设置当前的程序计数器
+    pub fn set_pc(&mut self, pc: usize) {
+        self.epc = pc;
+    }
+}
+
+impl ProbeArgs for TrapFrame {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn break_address(&self) -> usize {
+        self.epc
+    }
+    fn debug_address(&self) -> usize {
+        self.epc
     }
 }

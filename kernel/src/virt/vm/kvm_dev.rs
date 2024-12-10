@@ -1,6 +1,7 @@
 use core::intrinsics::unlikely;
 
 use alloc::sync::{Arc, Weak};
+use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -149,7 +150,7 @@ impl IndexNode for LockedKvmInode {
         match cmd {
             Self::KVM_CREATE_VM => {
                 let ret = self.create_vm(arg);
-                kwarn!("[KVM]: KVM_CREATE_VM {ret:?}");
+                warn!("[KVM]: KVM_CREATE_VM {ret:?}");
 
                 return ret;
             }
@@ -158,13 +159,13 @@ impl IndexNode for LockedKvmInode {
                 if arg != 0 {
                     return Err(SystemError::EINVAL);
                 }
-                kdebug!("[KVM] KVM_GET_VCPU_MMAP_SIZE");
+                debug!("[KVM] KVM_GET_VCPU_MMAP_SIZE");
                 return Ok(MMArch::PAGE_SIZE);
             }
 
             _ => {
                 // TODO: arch_ioctl
-                kwarn!("[KVM]: unknown iooctl cmd {cmd:x}");
+                warn!("[KVM]: unknown iooctl cmd {cmd:x}");
             }
         }
 
@@ -228,16 +229,16 @@ impl IndexNode for KvmInstance {
         arg: usize,
         _private_data: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
-        kdebug!("kvm instance ioctl cmd {cmd:x}");
+        debug!("kvm instance ioctl cmd {cmd:x}");
         match cmd {
             Self::KVM_CREATE_VCPU => {
                 let ret = self.kvm.lock().create_vcpu(arg);
-                kdebug!("[KVM] create vcpu fd {ret:?}");
+                debug!("[KVM] create vcpu fd {ret:?}");
                 return ret;
             }
 
             Self::KVM_SET_USER_MEMORY_REGION => {
-                kdebug!("[KVM-INSTANCE] KVM_SET_USER_MEMORY_REGION");
+                debug!("[KVM-INSTANCE] KVM_SET_USER_MEMORY_REGION");
                 let user_reader = UserBufferReader::new(
                     arg as *const PosixKvmUserspaceMemoryRegion,
                     core::mem::size_of::<PosixKvmUserspaceMemoryRegion>(),
@@ -427,17 +428,17 @@ impl IndexNode for KvmVcpuDev {
                 let mut sreg = UapiKvmSegmentRegs::default();
                 user_reader.copy_one_from_user(&mut sreg, 0)?;
 
-                if let Ok(res) = self.vcpu.lock().set_segment_regs(&mut sreg) {
+                if let Ok(_res) = self.vcpu.lock().set_segment_regs(&mut sreg) {
                     return Ok(0);
                 } else {
-                    kdebug!("set segment regs failed");
+                    debug!("set segment regs failed");
                     return Err(SystemError::EINVAL);
                 }
             }
 
             _ => {
                 // arch ioctl
-                kwarn!("[KVM-VCPU] unknown ioctl cmd {cmd:x}");
+                warn!("[KVM-VCPU] unknown ioctl cmd {cmd:x}");
             }
         }
 

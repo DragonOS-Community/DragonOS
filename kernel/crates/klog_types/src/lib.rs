@@ -1,5 +1,4 @@
 #![no_std]
-#![feature(const_refs_to_cell)]
 #![feature(const_size_of_val)]
 #![allow(clippy::needless_return)]
 
@@ -121,6 +120,7 @@ pub enum AllocatorLogType {
     Alloc(AllocLogItem),
     AllocZeroed(AllocLogItem),
     Free(AllocLogItem),
+    LazyAlloc(AllocLogItem),
 }
 
 #[repr(C)]
@@ -171,6 +171,12 @@ pub struct MMLogCycle;
 impl MMLogCycle {
     pub const fn new() -> Self {
         Self {}
+    }
+}
+
+impl Default for MMLogCycle {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

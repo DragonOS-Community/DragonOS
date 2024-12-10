@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use log::{error, warn};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
@@ -9,7 +10,6 @@ use x86_64::registers::control::{Efer, EferFlags};
 
 use crate::{
     arch::vm::vmx::{VmxL1dFlushState, L1TF_VMX_MITIGATION},
-    kerror, kwarn,
     libs::once::Once,
     mm::percpu::{PerCpu, PerCpuVar},
 };
@@ -303,7 +303,7 @@ impl KvmArchManager {
 
         // 是否已经设置过
         if kvm_x86_ops.is_some() {
-            kerror!(
+            error!(
                 "[KVM] already loaded vendor module {}",
                 kvm_x86_ops.unwrap().name()
             );
@@ -312,7 +312,7 @@ impl KvmArchManager {
 
         // 确保cpu支持fpu浮点数处理器
         if !cpu_feature.has_fpu() || !cpu_feature.has_fxsave_fxstor() {
-            kerror!("[KVM] inadequate fpu");
+            error!("[KVM] inadequate fpu");
             return Err(SystemError::ENOSYS);
         }
 
@@ -323,7 +323,7 @@ impl KvmArchManager {
         let host_pat = unsafe { rdmsr(msr::IA32_PAT) };
         // PAT[0]是否为write back类型，即判断低三位是否为0b110(0x06)
         if host_pat & 0b111 != 0b110 {
-            kerror!("[KVM] host PAT[0] is not WB");
+            error!("[KVM] host PAT[0] is not WB");
             return Err(SystemError::EIO);
         }
 
@@ -373,7 +373,7 @@ impl KvmArchManager {
         kvm_caps.default_tsc_scaling_ratio = 1 << kvm_caps.tsc_scaling_ratio_frac_bits;
         self.kvm_init_msr_lists();
 
-        kwarn!("vendor init over");
+        warn!("vendor init over");
         Ok(())
     }
 

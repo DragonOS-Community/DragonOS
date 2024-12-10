@@ -1,6 +1,7 @@
+use log::{debug, info};
+
 use crate::{
     driver::open_firmware::fdt::open_firmware_fdt_driver,
-    kinfo,
     time::{clocksource::HZ, TimeArch},
 };
 pub struct RiscV64TimeArch;
@@ -14,10 +15,12 @@ static mut TIME_FREQ: usize = 0;
 ///
 /// todo: 支持从acpi中获取
 fn init_time_freq() {
+    debug!("init_time_freq: init");
     let fdt = open_firmware_fdt_driver().fdt_ref();
     if fdt.is_err() {
         panic!("init_time_freq: failed to get fdt");
     }
+    debug!("init_time_freq: get fdt");
     let fdt = fdt.unwrap();
     let cpu_node = fdt.find_node("/cpus");
     if cpu_node.is_none() {
@@ -34,7 +37,7 @@ fn init_time_freq() {
     }
 
     let time_freq: usize = time_freq.unwrap();
-    kinfo!("init_time_freq: timebase-frequency: {}", time_freq);
+    info!("init_time_freq: timebase-frequency: {}", time_freq);
     unsafe {
         TIME_FREQ = time_freq;
     }
@@ -63,4 +66,8 @@ impl TimeArch for RiscV64TimeArch {
 
         cycles * 1000000000 / unsafe { TIME_FREQ }
     }
+}
+
+pub fn riscv_time_base_freq() -> usize {
+    unsafe { TIME_FREQ }
 }

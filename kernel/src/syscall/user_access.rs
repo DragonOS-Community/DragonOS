@@ -2,10 +2,11 @@
 
 use core::{
     mem::size_of,
+    num::NonZero,
     slice::{from_raw_parts, from_raw_parts_mut},
 };
 
-use alloc::{string::String, vec::Vec};
+use alloc::{ffi::CString, vec::Vec};
 
 use crate::mm::{verify_area, VirtAddr};
 
@@ -70,10 +71,11 @@ pub unsafe fn copy_from_user(dst: &mut [u8], src: VirtAddr) -> Result<usize, Sys
 /// ## 错误
 ///
 /// - `EFAULT`：用户态地址不合法
+/// - `EINVAL`：字符串不是合法的 C 字符串
 pub fn check_and_clone_cstr(
     user: *const u8,
     max_length: Option<usize>,
-) -> Result<String, SystemError> {
+) -> Result<CString, SystemError> {
     if user.is_null() {
         return Err(SystemError::EFAULT);
     }
@@ -93,9 +95,12 @@ pub fn check_and_clone_cstr(
         if c[0] == 0 {
             break;
         }
-        buffer.push(c[0]);
+        buffer.push(NonZero::new(c[0]).ok_or(SystemError::EINVAL)?);
     }
-    String::from_utf8(buffer).map_err(|_| SystemError::EFAULT)
+
+    let cstr = CString::from(buffer);
+
+    return Ok(cstr);
 }
 
 /// 检查并从用户态拷贝一个 C 字符串数组
@@ -112,11 +117,11 @@ pub fn check_and_clone_cstr(
 /// ## 错误
 ///
 /// - `EFAULT`：用户态地址不合法
-pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<String>, SystemError> {
+pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<CString>, SystemError> {
     if user.is_null() {
         Ok(Vec::new())
     } else {
-        // kdebug!("check_and_clone_cstr_array: {:p}\n", user);
+        // debug!("check_and_clone_cstr_array: {:p}\n", user);
         let mut buffer = Vec::new();
         for i in 0.. {
             let addr = unsafe { user.add(i) };
@@ -129,7 +134,7 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<String>,
                 let dst = core::mem::transmute::<[u8; size_of::<usize>()], [usize; 1]>(dst);
                 str_ptr = dst[0] as *const u8;
 
-                // kdebug!("str_ptr: {:p}, addr:{addr:?}\n", str_ptr);
+                // debug!("str_ptr: {:p}, addr:{addr:?}\n", str_ptr);
             }
 
             if str_ptr.is_null() {
@@ -155,7 +160,7 @@ pub struct UserBufferReader<'a> {
 }
 
 #[allow(dead_code)]
-impl<'a> UserBufferReader<'a> {
+impl UserBufferReader<'_> {
     /// 构造一个指向用户空间位置的BufferReader，为了兼容类似传入 *const u8 的情况，使用单独的泛型来进行初始化
     ///
     /// @param addr 用户空间指针
@@ -316,7 +321,7 @@ impl<'a> UserBufferWriter<'a> {
         return Ok(());
     }
 
-    pub fn buffer<T>(&'a mut self, offset: usize) -> Result<&mut [T], SystemError> {
+    pub fn buffer<T>(&'a mut self, offset: usize) -> Result<&'a mut [T], SystemError> {
         Self::convert_with_offset::<T>(self.buffer, offset).map_err(|_| SystemError::EINVAL)
     }
 

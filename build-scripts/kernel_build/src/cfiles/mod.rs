@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use cc::Build;
 
@@ -7,6 +7,7 @@ use crate::utils::cargo_handler::CargoHandler;
 use self::arch::current_cfiles_arch;
 
 mod arch;
+mod common;
 
 /// 构建项目的c文件
 pub struct CFilesBuilder;
@@ -46,19 +47,29 @@ impl CFilesBuilder {
     }
 
     fn setup_global_include_dir(c: &mut Build) {
-        c.include("src/include");
-        c.include("src");
+        let mut include_dirs = HashSet::new();
+
         c.include(".");
 
-        current_cfiles_arch().setup_global_include_dir(c);
+        common::setup_common_include_dir(&mut include_dirs);
+
+        current_cfiles_arch().setup_global_include_dir(&mut include_dirs);
+
+        let include_dirs: Vec<PathBuf> = include_dirs.into_iter().collect();
+        Self::set_rerun_if_files_changed(&include_dirs);
+
+        include_dirs.into_iter().for_each(|dir| {
+            c.include(dir);
+        });
     }
 
     /// 设置需要编译的文件
     fn setup_files(c: &mut Build) {
-        let mut files: Vec<PathBuf> = Vec::new();
-
+        let mut files: HashSet<PathBuf> = HashSet::new();
         current_cfiles_arch().setup_files(c, &mut files);
-
+        common::setup_common_files(&mut files);
+        // 去重
+        let files: Vec<PathBuf> = files.into_iter().collect();
         Self::set_rerun_if_files_changed(&files);
         c.files(files.as_slice());
     }

@@ -4,6 +4,7 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
+use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -25,7 +26,6 @@ use crate::{
     exception::InterruptArch,
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
-    kerror,
     libs::{
         mutex::Mutex,
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
@@ -163,6 +163,14 @@ impl Device for CmosRtcDevice {
     fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner().device_common.get_bus_weak_or_clear()
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = parent;
+    }
 }
 
 impl KObject for CmosRtcDevice {
@@ -286,7 +294,7 @@ impl RtcClassOps for CmosRtcClassOps {
     }
 
     fn set_time(&self, _dev: &Arc<dyn RtcDevice>, _time: &RtcTime) -> Result<(), SystemError> {
-        kerror!("set_time is not implemented for CmosRtcClassOps");
+        error!("set_time is not implemented for CmosRtcClassOps");
         Err(SystemError::ENOSYS)
     }
 }

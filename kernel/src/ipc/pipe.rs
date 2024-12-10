@@ -11,7 +11,7 @@ use crate::{
         wait_queue::WaitQueue,
     },
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
-    process::{ProcessManager, ProcessState},
+    process::{ProcessFlags, ProcessManager, ProcessState},
     sched::SchedMode,
     time::PosixTimeSpec,
 };
@@ -232,6 +232,9 @@ impl IndexNode for LockedPipeInode {
             drop(inode);
             let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
             if r.is_err() {
+                ProcessManager::current_pcb()
+                    .flags()
+                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
                 return Err(SystemError::ERESTARTSYS);
             }
 

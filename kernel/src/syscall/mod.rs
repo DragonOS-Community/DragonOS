@@ -1217,6 +1217,7 @@ impl Syscall {
                 Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
             SYS_SETRLIMIT => Ok(0),
+            SYS_RESTART_SYSCALL => Self::restart_syscall(),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

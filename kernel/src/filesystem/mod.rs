@@ -5,6 +5,7 @@ pub mod fat;
 pub mod kernfs;
 pub mod mbr;
 pub mod overlayfs;
+pub mod page_cache;
 pub mod procfs;
 pub mod ramfs;
 pub mod sysfs;

@@ -16,8 +16,7 @@ use crate::{
         FilePrivateData,
     },
     ipc::shm::{shm_manager_lock, IPC_PRIVATE},
-    libs::align::page_align_up,
-    libs::spinlock::SpinLock,
+    libs::{align::page_align_up, spinlock::SpinLock},
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
         page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
@@ -405,6 +404,9 @@ impl Syscall {
         // 更新最后一次连接时间
         kernel_shm.update_atim();
 
+        // 映射计数增加
+        kernel_shm.increase_count();
+
         Ok(r)
     }
 
@@ -432,29 +434,6 @@ impl Syscall {
         if vma.lock_irqsave().region().start() != vaddr {
             return Err(SystemError::EINVAL);
         }
-
-        // 获取映射的物理地址
-        let paddr = address_write_guard
-            .user_mapper
-            .utable
-            .translate(vaddr)
-            .ok_or(SystemError::EINVAL)?
-            .0;
-
-        // 如果物理页的shm_id为None，代表不是共享页
-        let mut page_manager_guard = page_manager_lock_irqsave();
-        let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
-        let shm_id = page.read_irqsave().shm_id().ok_or(SystemError::EINVAL)?;
-        drop(page_manager_guard);
-
-        // 获取对应共享页管理信息
-        let mut shm_manager_guard = shm_manager_lock();
-        let kernel_shm = shm_manager_guard
-            .get_mut(&shm_id)
-            .ok_or(SystemError::EINVAL)?;
-        // 更新最后一次断开连接时间
-        kernel_shm.update_dtim();
-        drop(shm_manager_guard);
 
         // 取消映射
         let flusher: PageFlushAll<MMArch> = PageFlushAll::new();

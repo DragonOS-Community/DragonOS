@@ -303,7 +303,7 @@ impl PageReclaimer {
         for _ in 0..count.data() {
             let (_, page) = self.lru.pop_lru().expect("pagecache is empty");
             if page.read_irqsave().flags.contains(PageFlags::PG_DIRTY) {
-                Self::page_writeback(&page, true);
+                self.page_writeback(&page, true);
             }
         }
     }
@@ -322,8 +322,8 @@ impl PageReclaimer {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(page: &Arc<Page>, unmap: bool) {
-        // log::debug!("page writeback: {page:?}");
+    pub fn page_writeback(&mut self, page: &Arc<Page>, unmap: bool) {
+        log::debug!("page writeback: {page:?}");
 
         let guard = page.read_irqsave();
         let (page_cache, page_index) = match guard.page_type() {
@@ -372,7 +372,7 @@ impl PageReclaimer {
         };
 
         inode
-            .write_at(
+            .write_direct(
                 page_index * MMArch::PAGE_SIZE,
                 len,
                 unsafe {
@@ -389,6 +389,7 @@ impl PageReclaimer {
             // 删除页面
             page_cache.lock_irqsave().remove_page(page_index);
             page_manager_lock_irqsave().remove_page(&paddr);
+            self.remove_page(&paddr);
         } else {
             // 清除标记
             page.write_irqsave().remove_flags(PageFlags::PG_DIRTY);
@@ -396,12 +397,19 @@ impl PageReclaimer {
     }
 
     /// lru脏页刷新
-    pub fn flush_dirty_pages(&self) {
+    pub fn flush_dirty_pages(&mut self) {
         // log::info!("flush_dirty_pages");
-        let iter = self.lru.iter();
-        for (_, page) in iter {
+        let iter = self.lru.iter().filter_map(|(_, page)| {
             if page.read_irqsave().flags().contains(PageFlags::PG_DIRTY) {
-                Self::page_writeback(page, false);
+                Some(page.clone())
+            } else {
+                None
+            }
+        });
+        let collection: Vec<Arc<Page>> = iter.collect();
+        for page in collection {
+            if page.read_irqsave().flags().contains(PageFlags::PG_DIRTY) {
+                self.page_writeback(&page, false);
             }
         }
     }

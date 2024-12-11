@@ -249,20 +249,22 @@ impl InnerPageCache {
                 MMArch::PAGE_SIZE
             };
 
-            let exist = self.get_page(page_index).is_some();
+            let mut page = self.get_page(page_index);
 
-            if !exist {
+            if page.is_none() {
                 let page_buf = vec![0u8; MMArch::PAGE_SIZE];
                 self.create_pages(page_index, &page_buf)?;
+                page = self.get_page(page_index);
             }
 
-            if let Some(page) = self.get_page(page_index) {
+            if let Some(page) = page {
                 let sub_buf = &buf[buf_offset..(buf_offset + sub_len)];
-
+                let mut page_guard = page.write_irqsave();
                 unsafe {
-                    page.write_irqsave().as_slice_mut()[page_offset..page_offset + sub_len]
+                    page_guard.as_slice_mut()[page_offset..page_offset + sub_len]
                         .copy_from_slice(sub_buf);
                 }
+                page_guard.add_flags(PageFlags::PG_DIRTY);
 
                 ret += sub_len;
 

@@ -155,7 +155,7 @@ impl FATInode {
 
     /// 更新访问时间
     pub fn update_time(&mut self) {
-        log::warn!("update_time has not yet been implemented");
+        // log::warn!("update_time has not yet been implemented");
     }
 
     fn find(&mut self, name: &str) -> Result<Arc<LockedFATInode>, SystemError> {

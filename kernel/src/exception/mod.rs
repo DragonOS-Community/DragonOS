@@ -7,6 +7,7 @@ use crate::arch::CurrentIrqArch;
 pub mod debug;
 pub mod dummychip;
 pub mod ebreak;
+pub mod entry;
 pub mod handle;
 pub mod init;
 pub mod ipi;

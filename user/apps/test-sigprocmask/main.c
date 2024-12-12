@@ -62,9 +62,11 @@ int main() {
         perror("signal");
         exit(EXIT_FAILURE);
     }
-
+    printf("Signal handler for SIGINT is registered.\n");
     signal_received = 0;
     kill(getpid(), SIGINT);
+    sleep(5);
+
     TEST_ASSERT(signal_received, 1, "SIGINT was received", "SIGINT was not received");
     signal_received = 0;
 

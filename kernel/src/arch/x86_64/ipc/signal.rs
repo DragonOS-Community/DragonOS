@@ -1,5 +1,6 @@
 use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
 
+use defer::defer;
 use log::error;
 use system_error::SystemError;
 
@@ -8,11 +9,12 @@ use crate::{
         fpu::FpState,
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
+        syscall::nr::SYS_RESTART_SYSCALL,
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
     ipc::{
-        signal::set_current_blocked,
+        signal::{restore_saved_sigmask, set_current_blocked},
         signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch},
     },
     mm::MemoryManagementArch,
@@ -405,99 +407,147 @@ pub struct SigStack {
     pub fpstate: FpState,
 }
 
-#[no_mangle]
-unsafe extern "C" fn do_signal(frame: &mut TrapFrame) {
-    X86_64SignalArch::do_signal(frame);
-    return;
+unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
+    let pcb = ProcessManager::current_pcb();
+
+    let siginfo = pcb.try_siginfo_irqsave(5);
+
+    if unlikely(siginfo.is_none()) {
+        return;
+    }
+
+    let siginfo_read_guard = siginfo.unwrap();
+
+    // 检查sigpending是否为0
+    if siginfo_read_guard.sig_pending().signal().bits() == 0 || !frame.is_from_user() {
+        // 若没有正在等待处理的信号，或者将要返回到的是内核态，则返回
+        return;
+    }
+
+    let mut sig_number: Signal;
+    let mut info: Option<SigInfo>;
+    let mut sigaction: Option<Sigaction>;
+    let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
+    drop(siginfo_read_guard);
+
+    let sig_guard = pcb.try_sig_struct_irqsave(5);
+    if unlikely(sig_guard.is_none()) {
+        return;
+    }
+    let siginfo_mut = pcb.try_siginfo_mut(5);
+    if unlikely(siginfo_mut.is_none()) {
+        return;
+    }
+
+    let sig_guard = sig_guard.unwrap();
+    let mut siginfo_mut_guard = siginfo_mut.unwrap();
+    loop {
+        (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
+
+        // 如果信号非法，则直接返回
+        if sig_number == Signal::INVALID {
+            return;
+        }
+        let sa = sig_guard.handlers[sig_number as usize - 1];
+
+        match sa.action() {
+            SigactionType::SaHandler(action_type) => match action_type {
+                SaHandlerType::Error => {
+                    error!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
+                    return;
+                }
+                SaHandlerType::Default => {
+                    sigaction = Some(sa);
+                }
+                SaHandlerType::Ignore => continue,
+                SaHandlerType::Customized(_) => {
+                    sigaction = Some(sa);
+                }
+            },
+            SigactionType::SaSigaction(_) => todo!(),
+        }
+
+        if sigaction.is_some() {
+            break;
+        }
+    }
+
+    let oldset = *siginfo_mut_guard.sig_blocked();
+    //避免死锁
+    drop(siginfo_mut_guard);
+    drop(sig_guard);
+    drop(pcb);
+    // 做完上面的检查后，开中断
+    CurrentIrqArch::interrupt_enable();
+
+    if sigaction.is_none() {
+        return;
+    }
+    *got_signal = true;
+
+    let mut sigaction = sigaction.unwrap();
+
+    // 注意！由于handle_signal里面可能会退出进程，
+    // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
+    let res: Result<i32, SystemError> =
+        handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
+    if res.is_err() {
+        error!(
+            "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
+            sig_number as i32,
+            ProcessManager::current_pcb().pid(),
+            res.as_ref().unwrap_err()
+        );
+    }
+}
+
+fn try_restart_syscall(frame: &mut TrapFrame) {
+    defer!({
+        // 如果没有信号需要传递，我们只需恢复保存的信号掩码
+        restore_saved_sigmask();
+    });
+
+    if unsafe { frame.syscall_nr() }.is_none() {
+        return;
+    }
+
+    let syscall_err = unsafe { frame.syscall_error() };
+    if syscall_err.is_none() {
+        return;
+    }
+    let syscall_err = syscall_err.unwrap();
+
+    let mut restart = false;
+    match syscall_err {
+        SystemError::ERESTARTSYS | SystemError::ERESTARTNOHAND | SystemError::ERESTARTNOINTR => {
+            frame.rax = frame.errcode;
+            frame.rip -= 2;
+            restart = true;
+        }
+        SystemError::ERESTART_RESTARTBLOCK => {
+            frame.rax = SYS_RESTART_SYSCALL as u64;
+            frame.rip -= 2;
+            restart = true;
+        }
+        _ => {}
+    }
+    log::debug!("try restart syscall: {:?}", restart);
 }
 
 pub struct X86_64SignalArch;
 
 impl SignalArch for X86_64SignalArch {
-    unsafe fn do_signal(frame: &mut TrapFrame) {
-        let pcb = ProcessManager::current_pcb();
+    /// 处理信号，并尝试重启系统调用
+    ///
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#865
+    unsafe fn do_signal_or_restart(frame: &mut TrapFrame) {
+        let mut got_signal = false;
+        do_signal(frame, &mut got_signal);
 
-        let siginfo = pcb.try_siginfo_irqsave(5);
-
-        if unlikely(siginfo.is_none()) {
+        if got_signal {
             return;
         }
-
-        let siginfo_read_guard = siginfo.unwrap();
-
-        // 检查sigpending是否为0
-        if siginfo_read_guard.sig_pending().signal().bits() == 0 || !frame.is_from_user() {
-            // 若没有正在等待处理的信号，或者将要返回到的是内核态，则返回
-            return;
-        }
-
-        let mut sig_number: Signal;
-        let mut info: Option<SigInfo>;
-        let mut sigaction: Sigaction;
-        let sig_block: SigSet = *siginfo_read_guard.sig_block();
-        drop(siginfo_read_guard);
-
-        let sig_guard = pcb.try_sig_struct_irqsave(5);
-        if unlikely(sig_guard.is_none()) {
-            return;
-        }
-        let siginfo_mut = pcb.try_siginfo_mut(5);
-        if unlikely(siginfo_mut.is_none()) {
-            return;
-        }
-
-        let sig_guard = sig_guard.unwrap();
-        let mut siginfo_mut_guard = siginfo_mut.unwrap();
-        loop {
-            (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block);
-            // 如果信号非法，则直接返回
-            if sig_number == Signal::INVALID {
-                return;
-            }
-
-            sigaction = sig_guard.handlers[sig_number as usize - 1];
-
-            match sigaction.action() {
-                SigactionType::SaHandler(action_type) => match action_type {
-                    SaHandlerType::Error => {
-                        error!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
-                        return;
-                    }
-                    SaHandlerType::Default => {
-                        sigaction = Sigaction::default();
-                        break;
-                    }
-                    SaHandlerType::Ignore => continue,
-                    SaHandlerType::Customized(_) => {
-                        break;
-                    }
-                },
-                SigactionType::SaSigaction(_) => todo!(),
-            }
-            // 如果当前动作是忽略这个信号，就继续循环。
-        }
-
-        let oldset = *siginfo_mut_guard.sig_block();
-        //避免死锁
-        drop(siginfo_mut_guard);
-        drop(sig_guard);
-        drop(pcb);
-
-        // 做完上面的检查后，开中断
-        CurrentIrqArch::interrupt_enable();
-
-        // 注意！由于handle_signal里面可能会退出进程，
-        // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
-        let res: Result<i32, SystemError> =
-            handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
-        if res.is_err() {
-            error!(
-                "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
-                sig_number as i32,
-                ProcessManager::current_pcb().pid(),
-                res.as_ref().unwrap_err()
-            );
-        }
+        try_restart_syscall(frame);
     }
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
@@ -533,6 +583,8 @@ impl SignalArch for X86_64SignalArch {
 /// @param regs 之前的系统调用将要返回的时候，要弹出的栈帧的拷贝
 ///
 /// @return Result<0,SystemError> 若Error, 则返回错误码,否则返回Ok(0)
+///
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#787
 fn handle_signal(
     sig: Signal,
     sigaction: &mut Sigaction,
@@ -540,8 +592,28 @@ fn handle_signal(
     oldset: &SigSet,
     frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
-    // TODO 这里要补充一段逻辑，好像是为了保证引入线程之后的地址空间不会出问题。详见https://code.dragonos.org.cn/xref/linux-6.1.9/arch/mips/kernel/signal.c#830
-
+    if unsafe { frame.syscall_nr() }.is_some() {
+        if let Some(syscall_err) = unsafe { frame.syscall_error() } {
+            match syscall_err {
+                SystemError::ERESTARTNOHAND | SystemError::ERESTART_RESTARTBLOCK => {
+                    frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
+                }
+                SystemError::ERESTARTSYS => {
+                    if !sigaction.flags().contains(SigFlags::SA_RESTART) {
+                        frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
+                    } else {
+                        frame.rax = frame.errcode;
+                        frame.rip -= 2;
+                    }
+                }
+                SystemError::ERESTARTNOINTR => {
+                    frame.rax = frame.errcode;
+                    frame.rip -= 2;
+                }
+                _ => {}
+            }
+        }
+    }
     // 设置栈帧
     return setup_frame(sig, sigaction, info, oldset, frame);
 }

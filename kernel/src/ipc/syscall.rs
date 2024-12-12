@@ -567,4 +567,10 @@ impl Syscall {
 
         Ok(0)
     }
+
+    pub fn restart_syscall() -> Result<usize, SystemError> {
+        // todo: https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#2998
+        unimplemented!("restart_syscall with restart block");
+        // Err(SystemError::ENOSYS)
+    }
 }

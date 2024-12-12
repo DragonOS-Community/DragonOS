@@ -21,7 +21,7 @@ use crate::{
     },
     mm::VirtAddr,
     net::event_poll::EPollEventType,
-    process::ProcessManager,
+    process::{ProcessFlags, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall},
 };
 
@@ -1680,11 +1680,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     break;
                 }
 
-                if ProcessManager::current_pcb()
-                    .sig_info_irqsave()
-                    .sig_pending()
-                    .has_pending()
-                {
+                if ProcessManager::current_pcb().has_pending_signal_fast() {
+                    ProcessManager::current_pcb()
+                        .flags()
+                        .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+
                     ret = Err(SystemError::ERESTARTSYS);
                     break;
                 }
@@ -1763,7 +1763,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         // drop(ldata);
         let mut offset = 0;
         loop {
-            if pcb.sig_info_irqsave().sig_pending().has_pending() {
+            if pcb.has_pending_signal_fast() {
+                ProcessManager::current_pcb()
+                    .flags()
+                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+
                 return Err(SystemError::ERESTARTSYS);
             }
             if core.flags().contains(TtyFlag::HUPPED) {

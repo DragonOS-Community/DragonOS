@@ -1,8 +1,9 @@
 use log::error;
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::{interrupt::TrapFrame, sched::sched, CurrentIrqArch},
     exception::InterruptArch,
+    ipc::signal_types::SignalArch,
     process::ProcessManager,
 };
 
@@ -338,4 +339,19 @@ fn sig_continue(sig: Signal) {
 /// 信号默认处理函数——忽略
 fn sig_ignore(_sig: Signal) {
     return;
+}
+
+pub struct RiscV64SignalArch;
+
+impl SignalArch for RiscV64SignalArch {
+    // TODO: 为RISCV64实现信号处理
+    // 注意，rv64现在在中断/系统调用返回用户态时，没有进入 irqentry_exit() 函数，
+    // 到时候实现信号处理时，需要修改中断/系统调用返回用户态的代码，进入 irqentry_exit() 函数
+    unsafe fn do_signal_or_restart(_frame: &mut TrapFrame) {
+        todo!()
+    }
+
+    fn sys_rt_sigreturn(_trap_frame: &mut TrapFrame) -> u64 {
+        todo!()
+    }
 }

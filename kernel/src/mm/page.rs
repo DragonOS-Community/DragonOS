@@ -302,8 +302,20 @@ impl PageReclaimer {
     pub fn shrink_list(&mut self, count: PageFrameCount) {
         for _ in 0..count.data() {
             let (_, page) = self.lru.pop_lru().expect("pagecache is empty");
-            if page.read_irqsave().flags.contains(PageFlags::PG_DIRTY) {
-                self.page_writeback(&page, true);
+            let guard = page.write_irqsave();
+            if let PageType::File(info) = guard.page_type() {
+                let page_cache = &info.page_cache;
+                let page_index = info.index;
+                let paddr = guard.phys_address();
+                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    // 先回写脏页
+                    Self::page_writeback(&page, true);
+                }
+
+                // 删除页面
+                page_cache.lock_irqsave().remove_page(page_index);
+                page_manager_lock_irqsave().remove_page(&paddr);
+                self.remove_page(&paddr);
             }
         }
     }
@@ -322,8 +334,8 @@ impl PageReclaimer {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(&mut self, page: &Arc<Page>, unmap: bool) {
-        log::debug!("page writeback: {page:?}");
+    pub fn page_writeback(page: &Arc<Page>, unmap: bool) {
+        // log::debug!("page writeback: {page:?}");
 
         let guard = page.read_irqsave();
         let (page_cache, page_index) = match guard.page_type() {
@@ -385,31 +397,17 @@ impl PageReclaimer {
             )
             .unwrap();
 
-        if unmap {
-            // 删除页面
-            page_cache.lock_irqsave().remove_page(page_index);
-            page_manager_lock_irqsave().remove_page(&paddr);
-            self.remove_page(&paddr);
-        } else {
-            // 清除标记
-            page.write_irqsave().remove_flags(PageFlags::PG_DIRTY);
-        }
+        // 清除标记
+        page.write_irqsave().remove_flags(PageFlags::PG_DIRTY);
     }
 
     /// lru脏页刷新
     pub fn flush_dirty_pages(&mut self) {
         // log::info!("flush_dirty_pages");
-        let iter = self.lru.iter().filter_map(|(_, page)| {
+        let iter = self.lru.iter();
+        for (_paddr, page) in iter {
             if page.read_irqsave().flags().contains(PageFlags::PG_DIRTY) {
-                Some(page.clone())
-            } else {
-                None
-            }
-        });
-        let collection: Vec<Arc<Page>> = iter.collect();
-        for page in collection {
-            if page.read_irqsave().flags().contains(PageFlags::PG_DIRTY) {
-                self.page_writeback(&page, false);
+                Self::page_writeback(page, false);
             }
         }
     }

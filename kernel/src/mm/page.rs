@@ -302,14 +302,14 @@ impl PageReclaimer {
     pub fn shrink_list(&mut self, count: PageFrameCount) {
         for _ in 0..count.data() {
             let (_, page) = self.lru.pop_lru().expect("pagecache is empty");
-            let guard = page.write_irqsave();
-            if let PageType::File(info) = guard.page_type() {
+            let mut guard = page.write_irqsave();
+            if let PageType::File(info) = guard.page_type().clone() {
                 let page_cache = &info.page_cache;
                 let page_index = info.index;
                 let paddr = guard.phys_address();
                 if guard.flags().contains(PageFlags::PG_DIRTY) {
                     // 先回写脏页
-                    Self::page_writeback(&page, true);
+                    Self::page_writeback(&mut guard, true);
                 }
 
                 // 删除页面
@@ -329,15 +329,14 @@ impl PageReclaimer {
     /// 脏页回写函数
     /// ## 参数
     ///
-    /// - `page`: 需要回写的脏页
+    /// - `guard`: 需要回写的脏页
     /// - `unmap`: 是否取消映射
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(page: &Arc<Page>, unmap: bool) {
-        // log::debug!("page writeback: {page:?}");
+    pub fn page_writeback(guard: &mut RwLockWriteGuard<InnerPage>, unmap: bool) {
+        // log::debug!("page writeback: {:?}", guard.phys_addr);
 
-        let guard = page.read_irqsave();
         let (page_cache, page_index) = match guard.page_type() {
             PageType::File(info) => (info.page_cache.clone(), info.index),
             _ => {
@@ -353,7 +352,7 @@ impl PageReclaimer {
             let address_space = address_space.upgrade().unwrap();
             let mut guard = address_space.write();
             let mapper = &mut guard.user_mapper.utable;
-            let virt = vma.lock_irqsave().page_address(page).unwrap();
+            let virt = vma.lock_irqsave().page_address(page_index).unwrap();
             if unmap {
                 unsafe {
                     // 取消页表映射
@@ -369,8 +368,6 @@ impl PageReclaimer {
                 };
             }
         }
-
-        drop(guard);
 
         let len = if let Ok(metadata) = inode.metadata() {
             let size = metadata.size as usize;
@@ -398,7 +395,7 @@ impl PageReclaimer {
             .unwrap();
 
         // 清除标记
-        page.write_irqsave().remove_flags(PageFlags::PG_DIRTY);
+        guard.remove_flags(PageFlags::PG_DIRTY);
     }
 
     /// lru脏页刷新
@@ -406,8 +403,9 @@ impl PageReclaimer {
         // log::info!("flush_dirty_pages");
         let iter = self.lru.iter();
         for (_paddr, page) in iter {
-            if page.read_irqsave().flags().contains(PageFlags::PG_DIRTY) {
-                Self::page_writeback(page, false);
+            let mut guard = page.write_irqsave();
+            if guard.flags().contains(PageFlags::PG_DIRTY) {
+                Self::page_writeback(&mut guard, false);
             }
         }
     }

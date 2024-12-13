@@ -2,7 +2,6 @@ use crate::{
     arch::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
         time::time_init,
-        vm::vmx::vmx_init,
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
     driver::{

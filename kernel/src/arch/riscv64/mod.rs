@@ -27,6 +27,8 @@ pub use self::time::RiscV64TimeArch as CurrentTimeArch;
 
 pub use self::elf::RiscV64ElfArch as CurrentElfArch;
 
+pub use self::ipc::signal::RiscV64SignalArch as CurrentSignalArch;
+
 pub use crate::arch::smp::RiscV64SMPArch as CurrentSMPArch;
 
 pub use crate::arch::sched::RiscV64SchedArch as CurrentSchedArch;

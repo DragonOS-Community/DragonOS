@@ -33,7 +33,7 @@ pub fn bpf(cmd: bpf_cmd, attr: &bpf_attr) -> Result<usize> {
         // Program related commands
         bpf_cmd::BPF_PROG_LOAD => prog::bpf_prog_load(attr),
         // Object creation commands
-        bpf_cmd::BPF_BTF_LOAD => {
+        bpf_cmd::BPF_BTF_LOAD | bpf_cmd::BPF_LINK_CREATE | bpf_cmd::BPF_OBJ_GET_INFO_BY_FD => {
             error!("bpf cmd {:?} not implemented", cmd);
             return Err(SystemError::ENOSYS);
         }

@@ -394,7 +394,31 @@ impl ProcFS {
         } else {
             panic!("create ksmg error");
         }
-
+        // 这个文件是用来欺骗Aya框架识别内核版本
+        /* On Ubuntu LINUX_VERSION_CODE doesn't correspond to info.release,
+         * but Ubuntu provides /proc/version_signature file, as described at
+         * https://ubuntu.com/kernel, with an example contents below, which we
+         * can use to get a proper LINUX_VERSION_CODE.
+         *
+         *   Ubuntu 5.4.0-12.15-generic 5.4.8
+         *
+         * In the above, 5.4.8 is what kernel is actually expecting, while
+         * uname() call will return 5.4.0 in info.release.
+         */
+        let binding = inode.create("version_signature", FileType::File, ModeType::S_IRUGO);
+        if let Ok(version_signature) = binding {
+            let version_signature = version_signature
+                .as_any_ref()
+                .downcast_ref::<LockedProcFSInode>()
+                .unwrap();
+            version_signature.0.lock().fdata.ftype = ProcFileType::Default;
+            version_signature.0.lock().data = "DragonOS 6.0.0-generic 6.0.0\n"
+                .to_string()
+                .as_bytes()
+                .to_vec();
+        } else {
+            panic!("create version_signature error");
+        }
         return result;
     }
 
@@ -466,6 +490,7 @@ impl IndexNode for LockedProcFSInode {
         let file_size = match inode.fdata.ftype {
             ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
+            ProcFileType::Default => inode.data.len() as i64,
             _ => {
                 todo!()
             }

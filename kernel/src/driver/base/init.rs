@@ -21,7 +21,6 @@ pub fn driver_init() -> Result<(), SystemError> {
     platform_bus_init()?;
     serio_bus_init()?;
     CpuDeviceManager::init()?;
-
     // 至此，已完成设备驱动模型的初始化
     return Ok(());
 }

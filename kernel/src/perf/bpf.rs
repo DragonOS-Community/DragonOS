@@ -80,54 +80,28 @@ impl RingPage {
         }
     }
 
+    #[inline]
     fn can_write(&self, data_size: usize, data_tail: usize, data_head: usize) -> bool {
-        if (data_head + 1) % self.data_region_size == data_tail {
-            // The buffer is full
-            return false;
-        }
-        let capacity = if data_head >= data_tail {
-            self.data_region_size - data_head + data_tail
-        } else {
-            data_tail - data_head
-        };
+        let capacity = self.data_region_size - data_head + data_tail;
         data_size <= capacity
     }
 
     pub fn write_event(&mut self, data: &[u8]) -> Result<()> {
         let data_tail = unsafe { &mut (*(self.ptr as *mut perf_event_mmap_page)).data_tail };
         let data_head = unsafe { &mut (*(self.ptr as *mut perf_event_mmap_page)).data_head };
-        // data_tail..data_head is the region that can be written
-        // check if there is enough space to write the event
-        let sample_size = PerfSample::calculate_size(data.len());
 
-        let can_write_sample =
-            self.can_write(sample_size, *data_tail as usize, *data_head as usize);
-        // log::error!(
-        //     "can_write_sample: {}, data_tail: {}, data_head: {}, data.len(): {}, region_size: {}",
-        //     can_write_sample,
-        //     *data_tail,
-        //     *data_head,
-        //     data.len(),
-        //     self.data_region_size
-        // );
-        if !can_write_sample {
-            //we need record it to the lost record
-            self.lost += 1;
-            // log::error!(
-            //     "Lost record: {}, data_tail: {}, data_head: {}",
-            //     self.lost,
-            //     *data_tail,
-            //     *data_head
-            // );
-            Ok(())
-        } else {
-            // we can write the sample to the page
-            // If the lost record is not zero, we need to write the lost record first.
+        // user lib will update the tail after read the data,but it will not % data_region_size
+        let perf_header_size = size_of::<perf_event_header>();
+        let can_write_perf_header =
+            self.can_write(perf_header_size, *data_tail as usize, *data_head as usize);
+
+        if can_write_perf_header {
             let can_write_lost_record = self.can_write(
                 size_of::<LostSamples>(),
                 *data_tail as usize,
                 *data_head as usize,
             );
+            // if there is lost record, we need to write the lost record first
             if self.lost > 0 && can_write_lost_record {
                 let new_data_head = self.write_lost(*data_head as usize)?;
                 *data_head = new_data_head as u64;
@@ -138,8 +112,21 @@ impl RingPage {
                 //     *data_head
                 // );
                 self.lost = 0;
-                self.write_event(data)
-            } else {
+                // try to write the event again
+                return self.write_event(data);
+            }
+            let sample_size = PerfSample::calculate_size(data.len());
+            let can_write_sample =
+                self.can_write(sample_size, *data_tail as usize, *data_head as usize);
+            // log::error!(
+            //     "can_write_sample: {}, data_tail: {}, data_head: {}, data.len(): {}, region_size: {}",
+            //     can_write_sample,
+            //     *data_tail,
+            //     *data_head,
+            //     data.len(),
+            //     self.data_region_size
+            // );
+            if can_write_sample {
                 let new_data_head = self.write_sample(data, *data_head as usize)?;
                 *data_head = new_data_head as u64;
                 // log::info!(
@@ -147,20 +134,24 @@ impl RingPage {
                 //     *data_tail,
                 //     *data_head
                 // );
-                Ok(())
+            } else {
+                self.lost += 1;
             }
+        } else {
+            self.lost += 1;
         }
+        Ok(())
     }
 
     /// Write any data to the page.
     ///
     /// Return the new data_head
-    fn write_any(&mut self, data: &[u8], data_head: usize) -> Result<usize> {
+    fn write_any(&mut self, data: &[u8], data_head: usize) -> Result<()> {
         let data_region_len = self.data_region_size;
         let data_region = self.as_mut_slice()[PAGE_SIZE..].as_mut();
         let data_len = data.len();
+        let start = data_head % data_region_len;
         let end = (data_head + data_len) % data_region_len;
-        let start = data_head;
         if start < end {
             data_region[start..end].copy_from_slice(data);
         } else {
@@ -168,40 +159,57 @@ impl RingPage {
             data_region[start..start + first_len].copy_from_slice(&data[..first_len]);
             data_region[0..end].copy_from_slice(&data[first_len..]);
         }
-        Ok(end)
+        Ok(())
+    }
+    #[inline]
+    fn fill_size(&self, data_head_mod: usize) -> usize {
+        if self.data_region_size - data_head_mod < size_of::<perf_event_header>() {
+            // The remaining space is not enough to write the perf_event_header
+            // We need to fill the remaining space with 0
+            self.data_region_size - data_head_mod
+        } else {
+            0
+        }
     }
 
     /// Write a sample to the page.
     fn write_sample(&mut self, data: &[u8], data_head: usize) -> Result<usize> {
+        let sample_size = PerfSample::calculate_size(data.len());
+        let maybe_end = (data_head + sample_size) % self.data_region_size;
+        let fill_size = self.fill_size(maybe_end);
         let perf_sample = PerfSample {
             s_hdr: SampleHeader {
                 header: perf_event_header {
                     type_: perf_event_type::PERF_RECORD_SAMPLE as u32,
                     misc: 0,
-                    size: size_of::<SampleHeader>() as u16 + data.len() as u16,
+                    size: size_of::<SampleHeader>() as u16 + data.len() as u16 + fill_size as u16,
                 },
                 size: data.len() as u32,
             },
             value: data,
         };
-        let new_head = self.write_any(perf_sample.s_hdr.as_bytes(), data_head)?;
-        self.write_any(perf_sample.value, new_head)
+        self.write_any(perf_sample.s_hdr.as_bytes(), data_head)?;
+        self.write_any(perf_sample.value, data_head + size_of::<SampleHeader>())?;
+        Ok(data_head + sample_size + fill_size)
     }
 
     /// Write a lost record to the page.
     ///
     /// Return the new data_head
     fn write_lost(&mut self, data_head: usize) -> Result<usize> {
+        let maybe_end = (data_head + size_of::<LostSamples>()) % self.data_region_size;
+        let fill_size = self.fill_size(maybe_end);
         let lost = LostSamples {
             header: perf_event_header {
                 type_: perf_event_type::PERF_RECORD_LOST as u32,
                 misc: 0,
-                size: size_of::<LostSamples>() as u16,
+                size: size_of::<LostSamples>() as u16 + fill_size as u16,
             },
             id: 0,
             count: self.lost as u64,
         };
-        self.write_any(lost.as_bytes(), data_head)
+        self.write_any(lost.as_bytes(), data_head)?;
+        Ok(data_head + size_of::<LostSamples>() + fill_size)
     }
 
     pub fn readable(&self) -> bool {

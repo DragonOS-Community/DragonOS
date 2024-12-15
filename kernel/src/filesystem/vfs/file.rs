@@ -242,21 +242,13 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
-        let r = if self.mode().contains(FileMode::O_DIRECT) {
+        let len = if self.mode().contains(FileMode::O_DIRECT) {
             self.inode
                 .read_direct(offset, len, buf, self.private_data.lock())
         } else {
             self.inode
                 .read_at(offset, len, buf, self.private_data.lock())
-        };
-
-        let len = r.map_err(|e| {
-            if e == SystemError::ERESTARTSYS {
-                SystemError::EINTR
-            } else {
-                e
-            }
-        })?;
+        }?;
 
         if update_offset {
             self.offset
@@ -281,24 +273,11 @@ impl File {
 
         // 如果文件指针已经超过了文件大小，则需要扩展文件大小
         if offset > self.inode.metadata()?.size as usize {
-            self.inode.resize(offset).map_err(|e| {
-                if e == SystemError::ERESTARTSYS {
-                    SystemError::EINTR
-                } else {
-                    e
-                }
-            })?;
+            self.inode.resize(offset)?;
         }
         let len = self
             .inode
-            .write_at(offset, len, buf, self.private_data.lock())
-            .map_err(|e| {
-                if e == SystemError::ERESTARTSYS {
-                    SystemError::EINTR
-                } else {
-                    e
-                }
-            })?;
+            .write_at(offset, len, buf, self.private_data.lock())?;
 
         if update_offset {
             self.offset

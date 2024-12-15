@@ -476,8 +476,8 @@ impl EventPoll {
                 }
 
                 // 如果有未处理的信号则返回错误
-                if current_pcb.sig_info_irqsave().sig_pending().signal().bits() != 0 {
-                    return Err(SystemError::EINTR);
+                if current_pcb.has_pending_signal_fast() {
+                    return Err(SystemError::ERESTARTSYS);
                 }
 
                 // 还未等待到事件发生，则睡眠
@@ -488,12 +488,18 @@ impl EventPoll {
                     let jiffies = next_n_us_timer_jiffies(
                         (timespec.tv_sec * 1000000 + timespec.tv_nsec / 1000) as u64,
                     );
-                    let inner = Timer::new(handle, jiffies);
+                    let inner: Arc<Timer> = Timer::new(handle, jiffies);
                     inner.activate();
                     timer = Some(inner);
                 }
                 let guard = epoll.0.lock_irqsave();
-                unsafe { guard.epoll_wq.sleep_without_schedule() };
+                // 睡眠，等待事件发生
+                // 如果wq已经dead，则直接返回错误
+                unsafe { guard.epoll_wq.sleep_without_schedule() }.inspect_err(|_| {
+                    if let Some(timer) = timer.as_ref() {
+                        timer.cancel();
+                    }
+                })?;
                 drop(guard);
                 schedule(SchedMode::SM_NONE);
                 // 被唤醒后,检查是否有事件可读

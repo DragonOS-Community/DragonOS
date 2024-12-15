@@ -37,7 +37,7 @@ impl Semaphore {
     fn down(&self) {
         if self.counter.fetch_sub(1, Ordering::Release) <= 0 {
             self.counter.fetch_add(1, Ordering::Relaxed);
-            self.wait_queue.sleep();
+            self.wait_queue.sleep().ok();
             //资源不充足,信号量<=0, 此时进程睡眠
         }
     }

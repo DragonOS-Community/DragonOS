@@ -4,6 +4,7 @@ use system_error::SystemError;
 
 use crate::{
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    process::ProcessManager,
     time::timer::schedule_timeout,
 };
 
@@ -29,20 +30,22 @@ impl Completion {
     /// @return 返回剩余时间或者SystemError
     fn do_wait_for_common(&self, mut timeout: i64, interuptible: bool) -> Result<i64, SystemError> {
         let mut inner = self.inner.lock_irqsave();
-
+        let pcb = ProcessManager::current_pcb();
         if inner.done == 0 {
             //loop break 类似 do while 保证进行一次信号检测
             loop {
                 //检查当前线程是否有未处理的信号
-                //             if (signal_pending_state(state, current)) {
-                // timeout = -ERESTARTSYS;
-                // break;
-                //}
+                if pcb.sig_info_irqsave().sig_pending().has_pending() {
+                    return Err(SystemError::ERESTARTSYS);
+                }
 
-                if interuptible {
-                    unsafe { inner.wait_queue.sleep_without_schedule() };
+                let e = if interuptible {
+                    unsafe { inner.wait_queue.sleep_without_schedule() }
                 } else {
-                    unsafe { inner.wait_queue.sleep_without_schedule_uninterruptible() };
+                    unsafe { inner.wait_queue.sleep_without_schedule_uninterruptible() }
+                };
+                if e.is_err() {
+                    break;
                 }
                 drop(inner);
                 timeout = schedule_timeout(timeout)?;

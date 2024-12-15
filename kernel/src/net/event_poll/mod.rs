@@ -495,11 +495,10 @@ impl EventPoll {
                 let guard = epoll.0.lock_irqsave();
                 // 睡眠，等待事件发生
                 // 如果wq已经dead，则直接返回错误
-                unsafe { guard.epoll_wq.sleep_without_schedule() }.map_err(|e| {
+                unsafe { guard.epoll_wq.sleep_without_schedule() }.inspect_err(|_| {
                     if let Some(timer) = timer.as_ref() {
                         timer.cancel();
                     }
-                    e
                 })?;
                 drop(guard);
                 schedule(SchedMode::SM_NONE);

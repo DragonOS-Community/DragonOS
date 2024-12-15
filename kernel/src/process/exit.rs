@@ -146,11 +146,10 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             if let Some(r) = r {
                 retval = r;
                 break 'outer;
-            } else {
-                if let Err(SystemError::ESRCH) = child_weak.upgrade().unwrap().wait_queue.sleep() {
-                    // log::debug!("do_wait: child_pcb sleep failed");
-                    continue;
-                }
+            } else if let Err(SystemError::ESRCH) = child_weak.upgrade().unwrap().wait_queue.sleep()
+            {
+                // log::debug!("do_wait: child_pcb sleep failed");
+                continue;
             }
         } else if kwo.pid_type == PidType::MAX {
             // 等待任意子进程

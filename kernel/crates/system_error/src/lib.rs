@@ -277,31 +277,51 @@ pub enum SystemError {
 
     // === 以下错误码不应该被用户态程序使用 ===
     ERESTARTSYS = 512,
-    // VMX on 虚拟化开启指令出错
-    EVMXONFailed = 513,
-    // VMX off 虚拟化关闭指令出错
-    EVMXOFFFailed = 514,
-    // VMX VMWRITE 写入虚拟化VMCS内存出错
-    EVMWRITEFailed = 515,
-    EVMREADFailed = 516,
-    EVMPRTLDFailed = 517,
-    EVMLAUNCHFailed = 518,
-    KVM_HVA_ERR_BAD = 519,
+    ERESTARTNOINTR = 513,
+    /// restart if no handler
+    ERESTARTNOHAND = 514,
+
     /// 没有对应的ioctlcmd
-    ENOIOCTLCMD = 520,
+    ENOIOCTLCMD = 515,
+    /// restart by calling sys restart syscall
+    ERESTART_RESTARTBLOCK = 516,
+
+    // === TODO: 这几个KVM的错误码不要放在这里 ===
+
+    // VMX on 虚拟化开启指令出错
+    EVMXONFailed = 1513,
+    // VMX off 虚拟化关闭指令出错
+    EVMXOFFFailed = 1514,
+    // VMX VMWRITE 写入虚拟化VMCS内存出错
+    EVMWRITEFailed = 1515,
+    EVMREADFailed = 1516,
+    EVMPRTLDFailed = 1517,
+    EVMLAUNCHFailed = 1518,
+    KVM_HVA_ERR_BAD = 1519,
+
+    MAXERRNO = 4095,
 }
 
 impl SystemError {
-    /// @brief 把posix错误码转换为系统错误枚举类型。
+    /// 判断一个值是否是有效的posix错误码。
+    pub fn is_valid_posix_errno<T>(val: T) -> bool
+    where
+        T: PartialOrd + From<i32>,
+    {
+        let max_errno = T::from(-(Self::MAXERRNO as i32));
+        val < T::from(0) && val >= max_errno
+    }
+
+    /// 尝试把posix错误码转换为系统错误枚举类型。
     pub fn from_posix_errno(errno: i32) -> Option<SystemError> {
         // posix 错误码是小于0的
-        if errno >= 0 {
+        if !Self::is_valid_posix_errno(errno) {
             return None;
         }
         return <Self as num_traits::FromPrimitive>::from_i32(-errno);
     }
 
-    /// @brief 把系统错误枚举类型转换为负数posix错误码。
+    /// 把系统错误枚举类型转换为负数posix错误码。
     pub fn to_posix_errno(&self) -> i32 {
         return -<Self as num_traits::ToPrimitive>::to_i32(self).unwrap();
     }

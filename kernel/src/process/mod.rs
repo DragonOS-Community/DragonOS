@@ -427,6 +427,7 @@ impl ProcessManager {
         }
         drop(thread);
         unsafe { pcb.basic_mut().set_user_vm(None) };
+        pcb.exit_files();
 
         // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
         // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
@@ -616,6 +617,32 @@ bitflags! {
         const NEED_MIGRATE = 1 << 7;
         /// 随机化的虚拟地址空间，主要用于动态链接器的加载
         const RANDOMIZE = 1 << 8;
+        /// 进程有未处理的信号（这是一个用于快速判断的标志位）
+        /// 相当于Linux的TIF_SIGPENDING
+        const HAS_PENDING_SIGNAL = 1 << 9;
+        /// 进程需要恢复之前保存的信号掩码
+        const RESTORE_SIG_MASK = 1 << 10;
+    }
+}
+
+impl ProcessFlags {
+    pub const fn exit_to_user_mode_work(&self) -> Self {
+        Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits))
+    }
+
+    /// 测试并清除标志位
+    ///
+    /// ## 参数
+    ///
+    /// - `rhs` : 需要测试并清除的标志位
+    ///
+    /// ## 返回值
+    ///
+    /// 如果标志位在清除前是置位的，则返回 `true`，否则返回 `false`
+    pub const fn test_and_clear(&mut self, rhs: Self) -> bool {
+        let r = (self.bits & rhs.bits) != 0;
+        self.bits &= !rhs.bits;
+        r
     }
 }
 #[derive(Debug)]
@@ -677,6 +704,7 @@ pub struct ProcessControlBlock {
 
     /// 进程作为主体的凭证集
     cred: SpinLock<Cred>,
+    self_ref: Weak<ProcessControlBlock>,
 }
 
 impl ProcessControlBlock {
@@ -738,7 +766,7 @@ impl ProcessControlBlock {
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
-        let pcb = Self {
+        let mut pcb = Self {
             pid,
             tgid: pid,
             thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
@@ -763,6 +791,7 @@ impl ProcessControlBlock {
             robust_list: RwLock::new(None),
             nsproxy: Arc::new(RwLock::new(NsProxy::new())),
             cred: SpinLock::new(cred),
+            self_ref: Weak::new(),
         };
 
         pcb.sig_info.write().set_tty(tty);
@@ -773,7 +802,10 @@ impl ProcessControlBlock {
             .lock()
             .init_syscall_stack(&pcb.syscall_stack.read());
 
-        let pcb = Arc::new(pcb);
+        let pcb = Arc::new_cyclic(|weak| {
+            pcb.self_ref = weak.clone();
+            pcb
+        });
 
         pcb.sched_info()
             .sched_entity()
@@ -1021,6 +1053,11 @@ impl ProcessControlBlock {
         return has_pending;
     }
 
+    /// 根据 pcb 的 flags 判断当前进程是否有未处理的信号
+    pub fn has_pending_signal_fast(&self) -> bool {
+        self.flags.get().contains(ProcessFlags::HAS_PENDING_SIGNAL)
+    }
+
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
     }
@@ -1060,6 +1097,19 @@ impl ProcessControlBlock {
     pub fn set_nsproxy(&self, nsprsy: NsProxy) {
         *self.nsproxy.write() = nsprsy;
     }
+
+    /// Exit fd table when process exit
+    fn exit_files(&self) {
+        self.basic.write_irqsave().set_fd_table(None);
+    }
+
+    pub fn children_read_irqsave(&self) -> RwLockReadGuard<Vec<Pid>> {
+        self.children.read_irqsave()
+    }
+
+    pub fn threads_read_irqsave(&self) -> RwLockReadGuard<ThreadInfo> {
+        self.thread.read_irqsave()
+    }
 }
 
 impl Drop for ProcessControlBlock {
@@ -1089,6 +1139,12 @@ pub struct ThreadInfo {
     vfork_done: Option<Arc<Completion>>,
     /// 线程组的组长
     group_leader: Weak<ProcessControlBlock>,
+}
+
+impl Default for ThreadInfo {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ThreadInfo {
@@ -1531,8 +1587,9 @@ pub fn process_init() {
 
 #[derive(Debug)]
 pub struct ProcessSignalInfo {
-    // 当前进程
-    sig_block: SigSet,
+    // 当前进程被屏蔽的信号
+    sig_blocked: SigSet,
+    saved_sigmask: SigSet,
     // sig_pending 中存储当前线程要处理的信号
     sig_pending: SigPending,
     // sig_shared_pending 中存储当前线程所属进程要处理的信号
@@ -1542,8 +1599,8 @@ pub struct ProcessSignalInfo {
 }
 
 impl ProcessSignalInfo {
-    pub fn sig_block(&self) -> &SigSet {
-        &self.sig_block
+    pub fn sig_blocked(&self) -> &SigSet {
+        &self.sig_blocked
     }
 
     pub fn sig_pending(&self) -> &SigPending {
@@ -1555,7 +1612,15 @@ impl ProcessSignalInfo {
     }
 
     pub fn sig_block_mut(&mut self) -> &mut SigSet {
-        &mut self.sig_block
+        &mut self.sig_blocked
+    }
+
+    pub fn saved_sigmask(&self) -> &SigSet {
+        &self.saved_sigmask
+    }
+
+    pub fn saved_sigmask_mut(&mut self) -> &mut SigSet {
+        &mut self.saved_sigmask
     }
 
     pub fn sig_shared_pending_mut(&mut self) -> &mut SigPending {
@@ -1580,12 +1645,19 @@ impl ProcessSignalInfo {
     ///
     /// - `sig_mask` 被忽略掉的信号
     ///
-    pub fn dequeue_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+    pub fn dequeue_signal(
+        &mut self,
+        sig_mask: &SigSet,
+        pcb: &Arc<ProcessControlBlock>,
+    ) -> (Signal, Option<SigInfo>) {
         let res = self.sig_pending.dequeue_signal(sig_mask);
+        pcb.recalc_sigpending(Some(self));
         if res.0 != Signal::INVALID {
             return res;
         } else {
-            return self.sig_shared_pending.dequeue_signal(sig_mask);
+            let res = self.sig_shared_pending.dequeue_signal(sig_mask);
+            pcb.recalc_sigpending(Some(self));
+            return res;
         }
     }
 }
@@ -1593,7 +1665,8 @@ impl ProcessSignalInfo {
 impl Default for ProcessSignalInfo {
     fn default() -> Self {
         Self {
-            sig_block: SigSet::empty(),
+            sig_blocked: SigSet::empty(),
+            saved_sigmask: SigSet::empty(),
             sig_pending: SigPending::default(),
             sig_shared_pending: SigPending::default(),
             tty: None,

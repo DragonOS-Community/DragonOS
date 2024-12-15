@@ -75,9 +75,15 @@ pub struct InnerSignalStruct {
 impl SignalStruct {
     #[inline(never)]
     pub fn new() -> Self {
-        Self {
+        let mut r = Self {
             inner: Box::<InnerSignalStruct>::default(),
-        }
+        };
+        let sig_ign = Sigaction::default();
+        r.inner.handlers[Signal::SIGCHLD as usize - 1] = sig_ign;
+        r.inner.handlers[Signal::SIGURG as usize - 1] = sig_ign;
+        r.inner.handlers[Signal::SIGWINCH as usize - 1] = sig_ign;
+
+        r
     }
 }
 
@@ -447,8 +453,6 @@ impl SigPending {
             None
         };
 
-        // 当一个进程具有多个线程之后，在这里需要重新计算线程的flag中的TIF_SIGPENDING位
-        // recalc_sigpending();
         return (sig, info);
     }
     /// @brief 从sigpending中删除mask中被置位的信号。也就是说，比如mask的第1位被置为1,那么就从sigqueue中删除所有signum为2的信号的信息。
@@ -539,10 +543,12 @@ impl SigQueue {
 pub trait SignalArch {
     /// 信号处理函数
     ///
+    /// 处理信号或重启系统调用
+    ///
     /// ## 参数
     ///
     /// - `frame` 中断栈帧
-    unsafe fn do_signal(frame: &mut TrapFrame);
+    unsafe fn do_signal_or_restart(frame: &mut TrapFrame);
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64;
 }

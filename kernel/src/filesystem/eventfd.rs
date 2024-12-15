@@ -4,7 +4,7 @@ use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, M
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll, KernelIoctlData};
-use crate::process::ProcessManager;
+use crate::process::{ProcessFlags, ProcessManager};
 use crate::sched::SchedMode;
 use crate::syscall::Syscall;
 use alloc::collections::LinkedList;
@@ -147,6 +147,10 @@ impl IndexNode for EventFdInode {
 
             let r = wq_wait_event_interruptible!(self.wait_queue, self.readable(), {});
             if r.is_err() {
+                ProcessManager::current_pcb()
+                    .flags()
+                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+
                 return Err(SystemError::ERESTARTSYS);
             }
 

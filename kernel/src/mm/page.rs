@@ -261,7 +261,7 @@ fn page_reclaim_thread() -> i32 {
             page_reclaimer_lock_irqsave().flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
-            let _ = nanosleep(PosixTimeSpec::new(5, 0));
+            let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
         }
     }
 }

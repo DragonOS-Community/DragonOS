@@ -5,8 +5,6 @@ use core::{
 
 use crate::{
     arch::{mm::LockedFrameAllocator, MMArch},
-    ipc::shm::shm_manager_lock,
-    libs::spinlock::SpinLockGuard,
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
 };
 
@@ -173,6 +171,8 @@ impl Iterator for VirtPageFrameIter {
 pub struct PageFrameCount(usize);
 
 impl PageFrameCount {
+    pub const ONE: PageFrameCount = PageFrameCount(1);
+
     // @brief 初始化PageFrameCount
     pub const fn new(count: usize) -> Self {
         return Self(count);
@@ -355,30 +355,8 @@ pub unsafe fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, P
 ///
 /// @param frame 要释放的第一个页帧
 /// @param count 要释放的页帧数量 (必须是2的n次幂)
-pub unsafe fn deallocate_page_frames(
-    frame: PhysPageFrame,
-    count: PageFrameCount,
-    page_manager_guard: &mut SpinLockGuard<'_, crate::mm::page::PageManager>,
-) {
+pub unsafe fn deallocate_page_frames(frame: PhysPageFrame, count: PageFrameCount) {
     unsafe {
         LockedFrameAllocator.free(frame.phys_address(), count);
-    }
-
-    let mut frame = frame;
-    for _ in 0..count.data() {
-        let paddr = frame.phys_address();
-        let page = page_manager_guard.get(&paddr);
-
-        if let Some(page) = page {
-            // 如果page是共享页，将其共享页信息从SHM_MANAGER中删去
-            let page_guard = page.read_irqsave();
-            if page_guard.shared() {
-                shm_manager_lock().free_id(&page_guard.shm_id().unwrap());
-            }
-        }
-
-        // 将已回收的物理页面对应的Page从PAGE_MANAGER中删去
-        page_manager_guard.remove_page(&paddr);
-        frame = frame.next();
-    }
+    };
 }

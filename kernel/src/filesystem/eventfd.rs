@@ -141,7 +141,7 @@ impl IndexNode for EventFdInode {
 
             drop(lock_efd);
 
-            if ProcessManager::current_pcb().has_pending_signal() {
+            if ProcessManager::current_pcb().has_pending_signal_fast() {
                 return Err(SystemError::ERESTARTSYS);
             }
 

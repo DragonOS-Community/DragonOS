@@ -388,61 +388,68 @@ impl ProcessManager {
     /// - `exit_code` : 进程的退出码
     pub fn exit(exit_code: usize) -> ! {
         // 关中断
-        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let pcb = ProcessManager::current_pcb();
-        let pid = pcb.pid();
-        pcb.sched_info
-            .inner_lock_write_irqsave()
-            .set_state(ProcessState::Exited(exit_code));
-        pcb.wait_queue.mark_dead();
-        pcb.wait_queue.wakeup_all(Some(ProcessState::Blocked(true)));
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let pid: Pid;
+        {
+            let pcb = ProcessManager::current_pcb();
+            pid = pcb.pid();
+            pcb.sched_info
+                .inner_lock_write_irqsave()
+                .set_state(ProcessState::Exited(exit_code));
+            pcb.wait_queue.mark_dead();
+            pcb.wait_queue.wakeup_all(Some(ProcessState::Blocked(true)));
 
-        let rq = cpu_rq(smp_get_processor_id().data() as usize);
-        let (rq, guard) = rq.self_lock();
-        rq.deactivate_task(
-            pcb.clone(),
-            DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-        );
-        drop(guard);
+            let rq = cpu_rq(smp_get_processor_id().data() as usize);
+            let (rq, guard) = rq.self_lock();
+            rq.deactivate_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+            drop(guard);
 
-        // 进行进程退出后的工作
-        let thread = pcb.thread.write_irqsave();
-        if let Some(addr) = thread.set_child_tid {
-            unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
-        }
-
-        if let Some(addr) = thread.clear_child_tid {
-            if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
-                let _ =
-                    Futex::futex_wake(addr, FutexFlag::FLAGS_MATCH_NONE, 1, FUTEX_BITSET_MATCH_ANY);
+            // 进行进程退出后的工作
+            let thread = pcb.thread.write_irqsave();
+            if let Some(addr) = thread.set_child_tid {
+                unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
             }
-            unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
-        }
 
-        RobustListHead::exit_robust_list(pcb.clone());
-
-        // 如果是vfork出来的进程，则需要处理completion
-        if thread.vfork_done.is_some() {
-            thread.vfork_done.as_ref().unwrap().complete_all();
-        }
-        drop(thread);
-        unsafe { pcb.basic_mut().set_user_vm(None) };
-        pcb.exit_files();
-
-        // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
-        // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
-        if let Some(tty) = pcb.sig_info_irqsave().tty() {
-            // 临时解决方案！！！ 临时解决方案！！！ 引入进程组之后，要重写这个更新前台进程组的逻辑
-            let mut g = tty.core().contorl_info_irqsave();
-            if g.pgid == Some(pid) {
-                g.pgid = None;
+            if let Some(addr) = thread.clear_child_tid {
+                if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
+                    let _ = Futex::futex_wake(
+                        addr,
+                        FutexFlag::FLAGS_MATCH_NONE,
+                        1,
+                        FUTEX_BITSET_MATCH_ANY,
+                    );
+                }
+                unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
             }
-        }
-        pcb.sig_info_mut().set_tty(None);
 
-        drop(pcb);
-        ProcessManager::exit_notify();
-        // unsafe { CurrentIrqArch::interrupt_enable() };
+            RobustListHead::exit_robust_list(pcb.clone());
+
+            // 如果是vfork出来的进程，则需要处理completion
+            if thread.vfork_done.is_some() {
+                thread.vfork_done.as_ref().unwrap().complete_all();
+            }
+            drop(thread);
+            unsafe { pcb.basic_mut().set_user_vm(None) };
+            pcb.exit_files();
+
+            // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
+            // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
+            if let Some(tty) = pcb.sig_info_irqsave().tty() {
+                // 临时解决方案！！！ 临时解决方案！！！ 引入进程组之后，要重写这个更新前台进程组的逻辑
+                let mut g = tty.core().contorl_info_irqsave();
+                if g.pgid == Some(pid) {
+                    g.pgid = None;
+                }
+            }
+            pcb.sig_info_mut().set_tty(None);
+
+            drop(pcb);
+            ProcessManager::exit_notify();
+        }
+
         __schedule(SchedMode::SM_NONE);
         error!("pid {pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]

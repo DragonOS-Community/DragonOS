@@ -106,7 +106,6 @@ pub fn kernel_wait4(
 fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
     let mut retval: Result<usize, SystemError>;
     let mut tmp_child_pcb: Option<Arc<ProcessControlBlock>> = None;
-
     macro_rules! notask {
         ($outer: lifetime) => {
             if let Some(err) = &kwo.no_task_error {
@@ -116,9 +115,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             }
 
             if retval.is_err() && !kwo.options.contains(WaitOption::WNOHANG) {
-                retval = Err(SystemError::EINTR);
-                // retval = Err(SystemError::ERESTARTSYS);
-                if !ProcessManager::current_pcb().has_pending_signal() {
+                retval = Err(SystemError::ERESTARTSYS);
+                if !ProcessManager::current_pcb().has_pending_signal_fast() {
                     schedule(SchedMode::SM_PREEMPT);
                     // todo: 增加子进程退出的回调后，这里可以直接等待在自身的child_wait等待队列上。
                     continue;
@@ -135,6 +133,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
     'outer: loop {
         kwo.no_task_error = Some(SystemError::ECHILD);
         let child_pcb = ProcessManager::find(kwo.pid).ok_or(SystemError::ECHILD);
+
         if kwo.pid_type != PidType::MAX && child_pcb.is_err() {
             notask!('outer);
         }
@@ -143,14 +142,14 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             let child_pcb = child_pcb.unwrap();
             // 获取weak引用，以便于在do_waitpid中能正常drop pcb
             let child_weak = Arc::downgrade(&child_pcb);
-            log::debug!("do_wait: child_pcb: {:?}", child_pcb.pid());
             let r = do_waitpid(child_pcb, kwo);
-            log::debug!("do_wait: do_waitpid return: {:?}", r);
             if let Some(r) = r {
-                return r;
+                retval = r;
+                break 'outer;
             } else {
                 if let Err(SystemError::ESRCH) = child_weak.upgrade().unwrap().wait_queue.sleep() {
-                    return Err(SystemError::ECHILD);
+                    // log::debug!("do_wait: child_pcb sleep failed");
+                    continue;
                 }
             }
         } else if kwo.pid_type == PidType::MAX {
@@ -185,12 +184,23 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             warn!("kernel_wait4: currently not support {:?}", kwo.pid_type);
             return Err(SystemError::EINVAL);
         }
-        log::debug!("xxxx, pending: {}", ProcessManager::current_pcb().has_pending_signal());
+
         notask!('outer);
     }
 
     drop(tmp_child_pcb);
-    log::debug!("do_wait, retval = {:?}, kwo: {:?}", retval, kwo.no_task_error);
+    ProcessManager::current_pcb()
+        .sched_info
+        .inner_lock_write_irqsave()
+        .set_state(ProcessState::Runnable);
+
+    // log::debug!(
+    //     "do_wait, kwo.pid: {}, retval = {:?}, kwo: {:?}",
+    //     kwo.pid,
+    //     retval,
+    //     kwo.no_task_error
+    // );
+
     return retval;
 }
 

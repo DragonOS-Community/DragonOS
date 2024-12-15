@@ -476,8 +476,8 @@ impl EventPoll {
                 }
 
                 // 如果有未处理的信号则返回错误
-                if current_pcb.sig_info_irqsave().sig_pending().signal().bits() != 0 {
-                    return Err(SystemError::EINTR);
+                if current_pcb.has_pending_signal_fast() {
+                    return Err(SystemError::ERESTARTSYS);
                 }
 
                 // 还未等待到事件发生，则睡眠

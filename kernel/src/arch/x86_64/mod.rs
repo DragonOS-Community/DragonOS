@@ -20,6 +20,7 @@ pub mod sched;
 pub mod smp;
 pub mod syscall;
 pub mod time;
+pub mod vm;
 
 pub use self::pci::pci::X86_64PciArch as PciArch;
 
@@ -40,3 +41,12 @@ pub use crate::arch::elf::X86_64ElfArch as CurrentElfArch;
 pub use crate::arch::smp::X86_64SMPArch as CurrentSMPArch;
 
 pub use crate::arch::sched::X86_64SchedArch as CurrentSchedArch;
+
+pub use crate::arch::vm::KvmArchManager as CurrentKvmManager;
+
+pub use crate::arch::vm::kvm_host::X86KvmArch as KvmArch;
+
+pub use crate::arch::vm::x86_kvm_ops as kvm_arch_ops;
+
+pub use crate::arch::vm::kvm_host::vcpu::X86VcpuArch as VirtCpuArch;
+pub use crate::arch::vm::kvm_host::KvmVcpuStat as VirtCpuStat;

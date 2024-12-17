@@ -25,6 +25,7 @@ use crate::{
         procfs::procfs_register_pid,
         vfs::{file::FileDescriptorVec, MAX_PATHLEN},
     },
+    libs::rand::rand_bytes,
     mm::{
         ucontext::{AddressSpace, UserStack},
         verify_area, MemoryManagementArch, VirtAddr,
@@ -171,6 +172,8 @@ impl Syscall {
         // debug!("argv: {:?}, envp: {:?}", argv, envp);
         param.init_info_mut().args = argv;
         param.init_info_mut().envs = envp;
+        // // 生成16字节随机数
+        param.init_info_mut().rand_num = rand_bytes::<16>();
 
         // 把proc_init_info写到用户栈上
         let mut ustack_message = unsafe {
@@ -182,7 +185,7 @@ impl Syscall {
         };
         let (user_sp, argv_ptr) = unsafe {
             param
-                .init_info()
+                .init_info_mut()
                 .push_at(
                     // address_space
                     //     .write()
@@ -271,7 +274,7 @@ impl Syscall {
     }
     /// @brief 获取当前进程的父进程id
     ///
-    /// 若为initproc则ppid设置为0   
+    /// 若为initproc则ppid设置为0
     pub fn getppid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
         return Ok(current_pcb.basic().ppid());

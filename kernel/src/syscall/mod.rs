@@ -1255,6 +1255,7 @@ impl Syscall {
     }
 
     pub fn reboot() -> Result<usize, SystemError> {
+        log::info!("reboot");
         unsafe { cpu_reset() };
     }
 }

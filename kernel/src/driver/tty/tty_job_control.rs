@@ -65,7 +65,7 @@ impl TtyJobCtrlManager {
                 ProcessManager::current_pcb()
                     .flags()
                     .insert(ProcessFlags::HAS_PENDING_SIGNAL);
-
+                log::debug!("job_ctrl_ioctl: kill. pgid: {pgid}, tty_pgid: {tty_pgid:?}");
                 return Err(SystemError::ERESTARTSYS);
             }
         }

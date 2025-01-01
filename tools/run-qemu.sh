@@ -78,7 +78,8 @@ QEMU_MONITOR="-monitor stdio"
 QEMU_TRACE="${qemu_trace_std}"
 QEMU_CPU_FEATURES=""
 QEMU_RTC_CLOCK=""
-QEMU_SERIAL="-serial file:../serial_opt.txt"
+QEMU_SERIAL_LOG_FILE="../serial_opt.txt"
+QEMU_SERIAL="-serial file:${QEMU_SERIAL_LOG_FILE}"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
 QEMU_ARGUMENT=""
@@ -137,7 +138,7 @@ while true;do
               window)
               ;;
               nographic)
-              QEMU_SERIAL=" -serial mon:stdio "
+              QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
               QEMU_MONITOR=""
               QEMU_ARGUMENT+=" --nographic "
               QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "

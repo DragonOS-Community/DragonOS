@@ -238,6 +238,10 @@ impl Syscall {
                 let r = args[0] as *const u8;
                 Self::chdir(r)
             }
+            SYS_FCHDIR => {
+                let fd = args[0] as i32;
+                Self::fchdir(fd)
+            }
 
             #[allow(unreachable_patterns)]
             SYS_GETDENTS64 | SYS_GETDENTS => {

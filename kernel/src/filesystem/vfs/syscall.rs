@@ -740,6 +740,22 @@ impl Syscall {
         }
     }
 
+    pub fn fchdir(fd: i32) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let file = pcb
+            .fd_table()
+            .read()
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+        let inode = file.inode();
+        if inode.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        let path = inode.absolute_path()?;
+        pcb.basic_mut().set_cwd(path);
+        return Ok(0);
+    }
+
     /// @brief 获取当前进程的工作目录路径
     ///
     /// @param buf 指向缓冲区的指针

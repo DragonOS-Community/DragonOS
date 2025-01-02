@@ -63,7 +63,6 @@ pub fn kernel_wait4(
 
     // 判断pid类型
     let pidtype: PidType;
-
     if pid == -1 {
         pidtype = PidType::MAX;
     } else if pid < 0 {

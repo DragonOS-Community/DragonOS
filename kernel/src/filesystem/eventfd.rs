@@ -4,7 +4,7 @@ use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, M
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll, KernelIoctlData};
-use crate::process::ProcessManager;
+use crate::process::{ProcessFlags, ProcessManager};
 use crate::sched::SchedMode;
 use crate::syscall::Syscall;
 use alloc::collections::LinkedList;
@@ -82,6 +82,21 @@ impl EventFdInode {
         let count = self.eventfd.lock().count;
         return count > 0;
     }
+
+    fn do_poll(
+        &self,
+        _private_data: &FilePrivateData,
+        self_guard: &SpinLockGuard<'_, EventFd>,
+    ) -> Result<usize, SystemError> {
+        let mut events = EPollEventType::empty();
+        if self_guard.count != 0 {
+            events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
+        }
+        if self_guard.count != u64::MAX {
+            events |= EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
+        }
+        return Ok(events.bits() as usize);
+    }
 }
 
 impl IndexNode for EventFdInode {
@@ -125,8 +140,17 @@ impl IndexNode for EventFdInode {
             }
 
             drop(lock_efd);
+
+            if ProcessManager::current_pcb().has_pending_signal_fast() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+
             let r = wq_wait_event_interruptible!(self.wait_queue, self.readable(), {});
             if r.is_err() {
+                ProcessManager::current_pcb()
+                    .flags()
+                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+
                 return Err(SystemError::ERESTARTSYS);
             }
 
@@ -134,7 +158,7 @@ impl IndexNode for EventFdInode {
         }
         let mut val = lock_efd.count;
 
-        let mut eventfd = self.eventfd.lock();
+        let mut eventfd = lock_efd;
         if eventfd.flags.contains(EventFdFlags::EFD_SEMAPHORE) {
             eventfd.count -= 1;
             val = 1;
@@ -143,8 +167,9 @@ impl IndexNode for EventFdInode {
         }
         let val_bytes = val.to_ne_bytes();
         buf[..8].copy_from_slice(&val_bytes);
+        let pollflag = EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
+        drop(eventfd);
 
-        let pollflag = EPollEventType::from_bits_truncate(self.poll(&data)? as u32);
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
 
@@ -174,6 +199,9 @@ impl IndexNode for EventFdInode {
             return Err(SystemError::EINVAL);
         }
         loop {
+            if ProcessManager::current_pcb().has_pending_signal() {
+                return Err(SystemError::ERESTARTSYS);
+            }
             let eventfd = self.eventfd.lock();
             if u64::MAX - eventfd.count > val {
                 break;
@@ -185,13 +213,17 @@ impl IndexNode for EventFdInode {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
             drop(eventfd);
-            self.wait_queue.sleep();
+            self.wait_queue.sleep().ok();
         }
         let mut eventfd = self.eventfd.lock();
         eventfd.count += val;
+        drop(eventfd);
         self.wait_queue.wakeup_all(None);
 
-        let pollflag = EPollEventType::from_bits_truncate(self.poll(&data)? as u32);
+        let eventfd = self.eventfd.lock();
+        let pollflag = EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
+        drop(eventfd);
+
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
         return Ok(8);
@@ -202,14 +234,8 @@ impl IndexNode for EventFdInode {
     /// - 如果 counter 的值大于 0 ，那么 fd 的状态就是可读的
     /// - 如果能无阻塞地写入一个至少为 1 的值，那么 fd 的状态就是可写的
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let mut events = EPollEventType::empty();
-        if self.eventfd.lock().count != 0 {
-            events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
-        }
-        if self.eventfd.lock().count != u64::MAX {
-            events |= EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
-        }
-        return Ok(events.bits() as usize);
+        let self_guard = self.eventfd.lock();
+        self.do_poll(_private_data, &self_guard)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

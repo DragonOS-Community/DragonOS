@@ -238,6 +238,10 @@ impl Syscall {
                 let r = args[0] as *const u8;
                 Self::chdir(r)
             }
+            SYS_FCHDIR => {
+                let fd = args[0] as i32;
+                Self::fchdir(fd)
+            }
 
             #[allow(unreachable_patterns)]
             SYS_GETDENTS64 | SYS_GETDENTS => {
@@ -879,8 +883,11 @@ impl Syscall {
             }
 
             SYS_RT_SIGPROCMASK => {
-                warn!("SYS_RT_SIGPROCMASK has not yet been implemented");
-                Ok(0)
+                let how = args[0] as i32;
+                let nset = args[1];
+                let oset = args[2];
+                let sigsetsize = args[3];
+                Self::rt_sigprocmask(how, nset, oset, sigsetsize)
             }
 
             SYS_TKILL => {
@@ -1213,6 +1220,8 @@ impl Syscall {
                 let flags = args[4] as u32;
                 Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
+            SYS_SETRLIMIT => Ok(0),
+            SYS_RESTART_SYSCALL => Self::restart_syscall(),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

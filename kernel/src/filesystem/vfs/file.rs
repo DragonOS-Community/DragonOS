@@ -5,16 +5,13 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use kdepends::xarray::XArray;
 use log::error;
 use system_error::SystemError;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::filesystem::eventfd::EventFdInode;
-use crate::libs::lazy_init::Lazy;
 use crate::perf::PerfEventInode;
 use crate::{
-    arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
@@ -22,7 +19,6 @@ use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    mm::{page::Page, MemoryManagementArch},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::Inode as SocketInode,
@@ -124,75 +120,6 @@ impl FileMode {
     }
 }
 
-/// 页面缓存
-pub struct PageCache {
-    xarray: SpinLock<XArray<Arc<Page>>>,
-    inode: Lazy<Weak<dyn IndexNode>>,
-}
-
-impl core::fmt::Debug for PageCache {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PageCache")
-            .field(
-                "xarray",
-                &self
-                    .xarray
-                    .lock()
-                    .range(0..((MMArch::PAGE_ADDRESS_SIZE >> MMArch::PAGE_SHIFT) as u64))
-                    .map(|(_, r)| (*r).clone())
-                    .collect::<Vec<Arc<Page>>>(),
-            )
-            .finish()
-    }
-}
-
-impl PageCache {
-    pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
-        let page_cache = Self {
-            xarray: SpinLock::new(XArray::new()),
-            inode: {
-                let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
-                if let Some(inode) = inode {
-                    v.init(inode);
-                }
-                v
-            },
-        };
-        Arc::new(page_cache)
-    }
-
-    pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {
-        self.inode.try_get().cloned()
-    }
-
-    pub fn add_page(&self, offset: usize, page: &Arc<Page>) {
-        let mut guard = self.xarray.lock();
-        let mut cursor = guard.cursor_mut(offset as u64);
-        cursor.store(page.clone());
-    }
-
-    pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
-        let mut guard = self.xarray.lock();
-        let mut cursor = guard.cursor_mut(offset as u64);
-        let page = cursor.load().map(|r| (*r).clone());
-        page
-    }
-
-    pub fn remove_page(&self, offset: usize) {
-        let mut guard = self.xarray.lock();
-        let mut cursor = guard.cursor_mut(offset as u64);
-        cursor.remove();
-    }
-
-    pub fn set_inode(&self, inode: Weak<dyn IndexNode>) -> Result<(), SystemError> {
-        if self.inode.initialized() {
-            return Err(SystemError::EINVAL);
-        }
-        self.inode.init(inode);
-        Ok(())
-    }
-}
-
 /// @brief 抽象文件结构体
 #[derive(Debug)]
 pub struct File {
@@ -238,13 +165,16 @@ impl File {
         return Ok(f);
     }
 
-    /// @brief 从文件中读取指定的字节数到buffer中
+    /// ## 从文件中读取指定的字节数到buffer中
     ///
-    /// @param len 要读取的字节数
-    /// @param buf 目标buffer
+    /// ### 参数
+    /// - `len`: 要读取的字节数
+    /// - `buf`: 缓冲区
+    /// - `read_direct`: 忽略缓存，直接读取磁盘
     ///
-    /// @return Ok(usize) 成功读取的字节数
-    /// @return Err(SystemError) 错误码
+    /// ### 返回值
+    /// - `Ok(usize)`: 成功读取的字节数
+    /// - `Err(SystemError)`: 错误码
     pub fn read(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         self.do_read(
             self.offset.load(core::sync::atomic::Ordering::SeqCst),
@@ -254,13 +184,16 @@ impl File {
         )
     }
 
-    /// @brief 从buffer向文件写入指定的字节数的数据
+    /// ## 从buffer向文件写入指定的字节数的数据
     ///
-    /// @param len 要写入的字节数
-    /// @param buf 源数据buffer
+    /// ### 参数
+    /// - `offset`: 文件偏移量
+    /// - `len`: 要写入的字节数
+    /// - `buf`: 写入缓冲区
     ///
-    /// @return Ok(usize) 成功写入的字节数
-    /// @return Err(SystemError) 错误码
+    /// ### 返回值
+    /// - `Ok(usize)`: 成功写入的字节数
+    /// - `Err(SystemError)`: 错误码
     pub fn write(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
         self.do_write(
             self.offset.load(core::sync::atomic::Ordering::SeqCst),
@@ -309,16 +242,13 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
-        let len = self
-            .inode
-            .read_at(offset, len, buf, self.private_data.lock())
-            .map_err(|e| {
-                if e == SystemError::ERESTARTSYS {
-                    SystemError::EINTR
-                } else {
-                    e
-                }
-            })?;
+        let len = if self.mode().contains(FileMode::O_DIRECT) {
+            self.inode
+                .read_direct(offset, len, buf, self.private_data.lock())
+        } else {
+            self.inode
+                .read_at(offset, len, buf, self.private_data.lock())
+        }?;
 
         if update_offset {
             self.offset
@@ -343,24 +273,11 @@ impl File {
 
         // 如果文件指针已经超过了文件大小，则需要扩展文件大小
         if offset > self.inode.metadata()?.size as usize {
-            self.inode.resize(offset).map_err(|e| {
-                if e == SystemError::ERESTARTSYS {
-                    SystemError::EINTR
-                } else {
-                    e
-                }
-            })?;
+            self.inode.resize(offset)?;
         }
         let len = self
             .inode
-            .write_at(offset, len, buf, self.private_data.lock())
-            .map_err(|e| {
-                if e == SystemError::ERESTARTSYS {
-                    SystemError::EINTR
-                } else {
-                    e
-                }
-            })?;
+            .write_at(offset, len, buf, self.private_data.lock())?;
 
         if update_offset {
             self.offset

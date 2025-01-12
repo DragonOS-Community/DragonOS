@@ -16,8 +16,7 @@ use crate::{
         FilePrivateData,
     },
     ipc::shm::{shm_manager_lock, IPC_PRIVATE},
-    libs::align::page_align_up,
-    libs::spinlock::SpinLock,
+    libs::{align::page_align_up, spinlock::SpinLock},
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
         page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
@@ -35,6 +34,7 @@ use crate::{
 use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
     shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
+    signal::{set_sigprocmask, SigHow},
     signal_types::{
         SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
         USER_SIG_ERR, USER_SIG_IGN,
@@ -404,6 +404,9 @@ impl Syscall {
         // 更新最后一次连接时间
         kernel_shm.update_atim();
 
+        // 映射计数增加
+        kernel_shm.increase_count();
+
         Ok(r)
     }
 
@@ -431,29 +434,6 @@ impl Syscall {
         if vma.lock_irqsave().region().start() != vaddr {
             return Err(SystemError::EINVAL);
         }
-
-        // 获取映射的物理地址
-        let paddr = address_write_guard
-            .user_mapper
-            .utable
-            .translate(vaddr)
-            .ok_or(SystemError::EINVAL)?
-            .0;
-
-        // 如果物理页的shm_id为None，代表不是共享页
-        let mut page_manager_guard = page_manager_lock_irqsave();
-        let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
-        let shm_id = page.read_irqsave().shm_id().ok_or(SystemError::EINVAL)?;
-        drop(page_manager_guard);
-
-        // 获取对应共享页管理信息
-        let mut shm_manager_guard = shm_manager_lock();
-        let kernel_shm = shm_manager_guard
-            .get_mut(&shm_id)
-            .ok_or(SystemError::EINVAL)?;
-        // 更新最后一次断开连接时间
-        kernel_shm.update_dtim();
-        drop(shm_manager_guard);
 
         // 取消映射
         let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
@@ -503,5 +483,73 @@ impl Syscall {
             // 无效操作码
             ShmCtlCmd::Default => Err(SystemError::EINVAL),
         }
+    }
+
+    /// # SYS_SIGPROCMASK系统调用函数，用于设置或查询当前进程的信号屏蔽字
+    ///
+    /// ## 参数
+    ///
+    /// - `how`: 指示如何修改信号屏蔽字
+    /// - `nset`: 新的信号屏蔽字
+    /// - `oset`: 旧的信号屏蔽字的指针，由于可以是NULL，所以用Option包装
+    /// - `sigsetsize`: 信号集的大小
+    ///
+    /// ## 返回值
+    ///
+    /// 成功：0
+    /// 失败：错误码
+    ///
+    /// ## 说明
+    /// 根据 https://man7.org/linux/man-pages/man2/sigprocmask.2.html ，传进来的oldset和newset都是指针类型，这里选择传入usize然后转换为u64的指针类型
+    pub fn rt_sigprocmask(
+        how: i32,
+        newset: usize,
+        oldset: usize,
+        sigsetsize: usize,
+    ) -> Result<usize, SystemError> {
+        // 对应oset传进来一个NULL的情况
+        let oset = if oldset == 0 { None } else { Some(oldset) };
+        let nset = if newset == 0 { None } else { Some(newset) };
+
+        if sigsetsize != size_of::<SigSet>() {
+            return Err(SystemError::EFAULT);
+        }
+
+        let sighow = SigHow::try_from(how)?;
+
+        let mut new_set = SigSet::default();
+        if let Some(nset) = nset {
+            let reader = UserBufferReader::new(
+                VirtAddr::new(nset).as_ptr::<u64>(),
+                core::mem::size_of::<u64>(),
+                true,
+            )?;
+
+            let nset = reader.read_one_from_user::<u64>(0)?;
+            new_set = SigSet::from_bits_truncate(*nset);
+            // debug!("Get Newset: {}", &new_set.bits());
+            let to_remove: SigSet =
+                <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
+            new_set.remove(to_remove);
+        }
+
+        let oldset_to_return = set_sigprocmask(sighow, new_set)?;
+        if let Some(oldset) = oset {
+            // debug!("Get Oldset to return: {}", &oldset_to_return.bits());
+            let mut writer = UserBufferWriter::new(
+                VirtAddr::new(oldset).as_ptr::<u64>(),
+                core::mem::size_of::<u64>(),
+                true,
+            )?;
+            writer.copy_one_to_user::<u64>(&oldset_to_return.bits(), 0)?;
+        }
+
+        Ok(0)
+    }
+
+    pub fn restart_syscall() -> Result<usize, SystemError> {
+        // todo: https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#2998
+        unimplemented!("restart_syscall with restart block");
+        // Err(SystemError::ENOSYS)
     }
 }

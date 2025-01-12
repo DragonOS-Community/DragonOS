@@ -21,6 +21,7 @@ use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
     filesystem::vfs::file::File,
+    ipc::shm::{shm_manager_lock, ShmFlags},
     libs::{
         align::page_align_up,
         rwlock::RwLock,
@@ -35,7 +36,7 @@ use super::{
     allocator::page_frame::{
         deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
-    page::{EntryFlags, Flusher, InactiveFlusher, Page, PageFlushAll},
+    page::{EntryFlags, Flusher, InactiveFlusher, PageFlushAll, PageType},
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
     MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
 };
@@ -841,7 +842,6 @@ impl Drop for UserMapper {
             deallocate_page_frames(
                 PhysPageFrame::new(self.utable.table().phys()),
                 PageFrameCount::new(1),
-                &mut page_manager_lock_irqsave(),
             )
         };
     }
@@ -1152,12 +1152,35 @@ impl LockedVMA {
 
     pub fn unmap(&self, mapper: &mut PageMapper, mut flusher: impl Flusher<MMArch>) {
         // todo: 如果当前vma与文件相关，完善文件相关的逻辑
-
         let mut guard = self.lock_irqsave();
 
         // 获取物理页的anon_vma的守卫
         let mut page_manager_guard: SpinLockGuard<'_, crate::mm::page::PageManager> =
             page_manager_lock_irqsave();
+
+        // 获取映射的物理地址
+        if let Some((paddr, _flags)) = mapper.translate(guard.region().start()) {
+            // 如果是共享页，执行释放操作
+            let page = page_manager_guard.get(&paddr).unwrap();
+            let page_guard = page.read_irqsave();
+            if let PageType::Shm(shm_id) = page_guard.page_type() {
+                let mut shm_manager_guard = shm_manager_lock();
+                if let Some(kernel_shm) = shm_manager_guard.get_mut(shm_id) {
+                    // 更新最后一次断开连接时间
+                    kernel_shm.update_dtim();
+
+                    // 映射计数减少
+                    kernel_shm.decrease_count();
+
+                    // 释放shm_id
+                    if kernel_shm.map_count() == 0 && kernel_shm.mode().contains(ShmFlags::SHM_DEST)
+                    {
+                        shm_manager_guard.free_id(shm_id);
+                    }
+                }
+            }
+        }
+
         for page in guard.region.pages() {
             if mapper.translate(page.virt_address()).is_none() {
                 continue;
@@ -1167,18 +1190,13 @@ impl LockedVMA {
 
             // 从anon_vma中删除当前VMA
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write_irqsave().remove_vma(self);
+            let mut page_guard = page.write_irqsave();
+            page_guard.remove_vma(self);
 
-            // 如果物理页的anon_vma链表长度为0并且不是共享页，则释放物理页.
-            if page.read_irqsave().can_deallocate() {
-                unsafe {
-                    drop(page);
-                    deallocate_page_frames(
-                        PhysPageFrame::new(paddr),
-                        PageFrameCount::new(1),
-                        &mut page_manager_guard,
-                    )
-                };
+            // 如果物理页的vma链表长度为0并且未标记为不可回收，则释放物理页.
+            // TODO 后续由lru释放物理页面
+            if page_guard.can_deallocate() {
+                page_manager_guard.remove_page(&paddr);
             }
 
             flusher.consume(flush);
@@ -1659,9 +1677,7 @@ impl VMA {
         return Ok(r);
     }
 
-    pub fn page_address(&self, page: &Arc<Page>) -> Result<VirtAddr, SystemError> {
-        let page_guard = page.read_irqsave();
-        let index = page_guard.index().unwrap();
+    pub fn page_address(&self, index: usize) -> Result<VirtAddr, SystemError> {
         if index >= self.file_pgoff.unwrap() {
             let address =
                 self.region.start + ((index - self.file_pgoff.unwrap()) << MMArch::PAGE_SHIFT);

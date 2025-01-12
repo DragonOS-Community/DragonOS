@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
-    process::{Pid, ProcessManager},
+    process::{Pid, ProcessFlags, ProcessManager},
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall,
@@ -51,9 +51,9 @@ impl TtyJobCtrlManager {
         if tty_pgid.is_some() && tty_pgid.unwrap() != pgid {
             if pcb
                 .sig_info_irqsave()
-                .sig_block()
+                .sig_blocked()
                 .contains(SigSet::from_bits_truncate(1 << sig as u64))
-                || pcb.sig_struct_irqsave().handlers[sig as usize].is_ignore()
+                || pcb.sig_struct_irqsave().handlers[sig as usize - 1].is_ignore()
             {
                 // 忽略该信号
                 if sig == Signal::SIGTTIN {
@@ -62,7 +62,11 @@ impl TtyJobCtrlManager {
             } else {
                 // 暂时使用kill而不是killpg
                 Syscall::kill(pgid, sig as i32)?;
-                return Err(SystemError::ERESTART);
+                ProcessManager::current_pcb()
+                    .flags()
+                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+                log::debug!("job_ctrl_ioctl: kill. pgid: {pgid}, tty_pgid: {tty_pgid:?}");
+                return Err(SystemError::ERESTARTSYS);
             }
         }
 

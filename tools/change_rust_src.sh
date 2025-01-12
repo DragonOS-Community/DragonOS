@@ -2,7 +2,8 @@ echo "正在为rust换源"
 
 sparse="false"
 
-CONFIG_FILE=~/.cargo/config.toml
+CARGO_HOME=${CARGO_HOME:-~/.cargo}
+CONFIG_FILE=$CARGO_HOME/config.toml
 # 创建父目录
 if [ ! -d ~/.cargo ]; then
     mkdir -p ~/.cargo

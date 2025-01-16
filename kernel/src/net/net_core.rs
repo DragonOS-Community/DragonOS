@@ -60,8 +60,10 @@ fn dhcp_query() -> Result<(), SystemError> {
 
     let sockets = || net_face.sockets().lock_irqsave();
 
-    // let dhcp_handle = SOCKET_SET.lock_irqsave().add(dhcp_socket);
     let dhcp_handle = sockets().add(dhcp_socket);
+    defer::defer!({
+        sockets().remove(dhcp_handle);
+    });
 
     const DHCP_TRY_ROUND: u8 = 100;
     for i in 0..DHCP_TRY_ROUND {

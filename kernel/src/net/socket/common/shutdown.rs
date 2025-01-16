@@ -124,7 +124,7 @@ impl TryFrom<usize> for ShutdownTemp {
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
         match value {
-            0 | 1 | 2 => Ok(ShutdownTemp {
+            0..2 => Ok(ShutdownTemp {
                 bit: value as u8 + 1,
             }),
             _ => Err(SystemError::EINVAL),

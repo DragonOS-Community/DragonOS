@@ -355,6 +355,13 @@ impl Listening {
             .port_manager()
             .unbind_port(Types::Tcp, port);
     }
+
+    pub fn release(&self) {
+        // log::debug!("Release Listening Socket");
+        for inner in self.inners.iter() {
+            inner.release();
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -348,7 +348,15 @@ impl Socket for TcpSocket {
     }
 
     fn close(&self) -> Result<(), SystemError> {
-        let inner = self.inner.write().take().unwrap();
+        let Some(inner) = self.inner.write().take() else {
+            log::warn!("TcpSocket::close: already closed, unexpected");
+            return Ok(());
+        };
+        if let Some(iface) = inner.iface() {
+            iface
+                .common()
+                .unbind_socket(self.self_ref.upgrade().unwrap());
+        }
 
         match inner {
             // complete connecting socket close logic
@@ -356,22 +364,21 @@ impl Socket for TcpSocket {
                 let conn = unsafe { conn.into_established() };
                 conn.close();
                 conn.release();
-                Ok(())
             }
             Inner::Established(es) => {
                 es.close();
                 es.release();
-                Ok(())
             }
             Inner::Listening(ls) => {
                 ls.close();
-                Ok(())
+                ls.release();
             }
             Inner::Init(init) => {
                 init.close();
-                Ok(())
             }
-        }
+        };
+
+        Ok(())
     }
 
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {

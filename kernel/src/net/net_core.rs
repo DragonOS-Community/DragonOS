@@ -7,10 +7,7 @@ use crate::{
     driver::net::{Iface, Operstate},
     libs::rwlock::RwLockReadGuard,
     net::NET_DEVICES,
-    time::{
-        sleep::nanosleep,
-        PosixTimeSpec,
-    },
+    time::{sleep::nanosleep, PosixTimeSpec},
 };
 
 pub fn net_init() -> Result<(), SystemError> {
@@ -21,7 +18,12 @@ fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
 
     // Default iface, misspelled to net_face
-    let net_face = binding.iter().find(|(_, iface)| iface.common().is_default_iface()).unwrap().1.clone();
+    let net_face = binding
+        .iter()
+        .find(|(_, iface)| iface.common().is_default_iface())
+        .unwrap()
+        .1
+        .clone();
 
     drop(binding);
 

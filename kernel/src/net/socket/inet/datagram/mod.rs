@@ -90,7 +90,7 @@ impl UdpSocket {
                 let ret = bound.try_recv(buf);
                 poll_ifaces();
                 ret
-            },
+            }
             _ => Err(ENOTCONN),
         }
     }
@@ -199,7 +199,8 @@ impl Socket for UdpSocket {
             if !self.is_bound() {
                 self.bind_emphemeral(remote.addr)?;
             }
-            if let UdpInner::Bound(inner) = self.inner.read().as_ref().expect("UDP Inner disappear") {
+            if let UdpInner::Bound(inner) = self.inner.read().as_ref().expect("UDP Inner disappear")
+            {
                 inner.connect(remote);
                 return Ok(());
             } else {

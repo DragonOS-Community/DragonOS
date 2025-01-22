@@ -33,13 +33,14 @@ impl UnboundUdp {
     }
 
     pub fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<BoundUdp, SystemError> {
-
         let inner = BoundInner::bind(self.socket, &local_endpoint.addr)?;
         let bind_addr = local_endpoint.addr;
         let bind_port = if local_endpoint.port == 0 {
             inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?
         } else {
-            inner.port_manager().bind_port(InetTypes::Udp, local_endpoint.port)?;
+            inner
+                .port_manager()
+                .bind_port(InetTypes::Udp, local_endpoint.port)?;
             local_endpoint.port
         };
 

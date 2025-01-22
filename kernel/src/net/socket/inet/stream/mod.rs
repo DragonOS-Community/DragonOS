@@ -99,7 +99,6 @@ impl TcpSocket {
     }
 
     pub fn try_accept(&self) -> Result<(Arc<TcpSocket>, smoltcp::wire::IpEndpoint), SystemError> {
-        // poll_ifaces();
         match self.inner.write().as_mut().expect("Tcp Inner is None") {
             Inner::Listening(listening) => listening.accept().map(|(stream, remote)| {
                 (
@@ -227,15 +226,8 @@ impl TcpSocket {
         }
     }
 
-    fn in_notify(&self) -> bool {
-        self.update_events();
-        // shouldn't pollee but just get the status of the socket
+    fn incoming(&self) -> bool {
         EP::from_bits_truncate(self.poll() as u32).contains(EP::EPOLLIN)
-    }
-
-    fn out_notify(&self) -> bool {
-        self.update_events();
-        EP::from_bits_truncate(self.poll() as u32).contains(EP::EPOLLOUT)
     }
 }
 
@@ -252,8 +244,17 @@ impl Socket for TcpSocket {
             })),
             Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
             Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
-            Inner::Established(established) => Ok(Endpoint::Ip(established.local_endpoint())),
+            Inner::Established(established) => Ok(Endpoint::Ip(established.get_name())),
             Inner::Listening(listening) => Ok(Endpoint::Ip(listening.get_name())),
+        }
+    }
+
+    fn get_peer_name(&self) -> Result<Endpoint, SystemError> {
+        match self.inner.read().as_ref().expect("Tcp Inner is None") {
+            Inner::Init(_) => Err(ENOTCONN),
+            Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_peer_name())),
+            Inner::Established(established) => Ok(Endpoint::Ip(established.get_peer_name())),
+            Inner::Listening(_) => Err(ENOTCONN),
         }
     }
 
@@ -261,7 +262,7 @@ impl Socket for TcpSocket {
         if let Endpoint::Ip(addr) = endpoint {
             return self.do_bind(addr);
         }
-        log::warn!("TcpSocket::bind: invalid endpoint");
+        log::debug!("TcpSocket::bind: invalid endpoint");
         return Err(EINVAL);
     }
 
@@ -295,7 +296,7 @@ impl Socket for TcpSocket {
             loop {
                 match self.try_accept() {
                     Err(EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.in_notify(), {})?;
+                        wq_wait_event_interruptible!(self.wait_queue, self.incoming(), {})?;
                     }
                     result => break result,
                 }

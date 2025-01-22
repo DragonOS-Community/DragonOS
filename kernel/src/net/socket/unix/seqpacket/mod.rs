@@ -471,12 +471,12 @@ impl Socket for SeqpacketSocket {
     }
 
     fn send_buffer_size(&self) -> usize {
-        log::warn!("using default buffer size");
+        // log::warn!("using default buffer size");
         SeqpacketSocket::DEFAULT_BUF_SIZE
     }
 
     fn recv_buffer_size(&self) -> usize {
-        log::warn!("using default buffer size");
+        // log::warn!("using default buffer size");
         SeqpacketSocket::DEFAULT_BUF_SIZE
     }
 

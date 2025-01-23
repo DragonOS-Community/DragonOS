@@ -78,28 +78,31 @@ impl UdpSocket {
             bound.close();
             inner.take();
         }
+        // unbound socket just drop (only need to free memory)
     }
 
     pub fn try_recv(
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
-        let received = match self.inner.read().as_ref().expect("Udp Inner is None") {
-            UdpInner::Bound(bound) => bound.try_recv(buf),
+        match self.inner.read().as_ref().expect("Udp Inner is None") {
+            UdpInner::Bound(bound) => {
+                let ret = bound.try_recv(buf);
+                poll_ifaces();
+                ret
+            }
             _ => Err(ENOTCONN),
-        };
-        poll_ifaces();
-        return received;
+        }
     }
 
     #[inline]
     pub fn can_recv(&self) -> bool {
-        self.on_events().contains(EP::EPOLLIN)
+        self.event().contains(EP::EPOLLIN)
     }
 
     #[inline]
     pub fn can_send(&self) -> bool {
-        self.on_events().contains(EP::EPOLLOUT)
+        self.event().contains(EP::EPOLLOUT)
     }
 
     pub fn try_send(
@@ -138,7 +141,7 @@ impl UdpSocket {
         }
     }
 
-    pub fn on_events(&self) -> EPollEventType {
+    pub fn event(&self) -> EPollEventType {
         let mut event = EPollEventType::empty();
         match self.inner.read().as_ref().unwrap() {
             UdpInner::Unbound(_) => {
@@ -154,8 +157,6 @@ impl UdpSocket {
 
                 if can_send {
                     event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
-                } else {
-                    todo!("缓冲区空间不够，需要使用信号处理");
                 }
             }
         }
@@ -169,7 +170,7 @@ impl Socket for UdpSocket {
     }
 
     fn poll(&self) -> usize {
-        self.on_events().bits() as usize
+        self.event().bits() as usize
     }
 
     fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
@@ -195,7 +196,9 @@ impl Socket for UdpSocket {
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(remote) = endpoint {
-            self.bind_emphemeral(remote.addr)?;
+            if !self.is_bound() {
+                self.bind_emphemeral(remote.addr)?;
+            }
             if let UdpInner::Bound(inner) = self.inner.read().as_ref().expect("UDP Inner disappear")
             {
                 inner.connect(remote);
@@ -271,6 +274,11 @@ impl Socket for UdpSocket {
             }
         }
         .map(|(len, remote)| (len, Endpoint::Ip(remote)));
+    }
+
+    fn close(&self) -> Result<(), SystemError> {
+        self.close();
+        Ok(())
     }
 }
 

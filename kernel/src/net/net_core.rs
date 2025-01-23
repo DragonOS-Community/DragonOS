@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, sync::Arc};
 use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
@@ -7,45 +7,23 @@ use crate::{
     driver::net::{Iface, Operstate},
     libs::rwlock::RwLockReadGuard,
     net::NET_DEVICES,
-    time::{
-        sleep::nanosleep,
-        timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
-        PosixTimeSpec,
-    },
+    time::{sleep::nanosleep, PosixTimeSpec},
 };
 
-/// The network poll function, which will be called by timer.
-///
-/// The main purpose of this function is to poll all network interfaces.
-#[derive(Debug)]
-#[allow(dead_code)]
-struct NetWorkPollFunc;
-
-impl TimerFunction for NetWorkPollFunc {
-    fn run(&mut self) -> Result<(), SystemError> {
-        poll_ifaces();
-        let next_time = next_n_ms_timer_jiffies(10);
-        let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
-        timer.activate();
-        return Ok(());
-    }
-}
-
 pub fn net_init() -> Result<(), SystemError> {
-    dhcp_query()?;
-    // Init poll timer function
-    // let next_time = next_n_ms_timer_jiffies(5);
-    // let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
-    // timer.activate();
-    return Ok(());
+    dhcp_query()
 }
 
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
-    // log::debug!("binding: {:?}", *binding);
-    //由于现在os未实现在用户态为网卡动态分配内存，而lo网卡的id最先分配且ip固定不能被分配
-    //所以特判取用id为1的网卡（也就是virtio_net）
-    let net_face = binding.get(&1).ok_or(SystemError::ENODEV)?.clone();
+
+    // Default iface, misspelled to net_face
+    let net_face = binding
+        .iter()
+        .find(|(_, iface)| iface.common().is_default_iface())
+        .unwrap()
+        .1
+        .clone();
 
     drop(binding);
 
@@ -149,7 +127,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 }
 
 pub fn poll_ifaces() {
-    log::debug!("poll_ifaces");
+    // log::debug!("poll_ifaces");
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
         warn!("poll_ifaces: No net driver found!");

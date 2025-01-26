@@ -5,6 +5,7 @@ use log::{error, info};
 use system_error::SystemError;
 
 use crate::{
+    define_event_trace, define_trace_point,
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
@@ -165,12 +166,15 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     return Ok(());
 }
 
+define_event_trace!(do_mkdir_at,path:&str,mode:FileMode,"mkdir at {} with mode {:?}");
+
 /// @brief 创建文件/文件夹
 pub fn do_mkdir_at(
     dirfd: i32,
     path: &str,
     mode: FileMode,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    trace_do_mkdir_at(path, mode);
     // debug!("Call do mkdir at");
     let (mut current_inode, path) =
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;

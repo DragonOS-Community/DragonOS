@@ -151,10 +151,11 @@ macro_rules! define_trace_point {
 
 #[macro_export]
 macro_rules! define_event_trace{
-     ($name:ident,$($arg:ident:$arg_type:ty),*, $print:literal) => {
-         define_trace_point!($name,$($arg:$arg_type),*);
-
-         paste::paste!{
+    ($name:ident,
+        ($($arg:ident:$arg_type:ty),*),
+        $fmt:expr) =>{
+        define_trace_point!($name,$($arg:$arg_type),*);
+        paste::paste!{
             #[derive(Debug)]
             #[repr(C)]
             #[allow(non_snake_case)]
@@ -171,8 +172,12 @@ macro_rules! define_event_trace{
                 print_func:[<trace_print_ $name>],
             };
             pub fn [<trace_print_ $name>](_data:&mut (dyn core::any::Any+Send+Sync),$($arg:$arg_type),* ){
-                println!($print $(,$arg)*);
+                 let time = $crate::time::Instant::now();
+                 let cpu_id = $crate::arch::cpu::current_cpu_id().data();
+                 let current_pid = $crate::process::ProcessManager::current_pcb().pid().data();
+                 let format = format!("[{}][{}][{}] {}\n",time,cpu_id,current_pid,$fmt);
+                 $crate::debug::tracing::trace_pipe::trace_pipe_push_record(format);
             }
         }
-     }
+    };
 }

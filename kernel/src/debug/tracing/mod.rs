@@ -1,7 +1,9 @@
 mod events;
+pub mod trace_pipe;
 pub mod tracepoint;
 
 use crate::debug::sysfs::debugfs_kset;
+use crate::debug::tracing::trace_pipe::TRACE_PIPE_MAX_RECORD;
 use crate::driver::base::kobject::KObject;
 use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback};
 use crate::filesystem::kernfs::KernFSInode;
@@ -33,6 +35,16 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
         None,
         Some(&TracingDirCallBack),
     )?;
+
+    tracing_root.add_file(
+        "trace_pipe".to_string(),
+        ModeType::from_bits_truncate(0o444),
+        Some(TRACE_PIPE_MAX_RECORD),
+        None,
+        Some(&trace_pipe::TracePipeCallBack),
+    )?;
+
+    trace_pipe::init_trace_pipe();
 
     events::init_events(events_root)?;
 

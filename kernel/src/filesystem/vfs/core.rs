@@ -156,7 +156,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
     let r = migrate_virtual_filesystem(fatfs);
     if r.is_err() {
-        error!("Failed to migrate virtual filesystem to FAT32!");
+        error!("Failed to migrate virtual filesyst  em to FAT32!");
         loop {
             spin_loop();
         }
@@ -166,8 +166,8 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     return Ok(());
 }
 
-define_event_trace!(do_mkdir_at,path:&str,mode:FileMode,"mkdir at {} with mode {:?}");
-
+define_event_trace!(do_mkdir_at,(path:&str,mode:FileMode),
+    format_args!("mkdir at {} with mode {:?}",path, mode));
 /// @brief 创建文件/文件夹
 pub fn do_mkdir_at(
     dirfd: i32,

@@ -24,7 +24,7 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
-    arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
+    arch::{interrupt::TrapFrame, MMArch},
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
@@ -232,7 +232,13 @@ impl Syscall {
                 Self::sbrk(increment).map(|vaddr: VirtAddr| vaddr.data())
             }
 
-            SYS_REBOOT => Self::reboot(),
+            SYS_REBOOT => {
+                let magic1 = args[0] as u32;
+                let magic2 = args[1] as u32;
+                let cmd = args[2] as u32;
+                let arg = args[3];
+                Self::reboot(magic1, magic2, cmd, arg)
+            }
 
             SYS_CHDIR => {
                 let r = args[0] as *const u8;
@@ -1252,10 +1258,5 @@ impl Syscall {
         let bb = back_color & 0x000000ff;
         print!("\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{s}\x1B[0m");
         return Ok(s.len());
-    }
-
-    pub fn reboot() -> Result<usize, SystemError> {
-        log::info!("reboot");
-        unsafe { cpu_reset() };
     }
 }

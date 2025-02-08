@@ -175,6 +175,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         break 'outer;
                     }
                 }
+                drop(rd_childen);
                 nanosleep(Duration::from_millis(100).into())?;
             }
         } else {

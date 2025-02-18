@@ -20,13 +20,13 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        return EventPoll::do_create_epoll(FileMode::empty());
+        return EventPoll::create_epoll(FileMode::empty());
     }
 
     pub fn epoll_create1(flag: usize) -> Result<usize, SystemError> {
         let flags = FileMode::from_bits_truncate(flag as u32);
 
-        let ret = EventPoll::do_create_epoll(flags);
+        let ret = EventPoll::create_epoll(flags);
         ret
     }
 
@@ -60,7 +60,7 @@ impl Syscall {
         )?;
 
         let epoll_events = epds_writer.buffer::<EPollEvent>(0)?;
-        return EventPoll::do_epoll_wait(epfd, epoll_events, max_events, timespec);
+        return EventPoll::epoll_wait(epfd, epoll_events, max_events, timespec);
     }
 
     pub fn epoll_ctl(epfd: i32, op: usize, fd: i32, event: VirtAddr) -> Result<usize, SystemError> {
@@ -84,7 +84,7 @@ impl Syscall {
             epds_reader.copy_one_from_user(&mut epds, 0)?;
         }
 
-        return EventPoll::do_epoll_ctl(epfd, op, fd, &mut epds, false);
+        return EventPoll::epoll_ctl_with_epfd(epfd, op, fd, &mut epds, false);
     }
 
     /// ## 在epoll_wait时屏蔽某些信号

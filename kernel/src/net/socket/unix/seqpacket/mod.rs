@@ -318,13 +318,14 @@ impl Socket for SeqpacketSocket {
             }
         };
 
-
+        //将socket状态置为Init
         *self.inner.write() = Inner::Init(Init::new());
-
+        //唤醒等待队列
         self.wait_queue.wakeup(None);
+        //抽象地址空间的资源回收
+        let _ = remove_abs_addr(&path);
 
         return Ok(());
-    
         
     }
 

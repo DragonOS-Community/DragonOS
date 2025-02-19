@@ -332,6 +332,28 @@ impl Socket for StreamSocket {
             return Ok(());
         }
         // TODO: 释放INODE_MAP相关资源
+        match self.get_name()? {
+            Endpoint::Unixpath((inode_id, _)) => {
+                // 从 INODE_MAP 中移除对应的 inode
+                let mut inode_guard = INODE_MAP.write_irqsave();
+                inode_guard.remove(&inode_id);
+            }
+            Endpoint::Abspath((abshandle, _)) => {
+                // 从 ABS_INODE_MAP 中移除对应的地址
+                let mut abs_inode_map = ABS_INODE_MAP.lock_irqsave();
+                abs_inode_map.remove(&abshandle.name());
+            }
+            _ => {
+                log::error!("Invalid endpoint in close");
+                return Err(SystemError::EINVAL);
+            }
+        }
+    
+        // 重置内部状态为初始状态
+        *self.inner.write() = Inner::Init(Init::new());
+    
+        // 唤醒等待队列中的等待者，防止阻塞
+        self.wait_queue.wakeup(None);
 
         // 尝试释放相关抽象地址资源
         let _ = remove_abs_addr(&path);

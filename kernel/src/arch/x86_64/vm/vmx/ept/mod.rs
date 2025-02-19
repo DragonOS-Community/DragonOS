@@ -278,7 +278,7 @@ impl EptPageMapper {
         };
     }
 
-    /// @brief 锁定内核映射器, 并返回一个内核映射器对象
+    /// 锁定内核映射器, 并返回一个内核映射器对象
     /// 目前只有这一个办法可以获得EptPageMapper对象
     #[inline(always)]
     pub fn lock() -> Self {
@@ -287,7 +287,7 @@ impl EptPageMapper {
         return Self::lock_cpu(cpuid);
     }
 
-    /// @brief: 检查有无gpa->hpa的映射
+    /// 检查有无gpa->hpa的映射
     #[no_mangle]
     pub fn is_mapped(&self, page_fault: &mut KvmPageFault) -> bool {
         let gpa = page_fault.gpa() as usize;

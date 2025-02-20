@@ -361,15 +361,6 @@ impl VirtCpu {
                 page_fault.map_writable = false;
                 return Ok(PFRet::Continue);
             }
-            /*
-             * 如果 APIC 访问页面存在但被禁用，则直接进行仿真，
-             * 而不缓存 MMIO 访问或创建 MMIO SPTE。
-             * 这样，当 AVIC 重新启用时，不需要清除缓存。
-             */
-            // if slot.get_id() == APIC_ACCESS_PAGE_PRIVATE_MEMSLOT && !self.kvm_apicv_activated()
-            // {
-            //     return PFRet::Emulate;
-            // }
         }
 
         // 尝试将 GFN 转换为 PFN

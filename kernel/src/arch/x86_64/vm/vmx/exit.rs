@@ -3,10 +3,7 @@ use system_error::SystemError;
 use x86::vmx::vmcs::{guest, ro};
 
 use crate::{
-    arch::{
-        kvm::vmx::{vmcs::VmcsFields, vmx_asm_wrapper::vmx_vmread},
-        vm::asm::{IntrInfo, VmxAsm},
-    },
+    arch::vm::asm::{IntrInfo, VmxAsm},
     virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
 };
 

@@ -6,13 +6,12 @@ use crate::arch::MMArch;
 use crate::libs::spinlock::SpinLockGuard;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::page::{
-    page_manager_lock_irqsave, EntryFlags, Page, PageEntry, PageFlush, PageManager,
+    page_manager_lock_irqsave, EntryFlags, PageEntry, PageFlags, PageFlush, PageManager, PageType,
 };
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::AtomicProcessorId;
 use crate::smp::cpu::ProcessorId;
-use alloc::sync::Arc;
 use core::ops::Add;
 use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
 use log::{debug, error, warn};
@@ -106,6 +105,7 @@ impl EptPageTable {
     }
 
     /// 获取第i个entry的虚拟内存空间
+    #[allow(dead_code)]
     pub fn entry_base(&self, i: usize) -> Option<VirtAddr> {
         if i < MMArch::PAGE_ENTRY_NUM {
             let shift = (self.level as usize - 1) * MMArch::PAGE_ENTRY_SHIFT + MMArch::PAGE_SHIFT;
@@ -205,6 +205,7 @@ impl EptPageTable {
 // }
 
 /// Check if MTRR is supported
+#[allow(dead_code)]
 pub fn check_ept_features() -> Result<(), SystemError> {
     const MTRR_ENABLE_BIT: u64 = 1 << 11;
     let ia32_mtrr_def_type = unsafe { msr::rdmsr(msr::IA32_MTRR_DEF_TYPE) };
@@ -360,14 +361,19 @@ impl EptPageMapper {
 
                 //分配一个entry的物理页
                 compiler_fence(Ordering::SeqCst);
-                let hpa: PhysAddr = unsafe { self.frame_allocator.allocate_one() }?;
-                debug!("Allocate hpa: {:?}", hpa);
+                // let hpa: PhysAddr = unsafe { self.frame_allocator.allocate_one() }?;
+                // debug!("Allocate hpa: {:?}", hpa);
                 // 修改全局页管理器
                 let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
                     page_manager_lock_irqsave();
-                if !page_manager_guard.contains(&hpa) {
-                    page_manager_guard.insert(hpa, &Arc::new(Page::new(false, hpa)))
-                }
+                let page = page_manager_guard
+                    .create_one_page(
+                        PageType::Normal,
+                        PageFlags::empty(),
+                        &mut self.frame_allocator,
+                    )
+                    .ok()?;
+                let hpa = page.phys_address();
                 drop(page_manager_guard);
                 // 清空这个页帧
                 unsafe {

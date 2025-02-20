@@ -1693,5 +1693,5 @@ impl KvmAsyncPageFault {
 pub enum KvmIntrType {
     None,
     Irq,
-    Nmi,
+    // Nmi,
 }

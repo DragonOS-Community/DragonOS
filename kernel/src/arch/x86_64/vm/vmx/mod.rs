@@ -1375,6 +1375,7 @@ impl Vmx {
     ];
 
     /// ### 查看CPU是否支持虚拟化
+    #[allow(dead_code)]
     pub fn check_vmx_support() -> bool {
         let cpuid = CpuId::new();
         // Check to see if CPU is Intel (“GenuineIntel”).
@@ -1564,7 +1565,7 @@ impl Vmx {
 
         return Ok(ctl);
     }
-
+    #[allow(dead_code)]
     fn adjust_vmx_controls64(ctl_opt: u32, msr: u32) -> u32 {
         let allow = unsafe { rdmsr(msr) } as u32;
         ctl_opt & allow
@@ -1584,7 +1585,7 @@ impl Vmx {
 
         return idx;
     }
-
+    #[allow(dead_code)]
     pub fn free_vpid(&self, vpid: Option<usize>) {
         if !self.enable_vpid || vpid.is_none() {
             return;

@@ -332,6 +332,7 @@ impl Vmx {
     }
 
     /// VPID 是否支持以单独地址方式进行范围
+    #[allow(dead_code)]
     #[inline]
     pub fn has_invvpid_individual_addr(&self) -> bool {
         return self.vmx_cap.vpid.contains(VpidFlag::EXTENT_INDIVIDUAL_ADDR);

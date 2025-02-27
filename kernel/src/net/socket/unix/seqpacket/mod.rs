@@ -297,11 +297,11 @@ impl Socket for SeqpacketSocket {
             Endpoint::Abspath((_, path)) => path,
             _ => return Err(SystemError::EINVAL),
         };
-    
+
         if path.is_empty() {
             return Ok(());
         }
-    
+
         match &endpoint {
             Endpoint::Unixpath((inode_id, _)) => {
                 let mut inode_guard = INODE_MAP.write_irqsave();
@@ -310,7 +310,8 @@ impl Socket for SeqpacketSocket {
             Endpoint::Inode((current_inode, current_path)) => {
                 let mut inode_guard = INODE_MAP.write_irqsave();
                 // 遍历查找匹配的条目
-                let target_entry = inode_guard.iter()
+                let target_entry = inode_guard
+                    .iter()
                     .find(|(_, ep)| {
                         if let Endpoint::Inode((map_inode, map_path)) = ep {
                             // 通过指针相等性比较确保是同一对象
@@ -319,11 +320,11 @@ impl Socket for SeqpacketSocket {
                             log::debug!("not match");
                             false
                         }
-                    });
+                    })
+                    .map(|(id, _)| *id);
 
-                if let Some((id, _)) = target_entry {
-                    let id_clone = id.clone();
-                    inode_guard.remove(&id_clone).ok_or(SystemError::EINVAL)?;
+                if let Some(id) = target_entry {
+                    inode_guard.remove(&id).ok_or(SystemError::EINVAL)?;
                 }
             }
             Endpoint::Abspath((abshandle, _)) => {
@@ -332,17 +333,16 @@ impl Socket for SeqpacketSocket {
             }
             _ => {
                 log::error!("invalid endpoint type");
-                return Err(SystemError::EINVAL)
+                return Err(SystemError::EINVAL);
             }
         }
-    
+
         *self.inner.write() = Inner::Init(Init::new());
         self.wait_queue.wakeup(None);
-    
+
         let _ = remove_abs_addr(path);
 
         return Ok(());
-        
     }
 
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {

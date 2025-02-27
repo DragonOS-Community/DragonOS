@@ -321,43 +321,58 @@ impl Socket for StreamSocket {
     fn close(&self) -> Result<(), SystemError> {
         self.shutdown.recv_shutdown();
         self.shutdown.send_shutdown();
-
-        let path = match self.get_name()? {
+    
+        let endpoint = self.get_name()?;
+        let path = match &endpoint {
             Endpoint::Inode((_, path)) => path,
+            Endpoint::Unixpath((_, path)) => path,
+            Endpoint::Abspath((_, path)) => path,
             _ => return Err(SystemError::EINVAL),
         };
-
-        //如果path是空的说明没有bind，不用释放相关映射资源
+    
         if path.is_empty() {
             return Ok(());
         }
-        // TODO: 释放INODE_MAP相关资源
-        match self.get_name()? {
+    
+        match &endpoint {
             Endpoint::Unixpath((inode_id, _)) => {
-                // 从 INODE_MAP 中移除对应的 inode
                 let mut inode_guard = INODE_MAP.write_irqsave();
-                inode_guard.remove(&inode_id);
+                inode_guard.remove(inode_id);
+            }
+            Endpoint::Inode((current_inode, current_path)) => {
+                let mut inode_guard = INODE_MAP.write_irqsave();
+                // 遍历查找匹配的条目
+                let target_entry = inode_guard.iter()
+                    .find(|(_, ep)| {
+                        if let Endpoint::Inode((map_inode, map_path)) = ep {
+                            // 通过指针相等性比较确保是同一对象
+                            Arc::ptr_eq(map_inode, current_inode) && map_path == current_path
+                        } else {
+                            false
+                        }
+                    });
+
+                if let Some((id, _)) = target_entry {
+                    let id_clone = id.clone();
+                    inode_guard.remove(&id_clone).ok_or(SystemError::EINVAL)?;
+                }
             }
             Endpoint::Abspath((abshandle, _)) => {
-                // 从 ABS_INODE_MAP 中移除对应的地址
                 let mut abs_inode_map = ABS_INODE_MAP.lock_irqsave();
                 abs_inode_map.remove(&abshandle.name());
             }
             _ => {
-                log::error!("Invalid endpoint in close");
+                log::error!("invalid endpoint type");
                 return Err(SystemError::EINVAL);
             }
         }
     
-        // 重置内部状态为初始状态
         *self.inner.write() = Inner::Init(Init::new());
-    
-        // 唤醒等待队列中的等待者，防止阻塞
         self.wait_queue.wakeup(None);
-
-        // 尝试释放相关抽象地址资源
-        let _ = remove_abs_addr(&path);
-        return Ok(());
+    
+        let _ = remove_abs_addr(path);
+    
+        Ok(())
     }
 
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {

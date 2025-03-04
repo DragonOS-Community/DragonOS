@@ -615,6 +615,24 @@ pub fn set_current_blocked(new_set: &mut SigSet) {
     __set_current_blocked(new_set);
 }
 
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=set_user_sigmask#set_user_sigmask
+/// 功能与set_current_blocked相同，多一步保存当前的sig_blocked到saved_sigmask
+/// 由于这之中设置了saved_sigmask，因此从系统调用返回之前需要恢复saved_sigmask
+pub fn set_user_sigmask(new_set: &mut SigSet) {
+    let pcb = ProcessManager::current_pcb();
+    let mut guard = pcb.sig_info_mut();
+    let oset = *guard.sig_blocked();
+
+    let flags = pcb.flags();
+    flags.set(ProcessFlags::RESTORE_SIG_MASK, true);
+
+    let saved_sigmask = guard.saved_sigmask_mut();
+    *saved_sigmask = oset;
+    drop(guard);
+
+    set_current_blocked(new_set);
+}
+
 /// 设置当前进程的屏蔽信号 (sig_block)
 ///
 /// ## 参数

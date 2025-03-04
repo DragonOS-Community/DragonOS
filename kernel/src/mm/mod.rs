@@ -155,7 +155,7 @@ pub enum PageTableKind {
 }
 
 /// 物理内存地址
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash, Default)]
 #[repr(transparent)]
 pub struct PhysAddr(usize);
 
@@ -277,7 +277,7 @@ impl core::ops::SubAssign<PhysAddr> for PhysAddr {
 }
 
 /// 虚拟内存地址
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash, Default)]
 #[repr(transparent)]
 pub struct VirtAddr(usize);
 

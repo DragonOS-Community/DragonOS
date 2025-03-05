@@ -8,17 +8,17 @@ use log::debug;
 use system_error::SystemError;
 
 use crate::{
-    arch::{vm::mmu::kvm_mmu::PAGE_SIZE, MMArch},
+    arch::{
+        vm::mmu::kvm_mmu::{PAGE_SHIFT, PAGE_SIZE},
+        MMArch,
+    },
     libs::{
         rbtree::RBTree,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{kernel_mapper::KernelMapper, page::EntryFlags, MemoryManagementArch, VirtAddr},
-    virt::{
-        kvm::host_mem::PAGE_SHIFT,
-        vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion},
-    },
+    virt::vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion},
 };
 
 use super::{LockedVm, Vm};

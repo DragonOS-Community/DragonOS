@@ -36,9 +36,6 @@ use core::fmt::Debug;
 
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
-use super::kvm::vmx::vmcs::VmcsFields;
-use super::kvm::vmx::vmx_asm_wrapper::vmx_vmread;
-
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
 
@@ -199,10 +196,8 @@ impl MemoryManagementArch for X86_64MMArch {
                 compiler_fence(Ordering::SeqCst);
                 return PhysAddr::new(cr3);
             }
-            PageTableKind::EPT => {
-                let eptp =
-                    vmx_vmread(VmcsFields::CTRL_EPTP_PTR as u32).expect("Failed to read eptp");
-                return PhysAddr::new(eptp as usize);
+            _ => {
+                todo!("Unsupported table kind: {:?}", table_kind);
             }
         }
     }

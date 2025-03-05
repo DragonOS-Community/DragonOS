@@ -2,7 +2,6 @@ use crate::arch::mm::X86_64MMArch;
 use crate::arch::vm::asm::VmxAsm;
 use crate::arch::vm::kvm_host::page::KVM_MIN_FREE_MMU_PAGES;
 use crate::mm::PhysAddr;
-use crate::virt::kvm::host_mem::PAGE_SHIFT;
 use crate::{
     arch::{mm::LockedFrameAllocator, MMArch, VirtCpuArch},
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -22,7 +21,7 @@ use x86_64::registers::control::EferFlags;
 
 use super::super::{vmx::vmx_info, x86_kvm_ops};
 use super::mmu_internal::KvmPageFault;
-
+pub const PAGE_SHIFT: u32 = 12;
 const PT64_ROOT_5LEVEL: usize = 5;
 const PT64_ROOT_4LEVEL: usize = 4;
 const PT32_ROOT_LEVEL: usize = 2;

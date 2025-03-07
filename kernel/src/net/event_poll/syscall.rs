@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::SigSet,
     filesystem::vfs::file::FileMode,
-    ipc::signal::set_current_blocked,
+    ipc::signal::{restore_saved_sigmask, set_user_sigmask},
     mm::VirtAddr,
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
@@ -96,13 +96,12 @@ impl Syscall {
         sigmask: &mut SigSet,
     ) -> Result<usize, SystemError> {
         // 设置屏蔽的信号
-        set_current_blocked(sigmask);
+        set_user_sigmask(sigmask);
 
         let wait_ret = Self::epoll_wait(epfd, epoll_event, max_events, timespec);
 
         if wait_ret.is_err() && *wait_ret.as_ref().unwrap_err() != SystemError::EINTR {
-            // TODO: 恢复信号?
-            // link：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/eventpoll.c#2294
+            restore_saved_sigmask();
         }
         wait_ret
     }

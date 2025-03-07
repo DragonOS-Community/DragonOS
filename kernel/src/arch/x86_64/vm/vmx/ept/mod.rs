@@ -227,7 +227,7 @@ pub struct EptPageMapper {
     /// EPT页表映射器
     //mapper: PageMapper,//PageTableKind::EPT, LockedFrameAllocator
     /// 标记当前映射器是否为只读
-    readonly: bool,
+    _readonly: bool,
     // EPT页表根地址
     root_page_addr: PhysAddr,
     /// 页分配器
@@ -273,7 +273,7 @@ impl EptPageMapper {
         let readonly = prev_count > 0;
         let root_page_addr = Self::root_page_addr();
         return Self {
-            readonly,
+            _readonly: readonly,
             root_page_addr,
             frame_allocator: LockedFrameAllocator,
         };

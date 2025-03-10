@@ -1,3 +1,4 @@
+#![allow(unused)]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use log::debug;

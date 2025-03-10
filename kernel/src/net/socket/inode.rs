@@ -30,6 +30,7 @@ impl IndexNode for Inode {
         data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         drop(data);
+        defer::defer!(log::debug!("write end."));
         self.inner.write(buf)
     }
 

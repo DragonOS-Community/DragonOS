@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::{bitmap_core::BitMapCore, traits::BitMapOps};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AllocBitmap {
     elements: usize,
     data: Vec<usize>,
@@ -25,6 +25,10 @@ impl AllocBitmap {
         for i in 0..rhs.data.len() {
             self.data[i] &= rhs.data[i];
         }
+    }
+
+    pub fn data(&self) -> &[usize] {
+        &self.data
     }
 }
 

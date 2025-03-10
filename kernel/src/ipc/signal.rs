@@ -69,6 +69,11 @@ impl Signal {
             warn!("Kill operation not support: pid={:?}", pid);
             return Err(SystemError::ENOSYS);
         }
+
+        // 暂时不支持发送信号给进程组
+        if pid.data() == 0 {
+            return Err(SystemError::ENOSYS);
+        }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 检查sig是否符合要求，如果不符合要求，则退出。
         if !self.is_valid() {
@@ -78,7 +83,7 @@ impl Signal {
         let pcb = ProcessManager::find(pid);
 
         if pcb.is_none() {
-            warn!("No such process.");
+            warn!("No such process: pid={:?}", pid);
             return retval;
         }
 

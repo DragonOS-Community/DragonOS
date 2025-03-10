@@ -31,7 +31,10 @@ use crate::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
     },
-    ipc::signal_types::{SigInfo, SigPending, SignalStruct},
+    ipc::{
+        signal::RestartBlock,
+        signal_types::{SigInfo, SigPending, SignalStruct},
+    },
     libs::{
         align::AlignedBox,
         casting::DowncastArc,
@@ -712,6 +715,8 @@ pub struct ProcessControlBlock {
     /// 进程作为主体的凭证集
     cred: SpinLock<Cred>,
     self_ref: Weak<ProcessControlBlock>,
+
+    restart_block: SpinLock<Option<RestartBlock>>,
 }
 
 impl ProcessControlBlock {
@@ -799,6 +804,7 @@ impl ProcessControlBlock {
             nsproxy: Arc::new(RwLock::new(NsProxy::new())),
             cred: SpinLock::new(cred),
             self_ref: Weak::new(),
+            restart_block: SpinLock::new(None),
         };
 
         pcb.sig_info.write().set_tty(tty);
@@ -1116,6 +1122,18 @@ impl ProcessControlBlock {
 
     pub fn threads_read_irqsave(&self) -> RwLockReadGuard<ThreadInfo> {
         self.thread.read_irqsave()
+    }
+
+    pub fn restart_block(&self) -> SpinLockGuard<Option<RestartBlock>> {
+        self.restart_block.lock()
+    }
+
+    pub fn set_restart_fn(
+        &self,
+        restart_block: Option<RestartBlock>,
+    ) -> Result<usize, SystemError> {
+        *self.restart_block.lock() = restart_block;
+        return Err(SystemError::ERESTART_RESTARTBLOCK);
     }
 }
 

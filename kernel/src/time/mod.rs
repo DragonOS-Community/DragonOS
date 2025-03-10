@@ -270,6 +270,24 @@ impl Instant {
     pub const fn total_micros(&self) -> i64 {
         self.micros
     }
+
+    /// Returns the duration between this instant and another one.
+    ///
+    /// # Arguments
+    ///
+    /// * `earlier` - The earlier instant to calculate the duration since.
+    ///
+    /// # Returns
+    ///
+    /// An `Option<Duration>` representing the duration between this instant and the earlier one.
+    /// If the earlier instant is later than this one, it returns `None`.
+    pub fn duration_since(&self, earlier: Instant) -> Option<Duration> {
+        if earlier.micros > self.micros {
+            return None;
+        }
+        let micros_diff = self.micros - earlier.micros;
+        Some(Duration::from_micros(micros_diff as u64))
+    }
 }
 
 impl fmt::Display for Instant {

@@ -548,8 +548,18 @@ impl Syscall {
     }
 
     pub fn restart_syscall() -> Result<usize, SystemError> {
-        // todo: https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#2998
-        unimplemented!("restart_syscall with restart block");
-        // Err(SystemError::ENOSYS)
+        let restart_block = ProcessManager::current_pcb().restart_block().take();
+        if let Some(mut restart_block) = restart_block {
+            return restart_block.restart_fn.call(&mut restart_block.data);
+        } else {
+            // 不应该走到这里，因此kill掉当前进程及同组的进程
+            let pid = Pid::new(0);
+            let sig = Signal::SIGKILL;
+            let mut info = SigInfo::new(sig, 0, SigCode::Kernel, SigType::Kill(pid));
+
+            sig.send_signal_info(Some(&mut info), pid)
+                .expect("Failed to kill ");
+            return Ok(0);
+        }
     }
 }

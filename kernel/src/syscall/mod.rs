@@ -879,8 +879,10 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_POLL => {
-                warn!("SYS_POLL has not yet been implemented");
-                Ok(0)
+                let fds = args[0];
+                let nfds = args[1] as u32;
+                let timeout = args[2] as i32;
+                Self::poll(fds, nfds, timeout)
             }
 
             SYS_SETPGID => {

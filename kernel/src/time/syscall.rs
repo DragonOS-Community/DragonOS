@@ -79,6 +79,7 @@ impl Syscall {
         if sleep_time.is_null() {
             return Err(SystemError::EFAULT);
         }
+
         let slt_spec = PosixTimeSpec {
             tv_sec: unsafe { *sleep_time }.tv_sec,
             tv_nsec: unsafe { *sleep_time }.tv_nsec,

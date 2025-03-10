@@ -144,7 +144,7 @@
     "rust-analyzer.checkOnSave.allTargets": false,
     "rust-analyzer.linkedProjects": [
         "./kernel/Cargo.toml",
-        "./tools/Cargo.toml",
+        //"./tools/Cargo.toml",
     
     ],
     // "rust-analyzer.cargo.target": "riscv64gc-unknown-none-elf",
@@ -154,4 +154,5 @@
         "check",
         
     ],
+    "makefile.configureOnOpen": false,
 }

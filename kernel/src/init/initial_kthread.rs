@@ -22,7 +22,12 @@ use crate::{
 
 use super::{cmdline::kenrel_cmdline_param_manager, initcall::do_initcalls};
 
-const INIT_PROC_TRYLIST: [&str; 3] = ["/bin/dragonreach", "/bin/init", "/bin/sh"];
+const INIT_PROC_TRYLIST: [(&str, Option<&str>); 4] = [
+    ("/bin/dragonreach", None),
+    ("/bin/init", None),
+    ("/bin/sh", None),
+    ("/bin/busybox", Some("init")),
+];
 
 pub fn initial_kernel_thread() -> i32 {
     kernel_init().unwrap_or_else(|err| {
@@ -88,6 +93,7 @@ fn switch_to_user() -> ! {
         try_to_run_init_process(
             path.as_c_str().to_str().unwrap(),
             &mut proc_init_info,
+            &None,
             &mut trap_frame,
         )
         .unwrap_or_else(|e| {
@@ -98,8 +104,9 @@ fn switch_to_user() -> ! {
         });
     } else {
         let mut ok = false;
-        for path in INIT_PROC_TRYLIST.iter() {
-            if try_to_run_init_process(path, &mut proc_init_info, &mut trap_frame).is_ok() {
+        for (path, ext_args) in INIT_PROC_TRYLIST.iter() {
+            if try_to_run_init_process(path, &mut proc_init_info, ext_args, &mut trap_frame).is_ok()
+            {
                 ok = true;
                 break;
             }
@@ -118,10 +125,22 @@ fn switch_to_user() -> ! {
 fn try_to_run_init_process(
     path: &str,
     proc_init_info: &mut ProcInitInfo,
+    ext_args: &Option<&str>,
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
+    let mut args_to_insert = alloc::vec::Vec::new();
+    args_to_insert.push(CString::new(path).unwrap());
+
+    if let Some(ext_args) = ext_args {
+        // Split ext_args by whitespace and trim each part
+        for arg in ext_args.split_whitespace() {
+            args_to_insert.push(CString::new(arg.trim()).unwrap());
+        }
+    }
     proc_init_info.proc_name = CString::new(path).unwrap();
-    proc_init_info.args.insert(0, CString::new(path).unwrap());
+    let elements_to_remove = args_to_insert.len();
+    let old_args = core::mem::replace(&mut proc_init_info.args, args_to_insert);
+    proc_init_info.args.extend(old_args);
     if let Err(e) = run_init_process(proc_init_info, trap_frame) {
         if e != SystemError::ENOENT {
             error!(
@@ -130,12 +149,12 @@ fn try_to_run_init_process(
             );
         }
 
-        proc_init_info.args.remove(0);
+        proc_init_info.args.drain(0..elements_to_remove);
         return Err(e);
     }
+
     Ok(())
 }
-
 fn run_init_process(
     proc_init_info: &ProcInitInfo,
     trap_frame: &mut TrapFrame,

@@ -295,7 +295,7 @@ impl EventPoll {
         op: EPollCtlOption,
         dstfd: i32,
         dst_file: Arc<File>,
-        epds: &mut EPollEvent,
+        mut epds: EPollEvent,
         nonblock: bool,
     ) -> Result<usize, SystemError> {
         // 检查是否允许 EPOLLWAKEUP
@@ -362,7 +362,7 @@ impl EventPoll {
                     // 设置epoll
                     let epitem = Arc::new(EPollItem::new(
                         Arc::downgrade(&epoll_data.epoll.0),
-                        *epds,
+                        epds,
                         dstfd,
                         Arc::downgrade(&dst_file),
                     ));
@@ -386,7 +386,7 @@ impl EventPoll {
                         epds.events |=
                             EPollEventType::EPOLLERR.bits() | EPollEventType::EPOLLHUP.bits();
 
-                        Self::ep_modify(&mut epoll_guard, ep_item, epds)?;
+                        Self::ep_modify(&mut epoll_guard, ep_item, &epds)?;
                     }
                 }
             }
@@ -399,7 +399,7 @@ impl EventPoll {
         epfd: i32,
         op: EPollCtlOption,
         dstfd: i32,
-        epds: &mut EPollEvent,
+        epds: EPollEvent,
         nonblock: bool,
     ) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
@@ -423,7 +423,7 @@ impl EventPoll {
         ep_file: Arc<File>,
         op: EPollCtlOption,
         dstfd: i32,
-        epds: &mut EPollEvent,
+        epds: EPollEvent,
         nonblock: bool,
     ) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
@@ -454,10 +454,10 @@ impl EventPoll {
             .ok_or(SystemError::EBADF)?;
 
         drop(fd_table_guard);
-        Self::do_epoll_wait(ep_file, epoll_event, max_events, timespec)
+        Self::epoll_wait_with_file(ep_file, epoll_event, max_events, timespec)
     }
     /// ## epoll_wait的具体实现
-    fn do_epoll_wait(
+    pub fn epoll_wait_with_file(
         ep_file: Arc<File>,
         epoll_event: &mut [EPollEvent],
         max_events: i32,
@@ -485,6 +485,9 @@ impl EventPoll {
                     // 非阻塞情况
                     timeout = true;
                 }
+            } else if timespec.is_none() {
+                // 非阻塞情况
+                timeout = true;
             }
             // 判断epoll上有没有就绪事件
             let mut available = epoll_guard.ep_events_available();
@@ -555,6 +558,7 @@ impl EventPoll {
                 })?;
                 drop(guard);
                 schedule(SchedMode::SM_NONE);
+
                 // 被唤醒后,检查是否有事件可读
                 available = epoll.0.lock_irqsave().ep_events_available();
                 if let Some(timer) = timer {
@@ -583,6 +587,9 @@ impl EventPoll {
         user_event: &mut [EPollEvent],
         max_events: i32,
     ) -> Result<usize, SystemError> {
+        if user_event.len() < max_events as usize {
+            return Err(SystemError::EINVAL);
+        }
         let mut ep_guard = epoll.0.lock_irqsave();
         let mut res: usize = 0;
 
@@ -791,7 +798,6 @@ impl EventPoll {
                 let binding = epitem.clone();
                 let event_guard = binding.event().read();
                 let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
-
                 // 检查事件合理性以及是否有感兴趣的事件
                 if !(ep_events
                     .difference(EPollEventType::EP_PRIVATE_BITS)

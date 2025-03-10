@@ -1,4 +1,4 @@
-use core::sync::atomic::compiler_fence;
+use core::{fmt::Debug, sync::atomic::compiler_fence};
 
 use alloc::sync::Arc;
 use log::warn;
@@ -8,9 +8,11 @@ use crate::{
     arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
     ipc::signal_types::SigactionType,
     libs::spinlock::SpinLockGuard,
+    mm::VirtAddr,
     process::{
         pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo,
     },
+    time::Instant,
 };
 
 use super::signal_types::{
@@ -645,4 +647,46 @@ pub fn set_sigprocmask(how: SigHow, set: SigSet) -> Result<SigSet, SystemError> 
 
     __set_current_blocked(&res_set);
     Ok(oset)
+}
+
+#[derive(Debug)]
+pub struct RestartBlock {
+    pub data: RestartBlockData,
+    pub restart_fn: &'static dyn RestartFn,
+}
+
+impl RestartBlock {
+    pub fn new(restart_fn: &'static dyn RestartFn, data: RestartBlockData) -> Self {
+        Self { data, restart_fn }
+    }
+}
+
+pub trait RestartFn: Debug + Sync + Send + 'static {
+    fn call(&self, data: &mut RestartBlockData) -> Result<usize, SystemError>;
+}
+
+#[derive(Debug, Clone)]
+pub enum RestartBlockData {
+    Poll(PollRestartBlockData),
+    // todo: nanosleep
+    Nanosleep(),
+    // todo: futex_wait
+    FutexWait(),
+}
+
+impl RestartBlockData {
+    pub fn new_poll(pollfd_ptr: VirtAddr, nfds: u32, timeout_instant: Option<Instant>) -> Self {
+        Self::Poll(PollRestartBlockData {
+            pollfd_ptr,
+            nfds,
+            timeout_instant,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PollRestartBlockData {
+    pub pollfd_ptr: VirtAddr,
+    pub nfds: u32,
+    pub timeout_instant: Option<Instant>,
 }

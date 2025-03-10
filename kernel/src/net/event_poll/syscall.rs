@@ -84,7 +84,7 @@ impl Syscall {
             epds_reader.copy_one_from_user(&mut epds, 0)?;
         }
 
-        return EventPoll::epoll_ctl_with_epfd(epfd, op, fd, &mut epds, false);
+        return EventPoll::epoll_ctl_with_epfd(epfd, op, fd, epds, false);
     }
 
     /// ## 在epoll_wait时屏蔽某些信号

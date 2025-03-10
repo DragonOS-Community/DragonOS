@@ -290,19 +290,58 @@ impl Socket for SeqpacketSocket {
         self.shutdown.recv_shutdown();
         self.shutdown.send_shutdown();
 
-        let path = match self.get_name()? {
+        let endpoint = self.get_name()?;
+        let path = match &endpoint {
             Endpoint::Inode((_, path)) => path,
+            Endpoint::Unixpath((_, path)) => path,
+            Endpoint::Abspath((_, path)) => path,
             _ => return Err(SystemError::EINVAL),
         };
 
-        //如果path是空的说明没有bind，不用释放相关映射资源
         if path.is_empty() {
             return Ok(());
         }
-        // TODO: 释放INODE_MAP相关资源
 
-        // 尝试释放相关抽象地址资源
-        let _ = remove_abs_addr(&path);
+        match &endpoint {
+            Endpoint::Unixpath((inode_id, _)) => {
+                let mut inode_guard = INODE_MAP.write_irqsave();
+                inode_guard.remove(inode_id);
+            }
+            Endpoint::Inode((current_inode, current_path)) => {
+                let mut inode_guard = INODE_MAP.write_irqsave();
+                // 遍历查找匹配的条目
+                let target_entry = inode_guard
+                    .iter()
+                    .find(|(_, ep)| {
+                        if let Endpoint::Inode((map_inode, map_path)) = ep {
+                            // 通过指针相等性比较确保是同一对象
+                            Arc::ptr_eq(map_inode, current_inode) && map_path == current_path
+                        } else {
+                            log::debug!("not match");
+                            false
+                        }
+                    })
+                    .map(|(id, _)| *id);
+
+                if let Some(id) = target_entry {
+                    inode_guard.remove(&id).ok_or(SystemError::EINVAL)?;
+                }
+            }
+            Endpoint::Abspath((abshandle, _)) => {
+                let mut abs_inode_map = ABS_INODE_MAP.lock_irqsave();
+                abs_inode_map.remove(&abshandle.name());
+            }
+            _ => {
+                log::error!("invalid endpoint type");
+                return Err(SystemError::EINVAL);
+            }
+        }
+
+        *self.inner.write() = Inner::Init(Init::new());
+        self.wait_queue.wakeup(None);
+
+        let _ = remove_abs_addr(path);
+
         return Ok(());
     }
 

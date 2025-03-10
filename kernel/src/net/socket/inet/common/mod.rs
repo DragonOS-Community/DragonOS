@@ -53,11 +53,11 @@ impl BoundInner {
                 })
                 .expect("No default interface");
 
-            let handle = iface.sockets().lock_no_preempt().add(socket);
+            let handle = iface.sockets().lock_irqsave().add(socket);
             return Ok(Self { handle, iface });
         } else {
             let iface = get_iface_to_bind(address).ok_or(ENODEV)?;
-            let handle = iface.sockets().lock_no_preempt().add(socket);
+            let handle = iface.sockets().lock_irqsave().add(socket);
             return Ok(Self { handle, iface });
         }
     }

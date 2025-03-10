@@ -138,7 +138,9 @@ fn test_stream() -> Result<(), Error> {
         send_message(client_fd, MSG2).expect("Failed to send message");
         println!("Server send finish");
 
+        println!("Server begin close!");
         unsafe { close(server_fd) };
+        println!("Server close finish!");
     });
 
     let client_fd = create_stream_socket()?;

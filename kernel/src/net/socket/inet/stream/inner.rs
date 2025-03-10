@@ -268,6 +268,15 @@ impl Connecting {
                     .expect("A Connecting Tcp With No Local Endpoint")
             })
     }
+
+    pub fn get_peer_name(&self) -> smoltcp::wire::IpEndpoint {
+        self.inner
+            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+                socket
+                    .remote_endpoint()
+                    .expect("A Connecting Tcp With No Remote Endpoint")
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -355,6 +364,13 @@ impl Listening {
             .port_manager()
             .unbind_port(Types::Tcp, port);
     }
+
+    pub fn release(&self) {
+        // log::debug!("Release Listening Socket");
+        for inner in self.inners.iter() {
+            inner.release();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -370,10 +386,6 @@ impl Established {
         self.inner.with_mut(f)
     }
 
-    pub fn with<R, F: Fn(&smoltcp::socket::tcp::Socket<'static>) -> R>(&self, f: F) -> R {
-        self.inner.with(f)
-    }
-
     pub fn close(&self) {
         self.inner
             .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
@@ -384,13 +396,13 @@ impl Established {
         self.inner.release();
     }
 
-    pub fn local_endpoint(&self) -> smoltcp::wire::IpEndpoint {
+    pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {
         self.inner
             .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.local_endpoint())
             .unwrap()
     }
 
-    pub fn remote_endpoint(&self) -> smoltcp::wire::IpEndpoint {
+    pub fn get_peer_name(&self) -> smoltcp::wire::IpEndpoint {
         self.inner
             .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.remote_endpoint().unwrap())
     }

@@ -204,7 +204,7 @@ impl phy::Device for LoopbackDriver {
         let mut result = phy::DeviceCapabilities::default();
         result.max_transmission_unit = 65535;
         result.max_burst_size = Some(1);
-        result.medium = smoltcp::phy::Medium::Ethernet;
+        result.medium = smoltcp::phy::Medium::Ip;
         return result;
     }
     /// ## Loopback驱动处理接受数据事件
@@ -284,9 +284,11 @@ impl LoopbackInterface {
     pub fn new(mut driver: LoopbackDriver) -> Arc<Self> {
         let iface_id = generate_iface_id();
 
-        let hardware_addr = HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ]));
+        // let hardware_addr = HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([
+        //     0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // ]));
+
+        let hardware_addr = HardwareAddress::Ip;
 
         let mut iface_config = smoltcp::iface::Config::new(hardware_addr);
 

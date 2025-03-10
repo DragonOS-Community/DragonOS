@@ -285,6 +285,14 @@ impl IfaceCommon {
         self.bounds.write().push(socket);
     }
 
+    pub fn unbind_socket(&self, socket: Arc<dyn InetSocket>) {
+        let mut bounds = self.bounds.write();
+        if let Some(index) = bounds.iter().position(|s| Arc::ptr_eq(s, &socket)) {
+            bounds.remove(index);
+            log::debug!("unbind socket success");
+        }
+    }
+
     // TODO: 需要在inet实现多网卡监听或路由子系统实现后移除
     pub fn is_default_iface(&self) -> bool {
         self.default_iface

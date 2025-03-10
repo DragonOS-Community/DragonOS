@@ -33,16 +33,14 @@ impl UnboundUdp {
     }
 
     pub fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<BoundUdp, SystemError> {
-        // let (addr, port) = (local_endpoint.addr, local_endpoint.port);
-        // if self.socket.bind(local_endpoint).is_err() {
-        //     log::debug!("bind failed!");
-        //     return Err(EINVAL);
-        // }
         let inner = BoundInner::bind(self.socket, &local_endpoint.addr)?;
         let bind_addr = local_endpoint.addr;
         let bind_port = if local_endpoint.port == 0 {
             inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?
         } else {
+            inner
+                .port_manager()
+                .bind_port(InetTypes::Udp, local_endpoint.port)?;
             local_endpoint.port
         };
 
@@ -76,10 +74,6 @@ impl UnboundUdp {
             inner,
             remote: SpinLock::new(Some(endpoint)),
         })
-    }
-
-    pub fn close(&mut self) {
-        self.socket.close();
     }
 }
 

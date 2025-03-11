@@ -1,5 +1,5 @@
 > [!TIP]
-> # 👋 大家好哇！欢迎来到 2025 OSCOMP DragonOS 仓库！
+> # 👋 欢迎来到 2025 OSCOMP DragonOS ～
 > 欢迎大家使用 DragonOS 作为内核实现赛道的基座系统！
 > ## OSCOMP Roadmap
 > 目前 DragonOS 正在紧锣密鼓适配 OSCOMP 的基座需求，同时也欢迎大家围绕下列部分添加实现～

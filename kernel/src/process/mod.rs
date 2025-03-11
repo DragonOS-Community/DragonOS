@@ -1596,6 +1596,7 @@ pub fn process_init() {
 pub struct ProcessSignalInfo {
     // 当前进程被屏蔽的信号
     sig_blocked: SigSet,
+    // 暂存旧信号，用于恢复
     saved_sigmask: SigSet,
     // sig_pending 中存储当前线程要处理的信号
     sig_pending: SigPending,

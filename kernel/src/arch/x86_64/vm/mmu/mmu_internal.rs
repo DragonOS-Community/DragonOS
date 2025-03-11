@@ -1,4 +1,4 @@
-use crate::mm::page::EntryFlags;
+use crate::{arch::vm::mmu::kvm_mmu::PAGE_SHIFT, mm::page::EntryFlags};
 use alloc::sync::Arc;
 use core::{intrinsics::unlikely, ops::Index};
 use log::{debug, warn};
@@ -18,14 +18,11 @@ use crate::{
         MMArch,
     },
     mm::PhysAddr,
-    virt::{
-        kvm::host_mem::PAGE_SHIFT,
-        vm::kvm_host::{
-            mem::{LockedKvmMemSlot, LockedVmMemSlotSet, UserMemRegionFlag, __gfn_to_pfn_memslot},
-            search_memslots,
-            vcpu::VirtCpu,
-            Vm,
-        },
+    virt::vm::kvm_host::{
+        mem::{LockedKvmMemSlot, LockedVmMemSlotSet, UserMemRegionFlag, __gfn_to_pfn_memslot},
+        search_memslots,
+        vcpu::VirtCpu,
+        Vm,
     },
 };
 

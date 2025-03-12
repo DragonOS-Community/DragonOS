@@ -122,6 +122,11 @@ impl BoundUdp {
         })
     }
 
+    #[inline]
+    pub fn can_recv(&self) -> bool {
+        self.with_socket(|socket| socket.can_recv())
+    }
+
     pub fn try_send(
         &self,
         buf: &[u8],

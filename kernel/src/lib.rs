@@ -1,6 +1,5 @@
 #![no_main] // <1>
 #![feature(alloc_error_handler)]
-#![feature(new_zeroed_alloc)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
 #![feature(concat_idents)]

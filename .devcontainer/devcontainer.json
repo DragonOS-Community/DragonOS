@@ -1,0 +1,16 @@
+{
+    "name": "OSCOMP Container",
+    "image": "docker.educg.net/cg/os-contest:20250226",
+    "runArgs": [
+        "--privileged"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "ms-vscode.cpptools",
+                "tamasfe.even-better-toml"
+            ]
+        }
+    }
+}

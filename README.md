@@ -1,3 +1,18 @@
+> [!TIP]
+> # 👋 欢迎来到 2025 OSCOMP DragonOS ～
+> 欢迎大家使用 DragonOS 作为内核实现赛道的基座系统！
+> ## OSCOMP Roadmap
+> 目前 DragonOS 正在紧锣密鼓适配 OSCOMP 的基座需求，同时也欢迎大家围绕下列部分添加实现～
+> - [ ] RISC-V
+>   - [ ] VirtIO base TTY
+>   - [x] Bootable Kernel
+> - [ ] LoongArch
+> - [ ] ext4 (正在实现)
+> - [ ] 优化启动内存序，允许qemu -kernel启动
+> - [ ] busybox (DragonOS使用的是NovaShell)
+
+</br>
+</br>
 <div align="center">
   <img width="40%" src="docs/_static/dragonos-logo.svg" alt="dragonos-logo"></br>
   <h2>打造完全自主可控的数字化未来！</h2>

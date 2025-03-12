@@ -1,4 +1,6 @@
-use core::{default, sync::atomic::AtomicU8};
+// TODO: 其他模块需要实现shutdown的具体逻辑
+#![allow(dead_code)]
+use core::sync::atomic::AtomicU8;
 
 use system_error::SystemError;
 

@@ -319,29 +319,26 @@ impl Syscall {
     ///
     /// @return 成功返回接收的字节数，失败返回错误码
     pub fn recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usize, SystemError> {
-        todo!("recvmsg, fd={}, msg={:?}, flags={}", fd, msg, flags);
-        // // 检查每个缓冲区地址是否合法，生成iovecs
-        // let mut iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        // 检查每个缓冲区地址是否合法，生成iovecs
+        let mut iovs = unsafe {
+            crate::filesystem::vfs::syscall::IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)?
+        };
 
-        // let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
-        //     .get_socket(fd as i32)
-        //     .ok_or(SystemError::EBADF)?;
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+            .get_socket(fd as i32)
+            .ok_or(SystemError::EBADF)?;
 
-        // let flags = socket::PMSG::from_bits_truncate(flags as u32);
+        let flags = socket::PMSG::from_bits_truncate(flags);
 
-        // let mut buf = iovs.new_buf(true);
-        // // 从socket中读取数据
-        // let recv_size = socket.recv_msg(&mut buf, flags)?;
-        // drop(socket);
+        let mut buf = iovs.new_buf(true);
+        // 从socket中读取数据
+        let recv_size = socket.recv(&mut buf, flags)?;
+        drop(socket);
 
-        // // 将数据写入用户空间的iovecs
-        // iovs.scatter(&buf[..recv_size]);
+        // 将数据写入用户空间的iovecs
+        iovs.scatter(&buf[..recv_size]);
 
-        // // let sockaddr_in = SockAddr::from(endpoint);
-        // // unsafe {
-        // //     sockaddr_in.write_to_user(msg.msg_name, &mut msg.msg_namelen)?;
-        // // }
-        // return Ok(recv_size);
+        return Ok(recv_size);
     }
 
     /// @brief sys_listen系统调用的实际执行函数

@@ -101,6 +101,7 @@ impl UdpSocket {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn can_send(&self) -> bool {
         self.event().contains(EP::EPOLLOUT)
     }
@@ -128,17 +129,6 @@ impl UdpSocket {
         };
         poll_ifaces();
         return result;
-    }
-
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        if self.is_nonblock() {
-            return self.try_recv(buf).map(|(size, _)| size);
-        } else {
-            // return self
-            //     .wait_queue
-            //     .busy_wait(EP::EPOLLIN, || self.try_recv(buf).map(|(size, _)| size));
-            todo!()
-        }
     }
 
     pub fn event(&self) -> EPollEventType {

@@ -13,5 +13,4 @@ mod bitmap_core;
 mod static_bitmap;
 pub mod traits;
 pub use alloc_bitmap::AllocBitmap;
-pub use bitmap_core::BitMapCore;
 pub use static_bitmap::StaticBitmap;

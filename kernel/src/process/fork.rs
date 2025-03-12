@@ -75,6 +75,8 @@ bitflags! {
         const CLONE_NEWNET = 0x40000000;
         /// 在新的 I/O 上下文中运行它
         const CLONE_IO = 0x80000000;
+        /// 克隆时，与父进程共享信号结构体
+        const CLONE_SIGNAL = 0x00010000 | 0x00000800;
         /// 克隆时，将原本被设置为SIG_IGNORE的信号，设置回SIG_DEFAULT
         const CLONE_CLEAR_SIGHAND = 0x100000000;
     }
@@ -345,11 +347,8 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
-
-        if (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS)
-            == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
-            || (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
-                == (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
+        if (clone_flags == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
+            || clone_flags == (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
         {
             return Err(SystemError::EINVAL);
         }
@@ -374,7 +373,7 @@ impl ProcessManager {
         // 如果新进程使用不同的 pid 或 namespace，
         // 则不允许它与分叉任务共享线程组。
         if clone_flags.contains(CloneFlags::CLONE_THREAD)
-            && !((clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID)).is_empty())
+            && clone_flags.contains(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID)
         {
             return Err(SystemError::EINVAL);
             // TODO: 判断新进程与当前进程namespace是否相同，不同则返回错误
@@ -382,12 +381,12 @@ impl ProcessManager {
 
         // 如果新进程将处于不同的time namespace，
         // 则不能让它共享vm或线程组。
-        if !((clone_flags & (CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM)).is_empty()) {
+        if clone_flags.contains(CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM) {
             // TODO: 判断time namespace，不同则返回错误
         }
 
         if clone_flags.contains(CloneFlags::CLONE_PIDFD)
-            && !((clone_flags & (CloneFlags::CLONE_DETACHED | CloneFlags::CLONE_THREAD)).is_empty())
+            && clone_flags.contains(CloneFlags::CLONE_DETACHED | CloneFlags::CLONE_THREAD)
         {
             return Err(SystemError::EINVAL);
         }
@@ -484,8 +483,6 @@ impl ProcessManager {
             )?;
             *pcb.thread_pid.write() = new_pid;
         }
-
-        // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {
             pcb.thread.write_irqsave().group_leader =
@@ -496,15 +493,14 @@ impl ProcessManager {
             }
         } else {
             pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
-
-            let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
             unsafe {
-                (*ptr).tgid = pcb.pid;
+                let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+                (*ptr).tgid = pcb.tgid;
             }
         }
 
         // CLONE_PARENT re-uses the old parent
-        if !((clone_flags & (CloneFlags::CLONE_PARENT | CloneFlags::CLONE_THREAD)).is_empty()) {
+        if clone_flags.contains(CloneFlags::CLONE_PARENT | CloneFlags::CLONE_THREAD) {
             *pcb.real_parent_pcb.write_irqsave() =
                 current_pcb.real_parent_pcb.read_irqsave().clone();
 

@@ -88,7 +88,7 @@ fn tdp_get_cr3(_vcpu: &VmxVcpu) -> u64 {
     return guest_cr3;
 }
 
-pub fn tdp_set_eptp(root_hpa: u64) -> Result<(), SystemError> {
+fn tdp_set_eptp(root_hpa: u64) -> Result<(), SystemError> {
     // 设置权限位，目前是写死的，可读可写可执行
     //  EPT paging-structure memory type: Uncacheable
     let mut eptp = 0x0_u64;

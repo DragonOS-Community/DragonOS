@@ -157,7 +157,7 @@ impl Timer {
         let expire_jiffies = inner_guard.expire_jiffies;
         let self_arc = inner_guard.self_ref.upgrade().unwrap();
         drop(inner_guard);
-        let mut split_pos: usize = timer_list.len();
+        let mut split_pos: usize = 0;
         for (pos, elt) in timer_list.iter().enumerate() {
             if Arc::ptr_eq(&self_arc, &elt.1) {
                 warn!("Timer already in list");

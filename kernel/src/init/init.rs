@@ -92,11 +92,8 @@ fn do_start_kernel() {
     Futex::init();
     crate::bpf::init_bpf_system();
     crate::debug::jump_label::static_keys_init();
-
-    // #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
-    // crate::virt::kvm::kvm_init();
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
-    crate::arch::vm::vmx::vmx_init().unwrap();
+    crate::virt::kvm::kvm_init();
 }
 
 /// 在内存管理初始化之前，执行的初始化

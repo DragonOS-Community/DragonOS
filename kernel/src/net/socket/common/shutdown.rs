@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-use core::sync::atomic::AtomicU8;
+use core::{default, sync::atomic::AtomicU8};
 
 use system_error::SystemError;
 

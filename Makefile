@@ -43,7 +43,7 @@ all: kernel user
 
 
 .PHONY: kernel
-kernel: check_arch
+kernel: check_arch update-submodules
 	mkdir -p bin/kernel/
 	
 	$(MAKE) -C ./kernel all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
@@ -160,7 +160,7 @@ log-monitor:
 update-submodules:
 	@echo "更新子模块"
 	@git submodule update --recursive --init
-	@git submodule foreach git pull origin master
+	# @git submodule foreach git pull origin master
 
 .PHONY: update-submodules-by-mirror
 update-submodules-by-mirror:

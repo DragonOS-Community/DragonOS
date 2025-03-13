@@ -1,15 +1,32 @@
+# 👋 欢迎来到 2025 OSCOMP DragonOS ～
+欢迎大家使用 DragonOS 作为内核实现赛道的基座系统！
+
+## OSCOMP Roadmap
+目前 DragonOS 正在紧锣密鼓适配 OSCOMP 的基座需求，同时也欢迎大家围绕下列部分添加实现～
+- [ ] RISC-V
+  - [ ] VirtIO base TTY
+  - [x] Bootable Kernel
+- [ ] LoongArch
+- [ ] ext4 (正在实现)
+- [ ] 优化启动内存序，允许qemu -kernel启动
+- [ ] busybox (DragonOS使用的是NovaShell)
+
+## 在 OSCOMP 下构建 riscv64
+本分支已将默认 Target 设为 riscv64
+
+### Quick Start
+因为使用 CI 镜像工具链，在不额外配置环境的情况下先不构建用户程序
+
+打开 VS Code ，安装 devcontainer 插件并进入 devcontainer 环境
+```sh
+make kernel && make write_diskimage && make qemu
+```
+
 > [!TIP]
-> # 👋 欢迎来到 2025 OSCOMP DragonOS ～
-> 欢迎大家使用 DragonOS 作为内核实现赛道的基座系统！
-> ## OSCOMP Roadmap
-> 目前 DragonOS 正在紧锣密鼓适配 OSCOMP 的基座需求，同时也欢迎大家围绕下列部分添加实现～
-> - [ ] RISC-V
->   - [ ] VirtIO base TTY
->   - [x] Bootable Kernel
-> - [ ] LoongArch
-> - [ ] ext4 (正在实现)
-> - [ ] 优化启动内存序，允许qemu -kernel启动
-> - [ ] busybox (DragonOS使用的是NovaShell)
+> 如果没有看到提示进入 devcontainer 环境，可以 `ctrl+shift+p` 找到 `Dev Containers: Reopen in Container`。
+> 第一次构建可能时间会有些久，尤其是拉取 CI 镜像时，请耐心一些～
+
+---
 
 </br>
 </br>

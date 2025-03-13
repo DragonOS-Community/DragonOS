@@ -1,6 +1,9 @@
 {
     "name": "OSCOMP Container",
-    "image": "docker.educg.net/cg/os-contest:20250226",
+    // "image": "docker.educg.net/cg/os-contest:20250226",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
     "runArgs": [
         "--privileged"
     ],

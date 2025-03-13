@@ -31,16 +31,16 @@ else
 fi
 
 
-INSTALL_POS="$HOME/opt/"
+INSTALL_POS="/opt/"
 
 mkdir -p $INSTALL_POS
 
 get_shell_rc_file()
 {
     if [ -n "$ZSH_VERSION" ]; then
-        echo "$HOME/.zshrc"
+        echo "/root/.zshrc"
     elif [ -n "$BASH_VERSION" ]; then
-        echo "$HOME/.bashrc"
+        echo "/root/.bashrc"
     else
         echo "$HOME/.profile"
     fi

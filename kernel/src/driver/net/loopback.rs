@@ -271,6 +271,8 @@ pub struct InnerLoopbackInterface {
 }
 
 impl LoopbackInterface {
+    pub const DEVICE_NAME: &str = "lo";
+
     /// ## `new` 是一个公共函数，用于创建一个新的 `LoopbackInterface` 实例。
     /// 生成一个新的接口 ID。创建一个新的接口配置，设置其硬件地址和随机种子，使用接口配置和驱动器创建一个新的 `smoltcp::iface::Interface` 实例。
     /// 设置接口的 IP 地址为 127.0.0.1。
@@ -370,7 +372,7 @@ impl KObject for LoopbackInterface {
     }
 
     fn name(&self) -> String {
-        "lo".to_string()
+        Self::DEVICE_NAME.to_string()
     }
 
     fn set_name(&self, _name: String) {
@@ -469,7 +471,7 @@ impl Iface for LoopbackInterface {
     }
 
     fn iface_name(&self) -> String {
-        "lo".to_string()
+        Self::DEVICE_NAME.to_string()
     }
 
     /// 由于lo网卡设备不是实际的物理设备，其mac地址需要手动设置为一个默认值，这里默认为00:00:00:00:00

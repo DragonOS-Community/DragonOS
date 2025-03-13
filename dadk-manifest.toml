@@ -2,7 +2,7 @@
 
 [metadata]
 # Target architecture. Options: x86_64, riscv64
-arch = "x86_64"
+arch = "riscv64"
 
 # Hypervisor config path
 hypervisor-config = "config/hypervisor.toml"

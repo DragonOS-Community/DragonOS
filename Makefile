@@ -88,21 +88,21 @@ write_diskimage-uefi: check_arch
 	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo DADK=$(DADK) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu: check_arch
-	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."
+	sh -c "cd oscomp && bash run-qemu.sh --bios=legacy --display=window && cd .."
 
 # 不编译，直接启动QEMU,不显示图像
 qemu-nographic: check_arch
-	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=nographic && cd .."
+	sh -c "cd oscomp && bash run-qemu.sh --bios=legacy --display=nographic && cd .."
 
 # 不编译，直接启动QEMU(UEFI)
 qemu-uefi: check_arch
-	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=window && cd .."
+	sh -c "cd oscomp && bash run-qemu.sh --bios=uefi --display=window && cd .."
 # 不编译，直接启动QEMU,使用VNC Display作为图像输出
 qemu-vnc: check_arch
-	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=vnc && cd .."
+	sh -c "cd oscomp && bash run-qemu.sh --bios=legacy --display=vnc && cd .."
 # 不编译，直接启动QEMU(UEFI),使用VNC Display作为图像输出
 qemu-uefi-vnc: check_arch
-	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=vnc && cd .."
+	sh -c "cd oscomp && bash run-qemu.sh --bios=uefi --display=vnc && cd .."
 	
 # 编译并写入磁盘镜像
 build: check_arch
@@ -159,6 +159,7 @@ log-monitor:
 .PHONY: update-submodules
 update-submodules:
 	@echo "更新子模块"
+	@sudo chown -R $(USER):$(USER) .
 	@git submodule update --recursive --init
 	# @git submodule foreach git pull origin master
 

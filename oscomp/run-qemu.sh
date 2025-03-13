@@ -70,7 +70,7 @@ fi
 
 # uboot版本
 UBOOT_VERSION="v2023.10"
-RISCV64_UBOOT_PATH="arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
+RISCV64_UBOOT_PATH="../tools/arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
 
 
 DISK_NAME="disk-image-${ARCH}.img"

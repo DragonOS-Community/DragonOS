@@ -38,9 +38,9 @@ mkdir -p $INSTALL_POS
 get_shell_rc_file()
 {
     if [ -n "$ZSH_VERSION" ]; then
-        echo "/root/.zshrc"
+        echo "$HOME/.zshrc"
     elif [ -n "$BASH_VERSION" ]; then
-        echo "/root/.bashrc"
+        echo "$HOME/.bashrc"
     else
         echo "$HOME/.profile"
     fi

@@ -84,7 +84,8 @@ pub trait TtyPort: Sync + Send + Debug {
         let ld = tty.ldisc();
 
         let ret = ld.receive_buf2(tty.clone(), buf, None, count);
-        if ret.is_err() && ret.clone().unwrap_err() == SystemError::ENOSYS {
+
+        if let Err(SystemError::ENOSYS) = ret {
             return ld.receive_buf(tty, buf, None, count);
         }
 

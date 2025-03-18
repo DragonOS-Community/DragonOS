@@ -4,6 +4,7 @@ use super::virtio_impl::HalImpl;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::block::virtio_blk::virtio_blk;
+use crate::driver::char::virtio_console::virtio_console;
 use crate::driver::net::virtio_net::virtio_net;
 use crate::driver::pci::pci::{
     get_pci_device_structures_mut_by_vendor_id, PciDeviceStructureGeneralDevice,
@@ -63,6 +64,7 @@ pub(super) fn virtio_device_init(
         DeviceType::GPU => {
             warn!("Not support virtio_gpu device for now");
         }
+        DeviceType::Console => virtio_console(transport, dev_id, dev_parent),
         DeviceType::Input => {
             warn!("Not support virtio_input device for now");
         }

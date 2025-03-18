@@ -865,12 +865,12 @@ impl VirtIODriver for VirtIONetDriver {
         return Ok(());
     }
 
-    fn virtio_id_table(&self) -> LinkedList<VirtioDeviceId> {
+    fn virtio_id_table(&self) -> Vec<VirtioDeviceId> {
         self.inner().virtio_driver_common.id_table.clone()
     }
 
     fn add_virtio_id(&self, id: VirtioDeviceId) {
-        self.inner().virtio_driver_common.id_table.push_back(id);
+        self.inner().virtio_driver_common.id_table.push(id);
     }
 }
 

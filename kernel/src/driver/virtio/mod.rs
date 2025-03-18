@@ -1,4 +1,5 @@
-use alloc::{collections::LinkedList, string::String, sync::Arc};
+
+use alloc::{vec::Vec,string::String, sync::Arc};
 use system_error::SystemError;
 
 use crate::exception::{irqdesc::IrqReturn, IrqNumber};
@@ -51,7 +52,7 @@ pub trait VirtIODevice: Device {
 pub trait VirtIODriver: Driver {
     fn probe(&self, device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError>;
 
-    fn virtio_id_table(&self) -> LinkedList<VirtioDeviceId>;
+    fn virtio_id_table(&self) -> Vec<VirtioDeviceId>;
 
     fn add_virtio_id(&self, id: VirtioDeviceId);
 }
@@ -60,7 +61,7 @@ int_like!(VirtIODeviceIndex, usize);
 
 #[derive(Debug, Default)]
 pub struct VirtIODriverCommonData {
-    pub id_table: LinkedList<VirtioDeviceId>,
+    pub id_table: Vec<VirtioDeviceId>,
 }
 
 /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/mod_devicetable.h#449

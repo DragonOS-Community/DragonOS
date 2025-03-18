@@ -1,15 +1,13 @@
 use super::{_port, hba::HbaCmdTable};
 use crate::arch::MMArch;
-use crate::driver::base::block::block_device::{
-    BlockDevName, BlockDevice, BlockId, GeneralBlockRange,
-};
+use crate::driver::base::block::block_device::{BlockDevice, BlockId, GeneralBlockRange};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::manager::BlockDevMeta;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
 
 use crate::driver::base::device::driver::Driver;
-use crate::driver::base::device::{Device, DeviceType, IdTable};
+use crate::driver::base::device::{DevName, Device, DeviceType, IdTable};
 use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
 use crate::driver::base::kset::KSet;
 use crate::driver::disk::ahci::HBA_PxIS_TFES;
@@ -520,7 +518,7 @@ impl Device for LockedAhciDisk {
 }
 
 impl BlockDevice for LockedAhciDisk {
-    fn dev_name(&self) -> &BlockDevName {
+    fn dev_name(&self) -> &DevName {
         &self.blkdev_meta.devname
     }
 

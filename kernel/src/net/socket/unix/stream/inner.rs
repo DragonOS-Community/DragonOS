@@ -90,6 +90,7 @@ impl Connected {
         self.addr.as_ref()
     }
 
+    #[allow(unused)]
     pub fn set_addr(&mut self, addr: Option<Endpoint>) {
         self.addr = addr;
     }
@@ -98,6 +99,7 @@ impl Connected {
         self.peer_addr.as_ref()
     }
 
+    #[allow(unused)]
     pub fn set_peer_addr(&mut self, peer: Option<Endpoint>) {
         self.peer_addr = peer;
     }
@@ -164,7 +166,7 @@ impl Connected {
             return Err(SystemError::EINVAL);
         }
     }
-
+    #[allow(unused)]
     pub fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
         if how.is_empty() {
             return Err(SystemError::EINVAL);
@@ -212,6 +214,7 @@ impl Listener {
         return Ok(());
     }
 
+    #[allow(unused)]
     pub fn pop_incoming(&self) -> Option<Arc<Inode>> {
         let mut incoming_connects = self.incoming_connects.lock();
 

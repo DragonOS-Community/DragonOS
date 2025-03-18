@@ -1,0 +1,32 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "DragonOS: Build riscv64",
+            "command": "make",
+            "group": { "kind": "build", "isDefault": true },
+            "args": [
+                "ci-build",
+                "ARCH=riscv64"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "type": "process",
+            "label": "DragonOS: Start riscv64",
+            "command": "bash",
+            "args": [
+                "ci-start-riscv64.sh"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/oscomp"
+            },
+            "isBackground": true
+        }
+    ]
+}

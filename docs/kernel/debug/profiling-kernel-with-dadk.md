@@ -62,7 +62,7 @@ make build && make qemu-nographic
 在DragonOS项目目录下，运行以下命令：
 
 ```shell
-dadk profile sample --format flamegraph  --output flame.svg --interval 200ms --duration 20s  --cpu-mask 0x1
+dadk profile sample --format flamegraph  --output flame.svg --interval 200ms --duration 20s  --cpu-mask 0x1 --kernel bin/x86_64/kernel/kernel.elf
 ```
 
 上面的命令，将会对DragonOS内核进行性能分析，并生成一个火焰图。

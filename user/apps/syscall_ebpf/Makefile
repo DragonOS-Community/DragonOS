@@ -54,4 +54,5 @@ test-release:
 
 .PHONY: install
 install:
+	cargo install bpf-linker
 	RUSTFLAGS=$(RUSTFLAGS) cargo $(TOOLCHAIN) install --target $(RUST_TARGET) --path ./syscall_ebpf --no-track --root $(INSTALL_DIR) --force

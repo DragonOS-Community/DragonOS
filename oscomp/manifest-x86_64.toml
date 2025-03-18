@@ -2,7 +2,7 @@
 
 [metadata]
 # Target architecture. Options: x86_64, riscv64
-arch = "riscv64"
+arch = "x86_64"
 
 # Hypervisor config path
 hypervisor-config = "config/hypervisor.toml"
@@ -14,10 +14,10 @@ rootfs-config = "config/rootfs.toml"
 boot-config = "config/boot.toml"
 
 # System root directory folder (DADK will copy the files in this directory to the root directory of the disk image)
-sysroot-dir = "bin/riscv64/sysroot"
+sysroot-dir = "bin/x86_64/sysroot"
 
 # DADK Root Cache directory path
-cache-root-dir = "bin/riscv64/dadk_cache"
+cache-root-dir = "bin/x86_64/dadk_cache"
 
 # User configuration directory path
 # 这个字段只是临时用于兼容旧版本，v0.2版本重构完成后会删除

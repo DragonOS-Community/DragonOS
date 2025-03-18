@@ -1,5 +1,5 @@
-TOOLCHAIN=
-RUSTFLAGS=
+TOOLCHAIN="+nightly-2024-11-05-x86_64-unknown-linux-gnu"
+RUSTFLAGS+=""
 
 ifdef DADK_CURRENT_BUILD_DIR
 # 如果是在dadk中编译，那么安装到dadk的安装目录中

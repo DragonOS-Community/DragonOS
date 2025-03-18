@@ -1,0 +1,22 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug RISCV64 elf",
+            "stopOnEntry": false,
+            "preLaunchTask": "DragonOS: Start riscv64",
+            "targetCreateCommands": ["target create ${workspaceFolder}/bin/riscv64/kernel/kernel.elf"],
+            "processCreateCommands": [
+                "gdb-remote localhost:1234",
+                "continue" // Get over the first trap into the kernel
+            ],
+            "args": [],
+            "cwd": "${workspaceFolder}",
+        }
+    ]
+}

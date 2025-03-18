@@ -1,7 +1,7 @@
 # From tools/run-qemu.sh, mainly remove the sudo for container environment
 # 
 # REFERENCE:
-# qemu-system-riscv64 -machine virt -kernel ../bin/kernel/kernel -m {mem} -nographic -smp {smp} -bios default -drive file={fs},if=none,format=raw,id=x0 \
+# qemu-system-riscv64 -machine virt -kernel ../bin/${ARCH}/kernel/kernel.elf -m {mem} -nographic -smp {smp} -bios default -drive file={fs},if=none,format=raw,id=x0 \
 #                     -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -no-reboot -device virtio-net-device,netdev=net -netdev user,id=net \
 #                     -rtc base=utc \
 #                     -drive file=disk.img,if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
@@ -73,10 +73,8 @@ UBOOT_VERSION="v2023.10"
 RISCV64_UBOOT_PATH="../tools/arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
 
 
-DISK_NAME="disk-image-${ARCH}.img"
-
 QEMU=qemu-system-${ARCH}
-QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
+QEMU_DISK_IMAGE="../bin/${ARCH}/disk.img"
 QEMU_MEMORY="512M"
 QEMU_MEMORY_BACKEND="dragonos-qemu-shm.ram"
 QEMU_MEMORY_BACKEND_PATH_PREFIX="/dev/shm"
@@ -149,7 +147,7 @@ while true;do
               QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
               QEMU_MONITOR=""
               QEMU_ARGUMENT+=" --nographic "
-              QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+              QEMU_ARGUMENT+=" -kernel ../bin/${ARCH}/kernel/kernel.elf "
 
               ;;
         esac;shift 2;;
@@ -216,7 +214,7 @@ if [ ${BIOS_TYPE} == uefi ] ;then
 else
   # 如果是i386架构或者x86_64架构，就直接启动
   if [ ${ARCH} == x86_64 ] || [ ${ARCH} == i386 ] ;then
-    ${QEMU} ${QEMU_ARGUMENT}
+    echo "${QEMU} ${QEMU_ARGUMENT}"
   elif [ ${ARCH} == riscv64 ] ;then
     # 如果是riscv64架构，就与efi启动一样
     install_riscv_uboot

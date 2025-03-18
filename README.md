@@ -19,8 +19,10 @@
 
 打开 VS Code ，安装 devcontainer 插件并进入 devcontainer 环境
 ```sh
-make kernel && make write_diskimage && make qemu
+make ci-run # or specify "ARCH=x86_64" to run x86 target
 ```
+
+更多选项请运行 `make help`
 
 > [!TIP]
 > 如果没有看到提示进入 devcontainer 环境，可以 `ctrl+shift+p` 找到 `Dev Containers: Reopen in Container`。

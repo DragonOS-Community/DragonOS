@@ -3,7 +3,9 @@ user_sub_dirs = apps
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
 MIN_DADK_VERSION = 0.2.0
-DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
+DADK_CACHE_DIR = $(ROOT_PATH)/bin/$(ARCH)/dadk_cache
+SYSROOT_DIR = $(ROOT_PATH)/bin/$(ARCH)/sysroot
+DADK_MANIFEST_PATH = $(ROOT_PATH)/oscomp/manifest-${ARCH}.toml
 
 ECHO:
 	@echo "$@"
@@ -33,6 +35,8 @@ ifneq ($(shell printf '%s\n%s' "$(DADK_VERSION)" "$(MIN_DADK_VERSION)" | sort -V
 endif
 endif
 
+DADK = $(shell which dadk) --manifest $(DADK_MANIFEST_PATH)
+
 .PHONY: dadk_run
 dadk_run: install_dadk
 	mkdir -p $(DADK_CACHE_DIR)
@@ -44,7 +48,7 @@ dadk_clean: install_dadk
 	@echo dadk_clean
 
 all:
-	mkdir -p $(ROOT_PATH)/bin/sysroot
+	mkdir -p $(SYSROOT_DIR)
 	
 	$(MAKE) dadk_run
 	$(MAKE) copy_sysconfig
@@ -53,7 +57,7 @@ all:
 
 .PHONY: copy_sysconfig
 copy_sysconfig:
-	cp -r sysconfig/* $(ROOT_PATH)/bin/sysroot/
+	cp -r sysconfig/* $(SYSROOT_DIR)
 
 
 .PHONY: clean

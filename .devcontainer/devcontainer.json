@@ -12,7 +12,8 @@
             "extensions": [
                 "rust-lang.rust-analyzer",
                 "ms-vscode.cpptools",
-                "tamasfe.even-better-toml"
+                "tamasfe.even-better-toml",
+                "vadimcn.vscode-lldb"
             ]
         }
     }

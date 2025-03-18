@@ -24,7 +24,7 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
-    arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
+    arch::{interrupt::TrapFrame, MMArch},
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
@@ -232,7 +232,13 @@ impl Syscall {
                 Self::sbrk(increment).map(|vaddr: VirtAddr| vaddr.data())
             }
 
-            SYS_REBOOT => Self::reboot(),
+            SYS_REBOOT => {
+                let magic1 = args[0] as u32;
+                let magic2 = args[1] as u32;
+                let cmd = args[2] as u32;
+                let arg = args[3];
+                Self::reboot(magic1, magic2, cmd, arg)
+            }
 
             SYS_CHDIR => {
                 let r = args[0] as *const u8;
@@ -873,8 +879,10 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_POLL => {
-                warn!("SYS_POLL has not yet been implemented");
-                Ok(0)
+                let fds = args[0];
+                let nfds = args[1] as u32;
+                let timeout = args[2] as i32;
+                Self::poll(fds, nfds, timeout)
             }
 
             SYS_SETPGID => {
@@ -1252,9 +1260,5 @@ impl Syscall {
         let bb = back_color & 0x000000ff;
         print!("\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{s}\x1B[0m");
         return Ok(s.len());
-    }
-
-    pub fn reboot() -> Result<usize, SystemError> {
-        unsafe { cpu_reset() };
     }
 }

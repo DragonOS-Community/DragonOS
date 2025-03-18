@@ -874,6 +874,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
 }
 
 /// 页表项
+#[repr(C, align(8))]
 #[derive(Copy, Clone)]
 pub struct PageEntry<Arch> {
     data: usize,

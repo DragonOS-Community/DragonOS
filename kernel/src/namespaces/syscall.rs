@@ -37,7 +37,7 @@ impl Syscall {
         Ok(check)
     }
 
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub fn sys_setns(_fd: i32, flags: u64) -> Result<usize, SystemError> {
         let check = check_unshare_flags(flags)?;
 

@@ -25,7 +25,7 @@ pub struct SeqpacketSocket {
 
 impl SeqpacketSocket {
     /// 默认的元数据缓冲区大小
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的缓冲区大小
     pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
@@ -51,7 +51,7 @@ impl SeqpacketSocket {
         return Ok(inode);
     }
 
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub fn new_connected(connected: Connected, is_nonblocking: bool) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Inner::Connected(connected)),

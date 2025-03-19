@@ -31,7 +31,7 @@ pub struct StreamSocket {
 
 impl StreamSocket {
     /// 默认的元数据缓冲区大小
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的缓冲区大小
     pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
@@ -61,7 +61,7 @@ impl StreamSocket {
 
         return Ok((inode0, inode1));
     }
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub fn new_connected(connected: Connected) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Inner::Connected(connected)),

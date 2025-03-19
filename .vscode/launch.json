@@ -17,6 +17,8 @@
             ],
             "args": [],
             "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["c", "cpp", "rust"],
+            "console": "internalConsole"
         }
     ]
 }

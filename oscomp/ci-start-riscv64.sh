@@ -1,3 +1,4 @@
+LOG_FILE="../serial_opt.txt"
 # uboot版本
 UBOOT_VERSION="v2023.10"
 RISCV64_UBOOT_PATH="../tools/arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
@@ -25,4 +26,6 @@ qemu-system-riscv64 -machine virt -kernel ../tools/arch/riscv64/u-boot-v2023.10-
                     -no-reboot -device virtio-net-device,netdev=net -netdev user,id=net \
                     -rtc base=utc \
                     -drive file=../bin/riscv64/disk.img,if=none,format=raw,id=x1 \
-                    -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 -s
+                    -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 -s \
+                    -serial chardev:mux -monitor chardev:mux \
+                    -chardev stdio,id=mux,mux=on,signal=off,logfile=${LOG_FILE}

@@ -138,7 +138,7 @@ pub struct Connected {
 
 impl Connected {
     /// 默认的缓冲区大小
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
     pub fn new_pair(
@@ -159,12 +159,12 @@ impl Connected {
         (this, peer)
     }
 
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub fn set_peer_inode(&mut self, peer_epoint: Option<Endpoint>) {
         self.peer_inode = peer_epoint;
     }
 
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub fn set_inode(&mut self, epoint: Option<Endpoint>) {
         self.inode = epoint;
     }

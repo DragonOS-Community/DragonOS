@@ -30,12 +30,12 @@ impl Buffer {
         return self.metadata.buf_size - self.read_buffer.lock().len() == 0;
     }
 
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub fn is_write_buf_empty(&self) -> bool {
         return self.write_buffer.lock().is_empty();
     }
 
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub fn is_write_buf_full(&self) -> bool {
         return self.write_buffer.lock().len() >= self.metadata.buf_size;
     }
@@ -62,7 +62,7 @@ impl Buffer {
         Ok(len)
     }
 
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub fn write_write_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {
         let mut buffer = self.write_buffer.lock_irqsave();
 

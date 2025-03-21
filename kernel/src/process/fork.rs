@@ -20,6 +20,7 @@ use crate::{
 
 use super::{
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
+    process_group::ProcessGroup,
     KernelStack, Pid, ProcessControlBlock, ProcessManager,
 };
 const MAX_PID_NS_LEVEL: usize = 32;
@@ -343,6 +344,7 @@ impl ProcessManager {
         clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
+        log::debug!("fork: clone_flags: {:?}", clone_args.flags);
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
@@ -497,7 +499,8 @@ impl ProcessManager {
         } else {
             pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
 
-            let ptr: *mut ProcessControlBlock = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+            let ptr: *mut ProcessControlBlock =
+                pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
             unsafe {
                 (*ptr).tgid = pcb.pid;
             }
@@ -532,7 +535,12 @@ impl ProcessManager {
         }
 
         // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
-        debug!("Current_pcb processgroup:{:?}", current_pcb.process_group());
+        debug!(
+            "Current_pcb pid:{}, processgroup:{:?}, clone flags:{:?}",
+            current_pcb.pid(),
+            current_pcb.process_group(),
+            clone_flags
+        );
         Self::set_group(current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
@@ -546,18 +554,25 @@ impl ProcessManager {
     }
 
     fn set_group(
-        current_pcb: &Arc<ProcessControlBlock>,
-        new_pcb: &Arc<ProcessControlBlock>,
+        parent_pcb: &Arc<ProcessControlBlock>,
+        child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        let pg = current_pcb.process_group().unwrap();
-        let mut pg_inner = pg.process_group_inner.lock();
-        let mut child_pg = new_pcb.process_group.lock();
-        let mut children_writelock = current_pcb.children.write();
+        let pg = if parent_pcb.process_group().is_none() && parent_pcb.pid() == Pid(0) {
+            ProcessGroup::new(child_pcb.clone())
+        } else {
+            parent_pcb.process_group().unwrap().clone()
+        };
 
-        children_writelock.push(new_pcb.pid());
-        pg_inner.processes.insert(new_pcb.pid(), new_pcb.clone());
+        let mut pg_inner = pg.process_group_inner.lock();
+        let mut child_pg = child_pcb.process_group.lock();
+        let mut children_writelock = parent_pcb.children.write();
+
+        children_writelock.push(child_pcb.pid());
+
+        pg_inner.processes.insert(child_pcb.pid(), child_pcb.clone());
         *child_pg = Arc::downgrade(&pg);
 
+        ProcessManager::add_process_group(pg.clone());
         Ok(())
     }
 }

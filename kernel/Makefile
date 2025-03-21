@@ -25,6 +25,7 @@ clean:
 
 .PHONY: fmt
 fmt:
+	sed -i '/^[[:space:]]*$$/d' ./src/include/bindings/bindings.rs
 	RUSTFLAGS="$(RUSTFLAGS)" cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
 	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 clippy --all-features

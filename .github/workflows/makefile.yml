@@ -1,4 +1,4 @@
-name: Build Check
+name: CI for DragonOS
 
 on:
   push:
@@ -7,92 +7,49 @@ on:
     branches: ["master", "feat-*", "fix-*"]
 
 jobs:
-  format-check:
-    name: Format check ${{ matrix.arch }}
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    container: dragonos/dragonos-dev:v1.8
-
+  ci:
     strategy:
       matrix:
-        arch: [x86_64, riscv64]
-
-    steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.8"
-      - uses: actions/checkout@v3
-
-      - name: Format check
-        env:
-          ARCH: ${{ matrix.arch }}
-          HOME: /root
-        shell: bash -ileo pipefail {0}
-        run: |
-          printf "\n" >> kernel/src/include/bindings/bindings.rs
-          sed -i 's/arch = ".*"/arch = "${{ matrix.arch }}"/' dadk-manifest.toml
-          FMT_CHECK=1 make fmt
-
-  kernel-static-test:
-    name: Kernel static test ${{ matrix.arch }}
+        arch: [riscv64, x86_64]
     runs-on: ubuntu-latest
-    continue-on-error: true
-    container: dragonos/dragonos-dev:v1.8
-
-    strategy:
-      matrix:
-        arch: [x86_64, riscv64]
-
-    steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.8"
-
-      - uses: actions/checkout@v3
-
-      - name: Run kernel static test
+    env:
+      ARCH: ${{ matrix.arch }}
+      HOME: /root
+    container: 
+      image: ghcr.io/samuka007/dragonos-oscomp-ci-docker:pre-2025-03-21
+      options: --privileged
+    defaults:
+      run:
         shell: bash -ileo pipefail {0}
-        env:
-          ARCH: ${{ matrix.arch }}
-          HOME: /root
-        run: bash -c "source /root/.cargo/env && cd kernel && make test && make test-rbpf"
-
-  build-x86_64:
-    runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.8
-
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.8"
-
-      - uses: actions/checkout@v3
-      - name: build the DragonOS
-        env:
-          ARCH: x86_64
-          HOME: /root
-        shell: bash -ileo pipefail {0}
-
-        run: |
-          source ~/.bashrc
-          source ~/.cargo/env
-          export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
-          sed -i 's/arch = ".*"/arch = "${{ env.ARCH }}"/' dadk-manifest.toml
-
-          make all -j $(nproc)
-
-  build-riscv64:
-    runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.8
-
-    steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.8"
-
       - uses: actions/checkout@v3
         with:
           submodules: "recursive"
-
-      - name: build the DragonOS
-        shell: bash -ileo pipefail {0}
-        env:
-          ARCH: riscv64
-          HOME: /root
-
+      
+      - name: Change source
         run: |
-          source ~/.bashrc && source ~/.cargo/env
-          sed -i 's/arch = ".*"/arch = "${{ env.ARCH }}"/' dadk-manifest.toml
-          make kernel -j $(nproc)
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+
+      - name: build kernel
+        run: |
+          make ci-kernel
+
+      - name: build userland
+        if: matrix.arch != 'x86_64'
+        run: |
+          make ci-user
+
+      - name: generate the disk image
+        if: matrix.arch != 'x86_64'
+        run: |
+          make ci-gendisk
+
+      - name: boot test
+        if: matrix.arch != 'x86_64'
+        timeout-minutes: 3
+        run: |
+          cd oscomp && bash ci-boot-test.sh
+
+      - name: Format check
+        run: |
+          FMT_CHECK=1 make fmt

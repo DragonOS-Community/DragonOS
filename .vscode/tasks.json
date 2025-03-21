@@ -26,6 +26,7 @@
             "options": {
                 "cwd": "${workspaceFolder}/oscomp"
             },
+            "problemMatcher": [],
             "isBackground": true
         }
     ]

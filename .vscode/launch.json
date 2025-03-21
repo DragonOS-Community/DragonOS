@@ -7,18 +7,42 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug RISCV64 elf",
+            "name": "Debug RISCV64 lldb",
             "stopOnEntry": false,
-            "preLaunchTask": "DragonOS: Start riscv64",
             "targetCreateCommands": ["target create ${workspaceFolder}/bin/riscv64/kernel/kernel.elf"],
             "processCreateCommands": [
                 "gdb-remote localhost:1234",
+                "settings set target.process.follow-fork-mode child",
                 "continue" // Get over the first trap into the kernel
             ],
             "args": [],
             "cwd": "${workspaceFolder}",
             "sourceLanguages": ["c", "cpp", "rust"],
             "console": "internalConsole"
+        },
+        {
+            "type": "cppdbg",
+            "request": "launch",
+            "name": "Debug RISCV64 gdb-multiarch",
+            "stopAtConnect": true,
+            "program": "${workspaceRoot}/bin/riscv64/kernel/kernel.elf",
+            "miDebuggerPath": "gdb-multiarch",
+            "miDebuggerServerAddress": "localhost:1234",
+            "postRemoteConnectCommands": [
+                {
+                    "text": "set follow-fork-mode child"
+                }
+            ],
+            "useExtendedRemote": true,
+            "args": [],
+            "cwd": "${workspaceRoot}",
+            "environment": [],
+            "internalConsoleOptions": "neverOpen",
+            "externalConsole": false,
+            "logging": {
+                "engineLogging": false
+            },
+            "MIMode": "gdb"
         }
     ]
 }

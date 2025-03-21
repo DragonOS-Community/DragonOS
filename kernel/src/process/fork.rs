@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use alloc::{string::ToString, sync::Arc};
-use log::error;
+use log::{debug, error};
 use system_error::SystemError;
 
 use crate::{
@@ -179,7 +179,7 @@ impl ProcessManager {
             );
             e
         })?;
-        ProcessManager::add_pcb(pcb.clone());
+        // ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程
         procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {
@@ -497,7 +497,7 @@ impl ProcessManager {
         } else {
             pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
 
-            let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+            let ptr: *mut ProcessControlBlock = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
             unsafe {
                 (*ptr).tgid = pcb.pid;
             }
@@ -532,8 +532,31 @@ impl ProcessManager {
         }
 
         // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
+        debug!("Current_pcb processgroup:{:?}", current_pcb.process_group());
+        Self::set_group(current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
 
         sched_cgroup_fork(pcb);
+
+        Ok(())
+    }
+
+    fn set_group(
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        let pg = current_pcb.process_group().unwrap();
+        let mut pg_inner = pg.process_group_inner.lock();
+        let mut child_pg = new_pcb.process_group.lock();
+        let mut children_writelock = current_pcb.children.write();
+
+        children_writelock.push(new_pcb.pid());
+        pg_inner.processes.insert(new_pcb.pid(), new_pcb.clone());
+        *child_pg = Arc::downgrade(&pg);
 
         Ok(())
     }

@@ -6,7 +6,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use log::error;
+use log::{debug, error};
 use system_error::SystemError;
 
 use super::{
@@ -16,7 +16,7 @@ use super::{
     exit::kernel_wait4,
     fork::{CloneFlags, KernelCloneArgs},
     resource::{RLimit64, RLimitID, RUsage, RUsageWho},
-    KernelStack, Pid, ProcessManager,
+    KernelStack, Pgid, Pid, ProcessManager,
 };
 use crate::{
     arch::{interrupt::TrapFrame, CurrentIrqArch, MMArch},
@@ -261,7 +261,7 @@ impl Syscall {
     ///
     /// @return 成功，指定进程的进程组id
     /// @return 错误，不存在该进程
-    pub fn getpgid(mut pid: Pid) -> Result<Pid, SystemError> {
+    pub fn getpgid(mut pid: Pid) -> Result<Pgid, SystemError> {
         if pid == Pid(0) {
             let current_pcb = ProcessManager::current_pcb();
             pid = current_pcb.pid();
@@ -269,6 +269,51 @@ impl Syscall {
         let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
         return Ok(target_proc.basic().pgid());
     }
+
+    pub fn setpgid(pid: Pid, pgid: Pgid) -> Result<usize, SystemError> {
+        let current_pcb = ProcessManager::current_pcb();
+        let pid = if pid == Pid(0) {
+            current_pcb.pid()
+        } else {
+            pid
+        };
+        let pgid = if pgid == Pgid(0) {
+            Pgid(pid.into())
+        } else {
+            pgid
+        };
+        if pid != current_pcb.pid() && !current_pcb.contain_child(&pid) {
+            return Err(SystemError::ESRCH);
+        }
+
+        if pgid.into() != pid.into() && ProcessManager::find_process_group(pgid).is_some() {
+            return Err(SystemError::EPERM);
+        }
+        let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+        pcb.join_other_group(pgid)?;
+
+        return Ok(0);
+    }
+
+    pub fn setsid() -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let session = pcb.go_to_new_session()?;
+        Ok(session.sid().0)
+    }
+
+    pub fn getsid(pid: Pid) -> Result<usize, SystemError> {
+        let session = ProcessManager::current_pcb().session().unwrap();
+        let sid = session.sid().0;
+        if pid == Pid(0) {
+            return Ok(sid);
+        }
+        let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+        if !Arc::ptr_eq(&session, &pcb.session().unwrap()) {
+            return Err(SystemError::EPERM);
+        }
+        return Ok(sid);
+    }
+
     /// @brief 获取当前进程的父进程id
     ///
     /// 若为initproc则ppid设置为0   
@@ -294,10 +339,11 @@ impl Syscall {
         let current_pcb = ProcessManager::current_pcb();
         let new_kstack = KernelStack::new()?;
         let name = current_pcb.basic().name().to_string();
+        debug!("the processgroup of current pcb: {:?}", current_pcb.basic().pgid());
         let pcb = ProcessControlBlock::new(name, new_kstack);
         // 克隆pcb
         ProcessManager::copy_process(&current_pcb, &pcb, clone_args, current_trapframe)?;
-        ProcessManager::add_pcb(pcb.clone());
+        // ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程
         procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {

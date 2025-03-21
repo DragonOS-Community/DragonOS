@@ -79,7 +79,9 @@ pub mod fork;
 pub mod idle;
 pub mod kthread;
 pub mod pid;
+pub mod process_group;
 pub mod resource;
+pub mod session;
 pub mod stdio;
 pub mod syscall;
 pub mod timer;
@@ -543,6 +545,8 @@ pub unsafe fn switch_finish_hook() {
 }
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
+int_like!(Pgid, AtomicPgid, usize, AtomicUsize);
+int_like!(Sid, AtomicSid, usize, AtomicUsize);
 
 impl fmt::Display for Pid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

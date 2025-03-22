@@ -2,9 +2,9 @@ name: CI for DragonOS
 
 on:
   push:
-    branches: ["master", "feat-*", "fix-*"]
+    branches: ["master", "feat-*", "fix-*", "oscomp"]
   pull_request:
-    branches: ["master", "feat-*", "fix-*"]
+    branches: ["master", "feat-*", "fix-*", "oscomp"]
 
 jobs:
   ci:

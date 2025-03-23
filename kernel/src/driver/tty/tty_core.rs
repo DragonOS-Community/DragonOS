@@ -50,11 +50,14 @@ impl Drop for TtyCore {
 }
 
 impl TtyCore {
+    #[inline(never)]
     pub fn new(driver: Arc<TtyDriver>, index: usize) -> Arc<Self> {
         let name = driver.tty_line_name(index);
         let device_number = driver
             .device_number(index)
             .expect("Get tty device number failed.");
+        log::debug!("Creating TtyCore with name: {}", name);
+        loop{}
         let termios = driver.init_termios();
         let core = TtyCoreData {
             tty_driver: driver,
@@ -76,7 +79,7 @@ impl TtyCore {
             device_number,
             privete_fields: SpinLock::new(None),
         };
-
+        log::debug!("Created TtyCore with name: {}", core.name);
         return Arc::new(Self {
             core,
             line_discipline: Arc::new(NTtyLinediscipline {

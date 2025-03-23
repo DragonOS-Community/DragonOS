@@ -4,15 +4,22 @@ use crate::{
             class::Class,
             device::{
                 bus::Bus,
+                device_number::Major,
                 driver::{Driver, DriverCommonData},
                 DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
+        tty::{
+            console::ConsoleSwitch, kthread::send_to_tty_refresh_thread, termios::{WindowSize, TTY_STD_TERMIOS}, tty_core::{TtyCore, TtyCoreData}, tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation}, virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, VirtConsole}
+        },
+        video::console::dummycon::dummy_console,
         virtio::{
+            irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
             transport::VirtIOTransport,
+            virtio_drivers_error_to_system_error,
             virtio_impl::HalImpl,
             VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
             VIRTIO_VENDOR_ID,
@@ -23,7 +30,7 @@ use crate::{
     init::initcall::INITCALL_POSTCORE,
     libs::{
         lazy_init::Lazy,
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -32,7 +39,7 @@ use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use bitmap::traits::BitMapOps;
-use core::any::Any;
+use core::{any::Any, sync::atomic::{compiler_fence, Ordering}};
 use core::fmt::Debug;
 use core::fmt::Formatter;
 use system_error::SystemError;
@@ -40,12 +47,19 @@ use unified_init::macros::unified_init;
 use virtio_drivers::device::console::VirtIOConsole;
 
 const VIRTIO_CONSOLE_BASENAME: &str = "virtio_console";
+const HVC_MINOR: u32 = 0;
 
 static mut VIRTIO_CONSOLE_DRIVER: Option<Arc<VirtIOConsoleDriver>> = None;
+static mut TTY_HVC_DRIVER: Option<Arc<TtyDriver>> = None;
 
 #[inline(always)]
 fn virtio_console_driver() -> &'static Arc<VirtIOConsoleDriver> {
     unsafe { VIRTIO_CONSOLE_DRIVER.as_ref().unwrap() }
+}
+
+#[inline(always)]
+fn tty_hvc_driver() -> &'static Arc<TtyDriver> {
+    unsafe { TTY_HVC_DRIVER.as_ref().unwrap() }
 }
 
 pub fn virtio_console(
@@ -53,6 +67,11 @@ pub fn virtio_console(
     dev_id: Arc<DeviceId>,
     dev_parent: Option<Arc<dyn Device>>,
 ) {
+    log::debug!(
+        "virtio_console: dev_id: {:?}, parent: {:?}",
+        dev_id,
+        dev_parent
+    );
     let device = VirtIOConsoleDevice::new(transport, dev_id.clone());
     if device.is_none() {
         return;
@@ -67,6 +86,8 @@ pub fn virtio_console(
         .device_add(device.clone() as Arc<dyn VirtIODevice>)
         .expect("Add virtio console failed");
 }
+
+//
 #[derive(Debug)]
 #[cast_to([sync] VirtIODevice)]
 #[cast_to([sync] Device)]
@@ -120,7 +141,7 @@ impl VirtIOConsoleDevice {
     }
 
     fn inner(&self) -> SpinLockGuard<InnerVirtIOConsoleDevice> {
-        self.inner.lock()
+        self.inner.lock_irqsave()
     }
 }
 
@@ -274,8 +295,21 @@ impl Device for VirtIOConsoleDevice {
 
 impl VirtIODevice for VirtIOConsoleDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        // todo: 发送字符到tty
-        todo!()
+        let mut buf = [0u8; 8];
+        let mut index = 0;
+        // Read up to the size of the buffer
+        while index < buf.len() {
+            if let Ok(Some(c)) = self.inner().device_inner.recv(true) {
+                buf[index] = c;
+                index += 1;
+            } else {
+                break; // No more bytes to read
+            }
+        }
+        
+
+        send_to_tty_refresh_thread(&buf[0..index]);
+        Ok(IrqReturn::Handled)
     }
 
     fn dev_id(&self) -> &Arc<DeviceId> {
@@ -319,6 +353,7 @@ impl VirtIODevice for VirtIOConsoleDevice {
 #[cast_to([sync] Driver)]
 struct VirtIOConsoleDriver {
     inner: SpinLock<InnerVirtIOConsoleDriver>,
+    devices: RwLock<[Option<Arc<VirtIOConsoleDevice>>; Self::MAX_DEVICES]>,
     kobj_state: LockedKObjectState,
 }
 
@@ -342,6 +377,7 @@ impl VirtIOConsoleDriver {
         let result = VirtIOConsoleDriver {
             inner: SpinLock::new(inner),
             kobj_state: LockedKObjectState::default(),
+            devices: RwLock::new([const { None }; Self::MAX_DEVICES]),
         };
 
         result.add_virtio_id(id_table);
@@ -350,6 +386,20 @@ impl VirtIOConsoleDriver {
 
     fn inner(&self) -> SpinLockGuard<InnerVirtIOConsoleDriver> {
         self.inner.lock()
+    }
+
+    fn do_install(
+        &self,
+        driver: Arc<TtyDriver>,
+        tty: Arc<TtyCore>,
+        vc: Arc<VirtConsole>,
+    ) -> Result<(), SystemError> {
+        driver.standard_install(tty.clone())?;
+        vc.port().setup_internal_tty(Arc::downgrade(&tty));
+        tty.set_port(vc.port());
+        vc.devfs_setup()?;
+
+        Ok(())
     }
 }
 
@@ -385,9 +435,92 @@ impl InnerVirtIOConsoleDriver {
     }
 }
 
+impl TtyOperation for VirtIOConsoleDriver {
+    fn open(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        if nr > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let index = tty.index();
+        if index >= VirtIOConsoleDriver::MAX_DEVICES {
+            return Err(SystemError::ENODEV);
+        }
+
+        let dev = self.devices.read()[index]
+            .clone()
+            .ok_or(SystemError::ENODEV)?;
+        let mut cnt = 0;
+        let mut inner = dev.inner();
+        for c in buf[0..nr].iter() {
+            if let Err(e) = inner.device_inner.send(*c) {
+                if cnt > 0 {
+                    return Ok(cnt);
+                }
+                return Err(virtio_drivers_error_to_system_error(e));
+            } else {
+                cnt += 1;
+            }
+        }
+
+        Ok(cnt)
+    }
+
+    fn flush_chars(&self, _tty: &TtyCoreData) {
+        // do nothing
+    }
+
+    fn ioctl(&self, _tty: Arc<TtyCore>, _cmd: u32, _arg: usize) -> Result<(), SystemError> {
+        Err(SystemError::ENOIOCTLCMD)
+    }
+
+    fn close(&self, _tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn resize(&self, tty: Arc<TtyCore>, winsize: WindowSize) -> Result<(), SystemError> {
+        *tty.core().window_size_write() = winsize;
+        Ok(())
+    }
+
+    fn install(&self, driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        if tty.core().index() >= VirtIOConsoleDriver::MAX_DEVICES {
+            return Err(SystemError::ENODEV);
+        }
+
+        let dev = self.devices.read()[tty.core().index()]
+            .clone()
+            .ok_or(SystemError::ENODEV)?;
+        let info = dev.inner().device_inner.info();
+        let winsize = WindowSize::new(info.rows, info.columns, 1, 1);
+
+        *tty.core().window_size_write() = winsize;
+        let vc_data = Arc::new(SpinLock::new(VirtualConsoleData::new(usize::MAX)));
+        let mut vc_data_guard = vc_data.lock_irqsave();
+        vc_data_guard.set_driver_funcs(Arc::downgrade(&dummy_console()) as Weak<dyn ConsoleSwitch>);
+        vc_data_guard.init(
+            Some(tty.core().window_size().row.into()),
+            Some(tty.core().window_size().col.into()),
+            true,
+        );
+        drop(vc_data_guard);
+
+        let vc = VirtConsole::new(Some(vc_data));
+        let vc_index = vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
+        self.do_install(driver, tty, vc.clone()).inspect_err(|_| {
+            vc_manager().free(vc_index);
+        })?;
+
+        Ok(())
+    }
+}
+
 impl VirtIODriver for VirtIOConsoleDriver {
     fn probe(&self, device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
-        let dev = device
+        log::debug!("VirtIOConsoleDriver::probe()");
+        let _dev = device
             .clone()
             .arc_any()
             .downcast::<VirtIOConsoleDevice>()
@@ -398,7 +531,7 @@ impl VirtIODriver for VirtIOConsoleDriver {
                 );
                 SystemError::EINVAL
             })?;
-
+        log::debug!("VirtIOConsoleDriver::probe() succeeded");
         Ok(())
     }
 
@@ -416,7 +549,9 @@ impl Driver for VirtIOConsoleDriver {
         Some(IdTable::new(VIRTIO_CONSOLE_BASENAME.to_string(), None))
     }
 
+    // todo: 添加错误时，资源释放的逻辑
     fn add_device(&self, device: Arc<dyn Device>) {
+        log::debug!("virtio console: add_device");
         let virtio_con_dev = device.arc_any().downcast::<VirtIOConsoleDevice>().expect(
             "VirtIOConsoleDriver::add_device() failed: device is not a VirtIOConsoleDevice",
         );
@@ -425,7 +560,9 @@ impl Driver for VirtIOConsoleDriver {
             virtio_con_dev.dev_id(),
         );
         }
+        log::debug!("virtio console: add_device: to lock inner");
         let mut inner = self.inner();
+        log::debug!("virtio console: add_device: inner.locked");
         let dev_name = inner.alloc_id();
         if dev_name.is_none() {
             panic!("Failed to allocate ID for VirtIO console device: '{:?}', virtio console device limit exceeded.", virtio_con_dev.dev_id())
@@ -438,7 +575,37 @@ impl Driver for VirtIOConsoleDriver {
         inner
             .driver_common
             .devices
-            .push(virtio_con_dev as Arc<dyn Device>);
+            .push(virtio_con_dev.clone() as Arc<dyn Device>);
+
+        // avoid deadlock in `init_tty_device`
+        drop(inner);
+
+        let mut devices_fast_guard = self.devices.write();
+        let index = virtio_con_dev.dev_name.get().id();
+        if devices_fast_guard[index].is_none() {
+            devices_fast_guard[index] = Some(virtio_con_dev.clone());
+        } else {
+            panic!("VirtIOConsoleDriver::add_device() failed: device slot already occupied at index: {}", index);
+        }
+        // avoid deadlock in `init_tty_device`
+        drop(devices_fast_guard);
+
+        log::debug!("virtio console: add_device: to init tty device");
+        let r = tty_hvc_driver().init_tty_device(Some(index));
+        log::debug!(
+            "virtio console: add_device: init tty device done, index: {}, dev_name: {:?}",
+            index,
+            virtio_con_dev.dev_name.get(),
+        );
+        if let Err(e) = r {
+            log::error!(
+                "Failed to init tty device for virtio console device, index: {}, dev_name: {:?}, err: {:?}",
+                index,
+                virtio_con_dev.dev_name.get(),
+                e,
+            );
+            return;
+        }
     }
 
     fn delete_device(&self, device: &Arc<dyn Device>) {
@@ -451,6 +618,7 @@ impl Driver for VirtIOConsoleDriver {
             );
 
         let mut guard = self.inner();
+        let mut devices_fast_guard = self.devices.write();
         let index = guard
             .driver_common
             .devices
@@ -460,6 +628,8 @@ impl Driver for VirtIOConsoleDriver {
 
         guard.driver_common.devices.remove(index);
         guard.free_id(virtio_con_dev.dev_name.get().id());
+
+        devices_fast_guard[index] = None;
     }
 
     fn devices(&self) -> Vec<Arc<dyn Device>> {
@@ -540,8 +710,27 @@ fn virtio_console_driver_init() -> Result<(), SystemError> {
         .register(driver.clone() as Arc<dyn VirtIODriver>)
         .expect("Add virtio console driver failed");
     unsafe {
-        VIRTIO_CONSOLE_DRIVER = Some(driver);
+        VIRTIO_CONSOLE_DRIVER = Some(driver.clone());
     }
+    let hvc_tty_driver = TtyDriver::new(
+        VirtIOConsoleDriver::MAX_DEVICES.try_into().unwrap(),
+        "hvc",
+        0,
+        Major::HVC_MAJOR,
+        HVC_MINOR,
+        TtyDriverType::System,
+        *TTY_STD_TERMIOS,
+        driver.clone(),
+        None,
+    );
+
+    let hvc_tty_driver = TtyDriverManager::tty_register_driver(hvc_tty_driver)?;
+    compiler_fence(Ordering::SeqCst);
+    unsafe {
+        TTY_HVC_DRIVER = Some(hvc_tty_driver);
+    }
+
+    compiler_fence(Ordering::SeqCst);
 
     return Ok(());
 }

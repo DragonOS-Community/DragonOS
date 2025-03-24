@@ -936,6 +936,12 @@ impl ProcessControlBlock {
         ProcessManager::add_session(session);
 
         ProcessManager::add_pcb(pcb.clone());
+        log::debug!(
+            "A new process is created, pid: {:?}, pgid: {:?}, sid: {:?}",
+            pcb.pid(),
+            pcb.process_group().unwrap().pgid(),
+            pcb.session().unwrap().sid()
+        );
 
         return pcb;
     }

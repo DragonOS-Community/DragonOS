@@ -339,7 +339,10 @@ impl Syscall {
         let current_pcb = ProcessManager::current_pcb();
         let new_kstack = KernelStack::new()?;
         let name = current_pcb.basic().name().to_string();
-        debug!("the processgroup of current pcb: {:?}", current_pcb.basic().pgid());
+        debug!(
+            "the processgroup of current pcb: {:?}",
+            current_pcb.basic().pgid()
+        );
         let pcb = ProcessControlBlock::new(name, new_kstack);
         // 克隆pcb
         ProcessManager::copy_process(&current_pcb, &pcb, clone_args, current_trapframe)?;

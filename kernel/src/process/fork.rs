@@ -21,6 +21,7 @@ use crate::{
 use super::{
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     process_group::ProcessGroup,
+    session::Session,
     KernelStack, Pid, ProcessControlBlock, ProcessManager,
 };
 const MAX_PID_NS_LEVEL: usize = 32;
@@ -557,22 +558,43 @@ impl ProcessManager {
         parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        let pg = if parent_pcb.process_group().is_none() && parent_pcb.pid() == Pid(0) {
-            ProcessGroup::new(child_pcb.clone())
-        } else {
-            parent_pcb.process_group().unwrap().clone()
-        };
-
+        // log::debug!(
+        //     "fork: before set_group: child_pcb pid: {:?}, sid: {:?}",
+        //     child_pcb.pid(),
+        //     child_pcb.session().unwrap().sid(),
+        // );
+        if parent_pcb.process_group().is_none() && parent_pcb.pid() == Pid(0) {
+            log::debug!(
+                "Setting child_pcb pid: {:?} as leader, sid: {:?}",
+                child_pcb.pid(),
+                child_pcb.sid()
+            );
+            return Ok(());
+        }
+        let pg = parent_pcb.process_group().unwrap().clone();
+        log::debug!(
+            "parent_pcb pid: {:?}, sid: {:?}",
+            parent_pcb.pid(),
+            parent_pcb.session().unwrap().sid()
+        );
         let mut pg_inner = pg.process_group_inner.lock();
         let mut child_pg = child_pcb.process_group.lock();
         let mut children_writelock = parent_pcb.children.write();
 
         children_writelock.push(child_pcb.pid());
 
-        pg_inner.processes.insert(child_pcb.pid(), child_pcb.clone());
+        pg_inner
+            .processes
+            .insert(child_pcb.pid(), child_pcb.clone());
         *child_pg = Arc::downgrade(&pg);
 
-        ProcessManager::add_process_group(pg.clone());
+        // ProcessManager::add_process_group(pg.clone());
+        log::debug!(
+            "fork: after set_group: child_pcb pid: {:?}, pgid: {:?}, sid: {:?}",
+            child_pcb.pid(),
+            child_pcb.process_group().unwrap().pgid(),
+            child_pcb.session().unwrap().sid()
+        );
         Ok(())
     }
 }

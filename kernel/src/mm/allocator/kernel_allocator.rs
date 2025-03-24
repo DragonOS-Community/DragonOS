@@ -15,7 +15,7 @@ use core::{
 
 use super::{
     page_frame::{FrameAllocator, PageFrameCount},
-    slab::{slab_init_state, SLABALLOCATOR},
+    slab::SLABALLOCATOR,
 };
 
 /// 类kmalloc的分配器应当实现的trait
@@ -95,7 +95,7 @@ impl LocalAlloc for KernelAllocator {
     }
 
     unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if allocator_select_condition(layout) || ((ptr as usize) % 4096) == 0 {
+        if allocator_select_condition(layout) {
             self.free_in_buddy(ptr, layout)
         } else if let Some(ref mut slab) = SLABALLOCATOR {
             slab.deallocate(ptr, layout).unwrap()
@@ -137,7 +137,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
 /// 判断选择buddy分配器还是slab分配器
 fn allocator_select_condition(layout: Layout) -> bool {
-    layout.size() > 2048 || !slab_init_state()
+    layout.size() > 2048
 }
 
 fn alloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {

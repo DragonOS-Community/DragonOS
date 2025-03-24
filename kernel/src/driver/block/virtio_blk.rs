@@ -15,13 +15,15 @@ use crate::{
     driver::{
         base::{
             block::{
-                block_device::{ BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
+                block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
                 disk_info::Partition,
                 manager::{block_dev_manager, BlockDevMeta},
             },
             class::Class,
             device::{
-                bus::Bus, driver::{Driver, DriverCommonData}, DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable
+                bus::Bus,
+                driver::{Driver, DriverCommonData},
+                DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,

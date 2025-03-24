@@ -231,7 +231,7 @@ impl VirtConsoleManager {
 
     pub fn setup_default_vc(&self) {
         let console_value_str = CONSOLE_PARAM.value_str().unwrap_or("").trim();
-        if console_value_str != "" {
+        if !console_value_str.is_empty() {
             if let Some(vc) = self.lookup_vc_by_tty_name(console_value_str) {
                 log::info!("Set vc by cmdline: {}", console_value_str);
                 self.set_current_vc(vc);

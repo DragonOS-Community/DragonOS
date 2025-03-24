@@ -26,8 +26,8 @@ use crate::{
     },
 };
 
-use core::{fmt::Display, intrinsics::unlikely, ops::Deref};
 use core::{any::Any, fmt::Debug};
+use core::{fmt::Display, intrinsics::unlikely, ops::Deref};
 use system_error::SystemError;
 
 use self::{
@@ -123,8 +123,6 @@ pub fn sys_devices_virtual_kset() -> Arc<KSet> {
 unsafe fn set_sys_devices_virtual_kset(kset: Arc<KSet>) {
     DEVICES_VIRTUAL_KSET_INSTANCE = Some(kset);
 }
-
-
 
 /// /dev下面的设备的名字
 pub struct DevName {

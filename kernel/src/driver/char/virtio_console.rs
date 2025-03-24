@@ -12,11 +12,15 @@ use crate::{
             kset::KSet,
         },
         tty::{
-            console::ConsoleSwitch, kthread::send_to_tty_refresh_thread, termios::{WindowSize, TTY_STD_TERMIOS}, tty_core::{TtyCore, TtyCoreData}, tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation}, virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, VirtConsole}
+            console::ConsoleSwitch,
+            kthread::send_to_tty_refresh_thread,
+            termios::{WindowSize, TTY_STD_TERMIOS},
+            tty_core::{TtyCore, TtyCoreData},
+            tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
+            virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, VirtConsole},
         },
         video::console::dummycon::dummy_console,
         virtio::{
-            irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
             transport::VirtIOTransport,
             virtio_drivers_error_to_system_error,
@@ -39,9 +43,12 @@ use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use bitmap::traits::BitMapOps;
-use core::{any::Any, sync::atomic::{compiler_fence, Ordering}};
 use core::fmt::Debug;
 use core::fmt::Formatter;
+use core::{
+    any::Any,
+    sync::atomic::{compiler_fence, Ordering},
+};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 use virtio_drivers::device::console::VirtIOConsole;
@@ -51,11 +58,6 @@ const HVC_MINOR: u32 = 0;
 
 static mut VIRTIO_CONSOLE_DRIVER: Option<Arc<VirtIOConsoleDriver>> = None;
 static mut TTY_HVC_DRIVER: Option<Arc<TtyDriver>> = None;
-
-#[inline(always)]
-fn virtio_console_driver() -> &'static Arc<VirtIOConsoleDriver> {
-    unsafe { VIRTIO_CONSOLE_DRIVER.as_ref().unwrap() }
-}
 
 #[inline(always)]
 fn tty_hvc_driver() -> &'static Arc<TtyDriver> {
@@ -94,7 +96,7 @@ pub fn virtio_console(
 pub struct VirtIOConsoleDevice {
     dev_name: Lazy<DevName>,
     dev_id: Arc<DeviceId>,
-    self_ref: Weak<Self>,
+    _self_ref: Weak<Self>,
     locked_kobj_state: LockedKObjectState,
     inner: SpinLock<InnerVirtIOConsoleDevice>,
 }
@@ -125,7 +127,7 @@ impl VirtIOConsoleDevice {
         let dev = Arc::new_cyclic(|self_ref| Self {
             dev_id,
             dev_name: Lazy::new(),
-            self_ref: self_ref.clone(),
+            _self_ref: self_ref.clone(),
             locked_kobj_state: LockedKObjectState::default(),
             inner: SpinLock::new(InnerVirtIOConsoleDevice {
                 device_inner,
@@ -306,7 +308,6 @@ impl VirtIODevice for VirtIOConsoleDevice {
                 break; // No more bytes to read
             }
         }
-        
 
         send_to_tty_refresh_thread(&buf[0..index]);
         Ok(IrqReturn::Handled)
@@ -422,8 +423,7 @@ impl InnerVirtIOConsoleDriver {
     }
 
     fn format_name(id: usize) -> DevName {
-        let x = (b'a' + id as u8) as char;
-        DevName::new(format!("vport{}", x), id)
+        DevName::new(format!("vport{}", id), id)
     }
 
     fn free_id(&mut self, id: usize) {

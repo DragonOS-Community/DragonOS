@@ -6,7 +6,6 @@ use core::{
 };
 
 use alloc::{
-    collections::LinkedList,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,

@@ -481,8 +481,8 @@ pub trait TtyOperation: Sync + Send + Debug {
 
     fn flush_chars(&self, tty: &TtyCoreData);
 
-    fn put_char(&self, tty: &TtyCoreData,ch: u8) -> Result<(), SystemError> {
-       self.write(tty, &[ch],1).map(|_| ())
+    fn put_char(&self, tty: &TtyCoreData, ch: u8) -> Result<(), SystemError> {
+        self.write(tty, &[ch], 1).map(|_| ())
     }
 
     fn start(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {

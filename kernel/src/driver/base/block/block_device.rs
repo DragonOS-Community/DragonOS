@@ -2,7 +2,8 @@
 use crate::driver::{
     base::{
         device::{
-            device_number::{DeviceNumber, Major}, DevName, Device, DeviceError, IdTable, BLOCKDEVS
+            device_number::{DeviceNumber, Major},
+            DevName, Device, DeviceError, IdTable, BLOCKDEVS,
         },
         map::{
             DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
@@ -12,8 +13,8 @@ use crate::driver::{
     block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
 };
 
-use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{any::Any, fmt::Display, ops::Deref};
+use alloc::{sync::Arc, vec::Vec};
+use core::any::Any;
 use log::error;
 use system_error::SystemError;
 
@@ -219,7 +220,6 @@ pub fn __bytes_to_lba(addr: usize, blk_size: usize) -> BlockId {
 pub fn __lba_to_bytes(lba_id: usize, blk_size: usize) -> BlockId {
     return lba_id * blk_size;
 }
-
 
 /// @brief 块设备应该实现的操作
 pub trait BlockDevice: Device {

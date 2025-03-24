@@ -24,7 +24,7 @@ use virtio_drivers::transport::{DeviceType, Transport};
 
 ///@brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）
 #[unified_init(INITCALL_DEVICE)]
-pub fn virtio_probe() -> Result<(), SystemError> {
+fn virtio_probe() -> Result<(), SystemError> {
     #[cfg(not(target_arch = "riscv64"))]
     virtio_probe_pci();
     virtio_probe_mmio();

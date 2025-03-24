@@ -85,7 +85,7 @@ QEMU_ACCELARATE=""
 QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
 
-KERNEL_CMDLINE=" -append console=/dev/char/hvc0 "
+KERNEL_CMDLINE=" console=/dev/char/hvc0 "
 
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
@@ -148,7 +148,7 @@ while true;do
               QEMU_MONITOR=""
               QEMU_ARGUMENT+=" --nographic "
               QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
-              QEMU_ARGUMENT+= " ${KERNEL_CMDLINE} "
+              QEMU_ARGUMENT+= " -append ${KERNEL_CMDLINE} "
 
               ;;
         esac;shift 2;;
@@ -171,7 +171,7 @@ QEMU_ARGUMENT+="-s ${QEMU_MACHINE} ${QEMU_CPU_FEATURES} ${QEMU_RTC_CLOCK} ${QEMU
 QEMU_ARGUMENT+=" ${QEMU_SHM_OBJECT} "
 QEMU_ARGUMENT+=" ${QEMU_ACCELARATE} "
 
-QEMU_ARGUMENT+=" -D qemu.log "
+QEMU_ARGUMENT+=" -D ../qemu.log "
 
 
 # 安装riscv64的uboot

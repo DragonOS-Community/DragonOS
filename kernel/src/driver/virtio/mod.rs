@@ -1,5 +1,4 @@
-
-use alloc::{vec::Vec,string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::exception::{irqdesc::IrqReturn, IrqNumber};
@@ -77,8 +76,7 @@ impl VirtioDeviceId {
     }
 }
 
-
-pub fn virtio_drivers_error_to_system_error(error: virtio_drivers::Error) -> SystemError{
+pub fn virtio_drivers_error_to_system_error(error: virtio_drivers::Error) -> SystemError {
     match error {
         virtio_drivers::Error::QueueFull => SystemError::ENOBUFS,
         virtio_drivers::Error::NotReady => SystemError::EAGAIN_OR_EWOULDBLOCK,

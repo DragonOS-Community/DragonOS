@@ -85,11 +85,11 @@ QEMU_ACCELARATE=""
 QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
 
-KERNEL_CMDLINE=" console=/dev/hvc0 "
+KERNEL_CMDLINE=""
 
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
-VIRTIO_BLK_DEVICE=false
+VIRTIO_BLK_DEVICE=true
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
     QEMU_ACCELARATE=" -machine accel=${qemu_accel} "
@@ -144,11 +144,12 @@ while true;do
               QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
               # 添加 virtio console 设备
               QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
-
+              KERNEL_CMDLINE+=" console=/dev/hvc0 "
               QEMU_MONITOR=""
               QEMU_ARGUMENT+=" --nographic "
               QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
-              QEMU_ARGUMENT+=" -append \"${KERNEL_CMDLINE}\" "
+              QEMU_ARGUMENT+=-append \"${KERNEL_CMDLINE}\"
+              
               ;;
         esac;shift 2;;
         *) break

@@ -107,7 +107,7 @@ impl VirtIONetDevice {
         let mac = wire::EthernetAddress::from_bytes(&driver_net.mac_address());
         debug!("VirtIONetDevice mac: {:?}", mac);
         let device_inner = VirtIONicDeviceInner::new(driver_net);
-
+        device_inner.inner.lock_irqsave().enable_interrupts();
         let dev = Arc::new(Self {
             dev_id,
             inner: SpinLock::new(InnerVirtIONetDevice {
@@ -258,7 +258,9 @@ impl Device for VirtIONetDevice {
 
 impl VirtIODevice for VirtIONetDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        poll_ifaces_try_lock_onetime().ok();
+        if poll_ifaces_try_lock_onetime().is_err() {
+            log::error!("virtio_net: try lock failed");
+        }
         return Ok(IrqReturn::Handled);
     }
 

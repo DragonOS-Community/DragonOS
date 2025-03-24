@@ -85,7 +85,7 @@ QEMU_ACCELARATE=""
 QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
 
-KERNEL_CMDLINE=" console=/dev/char/hvc0 "
+KERNEL_CMDLINE=" console=/dev/hvc0 "
 
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
@@ -148,8 +148,7 @@ while true;do
               QEMU_MONITOR=""
               QEMU_ARGUMENT+=" --nographic "
               QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
-              QEMU_ARGUMENT+= " -append ${KERNEL_CMDLINE} "
-
+              QEMU_ARGUMENT+=" -append \"${KERNEL_CMDLINE}\" "
               ;;
         esac;shift 2;;
         *) break

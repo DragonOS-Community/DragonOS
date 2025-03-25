@@ -314,7 +314,7 @@ impl Syscall {
     /// 获取指定进程的会话id
     ///
     /// 若pid为0，则返回当前进程的会话id
-    /// 
+    ///
     /// 若pid不为0，则返回指定进程的会话id
     pub fn getsid(pid: Pid) -> Result<usize, SystemError> {
         let session = ProcessManager::current_pcb().session().unwrap();

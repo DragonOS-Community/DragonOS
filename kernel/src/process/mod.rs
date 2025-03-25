@@ -1201,13 +1201,13 @@ impl ProcessControlBlock {
     }
 
     /// 将进程加入到指定pgid的进程组中（无论该进程组是否已经存在）
-    /// 
+    ///
     /// 如果进程组已经存在，则将进程加入到该进程组中
     /// 如果进程组不存在，则创建一个新的进程组，并将进程加入到该进程组中
-    /// 
+    ///
     /// ## 参数
     /// `pgid` : 目标进程组的pgid
-    /// 
+    ///
     /// ## 返回值
     /// 无
     pub fn join_other_group(self: &Arc<Self>, pgid: Pgid) -> Result<(), SystemError> {

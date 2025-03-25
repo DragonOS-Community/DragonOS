@@ -585,30 +585,26 @@ impl ProcessManager {
         pg_inner
             .processes
             .insert(child_pcb.pid(), child_pcb.clone());
+
+        // 检查是否已经存在pgid和sid
         let pgid = Pgid::new(child_pcb.pid().0);
         let sid = Sid::new(pgid.0);
+
         if ProcessManager::find_process_group(pgid).is_some() {
             ProcessManager::remove_process_group(pgid);
         }
         if ProcessManager::find_session(sid).is_some() {
             ProcessManager::remove_session(sid);
         }
-        // *child_pg = Arc::downgrade(&pg);
-        child_pcb.set_process_group(&pg);
-        // log::debug!(
-        //     "After set_group: child_pcb pid: {:?}, pgid: {:?}, sid: {:?}",
-        //     child_pcb.pid(),
-        //     child_pg.upgrade().unwrap().pgid(),
-        //     child_pcb.session().unwrap().sid()
-        // );
 
-        // ProcessManager::add_process_group(pg.clone());
-        // log::debug!(
-        //     "fork: after set_group: child_pcb pid: {:?}, pgid: {:?}, sid: {:?}",
-        //     child_pcb.pid(),
-        //     child_pcb.process_group().unwrap().pgid(),
-        //     child_pcb.session().unwrap().sid()
-        // );
+        child_pcb.set_process_group(&pg);
+
+        let mut guard = child_pcb.basic_mut();
+        guard.set_pgid(pg.pgid());
+        if let Some(session) = pg.session() {
+            guard.set_sid(session.sid());
+        }
+
         Ok(())
     }
 }

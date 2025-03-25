@@ -1545,12 +1545,20 @@ impl ProcessBasicInfo {
         return self.pgid;
     }
 
+    pub fn set_pgid(&mut self, pgid: Pgid) {
+        self.pgid = pgid;
+    }
+
     pub fn ppid(&self) -> Pid {
         return self.ppid;
     }
 
     pub fn sid(&self) -> Sid {
         return self.sid;
+    }
+
+    pub fn set_sid(&mut self, sid: Sid) {
+        self.sid = sid;
     }
 
     pub fn name(&self) -> &str {

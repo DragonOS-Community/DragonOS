@@ -233,7 +233,9 @@ impl VirtConsoleManager {
         let mut console_value_str = CONSOLE_PARAM.value_str().unwrap_or("").trim();
         if !console_value_str.is_empty() {
             // 删除前缀/dev/
-            console_value_str = console_value_str.strip_prefix("/dev/").unwrap_or(console_value_str);
+            console_value_str = console_value_str
+                .strip_prefix("/dev/")
+                .unwrap_or(console_value_str);
             if let Some(vc) = self.lookup_vc_by_tty_name(console_value_str) {
                 log::info!("Set vc by cmdline: {}", console_value_str);
                 self.set_current_vc(vc);

@@ -505,7 +505,7 @@ impl File {
             }
             FileType::Pipe => {
                 let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
-                return inode.inner().lock().add_epoll(epitem);
+                return inode.add_epoll(epitem);
             }
             _ => {
                 let r = self.inode.kernel_ioctl(epitem, &self.private_data.lock());
@@ -529,13 +529,14 @@ impl File {
             }
             FileType::Pipe => {
                 let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
-                inode.inner().lock().remove_epoll(epoll)
+                inode.remove_epoll(epoll)
             }
             _ => {
                 let inode = self.inode.downcast_ref::<EventFdInode>();
                 if let Some(inode) = inode {
                     return inode.remove_epoll(epoll);
                 }
+
                 let inode = self
                     .inode
                     .downcast_ref::<PerfEventInode>()

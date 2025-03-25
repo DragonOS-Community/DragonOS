@@ -1143,6 +1143,13 @@ impl ProcessControlBlock {
         return false;
     }
 
+    /// 将进程移动到新会话中
+    /// 如果进程已经是会话领导者，则返回当前会话
+    /// 如果不是，则主动创建一个新会话，并将进程移动到新会话中，返回新会话
+    ///
+    /// ## 返回值
+    ///
+    /// 新会话
     pub fn go_to_new_session(self: &Arc<Self>) -> Result<Arc<Session>, SystemError> {
         if self.is_session_leader() {
             return Ok(self.session().unwrap());
@@ -1193,6 +1200,16 @@ impl ProcessControlBlock {
         Ok(new_session)
     }
 
+    /// 将进程加入到指定pgid的进程组中（无论该进程组是否已经存在）
+    /// 
+    /// 如果进程组已经存在，则将进程加入到该进程组中
+    /// 如果进程组不存在，则创建一个新的进程组，并将进程加入到该进程组中
+    /// 
+    /// ## 参数
+    /// `pgid` : 目标进程组的pgid
+    /// 
+    /// ## 返回值
+    /// 无
     pub fn join_other_group(self: &Arc<Self>, pgid: Pgid) -> Result<(), SystemError> {
         if self.pgid() == pgid {
             return Ok(());
@@ -1219,6 +1236,7 @@ impl ProcessControlBlock {
         Ok(())
     }
 
+    /// 将进程加入到新创建的进程组中
     fn join_new_group(self: &Arc<Self>) -> Result<(), SystemError> {
         let session = self.session().unwrap();
         let mut self_pg_mut = self.process_group.lock();
@@ -1250,6 +1268,8 @@ impl ProcessControlBlock {
 
         Ok(())
     }
+
+    /// 将进程加入到指定的进程组中
     fn join_specified_group(
         self: &Arc<Self>,
         group: &Arc<ProcessGroup>,

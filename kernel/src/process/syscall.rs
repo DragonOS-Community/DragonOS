@@ -270,6 +270,15 @@ impl Syscall {
         return Ok(target_proc.pgid());
     }
 
+    /// 设置指定进程的pgid
+    ///
+    /// ## 参数
+    ///
+    /// - pid: 指定进程号
+    /// - pgid: 新的进程组号
+    ///
+    /// ## 返回值
+    /// 无
     pub fn setpgid(pid: Pid, pgid: Pgid) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
         let pid = if pid == Pid(0) {
@@ -295,12 +304,18 @@ impl Syscall {
         return Ok(0);
     }
 
+    /// 创建新的会话
     pub fn setsid() -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let session = pcb.go_to_new_session()?;
         Ok(session.sid().0)
     }
 
+    /// 获取指定进程的会话id
+    ///
+    /// 若pid为0，则返回当前进程的会话id
+    /// 
+    /// 若pid不为0，则返回指定进程的会话id
     pub fn getsid(pid: Pid) -> Result<usize, SystemError> {
         let session = ProcessManager::current_pcb().session().unwrap();
         let sid = session.sid().0;
@@ -339,10 +354,7 @@ impl Syscall {
         let current_pcb = ProcessManager::current_pcb();
         let new_kstack = KernelStack::new()?;
         let name = current_pcb.basic().name().to_string();
-        debug!(
-            "the processgroup of current pcb: {:?}",
-            current_pcb.basic().pgid()
-        );
+
         let pcb = ProcessControlBlock::new(name, new_kstack);
         // 克隆pcb
         ProcessManager::copy_process(&current_pcb, &pcb, clone_args, current_trapframe)?;

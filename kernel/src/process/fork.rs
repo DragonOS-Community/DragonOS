@@ -534,13 +534,8 @@ impl ProcessManager {
         }
 
         // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
-        // debug!(
-        //     "Current_pcb pid:{}, processgroup:{:?}, clone flags:{:?}",
-        //     current_pcb.pid(),
-        //     current_pcb.process_group(),
-        //     clone_flags
-        // );
-        Self::set_group(current_pcb, pcb).unwrap_or_else(|e| {
+
+        Self::copy_group(current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -552,32 +547,26 @@ impl ProcessManager {
         Ok(())
     }
 
-    fn set_group(
+    /// 拷贝进程组信息
+    ///
+    /// ## 参数
+    ///
+    /// `parent_pcb` - 父进程
+    /// `child_pcb` - 子进程
+    /// ## 返回值
+    ///
+    /// 无
+    fn copy_group(
         parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // log::debug!(
-        //     "fork: before set_group:  child_pcb pid: {:?}, pgid: {:?}, sid: {:?}",
-        //     child_pcb.pid(),
-        //     child_pcb.process_group().unwrap().pgid(),
-        //     child_pcb.session().unwrap().sid()
-        // );
         if parent_pcb.process_group().is_none() && parent_pcb.pid() == Pid(0) {
-            // log::debug!(
-            //     "Setting child_pcb pid: {:?} as leader, sid: {:?}",
-            //     child_pcb.pid(),
-            //     child_pcb.sid()
-            // );
             return Ok(());
         }
         let pg = parent_pcb.process_group().unwrap();
-        // log::debug!(
-        //     "parent_pcb pid: {:?}, sid: {:?}",
-        //     parent_pcb.pid(),
-        //     parent_pcb.session().unwrap().sid()
-        // );
+
         let mut pg_inner = pg.process_group_inner.lock();
-        // let mut child_pg = child_pcb.process_group.lock();
+
         let mut children_writelock = parent_pcb.children.write();
 
         children_writelock.push(child_pcb.pid());

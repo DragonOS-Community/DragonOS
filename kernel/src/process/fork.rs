@@ -590,9 +590,12 @@ impl ProcessManager {
 
         let mut guard = child_pcb.basic_mut();
         guard.set_pgid(pg.pgid());
-        if let Some(session) = pg.session() {
-            guard.set_sid(session.sid());
-        }
+        drop(guard);
+        //todo 这里应该解除注释，但是每次一到这里就触发调度，然后由于当前进程持有锁的数量不等于0导致panic
+        // 
+        // if let Some(session) = pg.session() {
+        //     guard.set_sid(session.sid());
+        // }
 
         Ok(())
     }

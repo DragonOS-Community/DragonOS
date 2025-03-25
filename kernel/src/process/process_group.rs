@@ -73,7 +73,13 @@ impl ProcessGroup {
     }
 
     pub fn session(&self) -> Option<Arc<Session>> {
-        self.process_group_inner.lock().session.upgrade()
+        // log::debug!("Before lock");
+        let guard = self.process_group_inner.lock();
+        // log::debug!("Locking");
+        let session = guard.session.upgrade();
+        drop(guard);
+        // log::debug!("After lock");
+        return session;
     }
 
     pub fn broadcast(&self) {

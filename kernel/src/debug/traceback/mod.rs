@@ -1,15 +1,17 @@
 use core::ffi::CStr;
 
-extern "C" {
-    #[linkage = "weak"]
-    fn kallsyms_address();
-    #[linkage = "weak"]
-    fn kallsyms_num();
-    #[linkage = "weak"]
-    fn kallsyms_names_index();
-    #[linkage = "weak"]
-    fn kallsyms_names();
-}
+#[linkage = "weak"]
+#[no_mangle]
+fn kallsyms_address() {}
+#[linkage = "weak"]
+#[no_mangle]
+fn kallsyms_num() {}
+#[linkage = "weak"]
+#[no_mangle]
+fn kallsyms_names_index() {}
+#[linkage = "weak"]
+#[no_mangle]
+fn kallsyms_names() {}
 
 pub unsafe fn lookup_kallsyms(addr: u64, level: i32) -> Option<()> {
     let sym_names = kallsyms_names as *const u8;

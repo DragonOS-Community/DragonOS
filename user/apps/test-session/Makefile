@@ -8,13 +8,13 @@ CC=$(CROSS_COMPILE)gcc
 
 
 all: main.c 
-	$(CC) -static -o test_pg_and_session main.c
+	$(CC) -static -o test-session main.c
 
 .PHONY: install clean
 install: all
-	mv test_pg_and_session $(DADK_CURRENT_BUILD_DIR)/test_pg_and_session
+	mv test-session $(DADK_CURRENT_BUILD_DIR)/test-session
 
 clean:
-	rm test_pg_and_session *.o
+	rm test-session *.o
 
 fmt:

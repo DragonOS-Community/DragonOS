@@ -1,11 +1,11 @@
 # 用户程序名称
-name = "test_pg_and_session"
+name = "test-session"
 
 # 版本号
 version = "0.1.0"
 
 # 用户程序描述信息
-description = "测试进程组和会话的系统调用"
+description = "测试会话的系统调用"
 
 # 是否只构建一次
 build-once = false
@@ -23,7 +23,7 @@ type = "build-from-source"
 # 构建来源
 source = "local"
 # 路径或URL
-source-path = "user/apps/test_pg_and_session"
+source-path = "user/apps/test-session"
 
 # 构建相关信息
 [build]

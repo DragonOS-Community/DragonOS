@@ -19,6 +19,13 @@ impl SessionInner {
     pub fn remove_process_group(&mut self, pgid: &Pgid) {
         self.process_groups.remove(pgid);
     }
+    pub fn remove_process(&mut self, pcb: &Arc<ProcessControlBlock>) {
+        if let Some(leader) = &self.leader {
+            if Arc::ptr_eq(leader, pcb) {
+                self.leader = None;
+            }
+        }
+    }
 }
 
 impl Session {
@@ -53,19 +60,5 @@ impl Session {
             .lock()
             .process_groups
             .contains_key(&process_group.pgid)
-    }
-
-    pub fn new_with_leader(pg:Arc<ProcessGroup>, leader: Arc<ProcessControlBlock>) -> Arc<Self> {
-        let sid = Sid(pg.pgid.into());
-        let mut process_groups = BTreeMap::new();
-        process_groups.insert(pg.pgid, pg.clone());
-        let inner = SessionInner {
-            process_groups,
-            leader: Some(leader),
-        };
-        Arc::new(Self {
-            sid,
-            session_inner: Mutex::new(inner),
-        })
     }
 }

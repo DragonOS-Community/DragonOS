@@ -261,13 +261,13 @@ impl Syscall {
     ///
     /// @return 成功，指定进程的进程组id
     /// @return 错误，不存在该进程
-    pub fn getpgid(mut pid: Pid) -> Result<Pgid, SystemError> {
+    pub fn getpgid(pid: Pid) -> Result<Pgid, SystemError> {
         if pid == Pid(0) {
             let current_pcb = ProcessManager::current_pcb();
-            pid = current_pcb.pid();
+            return Ok(current_pcb.pgid());
         }
         let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
-        return Ok(target_proc.basic().pgid());
+        return Ok(target_proc.pgid());
     }
 
     pub fn setpgid(pid: Pid, pgid: Pgid) -> Result<usize, SystemError> {
@@ -286,7 +286,7 @@ impl Syscall {
             return Err(SystemError::ESRCH);
         }
 
-        if pgid.into() != pid.into() && ProcessManager::find_process_group(pgid).is_some() {
+        if pgid.into() != pid.into() && ProcessManager::find_process_group(pgid).is_none() {
             return Err(SystemError::EPERM);
         }
         let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;

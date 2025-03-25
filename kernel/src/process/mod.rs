@@ -218,7 +218,7 @@ impl ProcessManager {
         return ALL_PROCESS.lock_irqsave().as_ref()?.get(&pid).cloned();
     }
 
-    /// 根据pgid获取进程组的pcb
+    /// 根据pgid获取进程组
     ///
     /// ## 参数
     ///
@@ -226,7 +226,7 @@ impl ProcessManager {
     ///
     /// ## 返回值
     ///
-    /// 如果找到了对应的进程组，那么返回该进程组的pcb，否则返回None
+    /// 如果找到了对应的进程组，那么返回该进程组，否则返回None
     pub fn find_process_group(pgid: Pgid) -> Option<Arc<ProcessGroup>> {
         return ALL_PROCESS_GROUP
             .lock_irqsave()
@@ -235,6 +235,15 @@ impl ProcessManager {
             .cloned();
     }
 
+    /// 根据sid获取会话
+    ///
+    /// ## 参数
+    ///
+    /// - `sid` : 会话的sid
+    ///
+    /// ## 返回值
+    ///
+    /// 如果找到了对应的会话，那么返回该会话，否则返回None
     pub fn find_session(sid: Sid) -> Option<Arc<Session>> {
         return ALL_SESSION.lock_irqsave().as_ref()?.get(&sid).cloned();
     }
@@ -265,7 +274,7 @@ impl ProcessManager {
     ///
     /// ## 参数
     ///
-    /// - `pg` : 进程组
+    /// - `pg` : Arc<ProcessGroup>
     ///
     /// ## 返回值
     ///
@@ -278,6 +287,15 @@ impl ProcessManager {
             .insert(pg.pgid(), pg.clone());
     }
 
+    /// 向系统中添加一个会话
+    ///
+    /// ## 参数
+    ///
+    /// - `session` : Arc<Session>
+    ///
+    /// ## 返回值
+    ///
+    /// 无
     pub fn add_session(session: Arc<Session>) {
         ALL_SESSION
             .lock_irqsave()
@@ -936,12 +954,12 @@ impl ProcessControlBlock {
         ProcessManager::add_session(session);
 
         ProcessManager::add_pcb(pcb.clone());
-        log::debug!(
-            "A new process is created, pid: {:?}, pgid: {:?}, sid: {:?}",
-            pcb.pid(),
-            pcb.process_group().unwrap().pgid(),
-            pcb.session().unwrap().sid()
-        );
+        // log::debug!(
+        //     "A new process is created, pid: {:?}, pgid: {:?}, sid: {:?}",
+        //     pcb.pid(),
+        //     pcb.process_group().unwrap().pgid(),
+        //     pcb.session().unwrap().sid()
+        // );
 
         return pcb;
     }
@@ -1055,13 +1073,17 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn pgid(&self) -> Pgid {
-        return self.basic().pgid();
+        if let Some(process_group) = self.process_group.lock().upgrade() {
+            process_group.pgid()
+        } else {
+            Pgid(0)
+        }
     }
 
-    #[inline(always)]
-    pub fn sid(&self) -> Sid {
-        return self.basic().sid();
-    }
+    // #[inline(always)]
+    // pub fn sid(&self) -> Sid {
+    //     return self.basic().sid();
+    // }
 
     #[inline(always)]
     pub fn pid_strcut(&self) -> Arc<RwLock<PidStrcut>> {
@@ -1098,6 +1120,11 @@ impl ProcessControlBlock {
         pg.session()
     }
 
+    pub fn set_process_group(self: &Arc<Self>, pg: &Arc<ProcessGroup>) {
+        *self.process_group.lock() = Arc::downgrade(pg);
+        // log::debug!("pid: {:?} set pgid: {:?}", self.pid(), pg.pgid());
+    }
+
     pub fn is_process_group_leader(self: &Arc<Self>) -> bool {
         let pg = self.process_group().unwrap();
         if let Some(leader) = pg.leader() {
@@ -1120,10 +1147,13 @@ impl ProcessControlBlock {
         if self.is_session_leader() {
             return Ok(self.session().unwrap());
         }
+
         if self.is_process_group_leader() {
             return Err(SystemError::EPERM);
         }
+
         let session = self.session().unwrap();
+
         let mut self_group = self.process_group.lock();
         if ProcessManager::find_session(Sid(self.pid().into())).is_some() {
             return Err(SystemError::EPERM);
@@ -1158,7 +1188,7 @@ impl ProcessControlBlock {
         ProcessManager::add_session(new_session.clone());
 
         let mut session_inner = session.session_inner.lock();
-        session_inner.remove_process_group(&self.pgid());
+        session_inner.remove_process(self);
 
         Ok(new_session)
     }

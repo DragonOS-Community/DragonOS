@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use alloc::{string::ToString, sync::Arc};
-use log::{debug, error};
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -20,9 +20,7 @@ use crate::{
 
 use super::{
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
-    process_group::ProcessGroup,
-    session::Session,
-    KernelStack, Pid, ProcessControlBlock, ProcessManager,
+    KernelStack, Pgid, Pid, ProcessControlBlock, ProcessManager, Sid,
 };
 const MAX_PID_NS_LEVEL: usize = 32;
 
@@ -345,7 +343,7 @@ impl ProcessManager {
         clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
-        log::debug!("fork: clone_flags: {:?}", clone_args.flags);
+        // log::debug!("fork: clone_flags: {:?}", clone_args.flags);
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
@@ -536,12 +534,12 @@ impl ProcessManager {
         }
 
         // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
-        debug!(
-            "Current_pcb pid:{}, processgroup:{:?}, clone flags:{:?}",
-            current_pcb.pid(),
-            current_pcb.process_group(),
-            clone_flags
-        );
+        // debug!(
+        //     "Current_pcb pid:{}, processgroup:{:?}, clone flags:{:?}",
+        //     current_pcb.pid(),
+        //     current_pcb.process_group(),
+        //     clone_flags
+        // );
         Self::set_group(current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
@@ -559,26 +557,27 @@ impl ProcessManager {
         child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
         // log::debug!(
-        //     "fork: before set_group: child_pcb pid: {:?}, sid: {:?}",
+        //     "fork: before set_group:  child_pcb pid: {:?}, pgid: {:?}, sid: {:?}",
         //     child_pcb.pid(),
-        //     child_pcb.session().unwrap().sid(),
+        //     child_pcb.process_group().unwrap().pgid(),
+        //     child_pcb.session().unwrap().sid()
         // );
         if parent_pcb.process_group().is_none() && parent_pcb.pid() == Pid(0) {
-            log::debug!(
-                "Setting child_pcb pid: {:?} as leader, sid: {:?}",
-                child_pcb.pid(),
-                child_pcb.sid()
-            );
+            // log::debug!(
+            //     "Setting child_pcb pid: {:?} as leader, sid: {:?}",
+            //     child_pcb.pid(),
+            //     child_pcb.sid()
+            // );
             return Ok(());
         }
-        let pg = parent_pcb.process_group().unwrap().clone();
-        log::debug!(
-            "parent_pcb pid: {:?}, sid: {:?}",
-            parent_pcb.pid(),
-            parent_pcb.session().unwrap().sid()
-        );
+        let pg = parent_pcb.process_group().unwrap();
+        // log::debug!(
+        //     "parent_pcb pid: {:?}, sid: {:?}",
+        //     parent_pcb.pid(),
+        //     parent_pcb.session().unwrap().sid()
+        // );
         let mut pg_inner = pg.process_group_inner.lock();
-        let mut child_pg = child_pcb.process_group.lock();
+        // let mut child_pg = child_pcb.process_group.lock();
         let mut children_writelock = parent_pcb.children.write();
 
         children_writelock.push(child_pcb.pid());
@@ -586,15 +585,30 @@ impl ProcessManager {
         pg_inner
             .processes
             .insert(child_pcb.pid(), child_pcb.clone());
-        *child_pg = Arc::downgrade(&pg);
+        let pgid = Pgid::new(child_pcb.pid().0);
+        let sid = Sid::new(pgid.0);
+        if ProcessManager::find_process_group(pgid).is_some() {
+            ProcessManager::remove_process_group(pgid);
+        }
+        if ProcessManager::find_session(sid).is_some() {
+            ProcessManager::remove_session(sid);
+        }
+        // *child_pg = Arc::downgrade(&pg);
+        child_pcb.set_process_group(&pg);
+        // log::debug!(
+        //     "After set_group: child_pcb pid: {:?}, pgid: {:?}, sid: {:?}",
+        //     child_pcb.pid(),
+        //     child_pg.upgrade().unwrap().pgid(),
+        //     child_pcb.session().unwrap().sid()
+        // );
 
         // ProcessManager::add_process_group(pg.clone());
-        log::debug!(
-            "fork: after set_group: child_pcb pid: {:?}, pgid: {:?}, sid: {:?}",
-            child_pcb.pid(),
-            child_pcb.process_group().unwrap().pgid(),
-            child_pcb.session().unwrap().sid()
-        );
+        // log::debug!(
+        //     "fork: after set_group: child_pcb pid: {:?}, pgid: {:?}, sid: {:?}",
+        //     child_pcb.pid(),
+        //     child_pcb.process_group().unwrap().pgid(),
+        //     child_pcb.session().unwrap().sid()
+        // );
         Ok(())
     }
 }

@@ -12,8 +12,9 @@ use crate::{
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
+        process_group::Pgid,
         resource::{RLimit64, RUsage},
-        Pgid, ProcessFlags, ProcessManager,
+        ProcessFlags, ProcessManager,
     },
     sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,

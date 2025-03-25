@@ -6,7 +6,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use log::{debug, error};
+use log::error;
 use system_error::SystemError;
 
 use super::{
@@ -286,8 +286,8 @@ impl Syscall {
         } else {
             pid
         };
-        let pgid = if pgid == Pgid(0) {
-            Pgid(pid.into())
+        let pgid = if pgid == Pgid::from(0) {
+            Pgid::from(pid.into())
         } else {
             pgid
         };
@@ -308,7 +308,7 @@ impl Syscall {
     pub fn setsid() -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let session = pcb.go_to_new_session()?;
-        Ok(session.sid().0)
+        Ok(session.sid().into())
     }
 
     /// 获取指定进程的会话id
@@ -318,7 +318,7 @@ impl Syscall {
     /// 若pid不为0，则返回指定进程的会话id
     pub fn getsid(pid: Pid) -> Result<usize, SystemError> {
         let session = ProcessManager::current_pcb().session().unwrap();
-        let sid = session.sid().0;
+        let sid = session.sid().into();
         if pid == Pid(0) {
             return Ok(sid);
         }

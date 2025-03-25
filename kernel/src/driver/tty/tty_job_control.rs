@@ -102,12 +102,12 @@ impl TtyJobCtrlManager {
                 if current.sig_info_irqsave().tty().is_none()
                     || !Arc::ptr_eq(&current.sig_info_irqsave().tty().clone().unwrap(), &tty)
                     || ctrl.session.is_none()
-                    || ctrl.session.unwrap() != Pid::new(current.basic().sid().into())
+                    || ctrl.session.unwrap() != Pid::from(current.basic().sid().into())
                 {
                     return Err(SystemError::ENOTTY);
                 }
 
-                ctrl.pgid = Some(Pid::new(*pgrp as usize));
+                ctrl.pgid = Some(Pid::from(*pgrp as usize));
 
                 return Ok(0);
             }

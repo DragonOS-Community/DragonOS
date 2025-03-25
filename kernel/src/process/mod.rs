@@ -16,8 +16,8 @@ use alloc::{
 use cred::INIT_CRED;
 use hashbrown::HashMap;
 use log::{debug, error, info, warn};
-use process_group::ProcessGroup;
-use session::Session;
+use process_group::{Pgid, ProcessGroup, ALL_PROCESS_GROUP};
+use session::{Session, Sid, ALL_SESSION};
 use system_error::SystemError;
 
 use crate::{
@@ -92,8 +92,6 @@ pub mod utils;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
-static ALL_PROCESS_GROUP: SpinLock<Option<HashMap<Pgid, Arc<ProcessGroup>>>> = SpinLock::new(None);
-static ALL_SESSION: SpinLock<Option<HashMap<Sid, Arc<Session>>>> = SpinLock::new(None);
 
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 
@@ -218,36 +216,6 @@ impl ProcessManager {
         return ALL_PROCESS.lock_irqsave().as_ref()?.get(&pid).cloned();
     }
 
-    /// 根据pgid获取进程组
-    ///
-    /// ## 参数
-    ///
-    /// - `pgid` : 进程组的pgid
-    ///
-    /// ## 返回值
-    ///
-    /// 如果找到了对应的进程组，那么返回该进程组，否则返回None
-    pub fn find_process_group(pgid: Pgid) -> Option<Arc<ProcessGroup>> {
-        return ALL_PROCESS_GROUP
-            .lock_irqsave()
-            .as_ref()?
-            .get(&pgid)
-            .cloned();
-    }
-
-    /// 根据sid获取会话
-    ///
-    /// ## 参数
-    ///
-    /// - `sid` : 会话的sid
-    ///
-    /// ## 返回值
-    ///
-    /// 如果找到了对应的会话，那么返回该会话，否则返回None
-    pub fn find_session(sid: Sid) -> Option<Arc<Session>> {
-        return ALL_SESSION.lock_irqsave().as_ref()?.get(&sid).cloned();
-    }
-
     /// 向系统中添加一个进程的pcb
     ///
     /// ## 参数
@@ -268,40 +236,6 @@ impl ProcessManager {
         //     .as_mut()
         //     .unwrap()
         //     .insert(pcb.pgid(), ProcessGroup::new(pcb.clone()));
-    }
-
-    /// 向系统中添加一个进程组
-    ///
-    /// ## 参数
-    ///
-    /// - `pg` : Arc<ProcessGroup>
-    ///
-    /// ## 返回值
-    ///
-    /// 无
-    pub fn add_process_group(pg: Arc<ProcessGroup>) {
-        ALL_PROCESS_GROUP
-            .lock_irqsave()
-            .as_mut()
-            .unwrap()
-            .insert(pg.pgid(), pg.clone());
-    }
-
-    /// 向系统中添加一个会话
-    ///
-    /// ## 参数
-    ///
-    /// - `session` : Arc<Session>
-    ///
-    /// ## 返回值
-    ///
-    /// 无
-    pub fn add_session(session: Arc<Session>) {
-        ALL_SESSION
-            .lock_irqsave()
-            .as_mut()
-            .unwrap()
-            .insert(session.sid(), session.clone());
     }
 
     /// 唤醒一个进程
@@ -560,18 +494,6 @@ impl ProcessManager {
         }
     }
 
-    pub fn remove_process_group(pgid: Pgid) {
-        ALL_PROCESS_GROUP
-            .lock_irqsave()
-            .as_mut()
-            .unwrap()
-            .remove(&pgid);
-    }
-
-    pub fn remove_session(sid: Sid) {
-        ALL_SESSION.lock_irqsave().as_mut().unwrap().remove(&sid);
-    }
-
     /// 上下文切换完成后的钩子函数
     unsafe fn switch_finish_hook() {
         // debug!("switch_finish_hook");
@@ -633,8 +555,6 @@ pub unsafe fn switch_finish_hook() {
 }
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
-int_like!(Pgid, AtomicPgid, usize, AtomicUsize);
-int_like!(Sid, AtomicSid, usize, AtomicUsize);
 
 impl fmt::Display for Pid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -863,8 +783,14 @@ impl ProcessControlBlock {
             (Self::generate_pid(), ppid, cwd, cred, tty)
         };
 
-        let basic_info =
-            ProcessBasicInfo::new(Pgid(pid.into()), ppid, Sid(pid.into()), name, cwd, None);
+        let basic_info = ProcessBasicInfo::new(
+            Pgid::from(pid.into()),
+            ppid,
+            Sid::from(pid.into()),
+            name,
+            cwd,
+            None,
+        );
         let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
@@ -1072,20 +998,6 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn pgid(&self) -> Pgid {
-        if let Some(process_group) = self.process_group.lock().upgrade() {
-            process_group.pgid()
-        } else {
-            Pgid(0)
-        }
-    }
-
-    // #[inline(always)]
-    // pub fn sid(&self) -> Sid {
-    //     return self.basic().sid();
-    // }
-
-    #[inline(always)]
     pub fn pid_strcut(&self) -> Arc<RwLock<PidStrcut>> {
         self.thread_pid.clone()
     }
@@ -1109,200 +1021,6 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn cred(&self) -> Cred {
         self.cred.lock().clone()
-    }
-
-    pub fn process_group(&self) -> Option<Arc<ProcessGroup>> {
-        self.process_group.lock().upgrade()
-    }
-
-    pub fn session(&self) -> Option<Arc<Session>> {
-        let pg = self.process_group()?;
-        pg.session()
-    }
-
-    pub fn set_process_group(self: &Arc<Self>, pg: &Arc<ProcessGroup>) {
-        *self.process_group.lock() = Arc::downgrade(pg);
-        // log::debug!("pid: {:?} set pgid: {:?}", self.pid(), pg.pgid());
-    }
-
-    pub fn is_process_group_leader(self: &Arc<Self>) -> bool {
-        let pg = self.process_group().unwrap();
-        if let Some(leader) = pg.leader() {
-            return Arc::ptr_eq(self, &leader);
-        }
-
-        return false;
-    }
-
-    pub fn is_session_leader(self: &Arc<Self>) -> bool {
-        let session = self.session().unwrap();
-        if let Some(leader) = session.leader() {
-            return Arc::ptr_eq(self, &leader);
-        }
-
-        return false;
-    }
-
-    /// 将进程移动到新会话中
-    /// 如果进程已经是会话领导者，则返回当前会话
-    /// 如果不是，则主动创建一个新会话，并将进程移动到新会话中，返回新会话
-    ///
-    /// ## 返回值
-    ///
-    /// 新会话
-    pub fn go_to_new_session(self: &Arc<Self>) -> Result<Arc<Session>, SystemError> {
-        if self.is_session_leader() {
-            return Ok(self.session().unwrap());
-        }
-
-        if self.is_process_group_leader() {
-            return Err(SystemError::EPERM);
-        }
-
-        let session = self.session().unwrap();
-
-        let mut self_group = self.process_group.lock();
-        if ProcessManager::find_session(Sid(self.pid().into())).is_some() {
-            return Err(SystemError::EPERM);
-        }
-        if ProcessManager::find_process_group(Pgid(self.pid.into())).is_some() {
-            return Err(SystemError::EPERM);
-        }
-        if let Some(old_pg) = self_group.upgrade() {
-            let mut old_pg_inner = old_pg.process_group_inner.lock();
-            let mut session_inner = session.session_inner.lock();
-            old_pg_inner.remove_process(&self.pid);
-            *self_group = Weak::new();
-
-            if old_pg_inner.is_empty() {
-                ProcessManager::remove_process_group(old_pg.pgid());
-                assert!(session_inner.process_groups.contains_key(&old_pg.pgid()));
-                session_inner.process_groups.remove(&old_pg.pgid());
-                if session_inner.is_empty() {
-                    ProcessManager::remove_session(session.sid());
-                }
-            }
-        }
-
-        let new_pg = ProcessGroup::new(self.clone());
-        *self_group = Arc::downgrade(&new_pg);
-        ProcessManager::add_process_group(new_pg.clone());
-
-        let new_session = Session::new(new_pg.clone());
-        let mut new_pg_inner = new_pg.process_group_inner.lock();
-        new_pg_inner.session = Arc::downgrade(&new_session);
-        new_session.session_inner.lock().leader = Some(self.clone());
-        ProcessManager::add_session(new_session.clone());
-
-        let mut session_inner = session.session_inner.lock();
-        session_inner.remove_process(self);
-
-        Ok(new_session)
-    }
-
-    /// 将进程加入到指定pgid的进程组中（无论该进程组是否已经存在）
-    ///
-    /// 如果进程组已经存在，则将进程加入到该进程组中
-    /// 如果进程组不存在，则创建一个新的进程组，并将进程加入到该进程组中
-    ///
-    /// ## 参数
-    /// `pgid` : 目标进程组的pgid
-    ///
-    /// ## 返回值
-    /// 无
-    pub fn join_other_group(self: &Arc<Self>, pgid: Pgid) -> Result<(), SystemError> {
-        if self.pgid() == pgid {
-            return Ok(());
-        }
-        if self.is_session_leader() {
-            // 会话领导者不能加入其他进程组
-            return Err(SystemError::EPERM);
-        }
-        if let Some(pg) = ProcessManager::find_process_group(pgid) {
-            let session = self.session().unwrap();
-            if !session.contains_process_group(&pg) {
-                // 进程组和进程应该属于同一个会话
-                return Err(SystemError::EPERM);
-            }
-            self.join_specified_group(&pg)?;
-        } else {
-            if pgid != Pgid(self.pid().into()) {
-                // 进程组不存在，只能加入自己的进程组
-                return Err(SystemError::EPERM);
-            }
-            self.join_new_group()?;
-        }
-
-        Ok(())
-    }
-
-    /// 将进程加入到新创建的进程组中
-    fn join_new_group(self: &Arc<Self>) -> Result<(), SystemError> {
-        let session = self.session().unwrap();
-        let mut self_pg_mut = self.process_group.lock();
-
-        if let Some(old_pg) = self_pg_mut.upgrade() {
-            let mut old_pg_inner = old_pg.process_group_inner.lock();
-            let mut session_inner = session.session_inner.lock();
-            old_pg_inner.remove_process(&self.pid);
-            *self_pg_mut = Weak::new();
-
-            if old_pg_inner.is_empty() {
-                ProcessManager::remove_process_group(old_pg.pgid());
-                assert!(session_inner.process_groups.contains_key(&old_pg.pgid()));
-                session_inner.process_groups.remove(&old_pg.pgid());
-            }
-        }
-
-        let new_pg = ProcessGroup::new(self.clone());
-        let mut new_pg_inner = new_pg.process_group_inner.lock();
-        let mut session_inner = session.session_inner.lock();
-
-        *self_pg_mut = Arc::downgrade(&new_pg);
-        ProcessManager::add_process_group(new_pg.clone());
-
-        new_pg_inner.session = Arc::downgrade(&session);
-        session_inner
-            .process_groups
-            .insert(new_pg.pgid, new_pg.clone());
-
-        Ok(())
-    }
-
-    /// 将进程加入到指定的进程组中
-    fn join_specified_group(
-        self: &Arc<Self>,
-        group: &Arc<ProcessGroup>,
-    ) -> Result<(), SystemError> {
-        let mut self_group = self.process_group.lock();
-
-        let mut group_inner = if let Some(old_pg) = self_group.upgrade() {
-            let (mut old_pg_inner, group_inner) = match old_pg.pgid().cmp(&group.pgid()) {
-                core::cmp::Ordering::Equal => return Ok(()),
-                core::cmp::Ordering::Less => (
-                    old_pg.process_group_inner.lock(),
-                    group.process_group_inner.lock(),
-                ),
-                core::cmp::Ordering::Greater => {
-                    let group_inner = group.process_group_inner.lock();
-                    let old_pg_inner = old_pg.process_group_inner.lock();
-                    (old_pg_inner, group_inner)
-                }
-            };
-            old_pg_inner.remove_process(&self.pid);
-            *self_group = Weak::new();
-
-            if old_pg_inner.is_empty() {
-                ProcessManager::remove_process_group(old_pg.pgid());
-            }
-            group_inner
-        } else {
-            group.process_group_inner.lock()
-        };
-
-        group_inner.processes.insert(self.pid, self.clone());
-        *self_group = Arc::downgrade(group);
-        Ok(())
     }
 
     /// 根据文件描述符序号，获取socket对象的Arc指针

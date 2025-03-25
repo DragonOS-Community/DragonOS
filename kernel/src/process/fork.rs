@@ -577,7 +577,7 @@ impl ProcessManager {
 
         // 检查是否已经存在pgid和sid
         let pgid = Pgid::new(child_pcb.pid().0);
-        let sid = Sid::new(pgid.0);
+        let sid = Sid::new(pgid.into());
 
         if ProcessManager::find_process_group(pgid).is_some() {
             ProcessManager::remove_process_group(pgid);

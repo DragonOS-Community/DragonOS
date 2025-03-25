@@ -120,6 +120,7 @@ impl<'a> ZoneAllocator<'a> {
             // reclaim的page数
             let just_reclaimed = slab.try_reclaim_pages(to_reclaim, &mut dealloc);
             self.total -= (just_reclaimed * OBJECT_PAGE_SIZE) as u64;
+
             to_reclaim = to_reclaim.saturating_sub(just_reclaimed);
             if to_reclaim == 0 {
                 break;
@@ -177,7 +178,20 @@ unsafe impl<'a> crate::Allocator<'a> for ZoneAllocator<'a> {
         slab_callback: &'static dyn CallBack,
     ) -> Result<(), AllocationError> {
         match ZoneAllocator::get_slab(layout.size()) {
-            Slab::Base(idx) => self.small_slabs[idx].deallocate(ptr, layout, slab_callback),
+            Slab::Base(idx) => {
+                let r = self.small_slabs[idx].deallocate(ptr, layout);
+                if let Ok(true) = r {
+                    self.small_slabs[idx].try_reclaim_pages(
+                        1,
+                        &mut |slab_page: *mut ObjectPage| {
+                            // 将slab_page归还buddy
+                            slab_callback
+                                .free_slab_page(slab_page as *const _ as *mut u8, ObjectPage::SIZE);
+                        },
+                    );
+                }
+                r.map(|_| ())
+            }
             Slab::Unsupported => Err(AllocationError::InvalidLayout),
         }
     }

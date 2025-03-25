@@ -2,7 +2,6 @@ use crate::arch::mm::X86_64MMArch;
 use crate::arch::vm::asm::VmxAsm;
 use crate::arch::vm::kvm_host::page::KVM_MIN_FREE_MMU_PAGES;
 use crate::mm::PhysAddr;
-use crate::virt::kvm::host_mem::PAGE_SHIFT;
 use crate::{
     arch::{mm::LockedFrameAllocator, MMArch, VirtCpuArch},
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -37,7 +36,7 @@ static mut MAX_TDP_LEVEL: usize = 0;
 static mut SHADOW_ACCESSED_MASK: usize = 0;
 
 static mut MAX_HUGE_PAGE_LEVEL: PageLevel = PageLevel::None;
-
+pub const PAGE_SHIFT: u32 = 12;
 pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
 pub fn is_tdp_mmu_enabled() -> bool {

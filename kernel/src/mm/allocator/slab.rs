@@ -72,11 +72,6 @@ pub unsafe fn slab_init() {
     SLABINITSTATE = true.into();
 }
 
-// 查看slab初始化状态
-pub fn slab_init_state() -> bool {
-    unsafe { *SLABINITSTATE.get_mut() }
-}
-
 pub unsafe fn slab_usage() -> SlabUsage {
     if let Some(ref mut slab) = SLABALLOCATOR {
         slab.zone.usage()

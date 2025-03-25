@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use core::intrinsics::likely;
 use core::ops::BitXor;
 
@@ -116,8 +117,8 @@ pub struct NTtyData {
     echo_tail: usize,
 
     /// 写者与读者共享
-    read_buf: [u8; NTTY_BUFSIZE],
-    echo_buf: [u8; NTTY_BUFSIZE],
+    read_buf: Box<[u8; NTTY_BUFSIZE]>,
+    echo_buf: Box<[u8; NTTY_BUFSIZE]>,
 
     read_flags: StaticBitmap<NTTY_BUFSIZE>,
     char_map: StaticBitmap<256>,
@@ -126,6 +127,7 @@ pub struct NTtyData {
 }
 
 impl NTtyData {
+    #[inline(never)]
     pub fn new() -> Self {
         Self {
             read_head: 0,
@@ -147,8 +149,8 @@ impl NTtyData {
             cursor_column: 0,
             canon_cursor_column: 0,
             echo_tail: 0,
-            read_buf: [0; NTTY_BUFSIZE],
-            echo_buf: [0; NTTY_BUFSIZE],
+            read_buf: Box::new([0; NTTY_BUFSIZE]),
+            echo_buf: Box::new([0; NTTY_BUFSIZE]),
             read_flags: StaticBitmap::new(),
             char_map: StaticBitmap::new(),
             tty: Weak::default(),

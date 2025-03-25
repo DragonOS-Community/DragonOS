@@ -67,6 +67,6 @@ impl ProcessGroup {
     }
 
     pub fn broadcast(&self) {
-        unimplemented!("广播信号尚未实现")
+        unimplemented!("broadcast not supported yet");
     }
 }

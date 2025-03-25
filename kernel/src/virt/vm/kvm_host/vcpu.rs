@@ -56,13 +56,13 @@ pub struct VirtCpu {
     /// 从用户层获取
     pub vcpu_id: usize,
     /// id alloctor获取
-    pub vcpu_idx: usize,
+    pub _vcpu_idx: usize,
     pub pid: Option<Pid>,
-    pub preempted: bool,
-    pub ready: bool,
-    pub last_used_slot: Option<Arc<KvmMemSlot>>,
-    pub stats_id: String,
-    pub pv_time: GfnToHvaCache,
+    pub _preempted: bool,
+    pub _ready: bool,
+    pub _last_used_slot: Option<Arc<KvmMemSlot>>,
+    pub _stats_id: String,
+    pub _pv_time: GfnToHvaCache,
     pub arch: VirtCpuArch,
     pub stat: VirtCpuStat,
 

@@ -18,6 +18,7 @@
 //! # Implementing GlobalAlloc
 //! See the [global alloc](https://github.com/gz/rust-slabmalloc/tree/master/examples/global_alloc.rs) example.
 #![allow(unused_features)]
+#![cfg_attr(test, feature(test, c_void_variant))]
 #![no_std]
 #![crate_name = "slabmalloc"]
 #![crate_type = "lib"]
@@ -33,8 +34,18 @@ pub use pages::*;
 pub use sc::*;
 pub use zone::*;
 
+#[cfg(test)]
+#[macro_use]
+extern crate std;
+#[cfg(test)]
+extern crate test;
+
+#[cfg(test)]
+mod tests;
+
 use core::alloc::Layout;
 use core::fmt;
+use core::mem;
 use core::ptr::{self, NonNull};
 
 use log::trace;
@@ -71,7 +82,6 @@ pub unsafe trait Allocator<'a> {
         layout: Layout,
         slab_callback: &'static dyn CallBack,
     ) -> Result<(), AllocationError>;
-
     /// Refill the allocator with a [`ObjectPage`].
     ///
     /// # Safety

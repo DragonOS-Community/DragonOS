@@ -76,6 +76,7 @@ unwinding = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/unwi
     "personality"
 ]}
 defer = "0.2.1"
+cfg-if = { version = "1.0.0" }
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]

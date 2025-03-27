@@ -1,9 +1,15 @@
 #[cfg(feature = "backtrace")]
 mod hook;
-use core::panic::PanicInfo;
-use core::sync::atomic::AtomicU8;
+use cfg_if::cfg_if;
 
-static PANIC_COUNTER: AtomicU8 = AtomicU8::new(0);
+cfg_if! {
+    if #[cfg(target_os = "none")] {
+        use core::panic::PanicInfo;
+        use core::sync::atomic::AtomicU8;
+
+        static PANIC_COUNTER: AtomicU8 = AtomicU8::new(0);
+    }
+}
 /// 全局的panic处理函数
 ///
 #[cfg(target_os = "none")]

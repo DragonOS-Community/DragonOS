@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use log::debug;
-use system_error::SystemError::{self, *};
+use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::file::{File, FileMode},
@@ -8,9 +8,10 @@ use crate::{
     syscall::Syscall,
 };
 
-use super::socket::{self, unix::Unix, AddressFamily as AF, Endpoint};
-
-pub use super::posix::*;
+use super::{
+    posix::{MsgHdr, PosixArgsSocketType, SockAddr},
+    socket::{self, endpoint::Endpoint, unix::Unix, AddressFamily},
+};
 
 /// Flags for socket, socketpair, accept4
 const SOCK_CLOEXEC: FileMode = FileMode::O_CLOEXEC;
@@ -72,7 +73,7 @@ impl Syscall {
         protocol: usize,
         fds: &mut [i32],
     ) -> Result<usize, SystemError> {
-        let address_family = AF::try_from(address_family as u16)?;
+        let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixArgsSocketType::from_bits_truncate(socket_type as u32);
         let stype = socket::PSOCK::try_from(socket_type)?;
 
@@ -80,7 +81,7 @@ impl Syscall {
         let mut fd_table_guard = binding.write();
 
         // check address family, only support AF_UNIX
-        if address_family != AF::Unix {
+        if address_family != AddressFamily::Unix {
             log::warn!(
                 "only support AF_UNIX, {:?} with protocol {:?} is not supported",
                 address_family,
@@ -113,7 +114,7 @@ impl Syscall {
         optval: &[u8],
     ) -> Result<usize, SystemError> {
         let sol = socket::PSOL::try_from(level as u32)?;
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         debug!("setsockopt: level = {:?} ", sol);
@@ -138,16 +139,16 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 获取socket
         let optval = optval as *mut u32;
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
-            .ok_or(EBADF)?;
+            .ok_or(SystemError::EBADF)?;
 
         use socket::{PSO, PSOL};
 
         let level = PSOL::try_from(level as u32)?;
 
         if matches!(level, PSOL::SOCKET) {
-            let optname = PSO::try_from(optname as u32).map_err(|_| ENOPROTOOPT)?;
+            let optname = PSO::try_from(optname as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
             match optname {
                 PSO::SNDBUF => {
                     // 返回发送缓冲区大小
@@ -166,7 +167,7 @@ impl Syscall {
                     return Ok(0);
                 }
                 _ => {
-                    return Err(ENOPROTOOPT);
+                    return Err(SystemError::ENOPROTOOPT);
                 }
             }
         }
@@ -180,15 +181,16 @@ impl Syscall {
 
         if matches!(level, PSOL::TCP) {
             use socket::inet::stream::TcpOption;
-            let optname = TcpOption::try_from(optname as i32).map_err(|_| ENOPROTOOPT)?;
+            let optname =
+                TcpOption::try_from(optname as i32).map_err(|_| SystemError::ENOPROTOOPT)?;
             match optname {
                 TcpOption::Congestion => return Ok(0),
                 _ => {
-                    return Err(ENOPROTOOPT);
+                    return Err(SystemError::ENOPROTOOPT);
                 }
             }
         }
-        return Err(ENOPROTOOPT);
+        return Err(SystemError::ENOPROTOOPT);
     }
 
     /// @brief sys_connect系统调用的实际执行函数
@@ -200,7 +202,7 @@ impl Syscall {
     /// @return 成功返回0，失败返回错误码
     pub fn connect(fd: usize, addr: *const SockAddr, addrlen: u32) -> Result<usize, SystemError> {
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         socket.connect(endpoint)?;
@@ -223,7 +225,7 @@ impl Syscall {
         //     addrlen
         // );
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         // log::debug!("bind: socket={:?}", socket);
@@ -255,7 +257,7 @@ impl Syscall {
 
         let flags = socket::PMSG::from_bits_truncate(flags);
 
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
 
@@ -282,7 +284,7 @@ impl Syscall {
         addr: *mut SockAddr,
         addr_len: *mut u32,
     ) -> Result<usize, SystemError> {
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let flags = socket::PMSG::from_bits_truncate(flags);
@@ -293,7 +295,7 @@ impl Syscall {
         }
 
         // address is not null
-        let address = unsafe { addr.as_ref() }.ok_or(EINVAL)?;
+        let address = unsafe { addr.as_ref() }.ok_or(SystemError::EINVAL)?;
 
         if unsafe { address.is_empty() } {
             let (recv_len, endpoint) = socket.recv_from(buf, flags, None)?;
@@ -304,7 +306,7 @@ impl Syscall {
             return Ok(recv_len);
         } else {
             // 从socket中读取数据
-            let addr_len = *unsafe { addr_len.as_ref() }.ok_or(EINVAL)?;
+            let addr_len = *unsafe { addr_len.as_ref() }.ok_or(SystemError::EINVAL)?;
             let address = SockAddr::to_endpoint(addr, addr_len)?;
             let (recv_len, _) = socket.recv_from(buf, flags, Some(address))?;
             return Ok(recv_len);
@@ -324,7 +326,7 @@ impl Syscall {
             crate::filesystem::vfs::syscall::IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)?
         };
 
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
 
@@ -348,7 +350,7 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn listen(fd: usize, backlog: usize) -> Result<usize, SystemError> {
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         socket.listen(backlog).map(|_| 0)
@@ -361,7 +363,7 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn shutdown(fd: usize, how: usize) -> Result<usize, SystemError> {
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         socket.shutdown(how.try_into()?)?;
@@ -420,7 +422,7 @@ impl Syscall {
         addrlen: *mut u32,
         flags: u32,
     ) -> Result<usize, SystemError> {
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
 
@@ -501,7 +503,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
 

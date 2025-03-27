@@ -1,24 +1,27 @@
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
-use system_error::SystemError::{self, *};
+use system_error::SystemError;
 
-use crate::libs::rwlock::RwLock;
+use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::EPollEventType;
-use crate::net::socket::*;
+use crate::net::socket::common::shutdown::{ShutdownBit, ShutdownTemp};
+use crate::net::socket::endpoint::Endpoint;
+use crate::net::socket::{Socket, SocketInode, PMSG, PSOL};
 use crate::sched::SchedMode;
-use inet::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
+use crate::{libs::rwlock::RwLock, net::socket::common::shutdown::Shutdown};
 use smoltcp;
 
 mod inner;
-use inner::*;
 
 mod option;
 pub use option::Options as TcpOption;
 
+use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
+
 type EP = EPollEventType;
 #[derive(Debug)]
 pub struct TcpSocket {
-    inner: RwLock<Option<Inner>>,
+    inner: RwLock<Option<inner::Inner>>,
     #[allow(dead_code)]
     shutdown: Shutdown, // TODO set shutdown status
     nonblock: AtomicBool,
@@ -30,7 +33,7 @@ pub struct TcpSocket {
 impl TcpSocket {
     pub fn new(_nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
-            inner: RwLock::new(Some(Inner::Init(Init::new(ver)))),
+            inner: RwLock::new(Some(inner::Inner::Init(inner::Init::new(ver)))),
             shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(false),
             wait_queue: WaitQueue::default(),
@@ -39,9 +42,9 @@ impl TcpSocket {
         })
     }
 
-    pub fn new_established(inner: Established, nonblock: bool) -> Arc<Self> {
+    pub fn new_established(inner: inner::Established, nonblock: bool) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
-            inner: RwLock::new(Some(Inner::Established(inner))),
+            inner: RwLock::new(Some(inner::Inner::Established(inner))),
             shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
@@ -56,38 +59,38 @@ impl TcpSocket {
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
-        match writer.take().expect("Tcp Inner is None") {
-            Inner::Init(inner) => {
+        match writer.take().expect("Tcp inner::Inner is None") {
+            inner::Inner::Init(inner) => {
                 let bound = inner.bind(local_endpoint)?;
-                if let Init::Bound((ref bound, _)) = bound {
+                if let inner::Init::Bound((ref bound, _)) = bound {
                     bound
                         .iface()
                         .common()
                         .bind_socket(self.self_ref.upgrade().unwrap());
                 }
-                writer.replace(Inner::Init(bound));
+                writer.replace(inner::Inner::Init(bound));
                 Ok(())
             }
             any => {
                 writer.replace(any);
                 log::error!("TcpSocket::do_bind: not Init");
-                Err(EINVAL)
+                Err(SystemError::EINVAL)
             }
         }
     }
 
     pub fn do_listen(&self, backlog: usize) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
-        let inner = writer.take().expect("Tcp Inner is None");
+        let inner = writer.take().expect("Tcp inner::Inner is None");
         let (listening, err) = match inner {
-            Inner::Init(init) => {
+            inner::Inner::Init(init) => {
                 let listen_result = init.listen(backlog);
                 match listen_result {
-                    Ok(listening) => (Inner::Listening(listening), None),
-                    Err((init, err)) => (Inner::Init(init), Some(err)),
+                    Ok(listening) => (inner::Inner::Listening(listening), None),
+                    Err((init, err)) => (inner::Inner::Init(init), Some(err)),
                 }
             }
-            _ => (inner, Some(EINVAL)),
+            _ => (inner, Some(SystemError::EINVAL)),
         };
         writer.replace(listening);
         drop(writer);
@@ -99,14 +102,19 @@ impl TcpSocket {
     }
 
     pub fn try_accept(&self) -> Result<(Arc<TcpSocket>, smoltcp::wire::IpEndpoint), SystemError> {
-        match self.inner.write().as_mut().expect("Tcp Inner is None") {
-            Inner::Listening(listening) => listening.accept().map(|(stream, remote)| {
+        match self
+            .inner
+            .write()
+            .as_mut()
+            .expect("Tcp inner::Inner is None")
+        {
+            inner::Inner::Listening(listening) => listening.accept().map(|(stream, remote)| {
                 (
                     TcpSocket::new_established(stream, self.is_nonblock()),
                     remote,
                 )
             }),
-            _ => Err(EINVAL),
+            _ => Err(SystemError::EINVAL),
         }
     }
 
@@ -116,32 +124,37 @@ impl TcpSocket {
         remote_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
-        let inner = writer.take().expect("Tcp Inner is None");
+        let inner = writer.take().expect("Tcp inner::Inner is None");
         let (init, result) = match inner {
-            Inner::Init(init) => {
+            inner::Inner::Init(init) => {
                 let conn_result = init.connect(remote_endpoint);
                 match conn_result {
                     Ok(connecting) => (
-                        Inner::Connecting(connecting),
+                        inner::Inner::Connecting(connecting),
                         if !self.is_nonblock() {
                             Ok(())
                         } else {
-                            Err(EINPROGRESS)
+                            Err(SystemError::EINPROGRESS)
                         },
                     ),
-                    Err((init, err)) => (Inner::Init(init), Err(err)),
+                    Err((init, err)) => (inner::Inner::Init(init), Err(err)),
                 }
             }
-            Inner::Connecting(connecting) if self.is_nonblock() => {
-                (Inner::Connecting(connecting), Err(EALREADY))
+            inner::Inner::Connecting(connecting) if self.is_nonblock() => (
+                inner::Inner::Connecting(connecting),
+                Err(SystemError::EALREADY),
+            ),
+            inner::Inner::Connecting(connecting) => (inner::Inner::Connecting(connecting), Ok(())),
+            inner::Inner::Listening(inner) => {
+                (inner::Inner::Listening(inner), Err(SystemError::EISCONN))
             }
-            Inner::Connecting(connecting) => (Inner::Connecting(connecting), Ok(())),
-            Inner::Listening(inner) => (Inner::Listening(inner), Err(EISCONN)),
-            Inner::Established(inner) => (Inner::Established(inner), Err(EISCONN)),
+            inner::Inner::Established(inner) => {
+                (inner::Inner::Established(inner), Err(SystemError::EISCONN))
+            }
         };
 
         match result {
-            Ok(()) | Err(EINPROGRESS) => {
+            Ok(()) | Err(SystemError::EINPROGRESS) => {
                 init.iface().unwrap().poll();
             }
             _ => {}
@@ -154,9 +167,10 @@ impl TcpSocket {
     // for irq use
     pub fn finish_connect(&self) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
-        let Inner::Connecting(conn) = writer.take().expect("Tcp Inner is None") else {
+        let inner::Inner::Connecting(conn) = writer.take().expect("Tcp inner::Inner is None")
+        else {
             log::error!("TcpSocket::finish_connect: not Connecting");
-            return Err(EINVAL);
+            return Err(SystemError::EINVAL);
         };
 
         let (inner, result) = conn.into_result();
@@ -169,16 +183,16 @@ impl TcpSocket {
     pub fn check_connect(&self) -> Result<(), SystemError> {
         self.update_events();
         let mut write_state = self.inner.write();
-        let inner = write_state.take().expect("Tcp Inner is None");
+        let inner = write_state.take().expect("Tcp inner::Inner is None");
         let (replace, result) = match inner {
-            Inner::Connecting(conn) => conn.into_result(),
-            Inner::Established(es) => {
+            inner::Inner::Connecting(conn) => conn.into_result(),
+            inner::Inner::Established(es) => {
                 log::warn!("TODO: check new established");
-                (Inner::Established(es), Ok(()))
+                (inner::Inner::Established(es), Ok(()))
             } // TODO check established
             _ => {
                 log::warn!("TODO: connecting socket error options");
-                (inner, Err(EINVAL))
+                (inner, Err(SystemError::EINVAL))
             } // TODO socket error options
         };
         write_state.replace(replace);
@@ -192,8 +206,8 @@ impl TcpSocket {
             .map(|inner| {
                 inner.iface().unwrap().poll();
                 let result = match inner {
-                    Inner::Established(inner) => inner.recv_slice(buf),
-                    _ => Err(EINVAL),
+                    inner::Inner::Established(inner) => inner.recv_slice(buf),
+                    _ => Err(SystemError::EINVAL),
                 };
                 inner.iface().unwrap().poll();
                 result
@@ -203,23 +217,33 @@ impl TcpSocket {
 
     pub fn try_send(&self, buf: &[u8]) -> Result<usize, SystemError> {
         // TODO: add nonblock check of connecting socket
-        let sent = match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Established(inner) => inner.send_slice(buf),
-            _ => Err(EINVAL),
+        let sent = match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("Tcp inner::Inner is None")
+        {
+            inner::Inner::Established(inner) => inner.send_slice(buf),
+            _ => Err(SystemError::EINVAL),
         };
         self.inner.read().as_ref().unwrap().iface().unwrap().poll();
         sent
     }
 
     fn update_events(&self) -> bool {
-        match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(_) => false,
-            Inner::Connecting(connecting) => connecting.update_io_events(),
-            Inner::Established(established) => {
+        match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("Tcp inner::Inner is None")
+        {
+            inner::Inner::Init(_) => false,
+            inner::Inner::Connecting(connecting) => connecting.update_io_events(),
+            inner::Inner::Established(established) => {
                 established.update_io_events(&self.pollee);
                 false
             }
-            Inner::Listening(listening) => {
+            inner::Inner::Listening(listening) => {
                 listening.update_io_events(&self.pollee);
                 false
             }
@@ -237,24 +261,34 @@ impl Socket for TcpSocket {
     }
 
     fn get_name(&self) -> Result<Endpoint, SystemError> {
-        match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(Init::Unbound((_, ver))) => Ok(Endpoint::Ip(match ver {
+        match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("Tcp inner::Inner is None")
+        {
+            inner::Inner::Init(inner::Init::Unbound((_, ver))) => Ok(Endpoint::Ip(match ver {
                 smoltcp::wire::IpVersion::Ipv4 => UNSPECIFIED_LOCAL_ENDPOINT_V4,
                 smoltcp::wire::IpVersion::Ipv6 => UNSPECIFIED_LOCAL_ENDPOINT_V6,
             })),
-            Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
-            Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
-            Inner::Established(established) => Ok(Endpoint::Ip(established.get_name())),
-            Inner::Listening(listening) => Ok(Endpoint::Ip(listening.get_name())),
+            inner::Inner::Init(inner::Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
+            inner::Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
+            inner::Inner::Established(established) => Ok(Endpoint::Ip(established.get_name())),
+            inner::Inner::Listening(listening) => Ok(Endpoint::Ip(listening.get_name())),
         }
     }
 
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {
-        match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(_) => Err(ENOTCONN),
-            Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_peer_name())),
-            Inner::Established(established) => Ok(Endpoint::Ip(established.get_peer_name())),
-            Inner::Listening(_) => Err(ENOTCONN),
+        match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("Tcp inner::Inner is None")
+        {
+            inner::Inner::Init(_) => Err(SystemError::ENOTCONN),
+            inner::Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_peer_name())),
+            inner::Inner::Established(established) => Ok(Endpoint::Ip(established.get_peer_name())),
+            inner::Inner::Listening(_) => Err(SystemError::ENOTCONN),
         }
     }
 
@@ -263,19 +297,19 @@ impl Socket for TcpSocket {
             return self.do_bind(addr);
         }
         log::debug!("TcpSocket::bind: invalid endpoint");
-        return Err(EINVAL);
+        return Err(SystemError::EINVAL);
     }
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let Endpoint::Ip(endpoint) = endpoint else {
             log::debug!("TcpSocket::connect: invalid endpoint");
-            return Err(EINVAL);
+            return Err(SystemError::EINVAL);
         };
         self.start_connect(endpoint)?; // Only Nonblock or error will return error.
 
         return loop {
             match self.check_connect() {
-                Err(EAGAIN_OR_EWOULDBLOCK) => {}
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {}
                 result => break result,
             }
         };
@@ -289,20 +323,20 @@ impl Socket for TcpSocket {
         self.do_listen(backlog)
     }
 
-    fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<SocketInode>, Endpoint), SystemError> {
         if self.is_nonblock() {
             self.try_accept()
         } else {
             loop {
                 match self.try_accept() {
-                    Err(EAGAIN_OR_EWOULDBLOCK) => {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         wq_wait_event_interruptible!(self.wait_queue, self.incoming(), {})?;
                     }
                     result => break result,
                 }
             }
         }
-        .map(|(inner, endpoint)| (Inode::new(inner), Endpoint::Ip(endpoint)))
+        .map(|(inner, endpoint)| (SocketInode::new(inner), Endpoint::Ip(endpoint)))
     }
 
     fn recv(&self, buffer: &mut [u8], _flags: PMSG) -> Result<usize, SystemError> {
@@ -317,7 +351,7 @@ impl Socket for TcpSocket {
         self.inner
             .read()
             .as_ref()
-            .expect("Tcp Inner is None")
+            .expect("Tcp inner::Inner is None")
             .send_buffer_size()
     }
 
@@ -325,7 +359,7 @@ impl Socket for TcpSocket {
         self.inner
             .read()
             .as_ref()
-            .expect("Tcp Inner is None")
+            .expect("Tcp inner::Inner is None")
             .recv_buffer_size()
     }
 
@@ -361,20 +395,20 @@ impl Socket for TcpSocket {
 
         match inner {
             // complete connecting socket close logic
-            Inner::Connecting(conn) => {
+            inner::Inner::Connecting(conn) => {
                 let conn = unsafe { conn.into_established() };
                 conn.close();
                 conn.release();
             }
-            Inner::Established(es) => {
+            inner::Inner::Established(es) => {
                 es.close();
                 es.release();
             }
-            Inner::Listening(ls) => {
+            inner::Inner::Listening(ls) => {
                 ls.close();
                 ls.release();
             }
-            Inner::Init(init) => {
+            inner::Inner::Init(init) => {
                 init.close();
             }
         };
@@ -384,7 +418,7 @@ impl Socket for TcpSocket {
 
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
         if level != PSOL::TCP {
-            // return Err(EINVAL);
+            // return Err(SystemError::EINVAL);
             log::debug!("TcpSocket::set_option: not TCP");
             return Ok(());
         }
@@ -395,62 +429,62 @@ impl Socket for TcpSocket {
             NoDelay => {
                 let nagle_enabled = val[0] != 0;
                 let mut writer = self.inner.write();
-                let inner = writer.take().expect("Tcp Inner is None");
+                let inner = writer.take().expect("Tcp inner::Inner is None");
                 match inner {
-                    Inner::Established(established) => {
+                    inner::Inner::Established(established) => {
                         established.with_mut(|socket| {
                             socket.set_nagle_enabled(nagle_enabled);
                         });
-                        writer.replace(Inner::Established(established));
+                        writer.replace(inner::Inner::Established(established));
                     }
                     _ => {
                         writer.replace(inner);
-                        return Err(EINVAL);
+                        return Err(SystemError::EINVAL);
                     }
                 }
             }
             KeepIntvl => {
                 if val.len() == 4 {
                     let mut writer = self.inner.write();
-                    let inner = writer.take().expect("Tcp Inner is None");
+                    let inner = writer.take().expect("Tcp inner::Inner is None");
                     match inner {
-                        Inner::Established(established) => {
+                        inner::Inner::Established(established) => {
                             let interval = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
                             established.with_mut(|socket| {
                                 socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
                                     interval as u64,
                                 )));
                             });
-                            writer.replace(Inner::Established(established));
+                            writer.replace(inner::Inner::Established(established));
                         }
                         _ => {
                             writer.replace(inner);
-                            return Err(EINVAL);
+                            return Err(SystemError::EINVAL);
                         }
                     }
                 } else {
-                    return Err(EINVAL);
+                    return Err(SystemError::EINVAL);
                 }
             }
             KeepCnt => {
                 // if val.len() == 4 {
                 //     let mut writer = self.inner.write();
-                //     let inner = writer.take().expect("Tcp Inner is None");
+                //     let inner = writer.take().expect("Tcp inner::Inner is None");
                 //     match inner {
-                //         Inner::Established(established) => {
+                //         inner::Inner::Established(established) => {
                 //             let count = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
                 //             established.with_mut(|socket| {
                 //                 socket.set_keep_alive_count(count);
                 //             });
-                //             writer.replace(Inner::Established(established));
+                //             writer.replace(inner::Inner::Established(established));
                 //         }
                 //         _ => {
                 //             writer.replace(inner);
-                //             return Err(EINVAL);
+                //             return Err(SystemError::EINVAL);
                 //         }
                 //     }
                 // } else {
-                //     return Err(EINVAL);
+                //     return Err(SystemError::EINVAL);
                 // }
             }
             KeepIdle => {}

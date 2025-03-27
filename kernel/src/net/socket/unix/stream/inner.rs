@@ -5,8 +5,10 @@ use system_error::SystemError;
 
 use crate::libs::mutex::Mutex;
 use crate::net::socket::buffer::Buffer;
+use crate::net::socket::common::shutdown::ShutdownTemp;
+use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::unix::stream::StreamSocket;
-use crate::net::socket::{Endpoint, Inode, ShutdownTemp};
+use crate::net::socket::SocketInode;
 
 use alloc::collections::VecDeque;
 use alloc::{string::String, sync::Arc};
@@ -183,7 +185,7 @@ impl Connected {
 #[derive(Debug)]
 pub struct Listener {
     addr: Option<Endpoint>,
-    incoming_connects: Mutex<VecDeque<Arc<Inode>>>,
+    incoming_connects: Mutex<VecDeque<Arc<SocketInode>>>,
     backlog: AtomicUsize,
 }
 
@@ -201,7 +203,7 @@ impl Listener {
         return Ok(());
     }
 
-    pub fn push_incoming(&self, server_inode: Arc<Inode>) -> Result<(), SystemError> {
+    pub fn push_incoming(&self, server_inode: Arc<SocketInode>) -> Result<(), SystemError> {
         let mut incoming_connects = self.incoming_connects.lock();
 
         if incoming_connects.len() >= self.backlog.load(Ordering::Relaxed) {
@@ -215,7 +217,7 @@ impl Listener {
     }
 
     #[allow(dead_code)]
-    pub fn pop_incoming(&self) -> Option<Arc<Inode>> {
+    pub fn pop_incoming(&self) -> Option<Arc<SocketInode>> {
         let mut incoming_connects = self.incoming_connects.lock();
 
         return incoming_connects.pop_front();
@@ -229,7 +231,7 @@ impl Listener {
         return self.incoming_connects.lock().len() != 0;
     }
 
-    pub(super) fn try_accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
+    pub(super) fn try_accept(&self) -> Result<(Arc<SocketInode>, Endpoint), SystemError> {
         let mut incoming_connecteds = self.incoming_connects.lock();
         debug!("incom len {}", incoming_connecteds.len());
         let connected = incoming_connecteds
@@ -242,6 +244,6 @@ impl Listener {
             _ => return Err(SystemError::ENOTCONN),
         };
         debug!("server accept!");
-        return Ok((Inode::new(socket), peer));
+        return Ok((SocketInode::new(socket), peer));
     }
 }

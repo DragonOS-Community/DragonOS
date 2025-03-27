@@ -1,68 +1,66 @@
 use alloc::sync::Arc;
-use smoltcp;
-use system_error::SystemError::{self, *};
+use smoltcp::{self, wire::IpProtocol};
+use system_error::SystemError;
 
-use inet::{TcpSocket, UdpSocket};
-
-// use crate::net::syscall_util::SysArgSocketType;
-use crate::net::socket::*;
+use crate::net::socket::{
+    family,
+    inet::{TcpSocket, UdpSocket},
+    Socket, SocketInode, PSOCK,
+};
 
 fn create_inet_socket(
     version: smoltcp::wire::IpVersion,
     socket_type: PSOCK,
     protocol: smoltcp::wire::IpProtocol,
 ) -> Result<Arc<dyn Socket>, SystemError> {
-    log::debug!("type: {:?}, protocol: {:?}", socket_type, protocol);
-    use smoltcp::wire::IpProtocol::*;
+    // log::debug!("type: {:?}, protocol: {:?}", socket_type, protocol);
     match socket_type {
         PSOCK::Datagram => match protocol {
-            HopByHop | Udp => {
-                log::debug!("create udp socket");
-                // return Err(EPROTONOSUPPORT);
+            IpProtocol::HopByHop | IpProtocol::Udp => {
                 return Ok(UdpSocket::new(false));
             }
             _ => {
-                return Err(EPROTONOSUPPORT);
+                return Err(SystemError::EPROTONOSUPPORT);
             }
         },
         PSOCK::Stream => match protocol {
-            HopByHop | Tcp => {
+            IpProtocol::HopByHop | IpProtocol::Tcp => {
                 log::debug!("create tcp socket");
                 return Ok(TcpSocket::new(false, version));
             }
             _ => {
-                return Err(EPROTONOSUPPORT);
+                return Err(SystemError::EPROTONOSUPPORT);
             }
         },
         PSOCK::Raw => {
             todo!("raw")
         }
         _ => {
-            return Err(EPROTONOSUPPORT);
+            return Err(SystemError::EPROTONOSUPPORT);
         }
     }
 }
 
 pub struct Inet;
 impl family::Family for Inet {
-    fn socket(stype: PSOCK, protocol: u32) -> Result<Arc<Inode>, SystemError> {
+    fn socket(stype: PSOCK, protocol: u32) -> Result<Arc<SocketInode>, SystemError> {
         let socket = create_inet_socket(
             smoltcp::wire::IpVersion::Ipv4,
             stype,
             smoltcp::wire::IpProtocol::from(protocol as u8),
         )?;
-        Ok(Inode::new(socket))
+        Ok(SocketInode::new(socket))
     }
 }
 
 pub struct Inet6;
 impl family::Family for Inet6 {
-    fn socket(stype: PSOCK, protocol: u32) -> Result<Arc<Inode>, SystemError> {
+    fn socket(stype: PSOCK, protocol: u32) -> Result<Arc<SocketInode>, SystemError> {
         let socket = create_inet_socket(
             smoltcp::wire::IpVersion::Ipv6,
             stype,
             smoltcp::wire::IpProtocol::from(protocol as u8),
         )?;
-        Ok(Inode::new(socket))
+        Ok(SocketInode::new(socket))
     }
 }

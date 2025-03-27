@@ -11,12 +11,17 @@ pub use common::BoundInner;
 pub use common::Types;
 // pub use raw::RawSocket;
 pub use datagram::UdpSocket;
+
+use smoltcp::wire::IpAddress;
+use smoltcp::wire::IpEndpoint;
+use smoltcp::wire::Ipv4Address;
+use smoltcp::wire::Ipv6Address;
+
 pub use stream::TcpSocket;
 pub use syscall::Inet;
 
 use super::Socket;
 
-use smoltcp::wire::*;
 /// A local endpoint, which indicates that the local endpoint is unspecified.
 ///
 /// According to the Linux man pages and the Linux implementation, `getsockname()` will _not_ fail

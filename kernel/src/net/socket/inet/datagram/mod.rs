@@ -1,17 +1,18 @@
-use inet::InetSocket;
+use inner::{UdpInner, UnboundUdp};
 use smoltcp;
-use system_error::SystemError::{self, *};
+use system_error::SystemError;
 
-use crate::libs::rwlock::RwLock;
+use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
-use crate::net::socket::*;
+use crate::net::socket::{Socket, PMSG};
+use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicBool;
 
-pub mod inner;
+use super::InetSocket;
 
-use inner::*;
+pub mod inner;
 
 type EP = EPollEventType;
 
@@ -51,7 +52,7 @@ impl UdpSocket {
             *inner = Some(UdpInner::Bound(bound));
             return Ok(());
         }
-        return Err(EINVAL);
+        return Err(SystemError::EINVAL);
     }
 
     pub fn bind_emphemeral(&self, remote: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
@@ -91,7 +92,7 @@ impl UdpSocket {
                 poll_ifaces();
                 ret
             }
-            _ => Err(ENOTCONN),
+            _ => Err(SystemError::ENOTCONN),
         }
     }
 
@@ -116,7 +117,7 @@ impl UdpSocket {
             let inner = match inner_guard.take().expect("Udp Inner is None") {
                 UdpInner::Bound(bound) => bound,
                 UdpInner::Unbound(unbound) => {
-                    unbound.bind_ephemeral(to.ok_or(EADDRNOTAVAIL)?.addr)?
+                    unbound.bind_ephemeral(to.ok_or(SystemError::EADDRNOTAVAIL)?.addr)?
                 }
             };
             // size = inner.try_send(buf, to)?;
@@ -125,7 +126,7 @@ impl UdpSocket {
         // Optimize: 拿两次锁的平均效率是否比一次长时间的读锁效率要高？
         let result = match self.inner.read().as_ref().expect("Udp Inner is None") {
             UdpInner::Bound(bound) => bound.try_send(buf, to),
-            _ => Err(ENOTCONN),
+            _ => Err(SystemError::ENOTCONN),
         };
         poll_ifaces();
         return result;
@@ -167,7 +168,7 @@ impl Socket for UdpSocket {
         if let Endpoint::Ip(local_endpoint) = local_endpoint {
             return self.do_bind(local_endpoint);
         }
-        Err(EAFNOSUPPORT)
+        Err(SystemError::EAFNOSUPPORT)
     }
 
     fn send_buffer_size(&self) -> usize {
@@ -197,7 +198,7 @@ impl Socket for UdpSocket {
                 panic!("");
             }
         }
-        return Err(EAFNOSUPPORT);
+        return Err(SystemError::EAFNOSUPPORT);
     }
 
     fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
@@ -217,7 +218,7 @@ impl Socket for UdpSocket {
             return self.try_send(buffer, Some(remote));
         }
 
-        return Err(EINVAL);
+        return Err(SystemError::EINVAL);
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
@@ -228,7 +229,7 @@ impl Socket for UdpSocket {
         } else {
             loop {
                 match self.try_recv(buffer) {
-                    Err(EAGAIN_OR_EWOULDBLOCK) => {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
                     }
                     result => break result,
@@ -255,7 +256,7 @@ impl Socket for UdpSocket {
         } else {
             loop {
                 match self.try_recv(buffer) {
-                    Err(EAGAIN_OR_EWOULDBLOCK) => {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
                         log::debug!("UdpSocket::recv_from: wake up");
                     }

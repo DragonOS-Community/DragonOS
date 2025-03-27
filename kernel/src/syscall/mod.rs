@@ -9,7 +9,7 @@ use crate::{
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
-    net::syscall::MsgHdr,
+    net::posix::{MsgHdr, SockAddr},
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
@@ -33,7 +33,6 @@ use crate::{
     },
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
-    net::syscall::SockAddr,
     process::{fork::CloneFlags, syscall::PosixOldUtsName, Pid},
     time::{
         syscall::{PosixTimeZone, PosixTimeval},

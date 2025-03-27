@@ -9,7 +9,7 @@ pub fn create_socket(
     protocol: u32,
     is_nonblock: bool,
     is_close_on_exec: bool,
-) -> Result<Arc<socket::Inode>, SystemError> {
+) -> Result<Arc<socket::SocketInode>, SystemError> {
     type AF = socket::AddressFamily;
     let inode = match family {
         AF::INet => socket::inet::Inet::socket(socket_type, protocol)?,

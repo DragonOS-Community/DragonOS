@@ -38,16 +38,16 @@ impl PosixArgsSocketType {
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::ffi::CStr;
-use unix::ns::abs::{alloc_abs_addr, look_up_abs_addr};
+use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES},
     mm::{verify_area, VirtAddr},
-    net::socket::*,
+    net::socket::unix::ns::abs::{alloc_abs_addr, look_up_abs_addr},
     process::ProcessManager,
 };
-use smoltcp;
-use system_error::SystemError::{self};
+
+use super::socket::{endpoint::Endpoint, AddressFamily};
 
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
 #[repr(C)]

@@ -1,5 +1,5 @@
 use smoltcp;
-use system_error::SystemError::{self, *};
+use system_error::SystemError;
 
 use crate::{
     libs::spinlock::SpinLock,
@@ -118,7 +118,7 @@ impl BoundUdp {
                     return Ok((size, metadata.endpoint));
                 }
             }
-            return Err(EAGAIN_OR_EWOULDBLOCK);
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         })
     }
 
@@ -127,13 +127,13 @@ impl BoundUdp {
         buf: &[u8],
         to: Option<smoltcp::wire::IpEndpoint>,
     ) -> Result<usize, SystemError> {
-        let remote = to.or(*self.remote.lock()).ok_or(ENOTCONN)?;
+        let remote = to.or(*self.remote.lock()).ok_or(SystemError::ENOTCONN)?;
         let result = self.with_mut_socket(|socket| {
             if socket.can_send() && socket.send_slice(buf, remote).is_ok() {
                 log::debug!("send {} bytes", buf.len());
                 return Ok(buf.len());
             }
-            return Err(ENOBUFS);
+            return Err(SystemError::ENOBUFS);
         });
         return result;
     }

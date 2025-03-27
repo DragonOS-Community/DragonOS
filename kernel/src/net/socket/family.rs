@@ -114,9 +114,11 @@ impl core::convert::TryFrom<u16> for AddressFamily {
 use crate::net::socket;
 use alloc::sync::Arc;
 
+use super::PSOCK;
+
 pub trait Family {
     fn socket(
-        stype: socket::PSOCK,
+        stype: PSOCK,
         protocol: u32,
-    ) -> Result<Arc<socket::Inode>, system_error::SystemError>;
+    ) -> Result<Arc<socket::SocketInode>, system_error::SystemError>;
 }

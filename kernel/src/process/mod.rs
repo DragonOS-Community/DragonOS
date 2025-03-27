@@ -54,7 +54,7 @@ use crate::{
         VirtAddr,
     },
     namespaces::{mnt_namespace::FsStruct, pid_namespace::PidStrcut, NsProxy},
-    net::socket::Inode as SocketInode,
+    net::socket::SocketInode,
     sched::{
         completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
         EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule,

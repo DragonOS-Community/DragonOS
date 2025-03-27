@@ -3,11 +3,12 @@ use alloc::{collections::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::SeqpacketSocket;
+use crate::net::socket::common::shutdown::ShutdownTemp;
 use crate::{
     libs::mutex::Mutex,
-    net::socket::{buffer::Buffer, endpoint::Endpoint, Inode, ShutdownTemp},
+    net::socket::{buffer::Buffer, endpoint::Endpoint, SocketInode},
 };
-use system_error::SystemError::{self, *};
+use system_error::SystemError;
 
 #[derive(Debug)]
 pub(super) struct Init {
@@ -22,11 +23,11 @@ impl Init {
     pub(super) fn bind(&mut self, epoint_to_bind: Endpoint) -> Result<(), SystemError> {
         if self.inode.is_some() {
             log::error!("the socket is already bound");
-            return Err(EINVAL);
+            return Err(SystemError::EINVAL);
         }
         match epoint_to_bind {
             Endpoint::Inode(_) => self.inode = Some(epoint_to_bind),
-            _ => return Err(EINVAL),
+            _ => return Err(SystemError::EINVAL),
         }
 
         return Ok(());
@@ -35,7 +36,7 @@ impl Init {
     pub fn bind_path(&mut self, sun_path: String) -> Result<Endpoint, SystemError> {
         if self.inode.is_none() {
             log::error!("the socket is not bound");
-            return Err(EINVAL);
+            return Err(SystemError::EINVAL);
         }
         if let Some(Endpoint::Inode((inode, mut path))) = self.inode.take() {
             path = sun_path;
@@ -56,7 +57,7 @@ impl Init {
 pub(super) struct Listener {
     inode: Endpoint,
     backlog: AtomicUsize,
-    incoming_conns: Mutex<VecDeque<Arc<Inode>>>,
+    incoming_conns: Mutex<VecDeque<Arc<SocketInode>>>,
 }
 
 impl Listener {
@@ -73,7 +74,7 @@ impl Listener {
         return &self.inode;
     }
 
-    pub(super) fn try_accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
+    pub(super) fn try_accept(&self) -> Result<(Arc<SocketInode>, Endpoint), SystemError> {
         let mut incoming_conns = self.incoming_conns.lock();
         log::debug!(" incom len {}", incoming_conns.len());
         let conn = incoming_conns
@@ -86,7 +87,7 @@ impl Listener {
             _ => return Err(SystemError::ENOTCONN),
         };
 
-        return Ok((Inode::new(socket), peer));
+        return Ok((SocketInode::new(socket), peer));
     }
 
     pub(super) fn listen(&self, backlog: usize) -> Result<(), SystemError> {
@@ -105,7 +106,7 @@ impl Listener {
         }
 
         let new_server = SeqpacketSocket::new(false);
-        let new_inode = Inode::new(new_server.clone());
+        let new_inode = SocketInode::new(new_server.clone());
         // log::debug!("new inode {:?},client_epoint {:?}",new_inode,client_epoint);
         let path = match &self.inode {
             Endpoint::Inode((_, path)) => path.clone(),

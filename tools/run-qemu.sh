@@ -148,8 +148,8 @@ while true;do
               QEMU_MONITOR=""
               QEMU_ARGUMENT+=" --nographic "
               QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
-              QEMU_ARGUMENT+=-append \"${KERNEL_CMDLINE}\"
-              
+              QEMU_ARGUMENT+="-append ${KERNEL_CMDLINE}"
+
               ;;
         esac;shift 2;;
         *) break

@@ -82,11 +82,14 @@ QEMU_SERIAL_LOG_FILE="../serial_opt.txt"
 QEMU_SERIAL="-serial file:${QEMU_SERIAL_LOG_FILE}"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
-QEMU_ARGUMENT=""
+QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
+
+KERNEL_CMDLINE=""
+
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
-VIRTIO_BLK_DEVICE=false
+VIRTIO_BLK_DEVICE=true
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
     QEMU_ACCELARATE=" -machine accel=${qemu_accel} "
@@ -139,9 +142,13 @@ while true;do
               ;;
               nographic)
               QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
+              # 添加 virtio console 设备
+              QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
+              KERNEL_CMDLINE+=" console=/dev/hvc0 "
               QEMU_MONITOR=""
               QEMU_ARGUMENT+=" --nographic "
               QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+              QEMU_ARGUMENT+="-append ${KERNEL_CMDLINE}"
 
               ;;
         esac;shift 2;;
@@ -156,12 +163,15 @@ QEMU_DEVICES+="${QEMU_DEVICES_DISK} "
 QEMU_DEVICES+=" -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 # E1000E
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
+
+
 QEMU_ARGUMENT+="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d ${QEMU_MONITOR} -d ${qemu_trace_std} "
 
 QEMU_ARGUMENT+="-s ${QEMU_MACHINE} ${QEMU_CPU_FEATURES} ${QEMU_RTC_CLOCK} ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES} "
 QEMU_ARGUMENT+=" ${QEMU_SHM_OBJECT} "
 QEMU_ARGUMENT+=" ${QEMU_ACCELARATE} "
 
+QEMU_ARGUMENT+=" -D ../qemu.log "
 
 
 # 安装riscv64的uboot

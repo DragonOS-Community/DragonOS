@@ -24,6 +24,8 @@ impl Major {
     pub const UNIX98_PTY_SLAVE_MAJOR: Self =
         Self::new(Self::UNIX98_PTY_MASTER_MAJOR.0 + Self::UNIX98_PTY_MAJOR_COUNT.0);
 
+    pub const HVC_MAJOR: Self = Self::new(229);
+
     pub const fn new(x: u32) -> Self {
         Major(x)
     }

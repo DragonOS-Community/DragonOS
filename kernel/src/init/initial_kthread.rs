@@ -8,7 +8,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
-    driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
+    driver::net::e1000e::e1000e::e1000e_init,
     filesystem::vfs::core::mount_root_fs,
     namespaces::NsProxy,
     net::net_core::net_init,
@@ -45,7 +45,7 @@ fn kernel_init() -> Result<(), SystemError> {
     crate::driver::disk::ahci::ahci_init()
         .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
         .ok();
-    virtio_probe();
+
     mount_root_fs().expect("Failed to mount root fs");
     e1000e_init();
     net_init().unwrap_or_else(|err| {

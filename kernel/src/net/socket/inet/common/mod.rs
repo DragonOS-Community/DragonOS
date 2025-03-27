@@ -1,9 +1,9 @@
 use crate::net::{Iface, NET_DEVICES};
 use alloc::sync::Arc;
-use system_error::SystemError::{self, *};
 
 pub mod port;
 pub use port::PortManager;
+use system_error::SystemError;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,7 +56,7 @@ impl BoundInner {
             let handle = iface.sockets().lock_irqsave().add(socket);
             return Ok(Self { handle, iface });
         } else {
-            let iface = get_iface_to_bind(address).ok_or(ENODEV)?;
+            let iface = get_iface_to_bind(address).ok_or(SystemError::ENODEV)?;
             let handle = iface.sockets().lock_irqsave().add(socket);
             return Ok(Self { handle, iface });
         }

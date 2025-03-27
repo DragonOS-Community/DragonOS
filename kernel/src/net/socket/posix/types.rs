@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
-pub enum Type {
+pub enum PSOCK {
     Stream = 1,
     Datagram = 2,
     Raw = 3,
@@ -10,7 +10,7 @@ pub enum Type {
 }
 
 use crate::net::posix::PosixArgsSocketType;
-impl TryFrom<PosixArgsSocketType> for Type {
+impl TryFrom<PosixArgsSocketType> for PSOCK {
     type Error = system_error::SystemError;
     fn try_from(x: PosixArgsSocketType) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;

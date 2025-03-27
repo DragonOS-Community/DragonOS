@@ -1,7 +1,6 @@
 use core::fmt;
 
-use crate::libs::spinlock::SpinLock;
-use crate::net::socket::Endpoint;
+use crate::{libs::spinlock::SpinLock, net::socket::endpoint::Endpoint};
 use alloc::string::String;
 use hashbrown::HashMap;
 use ida::IdAllocator;

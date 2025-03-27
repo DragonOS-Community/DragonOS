@@ -12,7 +12,7 @@ pub enum Endpoint {
     /// 网络层端点
     Ip(IpEndpoint),
     /// inode端点,Unix实际保存的端点
-    Inode((Arc<socket::Inode>, String)),
+    Inode((Arc<socket::SocketInode>, String)),
     /// Unix传递id索引和path所用的端点
     Unixpath((InodeId, String)),
     /// Unix抽象端点

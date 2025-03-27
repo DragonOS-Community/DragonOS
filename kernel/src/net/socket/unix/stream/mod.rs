@@ -1,4 +1,13 @@
-use crate::sched::SchedMode;
+use crate::{
+    net::{
+        posix::MsgHdr,
+        socket::{
+            common::shutdown::{Shutdown, ShutdownTemp},
+            endpoint::Endpoint,
+        },
+    },
+    sched::SchedMode,
+};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -46,11 +55,11 @@ impl StreamSocket {
         })
     }
 
-    pub fn new_pairs() -> Result<(Arc<Inode>, Arc<Inode>), SystemError> {
+    pub fn new_pairs() -> Result<(Arc<SocketInode>, Arc<SocketInode>), SystemError> {
         let socket0 = StreamSocket::new();
         let socket1 = StreamSocket::new();
-        let inode0 = Inode::new(socket0.clone());
-        let inode1 = Inode::new(socket1.clone());
+        let inode0 = SocketInode::new(socket0.clone());
+        let inode1 = SocketInode::new(socket1.clone());
 
         let (conn_0, conn_1) = Connected::new_pair(
             Some(Endpoint::Inode((inode0.clone(), String::from("")))),
@@ -72,9 +81,9 @@ impl StreamSocket {
         })
     }
 
-    pub fn new_inode() -> Result<Arc<Inode>, SystemError> {
+    pub fn new_inode() -> Result<Arc<SocketInode>, SystemError> {
         let socket = StreamSocket::new();
-        let inode = Inode::new(socket.clone());
+        let inode = SocketInode::new(socket.clone());
 
         let _ = match &mut *socket.inner.write() {
             Inner::Init(init) => init.bind(Endpoint::Inode((inode.clone(), String::from("")))),
@@ -93,7 +102,7 @@ impl StreamSocket {
         }
     }
 
-    pub fn try_accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
+    pub fn try_accept(&self) -> Result<(Arc<SocketInode>, Endpoint), SystemError> {
         match &*self.inner.read() {
             Inner::Listener(listener) => listener.try_accept() as _,
             _ => {
@@ -135,7 +144,7 @@ impl Socket for StreamSocket {
                 }
                 None => {
                     debug!("not bind when connected");
-                    let inode = Inode::new(self.self_ref.upgrade().unwrap().clone());
+                    let inode = SocketInode::new(self.self_ref.upgrade().unwrap().clone());
                     let epoint = Endpoint::Inode((inode.clone(), String::from("")));
                     let _ = init.bind(epoint.clone());
                     Some(epoint)
@@ -186,7 +195,7 @@ impl Socket for StreamSocket {
 
         //创建新的对端socket
         let new_server_socket = StreamSocket::new();
-        let new_server_inode = Inode::new(new_server_socket.clone());
+        let new_server_inode = SocketInode::new(new_server_socket.clone());
         let new_server_endpoint = Some(Endpoint::Inode((new_server_inode.clone(), sun_path)));
         //获取connect pair
         let (client_conn, server_conn) =
@@ -258,7 +267,7 @@ impl Socket for StreamSocket {
         return Ok(());
     }
 
-    fn accept(&self) -> Result<(Arc<socket::Inode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<socket::SocketInode>, Endpoint), SystemError> {
         debug!("stream server begin accept");
         //目前只实现了阻塞式实现
         loop {
@@ -490,11 +499,7 @@ impl Socket for StreamSocket {
         }
     }
 
-    fn recv_msg(
-        &self,
-        _msg: &mut crate::net::syscall::MsgHdr,
-        _flags: socket::PMSG,
-    ) -> Result<usize, SystemError> {
+    fn recv_msg(&self, _msg: &mut MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 
@@ -523,11 +528,7 @@ impl Socket for StreamSocket {
         }
     }
 
-    fn send_msg(
-        &self,
-        _msg: &crate::net::syscall::MsgHdr,
-        _flags: socket::PMSG,
-    ) -> Result<usize, SystemError> {
+    fn send_msg(&self, _msg: &MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
         todo!()
     }
 

@@ -2,15 +2,20 @@ use crate::filesystem::vfs::IndexNode;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::net::socket::*;
+use super::{
+    common::shutdown::ShutdownTemp,
+    endpoint::Endpoint,
+    posix::{PMSG, PSOL},
+    EPollItems, Socket,
+};
 
 #[derive(Debug)]
-pub struct Inode {
+pub struct SocketInode {
     inner: Arc<dyn Socket>,
     epoll_items: EPollItems,
 }
 
-impl IndexNode for Inode {
+impl IndexNode for SocketInode {
     fn read_at(
         &self,
         _offset: usize,
@@ -78,7 +83,7 @@ impl IndexNode for Inode {
     }
 }
 
-impl Inode {
+impl SocketInode {
     // pub fn wait_queue(&self) -> WaitQueue {
     //     self.inner.wait_queue()
     // }

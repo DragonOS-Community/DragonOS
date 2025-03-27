@@ -4,19 +4,33 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::sync::atomic::{AtomicBool, Ordering};
-use unix::ns::abs::{remove_abs_addr, ABS_INODE_MAP};
 
-use crate::sched::SchedMode;
-use crate::{libs::rwlock::RwLock, net::socket::*};
-use inner::*;
+use crate::{
+    libs::{rwlock::RwLock, wait_queue::WaitQueue},
+    net::socket::{EPollEventType, Socket, SocketInode, PMSG},
+};
+use crate::{
+    net::{
+        posix::MsgHdr,
+        socket::{
+            common::shutdown::{Shutdown, ShutdownTemp},
+            endpoint::Endpoint,
+        },
+    },
+    sched::SchedMode,
+};
+
 use system_error::SystemError;
 
-use super::INODE_MAP;
+use super::{
+    ns::abs::{remove_abs_addr, ABS_INODE_MAP},
+    INODE_MAP,
+};
 
 type EP = EPollEventType;
 #[derive(Debug)]
 pub struct SeqpacketSocket {
-    inner: RwLock<Inner>,
+    inner: RwLock<inner::Inner>,
     shutdown: Shutdown,
     is_nonblocking: AtomicBool,
     wait_queue: WaitQueue,
@@ -32,7 +46,7 @@ impl SeqpacketSocket {
 
     pub fn new(is_nonblocking: bool) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
-            inner: RwLock::new(Inner::Init(Init::new())),
+            inner: RwLock::new(inner::Inner::Init(inner::Init::new())),
             shutdown: Shutdown::new(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             wait_queue: WaitQueue::default(),
@@ -40,21 +54,23 @@ impl SeqpacketSocket {
         })
     }
 
-    pub fn new_inode(is_nonblocking: bool) -> Result<Arc<Inode>, SystemError> {
+    pub fn new_inode(is_nonblocking: bool) -> Result<Arc<SocketInode>, SystemError> {
         let socket = SeqpacketSocket::new(is_nonblocking);
-        let inode = Inode::new(socket.clone());
+        let inode = SocketInode::new(socket.clone());
         // 建立时绑定自身为后续能正常获取本端地址
         let _ = match &mut *socket.inner.write() {
-            Inner::Init(init) => init.bind(Endpoint::Inode((inode.clone(), String::from("")))),
+            inner::Inner::Init(init) => {
+                init.bind(Endpoint::Inode((inode.clone(), String::from(""))))
+            }
             _ => return Err(SystemError::EINVAL),
         };
         return Ok(inode);
     }
 
     #[allow(dead_code)]
-    pub fn new_connected(connected: Connected, is_nonblocking: bool) -> Arc<Self> {
+    pub fn new_connected(connected: inner::Connected, is_nonblocking: bool) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
-            inner: RwLock::new(Inner::Connected(connected)),
+            inner: RwLock::new(inner::Inner::Connected(connected)),
             shutdown: Shutdown::new(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             wait_queue: WaitQueue::default(),
@@ -62,25 +78,25 @@ impl SeqpacketSocket {
         })
     }
 
-    pub fn new_pairs() -> Result<(Arc<Inode>, Arc<Inode>), SystemError> {
+    pub fn new_pairs() -> Result<(Arc<SocketInode>, Arc<SocketInode>), SystemError> {
         let socket0 = SeqpacketSocket::new(false);
         let socket1 = SeqpacketSocket::new(false);
-        let inode0 = Inode::new(socket0.clone());
-        let inode1 = Inode::new(socket1.clone());
+        let inode0 = SocketInode::new(socket0.clone());
+        let inode1 = SocketInode::new(socket1.clone());
 
-        let (conn_0, conn_1) = Connected::new_pair(
+        let (conn_0, conn_1) = inner::Connected::new_pair(
             Some(Endpoint::Inode((inode0.clone(), String::from("")))),
             Some(Endpoint::Inode((inode1.clone(), String::from("")))),
         );
-        *socket0.inner.write() = Inner::Connected(conn_0);
-        *socket1.inner.write() = Inner::Connected(conn_1);
+        *socket0.inner.write() = inner::Inner::Connected(conn_0);
+        *socket1.inner.write() = inner::Inner::Connected(conn_1);
 
         return Ok((inode0, inode1));
     }
 
-    fn try_accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
+    fn try_accept(&self) -> Result<(Arc<SocketInode>, Endpoint), SystemError> {
         match &*self.inner.read() {
-            Inner::Listen(listen) => listen.try_accept() as _,
+            inner::Inner::Listen(listen) => listen.try_accept() as _,
             _ => {
                 log::error!("the socket is not listening");
                 return Err(SystemError::EINVAL);
@@ -90,7 +106,7 @@ impl SeqpacketSocket {
 
     fn is_acceptable(&self) -> bool {
         match &*self.inner.read() {
-            Inner::Listen(listen) => listen.is_acceptable(),
+            inner::Inner::Listen(listen) => listen.is_acceptable(),
             _ => {
                 panic!("the socket is not listening");
             }
@@ -111,7 +127,7 @@ impl SeqpacketSocket {
 
     fn can_recv(&self) -> Result<bool, SystemError> {
         let can = match &*self.inner.read() {
-            Inner::Connected(connected) => connected.can_recv(),
+            inner::Inner::Connected(connected) => connected.can_recv(),
             _ => return Err(SystemError::ENOTCONN),
         };
         Ok(can)
@@ -163,29 +179,29 @@ impl Socket for SeqpacketSocket {
             .map_err(|_| SystemError::EINVAL)?;
 
         let client_epoint = match &mut *self.inner.write() {
-            Inner::Init(init) => match init.endpoint().cloned() {
+            inner::Inner::Init(init) => match init.endpoint().cloned() {
                 Some(end) => {
-                    log::debug!("bind when connect");
+                    log::trace!("bind when connect");
                     Some(end)
                 }
                 None => {
-                    log::debug!("not bind when connect");
-                    let inode = Inode::new(self.self_ref.upgrade().unwrap().clone());
+                    log::trace!("not bind when connect");
+                    let inode = SocketInode::new(self.self_ref.upgrade().unwrap().clone());
                     let epoint = Endpoint::Inode((inode.clone(), String::from("")));
                     let _ = init.bind(epoint.clone());
                     Some(epoint)
                 }
             },
-            Inner::Listen(_) => return Err(SystemError::EINVAL),
-            Inner::Connected(_) => return Err(SystemError::EISCONN),
+            inner::Inner::Listen(_) => return Err(SystemError::EINVAL),
+            inner::Inner::Connected(_) => return Err(SystemError::EISCONN),
         };
         // ***阻塞与非阻塞处理还未实现
         // 客户端与服务端建立连接将服务端inode推入到自身的listen_incom队列中，
         // accept时从中获取推出对应的socket
         match &*remote_socket.inner.read() {
-            Inner::Listen(listener) => match listener.push_incoming(client_epoint) {
+            inner::Inner::Listen(listener) => match listener.push_incoming(client_epoint) {
                 Ok(connected) => {
-                    *self.inner.write() = Inner::Connected(connected);
+                    *self.inner.write() = inner::Inner::Connected(connected);
                     log::debug!("try to wake up");
 
                     remote_socket.wait_queue.wakeup(None);
@@ -194,11 +210,11 @@ impl Socket for SeqpacketSocket {
                 // ***错误处理
                 Err(_) => todo!(),
             },
-            Inner::Init(_) => {
+            inner::Inner::Init(_) => {
                 log::debug!("init einval");
                 return Err(SystemError::EINVAL);
             }
-            Inner::Connected(_) => return Err(SystemError::EISCONN),
+            inner::Inner::Connected(_) => return Err(SystemError::EISCONN),
         };
     }
 
@@ -207,7 +223,7 @@ impl Socket for SeqpacketSocket {
         match endpoint {
             Endpoint::Unixpath((inodeid, path)) => {
                 let inode = match &mut *self.inner.write() {
-                    Inner::Init(init) => init.bind_path(path)?,
+                    inner::Inner::Init(init) => init.bind_path(path)?,
                     _ => {
                         log::error!("socket has listen or connected");
                         return Err(SystemError::EINVAL);
@@ -219,7 +235,7 @@ impl Socket for SeqpacketSocket {
             }
             Endpoint::Abspath((abshandle, path)) => {
                 let inode = match &mut *self.inner.write() {
-                    Inner::Init(init) => init.bind_path(path)?,
+                    inner::Inner::Init(init) => init.bind_path(path)?,
                     _ => {
                         log::error!("socket has listen or connected");
                         return Err(SystemError::EINVAL);
@@ -235,7 +251,7 @@ impl Socket for SeqpacketSocket {
     fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
         log::debug!("seqpacket shutdown");
         match &*self.inner.write() {
-            Inner::Connected(connected) => connected.shutdown(how),
+            inner::Inner::Connected(connected) => connected.shutdown(how),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -244,21 +260,21 @@ impl Socket for SeqpacketSocket {
         let mut state = self.inner.write();
         log::debug!("listen into socket");
         let epoint = match &*state {
-            Inner::Init(init) => init.endpoint().ok_or(SystemError::EINVAL)?.clone(),
-            Inner::Listen(listener) => return listener.listen(backlog),
-            Inner::Connected(_) => {
+            inner::Inner::Init(init) => init.endpoint().ok_or(SystemError::EINVAL)?.clone(),
+            inner::Inner::Listen(listener) => return listener.listen(backlog),
+            inner::Inner::Connected(_) => {
                 log::error!("the socket is connected");
                 return Err(SystemError::EINVAL);
             }
         };
 
-        let listener = Listener::new(epoint, backlog);
-        *state = Inner::Listen(listener);
+        let listener = inner::Listener::new(epoint, backlog);
+        *state = inner::Inner::Listen(listener);
 
         Ok(())
     }
 
-    fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<SocketInode>, Endpoint), SystemError> {
         if !self.is_nonblocking() {
             loop {
                 wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?;
@@ -339,7 +355,7 @@ impl Socket for SeqpacketSocket {
             }
         }
 
-        *self.inner.write() = Inner::Init(Init::new());
+        *self.inner.write() = inner::Inner::Init(inner::Init::new());
         self.wait_queue.wakeup(None);
 
         let _ = remove_abs_addr(path);
@@ -350,7 +366,7 @@ impl Socket for SeqpacketSocket {
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {
         // 获取对端地址
         let endpoint = match &*self.inner.read() {
-            Inner::Connected(connected) => connected.peer_endpoint().cloned(),
+            inner::Inner::Connected(connected) => connected.peer_endpoint().cloned(),
             _ => return Err(SystemError::ENOTCONN),
         };
 
@@ -364,9 +380,9 @@ impl Socket for SeqpacketSocket {
     fn get_name(&self) -> Result<Endpoint, SystemError> {
         // 获取本端地址
         let endpoint = match &*self.inner.read() {
-            Inner::Init(init) => init.endpoint().cloned(),
-            Inner::Listen(listener) => Some(listener.endpoint().clone()),
-            Inner::Connected(connected) => connected.endpoint().cloned(),
+            inner::Inner::Init(init) => init.endpoint().cloned(),
+            inner::Inner::Listen(listener) => Some(listener.endpoint().clone()),
+            inner::Inner::Connected(connected) => connected.endpoint().cloned(),
         };
 
         if let Some(endpoint) = endpoint {
@@ -407,7 +423,7 @@ impl Socket for SeqpacketSocket {
                 )?;
                 // connect锁和flag判断顺序不正确，应该先判断在
                 match &*self.inner.write() {
-                    Inner::Connected(connected) => match connected.try_read(buffer) {
+                    inner::Inner::Connected(connected) => match connected.try_read(buffer) {
                         Ok(usize) => {
                             log::debug!("recv from successfully");
                             return Ok(usize);
@@ -427,7 +443,7 @@ impl Socket for SeqpacketSocket {
 
     fn recv_msg(
         &self,
-        _msg: &mut crate::net::syscall::MsgHdr,
+        _msg: &mut MsgHdr,
         _flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
@@ -443,7 +459,7 @@ impl Socket for SeqpacketSocket {
         if !flags.contains(PMSG::DONTWAIT) {
             loop {
                 match &*self.inner.write() {
-                    Inner::Connected(connected) => match connected.try_write(buffer) {
+                    inner::Inner::Connected(connected) => match connected.try_write(buffer) {
                         Ok(usize) => {
                             log::debug!("send successfully");
                             return Ok(usize);
@@ -463,7 +479,7 @@ impl Socket for SeqpacketSocket {
 
     fn send_msg(
         &self,
-        _msg: &crate::net::syscall::MsgHdr,
+        _msg: &MsgHdr,
         _flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
@@ -492,7 +508,7 @@ impl Socket for SeqpacketSocket {
                 )?;
                 // connect锁和flag判断顺序不正确，应该先判断在
                 match &*self.inner.write() {
-                    Inner::Connected(connected) => match connected.recv_slice(buffer) {
+                    inner::Inner::Connected(connected) => match connected.recv_slice(buffer) {
                         Ok(usize) => {
                             // log::debug!("recvs from successfully");
                             return Ok((usize, connected.peer_endpoint().unwrap().clone()));
@@ -535,7 +551,7 @@ impl Socket for SeqpacketSocket {
             mask |= EP::EPOLLRDHUP | EP::EPOLLIN | EP::EPOLLRDNORM;
         }
         match &*self.inner.read() {
-            Inner::Connected(connected) => {
+            inner::Inner::Connected(connected) => {
                 if connected.can_recv() {
                     mask |= EP::EPOLLIN | EP::EPOLLRDNORM;
                 }
@@ -552,8 +568,8 @@ impl Socket for SeqpacketSocket {
                     }
                 }
             }
-            Inner::Listen(_) => mask |= EP::EPOLLIN,
-            Inner::Init(_) => mask |= EP::EPOLLOUT,
+            inner::Inner::Listen(_) => mask |= EP::EPOLLIN,
+            inner::Inner::Init(_) => mask |= EP::EPOLLOUT,
         }
         mask.bits() as usize
     }

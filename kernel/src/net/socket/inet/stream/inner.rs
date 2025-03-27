@@ -6,7 +6,8 @@ use crate::net::socket::{self, inet::Types};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use smoltcp;
-use system_error::SystemError::{self, *};
+use smoltcp::socket::tcp;
+use system_error::SystemError;
 
 // pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
@@ -68,7 +69,7 @@ impl Init {
             }
             Init::Bound(_) => {
                 log::debug!("Already Bound");
-                Err(EINVAL)
+                Err(SystemError::EINVAL)
             }
         }
     }
@@ -89,7 +90,7 @@ impl Init {
                 let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
                 Ok((bound, endpoint))
             }
-            Init::Bound(_) => Err((self, EINVAL)),
+            Init::Bound(_) => Err((self, SystemError::EINVAL)),
         }
     }
 
@@ -102,7 +103,7 @@ impl Init {
             Init::Bound(inner) => inner,
         };
         if local.addr.is_unspecified() {
-            return Err((Init::Bound((inner, local)), EINVAL));
+            return Err((Init::Bound((inner, local)), SystemError::EINVAL));
         }
         let result = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket
@@ -111,7 +112,7 @@ impl Init {
                     remote_endpoint,
                     local,
                 )
-                .map_err(|_| ECONNREFUSED)
+                .map_err(|_| SystemError::ECONNREFUSED)
         });
         match result {
             Ok(_) => Ok(Connecting::new(inner)),
@@ -123,7 +124,7 @@ impl Init {
     pub(super) fn listen(self, backlog: usize) -> Result<Listening, (Self, SystemError)> {
         let (inner, local) = match self {
             Init::Unbound(_) => {
-                return Err((self, EINVAL));
+                return Err((self, SystemError::EINVAL));
             }
             Init::Bound(inner) => inner,
         };
@@ -154,7 +155,9 @@ impl Init {
         }
 
         if let Err(err) = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket.listen(listen_addr).map_err(|_| ECONNREFUSED)
+            socket
+                .listen(listen_addr)
+                .map_err(|_| SystemError::ECONNREFUSED)
         }) {
             return Err((Init::Bound((inner, local)), err));
         }
@@ -208,15 +211,20 @@ impl Connecting {
     }
 
     pub fn into_result(self) -> (Inner, Result<(), SystemError>) {
-        use ConnectResult::*;
         let result = *self.result.read_irqsave();
         match result {
-            Connecting => (Inner::Connecting(self), Err(EAGAIN_OR_EWOULDBLOCK)),
-            Connected => (
+            ConnectResult::Connecting => (
+                Inner::Connecting(self),
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            ),
+            ConnectResult::Connected => (
                 Inner::Established(Established { inner: self.inner }),
                 Ok(()),
             ),
-            Refused => (Inner::Init(Init::new_bound(self.inner)), Err(ECONNREFUSED)),
+            ConnectResult::Refused => (
+                Inner::Init(Init::new_bound(self.inner)),
+                Err(SystemError::ECONNREFUSED),
+            ),
         }
     }
 
@@ -294,7 +302,7 @@ impl Listening {
             .unwrap();
 
         if connected.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| !socket.is_active()) {
-            return Err(EAGAIN_OR_EWOULDBLOCK);
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
         let remote_endpoint = connected.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
@@ -354,7 +362,7 @@ impl Listening {
     }
 
     pub fn close(&self) {
-        log::debug!("Close Listening Socket");
+        // log::debug!("Close Listening Socket");
         let port = self.get_name().port;
         for inner in self.inners.iter() {
             inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
@@ -410,18 +418,17 @@ impl Established {
     pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         self.inner
             .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-                use smoltcp::socket::tcp::RecvError::*;
                 if socket.can_send() {
                     match socket.recv_slice(buf) {
                         Ok(size) => Ok(size),
-                        Err(InvalidState) => {
+                        Err(tcp::RecvError::InvalidState) => {
                             log::error!("TcpSocket::try_recv: InvalidState");
-                            Err(ENOTCONN)
+                            Err(SystemError::ENOTCONN)
                         }
-                        Err(Finished) => Ok(0),
+                        Err(tcp::RecvError::Finished) => Ok(0),
                     }
                 } else {
-                    Err(ENOBUFS)
+                    Err(SystemError::ENOBUFS)
                 }
             })
     }
@@ -430,9 +437,11 @@ impl Established {
         self.inner
             .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
                 if socket.can_send() {
-                    socket.send_slice(buf).map_err(|_| ECONNABORTED)
+                    socket
+                        .send_slice(buf)
+                        .map_err(|_| SystemError::ECONNABORTED)
                 } else {
-                    Err(ENOBUFS)
+                    Err(SystemError::ENOBUFS)
                 }
             })
     }

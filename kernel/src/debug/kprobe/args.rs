@@ -1,3 +1,4 @@
+use crate::debug::traceback::addr_from_symbol;
 use alloc::boxed::Box;
 use alloc::string::String;
 use kprobe::{CallBackFunc, KprobeBuilder, ProbeArgs};
@@ -15,10 +16,6 @@ pub struct KprobeInfo {
     pub enable: bool,
 }
 
-extern "C" {
-    fn addr_from_symbol(symbol: *const u8) -> usize;
-}
-
 impl TryFrom<KprobeInfo> for KprobeBuilder {
     type Error = SystemError;
     fn try_from(kprobe_info: KprobeInfo) -> Result<Self, Self::Error> {
@@ -30,20 +27,15 @@ impl TryFrom<KprobeInfo> for KprobeBuilder {
             return Err(SystemError::EINVAL);
         }
         let func_addr = if let Some(symbol) = kprobe_info.symbol.clone() {
-            let mut symbol_sting = symbol;
-            if !symbol_sting.ends_with("\0") {
-                symbol_sting.push('\0');
-            }
-            let symbol = symbol_sting.as_ptr();
-            let func_addr = unsafe { addr_from_symbol(symbol) };
-            if func_addr == 0 {
+            let func_addr = unsafe { addr_from_symbol(symbol.as_str()) };
+            if func_addr.is_none() {
                 warn!(
                     "register_kprobe: the symbol: {:?} not found",
                     kprobe_info.symbol
                 );
                 return Err(SystemError::ENXIO);
             }
-            func_addr
+            func_addr.unwrap() as usize
         } else {
             kprobe_info.addr.unwrap()
         };

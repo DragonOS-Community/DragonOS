@@ -34,46 +34,4 @@
 #include "glib.h"
 #include <stdarg.h>
 
-/**
- * @brief 将字符串按照fmt和args中的内容进行格式化，然后保存到buf中
- *
- * @param buf 结果缓冲区
- * @param fmt 格式化字符串
- * @param args 内容
- * @return 最终字符串的长度
- */
-int vsprintf(char *buf, const char *fmt, va_list args);
-
-/**
- * @brief 将字符串按照fmt和args中的内容进行格式化，截取字符串前buf_size-1，保存到buf中
- *
- * @param buf 结果缓冲区，大小为buf_size
- * @param fmt 格式化字符串
- * @param buf_size 缓冲区长度
- * @param args 内容
- * @return 最终字符串的长度
- */
-int vsnprintf(char *buf, const char *fmt, int buf_size, va_list args);
-
-/**
- * @brief 格式化打印字符串
- *
- * @param FRcolor 前景色
- * @param BKcolor 背景色
- * @param ... 格式化字符串
- */
-
-#define printk(...) printk_color(WHITE, BLACK, __VA_ARGS__)
-
-int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ...);
-
-/**
- * @brief 格式化字符串并输出到buf
- *
- * @param buf 输出缓冲区
- * @param fmt 格式
- * @param ... 参数
- * @return int 字符串长度
- */
-int sprintk(char *buf, const char *fmt, ...);
 #pragma GCC pop_options

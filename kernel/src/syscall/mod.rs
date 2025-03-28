@@ -12,6 +12,7 @@ use crate::{
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
+        process_group::Pgid,
         resource::{RLimit64, RUsage},
         ProcessFlags, ProcessManager,
     },
@@ -668,7 +669,7 @@ impl Syscall {
                 }
             }
 
-            SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pid| pid.into()),
+            SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pgid| pgid.into()),
 
             SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
             SYS_FSTAT => {
@@ -886,8 +887,9 @@ impl Syscall {
             }
 
             SYS_SETPGID => {
-                warn!("SYS_SETPGID has not yet been implemented");
-                Ok(0)
+                let pid = Pid::new(args[0]);
+                let pgid = Pgid::new(args[1]);
+                Self::setpgid(pid, pgid)
             }
 
             SYS_RT_SIGPROCMASK => {
@@ -950,10 +952,8 @@ impl Syscall {
             SYS_SETFSUID => Self::setfsuid(args[0]),
             SYS_SETFSGID => Self::setfsgid(args[0]),
 
-            SYS_SETSID => {
-                warn!("SYS_SETSID has not yet been implemented");
-                Ok(0)
-            }
+            SYS_SETSID => Self::setsid(),
+            SYS_GETSID => Self::getsid(Pid::new(args[0])),
 
             SYS_GETRUSAGE => {
                 let who = args[0] as c_int;

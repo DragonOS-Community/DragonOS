@@ -86,7 +86,7 @@ QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
 
 # 设置无图形界面模式
-QEMU_NOGRAPHIC=""
+QEMU_NOGRAPHIC=false
 
 KERNEL_CMDLINE=" "
 

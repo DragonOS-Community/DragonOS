@@ -128,6 +128,7 @@ fn try_to_run_init_process(
     ext_args: &Option<&str>,
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
+    log::debug!("Trying to run init process at {:?}", path);
     let mut args_to_insert = alloc::vec::Vec::new();
     args_to_insert.push(CString::new(path).unwrap());
 

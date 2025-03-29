@@ -558,14 +558,26 @@ impl BinaryLoader for ElfLoader {
             if seg.p_filesz > 4096 || seg.p_filesz < 2 {
                 return Err(ExecError::NotExecutable);
             }
-
-            let interpreter_ptr = unsafe {
-                core::slice::from_raw_parts(
-                    seg.p_offset as *const u8,
+            let mut buffer = vec![0; seg.p_filesz.try_into().unwrap()];
+            let r = param
+                .file_mut()
+                .pread(
+                    seg.p_offset.try_into().unwrap(),
                     seg.p_filesz.try_into().unwrap(),
+                    buffer.as_mut_slice(),
                 )
-            };
-            let _interpreter_path = core::str::from_utf8(interpreter_ptr).map_err(|e| {
+                .map_err(|e| {
+                    log::error!("Failed to load interpreter :{:?}", e);
+                    return ExecError::NotSupported;
+                })?;
+            if r != seg.p_filesz.try_into().unwrap() {
+                log::error!("Failed to load interpreter ");
+                return Err(ExecError::NotSupported);
+            }
+            let _interpreter_path = core::str::from_utf8(
+                &buffer[0..TryInto::<usize>::try_into(seg.p_filesz).unwrap() - 1], //
+            )
+            .map_err(|e| {
                 ExecError::Other(format!(
                     "Failed to parse the path of dynamic linker with error {}",
                     e

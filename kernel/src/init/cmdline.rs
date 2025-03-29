@@ -321,6 +321,7 @@ impl KernelCmdlineManager {
                 continue;
             }
 
+            log::debug!("cmdline: argument: {:?} ", argument);
             let (node, option, value) = match self.split_arg(argument) {
                 Some(v) => v,
                 None => continue,

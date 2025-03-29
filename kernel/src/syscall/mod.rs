@@ -885,6 +885,11 @@ impl Syscall {
                 Self::poll(fds, nfds, timeout)
             }
 
+            SYS_PPOLL => {
+                log::warn!("SYS_PPOLL has not yet been implemented");
+                Ok(0)
+            }
+
             SYS_SETPGID => {
                 warn!("SYS_SETPGID has not yet been implemented");
                 Ok(0)

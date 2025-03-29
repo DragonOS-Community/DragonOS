@@ -249,6 +249,8 @@ rustInstall() {
 		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION_OLD-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION_OLD-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION_OLD-riscv64gc-unknown-linux-gnu
         
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src

@@ -6,15 +6,20 @@ endif
 
 CC=$(CROSS_COMPILE)gcc
 
+
 .PHONY: all
 all: main.c
-	$(CC) -static -o init main.c
+# $(CC) -static -o init main.c
+	$(MAKE) -C riscv_rust_init ARCH=$(ARCH) install
 
 .PHONY: install clean
 install: all
-	mv init $(DADK_CURRENT_BUILD_DIR)/init
+	$(MAKE) -C riscv_rust_init ARCH=$(ARCH) install
+# mv init $(DADK_CURRENT_BUILD_DIR)/init
+
 
 clean:
 	rm init *.o
+	$(MAKE) -C riscv_rust_init ARCH=$(ARCH) clean
 
 fmt:

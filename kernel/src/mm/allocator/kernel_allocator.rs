@@ -154,7 +154,7 @@ fn dealloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {
     )
 }
 
-/// 为内核slab分配器实现Allocator特性
+// 为内核slab分配器实现Allocator特性
 // unsafe impl Allocator for KernelAllocator {
 //     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
 //         let memory = unsafe {self.local_alloc(layout)};

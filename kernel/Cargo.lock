@@ -1816,7 +1816,8 @@ dependencies = [
 [[package]]
 name = "unwinding"
 version = "0.2.3"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/unwinding?rev=4eb845da62#4eb845da624f4c9899639ca116beb6d2f87e18bc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "637d511437df708cee34bdec7ba2f1548d256b7acf3ff20e0a1c559f9bf3a987"
 dependencies = [
  "gimli 0.31.1",
 ]

@@ -15,6 +15,23 @@ cfg_if! {
         static PANIC_COUNTER: AtomicU8 = AtomicU8::new(0);
     }
 }
+
+#[derive(Debug)]
+struct PanicGuard;
+
+impl PanicGuard {
+    pub fn new() -> Self {
+        crate::arch::panic_pre_work();
+        Self
+    }
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        crate::arch::panic_post_work();
+    }
+}
+
 /// 全局的panic处理函数
 ///
 #[cfg(target_os = "none")]
@@ -47,10 +64,9 @@ pub fn panic(info: &PanicInfo) -> ! {
     }
 
     if info.can_unwind() {
-        crate::arch::panic_pre_work();
+        let guard = Box::new(PanicGuard::new());
         hook::print_stack_trace();
-        println!("Unwinding...");
-        let _res = unwinding::panic::begin_panic(Box::new(()));
+        let _res = unwinding::panic::begin_panic(guard);
         // log::error!("panic unreachable: {:?}", _res.0);
     }
     println!(
@@ -68,7 +84,6 @@ pub fn kernel_catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, SystemError> 
     match res {
         Ok(r) => Ok(r),
         Err(e) => {
-            crate::arch::panic_post_work();
             log::error!("Catch Unwind Error: {:?}", e);
             Err(SystemError::MAXERRNO)
         }

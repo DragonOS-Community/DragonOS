@@ -54,6 +54,8 @@ impl ProcessGroup {
             leader: Some(pcb),
             session: Weak::new(),
         };
+        log::debug!("New ProcessGroup {:?}", pid);
+
         Arc::new(Self {
             pgid: Pgid(pid.into()),
             process_group_inner: Mutex::new(inner),
@@ -84,6 +86,35 @@ impl ProcessGroup {
 
     pub fn broadcast(&self) {
         unimplemented!("broadcast not supported yet");
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let mut all_groups = ALL_PROCESS_GROUP.lock_irqsave();
+        if let Some(groups) = all_groups.as_mut() {
+            groups.remove(&self.pgid);
+        }
+
+        let mut inner = self.process_group_inner.lock();
+
+        if let Some(leader) = inner.leader.take() {
+            // 组长进程仍然在进程列表中，不应该直接销毁
+            if inner.processes.contains_key(&leader.pid()) {
+                inner.leader = Some(leader);
+            }
+        }
+
+        inner.processes.clear();
+
+        if let Some(session) = inner.session.upgrade() {
+            let mut session_inner = session.session_inner.lock();
+            session_inner.process_groups.remove(&self.pgid);
+
+            if session_inner.should_destory() {
+                ProcessManager::remove_session(session.sid());
+            }
+        }
     }
 }
 
@@ -120,14 +151,20 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pg.pgid(), pg.clone());
+        log::debug!("New ProcessGroup added, pgid: {:?}", pg.pgid());
     }
 
+    /// 删除一个进程组
     pub fn remove_process_group(pgid: Pgid) {
-        ALL_PROCESS_GROUP
-            .lock_irqsave()
-            .as_mut()
-            .unwrap()
-            .remove(&pgid);
+        log::debug!("Removing pg {:?}", pgid.clone());
+        let mut all_groups = ALL_PROCESS_GROUP.lock_irqsave();
+        if let Some(pg) = all_groups.as_mut().unwrap().remove(&pgid) {
+            if Arc::strong_count(&pg) <= 2 {
+                // 这里 Arc 计数小于等于 2，意味着它只有在 all_groups 里有一个引用，移除后会自动释放
+                drop(pg);
+                log::debug!("Dropping pg {:?}", pgid.clone());
+            }
+        }
     }
 }
 
@@ -146,15 +183,19 @@ impl ProcessControlBlock {
         self.process_group.lock().upgrade()
     }
 
-    pub fn set_process_group(self: &Arc<Self>, pg: &Arc<ProcessGroup>) {
-        *self.process_group.lock() = Arc::downgrade(pg);
-        // log::debug!("pid: {:?} set pgid: {:?}", self.pid(), pg.pgid());
+    pub fn set_process_group(&self, pg: &Arc<ProcessGroup>) {
+        if let Some(pcb) = self.self_ref.upgrade() {
+            *pcb.process_group.lock() = Arc::downgrade(pg);
+            // log::debug!("pid: {:?} set pgid: {:?}", self.pid(), pg.pgid());
+        }
     }
 
-    pub fn is_process_group_leader(self: &Arc<Self>) -> bool {
-        let pg = self.process_group().unwrap();
-        if let Some(leader) = pg.leader() {
-            return Arc::ptr_eq(self, &leader);
+    pub fn is_process_group_leader(&self) -> bool {
+        if let Some(pcb) = self.self_ref.upgrade() {
+            let pg = self.process_group().unwrap();
+            if let Some(leader) = pg.leader() {
+                return Arc::ptr_eq(&pcb, &leader);
+            }
         }
 
         return false;
@@ -170,7 +211,8 @@ impl ProcessControlBlock {
     ///
     /// ## 返回值
     /// 无
-    pub fn join_other_group(self: &Arc<Self>, pgid: Pgid) -> Result<(), SystemError> {
+    pub fn join_other_group(&self, pgid: Pgid) -> Result<(), SystemError> {
+        // if let Some(pcb) = self.self_ref.upgrade() {
         if self.pgid() == pgid {
             return Ok(());
         }
@@ -192,12 +234,13 @@ impl ProcessControlBlock {
             }
             self.join_new_group()?;
         }
+        // }
 
         Ok(())
     }
 
     /// 将进程加入到新创建的进程组中
-    fn join_new_group(self: &Arc<Self>) -> Result<(), SystemError> {
+    fn join_new_group(&self) -> Result<(), SystemError> {
         let session = self.session().unwrap();
         let mut self_pg_mut = self.process_group.lock();
 
@@ -214,7 +257,8 @@ impl ProcessControlBlock {
             }
         }
 
-        let new_pg = ProcessGroup::new(self.clone());
+        let pcb = self.self_ref.upgrade().unwrap();
+        let new_pg = ProcessGroup::new(pcb);
         let mut new_pg_inner = new_pg.process_group_inner.lock();
         let mut session_inner = session.session_inner.lock();
 
@@ -230,10 +274,7 @@ impl ProcessControlBlock {
     }
 
     /// 将进程加入到指定的进程组中
-    fn join_specified_group(
-        self: &Arc<Self>,
-        group: &Arc<ProcessGroup>,
-    ) -> Result<(), SystemError> {
+    fn join_specified_group(&self, group: &Arc<ProcessGroup>) -> Result<(), SystemError> {
         let mut self_group = self.process_group.lock();
 
         let mut group_inner = if let Some(old_pg) = self_group.upgrade() {
@@ -260,7 +301,8 @@ impl ProcessControlBlock {
             group.process_group_inner.lock()
         };
 
-        group_inner.processes.insert(self.pid, self.clone());
+        let pcb = self.self_ref.upgrade().unwrap();
+        group_inner.processes.insert(self.pid, pcb);
         *self_group = Arc::downgrade(group);
         Ok(())
     }

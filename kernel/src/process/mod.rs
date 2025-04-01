@@ -1196,6 +1196,34 @@ impl Drop for ProcessControlBlock {
                 .retain(|pid| *pid != self.pid());
         }
 
+        if let Some(pg) = self.process_group() {
+            let mut pg_inner = pg.process_group_inner.lock();
+            pg_inner.remove_process(&self.pid());
+
+            if pg_inner.is_empty() {
+                // 如果进程组没有任何进程了,就删除该进程组
+                ProcessManager::remove_process_group(pg.pgid());
+
+                if let Some(session) = pg_inner.session.upgrade() {
+                    let mut session_inner = session.session_inner.lock();
+                    session_inner.remove_process_group(&pg.pgid());
+                    if session_inner.is_empty() {
+                        // 如果会话没有任何进程组了,就删除该会话
+                        ProcessManager::remove_session(session.sid());
+                    }
+                }
+            }
+        }
+
+        if let Some(session) = self.session() {
+            let mut session_inner = session.session_inner.lock();
+            if let Some(leader) = &session_inner.leader {
+                if Arc::ptr_eq(leader, &self.self_ref.upgrade().unwrap()) {
+                    session_inner.leader = None;
+                }
+            }
+        }
+
         drop(irq_guard);
     }
 }

@@ -40,6 +40,9 @@ impl SessionInner {
             }
         }
     }
+    pub fn should_destory(&self) -> bool {
+        self.process_groups.is_empty()
+    }
 }
 
 impl Session {
@@ -51,6 +54,7 @@ impl Session {
             process_groups,
             leader: None,
         };
+        log::debug!("New Session {:?}", sid);
         Arc::new(Self {
             sid,
             session_inner: Mutex::new(inner),
@@ -76,6 +80,21 @@ impl Session {
             .contains_key(&process_group.pgid)
     }
 }
+
+// impl Drop for Session {
+//     fn drop(&mut self) {
+//         let mut all_sessions = ALL_SESSION.lock_irqsave();
+//         if let Some(sessions) = all_sessions.as_mut() {
+//             if sessions.remove(&self.sid).is_some() {
+//                 log::debug!("Session {:?} has been dropped", self.sid);
+//             }
+//         }
+
+//         let mut session_inner = self.session_inner.lock();
+//         session_inner.process_groups.clear();
+//         session_inner.leader = None;
+//     }
+// }
 
 impl ProcessManager {
     /// 根据sid获取会话
@@ -106,10 +125,19 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(session.sid(), session.clone());
+        log::debug!("New Session added, sid: {:?}", session.sid());
     }
 
     pub fn remove_session(sid: Sid) {
-        ALL_SESSION.lock_irqsave().as_mut().unwrap().remove(&sid);
+        log::debug!("Removing session: {:?}", sid.clone());
+        let mut all_sessions = ALL_SESSION.lock_irqsave();
+        if let Some(session) = all_sessions.as_mut().unwrap().remove(&sid) {
+            if Arc::strong_count(&session) <= 2 {
+                // 这里 Arc 计数为 1，意味着它只有在 all_groups 里有一个引用，移除后会自动释放
+                drop(session);
+                log::debug!("Dropping session: {:?}", sid.clone());
+            }
+        }
     }
 }
 
@@ -119,10 +147,12 @@ impl ProcessControlBlock {
         pg.session()
     }
 
-    pub fn is_session_leader(self: &Arc<Self>) -> bool {
-        let session = self.session().unwrap();
-        if let Some(leader) = session.leader() {
-            return Arc::ptr_eq(self, &leader);
+    pub fn is_session_leader(&self) -> bool {
+        if let Some(pcb) = self.self_ref.upgrade() {
+            let session = pcb.session().unwrap();
+            if let Some(leader) = session.leader() {
+                return Arc::ptr_eq(&pcb, &leader);
+            }
         }
 
         return false;
@@ -135,7 +165,7 @@ impl ProcessControlBlock {
     /// ## 返回值
     ///
     /// 新会话
-    pub fn go_to_new_session(self: &Arc<Self>) -> Result<Arc<Session>, SystemError> {
+    pub fn go_to_new_session(&self) -> Result<Arc<Session>, SystemError> {
         if self.is_session_leader() {
             return Ok(self.session().unwrap());
         }
@@ -169,18 +199,19 @@ impl ProcessControlBlock {
             }
         }
 
-        let new_pg = ProcessGroup::new(self.clone());
+        let pcb = self.self_ref.upgrade().unwrap();
+        let new_pg = ProcessGroup::new(pcb.clone());
         *self_group = Arc::downgrade(&new_pg);
         ProcessManager::add_process_group(new_pg.clone());
 
         let new_session = Session::new(new_pg.clone());
         let mut new_pg_inner = new_pg.process_group_inner.lock();
         new_pg_inner.session = Arc::downgrade(&new_session);
-        new_session.session_inner.lock().leader = Some(self.clone());
+        new_session.session_inner.lock().leader = Some(pcb.clone());
         ProcessManager::add_session(new_session.clone());
 
         let mut session_inner = session.session_inner.lock();
-        session_inner.remove_process(self);
+        session_inner.remove_process(&pcb);
 
         Ok(new_session)
     }

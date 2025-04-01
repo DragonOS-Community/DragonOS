@@ -116,7 +116,8 @@ impl ProcessManager {
     ///
     /// 无
     pub fn add_session(session: Arc<Session>) {
-        ALL_SESSION.lock_irqsave()
+        ALL_SESSION
+            .lock_irqsave()
             .as_mut()
             .unwrap()
             .insert(session.sid(), session.clone());

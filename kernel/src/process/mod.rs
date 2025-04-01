@@ -1200,7 +1200,6 @@ impl Drop for ProcessControlBlock {
                 .retain(|pid| *pid != self.pid());
         }
 
-
         // log::debug!("Drop pid: {:?}", self.pid());
         drop(irq_guard);
     }

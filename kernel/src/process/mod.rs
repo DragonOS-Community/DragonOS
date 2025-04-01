@@ -461,6 +461,7 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
 
+            pcb.clear_pg_and_session_reference();
             drop(pcb);
             ProcessManager::exit_notify();
         }
@@ -476,6 +477,7 @@ impl ProcessManager {
     pub unsafe fn release(pid: Pid) {
         let pcb = ProcessManager::find(pid);
         if pcb.is_some() {
+            // log::debug!("release pid {}", pid);
             // let pcb = pcb.unwrap();
             // 判断该pcb是否在全局没有任何引用
             // TODO: 当前，pcb的Arc指针存在泄露问题，引用计数不正确，打算在接下来实现debug专用的Arc，方便调试，然后解决这个bug。
@@ -870,16 +872,18 @@ impl ProcessControlBlock {
             }
         }
 
-        let process_group = ProcessGroup::new(pcb.clone());
-        *pcb.process_group.lock() = Arc::downgrade(&process_group);
-        ProcessManager::add_process_group(process_group.clone());
+        if pcb.pid() > Pid(0) && !is_idle {
+            let process_group = ProcessGroup::new(pcb.clone());
+            *pcb.process_group.lock() = Arc::downgrade(&process_group);
+            ProcessManager::add_process_group(process_group.clone());
 
-        let session = Session::new(process_group.clone());
-        process_group.process_group_inner.lock().session = Arc::downgrade(&session);
-        session.session_inner.lock().leader = Some(pcb.clone());
-        ProcessManager::add_session(session);
+            let session = Session::new(process_group.clone());
+            process_group.process_group_inner.lock().session = Arc::downgrade(&session);
+            session.session_inner.lock().leader = Some(pcb.clone());
+            ProcessManager::add_session(session);
 
-        ProcessManager::add_pcb(pcb.clone());
+            ProcessManager::add_pcb(pcb.clone());
+        }
         // log::debug!(
         //     "A new process is created, pid: {:?}, pgid: {:?}, sid: {:?}",
         //     pcb.pid(),
@@ -1196,34 +1200,8 @@ impl Drop for ProcessControlBlock {
                 .retain(|pid| *pid != self.pid());
         }
 
-        if let Some(pg) = self.process_group() {
-            let mut pg_inner = pg.process_group_inner.lock();
-            pg_inner.remove_process(&self.pid());
 
-            if pg_inner.is_empty() {
-                // 如果进程组没有任何进程了,就删除该进程组
-                ProcessManager::remove_process_group(pg.pgid());
-
-                if let Some(session) = pg_inner.session.upgrade() {
-                    let mut session_inner = session.session_inner.lock();
-                    session_inner.remove_process_group(&pg.pgid());
-                    if session_inner.is_empty() {
-                        // 如果会话没有任何进程组了,就删除该会话
-                        ProcessManager::remove_session(session.sid());
-                    }
-                }
-            }
-        }
-
-        if let Some(session) = self.session() {
-            let mut session_inner = session.session_inner.lock();
-            if let Some(leader) = &session_inner.leader {
-                if Arc::ptr_eq(leader, &self.self_ref.upgrade().unwrap()) {
-                    session_inner.leader = None;
-                }
-            }
-        }
-
+        // log::debug!("Drop pid: {:?}", self.pid());
         drop(irq_guard);
     }
 }

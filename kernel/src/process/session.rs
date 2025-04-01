@@ -16,11 +16,13 @@ int_like!(Sid, AtomicSid, usize, AtomicUsize);
 /// 系统中所有会话
 pub static ALL_SESSION: SpinLock<Option<HashMap<Sid, Arc<Session>>>> = SpinLock::new(None);
 
+#[derive(Debug)]
 pub struct Session {
     pub sid: Sid,
     pub session_inner: Mutex<SessionInner>,
 }
 
+#[derive(Debug)]
 pub struct SessionInner {
     pub process_groups: BTreeMap<Pgid, Arc<ProcessGroup>>,
     pub leader: Option<Arc<ProcessControlBlock>>,
@@ -54,7 +56,7 @@ impl Session {
             process_groups,
             leader: None,
         };
-        log::debug!("New Session {:?}", sid);
+        // log::debug!("New Session {:?}", sid);
         Arc::new(Self {
             sid,
             session_inner: Mutex::new(inner),
@@ -81,20 +83,14 @@ impl Session {
     }
 }
 
-// impl Drop for Session {
-//     fn drop(&mut self) {
-//         let mut all_sessions = ALL_SESSION.lock_irqsave();
-//         if let Some(sessions) = all_sessions.as_mut() {
-//             if sessions.remove(&self.sid).is_some() {
-//                 log::debug!("Session {:?} has been dropped", self.sid);
-//             }
-//         }
-
-//         let mut session_inner = self.session_inner.lock();
-//         session_inner.process_groups.clear();
-//         session_inner.leader = None;
-//     }
-// }
+impl Drop for Session {
+    fn drop(&mut self) {
+        let mut session_inner = self.session_inner.lock();
+        session_inner.process_groups.clear();
+        session_inner.leader = None;
+        // log::debug!("Dropping session: {:?}", self.sid());
+    }
+}
 
 impl ProcessManager {
     /// 根据sid获取会话
@@ -120,22 +116,20 @@ impl ProcessManager {
     ///
     /// 无
     pub fn add_session(session: Arc<Session>) {
-        ALL_SESSION
-            .lock_irqsave()
+        ALL_SESSION.lock_irqsave()
             .as_mut()
             .unwrap()
             .insert(session.sid(), session.clone());
-        log::debug!("New Session added, sid: {:?}", session.sid());
+        // log::debug!("New Session added, sid: {:?}", session.sid());
     }
 
     pub fn remove_session(sid: Sid) {
-        log::debug!("Removing session: {:?}", sid.clone());
+        // log::debug!("Removing session: {:?}", sid.clone());
         let mut all_sessions = ALL_SESSION.lock_irqsave();
         if let Some(session) = all_sessions.as_mut().unwrap().remove(&sid) {
             if Arc::strong_count(&session) <= 2 {
                 // 这里 Arc 计数为 1，意味着它只有在 all_groups 里有一个引用，移除后会自动释放
                 drop(session);
-                log::debug!("Dropping session: {:?}", sid.clone());
             }
         }
     }

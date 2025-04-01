@@ -54,7 +54,7 @@ impl ProcessGroup {
             leader: Some(pcb),
             session: Weak::new(),
         };
-        log::debug!("New ProcessGroup {:?}", pid);
+        // log::debug!("New ProcessGroup {:?}", pid);
 
         Arc::new(Self {
             pgid: Pgid(pid.into()),
@@ -91,11 +91,6 @@ impl ProcessGroup {
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        let mut all_groups = ALL_PROCESS_GROUP.lock_irqsave();
-        if let Some(groups) = all_groups.as_mut() {
-            groups.remove(&self.pgid);
-        }
-
         let mut inner = self.process_group_inner.lock();
 
         if let Some(leader) = inner.leader.take() {
@@ -115,6 +110,7 @@ impl Drop for ProcessGroup {
                 ProcessManager::remove_session(session.sid());
             }
         }
+        // log::debug!("Dropping pg {:?}", self.pgid.clone());
     }
 }
 
@@ -151,18 +147,18 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pg.pgid(), pg.clone());
-        log::debug!("New ProcessGroup added, pgid: {:?}", pg.pgid());
+        // log::debug!("New ProcessGroup added, pgid: {:?}", pg.pgid());
     }
 
     /// 删除一个进程组
     pub fn remove_process_group(pgid: Pgid) {
-        log::debug!("Removing pg {:?}", pgid.clone());
+        // log::debug!("Removing pg {:?}", pgid.clone());
         let mut all_groups = ALL_PROCESS_GROUP.lock_irqsave();
         if let Some(pg) = all_groups.as_mut().unwrap().remove(&pgid) {
+            // log::debug!("count: {:?}", Arc::strong_count(&pg));
             if Arc::strong_count(&pg) <= 2 {
                 // 这里 Arc 计数小于等于 2，意味着它只有在 all_groups 里有一个引用，移除后会自动释放
                 drop(pg);
-                log::debug!("Dropping pg {:?}", pgid.clone());
             }
         }
     }
@@ -305,5 +301,38 @@ impl ProcessControlBlock {
         group_inner.processes.insert(self.pid, pcb);
         *self_group = Arc::downgrade(group);
         Ok(())
+    }
+
+    /// ### 清除自身的进程组以及会话引用(如果有的话)，这个方法只能在进程退出时调用
+    pub fn clear_pg_and_session_reference(&self) {
+        if let Some(pg) = self.process_group() {
+            let mut pg_inner = pg.process_group_inner.lock();
+            pg_inner.remove_process(&self.pid());
+
+            if pg_inner.is_empty() {
+                // 如果进程组没有任何进程了,就删除该进程组
+                ProcessManager::remove_process_group(pg.pgid());
+                // log::debug!("clear_pg_reference: {:?}", pg.pgid());
+
+                if let Some(session) = pg_inner.session.upgrade() {
+                    let mut session_inner = session.session_inner.lock();
+                    session_inner.remove_process_group(&pg.pgid());
+                    if session_inner.is_empty() {
+                        // 如果会话没有任何进程组了,就删除该会话
+                        ProcessManager::remove_session(session.sid());
+                        // log::debug!("clear_pg_reference: {:?}", session.sid());
+                    }
+                }
+            }
+        }
+
+        if let Some(session) = self.session() {
+            let mut session_inner = session.session_inner.lock();
+            if let Some(leader) = &session_inner.leader {
+                if Arc::ptr_eq(leader, &self.self_ref.upgrade().unwrap()) {
+                    session_inner.leader = None;
+                }
+            }
+        }
     }
 }

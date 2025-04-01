@@ -57,7 +57,7 @@ system_error = { path = "crates/system_error" }
 uefi = { version = "=0.26.0", features = ["alloc"] }
 uefi-raw = "=0.5.0"
 unified-init = { path = "crates/unified-init" }
-virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "f91c807965" }
+virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "415ab38ff9" }
 wait_queue_macros = { path = "crates/wait_queue_macros" }
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }
@@ -76,6 +76,7 @@ unwinding = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/unwi
     "personality"
 ]}
 defer = "0.2.1"
+cfg-if = { version = "1.0.0" }
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]

@@ -886,6 +886,11 @@ impl Syscall {
                 Self::poll(fds, nfds, timeout)
             }
 
+            SYS_PPOLL => {
+                log::warn!("SYS_PPOLL has not yet been implemented");
+                Ok(0)
+            }
+
             SYS_SETPGID => {
                 let pid = Pid::new(args[0]);
                 let pgid = Pgid::new(args[1]);

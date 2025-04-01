@@ -23,7 +23,8 @@
 #![crate_name = "slabmalloc"]
 #![crate_type = "lib"]
 #![feature(maybe_uninit_as_bytes)]
-
+#![deny(clippy::all)]
+#![allow(clippy::needless_return)]
 extern crate alloc;
 
 mod pages;

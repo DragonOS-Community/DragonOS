@@ -1,9 +1,6 @@
+use crate::debug::traceback::lookup_kallsyms;
 use unwinding::abi::{UnwindContext, UnwindReasonCode, _Unwind_GetIP};
 use unwinding::panic::UserUnwindTrace;
-
-extern "C" {
-    fn lookup_kallsyms(addr: u64, level: i32) -> i32;
-}
 
 /// User hook for unwinding
 ///

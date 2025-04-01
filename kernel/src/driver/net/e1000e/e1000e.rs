@@ -587,11 +587,13 @@ impl Drop for E1000EDevice {
 
 pub fn e1000e_init() {
     match e1000e_probe() {
-        Ok(_code) => {
-            info!("Successfully init e1000e device!");
+        Ok(code) => {
+            if code == 1 {
+                info!("Successfully init e1000e device!");
+            }
         }
-        Err(_error) => {
-            info!("Error occurred!");
+        Err(error) => {
+            info!("Failed to init e1000e device: {error:?}");
         }
     }
 }
@@ -602,6 +604,7 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
     if result.is_empty() {
         return Ok(0);
     }
+    let mut initialized = false;
     for device in result {
         let standard_device = device.as_standard_device().unwrap();
         if standard_device.common_header.vendor_id == 0x8086 {
@@ -625,11 +628,16 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
                     .unwrap(),
                 )?;
                 e1000e_driver_init(e1000e);
+                initialized = true;
             }
         }
     }
 
-    return Ok(1);
+    if initialized {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
 }
 
 // 用到的e1000e寄存器结构体
@@ -787,6 +795,7 @@ const E1000E_TXD_CMD_RS: u8 = 1 << 3;
 
 /// E1000E驱动初始化过程中可能的错误
 #[allow(dead_code)]
+#[derive(Debug)]
 pub enum E1000EPciError {
     // 获取到错误类型的BAR（IO BAR）
     // An IO BAR was provided rather than a memory BAR.

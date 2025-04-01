@@ -3,7 +3,7 @@ use crate::driver::{
     base::{
         device::{
             device_number::{DeviceNumber, Major},
-            Device, DeviceError, IdTable, BLOCKDEVS,
+            DevName, Device, DeviceError, IdTable, BLOCKDEVS,
         },
         map::{
             DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
@@ -13,8 +13,8 @@ use crate::driver::{
     block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
 };
 
-use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{any::Any, fmt::Display, ops::Deref};
+use alloc::{sync::Arc, vec::Vec};
+use core::any::Any;
 use log::error;
 use system_error::SystemError;
 
@@ -221,74 +221,11 @@ pub fn __lba_to_bytes(lba_id: usize, blk_size: usize) -> BlockId {
     return lba_id * blk_size;
 }
 
-/// 块设备的名字
-pub struct BlockDevName {
-    name: Arc<String>,
-    id: usize,
-}
-
-impl BlockDevName {
-    pub fn new(name: String, id: usize) -> Self {
-        return BlockDevName {
-            name: Arc::new(name),
-            id,
-        };
-    }
-
-    #[inline]
-    pub fn id(&self) -> usize {
-        return self.id;
-    }
-}
-
-impl core::fmt::Debug for BlockDevName {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        return write!(f, "{}", self.name);
-    }
-}
-
-impl Display for BlockDevName {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        return write!(f, "{}", self.name);
-    }
-}
-
-impl Clone for BlockDevName {
-    fn clone(&self) -> Self {
-        return BlockDevName {
-            name: self.name.clone(),
-            id: self.id,
-        };
-    }
-}
-
-impl core::hash::Hash for BlockDevName {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-    }
-}
-
-impl Deref for BlockDevName {
-    type Target = String;
-
-    fn deref(&self) -> &Self::Target {
-        return self.name.as_ref();
-    }
-}
-
-impl PartialEq for BlockDevName {
-    fn eq(&self, other: &Self) -> bool {
-        return self.name == other.name;
-    }
-}
-
-impl Eq for BlockDevName {}
-
 /// @brief 块设备应该实现的操作
 pub trait BlockDevice: Device {
     /// # dev_name
     /// 返回块设备的名字
-    fn dev_name(&self) -> &BlockDevName;
+    fn dev_name(&self) -> &DevName;
 
     fn blkdev_meta(&self) -> &BlockDevMeta;
 

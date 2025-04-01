@@ -50,6 +50,7 @@ impl Drop for TtyCore {
 }
 
 impl TtyCore {
+    #[inline(never)]
     pub fn new(driver: Arc<TtyDriver>, index: usize) -> Arc<Self> {
         let name = driver.tty_line_name(index);
         let device_number = driver
@@ -76,7 +77,6 @@ impl TtyCore {
             device_number,
             privete_fields: SpinLock::new(None),
         };
-
         return Arc::new(Self {
             core,
             line_discipline: Arc::new(NTtyLinediscipline {

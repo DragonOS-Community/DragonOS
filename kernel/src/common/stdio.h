@@ -7,7 +7,3 @@
 #define	SEEK_END	2	/* Seek relative to end-of-file */
 
 #define SEEK_MAX	3
-
-extern int vsprintf(char *buf, const char *fmt, va_list args);
-
-extern int sprintk(char *buf, const char *fmt, ...);

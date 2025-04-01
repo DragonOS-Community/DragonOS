@@ -92,7 +92,8 @@ impl FsStruct {
 impl Namespace for MntNamespace {
     fn ns_common_to_ns(ns_common: Arc<NsCommon>) -> Arc<Self> {
         let ns_common_ptr = Arc::as_ptr(&ns_common);
-        container_of!(ns_common_ptr, MntNamespace, ns_common)
+        // container_of!(ns_common_ptr, MntNamespace, ns_common)
+        panic!("not implemented")
     }
 }
 

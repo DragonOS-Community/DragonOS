@@ -6,14 +6,14 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::base::block::gendisk::GenDisk,
+    driver::base::{block::gendisk::GenDisk, device::DevName},
     filesystem::mbr::MbrDiskPartionTable,
     init::initcall::INITCALL_POSTCORE,
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
 use super::{
-    block_device::{BlockDevName, BlockDevice, GeneralBlockRange},
+    block_device::{BlockDevice, GeneralBlockRange},
     gendisk::GenDiskMap,
 };
 
@@ -38,7 +38,7 @@ pub struct BlockDevManager {
 }
 
 struct InnerBlockDevManager {
-    disks: HashMap<BlockDevName, Arc<dyn BlockDevice>>,
+    disks: HashMap<DevName, Arc<dyn BlockDevice>>,
 }
 impl BlockDevManager {
     pub fn new() -> Self {
@@ -207,7 +207,7 @@ impl BlockDevManager {
 }
 
 pub struct BlockDevMeta {
-    pub devname: BlockDevName,
+    pub devname: DevName,
     inner: SpinLock<InnerBlockDevMeta>,
 }
 
@@ -216,7 +216,7 @@ pub struct InnerBlockDevMeta {
 }
 
 impl BlockDevMeta {
-    pub fn new(devname: BlockDevName) -> Self {
+    pub fn new(devname: DevName) -> Self {
         BlockDevMeta {
             devname,
             inner: SpinLock::new(InnerBlockDevMeta {

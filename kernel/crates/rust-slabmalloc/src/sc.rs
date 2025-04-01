@@ -71,7 +71,7 @@ macro_rules! new_sc_allocator {
         SCAllocator {
             size: $size,
             allocation_count: 0,
-            obj_per_page: obj_per_page,
+            obj_per_page,
             empty_slabs: PageList::new(),
             slabs: PageList::new(),
             full_slabs: PageList::new(),

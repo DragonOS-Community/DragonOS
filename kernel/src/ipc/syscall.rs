@@ -562,4 +562,28 @@ impl Syscall {
             return Ok(0);
         }
     }
+
+    #[inline(never)]
+    pub fn rt_sigpending(user_sigset_ptr: usize, sigsetsize: usize) -> Result<usize, SystemError> {
+        if sigsetsize != size_of::<SigSet>() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut user_buffer_writer =
+            UserBufferWriter::new(user_sigset_ptr as *mut SigSet, size_of::<SigSet>(), true)?;
+
+        let pcb = ProcessManager::current_pcb();
+        let siginfo_guard = pcb.sig_info_irqsave();
+        let pending_set = siginfo_guard.sig_pending().signal();
+        let shared_pending_set = siginfo_guard.sig_shared_pending().signal();
+        let blocked_set = *siginfo_guard.sig_blocked();
+        drop(siginfo_guard);
+
+        let mut result = pending_set.union(shared_pending_set);
+        result = result.difference(blocked_set);
+
+        user_buffer_writer.copy_one_to_user(&result, 0)?;
+
+        Ok(0)
+    }
 }

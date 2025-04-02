@@ -36,16 +36,8 @@ pub(super) fn syscall_handler(syscall_num: usize, frame: &mut TrapFrame) -> () {
 
     let args = [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5];
     let mut syscall_handle = || -> usize {
-        #[cfg(feature = "backtrace")]
-        {
-            Syscall::catch_handle(syscall_num, &args, frame)
-                .unwrap_or_else(|e| e.to_posix_errno() as usize)
-        }
-        #[cfg(not(feature = "backtrace"))]
-        {
-            Syscall::handle(syscall_num, &args, frame)
-                .unwrap_or_else(|e| e.to_posix_errno() as usize)
-        }
+        Syscall::catch_handle(syscall_num, &args, frame)
+            .unwrap_or_else(|e| e.to_posix_errno() as usize)
     };
     syscall_return!(syscall_handle(), frame, false);
 }

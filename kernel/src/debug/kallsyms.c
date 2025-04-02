@@ -61,7 +61,7 @@ int read_symbol(FILE *filp, struct kernel_symbol_entry_t *entry)
     int retval = sscanf(str, "%llx %c %512c", &entry->vaddr, &entry->type, symbol_name);
 
     // 如果当前行不符合要求
-    if (retval != 3)
+    if (retval != 3 || entry->type != 'T')
     {
         return -1;
     }

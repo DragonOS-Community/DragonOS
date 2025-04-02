@@ -883,10 +883,7 @@ impl Syscall {
                 Self::poll(fds, nfds, timeout)
             }
 
-            SYS_PPOLL => {
-                log::warn!("SYS_PPOLL has not yet been implemented");
-                Ok(0)
-            }
+            SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
 
             SYS_SETPGID => {
                 warn!("SYS_SETPGID has not yet been implemented");
@@ -1233,6 +1230,7 @@ impl Syscall {
             }
             SYS_SETRLIMIT => Ok(0),
             SYS_RESTART_SYSCALL => Self::restart_syscall(),
+            SYS_RT_SIGPENDING => Self::rt_sigpending(args[0], args[1]),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

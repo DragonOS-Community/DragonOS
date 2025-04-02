@@ -531,8 +531,10 @@ impl EventPoll {
                     continue;
                 }
 
-                // 如果有未处理的信号则返回错误
-                if current_pcb.has_pending_signal_fast() {
+                // 如果有未处理且未被屏蔽的信号则返回错误
+                if current_pcb.has_pending_signal_fast()
+                    && current_pcb.has_pending_not_masked_signal()
+                {
                     return Err(SystemError::ERESTARTSYS);
                 }
 
@@ -857,6 +859,14 @@ impl EPollEvent {
 
     pub fn events(&self) -> u32 {
         self.events
+    }
+
+    pub fn set_data(&mut self, data: u64) {
+        self.data = data;
+    }
+
+    pub fn data(&self) -> u64 {
+        self.data
     }
 }
 

@@ -419,6 +419,16 @@ pub fn restore_saved_sigmask() {
     }
 }
 
+pub fn restore_saved_sigmask_unless(interrupted: bool) {
+    if interrupted {
+        if !ProcessManager::current_pcb().has_pending_signal_fast() {
+            log::warn!("restore_saved_sigmask_unless: interrupted, but has NO pending signal");
+        }
+    } else {
+        restore_saved_sigmask();
+    }
+}
+
 /// 刷新指定进程的sighand的sigaction，将满足条件的sigaction恢复为默认状态。
 /// 除非某个信号被设置为忽略且 `force_default` 为 `false`，否则都不会将其恢复。
 ///

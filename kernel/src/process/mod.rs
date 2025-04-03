@@ -238,6 +238,15 @@ impl ProcessManager {
         //     .insert(pcb.pgid(), ProcessGroup::new(pcb.clone()));
     }
 
+    /// ### 获取所有进程的pid
+    pub fn get_all_processes() -> Vec<Pid> {
+        let mut pids = Vec::new();
+        for (pid, _) in ALL_PROCESS.lock_irqsave().as_ref().unwrap().iter() {
+            pids.push(*pid);
+        }
+        pids
+    }
+
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -383,7 +392,8 @@ impl ProcessManager {
                 return;
             }
             let parent_pcb = r.unwrap();
-            let r = Syscall::kill(parent_pcb.pid(), Signal::SIGCHLD as i32);
+            // let r = Syscall::kill(parent_pcb.pid(), Signal::SIGCHLD as i32);
+            let r = Syscall::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
             if r.is_err() {
                 warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",

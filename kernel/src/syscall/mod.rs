@@ -412,7 +412,7 @@ impl Syscall {
                 Self::unlink(path)
             }
             SYS_KILL => {
-                let pid = Pid::new(args[0]);
+                let pid = args[0] as i32;
                 let sig = args[1] as c_int;
                 // debug!("KILL SYSCALL RECEIVED");
                 Self::kill(pid, sig)

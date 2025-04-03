@@ -24,7 +24,7 @@ use crate::{
         ucontext::{AddressSpace, VMA},
         VirtAddr, VmFlags,
     },
-    process::{Pid, ProcessManager},
+    process::{process_group::Pgid, Pid, ProcessManager},
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall,
@@ -40,6 +40,34 @@ use super::{
         USER_SIG_ERR, USER_SIG_IGN,
     },
 };
+
+/// ### 过滤器，将输入的id转换成对应的pid或pgid
+/// - 如果id < -1，则为pgid
+/// - 如果id == -1，则为所有进程
+/// - 如果id == 0，则为当前进程组
+/// - 如果id > 0，则为pid
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filter {
+    All,
+    Pid(Pid),
+    Pgid(Pgid),
+}
+
+impl Filter {
+    /// ### 为 `wait` 和 `kill` 调用使用
+    pub fn from_id(id: i32) -> Self {
+        if id < -1 {
+            Filter::Pgid(Pgid::from(-id as usize))
+        } else if id == -1 {
+            Filter::All
+        } else if id == 0 {
+            let pgid = ProcessManager::current_pcb().pgid();
+            Filter::Pgid(pgid)
+        } else {
+            Filter::Pid(Pid::from(id as usize))
+        }
+    }
+}
 
 impl Syscall {
     /// # 创建带参数的匿名管道
@@ -92,7 +120,44 @@ impl Syscall {
         Ok(0)
     }
 
-    pub fn kill(pid: Pid, sig: c_int) -> Result<usize, SystemError> {
+    pub fn kill_process(to_kill: Pid, sig: Signal) -> Result<usize, SystemError> {
+        // 初始化signal info
+        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(to_kill));
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        let ret = sig
+            .send_signal_info(Some(&mut info), to_kill)
+            .map(|x| x as usize);
+
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        return ret;
+    }
+
+    pub fn kill_process_group(to_kill: Pgid, sig: Signal) -> Result<usize, SystemError> {
+        let pg = ProcessManager::find_process_group(to_kill).ok_or(SystemError::ESRCH)?;
+        let inner = pg.process_group_inner.lock();
+        for pcb in inner.processes.values() {
+            Self::kill_process(pcb.pid(), sig)?;
+        }
+        Ok(0)
+    }
+
+    pub fn kill_all(sig: Signal) -> Result<usize, SystemError> {
+        let current_pid = ProcessManager::current_pcb().pid();
+        let all_processes = ProcessManager::get_all_processes();
+
+        for pid in all_processes {
+            if pid == current_pid || pid.data() == 1 {
+                continue;
+            }
+            Self::kill_process(pid, sig)?;
+        }
+        Ok(0)
+    }
+
+    pub fn kill(id: i32, sig: c_int) -> Result<usize, SystemError> {
+        let filter = Filter::from_id(id);
         let sig = Signal::from(sig);
         if sig == Signal::INVALID {
             // 传入的signal数值不合法
@@ -100,16 +165,15 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        // 初始化signal info
-        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pid));
+        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        let retval = match filter {
+            Filter::Pid(pid) => Self::kill_process(pid, sig),
+            Filter::Pgid(pgid) => Self::kill_process_group(pgid, sig),
+            Filter::All => Self::kill_all(sig),
+        };
 
-        let retval = sig
-            .send_signal_info(Some(&mut info), pid)
-            .map(|x| x as usize);
-
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         return retval;
     }

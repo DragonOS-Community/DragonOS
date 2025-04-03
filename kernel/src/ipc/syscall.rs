@@ -120,13 +120,14 @@ impl Syscall {
         Ok(0)
     }
 
-    pub fn kill_process(to_kill: Pid, sig: Signal) -> Result<usize, SystemError> {
+    /// ### 杀死一个进程
+    pub fn kill_process(pid: Pid, sig: Signal) -> Result<usize, SystemError> {
         // 初始化signal info
-        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(to_kill));
+        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pid));
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         let ret = sig
-            .send_signal_info(Some(&mut info), to_kill)
+            .send_signal_info(Some(&mut info), pid)
             .map(|x| x as usize);
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -134,8 +135,9 @@ impl Syscall {
         return ret;
     }
 
-    pub fn kill_process_group(to_kill: Pgid, sig: Signal) -> Result<usize, SystemError> {
-        let pg = ProcessManager::find_process_group(to_kill).ok_or(SystemError::ESRCH)?;
+    /// ### 杀死一个进程组
+    pub fn kill_process_group(pgid: Pgid, sig: Signal) -> Result<usize, SystemError> {
+        let pg = ProcessManager::find_process_group(pgid).ok_or(SystemError::ESRCH)?;
         let inner = pg.process_group_inner.lock();
         for pcb in inner.processes.values() {
             Self::kill_process(pcb.pid(), sig)?;
@@ -143,6 +145,8 @@ impl Syscall {
         Ok(0)
     }
 
+    /// ### 杀死所有进程
+    /// - 该函数会杀死所有进程，除了当前进程和init进程
     pub fn kill_all(sig: Signal) -> Result<usize, SystemError> {
         let current_pid = ProcessManager::current_pcb().pid();
         let all_processes = ProcessManager::get_all_processes();
@@ -156,6 +160,11 @@ impl Syscall {
         Ok(0)
     }
 
+    /// # kill系统调用函数
+    /// 
+    /// ## 参数
+    /// - `id`: id，等于0表示当前进程组，等于-1表示所有进程，小于0表示pgid = -id，大于0表示pid = id，
+    /// - `sig`: 信号值
     pub fn kill(id: i32, sig: c_int) -> Result<usize, SystemError> {
         let filter = Filter::from_id(id);
         let sig = Signal::from(sig);

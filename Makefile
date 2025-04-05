@@ -139,6 +139,11 @@ run-vnc: check_arch
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-vnc
 
+run-nographic: check_arch
+	$(MAKE) all -j $(NPROCS)
+	$(MAKE) write_diskimage || exit 1
+	$(MAKE) qemu-nographic
+
 # 在docker中编译，并启动QEMU
 run-docker: check_arch
 	@echo "使用docker构建并运行"

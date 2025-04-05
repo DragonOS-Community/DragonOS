@@ -1,17 +1,19 @@
 use super::{
     process_group::{Pgid, ProcessGroup},
-    ProcessControlBlock, ProcessManager,
+    Pid, ProcessControlBlock, ProcessManager,
 };
 use crate::libs::{mutex::Mutex, spinlock::SpinLock};
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
 };
-use core::sync::atomic::AtomicUsize;
 use hashbrown::HashMap;
 use system_error::SystemError;
 
-int_like!(Sid, AtomicSid, usize, AtomicUsize);
+/// 会话SID
+pub type Sid = Pid;
+
+// int_like!(Sid, AtomicSid, usize, AtomicUsize);
 
 /// 系统中所有会话
 pub static ALL_SESSION: SpinLock<Option<HashMap<Sid, Arc<Session>>>> = SpinLock::new(None);
@@ -49,7 +51,7 @@ impl SessionInner {
 
 impl Session {
     pub fn new(group: Arc<ProcessGroup>) -> Arc<Self> {
-        let sid = Sid(group.pgid.into());
+        let sid = group.pgid;
         let mut process_groups = BTreeMap::new();
         process_groups.insert(group.pgid, group.clone());
         let inner = SessionInner {
@@ -172,10 +174,10 @@ impl ProcessControlBlock {
         let session = self.session().unwrap();
 
         let mut self_group = self.process_group.lock();
-        if ProcessManager::find_session(Sid(self.pid().into())).is_some() {
+        if ProcessManager::find_session(self.pid()).is_some() {
             return Err(SystemError::EPERM);
         }
-        if ProcessManager::find_process_group(Pgid::from(self.pid.into())).is_some() {
+        if ProcessManager::find_process_group(self.pid).is_some() {
             return Err(SystemError::EPERM);
         }
         if let Some(old_pg) = self_group.upgrade() {

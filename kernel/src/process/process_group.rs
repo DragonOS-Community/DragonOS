@@ -1,5 +1,3 @@
-use core::sync::atomic::AtomicUsize;
-
 use super::{session::Session, Pid, ProcessControlBlock, ProcessManager};
 use crate::libs::{mutex::Mutex, spinlock::SpinLock};
 use alloc::{
@@ -9,7 +7,15 @@ use alloc::{
 use hashbrown::HashMap;
 use system_error::SystemError;
 
-int_like!(Pgid, AtomicPgid, usize, AtomicUsize);
+/// 进程组ID
+pub type Pgid = Pid;
+// int_like!(Pgid, AtomicPgid, usize, AtomicUsize);
+
+// impl fmt::Display for Pgid {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         write!(f, "{}", self.0)
+//     }
+// }
 
 /// 系统中所有进程组
 pub static ALL_PROCESS_GROUP: SpinLock<Option<HashMap<Pgid, Arc<ProcessGroup>>>> =
@@ -57,7 +63,7 @@ impl ProcessGroup {
         // log::debug!("New ProcessGroup {:?}", pid);
 
         Arc::new(Self {
-            pgid: Pgid(pid.into()),
+            pgid: pid,
             process_group_inner: Mutex::new(inner),
         })
     }
@@ -224,7 +230,7 @@ impl ProcessControlBlock {
             }
             self.join_specified_group(&pg)?;
         } else {
-            if pgid != Pgid(self.pid().into()) {
+            if pgid != self.pid() {
                 // 进程组不存在，只能加入自己的进程组
                 return Err(SystemError::EPERM);
             }

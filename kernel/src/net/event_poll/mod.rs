@@ -1,5 +1,4 @@
 use core::{
-    any::Any,
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -9,7 +8,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
@@ -110,10 +108,6 @@ impl EPollItem {
     }
 }
 
-pub trait KernelIoctlData: Send + Sync + Any + Debug + CastFromSync {}
-
-impl KernelIoctlData for EPollItem {}
-
 /// ### Epoll文件的私有信息
 #[derive(Debug, Clone)]
 pub struct EPollPrivateData {
@@ -151,11 +145,6 @@ impl IndexNode for EPollInode {
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
-    }
-
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        // 需要实现epoll嵌套epoll时，需要实现这里
-        todo!()
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
@@ -221,9 +210,11 @@ impl EventPoll {
                 .get_file_by_fd(fd);
 
             if let Some(file) = file {
-                if let Some(self_ref) = self.self_ref.as_ref() {
-                    file.remove_epoll(self_ref)?;
-                }
+                // if let Some(self_ref) = self.self_ref.as_ref() {
+
+                // }
+                let epitm = self.ep_items.get(&fd).unwrap();
+                file.remove_epitem(epitm).unwrap();
             }
 
             self.ep_items.remove(&fd);
@@ -352,7 +343,7 @@ impl EventPoll {
                 }
             }
 
-            let ep_item = epoll_guard.ep_items.get(&dstfd);
+            let ep_item = epoll_guard.ep_items.get(&dstfd).cloned();
             match op {
                 EPollCtlOption::Add => {
                     // 如果已经存在，则返回错误
@@ -369,12 +360,16 @@ impl EventPoll {
                     Self::ep_insert(&mut epoll_guard, dst_file, epitem)?;
                 }
                 EPollCtlOption::Del => {
-                    // 不存在则返回错误
-                    if ep_item.is_none() {
-                        return Err(SystemError::ENOENT);
+                    match ep_item {
+                        Some(ref ep_item) => {
+                            // 删除
+                            Self::ep_remove(&mut epoll_guard, dstfd, Some(dst_file), ep_item)?;
+                        }
+                        None => {
+                            // 不存在则返回错误
+                            return Err(SystemError::ENOENT);
+                        }
                     }
-                    // 删除
-                    Self::ep_remove(&mut epoll_guard, dstfd, Some(dst_file))?;
                 }
                 EPollCtlOption::Mod => {
                     // 不存在则返回错误
@@ -700,7 +695,7 @@ impl EventPoll {
             return Err(SystemError::ENOSYS);
         }
 
-        dst_file.add_epoll(epitem.clone())?;
+        dst_file.add_epitem(epitem.clone())?;
         Ok(())
     }
 
@@ -708,9 +703,10 @@ impl EventPoll {
         epoll: &mut SpinLockGuard<EventPoll>,
         fd: i32,
         dst_file: Option<Arc<File>>,
+        epitem: &Arc<EPollItem>,
     ) -> Result<(), SystemError> {
         if let Some(dst_file) = dst_file {
-            dst_file.remove_epoll(epoll.self_ref.as_ref().unwrap())?;
+            dst_file.remove_epitem(epitem)?;
         }
 
         if let Some(epitem) = epoll.ep_items.remove(&fd) {

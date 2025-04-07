@@ -4,6 +4,11 @@
 # Target architecture. Options: x86_64, riscv64
 arch = "riscv64"
 
+# Builer version, affect the behavior of image generation
+# Options: v1, v2
+# Default: v1, to be compatible with the old version
+builder-version = "v2"
+
 # Hypervisor config path
 hypervisor-config = "config/hypervisor.toml"
 

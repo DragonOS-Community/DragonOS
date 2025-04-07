@@ -12,6 +12,6 @@ RUN rustup component add clippy --toolchain nightly-2024-11-05
 RUN rustup component add rustfmt --toolchain nightly-2024-11-05
 RUN cargo +nightly-2024-11-05 install cargo-binutils
 
-RUN cargo install --git https://github.com/Samuka007/DADK.git --branch 007/breaking-output-path
+RUN cargo install --git https://github.com/DragonOS-Community/DADK.git --branch 007/docker-multiarch
 
 ENTRYPOINT ["tini", "--"]

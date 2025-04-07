@@ -18,7 +18,7 @@ use crate::{
         wait_queue::EventWaitQueue,
     },
     mm::VirtAddr,
-    net::event_poll::{EPollEventType, EPollItem},
+    net::event_poll::{EPollEventType, EPollItem, EventPoll},
     process::Pid,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -488,6 +488,24 @@ impl TtyCoreData {
     #[inline]
     pub fn add_epitem(&self, epitem: Arc<EPollItem>) {
         self.epitems.lock().push_back(epitem)
+    }
+
+    pub fn remove_epitem(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
+        let is_remove = !self
+            .epitems
+            .lock_irqsave()
+            .extract_if(|x| x.epoll().ptr_eq(epoll))
+            .collect::<LinkedList<_>>()
+            .is_empty();
+        if is_remove {
+            return Ok(());
+        }
+        Err(SystemError::ENOENT)
+    }
+
+    pub fn clear_epitem(&self) -> Result<(), SystemError> {
+        self.epitems.lock().clear();
+        Ok(())
     }
 
     pub fn eptiems(&self) -> &SpinLock<LinkedList<Arc<EPollItem>>> {

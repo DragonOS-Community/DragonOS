@@ -19,7 +19,7 @@ use crate::{
     arch::rand::rand,
     filesystem::vfs::{
         file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
-        Metadata,
+        Metadata, PollableInode,
     },
     libs::{
         rwlock::{RwLock, RwLockWriteGuard},
@@ -333,6 +333,33 @@ impl Drop for SocketInode {
     }
 }
 
+impl PollableInode for SocketInode {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        let events = self.0.lock_irqsave().poll();
+        return Ok(events.bits() as usize);
+    }
+
+    fn add_epoll(
+        &self,
+        epitem: Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.0.lock_irqsave().add_epoll(epitem)
+    }
+
+    fn remove_epoll(
+        &self,
+        epoll: &Weak<SpinLock<EventPoll>>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.0.lock_irqsave().remove_epoll(epoll)
+    }
+
+    fn clear_epoll(&self, _private_data: &FilePrivateData) -> Result<(), SystemError> {
+        self.0.lock_irqsave().clear_epoll()
+    }
+}
+
 impl IndexNode for SocketInode {
     fn open(
         &self,
@@ -369,11 +396,6 @@ impl IndexNode for SocketInode {
         self.0.lock_no_preempt().write(&buf[0..len], None)
     }
 
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let events = self.0.lock_irqsave().poll();
-        return Ok(events.bits() as usize);
-    }
-
     fn fs(&self) -> Arc<dyn FileSystem> {
         todo!()
     }
@@ -398,6 +420,10 @@ impl IndexNode for SocketInode {
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         return Ok(());
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Ok(self)
     }
 }
 

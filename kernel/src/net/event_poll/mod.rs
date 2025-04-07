@@ -1,5 +1,4 @@
 use core::{
-    any::Any,
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -9,7 +8,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
@@ -110,10 +108,6 @@ impl EPollItem {
     }
 }
 
-pub trait KernelIoctlData: Send + Sync + Any + Debug + CastFromSync {}
-
-impl KernelIoctlData for EPollItem {}
-
 /// ### Epoll文件的私有信息
 #[derive(Debug, Clone)]
 pub struct EPollPrivateData {
@@ -151,11 +145,6 @@ impl IndexNode for EPollInode {
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
-    }
-
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        // 需要实现epoll嵌套epoll时，需要实现这里
-        todo!()
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {

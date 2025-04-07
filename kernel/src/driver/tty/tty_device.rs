@@ -26,15 +26,18 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
-        vfs::{file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata},
+        vfs::{
+            file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
+            PollableInode,
+        },
     },
     init::initcall::INITCALL_DEVICE,
     libs::{
         rwlock::{RwLock, RwLockWriteGuard},
-        spinlock::SpinLockGuard,
+        spinlock::{SpinLock, SpinLockGuard},
     },
     mm::VirtAddr,
-    net::event_poll::{EPollItem, KernelIoctlData},
+    net::event_poll::{EPollItem, EventPoll},
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -129,6 +132,49 @@ impl TtyDevice {
 
     pub fn name_ref(&self) -> &str {
         &self.name
+    }
+
+    fn tty_core(private_data: &FilePrivateData) -> Result<Arc<TtyCore>, SystemError> {
+        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = private_data {
+            (tty_priv.tty.clone(), tty_priv.mode)
+        } else {
+            return Err(SystemError::EIO);
+        };
+        Ok(tty)
+    }
+}
+
+impl PollableInode for TtyDevice {
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        let tty = TtyDevice::tty_core(private_data)?;
+        tty.ldisc().poll(tty)
+    }
+
+    fn add_epoll(
+        &self,
+        epitem: Arc<EPollItem>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let tty = TtyDevice::tty_core(private_data)?;
+        let core = tty.core();
+        core.add_epitem(epitem);
+        Ok(())
+    }
+
+    fn remove_epoll(
+        &self,
+        epoll: &Weak<SpinLock<EventPoll>>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let tty = TtyDevice::tty_core(private_data)?;
+        let core = tty.core();
+        core.remove_epitem(epoll)
+    }
+
+    fn clear_epoll(&self, private_data: &FilePrivateData) -> Result<(), SystemError> {
+        let tty = TtyDevice::tty_core(private_data)?;
+        let core = tty.core();
+        core.clear_epitem()
     }
 }
 
@@ -312,35 +358,6 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
-    fn kernel_ioctl(
-        &self,
-        arg: Arc<dyn KernelIoctlData>,
-        data: &FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        let epitem = arg
-            .arc_any()
-            .downcast::<EPollItem>()
-            .map_err(|_| SystemError::EFAULT)?;
-
-        let _ = UserBufferReader::new(
-            &epitem as *const Arc<EPollItem>,
-            core::mem::size_of::<Arc<EPollItem>>(),
-            false,
-        )?;
-
-        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
-            (tty_priv.tty(), tty_priv.mode)
-        } else {
-            return Err(SystemError::EIO);
-        };
-
-        let core = tty.core();
-
-        core.add_epitem(epitem.clone());
-
-        return Ok(0);
-    }
-
     fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
             (tty_priv.tty(), tty_priv.mode)
@@ -423,14 +440,8 @@ impl IndexNode for TtyDevice {
         Ok(0)
     }
 
-    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = private_data {
-            (tty_priv.tty.clone(), tty_priv.mode)
-        } else {
-            return Err(SystemError::EIO);
-        };
-
-        tty.ldisc().poll(tty)
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Ok(self)
     }
 }
 

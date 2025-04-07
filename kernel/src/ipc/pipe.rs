@@ -185,7 +185,7 @@ impl PollableInode for LockedPipeInode {
         epoll: &Weak<SpinLock<EventPoll>>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let is_remove = self
+        let is_remove = !self
             .epitems
             .lock_irqsave()
             .extract_if(|x| x.epoll().ptr_eq(epoll))

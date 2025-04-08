@@ -75,7 +75,7 @@ impl Serial8250Manager {
     /// 初始化串口设备（在内存管理初始化之前）
     pub fn early_init(&self) -> Result<(), SystemError> {
         // todo: riscv64: 串口设备初始化
-        #[cfg(not(target_arch = "riscv64"))]
+        #[cfg(target_arch = "x86_64")]
         serial8250_pio_port_early_init()?;
         return Ok(());
     }
@@ -127,7 +127,7 @@ impl Serial8250Manager {
         return Ok(());
     }
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     fn serial_tty_init(&self) -> Result<(), SystemError> {
         Ok(())
     }

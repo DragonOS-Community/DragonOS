@@ -927,6 +927,11 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
                 let ppn = ((self.data & (!((1 << 10) - 1))) >> 10) & ((1 << 54) - 1);
                 super::allocator::page_frame::PhysPageFrame::from_ppn(ppn).phys_address()
             }
+
+            #[cfg(target_arch = "loongarch64")]
+            {
+                todo!("la64: PageEntry::address")
+            }
         };
 
         if self.present() {
@@ -1055,6 +1060,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
                     // riscv64指向下一级页表的页表项，不应设置R/W/X权限位
                     Self::from_data(Arch::ENTRY_FLAG_DEFAULT_TABLE)
                 }
+
+                #[cfg(target_arch = "loongarch64")]
+                {
+                    Self::from_data(Arch::ENTRY_FLAG_DEFAULT_TABLE)
+                }
             };
 
             #[cfg(target_arch = "x86_64")]
@@ -1069,6 +1079,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
             #[cfg(target_arch = "riscv64")]
             {
                 r
+            }
+
+            #[cfg(target_arch = "loongarch64")]
+            {
+                todo!("loongarch64: new_page_table")
             }
         };
     }
@@ -1146,6 +1161,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
                     .update_flags(Arch::ENTRY_FLAG_READONLY, true)
                     .update_flags(Arch::ENTRY_FLAG_WRITEABLE, false);
             }
+        }
+
+        #[cfg(target_arch = "loongarch64")]
+        {
+            todo!("la64: set_write")
         }
     }
 
@@ -1279,6 +1299,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
                 .set_write(true)
                 .set_execute(true)
                 .set_page_global(true)
+        }
+
+        #[cfg(target_arch = "loongarch64")]
+        {
+            todo!("la64: mmio_flags()")
         }
     }
 }

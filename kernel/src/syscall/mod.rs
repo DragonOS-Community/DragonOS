@@ -5,7 +5,6 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    debug::panic::kernel_catch_unwind,
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
@@ -78,11 +77,13 @@ impl Syscall {
     /// 系统调用分发器，用于分发系统调用。
     ///
     /// 与[handle]不同，这个函数会捕获系统调用处理函数的panic，返回错误码。
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     pub fn catch_handle(
         syscall_num: usize,
         args: &[usize],
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
+        use crate::debug::panic::kernel_catch_unwind;
         let res = kernel_catch_unwind(|| Self::handle(syscall_num, args, frame))?;
         res
     }
@@ -669,6 +670,8 @@ impl Syscall {
             SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pid| pid.into()),
 
             SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
+
+            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_FSTAT => {
                 let fd = args[0] as i32;
                 let kstat: *mut PosixKstat = args[1] as *mut PosixKstat;
@@ -1130,6 +1133,7 @@ impl Syscall {
                 return Ok(0);
             }
 
+            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_NEWFSTATAT => {
                 // todo: 这个系统调用还没有实现
 
@@ -1228,6 +1232,7 @@ impl Syscall {
                 let flags = args[4] as u32;
                 Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
+            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_SETRLIMIT => Ok(0),
             SYS_RESTART_SYSCALL => Self::restart_syscall(),
             SYS_RT_SIGPENDING => Self::rt_sigpending(args[0], args[1]),

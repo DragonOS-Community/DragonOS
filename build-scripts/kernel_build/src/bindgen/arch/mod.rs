@@ -2,6 +2,7 @@ use crate::utils::cargo_handler::{CargoHandler, TargetArch};
 
 use self::x86_64::X86_64BindgenArch;
 
+pub mod loongarch64;
 pub mod riscv64;
 pub mod x86_64;
 
@@ -15,6 +16,7 @@ pub(super) fn current_bindgenarch() -> &'static dyn BindgenArch {
     match arch {
         TargetArch::X86_64 => &X86_64BindgenArch,
         TargetArch::Riscv64 => &riscv64::RiscV64BindgenArch,
+        TargetArch::LoongArch64 => &loongarch64::LoongArch64BindgenArch,
         _ => panic!("Unsupported arch: {:?}", arch),
     }
 }

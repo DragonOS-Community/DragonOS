@@ -7,6 +7,10 @@ ifeq ($(ARCH), x86_64)
 	export TARGET_JSON=arch/x86_64/x86_64-unknown-none.json
 else ifeq ($(ARCH), riscv64)
 	export TARGET_JSON=arch/riscv64/riscv64gc-unknown-none-elf.json
+else ifeq ($(ARCH), loongarch64)
+	export TARGET_JSON=loongarch64-unknown-none
+else
+	$(error "Unsupported ARCH: $(ARCH)")
 endif
 
 export CARGO_ZBUILD=-Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem

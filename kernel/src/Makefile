@@ -42,7 +42,7 @@ kernel_rust:
 
 
 all: kernel
-
+	rm -f ./debug/kallsyms.o || true
 # if x86_64
 ifeq ($(ARCH), x86_64)
 	$(MAKE) __link_x86_64_kernel

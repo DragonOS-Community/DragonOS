@@ -74,15 +74,10 @@ kprobe = { path = "crates/kprobe" }
 lru = "0.12.3"
 
 rbpf = { path = "crates/rbpf" }
-printf-compat = { version = "0.1.1", default-features = false }
+printf-compat = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat", rev = "5f5c9cc363", default-features = false }
 
 static-keys = "=0.6.1"
-unwinding = { version = "=0.2.3", default-features = false, features = [
-    "unwinder",
-    "fde-gnu-eh-frame-hdr",
-    "panic",
-    "personality",
-] }
+
 defer = "0.2.1"
 cfg-if = { version = "1.0.0" }
 
@@ -100,6 +95,14 @@ riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.gi
 ] }
 sbi-rt = { version = "=0.0.3", features = ["legacy"] }
 
+# 由于unwinding库不支持loongarch64架构，因此需要排除该依赖项
+[target.'cfg(not(target_arch = "loongarch64"))'.dependencies]
+unwinding = { version = "=0.2.3", default-features = false, features = [
+    "unwinder",
+    "fde-gnu-eh-frame-hdr",
+    "panic",
+    "personality",
+] }
 
 # 构建时依赖项
 [build-dependencies]

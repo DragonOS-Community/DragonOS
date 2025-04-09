@@ -53,11 +53,11 @@ impl BoundInner {
                 })
                 .expect("No default interface");
 
-            let handle = iface.sockets().lock_irqsave().add(socket);
+            let handle = iface.sockets().lock().add(socket);
             return Ok(Self { handle, iface });
         } else {
             let iface = get_iface_to_bind(address).ok_or(SystemError::ENODEV)?;
-            let handle = iface.sockets().lock_irqsave().add(socket);
+            let handle = iface.sockets().lock().add(socket);
             return Ok(Self { handle, iface });
         }
     }
@@ -72,7 +72,7 @@ impl BoundInner {
     {
         let (iface, address) = get_ephemeral_iface(&remote);
         // let bound_port = iface.port_manager().bind_ephemeral_port(socket_type)?;
-        let handle = iface.sockets().lock_no_preempt().add(socket);
+        let handle = iface.sockets().lock().add(socket);
         // let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);
         Ok((Self { handle, iface }, address))
     }

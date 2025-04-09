@@ -1,11 +1,8 @@
-use alloc::{collections::BTreeMap, sync::Arc};
-use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
 use crate::{
-    driver::net::{Iface, Operstate},
-    libs::rwlock::RwLockReadGuard,
+    driver::net::Operstate,
     net::NET_DEVICES,
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -86,7 +83,7 @@ fn dhcp_query() -> Result<(), SystemError> {
                     if let Some(cidr) = cidr {
                         // 这里先在这里将网卡设置为up，后面等netlink实现了再修改
                         net_face.set_operstate(Operstate::IF_OPER_UP);
-                        info!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr);
+                        log::info!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr);
                         return Ok(());
                     }
                 } else {
@@ -99,7 +96,7 @@ fn dhcp_query() -> Result<(), SystemError> {
             }
 
             Some(dhcpv4::Event::Deconfigured) => {
-                debug!("Dhcp v4 deconfigured");
+                log::debug!("Dhcp v4 deconfigured");
                 net_face
                     .update_ip_addrs(&[smoltcp::wire::IpCidr::Ipv4(wire::Ipv4Cidr::new(
                         wire::Ipv4Address::UNSPECIFIED,
@@ -124,16 +121,4 @@ fn dhcp_query() -> Result<(), SystemError> {
     }
 
     return Err(SystemError::ETIMEDOUT);
-}
-
-pub fn poll_ifaces() {
-    // log::debug!("poll_ifaces");
-    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> = NET_DEVICES.read_irqsave();
-    if guard.len() == 0 {
-        warn!("poll_ifaces: No net driver found!");
-        return;
-    }
-    for (_, iface) in guard.iter() {
-        iface.poll();
-    }
 }

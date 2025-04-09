@@ -211,7 +211,7 @@ impl Connecting {
     }
 
     pub fn into_result(self) -> (Inner, Result<(), SystemError>) {
-        let result = *self.result.read_irqsave();
+        let result = *self.result.read();
         match result {
             ConnectResult::Connecting => (
                 Inner::Connecting(self),
@@ -245,7 +245,7 @@ impl Connecting {
 
         self.inner
             .with_mut(|socket: &mut smoltcp::socket::tcp::Socket| {
-                let mut result = self.result.write_irqsave();
+                let mut result = self.result.write();
                 if matches!(*result, ConnectResult::Refused | ConnectResult::Connected) {
                     return false; // Already connected or refused
                 }

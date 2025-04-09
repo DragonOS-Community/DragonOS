@@ -8,7 +8,7 @@ ifeq ($(ARCH), x86_64)
 else ifeq ($(ARCH), riscv64)
 	export TARGET_JSON=arch/riscv64/riscv64gc-unknown-none-elf.json
 else ifeq ($(ARCH), loongarch64)
-	export TARGET_JSON=loongarch64-unknown-none
+	export TARGET_JSON=arch/loongarch64/loongarch64-unknown-none.json
 else
 	$(error "Unsupported ARCH: $(ARCH)")
 endif

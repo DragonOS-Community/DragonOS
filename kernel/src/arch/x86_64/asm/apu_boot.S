@@ -1,5 +1,4 @@
 #include "../common/asm.h"
-#include <asm/apu_boot.h>
 
 
 .align 0x1000  // 按照4k对齐

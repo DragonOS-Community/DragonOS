@@ -145,14 +145,13 @@
     "rust-analyzer.linkedProjects": [
         "./kernel/Cargo.toml",
         //"./tools/Cargo.toml",
-    
+        // "./kernel/src/debug/gen_kallsyms.rs",
     ],
     // "rust-analyzer.cargo.target": "riscv64gc-unknown-none-elf",
     "rust-analyzer.cargo.target": "x86_64-unknown-none",
     "rust-analyzer.check.overrideCommand": [
         "make",
         "check",
-        
     ],
     "makefile.configureOnOpen": false,
 }

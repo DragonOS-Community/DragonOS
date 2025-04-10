@@ -53,8 +53,6 @@ impl CFilesBuilder {
 
         common::setup_common_include_dir(&mut include_dirs);
 
-        current_cfiles_arch().setup_global_include_dir(&mut include_dirs);
-
         let include_dirs: Vec<PathBuf> = include_dirs.into_iter().collect();
         Self::set_rerun_if_files_changed(&include_dirs);
 
@@ -67,7 +65,6 @@ impl CFilesBuilder {
     fn setup_files(c: &mut Build) {
         let mut files: HashSet<PathBuf> = HashSet::new();
         current_cfiles_arch().setup_files(c, &mut files);
-        common::setup_common_files(&mut files);
         // 去重
         let files: Vec<PathBuf> = files.into_iter().collect();
         Self::set_rerun_if_files_changed(&files);

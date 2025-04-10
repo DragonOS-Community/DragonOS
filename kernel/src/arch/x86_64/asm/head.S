@@ -3,7 +3,6 @@
 // 2022/01/20
 
 #include "common/asm.h"
-#include <asm/apu_boot.h>
 
 // 以下是来自 multiboot2 规范的定义
 //  How many bytes from the start of the file we search for the header.

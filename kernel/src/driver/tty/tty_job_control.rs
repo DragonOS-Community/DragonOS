@@ -24,7 +24,7 @@ impl TtyJobCtrlManager {
         let mut ctrl = core.contorl_info_irqsave();
         ctrl.set_info_by_pcb(pcb.clone());
         drop(ctrl);
-        
+
         let mut singal = pcb.sig_info_mut();
         singal.set_tty(Some(tty.clone()));
     }
@@ -151,7 +151,7 @@ impl TtyJobCtrlManager {
         if guard.session.is_none() {
             return Err(SystemError::ENOTTY);
         }
-        let sid = guard.session.unwrap_or(Sid::new(0));
+        let sid = guard.session.unwrap();
         drop(guard);
 
         let mut user_writer = UserBufferWriter::new(

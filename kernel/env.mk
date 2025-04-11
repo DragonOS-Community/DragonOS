@@ -6,7 +6,7 @@ CCPREFIX=x86_64-linux-gnu-
 else ifeq ($(ARCH), riscv64)
 CCPREFIX=riscv64-linux-gnu-
 else ifeq ($(ARCH), loongarch64)
-CCPREFIX=loongarch64-linux-gnu-
+CCPREFIX=loongarch64-unknown-linux-gnu-
 else
 $(error "Unsupported ARCH: $(ARCH)")
 endif

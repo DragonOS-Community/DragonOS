@@ -1,4 +1,5 @@
 use system_error::SystemError;
+pub mod boot;
 
 #[derive(Debug)]
 pub struct ArchBootParams {}

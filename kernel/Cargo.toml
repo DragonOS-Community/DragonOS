@@ -81,6 +81,7 @@ static-keys = "=0.6.1"
 defer = "0.2.1"
 cfg-if = { version = "1.0.0" }
 
+
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 multiboot2 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/multiboot2", rev = "05739aab40" }
@@ -94,6 +95,11 @@ riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.gi
     "s-mode",
 ] }
 sbi-rt = { version = "=0.0.3", features = ["legacy"] }
+
+# target为loongarch64时，使用下面的依赖
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+# loongArch64 = "0.2.4"
+loongArch64 = { path = "/home/longjin/code/loongArch64" }
 
 # 由于unwinding库不支持loongarch64架构，因此需要排除该依赖项
 [target.'cfg(not(target_arch = "loongarch64"))'.dependencies]

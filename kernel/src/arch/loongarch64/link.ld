@@ -14,7 +14,7 @@ SECTIONS
 	. = KERNEL_VMA;
 	. = ALIGN(4096);
 	boot_text_start_pa = .;
-	.boot.text : AT(boot_text_start_pa - KERNEL_VMA)
+	.boot.text :
 	{
 		KEEP(*(.bootstrap))
 		*(.bootstrap)
@@ -28,7 +28,7 @@ SECTIONS
 	. = ALIGN(4096);
 	text_start_pa = .;
 	__executable_start = .;
-	.text (text_start_pa): AT(text_start_pa - KERNEL_VMA)
+	.text (text_start_pa): 
 	{
 		_text = .;
 
@@ -43,7 +43,7 @@ SECTIONS
 	}
 	. = ALIGN(32768);
 	data_start_pa = .;
-	.data (data_start_pa): AT(data_start_pa - KERNEL_VMA)
+	.data (data_start_pa):
 	{
 		_data = .;
 		*(.data)
@@ -56,7 +56,7 @@ SECTIONS
 	. = ALIGN(32768);
 
 	rodata_start_pa = .;
-	.rodata (rodata_start_pa): AT(rodata_start_pa - KERNEL_VMA)
+	.rodata (rodata_start_pa):
 	{
 		_rodata = .;	
 		*(.rodata)
@@ -68,12 +68,12 @@ SECTIONS
 	. = ALIGN(32768);
 
 	init_proc_union_start_pa = .;
-	.data.init_proc_union (init_proc_union_start_pa): AT(init_proc_union_start_pa - KERNEL_VMA)
+	.data.init_proc_union (init_proc_union_start_pa):
 	 { *(.data.init_proc_union) }
 
 	. = ALIGN(32768);
 	 bss_start_pa = .;
-	.bss (bss_start_pa): AT(bss_start_pa - KERNEL_VMA)
+	.bss (bss_start_pa):
 	{
 		_bss = .;
 		*(.bss)
@@ -84,7 +84,7 @@ SECTIONS
 	}
 
 	eh_frame = .;
-	.eh_frame (eh_frame): AT(eh_frame - KERNEL_VMA)
+	.eh_frame (eh_frame):
 	{
 		__eh_frame_hdr_start = .;
 		*(.eh_frame_hdr)

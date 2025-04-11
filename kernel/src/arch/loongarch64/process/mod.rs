@@ -14,6 +14,19 @@ pub mod idle;
 pub mod kthread;
 pub mod syscall;
 
+#[repr(align(32768))]
+pub union InitProcUnion {
+    /// 用于存放idle进程的内核栈
+    idle_stack: [u8; 32768],
+}
+
+
+#[link_section = ".data.init_proc_union"]
+#[no_mangle]
+pub(super) static BSP_IDLE_STACK_SPACE: InitProcUnion = InitProcUnion {
+    idle_stack: [0; 32768],
+};
+
 pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 以下代码不能发生中断
     CurrentIrqArch::interrupt_disable();

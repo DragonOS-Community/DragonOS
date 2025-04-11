@@ -17,7 +17,7 @@ impl CFilesArch for LoongArch64CFilesArch {
     }
 
     fn setup_files(&self, _c: &mut cc::Build, files: &mut HashSet<PathBuf>) {
-        files.insert(PathBuf::from("src/arch/loongarch64/asm/head.S"));
+        // files.insert(PathBuf::from("src/arch/loongarch64/asm/head.S"));
 
         FileUtils::list_all_files(&arch_path("asm"), Some("c"), true)
             .into_iter()
@@ -28,7 +28,7 @@ impl CFilesArch for LoongArch64CFilesArch {
 
     fn setup_global_flags(&self, c: &mut cc::Build) {
         // 在这里设置编译器，不然的话vscode的rust-analyzer会报错
-        c.compiler("loongarch64-linux-gnu-gcc");
+        c.compiler("loongarch64-unknown-linux-gnu-gcc");
         c.flag("-mcmodel=large");
 
         c.flag("-march=loongarch64");

@@ -1206,6 +1206,17 @@ impl ProcessControlBlock {
         *self.restart_block.lock() = restart_block;
         return Err(SystemError::ERESTART_RESTARTBLOCK);
     }
+
+    pub fn parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.parent_pcb.read().upgrade()
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.sched_info
+            .inner_lock_read_irqsave()
+            .state()
+            .is_exited()
+    }
 }
 
 impl Drop for ProcessControlBlock {

@@ -311,6 +311,19 @@ impl Syscall {
     pub fn setsid() -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let session = pcb.go_to_new_session()?;
+        let mut guard = pcb.sig_info_mut();
+        let tty = guard.tty();
+        guard.set_tty(None);
+        if let Some(tty) = tty {
+            {
+                let mut core = tty.core().contorl_info_irqsave();
+                if core.session == Some(Pid(1)) && core.pgid == Some(Pid(1)) {
+                    core.session = None;
+                    core.pgid = None;
+                }
+                drop(core);
+            }
+        }
         Ok(session.sid().into())
     }
 

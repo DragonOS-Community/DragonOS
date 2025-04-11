@@ -1,10 +1,26 @@
-use crate::debug::traceback::lookup_kallsyms;
 use crate::libs::spinlock::SpinLock;
-use core::ffi::c_void;
-use unwinding::abi::{UnwindContext, UnwindReasonCode, _Unwind_Backtrace, _Unwind_GetIP};
 
+use cfg_if::cfg_if;
+
+cfg_if! {
+    if #[cfg(not(target_arch = "loongarch64"))]
+    {
+        use unwinding::abi::{UnwindContext, UnwindReasonCode, _Unwind_Backtrace, _Unwind_GetIP};
+        use core::ffi::c_void;
+        use crate::debug::traceback::lookup_kallsyms;
+    }
+}
+
+static GLOBAL_LOCK: SpinLock<()> = SpinLock::new(());
+
+#[cfg(target_arch = "loongarch64")]
 pub fn print_stack_trace() {
-    static GLOBAL_LOCK: SpinLock<()> = SpinLock::new(());
+    let _lock = GLOBAL_LOCK.lock();
+    println!("This Arch does not support stack trace printing.");
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+pub fn print_stack_trace() {
     let _lock = GLOBAL_LOCK.lock();
     println!("Rust Panic Backtrace:");
     struct CallbackData {

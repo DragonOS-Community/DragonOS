@@ -95,9 +95,7 @@ impl From<i32> for Signal {
 
 impl Into<SigSet> for Signal {
     fn into(self) -> SigSet {
-        SigSet {
-            bits: (1 << (self as usize - 1) as u64),
-        }
+        self.into_sigset()
     }
 }
 impl Signal {

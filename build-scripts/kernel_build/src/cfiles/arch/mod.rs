@@ -6,6 +6,7 @@ use crate::utils::cargo_handler::{CargoHandler, TargetArch};
 
 use self::x86_64::X86_64CFilesArch;
 
+pub mod loongarch64;
 pub mod riscv64;
 pub mod x86_64;
 
@@ -27,6 +28,8 @@ pub(super) fn current_cfiles_arch() -> &'static dyn CFilesArch {
     match arch {
         TargetArch::X86_64 => &X86_64CFilesArch,
         TargetArch::Riscv64 => &riscv64::RiscV64CFilesArch,
+        TargetArch::LoongArch64 => &loongarch64::LoongArch64CFilesArch,
+
         _ => panic!("Unsupported arch: {:?}", arch),
     }
 }

@@ -1,0 +1,21 @@
+{
+    "arch": "loongarch64",
+    "code-model": "medium",
+    "crt-objects-fallback": "false",
+    "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+    "features": "+f,+d",
+    "linker": "rust-lld",
+    "linker-flavor": "gnu-lld",
+    "llvm-abiname": "lp64d",
+    "llvm-target": "loongarch64-unknown-none",
+    "max-atomic-width": 64,
+    "metadata": {
+        "description": "Freestanding/bare-metal LoongArch64",
+        "host_tools": false,
+        "std": false,
+        "tier": 2
+    },
+    "panic-strategy": "abort",
+    "relocation-model": "static",
+    "target-pointer-width": "64"
+}

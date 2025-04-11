@@ -202,7 +202,6 @@ impl<T> RwLock<T> {
         return (self.lock.load(Ordering::Relaxed) & WRITER) / WRITER;
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     #[allow(dead_code)]
     #[inline]
     /// @brief 尝试获得WRITER守卫
@@ -216,7 +215,6 @@ impl<T> RwLock<T> {
         return r;
     } //当架构为arm时,有些代码需要作出调整compare_exchange=>compare_exchange_weak
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     #[allow(dead_code)]
     #[inline]
     pub fn try_write_irqsave(&self) -> Option<RwLockWriteGuard<T>> {
@@ -233,7 +231,6 @@ impl<T> RwLock<T> {
         return r;
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     #[allow(dead_code)]
     fn inner_try_write(&self) -> Option<RwLockWriteGuard<T>> {
         let res: bool = self

@@ -64,6 +64,9 @@ impl PosixOldUtsName {
         #[cfg(target_arch = "riscv64")]
         const MACHINE: &[u8] = b"riscv64";
 
+        #[cfg(target_arch = "loongarch64")]
+        const MACHINE: &[u8] = b"longarch64";
+
         let mut r = Self {
             sysname: [0; 65],
             nodename: [0; 65],

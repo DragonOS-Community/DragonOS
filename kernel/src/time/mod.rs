@@ -86,7 +86,7 @@ impl PosixTimeSpec {
             }
         }
 
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
         {
             return PosixTimeSpec::new(0, 0);
         }

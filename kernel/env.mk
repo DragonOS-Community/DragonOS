@@ -5,6 +5,10 @@ ifeq ($(ARCH), x86_64)
 CCPREFIX=x86_64-linux-gnu-
 else ifeq ($(ARCH), riscv64)
 CCPREFIX=riscv64-linux-gnu-
+else ifeq ($(ARCH), loongarch64)
+CCPREFIX=loongarch64-unknown-linux-gnu-
+else
+$(error "Unsupported ARCH: $(ARCH)")
 endif
 
 export CC=$(CCPREFIX)gcc
@@ -24,6 +28,8 @@ ifeq ($(ARCH), x86_64)
 GLOBAL_CFLAGS += -mcmodel=large -m64
 else ifeq ($(ARCH), riscv64)
 GLOBAL_CFLAGS += -mcmodel=medany -march=rv64gc -mabi=lp64d
+else ifeq ($(ARCH), loongarch64)
+GLOBAL_CFLAGS += -mcmodel=large -march=loongarch64
 endif
 
 ifeq ($(DEBUG), DEBUG)

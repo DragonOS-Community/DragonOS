@@ -106,6 +106,19 @@ impl ElfLoader {
         return self.inner_probe_common(param, ehdr);
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    pub fn probe_loongarch(
+        &self,
+        param: &ExecParam,
+        ehdr: &FileHeader<AnyEndian>,
+    ) -> Result<(), ExecError> {
+        // 判断架构是否匹配
+        if ElfMachine::from(ehdr.e_machine) != ElfMachine::LoongArch {
+            return Err(ExecError::WrongArchitecture);
+        }
+        return self.inner_probe_common(param, ehdr);
+    }
+
     /// 设置用户堆空间，映射[start, end)区间的虚拟地址，并把brk指针指向end
     ///
     /// ## 参数
@@ -512,7 +525,14 @@ impl BinaryLoader for ElfLoader {
         #[cfg(target_arch = "riscv64")]
         return self.probe_riscv(param, &ehdr);
 
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        #[cfg(target_arch = "loongarch64")]
+        return self.probe_loongarch(param, &ehdr);
+
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64"
+        )))]
         compile_error!("BinaryLoader: Unsupported architecture");
     }
 

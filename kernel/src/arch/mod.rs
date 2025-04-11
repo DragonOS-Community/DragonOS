@@ -13,6 +13,11 @@ pub mod riscv64;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::*; // 公开riscv64架构下的函数，使外界接口统一
 
+#[cfg(target_arch = "loongarch64")]
+pub mod loongarch64;
+#[cfg(target_arch = "loongarch64")]
+pub use self::loongarch64::*; // 公开loongarch64架构下的函数，使外界接口统一
+
 pub mod io;
 
 /// TraitPciArch Pci架构相关函数，任何架构都应独立实现trait里的函数

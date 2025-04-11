@@ -251,7 +251,10 @@ rustInstall() {
 		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION_OLD-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION_OLD-riscv64gc-unknown-linux-gnu
-        
+
+		rustup target add loongarch64-unknown-none --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add loongarch64-unknown-none --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
+
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src
         rustup component add llvm-tools-preview

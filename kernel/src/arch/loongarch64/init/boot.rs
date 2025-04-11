@@ -7,9 +7,8 @@ static mut BOOT_FDT_PADDR: PhysAddr = PhysAddr::new(0);
 
 #[no_mangle]
 pub unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
-    
     clear_bss();
-    loop {}
+
     let fdt_paddr = PhysAddr::new(fdt_paddr);
 
     unsafe {
@@ -22,7 +21,7 @@ pub unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
 
 /// 设置中断、异常处理函数
 fn setup_trap_vector() {
-    todo!();
+    // todo!();
     // let ptr = handle_exception as *const () as usize;
     // ecfg::set_vs(0);
     // eentry::set_eentry(handle_exception as usize);

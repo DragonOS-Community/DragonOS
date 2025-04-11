@@ -23,7 +23,6 @@
 #![feature(vec_into_raw_parts)]
 #![feature(linkage)]
 #![feature(panic_can_unwind)]
-
 #![allow(static_mut_refs, non_local_definitions, internal_features)]
 // clippy的配置
 #![deny(clippy::all)]

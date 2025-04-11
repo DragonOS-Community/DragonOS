@@ -5,10 +5,7 @@ use core::any::Any;
 use kprobe::ProbeArgs;
 use loongArch64::register::CpuMode;
 
-use crate::{
-    exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
-    libs::align::align_up,
-};
+use crate::exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber};
 
 pub struct LoongArch64InterruptArch;
 
@@ -18,23 +15,25 @@ impl InterruptArch for LoongArch64InterruptArch {
     }
 
     unsafe fn interrupt_enable() {
-        todo!("interrupt_enable() not implemented for LoongArch64InterruptArch")
+        loongArch64::register::crmd::set_ie(true);
     }
 
     unsafe fn interrupt_disable() {
-        todo!("interrupt_disable() not implemented for LoongArch64InterruptArch")
+        loongArch64::register::crmd::set_ie(false);
     }
 
     fn is_irq_enabled() -> bool {
-        todo!("is_irq_enabled() not implemented for LoongArch64InterruptArch")
+        loongArch64::register::crmd::read().ie()
     }
 
     unsafe fn save_and_disable_irq() -> IrqFlagsGuard {
-        todo!("save_and_disable_irq() not implemented for LoongArch64InterruptArch")
+        let ie = loongArch64::register::crmd::read().ie();
+        loongArch64::register::crmd::set_ie(false);
+        IrqFlagsGuard::new(IrqFlags::new(if ie { 1 } else { 0 }))
     }
 
     unsafe fn restore_irq(flags: IrqFlags) {
-        todo!("restore_irq() not implemented for LoongArch64InterruptArch")
+        loongArch64::register::crmd::set_ie(flags.flags() == 1);
     }
 
     fn probe_total_irq_num() -> u32 {

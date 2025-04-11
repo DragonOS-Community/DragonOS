@@ -20,7 +20,6 @@ pub union InitProcUnion {
     idle_stack: [u8; 32768],
 }
 
-
 #[link_section = ".data.init_proc_union"]
 #[no_mangle]
 pub(super) static BSP_IDLE_STACK_SPACE: InitProcUnion = InitProcUnion {

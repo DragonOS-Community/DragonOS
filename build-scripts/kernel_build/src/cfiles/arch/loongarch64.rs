@@ -29,7 +29,7 @@ impl CFilesArch for LoongArch64CFilesArch {
     fn setup_global_flags(&self, c: &mut cc::Build) {
         // 在这里设置编译器，不然的话vscode的rust-analyzer会报错
         c.compiler("loongarch64-unknown-linux-gnu-gcc");
-        c.flag("-mcmodel=large");
+        c.flag("-mcmodel=normal");
 
         c.flag("-march=loongarch64");
     }

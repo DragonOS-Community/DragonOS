@@ -2,7 +2,6 @@
 /// The earliest entry point for the primary CPU.
 ///
 /// 这些代码拷贝、修改自 polyhal (https://github.com/Byte-OS/polyhal.git)
-
 use crate::arch::{cpu::current_cpu_id, init::boot::kernel_main};
 
 const QEMU_DTB_PADDR: usize = 0x100000;

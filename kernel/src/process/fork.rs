@@ -310,13 +310,18 @@ impl ProcessManager {
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // // 将信号的处理函数设置为default(除了那些被手动屏蔽的)
-        if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
-            flush_signal_handlers(new_pcb.clone(), false);
+        // todo SignalStruct结构需要更改，属于线程组逻辑
+        if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
+            // log::debug!("copy_sighand: CLONE_SIGHAND");
+            current_pcb.sig_struct_irqsave().cnt.fetch_add(1, Ordering::SeqCst);
+            return Ok(())
         }
 
-        if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
-            new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers;
+        // log::debug!("Just copy sighand");
+        new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers;
+
+        if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
+            flush_signal_handlers(new_pcb.clone(), false);
         }
         return Ok(());
     }

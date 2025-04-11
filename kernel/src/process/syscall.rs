@@ -317,6 +317,7 @@ impl Syscall {
         if let Some(tty) = tty {
             {
                 let mut core = tty.core().contorl_info_irqsave();
+                // 如果当前进程是会话首进程，则清空tty的会话id和pgid，防止tty被1号进程占用
                 if core.session == Some(Pid(1)) && core.pgid == Some(Pid(1)) {
                     core.session = None;
                     core.pgid = None;

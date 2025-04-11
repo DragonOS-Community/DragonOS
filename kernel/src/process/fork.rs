@@ -313,8 +313,11 @@ impl ProcessManager {
         // todo SignalStruct结构需要更改，属于线程组逻辑
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
             // log::debug!("copy_sighand: CLONE_SIGHAND");
-            current_pcb.sig_struct_irqsave().cnt.fetch_add(1, Ordering::SeqCst);
-            return Ok(())
+            current_pcb
+                .sig_struct_irqsave()
+                .cnt
+                .fetch_add(1, Ordering::SeqCst);
+            return Ok(());
         }
 
         // log::debug!("Just copy sighand");

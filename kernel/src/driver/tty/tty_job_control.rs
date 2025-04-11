@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
-    process::{process_group::Pgid, session::Sid, Pid, ProcessFlags, ProcessManager},
+    process::{process_group::Pgid, Pid, ProcessFlags, ProcessManager},
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall,

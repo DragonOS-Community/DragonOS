@@ -1,5 +1,8 @@
-use super::{session::Session, Pid, ProcessControlBlock, ProcessManager};
-use crate::libs::{mutex::Mutex, spinlock::SpinLock};
+use super::{
+    session::{Session, Sid},
+    Pid, ProcessControlBlock, ProcessManager,
+};
+use crate::libs::spinlock::SpinLock;
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -25,7 +28,7 @@ pub static ALL_PROCESS_GROUP: SpinLock<Option<HashMap<Pgid, Arc<ProcessGroup>>>>
 pub struct ProcessGroup {
     /// 进程组pgid
     pub pgid: Pgid,
-    pub process_group_inner: Mutex<PGInner>,
+    pub process_group_inner: SpinLock<PGInner>,
 }
 
 #[derive(Debug)]
@@ -64,7 +67,7 @@ impl ProcessGroup {
 
         Arc::new(Self {
             pgid: pid,
-            process_group_inner: Mutex::new(inner),
+            process_group_inner: SpinLock::new(inner),
         })
     }
 
@@ -92,6 +95,13 @@ impl ProcessGroup {
 
     pub fn broadcast(&self) {
         unimplemented!("broadcast not supported yet");
+    }
+
+    pub fn sid(&self) -> Sid {
+        if let Some(session) = self.session() {
+            return session.sid();
+        }
+        Sid::from(0)
     }
 }
 

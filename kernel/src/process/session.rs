@@ -2,7 +2,7 @@ use super::{
     process_group::{Pgid, ProcessGroup},
     Pid, ProcessControlBlock, ProcessManager,
 };
-use crate::libs::{mutex::Mutex, spinlock::SpinLock};
+use crate::libs::spinlock::SpinLock;
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -21,7 +21,7 @@ pub static ALL_SESSION: SpinLock<Option<HashMap<Sid, Arc<Session>>>> = SpinLock:
 #[derive(Debug)]
 pub struct Session {
     pub sid: Sid,
-    pub session_inner: Mutex<SessionInner>,
+    pub session_inner: SpinLock<SessionInner>,
 }
 
 #[derive(Debug)]
@@ -61,7 +61,7 @@ impl Session {
         // log::debug!("New Session {:?}", sid);
         Arc::new(Self {
             sid,
-            session_inner: Mutex::new(inner),
+            session_inner: SpinLock::new(inner),
         })
     }
 
@@ -211,5 +211,12 @@ impl ProcessControlBlock {
         session_inner.remove_process(&pcb);
 
         Ok(new_session)
+    }
+
+    pub fn sid(&self) -> Sid {
+        if let Some(session) = self.session() {
+            return session.sid();
+        }
+        return Sid::new(0);
     }
 }

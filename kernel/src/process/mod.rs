@@ -71,7 +71,6 @@ use timer::AlarmTimer;
 use self::{cred::Cred, kthread::WorkerPrivate};
 
 pub mod abi;
-pub mod c_adapter;
 pub mod cred;
 pub mod exec;
 pub mod exit;

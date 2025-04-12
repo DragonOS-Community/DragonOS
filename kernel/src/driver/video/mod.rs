@@ -295,10 +295,3 @@ impl TimerFunction for VideoRefreshExecutor {
         return Ok(());
     }
 }
-
-#[no_mangle]
-pub unsafe extern "C" fn rs_video_init() -> i32 {
-    return VideoRefreshManager::video_init()
-        .map(|_| 0)
-        .unwrap_or_else(|e| e.to_posix_errno());
-}

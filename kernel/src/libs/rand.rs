@@ -7,6 +7,7 @@ bitflags! {
 }
 
 // 软件实现的随机数生成器
+#[allow(dead_code)]
 pub fn soft_rand() -> usize {
     static mut SEED: u64 = 0xdead_beef_cafe_babe;
     let mut buf = [0u8; size_of::<usize>()];

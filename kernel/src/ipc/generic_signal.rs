@@ -66,9 +66,7 @@ impl GenericSignal {
 
     /// const convertor between `Signal` and `SigSet`
     pub const fn into_sigset(self) -> SigSet {
-        SigSet {
-            bits: (1 << (self as usize - 1) as u64),
-        }
+        SigSet::from_bits_truncate(1 << (self as usize - 1))
     }
 
     /// 判断一个信号是不是实时信号

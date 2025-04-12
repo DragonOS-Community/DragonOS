@@ -2,7 +2,6 @@
 set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 # 默认参数
 QEMU_VERSION="9.2.1"
 TARGET_LIST="loongarch64-softmmu"

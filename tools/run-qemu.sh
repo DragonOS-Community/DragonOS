@@ -78,7 +78,7 @@ RISCV64_UBOOT_PATH="arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
 
 DISK_NAME="disk-image-${ARCH}.img"
 
-QEMU=$(which qemu-system1-${ARCH})
+QEMU=$(which qemu-system-${ARCH})
 QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
 QEMU_MEMORY="512M"
 QEMU_MEMORY_BACKEND="dragonos-qemu-shm.ram"

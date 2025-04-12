@@ -102,8 +102,11 @@ impl TtyJobCtrlManager {
 
         //todo 权限检查？
         // https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/tty/tty_jobctrl.c#tiocsctty
-        if real_tty.core().contorl_info_irqsave().session.is_some() {
-            return Err(SystemError::EPERM);
+        if let Some(sid) = real_tty.core().contorl_info_irqsave().session {
+            //todo 目前只有一个tty设备，所以选择复用1号进程的tty，因此修改1号进程的tty暂时被允许
+            if sid != Pid::new(1) {
+                return Err(SystemError::EPERM);
+            }
         }
 
         Self::proc_set_tty(real_tty);

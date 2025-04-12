@@ -76,7 +76,7 @@ source = "git"
 # 路径或URL
 source-path = "https://github.com/sparkzky/DragonReach.git"
 # git标签或分支
-revision = "7030a95e3c488e7044f13820d900896a704d8ca6"
+revision = "30371a2adb87df7064edf50dfefc03910d4f63ce"
 
 # 构建相关信息
 [build]

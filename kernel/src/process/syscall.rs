@@ -312,7 +312,6 @@ impl Syscall {
         let pcb = ProcessManager::current_pcb();
         let session = pcb.go_to_new_session()?;
         let mut guard = pcb.sig_info_mut();
-        let tty = guard.tty();
         guard.set_tty(None);
         if let Some(tty) = tty {
             {

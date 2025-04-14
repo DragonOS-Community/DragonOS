@@ -271,6 +271,7 @@ fn do_waitpid(
 
             kwo.ret_status = status as i32;
 
+            child_pcb.clear_pg_and_session_reference();
             drop(child_pcb);
             // debug!("wait4: to release {pid:?}");
             unsafe { ProcessManager::release(pid) };

@@ -42,7 +42,7 @@ kernel_rust:
 
 
 all: kernel
-
+	rm -f ./debug/kallsyms.o
 # if x86_64
 ifeq ($(ARCH), x86_64)
 	$(MAKE) __link_x86_64_kernel
@@ -63,7 +63,7 @@ kernel: $(kernel_subdirs) kernel_rust
 __link_riscv64_kernel:
 	@echo "Linking kernel..."
 	$(LD) -b elf64-littleriscv -z muldefs $(LDFLAGS_UNWIND) -o kernel ../target/riscv64gc-unknown-none-elf/release/libdragonos_kernel.a -T arch/riscv64/link.ld --no-relax
-	# 生成kallsyms
+# 生成kallsyms
 	current_dir=$(pwd)
 
 	@dbg='debug';for x in $$dbg; do \

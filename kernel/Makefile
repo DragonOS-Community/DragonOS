@@ -16,6 +16,7 @@ ECHO:
 	@echo "$@"
 
 all: 
+	$(MAKE) -C ../build-scripts all
 	$(MAKE) -C src all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
 	
 

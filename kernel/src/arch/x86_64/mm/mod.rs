@@ -5,9 +5,7 @@ pub mod pkru;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use hashbrown::HashSet;
 use log::{debug, info};
-use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
 use crate::driver::serial::serial8250::send_to_default_serial8250_port;
@@ -553,11 +551,10 @@ unsafe fn allocator_init() {
     debug!("Successfully enabled new page table");
 }
 
-#[no_mangle]
-pub extern "C" fn rs_test_buddy() {
-    test_buddy();
-}
+#[cfg(test)]
 pub fn test_buddy() {
+    use hashbrown::HashSet;
+    use x86::time::rdtsc;
     // 申请内存然后写入数据然后free掉
     // 总共申请200MB内存
     const TOTAL_SIZE: usize = 200 * 1024 * 1024;

@@ -4,7 +4,6 @@ use system_error::SystemError;
 
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::EPollEventType;
-use crate::net::net_core::poll_ifaces;
 use crate::net::socket::{Socket, PMSG};
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
@@ -89,7 +88,7 @@ impl UdpSocket {
         match self.inner.read().as_ref().expect("Udp Inner is None") {
             UdpInner::Bound(bound) => {
                 let ret = bound.try_recv(buf);
-                poll_ifaces();
+                bound.inner().iface().poll();
                 ret
             }
             _ => Err(SystemError::ENOTCONN),
@@ -125,10 +124,13 @@ impl UdpSocket {
         };
         // Optimize: 拿两次锁的平均效率是否比一次长时间的读锁效率要高？
         let result = match self.inner.read().as_ref().expect("Udp Inner is None") {
-            UdpInner::Bound(bound) => bound.try_send(buf, to),
+            UdpInner::Bound(bound) => {
+                let ret = bound.try_send(buf, to);
+                bound.inner().iface().poll();
+                ret
+            }
             _ => Err(SystemError::ENOTCONN),
         };
-        poll_ifaces();
         return result;
     }
 

@@ -1,28 +1,19 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::filesystem::eventfd::EventFdInode;
-use crate::perf::PerfEventInode;
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
-    ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
+    ipc::pipe::PipeFsPrivateData,
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    net::{
-        event_poll::{EPollItem, EPollPrivateData, EventPoll},
-        socket::SocketInode,
-    },
+    net::event_poll::{EPollItem, EPollPrivateData},
     process::{cred::Cred, ProcessManager},
 };
 
@@ -492,62 +483,26 @@ impl File {
         return Ok(());
     }
 
-    /// ## 向该文件添加一个EPollItem对象
-    ///
-    /// 在文件状态发生变化时，需要向epoll通知
-    pub fn add_epoll(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
-        match self.file_type {
-            FileType::Socket => {
-                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
-                let mut socket = inode.inner();
-
-                return socket.add_epoll(epitem);
-            }
-            FileType::Pipe => {
-                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
-                return inode.add_epoll(epitem);
-            }
-            _ => {
-                let r = self.inode.kernel_ioctl(epitem, &self.private_data.lock());
-                if r.is_err() {
-                    return Err(SystemError::ENOSYS);
-                }
-
-                Ok(())
-            }
-        }
+    /// Add an EPollItem to the file
+    pub fn add_epitem(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+        let private_data = self.private_data.lock();
+        self.inode
+            .as_pollable_inode()?
+            .add_epitem(epitem, &private_data)
     }
 
-    /// ## 删除一个绑定的epoll
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        match self.file_type {
-            FileType::Socket => {
-                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
-                let mut socket = inode.inner();
-
-                socket.remove_epoll(epoll)
-            }
-            FileType::Pipe => {
-                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
-                inode.remove_epoll(epoll)
-            }
-            _ => {
-                let inode = self.inode.downcast_ref::<EventFdInode>();
-                if let Some(inode) = inode {
-                    return inode.remove_epoll(epoll);
-                }
-
-                let inode = self
-                    .inode
-                    .downcast_ref::<PerfEventInode>()
-                    .ok_or(SystemError::ENOSYS)?;
-                return inode.remove_epoll(epoll);
-            }
-        }
+    /// Remove epitems associated with the epoll
+    pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let private_data = self.private_data.lock();
+        self.inode
+            .as_pollable_inode()?
+            .remove_epitem(epitem, &private_data)
     }
 
+    /// Poll the file for events
     pub fn poll(&self) -> Result<usize, SystemError> {
-        self.inode.poll(&self.private_data.lock())
+        let private_data = self.private_data.lock();
+        self.inode.as_pollable_inode()?.poll(&private_data)
     }
 }
 

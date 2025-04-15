@@ -490,6 +490,16 @@ impl TtyCoreData {
         self.epitems.lock().push_back(epitem)
     }
 
+    pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let mut guard = self.epitems.lock();
+        let len = guard.len();
+        guard.retain(|x| !Arc::ptr_eq(x, epitem));
+        if len != guard.len() {
+            return Ok(());
+        }
+        Err(SystemError::ENOENT)
+    }
+
     pub fn eptiems(&self) -> &SpinLock<LinkedList<Arc<EPollItem>>> {
         &self.epitems
     }

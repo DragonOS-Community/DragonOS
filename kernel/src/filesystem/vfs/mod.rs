@@ -21,6 +21,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
+    net::event_poll::EPollItem,
     time::PosixTimeSpec,
 };
 
@@ -119,6 +120,24 @@ bitflags! {
         const READ = 1u8 << 1;
         const ERROR = 1u8 << 2;
     }
+}
+
+/// The pollable inode trait
+pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
+    /// Return the poll status of the inode
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError>;
+    /// Add an epoll item to the inode
+    fn add_epitem(
+        &self,
+        epitem: Arc<EPollItem>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError>;
+    /// Remove epitems associated with the epoll
+    fn remove_epitem(
+        &self,
+        epitm: &Arc<EPollItem>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError>;
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
@@ -233,14 +252,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
-
-    /// @brief 获取当前inode的状态。
-    ///
-    /// @return PollStatus结构体
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
     }
 
@@ -408,14 +419,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::ENOSYS);
-    }
-
-    fn kernel_ioctl(
-        &self,
-        _arg: Arc<dyn crate::net::event_poll::KernelIoctlData>,
-        _data: &FilePrivateData,
-    ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -624,6 +627,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
             crate::libs::name::get_type_name(&self)
         );
         None
+    }
+
+    /// Transform the inode to a pollable inode
+    ///
+    /// If the inode is not pollable, return an error
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 }
 

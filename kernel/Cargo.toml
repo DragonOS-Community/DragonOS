@@ -14,7 +14,6 @@ members = ["crates/*"]
 
 [features]
 default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test"]
-# 内核栈回溯
 # kvm
 kvm = []
 

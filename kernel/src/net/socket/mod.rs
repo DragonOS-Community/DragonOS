@@ -19,7 +19,7 @@ use crate::{
     arch::rand::rand,
     filesystem::vfs::{
         file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
-        Metadata,
+        Metadata, PollableInode,
     },
     libs::{
         rwlock::{RwLock, RwLockWriteGuard},
@@ -37,7 +37,7 @@ use self::{
 };
 
 use super::{
-    event_poll::{EPollEventType, EPollItem, EventPoll},
+    event_poll::{EPollEventType, EPollItem},
     Endpoint, Protocol, ShutdownType,
 };
 
@@ -242,29 +242,15 @@ pub trait Socket: Sync + Send + Debug + Any {
 
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
-    fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+    fn add_epitem(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
         let posix_item = self.posix_item();
-        posix_item.add_epoll(epitem);
+        posix_item.add_epitem(epitem);
         Ok(())
     }
 
-    fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
+    fn remove_epitm(&mut self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
         let posix_item = self.posix_item();
-        posix_item.remove_epoll(epoll)?;
-
-        Ok(())
-    }
-
-    fn clear_epoll(&mut self) -> Result<(), SystemError> {
-        let posix_item = self.posix_item();
-
-        for epitem in posix_item.epitems.lock_irqsave().iter() {
-            let epoll = epitem.epoll();
-
-            if let Some(epoll) = epoll.upgrade() {
-                EventPoll::ep_remove(&mut epoll.lock_irqsave(), epitem.fd(), None)?;
-            }
-        }
+        posix_item.remove_epitem(epitem)?;
 
         Ok(())
     }
@@ -312,8 +298,6 @@ impl SocketInode {
                 PORT_MANAGER.unbind_port(socket.metadata().socket_type, ip.port);
             }
 
-            socket.clear_epoll()?;
-
             HANDLE_MAP
                 .write_irqsave()
                 .remove(&socket.socket_handle())
@@ -330,6 +314,29 @@ impl Drop for SocketInode {
         for _ in 0..self.1.load(core::sync::atomic::Ordering::SeqCst) {
             let _ = self.do_close();
         }
+    }
+}
+
+impl PollableInode for SocketInode {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        let events = self.0.lock_irqsave().poll();
+        return Ok(events.bits() as usize);
+    }
+
+    fn add_epitem(
+        &self,
+        epitem: Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.0.lock_irqsave().add_epitem(epitem)
+    }
+
+    fn remove_epitem(
+        &self,
+        epitem: &Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.0.lock_irqsave().remove_epitm(epitem)
     }
 }
 
@@ -369,11 +376,6 @@ impl IndexNode for SocketInode {
         self.0.lock_no_preempt().write(&buf[0..len], None)
     }
 
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let events = self.0.lock_irqsave().poll();
-        return Ok(events.bits() as usize);
-    }
-
     fn fs(&self) -> Arc<dyn FileSystem> {
         todo!()
     }
@@ -398,6 +400,10 @@ impl IndexNode for SocketInode {
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         return Ok(());
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Ok(self)
     }
 }
 
@@ -426,22 +432,17 @@ impl PosixSocketHandleItem {
         schedule(SchedMode::SM_NONE);
     }
 
-    pub fn add_epoll(&self, epitem: Arc<EPollItem>) {
+    pub fn add_epitem(&self, epitem: Arc<EPollItem>) {
         self.epitems.lock_irqsave().push_back(epitem)
     }
 
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        let is_remove = !self
-            .epitems
-            .lock_irqsave()
-            .extract_if(|x| x.epoll().ptr_eq(epoll))
-            .collect::<Vec<_>>()
-            .is_empty();
-
-        if is_remove {
+    pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let mut guard = self.epitems.lock();
+        let len = guard.len();
+        guard.retain(|x| !Arc::ptr_eq(x, epitem));
+        if len != guard.len() {
             return Ok(());
         }
-
         Err(SystemError::ENOENT)
     }
 

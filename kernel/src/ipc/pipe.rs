@@ -4,7 +4,7 @@ use crate::{
     arch::ipc::signal::{SigCode, Signal},
     filesystem::vfs::{
         core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
-        FileType, IndexNode, Metadata,
+        FileType, IndexNode, Metadata, PollableInode,
     },
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -19,7 +19,6 @@ use crate::{
 use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -165,24 +164,33 @@ impl LockedPipeInode {
         let inode = self.inner.lock();
         return !inode.buf_full() || inode.reader == 0;
     }
+}
 
-    pub fn add_epoll(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+impl PollableInode for LockedPipeInode {
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        self.inner.lock().poll(private_data)
+    }
+
+    fn add_epitem(
+        &self,
+        epitem: Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
         self.epitems.lock().push_back(epitem);
         Ok(())
     }
 
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        let is_remove = !self
-            .epitems
-            .lock_irqsave()
-            .extract_if(|x| x.epoll().ptr_eq(epoll))
-            .collect::<Vec<_>>()
-            .is_empty();
-
-        if is_remove {
+    fn remove_epitem(
+        &self,
+        epitem: &Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.epitems.lock();
+        let len = guard.len();
+        guard.retain(|x| !Arc::ptr_eq(x, epitem));
+        if len != guard.len() {
             return Ok(());
         }
-
         Err(SystemError::ENOENT)
     }
 }
@@ -496,7 +504,7 @@ impl IndexNode for LockedPipeInode {
         return Err(SystemError::ENOSYS);
     }
 
-    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        return self.inner.lock().poll(private_data);
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Ok(self)
     }
 }

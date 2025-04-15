@@ -210,11 +210,8 @@ impl EventPoll {
                 .get_file_by_fd(fd);
 
             if let Some(file) = file {
-                // if let Some(self_ref) = self.self_ref.as_ref() {
-
-                // }
                 let epitm = self.ep_items.get(&fd).unwrap();
-                file.remove_epitem(epitm).unwrap();
+                file.remove_epitem(epitm)?;
             }
 
             self.ep_items.remove(&fd);
@@ -783,13 +780,17 @@ impl EventPoll {
         let mut epitems_guard = epitems.try_lock_irqsave()?;
         // 一次只取一个，因为一次也只有一个进程能拿到对应文件的🔓
         if let Some(epitem) = epitems_guard.pop_front() {
-            let pollflags = pollflags.unwrap_or({
-                if let Some(file) = epitem.file.upgrade() {
-                    EPollEventType::from_bits_truncate(file.poll()? as u32)
-                } else {
-                    EPollEventType::empty()
+            let pollflags = match pollflags {
+                Some(flags) => flags,
+                None => {
+                    if let Some(file) = epitem.file.upgrade() {
+                        // warning: deadlock will happen if poll() is called when pollflags is None
+                        EPollEventType::from_bits_truncate(file.poll()? as u32)
+                    } else {
+                        EPollEventType::empty()
+                    }
                 }
-            });
+            };
 
             if let Some(epoll) = epitem.epoll().upgrade() {
                 let mut epoll_guard = epoll.try_lock()?;

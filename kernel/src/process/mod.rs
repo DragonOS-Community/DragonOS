@@ -788,14 +788,7 @@ impl ProcessControlBlock {
             (Self::generate_pid(), ppid, cwd, cred, tty)
         };
 
-        let basic_info = ProcessBasicInfo::new(
-            Pgid::from(pid.into()),
-            ppid,
-            Sid::from(pid.into()),
-            name,
-            cwd,
-            None,
-        );
+        let basic_info = ProcessBasicInfo::new(ppid, name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
@@ -1275,12 +1268,8 @@ impl ThreadInfo {
 /// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。
 #[derive(Debug)]
 pub struct ProcessBasicInfo {
-    /// 当前进程的进程组id
-    pgid: Pgid,
     /// 当前进程的父进程的pid
     ppid: Pid,
-    /// 当前进程所属会话id
-    sid: Sid,
     /// 进程的名字
     name: String,
 
@@ -1297,18 +1286,14 @@ pub struct ProcessBasicInfo {
 impl ProcessBasicInfo {
     #[inline(never)]
     pub fn new(
-        pgid: Pgid,
         ppid: Pid,
-        sid: Sid,
         name: String,
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
         let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
         return RwLock::new(Self {
-            pgid,
             ppid,
-            sid,
             name,
             cwd,
             user_vm,
@@ -1316,24 +1301,8 @@ impl ProcessBasicInfo {
         });
     }
 
-    pub fn pgid(&self) -> Pgid {
-        return self.pgid;
-    }
-
-    pub fn set_pgid(&mut self, pgid: Pgid) {
-        self.pgid = pgid;
-    }
-
     pub fn ppid(&self) -> Pid {
         return self.ppid;
-    }
-
-    pub fn sid(&self) -> Sid {
-        return self.sid;
-    }
-
-    pub fn set_sid(&mut self, sid: Sid) {
-        self.sid = sid;
     }
 
     pub fn name(&self) -> &str {

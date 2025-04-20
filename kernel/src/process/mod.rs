@@ -74,7 +74,6 @@ use timer::AlarmTimer;
 use self::{cred::Cred, kthread::WorkerPrivate};
 
 pub mod abi;
-pub mod c_adapter;
 pub mod cred;
 pub mod exec;
 pub mod exit;
@@ -1124,6 +1123,24 @@ impl ProcessControlBlock {
     /// 根据 pcb 的 flags 判断当前进程是否有未处理的信号
     pub fn has_pending_signal_fast(&self) -> bool {
         self.flags.get().contains(ProcessFlags::HAS_PENDING_SIGNAL)
+    }
+
+    /// 检查当前进程是否有未被阻塞的待处理信号。
+    ///
+    /// 注：该函数较慢，因此需要与 has_pending_signal_fast 一起使用。
+    pub fn has_pending_not_masked_signal(&self) -> bool {
+        let sig_info = self.sig_info_irqsave();
+        let blocked: SigSet = *sig_info.sig_blocked();
+        let mut pending: SigSet = sig_info.sig_pending().signal();
+        drop(sig_info);
+        pending.remove(blocked);
+        // log::debug!(
+        //     "pending and not masked:{:?}, masked: {:?}",
+        //     pending,
+        //     blocked
+        // );
+        let has_not_masked = !pending.is_empty();
+        return has_not_masked;
     }
 
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {

@@ -10,14 +10,10 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [workspace]
-members = [ 
-    "crates/*",
-]
+members = ["crates/*"]
 
 [features]
-default = ["backtrace", "kvm", "fatfs", "fatfs-secure", "static_keys_test"]
-# 内核栈回溯
-backtrace = ["dep:unwinding"]
+default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test"]
 # kvm
 kvm = []
 
@@ -51,8 +47,19 @@ klog_types = { path = "crates/klog_types" }
 linkme = "=0.3.27"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
-num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
-smoltcp = { version = "=0.11.0", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6"]}
+num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev = "1597c1c", default-features = false }
+smoltcp = { version = "=0.11.0", default-features = false, features = [
+    "log",
+    "alloc",
+    "socket-raw",
+    "socket-udp",
+    "socket-tcp",
+    "socket-icmp",
+    "socket-dhcpv4",
+    "socket-dns",
+    "proto-ipv4",
+    "proto-ipv6",
+] }
 system_error = { path = "crates/system_error" }
 uefi = { version = "=0.26.0", features = ["alloc"] }
 uefi-raw = "=0.5.0"
@@ -69,12 +76,12 @@ rbpf = { path = "crates/rbpf" }
 printf-compat = { version = "0.1.1", default-features = false }
 
 static-keys = "=0.6.1"
-unwinding = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/unwinding", rev = "4eb845da62", default-features = false,  optional = true, features = [
+unwinding = { version = "=0.2.3", default-features = false, features = [
     "unwinder",
     "fde-gnu-eh-frame-hdr",
     "panic",
-    "personality"
-]}
+    "personality",
+] }
 defer = "0.2.1"
 cfg-if = { version = "1.0.0" }
 
@@ -87,7 +94,9 @@ x86_64 = "=0.14.10"
 
 # target为riscv64时，使用下面的依赖
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", rev = "4241a97", features = [ "s-mode" ] }
+riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", rev = "4241a97", features = [
+    "s-mode",
+] }
 sbi-rt = { version = "=0.0.3", features = ["legacy"] }
 
 
@@ -103,7 +112,7 @@ features = ["spin_no_std"]
 # The development profile, used for `cargo build`
 [profile.dev]
 # opt-level = 0  # Controls the --opt-level the compiler builds with
-debug = true   # Controls whether the compiler passes `-g`
+debug = true # Controls whether the compiler passes `-g`
 
 # The release profile, used for `cargo build --release`
 [profile.release]

@@ -16,6 +16,7 @@ ECHO:
 	@echo "$@"
 
 all: 
+	$(MAKE) -C ../build-scripts all
 	$(MAKE) -C src all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
 	
 
@@ -26,7 +27,7 @@ clean:
 fmt:
 	RUSTFLAGS="$(RUSTFLAGS)" cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 clippy --all-features
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 clippy --all-features --target x86_64-unknown-none
 endif
 
 

@@ -5,6 +5,7 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
+    debug::panic::kernel_catch_unwind,
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
@@ -78,16 +79,13 @@ impl Syscall {
     /// 系统调用分发器，用于分发系统调用。
     ///
     /// 与[handle]不同，这个函数会捕获系统调用处理函数的panic，返回错误码。
-    #[cfg(feature = "backtrace")]
     pub fn catch_handle(
         syscall_num: usize,
         args: &[usize],
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
-        let res = unwinding::panic::catch_unwind(|| Self::handle(syscall_num, args, frame));
-        res.unwrap_or_else(|_| loop {
-            core::hint::spin_loop();
-        })
+        let res = kernel_catch_unwind(|| Self::handle(syscall_num, args, frame))?;
+        res
     }
     /// @brief 系统调用分发器，用于分发系统调用。
     ///
@@ -886,10 +884,7 @@ impl Syscall {
                 Self::poll(fds, nfds, timeout)
             }
 
-            SYS_PPOLL => {
-                log::warn!("SYS_PPOLL has not yet been implemented");
-                Ok(0)
-            }
+            SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
 
             SYS_SETPGID => {
                 let pid = Pid::new(args[0]);
@@ -1235,6 +1230,7 @@ impl Syscall {
             }
             SYS_SETRLIMIT => Ok(0),
             SYS_RESTART_SYSCALL => Self::restart_syscall(),
+            SYS_RT_SIGPENDING => Self::rt_sigpending(args[0], args[1]),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

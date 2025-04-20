@@ -1,12 +1,18 @@
 use core::ffi::c_int;
 
 use crate::{
-    ipc::signal::{RestartBlock, RestartBlockData, RestartFn},
+    arch::ipc::signal::SigSet,
+    ipc::signal::{
+        restore_saved_sigmask_unless, set_user_sigmask, RestartBlock, RestartBlockData, RestartFn,
+    },
     mm::VirtAddr,
     net::event_poll::{EPollCtlOption, EPollEvent, EPollEventType, EventPoll},
     process::ProcessManager,
-    syscall::{user_access::UserBufferWriter, Syscall},
-    time::{Duration, Instant},
+    syscall::{
+        user_access::{UserBufferReader, UserBufferWriter},
+        Syscall,
+    },
+    time::{Duration, Instant, PosixTimeSpec},
 };
 
 use super::vfs::file::{File, FileMode};
@@ -32,11 +38,15 @@ impl<'a> PollAdapter<'a> {
     }
 
     fn add_pollfds(&self) -> Result<(), SystemError> {
-        for pollfd in self.poll_fds.iter() {
+        for (i, pollfd) in self.poll_fds.iter().enumerate() {
+            if pollfd.fd < 0 {
+                continue;
+            }
             let mut epoll_event = EPollEvent::default();
             let poll_flags = PollFlags::from_bits_truncate(pollfd.events);
             let ep_events: EPollEventType = poll_flags.into();
             epoll_event.set_events(ep_events.bits());
+            epoll_event.set_data(i as u64);
 
             EventPoll::epoll_ctl_with_epfile(
                 self.ep_file.clone(),
@@ -64,8 +74,13 @@ impl<'a> PollAdapter<'a> {
             remain_timeout,
         )?;
 
-        for (i, event) in epoll_events.iter().enumerate() {
-            self.poll_fds[i].revents = (event.events() & 0xffff) as u16;
+        for event in epoll_events.iter() {
+            let index = event.data() as usize;
+            if index >= self.poll_fds.len() {
+                log::warn!("poll_all_fds: Invalid index in epoll event: {}", index);
+                continue;
+            }
+            self.poll_fds[index].revents = (event.events() & 0xffff) as u16;
         }
 
         Ok(events)
@@ -74,13 +89,14 @@ impl<'a> PollAdapter<'a> {
 
 impl Syscall {
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/select.c#1068
+    #[inline(never)]
     pub fn poll(pollfd_ptr: usize, nfds: u32, timeout_ms: i32) -> Result<usize, SystemError> {
         let pollfd_ptr = VirtAddr::new(pollfd_ptr);
         let len = nfds as usize * core::mem::size_of::<PollFd>();
 
         let mut timeout: Option<Instant> = None;
         if timeout_ms >= 0 {
-            timeout = poll_select_set_timeout(timeout_ms);
+            timeout = poll_select_set_timeout(timeout_ms as u64);
         }
         let mut poll_fds_writer = UserBufferWriter::new(pollfd_ptr.as_ptr::<PollFd>(), len, true)?;
         let mut r = do_sys_poll(poll_fds_writer.buffer(0)?, timeout);
@@ -92,15 +108,58 @@ impl Syscall {
 
         return r;
     }
-}
 
-/// 计算超时的时刻
-fn poll_select_set_timeout(timeout_ms: i32) -> Option<Instant> {
-    if timeout_ms == 0 {
-        return None;
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/select.c#1101
+    #[inline(never)]
+    pub fn ppoll(
+        pollfd_ptr: usize,
+        nfds: u32,
+        timespec_ptr: usize,
+        sigmask_ptr: usize,
+    ) -> Result<usize, SystemError> {
+        let mut timeout_ts: Option<Instant> = None;
+        let mut sigmask: Option<SigSet> = None;
+        let pollfd_ptr = VirtAddr::new(pollfd_ptr);
+        let pollfds_len = nfds as usize * core::mem::size_of::<PollFd>();
+        let mut poll_fds_writer =
+            UserBufferWriter::new(pollfd_ptr.as_ptr::<PollFd>(), pollfds_len, true)?;
+        let poll_fds = poll_fds_writer.buffer(0)?;
+        if sigmask_ptr != 0 {
+            let sigmask_reader =
+                UserBufferReader::new(sigmask_ptr as *const SigSet, size_of::<SigSet>(), true)?;
+            sigmask = Some(*sigmask_reader.read_one_from_user(0)?);
+        }
+
+        if timespec_ptr != 0 {
+            let tsreader = UserBufferReader::new(
+                timespec_ptr as *const PosixTimeSpec,
+                size_of::<PosixTimeSpec>(),
+                true,
+            )?;
+            let ts: PosixTimeSpec = *tsreader.read_one_from_user(0)?;
+            let timeout_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000;
+
+            if timeout_ms >= 0 {
+                timeout_ts =
+                    Some(poll_select_set_timeout(timeout_ms as u64).ok_or(SystemError::EINVAL)?);
+            }
+        }
+
+        if let Some(mut sigmask) = sigmask {
+            set_user_sigmask(&mut sigmask);
+        }
+        // log::debug!(
+        //     "ppoll: poll_fds: {:?}, nfds: {}, timeout_ts: {:?}，sigmask: {:?}",
+        //     poll_fds,
+        //     nfds,
+        //     timeout_ts,
+        //     sigmask
+        // );
+
+        let r: Result<usize, SystemError> = do_sys_poll(poll_fds, timeout_ts);
+
+        return poll_select_finish(timeout_ts, timespec_ptr, PollTimeType::TimeSpec, r);
     }
-
-    Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
 }
 
 fn do_sys_poll(poll_fds: &mut [PollFd], timeout: Option<Instant>) -> Result<usize, SystemError> {
@@ -113,6 +172,75 @@ fn do_sys_poll(poll_fds: &mut [PollFd], timeout: Option<Instant>) -> Result<usiz
     let nevents = adapter.poll_all_fds(timeout)?;
 
     Ok(nevents)
+}
+
+/// 计算超时的时刻
+fn poll_select_set_timeout(timeout_ms: u64) -> Option<Instant> {
+    if timeout_ms == 0 {
+        return None;
+    }
+
+    Some(Instant::now() + Duration::from_millis(timeout_ms))
+}
+
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/select.c#298
+fn poll_select_finish(
+    end_time: Option<Instant>,
+    user_time_ptr: usize,
+    poll_time_type: PollTimeType,
+    mut result: Result<usize, SystemError>,
+) -> Result<usize, SystemError> {
+    restore_saved_sigmask_unless(result == Err(SystemError::ERESTARTNOHAND));
+
+    if user_time_ptr == 0 {
+        return result;
+    }
+
+    // todo: 处理sticky timeouts
+
+    if end_time.is_none() {
+        return result;
+    }
+
+    let end_time = end_time.unwrap();
+
+    // no update for zero timeout
+    if end_time.total_millis() <= 0 {
+        return result;
+    }
+
+    let ts = Instant::now();
+    let duration = end_time.saturating_sub(ts);
+    let rts: PosixTimeSpec = duration.into();
+
+    match poll_time_type {
+        PollTimeType::TimeSpec => {
+            let mut tswriter = UserBufferWriter::new(
+                user_time_ptr as *mut PosixTimeSpec,
+                size_of::<PosixTimeSpec>(),
+                true,
+            )?;
+            if tswriter.copy_one_to_user(&rts, 0).is_err() {
+                return result;
+            }
+        }
+        _ => todo!(),
+    }
+
+    if result == Err(SystemError::ERESTARTNOHAND) {
+        result = result.map_err(|_| SystemError::EINTR);
+    }
+
+    return result;
+}
+
+#[allow(unused)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollTimeType {
+    TimeVal,
+    OldTimeVal,
+    TimeSpec,
+    OldTimeSpec,
 }
 
 bitflags! {

@@ -6,5 +6,4 @@
     missing_docs,
     clippy::module_inception
 )]
-pub mod bindings;
 pub mod linux_bpf;

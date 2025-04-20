@@ -16,7 +16,7 @@ impl SchedClock {
             return CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles()) as u64;
         }
 
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
         {
             return CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles()) as u64;
         }

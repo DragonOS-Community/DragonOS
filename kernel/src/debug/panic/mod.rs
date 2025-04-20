@@ -63,6 +63,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         loop {}
     }
 
+    #[cfg(not(target_arch = "loongarch64"))]
     if info.can_unwind() {
         let guard = Box::new(PanicGuard::new());
         hook::print_stack_trace();
@@ -79,6 +80,7 @@ pub fn panic(info: &PanicInfo) -> ! {
 /// The wrapper of `unwinding::panic::begin_panic`. If the panic is
 /// caught, it will return the result of the function.
 /// If the panic is not caught, it will return an error.
+#[cfg(not(target_arch = "loongarch64"))]
 pub fn kernel_catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, SystemError> {
     let res = unwinding::panic::catch_unwind(f);
     match res {
@@ -90,6 +92,7 @@ pub fn kernel_catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, SystemError> 
     }
 }
 
+#[cfg(not(target_arch = "loongarch64"))]
 #[allow(unused)]
 pub fn test_unwind() {
     struct UnwindTest;

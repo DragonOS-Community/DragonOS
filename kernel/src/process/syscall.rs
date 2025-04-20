@@ -358,7 +358,6 @@ impl Syscall {
         let pcb = ProcessControlBlock::new(name, new_kstack);
         // 克隆pcb
         ProcessManager::copy_process(&current_pcb, &pcb, clone_args, current_trapframe)?;
-        // ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程
         procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {

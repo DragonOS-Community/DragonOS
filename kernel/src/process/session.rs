@@ -13,8 +13,6 @@ use system_error::SystemError;
 /// 会话SID
 pub type Sid = Pid;
 
-// int_like!(Sid, AtomicSid, usize, AtomicUsize);
-
 /// 系统中所有会话
 pub static ALL_SESSION: SpinLock<Option<HashMap<Sid, Arc<Session>>>> = SpinLock::new(None);
 

@@ -790,7 +790,6 @@ impl NTtyData {
         let ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
         if let Some(pg) = pg {
-            // let _ = Syscall::kill(pg.data()as i32, signal as i32);
             let _ = Syscall::kill_process(pg, signal);
         }
 

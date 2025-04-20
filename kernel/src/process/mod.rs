@@ -231,11 +231,7 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.pid(), pcb.clone());
-        // ALL_PROCESS_GROUP
-        //     .lock_irqsave()
-        //     .as_mut()
-        //     .unwrap()
-        //     .insert(pcb.pgid(), ProcessGroup::new(pcb.clone()));
+
     }
 
     /// ### 获取所有进程的pid
@@ -392,7 +388,6 @@ impl ProcessManager {
                 return;
             }
             let parent_pcb = r.unwrap();
-            // let r = Syscall::kill(parent_pcb.pid(), Signal::SIGCHLD as i32);
             let r = Syscall::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
             if r.is_err() {
                 warn!(

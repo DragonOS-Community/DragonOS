@@ -179,7 +179,6 @@ impl ProcessManager {
             );
             e
         })?;
-        // ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程
         procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {

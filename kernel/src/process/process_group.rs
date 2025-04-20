@@ -12,13 +12,6 @@ use system_error::SystemError;
 
 /// 进程组ID
 pub type Pgid = Pid;
-// int_like!(Pgid, AtomicPgid, usize, AtomicUsize);
-
-// impl fmt::Display for Pgid {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         write!(f, "{}", self.0)
-//     }
-// }
 
 /// 系统中所有进程组
 pub static ALL_PROCESS_GROUP: SpinLock<Option<HashMap<Pgid, Arc<ProcessGroup>>>> =

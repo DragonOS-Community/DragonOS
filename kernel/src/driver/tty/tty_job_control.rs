@@ -62,7 +62,6 @@ impl TtyJobCtrlManager {
                 }
             } else {
                 // 暂时使用kill而不是killpg
-                // Syscall::kill(pgid.data()as i32, sig as i32)?;
                 Syscall::kill_process(pgid, sig)?;
                 ProcessManager::current_pcb()
                     .flags()

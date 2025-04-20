@@ -230,7 +230,6 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.pid(), pcb.clone());
-
     }
 
     /// ### 获取所有进程的pid

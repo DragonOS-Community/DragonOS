@@ -74,7 +74,7 @@ install_loongarch64_gcc()
     echo "正在解压 loongarch64-unknown-linux-gnu 工具链"
     tar xf $LA64_GCC_TAR -C $INSTALL_POS || exit 1
     echo "正在将 loongarch64-unknown-linux-gnu 工具链添加到 PATH 环境变量中"
-    echo "PATH=\$PATH:$INSTALL_POS/${LA64_GCC_VERSION}/bin" >> $SHELL_RC
+    echo "export PATH=\$PATH:$INSTALL_POS/${LA64_GCC_VERSION}/bin" >> $SHELL_RC
 
     echo "loongarch64-unknown-linux-gnu 工具链已成功安装！请运行 source $SHELL_RC 以使更改生效！"
     rm -rf $LA64_GCC_TAR || exit 1
@@ -89,7 +89,7 @@ if [ ! -n "$(which x86_64-linux-musl-gcc)" ] || [ ! -n "$(which x86_64-linux-mus
     echo "下载完成"
     echo "开始解压x86_64-linux-musl-gcc"
     tar xvf $MUSL_GCC_X86_64_TAR -C $INSTALL_POS || exit 1
-    echo "PATH=\$PATH:$INSTALL_POS/x86_64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}/bin" >> $SHELL_RC
+    echo "export PATH=\$PATH:$INSTALL_POS/x86_64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}/bin" >> $SHELL_RC
     echo "安装完成"
     echo "开始清理x86_64-linux-musl-gcc的下载缓存"
     rm -rf $MUSL_GCC_X86_64_TAR || exit 1

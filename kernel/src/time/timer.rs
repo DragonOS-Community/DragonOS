@@ -385,10 +385,3 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
 pub fn clock() -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst);
 }
-
-// ====== 以下为给C提供的接口 ======
-
-#[no_mangle]
-pub extern "C" fn rs_timer_init() {
-    timer_init();
-}

@@ -346,7 +346,7 @@ cargo install dadk || exit 1
 bashpath=$(cd `dirname $0`; pwd)
 
 # 编译安装musl交叉编译工具链
-$SHELL ${bashpath}/install_musl_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
+$SHELL ${bashpath}/install_cross_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
 # 编译安装grub
 $SHELL ${bashpath}/grub_auto_install.sh || (echo "grub安装失败" && exit 1)
 

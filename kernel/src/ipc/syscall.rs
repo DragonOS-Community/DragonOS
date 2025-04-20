@@ -41,30 +41,30 @@ use super::{
     },
 };
 
-/// ### 过滤器，将输入的id转换成对应的pid或pgid
+/// ### pid转换器，将输入的id转换成对应的pid或pgid
 /// - 如果id < -1，则为pgid
 /// - 如果id == -1，则为所有进程
 /// - 如果id == 0，则为当前进程组
 /// - 如果id > 0，则为pid
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Filter {
+pub enum PidConverter {
     All,
     Pid(Pid),
     Pgid(Pgid),
 }
 
-impl Filter {
+impl PidConverter {
     /// ### 为 `wait` 和 `kill` 调用使用
     pub fn from_id(id: i32) -> Self {
         if id < -1 {
-            Filter::Pgid(Pgid::from(-id as usize))
+            PidConverter::Pgid(Pgid::from(-id as usize))
         } else if id == -1 {
-            Filter::All
+            PidConverter::All
         } else if id == 0 {
             let pgid = ProcessManager::current_pcb().pgid();
-            Filter::Pgid(pgid)
+            PidConverter::Pgid(pgid)
         } else {
-            Filter::Pid(Pid::from(id as usize))
+            PidConverter::Pid(Pid::from(id as usize))
         }
     }
 }
@@ -166,7 +166,7 @@ impl Syscall {
     /// - `id`: id，等于0表示当前进程组，等于-1表示所有进程，小于0表示pgid = -id，大于0表示pid = id，
     /// - `sig`: 信号值
     pub fn kill(id: i32, sig: c_int) -> Result<usize, SystemError> {
-        let filter = Filter::from_id(id);
+        let converter = PidConverter::from_id(id);
         let sig = Signal::from(sig);
         if sig == Signal::INVALID {
             // 传入的signal数值不合法
@@ -176,10 +176,10 @@ impl Syscall {
 
         // compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        let retval = match filter {
-            Filter::Pid(pid) => Self::kill_process(pid, sig),
-            Filter::Pgid(pgid) => Self::kill_process_group(pgid, sig),
-            Filter::All => Self::kill_all(sig),
+        let retval = match converter {
+            PidConverter::Pid(pid) => Self::kill_process(pid, sig),
+            PidConverter::Pgid(pgid) => Self::kill_process_group(pgid, sig),
+            PidConverter::All => Self::kill_all(sig),
         };
 
         // compiler_fence(core::sync::atomic::Ordering::SeqCst);

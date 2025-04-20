@@ -113,17 +113,18 @@ impl TracePoint {
 /// call trace_\$name to trigger the callback function
 #[macro_export]
 macro_rules! define_trace_point {
-    ($name:ident,$($arg:ident:$arg_type:ty),*) => {
+    ($name:ident $(,$arg:ident:$arg_type:ty),*) => {
         paste::paste!{
-            static_keys::define_static_key_false!([<__ $name _key>]);
+            static_keys::define_static_key_false!([<__ $name _KEY>]);
             #[allow(non_upper_case_globals)]
             #[used]
-            static [<__ $name>]: $crate::debug::tracing::tracepoint::TracePoint = $crate::debug::tracing::tracepoint::TracePoint::new(&[<__ $name _key>],stringify!($name), module_path!(),None,None);
+            static [<__ $name>]: $crate::debug::tracing::tracepoint::TracePoint = $crate::debug::tracing::tracepoint::TracePoint::new(&[<__ $name _KEY>],stringify!($name), module_path!(),None,None);
 
             #[inline(always)]
-            pub fn [<trace_ $name>]( $($arg:$arg_type),* ){
+            #[allow(non_snake_case)]
+            pub fn [<TRACE_ $name>]( $($arg:$arg_type),* ){
 
-                if static_keys::static_branch_unlikely!([<__ $name _key>]){
+                if static_keys::static_branch_unlikely!([<__ $name _KEY>]){
                     let mut funcs = [<__ $name>].callback_list();
                     for trace_func in funcs.values_mut(){
                         let func = trace_func.func;
@@ -135,11 +136,13 @@ macro_rules! define_trace_point {
 
             }
 
+            #[allow(unused,non_snake_case)]
             pub fn [<register_trace_ $name>](func:fn(&mut (dyn core::any::Any+Send+Sync),$($arg_type),*),data:alloc::boxed::Box<dyn core::any::Any+Send+Sync>){
                 let func = unsafe{core::mem::transmute::<fn(&mut (dyn core::any::Any+Send+Sync),$($arg_type),*),fn()>(func)};
                 [<__ $name>].register(func,data);
             }
 
+            #[allow(unused,non_snake_case)]
             pub fn [<unregister_trace_ $name>](func:fn(&mut (dyn core::any::Any+Send+Sync),$($arg_type),*)){
                 let func = unsafe{core::mem::transmute::<fn(&mut (dyn core::any::Any+Send+Sync),$($arg_type),*),fn()>(func)};
                 [<__ $name>].unregister(func);
@@ -154,7 +157,7 @@ macro_rules! define_event_trace{
     ($name:ident,
         ($($arg:ident:$arg_type:ty),*),
         $fmt:expr) =>{
-        define_trace_point!($name,$($arg:$arg_type),*);
+        define_trace_point!($name $(,$arg:$arg_type),*);
         paste::paste!{
             #[derive(Debug)]
             #[repr(C)]
@@ -169,9 +172,10 @@ macro_rules! define_event_trace{
              #[used]
             static [<__ $name _meta>]: [<__ $name _TracePointMeta>] = [<__ $name _TracePointMeta>]{
                 trace_point:&[<__ $name>],
-                print_func:[<trace_print_ $name>],
+                print_func:[<TRACE_PRINT_ $name>],
             };
-            pub fn [<trace_print_ $name>](_data:&mut (dyn core::any::Any+Send+Sync),$($arg:$arg_type),* ){
+            #[allow(non_snake_case)]
+            pub fn [<TRACE_PRINT_ $name>](_data:&mut (dyn core::any::Any+Send+Sync),$($arg:$arg_type),* ){
                  let time = $crate::time::Instant::now();
                  let cpu_id = $crate::arch::cpu::current_cpu_id().data();
                  let current_pid = $crate::process::ProcessManager::current_pcb().pid().data();

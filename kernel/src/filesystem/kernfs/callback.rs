@@ -105,11 +105,4 @@ impl KernInodePrivateData {
             _ => Err(SystemError::ENOSYS),
         };
     }
-
-    pub fn debugfs_tracepoint(&self) -> Option<&'static TracePoint> {
-        return match self {
-            KernInodePrivateData::DebugFS(tracepoint) => Some(tracepoint),
-            _ => None,
-        };
-    }
 }

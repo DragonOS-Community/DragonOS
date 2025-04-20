@@ -52,11 +52,6 @@ impl TracingEventsManager {
     pub fn get_subsystem(&self, subsystem_name: &str) -> Option<Arc<EventsSubsystem>> {
         self.subsystems.lock().get(subsystem_name).cloned()
     }
-
-    /// Remove the subsystem by name
-    pub fn remove_subsystem(&self, subsystem_name: &str) -> Option<Arc<EventsSubsystem>> {
-        self.subsystems.lock().remove(subsystem_name)
-    }
 }
 
 #[derive(Debug)]
@@ -73,22 +68,22 @@ impl EventsSubsystem {
         }
     }
 
-    /// Create an event by name
-    pub fn create_event(&self, event_name: &str, event_info: EventInfo) -> Result<(), SystemError> {
+    /// Insert a new event into the subsystem
+    pub fn insert_event(
+        &self,
+        event_name: &str,
+        event_info: Arc<EventInfo>,
+    ) -> Result<(), SystemError> {
         self.events
             .lock()
-            .insert(event_name.to_string(), Arc::new(event_info));
+            .insert(event_name.to_string(), event_info);
         Ok(())
     }
 
     /// Get the event by name
+    #[allow(unused)]
     pub fn get_event(&self, event_name: &str) -> Option<Arc<EventInfo>> {
         self.events.lock().get(event_name).cloned()
-    }
-
-    /// Remove the event by name
-    pub fn remove_event(&self, event_name: &str) -> Option<Arc<EventInfo>> {
-        self.events.lock().remove(event_name)
     }
 
     /// Get the root inode of the subsystem
@@ -99,13 +94,14 @@ impl EventsSubsystem {
 
 #[derive(Debug)]
 pub struct EventInfo {
+    #[allow(unused)]
     enable: Arc<KernFSInode>,
     // filter: Arc<KernFSInode>,
     // trigger: Arc<KernFSInode>,
 }
 
 impl EventInfo {
-    pub fn new(tracepoint: &'static TracePoint, subsystem: Arc<KernFSInode>) -> Self {
+    pub fn new(tracepoint: &'static TracePoint, subsystem: Arc<KernFSInode>) -> Arc<Self> {
         let trace_dir = subsystem
             .add_dir(
                 tracepoint.name().to_string(),
@@ -124,10 +120,14 @@ impl EventInfo {
             )
             .expect("add enable file failed");
 
-        Self {
+        Arc::new(Self {
             enable: enable_inode,
-        }
+        })
     }
+}
+
+impl Drop for EventInfo {
+    fn drop(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -183,7 +183,7 @@ impl KernFSCallback for EnableCallBack {
                         tracepoint.enable();
                     }
                     _ => {
-                        println!("EnableCallBack invalid value: {}", value);
+                        log::info!("EnableCallBack invalid value: {}", value);
                         return Err(SystemError::EINVAL);
                     }
                 }
@@ -224,7 +224,7 @@ pub fn init_events(events_root: Arc<KernFSInode>) -> Result<(), SystemError> {
         let subsys_name = subsys_name.nth(1).ok_or(SystemError::EINVAL)?;
         let subsys = events_manager.create_subsystem(subsys_name)?;
         let event_info = EventInfo::new(tracepoint, subsys.root());
-        subsys.create_event(tracepoint.name(), event_info)?;
+        subsys.insert_event(tracepoint.name(), event_info)?;
     }
 
     unsafe {

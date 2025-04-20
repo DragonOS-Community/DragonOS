@@ -5,16 +5,18 @@ pub mod tracepoint;
 use crate::debug::sysfs::debugfs_kset;
 use crate::debug::tracing::trace_pipe::TRACE_PIPE_MAX_RECORD;
 use crate::driver::base::kobject::KObject;
-use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback};
+use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::PollStatus;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use system_error::SystemError;
+use tracepoint::TracePoint;
 
 static mut TRACING_ROOT_INODE: Option<Arc<KernFSInode>> = None;
 
+#[allow(unused)]
 fn tracing_root_inode() -> Arc<KernFSInode> {
     unsafe { TRACING_ROOT_INODE.clone().unwrap() }
 }
@@ -22,7 +24,7 @@ fn tracing_root_inode() -> Arc<KernFSInode> {
 /// Initialize the debugfs tracing directory
 pub fn init_debugfs_tracing() -> Result<(), SystemError> {
     let debugfs = debugfs_kset();
-    let root_dir = debugfs.inode().unwrap();
+    let root_dir = debugfs.inode().ok_or(SystemError::ENOENT)?;
     let tracing_root = root_dir.add_dir(
         "tracing".to_string(),
         ModeType::from_bits_truncate(0o555),
@@ -82,5 +84,14 @@ impl KernFSCallback for TracingDirCallBack {
 
     fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
         Err(SystemError::EISDIR)
+    }
+}
+
+impl KernInodePrivateData {
+    pub fn debugfs_tracepoint(&self) -> Option<&'static TracePoint> {
+        return match self {
+            KernInodePrivateData::DebugFS(tracepoint) => Some(tracepoint),
+            _ => None,
+        };
     }
 }

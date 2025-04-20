@@ -68,7 +68,7 @@ lru = "0.12.3"
 rbpf = { path = "crates/rbpf" }
 printf-compat = { version = "0.1.1", default-features = false }
 
-static-keys = { git = "https://github.com/Godones/static-keys", branch = "ext" }
+static-keys = { version = "=0.7" }
 unwinding = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/unwinding", rev = "4eb845da62", default-features = false,  optional = true, features = [
     "unwinder",
     "fde-gnu-eh-frame-hdr",

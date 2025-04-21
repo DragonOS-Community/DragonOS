@@ -1,4 +1,4 @@
-use core::sync::atomic::compiler_fence;
+use core::{fmt::Debug, sync::atomic::compiler_fence};
 
 use alloc::sync::Arc;
 use log::warn;
@@ -8,9 +8,11 @@ use crate::{
     arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
     ipc::signal_types::SigactionType,
     libs::spinlock::SpinLockGuard,
+    mm::VirtAddr,
     process::{
         pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo,
     },
+    time::Instant,
 };
 
 use super::signal_types::{
@@ -69,6 +71,11 @@ impl Signal {
             warn!("Kill operation not support: pid={:?}", pid);
             return Err(SystemError::ENOSYS);
         }
+
+        // 暂时不支持发送信号给进程组
+        if pid.data() == 0 {
+            return Err(SystemError::ENOSYS);
+        }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 检查sig是否符合要求，如果不符合要求，则退出。
         if !self.is_valid() {
@@ -78,7 +85,7 @@ impl Signal {
         let pcb = ProcessManager::find(pid);
 
         if pcb.is_none() {
-            warn!("No such process.");
+            warn!("No such process: pid={:?}", pid);
             return retval;
         }
 
@@ -412,6 +419,16 @@ pub fn restore_saved_sigmask() {
     }
 }
 
+pub fn restore_saved_sigmask_unless(interrupted: bool) {
+    if interrupted {
+        if !ProcessManager::current_pcb().has_pending_signal_fast() {
+            log::warn!("restore_saved_sigmask_unless: interrupted, but has NO pending signal");
+        }
+    } else {
+        restore_saved_sigmask();
+    }
+}
+
 /// 刷新指定进程的sighand的sigaction，将满足条件的sigaction恢复为默认状态。
 /// 除非某个信号被设置为忽略且 `force_default` 为 `false`，否则都不会将其恢复。
 ///
@@ -610,6 +627,24 @@ pub fn set_current_blocked(new_set: &mut SigSet) {
     __set_current_blocked(new_set);
 }
 
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=set_user_sigmask#set_user_sigmask
+/// 功能与set_current_blocked相同，多一步保存当前的sig_blocked到saved_sigmask
+/// 由于这之中设置了saved_sigmask，因此从系统调用返回之前需要恢复saved_sigmask
+pub fn set_user_sigmask(new_set: &mut SigSet) {
+    let pcb = ProcessManager::current_pcb();
+    let mut guard = pcb.sig_info_mut();
+    let oset = *guard.sig_blocked();
+
+    let flags = pcb.flags();
+    flags.set(ProcessFlags::RESTORE_SIG_MASK, true);
+
+    let saved_sigmask = guard.saved_sigmask_mut();
+    *saved_sigmask = oset;
+    drop(guard);
+
+    set_current_blocked(new_set);
+}
+
 /// 设置当前进程的屏蔽信号 (sig_block)
 ///
 /// ## 参数
@@ -640,4 +675,46 @@ pub fn set_sigprocmask(how: SigHow, set: SigSet) -> Result<SigSet, SystemError> 
 
     __set_current_blocked(&res_set);
     Ok(oset)
+}
+
+#[derive(Debug)]
+pub struct RestartBlock {
+    pub data: RestartBlockData,
+    pub restart_fn: &'static dyn RestartFn,
+}
+
+impl RestartBlock {
+    pub fn new(restart_fn: &'static dyn RestartFn, data: RestartBlockData) -> Self {
+        Self { data, restart_fn }
+    }
+}
+
+pub trait RestartFn: Debug + Sync + Send + 'static {
+    fn call(&self, data: &mut RestartBlockData) -> Result<usize, SystemError>;
+}
+
+#[derive(Debug, Clone)]
+pub enum RestartBlockData {
+    Poll(PollRestartBlockData),
+    // todo: nanosleep
+    Nanosleep(),
+    // todo: futex_wait
+    FutexWait(),
+}
+
+impl RestartBlockData {
+    pub fn new_poll(pollfd_ptr: VirtAddr, nfds: u32, timeout_instant: Option<Instant>) -> Self {
+        Self::Poll(PollRestartBlockData {
+            pollfd_ptr,
+            nfds,
+            timeout_instant,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PollRestartBlockData {
+    pub pollfd_ptr: VirtAddr,
+    pub nfds: u32,
+    pub timeout_instant: Option<Instant>,
 }

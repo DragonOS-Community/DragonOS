@@ -74,6 +74,8 @@ clean-docs:
 gdb:
 ifeq ($(ARCH), x86_64)
 	rust-gdb -n -x tools/.gdbinit
+else ifeq ($(ARCH), loongarch64)
+	loongarch64-unknown-linux-gnu-gdb -n -x tools/.gdbinit
 else
 	gdb-multiarch -n -x tools/.gdbinit
 endif

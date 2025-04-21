@@ -242,14 +242,15 @@ rustInstall() {
 		rustup target add x86_64-unknown-none --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-linux-musl --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-linux-musl --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
+		rustup target add loongarch64-unknown-none --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add loongarch64-unknown-none --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 
-		rustup toolchain install $RUST_VERSION-riscv64gc-unknown-linux-gnu --force-non-host
-		rustup toolchain install $RUST_VERSION_OLD-riscv64gc-unknown-linux-gnu --force-non-host
-		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION_OLD-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION_OLD-riscv64gc-unknown-linux-gnu
-        
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src
         rustup component add llvm-tools-preview
@@ -265,6 +266,8 @@ install_python_pkg()
 	# 安装文档生成工具
 	sh -c "cd ../docs && pip3 install -r requirements.txt"
 }
+
+
 
 
 ############# 脚本开始 ##############
@@ -339,7 +342,7 @@ cargo install dadk || exit 1
 bashpath=$(cd `dirname $0`; pwd)
 
 # 编译安装musl交叉编译工具链
-$SHELL ${bashpath}/install_musl_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
+$SHELL ${bashpath}/install_cross_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
 # 编译安装grub
 $SHELL ${bashpath}/grub_auto_install.sh || (echo "grub安装失败" && exit 1)
 

@@ -1,6 +1,5 @@
 target/
 src/kernel
-Cargo.lock
 D.config
 
 # 将自动生成的C-Rust FFI加到gitignore

@@ -58,6 +58,8 @@ lazy_static! {
     static ref VC_MANAGER: VirtConsoleManager = VirtConsoleManager::new();
 }
 
+kernel_cmdline_param_kv!(CONSOLE_PARAM, console, "");
+
 /// 获取虚拟终端管理器
 #[inline]
 pub fn vc_manager() -> &'static VirtConsoleManager {
@@ -228,12 +230,29 @@ impl VirtConsoleManager {
     }
 
     pub fn setup_default_vc(&self) {
-        // todo: 从内核启动参数中获取
-        for name in Self::DEFAULT_VC_NAMES.iter() {
-            if let Some(vc) = self.lookup_vc_by_tty_name(name) {
-                log::info!("Set default vc with tty device: {}", name);
+        let mut console_value_str = CONSOLE_PARAM.value_str().unwrap_or("").trim();
+        if !console_value_str.is_empty() {
+            // 删除前缀/dev/
+            console_value_str = console_value_str
+                .strip_prefix("/dev/")
+                .unwrap_or(console_value_str);
+            if let Some(vc) = self.lookup_vc_by_tty_name(console_value_str) {
+                log::info!("Set vc by cmdline: {}", console_value_str);
                 self.set_current_vc(vc);
                 return;
+            } else {
+                panic!(
+                    "virt console: set vc by cmdline failed, name: {}",
+                    console_value_str
+                );
+            }
+        } else {
+            for name in Self::DEFAULT_VC_NAMES.iter() {
+                if let Some(vc) = self.lookup_vc_by_tty_name(name) {
+                    log::info!("Set default vc with tty device: {}", name);
+                    self.set_current_vc(vc);
+                    return;
+                }
             }
         }
 

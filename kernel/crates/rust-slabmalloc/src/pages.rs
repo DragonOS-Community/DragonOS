@@ -1,11 +1,6 @@
-use alloc::boxed::Box;
-
 use crate::*;
-use core::{
-    mem,
-    sync::atomic::{AtomicU64, Ordering},
-};
-
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU64, Ordering};
 /// A trait defining bitfield operations we need for tracking allocated objects within a page.
 pub(crate) trait Bitfield {
     fn initialize(&mut self, for_size: usize, capacity: usize);
@@ -59,9 +54,6 @@ impl Bitfield for [AtomicU64] {
         layout: Layout,
         page_size: usize,
     ) -> Option<(usize, usize)> {
-        let start_offset = get_offset_for_align(layout);
-        let data_start = base_addr + start_offset;
-
         for (base_idx, b) in self.iter().enumerate() {
             let bitval = b.load(Ordering::Relaxed);
             if bitval == u64::MAX {
@@ -79,7 +71,7 @@ impl Bitfield for [AtomicU64] {
                     return None;
                 }
 
-                let addr: usize = data_start + offset;
+                let addr: usize = base_addr + offset;
                 let alignment_ok = addr % layout.align() == 0;
                 let block_is_free = bitval & (1 << first_free) == 0;
                 if alignment_ok && block_is_free {
@@ -157,32 +149,6 @@ impl Bitfield for [AtomicU64] {
     }
 }
 
-/// # get_offset_for_align - 根据布局大小获取page内对齐偏移量
-///
-/// 这个函数根据给定的`Layout`大小确定一个合适的对齐偏移量。
-///
-/// ## 参数
-///
-/// - layout: Layout，这是需要计算对齐偏移量的布局参数。
-///
-/// ## 返回值
-///
-/// - usize: 成功时返回一个usize类型的对齐偏移量。
-fn get_offset_for_align(layout: Layout) -> usize {
-    match layout.size() {
-        0..=8 => 80,
-        9..=16 => 80,
-        17..=32 => 96,
-        33..=64 => 128,
-        65..=128 => 128,
-        129..=256 => 256,
-        257..=512 => 512,
-        513..=1024 => 1024,
-        1025..=2048 => 2048,
-        _ => panic!(),
-    }
-}
-
 /// This trait is used to define a page from which objects are allocated
 /// in an `SCAllocator`.
 ///
@@ -242,8 +208,7 @@ pub trait AllocablePage {
             ptr,
             layout
         );
-        let align_offset = get_offset_for_align(layout);
-        let page_offset = ((ptr.as_ptr() as usize) - align_offset) & (Self::SIZE - 1);
+        let page_offset = (ptr.as_ptr() as usize) & (Self::SIZE - 1);
         assert!(page_offset % layout.size() == 0);
         let idx = page_offset / layout.size();
         assert!(
@@ -282,20 +247,20 @@ pub trait AllocablePage {
 /// It is marked `repr(C)` because we rely on a well defined order of struct
 /// members (e.g., dealloc does a cast to find the bitfield).
 #[repr(C)]
+#[repr(align(4096))]
 pub struct ObjectPage<'a> {
+    /// Holds memory objects.
     #[allow(dead_code)]
-    /// A bit-field to track free/allocated memory within `data`.
-    pub(crate) bitfield: [AtomicU64; 8],
+    data: [u8; OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD],
 
     /// Next element in list (used by `PageList`).
     next: Rawlink<ObjectPage<'a>>,
     /// Previous element in  list (used by `PageList`)
     prev: Rawlink<ObjectPage<'a>>,
 
-    /// Holds memory objects.
-    data: [u8; OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD],
+    /// A bit-field to track free/allocated memory within `data`.
+    pub(crate) bitfield: [AtomicU64; 8],
 }
-
 impl<'a> ObjectPage<'a> {
     pub fn new() -> Box<ObjectPage<'a>> {
         unsafe { Box::new_uninit().assume_init() }
@@ -424,7 +389,6 @@ impl<'a, T: AllocablePage> PageList<'a, T> {
     }
 
     /// Removes `slab_page` from the list.
-    #[allow(clippy::manual_inspect)]
     pub(crate) fn pop<'b>(&'b mut self) -> Option<&'a mut T> {
         match self.head {
             None => None,
@@ -437,6 +401,8 @@ impl<'a, T: AllocablePage> PageList<'a, T> {
                 });
 
                 self.elements -= 1;
+
+                #[allow(clippy::manual_inspect)]
                 new_head.map(|node| {
                     *node.prev() = Rawlink::none();
                     *node.next() = Rawlink::none();
@@ -468,9 +434,9 @@ impl<'a, P: AllocablePage + 'a> Iterator for ObjectPageIterMut<'a, P> {
     type Item = &'a mut P;
 
     #[inline]
-    #[allow(clippy::manual_inspect)]
     fn next(&mut self) -> Option<&'a mut P> {
         unsafe {
+            #[allow(clippy::manual_inspect)]
             self.head.resolve_mut().map(|next| {
                 self.head = match next.next().resolve_mut() {
                     None => Rawlink::none(),

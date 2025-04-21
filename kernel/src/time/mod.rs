@@ -86,7 +86,7 @@ impl PosixTimeSpec {
             }
         }
 
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
         {
             return PosixTimeSpec::new(0, 0);
         }
@@ -269,6 +269,41 @@ impl Instant {
     /// the beginning of time.
     pub const fn total_micros(&self) -> i64 {
         self.micros
+    }
+
+    /// Returns the duration between this instant and another one.
+    ///
+    /// # Arguments
+    ///
+    /// * `earlier` - The earlier instant to calculate the duration since.
+    ///
+    /// # Returns
+    ///
+    /// An `Option<Duration>` representing the duration between this instant and the earlier one.
+    /// If the earlier instant is later than this one, it returns `None`.
+    pub fn duration_since(&self, earlier: Instant) -> Option<Duration> {
+        if earlier.micros > self.micros {
+            return None;
+        }
+        let micros_diff = self.micros - earlier.micros;
+        Some(Duration::from_micros(micros_diff as u64))
+    }
+
+    /// Saturating subtraction. Computes `self - other`, returning [`Instant::ZERO`] if the result would be negative.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The `Instant` to subtract from `self`.
+    ///
+    /// # Returns
+    ///
+    /// The duration between `self` and `other`, or [`Instant::ZERO`] if `other` is later than `self`.
+    pub fn saturating_sub(self, other: Instant) -> Duration {
+        if self.micros >= other.micros {
+            Duration::from_micros((self.micros - other.micros) as u64)
+        } else {
+            Duration::ZERO
+        }
     }
 }
 

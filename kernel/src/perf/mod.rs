@@ -6,7 +6,7 @@ use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
-    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, SuperBlock,
+    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
 };
 use crate::include::bindings::linux_bpf::{
     perf_event_attr, perf_event_sample_format, perf_sw_ids, perf_type_id,
@@ -15,7 +15,7 @@ use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
-use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll, KernelIoctlData};
+use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll};
 use crate::perf::bpf::BpfPerfEvent;
 use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs};
 use crate::process::ProcessManager;
@@ -24,7 +24,7 @@ use crate::syscall::Syscall;
 use alloc::boxed::Box;
 use alloc::collections::LinkedList;
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::ffi::c_void;
@@ -66,21 +66,6 @@ impl PerfEventInode {
             event,
             epitems: SpinLock::new(LinkedList::new()),
         }
-    }
-    pub fn remove_epoll(
-        &self,
-        epoll: &Weak<SpinLock<EventPoll>>,
-    ) -> core::result::Result<(), SystemError> {
-        let is_remove = !self
-            .epitems
-            .lock_irqsave()
-            .extract_if(|x| x.epoll().ptr_eq(epoll))
-            .collect::<Vec<_>>()
-            .is_empty();
-        if is_remove {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
     }
     fn do_poll(&self) -> Result<usize> {
         let mut events = EPollEventType::empty();
@@ -134,10 +119,6 @@ impl IndexNode for PerfEventInode {
         panic!("write_at not implemented for PerfEvent");
     }
 
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize> {
-        self.do_poll()
-    }
-
     fn metadata(&self) -> Result<Metadata> {
         let meta = Metadata {
             mode: ModeType::from_bits_truncate(0o755),
@@ -177,31 +158,50 @@ impl IndexNode for PerfEventInode {
         }
     }
 
-    fn kernel_ioctl(
-        &self,
-        arg: Arc<dyn KernelIoctlData>,
-        _data: &FilePrivateData,
-    ) -> core::result::Result<usize, SystemError> {
-        let epitem = arg
-            .arc_any()
-            .downcast::<EPollItem>()
-            .map_err(|_| SystemError::EFAULT)?;
-        self.epitems.lock().push_back(epitem);
-        Ok(0)
-    }
-
     fn fs(&self) -> Arc<dyn FileSystem> {
         // panic!("PerfEvent does not have a filesystem")
         Arc::new(PerfFakeFs)
     }
+
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
+
     fn list(&self) -> Result<Vec<String>> {
         Err(SystemError::ENOSYS)
     }
+
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         self.event.page_cache()
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode> {
+        Ok(self)
+    }
+}
+
+impl PollableInode for PerfEventInode {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize> {
+        self.do_poll()
+    }
+
+    fn add_epitem(&self, epitem: Arc<EPollItem>, _private_data: &FilePrivateData) -> Result<()> {
+        self.epitems.lock().push_back(epitem);
+        Ok(())
+    }
+
+    fn remove_epitem(
+        &self,
+        epitem: &Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<()> {
+        let mut guard = self.epitems.lock();
+        let len = guard.len();
+        guard.retain(|x| !Arc::ptr_eq(x, epitem));
+        if len != guard.len() {
+            return Ok(());
+        }
+        Err(SystemError::ENOENT)
     }
 }
 

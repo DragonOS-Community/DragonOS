@@ -35,6 +35,10 @@ impl SlabAllocator {
             Ok(nptr) => nptr.as_ptr(),
             Err(AllocationError::OutOfMemory) => {
                 let boxed_page = ObjectPage::new();
+                assert_eq!(
+                    (boxed_page.as_ref() as *const ObjectPage as usize) & (MMArch::PAGE_SIZE - 1),
+                    0
+                );
                 let leaked_page = Box::leak(boxed_page);
                 self.zone
                     .refill(layout, leaked_page)
@@ -70,11 +74,6 @@ pub unsafe fn slab_init() {
     debug!("trying to init a slab_allocator");
     SLABALLOCATOR = Some(SlabAllocator::new());
     SLABINITSTATE = true.into();
-}
-
-// 查看slab初始化状态
-pub fn slab_init_state() -> bool {
-    unsafe { *SLABINITSTATE.get_mut() }
 }
 
 pub unsafe fn slab_usage() -> SlabUsage {

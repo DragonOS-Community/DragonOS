@@ -1,7 +1,6 @@
 use core::{any::Any, fmt::Debug};
 
 use alloc::{
-    collections::LinkedList,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -16,7 +15,7 @@ use crate::{
     driver::{
         base::{
             block::{
-                block_device::{BlockDevName, BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
+                block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
                 disk_info::Partition,
                 manager::{block_dev_manager, BlockDevMeta},
             },
@@ -24,7 +23,7 @@ use crate::{
             device::{
                 bus::Bus,
                 driver::{Driver, DriverCommonData},
-                Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
+                DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
@@ -103,7 +102,7 @@ pub struct VirtIOBlkManager {
 
 struct InnerVirtIOBlkManager {
     id_bmp: bitmap::StaticBitmap<{ VirtIOBlkManager::MAX_DEVICES }>,
-    devname: [Option<BlockDevName>; VirtIOBlkManager::MAX_DEVICES],
+    devname: [Option<DevName>; VirtIOBlkManager::MAX_DEVICES],
 }
 
 impl VirtIOBlkManager {
@@ -122,7 +121,7 @@ impl VirtIOBlkManager {
         self.inner.lock()
     }
 
-    pub fn alloc_id(&self) -> Option<BlockDevName> {
+    pub fn alloc_id(&self) -> Option<DevName> {
         let mut inner = self.inner();
         let idx = inner.id_bmp.first_false_index()?;
         inner.id_bmp.set(idx, true);
@@ -132,9 +131,9 @@ impl VirtIOBlkManager {
     }
 
     /// Generate a new block device name like 'vda', 'vdb', etc.
-    fn format_name(id: usize) -> BlockDevName {
+    fn format_name(id: usize) -> DevName {
         let x = (b'a' + id as u8) as char;
-        BlockDevName::new(format!("vd{}", x), id)
+        DevName::new(format!("vd{}", x), id)
     }
 
     #[allow(dead_code)]
@@ -204,7 +203,7 @@ impl VirtIOBlkDevice {
 }
 
 impl BlockDevice for VirtIOBlkDevice {
-    fn dev_name(&self) -> &BlockDevName {
+    fn dev_name(&self) -> &DevName {
         &self.blkdev_meta.devname
     }
 
@@ -349,7 +348,7 @@ impl VirtIODevice for VirtIOBlkDevice {
 
 impl Device for VirtIOBlkDevice {
     fn dev_type(&self) -> DeviceType {
-        DeviceType::Net
+        DeviceType::Block
     }
 
     fn id_table(&self) -> IdTable {
@@ -479,7 +478,7 @@ fn virtio_blk_driver_init() -> Result<(), SystemError> {
     let driver = VirtIOBlkDriver::new();
     virtio_driver_manager()
         .register(driver.clone() as Arc<dyn VirtIODriver>)
-        .expect("Add virtio net driver failed");
+        .expect("Add virtio blk driver failed");
     unsafe {
         VIRTIO_BLK_DRIVER = Some(driver);
     }
@@ -546,12 +545,12 @@ impl VirtIODriver for VirtIOBlkDriver {
         return Ok(());
     }
 
-    fn virtio_id_table(&self) -> LinkedList<crate::driver::virtio::VirtioDeviceId> {
+    fn virtio_id_table(&self) -> Vec<crate::driver::virtio::VirtioDeviceId> {
         self.inner().virtio_driver_common.id_table.clone()
     }
 
     fn add_virtio_id(&self, id: VirtioDeviceId) {
-        self.inner().virtio_driver_common.id_table.push_back(id);
+        self.inner().virtio_driver_common.id_table.push(id);
     }
 }
 

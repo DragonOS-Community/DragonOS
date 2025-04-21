@@ -11,14 +11,14 @@ jobs:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.8
+    container: dragonos/dragonos-dev:v1.11
 
     strategy:
       matrix:
-        arch: [x86_64, riscv64]
+        arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.8"
+      - run: echo "Running in dragonos/dragonos-dev:v1.11"
       - uses: actions/checkout@v3
 
       - name: Format check
@@ -35,14 +35,14 @@ jobs:
     name: Kernel static test ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.8
+    container: dragonos/dragonos-dev:v1.11
 
     strategy:
       matrix:
-        arch: [x86_64, riscv64]
+        arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.8"
+      - run: echo "Running in dragonos/dragonos-dev:v1.11"
 
       - uses: actions/checkout@v3
 
@@ -53,46 +53,41 @@ jobs:
           HOME: /root
         run: bash -c "source /root/.cargo/env && cd kernel && make test && make test-rbpf"
 
-  build-x86_64:
+  build:
+    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.8
+    container: dragonos/dragonos-dev:v1.11
+    continue-on-error: true
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            make_target: all
+            checkout_params: {}
+          - arch: riscv64
+            make_target: all
+            checkout_params:
+              submodules: "recursive"
+          - arch: loongarch64
+            make_target: all
+            checkout_params: {}
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.8"
-
+      - run: echo "Running in dragonos/dragonos-dev:v1.11"
+      
       - uses: actions/checkout@v3
-      - name: build the DragonOS
+        with: ${{ matrix.checkout_params }}
+
+      - name: Build the DragonOS
         env:
-          ARCH: x86_64
+          ARCH: ${{ matrix.arch }}
           HOME: /root
         shell: bash -ileo pipefail {0}
-
         run: |
-          source ~/.bashrc
-          source ~/.cargo/env
-          export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
+          source $HOME/.bashrc
+          source $HOME/.cargo/env
+          if [[ "$ARCH" == "x86_64" ]]; then
+            export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
+          fi
           sed -i 's/arch = ".*"/arch = "${{ env.ARCH }}"/' dadk-manifest.toml
-
-          make all -j $(nproc)
-
-  build-riscv64:
-    runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.8
-
-    steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.8"
-
-      - uses: actions/checkout@v3
-        with:
-          submodules: "recursive"
-
-      - name: build the DragonOS
-        shell: bash -ileo pipefail {0}
-        env:
-          ARCH: riscv64
-          HOME: /root
-
-        run: |
-          source ~/.bashrc && source ~/.cargo/env
-          sed -i 's/arch = ".*"/arch = "${{ env.ARCH }}"/' dadk-manifest.toml
-          make kernel -j $(nproc)
+          make ${{ matrix.make_target }} -j $(nproc)

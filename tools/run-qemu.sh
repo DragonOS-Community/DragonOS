@@ -6,6 +6,16 @@ check_dependencies()
         exit 1
     fi
 
+    if [ -z "$(which ${QEMU})" ]; then
+      if [ "$ARCH" == "loongarch64" ]; then
+        echo -e "\nPlease install qemu-system-loongarch64 first!"
+        echo -e "\nYou can install it by running:  (if you are using ubuntu)"
+        echo -e "    ${ROOT_PATH}/tools/qemu/build-qemu-la64-for-ubuntu.sh"
+        echo -e ""
+        exit 1
+      fi
+    fi
+
     # Check if brctl is installed
     if [ -z "$(which brctl)" ]; then
         echo "Please install bridge-utils first!"
@@ -26,7 +36,6 @@ check_dependencies()
 
 }
 
-check_dependencies
 
 # 进行启动前检查
 flag_can_run=1
@@ -38,6 +47,8 @@ allflags=
 # 设置ARCH环境变量，如果没有设置，就默认为x86_64
 export ARCH=${ARCH:=x86_64}
 echo "ARCH=${ARCH}"
+
+
 #ARCH="i386"
 # 请根据自己的需要，在-d 后方加入所需的 trace 事件
 
@@ -67,7 +78,7 @@ RISCV64_UBOOT_PATH="arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
 
 DISK_NAME="disk-image-${ARCH}.img"
 
-QEMU=qemu-system-${ARCH}
+QEMU=$(which qemu-system-${ARCH})
 QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
 QEMU_MEMORY="512M"
 QEMU_MEMORY_BACKEND="dragonos-qemu-shm.ram"
@@ -82,11 +93,21 @@ QEMU_SERIAL_LOG_FILE="../serial_opt.txt"
 QEMU_SERIAL="-serial file:${QEMU_SERIAL_LOG_FILE}"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
-QEMU_ARGUMENT=""
+QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
+
+
+check_dependencies
+
+# 设置无图形界面模式
+QEMU_NOGRAPHIC=false
+
+KERNEL_CMDLINE=" "
+
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
-VIRTIO_BLK_DEVICE=false
+VIRTIO_BLK_DEVICE=true
+
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
     QEMU_ACCELARATE=" -machine accel=${qemu_accel} "
@@ -105,23 +126,25 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
       QEMU_DEVICES_DISK="-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
     fi
 
-else
+elif [ ${ARCH} == "riscv64" ]; then
     QEMU_MACHINE=" -machine virt,memory-backend=${QEMU_MEMORY_BACKEND} -cpu sifive-u54 "
     QEMU_DEVICES_DISK="-device virtio-blk-device,drive=disk "
-
+elif [ ${ARCH} == "loongarch64" ]; then
+    QEMU_MACHINE=" -machine virt"
+    QEMU_DEVICES_DISK="-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
+else
+    echo "Unsupported architecture: ${ARCH}"
+    exit 1
 fi
 
 if [ ${ARCH} == "riscv64" ]; then
 # 如果是riscv64架构，就不需要图形界面
-    QEMU_ARGUMENT+=" --nographic "
-    # 从控制台显示
-    QEMU_MONITOR=""
-    QEMU_SERIAL=""
+    QEMU_NOGRAPHIC=true
 fi
 
 while true;do
     case "$1" in
-        --bios) 
+        --bios)
         case "$2" in
               uefi) #uefi启动新增ovmf.fd固件
               BIOS_TYPE=uefi
@@ -138,17 +161,47 @@ while true;do
               window)
               ;;
               nographic)
-              QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
-              QEMU_MONITOR=""
-              QEMU_ARGUMENT+=" --nographic "
-              QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+              QEMU_NOGRAPHIC=true
 
               ;;
         esac;shift 2;;
         *) break
-      esac 
+      esac
   done
 
+if [ ${QEMU_NOGRAPHIC} == true ]; then
+    QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
+
+    # 添加 virtio console 设备
+    if [ ${ARCH} == "x86_64" ]; then
+      QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
+    elif [ ${ARCH} == "loongarch64" ]; then
+      QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
+    elif [ ${ARCH} == "riscv64" ]; then
+      QEMU_DEVICES+=" -device virtio-serial-device -device virtconsole,chardev=mux "
+    fi
+
+    KERNEL_CMDLINE+=" console=/dev/hvc0 "
+    QEMU_MONITOR=""
+    QEMU_ARGUMENT+=" --nographic "
+
+    if [ ${ARCH} == "x86_64" ]; then
+      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+    elif [ ${ARCH} == "loongarch64" ]; then
+      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+    fi
+fi
+
+setup_kernel_init_program() {
+    if [ ${ARCH} == "x86_64" ]; then
+        KERNEL_CMDLINE+=" init=/bin/dragonreach "
+    elif [ ${ARCH} == "riscv64" ]; then
+        KERNEL_CMDLINE+=" init=/bin/riscv_rust_init "
+    fi
+}
+
+# 设置内核init程序
+setup_kernel_init_program
 
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 "
@@ -156,12 +209,15 @@ QEMU_DEVICES+="${QEMU_DEVICES_DISK} "
 QEMU_DEVICES+=" -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 # E1000E
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
+
+
 QEMU_ARGUMENT+="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d ${QEMU_MONITOR} -d ${qemu_trace_std} "
 
 QEMU_ARGUMENT+="-s ${QEMU_MACHINE} ${QEMU_CPU_FEATURES} ${QEMU_RTC_CLOCK} ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES} "
 QEMU_ARGUMENT+=" ${QEMU_SHM_OBJECT} "
 QEMU_ARGUMENT+=" ${QEMU_ACCELARATE} "
 
+QEMU_ARGUMENT+=" -D ../qemu.log "
 
 
 # 安装riscv64的uboot
@@ -212,7 +268,9 @@ else
   elif [ ${ARCH} == riscv64 ] ;then
     # 如果是riscv64架构，就与efi启动一样
     install_riscv_uboot
-    sudo ${QEMU} -kernel ${RISCV64_UBOOT_PATH}/u-boot.bin ${QEMU_ARGUMENT}
+    sudo ${QEMU} -kernel ${RISCV64_UBOOT_PATH}/u-boot.bin ${QEMU_ARGUMENT} -append "${KERNEL_CMDLINE}"
+  elif [ ${ARCH} == loongarch64 ] ;then
+    sudo ${QEMU} ${QEMU_ARGUMENT}
   else
     echo "不支持的架构: ${ARCH}"
   fi

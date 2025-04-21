@@ -31,7 +31,10 @@ use crate::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
     },
-    ipc::signal_types::{SigInfo, SigPending, SignalStruct},
+    ipc::{
+        signal::RestartBlock,
+        signal_types::{SigInfo, SigPending, SignalStruct},
+    },
     libs::{
         align::AlignedBox,
         casting::DowncastArc,
@@ -68,7 +71,6 @@ use timer::AlarmTimer;
 use self::{cred::Cred, kthread::WorkerPrivate};
 
 pub mod abi;
-pub mod c_adapter;
 pub mod cred;
 pub mod exec;
 pub mod exit;
@@ -712,6 +714,8 @@ pub struct ProcessControlBlock {
     /// 进程作为主体的凭证集
     cred: SpinLock<Cred>,
     self_ref: Weak<ProcessControlBlock>,
+
+    restart_block: SpinLock<Option<RestartBlock>>,
 }
 
 impl ProcessControlBlock {
@@ -799,6 +803,7 @@ impl ProcessControlBlock {
             nsproxy: Arc::new(RwLock::new(NsProxy::new())),
             cred: SpinLock::new(cred),
             self_ref: Weak::new(),
+            restart_block: SpinLock::new(None),
         };
 
         pcb.sig_info.write().set_tty(tty);
@@ -1065,6 +1070,24 @@ impl ProcessControlBlock {
         self.flags.get().contains(ProcessFlags::HAS_PENDING_SIGNAL)
     }
 
+    /// 检查当前进程是否有未被阻塞的待处理信号。
+    ///
+    /// 注：该函数较慢，因此需要与 has_pending_signal_fast 一起使用。
+    pub fn has_pending_not_masked_signal(&self) -> bool {
+        let sig_info = self.sig_info_irqsave();
+        let blocked: SigSet = *sig_info.sig_blocked();
+        let mut pending: SigSet = sig_info.sig_pending().signal();
+        drop(sig_info);
+        pending.remove(blocked);
+        // log::debug!(
+        //     "pending and not masked:{:?}, masked: {:?}",
+        //     pending,
+        //     blocked
+        // );
+        let has_not_masked = !pending.is_empty();
+        return has_not_masked;
+    }
+
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
     }
@@ -1116,6 +1139,18 @@ impl ProcessControlBlock {
 
     pub fn threads_read_irqsave(&self) -> RwLockReadGuard<ThreadInfo> {
         self.thread.read_irqsave()
+    }
+
+    pub fn restart_block(&self) -> SpinLockGuard<Option<RestartBlock>> {
+        self.restart_block.lock()
+    }
+
+    pub fn set_restart_fn(
+        &self,
+        restart_block: Option<RestartBlock>,
+    ) -> Result<usize, SystemError> {
+        *self.restart_block.lock() = restart_block;
+        return Err(SystemError::ERESTART_RESTARTBLOCK);
     }
 }
 
@@ -1596,6 +1631,7 @@ pub fn process_init() {
 pub struct ProcessSignalInfo {
     // 当前进程被屏蔽的信号
     sig_blocked: SigSet,
+    // 暂存旧信号，用于恢复
     saved_sigmask: SigSet,
     // sig_pending 中存储当前线程要处理的信号
     sig_pending: SigPending,

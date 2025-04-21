@@ -1,8 +1,5 @@
 use crate::{
-    driver::{
-        serial::serial8250::send_to_default_serial8250_port, tty::virtual_terminal::vc_manager,
-        video::video_refresh_manager,
-    },
+    driver::{serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager},
     libs::{
         lib_ui::font::FONT_8x16,
         rwlock::RwLock,
@@ -1014,69 +1011,6 @@ where
 {
     fn index(&self, c: char) -> usize {
         self(c)
-    }
-}
-
-/// 在默认窗口上输出一个字符
-/// ## 参数
-/// - character 字符
-/// - FRcolor 前景色（RGB）
-/// - BKcolor 背景色（RGB）
-#[no_mangle]
-pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32) -> i32 {
-    if let Some(current_vc) = vc_manager().current_vc() {
-        // tty已经初始化了之后才输出到屏幕
-        let fr = (fr_color & 0x00ff0000) >> 16;
-        let fg = (fr_color & 0x0000ff00) >> 8;
-        let fb = fr_color & 0x000000ff;
-        let br = (bk_color & 0x00ff0000) >> 16;
-        let bg = (bk_color & 0x0000ff00) >> 8;
-        let bb = bk_color & 0x000000ff;
-        let buf = format!(
-            "\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{}\x1B[0m",
-            character as char
-        );
-        let port = current_vc.port();
-        let tty = port.port_data().internal_tty();
-        if let Some(tty) = tty {
-            return tty
-                .write_to_core(buf.as_bytes(), buf.len())
-                .map(|_| 0)
-                .unwrap_or_else(|e| e.to_posix_errno());
-        }
-    }
-    return textui_putchar(
-        character as char,
-        FontColor::from(fr_color),
-        FontColor::from(bk_color),
-    )
-    .map(|_| 0)
-    .unwrap_or_else(|e| e.to_posix_errno());
-}
-
-pub fn textui_putchar(
-    character: char,
-    fr_color: FontColor,
-    bk_color: FontColor,
-) -> Result<(), SystemError> {
-    if unsafe { TEXTUI_IS_INIT } {
-        return textui_framework()
-            .current_window
-            .lock_irqsave()
-            .textui_putchar_window(
-                character,
-                fr_color,
-                bk_color,
-                textui_is_enable_put_to_window(),
-            );
-    } else {
-        //未初始化暴力输出
-        return no_init_textui_putchar_window(
-            character,
-            fr_color,
-            bk_color,
-            textui_is_enable_put_to_window(),
-        );
     }
 }
 

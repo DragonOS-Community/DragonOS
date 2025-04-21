@@ -110,8 +110,3 @@ pub fn jiffies_init() {
         }
     };
 }
-
-#[no_mangle]
-pub extern "C" fn rs_jiffies_init() {
-    jiffies_init();
-}

@@ -68,6 +68,16 @@ SECTIONS
 
 	. = ALIGN(32768);
 
+	trace_point_start_pa = .;
+	.tracepoint (trace_point_start_pa): AT(trace_point_start_pa - KERNEL_VMA)
+    {
+        _tracepoint = .;
+        *(.tracepoint)
+        *(.tracepoint.*)
+        _etracepoint = .;
+    }
+    . = ALIGN(32768);
+
 	init_proc_union_start_pa = .;
 	.data.init_proc_union (init_proc_union_start_pa): AT(init_proc_union_start_pa - KERNEL_VMA)
 	 { *(.data.init_proc_union) }

@@ -75,7 +75,7 @@ lru = "0.12.3"
 rbpf = { path = "crates/rbpf" }
 printf-compat = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat", rev = "5f5c9cc363", default-features = false }
 
-static-keys = "=0.6.1"
+static-keys = { version = "=0.7" }
 
 defer = "0.2.1"
 cfg-if = { version = "1.0.0" }

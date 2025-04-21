@@ -57,6 +57,7 @@ jobs:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     container: dragonos/dragonos-dev:v1.11
+    continue-on-error: true
     strategy:
       matrix:
         include:

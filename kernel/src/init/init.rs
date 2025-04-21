@@ -103,6 +103,7 @@ fn do_start_kernel() {
 #[inline(never)]
 fn init_before_mem_init() {
     serial_early_init().expect("serial early init failed");
+
     let video_ok = unsafe { VideoRefreshManager::video_init().is_ok() };
     scm_init(video_ok);
 

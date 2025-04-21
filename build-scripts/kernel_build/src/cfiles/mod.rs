@@ -20,6 +20,9 @@ impl CFilesBuilder {
         Self::setup_defines(&mut c);
         Self::setup_global_include_dir(&mut c);
         Self::setup_files(&mut c);
+        if c.get_files().count() == 0 {
+            return;
+        }
         c.compile("dragonos_kernel_cfiles");
     }
 

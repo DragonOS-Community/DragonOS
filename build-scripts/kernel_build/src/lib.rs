@@ -3,6 +3,7 @@ extern crate lazy_static;
 extern crate cc;
 
 mod cfiles;
+mod constant;
 mod kconfig;
 mod utils;
 

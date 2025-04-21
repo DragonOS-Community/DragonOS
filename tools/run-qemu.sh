@@ -6,6 +6,16 @@ check_dependencies()
         exit 1
     fi
 
+    if [ -z "$(which ${QEMU})" ]; then
+      if [ "$ARCH" == "loongarch64" ]; then
+        echo -e "\nPlease install qemu-system-loongarch64 first!"
+        echo -e "\nYou can install it by running:  (if you are using ubuntu)"
+        echo -e "    ${ROOT_PATH}/tools/qemu/build-qemu-la64-for-ubuntu.sh"
+        echo -e ""
+        exit 1
+      fi
+    fi
+
     # Check if brctl is installed
     if [ -z "$(which brctl)" ]; then
         echo "Please install bridge-utils first!"
@@ -26,7 +36,6 @@ check_dependencies()
 
 }
 
-check_dependencies
 
 # 进行启动前检查
 flag_can_run=1
@@ -38,6 +47,8 @@ allflags=
 # 设置ARCH环境变量，如果没有设置，就默认为x86_64
 export ARCH=${ARCH:=x86_64}
 echo "ARCH=${ARCH}"
+
+
 #ARCH="i386"
 # 请根据自己的需要，在-d 后方加入所需的 trace 事件
 
@@ -67,7 +78,7 @@ RISCV64_UBOOT_PATH="arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
 
 DISK_NAME="disk-image-${ARCH}.img"
 
-QEMU=qemu-system-${ARCH}
+QEMU=$(which qemu-system-${ARCH})
 QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
 QEMU_MEMORY="512M"
 QEMU_MEMORY_BACKEND="dragonos-qemu-shm.ram"
@@ -85,6 +96,9 @@ QEMU_ACCELARATE=""
 QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
 
+
+check_dependencies
+
 # 设置无图形界面模式
 QEMU_NOGRAPHIC=false
 
@@ -93,6 +107,7 @@ KERNEL_CMDLINE=" "
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
 VIRTIO_BLK_DEVICE=true
+
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
     QEMU_ACCELARATE=" -machine accel=${qemu_accel} "
@@ -111,10 +126,15 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
       QEMU_DEVICES_DISK="-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
     fi
 
-else
+elif [ ${ARCH} == "riscv64" ]; then
     QEMU_MACHINE=" -machine virt,memory-backend=${QEMU_MEMORY_BACKEND} -cpu sifive-u54 "
     QEMU_DEVICES_DISK="-device virtio-blk-device,drive=disk "
-
+elif [ ${ARCH} == "loongarch64" ]; then
+    QEMU_MACHINE=" -machine virt"
+    QEMU_DEVICES_DISK="-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
+else
+    echo "Unsupported architecture: ${ARCH}"
+    exit 1
 fi
 
 if [ ${ARCH} == "riscv64" ]; then
@@ -153,7 +173,9 @@ if [ ${QEMU_NOGRAPHIC} == true ]; then
     QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
 
     # 添加 virtio console 设备
-    if [${ARCH} == "x86_64" ]; then
+    if [ ${ARCH} == "x86_64" ]; then
+      QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
+    elif [ ${ARCH} == "loongarch64" ]; then
       QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
     elif [ ${ARCH} == "riscv64" ]; then
       QEMU_DEVICES+=" -device virtio-serial-device -device virtconsole,chardev=mux "
@@ -164,7 +186,9 @@ if [ ${QEMU_NOGRAPHIC} == true ]; then
     QEMU_ARGUMENT+=" --nographic "
 
     if [ ${ARCH} == "x86_64" ]; then
-    QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+    elif [ ${ARCH} == "loongarch64" ]; then
+      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
     fi
 fi
 
@@ -245,6 +269,8 @@ else
     # 如果是riscv64架构，就与efi启动一样
     install_riscv_uboot
     sudo ${QEMU} -kernel ${RISCV64_UBOOT_PATH}/u-boot.bin ${QEMU_ARGUMENT} -append "${KERNEL_CMDLINE}"
+  elif [ ${ARCH} == loongarch64 ] ;then
+    sudo ${QEMU} ${QEMU_ARGUMENT}
   else
     echo "不支持的架构: ${ARCH}"
   fi

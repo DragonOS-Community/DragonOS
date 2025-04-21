@@ -77,6 +77,7 @@ impl KprobeBuilder {
         };
         let inst_tmp_ptr = point.inst_tmp.as_ptr() as usize;
         let inst_32 = unsafe { core::ptr::read(address as *const u32) };
+
         unsafe {
             core::ptr::write(address as *mut u32, EBREAK_INST);
             // inst_32 :0-32
@@ -90,6 +91,7 @@ impl KprobeBuilder {
             self.symbol,
             inst_32
         );
+        Arc::new(point)
     }
 }
 

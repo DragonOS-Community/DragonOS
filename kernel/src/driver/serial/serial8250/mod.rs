@@ -43,6 +43,9 @@ use super::{uart_manager, UartDriver, UartManager, UartPort, TTY_SERIAL_DEFAULT_
 #[cfg(target_arch = "x86_64")]
 mod serial8250_pio;
 
+#[cfg(target_arch = "loongarch64")]
+mod serial8250_la64;
+
 static mut SERIAL8250_ISA_DEVICES: Option<Arc<Serial8250ISADevices>> = None;
 static mut SERIAL8250_ISA_DRIVER: Option<Arc<Serial8250ISADriver>> = None;
 
@@ -75,8 +78,11 @@ impl Serial8250Manager {
     /// 初始化串口设备（在内存管理初始化之前）
     pub fn early_init(&self) -> Result<(), SystemError> {
         // todo: riscv64: 串口设备初始化
-        #[cfg(not(target_arch = "riscv64"))]
+        #[cfg(target_arch = "x86_64")]
         serial8250_pio_port_early_init()?;
+
+        #[cfg(target_arch = "loongarch64")]
+        serial8250_la64::early_la64_seria8250_init()?;
         return Ok(());
     }
 
@@ -127,7 +133,7 @@ impl Serial8250Manager {
         return Ok(());
     }
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     fn serial_tty_init(&self) -> Result<(), SystemError> {
         Ok(())
     }
@@ -563,5 +569,10 @@ pub fn send_to_default_serial8250_port(s: &[u8]) {
     #[cfg(target_arch = "riscv64")]
     {
         crate::arch::driver::sbi::console_putstr(s);
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    {
+        serial8250_la64::send_to_default_serial8250_la64_port(s);
     }
 }

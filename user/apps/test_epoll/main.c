@@ -99,18 +99,18 @@ int main() {
   }
 
   // 处理就绪事件
-  //   for (int i = 0; i < nfds; i++) {
-  //     if (events[i].data.fd == efd || events[i].data.fd == efd2) {
-  //       uint64_t count;
-  //       int fd = events[i].data.fd;
-  //       printf("主线程：事件发生在 fd = %d\n", fd);
-  //       if (read(fd, &count, sizeof(count)) != sizeof(count)) {
-  //         perror("从 eventfd 读取失败");
-  //         exit(EXIT_FAILURE);
-  //       }
-  //       printf("主线程：接收到 eventfd 事件，计数值 = %lu\n", count);
-  //     }
-  //   }
+  for (int i = 0; i < nfds; i++) {
+    if (events[i].data.fd == efd || events[i].data.fd == efd2) {
+      uint64_t count;
+      int fd = events[i].data.fd;
+      printf("主线程：事件发生在 fd = %d\n", fd);
+      if (read(fd, &count, sizeof(count)) != sizeof(count)) {
+        perror("从 eventfd 读取失败");
+        exit(EXIT_FAILURE);
+      }
+      printf("主线程：接收到 eventfd 事件，计数值 = %lu\n", count);
+    }
+  }
 
   // 等待工作线程结束
   pthread_join(tid, NULL);

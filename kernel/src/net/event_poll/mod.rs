@@ -479,7 +479,7 @@ impl EventPoll {
                 }
             } else if timespec.is_none() {
                 // 非阻塞情况
-                timeout = true;
+                timeout = false;
             }
             // 判断epoll上有没有就绪事件
             let mut available = epoll_guard.ep_events_available();

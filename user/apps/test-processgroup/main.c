@@ -4,6 +4,20 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#define TEST_ASSERT(left, right, success_msg, fail_msg)                        \
+    do {                                                                       \
+        if ((left) == (right)) {                                               \
+            printf("[PASS] %s\n", success_msg);                                \
+        } else {                                                               \
+            printf("[FAIL] %s: Expected 0x%lx, but got 0x%lx\n",               \
+                   fail_msg,                                                   \
+                   (unsigned long)(right),                                     \
+                   (unsigned long)(left));                                     \
+        }                                                                      \
+    } while (0)
+
+
+
 // 打印进程信息
 void print_ids(const char *name) {
     printf("[%s] PID=%d, PPID=%d, PGID=%d, SID=%d\n",
@@ -31,6 +45,11 @@ int main() {
         }
 
         print_ids("Child1 (after setpgid)");
+
+        // Assert: PGID 应该等于 PID
+        // assert(getpgid(0) == getpid());
+        TEST_ASSERT(getpgid(0), getpid(), "Successfully set child1 as processgroup leader", "Child1 PGID check failed");
+
         sleep(2);  // 保持运行，便于观察
         exit(EXIT_SUCCESS);
     }
@@ -48,6 +67,11 @@ int main() {
         }
 
         print_ids("Child2 (after setpgid)");
+
+        // Assert: PGID 应该等于 child1 的 PID
+        // assert(getpgid(0) == child1);
+        TEST_ASSERT(getpgid(0),child1,"Child2 PGID is equal to Child1","Child2 PGID check failed");
+
         sleep(2);  // 保持运行，便于观察
         exit(EXIT_SUCCESS);
     }

@@ -778,8 +778,9 @@ impl EventPoll {
         pollflags: Option<EPollEventType>,
     ) -> Result<(), SystemError> {
         let mut epitems_guard = epitems.try_lock_irqsave()?;
-        // 一次只取一个，因为一次也只有一个进程能拿到对应文件的🔓
-        if let Some(epitem) = epitems_guard.pop_front() {
+        let epitems = epitems_guard.clone();
+        epitems_guard.clear();
+        for epitem in epitems {
             let pollflags = match pollflags {
                 Some(flags) => flags,
                 None => {

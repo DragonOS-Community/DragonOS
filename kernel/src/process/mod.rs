@@ -16,6 +16,8 @@ use alloc::{
 use cred::INIT_CRED;
 use hashbrown::HashMap;
 use log::{debug, error, info, warn};
+use process_group::{Pgid, ProcessGroup, ALL_PROCESS_GROUP};
+use session::{Session, Sid, ALL_SESSION};
 use system_error::SystemError;
 
 use crate::{
@@ -43,6 +45,7 @@ use crate::{
             futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
+        mutex::Mutex,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
@@ -78,7 +81,9 @@ pub mod fork;
 pub mod idle;
 pub mod kthread;
 pub mod pid;
+pub mod process_group;
 pub mod resource;
+pub mod session;
 pub mod stdio;
 pub mod syscall;
 pub mod timer;
@@ -131,6 +136,8 @@ impl ProcessManager {
         };
 
         ALL_PROCESS.lock_irqsave().replace(HashMap::new());
+        ALL_PROCESS_GROUP.lock_irqsave().replace(HashMap::new());
+        ALL_SESSION.lock_irqsave().replace(HashMap::new());
         Self::init_switch_result();
         Self::arch_init();
         debug!("process arch init done.");
@@ -223,6 +230,15 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.pid(), pcb.clone());
+    }
+
+    /// ### 获取所有进程的pid
+    pub fn get_all_processes() -> Vec<Pid> {
+        let mut pids = Vec::new();
+        for (pid, _) in ALL_PROCESS.lock_irqsave().as_ref().unwrap().iter() {
+            pids.push(*pid);
+        }
+        pids
     }
 
     /// 唤醒一个进程
@@ -370,7 +386,7 @@ impl ProcessManager {
                 return;
             }
             let parent_pcb = r.unwrap();
-            let r = Syscall::kill(parent_pcb.pid(), Signal::SIGCHLD as i32);
+            let r = Syscall::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
             if r.is_err() {
                 warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",
@@ -448,6 +464,7 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
 
+            pcb.clear_pg_and_session_reference();
             drop(pcb);
             ProcessManager::exit_notify();
         }
@@ -463,6 +480,7 @@ impl ProcessManager {
     pub unsafe fn release(pid: Pid) {
         let pcb = ProcessManager::find(pid);
         if pcb.is_some() {
+            // log::debug!("release pid {}", pid);
             // let pcb = pcb.unwrap();
             // 判断该pcb是否在全局没有任何引用
             // TODO: 当前，pcb的Arc指针存在泄露问题，引用计数不正确，打算在接下来实现debug专用的Arc，方便调试，然后解决这个bug。
@@ -716,6 +734,9 @@ pub struct ProcessControlBlock {
     self_ref: Weak<ProcessControlBlock>,
 
     restart_block: SpinLock<Option<RestartBlock>>,
+
+    /// 进程组
+    process_group: Mutex<Weak<ProcessGroup>>,
 }
 
 impl ProcessControlBlock {
@@ -767,7 +788,14 @@ impl ProcessControlBlock {
             (Self::generate_pid(), ppid, cwd, cred, tty)
         };
 
-        let basic_info = ProcessBasicInfo::new(Pid(0), ppid, Pid(0), name, cwd, None);
+        let basic_info = ProcessBasicInfo::new(
+            Pgid::from(pid.into()),
+            ppid,
+            Sid::from(pid.into()),
+            name,
+            cwd,
+            None,
+        );
         let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
@@ -804,6 +832,7 @@ impl ProcessControlBlock {
             cred: SpinLock::new(cred),
             self_ref: Weak::new(),
             restart_block: SpinLock::new(None),
+            process_group: Mutex::new(Weak::new()),
         };
 
         pcb.sig_info.write().set_tty(tty);
@@ -846,6 +875,25 @@ impl ProcessControlBlock {
             }
         }
 
+        if pcb.pid() > Pid(0) && !is_idle {
+            let process_group = ProcessGroup::new(pcb.clone());
+            *pcb.process_group.lock() = Arc::downgrade(&process_group);
+            ProcessManager::add_process_group(process_group.clone());
+
+            let session = Session::new(process_group.clone());
+            process_group.process_group_inner.lock().session = Arc::downgrade(&session);
+            session.session_inner.lock().leader = Some(pcb.clone());
+            ProcessManager::add_session(session);
+
+            ProcessManager::add_pcb(pcb.clone());
+        }
+        // log::debug!(
+        //     "A new process is created, pid: {:?}, pgid: {:?}, sid: {:?}",
+        //     pcb.pid(),
+        //     pcb.process_group().unwrap().pgid(),
+        //     pcb.session().unwrap().sid()
+        // );
+
         return pcb;
     }
 
@@ -877,6 +925,12 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub unsafe fn set_preempt_count(&self, count: usize) {
         self.preempt_count.store(count, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn contain_child(&self, pid: &Pid) -> bool {
+        let children = self.children.read();
+        return children.contains(pid);
     }
 
     #[inline(always)]
@@ -1167,6 +1221,7 @@ impl Drop for ProcessControlBlock {
                 .retain(|pid| *pid != self.pid());
         }
 
+        // log::debug!("Drop pid: {:?}", self.pid());
         drop(irq_guard);
     }
 }
@@ -1210,11 +1265,11 @@ impl ThreadInfo {
 #[derive(Debug)]
 pub struct ProcessBasicInfo {
     /// 当前进程的进程组id
-    pgid: Pid,
+    pgid: Pgid,
     /// 当前进程的父进程的pid
     ppid: Pid,
     /// 当前进程所属会话id
-    sid: Pid,
+    sid: Sid,
     /// 进程的名字
     name: String,
 
@@ -1231,9 +1286,9 @@ pub struct ProcessBasicInfo {
 impl ProcessBasicInfo {
     #[inline(never)]
     pub fn new(
-        pgid: Pid,
+        pgid: Pgid,
         ppid: Pid,
-        sid: Pid,
+        sid: Sid,
         name: String,
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
@@ -1250,16 +1305,24 @@ impl ProcessBasicInfo {
         });
     }
 
-    pub fn pgid(&self) -> Pid {
+    pub fn pgid(&self) -> Pgid {
         return self.pgid;
+    }
+
+    pub fn set_pgid(&mut self, pgid: Pgid) {
+        self.pgid = pgid;
     }
 
     pub fn ppid(&self) -> Pid {
         return self.ppid;
     }
 
-    pub fn sid(&self) -> Pid {
+    pub fn sid(&self) -> Sid {
         return self.sid;
+    }
+
+    pub fn set_sid(&mut self, sid: Sid) {
+        self.sid = sid;
     }
 
     pub fn name(&self) -> &str {

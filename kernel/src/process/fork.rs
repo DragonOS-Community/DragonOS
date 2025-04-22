@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
-    KernelStack, Pid, ProcessControlBlock, ProcessManager,
+    KernelStack, Pgid, Pid, ProcessControlBlock, ProcessManager, Sid,
 };
 const MAX_PID_NS_LEVEL: usize = 32;
 
@@ -179,7 +179,6 @@ impl ProcessManager {
             );
             e
         })?;
-        ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程
         procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {
@@ -343,6 +342,7 @@ impl ProcessManager {
         clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
+        // log::debug!("fork: clone_flags: {:?}", clone_args.flags);
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
@@ -497,7 +497,8 @@ impl ProcessManager {
         } else {
             pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
 
-            let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+            let ptr: *mut ProcessControlBlock =
+                pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
             unsafe {
                 (*ptr).tgid = pcb.pid;
             }
@@ -533,7 +534,67 @@ impl ProcessManager {
 
         // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
 
+        Self::copy_group(current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
+
         sched_cgroup_fork(pcb);
+
+        Ok(())
+    }
+
+    /// 拷贝进程组信息
+    ///
+    /// ## 参数
+    ///
+    /// `parent_pcb` - 父进程
+    /// `child_pcb` - 子进程
+    /// ## 返回值
+    ///
+    /// 无
+    fn copy_group(
+        parent_pcb: &Arc<ProcessControlBlock>,
+        child_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        if parent_pcb.process_group().is_none() && parent_pcb.pid() == Pid(0) {
+            return Ok(());
+        }
+        let pg = parent_pcb.process_group().unwrap();
+
+        let mut pg_inner = pg.process_group_inner.lock();
+
+        let mut children_writelock = parent_pcb.children.write();
+
+        children_writelock.push(child_pcb.pid());
+
+        pg_inner
+            .processes
+            .insert(child_pcb.pid(), child_pcb.clone());
+
+        // 检查是否已经存在pgid和sid
+        let pgid = Pgid::new(child_pcb.pid().0);
+        let sid = Sid::new(pgid.into());
+
+        if ProcessManager::find_process_group(pgid).is_some() {
+            ProcessManager::remove_process_group(pgid);
+        }
+        if ProcessManager::find_session(sid).is_some() {
+            ProcessManager::remove_session(sid);
+        }
+
+        child_pcb.set_process_group(&pg);
+
+        let mut guard = child_pcb.basic_mut();
+        guard.set_pgid(pg.pgid());
+        drop(guard);
+        //todo 这里应该解除注释，但是每次一到这里就触发调度，然后由于当前进程持有锁的数量不等于0导致panic
+        //
+        // if let Some(session) = pg.session() {
+        //     guard.set_sid(session.sid());
+        // }
 
         Ok(())
     }

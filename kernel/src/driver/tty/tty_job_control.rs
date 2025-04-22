@@ -22,7 +22,8 @@ impl TtyJobCtrlManager {
         let mut ctrl = core.contorl_info_irqsave();
         let pcb = ProcessManager::current_pcb();
 
-        ctrl.session = Some(pcb.basic().sid());
+        let pid = Pid::new(pcb.basic().sid().into());
+        ctrl.session = Some(pid);
 
         assert!(pcb.sig_info_irqsave().tty().is_none());
 
@@ -61,7 +62,7 @@ impl TtyJobCtrlManager {
                 }
             } else {
                 // 暂时使用kill而不是killpg
-                Syscall::kill(pgid, sig as i32)?;
+                Syscall::kill_process(pgid, sig)?;
                 ProcessManager::current_pcb()
                     .flags()
                     .insert(ProcessFlags::HAS_PENDING_SIGNAL);
@@ -101,12 +102,12 @@ impl TtyJobCtrlManager {
                 if current.sig_info_irqsave().tty().is_none()
                     || !Arc::ptr_eq(&current.sig_info_irqsave().tty().clone().unwrap(), &tty)
                     || ctrl.session.is_none()
-                    || ctrl.session.unwrap() != current.basic().sid()
+                    || ctrl.session.unwrap() != Pid::from(current.basic().sid().into())
                 {
                     return Err(SystemError::ENOTTY);
                 }
 
-                ctrl.pgid = Some(Pid::new(*pgrp as usize));
+                ctrl.pgid = Some(Pid::from(*pgrp as usize));
 
                 return Ok(0);
             }

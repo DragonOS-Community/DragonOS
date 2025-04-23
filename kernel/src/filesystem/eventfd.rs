@@ -186,7 +186,7 @@ impl IndexNode for EventFdInode {
         drop(eventfd);
 
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
+        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
 
         return Ok(8);
     }
@@ -240,7 +240,7 @@ impl IndexNode for EventFdInode {
         drop(eventfd);
 
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
+        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
         return Ok(8);
     }
 

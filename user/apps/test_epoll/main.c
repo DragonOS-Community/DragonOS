@@ -98,6 +98,13 @@ int main() {
     printf("主线程：epoll_wait 返回，事件数量 = %d\n", nfds);
   }
 
+  if (nfds != 2) {
+    printf("主线程：事件数量不匹配，预期 2，实际 %d\n", nfds);
+    exit(EXIT_FAILURE);
+  }
+
+  // 由于dup复制了 eventfd 描述符，所以 只需要处理一个就行
+  nfds -= 1;
   // 处理就绪事件
   for (int i = 0; i < nfds; i++) {
     if (events[i].data.fd == efd || events[i].data.fd == efd2) {

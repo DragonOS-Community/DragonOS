@@ -23,10 +23,10 @@ use crate::{
 use super::{cmdline::kenrel_cmdline_param_manager, initcall::do_initcalls};
 
 const INIT_PROC_TRYLIST: [(&str, Option<&str>); 4] = [
+    ("/bin/busybox", Some("init")),
     ("/bin/dragonreach", None),
     ("/bin/init", None),
     ("/bin/sh", None),
-    ("/bin/busybox", Some("init")),
 ];
 
 pub fn initial_kernel_thread() -> i32 {

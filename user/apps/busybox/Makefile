@@ -34,11 +34,13 @@ $(bin): $(busybox_dir)
 	sed -i '/CONFIG_FEATURE_EDITING/s/=y/=n/' .config && \
 	sed -i '/CONFIG_HUSH/s/=y/=n/' .config  && \
 	sed -i '/CONFIG_NOMMU/s/=y/=n/' .config && \
-	sed -i '/CONFIG_FEATURE_USE_INITTAB/s/=y/=n/' .config && \
-	sed -i '/CONFIG_ASH_JOB_CONTROL/s/=y/=n/' .config && \
 	echo "CONFIG_CROSS_COMPILER_PREFIX=\"$(prefix)\"" >> .config && \
 	echo "CONFIG_FEATURE_STATIC=y" >> .config && \
-	echo "CONFIG_STATIC_LIBGCC=y" >> .config
+	echo "CONFIG_STATIC_LIBGCC=y" >> .config && \
+	echo "CONFIG_ASH=y" >> .config && \
+	echo "CONFIG_ASH_READ_PROFILE=y" >> .config && \
+	echo "CONFIG_FEATURE_EDITING=y" >> .config && \
+	echo "CONFIG_HUSH=y" >> .config
 
 	@# 执行编译
 	cd $(busybox_dir) && \

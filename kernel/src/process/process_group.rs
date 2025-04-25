@@ -172,6 +172,7 @@ impl ProcessManager {
         }
     }
 
+    // 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#345
     pub fn is_current_pgrp_orphaned() -> bool {
         let current_pcb = ProcessManager::current_pcb();
         let sid = current_pcb.sid();

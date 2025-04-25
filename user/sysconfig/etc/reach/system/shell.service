@@ -3,7 +3,7 @@ Description=Shell
 
 [Service]
 Type=simple
-ExecStart=/bin/busybox sh
+ExecStart=/bin/NovaShell
 Restart=always
 ExecStartPre=-/bin/about.elf
 Environment=PATH=/bin:/usr/bin:/usr/local/bin

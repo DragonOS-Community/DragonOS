@@ -12,6 +12,7 @@ use crate::{
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
+        process_group::Pgid,
         resource::{RLimit64, RUsage},
         ProcessFlags, ProcessManager,
     },
@@ -24,7 +25,7 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
-    arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
+    arch::{interrupt::TrapFrame, MMArch},
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
@@ -77,16 +78,15 @@ impl Syscall {
     /// 系统调用分发器，用于分发系统调用。
     ///
     /// 与[handle]不同，这个函数会捕获系统调用处理函数的panic，返回错误码。
-    #[cfg(feature = "backtrace")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     pub fn catch_handle(
         syscall_num: usize,
         args: &[usize],
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
-        let res = unwinding::panic::catch_unwind(|| Self::handle(syscall_num, args, frame));
-        res.unwrap_or_else(|_| loop {
-            core::hint::spin_loop();
-        })
+        use crate::debug::panic::kernel_catch_unwind;
+        let res = kernel_catch_unwind(|| Self::handle(syscall_num, args, frame))?;
+        res
     }
     /// @brief 系统调用分发器，用于分发系统调用。
     ///
@@ -232,11 +232,21 @@ impl Syscall {
                 Self::sbrk(increment).map(|vaddr: VirtAddr| vaddr.data())
             }
 
-            SYS_REBOOT => Self::reboot(),
+            SYS_REBOOT => {
+                let magic1 = args[0] as u32;
+                let magic2 = args[1] as u32;
+                let cmd = args[2] as u32;
+                let arg = args[3];
+                Self::reboot(magic1, magic2, cmd, arg)
+            }
 
             SYS_CHDIR => {
                 let r = args[0] as *const u8;
                 Self::chdir(r)
+            }
+            SYS_FCHDIR => {
+                let fd = args[0] as i32;
+                Self::fchdir(fd)
             }
 
             #[allow(unreachable_patterns)]
@@ -401,7 +411,7 @@ impl Syscall {
                 Self::unlink(path)
             }
             SYS_KILL => {
-                let pid = Pid::new(args[0]);
+                let pid = args[0] as i32;
                 let sig = args[1] as c_int;
                 // debug!("KILL SYSCALL RECEIVED");
                 Self::kill(pid, sig)
@@ -658,9 +668,11 @@ impl Syscall {
                 }
             }
 
-            SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pid| pid.into()),
+            SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pgid| pgid.into()),
 
             SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
+
+            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_FSTAT => {
                 let fd = args[0] as i32;
                 let kstat: *mut PosixKstat = args[1] as *mut PosixKstat;
@@ -869,18 +881,26 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_POLL => {
-                warn!("SYS_POLL has not yet been implemented");
-                Ok(0)
+                let fds = args[0];
+                let nfds = args[1] as u32;
+                let timeout = args[2] as i32;
+                Self::poll(fds, nfds, timeout)
             }
 
+            SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
+
             SYS_SETPGID => {
-                warn!("SYS_SETPGID has not yet been implemented");
-                Ok(0)
+                let pid = Pid::new(args[0]);
+                let pgid = Pgid::new(args[1]);
+                Self::setpgid(pid, pgid)
             }
 
             SYS_RT_SIGPROCMASK => {
-                warn!("SYS_RT_SIGPROCMASK has not yet been implemented");
-                Ok(0)
+                let how = args[0] as i32;
+                let nset = args[1];
+                let oset = args[2];
+                let sigsetsize = args[3];
+                Self::rt_sigprocmask(how, nset, oset, sigsetsize)
             }
 
             SYS_TKILL => {
@@ -937,10 +957,8 @@ impl Syscall {
             SYS_SETFSUID => Self::setfsuid(args[0]),
             SYS_SETFSGID => Self::setfsgid(args[0]),
 
-            SYS_SETSID => {
-                warn!("SYS_SETSID has not yet been implemented");
-                Ok(0)
-            }
+            SYS_SETSID => Self::setsid(),
+            SYS_GETSID => Self::getsid(Pid::new(args[0])),
 
             SYS_GETRUSAGE => {
                 let who = args[0] as c_int;
@@ -1117,6 +1135,7 @@ impl Syscall {
                 return Ok(0);
             }
 
+            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_NEWFSTATAT => {
                 // todo: 这个系统调用还没有实现
 
@@ -1215,6 +1234,10 @@ impl Syscall {
                 let flags = args[4] as u32;
                 Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
+            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+            SYS_SETRLIMIT => Ok(0),
+            SYS_RESTART_SYSCALL => Self::restart_syscall(),
+            SYS_RT_SIGPENDING => Self::rt_sigpending(args[0], args[1]),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 
@@ -1245,9 +1268,5 @@ impl Syscall {
         let bb = back_color & 0x000000ff;
         print!("\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{s}\x1B[0m");
         return Ok(s.len());
-    }
-
-    pub fn reboot() -> Result<usize, SystemError> {
-        unsafe { cpu_reset() };
     }
 }

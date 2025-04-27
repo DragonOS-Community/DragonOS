@@ -141,16 +141,21 @@ impl DevFS {
                     .as_any_ref()
                     .downcast_ref::<LockedDevFSInode>()
                     .unwrap();
-                // 在 /dev/char 下创建设备节点
-                dev_char_inode.add_dev(name, device.clone())?;
 
                 // 特殊处理 tty 设备，挂载在 /dev 下
                 if name.starts_with("tty") && name.len() > 3 {
                     dev_root_inode.add_dev(name, device.clone())?;
-                }
-                // ptmx设备
-                if name == "ptmx" {
+                } else if name.starts_with("hvc") && name.len() > 3 {
+                    // 特殊处理 hvc 设备，挂载在 /dev 下
                     dev_root_inode.add_dev(name, device.clone())?;
+                } else if name == "console" {
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else if name == "ptmx" {
+                    // ptmx设备
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else {
+                    // 在 /dev/char 下创建设备节点
+                    dev_char_inode.add_dev(name, device.clone())?;
                 }
                 device.set_fs(dev_char_inode.0.lock().fs.clone());
             }

@@ -4,14 +4,14 @@ use crate::{
     arch::ipc::signal::{SigCode, Signal},
     filesystem::vfs::{
         core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
-        FileType, IndexNode, Metadata,
+        FileType, IndexNode, Metadata, PollableInode,
     },
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
-    process::{ProcessManager, ProcessState},
+    process::{ProcessFlags, ProcessManager, ProcessState},
     sched::SchedMode,
     time::PosixTimeSpec,
 };
@@ -19,7 +19,6 @@ use crate::{
 use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -49,6 +48,7 @@ pub struct LockedPipeInode {
     inner: SpinLock<InnerPipeInode>,
     read_wait_queue: WaitQueue,
     write_wait_queue: WaitQueue,
+    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
 /// @brief 管道文件i节点(无锁)
@@ -65,7 +65,6 @@ pub struct InnerPipeInode {
     reader: u32,
     writer: u32,
     had_reader: bool,
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
 impl InnerPipeInode {
@@ -81,7 +80,7 @@ impl InnerPipeInode {
         if mode.contains(FileMode::O_RDONLY) {
             if self.valid_cnt != 0 {
                 // 有数据可读
-                events.insert(EPollEventType::EPOLLIN & EPollEventType::EPOLLRDNORM);
+                events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
             }
 
             // 没有写者
@@ -93,7 +92,7 @@ impl InnerPipeInode {
         if mode.contains(FileMode::O_WRONLY) {
             // 管道内数据未满
             if self.valid_cnt as usize != PIPE_BUFF_SIZE {
-                events.insert(EPollEventType::EPOLLIN & EPollEventType::EPOLLWRNORM);
+                events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
             }
 
             // 没有读者
@@ -105,28 +104,8 @@ impl InnerPipeInode {
         Ok(events.bits() as usize)
     }
 
-    pub fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
-        self.epitems.lock().push_back(epitem);
-        Ok(())
-    }
-
     fn buf_full(&self) -> bool {
         return self.valid_cnt as usize == PIPE_BUFF_SIZE;
-    }
-
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        let is_remove = !self
-            .epitems
-            .lock_irqsave()
-            .extract_if(|x| x.epoll().ptr_eq(epoll))
-            .collect::<Vec<_>>()
-            .is_empty();
-
-        if is_remove {
-            return Ok(());
-        }
-
-        Err(SystemError::ENOENT)
     }
 }
 
@@ -158,12 +137,12 @@ impl LockedPipeInode {
             },
             reader: 0,
             writer: 0,
-            epitems: SpinLock::new(LinkedList::new()),
         };
         let result = Arc::new(Self {
             inner: SpinLock::new(inner),
             read_wait_queue: WaitQueue::default(),
             write_wait_queue: WaitQueue::default(),
+            epitems: SpinLock::new(LinkedList::new()),
         });
         let mut guard = result.inner.lock();
         guard.self_ref = Arc::downgrade(&result);
@@ -184,6 +163,35 @@ impl LockedPipeInode {
     fn writeable(&self) -> bool {
         let inode = self.inner.lock();
         return !inode.buf_full() || inode.reader == 0;
+    }
+}
+
+impl PollableInode for LockedPipeInode {
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        self.inner.lock().poll(private_data)
+    }
+
+    fn add_epitem(
+        &self,
+        epitem: Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.epitems.lock().push_back(epitem);
+        Ok(())
+    }
+
+    fn remove_epitem(
+        &self,
+        epitem: &Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.epitems.lock();
+        let len = guard.len();
+        guard.retain(|x| !Arc::ptr_eq(x, epitem));
+        if len != guard.len() {
+            return Ok(());
+        }
+        Err(SystemError::ENOENT)
     }
 }
 
@@ -210,12 +218,12 @@ impl IndexNode for LockedPipeInode {
         }
         // log::debug!("pipe mode: {:?}", mode);
         // 加锁
-        let mut inode = self.inner.lock();
+        let mut inner_guard = self.inner.lock();
 
         // 如果管道里面没有数据，则唤醒写端，
-        while inode.valid_cnt == 0 {
+        while inner_guard.valid_cnt == 0 {
             // 如果当前管道写者数为0，则返回EOF
-            if inode.writer == 0 {
+            if inner_guard.writer == 0 {
                 return Ok(0);
             }
 
@@ -224,46 +232,51 @@ impl IndexNode for LockedPipeInode {
 
             // 如果为非阻塞管道，直接返回错误
             if mode.contains(FileMode::O_NONBLOCK) {
-                drop(inode);
+                drop(inner_guard);
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
 
             // 否则在读等待队列中睡眠，并释放锁
-            drop(inode);
+            drop(inner_guard);
             let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
             if r.is_err() {
+                ProcessManager::current_pcb()
+                    .flags()
+                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
                 return Err(SystemError::ERESTARTSYS);
             }
 
-            inode = self.inner.lock();
+            inner_guard = self.inner.lock();
         }
 
-        let mut num = inode.valid_cnt as usize;
+        let mut num = inner_guard.valid_cnt as usize;
         //决定要输出的字节
-        let start = inode.read_pos as usize;
+        let start = inner_guard.read_pos as usize;
         //如果读端希望读取的字节数大于有效字节数，则输出有效字节
-        let mut end = (inode.valid_cnt as usize + inode.read_pos as usize) % PIPE_BUFF_SIZE;
+        let mut end =
+            (inner_guard.valid_cnt as usize + inner_guard.read_pos as usize) % PIPE_BUFF_SIZE;
         //如果读端希望读取的字节数少于有效字节数，则输出希望读取的字节
-        if len < inode.valid_cnt as usize {
-            end = (len + inode.read_pos as usize) % PIPE_BUFF_SIZE;
+        if len < inner_guard.valid_cnt as usize {
+            end = (len + inner_guard.read_pos as usize) % PIPE_BUFF_SIZE;
             num = len;
         }
 
         // 从管道拷贝数据到用户的缓冲区
 
         if end < start {
-            buf[0..(PIPE_BUFF_SIZE - start)].copy_from_slice(&inode.data[start..PIPE_BUFF_SIZE]);
-            buf[(PIPE_BUFF_SIZE - start)..num].copy_from_slice(&inode.data[0..end]);
+            buf[0..(PIPE_BUFF_SIZE - start)]
+                .copy_from_slice(&inner_guard.data[start..PIPE_BUFF_SIZE]);
+            buf[(PIPE_BUFF_SIZE - start)..num].copy_from_slice(&inner_guard.data[0..end]);
         } else {
-            buf[0..num].copy_from_slice(&inode.data[start..end]);
+            buf[0..num].copy_from_slice(&inner_guard.data[start..end]);
         }
 
         //更新读位置以及valid_cnt
-        inode.read_pos = (inode.read_pos + num as i32) % PIPE_BUFF_SIZE as i32;
-        inode.valid_cnt -= num as i32;
+        inner_guard.read_pos = (inner_guard.read_pos + num as i32) % PIPE_BUFF_SIZE as i32;
+        inner_guard.valid_cnt -= num as i32;
 
         // 读完以后如果未读完，则唤醒下一个读者
-        if inode.valid_cnt > 0 {
+        if inner_guard.valid_cnt > 0 {
             self.read_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
         }
@@ -271,10 +284,10 @@ impl IndexNode for LockedPipeInode {
         //读完后解锁并唤醒等待在写等待队列中的进程
         self.write_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
-
-        let pollflag = EPollEventType::from_bits_truncate(inode.poll(&data)? as u32);
+        let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&data)? as u32);
+        drop(inner_guard);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&inode.epitems, Some(pollflag))?;
+        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
 
         //返回读取的字节数
         return Ok(num);
@@ -377,11 +390,10 @@ impl IndexNode for LockedPipeInode {
             return Err(SystemError::EINVAL);
         }
         // 加锁
+        let mut inner_guard = self.inner.lock();
 
-        let mut inode = self.inner.lock();
-
-        if inode.reader == 0 {
-            if !inode.had_reader {
+        if inner_guard.reader == 0 {
+            if !inner_guard.had_reader {
                 // 如果从未有读端，直接返回 ENXIO，无论是否阻塞模式
                 return Err(SystemError::ENXIO);
             } else {
@@ -414,43 +426,44 @@ impl IndexNode for LockedPipeInode {
 
         // 如果管道空间不够
 
-        while len + inode.valid_cnt as usize > PIPE_BUFF_SIZE {
+        while len + inner_guard.valid_cnt as usize > PIPE_BUFF_SIZE {
             // 唤醒读端
             self.read_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
 
             // 如果为非阻塞管道，直接返回错误
             if mode.contains(FileMode::O_NONBLOCK) {
-                drop(inode);
+                drop(inner_guard);
                 return Err(SystemError::ENOMEM);
             }
 
             // 解锁并睡眠
-            drop(inode);
+            drop(inner_guard);
             let r = wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {});
             if r.is_err() {
                 return Err(SystemError::ERESTARTSYS);
             }
-            inode = self.inner.lock();
+            inner_guard = self.inner.lock();
         }
 
         // 决定要输入的字节
-        let start = inode.write_pos as usize;
-        let end = (inode.write_pos as usize + len) % PIPE_BUFF_SIZE;
+        let start = inner_guard.write_pos as usize;
+        let end = (inner_guard.write_pos as usize + len) % PIPE_BUFF_SIZE;
         // 从用户的缓冲区拷贝数据到管道
 
         if end < start {
-            inode.data[start..PIPE_BUFF_SIZE].copy_from_slice(&buf[0..(PIPE_BUFF_SIZE - start)]);
-            inode.data[0..end].copy_from_slice(&buf[(PIPE_BUFF_SIZE - start)..len]);
+            inner_guard.data[start..PIPE_BUFF_SIZE]
+                .copy_from_slice(&buf[0..(PIPE_BUFF_SIZE - start)]);
+            inner_guard.data[0..end].copy_from_slice(&buf[(PIPE_BUFF_SIZE - start)..len]);
         } else {
-            inode.data[start..end].copy_from_slice(&buf[0..len]);
+            inner_guard.data[start..end].copy_from_slice(&buf[0..len]);
         }
         // 更新写位置以及valid_cnt
-        inode.write_pos = (inode.write_pos + len as i32) % PIPE_BUFF_SIZE as i32;
-        inode.valid_cnt += len as i32;
+        inner_guard.write_pos = (inner_guard.write_pos + len as i32) % PIPE_BUFF_SIZE as i32;
+        inner_guard.valid_cnt += len as i32;
 
         // 写完后还有位置，则唤醒下一个写者
-        if (inode.valid_cnt as usize) < PIPE_BUFF_SIZE {
+        if (inner_guard.valid_cnt as usize) < PIPE_BUFF_SIZE {
             self.write_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
         }
@@ -459,9 +472,11 @@ impl IndexNode for LockedPipeInode {
         self.read_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
 
-        let pollflag = EPollEventType::from_bits_truncate(inode.poll(&data)? as u32);
+        let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&data)? as u32);
+
+        drop(inner_guard);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&inode.epitems, Some(pollflag))?;
+        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
 
         // 返回写入的字节数
         return Ok(len);
@@ -489,7 +504,7 @@ impl IndexNode for LockedPipeInode {
         return Err(SystemError::ENOSYS);
     }
 
-    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        return self.inner.lock().poll(private_data);
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Ok(self)
     }
 }

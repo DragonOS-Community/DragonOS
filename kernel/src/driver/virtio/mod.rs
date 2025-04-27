@@ -1,4 +1,4 @@
-use alloc::{collections::LinkedList, string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::exception::{irqdesc::IrqReturn, IrqNumber};
@@ -51,7 +51,7 @@ pub trait VirtIODevice: Device {
 pub trait VirtIODriver: Driver {
     fn probe(&self, device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError>;
 
-    fn virtio_id_table(&self) -> LinkedList<VirtioDeviceId>;
+    fn virtio_id_table(&self) -> Vec<VirtioDeviceId>;
 
     fn add_virtio_id(&self, id: VirtioDeviceId);
 }
@@ -60,7 +60,7 @@ int_like!(VirtIODeviceIndex, usize);
 
 #[derive(Debug, Default)]
 pub struct VirtIODriverCommonData {
-    pub id_table: LinkedList<VirtioDeviceId>,
+    pub id_table: Vec<VirtioDeviceId>,
 }
 
 /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/mod_devicetable.h#449
@@ -73,5 +73,21 @@ pub struct VirtioDeviceId {
 impl VirtioDeviceId {
     pub fn new(device: u32, vendor: u32) -> Self {
         Self { device, vendor }
+    }
+}
+
+pub fn virtio_drivers_error_to_system_error(error: virtio_drivers::Error) -> SystemError {
+    match error {
+        virtio_drivers::Error::QueueFull => SystemError::ENOBUFS,
+        virtio_drivers::Error::NotReady => SystemError::EAGAIN_OR_EWOULDBLOCK,
+        virtio_drivers::Error::WrongToken => SystemError::EINVAL,
+        virtio_drivers::Error::AlreadyUsed => SystemError::EBUSY,
+        virtio_drivers::Error::InvalidParam => SystemError::EINVAL,
+        virtio_drivers::Error::DmaError => SystemError::ENOMEM,
+        virtio_drivers::Error::IoError => SystemError::EIO,
+        virtio_drivers::Error::Unsupported => SystemError::ENOSYS,
+        virtio_drivers::Error::ConfigSpaceTooSmall => SystemError::EINVAL,
+        virtio_drivers::Error::ConfigSpaceMissing => SystemError::EINVAL,
+        virtio_drivers::Error::SocketDeviceError(_) => SystemError::EIO,
     }
 }

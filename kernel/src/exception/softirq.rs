@@ -28,11 +28,6 @@ const MAX_SOFTIRQ_RESTART: i32 = 20;
 static mut __CPU_PENDING: Option<Box<[VecStatus; PerCpu::MAX_CPU_NUM as usize]>> = None;
 static mut __SORTIRQ_VECTORS: *mut Softirq = null_mut();
 
-#[no_mangle]
-pub extern "C" fn rs_softirq_init() {
-    softirq_init().expect("softirq_init failed");
-}
-
 #[inline(never)]
 pub fn softirq_init() -> Result<(), SystemError> {
     info!("Initializing softirq...");

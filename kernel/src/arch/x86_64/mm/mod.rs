@@ -5,9 +5,7 @@ pub mod pkru;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use hashbrown::HashSet;
 use log::{debug, info};
-use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
 use crate::driver::serial::serial8250::send_to_default_serial8250_port;
@@ -35,9 +33,6 @@ use core::arch::asm;
 use core::fmt::Debug;
 
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
-
-use super::kvm::vmx::vmcs::VmcsFields;
-use super::kvm::vmx::vmx_asm_wrapper::vmx_vmread;
 
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
@@ -199,10 +194,8 @@ impl MemoryManagementArch for X86_64MMArch {
                 compiler_fence(Ordering::SeqCst);
                 return PhysAddr::new(cr3);
             }
-            PageTableKind::EPT => {
-                let eptp =
-                    vmx_vmread(VmcsFields::CTRL_EPTP_PTR as u32).expect("Failed to read eptp");
-                return PhysAddr::new(eptp as usize);
+            _ => {
+                todo!("Unsupported table kind: {:?}", table_kind);
             }
         }
     }
@@ -439,6 +432,15 @@ impl X86_64MMArch {
         // 不支持的原因是，目前好像没有能正确的设置page-level的xd位，会触发page fault
         return true;
     }
+
+    pub unsafe fn read_array<T>(addr: VirtAddr, count: usize) -> Vec<T> {
+        // 实现读取数组逻辑
+        let mut vec = Vec::with_capacity(count);
+        for i in 0..count {
+            vec.push(Self::read(addr + i * core::mem::size_of::<T>()));
+        }
+        vec
+    }
 }
 
 impl VirtAddr {
@@ -549,11 +551,10 @@ unsafe fn allocator_init() {
     debug!("Successfully enabled new page table");
 }
 
-#[no_mangle]
-pub extern "C" fn rs_test_buddy() {
-    test_buddy();
-}
+#[cfg(test)]
 pub fn test_buddy() {
+    use hashbrown::HashSet;
+    use x86::time::rdtsc;
     // 申请内存然后写入数据然后free掉
     // 总共申请200MB内存
     const TOTAL_SIZE: usize = 200 * 1024 * 1024;

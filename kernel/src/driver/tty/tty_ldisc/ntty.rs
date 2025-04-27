@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use core::intrinsics::likely;
 use core::ops::BitXor;
 
@@ -21,7 +22,7 @@ use crate::{
     },
     mm::VirtAddr,
     net::event_poll::EPollEventType,
-    process::ProcessManager,
+    process::{ProcessFlags, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall},
 };
 
@@ -116,8 +117,8 @@ pub struct NTtyData {
     echo_tail: usize,
 
     /// 写者与读者共享
-    read_buf: [u8; NTTY_BUFSIZE],
-    echo_buf: [u8; NTTY_BUFSIZE],
+    read_buf: Box<[u8; NTTY_BUFSIZE]>,
+    echo_buf: Box<[u8; NTTY_BUFSIZE]>,
 
     read_flags: StaticBitmap<NTTY_BUFSIZE>,
     char_map: StaticBitmap<256>,
@@ -126,6 +127,7 @@ pub struct NTtyData {
 }
 
 impl NTtyData {
+    #[inline(never)]
     pub fn new() -> Self {
         Self {
             read_head: 0,
@@ -147,8 +149,8 @@ impl NTtyData {
             cursor_column: 0,
             canon_cursor_column: 0,
             echo_tail: 0,
-            read_buf: [0; NTTY_BUFSIZE],
-            echo_buf: [0; NTTY_BUFSIZE],
+            read_buf: Box::new([0; NTTY_BUFSIZE]),
+            echo_buf: Box::new([0; NTTY_BUFSIZE]),
             read_flags: StaticBitmap::new(),
             char_map: StaticBitmap::new(),
             tty: Weak::default(),
@@ -788,7 +790,7 @@ impl NTtyData {
         let ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
         if let Some(pg) = pg {
-            let _ = Syscall::kill(pg, signal as i32);
+            let _ = Syscall::kill_process(pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {
@@ -1680,11 +1682,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     break;
                 }
 
-                if ProcessManager::current_pcb()
-                    .sig_info_irqsave()
-                    .sig_pending()
-                    .has_pending()
-                {
+                if ProcessManager::current_pcb().has_pending_signal_fast() {
+                    ProcessManager::current_pcb()
+                        .flags()
+                        .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+
                     ret = Err(SystemError::ERESTARTSYS);
                     break;
                 }
@@ -1763,7 +1765,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         // drop(ldata);
         let mut offset = 0;
         loop {
-            if pcb.sig_info_irqsave().sig_pending().has_pending() {
+            if pcb.has_pending_signal_fast() {
+                ProcessManager::current_pcb()
+                    .flags()
+                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+
                 return Err(SystemError::ERESTARTSYS);
             }
             if core.flags().contains(TtyFlag::HUPPED) {

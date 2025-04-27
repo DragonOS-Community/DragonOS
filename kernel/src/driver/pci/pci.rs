@@ -1063,7 +1063,12 @@ pub fn pci_init() {
         let common_header = box_pci_device.common_header();
         match box_pci_device.header_type() {
             HeaderType::Standard if common_header.status & 0x10 != 0 => {
-                info!("Found pci standard device with class code ={} subclass={} status={:#x} cap_pointer={:#x}  vendor={:#x}, device id={:#x},bdf={}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_standard_device().unwrap().capabilities_pointer,common_header.vendor_id, common_header.device_id,common_header.bus_device_function);
+                info!(
+                    "Found pci standard device with class code ={} subclass={}, bdf={}",
+                    common_header.class_code,
+                    common_header.subclass,
+                    common_header.bus_device_function
+                );
             }
             HeaderType::Standard => {
                 info!(

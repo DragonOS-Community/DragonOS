@@ -1,2 +1,0 @@
-install:
-	bash exec.sh

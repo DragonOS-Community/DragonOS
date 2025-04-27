@@ -4,6 +4,7 @@ use super::virtio_impl::HalImpl;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::block::virtio_blk::virtio_blk;
+use crate::driver::char::virtio_console::virtio_console;
 use crate::driver::net::virtio_net::virtio_net;
 use crate::driver::pci::pci::{
     get_pci_device_structures_mut_by_vendor_id, PciDeviceStructureGeneralDevice,
@@ -11,18 +12,24 @@ use crate::driver::pci::pci::{
 };
 use crate::driver::pci::subsys::pci_bus;
 use crate::driver::virtio::transport::VirtIOTransport;
+use crate::init::initcall::INITCALL_DEVICE;
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use log::{debug, error, warn};
+use system_error::SystemError;
+use unified_init::macros::unified_init;
 use virtio_drivers::transport::{DeviceType, Transport};
 
 ///@brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）
-pub fn virtio_probe() {
+#[unified_init(INITCALL_DEVICE)]
+fn virtio_probe() -> Result<(), SystemError> {
     #[cfg(not(target_arch = "riscv64"))]
     virtio_probe_pci();
     virtio_probe_mmio();
+
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -63,6 +70,7 @@ pub(super) fn virtio_device_init(
         DeviceType::GPU => {
             warn!("Not support virtio_gpu device for now");
         }
+        DeviceType::Console => virtio_console(transport, dev_id, dev_parent),
         DeviceType::Input => {
             warn!("Not support virtio_input device for now");
         }

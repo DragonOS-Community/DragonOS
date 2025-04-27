@@ -215,6 +215,7 @@ make run-docker
 ### 5.1 创建磁盘镜像
 
 &emsp;&emsp;首先，您需要使用**普通用户**权限运行`tools/create_hdd_image.sh`，为DragonOS创建一块磁盘镜像文件。该脚本会自动完成创建磁盘镜像的工作，并将其移动到`bin/`目录下。
+
 &emsp;&emsp;请注意，由于权限问题，请务必使用**普通用户**权限运行此脚本。（运行后，需要提升权限时，系统可能会要求您输入密码）
 
 
@@ -239,6 +240,8 @@ make run-docker
 - 本地编译，不运行: `make all -j 您的CPU核心数`
 - 本地编译，并写入磁盘镜像，不运行: `make build`
 - 本地编译，写入磁盘镜像，并在QEMU中运行: `make run`
+- 本地编译，写入磁盘镜像，以无图形模式运行: 
+`make run-nographic`
 - Docker编译，并写入磁盘镜像,: `make docker`
 - Docker编译，写入磁盘镜像，并在QEMU中运行: `make run-docker`
 - 不编译，直接从已有的磁盘镜像启动: `make qemu`

@@ -157,7 +157,7 @@ impl Timer {
         let expire_jiffies = inner_guard.expire_jiffies;
         let self_arc = inner_guard.self_ref.upgrade().unwrap();
         drop(inner_guard);
-        let mut split_pos: usize = 0;
+        let mut split_pos: usize = timer_list.len();
         for (pos, elt) in timer_list.iter().enumerate() {
             if Arc::ptr_eq(&self_arc, &elt.1) {
                 warn!("Timer already in list");
@@ -384,11 +384,4 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
 
 pub fn clock() -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst);
-}
-
-// ====== 以下为给C提供的接口 ======
-
-#[no_mangle]
-pub extern "C" fn rs_timer_init() {
-    timer_init();
 }

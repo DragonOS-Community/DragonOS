@@ -1,5 +1,3 @@
 [workspace]
-members = [
-    "kernel_build",
-]
+members = ["gen_kallsyms", "kernel_build"]
 resolver = "2"

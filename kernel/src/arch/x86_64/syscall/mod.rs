@@ -65,6 +65,8 @@ macro_rules! syscall_return {
 
 #[no_mangle]
 pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
+    // 系统调用进入时，把系统调用号存入errcode字段，以便在syscall_handler退出后，仍能获取到系统调用号
+    frame.errcode = frame.rax;
     let syscall_num = frame.rax as usize;
     // 防止sys_sched由于超时无法退出导致的死锁
     if syscall_num == SYS_SCHED {
@@ -118,16 +120,8 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         _ => {}
     }
     let mut syscall_handle = || -> u64 {
-        #[cfg(feature = "backtrace")]
-        {
-            Syscall::catch_handle(syscall_num, &args, frame)
-                .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
-        }
-        #[cfg(not(feature = "backtrace"))]
-        {
-            Syscall::handle(syscall_num, &args, frame)
-                .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
-        }
+        Syscall::catch_handle(syscall_num, &args, frame)
+            .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
     };
     syscall_return!(syscall_handle(), frame, show);
 }

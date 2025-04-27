@@ -1,9 +1,9 @@
 use crate::{ebpf::STACK_SIZE, vec, Vec};
 
 pub struct StackFrame {
-    return_address: u16,
+    return_address: u64,
     saved_registers: [u64; 4],
-    sp: u16,
+    sp: u64,
     frame: Vec<u8>,
 }
 
@@ -54,22 +54,22 @@ impl StackFrame {
     }
 
     /// Save the return address
-    pub fn save_return_address(&mut self, address: u16) {
+    pub fn save_return_address(&mut self, address: u64) {
         self.return_address = address;
     }
 
     /// Get the return address
-    pub fn get_return_address(&self) -> u16 {
+    pub fn get_return_address(&self) -> u64 {
         self.return_address
     }
 
     /// Save the stack pointer
-    pub fn save_sp(&mut self, sp: u16) {
+    pub fn save_sp(&mut self, sp: u64) {
         self.sp = sp;
     }
 
     /// Get the stack pointer
-    pub fn get_sp(&self) -> u16 {
+    pub fn get_sp(&self) -> u64 {
         self.sp
     }
 }

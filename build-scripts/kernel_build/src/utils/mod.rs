@@ -2,8 +2,10 @@ use std::path::PathBuf;
 
 pub mod cargo_handler;
 
+#[allow(dead_code)]
 pub struct FileUtils;
 
+#[allow(dead_code)]
 impl FileUtils {
     /// 列出指定目录下的所有文件
     ///

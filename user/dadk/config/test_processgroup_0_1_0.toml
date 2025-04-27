@@ -1,0 +1,47 @@
+# 用户程序名称
+name = "test-processgroup"
+
+# 版本号
+version = "0.1.0"
+
+# 用户程序描述信息
+description = "测试进程组的系统调用"
+
+# 是否只构建一次
+build-once = false
+
+# 是否只安装一次
+install-once = false
+
+# 目标架构
+target-arch = ["x86_64"]
+
+# 任务源
+[task-source]
+# 构建类型
+type = "build-from-source"
+# 构建来源
+source = "local"
+# 路径或URL
+source-path = "user/apps/test-processgroup"
+
+# 构建相关信息
+[build]
+# 构建命令
+build-command = "make install -j $(nproc)"
+
+# 安装相关信息
+[install]
+# 安装到DragonOS的路径
+in-dragonos-path = "/bin"
+
+# 清除相关信息
+[clean]
+# 清除命令
+clean-command = "make clean"
+
+# 依赖项
+# 注意：因为没有依赖项，所以这里不包含[[depends]]部分
+
+# 环境变量
+# 注意：因为没有环境变量，所以这里不包含[[envs]]部分

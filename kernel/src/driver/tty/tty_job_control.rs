@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
-    process::{Pid, ProcessManager},
+    process::{Pid, ProcessFlags, ProcessManager},
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall,
@@ -22,7 +22,8 @@ impl TtyJobCtrlManager {
         let mut ctrl = core.contorl_info_irqsave();
         let pcb = ProcessManager::current_pcb();
 
-        ctrl.session = Some(pcb.basic().sid());
+        let pid = Pid::new(pcb.basic().sid().into());
+        ctrl.session = Some(pid);
 
         assert!(pcb.sig_info_irqsave().tty().is_none());
 
@@ -51,9 +52,9 @@ impl TtyJobCtrlManager {
         if tty_pgid.is_some() && tty_pgid.unwrap() != pgid {
             if pcb
                 .sig_info_irqsave()
-                .sig_block()
+                .sig_blocked()
                 .contains(SigSet::from_bits_truncate(1 << sig as u64))
-                || pcb.sig_struct_irqsave().handlers[sig as usize].is_ignore()
+                || pcb.sig_struct_irqsave().handlers[sig as usize - 1].is_ignore()
             {
                 // 忽略该信号
                 if sig == Signal::SIGTTIN {
@@ -61,8 +62,12 @@ impl TtyJobCtrlManager {
                 }
             } else {
                 // 暂时使用kill而不是killpg
-                Syscall::kill(pgid, sig as i32)?;
-                return Err(SystemError::ERESTART);
+                Syscall::kill_process(pgid, sig)?;
+                ProcessManager::current_pcb()
+                    .flags()
+                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+                log::debug!("job_ctrl_ioctl: kill. pgid: {pgid}, tty_pgid: {tty_pgid:?}");
+                return Err(SystemError::ERESTARTSYS);
             }
         }
 
@@ -97,12 +102,12 @@ impl TtyJobCtrlManager {
                 if current.sig_info_irqsave().tty().is_none()
                     || !Arc::ptr_eq(&current.sig_info_irqsave().tty().clone().unwrap(), &tty)
                     || ctrl.session.is_none()
-                    || ctrl.session.unwrap() != current.basic().sid()
+                    || ctrl.session.unwrap() != Pid::from(current.basic().sid().into())
                 {
                     return Err(SystemError::ENOTTY);
                 }
 
-                ctrl.pgid = Some(Pid::new(*pgrp as usize));
+                ctrl.pgid = Some(Pid::from(*pgrp as usize));
 
                 return Ok(0);
             }

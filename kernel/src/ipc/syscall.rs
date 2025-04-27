@@ -16,8 +16,7 @@ use crate::{
         FilePrivateData,
     },
     ipc::shm::{shm_manager_lock, IPC_PRIVATE},
-    libs::align::page_align_up,
-    libs::spinlock::SpinLock,
+    libs::{align::page_align_up, spinlock::SpinLock},
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
         page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
@@ -25,7 +24,7 @@ use crate::{
         ucontext::{AddressSpace, VMA},
         VirtAddr, VmFlags,
     },
-    process::{Pid, ProcessManager},
+    process::{process_group::Pgid, Pid, ProcessManager},
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall,
@@ -35,11 +34,40 @@ use crate::{
 use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
     shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
+    signal::{set_sigprocmask, SigHow},
     signal_types::{
         SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
         USER_SIG_ERR, USER_SIG_IGN,
     },
 };
+
+/// ### pid转换器，将输入的id转换成对应的pid或pgid
+/// - 如果id < -1，则为pgid
+/// - 如果id == -1，则为所有进程
+/// - 如果id == 0，则为当前进程组
+/// - 如果id > 0，则为pid
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidConverter {
+    All,
+    Pid(Pid),
+    Pgid(Pgid),
+}
+
+impl PidConverter {
+    /// ### 为 `wait` 和 `kill` 调用使用
+    pub fn from_id(id: i32) -> Self {
+        if id < -1 {
+            PidConverter::Pgid(Pgid::from(-id as usize))
+        } else if id == -1 {
+            PidConverter::All
+        } else if id == 0 {
+            let pgid = ProcessManager::current_pcb().pgid();
+            PidConverter::Pgid(pgid)
+        } else {
+            PidConverter::Pid(Pid::from(id as usize))
+        }
+    }
+}
 
 impl Syscall {
     /// # 创建带参数的匿名管道
@@ -92,7 +120,53 @@ impl Syscall {
         Ok(0)
     }
 
-    pub fn kill(pid: Pid, sig: c_int) -> Result<usize, SystemError> {
+    /// ### 杀死一个进程
+    pub fn kill_process(pid: Pid, sig: Signal) -> Result<usize, SystemError> {
+        // 初始化signal info
+        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pid));
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        let ret = sig
+            .send_signal_info(Some(&mut info), pid)
+            .map(|x| x as usize);
+
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        return ret;
+    }
+
+    /// ### 杀死一个进程组
+    pub fn kill_process_group(pgid: Pgid, sig: Signal) -> Result<usize, SystemError> {
+        let pg = ProcessManager::find_process_group(pgid).ok_or(SystemError::ESRCH)?;
+        let inner = pg.process_group_inner.lock();
+        for pcb in inner.processes.values() {
+            Self::kill_process(pcb.pid(), sig)?;
+        }
+        Ok(0)
+    }
+
+    /// ### 杀死所有进程
+    /// - 该函数会杀死所有进程，除了当前进程和init进程
+    pub fn kill_all(sig: Signal) -> Result<usize, SystemError> {
+        let current_pid = ProcessManager::current_pcb().pid();
+        let all_processes = ProcessManager::get_all_processes();
+
+        for pid in all_processes {
+            if pid == current_pid || pid.data() == 1 {
+                continue;
+            }
+            Self::kill_process(pid, sig)?;
+        }
+        Ok(0)
+    }
+
+    /// # kill系统调用函数
+    ///
+    /// ## 参数
+    /// - `id`: id，等于0表示当前进程组，等于-1表示所有进程，小于0表示pgid = -id，大于0表示pid = id，
+    /// - `sig`: 信号值
+    pub fn kill(id: i32, sig: c_int) -> Result<usize, SystemError> {
+        let converter = PidConverter::from_id(id);
         let sig = Signal::from(sig);
         if sig == Signal::INVALID {
             // 传入的signal数值不合法
@@ -100,16 +174,15 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        // 初始化signal info
-        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pid));
+        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        let retval = match converter {
+            PidConverter::Pid(pid) => Self::kill_process(pid, sig),
+            PidConverter::Pgid(pgid) => Self::kill_process_group(pgid, sig),
+            PidConverter::All => Self::kill_all(sig),
+        };
 
-        let retval = sig
-            .send_signal_info(Some(&mut info), pid)
-            .map(|x| x as usize);
-
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         return retval;
     }
@@ -404,6 +477,9 @@ impl Syscall {
         // 更新最后一次连接时间
         kernel_shm.update_atim();
 
+        // 映射计数增加
+        kernel_shm.increase_count();
+
         Ok(r)
     }
 
@@ -431,29 +507,6 @@ impl Syscall {
         if vma.lock_irqsave().region().start() != vaddr {
             return Err(SystemError::EINVAL);
         }
-
-        // 获取映射的物理地址
-        let paddr = address_write_guard
-            .user_mapper
-            .utable
-            .translate(vaddr)
-            .ok_or(SystemError::EINVAL)?
-            .0;
-
-        // 如果物理页的shm_id为None，代表不是共享页
-        let mut page_manager_guard = page_manager_lock_irqsave();
-        let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
-        let shm_id = page.read_irqsave().shm_id().ok_or(SystemError::EINVAL)?;
-        drop(page_manager_guard);
-
-        // 获取对应共享页管理信息
-        let mut shm_manager_guard = shm_manager_lock();
-        let kernel_shm = shm_manager_guard
-            .get_mut(&shm_id)
-            .ok_or(SystemError::EINVAL)?;
-        // 更新最后一次断开连接时间
-        kernel_shm.update_dtim();
-        drop(shm_manager_guard);
 
         // 取消映射
         let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
@@ -503,5 +556,107 @@ impl Syscall {
             // 无效操作码
             ShmCtlCmd::Default => Err(SystemError::EINVAL),
         }
+    }
+
+    /// # SYS_SIGPROCMASK系统调用函数，用于设置或查询当前进程的信号屏蔽字
+    ///
+    /// ## 参数
+    ///
+    /// - `how`: 指示如何修改信号屏蔽字
+    /// - `nset`: 新的信号屏蔽字
+    /// - `oset`: 旧的信号屏蔽字的指针，由于可以是NULL，所以用Option包装
+    /// - `sigsetsize`: 信号集的大小
+    ///
+    /// ## 返回值
+    ///
+    /// 成功：0
+    /// 失败：错误码
+    ///
+    /// ## 说明
+    /// 根据 https://man7.org/linux/man-pages/man2/sigprocmask.2.html ，传进来的oldset和newset都是指针类型，这里选择传入usize然后转换为u64的指针类型
+    pub fn rt_sigprocmask(
+        how: i32,
+        newset: usize,
+        oldset: usize,
+        sigsetsize: usize,
+    ) -> Result<usize, SystemError> {
+        // 对应oset传进来一个NULL的情况
+        let oset = if oldset == 0 { None } else { Some(oldset) };
+        let nset = if newset == 0 { None } else { Some(newset) };
+
+        if sigsetsize != size_of::<SigSet>() {
+            return Err(SystemError::EFAULT);
+        }
+
+        let sighow = SigHow::try_from(how)?;
+
+        let mut new_set = SigSet::default();
+        if let Some(nset) = nset {
+            let reader = UserBufferReader::new(
+                VirtAddr::new(nset).as_ptr::<u64>(),
+                core::mem::size_of::<u64>(),
+                true,
+            )?;
+
+            let nset = reader.read_one_from_user::<u64>(0)?;
+            new_set = SigSet::from_bits_truncate(*nset);
+            // debug!("Get Newset: {}", &new_set.bits());
+            let to_remove: SigSet =
+                <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
+            new_set.remove(to_remove);
+        }
+
+        let oldset_to_return = set_sigprocmask(sighow, new_set)?;
+        if let Some(oldset) = oset {
+            // debug!("Get Oldset to return: {}", &oldset_to_return.bits());
+            let mut writer = UserBufferWriter::new(
+                VirtAddr::new(oldset).as_ptr::<u64>(),
+                core::mem::size_of::<u64>(),
+                true,
+            )?;
+            writer.copy_one_to_user::<u64>(&oldset_to_return.bits(), 0)?;
+        }
+
+        Ok(0)
+    }
+
+    pub fn restart_syscall() -> Result<usize, SystemError> {
+        let restart_block = ProcessManager::current_pcb().restart_block().take();
+        if let Some(mut restart_block) = restart_block {
+            return restart_block.restart_fn.call(&mut restart_block.data);
+        } else {
+            // 不应该走到这里，因此kill掉当前进程及同组的进程
+            let pid = Pid::new(0);
+            let sig = Signal::SIGKILL;
+            let mut info = SigInfo::new(sig, 0, SigCode::Kernel, SigType::Kill(pid));
+
+            sig.send_signal_info(Some(&mut info), pid)
+                .expect("Failed to kill ");
+            return Ok(0);
+        }
+    }
+
+    #[inline(never)]
+    pub fn rt_sigpending(user_sigset_ptr: usize, sigsetsize: usize) -> Result<usize, SystemError> {
+        if sigsetsize != size_of::<SigSet>() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut user_buffer_writer =
+            UserBufferWriter::new(user_sigset_ptr as *mut SigSet, size_of::<SigSet>(), true)?;
+
+        let pcb = ProcessManager::current_pcb();
+        let siginfo_guard = pcb.sig_info_irqsave();
+        let pending_set = siginfo_guard.sig_pending().signal();
+        let shared_pending_set = siginfo_guard.sig_shared_pending().signal();
+        let blocked_set = *siginfo_guard.sig_blocked();
+        drop(siginfo_guard);
+
+        let mut result = pending_set.union(shared_pending_set);
+        result = result.difference(blocked_set);
+
+        user_buffer_writer.copy_one_to_user(&result, 0)?;
+
+        Ok(0)
     }
 }

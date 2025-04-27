@@ -24,6 +24,7 @@ DEFAULT_INSTALL="false"
 export RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER:-https://rsproxy.cn}
 export RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}
 export RUST_VERSION="${RUST_VERSION:-nightly-2024-11-05}"
+export RUST_VERSION_OLD="${RUST_VERSION:-nightly-2024-07-23}"
 
 banner()
 {
@@ -65,7 +66,7 @@ install_ubuntu_debian_pkg()
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config \
-		sphinx make git
+		python3-sphinx make git
 	# 必须分开安装，否则会出现错误
 	sudo "$1" install -y \
 		gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu gdb-multiarch
@@ -233,22 +234,23 @@ rustInstall() {
         echo "正在安装DragonOS所需的rust组件...首次安装需要一些时间来更新索引，请耐心等待..."
         cargo install cargo-binutils
 		cargo install bpf-linker
-		rustup toolchain install nightly-2024-11-05-x86_64-unknown-linux-gnu
 		rustup toolchain install $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup toolchain install $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup component add rust-src --toolchain nightly-2024-11-05-x86_64-unknown-linux-gnu
+		rustup component add rust-src --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-none --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-none --toolchain nightly-2024-11-05-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2024-11-05-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-none --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-linux-musl --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-linux-musl --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
+		rustup target add loongarch64-unknown-none --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup target add loongarch64-unknown-none --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 
-		rustup toolchain install $RUST_VERSION-riscv64gc-unknown-linux-gnu --force-non-host
-		rustup toolchain install nightly-2024-11-05-riscv64gc-unknown-linux-gnu --force-non-host
-		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2024-11-05-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2024-11-05-riscv64gc-unknown-linux-gnu
-        
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src
         rustup component add llvm-tools-preview
@@ -264,6 +266,8 @@ install_python_pkg()
 	# 安装文档生成工具
 	sh -c "cd ../docs && pip3 install -r requirements.txt"
 }
+
+
 
 
 ############# 脚本开始 ##############
@@ -338,9 +342,9 @@ cargo install dadk || exit 1
 bashpath=$(cd `dirname $0`; pwd)
 
 # 编译安装musl交叉编译工具链
-bash ${bashpath}/install_musl_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
+$SHELL ${bashpath}/install_cross_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
 # 编译安装grub
-bash ${bashpath}/grub_auto_install.sh || (echo "grub安装失败" && exit 1)
+$SHELL ${bashpath}/grub_auto_install.sh || (echo "grub安装失败" && exit 1)
 
 # 解决kvm权限问题
 USR=$USER

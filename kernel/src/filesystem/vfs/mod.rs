@@ -21,16 +21,14 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
+    net::event_poll::EPollItem,
     time::PosixTimeSpec,
 };
 
-use self::{
-    core::generate_inode_id,
-    file::{FileMode, PageCache},
-    syscall::ModeType,
-    utils::DName,
-};
+use self::{core::generate_inode_id, file::FileMode, syscall::ModeType, utils::DName};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
+
+use super::page_cache::PageCache;
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: usize = 1024;
@@ -124,10 +122,37 @@ bitflags! {
     }
 }
 
+/// The pollable inode trait
+pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
+    /// Return the poll status of the inode
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError>;
+    /// Add an epoll item to the inode
+    fn add_epitem(
+        &self,
+        epitem: Arc<EPollItem>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError>;
+    /// Remove epitems associated with the epoll
+    fn remove_epitem(
+        &self,
+        epitm: &Arc<EPollItem>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError>;
+}
+
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
+
+    fn read_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    fn write_sync(&self, _offset: usize, _buf: &[u8]) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
     /// @brief 打开文件
     ///
     /// @return 成功：Ok()
@@ -184,11 +209,49 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
-    /// @brief 获取当前inode的状态。
+    /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
     ///
-    /// @return PollStatus结构体
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+    /// ## 参数
+    ///
+    /// - `offset`: 起始位置在Inode中的偏移量
+    /// - `len`: 要读取的字节数
+    /// - `buf`: 缓冲区
+    /// - `data`: 各文件系统系统所需私有信息
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(usize)``: Ok(读取的字节数)
+    /// - `Err(SystemError)``: Err(Posix错误码)
+    fn read_direct(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// # 在inode的指定偏移量开始，写入指定大小的数据，忽略PageCache
+    ///
+    /// ## 参数
+    ///
+    /// - `offset`: 起始位置在Inode中的偏移量
+    /// - `len`: 要读取的字节数
+    /// - `buf`: 缓冲区
+    /// - `data`: 各文件系统系统所需私有信息
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(usize)``: Ok(读取的字节数)
+    /// - `Err(SystemError)``: Err(Posix错误码)
+    fn write_direct(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -356,14 +419,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::ENOSYS);
-    }
-
-    fn kernel_ioctl(
-        &self,
-        _arg: Arc<dyn crate::net::event_poll::KernelIoctlData>,
-        _data: &FilePrivateData,
-    ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -572,6 +627,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
             crate::libs::name::get_type_name(&self)
         );
         None
+    }
+
+    /// Transform the inode to a pollable inode
+    ///
+    /// If the inode is not pollable, return an error
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 }
 

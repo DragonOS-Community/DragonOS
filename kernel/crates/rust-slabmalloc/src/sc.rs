@@ -1,7 +1,5 @@
 //! A SCAllocator that can allocate fixed size objects.
 
-use core::mem;
-
 use crate::*;
 
 /// A genius(?) const min()
@@ -235,6 +233,10 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
             }
         }
 
+        self.free_obj_count = self
+            .free_obj_count
+            .saturating_sub(reclaimed * self.obj_per_page);
+
         reclaimed
     }
 
@@ -247,7 +249,6 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
             .initialize(self.size, P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD);
         *page.prev() = Rawlink::none();
         *page.next() = Rawlink::none();
-        trace!("adding page to SCAllocator {:p}", page);
         self.insert_empty(page);
         self.free_obj_count += self.obj_per_page;
     }
@@ -314,15 +315,13 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
     /// May return an error in case an invalid `layout` is provided.
     /// The function may also move internal slab pages between lists partial -> empty
     /// or full -> partial lists.
-    ///
     /// # Safety
     /// The caller must ensure that the `layout` is valid.
     pub unsafe fn deallocate(
         &mut self,
         ptr: NonNull<u8>,
         layout: Layout,
-        slab_callback: &'static dyn CallBack,
-    ) -> Result<(), AllocationError> {
+    ) -> Result<bool, AllocationError> {
         assert!(layout.size() <= self.size);
         assert!(self.size <= (P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD));
         trace!(
@@ -342,17 +341,16 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
 
         let ret = slab_page.deallocate(ptr, new_layout);
         debug_assert!(ret.is_ok(), "Slab page deallocate won't fail at the moment");
+
         self.free_obj_count += 1;
         let is_empty_after_dealloc = slab_page.is_empty(self.obj_per_page);
 
+        let mut need_reclaim = false;
         // 如果slab_page是空白的，且空闲块数大于free_limit，将slab_page归还buddy
         if self.free_obj_count >= self.free_limit && is_empty_after_dealloc {
-            self.slabs.remove_from_list(slab_page);
-            // 将slab_page归还buddy
-            slab_callback.free_slab_page(slab_page as *const P as *mut u8, P::SIZE);
+            need_reclaim = true;
         }
-        self.check_page_assignments();
 
-        ret
+        ret.map(|_| need_reclaim)
     }
 }

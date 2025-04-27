@@ -1,0 +1,46 @@
+# 用户程序名称
+name = "test_epoll"
+# 版本号
+version = "0.1.0"
+# 用户程序描述信息
+description = "test_epoll"
+# （可选）默认: false 是否只构建一次，如果为true，DADK会在构建成功后，将构建结果缓存起来，下次构建时，直接使用缓存的构建结果
+build-once = false
+#  (可选) 默认: false 是否只安装一次，如果为true，DADK会在安装成功后，不再重复安装
+install-once = false
+# 目标架构
+# 可选值："x86_64", "aarch64", "riscv64"
+target-arch = ["x86_64"]
+# 任务源
+[task-source]
+# 构建类型
+# 可选值："build-from_source", "install-from-prebuilt"
+type = "build-from-source"
+# 构建来源
+# "build_from_source" 可选值："git", "local", "archive"
+# "install_from_prebuilt" 可选值："local", "archive"
+source = "local"
+# 路径或URL
+source-path = "user/apps/test_epoll"
+# 构建相关信息
+[build]
+# （可选）构建命令
+build-command = "make install"
+# 安装相关信息
+[install]
+# （可选）安装到DragonOS的路径
+in-dragonos-path = "/bin"
+# 清除相关信息
+[clean]
+# （可选）清除命令
+clean-command = "make clean"
+# （可选）依赖项
+# 注意：如果没有依赖项，忽略此项，不允许只留一个[[depends]]
+# [[depends]]
+# name = "depend1"
+# version = "0.1.1"
+# （可选）环境变量
+# 注意：如果没有环境变量，忽略此项，不允许只留一个[[envs]]
+# [[envs]]
+# key = "PATH"
+# value = "/usr/bin"

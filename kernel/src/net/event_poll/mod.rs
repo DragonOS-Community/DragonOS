@@ -1,5 +1,4 @@
 use core::{
-    any::Any,
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -9,7 +8,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
@@ -49,27 +47,6 @@ pub struct EventPoll {
     /// 是否已经关闭
     shutdown: AtomicBool,
     self_ref: Option<Weak<SpinLock<EventPoll>>>,
-}
-
-impl EventPoll {
-    pub const EP_MAX_EVENTS: u32 = u32::MAX / (core::mem::size_of::<EPollEvent>() as u32);
-    /// 用于获取inode中的epitem队列
-    pub const ADD_EPOLLITEM: u32 = 0x7965;
-    pub fn new() -> Self {
-        Self {
-            epoll_wq: WaitQueue::default(),
-            ep_items: RBTree::new(),
-            ready_list: LinkedList::new(),
-            shutdown: AtomicBool::new(false),
-            self_ref: None,
-        }
-    }
-}
-
-impl Default for EventPoll {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// EpollItem表示的是Epoll所真正管理的对象
@@ -131,10 +108,6 @@ impl EPollItem {
     }
 }
 
-pub trait KernelIoctlData: Send + Sync + Any + Debug + CastFromSync {}
-
-impl KernelIoctlData for EPollItem {}
-
 /// ### Epoll文件的私有信息
 #[derive(Debug, Clone)]
 pub struct EPollPrivateData {
@@ -174,11 +147,6 @@ impl IndexNode for EPollInode {
         Err(SystemError::ENOSYS)
     }
 
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        // 需要实现epoll嵌套epoll时，需要实现这里
-        todo!()
-    }
-
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
         todo!()
     }
@@ -199,25 +167,7 @@ impl IndexNode for EPollInode {
         // 释放资源
         let mut epoll = self.epoll.0.lock_irqsave();
 
-        // 唤醒epoll上面等待的所有进程
-        epoll.shutdown.store(true, Ordering::SeqCst);
-        epoll.ep_wake_all();
-
-        let fds = epoll.ep_items.keys().cloned().collect::<Vec<_>>();
-
-        // 清理红黑树里面的epitems
-        for fd in fds {
-            let file = ProcessManager::current_pcb()
-                .fd_table()
-                .read()
-                .get_file_by_fd(fd);
-
-            if file.is_some() {
-                file.unwrap().remove_epoll(&Arc::downgrade(&self.epoll.0))?;
-            }
-
-            epoll.ep_items.remove(&fd);
-        }
+        epoll.close()?;
 
         Ok(())
     }
@@ -232,21 +182,71 @@ impl IndexNode for EPollInode {
 }
 
 impl EventPoll {
-    /// ## 创建epoll对象
+    pub const EP_MAX_EVENTS: u32 = u32::MAX / (core::mem::size_of::<EPollEvent>() as u32);
+    /// 用于获取inode中的epitem队列
+    pub const ADD_EPOLLITEM: u32 = 0x7965;
+    fn new() -> Self {
+        Self {
+            epoll_wq: WaitQueue::default(),
+            ep_items: RBTree::new(),
+            ready_list: LinkedList::new(),
+            shutdown: AtomicBool::new(false),
+            self_ref: None,
+        }
+    }
+
+    /// 关闭epoll时，执行的逻辑
+    fn close(&mut self) -> Result<(), SystemError> {
+        // 唤醒epoll上面等待的所有进程
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.ep_wake_all();
+
+        let fds: Vec<i32> = self.ep_items.keys().cloned().collect::<Vec<_>>();
+        // 清理红黑树里面的epitems
+        for fd in fds {
+            let file = ProcessManager::current_pcb()
+                .fd_table()
+                .read()
+                .get_file_by_fd(fd);
+
+            if let Some(file) = file {
+                let epitm = self.ep_items.get(&fd).unwrap();
+                file.remove_epitem(epitm)?;
+            }
+
+            self.ep_items.remove(&fd);
+        }
+
+        Ok(())
+    }
+
+    /// ## 创建epoll对象, 并将其加入到当前进程的fd_table中
     ///
     /// ### 参数
     /// - flags: 创建的epoll文件的FileMode
     ///
     /// ### 返回值
     /// - 成功则返回Ok(fd)，否则返回Err
-    pub fn do_create_epoll(flags: FileMode) -> Result<usize, SystemError> {
+    pub fn create_epoll(flags: FileMode) -> Result<usize, SystemError> {
+        let ep_file = Self::create_epoll_file(flags)?;
+
+        let current_pcb = ProcessManager::current_pcb();
+        let fd_table = current_pcb.fd_table();
+        let mut fd_table_guard = fd_table.write();
+
+        let fd = fd_table_guard.alloc_fd(ep_file, None)?;
+
+        Ok(fd as usize)
+    }
+
+    /// ## 创建epoll文件
+    pub fn create_epoll_file(flags: FileMode) -> Result<File, SystemError> {
         if !flags.difference(FileMode::O_CLOEXEC).is_empty() {
             return Err(SystemError::EINVAL);
         }
 
         // 创建epoll
-        let epoll = LockedEventPoll(Arc::new(SpinLock::new(EventPoll::new())));
-        epoll.0.lock_irqsave().self_ref = Some(Arc::downgrade(&epoll.0));
+        let epoll = Self::do_create_epoll();
 
         // 创建epoll的inode对象
         let epoll_inode = EPollInode::new(epoll.clone());
@@ -258,14 +258,13 @@ impl EventPoll {
 
         // 设置ep_file的FilePrivateData
         ep_file.private_data = SpinLock::new(FilePrivateData::EPoll(EPollPrivateData { epoll }));
+        Ok(ep_file)
+    }
 
-        let current_pcb = ProcessManager::current_pcb();
-        let fd_table = current_pcb.fd_table();
-        let mut fd_table_guard = fd_table.write();
-
-        let fd = fd_table_guard.alloc_fd(ep_file, None)?;
-
-        Ok(fd as usize)
+    fn do_create_epoll() -> LockedEventPoll {
+        let epoll = LockedEventPoll(Arc::new(SpinLock::new(EventPoll::new())));
+        epoll.0.lock().self_ref = Some(Arc::downgrade(&epoll.0));
+        epoll
     }
 
     /// ## epoll_ctl的具体实现
@@ -273,30 +272,20 @@ impl EventPoll {
     /// 根据不同的op对epoll文件进行增删改
     ///
     /// ### 参数
-    /// - epfd: 操作的epoll文件描述符
+    /// - ep_file: epoll文件
     /// - op: 对应的操作
-    /// - fd: 操作对应的文件描述符
+    /// - dstfd: 操作对应的文件描述符
+    /// - dst_file: 操作对应的文件(与dstfd对应)
     /// - epds: 从用户态传入的event，若op为EpollCtlAdd，则对应注册的监听事件，若op为EPollCtlMod，则对应更新的事件，删除操作不涉及此字段
     /// - nonblock: 定义这次操作是否为非阻塞（有可能其他地方占有EPoll的锁）
-    pub fn do_epoll_ctl(
-        epfd: i32,
+    fn do_epoll_ctl(
+        ep_file: Arc<File>,
         op: EPollCtlOption,
-        fd: i32,
-        epds: &mut EPollEvent,
+        dstfd: i32,
+        dst_file: Arc<File>,
+        mut epds: EPollEvent,
         nonblock: bool,
     ) -> Result<usize, SystemError> {
-        let current_pcb = ProcessManager::current_pcb();
-        let fd_table = current_pcb.fd_table();
-        let fd_table_guard = fd_table.read();
-
-        // 获取epoll和对应fd指向的文件
-        let ep_file = fd_table_guard
-            .get_file_by_fd(epfd)
-            .ok_or(SystemError::EBADF)?;
-        let dst_file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-
         // 检查是否允许 EPOLLWAKEUP
         if op != EPollCtlOption::Del {
             epds.events &= !EPollEventType::EPOLLWAKEUP.bits();
@@ -351,7 +340,7 @@ impl EventPoll {
                 }
             }
 
-            let ep_item = epoll_guard.ep_items.get(&fd);
+            let ep_item = epoll_guard.ep_items.get(&dstfd).cloned();
             match op {
                 EPollCtlOption::Add => {
                     // 如果已经存在，则返回错误
@@ -361,19 +350,23 @@ impl EventPoll {
                     // 设置epoll
                     let epitem = Arc::new(EPollItem::new(
                         Arc::downgrade(&epoll_data.epoll.0),
-                        *epds,
-                        fd,
+                        epds,
+                        dstfd,
                         Arc::downgrade(&dst_file),
                     ));
                     Self::ep_insert(&mut epoll_guard, dst_file, epitem)?;
                 }
                 EPollCtlOption::Del => {
-                    // 不存在则返回错误
-                    if ep_item.is_none() {
-                        return Err(SystemError::ENOENT);
+                    match ep_item {
+                        Some(ref ep_item) => {
+                            // 删除
+                            Self::ep_remove(&mut epoll_guard, dstfd, Some(dst_file), ep_item)?;
+                        }
+                        None => {
+                            // 不存在则返回错误
+                            return Err(SystemError::ENOENT);
+                        }
                     }
-                    // 删除
-                    Self::ep_remove(&mut epoll_guard, fd, Some(dst_file))?;
                 }
                 EPollCtlOption::Mod => {
                     // 不存在则返回错误
@@ -385,7 +378,7 @@ impl EventPoll {
                         epds.events |=
                             EPollEventType::EPOLLERR.bits() | EPollEventType::EPOLLHUP.bits();
 
-                        Self::ep_modify(&mut epoll_guard, ep_item, epds)?;
+                        Self::ep_modify(&mut epoll_guard, ep_item, &epds)?;
                     }
                 }
             }
@@ -394,8 +387,50 @@ impl EventPoll {
         Ok(0)
     }
 
-    /// ## epoll_wait的具体实现
-    pub fn do_epoll_wait(
+    pub fn epoll_ctl_with_epfd(
+        epfd: i32,
+        op: EPollCtlOption,
+        dstfd: i32,
+        epds: EPollEvent,
+        nonblock: bool,
+    ) -> Result<usize, SystemError> {
+        let current_pcb = ProcessManager::current_pcb();
+        let fd_table = current_pcb.fd_table();
+        let fd_table_guard = fd_table.read();
+
+        // 获取epoll和对应fd指向的文件
+        let ep_file = fd_table_guard
+            .get_file_by_fd(epfd)
+            .ok_or(SystemError::EBADF)?;
+        let dst_file = fd_table_guard
+            .get_file_by_fd(dstfd)
+            .ok_or(SystemError::EBADF)?;
+
+        drop(fd_table_guard);
+
+        Self::do_epoll_ctl(ep_file, op, dstfd, dst_file, epds, nonblock)
+    }
+
+    pub fn epoll_ctl_with_epfile(
+        ep_file: Arc<File>,
+        op: EPollCtlOption,
+        dstfd: i32,
+        epds: EPollEvent,
+        nonblock: bool,
+    ) -> Result<usize, SystemError> {
+        let current_pcb = ProcessManager::current_pcb();
+        let fd_table = current_pcb.fd_table();
+        let fd_table_guard = fd_table.read();
+        let dst_file = fd_table_guard
+            .get_file_by_fd(dstfd)
+            .ok_or(SystemError::EBADF)?;
+
+        drop(fd_table_guard);
+
+        Self::do_epoll_ctl(ep_file, op, dstfd, dst_file, epds, nonblock)
+    }
+
+    pub fn epoll_wait(
         epfd: i32,
         epoll_event: &mut [EPollEvent],
         max_events: i32,
@@ -411,6 +446,16 @@ impl EventPoll {
             .ok_or(SystemError::EBADF)?;
 
         drop(fd_table_guard);
+        Self::epoll_wait_with_file(ep_file, epoll_event, max_events, timespec)
+    }
+    /// ## epoll_wait的具体实现
+    pub fn epoll_wait_with_file(
+        ep_file: Arc<File>,
+        epoll_event: &mut [EPollEvent],
+        max_events: i32,
+        timespec: Option<PosixTimeSpec>,
+    ) -> Result<usize, SystemError> {
+        let current_pcb = ProcessManager::current_pcb();
 
         // 确保是epoll file
         if !Self::is_epoll_file(&ep_file) {
@@ -432,6 +477,9 @@ impl EventPoll {
                     // 非阻塞情况
                     timeout = true;
                 }
+            } else if timespec.is_none() {
+                // 非阻塞情况
+                timeout = true;
             }
             // 判断epoll上有没有就绪事件
             let mut available = epoll_guard.ep_events_available();
@@ -475,9 +523,11 @@ impl EventPoll {
                     continue;
                 }
 
-                // 如果有未处理的信号则返回错误
-                if current_pcb.sig_info_irqsave().sig_pending().signal().bits() != 0 {
-                    return Err(SystemError::EINTR);
+                // 如果有未处理且未被屏蔽的信号则返回错误
+                if current_pcb.has_pending_signal_fast()
+                    && current_pcb.has_pending_not_masked_signal()
+                {
+                    return Err(SystemError::ERESTARTSYS);
                 }
 
                 // 还未等待到事件发生，则睡眠
@@ -488,14 +538,21 @@ impl EventPoll {
                     let jiffies = next_n_us_timer_jiffies(
                         (timespec.tv_sec * 1000000 + timespec.tv_nsec / 1000) as u64,
                     );
-                    let inner = Timer::new(handle, jiffies);
+                    let inner: Arc<Timer> = Timer::new(handle, jiffies);
                     inner.activate();
                     timer = Some(inner);
                 }
                 let guard = epoll.0.lock_irqsave();
-                unsafe { guard.epoll_wq.sleep_without_schedule() };
+                // 睡眠，等待事件发生
+                // 如果wq已经dead，则直接返回错误
+                unsafe { guard.epoll_wq.sleep_without_schedule() }.inspect_err(|_| {
+                    if let Some(timer) = timer.as_ref() {
+                        timer.cancel();
+                    }
+                })?;
                 drop(guard);
                 schedule(SchedMode::SM_NONE);
+
                 // 被唤醒后,检查是否有事件可读
                 available = epoll.0.lock_irqsave().ep_events_available();
                 if let Some(timer) = timer {
@@ -524,6 +581,9 @@ impl EventPoll {
         user_event: &mut [EPollEvent],
         max_events: i32,
     ) -> Result<usize, SystemError> {
+        if user_event.len() < max_events as usize {
+            return Err(SystemError::EINVAL);
+        }
         let mut ep_guard = epoll.0.lock_irqsave();
         let mut res: usize = 0;
 
@@ -632,7 +692,7 @@ impl EventPoll {
             return Err(SystemError::ENOSYS);
         }
 
-        dst_file.add_epoll(epitem.clone())?;
+        dst_file.add_epitem(epitem.clone())?;
         Ok(())
     }
 
@@ -640,16 +700,15 @@ impl EventPoll {
         epoll: &mut SpinLockGuard<EventPoll>,
         fd: i32,
         dst_file: Option<Arc<File>>,
+        epitem: &Arc<EPollItem>,
     ) -> Result<(), SystemError> {
         if let Some(dst_file) = dst_file {
-            dst_file.remove_epoll(epoll.self_ref.as_ref().unwrap())?;
+            dst_file.remove_epitem(epitem)?;
         }
 
-        let epitem = epoll.ep_items.remove(&fd).unwrap();
-
-        let _ = epoll
-            .ready_list
-            .extract_if(|item| Arc::ptr_eq(item, &epitem));
+        if let Some(epitem) = epoll.ep_items.remove(&fd) {
+            epoll.ready_list.retain(|item| !Arc::ptr_eq(item, &epitem));
+        }
 
         Ok(())
     }
@@ -721,20 +780,23 @@ impl EventPoll {
         let mut epitems_guard = epitems.try_lock_irqsave()?;
         // 一次只取一个，因为一次也只有一个进程能拿到对应文件的🔓
         if let Some(epitem) = epitems_guard.pop_front() {
-            let pollflags = pollflags.unwrap_or({
-                if let Some(file) = epitem.file.upgrade() {
-                    EPollEventType::from_bits_truncate(file.poll()? as u32)
-                } else {
-                    EPollEventType::empty()
+            let pollflags = match pollflags {
+                Some(flags) => flags,
+                None => {
+                    if let Some(file) = epitem.file.upgrade() {
+                        // warning: deadlock will happen if poll() is called when pollflags is None
+                        EPollEventType::from_bits_truncate(file.poll()? as u32)
+                    } else {
+                        EPollEventType::empty()
+                    }
                 }
-            });
+            };
 
             if let Some(epoll) = epitem.epoll().upgrade() {
                 let mut epoll_guard = epoll.try_lock()?;
                 let binding = epitem.clone();
                 let event_guard = binding.event().read();
                 let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
-
                 // 检查事件合理性以及是否有感兴趣的事件
                 if !(ep_events
                     .difference(EPollEventType::EP_PRIVATE_BITS)
@@ -794,6 +856,14 @@ impl EPollEvent {
 
     pub fn events(&self) -> u32 {
         self.events
+    }
+
+    pub fn set_data(&mut self, data: u64) {
+        self.data = data;
+    }
+
+    pub fn data(&self) -> u64 {
+        self.data
     }
 }
 

@@ -7,7 +7,7 @@ use crate::{
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
-use super::base::block::block_device::BlockDevName;
+use super::base::device::DevName;
 
 static mut SCSI_MANAGER: Option<ScsiManager> = None;
 
@@ -30,7 +30,7 @@ pub struct ScsiManager {
 
 struct InnerScsiManager {
     id_bmp: bitmap::StaticBitmap<{ ScsiManager::MAX_DEVICES }>,
-    devname: [Option<BlockDevName>; ScsiManager::MAX_DEVICES],
+    devname: [Option<DevName>; ScsiManager::MAX_DEVICES],
 }
 
 impl ScsiManager {
@@ -49,7 +49,7 @@ impl ScsiManager {
         self.inner.lock()
     }
 
-    pub fn alloc_id(&self) -> Option<BlockDevName> {
+    pub fn alloc_id(&self) -> Option<DevName> {
         let mut inner = self.inner();
         let idx = inner.id_bmp.first_false_index()?;
         inner.id_bmp.set(idx, true);
@@ -59,9 +59,9 @@ impl ScsiManager {
     }
 
     /// Generate a new block device name like 'sda', 'sdb', etc.
-    fn format_name(id: usize) -> BlockDevName {
+    fn format_name(id: usize) -> DevName {
         let x = (b'a' + id as u8) as char;
-        BlockDevName::new(format!("sd{}", x), id)
+        DevName::new(format!("sd{}", x), id)
     }
 
     #[allow(dead_code)]

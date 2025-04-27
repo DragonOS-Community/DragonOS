@@ -649,7 +649,7 @@ pub(super) fn do_plic_irq(trap_frame: &mut TrapFrame) {
         if claim == 0 {
             break;
         }
-        debug!("plic: claim: {claim:?}");
+        // debug!("plic: claim: {claim:?}");
 
         let hwirq = HardwareIrqNumber::new(claim);
         if let Err(e) = GenericIrqHandler::handle_domain_irq(domain.clone(), hwirq, trap_frame) {

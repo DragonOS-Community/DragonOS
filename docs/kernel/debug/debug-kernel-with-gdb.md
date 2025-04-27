@@ -3,6 +3,7 @@
 
 ## 前言
 &emsp;&emsp;GDB是一个功能强大的开源调试工具，能够帮助您更好的诊断和修复程序中的错误。
+
 &emsp;&emsp;它提供了一套丰富的功能，使您能够检查程序的执行状态、跟踪代码的执行流程、查看和修改变量的值、分析内存状态等。它可以与编译器配合使用，以便您在调试过程中访问程序的调试信息。
 
 &emsp;&emsp;此教程将告诉您如何在DragonOS中使用`rust-gdb`来调试内核，包括如何开始调试以及相应的调试命令。
@@ -29,6 +30,7 @@ debug = true
 ### 1.2 运行DragonOS
 
 &emsp;&emsp;准备工作完成后，您就可以编译、运行DragonOS来开展后续的调试工作了。
+
 &emsp;&emsp;在DragonOS根目录中开启终端，使用`make run`即可开始编译运行DragonOS,如需更多编译命令方面的帮助，详见
 > [构建DragonOS](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html)。
 

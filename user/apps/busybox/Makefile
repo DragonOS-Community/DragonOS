@@ -15,9 +15,16 @@ endif
 cc := $(prefix)gcc
 strip := $(prefix)strip
 
+# 下载 busybox 的 md5sum 文件
+$(busybox_tarball_path).md5sum:
+	wget https://mirrors.dragonos.org.cn/pub/third_party/busybox/$(busybox_tarball).md5sum
+
 # 下载源码
-$(busybox_tarball_path):
-	wget https://busybox.net/downloads/$(busybox_tarball)
+$(busybox_tarball_path): $(busybox_tarball_path).md5sum
+	@if [ ! -f $@ ] || ! md5sum -c $(busybox_tarball_path).md5sum; then \
+		echo "Downloading $@..."; \
+		wget https://mirrors.dragonos.org.cn/pub/third_party/busybox/$(busybox_tarball); \
+	fi
 
 # 解压源码包
 $(busybox_dir): $(busybox_tarball_path)
@@ -66,4 +73,4 @@ clean:
 	rm -rf build/
 
 distclean: clean
-	rm -f $(busybox_tarball_path)
+	rm -f $(busybox_tarball_path) $(busybox_tarball_path).md5sum

@@ -1983,9 +1983,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 ldata
                     .char_map
                     .set(contorl_chars[ControlCharIndex::VERASE] as usize, true);
-                ldata
-                    .char_map
-                    .set(default_control_chars[ControlCharIndex::VERASE] as usize, true);
+                ldata.char_map.set(
+                    default_control_chars[ControlCharIndex::VERASE] as usize,
+                    true,
+                );
                 ldata
                     .char_map
                     .set(contorl_chars[ControlCharIndex::VKILL] as usize, true);

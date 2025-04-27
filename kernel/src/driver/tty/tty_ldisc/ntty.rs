@@ -405,6 +405,7 @@ impl NTtyData {
     pub fn receive_special_char(&mut self, mut c: u8, tty: Arc<TtyCore>, lookahead_done: bool) {
         let is_flow_ctrl = self.is_flow_ctrl_char(tty.clone(), c, lookahead_done);
         let termios = tty.core().termios();
+        let default_termios = *crate::driver::tty::termios::TTY_STD_TERMIOS;
 
         // 启用软件流控，并且该字符已经当做软件流控字符处理
         if termios.input_mode.contains(InputMode::IXON) && is_flow_ctrl {
@@ -454,12 +455,13 @@ impl NTtyData {
         }
 
         if self.icanon {
-            if c == termios.control_characters[ControlCharIndex::VERASE]
+            if (c == termios.control_characters[ControlCharIndex::VERASE]
+                || c == default_termios.control_characters[ControlCharIndex::VERASE])
                 || c == termios.control_characters[ControlCharIndex::VKILL]
                 || (c == termios.control_characters[ControlCharIndex::VWERASE]
                     && termios.local_mode.contains(LocalMode::IEXTEN))
             {
-                self.eraser(c, &termios);
+                self.eraser(c, &termios, &default_termios);
                 self.commit_echoes(tty.clone());
                 return;
             }
@@ -579,12 +581,13 @@ impl NTtyData {
 
     /// ## ntty默认eraser function
     #[inline(never)]
-    fn eraser(&mut self, mut c: u8, termios: &RwLockReadGuard<Termios>) {
+    fn eraser(&mut self, mut c: u8, termios: &RwLockReadGuard<Termios>, default_termios: &Termios) {
         if self.read_head == self.canon_head {
             return;
         }
 
-        let erase = c == termios.control_characters[ControlCharIndex::VERASE];
+        let erase = c == termios.control_characters[ControlCharIndex::VERASE]
+            || c == default_termios.control_characters[ControlCharIndex::VERASE];
         let werase = c == termios.control_characters[ControlCharIndex::VWERASE];
         let kill = !erase && !werase;
 

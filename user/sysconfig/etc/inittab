@@ -1,6 +1,6 @@
 # /etc/inittab
 ::sysinit:busybox sh /etc/init.d/rcS      # 系统初始化脚本
-
+::sysinit:/bin/modify-termios
 ::askfirst:-/bin/busybox sh --login
 # ttyS0::respawn:/bin/busybox sh
 

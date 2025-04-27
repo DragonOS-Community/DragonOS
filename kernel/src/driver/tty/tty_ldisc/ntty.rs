@@ -405,7 +405,6 @@ impl NTtyData {
     pub fn receive_special_char(&mut self, mut c: u8, tty: Arc<TtyCore>, lookahead_done: bool) {
         let is_flow_ctrl = self.is_flow_ctrl_char(tty.clone(), c, lookahead_done);
         let termios = tty.core().termios();
-        let default_termios = *crate::driver::tty::termios::TTY_STD_TERMIOS;
 
         // 启用软件流控，并且该字符已经当做软件流控字符处理
         if termios.input_mode.contains(InputMode::IXON) && is_flow_ctrl {
@@ -455,13 +454,12 @@ impl NTtyData {
         }
 
         if self.icanon {
-            if (c == termios.control_characters[ControlCharIndex::VERASE]
-                || c == default_termios.control_characters[ControlCharIndex::VERASE])
+            if c == termios.control_characters[ControlCharIndex::VERASE]
                 || c == termios.control_characters[ControlCharIndex::VKILL]
                 || (c == termios.control_characters[ControlCharIndex::VWERASE]
                     && termios.local_mode.contains(LocalMode::IEXTEN))
             {
-                self.eraser(c, &termios, &default_termios);
+                self.eraser(c, &termios);
                 self.commit_echoes(tty.clone());
                 return;
             }
@@ -581,13 +579,12 @@ impl NTtyData {
 
     /// ## ntty默认eraser function
     #[inline(never)]
-    fn eraser(&mut self, mut c: u8, termios: &RwLockReadGuard<Termios>, default_termios: &Termios) {
+    fn eraser(&mut self, mut c: u8, termios: &RwLockReadGuard<Termios>) {
         if self.read_head == self.canon_head {
             return;
         }
 
-        let erase = c == termios.control_characters[ControlCharIndex::VERASE]
-            || c == default_termios.control_characters[ControlCharIndex::VERASE];
+        let erase = c == termios.control_characters[ControlCharIndex::VERASE];
         let werase = c == termios.control_characters[ControlCharIndex::VWERASE];
         let kill = !erase && !werase;
 
@@ -1911,10 +1908,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     ) -> Result<(), system_error::SystemError> {
         let core = tty.core();
         let termios = core.termios();
-        let default_termios = *crate::driver::tty::termios::TTY_STD_TERMIOS;
         let mut ldata = self.disc_data();
         let contorl_chars = termios.control_characters;
-        let default_control_chars = default_termios.control_characters;
 
         // 第一次设置或者规范模式 (ICANON) 或者扩展处理 (EXTPROC) 标志发生变化
         let mut spec_mode_changed = false;
@@ -1983,10 +1978,6 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 ldata
                     .char_map
                     .set(contorl_chars[ControlCharIndex::VERASE] as usize, true);
-                ldata.char_map.set(
-                    default_control_chars[ControlCharIndex::VERASE] as usize,
-                    true,
-                );
                 ldata
                     .char_map
                     .set(contorl_chars[ControlCharIndex::VKILL] as usize, true);

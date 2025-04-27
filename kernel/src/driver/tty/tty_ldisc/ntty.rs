@@ -390,7 +390,7 @@ impl NTtyData {
                 continue;
             }
 
-            if ((c as usize) < self.char_map.size()) && self.char_map.get(c as usize).unwrap() {
+            if ((c as usize) < self.char_map.len()) && self.char_map.get(c as usize).unwrap() {
                 // 特殊字符
                 self.receive_special_char(c, tty.clone(), lookahead_done);
             } else {
@@ -1911,8 +1911,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     ) -> Result<(), system_error::SystemError> {
         let core = tty.core();
         let termios = core.termios();
+        let default_termios = *crate::driver::tty::termios::TTY_STD_TERMIOS;
         let mut ldata = self.disc_data();
         let contorl_chars = termios.control_characters;
+        let default_control_chars = default_termios.control_characters;
 
         // 第一次设置或者规范模式 (ICANON) 或者扩展处理 (EXTPROC) 标志发生变化
         let mut spec_mode_changed = false;
@@ -1981,6 +1983,9 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 ldata
                     .char_map
                     .set(contorl_chars[ControlCharIndex::VERASE] as usize, true);
+                ldata
+                    .char_map
+                    .set(default_control_chars[ControlCharIndex::VERASE] as usize, true);
                 ldata
                     .char_map
                     .set(contorl_chars[ControlCharIndex::VKILL] as usize, true);

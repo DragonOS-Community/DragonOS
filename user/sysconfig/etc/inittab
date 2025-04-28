@@ -1,9 +1,9 @@
 # /etc/inittab
 ::sysinit:busybox sh /etc/init.d/rcS      # 系统初始化脚本
-::sysinit:/bin/modify-termios
-::askfirst:-/bin/busybox sh --login
-# ttyS0::respawn:/bin/busybox sh
 
+::askfirst:-/bin/busybox sh --login
+
+::respawn:/bin/modify-termios
 
 
 # /etc/inittab - 根据源码弄出来的默认inittab

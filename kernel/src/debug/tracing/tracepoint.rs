@@ -162,7 +162,7 @@ macro_rules! define_event_trace{
             #[derive(Debug)]
             #[repr(C)]
             #[allow(non_snake_case)]
-
+            #[allow(non_camel_case_types)]
             struct [<__ $name _TracePointMeta>]{
                 trace_point: &'static $crate::debug::tracing::tracepoint::TracePoint,
                 print_func: fn(&mut (dyn core::any::Any+Send+Sync),$($arg_type),*),

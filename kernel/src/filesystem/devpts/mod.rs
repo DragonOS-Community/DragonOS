@@ -22,14 +22,14 @@ use crate::{
             tty_device::{PtyType, TtyDevice, TtyType},
         },
     },
-    filesystem::vfs::{core::do_mount_mkdir, syscall::ModeType, FileType},
+    filesystem::vfs::{syscall::ModeType, vcore::do_mount_mkdir, FileType},
     init::initcall::INITCALL_FS,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
 };
 
 use super::vfs::{
-    core::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata,
+    vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata,
 };
 
 const DEV_PTYFS_MAX_NAMELEN: usize = 16;
@@ -109,6 +109,7 @@ impl LockedDevPtsFSInode {
                     atime: PosixTimeSpec::default(),
                     mtime: PosixTimeSpec::default(),
                     ctime: PosixTimeSpec::default(),
+                    btime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
                     mode: ModeType::from_bits_truncate(0o777),
                     nlinks: 1,

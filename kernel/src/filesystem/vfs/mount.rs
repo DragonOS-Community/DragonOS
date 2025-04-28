@@ -749,3 +749,18 @@ impl Debug for MountList {
         f.debug_map().entries(MOUNT_LIST().0.read().iter()).finish()
     }
 }
+
+/// 判断给定的inode是否为其所在文件系统的根inode
+///
+/// ## 返回值
+///
+/// - `true`: 是根inode
+/// - `false`: 不是根inode或者传入的inode不是MountFSInode类型，或者调用inode的metadata方法时报错了。
+pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
+    let mnt_inode = inode.as_any_ref().downcast_ref::<MountFSInode>();
+    if let Some(mnt) = mnt_inode {
+        return mnt.is_mountpoint_root().unwrap_or(false);
+    }
+
+    return false;
+}

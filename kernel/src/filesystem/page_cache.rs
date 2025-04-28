@@ -25,7 +25,6 @@ use crate::{libs::align::page_align_up, mm::page::PageType};
 #[derive(Debug)]
 pub struct PageCache {
     inner: SpinLock<InnerPageCache>,
-    inode_id: usize,
     inode: Lazy<Weak<dyn IndexNode>>,
 }
 
@@ -319,15 +318,6 @@ impl Drop for InnerPageCache {
 
 impl PageCache {
     pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
-        let inode_id = inode
-            .as_ref()
-            .and_then(|inode| inode.upgrade())
-            .map_or(0, |inode| {
-                inode
-                    .metadata()
-                    .map(|metadata| metadata.inode_id.data())
-                    .unwrap_or(0)
-            });
         Arc::new_cyclic(|weak| Self {
             inner: SpinLock::new(InnerPageCache::new(weak.clone())),
             inode: {
@@ -337,7 +327,6 @@ impl PageCache {
                 }
                 v
             },
-            inode_id,
         })
     }
 

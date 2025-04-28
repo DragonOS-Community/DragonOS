@@ -355,11 +355,6 @@ impl InnerAddressSpace {
 
         let len = page_align_up(len);
 
-        let vm_flags = VmFlags::from(prot_flags)
-            | VmFlags::from(map_flags)
-            | VmFlags::VM_MAYREAD
-            | VmFlags::VM_MAYWRITE
-            | VmFlags::VM_MAYEXEC;
         // debug!("map_anonymous: len = {}", len);
 
         let binding = ProcessManager::current_pcb().fd_table();

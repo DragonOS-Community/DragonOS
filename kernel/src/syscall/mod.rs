@@ -1065,7 +1065,7 @@ impl Syscall {
 
             SYS_RSEQ => {
                 warn!("SYS_RSEQ has not yet been implemented");
-                Ok(0)
+                Err(SystemError::ENOSYS)
             }
 
             #[cfg(target_arch = "x86_64")]

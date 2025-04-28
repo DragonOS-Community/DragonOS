@@ -51,10 +51,10 @@ pub struct PosixOldUtsName {
 
 impl PosixOldUtsName {
     pub fn new() -> Self {
-        const SYS_NAME: &[u8] = b"DragonOS";
+        const SYS_NAME: &[u8] = b"Linux";
         const NODENAME: &[u8] = b"DragonOS";
-        const RELEASE: &[u8] = env!("CARGO_PKG_VERSION").as_bytes();
-        const VERSION: &[u8] = env!("CARGO_PKG_VERSION").as_bytes();
+        const RELEASE: &[u8] = b"5.19.0";
+        const VERSION: &[u8] = b"5.19.0";
 
         #[cfg(target_arch = "x86_64")]
         const MACHINE: &[u8] = b"x86_64";

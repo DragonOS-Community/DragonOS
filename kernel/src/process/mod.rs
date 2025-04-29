@@ -737,6 +737,9 @@ pub struct ProcessControlBlock {
 
     /// 进程组
     process_group: Mutex<Weak<ProcessGroup>>,
+
+    /// 进程的可执行文件路径
+    executable_path: RwLock<String>,
 }
 
 impl ProcessControlBlock {
@@ -788,7 +791,7 @@ impl ProcessControlBlock {
             (Self::generate_pid(), ppid, cwd, cred, tty)
         };
 
-        let basic_info = ProcessBasicInfo::new(ppid, name, cwd, None);
+        let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
@@ -826,6 +829,7 @@ impl ProcessControlBlock {
             self_ref: Weak::new(),
             restart_block: SpinLock::new(None),
             process_group: Mutex::new(Weak::new()),
+            executable_path: RwLock::new(name),
         };
 
         pcb.sig_info.write().set_tty(tty);
@@ -1021,6 +1025,14 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn cred(&self) -> Cred {
         self.cred.lock().clone()
+    }
+
+    pub fn set_execute_path(&self, path: String) {
+        *self.executable_path.write() = path;
+    }
+
+    pub fn get_execute_path(&self) -> String {
+        self.executable_path.read().clone()
     }
 
     /// 根据文件描述符序号，获取socket对象的Arc指针

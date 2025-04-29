@@ -1,4 +1,4 @@
-use libc::{tcgetattr, tcsetattr, termios, TCSANOW, VERASE, STDIN_FILENO};
+use libc::{tcgetattr, tcsetattr, termios, STDIN_FILENO, TCSANOW, VERASE};
 
 fn main() {
     unsafe {

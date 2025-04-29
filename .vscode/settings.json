@@ -4,7 +4,6 @@
     },
     "C_Cpp.errorSquiggles": "enabled",
     "esbonio.sphinx.confDir": "",
-    "rust-analyzer.checkOnSave.allTargets": false,
     "rust-analyzer.linkedProjects": [
         "./kernel/Cargo.toml",
         //"./tools/Cargo.toml",

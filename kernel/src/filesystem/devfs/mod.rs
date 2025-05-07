@@ -3,10 +3,10 @@ pub mod null_dev;
 pub mod zero_dev;
 
 use super::vfs::{
-    core::{generate_inode_id, ROOT_INODE},
     file::FileMode,
     syscall::ModeType,
     utils::DName,
+    vcore::{generate_inode_id, ROOT_INODE},
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
@@ -284,6 +284,7 @@ impl DevFSInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: dev_type_, // 文件夹
                 mode,
                 nlinks: 1,
@@ -375,6 +376,7 @@ impl LockedDevFSInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type,
                 mode,
                 nlinks: 1,
@@ -531,6 +533,7 @@ impl IndexNode for LockedDevFSInode {
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
         inode.metadata.ctime = metadata.ctime;
+        inode.metadata.btime = metadata.btime;
         inode.metadata.mode = metadata.mode;
         inode.metadata.uid = metadata.uid;
         inode.metadata.gid = metadata.gid;

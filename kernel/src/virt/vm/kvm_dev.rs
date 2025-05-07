@@ -13,9 +13,9 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{
-            core::generate_inode_id,
             file::{File, FileMode},
             syscall::ModeType,
+            vcore::generate_inode_id,
             FileType, IndexNode, Metadata,
         },
     },
@@ -61,6 +61,7 @@ impl LockedKvmInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
                 mode: ModeType::S_IALLUGO,
                 nlinks: 1,
@@ -202,6 +203,7 @@ impl KvmInstance {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice,
                 mode: ModeType::S_IALLUGO,
                 nlinks: 1,
@@ -332,6 +334,7 @@ impl KvmVcpuDev {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
                 mode: ModeType::S_IALLUGO,
                 nlinks: 1,

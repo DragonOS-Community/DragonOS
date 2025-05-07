@@ -10,7 +10,7 @@ use crate::producefs;
 use crate::syscall::user_access::UserBufferReader;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
-    filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
+    filesystem::vfs::{file::FileDescriptorVec, vcore as Vcore},
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
@@ -21,15 +21,16 @@ use crate::{
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
-use super::core::do_symlinkat;
+use super::stat::{do_newfstatat, do_statx, PosixKstat};
+use super::vcore::do_symlinkat;
 use super::{
-    core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     open::{
         do_faccessat, do_fchmodat, do_fchownat, do_sys_open, do_utimensat, do_utimes, ksys_fchown,
     },
     utils::{rsplit_path, user_path_at},
+    vcore::{do_mkdir_at, do_remove_dir, do_unlink_at},
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -90,124 +91,63 @@ bitflags! {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-/// # 文件信息结构体
-pub struct PosixKstat {
-    /// 硬件设备ID
-    dev_id: u64,
-    /// inode号
-    inode: u64,
-    /// 硬链接数
-    nlink: u64,
-    /// 文件权限
-    mode: ModeType,
-    /// 所有者用户ID
-    uid: i32,
-    /// 所有者组ID
-    gid: i32,
-    /// 设备ID
-    rdev: i64,
-    /// 文件大小
-    size: i64,
-    /// 文件系统块大小
-    blcok_size: i64,
-    /// 分配的512B块数
-    blocks: u64,
-    /// 最后访问时间
-    atime: PosixTimeSpec,
-    /// 最后修改时间
-    mtime: PosixTimeSpec,
-    /// 最后状态变化时间
-    ctime: PosixTimeSpec,
-    /// 用于填充结构体大小的空白数据
-    pub _pad: [i8; 24],
-}
-impl PosixKstat {
-    fn new() -> Self {
-        Self {
-            inode: 0,
-            dev_id: 0,
-            mode: ModeType { bits: 0 },
-            nlink: 0,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            size: 0,
-            atime: PosixTimeSpec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            },
-            mtime: PosixTimeSpec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            },
-            ctime: PosixTimeSpec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            },
-            blcok_size: 0,
-            blocks: 0,
-            _pad: Default::default(),
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 /// # 文件信息结构体X
 pub struct PosixStatx {
     /* 0x00 */
-    stx_mask: PosixStatxMask,
+    pub stx_mask: PosixStatxMask,
     /// 文件系统块大小
-    stx_blksize: u32,
+    pub stx_blksize: u32,
     /// Flags conveying information about the file [uncond]
-    stx_attributes: StxAttributes,
+    pub stx_attributes: StxAttributes,
     /* 0x10 */
     /// 硬链接数
-    stx_nlink: u32,
+    pub stx_nlink: u32,
     /// 所有者用户ID
-    stx_uid: u32,
+    pub stx_uid: u32,
     /// 所有者组ID
-    stx_gid: u32,
+    pub stx_gid: u32,
     /// 文件权限
-    stx_mode: ModeType,
+    pub stx_mode: ModeType,
 
     /* 0x20 */
     /// inode号
-    stx_inode: u64,
+    pub stx_inode: u64,
     /// 文件大小
-    stx_size: i64,
+    pub stx_size: i64,
     /// 分配的512B块数
-    stx_blocks: u64,
+    pub stx_blocks: u64,
     /// Mask to show what's supported in stx_attributes
-    stx_attributes_mask: StxAttributes,
+    pub stx_attributes_mask: StxAttributes,
 
     /* 0x40 */
     /// 最后访问时间
-    stx_atime: PosixTimeSpec,
+    pub stx_atime: PosixTimeSpec,
     /// 文件创建时间
-    stx_btime: PosixTimeSpec,
+    pub stx_btime: PosixTimeSpec,
     /// 最后状态变化时间
-    stx_ctime: PosixTimeSpec,
+    pub stx_ctime: PosixTimeSpec,
     /// 最后修改时间
-    stx_mtime: PosixTimeSpec,
+    pub stx_mtime: PosixTimeSpec,
 
     /* 0x80 */
     /// 主设备ID
-    stx_rdev_major: u32,
+    pub stx_rdev_major: u32,
     /// 次设备ID
-    stx_rdev_minor: u32,
+    pub stx_rdev_minor: u32,
     /// 主硬件设备ID
-    stx_dev_major: u32,
+    pub stx_dev_major: u32,
     /// 次硬件设备ID
-    stx_dev_minor: u32,
+    pub stx_dev_minor: u32,
 
     /* 0x90 */
-    stx_mnt_id: u64,
-    stx_dio_mem_align: u32,
-    stx_dio_offset_align: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
 }
+
 impl PosixStatx {
-    fn new() -> Self {
+    #[inline(never)]
+    pub(super) fn new() -> Self {
         Self {
             stx_mask: PosixStatxMask::STATX_BASIC_STATS,
             stx_blksize: 0,
@@ -301,6 +241,9 @@ bitflags! {
 
         /// Reserved for future struct statx expansion
         const STATX_RESERVED = 0x80000000;
+
+        /// Want/got stx_change_attr
+        const STATX_CHANGE_COOKIE = 0x40000000;
     }
 }
 
@@ -324,6 +267,8 @@ bitflags! {
         const STATX_ATTR_VERITY = 0x00100000;
         /// 文件当前处于 DAX 状态 CPU直接访问
         const STATX_ATTR_DAX = 0x00200000;
+        /// version monotonically increases
+        const STATX_ATTR_CHANGE_MONOTONIC = 0x8000000000000000;
     }
 }
 
@@ -1411,112 +1356,39 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn do_statx(
-        fd: i32,
-        path: *const u8,
+    #[inline(never)]
+    pub fn statx(
+        dfd: i32,
+        filename_ptr: usize,
         flags: u32,
         mask: u32,
-        usr_kstat: *mut PosixStatx,
+        user_kstat_ptr: usize,
     ) -> Result<usize, SystemError> {
-        if usr_kstat.is_null() {
+        if user_kstat_ptr == 0 {
             return Err(SystemError::EFAULT);
         }
 
-        let mask = PosixStatxMask::from_bits_truncate(mask);
+        let filename = check_and_clone_cstr(filename_ptr as *const u8, Some(MAX_PATHLEN))?;
+        let filename_str = filename.to_str().map_err(|_| SystemError::EINVAL)?;
 
-        if mask.contains(PosixStatxMask::STATX_RESERVED) {
-            return Err(SystemError::ENAVAIL);
-        }
+        do_statx(dfd, filename_str, flags, mask, user_kstat_ptr).map(|_| 0)
+    }
 
-        let flags = FileMode::from_bits_truncate(flags);
-        let ofd = Self::open(path, flags.bits(), ModeType::empty().bits, true)?;
-
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(ofd as i32)
-            .ok_or(SystemError::EBADF)?;
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixStatx>(), true)?;
-        let mut tmp: PosixStatx = PosixStatx::new();
-        // 获取文件信息
-        let metadata = file.metadata()?;
-
-        tmp.stx_mask |= PosixStatxMask::STATX_BASIC_STATS;
-        tmp.stx_blksize = metadata.blk_size as u32;
-        if mask.contains(PosixStatxMask::STATX_MODE) || mask.contains(PosixStatxMask::STATX_TYPE) {
-            tmp.stx_mode = metadata.mode;
-        }
-        if mask.contains(PosixStatxMask::STATX_NLINK) {
-            tmp.stx_nlink = metadata.nlinks as u32;
-        }
-        if mask.contains(PosixStatxMask::STATX_UID) {
-            tmp.stx_uid = metadata.uid as u32;
-        }
-        if mask.contains(PosixStatxMask::STATX_GID) {
-            tmp.stx_gid = metadata.gid as u32;
-        }
-        if mask.contains(PosixStatxMask::STATX_ATIME) {
-            tmp.stx_atime.tv_sec = metadata.atime.tv_sec;
-            tmp.stx_atime.tv_nsec = metadata.atime.tv_nsec;
-        }
-        if mask.contains(PosixStatxMask::STATX_MTIME) {
-            tmp.stx_mtime.tv_sec = metadata.ctime.tv_sec;
-            tmp.stx_mtime.tv_nsec = metadata.ctime.tv_nsec;
-        }
-        if mask.contains(PosixStatxMask::STATX_CTIME) {
-            // ctime是文件上次修改状态的时间
-            tmp.stx_ctime.tv_sec = metadata.mtime.tv_sec;
-            tmp.stx_ctime.tv_nsec = metadata.mtime.tv_nsec;
-        }
-        if mask.contains(PosixStatxMask::STATX_INO) {
-            tmp.stx_inode = metadata.inode_id.into() as u64;
-        }
-        if mask.contains(PosixStatxMask::STATX_SIZE) {
-            tmp.stx_size = metadata.size;
-        }
-        if mask.contains(PosixStatxMask::STATX_BLOCKS) {
-            tmp.stx_blocks = metadata.blocks as u64;
+    #[inline(never)]
+    pub fn newfstatat(
+        dfd: i32,
+        filename_ptr: usize,
+        user_stat_buf_ptr: usize,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        if user_stat_buf_ptr == 0 {
+            return Err(SystemError::EFAULT);
         }
 
-        if mask.contains(PosixStatxMask::STATX_BTIME) {
-            // btime是文件创建时间
-            tmp.stx_btime.tv_sec = metadata.ctime.tv_sec;
-            tmp.stx_btime.tv_nsec = metadata.ctime.tv_nsec;
-        }
-        if mask.contains(PosixStatxMask::STATX_ALL) {
-            tmp.stx_attributes = StxAttributes::STATX_ATTR_APPEND;
-            tmp.stx_attributes_mask |=
-                StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
-            tmp.stx_dev_major = metadata.dev_id as u32;
-            tmp.stx_dev_minor = metadata.dev_id as u32; //
-            tmp.stx_rdev_major = metadata.raw_dev.data();
-            tmp.stx_rdev_minor = metadata.raw_dev.data();
-        }
-        if mask.contains(PosixStatxMask::STATX_MNT_ID) {
-            tmp.stx_mnt_id = 0;
-        }
-        if mask.contains(PosixStatxMask::STATX_DIOALIGN) {
-            tmp.stx_dio_mem_align = 0;
-            tmp.stx_dio_offset_align = 0;
-        }
+        let filename = check_and_clone_cstr(filename_ptr as *const u8, Some(MAX_PATHLEN))?;
+        let filename_str = filename.to_str().map_err(|_| SystemError::EINVAL)?;
 
-        match file.file_type() {
-            FileType::File => tmp.stx_mode.insert(ModeType::S_IFREG),
-            FileType::Dir => tmp.stx_mode.insert(ModeType::S_IFDIR),
-            FileType::BlockDevice => tmp.stx_mode.insert(ModeType::S_IFBLK),
-            FileType::CharDevice => tmp.stx_mode.insert(ModeType::S_IFCHR),
-            FileType::SymLink => tmp.stx_mode.insert(ModeType::S_IFLNK),
-            FileType::Socket => tmp.stx_mode.insert(ModeType::S_IFSOCK),
-            FileType::Pipe => tmp.stx_mode.insert(ModeType::S_IFIFO),
-            FileType::KvmDevice => tmp.stx_mode.insert(ModeType::S_IFCHR),
-            FileType::FramebufferDevice => tmp.stx_mode.insert(ModeType::S_IFCHR),
-        }
-
-        writer.copy_one_to_user(&tmp, 0)?;
-        Self::close(fd as usize).ok();
-        return Ok(0);
+        do_newfstatat(dfd, filename_str, user_stat_buf_ptr, flags).map(|_| 0)
     }
 
     pub fn mknod(

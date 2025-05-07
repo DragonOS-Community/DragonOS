@@ -65,6 +65,10 @@ impl PosixTimeSpec {
         };
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.tv_nsec == 0 && self.tv_sec == 0
+    }
+
     /// 获取当前时间
     #[inline(always)]
     pub fn now() -> Self {

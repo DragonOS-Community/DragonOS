@@ -26,6 +26,7 @@ use super::{
     fcntl::AtFlags,
     file::FileMode,
     mount::{init_mountlist, MOUNT_LIST},
+    stat::LookUpFlags,
     syscall::UmountFlag,
     utils::{rsplit_path, user_path_at},
     FilePrivateData, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -395,4 +396,14 @@ pub fn do_umount2(
         return Err(SystemError::EINVAL);
     };
     return do_umount();
+}
+
+pub(super) fn do_file_lookup_at(
+    dfd: i32,
+    path: &str,
+    lookup_flags: LookUpFlags,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
+    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dfd, path)?;
+    let follow_final = lookup_flags.contains(LookUpFlags::FOLLOW);
+    return inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final);
 }

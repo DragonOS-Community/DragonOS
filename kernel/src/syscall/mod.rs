@@ -5,7 +5,7 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
+    filesystem::vfs::syscall::PosixStatfs,
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
@@ -29,7 +29,8 @@ use crate::{
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
-        syscall::{ModeType, PosixKstat, UtimensFlags},
+        stat::PosixKstat,
+        syscall::{ModeType, UtimensFlags},
         MAX_PATHLEN,
     },
     libs::align::page_align_up,
@@ -811,15 +812,13 @@ impl Syscall {
                 Self::fstatfs(fd, statfs)
             }
 
-            SYS_STATX => {
-                let fd = args[0] as i32;
-                let path = args[1] as *const u8;
-                let flags = args[2] as u32;
-                let mask = args[3] as u32;
-                let kstat = args[4] as *mut PosixStatx;
-
-                Self::do_statx(fd, path, flags, mask, kstat)
-            }
+            SYS_STATX => Self::statx(
+                args[0] as i32,
+                args[1],
+                args[2] as u32,
+                args[3] as u32,
+                args[4],
+            ),
 
             #[cfg(target_arch = "x86_64")]
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),
@@ -1136,11 +1135,7 @@ impl Syscall {
             }
 
             #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-            SYS_NEWFSTATAT => {
-                // todo: 这个系统调用还没有实现
-
-                Err(SystemError::ENOSYS)
-            }
+            SYS_NEWFSTATAT => Self::newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
 
             // SYS_SCHED_YIELD => Self::sched_yield(),
             SYS_UNAME => {

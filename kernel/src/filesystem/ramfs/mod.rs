@@ -5,7 +5,7 @@ use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{core::generate_inode_id, FileType},
+    filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -86,6 +86,7 @@ impl RamFSInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -281,6 +282,7 @@ impl IndexNode for LockedRamFSInode {
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
         inode.metadata.ctime = metadata.ctime;
+        inode.metadata.btime = metadata.btime;
         inode.metadata.mode = metadata.mode;
         inode.metadata.uid = metadata.uid;
         inode.metadata.gid = metadata.gid;
@@ -332,6 +334,7 @@ impl IndexNode for LockedRamFSInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type,
                 mode,
                 nlinks: 1,
@@ -594,6 +597,7 @@ impl IndexNode for LockedRamFSInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::Pipe,
                 mode,
                 nlinks: 1,

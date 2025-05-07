@@ -4,6 +4,7 @@ mod acpi;
 pub mod cpu;
 pub mod driver;
 pub mod elf;
+pub mod filesystem;
 pub mod fpu;
 pub mod init;
 pub mod interrupt;

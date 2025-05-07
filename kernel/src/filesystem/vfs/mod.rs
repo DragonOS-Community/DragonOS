@@ -803,6 +803,7 @@ impl dyn IndexNode {
 #[builder(no_std, setter(into))]
 pub struct Metadata {
     /// 当前inode所在的文件系统的设备号
+    /// todo:更改为DeviceNumber结构体
     pub dev_id: usize,
 
     /// inode号

@@ -21,7 +21,6 @@ SECTIONS
 		*(.bootstrap.*)
 		. = ALIGN(4096);
 		*(.initial_pgtable_section)
-		. = ALIGN(4096);
 	}
 
 
@@ -68,7 +67,7 @@ SECTIONS
 	. = ALIGN(32768);
 	
 	trace_point_start_pa = .;
-	.tracepoint (trace_point_start_pa): AT(trace_point_start_pa - KERNEL_VMA)
+	.tracepoint (trace_point_start_pa):
     {
         _tracepoint = .;
         *(.tracepoint)

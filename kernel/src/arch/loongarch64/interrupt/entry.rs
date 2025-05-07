@@ -1,20 +1,7 @@
-use asm_macros::{
-    backup_t0t1, get_saved_sp, reload_t0t1, restore_all_and_ret, restore_some, restore_sp_and_ret,
-    restore_static, restore_temp, save_all, save_some, save_static, save_temp,
-};
+use asm_macros::*;
 use kdepends::memoffset::offset_of;
 
-use crate::{
-    arch::{
-        asm::{
-            EXCEPTION_KS0, EXCEPTION_KS1, LOONGARCH_CSR_BADV, LOONGARCH_CSR_CRMD,
-            LOONGARCH_CSR_ECFG, LOONGARCH_CSR_ERA, LOONGARCH_CSR_ESTAT, LOONGARCH_CSR_EUEN,
-            LOONGARCH_CSR_PRMD, PERCPU_BASE_KS, _THREAD_MASK,
-        },
-        interrupt::TrapFrame,
-    },
-    driver::serial::serial8250::send_to_default_serial8250_port,
-};
+use crate::arch::{asm::*, interrupt::TrapFrame};
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/arch/loongarch/kernel/genex.S#55
 macro_rules! build_prep_badv_ {

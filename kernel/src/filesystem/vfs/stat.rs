@@ -1,7 +1,10 @@
 use system_error::SystemError;
 
 use crate::{
+    arch::filesystem::stat::PosixStat,
+    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{mount::is_mountpoint_root, vcore::do_file_lookup_at},
+    process::ProcessManager,
     syscall::user_access::UserBufferWriter,
     time::PosixTimeSpec,
 };
@@ -22,8 +25,8 @@ pub struct KStat {
     pub attributes: StxAttributes,
     pub attributes_mask: StxAttributes,
     pub ino: u64,
-    pub dev: i64,             // dev_t
-    pub rdev: i64,            // dev_t
+    pub dev: DeviceNumber,    // dev_t
+    pub rdev: DeviceNumber,   // dev_t
     pub uid: u32,             // kuid_t
     pub gid: u32,             // kgid_t
     pub size: usize,          // loff_t
@@ -257,14 +260,75 @@ pub fn vfs_getattr(
         kstat.attributes = StxAttributes::STATX_ATTR_APPEND;
         kstat.attributes_mask |=
             StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
-        kstat.dev = metadata.dev_id as i64;
-        kstat.rdev = metadata.raw_dev.data() as i64;
+        kstat.dev = DeviceNumber::from(metadata.dev_id as u32);
+        kstat.rdev = metadata.raw_dev;
     }
 
     // 把文件类型加入mode里面 （todo: 在具体的文件系统里面去实现这个操作。这里只是权宜之计）
     kstat.mode |= metadata.file_type.into();
 
     return Ok(kstat);
+}
+
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#274
+#[inline(never)]
+pub fn vfs_fstatat(dfd: i32, filename: &str, flags: AtFlags) -> Result<KStat, SystemError> {
+    let statx_flags = flags | AtFlags::AT_NO_AUTOMOUNT;
+    if dfd >= 0 && flags == AtFlags::AT_EMPTY_PATH {
+        return vfs_fstat(dfd);
+    }
+
+    return vfs_statx(
+        dfd,
+        filename,
+        statx_flags,
+        PosixStatxMask::STATX_BASIC_STATS,
+    );
+}
+
+/// vfs_fstat - Get the basic attributes by file descriptor
+///
+/// # Arguments
+/// - fd: The file descriptor referring to the file of interest
+///
+///  This function is a wrapper around vfs_getattr(). The main difference is
+///  that it uses a file descriptor to determine the file location.
+///
+/// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#190
+pub fn vfs_fstat(dfd: i32) -> Result<KStat, SystemError> {
+    // Get the file from the file descriptor
+    let pcb = ProcessManager::current_pcb();
+    let fd_table = pcb.fd_table();
+    let file = fd_table
+        .read()
+        .get_file_by_fd(dfd)
+        .ok_or(SystemError::EBADF)?;
+    let inode = file.inode();
+
+    // Get attributes using vfs_getattr with basic stats mask
+    vfs_getattr(&inode, PosixStatxMask::STATX_BASIC_STATS, AtFlags::empty())
+}
+
+pub(super) fn do_newfstatat(
+    dfd: i32,
+    filename: &str,
+    user_stat_buf_ptr: usize,
+    flags: u32,
+) -> Result<(), SystemError> {
+    let kstat = vfs_fstatat(dfd, filename, AtFlags::from_bits_truncate(flags as i32))?;
+
+    cp_new_stat(kstat, user_stat_buf_ptr)
+}
+
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#393
+#[inline(never)]
+fn cp_new_stat(kstat: KStat, user_buf_ptr: usize) -> Result<(), SystemError> {
+    let posix_stat = PosixStat::try_from(kstat)?;
+    let mut ubuf_writer =
+        UserBufferWriter::new(user_buf_ptr as *mut PosixStat, size_of::<PosixStat>(), true)?;
+    ubuf_writer
+        .copy_one_to_user(&posix_stat, 0)
+        .map_err(|_| SystemError::EFAULT)
 }
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#660
@@ -319,10 +383,10 @@ fn cp_statx(kstat: KStat, user_buf_ptr: usize) -> Result<(), SystemError> {
     statx.stx_mtime = kstat.mtime;
 
     // Convert device numbers
-    statx.stx_rdev_major = ((kstat.rdev >> 32) & 0xffff_ffff) as u32; // MAJOR equivalent
-    statx.stx_rdev_minor = (kstat.rdev & 0xffff_ffff) as u32; // MINOR equivalent
-    statx.stx_dev_major = ((kstat.dev >> 32) & 0xffff_ffff) as u32; // MAJOR equivalent
-    statx.stx_dev_minor = (kstat.dev & 0xffff_ffff) as u32; // MINOR equivalent
+    statx.stx_rdev_major = kstat.rdev.major().data();
+    statx.stx_rdev_minor = kstat.rdev.minor();
+    statx.stx_dev_major = kstat.dev.major().data();
+    statx.stx_dev_minor = kstat.dev.minor();
 
     statx.stx_mnt_id = kstat.mnt_id;
     statx.stx_dio_mem_align = kstat.dio_mem_align;

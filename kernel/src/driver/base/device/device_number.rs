@@ -60,6 +60,17 @@ impl DeviceNumber {
     pub const fn data(&self) -> u32 {
         self.data
     }
+
+    /// acceptable for old filesystems
+    pub const fn old_valid_dev(&self) -> bool {
+        (self.major().data() < 256) && (self.minor() < 256)
+    }
+
+    pub const fn new_encode_dev(&self) -> u32 {
+        let major = self.major().data();
+        let minor = self.minor();
+        return (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
+    }
 }
 
 impl Default for DeviceNumber {

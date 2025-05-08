@@ -69,22 +69,24 @@ impl PosixTermios {
             local_mode: LocalMode::from_bits_truncate(self.c_lflag),
             control_characters: self.c_cc,
             line: LineDisciplineType::from_line(self.c_line),
-            input_speed: self.get_input_speed().unwrap_or(38400),
-            output_speed: self.get_output_speed().unwrap_or(38400),
+            input_speed: self.input_speed().unwrap_or(38400),
+            output_speed: self.output_speed().unwrap_or(38400),
         }
     }
 
-    fn get_output_speed(&self) -> Option<u32> {
-        let flag = self.c_cflag & ControlMode::CBAUD.intersection(ControlMode::CBAUDEX).bits(); // CBAUD + CBAUDEX
-        get_baud_rate_from_flag(flag)
+    fn output_speed(&self) -> Option<u32> {
+        let flag = ControlMode::from_bits_truncate(
+            self.c_cflag & ControlMode::CBAUD.intersection(ControlMode::CBAUDEX).bits(),
+        ); // CBAUD + CBAUDEX
+        flag.baud_rate()
     }
 
-    fn get_input_speed(&self) -> Option<u32> {
+    fn input_speed(&self) -> Option<u32> {
         let ibaud = (self.c_cflag & ControlMode::CIBAUD.bits()) >> 16;
         if ibaud == 0 {
-            self.get_output_speed()
+            self.output_speed()
         } else {
-            get_baud_rate_from_flag(ibaud << 16)
+            ControlMode::from_bits_truncate(ibaud).baud_rate()
         }
     }
 }
@@ -362,6 +364,46 @@ bitflags! {
     }
 }
 
+impl ControlMode {
+    /// 获取波特率
+    pub fn baud_rate(&self) -> Option<u32> {
+        match *self {
+            ControlMode::B0 => Some(0),
+            ControlMode::B50 => Some(50),
+            ControlMode::B75 => Some(75),
+            ControlMode::B110 => Some(110),
+            ControlMode::B134 => Some(134),
+            ControlMode::B150 => Some(150),
+            ControlMode::B200 => Some(200),
+            ControlMode::B300 => Some(300),
+            ControlMode::B600 => Some(600),
+            ControlMode::B1200 => Some(1200),
+            ControlMode::B1800 => Some(1800),
+            ControlMode::B2400 => Some(2400),
+            ControlMode::B4800 => Some(4800),
+            ControlMode::B9600 => Some(9600),
+            ControlMode::B19200 => Some(19200),
+            ControlMode::B38400 => Some(38400),
+            ControlMode::B57600 => Some(57600),
+            ControlMode::B115200 => Some(115200),
+            ControlMode::B230400 => Some(230400),
+            ControlMode::B460800 => Some(460800),
+            ControlMode::B500000 => Some(500000),
+            ControlMode::B576000 => Some(576000),
+            ControlMode::B921600 => Some(921600),
+            ControlMode::B1000000 => Some(1000000),
+            ControlMode::B1152000 => Some(1152000),
+            ControlMode::B1500000 => Some(1500000),
+            ControlMode::B2000000 => Some(2000000),
+            ControlMode::B2500000 => Some(2500000),
+            ControlMode::B3000000 => Some(3000000),
+            ControlMode::B3500000 => Some(3500000),
+            ControlMode::B4000000 => Some(4000000),
+            _ => None,
+        }
+    }
+}
+
 /// 对应termios中控制字符的索引
 pub struct ControlCharIndex;
 #[allow(dead_code)]
@@ -401,41 +443,4 @@ impl ControlCharIndex {
     pub const VLNEXT: usize = 15;
     /// 对应于字符丢弃信号，用于丢弃当前输入的行
     pub const VDISCARD: usize = 16;
-}
-
-fn get_baud_rate_from_flag(flag: u32) -> Option<u32> {
-    match flag {
-        0x00000000 => Some(0),
-        0x00000001 => Some(50),
-        0x00000002 => Some(75),
-        0x00000003 => Some(110),
-        0x00000004 => Some(134),
-        0x00000005 => Some(150),
-        0x00000006 => Some(200),
-        0x00000007 => Some(300),
-        0x00000008 => Some(600),
-        0x00000009 => Some(1200),
-        0x0000000a => Some(1800),
-        0x0000000b => Some(2400),
-        0x0000000c => Some(4800),
-        0x0000000d => Some(9600),
-        0x0000000e => Some(19200),
-        0x0000000f => Some(38400),
-        0x00001001 => Some(57600),
-        0x00001002 => Some(115200),
-        0x00001003 => Some(230400),
-        0x00001004 => Some(460800),
-        0x00001005 => Some(500000),
-        0x00001006 => Some(576000),
-        0x00001007 => Some(921600),
-        0x00001008 => Some(1_000_000),
-        0x00001009 => Some(1_152_000),
-        0x0000100a => Some(1_500_000),
-        0x0000100b => Some(2_000_000),
-        0x0000100c => Some(2_500_000),
-        0x0000100d => Some(3_000_000),
-        0x0000100e => Some(3_500_000),
-        0x0000100f => Some(4_000_000),
-        _ => None,
-    }
 }

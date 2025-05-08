@@ -549,6 +549,13 @@ impl ProcessManager {
             )
         });
 
+        Self::copy_fs(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
+
         sched_cgroup_fork(pcb);
 
         Ok(())
@@ -595,6 +602,21 @@ impl ProcessManager {
 
         child_pcb.set_process_group(&pg);
 
+        Ok(())
+    }
+
+    fn copy_fs(
+        clone_flags: &CloneFlags,
+        parent_pcb: &Arc<ProcessControlBlock>,
+        child_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        let fs = parent_pcb.fs_struct();
+        if clone_flags.contains(CloneFlags::CLONE_FS) {
+            child_pcb.set_fs_struct(fs.clone());
+        } else {
+            let new_fs = (*fs).clone();
+            child_pcb.set_fs_struct(Arc::new(new_fs));
+        }
         Ok(())
     }
 }

@@ -734,6 +734,7 @@ impl Syscall {
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(new_path);
+            proc.set_pwd(inode);
             return Ok(0);
         } else {
             return Err(SystemError::ENOTDIR);
@@ -753,6 +754,7 @@ impl Syscall {
         }
         let path = inode.absolute_path()?;
         pcb.basic_mut().set_cwd(path);
+        pcb.set_pwd(inode);
         return Ok(0);
     }
 

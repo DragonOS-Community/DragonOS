@@ -87,6 +87,9 @@ impl FsStruct {
     pub fn set_pwd(&mut self, inode: Arc<dyn IndexNode>) {
         self.pwd = inode;
     }
+    pub fn pwd(&self) -> Arc<dyn IndexNode> {
+        self.pwd.clone()
+    }
 }
 
 impl Namespace for MntNamespace {
@@ -127,8 +130,11 @@ impl NsOperations for MntNsOperations {
         }
         nsproxy.mnt_namespace = mnt_ns;
 
-        nsset.fs.lock().set_pwd(ROOT_INODE());
-        nsset.fs.lock().set_root(ROOT_INODE());
+        let mut guard = nsset.fs.write();
+        let mut fs = (**guard).clone();
+        fs.set_pwd(ROOT_INODE());
+        fs.set_root(ROOT_INODE());
+        *guard = Arc::new(fs);
         Ok(())
     }
     fn owner(&self, ns_common: Arc<NsCommon>) -> Arc<UserNamespace> {

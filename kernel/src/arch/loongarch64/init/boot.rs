@@ -1,6 +1,6 @@
 use loongArch64::register::{ecfg, eentry};
 
-use crate::{init::init::start_kernel, mm::PhysAddr};
+use crate::{arch::interrupt::entry::handle_reserved_, init::init::start_kernel, mm::PhysAddr};
 
 static mut BOOT_HARTID: u32 = 0;
 static mut BOOT_FDT_PADDR: PhysAddr = PhysAddr::new(0);
@@ -15,16 +15,19 @@ pub unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
         BOOT_HARTID = hartid as u32;
         BOOT_FDT_PADDR = fdt_paddr;
     }
-    setup_trap_vector();
+    boot_tmp_setup_trap_vector();
+
     start_kernel();
 }
 
-/// 设置中断、异常处理函数
-fn setup_trap_vector() {
-    // todo!();
-    // let ptr = handle_exception as *const () as usize;
-    // ecfg::set_vs(0);
-    // eentry::set_eentry(handle_exception as usize);
+/// 临时设置中断、异常处理函数
+///
+/// 后续需要通过 https://code.dragonos.org.cn/xref/linux-6.6.21/arch/loongarch/kernel/traps.c#1085
+/// 这里的这个函数来重新设置中断、异常处理函数
+fn boot_tmp_setup_trap_vector() {
+    let ptr = handle_reserved_ as *const () as usize;
+    ecfg::set_vs(0);
+    eentry::set_eentry(ptr);
 }
 
 /// Clear the bss section

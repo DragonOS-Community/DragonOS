@@ -3,6 +3,7 @@ on: [push]
 
 jobs:
   sync:
+    if: github.repository == 'DragonOS-Community/DragonOS'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3

@@ -1,4 +1,4 @@
-use crate::smp::cpu::ProcessorId;
+use crate::{mm::percpu::PerCpu, smp::cpu::ProcessorId};
 
 /// 重置cpu
 pub unsafe fn cpu_reset() -> ! {
@@ -13,3 +13,6 @@ pub unsafe fn cpu_reset() -> ! {
 pub fn current_cpu_id() -> ProcessorId {
     ProcessorId::new(loongArch64::register::cpuid::read().core_id() as u32)
 }
+
+#[no_mangle]
+pub static mut KERNEL_SP: [usize; PerCpu::MAX_CPU_NUM as usize] = [0; PerCpu::MAX_CPU_NUM as usize];

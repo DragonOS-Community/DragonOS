@@ -43,7 +43,7 @@ congratulations()
     echo "|   请[关闭]当前终端, 并[重新打开]一个终端 |"
 	echo "|   然后通过以下命令运行:                  |"
 	echo "|                                          |"
-	echo "|                make run                  |"
+	echo "|          make run-nographic              |"
 	echo "|                                          |"
 	echo "|------------------------------------------|"
 }
@@ -232,8 +232,7 @@ rustInstall() {
 		fi
 
         echo "正在安装DragonOS所需的rust组件...首次安装需要一些时间来更新索引，请耐心等待..."
-        cargo install cargo-binutils
-		cargo install bpf-linker
+        
 		rustup toolchain install $RUST_VERSION-x86_64-unknown-linux-gnu
 		rustup toolchain install $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
@@ -255,6 +254,8 @@ rustInstall() {
 		rustup component add rust-src
         rustup component add llvm-tools-preview
 		rustup default $RUST_VERSION
+		cargo install cargo-binutils
+		cargo install bpf-linker
 		
 		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 以使rust在当前窗口生效！"
 	fi

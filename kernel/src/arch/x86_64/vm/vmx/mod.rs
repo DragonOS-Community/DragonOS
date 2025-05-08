@@ -3743,8 +3743,12 @@ pub static L1TF_VMX_MITIGATION: RwLock<VmxL1dFlushState> = RwLock::new(VmxL1dFlu
 
 pub fn vmx_init() -> Result<(), SystemError> {
     let cpuid = CpuId::new();
-    let cpu_feat = cpuid.get_feature_info().ok_or(SystemError::ENOSYS)?;
+    let cpu_feat = cpuid.get_feature_info().ok_or_else(|| {
+        log::warn!("Failed to get CPU feature info, perhaps not AMD or Intel CPU");
+        SystemError::ENOSYS
+    })?;
     if !cpu_feat.has_vmx() {
+        log::warn!("VMX not supported or enabled");
         return Err(SystemError::ENOSYS);
     }
 

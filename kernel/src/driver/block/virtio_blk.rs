@@ -1,4 +1,7 @@
-use core::{any::Any, fmt::Debug};
+use core::{
+    any::Any,
+    fmt::{Debug, Formatter},
+};
 
 use alloc::{
     string::{String, ToString},
@@ -147,7 +150,6 @@ impl VirtIOBlkManager {
 }
 
 /// virtio block device
-#[derive(Debug)]
 #[cast_to([sync] VirtIODevice)]
 #[cast_to([sync] Device)]
 pub struct VirtIOBlkDevice {
@@ -156,6 +158,15 @@ pub struct VirtIOBlkDevice {
     inner: SpinLock<InnerVirtIOBlkDevice>,
     locked_kobj_state: LockedKObjectState,
     self_ref: Weak<Self>,
+}
+
+impl Debug for VirtIOBlkDevice {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtIOBlkDevice")
+            .field("devname", &self.blkdev_meta.devname)
+            .field("dev_id", &self.dev_id.id())
+            .finish()
+    }
 }
 
 unsafe impl Send for VirtIOBlkDevice {}

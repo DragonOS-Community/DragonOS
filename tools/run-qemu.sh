@@ -194,7 +194,7 @@ fi
 
 setup_kernel_init_program() {
     if [ ${ARCH} == "x86_64" ]; then
-        KERNEL_CMDLINE+=" init=/bin/dragonreach "
+        KERNEL_CMDLINE+=" init=/bin/busybox init "
     elif [ ${ARCH} == "riscv64" ]; then
         KERNEL_CMDLINE+=" init=/bin/riscv_rust_init "
     fi
@@ -264,7 +264,7 @@ if [ ${BIOS_TYPE} == uefi ] ;then
 else
   # 如果是i386架构或者x86_64架构，就直接启动
   if [ ${ARCH} == x86_64 ] || [ ${ARCH} == i386 ] ;then
-    sudo ${QEMU} ${QEMU_ARGUMENT}
+    sudo ${QEMU} ${QEMU_ARGUMENT} -append "${KERNEL_CMDLINE}"
   elif [ ${ARCH} == riscv64 ] ;then
     # 如果是riscv64架构，就与efi启动一样
     install_riscv_uboot

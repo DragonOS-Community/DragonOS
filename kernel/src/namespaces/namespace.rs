@@ -113,7 +113,7 @@ pub fn commit_nsset(nsset: NsSet) {
     if flags.contains(CloneFlags::CLONE_NEWNS) {
         let nsset_fs = nsset.fs.read();
         let fs = current.fs_struct();
-        
+
         let mut fs = (*fs).clone();
         fs.set_pwd(nsset_fs.pwd.clone());
         fs.set_root(nsset_fs.root.clone());

@@ -5,10 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::block::SeekFrom,
-    filesystem::vfs::{
-        file::{File, FileMode},
-        ROOT_INODE,
-    },
+    filesystem::vfs::file::{File, FileMode},
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},

@@ -284,7 +284,7 @@ impl ProcFSInode {
         } else {
             ProcessManager::find(pid).ok_or(SystemError::ESRCH)?
         };
-        let exe = pcb.get_execute_path();
+        let exe = pcb.execute_path();
         let exe_bytes = exe.as_bytes();
         let len = exe_bytes.len().min(buf.len());
         buf[..len].copy_from_slice(&exe_bytes[..len]);

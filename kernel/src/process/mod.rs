@@ -1031,7 +1031,7 @@ impl ProcessControlBlock {
         *self.executable_path.write() = path;
     }
 
-    pub fn get_execute_path(&self) -> String {
+    pub fn execute_path(&self) -> String {
         self.executable_path.read().clone()
     }
 

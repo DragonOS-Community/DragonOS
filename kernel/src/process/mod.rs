@@ -737,6 +737,9 @@ pub struct ProcessControlBlock {
 
     /// 进程组
     process_group: Mutex<Weak<ProcessGroup>>,
+
+    /// 进程的可执行文件路径
+    executable_path: RwLock<String>,
 }
 
 impl ProcessControlBlock {
@@ -788,14 +791,7 @@ impl ProcessControlBlock {
             (Self::generate_pid(), ppid, cwd, cred, tty)
         };
 
-        let basic_info = ProcessBasicInfo::new(
-            Pgid::from(pid.into()),
-            ppid,
-            Sid::from(pid.into()),
-            name,
-            cwd,
-            None,
-        );
+        let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
@@ -833,6 +829,7 @@ impl ProcessControlBlock {
             self_ref: Weak::new(),
             restart_block: SpinLock::new(None),
             process_group: Mutex::new(Weak::new()),
+            executable_path: RwLock::new(name),
         };
 
         pcb.sig_info.write().set_tty(tty);
@@ -1030,6 +1027,14 @@ impl ProcessControlBlock {
         self.cred.lock().clone()
     }
 
+    pub fn set_execute_path(&self, path: String) {
+        *self.executable_path.write() = path;
+    }
+
+    pub fn execute_path(&self) -> String {
+        self.executable_path.read().clone()
+    }
+
     /// 根据文件描述符序号，获取socket对象的Arc指针
     ///
     /// ## 参数
@@ -1206,6 +1211,17 @@ impl ProcessControlBlock {
         *self.restart_block.lock() = restart_block;
         return Err(SystemError::ERESTART_RESTARTBLOCK);
     }
+
+    pub fn parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.parent_pcb.read().upgrade()
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.sched_info
+            .inner_lock_read_irqsave()
+            .state()
+            .is_exited()
+    }
 }
 
 impl Drop for ProcessControlBlock {
@@ -1264,12 +1280,8 @@ impl ThreadInfo {
 /// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。
 #[derive(Debug)]
 pub struct ProcessBasicInfo {
-    /// 当前进程的进程组id
-    pgid: Pgid,
     /// 当前进程的父进程的pid
     ppid: Pid,
-    /// 当前进程所属会话id
-    sid: Sid,
     /// 进程的名字
     name: String,
 
@@ -1286,18 +1298,14 @@ pub struct ProcessBasicInfo {
 impl ProcessBasicInfo {
     #[inline(never)]
     pub fn new(
-        pgid: Pgid,
         ppid: Pid,
-        sid: Sid,
         name: String,
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
         let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
         return RwLock::new(Self {
-            pgid,
             ppid,
-            sid,
             name,
             cwd,
             user_vm,
@@ -1305,24 +1313,8 @@ impl ProcessBasicInfo {
         });
     }
 
-    pub fn pgid(&self) -> Pgid {
-        return self.pgid;
-    }
-
-    pub fn set_pgid(&mut self, pgid: Pgid) {
-        self.pgid = pgid;
-    }
-
     pub fn ppid(&self) -> Pid {
         return self.ppid;
-    }
-
-    pub fn sid(&self) -> Sid {
-        return self.sid;
-    }
-
-    pub fn set_sid(&mut self, sid: Sid) {
-        self.sid = sid;
     }
 
     pub fn name(&self) -> &str {

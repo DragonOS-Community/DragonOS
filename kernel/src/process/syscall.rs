@@ -139,15 +139,17 @@ impl Syscall {
             .basic_mut()
             .set_name(ProcessControlBlock::generate_name(&path, &argv));
 
-        Self::do_execve(path, argv, envp, frame)?;
+        Self::do_execve(path.clone(), argv, envp, frame)?;
 
+        let pcb = ProcessManager::current_pcb();
         // 关闭设置了O_CLOEXEC的文件描述符
-        let fd_table = ProcessManager::current_pcb().fd_table();
+        let fd_table = pcb.fd_table();
         fd_table.write().close_on_exec();
         // debug!(
         //     "after execve: strong count: {}",
         //     Arc::strong_count(&ProcessManager::current_pcb())
         // );
+        pcb.set_execute_path(path);
 
         return Ok(());
     }
@@ -311,6 +313,8 @@ impl Syscall {
     pub fn setsid() -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let session = pcb.go_to_new_session()?;
+        let mut guard = pcb.sig_info_mut();
+        guard.set_tty(None);
         Ok(session.sid().into())
     }
 

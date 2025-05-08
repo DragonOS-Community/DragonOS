@@ -171,6 +171,29 @@ impl ProcessManager {
             }
         }
     }
+
+    // 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#345
+    pub fn is_current_pgrp_orphaned() -> bool {
+        let current_pcb = ProcessManager::current_pcb();
+        let sid = current_pcb.sid();
+        let process_group = current_pcb.process_group();
+        if let Some(pg) = process_group {
+            for process in pg.process_group_inner.lock().processes.values() {
+                if let Some(real_parent) = process.real_parent_pcb.read().clone().upgrade() {
+                    //todo 添加判断： 1.是否被忽略 2.是否已经退出（线程组是否为空）
+                    if real_parent.pid == Pid(1) || process.is_exited() {
+                        log::debug!("is_current_pgrp_orphaned: real_parent is init or exited");
+                        continue;
+                    }
+                    let real_parent_pg = real_parent.process_group().unwrap();
+                    if real_parent_pg.pgid() != pg.pgid() && real_parent_pg.sid() == sid {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
 }
 
 impl ProcessControlBlock {

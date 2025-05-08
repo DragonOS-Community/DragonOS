@@ -50,6 +50,8 @@ pub enum ProcFileType {
     ProcMeminfo = 1,
     /// kmsg
     ProcKmsg = 2,
+    /// 可执行路径
+    ProcExe = 3,
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -61,6 +63,7 @@ impl From<u8> for ProcFileType {
             0 => ProcFileType::ProcStatus,
             1 => ProcFileType::ProcMeminfo,
             2 => ProcFileType::ProcKmsg,
+            3 => ProcFileType::ProcExe,
             _ => ProcFileType::Default,
         }
     }
@@ -266,6 +269,28 @@ impl ProcFSInode {
         return Ok((data.len() * size_of::<u8>()) as i64);
     }
 
+    // 打开 exe 文件
+    fn open_exe(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
+        // 这个文件是一个软链接，直接返回0即可
+        return Ok(0);
+    }
+
+    // 读取exe文件
+    fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        // 判断是否有记录pid信息，有的话就是当前进程的exe文件，没有则是当前进程的exe文件
+        let pid = self.fdata.pid;
+        let pcb = if pid == Pid::from(0) {
+            ProcessManager::current_pcb()
+        } else {
+            ProcessManager::find(pid).ok_or(SystemError::ESRCH)?
+        };
+        let exe = pcb.execute_path();
+        let exe_bytes = exe.as_bytes();
+        let len = exe_bytes.len().min(buf.len());
+        buf[..len].copy_from_slice(&exe_bytes[..len]);
+        Ok(len)
+    }
+
     /// proc文件系统读取函数
     fn proc_read(
         &self,
@@ -419,6 +444,23 @@ impl ProcFS {
         } else {
             panic!("create version_signature error");
         }
+
+        let self_dir = inode
+            .create("self", FileType::Dir, ModeType::from_bits_truncate(0o555))
+            .unwrap();
+
+        let binding = self_dir.create("exe", FileType::SymLink, ModeType::S_IRUGO);
+        if let Ok(exe) = binding {
+            let exe_file = exe
+                .as_any_ref()
+                .downcast_ref::<LockedProcFSInode>()
+                .unwrap();
+            exe_file.0.lock().fdata.pid = Pid::new(0);
+            exe_file.0.lock().fdata.ftype = ProcFileType::ProcExe;
+        } else {
+            panic!("create exe error");
+        }
+
         return result;
     }
 
@@ -435,17 +477,31 @@ impl ProcFS {
         )?;
         // 创建相关文件
         // status文件
-        let binding: Arc<dyn IndexNode> = pid_dir.create(
+        let status_binding: Arc<dyn IndexNode> = pid_dir.create(
             "status",
             FileType::File,
             ModeType::from_bits_truncate(0o444),
         )?;
-        let status_file: &LockedProcFSInode = binding
+        let status_file: &LockedProcFSInode = status_binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
             .unwrap();
         status_file.0.lock().fdata.pid = pid;
         status_file.0.lock().fdata.ftype = ProcFileType::ProcStatus;
+
+        // exe文件
+        let exe_binding: Arc<dyn IndexNode> = pid_dir.create_with_data(
+            "exe",
+            FileType::SymLink,
+            ModeType::from_bits_truncate(0o444),
+            0,
+        )?;
+        let exe_file = exe_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        exe_file.0.lock().fdata.pid = pid;
+        exe_file.0.lock().fdata.ftype = ProcFileType::ProcExe;
 
         //todo: 创建其他文件
 
@@ -461,6 +517,7 @@ impl ProcFS {
         let pid_dir: Arc<dyn IndexNode> = proc.find(&pid.to_string())?;
         // 删除进程文件夹下文件
         pid_dir.unlink("status")?;
+        pid_dir.unlink("exe")?;
 
         // 查看进程文件是否还存在
         // let pf= pid_dir.find("status").expect("Cannot find status");
@@ -490,6 +547,7 @@ impl IndexNode for LockedProcFSInode {
         let file_size = match inode.fdata.ftype {
             ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
+            ProcFileType::ProcExe => inode.open_exe(&mut private_data)?,
             ProcFileType::Default => inode.data.len() as i64,
             _ => {
                 todo!()
@@ -548,6 +606,7 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcMeminfo => {
                 return inode.proc_read(offset, len, buf, &mut private_data)
             }
+            ProcFileType::ProcExe => return inode.read_link(buf),
             ProcFileType::ProcKmsg => (),
             ProcFileType::Default => (),
         };

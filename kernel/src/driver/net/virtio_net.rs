@@ -1,7 +1,7 @@
 use core::{
     any::Any,
     cell::UnsafeCell,
-    fmt::Debug,
+    fmt::{Debug, Formatter},
     ops::{Deref, DerefMut},
 };
 
@@ -62,13 +62,20 @@ fn virtio_net_driver() -> Arc<VirtIONetDriver> {
 }
 
 /// virtio net device
-#[derive(Debug)]
 #[cast_to([sync] VirtIODevice)]
 #[cast_to([sync] Device)]
 pub struct VirtIONetDevice {
     dev_id: Arc<DeviceId>,
     inner: SpinLock<InnerVirtIONetDevice>,
     locked_kobj_state: LockedKObjectState,
+}
+
+impl Debug for VirtIONetDevice {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtIONetDevice")
+            .field("dev_id", &self.dev_id.id())
+            .finish()
+    }
 }
 
 unsafe impl Send for VirtIONetDevice {}
@@ -84,7 +91,7 @@ struct InnerVirtIONetDevice {
 
 impl Debug for InnerVirtIONetDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("InnerVirtIOBlkDevice").finish()
+        f.debug_struct("InnerVirtIONetDevice").finish()
     }
 }
 

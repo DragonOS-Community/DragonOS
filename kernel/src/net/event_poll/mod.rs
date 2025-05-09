@@ -479,7 +479,7 @@ impl EventPoll {
                 }
             } else if timespec.is_none() {
                 // 非阻塞情况
-                timeout = true;
+                timeout = false;
             }
             // 判断epoll上有没有就绪事件
             let mut available = epoll_guard.ep_events_available();
@@ -775,52 +775,37 @@ impl EventPoll {
     /// ### epoll的回调，支持epoll的文件有事件到来时直接调用该方法即可
     pub fn wakeup_epoll(
         epitems: &SpinLock<LinkedList<Arc<EPollItem>>>,
-        pollflags: Option<EPollEventType>,
+        pollflags: EPollEventType,
     ) -> Result<(), SystemError> {
-        let mut epitems_guard = epitems.try_lock_irqsave()?;
-        // 一次只取一个，因为一次也只有一个进程能拿到对应文件的🔓
-        if let Some(epitem) = epitems_guard.pop_front() {
-            let pollflags = match pollflags {
-                Some(flags) => flags,
-                None => {
-                    if let Some(file) = epitem.file.upgrade() {
-                        // warning: deadlock will happen if poll() is called when pollflags is None
-                        EPollEventType::from_bits_truncate(file.poll()? as u32)
+        let epitems_guard = epitems.try_lock_irqsave()?;
+        for epitem in epitems_guard.iter() {
+            // The upgrade is safe because EventPoll always exists when the epitem is in the list
+            let epoll = epitem.epoll().upgrade().unwrap();
+            let mut epoll_guard = epoll.try_lock()?;
+            let binding = epitem.clone();
+            let event_guard = binding.event().read();
+            let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
+            // 检查事件合理性以及是否有感兴趣的事件
+            if !(ep_events
+                .difference(EPollEventType::EP_PRIVATE_BITS)
+                .is_empty()
+                || pollflags.difference(ep_events).is_empty())
+            {
+                // TODO: 未处理pm相关
+
+                // 首先将就绪的epitem加入等待队列
+                epoll_guard.ep_add_ready(epitem.clone());
+
+                if epoll_guard.ep_has_waiter() {
+                    if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
+                        && !pollflags.contains(EPollEventType::POLLFREE)
+                    {
+                        // 避免惊群
+                        epoll_guard.ep_wake_one();
                     } else {
-                        EPollEventType::empty()
+                        epoll_guard.ep_wake_all();
                     }
                 }
-            };
-
-            if let Some(epoll) = epitem.epoll().upgrade() {
-                let mut epoll_guard = epoll.try_lock()?;
-                let binding = epitem.clone();
-                let event_guard = binding.event().read();
-                let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
-                // 检查事件合理性以及是否有感兴趣的事件
-                if !(ep_events
-                    .difference(EPollEventType::EP_PRIVATE_BITS)
-                    .is_empty()
-                    || pollflags.difference(ep_events).is_empty())
-                {
-                    // TODO: 未处理pm相关
-
-                    // 首先将就绪的epitem加入等待队列
-                    epoll_guard.ep_add_ready(epitem.clone());
-
-                    if epoll_guard.ep_has_waiter() {
-                        if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
-                            && !pollflags.contains(EPollEventType::POLLFREE)
-                        {
-                            // 避免惊群
-                            epoll_guard.ep_wake_one();
-                        } else {
-                            epoll_guard.ep_wake_all();
-                        }
-                    }
-                }
-
-                epitems_guard.push_back(epitem);
             }
         }
         Ok(())

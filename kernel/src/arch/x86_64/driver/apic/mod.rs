@@ -587,7 +587,6 @@ impl CurrentApic {
             self.set_lvt(lvt);
         }
 
-        // 这段不知道啥意思，看后面要不要保留 （这段代码不能执行，否则会报错），说明Dragon的APIC不是集成APIC
         if max_lvt > 3 {
             apic_write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR as u32, 0);
         }

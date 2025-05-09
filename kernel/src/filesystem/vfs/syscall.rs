@@ -21,7 +21,7 @@ use crate::{
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
-use super::stat::{do_newfstatat, do_statx, PosixKstat};
+use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::vcore::do_symlinkat;
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
@@ -1248,79 +1248,31 @@ impl Syscall {
         return Err(SystemError::EBADF);
     }
 
-    fn do_fstat(fd: i32) -> Result<PosixKstat, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-
-        let mut kstat = PosixKstat::new();
-        // 获取文件信息
-        let metadata = file.metadata()?;
-        kstat.size = metadata.size;
-        kstat.dev_id = metadata.dev_id as u64;
-        kstat.inode = metadata.inode_id.into() as u64;
-        kstat.blcok_size = metadata.blk_size as i64;
-        kstat.blocks = metadata.blocks as u64;
-
-        kstat.atime.tv_sec = metadata.atime.tv_sec;
-        kstat.atime.tv_nsec = metadata.atime.tv_nsec;
-        kstat.mtime.tv_sec = metadata.mtime.tv_sec;
-        kstat.mtime.tv_nsec = metadata.mtime.tv_nsec;
-        kstat.ctime.tv_sec = metadata.ctime.tv_sec;
-        kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
-
-        kstat.nlink = metadata.nlinks as u64;
-        kstat.uid = metadata.uid as i32;
-        kstat.gid = metadata.gid as i32;
-        kstat.rdev = metadata.raw_dev.data() as i64;
-        kstat.mode = metadata.mode;
-        match file.file_type() {
-            FileType::File => kstat.mode.insert(ModeType::S_IFREG),
-            FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
-            FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
-            FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),
-            FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
-            FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
-            FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
-            FileType::KvmDevice => kstat.mode.insert(ModeType::S_IFCHR),
-            FileType::FramebufferDevice => kstat.mode.insert(ModeType::S_IFCHR),
-        }
-
-        return Ok(kstat);
+    #[inline(never)]
+    pub fn fstat(fd: i32, user_stat_ptr: usize) -> Result<usize, SystemError> {
+        Self::newfstat(fd, user_stat_ptr)
     }
 
-    pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixKstat>(), true)?;
-        let kstat = Self::do_fstat(fd)?;
-
-        writer.copy_one_to_user(&kstat, 0)?;
-        return Ok(0);
-    }
-
-    pub fn stat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+    pub fn stat(path: *const u8, user_stat_ptr: usize) -> Result<usize, SystemError> {
         let fd = Self::open(
             path,
             FileMode::O_RDONLY.bits(),
             ModeType::empty().bits(),
             true,
         )?;
-        let r = Self::fstat(fd as i32, user_kstat);
+        let r = Self::fstat(fd as i32, user_stat_ptr);
         Self::close(fd).ok();
         return r;
     }
 
-    pub fn lstat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+    pub fn lstat(path: *const u8, user_stat_ptr: usize) -> Result<usize, SystemError> {
         let fd = Self::open(
             path,
             FileMode::O_RDONLY.bits(),
             ModeType::empty().bits(),
             false,
         )?;
-        let r = Self::fstat(fd as i32, user_kstat);
+        let r = Self::fstat(fd as i32, user_stat_ptr);
         Self::close(fd).ok();
         return r;
     }
@@ -1393,6 +1345,16 @@ impl Syscall {
         do_newfstatat(dfd, filename_str, user_stat_buf_ptr, flags).map(|_| 0)
     }
 
+    #[inline(never)]
+    pub fn newfstat(fd: i32, user_stat_buf_ptr: usize) -> Result<usize, SystemError> {
+        if user_stat_buf_ptr == 0 {
+            return Err(SystemError::EFAULT);
+        }
+        let stat = vfs_fstat(fd)?;
+        // log::debug!("newfstat fd: {}, stat.size: {:?}",fd,stat.size);
+        super::stat::cp_new_stat(stat, user_stat_buf_ptr).map(|_| 0)
+    }
+
     pub fn mknod(
         path: *const u8,
         mode: ModeType,
@@ -1426,6 +1388,9 @@ impl Syscall {
         let iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, false) }?;
 
         let data = iovecs.gather();
+        if ProcessManager::current_pid().data() >= 9 {
+            log::debug!("writev: fd = {}, data.len() = {:?}", fd, data.len());
+        }
 
         Self::write(fd, &data)
     }
@@ -1722,11 +1687,8 @@ impl IoVecs {
                 continue;
             }
 
-            verify_area(
-                VirtAddr::new(iov.iov_base as usize),
-                iovcnt * core::mem::size_of::<IoVec>(),
-            )
-            .map_err(|_| SystemError::EFAULT)?;
+            verify_area(VirtAddr::new(iov.iov_base as usize), iov.iov_len)
+                .map_err(|_| SystemError::EFAULT)?;
 
             slices.push(core::slice::from_raw_parts_mut(iov.iov_base, iov.iov_len));
         }

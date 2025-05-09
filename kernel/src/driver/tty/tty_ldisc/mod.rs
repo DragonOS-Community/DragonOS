@@ -99,6 +99,7 @@ impl TtyLdiscManager {
     /// ### 参数
     /// - tty：需要设置的tty
     /// - o_tty: other tty 用于pty pair
+    #[inline(never)]
     pub fn ldisc_setup(tty: Arc<TtyCore>, o_tty: Option<Arc<TtyCore>>) -> Result<(), SystemError> {
         let ld = tty.ldisc();
 

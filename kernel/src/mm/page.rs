@@ -380,19 +380,21 @@ impl PageReclaimer {
             MMArch::PAGE_SIZE
         };
 
-        inode
-            .write_direct(
-                page_index * MMArch::PAGE_SIZE,
-                len,
-                unsafe {
-                    core::slice::from_raw_parts(
-                        MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8,
-                        len,
-                    )
-                },
-                SpinLock::new(FilePrivateData::Unused).lock(),
-            )
-            .unwrap();
+        if len > 0 {
+            inode
+                .write_direct(
+                    page_index * MMArch::PAGE_SIZE,
+                    len,
+                    unsafe {
+                        core::slice::from_raw_parts(
+                            MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8,
+                            len,
+                        )
+                    },
+                    SpinLock::new(FilePrivateData::Unused).lock(),
+                )
+                .unwrap();
+        }
 
         // 清除标记
         guard.remove_flags(PageFlags::PG_DIRTY);

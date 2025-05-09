@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use core::{
     alloc::Layout,
     cmp::{max, min},
@@ -20,10 +21,7 @@ use crate::{
 
 use crate::mm::MemoryManagementArch;
 
-use super::{
-    allocator::page_frame::FrameAllocator,
-    page::{FileMapInfo, Page, PageFlags, PageType},
-};
+use super::page::{Page, PageFlags};
 
 bitflags! {
     pub struct FaultFlags: u64{
@@ -621,10 +619,10 @@ impl PageFaultHandler {
         let file = vma_guard.vm_file().expect("no vm_file in vma");
         let page_cache = file.inode().page_cache().unwrap();
         let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
-        let mapper = &mut pfm.mapper;
         let mut ret = VmFaultReason::empty();
 
-        if let Some(page) = page_cache.lock_irqsave().get_page(file_pgoff) {
+        let page = page_cache.lock_irqsave().get_page(file_pgoff);
+        if let Some(page) = page {
             // TODO 异步从磁盘中预读页面进PageCache
 
             // 直接将PageCache中的页面作为要映射的页面
@@ -633,37 +631,17 @@ impl PageFaultHandler {
             // TODO 同步预读
             //涉及磁盘IO，返回标志为VM_FAULT_MAJOR
             ret = VmFaultReason::VM_FAULT_MAJOR;
-            // let mut buf: Vec<u8> = vec![0; MMArch::PAGE_SIZE];
-
-            let allocator = mapper.allocator_mut();
-
-            // 分配一个物理页面作为加入PageCache的新页
-            let new_cache_page = allocator.allocate_one().unwrap();
-            // (MMArch::phys_2_virt(new_cache_page).unwrap().data() as *mut u8)
-            //     .copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
+            let mut buffer = Box::new([0u8; MMArch::PAGE_SIZE]);
             file.pread(
                 file_pgoff * MMArch::PAGE_SIZE,
                 MMArch::PAGE_SIZE,
-                core::slice::from_raw_parts_mut(
-                    MMArch::phys_2_virt(new_cache_page).unwrap().data() as *mut u8,
-                    MMArch::PAGE_SIZE,
-                ),
+                buffer.as_mut_slice(),
             )
             .expect("failed to read file to create pagecache page");
+            drop(buffer);
 
-            let page = page_manager_lock_irqsave()
-                .create_one_page(
-                    PageType::File(FileMapInfo {
-                        page_cache: page_cache.clone(),
-                        index: file_pgoff,
-                    }),
-                    PageFlags::PG_LRU,
-                    allocator,
-                )
-                .expect("failed to create page");
-            pfm.page = Some(page.clone());
-
-            page_cache.lock_irqsave().add_page(file_pgoff, &page);
+            let page = page_cache.lock_irqsave().get_page(file_pgoff);
+            pfm.page = page;
         }
         ret
     }

@@ -1017,7 +1017,7 @@ impl ProcessControlBlock {
     }
 
     pub fn fs_struct_mut(&self) -> RwLockWriteGuard<Arc<FsStruct>> {
-        self.fs.write_irqsave()
+        self.fs.write()
     }
 
     pub fn pwd_inode(&self) -> Arc<dyn IndexNode> {

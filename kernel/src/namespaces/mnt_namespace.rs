@@ -16,6 +16,7 @@ use super::ucount::Ucount::MntNamespaces;
 use super::{namespace::NsCommon, ucount::UCounts, user_namespace::UserNamespace};
 use crate::container_of;
 use crate::filesystem::vfs::mount::MountFSInode;
+use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::IndexNode;
 use crate::filesystem::vfs::InodeId;
 use crate::filesystem::vfs::MountFS;
@@ -76,10 +77,19 @@ impl PathContext {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FsStruct {
-    umask: u32, //文件权限掩码
-    path_context: Arc<RwLock<PathContext>>,
+    umask: ModeType, //文件权限掩码
+    path_context: RwLock<PathContext>,
+}
+
+impl Clone for FsStruct {
+    fn clone(&self) -> Self {
+        Self {
+            umask: self.umask,
+            path_context: RwLock::new(self.path_context.read().clone()),
+        }
+    }
 }
 
 impl Default for FsStruct {
@@ -91,8 +101,8 @@ impl Default for FsStruct {
 impl FsStruct {
     pub fn new() -> Self {
         Self {
-            umask: 0o22,
-            path_context: Arc::new(RwLock::new(PathContext::new())),
+            umask: ModeType::S_IWUGO,
+            path_context: RwLock::new(PathContext::new()),
         }
     }
 

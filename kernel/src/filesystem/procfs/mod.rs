@@ -15,7 +15,7 @@ use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
-        core::{generate_inode_id, ROOT_INODE},
+        vcore::{generate_inode_id, ROOT_INODE},
         FileType,
     },
     libs::{
@@ -361,6 +361,7 @@ impl ProcFS {
                     atime: PosixTimeSpec::default(),
                     mtime: PosixTimeSpec::default(),
                     ctime: PosixTimeSpec::default(),
+                    btime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
                     mode: ModeType::from_bits_truncate(0o555),
                     nlinks: 1,
@@ -656,6 +657,7 @@ impl IndexNode for LockedProcFSInode {
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
         inode.metadata.ctime = metadata.ctime;
+        inode.metadata.btime = metadata.btime;
         inode.metadata.mode = metadata.mode;
         inode.metadata.uid = metadata.uid;
         inode.metadata.gid = metadata.gid;
@@ -708,6 +710,7 @@ impl IndexNode for LockedProcFSInode {
                     atime: PosixTimeSpec::default(),
                     mtime: PosixTimeSpec::default(),
                     ctime: PosixTimeSpec::default(),
+                    btime: PosixTimeSpec::default(),
                     file_type,
                     mode,
                     nlinks: 1,

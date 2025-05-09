@@ -22,7 +22,7 @@ use crate::{
 use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
-    core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
+    file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
     FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
@@ -94,6 +94,7 @@ impl KernFS {
             atime: PosixTimeSpec::new(0, 0),
             mtime: PosixTimeSpec::new(0, 0),
             ctime: PosixTimeSpec::new(0, 0),
+            btime: PosixTimeSpec::new(0, 0),
             dev_id: 0,
             inode_id: generate_inode_id(),
             file_type: FileType::Dir,
@@ -525,6 +526,7 @@ impl KernFSInode {
             atime: PosixTimeSpec::new(0, 0),
             mtime: PosixTimeSpec::new(0, 0),
             ctime: PosixTimeSpec::new(0, 0),
+            btime: PosixTimeSpec::new(0, 0),
             dev_id: 0,
             inode_id: generate_inode_id(),
             file_type: file_type.into(),

@@ -23,9 +23,9 @@ use crate::mm::VmFaultReason;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
-        core::generate_inode_id,
         file::{FileMode, FilePrivateData},
         syscall::ModeType,
+        vcore::generate_inode_id,
         FileSystem, FileType, IndexNode, InodeId, Metadata,
     },
     libs::{
@@ -227,6 +227,7 @@ impl LockedFATInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -377,6 +378,7 @@ impl FATFileSystem {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,

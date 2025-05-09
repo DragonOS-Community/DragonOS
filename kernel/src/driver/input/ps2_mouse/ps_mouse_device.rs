@@ -31,7 +31,7 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
         vfs::{
-            core::generate_inode_id, syscall::ModeType, utils::DName, FilePrivateData, FileSystem,
+            syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
             FileType, IndexNode, Metadata,
         },
     },
@@ -198,6 +198,7 @@ impl Ps2MouseDevice {
                     atime: PosixTimeSpec::default(),
                     mtime: PosixTimeSpec::default(),
                     ctime: PosixTimeSpec::default(),
+                    btime: PosixTimeSpec::default(),
                     file_type: FileType::CharDevice, // 文件夹，block设备，char设备
                     mode: ModeType::from_bits_truncate(0o644),
                     nlinks: 1,

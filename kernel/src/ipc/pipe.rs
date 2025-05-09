@@ -3,7 +3,7 @@ use core::sync::atomic::compiler_fence;
 use crate::{
     arch::ipc::signal::{SigCode, Signal},
     filesystem::vfs::{
-        core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
+        file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
         FileType, IndexNode, Metadata, PollableInode,
     },
     libs::{
@@ -128,6 +128,7 @@ impl LockedPipeInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::Pipe,
                 mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,

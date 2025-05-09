@@ -9,7 +9,7 @@ use crate::{
         video::VideoRefreshManager,
     },
     exception::{init::irq_init, softirq::softirq_init, InterruptArch},
-    filesystem::vfs::core::vfs_init,
+    filesystem::vfs::vcore::vfs_init,
     init::init_intertrait,
     libs::{
         futex::futex::Futex,

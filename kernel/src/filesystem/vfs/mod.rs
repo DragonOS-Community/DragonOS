@@ -1,13 +1,15 @@
-pub mod core;
 pub mod fcntl;
 pub mod file;
 pub mod mount;
 pub mod open;
+pub mod stat;
 pub mod syscall;
 pub mod utils;
+pub mod vcore;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use derive_builder::Builder;
 use intertrait::CastFromSync;
 use system_error::SystemError;
 
@@ -25,8 +27,8 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{core::generate_inode_id, file::FileMode, syscall::ModeType, utils::DName};
-pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
+use self::{file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id};
+pub use self::{file::FilePrivateData, mount::MountFS, vcore::ROOT_INODE};
 
 use super::page_cache::PageCache;
 
@@ -57,6 +59,22 @@ pub enum FileType {
     SymLink,
     /// 套接字
     Socket,
+}
+
+impl From<FileType> for ModeType {
+    fn from(val: FileType) -> Self {
+        match val {
+            FileType::File => ModeType::S_IFREG,
+            FileType::Dir => ModeType::S_IFDIR,
+            FileType::BlockDevice => ModeType::S_IFBLK,
+            FileType::CharDevice => ModeType::S_IFCHR,
+            FileType::SymLink => ModeType::S_IFLNK,
+            FileType::Socket => ModeType::S_IFSOCK,
+            FileType::Pipe => ModeType::S_IFIFO,
+            FileType::KvmDevice => ModeType::S_IFCHR,
+            FileType::FramebufferDevice => ModeType::S_IFCHR,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -781,7 +799,8 @@ impl dyn IndexNode {
 /// IndexNode的元数据
 ///
 /// 对应Posix2008中的sys/stat.h中的定义 https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/sys_stat.h.html
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Builder)]
+#[builder(no_std, setter(into))]
 pub struct Metadata {
     /// 当前inode所在的文件系统的设备号
     pub dev_id: usize,
@@ -803,11 +822,14 @@ pub struct Metadata {
     /// inode最后一次被访问的时间
     pub atime: PosixTimeSpec,
 
-    /// inode最后一次修改的时间
+    /// inode的文件数据最后一次修改的时间
     pub mtime: PosixTimeSpec,
 
-    /// inode的创建时间
+    /// inode的元数据、权限或文件内容最后一次发生改变的时间
     pub ctime: PosixTimeSpec,
+
+    /// inode的创建时间
+    pub btime: PosixTimeSpec,
 
     /// 文件类型
     pub file_type: FileType,
@@ -839,6 +861,7 @@ impl Default for Metadata {
             atime: PosixTimeSpec::default(),
             mtime: PosixTimeSpec::default(),
             ctime: PosixTimeSpec::default(),
+            btime: PosixTimeSpec::default(),
             file_type: FileType::File,
             mode: ModeType::empty(),
             nlinks: 1,
@@ -975,6 +998,7 @@ impl Metadata {
             atime: PosixTimeSpec::default(),
             mtime: PosixTimeSpec::default(),
             ctime: PosixTimeSpec::default(),
+            btime: PosixTimeSpec::default(),
             file_type,
             mode,
             nlinks: 1,

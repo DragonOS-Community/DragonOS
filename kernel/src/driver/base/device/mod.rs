@@ -4,7 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use intertrait::cast::CastArc;
-use log::{error, warn};
+use log::{debug, error, warn};
 
 use crate::{
     driver::{
@@ -39,7 +39,8 @@ use self::{
 use super::{
     class::{Class, ClassKObjbectType},
     kobject::{
-        KObjType, KObject, KObjectCommonData, KObjectManager, KObjectState, LockedKObjectState,
+        CommonKobj, KObjType, KObject, KObjectCommonData, KObjectManager, KObjectState,
+        LockedKObjectState,
     },
     kset::KSet,
     swnode::software_node_notify,
@@ -72,15 +73,15 @@ lazy_static! {
 
 /// `/sys/devices` 的 kset 实例
 static mut DEVICES_KSET_INSTANCE: Option<Arc<KSet>> = None;
-/// `/sys/dev` 的 kset 实例
-static mut DEV_KSET_INSTANCE: Option<Arc<KSet>> = None;
-/// `/sys/dev/block` 的 kset 实例
-static mut DEV_BLOCK_KSET_INSTANCE: Option<Arc<KSet>> = None;
+/// `/sys/dev` 的 kobject 实例
+static mut DEV_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
+/// `/sys/dev/block` 的 kobject 实例
+static mut DEV_BLOCK_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
 /// `/sys/dev/char` 的 kset 实例
-static mut DEV_CHAR_KSET_INSTANCE: Option<Arc<KSet>> = None;
+static mut DEV_CHAR_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
 
-/// `/sys/devices/virtual` 的 kset 实例
-static mut DEVICES_VIRTUAL_KSET_INSTANCE: Option<Arc<KSet>> = None;
+/// `/sys/devices/virtual` 的 kobject 实例
+static mut DEVICES_VIRTUAL_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
 
 /// 获取`/sys/devices`的kset实例
 #[inline(always)]
@@ -88,40 +89,41 @@ pub fn sys_devices_kset() -> Arc<KSet> {
     unsafe { DEVICES_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
-/// 获取`/sys/dev`的kset实例
+/// 获取`/sys/dev`的kobject实例
 #[inline(always)]
-pub(super) fn sys_dev_kset() -> Arc<KSet> {
-    unsafe { DEV_KSET_INSTANCE.as_ref().unwrap().clone() }
+pub fn sys_dev_kobj() -> Arc<CommonKobj> {
+    unsafe { DEV_KOBJECT_INSTANCE.as_ref().unwrap().clone() }
 }
 
-/// 获取`/sys/dev/block`的kset实例
+/// 获取`/sys/dev/block`的kobject实例
 #[inline(always)]
 #[allow(dead_code)]
-pub fn sys_dev_block_kset() -> Arc<KSet> {
-    unsafe { DEV_BLOCK_KSET_INSTANCE.as_ref().unwrap().clone() }
+pub fn sys_dev_block_kobj() -> Arc<CommonKobj> {
+    unsafe { DEV_BLOCK_KOBJECT_INSTANCE.as_ref().unwrap().clone() }
 }
 
-/// 获取`/sys/dev/char`的kset实例
+/// 获取`/sys/dev/char`的kobject实例
 #[inline(always)]
-pub fn sys_dev_char_kset() -> Arc<KSet> {
-    unsafe { DEV_CHAR_KSET_INSTANCE.as_ref().unwrap().clone() }
+pub fn sys_dev_char_kobj() -> Arc<CommonKobj> {
+    unsafe { DEV_CHAR_KOBJECT_INSTANCE.as_ref().unwrap().clone() }
 }
 
-unsafe fn set_sys_dev_block_kset(kset: Arc<KSet>) {
-    DEV_BLOCK_KSET_INSTANCE = Some(kset);
+unsafe fn set_sys_dev_block_kobj(kobj: Arc<CommonKobj>) {
+    DEV_BLOCK_KOBJECT_INSTANCE = Some(kobj);
 }
 
-unsafe fn set_sys_dev_char_kset(kset: Arc<KSet>) {
-    DEV_CHAR_KSET_INSTANCE = Some(kset);
+unsafe fn set_sys_dev_char_kobj(kobj: Arc<CommonKobj>) {
+    DEV_CHAR_KOBJECT_INSTANCE = Some(kobj);
 }
 
-/// 获取`/sys/devices/virtual`的kset实例
-pub fn sys_devices_virtual_kset() -> Arc<KSet> {
-    unsafe { DEVICES_VIRTUAL_KSET_INSTANCE.as_ref().unwrap().clone() }
+/// 获取`/sys/devices/virtual`的kobject实例
+pub fn sys_devices_virtual_kobj() -> Arc<CommonKobj> {
+    unsafe { DEVICES_VIRTUAL_KOBJECT_INSTANCE.as_ref().unwrap().clone() }
 }
 
-unsafe fn set_sys_devices_virtual_kset(kset: Arc<KSet>) {
-    DEVICES_VIRTUAL_KSET_INSTANCE = Some(kset);
+#[allow(dead_code)]
+unsafe fn set_sys_devices_virtual_kobj(kset: Arc<CommonKobj>) {
+    DEVICES_VIRTUAL_KOBJECT_INSTANCE = Some(kset);
 }
 
 /// /dev下面的设备的名字
@@ -582,7 +584,7 @@ impl DeviceManager {
             device.set_parent(Some(Arc::downgrade(&kobject_parent)));
         }
 
-        KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>, None).map_err(|e| {
+        KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>).map_err(|e| {
             error!("add device '{:?}' failed: {:?}", device.name(), e);
             e
         })?;
@@ -649,7 +651,7 @@ impl DeviceManager {
         class_dir.set_kobj_type(Some(&ClassKObjbectType));
         class_dir.set_parent(Some(Arc::downgrade(&kobject_parent)));
 
-        KObjectManager::add_kobj(class_dir.clone() as Arc<dyn KObject>, None)
+        KObjectManager::add_kobj(class_dir.clone() as Arc<dyn KObject>)
             .expect("add class dir failed");
 
         guard.insert(key, class_dir.clone());
@@ -684,7 +686,7 @@ impl DeviceManager {
                     kobject_parent = dp.clone() as Arc<dyn KObject>;
                 }
             } else {
-                kobject_parent = sys_devices_virtual_kset() as Arc<dyn KObject>;
+                kobject_parent = sys_devices_virtual_kobj() as Arc<dyn KObject>;
             }
 
             // 是否需要glue dir?
@@ -920,7 +922,7 @@ impl DeviceManager {
     /// - `dev`: 设备
     fn device_to_dev_kobj(&self, _dev: &Arc<dyn Device>) -> Arc<dyn KObject> {
         // todo: 处理class的逻辑
-        let kobj = sys_dev_char_kset().as_kobject();
+        let kobj = sys_dev_char_kobj() as Arc<dyn KObject>;
         return kobj;
     }
 
@@ -973,6 +975,38 @@ pub fn device_unregister<T: Device>(_device: Arc<T>) {
     //     Err(_) => Err(DeviceError::RegisterError),
     // }
     todo!("device_unregister")
+}
+
+/// # 关闭所有设备
+///
+/// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#4611
+pub fn device_shutdown() {
+    // 遍历/sys/devices下的所有设备，关闭设备
+    let devices_kset = sys_devices_kset();
+    let kobjects = devices_kset.kobjects();
+    for weak_kobj in kobjects.iter() {
+        // 尝试升级weak指针
+        if let Some(kobj) = weak_kobj.upgrade() {
+            debug!("Found kobject: {}", kobj.name());
+
+            // 执行设备的shutdown回调
+            let dev = kobj
+                .cast::<dyn Device>()
+                .expect("Failed to cast kobj to Device");
+
+            if let Some(dev_bus) = dev.bus() {
+                if let Some(dev_bus) = dev_bus.upgrade() {
+                    // 执行设备的shutdown回调
+                    dev_bus.shutdown(&dev.clone());
+                } else {
+                    debug!("{} has been released", dev.clone().name());
+                }
+            }
+        } else {
+            // Weak指针已经过期，表示kobject已经被释放
+            debug!("Weak pointer expired");
+        }
+    }
 }
 
 /// 设备文件夹下的`dev`文件的属性

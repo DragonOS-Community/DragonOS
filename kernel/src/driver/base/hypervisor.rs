@@ -17,7 +17,7 @@ pub fn sys_hypervisor_kset() -> Arc<KSet> {
 pub(super) fn hypervisor_init() -> Result<(), SystemError> {
     let hypervisor_kset = KSet::new("hypervisor".to_string());
     hypervisor_kset
-        .register(None)
+        .register()
         .expect("register hypervisor kset failed");
     unsafe {
         HYPERVISOR_KSET_INSTANCE = Some(hypervisor_kset);

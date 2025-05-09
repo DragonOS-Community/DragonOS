@@ -16,6 +16,7 @@ use crate::{
     libs::{
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        spinlock::SpinLock,
     },
 };
 
@@ -180,22 +181,18 @@ pub struct KObjectManager;
 impl KObjectManager {
     pub fn init_and_add_kobj(
         kobj: Arc<dyn KObject>,
-        join_kset: Option<Arc<KSet>>,
         kobj_type: Option<&'static dyn KObjType>,
     ) -> Result<(), SystemError> {
         Self::kobj_init(&kobj, kobj_type);
-        Self::add_kobj(kobj, join_kset)
+        Self::add_kobj(kobj)
     }
 
     pub fn kobj_init(kobj: &Arc<dyn KObject>, kobj_type: Option<&'static dyn KObjType>) {
         kobj.set_kobj_type(kobj_type);
     }
 
-    pub fn add_kobj(
-        kobj: Arc<dyn KObject>,
-        join_kset: Option<Arc<KSet>>,
-    ) -> Result<(), SystemError> {
-        if let Some(kset) = join_kset {
+    pub fn add_kobj(kobj: Arc<dyn KObject>) -> Result<(), SystemError> {
+        if let Some(kset) = kobj.kset() {
             kset.join(&kobj);
             // 如果kobject没有parent，那么就将这个kset作为parent
             if kobj.parent().is_none() {
@@ -277,5 +274,81 @@ impl KObjType for DynamicKObjKType {
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
         None
+    }
+}
+
+/// 作为sysfs中kobject目录的实现
+#[derive(Debug)]
+pub struct CommonKobj {
+    name: String,
+    kobject_common: SpinLock<KObjectCommonData>,
+    locked_kobjstate: LockedKObjectState,
+}
+
+impl CommonKobj {
+    pub fn new(name: String) -> Arc<CommonKobj> {
+        return Arc::new(CommonKobj {
+            name,
+            kobject_common: SpinLock::new(KObjectCommonData::default()),
+            locked_kobjstate: LockedKObjectState::new(None),
+        });
+    }
+}
+
+impl KObject for CommonKobj {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        self.kobject_common.lock().kern_inode = inode;
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        self.kobject_common.lock().kern_inode.clone()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        self.kobject_common.lock().get_parent_or_clear_weak()
+    }
+
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        self.kobject_common.lock().parent = parent;
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        self.kobject_common.lock().kset.clone()
+    }
+
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        self.kobject_common.lock().kset = kset;
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        self.kobject_common.lock().kobj_type
+    }
+
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.kobject_common.lock().kobj_type = ktype;
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&self, _name: String) {
+        // Do nothing
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        self.locked_kobjstate.read()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        self.locked_kobjstate.write()
+    }
+
+    fn set_kobj_state(&self, state: KObjectState) {
+        *self.locked_kobjstate.write() = state;
     }
 }

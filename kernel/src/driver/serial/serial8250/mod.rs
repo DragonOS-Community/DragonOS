@@ -465,7 +465,8 @@ impl PlatformDriver for Serial8250ISADriver {
     }
 
     fn shutdown(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
-        todo!()
+        // Do nothing
+        return Ok(());
     }
 
     fn suspend(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {

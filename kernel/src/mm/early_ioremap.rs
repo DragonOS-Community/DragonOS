@@ -191,7 +191,7 @@ impl EarlyIoRemap {
     }
 
     /// 把slot下标转换为这个slot对应的虚拟地址
-    fn idx_to_virt(idx: usize) -> VirtAddr {
+    pub fn idx_to_virt(idx: usize) -> VirtAddr {
         MMArch::FIXMAP_START_VADDR + idx * MMArch::PAGE_SIZE
     }
 }

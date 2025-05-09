@@ -1,12 +1,9 @@
-use core::{fmt::Debug, ptr::NonNull};
-
-use acpi::{AcpiHandler, AcpiTables, PlatformInfo};
-use alloc::{string::ToString, sync::Arc};
-use log::{error, info};
-
 use crate::{
     arch::MMArch,
-    driver::base::firmware::sys_firmware_kset,
+    driver::base::{
+        firmware::sys_firmware_kobj,
+        kobject::{CommonKobj, DynamicKObjKType, KObject, KObjectManager},
+    },
     init::{boot::BootloaderAcpiArg, boot_params},
     libs::align::{page_align_down, page_align_up, AlignedBox},
     mm::{
@@ -14,20 +11,23 @@ use crate::{
         MemoryManagementArch, PhysAddr, VirtAddr,
     },
 };
+use acpi::{AcpiHandler, AcpiTables, PlatformInfo};
+use alloc::{string::ToString, sync::Arc};
+use core::{fmt::Debug, ptr::NonNull};
+use log::{error, info};
 use system_error::SystemError;
-
-use super::base::kset::KSet;
 
 extern crate acpi;
 
 pub mod bus;
 pub mod glue;
 pub mod pmtmr;
+pub mod reboot;
 mod sysfs;
 
 static mut __ACPI_TABLE: Option<acpi::AcpiTables<AcpiHandlerImpl>> = None;
-/// `/sys/firmware/acpi`的kset
-static mut ACPI_KSET_INSTANCE: Option<Arc<KSet>> = None;
+/// `/sys/firmware/acpi`的kobject实例
+static mut ACPI_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
 
 static mut RSDP_TMP_BOX: Option<AlignedBox<[u8; 4096], 4096>> = None;
 
@@ -37,8 +37,8 @@ pub fn acpi_manager() -> &'static AcpiManager {
 }
 
 #[inline(always)]
-pub fn acpi_kset() -> Arc<KSet> {
-    unsafe { ACPI_KSET_INSTANCE.clone().unwrap() }
+pub fn acpi_kobj() -> Arc<CommonKobj> {
+    unsafe { ACPI_KOBJECT_INSTANCE.clone().unwrap() }
 }
 
 #[derive(Debug)]
@@ -60,11 +60,15 @@ impl AcpiManager {
         info!("Initializing Acpi Manager...");
 
         // 初始化`/sys/firmware/acpi`的kset
-        let kset = KSet::new("acpi".to_string());
-        kset.register(Some(sys_firmware_kset()))?;
+        let acpi_kobj = CommonKobj::new("acpi".to_string());
+        acpi_kobj.set_parent(Some(Arc::downgrade(
+            &(sys_firmware_kobj() as Arc<dyn KObject>),
+        )));
+        KObjectManager::init_and_add_kobj(acpi_kobj.clone(), Some(&DynamicKObjKType))?;
         unsafe {
-            ACPI_KSET_INSTANCE = Some(kset.clone());
+            ACPI_KOBJECT_INSTANCE = Some(acpi_kobj.clone());
         }
+
         let acpi_args = boot_params().read().acpi;
         if let BootloaderAcpiArg::NotProvided = acpi_args {
             error!("acpi_init(): ACPI not provided by bootloader");

@@ -2,7 +2,7 @@ mod events;
 pub mod trace_pipe;
 pub mod tracepoint;
 
-use crate::debug::sysfs::debugfs_kset;
+use crate::debug::sysfs::debugfs_kobj;
 use crate::debug::tracing::trace_pipe::TRACE_PIPE_MAX_RECORD;
 use crate::driver::base::kobject::KObject;
 use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
@@ -23,7 +23,7 @@ fn tracing_root_inode() -> Arc<KernFSInode> {
 
 /// Initialize the debugfs tracing directory
 pub fn init_debugfs_tracing() -> Result<(), SystemError> {
-    let debugfs = debugfs_kset();
+    let debugfs = debugfs_kobj();
     let root_dir = debugfs.inode().ok_or(SystemError::ENOENT)?;
     let tracing_root = root_dir.add_dir(
         "tracing".to_string(),

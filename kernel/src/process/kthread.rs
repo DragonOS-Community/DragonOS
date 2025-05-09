@@ -16,7 +16,7 @@ use system_error::SystemError;
 use crate::{
     arch::CurrentIrqArch,
     exception::{irqdesc::IrqAction, InterruptArch},
-    init::initial_kthread::initial_kernel_thread,
+    init::initial_kthread::{initial_kernel_thread, set_system_state, SystemState},
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
     sched::{schedule, SchedMode},
@@ -296,6 +296,7 @@ impl KernelThreadMechanism {
             .remove(ProcessFlags::KTHREAD);
 
         drop(irq_guard);
+        set_system_state(SystemState::Scheduling);
         info!("Initializing kernel thread mechanism stage1 complete");
     }
 

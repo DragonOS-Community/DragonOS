@@ -31,7 +31,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         procfs::procfs_unregister_pid,
-        vfs::{file::FileDescriptorVec, FileType},
+        vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
         signal::RestartBlock,
@@ -718,7 +718,7 @@ pub struct ProcessControlBlock {
     thread: RwLock<ThreadInfo>,
 
     /// 进程文件系统的状态
-    fs: Arc<SpinLock<FsStruct>>,
+    fs: RwLock<Arc<FsStruct>>,
 
     ///闹钟定时器
     alarm_timer: SpinLock<Option<AlarmTimer>>,
@@ -821,7 +821,7 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
-            fs: Arc::new(SpinLock::new(FsStruct::new())),
+            fs: RwLock::new(Arc::new(FsStruct::new())),
             alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
             nsproxy: Arc::new(RwLock::new(NsProxy::new())),
@@ -1012,8 +1012,16 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn fs_struct(&self) -> Arc<SpinLock<FsStruct>> {
-        self.fs.clone()
+    pub fn fs_struct(&self) -> Arc<FsStruct> {
+        self.fs.read().clone()
+    }
+
+    pub fn fs_struct_mut(&self) -> RwLockWriteGuard<Arc<FsStruct>> {
+        self.fs.write()
+    }
+
+    pub fn pwd_inode(&self) -> Arc<dyn IndexNode> {
+        self.fs.read().pwd()
     }
 
     /// 获取文件描述符表的Arc指针

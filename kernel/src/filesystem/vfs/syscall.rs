@@ -21,7 +21,7 @@ use crate::{
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
-use super::stat::{do_statx, PosixKstat};
+use super::stat::{do_newfstatat, do_statx, PosixKstat};
 use super::vcore::do_symlinkat;
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
@@ -1374,6 +1374,23 @@ impl Syscall {
         let filename_str = filename.to_str().map_err(|_| SystemError::EINVAL)?;
 
         do_statx(dfd, filename_str, flags, mask, user_kstat_ptr).map(|_| 0)
+    }
+
+    #[inline(never)]
+    pub fn newfstatat(
+        dfd: i32,
+        filename_ptr: usize,
+        user_stat_buf_ptr: usize,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        if user_stat_buf_ptr == 0 {
+            return Err(SystemError::EFAULT);
+        }
+
+        let filename = check_and_clone_cstr(filename_ptr as *const u8, Some(MAX_PATHLEN))?;
+        let filename_str = filename.to_str().map_err(|_| SystemError::EINVAL)?;
+
+        do_newfstatat(dfd, filename_str, user_stat_buf_ptr, flags).map(|_| 0)
     }
 
     pub fn mknod(

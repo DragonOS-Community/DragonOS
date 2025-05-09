@@ -23,15 +23,6 @@ pub struct NsSet {
     pub fs: RwLock<Arc<FsStruct>>,
 }
 
-impl Clone for NsSet {
-    fn clone(&self) -> Self {
-        Self {
-            flags: self.flags,
-            nsproxy: self.nsproxy.clone(),
-            fs: RwLock::new(self.fs.read().clone()),
-        }
-    }
-}
 #[derive(Debug, Clone)]
 pub struct NsProxy {
     pub pid_namespace: Arc<PidNamespace>,

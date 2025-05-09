@@ -611,11 +611,12 @@ impl ProcessManager {
         child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
         let fs = parent_pcb.fs_struct();
+        let mut guard = child_pcb.fs_struct_mut();
         if clone_flags.contains(CloneFlags::CLONE_FS) {
-            child_pcb.set_fs_struct(fs.clone());
+            *guard = fs.clone();
         } else {
             let new_fs = (*fs).clone();
-            child_pcb.set_fs_struct(Arc::new(new_fs));
+            *guard = Arc::new(new_fs);
         }
         Ok(())
     }

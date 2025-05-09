@@ -21,6 +21,7 @@ use crate::filesystem::vfs::InodeId;
 use crate::filesystem::vfs::MountFS;
 use crate::filesystem::vfs::ROOT_INODE;
 use crate::libs::rbtree::RBTree;
+use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::process::fork::CloneFlags;
 use crate::process::ProcessManager;
@@ -60,13 +61,27 @@ struct MntNsOperations {
     clone_flags: CloneFlags,
 }
 
-/// 使用该结构体的时候加spinlock
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
+struct PathContext {
+    root: Arc<dyn IndexNode>,
+    pwd: Arc<dyn IndexNode>,
+}
+
+impl PathContext {
+    pub fn new() -> Self {
+        Self {
+            root: ROOT_INODE(),
+            pwd: ROOT_INODE(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FsStruct {
     umask: u32, //文件权限掩码
-    pub root: Arc<dyn IndexNode>,
-    pub pwd: Arc<dyn IndexNode>,
+    path_context: Arc<RwLock<PathContext>>,
 }
+
 impl Default for FsStruct {
     fn default() -> Self {
         Self::new()
@@ -77,18 +92,24 @@ impl FsStruct {
     pub fn new() -> Self {
         Self {
             umask: 0o22,
-            root: ROOT_INODE(),
-            pwd: ROOT_INODE(),
+            path_context: Arc::new(RwLock::new(PathContext::new())),
         }
     }
-    pub fn set_root(&mut self, inode: Arc<dyn IndexNode>) {
-        self.root = inode;
+
+    pub fn set_root(&self, inode: Arc<dyn IndexNode>) {
+        self.path_context.write().root = inode;
     }
-    pub fn set_pwd(&mut self, inode: Arc<dyn IndexNode>) {
-        self.pwd = inode;
+
+    pub fn set_pwd(&self, inode: Arc<dyn IndexNode>) {
+        self.path_context.write().pwd = inode;
     }
+
     pub fn pwd(&self) -> Arc<dyn IndexNode> {
-        self.pwd.clone()
+        self.path_context.read().pwd.clone()
+    }
+
+    pub fn root(&self) -> Arc<dyn IndexNode> {
+        self.path_context.read().root.clone()
     }
 }
 
@@ -130,11 +151,10 @@ impl NsOperations for MntNsOperations {
         }
         nsproxy.mnt_namespace = mnt_ns;
 
-        let mut guard = nsset.fs.write();
-        let mut fs = (**guard).clone();
-        fs.set_pwd(ROOT_INODE());
-        fs.set_root(ROOT_INODE());
-        *guard = Arc::new(fs);
+        let guard = nsset.fs.write();
+        guard.set_pwd(ROOT_INODE());
+        guard.set_root(ROOT_INODE());
+
         Ok(())
     }
     fn owner(&self, ns_common: Arc<NsCommon>) -> Arc<UserNamespace> {

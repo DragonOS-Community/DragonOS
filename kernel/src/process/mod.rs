@@ -1016,17 +1016,11 @@ impl ProcessControlBlock {
         self.fs.read().clone()
     }
 
-    pub fn set_fs_struct(&self, fs: Arc<FsStruct>) {
-        self.fs.write().clone_from(&fs);
+    pub fn fs_struct_mut(&self) -> RwLockWriteGuard<Arc<FsStruct>> {
+        self.fs.write_irqsave()
     }
 
-    pub fn set_pwd(&self, pwd: Arc<dyn IndexNode>) {
-        let mut fs = (**(self.fs.read())).clone();
-        fs.set_pwd(pwd);
-        *self.fs.write() = Arc::new(fs);
-    }
-
-    pub fn pwd(&self) -> Arc<dyn IndexNode> {
+    pub fn pwd_inode(&self) -> Arc<dyn IndexNode> {
         self.fs.read().pwd()
     }
 

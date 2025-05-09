@@ -115,7 +115,7 @@ impl ExecParam {
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
-        let pwd = ProcessManager::current_pcb().pwd();
+        let pwd = ProcessManager::current_pcb().pwd_inode();
         let inode = pwd.lookup(file_path)?;
 
         // 读取文件头部，用于判断文件类型

@@ -112,12 +112,9 @@ pub fn commit_nsset(nsset: NsSet) {
     let current = ProcessManager::current_pcb();
     if flags.contains(CloneFlags::CLONE_NEWNS) {
         let nsset_fs = nsset.fs.read();
-        let fs = current.fs_struct();
-
-        let mut fs = (*fs).clone();
-        fs.set_pwd(nsset_fs.pwd.clone());
-        fs.set_root(nsset_fs.root.clone());
-        current.set_fs_struct(Arc::new(fs));
+        let fs = current.fs_struct_mut();
+        fs.set_pwd(nsset_fs.pwd());
+        fs.set_root(nsset_fs.root());
     }
     switch_task_namespace(current, nsset.nsproxy); // 转移所有权
 }

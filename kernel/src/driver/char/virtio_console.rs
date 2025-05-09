@@ -90,7 +90,7 @@ pub fn virtio_console(
 }
 
 //
-#[derive(Debug)]
+
 #[cast_to([sync] VirtIODevice)]
 #[cast_to([sync] Device)]
 pub struct VirtIOConsoleDevice {
@@ -102,6 +102,22 @@ pub struct VirtIOConsoleDevice {
 }
 unsafe impl Send for VirtIOConsoleDevice {}
 unsafe impl Sync for VirtIOConsoleDevice {}
+
+impl Debug for VirtIOConsoleDevice {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtIOConsoleDevice")
+            .field(
+                "devname",
+                &self
+                    .dev_name
+                    .try_get()
+                    .map(|x| x.as_str())
+                    .unwrap_or("uninitialized"),
+            )
+            .field("dev_id", &self.dev_id.id())
+            .finish()
+    }
+}
 
 impl VirtIOConsoleDevice {
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {

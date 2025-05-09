@@ -460,3 +460,95 @@ impl PosixKstat {
         }
     }
 }
+
+/// 通用的PosixStat
+#[allow(unused)]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct GenericPosixStat {
+    /// Device ID
+    pub st_dev: u64,
+    /// File serial number (inode)
+    pub st_ino: u64,
+    /// File mode
+    pub st_mode: u32,
+    /// Link count
+    pub st_nlink: u32,
+    /// User ID of the file's owner
+    pub st_uid: u32,
+    /// Group ID of the file's group
+    pub st_gid: u32,
+    /// Device number, if device
+    pub st_rdev: u64,
+    /// Padding
+    pub __pad1: u64,
+    /// Size of file, in bytes
+    pub st_size: i64,
+    /// Optimal block size for I/O
+    pub st_blksize: i32,
+    /// Padding
+    pub __pad2: i32,
+    /// Number 512-byte blocks allocated
+    pub st_blocks: i64,
+    /// Time of last access (seconds)
+    pub st_atime: i64,
+    /// Time of last access (nanoseconds)
+    pub st_atime_nsec: u64,
+    /// Time of last modification (seconds)
+    pub st_mtime: i64,
+    /// Time of last modification (nanoseconds)
+    pub st_mtime_nsec: u64,
+    /// Time of last status change (seconds)
+    pub st_ctime: i64,
+    /// Time of last status change (nanoseconds)
+    pub st_ctime_nsec: u64,
+    /// Unused
+    pub __unused4: u32,
+    /// Unused
+    pub __unused5: u32,
+}
+
+/// 转换的代码参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#393
+impl TryFrom<KStat> for GenericPosixStat {
+    type Error = SystemError;
+
+    fn try_from(kstat: KStat) -> Result<Self, Self::Error> {
+        let mut tmp = GenericPosixStat::default();
+        if core::mem::size_of_val(&tmp.st_dev) < 4 && !kstat.dev.old_valid_dev() {
+            return Err(SystemError::EOVERFLOW);
+        }
+        if core::mem::size_of_val(&tmp.st_rdev) < 4 && !kstat.rdev.old_valid_dev() {
+            return Err(SystemError::EOVERFLOW);
+        }
+
+        tmp.st_dev = kstat.dev.new_encode_dev() as u64;
+        tmp.st_ino = kstat.ino;
+
+        if core::mem::size_of_val(&tmp.st_ino) < core::mem::size_of_val(&kstat.ino)
+            && tmp.st_ino != kstat.ino
+        {
+            return Err(SystemError::EOVERFLOW);
+        }
+
+        tmp.st_mode = kstat.mode.bits();
+        tmp.st_nlink = kstat.nlink;
+
+        // todo: 处理user namespace (https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#415)
+        tmp.st_uid = kstat.uid;
+        tmp.st_gid = kstat.gid;
+
+        tmp.st_rdev = kstat.rdev.data() as u64;
+        tmp.st_size = kstat.size as i64;
+
+        tmp.st_atime = kstat.atime.tv_sec;
+        tmp.st_mtime = kstat.mtime.tv_sec;
+        tmp.st_ctime = kstat.ctime.tv_sec;
+        tmp.st_atime_nsec = kstat.atime.tv_nsec as u64;
+        tmp.st_mtime_nsec = kstat.mtime.tv_nsec as u64;
+        tmp.st_ctime_nsec = kstat.ctime.tv_nsec as u64;
+        tmp.st_blocks = kstat.blocks as i64;
+        tmp.st_blksize = kstat.blksize as i32;
+
+        Ok(tmp)
+    }
+}

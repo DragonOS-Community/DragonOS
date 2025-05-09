@@ -98,7 +98,7 @@ sbi-rt = { version = "=0.0.3", features = ["legacy"] }
 
 # target为loongarch64时，使用下面的依赖
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
-loongArch64 = { git = "https://github.com/fslongjin/loongArch64", rev = "7af150e" }
+loongArch64 = "=0.2.5"
 
 # 由于unwinding库不支持loongarch64架构，因此需要排除该依赖项
 [target.'cfg(not(target_arch = "loongarch64"))'.dependencies]

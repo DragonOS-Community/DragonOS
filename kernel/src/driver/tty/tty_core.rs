@@ -19,7 +19,7 @@ use crate::{
     },
     mm::VirtAddr,
     net::event_poll::{EPollEventType, EPollItem},
-    process::Pid,
+    process::{process_group::Pgid, session::Sid, ProcessControlBlock},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
@@ -280,14 +280,21 @@ impl TtyCore {
 
 #[derive(Debug, Default)]
 pub struct TtyContorlInfo {
-    /// 前台进程pid
-    pub session: Option<Pid>,
+    /// 当前会话的SId
+    pub session: Option<Sid>,
     /// 前台进程组id
-    pub pgid: Option<Pid>,
+    pub pgid: Option<Pgid>,
 
     /// packet模式下使用，目前未用到
     pub pktstatus: TtyPacketStatus,
     pub packet: bool,
+}
+
+impl TtyContorlInfo {
+    pub fn set_info_by_pcb(&mut self, pcb: Arc<ProcessControlBlock>) {
+        self.session = Some(pcb.sid());
+        self.pgid = Some(pcb.pgid());
+    }
 }
 
 #[derive(Debug, Default)]

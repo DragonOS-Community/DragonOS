@@ -5,10 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::block::SeekFrom,
-    filesystem::vfs::{
-        file::{File, FileMode},
-        ROOT_INODE,
-    },
+    filesystem::vfs::file::{File, FileMode},
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -118,7 +115,8 @@ impl ExecParam {
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
-        let inode = ROOT_INODE().lookup(file_path)?;
+        let pwd = ProcessManager::current_pcb().pwd_inode();
+        let inode = pwd.lookup(file_path)?;
 
         // 读取文件头部，用于判断文件类型
         let file = File::new(inode, FileMode::O_RDONLY)?;

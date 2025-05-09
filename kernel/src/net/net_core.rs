@@ -245,7 +245,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
         }
         EventPoll::wakeup_epoll(
             &posix_item.epitems,
-            Some(EPollEventType::from_bits_truncate(events as u32)),
+            EPollEventType::from_bits_truncate(events as u32),
         )?;
         drop(handle_guard);
         // crate::debug!(

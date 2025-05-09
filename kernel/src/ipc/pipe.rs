@@ -288,7 +288,7 @@ impl IndexNode for LockedPipeInode {
         let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&data)? as u32);
         drop(inner_guard);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
+        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
 
         //返回读取的字节数
         return Ok(num);
@@ -477,7 +477,7 @@ impl IndexNode for LockedPipeInode {
 
         drop(inner_guard);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
+        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
 
         // 返回写入的字节数
         return Ok(len);

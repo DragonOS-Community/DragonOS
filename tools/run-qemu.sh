@@ -169,6 +169,19 @@ while true;do
       esac
   done
 
+setup_kernel_init_program() {
+    if [ ${ARCH} == "x86_64" ]; then
+        # KERNEL_CMDLINE+=" init=/bin/busybox init "
+        KERNEL_CMDLINE+=" init=/bin/dragonreach "
+    elif [ ${ARCH} == "riscv64" ]; then
+        KERNEL_CMDLINE+=" init=/bin/riscv_rust_init "
+    fi
+}
+
+# 设置内核init程序
+setup_kernel_init_program
+
+
 if [ ${QEMU_NOGRAPHIC} == true ]; then
     QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
 
@@ -181,27 +194,21 @@ if [ ${QEMU_NOGRAPHIC} == true ]; then
       QEMU_DEVICES+=" -device virtio-serial-device -device virtconsole,chardev=mux "
     fi
 
-    KERNEL_CMDLINE+=" console=/dev/hvc0 "
+    KERNEL_CMDLINE=" console=/dev/hvc0 ${KERNEL_CMDLINE}"
     QEMU_MONITOR=""
     QEMU_ARGUMENT+=" --nographic "
 
+    KERNEL_CMDLINE=$(echo "${KERNEL_CMDLINE}" | sed 's/^[ \t]*//;s/[ \t]*$//')
+
     if [ ${ARCH} == "x86_64" ]; then
-      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf -append \"${KERNEL_CMDLINE}\" "
     elif [ ${ARCH} == "loongarch64" ]; then
-      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
+      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf -append \"${KERNEL_CMDLINE}\" "
+    elif [ ${ARCH} == "riscv64" ]; then
+      QEMU_ARGUMENT+=" -append \"${KERNEL_CMDLINE}\" "
     fi
 fi
 
-setup_kernel_init_program() {
-    if [ ${ARCH} == "x86_64" ]; then
-        KERNEL_CMDLINE+=" init=/bin/dragonreach "
-    elif [ ${ARCH} == "riscv64" ]; then
-        KERNEL_CMDLINE+=" init=/bin/riscv_rust_init "
-    fi
-}
-
-# 设置内核init程序
-setup_kernel_init_program
 
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 "
@@ -252,25 +259,25 @@ sudo rm -rf ${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND}
 
 if [ ${BIOS_TYPE} == uefi ] ;then
   if [ ${ARCH} == x86_64 ] ;then
-    sudo ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
+    sh -c "sudo ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}"
   elif [ ${ARCH} == i386 ] ;then
-    sudo ${QEMU} -bios arch/i386/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}
+    sh -c "sudo ${QEMU} -bios arch/i386/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}"
   elif [ ${ARCH} == riscv64 ] ;then
     install_riscv_uboot
-    sudo ${QEMU} -kernel ${RISCV64_UBOOT_PATH}/u-boot.bin ${QEMU_ARGUMENT}
+    sh -c "sudo ${QEMU} -kernel ${RISCV64_UBOOT_PATH}/u-boot.bin ${QEMU_ARGUMENT}"
   else
     echo "不支持的架构: ${ARCH}"
   fi
 else
   # 如果是i386架构或者x86_64架构，就直接启动
   if [ ${ARCH} == x86_64 ] || [ ${ARCH} == i386 ] ;then
-    sudo ${QEMU} ${QEMU_ARGUMENT}
+    sh -c "sudo ${QEMU} ${QEMU_ARGUMENT}"
   elif [ ${ARCH} == riscv64 ] ;then
     # 如果是riscv64架构，就与efi启动一样
     install_riscv_uboot
-    sudo ${QEMU} -kernel ${RISCV64_UBOOT_PATH}/u-boot.bin ${QEMU_ARGUMENT} -append "${KERNEL_CMDLINE}"
+    sh -c "sudo ${QEMU} -kernel ${RISCV64_UBOOT_PATH}/u-boot.bin ${QEMU_ARGUMENT}"
   elif [ ${ARCH} == loongarch64 ] ;then
-    sudo ${QEMU} ${QEMU_ARGUMENT}
+    sh -c "sudo ${QEMU} ${QEMU_ARGUMENT}"
   else
     echo "不支持的架构: ${ARCH}"
   fi

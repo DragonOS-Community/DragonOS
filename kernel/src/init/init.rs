@@ -93,10 +93,10 @@ fn do_start_kernel() {
     crate::bpf::init_bpf_system();
     crate::debug::jump_label::static_keys_init();
 
-    // #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
-    // crate::virt::kvm::kvm_init();
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
-    crate::arch::vm::vmx::vmx_init().unwrap();
+    if crate::arch::vm::vmx::vmx_init().is_err() {
+        log::warn!("vmx init failed, will not be enabled");
+    }
 }
 
 /// 在内存管理初始化之前，执行的初始化

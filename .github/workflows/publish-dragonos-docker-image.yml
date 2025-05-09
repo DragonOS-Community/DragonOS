@@ -35,5 +35,5 @@ jobs:
           context: "{{defaultContext}}:tools"
           file: Dockerfile
           platforms: linux/amd64
-          push: true
+          push: ${{ github.repository == 'DragonOS-Community/DragonOS' }}
           tags: dragonos/dragonos-dev:${{ steps.fetch-versions.outputs.build_container_version }}

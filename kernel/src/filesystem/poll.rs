@@ -64,9 +64,11 @@ impl<'a> PollAdapter<'a> {
     fn poll_all_fds(&mut self, timeout: Option<Instant>) -> Result<usize, SystemError> {
         let mut epoll_events = vec![EPollEvent::default(); self.poll_fds.len()];
         let len = epoll_events.len() as i32;
-        let remain_timeout = timeout
-            .and_then(|t| t.duration_since(Instant::now()))
-            .map(|t| t.into());
+        let remain_timeout = timeout.map(|t| {
+            t.duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO)
+                .into()
+        });
         let events = EventPoll::epoll_wait_with_file(
             self.ep_file.clone(),
             &mut epoll_events,
@@ -176,10 +178,6 @@ fn do_sys_poll(poll_fds: &mut [PollFd], timeout: Option<Instant>) -> Result<usiz
 
 /// 计算超时的时刻
 fn poll_select_set_timeout(timeout_ms: u64) -> Option<Instant> {
-    if timeout_ms == 0 {
-        return None;
-    }
-
     Some(Instant::now() + Duration::from_millis(timeout_ms))
 }
 

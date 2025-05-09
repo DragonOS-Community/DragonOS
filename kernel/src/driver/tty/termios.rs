@@ -44,10 +44,8 @@ pub struct PosixTermios {
     pub c_oflag: u32,
     pub c_cflag: u32,
     pub c_lflag: u32,
-    pub c_cc: [u8; CONTORL_CHARACTER_NUM],
     pub c_line: u8,
-    pub c_ispeed: u32,
-    pub c_ospeed: u32,
+    pub c_cc: [u8; CONTORL_CHARACTER_NUM],
 }
 
 impl PosixTermios {
@@ -59,8 +57,6 @@ impl PosixTermios {
             c_lflag: termios.local_mode.bits,
             c_cc: termios.control_characters,
             c_line: termios.line as u8,
-            c_ispeed: termios.input_speed,
-            c_ospeed: termios.output_speed,
         }
     }
 
@@ -73,8 +69,24 @@ impl PosixTermios {
             local_mode: LocalMode::from_bits_truncate(self.c_lflag),
             control_characters: self.c_cc,
             line: LineDisciplineType::from_line(self.c_line),
-            input_speed: self.c_ispeed,
-            output_speed: self.c_ospeed,
+            input_speed: self.input_speed().unwrap_or(38400),
+            output_speed: self.output_speed().unwrap_or(38400),
+        }
+    }
+
+    fn output_speed(&self) -> Option<u32> {
+        let flag = ControlMode::from_bits_truncate(
+            self.c_cflag & ControlMode::CBAUD.intersection(ControlMode::CBAUDEX).bits(),
+        ); // CBAUD + CBAUDEX
+        flag.baud_rate()
+    }
+
+    fn input_speed(&self) -> Option<u32> {
+        let ibaud = (self.c_cflag & ControlMode::CIBAUD.bits()) >> 16;
+        if ibaud == 0 {
+            self.output_speed()
+        } else {
+            ControlMode::from_bits_truncate(ibaud).baud_rate()
         }
     }
 }
@@ -349,6 +361,47 @@ bitflags! {
         const TERMIOS_WAIT	=2;
         const TERMIOS_TERMIO	=4;
         const TERMIOS_OLD	=8;
+    }
+}
+
+impl ControlMode {
+    /// 获取波特率
+    pub fn baud_rate(&self) -> Option<u32> {
+        let flag = self.intersection(Self::CBAUD);
+        match flag {
+            Self::B0 => Some(0),
+            Self::B50 => Some(50),
+            Self::B75 => Some(75),
+            Self::B110 => Some(110),
+            Self::B134 => Some(134),
+            Self::B150 => Some(150),
+            Self::B200 => Some(200),
+            Self::B300 => Some(300),
+            Self::B600 => Some(600),
+            Self::B1200 => Some(1200),
+            Self::B1800 => Some(1800),
+            Self::B2400 => Some(2400),
+            Self::B4800 => Some(4800),
+            Self::B9600 => Some(9600),
+            Self::B19200 => Some(19200),
+            Self::B38400 => Some(38400),
+            Self::B57600 => Some(57600),
+            Self::B115200 => Some(115200),
+            Self::B230400 => Some(230400),
+            Self::B460800 => Some(460800),
+            Self::B500000 => Some(500000),
+            Self::B576000 => Some(576000),
+            Self::B921600 => Some(921600),
+            Self::B1000000 => Some(1000000),
+            Self::B1152000 => Some(1152000),
+            Self::B1500000 => Some(1500000),
+            Self::B2000000 => Some(2000000),
+            Self::B2500000 => Some(2500000),
+            Self::B3000000 => Some(3000000),
+            Self::B3500000 => Some(3500000),
+            Self::B4000000 => Some(4000000),
+            _ => None,
+        }
     }
 }
 

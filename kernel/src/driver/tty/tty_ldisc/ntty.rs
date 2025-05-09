@@ -390,7 +390,7 @@ impl NTtyData {
                 continue;
             }
 
-            if ((c as usize) < self.char_map.size()) && self.char_map.get(c as usize).unwrap() {
+            if ((c as usize) < self.char_map.len()) && self.char_map.get(c as usize).unwrap() {
                 // 特殊字符
                 self.receive_special_char(c, tty.clone(), lookahead_done);
             } else {
@@ -790,7 +790,7 @@ impl NTtyData {
         let ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
         if let Some(pg) = pg {
-            let _ = Syscall::kill_process(pg, signal);
+            let _ = Syscall::kill_process_group(pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {

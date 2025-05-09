@@ -177,6 +177,10 @@ impl X86_64MMArch {
         error_code: X86PfErrorCode,
         address: VirtAddr,
     ) {
+        // log::debug!("fault at {:?}:{:?}",
+        // address,
+        // error_code,
+        // );
         let rflags = RFlags::from_bits_truncate(regs.rflags);
         let mut flags: FaultFlags = FaultFlags::FAULT_FLAG_ALLOW_RETRY
             | FaultFlags::FAULT_FLAG_KILLABLE

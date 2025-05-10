@@ -316,7 +316,6 @@ impl PageFaultHandler {
         } else {
             return VmFaultReason::VM_FAULT_OOM;
         }
-
         ret = ret.union(Self::finish_fault(pfm));
 
         ret
@@ -635,7 +634,9 @@ impl PageFaultHandler {
             // TODO 同步预读
             //涉及磁盘IO，返回标志为VM_FAULT_MAJOR
             ret = VmFaultReason::VM_FAULT_MAJOR;
+
             let mut buffer = Box::new([0u8; MMArch::PAGE_SIZE]);
+
             file.pread(
                 file_pgoff * MMArch::PAGE_SIZE,
                 MMArch::PAGE_SIZE,

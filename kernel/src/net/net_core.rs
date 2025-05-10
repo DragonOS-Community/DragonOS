@@ -37,7 +37,7 @@ impl TimerFunction for NetWorkPollFunc {
 }
 
 pub fn net_init() -> Result<(), SystemError> {
-    dhcp_query()?;
+    // dhcp_query()?;
     // Init poll timer function
     // let next_time = next_n_ms_timer_jiffies(5);
     // let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);

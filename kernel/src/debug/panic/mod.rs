@@ -1,4 +1,4 @@
-mod hook;
+pub mod hook;
 use alloc::boxed::Box;
 use cfg_if::cfg_if;
 

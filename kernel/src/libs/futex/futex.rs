@@ -677,7 +677,7 @@ impl RobustListHead {
     /// - head_uaddr：robust list head用户空间地址
     /// - len：robust list head的长度    
     pub fn set_robust_list(head_uaddr: VirtAddr, len: usize) -> Result<usize, SystemError> {
-        let robust_list_head_len = mem::size_of::<&RobustListHead>();
+        let robust_list_head_len = mem::size_of::<RobustListHead>();
         if unlikely(len != robust_list_head_len) {
             return Err(SystemError::EINVAL);
         }

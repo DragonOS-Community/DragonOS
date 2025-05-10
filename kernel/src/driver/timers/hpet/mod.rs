@@ -4,14 +4,23 @@ use crate::libs::volatile::Volatile;
 
 #[repr(C, packed)]
 pub struct HpetRegisters {
+    /// HPET 功能寄存器，包含计时器的功能信息
     capabilties: Volatile<u32>,
+    /// HPET 时钟周期寄存器，表示计时器的时钟周期
     period: Volatile<u32>,
+    /// 保留字段，用于填充内存对齐
     _reserved0: Volatile<u64>,
+    /// HPET 通用配置寄存器，用于配置计时器
     general_config: Volatile<u64>,
+    /// 保留字段，用于填充内存对齐
     _reserved1: Volatile<u64>,
+    /// HPET 通用中断状态寄存器，表示中断状态
     general_intr_status: Volatile<u64>,
+    /// 保留字段，用于填充内存对齐
     _reserved2: [Volatile<u64>; 25],
+    /// HPET 计数器值寄存器，表示当前的计数值
     main_counter_value: Volatile<u64>,
+    /// 保留字段，用于填充内存对齐
     _reserved3: Volatile<u64>,
     // 这里后面跟着各个定时器的寄存器（数量由capabilties决定）
 }
@@ -47,7 +56,6 @@ impl HpetRegisters {
         volwrite!(p, main_counter_value, value);
     }
 
-    #[allow(dead_code)]
     pub fn general_config(&self) -> u64 {
         let p = NonNull::new(self as *const HpetRegisters as *mut HpetRegisters).unwrap();
         unsafe { volread!(p, general_config) }
@@ -67,7 +75,30 @@ impl HpetRegisters {
 
 #[repr(C, packed)]
 pub struct HpetTimerRegisters {
-    pub config: Volatile<u64>,
-    pub comparator_value: Volatile<u64>,
-    pub fsb_interrupt_route: [Volatile<u64>; 2],
+    config: Volatile<u64>,
+    comparator_value: Volatile<u64>,
+    fsb_interrupt_route: [Volatile<u64>; 2],
+}
+
+impl HpetTimerRegisters {
+    pub fn config(&self) -> u64 {
+        let p = NonNull::new(self as *const HpetTimerRegisters as *mut HpetTimerRegisters).unwrap();
+        unsafe { volread!(p, config) }
+    }
+
+    pub unsafe fn write_config(&mut self, value: u64) {
+        let p = NonNull::new(self as *const HpetTimerRegisters as *mut HpetTimerRegisters).unwrap();
+        unsafe { volwrite!(p, config, value) }
+    }
+
+    #[allow(dead_code)]
+    pub fn comparator_value(&self) -> u64 {
+        let p = NonNull::new(self as *const HpetTimerRegisters as *mut HpetTimerRegisters).unwrap();
+        unsafe { volread!(p, comparator_value) }
+    }
+
+    pub unsafe fn write_comparator_value(&mut self, value: u64) {
+        let p = NonNull::new(self as *const HpetTimerRegisters as *mut HpetTimerRegisters).unwrap();
+        unsafe { volwrite!(p, comparator_value, value) }
+    }
 }

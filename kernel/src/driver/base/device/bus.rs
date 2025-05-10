@@ -299,14 +299,9 @@ impl BusManager {
             .ok_or(SystemError::EINVAL)?;
         debug!("bus '{}' add driver '{}'", bus.name(), driver.name());
 
-        // driver.set_kobj_type(Some(&BusDriverKType));
         let kobj = driver.clone() as Arc<dyn KObject>;
-        // KObjectManager::add_kobj(kobj, bus.subsystem().drivers_kset())?;
-        KObjectManager::init_and_add_kobj(
-            kobj,
-            bus.subsystem().drivers_kset(),
-            Some(&BusDriverKType),
-        )?;
+        kobj.set_kset(bus.subsystem().drivers_kset());
+        KObjectManager::init_and_add_kobj(kobj, Some(&BusDriverKType))?;
 
         bus.subsystem().add_driver_to_vec(driver)?;
         if bus.subsystem().drivers_autoprobe() {
@@ -363,15 +358,14 @@ impl BusManager {
 
         let subsys_kset = bus.subsystem().subsys();
         subsys_kset.set_name(bus.name());
+        subsys_kset.set_kset(Some(sys_bus_kset()));
         bus.subsystem().set_drivers_autoprobe(true);
 
-        subsys_kset.register(Some(sys_bus_kset()))?;
+        subsys_kset.register()?;
 
-        let devices_kset =
-            KSet::new_and_add("devices".to_string(), None, Some(subsys_kset.clone()))?;
+        let devices_kset = KSet::new_and_add("devices".to_string(), Some(subsys_kset.clone()))?;
         bus.subsystem().set_devices_kset(devices_kset);
-        let drivers_kset =
-            KSet::new_and_add("drivers".to_string(), None, Some(subsys_kset.clone()))?;
+        let drivers_kset = KSet::new_and_add("drivers".to_string(), Some(subsys_kset.clone()))?;
         bus.subsystem().set_drivers_kset(drivers_kset);
 
         self.add_probe_files(&bus)?;
@@ -531,7 +525,7 @@ pub fn bus_unregister(bus: Arc<dyn Bus>) -> Result<(), SystemError> {
 
 pub fn buses_init() -> Result<(), SystemError> {
     let bus_kset = KSet::new("bus".to_string());
-    bus_kset.register(None).expect("bus kset register failed");
+    bus_kset.register().expect("bus kset register failed");
     unsafe {
         BUS_KSET_INSTANCE = Some(bus_kset);
     }
@@ -542,7 +536,7 @@ pub fn buses_init() -> Result<(), SystemError> {
         let parent = sys_devices_kset() as Arc<dyn KObject>;
         devices_system_kset.set_parent(Some(Arc::downgrade(&parent)));
         devices_system_kset
-            .register(Some(sys_devices_kset()))
+            .register()
             .expect("devices system kset register failed");
         unsafe {
             DEVICES_SYSTEM_KSET_INSTANCE = Some(devices_system_kset);

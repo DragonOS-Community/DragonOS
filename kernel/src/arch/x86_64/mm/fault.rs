@@ -277,6 +277,7 @@ impl X86_64MMArch {
                         flags
                     );
                     log::error!("fault rip: {:#x}", regs.rip);
+
                     let pid = ProcessManager::current_pid();
                     let mut info =
                         SigInfo::new(Signal::SIGSEGV, 0, SigCode::User, SigType::Kill(pid));

@@ -451,8 +451,7 @@ impl InnerAddressSpace {
         // 找到未使用的区域
         let region = match addr {
             Some(vaddr) => {
-                self.mappings
-                    .find_free_at(self.mmap_min, vaddr, page_count.bytes(), map_flags)?
+                self.find_free_at(self.mmap_min, vaddr, page_count.bytes(), map_flags)?
             }
             None => self
                 .mappings
@@ -799,6 +798,56 @@ impl InnerAddressSpace {
 
         return self.set_brk(new_brk);
     }
+
+    pub fn find_free_at(
+        &mut self,
+        min_vaddr: VirtAddr,
+        vaddr: VirtAddr,
+        size: usize,
+        flags: MapFlags,
+    ) -> Result<VirtRegion, SystemError> {
+        // 如果没有指定地址，那么就在当前进程的地址空间中寻找一个空闲的虚拟内存范围。
+        if vaddr == VirtAddr::new(0) {
+            return self
+                .mappings
+                .find_free(min_vaddr, size)
+                .ok_or(SystemError::ENOMEM);
+        }
+
+        // 如果指定了地址，那么就检查指定的地址是否可用。
+        let requested = VirtRegion::new(vaddr, size);
+
+        if requested.end() >= MMArch::USER_END_VADDR || !vaddr.check_aligned(MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let intersect_vma = self.mappings.conflicts(requested).next();
+        if let Some(vma) = intersect_vma {
+            if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
+                // 如果指定了 MAP_FIXED_NOREPLACE 标志，由于所指定的地址无法成功建立映射，则放弃映射，不对地址做修正
+                return Err(SystemError::EEXIST);
+            }
+
+            if flags.contains(MapFlags::MAP_FIXED) {
+                // 对已有的VMA进行覆盖
+                let intersect_region = vma.lock().region.intersect(&requested).unwrap();
+                self.munmap(
+                    VirtPageFrame::new(intersect_region.start),
+                    PageFrameCount::from_bytes(intersect_region.size).unwrap(),
+                )?;
+                return Ok(requested);
+            }
+
+            // 如果没有指定MAP_FIXED标志，那么就对地址做修正
+            let requested = self
+                .mappings
+                .find_free(min_vaddr, size)
+                .ok_or(SystemError::ENOMEM)?;
+            return Ok(requested);
+        }
+
+        return Ok(requested);
+    }
 }
 
 impl Drop for InnerAddressSpace {
@@ -947,45 +996,6 @@ impl UserMappings {
         let region = VirtRegion::new(cmp::max(*hole_vaddr, min_vaddr), *size);
 
         return Some(region);
-    }
-
-    pub fn find_free_at(
-        &self,
-        min_vaddr: VirtAddr,
-        vaddr: VirtAddr,
-        size: usize,
-        flags: MapFlags,
-    ) -> Result<VirtRegion, SystemError> {
-        // 如果没有指定地址，那么就在当前进程的地址空间中寻找一个空闲的虚拟内存范围。
-        if vaddr == VirtAddr::new(0) {
-            return self.find_free(min_vaddr, size).ok_or(SystemError::ENOMEM);
-        }
-
-        // 如果指定了地址，那么就检查指定的地址是否可用。
-
-        let requested = VirtRegion::new(vaddr, size);
-
-        if requested.end() >= MMArch::USER_END_VADDR || !vaddr.check_aligned(MMArch::PAGE_SIZE) {
-            return Err(SystemError::EINVAL);
-        }
-
-        if let Some(_x) = self.conflicts(requested).next() {
-            if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
-                // 如果指定了 MAP_FIXED_NOREPLACE 标志，由于所指定的地址无法成功建立映射，则放弃映射，不对地址做修正
-                return Err(SystemError::EEXIST);
-            }
-
-            if flags.contains(MapFlags::MAP_FIXED) {
-                // todo: 支持MAP_FIXED标志对已有的VMA进行覆盖
-                return Err(SystemError::ENOSYS);
-            }
-
-            // 如果没有指定MAP_FIXED标志，那么就对地址做修正
-            let requested = self.find_free(min_vaddr, size).ok_or(SystemError::ENOMEM)?;
-            return Ok(requested);
-        }
-
-        return Ok(requested);
     }
 
     /// 在当前进程的地址空间中，保留一个指定大小的区域，使得该区域不在空洞中。

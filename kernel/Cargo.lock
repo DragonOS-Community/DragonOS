@@ -40,6 +40,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "another_ext4"
+version = "0.1.0"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git?rev=28bb8731fc#28bb8731fc8b19530e20d03ba08a813db0b1c9f1"
+dependencies = [
+ "bitflags 2.9.0",
+ "log",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -493,6 +502,7 @@ name = "dragonos_kernel"
 version = "0.1.10"
 dependencies = [
  "acpi",
+ "another_ext4",
  "asm_macros",
  "atomic_enum",
  "bit_field",
@@ -1669,6 +1679,7 @@ dependencies = [
 name = "system_error"
 version = "0.1.0"
 dependencies = [
+ "another_ext4",
  "num-derive",
  "num-traits 0.2.15",
 ]

@@ -8,6 +8,6 @@ pub(crate) fn machine_restart(_cmd: Option<&str>) -> ! {
 /// # 功能
 ///
 /// 执行系统停止操作
-pub(crate) fn machine_halt() ->! {
+pub(crate) fn machine_halt() -> ! {
     todo!();
 }

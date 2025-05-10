@@ -82,12 +82,16 @@ impl PageManager {
     }
 
     pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
-        page_reclaimer_lock_irqsave().get(paddr);
+        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+            return Some(p);
+        }
         self.phys2page.get(paddr).cloned()
     }
 
     pub fn get_unwrap(&mut self, paddr: &PhysAddr) -> Arc<Page> {
-        page_reclaimer_lock_irqsave().get(paddr);
+        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+            return p;
+        }
         self.phys2page
             .get(paddr)
             .unwrap_or_else(|| panic!("Phys Page not found, {:?}", paddr))
@@ -348,8 +352,11 @@ impl PageReclaimer {
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
 
         for vma in guard.vma_set() {
-            let address_space = vma.lock_irqsave().address_space().unwrap();
-            let address_space = address_space.upgrade().unwrap();
+            let address_space = vma.lock_irqsave().address_space().and_then(|x| x.upgrade());
+            if address_space.is_none() {
+                continue;
+            }
+            let address_space = address_space.unwrap();
             let mut guard = address_space.write();
             let mapper = &mut guard.user_mapper.utable;
             let virt = vma.lock_irqsave().page_address(page_index).unwrap();

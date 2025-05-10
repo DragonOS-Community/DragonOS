@@ -268,6 +268,7 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
+    #[inline(never)]
     pub unsafe fn do_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         if !pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE) {
             Self::do_read_fault(pfm)
@@ -291,6 +292,7 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
+    #[inline(never)]
     pub unsafe fn do_cow_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let mut ret = Self::filemap_fault(pfm);
 
@@ -351,6 +353,7 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
+    #[inline(never)]
     pub unsafe fn do_shared_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let mut ret = Self::filemap_fault(pfm);
 
@@ -411,6 +414,7 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
+    #[inline(never)]
     pub unsafe fn do_wp_page(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
@@ -538,7 +542,7 @@ impl PageFaultHandler {
         let to_pte = min(
             from_pte + fault_around_page_number,
             min(
-                1 << MMArch::PAGE_SHIFT,
+                MMArch::PAGE_ENTRY_NUM,
                 pte_pgoff + (vma_pages_count - vm_pgoff),
             ),
         );
@@ -587,7 +591,7 @@ impl PageFaultHandler {
                     .expect("file_page_offset is none"))
                 << MMArch::PAGE_SHIFT);
 
-        for pgoff in start_pgoff..=end_pgoff {
+        for pgoff in start_pgoff..end_pgoff {
             if let Some(page) = page_cache.lock_irqsave().get_page(pgoff) {
                 let page_guard = page.read_irqsave();
                 if page_guard.flags().contains(PageFlags::PG_UPTODATE) {

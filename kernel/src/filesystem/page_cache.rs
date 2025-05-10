@@ -1,4 +1,7 @@
-use core::cmp::min;
+use core::{
+    cmp::min,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use alloc::{
     sync::{Arc, Weak},
@@ -21,22 +24,27 @@ use crate::{
 };
 use crate::{libs::align::page_align_up, mm::page::PageType};
 
+static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
 /// 页面缓存
 #[derive(Debug)]
 pub struct PageCache {
+    id: usize,
     inner: SpinLock<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
 }
 
 #[derive(Debug)]
 pub struct InnerPageCache {
+    #[allow(unused)]
+    id: usize,
     pages: HashMap<usize, Arc<Page>>,
     page_cache_ref: Weak<PageCache>,
 }
 
 impl InnerPageCache {
-    pub fn new(page_cache_ref: Weak<PageCache>) -> InnerPageCache {
+    pub fn new(page_cache_ref: Weak<PageCache>, id: usize) -> InnerPageCache {
         Self {
+            id,
             pages: HashMap::new(),
             page_cache_ref,
         }
@@ -316,8 +324,10 @@ impl Drop for InnerPageCache {
 
 impl PageCache {
     pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
+        let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
         Arc::new_cyclic(|weak| Self {
-            inner: SpinLock::new(InnerPageCache::new(weak.clone())),
+            id,
+            inner: SpinLock::new(InnerPageCache::new(weak.clone(), id)),
             inode: {
                 let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
                 if let Some(inode) = inode {
@@ -326,6 +336,13 @@ impl PageCache {
                 v
             },
         })
+    }
+
+    /// # 获取页缓存的ID
+    #[inline]
+    #[allow(unused)]
+    pub fn id(&self) -> usize {
+        self.id
     }
 
     pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {

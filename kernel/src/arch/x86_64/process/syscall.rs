@@ -116,7 +116,11 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        todo!("do_arch_prctl_common not unimplemented, option: {}, arg2: {}", option, arg2);
+        todo!(
+            "do_arch_prctl_common not unimplemented, option: {}, arg2: {}",
+            option,
+            arg2
+        );
     }
 }
 

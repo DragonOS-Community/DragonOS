@@ -72,7 +72,7 @@ pub fn virtio_console(
     log::debug!(
         "virtio_console: dev_id: {:?}, parent: {:?}",
         dev_id,
-        dev_parent.as_ref().map(|x|x.name())
+        dev_parent.as_ref().map(|x| x.name())
     );
     let device = VirtIOConsoleDevice::new(transport, dev_id.clone());
     if device.is_none() {

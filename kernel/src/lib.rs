@@ -26,6 +26,8 @@
 #![allow(static_mut_refs, non_local_definitions, internal_features)]
 // clippy的配置
 #![deny(clippy::all)]
+#![deny(clippy::large_stack_frames)]
+#![deny(clippy::large_const_arrays)]
 // DragonOS允许在函数中使用return语句（尤其是长函数时，我们推荐这么做）
 #![allow(
     clippy::macro_metavars_in_unsafe,

@@ -22,6 +22,10 @@ type = "build-from-source"
 source = "archive"
 # 路径或URL
 source-path = "https://mirrors.dragonos.org.cn/pub/third_party/gnu/coreutils/coreutils-9.4.tar.xz"
+
+# 把压缩包中的哪个目录作为根目录（可选）,仅当 source = "archive" 时生效
+archive-rootdir = "coreutils-9.4"
+
 # 构建相关信息
 [build]
 # （可选）构建命令

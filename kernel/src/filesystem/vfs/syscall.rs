@@ -1388,9 +1388,6 @@ impl Syscall {
         let iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, false) }?;
 
         let data = iovecs.gather();
-        if ProcessManager::current_pid().data() >= 9 {
-            log::debug!("writev: fd = {}, data.len() = {:?}", fd, data.len());
-        }
 
         Self::write(fd, &data)
     }

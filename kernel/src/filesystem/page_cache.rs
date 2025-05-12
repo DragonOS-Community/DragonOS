@@ -316,7 +316,7 @@ impl InnerPageCache {
 
 impl Drop for InnerPageCache {
     fn drop(&mut self) {
-        log::debug!("page cache drop");
+        // log::debug!("page cache drop");
         let mut page_manager = page_manager_lock_irqsave();
         for page in self.pages.values() {
             page_manager.remove_page(&page.phys_address());

@@ -12,7 +12,7 @@ use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::vfs::{file::FileDescriptorVec, vcore as Vcore},
     libs::rwlock::RwLockWriteGuard,
-    mm::{verify_area, VirtAddr},
+    mm::VirtAddr,
     process::ProcessManager,
     syscall::{
         user_access::{self, check_and_clone_cstr, UserBufferWriter},
@@ -21,6 +21,7 @@ use crate::{
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
+use super::iov::{IoVec, IoVecs};
 use super::stat::{do_newfstatat, do_statx, PosixKstat};
 use super::vcore::do_symlinkat;
 use super::{
@@ -34,6 +35,9 @@ use super::{
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+
+mod sys_write;
+mod sys_writev;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -517,26 +521,6 @@ impl Syscall {
         let file = file.unwrap();
 
         return file.read(buf.len(), buf);
-    }
-
-    /// @brief 根据文件描述符，向文件写入数据。尝试写入的数据长度与buf的长度相同。
-    ///
-    /// @param fd 文件描述符编号
-    /// @param buf 输入缓冲区
-    ///
-    /// @return Ok(usize) 成功写入的数据的字节数
-    /// @return Err(SystemError) 写入失败，返回posix错误码
-    pub fn write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        return file.write(buf.len(), buf);
     }
 
     /// @brief 调整文件操作指针的位置
@@ -1421,20 +1405,11 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn writev(fd: i32, iov: usize, count: usize) -> Result<usize, SystemError> {
-        // IoVecs会进行用户态检验
-        let iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, false) }?;
-
-        let data = iovecs.gather();
-
-        Self::write(fd, &data)
-    }
-
     pub fn readv(fd: i32, iov: usize, count: usize) -> Result<usize, SystemError> {
         // IoVecs会进行用户态检验
-        let mut iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, true) }?;
+        let iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, true) }?;
 
-        let mut data = vec![0; iovecs.0.iter().map(|x| x.len()).sum()];
+        let mut data = vec![0; iovecs.total_len()];
 
         let len = Self::read(fd, &mut data)?;
 
@@ -1673,106 +1648,5 @@ impl Syscall {
             Some([times[0], times[1]])
         };
         do_utimes(&pathname, times)
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct IoVec {
-    /// 缓冲区的起始地址
-    pub iov_base: *mut u8,
-    /// 缓冲区的长度
-    pub iov_len: usize,
-}
-
-/// 用于存储多个来自用户空间的IoVec
-///
-/// 由于目前内核中的文件系统还不支持分散读写，所以暂时只支持将用户空间的IoVec聚合成一个缓冲区，然后进行操作。
-/// TODO：支持分散读写
-#[derive(Debug)]
-pub struct IoVecs(Vec<&'static mut [u8]>);
-
-impl IoVecs {
-    /// 从用户空间的IoVec中构造IoVecs
-    ///
-    /// @param iov 用户空间的IoVec
-    /// @param iovcnt 用户空间的IoVec的数量
-    /// @param readv 是否为readv系统调用
-    ///
-    /// @return 构造成功返回IoVecs，否则返回错误码
-    pub unsafe fn from_user(
-        iov: *const IoVec,
-        iovcnt: usize,
-        _readv: bool,
-    ) -> Result<Self, SystemError> {
-        // 检查iov指针所在空间是否合法
-        verify_area(
-            VirtAddr::new(iov as usize),
-            iovcnt * core::mem::size_of::<IoVec>(),
-        )
-        .map_err(|_| SystemError::EFAULT)?;
-
-        // 将用户空间的IoVec转换为引用（注意：这里的引用是静态的，因为用户空间的IoVec不会被释放）
-        let iovs: &[IoVec] = core::slice::from_raw_parts(iov, iovcnt);
-
-        let mut slices: Vec<&mut [u8]> = Vec::with_capacity(iovs.len());
-
-        for iov in iovs.iter() {
-            if iov.iov_len == 0 {
-                continue;
-            }
-
-            verify_area(
-                VirtAddr::new(iov.iov_base as usize),
-                iovcnt * core::mem::size_of::<IoVec>(),
-            )
-            .map_err(|_| SystemError::EFAULT)?;
-
-            slices.push(core::slice::from_raw_parts_mut(iov.iov_base, iov.iov_len));
-        }
-
-        return Ok(Self(slices));
-    }
-
-    /// @brief 将IoVecs中的数据聚合到一个缓冲区中
-    ///
-    /// @return 返回聚合后的缓冲区
-    pub fn gather(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for slice in self.0.iter() {
-            buf.extend_from_slice(slice);
-        }
-        return buf;
-    }
-
-    /// @brief 将给定的数据分散写入到IoVecs中
-    pub fn scatter(&mut self, data: &[u8]) {
-        let mut data: &[u8] = data;
-        for slice in self.0.iter_mut() {
-            let len = core::cmp::min(slice.len(), data.len());
-            if len == 0 {
-                continue;
-            }
-
-            slice[..len].copy_from_slice(&data[..len]);
-            data = &data[len..];
-        }
-    }
-
-    /// @brief 创建与IoVecs等长的缓冲区
-    ///
-    /// @param set_len 是否设置返回的Vec的len。
-    /// 如果为true，则返回的Vec的len为所有IoVec的长度之和;
-    /// 否则返回的Vec的len为0，capacity为所有IoVec的长度之和.
-    ///
-    /// @return 返回创建的缓冲区
-    pub fn new_buf(&self, set_len: bool) -> Vec<u8> {
-        let total_len: usize = self.0.iter().map(|slice| slice.len()).sum();
-        let mut buf: Vec<u8> = Vec::with_capacity(total_len);
-
-        if set_len {
-            buf.resize(total_len, 0);
-        }
-        return buf;
     }
 }

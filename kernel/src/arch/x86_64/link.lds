@@ -40,7 +40,7 @@ SECTIONS
 		_etext = .;
 		__etext = .;
 	}
-	. = ALIGN(32768);
+	. = ALIGN(4096);
 	data_start_pa = .;
 	.data (data_start_pa): AT(data_start_pa - KERNEL_VMA)
 	{
@@ -51,7 +51,7 @@ SECTIONS
 		_edata = .;
 	}
 
-	. = ALIGN(32768);
+	. = ALIGN(4096);
 
 	rodata_start_pa = .;
 	.rodata (rodata_start_pa): AT(rodata_start_pa - KERNEL_VMA)
@@ -65,7 +65,7 @@ SECTIONS
 		_erodata = .;
 	}
 
-	. = ALIGN(32768);
+	. = ALIGN(4096);
 
 	trace_point_start_pa = .;
 	.tracepoint (trace_point_start_pa): AT(trace_point_start_pa - KERNEL_VMA)
@@ -75,8 +75,18 @@ SECTIONS
         *(.tracepoint.*)
         _etracepoint = .;
     }
-    . = ALIGN(32768);
+    . = ALIGN(4096);
 
+	syscall_table_start_pa = .;
+	.syscall_table (syscall_table_start_pa): AT(syscall_table_start_pa - KERNEL_VMA)
+    {
+        _syscall_table = .;
+        *(.syscall_table)
+		*(.syscall_table.*)
+        _esyscall_table = .;
+    }
+	
+    . = ALIGN(32768);
 	init_proc_union_start_pa = .;
 	.data.init_proc_union (init_proc_union_start_pa): AT(init_proc_union_start_pa - KERNEL_VMA)
 	 { *(.data.init_proc_union) }

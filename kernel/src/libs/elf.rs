@@ -381,7 +381,7 @@ impl ElfLoader {
                 let vaddr = TryInto::<usize>::try_into(section.p_vaddr).unwrap();
                 let mut addr_to_map = load_addr + vaddr;
                 if interp_hdr.e_type == ET_EXEC || load_addr_set {
-                    elf_type.insert(MapFlags::MAP_FIXED) //TODO 应当为MapFlags::MAP_FIXED，暂时未支持
+                    elf_type.insert(MapFlags::MAP_FIXED)
                 } else if load_bias != 0 && interp_hdr.e_type == ET_DYN {
                     addr_to_map = VirtAddr::new(0);
                 }

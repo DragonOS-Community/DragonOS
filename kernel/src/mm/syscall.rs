@@ -251,7 +251,7 @@ impl From<VmFlags> for ProtFlags {
 
 impl Syscall {
     pub fn brk(new_addr: VirtAddr) -> Result<VirtAddr, SystemError> {
-        // debug!("brk: new_addr={:?}", new_addr);
+        // log::debug!("brk: new_addr={:?}", new_addr);
         let address_space = AddressSpace::current()?;
         let mut address_space = address_space.write();
 
@@ -263,6 +263,7 @@ impl Syscall {
         }
 
         unsafe {
+            // log::debug!("brk: set_brk new_addr={:?}", new_addr);
             address_space
                 .set_brk(VirtAddr::new(page_align_up(new_addr.data())))
                 .ok();
@@ -346,7 +347,6 @@ impl Syscall {
                 false,
             )?
         };
-
         return Ok(start_page.virt_address().data());
     }
 

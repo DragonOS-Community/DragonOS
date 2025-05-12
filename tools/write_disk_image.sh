@@ -79,6 +79,9 @@ $DADK -w $root_folder rootfs mount || exit 1
 LOOP_DEVICE=$($DADK -w $root_folder rootfs show-loop-device || exit 1)
 echo $LOOP_DEVICE
 echo ${mount_folder}
+
+FS_TYPE=$(findmnt -n -o FSTYPE ${mount_folder} || df -T ${mount_folder} | tail -1 | awk '{print $2}')
+echo "FS_TYPE: $FS_TYPE"
 # mkdir -p ${GRUB_INSTALL_PATH}
 
 # 检测grub文件夹是否存在
@@ -99,7 +102,12 @@ mkdir -p ${mount_folder}/bin
 mkdir -p ${mount_folder}/dev
 mkdir -p ${mount_folder}/proc
 mkdir -p ${mount_folder}/usr
-cp -r ${root_folder}/bin/sysroot/* ${mount_folder}/
+
+if [ "$FS_TYPE" = "vfat" ] || [ "$FS_TYPE" = "fat32" ]; then
+    cp -rL ${root_folder}/bin/sysroot/* ${mount_folder}/
+else
+    cp -r ${root_folder}/bin/sysroot/* ${mount_folder}/
+fi
 
 # 设置 grub 相关数据
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then

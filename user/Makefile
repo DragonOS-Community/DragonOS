@@ -2,7 +2,7 @@ user_sub_dirs = apps
 
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
-MIN_DADK_VERSION = 0.3.0
+MIN_DADK_VERSION = 0.4.0
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 
 ECHO:

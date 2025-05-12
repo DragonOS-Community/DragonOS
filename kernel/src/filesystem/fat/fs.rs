@@ -1452,7 +1452,6 @@ impl IndexNode for LockedFATInode {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
             let r = page_cache.lock_irqsave().read(offset, &mut buf[0..len]);
-            // self.0.lock_irqsave().update_metadata();
             return r;
         } else {
             return self.read_direct(offset, len, buf, data);

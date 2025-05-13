@@ -107,8 +107,14 @@ impl PlatformDriver for CmosPlatformDriver {
         Err(SystemError::ENOSYS)
     }
 
+    /// # 功能
+    ///
+    /// Cmos驱动关闭时被调用
+    ///
+    /// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/rtc/rtc-cmos.c#1498，目前rtc没有闹钟中断的功能，这个关闭主要是禁用中断的
     fn shutdown(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
-        unimplemented!("cmos platform driver shutdown")
+        // 为了使reboot正常，这里直接正常返回
+        return Ok(());
     }
 
     fn suspend(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {

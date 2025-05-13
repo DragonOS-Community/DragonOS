@@ -1,8 +1,17 @@
+use alloc::{string::String, sync::Arc};
 use core::hint::spin_loop;
-
 use system_error::SystemError;
 
-use crate::{arch::cpu::cpu_reset, libs::mutex::Mutex, syscall::user_access::check_and_clone_cstr};
+use crate::{
+    arch::reboot::{machine_halt, machine_restart},
+    driver::base::device::device_shutdown,
+    init::initial_kthread::{set_system_state, SystemState},
+    libs::{
+        mutex::Mutex,
+        notifier::{BlockingNotifierChain, NotifierBlock},
+    },
+    syscall::user_access::check_and_clone_cstr,
+};
 
 static SYSTEM_TRANSITION_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -11,6 +20,45 @@ const LINUX_REBOOT_MAGIC2: u32 = 672274793;
 const LINUX_REBOOT_MAGIC2A: u32 = 85072278;
 const LINUX_REBOOT_MAGIC2B: u32 = 369367448;
 const LINUX_REBOOT_MAGIC2C: u32 = 537993216;
+
+static mut C_A_D: bool = true;
+lazy_static! {
+    /// 注册此通知链的回调函数通常属于内核子系统或驱动程序
+    static ref REBOOT_NOTIFIER_LIST: Mutex<BlockingNotifierChain<RebootNotifyEvent, String>> =
+        Mutex::new(BlockingNotifierChain::new());
+}
+lazy_static! {
+    /// 注册此通知链的回调函数通常是与硬件相关的重启准备处理程序
+    static ref RESTART_PERP_HANDLER_LIST: Mutex<BlockingNotifierChain<RebootNotifyEvent, String>> =
+        Mutex::new(BlockingNotifierChain::new());
+}
+lazy_static! {
+    /// 注册此通知链的回调函数通常是与硬件相关的重启准备处理程序
+    static ref POWER_OFF_PREP_HANDLER_LIST: Mutex<BlockingNotifierChain<RebootNotifyEvent, String>> =
+        Mutex::new(BlockingNotifierChain::new());
+}
+
+/// # 功能
+///
+/// 将一个任意实现`NotifierBlock`trait的结构体notifier注册到`REBOOT_NOTIFIER_LIST`通知连中
+#[allow(dead_code)]
+pub fn register_reboot_notifier(
+    notifier: Arc<dyn NotifierBlock<RebootNotifyEvent, String>>,
+) -> Result<(), SystemError> {
+    let mut reboot_notifier_list = REBOOT_NOTIFIER_LIST.lock();
+    return reboot_notifier_list.register(notifier);
+}
+
+/// # 功能
+///
+/// 从`REBOOT_NOTIFIER_LIST`通知链中移除指定的实现`NotifierBlock`trait的结构体。
+#[allow(dead_code)]
+pub fn unregister_reboot_notifier(
+    notifier: Arc<dyn NotifierBlock<RebootNotifyEvent, String>>,
+) -> Result<(), SystemError> {
+    let mut reboot_notifier_list = REBOOT_NOTIFIER_LIST.lock();
+    return reboot_notifier_list.unregister(notifier);
+}
 
 #[derive(Debug)]
 pub enum RebootCommand {
@@ -65,6 +113,19 @@ impl From<RebootCommand> for u32 {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub enum RebootNotifyEvent {
+    /// 系统关闭
+    Down,
+    /// 系统重启
+    Restart,
+    /// 系统挂起
+    Halt,
+    /// 系统关闭电源
+    PowerOff,
+}
+
 /// 系统调用reboot的实现
 ///
 /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/reboot.c#700
@@ -94,11 +155,15 @@ pub(super) fn do_sys_reboot(
         RebootCommand::Restart => kernel_restart(None),
         RebootCommand::Halt => kernel_halt(),
         RebootCommand::CadOn => {
-            // todo: 支持Ctrl-Alt-Del序列
+            unsafe {
+                C_A_D = true;
+            }
             return Ok(());
         }
         RebootCommand::CadOff => {
-            // todo: 支持Ctrl-Alt-Del序列
+            unsafe {
+                C_A_D = false;
+            }
             return Ok(());
         }
         RebootCommand::PowerOff => kernel_power_off(),
@@ -126,18 +191,51 @@ pub(super) fn do_sys_reboot(
 /// 关闭所有东西并执行一个干净的重启。
 /// 在中断上下文中调用这是不安全的。
 ///
-/// todo: 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/reboot.c#265
+/// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/reboot.c#265
 pub fn kernel_restart(cmd: Option<&str>) -> ! {
+    kernel_restart_prepare(cmd);
+    do_kernel_restart_prepare();
+
     if let Some(cmd) = cmd {
         log::warn!("Restarting system with command: '{}'", cmd);
     } else {
         log::warn!("Restarting system...");
     }
-    unsafe { cpu_reset() }
+
+    // 执行与机器硬件相关的重启操作
+    machine_restart(cmd);
 }
 
-/// todo: 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/reboot.c#678
+/// # 功能
+///
+/// 处理一些重启前的准备工作
+fn kernel_restart_prepare(cmd: Option<&str>) {
+    let cmd = if let Some(cmd) = cmd {
+        // 将&str转换为String
+        String::from(cmd)
+    } else {
+        String::new()
+    };
+    REBOOT_NOTIFIER_LIST
+        .lock()
+        .call_chain(RebootNotifyEvent::Restart, Some(&cmd), None);
+
+    set_system_state(SystemState::Restart);
+
+    device_shutdown();
+}
+
+fn do_kernel_restart_prepare() {
+    RESTART_PERP_HANDLER_LIST
+        .lock()
+        .call_chain(RebootNotifyEvent::Restart, None, None);
+}
+
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/reboot.c#678
 pub fn kernel_power_off() -> ! {
+    kernel_shutdown_prepare(SystemState::PowerOff);
+    do_kernel_power_off_prepare();
+
     log::warn!("Power down");
     log::warn!("Currently, the system cannot be powered off, so we halt here.");
     loop {
@@ -145,10 +243,37 @@ pub fn kernel_power_off() -> ! {
     }
 }
 
-/// todo: 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/reboot.c#293
+/// # 功能
+///
+/// 在系统关机前执行必要的准备工作
+///
+/// 参考: https://elixir.bootlin.com/linux/v6.6/source/kernel/reboot.c#L280
+pub fn kernel_shutdown_prepare(state: SystemState) {
+    let event = if state == SystemState::Halt {
+        RebootNotifyEvent::Halt
+    } else {
+        RebootNotifyEvent::PowerOff
+    };
+    REBOOT_NOTIFIER_LIST.lock().call_chain(event, None, None);
+
+    set_system_state(state);
+
+    device_shutdown();
+}
+
+fn do_kernel_power_off_prepare() {
+    POWER_OFF_PREP_HANDLER_LIST
+        .lock()
+        .call_chain(RebootNotifyEvent::PowerOff, None, None);
+}
+
+/// # 功能
+///
+/// 执行内核停止操作
+///
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/reboot.c#293
 pub fn kernel_halt() -> ! {
-    log::warn!("System halted.");
-    loop {
-        spin_loop();
-    }
+    kernel_shutdown_prepare(SystemState::Halt);
+
+    machine_halt();
 }

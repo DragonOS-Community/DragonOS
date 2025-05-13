@@ -86,8 +86,27 @@ impl Bus for SerioBus {
         todo!()
     }
 
-    fn shutdown(&self, _device: &Arc<dyn Device>) {
-        todo!()
+    fn shutdown(&self, device: &Arc<dyn Device>) {
+        let serio_device = device
+            .clone()
+            .cast::<dyn SerioDevice>()
+            .expect("SerioBus::shutdown() failed: device is not a SerioDevice");
+        let driver = serio_device.driver();
+        if driver.is_none() {
+            return;
+        }
+
+        let serio_driver = driver
+            .unwrap()
+            .cast::<dyn SerioDriver>()
+            .expect("SerioBus::shutdown() failed: driver is not a SerioDriver");
+        if let Err(err) = serio_driver.cleanup(&serio_device) {
+            error!(
+                "SerioBus::shutdown() failed: cleanup failed. Device: '{:?}', Error: '{:?}'",
+                device.name(),
+                err
+            );
+        }
     }
 
     fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {

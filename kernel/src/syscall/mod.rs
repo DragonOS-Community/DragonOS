@@ -169,17 +169,6 @@ impl Syscall {
                 let fd = args[0];
                 Self::close(fd)
             }
-            SYS_READ => {
-                let fd = args[0] as i32;
-                let buf_vaddr = args[1];
-                let len = args[2];
-                let from_user = frame.is_from_user();
-                let mut user_buffer_writer =
-                    UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
-
-                let user_buf = user_buffer_writer.buffer(0)?;
-                Self::read(fd, user_buf)
-            }
 
             SYS_LSEEK => {
                 let fd = args[0] as i32;
@@ -783,8 +772,6 @@ impl Syscall {
                 let ret = Self::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
                 return ret;
             }
-
-            SYS_READV => Self::readv(args[0] as i32, args[1], args[2]),
 
             SYS_SET_TID_ADDRESS => Self::set_tid_address(args[0]),
 

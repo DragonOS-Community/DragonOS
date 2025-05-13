@@ -1,49 +1,48 @@
 use system_error::SystemError;
 
-use crate::arch::syscall::nr::SYS_WRITE;
+use crate::arch::syscall::nr::SYS_READ;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::UserBufferReader;
+use crate::syscall::user_access::UserBufferWriter;
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-/// System call handler for the `write` syscall
+/// System call handler for the `read` syscall
 ///
-/// This handler implements the `Syscall` trait to provide functionality for writing data to a file descriptor.
-pub struct SysWriteHandle;
+/// This handler implements the `Syscall` trait to provide functionality for reading data from a file descriptor.
+pub struct SysReadHandle;
 
-impl Syscall for SysWriteHandle {
-    /// Returns the number of arguments expected by the `write` syscall
+impl Syscall for SysReadHandle {
+    /// Returns the number of arguments expected by the `read` syscall
     fn num_args(&self) -> usize {
         3
     }
 
-    /// Handles the `write` system call
+    /// Handles the `read` system call
     ///
-    /// Writes data from a user buffer to the specified file descriptor.
+    /// Reads data from the specified file descriptor into a user buffer.
     ///
     /// # Arguments
     /// * `args` - Array containing:
     ///   - args[0]: File descriptor (i32)
-    ///   - args[1]: Pointer to user buffer (*const u8)
-    ///   - args[2]: Length of data to write (usize)
+    ///   - args[1]: Pointer to user buffer (*mut u8)
+    ///   - args[2]: Length of data to read (usize)
     /// * `from_user` - Indicates if the call originates from user space
     ///
     /// # Returns
-    /// * `Ok(usize)` - Number of bytes successfully written
+    /// * `Ok(usize)` - Number of bytes successfully read
     /// * `Err(SystemError)` - Error code if operation fails
     fn handle(&self, args: &[usize], from_user: bool) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
 
-        let user_buffer_reader = UserBufferReader::new(buf_vaddr, len, from_user)?;
+        let mut user_buffer_writer = UserBufferWriter::new(buf_vaddr, len, from_user)?;
 
-        let user_buf = user_buffer_reader.read_from_user(0)?;
-
-        do_write(fd, user_buf)
+        let user_buf = user_buffer_writer.buffer(0)?;
+        do_read(fd, user_buf)
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -62,15 +61,15 @@ impl Syscall for SysWriteHandle {
     }
 }
 
-impl SysWriteHandle {
+impl SysReadHandle {
     /// Extracts the file descriptor from syscall arguments
     fn fd(args: &[usize]) -> i32 {
         args[0] as i32
     }
 
     /// Extracts the buffer pointer from syscall arguments
-    fn buf(args: &[usize]) -> *const u8 {
-        args[1] as *const u8
+    fn buf(args: &[usize]) -> *mut u8 {
+        args[1] as *mut u8
     }
 
     /// Extracts the buffer length from syscall arguments
@@ -79,26 +78,28 @@ impl SysWriteHandle {
     }
 }
 
-syscall_table_macros::declare_syscall!(SYS_WRITE, SysWriteHandle);
+syscall_table_macros::declare_syscall!(SYS_READ, SysReadHandle);
 
-/// Internal implementation of the write operation
+/// Internal implementation of the read operation
 ///
 /// # Arguments
-/// * `fd` - File descriptor to write to
-/// * `buf` - Buffer containing data to write
+/// * `fd` - File descriptor to read from
+/// * `buf` - Buffer to store read data
 ///
 /// # Returns
-/// * `Ok(usize)` - Number of bytes successfully written
+/// * `Ok(usize)` - Number of bytes successfully read
 /// * `Err(SystemError)` - Error code if operation fails
-pub(super) fn do_write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
+pub(super) fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 
-    let file = fd_table_guard
-        .get_file_by_fd(fd)
-        .ok_or(SystemError::EBADF)?;
-
+    let file = fd_table_guard.get_file_by_fd(fd);
+    if file.is_none() {
+        return Err(SystemError::EBADF);
+    }
     // drop guard 以避免无法调度的问题
     drop(fd_table_guard);
-    return file.write(buf.len(), buf);
+    let file = file.unwrap();
+
+    return file.read(buf.len(), buf);
 }

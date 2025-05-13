@@ -21,7 +21,6 @@ use crate::{
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
-use super::iov::{IoVec, IoVecs};
 use super::stat::{do_newfstatat, do_statx, PosixKstat};
 use super::vcore::do_symlinkat;
 use super::{
@@ -36,6 +35,8 @@ use super::{
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
+mod sys_read;
+mod sys_readv;
 mod sys_write;
 mod sys_writev;
 
@@ -499,28 +500,6 @@ impl Syscall {
         drop(fd_table_guard);
         let r = file.inode().ioctl(cmd, data, &file.private_data.lock());
         return r;
-    }
-
-    /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
-    ///
-    /// @param fd 文件描述符编号
-    /// @param buf 输出缓冲区
-    ///
-    /// @return Ok(usize) 成功读取的数据的字节数
-    /// @return Err(SystemError) 读取失败，返回posix错误码
-    pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard.get_file_by_fd(fd);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
-        }
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        let file = file.unwrap();
-
-        return file.read(buf.len(), buf);
     }
 
     /// @brief 调整文件操作指针的位置
@@ -1403,19 +1382,6 @@ impl Syscall {
         parent_inode.mknod(filename, mode, dev_t)?;
 
         return Ok(0);
-    }
-
-    pub fn readv(fd: i32, iov: usize, count: usize) -> Result<usize, SystemError> {
-        // IoVecs会进行用户态检验
-        let iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, true) }?;
-
-        let mut data = vec![0; iovecs.total_len()];
-
-        let len = Self::read(fd, &mut data)?;
-
-        iovecs.scatter(&data[..len]);
-
-        return Ok(len);
     }
 
     pub fn readlink_at(

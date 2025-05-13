@@ -33,6 +33,7 @@
    kernel/container/index
    kernel/libs/index
    kernel/trace/index
+   kernel/syscall/index
 
 
 
@@ -42,11 +43,6 @@
    
    userland/appdev/index
 
-.. toctree::
-   :maxdepth: 1
-   :caption: 系统调用api文档
-
-   syscall_api/index
 
 .. toctree::
    :maxdepth: 1

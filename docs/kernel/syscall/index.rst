@@ -1,10 +1,10 @@
-.. _syscall_api:
+.. _syscall:
 
-系统调用API
+系统调用
 ====================================
 
 .. toctree::
    :maxdepth: 1
    :caption: 目录
 
-   intro
+   syscall_table

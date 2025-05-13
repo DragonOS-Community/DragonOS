@@ -8,14 +8,12 @@ CC=$(CROSS_COMPILE)gcc
 
 
 .PHONY: all
-all: main.c
-# $(CC) -static -o init main.c
+all: $(riscv_rust_init)
 	$(MAKE) -C riscv_rust_init ARCH=$(ARCH) install
 
 .PHONY: install clean
 install: all
 	$(MAKE) -C riscv_rust_init ARCH=$(ARCH) install
-# mv init $(DADK_CURRENT_BUILD_DIR)/init
 
 
 clean:

@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
 num-derive = "0.3"
+another_ext4 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git", rev = "28bb8731fc", default-features = false }

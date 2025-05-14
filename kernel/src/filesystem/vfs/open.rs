@@ -149,7 +149,7 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
     return result;
 }
 
-pub(super) fn do_sys_open(
+pub fn do_sys_open(
     dfd: i32,
     path: &str,
     o_flags: FileMode,

@@ -35,6 +35,9 @@ use super::{
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
+#[cfg(target_arch = "x86_64")]
+mod sys_open;
+
 mod sys_read;
 mod sys_readv;
 mod sys_write;
@@ -425,33 +428,6 @@ bitflags! {
 }
 
 impl Syscall {
-    /// @brief 为当前进程打开一个文件
-    ///
-    /// @param path 文件路径
-    /// @param o_flags 打开文件的标志位
-    ///
-    /// @return 文件描述符编号，或者是错误码
-    pub fn open(
-        path: *const u8,
-        o_flags: u32,
-        mode: u32,
-        follow_symlink: bool,
-    ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-        let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
-        return do_sys_open(
-            AtFlags::AT_FDCWD.bits(),
-            &path,
-            open_flags,
-            mode,
-            follow_symlink,
-        );
-    }
-
     pub fn openat(
         dirfd: i32,
         path: *const u8,
@@ -1265,7 +1241,7 @@ impl Syscall {
     }
 
     pub fn stat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(
+        let fd = sys_open::do_open(
             path,
             FileMode::O_RDONLY.bits(),
             ModeType::empty().bits(),
@@ -1277,7 +1253,7 @@ impl Syscall {
     }
 
     pub fn lstat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(
+        let fd = sys_open::do_open(
             path,
             FileMode::O_RDONLY.bits(),
             ModeType::empty().bits(),
@@ -1290,7 +1266,7 @@ impl Syscall {
 
     pub fn statfs(path: *const u8, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
-        let fd = Self::open(
+        let fd = sys_open::do_open(
             path,
             FileMode::O_RDONLY.bits(),
             ModeType::empty().bits(),

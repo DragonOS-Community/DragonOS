@@ -117,14 +117,6 @@ impl Syscall {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
             }
-            #[cfg(target_arch = "x86_64")]
-            SYS_OPEN => {
-                let path = args[0] as *const u8;
-                let flags = args[1] as u32;
-                let mode = args[2] as u32;
-
-                Self::open(path, flags, mode, true)
-            }
 
             #[cfg(target_arch = "x86_64")]
             SYS_RENAME => {

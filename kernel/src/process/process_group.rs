@@ -17,14 +17,12 @@ pub type Pgid = Pid;
 pub static ALL_PROCESS_GROUP: SpinLock<Option<HashMap<Pgid, Arc<ProcessGroup>>>> =
     SpinLock::new(None);
 
-#[derive(Debug)]
 pub struct ProcessGroup {
     /// 进程组pgid
     pub pgid: Pgid,
     pub process_group_inner: SpinLock<PGInner>,
 }
 
-#[derive(Debug)]
 pub struct PGInner {
     pub processes: BTreeMap<Pid, Arc<ProcessControlBlock>>,
     pub leader: Option<Arc<ProcessControlBlock>>,

@@ -245,7 +245,7 @@ impl Syscall {
     ///
     /// - status: 退出状态
     pub fn exit(status: usize) -> ! {
-        ProcessManager::exit(status);
+        ProcessManager::exit((status & 0xff) << 8);
     }
 
     /// @brief 获取当前进程的pid

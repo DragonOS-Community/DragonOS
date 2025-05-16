@@ -203,7 +203,7 @@ impl Syscall {
     }
 
     pub fn wait4(
-        pid: i64,
+        pid: i32,
         wstatus: *mut i32,
         options: i32,
         rusage: *mut c_void,

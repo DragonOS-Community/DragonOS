@@ -6,5 +6,4 @@ Type=simple
 ExecStart=/bin/NovaShell
 Restart=always
 ExecStartPre=-/bin/about.elf
-ExecStartPre=/bin/busybox stty erase 127
 Environment=PATH=/bin:/usr/bin:/usr/local/bin

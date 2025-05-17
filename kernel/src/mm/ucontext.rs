@@ -210,17 +210,53 @@ impl InnerAddressSpace {
     /// ## 参数
     ///
     /// - `bytes`: 拓展大小
-    #[allow(dead_code)]
     pub fn extend_stack(&mut self, mut bytes: usize) -> Result<(), SystemError> {
-        // debug!("extend user stack");
+        // log::debug!("extend user stack");
+
+        // Layout
+        // -------------- high  stack_bottom
+        // | stack pages|
+        // |------------|
+        // | stack pages|
+        // |------------|
+        // | guard pages|
+        // -------------- low
+
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
         let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_GROWSDOWN;
         let stack = self.user_stack.as_mut().unwrap();
 
         bytes = page_align_up(bytes);
         stack.mapped_size += bytes;
-        let len = stack.stack_bottom - stack.mapped_size;
-        self.map_anonymous(len, bytes, prot_flags, map_flags, false, false)?;
+        // map new stack pages
+        let extend_stack_start = stack.stack_bottom - stack.mapped_size + UserStack::GUARD_SIZE;
+        // map guard pages
+        let guard_start = stack.stack_bottom - stack.mapped_size;
+
+        self.map_anonymous(
+            extend_stack_start,
+            bytes,
+            prot_flags,
+            map_flags,
+            false,
+            false,
+        )?;
+
+        let prot_flags = ProtFlags::PROT_NONE;
+        let map_flags = MapFlags::MAP_PRIVATE
+            | MapFlags::MAP_ANONYMOUS
+            | MapFlags::MAP_FIXED_NOREPLACE
+            | MapFlags::MAP_GROWSDOWN;
+
+        self.map_anonymous(
+            guard_start,
+            UserStack::GUARD_SIZE,
+            prot_flags,
+            map_flags,
+            false,
+            false,
+        )?;
+
         return Ok(());
     }
 
@@ -1743,6 +1779,8 @@ impl UserStack {
     pub const DEFAULT_USER_STACK_SIZE: usize = 8 * 1024 * 1024;
     /// 用户栈的保护页数量
     pub const GUARD_PAGES_NUM: usize = 4;
+    /// 用户栈的保护页大小
+    pub const GUARD_SIZE: usize = Self::GUARD_PAGES_NUM * MMArch::PAGE_SIZE;
 
     /// 创建一个用户栈
     pub fn new(
@@ -1753,58 +1791,45 @@ impl UserStack {
         let stack_bottom = stack_bottom.unwrap_or(Self::DEFAULT_USER_STACK_BOTTOM);
         assert!(stack_bottom.check_aligned(MMArch::PAGE_SIZE));
 
-        // 分配用户栈的保护页
-        let guard_size = Self::GUARD_PAGES_NUM * MMArch::PAGE_SIZE;
-        let actual_stack_bottom = stack_bottom - guard_size;
+        let actual_stack_bottom = stack_bottom;
 
-        let mut prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        // Layout
+        // -------------- high
+        // | stack pages|
+        // |------------|
+        // | guard pages|
+        // -------------- low
+
+        let guard_start = actual_stack_bottom - Self::GUARD_SIZE - stack_size;
+        let prot_flags = ProtFlags::PROT_NONE;
         let map_flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
             | MapFlags::MAP_FIXED_NOREPLACE
             | MapFlags::MAP_GROWSDOWN;
-        // debug!(
-        //     "map anonymous stack: {:?} {}",
-        //     actual_stack_bottom,
-        //     guard_size
-        // );
+
+        log::info!(
+            "UserStack guard_range: {:#x} - {:#x}",
+            guard_start.data(),
+            guard_start.data() + Self::GUARD_SIZE
+        );
+
         vm.map_anonymous(
-            actual_stack_bottom,
-            guard_size,
+            guard_start,
+            Self::GUARD_SIZE,
             prot_flags,
             map_flags,
             false,
             false,
         )?;
-        // test_buddy();
-        // 设置保护页只读
-        prot_flags.remove(ProtFlags::PROT_WRITE);
-        // debug!(
-        //     "to mprotect stack guard pages: {:?} {}",
-        //     actual_stack_bottom,
-        //     guard_size
-        // );
-        vm.mprotect(
-            VirtPageFrame::new(actual_stack_bottom),
-            PageFrameCount::new(Self::GUARD_PAGES_NUM),
-            prot_flags,
-        )?;
-
-        // debug!(
-        //     "mprotect stack guard pages done: {:?} {}",
-        //     actual_stack_bottom,
-        //     guard_size
-        // );
 
         let mut user_stack = UserStack {
             stack_bottom: actual_stack_bottom,
-            mapped_size: guard_size,
-            current_sp: actual_stack_bottom - guard_size,
+            mapped_size: Self::GUARD_SIZE,
+            current_sp: actual_stack_bottom,
         };
 
-        // debug!("extend user stack: {:?} {}", stack_bottom, stack_size);
         // 分配用户栈
         user_stack.initial_extend(vm, stack_size)?;
-        // debug!("user stack created: {:?} {}", stack_bottom, stack_size);
         return Ok(user_stack);
     }
 
@@ -1819,43 +1844,14 @@ impl UserStack {
         bytes = page_align_up(bytes);
         self.mapped_size += bytes;
 
-        vm.map_anonymous(
-            self.stack_bottom - self.mapped_size,
-            bytes,
-            prot_flags,
-            map_flags,
-            false,
-            false,
-        )?;
-
-        return Ok(());
-    }
-
-    /// 扩展用户栈
-    ///
-    /// ## 参数
-    ///
-    /// - `vm` 用户地址空间结构体
-    /// - `bytes` 要扩展的字节数
-    ///
-    /// ## 返回值
-    ///
-    /// - **Ok(())** 扩展成功
-    /// - **Err(SystemError)** 扩展失败
-    #[allow(dead_code)]
-    pub fn extend(
-        &mut self,
-        vm: &mut InnerAddressSpace,
-        mut bytes: usize,
-    ) -> Result<(), SystemError> {
-        let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
-        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
-
-        bytes = page_align_up(bytes);
-        self.mapped_size += bytes;
+        log::info!(
+            "UserStack stack_range: {:#x} - {:#x}",
+            self.stack_bottom.data() - bytes,
+            self.stack_bottom.data()
+        );
 
         vm.map_anonymous(
-            self.stack_bottom - self.mapped_size,
+            self.stack_bottom - bytes,
             bytes,
             prot_flags,
             map_flags,

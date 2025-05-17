@@ -225,13 +225,19 @@ impl X86_64MMArch {
             flags |= FaultFlags::FAULT_FLAG_INSTRUCTION;
         }
 
+        let send_segv = || {
+            let pid = ProcessManager::current_pid();
+            let mut info = SigInfo::new(Signal::SIGSEGV, 0, SigCode::User, SigType::Kill(pid));
+            Signal::SIGSEGV
+                .send_signal_info(Some(&mut info), pid)
+                .expect("failed to send SIGSEGV to process");
+        };
+
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
         let mut space_guard = current_address_space.write_irqsave();
         let mut fault;
         loop {
             let vma = space_guard.mappings.find_nearest(address);
-            // let vma = space_guard.mappings.contains(address);
-
             let vma = match vma {
                 Some(vma) => vma,
                 None => {
@@ -240,12 +246,7 @@ impl X86_64MMArch {
                         error_code,
                         address.data(),
                     );
-                    let pid = ProcessManager::current_pid();
-                    let mut info =
-                        SigInfo::new(Signal::SIGSEGV, 0, SigCode::User, SigType::Kill(pid));
-                    Signal::SIGSEGV
-                        .send_signal_info(Some(&mut info), pid)
-                        .expect("failed to send SIGSEGV to process");
+                    send_segv();
                     return;
                 }
             };
@@ -274,22 +275,18 @@ impl X86_64MMArch {
                     );
                     log::error!("fault rip: {:#x}", regs.rip);
 
-                    let pid = ProcessManager::current_pid();
-                    let mut info =
-                        SigInfo::new(Signal::SIGSEGV, 0, SigCode::User, SigType::Kill(pid));
-                    Signal::SIGSEGV
-                        .send_signal_info(Some(&mut info), pid)
-                        .expect("failed to send SIGSEGV to process");
+                    send_segv();
                     return;
                 }
             }
 
             if unlikely(Self::vma_access_error(vma.clone(), error_code)) {
-                panic!(
-                    "vma access error, error_code: {:#b}, address: {:#x}",
+                log::error!(
+                    "vma access error, error_code: {:?}, address: {:#x}",
                     error_code,
                     address.data(),
                 );
+                send_segv();
             }
             let mapper = &mut space_guard.user_mapper.utable;
             let message = PageFaultMessage::new(vma.clone(), address, flags, mapper);

@@ -206,21 +206,51 @@ impl InnerAddressSpace {
         return Ok(new_addr_space);
     }
 
+    /// Check if the stack can be extended
+    pub fn can_extend_stack(&self, bytes: usize) -> bool {
+        let bytes = page_align_up(bytes);
+        let stack = self.user_stack.as_ref().unwrap();
+        let new_size = stack.mapped_size + bytes;
+        if new_size > stack.max_limit {
+            // Don't exceed the maximum stack size
+            return false;
+        }
+        return true;
+    }
+
     /// 拓展用户栈
     /// ## 参数
     ///
     /// - `bytes`: 拓展大小
-    #[allow(dead_code)]
     pub fn extend_stack(&mut self, mut bytes: usize) -> Result<(), SystemError> {
-        // debug!("extend user stack");
+        // log::debug!("extend user stack");
+
+        // Layout
+        // -------------- high  stack_bottom
+        // | stack pages|
+        // |------------|
+        // | stack pages|
+        // |------------|
+        // | guard pages| not mapped
+        // -------------- low
+
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
         let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_GROWSDOWN;
         let stack = self.user_stack.as_mut().unwrap();
 
         bytes = page_align_up(bytes);
         stack.mapped_size += bytes;
-        let len = stack.stack_bottom - stack.mapped_size;
-        self.map_anonymous(len, bytes, prot_flags, map_flags, false, false)?;
+        // map new stack pages
+        let extend_stack_start = stack.stack_bottom - stack.mapped_size;
+
+        self.map_anonymous(
+            extend_stack_start,
+            bytes,
+            prot_flags,
+            map_flags,
+            false,
+            false,
+        )?;
         return Ok(());
     }
 
@@ -1734,6 +1764,8 @@ pub struct UserStack {
     mapped_size: usize,
     /// 栈顶地址（这个值需要仔细确定！因为它可能不会实时与用户栈的真实栈顶保持一致！要小心！）
     current_sp: VirtAddr,
+    /// 用户自定义的栈大小限制
+    max_limit: usize,
 }
 
 impl UserStack {
@@ -1753,117 +1785,43 @@ impl UserStack {
         let stack_bottom = stack_bottom.unwrap_or(Self::DEFAULT_USER_STACK_BOTTOM);
         assert!(stack_bottom.check_aligned(MMArch::PAGE_SIZE));
 
-        // 分配用户栈的保护页
-        let guard_size = Self::GUARD_PAGES_NUM * MMArch::PAGE_SIZE;
-        let actual_stack_bottom = stack_bottom - guard_size;
+        // Layout
+        // -------------- high
+        // | stack pages|
+        // |------------|
+        // | guard pages| not mapped
+        // -------------- low
 
-        let mut prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
-        let map_flags = MapFlags::MAP_PRIVATE
-            | MapFlags::MAP_ANONYMOUS
-            | MapFlags::MAP_FIXED_NOREPLACE
-            | MapFlags::MAP_GROWSDOWN;
-        // debug!(
-        //     "map anonymous stack: {:?} {}",
-        //     actual_stack_bottom,
-        //     guard_size
-        // );
-        vm.map_anonymous(
-            actual_stack_bottom,
-            guard_size,
-            prot_flags,
-            map_flags,
-            false,
-            false,
-        )?;
-        // test_buddy();
-        // 设置保护页只读
-        prot_flags.remove(ProtFlags::PROT_WRITE);
-        // debug!(
-        //     "to mprotect stack guard pages: {:?} {}",
-        //     actual_stack_bottom,
-        //     guard_size
-        // );
-        vm.mprotect(
-            VirtPageFrame::new(actual_stack_bottom),
-            PageFrameCount::new(Self::GUARD_PAGES_NUM),
-            prot_flags,
-        )?;
-
-        // debug!(
-        //     "mprotect stack guard pages done: {:?} {}",
-        //     actual_stack_bottom,
-        //     guard_size
-        // );
-
-        let mut user_stack = UserStack {
-            stack_bottom: actual_stack_bottom,
-            mapped_size: guard_size,
-            current_sp: actual_stack_bottom - guard_size,
-        };
-
-        // debug!("extend user stack: {:?} {}", stack_bottom, stack_size);
-        // 分配用户栈
-        user_stack.initial_extend(vm, stack_size)?;
-        // debug!("user stack created: {:?} {}", stack_bottom, stack_size);
-        return Ok(user_stack);
-    }
-
-    fn initial_extend(
-        &mut self,
-        vm: &mut InnerAddressSpace,
-        mut bytes: usize,
-    ) -> Result<(), SystemError> {
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
         let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_GROWSDOWN;
 
-        bytes = page_align_up(bytes);
-        self.mapped_size += bytes;
+        let stack_size = page_align_up(stack_size);
+
+        // log::info!(
+        //     "UserStack stack_range: {:#x} - {:#x}",
+        //     stack_bottom.data() - stack_size,
+        //     stack_bottom.data()
+        // );
 
         vm.map_anonymous(
-            self.stack_bottom - self.mapped_size,
-            bytes,
+            stack_bottom - stack_size,
+            stack_size,
             prot_flags,
             map_flags,
             false,
             false,
         )?;
 
-        return Ok(());
-    }
+        let max_limit = core::cmp::max(Self::DEFAULT_USER_STACK_SIZE, stack_size);
 
-    /// 扩展用户栈
-    ///
-    /// ## 参数
-    ///
-    /// - `vm` 用户地址空间结构体
-    /// - `bytes` 要扩展的字节数
-    ///
-    /// ## 返回值
-    ///
-    /// - **Ok(())** 扩展成功
-    /// - **Err(SystemError)** 扩展失败
-    #[allow(dead_code)]
-    pub fn extend(
-        &mut self,
-        vm: &mut InnerAddressSpace,
-        mut bytes: usize,
-    ) -> Result<(), SystemError> {
-        let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
-        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+        let user_stack = UserStack {
+            stack_bottom,
+            mapped_size: stack_size,
+            current_sp: stack_bottom,
+            max_limit,
+        };
 
-        bytes = page_align_up(bytes);
-        self.mapped_size += bytes;
-
-        vm.map_anonymous(
-            self.stack_bottom - self.mapped_size,
-            bytes,
-            prot_flags,
-            map_flags,
-            false,
-            false,
-        )?;
-
-        return Ok(());
+        return Ok(user_stack);
     }
 
     /// 获取栈顶地址
@@ -1883,11 +1841,17 @@ impl UserStack {
             stack_bottom: self.stack_bottom,
             mapped_size: self.mapped_size,
             current_sp: self.current_sp,
+            max_limit: self.max_limit,
         };
     }
 
     /// 获取当前用户栈的大小（不包括保护页）
     pub fn stack_size(&self) -> usize {
-        return self.mapped_size - Self::GUARD_PAGES_NUM * MMArch::PAGE_SIZE;
+        return self.mapped_size;
+    }
+
+    /// 设置当前用户栈的最大大小
+    pub fn set_max_limit(&mut self, max_limit: usize) {
+        self.max_limit = max_limit;
     }
 }

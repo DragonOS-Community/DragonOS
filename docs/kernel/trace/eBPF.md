@@ -18,7 +18,7 @@ eBPF 从根本上改变了这个方式。通过允许在操作系统中运行沙
 
 ## eBPF的运行流程
 
-![image-20240909165945192](./ebpf_flow.png)
+![image-20240909165945192](/kernel/trace/ebpf_flow.png)
 
 如图所示，eBPF程序的运行过程分为三个主要步骤：
 

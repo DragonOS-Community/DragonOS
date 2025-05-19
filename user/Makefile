@@ -20,7 +20,7 @@ ifeq ("$(DADK_VERSION)", "")
 	@echo "\n\tcargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION)" --locked
 	@echo "\n"
 	@echo "Auto installing dadk..."
-	cargo install dadk
+	cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION)" --locked
 else
 # 如果DADK版本过低，则自动更新
 	@echo "dadk version $(DADK_VERSION) installed"

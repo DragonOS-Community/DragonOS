@@ -30,7 +30,6 @@ use crate::{
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
-        stat::PosixKstat,
         syscall::{ModeType, UtimensFlags},
         MAX_PATHLEN,
     },
@@ -156,10 +155,6 @@ impl Syscall {
                 let mode = args[3] as u32;
 
                 Self::openat(dirfd, path, flags, mode, true)
-            }
-            SYS_CLOSE => {
-                let fd = args[0];
-                Self::close(fd)
             }
 
             SYS_LSEEK => {
@@ -657,19 +652,6 @@ impl Syscall {
 
             SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
 
-            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-            SYS_FSTAT => {
-                let fd = args[0] as i32;
-                let kstat: *mut PosixKstat = args[1] as *mut PosixKstat;
-                let vaddr = VirtAddr::new(kstat as usize);
-                // FIXME 由于c中的verify_area与rust中的verify_area重名，所以在引入时加了前缀区分
-                // TODO 应该将用了c版本的verify_area都改为rust的verify_area
-                match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                    Ok(_) => Self::fstat(fd, kstat),
-                    Err(e) => Err(e),
-                }
-            }
-
             SYS_FCNTL => {
                 let fd = args[0] as i32;
                 let cmd: Option<FcntlCommand> =
@@ -766,20 +748,6 @@ impl Syscall {
             }
 
             SYS_SET_TID_ADDRESS => Self::set_tid_address(args[0]),
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_LSTAT => {
-                let path = args[0] as *const u8;
-                let kstat = args[1] as *mut PosixKstat;
-                Self::lstat(path, kstat)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_STAT => {
-                let path = args[0] as *const u8;
-                let kstat = args[1] as *mut PosixKstat;
-                Self::stat(path, kstat)
-            }
 
             SYS_STATFS => {
                 let path = args[0] as *const u8;

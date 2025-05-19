@@ -3,6 +3,7 @@ use crate::filesystem::vfs::FileSystemMakerData;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+
 use log::warn;
 use system_error::SystemError;
 
@@ -21,7 +22,7 @@ use crate::{
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
-use super::stat::{do_newfstatat, do_statx, PosixKstat};
+use super::stat::{do_newfstatat, do_statx};
 use super::vcore::do_symlinkat;
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
@@ -35,11 +36,17 @@ use super::{
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
+mod sys_close;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+mod sys_fstat;
+#[cfg(target_arch = "x86_64")]
+mod sys_lstat;
 #[cfg(target_arch = "x86_64")]
 mod sys_open;
-
 mod sys_read;
 mod sys_readv;
+#[cfg(target_arch = "x86_64")]
+mod sys_stat;
 mod sys_write;
 mod sys_writev;
 
@@ -442,19 +449,6 @@ impl Syscall {
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
         let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
-    }
-
-    /// @brief 关闭文件
-    ///
-    /// @param fd 文件描述符编号
-    ///
-    /// @return 成功返回0，失败返回错误码
-    pub fn close(fd: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        let _file = fd_table_guard.drop_fd(fd as i32)?;
-        drop(fd_table_guard);
-        Ok(0)
     }
 
     /// @brief 发送命令到文件描述符对应的设备，
@@ -1185,83 +1179,6 @@ impl Syscall {
         }
 
         return Err(SystemError::EBADF);
-    }
-
-    fn do_fstat(fd: i32) -> Result<PosixKstat, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-
-        let mut kstat = PosixKstat::new();
-        // 获取文件信息
-        let metadata = file.metadata()?;
-        kstat.size = metadata.size;
-        kstat.dev_id = metadata.dev_id as u64;
-        kstat.inode = metadata.inode_id.into() as u64;
-        kstat.blcok_size = metadata.blk_size as i64;
-        kstat.blocks = metadata.blocks as u64;
-
-        kstat.atime.tv_sec = metadata.atime.tv_sec;
-        kstat.atime.tv_nsec = metadata.atime.tv_nsec;
-        kstat.mtime.tv_sec = metadata.mtime.tv_sec;
-        kstat.mtime.tv_nsec = metadata.mtime.tv_nsec;
-        kstat.ctime.tv_sec = metadata.ctime.tv_sec;
-        kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
-
-        kstat.nlink = metadata.nlinks as u64;
-        kstat.uid = metadata.uid as i32;
-        kstat.gid = metadata.gid as i32;
-        kstat.rdev = metadata.raw_dev.data() as i64;
-        kstat.mode = metadata.mode;
-        match file.file_type() {
-            FileType::File => kstat.mode.insert(ModeType::S_IFREG),
-            FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
-            FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
-            FileType::CharDevice => kstat.mode.insert(ModeType::S_IFCHR),
-            FileType::SymLink => kstat.mode.insert(ModeType::S_IFLNK),
-            FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
-            FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
-            FileType::KvmDevice => kstat.mode.insert(ModeType::S_IFCHR),
-            FileType::FramebufferDevice => kstat.mode.insert(ModeType::S_IFCHR),
-        }
-
-        return Ok(kstat);
-    }
-
-    pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixKstat>(), true)?;
-        let kstat = Self::do_fstat(fd)?;
-
-        writer.copy_one_to_user(&kstat, 0)?;
-        return Ok(0);
-    }
-
-    pub fn stat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = sys_open::do_open(
-            path,
-            FileMode::O_RDONLY.bits(),
-            ModeType::empty().bits(),
-            true,
-        )?;
-        let r = Self::fstat(fd as i32, user_kstat);
-        Self::close(fd).ok();
-        return r;
-    }
-
-    pub fn lstat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = sys_open::do_open(
-            path,
-            FileMode::O_RDONLY.bits(),
-            ModeType::empty().bits(),
-            false,
-        )?;
-        let r = Self::fstat(fd as i32, user_kstat);
-        Self::close(fd).ok();
-        return r;
     }
 
     pub fn statfs(path: *const u8, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {

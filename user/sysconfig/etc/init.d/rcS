@@ -1,4 +1,3 @@
 #!/bin/sh
 echo "[rcS] Running system init script..."
 /bin/about.elf
-/bin/busybox stty erase 127

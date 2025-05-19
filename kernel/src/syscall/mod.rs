@@ -23,6 +23,7 @@ use crate::{
 use log::{info, warn};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
+use table::{syscall_table, syscall_table_init};
 
 use crate::{
     arch::{interrupt::TrapFrame, MMArch},
@@ -48,6 +49,7 @@ use self::{
 };
 
 pub mod misc;
+pub mod table;
 pub mod user_access;
 
 // 与linux不一致的调用，在linux基础上累加
@@ -98,6 +100,18 @@ impl Syscall {
         args: &[usize],
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
+        // 首先尝试从syscall_table获取处理函数
+        if let Some(handler) = syscall_table().get(syscall_num) {
+            // 使用以下代码可以打印系统调用号和参数，方便调试
+            // log::debug!(
+            //     "Syscall {} called with args {}",
+            //     handler.name,
+            //     handler.args_string(args)
+            // );
+            return handler.inner_handle.handle(args, frame.is_from_user());
+        }
+
+        // 如果找不到，fallback到原有逻辑
         let r = match syscall_num {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
@@ -153,28 +167,6 @@ impl Syscall {
             SYS_CLOSE => {
                 let fd = args[0];
                 Self::close(fd)
-            }
-            SYS_READ => {
-                let fd = args[0] as i32;
-                let buf_vaddr = args[1];
-                let len = args[2];
-                let from_user = frame.is_from_user();
-                let mut user_buffer_writer =
-                    UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
-
-                let user_buf = user_buffer_writer.buffer(0)?;
-                Self::read(fd, user_buf)
-            }
-            SYS_WRITE => {
-                let fd = args[0] as i32;
-                let buf_vaddr = args[1];
-                let len = args[2];
-                let from_user = frame.is_from_user();
-                let user_buffer_reader =
-                    UserBufferReader::new(buf_vaddr as *const u8, len, from_user)?;
-
-                let user_buf = user_buffer_reader.read_from_user(0)?;
-                Self::write(fd, user_buf)
             }
 
             SYS_LSEEK => {
@@ -773,9 +765,6 @@ impl Syscall {
                 return ret;
             }
 
-            SYS_READV => Self::readv(args[0] as i32, args[1], args[2]),
-            SYS_WRITEV => Self::writev(args[0] as i32, args[1], args[2]),
-
             SYS_SET_TID_ADDRESS => Self::set_tid_address(args[0]),
 
             #[cfg(target_arch = "x86_64")]
@@ -1258,4 +1247,10 @@ impl Syscall {
         print!("\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{s}\x1B[0m");
         return Ok(s.len());
     }
+}
+
+#[inline(never)]
+pub fn syscall_init() -> Result<(), SystemError> {
+    syscall_table_init()?;
+    Ok(())
 }

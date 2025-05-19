@@ -8,7 +8,7 @@ use system_error::SystemError;
 use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
-        syscall::{IoVec, IoVecs},
+        iov::{IoVec, IoVecs},
         FileType,
     },
     libs::spinlock::SpinLockGuard,
@@ -295,7 +295,7 @@ impl Syscall {
     /// @return 成功返回接收的字节数，失败返回错误码
     pub fn recvmsg(fd: usize, msg: &mut MsgHdr, _flags: u32) -> Result<usize, SystemError> {
         // 检查每个缓冲区地址是否合法，生成iovecs
-        let mut iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)

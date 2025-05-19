@@ -23,7 +23,7 @@ use crate::{
     process::{kthread::kthread_init, process_init, ProcessManager},
     sched::SchedArch,
     smp::{early_smp_init, SMPArch},
-    syscall::Syscall,
+    syscall::{syscall_init, Syscall},
     time::{
         clocksource::clocksource_boot_finish, timekeeping::timekeeping_init, timer::timer_init,
     },
@@ -68,6 +68,8 @@ fn do_start_kernel() {
     boot_callback_except_early();
 
     init_intertrait();
+
+    syscall_init().expect("syscall init failed");
 
     vfs_init().expect("vfs init failed");
     driver_init().expect("driver init failed");

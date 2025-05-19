@@ -30,7 +30,6 @@ use crate::{
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
-        stat::PosixKstat,
         syscall::{ModeType, UtimensFlags},
         MAX_PATHLEN,
     },
@@ -668,14 +667,7 @@ impl Syscall {
             #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_FSTAT => {
                 let fd = args[0] as i32;
-                let kstat: *mut PosixKstat = args[1] as *mut PosixKstat;
-                let vaddr = VirtAddr::new(kstat as usize);
-                // FIXME 由于c中的verify_area与rust中的verify_area重名，所以在引入时加了前缀区分
-                // TODO 应该将用了c版本的verify_area都改为rust的verify_area
-                match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                    Ok(_) => Self::fstat(fd, kstat),
-                    Err(e) => Err(e),
-                }
+                Self::fstat(fd, args[1])
             }
 
             SYS_FCNTL => {
@@ -778,15 +770,13 @@ impl Syscall {
             #[cfg(target_arch = "x86_64")]
             SYS_LSTAT => {
                 let path = args[0] as *const u8;
-                let kstat = args[1] as *mut PosixKstat;
-                Self::lstat(path, kstat)
+                Self::lstat(path, args[1])
             }
 
             #[cfg(target_arch = "x86_64")]
             SYS_STAT => {
                 let path = args[0] as *const u8;
-                let kstat = args[1] as *mut PosixKstat;
-                Self::stat(path, kstat)
+                Self::stat(path, args[1])
             }
 
             SYS_STATFS => {
@@ -902,8 +892,10 @@ impl Syscall {
             }
 
             SYS_EXIT_GROUP => {
-                warn!("SYS_EXIT_GROUP has not yet been implemented");
-                Ok(0)
+                let exit_code = args[0];
+                Self::exit(exit_code)
+                // warn!("SYS_EXIT_GROUP has not yet been implemented");
+                // Ok(0)
             }
 
             SYS_MADVISE => {
@@ -1051,7 +1043,7 @@ impl Syscall {
 
             SYS_RSEQ => {
                 warn!("SYS_RSEQ has not yet been implemented");
-                Ok(0)
+                Err(SystemError::ENOSYS)
             }
 
             #[cfg(target_arch = "x86_64")]

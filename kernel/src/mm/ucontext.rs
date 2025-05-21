@@ -226,12 +226,12 @@ impl InnerAddressSpace {
         // log::debug!("extend user stack");
 
         // Layout
-        // -------------- high  stack_bottom
+        // -------------- high->sp
         // | stack pages|
         // |------------|
         // | stack pages|
         // |------------|
-        // | guard pages| not mapped
+        // | not mapped |
         // -------------- low
 
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
@@ -1786,10 +1786,10 @@ impl UserStack {
         assert!(stack_bottom.check_aligned(MMArch::PAGE_SIZE));
 
         // Layout
-        // -------------- high
+        // -------------- high->sp
         // | stack pages|
         // |------------|
-        // | guard pages| not mapped
+        // | not mapped |
         // -------------- low
 
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;

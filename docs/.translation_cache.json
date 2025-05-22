@@ -264,6 +264,12 @@
     "hash": "8b840ec6af5782d8f793f746b1061ed9"
   },
   "en:index.rst": {
-    "hash": "8ca31b793978d962c65df867b3261860"
+    "hash": "9bdd33a9fc7a2648cded2d463fe29115"
+  },
+  "en:questions/index.rst": {
+    "hash": "b1cee9bfde04d6375f24c93a29ce3c71"
+  },
+  "en:questions/build_errors.md": {
+    "hash": "76bf24821bab907c28e8c8287d2895d5"
   }
 }

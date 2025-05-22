@@ -22,6 +22,7 @@ import re
 import hashlib
 import json
 from pathlib import Path
+import sys
 import threading
 from typing import List, Dict, Tuple
 import openai
@@ -454,6 +455,7 @@ class DocumentTranslator:
         lang_pbar.close()
         print(
             f"\n翻译完成！ Succ: {total_tasks-self.fail_count}, Fail: {self.fail_count}")
+        
 
 
 if __name__ == "__main__":
@@ -465,3 +467,6 @@ if __name__ == "__main__":
 
     translator = DocumentTranslator()
     translator.run()
+    
+    if translator.fail_count > 0:
+        sys.exit(1)

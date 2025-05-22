@@ -2,6 +2,8 @@ use crate::driver::base::block::gendisk::GenDisk;
 use crate::filesystem::vfs::{
     self, FileSystem, FileSystemMaker, FileSystemMakerData, IndexNode, Magic, FSMAKER,
 };
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
+use crate::mm::VmFaultReason;
 use alloc::sync::{Arc, Weak};
 use linkme::distributed_slice;
 use system_error::SystemError;
@@ -30,6 +32,19 @@ impl FileSystem for Ext4FileSystem {
 
     fn super_block(&self) -> vfs::SuperBlock {
         vfs::SuperBlock::new(Magic::EXT4_MAGIC, another_ext4::BLOCK_SIZE as u64, 255)
+    }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::filemap_fault(pfm)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
 }
 

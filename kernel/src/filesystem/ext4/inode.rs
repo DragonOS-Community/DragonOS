@@ -1,4 +1,10 @@
-use crate::filesystem::vfs::{self, syscall::ModeType, IndexNode, InodeId};
+use crate::{
+    filesystem::{
+        page_cache::PageCache,
+        vfs::{self, syscall::ModeType, FilePrivateData, IndexNode, InodeId},
+    },
+    libs::spinlock::SpinLockGuard,
+};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -6,6 +12,7 @@ use alloc::{
 };
 use another_ext4;
 use core::fmt::Debug;
+use num::ToPrimitive;
 use system_error::SystemError;
 
 type PrivateData<'a> = crate::libs::spinlock::SpinLockGuard<'a, vfs::FilePrivateData>;
@@ -13,6 +20,7 @@ type PrivateData<'a> = crate::libs::spinlock::SpinLockGuard<'a, vfs::FilePrivate
 pub struct Ext4Inode {
     inode: u32,
     fs_ptr: Arc<super::filesystem::Ext4FileSystem>,
+    page_cache: Option<Arc<PageCache>>,
 }
 
 impl IndexNode for Ext4Inode {
@@ -35,7 +43,7 @@ impl IndexNode for Ext4Inode {
             name,
             another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16),
         )?;
-        Ok(self.new_ref(id))
+        self.new_ref(id).map(|inode| inode as Arc<dyn IndexNode>)
     }
 
     fn read_at(
@@ -43,11 +51,59 @@ impl IndexNode for Ext4Inode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _: PrivateData,
+        data: PrivateData,
     ) -> Result<usize, SystemError> {
-        self.concret_fs()
-            .read(self.inode, offset, &mut buf[0..len])
-            .map_err(From::from)
+        let len = core::cmp::min(len, buf.len());
+        let buf = &mut buf[0..len];
+        if let Some(page_cache) = self.page_cache.clone() {
+            let time = crate::time::PosixTimeSpec::now()
+                .tv_sec
+                .to_u32()
+                .unwrap_or_else(|| {
+                    log::warn!("Failed to get current time, using 0");
+                    0
+                });
+            self.concret_fs()
+                .setattr(
+                    self.inode,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(time),
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(SystemError::from)?;
+            page_cache.lock_irqsave().read(offset, buf)
+        } else {
+            self.read_direct(offset, len, buf, data)
+        }
+    }
+
+    fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        use another_ext4::FileType;
+        match self.concret_fs().getattr(self.inode)?.ftype {
+            FileType::Directory => Err(SystemError::EISDIR),
+            FileType::Unknown => Err(SystemError::EROFS),
+            FileType::RegularFile => self
+                .concret_fs()
+                .read(self.inode, offset, buf)
+                .map_err(From::from),
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
+    fn read_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let len = core::cmp::min(len, buf.len());
+        self.read_sync(offset, &mut buf[0..len])
     }
 
     fn write_at(
@@ -55,11 +111,62 @@ impl IndexNode for Ext4Inode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _: PrivateData,
+        data: PrivateData,
     ) -> Result<usize, SystemError> {
-        self.concret_fs()
-            .write(self.inode, offset, &buf[0..len])
-            .map_err(From::from)
+        let len = core::cmp::min(len, buf.len());
+        let buf = &buf[0..len];
+        if let Some(page_cache) = self.page_cache.clone() {
+            let write_len = page_cache.lock_irqsave().write(offset, buf)?;
+            let old_file_size = self.concret_fs().getattr(self.inode)?.size;
+            let current_file_size = core::cmp::max(old_file_size, (offset + write_len) as u64);
+            let time = crate::time::PosixTimeSpec::now()
+                .tv_sec
+                .to_u32()
+                .unwrap_or_else(|| {
+                    log::warn!("Failed to get current time, using 0");
+                    0
+                });
+            self.concret_fs()
+                .setattr(
+                    self.inode,
+                    None,
+                    None,
+                    None,
+                    Some(current_file_size),
+                    None,
+                    Some(time),
+                    None,
+                    None,
+                )
+                .map_err(SystemError::from)?;
+            Ok(write_len)
+        } else {
+            self.write_direct(offset, len, buf, data)
+        }
+    }
+
+    fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        use another_ext4::FileType;
+        match self.concret_fs().getattr(self.inode)?.ftype {
+            FileType::Directory => Err(SystemError::EISDIR),
+            FileType::Unknown => Err(SystemError::EROFS),
+            FileType::RegularFile => self
+                .concret_fs()
+                .write(self.inode, offset, buf)
+                .map_err(From::from),
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
+    fn write_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let len = core::cmp::min(len, buf.len());
+        self.write_sync(offset, &buf[0..len])
     }
 
     fn fs(&self) -> Arc<dyn vfs::FileSystem> {
@@ -72,7 +179,8 @@ impl IndexNode for Ext4Inode {
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let next_inode = self.concret_fs().lookup(self.inode, name)?;
-        Ok(self.new_ref(next_inode))
+        self.new_ref(next_inode)
+            .map(|inode| inode as Arc<dyn IndexNode>)
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -155,14 +263,34 @@ impl IndexNode for Ext4Inode {
     fn close(&self, _: PrivateData) -> Result<(), SystemError> {
         Ok(())
     }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        // self.0.lock().page_cache.clone()
+        todo!()
+    }
 }
 
 impl Ext4Inode {
-    pub fn new_ref(&self, inode: u32) -> Arc<Self> {
-        Arc::new(Ext4Inode {
-            inode,
-            fs_ptr: self.fs_ptr.clone(),
-        })
+    pub fn new_ref(&self, inode: u32) -> Result<Arc<Self>, SystemError> {
+        if self
+            .concret_fs()
+            .getattr(inode)
+            .map_err(SystemError::from)?
+            .ftype
+            != another_ext4::FileType::Directory
+        {
+            Ok(Arc::new_cyclic(|me| Ext4Inode {
+                inode,
+                fs_ptr: self.fs_ptr.clone(),
+                page_cache: Some(PageCache::new(Some(me.clone() as Weak<dyn IndexNode>))),
+            }))
+        } else {
+            Ok(Arc::new(Ext4Inode {
+                inode,
+                fs_ptr: self.fs_ptr.clone(),
+                page_cache: None,
+            }))
+        }
     }
 
     fn concret_fs(&self) -> &another_ext4::Ext4 {
@@ -173,6 +301,7 @@ impl Ext4Inode {
         Arc::new(Ext4Inode {
             inode: another_ext4::EXT4_ROOT_INO,
             fs_ptr: fs.upgrade().expect("Ext4FileSystem should be alive"),
+            page_cache: None,
         })
     }
 }

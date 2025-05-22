@@ -30,9 +30,9 @@ jobs:
       run: python tools/doc_translator.py
       env:
         MAX_WORKERS: 20
-        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-        OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        OPENAI_API_KEY: ${{ secrets.DRAGONOS_OPENAI_API_KEY }}
+        OPENAI_MODEL: Qwen/Qwen3-8B
+        OPENAI_BASE_URL: ${{ secrets.DRAGONOS_OPENAI_API_BASE }}
 
     - name: Commit translated files
       run: |

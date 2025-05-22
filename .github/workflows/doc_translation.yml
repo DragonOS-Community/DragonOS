@@ -2,7 +2,7 @@ name: Docs Translation
 
 on:
   push:
-    branches: [master, "doc-*"]
+    branches: [master]
     paths:
       - "docs/**"
   workflow_dispatch:

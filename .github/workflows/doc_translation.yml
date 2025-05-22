@@ -16,6 +16,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - id: get-short_sha
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const short_sha = context.sha.substring(0, 8)
+            core.setOutput('short_sha', short_sha)
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -45,7 +52,7 @@ jobs:
         uses: peter-evans/create-pull-request@v5
         with:
           commit-message: "Update translated documentation"
-          title: "docs: Translation update [${{ format('{0:.7}', github.sha) }}]"
+          title: "docs: Translation update [${{steps.get-short_sha.outputs.short_sha}}]"
           body: |
             Automated translation update triggered by docs changes
             Commit: ${{ github.sha }}

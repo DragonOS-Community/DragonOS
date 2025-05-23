@@ -267,8 +267,7 @@ impl IndexNode for Ext4Inode {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        // self.0.lock().page_cache.clone()
-        todo!()
+        self.page_cache.clone()
     }
 
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {

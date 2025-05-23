@@ -35,13 +35,15 @@ impl IndexNode for Ext4Inode {
     fn create(
         &self,
         name: &str,
-        _file_type: vfs::FileType,
+        file_type: vfs::FileType,
         mode: vfs::syscall::ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // another_ext4的高4位是文件类型，低12位是权限
+        let file_mode = ModeType::from(file_type).union(mode);
         let id = self.concret_fs().create(
             self.inode,
             name,
-            another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16),
+            another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16),
         )?;
         self.new_ref(id).map(|inode| inode as Arc<dyn IndexNode>)
     }
@@ -267,6 +269,24 @@ impl IndexNode for Ext4Inode {
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         // self.0.lock().page_cache.clone()
         todo!()
+    }
+
+    fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
+        use another_ext4::InodeMode;
+        let mode = metadata.mode.union(ModeType::from(metadata.file_type));
+        let _ = self.concret_fs().setattr(
+            self.inode,
+            Some(InodeMode::from_bits_truncate(mode.bits() as u16)),
+            Some(metadata.uid as u32),
+            Some(metadata.gid as u32),
+            Some(metadata.size as u64),
+            Some(metadata.atime.to_ext4_time()),
+            Some(metadata.mtime.to_ext4_time()),
+            Some(metadata.ctime.to_ext4_time()),
+            Some(metadata.btime.to_ext4_time()),
+        )?;
+
+        Ok(())
     }
 }
 

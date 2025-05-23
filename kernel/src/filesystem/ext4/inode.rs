@@ -273,16 +273,16 @@ impl IndexNode for Ext4Inode {
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
         use another_ext4::InodeMode;
         let mode = metadata.mode.union(ModeType::from(metadata.file_type));
-        let _ = self.concret_fs().setattr(
+        self.concret_fs().setattr(
             self.inode,
             Some(InodeMode::from_bits_truncate(mode.bits() as u16)),
             Some(metadata.uid as u32),
             Some(metadata.gid as u32),
             Some(metadata.size as u64),
-            Some(metadata.atime.to_ext4_time()),
-            Some(metadata.mtime.to_ext4_time()),
-            Some(metadata.ctime.to_ext4_time()),
-            Some(metadata.btime.to_ext4_time()),
+            Some(metadata.atime.ext4_time()),
+            Some(metadata.mtime.ext4_time()),
+            Some(metadata.ctime.ext4_time()),
+            Some(metadata.btime.ext4_time()),
         )?;
 
         Ok(())

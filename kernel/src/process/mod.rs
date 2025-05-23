@@ -1574,8 +1574,8 @@ pub struct KernelStack {
 }
 
 impl KernelStack {
-    pub const SIZE: usize = 0x4000;
-    pub const ALIGN: usize = 0x4000;
+    pub const SIZE: usize = 0x8000;
+    pub const ALIGN: usize = 0x8000;
 
     pub fn new() -> Result<Self, SystemError> {
         return Ok(Self {

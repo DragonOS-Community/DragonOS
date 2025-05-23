@@ -338,7 +338,7 @@ rustInstall
 install_python_pkg
 
 # 安装dadk
-cargo install dadk || exit 1
+cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.4.0 || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 

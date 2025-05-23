@@ -144,6 +144,7 @@ impl DeviceManager {
     /// - Err(SystemError): 匹配过程中出现意外错误,没有匹配成功
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#899
+    #[inline(never)]
     fn do_device_attach_driver(
         &self,
         driver: &Arc<dyn Driver>,

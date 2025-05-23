@@ -9,6 +9,7 @@ use crate::{
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
+        ext4::filesystem::Ext4FileSystem,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         ramfs::RamFS,
@@ -156,6 +157,14 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     }
     let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
     let r = migrate_virtual_filesystem(fatfs);
+
+    let disk = try_find_gendisk_as_rootfs("/dev/vdb1").unwrap();
+    let ext4fs = Ext4FileSystem::from_gendisk(disk);
+
+    let _ = ROOT_INODE()
+        .mkdir("ext4", ModeType::from_bits_truncate(0o755))?
+        .mount(ext4fs.unwrap())?;
+
     if r.is_err() {
         error!("Failed to migrate virtual filesyst  em to FAT32!");
         loop {

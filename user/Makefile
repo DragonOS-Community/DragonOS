@@ -2,7 +2,7 @@ user_sub_dirs = apps
 
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
-MIN_DADK_VERSION = 0.3.0
+MIN_DADK_VERSION = 0.4.0
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 
 ECHO:
@@ -20,7 +20,7 @@ ifeq ("$(DADK_VERSION)", "")
 	@echo "\n\tcargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION)" --locked
 	@echo "\n"
 	@echo "Auto installing dadk..."
-	cargo install dadk
+	cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION)" --locked
 else
 # 如果DADK版本过低，则自动更新
 	@echo "dadk version $(DADK_VERSION) installed"

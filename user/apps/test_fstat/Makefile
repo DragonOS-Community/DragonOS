@@ -1,5 +1,5 @@
 ifeq ($(ARCH), x86_64)
-	CROSS_COMPILE=x86_64-linux-musl-
+	CROSS_COMPILE=x86_64-linux-gnu-
 else ifeq ($(ARCH), riscv64)
 	CROSS_COMPILE=riscv64-linux-musl-
 endif
@@ -8,7 +8,7 @@ CC=$(CROSS_COMPILE)gcc
 
 .PHONY: all
 all: main.c
-	$(CC) -static -o test_fstat main.c
+	$(CC) -o test_fstat main.c
 
 .PHONY: install clean
 install: all

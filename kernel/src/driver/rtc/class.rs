@@ -9,7 +9,7 @@ use unified_init::macros::unified_init;
 use crate::{
     driver::base::{
         class::{class_manager, Class},
-        device::{device_manager, sys_dev_char_kset},
+        device::{device_manager, sys_dev_char_kobj},
         kobject::KObject,
         subsys::SubSysPrivate,
     },
@@ -68,7 +68,7 @@ impl Class for RtcClass {
     }
 
     fn dev_kobj(&self) -> Option<Arc<dyn KObject>> {
-        Some(sys_dev_char_kset() as Arc<dyn KObject>)
+        Some(sys_dev_char_kobj() as Arc<dyn KObject>)
     }
 
     fn set_dev_kobj(&self, _kobj: Arc<dyn KObject>) {

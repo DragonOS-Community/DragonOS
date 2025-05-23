@@ -54,7 +54,7 @@ use crate::{
         percpu::{PerCpu, PerCpuVar},
         set_IDLE_PROCESS_ADDRESS_SPACE,
         ucontext::AddressSpace,
-        VirtAddr,
+        PhysAddr, VirtAddr,
     },
     namespaces::{mnt_namespace::FsStruct, pid_namespace::PidStrcut, NsProxy},
     net::socket::SocketInode,
@@ -1570,7 +1570,106 @@ impl ProcessSchedulerInfo {
 pub struct KernelStack {
     stack: Option<AlignedBox<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>>,
     /// 标记该内核栈是否可以被释放
-    can_be_freed: bool,
+    ty: KernelStackType,
+}
+
+#[derive(Debug, Clone)]
+pub enum KernelStackType {
+    KernelSpace(PhysAddr),
+    Static,
+    Dynamic,
+}
+
+fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
+    use crate::arch::MMArch;
+    use crate::mm::allocator::page_frame::{allocate_page_frames, PageFrameCount};
+    use crate::mm::kernel_mapper::KernelMapper;
+    use crate::mm::page::EntryFlags;
+    use crate::mm::MemoryManagementArch;
+
+    const KERNEL_STACK_VADDR: usize = 0xFFFF_FFFF_FFFF_0000; //
+    static KERNEL_STACK_TOP: AtomicUsize = AtomicUsize::new(KERNEL_STACK_VADDR);
+
+    // Layout
+    // ---------------
+    // | KernelStack |
+    // | guard page  | size == KernelStack::SIZE
+    // | KernelStack |
+    // | guard page  |
+    // | ..........  |
+    // ---------------
+
+    let kstack_virt_addr = KERNEL_STACK_TOP.fetch_sub(KernelStack::SIZE, Ordering::SeqCst);
+    // alloc guard page
+    KERNEL_STACK_TOP.fetch_sub(KernelStack::SIZE, Ordering::SeqCst);
+
+    assert!(kstack_virt_addr % KernelStack::ALIGN == 0);
+
+    let page_num = PageFrameCount::new(
+        KernelStack::SIZE
+            .div_ceil(MMArch::PAGE_SIZE)
+            .next_power_of_two(),
+    );
+
+    unsafe {
+        let (paddr, count) = allocate_page_frames(page_num).expect("kernel stack alloc failed");
+        let virt = MMArch::phys_2_virt(paddr).unwrap();
+
+        core::ptr::write_bytes(virt.data() as *mut u8, 0, count.data() * MMArch::PAGE_SIZE);
+
+        let kstack_flags = EntryFlags::new().set_write(true).set_execute(true);
+        let mut kernel_mapper = KernelMapper::lock();
+        kernel_mapper
+            .map_phys_with_size(
+                VirtAddr::new(kstack_virt_addr),
+                paddr,
+                KernelStack::SIZE,
+                kstack_flags,
+                true,
+            )
+            .unwrap();
+
+        log::error!(
+            "[kernel stack alloc]: virt: {:#x}, phy: {:#x}",
+            kstack_virt_addr,
+            paddr.data()
+        );
+        (VirtAddr::new(kstack_virt_addr), paddr)
+    }
+}
+
+fn dealloc_from_kernel_space(vaddr: VirtAddr, phy_addr: PhysAddr) {
+    use crate::arch::MMArch;
+    use crate::mm::allocator::page_frame::{deallocate_page_frames, PageFrameCount, PhysPageFrame};
+    use crate::mm::kernel_mapper::KernelMapper;
+    use crate::mm::MemoryManagementArch;
+
+    let mut kernel_mapper = KernelMapper::lock();
+
+    let page_num = PageFrameCount::new(
+        KernelStack::SIZE
+            .div_ceil(MMArch::PAGE_SIZE)
+            .next_power_of_two(),
+    );
+
+    log::error!(
+        "[kernel stack dealloc]: virt: {:#x}, phy: {:#x}",
+        vaddr.data(),
+        phy_addr.data()
+    );
+    for i in 0..page_num.data() {
+        unsafe {
+            let res = kernel_mapper
+                .as_mut()
+                .unwrap()
+                .unmap_phys(vaddr + i * MMArch::PAGE_SIZE, false);
+            if let Some((_, _, flush)) = res {
+                flush.flush();
+            }
+        };
+    }
+    // release the physical page
+    unsafe { deallocate_page_frames(PhysPageFrame::new(phy_addr), page_num) };
 }
 
 impl KernelStack {
@@ -1578,12 +1677,26 @@ impl KernelStack {
     pub const ALIGN: usize = 0x8000;
 
     pub fn new() -> Result<Self, SystemError> {
-        return Ok(Self {
-            stack: Some(
-                AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
-            ),
-            can_be_freed: true,
-        });
+        if cfg!(feature = "kstack_protect") {
+            let (kstack_virt_addr, kstack_phy_addr) = alloc_from_kernel_space();
+            unsafe {
+                Ok(Self {
+                    stack: Some(
+                        AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_unchecked(
+                            kstack_virt_addr.data() as *mut [u8; KernelStack::SIZE],
+                        ),
+                    ),
+                    ty: KernelStackType::KernelSpace(kstack_phy_addr),
+                })
+            }
+        } else {
+            Ok(Self {
+                stack: Some(
+                    AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
+                ),
+                ty: KernelStackType::Dynamic,
+            })
+        }
     }
 
     /// 根据已有的空间，构造一个内核栈结构体
@@ -1594,14 +1707,14 @@ impl KernelStack {
             return Err(SystemError::EFAULT);
         }
 
-        return Ok(Self {
+        Ok(Self {
             stack: Some(
                 AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_unchecked(
                     base.data() as *mut [u8; KernelStack::SIZE],
                 ),
             ),
-            can_be_freed: false,
-        });
+            ty: KernelStackType::Static,
+        })
     }
 
     /// 返回内核栈的起始虚拟地址(低地址)
@@ -1678,10 +1791,17 @@ impl Drop for KernelStack {
                 drop(pcb_ptr);
             }
         }
-        // 如果该内核栈不可以被释放，那么，这里就forget，不调用AlignedBox的drop函数
-        if !self.can_be_freed {
-            let bx = self.stack.take();
-            core::mem::forget(bx);
+        match self.ty {
+            KernelStackType::KernelSpace(kstack_phy_addr) => {
+                // 释放内核栈
+                let kstack_virt_addr = self.start_address();
+                dealloc_from_kernel_space(kstack_virt_addr, kstack_phy_addr);
+            }
+            KernelStackType::Static => {
+                let bx = self.stack.take();
+                core::mem::forget(bx);
+            }
+            KernelStackType::Dynamic => {}
         }
     }
 }

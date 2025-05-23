@@ -102,10 +102,7 @@ impl TSCManager {
     /// 使用pit、hpet、ptimer来测量CPU总线的频率
     fn calibrate_cpu_by_pit_hpet_ptimer() -> Result<u64, SystemError> {
         let hpet = is_hpet_enabled();
-        debug!(
-            "Calibrating TSC with {}",
-            if hpet { "HPET" } else { "PMTIMER" }
-        );
+        log_for_hpet(hpet);
 
         let mut tsc_pit_min = u64::MAX;
         let mut tsc_ref_min = u64::MAX;
@@ -388,4 +385,13 @@ impl TSCManager {
             TSC_KHZ = khz;
         }
     }
+}
+
+/// # 从calibrate_cpu_by_pit_hpet_ptimer 解耦出，减少calibrate_cpu_by_pit_hpet_ptimer的栈帧
+#[inline(never)]
+fn log_for_hpet(hpet: bool) {
+    debug!(
+        "Calibrating TSC with {}",
+        if hpet { "HPET" } else { "PMTIMER" }
+    );
 }

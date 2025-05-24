@@ -294,6 +294,13 @@ interrupt_handler!(255);
 
 #[inline(never)]
 pub unsafe fn arch_setup_interrupt_gate() {
+    arch_setup_interrupt_gate_32_130();
+    arch_setup_interrupt_gate_131_255();
+}
+
+/// # 从arch_setup_interrupt_gate()解耦出，避免函数体过大导致爆栈
+#[inline(never)]
+unsafe fn arch_setup_interrupt_gate_32_130() {
     set_intr_gate(32, 0, VirtAddr::new(irq_handler32 as usize));
     set_intr_gate(33, 0, VirtAddr::new(irq_handler33 as usize));
     set_intr_gate(34, 0, VirtAddr::new(irq_handler34 as usize));
@@ -401,7 +408,11 @@ pub unsafe fn arch_setup_interrupt_gate() {
     set_intr_gate(127, 0, VirtAddr::new(irq_handler127 as usize));
     set_intr_gate(129, 0, VirtAddr::new(irq_handler129 as usize));
     set_intr_gate(130, 0, VirtAddr::new(irq_handler130 as usize));
+}
 
+/// # 从arch_setup_interrupt_gate()解耦出，避免函数体过大导致爆栈
+#[inline(never)]
+unsafe fn arch_setup_interrupt_gate_131_255() {
     set_intr_gate(131, 0, VirtAddr::new(irq_handler131 as usize));
     set_intr_gate(132, 0, VirtAddr::new(irq_handler132 as usize));
     set_intr_gate(133, 0, VirtAddr::new(irq_handler133 as usize));

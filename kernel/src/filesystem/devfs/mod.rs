@@ -174,7 +174,15 @@ impl DevFS {
                     .downcast_ref::<LockedDevFSInode>()
                     .unwrap();
 
-                dev_block_inode.add_dev(name, device.clone())?;
+                if name.starts_with("vd") && name.len() > 2 {
+                    // 虚拟磁盘设备挂载在 /dev 下
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else if name.starts_with("nvme") {
+                    // NVMe设备挂载在 /dev 下
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else {
+                    dev_block_inode.add_dev(name, device.clone())?;
+                }
                 device.set_fs(dev_block_inode.0.lock().fs.clone());
             }
             FileType::KvmDevice => {

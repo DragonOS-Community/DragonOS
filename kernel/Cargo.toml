@@ -13,7 +13,7 @@ crate-type = ["staticlib"]
 members = ["crates/*"]
 
 [features]
-default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test"]
+default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test", "kstack_protect"]
 # kvm
 kvm = []
 
@@ -24,6 +24,9 @@ driver_ps2_mouse = []
 # kprobe
 kprobe_test = []
 static_keys_test = []
+
+# kstack_protect
+kstack_protect = []
 
 # 运行时依赖项
 [dependencies]

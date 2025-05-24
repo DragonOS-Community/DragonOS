@@ -81,7 +81,7 @@ static-keys = { version = "=0.7" }
 defer = "0.2.1"
 cfg-if = { version = "1.0.0" }
 derive_builder = { version = "0.20.2", default-features = false, features = ["alloc"] }
-another_ext4 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git", rev = "28bb8731fc" }
+another_ext4 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git", rev = "bf782ff294" }
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]

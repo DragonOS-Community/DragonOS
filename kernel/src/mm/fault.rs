@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use core::{
     alloc::Layout,
     cmp::{max, min},
@@ -634,9 +633,7 @@ impl PageFaultHandler {
             // TODO 同步预读
             //涉及磁盘IO，返回标志为VM_FAULT_MAJOR
             ret = VmFaultReason::VM_FAULT_MAJOR;
-
-            let mut buffer = Box::new([0u8; MMArch::PAGE_SIZE]);
-
+            let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
             file.pread(
                 file_pgoff * MMArch::PAGE_SIZE,
                 MMArch::PAGE_SIZE,

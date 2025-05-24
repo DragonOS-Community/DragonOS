@@ -273,6 +273,7 @@ pub fn vfs_getattr(
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#274
 #[inline(never)]
 pub fn vfs_fstatat(dfd: i32, filename: &str, flags: AtFlags) -> Result<KStat, SystemError> {
+    // log::debug!("vfs_fstatat: dfd={}, filename={}", dfd, filename);
     let statx_flags = flags | AtFlags::AT_NO_AUTOMOUNT;
     if dfd >= 0 && flags == AtFlags::AT_EMPTY_PATH {
         return vfs_fstat(dfd);
@@ -322,7 +323,7 @@ pub(super) fn do_newfstatat(
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#393
 #[inline(never)]
-fn cp_new_stat(kstat: KStat, user_buf_ptr: usize) -> Result<(), SystemError> {
+pub(super) fn cp_new_stat(kstat: KStat, user_buf_ptr: usize) -> Result<(), SystemError> {
     let posix_stat = PosixStat::try_from(kstat)?;
     let mut ubuf_writer =
         UserBufferWriter::new(user_buf_ptr as *mut PosixStat, size_of::<PosixStat>(), true)?;
@@ -395,70 +396,6 @@ fn cp_statx(kstat: KStat, user_buf_ptr: usize) -> Result<(), SystemError> {
     // Write to user space
     userbuf.copy_one_to_user(&statx, 0)?;
     Ok(())
-}
-
-// 注意！这个结构体定义的貌似不太对，需要修改！
-#[repr(C)]
-#[derive(Clone, Copy)]
-/// # 文件信息结构体
-pub struct PosixKstat {
-    /// 硬件设备ID
-    pub dev_id: u64,
-    /// inode号
-    pub inode: u64,
-    /// 硬链接数
-    pub nlink: u64,
-    /// 文件权限
-    pub mode: ModeType,
-    /// 所有者用户ID
-    pub uid: i32,
-    /// 所有者组ID
-    pub gid: i32,
-    /// 设备ID
-    pub rdev: i64,
-    /// 文件大小
-    pub size: i64,
-    /// 文件系统块大小
-    pub blcok_size: i64,
-    /// 分配的512B块数
-    pub blocks: u64,
-    /// 最后访问时间
-    pub atime: PosixTimeSpec,
-    /// 最后修改时间
-    pub mtime: PosixTimeSpec,
-    /// 最后状态变化时间
-    pub ctime: PosixTimeSpec,
-    /// 用于填充结构体大小的空白数据
-    pub _pad: [i8; 24],
-}
-impl PosixKstat {
-    pub(super) fn new() -> Self {
-        Self {
-            inode: 0,
-            dev_id: 0,
-            mode: ModeType::empty(),
-            nlink: 0,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            size: 0,
-            atime: PosixTimeSpec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            },
-            mtime: PosixTimeSpec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            },
-            ctime: PosixTimeSpec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            },
-            blcok_size: 0,
-            blocks: 0,
-            _pad: Default::default(),
-        }
-    }
 }
 
 /// 通用的PosixStat

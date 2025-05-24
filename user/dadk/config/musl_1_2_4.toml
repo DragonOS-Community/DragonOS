@@ -22,10 +22,13 @@ type = "build-from-source"
 source = "archive"
 # 路径或URL
 source-path = "https://mirrors.dragonos.org.cn/pub/third_party/musl/musl-1.2.4.tar.gz"
+# 把压缩包中的哪个目录作为根目录（可选）,仅当 source = "archive" 时生效
+archive-rootdir = "musl-1.2.4"
+
 # 构建相关信息
 [build]
 # （可选）构建命令
-build-command = "touch config.mak && DESTDIR=$DADK_CURRENT_BUILD_DIR make install -j $(nproc)"
+build-command = "touch config.mak && DESTDIR=$DADK_CURRENT_BUILD_DIR make install -j $(nproc) && rm -rf $DADK_CURRENT_BUILD_DIR/lib && rm -rf $DADK_CURRENT_BUILD_DIR/lib64"
 # 安装相关信息
 [install]
 # （可选）安装到DragonOS的路径

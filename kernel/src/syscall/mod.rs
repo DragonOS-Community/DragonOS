@@ -276,7 +276,7 @@ impl Syscall {
                 let rusage = args[3] as *mut c_void;
                 // 权限校验
                 // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
-                Self::wait4(pid.into(), wstatus, options, rusage)
+                Self::wait4(pid, wstatus, options, rusage)
             }
 
             SYS_EXIT => {
@@ -855,8 +855,10 @@ impl Syscall {
             }
 
             SYS_EXIT_GROUP => {
-                warn!("SYS_EXIT_GROUP has not yet been implemented");
-                Ok(0)
+                let exit_code = args[0];
+                Self::exit(exit_code)
+                // warn!("SYS_EXIT_GROUP has not yet been implemented");
+                // Ok(0)
             }
 
             SYS_MADVISE => {
@@ -1004,7 +1006,7 @@ impl Syscall {
 
             SYS_RSEQ => {
                 warn!("SYS_RSEQ has not yet been implemented");
-                Ok(0)
+                Err(SystemError::ENOSYS)
             }
 
             #[cfg(target_arch = "x86_64")]

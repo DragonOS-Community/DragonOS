@@ -404,6 +404,11 @@ impl ProcessManager {
     /// ## 参数
     ///
     /// - `exit_code` : 进程的退出码
+    ///
+    /// ## 注意
+    ///  对于正常退出的进程，状态码应该先左移八位，以便用户态读取的时候正常返回退出码；而对于被信号终止的进程，状态码则是最低七位，无需进行移位操作。
+    ///
+    ///  因此注意，传入的`exit_code`应该是已经完成了移位操作的
     pub fn exit(exit_code: usize) -> ! {
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -1574,8 +1579,8 @@ pub struct KernelStack {
 }
 
 impl KernelStack {
-    pub const SIZE: usize = 0x4000;
-    pub const ALIGN: usize = 0x4000;
+    pub const SIZE: usize = 0x8000;
+    pub const ALIGN: usize = 0x8000;
 
     pub fn new() -> Result<Self, SystemError> {
         return Ok(Self {

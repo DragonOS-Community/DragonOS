@@ -14,7 +14,7 @@ kprobes技术依赖硬件架构相关的支持，主要包括CPU的异常处理�
 
 ## kprobe工作流程
 
-<img src="./kprobe_flow.png" style="zoom: 67%;"  alt="xxx"/>
+<img src="/kernel/trace/kprobe_flow.png" style="zoom: 67%;"  alt="xxx"/>
 
 
 

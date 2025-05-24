@@ -6,14 +6,11 @@ use defer::defer;
 
 use crate::arch::syscall::nr::SYS_STAT;
 use crate::filesystem::vfs::file::FileMode;
-use crate::filesystem::vfs::stat::PosixKstat;
 use crate::filesystem::vfs::syscall::sys_close::do_close;
-use crate::filesystem::vfs::syscall::sys_fstat::do_fstat;
 use crate::filesystem::vfs::syscall::sys_open;
 use crate::filesystem::vfs::ModeType;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::UserBufferWriter;
 
 use alloc::vec::Vec;
 
@@ -28,7 +25,6 @@ impl Syscall for SysStatHandle {
     fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
         let path = Self::path(args);
         let usr_kstat = Self::usr_kstat(args);
-        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixKstat>(), true)?;
 
         let fd = sys_open::do_open(
             path,
@@ -40,9 +36,9 @@ impl Syscall for SysStatHandle {
         defer!({
             do_close(fd as i32).ok();
         });
-        let kstat = do_fstat(fd as i32)?;
 
-        writer.copy_one_to_user(&kstat, 0)?;
+        crate::syscall::Syscall::newfstat(fd as i32, usr_kstat)?;
+
         return Ok(0);
     }
 
@@ -50,7 +46,7 @@ impl Syscall for SysStatHandle {
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
             FormattedSyscallParam::new("path", format!("{:#x}", Self::path(args) as usize)),
-            FormattedSyscallParam::new("statbuf", format!("{:#x}", Self::usr_kstat(args) as usize)),
+            FormattedSyscallParam::new("statbuf", format!("{:#x}", Self::usr_kstat(args))),
         ]
     }
 }
@@ -62,8 +58,8 @@ impl SysStatHandle {
     }
 
     /// Extracts the usr_kstat argument from syscall parameters.
-    fn usr_kstat(args: &[usize]) -> *mut PosixKstat {
-        args[1] as *mut PosixKstat
+    fn usr_kstat(args: &[usize]) -> usize {
+        args[1]
     }
 }
 

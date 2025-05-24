@@ -26,7 +26,6 @@
 #![allow(static_mut_refs, non_local_definitions, internal_features)]
 // clippy的配置
 #![deny(clippy::all)]
-
 // 取消下面的注释以启用clippy对栈帧大小的检查
 // #![deny(clippy::large_stack_frames)]
 // #![deny(clippy::large_const_arrays)]

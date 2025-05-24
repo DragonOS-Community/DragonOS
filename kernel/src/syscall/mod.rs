@@ -295,7 +295,7 @@ impl Syscall {
                 let rusage = args[3] as *mut c_void;
                 // 权限校验
                 // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
-                Self::wait4(pid.into(), wstatus, options, rusage)
+                Self::wait4(pid, wstatus, options, rusage)
             }
 
             SYS_EXIT => {

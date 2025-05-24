@@ -116,14 +116,6 @@ impl Syscall {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
             }
-            #[cfg(target_arch = "x86_64")]
-            SYS_OPEN => {
-                let path = args[0] as *const u8;
-                let flags = args[1] as u32;
-                let mode = args[2] as u32;
-
-                Self::open(path, flags, mode, true)
-            }
 
             #[cfg(target_arch = "x86_64")]
             SYS_RENAME => {
@@ -164,10 +156,6 @@ impl Syscall {
 
                 Self::openat(dirfd, path, flags, mode, true)
             }
-            SYS_CLOSE => {
-                let fd = args[0];
-                Self::close(fd)
-            }
 
             SYS_LSEEK => {
                 let fd = args[0] as i32;
@@ -200,13 +188,6 @@ impl Syscall {
 
                 let buf = user_buffer_reader.read_from_user(0)?;
                 Self::pwrite(fd, buf, len, offset)
-            }
-
-            SYS_IOCTL => {
-                let fd = args[0];
-                let cmd = args[1];
-                let data = args[2];
-                Self::ioctl(fd, cmd as u32, data)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -664,12 +645,6 @@ impl Syscall {
 
             SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
 
-            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-            SYS_FSTAT => {
-                let fd = args[0] as i32;
-                Self::fstat(fd, args[1])
-            }
-
             SYS_FCNTL => {
                 let fd = args[0] as i32;
                 let cmd: Option<FcntlCommand> =
@@ -766,18 +741,6 @@ impl Syscall {
             }
 
             SYS_SET_TID_ADDRESS => Self::set_tid_address(args[0]),
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_LSTAT => {
-                let path = args[0] as *const u8;
-                Self::lstat(path, args[1])
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_STAT => {
-                let path = args[0] as *const u8;
-                Self::stat(path, args[1])
-            }
 
             SYS_STATFS => {
                 let path = args[0] as *const u8;

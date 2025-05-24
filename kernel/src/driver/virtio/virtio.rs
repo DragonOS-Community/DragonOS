@@ -13,7 +13,6 @@ use crate::driver::pci::pci::{
 use crate::driver::pci::subsys::pci_bus;
 use crate::driver::virtio::transport::VirtIOTransport;
 use crate::init::initcall::INITCALL_DEVICE;
-use alloc::boxed::Box;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -37,10 +36,8 @@ fn virtio_probe() -> Result<(), SystemError> {
 fn virtio_probe_pci() {
     let virtio_list = virtio_device_search();
     for virtio_device in virtio_list {
-        // 将 String 转为 'static 的 &str 需要将其存储到全局或泄漏内存
         let bdf: String = virtio_device.common_header.bus_device_function.into();
-        let bdf: &'static str = Box::leak(bdf.into_boxed_str());
-        let dev_id = DeviceId::new(Some(bdf), None).unwrap();
+        let dev_id = DeviceId::new(None, Some(bdf)).unwrap();
         // log::info!("virtio device id: probe {:?}", dev_id.id());
         match PciTransport::new::<HalImpl>(virtio_device.clone(), dev_id.clone()) {
             Ok(mut transport) => {
@@ -104,6 +101,7 @@ fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
     for device in result {
         let standard_device = device.as_standard_device().unwrap();
         let header = &standard_device.common_header;
+        // log::info!("header: {:?}", header);
         if header.device_id >= 0x1000 && header.device_id <= 0x103F {
             virtio_list.push(standard_device);
         }

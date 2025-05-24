@@ -39,6 +39,7 @@ use super::{
 mod sys_close;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 mod sys_fstat;
+mod sys_ioctl;
 #[cfg(target_arch = "x86_64")]
 mod sys_lstat;
 #[cfg(target_arch = "x86_64")]
@@ -449,27 +450,6 @@ impl Syscall {
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
         let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
-    }
-
-    /// @brief 发送命令到文件描述符对应的设备，
-    ///
-    /// @param fd 文件描述符编号
-    /// @param cmd 设备相关的请求类型
-    ///
-    /// @return Ok(usize) 成功返回0
-    /// @return Err(SystemError) 读取失败，返回posix错误码
-    pub fn ioctl(fd: usize, cmd: u32, data: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard
-            .get_file_by_fd(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        let r = file.inode().ioctl(cmd, data, &file.private_data.lock());
-        return r;
     }
 
     /// @brief 调整文件操作指针的位置

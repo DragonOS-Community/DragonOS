@@ -190,13 +190,6 @@ impl Syscall {
                 Self::pwrite(fd, buf, len, offset)
             }
 
-            SYS_IOCTL => {
-                let fd = args[0];
-                let cmd = args[1];
-                let data = args[2];
-                Self::ioctl(fd, cmd as u32, data)
-            }
-
             #[cfg(target_arch = "x86_64")]
             SYS_FORK => Self::fork(frame),
             #[cfg(target_arch = "x86_64")]

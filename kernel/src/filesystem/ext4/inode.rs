@@ -11,6 +11,7 @@ use alloc::{
     vec::Vec,
 };
 use another_ext4;
+use another_ext4::FileType;
 use core::fmt::Debug;
 use num::ToPrimitive;
 use system_error::SystemError;
@@ -85,7 +86,6 @@ impl IndexNode for Ext4Inode {
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        use another_ext4::FileType;
         match self.concret_fs().getattr(self.inode)?.ftype {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
@@ -148,7 +148,6 @@ impl IndexNode for Ext4Inode {
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        use another_ext4::FileType;
         match self.concret_fs().getattr(self.inode)?.ftype {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
@@ -284,6 +283,16 @@ impl IndexNode for Ext4Inode {
             Some(metadata.ctime.ext4_time()),
             Some(metadata.btime.ext4_time()),
         )?;
+
+        Ok(())
+    }
+
+    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+        let concret_fs = self.concret_fs();
+        if concret_fs.getattr(self.inode)?.ftype != FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+        concret_fs.rmdir(self.inode, name)?;
 
         Ok(())
     }

@@ -40,10 +40,15 @@ use crate::{
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable},
+    filesystem::{
+        devfs::{devfs_register, DevFS, DeviceINode},
+        kernfs::KernFSInode,
+        mbr::MbrDiskPartionTable,
+        vfs::{syscall::ModeType, IndexNode, Metadata},
+    },
     init::initcall::INITCALL_POSTCORE,
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -81,6 +86,8 @@ pub fn virtio_blk(
         virtio_device_manager()
             .device_add(device.clone() as Arc<dyn VirtIODevice>)
             .expect("Add virtio blk failed");
+        devfs_register(device.dev_name(), device.clone()).unwrap();
+        // device_register(device).unwrap();
     }
 }
 
@@ -158,6 +165,9 @@ pub struct VirtIOBlkDevice {
     inner: SpinLock<InnerVirtIOBlkDevice>,
     locked_kobj_state: LockedKObjectState,
     self_ref: Weak<Self>,
+
+    fs: RwLock<Weak<DevFS>>,
+    metadata: Metadata,
 }
 
 impl Debug for VirtIOBlkDevice {
@@ -203,6 +213,11 @@ impl VirtIOBlkDevice {
                 kobject_common: KObjectCommonData::default(),
                 irq,
             }),
+            fs: RwLock::new(Weak::default()),
+            metadata: Metadata::new(
+                crate::filesystem::vfs::FileType::BlockDevice,
+                ModeType::from_bits_truncate(0o755),
+            ),
         });
 
         Some(dev)
@@ -210,6 +225,45 @@ impl VirtIOBlkDevice {
 
     fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkDevice> {
         self.inner.lock()
+    }
+}
+
+impl IndexNode for VirtIOBlkDevice {
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        todo!()
+    }
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EBUSY)
+    }
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EACCES)
+    }
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
+        todo!()
+    }
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        Ok(self.metadata.clone())
+    }
+}
+
+impl DeviceINode for VirtIOBlkDevice {
+    fn set_fs(&self, fs: alloc::sync::Weak<crate::filesystem::devfs::DevFS>) {
+        *self.fs.write() = fs;
     }
 }
 

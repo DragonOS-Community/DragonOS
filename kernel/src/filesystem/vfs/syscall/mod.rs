@@ -36,6 +36,7 @@ use super::{
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
+mod open_utils;
 mod sys_close;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 mod sys_fstat;
@@ -1163,7 +1164,7 @@ impl Syscall {
 
     pub fn statfs(path: *const u8, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
-        let fd = sys_open::do_open(
+        let fd = open_utils::do_open(
             path,
             FileMode::O_RDONLY.bits(),
             ModeType::empty().bits(),

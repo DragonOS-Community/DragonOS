@@ -7,7 +7,6 @@ use defer::defer;
 use crate::arch::syscall::nr::SYS_LSTAT;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::sys_close::do_close;
-use crate::filesystem::vfs::syscall::sys_open;
 use crate::filesystem::vfs::ModeType;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -26,7 +25,7 @@ impl Syscall for SysLstatHandle {
         let path = Self::path(args);
         let usr_kstat = Self::usr_kstat(args);
 
-        let fd = sys_open::do_open(
+        let fd = super::open_utils::do_open(
             path,
             FileMode::O_RDONLY.bits(),
             ModeType::empty().bits(),

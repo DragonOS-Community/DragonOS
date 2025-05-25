@@ -83,7 +83,9 @@ static-keys = { version = "=0.7" }
 
 defer = "0.2.1"
 cfg-if = { version = "1.0.0" }
-derive_builder = { version = "0.20.2", default-features = false, features = ["alloc"] }
+derive_builder = { version = "0.20.2", default-features = false, features = [
+    "alloc",
+] }
 
 
 # target为x86_64时，使用下面的依赖

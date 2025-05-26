@@ -5,9 +5,7 @@ use crate::mm::page::{PAGE_1G_SHIFT, PAGE_4K_SHIFT};
 use crate::mm::{MMArch, MemoryManagementArch};
 use crate::process::ProcessManager;
 
-use alloc::{collections::LinkedList, vec::Vec};
-use core::mem;
-use core::mem::MaybeUninit;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, error, info, warn};
 use system_error::SystemError;
@@ -43,25 +41,18 @@ pub enum MmioResult {
 pub struct MmioBuddyMemPool {
     pool_start_addr: VirtAddr,
     pool_size: usize,
-    free_regions: [SpinLock<MmioFreeRegionList>; MMIO_BUDDY_REGION_COUNT as usize],
+    free_regions: Vec<SpinLock<MmioFreeRegionList>>,
 }
 
 impl MmioBuddyMemPool {
     #[inline(never)]
     fn new() -> Self {
-        let mut free_regions: [MaybeUninit<SpinLock<MmioFreeRegionList>>;
-            MMIO_BUDDY_REGION_COUNT as usize] = unsafe { MaybeUninit::uninit().assume_init() };
-        for i in 0..MMIO_BUDDY_REGION_COUNT {
-            free_regions[i as usize] = MaybeUninit::new(SpinLock::new(MmioFreeRegionList::new()));
+        let mut free_regions: Vec<SpinLock<MmioFreeRegionList>> =
+            Vec::with_capacity(MMIO_BUDDY_REGION_COUNT as usize);
+
+        for _ in 0..MMIO_BUDDY_REGION_COUNT {
+            free_regions.push(SpinLock::new(MmioFreeRegionList::new()));
         }
-        let free_regions = unsafe {
-            mem::transmute::<
-                [core::mem::MaybeUninit<
-                    crate::libs::spinlock::SpinLock<crate::mm::mmio_buddy::MmioFreeRegionList>,
-                >; MMIO_BUDDY_REGION_COUNT as usize],
-                [SpinLock<MmioFreeRegionList>; MMIO_BUDDY_REGION_COUNT as usize],
-            >(free_regions)
-        };
 
         let pool = MmioBuddyMemPool {
             pool_start_addr: MMArch::MMIO_BASE,
@@ -70,7 +61,6 @@ impl MmioBuddyMemPool {
         };
 
         assert!(pool.pool_start_addr.data() % PAGE_1G_SIZE == 0);
-        debug!("MMIO buddy pool init: created");
 
         let mut vaddr_base = MMArch::MMIO_BASE;
         let mut remain_size = MMArch::MMIO_SIZE;
@@ -122,6 +112,7 @@ impl MmioBuddyMemPool {
     /// @return Ok(i32) 返回0
     ///
     /// @return Err(SystemError) 返回错误码
+    #[inline(never)]
     fn give_back_block(&self, vaddr: VirtAddr, exp: u32) -> Result<i32, SystemError> {
         // 确保内存对齐，低位都要为0
         if (vaddr.data() & ((1 << exp) - 1)) != 0 {
@@ -178,13 +169,13 @@ impl MmioBuddyMemPool {
         }
         // 没有恰好符合要求的内存块
         // 注意：exp对应的链表list_guard已上锁【注意避免死锁问题】
-        if list_guard.num_free == 0 {
+        if list_guard.free_count() == 0 {
             // 找到最小符合申请范围的内存块
             // 将大的内存块依次分成小块内存，直到能够满足exp大小，即将exp+1分成两块exp
             for e in exp + 1..MMIO_BUDDY_MAX_EXP + 1 {
                 let pop_list: &mut SpinLockGuard<MmioFreeRegionList> =
                     &mut self.free_regions[exp2index(e)].lock();
-                if pop_list.num_free == 0 {
+                if pop_list.free_count() == 0 {
                     continue;
                 }
 
@@ -232,7 +223,7 @@ impl MmioBuddyMemPool {
                 break;
             }
             // 判断是否获得了exp大小的内存块
-            if list_guard.num_free > 0 {
+            if list_guard.free_count() > 0 {
                 match self.pop_block(list_guard) {
                     Ok(ret) => return Ok(ret),
                     Err(err) => return Err(err),
@@ -283,7 +274,7 @@ impl MmioBuddyMemPool {
             }
 
             //判断是否获得了exp大小的内存块
-            if list_guard.num_free > 0 {
+            if list_guard.free_count() > 0 {
                 match self.pop_block(list_guard) {
                     Ok(ret) => return Ok(ret),
                     Err(err) => return Err(err),
@@ -325,8 +316,7 @@ impl MmioBuddyMemPool {
         region: MmioBuddyAddrRegion,
         list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) {
-        list_guard.list.push_back(region);
-        list_guard.num_free += 1;
+        list_guard.list.push(region);
     }
 
     /// @brief 根据地址和内存块大小，计算伙伴块虚拟内存的地址
@@ -365,7 +355,6 @@ impl MmioBuddyMemPool {
                 .extract_if(|x| x.vaddr == buddy_vaddr)
                 .collect();
             if element.len() == 1 {
-                list_guard.num_free -= 1;
                 return Ok(element.pop().unwrap());
             }
 
@@ -386,8 +375,7 @@ impl MmioBuddyMemPool {
         list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) -> Result<MmioBuddyAddrRegion, MmioResult> {
         if !list_guard.list.is_empty() {
-            list_guard.num_free -= 1;
-            return Ok(list_guard.list.pop_back().unwrap());
+            return Ok(list_guard.list.pop().unwrap());
         }
         return Err(MmioResult::ISEMPTY);
     }
@@ -412,22 +400,22 @@ impl MmioBuddyMemPool {
         high_list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) -> Result<MmioResult, MmioResult> {
         // 至少要两个内存块才能合并
-        if list_guard.num_free <= 1 {
+        if list_guard.free_count() <= 1 {
             return Err(MmioResult::EINVAL);
         }
         loop {
-            if list_guard.num_free <= 1 {
+            if list_guard.free_count() <= 1 {
                 break;
             }
             // 获取内存块
-            let vaddr: VirtAddr = list_guard.list.back().unwrap().vaddr;
+            let vaddr: VirtAddr = list_guard.list.last().unwrap().vaddr;
             // 获取伙伴内存块
             match self.pop_buddy_block(vaddr, exp, list_guard) {
                 Err(err) => {
                     return Err(err);
                 }
                 Ok(buddy_region) => {
-                    let region: MmioBuddyAddrRegion = list_guard.list.pop_back().unwrap();
+                    let region: MmioBuddyAddrRegion = list_guard.list.pop().unwrap();
                     let copy_region = region.clone();
                     // 在两块内存都被取出之后才进行合并
                     match self.merge_blocks(region, buddy_region, exp, high_list_guard) {
@@ -593,17 +581,17 @@ impl MmioBuddyAddrRegion {
 /// @brief 空闲页数组结构体
 #[derive(Debug, Default)]
 pub struct MmioFreeRegionList {
-    /// 存储mmio_buddy的地址链表
-    list: LinkedList<MmioBuddyAddrRegion>,
-    /// 空闲块的数量
-    num_free: i64,
+    /// 存储mmio_buddy的地址数组
+    list: Vec<MmioBuddyAddrRegion>,
 }
 impl MmioFreeRegionList {
     #[allow(dead_code)]
-    fn new() -> Self {
-        return MmioFreeRegionList {
-            ..Default::default()
-        };
+    const fn new() -> Self {
+        Self { list: Vec::new() }
+    }
+
+    fn free_count(&self) -> usize {
+        return self.list.len();
     }
 }
 

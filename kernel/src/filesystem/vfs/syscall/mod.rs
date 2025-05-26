@@ -52,6 +52,14 @@ mod sys_stat;
 mod sys_write;
 mod sys_writev;
 
+#[cfg(target_arch = "x86_64")]
+mod sys_epoll_create;
+mod sys_epoll_create1;
+mod sys_epoll_ctl;
+mod sys_epoll_pwait;
+#[cfg(target_arch = "x86_64")]
+mod sys_epoll_wait;
+
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;

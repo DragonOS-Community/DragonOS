@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    arch::{ipc::signal::SigSet, syscall::nr::*},
+    arch::syscall::nr::*,
     filesystem::vfs::syscall::PosixStatfs,
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
@@ -761,48 +761,6 @@ impl Syscall {
                 args[3] as u32,
                 args[4],
             ),
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),
-            SYS_EPOLL_CREATE1 => Self::epoll_create1(args[0]),
-
-            SYS_EPOLL_CTL => Self::epoll_ctl(
-                args[0] as i32,
-                args[1],
-                args[2] as i32,
-                VirtAddr::new(args[3]),
-            ),
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_EPOLL_WAIT => Self::epoll_wait(
-                args[0] as i32,
-                VirtAddr::new(args[1]),
-                args[2] as i32,
-                args[3] as i32,
-            ),
-
-            SYS_EPOLL_PWAIT => {
-                let epfd = args[0] as i32;
-                let epoll_event = VirtAddr::new(args[1]);
-                let max_events = args[2] as i32;
-                let timespec = args[3] as i32;
-                let sigmask_addr = args[4] as *mut SigSet;
-
-                if sigmask_addr.is_null() {
-                    return Self::epoll_wait(epfd, epoll_event, max_events, timespec);
-                }
-                let sigmask_reader =
-                    UserBufferReader::new(sigmask_addr, core::mem::size_of::<SigSet>(), true)?;
-                let mut sigmask = *sigmask_reader.read_one_from_user::<SigSet>(0)?;
-
-                Self::epoll_pwait(
-                    args[0] as i32,
-                    VirtAddr::new(args[1]),
-                    args[2] as i32,
-                    args[3] as i32,
-                    &mut sigmask,
-                )
-            }
 
             // 目前为了适配musl-libc,以下系统调用先这样写着
             SYS_GETRANDOM => {

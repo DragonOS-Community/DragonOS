@@ -18,13 +18,13 @@ use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
+    filesystem::epoll::EPollItem,
     ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
-    net::event_poll::EPollItem,
     time::PosixTimeSpec,
 };
 

@@ -15,13 +15,12 @@ use crate::{
         tty_driver::{TtyDriverFlag, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
-    filesystem::vfs::file::FileMode,
+    filesystem::{epoll::EPollEventType, vfs::file::FileMode},
     libs::{
         rwlock::RwLockReadGuard,
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::VirtAddr,
-    net::event_poll::EPollEventType,
     process::{ProcessFlags, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall},
 };

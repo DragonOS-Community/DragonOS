@@ -5,8 +5,8 @@ use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
 use crate::{
+    filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     libs::spinlock::{SpinLock, SpinLockGuard},
-    net::event_poll::{EPollEventType, EventPoll},
 };
 
 use super::tty_core::TtyCore;

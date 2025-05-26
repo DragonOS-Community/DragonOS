@@ -11,7 +11,7 @@ use crate::syscall::user_access::UserBufferReader;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use super::sys_epoll_wait::do_epoll_wait;
+use super::epoll_utils::do_epoll_wait;
 
 pub struct SysEpollPwaitHandle;
 

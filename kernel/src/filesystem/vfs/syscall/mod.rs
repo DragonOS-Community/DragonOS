@@ -52,6 +52,7 @@ mod sys_stat;
 mod sys_write;
 mod sys_writev;
 
+mod epoll_utils;
 #[cfg(target_arch = "x86_64")]
 mod sys_epoll_create;
 mod sys_epoll_create1;

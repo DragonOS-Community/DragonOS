@@ -19,6 +19,8 @@ use super::{
     verify_area, MsFlags, VirtAddr, VmFlags,
 };
 
+mod sys_brk;
+
 bitflags! {
     /// Memory protection flags
     pub struct ProtFlags: u64 {
@@ -250,28 +252,6 @@ impl From<VmFlags> for ProtFlags {
 }
 
 impl Syscall {
-    pub fn brk(new_addr: VirtAddr) -> Result<VirtAddr, SystemError> {
-        // log::debug!("brk: new_addr={:?}", new_addr);
-        let address_space = AddressSpace::current()?;
-        let mut address_space = address_space.write();
-
-        if new_addr < address_space.brk_start || new_addr >= MMArch::USER_END_VADDR {
-            return Ok(address_space.brk);
-        }
-        if new_addr == address_space.brk {
-            return Ok(address_space.brk);
-        }
-
-        unsafe {
-            // log::debug!("brk: set_brk new_addr={:?}", new_addr);
-            address_space
-                .set_brk(VirtAddr::new(page_align_up(new_addr.data())))
-                .ok();
-
-            return Ok(address_space.sbrk(0).unwrap());
-        }
-    }
-
     pub fn sbrk(incr: isize) -> Result<VirtAddr, SystemError> {
         let address_space = AddressSpace::current()?;
         assert!(address_space.read().user_mapper.utable.is_current());

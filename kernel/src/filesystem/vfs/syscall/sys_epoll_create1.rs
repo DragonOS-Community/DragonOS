@@ -1,6 +1,6 @@
 //! System call handler for epoll_create1.
 
-use crate::arch::syscall::nr::SYS_EPOLL_CREATE;
+use crate::arch::syscall::nr::SYS_EPOLL_CREATE1;
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::vfs::file::FileMode;
 use crate::syscall::table::FormattedSyscallParam;
@@ -33,4 +33,4 @@ impl SysEpollCreate1Handle {
     }
 }
 
-syscall_table_macros::declare_syscall!(SYS_EPOLL_CREATE, SysEpollCreate1Handle);
+syscall_table_macros::declare_syscall!(SYS_EPOLL_CREATE1, SysEpollCreate1Handle);

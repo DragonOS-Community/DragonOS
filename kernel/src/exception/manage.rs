@@ -160,6 +160,86 @@ impl IrqManager {
         return self.inner_setup_irq(irq, irqaction, desc);
     }
 
+    /// 处理线程错误
+    #[inline(never)]
+    fn handle_thread_error(
+        &self,
+        e: SystemError,
+        mut action_guard: SpinLockGuard<'_, InnerIrqAction>,
+    ) -> SystemError {
+        if let Some(thread_pcb) = action_guard.thread() {
+            action_guard.set_thread(None);
+            KernelThreadMechanism::stop(&thread_pcb).ok();
+        }
+
+        if let Some(secondary) = action_guard.secondary() {
+            let mut secondary_guard = secondary.inner();
+            if let Some(thread_pcb) = secondary_guard.thread() {
+                secondary_guard.set_thread(None);
+                KernelThreadMechanism::stop(&thread_pcb).ok();
+            }
+        }
+        e
+    }
+
+    /// 处理总线解锁错误
+    #[inline(never)]
+    fn handle_bus_unlock_error(
+        &self,
+        e: SystemError,
+        desc: Arc<IrqDesc>,
+        req_mutex_guard: crate::libs::mutex::MutexGuard<'_, ()>,
+        action_guard: SpinLockGuard<'_, InnerIrqAction>,
+    ) -> SystemError {
+        desc.chip_bus_sync_unlock();
+        drop(req_mutex_guard);
+        self.handle_thread_error(e, action_guard)
+    }
+
+    /// 处理解锁错误
+    #[inline(never)]
+    fn handle_unlock_error(
+        &self,
+        e: SystemError,
+        desc_guard: SpinLockGuard<'_, InnerIrqDesc>,
+        desc: Arc<IrqDesc>,
+        req_mutex_guard: crate::libs::mutex::MutexGuard<'_, ()>,
+        action_guard: SpinLockGuard<'_, InnerIrqAction>,
+    ) -> SystemError {
+        drop(desc_guard);
+        self.handle_bus_unlock_error(e, desc, req_mutex_guard, action_guard)
+    }
+
+    /// 处理标志不匹配错误
+    #[inline(never)]
+    fn __inner_setup_irq_handle_mismatch_error(
+        &self,
+        old_action_guard: SpinLockGuard<'_, InnerIrqAction>,
+        desc_guard: SpinLockGuard<'_, InnerIrqDesc>,
+        action_guard: SpinLockGuard<'_, InnerIrqAction>,
+        desc: Arc<IrqDesc>,
+        req_mutex_guard: crate::libs::mutex::MutexGuard<'_, ()>,
+    ) -> SystemError {
+        if !action_guard
+            .flags()
+            .contains(IrqHandleFlags::IRQF_PROBE_SHARED)
+        {
+            error!("Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}", 
+                desc.irq_data().irq().data(),
+                action_guard.name(),
+                action_guard.flags(),
+                old_action_guard.name(),
+                old_action_guard.flags());
+        }
+        self.handle_unlock_error(
+            SystemError::EBUSY,
+            desc_guard,
+            desc,
+            req_mutex_guard,
+            action_guard,
+        )
+    }
+
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/manage.c?r=&mo=59252&fi=2138#1497
     #[inline(never)]
     fn inner_setup_irq(
@@ -168,65 +248,6 @@ impl IrqManager {
         action: Arc<IrqAction>,
         desc: Arc<IrqDesc>,
     ) -> Result<(), SystemError> {
-        // ==== 定义错误处理函数 ====
-        let err_out_thread =
-            |e: SystemError, mut action_guard: SpinLockGuard<'_, InnerIrqAction>| -> SystemError {
-                if let Some(thread_pcb) = action_guard.thread() {
-                    action_guard.set_thread(None);
-                    KernelThreadMechanism::stop(&thread_pcb).ok();
-                }
-
-                if let Some(secondary) = action_guard.secondary() {
-                    let mut secondary_guard = secondary.inner();
-                    if let Some(thread_pcb) = secondary_guard.thread() {
-                        secondary_guard.set_thread(None);
-                        KernelThreadMechanism::stop(&thread_pcb).ok();
-                    }
-                }
-                return e;
-            };
-
-        let err_out_bus_unlock = |e: SystemError,
-                                  desc: Arc<IrqDesc>,
-                                  req_mutex_guard: crate::libs::mutex::MutexGuard<'_, ()>,
-                                  action_guard: SpinLockGuard<'_, InnerIrqAction>|
-         -> SystemError {
-            desc.chip_bus_sync_unlock();
-            drop(req_mutex_guard);
-            return err_out_thread(e, action_guard);
-        };
-
-        let err_out_unlock = |e: SystemError,
-                              desc_guard: SpinLockGuard<'_, InnerIrqDesc>,
-                              desc: Arc<IrqDesc>,
-                              req_mutex_guard: crate::libs::mutex::MutexGuard<'_, ()>,
-                              action_guard: SpinLockGuard<'_, InnerIrqAction>|
-         -> SystemError {
-            drop(desc_guard);
-            return err_out_bus_unlock(e, desc, req_mutex_guard, action_guard);
-        };
-
-        let err_out_mismatch = |old_action_guard: SpinLockGuard<'_, InnerIrqAction>,
-                                desc_guard: SpinLockGuard<'_, InnerIrqDesc>,
-                                action_guard: SpinLockGuard<'_, InnerIrqAction>,
-                                desc: Arc<IrqDesc>,
-                                req_mutex_guard: crate::libs::mutex::MutexGuard<'_, ()>|
-         -> SystemError {
-            if !action_guard
-                .flags()
-                .contains(IrqHandleFlags::IRQF_PROBE_SHARED)
-            {
-                error!("Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}", irq.data(), action_guard.name(), action_guard.flags(), old_action_guard.name(), old_action_guard.flags());
-            }
-            return err_out_unlock(
-                SystemError::EBUSY,
-                desc_guard,
-                desc,
-                req_mutex_guard,
-                action_guard,
-            );
-        };
-
         // ===== 代码开始 =====
 
         if Arc::ptr_eq(
@@ -263,7 +284,7 @@ impl IrqManager {
             if let Some(secondary) = action_guard.secondary() {
                 let secondary_guard = secondary.inner();
                 if let Err(e) = self.setup_irq_thread(irq, secondary_guard.deref(), true) {
-                    return Err(err_out_thread(e, action_guard));
+                    return Err(self.handle_thread_error(e, action_guard));
                 }
             }
         }
@@ -308,7 +329,7 @@ impl IrqManager {
                     desc.irq_data().chip_info_read_irqsave().chip().name(),
                     e
                 );
-                return Err(err_out_bus_unlock(
+                return Err(self.handle_bus_unlock_error(
                     e,
                     desc.clone(),
                     req_mutex_guard,
@@ -340,7 +361,7 @@ impl IrqManager {
                         .chip()
                         .name()
                 );
-                return Err(err_out_unlock(
+                return Err(self.handle_unlock_error(
                     SystemError::EINVAL,
                     desc_inner_guard,
                     desc.clone(),
@@ -380,7 +401,7 @@ impl IrqManager {
                     old_guard.flags()
                 );
 
-                return Err(err_out_mismatch(
+                return Err(self.__inner_setup_irq_handle_mismatch_error(
                     old_guard,
                     desc_inner_guard,
                     action_guard,
@@ -399,7 +420,7 @@ impl IrqManager {
                     action_guard.name(),
                     action_guard.flags()
                 );
-                return Err(err_out_mismatch(
+                return Err(self.__inner_setup_irq_handle_mismatch_error(
                     old_guard,
                     desc_inner_guard,
                     action_guard,
@@ -435,7 +456,7 @@ impl IrqManager {
                 irq.data(),
                 action_guard.name()
             );
-            return Err(err_out_unlock(
+            return Err(self.handle_unlock_error(
                 SystemError::EINVAL,
                 desc_inner_guard,
                 desc.clone(),
@@ -459,7 +480,7 @@ impl IrqManager {
                         action_guard.flags(),
                         e
                     );
-                    return Err(err_out_unlock(
+                    return Err(self.handle_unlock_error(
                         e,
                         desc_inner_guard,
                         desc.clone(),
@@ -478,7 +499,7 @@ impl IrqManager {
                     action_guard.flags(),
                     e
                 );
-                return Err(err_out_unlock(
+                return Err(self.handle_unlock_error(
                     e,
                     desc_inner_guard,
                     desc.clone(),

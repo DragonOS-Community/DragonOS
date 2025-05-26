@@ -23,6 +23,41 @@ use system_error::SystemError;
 
 use super::{acpi_kset, AcpiManager};
 
+// 定义所有ACPI表结构体
+macro_rules! define_acpi_tables {
+    ($($name:ident),*) => {
+        $(
+            #[repr(transparent)]
+            #[allow(non_snake_case)]
+            #[allow(non_camel_case_types)]
+            struct $name {
+                header: SdtHeader,
+            }
+
+            unsafe impl acpi::AcpiTable for $name {
+                const SIGNATURE: acpi::sdt::Signature = acpi::sdt::Signature::$name;
+                fn header(&self) -> &acpi::sdt::SdtHeader {
+                    return &self.header;
+                }
+            }
+        )*
+    };
+}
+
+define_acpi_tables!(
+    RSDT, XSDT, FADT, HPET, MADT, MCFG, SSDT, BERT, BGRT, CPEP, DSDT, ECDT, EINJ, ERST, FACS, FPDT,
+    GTDT, HEST, MSCT, MPST, NFIT, PCCT, PHAT, PMTT, PSDT, RASF, SBST, SDEV, SLIT, SRAT, AEST, BDAT,
+    CDIT, CEDT, CRAT, CSRT, DBGP, DBG2, DMAR, DRTM, ETDT, IBFT, IORT, IVRS, LPIT, MCHI, MPAM, MSDM,
+    PRMT, RGRT, SDEI, SLIC, SPCR, SPMI, STAO, SVKL, TCPA, TPM2, UEFI, WAET, WDAT, WDRT, WPBT, WSMT,
+    XENV
+);
+
+macro_rules! handle_read_table {
+    ($name: ident, $name_str: expr, $tables: expr, $buf: expr, $offset: expr) => {{
+        AttrAcpiTable::do_binattr_read_table::<$name>($tables, $name_str, $buf, $offset)
+    }};
+}
+
 static mut __HOTPLUG_KSET_INSTANCE: Option<Arc<KSet>> = None;
 static mut __ACPI_TABLES_KSET_INSTANCE: Option<Arc<KSet>> = None;
 static mut __ACPI_TABLES_DATA_KSET_INSTANCE: Option<Arc<KSet>> = None;
@@ -202,6 +237,260 @@ impl AttrAcpiTable {
         )?;
         return Ok(result);
     }
+
+    #[inline(never)]
+    fn do_binattr_read_table<T: acpi::AcpiTable>(
+        tables: &'static acpi::AcpiTables<crate::driver::acpi::AcpiHandlerImpl>,
+        name: &str,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        let table = tables.find_entire_table::<T>().map_err(|e| {
+            warn!(
+                "AttrAcpiTable::read(): failed to find table. name: {}, error: {:?}",
+                name, e
+            );
+            SystemError::ENODEV
+        })?;
+
+        let from = unsafe {
+            core::slice::from_raw_parts(
+                table.virtual_start().as_ptr() as *const u8,
+                table.region_length(),
+            )
+        };
+        if offset >= from.len() {
+            return Ok(0);
+        }
+        let mut count = buf.len();
+        if count > from.len() - offset {
+            count = from.len() - offset;
+        }
+        buf[0..count].copy_from_slice(&from[offset..offset + count]);
+        return Ok(count);
+    }
+
+    #[inline(never)]
+    fn do_binattr_read_1(
+        &self,
+        tables: &'static acpi::AcpiTables<crate::driver::acpi::AcpiHandlerImpl>,
+        name_str: &str,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        match name_str {
+            "RSDT" => {
+                handle_read_table!(RSDT, name_str, tables, buf, offset)
+            }
+            "XSDT" => {
+                handle_read_table!(XSDT, name_str, tables, buf, offset)
+            }
+            "FACP" => {
+                handle_read_table!(FADT, name_str, tables, buf, offset)
+            }
+            "HPET" => {
+                handle_read_table!(HPET, name_str, tables, buf, offset)
+            }
+            "APIC" => {
+                handle_read_table!(MADT, name_str, tables, buf, offset)
+            }
+            "MCFG" => {
+                handle_read_table!(MCFG, name_str, tables, buf, offset)
+            }
+            "SSDT" => {
+                handle_read_table!(SSDT, name_str, tables, buf, offset)
+            }
+            "BERT" => {
+                handle_read_table!(BERT, name_str, tables, buf, offset)
+            }
+            "BGRT" => {
+                handle_read_table!(BGRT, name_str, tables, buf, offset)
+            }
+            "CPEP" => {
+                handle_read_table!(CPEP, name_str, tables, buf, offset)
+            }
+            "DSDT" => {
+                handle_read_table!(DSDT, name_str, tables, buf, offset)
+            }
+            "ECDT" => {
+                handle_read_table!(ECDT, name_str, tables, buf, offset)
+            }
+            "EINJ" => {
+                handle_read_table!(EINJ, name_str, tables, buf, offset)
+            }
+            "ERST" => {
+                handle_read_table!(ERST, name_str, tables, buf, offset)
+            }
+            "FACS" => {
+                handle_read_table!(FACS, name_str, tables, buf, offset)
+            }
+            "FPDT" => {
+                handle_read_table!(FPDT, name_str, tables, buf, offset)
+            }
+            "GTDT" => {
+                handle_read_table!(GTDT, name_str, tables, buf, offset)
+            }
+            "HEST" => {
+                handle_read_table!(HEST, name_str, tables, buf, offset)
+            }
+
+            _ => Err(SystemError::ENODEV),
+        }
+    }
+
+    #[inline(never)]
+    fn do_binattr_read_2(
+        &self,
+        tables: &'static acpi::AcpiTables<crate::driver::acpi::AcpiHandlerImpl>,
+        name_str: &str,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        match name_str {
+            "MSCT" => {
+                handle_read_table!(MSCT, name_str, tables, buf, offset)
+            }
+            "MPST" => {
+                handle_read_table!(MPST, name_str, tables, buf, offset)
+            }
+            "NFIT" => {
+                handle_read_table!(NFIT, name_str, tables, buf, offset)
+            }
+            "PCCT" => {
+                handle_read_table!(PCCT, name_str, tables, buf, offset)
+            }
+            "PHAT" => {
+                handle_read_table!(PHAT, name_str, tables, buf, offset)
+            }
+            "PMTT" => {
+                handle_read_table!(PMTT, name_str, tables, buf, offset)
+            }
+            "PSDT" => {
+                handle_read_table!(PSDT, name_str, tables, buf, offset)
+            }
+            "RASF" => {
+                handle_read_table!(RASF, name_str, tables, buf, offset)
+            }
+            "SBST" => {
+                handle_read_table!(SBST, name_str, tables, buf, offset)
+            }
+            "SDEV" => {
+                handle_read_table!(SDEV, name_str, tables, buf, offset)
+            }
+            "SLIT" => {
+                handle_read_table!(SLIT, name_str, tables, buf, offset)
+            }
+            "SRAT" => {
+                handle_read_table!(SRAT, name_str, tables, buf, offset)
+            }
+            "AEST" => {
+                handle_read_table!(AEST, name_str, tables, buf, offset)
+            }
+            "BDAT" => {
+                handle_read_table!(BDAT, name_str, tables, buf, offset)
+            }
+            "CDIT" => {
+                handle_read_table!(CDIT, name_str, tables, buf, offset)
+            }
+            "CEDT" => {
+                handle_read_table!(CEDT, name_str, tables, buf, offset)
+            }
+            "CRAT" => {
+                handle_read_table!(CRAT, name_str, tables, buf, offset)
+            }
+            "CSRT" => {
+                handle_read_table!(CSRT, name_str, tables, buf, offset)
+            }
+            "DBGP" => {
+                handle_read_table!(DBGP, name_str, tables, buf, offset)
+            }
+            "DBG2" => {
+                handle_read_table!(DBG2, name_str, tables, buf, offset)
+            }
+            "DMAR" => {
+                handle_read_table!(DMAR, name_str, tables, buf, offset)
+            }
+            "DRTM" => {
+                handle_read_table!(DRTM, name_str, tables, buf, offset)
+            }
+            "ETDT" => {
+                handle_read_table!(ETDT, name_str, tables, buf, offset)
+            }
+            "IBFT" => {
+                handle_read_table!(IBFT, name_str, tables, buf, offset)
+            }
+            "IORT" => {
+                handle_read_table!(IORT, name_str, tables, buf, offset)
+            }
+            "IVRS" => {
+                handle_read_table!(IVRS, name_str, tables, buf, offset)
+            }
+            "LPIT" => {
+                handle_read_table!(LPIT, name_str, tables, buf, offset)
+            }
+            "MCHI" => {
+                handle_read_table!(MCHI, name_str, tables, buf, offset)
+            }
+            "MPAM" => {
+                handle_read_table!(MPAM, name_str, tables, buf, offset)
+            }
+            "MSDM" => {
+                handle_read_table!(MSDM, name_str, tables, buf, offset)
+            }
+            "PRMT" => {
+                handle_read_table!(PRMT, name_str, tables, buf, offset)
+            }
+            "RGRT" => {
+                handle_read_table!(RGRT, name_str, tables, buf, offset)
+            }
+            "SDEI" => {
+                handle_read_table!(SDEI, name_str, tables, buf, offset)
+            }
+            "SLIC" => {
+                handle_read_table!(SLIC, name_str, tables, buf, offset)
+            }
+            "SPCR" => {
+                handle_read_table!(SPCR, name_str, tables, buf, offset)
+            }
+            "SPMI" => {
+                handle_read_table!(SPMI, name_str, tables, buf, offset)
+            }
+            "STAO" => {
+                handle_read_table!(STAO, name_str, tables, buf, offset)
+            }
+            "SVKL" => {
+                handle_read_table!(SVKL, name_str, tables, buf, offset)
+            }
+            "TCPA" => {
+                handle_read_table!(TCPA, name_str, tables, buf, offset)
+            }
+            "TPM2" => {
+                handle_read_table!(TPM2, name_str, tables, buf, offset)
+            }
+            "UEFI" => {
+                handle_read_table!(UEFI, name_str, tables, buf, offset)
+            }
+            "WAET" => {
+                handle_read_table!(WAET, name_str, tables, buf, offset)
+            }
+            "WDAT" => {
+                handle_read_table!(WDAT, name_str, tables, buf, offset)
+            }
+            "WDRT" => {
+                handle_read_table!(WDRT, name_str, tables, buf, offset)
+            }
+            "WPBT" => {
+                handle_read_table!(WPBT, name_str, tables, buf, offset)
+            }
+            "WSMT" => {
+                handle_read_table!(WSMT, name_str, tables, buf, offset)
+            }
+            "XENV" => {
+                handle_read_table!(XENV, name_str, tables, buf, offset)
+            }
+            _ => Err(SystemError::ENODEV),
+        }
+    }
 }
 
 impl Attribute for AttrAcpiTable {
@@ -248,262 +537,19 @@ impl BinAttribute for AttrAcpiTable {
         buf: &mut [u8],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        macro_rules! copy_data {
-            ($table:expr) => {
-                let from = unsafe {
-                    core::slice::from_raw_parts(
-                        $table.virtual_start().as_ptr() as *const u8,
-                        $table.region_length(),
-                    )
-                };
-                if offset >= from.len() {
-                    return Ok(0);
-                }
-                let mut count = buf.len();
-                if count > from.len() - offset {
-                    count = from.len() - offset;
-                }
-                buf[0..count].copy_from_slice(&from[offset..offset + count]);
-                return Ok(count);
-            };
-        }
-
-        macro_rules! define_struct {
-            ($name:ident) => {
-                #[repr(transparent)]
-                #[allow(non_snake_case)]
-                #[allow(non_camel_case_types)]
-                struct $name {
-                    header: SdtHeader,
-                }
-
-                unsafe impl acpi::AcpiTable for $name {
-                    const SIGNATURE: acpi::sdt::Signature = acpi::sdt::Signature::$name;
-                    fn header(&self) -> &acpi::sdt::SdtHeader {
-                        return &self.header;
-                    }
-                }
-            };
-        }
-
-        macro_rules! handle {
-            ($name: ident, $tables: expr) => {
-                define_struct!($name);
-                let table = $tables.find_entire_table::<$name>().map_err(|e| {
-                    warn!(
-                        "AttrAcpiTable::read(): failed to find table. name: {}, error: {:?}",
-                        self.name, e
-                    );
-                    SystemError::ENODEV
-                })?;
-
-                copy_data!(table);
-            };
-        }
-
         let tables = acpi_manager().tables().unwrap();
-        match self.name.as_str() {
-            "RSDT" => {
-                handle!(RSDT, tables);
-            }
-            "XSDT" => {
-                handle!(XSDT, tables);
-            }
-            "FACP" => {
-                handle!(FADT, tables);
-            }
-            "HPET" => {
-                handle!(HPET, tables);
-            }
-            "APIC" => {
-                handle!(MADT, tables);
-            }
-            "MCFG" => {
-                handle!(MCFG, tables);
-            }
-            "SSDT" => {
-                handle!(SSDT, tables);
-            }
-            "BERT" => {
-                handle!(BERT, tables);
-            }
-            "BGRT" => {
-                handle!(BGRT, tables);
-            }
-            "CPEP" => {
-                handle!(CPEP, tables);
-            }
-            "DSDT" => {
-                handle!(DSDT, tables);
-            }
-            "ECDT" => {
-                handle!(ECDT, tables);
-            }
-            "EINJ" => {
-                handle!(EINJ, tables);
-            }
-            "ERST" => {
-                handle!(ERST, tables);
-            }
-            "FACS" => {
-                handle!(FACS, tables);
-            }
-            "FPDT" => {
-                handle!(FPDT, tables);
-            }
-            "GTDT" => {
-                handle!(GTDT, tables);
-            }
-            "HEST" => {
-                handle!(HEST, tables);
-            }
-            "MSCT" => {
-                handle!(MSCT, tables);
-            }
-            "MPST" => {
-                handle!(MPST, tables);
-            }
-            "NFIT" => {
-                handle!(NFIT, tables);
-            }
-            "PCCT" => {
-                handle!(PCCT, tables);
-            }
-            "PHAT" => {
-                handle!(PHAT, tables);
-            }
-            "PMTT" => {
-                handle!(PMTT, tables);
-            }
-            "PSDT" => {
-                handle!(PSDT, tables);
-            }
-            "RASF" => {
-                handle!(RASF, tables);
-            }
-            "SBST" => {
-                handle!(SBST, tables);
-            }
-            "SDEV" => {
-                handle!(SDEV, tables);
-            }
-            "SLIT" => {
-                handle!(SLIT, tables);
-            }
-            "SRAT" => {
-                handle!(SRAT, tables);
-            }
-            "AEST" => {
-                handle!(AEST, tables);
-            }
-            "BDAT" => {
-                handle!(BDAT, tables);
-            }
-            "CDIT" => {
-                handle!(CDIT, tables);
-            }
-            "CEDT" => {
-                handle!(CEDT, tables);
-            }
-            "CRAT" => {
-                handle!(CRAT, tables);
-            }
-            "CSRT" => {
-                handle!(CSRT, tables);
-            }
-            "DBGP" => {
-                handle!(DBGP, tables);
-            }
-            "DBG2" => {
-                handle!(DBG2, tables);
-            }
-            "DMAR" => {
-                handle!(DMAR, tables);
-            }
-            "DRTM" => {
-                handle!(DRTM, tables);
-            }
-            "ETDT" => {
-                handle!(ETDT, tables);
-            }
-            "IBFT" => {
-                handle!(IBFT, tables);
-            }
-            "IORT" => {
-                handle!(IORT, tables);
-            }
-            "IVRS" => {
-                handle!(IVRS, tables);
-            }
-            "LPIT" => {
-                handle!(LPIT, tables);
-            }
-            "MCHI" => {
-                handle!(MCHI, tables);
-            }
-            "MPAM" => {
-                handle!(MPAM, tables);
-            }
-            "MSDM" => {
-                handle!(MSDM, tables);
-            }
-            "PRMT" => {
-                handle!(PRMT, tables);
-            }
-            "RGRT" => {
-                handle!(RGRT, tables);
-            }
-            "SDEI" => {
-                handle!(SDEI, tables);
-            }
-            "SLIC" => {
-                handle!(SLIC, tables);
-            }
-            "SPCR" => {
-                handle!(SPCR, tables);
-            }
-            "SPMI" => {
-                handle!(SPMI, tables);
-            }
-            "STAO" => {
-                handle!(STAO, tables);
-            }
-            "SVKL" => {
-                handle!(SVKL, tables);
-            }
-            "TCPA" => {
-                handle!(TCPA, tables);
-            }
-            "TPM2" => {
-                handle!(TPM2, tables);
-            }
-            "UEFI" => {
-                handle!(UEFI, tables);
-            }
-            "WAET" => {
-                handle!(WAET, tables);
-            }
-            "WDAT" => {
-                handle!(WDAT, tables);
-            }
-            "WDRT" => {
-                handle!(WDRT, tables);
-            }
-            "WPBT" => {
-                handle!(WPBT, tables);
-            }
-            "WSMT" => {
-                handle!(WSMT, tables);
-            }
-            "XENV" => {
-                handle!(XENV, tables);
-            }
+        let name_str = self.name.as_str();
+        // 这里分多个函数进行处理，是为了减小栈内存的使用。
+        if let Ok(x) = self.do_binattr_read_1(tables, name_str, buf, offset) {
+            return Ok(x);
+        }
 
-            _ => {
-                error!("AttrAcpiTable::read(): unknown table. name: {}", self.name);
-                return Err(SystemError::ENODEV);
-            }
-        };
+        if let Ok(x) = self.do_binattr_read_2(tables, name_str, buf, offset) {
+            return Ok(x);
+        }
+
+        error!("AttrAcpiTable::read(): unknown table. name: {}", self.name);
+        return Err(SystemError::ENODEV);
     }
 
     fn size(&self) -> usize {

@@ -20,6 +20,7 @@ use super::{
 };
 
 mod sys_brk;
+mod sys_sbrk;
 
 bitflags! {
     /// Memory protection flags
@@ -252,15 +253,6 @@ impl From<VmFlags> for ProtFlags {
 }
 
 impl Syscall {
-    pub fn sbrk(incr: isize) -> Result<VirtAddr, SystemError> {
-        let address_space = AddressSpace::current()?;
-        assert!(address_space.read().user_mapper.utable.is_current());
-        let mut address_space = address_space.write();
-        let r = unsafe { address_space.sbrk(incr) };
-
-        return r;
-    }
-
     /// ## mmap系统调用
     ///
     /// 该函数的实现参考了Linux内核的实现，但是并不完全相同。因为有些功能咱们还没实现

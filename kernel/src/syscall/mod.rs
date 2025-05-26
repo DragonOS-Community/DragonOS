@@ -195,11 +195,6 @@ impl Syscall {
             #[cfg(target_arch = "x86_64")]
             SYS_VFORK => Self::vfork(frame),
 
-            SYS_SBRK => {
-                let increment = args[0] as isize;
-                Self::sbrk(increment).map(|vaddr: VirtAddr| vaddr.data())
-            }
-
             SYS_REBOOT => {
                 let magic1 = args[0] as u32;
                 let magic2 = args[1] as u32;

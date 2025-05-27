@@ -10,10 +10,12 @@ use crate::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
     },
-    filesystem::procfs::ProcfsFilePrivateData,
+    filesystem::{
+        epoll::{event_poll::EPollPrivateData, EPollItem},
+        procfs::ProcfsFilePrivateData,
+    },
     ipc::pipe::PipeFsPrivateData,
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    net::event_poll::{EPollItem, EPollPrivateData},
     process::{cred::Cred, ProcessManager},
 };
 

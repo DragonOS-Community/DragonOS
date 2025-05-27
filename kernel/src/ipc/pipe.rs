@@ -2,15 +2,17 @@ use core::sync::atomic::compiler_fence;
 
 use crate::{
     arch::ipc::signal::{SigCode, Signal},
-    filesystem::vfs::{
-        file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
-        FileType, IndexNode, Metadata, PollableInode,
+    filesystem::{
+        epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
+        vfs::{
+            file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
+            FileSystem, FileType, IndexNode, Metadata, PollableInode,
+        },
     },
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    net::event_poll::{EPollEventType, EPollItem, EventPoll},
     process::{ProcessFlags, ProcessManager, ProcessState},
     sched::SchedMode,
     time::PosixTimeSpec,

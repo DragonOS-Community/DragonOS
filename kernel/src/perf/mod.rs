@@ -2,6 +2,7 @@ mod bpf;
 mod kprobe;
 mod util;
 
+use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::syscall::ModeType;
@@ -15,7 +16,6 @@ use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
-use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll};
 use crate::perf::bpf::BpfPerfEvent;
 use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs};
 use crate::process::ProcessManager;

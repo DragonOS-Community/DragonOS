@@ -2,11 +2,11 @@ use core::ffi::c_int;
 
 use crate::{
     arch::ipc::signal::SigSet,
+    filesystem::epoll::{event_poll::EventPoll, EPollCtlOption, EPollEvent, EPollEventType},
     ipc::signal::{
         restore_saved_sigmask_unless, set_user_sigmask, RestartBlock, RestartBlockData, RestartFn,
     },
     mm::VirtAddr,
-    net::event_poll::{EPollCtlOption, EPollEvent, EPollEventType, EventPoll},
     process::ProcessManager,
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},

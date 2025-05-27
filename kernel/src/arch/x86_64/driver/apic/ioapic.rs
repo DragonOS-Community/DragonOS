@@ -35,7 +35,7 @@ static mut __IOAPIC: Option<SpinLock<IoApic>> = None;
 static mut IOAPIC_IR_CHIP: Option<Arc<IoApicChip>> = None;
 
 #[allow(non_snake_case)]
-fn IOAPIC() -> &'static SpinLock<IoApic> {
+pub(crate) fn IOAPIC() -> &'static SpinLock<IoApic> {
     unsafe { __IOAPIC.as_ref().unwrap() }
 }
 

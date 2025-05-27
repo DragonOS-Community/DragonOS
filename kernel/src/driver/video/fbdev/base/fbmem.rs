@@ -18,7 +18,7 @@ use crate::{
             device_manager,
             device_number::{DeviceNumber, Major},
             driver::Driver,
-            sys_dev_char_kset, Device, DeviceCommonData, DeviceType, IdTable,
+            sys_dev_char_kobj, Device, DeviceCommonData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
@@ -102,7 +102,7 @@ impl Class for GraphicsClass {
     }
 
     fn dev_kobj(&self) -> Option<Arc<dyn KObject>> {
-        Some(sys_dev_char_kset() as Arc<dyn KObject>)
+        Some(sys_dev_char_kobj() as Arc<dyn KObject>)
     }
 
     fn set_dev_kobj(&self, _kobj: Arc<dyn KObject>) {

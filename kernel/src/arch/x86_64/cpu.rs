@@ -13,6 +13,7 @@ pub fn current_cpu_id() -> ProcessorId {
 }
 
 /// 重置cpu
+#[allow(dead_code)]
 pub unsafe fn cpu_reset() -> ! {
     // 重启计算机
     unsafe { x86::io::outb(0x64, 0xfe) };

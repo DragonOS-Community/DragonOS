@@ -12,6 +12,7 @@ pub mod pci;
 pub mod pio;
 pub mod process;
 pub mod rand;
+pub mod reboot;
 pub mod sched;
 pub mod smp;
 pub mod syscall;

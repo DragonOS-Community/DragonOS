@@ -16,7 +16,9 @@ pub const USER_DS: SegmentSelector = SegmentSelector::new(5, Ring::Ring3);
 /// 如果改这里，记得改syscall_64里面写死的常量
 pub const USER_CS: SegmentSelector = SegmentSelector::new(6, Ring::Ring3);
 
-static mut TSS_MANAGER: TSSManager = TSSManager::new();
+static mut TSS_MANAGER: TSSManager = TSSManager {
+    tss: [TaskStateSegment::new(); PerCpu::MAX_CPU_NUM as usize],
+};
 
 extern "C" {
     static mut GDT_Table: [u64; 512];
@@ -36,12 +38,6 @@ pub struct TSSManager {
 }
 
 impl TSSManager {
-    const fn new() -> Self {
-        return Self {
-            tss: [TaskStateSegment::new(); PerCpu::MAX_CPU_NUM as usize],
-        };
-    }
-
     /// 获取当前CPU的TSS
     pub unsafe fn current_tss() -> &'static mut TaskStateSegment {
         &mut TSS_MANAGER.tss[smp_get_processor_id().data() as usize]

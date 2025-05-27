@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    arch::{ipc::signal::SigSet, syscall::nr::*},
+    arch::syscall::nr::*,
     filesystem::vfs::syscall::PosixStatfs,
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
@@ -116,14 +116,6 @@ impl Syscall {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
             }
-            #[cfg(target_arch = "x86_64")]
-            SYS_OPEN => {
-                let path = args[0] as *const u8;
-                let flags = args[1] as u32;
-                let mode = args[2] as u32;
-
-                Self::open(path, flags, mode, true)
-            }
 
             #[cfg(target_arch = "x86_64")]
             SYS_RENAME => {
@@ -164,10 +156,6 @@ impl Syscall {
 
                 Self::openat(dirfd, path, flags, mode, true)
             }
-            SYS_CLOSE => {
-                let fd = args[0];
-                Self::close(fd)
-            }
 
             SYS_LSEEK => {
                 let fd = args[0] as i32;
@@ -200,13 +188,6 @@ impl Syscall {
 
                 let buf = user_buffer_reader.read_from_user(0)?;
                 Self::pwrite(fd, buf, len, offset)
-            }
-
-            SYS_IOCTL => {
-                let fd = args[0];
-                let cmd = args[1];
-                let data = args[2];
-                Self::ioctl(fd, cmd as u32, data)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -295,7 +276,7 @@ impl Syscall {
                 let rusage = args[3] as *mut c_void;
                 // 权限校验
                 // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
-                Self::wait4(pid.into(), wstatus, options, rusage)
+                Self::wait4(pid, wstatus, options, rusage)
             }
 
             SYS_EXIT => {
@@ -664,12 +645,6 @@ impl Syscall {
 
             SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
 
-            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-            SYS_FSTAT => {
-                let fd = args[0] as i32;
-                Self::fstat(fd, args[1])
-            }
-
             SYS_FCNTL => {
                 let fd = args[0] as i32;
                 let cmd: Option<FcntlCommand> =
@@ -767,18 +742,6 @@ impl Syscall {
 
             SYS_SET_TID_ADDRESS => Self::set_tid_address(args[0]),
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_LSTAT => {
-                let path = args[0] as *const u8;
-                Self::lstat(path, args[1])
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_STAT => {
-                let path = args[0] as *const u8;
-                Self::stat(path, args[1])
-            }
-
             SYS_STATFS => {
                 let path = args[0] as *const u8;
                 let statfs = args[1] as *mut PosixStatfs;
@@ -798,48 +761,6 @@ impl Syscall {
                 args[3] as u32,
                 args[4],
             ),
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),
-            SYS_EPOLL_CREATE1 => Self::epoll_create1(args[0]),
-
-            SYS_EPOLL_CTL => Self::epoll_ctl(
-                args[0] as i32,
-                args[1],
-                args[2] as i32,
-                VirtAddr::new(args[3]),
-            ),
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_EPOLL_WAIT => Self::epoll_wait(
-                args[0] as i32,
-                VirtAddr::new(args[1]),
-                args[2] as i32,
-                args[3] as i32,
-            ),
-
-            SYS_EPOLL_PWAIT => {
-                let epfd = args[0] as i32;
-                let epoll_event = VirtAddr::new(args[1]);
-                let max_events = args[2] as i32;
-                let timespec = args[3] as i32;
-                let sigmask_addr = args[4] as *mut SigSet;
-
-                if sigmask_addr.is_null() {
-                    return Self::epoll_wait(epfd, epoll_event, max_events, timespec);
-                }
-                let sigmask_reader =
-                    UserBufferReader::new(sigmask_addr, core::mem::size_of::<SigSet>(), true)?;
-                let mut sigmask = *sigmask_reader.read_one_from_user::<SigSet>(0)?;
-
-                Self::epoll_pwait(
-                    args[0] as i32,
-                    VirtAddr::new(args[1]),
-                    args[2] as i32,
-                    args[3] as i32,
-                    &mut sigmask,
-                )
-            }
 
             // 目前为了适配musl-libc,以下系统调用先这样写着
             SYS_GETRANDOM => {

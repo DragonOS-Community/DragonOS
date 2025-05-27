@@ -1,13 +1,13 @@
 use core::ffi::{c_char, c_void};
 use errno::errno;
-use libc::{mount, MS_BIND};
+use libc::{mount, umount, MS_BIND};
 use std::fs;
 use std::path::Path;
 use std::time;
 
 fn main() {
-    let path = Path::new("mnt/ext4");
-    let dir = fs::create_dir_all(path);
+    let ext4_path = Path::new("mnt/ext4");
+    let dir = fs::create_dir_all(ext4_path);
     if dir.is_err() {
         panic!("mkdir /mnt/ext4 fail.");
     }
@@ -34,4 +34,17 @@ fn main() {
     }
     let dur = clock.elapsed();
     println!("mount costing time: {} ns", dur.as_nanos());
+
+    let path = b"/mnt/ext4\0".as_ptr() as *const c_char;
+    let result = unsafe { umount(path) };
+    if result != 0 {
+        let err = errno();
+        println!("Mount failed with error code: {}", err.0);
+    }
+    assert_eq!(result, 0, "Umount myramfs failed");
+    println!("Umount successful");
+
+    let _ = fs::remove_dir_all(ext4_path);
+
+    println!("All tests passed!");
 }

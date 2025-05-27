@@ -84,15 +84,13 @@ pub fn do_umount2(
 ) -> Result<Arc<MountFS>, SystemError> {
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
     let path = work.absolute_path()? + &rest;
-    let do_umount = || -> Result<Arc<MountFS>, SystemError> {
-        if let Some(fs) = MOUNT_LIST().remove(path) {
-            // Todo: 占用检测
-            fs.umount()?;
-            return Ok(fs);
-        }
-        return Err(SystemError::EINVAL);
-    };
-    return do_umount();
+
+    if let Some(fs) = MOUNT_LIST().remove(path) {
+        // Todo: 占用检测
+        fs.umount()?;
+        return Ok(fs);
+    }
+    return Err(SystemError::EINVAL);
 }
 
 bitflags! {

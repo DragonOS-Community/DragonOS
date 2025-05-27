@@ -7,6 +7,14 @@ use alloc::sync::{Arc, Weak};
 use hashbrown::HashMap;
 use system_error::SystemError;
 
+use crate::{
+    filesystem::{
+        devfs::{DevFS, DeviceINode},
+        vfs::{syscall::ModeType, IndexNode, Metadata},
+    },
+    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
+};
+
 use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 
 pub mod ext4;
@@ -17,6 +25,9 @@ pub struct GenDisk {
     range: GeneralBlockRange,
     block_size_log2: u8,
     idx: Option<u32>,
+
+    fs: RwLock<Weak<DevFS>>,
+    metadata: Metadata,
 }
 
 impl GenDisk {
@@ -35,6 +46,11 @@ impl GenDisk {
             range,
             block_size_log2: bsizelog2,
             idx,
+            fs: RwLock::new(Weak::default()),
+            metadata: Metadata::new(
+                crate::filesystem::vfs::FileType::BlockDevice,
+                ModeType::from_bits_truncate(0o755),
+            ),
         });
     }
 
@@ -145,6 +161,45 @@ impl GenDisk {
     /// 同步磁盘
     pub fn sync(&self) -> Result<(), SystemError> {
         self.block_device().sync()
+    }
+}
+
+impl IndexNode for GenDisk {
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        todo!()
+    }
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EBUSY)
+    }
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EACCES)
+    }
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
+        todo!()
+    }
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        Ok(self.metadata.clone())
+    }
+}
+
+impl DeviceINode for GenDisk {
+    fn set_fs(&self, fs: alloc::sync::Weak<crate::filesystem::devfs::DevFS>) {
+        *self.fs.write() = fs;
     }
 }
 

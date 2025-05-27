@@ -225,7 +225,7 @@ impl BlockDevMeta {
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerBlockDevMeta> {
+    pub(crate) fn inner(&self) -> SpinLockGuard<InnerBlockDevMeta> {
         self.inner.lock()
     }
 }

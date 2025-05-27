@@ -126,7 +126,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
 
 fn try_find_gendisk_as_rootfs(path: &str) -> Option<Arc<GenDisk>> {
     if let Some(gd) = block_dev_manager().lookup_gendisk_by_path(path) {
-        info!("Use {} as rootfs", path);
+        // info!("Use {} as rootfs", path);
         return Some(gd);
     }
     return None;
@@ -158,12 +158,13 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
     let r = migrate_virtual_filesystem(fatfs);
 
-    let disk = try_find_gendisk_as_rootfs("/dev/vdb1").unwrap();
-    let ext4fs = Ext4FileSystem::from_gendisk(disk);
+    if let Some(disk) = try_find_gendisk_as_rootfs("/dev/vdb1") {
+        let ext4fs = Ext4FileSystem::from_gendisk(disk);
 
-    let _ = ROOT_INODE()
-        .mkdir("ext4", ModeType::from_bits_truncate(0o755))?
-        .mount(ext4fs.unwrap())?;
+        let _ = ROOT_INODE()
+            .mkdir("ext4", ModeType::from_bits_truncate(0o755))?
+            .mount(ext4fs.unwrap())?;
+    }
 
     if r.is_err() {
         error!("Failed to migrate virtual filesyst  em to FAT32!");

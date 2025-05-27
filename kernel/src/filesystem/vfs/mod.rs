@@ -971,6 +971,64 @@ impl DowncastArc for dyn FileSystem {
     }
 }
 
+/// # 可以被挂载的文件系统应该实现的trait
+pub trait MountableFileSystem: FileSystem {
+    fn make_mount_data(
+        _raw_data: *const u8,
+        _source: &str,
+    ) -> Result<Arc<dyn FileSystemMakerData + 'static>, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn make_fs(
+        _data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+}
+
+/// # 注册一个可以被挂载文件系统
+/// 此宏用于注册一个可以被挂载的文件系统。
+/// 它会将文件系统的创建函数和挂载数据创建函数注册到全局的`FSMAKER`数组中。
+///
+/// ## 参数
+/// - `$fs`: 文件系统对应的结构体
+/// - `$maker_name`: 文件系统的注册名
+/// - `$fs_name`: 文件系统的名称（字符串字面量）
+#[macro_export]
+macro_rules! register_mountable_fs {
+    ($fs:ident, $maker_name:ident, $fs_name:literal) => {
+        impl $fs {
+            pub fn make_fs_bridge(
+                data: Option<&dyn FileSystemMakerData>,
+            ) -> Result<Arc<dyn FileSystem>, SystemError> {
+                <$fs as MountableFileSystem>::make_fs(data)
+            }
+
+            pub fn make_mount_data_bridge(
+                raw_data: *const u8,
+                source: &str,
+            ) -> Result<Arc<dyn FileSystemMakerData + 'static>, SystemError> {
+                <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
+            }
+        }
+
+        #[distributed_slice(FSMAKER)]
+        static $maker_name: FileSystemMaker = FileSystemMaker::new(
+            $fs_name,
+            &($fs::make_fs_bridge
+                as fn(
+                    Option<&dyn FileSystemMakerData>,
+                ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+            &($fs::make_mount_data_bridge
+                as fn(
+                    *const u8,
+                    &str,
+                ) -> Result<Arc<dyn FileSystemMakerData + 'static>, SystemError>),
+        );
+    };
+}
+
 #[derive(Debug)]
 pub struct FsInfo {
     /// 文件系统所在的块设备的id
@@ -1012,23 +1070,32 @@ impl Metadata {
     }
 }
 pub struct FileSystemMaker {
-    function: &'static FileSystemNewFunction,
+    /// 文件系统的创建函数
+    maker: &'static FSMakerFunction,
+    /// 文件系统的名称
     name: &'static str,
+    /// 用于创建挂载数据的函数
+    builder: &'static MountDataBuilder,
 }
 
 impl FileSystemMaker {
     pub const fn new(
         name: &'static str,
-        function: &'static FileSystemNewFunction,
+        maker: &'static FSMakerFunction,
+        builder: &'static MountDataBuilder,
     ) -> FileSystemMaker {
-        FileSystemMaker { function, name }
+        FileSystemMaker {
+            maker,
+            name,
+            builder,
+        }
     }
 
-    pub fn call(
+    pub fn build(
         &self,
         data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
-        (self.function)(data)
+        (self.maker)(data)
     }
 }
 
@@ -1036,8 +1103,10 @@ pub trait FileSystemMakerData: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub type FileSystemNewFunction =
+pub type FSMakerFunction =
     fn(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError>;
+pub type MountDataBuilder =
+    fn(raw_data: *const u8, source: &str) -> Result<Arc<dyn FileSystemMakerData>, SystemError>;
 
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
@@ -1053,17 +1122,16 @@ macro_rules! define_filesystem_maker_slice {
 /// 调用指定数组中的所有初始化器
 #[macro_export]
 macro_rules! producefs {
-    ($initializer_slice:ident,$filesystem:ident,$raw_data : ident) => {
+    ($initializer_slice : ident, $filesystem : ident, $raw_data : ident, $source : ident) => {
         match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
             Some(maker) => {
-                let mount_data = match $filesystem {
-                    "overlay" => OverlayMountData::from_row($raw_data).ok(),
-                    _ => None,
-                };
-                let data: Option<&dyn FileSystemMakerData> =
-                    mount_data.as_ref().map(|d| d as &dyn FileSystemMakerData);
+                let mount_data = (maker.builder)($raw_data, $source).map_err(|e| {
+                    log::error!("failed to build mount data for {}: {:?}", $filesystem, e);
+                    e
+                })?;
+                let data: Option<&dyn FileSystemMakerData> = Some(mount_data.as_ref());
 
-                maker.call(data)
+                maker.build(data)
             }
             None => {
                 log::error!("mismatch filesystem type : {}", $filesystem);

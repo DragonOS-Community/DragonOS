@@ -24,7 +24,7 @@ use system_error::SystemError;
 ///
 /// ## 参数:
 ///
-/// - source       挂载设备(暂时不支持)
+/// - source       挂载设备(目前只支持ext4格式的硬盘)
 /// - target       挂载目录
 /// - filesystemtype   文件系统
 /// - mountflags     挂载选项（暂未实现）

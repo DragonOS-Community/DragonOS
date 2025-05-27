@@ -124,7 +124,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
-fn try_find_gendisk_as_rootfs(path: &str) -> Option<Arc<GenDisk>> {
+pub(crate) fn try_find_gendisk(path: &str) -> Option<Arc<GenDisk>> {
     if let Some(gd) = block_dev_manager().lookup_gendisk_by_path(path) {
         // info!("Use {} as rootfs", path);
         return Some(gd);
@@ -136,12 +136,12 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount root fs...");
     block_dev_manager().print_gendisks();
     let gendisk = if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM.value_str() {
-        try_find_gendisk_as_rootfs(rootfs_dev_path)
+        try_find_gendisk(rootfs_dev_path)
             .unwrap_or_else(|| panic!("Failed to find rootfs device {}", rootfs_dev_path))
     } else {
         ROOTFS_TRY_LIST
             .iter()
-            .find_map(|&path| try_find_gendisk_as_rootfs(path))
+            .find_map(|&path| try_find_gendisk(path))
             .ok_or(SystemError::ENODEV)?
     };
 
@@ -158,7 +158,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
     let r = migrate_virtual_filesystem(fatfs);
 
-    if let Some(disk) = try_find_gendisk_as_rootfs("/dev/vdb1") {
+    if let Some(disk) = try_find_gendisk("/dev/vdb1") {
         let ext4fs = Ext4FileSystem::from_gendisk(disk);
 
         let _ = ROOT_INODE()

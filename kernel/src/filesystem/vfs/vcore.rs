@@ -26,9 +26,8 @@ use crate::{
 use super::{
     fcntl::AtFlags,
     file::FileMode,
-    mount::{init_mountlist, MOUNT_LIST},
+    mount::init_mountlist,
     stat::LookUpFlags,
-    syscall::UmountFlag,
     utils::{rsplit_path, user_path_at},
     FilePrivateData, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -307,42 +306,6 @@ pub fn do_symlinkat(from: *const u8, newdfd: i32, to: *const u8) -> Result<usize
     let len = buf.len();
     new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
     return Ok(0);
-}
-
-/// # do_umount2 - 执行卸载文件系统的函数
-///
-/// 这个函数用于卸载指定的文件系统。
-///
-/// ## 参数
-///
-/// - dirfd: i32 - 目录文件描述符，用于指定要卸载的文件系统的根目录。
-/// - target: &str - 要卸载的文件系统的目标路径。
-/// - _flag: UmountFlag - 卸载标志，目前未使用。
-///
-/// ## 返回值
-///
-/// - Ok(Arc<MountFS>): 成功时返回文件系统的 Arc 引用。
-/// - Err(SystemError): 出错时返回系统错误。
-///
-/// ## 错误处理
-///
-/// 如果指定的路径没有对应的文件系统，或者在尝试卸载时发生错误，将返回错误。
-pub fn do_umount2(
-    dirfd: i32,
-    target: &str,
-    _flag: UmountFlag,
-) -> Result<Arc<MountFS>, SystemError> {
-    let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
-    let path = work.absolute_path()? + &rest;
-    let do_umount = || -> Result<Arc<MountFS>, SystemError> {
-        if let Some(fs) = MOUNT_LIST().remove(path) {
-            // Todo: 占用检测
-            fs.umount()?;
-            return Ok(fs);
-        }
-        return Err(SystemError::EINVAL);
-    };
-    return do_umount();
 }
 
 pub(super) fn do_file_lookup_at(

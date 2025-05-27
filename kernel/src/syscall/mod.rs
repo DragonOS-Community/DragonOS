@@ -1018,13 +1018,6 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            SYS_UMOUNT2 => {
-                let target = args[0] as *const u8;
-                let flags = args[1] as i32;
-                Self::umount2(target, flags)?;
-                return Ok(0);
-            }
-
             #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_NEWFSTATAT => Self::newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
 

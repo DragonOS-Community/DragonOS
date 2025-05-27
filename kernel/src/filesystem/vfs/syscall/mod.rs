@@ -1,5 +1,3 @@
-use crate::filesystem::overlayfs::OverlayMountData;
-use crate::filesystem::vfs::FileSystemMakerData;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -7,7 +5,6 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use log::warn;
 use system_error::SystemError;
 
-use crate::producefs;
 use crate::syscall::user_access::UserBufferReader;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
@@ -32,8 +29,7 @@ use super::{
     },
     utils::{rsplit_path, user_path_at},
     vcore::{do_mkdir_at, do_remove_dir, do_unlink_at},
-    Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
-    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 mod open_utils;
@@ -60,6 +56,8 @@ mod sys_epoll_ctl;
 mod sys_epoll_pwait;
 #[cfg(target_arch = "x86_64")]
 mod sys_epoll_wait;
+
+pub(crate) mod sys_mount;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -1409,42 +1407,6 @@ impl Syscall {
 
     pub fn fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError> {
         return ksys_fchown(fd, uid, gid);
-    }
-
-    /// #挂载文件系统
-    ///
-    /// 用于挂载文件系统,目前仅支持ramfs挂载
-    ///
-    /// ## 参数:
-    ///
-    /// - source       挂载设备(暂时不支持)
-    /// - target       挂载目录
-    /// - filesystemtype   文件系统
-    /// - mountflags     挂载选项（暂未实现）
-    /// - data        带数据挂载
-    ///
-    /// ## 返回值
-    /// - Ok(0): 挂载成功
-    /// - Err(SystemError) :挂载过程中出错
-    pub fn mount(
-        _source: *const u8,
-        target: *const u8,
-        filesystemtype: *const u8,
-        _mountflags: usize,
-        data: *const u8,
-    ) -> Result<usize, SystemError> {
-        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        let fstype_str = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
-        let fstype_str = fstype_str.to_str().map_err(|_| SystemError::EINVAL)?;
-
-        let fstype = producefs!(FSMAKER, fstype_str, data)?;
-
-        Vcore::do_mount(fstype, &target)?;
-
-        return Ok(0);
     }
 
     // 想法：可以在VFS中实现一个文件系统分发器，流程如下：

@@ -309,69 +309,6 @@ pub fn do_symlinkat(from: *const u8, newdfd: i32, to: *const u8) -> Result<usize
     return Ok(0);
 }
 
-/// # do_mount - 挂载文件系统
-///
-/// 将给定的文件系统挂载到指定的挂载点。
-///
-/// 此函数会检查是否已经挂载了相同的文件系统，如果已经挂载，则返回错误。
-/// 它还会处理符号链接，并确保挂载点是有效的。
-///
-/// ## 参数
-///
-/// - `fs`: Arc<dyn FileSystem>，要挂载的文件系统。
-/// - `mount_point`: &str，挂载点路径。
-///
-/// ## 返回值
-///
-/// - `Ok(Arc<MountFS>)`: 挂载成功后返回挂载的文件系统。
-/// - `Err(SystemError)`: 挂载失败时返回错误。
-pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountFS>, SystemError> {
-    let (current_node, rest_path) = user_path_at(
-        &ProcessManager::current_pcb(),
-        AtFlags::AT_FDCWD.bits(),
-        mount_point,
-    )?;
-    let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
-        if rest.is_empty() {
-            return Err(SystemError::EBUSY);
-        }
-    }
-    // 移至IndexNode.mount()来记录
-    return inode.mount(fs);
-}
-
-/// # do_mount_mkdir - 在指定挂载点创建目录并挂载文件系统
-///
-/// 在指定的挂载点创建一个目录，并将其挂载到文件系统中。如果挂载点已经存在，并且不是空的，
-/// 则会返回错误。成功时，会返回一个新的挂载文件系统的引用。
-///
-/// ## 参数
-///
-/// - `fs`: FileSystem - 文件系统的引用，用于创建和挂载目录。
-/// - `mount_point`: &str - 挂载点路径，用于创建和挂载目录。
-///
-/// ## 返回值
-///
-/// - `Ok(Arc<MountFS>)`: 成功挂载文件系统后，返回挂载文件系统的共享引用。
-/// - `Err(SystemError)`: 挂载失败时，返回系统错误。
-pub fn do_mount_mkdir(
-    fs: Arc<dyn FileSystem>,
-    mount_point: &str,
-) -> Result<Arc<MountFS>, SystemError> {
-    let inode = do_mkdir_at(
-        AtFlags::AT_FDCWD.bits(),
-        mount_point,
-        FileMode::from_bits_truncate(0o755),
-    )?;
-    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
-        if rest.is_empty() {
-            return Err(SystemError::EBUSY);
-        }
-    }
-    return inode.mount(fs);
-}
-
 /// # do_umount2 - 执行卸载文件系统的函数
 ///
 /// 这个函数用于卸载指定的文件系统。

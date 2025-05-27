@@ -41,7 +41,6 @@ impl Syscall for SysMountHandle {
     }
 
     fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
-        log::info!("sys_mount called with");
         let target = Self::target(args);
         let filesystemtype = Self::filesystemtype(args);
         let data = Self::data(args);
@@ -59,7 +58,6 @@ impl Syscall for SysMountHandle {
         let fstype_str = fstype_str.to_str().map_err(|_| SystemError::EINVAL)?;
 
         let fstype = producefs!(FSMAKER, fstype_str, data, source)?;
-        log::info!("generate filesystem");
 
         do_mount(fstype, &target)?;
 

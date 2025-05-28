@@ -7,7 +7,6 @@ use crate::{
     process::{process_group::Pgid, Pid, ProcessFlags, ProcessManager},
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
-        Syscall,
     },
 };
 
@@ -59,7 +58,7 @@ impl TtyJobCtrlManager {
             } else if ProcessManager::is_current_pgrp_orphaned() {
                 return Err(SystemError::EIO);
             } else {
-                Syscall::kill_process_group(pgid, sig)?;
+                crate::ipc::kill::kill_process_group(pgid, sig)?;
                 ProcessManager::current_pcb()
                     .flags()
                     .insert(ProcessFlags::HAS_PENDING_SIGNAL);

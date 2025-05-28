@@ -6,7 +6,6 @@ use core::{
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     filesystem::vfs::syscall::PosixStatfs,
-    ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
     net::syscall::MsgHdr,
@@ -29,7 +28,6 @@ use crate::{
     arch::{interrupt::TrapFrame, MMArch},
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
-        file::FileMode,
         syscall::{ModeType, UtimensFlags},
         MAX_PATHLEN,
     },
@@ -314,27 +312,6 @@ impl Syscall {
             }
 
             SYS_CLOCK => Self::clock(),
-            #[cfg(target_arch = "x86_64")]
-            SYS_PIPE => {
-                let pipefd: *mut i32 = args[0] as *mut c_int;
-                if pipefd.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::pipe2(pipefd, FileMode::empty())
-                }
-            }
-
-            SYS_PIPE2 => {
-                let pipefd: *mut i32 = args[0] as *mut c_int;
-                let arg1 = args[1];
-                if pipefd.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    let flags = FileMode::from_bits_truncate(arg1 as u32);
-                    Self::pipe2(pipefd, flags)
-                }
-            }
-
             SYS_UNLINKAT => {
                 let dirfd = args[0] as i32;
                 let path = args[1] as *const u8;
@@ -383,20 +360,6 @@ impl Syscall {
                 let path = args[0] as *const u8;
                 Self::unlink(path)
             }
-            SYS_KILL => {
-                let pid = args[0] as i32;
-                let sig = args[1] as c_int;
-                // debug!("KILL SYSCALL RECEIVED");
-                Self::kill(pid, sig)
-            }
-
-            SYS_RT_SIGACTION => {
-                let sig = args[0] as c_int;
-                let act = args[1];
-                let old_act = args[2];
-                Self::sigaction(sig, act, old_act, frame.is_from_user())
-            }
-
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
             SYS_SCHED => {
@@ -836,14 +799,6 @@ impl Syscall {
                 Self::setpgid(pid, pgid)
             }
 
-            SYS_RT_SIGPROCMASK => {
-                let how = args[0] as i32;
-                let nset = args[1];
-                let oset = args[2];
-                let sigsetsize = args[3];
-                Self::rt_sigprocmask(how, nset, oset, sigsetsize)
-            }
-
             SYS_TKILL => {
                 warn!("SYS_TKILL has not yet been implemented");
                 Ok(0)
@@ -1095,33 +1050,6 @@ impl Syscall {
                 let second = args[0] as u32;
                 Self::alarm(second)
             }
-
-            SYS_SHMGET => {
-                let key = ShmKey::new(args[0]);
-                let size = args[1];
-                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
-
-                Self::shmget(key, size, shmflg)
-            }
-            SYS_SHMAT => {
-                let id = ShmId::new(args[0]);
-                let vaddr = VirtAddr::new(args[1]);
-                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
-
-                Self::shmat(id, vaddr, shmflg)
-            }
-            SYS_SHMDT => {
-                let vaddr = VirtAddr::new(args[0]);
-                Self::shmdt(vaddr)
-            }
-            SYS_SHMCTL => {
-                let id = ShmId::new(args[0]);
-                let cmd = ShmCtlCmd::from(args[1]);
-                let user_buf = args[2] as *const u8;
-                let from_user = frame.is_from_user();
-
-                Self::shmctl(id, cmd, user_buf, from_user)
-            }
             SYS_MSYNC => {
                 let start = page_align_up(args[0]);
                 let len = page_align_up(args[1]);
@@ -1173,8 +1101,7 @@ impl Syscall {
             }
             #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_SETRLIMIT => Ok(0),
-            SYS_RESTART_SYSCALL => Self::restart_syscall(),
-            SYS_RT_SIGPENDING => Self::rt_sigpending(args[0], args[1]),
+        
             SYS_RT_SIGTIMEDWAIT => {
                 log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
                 Ok(0)

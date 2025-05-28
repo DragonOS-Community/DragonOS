@@ -20,7 +20,7 @@ use crate::{
     mm::MemoryManagementArch,
     process::ProcessManager,
     sched::{schedule, SchedMode},
-    syscall::{user_access::UserBufferWriter, Syscall},
+    syscall::{user_access::UserBufferWriter},
 };
 
 /// 信号处理的栈的栈指针的最小对齐数量
@@ -556,7 +556,7 @@ impl SignalArch for X86_64SignalArch {
         // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
         if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
             error!("rsp doesn't from user level");
-            let _r = Syscall::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV)
+            let _r = crate::ipc::kill::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV)
                 .map_err(|e| e.to_posix_errno());
             return trap_frame.rax;
         }
@@ -565,7 +565,7 @@ impl SignalArch for X86_64SignalArch {
         // 从用户栈恢复sigcontext
         if !unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) {
             error!("unable to restore sigcontext");
-            let _r = Syscall::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV)
+            let _r = crate::ipc::kill::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV)
                 .map_err(|e| e.to_posix_errno());
             // 如果这里返回 err 值的话会丢失上一个系统调用的返回值
         }
@@ -658,7 +658,7 @@ fn setup_frame(
                             ProcessManager::current_pcb().pid(),
                             sig as i32
                         );
-                        let r = Syscall::kill_process(
+                        let r = crate::ipc::kill::kill_process(
                             ProcessManager::current_pcb().pid(),
                             Signal::SIGSEGV,
                         );
@@ -698,7 +698,7 @@ fn setup_frame(
     if r.is_err() {
         // 如果地址区域位于内核空间，则直接报错
         // todo: 生成一个sigsegv
-        let r = Syscall::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV);
+        let r = crate::ipc::kill::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV);
         if r.is_err() {
             error!("In setup frame: generate SIGSEGV signal failed");
         }
@@ -709,7 +709,7 @@ fn setup_frame(
     // 将siginfo拷贝到用户栈
     info.copy_siginfo_to_user(unsafe { &mut ((*frame).info) as *mut SigInfo })
         .map_err(|e| -> SystemError {
-            let r = Syscall::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV);
+            let r = crate::ipc::kill::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV);
             if r.is_err() {
                 error!("In copy_siginfo_to_user: generate SIGSEGV signal failed");
             }
@@ -723,7 +723,7 @@ fn setup_frame(
             .context
             .setup_sigcontext(oldset, trap_frame)
             .map_err(|e: SystemError| -> SystemError {
-                let r = Syscall::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV);
+                let r = crate::ipc::kill::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV);
                 if r.is_err() {
                     error!("In setup_sigcontext: generate SIGSEGV signal failed");
                 }

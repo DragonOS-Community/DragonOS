@@ -1,11 +1,14 @@
 use crate::driver::base::block::gendisk::GenDisk;
+use crate::filesystem::vfs::fcntl::AtFlags;
+use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::vcore::try_find_gendisk;
 use crate::filesystem::vfs::{
     self, FileSystem, FileSystemMaker, FileSystemMakerData, IndexNode, Magic, MountableFileSystem,
-    FSMAKER,
+    FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
+use crate::process::ProcessManager;
 use crate::register_mountable_fs;
 use alloc::sync::{Arc, Weak};
 use linkme::distributed_slice;
@@ -94,11 +97,16 @@ impl FileSystemMakerData for Ext4MountData {
 
 impl Ext4MountData {
     pub fn form_source(path: &str) -> Result<Self, SystemError> {
-        //todo 进一步的检查
-        if !path.starts_with('/') {
-            return Err(SystemError::EINVAL);
+        let pcb = ProcessManager::current_pcb();
+        let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), path)?;
+        let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        if !inode.metadata()?.file_type.eq(&vfs::FileType::BlockDevice) {
+            return Err(SystemError::ENOTBLK);
         }
-        if let Some(gendisk) = try_find_gendisk(path) {
+
+        let disk = inode.dname()?;
+
+        if let Some(gendisk) = try_find_gendisk(disk.0.as_str()) {
             return Ok(Self { gendisk });
         }
         Err(SystemError::ENOENT)

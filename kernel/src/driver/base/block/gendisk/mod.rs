@@ -8,9 +8,10 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
+    driver::base::device::DevName,
     filesystem::{
         devfs::{DevFS, DeviceINode},
-        vfs::{syscall::ModeType, IndexNode, Metadata},
+        vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
     },
     libs::{rwlock::RwLock, spinlock::SpinLockGuard},
 };
@@ -28,6 +29,7 @@ pub struct GenDisk {
 
     fs: RwLock<Weak<DevFS>>,
     metadata: Metadata,
+    name: DName,
 }
 
 impl GenDisk {
@@ -38,6 +40,7 @@ impl GenDisk {
         bdev: Weak<dyn BlockDevice>,
         range: GeneralBlockRange,
         idx: Option<u32>,
+        dev_name: &DevName,
     ) -> Arc<Self> {
         let bsizelog2 = bdev.upgrade().unwrap().blk_size_log2();
 
@@ -51,6 +54,7 @@ impl GenDisk {
                 crate::filesystem::vfs::FileType::BlockDevice,
                 ModeType::from_bits_truncate(0o755),
             ),
+            name: DName::from(format!("{}{}", dev_name.name(), dev_name.id())),
         });
     }
 
@@ -166,7 +170,7 @@ impl GenDisk {
 
 impl IndexNode for GenDisk {
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!()
+        self.fs.read().upgrade().unwrap()
     }
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
@@ -194,6 +198,9 @@ impl IndexNode for GenDisk {
     }
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         Ok(self.metadata.clone())
+    }
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.name.clone())
     }
 }
 

@@ -85,7 +85,7 @@ impl BlockDevManager {
         let mbr = MbrDiskPartionTable::from_disk(dev.clone())?;
         let piter = mbr.partitions_raw();
         for p in piter {
-            self.register_gendisk_with_range(dev, p.try_into()?)?;
+            self.register_gendisk_with_range(dev, p.try_into()?, dev.dev_name())?;
         }
         Ok(())
     }
@@ -96,19 +96,21 @@ impl BlockDevManager {
         dev: &Arc<dyn BlockDevice>,
     ) -> Result<(), SystemError> {
         let range = dev.disk_range();
-        self.register_gendisk_with_range(dev, range)
+        self.register_gendisk_with_range(dev, range, dev.dev_name())
     }
 
     fn register_gendisk_with_range(
         &self,
         dev: &Arc<dyn BlockDevice>,
         range: GeneralBlockRange,
+        dev_name: &DevName,
     ) -> Result<(), SystemError> {
         let weak_dev = Arc::downgrade(dev);
         let gendisk = GenDisk::new(
             weak_dev,
             range,
             Some(dev.blkdev_meta().inner().gendisks.alloc_idx()),
+            dev_name,
         );
         self.register_gendisk(dev, gendisk)
     }

@@ -15,11 +15,12 @@ use crate::{
 
 use super::{
     allocator::page_frame::{PageFrameCount, VirtPageFrame},
-    ucontext::{AddressSpace, DEFAULT_MMAP_MIN_ADDR},
+    ucontext::AddressSpace,
     verify_area, MsFlags, VirtAddr, VmFlags,
 };
 
 mod sys_brk;
+mod sys_mmap;
 mod sys_sbrk;
 
 bitflags! {
@@ -253,75 +254,6 @@ impl From<VmFlags> for ProtFlags {
 }
 
 impl Syscall {
-    /// ## mmap系统调用
-    ///
-    /// 该函数的实现参考了Linux内核的实现，但是并不完全相同。因为有些功能咱们还没实现
-    ///
-    /// ## 参数
-    ///
-    /// - `start_vaddr`：映射的起始地址
-    /// - `len`：映射的长度
-    /// - `prot`：保护标志
-    /// - `flags`：映射标志
-    /// - `fd`：文件描述符（暂时不支持）
-    /// - `offset`：文件偏移量 （暂时不支持）
-    ///
-    /// ## 返回值
-    ///
-    /// 成功时返回映射的起始地址，失败时返回错误码
-    pub fn mmap(
-        start_vaddr: VirtAddr,
-        len: usize,
-        prot_flags: usize,
-        map_flags: usize,
-        fd: i32,
-        offset: usize,
-    ) -> Result<usize, SystemError> {
-        let map_flags = MapFlags::from_bits_truncate(map_flags as u64);
-        let prot_flags = ProtFlags::from_bits_truncate(prot_flags as u64);
-
-        if start_vaddr < VirtAddr::new(DEFAULT_MMAP_MIN_ADDR)
-            && map_flags.contains(MapFlags::MAP_FIXED)
-        {
-            error!(
-                "mmap: MAP_FIXED is not supported for address below {}",
-                DEFAULT_MMAP_MIN_ADDR
-            );
-            return Err(SystemError::EINVAL);
-        }
-
-        // 暂时不支持巨页映射
-        if map_flags.contains(MapFlags::MAP_HUGETLB) {
-            error!("mmap: not support huge page mapping");
-            return Err(SystemError::ENOSYS);
-        }
-        let current_address_space = AddressSpace::current()?;
-        let start_page = if map_flags.contains(MapFlags::MAP_ANONYMOUS) {
-            // 匿名映射
-            current_address_space.write().map_anonymous(
-                start_vaddr,
-                len,
-                prot_flags,
-                map_flags,
-                true,
-                false,
-            )?
-        } else {
-            // 文件映射
-            current_address_space.write().file_mapping(
-                start_vaddr,
-                len,
-                prot_flags,
-                map_flags,
-                fd,
-                offset,
-                true,
-                false,
-            )?
-        };
-        return Ok(start_page.virt_address().data());
-    }
-
     /// ## mremap系统调用
     ///
     ///

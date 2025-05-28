@@ -569,22 +569,7 @@ impl Syscall {
                 let timezone_ptr = args[1] as *mut PosixTimeZone;
                 Self::gettimeofday(timeval, timezone_ptr)
             }
-            SYS_MMAP => {
-                let len = page_align_up(args[1]);
-                let virt_addr = VirtAddr::new(args[0]);
-                if verify_area(virt_addr, len).is_err() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::mmap(
-                        VirtAddr::new(args[0]),
-                        len,
-                        args[2],
-                        args[3],
-                        args[4] as i32,
-                        args[5],
-                    )
-                }
-            }
+
             SYS_MREMAP => {
                 let old_vaddr = VirtAddr::new(args[0]);
                 let old_len = args[1];

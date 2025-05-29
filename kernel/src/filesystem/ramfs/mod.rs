@@ -160,22 +160,15 @@ impl MountableFileSystem for RamFS {
     fn make_mount_data(
         _raw_data: *const u8,
         _source: &str,
-    ) -> Result<Arc<dyn FileSystemMakerData + 'static>, SystemError> {
+    ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
         // 目前ramfs不需要任何额外的mount数据
-        Ok(Arc::new(RamFSMountData {}))
+        None
     }
     fn make_fs(
         _data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
         let fs = RamFS::new();
         return Ok(fs);
-    }
-}
-
-pub struct RamFSMountData;
-impl FileSystemMakerData for RamFSMountData {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

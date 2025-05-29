@@ -206,9 +206,9 @@ impl MountableFileSystem for OverlayFS {
     fn make_mount_data(
         raw_data: *const u8,
         _source: &str,
-    ) -> Result<Arc<dyn FileSystemMakerData + 'static>, SystemError> {
-        let mount_data = OverlayMountData::from_row(raw_data)?;
-        Ok(Arc::new(mount_data))
+    ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
+        let mount_data = OverlayMountData::from_raw(raw_data).unwrap();
+        Some(Arc::new(mount_data))
     }
 }
 

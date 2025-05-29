@@ -976,13 +976,15 @@ pub trait MountableFileSystem: FileSystem {
     fn make_mount_data(
         _raw_data: *const u8,
         _source: &str,
-    ) -> Result<Arc<dyn FileSystemMakerData + 'static>, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
+        log::error!("This filesystem does not support make_mount_data");
+        None
     }
 
     fn make_fs(
         _data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        log::error!("This filesystem does not support make_fs");
         Err(SystemError::ENOSYS)
     }
 }
@@ -1008,7 +1010,7 @@ macro_rules! register_mountable_fs {
             pub fn make_mount_data_bridge(
                 raw_data: *const u8,
                 source: &str,
-            ) -> Result<Arc<dyn FileSystemMakerData + 'static>, SystemError> {
+            ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
                 <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
             }
         }
@@ -1021,10 +1023,7 @@ macro_rules! register_mountable_fs {
                     Option<&dyn FileSystemMakerData>,
                 ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
             &($fs::make_mount_data_bridge
-                as fn(
-                    *const u8,
-                    &str,
-                ) -> Result<Arc<dyn FileSystemMakerData + 'static>, SystemError>),
+                as fn(*const u8, &str) -> Option<Arc<dyn FileSystemMakerData + 'static>>),
         );
     };
 }
@@ -1106,7 +1105,7 @@ pub trait FileSystemMakerData: Send + Sync {
 pub type FSMakerFunction =
     fn(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError>;
 pub type MountDataBuilder =
-    fn(raw_data: *const u8, source: &str) -> Result<Arc<dyn FileSystemMakerData>, SystemError>;
+    fn(raw_data: *const u8, source: &str) -> Option<Arc<dyn FileSystemMakerData>>;
 
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
@@ -1125,13 +1124,14 @@ macro_rules! producefs {
     ($initializer_slice : ident, $filesystem : ident, $raw_data : ident, $source : ident) => {
         match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
             Some(maker) => {
-                let mount_data = (maker.builder)($raw_data, $source).map_err(|e| {
-                    log::error!("failed to build mount data for {}: {:?}", $filesystem, e);
-                    e
-                })?;
-                let data: Option<&dyn FileSystemMakerData> = Some(mount_data.as_ref());
+                if let Some(mount_data) = (maker.builder)($raw_data, $source) {
+                    let data: Option<&dyn FileSystemMakerData> = Some(mount_data.as_ref());
 
-                maker.build(data)
+                    maker.build(data)
+                } else {
+                    log::error!("failed to build mount data for {}", $filesystem);
+                    Err(SystemError::ENOSYS)
+                }
             }
             None => {
                 log::error!("mismatch filesystem type : {}", $filesystem);

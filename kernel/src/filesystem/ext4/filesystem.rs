@@ -78,9 +78,9 @@ impl MountableFileSystem for Ext4FileSystem {
     fn make_mount_data(
         _raw_data: *const u8,
         source: &str,
-    ) -> Result<Arc<dyn FileSystemMakerData + 'static>, SystemError> {
-        let mount_data = Ext4MountData::form_source(source)?;
-        Ok(Arc::new(mount_data))
+    ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
+        let mount_data = Ext4MountData::from_source(source).unwrap();
+        Some(Arc::new(mount_data))
     }
 }
 

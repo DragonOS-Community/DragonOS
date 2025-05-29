@@ -11,7 +11,7 @@ use crate::{
         irqchip::IrqChipSetMaskResult,
         irqdesc::{irq_desc_manager, InnerIrqDesc, IrqAction},
     },
-    libs::{cpumask::CpuMask, spinlock::SpinLockGuard},
+    libs::{cpumask::CpuMask, mutex::MutexGuard, spinlock::SpinLockGuard},
     process::{kthread::KernelThreadMechanism, ProcessManager},
     smp::cpu::ProcessorId,
 };
@@ -301,13 +301,12 @@ impl IrqManager {
     }
 
     #[inline(never)]
-    fn finalize_irq_setup(
+    fn setup_irq_resources<'a>(
         &self,
-        action_guard: SpinLockGuard<'_, InnerIrqAction>,
+        action_guard: SpinLockGuard<'a, InnerIrqAction>,
         irq: IrqNumber,
-        action: Arc<IrqAction>,
-        desc: Arc<IrqDesc>,
-    ) -> Result<(), SystemError> {
+        desc: &'a Arc<IrqDesc>,
+    ) -> Result<SetupIrqResourcesResp<'a>, SystemError> {
         // Protects against a concurrent __free_irq() call which might wait
         // for synchronize_hardirq() to complete without holding the optional
         // chip bus lock and desc->lock. Also protects against handing out
@@ -334,7 +333,7 @@ impl IrqManager {
                     );
                 }
 
-                __tmp_log(action_guard.name(), &irq, &desc, &e);
+                __tmp_log(action_guard.name(), &irq, desc, &e);
 
                 return Err(self.handle_bus_unlock_error(
                     e,
@@ -345,7 +344,7 @@ impl IrqManager {
             }
         }
 
-        let mut desc_inner_guard: SpinLockGuard<'_, InnerIrqDesc> = desc.inner();
+        let desc_inner_guard: SpinLockGuard<'_, InnerIrqDesc> = desc.inner();
 
         // 标记当前irq是否是共享的
         let mut irq_shared = false;
@@ -487,13 +486,29 @@ impl IrqManager {
             ));
         }
 
+        return Ok(SetupIrqResourcesResp {
+            action_guard,
+            irq_shared,
+            desc_inner_guard,
+            req_mutex_guard,
+        });
+    }
+
+    #[inline(never)]
+    fn activate_irq_line<'a>(
+        &self,
+        irq: IrqNumber,
+        desc: &'a Arc<IrqDesc>,
+        action: Arc<IrqAction>,
+        mut resp: SetupIrqResourcesResp<'a>,
+    ) -> Result<(), SystemError> {
         // 第一次在当前irqdesc上注册中断处理函数
-        if !irq_shared {
+        if !resp.irq_shared {
             // 设置中断触发方式
-            if action_guard.flags().trigger_type_specified() {
-                let trigger_type = action_guard.flags().trigger_type();
+            if resp.action_guard.flags().trigger_type_specified() {
+                let trigger_type = resp.action_guard.flags().trigger_type();
                 if let Err(e) =
-                    self.do_set_irq_trigger(desc.clone(), &mut desc_inner_guard, trigger_type)
+                    self.do_set_irq_trigger(desc.clone(), &mut resp.desc_inner_guard, trigger_type)
                 {
                     // debug!(
                     //     "Failed to set trigger type for irq {} (name: {}, flags: {:?}), error {:?}",
@@ -504,16 +519,16 @@ impl IrqManager {
                     // );
                     return Err(self.handle_unlock_error(
                         e,
-                        desc_inner_guard,
+                        resp.desc_inner_guard,
                         desc.clone(),
-                        req_mutex_guard,
-                        action_guard,
+                        resp.req_mutex_guard,
+                        resp.action_guard,
                     ));
                 }
             }
             // debug!("to irq_activate");
             // 激活中断。这种激活必须独立于IRQ_NOAUTOEN进行*desc_inner_guard.internal_state_mut() |= IrqDescState::IRQS_NOREQUEST;uest.
-            if let Err(e) = self.irq_activate(&desc, &mut desc_inner_guard) {
+            if let Err(e) = self.irq_activate(&desc, &mut resp.desc_inner_guard) {
                 // debug!(
                 //     "Failed to activate irq {} (name: {}, flags: {:?}), error {:?}",
                 //     irq.data(),
@@ -523,53 +538,67 @@ impl IrqManager {
                 // );
                 return Err(self.handle_unlock_error(
                     e,
-                    desc_inner_guard,
+                    resp.desc_inner_guard,
                     desc.clone(),
-                    req_mutex_guard,
-                    action_guard,
+                    resp.req_mutex_guard,
+                    resp.action_guard,
                 ));
             }
 
-            *desc_inner_guard.internal_state_mut() &= !(IrqDescState::IRQS_AUTODETECT
+            *resp.desc_inner_guard.internal_state_mut() &= !(IrqDescState::IRQS_AUTODETECT
                 | IrqDescState::IRQS_SPURIOUS_DISABLED
                 | IrqDescState::IRQS_ONESHOT
                 | IrqDescState::IRQS_WAITING);
-            desc_inner_guard
+            resp.desc_inner_guard
                 .common_data()
                 .clear_status(IrqStatus::IRQD_IRQ_INPROGRESS);
 
-            if action_guard.flags().contains(IrqHandleFlags::IRQF_PERCPU) {
-                desc_inner_guard
+            if resp
+                .action_guard
+                .flags()
+                .contains(IrqHandleFlags::IRQF_PERCPU)
+            {
+                resp.desc_inner_guard
                     .common_data()
                     .insert_status(IrqStatus::IRQD_PER_CPU);
-                desc_inner_guard.line_status_set_per_cpu();
+                resp.desc_inner_guard.line_status_set_per_cpu();
 
-                if action_guard.flags().contains(IrqHandleFlags::IRQF_NO_DEBUG) {
-                    desc_inner_guard.line_status_set_no_debug();
+                if resp
+                    .action_guard
+                    .flags()
+                    .contains(IrqHandleFlags::IRQF_NO_DEBUG)
+                {
+                    resp.desc_inner_guard.line_status_set_no_debug();
                 }
             }
 
-            if action_guard.flags().contains(IrqHandleFlags::IRQF_ONESHOT) {
-                *desc_inner_guard.internal_state_mut() |= IrqDescState::IRQS_ONESHOT;
+            if resp
+                .action_guard
+                .flags()
+                .contains(IrqHandleFlags::IRQF_ONESHOT)
+            {
+                *resp.desc_inner_guard.internal_state_mut() |= IrqDescState::IRQS_ONESHOT;
             }
 
             // 如果有要求的话，则忽略IRQ的均衡。
-            if action_guard
+            if resp
+                .action_guard
                 .flags()
                 .contains(IrqHandleFlags::IRQF_NOBALANCING)
             {
                 todo!("IRQF_NO_BALANCING");
             }
 
-            if !action_guard
+            if !resp
+                .action_guard
                 .flags()
                 .contains(IrqHandleFlags::IRQF_NO_AUTOEN)
-                && desc_inner_guard.can_autoenable()
+                && resp.desc_inner_guard.can_autoenable()
             {
                 // 如果没有设置IRQF_NOAUTOEN，则自动使能中断
                 self.irq_startup(
                     &desc,
-                    &mut desc_inner_guard,
+                    &mut resp.desc_inner_guard,
                     Self::IRQ_RESEND,
                     Self::IRQ_START_COND,
                 )
@@ -579,7 +608,11 @@ impl IrqManager {
                 // 共享中断可能在它仍然被禁用时请求它，然后永远等待中断。
 
                 static mut WARNED: bool = false;
-                if action_guard.flags().contains(IrqHandleFlags::IRQF_SHARED) && unsafe { !WARNED }
+                if resp
+                    .action_guard
+                    .flags()
+                    .contains(IrqHandleFlags::IRQF_SHARED)
+                    && unsafe { !WARNED }
                 {
                     #[inline(never)]
                     fn __tmp_warn_shared_interrupt(irq: &IrqNumber, name: &str) {
@@ -589,15 +622,15 @@ impl IrqManager {
                             name
                         );
                     }
-                    __tmp_warn_shared_interrupt(&irq, action_guard.name());
+                    __tmp_warn_shared_interrupt(&irq, resp.action_guard.name());
                     unsafe { WARNED = true };
                 }
 
-                desc_inner_guard.set_depth(1);
+                resp.desc_inner_guard.set_depth(1);
             }
-        } else if action_guard.flags().trigger_type_specified() {
-            let new_trigger_type = action_guard.flags().trigger_type();
-            let old_trigger_type = desc_inner_guard.common_data().trigger_type();
+        } else if resp.action_guard.flags().trigger_type_specified() {
+            let new_trigger_type = resp.action_guard.flags().trigger_type();
+            let old_trigger_type = resp.desc_inner_guard.common_data().trigger_type();
             if new_trigger_type != old_trigger_type {
                 #[inline(never)]
                 fn ___tmp_log_irq_line_status_change(
@@ -613,25 +646,27 @@ impl IrqManager {
         }
 
         // 在队列末尾添加新的irqaction
-        desc_inner_guard.add_action(action.clone());
+        resp.desc_inner_guard.add_action(action.clone());
 
         // 检查我们是否曾经通过虚构的中断处理程序禁用过irq。重新启用它并再给它一次机会。
-        if irq_shared
-            && desc_inner_guard
+        if resp.irq_shared
+            && resp
+                .desc_inner_guard
                 .internal_state()
                 .contains(IrqDescState::IRQS_SPURIOUS_DISABLED)
         {
-            desc_inner_guard
+            resp.desc_inner_guard
                 .internal_state_mut()
                 .remove(IrqDescState::IRQS_SPURIOUS_DISABLED);
-            self.do_enable_irq(desc.clone(), &mut desc_inner_guard).ok();
+            self.do_enable_irq(desc.clone(), &mut resp.desc_inner_guard)
+                .ok();
         }
 
-        drop(desc_inner_guard);
+        drop(resp.desc_inner_guard);
         desc.chip_bus_sync_unlock();
-        drop(req_mutex_guard);
+        drop(resp.req_mutex_guard);
 
-        drop(action_guard);
+        drop(resp.action_guard);
         self.wake_up_and_wait_for_irq_thread_ready(&desc, Some(action.clone()));
         self.wake_up_and_wait_for_irq_thread_ready(&desc, action.inner().secondary());
         Ok(())
@@ -653,7 +688,9 @@ impl IrqManager {
         let action_guard = action.inner();
 
         let action_guard = self.prepare_irq_setup(action_guard, irq, &desc)?;
-        self.finalize_irq_setup(action_guard, irq, action.clone(), desc)
+        let resp: SetupIrqResourcesResp<'_> = self.setup_irq_resources(action_guard, irq, &desc)?;
+
+        self.activate_irq_line(irq, &desc, action.clone(), resp)
     }
 
     /// 唤醒中断线程并等待中断线程准备好
@@ -1219,4 +1256,11 @@ impl IrqHandler for IrqNestedPrimaryHandler {
         warn!("Primary handler called for nested irq {}", irq.data());
         return Ok(IrqReturn::NotHandled);
     }
+}
+
+struct SetupIrqResourcesResp<'a> {
+    action_guard: SpinLockGuard<'a, InnerIrqAction>,
+    irq_shared: bool,
+    desc_inner_guard: SpinLockGuard<'a, InnerIrqDesc>,
+    req_mutex_guard: MutexGuard<'a, ()>,
 }

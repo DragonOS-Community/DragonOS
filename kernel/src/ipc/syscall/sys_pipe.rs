@@ -2,11 +2,9 @@ use super::sys_pipe2::do_kernel_pipe2;
 use crate::arch::syscall::nr::SYS_PIPE;
 use crate::{
     filesystem::vfs::file::FileMode,
-    syscall::{
-        table::{FormattedSyscallParam, Syscall}, // Added FormattedSyscallParam
-    },
+    syscall::table::{FormattedSyscallParam, Syscall},
 };
-use alloc::vec::Vec; // For FormattedSyscallParam// For FormattedSyscallParam
+use alloc::vec::Vec;
 use core::ffi::c_int;
 use system_error::SystemError;
 pub struct SysPipeHandle;
@@ -34,9 +32,10 @@ impl Syscall for SysPipeHandle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         let fd_ptr = Self::pipefd(args);
-        vec![
-            FormattedSyscallParam::new("fd_ptr", format!("{}", fd_ptr as usize)), // Format pointer as hex
-        ]
+        vec![FormattedSyscallParam::new(
+            "fd_ptr",
+            format!("{}", fd_ptr as usize),
+        )]
     }
 }
 

@@ -5,10 +5,7 @@ use core::ffi::c_int;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
-    arch::{
-        ipc::signal::Signal,   // SigCode 用于 SigInfo::new, Signal 用于类型和方法
-        syscall::nr::SYS_KILL, // 用于 declare_syscall! 宏
-    },
+    arch::{ipc::signal::Signal, syscall::nr::SYS_KILL},
     process::{process_group::Pgid, Pid, ProcessManager},
 };
 use log::warn;

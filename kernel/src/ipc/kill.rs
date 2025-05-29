@@ -1,5 +1,5 @@
-use crate::arch::ipc::signal::{SigCode, Signal}; // Adjust path as needed
-use crate::ipc::signal_types::{SigInfo, SigType}; // Adjust path as needed
+use crate::arch::ipc::signal::{SigCode, Signal};
+use crate::ipc::signal_types::{SigInfo, SigType};
 use crate::process::{process_group::Pgid, Pid, ProcessManager};
 use core::sync::atomic::compiler_fence;
 use system_error::SystemError;

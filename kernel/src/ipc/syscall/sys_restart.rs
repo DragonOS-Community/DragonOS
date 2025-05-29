@@ -10,29 +10,27 @@ use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
 
 pub struct SysRestartHandle;
+/// # SYS_RESTART_SYSCALL 系统调用函数，用于重启被信号中断的系统调用
+///
+/// ## 返回值
+///
+/// 根据被重启的系统调用决定
+pub(super) fn do_kernel_restart_syscall() -> Result<usize, SystemError> {
+    let restart_block = ProcessManager::current_pcb().restart_block().take();
+    if let Some(mut restart_block) = restart_block {
+        return restart_block.restart_fn.call(&mut restart_block.data);
+    } else {
+        // 不应该走到这里，因此kill掉当前进程及同组的进程
+        let pid = Pid::new(0);
+        let sig = Signal::SIGKILL;
+        let mut info = SigInfo::new(sig, 0, SigCode::Kernel, SigType::Kill(pid));
 
-impl SysRestartHandle {
-    /// # SYS_RESTART_SYSCALL 系统调用函数，用于重启被信号中断的系统调用
-    ///
-    /// ## 返回值
-    ///
-    /// 根据被重启的系统调用决定
-    fn do_kernel_restart_syscall() -> Result<usize, SystemError> {
-        let restart_block = ProcessManager::current_pcb().restart_block().take();
-        if let Some(mut restart_block) = restart_block {
-            return restart_block.restart_fn.call(&mut restart_block.data);
-        } else {
-            // 不应该走到这里，因此kill掉当前进程及同组的进程
-            let pid = Pid::new(0);
-            let sig = Signal::SIGKILL;
-            let mut info = SigInfo::new(sig, 0, SigCode::Kernel, SigType::Kill(pid));
-
-            sig.send_signal_info(Some(&mut info), pid)
-                .expect("Failed to kill ");
-            return Ok(0);
-        }
+        sig.send_signal_info(Some(&mut info), pid)
+            .expect("Failed to kill ");
+        return Ok(0);
     }
 }
+impl SysRestartHandle {}
 
 impl Syscall for SysRestartHandle {
     fn num_args(&self) -> usize {
@@ -44,7 +42,7 @@ impl Syscall for SysRestartHandle {
     }
 
     fn handle(&self, _args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
-        Self::do_kernel_restart_syscall()
+        do_kernel_restart_syscall()
     }
 }
 

@@ -8,11 +8,11 @@ use crate::{
     libs::spinlock::SpinLock,
     process::ProcessManager,
     syscall::{
-        table::{FormattedSyscallParam, Syscall}, // Added FormattedSyscallParam
+        table::{FormattedSyscallParam, Syscall},
         user_access::UserBufferWriter,
     },
 };
-use alloc::vec::Vec; // For FormattedSyscallParam// For FormattedSyscallParam
+use alloc::vec::Vec;
 use core::ffi::c_int;
 use system_error::SystemError;
 

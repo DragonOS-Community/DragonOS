@@ -156,7 +156,7 @@ impl IrqManager {
         *action_guard.flags_mut() = flags;
         *action_guard.dev_id_mut() = dev_id;
         drop(action_guard);
-        debug!("to inner_setup_irq: {irq:?}");
+        // debug!("to inner_setup_irq: {irq:?}");
         return self.inner_setup_irq(irq, irqaction, desc);
     }
 
@@ -242,22 +242,12 @@ impl IrqManager {
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/manage.c?r=&mo=59252&fi=2138#1497
     #[inline(never)]
-    fn inner_setup_irq(
+    fn prepare_irq_setup<'a>(
         &self,
+        mut action_guard: SpinLockGuard<'a, InnerIrqAction>,
         irq: IrqNumber,
-        action: Arc<IrqAction>,
-        desc: Arc<IrqDesc>,
-    ) -> Result<(), SystemError> {
-        // ===== 代码开始 =====
-
-        if Arc::ptr_eq(
-            &desc.irq_data().chip_info_read_irqsave().chip(),
-            &no_irq_chip(),
-        ) {
-            return Err(SystemError::ENOSYS);
-        }
-
-        let mut action_guard = action.inner();
+        desc: &Arc<IrqDesc>,
+    ) -> Result<SpinLockGuard<'a, InnerIrqAction>, SystemError> {
         if !action_guard.flags().trigger_type_specified() {
             // 如果没有指定触发类型，则使用默认的触发类型
             action_guard
@@ -307,6 +297,17 @@ impl IrqManager {
             *action_guard.flags_mut() &= !IrqHandleFlags::IRQF_ONESHOT;
         }
 
+        Ok(action_guard)
+    }
+
+    #[inline(never)]
+    fn finalize_irq_setup(
+        &self,
+        action_guard: SpinLockGuard<'_, InnerIrqAction>,
+        irq: IrqNumber,
+        action: Arc<IrqAction>,
+        desc: Arc<IrqDesc>,
+    ) -> Result<(), SystemError> {
         // Protects against a concurrent __free_irq() call which might wait
         // for synchronize_hardirq() to complete without holding the optional
         // chip bus lock and desc->lock. Also protects against handing out
@@ -322,13 +323,19 @@ impl IrqManager {
         // 如果当前中断线上还没有irqaction, 则先为中断线申请资源
         if desc.actions().is_empty() {
             if let Err(e) = self.irq_request_resources(desc.clone()) {
-                error!(
-                    "Failed to request resources for {} (irq {}) on irqchip {}, error {:?}",
-                    action_guard.name(),
-                    irq.data(),
-                    desc.irq_data().chip_info_read_irqsave().chip().name(),
-                    e
-                );
+                #[inline(never)]
+                fn __tmp_log(name: &str, irq: &IrqNumber, desc: &Arc<IrqDesc>, e: &SystemError) {
+                    error!(
+                        "Failed to request resources for {} (irq {}) on irqchip {}, error {:?}",
+                        name,
+                        irq.data(),
+                        desc.irq_data().chip_info_read_irqsave().chip().name(),
+                        e
+                    );
+                }
+
+                __tmp_log(action_guard.name(), &irq, &desc, &e);
+
                 return Err(self.handle_bus_unlock_error(
                     e,
                     desc.clone(),
@@ -351,16 +358,26 @@ impl IrqManager {
                 .internal_state()
                 .contains(IrqDescState::IRQS_NMI)
             {
-                error!(
-                    "Invalid attempt to share NMI for {} (irq {}) on irqchip {}",
-                    action_guard.name(),
-                    irq.data(),
-                    desc_inner_guard
-                        .irq_data()
-                        .chip_info_read_irqsave()
-                        .chip()
-                        .name()
-                );
+                #[inline(never)]
+                fn __tmp_log(
+                    name: &str,
+                    irq: &IrqNumber,
+                    desc_inner_guard: &SpinLockGuard<'_, InnerIrqDesc>,
+                ) {
+                    error!(
+                        "Invalid attempt to share NMI for {} (irq {}) on irqchip {}",
+                        name,
+                        irq.data(),
+                        desc_inner_guard
+                            .irq_data()
+                            .chip_info_read_irqsave()
+                            .chip()
+                            .name()
+                    );
+                }
+
+                __tmp_log(action_guard.name(), &irq, &desc_inner_guard);
+
                 return Err(self.handle_unlock_error(
                     SystemError::EINVAL,
                     desc_inner_guard,
@@ -392,14 +409,14 @@ impl IrqManager {
                 || ((old_guard.flags().bitxor(*action_guard.flags()))
                     .contains(IrqHandleFlags::IRQF_ONESHOT))
             {
-                debug!(
-                    "Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}",
-                    irq.data(),
-                    action_guard.name(),
-                    action_guard.flags(),
-                    old_guard.name(),
-                    old_guard.flags()
-                );
+                // debug!(
+                //     "Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}",
+                //     irq.data(),
+                //     action_guard.name(),
+                //     action_guard.flags(),
+                //     old_guard.name(),
+                //     old_guard.flags()
+                // );
 
                 return Err(self.__inner_setup_irq_handle_mismatch_error(
                     old_guard,
@@ -414,12 +431,12 @@ impl IrqManager {
             if *old_guard.flags() & IrqHandleFlags::IRQF_PERCPU
                 != *action_guard.flags() & IrqHandleFlags::IRQF_PERCPU
             {
-                debug!(
-                    "Per-cpu mismatch for irq {} (name: {}, flags: {:?})",
-                    irq.data(),
-                    action_guard.name(),
-                    action_guard.flags()
-                );
+                // debug!(
+                //     "Per-cpu mismatch for irq {} (name: {}, flags: {:?})",
+                //     irq.data(),
+                //     action_guard.name(),
+                //     action_guard.flags()
+                // );
                 return Err(self.__inner_setup_irq_handle_mismatch_error(
                     old_guard,
                     desc_inner_guard,
@@ -451,11 +468,16 @@ impl IrqManager {
             // 因为我们不能确定这个中断实际上具有什么类型。
             // 由于底层芯片实现可能会覆盖它们，所以类型标志并不可靠.
 
-            error!(
+            #[inline(never)]
+            fn __tmp_log(irq: &IrqNumber, name: &str) {
+                error!(
                 "Requesting irq {} without a handler, and ONESHOT flags not set for irqaction: {}",
-                irq.data(),
-                action_guard.name()
-            );
+                    irq.data(),
+                    name,
+                );
+            }
+
+            __tmp_log(&irq, action_guard.name());
             return Err(self.handle_unlock_error(
                 SystemError::EINVAL,
                 desc_inner_guard,
@@ -473,13 +495,13 @@ impl IrqManager {
                 if let Err(e) =
                     self.do_set_irq_trigger(desc.clone(), &mut desc_inner_guard, trigger_type)
                 {
-                    debug!(
-                        "Failed to set trigger type for irq {} (name: {}, flags: {:?}), error {:?}",
-                        irq.data(),
-                        action_guard.name(),
-                        action_guard.flags(),
-                        e
-                    );
+                    // debug!(
+                    //     "Failed to set trigger type for irq {} (name: {}, flags: {:?}), error {:?}",
+                    //     irq.data(),
+                    //     action_guard.name(),
+                    //     action_guard.flags(),
+                    //     e
+                    // );
                     return Err(self.handle_unlock_error(
                         e,
                         desc_inner_guard,
@@ -489,16 +511,16 @@ impl IrqManager {
                     ));
                 }
             }
-            debug!("to irq_activate");
+            // debug!("to irq_activate");
             // 激活中断。这种激活必须独立于IRQ_NOAUTOEN进行*desc_inner_guard.internal_state_mut() |= IrqDescState::IRQS_NOREQUEST;uest.
             if let Err(e) = self.irq_activate(&desc, &mut desc_inner_guard) {
-                debug!(
-                    "Failed to activate irq {} (name: {}, flags: {:?}), error {:?}",
-                    irq.data(),
-                    action_guard.name(),
-                    action_guard.flags(),
-                    e
-                );
+                // debug!(
+                //     "Failed to activate irq {} (name: {}, flags: {:?}), error {:?}",
+                //     irq.data(),
+                //     action_guard.name(),
+                //     action_guard.flags(),
+                //     e
+                // );
                 return Err(self.handle_unlock_error(
                     e,
                     desc_inner_guard,
@@ -559,11 +581,15 @@ impl IrqManager {
                 static mut WARNED: bool = false;
                 if action_guard.flags().contains(IrqHandleFlags::IRQF_SHARED) && unsafe { !WARNED }
                 {
-                    warn!(
-                        "Shared interrupt {} for {} requested but not auto enabled",
-                        irq.data(),
-                        action_guard.name()
-                    );
+                    #[inline(never)]
+                    fn __tmp_warn_shared_interrupt(irq: &IrqNumber, name: &str) {
+                        warn!(
+                            "Shared interrupt {} for {} requested but not auto enabled",
+                            irq.data(),
+                            name
+                        );
+                    }
+                    __tmp_warn_shared_interrupt(&irq, action_guard.name());
                     unsafe { WARNED = true };
                 }
 
@@ -573,7 +599,16 @@ impl IrqManager {
             let new_trigger_type = action_guard.flags().trigger_type();
             let old_trigger_type = desc_inner_guard.common_data().trigger_type();
             if new_trigger_type != old_trigger_type {
-                warn!("Irq {} uses trigger type: {old_trigger_type:?}, but requested trigger type: {new_trigger_type:?}.", irq.data());
+                #[inline(never)]
+                fn ___tmp_log_irq_line_status_change(
+                    old_trigger_type: IrqLineStatus,
+                    new_trigger_type: IrqLineStatus,
+                    irq: &IrqNumber,
+                ) {
+                    warn!("Irq {} uses trigger type: {old_trigger_type:?}, but requested trigger type: {new_trigger_type:?}.", irq.data());
+                }
+
+                ___tmp_log_irq_line_status_change(old_trigger_type, new_trigger_type, &irq);
             }
         }
 
@@ -599,7 +634,26 @@ impl IrqManager {
         drop(action_guard);
         self.wake_up_and_wait_for_irq_thread_ready(&desc, Some(action.clone()));
         self.wake_up_and_wait_for_irq_thread_ready(&desc, action.inner().secondary());
-        return Ok(());
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn inner_setup_irq(
+        &self,
+        irq: IrqNumber,
+        action: Arc<IrqAction>,
+        desc: Arc<IrqDesc>,
+    ) -> Result<(), SystemError> {
+        if Arc::ptr_eq(
+            &desc.irq_data().chip_info_read_irqsave().chip(),
+            &no_irq_chip(),
+        ) {
+            return Err(SystemError::ENOSYS);
+        }
+        let action_guard = action.inner();
+
+        let action_guard = self.prepare_irq_setup(action_guard, irq, &desc)?;
+        self.finalize_irq_setup(action_guard, irq, action.clone(), desc)
     }
 
     /// 唤醒中断线程并等待中断线程准备好
@@ -659,6 +713,7 @@ impl IrqManager {
         self.irq_startup(desc, desc_inner_guard, resend, Self::IRQ_START_FORCE)
     }
 
+    #[inline(never)]
     pub(super) fn irq_activate(
         &self,
         _desc: &Arc<IrqDesc>,

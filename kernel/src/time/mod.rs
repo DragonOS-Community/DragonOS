@@ -100,10 +100,6 @@ impl PosixTimeSpec {
     pub fn total_nanos(&self) -> i64 {
         self.tv_sec * 1000000000 + self.tv_nsec
     }
-
-    pub fn ext4_time(&self) -> u32 {
-        self.tv_sec.max(0).min(u32::MAX as i64) as u32
-    }
 }
 
 impl Sub for PosixTimeSpec {

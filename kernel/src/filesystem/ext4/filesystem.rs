@@ -97,7 +97,7 @@ impl FileSystemMakerData for Ext4MountData {
 }
 
 impl Ext4MountData {
-    pub fn form_source(path: &str) -> Result<Self, SystemError> {
+    fn from_source(path: &str) -> Result<Self, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), path)?;
         let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;

@@ -20,7 +20,6 @@ use crate::{
             block::{
                 block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
                 disk_info::Partition,
-                gendisk::GenDisk,
                 manager::{block_dev_manager, BlockDevMeta},
             },
             class::Class,
@@ -42,7 +41,7 @@ use crate::{
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
+        devfs::{DevFS, DeviceINode},
         kernfs::KernFSInode,
         mbr::MbrDiskPartionTable,
         vfs::{syscall::ModeType, IndexNode, Metadata},
@@ -87,23 +86,6 @@ pub fn virtio_blk(
         virtio_device_manager()
             .device_add(device.clone() as Arc<dyn VirtIODevice>)
             .expect("Add virtio blk failed");
-        // devfs_register(device.dev_name(), device.clone()).unwrap();
-        // device_register(device).unwrap();
-        let meta = device.blkdev_meta().inner();
-        for (idx, disk) in meta.gendisks.iter() {
-            // log::info!("registering {}", idx);
-            if idx == &GenDisk::ENTIRE_DISK_IDX {
-                // log::info!("Registering entire disk: {}", device.dev_name());
-                devfs_register(format!("{}", device.dev_name()).as_str(), disk.clone()).unwrap();
-            } else {
-                // log::info!("Registering partition {}: {}", idx, device.dev_name());
-                devfs_register(
-                    format!("{}{}", device.dev_name(), idx).as_str(),
-                    disk.clone(),
-                )
-                .unwrap();
-            }
-        }
     }
 }
 
@@ -267,7 +249,7 @@ impl IndexNode for VirtIOBlkDevice {
         _buf: &[u8],
         _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EACCES)
+        Err(SystemError::EPERM)
     }
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
         todo!()

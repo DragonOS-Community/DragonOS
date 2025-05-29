@@ -29,6 +29,7 @@ pub struct GenDisk {
 
     fs: RwLock<Weak<DevFS>>,
     metadata: Metadata,
+    /// 对应/dev/下的设备名
     name: DName,
 }
 
@@ -43,6 +44,11 @@ impl GenDisk {
         dev_name: &DevName,
     ) -> Arc<Self> {
         let bsizelog2 = bdev.upgrade().unwrap().blk_size_log2();
+        let name = match idx {
+            Some(Self::ENTIRE_DISK_IDX) => DName::from(dev_name.name()),
+            Some(idx) => DName::from(format!("{}{}", dev_name.name(), idx)),
+            None => DName::from(dev_name.name()),
+        };
 
         return Arc::new(GenDisk {
             bdev,
@@ -54,7 +60,7 @@ impl GenDisk {
                 crate::filesystem::vfs::FileType::BlockDevice,
                 ModeType::from_bits_truncate(0o755),
             ),
-            name: DName::from(format!("{}{}", dev_name.name(), dev_name.id())),
+            name,
         });
     }
 
@@ -191,7 +197,7 @@ impl IndexNode for GenDisk {
         _buf: &[u8],
         _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EACCES)
+        Err(SystemError::EPERM)
     }
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
         todo!()

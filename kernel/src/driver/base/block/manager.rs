@@ -7,7 +7,7 @@ use unified_init::macros::unified_init;
 
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::DevName},
-    filesystem::mbr::MbrDiskPartionTable,
+    filesystem::{devfs::devfs_register, mbr::MbrDiskPartionTable, vfs::IndexNode},
     init::initcall::INITCALL_POSTCORE,
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
@@ -85,7 +85,7 @@ impl BlockDevManager {
         let mbr = MbrDiskPartionTable::from_disk(dev.clone())?;
         let piter = mbr.partitions_raw();
         for p in piter {
-            self.register_gendisk_with_range(dev, p.try_into()?, dev.dev_name())?;
+            self.register_gendisk_with_range(dev, p.try_into()?)?;
         }
         Ok(())
     }
@@ -96,21 +96,20 @@ impl BlockDevManager {
         dev: &Arc<dyn BlockDevice>,
     ) -> Result<(), SystemError> {
         let range = dev.disk_range();
-        self.register_gendisk_with_range(dev, range, dev.dev_name())
+        self.register_gendisk_with_range(dev, range)
     }
 
     fn register_gendisk_with_range(
         &self,
         dev: &Arc<dyn BlockDevice>,
         range: GeneralBlockRange,
-        dev_name: &DevName,
     ) -> Result<(), SystemError> {
         let weak_dev = Arc::downgrade(dev);
         let gendisk = GenDisk::new(
             weak_dev,
             range,
             Some(dev.blkdev_meta().inner().gendisks.alloc_idx()),
-            dev_name,
+            dev.dev_name(),
         );
         self.register_gendisk(dev, gendisk)
     }
@@ -132,6 +131,11 @@ impl BlockDevManager {
         dev.callback_gendisk_registered(&gendisk).inspect_err(|_| {
             meta_inner.gendisks.remove(&idx);
         })?;
+
+        // 注册到devfs
+        for disk in meta_inner.gendisks.values() {
+            devfs_register(disk.dname()?.as_ref(), disk.clone())?;
+        }
         Ok(())
     }
 

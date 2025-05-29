@@ -4,6 +4,7 @@ use crate::{
         vfs::{self, syscall::ModeType, FilePrivateData, IndexNode, InodeId},
     },
     libs::spinlock::SpinLockGuard,
+    time::PosixTimeSpec,
 };
 use alloc::{
     string::String,
@@ -57,7 +58,7 @@ impl IndexNode for Ext4Inode {
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         let buf = &mut buf[0..len];
-        if let Some(page_cache) = self.page_cache.clone() {
+        if let Some(page_cache) = &self.page_cache {
             let time = crate::time::PosixTimeSpec::now()
                 .tv_sec
                 .to_u32()
@@ -116,7 +117,7 @@ impl IndexNode for Ext4Inode {
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         let buf = &buf[0..len];
-        if let Some(page_cache) = self.page_cache.clone() {
+        if let Some(page_cache) = &self.page_cache {
             let write_len = page_cache.lock_irqsave().write(offset, buf)?;
             let old_file_size = self.concret_fs().getattr(self.inode)?.size;
             let current_file_size = core::cmp::max(old_file_size, (offset + write_len) as u64);
@@ -271,16 +272,20 @@ impl IndexNode for Ext4Inode {
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
         use another_ext4::InodeMode;
         let mode = metadata.mode.union(ModeType::from(metadata.file_type));
+
+        let to_ext4_time =
+            |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };
+
         self.concret_fs().setattr(
             self.inode,
             Some(InodeMode::from_bits_truncate(mode.bits() as u16)),
             Some(metadata.uid as u32),
             Some(metadata.gid as u32),
             Some(metadata.size as u64),
-            Some(metadata.atime.ext4_time()),
-            Some(metadata.mtime.ext4_time()),
-            Some(metadata.ctime.ext4_time()),
-            Some(metadata.btime.ext4_time()),
+            Some(to_ext4_time(&metadata.atime)),
+            Some(to_ext4_time(&metadata.mtime)),
+            Some(to_ext4_time(&metadata.ctime)),
+            Some(to_ext4_time(&metadata.btime)),
         )?;
 
         Ok(())

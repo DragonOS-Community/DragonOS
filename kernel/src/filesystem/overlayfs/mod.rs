@@ -32,7 +32,7 @@ pub struct OverlayMountData {
 }
 
 impl OverlayMountData {
-    pub fn from_row(raw_data: *const u8) -> Result<Self, SystemError> {
+    pub fn from_raw(raw_data: *const u8) -> Result<Self, SystemError> {
         if raw_data.is_null() {
             return Err(SystemError::EINVAL);
         }

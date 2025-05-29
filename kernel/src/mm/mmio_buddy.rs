@@ -1,4 +1,3 @@
-use crate::libs::align::{page_align_down, page_align_up};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::{PAGE_1G_SHIFT, PAGE_4K_SHIFT};
@@ -665,22 +664,8 @@ impl MMIOSpaceGuard {
     /// 传入的物理地址【一定要是设备的物理地址】。
     /// 如果物理地址是从内存分配器中分配的，那么会造成内存泄露。因为mmio_release的时候，只取消映射，不会释放内存。
     pub unsafe fn map_phys(&self, paddr: PhysAddr, length: usize) -> Result<(), SystemError> {
-        if length > self.size {
-            return Err(SystemError::EINVAL);
-        }
-
-        let check = self
-            .mapped
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        if check.is_err() {
-            return Err(SystemError::EINVAL);
-        }
-
         let flags = EntryFlags::mmio_flags();
-
-        let mut kernel_mapper = KernelMapper::lock();
-        let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
-        return r;
+        self.map_phys_with_flags(paddr, length, flags)
     }
 
     /// 将物理地址填写到虚拟地址空间中
@@ -707,43 +692,7 @@ impl MMIOSpaceGuard {
         }
 
         let mut kernel_mapper = KernelMapper::lock();
-        let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
-        return r;
-    }
-
-    /// # map_any_phys - 将任意物理地址映射到虚拟地址
-    ///
-    /// 将指定的物理地址和长度映射到虚拟地址空间。
-    ///
-    /// ## 参数
-    ///
-    /// - `paddr`: 物理地址，需要被映射的起始地址。
-    /// - `length`: 要映射的物理地址长度。
-    ///
-    /// ## 返回值
-    /// - `Ok(VirtAddr)`: 映射成功，返回虚拟地址的起始地址。
-    /// - `Err(SystemError)`: 映射失败，返回系统错误。
-    ///
-    /// ## 副作用
-    ///
-    /// 该函数会修改虚拟地址空间，将物理地址映射到虚拟地址。
-    ///
-    /// ## Safety
-    ///
-    /// 由于该函数涉及到内存操作，因此它是非安全的。确保在调用该函数时，你传入的物理地址是正确的。
-    #[allow(dead_code)]
-    pub unsafe fn map_any_phys(
-        &self,
-        paddr: PhysAddr,
-        length: usize,
-    ) -> Result<VirtAddr, SystemError> {
-        let paddr_base = PhysAddr::new(page_align_down(paddr.data()));
-        let offset = paddr - paddr_base;
-        let vaddr_base = self.vaddr;
-        let vaddr = vaddr_base + offset;
-
-        self.map_phys(paddr_base, page_align_up(length + offset))?;
-        return Ok(vaddr);
+        kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true)
     }
 
     /// 泄露一个MMIO space guard，不会释放映射的空间

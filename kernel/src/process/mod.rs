@@ -54,7 +54,7 @@ use crate::{
         percpu::{PerCpu, PerCpuVar},
         set_IDLE_PROCESS_ADDRESS_SPACE,
         ucontext::AddressSpace,
-        VirtAddr,
+        PhysAddr, VirtAddr,
     },
     namespaces::{mnt_namespace::FsStruct, pid_namespace::PidStrcut, NsProxy},
     net::socket::SocketInode,
@@ -1571,24 +1571,140 @@ impl ProcessSchedulerInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KernelStack {
     stack: Option<AlignedBox<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>>,
     /// 标记该内核栈是否可以被释放
-    can_be_freed: bool,
+    ty: KernelStackType,
+}
+
+#[derive(Debug)]
+pub enum KernelStackType {
+    KernelSpace(VirtAddr, PhysAddr),
+    Static,
+    Dynamic,
+}
+
+unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
+    use crate::arch::MMArch;
+    use crate::mm::allocator::page_frame::{allocate_page_frames, PageFrameCount};
+    use crate::mm::kernel_mapper::KernelMapper;
+    use crate::mm::page::EntryFlags;
+    use crate::mm::MemoryManagementArch;
+
+    // Layout
+    // ---------------
+    // | KernelStack |
+    // | guard page  | size == KernelStack::SIZE
+    // | KernelStack |
+    // | guard page  |
+    // | ..........  |
+    // ---------------
+
+    let need_size = KernelStack::SIZE * 2;
+    let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
+
+    let (paddr, _count) = allocate_page_frames(page_num).expect("kernel stack alloc failed");
+
+    let guard_vaddr = MMArch::phys_2_virt(paddr).unwrap();
+    let kstack_paddr = paddr + KernelStack::SIZE;
+    let kstack_vaddr = guard_vaddr + KernelStack::SIZE;
+
+    core::ptr::write_bytes(kstack_vaddr.data() as *mut u8, 0, KernelStack::SIZE);
+
+    let guard_flags = EntryFlags::new();
+
+    let mut kernel_mapper = KernelMapper::lock();
+    let kernel_mapper = kernel_mapper.as_mut().unwrap();
+
+    for i in 0..KernelStack::SIZE / MMArch::PAGE_SIZE {
+        let guard_page_vaddr = guard_vaddr + i * MMArch::PAGE_SIZE;
+        // Map the guard page
+        let flusher = kernel_mapper.remap(guard_page_vaddr, guard_flags).unwrap();
+        flusher.flush();
+    }
+
+    // todo!(why?)
+    unsafe {
+        let guard_ptr = (kstack_vaddr.data() - 8) as *mut usize;
+        guard_ptr.write(0xfff); // Invalid
+        let guard_ptr = guard_vaddr.data() as *mut usize;
+        guard_ptr.write(0xfff); // Invalid
+    }
+
+    // Don't need to remap the kernel stack page, because it is already mapped
+
+    // let kstack_flags = EntryFlags::new().set_write(true).set_execute(true);
+    // let flusher = kernel_mapper.remap(kstack_vaddr, kstack_flags).unwrap();
+    // flusher.flush();
+
+    log::error!(
+        "[kernel stack alloc]: virt: {:#x}, phy: {:#x}",
+        kstack_vaddr.data(),
+        kstack_paddr.data()
+    );
+    (guard_vaddr, paddr)
+}
+
+unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr) {
+    use crate::arch::mm::kernel_page_flags;
+    use crate::arch::MMArch;
+    use crate::mm::allocator::page_frame::{deallocate_page_frames, PageFrameCount, PhysPageFrame};
+    use crate::mm::kernel_mapper::KernelMapper;
+    use crate::mm::MemoryManagementArch;
+
+    let need_size = KernelStack::SIZE * 2;
+    let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
+
+    log::error!(
+        "[kernel stack dealloc]: virt: {:#x}, phy: {:#x}",
+        vaddr.data(),
+        paddr.data()
+    );
+
+    let mut kernel_mapper = KernelMapper::lock();
+    let kernel_mapper = kernel_mapper.as_mut().unwrap();
+
+    // restore the guard page flags
+    for i in 0..KernelStack::SIZE / MMArch::PAGE_SIZE {
+        let guard_page_vaddr = vaddr + i * MMArch::PAGE_SIZE;
+
+        let flusher = kernel_mapper
+            .remap(guard_page_vaddr, kernel_page_flags(vaddr))
+            .unwrap();
+        flusher.flush();
+    }
+
+    // release the physical page
+    unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), page_num) };
 }
 
 impl KernelStack {
-    pub const SIZE: usize = 0x8000;
-    pub const ALIGN: usize = 0x8000;
+    pub const SIZE: usize = 0x4000;
+    pub const ALIGN: usize = 0x4000;
 
     pub fn new() -> Result<Self, SystemError> {
-        return Ok(Self {
-            stack: Some(
-                AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
-            ),
-            can_be_freed: true,
-        });
+        if cfg!(feature = "kstack_protect") {
+            unsafe {
+                let (kstack_vaddr, kstack_paddr) = alloc_from_kernel_space();
+                let real_kstack_vaddr = kstack_vaddr + KernelStack::SIZE;
+                Ok(Self {
+                    stack: Some(
+                        AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_unchecked(
+                            real_kstack_vaddr.data() as *mut [u8; KernelStack::SIZE],
+                        ),
+                    ),
+                    ty: KernelStackType::KernelSpace(kstack_vaddr, kstack_paddr),
+                })
+            }
+        } else {
+            Ok(Self {
+                stack: Some(
+                    AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
+                ),
+                ty: KernelStackType::Dynamic,
+            })
+        }
     }
 
     /// 根据已有的空间，构造一个内核栈结构体
@@ -1599,14 +1715,14 @@ impl KernelStack {
             return Err(SystemError::EFAULT);
         }
 
-        return Ok(Self {
+        Ok(Self {
             stack: Some(
                 AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_unchecked(
                     base.data() as *mut [u8; KernelStack::SIZE],
                 ),
             ),
-            can_be_freed: false,
-        });
+            ty: KernelStackType::Static,
+        })
     }
 
     /// 返回内核栈的起始虚拟地址(低地址)
@@ -1683,10 +1799,20 @@ impl Drop for KernelStack {
                 drop(pcb_ptr);
             }
         }
-        // 如果该内核栈不可以被释放，那么，这里就forget，不调用AlignedBox的drop函数
-        if !self.can_be_freed {
-            let bx = self.stack.take();
-            core::mem::forget(bx);
+        match self.ty {
+            KernelStackType::KernelSpace(kstack_virt_addr, kstack_phy_addr) => {
+                // 释放内核栈
+                unsafe {
+                    dealloc_from_kernel_space(kstack_virt_addr, kstack_phy_addr);
+                }
+                let bx = self.stack.take();
+                core::mem::forget(bx);
+            }
+            KernelStackType::Static => {
+                let bx = self.stack.take();
+                core::mem::forget(bx);
+            }
+            KernelStackType::Dynamic => {}
         }
     }
 }

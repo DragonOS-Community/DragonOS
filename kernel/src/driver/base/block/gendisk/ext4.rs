@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use kdepends::another_ext4;
 
 impl super::GenDisk {
     fn convert_from_ext4_blkid(&self, ext4_blkid: u64) -> (usize, usize, usize) {

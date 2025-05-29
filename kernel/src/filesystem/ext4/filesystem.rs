@@ -11,6 +11,7 @@ use crate::mm::VmFaultReason;
 use crate::process::ProcessManager;
 use crate::register_mountable_fs;
 use alloc::sync::{Arc, Weak};
+use kdepends::another_ext4;
 use linkme::distributed_slice;
 use system_error::SystemError;
 
@@ -33,7 +34,7 @@ impl FileSystem for Ext4FileSystem {
     }
 
     fn name(&self) -> &str {
-        "Ext4"
+        "ext4"
     }
 
     fn super_block(&self) -> vfs::SuperBlock {

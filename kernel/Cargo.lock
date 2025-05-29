@@ -502,7 +502,6 @@ name = "dragonos_kernel"
 version = "0.1.10"
 dependencies = [
  "acpi",
- "another_ext4",
  "asm_macros",
  "atomic_enum",
  "bit_field",
@@ -841,6 +840,7 @@ version = "0.1.0"
 name = "kdepends"
 version = "0.1.0"
 dependencies = [
+ "another_ext4",
  "crc",
  "memoffset",
  "ringbuffer",
@@ -1684,7 +1684,7 @@ version = "0.1.0"
 name = "system_error"
 version = "0.1.0"
 dependencies = [
- "another_ext4",
+ "kdepends",
  "num-derive",
  "num-traits 0.2.15",
 ]

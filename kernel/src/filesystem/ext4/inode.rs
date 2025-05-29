@@ -10,8 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use another_ext4;
-use another_ext4::FileType;
+use kdepends::another_ext4::{self, FileType};
 use core::fmt::Debug;
 use num::ToPrimitive;
 use system_error::SystemError;

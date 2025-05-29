@@ -1,8 +1,8 @@
 use super::super::signal_types::{SigInfo, SigType};
 use crate::{
-    alloc::vec::Vec, // 添加 Vec
+    alloc::vec::Vec,
     arch::ipc::signal::{SigCode, Signal},
-    arch::syscall::nr::SYS_RESTART_SYSCALL, // 请确认实际的系统调用号
+    arch::syscall::nr::SYS_RESTART_SYSCALL,
     process::{Pid, ProcessManager},
     syscall::table::{FormattedSyscallParam, Syscall},
 };

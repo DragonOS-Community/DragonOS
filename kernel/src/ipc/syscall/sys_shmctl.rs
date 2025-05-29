@@ -5,7 +5,7 @@ use crate::{
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use syscall_table_macros::declare_syscall;
-use system_error::SystemError; // Added Vec
+use system_error::SystemError;
 
 pub struct SysShmctlHandle;
 /// # SYS_SHMCTL系统调用函数，用于管理共享内存段

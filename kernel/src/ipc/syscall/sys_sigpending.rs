@@ -13,6 +13,7 @@ use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
 
 pub struct SysSigpendingHandle;
+
 #[inline(never)]
 pub(super) fn do_kernel_rt_sigpending(
     user_sigset_ptr: usize,
@@ -39,7 +40,6 @@ pub(super) fn do_kernel_rt_sigpending(
 
     Ok(0)
 }
-impl SysSigpendingHandle {}
 
 impl Syscall for SysSigpendingHandle {
     fn num_args(&self) -> usize {
@@ -52,7 +52,24 @@ impl Syscall for SysSigpendingHandle {
         ]
     }
     fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
-        do_kernel_rt_sigpending(args[0], args[1])
+        let user_sigset = SysSigpendingHandle::user_sigset_ptr(args);
+        let size = SysSigpendingHandle::sigsetsize(args);
+
+        do_kernel_rt_sigpending(user_sigset, size)
+    }
+}
+
+impl SysSigpendingHandle {
+    #[inline(always)]
+    fn user_sigset_ptr(args: &[usize]) -> usize {
+        // 第一个参数是用户空间信号集的指针
+        args[0]
+    }
+
+    #[inline(always)]
+    fn sigsetsize(args: &[usize]) -> usize {
+        // 第二个参数是 sigset_t 的大小
+        args[1]
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::alloc::vec::Vec; // 确保 Vec 已导入
+use crate::alloc::vec::Vec;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMAT,

@@ -1,33 +1,22 @@
-use core::{
-    ffi::{c_int, c_void},
+use super::super::signal_types::{
+    SaHandlerType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL, USER_SIG_ERR,
+    USER_SIG_IGN,
 };
-use log::{error};
-use system_error::SystemError;
-use crate::{
-    arch::{
-        ipc::signal::{SigFlags, SigSet, Signal},
-
-    },
-    mm::{
-        VirtAddr,
-    },
-    process::{ ProcessManager},
-    syscall::{
-        user_access::{UserBufferWriter},
-    },
-};
-use super::super::{
-    signal_types::{
-        SaHandlerType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
-        USER_SIG_ERR, USER_SIG_IGN,
-    },
-};
-use alloc::vec::Vec;
 use crate::arch::syscall::nr::SYS_RT_SIGACTION;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use crate::{
+    arch::ipc::signal::{SigFlags, SigSet, Signal},
+    mm::VirtAddr,
+    process::ProcessManager,
+    syscall::user_access::UserBufferWriter,
+};
+use alloc::vec::Vec;
+use core::ffi::{c_int, c_void};
+use log::error;
+use system_error::SystemError;
 pub struct SysSigactionHandle;
-impl SysSigactionHandle{
-        #[inline(always)]
+impl SysSigactionHandle {
+    #[inline(always)]
     fn sig(args: &[usize]) -> c_int {
         // 第一个参数是信号值
         args[0] as c_int
@@ -35,14 +24,14 @@ impl SysSigactionHandle{
     #[inline(always)]
     fn act(args: &[usize]) -> usize {
         // 第二个参数是用户空间传入的 Sigaction 指针
-        args[1] 
+        args[1]
     }
-    #[inline(always)]    
-       fn old_act(args: &[usize]) -> usize {
+    #[inline(always)]
+    fn old_act(args: &[usize]) -> usize {
         // 第三个参数是用户空间传入的用来保存旧 Sigaction 的指针
-        args[2] 
-       }
-        /// 通用信号注册函数
+        args[2]
+    }
+    /// 通用信号注册函数
     ///
     /// ## 参数
     ///
@@ -52,7 +41,7 @@ impl SysSigactionHandle{
     /// - `from_user` 用来标识这个函数调用是否来自用户空间
     ///
     /// @return int 错误码
- #[no_mangle]
+    #[no_mangle]
     fn do_kernel_sigaction(
         sig: c_int,
         new_act: usize,
@@ -180,19 +169,19 @@ impl Syscall for SysSigactionHandle {
     }
 
     #[no_mangle]
-    fn handle(&self, args: &[usize],from_user:bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], from_user: bool) -> Result<usize, SystemError> {
         let sig = Self::sig(args);
         let act = Self::act(args);
         let old_act = Self::old_act(args);
 
-        Self::do_kernel_sigaction(sig, act, old_act,from_user)
+        Self::do_kernel_sigaction(sig, act, old_act, from_user)
     }
-       fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
+    fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-             FormattedSyscallParam::new("sig", format!("{}", Self::sig(args))),
+            FormattedSyscallParam::new("sig", format!("{}", Self::sig(args))),
             FormattedSyscallParam::new("act", format!("{:#x}", Self::act(args))),
-            FormattedSyscallParam  ::new("old_act", format!("{:#x}", Self::old_act(args))),
+            FormattedSyscallParam::new("old_act", format!("{:#x}", Self::old_act(args))),
         ]
     }
 }
-    syscall_table_macros::declare_syscall!(SYS_RT_SIGACTION, SysSigactionHandle);
+syscall_table_macros::declare_syscall!(SYS_RT_SIGACTION, SysSigactionHandle);

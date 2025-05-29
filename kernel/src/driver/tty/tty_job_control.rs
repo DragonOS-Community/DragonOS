@@ -5,9 +5,7 @@ use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
     process::{process_group::Pgid, Pid, ProcessFlags, ProcessManager},
-    syscall::{
-        user_access::{UserBufferReader, UserBufferWriter},
-    },
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::tty_core::{TtyCore, TtyIoctlCmd};

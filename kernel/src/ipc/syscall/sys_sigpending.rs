@@ -1,4 +1,5 @@
 use crate::{
+    alloc::vec::Vec, // 添加 Vec
     arch::ipc::signal::SigSet,
     arch::syscall::nr::SYS_RT_SIGPENDING, // 请确认实际的系统调用号
     process::ProcessManager,
@@ -6,7 +7,6 @@ use crate::{
         table::{FormattedSyscallParam, Syscall},
         user_access::UserBufferWriter,
     },
-    alloc::vec::Vec, // 添加 Vec
 };
 use core::mem::size_of;
 use syscall_table_macros::declare_syscall;
@@ -15,8 +15,11 @@ use system_error::SystemError;
 pub struct SysSigpendingHandle;
 
 impl SysSigpendingHandle {
-       #[inline(never)]
-    fn do_kernel_rt_sigpending(user_sigset_ptr: usize, sigsetsize: usize) -> Result<usize, SystemError> {
+    #[inline(never)]
+    fn do_kernel_rt_sigpending(
+        user_sigset_ptr: usize,
+        sigsetsize: usize,
+    ) -> Result<usize, SystemError> {
         if sigsetsize != size_of::<SigSet>() {
             return Err(SystemError::EINVAL);
         }

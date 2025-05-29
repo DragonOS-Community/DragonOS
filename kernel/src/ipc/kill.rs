@@ -1,8 +1,8 @@
-use crate::process::{Pid, ProcessManager, process_group::Pgid};
-use crate::arch::ipc::signal::{Signal, SigCode}; // Adjust path as needed
+use crate::arch::ipc::signal::{SigCode, Signal}; // Adjust path as needed
 use crate::ipc::signal_types::{SigInfo, SigType}; // Adjust path as needed
-use system_error::SystemError;
+use crate::process::{process_group::Pgid, Pid, ProcessManager};
 use core::sync::atomic::compiler_fence;
+use system_error::SystemError;
 
 /// ### 杀死一个进程
 pub fn kill_process(pid: Pid, sig: Signal) -> Result<usize, SystemError> {

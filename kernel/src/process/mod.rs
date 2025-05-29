@@ -67,7 +67,7 @@ use crate::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
-    syscall::{user_access::clear_user},
+    syscall::user_access::clear_user,
 };
 use timer::AlarmTimer;
 

@@ -1,13 +1,13 @@
-use crate::{
-    ipc::shm::{shm_manager_lock, ShmFlags, ShmKey, IPC_PRIVATE},
-    syscall::table::Syscall ,
-    arch::syscall::nr::SYS_SHMGET,
-};
-use syscall_table_macros::declare_syscall;
-use system_error::SystemError;
-use log::error;
 use crate::alloc::vec::Vec;
 use crate::syscall::table::FormattedSyscallParam;
+use crate::{
+    arch::syscall::nr::SYS_SHMGET,
+    ipc::shm::{shm_manager_lock, ShmFlags, ShmKey, IPC_PRIVATE},
+    syscall::table::Syscall,
+};
+use log::error;
+use syscall_table_macros::declare_syscall;
+use system_error::SystemError;
 pub struct SysShmgetHandle;
 
 impl SysShmgetHandle {
@@ -31,7 +31,7 @@ impl SysShmgetHandle {
         // In the old code: ShmFlags::from_bits_truncate(args[2] as u32)
         ShmFlags::from_bits_truncate(args[2] as u32)
     }
-     /// # SYS_SHMGET系统调用函数，用于获取共享内存
+    /// # SYS_SHMGET系统调用函数，用于获取共享内存
     ///
     /// ## 参数
     ///
@@ -43,7 +43,7 @@ impl SysShmgetHandle {
     ///
     /// 成功：共享内存id
     /// 失败：错误码
-     fn do_kernel_shmget(key: ShmKey, size: usize, shmflg: ShmFlags) -> Result<usize, SystemError> {
+    fn do_kernel_shmget(key: ShmKey, size: usize, shmflg: ShmFlags) -> Result<usize, SystemError> {
         // 暂不支持巨页
         if shmflg.contains(ShmFlags::SHM_HUGETLB) {
             error!("shmget: not support huge page");
@@ -83,8 +83,7 @@ impl Syscall for SysShmgetHandle {
         3 // key, size, shmflg
     }
 
-
-    fn handle(&self, args: &[usize],_from_user:bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
         let key = Self::key(args);
         let size = Self::size(args);
         let shmflg = Self::shmflg(args);
@@ -93,9 +92,9 @@ impl Syscall for SysShmgetHandle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("key", format!("{}",Self::key(args).data())),
+            FormattedSyscallParam::new("key", format!("{}", Self::key(args).data())),
             // 使用 format! 宏将 usize 类型的 size 转换为 String
-            FormattedSyscallParam::new("size",  format!("{}", Self::size(args))),
+            FormattedSyscallParam::new("size", format!("{}", Self::size(args))),
             FormattedSyscallParam::new("shmflg", format!("{:#x}", Self::shmflg(args).bits())),
         ]
     }

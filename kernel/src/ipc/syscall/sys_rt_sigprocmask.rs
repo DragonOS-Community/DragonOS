@@ -1,20 +1,20 @@
+use crate::alloc::vec::Vec;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
+    arch::syscall::nr::SYS_RT_SIGPROCMASK,
     ipc::signal::{set_sigprocmask, SigHow},
+    mm::VirtAddr,
     syscall::{
-        table::{Syscall, FormattedSyscallParam}, // 添加 FormattedSyscallParam
+        table::{FormattedSyscallParam, Syscall}, // 添加 FormattedSyscallParam
         user_access::{UserBufferReader, UserBufferWriter},
     },
-    mm::VirtAddr,
-    arch::syscall::nr::SYS_RT_SIGPROCMASK,
 };
 use core::mem::size_of;
 use syscall_table_macros::declare_syscall;
-use system_error::SystemError;
-use crate::alloc::vec::Vec; // 添加 Vec
+use system_error::SystemError; // 添加 Vec
 
 pub struct SysRtSigprocmaskHandle;
-impl SysRtSigprocmaskHandle{
+impl SysRtSigprocmaskHandle {
     #[inline(always)]
     fn how(args: &[usize]) -> i32 {
         // 第一个参数是 how
@@ -22,7 +22,7 @@ impl SysRtSigprocmaskHandle{
     }
 
     #[inline(always)]
-    fn nset(args: &[usize]) ->usize {
+    fn nset(args: &[usize]) -> usize {
         // 第二个参数是新信号集的指针
         args[1]
     }
@@ -113,22 +113,21 @@ impl Syscall for SysRtSigprocmaskHandle {
         let oset_ptr = Self::oset(args);
         let sigsetsize = Self::sigsetsize(args);
 
-
         vec![
-            FormattedSyscallParam::new("how", format!("{:#x}",how)),
+            FormattedSyscallParam::new("how", format!("{:#x}", how)),
             FormattedSyscallParam::new("nset", format!("{:#x}", nset_ptr)),
             FormattedSyscallParam::new("oset", format!("{:#x}", oset_ptr)),
             FormattedSyscallParam::new("sigsetsize", format!("{}", sigsetsize)),
         ]
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) ->  Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
         let how = Self::how(args);
         let nset = Self::nset(args);
         let oset = Self::oset(args);
         let sigsetsize = Self::sigsetsize(args);
 
-        Self::do_kernel_rt_sigprocmask(how, nset, oset, sigsetsize) 
+        Self::do_kernel_rt_sigprocmask(how, nset, oset, sigsetsize)
     }
 }
 

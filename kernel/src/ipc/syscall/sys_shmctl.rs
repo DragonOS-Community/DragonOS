@@ -1,14 +1,15 @@
+use crate::alloc::vec::Vec;
 use crate::{
-    arch::syscall::nr::SYS_SHMCTL,  ipc::shm::{shm_manager_lock, ShmCtlCmd, ShmId}, syscall::table::{FormattedSyscallParam, Syscall}
+    arch::syscall::nr::SYS_SHMCTL,
+    ipc::shm::{shm_manager_lock, ShmCtlCmd, ShmId},
+    syscall::table::{FormattedSyscallParam, Syscall},
 };
 use syscall_table_macros::declare_syscall;
-use system_error::SystemError;
-use crate::alloc::vec::Vec; // Added Vec
+use system_error::SystemError; // Added Vec
 
 pub struct SysShmctlHandle;
 
 impl SysShmctlHandle {
-
     #[inline(always)]
     fn id(args: &[usize]) -> ShmId {
         ShmId::new(args[0]) // Assuming ShmId::new takes usize or can infer from args[0]
@@ -80,11 +81,11 @@ impl Syscall for SysShmctlHandle {
         ]
     }
 
-    fn handle(&self, args: &[usize], from_user: bool) ->  Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], from_user: bool) -> Result<usize, SystemError> {
         let id = Self::id(args);
         let cmd = Self::cmd(args);
-       let user_buf=Self::user_buf(args);
-        Self::do_kernel_shmctl(id, cmd, user_buf,from_user)
+        let user_buf = Self::user_buf(args);
+        Self::do_kernel_shmctl(id, cmd, user_buf, from_user)
     }
 }
 

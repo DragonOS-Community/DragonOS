@@ -1,14 +1,13 @@
+use super::super::signal_types::{SigInfo, SigType};
 use crate::{
+    alloc::vec::Vec, // 添加 Vec
+    arch::ipc::signal::{SigCode, Signal},
     arch::syscall::nr::SYS_RESTART_SYSCALL, // 请确认实际的系统调用号
-    arch::ipc::signal::{SigCode,Signal},
     process::{Pid, ProcessManager},
     syscall::table::{FormattedSyscallParam, Syscall},
-    alloc::vec::Vec, // 添加 Vec
 };
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
-use super::super:: signal_types::{SigInfo,SigType};
-
 
 pub struct SysRestartHandle;
 
@@ -19,7 +18,7 @@ impl SysRestartHandle {
     ///
     /// 根据被重启的系统调用决定
     fn do_kernel_restart_syscall() -> Result<usize, SystemError> {
-      let restart_block = ProcessManager::current_pcb().restart_block().take();
+        let restart_block = ProcessManager::current_pcb().restart_block().take();
         if let Some(mut restart_block) = restart_block {
             return restart_block.restart_fn.call(&mut restart_block.data);
         } else {
@@ -33,7 +32,6 @@ impl SysRestartHandle {
             return Ok(0);
         }
     }
-    
 }
 
 impl Syscall for SysRestartHandle {

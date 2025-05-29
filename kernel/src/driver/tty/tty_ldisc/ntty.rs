@@ -23,7 +23,7 @@ use crate::{
     mm::VirtAddr,
     net::event_poll::EPollEventType,
     process::{ProcessFlags, ProcessManager},
-    syscall::{user_access::UserBufferWriter },
+    syscall::user_access::UserBufferWriter,
 };
 
 use super::TtyLineDiscipline;

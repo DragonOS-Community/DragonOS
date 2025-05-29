@@ -1,4 +1,7 @@
+use crate::alloc::vec::Vec; // 确保 Vec 已导入
+use crate::syscall::table::FormattedSyscallParam;
 use crate::{
+    arch::syscall::nr::SYS_SHMAT,
     arch::MMArch,
     ipc::shm::{shm_manager_lock, ShmFlags, ShmId},
     libs::align::page_align_up,
@@ -7,22 +10,15 @@ use crate::{
         page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
         syscall::ProtFlags,
         ucontext::{AddressSpace, VMA},
-        VirtAddr,
-        VmFlags,
+        VirtAddr, VmFlags,
     },
-    syscall::{
-        table::{Syscall},
-        user_access::UserBufferReader,
-    },
-    arch::syscall::nr::SYS_SHMAT,
+    syscall::{table::Syscall, user_access::UserBufferReader},
 };
 use syscall_table_macros::declare_syscall;
-use system_error::SystemError;
-use crate::alloc::vec::Vec; // 确保 Vec 已导入
-use crate::syscall::table::FormattedSyscallParam; // 确保 FormattedSyscallParam 已导入
+use system_error::SystemError; // 确保 FormattedSyscallParam 已导入
 
 pub struct SysShmatHandle;
-impl SysShmatHandle{
+impl SysShmatHandle {
     #[inline(always)]
     fn id(args: &[usize]) -> ShmId {
         ShmId::new(args[0]) // 更正 ShmIT 为 ShmId
@@ -36,7 +32,7 @@ impl SysShmatHandle{
     fn shmflg(args: &[usize]) -> ShmFlags {
         ShmFlags::from_bits_truncate(args[2] as u32)
     }
-      /// # SYS_SHMAT系统调用函数，用于连接共享内存段
+    /// # SYS_SHMAT系统调用函数，用于连接共享内存段
     ///
     /// ## 参数
     ///
@@ -161,17 +157,16 @@ impl Syscall for SysShmatHandle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("id", format!("{}",Self::id(args).data())),
+            FormattedSyscallParam::new("id", format!("{}", Self::id(args).data())),
             FormattedSyscallParam::new("vaddr", format!("{}", Self::vaddr(args).data())),
             FormattedSyscallParam::new("shmflg", format!("{}", Self::shmflg(args).bits())),
         ]
     }
-     fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
         let id = Self::id(args);
         let vaddr = Self::vaddr(args);
         let shmflg = Self::shmflg(args);
         Self::do_kernel_shmat(id, vaddr, shmflg)
-     }
-     
+    }
 }
 declare_syscall!(SYS_SHMAT, SysShmatHandle);

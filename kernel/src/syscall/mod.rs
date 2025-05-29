@@ -1101,7 +1101,7 @@ impl Syscall {
             }
             #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_SETRLIMIT => Ok(0),
-        
+
             SYS_RT_SIGTIMEDWAIT => {
                 log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
                 Ok(0)

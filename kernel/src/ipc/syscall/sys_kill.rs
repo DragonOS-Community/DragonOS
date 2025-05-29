@@ -1,20 +1,20 @@
-use core::ffi::c_int;
 use alloc::string::ToString;
 use alloc::vec::Vec;
+use core::ffi::c_int;
 
-use log::warn;
-use system_error::SystemError;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
     arch::{
-        ipc::signal::{Signal}, // SigCode 用于 SigInfo::new, Signal 用于类型和方法
-        syscall::nr::SYS_KILL,         // 用于 declare_syscall! 宏
+        ipc::signal::Signal,   // SigCode 用于 SigInfo::new, Signal 用于类型和方法
+        syscall::nr::SYS_KILL, // 用于 declare_syscall! 宏
     },
     process::{process_group::Pgid, Pid, ProcessManager},
 };
+use log::warn;
+use system_error::SystemError;
 
-use crate::ipc::kill::{kill_all,kill_process,kill_process_group};
+use crate::ipc::kill::{kill_all, kill_process, kill_process_group};
 /// ### pid转换器，将输入的id转换成对应的pid或pgid
 /// - 如果id < -1，则为pgid
 /// - 如果id == -1，则为所有进程
@@ -56,8 +56,6 @@ impl SysKillHandle {
         // 第二个参数是信号值
         args[1] as c_int
     }
-
-   
 }
 
 impl Syscall for SysKillHandle {

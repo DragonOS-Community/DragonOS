@@ -11,7 +11,6 @@ use crate::{
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
-        process_group::Pgid,
         resource::{RLimit64, RUsage},
         ProcessFlags, ProcessManager,
     },
@@ -360,7 +359,19 @@ impl Syscall {
                 let path = args[0] as *const u8;
                 Self::unlink(path)
             }
-            SYS_GETPID => Self::getpid().map(|pid| pid.into()),
+            SYS_KILL => {
+                let pid = args[0] as i32;
+                let sig = args[1] as c_int;
+                // debug!("KILL SYSCALL RECEIVED");
+                Self::kill(pid, sig)
+            }
+
+            SYS_RT_SIGACTION => {
+                let sig = args[0] as c_int;
+                let act = args[1];
+                let old_act = args[2];
+                Self::sigaction(sig, act, old_act, frame.is_from_user())
+            }
 
             SYS_SCHED => {
                 warn!("syscall sched");
@@ -604,10 +615,6 @@ impl Syscall {
                 }
             }
 
-            SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pgid| pgid.into()),
-
-            SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
-
             SYS_FCNTL => {
                 let fd = args[0] as i32;
                 let cmd: Option<FcntlCommand> =
@@ -703,8 +710,6 @@ impl Syscall {
                 return ret;
             }
 
-            SYS_SET_TID_ADDRESS => Self::set_tid_address(args[0]),
-
             SYS_STATFS => {
                 let path = args[0] as *const u8;
                 let statfs = args[1] as *mut PosixStatfs;
@@ -751,10 +756,12 @@ impl Syscall {
 
             SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
 
-            SYS_SETPGID => {
-                let pid = Pid::new(args[0]);
-                let pgid = Pgid::new(args[1]);
-                Self::setpgid(pid, pgid)
+            SYS_RT_SIGPROCMASK => {
+                let how = args[0] as i32;
+                let nset = args[1];
+                let oset = args[2];
+                let sigsetsize = args[3];
+                Self::rt_sigprocmask(how, nset, oset, sigsetsize)
             }
 
             SYS_TKILL => {
@@ -784,8 +791,6 @@ impl Syscall {
                 }
             }
 
-            SYS_GETTID => Self::gettid().map(|tid| tid.into()),
-
             SYS_SYSLOG => {
                 let syslog_action_type = args[0];
                 let buf_vaddr = args[1];
@@ -797,22 +802,6 @@ impl Syscall {
                 let user_buf = user_buffer_writer.buffer(0)?;
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
-
-            SYS_GETUID => Self::getuid(),
-            SYS_GETGID => Self::getgid(),
-            SYS_SETUID => Self::setuid(args[0]),
-            SYS_SETGID => Self::setgid(args[0]),
-
-            SYS_GETEUID => Self::geteuid(),
-            SYS_GETEGID => Self::getegid(),
-            SYS_SETRESUID => Self::seteuid(args[1]),
-            SYS_SETRESGID => Self::setegid(args[1]),
-
-            SYS_SETFSUID => Self::setfsuid(args[0]),
-            SYS_SETFSGID => Self::setfsgid(args[0]),
-
-            SYS_SETSID => Self::setsid(),
-            SYS_GETSID => Self::getsid(Pid::new(args[0])),
 
             SYS_GETRUSAGE => {
                 let who = args[0] as c_int;

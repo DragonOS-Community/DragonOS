@@ -11,12 +11,11 @@ use system_error::SystemError;
 
 use super::{
     abi::WaitOption,
-    cred::{Kgid, Kuid},
     exec::{load_binary_file, ExecParam, ExecParamFlags},
     exit::kernel_wait4,
     fork::{CloneFlags, KernelCloneArgs},
     resource::{RLimit64, RLimitID, RUsage, RUsageWho},
-    KernelStack, Pgid, Pid, ProcessManager,
+    KernelStack, Pid, ProcessManager,
 };
 use crate::{
     arch::{interrupt::TrapFrame, CurrentIrqArch, MMArch},
@@ -28,7 +27,7 @@ use crate::{
     libs::rand::rand_bytes,
     mm::{
         ucontext::{AddressSpace, UserStack},
-        verify_area, MemoryManagementArch, VirtAddr,
+        MemoryManagementArch,
     },
     process::ProcessControlBlock,
     sched::completion::Completion,
@@ -251,102 +250,6 @@ impl Syscall {
         ProcessManager::exit((status & 0xff) << 8);
     }
 
-    /// @brief 获取当前进程的pid
-    pub fn getpid() -> Result<Pid, SystemError> {
-        let current_pcb = ProcessManager::current_pcb();
-        // if let Some(pid_ns) = &current_pcb.get_nsproxy().read().pid_namespace {
-        //     // 获取该进程在命名空间中的 PID
-        //     return Ok(current_pcb.pid_strcut().read().numbers[pid_ns.level].nr);
-        //     // 返回命名空间中的 PID
-        // }
-        // 默认返回 tgid
-        Ok(current_pcb.tgid())
-    }
-
-    /// @brief 获取指定进程的pgid
-    ///
-    /// @param pid 指定一个进程号
-    ///
-    /// @return 成功，指定进程的进程组id
-    /// @return 错误，不存在该进程
-    pub fn getpgid(pid: Pid) -> Result<Pgid, SystemError> {
-        if pid == Pid(0) {
-            let current_pcb = ProcessManager::current_pcb();
-            return Ok(current_pcb.pgid());
-        }
-        let target_proc = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
-        return Ok(target_proc.pgid());
-    }
-
-    /// 设置指定进程的pgid
-    ///
-    /// ## 参数
-    ///
-    /// - pid: 指定进程号
-    /// - pgid: 新的进程组号
-    ///
-    /// ## 返回值
-    /// 无
-    pub fn setpgid(pid: Pid, pgid: Pgid) -> Result<usize, SystemError> {
-        let current_pcb = ProcessManager::current_pcb();
-        let pid = if pid == Pid(0) {
-            current_pcb.pid()
-        } else {
-            pid
-        };
-        let pgid = if pgid == Pgid::from(0) {
-            Pgid::from(pid.into())
-        } else {
-            pgid
-        };
-        if pid != current_pcb.pid() && !current_pcb.contain_child(&pid) {
-            return Err(SystemError::ESRCH);
-        }
-
-        if pgid.into() != pid.into() && ProcessManager::find_process_group(pgid).is_none() {
-            return Err(SystemError::EPERM);
-        }
-        let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
-        pcb.join_other_group(pgid)?;
-
-        return Ok(0);
-    }
-
-    /// 创建新的会话
-    pub fn setsid() -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let session = pcb.go_to_new_session()?;
-        let mut guard = pcb.sig_info_mut();
-        guard.set_tty(None);
-        Ok(session.sid().into())
-    }
-
-    /// 获取指定进程的会话id
-    ///
-    /// 若pid为0，则返回当前进程的会话id
-    ///
-    /// 若pid不为0，则返回指定进程的会话id
-    pub fn getsid(pid: Pid) -> Result<usize, SystemError> {
-        let session = ProcessManager::current_pcb().session().unwrap();
-        let sid = session.sid().into();
-        if pid == Pid(0) {
-            return Ok(sid);
-        }
-        let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
-        if !Arc::ptr_eq(&session, &pcb.session().unwrap()) {
-            return Err(SystemError::EPERM);
-        }
-        return Ok(sid);
-    }
-
-    /// @brief 获取当前进程的父进程id
-    ///
-    /// 若为initproc则ppid设置为0
-    pub fn getppid() -> Result<Pid, SystemError> {
-        let current_pcb = ProcessManager::current_pcb();
-        return Ok(current_pcb.basic().ppid());
-    }
-
     pub fn clone(
         current_trapframe: &TrapFrame,
         clone_args: KernelCloneArgs,
@@ -403,141 +306,6 @@ impl Syscall {
         }
 
         return Ok(pcb.pid().0);
-    }
-
-    /// 设置线程地址
-    pub fn set_tid_address(ptr: usize) -> Result<usize, SystemError> {
-        verify_area(VirtAddr::new(ptr), core::mem::size_of::<i32>())
-            .map_err(|_| SystemError::EFAULT)?;
-
-        let pcb = ProcessManager::current_pcb();
-        pcb.thread.write_irqsave().clear_child_tid = Some(VirtAddr::new(ptr));
-        Ok(pcb.pid.0)
-    }
-
-    pub fn gettid() -> Result<Pid, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        Ok(pcb.pid)
-    }
-
-    pub fn getuid() -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        return Ok(pcb.cred.lock().uid.data());
-    }
-
-    pub fn getgid() -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        return Ok(pcb.cred.lock().gid.data());
-    }
-
-    pub fn geteuid() -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        return Ok(pcb.cred.lock().euid.data());
-    }
-
-    pub fn getegid() -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        return Ok(pcb.cred.lock().egid.data());
-    }
-
-    pub fn setuid(uid: usize) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
-
-        if guard.uid.data() == 0 {
-            guard.setuid(uid);
-            guard.seteuid(uid);
-            guard.setsuid(uid);
-        } else if uid == guard.uid.data() || uid == guard.suid.data() {
-            guard.seteuid(uid);
-        } else {
-            return Err(SystemError::EPERM);
-        }
-
-        return Ok(0);
-    }
-
-    pub fn setgid(gid: usize) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
-
-        if guard.egid.data() == 0 {
-            guard.setgid(gid);
-            guard.setegid(gid);
-            guard.setsgid(gid);
-            guard.setfsgid(gid);
-        } else if guard.gid.data() == gid || guard.sgid.data() == gid {
-            guard.setegid(gid);
-            guard.setfsgid(gid);
-        } else {
-            return Err(SystemError::EPERM);
-        }
-
-        return Ok(0);
-    }
-
-    pub fn seteuid(euid: usize) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
-
-        if euid == usize::MAX || (euid == guard.euid.data() && euid == guard.fsuid.data()) {
-            return Ok(0);
-        }
-
-        if euid != usize::MAX {
-            guard.seteuid(euid);
-        }
-
-        let euid = guard.euid.data();
-        guard.setfsuid(euid);
-
-        return Ok(0);
-    }
-
-    pub fn setegid(egid: usize) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
-
-        if egid == usize::MAX || (egid == guard.egid.data() && egid == guard.fsgid.data()) {
-            return Ok(0);
-        }
-
-        if egid != usize::MAX {
-            guard.setegid(egid);
-        }
-
-        let egid = guard.egid.data();
-        guard.setfsgid(egid);
-
-        return Ok(0);
-    }
-
-    pub fn setfsuid(fsuid: usize) -> Result<usize, SystemError> {
-        let fsuid = Kuid::new(fsuid);
-
-        let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
-        let old_fsuid = guard.fsuid;
-
-        if fsuid == guard.uid || fsuid == guard.euid || fsuid == guard.suid {
-            guard.setfsuid(fsuid.data());
-        }
-
-        Ok(old_fsuid.data())
-    }
-
-    pub fn setfsgid(fsgid: usize) -> Result<usize, SystemError> {
-        let fsgid = Kgid::new(fsgid);
-
-        let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
-        let old_fsgid = guard.fsgid;
-
-        if fsgid == guard.gid || fsgid == guard.egid || fsgid == guard.sgid {
-            guard.setfsgid(fsgid.data());
-        }
-
-        Ok(old_fsgid.data())
     }
 
     pub fn get_rusage(who: i32, rusage: *mut RUsage) -> Result<usize, SystemError> {

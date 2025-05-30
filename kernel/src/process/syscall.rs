@@ -250,14 +250,6 @@ impl Syscall {
 
         return Ok(pcb.pid().0);
     }
-
-    pub fn uname(name: *mut PosixOldUtsName) -> Result<usize, SystemError> {
-        let mut writer =
-            UserBufferWriter::new(name, core::mem::size_of::<PosixOldUtsName>(), true)?;
-        writer.copy_one_to_user(&PosixOldUtsName::new(), 0)?;
-
-        return Ok(0);
-    }
 }
 
 /// 切换用户虚拟内存空间

@@ -20,6 +20,7 @@ mod sys_setresgid;
 mod sys_setresuid;
 mod sys_setsid;
 mod sys_setuid;
+mod sys_uname;
 mod sys_wait4;
 
 #[cfg(target_arch = "x86_64")]

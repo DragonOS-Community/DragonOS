@@ -241,15 +241,6 @@ impl Syscall {
         return Ok(r);
     }
 
-    /// # 退出进程
-    ///
-    /// ## 参数
-    ///
-    /// - status: 退出状态
-    pub fn exit(status: usize) -> ! {
-        ProcessManager::exit((status & 0xff) << 8);
-    }
-
     pub fn clone(
         current_trapframe: &TrapFrame,
         clone_args: KernelCloneArgs,

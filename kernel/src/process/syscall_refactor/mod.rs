@@ -22,3 +22,5 @@ mod sys_setresuid;
 mod sys_setsid;
 mod sys_setuid;
 mod sys_get_rusage;
+mod sys_exit;
+mod sys_exit_group;

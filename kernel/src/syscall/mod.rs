@@ -276,10 +276,6 @@ impl Syscall {
                 Self::wait4(pid, wstatus, options, rusage)
             }
 
-            SYS_EXIT => {
-                let exit_code = args[0];
-                Self::exit(exit_code)
-            }
             #[cfg(target_arch = "x86_64")]
             SYS_MKDIR => {
                 let path = args[0] as *const u8;
@@ -772,13 +768,6 @@ impl Syscall {
             SYS_SIGALTSTACK => {
                 warn!("SYS_SIGALTSTACK has not yet been implemented");
                 Ok(0)
-            }
-
-            SYS_EXIT_GROUP => {
-                let exit_code = args[0];
-                Self::exit(exit_code)
-                // warn!("SYS_EXIT_GROUP has not yet been implemented");
-                // Ok(0)
             }
 
             SYS_MADVISE => {

@@ -25,8 +25,8 @@ use crate::libs::rbtree::RBTree;
 use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::process::fork::CloneFlags;
-use crate::process::ProcessManager;
 use crate::process::geteuid::do_geteuid;
+use crate::process::ProcessManager;
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct MntNamespace {

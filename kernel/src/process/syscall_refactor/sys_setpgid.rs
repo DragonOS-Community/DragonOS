@@ -26,7 +26,7 @@ impl Syscall for SysSetPgid {
 
     /// # 函数的功能
     /// 设置指定进程的pgid
-    /// 
+    ///
     /// ## 参数
     /// - pid: 指定进程号
     /// - pgid: 新的进程组号

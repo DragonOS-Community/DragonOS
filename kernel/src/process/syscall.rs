@@ -1,5 +1,3 @@
-use core::ffi::c_void;
-
 use alloc::{
     ffi::CString,
     string::{String, ToString},
@@ -10,11 +8,9 @@ use log::error;
 use system_error::SystemError;
 
 use super::{
-    abi::WaitOption,
     exec::{load_binary_file, ExecParam, ExecParamFlags},
-    exit::kernel_wait4,
     fork::{CloneFlags, KernelCloneArgs},
-    resource::{RLimit64, RLimitID, RUsage},
+    resource::{RLimit64, RLimitID},
     KernelStack, Pid, ProcessManager,
 };
 use crate::{
@@ -202,43 +198,6 @@ impl Syscall {
         address_space.write().user_stack = Some(ustack_message);
 
         Self::arch_do_execve(regs, &param, &load_result, user_sp, argv_ptr)
-    }
-
-    pub fn wait4(
-        pid: i32,
-        wstatus: *mut i32,
-        options: i32,
-        rusage: *mut c_void,
-    ) -> Result<usize, SystemError> {
-        let options = WaitOption::from_bits(options as u32).ok_or(SystemError::EINVAL)?;
-
-        let wstatus_buf = if wstatus.is_null() {
-            None
-        } else {
-            Some(UserBufferWriter::new(
-                wstatus,
-                core::mem::size_of::<i32>(),
-                true,
-            )?)
-        };
-
-        let mut tmp_rusage = if rusage.is_null() {
-            None
-        } else {
-            Some(RUsage::default())
-        };
-
-        let r = kernel_wait4(pid, wstatus_buf, options, tmp_rusage.as_mut())?;
-
-        if !rusage.is_null() {
-            let mut rusage_buf = UserBufferWriter::new::<RUsage>(
-                rusage as *mut RUsage,
-                core::mem::size_of::<RUsage>(),
-                true,
-            )?;
-            rusage_buf.copy_one_to_user(&tmp_rusage.unwrap(), 0)?;
-        }
-        return Ok(r);
     }
 
     pub fn clone(

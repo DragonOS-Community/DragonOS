@@ -21,3 +21,4 @@ mod sys_setresgid;
 mod sys_setresuid;
 mod sys_setsid;
 mod sys_setuid;
+mod sys_get_rusage;

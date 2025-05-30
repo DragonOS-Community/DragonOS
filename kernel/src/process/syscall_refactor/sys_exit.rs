@@ -23,7 +23,10 @@ impl Syscall for SysExit {
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
-        vec![FormattedSyscallParam::new("exit_code", format!("{:#x}", Self::exit_code(args)))]
+        vec![FormattedSyscallParam::new(
+            "exit_code",
+            format!("{:#x}", Self::exit_code(args)),
+        )]
     }
 }
 

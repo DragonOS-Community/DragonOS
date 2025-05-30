@@ -10,6 +10,7 @@ mod sys_getppid;
 mod sys_getsid;
 mod sys_gettid;
 mod sys_getuid;
+mod sys_prlimit64;
 mod sys_set_tid_address;
 mod sys_setfsgid;
 mod sys_setfsuid;
@@ -20,8 +21,6 @@ mod sys_setresuid;
 mod sys_setsid;
 mod sys_setuid;
 mod sys_wait4;
-mod sys_prlimit64;
 
 #[cfg(target_arch = "x86_64")]
 mod sys_getrlimit;
-

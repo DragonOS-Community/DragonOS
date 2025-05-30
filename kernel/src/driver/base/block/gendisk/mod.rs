@@ -3,7 +3,10 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+};
 use hashbrown::HashMap;
 use system_error::SystemError;
 
@@ -27,6 +30,9 @@ pub struct GenDisk {
     block_size_log2: u8,
     idx: Option<u32>,
 
+    major: u32,
+    minor: usize,
+
     fs: RwLock<Weak<DevFS>>,
     metadata: Metadata,
     /// 对应/dev/下的设备名
@@ -49,12 +55,20 @@ impl GenDisk {
             Some(idx) => DName::from(format!("{}{}", dev_name.name(), idx)),
             None => DName::from(dev_name.name()),
         };
+        let index = (idx.unwrap_or(0)) as usize;
+
+        let ptr = bdev.upgrade().unwrap();
+        let meta = ptr.blkdev_meta();
+        let major = meta.major;
+        let minor: usize = meta.inner().dev_idx * 16 + index;
 
         return Arc::new(GenDisk {
             bdev,
             range,
             block_size_log2: bsizelog2,
             idx,
+            major,
+            minor,
             fs: RwLock::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
@@ -171,6 +185,10 @@ impl GenDisk {
     /// 同步磁盘
     pub fn sync(&self) -> Result<(), SystemError> {
         self.block_device().sync()
+    }
+
+    pub fn symlink_name(&self) -> String {
+        format!("{}:{}", self.major, self.minor)
     }
 }
 

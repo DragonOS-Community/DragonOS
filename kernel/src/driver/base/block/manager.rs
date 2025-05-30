@@ -105,12 +105,9 @@ impl BlockDevManager {
         range: GeneralBlockRange,
     ) -> Result<(), SystemError> {
         let weak_dev = Arc::downgrade(dev);
-        let gendisk = GenDisk::new(
-            weak_dev,
-            range,
-            Some(dev.blkdev_meta().inner().gendisks.alloc_idx()),
-            dev.dev_name(),
-        );
+        let idx = dev.blkdev_meta().inner().gendisks.alloc_idx();
+        let gendisk = GenDisk::new(weak_dev, range, Some(idx), dev.dev_name());
+        log::info!("Registering gendisk");
         self.register_gendisk(dev, gendisk)
     }
 
@@ -214,19 +211,23 @@ impl BlockDevManager {
 
 pub struct BlockDevMeta {
     pub devname: DevName,
+    pub major: u32,
     inner: SpinLock<InnerBlockDevMeta>,
 }
 
 pub struct InnerBlockDevMeta {
     pub gendisks: GenDiskMap,
+    pub dev_idx: usize,
 }
 
 impl BlockDevMeta {
-    pub fn new(devname: DevName) -> Self {
+    pub fn new(devname: DevName, major: u32) -> Self {
         BlockDevMeta {
             devname,
+            major,
             inner: SpinLock::new(InnerBlockDevMeta {
                 gendisks: GenDiskMap::new(),
+                dev_idx: 0, // 默认索引为0
             }),
         }
     }

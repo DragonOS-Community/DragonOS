@@ -181,6 +181,8 @@ unsafe impl Send for VirtIOBlkDevice {}
 unsafe impl Sync for VirtIOBlkDevice {}
 
 impl VirtIOBlkDevice {
+    pub const VIRTIO_BLK_MAJOR: u32 = 254;
+
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
         // 设置中断
         if let Err(err) = transport.setup_irq(dev_id.clone()) {
@@ -199,7 +201,7 @@ impl VirtIOBlkDevice {
         let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
         device_inner.enable_interrupts();
         let dev = Arc::new_cyclic(|self_ref| Self {
-            blkdev_meta: BlockDevMeta::new(devname),
+            blkdev_meta: BlockDevMeta::new(devname, Self::VIRTIO_BLK_MAJOR),
             self_ref: self_ref.clone(),
             dev_id,
             locked_kobj_state: LockedKObjectState::default(),
@@ -394,6 +396,7 @@ impl VirtIODevice for VirtIOBlkDevice {
 
     fn set_virtio_device_index(&self, index: VirtIODeviceIndex) {
         self.inner().virtio_index = Some(index);
+        self.blkdev_meta.inner().dev_idx = index.into();
     }
 
     fn virtio_device_index(&self) -> Option<VirtIODeviceIndex> {

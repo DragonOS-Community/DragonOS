@@ -1,8 +1,3 @@
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "riscv64",
-    target_arch = "loongarch64"
-))]
 mod sys_getegid;
 mod sys_geteuid;
 mod sys_getgid;

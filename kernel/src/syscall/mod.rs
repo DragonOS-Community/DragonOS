@@ -29,7 +29,7 @@ use crate::{
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
-    process::{fork::CloneFlags, syscall::PosixOldUtsName},
+    process::fork::CloneFlags,
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         PosixTimeSpec,
@@ -930,10 +930,6 @@ impl Syscall {
             SYS_NEWFSTATAT => Self::newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
 
             // SYS_SCHED_YIELD => Self::sched_yield(),
-            SYS_UNAME => {
-                let name = args[0] as *mut PosixOldUtsName;
-                Self::uname(name)
-            }
             SYS_PRCTL => {
                 // todo: 这个系统调用还没有实现
 

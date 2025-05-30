@@ -14,7 +14,7 @@ use super::{
     exec::{load_binary_file, ExecParam, ExecParamFlags},
     exit::kernel_wait4,
     fork::{CloneFlags, KernelCloneArgs},
-    resource::{RLimit64, RLimitID, RUsage, RUsageWho},
+    resource::{RLimit64, RLimitID, RUsage},
     KernelStack, Pid, ProcessManager,
 };
 use crate::{
@@ -306,18 +306,6 @@ impl Syscall {
         }
 
         return Ok(pcb.pid().0);
-    }
-
-    pub fn get_rusage(who: i32, rusage: *mut RUsage) -> Result<usize, SystemError> {
-        let who = RUsageWho::try_from(who)?;
-        let mut writer = UserBufferWriter::new(rusage, core::mem::size_of::<RUsage>(), true)?;
-        let pcb = ProcessManager::current_pcb();
-        let rusage = pcb.get_rusage(who).ok_or(SystemError::EINVAL)?;
-
-        let ubuf = writer.buffer::<RUsage>(0).unwrap();
-        ubuf.copy_from_slice(&[rusage]);
-
-        return Ok(0);
     }
 
     /// # 设置资源限制

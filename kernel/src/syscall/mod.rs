@@ -12,7 +12,7 @@ use crate::{
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
-        resource::{RLimit64, RUsage},
+        resource::RLimit64,
         ProcessFlags, ProcessManager,
     },
     sched::{schedule, SchedMode},
@@ -826,11 +826,6 @@ impl Syscall {
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
-            SYS_GETRUSAGE => {
-                let who = args[0] as c_int;
-                let rusage = args[1] as *mut RUsage;
-                Self::get_rusage(who, rusage)
-            }
             #[cfg(target_arch = "x86_64")]
             SYS_READLINK => {
                 let path = args[0] as *const u8;

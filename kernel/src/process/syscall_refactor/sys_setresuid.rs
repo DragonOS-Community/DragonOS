@@ -1,25 +1,25 @@
-use system_error::SystemError;
-use alloc::vec::Vec;
+use crate::arch::syscall::nr::SYS_SETRESUID;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::arch::syscall::nr::SYS_SETRESUID;
+use alloc::vec::Vec;
+use system_error::SystemError;
 
 pub struct SysSetResUid;
 
-impl SysSetResUid{
-    fn euid(args:&[usize])->usize{
-        args[1] 
+impl SysSetResUid {
+    fn euid(args: &[usize]) -> usize {
+        args[1]
     }
 }
 
-impl Syscall for SysSetResUid{
-    fn num_args(&self)->usize{
-        2  
+impl Syscall for SysSetResUid {
+    fn num_args(&self) -> usize {
+        2
     }
 
-    fn handle(&self, args:&[usize],_from_user:bool)->Result<usize,SystemError>{
-        let euid=Self::euid(args);
+    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+        let euid = Self::euid(args);
         let pcb = ProcessManager::current_pcb();
         let mut guard = pcb.cred.lock();
 
@@ -38,7 +38,10 @@ impl Syscall for SysSetResUid{
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
-        vec![FormattedSyscallParam::new("euid", format!("{:#x}", Self::euid(args)))]
+        vec![FormattedSyscallParam::new(
+            "euid",
+            format!("{:#x}", Self::euid(args)),
+        )]
     }
 }
 

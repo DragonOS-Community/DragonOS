@@ -1,13 +1,13 @@
-use system_error::SystemError;
-use alloc::vec::Vec;
+use crate::arch::syscall::nr::SYS_GETTID;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::arch::syscall::nr::SYS_GETTID;
+use alloc::vec::Vec;
+use system_error::SystemError;
 
 pub struct SysGetTid;
 
-impl Syscall for SysGetTid{
+impl Syscall for SysGetTid {
     fn num_args(&self) -> usize {
         0
     }

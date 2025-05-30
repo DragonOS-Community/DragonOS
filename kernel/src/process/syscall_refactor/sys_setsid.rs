@@ -1,13 +1,13 @@
-use system_error::SystemError;
-use alloc::vec::Vec;
+use crate::arch::syscall::nr::SYS_SETSID;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::arch::syscall::nr::SYS_SETSID;
+use alloc::vec::Vec;
+use system_error::SystemError;
 
 pub struct SysSetsid;
 
-impl Syscall for SysSetsid{
+impl Syscall for SysSetsid {
     fn num_args(&self) -> usize {
         0
     }
@@ -20,7 +20,6 @@ impl Syscall for SysSetsid{
         let mut guard = pcb.sig_info_mut();
         guard.set_tty(None);
         Ok(session.sid().into())
-        
     }
 
     fn entry_format(&self, _args: &[usize]) -> Vec<FormattedSyscallParam> {

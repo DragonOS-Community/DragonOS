@@ -78,6 +78,7 @@ pub mod cred;
 pub mod exec;
 pub mod exit;
 pub mod fork;
+pub mod geteuid;
 pub mod idle;
 pub mod kthread;
 pub mod pid;
@@ -86,10 +87,9 @@ pub mod resource;
 pub mod session;
 pub mod stdio;
 pub mod syscall;
+pub mod syscall_refactor;
 pub mod timer;
 pub mod utils;
-pub mod syscall_refactor;
-pub mod geteuid;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);

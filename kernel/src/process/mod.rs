@@ -88,6 +88,8 @@ pub mod stdio;
 pub mod syscall;
 pub mod timer;
 pub mod utils;
+pub mod syscall_refactor;
+pub mod geteuid;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);

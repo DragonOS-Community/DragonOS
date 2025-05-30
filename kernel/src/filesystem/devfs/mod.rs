@@ -353,7 +353,7 @@ impl LockedDevFSInode {
     }
 
     /// # 在devfs中添加一个符号链接
-    /// 
+    ///
     /// ## 参数
     /// - `path`: 符号链接指向的路径
     /// - `symlink_name`: 符号链接的名称

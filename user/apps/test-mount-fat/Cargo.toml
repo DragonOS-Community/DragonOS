@@ -1,8 +1,8 @@
 [package]
-name = "test-mount-ext4"
+name = "test-mount-fat"
 version = "0.1.0"
 edition = "2021"
-description = "测试是否可以通过mount系统调用来挂载ext4类型的硬盘"
+description = "测试fat的挂载"
 authors = ["sparkzky <sparkhhhhhhhhhh@outlook.com>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

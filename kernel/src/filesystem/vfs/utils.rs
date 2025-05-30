@@ -5,6 +5,7 @@ use core::hash::Hash;
 use alloc::{string::String, sync::Arc};
 use system_error::SystemError;
 
+use crate::driver::base::device::DevName;
 use crate::process::ProcessControlBlock;
 
 use super::{fcntl::AtFlags, FileType, IndexNode, ROOT_INODE};
@@ -143,5 +144,11 @@ impl fmt::Display for DName {
 impl AsRef<str> for DName {
     fn as_ref(&self) -> &str {
         self.0.as_str()
+    }
+}
+
+impl From<&DevName> for DName {
+    fn from(value: &DevName) -> Self {
+        Self(Arc::from(format!("{}{}", value.name(), value.id())))
     }
 }

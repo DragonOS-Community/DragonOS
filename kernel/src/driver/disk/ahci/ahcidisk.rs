@@ -377,11 +377,13 @@ impl AhciDisk {
 }
 
 impl LockedAhciDisk {
+    pub const AHCI_BLK_MAJOR: u32 = 8;
+
     pub fn new(ctrl_num: u8, port_num: u8) -> Result<Arc<LockedAhciDisk>, SystemError> {
         let devname = scsi_manager().alloc_id().ok_or(SystemError::EBUSY)?;
         // 构建磁盘结构体
         let result: Arc<LockedAhciDisk> = Arc::new_cyclic(|self_ref| LockedAhciDisk {
-            blkdev_meta: BlockDevMeta::new(devname),
+            blkdev_meta: BlockDevMeta::new(devname, Self::AHCI_BLK_MAJOR),
             inner: SpinLock::new(AhciDisk {
                 partitions: Vec::new(),
                 ctrl_num,

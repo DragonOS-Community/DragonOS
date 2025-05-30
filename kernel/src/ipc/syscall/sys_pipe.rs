@@ -7,6 +7,7 @@ use crate::{
 use alloc::vec::Vec;
 use core::ffi::c_int;
 use system_error::SystemError;
+
 pub struct SysPipeHandle;
 
 impl SysPipeHandle {
@@ -16,6 +17,7 @@ impl SysPipeHandle {
         args[0] as *mut c_int
     }
 }
+
 impl Syscall for SysPipeHandle {
     fn num_args(&self) -> usize {
         1 // pipefd

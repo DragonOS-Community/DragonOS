@@ -8,6 +8,7 @@ use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
 
 pub struct SysShmctlHandle;
+
 /// # SYS_SHMCTL系统调用函数，用于管理共享内存段
 ///
 /// ## 参数
@@ -50,6 +51,7 @@ pub(super) fn do_kernel_shmctl(
         ShmCtlCmd::Default => Err(SystemError::EINVAL),
     }
 }
+
 impl SysShmctlHandle {
     #[inline(always)]
     fn id(args: &[usize]) -> ShmId {

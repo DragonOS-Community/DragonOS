@@ -12,6 +12,7 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::ipc::kill::{kill_all, kill_process, kill_process_group};
+
 /// ### pid转换器，将输入的id转换成对应的pid或pgid
 /// - 如果id < -1，则为pgid
 /// - 如果id == -1，则为所有进程
@@ -84,5 +85,6 @@ impl Syscall for SysKillHandle {
         ]
     }
 }
+
 // 注册系统调用
 syscall_table_macros::declare_syscall!(SYS_KILL, SysKillHandle);

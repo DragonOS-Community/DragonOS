@@ -9,13 +9,16 @@ use crate::{
 use alloc::vec::Vec;
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
+
 pub struct SysShmdtHandle;
+
 impl SysShmdtHandle {
     #[inline(always)]
     fn vaddr(args: &[usize]) -> VirtAddr {
         VirtAddr::new(args[0])
     }
 }
+
 impl Syscall for SysShmdtHandle {
     fn num_args(&self) -> usize {
         1

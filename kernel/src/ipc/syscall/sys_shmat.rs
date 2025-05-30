@@ -15,9 +15,10 @@ use crate::{
     syscall::{table::Syscall, user_access::UserBufferReader},
 };
 use syscall_table_macros::declare_syscall;
-use system_error::SystemError; // 确保 FormattedSyscallParam 已导入
+use system_error::SystemError;
 
 pub struct SysShmatHandle;
+
 /// # SYS_SHMAT系统调用函数，用于连接共享内存段
 ///
 /// ## 参数
@@ -138,6 +139,7 @@ pub(super) fn do_kernel_shmat(
 
     Ok(r)
 }
+
 impl SysShmatHandle {
     #[inline(always)]
     fn id(args: &[usize]) -> ShmId {
@@ -173,4 +175,5 @@ impl Syscall for SysShmatHandle {
         do_kernel_shmat(id, vaddr, shmflg)
     }
 }
+
 declare_syscall!(SYS_SHMAT, SysShmatHandle);

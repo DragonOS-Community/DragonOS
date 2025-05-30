@@ -98,4 +98,5 @@ impl Syscall for SysPipe2Handle {
         ]
     }
 }
+
 syscall_table_macros::declare_syscall!(SYS_PIPE2, SysPipe2Handle);

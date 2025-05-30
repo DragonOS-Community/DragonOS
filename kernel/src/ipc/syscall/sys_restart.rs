@@ -10,6 +10,7 @@ use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
 
 pub struct SysRestartHandle;
+
 /// # SYS_RESTART_SYSCALL 系统调用函数，用于重启被信号中断的系统调用
 ///
 /// ## 返回值
@@ -30,7 +31,6 @@ pub(super) fn do_kernel_restart_syscall() -> Result<usize, SystemError> {
         return Ok(0);
     }
 }
-impl SysRestartHandle {}
 
 impl Syscall for SysRestartHandle {
     fn num_args(&self) -> usize {

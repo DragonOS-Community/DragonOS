@@ -14,7 +14,9 @@ use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
 use log::error;
 use system_error::SystemError;
+
 pub struct SysSigactionHandle;
+
 /// 通用信号注册函数
 ///
 /// ## 参数
@@ -145,6 +147,7 @@ pub(super) fn do_kernel_sigaction(
     }
     return retval.map(|_| 0);
 }
+
 impl SysSigactionHandle {
     #[inline(always)]
     fn sig(args: &[usize]) -> c_int {
@@ -162,6 +165,7 @@ impl SysSigactionHandle {
         args[2]
     }
 }
+
 impl Syscall for SysSigactionHandle {
     fn num_args(&self) -> usize {
         3
@@ -183,4 +187,5 @@ impl Syscall for SysSigactionHandle {
         ]
     }
 }
+
 syscall_table_macros::declare_syscall!(SYS_RT_SIGACTION, SysSigactionHandle);

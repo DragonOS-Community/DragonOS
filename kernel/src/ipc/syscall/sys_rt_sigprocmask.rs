@@ -14,6 +14,7 @@ use syscall_table_macros::declare_syscall;
 use system_error::SystemError; // 添加 Vec
 
 pub struct SysRtSigprocmaskHandle;
+
 /// # SYS_SIGPROCMASK系统调用函数，用于设置或查询当前进程的信号屏蔽字
 ///
 /// ## 参数
@@ -75,6 +76,7 @@ pub(super) fn do_kernel_rt_sigprocmask(
 
     Ok(0)
 }
+
 impl SysRtSigprocmaskHandle {
     #[inline(always)]
     fn how(args: &[usize]) -> i32 {

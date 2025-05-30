@@ -8,7 +8,9 @@ use crate::{
 use log::error;
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
+
 pub struct SysShmgetHandle;
+
 /// # SYS_SHMGET系统调用函数，用于获取共享内存
 ///
 /// ## 参数
@@ -59,6 +61,7 @@ pub(super) fn do_kernel_shmget(
         }
     }
 }
+
 impl SysShmgetHandle {
     #[inline(always)]
     fn key(args: &[usize]) -> ShmKey {
@@ -81,6 +84,7 @@ impl SysShmgetHandle {
         ShmFlags::from_bits_truncate(args[2] as u32)
     }
 }
+
 impl Syscall for SysShmgetHandle {
     fn num_args(&self) -> usize {
         3 // key, size, shmflg

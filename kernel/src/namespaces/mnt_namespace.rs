@@ -25,8 +25,8 @@ use crate::libs::rbtree::RBTree;
 use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::process::fork::CloneFlags;
+use crate::process::geteuid::do_geteuid;
 use crate::process::ProcessManager;
-use crate::syscall::Syscall;
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct MntNamespace {
@@ -230,7 +230,7 @@ impl MntNamespace {
     ) -> Result<Option<Arc<UCounts>>, SystemError> {
         Ok(self
             .ucounts
-            .inc_ucounts(user_ns, Syscall::geteuid()?, MntNamespaces))
+            .inc_ucounts(user_ns, do_geteuid()?, MntNamespaces))
     }
 
     pub fn dec_mnt_namespace(&self, uc: Arc<UCounts>) {

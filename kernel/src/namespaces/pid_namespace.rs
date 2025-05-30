@@ -9,8 +9,8 @@ use crate::container_of;
 use crate::filesystem::vfs::{IndexNode, ROOT_INODE};
 use crate::namespaces::namespace::NsOperations;
 use crate::process::fork::CloneFlags;
+use crate::process::geteuid::do_geteuid;
 use crate::process::ProcessManager;
-use crate::syscall::Syscall;
 use crate::{libs::rwlock::RwLock, process::Pid};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -264,7 +264,7 @@ impl PidNamespace {
     ) -> Result<Option<Arc<UCounts>>, SystemError> {
         Ok(self
             .ucounts
-            .inc_ucounts(user_ns, Syscall::geteuid()?, PidNamespaces))
+            .inc_ucounts(user_ns, do_geteuid()?, PidNamespaces))
     }
 
     pub fn dec_pid_namespaces(&mut self, uc: Arc<UCounts>) {

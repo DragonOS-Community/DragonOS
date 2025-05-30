@@ -1,5 +1,5 @@
 use core::{
-    ffi::{c_int, c_void},
+    ffi::c_int,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -10,12 +10,7 @@ use crate::{
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
     net::syscall::MsgHdr,
-    process::{
-        fork::KernelCloneArgs,
-        process_group::Pgid,
-        resource::{RLimit64, RUsage},
-        ProcessFlags, ProcessManager,
-    },
+    process::{fork::KernelCloneArgs, ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
@@ -36,7 +31,7 @@ use crate::{
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
-    process::{fork::CloneFlags, syscall::PosixOldUtsName, Pid},
+    process::fork::CloneFlags,
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         PosixTimeSpec,
@@ -269,20 +264,7 @@ impl Syscall {
                     .map(|_| 0)
                 }
             }
-            SYS_WAIT4 => {
-                let pid = args[0] as i32;
-                let wstatus = args[1] as *mut i32;
-                let options = args[2] as c_int;
-                let rusage = args[3] as *mut c_void;
-                // 权限校验
-                // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
-                Self::wait4(pid, wstatus, options, rusage)
-            }
 
-            SYS_EXIT => {
-                let exit_code = args[0];
-                Self::exit(exit_code)
-            }
             #[cfg(target_arch = "x86_64")]
             SYS_MKDIR => {
                 let path = args[0] as *const u8;
@@ -396,8 +378,6 @@ impl Syscall {
                 let old_act = args[2];
                 Self::sigaction(sig, act, old_act, frame.is_from_user())
             }
-
-            SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
             SYS_SCHED => {
                 warn!("syscall sched");
@@ -641,10 +621,6 @@ impl Syscall {
                 }
             }
 
-            SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pgid| pgid.into()),
-
-            SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
-
             SYS_FCNTL => {
                 let fd = args[0] as i32;
                 let cmd: Option<FcntlCommand> =
@@ -740,8 +716,6 @@ impl Syscall {
                 return ret;
             }
 
-            SYS_SET_TID_ADDRESS => Self::set_tid_address(args[0]),
-
             SYS_STATFS => {
                 let path = args[0] as *const u8;
                 let statfs = args[1] as *mut PosixStatfs;
@@ -788,12 +762,6 @@ impl Syscall {
 
             SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
 
-            SYS_SETPGID => {
-                let pid = Pid::new(args[0]);
-                let pgid = Pgid::new(args[1]);
-                Self::setpgid(pid, pgid)
-            }
-
             SYS_RT_SIGPROCMASK => {
                 let how = args[0] as i32;
                 let nset = args[1];
@@ -812,13 +780,6 @@ impl Syscall {
                 Ok(0)
             }
 
-            SYS_EXIT_GROUP => {
-                let exit_code = args[0];
-                Self::exit(exit_code)
-                // warn!("SYS_EXIT_GROUP has not yet been implemented");
-                // Ok(0)
-            }
-
             SYS_MADVISE => {
                 let addr = args[0];
                 let len = page_align_up(args[1]);
@@ -828,8 +789,6 @@ impl Syscall {
                     Self::madvise(VirtAddr::new(addr), len, args[2])
                 }
             }
-
-            SYS_GETTID => Self::gettid().map(|tid| tid.into()),
 
             SYS_SYSLOG => {
                 let syslog_action_type = args[0];
@@ -843,27 +802,6 @@ impl Syscall {
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
-            SYS_GETUID => Self::getuid(),
-            SYS_GETGID => Self::getgid(),
-            SYS_SETUID => Self::setuid(args[0]),
-            SYS_SETGID => Self::setgid(args[0]),
-
-            SYS_GETEUID => Self::geteuid(),
-            SYS_GETEGID => Self::getegid(),
-            SYS_SETRESUID => Self::seteuid(args[1]),
-            SYS_SETRESGID => Self::setegid(args[1]),
-
-            SYS_SETFSUID => Self::setfsuid(args[0]),
-            SYS_SETFSGID => Self::setfsgid(args[0]),
-
-            SYS_SETSID => Self::setsid(),
-            SYS_GETSID => Self::getsid(Pid::new(args[0])),
-
-            SYS_GETRUSAGE => {
-                let who = args[0] as c_int;
-                let rusage = args[1] as *mut RUsage;
-                Self::get_rusage(who, rusage)
-            }
             #[cfg(target_arch = "x86_64")]
             SYS_READLINK => {
                 let path = args[0] as *const u8;
@@ -878,16 +816,6 @@ impl Syscall {
                 let buf = args[2] as *mut u8;
                 let bufsiz = args[3];
                 Self::readlink_at(dirfd, path, buf, bufsiz)
-            }
-
-            SYS_PRLIMIT64 => {
-                let pid = args[0];
-                let pid = Pid::new(pid);
-                let resource = args[1];
-                let new_limit = args[2] as *const RLimit64;
-                let old_limit = args[3] as *mut RLimit64;
-
-                Self::prlimit64(pid, resource, new_limit, old_limit)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -999,19 +927,6 @@ impl Syscall {
                 Self::getaffinity(pid, set)
             }
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_GETRLIMIT => {
-                let resource = args[0];
-                let rlimit = args[1] as *mut RLimit64;
-
-                Self::prlimit64(
-                    ProcessManager::current_pcb().pid(),
-                    resource,
-                    core::ptr::null::<RLimit64>(),
-                    rlimit,
-                )
-            }
-
             SYS_FADVISE64 => {
                 // todo: 这个系统调用还没有实现
 
@@ -1038,10 +953,6 @@ impl Syscall {
             SYS_NEWFSTATAT => Self::newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
 
             // SYS_SCHED_YIELD => Self::sched_yield(),
-            SYS_UNAME => {
-                let name = args[0] as *mut PosixOldUtsName;
-                Self::uname(name)
-            }
             SYS_PRCTL => {
                 // todo: 这个系统调用还没有实现
 

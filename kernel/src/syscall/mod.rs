@@ -9,7 +9,7 @@ use crate::{
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
     net::syscall::MsgHdr,
-    process::{fork::KernelCloneArgs, resource::RLimit64, ProcessFlags, ProcessManager},
+    process::{fork::KernelCloneArgs, ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
@@ -29,7 +29,7 @@ use crate::{
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
-    process::{fork::CloneFlags, syscall::PosixOldUtsName, Pid},
+    process::{fork::CloneFlags, syscall::PosixOldUtsName},
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         PosixTimeSpec,
@@ -795,16 +795,6 @@ impl Syscall {
                 Self::readlink_at(dirfd, path, buf, bufsiz)
             }
 
-            SYS_PRLIMIT64 => {
-                let pid = args[0];
-                let pid = Pid::new(pid);
-                let resource = args[1];
-                let new_limit = args[2] as *const RLimit64;
-                let old_limit = args[3] as *mut RLimit64;
-
-                Self::prlimit64(pid, resource, new_limit, old_limit)
-            }
-
             #[cfg(target_arch = "x86_64")]
             SYS_ACCESS => {
                 let pathname = args[0] as *const u8;
@@ -912,19 +902,6 @@ impl Syscall {
                 let set: &mut [u8] = user_buffer_writer.buffer(0)?;
 
                 Self::getaffinity(pid, set)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_GETRLIMIT => {
-                let resource = args[0];
-                let rlimit = args[1] as *mut RLimit64;
-
-                Self::prlimit64(
-                    ProcessManager::current_pcb().pid(),
-                    resource,
-                    core::ptr::null::<RLimit64>(),
-                    rlimit,
-                )
             }
 
             SYS_FADVISE64 => {

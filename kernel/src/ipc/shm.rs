@@ -14,13 +14,13 @@ use crate::{
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
+use core::fmt;
 use core::sync::atomic::{compiler_fence, Ordering};
 use hashbrown::HashMap;
 use ida::IdAllocator;
 use log::info;
 use num::ToPrimitive;
 use system_error::SystemError;
-
 pub static mut SHM_MANAGER: Option<SpinLock<ShmManager>> = None;
 
 /// 用于创建新的私有IPC对象
@@ -100,6 +100,23 @@ impl From<usize> for ShmCtlCmd {
             14 => Self::ShmInfo,
             15 => Self::ShmtStatAny,
             _ => Self::Default,
+        }
+    }
+}
+
+impl fmt::Display for ShmCtlCmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShmCtlCmd::IpcRmid => write!(f, "IPC_RMID"),
+            ShmCtlCmd::IpcSet => write!(f, "IPC_SET"),
+            ShmCtlCmd::IpcStat => write!(f, "IPC_STAT"),
+            ShmCtlCmd::IpcInfo => write!(f, "IPC_INFO"),
+            ShmCtlCmd::ShmLock => write!(f, "SHM_LOCK"),
+            ShmCtlCmd::ShmUnlock => write!(f, "SHM_UNLOCK"),
+            ShmCtlCmd::ShmStat => write!(f, "SHM_STAT"),
+            ShmCtlCmd::ShmInfo => write!(f, "SHM_INFO"),
+            ShmCtlCmd::ShmtStatAny => write!(f, "SHM_STAT_ANY"),
+            ShmCtlCmd::Default => write!(f, "DEFAULT (Invalid Cmd)"),
         }
     }
 }

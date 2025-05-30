@@ -67,7 +67,7 @@ use crate::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
-    syscall::{user_access::clear_user, Syscall},
+    syscall::user_access::clear_user,
 };
 use timer::AlarmTimer;
 
@@ -386,7 +386,7 @@ impl ProcessManager {
                 return;
             }
             let parent_pcb = r.unwrap();
-            let r = Syscall::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
+            let r = crate::ipc::kill::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
             if r.is_err() {
                 warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",

@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigChildCode, Signal},
-    ipc::syscall::PidConverter,
+    ipc::syscall::sys_kill::PidConverter,
     sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
     time::{sleep::nanosleep, Duration},

@@ -22,7 +22,7 @@ use crate::{
     },
     mm::VirtAddr,
     process::{ProcessFlags, ProcessManager},
-    syscall::{user_access::UserBufferWriter, Syscall},
+    syscall::user_access::UserBufferWriter,
 };
 
 use super::TtyLineDiscipline;
@@ -789,7 +789,7 @@ impl NTtyData {
         let ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
         if let Some(pg) = pg {
-            let _ = Syscall::kill_process_group(pg, signal);
+            let _ = crate::ipc::kill::kill_process_group(pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {

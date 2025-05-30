@@ -158,7 +158,7 @@ impl RamFS {
 
 impl MountableFileSystem for RamFS {
     fn make_mount_data(
-        _raw_data: *const u8,
+        _raw_data: Option<&str>,
         _source: &str,
     ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
         // 目前ramfs不需要任何额外的mount数据

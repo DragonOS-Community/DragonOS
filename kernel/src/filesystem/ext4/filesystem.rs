@@ -97,7 +97,7 @@ impl MountableFileSystem for Ext4FileSystem {
         Self::from_gendisk(mount_data.gendisk.clone())
     }
     fn make_mount_data(
-        _raw_data: *const u8,
+        _raw_data: Option<&str>,
         source: &str,
     ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
         let mount_data = Ext4MountData::from_source(source).unwrap();

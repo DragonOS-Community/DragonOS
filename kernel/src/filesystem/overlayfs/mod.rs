@@ -32,15 +32,11 @@ pub struct OverlayMountData {
 }
 
 impl OverlayMountData {
-    pub fn from_raw(raw_data: *const u8) -> Result<Self, SystemError> {
-        if raw_data.is_null() {
+    pub fn from_raw(raw_data: Option<&str>) -> Result<Self, SystemError> {
+        if raw_data.is_none() {
             return Err(SystemError::EINVAL);
         }
-        let len = (0..)
-            .find(|&i| unsafe { raw_data.add(i).read() } == 0)
-            .ok_or(SystemError::EINVAL)?;
-        let slice = unsafe { core::slice::from_raw_parts(raw_data, len) };
-        let raw_str = core::str::from_utf8(slice).map_err(|_| SystemError::EINVAL)?;
+        let raw_str = raw_data.unwrap();
         let mut data = OverlayMountData {
             upper_dir: String::new(),
             lower_dirs: Vec::new(),
@@ -204,7 +200,7 @@ impl MountableFileSystem for OverlayFS {
     }
 
     fn make_mount_data(
-        raw_data: *const u8,
+        raw_data: Option<&str>,
         _source: &str,
     ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
         let mount_data = OverlayMountData::from_raw(raw_data).unwrap();

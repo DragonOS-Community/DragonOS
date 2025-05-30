@@ -974,7 +974,7 @@ impl DowncastArc for dyn FileSystem {
 /// # 可以被挂载的文件系统应该实现的trait
 pub trait MountableFileSystem: FileSystem {
     fn make_mount_data(
-        _raw_data: *const u8,
+        _raw_data: Option<&str>,
         _source: &str,
     ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
         log::error!("This filesystem does not support make_mount_data");
@@ -1008,7 +1008,7 @@ macro_rules! register_mountable_fs {
             }
 
             pub fn make_mount_data_bridge(
-                raw_data: *const u8,
+                raw_data: Option<&str>,
                 source: &str,
             ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
                 <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
@@ -1023,7 +1023,7 @@ macro_rules! register_mountable_fs {
                     Option<&dyn FileSystemMakerData>,
                 ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
             &($fs::make_mount_data_bridge
-                as fn(*const u8, &str) -> Option<Arc<dyn FileSystemMakerData + 'static>>),
+                as fn(Option<&str>, &str) -> Option<Arc<dyn FileSystemMakerData + 'static>>),
         );
     };
 }
@@ -1105,7 +1105,7 @@ pub trait FileSystemMakerData: Send + Sync {
 pub type FSMakerFunction =
     fn(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError>;
 pub type MountDataBuilder =
-    fn(raw_data: *const u8, source: &str) -> Option<Arc<dyn FileSystemMakerData>>;
+    fn(raw_data: Option<&str>, source: &str) -> Option<Arc<dyn FileSystemMakerData>>;
 
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {

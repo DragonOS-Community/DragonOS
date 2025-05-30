@@ -43,7 +43,7 @@ impl Syscall for SysMountHandle {
     fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
         let target = Self::target(args);
         let filesystemtype = Self::filesystemtype(args);
-        let data = Self::data(args);
+        let data = Self::raw_data(args);
         let source = Self::source(args);
 
         let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
@@ -69,11 +69,11 @@ impl Syscall for SysMountHandle {
             FormattedSyscallParam::new("source", format!("{:#x}", Self::source(args) as usize)),
             FormattedSyscallParam::new("target", format!("{:#x}", Self::target(args) as usize)),
             FormattedSyscallParam::new(
-                "filesystemtype",
+                "filesystem type",
                 format!("{:#x}", Self::filesystemtype(args) as usize),
             ),
             FormattedSyscallParam::new("mountflags", format!("{:#x}", Self::mountflags(args))),
-            FormattedSyscallParam::new("data", format!("{:#x}", Self::data(args) as usize)),
+            FormattedSyscallParam::new("data", format!("{:?}", Self::raw_data(args))),
         ]
     }
 }
@@ -91,8 +91,16 @@ impl SysMountHandle {
     fn mountflags(args: &[usize]) -> usize {
         args[3]
     }
-    fn data(args: &[usize]) -> *const u8 {
-        args[4] as *const u8
+    fn raw_data(args: &[usize]) -> Option<&'static str> {
+        let raw = args[4] as *const u8;
+        if raw.is_null() {
+            return None;
+        }
+        let len = (0..).find(|&i| unsafe { raw.add(i).read() } == 0).unwrap();
+
+        let slice = unsafe { core::slice::from_raw_parts(raw, len) };
+        let raw_str = core::str::from_utf8(slice).ok().unwrap();
+        Some(raw_str)
     }
 }
 

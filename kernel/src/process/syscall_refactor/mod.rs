@@ -1,3 +1,6 @@
+mod sys_exit;
+mod sys_exit_group;
+mod sys_get_rusage;
 mod sys_getegid;
 mod sys_geteuid;
 mod sys_getgid;
@@ -16,6 +19,4 @@ mod sys_setresgid;
 mod sys_setresuid;
 mod sys_setsid;
 mod sys_setuid;
-mod sys_get_rusage;
-mod sys_exit;
-mod sys_exit_group;
+mod sys_wait4;

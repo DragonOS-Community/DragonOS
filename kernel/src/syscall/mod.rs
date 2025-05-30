@@ -1,5 +1,5 @@
 use core::{
-    ffi::{c_int, c_void},
+    ffi::c_int,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -9,11 +9,7 @@ use crate::{
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
     net::syscall::MsgHdr,
-    process::{
-        fork::KernelCloneArgs,
-        resource::RLimit64,
-        ProcessFlags, ProcessManager,
-    },
+    process::{fork::KernelCloneArgs, resource::RLimit64, ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
@@ -265,15 +261,6 @@ impl Syscall {
                     )
                     .map(|_| 0)
                 }
-            }
-            SYS_WAIT4 => {
-                let pid = args[0] as i32;
-                let wstatus = args[1] as *mut i32;
-                let options = args[2] as c_int;
-                let rusage = args[3] as *mut c_void;
-                // 权限校验
-                // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
-                Self::wait4(pid, wstatus, options, rusage)
             }
 
             #[cfg(target_arch = "x86_64")]

@@ -20,7 +20,6 @@ use crate::{
 };
 
 use super::stat::{do_newfstatat, do_statx, vfs_fstat};
-use super::vcore::do_symlinkat;
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
@@ -59,6 +58,11 @@ mod sys_epoll_wait;
 
 pub mod sys_mount;
 pub mod sys_umount2;
+
+pub mod symlink_utils;
+#[cfg(target_arch = "x86_64")]
+mod sys_symlink;
+mod sys_symlinkat;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -857,18 +861,6 @@ impl Syscall {
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
-    }
-
-    pub fn symlink(oldname: *const u8, newname: *const u8) -> Result<usize, SystemError> {
-        return do_symlinkat(oldname, AtFlags::AT_FDCWD.bits(), newname);
-    }
-
-    pub fn symlinkat(
-        oldname: *const u8,
-        newdfd: i32,
-        newname: *const u8,
-    ) -> Result<usize, SystemError> {
-        return do_symlinkat(oldname, newdfd, newname);
     }
 
     /// # 修改文件名

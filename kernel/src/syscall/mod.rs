@@ -343,20 +343,6 @@ impl Syscall {
             }
 
             #[cfg(target_arch = "x86_64")]
-            SYS_SYMLINK => {
-                let oldname = args[0] as *const u8;
-                let newname = args[1] as *const u8;
-                Self::symlink(oldname, newname)
-            }
-
-            SYS_SYMLINKAT => {
-                let oldname = args[0] as *const u8;
-                let newdfd = args[1] as i32;
-                let newname = args[2] as *const u8;
-                Self::symlinkat(oldname, newdfd, newname)
-            }
-
-            #[cfg(target_arch = "x86_64")]
             SYS_RMDIR => {
                 let path = args[0] as *const u8;
                 Self::rmdir(path)

@@ -25,6 +25,7 @@ fn main() {
     if dir.is_err() {
         panic!("mkdir /mnt/ext4/tmp fail.");
     }
+    let _ = fs::remove_dir_all(path);
 
     if result == 0 {
         println!("Mount successful");
@@ -35,13 +36,12 @@ fn main() {
     let dur = clock.elapsed();
     println!("mount costing time: {} ns", dur.as_nanos());
 
-    let path = b"/mnt/ext4\0".as_ptr() as *const c_char;
-    let result = unsafe { umount(path) };
+    let result = unsafe { umount(target) };
     if result != 0 {
         let err = errno();
         println!("Mount failed with error code: {}", err.0);
     }
-    assert_eq!(result, 0, "Umount myramfs failed");
+    assert_eq!(result, 0, "Umount ext4 failed");
     println!("Umount successful");
 
     let _ = fs::remove_dir_all(ext4_path);

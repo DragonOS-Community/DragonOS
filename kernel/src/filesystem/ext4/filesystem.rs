@@ -1,28 +1,36 @@
 use crate::driver::base::block::gendisk::GenDisk;
+use crate::filesystem::ext4::inode::Ext4Inode;
 use crate::filesystem::vfs::fcntl::AtFlags;
-use crate::filesystem::vfs::utils::user_path_at;
-use crate::filesystem::vfs::vcore::try_find_gendisk;
+use crate::filesystem::vfs::utils::{user_path_at, DName};
+use crate::filesystem::vfs::vcore::{generate_inode_id, try_find_gendisk};
 use crate::filesystem::vfs::{
     self, FileSystem, FileSystemMaker, FileSystemMakerData, IndexNode, Magic, MountableFileSystem,
     FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+use crate::libs::spinlock::SpinLock;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::process::ProcessManager;
 use crate::register_mountable_fs;
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+};
 use kdepends::another_ext4;
 use linkme::distributed_slice;
 use system_error::SystemError;
 
+use super::inode::LockedExt4Inode;
+
 pub struct Ext4FileSystem {
     pub(super) fs: another_ext4::Ext4,
-    self_ref: Weak<Self>,
+
+    root_inode: Arc<LockedExt4Inode>,
 }
 
 impl FileSystem for Ext4FileSystem {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
-        super::inode::Ext4Inode::point_to_root(self.self_ref.clone())
+        self.root_inode.clone()
     }
 
     fn info(&self) -> vfs::FsInfo {
@@ -58,10 +66,23 @@ impl FileSystem for Ext4FileSystem {
 impl Ext4FileSystem {
     pub fn from_gendisk(mount_data: Arc<GenDisk>) -> Result<Arc<dyn FileSystem>, SystemError> {
         let fs = another_ext4::Ext4::load(mount_data)?;
-        Ok(Arc::new_cyclic(|me| Ext4FileSystem {
-            fs,
-            self_ref: me.clone(),
-        }))
+        let root_inode: Arc<LockedExt4Inode> =
+            Arc::new(LockedExt4Inode(SpinLock::new(Ext4Inode {
+                inode_num: another_ext4::EXT4_ROOT_INO,
+                fs_ptr: Weak::default(),
+                page_cache: None,
+                children: BTreeMap::new(),
+                dname: DName::from("/"),
+                inode_id: generate_inode_id(),
+            })));
+
+        let fs = Arc::new(Ext4FileSystem { fs, root_inode });
+
+        let mut guard = fs.root_inode.0.lock();
+        guard.fs_ptr = Arc::downgrade(&fs);
+        drop(guard);
+
+        Ok(fs)
     }
 }
 

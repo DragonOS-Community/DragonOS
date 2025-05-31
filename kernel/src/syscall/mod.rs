@@ -579,16 +579,7 @@ impl Syscall {
 
                 Self::mremap(old_vaddr, old_len, new_len, mremap_flags, new_vaddr)
             }
-            SYS_MUNMAP => {
-                let addr = args[0];
-                let len = page_align_up(args[1]);
-                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
-                    // The addr argument is not a multiple of the page size
-                    Err(SystemError::EINVAL)
-                } else {
-                    Self::munmap(VirtAddr::new(addr), len)
-                }
-            }
+
             SYS_MPROTECT => {
                 let addr = args[0];
                 let len = page_align_up(args[1]);

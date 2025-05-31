@@ -19,8 +19,11 @@ use super::{
     verify_area, MsFlags, VirtAddr, VmFlags,
 };
 
+use crate::mm::syscall::sys_munmap::do_munmap;
+
 mod sys_brk;
 mod sys_mmap;
+mod sys_munmap;
 mod sys_sbrk;
 
 bitflags! {
@@ -320,7 +323,7 @@ impl Syscall {
 
         // 缩小旧内存映射区域
         if old_len > new_len {
-            Self::munmap(old_vaddr + new_len, old_len - new_len)?;
+            do_munmap(old_vaddr + new_len, old_len - new_len)?;
             return Ok(old_vaddr.data());
         }
 
@@ -335,43 +338,10 @@ impl Syscall {
         )?;
 
         if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) {
-            Self::munmap(old_vaddr, old_len)?;
+            do_munmap(old_vaddr, old_len)?;
         }
 
         return Ok(r.data());
-    }
-
-    /// ## munmap系统调用
-    ///
-    /// ## 参数
-    ///
-    /// - `start_vaddr`：取消映射的起始地址（已经对齐到页）
-    /// - `len`：取消映射的字节数(已经对齐到页)
-    ///
-    /// ## 返回值
-    ///
-    /// 成功时返回0，失败时返回错误码
-    pub fn munmap(start_vaddr: VirtAddr, len: usize) -> Result<usize, SystemError> {
-        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
-        assert!(check_aligned(len, MMArch::PAGE_SIZE));
-
-        if unlikely(verify_area(start_vaddr, len).is_err()) {
-            return Err(SystemError::EINVAL);
-        }
-        if unlikely(len == 0) {
-            return Err(SystemError::EINVAL);
-        }
-
-        let current_address_space: Arc<AddressSpace> = AddressSpace::current()?;
-        let start_frame = VirtPageFrame::new(start_vaddr);
-        let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
-
-        current_address_space
-            .write()
-            .munmap(start_frame, page_count)
-            .map_err(|_| SystemError::EINVAL)?;
-
-        return Ok(0);
     }
 
     /// ## mprotect系统调用

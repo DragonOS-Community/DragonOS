@@ -570,17 +570,6 @@ impl Syscall {
                 Self::gettimeofday(timeval, timezone_ptr)
             }
 
-            SYS_MPROTECT => {
-                let addr = args[0];
-                let len = page_align_up(args[1]);
-                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
-                    // The addr argument is not a multiple of the page size
-                    Err(SystemError::EINVAL)
-                } else {
-                    Self::mprotect(VirtAddr::new(addr), len, args[2])
-                }
-            }
-
             SYS_GETCWD => {
                 let buf = args[0] as *mut u8;
                 let size = args[1];

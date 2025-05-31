@@ -21,6 +21,7 @@ use super::{
 
 mod sys_brk;
 mod sys_mmap;
+mod sys_mprotect;
 mod sys_mremap;
 mod sys_munmap;
 mod sys_sbrk;
@@ -256,41 +257,6 @@ impl From<VmFlags> for ProtFlags {
 }
 
 impl Syscall {
-    /// ## mprotect系统调用
-    ///
-    /// ## 参数
-    ///
-    /// - `start_vaddr`：起始地址(已经对齐到页)
-    /// - `len`：长度(已经对齐到页)
-    /// - `prot_flags`：保护标志
-    pub fn mprotect(
-        start_vaddr: VirtAddr,
-        len: usize,
-        prot_flags: usize,
-    ) -> Result<usize, SystemError> {
-        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
-        assert!(check_aligned(len, MMArch::PAGE_SIZE));
-
-        if unlikely(verify_area(start_vaddr, len).is_err()) {
-            return Err(SystemError::EINVAL);
-        }
-        if unlikely(len == 0) {
-            return Err(SystemError::EINVAL);
-        }
-
-        let prot_flags = ProtFlags::from_bits(prot_flags as u64).ok_or(SystemError::EINVAL)?;
-
-        let current_address_space: Arc<AddressSpace> = AddressSpace::current()?;
-        let start_frame = VirtPageFrame::new(start_vaddr);
-        let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
-
-        current_address_space
-            .write()
-            .mprotect(start_frame, page_count, prot_flags)
-            .map_err(|_| SystemError::EINVAL)?;
-        return Ok(0);
-    }
-
     /// ## madvise系统调用
     ///
     /// ## 参数

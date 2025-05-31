@@ -1,7 +1,7 @@
 use core::{intrinsics::unlikely, slice::from_raw_parts};
 
 use alloc::sync::Arc;
-use log::error;
+
 use system_error::SystemError;
 
 use crate::{
@@ -19,10 +19,9 @@ use super::{
     verify_area, MsFlags, VirtAddr, VmFlags,
 };
 
-use crate::mm::syscall::sys_munmap::do_munmap;
-
 mod sys_brk;
 mod sys_mmap;
+mod sys_mremap;
 mod sys_munmap;
 mod sys_sbrk;
 
@@ -257,93 +256,6 @@ impl From<VmFlags> for ProtFlags {
 }
 
 impl Syscall {
-    /// ## mremap系统调用
-    ///
-    ///
-    /// ## 参数
-    ///
-    /// - `old_vaddr`：原映射的起始地址
-    /// - `old_len`：原映射的长度
-    /// - `new_len`：重新映射的长度
-    /// - `mremap_flags`：重映射标志
-    /// - `new_vaddr`：重新映射的起始地址
-    ///
-    /// ## 返回值
-    ///
-    /// 成功时返回重映射的起始地址，失败时返回错误码
-    pub fn mremap(
-        old_vaddr: VirtAddr,
-        old_len: usize,
-        new_len: usize,
-        mremap_flags: MremapFlags,
-        new_vaddr: VirtAddr,
-    ) -> Result<usize, SystemError> {
-        // 需要重映射到新内存区域的情况下，必须包含MREMAP_MAYMOVE并且指定新地址
-        if mremap_flags.contains(MremapFlags::MREMAP_FIXED)
-            && (!mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE)
-                || new_vaddr == VirtAddr::new(0))
-        {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 不取消旧映射的情况下，必须包含MREMAP_MAYMOVE并且新内存大小等于旧内存大小
-        if mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP)
-            && (!mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE) || old_len != new_len)
-        {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 旧内存地址必须对齐
-        if !old_vaddr.check_aligned(MMArch::PAGE_SIZE) {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 将old_len、new_len 对齐页面大小
-        let old_len = page_align_up(old_len);
-        let new_len = page_align_up(new_len);
-
-        // 不允许重映射内存区域大小为0
-        if new_len == 0 {
-            return Err(SystemError::EINVAL);
-        }
-
-        let current_address_space = AddressSpace::current()?;
-        let vma = current_address_space.read().mappings.contains(old_vaddr);
-        if vma.is_none() {
-            return Err(SystemError::EINVAL);
-        }
-        let vma = vma.unwrap();
-        let vm_flags = *vma.lock_irqsave().vm_flags();
-
-        // 暂时不支持巨页映射
-        if vm_flags.contains(VmFlags::VM_HUGETLB) {
-            error!("mmap: not support huge page mapping");
-            return Err(SystemError::ENOSYS);
-        }
-
-        // 缩小旧内存映射区域
-        if old_len > new_len {
-            do_munmap(old_vaddr + new_len, old_len - new_len)?;
-            return Ok(old_vaddr.data());
-        }
-
-        // 重映射到新内存区域
-        let r = current_address_space.write().mremap(
-            old_vaddr,
-            old_len,
-            new_len,
-            mremap_flags,
-            new_vaddr,
-            vm_flags,
-        )?;
-
-        if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) {
-            do_munmap(old_vaddr, old_len)?;
-        }
-
-        return Ok(r.data());
-    }
-
     /// ## mprotect系统调用
     ///
     /// ## 参数

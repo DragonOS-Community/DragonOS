@@ -1,7 +1,5 @@
 use core::{intrinsics::unlikely, slice::from_raw_parts};
 
-use alloc::sync::Arc;
-
 use system_error::SystemError;
 
 use crate::{
@@ -14,12 +12,12 @@ use crate::{
 };
 
 use super::{
-    allocator::page_frame::{PageFrameCount, VirtPageFrame},
-    ucontext::AddressSpace,
-    verify_area, MsFlags, VirtAddr, VmFlags,
+    allocator::page_frame::PageFrameCount, ucontext::AddressSpace, verify_area, MsFlags, VirtAddr,
+    VmFlags,
 };
 
 mod sys_brk;
+mod sys_madvise;
 mod sys_mmap;
 mod sys_mprotect;
 mod sys_mremap;
@@ -257,42 +255,6 @@ impl From<VmFlags> for ProtFlags {
 }
 
 impl Syscall {
-    /// ## madvise系统调用
-    ///
-    /// ## 参数
-    ///
-    /// - `start_vaddr`：起始地址(已经对齐到页)
-    /// - `len`：长度(已经对齐到页)
-    /// - `madv_flags`：建议标志
-    pub fn madvise(
-        start_vaddr: VirtAddr,
-        len: usize,
-        madv_flags: usize,
-    ) -> Result<usize, SystemError> {
-        if !start_vaddr.check_aligned(MMArch::PAGE_SIZE) || !check_aligned(len, MMArch::PAGE_SIZE) {
-            return Err(SystemError::EINVAL);
-        }
-
-        if unlikely(verify_area(start_vaddr, len).is_err()) {
-            return Err(SystemError::EINVAL);
-        }
-        if unlikely(len == 0) {
-            return Err(SystemError::EINVAL);
-        }
-
-        let madv_flags = MadvFlags::from_bits(madv_flags as u64).ok_or(SystemError::EINVAL)?;
-
-        let current_address_space: Arc<AddressSpace> = AddressSpace::current()?;
-        let start_frame = VirtPageFrame::new(start_vaddr);
-        let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
-
-        current_address_space
-            .write()
-            .madvise(start_frame, page_count, madv_flags)
-            .map_err(|_| SystemError::EINVAL)?;
-        return Ok(0);
-    }
-
     /// ## msync系统调用
     ///
     /// ## 参数

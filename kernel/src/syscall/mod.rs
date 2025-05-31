@@ -26,7 +26,7 @@ use system_error::SystemError;
 use table::{syscall_table, syscall_table_init};
 
 use crate::{
-    arch::{interrupt::TrapFrame, MMArch},
+    arch::interrupt::TrapFrame,
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
@@ -34,7 +34,7 @@ use crate::{
         MAX_PATHLEN,
     },
     libs::align::page_align_up,
-    mm::{verify_area, MemoryManagementArch, VirtAddr},
+    mm::{verify_area, VirtAddr},
     net::syscall::SockAddr,
     process::{fork::CloneFlags, syscall::PosixOldUtsName, Pid},
     time::{
@@ -804,16 +804,6 @@ impl Syscall {
                 Self::exit(exit_code)
                 // warn!("SYS_EXIT_GROUP has not yet been implemented");
                 // Ok(0)
-            }
-
-            SYS_MADVISE => {
-                let addr = args[0];
-                let len = page_align_up(args[1]);
-                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
-                    Err(SystemError::EINVAL)
-                } else {
-                    Self::madvise(VirtAddr::new(addr), len, args[2])
-                }
             }
 
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),

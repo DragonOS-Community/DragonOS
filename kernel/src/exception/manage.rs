@@ -528,7 +528,7 @@ impl IrqManager {
             }
             // debug!("to irq_activate");
             // 激活中断。这种激活必须独立于IRQ_NOAUTOEN进行*desc_inner_guard.internal_state_mut() |= IrqDescState::IRQS_NOREQUEST;uest.
-            if let Err(e) = self.irq_activate(&desc, &mut resp.desc_inner_guard) {
+            if let Err(e) = self.irq_activate(desc, &mut resp.desc_inner_guard) {
                 // debug!(
                 //     "Failed to activate irq {} (name: {}, flags: {:?}), error {:?}",
                 //     irq.data(),
@@ -597,7 +597,7 @@ impl IrqManager {
             {
                 // 如果没有设置IRQF_NOAUTOEN，则自动使能中断
                 self.irq_startup(
-                    &desc,
+                    desc,
                     &mut resp.desc_inner_guard,
                     Self::IRQ_RESEND,
                     Self::IRQ_START_COND,
@@ -667,8 +667,8 @@ impl IrqManager {
         drop(resp.req_mutex_guard);
 
         drop(resp.action_guard);
-        self.wake_up_and_wait_for_irq_thread_ready(&desc, Some(action.clone()));
-        self.wake_up_and_wait_for_irq_thread_ready(&desc, action.inner().secondary());
+        self.wake_up_and_wait_for_irq_thread_ready(desc, Some(action.clone()));
+        self.wake_up_and_wait_for_irq_thread_ready(desc, action.inner().secondary());
         Ok(())
     }
 

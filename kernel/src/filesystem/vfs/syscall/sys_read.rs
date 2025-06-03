@@ -1,11 +1,11 @@
 use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_READ;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::UserBufferWriter;
-
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -34,12 +34,12 @@ impl Syscall for SysReadHandle {
     /// # Returns
     /// * `Ok(usize)` - Number of bytes successfully read
     /// * `Err(SystemError)` - Error code if operation fails
-    fn handle(&self, args: &[usize], from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
 
-        let mut user_buffer_writer = UserBufferWriter::new(buf_vaddr, len, from_user)?;
+        let mut user_buffer_writer = UserBufferWriter::new(buf_vaddr, len, frame.is_from_user())?;
 
         let user_buf = user_buffer_writer.buffer(0)?;
         do_read(fd, user_buf)

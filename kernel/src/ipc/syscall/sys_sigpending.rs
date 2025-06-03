@@ -1,3 +1,4 @@
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::{
     alloc::vec::Vec,
     arch::ipc::signal::SigSet,
@@ -11,7 +12,6 @@ use crate::{
 use core::mem::size_of;
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
-
 pub struct SysSigpendingHandle;
 
 #[inline(never)]
@@ -51,7 +51,7 @@ impl Syscall for SysSigpendingHandle {
             FormattedSyscallParam::new("sigsetsize", format!("{}", args[1])),
         ]
     }
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let user_sigset = SysSigpendingHandle::user_sigset_ptr(args);
         let size = SysSigpendingHandle::sigsetsize(args);
 

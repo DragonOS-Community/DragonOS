@@ -1,4 +1,5 @@
 use crate::alloc::vec::Vec;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::{
     arch::syscall::nr::SYS_SHMCTL,
     ipc::shm::{shm_manager_lock, ShmCtlCmd, ShmId},
@@ -6,7 +7,6 @@ use crate::{
 };
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
-
 pub struct SysShmctlHandle;
 
 /// # SYS_SHMCTL系统调用函数，用于管理共享内存段
@@ -81,11 +81,11 @@ impl Syscall for SysShmctlHandle {
         ]
     }
 
-    fn handle(&self, args: &[usize], from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let id = Self::id(args);
         let cmd = Self::cmd(args);
         let user_buf = Self::user_buf(args);
-        do_kernel_shmctl(id, cmd, user_buf, from_user)
+        do_kernel_shmctl(id, cmd, user_buf, frame.is_from_user())
     }
 }
 

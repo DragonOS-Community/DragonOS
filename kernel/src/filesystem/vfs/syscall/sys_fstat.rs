@@ -6,9 +6,9 @@ use crate::arch::syscall::nr::SYS_FSTAT;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 
+use crate::arch::x86_64::interrupt::TrapFrame;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-
 pub struct SysFstatHandle;
 
 impl Syscall for SysFstatHandle {
@@ -17,7 +17,7 @@ impl Syscall for SysFstatHandle {
         2
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         let usr_kstat = Self::usr_kstat(args);
         crate::syscall::Syscall::newfstat(fd, usr_kstat)

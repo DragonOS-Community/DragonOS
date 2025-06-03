@@ -2,14 +2,14 @@
 
 use system_error::SystemError;
 
-use defer::defer;
-
 use crate::arch::syscall::nr::SYS_STAT;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::sys_close::do_close;
 use crate::filesystem::vfs::ModeType;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
+use defer::defer;
 
 use alloc::vec::Vec;
 
@@ -21,7 +21,7 @@ impl Syscall for SysStatHandle {
         2
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let path = Self::path(args);
         let usr_kstat = Self::usr_kstat(args);
 

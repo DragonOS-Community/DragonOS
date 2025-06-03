@@ -1,11 +1,11 @@
 use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_READV;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::filesystem::vfs::iov::IoVec;
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -22,7 +22,7 @@ impl Syscall for SysReadVHandle {
         3
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         let iov = Self::iov(args);
         let count = Self::count(args);

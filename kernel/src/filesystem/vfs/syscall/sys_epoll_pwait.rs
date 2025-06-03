@@ -1,7 +1,9 @@
 //! System call handler for epoll_pwait.
 
+use super::epoll_utils::do_epoll_wait;
 use crate::arch::ipc::signal::SigSet;
 use crate::arch::syscall::nr::SYS_EPOLL_PWAIT;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::ipc::signal::restore_saved_sigmask;
 use crate::ipc::signal::set_user_sigmask;
 use crate::mm::VirtAddr;
@@ -11,8 +13,6 @@ use crate::syscall::user_access::UserBufferReader;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use super::epoll_utils::do_epoll_wait;
-
 pub struct SysEpollPwaitHandle;
 
 impl Syscall for SysEpollPwaitHandle {
@@ -20,7 +20,7 @@ impl Syscall for SysEpollPwaitHandle {
         5
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let epfd = Self::epfd(args);
         let epoll_event = Self::epoll_event(args);
         let max_events = Self::max_events(args);

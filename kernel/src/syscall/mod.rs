@@ -106,7 +106,7 @@ impl Syscall {
             //     handler.name,
             //     handler.args_string(args)
             // );
-            return handler.inner_handle.handle(args, frame.is_from_user());
+            return handler.inner_handle.handle(args, frame);
         }
 
         // 如果找不到，fallback到原有逻辑

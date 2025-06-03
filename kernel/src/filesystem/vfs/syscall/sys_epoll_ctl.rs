@@ -1,6 +1,7 @@
 //! System call handler for epoll_ctl.
 
 use crate::arch::syscall::nr::SYS_EPOLL_CTL;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::EPollCtlOption;
 use crate::filesystem::epoll::EPollEvent;
@@ -18,7 +19,7 @@ impl Syscall for SysEpollCtlHandle {
         4
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let op = EPollCtlOption::from_op_num(Self::op(args))?;
         let mut epds = EPollEvent::default();
         let event = Self::event(args);

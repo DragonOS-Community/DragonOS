@@ -3,6 +3,7 @@
 use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_OPEN;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 
@@ -19,7 +20,7 @@ impl Syscall for SysOpenHandle {
     }
 
     /// Handles the open syscall by extracting arguments and calling `do_open`.
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let path = Self::path(args);
         let flags = Self::flags(args);
         let mode = Self::mode(args);

@@ -1,4 +1,5 @@
 use crate::alloc::vec::Vec;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     arch::syscall::nr::SYS_RT_SIGPROCMASK,
@@ -12,7 +13,6 @@ use crate::{
 use core::mem::size_of;
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError; // 添加 Vec
-
 pub struct SysRtSigprocmaskHandle;
 
 /// # SYS_SIGPROCMASK系统调用函数，用于设置或查询当前进程的信号屏蔽字
@@ -122,7 +122,7 @@ impl Syscall for SysRtSigprocmaskHandle {
         ]
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let how = Self::how(args);
         let nset = Self::nset(args);
         let oset = Self::oset(args);

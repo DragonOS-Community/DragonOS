@@ -1,5 +1,6 @@
 use super::sys_pipe2::do_kernel_pipe2;
 use crate::arch::syscall::nr::SYS_PIPE;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::{
     filesystem::vfs::file::FileMode,
     syscall::table::{FormattedSyscallParam, Syscall},
@@ -23,7 +24,7 @@ impl Syscall for SysPipeHandle {
         1 // pipefd
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pipefd = Self::pipefd(args);
         if pipefd.is_null() {
             return Err(SystemError::EFAULT);

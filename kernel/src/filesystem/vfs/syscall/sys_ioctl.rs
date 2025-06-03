@@ -1,6 +1,7 @@
 //! System call handler for ioctls.
 
 use crate::arch::syscall::nr::SYS_IOCTL;
+use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -29,7 +30,7 @@ impl Syscall for SysIoctlHandle {
     ///
     /// * `Ok(usize)` - On success, returns 0
     /// * `Err(SystemError)` - On failure, returns a POSIX error code
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         let cmd = Self::cmd(args);
         let data = Self::data(args);

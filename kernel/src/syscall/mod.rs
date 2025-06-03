@@ -342,19 +342,6 @@ impl Syscall {
                 let path = args[0] as *const u8;
                 Self::unlink(path)
             }
-            SYS_KILL => {
-                let pid = args[0] as i32;
-                let sig = args[1] as c_int;
-                // debug!("KILL SYSCALL RECEIVED");
-                Self::kill(pid, sig)
-            }
-
-            SYS_RT_SIGACTION => {
-                let sig = args[0] as c_int;
-                let act = args[1];
-                let old_act = args[2];
-                Self::sigaction(sig, act, old_act, frame.is_from_user())
-            }
 
             SYS_SCHED => {
                 warn!("syscall sched");
@@ -738,14 +725,6 @@ impl Syscall {
             }
 
             SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
-
-            SYS_RT_SIGPROCMASK => {
-                let how = args[0] as i32;
-                let nset = args[1];
-                let oset = args[2];
-                let sigsetsize = args[3];
-                Self::rt_sigprocmask(how, nset, oset, sigsetsize)
-            }
 
             SYS_TKILL => {
                 warn!("SYS_TKILL has not yet been implemented");

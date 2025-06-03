@@ -1,5 +1,5 @@
 use super::KernFSInode;
-use crate::debug::tracing::tracepoint::TracePoint;
+use crate::tracepoint::{TracePipeSnapshot, TracePointInfo};
 use crate::{
     filesystem::{sysfs::SysFSKernPrivateData, vfs::PollStatus},
     libs::spinlock::SpinLockGuard,
@@ -86,7 +86,8 @@ impl<'a> KernCallbackData<'a> {
 #[derive(Debug)]
 pub enum KernInodePrivateData {
     SysFS(SysFSKernPrivateData),
-    DebugFS(&'static TracePoint),
+    DebugFS(Arc<TracePointInfo>),
+    TracePipe(TracePipeSnapshot),
 }
 
 impl KernInodePrivateData {

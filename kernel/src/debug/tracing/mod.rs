@@ -28,7 +28,14 @@ pub fn trace_pipe_push_raw_record(record: &[u8]) {
 pub fn trace_cmdline_push(pid: u32) {
     let process = crate::process::ProcessManager::current_pcb();
     let binding = process.basic();
-    let pname = binding.name().split(' ').next().unwrap_or("unknown");
+    let pname = binding
+        .name()
+        .split(' ')
+        .next()
+        .unwrap_or("unknown")
+        .split('/')
+        .last()
+        .unwrap_or("unknown");
     TRACE_CMDLINE_CACHE.lock().insert(pid, pname.to_string());
 }
 
@@ -108,6 +115,7 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
     //     None,
     //     Some(&trace_pipe::TraceCallBack),
     // )?;
+
     tracing_root.add_file_lazy("trace".to_string(), trace_pipe::kernel_inode_provider)?;
 
     tracing_root.add_file(

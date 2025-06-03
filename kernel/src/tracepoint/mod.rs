@@ -17,7 +17,9 @@ use core::{
 };
 pub use point::{CommonTracePointMeta, TraceEntry, TracePoint, TracePointFunc};
 use system_error::SystemError;
-pub use trace_pipe::{TraceCmdLineCache, TraceEntryParser, TracePipeRaw, TracePipeSnapshot};
+pub use trace_pipe::{
+    TraceCmdLineCache, TraceEntryParser, TracePipeOps, TracePipeRaw, TracePipeSnapshot,
+};
 
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 

@@ -1,7 +1,16 @@
-use alloc::string::ToString;
-
 use crate::tracepoint::{TraceEntry, TracePointMap};
 use alloc::{format, string::String, vec::Vec};
+
+pub trait TracePipeOps {
+    /// Returns the first event in the trace pipe buffer without removing it.
+    fn peek(&self) -> Option<&Vec<u8>>;
+
+    /// Remove and return the first event in the trace pipe buffer.
+    fn pop(&mut self) -> Option<Vec<u8>>;
+
+    /// Whether the trace pipe buffer is empty.
+    fn is_empty(&self) -> bool;
+}
 
 /// A raw trace pipe buffer that stores trace events as byte vectors.
 pub struct TracePipeRaw {
@@ -49,14 +58,14 @@ impl TracePipeRaw {
     pub fn snapshot(&self) -> TracePipeSnapshot {
         TracePipeSnapshot::new(self.event_buf.clone())
     }
+}
 
-    /// Returns the first event in the trace pipe buffer without removing it.
-    pub fn peek(&self) -> Option<&Vec<u8>> {
+impl TracePipeOps for TracePipeRaw {
+    fn peek(&self) -> Option<&Vec<u8>> {
         self.event_buf.first()
     }
 
-    /// Remove and return the first event in the trace pipe buffer.
-    pub fn pop(&mut self) -> Option<Vec<u8>> {
+    fn pop(&mut self) -> Option<Vec<u8>> {
         if self.event_buf.is_empty() {
             None
         } else {
@@ -64,26 +73,22 @@ impl TracePipeRaw {
         }
     }
 
-    /// Whether the trace pipe buffer is empty.
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.event_buf.is_empty()
     }
 }
 
 #[derive(Debug)]
-pub struct TracePipeSnapshot {
-    event_buf: Vec<Vec<u8>>,
-}
+pub struct TracePipeSnapshot(Vec<Vec<u8>>);
 
 impl TracePipeSnapshot {
     pub fn new(event_buf: Vec<Vec<u8>>) -> Self {
-        Self { event_buf }
+        Self(event_buf)
     }
 
     /// The formatted string representation to be used as a header for the trace pipe output.
-    pub fn default_fmt_str() -> &'static str {
-        "# tracer: nop
-#
+    pub fn default_fmt_str(&self) -> String {
+        let show = "#
 #
 #                                _-----=> irqs-off/BH-disabled
 #                               / _----=> need-resched
@@ -93,26 +98,31 @@ impl TracePipeSnapshot {
 #                              |||| /     delay
 #           TASK-PID     CPU#  |||||  TIMESTAMP  FUNCTION
 #              | |         |   |||||     |         |
-"
+";
+        format!(
+            "# tracer: nop\n#\n# entries-in-buffer/entries-written: {}/{}   #P:32\n{}",
+            self.0.len(),
+            self.0.len(),
+            show
+        )
+    }
+}
+
+impl TracePipeOps for TracePipeSnapshot {
+    fn peek(&self) -> Option<&Vec<u8>> {
+        self.0.first()
     }
 
-    /// Whether the trace pipe buffer is empty.
-    pub fn is_empty(&self) -> bool {
-        self.event_buf.is_empty()
-    }
-
-    /// Returns the first event in the trace pipe buffer without removing it.
-    pub fn peek(&self) -> Option<&Vec<u8>> {
-        self.event_buf.first()
-    }
-
-    /// Remove and return the first event in the trace pipe buffer.
-    pub fn pop(&mut self) -> Option<Vec<u8>> {
-        if self.event_buf.is_empty() {
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        if self.0.is_empty() {
             None
         } else {
-            Some(self.event_buf.remove(0))
+            Some(self.0.remove(0))
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -120,7 +130,7 @@ impl TracePipeSnapshot {
 ///
 /// See https://www.kernel.org/doc/Documentation/trace/ftrace.txt
 pub struct TraceCmdLineCache {
-    cmdline: Vec<(u32, String)>,
+    cmdline: Vec<(u32, [u8; 16])>,
     max_record: usize,
 }
 
@@ -133,19 +143,34 @@ impl TraceCmdLineCache {
     }
 
     /// Insert a command line argument for a trace point.
+    ///
+    /// If the command line exceeds 16 bytes, it will be truncated.
+    /// If the cache exceeds the maximum record limit, the oldest entry will be removed.
     pub fn insert(&mut self, id: u32, cmdline: String) {
         if self.cmdline.len() >= self.max_record {
             // Remove the oldest entry if we exceed the max record limit
             self.cmdline.remove(0);
         }
-        self.cmdline.push((id, cmdline));
+        let mut cmdline_bytes = [0u8; 16];
+        if cmdline.len() > 16 {
+            // Truncate to fit the fixed size
+            cmdline_bytes.copy_from_slice(&cmdline.as_bytes()[..16]);
+        } else {
+            // Copy the command line bytes into the fixed size array
+            cmdline_bytes[..cmdline.len()].copy_from_slice(cmdline.as_bytes());
+        }
+        self.cmdline.push((id, cmdline_bytes));
     }
 
     /// Get the command line argument for a trace point.
-    pub fn get(&self, id: u32) -> Option<&String> {
-        self.cmdline
-            .iter()
-            .find_map(|(key, value)| if *key == id { Some(value) } else { None })
+    pub fn get(&self, id: u32) -> Option<&str> {
+        self.cmdline.iter().find_map(|(key, value)| {
+            if *key == id {
+                Some(core::str::from_utf8(value).unwrap().trim_end_matches('\0'))
+            } else {
+                None
+            }
+        })
     }
 
     /// Set the maximum length for command line arguments.
@@ -176,10 +201,7 @@ impl TraceEntryParser {
         let time = crate::time::Instant::now().total_micros() * 1000; // Convert to nanoseconds
         let cpu_id = crate::arch::cpu::current_cpu_id().data();
 
-        let pname = cmdline_cache
-            .get(trace_entry.pid as u32)
-            .unwrap_or(&"<...>".to_string())
-            .clone();
+        let pname = cmdline_cache.get(trace_entry.pid as u32).unwrap_or("<...>");
 
         let secs = time / 1_000_000_000;
         let usec_rem = time % 1_000_000_000 / 1000;

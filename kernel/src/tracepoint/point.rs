@@ -20,11 +20,11 @@ impl TraceEntry {
         let hardsoft_irq = '.';
         let mut preempt_low = '.';
         if self.preempt_count & 0xf != 0 {
-            preempt_low = (self.preempt_count & 0xf) as char;
+            preempt_low = ((b'0') + (self.preempt_count & 0xf)) as char;
         }
         let mut preempt_high = '.';
         if self.preempt_count >> 4 != 0 {
-            preempt_high = (self.preempt_count >> 4) as char;
+            preempt_high = ((b'0') + (self.preempt_count >> 4)) as char;
         }
         format!(
             "{}{}{}{}{}",

@@ -29,8 +29,8 @@ impl KernFSCallback for EnableCallBack {
         if offset >= enable_value.as_bytes().len() {
             return Ok(0); // Offset is beyond the length of the string
         }
-        let len = buf.len().min(enable_value.as_bytes().len());
-        buf[..len].copy_from_slice(&enable_value.as_bytes()[..len]);
+        let len = buf.len().min(enable_value.as_bytes().len() - offset);
+        buf[..len].copy_from_slice(&enable_value.as_bytes()[offset..offset + len]);
         Ok(len)
     }
 
@@ -74,9 +74,8 @@ impl KernFSCallback for FormatCallBack {
         if offset >= format_str.as_bytes().len() {
             return Ok(0); // Offset is beyond the length of the string
         }
-        let len = buf.len().min(format_str.as_bytes().len());
-
-        buf[..len].copy_from_slice(&format_str.as_bytes()[..len]);
+        let len = buf.len().min(format_str.as_bytes().len() - offset);
+        buf[..len].copy_from_slice(&format_str.as_bytes()[offset..offset + len]);
         Ok(len)
     }
 
@@ -114,8 +113,8 @@ impl KernFSCallback for IDCallBack {
         if offset >= id_str.as_bytes().len() {
             return Ok(0); // Offset is beyond the length of the string
         }
-        let len = buf.len().min(id_str.as_bytes().len());
-        buf[..len].copy_from_slice(&id_str.as_bytes()[..len]);
+        let len = buf.len().min(id_str.as_bytes().len() - offset);
+        buf[..len].copy_from_slice(&id_str.as_bytes()[offset..offset + len]);
         Ok(len)
     }
 

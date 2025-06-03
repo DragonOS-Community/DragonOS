@@ -346,7 +346,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type == KernInodeType::SymLink {
             let inner = self.inner.read();
@@ -375,6 +375,8 @@ impl IndexNode for KernFSInode {
             warn!("kernfs: callback is none");
             return Err(SystemError::ENOSYS);
         }
+        // release the private data lock before calling the callback
+        drop(data);
 
         let callback_data =
             KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
@@ -390,7 +392,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type != KernInodeType::File {
             return Err(SystemError::EISDIR);
@@ -399,6 +401,9 @@ impl IndexNode for KernFSInode {
         if self.callback.is_none() {
             return Err(SystemError::ENOSYS);
         }
+
+        // release the private data lock before calling the callback
+        drop(data);
 
         let callback_data =
             KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());

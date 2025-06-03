@@ -363,18 +363,10 @@ impl LockedExt4Inode {
             inode_id: generate_inode_id(),
         })));
         let mut guard = inode.0.lock();
-        if !(guard
-            .concret_fs()
-            .fs
-            .getattr(inode_num)
-            .map_err(SystemError::from)
-            .unwrap()
-            .ftype
-            != another_ext4::FileType::Directory)
-        {
-            let page_cache = PageCache::new(Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>));
-            guard.page_cache = Some(page_cache);
-        }
+
+        let page_cache = PageCache::new(Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>));
+        guard.page_cache = Some(page_cache);
+
         drop(guard);
         return inode;
     }

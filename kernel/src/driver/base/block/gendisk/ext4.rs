@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use kdepends::another_ext4;
+use system_error::SystemError;
 
 impl super::GenDisk {
     fn convert_from_ext4_blkid(&self, ext4_blkid: u64) -> (usize, usize, usize) {
@@ -24,7 +25,11 @@ impl another_ext4::BlockDevice for super::GenDisk {
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block_id);
         self.block_device()
             .read_at(lba_id_start, block_count, &mut *buf)
-            .expect("read block error");
+            .map_err(|e| {
+                log::error!("Ext4BlkDevice '{:?}' read_block failed: {:?}", block_id, e);
+                SystemError::EIO
+            })
+            .unwrap();
         another_ext4::Block::new(block_id, buf)
     }
 
@@ -32,6 +37,10 @@ impl another_ext4::BlockDevice for super::GenDisk {
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block.id);
         self.block_device()
             .write_at(lba_id_start, block_count, &*block.data)
-            .expect("write block error");
+            .map_err(|e| {
+                log::error!("Ext4BlkDevice '{:?}' write_block failed: {:?}", block.id, e);
+                SystemError::EIO
+            })
+            .unwrap();
     }
 }

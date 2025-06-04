@@ -1,7 +1,7 @@
 //! System call handler for sys_symlink.
 
 use crate::{
-    arch::syscall::nr::SYS_SYMLINK,
+    arch::{interrupt::TrapFrame, syscall::nr::SYS_SYMLINK},
     filesystem::vfs::MAX_PATHLEN,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
@@ -21,7 +21,7 @@ impl Syscall for SysSymlinkHandle {
         2
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let from = Self::from(args);
         let to = Self::to(args);
 

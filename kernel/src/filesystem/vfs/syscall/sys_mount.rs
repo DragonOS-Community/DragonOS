@@ -1,7 +1,7 @@
 //! System call handler for sys_mount.
 
 use crate::{
-    arch::syscall::nr::SYS_MOUNT,
+    arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
         fcntl::AtFlags, mount::MOUNT_LIST, utils::user_path_at, FileSystem, FileSystemMakerData,
         MountFS, FSMAKER, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -39,7 +39,7 @@ impl Syscall for SysMountHandle {
         5
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let target = Self::target(args);
         let filesystemtype = Self::filesystemtype(args);
         let data = Self::raw_data(args);

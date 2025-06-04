@@ -1,7 +1,7 @@
 //! System call handler for sys_umount.
 
 use crate::{
-    arch::syscall::nr::SYS_UMOUNT2,
+    arch::{interrupt::TrapFrame, syscall::nr::SYS_UMOUNT2},
     filesystem::vfs::{
         fcntl::AtFlags, mount::MOUNT_LIST, utils::user_path_at, MountFS, MAX_PATHLEN,
     },
@@ -24,7 +24,7 @@ impl Syscall for SysUmount2Handle {
         2
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let target = Self::target(args);
         let flags = Self::flags(args);
 

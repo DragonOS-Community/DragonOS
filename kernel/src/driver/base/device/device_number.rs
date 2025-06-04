@@ -24,6 +24,10 @@ impl Major {
     pub const UNIX98_PTY_SLAVE_MAJOR: Self =
         Self::new(Self::UNIX98_PTY_MASTER_MAJOR.0 + Self::UNIX98_PTY_MAJOR_COUNT.0);
 
+    /// Disk
+    pub const AHCI_BLK_MAJOR: Self = Self::new(8);
+    pub const VIRTIO_BLK_MAJOR: Self = Self::new(254);
+
     pub const HVC_MAJOR: Self = Self::new(229);
 
     pub const fn new(x: u32) -> Self {

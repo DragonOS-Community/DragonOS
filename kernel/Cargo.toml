@@ -82,7 +82,6 @@ defer = "0.2.1"
 cfg-if = { version = "1.0.0" }
 derive_builder = { version = "0.20.2", default-features = false, features = ["alloc"] }
 
-
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 multiboot2 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/multiboot2", rev = "05739aab40" }

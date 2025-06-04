@@ -1,3 +1,4 @@
+use crate::process::fork::CloneFlags;
 use core::{
     ffi::c_int,
     sync::atomic::{AtomicBool, Ordering},
@@ -9,7 +10,7 @@ use crate::{
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
     net::syscall::MsgHdr,
-    process::{fork::KernelCloneArgs, ProcessFlags, ProcessManager},
+    process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
@@ -24,12 +25,10 @@ use crate::{
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         syscall::{ModeType, UtimensFlags},
-        MAX_PATHLEN,
     },
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
-    process::fork::CloneFlags,
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         PosixTimeSpec,
@@ -101,6 +100,7 @@ impl Syscall {
             //     handler.name,
             //     handler.args_string(args)
             // );
+
             return handler.inner_handle.handle(args, frame);
         }
 
@@ -122,6 +122,11 @@ impl Syscall {
                     0,
                 )
             }
+
+            #[cfg(target_arch = "x86_64")]
+            SYS_FORK => ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into()),
+            #[cfg(target_arch = "x86_64")]
+            SYS_VFORK => ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into()),
 
             #[cfg(target_arch = "x86_64")]
             SYS_RENAMEAT => {
@@ -183,11 +188,6 @@ impl Syscall {
                 Self::pwrite(fd, buf, len, offset)
             }
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_FORK => Self::fork(frame),
-            #[cfg(target_arch = "x86_64")]
-            SYS_VFORK => Self::vfork(frame),
-
             SYS_BRK => {
                 let new_brk = VirtAddr::new(args[0]);
                 Self::brk(new_brk).map(|vaddr| vaddr.data())
@@ -236,31 +236,6 @@ impl Syscall {
                 };
 
                 res
-            }
-
-            SYS_EXECVE => {
-                let path_ptr = args[0];
-                let argv_ptr = args[1];
-                let env_ptr = args[2];
-                let virt_path_ptr = VirtAddr::new(path_ptr);
-                let virt_argv_ptr = VirtAddr::new(argv_ptr);
-                let virt_env_ptr = VirtAddr::new(env_ptr);
-                // 权限校验
-                if frame.is_from_user()
-                    && (verify_area(virt_path_ptr, MAX_PATHLEN).is_err()
-                        || verify_area(virt_argv_ptr, PAGE_4K_SIZE).is_err())
-                    || verify_area(virt_env_ptr, PAGE_4K_SIZE).is_err()
-                {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::execve(
-                        path_ptr as *const u8,
-                        argv_ptr as *const *const u8,
-                        env_ptr as *const *const u8,
-                        frame,
-                    )
-                    .map(|_| 0)
-                }
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -619,23 +594,6 @@ impl Syscall {
                     flags,
                     crate::driver::base::device::device_number::DeviceNumber::from(dev_t as u32),
                 )
-            }
-
-            SYS_CLONE => {
-                let parent_tid = VirtAddr::new(args[2]);
-                let child_tid = VirtAddr::new(args[3]);
-
-                // 地址校验
-                verify_area(parent_tid, core::mem::size_of::<i32>())?;
-                verify_area(child_tid, core::mem::size_of::<i32>())?;
-
-                let mut clone_args = KernelCloneArgs::new();
-                clone_args.flags = CloneFlags::from_bits_truncate(args[0] as u64);
-                clone_args.stack = args[1];
-                clone_args.parent_tid = parent_tid;
-                clone_args.child_tid = child_tid;
-                clone_args.tls = args[4];
-                Self::clone(frame, clone_args)
             }
 
             SYS_FUTEX => {

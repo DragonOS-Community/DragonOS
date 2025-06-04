@@ -1,5 +1,5 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::syscall::nr::SYS_VFORK;
+//use crate::arch::syscall::nr::SYS_VFORK;
 use crate::process::fork::CloneFlags;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -32,4 +32,4 @@ impl Syscall for SysVfork {
     }
 }
 
-syscall_table_macros::declare_syscall!(SYS_VFORK, SysVfork);
+//syscall_table_macros::declare_syscall!(SYS_VFORK, SysVfork);

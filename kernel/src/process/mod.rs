@@ -88,7 +88,6 @@ pub mod resource;
 pub mod session;
 pub mod stdio;
 pub mod syscall;
-pub mod syscall_refactor;
 pub mod timer;
 pub mod utils;
 

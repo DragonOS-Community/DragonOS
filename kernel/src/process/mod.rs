@@ -76,6 +76,7 @@ use self::{cred::Cred, kthread::WorkerPrivate};
 pub mod abi;
 pub mod cred;
 pub mod exec;
+pub mod execve;
 pub mod exit;
 pub mod fork;
 pub mod geteuid;

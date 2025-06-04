@@ -803,52 +803,53 @@ impl ProcessControlBlock {
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
         let sched_info = ProcessSchedulerInfo::new(None);
-        let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
-        let mut pcb = Self {
-            pid,
-            tgid: pid,
-            thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
-            basic: basic_info,
-            preempt_count,
-            flags,
-            kernel_stack: RwLock::new(kstack),
-            syscall_stack: RwLock::new(KernelStack::new().unwrap()),
-            worker_private: SpinLock::new(None),
-            sched_info,
-            arch_info,
-            sig_info: RwLock::new(ProcessSignalInfo::default()),
-            sig_struct: SpinLock::new(SignalStruct::new()),
-            exit_signal: AtomicSignal::new(Signal::SIGCHLD),
-            parent_pcb: RwLock::new(ppcb.clone()),
-            real_parent_pcb: RwLock::new(ppcb),
-            children: RwLock::new(Vec::new()),
-            wait_queue: WaitQueue::default(),
-            thread: RwLock::new(ThreadInfo::new()),
-            fs: RwLock::new(Arc::new(FsStruct::new())),
-            alarm_timer: SpinLock::new(None),
-            robust_list: RwLock::new(None),
-            nsproxy: Arc::new(RwLock::new(NsProxy::new())),
-            cred: SpinLock::new(cred),
-            self_ref: Weak::new(),
-            restart_block: SpinLock::new(None),
-            process_group: Mutex::new(Weak::new()),
-            executable_path: RwLock::new(name),
-        };
 
-        pcb.sig_info.write().set_tty(tty);
-
-        // 初始化系统调用栈
-        #[cfg(target_arch = "x86_64")]
-        pcb.arch_info
-            .lock()
-            .init_syscall_stack(&pcb.syscall_stack.read());
-
+        // 使用 Arc::new_cyclic 避免在栈上创建巨大的结构体
         let pcb = Arc::new_cyclic(|weak| {
-            pcb.self_ref = weak.clone();
+            let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
+            let pcb = Self {
+                pid,
+                tgid: pid,
+                thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
+                basic: basic_info,
+                preempt_count,
+                flags,
+                kernel_stack: RwLock::new(kstack),
+                syscall_stack: RwLock::new(KernelStack::new().unwrap()),
+                worker_private: SpinLock::new(None),
+                sched_info,
+                arch_info,
+                sig_info: RwLock::new(ProcessSignalInfo::default()),
+                sig_struct: SpinLock::new(SignalStruct::new()),
+                exit_signal: AtomicSignal::new(Signal::SIGCHLD),
+                parent_pcb: RwLock::new(ppcb.clone()),
+                real_parent_pcb: RwLock::new(ppcb),
+                children: RwLock::new(Vec::new()),
+                wait_queue: WaitQueue::default(),
+                thread: RwLock::new(ThreadInfo::new()),
+                fs: RwLock::new(Arc::new(FsStruct::new())),
+                alarm_timer: SpinLock::new(None),
+                robust_list: RwLock::new(None),
+                nsproxy: Arc::new(RwLock::new(NsProxy::new())),
+                cred: SpinLock::new(cred),
+                self_ref: weak.clone(),
+                restart_block: SpinLock::new(None),
+                process_group: Mutex::new(Weak::new()),
+                executable_path: RwLock::new(name),
+            };
+
+            pcb.sig_info.write().set_tty(tty);
+
+            // 初始化系统调用栈
+            #[cfg(target_arch = "x86_64")]
+            pcb.arch_info
+                .lock()
+                .init_syscall_stack(&pcb.syscall_stack.read());
+
             pcb
         });
 

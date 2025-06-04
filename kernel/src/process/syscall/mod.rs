@@ -27,7 +27,9 @@ mod sys_wait4;
 
 #[cfg(target_arch = "x86_64")]
 mod sys_fork;
+#[cfg(target_arch = "x86_64")]
 mod sys_getrlimit;
+#[cfg(target_arch = "x86_64")]
 mod sys_vfork;
 
 //参考资料：https://code.dragonos.org.cn/xref/linux-6.1.9/include/uapi/linux/utsname.h#17

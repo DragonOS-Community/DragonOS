@@ -1,3 +1,4 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETFSUID;
 use crate::process::cred::Kuid;
 use crate::process::ProcessManager;
@@ -5,7 +6,6 @@ use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
 pub struct SysSetFsuid;
 
 impl SysSetFsuid {
@@ -19,7 +19,7 @@ impl Syscall for SysSetFsuid {
         1
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fsuid = Self::fsuid(args);
         let fsuid = Kuid::new(fsuid);
 

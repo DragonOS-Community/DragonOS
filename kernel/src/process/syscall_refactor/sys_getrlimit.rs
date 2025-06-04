@@ -1,5 +1,6 @@
 use system_error::SystemError;
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETRLIMIT;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -33,7 +34,7 @@ impl Syscall for SysGetRlimit {
         2
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let resource = Self::resource(args);
         let rlimit = Self::rlimit(args);
 

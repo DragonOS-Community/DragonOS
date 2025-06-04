@@ -1,10 +1,10 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_UNAME;
 use crate::process::syscall::PosixOldUtsName;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferWriter;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
 pub struct SysUname;
 
 impl SysUname {
@@ -18,7 +18,7 @@ impl Syscall for SysUname {
         1
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let name = Self::name(args);
         let mut writer =
             UserBufferWriter::new(name, core::mem::size_of::<PosixOldUtsName>(), true)?;

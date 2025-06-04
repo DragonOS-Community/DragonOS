@@ -1,3 +1,4 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_WAIT4;
 use crate::process::abi::WaitOption;
 use crate::process::exit::kernel_wait4;
@@ -35,7 +36,7 @@ impl Syscall for SysWait4 {
         4
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = Self::pid(args);
         let wstatus = Self::wstatus(args);
         let options = Self::options(args);

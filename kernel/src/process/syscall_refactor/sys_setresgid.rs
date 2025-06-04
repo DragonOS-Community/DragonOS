@@ -1,10 +1,10 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETRESGID;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
 pub struct SysSetResGid;
 
 impl SysSetResGid {
@@ -18,7 +18,7 @@ impl Syscall for SysSetResGid {
         2
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let egid = Self::egid(args);
         let pcb = ProcessManager::current_pcb();
         let mut guard = pcb.cred.lock();

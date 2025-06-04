@@ -1,3 +1,4 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETFSGID;
 use crate::process::cred::Kgid;
 use crate::process::ProcessManager;
@@ -19,7 +20,7 @@ impl Syscall for SysSetFsgid {
         1
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fsgid = Self::fsgid(args);
         let fsgid = Kgid::new(fsgid);
 

@@ -1,3 +1,4 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETGID;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -18,7 +19,7 @@ impl Syscall for SysSetGid {
         1
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let gid = Self::gid(args);
         let pcb = ProcessManager::current_pcb();
         let mut guard = pcb.cred.lock();

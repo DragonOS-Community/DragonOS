@@ -1,3 +1,4 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETRUSAGE;
 use crate::process::resource::RUsageWho;
 use crate::process::{resource::RUsage, ProcessManager};
@@ -25,7 +26,7 @@ impl Syscall for SysGetRusage {
         2
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let who = Self::who(args);
         let rusage = Self::rusage(args);
 

@@ -1,10 +1,10 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETSID;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
 pub struct SysSetsid;
 
 impl Syscall for SysSetsid {
@@ -14,7 +14,7 @@ impl Syscall for SysSetsid {
 
     /// # 函数的功能
     /// 创建新的会话
-    fn handle(&self, _args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let session = pcb.go_to_new_session()?;
         let mut guard = pcb.sig_info_mut();

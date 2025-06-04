@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use system_error::SystemError;
 
 use super::sys_getrlimit::do_prlimit64;
-
+use crate::arch::interrupt::TrapFrame;
 pub struct SysPrlimit64;
 
 impl SysPrlimit64 {
@@ -33,7 +33,7 @@ impl Syscall for SysPrlimit64 {
         4
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = Self::pid(args);
         let resource = Self::resource(args);
         let new_limit = Self::new_limit(args);

@@ -1,3 +1,4 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETEUID;
 use crate::process::geteuid::do_geteuid;
 use crate::syscall::table::FormattedSyscallParam;
@@ -12,7 +13,7 @@ impl Syscall for SysGetEuid {
         0
     }
 
-    fn handle(&self, _args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         do_geteuid()
     }
 

@@ -1,3 +1,4 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSID;
 use crate::process::Pid;
 use crate::process::ProcessManager;
@@ -6,7 +7,6 @@ use crate::syscall::table::Syscall;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
 pub struct SysGetsid;
 
 impl SysGetsid {
@@ -29,7 +29,7 @@ impl Syscall for SysGetsid {
     ///
     /// ## 参数
     /// - pid: 指定一个进程号
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = Self::pid(args);
         let session = ProcessManager::current_pcb().session().unwrap();
         let sid = session.sid().into();

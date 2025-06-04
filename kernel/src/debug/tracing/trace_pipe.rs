@@ -1,97 +1,110 @@
-use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback};
+use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
+use crate::filesystem::kernfs::{KernFSInodeArgs, KernInodeType};
+use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::PollStatus;
-use crate::libs::spinlock::SpinLock;
-use alloc::string::String;
-use alloc::vec::Vec;
+use crate::libs::wait_queue::WaitQueue;
+use crate::process::{ProcessFlags, ProcessManager};
+use crate::sched::SchedMode;
+use crate::tracepoint::{TraceEntryParser, TracePipeOps};
 use core::fmt::Debug;
 use system_error::SystemError;
 
-static mut TRACE_PIPE: Option<TracePipe> = None;
-
-pub const TRACE_PIPE_MAX_RECORD: usize = 4096;
-
-pub fn init_trace_pipe() {
-    unsafe {
-        TRACE_PIPE = Some(TracePipe::new(TRACE_PIPE_MAX_RECORD));
-    }
-}
-
-pub fn trace_pipe() -> &'static TracePipe {
-    unsafe { TRACE_PIPE.as_ref().unwrap() }
-}
-
-/// Push a record to trace pipe
-pub fn trace_pipe_push_record(record: String) {
-    trace_pipe().push_record(record);
-}
-
-pub struct TracePipe {
-    buf: SpinLock<TracePipeBuf>,
-}
-
-struct TracePipeBuf {
-    size: usize,
-    max_record: usize,
-    buf: Vec<String>,
-}
-
-impl TracePipeBuf {
-    pub const fn new(max_record: usize) -> Self {
-        Self {
-            max_record,
-            size: 0,
-            buf: Vec::new(),
-        }
-    }
-
-    pub fn push_str(&mut self, record: String) {
-        let record_size = record.len();
-        if self.size + record_size > self.max_record {
-            let mut i = 0;
-            while i < record_size {
-                let t = self.buf.pop().unwrap();
-                self.size -= t.len();
-                i += t.len();
+fn common_trace_pipe_read(
+    trace_buf: &mut dyn TracePipeOps,
+    buf: &mut [u8],
+) -> Result<usize, SystemError> {
+    let manager = super::events::tracing_events_manager();
+    let tracepint_map = manager.tracepoint_map();
+    let trace_cmdline_cache = super::TRACE_CMDLINE_CACHE.lock();
+    // read real trace data
+    let mut copy_len = 0;
+    let mut peek_flag = false;
+    loop {
+        if let Some(record) = trace_buf.peek() {
+            let record_str = TraceEntryParser::parse(&tracepint_map, &trace_cmdline_cache, record);
+            if copy_len + record_str.len() > buf.len() {
+                break; // Buffer is full
             }
+            let len = record_str.len();
+            buf[copy_len..copy_len + len].copy_from_slice(record_str.as_bytes());
+            copy_len += len;
+            peek_flag = true;
         }
-        self.buf.push(record);
-        self.size += record_size;
-    }
-
-    pub fn read_at(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
-        if offset == self.size {
-            return Ok(0);
-        }
-        if buf.len() < self.size {
-            return Err(SystemError::EINVAL);
-        }
-        let mut count = 0;
-        for line in self.buf.iter() {
-            let line = line.as_bytes();
-            buf[count..count + line.len()].copy_from_slice(line);
-            count += line.len();
-        }
-        Ok(count)
-    }
-}
-
-impl TracePipe {
-    pub const fn new(max_record: usize) -> Self {
-        Self {
-            buf: SpinLock::new(TracePipeBuf::new(max_record)),
+        if peek_flag {
+            trace_buf.pop(); // Remove the record after reading
+            peek_flag = false;
+        } else {
+            break; // No more records to read
         }
     }
-    pub fn push_record(&self, record: String) {
-        self.buf.lock().push_str(record);
-    }
-
-    pub fn read_at(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
-        self.buf.lock().read_at(buf, offset)
-    }
+    Ok(copy_len)
 }
 
 #[derive(Debug)]
+pub struct TraceCallBack;
+
+impl KernFSCallback for TraceCallBack {
+    fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
+        let pri_data = data.private_data_mut();
+        let snapshot = super::TRACE_RAW_PIPE.lock().snapshot();
+        pri_data.replace(KernInodePrivateData::TracePipe(snapshot));
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        mut data: KernCallbackData,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        let pri_data = data.private_data_mut().as_mut().unwrap();
+        let snapshot = pri_data.tracepipe().unwrap();
+
+        let default_fmt_str = snapshot.default_fmt_str();
+        if offset >= default_fmt_str.len() {
+            common_trace_pipe_read(snapshot, buf)
+        } else {
+            let len = buf.len().min(default_fmt_str.len() - offset);
+            buf[..len].copy_from_slice(&default_fmt_str.as_bytes()[offset..offset + len]);
+            Ok(len)
+        }
+    }
+
+    fn write(
+        &self,
+        _data: KernCallbackData,
+        _buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EPERM)
+    }
+
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
+        Ok(PollStatus::READ)
+    }
+}
+
+pub fn kernel_inode_provider() -> KernFSInodeArgs {
+    KernFSInodeArgs {
+        mode: ModeType::from_bits_truncate(0o444),
+        callback: Some(&TraceCallBack),
+        inode_type: KernInodeType::File,
+        size: Some(4096),
+        private_data: None,
+    }
+}
+
+static TracePipeCallBackWaitQueue: WaitQueue = WaitQueue::default();
+
+#[derive(Debug)]
 pub struct TracePipeCallBack;
+
+impl TracePipeCallBack {
+    fn readable(&self) -> bool {
+        let trace_raw_pipe = super::TRACE_RAW_PIPE.lock();
+        !trace_raw_pipe.is_empty()
+    }
+}
 
 impl KernFSCallback for TracePipeCallBack {
     fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
@@ -100,12 +113,30 @@ impl KernFSCallback for TracePipeCallBack {
 
     fn read(
         &self,
-        _data: KernCallbackData,
+        data: KernCallbackData,
         buf: &mut [u8],
-        offset: usize,
+        _offset: usize,
     ) -> Result<usize, SystemError> {
-        let trace_pipe = trace_pipe();
-        trace_pipe.read_at(buf, offset)
+        drop(data); // We don't need the data here, release the internal lock
+        let read_len = loop {
+            let mut trace_raw_pipe = super::TRACE_RAW_PIPE.lock();
+            let read_len = common_trace_pipe_read(&mut *trace_raw_pipe, buf).unwrap();
+            if read_len != 0 {
+                break read_len;
+            }
+            // Release the lock before waiting
+            drop(trace_raw_pipe);
+            // wait for new data
+            let r = wq_wait_event_interruptible!(TracePipeCallBackWaitQueue, self.readable(), {});
+            if r.is_err() {
+                ProcessManager::current_pcb()
+                    .flags()
+                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+                return Err(SystemError::ERESTARTSYS);
+            }
+            // todo!(wq_wait_event_interruptible may has a bug)
+        };
+        Ok(read_len)
     }
 
     fn write(

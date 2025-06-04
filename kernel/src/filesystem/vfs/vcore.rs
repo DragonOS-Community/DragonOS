@@ -5,7 +5,7 @@ use log::{error, info};
 use system_error::SystemError;
 
 use crate::{
-    define_event_trace, define_trace_point,
+    define_event_trace,
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
@@ -162,15 +162,39 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     return Ok(());
 }
 
-define_event_trace!(DO_MKDIR_AT,(path:&str,mode:FileMode),
-    format_args!("mkdir at {} with mode {:?}",path, mode));
+define_event_trace!(
+    do_mkdir_at,
+    TP_system(vfs),
+    TP_PROTO(path:&str, mode: FileMode),
+    TP_STRUCT__entry {
+        fmode: FileMode,
+        path: [u8;64],
+    },
+    TP_fast_assign {
+        fmode: mode,
+        path: {
+            let mut buf = [0u8; 64];
+            let path = path.as_bytes();
+            let len = path.len().min(63);
+            buf[..len].copy_from_slice(&path[..len]);
+            buf[len] = 0; // null-terminate
+            buf
+        },
+    },
+    TP_ident(__entry),
+    TP_printk({
+        let path = core::str::from_utf8(&__entry.path).unwrap_or("invalid utf8");
+        let mode = __entry.fmode;
+        format!("mkdir at {} with mode {:?}", path, mode)
+    })
+);
 /// @brief 创建文件/文件夹
 pub fn do_mkdir_at(
     dirfd: i32,
     path: &str,
     mode: FileMode,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
-    TRACE_DO_MKDIR_AT(path, mode);
+    trace_do_mkdir_at(path, mode);
     // debug!("Call do mkdir at");
     let (mut current_inode, path) =
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;

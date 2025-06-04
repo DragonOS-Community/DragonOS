@@ -1,5 +1,6 @@
 //! System call handler for epoll creation.
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EPOLL_CREATE;
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::vfs::file::FileMode;
@@ -15,7 +16,7 @@ impl Syscall for SysEpollCreateHandle {
         1
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let max_size = Self::max_size(args);
         if max_size < 0 {
             return Err(SystemError::EINVAL);

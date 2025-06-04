@@ -11,7 +11,10 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
-    driver::base::device::DevName,
+    driver::base::device::{
+        device_number::{DeviceNumber, Major},
+        DevName,
+    },
     filesystem::{
         devfs::{DevFS, DeviceINode},
         vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
@@ -28,8 +31,7 @@ pub struct GenDisk {
     block_size_log2: u8,
     idx: Option<u32>,
 
-    major: u32,
-    minor: usize,
+    device_num: DeviceNumber,
 
     fs: RwLock<Weak<DevFS>>,
     metadata: Metadata,
@@ -60,13 +62,14 @@ impl GenDisk {
         let major = meta.major;
         let minor: usize = meta.inner().dev_idx * 16 + index;
 
+        let device_num = DeviceNumber::new(Major::new(major), minor as u32);
+
         return Arc::new(GenDisk {
             bdev,
             range,
             block_size_log2: bsizelog2,
             idx,
-            major,
-            minor,
+            device_num,
             fs: RwLock::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
@@ -186,7 +189,9 @@ impl GenDisk {
     }
 
     pub fn symlink_name(&self) -> String {
-        format!("{}:{}", self.major, self.minor)
+        let major = self.device_num.major().data();
+        let minor = self.device_num.minor();
+        format!("{}:{}", major, minor)
     }
 
     pub fn block_size_log2(&self) -> u8 {

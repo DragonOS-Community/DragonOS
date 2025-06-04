@@ -68,12 +68,12 @@ impl Ext4FileSystem {
         let fs = another_ext4::Ext4::load(mount_data)?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new(LockedExt4Inode(SpinLock::new(Ext4Inode {
-                inode_num: another_ext4::EXT4_ROOT_INO,
+                inner_inode_num: another_ext4::EXT4_ROOT_INO,
                 fs_ptr: Weak::default(),
                 page_cache: None,
                 children: BTreeMap::new(),
                 dname: DName::from("/"),
-                inode_id: generate_inode_id(),
+                vfs_inode_id: generate_inode_id(),
             })));
 
         let fs = Arc::new(Ext4FileSystem { fs, root_inode });

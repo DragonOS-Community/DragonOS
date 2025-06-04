@@ -1,0 +1,69 @@
+#!/bin/bash
+set -euo pipefail
+
+# 使用方法
+usage() {
+    echo "用法: $0 [ext4|fat]"
+    exit 1
+}
+
+# 解析参数
+FS_TYPE="${1:-ext4}"
+case "$FS_TYPE" in
+    ext4)
+        IMG_NAME="ext4.img"
+        IMG_SIZE="1G"
+        PART_TYPE="ext4"
+        MKFS_CMD="mkfs.ext4"
+        ;;
+    fat)
+        IMG_NAME="fat.img"
+        IMG_SIZE="64M"
+        PART_TYPE="fat32"
+        MKFS_CMD="mkfs.vfat -F 32"
+        ;;
+    *)
+        echo "错误: 不支持的文件系统类型 '$FS_TYPE'"
+        usage
+        ;;
+esac
+
+# 设置变量
+root_folder=$(dirname "$(pwd)")
+LOOP_DEVICE=""
+
+# 自动清理 trap
+cleanup() {
+    if [[ -n "${LOOP_DEVICE:-}" ]]; then
+        echo "清理：释放 loop 设备 $LOOP_DEVICE"
+        losetup -d "$LOOP_DEVICE" || echo "警告：无法释放 $LOOP_DEVICE"
+    fi
+}
+trap cleanup EXIT
+
+# 创建空白镜像
+echo "创建镜像 $IMG_NAME 大小 $IMG_SIZE"
+dd if=/dev/zero of="$IMG_NAME" bs=1M count=$(( $(echo "$IMG_SIZE" | sed 's/M/*1/;s/G/*1024/') )) status=progress
+
+# 创建分区
+parted -s "$IMG_NAME" mklabel msdos
+parted -s "$IMG_NAME" mkpart primary "$PART_TYPE" 1MiB 100%
+
+# 启用 loop 设备和分区
+LOOP_DEVICE=$(losetup --find --partscan --show "$IMG_NAME")
+PARTITION="${LOOP_DEVICE}p1"
+
+echo "loop 设备为 $LOOP_DEVICE，分区为 $PARTITION"
+sleep 1  # 等待内核识别分区
+
+# 格式化文件系统
+echo "格式化为 $FS_TYPE..."
+$MKFS_CMD "$PARTITION"
+
+# 释放 loop 设备
+losetup -d "$LOOP_DEVICE"
+LOOP_DEVICE=""
+
+# 移动镜像
+mv "$IMG_NAME" "$root_folder/bin/$IMG_NAME"
+echo "镜像已保存到 $root_folder/bin/$IMG_NAME"

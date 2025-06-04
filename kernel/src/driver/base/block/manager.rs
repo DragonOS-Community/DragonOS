@@ -130,9 +130,15 @@ impl BlockDevManager {
         })?;
 
         // 注册到devfs
-        for disk in meta_inner.gendisks.values() {
-            devfs_register(disk.dname()?.as_ref(), disk.clone())?;
-        }
+        let dname = gendisk.dname()?;
+        devfs_register(dname.as_ref(), gendisk.clone()).map_err(|e| {
+            log::error!(
+                "Failed to register gendisk {:?} to devfs: {:?}",
+                dname.as_ref(),
+                e
+            );
+            e
+        })?;
         Ok(())
     }
 

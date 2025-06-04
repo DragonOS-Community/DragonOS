@@ -1001,13 +1001,13 @@ pub trait MountableFileSystem: FileSystem {
 macro_rules! register_mountable_fs {
     ($fs:ident, $maker_name:ident, $fs_name:literal) => {
         impl $fs {
-            pub fn make_fs_bridge(
+            fn make_fs_bridge(
                 data: Option<&dyn FileSystemMakerData>,
             ) -> Result<Arc<dyn FileSystem>, SystemError> {
                 <$fs as MountableFileSystem>::make_fs(data)
             }
 
-            pub fn make_mount_data_bridge(
+            fn make_mount_data_bridge(
                 raw_data: Option<&str>,
                 source: &str,
             ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {

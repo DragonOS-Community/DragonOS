@@ -22,10 +22,7 @@ use crate::{
             tty_device::{PtyType, TtyDevice, TtyType},
         },
     },
-    filesystem::vfs::{
-        syscall::{sys_mount::do_mount_mkdir, ModeType},
-        FileType,
-    },
+    filesystem::vfs::{mount::do_mount_mkdir, syscall::ModeType, FileType},
     init::initcall::INITCALL_FS,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,

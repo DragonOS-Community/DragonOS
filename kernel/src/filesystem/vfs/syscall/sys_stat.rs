@@ -2,8 +2,8 @@
 
 use system_error::SystemError;
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STAT;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::sys_close::do_close;
 use crate::filesystem::vfs::ModeType;

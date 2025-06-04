@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::cell::OnceCell;
 use core::fmt::Display;
 
-use crate::arch::x86_64::interrupt::TrapFrame;
+use crate::arch::interrupt::TrapFrame;
 use crate::libs::once::Once;
 use crate::syscall::SystemError;
 

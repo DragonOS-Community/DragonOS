@@ -1,5 +1,5 @@
 use super::super::signal_types::{SigInfo, SigType};
-use crate::arch::x86_64::interrupt::TrapFrame;
+use crate::arch::interrupt::TrapFrame;
 use crate::{
     alloc::vec::Vec,
     arch::ipc::signal::{SigCode, Signal},

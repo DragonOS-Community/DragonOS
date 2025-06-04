@@ -1,8 +1,8 @@
 //! System call handler for epoll_wait.
 
 use super::epoll_utils::do_epoll_wait;
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EPOLL_WAIT;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::mm::VirtAddr;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;

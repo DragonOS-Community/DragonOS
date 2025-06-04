@@ -2,8 +2,8 @@
 
 use alloc::string::ToString;
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CLOSE;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;

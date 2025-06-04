@@ -1,4 +1,4 @@
-use crate::arch::x86_64::interrupt::TrapFrame;
+use crate::arch::interrupt::TrapFrame;
 use crate::mm::page::PageFlushAll;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{

@@ -4,8 +4,8 @@ use system_error::SystemError;
 
 use defer::defer;
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_LSTAT;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::sys_close::do_close;
 use crate::filesystem::vfs::ModeType;

@@ -1,4 +1,4 @@
-use crate::arch::x86_64::interrupt::TrapFrame;
+use crate::arch::interrupt::TrapFrame;
 use crate::{
     arch::syscall::nr::SYS_PIPE2,
     filesystem::vfs::{

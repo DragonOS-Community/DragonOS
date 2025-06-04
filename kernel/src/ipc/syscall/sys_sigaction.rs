@@ -2,8 +2,8 @@ use super::super::signal_types::{
     SaHandlerType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL, USER_SIG_ERR,
     USER_SIG_IGN,
 };
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RT_SIGACTION;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::{
     arch::ipc::signal::{SigFlags, SigSet, Signal},

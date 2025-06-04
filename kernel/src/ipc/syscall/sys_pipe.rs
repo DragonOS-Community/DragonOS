@@ -1,6 +1,6 @@
 use super::sys_pipe2::do_kernel_pipe2;
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PIPE;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::{
     filesystem::vfs::file::FileMode,
     syscall::table::{FormattedSyscallParam, Syscall},

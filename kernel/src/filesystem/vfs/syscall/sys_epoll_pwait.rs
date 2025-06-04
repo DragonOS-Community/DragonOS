@@ -1,9 +1,9 @@
 //! System call handler for epoll_pwait.
 
 use super::epoll_utils::do_epoll_wait;
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::ipc::signal::SigSet;
 use crate::arch::syscall::nr::SYS_EPOLL_PWAIT;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::ipc::signal::restore_saved_sigmask;
 use crate::ipc::signal::set_user_sigmask;
 use crate::mm::VirtAddr;

@@ -6,7 +6,7 @@ use crate::arch::syscall::nr::SYS_FSTAT;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 
-use crate::arch::x86_64::interrupt::TrapFrame;
+use crate::arch::interrupt::TrapFrame;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 pub struct SysFstatHandle;

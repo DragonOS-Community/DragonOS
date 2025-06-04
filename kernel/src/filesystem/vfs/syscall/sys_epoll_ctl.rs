@@ -1,7 +1,7 @@
 //! System call handler for epoll_ctl.
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EPOLL_CTL;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::EPollCtlOption;
 use crate::filesystem::epoll::EPollEvent;

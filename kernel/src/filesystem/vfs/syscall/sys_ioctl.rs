@@ -1,7 +1,7 @@
 //! System call handler for ioctls.
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_IOCTL;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;

@@ -1,7 +1,7 @@
 use system_error::SystemError;
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READV;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::filesystem::vfs::iov::IoVec;
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::syscall::table::FormattedSyscallParam;

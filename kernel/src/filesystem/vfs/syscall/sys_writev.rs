@@ -10,7 +10,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use super::sys_write::do_write;
-use crate::arch::x86_64::interrupt::TrapFrame;
+use crate::arch::interrupt::TrapFrame;
 /// System call handler for `writev` operation
 ///
 /// The `writev` system call writes data from multiple buffers to a file descriptor.

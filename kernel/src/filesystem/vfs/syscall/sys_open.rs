@@ -2,8 +2,8 @@
 
 use system_error::SystemError;
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_OPEN;
-use crate::arch::x86_64::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 

@@ -21,8 +21,6 @@ use crate::{
 
 use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 
-pub mod ext4;
-
 #[derive(Debug)]
 pub struct GenDisk {
     bdev: Weak<dyn BlockDevice>,
@@ -162,7 +160,7 @@ impl GenDisk {
     }
 
     #[inline]
-    fn block_offset_2_disk_blkid(&self, block_offset: BlockId) -> BlockId {
+    pub fn block_offset_2_disk_blkid(&self, block_offset: BlockId) -> BlockId {
         self.range.lba_start + block_offset
     }
 
@@ -189,6 +187,10 @@ impl GenDisk {
 
     pub fn symlink_name(&self) -> String {
         format!("{}:{}", self.major, self.minor)
+    }
+
+    pub fn block_size_log2(&self) -> u8 {
+        self.block_size_log2
     }
 }
 

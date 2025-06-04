@@ -2,17 +2,20 @@ use alloc::boxed::Box;
 use kdepends::another_ext4;
 use system_error::SystemError;
 
-impl super::GenDisk {
+use crate::driver::base::block::gendisk::GenDisk;
+
+impl GenDisk {
     fn convert_from_ext4_blkid(&self, ext4_blkid: u64) -> (usize, usize, usize) {
+        let size = self.block_size_log2();
         let start_block_offset =
-            ext4_blkid as usize * (another_ext4::BLOCK_SIZE / (1 << self.block_size_log2 as usize));
+            ext4_blkid as usize * (another_ext4::BLOCK_SIZE / (1 << size as usize));
         let lba_id_start = self.block_offset_2_disk_blkid(start_block_offset);
-        let block_count = another_ext4::BLOCK_SIZE / (1 << self.block_size_log2 as usize);
+        let block_count = another_ext4::BLOCK_SIZE / (1 << size as usize);
         (start_block_offset, lba_id_start, block_count)
     }
 }
 
-impl another_ext4::BlockDevice for super::GenDisk {
+impl another_ext4::BlockDevice for GenDisk {
     // - convert the ext4 block id to gendisk block id
     // - read the block from gendisk
     // - return the block

@@ -15,7 +15,9 @@ use core::{
     ops::{Deref, DerefMut},
     sync::atomic::AtomicUsize,
 };
-pub use point::{CommonTracePointMeta, TraceEntry, TracePoint, TracePointFunc};
+pub use point::{
+    CommonTracePointMeta, TraceEntry, TracePoint, TracePointCallBackFunc, TracePointFunc,
+};
 use system_error::SystemError;
 pub use trace_pipe::{
     TraceCmdLineCache, TraceEntryParser, TracePipeOps, TracePipeRaw, TracePipeSnapshot,

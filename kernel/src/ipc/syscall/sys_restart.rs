@@ -1,4 +1,5 @@
 use super::super::signal_types::{SigInfo, SigType};
+use crate::arch::interrupt::TrapFrame;
 use crate::{
     alloc::vec::Vec,
     arch::ipc::signal::{SigCode, Signal},
@@ -8,7 +9,6 @@ use crate::{
 };
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
-
 pub struct SysRestartHandle;
 
 /// # SYS_RESTART_SYSCALL 系统调用函数，用于重启被信号中断的系统调用
@@ -41,7 +41,7 @@ impl Syscall for SysRestartHandle {
         Vec::new() // 没有参数，返回空Vec
     }
 
-    fn handle(&self, _args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         do_kernel_restart_syscall()
     }
 }

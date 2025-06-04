@@ -1,4 +1,5 @@
 use crate::alloc::vec::Vec;
+use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMAT,
@@ -16,7 +17,6 @@ use crate::{
 };
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
-
 pub struct SysShmatHandle;
 
 /// # SYS_SHMAT系统调用函数，用于连接共享内存段
@@ -168,7 +168,7 @@ impl Syscall for SysShmatHandle {
             FormattedSyscallParam::new("shmflg", format!("{}", Self::shmflg(args).bits())),
         ]
     }
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let id = Self::id(args);
         let vaddr = Self::vaddr(args);
         let shmflg = Self::shmflg(args);

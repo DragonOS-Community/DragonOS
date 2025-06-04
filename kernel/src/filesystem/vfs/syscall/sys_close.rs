@@ -2,13 +2,13 @@
 
 use alloc::string::ToString;
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CLOSE;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
 /// Handler for the `close` system call.
 pub struct SysCloseHandle;
 
@@ -19,7 +19,7 @@ impl Syscall for SysCloseHandle {
     }
 
     /// Handles the close syscall by extracting arguments and calling `do_close`.
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         do_close(fd)
     }

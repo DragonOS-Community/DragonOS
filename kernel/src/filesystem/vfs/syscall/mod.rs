@@ -1531,7 +1531,7 @@ impl Syscall {
         if metadata.file_type != FileType::File {
             return Err(SystemError::EINVAL);
         }
-	// TODO!: 添加权限检查
+        // TODO!: 添加权限检查
         inode.truncate(length)?;
         Ok(0)
     }

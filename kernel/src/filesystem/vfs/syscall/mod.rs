@@ -1508,7 +1508,14 @@ impl Syscall {
         };
         do_utimes(&pathname, times)
     }
-
+    /// # SYS_TRUNCATE 系统调用的实际执行函数
+    /// 改变文件大小.
+    /// 如果文件大小大于原来的大小，那么文件的内容将会被扩展到指定的大小，新的空间将会用0填充.
+    /// 如果文件大小小于原来的大小，那么文件的内容将会被截断到指定的大小.
+    /// 与SYS_FTRUNCATE的区别在于SYS_TRUNCATE不需要文件描述符 仅使用路径标识文件
+    /// ## 参数
+    /// - `path`: 文件路径
+    /// - `len`: 文件大小
     pub fn truncate(path: *const u8, length: usize) -> Result<usize, SystemError> {
         let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
@@ -1524,6 +1531,7 @@ impl Syscall {
         if metadata.file_type != FileType::File {
             return Err(SystemError::EINVAL);
         }
+	// TODO!: 添加权限检查
         inode.truncate(length)?;
         Ok(0)
     }

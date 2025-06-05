@@ -1514,7 +1514,7 @@ impl Syscall {
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         let pwd = ProcessManager::current_pcb().pwd_inode();
-        let inode = pwd.lookup(path)?;
+        let inode = pwd.lookup(&path)?;
         // 获取inode元数据
         let metadata = inode.metadata()?;
         // 若是目录返回EISDIR 其他的返回EINVAL

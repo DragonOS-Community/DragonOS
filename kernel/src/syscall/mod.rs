@@ -630,7 +630,12 @@ impl Syscall {
                 // debug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
             }
-
+            SYS_TRUNCATE => {
+                let path_ptr = args[0];
+                let len = args[1];
+                let res = Self::truncate(path_ptr as *const u8, len);
+                res
+            }
             #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
                 let path = args[0];

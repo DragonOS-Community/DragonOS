@@ -1508,4 +1508,22 @@ impl Syscall {
         };
         do_utimes(&pathname, times)
     }
+
+    pub fn truncate(path: *const u8, length: usize) -> Result<usize, SystemError> {
+        let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        let pwd = ProcessManager::current_pcb().pwd_inode();
+        let inode = pwd.lookup(path)?;
+        // 获取inode元数据
+        let metadata = inode.metadata()?;
+        // 若是目录返回EISDIR 其他的返回EINVAL
+        if metadata.file_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
+        if metadata.file_type != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
+        inode.truncate(length)
+    }
 }

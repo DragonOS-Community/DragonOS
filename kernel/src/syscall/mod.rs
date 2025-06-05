@@ -8,7 +8,7 @@ use crate::{
     arch::syscall::nr::*,
     filesystem::vfs::syscall::PosixStatfs,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
-    mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
+    mm::page::PAGE_4K_SIZE,
     net::syscall::MsgHdr,
     process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
@@ -21,13 +21,12 @@ use system_error::SystemError;
 use table::{syscall_table, syscall_table_init};
 
 use crate::{
-    arch::{interrupt::TrapFrame, MMArch},
+    arch::interrupt::TrapFrame,
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         syscall::{ModeType, UtimensFlags},
     },
-    libs::align::page_align_up,
-    mm::{verify_area, MemoryManagementArch, VirtAddr},
+    mm::{verify_area, VirtAddr},
     net::syscall::SockAddr,
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
@@ -186,16 +185,6 @@ impl Syscall {
 
                 let buf = user_buffer_reader.read_from_user(0)?;
                 Self::pwrite(fd, buf, len, offset)
-            }
-
-            SYS_BRK => {
-                let new_brk = VirtAddr::new(args[0]);
-                Self::brk(new_brk).map(|vaddr| vaddr.data())
-            }
-
-            SYS_SBRK => {
-                let increment = args[0] as isize;
-                Self::sbrk(increment).map(|vaddr: VirtAddr| vaddr.data())
             }
 
             SYS_REBOOT => {
@@ -498,51 +487,6 @@ impl Syscall {
                 let timezone_ptr = args[1] as *mut PosixTimeZone;
                 Self::gettimeofday(timeval, timezone_ptr)
             }
-            SYS_MMAP => {
-                let len = page_align_up(args[1]);
-                let virt_addr = VirtAddr::new(args[0]);
-                if verify_area(virt_addr, len).is_err() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::mmap(
-                        VirtAddr::new(args[0]),
-                        len,
-                        args[2],
-                        args[3],
-                        args[4] as i32,
-                        args[5],
-                    )
-                }
-            }
-            SYS_MREMAP => {
-                let old_vaddr = VirtAddr::new(args[0]);
-                let old_len = args[1];
-                let new_len = args[2];
-                let mremap_flags = MremapFlags::from_bits_truncate(args[3] as u8);
-                let new_vaddr = VirtAddr::new(args[4]);
-
-                Self::mremap(old_vaddr, old_len, new_len, mremap_flags, new_vaddr)
-            }
-            SYS_MUNMAP => {
-                let addr = args[0];
-                let len = page_align_up(args[1]);
-                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
-                    // The addr argument is not a multiple of the page size
-                    Err(SystemError::EINVAL)
-                } else {
-                    Self::munmap(VirtAddr::new(addr), len)
-                }
-            }
-            SYS_MPROTECT => {
-                let addr = args[0];
-                let len = page_align_up(args[1]);
-                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
-                    // The addr argument is not a multiple of the page size
-                    Err(SystemError::EINVAL)
-                } else {
-                    Self::mprotect(VirtAddr::new(addr), len, args[2])
-                }
-            }
 
             SYS_GETCWD => {
                 let buf = args[0] as *mut u8;
@@ -692,16 +636,6 @@ impl Syscall {
             SYS_SIGALTSTACK => {
                 warn!("SYS_SIGALTSTACK has not yet been implemented");
                 Ok(0)
-            }
-
-            SYS_MADVISE => {
-                let addr = args[0];
-                let len = page_align_up(args[1]);
-                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
-                    Err(SystemError::EINVAL)
-                } else {
-                    Self::madvise(VirtAddr::new(addr), len, args[2])
-                }
             }
 
             SYS_SYSLOG => {
@@ -878,12 +812,7 @@ impl Syscall {
                 let second = args[0] as u32;
                 Self::alarm(second)
             }
-            SYS_MSYNC => {
-                let start = page_align_up(args[0]);
-                let len = page_align_up(args[1]);
-                let flags = args[2];
-                Self::msync(VirtAddr::new(start), len, flags)
-            }
+
             SYS_UTIMENSAT => Self::sys_utimensat(
                 args[0] as i32,
                 args[1] as *const u8,

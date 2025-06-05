@@ -1525,6 +1525,6 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         inode.truncate(length)?;
-	Ok(0)
+        Ok(0)
     }
 }

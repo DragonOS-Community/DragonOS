@@ -1524,6 +1524,7 @@ impl Syscall {
         if metadata.file_type != FileType::File {
             return Err(SystemError::EINVAL);
         }
-        inode.truncate(length)
+        inode.truncate(length)?;
+	Ok(0)
     }
 }

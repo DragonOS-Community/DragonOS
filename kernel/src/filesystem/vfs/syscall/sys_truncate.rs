@@ -23,7 +23,7 @@ impl Syscall for SysTruncateHandle {
         args: &[usize],
     ) -> std::vec::Vec<crate::syscall::table::FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("path_ptr", Self::path_ptr(args).to_string()),
+            FormattedSyscallParam::new("path", format!("{:#x}", Self::path(args) as usize)),
             FormattedSyscallParam::new("len", Self::len(args).to_string()),
         ]
     }

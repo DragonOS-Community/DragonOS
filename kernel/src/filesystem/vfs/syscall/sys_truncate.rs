@@ -1,17 +1,20 @@
 use system_error::SystemError;
 
 use crate::syscall::table::Syscall;
+use crate::syscall::user_access::check_and_clone_cstr;
 
 use super::{FileType, MAX_PATHLEN};
 use crate::process::ProcessManager;
-/// SYS_TRUNCATE系统调用Handler
-pub struct SysTruncateHandle;
 
 use crate::arch::syscall::nr::SYS_TRUNCATE;
 use crate::syscall::table::FormattedSyscallParam;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
+
+/// SYS_TRUNCATE系统调用Handler
+pub struct SysTruncateHandle;
+
 impl Syscall for SysTruncateHandle {
     /// 返回参数个数
     fn num_args(&self) -> usize {

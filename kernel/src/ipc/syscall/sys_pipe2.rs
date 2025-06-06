@@ -1,3 +1,4 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::{
     arch::syscall::nr::SYS_PIPE2,
     filesystem::vfs::{
@@ -15,7 +16,6 @@ use crate::{
 use alloc::vec::Vec;
 use core::ffi::c_int;
 use system_error::SystemError;
-
 pub struct SysPipe2Handle;
 
 // Extracted core logic for pipe2
@@ -80,7 +80,7 @@ impl Syscall for SysPipe2Handle {
         2 // fd_ptr, flags
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd_ptr = Self::pipefd(args);
         if fd_ptr.is_null() {
             return Err(SystemError::EFAULT);

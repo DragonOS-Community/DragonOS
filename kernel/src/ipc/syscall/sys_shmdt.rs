@@ -1,3 +1,4 @@
+use crate::arch::interrupt::TrapFrame;
 use crate::mm::page::PageFlushAll;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
@@ -9,7 +10,6 @@ use crate::{
 use alloc::vec::Vec;
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
-
 pub struct SysShmdtHandle;
 
 impl SysShmdtHandle {
@@ -40,7 +40,7 @@ impl Syscall for SysShmdtHandle {
     ///
     /// 成功：0
     /// 失败：错误码
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let vaddr = Self::vaddr(args);
         let current_address_space = AddressSpace::current()?;
         let mut address_write_guard = current_address_space.write();

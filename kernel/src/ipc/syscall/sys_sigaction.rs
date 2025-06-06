@@ -2,6 +2,7 @@ use super::super::signal_types::{
     SaHandlerType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL, USER_SIG_ERR,
     USER_SIG_IGN,
 };
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RT_SIGACTION;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::{
@@ -14,7 +15,6 @@ use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
 use log::error;
 use system_error::SystemError;
-
 pub struct SysSigactionHandle;
 
 /// 通用信号注册函数
@@ -172,12 +172,12 @@ impl Syscall for SysSigactionHandle {
     }
 
     #[no_mangle]
-    fn handle(&self, args: &[usize], from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let sig = Self::sig(args);
         let act = Self::act(args);
         let old_act = Self::old_act(args);
 
-        do_kernel_sigaction(sig, act, old_act, from_user)
+        do_kernel_sigaction(sig, act, old_act, frame.is_from_user())
     }
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![

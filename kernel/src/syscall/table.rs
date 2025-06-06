@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use core::cell::OnceCell;
 use core::fmt::Display;
 
+use crate::arch::interrupt::TrapFrame;
 use crate::libs::once::Once;
 use crate::syscall::SystemError;
 
@@ -13,7 +14,7 @@ use crate::syscall::SystemError;
 pub trait Syscall: Send + Sync + 'static {
     /// 系统调用参数数量
     fn num_args(&self) -> usize;
-    fn handle(&self, args: &[usize], from_user: bool) -> Result<usize, SystemError>;
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError>;
 
     /// Formats the system call parameters for display/debug purposes
     ///

@@ -13,11 +13,10 @@ use crate::{
     namespaces::NsProxy,
     net::net_core::net_init,
     process::{
-        exec::ProcInitInfo, kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags,
-        ProcessManager,
+        exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
+        ProcessFlags, ProcessManager,
     },
     smp::smp_init,
-    syscall::Syscall,
 };
 
 use super::{cmdline::kenrel_cmdline_param_manager, initcall::do_initcalls};
@@ -164,7 +163,7 @@ fn run_init_process(
     ProcessManager::current_pcb().set_nsproxy(NsProxy::new()); // 初始化init进程的namespace
     let path = proc_init_info.proc_name.to_str().unwrap();
 
-    Syscall::do_execve(
+    do_execve(
         path.to_string(),
         proc_init_info.args.clone(),
         proc_init_info.envs.clone(),

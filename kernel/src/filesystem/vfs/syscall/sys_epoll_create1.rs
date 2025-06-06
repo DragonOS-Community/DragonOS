@@ -1,5 +1,6 @@
 //! System call handler for epoll_create1.
 
+use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EPOLL_CREATE1;
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::vfs::file::FileMode;
@@ -7,7 +8,6 @@ use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
 pub struct SysEpollCreate1Handle;
 
 impl Syscall for SysEpollCreate1Handle {
@@ -15,7 +15,7 @@ impl Syscall for SysEpollCreate1Handle {
         1
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         return EventPoll::create_epoll(Self::flags(args));
     }
 

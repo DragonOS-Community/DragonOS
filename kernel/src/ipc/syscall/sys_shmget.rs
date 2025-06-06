@@ -1,4 +1,5 @@
 use crate::alloc::vec::Vec;
+use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMGET,
@@ -8,7 +9,6 @@ use crate::{
 use log::error;
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
-
 pub struct SysShmgetHandle;
 
 /// # SYS_SHMGET系统调用函数，用于获取共享内存
@@ -90,7 +90,7 @@ impl Syscall for SysShmgetHandle {
         3 // key, size, shmflg
     }
 
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let key = Self::key(args);
         let size = Self::size(args);
         let shmflg = Self::shmflg(args);

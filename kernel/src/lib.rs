@@ -23,7 +23,12 @@
 #![feature(vec_into_raw_parts)]
 #![feature(linkage)]
 #![feature(panic_can_unwind)]
-#![allow(static_mut_refs, non_local_definitions, internal_features)]
+#![allow(
+    static_mut_refs,
+    non_local_definitions,
+    internal_features,
+    non_upper_case_globals
+)]
 // clippy的配置
 #![deny(clippy::all)]
 // 取消下面的注释以启用clippy对栈帧大小的检查
@@ -70,6 +75,7 @@ mod sched;
 mod smp;
 mod syscall;
 mod time;
+mod tracepoint;
 #[cfg(target_arch = "x86_64")]
 mod virt;
 

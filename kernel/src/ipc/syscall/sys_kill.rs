@@ -2,6 +2,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::ffi::c_int;
 
+use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
@@ -60,7 +61,7 @@ impl Syscall for SysKillHandle {
     fn num_args(&self) -> usize {
         2
     }
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let id = Self::pid(args);
         let sig_c_int = Self::sig(args);
 

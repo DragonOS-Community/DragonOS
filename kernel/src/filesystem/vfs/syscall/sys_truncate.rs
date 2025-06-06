@@ -6,6 +6,10 @@ use super::{FileType, MAX_PATHLEN};
 use crate::process::ProcessManager;
 /// SYS_TRUNCATE系统调用Handler
 pub struct SysTruncateHandle;
+
+use crate::arch::syscall::nr::SYS_TRUNCATE;
+use crate::syscall::table::FormattedSyscallParam;
+use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 impl Syscall for SysTruncateHandle {
@@ -19,10 +23,7 @@ impl Syscall for SysTruncateHandle {
         let res = do_truncate(path_ptr, len);
         res
     }
-    fn entry_format(
-        &self,
-        args: &[usize],
-    ) -> std::vec::Vec<crate::syscall::table::FormattedSyscallParam> {
+    fn entry_format(&self, args: &[usize]) -> Vec<crate::syscall::table::FormattedSyscallParam> {
         vec![
             FormattedSyscallParam::new("path", format!("{:#x}", Self::path_ptr(args) as usize)),
             FormattedSyscallParam::new("len", Self::len(args).to_string()),

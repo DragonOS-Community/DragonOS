@@ -187,6 +187,11 @@ impl Syscall {
                 Self::pwrite(fd, buf, len, offset)
             }
 
+            SYS_SBRK => {
+                let incr = args[0] as isize;
+                crate::mm::syscall::sys_sbrk::sys_sbrk(incr)
+            }
+
             SYS_REBOOT => {
                 let magic1 = args[0] as u32;
                 let magic2 = args[1] as u32;

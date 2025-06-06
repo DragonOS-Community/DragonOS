@@ -12,7 +12,7 @@ mod sys_mprotect;
 mod sys_mremap;
 mod sys_msync;
 mod sys_munmap;
-mod sys_sbrk;
+pub mod sys_sbrk;
 
 bitflags! {
     /// Memory protection flags

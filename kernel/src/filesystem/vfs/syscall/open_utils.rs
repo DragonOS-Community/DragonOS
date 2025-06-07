@@ -1,6 +1,7 @@
 use system_error::SystemError;
 
 use crate::{
+    define_event_trace,
     filesystem::vfs::{fcntl::AtFlags, file::FileMode, open::do_sys_open, MAX_PATHLEN},
     syscall::user_access::check_and_clone_cstr,
 };
@@ -23,6 +24,7 @@ pub(super) fn do_open(
     mode: u32,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
+    trace_sys_enter_openat(AtFlags::AT_FDCWD.bits(), path, o_flags, mode);
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
@@ -37,3 +39,31 @@ pub(super) fn do_open(
         follow_symlink,
     );
 }
+
+define_event_trace!(
+    sys_enter_openat,
+    TP_system(syscalls),
+    TP_PROTO(dfd: i32, path:*const u8, o_flags: u32, mode: u32),
+    TP_STRUCT__entry{
+        dfd: i32,
+        path: u64,
+        o_flags: u32,
+        mode: u32,
+    },
+    TP_fast_assign{
+        dfd: dfd,
+        path: path as u64,
+        o_flags: o_flags,
+        mode: mode,
+    },
+    TP_ident(__entry),
+    TP_printk({
+        format!(
+            "dfd: {}, path: {:#x}, o_flags: {:?}, mode: {:?}",
+            __entry.dfd,
+            __entry.path,
+            __entry.o_flags,
+            __entry.mode
+        )
+    })
+);

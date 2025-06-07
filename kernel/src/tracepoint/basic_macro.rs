@@ -93,12 +93,13 @@ macro_rules! define_event_trace{
             };
 
             #[allow(unused,non_snake_case)]
+            #[allow(clippy::redundant_field_names)]
             pub fn [<trace_default_ $name>](_data:&mut (dyn core::any::Any+Send+Sync), $($arg:$arg_type),* ){
-                #[repr(C)]
+                #[repr(C, packed)]
                 struct Entry {
                     $($entry: $entry_type,)*
                 }
-                #[repr(C)]
+                #[repr(C, packed)]
                 struct FullEntry {
                     common: $crate::tracepoint::TraceEntry,
                     entry: Entry,
@@ -129,18 +130,25 @@ macro_rules! define_event_trace{
                         core::mem::size_of::<FullEntry>(),
                     )
                 };
+
+                let func = |f:&alloc::boxed::Box<dyn $crate::tracepoint::TracePointCallBackFunc>|{
+                    f.call(event_buf);
+                };
+
+                [<__ $name>].raw_callback_list(&func);
+
                 $crate::debug::tracing::trace_cmdline_push(pid as u32);
                 $crate::debug::tracing::trace_pipe_push_raw_record(event_buf);
             }
 
             #[allow(unused,non_snake_case)]
-            pub fn [<trace_fmt_ $name>](buf_ptr: *const u8) -> alloc::string::String {
+            pub fn [<trace_fmt_ $name>](buf: &[u8]) -> alloc::string::String {
                 #[repr(C)]
                 struct Entry {
                     $($entry: $entry_type,)*
                 }
                 let $tp_ident = unsafe {
-                    &*(buf_ptr as *const Entry)
+                    &*(buf.as_ptr() as *const Entry)
                 };
                 let fmt = format!("{}", $fmt_expr);
                 fmt

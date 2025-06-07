@@ -33,7 +33,7 @@ pub enum PerfEventIoc {
 #[allow(unused)]
 /// `perf_event_open` syscall arguments.
 pub struct PerfProbeArgs {
-    pub config: perf_sw_ids,
+    pub config: PerfProbeConfig,
     pub name: String,
     pub offset: u64,
     pub size: u32,
@@ -45,6 +45,12 @@ pub struct PerfProbeArgs {
     pub sample_type: Option<perf_event_sample_format>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerfProbeConfig {
+    PerfSwIds(perf_sw_ids),
+    Raw(u64),
+}
+
 impl PerfProbeArgs {
     pub fn try_from(
         attr: &perf_event_attr,
@@ -54,7 +60,13 @@ impl PerfProbeArgs {
         flags: u32,
     ) -> Result<Self, SystemError> {
         let ty = perf_type_id::from_u32(attr.type_).ok_or(SystemError::EINVAL)?;
-        let config = perf_sw_ids::from_u32(attr.config as u32).ok_or(SystemError::EINVAL)?;
+        let config = match ty {
+            perf_type_id::PERF_TYPE_TRACEPOINT => PerfProbeConfig::Raw(attr.config),
+            _ => {
+                let sw_id = perf_sw_ids::from_u32(attr.config as u32).ok_or(SystemError::EINVAL)?;
+                PerfProbeConfig::PerfSwIds(sw_id)
+            }
+        };
         let name = if ty == perf_type_id::PERF_TYPE_MAX {
             let name_ptr = unsafe { attr.__bindgen_anon_3.config1 } as *const u8;
             let name = check_and_clone_cstr(name_ptr, None)?;

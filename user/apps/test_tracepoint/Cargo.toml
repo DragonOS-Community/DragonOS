@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "mytrace",
+    "mytrace-common",
+    "mytrace-ebpf",
+]
+default-members = ["mytrace", "mytrace-common"]
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+aya = { version = "0.13.1", default-features = false }
+aya-build = { version = "0.1.2", default-features = false }
+aya-ebpf = { version = "0.1.1", default-features = false }
+aya-log = { version = "0.2.1", default-features = false }
+aya-log-ebpf = { version = "0.1.1", default-features = false }
+
+anyhow = { version = "1", default-features = false }
+# `std` feature is currently required to build `clap`.
+#
+# See https://github.com/clap-rs/clap/blob/61f5ee5/clap_builder/src/lib.rs#L15.
+clap = { version = "4.5.20", default-features = false, features = ["std"] }
+env_logger = { version = "0.11.5", default-features = false }
+libc = { version = "0.2.159", default-features = false }
+log = { version = "0.4.22", default-features = false }
+tokio = { version = "1.40.0", default-features = false }
+which = { version = "6.0.0", default-features = false }
+
+[profile.release.package.mytrace-ebpf]
+debug = 2
+codegen-units = 1

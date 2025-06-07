@@ -13,6 +13,8 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
+pub use events::tracing_events_manager;
+
 static mut TRACING_ROOT_INODE: Option<Arc<KernFSInode>> = None;
 
 static TRACE_RAW_PIPE: SpinLock<crate::tracepoint::TracePipeRaw> =
@@ -22,6 +24,7 @@ static TRACE_CMDLINE_CACHE: SpinLock<crate::tracepoint::TraceCmdLineCache> =
     SpinLock::new(crate::tracepoint::TraceCmdLineCache::new(128));
 
 pub fn trace_pipe_push_raw_record(record: &[u8]) {
+    // log::debug!("trace_pipe_push_raw_record: {}", record.len());
     TRACE_RAW_PIPE.lock().push_event(record.to_vec());
 }
 
@@ -107,14 +110,6 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
         None,
         Some(&TracingDirCallBack),
     )?;
-
-    // tracing_root.add_file(
-    //     "trace".to_string(),
-    //     ModeType::from_bits_truncate(0o444),
-    //     Some(4096),
-    //     None,
-    //     Some(&trace_pipe::TraceCallBack),
-    // )?;
 
     tracing_root.add_file_lazy("trace".to_string(), trace_pipe::kernel_inode_provider)?;
 

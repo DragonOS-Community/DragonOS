@@ -10,3 +10,4 @@ pub const HELPER_TRACE_PRINTF: u32 = 6;
 pub const HELPER_MAP_PUSH_ELEM: u32 = 87;
 pub const HELPER_MAP_POP_ELEM: u32 = 88;
 pub const HELPER_MAP_PEEK_ELEM: u32 = 89;
+pub const HELPER_PROBE_READ_USER_STR: u32 = 114;

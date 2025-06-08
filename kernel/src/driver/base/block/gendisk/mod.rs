@@ -24,6 +24,9 @@ use crate::{
 
 use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 
+static NEXT_MINOR_BASE: AtomicU32 = AtomicU32::new(0);
+const MINORS_PER_DISK: u32 = 256;
+
 #[derive(Debug)]
 pub struct GenDisk {
     bdev: Weak<dyn BlockDevice>,
@@ -37,6 +40,8 @@ pub struct GenDisk {
     metadata: Metadata,
     /// 对应/dev/下的设备名
     name: DName,
+
+    base_minor: u32,
 }
 
 impl GenDisk {
@@ -60,9 +65,13 @@ impl GenDisk {
         let ptr = bdev.upgrade().unwrap();
         let meta = ptr.blkdev_meta();
         let major = meta.major;
-        let minor: usize = meta.inner().dev_idx * 16 + index;
 
-        let device_num = DeviceNumber::new(Major::new(major), minor as u32);
+        let base = NEXT_MINOR_BASE.load(Ordering::SeqCst);
+        NEXT_MINOR_BASE.fetch_add(MINORS_PER_DISK, Ordering::SeqCst);
+
+        let base_minor = base + index as u32;
+        // log::info!("New gendisk: major: {}, minor: {}", major, base_minor);
+        let device_num = DeviceNumber::new(Major::new(major), base_minor as u32);
 
         return Arc::new(GenDisk {
             bdev,
@@ -76,6 +85,7 @@ impl GenDisk {
                 ModeType::from_bits_truncate(0o755),
             ),
             name,
+            base_minor,
         });
     }
 
@@ -185,6 +195,11 @@ impl GenDisk {
     #[inline]
     pub fn device_num(&self) -> DeviceNumber {
         self.device_num
+    }
+
+    #[inline]
+    pub fn base_minor(&self) -> u32 {
+        self.base_minor
     }
 
     /// # sync

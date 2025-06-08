@@ -29,8 +29,7 @@ use super::{
     },
     utils::{rsplit_path, user_path_at},
     vcore::{do_mkdir_at, do_remove_dir, do_unlink_at},
-    Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
-    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 mod open_utils;

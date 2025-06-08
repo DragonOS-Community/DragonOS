@@ -1,4 +1,5 @@
 use crate::driver::base::block::gendisk::GenDisk;
+use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::ext4::inode::Ext4Inode;
 use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::utils::{user_path_at, DName};
@@ -23,8 +24,12 @@ use system_error::SystemError;
 use super::inode::LockedExt4Inode;
 
 pub struct Ext4FileSystem {
+    /// 对应 another_ext4 中的实际文件系统
     pub(super) fs: another_ext4::Ext4,
+    /// 当前文件系统对应的设备号
+    pub(super) raw_dev: DeviceNumber,
 
+    /// 根 inode
     root_inode: Arc<LockedExt4Inode>,
 }
 
@@ -65,6 +70,7 @@ impl FileSystem for Ext4FileSystem {
 
 impl Ext4FileSystem {
     pub fn from_gendisk(mount_data: Arc<GenDisk>) -> Result<Arc<dyn FileSystem>, SystemError> {
+        let raw_dev = mount_data.device_num();
         let fs = another_ext4::Ext4::load(mount_data)?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new(LockedExt4Inode(SpinLock::new(Ext4Inode {
@@ -76,7 +82,11 @@ impl Ext4FileSystem {
                 vfs_inode_id: generate_inode_id(),
             })));
 
-        let fs = Arc::new(Ext4FileSystem { fs, root_inode });
+        let fs = Arc::new(Ext4FileSystem {
+            fs,
+            raw_dev,
+            root_inode,
+        });
 
         let mut guard = fs.root_inode.0.lock();
         guard.fs_ptr = Arc::downgrade(&fs);

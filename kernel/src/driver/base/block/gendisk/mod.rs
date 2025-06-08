@@ -182,6 +182,11 @@ impl GenDisk {
         &self.range
     }
 
+    #[inline]
+    pub fn device_num(&self) -> DeviceNumber {
+        self.device_num
+    }
+
     /// # sync
     /// 同步磁盘
     pub fn sync(&self) -> Result<(), SystemError> {

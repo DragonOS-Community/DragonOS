@@ -259,6 +259,7 @@ impl IndexNode for LockedExt4Inode {
         let guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let attr = ext4.getattr(guard.inner_inode_num)?;
+        let raw_dev = guard.fs_ptr.upgrade().unwrap().raw_dev;
         Ok(vfs::Metadata {
             inode_id: guard.vfs_inode_id,
             size: attr.size as i64,
@@ -274,7 +275,7 @@ impl IndexNode for LockedExt4Inode {
             uid: attr.uid as usize,
             gid: attr.gid as usize,
             dev_id: 0,
-            raw_dev: crate::driver::base::device::device_number::DeviceNumber::default(),
+            raw_dev,
         })
     }
 
@@ -333,14 +334,9 @@ impl LockedExt4Inode {
         fs_ptr: Weak<super::filesystem::Ext4FileSystem>,
         dname: DName,
     ) -> Arc<Self> {
-        let inode = Arc::new(LockedExt4Inode(SpinLock::new(Ext4Inode {
-            inner_inode_num: inode_num,
-            fs_ptr,
-            page_cache: None,
-            children: BTreeMap::new(),
-            dname,
-            vfs_inode_id: generate_inode_id(),
-        })));
+        let inode = Arc::new(LockedExt4Inode(SpinLock::new(Ext4Inode::new(
+            inode_num, fs_ptr, dname,
+        ))));
         let mut guard = inode.0.lock();
 
         let page_cache = PageCache::new(Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>));
@@ -372,6 +368,17 @@ impl Ext4Inode {
         self.fs_ptr
             .upgrade()
             .expect("Ext4FileSystem should be alive")
+    }
+
+    pub fn new(inode_num: u32, fs_ptr: Weak<Ext4FileSystem>, dname: DName) -> Self {
+        Self {
+            inner_inode_num: inode_num,
+            fs_ptr,
+            page_cache: None,
+            children: BTreeMap::new(),
+            dname,
+            vfs_inode_id: generate_inode_id(),
+        }
     }
 }
 

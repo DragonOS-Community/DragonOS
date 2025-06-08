@@ -3,11 +3,10 @@
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
-        fcntl::AtFlags, mount::MOUNT_LIST, utils::user_path_at, FileSystem, FileSystemMakerData,
-        MountFS, FSMAKER, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        fcntl::AtFlags, mount::MOUNT_LIST, produce_fs, utils::user_path_at, FileSystem, MountFS,
+        MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     process::ProcessManager,
-    producefs,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access,
@@ -56,7 +55,7 @@ impl Syscall for SysMountHandle {
         let fstype_str = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
         let fstype_str = fstype_str.to_str().map_err(|_| SystemError::EINVAL)?;
 
-        let fstype = producefs!(FSMAKER, fstype_str, data, source)?;
+        let fstype = produce_fs(fstype_str, data, source)?;
 
         do_mount(fstype, &target)?;
 

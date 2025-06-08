@@ -1118,27 +1118,38 @@ macro_rules! define_filesystem_maker_slice {
     };
 }
 
-/// 调用指定数组中的所有初始化器
-#[macro_export]
-macro_rules! producefs {
-    ($initializer_slice : ident, $filesystem : ident, $raw_data : ident, $source : ident) => {
-        match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
-            Some(maker) => {
-                if let Some(mount_data) = (maker.builder)($raw_data, $source) {
-                    let data: Option<&dyn FileSystemMakerData> = Some(mount_data.as_ref());
-
-                    maker.build(data)
-                } else {
-                    log::error!("failed to build mount data for {}", $filesystem);
-                    Err(SystemError::ENOSYS)
-                }
-            }
-            None => {
-                log::error!("mismatch filesystem type : {}", $filesystem);
-                Err(SystemError::EINVAL)
+/// # 通过文件系统的名称和数据创建一个文件系统实例
+///
+/// ## 参数
+/// - `filesystem`: 文件系统的名称
+/// - `data`: 可选的挂载数据
+/// - `source`: 挂载源
+///
+/// ## 返回值
+/// - `Ok(Arc<dyn FileSystem>)`: 成功时返回文件系统的共享引用
+/// - `Err(SystemError)`: 如果找不到对应的文件系统或创建失败，则返回错误
+///
+/// 这个是之前的`produce_fs!`的函数版本，改成了函数之后ext4的挂载会慢一点，仅作记录
+pub fn produce_fs(
+    filesystem: &str,
+    data: Option<&str>,
+    source: &str,
+) -> Result<Arc<dyn FileSystem>, SystemError> {
+    match FSMAKER.iter().find(|&m| m.name == filesystem) {
+        Some(maker) => {
+            if let Some(mount_data) = (maker.builder)(data, source) {
+                let data: Option<&dyn FileSystemMakerData> = Some(mount_data.as_ref());
+                maker.build(data)
+            } else {
+                log::error!("failed to build mount data for {}", filesystem);
+                Err(SystemError::ENOSYS)
             }
         }
-    };
+        None => {
+            log::error!("mismatch filesystem type : {}", filesystem);
+            Err(SystemError::EINVAL)
+        }
+    }
 }
 
 define_filesystem_maker_slice!(FSMAKER);

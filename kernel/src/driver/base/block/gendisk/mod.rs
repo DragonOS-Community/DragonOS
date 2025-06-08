@@ -71,7 +71,7 @@ impl GenDisk {
 
         let base_minor = base + index as u32;
         // log::info!("New gendisk: major: {}, minor: {}", major, base_minor);
-        let device_num = DeviceNumber::new(Major::new(major), base_minor as u32);
+        let device_num = DeviceNumber::new(Major::new(major), base_minor);
 
         return Arc::new(GenDisk {
             bdev,

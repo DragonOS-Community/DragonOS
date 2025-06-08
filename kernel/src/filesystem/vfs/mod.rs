@@ -1142,3 +1142,75 @@ macro_rules! producefs {
 }
 
 define_filesystem_maker_slice!(FSMAKER);
+
+/// # 批量填充Dirent时的上下文Add commentMore actions
+/// linux语义是通过getdents_callback *类型来实现类似链表的迭代填充，这里考虑通过填充传入的缓冲区来实现
+pub struct FilldirContext<'a> {
+    buf: &'a mut [u8],
+    current_pos: usize,
+    remain_size: usize,
+    error: Option<SystemError>,
+}
+
+impl<'a> FilldirContext<'a> {
+    pub fn new(user_buf: &'a mut [u8]) -> Self {
+        Self {
+            remain_size: user_buf.len(),
+            buf: user_buf,
+            current_pos: 0,
+            error: None,
+        }
+    }
+
+    /// # 填充单个dirent结构体
+    ///
+    /// ## 参数
+    /// - name 目录项名称
+    /// - offset 当前目录项偏移量
+    /// - ino 目录项的inode的inode_id
+    /// - d_type 目录项的inode的file_type_num
+    fn fill_dir(
+        &mut self,
+        name: &str,
+        offset: usize,
+        ino: u64,
+        d_type: u8,
+    ) -> Result<(), SystemError> {
+        let name_len = name.as_bytes().len();
+        let dirent_size = ::core::mem::size_of::<Dirent>() - ::core::mem::size_of::<u8>();
+        let reclen = name_len + dirent_size + 1;
+
+        // 将reclen向上对齐usize大小
+        let align_up = |len: usize, align: usize| -> usize { (len + align - 1) & !(align - 1) };
+        let align_up_reclen = align_up(reclen, ::core::mem::size_of::<usize>());
+
+        // 当前缓冲区空间已不足，返回EINVAL
+        if align_up_reclen > self.remain_size {
+            self.error = Some(SystemError::EINVAL);
+            return Err(SystemError::EINVAL);
+        }
+
+        // 获取剩余缓冲区
+        let current_dirent_slice = &mut self.buf[self.current_pos..];
+        let dirent = unsafe { (current_dirent_slice.as_mut_ptr() as *mut Dirent).as_mut() }
+            .ok_or(SystemError::EFAULT)?;
+
+        // 填充dirent
+        dirent.d_ino = ino;
+        dirent.d_type = d_type;
+        dirent.d_reclen = align_up_reclen as u16;
+        dirent.d_off = offset as i64;
+        unsafe {
+            let ptr = &mut dirent.d_name as *mut u8;
+            let buf: &mut [u8] =
+                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_len + 1);
+            buf[0..name_len].copy_from_slice(name.as_bytes());
+            buf[name_len] = 0;
+        }
+
+        self.current_pos += align_up_reclen;
+        self.remain_size -= align_up_reclen;
+
+        return Ok(());
+    }
+}

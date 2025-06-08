@@ -1,3 +1,4 @@
+use crate::filesystem::vfs::FilldirContext;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -28,7 +29,8 @@ use super::{
     },
     utils::{rsplit_path, user_path_at},
     vcore::{do_mkdir_at, do_remove_dir, do_unlink_at},
-    Dirent, FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 mod open_utils;
@@ -641,18 +643,16 @@ impl Syscall {
         return Ok(VirtAddr::new(buf.as_ptr() as usize));
     }
 
-    /// @brief 获取目录中的数据
+    /// # 获取目录中的数据
     ///
-    /// TODO: 这个函数的语义与Linux不一致，需要修改！！！
+    /// ## 参数
+    /// - fd 文件描述符号
+    /// - buf 输出缓冲区
     ///
-    /// @param fd 文件描述符号
-    /// @param buf 输出缓冲区
-    ///
-    /// @return 成功返回读取的字节数，失败返回错误码
+    /// ## 返回值
+    /// - Ok(ctx.current_pos) 填充缓冲区当前指针位置
+    /// - Err(ctx.error.unwrap()) 填充缓冲区时返回的错误
     pub fn getdents(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let dirent =
-            unsafe { (buf.as_mut_ptr() as *mut Dirent).as_mut() }.ok_or(SystemError::EFAULT)?;
-
         if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
             return Err(SystemError::EBADF);
         }
@@ -667,9 +667,22 @@ impl Syscall {
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
-        let res = file.readdir(dirent).map(|x| x as usize);
-
-        return res;
+        let mut ctx = FilldirContext::new(buf);
+        match file.read_dir(&mut ctx) {
+            Ok(_) => {
+                if ctx.error.is_some() {
+                    if ctx.error == Some(SystemError::EINVAL) {
+                        return Ok(ctx.current_pos);
+                    } else {
+                        return Err(ctx.error.unwrap());
+                    }
+                }
+                return Ok(ctx.current_pos);
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
     }
 
     /// @brief 创建文件夹

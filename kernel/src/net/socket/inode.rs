@@ -52,10 +52,6 @@ impl IndexNode for SocketInode {
         unimplemented!()
     }
 
-    fn poll(&self, _: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
-        Ok(self.inner.poll())
-    }
-
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,

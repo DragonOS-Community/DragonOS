@@ -74,6 +74,8 @@ clean-docs:
 gdb:
 ifeq ($(ARCH), x86_64)
 	rust-gdb -n -x tools/.gdbinit
+else ifeq ($(ARCH), loongarch64)
+	loongarch64-unknown-linux-gnu-gdb -n -x tools/.gdbinit
 else
 	gdb-multiarch -n -x tools/.gdbinit
 endif
@@ -138,6 +140,11 @@ run-vnc: check_arch
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-vnc
+
+run-nographic: check_arch
+	$(MAKE) all -j $(NPROCS)
+	$(MAKE) write_diskimage || exit 1
+	$(MAKE) qemu-nographic
 
 # 在docker中编译，并启动QEMU
 run-docker: check_arch

@@ -3,10 +3,10 @@ pub mod null_dev;
 pub mod zero_dev;
 
 use super::vfs::{
-    core::{generate_inode_id, ROOT_INODE},
     file::FileMode,
     syscall::ModeType,
     utils::DName,
+    vcore::{generate_inode_id, ROOT_INODE},
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
@@ -141,16 +141,21 @@ impl DevFS {
                     .as_any_ref()
                     .downcast_ref::<LockedDevFSInode>()
                     .unwrap();
-                // 在 /dev/char 下创建设备节点
-                dev_char_inode.add_dev(name, device.clone())?;
 
                 // 特殊处理 tty 设备，挂载在 /dev 下
                 if name.starts_with("tty") && name.len() > 3 {
                     dev_root_inode.add_dev(name, device.clone())?;
-                }
-                // ptmx设备
-                if name == "ptmx" {
+                } else if name.starts_with("hvc") && name.len() > 3 {
+                    // 特殊处理 hvc 设备，挂载在 /dev 下
                     dev_root_inode.add_dev(name, device.clone())?;
+                } else if name == "console" {
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else if name == "ptmx" {
+                    // ptmx设备
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else {
+                    // 在 /dev/char 下创建设备节点
+                    dev_char_inode.add_dev(name, device.clone())?;
                 }
                 device.set_fs(dev_char_inode.0.lock().fs.clone());
             }
@@ -279,6 +284,7 @@ impl DevFSInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: dev_type_, // 文件夹
                 mode,
                 nlinks: 1,
@@ -370,6 +376,7 @@ impl LockedDevFSInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type,
                 mode,
                 nlinks: 1,
@@ -526,6 +533,7 @@ impl IndexNode for LockedDevFSInode {
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
         inode.metadata.ctime = metadata.ctime;
+        inode.metadata.btime = metadata.btime;
         inode.metadata.mode = metadata.mode;
         inode.metadata.uid = metadata.uid;
         inode.metadata.gid = metadata.gid;

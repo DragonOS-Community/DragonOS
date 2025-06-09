@@ -1,7 +1,7 @@
 # DADK 总控文件
 
 [metadata]
-# Target architecture. Options: x86_64, riscv64
+# Target architecture. Options: x86_64, riscv64, loongarch64
 arch = "x86_64"
 
 # Hypervisor config path

@@ -90,7 +90,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     mfence();
     let pid = ProcessManager::current_pcb().pid();
     let show = false;
-    // let show = if syscall_num != SYS_SCHED && pid.data() >= 7 {
+    // let show = if syscall_num != SYS_SCHED && pid.data() >= 9{
     //     true
     // } else {
     //     false
@@ -120,16 +120,8 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         _ => {}
     }
     let mut syscall_handle = || -> u64 {
-        #[cfg(feature = "backtrace")]
-        {
-            Syscall::catch_handle(syscall_num, &args, frame)
-                .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
-        }
-        #[cfg(not(feature = "backtrace"))]
-        {
-            Syscall::handle(syscall_num, &args, frame)
-                .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
-        }
+        Syscall::catch_handle(syscall_num, &args, frame)
+            .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
     };
     syscall_return!(syscall_handle(), frame, show);
 }

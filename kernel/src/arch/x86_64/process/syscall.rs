@@ -53,6 +53,7 @@ impl Syscall {
     }
 
     /// ## 用于控制和查询与体系结构相关的进程特定选项
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/process_64.c#913
     pub fn arch_prctl(option: usize, arg2: usize) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
         if let Err(SystemError::EINVAL) = Self::do_arch_prctl_64(&pcb, option, arg2, true) {
@@ -109,8 +110,17 @@ impl Syscall {
     }
 
     #[allow(dead_code)]
-    pub fn do_arch_prctl_common(_option: usize, _arg2: usize) -> Result<usize, SystemError> {
-        todo!("do_arch_prctl_common not unimplemented");
+    pub fn do_arch_prctl_common(option: usize, arg2: usize) -> Result<usize, SystemError> {
+        // Don't use 0x3001-0x3004 because of old glibcs
+        if (0x3001..=0x3004).contains(&option) {
+            return Err(SystemError::EINVAL);
+        }
+
+        todo!(
+            "do_arch_prctl_common not unimplemented, option: {}, arg2: {}",
+            option,
+            arg2
+        );
     }
 }
 

@@ -6,8 +6,8 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
+    filesystem::epoll::{event_poll::EventPoll, EPollItem},
     libs::spinlock::SpinLock,
-    net::event_poll::{EPollItem, EventPoll},
 };
 
 #[derive(Debug, Clone)]
@@ -50,8 +50,8 @@ impl EPollItems {
         let mut result = Ok(());
         guard.iter().for_each(|item| {
             if let Some(epoll) = item.epoll().upgrade() {
-                let _ =
-                    EventPoll::ep_remove(&mut epoll.lock_irqsave(), item.fd(), None).map_err(|e| {
+                let _ = EventPoll::ep_remove(&mut epoll.lock_irqsave(), item.fd(), None, item)
+                    .map_err(|e| {
                         result = Err(e);
                     });
             }

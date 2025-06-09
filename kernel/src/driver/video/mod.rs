@@ -155,7 +155,7 @@ impl VideoRefreshManager {
     }
 
     /// 在riscv64平台下暂时不支持
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     pub unsafe fn video_init() -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -294,11 +294,4 @@ impl TimerFunction for VideoRefreshExecutor {
 
         return Ok(());
     }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rs_video_init() -> i32 {
-    return VideoRefreshManager::video_init()
-        .map(|_| 0)
-        .unwrap_or_else(|e| e.to_posix_errno());
 }

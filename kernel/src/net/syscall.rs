@@ -3,14 +3,18 @@ use log::debug;
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::file::{File, FileMode},
+    filesystem::vfs::{
+        file::{File, FileMode},
+        iov::IoVecs,
+    },
+    net::socket::AddressFamily,
     process::ProcessManager,
     syscall::Syscall,
 };
 
 use super::{
     posix::{MsgHdr, PosixArgsSocketType, SockAddr},
-    socket::{self, endpoint::Endpoint, unix::Unix, AddressFamily},
+    socket::{self, endpoint::Endpoint, unix::Unix},
 };
 
 /// Flags for socket, socketpair, accept4
@@ -322,9 +326,7 @@ impl Syscall {
     /// @return 成功返回接收的字节数，失败返回错误码
     pub fn recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usize, SystemError> {
         // 检查每个缓冲区地址是否合法，生成iovecs
-        let mut iovs = unsafe {
-            crate::filesystem::vfs::syscall::IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)?
-        };
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
         let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)

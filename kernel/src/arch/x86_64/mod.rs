@@ -4,6 +4,7 @@ mod acpi;
 pub mod cpu;
 pub mod driver;
 pub mod elf;
+pub mod filesystem;
 pub mod fpu;
 pub mod init;
 pub mod interrupt;
@@ -48,3 +49,6 @@ pub use crate::arch::vm::x86_kvm_ops as kvm_arch_ops;
 
 pub use crate::arch::vm::kvm_host::vcpu::X86VcpuArch as VirtCpuArch;
 pub use crate::arch::vm::kvm_host::KvmVcpuStat as VirtCpuStat;
+
+pub fn panic_pre_work() {}
+pub fn panic_post_work() {}

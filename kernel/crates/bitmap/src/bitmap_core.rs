@@ -7,6 +7,12 @@ pub struct BitMapCore<T: BitOps> {
     phantom: PhantomData<T>,
 }
 
+impl<T: BitOps> Default for BitMapCore<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: BitOps> BitMapCore<T> {
     pub const fn new() -> Self {
         Self {

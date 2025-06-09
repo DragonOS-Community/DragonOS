@@ -240,6 +240,8 @@ make run-docker
 - 本地编译，不运行: `make all -j 您的CPU核心数`
 - 本地编译，并写入磁盘镜像，不运行: `make build`
 - 本地编译，写入磁盘镜像，并在QEMU中运行: `make run`
+- 本地编译，写入磁盘镜像，以无图形模式运行: 
+`make run-nographic`
 - Docker编译，并写入磁盘镜像,: `make docker`
 - Docker编译，写入磁盘镜像，并在QEMU中运行: `make run-docker`
 - 不编译，直接从已有的磁盘镜像启动: `make qemu`

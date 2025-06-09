@@ -3,6 +3,7 @@ use core::fmt::Debug;
 
 use crate::filesystem::procfs::ProcFSInode;
 use crate::filesystem::vfs::{IndexNode, ROOT_INODE};
+use crate::libs::rwlock::RwLock;
 use crate::namespaces::user_namespace::UserNamespace;
 use crate::process::fork::CloneFlags;
 use crate::process::{Pid, ProcessControlBlock, ProcessManager};
@@ -101,7 +102,7 @@ pub fn prepare_nsset(flags: u64) -> Result<NsSet, SystemError> {
     let current = ProcessManager::current_pcb();
     Ok(NsSet {
         flags,
-        fs: current.fs_struct(),
+        fs: RwLock::new(current.fs_struct()),
         nsproxy: create_new_namespaces(flags, &current, USER_NS.clone())?,
     })
 }
@@ -110,10 +111,10 @@ pub fn commit_nsset(nsset: NsSet) {
     let flags = CloneFlags::from_bits_truncate(nsset.flags);
     let current = ProcessManager::current_pcb();
     if flags.contains(CloneFlags::CLONE_NEWNS) {
-        let fs = current.fs_struct();
-        let nsset_fs = nsset.fs.lock();
-        fs.lock().set_pwd(nsset_fs.pwd.clone());
-        fs.lock().set_root(nsset_fs.root.clone());
+        let nsset_fs = nsset.fs.read();
+        let fs = current.fs_struct_mut();
+        fs.set_pwd(nsset_fs.pwd());
+        fs.set_root(nsset_fs.root());
     }
     switch_task_namespace(current, nsset.nsproxy); // 转移所有权
 }

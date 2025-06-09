@@ -9,7 +9,7 @@ use crate::{
         video::VideoRefreshManager,
     },
     exception::{init::irq_init, softirq::softirq_init, InterruptArch},
-    filesystem::vfs::core::vfs_init,
+    filesystem::vfs::vcore::vfs_init,
     init::init_intertrait,
     libs::{
         futex::futex::Futex,
@@ -23,7 +23,7 @@ use crate::{
     process::{kthread::kthread_init, process_init, ProcessManager},
     sched::SchedArch,
     smp::{early_smp_init, SMPArch},
-    syscall::Syscall,
+    syscall::{syscall_init, Syscall},
     time::{
         clocksource::clocksource_boot_finish, timekeeping::timekeeping_init, timer::timer_init,
     },
@@ -69,6 +69,8 @@ fn do_start_kernel() {
 
     init_intertrait();
 
+    syscall_init().expect("syscall init failed");
+
     vfs_init().expect("vfs init failed");
     driver_init().expect("driver init failed");
 
@@ -93,16 +95,17 @@ fn do_start_kernel() {
     crate::bpf::init_bpf_system();
     crate::debug::jump_label::static_keys_init();
 
-    // #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
-    // crate::virt::kvm::kvm_init();
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
-    crate::arch::vm::vmx::vmx_init().unwrap();
+    if crate::arch::vm::vmx::vmx_init().is_err() {
+        log::warn!("vmx init failed, will not be enabled");
+    }
 }
 
 /// 在内存管理初始化之前，执行的初始化
 #[inline(never)]
 fn init_before_mem_init() {
     serial_early_init().expect("serial early init failed");
+
     let video_ok = unsafe { VideoRefreshManager::video_init().is_ok() };
     scm_init(video_ok);
 

@@ -12,7 +12,6 @@ mod utils;
 use crate::libs::wait_queue::WaitQueue;
 pub use base::Socket;
 
-pub use crate::net::event_poll::EPollEventType;
 pub use common::{
     // poll_unit::{EPollItems, WaitQueue},
     EPollItems,

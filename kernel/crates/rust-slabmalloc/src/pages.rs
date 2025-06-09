@@ -33,7 +33,7 @@ impl Bitfield for [AtomicU64] {
     fn initialize(&mut self, for_size: usize, capacity: usize) {
         // Set everything to allocated
         for bitmap in self.iter_mut() {
-            *bitmap = AtomicU64::new(u64::max_value());
+            *bitmap = AtomicU64::new(u64::MAX);
         }
 
         // Mark actual slots as free
@@ -56,7 +56,7 @@ impl Bitfield for [AtomicU64] {
     ) -> Option<(usize, usize)> {
         for (base_idx, b) in self.iter().enumerate() {
             let bitval = b.load(Ordering::Relaxed);
-            if bitval == u64::max_value() {
+            if bitval == u64::MAX {
                 continue;
             } else {
                 let negated = !bitval;
@@ -117,7 +117,7 @@ impl Bitfield for [AtomicU64] {
     #[inline(always)]
     fn is_full(&self) -> bool {
         self.iter()
-            .filter(|&x| x.load(Ordering::Relaxed) != u64::max_value())
+            .filter(|&x| x.load(Ordering::Relaxed) != u64::MAX)
             .count()
             == 0
     }
@@ -268,10 +268,10 @@ impl<'a> ObjectPage<'a> {
 }
 
 // These needs some more work to be really safe...
-unsafe impl<'a> Send for ObjectPage<'a> {}
-unsafe impl<'a> Sync for ObjectPage<'a> {}
+unsafe impl Send for ObjectPage<'_> {}
+unsafe impl Sync for ObjectPage<'_> {}
 
-impl<'a> AllocablePage for ObjectPage<'a> {
+impl AllocablePage for ObjectPage<'_> {
     const SIZE: usize = OBJECT_PAGE_SIZE;
 
     fn bitfield(&self) -> &[AtomicU64; 8] {
@@ -296,7 +296,7 @@ impl<'a> Default for ObjectPage<'a> {
     }
 }
 
-impl<'a> fmt::Debug for ObjectPage<'a> {
+impl fmt::Debug for ObjectPage<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "ObjectPage")
     }
@@ -401,6 +401,8 @@ impl<'a, T: AllocablePage> PageList<'a, T> {
                 });
 
                 self.elements -= 1;
+
+                #[allow(clippy::manual_inspect)]
                 new_head.map(|node| {
                     *node.prev() = Rawlink::none();
                     *node.next() = Rawlink::none();
@@ -434,6 +436,7 @@ impl<'a, P: AllocablePage + 'a> Iterator for ObjectPageIterMut<'a, P> {
     #[inline]
     fn next(&mut self) -> Option<&'a mut P> {
         unsafe {
+            #[allow(clippy::manual_inspect)]
             self.head.resolve_mut().map(|next| {
                 self.head = match next.next().resolve_mut() {
                     None => Rawlink::none(),

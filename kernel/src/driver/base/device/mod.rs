@@ -26,8 +26,8 @@ use crate::{
     },
 };
 
-use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
+use core::{fmt::Display, intrinsics::unlikely, ops::Deref};
 use system_error::SystemError;
 
 use self::{
@@ -123,6 +123,69 @@ pub fn sys_devices_virtual_kset() -> Arc<KSet> {
 unsafe fn set_sys_devices_virtual_kset(kset: Arc<KSet>) {
     DEVICES_VIRTUAL_KSET_INSTANCE = Some(kset);
 }
+
+/// /dev下面的设备的名字
+pub struct DevName {
+    name: Arc<String>,
+    id: usize,
+}
+
+impl DevName {
+    pub fn new(name: String, id: usize) -> Self {
+        return DevName {
+            name: Arc::new(name),
+            id,
+        };
+    }
+
+    #[inline]
+    pub fn id(&self) -> usize {
+        return self.id;
+    }
+}
+
+impl core::fmt::Debug for DevName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        return write!(f, "{}", self.name);
+    }
+}
+
+impl Display for DevName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        return write!(f, "{}", self.name);
+    }
+}
+
+impl Clone for DevName {
+    fn clone(&self) -> Self {
+        return DevName {
+            name: self.name.clone(),
+            id: self.id,
+        };
+    }
+}
+
+impl core::hash::Hash for DevName {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl Deref for DevName {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        return self.name.as_ref();
+    }
+}
+
+impl PartialEq for DevName {
+    fn eq(&self, other: &Self) -> bool {
+        return self.name == other.name;
+    }
+}
+
+impl Eq for DevName {}
 
 /// 设备应该实现的操作
 ///

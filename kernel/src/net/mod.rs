@@ -8,7 +8,6 @@ use alloc::{collections::BTreeMap, sync::Arc};
 
 use crate::{driver::net::Iface, libs::rwlock::RwLock};
 
-pub mod event_poll;
 pub mod net_core;
 pub mod posix;
 pub mod socket;

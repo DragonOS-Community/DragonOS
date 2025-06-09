@@ -5,10 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::block::SeekFrom,
-    filesystem::vfs::{
-        file::{File, FileMode},
-        ROOT_INODE,
-    },
+    filesystem::vfs::file::{File, FileMode},
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -118,7 +115,8 @@ impl ExecParam {
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
-        let inode = ROOT_INODE().lookup(file_path)?;
+        let pwd = ProcessManager::current_pcb().pwd_inode();
+        let inode = pwd.lookup(file_path)?;
 
         // 读取文件头部，用于判断文件类型
         let file = File::new(inode, FileMode::O_RDONLY)?;
@@ -158,6 +156,11 @@ impl ExecParam {
 
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
+    }
+
+    /// 获取File的所有权，用于将动态链接器加入文件描述符表中
+    pub fn file(self) -> File {
+        self.file
     }
 }
 
@@ -201,6 +204,7 @@ pub struct ProcInitInfo {
     pub args: Vec<CString>,
     pub envs: Vec<CString>,
     pub auxv: BTreeMap<u8, usize>,
+    pub rand_num: [u8; 16],
 }
 
 impl ProcInitInfo {
@@ -210,6 +214,7 @@ impl ProcInitInfo {
             args: Vec::new(),
             envs: Vec::new(),
             auxv: BTreeMap::new(),
+            rand_num: [0u8; 16],
         }
     }
 
@@ -220,7 +225,7 @@ impl ProcInitInfo {
     ///
     /// 返回值是一个元组，第一个元素是最终的用户栈顶地址，第二个元素是环境变量pointer数组的起始地址     
     pub unsafe fn push_at(
-        &self,
+        &mut self,
         ustack: &mut UserStack,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
         // 先把程序的名称压入栈中
@@ -235,6 +240,7 @@ impl ProcInitInfo {
                 ustack.sp()
             })
             .collect::<Vec<_>>();
+
         // 然后把参数压入栈中
         let argps = self
             .args
@@ -244,6 +250,20 @@ impl ProcInitInfo {
                 ustack.sp()
             })
             .collect::<Vec<_>>();
+
+        // 压入随机数，把指针放入auxv
+        self.push_slice(ustack, &[self.rand_num])?;
+        self.auxv
+            .insert(super::abi::AtType::Random as u8, ustack.sp().data());
+
+        // 实现栈的16字节对齐
+        // 用当前栈顶地址减去后续要压栈的长度，得到的压栈后的栈顶地址与0xF按位与操作得到对齐要填充的字节数
+        let length_to_push = (self.auxv.len() + envps.len() + 1 + argps.len() + 1 + 1)
+            * core::mem::align_of::<usize>();
+        self.push_slice(
+            ustack,
+            &vec![0u8; (ustack.sp().data() - length_to_push) & 0xF],
+        )?;
 
         // 压入auxv
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;
@@ -258,7 +278,6 @@ impl ProcInitInfo {
         // 把参数指针压入栈中
         self.push_slice(ustack, &[null::<u8>()])?;
         self.push_slice(ustack, argps.as_slice())?;
-
         let argv_ptr = ustack.sp();
 
         // 把argc压入栈中

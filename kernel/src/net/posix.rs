@@ -364,7 +364,7 @@ pub struct MsgHdr {
     /// SockAddr结构体的大小
     pub msg_namelen: u32,
     /// scatter/gather array
-    pub msg_iov: *mut crate::filesystem::vfs::syscall::IoVec,
+    pub msg_iov: *mut crate::filesystem::vfs::iov::IoVec,
     /// elements in msg_iov
     pub msg_iovlen: usize,
     /// 辅助数据

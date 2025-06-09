@@ -1,12 +1,11 @@
 use core::{
     any::Any,
     cell::UnsafeCell,
-    fmt::Debug,
+    fmt::{Debug, Formatter},
     ops::{Deref, DerefMut},
 };
 
 use alloc::{
-    collections::LinkedList,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -63,13 +62,20 @@ fn virtio_net_driver() -> Arc<VirtIONetDriver> {
 }
 
 /// virtio net device
-#[derive(Debug)]
 #[cast_to([sync] VirtIODevice)]
 #[cast_to([sync] Device)]
 pub struct VirtIONetDevice {
     dev_id: Arc<DeviceId>,
     inner: SpinLock<InnerVirtIONetDevice>,
     locked_kobj_state: LockedKObjectState,
+}
+
+impl Debug for VirtIONetDevice {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtIONetDevice")
+            .field("dev_id", &self.dev_id.id())
+            .finish()
+    }
 }
 
 unsafe impl Send for VirtIONetDevice {}
@@ -85,7 +91,7 @@ struct InnerVirtIONetDevice {
 
 impl Debug for InnerVirtIONetDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("InnerVirtIOBlkDevice").finish()
+        f.debug_struct("InnerVirtIONetDevice").finish()
     }
 }
 
@@ -108,7 +114,7 @@ impl VirtIONetDevice {
         let mac = wire::EthernetAddress::from_bytes(&driver_net.mac_address());
         debug!("VirtIONetDevice mac: {:?}", mac);
         let device_inner = VirtIONicDeviceInner::new(driver_net);
-
+        device_inner.inner.lock_irqsave().enable_interrupts();
         let dev = Arc::new(Self {
             dev_id,
             inner: SpinLock::new(InnerVirtIONetDevice {
@@ -824,12 +830,12 @@ impl VirtIODriver for VirtIONetDriver {
         return Ok(());
     }
 
-    fn virtio_id_table(&self) -> LinkedList<VirtioDeviceId> {
+    fn virtio_id_table(&self) -> Vec<VirtioDeviceId> {
         self.inner().virtio_driver_common.id_table.clone()
     }
 
     fn add_virtio_id(&self, id: VirtioDeviceId) {
-        self.inner().virtio_driver_common.id_table.push_back(id);
+        self.inner().virtio_driver_common.id_table.push(id);
     }
 }
 

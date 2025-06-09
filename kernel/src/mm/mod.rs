@@ -21,7 +21,6 @@ use self::{
 };
 
 pub mod allocator;
-pub mod c_adapter;
 pub mod early_ioremap;
 pub mod fault;
 pub mod init;

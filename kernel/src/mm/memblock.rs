@@ -40,6 +40,9 @@ impl MemBlockManager {
     pub const MIN_MEMBLOCK_ADDR: PhysAddr = PhysAddr::new(0);
     #[allow(dead_code)]
     pub const MAX_MEMBLOCK_ADDR: PhysAddr = PhysAddr::new(usize::MAX);
+
+    /// 由于这个函数只在全局调用，因此不需要担心栈上溢出问题
+    #[allow(clippy::large_stack_frames)]
     const fn new() -> Self {
         Self {
             inner: SpinLock::new(InnerMemBlockManager {

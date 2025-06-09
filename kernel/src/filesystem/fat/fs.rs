@@ -23,9 +23,9 @@ use crate::mm::VmFaultReason;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
-        core::generate_inode_id,
         file::{FileMode, FilePrivateData},
         syscall::ModeType,
+        vcore::generate_inode_id,
         FileSystem, FileType, IndexNode, InodeId, Metadata,
     },
     libs::{
@@ -227,6 +227,7 @@ impl LockedFATInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -249,6 +250,83 @@ impl LockedFATInode {
         inode.0.lock().synchronize_metadata();
 
         return inode;
+    }
+
+    #[inline(never)]
+    fn rename_file_in_current_dir(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.0.lock();
+        let old_inode: Arc<LockedFATInode> = guard.find(old_name)?;
+        // 对目标inode上锁，以防更改
+        let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
+        let fs = old_inode_guard.fs.upgrade().unwrap();
+        // 从缓存删除
+        let old_dir = match &guard.inode_type {
+            FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
+                return Err(SystemError::ENOTDIR);
+            }
+            FATDirEntry::Dir(d) => d,
+            FATDirEntry::UnInit => {
+                error!("FATFS: param: Inode_type uninitialized.");
+                return Err(SystemError::EROFS);
+            }
+        };
+        // 检查文件是否存在
+        // old_dir.check_existence(old_name, Some(false), guard.fs.upgrade().unwrap())?;
+
+        old_dir.rename(fs, old_name, new_name)?;
+        let _nod = guard.children.remove(&to_search_name(old_name));
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn move_to_another_dir(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        target: &Arc<dyn IndexNode>,
+    ) -> Result<(), SystemError> {
+        let mut old_guard = self.0.lock();
+        let other: &LockedFATInode = target
+            .downcast_ref::<LockedFATInode>()
+            .ok_or(SystemError::EPERM)?;
+
+        let new_guard = other.0.lock();
+        let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
+        // 对目标inode上锁，以防更改
+        let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
+        let fs = old_inode_guard.fs.upgrade().unwrap();
+
+        let old_dir = match &old_guard.inode_type {
+            FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
+                return Err(SystemError::ENOTDIR);
+            }
+            FATDirEntry::Dir(d) => d,
+            FATDirEntry::UnInit => {
+                error!("FATFS: param: Inode_type uninitialized.");
+                return Err(SystemError::EROFS);
+            }
+        };
+        let new_dir = match &new_guard.inode_type {
+            FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
+                return Err(SystemError::ENOTDIR);
+            }
+            FATDirEntry::Dir(d) => d,
+            FATDirEntry::UnInit => {
+                error!("FATFA: param: Inode_type uninitialized.");
+                return Err(SystemError::EROFS);
+            }
+        };
+        // 检查文件是否存在
+        old_dir.check_existence(old_name, Some(false), old_guard.fs.upgrade().unwrap())?;
+        old_dir.rename_across(fs, new_dir, old_name, new_name)?;
+        // 从缓存删除
+        let _nod = old_guard.children.remove(&to_search_name(old_name));
+
+        Ok(())
     }
 }
 
@@ -377,6 +455,7 @@ impl FATFileSystem {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -1450,7 +1529,6 @@ impl IndexNode for LockedFATInode {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
             let r = page_cache.lock_irqsave().read(offset, &mut buf[0..len]);
-            // self.0.lock_irqsave().update_metadata();
             return r;
         } else {
             return self.read_direct(offset, len, buf, data);
@@ -1761,64 +1839,9 @@ impl IndexNode for LockedFATInode {
         let new_id = target.metadata().unwrap().inode_id;
         // 若在同一父目录下
         if old_id == new_id {
-            let mut guard = self.0.lock();
-            let old_inode: Arc<LockedFATInode> = guard.find(old_name)?;
-            // 对目标inode上锁，以防更改
-            let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
-            let fs = old_inode_guard.fs.upgrade().unwrap();
-            // 从缓存删除
-            let old_dir = match &guard.inode_type {
-                FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                    return Err(SystemError::ENOTDIR);
-                }
-                FATDirEntry::Dir(d) => d,
-                FATDirEntry::UnInit => {
-                    error!("FATFS: param: Inode_type uninitialized.");
-                    return Err(SystemError::EROFS);
-                }
-            };
-            // 检查文件是否存在
-            // old_dir.check_existence(old_name, Some(false), guard.fs.upgrade().unwrap())?;
-
-            old_dir.rename(fs, old_name, new_name)?;
-            let _nod = guard.children.remove(&to_search_name(old_name));
+            self.rename_file_in_current_dir(old_name, new_name)?;
         } else {
-            let mut old_guard = self.0.lock();
-            let other: &LockedFATInode = target
-                .downcast_ref::<LockedFATInode>()
-                .ok_or(SystemError::EPERM)?;
-
-            let new_guard = other.0.lock();
-            let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
-            // 对目标inode上锁，以防更改
-            let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
-            let fs = old_inode_guard.fs.upgrade().unwrap();
-
-            let old_dir = match &old_guard.inode_type {
-                FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                    return Err(SystemError::ENOTDIR);
-                }
-                FATDirEntry::Dir(d) => d,
-                FATDirEntry::UnInit => {
-                    error!("FATFS: param: Inode_type uninitialized.");
-                    return Err(SystemError::EROFS);
-                }
-            };
-            let new_dir = match &new_guard.inode_type {
-                FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
-                    return Err(SystemError::ENOTDIR);
-                }
-                FATDirEntry::Dir(d) => d,
-                FATDirEntry::UnInit => {
-                    error!("FATFA: param: Inode_type uninitialized.");
-                    return Err(SystemError::EROFS);
-                }
-            };
-            // 检查文件是否存在
-            old_dir.check_existence(old_name, Some(false), old_guard.fs.upgrade().unwrap())?;
-            old_dir.rename_across(fs, new_dir, old_name, new_name)?;
-            // 从缓存删除
-            let _nod = old_guard.children.remove(&to_search_name(old_name));
+            self.move_to_another_dir(old_name, new_name, target)?;
         }
 
         return Ok(());

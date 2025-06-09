@@ -25,7 +25,7 @@ use crate::{
     net::socket::{self, *},
 };
 
-type EP = EPollEventType;
+type EP = crate::filesystem::epoll::EPollEventType;
 
 pub mod inner;
 

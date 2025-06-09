@@ -7,6 +7,10 @@ ifeq ($(ARCH), x86_64)
 	export TARGET_JSON=arch/x86_64/x86_64-unknown-none.json
 else ifeq ($(ARCH), riscv64)
 	export TARGET_JSON=arch/riscv64/riscv64gc-unknown-none-elf.json
+else ifeq ($(ARCH), loongarch64)
+	export TARGET_JSON=arch/loongarch64/loongarch64-unknown-none.json
+else
+	$(error "Unsupported ARCH: $(ARCH)")
 endif
 
 export CARGO_ZBUILD=-Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
@@ -16,6 +20,7 @@ ECHO:
 	@echo "$@"
 
 all: 
+	$(MAKE) -C ../build-scripts all
 	$(MAKE) -C src all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
 	
 
@@ -26,7 +31,7 @@ clean:
 fmt:
 	RUSTFLAGS="$(RUSTFLAGS)" cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 clippy --all-features
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 clippy --all-features --target x86_64-unknown-none
 endif
 
 

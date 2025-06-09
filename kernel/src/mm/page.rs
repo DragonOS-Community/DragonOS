@@ -82,12 +82,16 @@ impl PageManager {
     }
 
     pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
-        page_reclaimer_lock_irqsave().get(paddr);
+        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+            return Some(p);
+        }
         self.phys2page.get(paddr).cloned()
     }
 
     pub fn get_unwrap(&mut self, paddr: &PhysAddr) -> Arc<Page> {
-        page_reclaimer_lock_irqsave().get(paddr);
+        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+            return p;
+        }
         self.phys2page
             .get(paddr)
             .unwrap_or_else(|| panic!("Phys Page not found, {:?}", paddr))
@@ -348,8 +352,11 @@ impl PageReclaimer {
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
 
         for vma in guard.vma_set() {
-            let address_space = vma.lock_irqsave().address_space().unwrap();
-            let address_space = address_space.upgrade().unwrap();
+            let address_space = vma.lock_irqsave().address_space().and_then(|x| x.upgrade());
+            if address_space.is_none() {
+                continue;
+            }
+            let address_space = address_space.unwrap();
             let mut guard = address_space.write();
             let mapper = &mut guard.user_mapper.utable;
             let virt = vma.lock_irqsave().page_address(page_index).unwrap();
@@ -380,19 +387,21 @@ impl PageReclaimer {
             MMArch::PAGE_SIZE
         };
 
-        inode
-            .write_direct(
-                page_index * MMArch::PAGE_SIZE,
-                len,
-                unsafe {
-                    core::slice::from_raw_parts(
-                        MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8,
-                        len,
-                    )
-                },
-                SpinLock::new(FilePrivateData::Unused).lock(),
-            )
-            .unwrap();
+        if len > 0 {
+            inode
+                .write_direct(
+                    page_index * MMArch::PAGE_SIZE,
+                    len,
+                    unsafe {
+                        core::slice::from_raw_parts(
+                            MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8,
+                            len,
+                        )
+                    },
+                    SpinLock::new(FilePrivateData::Unused).lock(),
+                )
+                .unwrap();
+        }
 
         // 清除标记
         guard.remove_flags(PageFlags::PG_DIRTY);
@@ -927,6 +936,11 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
                 let ppn = ((self.data & (!((1 << 10) - 1))) >> 10) & ((1 << 54) - 1);
                 super::allocator::page_frame::PhysPageFrame::from_ppn(ppn).phys_address()
             }
+
+            #[cfg(target_arch = "loongarch64")]
+            {
+                todo!("la64: PageEntry::address")
+            }
         };
 
         if self.present() {
@@ -1055,6 +1069,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
                     // riscv64指向下一级页表的页表项，不应设置R/W/X权限位
                     Self::from_data(Arch::ENTRY_FLAG_DEFAULT_TABLE)
                 }
+
+                #[cfg(target_arch = "loongarch64")]
+                {
+                    Self::from_data(Arch::ENTRY_FLAG_DEFAULT_TABLE)
+                }
             };
 
             #[cfg(target_arch = "x86_64")]
@@ -1069,6 +1088,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
             #[cfg(target_arch = "riscv64")]
             {
                 r
+            }
+
+            #[cfg(target_arch = "loongarch64")]
+            {
+                todo!("loongarch64: new_page_table")
             }
         };
     }
@@ -1146,6 +1170,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
                     .update_flags(Arch::ENTRY_FLAG_READONLY, true)
                     .update_flags(Arch::ENTRY_FLAG_WRITEABLE, false);
             }
+        }
+
+        #[cfg(target_arch = "loongarch64")]
+        {
+            todo!("la64: set_write")
         }
     }
 
@@ -1279,6 +1308,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
                 .set_write(true)
                 .set_execute(true)
                 .set_page_global(true)
+        }
+
+        #[cfg(target_arch = "loongarch64")]
+        {
+            todo!("la64: mmio_flags()")
         }
     }
 }

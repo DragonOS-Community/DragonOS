@@ -12,14 +12,14 @@ use system_error::SystemError;
 
 use crate::{
     driver::{base::device::device_number::DeviceNumber, tty::pty::ptm_driver},
+    filesystem::epoll::{EPollEventType, EPollItem},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
     mm::VirtAddr,
-    net::event_poll::{EPollEventType, EPollItem},
-    process::Pid,
+    process::{process_group::Pgid, session::Sid, ProcessControlBlock},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
@@ -50,6 +50,7 @@ impl Drop for TtyCore {
 }
 
 impl TtyCore {
+    #[inline(never)]
     pub fn new(driver: Arc<TtyDriver>, index: usize) -> Arc<Self> {
         let name = driver.tty_line_name(index);
         let device_number = driver
@@ -76,7 +77,6 @@ impl TtyCore {
             device_number,
             privete_fields: SpinLock::new(None),
         };
-
         return Arc::new(Self {
             core,
             line_discipline: Arc::new(NTtyLinediscipline {
@@ -280,14 +280,21 @@ impl TtyCore {
 
 #[derive(Debug, Default)]
 pub struct TtyContorlInfo {
-    /// 前台进程pid
-    pub session: Option<Pid>,
+    /// 当前会话的SId
+    pub session: Option<Sid>,
     /// 前台进程组id
-    pub pgid: Option<Pid>,
+    pub pgid: Option<Pgid>,
 
     /// packet模式下使用，目前未用到
     pub pktstatus: TtyPacketStatus,
     pub packet: bool,
+}
+
+impl TtyContorlInfo {
+    pub fn set_info_by_pcb(&mut self, pcb: Arc<ProcessControlBlock>) {
+        self.session = Some(pcb.sid());
+        self.pgid = Some(pcb.pgid());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -488,6 +495,16 @@ impl TtyCoreData {
     #[inline]
     pub fn add_epitem(&self, epitem: Arc<EPollItem>) {
         self.epitems.lock().push_back(epitem)
+    }
+
+    pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let mut guard = self.epitems.lock();
+        let len = guard.len();
+        guard.retain(|x| !Arc::ptr_eq(x, epitem));
+        if len != guard.len() {
+            return Ok(());
+        }
+        Err(SystemError::ENOENT)
     }
 
     pub fn eptiems(&self) -> &SpinLock<LinkedList<Arc<EPollItem>>> {

@@ -1,7 +1,7 @@
 use core::sync::atomic::AtomicUsize;
 
+use crate::filesystem::epoll::EPollEventType;
 use crate::libs::rwlock::RwLock;
-use crate::net::socket::EPollEventType;
 use crate::net::socket::{self, inet::Types};
 use alloc::boxed::Box;
 use alloc::vec::Vec;

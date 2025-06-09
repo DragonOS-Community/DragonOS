@@ -78,7 +78,11 @@ impl SignalStruct {
         let mut r = Self {
             inner: Box::<InnerSignalStruct>::default(),
         };
-        let sig_ign = Sigaction::default();
+        let mut sig_ign = Sigaction::default();
+        // 收到忽略的信号，重启系统调用
+        // todo: 看看linux哪些
+        sig_ign.flags_mut().insert(SigFlags::SA_RESTART);
+
         r.inner.handlers[Signal::SIGCHLD as usize - 1] = sig_ign;
         r.inner.handlers[Signal::SIGURG as usize - 1] = sig_ign;
         r.inner.handlers[Signal::SIGWINCH as usize - 1] = sig_ign;

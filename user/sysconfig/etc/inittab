@@ -1,0 +1,27 @@
+# /etc/inittab
+::sysinit:busybox sh /etc/init.d/rcS      # 系统初始化脚本
+
+::askfirst:-/bin/busybox sh --login
+
+
+# /etc/inittab - 根据源码弄出来的默认inittab
+# https://code.dragonos.org.cn/xref/busybox-1.35.0/init/init.c#679
+
+# # 系统初始化脚本
+# ::sysinit:/etc/init.d/rcS
+
+# # askfirst shell
+# ::askfirst:-/bin/sh
+# tty2::askfirst:-/bin/sh
+# tty3::askfirst:-/bin/sh
+# tty4::askfirst:-/bin/sh
+
+# # Ctrl-Alt-Del 重启
+# ::ctrlaltdel:/sbin/reboot
+
+# # 系统关闭或重启前的动作
+# ::shutdown:/bin/umount -a -r
+# ::shutdown:/sbin/swapoff -a
+
+# # 收到 QUIT 信号时重启 init
+# ::restart:/sbin/init

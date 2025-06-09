@@ -19,3 +19,4 @@ cppcheck.xml
 .cache
 compile_commands.json
 /logs/
+*.log

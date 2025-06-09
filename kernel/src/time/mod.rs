@@ -65,6 +65,10 @@ impl PosixTimeSpec {
         };
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.tv_nsec == 0 && self.tv_sec == 0
+    }
+
     /// 获取当前时间
     #[inline(always)]
     pub fn now() -> Self {
@@ -86,7 +90,7 @@ impl PosixTimeSpec {
             }
         }
 
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
         {
             return PosixTimeSpec::new(0, 0);
         }
@@ -287,6 +291,23 @@ impl Instant {
         }
         let micros_diff = self.micros - earlier.micros;
         Some(Duration::from_micros(micros_diff as u64))
+    }
+
+    /// Saturating subtraction. Computes `self - other`, returning [`Instant::ZERO`] if the result would be negative.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The `Instant` to subtract from `self`.
+    ///
+    /// # Returns
+    ///
+    /// The duration between `self` and `other`, or [`Instant::ZERO`] if `other` is later than `self`.
+    pub fn saturating_sub(self, other: Instant) -> Duration {
+        if self.micros >= other.micros {
+            Duration::from_micros((self.micros - other.micros) as u64)
+        } else {
+            Duration::ZERO
+        }
     }
 }
 

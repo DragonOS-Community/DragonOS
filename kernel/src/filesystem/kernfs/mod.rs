@@ -1,3 +1,4 @@
+use alloc::string::ToString;
 use core::{cmp::min, fmt::Debug, intrinsics::unlikely};
 
 use alloc::{
@@ -22,7 +23,7 @@ use crate::{
 use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
-    core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
+    file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
     FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
@@ -94,6 +95,7 @@ impl KernFS {
             atime: PosixTimeSpec::new(0, 0),
             mtime: PosixTimeSpec::new(0, 0),
             ctime: PosixTimeSpec::new(0, 0),
+            btime: PosixTimeSpec::new(0, 0),
             dev_id: 0,
             inode_id: generate_inode_id(),
             file_type: FileType::Dir,
@@ -114,6 +116,7 @@ impl KernFS {
             callback: None,
             children: SpinLock::new(HashMap::new()),
             inode_type: KernInodeType::Dir,
+            lazy_list: SpinLock::new(HashMap::new()),
         });
 
         return root_inode;
@@ -137,6 +140,16 @@ pub struct KernFSInode {
     inode_type: KernInodeType,
     /// Inode名称
     name: String,
+    /// lazy list
+    lazy_list: SpinLock<HashMap<String, fn() -> KernFSInodeArgs>>,
+}
+
+pub struct KernFSInodeArgs {
+    pub mode: ModeType,
+    pub inode_type: KernInodeType,
+    pub size: Option<usize>,
+    pub private_data: Option<KernInodePrivateData>,
+    pub callback: Option<&'static dyn KernFSCallback>,
 }
 
 #[derive(Debug)]
@@ -244,12 +257,25 @@ impl IndexNode for KernFSInode {
             }
             name => {
                 // 在子目录项中查找
-                return Ok(self
-                    .children
-                    .lock()
-                    .get(name)
-                    .ok_or(SystemError::ENOENT)?
-                    .clone());
+                let child = self.children.lock().get(name).cloned();
+                if let Some(child) = child {
+                    return Ok(child);
+                }
+                let lazy_list = self.lazy_list.lock();
+                if let Some(provider) = lazy_list.get(name) {
+                    // 如果存在lazy list，则调用提供者函数创建
+                    let args = provider();
+                    let inode = self.inner_create(
+                        name.to_string(),
+                        args.inode_type,
+                        args.mode,
+                        args.size.unwrap_or(4096),
+                        args.private_data,
+                        args.callback,
+                    )?;
+                    return Ok(inode);
+                }
+                Err(SystemError::ENOENT)
             }
         }
     }
@@ -320,7 +346,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type == KernInodeType::SymLink {
             let inner = self.inner.read();
@@ -349,6 +375,8 @@ impl IndexNode for KernFSInode {
             warn!("kernfs: callback is none");
             return Err(SystemError::ENOSYS);
         }
+        // release the private data lock before calling the callback
+        drop(data);
 
         let callback_data =
             KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
@@ -364,7 +392,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type != KernInodeType::File {
             return Err(SystemError::EISDIR);
@@ -373,6 +401,9 @@ impl IndexNode for KernFSInode {
         if self.callback.is_none() {
             return Err(SystemError::ENOSYS);
         }
+
+        // release the private data lock before calling the callback
+        drop(data);
 
         let callback_data =
             KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
@@ -410,6 +441,7 @@ impl KernFSInode {
             callback,
             children: SpinLock::new(HashMap::new()),
             inode_type,
+            lazy_list: SpinLock::new(HashMap::new()),
         });
 
         {
@@ -499,6 +531,18 @@ impl KernFSInode {
         );
     }
 
+    pub fn add_file_lazy(
+        &self,
+        name: String,
+        provider: fn() -> KernFSInodeArgs,
+    ) -> Result<(), SystemError> {
+        if unlikely(self.inode_type != KernInodeType::Dir) {
+            return Err(SystemError::ENOTDIR);
+        }
+        self.lazy_list.lock().insert(name, provider);
+        Ok(())
+    }
+
     fn inner_create(
         &self,
         name: String,
@@ -525,6 +569,7 @@ impl KernFSInode {
             atime: PosixTimeSpec::new(0, 0),
             mtime: PosixTimeSpec::new(0, 0),
             ctime: PosixTimeSpec::new(0, 0),
+            btime: PosixTimeSpec::new(0, 0),
             dev_id: 0,
             inode_id: generate_inode_id(),
             file_type: file_type.into(),

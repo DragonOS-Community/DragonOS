@@ -3,7 +3,6 @@ use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError;
 
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::event_poll::EPollEventType;
 use crate::net::socket::common::shutdown::{ShutdownBit, ShutdownTemp};
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::{Socket, SocketInode, PMSG, PSOL};
@@ -18,7 +17,7 @@ pub use option::Options as TcpOption;
 
 use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
 
-type EP = EPollEventType;
+type EP = crate::filesystem::epoll::EPollEventType;
 #[derive(Debug)]
 pub struct TcpSocket {
     inner: RwLock<Option<inner::Inner>>,

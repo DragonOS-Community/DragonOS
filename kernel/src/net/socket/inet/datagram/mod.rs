@@ -2,8 +2,8 @@ use inner::{UdpInner, UnboundUdp};
 use smoltcp;
 use system_error::SystemError;
 
+use crate::filesystem::epoll::EPollEventType;
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::event_poll::EPollEventType;
 use crate::net::socket::{Socket, PMSG};
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
@@ -13,7 +13,7 @@ use super::InetSocket;
 
 pub mod inner;
 
-type EP = EPollEventType;
+type EP = crate::filesystem::epoll::EPollEventType;
 
 // Udp Socket 负责提供状态切换接口、执行状态切换
 #[derive(Debug)]

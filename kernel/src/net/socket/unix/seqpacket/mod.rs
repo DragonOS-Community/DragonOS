@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     libs::{rwlock::RwLock, wait_queue::WaitQueue},
-    net::socket::{EPollEventType, Socket, SocketInode, PMSG},
+    net::socket::{Socket, SocketInode, PMSG},
 };
 use crate::{
     net::{
@@ -27,7 +27,7 @@ use super::{
     INODE_MAP,
 };
 
-type EP = EPollEventType;
+type EP = crate::filesystem::epoll::EPollEventType;
 #[derive(Debug)]
 pub struct SeqpacketSocket {
     inner: RwLock<inner::Inner>,

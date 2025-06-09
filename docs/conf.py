@@ -17,7 +17,7 @@ import os
 # -- Project information -----------------------------------------------------
 
 project = 'DragonOS'
-copyright = '2022-2024, DragonOS Community'
+copyright = '2022-2025, DragonOS Community'
 author = 'longjin'
 github_org = 'DragonOS-Community'
 github_repo = 'DragonOS'
@@ -31,7 +31,12 @@ release = 'dev'
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-extensions = ['myst_parser', 'sphinx_multiversion']
+extensions = [
+    'myst_parser', 
+    'sphinx_multiversion',
+    'sphinxcontrib.mermaid',
+    'sphinx.ext.extlinks',
+]
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -42,6 +47,7 @@ templates_path = ['_templates']
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
 language = 'zh_CN'
+locale_dirs = ['locale/']   # path is example but recommended.
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.

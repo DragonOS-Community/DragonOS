@@ -149,16 +149,18 @@ impl X86_64MMArch {
     /// - `error_code`: 错误标志
     /// - `address`: 发生缺页异常的虚拟地址
     pub fn do_kern_addr_fault(
-        _regs: &'static TrapFrame,
+        regs: &'static TrapFrame,
         error_code: X86PfErrorCode,
         address: VirtAddr,
     ) {
         panic!(
             "do_kern_addr_fault has not yet been implemented, 
-        fault address: {:#x}, 
+        fault address: {:#x},
+        rip: {:#x},
         error_code: {:#b}, 
         pid: {}\n",
             address.data(),
+            regs.rip,
             error_code,
             crate::process::ProcessManager::current_pid().data()
         );

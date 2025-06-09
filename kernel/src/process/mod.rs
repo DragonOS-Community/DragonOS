@@ -1619,13 +1619,13 @@ unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
         flusher.flush();
     }
 
-    // todo!(why?)
-    unsafe {
-        let guard_ptr = (kstack_vaddr.data() - 8) as *mut usize;
-        guard_ptr.write(0xfff); // Invalid
-        let guard_ptr = guard_vaddr.data() as *mut usize;
-        guard_ptr.write(0xfff); // Invalid
-    }
+    // // todo!(why?)
+    // unsafe {
+    //     let guard_ptr = (kstack_vaddr.data() - 8) as *mut usize;
+    //     guard_ptr.write(0xfff); // Invalid
+    //     let guard_ptr = guard_vaddr.data() as *mut usize;
+    //     guard_ptr.write(0xfff); // Invalid
+    // }
 
     // Don't need to remap the kernel stack page, because it is already mapped
 

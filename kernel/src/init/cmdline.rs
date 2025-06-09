@@ -347,6 +347,9 @@ impl KernelCmdlineManager {
                             log::warn!("cmdline: parameter {} is set twice", p.name);
                             continue;
                         }
+                        // For x86, we need disable CR0 WP bit to allow writing to read-only memory.
+                        // This is because the kernel command line parameters are stored in read-only memory.
+                        // For other architectures, this is also necessary to ensure that the parameters can be modified.
                         p.value = Some(CString::new(value.unwrap()).unwrap());
                         p.initialized = true;
                     }

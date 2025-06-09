@@ -158,8 +158,7 @@ impl MemoryManagementArch for X86_64MMArch {
         boot_callbacks()
             .early_init_memory_blocks()
             .expect("init memory area failed");
-
-        debug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
+        debug!("bootstrap info: {:#x?}", unsafe { BOOTSTRAP_MM_INFO });
         debug!("phys[0]=virt[0x{:x}]", unsafe {
             MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
         });
@@ -167,7 +166,6 @@ impl MemoryManagementArch for X86_64MMArch {
         // 初始化内存管理器
         unsafe { allocator_init() };
 
-        Self::enable_kernel_wp();
         send_to_default_serial8250_port("x86 64 mm init done\n\0".as_bytes());
     }
 
@@ -428,13 +426,25 @@ impl X86_64MMArch {
     /// 启用CR0的WP位(Write Protect)
     /// 这样即使在内核态，CPU也会检查页面的写保护位
     /// 防止内核错误地写入只读页面
-    fn enable_kernel_wp() {
+    pub fn enable_kernel_wp() {
         unsafe {
             use x86::controlregs::{cr0, cr0_write, Cr0};
             let mut cr0_val = cr0();
             cr0_val.insert(Cr0::CR0_WRITE_PROTECT);
             cr0_write(cr0_val);
             log::debug!("CR0.WP bit enabled for kernel write protection");
+        }
+    }
+
+    /// 禁用CR0的WP位(Write Protect)
+    #[allow(unused)]
+    pub fn disable_kernel_wp() {
+        unsafe {
+            use x86::controlregs::{cr0, cr0_write, Cr0};
+            let mut cr0_val = cr0();
+            cr0_val.remove(Cr0::CR0_WRITE_PROTECT);
+            cr0_write(cr0_val);
+            log::debug!("CR0.WP bit disabled for kernel write protection");
         }
     }
 

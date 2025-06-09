@@ -685,6 +685,11 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
             )
             .bits()];
 
+        // map集合中并不会主动设置该位，需要手动设置
+        if vm_flags.contains(VmFlags::VM_WRITE) {
+            ret = ret.set_write(true)
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             // 如果xd位被保留，那么将可执行性设置为true

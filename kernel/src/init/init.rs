@@ -48,6 +48,10 @@ pub fn start_kernel() -> ! {
 
     CurrentSchedArch::enable_sched_local();
 
+    // 将该函数放置在这个位置的原因是内核初始化期间需要修改一些只读页的数据，
+    // 如果在前期就设置该属性，需要每次在修改这些页时都要修改该属性
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::MMArch::enable_kernel_wp();
     ProcessManager::arch_idle_func();
 }
 

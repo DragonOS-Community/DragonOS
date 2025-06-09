@@ -153,6 +153,23 @@ impl X86_64MMArch {
         error_code: X86PfErrorCode,
         address: VirtAddr,
     ) {
+        unsafe { crate::debug::traceback::lookup_kallsyms(regs.rip, 0xff) };
+        let pcb = crate::process::ProcessManager::current_pcb();
+        let kstack_guard_addr = pcb.kernel_stack().guard_page_address();
+        if let Some(guard_page) = kstack_guard_addr {
+            let guard_page_size = pcb.kernel_stack().guard_page_size().unwrap();
+            if address.data() >= guard_page.data()
+                && address.data() < guard_page.data() + guard_page_size
+            {
+                // 发生在内核栈保护页上
+                error!(
+                    "kernel stack guard page fault at {:#x}, guard page range: {:#x} - {:#x}",
+                    address.data(),
+                    guard_page.data(),
+                    guard_page.data() + guard_page_size
+                );
+            }
+        }
         panic!(
             "do_kern_addr_fault has not yet been implemented, 
         fault address: {:#x},
@@ -162,7 +179,7 @@ impl X86_64MMArch {
             address.data(),
             regs.rip,
             error_code,
-            crate::process::ProcessManager::current_pid().data()
+            pcb.pid().data()
         );
         //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/mm/fault.c#do_kern_addr_fault
     }

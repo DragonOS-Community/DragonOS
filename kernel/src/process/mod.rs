@@ -1580,6 +1580,12 @@ pub enum KernelStackType {
     Dynamic,
 }
 
+// 为什么需要这个锁?
+// alloc_from_kernel_space 使用该函数分配内核栈时，如果该函数被中断打断，
+// 而切换的任务使用dealloc_from_kernel_space回收内核栈，对
+// KernelMapper的可变引用获取将会失败造成错误
+static KSTACK_LOCK: SpinLock<()> = SpinLock::new(());
+
 unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
     use crate::arch::MMArch;
     use crate::mm::allocator::page_frame::{allocate_page_frames, PageFrameCount};
@@ -1596,13 +1602,14 @@ unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
     // | ..........  |
     // ---------------
 
+    let _guard = KSTACK_LOCK.try_lock_irqsave().unwrap();
     let need_size = KernelStack::SIZE * 2;
     let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
 
     let (paddr, _count) = allocate_page_frames(page_num).expect("kernel stack alloc failed");
 
     let guard_vaddr = MMArch::phys_2_virt(paddr).unwrap();
-    let kstack_paddr = paddr + KernelStack::SIZE;
+    let _kstack_paddr = paddr + KernelStack::SIZE;
     let kstack_vaddr = guard_vaddr + KernelStack::SIZE;
 
     core::ptr::write_bytes(kstack_vaddr.data() as *mut u8, 0, KernelStack::SIZE);
@@ -1619,25 +1626,20 @@ unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
         flusher.flush();
     }
 
-    // // todo!(why?)
     // unsafe {
+    //     log::debug!(
+    //         "trigger kernel stack guard page :{:#x}",
+    //         (kstack_vaddr.data() - 8)
+    //     );
     //     let guard_ptr = (kstack_vaddr.data() - 8) as *mut usize;
-    //     guard_ptr.write(0xfff); // Invalid
-    //     let guard_ptr = guard_vaddr.data() as *mut usize;
     //     guard_ptr.write(0xfff); // Invalid
     // }
 
-    // Don't need to remap the kernel stack page, because it is already mapped
-
-    // let kstack_flags = EntryFlags::new().set_write(true).set_execute(true);
-    // let flusher = kernel_mapper.remap(kstack_vaddr, kstack_flags).unwrap();
-    // flusher.flush();
-
-    log::error!(
-        "[kernel stack alloc]: virt: {:#x}, phy: {:#x}",
-        kstack_vaddr.data(),
-        kstack_paddr.data()
-    );
+    // log::info!(
+    //     "[kernel stack alloc]: virt: {:#x}, phy: {:#x}",
+    //     kstack_vaddr.data(),
+    //     _kstack_paddr.data()
+    // );
     (guard_vaddr, paddr)
 }
 
@@ -1648,14 +1650,16 @@ unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr) {
     use crate::mm::kernel_mapper::KernelMapper;
     use crate::mm::MemoryManagementArch;
 
+    let _guard = KSTACK_LOCK.try_lock_irqsave().unwrap();
+
     let need_size = KernelStack::SIZE * 2;
     let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
 
-    log::error!(
-        "[kernel stack dealloc]: virt: {:#x}, phy: {:#x}",
-        vaddr.data(),
-        paddr.data()
-    );
+    // log::info!(
+    //     "[kernel stack dealloc]: virt: {:#x}, phy: {:#x}",
+    //     vaddr.data(),
+    //     paddr.data()
+    // );
 
     let mut kernel_mapper = KernelMapper::lock();
     let kernel_mapper = kernel_mapper.as_mut().unwrap();
@@ -1663,7 +1667,6 @@ unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr) {
     // restore the guard page flags
     for i in 0..KernelStack::SIZE / MMArch::PAGE_SIZE {
         let guard_page_vaddr = vaddr + i * MMArch::PAGE_SIZE;
-
         let flusher = kernel_mapper
             .remap(guard_page_vaddr, kernel_page_flags(vaddr))
             .unwrap();
@@ -1718,6 +1721,30 @@ impl KernelStack {
             ),
             ty: KernelStackType::Static,
         })
+    }
+
+    pub fn guard_page_address(&self) -> Option<VirtAddr> {
+        match self.ty {
+            KernelStackType::KernelSpace(kstack_virt_addr, _) => {
+                return Some(kstack_virt_addr);
+            }
+            _ => {
+                // 静态内核栈和动态内核栈没有guard page
+                return None;
+            }
+        }
+    }
+
+    pub fn guard_page_size(&self) -> Option<usize> {
+        match self.ty {
+            KernelStackType::KernelSpace(_, _) => {
+                return Some(KernelStack::SIZE);
+            }
+            _ => {
+                // 静态内核栈和动态内核栈没有guard page
+                return None;
+            }
+        }
     }
 
     /// 返回内核栈的起始虚拟地址(低地址)

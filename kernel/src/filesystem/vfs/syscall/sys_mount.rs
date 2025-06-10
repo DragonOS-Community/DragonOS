@@ -55,9 +55,9 @@ impl Syscall for SysMountHandle {
         let fstype_str = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
         let fstype_str = fstype_str.to_str().map_err(|_| SystemError::EINVAL)?;
 
-        let fstype = produce_fs(fstype_str, data, source)?;
+        let fs = produce_fs(fstype_str, data, source)?;
 
-        do_mount(fstype, &target)?;
+        do_mount(fs, &target)?;
 
         return Ok(0);
     }

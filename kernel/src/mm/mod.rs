@@ -685,11 +685,6 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
             )
             .bits()];
 
-        // map集合中并不会主动设置该位，需要手动设置
-        if vm_flags.contains(VmFlags::VM_WRITE) {
-            ret = ret.set_write(true)
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             // 如果xd位被保留，那么将可执行性设置为true
@@ -699,6 +694,14 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
         }
         ret
     }
+
+    /// 启用 内核态的 Write Protect
+    /// 这样即使在内核态，CPU也会检查页面的写保护位
+    /// 防止内核错误地写入只读页面
+    fn enable_kernel_wp();
+
+    /// 禁用 内核态的 Write Protect
+    fn disable_kernel_wp();
 }
 
 /// @brief 虚拟地址范围

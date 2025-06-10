@@ -1,21 +1,16 @@
+use crate::process::fork::CloneFlags;
 use core::{
-    ffi::{c_int, c_void},
+    ffi::c_int,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
-    arch::{ipc::signal::SigSet, syscall::nr::*},
+    arch::syscall::nr::*,
     filesystem::vfs::syscall::PosixStatfs,
-    ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
-    mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
+    mm::page::PAGE_4K_SIZE,
     net::syscall::MsgHdr,
-    process::{
-        fork::KernelCloneArgs,
-        process_group::Pgid,
-        resource::{RLimit64, RUsage},
-        ProcessFlags, ProcessManager,
-    },
+    process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
@@ -26,17 +21,13 @@ use system_error::SystemError;
 use table::{syscall_table, syscall_table_init};
 
 use crate::{
-    arch::{interrupt::TrapFrame, MMArch},
+    arch::interrupt::TrapFrame,
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
-        file::FileMode,
         syscall::{ModeType, UtimensFlags},
-        MAX_PATHLEN,
     },
-    libs::align::page_align_up,
-    mm::{verify_area, MemoryManagementArch, VirtAddr},
+    mm::{verify_area, VirtAddr},
     net::syscall::SockAddr,
-    process::{fork::CloneFlags, syscall::PosixOldUtsName, Pid},
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         PosixTimeSpec,
@@ -108,21 +99,14 @@ impl Syscall {
             //     handler.name,
             //     handler.args_string(args)
             // );
-            return handler.inner_handle.handle(args, frame.is_from_user());
+
+            return handler.inner_handle.handle(args, frame);
         }
 
         // 如果找不到，fallback到原有逻辑
         let r = match syscall_num {
             SYS_PUT_STRING => {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
-            }
-            #[cfg(target_arch = "x86_64")]
-            SYS_OPEN => {
-                let path = args[0] as *const u8;
-                let flags = args[1] as u32;
-                let mode = args[2] as u32;
-
-                Self::open(path, flags, mode, true)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -137,6 +121,11 @@ impl Syscall {
                     0,
                 )
             }
+
+            #[cfg(target_arch = "x86_64")]
+            SYS_FORK => ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into()),
+            #[cfg(target_arch = "x86_64")]
+            SYS_VFORK => ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into()),
 
             #[cfg(target_arch = "x86_64")]
             SYS_RENAMEAT => {
@@ -163,10 +152,6 @@ impl Syscall {
                 let mode = args[3] as u32;
 
                 Self::openat(dirfd, path, flags, mode, true)
-            }
-            SYS_CLOSE => {
-                let fd = args[0];
-                Self::close(fd)
             }
 
             SYS_LSEEK => {
@@ -202,26 +187,9 @@ impl Syscall {
                 Self::pwrite(fd, buf, len, offset)
             }
 
-            SYS_IOCTL => {
-                let fd = args[0];
-                let cmd = args[1];
-                let data = args[2];
-                Self::ioctl(fd, cmd as u32, data)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_FORK => Self::fork(frame),
-            #[cfg(target_arch = "x86_64")]
-            SYS_VFORK => Self::vfork(frame),
-
-            SYS_BRK => {
-                let new_brk = VirtAddr::new(args[0]);
-                Self::brk(new_brk).map(|vaddr| vaddr.data())
-            }
-
             SYS_SBRK => {
-                let increment = args[0] as isize;
-                Self::sbrk(increment).map(|vaddr: VirtAddr| vaddr.data())
+                let incr = args[0] as isize;
+                crate::mm::syscall::sys_sbrk::sys_sbrk(incr)
             }
 
             SYS_REBOOT => {
@@ -264,44 +232,6 @@ impl Syscall {
                 res
             }
 
-            SYS_EXECVE => {
-                let path_ptr = args[0];
-                let argv_ptr = args[1];
-                let env_ptr = args[2];
-                let virt_path_ptr = VirtAddr::new(path_ptr);
-                let virt_argv_ptr = VirtAddr::new(argv_ptr);
-                let virt_env_ptr = VirtAddr::new(env_ptr);
-                // 权限校验
-                if frame.is_from_user()
-                    && (verify_area(virt_path_ptr, MAX_PATHLEN).is_err()
-                        || verify_area(virt_argv_ptr, PAGE_4K_SIZE).is_err())
-                    || verify_area(virt_env_ptr, PAGE_4K_SIZE).is_err()
-                {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::execve(
-                        path_ptr as *const u8,
-                        argv_ptr as *const *const u8,
-                        env_ptr as *const *const u8,
-                        frame,
-                    )
-                    .map(|_| 0)
-                }
-            }
-            SYS_WAIT4 => {
-                let pid = args[0] as i32;
-                let wstatus = args[1] as *mut i32;
-                let options = args[2] as c_int;
-                let rusage = args[3] as *mut c_void;
-                // 权限校验
-                // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
-                Self::wait4(pid.into(), wstatus, options, rusage)
-            }
-
-            SYS_EXIT => {
-                let exit_code = args[0];
-                Self::exit(exit_code)
-            }
             #[cfg(target_arch = "x86_64")]
             SYS_MKDIR => {
                 let path = args[0] as *const u8;
@@ -333,27 +263,6 @@ impl Syscall {
             }
 
             SYS_CLOCK => Self::clock(),
-            #[cfg(target_arch = "x86_64")]
-            SYS_PIPE => {
-                let pipefd: *mut i32 = args[0] as *mut c_int;
-                if pipefd.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::pipe2(pipefd, FileMode::empty())
-                }
-            }
-
-            SYS_PIPE2 => {
-                let pipefd: *mut i32 = args[0] as *mut c_int;
-                let arg1 = args[1];
-                if pipefd.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    let flags = FileMode::from_bits_truncate(arg1 as u32);
-                    Self::pipe2(pipefd, flags)
-                }
-            }
-
             SYS_UNLINKAT => {
                 let dirfd = args[0] as i32;
                 let path = args[1] as *const u8;
@@ -402,21 +311,6 @@ impl Syscall {
                 let path = args[0] as *const u8;
                 Self::unlink(path)
             }
-            SYS_KILL => {
-                let pid = args[0] as i32;
-                let sig = args[1] as c_int;
-                // debug!("KILL SYSCALL RECEIVED");
-                Self::kill(pid, sig)
-            }
-
-            SYS_RT_SIGACTION => {
-                let sig = args[0] as c_int;
-                let act = args[1];
-                let old_act = args[2];
-                Self::sigaction(sig, act, old_act, frame.is_from_user())
-            }
-
-            SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
             SYS_SCHED => {
                 warn!("syscall sched");
@@ -598,51 +492,6 @@ impl Syscall {
                 let timezone_ptr = args[1] as *mut PosixTimeZone;
                 Self::gettimeofday(timeval, timezone_ptr)
             }
-            SYS_MMAP => {
-                let len = page_align_up(args[1]);
-                let virt_addr = VirtAddr::new(args[0]);
-                if verify_area(virt_addr, len).is_err() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::mmap(
-                        VirtAddr::new(args[0]),
-                        len,
-                        args[2],
-                        args[3],
-                        args[4] as i32,
-                        args[5],
-                    )
-                }
-            }
-            SYS_MREMAP => {
-                let old_vaddr = VirtAddr::new(args[0]);
-                let old_len = args[1];
-                let new_len = args[2];
-                let mremap_flags = MremapFlags::from_bits_truncate(args[3] as u8);
-                let new_vaddr = VirtAddr::new(args[4]);
-
-                Self::mremap(old_vaddr, old_len, new_len, mremap_flags, new_vaddr)
-            }
-            SYS_MUNMAP => {
-                let addr = args[0];
-                let len = page_align_up(args[1]);
-                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
-                    // The addr argument is not a multiple of the page size
-                    Err(SystemError::EINVAL)
-                } else {
-                    Self::munmap(VirtAddr::new(addr), len)
-                }
-            }
-            SYS_MPROTECT => {
-                let addr = args[0];
-                let len = page_align_up(args[1]);
-                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
-                    // The addr argument is not a multiple of the page size
-                    Err(SystemError::EINVAL)
-                } else {
-                    Self::mprotect(VirtAddr::new(addr), len, args[2])
-                }
-            }
 
             SYS_GETCWD => {
                 let buf = args[0] as *mut u8;
@@ -658,16 +507,6 @@ impl Syscall {
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf, size) };
                     Self::getcwd(buf).map(|ptr| ptr.data())
                 }
-            }
-
-            SYS_GETPGID => Self::getpgid(Pid::new(args[0])).map(|pgid| pgid.into()),
-
-            SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
-
-            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-            SYS_FSTAT => {
-                let fd = args[0] as i32;
-                Self::fstat(fd, args[1])
             }
 
             SYS_FCNTL => {
@@ -704,23 +543,6 @@ impl Syscall {
                     flags,
                     crate::driver::base::device::device_number::DeviceNumber::from(dev_t as u32),
                 )
-            }
-
-            SYS_CLONE => {
-                let parent_tid = VirtAddr::new(args[2]);
-                let child_tid = VirtAddr::new(args[3]);
-
-                // 地址校验
-                verify_area(parent_tid, core::mem::size_of::<i32>())?;
-                verify_area(child_tid, core::mem::size_of::<i32>())?;
-
-                let mut clone_args = KernelCloneArgs::new();
-                clone_args.flags = CloneFlags::from_bits_truncate(args[0] as u64);
-                clone_args.stack = args[1];
-                clone_args.parent_tid = parent_tid;
-                clone_args.child_tid = child_tid;
-                clone_args.tls = args[4];
-                Self::clone(frame, clone_args)
             }
 
             SYS_FUTEX => {
@@ -765,20 +587,6 @@ impl Syscall {
                 return ret;
             }
 
-            SYS_SET_TID_ADDRESS => Self::set_tid_address(args[0]),
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_LSTAT => {
-                let path = args[0] as *const u8;
-                Self::lstat(path, args[1])
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_STAT => {
-                let path = args[0] as *const u8;
-                Self::stat(path, args[1])
-            }
-
             SYS_STATFS => {
                 let path = args[0] as *const u8;
                 let statfs = args[1] as *mut PosixStatfs;
@@ -798,48 +606,6 @@ impl Syscall {
                 args[3] as u32,
                 args[4],
             ),
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),
-            SYS_EPOLL_CREATE1 => Self::epoll_create1(args[0]),
-
-            SYS_EPOLL_CTL => Self::epoll_ctl(
-                args[0] as i32,
-                args[1],
-                args[2] as i32,
-                VirtAddr::new(args[3]),
-            ),
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_EPOLL_WAIT => Self::epoll_wait(
-                args[0] as i32,
-                VirtAddr::new(args[1]),
-                args[2] as i32,
-                args[3] as i32,
-            ),
-
-            SYS_EPOLL_PWAIT => {
-                let epfd = args[0] as i32;
-                let epoll_event = VirtAddr::new(args[1]);
-                let max_events = args[2] as i32;
-                let timespec = args[3] as i32;
-                let sigmask_addr = args[4] as *mut SigSet;
-
-                if sigmask_addr.is_null() {
-                    return Self::epoll_wait(epfd, epoll_event, max_events, timespec);
-                }
-                let sigmask_reader =
-                    UserBufferReader::new(sigmask_addr, core::mem::size_of::<SigSet>(), true)?;
-                let mut sigmask = *sigmask_reader.read_one_from_user::<SigSet>(0)?;
-
-                Self::epoll_pwait(
-                    args[0] as i32,
-                    VirtAddr::new(args[1]),
-                    args[2] as i32,
-                    args[3] as i32,
-                    &mut sigmask,
-                )
-            }
 
             // 目前为了适配musl-libc,以下系统调用先这样写着
             SYS_GETRANDOM => {
@@ -867,20 +633,6 @@ impl Syscall {
 
             SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
 
-            SYS_SETPGID => {
-                let pid = Pid::new(args[0]);
-                let pgid = Pgid::new(args[1]);
-                Self::setpgid(pid, pgid)
-            }
-
-            SYS_RT_SIGPROCMASK => {
-                let how = args[0] as i32;
-                let nset = args[1];
-                let oset = args[2];
-                let sigsetsize = args[3];
-                Self::rt_sigprocmask(how, nset, oset, sigsetsize)
-            }
-
             SYS_TKILL => {
                 warn!("SYS_TKILL has not yet been implemented");
                 Ok(0)
@@ -890,25 +642,6 @@ impl Syscall {
                 warn!("SYS_SIGALTSTACK has not yet been implemented");
                 Ok(0)
             }
-
-            SYS_EXIT_GROUP => {
-                let exit_code = args[0];
-                Self::exit(exit_code)
-                // warn!("SYS_EXIT_GROUP has not yet been implemented");
-                // Ok(0)
-            }
-
-            SYS_MADVISE => {
-                let addr = args[0];
-                let len = page_align_up(args[1]);
-                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
-                    Err(SystemError::EINVAL)
-                } else {
-                    Self::madvise(VirtAddr::new(addr), len, args[2])
-                }
-            }
-
-            SYS_GETTID => Self::gettid().map(|tid| tid.into()),
 
             SYS_SYSLOG => {
                 let syslog_action_type = args[0];
@@ -922,27 +655,6 @@ impl Syscall {
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
-            SYS_GETUID => Self::getuid(),
-            SYS_GETGID => Self::getgid(),
-            SYS_SETUID => Self::setuid(args[0]),
-            SYS_SETGID => Self::setgid(args[0]),
-
-            SYS_GETEUID => Self::geteuid(),
-            SYS_GETEGID => Self::getegid(),
-            SYS_SETRESUID => Self::seteuid(args[1]),
-            SYS_SETRESGID => Self::setegid(args[1]),
-
-            SYS_SETFSUID => Self::setfsuid(args[0]),
-            SYS_SETFSGID => Self::setfsgid(args[0]),
-
-            SYS_SETSID => Self::setsid(),
-            SYS_GETSID => Self::getsid(Pid::new(args[0])),
-
-            SYS_GETRUSAGE => {
-                let who = args[0] as c_int;
-                let rusage = args[1] as *mut RUsage;
-                Self::get_rusage(who, rusage)
-            }
             #[cfg(target_arch = "x86_64")]
             SYS_READLINK => {
                 let path = args[0] as *const u8;
@@ -957,16 +669,6 @@ impl Syscall {
                 let buf = args[2] as *mut u8;
                 let bufsiz = args[3];
                 Self::readlink_at(dirfd, path, buf, bufsiz)
-            }
-
-            SYS_PRLIMIT64 => {
-                let pid = args[0];
-                let pid = Pid::new(pid);
-                let resource = args[1];
-                let new_limit = args[2] as *const RLimit64;
-                let old_limit = args[3] as *mut RLimit64;
-
-                Self::prlimit64(pid, resource, new_limit, old_limit)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -1078,19 +780,6 @@ impl Syscall {
                 Self::getaffinity(pid, set)
             }
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_GETRLIMIT => {
-                let resource = args[0];
-                let rlimit = args[1] as *mut RLimit64;
-
-                Self::prlimit64(
-                    ProcessManager::current_pcb().pid(),
-                    resource,
-                    core::ptr::null::<RLimit64>(),
-                    rlimit,
-                )
-            }
-
             SYS_FADVISE64 => {
                 // todo: 这个系统调用还没有实现
 
@@ -1117,10 +806,6 @@ impl Syscall {
             SYS_NEWFSTATAT => Self::newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
 
             // SYS_SCHED_YIELD => Self::sched_yield(),
-            SYS_UNAME => {
-                let name = args[0] as *mut PosixOldUtsName;
-                Self::uname(name)
-            }
             SYS_PRCTL => {
                 // todo: 这个系统调用还没有实现
 
@@ -1133,38 +818,6 @@ impl Syscall {
                 Self::alarm(second)
             }
 
-            SYS_SHMGET => {
-                let key = ShmKey::new(args[0]);
-                let size = args[1];
-                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
-
-                Self::shmget(key, size, shmflg)
-            }
-            SYS_SHMAT => {
-                let id = ShmId::new(args[0]);
-                let vaddr = VirtAddr::new(args[1]);
-                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
-
-                Self::shmat(id, vaddr, shmflg)
-            }
-            SYS_SHMDT => {
-                let vaddr = VirtAddr::new(args[0]);
-                Self::shmdt(vaddr)
-            }
-            SYS_SHMCTL => {
-                let id = ShmId::new(args[0]);
-                let cmd = ShmCtlCmd::from(args[1]);
-                let user_buf = args[2] as *const u8;
-                let from_user = frame.is_from_user();
-
-                Self::shmctl(id, cmd, user_buf, from_user)
-            }
-            SYS_MSYNC => {
-                let start = page_align_up(args[0]);
-                let len = page_align_up(args[1]);
-                let flags = args[2];
-                Self::msync(VirtAddr::new(start), len, flags)
-            }
             SYS_UTIMENSAT => Self::sys_utimensat(
                 args[0] as i32,
                 args[1] as *const u8,
@@ -1210,8 +863,7 @@ impl Syscall {
             }
             #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             SYS_SETRLIMIT => Ok(0),
-            SYS_RESTART_SYSCALL => Self::restart_syscall(),
-            SYS_RT_SIGPENDING => Self::rt_sigpending(args[0], args[1]),
+
             SYS_RT_SIGTIMEDWAIT => {
                 log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
                 Ok(0)

@@ -1,5 +1,6 @@
 pub mod devfs;
 pub mod devpts;
+pub mod epoll;
 pub mod eventfd;
 pub mod fat;
 pub mod kernfs;

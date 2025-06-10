@@ -67,7 +67,7 @@ use crate::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
-    syscall::{user_access::clear_user, Syscall},
+    syscall::user_access::clear_user,
 };
 use timer::AlarmTimer;
 
@@ -76,8 +76,10 @@ use self::{cred::Cred, kthread::WorkerPrivate};
 pub mod abi;
 pub mod cred;
 pub mod exec;
+pub mod execve;
 pub mod exit;
 pub mod fork;
+pub mod geteuid;
 pub mod idle;
 pub mod kthread;
 pub mod pid;
@@ -386,7 +388,7 @@ impl ProcessManager {
                 return;
             }
             let parent_pcb = r.unwrap();
-            let r = Syscall::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
+            let r = crate::ipc::kill::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
             if r.is_err() {
                 warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",
@@ -404,6 +406,11 @@ impl ProcessManager {
     /// ## 参数
     ///
     /// - `exit_code` : 进程的退出码
+    ///
+    /// ## 注意
+    ///  对于正常退出的进程，状态码应该先左移八位，以便用户态读取的时候正常返回退出码；而对于被信号终止的进程，状态码则是最低七位，无需进行移位操作。
+    ///
+    ///  因此注意，传入的`exit_code`应该是已经完成了移位操作的
     pub fn exit(exit_code: usize) -> ! {
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -796,52 +803,53 @@ impl ProcessControlBlock {
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
         let sched_info = ProcessSchedulerInfo::new(None);
-        let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
-        let mut pcb = Self {
-            pid,
-            tgid: pid,
-            thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
-            basic: basic_info,
-            preempt_count,
-            flags,
-            kernel_stack: RwLock::new(kstack),
-            syscall_stack: RwLock::new(KernelStack::new().unwrap()),
-            worker_private: SpinLock::new(None),
-            sched_info,
-            arch_info,
-            sig_info: RwLock::new(ProcessSignalInfo::default()),
-            sig_struct: SpinLock::new(SignalStruct::new()),
-            exit_signal: AtomicSignal::new(Signal::SIGCHLD),
-            parent_pcb: RwLock::new(ppcb.clone()),
-            real_parent_pcb: RwLock::new(ppcb),
-            children: RwLock::new(Vec::new()),
-            wait_queue: WaitQueue::default(),
-            thread: RwLock::new(ThreadInfo::new()),
-            fs: RwLock::new(Arc::new(FsStruct::new())),
-            alarm_timer: SpinLock::new(None),
-            robust_list: RwLock::new(None),
-            nsproxy: Arc::new(RwLock::new(NsProxy::new())),
-            cred: SpinLock::new(cred),
-            self_ref: Weak::new(),
-            restart_block: SpinLock::new(None),
-            process_group: Mutex::new(Weak::new()),
-            executable_path: RwLock::new(name),
-        };
 
-        pcb.sig_info.write().set_tty(tty);
-
-        // 初始化系统调用栈
-        #[cfg(target_arch = "x86_64")]
-        pcb.arch_info
-            .lock()
-            .init_syscall_stack(&pcb.syscall_stack.read());
-
+        // 使用 Arc::new_cyclic 避免在栈上创建巨大的结构体
         let pcb = Arc::new_cyclic(|weak| {
-            pcb.self_ref = weak.clone();
+            let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
+            let pcb = Self {
+                pid,
+                tgid: pid,
+                thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
+                basic: basic_info,
+                preempt_count,
+                flags,
+                kernel_stack: RwLock::new(kstack),
+                syscall_stack: RwLock::new(KernelStack::new().unwrap()),
+                worker_private: SpinLock::new(None),
+                sched_info,
+                arch_info,
+                sig_info: RwLock::new(ProcessSignalInfo::default()),
+                sig_struct: SpinLock::new(SignalStruct::new()),
+                exit_signal: AtomicSignal::new(Signal::SIGCHLD),
+                parent_pcb: RwLock::new(ppcb.clone()),
+                real_parent_pcb: RwLock::new(ppcb),
+                children: RwLock::new(Vec::new()),
+                wait_queue: WaitQueue::default(),
+                thread: RwLock::new(ThreadInfo::new()),
+                fs: RwLock::new(Arc::new(FsStruct::new())),
+                alarm_timer: SpinLock::new(None),
+                robust_list: RwLock::new(None),
+                nsproxy: Arc::new(RwLock::new(NsProxy::new())),
+                cred: SpinLock::new(cred),
+                self_ref: weak.clone(),
+                restart_block: SpinLock::new(None),
+                process_group: Mutex::new(Weak::new()),
+                executable_path: RwLock::new(name),
+            };
+
+            pcb.sig_info.write().set_tty(tty);
+
+            // 初始化系统调用栈
+            #[cfg(target_arch = "x86_64")]
+            pcb.arch_info
+                .lock()
+                .init_syscall_stack(&pcb.syscall_stack.read());
+
             pcb
         });
 

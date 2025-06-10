@@ -1,26 +1,23 @@
-use core::intrinsics::likely;
-
 use alloc::sync::Arc;
-use log::warn;
+use core::intrinsics::likely;
 use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigChildCode, Signal},
+    ipc::syscall::sys_kill::PidConverter,
     sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
     time::{sleep::nanosleep, Duration},
 };
 
 use super::{
-    abi::WaitOption, pid::PidType, resource::RUsage, Pid, ProcessControlBlock, ProcessManager,
-    ProcessState,
+    abi::WaitOption, resource::RUsage, Pid, ProcessControlBlock, ProcessManager, ProcessState,
 };
 
 /// 内核wait4时的参数
 #[derive(Debug)]
 pub struct KernelWaitOption<'a> {
-    pub pid_type: PidType,
-    pub pid: Pid,
+    pub pid_converter: PidConverter,
     pub options: WaitOption,
     pub ret_status: i32,
     pub ret_info: Option<WaitIdInfo>,
@@ -37,10 +34,9 @@ pub struct WaitIdInfo {
 }
 
 impl KernelWaitOption<'_> {
-    pub fn new(pid_type: PidType, pid: Pid, options: WaitOption) -> Self {
+    pub fn new(pid_converter: PidConverter, options: WaitOption) -> Self {
         Self {
-            pid_type,
-            pid,
+            pid_converter,
             options,
             ret_status: 0,
             ret_info: None,
@@ -51,36 +47,15 @@ impl KernelWaitOption<'_> {
 }
 
 pub fn kernel_wait4(
-    mut pid: i64,
+    pid: i32,
     wstatus_buf: Option<UserBufferWriter<'_>>,
     options: WaitOption,
     rusage_buf: Option<&mut RUsage>,
 ) -> Result<usize, SystemError> {
-    // i64::MIN is not defined
-    if pid == i64::MIN {
-        return Err(SystemError::ESRCH);
-    }
-
-    // 判断pid类型
-    let pidtype: PidType;
-    if pid == -1 {
-        pidtype = PidType::MAX;
-    } else if pid < 0 {
-        pidtype = PidType::PGID;
-        warn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
-        pid = -pid;
-    } else if pid == 0 {
-        pidtype = PidType::PGID;
-        warn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
-        pid = ProcessManager::current_pcb().pid().data() as i64;
-    } else {
-        pidtype = PidType::PID;
-    }
-
-    let pid = Pid(pid as usize);
+    let converter = PidConverter::from_id(pid);
 
     // 构造参数
-    let mut kwo = KernelWaitOption::new(pidtype, pid, options);
+    let mut kwo = KernelWaitOption::new(converter, options);
 
     kwo.options.insert(WaitOption::WEXITED);
     kwo.ret_rusage = rusage_buf;
@@ -131,59 +106,78 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
     'outer: loop {
         kwo.no_task_error = Some(SystemError::ECHILD);
-        let child_pcb = ProcessManager::find(kwo.pid).ok_or(SystemError::ECHILD);
-
-        if kwo.pid_type != PidType::MAX && child_pcb.is_err() {
-            notask!('outer);
-        }
-
-        if kwo.pid_type == PidType::PID {
-            let child_pcb = child_pcb.unwrap();
-            // 获取weak引用，以便于在do_waitpid中能正常drop pcb
-            let child_weak = Arc::downgrade(&child_pcb);
-            let r = do_waitpid(child_pcb, kwo);
-            if let Some(r) = r {
-                retval = r;
-                break 'outer;
-            } else if let Err(SystemError::ESRCH) = child_weak.upgrade().unwrap().wait_queue.sleep()
-            {
-                // log::debug!("do_wait: child_pcb sleep failed");
-                continue;
-            }
-        } else if kwo.pid_type == PidType::MAX {
-            // 等待任意子进程
-            // todo: 这里有问题！应当让当前进程sleep到自身的child_wait等待队列上，这样才高效。（还没实现）
-            let current_pcb = ProcessManager::current_pcb();
-            loop {
-                let rd_childen = current_pcb.children.read();
-                if rd_childen.is_empty() {
-                    break;
+        match kwo.pid_converter {
+            PidConverter::Pid(pid) => {
+                let child_pcb = ProcessManager::find(pid)
+                    .ok_or(SystemError::ECHILD)
+                    .unwrap();
+                // 获取weak引用，以便于在do_waitpid中能正常drop pcb
+                let child_weak = Arc::downgrade(&child_pcb);
+                let r: Option<Result<usize, SystemError>> = do_waitpid(child_pcb, kwo);
+                if let Some(r) = r {
+                    retval = r;
+                    break 'outer;
+                } else if let Err(SystemError::ESRCH) =
+                    child_weak.upgrade().unwrap().wait_queue.sleep()
+                {
+                    // log::debug!("do_wait: child_pcb sleep failed");
+                    continue;
                 }
-                for pid in rd_childen.iter() {
-                    let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
-                    let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
-                    let state = sched_guard.state();
-                    if state.is_exited() {
-                        kwo.ret_status = state.exit_code().unwrap() as i32;
-                        kwo.no_task_error = None;
-                        // 由于pcb的drop方法里面要获取父进程的children字段的写锁，所以这里不能直接drop pcb，
-                        // 而是要先break到外层循环，以便释放父进程的children字段的锁,才能drop pcb。
-                        // 否则会死锁。
-                        tmp_child_pcb = Some(pcb.clone());
-                        unsafe { ProcessManager::release(*pid) };
-                        retval = Ok((*pid).into());
-                        break 'outer;
+            }
+            PidConverter::All => {
+                // 等待任意子进程
+                // todo: 这里有问题！应当让当前进程sleep到自身的child_wait等待队列上，这样才高效。（还没实现）
+                let current_pcb = ProcessManager::current_pcb();
+                loop {
+                    let rd_childen = current_pcb.children.read();
+                    if rd_childen.is_empty() {
+                        break;
                     }
+                    for pid in rd_childen.iter() {
+                        let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
+                        let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
+                        let state = sched_guard.state();
+                        if state.is_exited() {
+                            kwo.ret_status = state.exit_code().unwrap() as i32;
+                            kwo.no_task_error = None;
+                            // 由于pcb的drop方法里面要获取父进程的children字段的写锁，所以这里不能直接drop pcb，
+                            // 而是要先break到外层循环，以便释放父进程的children字段的锁,才能drop pcb。
+                            // 否则会死锁。
+                            tmp_child_pcb = Some(pcb.clone());
+                            unsafe { ProcessManager::release(*pid) };
+                            retval = Ok((*pid).into());
+                            break 'outer;
+                        }
+                    }
+                    drop(rd_childen);
+                    nanosleep(Duration::from_millis(100).into())?;
                 }
-                drop(rd_childen);
-                nanosleep(Duration::from_millis(100).into())?;
             }
-        } else {
-            // todo: 对于pgid的处理
-            warn!("kernel_wait4: currently not support {:?}", kwo.pid_type);
-            return Err(SystemError::EINVAL);
+            PidConverter::Pgid(pgid) => {
+                let pg = ProcessManager::find_process_group(pgid).ok_or(SystemError::ESRCH)?;
+                loop {
+                    let inner = pg.process_group_inner.lock();
+                    for (_, pcb) in inner.processes.iter() {
+                        let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
+                        let state = sched_guard.state();
+                        if state.is_exited() {
+                            kwo.ret_status = state.exit_code().unwrap() as i32;
+                            kwo.no_task_error = None;
+                            // 由于pcb的drop方法里面要获取父进程的children字段的写锁，所以这里不能直接drop pcb，
+                            // 而是要先break到外层循环，以便释放父进程的children字段的锁,才能drop pcb。
+                            // 否则会死锁。
+                            tmp_child_pcb = Some(pcb.clone());
+                            let pid = pcb.pid();
+                            unsafe { ProcessManager::release(pid) };
+                            retval = Ok((pid).into());
+                            break 'outer;
+                        }
+                    }
+                    drop(inner);
+                    nanosleep(Duration::from_millis(100).into())?;
+                }
+            }
         }
-
         notask!('outer);
     }
 

@@ -1,8 +1,9 @@
 use crate::filesystem::overlayfs::OverlayMountData;
-use crate::filesystem::vfs::FileSystemMakerData;
+use crate::filesystem::vfs::{FileSystemMakerData, FilldirContext};
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+
 use log::warn;
 use system_error::SystemError;
 
@@ -31,14 +32,34 @@ use super::{
     },
     utils::{rsplit_path, user_path_at},
     vcore::{do_mkdir_at, do_remove_dir, do_unlink_at},
-    Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
+    FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
+mod open_utils;
+mod sys_close;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+mod sys_fstat;
+mod sys_ioctl;
+#[cfg(target_arch = "x86_64")]
+mod sys_lstat;
+#[cfg(target_arch = "x86_64")]
+mod sys_open;
 mod sys_read;
 mod sys_readv;
+#[cfg(target_arch = "x86_64")]
+mod sys_stat;
 mod sys_write;
 mod sys_writev;
+
+mod epoll_utils;
+#[cfg(target_arch = "x86_64")]
+mod sys_epoll_create;
+mod sys_epoll_create1;
+mod sys_epoll_ctl;
+mod sys_epoll_pwait;
+#[cfg(target_arch = "x86_64")]
+mod sys_epoll_wait;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -425,33 +446,6 @@ bitflags! {
 }
 
 impl Syscall {
-    /// @brief 为当前进程打开一个文件
-    ///
-    /// @param path 文件路径
-    /// @param o_flags 打开文件的标志位
-    ///
-    /// @return 文件描述符编号，或者是错误码
-    pub fn open(
-        path: *const u8,
-        o_flags: u32,
-        mode: u32,
-        follow_symlink: bool,
-    ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-        let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
-        return do_sys_open(
-            AtFlags::AT_FDCWD.bits(),
-            &path,
-            open_flags,
-            mode,
-            follow_symlink,
-        );
-    }
-
     pub fn openat(
         dirfd: i32,
         path: *const u8,
@@ -466,40 +460,6 @@ impl Syscall {
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
         let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
-    }
-
-    /// @brief 关闭文件
-    ///
-    /// @param fd 文件描述符编号
-    ///
-    /// @return 成功返回0，失败返回错误码
-    pub fn close(fd: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        let _file = fd_table_guard.drop_fd(fd as i32)?;
-        drop(fd_table_guard);
-        Ok(0)
-    }
-
-    /// @brief 发送命令到文件描述符对应的设备，
-    ///
-    /// @param fd 文件描述符编号
-    /// @param cmd 设备相关的请求类型
-    ///
-    /// @return Ok(usize) 成功返回0
-    /// @return Err(SystemError) 读取失败，返回posix错误码
-    pub fn ioctl(fd: usize, cmd: u32, data: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard
-            .get_file_by_fd(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        let r = file.inode().ioctl(cmd, data, &file.private_data.lock());
-        return r;
     }
 
     /// @brief 调整文件操作指针的位置
@@ -688,18 +648,16 @@ impl Syscall {
         return Ok(VirtAddr::new(buf.as_ptr() as usize));
     }
 
-    /// @brief 获取目录中的数据
+    /// # 获取目录中的数据
     ///
-    /// TODO: 这个函数的语义与Linux不一致，需要修改！！！
+    /// ## 参数
+    /// - fd 文件描述符号
+    /// - buf 输出缓冲区
     ///
-    /// @param fd 文件描述符号
-    /// @param buf 输出缓冲区
-    ///
-    /// @return 成功返回读取的字节数，失败返回错误码
+    /// ## 返回值
+    /// - Ok(ctx.current_pos) 填充缓冲区当前指针位置
+    /// - Err(ctx.error.unwrap()) 填充缓冲区时返回的错误
     pub fn getdents(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let dirent =
-            unsafe { (buf.as_mut_ptr() as *mut Dirent).as_mut() }.ok_or(SystemError::EFAULT)?;
-
         if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
             return Err(SystemError::EBADF);
         }
@@ -714,9 +672,22 @@ impl Syscall {
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
-        let res = file.readdir(dirent).map(|x| x as usize);
-
-        return res;
+        let mut ctx = FilldirContext::new(buf);
+        match file.read_dir(&mut ctx) {
+            Ok(_) => {
+                if ctx.error.is_some() {
+                    if ctx.error == Some(SystemError::EINVAL) {
+                        return Ok(ctx.current_pos);
+                    } else {
+                        return Err(ctx.error.unwrap());
+                    }
+                }
+                return Ok(ctx.current_pos);
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
     }
 
     /// @brief 创建文件夹
@@ -1211,38 +1182,9 @@ impl Syscall {
         return Err(SystemError::EBADF);
     }
 
-    #[inline(never)]
-    pub fn fstat(fd: i32, user_stat_ptr: usize) -> Result<usize, SystemError> {
-        Self::newfstat(fd, user_stat_ptr)
-    }
-
-    pub fn stat(path: *const u8, user_stat_ptr: usize) -> Result<usize, SystemError> {
-        let fd = Self::open(
-            path,
-            FileMode::O_RDONLY.bits(),
-            ModeType::empty().bits(),
-            true,
-        )?;
-        let r = Self::fstat(fd as i32, user_stat_ptr);
-        Self::close(fd).ok();
-        return r;
-    }
-
-    pub fn lstat(path: *const u8, user_stat_ptr: usize) -> Result<usize, SystemError> {
-        let fd = Self::open(
-            path,
-            FileMode::O_RDONLY.bits(),
-            ModeType::empty().bits(),
-            false,
-        )?;
-        let r = Self::fstat(fd as i32, user_stat_ptr);
-        Self::close(fd).ok();
-        return r;
-    }
-
     pub fn statfs(path: *const u8, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
-        let fd = Self::open(
+        let fd = open_utils::do_open(
             path,
             FileMode::O_RDONLY.bits(),
             ModeType::empty().bits(),

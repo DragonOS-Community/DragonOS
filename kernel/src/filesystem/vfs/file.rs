@@ -4,16 +4,19 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
 
-use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
     },
-    filesystem::procfs::ProcfsFilePrivateData,
+    filesystem::{
+        epoll::{event_poll::EPollPrivateData, EPollItem},
+        procfs::ProcfsFilePrivateData,
+        vfs::FilldirContext,
+    },
     ipc::pipe::PipeFsPrivateData,
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    net::event_poll::{EPollItem, EPollPrivateData},
     process::{cred::Cred, ProcessManager},
 };
 
@@ -343,60 +346,49 @@ impl File {
         return Ok(());
     }
 
-    /// @biref 充填dirent结构体
-    /// @return 返回dirent结构体的大小
-    pub fn readdir(&self, dirent: &mut Dirent) -> Result<u64, SystemError> {
+    /// # 读取目录项
+    ///
+    /// ## 参数
+    /// - ctx 填充目录项的上下文
+    pub fn read_dir(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
         let inode: &Arc<dyn IndexNode> = &self.inode;
-        let mut readdir_subdirs_name = self.readdir_subdirs_name.lock();
-        let offset = self.offset.load(Ordering::SeqCst);
-        // 如果偏移量为0
-        if offset == 0 {
-            // 通过list更新readdir_subdirs_name
-            *readdir_subdirs_name = inode.list()?;
-            readdir_subdirs_name.sort();
-        }
-        // debug!("sub_entries={sub_entries:?}");
+        let mut current_pos = self.offset.load(Ordering::SeqCst);
 
-        // 已经读到末尾
-        if offset == readdir_subdirs_name.len() {
-            self.offset.store(0, Ordering::SeqCst);
-            return Ok(0);
-        }
-        let name = &readdir_subdirs_name[offset];
-        let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
-            Ok(i) => i,
-            Err(e) => {
-                error!(
-                    "Readdir error: Failed to find sub inode:{name:?}, file={self:?}, error={e:?}"
-                );
-                return Err(e);
+        // POSIX 标准要求readdir应该返回. 和 ..
+        // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理
+
+        // 迭代读取目录项
+        let readdir_subdirs_name = inode.list()?;
+
+        let subdirs_name_len = readdir_subdirs_name.len();
+        while current_pos < subdirs_name_len {
+            let name = &readdir_subdirs_name[current_pos];
+            let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("Readdir error: Failed to find sub inode");
+                    return Err(e);
+                }
+            };
+
+            let inode_metadata = sub_inode.metadata().unwrap();
+            let entry_ino = inode_metadata.inode_id.into() as u64;
+            let entry_d_type = inode_metadata.file_type.get_file_type_num() as u8;
+            match ctx.fill_dir(name, current_pos, entry_ino, entry_d_type) {
+                Ok(_) => {
+                    self.offset.fetch_add(1, Ordering::SeqCst);
+                    current_pos += 1;
+                }
+                Err(SystemError::EINVAL) => {
+                    return Ok(());
+                }
+                Err(e) => {
+                    ctx.error = Some(e.clone());
+                    return Err(e);
+                }
             }
-        };
-
-        let name_bytes: &[u8] = name.as_bytes();
-
-        // 根据posix的规定，dirent中的d_name是一个不定长的数组，因此需要unsafe来拷贝数据
-        unsafe {
-            let ptr = &mut dirent.d_name as *mut u8;
-
-            let buf: &mut [u8] =
-                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len() + 1);
-            buf[0..name_bytes.len()].copy_from_slice(name_bytes);
-            buf[name_bytes.len()] = 0;
         }
-
-        self.offset.fetch_add(1, Ordering::SeqCst);
-        dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
-        dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
-
-        // 计算dirent结构体的大小
-        let size = (name_bytes.len() + ::core::mem::size_of::<Dirent>()
-            - ::core::mem::size_of_val(&dirent.d_name)) as u64;
-
-        dirent.d_reclen = size as u16;
-        dirent.d_off += dirent.d_reclen as i64;
-
-        return Ok(size);
+        return Ok(());
     }
 
     pub fn inode(&self) -> Arc<dyn IndexNode> {

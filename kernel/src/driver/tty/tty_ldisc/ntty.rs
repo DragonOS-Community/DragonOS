@@ -15,15 +15,14 @@ use crate::{
         tty_driver::{TtyDriverFlag, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
-    filesystem::vfs::file::FileMode,
+    filesystem::{epoll::EPollEventType, vfs::file::FileMode},
     libs::{
         rwlock::RwLockReadGuard,
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::VirtAddr,
-    net::event_poll::EPollEventType,
     process::{ProcessFlags, ProcessManager},
-    syscall::{user_access::UserBufferWriter, Syscall},
+    syscall::user_access::UserBufferWriter,
 };
 
 use super::TtyLineDiscipline;
@@ -149,8 +148,8 @@ impl NTtyData {
             cursor_column: 0,
             canon_cursor_column: 0,
             echo_tail: 0,
-            read_buf: Box::new([0; NTTY_BUFSIZE]),
-            echo_buf: Box::new([0; NTTY_BUFSIZE]),
+            read_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
+            echo_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
             read_flags: StaticBitmap::new(),
             char_map: StaticBitmap::new(),
             tty: Weak::default(),
@@ -790,7 +789,7 @@ impl NTtyData {
         let ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
         if let Some(pg) = pg {
-            let _ = Syscall::kill_process_group(pg, signal);
+            let _ = crate::ipc::kill::kill_process_group(pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {

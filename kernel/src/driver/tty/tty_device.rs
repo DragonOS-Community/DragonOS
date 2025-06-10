@@ -25,6 +25,7 @@ use crate::{
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
+        epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
             file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
@@ -37,7 +38,6 @@ use crate::{
         spinlock::SpinLockGuard,
     },
     mm::VirtAddr,
-    net::event_poll::EPollItem,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };

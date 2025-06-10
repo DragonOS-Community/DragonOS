@@ -3,8 +3,10 @@ use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
+use super::socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET};
 use crate::{
     driver::net::{NetDevice, Operstate},
+    filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     libs::rwlock::RwLockReadGuard,
     net::{socket::SocketPollMethod, NET_DEVICES},
     time::{
@@ -12,11 +14,6 @@ use crate::{
         timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
         PosixTimeSpec,
     },
-};
-
-use super::{
-    event_poll::{EPollEventType, EventPoll},
-    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
 /// The network poll function, which will be called by timer.

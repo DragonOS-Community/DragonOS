@@ -10,7 +10,6 @@ use smoltcp::wire::IpEndpoint;
 
 use self::socket::SocketInode;
 
-pub mod event_poll;
 pub mod net_core;
 pub mod socket;
 pub mod syscall;

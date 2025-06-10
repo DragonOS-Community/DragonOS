@@ -574,7 +574,7 @@ unsafe fn allocator_init() {
         compiler_fence(Ordering::SeqCst);
         mapper.make_current();
         compiler_fence(Ordering::SeqCst);
-        debug!("New page table enabled");
+        //debug!("New page table enabled");
     }
     debug!("Successfully enabled new page table");
 }

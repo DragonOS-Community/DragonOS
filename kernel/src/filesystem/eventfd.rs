@@ -1,10 +1,12 @@
 use super::vfs::PollableInode;
 use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::syscall::ModeType;
-use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
+use crate::filesystem::{
+    epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
+    vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
+};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll};
 use crate::process::{ProcessFlags, ProcessManager};
 use crate::sched::SchedMode;
 use crate::syscall::Syscall;

@@ -10,7 +10,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use super::sys_write::do_write;
-
+use crate::arch::interrupt::TrapFrame;
 /// System call handler for `writev` operation
 ///
 /// The `writev` system call writes data from multiple buffers to a file descriptor.
@@ -38,7 +38,7 @@ impl Syscall for SysWriteVHandle {
     ///
     /// # Safety
     /// The caller must ensure the `iov` pointer is valid and points to properly initialized memory.
-    fn handle(&self, args: &[usize], _from_user: bool) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         let iov = Self::iov(args);
         let count = Self::count(args);

@@ -62,6 +62,9 @@ impl GenDisk {
         };
         let index = (idx.unwrap_or(0)) as usize;
 
+        if index >= MINORS_PER_DISK as usize {
+            panic!("GenDisk index out of range: {}", index);
+        }
         let ptr = bdev.upgrade().unwrap();
         let meta = ptr.blkdev_meta();
         let major = meta.major;

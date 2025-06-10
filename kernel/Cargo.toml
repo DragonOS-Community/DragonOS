@@ -13,7 +13,7 @@ crate-type = ["staticlib"]
 members = ["crates/*"]
 
 [features]
-default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test", "kstack_protect"]
+default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test"]
 # kvm
 kvm = []
 
@@ -25,7 +25,7 @@ driver_ps2_mouse = []
 kprobe_test = []
 static_keys_test = []
 
-# kstack_protect
+# kstack_protect 开启该功能后，会开启内核栈保护功能。用于辅助检测栈溢出。(内核栈占用会*2)
 kstack_protect = []
 
 # 运行时依赖项

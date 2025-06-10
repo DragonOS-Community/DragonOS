@@ -42,12 +42,14 @@ static mut INITIAL_CR3_VALUE: PhysAddr = PhysAddr::new(0);
 
 static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = SpinLock::new(None);
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct X86_64MMBootstrapInfo {
     kernel_load_base_paddr: usize,
     kernel_code_start: usize,
     kernel_code_end: usize,
     kernel_data_end: usize,
+    kernel_rodata_start: usize,
     kernel_rodata_end: usize,
     start_brk: usize,
 }
@@ -134,6 +136,7 @@ impl MemoryManagementArch for X86_64MMArch {
             fn _text();
             fn _etext();
             fn _edata();
+            fn _rodata();
             fn _erodata();
             fn _end();
             fn _default_kernel_load_base();
@@ -146,6 +149,7 @@ impl MemoryManagementArch for X86_64MMArch {
             kernel_code_start: _text as usize,
             kernel_code_end: _etext as usize,
             kernel_data_end: _edata as usize,
+            kernel_rodata_start: _rodata as usize,
             kernel_rodata_end: _erodata as usize,
             start_brk: _end as usize,
         };
@@ -165,7 +169,7 @@ impl MemoryManagementArch for X86_64MMArch {
 
         // 初始化内存管理器
         unsafe { allocator_init() };
-
+        Self::enable_kernel_wp();
         send_to_default_serial8250_port("x86 64 mm init done\n\0".as_bytes());
     }
 
@@ -705,7 +709,7 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> Entr
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
         // Remap kernel code  execute
         return EntryFlags::new().set_execute(true).set_write(true);
-    } else if virt.data() >= info.kernel_data_end && virt.data() < info.kernel_rodata_end {
+    } else if virt.data() >= info.kernel_rodata_start && virt.data() < info.kernel_rodata_end {
         // Remap kernel rodata read only
         return EntryFlags::new().set_execute(true);
     } else {

@@ -77,11 +77,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         // 定义一个变量记录buddy表的大小
         (A::PAGE_SIZE - mem::size_of::<PageList<A>>()) / mem::size_of::<PhysAddr>();
 
+    #[inline(never)]
     pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
         let initial_free_pages = bump_allocator.usage().free();
         let total_memory = bump_allocator.usage().total();
         debug!("Free pages before init buddy: {:?}", initial_free_pages);
-        debug!("Buddy entries: {}", Self::BUDDY_ENTRIES);
+        // debug!("Buddy entries: {}", Self::BUDDY_ENTRIES);
 
         let mut free_area: [PhysAddr; MAX_ORDER - MIN_ORDER] =
             [PhysAddr::new(0); MAX_ORDER - MIN_ORDER];
@@ -105,12 +106,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         };
 
         let mut total_pages_to_buddy = PageFrameCount::new(0);
-        let mut res_areas = [PhysMemoryArea::default(); 128];
+        static mut RES_AREAS: [PhysMemoryArea; 128] = [PhysMemoryArea::DEFAULT; 128];
         let mut offset_in_remain_area = bump_allocator
-            .remain_areas(&mut res_areas)
+            .remain_areas(&mut RES_AREAS)
             .expect("BuddyAllocator: failed to get remain areas from bump allocator");
 
-        let remain_areas = &res_areas[0..];
+        let remain_areas = &RES_AREAS[0..];
 
         for area in remain_areas {
             let mut paddr = (area.area_base_aligned() + offset_in_remain_area).data();
@@ -120,7 +121,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             if remain_pages.data() == 0 {
                 continue;
             }
-            debug!("area: {area:?}, paddr: {paddr:#x}, remain_pages: {remain_pages:?}");
+            // debug!("area: {area:?}, paddr: {paddr:#x}, remain_pages: {remain_pages:?}");
 
             total_pages_to_buddy += remain_pages;
 

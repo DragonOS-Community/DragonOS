@@ -1137,13 +1137,9 @@ pub fn produce_fs(
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
     match FSMAKER.iter().find(|&m| m.name == filesystem) {
         Some(maker) => {
-            if let Some(mount_data) = (maker.builder)(data, source) {
-                let data: Option<&dyn FileSystemMakerData> = Some(mount_data.as_ref());
-                maker.build(data)
-            } else {
-                log::error!("failed to build mount data for {}", filesystem);
-                Err(SystemError::ENOSYS)
-            }
+            let mount_data = (maker.builder)(data, source);
+            let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
+            maker.build(mount_data_ref)
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);

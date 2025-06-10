@@ -110,8 +110,12 @@ impl MountableFileSystem for Ext4FileSystem {
         _raw_data: Option<&str>,
         source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        let mount_data = Ext4MountData::from_source(source).map_err(|e|{
-            log::error!("Failed to create Ext4 mount data from source '{}': {:?}", source, e);
+        let mount_data = Ext4MountData::from_source(source).map_err(|e| {
+            log::error!(
+                "Failed to create Ext4 mount data from source '{}': {:?}",
+                source,
+                e
+            );
             e
         })?;
         Ok(Some(Arc::new(mount_data)))

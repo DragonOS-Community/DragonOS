@@ -203,7 +203,7 @@ impl MountableFileSystem for OverlayFS {
         raw_data: Option<&str>,
         _source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        let mount_data = OverlayMountData::from_raw(raw_data).map_err(|e|{
+        let mount_data = OverlayMountData::from_raw(raw_data).map_err(|e| {
             log::error!("Failed to create overlay mount data: {:?}", e);
             e
         })?;

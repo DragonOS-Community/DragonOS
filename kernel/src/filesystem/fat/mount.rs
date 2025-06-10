@@ -59,8 +59,12 @@ impl MountableFileSystem for FATFileSystem {
         _raw_data: Option<&str>,
         source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        let mount_data = FatMountData::from_source(source).map_err(|e|{
-            log::error!("Failed to create FAT mount data from source '{}': {:?}", source, e);
+        let mount_data = FatMountData::from_source(source).map_err(|e| {
+            log::error!(
+                "Failed to create FAT mount data from source '{}': {:?}",
+                source,
+                e
+            );
             e
         })?;
         Ok(Some(Arc::new(mount_data)))

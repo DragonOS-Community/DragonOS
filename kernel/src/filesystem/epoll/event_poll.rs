@@ -68,11 +68,7 @@ impl EventPoll {
         let fds: Vec<i32> = self.ep_items.keys().cloned().collect::<Vec<_>>();
         // 清理红黑树里面的epitems
         for fd in fds {
-            let pcb = ProcessManager::current_pcb();
-            let basic = pcb.basic();
-            let fdtable = basic.try_fd_table().clone();
-            drop(basic);
-            drop(pcb);
+            let fdtable = ProcessManager::current_pcb().basic().try_fd_table().clone();
             let file = fdtable.and_then(|fdtable| fdtable.read().get_file_by_fd(fd));
 
             if let Some(file) = file {

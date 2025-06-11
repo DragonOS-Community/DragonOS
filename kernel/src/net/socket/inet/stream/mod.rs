@@ -2,12 +2,10 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError;
 
+use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::socket::common::shutdown::{ShutdownBit, ShutdownTemp};
-use crate::net::socket::endpoint::Endpoint;
-use crate::net::socket::{Socket, SocketInode, PMSG, PSOL};
+use crate::net::socket::{common::shutdown::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSOL};
 use crate::sched::SchedMode;
-use crate::{libs::rwlock::RwLock, net::socket::common::shutdown::Shutdown};
 use smoltcp;
 
 mod inner;
@@ -21,8 +19,7 @@ type EP = crate::filesystem::epoll::EPollEventType;
 #[derive(Debug)]
 pub struct TcpSocket {
     inner: RwLock<Option<inner::Inner>>,
-    #[allow(dead_code)]
-    shutdown: Shutdown, // TODO set shutdown status
+    // shutdown: Shutdown, // TODO set shutdown status
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
     self_ref: Weak<Self>,
@@ -33,7 +30,7 @@ impl TcpSocket {
     pub fn new(_nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Some(inner::Inner::Init(inner::Init::new(ver)))),
-            shutdown: Shutdown::new(),
+            // shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(false),
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
@@ -44,7 +41,7 @@ impl TcpSocket {
     pub fn new_established(inner: inner::Established, nonblock: bool) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Some(inner::Inner::Established(inner))),
-            shutdown: Shutdown::new(),
+            // shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
@@ -322,7 +319,7 @@ impl Socket for TcpSocket {
         self.do_listen(backlog)
     }
 
-    fn accept(&self) -> Result<(Arc<SocketInode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
         if self.is_nonblock() {
             self.try_accept()
         } else {
@@ -335,7 +332,6 @@ impl Socket for TcpSocket {
                 }
             }
         }
-        .map(|(inner, endpoint)| (SocketInode::new(inner), Endpoint::Ip(endpoint)))
     }
 
     fn recv(&self, buffer: &mut [u8], _flags: PMSG) -> Result<usize, SystemError> {
@@ -362,26 +358,26 @@ impl Socket for TcpSocket {
             .recv_buffer_size()
     }
 
-    fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
-        let self_shutdown = self.shutdown.get().bits();
-        let diff = how.bits().difference(self_shutdown);
-        match diff.is_empty() {
-            true => return Ok(()),
-            false => {
-                if diff.contains(ShutdownBit::SHUT_RD) {
-                    self.shutdown.recv_shutdown();
-                    // TODO 协议栈处理
-                }
-                if diff.contains(ShutdownBit::SHUT_WR) {
-                    self.shutdown.send_shutdown();
-                    // TODO 协议栈处理
-                }
-            }
-        }
+    fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
+        // let self_shutdown = self.shutdown.get().bits();
+        // let diff = how.bits().difference(self_shutdown);
+        // match diff.is_empty() {
+        //     true => return Ok(()),
+        //     false => {
+        //         if diff.contains(ShutdownBit::SHUT_RD) {
+        //             self.shutdown.recv_shutdown();
+        //             // TODO 协议栈处理
+        //         }
+        //         if diff.contains(ShutdownBit::SHUT_WR) {
+        //             self.shutdown.send_shutdown();
+        //             // TODO 协议栈处理
+        //         }
+        //     }
+        // }
         Ok(())
     }
 
-    fn close(&self) -> Result<(), SystemError> {
+    fn do_close(&self) -> Result<(), SystemError> {
         let Some(inner) = self.inner.write().take() else {
             log::warn!("TcpSocket::close: already closed, unexpected");
             return Ok(());
@@ -493,6 +489,35 @@ impl Socket for TcpSocket {
             }
         }
         Ok(())
+    }
+
+    fn get_option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn recv_from(
+        &self,
+        buffer: &mut [u8],
+        flags: PMSG,
+        address: Option<Endpoint>,
+    ) -> Result<(usize, Endpoint), SystemError> {
+        todo!()
+    }
+
+    fn recv_msg(
+        &self,
+        msg: &mut crate::net::posix::MsgHdr,
+        flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError> {
+        todo!()
     }
 }
 

@@ -4,11 +4,10 @@ use log::debug;
 use system_error::SystemError;
 
 use crate::libs::mutex::Mutex;
-use crate::net::socket::buffer::Buffer;
-use crate::net::socket::common::shutdown::ShutdownTemp;
+use crate::net::socket::common::shutdown::ShutdownBit;
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::unix::stream::StreamSocket;
-use crate::net::socket::SocketInode;
+use crate::net::socket::unix::UnixEndpoint;
 
 use alloc::collections::VecDeque;
 use alloc::{string::String, sync::Arc};
@@ -67,13 +66,13 @@ impl Init {
 
 #[derive(Debug, Clone)]
 pub struct Connected {
-    addr: Option<Endpoint>,
-    peer_addr: Option<Endpoint>,
+    addr: Option<UnixEndpoint>,
+    peer_addr: Option<UnixEndpoint>,
     buffer: Arc<Buffer>,
 }
 
 impl Connected {
-    pub fn new_pair(addr: Option<Endpoint>, peer_addr: Option<Endpoint>) -> (Self, Self) {
+    pub fn new_pair(addr: Option<UnixEndpoint>, peer_addr: Option<UnixEndpoint>) -> (Self, Self) {
         let this = Connected {
             addr: addr.clone(),
             peer_addr: peer_addr.clone(),
@@ -169,7 +168,7 @@ impl Connected {
         }
     }
     #[allow(dead_code)]
-    pub fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
+    pub fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
         if how.is_empty() {
             return Err(SystemError::EINVAL);
         } else if how.is_send_shutdown() {

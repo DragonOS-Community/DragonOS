@@ -25,6 +25,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
+    net::socket::Socket,
     time::PosixTimeSpec,
 };
 
@@ -653,6 +654,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// If the inode is not pollable, return an error
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Err(SystemError::ENOSYS)
+    }
+
+    fn as_socket(&self) -> Option<&dyn Socket> {
+        None
     }
 }
 

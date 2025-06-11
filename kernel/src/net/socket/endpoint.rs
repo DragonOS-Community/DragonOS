@@ -1,9 +1,13 @@
-use crate::{filesystem::vfs::InodeId, net::socket};
+use crate::{
+    filesystem::vfs::InodeId,
+    net::{
+        posix::SockAddr,
+        socket::{self, unix::UnixEndpoint},
+    },
+};
 use alloc::{string::String, sync::Arc};
 
 pub use smoltcp::wire::IpEndpoint;
-
-use super::unix::ns::abs::AbsHandle;
 
 #[derive(Debug, Clone)]
 pub enum Endpoint {
@@ -11,12 +15,8 @@ pub enum Endpoint {
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
     Ip(IpEndpoint),
-    /// inode端点,Unix实际保存的端点
-    Inode((Arc<socket::SocketInode>, String)),
-    /// Unix传递id索引和path所用的端点
-    Unixpath((InodeId, String)),
-    /// Unix抽象端点
-    Abspath((AbsHandle, String)),
+
+    Unix(UnixEndpoint),
 }
 
 /// @brief 链路层端点
@@ -40,5 +40,17 @@ impl LinkLayerEndpoint {
 impl From<IpEndpoint> for Endpoint {
     fn from(endpoint: IpEndpoint) -> Self {
         Self::Ip(endpoint)
+    }
+}
+
+impl Endpoint {
+    pub fn write_to_user(
+        &self,
+        addr: *mut SockAddr,
+        addr_len: *mut u32,
+    ) -> Result<(), system_error::SystemError> {
+        // use system_error::SystemError;
+
+        todo!("write_to_user: {:?}", self);
     }
 }

@@ -3,6 +3,7 @@ use smoltcp;
 use system_error::SystemError;
 
 use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::IndexNode;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::{Socket, PMSG};
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
@@ -162,10 +163,6 @@ impl Socket for UdpSocket {
         &self.wait_queue
     }
 
-    fn poll(&self) -> usize {
-        self.event().bits() as usize
-    }
-
     fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(local_endpoint) = local_endpoint {
             return self.do_bind(local_endpoint);
@@ -269,9 +266,84 @@ impl Socket for UdpSocket {
         .map(|(len, remote)| (len, Endpoint::Ip(remote)));
     }
 
-    fn close(&self) -> Result<(), SystemError> {
+    fn do_close(&self) -> Result<(), SystemError> {
         self.close();
         Ok(())
+    }
+
+    fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError> {
+        todo!()
+    }
+
+    fn get_peer_name(&self) -> Result<Endpoint, SystemError> {
+        todo!()
+    }
+
+    fn get_name(&self) -> Result<Endpoint, SystemError> {
+        todo!()
+    }
+
+    fn get_option(
+        &self,
+        level: crate::net::socket::PSOL,
+        name: usize,
+        value: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn listen(&self, backlog: usize) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    fn recv_msg(
+        &self,
+        msg: &mut crate::net::posix::MsgHdr,
+        flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn set_option(
+        &self,
+        level: crate::net::socket::PSOL,
+        name: usize,
+        val: &[u8],
+    ) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    fn shutdown(&self, how: usize) -> Result<(), SystemError> {
+        todo!()
+    }
+}
+
+impl crate::filesystem::vfs::PollableInode for UdpSocket {
+    fn poll(
+        &self,
+        private_data: &crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        Ok(self.event().bits() as usize)
+    }
+
+    fn add_epitem(
+        &self,
+        epitem: Arc<crate::filesystem::epoll::EPollItem>,
+        private_data: &crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    fn remove_epitem(
+        &self,
+        epitm: &Arc<crate::filesystem::epoll::EPollItem>,
+        private_data: &crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<(), SystemError> {
+        todo!()
     }
 }
 

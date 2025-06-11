@@ -412,6 +412,19 @@ impl ProcessManager {
     ///
     ///  因此注意，传入的`exit_code`应该是已经完成了移位操作的
     pub fn exit(exit_code: usize) -> ! {
+        // 检查是否是init进程尝试退出，如果是则产生panic
+        let current_pcb = ProcessManager::current_pcb();
+        if current_pcb.pid() == Pid(1) {
+            log::error!(
+                "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
+                exit_code
+            );
+            loop {
+                spin_loop();
+            }
+        }
+        drop(current_pcb);
+
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pid: Pid;

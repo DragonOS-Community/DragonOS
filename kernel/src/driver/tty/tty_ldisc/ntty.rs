@@ -1018,7 +1018,13 @@ impl NTtyData {
         };
 
         // 找到eol的坐标
-        let tmp = self.read_flags.next_index(tail);
+        // 注意：next_index可能不包括起始位置，所以我们需要手动检查tail位置
+
+        let tmp: Option<usize> = if self.read_flags.get(tail).unwrap_or(false) {
+            Some(tail)
+        } else {
+            self.read_flags.next_index(tail)
+        };
         // 找到的话即为坐标，未找到的话即为NTTY_BUFSIZE
         let mut eol = if let Some(tmp) = tmp { tmp } else { size };
         if eol > size {

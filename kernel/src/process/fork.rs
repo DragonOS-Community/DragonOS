@@ -321,7 +321,7 @@ impl ProcessManager {
         }
 
         // log::debug!("Just copy sighand");
-        new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers;
+        new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers.clone();
 
         if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
             flush_signal_handlers(new_pcb.clone(), false);

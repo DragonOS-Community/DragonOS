@@ -42,8 +42,7 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES},
-    mm::{verify_area, VirtAddr},
-    net::socket::unix::ns::abs::{alloc_abs_addr, look_up_abs_addr},
+    net::socket::unix::UnixEndpoint,
     process::ProcessManager,
 };
 
@@ -150,6 +149,15 @@ impl SockAddr {
 
                     if addr_un.sun_path[0] == 0 {
                         // 抽象地址空间，与文件系统没有关系
+                        // TODO: Autobind feature
+                        //    If a bind(2) call specifies addrlen as sizeof(sa_family_t), or the
+                        //    SO_PASSCRED socket option was specified for a socket that was not
+                        //    explicitly bound to an address, then the socket is autobound to an
+                        //    abstract address.  The address consists of a null byte followed by
+                        //    5 bytes in the character set [0-9a-f].  Thus, there is a limit of
+                        //    2^20 autobind addresses.  (From Linux 2.1.15, when the autobind
+                        //    feature was added, 8 bytes were used, and the limit was thus 2^32
+                        //    autobind addresses.  The change to 5 bytes came in Linux 2.3.15.)
                         let path = CStr::from_bytes_until_nul(&addr_un.sun_path[1..])
                             .map_err(|_| {
                                 log::error!("CStr::from_bytes_until_nul fail");
@@ -164,24 +172,25 @@ impl SockAddr {
                         // 向抽象地址管理器申请或查找抽象地址
                         let spath = String::from(path);
                         log::debug!("abs path: {}", spath);
-                        let abs_find = match look_up_abs_addr(&spath) {
-                            Ok(result) => result,
-                            Err(_) => {
-                                //未找到尝试分配abs
-                                match alloc_abs_addr(spath.clone()) {
-                                    Ok(result) => {
-                                        log::debug!("alloc abs addr success!");
-                                        return Ok(result);
-                                    }
-                                    Err(e) => {
-                                        log::debug!("alloc abs addr failed!");
-                                        return Err(e);
-                                    }
-                                };
-                            }
-                        };
-                        log::debug!("find alloc abs addr success!");
-                        return Ok(abs_find);
+                        todo!("abstract address space not implemented yet");
+                        // let abs_find = match look_up_abs_addr(&spath) {
+                        //     Ok(result) => result,
+                        //     Err(_) => {
+                        //         //未找到尝试分配abs
+                        //         match alloc_abs_addr(spath.clone()) {
+                        //             Ok(result) => {
+                        //                 log::debug!("alloc abs addr success!");
+                        //                 return Ok(result);
+                        //             }
+                        //             Err(e) => {
+                        //                 log::debug!("alloc abs addr failed!");
+                        //                 return Err(e);
+                        //             }
+                        //         };
+                        //     }
+                        // };
+                        // log::debug!("find alloc abs addr success!");
+                        // return Ok(abs_find);
                     }
 
                     let path = CStr::from_bytes_until_nul(&addr_un.sun_path)
@@ -230,8 +239,9 @@ impl SockAddr {
                             inode
                         }
                     };
+                    let file_abs_path = inode.absolute_path()?;
 
-                    return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id, path)));
+                    return Ok(Endpoint::Unix(UnixEndpoint::File(file_abs_path)));
                 }
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);
@@ -253,106 +263,8 @@ impl SockAddr {
         .map(|x| x as u32)
     }
 
-    /// @brief 把SockAddr的数据写入用户空间
-    ///
-    /// @param addr 用户空间的SockAddr的地址
-    /// @param len 要写入的长度
-    ///
-    /// @return 成功返回写入的长度，失败返回错误码
-    pub unsafe fn write_to_user(
-        &self,
-        addr: *mut SockAddr,
-        addr_len: *mut u32,
-    ) -> Result<u32, SystemError> {
-        // 当用户传入的地址或者长度为空时，直接返回0
-        if addr.is_null() || addr_len.is_null() {
-            return Ok(0);
-        }
-
-        // 检查用户传入的地址是否合法
-        verify_area(
-            VirtAddr::new(addr as usize),
-            core::mem::size_of::<SockAddr>(),
-        )
-        .map_err(|_| SystemError::EFAULT)?;
-
-        verify_area(
-            VirtAddr::new(addr_len as usize),
-            core::mem::size_of::<u32>(),
-        )
-        .map_err(|_| SystemError::EFAULT)?;
-
-        let to_write = core::cmp::min(self.len()?, *addr_len);
-        if to_write > 0 {
-            let buf = core::slice::from_raw_parts_mut(addr as *mut u8, to_write as usize);
-            buf.copy_from_slice(core::slice::from_raw_parts(
-                self as *const SockAddr as *const u8,
-                to_write as usize,
-            ));
-        }
-        *addr_len = self.len()?;
-        return Ok(to_write);
-    }
-
     pub unsafe fn is_empty(&self) -> bool {
         unsafe { self.family == 0 && self.addr_ph.data == [0; 14] }
-    }
-}
-
-impl From<Endpoint> for SockAddr {
-    fn from(value: Endpoint) -> Self {
-        match value {
-            Endpoint::Ip(ip_endpoint) => match ip_endpoint.addr {
-                smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
-                    let addr_in = SockAddrIn {
-                        sin_family: AddressFamily::INet as u16,
-                        sin_port: ip_endpoint.port.to_be(),
-                        sin_addr: ipv4_addr.to_bits(),
-                        sin_zero: [0; 8],
-                    };
-
-                    return SockAddr { addr_in };
-                }
-                _ => {
-                    unimplemented!("not support ipv6");
-                }
-            },
-
-            Endpoint::LinkLayer(link_endpoint) => {
-                let addr_ll = SockAddrLl {
-                    sll_family: AddressFamily::Packet as u16,
-                    sll_protocol: 0,
-                    sll_ifindex: link_endpoint.interface as u32,
-                    sll_hatype: 0,
-                    sll_pkttype: 0,
-                    sll_halen: 0,
-                    sll_addr: [0; 8],
-                };
-
-                return SockAddr { addr_ll };
-            }
-
-            Endpoint::Inode((_, path)) => {
-                log::debug!("from unix path {:?}", path);
-                let bytes = path.as_bytes();
-                let mut sun_path = [0u8; 108];
-                if bytes.len() <= 108 {
-                    sun_path[..bytes.len()].copy_from_slice(bytes);
-                } else {
-                    panic!("unix address path too long!");
-                }
-                let addr_un = SockAddrUn {
-                    sun_family: AddressFamily::Unix as u16,
-                    sun_path,
-                };
-                return SockAddr { addr_un };
-            }
-
-            _ => {
-                // todo: support other endpoint, like Netlink...
-                unimplemented!("not support {value:?}");
-            }
-        }
     }
 }
 

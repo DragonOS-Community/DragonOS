@@ -1,5 +1,3 @@
-use alloc::sync::Arc;
-use log::debug;
 use system_error::SystemError;
 
 use crate::{
@@ -57,10 +55,8 @@ impl Syscall {
         let file = File::new(inode, FileMode::O_RDWR)?;
         // 把socket添加到当前进程的文件描述符表中
         let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        let fd: Result<usize, SystemError> =
-            fd_table_guard.alloc_fd(file, None).map(|x| x as usize);
-        drop(fd_table_guard);
+
+        let fd = binding.write().alloc_fd(file, None).map(|x| x as usize);
         return fd;
     }
 
@@ -95,7 +91,7 @@ impl Syscall {
         }
 
         // 创建一对新的unix socket pair
-        let (inode0, inode1) = Unix::new_pairs(stype)?;
+        let (inode0, inode1) = Unix::new_pairs(stype, socket_type.is_nonblock())?;
 
         fds[0] = fd_table_guard.alloc_fd(File::new(inode0, FileMode::O_RDWR)?, None)?;
         fds[1] = fd_table_guard.alloc_fd(File::new(inode1, FileMode::O_RDWR)?, None)?;
@@ -118,10 +114,11 @@ impl Syscall {
         optval: &[u8],
     ) -> Result<usize, SystemError> {
         let sol = socket::PSOL::try_from(level as u32)?;
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
+        let socket = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        debug!("setsockopt: level = {:?} ", sol);
+        let socket = socket.as_socket().unwrap();
+        log::debug!("setsockopt: level = {:?} ", sol);
         return socket.set_option(sol, optname, optval).map(|_| 0);
     }
 
@@ -143,9 +140,10 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 获取socket
         let optval = optval as *mut u32;
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
+        let inode = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
+        let socket = inode.as_socket().unwrap();
 
         use socket::{PSO, PSOL};
 
@@ -175,7 +173,7 @@ impl Syscall {
                 }
             }
         }
-        drop(socket);
+        drop(inode);
 
         // To manipulate options at any other level the
         // protocol number of the appropriate protocol controlling the
@@ -209,6 +207,7 @@ impl Syscall {
         let socket = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
+        let socket = socket.as_socket().unwrap();
         socket.connect(endpoint)?;
         Ok(0)
     }
@@ -229,9 +228,10 @@ impl Syscall {
         //     addrlen
         // );
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
+        let socket = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
+        let socket = socket.as_socket().unwrap();
         // log::debug!("bind: socket={:?}", socket);
         socket.bind(endpoint)?;
         Ok(0)
@@ -261,12 +261,13 @@ impl Syscall {
 
         let flags = socket::PMSG::from_bits_truncate(flags);
 
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
+        let inode = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
+        let socket = inode.as_socket().unwrap();
 
         if let Some(endpoint) = endpoint {
-            return socket.send_to(buf, endpoint, flags);
+            return socket.send_to(buf, flags, endpoint);
         } else {
             return socket.send(buf, flags);
         }
@@ -288,9 +289,10 @@ impl Syscall {
         addr: *mut SockAddr,
         addr_len: *mut u32,
     ) -> Result<usize, SystemError> {
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
+        let inode = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
+        let socket = inode.as_socket().unwrap();
         let flags = socket::PMSG::from_bits_truncate(flags);
 
         if addr.is_null() {
@@ -303,10 +305,7 @@ impl Syscall {
 
         if unsafe { address.is_empty() } {
             let (recv_len, endpoint) = socket.recv_from(buf, flags, None)?;
-            let sockaddr_in = SockAddr::from(endpoint);
-            unsafe {
-                sockaddr_in.write_to_user(addr, addr_len)?;
-            }
+            endpoint.write_to_user(addr, addr_len)?;
             return Ok(recv_len);
         } else {
             // 从socket中读取数据
@@ -328,16 +327,20 @@ impl Syscall {
         // 检查每个缓冲区地址是否合法，生成iovecs
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
+        let (buf, recv_size) = {
+            let inode = ProcessManager::current_pcb()
+                .get_socket(fd as i32)
+                .ok_or(SystemError::EBADF)?;
+            let socket = inode.as_socket().unwrap();
 
-        let flags = socket::PMSG::from_bits_truncate(flags);
+            let flags = socket::PMSG::from_bits_truncate(flags);
 
-        let mut buf = iovs.new_buf(true);
-        // 从socket中读取数据
-        let recv_size = socket.recv(&mut buf, flags)?;
-        drop(socket);
+            let mut buf = iovs.new_buf(true);
+            // 从socket中读取数据
+            let recv_size = socket.recv(&mut buf, flags)?;
+
+            (buf, recv_size)
+        };
 
         // 将数据写入用户空间的iovecs
         iovs.scatter(&buf[..recv_size]);
@@ -352,9 +355,10 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn listen(fd: usize, backlog: usize) -> Result<usize, SystemError> {
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
+        let inode = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
+        let socket = inode.as_socket().unwrap();
         socket.listen(backlog).map(|_| 0)
     }
 
@@ -365,11 +369,11 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn shutdown(fd: usize, how: usize) -> Result<usize, SystemError> {
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
+        let inode = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        socket.shutdown(how.try_into()?)?;
-        return Ok(0);
+        let socket = inode.as_socket().unwrap();
+        socket.shutdown(how).map(|()| 0)
     }
 
     /// @brief sys_accept系统调用的实际执行函数
@@ -424,13 +428,15 @@ impl Syscall {
         addrlen: *mut u32,
         flags: u32,
     ) -> Result<usize, SystemError> {
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
+        let (new_socket, remote_endpoint) = {
+            let inode = ProcessManager::current_pcb()
+                .get_socket(fd as i32)
+                .ok_or(SystemError::EBADF)?;
+            let socket = inode.as_socket().unwrap();
 
-        // 从socket中接收连接
-        let (new_socket, remote_endpoint) = socket.accept()?;
-        drop(socket);
+            // 从socket中接收连接
+            socket.accept()?
+        };
 
         // debug!("accept: new_socket={:?}", new_socket);
         // Insert the new socket into the file descriptor vector
@@ -449,12 +455,8 @@ impl Syscall {
             .alloc_fd(File::new(new_socket, file_mode)?, None)?;
         // debug!("accept: new_fd={}", new_fd);
         if !addr.is_null() {
-            // debug!("accept: write remote_endpoint to user");
             // 将对端地址写入用户空间
-            let sockaddr_in = SockAddr::from(remote_endpoint);
-            unsafe {
-                sockaddr_in.write_to_user(addr, addrlen)?;
-            }
+            remote_endpoint.write_to_user(addr, addrlen)?;
         }
         return Ok(new_fd as usize);
     }
@@ -477,15 +479,13 @@ impl Syscall {
         if addr.is_null() {
             return Err(SystemError::EINVAL);
         }
-        let endpoint = ProcessManager::current_pcb()
+        ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?
-            .get_name()?;
-
-        let sockaddr_in = SockAddr::from(endpoint);
-        unsafe {
-            sockaddr_in.write_to_user(addr, addrlen)?;
-        }
+            .as_socket()
+            .unwrap()
+            .get_name()?
+            .write_to_user(addr, addrlen)?;
         return Ok(0);
     }
 
@@ -505,17 +505,14 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        let socket: Arc<socket::SocketInode> = ProcessManager::current_pcb()
+        ProcessManager::current_pcb()
             .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
+            .ok_or(SystemError::EBADF)?
+            .as_socket()
+            .unwrap()
+            .get_peer_name()?
+            .write_to_user(addr, addrlen)?;
 
-        let endpoint: Endpoint = socket.get_peer_name()?;
-        drop(socket);
-
-        let sockaddr_in = SockAddr::from(endpoint);
-        unsafe {
-            sockaddr_in.write_to_user(addr, addrlen)?;
-        }
         return Ok(0);
     }
 }

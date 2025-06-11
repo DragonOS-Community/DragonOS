@@ -6,19 +6,18 @@ use system_error::SystemError;
 
 use crate::libs::spinlock::SpinLock;
 
-#[derive(Debug)]
-pub struct Buffer {
-    metadata: Metadata,
-    read_buffer: SpinLock<Vec<u8>>,
-    write_buffer: SpinLock<Vec<u8>>,
-}
+const DEFAULT_BUF_SIZE: usize = 64 * 1024; // 64 KiB
+
+// #[derive(Debug)]
+// pub struct Buffer {
+//     buffer: 
+// }
 
 impl Buffer {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            metadata: Metadata::default(),
-            read_buffer: SpinLock::new(Vec::new()),
-            write_buffer: SpinLock::new(Vec::new()),
+            read_buffer: SpinLock::new(Vec::with_capacity(DEFAULT_BUF_SIZE)),
+            write_buffer: SpinLock::new(Vec::with_capacity(DEFAULT_BUF_SIZE)),
         })
     }
 
@@ -27,17 +26,9 @@ impl Buffer {
     }
 
     pub fn is_read_buf_full(&self) -> bool {
-        return self.metadata.buf_size - self.read_buffer.lock().len() == 0;
-    }
-
-    #[allow(dead_code)]
-    pub fn is_write_buf_empty(&self) -> bool {
-        return self.write_buffer.lock().is_empty();
-    }
-
-    #[allow(dead_code)]
-    pub fn is_write_buf_full(&self) -> bool {
-        return self.write_buffer.lock().len() >= self.metadata.buf_size;
+        let read_buffer = self.read_buffer.lock();
+        let capacity = read_buffer.capacity();
+        return self.read_buffer.lo - self.read_buffer.lock().len() == 0;
     }
 
     pub fn read_read_buffer(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -73,23 +64,5 @@ impl Buffer {
         buffer.extend_from_slice(buf);
 
         Ok(len)
-    }
-}
-
-#[derive(Debug)]
-pub struct Metadata {
-    /// 默认的元数据缓冲区大小
-    #[allow(dead_code)]
-    metadata_buf_size: usize,
-    /// 默认的缓冲区大小
-    buf_size: usize,
-}
-
-impl Default for Metadata {
-    fn default() -> Self {
-        Self {
-            metadata_buf_size: 1024,
-            buf_size: 64 * 1024,
-        }
     }
 }

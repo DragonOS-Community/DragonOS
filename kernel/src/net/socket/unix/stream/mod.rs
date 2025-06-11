@@ -1,8 +1,9 @@
 use crate::{
+    filesystem::vfs::{FilePrivateData, IndexNode, PollableInode},
     net::{
         posix::MsgHdr,
         socket::{
-            common::shutdown::{Shutdown, ShutdownTemp},
+            common::shutdown::{Shutdown, ShutdownBit},
             endpoint::Endpoint,
         },
     },
@@ -55,20 +56,19 @@ impl StreamSocket {
         })
     }
 
-    pub fn new_pairs() -> Result<(Arc<SocketInode>, Arc<SocketInode>), SystemError> {
+    pub fn new_pairs() -> Result<(Arc<dyn Socket>, Arc<dyn Socket>), SystemError> {
         let socket0 = StreamSocket::new();
         let socket1 = StreamSocket::new();
-        let inode0 = SocketInode::new(socket0.clone());
-        let inode1 = SocketInode::new(socket1.clone());
 
-        let (conn_0, conn_1) = Connected::new_pair(
-            Some(Endpoint::Inode((inode0.clone(), String::from("")))),
-            Some(Endpoint::Inode((inode1.clone(), String::from("")))),
-        );
-        *socket0.inner.write() = Inner::Connected(conn_0);
-        *socket1.inner.write() = Inner::Connected(conn_1);
+        // let (conn_0, conn_1) = Connected::new_pair(
+        //     Some(Endpoint::Inode((inode0.clone(), String::from("")))),
+        //     Some(Endpoint::Inode((inode1.clone(), String::from("")))),
+        // );
+        // *socket0.inner.write() = Inner::Connected(conn_0);
+        // *socket1.inner.write() = Inner::Connected(conn_1);
 
-        return Ok((inode0, inode1));
+        // return Ok((inode0, inode1));
+        todo!()
     }
     #[allow(dead_code)]
     pub fn new_connected(connected: Connected) -> Arc<Self> {
@@ -81,16 +81,15 @@ impl StreamSocket {
         })
     }
 
-    pub fn new_inode() -> Result<Arc<SocketInode>, SystemError> {
+    pub fn new_inode() -> Result<Arc<dyn IndexNode>, SystemError> {
         let socket = StreamSocket::new();
-        let inode = SocketInode::new(socket.clone());
 
         let _ = match &mut *socket.inner.write() {
             Inner::Init(init) => init.bind(Endpoint::Inode((inode.clone(), String::from("")))),
             _ => return Err(SystemError::EINVAL),
         };
 
-        return Ok(inode);
+        return Ok(socket);
     }
 
     fn is_acceptable(&self) -> bool {
@@ -102,7 +101,7 @@ impl StreamSocket {
         }
     }
 
-    pub fn try_accept(&self) -> Result<(Arc<SocketInode>, Endpoint), SystemError> {
+    pub fn try_accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
         match &*self.inner.read() {
             Inner::Listener(listener) => listener.try_accept() as _,
             _ => {
@@ -144,7 +143,6 @@ impl Socket for StreamSocket {
                 }
                 None => {
                     debug!("not bind when connected");
-                    let inode = SocketInode::new(self.self_ref.upgrade().unwrap().clone());
                     let epoint = Endpoint::Inode((inode.clone(), String::from("")));
                     let _ = init.bind(epoint.clone());
                     Some(epoint)
@@ -162,9 +160,9 @@ impl Socket for StreamSocket {
         //找到对端socket
         let (peer_inode, sun_path) = match server_endpoint {
             Endpoint::Inode((inode, path)) => (inode, path),
-            Endpoint::Unixpath((inode_id, path)) => {
+            Endpoint::Unixpath((inode, path)) => {
                 let inode_guard = INODE_MAP.read_irqsave();
-                let inode = inode_guard.get(&inode_id).unwrap();
+                let inode = inode_guard.get(&inode).unwrap();
                 match inode {
                     Endpoint::Inode((inode, _)) => (inode.clone(), path),
                     _ => return Err(SystemError::EINVAL),
@@ -194,8 +192,7 @@ impl Socket for StreamSocket {
             Arc::downcast::<StreamSocket>(peer_inode.inner()).map_err(|_| SystemError::EINVAL)?;
 
         //创建新的对端socket
-        let new_server_socket = StreamSocket::new();
-        let new_server_inode = SocketInode::new(new_server_socket.clone());
+        let new_server_inode = StreamSocket::new();
         let new_server_endpoint = Some(Endpoint::Inode((new_server_inode.clone(), sun_path)));
         //获取connect pair
         let (client_conn, server_conn) =
@@ -245,8 +242,8 @@ impl Socket for StreamSocket {
         }
     }
 
-    fn shutdown(&self, _stype: ShutdownTemp) -> Result<(), SystemError> {
-        todo!();
+    fn shutdown(&self, _stype: ShutdownBit) -> Result<(), SystemError> {
+        self.do_close()
     }
 
     fn listen(&self, backlog: usize) -> Result<(), SystemError> {
@@ -267,7 +264,7 @@ impl Socket for StreamSocket {
         return Ok(());
     }
 
-    fn accept(&self) -> Result<(Arc<socket::SocketInode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError> {
         debug!("stream server begin accept");
         //目前只实现了阻塞式实现
         loop {
@@ -291,44 +288,7 @@ impl Socket for StreamSocket {
         return &self.wait_queue;
     }
 
-    fn poll(&self) -> usize {
-        let mut mask = EP::empty();
-        let shutdown = self.shutdown.get();
-
-        // 参考linux的unix_poll https://code.dragonos.org.cn/xref/linux-6.1.9/net/unix/af_unix.c#3152
-        // 用关闭读写端表示连接断开
-        if shutdown.is_both_shutdown() || self.is_peer_shutdown().unwrap() {
-            mask |= EP::EPOLLHUP;
-        }
-
-        if shutdown.is_recv_shutdown() {
-            mask |= EP::EPOLLRDHUP | EP::EPOLLIN | EP::EPOLLRDNORM;
-        }
-        match &*self.inner.read() {
-            Inner::Connected(connected) => {
-                if connected.can_recv() {
-                    mask |= EP::EPOLLIN | EP::EPOLLRDNORM;
-                }
-                // if (sk_is_readable(sk))
-                // mask |= EPOLLIN | EPOLLRDNORM;
-
-                // TODO:处理紧急情况 EPOLLPRI
-                // TODO:处理连接是否关闭 EPOLLHUP
-                if !shutdown.is_send_shutdown() {
-                    if connected.can_send().unwrap() {
-                        mask |= EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND;
-                    } else {
-                        todo!("poll: buffer space not enough");
-                    }
-                }
-            }
-            Inner::Listener(_) => mask |= EP::EPOLLIN,
-            Inner::Init(_) => mask |= EP::EPOLLOUT,
-        }
-        mask.bits() as usize
-    }
-
-    fn close(&self) -> Result<(), SystemError> {
+    fn do_close(&self) -> Result<(), SystemError> {
         self.shutdown.recv_shutdown();
         self.shutdown.send_shutdown();
 
@@ -553,5 +513,61 @@ impl Socket for StreamSocket {
     fn recv_buffer_size(&self) -> usize {
         log::warn!("using default buffer size");
         StreamSocket::DEFAULT_BUF_SIZE
+    }
+}
+
+impl PollableInode for StreamSocket {
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        todo!("poll is not implemented yet");
+        // let mut mask = EP::empty();
+        // let shutdown = self.shutdown.get();
+
+        // // 参考linux的unix_poll https://code.dragonos.org.cn/xref/linux-6.1.9/net/unix/af_unix.c#3152
+        // // 用关闭读写端表示连接断开
+        // if shutdown.is_both_shutdown() || self.is_peer_shutdown().unwrap() {
+        //     mask |= EP::EPOLLHUP;
+        // }
+
+        // if shutdown.is_recv_shutdown() {
+        //     mask |= EP::EPOLLRDHUP | EP::EPOLLIN | EP::EPOLLRDNORM;
+        // }
+        // match &*self.inner.read() {
+        //     Inner::Connected(connected) => {
+        //         if connected.can_recv() {
+        //             mask |= EP::EPOLLIN | EP::EPOLLRDNORM;
+        //         }
+        //         // if (sk_is_readable(sk))
+        //         // mask |= EPOLLIN | EPOLLRDNORM;
+
+        //         // TODO:处理紧急情况 EPOLLPRI
+        //         // TODO:处理连接是否关闭 EPOLLHUP
+        //         if !shutdown.is_send_shutdown() {
+        //             if connected.can_send().unwrap() {
+        //                 mask |= EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND;
+        //             } else {
+        //                 todo!("poll: buffer space not enough");
+        //             }
+        //         }
+        //     }
+        //     Inner::Listener(_) => mask |= EP::EPOLLIN,
+        //     Inner::Init(_) => mask |= EP::EPOLLOUT,
+        // }
+        // Ok(mask.bits() as usize)
+    }
+
+    fn add_epitem(
+        &self,
+        epitem: Arc<crate::filesystem::epoll::EPollItem>,
+        private_data: &crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    fn remove_epitem(
+        &self,
+        epitm: &Arc<crate::filesystem::epoll::EPollItem>,
+        private_data: &crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<(), SystemError> {
+        todo!()
     }
 }

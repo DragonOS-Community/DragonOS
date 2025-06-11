@@ -111,7 +111,7 @@ impl core::convert::TryFrom<u16> for AddressFamily {
     }
 }
 
-use crate::net::socket;
+use crate::filesystem::vfs::IndexNode;
 use alloc::sync::Arc;
 
 use super::PSOCK;
@@ -120,5 +120,6 @@ pub trait Family {
     fn socket(
         stype: PSOCK,
         protocol: u32,
-    ) -> Result<Arc<socket::SocketInode>, system_error::SystemError>;
+        is_nonblock: bool,
+    ) -> Result<Arc<dyn IndexNode>, system_error::SystemError>;
 }

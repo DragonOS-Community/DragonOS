@@ -89,3 +89,5 @@ fn main() {
     println!("Mount successfully!");
 }
 ```
+
+至于硬盘镜像的制作，可以通过运行`sudo bash tools/make_fs_image.sh`来同时制作`ext4`和`fat`的磁盘镜像，进入系统后就可以dev目录下多出两个磁盘文件(`vdb1`和`vdc1`)，然后就可以执行`test-mount-ext4`以及`test-mount-fat`测试程序来验证

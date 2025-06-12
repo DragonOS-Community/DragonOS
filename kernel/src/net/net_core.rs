@@ -45,10 +45,17 @@ pub fn net_init() -> Result<(), SystemError> {
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
 
-    //由于现在os未实现在用户态为网卡动态分配内存，而lo网卡的id最先分配且ip固定不能被分配
-    //所以特判取用id为1的网卡（也就是virto_net）
-    let net_face = binding.get(&1).ok_or(SystemError::ENODEV)?.clone();
+    let net_face = binding
+        .iter()
+        .find(|(_, iface)| iface.name().starts_with("eth"))
+        .map(|(_, iface)| iface.clone());
 
+    if net_face.is_none() {
+        warn!("dhcp_query: No net device found!");
+        return Err(SystemError::ENODEV);
+    }
+    let net_face = net_face.unwrap();
+    log::debug!("dhcp_query: net_face={}", net_face.name());
     drop(binding);
 
     // Create sockets

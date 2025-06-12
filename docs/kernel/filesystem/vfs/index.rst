@@ -12,7 +12,7 @@ VFS是DragonOS文件系统的核心，它提供了一套统一的文件系统接
 - 提供文件系统的抽象（FileSystem）
 - 提供IndexNode抽象
 - 提供文件系统的缓存、同步机制（尚未实现）
-- 支持将硬盘设备挂载到文件系统上（目前支持VIRTIO换EXT4）
+- 支持将硬盘设备挂载到文件系统上（目前支持EXT4和vfat类型的virtio硬盘）
 
 
 .. toctree::

@@ -325,6 +325,12 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         drop(irq_guard);
 
         schedule(SchedMode::SM_NONE);
+
+        // 如果定时器没有超时（被信号中断或其他原因唤醒），则取消定时器
+        if !timer.timeout() {
+            timer.cancel();
+        }
+
         let time_remaining: i64 = timeout - TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         if time_remaining >= 0 {
             // 被提前唤醒，返回剩余时间

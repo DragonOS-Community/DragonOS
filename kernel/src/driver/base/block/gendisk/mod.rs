@@ -11,10 +11,7 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
-    driver::base::device::{
-        device_number::{DeviceNumber, Major},
-        DevName,
-    },
+    driver::base::device::{device_number::DeviceNumber, DevName},
     filesystem::{
         devfs::{DevFS, DeviceINode},
         vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
@@ -71,7 +68,7 @@ impl GenDisk {
 
         let base_minor = base + index as u32;
         // log::info!("New gendisk: major: {}, minor: {}", major, base_minor);
-        let device_num = DeviceNumber::new(Major::new(major), base_minor);
+        let device_num = DeviceNumber::new(major, base_minor);
 
         return Arc::new(GenDisk {
             bdev,
@@ -233,7 +230,7 @@ impl IndexNode for GenDisk {
         _buf: &mut [u8],
         _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EBUSY)
+        Err(SystemError::EPERM)
     }
     fn write_at(
         &self,
@@ -245,7 +242,7 @@ impl IndexNode for GenDisk {
         Err(SystemError::EPERM)
     }
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
-        todo!()
+        Err(SystemError::ENOSYS)
     }
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         Ok(self.metadata.clone())

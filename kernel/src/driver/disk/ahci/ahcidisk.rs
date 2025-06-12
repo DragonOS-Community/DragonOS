@@ -382,7 +382,7 @@ impl LockedAhciDisk {
         let devname = scsi_manager().alloc_id().ok_or(SystemError::EBUSY)?;
         // 构建磁盘结构体
         let result: Arc<LockedAhciDisk> = Arc::new_cyclic(|self_ref| LockedAhciDisk {
-            blkdev_meta: BlockDevMeta::new(devname, Major::AHCI_BLK_MAJOR.data()),
+            blkdev_meta: BlockDevMeta::new(devname, Major::AHCI_BLK_MAJOR),
             inner: SpinLock::new(AhciDisk {
                 partitions: Vec::new(),
                 ctrl_num,

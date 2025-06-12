@@ -5,7 +5,35 @@ Email: <sparkhhhhhhhhhh@outlook.com>
 :::
 
 # 设计
-![alt text](mountablefs.png)
+```mermaid
+    graph TD
+    subgraph 用户层 / 系统调用
+        A[sys_mount] --> B[produce_fs!]
+    end
+
+    subgraph 文件系统注册与创建
+        B --> C{查找 FSMAKER}
+        C -- 找到匹配 --> D[FileSystemMaker::builder && FileSystemMaker::maker]
+        D --> G[FileSystem 实例]
+        G --> H[挂载成功]
+        C -- 未找到 --> I[错误: EINVAL]
+    end
+
+    subgraph 文件系统实现者
+        J[RamFS / 其他文件系统] --> K[实现 MountableFileSystem trait]
+        K --> L[make_mount_data]
+        K --> M[make_fs]
+        L --> N[register_mountable_fs!宏]
+        M --> N
+    end
+
+    N --> O[分布式切片 FSMAKER ]
+    O --> C
+
+    click J "#" "RamFS - 文件系统示例"
+    click B "#" "produce_fs 函数"
+    click O "#" "FSMAKER - 文件系统工厂数组"
+```
 ## 流程说明:
 
 
@@ -33,7 +61,7 @@ Email: <sparkhhhhhhhhhh@outlook.com>
 - 挂载操作需要指定对应的硬盘设备名称（位于 /dev 下）。
 - 这些硬盘设备文件来源于通过修改 `tools/run-qemu.sh` 启动脚本，将制作好的硬盘镜像文件传入系统。virtio 硬盘设备命名示例如 `vda1`、`vdb1`，硬盘在 DragonOS 内的设备名称是根据 `run-qemu.sh` 中镜像传入的顺序自动分配（a，b，c等等）的，其中的数字表示分区号。
 
-所以目前需要挂载硬盘的话，可以更改`test-mount-ext4`执行程序，将指定的硬盘文件以对应的文件系统格式进行挂载，以下为挂载实例
+所以目前需要挂载硬盘的话，可以更改`test-mount-ext4`执行程序，将指定的硬盘文件以对应的文件系统格式进行挂载，以下为挂载示例：
 
 
 ```Rust

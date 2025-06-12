@@ -8,6 +8,10 @@ Email: <sparkhhhhhhhhhh@outlook.com>
 ![alt text](mountablefs.png)
 ## 流程说明:
 
+
+- 具体的文件系统（例如`RamFS`）通过实现```MountableFileSystem trait```，并使用 ```register_mountable_fs!``` 宏，将自身的创建逻辑注册到 `FSMAKER` 中。
+
+
 - 用户通过 `sys_mount` 系统调用请求挂载一个文件系统。
 
 - `sys_mount` 调用 `produce_fs` 函数，传入文件系统类型、原始挂载数据和源路径。
@@ -21,8 +25,6 @@ Email: <sparkhhhhhhhhhh@outlook.com>
 - 成功创建的文件系统实例（`Arc<dyn FileSystem>`）被返回并用于后续的挂载操作。
 
 - 如果找不到对应的文件系统类型，则返回错误。
-
-- 具体的文件系统（例如`RamFS`）通过实现```MountableFileSystem trait```，并使用 ```register_mountable_fs!``` 宏，将自身的创建逻辑注册到 `FSMAKER` 中。
 
 ## 其他
 

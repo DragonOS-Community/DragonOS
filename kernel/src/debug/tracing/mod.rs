@@ -8,7 +8,7 @@ use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::PollStatus;
 use crate::libs::spinlock::SpinLock;
-use crate::tracepoint::TracePointInfo;
+use crate::tracepoint::{TraceCmdLineCacheSnapshot, TracePointInfo};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use system_error::SystemError;
@@ -92,6 +92,13 @@ impl KernInodePrivateData {
             _ => None,
         };
     }
+
+    pub fn trace_saved_cmdlines(&mut self) -> Option<&mut TraceCmdLineCacheSnapshot> {
+        return match self {
+            KernInodePrivateData::TraceSavedCmdlines(cache) => Some(cache),
+            _ => None,
+        };
+    }
 }
 
 /// Initialize the debugfs tracing directory
@@ -111,7 +118,7 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
         Some(&TracingDirCallBack),
     )?;
 
-    tracing_root.add_file_lazy("trace".to_string(), trace_pipe::kernel_inode_provider)?;
+    tracing_root.add_file_lazy("trace".to_string(), trace_pipe::kernel_inode_provider_trace)?;
 
     tracing_root.add_file(
         "trace_pipe".to_string(),
@@ -119,6 +126,17 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&trace_pipe::TracePipeCallBack),
+    )?;
+    tracing_root.add_file_lazy(
+        "saved_cmdlines".to_string(),
+        trace_pipe::kernel_inode_provider_saved_cmdlines,
+    )?;
+    tracing_root.add_file(
+        "saved_cmdlines_size".to_string(),
+        ModeType::from_bits_truncate(0o444),
+        None,
+        None,
+        Some(&trace_pipe::SavedCmdlinesSizeCallBack),
     )?;
 
     events::init_events(events_root)?;

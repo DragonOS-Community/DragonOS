@@ -20,7 +20,8 @@ pub use point::{
 };
 use system_error::SystemError;
 pub use trace_pipe::{
-    TraceCmdLineCache, TraceEntryParser, TracePipeOps, TracePipeRaw, TracePipeSnapshot,
+    TraceCmdLineCache, TraceCmdLineCacheSnapshot, TraceEntryParser, TracePipeOps, TracePipeRaw,
+    TracePipeSnapshot,
 };
 
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};

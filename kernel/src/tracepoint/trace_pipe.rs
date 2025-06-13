@@ -29,6 +29,7 @@ impl TracePipeRaw {
     /// Set the maximum number of records to keep in the trace pipe buffer.
     ///
     /// If the current number of records exceeds this limit, the oldest records will be removed.
+    #[allow(unused)]
     pub fn set_max_record(&mut self, max_record: usize) {
         self.max_record = max_record;
         if self.event_buf.len() > max_record {
@@ -42,11 +43,6 @@ impl TracePipeRaw {
             self.event_buf.remove(0); // Remove the oldest record
         }
         self.event_buf.push(event);
-    }
-
-    /// The number of events currently in the trace pipe buffer.
-    pub fn event_count(&self) -> usize {
-        self.event_buf.len()
     }
 
     /// Clear the trace pipe buffer.
@@ -178,6 +174,38 @@ impl TraceCmdLineCache {
         self.max_record = max_len;
         if self.cmdline.len() > max_len {
             self.cmdline.truncate(max_len); // Keep only the latest records
+        }
+    }
+
+    /// Get the maximum number of records in the cache.
+    pub fn max_record(&self) -> usize {
+        self.max_record
+    }
+
+    /// Create a snapshot of the current state of the command line cache.
+    pub fn snapshot(&self) -> TraceCmdLineCacheSnapshot {
+        TraceCmdLineCacheSnapshot::new(self.cmdline.clone())
+    }
+}
+
+#[derive(Debug)]
+pub struct TraceCmdLineCacheSnapshot(Vec<(u32, [u8; 16])>);
+impl TraceCmdLineCacheSnapshot {
+    pub fn new(cmdline: Vec<(u32, [u8; 16])>) -> Self {
+        Self(cmdline)
+    }
+
+    /// Return the first command line entry in the cache.
+    pub fn peek(&self) -> Option<&(u32, [u8; 16])> {
+        self.0.first()
+    }
+
+    /// Remove and return the first command line entry in the cache.
+    pub fn pop(&mut self) -> Option<(u32, [u8; 16])> {
+        if self.0.is_empty() {
+            None
+        } else {
+            Some(self.0.remove(0))
         }
     }
 }

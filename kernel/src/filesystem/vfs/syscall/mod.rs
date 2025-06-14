@@ -13,7 +13,6 @@ use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::vfs::{file::FileDescriptorVec, vcore as Vcore},
     libs::rwlock::RwLockWriteGuard,
-    mm::VirtAddr,
     process::ProcessManager,
     syscall::{
         user_access::{self, check_and_clone_cstr, UserBufferWriter},

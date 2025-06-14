@@ -9,3 +9,4 @@
 
    eBPF
    kprobe
+   tracepoint

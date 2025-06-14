@@ -531,7 +531,6 @@ impl Syscall {
                 // debug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
             }
-
             #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
                 let path = args[0];

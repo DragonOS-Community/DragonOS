@@ -312,6 +312,10 @@ impl InnerPageCache {
 
         Ok(())
     }
+
+    pub fn pages_size(&self) -> usize {
+        return self.pages.len();
+    }
 }
 
 impl Drop for InnerPageCache {

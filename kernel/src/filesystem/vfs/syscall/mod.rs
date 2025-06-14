@@ -633,7 +633,7 @@ impl Syscall {
     ///
     /// @return 成功，返回的指针指向包含工作目录路径的字符串
     /// @return 错误，没有足够的空间
-    pub fn getcwd(buf: &mut [u8]) -> Result<VirtAddr, SystemError> {
+    pub fn getcwd(buf: &mut [u8]) -> Result<usize, SystemError> {
         let proc = ProcessManager::current_pcb();
         let cwd = proc.basic().cwd();
 
@@ -645,7 +645,7 @@ impl Syscall {
         buf[..cwd_len].copy_from_slice(cwd_bytes);
         buf[cwd_len] = 0;
 
-        return Ok(VirtAddr::new(buf.as_ptr() as usize));
+        return Ok(cwd_len + 1);
     }
 
     /// # 获取目录中的数据

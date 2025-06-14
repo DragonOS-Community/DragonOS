@@ -25,6 +25,7 @@ use crate::{
             class::Class,
             device::{
                 bus::Bus,
+                device_number::Major,
                 driver::{Driver, DriverCommonData},
                 DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
@@ -40,10 +41,15 @@ use crate::{
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable},
+    filesystem::{
+        devfs::{DevFS, DeviceINode},
+        kernfs::KernFSInode,
+        mbr::MbrDiskPartionTable,
+        vfs::{syscall::ModeType, IndexNode, Metadata},
+    },
     init::initcall::INITCALL_POSTCORE,
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -158,6 +164,9 @@ pub struct VirtIOBlkDevice {
     inner: SpinLock<InnerVirtIOBlkDevice>,
     locked_kobj_state: LockedKObjectState,
     self_ref: Weak<Self>,
+
+    fs: RwLock<Weak<DevFS>>,
+    metadata: Metadata,
 }
 
 impl Debug for VirtIOBlkDevice {
@@ -191,7 +200,7 @@ impl VirtIOBlkDevice {
         let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
         device_inner.enable_interrupts();
         let dev = Arc::new_cyclic(|self_ref| Self {
-            blkdev_meta: BlockDevMeta::new(devname),
+            blkdev_meta: BlockDevMeta::new(devname, Major::VIRTIO_BLK_MAJOR),
             self_ref: self_ref.clone(),
             dev_id,
             locked_kobj_state: LockedKObjectState::default(),
@@ -203,6 +212,11 @@ impl VirtIOBlkDevice {
                 kobject_common: KObjectCommonData::default(),
                 irq,
             }),
+            fs: RwLock::new(Weak::default()),
+            metadata: Metadata::new(
+                crate::filesystem::vfs::FileType::BlockDevice,
+                ModeType::from_bits_truncate(0o755),
+            ),
         });
 
         Some(dev)
@@ -210,6 +224,45 @@ impl VirtIOBlkDevice {
 
     fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkDevice> {
         self.inner.lock()
+    }
+}
+
+impl IndexNode for VirtIOBlkDevice {
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        todo!()
+    }
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        Ok(self.metadata.clone())
+    }
+}
+
+impl DeviceINode for VirtIOBlkDevice {
+    fn set_fs(&self, fs: alloc::sync::Weak<crate::filesystem::devfs::DevFS>) {
+        *self.fs.write() = fs;
     }
 }
 
@@ -342,6 +395,7 @@ impl VirtIODevice for VirtIOBlkDevice {
 
     fn set_virtio_device_index(&self, index: VirtIODeviceIndex) {
         self.inner().virtio_index = Some(index);
+        self.blkdev_meta.inner().dev_idx = index.into();
     }
 
     fn virtio_device_index(&self) -> Option<VirtIODeviceIndex> {

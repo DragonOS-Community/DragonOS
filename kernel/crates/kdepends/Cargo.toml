@@ -11,6 +11,7 @@ crc = { path = "../crc" }
 memoffset = "0.9.0"
 ringbuffer = "0.15.0"
 xarray = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/xarray", rev = "de93b57c34", features = ["slab-friendly"] }
+another_ext4 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git", rev = "bf782ff294", default-features = false }
 
 # 一个无锁MPSC队列
 [dependencies.thingbuf]

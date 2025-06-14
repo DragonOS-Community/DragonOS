@@ -77,9 +77,13 @@ RISCV64_UBOOT_PATH="arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
 
 
 DISK_NAME="disk-image-${ARCH}.img"
+EXT4_DISK_NAME="ext4.img"
+FAT_DISK_NAME="fat.img"
 
 QEMU=$(which qemu-system-${ARCH})
 QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
+QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
+QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
 QEMU_MEMORY="512M"
 QEMU_MEMORY_BACKEND="dragonos-qemu-shm.ram"
 QEMU_MEMORY_BACKEND_PATH_PREFIX="/dev/shm"
@@ -96,6 +100,12 @@ QEMU_ACCELARATE=""
 QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
 
+if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
+  QEMU_DRIVE+=" -drive id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw"
+fi
+if [ -f "${QEMU_FAT_DISK_IMAGE}" ]; then
+  QEMU_DRIVE+=" -drive id=fatdisk,file=${QEMU_FAT_DISK_IMAGE},if=none,format=raw"
+fi
 
 check_dependencies
 
@@ -124,6 +134,12 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
       QEMU_DEVICES_DISK+="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 "
     else
       QEMU_DEVICES_DISK="-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
+    fi
+    if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
+      QEMU_DEVICES_DISK+=" -device virtio-blk-pci,drive=ext4disk"
+    fi
+    if [ -f "${QEMU_FAT_DISK_IMAGE}" ]; then
+      QEMU_DEVICES_DISK+=" -device virtio-blk-pci,drive=fatdisk"
     fi
 
 elif [ ${ARCH} == "riscv64" ]; then

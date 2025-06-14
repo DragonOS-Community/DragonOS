@@ -271,20 +271,6 @@ impl Syscall {
             }
 
             #[cfg(target_arch = "x86_64")]
-            SYS_SYMLINK => {
-                let oldname = args[0] as *const u8;
-                let newname = args[1] as *const u8;
-                Self::symlink(oldname, newname)
-            }
-
-            SYS_SYMLINKAT => {
-                let oldname = args[0] as *const u8;
-                let newdfd = args[1] as i32;
-                let newname = args[2] as *const u8;
-                Self::symlinkat(oldname, newdfd, newname)
-            }
-
-            #[cfg(target_arch = "x86_64")]
             SYS_RMDIR => {
                 let path = args[0] as *const u8;
                 Self::rmdir(path)
@@ -784,22 +770,6 @@ impl Syscall {
                 // todo: 这个系统调用还没有实现
 
                 Err(SystemError::ENOSYS)
-            }
-
-            SYS_MOUNT => {
-                let source = args[0] as *const u8;
-                let target = args[1] as *const u8;
-                let filesystemtype = args[2] as *const u8;
-                let mountflags = args[3];
-                let data = args[4] as *const u8; // 额外的mount参数，实现自己的mountdata来获取
-                return Self::mount(source, target, filesystemtype, mountflags, data);
-            }
-
-            SYS_UMOUNT2 => {
-                let target = args[0] as *const u8;
-                let flags = args[1] as i32;
-                Self::umount2(target, flags)?;
-                return Ok(0);
             }
 
             #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]

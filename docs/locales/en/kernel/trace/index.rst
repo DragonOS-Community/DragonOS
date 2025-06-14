@@ -4,7 +4,7 @@
 
    - Source document: kernel/trace/index.rst
 
-   - Translation time: 2025-05-19 01:41:20
+   - Translation time: 2025-06-14 09:35:32
 
    - Translation model: `Qwen/Qwen3-8B`
 
@@ -14,7 +14,7 @@
 Kernel Tracing Mechanism
 ====================================
 
-   The kernel tracing mechanism consists of many functionalities, such as kprobe, uprobe, tracepoint, ftrace, and eBPF, which is used to extend the observability of the kernel. The kernel currently supports kprobe and eBPF. This chapter will introduce these two mechanisms.
+   The kernel tracing mechanism consists of many features, such as kprobe, uprobe, tracepoint, and ftrace, as well as eBPF for extending kernel observability. The kernel currently supports kprobe and eBPF, and this chapter will introduce these two mechanisms.
 
 .. toctree::
    :maxdepth: 1
@@ -22,3 +22,4 @@ Kernel Tracing Mechanism
 
    eBPF
    kprobe
+   tracepoint

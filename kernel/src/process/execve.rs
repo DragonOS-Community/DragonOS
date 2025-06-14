@@ -26,7 +26,7 @@ pub fn do_execve(
         }
     })?;
 
-    // debug!("load binary file done");
+    // log::debug!("load binary file done");
     // debug!("argv: {:?}, envp: {:?}", argv, envp);
     param.init_info_mut().args = argv;
     param.init_info_mut().envs = envp;

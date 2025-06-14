@@ -25,7 +25,7 @@ source = "git"
 source-path = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/Held.git"
 # git标签或分支
 # 注意： branch和revision只能二选一，且source要设置为"git"
-revision = "f192df4"
+revision = "5163c56"
 
 # 构建相关信息
 [build]

@@ -976,9 +976,9 @@ pub trait MountableFileSystem: FileSystem {
     fn make_mount_data(
         _raw_data: Option<&str>,
         _source: &str,
-    ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
         log::error!("This filesystem does not support make_mount_data");
-        None
+        Err(SystemError::ENOSYS)
     }
 
     fn make_fs(
@@ -1010,7 +1010,7 @@ macro_rules! register_mountable_fs {
             fn make_mount_data_bridge(
                 raw_data: Option<&str>,
                 source: &str,
-            ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
+            ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
                 <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
             }
         }
@@ -1023,7 +1023,11 @@ macro_rules! register_mountable_fs {
                     Option<&dyn FileSystemMakerData>,
                 ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
             &($fs::make_mount_data_bridge
-                as fn(Option<&str>, &str) -> Option<Arc<dyn FileSystemMakerData + 'static>>),
+                as fn(
+                    Option<&str>,
+                    &str,
+                )
+                    -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
         );
     };
 }
@@ -1105,7 +1109,10 @@ pub trait FileSystemMakerData: Send + Sync {
 pub type FSMakerFunction =
     fn(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError>;
 pub type MountDataBuilder =
-    fn(raw_data: Option<&str>, source: &str) -> Option<Arc<dyn FileSystemMakerData>>;
+    fn(
+        raw_data: Option<&str>,
+        source: &str,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>;
 
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
@@ -1137,13 +1144,9 @@ pub fn produce_fs(
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
     match FSMAKER.iter().find(|&m| m.name == filesystem) {
         Some(maker) => {
-            if let Some(mount_data) = (maker.builder)(data, source) {
-                let data: Option<&dyn FileSystemMakerData> = Some(mount_data.as_ref());
-                maker.build(data)
-            } else {
-                log::error!("failed to build mount data for {}", filesystem);
-                Err(SystemError::ENOSYS)
-            }
+            let mount_data = (maker.builder)(data, source).unwrap();
+            let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
+            maker.build(mount_data_ref)
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);

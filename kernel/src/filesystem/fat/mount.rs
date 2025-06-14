@@ -52,15 +52,22 @@ impl MountableFileSystem for FATFileSystem {
             .and_then(|d| d.as_any().downcast_ref::<FatMountData>())
             .ok_or(SystemError::EINVAL)?;
 
-        let fs = Self::new(mount_data.gendisk.clone()).unwrap();
+        let fs = Self::new(mount_data.gendisk.clone())?;
         Ok(fs)
     }
     fn make_mount_data(
         _raw_data: Option<&str>,
         source: &str,
-    ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
-        let mount_data = FatMountData::from_source(source).unwrap();
-        Some(Arc::new(mount_data))
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        let mount_data = FatMountData::from_source(source).map_err(|e| {
+            log::error!(
+                "Failed to create FAT mount data from source '{}': {:?}",
+                source,
+                e
+            );
+            e
+        })?;
+        Ok(Some(Arc::new(mount_data)))
     }
 }
 

@@ -160,9 +160,9 @@ impl MountableFileSystem for RamFS {
     fn make_mount_data(
         _raw_data: Option<&str>,
         _source: &str,
-    ) -> Option<Arc<dyn FileSystemMakerData + 'static>> {
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
         // 目前ramfs不需要任何额外的mount数据
-        None
+        Ok(None)
     }
     fn make_fs(
         _data: Option<&dyn FileSystemMakerData>,

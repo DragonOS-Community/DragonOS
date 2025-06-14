@@ -200,7 +200,7 @@ impl VirtIOBlkDevice {
         let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
         device_inner.enable_interrupts();
         let dev = Arc::new_cyclic(|self_ref| Self {
-            blkdev_meta: BlockDevMeta::new(devname, Major::VIRTIO_BLK_MAJOR.data()),
+            blkdev_meta: BlockDevMeta::new(devname, Major::VIRTIO_BLK_MAJOR),
             self_ref: self_ref.clone(),
             dev_id,
             locked_kobj_state: LockedKObjectState::default(),
@@ -241,7 +241,7 @@ impl IndexNode for VirtIOBlkDevice {
         _buf: &mut [u8],
         _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EBUSY)
+        Err(SystemError::ENOSYS)
     }
     fn write_at(
         &self,
@@ -250,10 +250,10 @@ impl IndexNode for VirtIOBlkDevice {
         _buf: &[u8],
         _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EPERM)
+        Err(SystemError::ENOSYS)
     }
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
-        todo!()
+        Err(SystemError::ENOSYS)
     }
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         Ok(self.metadata.clone())

@@ -6,7 +6,10 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::base::{block::gendisk::GenDisk, device::DevName},
+    driver::base::{
+        block::gendisk::GenDisk,
+        device::{device_number::Major, DevName},
+    },
     filesystem::{devfs::devfs_register, mbr::MbrDiskPartionTable, vfs::IndexNode},
     init::initcall::INITCALL_POSTCORE,
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -217,7 +220,7 @@ impl BlockDevManager {
 
 pub struct BlockDevMeta {
     pub devname: DevName,
-    pub major: u32,
+    pub major: Major,
     inner: SpinLock<InnerBlockDevMeta>,
 }
 
@@ -227,7 +230,7 @@ pub struct InnerBlockDevMeta {
 }
 
 impl BlockDevMeta {
-    pub fn new(devname: DevName, major: u32) -> Self {
+    pub fn new(devname: DevName, major: Major) -> Self {
         BlockDevMeta {
             devname,
             major,

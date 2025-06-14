@@ -1,8 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# 检查是否以 root 权限运行
+if [[ $EUID -ne 0 ]]; then
+    echo "错误：此脚本必须以 root 权限运行！"
+    exit 1
+fi
+
+
 # 获取项目根目录（无论从哪里调用脚本）
 root_folder="$(cd "$(dirname "$0")/.." && pwd)"
+echo "项目根目录：$root_folder"
 mkdir -p "$root_folder/bin"
 
 LOOP_DEVICE=""

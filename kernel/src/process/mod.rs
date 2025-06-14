@@ -427,6 +427,7 @@ impl ProcessManager {
 
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
         let pid: Pid;
         {
             let pcb = ProcessManager::current_pcb();
@@ -472,7 +473,6 @@ impl ProcessManager {
             drop(thread);
             unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();
-
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
             if let Some(tty) = pcb.sig_info_irqsave().tty() {
@@ -483,7 +483,6 @@ impl ProcessManager {
                 }
             }
             pcb.sig_info_mut().set_tty(None);
-
             pcb.clear_pg_and_session_reference();
             drop(pcb);
             ProcessManager::exit_notify();
@@ -1048,7 +1047,7 @@ impl ProcessControlBlock {
     /// 获取文件描述符表的Arc指针
     #[inline(always)]
     pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
-        return self.basic.read().fd_table().unwrap();
+        return self.basic.read().try_fd_table().unwrap();
     }
 
     #[inline(always)]
@@ -1218,7 +1217,12 @@ impl ProcessControlBlock {
 
     /// Exit fd table when process exit
     fn exit_files(&self) {
-        self.basic.write_irqsave().set_fd_table(None);
+        // 关闭文件描述符表
+        // 这里这样写的原因是避免某些inode在关闭时需要访问当前进程的basic，导致死锁
+        let mut guard = self.basic.write_irqsave();
+        let old = guard.set_fd_table(None);
+        drop(guard);
+        drop(old)
     }
 
     pub fn children_read_irqsave(&self) -> RwLockReadGuard<Vec<Pid>> {
@@ -1369,12 +1373,17 @@ impl ProcessBasicInfo {
         self.user_vm = user_vm;
     }
 
-    pub fn fd_table(&self) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+    pub fn try_fd_table(&self) -> Option<Arc<RwLock<FileDescriptorVec>>> {
         return self.fd_table.clone();
     }
 
-    pub fn set_fd_table(&mut self, fd_table: Option<Arc<RwLock<FileDescriptorVec>>>) {
+    pub fn set_fd_table(
+        &mut self,
+        fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
+    ) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+        let old = self.fd_table.take();
         self.fd_table = fd_table;
+        return old;
     }
 }
 

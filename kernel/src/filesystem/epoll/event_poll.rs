@@ -68,16 +68,13 @@ impl EventPoll {
         let fds: Vec<i32> = self.ep_items.keys().cloned().collect::<Vec<_>>();
         // 清理红黑树里面的epitems
         for fd in fds {
-            let file = ProcessManager::current_pcb()
-                .fd_table()
-                .read()
-                .get_file_by_fd(fd);
+            let fdtable = ProcessManager::current_pcb().basic().try_fd_table().clone();
+            let file = fdtable.and_then(|fdtable| fdtable.read().get_file_by_fd(fd));
 
             if let Some(file) = file {
                 let epitm = self.ep_items.get(&fd).unwrap();
                 file.remove_epitem(epitm)?;
             }
-
             self.ep_items.remove(&fd);
         }
 
@@ -644,7 +641,12 @@ impl EventPoll {
         let epitems_guard = epitems.try_lock_irqsave()?;
         for epitem in epitems_guard.iter() {
             // The upgrade is safe because EventPoll always exists when the epitem is in the list
-            let epoll = epitem.epoll().upgrade().unwrap();
+            let epoll = epitem.epoll().upgrade();
+            if epoll.is_none() {
+                // 如果epoll已经被释放，则直接跳过
+                continue;
+            }
+            let epoll = epoll.unwrap();
             let mut epoll_guard = epoll.try_lock()?;
             let binding = epitem.clone();
             let event_guard = binding.event().read();

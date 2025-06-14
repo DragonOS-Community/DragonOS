@@ -52,14 +52,23 @@ impl GenDisk {
         dev_name: &DevName,
     ) -> Arc<Self> {
         let bsizelog2 = bdev.upgrade().unwrap().blk_size_log2();
+        let index;
         let name = match idx {
-            Some(Self::ENTIRE_DISK_IDX) => DName::from(dev_name.name()),
-            Some(idx) => DName::from(format!("{}{}", dev_name.name(), idx)),
-            None => DName::from(dev_name.name()),
+            Some(Self::ENTIRE_DISK_IDX) => {
+                index = 0;
+                DName::from(dev_name.name())
+            }
+            Some(idx) => {
+                index = idx;
+                DName::from(format!("{}{}", dev_name.name(), idx))
+            }
+            None => {
+                index = 0;
+                DName::from(dev_name.name())
+            }
         };
-        let index = (idx.unwrap_or(0)) as usize;
 
-        if index >= MINORS_PER_DISK as usize {
+        if index >= MINORS_PER_DISK {
             panic!("GenDisk index out of range: {}", index);
         }
         let ptr = bdev.upgrade().unwrap();

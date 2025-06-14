@@ -13,7 +13,7 @@ fn main() {
     }
 
     let clock = time::Instant::now();
-    let source = b"/dev/vdb1\0".as_ptr() as *const c_char;
+    let source = b"/dev/vdb\0".as_ptr() as *const c_char;
     let target = b"/mnt/ext4\0".as_ptr() as *const c_char;
     let fstype = b"ext4\0".as_ptr() as *const c_char;
     let flags = MS_BIND;

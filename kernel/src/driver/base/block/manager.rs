@@ -76,7 +76,7 @@ impl BlockDevManager {
 
     /// 检测分区表，并创建gendisk
     fn check_partitions(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
-        if self.check_mbr(dev).is_ok() {
+        if self.try_register_disk_by_mbr(dev).is_ok() {
             return Ok(());
         }
 
@@ -84,11 +84,13 @@ impl BlockDevManager {
         self.register_entire_disk_as_gendisk(dev)
     }
 
-    fn check_mbr(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
+    fn try_register_disk_by_mbr(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
         let mbr = MbrDiskPartionTable::from_disk(dev.clone())?;
         let piter = mbr.partitions_raw();
+        let mut idx;
         for p in piter {
-            self.register_gendisk_with_range(dev, p.try_into()?)?;
+            idx = dev.blkdev_meta().inner().gendisks.alloc_idx();
+            self.register_gendisk_with_range(dev, p.try_into()?, idx)?;
         }
         Ok(())
     }
@@ -99,18 +101,18 @@ impl BlockDevManager {
         dev: &Arc<dyn BlockDevice>,
     ) -> Result<(), SystemError> {
         let range = dev.disk_range();
-        self.register_gendisk_with_range(dev, range)
+        self.register_gendisk_with_range(dev, range, GenDisk::ENTIRE_DISK_IDX)
     }
 
     fn register_gendisk_with_range(
         &self,
         dev: &Arc<dyn BlockDevice>,
         range: GeneralBlockRange,
+        idx: u32,
     ) -> Result<(), SystemError> {
         let weak_dev = Arc::downgrade(dev);
-        let idx = dev.blkdev_meta().inner().gendisks.alloc_idx();
         let gendisk = GenDisk::new(weak_dev, range, Some(idx), dev.dev_name());
-        log::info!("Registering gendisk");
+        // log::info!("Registering gendisk");
         self.register_gendisk(dev, gendisk)
     }
 

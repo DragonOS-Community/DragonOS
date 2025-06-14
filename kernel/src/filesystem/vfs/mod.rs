@@ -1144,7 +1144,7 @@ pub fn produce_fs(
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
     match FSMAKER.iter().find(|&m| m.name == filesystem) {
         Some(maker) => {
-            let mount_data = (maker.builder)(data, source).unwrap();
+            let mount_data = (maker.builder)(data, source)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
             maker.build(mount_data_ref)
         }

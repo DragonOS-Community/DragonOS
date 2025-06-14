@@ -153,7 +153,7 @@
     "hash": "aa1979d81b79f64b12962f885a6820af"
   },
   "en:kernel/trace/index.rst": {
-    "hash": "944a5b865100258ec7957a4cbedd7251"
+    "hash": "3c466a411a5bd71514f8fa4f15d06241"
   },
   "en:kernel/configuration/config.md": {
     "hash": "dff794c4f3bfb4c3d66e6d0fa8f7c495"
@@ -271,5 +271,8 @@
   },
   "en:questions/build_errors.md": {
     "hash": "76bf24821bab907c28e8c8287d2895d5"
+  },
+  "en:kernel/trace/tracepoint.md": {
+    "hash": "18a5f586ca3e3ffbdec6ceeac34eba9c"
   }
 }

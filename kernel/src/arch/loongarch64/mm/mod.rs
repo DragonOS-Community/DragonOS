@@ -137,6 +137,10 @@ impl MemoryManagementArch for LoongArch64MMArch {
     fn make_entry(paddr: crate::mm::PhysAddr, page_flags: usize) -> usize {
         todo!()
     }
+
+    fn enable_kernel_wp() {}
+
+    fn disable_kernel_wp() {}
 }
 
 /// 获取内核地址默认的页面标志

@@ -93,7 +93,7 @@ pub(super) fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 
-    let file = fd_table_guard.get_file_by_fd(fd);
+    let file = fd_table_guard.get_file_by_fd_and_check(fd);
     if file.is_none() {
         return Err(SystemError::EBADF);
     }

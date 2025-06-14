@@ -505,7 +505,7 @@ impl Syscall {
                     Err(e)
                 } else {
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf, size) };
-                    Self::getcwd(buf).map(|ptr| ptr.data())
+                    Self::getcwd(buf)
                 }
             }
 

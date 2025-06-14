@@ -18,6 +18,7 @@ use crate::{
         },
     },
     libs::spinlock::SpinLock,
+    mm::truncate::truncate_inode_pages,
     process::ProcessManager,
     syscall::user_access::check_and_clone_cstr,
 };
@@ -262,7 +263,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         }
     }
     // 禁止在目录上unlink
-    if inode.unwrap().metadata()?.file_type == FileType::Dir {
+    if inode.clone().unwrap().metadata()?.file_type == FileType::Dir {
         return Err(SystemError::EPERM);
     }
 
@@ -277,6 +278,10 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     // 删除文件
     parent_inode.unlink(filename)?;
+
+    if let Some(page_cache) = inode.unwrap().page_cache().clone() {
+        truncate_inode_pages(page_cache, 0);
+    }
 
     return Ok(0);
 }

@@ -220,7 +220,10 @@ impl ElfLoader {
         map_flags: &MapFlags,
         total_size: usize,
     ) -> Result<(VirtAddr, bool), SystemError> {
-        // debug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
+        // log::debug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
+        // defer!({
+        //     log::debug!("load_elf_segment done");
+        // });
 
         // 映射位置的偏移量（页内偏移）
         let beginning_page_offset = Self::elf_page_offset(addr_to_map);
@@ -343,6 +346,9 @@ impl ElfLoader {
         load_bias: usize,
     ) -> Result<BinaryLoaderResult, ExecError> {
         // log::debug!("loading elf interp");
+        // defer!({
+        //     log::debug!("load_elf_interp done");
+        // });
         let mut head_buf = [0u8; 512];
         interp_elf_ex
             .file_mut()

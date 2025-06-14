@@ -25,6 +25,9 @@ driver_ps2_mouse = []
 kprobe_test = []
 static_keys_test = []
 
+# kstack_protect 开启该功能后，会开启内核栈保护功能。用于辅助检测栈溢出。(内核栈占用会*2)
+kstack_protect = []
+
 # 运行时依赖项
 [dependencies]
 acpi = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "282df2af7b" }
@@ -79,7 +82,9 @@ static-keys = { version = "=0.7" }
 
 defer = "0.2.1"
 cfg-if = { version = "1.0.0" }
-derive_builder = { version = "0.20.2", default-features = false, features = ["alloc"] }
+derive_builder = { version = "0.20.2", default-features = false, features = [
+    "alloc",
+] }
 
 
 # target为x86_64时，使用下面的依赖

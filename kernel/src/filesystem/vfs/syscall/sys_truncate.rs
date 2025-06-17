@@ -59,10 +59,10 @@ pub fn do_truncate(path: *const u8, length: usize) -> Result<usize, SystemError>
     let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
-    let pwd = ProcessManager::current_pcb().pwd_inode();
-
-    let inode = pwd.lookup(&path)?;
-    // 获取inode元数据
+    let pcb = ProcessManager::current_pcb(); // 获取pcb
+    let pwd = pcb.pwd_inode(); // 获取pwd
+    let inode = pwd.lookup(&path)?; // 通过路径获取inode
+                                    // 获取inode元数据
     let metadata = inode.metadata()?;
     // 若是目录返回EISDIR 其他的返回EINVAL
     if metadata.file_type == FileType::Dir {
@@ -71,7 +71,7 @@ pub fn do_truncate(path: *const u8, length: usize) -> Result<usize, SystemError>
     if metadata.file_type != FileType::File {
         return Err(SystemError::EINVAL);
     }
-    // TODO!: 添加权限检查
+    // TODO!: 添加权限检查 目前暂时认为都可进行truncate
     inode.truncate(length)?;
     Ok(0)
 }

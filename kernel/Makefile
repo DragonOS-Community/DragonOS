@@ -42,6 +42,3 @@ check: ECHO
 test:
 # 测试内核库
 	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 test --workspace --exclude dragonos_kernel rbpf
-
-test-rbpf:
-	cd crates/rbpf && RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 test --features=std,user,cranelift

@@ -25,7 +25,7 @@ impl Syscall for SysFtruncateHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         let len = Self::len(args);
-        let res = do_ftruncate(path_ptr, len);
+        let res = do_ftruncate(fd, len);
         res
     }
     fn entry_format(&self, args: &[usize]) -> Vec<crate::syscall::table::FormattedSyscallParam> {

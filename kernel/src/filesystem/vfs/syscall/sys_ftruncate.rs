@@ -36,7 +36,7 @@ impl Syscall for SysFtruncateHandle {
     }
 }
 
-impl SysTruncateHandle {
+impl SysFtruncateHandle {
     /// Extracts the fd from syscall arguments
     fn fd(args: &[usize]) -> i32 {
         args[0] as i32
@@ -69,23 +69,23 @@ pub fn do_ftruncate(fd: i32, len: usize) -> Result<usize, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 
+
     if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
-        // 确保文件是普通文件而不是目录或其他文件类型
-        let file_type = file.file_type(); // 获取文件类型
-                                          // 不是普通文件返回-EINVAL
-        if file_type == FileType::Dir {
+	// 确保文件是普通文件而不是目录或其他文件类型
+	let file_type = file.file_type(); // 获取文件类型
+	// 不是普通文件返回-EINVAL
+	if file_type != FileType::File {
             return Err(SystemError::EINVAL);
-        }
-        if file_type != FileType::File {
-            return Err(SystemError::EINVAL);
-        }
-
+	}
+	
         let r = file.ftruncate(len).map(|_| 0);
         return r;
     }
 
     return Err(SystemError::EBADF);
 }
+
+

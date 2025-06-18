@@ -41,4 +41,4 @@ check: ECHO
 
 test:
 # 测试内核库
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 test --workspace --exclude dragonos_kernel rbpf
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 test --workspace --exclude dragonos_kernel

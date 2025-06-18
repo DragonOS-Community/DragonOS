@@ -1049,7 +1049,7 @@ dependencies = [
 [[package]]
 name = "rbpf"
 version = "0.3.0"
-source = "git+https://github.com/qmonnet/rbpf.git#f31e471a29dea9a0c272626f7b762adba755e6cc"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/rbpf?rev=f31e471a29#f31e471a29dea9a0c272626f7b762adba755e6cc"
 dependencies = [
  "byteorder",
  "combine",

@@ -75,7 +75,7 @@ log = "0.4.21"
 kprobe = { path = "crates/kprobe" }
 lru = "0.12.3"
 
-rbpf = { git = "https://github.com/qmonnet/rbpf.git", default-features = false }
+rbpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rbpf", rev = "f31e471a29", default-features = false }
 printf-compat = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat", rev = "5f5c9cc363", default-features = false }
 
 static-keys = { version = "=0.7" }

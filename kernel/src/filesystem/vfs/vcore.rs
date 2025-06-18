@@ -263,7 +263,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         }
     }
     // 禁止在目录上unlink
-    if inode.clone().unwrap().metadata()?.file_type == FileType::Dir {
+    if inode.as_ref().unwrap().metadata()?.file_type == FileType::Dir {
         return Err(SystemError::EPERM);
     }
 

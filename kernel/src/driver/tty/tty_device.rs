@@ -1,3 +1,5 @@
+use core::fmt::Debug;
+
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
@@ -25,6 +27,7 @@ use crate::{
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
+        epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
             file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
@@ -37,7 +40,6 @@ use crate::{
         spinlock::SpinLockGuard,
     },
     mm::VirtAddr,
-    net::event_poll::EPollItem,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -97,7 +99,6 @@ pub enum PtyType {
     Pts,
 }
 
-#[derive(Debug)]
 #[cast_to([sync] Device)]
 pub struct TtyDevice {
     name: String,
@@ -141,6 +142,14 @@ impl TtyDevice {
             return Err(SystemError::EIO);
         };
         Ok(tty)
+    }
+}
+
+impl Debug for TtyDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TtyDevice")
+            .field("name", &self.name)
+            .finish()
     }
 }
 

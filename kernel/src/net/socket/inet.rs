@@ -8,11 +8,9 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::NetDevice,
+    filesystem::epoll::EPollEventType,
     libs::rwlock::RwLock,
-    net::{
-        event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
-        NET_DEVICES,
-    },
+    net::{net_core::poll_ifaces, Endpoint, Protocol, ShutdownType, NET_DEVICES},
 };
 
 use super::{

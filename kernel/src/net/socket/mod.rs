@@ -17,9 +17,12 @@ use system_error::SystemError;
 
 use crate::{
     arch::rand::rand,
-    filesystem::vfs::{
-        file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
-        Metadata, PollableInode,
+    filesystem::{
+        epoll::{EPollEventType, EPollItem},
+        vfs::{
+            file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
+            Metadata, PollableInode,
+        },
     },
     libs::{
         rwlock::{RwLock, RwLockWriteGuard},
@@ -36,10 +39,7 @@ use self::{
     unix::{SeqpacketSocket, StreamSocket},
 };
 
-use super::{
-    event_poll::{EPollEventType, EPollItem},
-    Endpoint, Protocol, ShutdownType,
-};
+use super::{Endpoint, Protocol, ShutdownType};
 
 pub mod handle;
 pub mod inet;

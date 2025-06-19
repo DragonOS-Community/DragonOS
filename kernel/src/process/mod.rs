@@ -54,7 +54,7 @@ use crate::{
         percpu::{PerCpu, PerCpuVar},
         set_IDLE_PROCESS_ADDRESS_SPACE,
         ucontext::AddressSpace,
-        VirtAddr,
+        PhysAddr, VirtAddr,
     },
     namespaces::{mnt_namespace::FsStruct, pid_namespace::PidStrcut, NsProxy},
     net::socket::SocketInode,
@@ -67,7 +67,7 @@ use crate::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
-    syscall::{user_access::clear_user, Syscall},
+    syscall::user_access::clear_user,
 };
 use timer::AlarmTimer;
 
@@ -76,8 +76,10 @@ use self::{cred::Cred, kthread::WorkerPrivate};
 pub mod abi;
 pub mod cred;
 pub mod exec;
+pub mod execve;
 pub mod exit;
 pub mod fork;
+pub mod geteuid;
 pub mod idle;
 pub mod kthread;
 pub mod pid;
@@ -386,7 +388,7 @@ impl ProcessManager {
                 return;
             }
             let parent_pcb = r.unwrap();
-            let r = Syscall::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
+            let r = crate::ipc::kill::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
             if r.is_err() {
                 warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",
@@ -404,9 +406,28 @@ impl ProcessManager {
     /// ## 参数
     ///
     /// - `exit_code` : 进程的退出码
+    ///
+    /// ## 注意
+    ///  对于正常退出的进程，状态码应该先左移八位，以便用户态读取的时候正常返回退出码；而对于被信号终止的进程，状态码则是最低七位，无需进行移位操作。
+    ///
+    ///  因此注意，传入的`exit_code`应该是已经完成了移位操作的
     pub fn exit(exit_code: usize) -> ! {
+        // 检查是否是init进程尝试退出，如果是则产生panic
+        let current_pcb = ProcessManager::current_pcb();
+        if current_pcb.pid() == Pid(1) {
+            log::error!(
+                "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
+                exit_code
+            );
+            loop {
+                spin_loop();
+            }
+        }
+        drop(current_pcb);
+
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
         let pid: Pid;
         {
             let pcb = ProcessManager::current_pcb();
@@ -452,7 +473,6 @@ impl ProcessManager {
             drop(thread);
             unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();
-
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
             if let Some(tty) = pcb.sig_info_irqsave().tty() {
@@ -463,7 +483,6 @@ impl ProcessManager {
                 }
             }
             pcb.sig_info_mut().set_tty(None);
-
             pcb.clear_pg_and_session_reference();
             drop(pcb);
             ProcessManager::exit_notify();
@@ -796,52 +815,53 @@ impl ProcessControlBlock {
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
         let sched_info = ProcessSchedulerInfo::new(None);
-        let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
-        let mut pcb = Self {
-            pid,
-            tgid: pid,
-            thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
-            basic: basic_info,
-            preempt_count,
-            flags,
-            kernel_stack: RwLock::new(kstack),
-            syscall_stack: RwLock::new(KernelStack::new().unwrap()),
-            worker_private: SpinLock::new(None),
-            sched_info,
-            arch_info,
-            sig_info: RwLock::new(ProcessSignalInfo::default()),
-            sig_struct: SpinLock::new(SignalStruct::new()),
-            exit_signal: AtomicSignal::new(Signal::SIGCHLD),
-            parent_pcb: RwLock::new(ppcb.clone()),
-            real_parent_pcb: RwLock::new(ppcb),
-            children: RwLock::new(Vec::new()),
-            wait_queue: WaitQueue::default(),
-            thread: RwLock::new(ThreadInfo::new()),
-            fs: RwLock::new(Arc::new(FsStruct::new())),
-            alarm_timer: SpinLock::new(None),
-            robust_list: RwLock::new(None),
-            nsproxy: Arc::new(RwLock::new(NsProxy::new())),
-            cred: SpinLock::new(cred),
-            self_ref: Weak::new(),
-            restart_block: SpinLock::new(None),
-            process_group: Mutex::new(Weak::new()),
-            executable_path: RwLock::new(name),
-        };
 
-        pcb.sig_info.write().set_tty(tty);
-
-        // 初始化系统调用栈
-        #[cfg(target_arch = "x86_64")]
-        pcb.arch_info
-            .lock()
-            .init_syscall_stack(&pcb.syscall_stack.read());
-
+        // 使用 Arc::new_cyclic 避免在栈上创建巨大的结构体
         let pcb = Arc::new_cyclic(|weak| {
-            pcb.self_ref = weak.clone();
+            let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
+            let pcb = Self {
+                pid,
+                tgid: pid,
+                thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
+                basic: basic_info,
+                preempt_count,
+                flags,
+                kernel_stack: RwLock::new(kstack),
+                syscall_stack: RwLock::new(KernelStack::new().unwrap()),
+                worker_private: SpinLock::new(None),
+                sched_info,
+                arch_info,
+                sig_info: RwLock::new(ProcessSignalInfo::default()),
+                sig_struct: SpinLock::new(SignalStruct::new()),
+                exit_signal: AtomicSignal::new(Signal::SIGCHLD),
+                parent_pcb: RwLock::new(ppcb.clone()),
+                real_parent_pcb: RwLock::new(ppcb),
+                children: RwLock::new(Vec::new()),
+                wait_queue: WaitQueue::default(),
+                thread: RwLock::new(ThreadInfo::new()),
+                fs: RwLock::new(Arc::new(FsStruct::new())),
+                alarm_timer: SpinLock::new(None),
+                robust_list: RwLock::new(None),
+                nsproxy: Arc::new(RwLock::new(NsProxy::new())),
+                cred: SpinLock::new(cred),
+                self_ref: weak.clone(),
+                restart_block: SpinLock::new(None),
+                process_group: Mutex::new(Weak::new()),
+                executable_path: RwLock::new(name),
+            };
+
+            pcb.sig_info.write().set_tty(tty);
+
+            // 初始化系统调用栈
+            #[cfg(target_arch = "x86_64")]
+            pcb.arch_info
+                .lock()
+                .init_syscall_stack(&pcb.syscall_stack.read());
+
             pcb
         });
 
@@ -1027,7 +1047,7 @@ impl ProcessControlBlock {
     /// 获取文件描述符表的Arc指针
     #[inline(always)]
     pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
-        return self.basic.read().fd_table().unwrap();
+        return self.basic.read().try_fd_table().unwrap();
     }
 
     #[inline(always)]
@@ -1197,7 +1217,12 @@ impl ProcessControlBlock {
 
     /// Exit fd table when process exit
     fn exit_files(&self) {
-        self.basic.write_irqsave().set_fd_table(None);
+        // 关闭文件描述符表
+        // 这里这样写的原因是避免某些inode在关闭时需要访问当前进程的basic，导致死锁
+        let mut guard = self.basic.write_irqsave();
+        let old = guard.set_fd_table(None);
+        drop(guard);
+        drop(old)
     }
 
     pub fn children_read_irqsave(&self) -> RwLockReadGuard<Vec<Pid>> {
@@ -1348,12 +1373,17 @@ impl ProcessBasicInfo {
         self.user_vm = user_vm;
     }
 
-    pub fn fd_table(&self) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+    pub fn try_fd_table(&self) -> Option<Arc<RwLock<FileDescriptorVec>>> {
         return self.fd_table.clone();
     }
 
-    pub fn set_fd_table(&mut self, fd_table: Option<Arc<RwLock<FileDescriptorVec>>>) {
+    pub fn set_fd_table(
+        &mut self,
+        fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
+    ) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+        let old = self.fd_table.take();
         self.fd_table = fd_table;
+        return old;
     }
 }
 
@@ -1566,11 +1596,115 @@ impl ProcessSchedulerInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KernelStack {
     stack: Option<AlignedBox<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>>,
     /// 标记该内核栈是否可以被释放
-    can_be_freed: bool,
+    ty: KernelStackType,
+}
+
+#[derive(Debug)]
+pub enum KernelStackType {
+    KernelSpace(VirtAddr, PhysAddr),
+    Static,
+    Dynamic,
+}
+
+// 为什么需要这个锁?
+// alloc_from_kernel_space 使用该函数分配内核栈时，如果该函数被中断打断，
+// 而切换的任务使用dealloc_from_kernel_space回收内核栈，对
+// KernelMapper的可变引用获取将会失败造成错误
+static KSTACK_LOCK: SpinLock<()> = SpinLock::new(());
+
+unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
+    use crate::arch::MMArch;
+    use crate::mm::allocator::page_frame::{allocate_page_frames, PageFrameCount};
+    use crate::mm::kernel_mapper::KernelMapper;
+    use crate::mm::page::EntryFlags;
+    use crate::mm::MemoryManagementArch;
+
+    // Layout
+    // ---------------
+    // | KernelStack |
+    // | guard page  | size == KernelStack::SIZE
+    // | KernelStack |
+    // | guard page  |
+    // | ..........  |
+    // ---------------
+
+    let _guard = KSTACK_LOCK.try_lock_irqsave().unwrap();
+    let need_size = KernelStack::SIZE * 2;
+    let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
+
+    let (paddr, _count) = allocate_page_frames(page_num).expect("kernel stack alloc failed");
+
+    let guard_vaddr = MMArch::phys_2_virt(paddr).unwrap();
+    let _kstack_paddr = paddr + KernelStack::SIZE;
+    let kstack_vaddr = guard_vaddr + KernelStack::SIZE;
+
+    core::ptr::write_bytes(kstack_vaddr.data() as *mut u8, 0, KernelStack::SIZE);
+
+    let guard_flags = EntryFlags::new();
+
+    let mut kernel_mapper = KernelMapper::lock();
+    let kernel_mapper = kernel_mapper.as_mut().unwrap();
+
+    for i in 0..KernelStack::SIZE / MMArch::PAGE_SIZE {
+        let guard_page_vaddr = guard_vaddr + i * MMArch::PAGE_SIZE;
+        // Map the guard page
+        let flusher = kernel_mapper.remap(guard_page_vaddr, guard_flags).unwrap();
+        flusher.flush();
+    }
+
+    // unsafe {
+    //     log::debug!(
+    //         "trigger kernel stack guard page :{:#x}",
+    //         (kstack_vaddr.data() - 8)
+    //     );
+    //     let guard_ptr = (kstack_vaddr.data() - 8) as *mut usize;
+    //     guard_ptr.write(0xfff); // Invalid
+    // }
+
+    // log::info!(
+    //     "[kernel stack alloc]: virt: {:#x}, phy: {:#x}",
+    //     kstack_vaddr.data(),
+    //     _kstack_paddr.data()
+    // );
+    (guard_vaddr, paddr)
+}
+
+unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr) {
+    use crate::arch::mm::kernel_page_flags;
+    use crate::arch::MMArch;
+    use crate::mm::allocator::page_frame::{deallocate_page_frames, PageFrameCount, PhysPageFrame};
+    use crate::mm::kernel_mapper::KernelMapper;
+    use crate::mm::MemoryManagementArch;
+
+    let _guard = KSTACK_LOCK.try_lock_irqsave().unwrap();
+
+    let need_size = KernelStack::SIZE * 2;
+    let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
+
+    // log::info!(
+    //     "[kernel stack dealloc]: virt: {:#x}, phy: {:#x}",
+    //     vaddr.data(),
+    //     paddr.data()
+    // );
+
+    let mut kernel_mapper = KernelMapper::lock();
+    let kernel_mapper = kernel_mapper.as_mut().unwrap();
+
+    // restore the guard page flags
+    for i in 0..KernelStack::SIZE / MMArch::PAGE_SIZE {
+        let guard_page_vaddr = vaddr + i * MMArch::PAGE_SIZE;
+        let flusher = kernel_mapper
+            .remap(guard_page_vaddr, kernel_page_flags(vaddr))
+            .unwrap();
+        flusher.flush();
+    }
+
+    // release the physical page
+    unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), page_num) };
 }
 
 impl KernelStack {
@@ -1578,12 +1712,27 @@ impl KernelStack {
     pub const ALIGN: usize = 0x4000;
 
     pub fn new() -> Result<Self, SystemError> {
-        return Ok(Self {
-            stack: Some(
-                AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
-            ),
-            can_be_freed: true,
-        });
+        if cfg!(feature = "kstack_protect") {
+            unsafe {
+                let (kstack_vaddr, kstack_paddr) = alloc_from_kernel_space();
+                let real_kstack_vaddr = kstack_vaddr + KernelStack::SIZE;
+                Ok(Self {
+                    stack: Some(
+                        AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_unchecked(
+                            real_kstack_vaddr.data() as *mut [u8; KernelStack::SIZE],
+                        ),
+                    ),
+                    ty: KernelStackType::KernelSpace(kstack_vaddr, kstack_paddr),
+                })
+            }
+        } else {
+            Ok(Self {
+                stack: Some(
+                    AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
+                ),
+                ty: KernelStackType::Dynamic,
+            })
+        }
     }
 
     /// 根据已有的空间，构造一个内核栈结构体
@@ -1594,14 +1743,38 @@ impl KernelStack {
             return Err(SystemError::EFAULT);
         }
 
-        return Ok(Self {
+        Ok(Self {
             stack: Some(
                 AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_unchecked(
                     base.data() as *mut [u8; KernelStack::SIZE],
                 ),
             ),
-            can_be_freed: false,
-        });
+            ty: KernelStackType::Static,
+        })
+    }
+
+    pub fn guard_page_address(&self) -> Option<VirtAddr> {
+        match self.ty {
+            KernelStackType::KernelSpace(kstack_virt_addr, _) => {
+                return Some(kstack_virt_addr);
+            }
+            _ => {
+                // 静态内核栈和动态内核栈没有guard page
+                return None;
+            }
+        }
+    }
+
+    pub fn guard_page_size(&self) -> Option<usize> {
+        match self.ty {
+            KernelStackType::KernelSpace(_, _) => {
+                return Some(KernelStack::SIZE);
+            }
+            _ => {
+                // 静态内核栈和动态内核栈没有guard page
+                return None;
+            }
+        }
     }
 
     /// 返回内核栈的起始虚拟地址(低地址)
@@ -1678,10 +1851,20 @@ impl Drop for KernelStack {
                 drop(pcb_ptr);
             }
         }
-        // 如果该内核栈不可以被释放，那么，这里就forget，不调用AlignedBox的drop函数
-        if !self.can_be_freed {
-            let bx = self.stack.take();
-            core::mem::forget(bx);
+        match self.ty {
+            KernelStackType::KernelSpace(kstack_virt_addr, kstack_phy_addr) => {
+                // 释放内核栈
+                unsafe {
+                    dealloc_from_kernel_space(kstack_virt_addr, kstack_phy_addr);
+                }
+                let bx = self.stack.take();
+                core::mem::forget(bx);
+            }
+            KernelStackType::Static => {
+                let bx = self.stack.take();
+                core::mem::forget(bx);
+            }
+            KernelStackType::Dynamic => {}
         }
     }
 }

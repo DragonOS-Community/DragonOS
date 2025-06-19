@@ -42,6 +42,7 @@ pub(super) fn do_faccessat(
 
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
+    // log::debug!("do_faccessat path: {:?}", path);
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
@@ -149,7 +150,7 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
     return result;
 }
 
-pub(super) fn do_sys_open(
+pub fn do_sys_open(
     dfd: i32,
     path: &str,
     o_flags: FileMode,
@@ -166,7 +167,7 @@ fn do_sys_openat2(
     how: OpenHow,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
-    // debug!("open path: {}, how: {:?}", path, how);
+    // log::debug!("openat2: dirfd: {}, path: {}, how: {:?}",dirfd, path, how);
     let path = path.trim();
 
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;

@@ -531,6 +531,7 @@ dependencies = [
  "slabmalloc",
  "smoltcp",
  "static-keys",
+ "syscall_table_macros",
  "system_error",
  "uefi",
  "uefi-raw",
@@ -1542,7 +1543,6 @@ dependencies = [
  "cfg-if",
  "defmt",
  "heapless",
- "log",
  "managed",
 ]
 
@@ -1664,6 +1664,10 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "syscall_table_macros"
+version = "0.1.0"
 
 [[package]]
 name = "system_error"

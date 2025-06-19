@@ -3,8 +3,21 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
+.. Note: __EXCLUDE_IN_TRANSLATED_START
+
 欢迎来到DragonOS的文档！
 ====================================
+
+.. raw:: html
+
+   <div class="toctree-wrapper compound">
+   <p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+   <ul>
+   <li class="toctree-l1"><a class="reference internal" href="locales/en/index.html">English</a></li>
+   </ul>
+   </div>
+
+.. Note: __EXCLUDE_IN_TRANSLATED_END
 
 .. toctree::
    :maxdepth: 1
@@ -33,6 +46,7 @@
    kernel/container/index
    kernel/libs/index
    kernel/trace/index
+   kernel/syscall/index
 
 
 
@@ -44,9 +58,11 @@
 
 .. toctree::
    :maxdepth: 1
-   :caption: 系统调用api文档
+   :caption: Q&A
+   
+   questions/index
 
-   syscall_api/index
+
 
 .. toctree::
    :maxdepth: 1
@@ -56,6 +72,13 @@
    community/contact/index
    community/ChangeLog/index
 
+.. Note: __EXCLUDE_IN_TRANSLATED_START
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Translations
+
+   locales/en/index
 
 Indices and tables
 ==================
@@ -63,3 +86,5 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
+
+.. Note: __EXCLUDE_IN_TRANSLATED_END

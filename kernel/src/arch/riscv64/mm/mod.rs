@@ -284,6 +284,10 @@ impl MemoryManagementArch for RiscV64MMArch {
     const PAGE_READONLY_EXEC: usize = 0;
 
     const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
+
+    fn enable_kernel_wp() {}
+
+    fn disable_kernel_wp() {}
 }
 
 const fn protection_map() -> [EntryFlags<MMArch>; 16] {

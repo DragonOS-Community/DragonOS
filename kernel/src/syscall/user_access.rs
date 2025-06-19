@@ -7,8 +7,12 @@ use core::{
 };
 
 use alloc::{ffi::CString, vec::Vec};
+use defer::defer;
 
-use crate::mm::{verify_area, VirtAddr};
+use crate::{
+    arch::MMArch,
+    mm::{verify_area, MemoryManagementArch, VirtAddr},
+};
 
 use super::SystemError;
 
@@ -37,6 +41,10 @@ pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemErro
 
 pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
     verify_area(dest, src.len()).map_err(|_| SystemError::EFAULT)?;
+    MMArch::disable_kernel_wp();
+    defer!({
+        MMArch::enable_kernel_wp();
+    });
 
     let p = dest.data() as *mut u8;
     // 拷贝数据

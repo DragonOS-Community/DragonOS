@@ -12,13 +12,13 @@ use system_error::SystemError;
 
 use crate::{
     driver::{base::device::device_number::DeviceNumber, tty::pty::ptm_driver},
+    filesystem::epoll::{EPollEventType, EPollItem},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
     mm::VirtAddr,
-    net::event_poll::{EPollEventType, EPollItem},
     process::{process_group::Pgid, session::Sid, ProcessControlBlock},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };

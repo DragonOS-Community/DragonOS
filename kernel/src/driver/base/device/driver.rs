@@ -171,6 +171,7 @@ impl dyn Driver {
     /// ## 注意
     ///
     /// 这里的默认实现很低效，请为特定的驱动自行实现高效的查询
+    #[inline(never)]
     pub fn find_device_by_name(&self, name: &str) -> Option<Arc<dyn Device>> {
         if let Some(r) = self.__find_device_by_name_fast(name) {
             return Some(r);

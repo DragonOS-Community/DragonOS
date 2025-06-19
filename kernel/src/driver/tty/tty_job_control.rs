@@ -5,10 +5,7 @@ use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
     process::{process_group::Pgid, Pid, ProcessFlags, ProcessManager},
-    syscall::{
-        user_access::{UserBufferReader, UserBufferWriter},
-        Syscall,
-    },
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::tty_core::{TtyCore, TtyIoctlCmd};
@@ -59,7 +56,7 @@ impl TtyJobCtrlManager {
             } else if ProcessManager::is_current_pgrp_orphaned() {
                 return Err(SystemError::EIO);
             } else {
-                Syscall::kill_process_group(pgid, sig)?;
+                crate::ipc::kill::kill_process_group(pgid, sig)?;
                 ProcessManager::current_pcb()
                     .flags()
                     .insert(ProcessFlags::HAS_PENDING_SIGNAL);

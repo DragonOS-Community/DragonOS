@@ -29,7 +29,7 @@ build-command = "make install"
 # 安装相关信息
 [install]
 # （可选）安装到DragonOS的路径
-in-dragonos-path = "/bin"
+in-dragonos-path = "/"
 # 清除相关信息
 [clean]
 # （可选）清除命令

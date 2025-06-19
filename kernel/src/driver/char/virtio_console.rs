@@ -72,7 +72,7 @@ pub fn virtio_console(
     log::debug!(
         "virtio_console: dev_id: {:?}, parent: {:?}",
         dev_id,
-        dev_parent
+        dev_parent.as_ref().map(|x| x.name())
     );
     let device = VirtIOConsoleDevice::new(transport, dev_id.clone());
     if device.is_none() {
@@ -576,9 +576,7 @@ impl Driver for VirtIOConsoleDriver {
             virtio_con_dev.dev_id(),
         );
         }
-        log::debug!("virtio console: add_device: to lock inner");
         let mut inner = self.inner();
-        log::debug!("virtio console: add_device: inner.locked");
         let dev_name = inner.alloc_id();
         if dev_name.is_none() {
             panic!("Failed to allocate ID for VirtIO console device: '{:?}', virtio console device limit exceeded.", virtio_con_dev.dev_id())

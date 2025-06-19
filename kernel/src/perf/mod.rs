@@ -1,7 +1,9 @@
 mod bpf;
 mod kprobe;
+mod tracepoint;
 mod util;
 
+use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::syscall::ModeType;
@@ -15,9 +17,8 @@ use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
-use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll};
 use crate::perf::bpf::BpfPerfEvent;
-use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs};
+use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs, PerfProbeConfig};
 use crate::process::ProcessManager;
 use crate::syscall::user_access::UserBufferReader;
 use crate::syscall::Syscall;
@@ -77,7 +78,7 @@ impl PerfEventInode {
     fn epoll_callback(&self) -> Result<()> {
         let pollflag = EPollEventType::from_bits_truncate(self.do_poll()? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))
+        EventPoll::wakeup_epoll(&self.epitems, pollflag)
     }
 }
 
@@ -287,13 +288,20 @@ pub fn perf_event_open(
         }
         perf_type_id::PERF_TYPE_SOFTWARE => {
             // For bpf prog output
-            assert_eq!(args.config, perf_sw_ids::PERF_COUNT_SW_BPF_OUTPUT);
+            assert_eq!(
+                args.config,
+                PerfProbeConfig::PerfSwIds(perf_sw_ids::PERF_COUNT_SW_BPF_OUTPUT)
+            );
             assert_eq!(
                 args.sample_type,
                 Some(perf_event_sample_format::PERF_SAMPLE_RAW)
             );
             let bpf_event = bpf::perf_event_open_bpf(args);
             Box::new(bpf_event)
+        }
+        perf_type_id::PERF_TYPE_TRACEPOINT => {
+            let tracepoint_event = tracepoint::perf_event_open_tracepoint(args)?;
+            Box::new(tracepoint_event)
         }
         _ => {
             unimplemented!("perf_event_process: unknown type: {:?}", args);

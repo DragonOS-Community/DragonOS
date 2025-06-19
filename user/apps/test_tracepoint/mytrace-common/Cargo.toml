@@ -1,0 +1,16 @@
+[package]
+name = "mytrace-common"
+version = "0.1.0"
+edition = "2021"
+
+license.workspace = true
+
+[features]
+default = []
+user = ["aya"]
+
+[dependencies]
+aya = { workspace = true, optional = true }
+
+[lib]
+path = "src/lib.rs"

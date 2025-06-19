@@ -3,8 +3,10 @@ use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
+use super::socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET};
 use crate::{
     driver::net::{NetDevice, Operstate},
+    filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     libs::rwlock::RwLockReadGuard,
     net::{socket::SocketPollMethod, NET_DEVICES},
     time::{
@@ -12,11 +14,6 @@ use crate::{
         timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
         PosixTimeSpec,
     },
-};
-
-use super::{
-    event_poll::{EPollEventType, EventPoll},
-    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
 /// The network poll function, which will be called by timer.
@@ -48,10 +45,17 @@ pub fn net_init() -> Result<(), SystemError> {
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
 
-    //由于现在os未实现在用户态为网卡动态分配内存，而lo网卡的id最先分配且ip固定不能被分配
-    //所以特判取用id为1的网卡（也就是virto_net）
-    let net_face = binding.get(&1).ok_or(SystemError::ENODEV)?.clone();
+    let net_face = binding
+        .iter()
+        .find(|(_, iface)| iface.name().starts_with("eth"))
+        .map(|(_, iface)| iface.clone());
 
+    if net_face.is_none() {
+        warn!("dhcp_query: No net device found!");
+        return Err(SystemError::ENODEV);
+    }
+    let net_face = net_face.unwrap();
+    log::debug!("dhcp_query: net_face={}", net_face.name());
     drop(binding);
 
     // Create sockets
@@ -245,7 +249,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
         }
         EventPoll::wakeup_epoll(
             &posix_item.epitems,
-            Some(EPollEventType::from_bits_truncate(events as u32)),
+            EPollEventType::from_bits_truncate(events as u32),
         )?;
         drop(handle_guard);
         // crate::debug!(

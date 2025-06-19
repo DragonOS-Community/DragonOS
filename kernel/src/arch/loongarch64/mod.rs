@@ -1,6 +1,7 @@
 pub mod asm;
 pub mod cpu;
 pub mod elf;
+pub mod filesystem;
 pub mod init;
 pub mod interrupt;
 pub mod ipc;

@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-/// `/sys/kernel/debug`的koject
+/// `/sys/kernel/debug`的kobject
 static mut SYS_KERNEL_DEBUG_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
 
 /// 初始化debug模块在sysfs中的目录

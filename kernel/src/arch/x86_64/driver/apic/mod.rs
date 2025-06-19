@@ -21,7 +21,6 @@ use self::{
 };
 
 pub mod apic_timer;
-mod c_adapter;
 pub mod hw_irq;
 pub mod ioapic;
 pub mod lapic_vector;

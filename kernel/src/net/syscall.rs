@@ -7,8 +7,11 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
+        fcntl::AtFlags,
         file::{File, FileMode},
-        syscall::{IoVec, IoVecs},
+        iov::{IoVec, IoVecs},
+        open::do_sys_open,
+        syscall::ModeType,
         FileType,
     },
     libs::spinlock::SpinLockGuard,
@@ -295,7 +298,7 @@ impl Syscall {
     /// @return 成功返回接收的字节数，失败返回错误码
     pub fn recvmsg(fd: usize, msg: &mut MsgHdr, _flags: u32) -> Result<usize, SystemError> {
         // 检查每个缓冲区地址是否合法，生成iovecs
-        let mut iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
@@ -591,7 +594,13 @@ impl SockAddr {
                         .to_str()
                         .map_err(|_| SystemError::EINVAL)?;
 
-                    let fd = Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true)?;
+                    let fd = do_sys_open(
+                        AtFlags::AT_FDCWD.bits(),
+                        path,
+                        FileMode::O_RDWR,
+                        ModeType::S_IWUGO | ModeType::S_IRUGO,
+                        true,
+                    )?;
 
                     let binding = ProcessManager::current_pcb().fd_table();
                     let fd_table_guard = binding.read();

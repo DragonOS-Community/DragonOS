@@ -284,6 +284,8 @@ pub trait BitMapOps<T: BitOps> {
     fn last_false_index(&self) -> Option<usize>;
 
     /// 获取指定index之后第一个为1的位的index
+    ///
+    /// **注意**: 这个不包含当前的index位（如果index位的值是1，那么它是会跳过这个位的）
     fn next_index(&self, index: usize) -> Option<usize>;
 
     /// 获取指定index之后第一个为0的位的index

@@ -10,6 +10,7 @@ use crate::{
     },
     filesystem::{
         devpts::DevPtsFs,
+        epoll::EPollEventType,
         vfs::{
             file::FileMode, syscall::ModeType, FilePrivateData, FileType, MountFS, ROOT_INODE,
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -17,7 +18,6 @@ use crate::{
     },
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
-    net::event_poll::EPollEventType,
     syscall::user_access::UserBufferWriter,
 };
 

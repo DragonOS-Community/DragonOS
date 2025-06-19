@@ -5,9 +5,7 @@ pub mod pkru;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use hashbrown::HashSet;
 use log::{debug, info};
-use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
 use crate::driver::serial::serial8250::send_to_default_serial8250_port;
@@ -44,12 +42,14 @@ static mut INITIAL_CR3_VALUE: PhysAddr = PhysAddr::new(0);
 
 static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = SpinLock::new(None);
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct X86_64MMBootstrapInfo {
     kernel_load_base_paddr: usize,
     kernel_code_start: usize,
     kernel_code_end: usize,
     kernel_data_end: usize,
+    kernel_rodata_start: usize,
     kernel_rodata_end: usize,
     start_brk: usize,
 }
@@ -136,6 +136,7 @@ impl MemoryManagementArch for X86_64MMArch {
             fn _text();
             fn _etext();
             fn _edata();
+            fn _rodata();
             fn _erodata();
             fn _end();
             fn _default_kernel_load_base();
@@ -148,6 +149,7 @@ impl MemoryManagementArch for X86_64MMArch {
             kernel_code_start: _text as usize,
             kernel_code_end: _etext as usize,
             kernel_data_end: _edata as usize,
+            kernel_rodata_start: _rodata as usize,
             kernel_rodata_end: _erodata as usize,
             start_brk: _end as usize,
         };
@@ -160,15 +162,14 @@ impl MemoryManagementArch for X86_64MMArch {
         boot_callbacks()
             .early_init_memory_blocks()
             .expect("init memory area failed");
-
-        debug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
+        debug!("bootstrap info: {:#x?}", unsafe { BOOTSTRAP_MM_INFO });
         debug!("phys[0]=virt[0x{:x}]", unsafe {
             MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
         });
 
         // 初始化内存管理器
         unsafe { allocator_init() };
-
+        Self::enable_kernel_wp();
         send_to_default_serial8250_port("x86 64 mm init done\n\0".as_bytes());
     }
 
@@ -368,10 +369,35 @@ impl MemoryManagementArch for X86_64MMArch {
     const PAGE_WRITE: usize = 0;
     const PAGE_WRITE_EXEC: usize = 0;
     const PAGE_EXEC: usize = 0;
+
+    /// 启用 内核态的 Write Protect
+    /// 这样即使在内核态，CPU也会检查页面的写保护位
+    /// 防止内核错误地写入只读页面
+    fn enable_kernel_wp() {
+        unsafe {
+            use x86::controlregs::{cr0, cr0_write, Cr0};
+            let mut cr0_val = cr0();
+            cr0_val.insert(Cr0::CR0_WRITE_PROTECT);
+            cr0_write(cr0_val);
+            // log::debug!("CR0.WP bit enabled for kernel write protection");
+        }
+    }
+
+    /// 禁用 内核态的 Write Protect
+    fn disable_kernel_wp() {
+        unsafe {
+            use x86::controlregs::{cr0, cr0_write, Cr0};
+            let mut cr0_val = cr0();
+            cr0_val.remove(Cr0::CR0_WRITE_PROTECT);
+            cr0_write(cr0_val);
+            // log::debug!("CR0.WP bit disabled for kernel write protection");
+        }
+    }
 }
 
 /// 获取保护标志的映射表
 ///
+/// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/mm/pgprot.c#8
 ///
 /// ## 返回值
 /// - `[usize; 16]`: 长度为16的映射表
@@ -548,16 +574,15 @@ unsafe fn allocator_init() {
         compiler_fence(Ordering::SeqCst);
         mapper.make_current();
         compiler_fence(Ordering::SeqCst);
-        debug!("New page table enabled");
+        //debug!("New page table enabled");
     }
     debug!("Successfully enabled new page table");
 }
 
-#[no_mangle]
-pub extern "C" fn rs_test_buddy() {
-    test_buddy();
-}
+#[cfg(test)]
 pub fn test_buddy() {
+    use hashbrown::HashSet;
+    use x86::time::rdtsc;
     // 申请内存然后写入数据然后free掉
     // 总共申请200MB内存
     const TOTAL_SIZE: usize = 200 * 1024 * 1024;
@@ -684,7 +709,7 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> Entr
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
         // Remap kernel code  execute
         return EntryFlags::new().set_execute(true).set_write(true);
-    } else if virt.data() >= info.kernel_data_end && virt.data() < info.kernel_rodata_end {
+    } else if virt.data() >= info.kernel_rodata_start && virt.data() < info.kernel_rodata_end {
         // Remap kernel rodata read only
         return EntryFlags::new().set_execute(true);
     } else {

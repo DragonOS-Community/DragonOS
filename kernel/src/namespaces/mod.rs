@@ -5,7 +5,7 @@ use system_error::SystemError;
 use user_namespace::UserNamespace;
 
 use crate::{
-    libs::spinlock::SpinLock,
+    libs::rwlock::RwLock,
     process::{fork::CloneFlags, ProcessControlBlock},
 };
 
@@ -17,12 +17,12 @@ pub mod ucount;
 pub mod user_namespace;
 
 /// 管理 namespace,包含了所有namespace的信息
-#[derive(Clone)]
 pub struct NsSet {
     flags: u64,
     nsproxy: NsProxy,
-    pub fs: Arc<SpinLock<FsStruct>>,
+    pub fs: RwLock<Arc<FsStruct>>,
 }
+
 #[derive(Debug, Clone)]
 pub struct NsProxy {
     pub pid_namespace: Arc<PidNamespace>,

@@ -1,0 +1,17 @@
+[package]
+name = "mytrace-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mytrace-common = { path = "../mytrace-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "mytrace"
+path = "src/main.rs"

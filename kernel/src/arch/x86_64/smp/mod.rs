@@ -151,11 +151,16 @@ pub struct X86_64SmpManager {
 }
 
 impl X86_64SmpManager {
-    pub const fn new() -> Self {
+    /// 创建一个新的X86_64SmpManager实例
+    ///
+    /// 注：由于该函数只在编译时被调用，因此 `#[allow(clippy::large_stack_frames)]` 是安全的。
+    #[allow(clippy::large_stack_frames)]
+    const fn new() -> Self {
         return Self {
             ia64_cpu_to_sapicid: RwLock::new([None; PerCpu::MAX_CPU_NUM as usize]),
         };
     }
+
     /// initialize the logical cpu number to APIC ID mapping
     pub fn build_cpu_map(&self) -> Result<(), SystemError> {
         // 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/ia64/kernel/smpboot.c?fi=smp_build_cpu_map#496

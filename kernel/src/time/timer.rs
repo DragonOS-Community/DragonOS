@@ -325,6 +325,12 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         drop(irq_guard);
 
         schedule(SchedMode::SM_NONE);
+
+        // 如果定时器没有超时（被信号中断或其他原因唤醒），则取消定时器
+        if !timer.timeout() {
+            timer.cancel();
+        }
+
         let time_remaining: i64 = timeout - TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         if time_remaining >= 0 {
             // 被提前唤醒，返回剩余时间
@@ -384,11 +390,4 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
 
 pub fn clock() -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst);
-}
-
-// ====== 以下为给C提供的接口 ======
-
-#[no_mangle]
-pub extern "C" fn rs_timer_init() {
-    timer_init();
 }

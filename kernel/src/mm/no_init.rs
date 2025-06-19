@@ -51,7 +51,13 @@ pub struct EarlyIoRemapPages {
 impl EarlyIoRemapPages {
     /// 预留的用于在内存管理初始化之前，映射内存所使用的页表数量
     pub const EARLY_REMAP_PAGES_NUM: usize = 256;
-    pub const fn new() -> Self {
+
+    /// 创建一个新的EarlyIoRemapPages实例
+    ///
+    /// # Safety
+    /// 由于该函数只在编译时被调用，因此 `#[allow(clippy::large_stack_frames)]` 是安全的。
+    #[allow(clippy::large_stack_frames)]
+    const fn new() -> Self {
         Self {
             pages: [EarlyRemapPage {
                 data: [0; MMArch::PAGE_SIZE],

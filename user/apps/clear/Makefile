@@ -10,7 +10,7 @@ else
 endif
 
 ifeq ($(ARCH), x86_64)
-	export RUST_TARGET=x86_64-unknown-linux-musl
+	export RUST_TARGET=x86_64-unknown-linux-gnu
 else ifeq ($(ARCH), riscv64)
 	export RUST_TARGET=riscv64gc-unknown-linux-gnu
 else 

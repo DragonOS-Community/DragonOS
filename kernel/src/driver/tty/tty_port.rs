@@ -5,8 +5,8 @@ use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
 use crate::{
+    filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     libs::spinlock::{SpinLock, SpinLockGuard},
-    net::event_poll::EventPoll,
 };
 
 use super::tty_core::TtyCore;
@@ -80,17 +80,14 @@ pub trait TtyPort: Sync + Send + Debug {
     /// 作为客户端的tty ports接收数据
     fn receive_buf(&self, buf: &[u8], _flags: &[u8], count: usize) -> Result<usize, SystemError> {
         let tty = self.port_data().internal_tty().unwrap();
-
         let ld = tty.ldisc();
-
         let ret = ld.receive_buf2(tty.clone(), buf, None, count);
-
         if let Err(SystemError::ENOSYS) = ret {
             return ld.receive_buf(tty, buf, None, count);
         }
-
-        EventPoll::wakeup_epoll(tty.core().eptiems(), None)?;
-
+        let event: usize = ld.poll(tty.clone())?;
+        let pollflag = EPollEventType::from_bits_truncate(event as u32);
+        EventPoll::wakeup_epoll(tty.core().eptiems(), pollflag)?;
         ret
     }
 }

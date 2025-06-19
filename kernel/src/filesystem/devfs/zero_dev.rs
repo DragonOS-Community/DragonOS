@@ -2,7 +2,7 @@ use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
-    core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
+    vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
 use crate::libs::spinlock::SpinLockGuard;
 use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
@@ -45,6 +45,7 @@ impl LockedZeroInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::CharDevice, // 文件夹，block设备，char设备
                 mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
@@ -101,6 +102,7 @@ impl IndexNode for LockedZeroInode {
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
         inode.metadata.ctime = metadata.ctime;
+        inode.metadata.btime = metadata.btime;
         inode.metadata.mode = metadata.mode;
         inode.metadata.uid = metadata.uid;
         inode.metadata.gid = metadata.gid;

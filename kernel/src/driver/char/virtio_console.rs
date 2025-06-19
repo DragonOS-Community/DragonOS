@@ -72,7 +72,7 @@ pub fn virtio_console(
     log::debug!(
         "virtio_console: dev_id: {:?}, parent: {:?}",
         dev_id,
-        dev_parent
+        dev_parent.as_ref().map(|x| x.name())
     );
     let device = VirtIOConsoleDevice::new(transport, dev_id.clone());
     if device.is_none() {
@@ -90,7 +90,7 @@ pub fn virtio_console(
 }
 
 //
-#[derive(Debug)]
+
 #[cast_to([sync] VirtIODevice)]
 #[cast_to([sync] Device)]
 pub struct VirtIOConsoleDevice {
@@ -102,6 +102,22 @@ pub struct VirtIOConsoleDevice {
 }
 unsafe impl Send for VirtIOConsoleDevice {}
 unsafe impl Sync for VirtIOConsoleDevice {}
+
+impl Debug for VirtIOConsoleDevice {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtIOConsoleDevice")
+            .field(
+                "devname",
+                &self
+                    .dev_name
+                    .try_get()
+                    .map(|x| x.as_str())
+                    .unwrap_or("uninitialized"),
+            )
+            .field("dev_id", &self.dev_id.id())
+            .finish()
+    }
+}
 
 impl VirtIOConsoleDevice {
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
@@ -560,9 +576,7 @@ impl Driver for VirtIOConsoleDriver {
             virtio_con_dev.dev_id(),
         );
         }
-        log::debug!("virtio console: add_device: to lock inner");
         let mut inner = self.inner();
-        log::debug!("virtio console: add_device: inner.locked");
         let dev_name = inner.alloc_id();
         if dev_name.is_none() {
             panic!("Failed to allocate ID for VirtIO console device: '{:?}', virtio console device limit exceeded.", virtio_con_dev.dev_id())

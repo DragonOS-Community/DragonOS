@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
-    KernelStack, Pid, ProcessControlBlock, ProcessManager,
+    KernelStack, Pgid, Pid, ProcessControlBlock, ProcessManager, Sid,
 };
 const MAX_PID_NS_LEVEL: usize = 32;
 
@@ -179,7 +179,6 @@ impl ProcessManager {
             );
             e
         })?;
-        ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程
         procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {
@@ -292,14 +291,14 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         // 如果不共享文件描述符表，则拷贝文件描述符表
         if !clone_flags.contains(CloneFlags::CLONE_FILES) {
-            let new_fd_table = current_pcb.basic().fd_table().unwrap().read().clone();
+            let new_fd_table = current_pcb.basic().try_fd_table().unwrap().read().clone();
             let new_fd_table = Arc::new(RwLock::new(new_fd_table));
             new_pcb.basic_mut().set_fd_table(Some(new_fd_table));
         } else {
             // 如果共享文件描述符表，则直接拷贝指针
             new_pcb
                 .basic_mut()
-                .set_fd_table(current_pcb.basic().fd_table().clone());
+                .set_fd_table(current_pcb.basic().try_fd_table().clone());
         }
 
         return Ok(());
@@ -311,13 +310,21 @@ impl ProcessManager {
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // // 将信号的处理函数设置为default(除了那些被手动屏蔽的)
-        if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
-            flush_signal_handlers(new_pcb.clone(), false);
+        // todo SignalStruct结构需要更改，属于线程组逻辑
+        if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
+            // log::debug!("copy_sighand: CLONE_SIGHAND");
+            current_pcb
+                .sig_struct_irqsave()
+                .cnt
+                .fetch_add(1, Ordering::SeqCst);
+            return Ok(());
         }
 
-        if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
-            new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers;
+        // log::debug!("Just copy sighand");
+        new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers.clone();
+
+        if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
+            flush_signal_handlers(new_pcb.clone(), false);
         }
         return Ok(());
     }
@@ -343,6 +350,7 @@ impl ProcessManager {
         clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
+        // log::debug!("fork: clone_flags: {:?}", clone_args.flags);
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
@@ -497,7 +505,8 @@ impl ProcessManager {
         } else {
             pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
 
-            let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+            let ptr: *mut ProcessControlBlock =
+                pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
             unsafe {
                 (*ptr).tgid = pcb.pid;
             }
@@ -533,8 +542,82 @@ impl ProcessManager {
 
         // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
 
+        Self::copy_group(current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
+
+        Self::copy_fs(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
+
         sched_cgroup_fork(pcb);
 
+        Ok(())
+    }
+
+    /// 拷贝进程组信息
+    ///
+    /// ## 参数
+    ///
+    /// `parent_pcb` - 父进程
+    /// `child_pcb` - 子进程
+    /// ## 返回值
+    ///
+    /// 无
+    fn copy_group(
+        parent_pcb: &Arc<ProcessControlBlock>,
+        child_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        if parent_pcb.process_group().is_none() && parent_pcb.pid() == Pid(0) {
+            return Ok(());
+        }
+        let pg = parent_pcb.process_group().unwrap();
+
+        let mut pg_inner = pg.process_group_inner.lock();
+
+        let mut children_writelock = parent_pcb.children.write();
+
+        children_writelock.push(child_pcb.pid());
+
+        pg_inner
+            .processes
+            .insert(child_pcb.pid(), child_pcb.clone());
+
+        // 检查是否已经存在pgid和sid
+        let pgid = Pgid::new(child_pcb.pid().0);
+        let sid = Sid::new(pgid.into());
+
+        if ProcessManager::find_process_group(pgid).is_some() {
+            ProcessManager::remove_process_group(pgid);
+        }
+        if ProcessManager::find_session(sid).is_some() {
+            ProcessManager::remove_session(sid);
+        }
+
+        child_pcb.set_process_group(&pg);
+
+        Ok(())
+    }
+
+    fn copy_fs(
+        clone_flags: &CloneFlags,
+        parent_pcb: &Arc<ProcessControlBlock>,
+        child_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        let fs = parent_pcb.fs_struct();
+        let mut guard = child_pcb.fs_struct_mut();
+        if clone_flags.contains(CloneFlags::CLONE_FS) {
+            *guard = fs.clone();
+        } else {
+            let new_fs = (*fs).clone();
+            *guard = Arc::new(new_fs);
+        }
         Ok(())
     }
 }

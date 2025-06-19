@@ -5,7 +5,7 @@ use core::{
     sync::atomic::AtomicI64,
 };
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 use crate::{
@@ -60,7 +60,7 @@ pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
 /// SignalStruct 在 pcb 中加锁
 #[derive(Debug)]
 pub struct SignalStruct {
-    inner: Box<InnerSignalStruct>,
+    inner: InnerSignalStruct,
 }
 
 #[derive(Debug)]
@@ -69,16 +69,20 @@ pub struct InnerSignalStruct {
     pub cnt: AtomicI64,
     /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
     /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
-    pub handlers: [Sigaction; MAX_SIG_NUM],
+    pub handlers: Vec<Sigaction>,
 }
 
 impl SignalStruct {
     #[inline(never)]
     pub fn new() -> Self {
         let mut r = Self {
-            inner: Box::<InnerSignalStruct>::default(),
+            inner: InnerSignalStruct::default(),
         };
-        let sig_ign = Sigaction::default();
+        let mut sig_ign = Sigaction::default();
+        // 收到忽略的信号，重启系统调用
+        // todo: 看看linux哪些
+        sig_ign.flags_mut().insert(SigFlags::SA_RESTART);
+
         r.inner.handlers[Signal::SIGCHLD as usize - 1] = sig_ign;
         r.inner.handlers[Signal::SIGURG as usize - 1] = sig_ign;
         r.inner.handlers[Signal::SIGWINCH as usize - 1] = sig_ign;
@@ -111,7 +115,7 @@ impl Default for InnerSignalStruct {
     fn default() -> Self {
         Self {
             cnt: Default::default(),
-            handlers: [Sigaction::default(); MAX_SIG_NUM],
+            handlers: vec![Sigaction::default(); MAX_SIG_NUM],
         }
     }
 }

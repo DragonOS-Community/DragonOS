@@ -16,6 +16,8 @@ use alloc::{
 use cred::INIT_CRED;
 use hashbrown::HashMap;
 use log::{debug, error, info, warn};
+use process_group::{Pgid, ProcessGroup, ALL_PROCESS_GROUP};
+use session::{Session, Sid, ALL_SESSION};
 use system_error::SystemError;
 
 use crate::{
@@ -29,7 +31,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         procfs::procfs_unregister_pid,
-        vfs::{file::FileDescriptorVec, FileType},
+        vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
         signal::RestartBlock,
@@ -43,6 +45,7 @@ use crate::{
             futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
+        mutex::Mutex,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
@@ -51,7 +54,7 @@ use crate::{
         percpu::{PerCpu, PerCpuVar},
         set_IDLE_PROCESS_ADDRESS_SPACE,
         ucontext::AddressSpace,
-        VirtAddr,
+        PhysAddr, VirtAddr,
     },
     namespaces::{mnt_namespace::FsStruct, pid_namespace::PidStrcut, NsProxy},
     net::socket::SocketInode,
@@ -64,22 +67,25 @@ use crate::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
-    syscall::{user_access::clear_user, Syscall},
+    syscall::user_access::clear_user,
 };
 use timer::AlarmTimer;
 
 use self::{cred::Cred, kthread::WorkerPrivate};
 
 pub mod abi;
-pub mod c_adapter;
 pub mod cred;
 pub mod exec;
+pub mod execve;
 pub mod exit;
 pub mod fork;
+pub mod geteuid;
 pub mod idle;
 pub mod kthread;
 pub mod pid;
+pub mod process_group;
 pub mod resource;
+pub mod session;
 pub mod stdio;
 pub mod syscall;
 pub mod timer;
@@ -132,6 +138,8 @@ impl ProcessManager {
         };
 
         ALL_PROCESS.lock_irqsave().replace(HashMap::new());
+        ALL_PROCESS_GROUP.lock_irqsave().replace(HashMap::new());
+        ALL_SESSION.lock_irqsave().replace(HashMap::new());
         Self::init_switch_result();
         Self::arch_init();
         debug!("process arch init done.");
@@ -224,6 +232,15 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.pid(), pcb.clone());
+    }
+
+    /// ### 获取所有进程的pid
+    pub fn get_all_processes() -> Vec<Pid> {
+        let mut pids = Vec::new();
+        for (pid, _) in ALL_PROCESS.lock_irqsave().as_ref().unwrap().iter() {
+            pids.push(*pid);
+        }
+        pids
     }
 
     /// 唤醒一个进程
@@ -371,7 +388,7 @@ impl ProcessManager {
                 return;
             }
             let parent_pcb = r.unwrap();
-            let r = Syscall::kill(parent_pcb.pid(), Signal::SIGCHLD as i32);
+            let r = crate::ipc::kill::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
             if r.is_err() {
                 warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",
@@ -389,9 +406,28 @@ impl ProcessManager {
     /// ## 参数
     ///
     /// - `exit_code` : 进程的退出码
+    ///
+    /// ## 注意
+    ///  对于正常退出的进程，状态码应该先左移八位，以便用户态读取的时候正常返回退出码；而对于被信号终止的进程，状态码则是最低七位，无需进行移位操作。
+    ///
+    ///  因此注意，传入的`exit_code`应该是已经完成了移位操作的
     pub fn exit(exit_code: usize) -> ! {
+        // 检查是否是init进程尝试退出，如果是则产生panic
+        let current_pcb = ProcessManager::current_pcb();
+        if current_pcb.pid() == Pid(1) {
+            log::error!(
+                "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
+                exit_code
+            );
+            loop {
+                spin_loop();
+            }
+        }
+        drop(current_pcb);
+
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
         let pid: Pid;
         {
             let pcb = ProcessManager::current_pcb();
@@ -437,7 +473,6 @@ impl ProcessManager {
             drop(thread);
             unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();
-
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
             if let Some(tty) = pcb.sig_info_irqsave().tty() {
@@ -448,7 +483,7 @@ impl ProcessManager {
                 }
             }
             pcb.sig_info_mut().set_tty(None);
-
+            pcb.clear_pg_and_session_reference();
             drop(pcb);
             ProcessManager::exit_notify();
         }
@@ -464,6 +499,7 @@ impl ProcessManager {
     pub unsafe fn release(pid: Pid) {
         let pcb = ProcessManager::find(pid);
         if pcb.is_some() {
+            // log::debug!("release pid {}", pid);
             // let pcb = pcb.unwrap();
             // 判断该pcb是否在全局没有任何引用
             // TODO: 当前，pcb的Arc指针存在泄露问题，引用计数不正确，打算在接下来实现debug专用的Arc，方便调试，然后解决这个bug。
@@ -701,7 +737,7 @@ pub struct ProcessControlBlock {
     thread: RwLock<ThreadInfo>,
 
     /// 进程文件系统的状态
-    fs: Arc<SpinLock<FsStruct>>,
+    fs: RwLock<Arc<FsStruct>>,
 
     ///闹钟定时器
     alarm_timer: SpinLock<Option<AlarmTimer>>,
@@ -717,6 +753,12 @@ pub struct ProcessControlBlock {
     self_ref: Weak<ProcessControlBlock>,
 
     restart_block: SpinLock<Option<RestartBlock>>,
+
+    /// 进程组
+    process_group: Mutex<Weak<ProcessGroup>>,
+
+    /// 进程的可执行文件路径
+    executable_path: RwLock<String>,
 }
 
 impl ProcessControlBlock {
@@ -768,55 +810,58 @@ impl ProcessControlBlock {
             (Self::generate_pid(), ppid, cwd, cred, tty)
         };
 
-        let basic_info = ProcessBasicInfo::new(Pid(0), ppid, Pid(0), name, cwd, None);
+        let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
         let sched_info = ProcessSchedulerInfo::new(None);
-        let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
-        let mut pcb = Self {
-            pid,
-            tgid: pid,
-            thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
-            basic: basic_info,
-            preempt_count,
-            flags,
-            kernel_stack: RwLock::new(kstack),
-            syscall_stack: RwLock::new(KernelStack::new().unwrap()),
-            worker_private: SpinLock::new(None),
-            sched_info,
-            arch_info,
-            sig_info: RwLock::new(ProcessSignalInfo::default()),
-            sig_struct: SpinLock::new(SignalStruct::new()),
-            exit_signal: AtomicSignal::new(Signal::SIGCHLD),
-            parent_pcb: RwLock::new(ppcb.clone()),
-            real_parent_pcb: RwLock::new(ppcb),
-            children: RwLock::new(Vec::new()),
-            wait_queue: WaitQueue::default(),
-            thread: RwLock::new(ThreadInfo::new()),
-            fs: Arc::new(SpinLock::new(FsStruct::new())),
-            alarm_timer: SpinLock::new(None),
-            robust_list: RwLock::new(None),
-            nsproxy: Arc::new(RwLock::new(NsProxy::new())),
-            cred: SpinLock::new(cred),
-            self_ref: Weak::new(),
-            restart_block: SpinLock::new(None),
-        };
 
-        pcb.sig_info.write().set_tty(tty);
-
-        // 初始化系统调用栈
-        #[cfg(target_arch = "x86_64")]
-        pcb.arch_info
-            .lock()
-            .init_syscall_stack(&pcb.syscall_stack.read());
-
+        // 使用 Arc::new_cyclic 避免在栈上创建巨大的结构体
         let pcb = Arc::new_cyclic(|weak| {
-            pcb.self_ref = weak.clone();
+            let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
+            let pcb = Self {
+                pid,
+                tgid: pid,
+                thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
+                basic: basic_info,
+                preempt_count,
+                flags,
+                kernel_stack: RwLock::new(kstack),
+                syscall_stack: RwLock::new(KernelStack::new().unwrap()),
+                worker_private: SpinLock::new(None),
+                sched_info,
+                arch_info,
+                sig_info: RwLock::new(ProcessSignalInfo::default()),
+                sig_struct: SpinLock::new(SignalStruct::new()),
+                exit_signal: AtomicSignal::new(Signal::SIGCHLD),
+                parent_pcb: RwLock::new(ppcb.clone()),
+                real_parent_pcb: RwLock::new(ppcb),
+                children: RwLock::new(Vec::new()),
+                wait_queue: WaitQueue::default(),
+                thread: RwLock::new(ThreadInfo::new()),
+                fs: RwLock::new(Arc::new(FsStruct::new())),
+                alarm_timer: SpinLock::new(None),
+                robust_list: RwLock::new(None),
+                nsproxy: Arc::new(RwLock::new(NsProxy::new())),
+                cred: SpinLock::new(cred),
+                self_ref: weak.clone(),
+                restart_block: SpinLock::new(None),
+                process_group: Mutex::new(Weak::new()),
+                executable_path: RwLock::new(name),
+            };
+
+            pcb.sig_info.write().set_tty(tty);
+
+            // 初始化系统调用栈
+            #[cfg(target_arch = "x86_64")]
+            pcb.arch_info
+                .lock()
+                .init_syscall_stack(&pcb.syscall_stack.read());
+
             pcb
         });
 
@@ -846,6 +891,25 @@ impl ProcessControlBlock {
                 panic!("parent pcb is None");
             }
         }
+
+        if pcb.pid() > Pid(0) && !is_idle {
+            let process_group = ProcessGroup::new(pcb.clone());
+            *pcb.process_group.lock() = Arc::downgrade(&process_group);
+            ProcessManager::add_process_group(process_group.clone());
+
+            let session = Session::new(process_group.clone());
+            process_group.process_group_inner.lock().session = Arc::downgrade(&session);
+            session.session_inner.lock().leader = Some(pcb.clone());
+            ProcessManager::add_session(session);
+
+            ProcessManager::add_pcb(pcb.clone());
+        }
+        // log::debug!(
+        //     "A new process is created, pid: {:?}, pgid: {:?}, sid: {:?}",
+        //     pcb.pid(),
+        //     pcb.process_group().unwrap().pgid(),
+        //     pcb.session().unwrap().sid()
+        // );
 
         return pcb;
     }
@@ -878,6 +942,12 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub unsafe fn set_preempt_count(&self, count: usize) {
         self.preempt_count.store(count, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn contain_child(&self, pid: &Pid) -> bool {
+        let children = self.children.read();
+        return children.contains(pid);
     }
 
     #[inline(always)]
@@ -962,19 +1032,35 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn fs_struct(&self) -> Arc<SpinLock<FsStruct>> {
-        self.fs.clone()
+    pub fn fs_struct(&self) -> Arc<FsStruct> {
+        self.fs.read().clone()
+    }
+
+    pub fn fs_struct_mut(&self) -> RwLockWriteGuard<Arc<FsStruct>> {
+        self.fs.write()
+    }
+
+    pub fn pwd_inode(&self) -> Arc<dyn IndexNode> {
+        self.fs.read().pwd()
     }
 
     /// 获取文件描述符表的Arc指针
     #[inline(always)]
     pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
-        return self.basic.read().fd_table().unwrap();
+        return self.basic.read().try_fd_table().unwrap();
     }
 
     #[inline(always)]
     pub fn cred(&self) -> Cred {
         self.cred.lock().clone()
+    }
+
+    pub fn set_execute_path(&self, path: String) {
+        *self.executable_path.write() = path;
+    }
+
+    pub fn execute_path(&self) -> String {
+        self.executable_path.read().clone()
     }
 
     /// 根据文件描述符序号，获取socket对象的Arc指针
@@ -1071,6 +1157,24 @@ impl ProcessControlBlock {
         self.flags.get().contains(ProcessFlags::HAS_PENDING_SIGNAL)
     }
 
+    /// 检查当前进程是否有未被阻塞的待处理信号。
+    ///
+    /// 注：该函数较慢，因此需要与 has_pending_signal_fast 一起使用。
+    pub fn has_pending_not_masked_signal(&self) -> bool {
+        let sig_info = self.sig_info_irqsave();
+        let blocked: SigSet = *sig_info.sig_blocked();
+        let mut pending: SigSet = sig_info.sig_pending().signal();
+        drop(sig_info);
+        pending.remove(blocked);
+        // log::debug!(
+        //     "pending and not masked:{:?}, masked: {:?}",
+        //     pending,
+        //     blocked
+        // );
+        let has_not_masked = !pending.is_empty();
+        return has_not_masked;
+    }
+
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
     }
@@ -1113,7 +1217,12 @@ impl ProcessControlBlock {
 
     /// Exit fd table when process exit
     fn exit_files(&self) {
-        self.basic.write_irqsave().set_fd_table(None);
+        // 关闭文件描述符表
+        // 这里这样写的原因是避免某些inode在关闭时需要访问当前进程的basic，导致死锁
+        let mut guard = self.basic.write_irqsave();
+        let old = guard.set_fd_table(None);
+        drop(guard);
+        drop(old)
     }
 
     pub fn children_read_irqsave(&self) -> RwLockReadGuard<Vec<Pid>> {
@@ -1135,6 +1244,17 @@ impl ProcessControlBlock {
         *self.restart_block.lock() = restart_block;
         return Err(SystemError::ERESTART_RESTARTBLOCK);
     }
+
+    pub fn parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.parent_pcb.read().upgrade()
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.sched_info
+            .inner_lock_read_irqsave()
+            .state()
+            .is_exited()
+    }
 }
 
 impl Drop for ProcessControlBlock {
@@ -1150,6 +1270,7 @@ impl Drop for ProcessControlBlock {
                 .retain(|pid| *pid != self.pid());
         }
 
+        // log::debug!("Drop pid: {:?}", self.pid());
         drop(irq_guard);
     }
 }
@@ -1192,12 +1313,8 @@ impl ThreadInfo {
 /// 这个结构体保存进程的基本信息，主要是那些不会随着进程的运行而经常改变的信息。
 #[derive(Debug)]
 pub struct ProcessBasicInfo {
-    /// 当前进程的进程组id
-    pgid: Pid,
     /// 当前进程的父进程的pid
     ppid: Pid,
-    /// 当前进程所属会话id
-    sid: Pid,
     /// 进程的名字
     name: String,
 
@@ -1214,18 +1331,14 @@ pub struct ProcessBasicInfo {
 impl ProcessBasicInfo {
     #[inline(never)]
     pub fn new(
-        pgid: Pid,
         ppid: Pid,
-        sid: Pid,
         name: String,
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
         let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
         return RwLock::new(Self {
-            pgid,
             ppid,
-            sid,
             name,
             cwd,
             user_vm,
@@ -1233,16 +1346,8 @@ impl ProcessBasicInfo {
         });
     }
 
-    pub fn pgid(&self) -> Pid {
-        return self.pgid;
-    }
-
     pub fn ppid(&self) -> Pid {
         return self.ppid;
-    }
-
-    pub fn sid(&self) -> Pid {
-        return self.sid;
     }
 
     pub fn name(&self) -> &str {
@@ -1268,12 +1373,17 @@ impl ProcessBasicInfo {
         self.user_vm = user_vm;
     }
 
-    pub fn fd_table(&self) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+    pub fn try_fd_table(&self) -> Option<Arc<RwLock<FileDescriptorVec>>> {
         return self.fd_table.clone();
     }
 
-    pub fn set_fd_table(&mut self, fd_table: Option<Arc<RwLock<FileDescriptorVec>>>) {
+    pub fn set_fd_table(
+        &mut self,
+        fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
+    ) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+        let old = self.fd_table.take();
         self.fd_table = fd_table;
+        return old;
     }
 }
 
@@ -1486,11 +1596,115 @@ impl ProcessSchedulerInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KernelStack {
     stack: Option<AlignedBox<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>>,
     /// 标记该内核栈是否可以被释放
-    can_be_freed: bool,
+    ty: KernelStackType,
+}
+
+#[derive(Debug)]
+pub enum KernelStackType {
+    KernelSpace(VirtAddr, PhysAddr),
+    Static,
+    Dynamic,
+}
+
+// 为什么需要这个锁?
+// alloc_from_kernel_space 使用该函数分配内核栈时，如果该函数被中断打断，
+// 而切换的任务使用dealloc_from_kernel_space回收内核栈，对
+// KernelMapper的可变引用获取将会失败造成错误
+static KSTACK_LOCK: SpinLock<()> = SpinLock::new(());
+
+unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
+    use crate::arch::MMArch;
+    use crate::mm::allocator::page_frame::{allocate_page_frames, PageFrameCount};
+    use crate::mm::kernel_mapper::KernelMapper;
+    use crate::mm::page::EntryFlags;
+    use crate::mm::MemoryManagementArch;
+
+    // Layout
+    // ---------------
+    // | KernelStack |
+    // | guard page  | size == KernelStack::SIZE
+    // | KernelStack |
+    // | guard page  |
+    // | ..........  |
+    // ---------------
+
+    let _guard = KSTACK_LOCK.try_lock_irqsave().unwrap();
+    let need_size = KernelStack::SIZE * 2;
+    let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
+
+    let (paddr, _count) = allocate_page_frames(page_num).expect("kernel stack alloc failed");
+
+    let guard_vaddr = MMArch::phys_2_virt(paddr).unwrap();
+    let _kstack_paddr = paddr + KernelStack::SIZE;
+    let kstack_vaddr = guard_vaddr + KernelStack::SIZE;
+
+    core::ptr::write_bytes(kstack_vaddr.data() as *mut u8, 0, KernelStack::SIZE);
+
+    let guard_flags = EntryFlags::new();
+
+    let mut kernel_mapper = KernelMapper::lock();
+    let kernel_mapper = kernel_mapper.as_mut().unwrap();
+
+    for i in 0..KernelStack::SIZE / MMArch::PAGE_SIZE {
+        let guard_page_vaddr = guard_vaddr + i * MMArch::PAGE_SIZE;
+        // Map the guard page
+        let flusher = kernel_mapper.remap(guard_page_vaddr, guard_flags).unwrap();
+        flusher.flush();
+    }
+
+    // unsafe {
+    //     log::debug!(
+    //         "trigger kernel stack guard page :{:#x}",
+    //         (kstack_vaddr.data() - 8)
+    //     );
+    //     let guard_ptr = (kstack_vaddr.data() - 8) as *mut usize;
+    //     guard_ptr.write(0xfff); // Invalid
+    // }
+
+    // log::info!(
+    //     "[kernel stack alloc]: virt: {:#x}, phy: {:#x}",
+    //     kstack_vaddr.data(),
+    //     _kstack_paddr.data()
+    // );
+    (guard_vaddr, paddr)
+}
+
+unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr) {
+    use crate::arch::mm::kernel_page_flags;
+    use crate::arch::MMArch;
+    use crate::mm::allocator::page_frame::{deallocate_page_frames, PageFrameCount, PhysPageFrame};
+    use crate::mm::kernel_mapper::KernelMapper;
+    use crate::mm::MemoryManagementArch;
+
+    let _guard = KSTACK_LOCK.try_lock_irqsave().unwrap();
+
+    let need_size = KernelStack::SIZE * 2;
+    let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
+
+    // log::info!(
+    //     "[kernel stack dealloc]: virt: {:#x}, phy: {:#x}",
+    //     vaddr.data(),
+    //     paddr.data()
+    // );
+
+    let mut kernel_mapper = KernelMapper::lock();
+    let kernel_mapper = kernel_mapper.as_mut().unwrap();
+
+    // restore the guard page flags
+    for i in 0..KernelStack::SIZE / MMArch::PAGE_SIZE {
+        let guard_page_vaddr = vaddr + i * MMArch::PAGE_SIZE;
+        let flusher = kernel_mapper
+            .remap(guard_page_vaddr, kernel_page_flags(vaddr))
+            .unwrap();
+        flusher.flush();
+    }
+
+    // release the physical page
+    unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), page_num) };
 }
 
 impl KernelStack {
@@ -1498,12 +1712,27 @@ impl KernelStack {
     pub const ALIGN: usize = 0x4000;
 
     pub fn new() -> Result<Self, SystemError> {
-        return Ok(Self {
-            stack: Some(
-                AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
-            ),
-            can_be_freed: true,
-        });
+        if cfg!(feature = "kstack_protect") {
+            unsafe {
+                let (kstack_vaddr, kstack_paddr) = alloc_from_kernel_space();
+                let real_kstack_vaddr = kstack_vaddr + KernelStack::SIZE;
+                Ok(Self {
+                    stack: Some(
+                        AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_unchecked(
+                            real_kstack_vaddr.data() as *mut [u8; KernelStack::SIZE],
+                        ),
+                    ),
+                    ty: KernelStackType::KernelSpace(kstack_vaddr, kstack_paddr),
+                })
+            }
+        } else {
+            Ok(Self {
+                stack: Some(
+                    AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
+                ),
+                ty: KernelStackType::Dynamic,
+            })
+        }
     }
 
     /// 根据已有的空间，构造一个内核栈结构体
@@ -1514,14 +1743,38 @@ impl KernelStack {
             return Err(SystemError::EFAULT);
         }
 
-        return Ok(Self {
+        Ok(Self {
             stack: Some(
                 AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_unchecked(
                     base.data() as *mut [u8; KernelStack::SIZE],
                 ),
             ),
-            can_be_freed: false,
-        });
+            ty: KernelStackType::Static,
+        })
+    }
+
+    pub fn guard_page_address(&self) -> Option<VirtAddr> {
+        match self.ty {
+            KernelStackType::KernelSpace(kstack_virt_addr, _) => {
+                return Some(kstack_virt_addr);
+            }
+            _ => {
+                // 静态内核栈和动态内核栈没有guard page
+                return None;
+            }
+        }
+    }
+
+    pub fn guard_page_size(&self) -> Option<usize> {
+        match self.ty {
+            KernelStackType::KernelSpace(_, _) => {
+                return Some(KernelStack::SIZE);
+            }
+            _ => {
+                // 静态内核栈和动态内核栈没有guard page
+                return None;
+            }
+        }
     }
 
     /// 返回内核栈的起始虚拟地址(低地址)
@@ -1598,10 +1851,20 @@ impl Drop for KernelStack {
                 drop(pcb_ptr);
             }
         }
-        // 如果该内核栈不可以被释放，那么，这里就forget，不调用AlignedBox的drop函数
-        if !self.can_be_freed {
-            let bx = self.stack.take();
-            core::mem::forget(bx);
+        match self.ty {
+            KernelStackType::KernelSpace(kstack_virt_addr, kstack_phy_addr) => {
+                // 释放内核栈
+                unsafe {
+                    dealloc_from_kernel_space(kstack_virt_addr, kstack_phy_addr);
+                }
+                let bx = self.stack.take();
+                core::mem::forget(bx);
+            }
+            KernelStackType::Static => {
+                let bx = self.stack.take();
+                core::mem::forget(bx);
+            }
+            KernelStackType::Dynamic => {}
         }
     }
 }

@@ -1,3 +1,5 @@
+use super::KernFSInode;
+use crate::tracepoint::{TraceCmdLineCacheSnapshot, TracePipeSnapshot, TracePointInfo};
 use crate::{
     filesystem::{sysfs::SysFSKernPrivateData, vfs::PollStatus},
     libs::spinlock::SpinLockGuard,
@@ -5,8 +7,6 @@ use crate::{
 use alloc::sync::Arc;
 use core::fmt::Debug;
 use system_error::SystemError;
-
-use super::KernFSInode;
 
 /// KernFS文件的回调接口
 ///
@@ -86,24 +86,25 @@ impl<'a> KernCallbackData<'a> {
 #[derive(Debug)]
 pub enum KernInodePrivateData {
     SysFS(SysFSKernPrivateData),
+    DebugFS(Arc<TracePointInfo>),
+    TracePipe(TracePipeSnapshot),
+    TraceSavedCmdlines(TraceCmdLineCacheSnapshot),
 }
 
 impl KernInodePrivateData {
     #[inline(always)]
     pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
-        match self {
-            KernInodePrivateData::SysFS(private_data) => {
-                return private_data.callback_read(buf, offset);
-            }
-        }
+        return match self {
+            KernInodePrivateData::SysFS(private_data) => private_data.callback_read(buf, offset),
+            _ => Err(SystemError::ENOSYS),
+        };
     }
 
     #[inline(always)]
     pub fn callback_write(&self, buf: &[u8], offset: usize) -> Result<usize, SystemError> {
-        match self {
-            KernInodePrivateData::SysFS(private_data) => {
-                return private_data.callback_write(buf, offset);
-            }
-        }
+        return match self {
+            KernInodePrivateData::SysFS(private_data) => private_data.callback_write(buf, offset),
+            _ => Err(SystemError::ENOSYS),
+        };
     }
 }

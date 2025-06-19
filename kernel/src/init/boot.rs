@@ -102,7 +102,7 @@ impl BootParams {
         #[cfg(target_arch = "riscv64")]
         return Some(self.arch.arch_fdt());
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
         return None;
     }
 
@@ -112,7 +112,7 @@ impl BootParams {
         #[cfg(target_arch = "riscv64")]
         return Some(self.arch.fdt_paddr);
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
         return None;
     }
 }

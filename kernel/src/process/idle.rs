@@ -97,6 +97,11 @@ impl ProcessManager {
             }
             return VirtAddr::new(stack_ptr);
         }
+
+        #[cfg(target_arch = "loongarch64")]
+        {
+            todo!("la64: stack_ptr() not implemented yet")
+        }
     }
 
     /// 获取idle进程数组的引用

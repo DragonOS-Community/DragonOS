@@ -124,11 +124,11 @@ static mut CASTER_MAP: Option<HashMap<(TypeId, TypeId), BoxedCaster, BuildFastHa
 #[cfg(target_os = "none")]
 #[allow(static_mut_refs)]
 pub fn caster_map() -> &'static HashMap<(TypeId, TypeId), BoxedCaster, BuildFastHasher> {
-    return unsafe {
+    unsafe {
         CASTER_MAP.as_ref().unwrap_or_else(|| {
             panic!("intertrait_caster_map() must be called after CASTER_MAP is initialized")
         })
-    };
+    }
 }
 
 /// Initializes the global [`CASTER_MAP`] with [`CASTERS`].

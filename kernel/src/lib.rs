@@ -1,12 +1,16 @@
 #![no_main] // <1>
+#![no_std]
 #![feature(alloc_error_handler)]
+#![feature(asm_goto)]
 #![feature(new_zeroed_alloc)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
 #![feature(concat_idents)]
 #![feature(const_for)]
+#![feature(const_size_of_val)]
 #![feature(const_trait_impl)]
 #![feature(core_intrinsics)]
+#![feature(c_variadic)]
 #![feature(c_void_variant)]
 #![feature(extract_if)]
 #![feature(fn_align)]
@@ -17,13 +21,20 @@
 #![feature(slice_ptr_get)]
 #![feature(sync_unsafe_cell)]
 #![feature(vec_into_raw_parts)]
-#![feature(c_variadic)]
-#![feature(asm_goto)]
 #![feature(linkage)]
-#![cfg_attr(target_os = "none", no_std)]
-#![allow(static_mut_refs, non_local_definitions, internal_features)]
+#![feature(panic_can_unwind)]
+#![allow(
+    static_mut_refs,
+    non_local_definitions,
+    internal_features,
+    non_upper_case_globals
+)]
 // clippy的配置
 #![deny(clippy::all)]
+// 取消下面的注释以启用clippy对栈帧大小的检查
+// #![deny(clippy::large_stack_frames)]
+// #![deny(clippy::large_const_arrays)]
+
 // DragonOS允许在函数中使用return语句（尤其是长函数时，我们推荐这么做）
 #![allow(
     clippy::macro_metavars_in_unsafe,
@@ -64,6 +75,7 @@ mod sched;
 mod smp;
 mod syscall;
 mod time;
+mod tracepoint;
 #[cfg(target_arch = "x86_64")]
 mod virt;
 

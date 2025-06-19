@@ -25,7 +25,7 @@ use crate::{
 
 use super::{
     file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType,
-    IndexNode, InodeId, Magic, SuperBlock,
+    IndexNode, InodeId, Magic, PollableInode, SuperBlock,
 };
 
 const MOUNTFS_BLOCK_SIZE: u64 = 512;
@@ -436,15 +436,6 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
-    fn kernel_ioctl(
-        &self,
-        arg: Arc<dyn crate::net::event_poll::KernelIoctlData>,
-        data: &FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        return self.inner_inode.kernel_ioctl(arg, data);
-    }
-
-    #[inline]
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
         return self.inner_inode.list();
     }
@@ -528,11 +519,6 @@ impl IndexNode for MountFSInode {
         self.inner_inode.special_node()
     }
 
-    #[inline]
-    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        self.inner_inode.poll(private_data)
-    }
-
     /// 若不支持，则调用第二种情况来从父目录获取文件名
     /// # Performance
     /// 应尽可能引入DName，
@@ -552,6 +538,10 @@ impl IndexNode for MountFSInode {
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         self.inner_inode.page_cache()
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        self.inner_inode.as_pollable_inode()
     }
 }
 
@@ -758,4 +748,19 @@ impl Debug for MountList {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_map().entries(MOUNT_LIST().0.read().iter()).finish()
     }
+}
+
+/// 判断给定的inode是否为其所在文件系统的根inode
+///
+/// ## 返回值
+///
+/// - `true`: 是根inode
+/// - `false`: 不是根inode或者传入的inode不是MountFSInode类型，或者调用inode的metadata方法时报错了。
+pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
+    let mnt_inode = inode.as_any_ref().downcast_ref::<MountFSInode>();
+    if let Some(mnt) = mnt_inode {
+        return mnt.is_mountpoint_root().unwrap_or(false);
+    }
+
+    return false;
 }

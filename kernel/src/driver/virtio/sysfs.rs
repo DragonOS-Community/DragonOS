@@ -196,7 +196,7 @@ impl VirtIODeviceManager {
         dev.set_virtio_device_index(virtio_index);
         dev.set_device_name(format!("virtio{}", virtio_index.data()));
 
-        log::debug!("virtio_device_add: dev: {:?}", dev);
+        log::debug!("virtio_device_add: dev: {:?}", dev.name());
         // 添加设备到设备管理器
         device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
         let r = device_manager()

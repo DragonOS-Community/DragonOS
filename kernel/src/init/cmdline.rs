@@ -321,6 +321,7 @@ impl KernelCmdlineManager {
                 continue;
             }
 
+            log::debug!("cmdline: argument: {:?} ", argument);
             let (node, option, value) = match self.split_arg(argument) {
                 Some(v) => v,
                 None => continue,
@@ -346,6 +347,7 @@ impl KernelCmdlineManager {
                             log::warn!("cmdline: parameter {} is set twice", p.name);
                             continue;
                         }
+
                         p.value = Some(CString::new(value.unwrap()).unwrap());
                         p.initialized = true;
                     }

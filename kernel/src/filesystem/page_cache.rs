@@ -1,4 +1,7 @@
-use core::cmp::min;
+use core::{
+    cmp::min,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use alloc::{
     sync::{Arc, Weak},
@@ -21,22 +24,27 @@ use crate::{
 };
 use crate::{libs::align::page_align_up, mm::page::PageType};
 
+static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
 /// 页面缓存
 #[derive(Debug)]
 pub struct PageCache {
+    id: usize,
     inner: SpinLock<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
 }
 
 #[derive(Debug)]
 pub struct InnerPageCache {
+    #[allow(unused)]
+    id: usize,
     pages: HashMap<usize, Arc<Page>>,
     page_cache_ref: Weak<PageCache>,
 }
 
 impl InnerPageCache {
-    pub fn new(page_cache_ref: Weak<PageCache>) -> InnerPageCache {
+    pub fn new(page_cache_ref: Weak<PageCache>, id: usize) -> InnerPageCache {
         Self {
+            id,
             pages: HashMap::new(),
             page_cache_ref,
         }
@@ -105,13 +113,14 @@ impl InnerPageCache {
     /// - `Ok(usize)` 成功读取的长度
     /// - `Err(SystemError)` 失败返回错误码
     pub fn read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let inode = self
+        let inode: Arc<dyn IndexNode> = self
             .page_cache_ref
             .upgrade()
             .unwrap()
             .inode
             .upgrade()
             .unwrap();
+
         let file_size = inode.metadata().unwrap().size;
 
         let len = if offset < file_size as usize {
@@ -174,6 +183,7 @@ impl InnerPageCache {
         for (page_index, count) in not_exist {
             // TODO 这里使用buffer避免多次读取磁盘，将来引入异步IO直接写入页面，减少内存开销和拷贝
             let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
+
             inode.read_sync(page_index * MMArch::PAGE_SIZE, page_buf.as_mut())?;
 
             self.create_pages(page_index, page_buf.as_mut())?;
@@ -306,7 +316,7 @@ impl InnerPageCache {
 
 impl Drop for InnerPageCache {
     fn drop(&mut self) {
-        log::debug!("page cache drop");
+        // log::debug!("page cache drop");
         let mut page_manager = page_manager_lock_irqsave();
         for page in self.pages.values() {
             page_manager.remove_page(&page.phys_address());
@@ -316,8 +326,10 @@ impl Drop for InnerPageCache {
 
 impl PageCache {
     pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
+        let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
         Arc::new_cyclic(|weak| Self {
-            inner: SpinLock::new(InnerPageCache::new(weak.clone())),
+            id,
+            inner: SpinLock::new(InnerPageCache::new(weak.clone(), id)),
             inode: {
                 let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
                 if let Some(inode) = inode {
@@ -326,6 +338,13 @@ impl PageCache {
                 v
             },
         })
+    }
+
+    /// # 获取页缓存的ID
+    #[inline]
+    #[allow(unused)]
+    pub fn id(&self) -> usize {
+        self.id
     }
 
     pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {
@@ -341,6 +360,13 @@ impl PageCache {
     }
 
     pub fn lock_irqsave(&self) -> SpinLockGuard<InnerPageCache> {
+        if self.inner.is_locked() {
+            log::error!("page cache already locked");
+        }
         self.inner.lock_irqsave()
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.inner.is_locked()
     }
 }

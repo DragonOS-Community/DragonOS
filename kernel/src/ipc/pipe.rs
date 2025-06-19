@@ -2,15 +2,17 @@ use core::sync::atomic::compiler_fence;
 
 use crate::{
     arch::ipc::signal::{SigCode, Signal},
-    filesystem::vfs::{
-        core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
-        FileType, IndexNode, Metadata,
+    filesystem::{
+        epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
+        vfs::{
+            file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
+            FileSystem, FileType, IndexNode, Metadata, PollableInode,
+        },
     },
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    net::event_poll::{EPollEventType, EPollItem, EventPoll},
     process::{ProcessFlags, ProcessManager, ProcessState},
     sched::SchedMode,
     time::PosixTimeSpec,
@@ -19,7 +21,6 @@ use crate::{
 use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -129,6 +130,7 @@ impl LockedPipeInode {
                 atime: PosixTimeSpec::default(),
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
                 file_type: FileType::Pipe,
                 mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
@@ -165,24 +167,33 @@ impl LockedPipeInode {
         let inode = self.inner.lock();
         return !inode.buf_full() || inode.reader == 0;
     }
+}
 
-    pub fn add_epoll(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+impl PollableInode for LockedPipeInode {
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        self.inner.lock().poll(private_data)
+    }
+
+    fn add_epitem(
+        &self,
+        epitem: Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
         self.epitems.lock().push_back(epitem);
         Ok(())
     }
 
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        let is_remove = !self
-            .epitems
-            .lock_irqsave()
-            .extract_if(|x| x.epoll().ptr_eq(epoll))
-            .collect::<Vec<_>>()
-            .is_empty();
-
-        if is_remove {
+    fn remove_epitem(
+        &self,
+        epitem: &Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.epitems.lock();
+        let len = guard.len();
+        guard.retain(|x| !Arc::ptr_eq(x, epitem));
+        if len != guard.len() {
             return Ok(());
         }
-
         Err(SystemError::ENOENT)
     }
 }
@@ -279,7 +290,7 @@ impl IndexNode for LockedPipeInode {
         let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&data)? as u32);
         drop(inner_guard);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
+        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
 
         //返回读取的字节数
         return Ok(num);
@@ -468,7 +479,7 @@ impl IndexNode for LockedPipeInode {
 
         drop(inner_guard);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
+        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
 
         // 返回写入的字节数
         return Ok(len);
@@ -496,7 +507,7 @@ impl IndexNode for LockedPipeInode {
         return Err(SystemError::ENOSYS);
     }
 
-    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        return self.inner.lock().poll(private_data);
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Ok(self)
     }
 }

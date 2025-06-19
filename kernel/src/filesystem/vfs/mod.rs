@@ -1,13 +1,16 @@
-pub mod core;
 pub mod fcntl;
 pub mod file;
+pub mod iov;
 pub mod mount;
 pub mod open;
+pub mod stat;
 pub mod syscall;
 pub mod utils;
+pub mod vcore;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use derive_builder::Builder;
 use intertrait::CastFromSync;
 use system_error::SystemError;
 
@@ -15,6 +18,7 @@ use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
+    filesystem::epoll::EPollItem,
     ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
@@ -24,8 +28,8 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{core::generate_inode_id, file::FileMode, syscall::ModeType, utils::DName};
-pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
+use self::{file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id};
+pub use self::{file::FilePrivateData, mount::MountFS, vcore::ROOT_INODE};
 
 use super::page_cache::PageCache;
 
@@ -56,6 +60,22 @@ pub enum FileType {
     SymLink,
     /// 套接字
     Socket,
+}
+
+impl From<FileType> for ModeType {
+    fn from(val: FileType) -> Self {
+        match val {
+            FileType::File => ModeType::S_IFREG,
+            FileType::Dir => ModeType::S_IFDIR,
+            FileType::BlockDevice => ModeType::S_IFBLK,
+            FileType::CharDevice => ModeType::S_IFCHR,
+            FileType::SymLink => ModeType::S_IFLNK,
+            FileType::Socket => ModeType::S_IFSOCK,
+            FileType::Pipe => ModeType::S_IFIFO,
+            FileType::KvmDevice => ModeType::S_IFCHR,
+            FileType::FramebufferDevice => ModeType::S_IFCHR,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -119,6 +139,24 @@ bitflags! {
         const READ = 1u8 << 1;
         const ERROR = 1u8 << 2;
     }
+}
+
+/// The pollable inode trait
+pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
+    /// Return the poll status of the inode
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError>;
+    /// Add an epoll item to the inode
+    fn add_epitem(
+        &self,
+        epitem: Arc<EPollItem>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError>;
+    /// Remove epitems associated with the epoll
+    fn remove_epitem(
+        &self,
+        epitm: &Arc<EPollItem>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError>;
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
@@ -233,14 +271,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
-
-    /// @brief 获取当前inode的状态。
-    ///
-    /// @return PollStatus结构体
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
     }
 
@@ -408,14 +438,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::ENOSYS);
-    }
-
-    fn kernel_ioctl(
-        &self,
-        _arg: Arc<dyn crate::net::event_poll::KernelIoctlData>,
-        _data: &FilePrivateData,
-    ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -625,6 +647,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         );
         None
     }
+
+    /// Transform the inode to a pollable inode
+    ///
+    /// If the inode is not pollable, return an error
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 }
 
 impl DowncastArc for dyn IndexNode {
@@ -771,9 +800,11 @@ impl dyn IndexNode {
 /// IndexNode的元数据
 ///
 /// 对应Posix2008中的sys/stat.h中的定义 https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/sys_stat.h.html
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Builder)]
+#[builder(no_std, setter(into))]
 pub struct Metadata {
     /// 当前inode所在的文件系统的设备号
+    /// todo:更改为DeviceNumber结构体
     pub dev_id: usize,
 
     /// inode号
@@ -793,11 +824,14 @@ pub struct Metadata {
     /// inode最后一次被访问的时间
     pub atime: PosixTimeSpec,
 
-    /// inode最后一次修改的时间
+    /// inode的文件数据最后一次修改的时间
     pub mtime: PosixTimeSpec,
 
-    /// inode的创建时间
+    /// inode的元数据、权限或文件内容最后一次发生改变的时间
     pub ctime: PosixTimeSpec,
+
+    /// inode的创建时间
+    pub btime: PosixTimeSpec,
 
     /// 文件类型
     pub file_type: FileType,
@@ -829,6 +863,7 @@ impl Default for Metadata {
             atime: PosixTimeSpec::default(),
             mtime: PosixTimeSpec::default(),
             ctime: PosixTimeSpec::default(),
+            btime: PosixTimeSpec::default(),
             file_type: FileType::File,
             mode: ModeType::empty(),
             nlinks: 1,
@@ -965,6 +1000,7 @@ impl Metadata {
             atime: PosixTimeSpec::default(),
             mtime: PosixTimeSpec::default(),
             ctime: PosixTimeSpec::default(),
+            btime: PosixTimeSpec::default(),
             file_type,
             mode,
             nlinks: 1,
@@ -1037,3 +1073,75 @@ macro_rules! producefs {
 }
 
 define_filesystem_maker_slice!(FSMAKER);
+
+/// # 批量填充Dirent时的上下文Add commentMore actions
+/// linux语义是通过getdents_callback *类型来实现类似链表的迭代填充，这里考虑通过填充传入的缓冲区来实现
+pub struct FilldirContext<'a> {
+    buf: &'a mut [u8],
+    current_pos: usize,
+    remain_size: usize,
+    error: Option<SystemError>,
+}
+
+impl<'a> FilldirContext<'a> {
+    pub fn new(user_buf: &'a mut [u8]) -> Self {
+        Self {
+            remain_size: user_buf.len(),
+            buf: user_buf,
+            current_pos: 0,
+            error: None,
+        }
+    }
+
+    /// # 填充单个dirent结构体
+    ///
+    /// ## 参数
+    /// - name 目录项名称
+    /// - offset 当前目录项偏移量
+    /// - ino 目录项的inode的inode_id
+    /// - d_type 目录项的inode的file_type_num
+    fn fill_dir(
+        &mut self,
+        name: &str,
+        offset: usize,
+        ino: u64,
+        d_type: u8,
+    ) -> Result<(), SystemError> {
+        let name_len = name.as_bytes().len();
+        let dirent_size = ::core::mem::size_of::<Dirent>() - ::core::mem::size_of::<u8>();
+        let reclen = name_len + dirent_size + 1;
+
+        // 将reclen向上对齐usize大小
+        let align_up = |len: usize, align: usize| -> usize { (len + align - 1) & !(align - 1) };
+        let align_up_reclen = align_up(reclen, ::core::mem::size_of::<usize>());
+
+        // 当前缓冲区空间已不足，返回EINVAL
+        if align_up_reclen > self.remain_size {
+            self.error = Some(SystemError::EINVAL);
+            return Err(SystemError::EINVAL);
+        }
+
+        // 获取剩余缓冲区
+        let current_dirent_slice = &mut self.buf[self.current_pos..];
+        let dirent = unsafe { (current_dirent_slice.as_mut_ptr() as *mut Dirent).as_mut() }
+            .ok_or(SystemError::EFAULT)?;
+
+        // 填充dirent
+        dirent.d_ino = ino;
+        dirent.d_type = d_type;
+        dirent.d_reclen = align_up_reclen as u16;
+        dirent.d_off = offset as i64;
+        unsafe {
+            let ptr = &mut dirent.d_name as *mut u8;
+            let buf: &mut [u8] =
+                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_len + 1);
+            buf[0..name_len].copy_from_slice(name.as_bytes());
+            buf[name_len] = 0;
+        }
+
+        self.current_pos += align_up_reclen;
+        self.remain_size -= align_up_reclen;
+
+        return Ok(());
+    }
+}

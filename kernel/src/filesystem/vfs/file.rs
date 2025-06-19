@@ -1,28 +1,22 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
 
-use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::filesystem::eventfd::EventFdInode;
-use crate::perf::PerfEventInode;
+use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
     },
-    filesystem::procfs::ProcfsFilePrivateData,
-    ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
-    libs::{rwlock::RwLock, spinlock::SpinLock},
-    net::{
-        event_poll::{EPollItem, EPollPrivateData, EventPoll},
-        socket::SocketInode,
+    filesystem::{
+        epoll::{event_poll::EPollPrivateData, EPollItem},
+        procfs::ProcfsFilePrivateData,
+        vfs::FilldirContext,
     },
+    ipc::pipe::PipeFsPrivateData,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
     process::{cred::Cred, ProcessManager},
 };
 
@@ -352,60 +346,49 @@ impl File {
         return Ok(());
     }
 
-    /// @biref 充填dirent结构体
-    /// @return 返回dirent结构体的大小
-    pub fn readdir(&self, dirent: &mut Dirent) -> Result<u64, SystemError> {
+    /// # 读取目录项
+    ///
+    /// ## 参数
+    /// - ctx 填充目录项的上下文
+    pub fn read_dir(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
         let inode: &Arc<dyn IndexNode> = &self.inode;
-        let mut readdir_subdirs_name = self.readdir_subdirs_name.lock();
-        let offset = self.offset.load(Ordering::SeqCst);
-        // 如果偏移量为0
-        if offset == 0 {
-            // 通过list更新readdir_subdirs_name
-            *readdir_subdirs_name = inode.list()?;
-            readdir_subdirs_name.sort();
-        }
-        // debug!("sub_entries={sub_entries:?}");
+        let mut current_pos = self.offset.load(Ordering::SeqCst);
 
-        // 已经读到末尾
-        if offset == readdir_subdirs_name.len() {
-            self.offset.store(0, Ordering::SeqCst);
-            return Ok(0);
-        }
-        let name = &readdir_subdirs_name[offset];
-        let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
-            Ok(i) => i,
-            Err(e) => {
-                error!(
-                    "Readdir error: Failed to find sub inode:{name:?}, file={self:?}, error={e:?}"
-                );
-                return Err(e);
+        // POSIX 标准要求readdir应该返回. 和 ..
+        // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理
+
+        // 迭代读取目录项
+        let readdir_subdirs_name = inode.list()?;
+
+        let subdirs_name_len = readdir_subdirs_name.len();
+        while current_pos < subdirs_name_len {
+            let name = &readdir_subdirs_name[current_pos];
+            let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("Readdir error: Failed to find sub inode");
+                    return Err(e);
+                }
+            };
+
+            let inode_metadata = sub_inode.metadata().unwrap();
+            let entry_ino = inode_metadata.inode_id.into() as u64;
+            let entry_d_type = inode_metadata.file_type.get_file_type_num() as u8;
+            match ctx.fill_dir(name, current_pos, entry_ino, entry_d_type) {
+                Ok(_) => {
+                    self.offset.fetch_add(1, Ordering::SeqCst);
+                    current_pos += 1;
+                }
+                Err(SystemError::EINVAL) => {
+                    return Ok(());
+                }
+                Err(e) => {
+                    ctx.error = Some(e.clone());
+                    return Err(e);
+                }
             }
-        };
-
-        let name_bytes: &[u8] = name.as_bytes();
-
-        // 根据posix的规定，dirent中的d_name是一个不定长的数组，因此需要unsafe来拷贝数据
-        unsafe {
-            let ptr = &mut dirent.d_name as *mut u8;
-
-            let buf: &mut [u8] =
-                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_bytes.len() + 1);
-            buf[0..name_bytes.len()].copy_from_slice(name_bytes);
-            buf[name_bytes.len()] = 0;
         }
-
-        self.offset.fetch_add(1, Ordering::SeqCst);
-        dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
-        dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
-
-        // 计算dirent结构体的大小
-        let size = (name_bytes.len() + ::core::mem::size_of::<Dirent>()
-            - ::core::mem::size_of_val(&dirent.d_name)) as u64;
-
-        dirent.d_reclen = size as u16;
-        dirent.d_off += dirent.d_reclen as i64;
-
-        return Ok(size);
+        return Ok(());
     }
 
     pub fn inode(&self) -> Arc<dyn IndexNode> {
@@ -492,62 +475,26 @@ impl File {
         return Ok(());
     }
 
-    /// ## 向该文件添加一个EPollItem对象
-    ///
-    /// 在文件状态发生变化时，需要向epoll通知
-    pub fn add_epoll(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
-        match self.file_type {
-            FileType::Socket => {
-                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
-                let mut socket = inode.inner();
-
-                return socket.add_epoll(epitem);
-            }
-            FileType::Pipe => {
-                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
-                return inode.add_epoll(epitem);
-            }
-            _ => {
-                let r = self.inode.kernel_ioctl(epitem, &self.private_data.lock());
-                if r.is_err() {
-                    return Err(SystemError::ENOSYS);
-                }
-
-                Ok(())
-            }
-        }
+    /// Add an EPollItem to the file
+    pub fn add_epitem(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+        let private_data = self.private_data.lock();
+        self.inode
+            .as_pollable_inode()?
+            .add_epitem(epitem, &private_data)
     }
 
-    /// ## 删除一个绑定的epoll
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        match self.file_type {
-            FileType::Socket => {
-                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
-                let mut socket = inode.inner();
-
-                socket.remove_epoll(epoll)
-            }
-            FileType::Pipe => {
-                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
-                inode.remove_epoll(epoll)
-            }
-            _ => {
-                let inode = self.inode.downcast_ref::<EventFdInode>();
-                if let Some(inode) = inode {
-                    return inode.remove_epoll(epoll);
-                }
-
-                let inode = self
-                    .inode
-                    .downcast_ref::<PerfEventInode>()
-                    .ok_or(SystemError::ENOSYS)?;
-                return inode.remove_epoll(epoll);
-            }
-        }
+    /// Remove epitems associated with the epoll
+    pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let private_data = self.private_data.lock();
+        self.inode
+            .as_pollable_inode()?
+            .remove_epitem(epitem, &private_data)
     }
 
+    /// Poll the file for events
     pub fn poll(&self) -> Result<usize, SystemError> {
-        self.inode.poll(&self.private_data.lock())
+        let private_data = self.private_data.lock();
+        self.inode.as_pollable_inode()?.poll(&private_data)
     }
 }
 

@@ -93,13 +93,14 @@ impl From<i32> for Signal {
     }
 }
 
-impl Into<SigSet> for Signal {
-    fn into(self) -> SigSet {
+impl From<Signal> for SigSet {
+    fn from(val: Signal) -> Self {
         SigSet {
-            bits: (1 << (self as usize - 1) as u64),
+            bits: (1 << (val as usize - 1) as u64),
         }
     }
 }
+
 impl Signal {
     /// 判断一个数字是否为可用的信号
     #[inline]

@@ -15,15 +15,14 @@ use crate::{
         tty_driver::{TtyDriverFlag, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
-    filesystem::vfs::file::FileMode,
+    filesystem::{epoll::EPollEventType, vfs::file::FileMode},
     libs::{
         rwlock::RwLockReadGuard,
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::VirtAddr,
-    net::event_poll::EPollEventType,
     process::{ProcessFlags, ProcessManager},
-    syscall::{user_access::UserBufferWriter, Syscall},
+    syscall::user_access::UserBufferWriter,
 };
 
 use super::TtyLineDiscipline;
@@ -149,8 +148,8 @@ impl NTtyData {
             cursor_column: 0,
             canon_cursor_column: 0,
             echo_tail: 0,
-            read_buf: Box::new([0; NTTY_BUFSIZE]),
-            echo_buf: Box::new([0; NTTY_BUFSIZE]),
+            read_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
+            echo_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
             read_flags: StaticBitmap::new(),
             char_map: StaticBitmap::new(),
             tty: Weak::default(),
@@ -390,7 +389,7 @@ impl NTtyData {
                 continue;
             }
 
-            if ((c as usize) < self.char_map.size()) && self.char_map.get(c as usize).unwrap() {
+            if ((c as usize) < self.char_map.len()) && self.char_map.get(c as usize).unwrap() {
                 // 特殊字符
                 self.receive_special_char(c, tty.clone(), lookahead_done);
             } else {
@@ -790,7 +789,7 @@ impl NTtyData {
         let ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
         if let Some(pg) = pg {
-            let _ = Syscall::kill(pg, signal as i32);
+            let _ = crate::ipc::kill::kill_process_group(pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {
@@ -1019,7 +1018,13 @@ impl NTtyData {
         };
 
         // 找到eol的坐标
-        let tmp = self.read_flags.next_index(tail);
+        // 注意：next_index可能不包括起始位置，所以我们需要手动检查tail位置
+
+        let tmp: Option<usize> = if self.read_flags.get(tail).unwrap_or(false) {
+            Some(tail)
+        } else {
+            self.read_flags.next_index(tail)
+        };
         // 找到的话即为坐标，未找到的话即为NTTY_BUFSIZE
         let mut eol = if let Some(tmp) = tmp { tmp } else { size };
         if eol > size {

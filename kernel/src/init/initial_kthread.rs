@@ -9,24 +9,23 @@ use system_error::SystemError;
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::net::e1000e::e1000e::e1000e_init,
-    filesystem::vfs::core::mount_root_fs,
+    filesystem::vfs::vcore::mount_root_fs,
     namespaces::NsProxy,
     net::net_core::net_init,
     process::{
-        exec::ProcInitInfo, kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags,
-        ProcessManager,
+        exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
+        ProcessFlags, ProcessManager,
     },
     smp::smp_init,
-    syscall::Syscall,
 };
 
 use super::{cmdline::kenrel_cmdline_param_manager, initcall::do_initcalls};
 
 const INIT_PROC_TRYLIST: [(&str, Option<&str>); 4] = [
     ("/bin/dragonreach", None),
+    ("/bin/busybox", Some("init")),
     ("/bin/init", None),
     ("/bin/sh", None),
-    ("/bin/busybox", Some("init")),
 ];
 
 pub fn initial_kernel_thread() -> i32 {
@@ -128,6 +127,7 @@ fn try_to_run_init_process(
     ext_args: &Option<&str>,
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
+    log::debug!("Trying to run init process at {:?}", path);
     let mut args_to_insert = alloc::vec::Vec::new();
     args_to_insert.push(CString::new(path).unwrap());
 
@@ -163,7 +163,7 @@ fn run_init_process(
     ProcessManager::current_pcb().set_nsproxy(NsProxy::new()); // 初始化init进程的namespace
     let path = proc_init_info.proc_name.to_str().unwrap();
 
-    Syscall::do_execve(
+    do_execve(
         path.to_string(),
         proc_init_info.args.clone(),
         proc_init_info.envs.clone(),

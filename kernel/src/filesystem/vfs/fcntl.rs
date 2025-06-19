@@ -101,6 +101,8 @@ bitflags! {
         /// 应用于整个子树。
         /// AT_RECURSIVE: 0x8000
         const AT_RECURSIVE = 0x8000;
+
+        const AT_GETATTR_NOSEC = i32::MIN;
     }
 }
 

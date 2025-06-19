@@ -67,7 +67,7 @@ Syscall:    │   sys_open, sys_read, sys_write, sys_close,     │
 - `sys_fchmod`：修改文件权限（未实现）
 - 其他系统调用接口（未实现）
 
-&emsp;&emsp;关于接口的具体含义，可以参考 [DragonOS系统调用接口](../../syscall_api/index.rst)。
+&emsp;&emsp;关于接口的具体含义，可以参考Linux的相关文档。
 
 ## 虚拟文件系统（VFS）
 

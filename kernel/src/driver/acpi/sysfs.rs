@@ -1,7 +1,7 @@
 use crate::{
     driver::{
         acpi::acpi_manager,
-        base::{kobject::KObject, kset::KSet},
+        base::kobject::{CommonKobj, DynamicKObjKType, KObject, KObjectManager},
     },
     filesystem::{
         sysfs::{
@@ -21,7 +21,7 @@ use alloc::{
 use log::{debug, error, warn};
 use system_error::SystemError;
 
-use super::{acpi_kset, AcpiManager};
+use super::{acpi_kobj, AcpiManager};
 
 // 定义所有ACPI表结构体
 macro_rules! define_acpi_tables {
@@ -58,35 +58,35 @@ macro_rules! handle_read_table {
     }};
 }
 
-static mut __HOTPLUG_KSET_INSTANCE: Option<Arc<KSet>> = None;
-static mut __ACPI_TABLES_KSET_INSTANCE: Option<Arc<KSet>> = None;
-static mut __ACPI_TABLES_DATA_KSET_INSTANCE: Option<Arc<KSet>> = None;
-static mut __ACPI_TABLES_DYNAMIC_KSET_INSTANCE: Option<Arc<KSet>> = None;
+static mut __HOTPLUG_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
+static mut __ACPI_TABLES_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
+static mut __ACPI_TABLES_DATA_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
+static mut __ACPI_TABLES_DYNAMIC_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
 static mut __ACPI_TABLE_ATTR_LIST: Option<RwLock<Vec<Arc<AttrAcpiTable>>>> = None;
 
 const ACPI_MAX_TABLE_INSTANCES: usize = 999;
 
 #[inline(always)]
 #[allow(dead_code)]
-pub fn hotplug_kset() -> Arc<KSet> {
-    unsafe { __HOTPLUG_KSET_INSTANCE.clone().unwrap() }
+pub fn hotplug_kobj() -> Arc<CommonKobj> {
+    unsafe { __HOTPLUG_KOBJECT_INSTANCE.clone().unwrap() }
 }
 
 #[inline(always)]
-pub fn acpi_tables_kset() -> Arc<KSet> {
-    unsafe { __ACPI_TABLES_KSET_INSTANCE.clone().unwrap() }
-}
-
-#[inline(always)]
-#[allow(dead_code)]
-pub fn acpi_tables_data_kset() -> Arc<KSet> {
-    unsafe { __ACPI_TABLES_DATA_KSET_INSTANCE.clone().unwrap() }
+pub fn acpi_tables_kobj() -> Arc<CommonKobj> {
+    unsafe { __ACPI_TABLES_KOBJECT_INSTANCE.clone().unwrap() }
 }
 
 #[inline(always)]
 #[allow(dead_code)]
-pub fn acpi_tables_dynamic_kset() -> Arc<KSet> {
-    unsafe { __ACPI_TABLES_DYNAMIC_KSET_INSTANCE.clone().unwrap() }
+pub fn acpi_tables_data_kobj() -> Arc<CommonKobj> {
+    unsafe { __ACPI_TABLES_DATA_KOBJECT_INSTANCE.clone().unwrap() }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+pub fn acpi_tables_dynamic_kobj() -> Arc<CommonKobj> {
+    unsafe { __ACPI_TABLES_DYNAMIC_KOBJECT_INSTANCE.clone().unwrap() }
 }
 
 #[inline(always)]
@@ -103,14 +103,14 @@ impl AcpiManager {
         }
         self.acpi_tables_sysfs_init()?;
 
-        let hotplug_kset = KSet::new("hotplug".to_string());
-        hotplug_kset.register(Some(acpi_kset()))?;
-
+        let hotplug_kobj = CommonKobj::new("hotplug".to_string());
+        hotplug_kobj.set_parent(Some(Arc::downgrade(&(acpi_kobj() as Arc<dyn KObject>))));
+        KObjectManager::init_and_add_kobj(hotplug_kobj.clone(), Some(&DynamicKObjKType))?;
         unsafe {
-            __HOTPLUG_KSET_INSTANCE = Some(hotplug_kset.clone());
+            __HOTPLUG_KOBJECT_INSTANCE = Some(hotplug_kobj.clone());
         }
 
-        let hotplug_kobj = hotplug_kset as Arc<dyn KObject>;
+        let hotplug_kobj = hotplug_kobj as Arc<dyn KObject>;
         sysfs_instance().create_file(&hotplug_kobj, &AttrForceRemove)?;
 
         return Ok(());
@@ -121,24 +121,34 @@ impl AcpiManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/sysfs.c?fi=acpi_sysfs_init#488
     fn acpi_tables_sysfs_init(&self) -> Result<(), SystemError> {
         // 创建 `/sys/firmware/acpi/tables` 目录
-        let acpi_tables_kset = KSet::new("tables".to_string());
-        acpi_tables_kset.register(Some(acpi_kset()))?;
+        let acpi_tables_kobj = CommonKobj::new("tables".to_string());
+        acpi_tables_kobj.set_parent(Some(Arc::downgrade(&(acpi_kobj() as Arc<dyn KObject>))));
+        KObjectManager::init_and_add_kobj(acpi_tables_kobj.clone(), Some(&DynamicKObjKType))?;
         unsafe {
-            __ACPI_TABLES_KSET_INSTANCE = Some(acpi_tables_kset.clone());
+            __ACPI_TABLES_KOBJECT_INSTANCE = Some(acpi_tables_kobj.clone());
         }
 
         // 创建 `/sys/firmware/acpi/tables/data` 目录
-        let acpi_tables_data_kset = KSet::new("data".to_string());
-        acpi_tables_data_kset.register(Some(acpi_tables_kset.clone()))?;
+        let acpi_tables_data_kobj = CommonKobj::new("data".to_string());
+        acpi_tables_data_kobj.set_parent(Some(Arc::downgrade(
+            &(acpi_tables_kobj.clone() as Arc<dyn KObject>),
+        )));
+        KObjectManager::init_and_add_kobj(acpi_tables_data_kobj.clone(), Some(&DynamicKObjKType))?;
         unsafe {
-            __ACPI_TABLES_DATA_KSET_INSTANCE = Some(acpi_tables_data_kset);
+            __ACPI_TABLES_DATA_KOBJECT_INSTANCE = Some(acpi_tables_data_kobj.clone());
         }
 
         // 创建 `/sys/firmware/acpi/tables/dynamic` 目录
-        let acpi_tables_dynamic_kset = KSet::new("dynamic".to_string());
-        acpi_tables_dynamic_kset.register(Some(acpi_tables_kset.clone()))?;
+        let acpi_tables_dynamic_kobj = CommonKobj::new("dynamic".to_string());
+        acpi_tables_dynamic_kobj.set_parent(Some(Arc::downgrade(
+            &(acpi_tables_kobj.clone() as Arc<dyn KObject>),
+        )));
+        KObjectManager::init_and_add_kobj(
+            acpi_tables_dynamic_kobj.clone(),
+            Some(&DynamicKObjKType),
+        )?;
         unsafe {
-            __ACPI_TABLES_DYNAMIC_KSET_INSTANCE = Some(acpi_tables_dynamic_kset);
+            __ACPI_TABLES_DYNAMIC_KOBJECT_INSTANCE = Some(acpi_tables_dynamic_kobj);
         }
 
         // todo: get acpi tables.
@@ -232,7 +242,7 @@ impl AttrAcpiTable {
 
         let result = Arc::new(r);
         sysfs_instance().create_bin_file(
-            &(acpi_tables_kset() as Arc<dyn KObject>),
+            &(acpi_tables_kobj() as Arc<dyn KObject>),
             &(result.clone() as Arc<dyn BinAttribute>),
         )?;
         return Ok(result);

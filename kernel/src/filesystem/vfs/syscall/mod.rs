@@ -40,6 +40,7 @@ mod open_utils;
 mod sys_close;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 mod sys_fstat;
+mod sys_ftruncate;
 mod sys_ioctl;
 #[cfg(target_arch = "x86_64")]
 mod sys_lstat;

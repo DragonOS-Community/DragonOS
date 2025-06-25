@@ -1,7 +1,6 @@
 use system_error::SystemError;
 
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::check_and_clone_cstr;
 
 use super::{FileType, MAX_PATHLEN};
 use crate::process::ProcessManager;

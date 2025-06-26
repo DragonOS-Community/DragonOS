@@ -6,6 +6,7 @@ use crate::libs::wait_queue::WaitQueue;
 use crate::process::{ProcessFlags, ProcessManager};
 use crate::sched::SchedMode;
 use crate::tracepoint::{TraceEntryParser, TracePipeOps};
+use alloc::string::String;
 use core::fmt::Debug;
 use system_error::SystemError;
 
@@ -73,10 +74,14 @@ impl KernFSCallback for TraceCallBack {
     fn write(
         &self,
         _data: KernCallbackData,
-        _buf: &[u8],
+        buf: &[u8],
         _offset: usize,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EPERM)
+        if buf.len() == 1 {
+            let mut trace_raw_pipe = super::TRACE_RAW_PIPE.lock();
+            trace_raw_pipe.clear();
+        }
+        Ok(buf.len())
     }
 
     fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
@@ -84,7 +89,7 @@ impl KernFSCallback for TraceCallBack {
     }
 }
 
-pub fn kernel_inode_provider() -> KernFSInodeArgs {
+pub fn kernel_inode_provider_trace() -> KernFSInodeArgs {
     KernFSInodeArgs {
         mode: ModeType::from_bits_truncate(0o444),
         callback: Some(&TraceCallBack),
@@ -150,5 +155,117 @@ impl KernFSCallback for TracePipeCallBack {
 
     fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
         Ok(PollStatus::READ)
+    }
+}
+
+#[derive(Debug)]
+pub struct SavedCmdlinesSizeCallBack;
+
+impl KernFSCallback for SavedCmdlinesSizeCallBack {
+    fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        _data: KernCallbackData,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        let max_record = super::TRACE_CMDLINE_CACHE.lock().max_record();
+        let str = format!("{}\n", max_record);
+        let str_bytes = str.as_bytes();
+        if offset >= str_bytes.len() {
+            return Ok(0); // Offset is beyond the length of the string
+        }
+        let len = buf.len().min(str_bytes.len() - offset);
+        buf[..len].copy_from_slice(&str_bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write(
+        &self,
+        _data: KernCallbackData,
+        buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        let max_record_str = String::from_utf8_lossy(buf);
+        let max_record: usize = max_record_str
+            .trim()
+            .parse()
+            .map_err(|_| SystemError::EINVAL)?;
+        super::TRACE_CMDLINE_CACHE.lock().set_max_record(max_record);
+        Ok(buf.len())
+    }
+
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+}
+
+pub fn kernel_inode_provider_saved_cmdlines() -> KernFSInodeArgs {
+    KernFSInodeArgs {
+        mode: ModeType::from_bits_truncate(0o444),
+        callback: Some(&SavedCmdlinesSnapshotCallBack),
+        inode_type: KernInodeType::File,
+        size: Some(4096),
+        private_data: None,
+    }
+}
+
+#[derive(Debug)]
+pub struct SavedCmdlinesSnapshotCallBack;
+
+impl KernFSCallback for SavedCmdlinesSnapshotCallBack {
+    fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
+        let pri_data = data.private_data_mut();
+        let snapshot = super::TRACE_CMDLINE_CACHE.lock().snapshot();
+        pri_data.replace(KernInodePrivateData::TraceSavedCmdlines(snapshot));
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        mut data: KernCallbackData,
+        buf: &mut [u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        let pri_data = data.private_data_mut().as_mut().unwrap();
+        let snapshot = pri_data.trace_saved_cmdlines().unwrap();
+
+        let mut copy_len = 0;
+        let mut peek_flag = false;
+        loop {
+            if let Some((pid, cmdline)) = snapshot.peek() {
+                let record_str = format!("{} {}\n", pid, String::from_utf8_lossy(cmdline));
+                if copy_len + record_str.len() > buf.len() {
+                    break;
+                }
+                let len = record_str.len();
+                buf[copy_len..copy_len + len].copy_from_slice(record_str.as_bytes());
+                copy_len += len;
+                peek_flag = true;
+            }
+            if peek_flag {
+                snapshot.pop(); // Remove the record after reading
+                peek_flag = false;
+            } else {
+                break; // No more records to read
+            }
+        }
+        Ok(copy_len)
+    }
+
+    fn write(
+        &self,
+        _data: KernCallbackData,
+        _buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EPERM)
+    }
+
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 }

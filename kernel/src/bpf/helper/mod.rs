@@ -6,6 +6,7 @@ use crate::bpf::map::{BpfCallBackFn, BpfMap};
 use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
 use crate::smp::core::smp_get_processor_id;
+use crate::syscall::user_access::check_and_clone_cstr;
 use crate::time::Instant;
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::ffi::c_void;
@@ -89,12 +90,12 @@ pub fn perf_event_output(
 
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_probe_read/
 fn raw_bpf_probe_read(dst: *mut c_void, size: u32, unsafe_ptr: *const c_void) -> i64 {
-    log::info!(
-        "raw_bpf_probe_read, dst:{:x}, size:{}, unsafe_ptr: {:x}",
-        dst as usize,
-        size,
-        unsafe_ptr as usize
-    );
+    // log::info!(
+    //     "raw_bpf_probe_read, dst:{:x}, size:{}, unsafe_ptr: {:x}",
+    //     dst as usize,
+    //     size,
+    //     unsafe_ptr as usize
+    // );
     let (dst, src) = unsafe {
         let dst = core::slice::from_raw_parts_mut(dst as *mut u8, size as usize);
         let src = core::slice::from_raw_parts(unsafe_ptr as *const u8, size as usize);
@@ -111,7 +112,7 @@ fn raw_bpf_probe_read(dst: *mut c_void, size: u32, unsafe_ptr: *const c_void) ->
 /// bytes from kernel space address unsafe_ptr and
 /// store the data in dst.
 pub fn bpf_probe_read(dst: &mut [u8], src: &[u8]) -> Result<()> {
-    log::info!("bpf_probe_read: len: {}", dst.len());
+    // log::info!("bpf_probe_read: len: {}", dst.len());
     dst.copy_from_slice(src);
     Ok(())
 }
@@ -305,6 +306,38 @@ pub fn bpf_ktime_get_ns() -> u64 {
     (Instant::now().total_micros() * 1000) as u64
 }
 
+/// Copy a NULL terminated string from an unsafe user address unsafe_ptr to dst.
+/// The size should include the terminating NULL byte. In case the string length is smaller than size,
+/// the target is not padded with further NULL bytes. If the string length is larger than size,
+/// just size-1 bytes are copied and the last byte is set to NULL.
+///
+/// On success, the strictly positive length of the output string, including the trailing NULL character. On error, a negative value
+///
+/// See https://docs.ebpf.io/linux/helper-function/bpf_probe_read_user_str/
+unsafe fn raw_probe_read_user_str(dst: *mut c_void, size: u32, unsafe_ptr: *const c_void) -> i64 {
+    // log::info!(
+    //     "<raw_probe_read_user_str>: dst:{:x}, size:{}, unsafe_ptr: {:x}",
+    //     dst as usize,
+    //     size,
+    //     unsafe_ptr as usize
+    // );
+    let dst = core::slice::from_raw_parts_mut(dst as *mut u8, size as usize);
+    let res = probe_read_user_str(dst, unsafe_ptr as *const u8);
+    match res {
+        Ok(len) => len as i64,
+        Err(e) => e as i64,
+    }
+}
+
+pub fn probe_read_user_str(dst: &mut [u8], src: *const u8) -> Result<usize> {
+    let str = check_and_clone_cstr(src, None).unwrap();
+    let len = str.as_bytes().len();
+    let copy_len = len.min(dst.len() - 1); // Leave space for NULL terminator
+    dst[..copy_len].copy_from_slice(&str.as_bytes()[..copy_len]);
+    dst[copy_len] = 0; // Null-terminate the string
+    Ok(copy_len + 1) // Return length including NULL terminator
+}
+
 pub static BPF_HELPER_FUN_SET: Lazy<BTreeMap<u32, RawBPFHelperFn>> = Lazy::new();
 
 /// Initialize the helper functions.
@@ -341,6 +374,12 @@ pub fn init_helper_functions() {
         map.insert(HELPER_MAP_PUSH_ELEM, define_func!(raw_map_push_elem));
         map.insert(HELPER_MAP_POP_ELEM, define_func!(raw_map_pop_elem));
         map.insert(HELPER_MAP_PEEK_ELEM, define_func!(raw_map_peek_elem));
+
+        // User access helpers
+        map.insert(
+            HELPER_PROBE_READ_USER_STR,
+            define_func!(raw_probe_read_user_str),
+        );
     }
     BPF_HELPER_FUN_SET.init(map);
 }

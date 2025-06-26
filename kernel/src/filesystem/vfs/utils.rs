@@ -45,7 +45,7 @@ pub fn user_path_at(
     let mut inode = ROOT_INODE();
     let ret_path;
     // 如果path不是绝对路径，则需要拼接
-    if path.as_bytes()[0] != b'/' {
+    if path.is_empty() || path.as_bytes()[0] != b'/' {
         // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
         if dirfd != AtFlags::AT_FDCWD.bits() {
             let binding = pcb.fd_table();

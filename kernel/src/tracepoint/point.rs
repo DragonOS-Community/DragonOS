@@ -1,10 +1,10 @@
 use crate::libs::spinlock::SpinLock;
 use alloc::{boxed::Box, collections::BTreeMap, format, string::String};
-use core::{any::Any, sync::atomic::AtomicU32};
+use core::{any::Any, fmt::Debug, sync::atomic::AtomicU32};
 use static_keys::StaticFalseKey;
 
 #[derive(Debug)]
-#[repr(C)]
+#[repr(C, packed)]
 pub struct TraceEntry {
     pub type_: u16,
     pub flags: u8,
@@ -38,14 +38,11 @@ pub struct TracePoint {
     system: &'static str,
     key: &'static StaticFalseKey,
     id: AtomicU32,
-    inner: SpinLock<TracePointInner>,
-    trace_entry_fmt_func: fn(*const u8) -> String,
+    callback: SpinLock<BTreeMap<usize, TracePointFunc>>,
+    raw_callback: SpinLock<BTreeMap<usize, Box<dyn TracePointCallBackFunc>>>,
+    trace_entry_fmt_func: fn(&[u8]) -> String,
     trace_print_func: fn() -> String,
     flags: u8,
-}
-
-struct TracePointInner {
-    callback: BTreeMap<usize, TracePointFunc>,
 }
 
 impl core::fmt::Debug for TracePoint {
@@ -72,12 +69,16 @@ pub struct TracePointFunc {
     pub data: Box<dyn Any + Send + Sync>,
 }
 
+pub trait TracePointCallBackFunc: Send + Sync {
+    fn call(&self, entry: &[u8]);
+}
+
 impl TracePoint {
     pub const fn new(
         key: &'static StaticFalseKey,
         name: &'static str,
         system: &'static str,
-        fmt_func: fn(*const u8) -> String,
+        fmt_func: fn(&[u8]) -> String,
         trace_print_func: fn() -> String,
     ) -> Self {
         Self {
@@ -88,9 +89,8 @@ impl TracePoint {
             flags: 0,
             trace_entry_fmt_func: fmt_func,
             trace_print_func,
-            inner: SpinLock::new(TracePointInner {
-                callback: BTreeMap::new(),
-            }),
+            callback: SpinLock::new(BTreeMap::new()),
+            raw_callback: SpinLock::new(BTreeMap::new()),
         }
     }
 
@@ -120,7 +120,7 @@ impl TracePoint {
     }
 
     /// Returns the format function for the tracepoint.
-    pub(crate) fn fmt_func(&self) -> fn(*const u8) -> String {
+    pub(crate) fn fmt_func(&self) -> fn(&[u8]) -> String {
         self.trace_entry_fmt_func
     }
 
@@ -137,24 +137,47 @@ impl TracePoint {
     pub fn register(&self, func: fn(), data: Box<dyn Any + Sync + Send>) {
         let trace_point_func = TracePointFunc { func, data };
         let ptr = func as usize;
-        self.inner
-            .lock()
-            .callback
-            .entry(ptr)
-            .or_insert(trace_point_func);
+        self.callback.lock().entry(ptr).or_insert(trace_point_func);
     }
 
     /// Unregister a callback function from the tracepoint
     pub fn unregister(&self, func: fn()) {
         let func_ptr = func as usize;
-        self.inner.lock().callback.remove(&func_ptr);
+        self.callback.lock().remove(&func_ptr);
     }
 
     /// Iterate over all registered callback functions
     pub fn callback_list(&self, f: &dyn Fn(&TracePointFunc)) {
-        let inner = self.inner.lock();
-        for trace_func in inner.callback.values() {
+        let callback = self.callback.lock();
+        for trace_func in callback.values() {
             f(trace_func);
+        }
+    }
+
+    /// Register a raw callback function to the tracepoint
+    ///
+    /// This function will be called when default tracepoint fmt function is called.
+    pub fn register_raw_callback(
+        &self,
+        callback_id: usize,
+        callback: Box<dyn TracePointCallBackFunc>,
+    ) {
+        self.raw_callback
+            .lock()
+            .entry(callback_id)
+            .or_insert(callback);
+    }
+
+    /// Unregister a raw callback function from the tracepoint
+    pub fn unregister_raw_callback(&self, callback_id: usize) {
+        self.raw_callback.lock().remove(&callback_id);
+    }
+
+    /// Iterate over all registered raw callback functions
+    pub fn raw_callback_list(&self, f: &dyn Fn(&Box<dyn TracePointCallBackFunc>)) {
+        let raw_callback = self.raw_callback.lock();
+        for callback in raw_callback.values() {
+            f(callback);
         }
     }
 

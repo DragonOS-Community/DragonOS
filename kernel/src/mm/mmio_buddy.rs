@@ -653,50 +653,8 @@ impl MMIOSpaceGuard {
     /// 传入的物理地址【一定要是设备的物理地址】。
     /// 如果物理地址是从内存分配器中分配的，那么会造成内存泄露。因为mmio_release的时候，只取消映射，不会释放内存。
     pub unsafe fn map_phys(&self, paddr: PhysAddr, length: usize) -> Result<(), SystemError> {
-        if length > self.size {
-            return Err(SystemError::EINVAL);
-        }
-
-        let check = self
-            .mapped
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        if check.is_err() {
-            return Err(SystemError::EINVAL);
-        }
-
         let flags = EntryFlags::mmio_flags();
-
-        let mut kernel_mapper = KernelMapper::lock();
-        let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
-        return r;
-    }
-
-    /// 将物理地址填写到虚拟地址空间中
-    ///
-    /// ## Safety
-    ///
-    /// 传入的物理地址【一定要是设备的物理地址】。
-    /// 如果物理地址是从内存分配器中分配的，那么会造成内存泄露。因为mmio_release的时候，只取消映射，不会释放内存。
-    pub unsafe fn map_phys_with_flags(
-        &self,
-        paddr: PhysAddr,
-        length: usize,
-        flags: EntryFlags<MMArch>,
-    ) -> Result<(), SystemError> {
-        if length > self.size {
-            return Err(SystemError::EINVAL);
-        }
-
-        let check = self
-            .mapped
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        if check.is_err() {
-            return Err(SystemError::EINVAL);
-        }
-
-        let mut kernel_mapper = KernelMapper::lock();
-        let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
-        return r;
+        self.map_phys_with_flags(paddr, length, flags)
     }
 
     /// # map_any_phys - 将任意物理地址映射到虚拟地址
@@ -732,6 +690,33 @@ impl MMIOSpaceGuard {
 
         self.map_phys(paddr_base, page_align_up(length + offset))?;
         return Ok(vaddr);
+    }
+
+    /// 将物理地址填写到虚拟地址空间中
+    ///
+    /// ## Safety
+    ///
+    /// 传入的物理地址【一定要是设备的物理地址】。
+    /// 如果物理地址是从内存分配器中分配的，那么会造成内存泄露。因为mmio_release的时候，只取消映射，不会释放内存。
+    pub unsafe fn map_phys_with_flags(
+        &self,
+        paddr: PhysAddr,
+        length: usize,
+        flags: EntryFlags<MMArch>,
+    ) -> Result<(), SystemError> {
+        if length > self.size {
+            return Err(SystemError::EINVAL);
+        }
+
+        let check = self
+            .mapped
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        if check.is_err() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut kernel_mapper = KernelMapper::lock();
+        kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true)
     }
 
     /// 泄露一个MMIO space guard，不会释放映射的空间

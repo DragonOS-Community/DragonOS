@@ -84,7 +84,6 @@ trigger_files = ["kernel/src/virt", "kernel/src/arch/x86_64/kvm"]
 
 [autolabel."T-Obs and Test"]
 trigger_files = [
-    "/kernel/crates/rbpf",
     "/kernel/crates/kprobe",
     "/kernel/src/debug/kprobe",
     "/kernel/src/bpf",
@@ -167,7 +166,6 @@ infra = ["@dragonos/infra"]
 "/kernel/src/arch/x86_64/kvm" = ["virtulization"]
 "/kernel/src/arch/x86_64" = ["x86_64"]
 "/kernel/src/arch/riscv64" = ["riscv64"]
-"/kernel/crates/rbpf" = ["sig-obs"]
 "/kernel/crates/kprobe" = ["sig-obs"]
 "/kernel/src/debug/kprobe" = ["sig-obs"]
 "/kernel/src/bpf" = ["sig-obs"]

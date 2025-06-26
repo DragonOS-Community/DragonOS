@@ -291,14 +291,14 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         // 如果不共享文件描述符表，则拷贝文件描述符表
         if !clone_flags.contains(CloneFlags::CLONE_FILES) {
-            let new_fd_table = current_pcb.basic().fd_table().unwrap().read().clone();
+            let new_fd_table = current_pcb.basic().try_fd_table().unwrap().read().clone();
             let new_fd_table = Arc::new(RwLock::new(new_fd_table));
             new_pcb.basic_mut().set_fd_table(Some(new_fd_table));
         } else {
             // 如果共享文件描述符表，则直接拷贝指针
             new_pcb
                 .basic_mut()
-                .set_fd_table(current_pcb.basic().fd_table().clone());
+                .set_fd_table(current_pcb.basic().try_fd_table().clone());
         }
 
         return Ok(());
@@ -321,7 +321,7 @@ impl ProcessManager {
         }
 
         // log::debug!("Just copy sighand");
-        new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers;
+        new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers.clone();
 
         if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
             flush_signal_handlers(new_pcb.clone(), false);

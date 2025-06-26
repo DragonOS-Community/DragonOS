@@ -1,3 +1,5 @@
+use core::fmt::Debug;
+
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
@@ -97,7 +99,6 @@ pub enum PtyType {
     Pts,
 }
 
-#[derive(Debug)]
 #[cast_to([sync] Device)]
 pub struct TtyDevice {
     name: String,
@@ -141,6 +142,14 @@ impl TtyDevice {
             return Err(SystemError::EIO);
         };
         Ok(tty)
+    }
+}
+
+impl Debug for TtyDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TtyDevice")
+            .field("name", &self.name)
+            .finish()
     }
 }
 

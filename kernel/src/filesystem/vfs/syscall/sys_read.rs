@@ -2,6 +2,7 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READ;
+use crate::filesystem::vfs::file::FileMode;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -93,13 +94,16 @@ pub(super) fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 
-    let file = fd_table_guard.get_file_by_fd_and_check(fd);
-    if file.is_none() {
-        return Err(SystemError::EBADF);
-    }
+    let file = fd_table_guard
+        .get_file_by_fd(fd)
+        .ok_or(SystemError::EBADF)?;
+
     // drop guard 以避免无法调度的问题
     drop(fd_table_guard);
-    let file = file.unwrap();
+
+    if file.mode().contains(FileMode::O_PATH) {
+        return Err(SystemError::EBADF);
+    }
 
     return file.read(buf.len(), buf);
 }

@@ -616,25 +616,6 @@ impl FileDescriptorVec {
         self.fds[fd as usize].clone()
     }
 
-    /// 根据文件描述符序号，获取文件结构体的Arc指针，并检查文件模式是不为O_PATH
-    ///
-    /// ## 参数
-    ///
-    /// - `fd` 文件描述符序号
-    pub fn get_file_by_fd_and_check(&self, fd: i32) -> Option<Arc<File>> {
-        if !FileDescriptorVec::validate_fd(fd) {
-            return None;
-        }
-
-        let file = self.fds[fd as usize].clone();
-        if file.is_some() && file.as_ref().unwrap().mode().contains(FileMode::O_PATH) {
-            // 如果文件是O_PATH模式，则返回None
-            return None;
-        }
-
-        return file;
-    }
-
     /// 释放文件描述符，同时关闭文件。
     ///
     /// ## 参数

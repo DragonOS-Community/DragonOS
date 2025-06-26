@@ -12,9 +12,9 @@ use alloc::sync::Arc;
 /// - start: 偏移量
 pub fn truncate_inode_pages(page_cache: Arc<PageCache>, start: usize) {
     let guard = page_cache.lock_irqsave();
-    let pages_size = guard.pages_size();
+    let pages_count = guard.pages_count();
 
-    for i in start..pages_size {
+    for i in start..pages_count {
         let page = guard.get_page(i);
         let page = if let Some(page) = page {
             page

@@ -313,7 +313,7 @@ impl InnerPageCache {
         Ok(())
     }
 
-    pub fn pages_size(&self) -> usize {
+    pub fn pages_count(&self) -> usize {
         return self.pages.len();
     }
 }

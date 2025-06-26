@@ -30,6 +30,7 @@ use crate::{
     driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
     filesystem::{
+        fs::FsStruct,
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
@@ -56,7 +57,6 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    namespaces::{mnt_namespace::FsStruct, pid_namespace::PidStrcut, NsProxy},
     net::socket::SocketInode,
     sched::{
         completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
@@ -697,8 +697,6 @@ pub struct ProcessControlBlock {
     pid: Pid,
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
     tgid: Pid,
-    /// 有关Pid的相关的信息
-    thread_pid: Arc<RwLock<PidStrcut>>,
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
@@ -744,9 +742,6 @@ pub struct ProcessControlBlock {
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
-
-    /// namespace的指针
-    nsproxy: Arc<RwLock<NsProxy>>,
 
     /// 进程作为主体的凭证集
     cred: SpinLock<Cred>,
@@ -826,7 +821,6 @@ impl ProcessControlBlock {
             let pcb = Self {
                 pid,
                 tgid: pid,
-                thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
                 basic: basic_info,
                 preempt_count,
                 flags,
@@ -846,7 +840,6 @@ impl ProcessControlBlock {
                 fs: RwLock::new(Arc::new(FsStruct::new())),
                 alarm_timer: SpinLock::new(None),
                 robust_list: RwLock::new(None),
-                nsproxy: Arc::new(RwLock::new(NsProxy::new())),
                 cred: SpinLock::new(cred),
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
@@ -1019,11 +1012,6 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn pid(&self) -> Pid {
         return self.pid;
-    }
-
-    #[inline(always)]
-    pub fn pid_strcut(&self) -> Arc<RwLock<PidStrcut>> {
-        self.thread_pid.clone()
     }
 
     #[inline(always)]
@@ -1205,14 +1193,6 @@ impl ProcessControlBlock {
 
     pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<Option<AlarmTimer>> {
         return self.alarm_timer.lock_irqsave();
-    }
-
-    pub fn get_nsproxy(&self) -> Arc<RwLock<NsProxy>> {
-        self.nsproxy.clone()
-    }
-
-    pub fn set_nsproxy(&self, nsprsy: NsProxy) {
-        *self.nsproxy.write() = nsprsy;
     }
 
     /// Exit fd table when process exit

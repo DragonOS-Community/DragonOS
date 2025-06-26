@@ -72,6 +72,6 @@ pub fn do_truncate(path: *const u8, length: usize) -> Result<usize, SystemError>
         return Err(SystemError::EINVAL);
     }
     // TODO!: 添加权限检查 目前暂时认为都可进行truncate
-    inode.truncate(length)?;
+    inode.resize(length)?;
     Ok(0)
 }

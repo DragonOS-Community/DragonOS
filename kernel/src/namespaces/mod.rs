@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use mnt_namespace::{FsStruct, MntNamespace};
+use mnt_namespace::FsStruct;
 use pid_namespace::PidNamespace;
 use system_error::SystemError;
 use user_namespace::UserNamespace;
@@ -26,7 +26,6 @@ pub struct NsSet {
 #[derive(Debug, Clone)]
 pub struct NsProxy {
     pub pid_namespace: Arc<PidNamespace>,
-    pub mnt_namespace: Arc<MntNamespace>,
 }
 impl Default for NsProxy {
     fn default() -> Self {
@@ -38,15 +37,10 @@ impl NsProxy {
     pub fn new() -> Self {
         Self {
             pid_namespace: Arc::new(PidNamespace::new()),
-            mnt_namespace: Arc::new(MntNamespace::new()),
         }
     }
     pub fn set_pid_namespace(&mut self, new_pid_ns: Arc<PidNamespace>) {
         self.pid_namespace = new_pid_ns;
-    }
-
-    pub fn set_mnt_namespace(&mut self, new_mnt_ns: Arc<MntNamespace>) {
-        self.mnt_namespace = new_mnt_ns;
     }
 }
 
@@ -66,14 +60,6 @@ pub fn create_new_namespaces(
         pcb.get_nsproxy().read().pid_namespace.clone()
     };
     nsproxy.set_pid_namespace(new_pid_ns);
-
-    // mnt_namespace
-    let new_mnt_ns = if clone_flags & CloneFlags::CLONE_NEWNS.bits() != 0 {
-        Arc::new(MntNamespace::new().create_mnt_namespace(user_ns.clone(), false)?)
-    } else {
-        pcb.get_nsproxy().read().mnt_namespace.clone()
-    };
-    nsproxy.set_mnt_namespace(new_mnt_ns);
 
     Ok(nsproxy)
 }

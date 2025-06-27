@@ -185,8 +185,12 @@ impl SmpCpuManager {
         return old_state;
     }
 
-    pub fn set_online_cpu(&self, cpu_id: ProcessorId) {
-        unsafe { self.set_cpuhp_state(cpu_id, CpuHpState::Online) };
+    pub fn set_online_cpu(&self, cpu_id: ProcessorId, is_online: bool) {
+        if is_online {
+            unsafe { self.set_cpuhp_state(cpu_id, CpuHpState::Online) };
+        } else {
+            unsafe { self.set_cpuhp_state(cpu_id, CpuHpState::Offline) };
+        }
     }
 
     /// 获取出现在系统中的CPU

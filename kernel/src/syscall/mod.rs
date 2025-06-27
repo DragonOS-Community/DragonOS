@@ -192,14 +192,6 @@ impl Syscall {
                 crate::mm::syscall::sys_sbrk::sys_sbrk(incr)
             }
 
-            SYS_REBOOT => {
-                let magic1 = args[0] as u32;
-                let magic2 = args[1] as u32;
-                let cmd = args[2] as u32;
-                let arg = args[3];
-                Self::reboot(magic1, magic2, cmd, arg)
-            }
-
             SYS_CHDIR => {
                 let r = args[0] as *const u8;
                 Self::chdir(r)

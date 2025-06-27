@@ -1646,9 +1646,6 @@ impl IndexNode for LockedFATInode {
         Ok(())
     }
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        if let Some(page_cache) = self.page_cache() {
-            return page_cache.lock_irqsave().resize(len);
-        }
 
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();

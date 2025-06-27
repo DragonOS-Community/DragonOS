@@ -32,6 +32,7 @@ pub mod no_init;
 pub mod page;
 pub mod percpu;
 pub mod syscall;
+pub mod truncate;
 pub mod ucontext;
 
 /// 内核INIT进程的用户地址空间结构体（仅在process_init中初始化）

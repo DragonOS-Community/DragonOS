@@ -3,6 +3,7 @@ pub mod devpts;
 pub mod epoll;
 pub mod eventfd;
 pub mod fat;
+pub mod fs;
 pub mod kernfs;
 pub mod mbr;
 pub mod overlayfs;

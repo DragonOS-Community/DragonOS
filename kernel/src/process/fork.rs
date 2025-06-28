@@ -11,7 +11,6 @@ use crate::{
     ipc::signal::flush_signal_handlers,
     libs::rwlock::RwLock,
     mm::VirtAddr,
-    namespaces::{create_new_namespaces, namespace::USER_NS, pid_namespace::PidStrcut},
     process::ProcessFlags,
     sched::{sched_cgroup_fork, sched_fork},
     smp::core::smp_get_processor_id,
@@ -256,34 +255,6 @@ impl ProcessManager {
     }
 
     #[inline(never)]
-    fn copy_namespaces(
-        clone_flags: &CloneFlags,
-        current_pcb: &Arc<ProcessControlBlock>,
-        new_pcb: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
-        if !clone_flags.contains(CloneFlags::CLONE_NEWNS)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWUTS)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWIPC)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWPID)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWNET)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWCGROUP)
-        {
-            new_pcb.set_nsproxy(current_pcb.get_nsproxy().read().clone());
-            return Ok(());
-        }
-
-        if clone_flags.contains(CloneFlags::CLONE_NEWIPC)
-            && clone_flags.contains(CloneFlags::CLONE_SYSVSEM)
-        {
-            return Err(SystemError::EINVAL);
-        }
-
-        let new_nsproxy = create_new_namespaces(clone_flags.bits(), current_pcb, USER_NS.clone())?;
-        *new_pcb.nsproxy.write() = new_nsproxy;
-        Ok(())
-    }
-
-    #[inline(never)]
     fn copy_files(
         clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
@@ -457,11 +428,6 @@ impl ProcessManager {
             )
         });
 
-        Self::copy_namespaces(&clone_flags, current_pcb, pcb).unwrap_or_else(|e|{
-            panic!("fork: Failed to copy namespace form current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e)
-        });
-
         // 拷贝文件描述符表
         Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
@@ -485,13 +451,6 @@ impl ProcessManager {
                 current_pcb.pid(), pcb.pid(), e
             )
         });
-        if current_pcb.pid() != Pid(0) {
-            let new_pid = PidStrcut::alloc_pid(
-                pcb.get_nsproxy().read().pid_namespace.clone(), // 获取命名空间
-                clone_args.set_tid.clone(),
-            )?;
-            *pcb.thread_pid.write() = new_pid;
-        }
 
         // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长

@@ -10,6 +10,7 @@ use crate::{
 use smoltcp;
 use system_error::SystemError;
 
+pub mod bridge;
 pub mod class;
 mod dma;
 pub mod e1000e;
@@ -17,6 +18,7 @@ pub mod irq_handle;
 pub mod kthread;
 pub mod loopback;
 pub mod sysfs;
+pub mod veth;
 pub mod virtio_net;
 
 bitflags! {

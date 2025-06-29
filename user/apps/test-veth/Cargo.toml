@@ -1,0 +1,11 @@
+[package]
+name = "test-veth"
+version = "0.1.0"
+edition = "2021"
+description = "测试veth pair"
+authors = [ "sparkzky <sparkhhhhhhhhhh@outlook.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+smoltcp = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp.git", rev = "3e61c909fd540d05575068d16dc4574e196499ed", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6", "medium-ip"]}

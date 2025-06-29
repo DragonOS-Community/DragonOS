@@ -4,7 +4,7 @@
 
    - Source document: kernel/filesystem/vfs/index.rst
 
-   - Translation time: 2025-05-19 01:41:14
+   - Translation time: 2025-06-29 09:05:52
 
    - Translation model: `Qwen/Qwen3-8B`
 
@@ -14,9 +14,9 @@
 VFS Virtual File System
 ====================================
 
-In DragonOS, VFS acts as an adapter, hiding the differences between specific file systems and providing a unified file operation interface abstraction to the outside.
+In DragonOS, VFS acts as an adapter, hiding the differences between specific file systems and providing a unified abstract interface for file operations.
 
-VFS is the core of the file system in DragonOS. It provides a set of unified file system interfaces, enabling DragonOS to support various different file systems. The main functions of VFS include:
+VFS is the core of DragonOS's file system, offering a set of unified file system interfaces that allow DragonOS to support various different file systems. The main functions of VFS include:
 
 - Providing a unified file system interface
 - Providing mount and unmount mechanisms for file systems (MountFS)
@@ -24,6 +24,7 @@ VFS is the core of the file system in DragonOS. It provides a set of unified fil
 - Providing file system abstraction (FileSystem)
 - Providing IndexNode abstraction
 - Providing caching and synchronization mechanisms for file systems (not yet implemented)
+- Supporting the mounting of disk devices into the file system (currently supports EXT4 and vfat types of virtio disks)
 
 .. toctree::
    :maxdepth: 1
@@ -31,3 +32,4 @@ VFS is the core of the file system in DragonOS. It provides a set of unified fil
 
    design
    api
+   mountable_fs

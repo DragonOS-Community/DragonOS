@@ -72,6 +72,7 @@ use crate::{
 use timer::AlarmTimer;
 
 use self::{cred::Cred, kthread::WorkerPrivate};
+use crate::process::namespace::nsproxy::NsProxy;
 
 pub mod abi;
 pub mod cred;
@@ -82,6 +83,7 @@ pub mod fork;
 pub mod geteuid;
 pub mod idle;
 pub mod kthread;
+pub mod namespace;
 pub mod pid;
 pub mod process_group;
 pub mod resource;
@@ -697,6 +699,10 @@ pub struct ProcessControlBlock {
     pid: Pid,
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
     tgid: Pid,
+
+    /// namespace代理
+    nsproxy: RwLock<Arc<NsProxy>>,
+
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
@@ -818,9 +824,20 @@ impl ProcessControlBlock {
         // 使用 Arc::new_cyclic 避免在栈上创建巨大的结构体
         let pcb = Arc::new_cyclic(|weak| {
             let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
+
+            // 初始化namespace代理
+            let nsproxy = if is_idle {
+                // idle进程使用root namespace
+                NsProxy::new_root()
+            } else {
+                // 其他进程继承父进程的namespace
+                ProcessManager::current_pcb().nsproxy().clone()
+            };
+
             let pcb = Self {
                 pid,
                 tgid: pid,
+                nsproxy: RwLock::new(nsproxy),
                 basic: basic_info,
                 preempt_count,
                 flags,
@@ -1234,6 +1251,16 @@ impl ProcessControlBlock {
             .inner_lock_read_irqsave()
             .state()
             .is_exited()
+    }
+
+    /// 获取进程的namespace代理
+    pub fn nsproxy(&self) -> Arc<NsProxy> {
+        self.nsproxy.read().clone()
+    }
+
+    /// 设置进程的namespace代理
+    pub fn set_nsproxy(&self, nsproxy: Arc<NsProxy>) {
+        *self.nsproxy.write() = nsproxy;
     }
 }
 

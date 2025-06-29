@@ -26,6 +26,7 @@ const MAX_PID_NS_LEVEL: usize = 32;
 bitflags! {
     /// 进程克隆标志
     pub struct CloneFlags: u64 {
+        const CLONE_NEWTIME = 0x00000080;
         /// 在进程间共享虚拟内存空间
         const CLONE_VM = 0x00000100;
         /// 在进程间共享文件系统信息
@@ -440,6 +441,14 @@ impl ProcessManager {
         Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
+
+        // 拷贝namespace
+        Self::copy_namespaces(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy namespaces from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
             )
         });

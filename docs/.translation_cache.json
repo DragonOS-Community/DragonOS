@@ -69,7 +69,7 @@
     "hash": "1b0b3fe0cc2918cc2c53a5af392a96ff"
   },
   "en:kernel/filesystem/vfs/index.rst": {
-    "hash": "d0de5d78a2105a1ecfe4ef137c18f7f5"
+    "hash": "ab891fde3149c7b4f28cf2197584e1eb"
   },
   "en:kernel/debug/profiling-kernel-with-dadk.md": {
     "hash": "966d07272ad19e1afbdc64bb6cfcea73"
@@ -274,5 +274,8 @@
   },
   "en:kernel/trace/tracepoint.md": {
     "hash": "18a5f586ca3e3ffbdec6ceeac34eba9c"
+  },
+  "en:kernel/filesystem/vfs/mountable_fs.md": {
+    "hash": "d2ba6ab80dfbc436408ee23e81bbe2ae"
   }
 }

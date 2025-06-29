@@ -36,17 +36,10 @@ jobs:
       - name: Run document translator
         run: python tools/doc_translator.py
         env:
-          MAX_WORKERS: 20
+          MAX_WORKERS: 5
           OPENAI_API_KEY: ${{ secrets.DRAGONOS_OPENAI_API_KEY }}
-          OPENAI_MODEL: Qwen/Qwen3-8B
+          OPENAI_MODEL: hunyuan-turbos-latest
           OPENAI_BASE_URL: ${{ secrets.DRAGONOS_OPENAI_API_BASE }}
-
-      - name: Commit translated files
-        run: |
-          git config --global user.name "dragonosbot"
-          git config --global user.email "bot@dragonos.org"
-          git add docs/locales/
-          git commit -m "Update translated documentation" || echo "No changes to commit"
 
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v5

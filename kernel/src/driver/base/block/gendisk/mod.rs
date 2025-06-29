@@ -11,7 +11,7 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
-    driver::base::device::{device_number::DeviceNumber, DevName},
+    driver::base::device::device_number::DeviceNumber,
     filesystem::{
         devfs::{DevFS, DeviceINode},
         vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
@@ -21,7 +21,6 @@ use crate::{
 
 use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 
-static NEXT_MINOR_BASE: AtomicU32 = AtomicU32::new(0);
 const MINORS_PER_DISK: u32 = 256;
 
 #[derive(Debug)]
@@ -37,8 +36,6 @@ pub struct GenDisk {
     metadata: Metadata,
     /// 对应/dev/下的设备名
     name: DName,
-
-    base_minor: u32,
 }
 
 impl GenDisk {
@@ -49,38 +46,22 @@ impl GenDisk {
         bdev: Weak<dyn BlockDevice>,
         range: GeneralBlockRange,
         idx: Option<u32>,
-        dev_name: &DevName,
+        dev_name: DName,
     ) -> Arc<Self> {
         let bsizelog2 = bdev.upgrade().unwrap().blk_size_log2();
-        let index;
-        let name = match idx {
-            Some(Self::ENTIRE_DISK_IDX) => {
-                index = 0;
-                DName::from(dev_name.name())
-            }
-            Some(idx) => {
-                index = idx;
-                DName::from(format!("{}{}", dev_name.name(), idx))
-            }
-            None => {
-                index = 0;
-                DName::from(dev_name.name())
-            }
-        };
 
-        if index >= MINORS_PER_DISK {
-            panic!("GenDisk index out of range: {}", index);
+        // 对应整块硬盘的情况
+        let id = idx.unwrap_or(0);
+        if id >= MINORS_PER_DISK {
+            panic!("GenDisk index out of range: {}", id);
         }
         let ptr = bdev.upgrade().unwrap();
         let meta = ptr.blkdev_meta();
         let major = meta.major;
 
-        let base = NEXT_MINOR_BASE.load(Ordering::SeqCst);
-        NEXT_MINOR_BASE.fetch_add(MINORS_PER_DISK, Ordering::SeqCst);
-
-        let base_minor = base + index as u32;
-        // log::info!("New gendisk: major: {}, minor: {}", major, base_minor);
-        let device_num = DeviceNumber::new(major, base_minor);
+        let minor = meta.base_minor * MINORS_PER_DISK + id;
+        // log::info!("New gendisk: major: {}, minor: {}", major, minor);
+        let device_num = DeviceNumber::new(major, minor);
 
         return Arc::new(GenDisk {
             bdev,
@@ -93,8 +74,7 @@ impl GenDisk {
                 crate::filesystem::vfs::FileType::BlockDevice,
                 ModeType::from_bits_truncate(0o755),
             ),
-            name,
-            base_minor,
+            name: dev_name,
         });
     }
 
@@ -207,8 +187,8 @@ impl GenDisk {
     }
 
     #[inline]
-    pub fn base_minor(&self) -> u32 {
-        self.base_minor
+    pub fn minor(&self) -> u32 {
+        self.device_num.minor()
     }
 
     /// # sync

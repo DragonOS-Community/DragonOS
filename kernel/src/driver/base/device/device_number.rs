@@ -1,3 +1,5 @@
+use core::hash::{Hash, Hasher};
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Major(u32);
 
@@ -35,6 +37,12 @@ impl Major {
     }
     pub const fn data(&self) -> u32 {
         self.0
+    }
+}
+
+impl Hash for Major {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state); // 使用 Major 内部的 u32 值来计算哈希值
     }
 }
 

@@ -491,7 +491,7 @@ impl Syscall {
                     Err(e)
                 } else {
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf, size) };
-                    Self::getcwd(buf).map(|ptr| ptr.data())
+                    Self::getcwd(buf)
                 }
             }
 
@@ -816,7 +816,7 @@ impl Syscall {
                 let flags = args[1] as u32;
                 Self::sys_eventfd(initval, flags)
             }
-            SYS_UNSHARE => Self::sys_unshare(args[0] as u64),
+
             SYS_BPF => {
                 let cmd = args[0] as u32;
                 let attr = args[1] as *mut u8;

@@ -334,11 +334,11 @@ impl<'a> UserBufferWriter<'a> {
     }
 
     fn convert_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut [T], SystemError> {
-        if offset >= src.len() {
+        if offset > src.len() {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &mut [u8] = &mut src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 || byte_buffer.is_empty() {
+        if byte_buffer.len() % core::mem::size_of::<T>() != 0 {
             return Err(SystemError::EINVAL);
         }
 

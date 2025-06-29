@@ -67,7 +67,6 @@ mod init;
 mod ipc;
 mod misc;
 mod mm;
-mod namespaces;
 mod net;
 mod perf;
 mod process;

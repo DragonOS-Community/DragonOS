@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::process::{fork::CloneFlags, ProcessControlBlock, ProcessManager};
-use core::{fmt::Debug, intrinsics::likely};
+use core::{fmt::Debug, intrinsics::likely, sync::atomic::AtomicIsize};
 
 use super::pid_namespace::PidNamespace;
 
@@ -119,4 +119,10 @@ fn create_new_namespaces(
 
     let result = Arc::new(result);
     return Ok(result);
+}
+
+/// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/ns_common.h#9
+pub struct NsCommon {
+    pub stashed: AtomicIsize,
+    // todo: 添加其他公共字段
 }

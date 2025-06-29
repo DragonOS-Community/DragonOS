@@ -14,7 +14,10 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    filesystem::{page_cache::PageCache, vfs::ROOT_INODE},
+    filesystem::{
+        page_cache::PageCache,
+        vfs::{fcntl::AtFlags, vcore::do_mkdir_at, ROOT_INODE},
+    },
     libs::{
         casting::DowncastArc,
         rwlock::RwLock,
@@ -763,4 +766,35 @@ pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
     }
 
     return false;
+}
+
+/// # do_mount_mkdir - 在指定挂载点创建目录并挂载文件系统
+///
+/// 在指定的挂载点创建一个目录，并将其挂载到文件系统中。如果挂载点已经存在，并且不是空的，
+/// 则会返回错误。成功时，会返回一个新的挂载文件系统的引用。
+///
+/// ## 参数
+///
+/// - `fs`: FileSystem - 文件系统的引用，用于创建和挂载目录。
+/// - `mount_point`: &str - 挂载点路径，用于创建和挂载目录。
+///
+/// ## 返回值
+///
+/// - `Ok(Arc<MountFS>)`: 成功挂载文件系统后，返回挂载文件系统的共享引用。
+/// - `Err(SystemError)`: 挂载失败时，返回系统错误。
+pub fn do_mount_mkdir(
+    fs: Arc<dyn FileSystem>,
+    mount_point: &str,
+) -> Result<Arc<MountFS>, SystemError> {
+    let inode = do_mkdir_at(
+        AtFlags::AT_FDCWD.bits(),
+        mount_point,
+        FileMode::from_bits_truncate(0o755),
+    )?;
+    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
+        if rest.is_empty() {
+            return Err(SystemError::EBUSY);
+        }
+    }
+    return inode.mount(fs);
 }

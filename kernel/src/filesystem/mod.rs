@@ -2,6 +2,7 @@ pub mod devfs;
 pub mod devpts;
 pub mod epoll;
 pub mod eventfd;
+pub mod ext4;
 pub mod fat;
 pub mod fs;
 pub mod kernfs;

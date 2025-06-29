@@ -13,24 +13,18 @@ use crate::{
         procfs::procfs_init,
         ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{
-            mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType, MAX_PATHLEN,
-        },
+        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
-    libs::spinlock::SpinLock,
     mm::truncate::truncate_inode_pages,
     process::ProcessManager,
-    syscall::user_access::check_and_clone_cstr,
 };
 
 use super::{
-    fcntl::AtFlags,
     file::FileMode,
-    mount::{init_mountlist, MOUNT_LIST},
+    mount::init_mountlist,
     stat::LookUpFlags,
-    syscall::UmountFlag,
     utils::{rsplit_path, user_path_at},
-    FilePrivateData, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表
@@ -124,9 +118,9 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
-fn try_find_gendisk_as_rootfs(path: &str) -> Option<Arc<GenDisk>> {
+pub(crate) fn try_find_gendisk(path: &str) -> Option<Arc<GenDisk>> {
     if let Some(gd) = block_dev_manager().lookup_gendisk_by_path(path) {
-        info!("Use {} as rootfs", path);
+        // info!("Use {} as rootfs", path);
         return Some(gd);
     }
     return None;
@@ -136,12 +130,12 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount root fs...");
     block_dev_manager().print_gendisks();
     let gendisk = if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM.value_str() {
-        try_find_gendisk_as_rootfs(rootfs_dev_path)
+        try_find_gendisk(rootfs_dev_path)
             .unwrap_or_else(|| panic!("Failed to find rootfs device {}", rootfs_dev_path))
     } else {
         ROOTFS_TRY_LIST
             .iter()
-            .find_map(|&path| try_find_gendisk_as_rootfs(path))
+            .find_map(|&path| try_find_gendisk(path))
             .ok_or(SystemError::ENODEV)?
     };
 
@@ -157,6 +151,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     }
     let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
     let r = migrate_virtual_filesystem(fatfs);
+
     if r.is_err() {
         error!("Failed to migrate virtual filesyst  em to FAT32!");
         loop {
@@ -284,147 +279,6 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     }
 
     return Ok(0);
-}
-
-pub fn do_symlinkat(from: *const u8, newdfd: i32, to: *const u8) -> Result<usize, SystemError> {
-    let oldname = check_and_clone_cstr(from, Some(MAX_PATHLEN))?
-        .into_string()
-        .map_err(|_| SystemError::EINVAL)?;
-    let newname = check_and_clone_cstr(to, Some(MAX_PATHLEN))?
-        .into_string()
-        .map_err(|_| SystemError::EINVAL)?;
-    let from = oldname.as_str().trim();
-    let to = newname.as_str().trim();
-
-    // TODO: 添加权限检查，确保进程拥有目标路径的权限
-
-    let pcb = ProcessManager::current_pcb();
-    let (old_begin_inode, old_remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), from)?;
-    // info!("old_begin_inode={:?}", old_begin_inode.metadata());
-    let _ =
-        old_begin_inode.lookup_follow_symlink(&old_remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-
-    // 得到新创建节点的父节点
-    let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newdfd, to)?;
-    let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
-    let new_parent = new_begin_inode
-        .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    // info!("new_parent={:?}", new_parent.metadata());
-
-    if new_parent.metadata()?.file_type != FileType::Dir {
-        return Err(SystemError::ENOTDIR);
-    }
-
-    let new_inode = new_parent.create_with_data(
-        new_name,
-        FileType::SymLink,
-        ModeType::from_bits_truncate(0o777),
-        0,
-    )?;
-
-    let buf = old_remain_path.as_bytes();
-    let len = buf.len();
-    new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
-    return Ok(0);
-}
-
-/// # do_mount - 挂载文件系统
-///
-/// 将给定的文件系统挂载到指定的挂载点。
-///
-/// 此函数会检查是否已经挂载了相同的文件系统，如果已经挂载，则返回错误。
-/// 它还会处理符号链接，并确保挂载点是有效的。
-///
-/// ## 参数
-///
-/// - `fs`: Arc<dyn FileSystem>，要挂载的文件系统。
-/// - `mount_point`: &str，挂载点路径。
-///
-/// ## 返回值
-///
-/// - `Ok(Arc<MountFS>)`: 挂载成功后返回挂载的文件系统。
-/// - `Err(SystemError)`: 挂载失败时返回错误。
-pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountFS>, SystemError> {
-    let (current_node, rest_path) = user_path_at(
-        &ProcessManager::current_pcb(),
-        AtFlags::AT_FDCWD.bits(),
-        mount_point,
-    )?;
-    let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
-        if rest.is_empty() {
-            return Err(SystemError::EBUSY);
-        }
-    }
-    // 移至IndexNode.mount()来记录
-    return inode.mount(fs);
-}
-
-/// # do_mount_mkdir - 在指定挂载点创建目录并挂载文件系统
-///
-/// 在指定的挂载点创建一个目录，并将其挂载到文件系统中。如果挂载点已经存在，并且不是空的，
-/// 则会返回错误。成功时，会返回一个新的挂载文件系统的引用。
-///
-/// ## 参数
-///
-/// - `fs`: FileSystem - 文件系统的引用，用于创建和挂载目录。
-/// - `mount_point`: &str - 挂载点路径，用于创建和挂载目录。
-///
-/// ## 返回值
-///
-/// - `Ok(Arc<MountFS>)`: 成功挂载文件系统后，返回挂载文件系统的共享引用。
-/// - `Err(SystemError)`: 挂载失败时，返回系统错误。
-pub fn do_mount_mkdir(
-    fs: Arc<dyn FileSystem>,
-    mount_point: &str,
-) -> Result<Arc<MountFS>, SystemError> {
-    let inode = do_mkdir_at(
-        AtFlags::AT_FDCWD.bits(),
-        mount_point,
-        FileMode::from_bits_truncate(0o755),
-    )?;
-    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
-        if rest.is_empty() {
-            return Err(SystemError::EBUSY);
-        }
-    }
-    return inode.mount(fs);
-}
-
-/// # do_umount2 - 执行卸载文件系统的函数
-///
-/// 这个函数用于卸载指定的文件系统。
-///
-/// ## 参数
-///
-/// - dirfd: i32 - 目录文件描述符，用于指定要卸载的文件系统的根目录。
-/// - target: &str - 要卸载的文件系统的目标路径。
-/// - _flag: UmountFlag - 卸载标志，目前未使用。
-///
-/// ## 返回值
-///
-/// - Ok(Arc<MountFS>): 成功时返回文件系统的 Arc 引用。
-/// - Err(SystemError): 出错时返回系统错误。
-///
-/// ## 错误处理
-///
-/// 如果指定的路径没有对应的文件系统，或者在尝试卸载时发生错误，将返回错误。
-pub fn do_umount2(
-    dirfd: i32,
-    target: &str,
-    _flag: UmountFlag,
-) -> Result<Arc<MountFS>, SystemError> {
-    let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
-    let path = work.absolute_path()? + &rest;
-    let do_umount = || -> Result<Arc<MountFS>, SystemError> {
-        if let Some(fs) = MOUNT_LIST().remove(path) {
-            // Todo: 占用检测
-            fs.umount()?;
-            return Ok(fs);
-        }
-        return Err(SystemError::EINVAL);
-    };
-    return do_umount();
 }
 
 pub(super) fn do_file_lookup_at(

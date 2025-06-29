@@ -3,11 +3,25 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+};
 use hashbrown::HashMap;
 use system_error::SystemError;
 
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::{
+        devfs::{DevFS, DeviceINode},
+        vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
+    },
+    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
+};
+
 use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
+
+const MINORS_PER_DISK: u32 = 256;
 
 #[derive(Debug)]
 pub struct GenDisk {
@@ -15,6 +29,13 @@ pub struct GenDisk {
     range: GeneralBlockRange,
     block_size_log2: u8,
     idx: Option<u32>,
+
+    device_num: DeviceNumber,
+
+    fs: RwLock<Weak<DevFS>>,
+    metadata: Metadata,
+    /// 对应/dev/下的设备名
+    name: DName,
 }
 
 impl GenDisk {
@@ -25,14 +46,35 @@ impl GenDisk {
         bdev: Weak<dyn BlockDevice>,
         range: GeneralBlockRange,
         idx: Option<u32>,
+        dev_name: DName,
     ) -> Arc<Self> {
         let bsizelog2 = bdev.upgrade().unwrap().blk_size_log2();
+
+        // 对应整块硬盘的情况
+        let id = idx.unwrap_or(0);
+        if id >= MINORS_PER_DISK {
+            panic!("GenDisk index out of range: {}", id);
+        }
+        let ptr = bdev.upgrade().unwrap();
+        let meta = ptr.blkdev_meta();
+        let major = meta.major;
+
+        let minor = meta.base_minor * MINORS_PER_DISK + id;
+        // log::info!("New gendisk: major: {}, minor: {}", major, minor);
+        let device_num = DeviceNumber::new(major, minor);
 
         return Arc::new(GenDisk {
             bdev,
             range,
             block_size_log2: bsizelog2,
             idx,
+            device_num,
+            fs: RwLock::new(Weak::default()),
+            metadata: Metadata::new(
+                crate::filesystem::vfs::FileType::BlockDevice,
+                ModeType::from_bits_truncate(0o755),
+            ),
+            name: dev_name,
         });
     }
 
@@ -120,7 +162,7 @@ impl GenDisk {
     }
 
     #[inline]
-    fn block_offset_2_disk_blkid(&self, block_offset: BlockId) -> BlockId {
+    pub fn block_offset_2_disk_blkid(&self, block_offset: BlockId) -> BlockId {
         self.range.lba_start + block_offset
     }
 
@@ -139,10 +181,72 @@ impl GenDisk {
         &self.range
     }
 
+    #[inline]
+    pub fn device_num(&self) -> DeviceNumber {
+        self.device_num
+    }
+
+    #[inline]
+    pub fn minor(&self) -> u32 {
+        self.device_num.minor()
+    }
+
     /// # sync
     /// 同步磁盘
     pub fn sync(&self) -> Result<(), SystemError> {
         self.block_device().sync()
+    }
+
+    pub fn symlink_name(&self) -> String {
+        let major = self.device_num.major().data();
+        let minor = self.device_num.minor();
+        format!("{}:{}", major, minor)
+    }
+
+    pub fn block_size_log2(&self) -> u8 {
+        self.block_size_log2
+    }
+}
+
+impl IndexNode for GenDisk {
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        self.fs.read().upgrade().unwrap()
+    }
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EPERM)
+    }
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EPERM)
+    }
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        Ok(self.metadata.clone())
+    }
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.name.clone())
+    }
+}
+
+impl DeviceINode for GenDisk {
+    fn set_fs(&self, fs: alloc::sync::Weak<crate::filesystem::devfs::DevFS>) {
+        *self.fs.write() = fs;
     }
 }
 

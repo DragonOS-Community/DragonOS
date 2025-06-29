@@ -3,12 +3,15 @@ pub mod copy_up;
 pub mod entry;
 
 use super::ramfs::{LockedRamFSInode, RamFSInode};
-use super::vfs::{self, FileSystem, FileType, FsInfo, IndexNode, Metadata, SuperBlock};
+use super::vfs::{
+    self, FileSystem, FileType, FsInfo, IndexNode, Metadata, MountableFileSystem, SuperBlock,
+};
 use super::vfs::{FSMAKER, ROOT_INODE};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::driver::base::device::device_number::Major;
 use crate::filesystem::vfs::{FileSystemMaker, FileSystemMakerData};
 use crate::libs::spinlock::SpinLock;
+use crate::register_mountable_fs;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
@@ -21,14 +24,6 @@ const WHITEOUT_MODE: u64 = 0o020000 | 0o600; // whiteout字符设备文件模式
 const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0); // Whiteout 文件设备号
 const WHITEOUT_FLAG: u64 = 0x1;
 
-#[distributed_slice(FSMAKER)]
-static OVERLAYFSMAKER: FileSystemMaker = FileSystemMaker::new(
-    "overlay",
-    &(OverlayFS::make_overlayfs
-        as fn(
-            Option<&dyn FileSystemMakerData>,
-        ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
-);
 #[derive(Debug)]
 pub struct OverlayMountData {
     upper_dir: String,
@@ -37,15 +32,11 @@ pub struct OverlayMountData {
 }
 
 impl OverlayMountData {
-    pub fn from_row(raw_data: *const u8) -> Result<Self, SystemError> {
-        if raw_data.is_null() {
+    pub fn from_raw(raw_data: Option<&str>) -> Result<Self, SystemError> {
+        if raw_data.is_none() {
             return Err(SystemError::EINVAL);
         }
-        let len = (0..)
-            .find(|&i| unsafe { raw_data.add(i).read() } == 0)
-            .ok_or(SystemError::EINVAL)?;
-        let slice = unsafe { core::slice::from_raw_parts(raw_data, len) };
-        let raw_str = core::str::from_utf8(slice).map_err(|_| SystemError::EINVAL)?;
+        let raw_str = raw_data.unwrap();
         let mut data = OverlayMountData {
             upper_dir: String::new(),
             lower_dirs: Vec::new(),
@@ -146,7 +137,10 @@ impl OverlayFS {
     pub fn ovl_upper_mnt(&self) -> Arc<dyn IndexNode> {
         self.layers[0].mnt.clone()
     }
-    pub fn make_overlayfs(
+}
+
+impl MountableFileSystem for OverlayFS {
+    fn make_fs(
         data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
         let mount_data = data
@@ -204,7 +198,20 @@ impl OverlayFS {
         };
         Ok(Arc::new(fs))
     }
+
+    fn make_mount_data(
+        raw_data: Option<&str>,
+        _source: &str,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        let mount_data = OverlayMountData::from_raw(raw_data).map_err(|e| {
+            log::error!("Failed to create overlay mount data: {:?}", e);
+            e
+        })?;
+        Ok(Some(Arc::new(mount_data)))
+    }
 }
+
+register_mountable_fs!(OverlayFS, OVERLAYFSMAKER, "overlay");
 
 impl OvlInode {
     pub fn ovl_lower_redirect(&self) -> Option<&str> {

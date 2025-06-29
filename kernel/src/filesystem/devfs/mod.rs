@@ -10,7 +10,7 @@ use super::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
-    driver::base::device::device_number::DeviceNumber,
+    driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
     libs::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
@@ -174,7 +174,23 @@ impl DevFS {
                     .downcast_ref::<LockedDevFSInode>()
                     .unwrap();
 
-                dev_block_inode.add_dev(name, device.clone())?;
+                if name.starts_with("vd") && name.len() > 2 {
+                    // 虚拟磁盘设备挂载在 /dev 下
+                    dev_root_inode.add_dev(name, device.clone())?;
+                    let path = format!("/dev/{}", name);
+                    let symlink_name = device
+                        .as_any_ref()
+                        .downcast_ref::<GenDisk>()
+                        .unwrap()
+                        .symlink_name();
+
+                    dev_block_inode.add_dev_symlink(&path, &symlink_name)?;
+                } else if name.starts_with("nvme") {
+                    // NVMe设备挂载在 /dev 下
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else {
+                    dev_block_inode.add_dev(name, device.clone())?;
+                }
                 device.set_fs(dev_block_inode.0.lock().fs.clone());
             }
             FileType::KvmDevice => {
@@ -258,6 +274,8 @@ pub struct DevFSInode {
     metadata: Metadata,
     /// 目录名
     dname: DName,
+    /// 当前inode的数据部分(仅供symlink使用)
+    data: Vec<u8>,
 }
 
 impl DevFSInode {
@@ -294,6 +312,7 @@ impl DevFSInode {
             },
             fs: Weak::default(),
             dname: DName::default(),
+            data: Vec::new(),
         };
     }
 }
@@ -333,6 +352,28 @@ impl LockedDevFSInode {
         return Ok(());
     }
 
+    /// # 在devfs中添加一个符号链接
+    ///
+    /// ## 参数
+    /// - `path`: 符号链接指向的路径
+    /// - `symlink_name`: 符号链接的名称
+    pub fn add_dev_symlink(&self, path: &str, symlink_name: &str) -> Result<(), SystemError> {
+        let new_inode = self.create_with_data(
+            symlink_name,
+            FileType::SymLink,
+            ModeType::from_bits_truncate(0o777),
+            0,
+        )?;
+
+        let buf = path.as_bytes();
+        let len = buf.len();
+        new_inode
+            .downcast_ref::<LockedDevFSInode>()
+            .unwrap()
+            .write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
+        Ok(())
+    }
+
     pub fn remove(&self, name: &str) -> Result<(), SystemError> {
         let x = self
             .0
@@ -351,7 +392,7 @@ impl LockedDevFSInode {
         name: &str,
         file_type: FileType,
         mode: ModeType,
-        data: usize,
+        dev: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -382,10 +423,11 @@ impl LockedDevFSInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: DeviceNumber::from(data as u32),
+                raw_dev: DeviceNumber::from(dev as u32),
             },
             fs: guard.fs.clone(),
             dname: name.clone(),
+            data: Vec::new(),
         })));
 
         // 初始化inode的自引用的weak指针
@@ -541,27 +583,84 @@ impl IndexNode for LockedDevFSInode {
         return Ok(());
     }
 
-    /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写
+    /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写，仅支持符号链接的读取
     fn read_at(
         &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        error!("DevFS: read_at is not supported!");
-        Err(SystemError::ENOSYS)
+        let meta = self.metadata()?;
+        match meta.file_type {
+            FileType::SymLink => {
+                if buf.len() < len {
+                    return Err(SystemError::EINVAL);
+                }
+                // 加锁
+                let inode = self.0.lock();
+
+                // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
+                if inode.metadata.file_type == FileType::Dir {
+                    return Err(SystemError::EISDIR);
+                }
+
+                let start = inode.data.len().min(offset);
+                let end = inode.data.len().min(offset + len);
+
+                // buffer空间不足
+                if buf.len() < (end - start) {
+                    return Err(SystemError::ENOBUFS);
+                }
+
+                // 拷贝数据
+                let src = &inode.data[start..end];
+                buf[0..src.len()].copy_from_slice(src);
+                return Ok(src.len());
+            }
+            _ => {
+                error!("DevFS: read_at is not supported!");
+                Err(SystemError::ENOSYS)
+            }
+        }
     }
 
-    /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
+    /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写，仅支持符号链接的写入
     fn write_at(
         &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &[u8],
+        offset: usize,
+        len: usize,
+        buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+        let meta = self.metadata()?;
+        match meta.file_type {
+            FileType::SymLink => {
+                if buf.len() < len {
+                    return Err(SystemError::EINVAL);
+                }
+                let mut inode = self.0.lock();
+
+                if inode.metadata.file_type == FileType::Dir {
+                    return Err(SystemError::EISDIR);
+                }
+
+                let data: &mut Vec<u8> = &mut inode.data;
+
+                // 如果文件大小比原来的大，那就resize这个数组
+                if offset + len > data.len() {
+                    data.resize(offset + len, 0);
+                }
+
+                let target = &mut data[offset..offset + len];
+                target.copy_from_slice(&buf[0..len]);
+                return Ok(len);
+            }
+            _ => {
+                error!("DevFS: read_at is not supported!");
+                Err(SystemError::ENOSYS)
+            }
+        }
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

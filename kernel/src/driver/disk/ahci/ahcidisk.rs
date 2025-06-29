@@ -6,6 +6,7 @@ use crate::driver::base::block::manager::BlockDevMeta;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
 
+use crate::driver::base::device::device_number::Major;
 use crate::driver::base::device::driver::Driver;
 use crate::driver::base::device::{DevName, Device, DeviceType, IdTable};
 use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
@@ -381,7 +382,7 @@ impl LockedAhciDisk {
         let devname = scsi_manager().alloc_id().ok_or(SystemError::EBUSY)?;
         // 构建磁盘结构体
         let result: Arc<LockedAhciDisk> = Arc::new_cyclic(|self_ref| LockedAhciDisk {
-            blkdev_meta: BlockDevMeta::new(devname),
+            blkdev_meta: BlockDevMeta::new(devname, Major::AHCI_BLK_MAJOR),
             inner: SpinLock::new(AhciDisk {
                 partitions: Vec::new(),
                 ctrl_num,

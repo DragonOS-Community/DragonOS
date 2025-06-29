@@ -1,5 +1,4 @@
-use crate::filesystem::overlayfs::OverlayMountData;
-use crate::filesystem::vfs::{FileSystemMakerData, FilldirContext};
+use crate::filesystem::vfs::FilldirContext;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -7,11 +6,10 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use log::warn;
 use system_error::SystemError;
 
-use crate::producefs;
 use crate::syscall::user_access::UserBufferReader;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
-    filesystem::vfs::{file::FileDescriptorVec, vcore as Vcore},
+    filesystem::vfs::file::FileDescriptorVec,
     libs::rwlock::RwLockWriteGuard,
     process::ProcessManager,
     syscall::{
@@ -22,7 +20,6 @@ use crate::{
 };
 
 use super::stat::{do_newfstatat, do_statx, vfs_fstat};
-use super::vcore::do_symlinkat;
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
@@ -31,8 +28,7 @@ use super::{
     },
     utils::{rsplit_path, user_path_at},
     vcore::{do_mkdir_at, do_remove_dir, do_unlink_at},
-    FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
-    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 mod open_utils;
@@ -59,6 +55,14 @@ mod sys_epoll_ctl;
 mod sys_epoll_pwait;
 #[cfg(target_arch = "x86_64")]
 mod sys_epoll_wait;
+
+pub mod sys_mount;
+pub mod sys_umount2;
+
+pub mod symlink_utils;
+#[cfg(target_arch = "x86_64")]
+mod sys_symlink;
+mod sys_symlinkat;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -431,16 +435,6 @@ bitflags! {
         // 			return -EAGAIN if that's not
         // 			possible.
         const RESOLVE_CACHED = 0x20;
-    }
-}
-
-bitflags! {
-    pub struct UmountFlag: i32 {
-        const DEFAULT = 0;          /* Default call to umount. */
-        const MNT_FORCE = 1;        /* Force unmounting.  */
-        const MNT_DETACH = 2;       /* Just detach from the tree.  */
-        const MNT_EXPIRE = 4;       /* Mark for expiry.  */
-        const UMOUNT_NOFOLLOW = 8;  /* Don't follow symlink on umount.  */
     }
 }
 
@@ -878,18 +872,6 @@ impl Syscall {
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
-    }
-
-    pub fn symlink(oldname: *const u8, newname: *const u8) -> Result<usize, SystemError> {
-        return do_symlinkat(oldname, AtFlags::AT_FDCWD.bits(), newname);
-    }
-
-    pub fn symlinkat(
-        oldname: *const u8,
-        newdfd: i32,
-        newname: *const u8,
-    ) -> Result<usize, SystemError> {
-        return do_symlinkat(oldname, newdfd, newname);
     }
 
     /// # 修改文件名
@@ -1419,62 +1401,6 @@ impl Syscall {
 
     pub fn fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError> {
         return ksys_fchown(fd, uid, gid);
-    }
-
-    /// #挂载文件系统
-    ///
-    /// 用于挂载文件系统,目前仅支持ramfs挂载
-    ///
-    /// ## 参数:
-    ///
-    /// - source       挂载设备(暂时不支持)
-    /// - target       挂载目录
-    /// - filesystemtype   文件系统
-    /// - mountflags     挂载选项（暂未实现）
-    /// - data        带数据挂载
-    ///
-    /// ## 返回值
-    /// - Ok(0): 挂载成功
-    /// - Err(SystemError) :挂载过程中出错
-    pub fn mount(
-        _source: *const u8,
-        target: *const u8,
-        filesystemtype: *const u8,
-        _mountflags: usize,
-        data: *const u8,
-    ) -> Result<usize, SystemError> {
-        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        let fstype_str = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
-        let fstype_str = fstype_str.to_str().map_err(|_| SystemError::EINVAL)?;
-
-        let fstype = producefs!(FSMAKER, fstype_str, data)?;
-
-        Vcore::do_mount(fstype, &target)?;
-
-        return Ok(0);
-    }
-
-    // 想法：可以在VFS中实现一个文件系统分发器，流程如下：
-    // 1. 接受从上方传来的文件类型字符串
-    // 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
-    // 3. 直接在函数内调用构造方法并直接返回文件系统对象
-
-    /// src/linux/mount.c `umount` & `umount2`
-    ///
-    /// [umount(2) — Linux manual page](https://www.man7.org/linux/man-pages/man2/umount.2.html)
-    pub fn umount2(target: *const u8, flags: i32) -> Result<(), SystemError> {
-        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        Vcore::do_umount2(
-            AtFlags::AT_FDCWD.bits(),
-            &target,
-            UmountFlag::from_bits(flags).ok_or(SystemError::EINVAL)?,
-        )?;
-        return Ok(());
     }
 
     pub fn sys_utimensat(

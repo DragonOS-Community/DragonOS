@@ -212,14 +212,16 @@ class DocumentTranslator:
         for block in exclude_blocks:
             text = text.replace(block, '')
 
-        # 处理多行代码块
-        code_blocks = re.findall(r"```.*?\n.*?```", text, re.DOTALL)
+        # 处理多行代码块 - 修正的正则表达式
+        # 匹配以```开头（可选语言标识符）并以```结尾的多行代码块
+        code_blocks = re.findall(r"^```[a-zA-Z]*\n.*?\n```$", text, re.MULTILINE | re.DOTALL)
         for i, block in enumerate(code_blocks):
             placeholder = f"__CODE_BLOCK_{i}__"
             preserved[placeholder] = block
             text = text.replace(block, placeholder)
-        # 处理内联代码块
-        inline_code = re.findall(r"`[^`]+`", text)
+        
+        # 处理内联代码块 - 确保不匹配已经处理的多行代码块
+        inline_code = re.findall(r"`[^`\n]+`", text)
         for i, code in enumerate(inline_code):
             placeholder = f"__INLINE_CODE_{i}__"
             preserved[placeholder] = code
@@ -254,7 +256,7 @@ class DocumentTranslator:
         while retry > 0:
             try:
                 lang_name = CONFIG["target_languages"].get(lang, "English")
-                prompt = f"你是一个专业的文档翻译助手，请将以下中文技术文档准确翻译成{lang_name}，保持技术术语的正确性和格式不变."
+                prompt = f"你是一个专业的文档翻译助手，请将以下中文技术文档准确翻译成{lang_name}，保持技术术语的正确性和格式不变.\n直接输出翻译后的内容，不要添加任何额外的无关内容。\n\n"
 
                 # disable qwen3's thinking mode
                 if "qwen3" in CONFIG["model"].lower():

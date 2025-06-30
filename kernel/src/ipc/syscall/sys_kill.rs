@@ -7,7 +7,7 @@ use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
     arch::{ipc::signal::Signal, syscall::nr::SYS_KILL},
-    process::{process_group::Pgid, Pid, ProcessManager},
+    process::{process_group::Pgid, ProcessManager, RawPid},
 };
 use log::warn;
 use system_error::SystemError;
@@ -22,7 +22,7 @@ use crate::ipc::kill::{kill_all, kill_process, kill_process_group};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PidConverter {
     All,
-    Pid(Pid),
+    Pid(RawPid),
     Pgid(Pgid),
 }
 
@@ -37,7 +37,7 @@ impl PidConverter {
             let pgid = ProcessManager::current_pcb().pgid();
             PidConverter::Pgid(pgid)
         } else {
-            PidConverter::Pid(Pid::from(id as usize))
+            PidConverter::Pid(RawPid::from(id as usize))
         }
     }
 }

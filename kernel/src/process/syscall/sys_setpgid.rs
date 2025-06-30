@@ -1,8 +1,8 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETPGID;
 use crate::process::Pgid;
-use crate::process::Pid;
 use crate::process::ProcessManager;
+use crate::process::RawPid;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
@@ -10,8 +10,8 @@ use system_error::SystemError;
 pub struct SysSetPgid;
 
 impl SysSetPgid {
-    fn pid(args: &[usize]) -> Pid {
-        Pid::new(args[0])
+    fn pid(args: &[usize]) -> RawPid {
+        RawPid::new(args[0])
     }
 
     fn pgid(args: &[usize]) -> Pgid {
@@ -35,7 +35,7 @@ impl Syscall for SysSetPgid {
         let pgid = Self::pgid(args);
 
         let current_pcb = ProcessManager::current_pcb();
-        let pid = if pid == Pid(0) {
+        let pid = if pid == RawPid(0) {
             current_pcb.pid()
         } else {
             pid

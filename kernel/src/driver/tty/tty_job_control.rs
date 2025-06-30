@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
-    process::{process_group::Pgid, Pid, ProcessFlags, ProcessManager},
+    process::{process_group::Pgid, ProcessFlags, ProcessManager, RawPid},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
@@ -101,7 +101,7 @@ impl TtyJobCtrlManager {
         // https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/tty/tty_jobctrl.c#tiocsctty
         if let Some(sid) = real_tty.core().contorl_info_irqsave().session {
             //todo 目前只有一个tty设备，所以选择复用1号进程的tty，因此修改1号进程的tty暂时被允许
-            if sid != Pid::new(1) {
+            if sid != RawPid::new(1) {
                 return Err(SystemError::EPERM);
             }
         }
@@ -130,7 +130,7 @@ impl TtyJobCtrlManager {
                 .core()
                 .contorl_info_irqsave()
                 .pgid
-                .unwrap_or(Pid::new(1))
+                .unwrap_or(RawPid::new(1))
                 .data() as i32),
             0,
         )?;
@@ -206,7 +206,7 @@ impl TtyJobCtrlManager {
             return Err(SystemError::EPERM);
         }
 
-        ctrl.pgid = Some(Pid::from(*pgrp as usize));
+        ctrl.pgid = Some(RawPid::from(*pgrp as usize));
 
         return Ok(0);
     }

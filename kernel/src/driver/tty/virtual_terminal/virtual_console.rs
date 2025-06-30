@@ -13,7 +13,7 @@ use crate::{
         tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
     },
     libs::{font::FontDesc, rwlock::RwLock},
-    process::Pid,
+    process::RawPid,
 };
 
 use super::{
@@ -91,7 +91,7 @@ pub struct VirtualConsoleData {
 
     pub cursor_blink_ms: u16,
 
-    pub pid: Option<Pid>,
+    pub pid: Option<RawPid>,
     pub index: usize,
 
     pub vc_state: VirtualConsoleState,

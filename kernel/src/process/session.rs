@@ -1,6 +1,6 @@
 use super::{
     process_group::{Pgid, ProcessGroup},
-    Pid, ProcessControlBlock, ProcessManager,
+    ProcessControlBlock, ProcessManager, RawPid,
 };
 use crate::libs::spinlock::SpinLock;
 use alloc::{
@@ -11,7 +11,7 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 /// 会话SID
-pub type Sid = Pid;
+pub type Sid = RawPid;
 
 /// 系统中所有会话
 pub static ALL_SESSION: SpinLock<Option<HashMap<Sid, Arc<Session>>>> = SpinLock::new(None);

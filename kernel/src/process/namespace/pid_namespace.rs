@@ -7,8 +7,8 @@ use system_error::SystemError;
 
 use crate::libs::spinlock::SpinLock;
 use crate::process::fork::CloneFlags;
-use crate::process::Pid;
 use crate::process::ProcessControlBlock;
+use crate::process::RawPid;
 
 use super::nsproxy::NsCommon;
 
@@ -29,7 +29,7 @@ pub struct InnerPidNamespace {
     pub ns_common: NsCommon,
     ida: IdAllocator,
     /// PID到进程的映射表
-    pid_map: HashMap<Pid, Weak<ProcessControlBlock>>,
+    pid_map: HashMap<RawPid, Weak<ProcessControlBlock>>,
 }
 
 impl PidNamespace {

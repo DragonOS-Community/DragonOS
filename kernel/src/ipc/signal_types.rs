@@ -15,7 +15,7 @@ use crate::{
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
-    process::Pid,
+    process::RawPid,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -348,8 +348,8 @@ impl SigInfo {
 
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
-    Kill(Pid),
-    Alarm(Pid),
+    Kill(RawPid),
+    Alarm(RawPid),
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
@@ -437,8 +437,8 @@ impl SigPending {
             return info;
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(Pid::from(0)));
-            ret.set_sig_type(SigType::Kill(Pid::new(0)));
+            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(RawPid::from(0)));
+            ret.set_sig_type(SigType::Kill(RawPid::new(0)));
             return ret;
         }
     }

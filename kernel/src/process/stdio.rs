@@ -6,12 +6,12 @@ use crate::{
         file::{File, FileMode},
         ROOT_INODE,
     },
-    process::{Pid, ProcessManager},
+    process::{ProcessManager, RawPid},
 };
 
 /// @brief 初始化pid=1的进程的stdio
 pub fn stdio_init() -> Result<(), SystemError> {
-    if ProcessManager::current_pcb().pid() != Pid(1) {
+    if ProcessManager::current_pcb().pid() != RawPid(1) {
         return Err(SystemError::EPERM);
     }
     let tty_path = format!(

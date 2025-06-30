@@ -18,7 +18,7 @@ use crate::{
     exception::InterruptArch,
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
-    process::{Pid, ProcessControlBlock, ProcessManager},
+    process::{ProcessControlBlock, ProcessManager, RawPid},
     sched::{schedule, SchedMode},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
@@ -708,7 +708,7 @@ impl RobustListHead {
         let pcb: Arc<ProcessControlBlock> = if pid == 0 {
             ProcessManager::current_pcb()
         } else {
-            ProcessManager::find(Pid::new(pid)).ok_or(SystemError::ESRCH)?
+            ProcessManager::find(RawPid::new(pid)).ok_or(SystemError::ESRCH)?
         };
 
         // TODO: 检查当前进程是否能ptrace另一个进程

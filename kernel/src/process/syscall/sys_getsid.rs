@@ -1,7 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSID;
-use crate::process::Pid;
 use crate::process::ProcessManager;
+use crate::process::RawPid;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::sync::Arc;
@@ -10,8 +10,8 @@ use system_error::SystemError;
 pub struct SysGetsid;
 
 impl SysGetsid {
-    fn pid(args: &[usize]) -> Pid {
-        Pid::new(args[0])
+    fn pid(args: &[usize]) -> RawPid {
+        RawPid::new(args[0])
     }
 }
 
@@ -33,7 +33,7 @@ impl Syscall for SysGetsid {
         let pid = Self::pid(args);
         let session = ProcessManager::current_pcb().session().unwrap();
         let sid = session.sid().into();
-        if pid == Pid(0) {
+        if pid == RawPid(0) {
             return Ok(sid);
         }
         let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;

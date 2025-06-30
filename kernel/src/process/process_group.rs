@@ -1,6 +1,6 @@
 use super::{
     session::{Session, Sid},
-    Pid, ProcessControlBlock, ProcessManager,
+    ProcessControlBlock, ProcessManager, RawPid,
 };
 use crate::libs::spinlock::SpinLock;
 use alloc::{
@@ -11,7 +11,7 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 /// 进程组ID
-pub type Pgid = Pid;
+pub type Pgid = RawPid;
 
 /// 系统中所有进程组
 pub static ALL_PROCESS_GROUP: SpinLock<Option<HashMap<Pgid, Arc<ProcessGroup>>>> =
@@ -24,13 +24,13 @@ pub struct ProcessGroup {
 }
 
 pub struct PGInner {
-    pub processes: BTreeMap<Pid, Arc<ProcessControlBlock>>,
+    pub processes: BTreeMap<RawPid, Arc<ProcessControlBlock>>,
     pub leader: Option<Arc<ProcessControlBlock>>,
     pub session: Weak<Session>,
 }
 
 impl PGInner {
-    pub fn remove_process(&mut self, pid: &Pid) {
+    pub fn remove_process(&mut self, pid: &RawPid) {
         if let Some(process) = self.processes.remove(pid) {
             if let Some(leader) = &self.leader {
                 if Arc::ptr_eq(leader, &process) {
@@ -62,7 +62,7 @@ impl ProcessGroup {
         })
     }
 
-    pub fn contains(&self, pid: Pid) -> bool {
+    pub fn contains(&self, pid: RawPid) -> bool {
         self.process_group_inner.lock().processes.contains_key(&pid)
     }
 
@@ -179,7 +179,7 @@ impl ProcessManager {
             for process in pg.process_group_inner.lock().processes.values() {
                 if let Some(real_parent) = process.real_parent_pcb.read().clone().upgrade() {
                     //todo 添加判断： 1.是否被忽略 2.是否已经退出（线程组是否为空）
-                    if real_parent.pid == Pid(1) || process.is_exited() {
+                    if real_parent.pid == RawPid(1) || process.is_exited() {
                         log::debug!("is_current_pgrp_orphaned: real_parent is init or exited");
                         continue;
                     }

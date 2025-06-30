@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
-    KernelStack, Pgid, Pid, ProcessControlBlock, ProcessManager, Sid,
+    KernelStack, Pgid, ProcessControlBlock, ProcessManager, RawPid, Sid,
 };
 const MAX_PID_NS_LEVEL: usize = 32;
 
@@ -158,7 +158,7 @@ impl ProcessManager {
     pub fn fork(
         current_trapframe: &TrapFrame,
         clone_flags: CloneFlags,
-    ) -> Result<Pid, SystemError> {
+    ) -> Result<RawPid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
 
         let new_kstack: KernelStack = KernelStack::new()?;
@@ -542,7 +542,7 @@ impl ProcessManager {
         parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        if parent_pcb.process_group().is_none() && parent_pcb.pid() == Pid(0) {
+        if parent_pcb.process_group().is_none() && parent_pcb.pid() == RawPid(0) {
             return Ok(());
         }
         let pg = parent_pcb.process_group().unwrap();

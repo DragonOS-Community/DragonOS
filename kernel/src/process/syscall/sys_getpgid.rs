@@ -1,7 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETPGID;
-use crate::process::Pid;
 use crate::process::ProcessManager;
+use crate::process::RawPid;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
@@ -9,8 +9,8 @@ use system_error::SystemError;
 pub struct SysGetPgid;
 
 impl SysGetPgid {
-    fn pid(args: &[usize]) -> Pid {
-        Pid::new(args[0])
+    fn pid(args: &[usize]) -> RawPid {
+        RawPid::new(args[0])
     }
 }
 
@@ -30,7 +30,7 @@ impl Syscall for SysGetPgid {
     /// - 错误，不存在该进程
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = Self::pid(args);
-        if pid == Pid(0) {
+        if pid == RawPid(0) {
             let current_pcb = ProcessManager::current_pcb();
             return Ok(current_pcb.pgid().into());
         }

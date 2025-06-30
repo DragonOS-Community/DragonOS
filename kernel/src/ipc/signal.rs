@@ -10,7 +10,7 @@ use crate::{
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
-        pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo,
+        pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
     time::Instant,
 };
@@ -59,7 +59,7 @@ impl Signal {
     pub fn send_signal_info(
         &self,
         info: Option<&mut SigInfo>,
-        pid: Pid,
+        pid: RawPid,
     ) -> Result<i32, SystemError> {
         // TODO:暂时不支持特殊的信号操作，待引入进程组后补充
         // 如果 pid 大于 0，那么会发送信号给 pid 指定的进程
@@ -67,7 +67,7 @@ impl Signal {
         // 如果 pid 小于 -1，那么会向组 ID 等于该 pid 绝对值的进程组内所有下属进程发送信号。向一个进程组的所有进程发送信号在 shell 作业控制中有特殊有途
         // 如果 pid 等于 -1，那么信号的发送范围是：调用进程有权将信号发往的每个目标进程，除去 init（进程 ID 为 1）和调用进程自身。如果特权级进程发起这一调用，那么会发送信号给系统中的所有进程，上述两个进程除外。显而易见，有时也将这种信号发送方式称之为广播信号
         // 如果并无进程与指定的 pid 相匹配，那么 kill() 调用失败，同时将 errno 置为 ESRCH（“查无此进程”）
-        if pid.lt(&Pid::from(0)) {
+        if pid.lt(&RawPid::from(0)) {
             warn!("Kill operation not support: pid={:?}", pid);
             return Err(SystemError::ENOSYS);
         }

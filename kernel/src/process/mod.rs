@@ -94,7 +94,8 @@ pub mod timer;
 pub mod utils;
 
 /// 系统中所有进程的pcb
-static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
+static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> =
+    SpinLock::new(None);
 
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 
@@ -182,9 +183,9 @@ impl ProcessManager {
     /// 获取当前进程的pid
     ///
     /// 如果进程管理器未初始化完成，那么返回0
-    pub fn current_pid() -> Pid {
+    pub fn current_pid() -> RawPid {
         if unlikely(unsafe { !__PROCESS_MANAGEMENT_INIT_DONE }) {
-            return Pid(0);
+            return RawPid(0);
         }
 
         return ProcessManager::current_pcb().pid();
@@ -215,7 +216,7 @@ impl ProcessManager {
     /// ## 返回值
     ///
     /// 如果找到了对应的进程，那么返回该进程的pcb，否则返回None
-    pub fn find(pid: Pid) -> Option<Arc<ProcessControlBlock>> {
+    pub fn find(pid: RawPid) -> Option<Arc<ProcessControlBlock>> {
         return ALL_PROCESS.lock_irqsave().as_ref()?.get(&pid).cloned();
     }
 
@@ -237,7 +238,7 @@ impl ProcessManager {
     }
 
     /// ### 获取所有进程的pid
-    pub fn get_all_processes() -> Vec<Pid> {
+    pub fn get_all_processes() -> Vec<RawPid> {
         let mut pids = Vec::new();
         for (pid, _) in ALL_PROCESS.lock_irqsave().as_ref().unwrap().iter() {
             pids.push(*pid);
@@ -379,7 +380,7 @@ impl ProcessManager {
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
         // 让INIT进程收养所有子进程
-        if current.pid() != Pid(1) {
+        if current.pid() != RawPid(1) {
             unsafe {
                 current
                     .adopt_childen()
@@ -416,7 +417,7 @@ impl ProcessManager {
     pub fn exit(exit_code: usize) -> ! {
         // 检查是否是init进程尝试退出，如果是则产生panic
         let current_pcb = ProcessManager::current_pcb();
-        if current_pcb.pid() == Pid(1) {
+        if current_pcb.pid() == RawPid(1) {
             log::error!(
                 "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
                 exit_code
@@ -430,7 +431,7 @@ impl ProcessManager {
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-        let pid: Pid;
+        let pid: RawPid;
         {
             let pcb = ProcessManager::current_pcb();
             pid = pcb.pid();
@@ -498,7 +499,7 @@ impl ProcessManager {
         }
     }
 
-    pub unsafe fn release(pid: Pid) {
+    pub unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if pcb.is_some() {
             // log::debug!("release pid {}", pid);
@@ -580,9 +581,9 @@ pub unsafe fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 
-int_like!(Pid, AtomicPid, usize, AtomicUsize);
+int_like!(RawPid, AtomicRawPid, usize, AtomicUsize);
 
-impl fmt::Display for Pid {
+impl fmt::Display for RawPid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -696,9 +697,9 @@ impl ProcessFlags {
 #[derive(Debug)]
 pub struct ProcessControlBlock {
     /// 当前进程的pid
-    pid: Pid,
+    pid: RawPid,
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
-    tgid: Pid,
+    tgid: RawPid,
 
     /// namespace代理
     nsproxy: RwLock<Arc<NsProxy>>,
@@ -732,7 +733,7 @@ pub struct ProcessControlBlock {
     real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
-    children: RwLock<Vec<Pid>>,
+    children: RwLock<Vec<RawPid>>,
 
     /// 等待队列
     wait_queue: WaitQueue,
@@ -800,7 +801,7 @@ impl ProcessControlBlock {
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
         let (pid, ppid, cwd, cred, tty) = if is_idle {
             let cred = INIT_CRED.clone();
-            (Pid(0), Pid(0), "/".to_string(), cred, None)
+            (RawPid(0), RawPid(0), "/".to_string(), cred, None)
         } else {
             let ppid = ProcessManager::current_pcb().pid();
             let mut cred = ProcessManager::current_pcb().cred();
@@ -893,7 +894,7 @@ impl ProcessControlBlock {
         };
 
         // 将当前pcb加入父进程的子进程哈希表中
-        if pcb.pid() > Pid(1) {
+        if pcb.pid() > RawPid(1) {
             if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
                 let mut children = ppcb_arc.children.write_irqsave();
                 children.push(pcb.pid());
@@ -902,7 +903,7 @@ impl ProcessControlBlock {
             }
         }
 
-        if pcb.pid() > Pid(0) && !is_idle {
+        if pcb.pid() > RawPid(0) && !is_idle {
             let process_group = ProcessGroup::new(pcb.clone());
             *pcb.process_group.lock() = Arc::downgrade(&process_group);
             ProcessManager::add_process_group(process_group.clone());
@@ -926,9 +927,9 @@ impl ProcessControlBlock {
 
     /// 生成一个新的pid
     #[inline(always)]
-    fn generate_pid() -> Pid {
-        static NEXT_PID: AtomicPid = AtomicPid::new(Pid(1));
-        return NEXT_PID.fetch_add(Pid(1), Ordering::SeqCst);
+    fn generate_pid() -> RawPid {
+        static NEXT_PID: AtomicRawPid = AtomicRawPid::new(RawPid(1));
+        return NEXT_PID.fetch_add(RawPid(1), Ordering::SeqCst);
     }
 
     /// 返回当前进程的锁持有计数
@@ -955,7 +956,7 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn contain_child(&self, pid: &Pid) -> bool {
+    pub fn contain_child(&self, pid: &RawPid) -> bool {
         let children = self.children.read();
         return children.contains(pid);
     }
@@ -1027,12 +1028,12 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn pid(&self) -> Pid {
+    pub fn pid(&self) -> RawPid {
         return self.pid;
     }
 
     #[inline(always)]
-    pub fn tgid(&self) -> Pid {
+    pub fn tgid(&self) -> RawPid {
         return self.tgid;
     }
 
@@ -1096,7 +1097,7 @@ impl ProcessControlBlock {
 
     /// 当前进程退出时,让初始进程收养所有子进程
     unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
-        match ProcessManager::find(Pid(1)) {
+        match ProcessManager::find(RawPid(1)) {
             Some(init_pcb) => {
                 let childen_guard = self.children.write();
                 let mut init_childen_guard = init_pcb.children.write();
@@ -1222,7 +1223,7 @@ impl ProcessControlBlock {
         drop(old)
     }
 
-    pub fn children_read_irqsave(&self) -> RwLockReadGuard<Vec<Pid>> {
+    pub fn children_read_irqsave(&self) -> RwLockReadGuard<Vec<RawPid>> {
         self.children.read_irqsave()
     }
 
@@ -1321,7 +1322,7 @@ impl ThreadInfo {
 #[derive(Debug)]
 pub struct ProcessBasicInfo {
     /// 当前进程的父进程的pid
-    ppid: Pid,
+    ppid: RawPid,
     /// 进程的名字
     name: String,
 
@@ -1338,7 +1339,7 @@ pub struct ProcessBasicInfo {
 impl ProcessBasicInfo {
     #[inline(never)]
     pub fn new(
-        ppid: Pid,
+        ppid: RawPid,
         name: String,
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
@@ -1353,7 +1354,7 @@ impl ProcessBasicInfo {
         });
     }
 
-    pub fn ppid(&self) -> Pid {
+    pub fn ppid(&self) -> RawPid {
         return self.ppid;
     }
 

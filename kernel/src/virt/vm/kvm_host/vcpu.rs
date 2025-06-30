@@ -13,7 +13,7 @@ use crate::{
         VirtCpuArch, VirtCpuStat,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    process::Pid,
+    process::RawPid,
     smp::cpu::ProcessorId,
     virt::vm::user_api::UapiKvmRun,
 };
@@ -57,7 +57,7 @@ pub struct VirtCpu {
     pub vcpu_id: usize,
     /// id alloctor获取
     pub _vcpu_idx: usize,
-    pub pid: Option<Pid>,
+    pub pid: Option<RawPid>,
     pub _preempted: bool,
     pub _ready: bool,
     pub _last_used_slot: Option<Arc<KvmMemSlot>>,

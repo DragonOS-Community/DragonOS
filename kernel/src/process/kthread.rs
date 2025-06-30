@@ -22,7 +22,7 @@ use crate::{
     sched::{schedule, SchedMode},
 };
 
-use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
+use super::{fork::CloneFlags, ProcessControlBlock, ProcessFlags, RawPid};
 
 /// 内核线程的创建任务列表
 static KTHREAD_CREATE_LIST: SpinLock<LinkedList<Arc<KernelThreadCreateInfo>>> =
@@ -263,7 +263,7 @@ pub struct KernelThreadMechanism;
 
 impl KernelThreadMechanism {
     pub fn init_stage1() {
-        assert!(ProcessManager::current_pcb().pid() == Pid::new(0));
+        assert!(ProcessManager::current_pcb().pid() == RawPid::new(0));
         info!("Initializing kernel thread mechanism stage1...");
 
         // 初始化第一个内核线程
@@ -311,7 +311,7 @@ impl KernelThreadMechanism {
             let info = KernelThreadCreateInfo::new(closure, "kthreadd".to_string());
             info.set_to_mark_sleep(false)
                 .expect("kthreadadd should be run first");
-            let kthreadd_pid: Pid = Self::__inner_create(
+            let kthreadd_pid: RawPid = Self::__inner_create(
                 &info,
                 CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGHAND,
             )
@@ -464,7 +464,7 @@ impl KernelThreadMechanism {
             while let Some(info) = list.pop_front() {
                 drop(list);
                 // create a new kernel thread
-                let result: Result<Pid, SystemError> = Self::__inner_create(
+                let result: Result<RawPid, SystemError> = Self::__inner_create(
                     &info,
                     CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGHAND,
                 );

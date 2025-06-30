@@ -1,11 +1,11 @@
 use crate::arch::ipc::signal::{SigCode, Signal};
 use crate::ipc::signal_types::{SigInfo, SigType};
-use crate::process::{process_group::Pgid, Pid, ProcessManager};
+use crate::process::{process_group::Pgid, ProcessManager, RawPid};
 use core::sync::atomic::compiler_fence;
 use system_error::SystemError;
 
 /// ### 杀死一个进程
-pub fn kill_process(pid: Pid, sig: Signal) -> Result<usize, SystemError> {
+pub fn kill_process(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
     // 初始化signal info
     let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pid));
     compiler_fence(core::sync::atomic::Ordering::SeqCst);

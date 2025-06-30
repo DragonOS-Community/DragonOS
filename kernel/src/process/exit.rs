@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    abi::WaitOption, resource::RUsage, Pid, ProcessControlBlock, ProcessManager, ProcessState,
+    abi::WaitOption, resource::RUsage, ProcessControlBlock, ProcessManager, ProcessState, RawPid,
 };
 
 /// 内核wait4时的参数
@@ -28,7 +28,7 @@ pub struct KernelWaitOption<'a> {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct WaitIdInfo {
-    pub pid: Pid,
+    pub pid: RawPid,
     pub status: i32,
     pub cause: i32,
 }

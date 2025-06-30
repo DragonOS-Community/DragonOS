@@ -10,7 +10,7 @@ use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     libs::spinlock::SpinLockGuard,
-    process::{Pid, ProcessControlBlock, ProcessManager},
+    process::{ProcessControlBlock, ProcessManager, RawPid},
     sched::{schedule, SchedMode},
 };
 
@@ -132,7 +132,7 @@ impl<T> Mutex<T> {
 
     /// @brief 检查进程是否在该mutex的等待队列内
     #[inline]
-    fn check_pid_in_wait_list(&self, inner: &MutexInner, pid: Pid) -> bool {
+    fn check_pid_in_wait_list(&self, inner: &MutexInner, pid: RawPid) -> bool {
         for p in inner.wait_list.iter() {
             if p.pid() == pid {
                 // 在等待队列内

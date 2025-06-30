@@ -52,7 +52,7 @@ macro_rules! syscall_return {
         $regs.rax = ret as u64;
 
         if $show {
-            let pid = ProcessManager::current_pcb().pid();
+            let pid = ProcessManager::current_pcb().raw_pid();
             debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
         }
 
@@ -88,7 +88,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         frame.r9 as usize,
     ];
     mfence();
-    let pid = ProcessManager::current_pcb().pid();
+    let pid = ProcessManager::current_pcb().raw_pid();
     let show = false;
     // let show = if syscall_num != SYS_SCHED && pid.data() >= 9{
     //     true

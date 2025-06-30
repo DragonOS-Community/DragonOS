@@ -167,7 +167,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             // 而是要先break到外层循环，以便释放父进程的children字段的锁,才能drop pcb。
                             // 否则会死锁。
                             tmp_child_pcb = Some(pcb.clone());
-                            let pid = pcb.pid();
+                            let pid = pcb.raw_pid();
                             unsafe { ProcessManager::release(pid) };
                             retval = Ok((pid).into());
                             break 'outer;
@@ -210,7 +210,7 @@ fn do_waitpid(
             {
                 if let Some(info) = &mut kwo.ret_info {
                     *info = WaitIdInfo {
-                        pid: child_pcb.pid(),
+                        pid: child_pcb.raw_pid(),
                         status: Signal::SIGCONT as i32,
                         cause: SigChildCode::Continued.into(),
                     };
@@ -237,16 +237,16 @@ fn do_waitpid(
             }
             if let Some(infop) = &mut kwo.ret_info {
                 *infop = WaitIdInfo {
-                    pid: child_pcb.pid(),
+                    pid: child_pcb.raw_pid(),
                     status: exitcode,
                     cause: SigChildCode::Stopped.into(),
                 };
             }
 
-            return Some(Ok(child_pcb.pid().data()));
+            return Some(Ok(child_pcb.raw_pid().data()));
         }
         ProcessState::Exited(status) => {
-            let pid = child_pcb.pid();
+            let pid = child_pcb.raw_pid();
             // debug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
 
             if likely(!kwo.options.contains(WaitOption::WEXITED)) {

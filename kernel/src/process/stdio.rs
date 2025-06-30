@@ -11,7 +11,7 @@ use crate::{
 
 /// @brief 初始化pid=1的进程的stdio
 pub fn stdio_init() -> Result<(), SystemError> {
-    if ProcessManager::current_pcb().pid() != RawPid(1) {
+    if ProcessManager::current_pcb().raw_pid() != RawPid(1) {
         return Err(SystemError::EPERM);
     }
     let tty_path = format!(

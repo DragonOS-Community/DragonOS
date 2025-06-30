@@ -561,7 +561,7 @@ impl Futex {
         if (encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0) && oparg > 31 {
             warn!(
                 "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
-                ProcessManager::current_pcb().pid().data(),
+                ProcessManager::current_pcb().raw_pid().data(),
                 oparg
             );
 
@@ -752,7 +752,7 @@ impl RobustListHead {
         };
         // 遍历当前进程/线程的robust list
         for futex_uaddr in head.futexes() {
-            let ret = Self::handle_futex_death(futex_uaddr, pcb.pid().into() as u32);
+            let ret = Self::handle_futex_death(futex_uaddr, pcb.raw_pid().into() as u32);
             if ret.is_err() {
                 return;
             }

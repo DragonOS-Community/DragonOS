@@ -154,7 +154,7 @@ impl Signal {
                         *self,
                         0,
                         SigCode::User,
-                        SigType::Kill(ProcessManager::current_pcb().pid()),
+                        SigType::Kill(ProcessManager::current_pcb().raw_pid()),
                     )
                 }
             };
@@ -337,8 +337,8 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
             wakeup_ok = false;
             warn!(
                 "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
-                ProcessManager::current_pcb().pid(),
-                pcb.pid(),
+                ProcessManager::current_pcb().raw_pid(),
+                pcb.raw_pid(),
                 e
             );
         });
@@ -347,8 +347,8 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
             wakeup_ok = false;
             warn!(
                 "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
-                ProcessManager::current_pcb().pid(),
-                pcb.pid(),
+                ProcessManager::current_pcb().raw_pid(),
+                pcb.raw_pid(),
                 e
             );
         });

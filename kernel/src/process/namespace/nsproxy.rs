@@ -61,8 +61,8 @@ impl ProcessManager {
         log::debug!(
             "copy_namespaces: clone_flags={:?}, parent pid={}, child pid={}, child name={}",
             clone_flags,
-            parent_pcb.pid(),
-            child_pcb.pid(),
+            parent_pcb.raw_pid(),
+            child_pcb.raw_pid(),
             child_pcb.basic().name()
         );
         if likely(!clone_flags.intersects(

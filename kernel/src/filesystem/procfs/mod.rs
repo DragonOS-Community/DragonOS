@@ -185,7 +185,7 @@ impl ProcFSInode {
 
         // pid
         pdata.append(
-            &mut format!("\nPid:\t{}", pcb.pid().into())
+            &mut format!("\nPid:\t{}", pcb.raw_pid().into())
                 .as_bytes()
                 .to_owned(),
         );

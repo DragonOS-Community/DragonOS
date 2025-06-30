@@ -23,7 +23,7 @@ pub fn kill_process_group(pgid: Pgid, sig: Signal) -> Result<usize, SystemError>
     let pg = ProcessManager::find_process_group(pgid).ok_or(SystemError::ESRCH)?;
     let inner = pg.process_group_inner.lock();
     for pcb in inner.processes.values() {
-        kill_process(pcb.pid(), sig)?; // Call the new common function
+        kill_process(pcb.raw_pid(), sig)?; // Call the new common function
     }
     Ok(0)
 }
@@ -31,7 +31,7 @@ pub fn kill_process_group(pgid: Pgid, sig: Signal) -> Result<usize, SystemError>
 /// ### 杀死所有进程
 /// - 该函数会杀死所有进程，除了当前进程和init进程
 pub fn kill_all(sig: Signal) -> Result<usize, SystemError> {
-    let current_pid = ProcessManager::current_pcb().pid();
+    let current_pid = ProcessManager::current_pcb().raw_pid();
     let all_processes = ProcessManager::get_all_processes();
 
     for pid_val in all_processes {

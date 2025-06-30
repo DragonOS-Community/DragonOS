@@ -36,7 +36,7 @@ impl Syscall for SysSetPgid {
 
         let current_pcb = ProcessManager::current_pcb();
         let pid = if pid == RawPid(0) {
-            current_pcb.pid()
+            current_pcb.raw_pid()
         } else {
             pid
         };
@@ -45,7 +45,7 @@ impl Syscall for SysSetPgid {
         } else {
             pgid
         };
-        if pid != current_pcb.pid() && !current_pcb.contain_child(&pid) {
+        if pid != current_pcb.raw_pid() && !current_pcb.contain_child(&pid) {
             return Err(SystemError::ESRCH);
         }
 

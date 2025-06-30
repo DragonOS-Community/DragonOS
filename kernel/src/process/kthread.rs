@@ -263,7 +263,7 @@ pub struct KernelThreadMechanism;
 
 impl KernelThreadMechanism {
     pub fn init_stage1() {
-        assert!(ProcessManager::current_pcb().pid() == RawPid::new(0));
+        assert!(ProcessManager::current_pcb().raw_pid() == RawPid::new(0));
         info!("Initializing kernel thread mechanism stage1...");
 
         // 初始化第一个内核线程
@@ -366,7 +366,7 @@ impl KernelThreadMechanism {
     ) -> Option<Arc<ProcessControlBlock>> {
         let pcb = Self::create(func, name)?;
         ProcessManager::wakeup(&pcb)
-            .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.pid()));
+            .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.raw_pid()));
         return Some(pcb);
     }
 
@@ -387,7 +387,7 @@ impl KernelThreadMechanism {
         assert!(
             worker_private.is_some(),
             "kthread stop: worker_private is none, pid: {:?}",
-            pcb.pid()
+            pcb.raw_pid()
         );
         worker_private
             .as_mut()
@@ -434,7 +434,7 @@ impl KernelThreadMechanism {
         assert!(
             worker_private.is_some(),
             "kthread should_stop: worker_private is none, pid: {:?}",
-            pcb.pid()
+            pcb.raw_pid()
         );
         return worker_private
             .as_ref()

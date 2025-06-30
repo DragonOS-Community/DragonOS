@@ -173,18 +173,18 @@ impl ProcessManager {
         Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
             error!(
                 "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(),
-                pcb.pid(),
+                current_pcb.raw_pid(),
+                pcb.raw_pid(),
                 e
             );
             e
         })?;
 
         // 向procfs注册进程
-        procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {
+        procfs_register_pid(pcb.raw_pid()).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to register pid to procfs, pid: [{:?}]. Error: {:?}",
-                pcb.pid(),
+                pcb.raw_pid(),
                 e
             )
         });
@@ -194,12 +194,12 @@ impl ProcessManager {
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
-                pcb.pid(),
+                pcb.raw_pid(),
                 e
             )
         });
 
-        return Ok(pcb.pid());
+        return Ok(pcb.raw_pid());
     }
 
     fn copy_flags(
@@ -237,7 +237,7 @@ impl ProcessManager {
         let old_address_space = current_pcb.basic().user_vm().unwrap_or_else(|| {
             panic!(
                 "copy_mm: Failed to get address space of current process, current pid: [{:?}]",
-                current_pcb.pid()
+                current_pcb.raw_pid()
             )
         });
 
@@ -248,7 +248,7 @@ impl ProcessManager {
         let new_address_space = old_address_space.write_irqsave().try_clone().unwrap_or_else(|e| {
             panic!(
                 "copy_mm: Failed to clone address space of current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), new_pcb.pid(), e
+                current_pcb.raw_pid(), new_pcb.raw_pid(), e
             )
         });
         unsafe { new_pcb.basic_mut().set_user_vm(Some(new_address_space)) };
@@ -403,13 +403,13 @@ impl ProcessManager {
                 true,
             )?;
 
-            writer.copy_one_to_user(&(pcb.pid().0 as i32), 0)?;
+            writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
         }
 
         sched_fork(pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to set sched info from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -417,7 +417,7 @@ impl ProcessManager {
         Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy flags from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -425,7 +425,7 @@ impl ProcessManager {
         Self::copy_mm(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy mm from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -433,7 +433,7 @@ impl ProcessManager {
         Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy files from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -441,7 +441,7 @@ impl ProcessManager {
         Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -449,7 +449,7 @@ impl ProcessManager {
         Self::copy_namespaces(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy namespaces from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -457,7 +457,7 @@ impl ProcessManager {
         Self::copy_thread(current_pcb, pcb, &clone_args, current_trapframe).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy thread from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -492,7 +492,7 @@ impl ProcessManager {
                 if unlikely(leader.is_none()) {
                     panic!(
                         "fork: Failed to get leader of current process, current pid: [{:?}]",
-                        current_pcb.pid()
+                        current_pcb.raw_pid()
                     );
                 }
 
@@ -513,14 +513,14 @@ impl ProcessManager {
         Self::copy_group(current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
         Self::copy_fs(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -542,7 +542,7 @@ impl ProcessManager {
         parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        if parent_pcb.process_group().is_none() && parent_pcb.pid() == RawPid(0) {
+        if parent_pcb.process_group().is_none() && parent_pcb.raw_pid() == RawPid(0) {
             return Ok(());
         }
         let pg = parent_pcb.process_group().unwrap();
@@ -551,14 +551,14 @@ impl ProcessManager {
 
         let mut children_writelock = parent_pcb.children.write();
 
-        children_writelock.push(child_pcb.pid());
+        children_writelock.push(child_pcb.raw_pid());
 
         pg_inner
             .processes
-            .insert(child_pcb.pid(), child_pcb.clone());
+            .insert(child_pcb.raw_pid(), child_pcb.clone());
 
         // 检查是否已经存在pgid和sid
-        let pgid = Pgid::new(child_pcb.pid().0);
+        let pgid = Pgid::new(child_pcb.raw_pid().0);
         let sid = Sid::new(pgid.into());
 
         if ProcessManager::find_process_group(pgid).is_some() {

@@ -170,7 +170,7 @@ impl ProcessControlBlock {
         let session = self.session().unwrap();
 
         let mut self_group = self.process_group.lock();
-        if ProcessManager::find_session(self.pid()).is_some() {
+        if ProcessManager::find_session(self.raw_pid()).is_some() {
             return Err(SystemError::EPERM);
         }
         if ProcessManager::find_process_group(self.pid).is_some() {

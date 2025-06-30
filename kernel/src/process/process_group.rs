@@ -46,7 +46,7 @@ impl PGInner {
 
 impl ProcessGroup {
     pub fn new(pcb: Arc<ProcessControlBlock>) -> Arc<Self> {
-        let pid = pcb.pid();
+        let pid = pcb.raw_pid();
         let mut processes = BTreeMap::new();
         processes.insert(pid, pcb.clone());
         let inner = PGInner {
@@ -102,7 +102,7 @@ impl Drop for ProcessGroup {
 
         if let Some(leader) = inner.leader.take() {
             // 组长进程仍然在进程列表中，不应该直接销毁
-            if inner.processes.contains_key(&leader.pid()) {
+            if inner.processes.contains_key(&leader.raw_pid()) {
                 inner.leader = Some(leader);
             }
         }
@@ -254,7 +254,7 @@ impl ProcessControlBlock {
             }
             self.join_specified_group(&pg)?;
         } else {
-            if pgid != self.pid() {
+            if pgid != self.raw_pid() {
                 // 进程组不存在，只能加入自己的进程组
                 return Err(SystemError::EPERM);
             }
@@ -337,7 +337,7 @@ impl ProcessControlBlock {
     pub fn clear_pg_and_session_reference(&self) {
         if let Some(pg) = self.process_group() {
             let mut pg_inner = pg.process_group_inner.lock();
-            pg_inner.remove_process(&self.pid());
+            pg_inner.remove_process(&self.raw_pid());
 
             if pg_inner.is_empty() {
                 // 如果进程组没有任何进程了,就删除该进程组

@@ -188,7 +188,7 @@ impl ProcessManager {
             return RawPid(0);
         }
 
-        return ProcessManager::current_pcb().pid();
+        return ProcessManager::current_pcb().raw_pid();
     }
 
     /// 增加当前进程的锁持有计数
@@ -234,7 +234,7 @@ impl ProcessManager {
             .lock_irqsave()
             .as_mut()
             .unwrap()
-            .insert(pcb.pid(), pcb.clone());
+            .insert(pcb.raw_pid(), pcb.clone());
     }
 
     /// ### 获取所有进程的pid
@@ -380,7 +380,7 @@ impl ProcessManager {
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
         // 让INIT进程收养所有子进程
-        if current.pid() != RawPid(1) {
+        if current.raw_pid() != RawPid(1) {
             unsafe {
                 current
                     .adopt_childen()
@@ -391,12 +391,12 @@ impl ProcessManager {
                 return;
             }
             let parent_pcb = r.unwrap();
-            let r = crate::ipc::kill::kill_process(parent_pcb.pid(), Signal::SIGCHLD);
+            let r = crate::ipc::kill::kill_process(parent_pcb.raw_pid(), Signal::SIGCHLD);
             if r.is_err() {
                 warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",
-                    current.pid(),
-                    parent_pcb.pid()
+                    current.raw_pid(),
+                    parent_pcb.raw_pid()
                 );
             }
             // todo: 这里需要向父进程发送SIGCHLD信号
@@ -417,7 +417,7 @@ impl ProcessManager {
     pub fn exit(exit_code: usize) -> ! {
         // 检查是否是init进程尝试退出，如果是则产生panic
         let current_pcb = ProcessManager::current_pcb();
-        if current_pcb.pid() == RawPid(1) {
+        if current_pcb.raw_pid() == RawPid(1) {
             log::error!(
                 "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
                 exit_code
@@ -434,7 +434,7 @@ impl ProcessManager {
         let pid: RawPid;
         {
             let pcb = ProcessManager::current_pcb();
-            pid = pcb.pid();
+            pid = pcb.raw_pid();
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
@@ -560,7 +560,7 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            if pcb.pid() == cpu_rq(cpu_id.data() as usize).current().pid() {
+            if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid() {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }
@@ -803,7 +803,7 @@ impl ProcessControlBlock {
             let cred = INIT_CRED.clone();
             (RawPid(0), RawPid(0), "/".to_string(), cred, None)
         } else {
-            let ppid = ProcessManager::current_pcb().pid();
+            let ppid = ProcessManager::current_pcb().raw_pid();
             let mut cred = ProcessManager::current_pcb().cred();
             cred.cap_permitted = cred.cap_ambient;
             cred.cap_effective = cred.cap_ambient;
@@ -894,16 +894,16 @@ impl ProcessControlBlock {
         };
 
         // 将当前pcb加入父进程的子进程哈希表中
-        if pcb.pid() > RawPid(1) {
+        if pcb.raw_pid() > RawPid(1) {
             if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
                 let mut children = ppcb_arc.children.write_irqsave();
-                children.push(pcb.pid());
+                children.push(pcb.raw_pid());
             } else {
                 panic!("parent pcb is None");
             }
         }
 
-        if pcb.pid() > RawPid(0) && !is_idle {
+        if pcb.raw_pid() > RawPid(0) && !is_idle {
             let process_group = ProcessGroup::new(pcb.clone());
             *pcb.process_group.lock() = Arc::downgrade(&process_group);
             ProcessManager::add_process_group(process_group.clone());
@@ -1028,7 +1028,7 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn pid(&self) -> RawPid {
+    pub fn raw_pid(&self) -> RawPid {
         return self.pid;
     }
 
@@ -1269,13 +1269,13 @@ impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // 在ProcFS中,解除进程的注册
-        procfs_unregister_pid(self.pid())
+        procfs_unregister_pid(self.raw_pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
 
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
             ppcb.children
                 .write_irqsave()
-                .retain(|pid| *pid != self.pid());
+                .retain(|pid| *pid != self.raw_pid());
         }
 
         // log::debug!("Drop pid: {:?}", self.pid());

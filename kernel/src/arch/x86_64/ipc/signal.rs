@@ -453,7 +453,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
                 SaHandlerType::Error => {
-                    error!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
+                    error!("Trying to handle a Sigerror on Process:{:?}", pcb.raw_pid());
                     return;
                 }
                 SaHandlerType::Default => {
@@ -495,7 +495,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         error!(
             "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
             sig_number as i32,
-            ProcessManager::current_pcb().pid(),
+            ProcessManager::current_pcb().raw_pid(),
             res.as_ref().unwrap_err()
         );
     }
@@ -557,7 +557,7 @@ impl SignalArch for X86_64SignalArch {
         if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
             error!("rsp doesn't from user level");
             let _r = crate::ipc::kill::kill_process(
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             )
             .map_err(|e| e.to_posix_errno());
@@ -569,7 +569,7 @@ impl SignalArch for X86_64SignalArch {
         if !unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) {
             error!("unable to restore sigcontext");
             let _r = crate::ipc::kill::kill_process(
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             )
             .map_err(|e| e.to_posix_errno());
@@ -661,11 +661,11 @@ fn setup_frame(
                     } else {
                         error!(
                             "pid-{:?} forgot to set SA_FLAG_RESTORER for signal {:?}",
-                            ProcessManager::current_pcb().pid(),
+                            ProcessManager::current_pcb().raw_pid(),
                             sig as i32
                         );
                         let r = crate::ipc::kill::kill_process(
-                            ProcessManager::current_pcb().pid(),
+                            ProcessManager::current_pcb().raw_pid(),
                             Signal::SIGSEGV,
                         );
                         if r.is_err() {
@@ -676,7 +676,7 @@ fn setup_frame(
                     if sigaction.restorer().is_none() {
                         error!(
                             "restorer in process:{:?} is not defined",
-                            ProcessManager::current_pcb().pid()
+                            ProcessManager::current_pcb().raw_pid()
                         );
                         return Err(SystemError::EINVAL);
                     }
@@ -704,8 +704,10 @@ fn setup_frame(
     if r.is_err() {
         // 如果地址区域位于内核空间，则直接报错
         // todo: 生成一个sigsegv
-        let r =
-            crate::ipc::kill::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV);
+        let r = crate::ipc::kill::kill_process(
+            ProcessManager::current_pcb().raw_pid(),
+            Signal::SIGSEGV,
+        );
         if r.is_err() {
             error!("In setup frame: generate SIGSEGV signal failed");
         }
@@ -717,7 +719,7 @@ fn setup_frame(
     info.copy_siginfo_to_user(unsafe { &mut ((*frame).info) as *mut SigInfo })
         .map_err(|e| -> SystemError {
             let r = crate::ipc::kill::kill_process(
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             );
             if r.is_err() {
@@ -734,7 +736,7 @@ fn setup_frame(
             .setup_sigcontext(oldset, trap_frame)
             .map_err(|e: SystemError| -> SystemError {
                 let r = crate::ipc::kill::kill_process(
-                    ProcessManager::current_pcb().pid(),
+                    ProcessManager::current_pcb().raw_pid(),
                     Signal::SIGSEGV,
                 );
                 if r.is_err() {
@@ -811,7 +813,7 @@ fn sig_continue(sig: Signal) {
     ProcessManager::wakeup_stop(&ProcessManager::current_pcb()).unwrap_or_else(|_| {
         error!(
             "Failed to wake up process pid = {:?} with signal :{:?}",
-            ProcessManager::current_pcb().pid(),
+            ProcessManager::current_pcb().raw_pid(),
             sig
         );
     });

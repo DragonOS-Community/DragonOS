@@ -8,9 +8,11 @@ use system_error::SystemError;
 use crate::libs::spinlock::SpinLock;
 use crate::process::fork::CloneFlags;
 use crate::process::ProcessControlBlock;
+use crate::process::ProcessManager;
 use crate::process::RawPid;
 
 use super::nsproxy::NsCommon;
+use super::user_namespace::UserNamespace;
 
 pub struct PidNamespace {
     self_ref: Weak<PidNamespace>,
@@ -51,11 +53,32 @@ impl PidNamespace {
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid_namespace.c#145
-    pub(super) fn copy_pid_ns(&self, clone_flags: &CloneFlags) -> Result<Arc<Self>, SystemError> {
+    pub(super) fn copy_pid_ns(
+        &self,
+        clone_flags: &CloneFlags,
+        user_ns: Arc<UserNamespace>,
+    ) -> Result<Arc<Self>, SystemError> {
         if !clone_flags.contains(CloneFlags::CLONE_NEWPID) {
             return Ok(self.self_ref.upgrade().unwrap());
         }
+        if !Arc::ptr_eq(
+            &ProcessManager::current_pcb().active_pid_ns(),
+            &self.self_ref.upgrade().unwrap(),
+        ) {
+            return Err(SystemError::EINVAL);
+        }
 
-        todo!("Implement new PID namespace creation logic");
+        return self.create_pid_namespace(user_ns);
+    }
+
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid_namespace.c#72
+    fn create_pid_namespace(&self, user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, SystemError> {
+        todo!("Implement PID namespace creation logic with user namespace support");
+    }
+}
+
+impl ProcessControlBlock {
+    pub fn active_pid_ns(&self) -> Arc<PidNamespace> {
+        self.pid().unwrap().ns_of_pid()
     }
 }

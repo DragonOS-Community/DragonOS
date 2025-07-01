@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::process::{fork::CloneFlags, ProcessControlBlock, ProcessManager};
 use core::{fmt::Debug, intrinsics::likely, sync::atomic::AtomicIsize};
 
-use super::pid_namespace::PidNamespace;
+use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace};
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///
@@ -96,8 +96,8 @@ impl ProcessManager {
         {
             return Err(SystemError::EINVAL);
         }
-
-        let new_ns = create_new_namespaces(clone_flags, child_pcb)?;
+        let user_ns = child_pcb.cred().user_ns.clone();
+        let new_ns = create_new_namespaces(clone_flags, child_pcb, user_ns)?;
         // 设置新的nsproxy
 
         child_pcb.set_nsproxy(new_ns);
@@ -106,12 +106,20 @@ impl ProcessManager {
     }
 }
 
+/// 创建新的namespace代理及其所有关联的命名空间。
+///
+/// 返回新创建的nsproxy。调用者需要负责正确的加锁并将其附加到进程上。
+///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?r=&mo=3770&fi=151#67
 fn create_new_namespaces(
     clone_flags: &CloneFlags,
     pcb: &Arc<ProcessControlBlock>,
+    user_ns: Arc<UserNamespace>,
 ) -> Result<Arc<NsProxy>, SystemError> {
-    let pid_ns_for_children = pcb.nsproxy().pid_ns_for_children.copy_pid_ns(clone_flags)?;
+    let pid_ns_for_children = pcb
+        .nsproxy()
+        .pid_ns_for_children
+        .copy_pid_ns(clone_flags, user_ns)?;
 
     let result = NsProxy {
         pid_ns_for_children,
@@ -122,6 +130,7 @@ fn create_new_namespaces(
 }
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/ns_common.h#9
+#[derive(Default)]
 pub struct NsCommon {
     pub stashed: AtomicIsize,
     // todo: 添加其他公共字段

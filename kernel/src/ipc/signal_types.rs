@@ -5,6 +5,7 @@ use core::{
     sync::atomic::AtomicI64,
 };
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -15,7 +16,10 @@ use crate::{
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
-    process::RawPid,
+    process::{
+        pid::{Pid, PidType},
+        RawPid,
+    },
     syscall::user_access::UserBufferWriter,
 };
 
@@ -70,6 +74,8 @@ pub struct InnerSignalStruct {
     /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
     /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
     pub handlers: Vec<Sigaction>,
+
+    pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
 }
 
 impl SignalStruct {
@@ -116,6 +122,7 @@ impl Default for InnerSignalStruct {
         Self {
             cnt: Default::default(),
             handlers: vec![Sigaction::default(); MAX_SIG_NUM],
+            pids: core::array::from_fn(|_| None),
         }
     }
 }

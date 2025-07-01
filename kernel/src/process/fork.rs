@@ -19,6 +19,7 @@ use crate::{
 
 use super::{
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
+    pid::{Pid, PidType},
     KernelStack, Pgid, ProcessControlBlock, ProcessManager, RawPid, Sid,
 };
 const MAX_PID_NS_LEVEL: usize = 32;
@@ -524,6 +525,11 @@ impl ProcessManager {
             )
         });
 
+        todo!("https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/fork.c#2676");
+        if pcb.pid().is_some() {
+            pcb.init_task_pid(PidType::PID, pid);
+        }
+
         sched_cgroup_fork(pcb);
 
         Ok(())
@@ -587,5 +593,17 @@ impl ProcessManager {
             *guard = Arc::new(new_fs);
         }
         Ok(())
+    }
+}
+
+impl ProcessControlBlock {
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/fork.c#1959
+
+    pub(super) fn init_task_pid(&self, pid_type: PidType, pid: Arc<Pid>) {
+        if pid_type == PidType::PID {
+            self.thread_pid.write().replace(pid);
+        } else {
+            self.sig_struct().pids[pid_type as usize] = Some(pid);
+        }
     }
 }

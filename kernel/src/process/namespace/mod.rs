@@ -1,5 +1,6 @@
 pub mod nsproxy;
 pub mod pid_namespace;
+pub mod user_namespace;
 
 /// Namespace 种类，用于运行时调试与 /proc 导出
 #[repr(u8)]

@@ -129,6 +129,13 @@ impl GenericSignal {
             Self::SIGRTMAX => sig_terminate(*self),
         }
     }
+
+    pub fn kernel_only(&self) -> bool {
+        match self {
+            Self::SIGKILL | Self::SIGSTOP => true,
+            _ => false,
+        }
+    }
 }
 
 impl From<GenericSignal> for usize {

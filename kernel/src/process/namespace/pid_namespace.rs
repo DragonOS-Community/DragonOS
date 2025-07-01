@@ -6,6 +6,7 @@ use ida::IdAllocator;
 use system_error::SystemError;
 
 use crate::libs::spinlock::SpinLock;
+use crate::libs::spinlock::SpinLockGuard;
 use crate::process::fork::CloneFlags;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessManager;
@@ -21,9 +22,6 @@ pub struct PidNamespace {
     /// 父namespace的弱引用
     parent: Option<Weak<PidNamespace>>,
 
-    /// init进程引用
-    child_reaper: Option<Weak<ProcessControlBlock>>,
-
     inner: SpinLock<InnerPidNamespace>,
 }
 
@@ -32,6 +30,8 @@ pub struct InnerPidNamespace {
     ida: IdAllocator,
     /// PID到进程的映射表
     pid_map: HashMap<RawPid, Weak<ProcessControlBlock>>,
+    /// init进程引用
+    child_reaper: Option<Weak<ProcessControlBlock>>,
 }
 
 impl PidNamespace {
@@ -41,11 +41,9 @@ impl PidNamespace {
             self_ref: self_ref.clone(),
             level: 0,
             parent: None,
-            child_reaper: None,
             inner: SpinLock::new(InnerPidNamespace {
-                ns_common: NsCommon {
-                    stashed: core::sync::atomic::AtomicIsize::new(0),
-                },
+                ns_common: NsCommon::default(),
+                child_reaper: None,
                 ida: IdAllocator::new(1, usize::MAX).unwrap(),
                 pid_map: HashMap::new(),
             }),
@@ -74,6 +72,18 @@ impl PidNamespace {
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid_namespace.c#72
     fn create_pid_namespace(&self, user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, SystemError> {
         todo!("Implement PID namespace creation logic with user namespace support");
+    }
+
+    fn inner(&self) -> SpinLockGuard<InnerPidNamespace> {
+        self.inner.lock()
+    }
+
+    pub fn child_reaper(&self) -> Option<Weak<ProcessControlBlock>> {
+        self.inner().child_reaper.clone()
+    }
+
+    pub fn set_child_reaper(&self, child_reaper: Weak<ProcessControlBlock>) {
+        self.inner().child_reaper = Some(child_reaper);
     }
 }
 

@@ -4,7 +4,10 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigChildCode, Signal},
+    driver::tty::tty_core::TtyCore,
+    filesystem::sysfs::group,
     ipc::syscall::sys_kill::PidConverter,
+    process::pid::PidType,
     sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
     time::{sleep::nanosleep, Duration},
@@ -274,4 +277,40 @@ fn do_waitpid(
     };
 
     return None;
+}
+
+impl ProcessControlBlock {
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#143
+    pub(super) fn __exit_signal(&mut self) {
+        let group_dead = self.is_thread_group_leader();
+        let mut sig_guard = self.sig_info_mut();
+        let mut tty: Option<Arc<TtyCore>> = None;
+        if group_dead {
+            tty = sig_guard.tty();
+            sig_guard.set_tty(None);
+        } else {
+            // todo: 通知那些等待当前线程组退出的进程
+        }
+        self.__unhash_process(group_dead);
+
+        drop(tty);
+    }
+
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#123
+    fn __unhash_process(&self, group_dead: bool) {
+        self.detach_pid(PidType::PID);
+        if group_dead {
+            self.detach_pid(PidType::TGID);
+            self.detach_pid(PidType::PGID);
+            self.detach_pid(PidType::SID);
+        }
+
+        // 从线程组中移除
+        let self_ref = self.self_ref.upgrade().unwrap();
+        let thread_group_leader = self.threads_read_irqsave().group_leader().unwrap();
+        thread_group_leader
+            .threads_write_irqsave()
+            .group_tasks
+            .retain(|pcb| !Arc::ptr_eq(pcb, &self_ref));
+    }
 }

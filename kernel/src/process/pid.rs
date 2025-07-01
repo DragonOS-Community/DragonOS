@@ -1,4 +1,5 @@
 use core::fmt::Debug;
+use core::ops::Index;
 
 use crate::libs::rwlock::RwLock;
 use crate::libs::spinlock::SpinLock;
@@ -22,6 +23,8 @@ pub enum PidType {
 }
 
 impl PidType {
+    pub const ALL: [PidType; Self::PIDTYPE_MAX - 1] =
+        [PidType::PID, PidType::TGID, PidType::PGID, PidType::SID];
     pub const PIDTYPE_MAX: usize = PidType::MAX as usize;
 }
 
@@ -56,6 +59,20 @@ impl Pid {
 
     pub fn first_upid(&self) -> Option<UPid> {
         self.numbers.lock().first().cloned()
+    }
+
+    /// 判断当前pid是否是当前命名空间的init进程(即child reaper)
+    ///
+    /// 由于在copy_process中可能在pid_ns->child_reaper被赋值前就需要检查，
+    /// 因此这里通过pid号来检查。
+    /// 如果当前pid在当前命名空间中的pid号为1，则返回true，否则返回false。
+    pub fn is_child_reaper(&self) -> bool {
+        self.numbers.lock()[self.level as usize].nr == 1
+    }
+
+    pub fn has_task(&self, pid_type: PidType) -> bool {
+        let tasks = self.tasks[pid_type as usize].lock();
+        !tasks.is_empty()
     }
 }
 
@@ -103,12 +120,12 @@ impl PidLink {
     }
 
     /// 链接到指定的PID
-    pub fn link_pid(&self, pid: Arc<Pid>) {
+    pub(super) fn link_pid(&self, pid: Arc<Pid>) {
         self.pid.write().replace(pid);
     }
 
     /// 取消PID链接
-    pub fn unlink_pid(&self) {
+    pub(super) fn unlink_pid(&self) {
         self.pid.write().take();
     }
 
@@ -142,4 +159,58 @@ impl Clone for PidLink {
 /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c?fi=alloc_pid#162
 pub(super) fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, SystemError> {
     todo!("alloc_pid not implemented yet");
+}
+
+/// 释放pid
+///
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c#129
+pub(super) fn free_pid(pid: Arc<Pid>) {
+    // 释放PID
+    todo!("free_pid not implemented yet");
+}
+
+impl ProcessControlBlock {
+    pub(super) fn attach_pid(&self, pid_type: PidType) {
+        let pid = self.task_pid_ptr(pid_type);
+        if let Some(pid) = pid {
+            self.pids_links[pid_type as usize].link_pid(pid.clone());
+            pid.tasks[pid_type as usize]
+                .lock()
+                .push(self.self_ref.clone());
+        }
+    }
+
+    pub fn task_pid_ptr(&self, pid_type: PidType) -> Option<Arc<Pid>> {
+        if pid_type == PidType::PID {
+            return self.thread_pid.read().clone();
+        }
+
+        self.sig_struct().pids[pid_type as usize].clone()
+    }
+
+    pub(super) fn detach_pid(&self, pid_type: PidType) {
+        self.__change_pid(pid_type, None);
+    }
+
+    pub(super) fn change_pid(&self, pid_type: PidType, new_pid: Arc<Pid>) {
+        self.__change_pid(pid_type, Some(new_pid));
+        self.attach_pid(pid_type);
+    }
+
+    fn __change_pid(&self, pid_type: PidType, new_pid: Option<Arc<Pid>>) {
+        let pid = self.task_pid_ptr(pid_type);
+        self.pids_links[pid_type as usize].unlink_pid();
+        if let Some(new_pid) = new_pid {
+            self.pids_links[pid_type as usize].link_pid(new_pid.clone());
+        }
+
+        if let Some(pid) = pid {
+            for x in PidType::ALL.iter().rev() {
+                if pid.has_task(*x) {
+                    return;
+                }
+            }
+            free_pid(pid);
+        }
+    }
 }

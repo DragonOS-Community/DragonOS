@@ -563,3 +563,23 @@ pub trait SignalArch {
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64;
 }
+
+bitflags! {
+
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/sched/signal.h#253
+    pub struct SignalFlags: u32 {
+        const STOP_STOPPED = 0x00000001; /* job control stop in effect */
+        const STOP_CONTINUED = 0x00000002; /* SIGCONT since WCONTINUED reap */
+        const GROUP_EXIT = 0x00000004; /* group exit in progress */
+        const CLD_STOPPED = 0x00000010; /* Pending notifications to parent */
+        const CLD_CONTINUED = 0x00000020;
+        const UNKILLABLE = 0x00000040; /* for init: ignore fatal signals */
+    }
+}
+
+impl SignalFlags {
+    pub const CLD_MASK: SignalFlags = SignalFlags::CLD_STOPPED.union(SignalFlags::CLD_CONTINUED);
+    pub const STOP_MASK: SignalFlags = SignalFlags::CLD_MASK
+        .union(SignalFlags::STOP_STOPPED)
+        .union(SignalFlags::STOP_CONTINUED);
+}

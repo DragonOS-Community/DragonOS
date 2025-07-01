@@ -37,7 +37,7 @@ use crate::{
     },
     ipc::{
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending, SignalStruct},
+        signal_types::{SigInfo, SigPending, SignalFlags, SignalStruct},
     },
     libs::{
         align::AlignedBox,
@@ -704,7 +704,7 @@ pub struct ProcessControlBlock {
 
     thread_pid: RwLock<Option<Arc<Pid>>>,
     /// PID链接数组
-    pids: [PidLink; PidType::PIDTYPE_MAX],
+    pids_links: [PidLink; PidType::PIDTYPE_MAX],
 
     /// namespace代理
     nsproxy: RwLock<Arc<NsProxy>>,
@@ -864,7 +864,7 @@ impl ProcessControlBlock {
                 pid: raw_pid,
                 tgid: raw_pid,
                 thread_pid: RwLock::new(None),
-                pids: core::array::from_fn(|_| PidLink::default()),
+                pids_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RwLock::new(nsproxy),
                 basic: basic_info,
                 preempt_count,
@@ -1263,6 +1263,10 @@ impl ProcessControlBlock {
         self.thread.read_irqsave()
     }
 
+    pub fn threads_write_irqsave(&self) -> RwLockWriteGuard<ThreadInfo> {
+        self.thread.write_irqsave()
+    }
+
     pub fn restart_block(&self) -> SpinLockGuard<Option<RestartBlock>> {
         self.restart_block.lock()
     }
@@ -1296,32 +1300,18 @@ impl ProcessControlBlock {
         *self.nsproxy.write() = nsproxy;
     }
 
-    /// 初始化进程的PID链接（仅在fork/exec时调用）
-    pub fn init_pid_links(&mut self, main_pid: Arc<Pid>) {
-        // PID 和 TGID 通常相同
-        self.pids[PidType::PID as usize].link_pid(main_pid.clone());
-        self.pids[PidType::TGID as usize].link_pid(main_pid.clone());
-    }
-
-    /// 清理进程的PID链接，在进程退出时调用
-    pub fn clear_pid_links(&mut self) {
-        for link in &mut self.pids {
-            if let Some(pid_arc) = link.get_pid() {
-                free_pid(pid_arc);
-            }
-            link.unlink_pid();
-        }
+    pub fn is_thread_group_leader(&self) -> bool {
+        self.exit_signal.load(Ordering::SeqCst) != Signal::INVALID
     }
 }
 
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        self.__exit_signal();
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.raw_pid())
-            .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
-        // 释放所有 PID 映射
-        self.clear_pid_links();
+            .unwrap_or_else(|e: SystemError| panic!("procfs_unregister_pid failed: error: {e:?}"));
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
             ppcb.children
                 .write_irqsave()
@@ -1343,6 +1333,9 @@ pub struct ThreadInfo {
     vfork_done: Option<Arc<Completion>>,
     /// 线程组的组长
     group_leader: Weak<ProcessControlBlock>,
+
+    /// 当前线程为组长时，该字段存储组内所有线程的pcb
+    group_tasks: Vec<Arc<ProcessControlBlock>>,
 }
 
 impl Default for ThreadInfo {
@@ -1358,6 +1351,7 @@ impl ThreadInfo {
             set_child_tid: None,
             vfork_done: None,
             group_leader: Weak::default(),
+            group_tasks: Vec::new(),
         }
     }
 
@@ -1941,8 +1935,15 @@ pub struct ProcessSignalInfo {
     sig_pending: SigPending,
     // sig_shared_pending 中存储当前线程所属进程要处理的信号
     sig_shared_pending: SigPending,
+    flags: SignalFlags,
     // 当前进程对应的tty
     tty: Option<Arc<TtyCore>>,
+    has_child_subreaper: bool,
+
+    /// 标记当前进程是否是一个“子进程收割者”
+    ///
+    /// todo: 在prctl里面实现设置这个标志位的功能
+    is_child_subreaper: bool,
 }
 
 impl ProcessSignalInfo {
@@ -1986,6 +1987,10 @@ impl ProcessSignalInfo {
         self.tty = tty;
     }
 
+    pub fn flags(&self) -> SignalFlags {
+        self.flags
+    }
+
     /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号
     ///
     /// ## 参数
@@ -2007,6 +2012,22 @@ impl ProcessSignalInfo {
             return res;
         }
     }
+
+    pub fn has_child_subreaper(&self) -> bool {
+        self.has_child_subreaper
+    }
+
+    pub fn set_has_child_subreaper(&mut self, has_child_subreaper: bool) {
+        self.has_child_subreaper = has_child_subreaper;
+    }
+
+    pub fn is_child_subreaper(&self) -> bool {
+        self.is_child_subreaper
+    }
+
+    pub fn set_is_child_subreaper(&mut self, is_child_subreaper: bool) {
+        self.is_child_subreaper = is_child_subreaper;
+    }
 }
 
 impl Default for ProcessSignalInfo {
@@ -2017,6 +2038,9 @@ impl Default for ProcessSignalInfo {
             sig_pending: SigPending::default(),
             sig_shared_pending: SigPending::default(),
             tty: None,
+            has_child_subreaper: false,
+            is_child_subreaper: false,
+            flags: SignalFlags::empty(),
         }
     }
 }

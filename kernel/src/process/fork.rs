@@ -8,7 +8,7 @@ use system_error::SystemError;
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
     filesystem::procfs::procfs_register_pid,
-    ipc::signal::flush_signal_handlers,
+    ipc::{signal::flush_signal_handlers, signal_types::SignalFlags},
     libs::rwlock::RwLock,
     mm::VirtAddr,
     process::ProcessFlags,
@@ -350,7 +350,17 @@ impl ProcessManager {
             return Err(SystemError::EINVAL);
         }
 
-        // TODO: 处理CLONE_PARENT 与 SIGNAL_UNKILLABLE的情况
+        // 当全局init进程或其容器内init进程的兄弟进程退出时，由于它们的父进程（swapper）不会回收它们，
+        // 这些进程会保持僵尸状态。为了避免这种情况以及防止出现多根进程树，
+        // 需要阻止全局init和容器内init进程创建兄弟进程。
+        if clone_flags.contains(CloneFlags::CLONE_PARENT)
+            && current_pcb
+                .sig_info_irqsave()
+                .flags
+                .contains(SignalFlags::UNKILLABLE)
+        {
+            return Err(SystemError::EINVAL);
+        }
 
         // 如果新进程使用不同的 pid 或 namespace，
         // 则不允许它与分叉任务共享线程组。
@@ -509,8 +519,6 @@ impl ProcessManager {
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }
 
-        // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
-
         Self::copy_group(current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
@@ -524,10 +532,48 @@ impl ProcessManager {
                 current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
+        let pid = pcb.pid();
+        if let Some(pid) = pid.clone() {
+            if pcb.is_thread_group_leader() {
+                pcb.init_task_pid(PidType::TGID, pid.clone());
+                pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
+                pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
 
-        todo!("https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/fork.c#2676");
-        if pcb.pid().is_some() {
-            pcb.init_task_pid(PidType::PID, pid);
+                if pid.is_child_reaper() {
+                    pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
+                    pcb.sig_info_mut().flags.insert(SignalFlags::UNKILLABLE);
+                }
+
+                let parent_siginfo = current_pcb.sig_info_irqsave();
+                let parent_tty = parent_siginfo.tty();
+                let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
+                let parent_is_child_reaper = parent_siginfo.is_child_subreaper();
+                drop(parent_siginfo);
+                let mut sig_info_guard = pcb.sig_info_mut();
+
+                sig_info_guard.set_tty(parent_tty);
+
+                /*
+                 * Inherit has_child_subreaper flag under the same
+                 * tasklist_lock with adding child to the process tree
+                 * for propagate_has_child_subreaper optimization.
+                 */
+                sig_info_guard
+                    .set_has_child_subreaper(parent_has_child_subreaper || parent_is_child_reaper);
+                drop(sig_info_guard);
+                pcb.attach_pid(PidType::TGID);
+                pcb.attach_pid(PidType::PGID);
+                pcb.attach_pid(PidType::SID);
+            } else {
+                pcb.task_join_group_stop();
+                let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
+                group_leader
+                    .threads_write_irqsave()
+                    .group_tasks
+                    .push(pcb.clone());
+            }
+
+            pcb.attach_pid(PidType::PID);
         }
 
         sched_cgroup_fork(pcb);
@@ -598,7 +644,6 @@ impl ProcessManager {
 
 impl ProcessControlBlock {
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/fork.c#1959
-
     pub(super) fn init_task_pid(&self, pid_type: PidType, pid: Arc<Pid>) {
         if pid_type == PidType::PID {
             self.thread_pid.write().replace(pid);

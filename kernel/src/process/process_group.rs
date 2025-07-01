@@ -2,7 +2,10 @@ use super::{
     session::{Session, Sid},
     ProcessControlBlock, ProcessManager, RawPid,
 };
-use crate::libs::spinlock::SpinLock;
+use crate::{
+    libs::spinlock::SpinLock,
+    process::pid::{Pid, PidType},
+};
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -364,5 +367,18 @@ impl ProcessControlBlock {
                 }
             }
         }
+    }
+
+    pub fn task_pgrp(&self) -> Option<Arc<Pid>> {
+        self.sig_struct().pids[PidType::PGID as usize].clone()
+    }
+
+    pub fn task_session(&self) -> Option<Arc<Pid>> {
+        self.sig_struct().pids[PidType::SID as usize].clone()
+    }
+
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=task_join_group_stop#393
+    pub(super) fn task_join_group_stop(&self) {
+        // todo: 实现  https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=task_join_group_stop#393
     }
 }

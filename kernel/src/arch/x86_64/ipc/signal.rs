@@ -20,7 +20,7 @@ use crate::{
     exception::InterruptArch,
     ipc::{
         signal::{restore_saved_sigmask, set_current_blocked},
-        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch},
+        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags},
     },
     mm::MemoryManagementArch,
     process::ProcessManager,
@@ -208,7 +208,10 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         return;
     }
 
-    let sig_guard = sig_guard.unwrap();
+    let sig_guard: crate::libs::spinlock::SpinLockGuard<
+        '_,
+        crate::ipc::signal_types::SignalStruct,
+    > = sig_guard.unwrap();
     let mut siginfo_mut_guard = siginfo_mut.unwrap();
     loop {
         (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
@@ -234,6 +237,22 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
                 }
             },
             SigactionType::SaSigaction(_) => todo!(),
+        }
+
+        /*
+         * Global init gets no signals it doesn't want.
+         * Container-init gets no signals it doesn't want from same
+         * container.
+         *
+         * Note that if global/container-init sees a sig_kernel_only()
+         * signal here, the signal must have been generated internally
+         * or must have come from an ancestor namespace. In either
+         * case, the signal cannot be dropped.
+         */
+        // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/signal.h?fi=sig_kernel_only#444
+        if siginfo_mut_guard.flags().contains(SignalFlags::UNKILLABLE) && !sig_number.kernel_only()
+        {
+            continue;
         }
 
         if sigaction.is_some() {

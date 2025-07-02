@@ -33,13 +33,15 @@ use super::{Iface, IfaceCommon};
 // const DEVICE_NAME: &str = "veth";
 
 pub struct Veth {
+    name: String,
     rx_queue: VecDeque<Vec<u8>>,
     peer: Option<Arc<SpinLock<Veth>>>,
 }
 
 impl Veth {
-    pub fn new() -> Self {
+    pub fn new(name: String) -> Self {
         Veth {
+            name,
             rx_queue: VecDeque::new(),
             peer: None,
         }
@@ -50,13 +52,29 @@ impl Veth {
     }
 
     pub fn send_to_peer(&self, data: Vec<u8>) {
+        // log::info!("{} sending", self.name);
         if let Some(peer) = &self.peer {
-            peer.lock().rx_queue.push_back(data);
+            let mut peer = peer.lock();
+            peer.rx_queue.push_back(data);
+            // log::info!(
+            //     "{} sending data to peer {}, peer current rx_queue: {:?}",
+            //     self.name,
+            //     peer.name(),
+            //     peer.rx_queue
+            // );
         }
     }
 
-    pub fn recv(&mut self) -> Option<Vec<u8>> {
+    pub fn recv_from_peer(&mut self) -> Option<Vec<u8>> {
+        // log::info!(
+        //     "{} Receiving data from peer, current rx_queue: {:?}",
+        //     self.name,
+        //     self.rx_queue
+        // );
         self.rx_queue.pop_front()
+    }
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -66,9 +84,9 @@ pub struct VethDriver {
 }
 
 impl VethDriver {
-    pub fn new_pair() -> (Self, Self) {
-        let dev1 = Arc::new(SpinLock::new(Veth::new()));
-        let dev2 = Arc::new(SpinLock::new(Veth::new()));
+    pub fn new_pair(name1: &str, name2: &str) -> (Self, Self) {
+        let dev1 = Arc::new(SpinLock::new(Veth::new(name1.to_string())));
+        let dev2 = Arc::new(SpinLock::new(Veth::new(name2.to_string())));
 
         dev1.lock().set_peer(dev2.clone());
         dev2.lock().set_peer(dev1.clone());
@@ -148,7 +166,8 @@ impl phy::Device for VethDriver {
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut guard = self.inner.lock();
-        guard.recv().map(|buf| {
+        guard.recv_from_peer().map(|buf| {
+            // log::info!("VethDriver received data: {:?}", buf);
             (
                 VethRxToken { buffer: buf },
                 VethTxToken {
@@ -221,10 +240,14 @@ impl VethInterface {
         NET_DEVICES
             .write_irqsave()
             .insert(device.nic_id(), device.clone());
-        log::debug!(
-            "VethInterface created, devices: {:?}",
-            NET_DEVICES.read().keys()
-        );
+        // log::debug!(
+        //     "VethInterface created, devices: {:?}",
+        //     NET_DEVICES
+        //         .read()
+        //         .values()
+        //         .map(|d| d.iface_name())
+        //         .collect::<Vec<_>>()
+        // );
         register_netdevice(device.clone()).expect("register veth device failed");
 
         device
@@ -234,9 +257,8 @@ impl VethInterface {
         self.inner.lock()
     }
 
-    pub fn update_ip_addrs(&self, addr: IpAddress, cidr: u8) {
+    pub fn update_ip_addrs(&self, addr: IpAddress, cidr: IpCidr) {
         let iface = &mut self.common.smol_iface.lock();
-        let cidr = IpCidr::new(addr, cidr);
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs.push(cidr).expect("Push ipCidr failed: full");
         });
@@ -252,6 +274,8 @@ impl VethInterface {
                 })
                 .expect("Add default ipv4 route failed: full");
         });
+
+        log::info!("VethInterface {} updated IP address: {}", self.name, addr);
     }
 }
 
@@ -391,7 +415,7 @@ impl Iface for VethInterface {
 }
 
 impl BridgeEnableDevice for VethInterface {
-    fn bridge_transmit(&self, frame: &[u8]) {
+    fn receive_from_bridge(&self, frame: &[u8]) {
         let driver = self.driver.force_get_mut();
         let token = VethTxToken {
             driver: driver.clone(),
@@ -403,6 +427,9 @@ impl BridgeEnableDevice for VethInterface {
     fn name(&self) -> String {
         self.name.clone()
     }
+    fn mac_addr(&self) -> EthernetAddress {
+        self.mac()
+    }
     // fn bridge_receive(&self, frame: &[u8]) {
     //     let driver = self.driver.force_get_mut();
     //     let token = VethRxToken {
@@ -412,9 +439,19 @@ impl BridgeEnableDevice for VethInterface {
 }
 
 pub fn veth_probe() {
-    let (drv0, drv1) = VethDriver::new_pair();
-    VethInterface::new("veth0", drv0);
-    VethInterface::new("veth1", drv1);
+    let name1 = "veth0";
+    let name2 = "veth1";
+    let (drv0, drv1) = VethDriver::new_pair(name1, name2);
+    let iface1 = VethInterface::new(name1, drv0);
+    let iface2 = VethInterface::new(name2, drv1);
+
+    let addr1 = IpAddress::v4(10, 0, 0, 1);
+    let cidr1 = IpCidr::new(addr1, 24);
+    iface1.update_ip_addrs(addr1, cidr1);
+
+    let addr2 = IpAddress::v4(10, 0, 0, 2);
+    let cidr2 = IpCidr::new(addr2, 24);
+    iface2.update_ip_addrs(addr2, cidr2);
 }
 
 #[unified_init(INITCALL_DEVICE)]
@@ -423,70 +460,3 @@ pub fn veth_init() -> Result<(), SystemError> {
     log::info!("Veth pair initialized.");
     Ok(())
 }
-
-// use smoltcp::time::Instant;
-
-// pub fn test_veth_loop() {
-//     let mut dev_map = NET_DEVICES.write_irqsave();
-
-//     let veth0 = dev_map
-//         .iter()
-//         .find(|(_, dev)| dev.iface_name() == "veth0")
-//         .map(|(_, dev)| dev.clone())
-//         .and_then(|dev| dev.as_any_ref().downcast_ref::<VethInterface>())
-//         .expect("veth0 not found");
-
-//     let veth1 = dev_map
-//         .iter()
-//         .find(|(_, dev)| dev.iface_name() == "veth1")
-//         .map(|(_, dev)| dev.clone())
-//         .and_then(|dev| dev.as_any_ref().downcast_ref::<VethInterface>())
-//         .expect("veth1 not found");
-
-//     // veth0 → veth1
-//     {
-//         let frame: &[u8] = &[
-//             0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // Destination MAC
-//             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, // Source MAC
-//             0x08, 0x00, // Ethertype: IPv4
-//             0xde, 0xad, 0xbe, 0xef, // Payload
-//         ];
-//         let tx = veth0.bridge_transmit(frame);
-
-//         veth1.poll(); // 触发接收
-
-//         veth1
-//             .driver
-//             .inner
-//             .lock()
-//             .rx_queue
-//             .pop_front()
-//             .map(|buf| {
-//                 log::info!("[veth1 recv]: {:?}", &buf);
-//             })
-//             .unwrap_or_else(|| {
-//                 log::warn!("[veth1 recv]: nothing received");
-//             });
-//     }
-
-    // // veth1 → veth0
-    // {
-    //     let tx = veth1.bridge_transmit(Instant::now()).unwrap();
-    //     let _ = tx.consume(32, |buf| {
-    //         buf[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x77]);
-    //         buf[6..12].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
-    //         buf[12..14].copy_from_slice(&(0x0806u16.to_be_bytes())); // ethertype: ARP
-    //         buf[14..].copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
-    //     });
-
-    //     veth0.poll();
-
-    //     if let Some((rx, _)) = veth0.driver.force_get_mut().receive(Instant::now()) {
-    //         rx.consume(|buf| {
-    //             log::info!("[veth0 recv]: {:?}", &buf);
-    //         });
-    //     } else {
-    //         log::warn!("[veth0 recv]: nothing received");
-    //     }
-    // }
-// }

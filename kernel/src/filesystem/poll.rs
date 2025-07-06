@@ -164,7 +164,10 @@ impl Syscall {
     }
 }
 
-fn do_sys_poll(poll_fds: &mut [PollFd], timeout: Option<Instant>) -> Result<usize, SystemError> {
+pub fn do_sys_poll(
+    poll_fds: &mut [PollFd],
+    timeout: Option<Instant>,
+) -> Result<usize, SystemError> {
     let ep_file = EventPoll::create_epoll_file(FileMode::empty())?;
 
     let ep_file = Arc::new(ep_file);
@@ -177,7 +180,7 @@ fn do_sys_poll(poll_fds: &mut [PollFd], timeout: Option<Instant>) -> Result<usiz
 }
 
 /// 计算超时的时刻
-fn poll_select_set_timeout(timeout_ms: u64) -> Option<Instant> {
+pub fn poll_select_set_timeout(timeout_ms: u64) -> Option<Instant> {
     Some(Instant::now() + Duration::from_millis(timeout_ms))
 }
 

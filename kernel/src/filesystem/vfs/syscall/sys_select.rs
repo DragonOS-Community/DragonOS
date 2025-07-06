@@ -2,8 +2,9 @@
 use alloc::vec::Vec;
 use system_error::SystemError;
 
+#[cfg(target_arch = "x86_64")]
+use crate::arch::syscall::nr::SYS_SELECT;
 use crate::{
-    arch::syscall::nr::SYS_SELECT,
     filesystem::{
         epoll::EPollEventType,
         poll::{do_sys_poll, poll_select_set_timeout, PollFd},
@@ -280,5 +281,5 @@ impl FdSet {
         }
     }
 }
-
+#[cfg(target_arch = "x86_64")]
 syscall_table_macros::declare_syscall!(SYS_SELECT, SysSelect);

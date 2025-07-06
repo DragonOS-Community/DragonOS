@@ -61,7 +61,6 @@ pub mod sys_umount2;
 
 pub mod symlink_utils;
 mod sys_pselect6;
-#[cfg(target_arch = "x86_64")]
 mod sys_select;
 #[cfg(target_arch = "x86_64")]
 mod sys_symlink;

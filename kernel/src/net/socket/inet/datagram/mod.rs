@@ -160,6 +160,22 @@ impl UdpSocket {
         }
         return event;
     }
+
+    /// 这个方法会阻塞当前线程，直到有数据可读
+    /// 通过 poll_blocking 来等待数据的到来
+    pub(self) fn wait_for_recv(&self) {
+        use crate::sched::SchedMode;
+        let guard = self.inner.read();
+        let inner = guard.as_ref();
+        if let UdpInner::Bound(bound) = inner.unwrap() {
+            let rem = bound.inner().iface().clone();
+            drop(guard);
+            let self_ref = self.self_ref.upgrade().unwrap().clone();
+            let can_recv = move || self_ref.can_recv();
+            rem.poll_blocking(&can_recv);
+        }
+        let _ = wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {});
+    }
 }
 
 impl Socket for UdpSocket {
@@ -225,15 +241,13 @@ impl Socket for UdpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        use crate::sched::SchedMode;
-
         return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer)
         } else {
             loop {
                 match self.try_recv(buffer) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                        self.wait_for_recv();
                     }
                     result => break result,
                 }
@@ -248,7 +262,6 @@ impl Socket for UdpSocket {
         flags: PMSG,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        use crate::sched::SchedMode;
         // could block io
         if let Some(endpoint) = address {
             self.connect(endpoint)?;
@@ -260,8 +273,8 @@ impl Socket for UdpSocket {
             loop {
                 match self.try_recv(buffer) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
-                        log::debug!("UdpSocket::recv_from: wake up");
+                        self.wait_for_recv();
+                        log::info!("UdpSocket::recv_from: wake up");
                     }
                     result => break result,
                 }

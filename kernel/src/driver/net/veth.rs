@@ -1,3 +1,6 @@
+use super::bridge::BridgeEnableDevice;
+use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
+use super::{Iface, IfaceCommon};
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
@@ -11,7 +14,10 @@ use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::libs::wait_queue::WaitQueue;
 use crate::net::{generate_iface_id, NET_DEVICES};
+use crate::process::ProcessState;
+use crate::sched::SchedMode;
 use alloc::collections::VecDeque;
 use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
@@ -25,17 +31,11 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use super::bridge::BridgeEnableDevice;
-use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
-
-use super::{Iface, IfaceCommon};
-
-// const DEVICE_NAME: &str = "veth";
-
 pub struct Veth {
     name: String,
     rx_queue: VecDeque<Vec<u8>>,
-    peer: Option<Arc<SpinLock<Veth>>>,
+    /// 对端的 `VethInterface`，在完成数据发送的时候会使用到
+    peer: Weak<VethInterface>,
 }
 
 impl Veth {
@@ -43,36 +43,29 @@ impl Veth {
         Veth {
             name,
             rx_queue: VecDeque::new(),
-            peer: None,
+            peer: Weak::new(),
         }
     }
 
-    pub fn set_peer(&mut self, peer: Arc<SpinLock<Veth>>) {
-        self.peer = Some(peer);
+    pub fn set_peer_iface(&mut self, peer: &Arc<VethInterface>) {
+        self.peer = Arc::downgrade(peer);
     }
 
     pub fn send_to_peer(&self, data: Vec<u8>) {
-        // log::info!("{} sending", self.name);
-        if let Some(peer) = &self.peer {
-            let mut peer = peer.lock();
-            peer.rx_queue.push_back(data);
-            // log::info!(
-            //     "{} sending data to peer {}, peer current rx_queue: {:?}",
-            //     self.name,
-            //     peer.name(),
-            //     peer.rx_queue
-            // );
+        if let Some(peer) = self.peer.upgrade() {
+            let mut peer_veth = peer.driver.force_get_mut().inner.lock_irqsave();
+            peer_veth.rx_queue.push_back(data.clone());
+            drop(peer_veth);
+
+            // 唤醒对端正在等待的进程
+            peer.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
         }
     }
 
     pub fn recv_from_peer(&mut self) -> Option<Vec<u8>> {
-        // log::info!(
-        //     "{} Receiving data from peer, current rx_queue: {:?}",
-        //     self.name,
-        //     self.rx_queue
-        // );
         self.rx_queue.pop_front()
     }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -84,14 +77,26 @@ pub struct VethDriver {
 }
 
 impl VethDriver {
-    pub fn new_pair(name1: &str, name2: &str) -> (Self, Self) {
+    /// # `new_pair`
+    /// 创建一对虚拟以太网设备（veth pair），用于网络测试
+    /// ## 参数
+    /// - `name1`: 第一个设备的名称
+    /// - `name2`: 第二个设备的名称
+    /// ## 返回值
+    /// 返回一个元组，包含两个 `VethDriver` 实例，分别对应
+    /// 第一个和第二个虚拟以太网设备。   
+    pub fn new_pair(name1: &str, name2: &str) -> (VethDriver, VethDriver) {
         let dev1 = Arc::new(SpinLock::new(Veth::new(name1.to_string())));
         let dev2 = Arc::new(SpinLock::new(Veth::new(name2.to_string())));
 
-        dev1.lock().set_peer(dev2.clone());
-        dev2.lock().set_peer(dev1.clone());
+        let driver1 = VethDriver { inner: dev1 };
+        let driver2 = VethDriver { inner: dev2 };
 
-        (VethDriver { inner: dev1 }, VethDriver { inner: dev2 })
+        (driver1, driver2)
+    }
+
+    pub fn name(&self) -> String {
+        self.inner.lock_irqsave().name().to_string()
     }
 }
 
@@ -106,7 +111,7 @@ impl phy::TxToken for VethTxToken {
     {
         let mut buf = vec![0; len];
         let result = f(&mut buf);
-        self.driver.inner.lock().send_to_peer(buf);
+        self.driver.inner.lock_irqsave().send_to_peer(buf);
         result
     }
 }
@@ -165,7 +170,7 @@ impl phy::Device for VethDriver {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let mut guard = self.inner.lock();
+        let mut guard = self.inner.lock_irqsave();
         guard.recv_from_peer().map(|buf| {
             // log::info!("VethDriver received data: {:?}", buf);
             (
@@ -191,20 +196,34 @@ pub struct VethInterface {
     name: String,
     driver: VethDriverWarpper,
     common: IfaceCommon,
-    inner: SpinLock<InnerVethInterface>,
+    inner: SpinLock<VethCommonData>,
     locked_kobj_state: LockedKObjectState,
+    wait_queue: WaitQueue,
 }
 
 #[derive(Debug)]
-pub struct InnerVethInterface {
+pub struct VethCommonData {
     netdevice_common: NetDeviceCommonData,
     device_common: DeviceCommonData,
     kobj_common: KObjectCommonData,
+    peer_veth: Weak<VethInterface>,
 }
 
 impl VethInterface {
-    pub fn new(name: &str, driver: VethDriver) -> Arc<Self> {
+    pub fn has_data(&self) -> bool {
+        let driver = self.driver.force_get_mut();
+        let inner = driver.inner.lock_irqsave();
+        !inner.rx_queue.is_empty()
+    }
+
+    #[allow(unused)]
+    pub fn peer_veth(&self) -> Arc<VethInterface> {
+        self.inner.lock_irqsave().peer_veth.upgrade().unwrap()
+    }
+
+    pub fn new(driver: VethDriver) -> Arc<Self> {
         let iface_id = generate_iface_id();
+        let name = driver.name();
         let mac = [
             0x02,
             0x00,
@@ -224,41 +243,48 @@ impl VethInterface {
         iface.set_any_ip(true);
 
         let device = Arc::new(VethInterface {
-            name: name.to_string(),
+            name,
             driver: VethDriverWarpper(UnsafeCell::new(driver)),
             common: IfaceCommon::new(iface_id, true, iface),
-            inner: SpinLock::new(InnerVethInterface {
+            inner: SpinLock::new(VethCommonData {
                 netdevice_common: NetDeviceCommonData::default(),
                 device_common: DeviceCommonData::default(),
                 kobj_common: KObjectCommonData::default(),
+                peer_veth: Weak::new(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
+            wait_queue: WaitQueue::default(),
         });
-
-        device.set_net_state(NetDeivceState::__LINK_STATE_START);
-        device.set_operstate(Operstate::IF_OPER_UP);
-        NET_DEVICES
-            .write_irqsave()
-            .insert(device.nic_id(), device.clone());
-        // log::debug!(
-        //     "VethInterface created, devices: {:?}",
-        //     NET_DEVICES
-        //         .read()
-        //         .values()
-        //         .map(|d| d.iface_name())
-        //         .collect::<Vec<_>>()
-        // );
-        register_netdevice(device.clone()).expect("register veth device failed");
-
         device
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVethInterface> {
-        self.inner.lock()
+    pub fn set_peer_iface(&self, peer: &Arc<VethInterface>) {
+        let mut inner = self.inner.lock_irqsave();
+        inner.peer_veth = Arc::downgrade(peer);
+        self.driver.inner.lock_irqsave().set_peer_iface(peer);
+    }
+
+    pub fn new_pair(name1: &str, name2: &str) -> (Arc<Self>, Arc<Self>) {
+        let (driver1, driver2) = VethDriver::new_pair(name1, name2);
+        let iface1 = VethInterface::new(driver1);
+        let iface2 = VethInterface::new(driver2);
+
+        iface1.set_peer_iface(&iface2);
+        iface2.set_peer_iface(&iface1);
+
+        // log::info!(
+        //     "is connected: {}",
+        //     iface1.driver.inner.lock_irqsave().peer.upgrade().is_some()
+        // );
+        (iface1, iface2)
+    }
+
+    fn inner(&self) -> SpinLockGuard<VethCommonData> {
+        self.inner.lock_irqsave()
     }
 
     pub fn update_ip_addrs(&self, addr: IpAddress, cidr: IpCidr) {
-        let iface = &mut self.common.smol_iface.lock();
+        let iface = &mut self.common.smol_iface.lock_irqsave();
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs.push(cidr).expect("Push ipCidr failed: full");
         });
@@ -275,7 +301,7 @@ impl VethInterface {
                 .expect("Add default ipv4 route failed: full");
         });
 
-        log::info!("VethInterface {} updated IP address: {}", self.name, addr);
+        // log::info!("VethInterface {} updated IP address: {}", self.name, addr);
     }
 }
 
@@ -283,40 +309,52 @@ impl KObject for VethInterface {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
+
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
         self.inner().kobj_common.kern_inode = inode;
     }
+
     fn inode(&self) -> Option<Arc<KernFSInode>> {
         self.inner().kobj_common.kern_inode.clone()
     }
+
     fn parent(&self) -> Option<Weak<dyn KObject>> {
         self.inner().kobj_common.parent.clone()
     }
+
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
         self.inner().kobj_common.parent = parent;
     }
+
     fn kset(&self) -> Option<Arc<KSet>> {
         self.inner().kobj_common.kset.clone()
     }
+
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
         self.inner().kobj_common.kset = kset;
     }
+
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
         self.inner().kobj_common.kobj_type
     }
+
     fn name(&self) -> String {
         self.name.clone()
     }
+
     fn set_name(&self, _name: String) {}
     fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
         self.locked_kobj_state.read()
     }
+
     fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
         self.locked_kobj_state.write()
     }
+
     fn set_kobj_state(&self, state: KObjectState) {
         *self.locked_kobj_state.write() = state;
     }
+
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
         self.inner().kobj_common.kobj_type = ktype;
     }
@@ -326,15 +364,19 @@ impl Device for VethInterface {
     fn dev_type(&self) -> DeviceType {
         DeviceType::Net
     }
+
     fn id_table(&self) -> IdTable {
         IdTable::new(self.name.clone(), None)
     }
+
     fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner().device_common.bus.clone()
     }
+
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner().device_common.bus = bus;
     }
+
     fn class(&self) -> Option<Arc<dyn Class>> {
         let mut guard = self.inner();
         let r = guard.device_common.class.clone()?.upgrade();
@@ -343,9 +385,11 @@ impl Device for VethInterface {
         }
         r
     }
+
     fn set_class(&self, class: Option<Weak<dyn Class>>) {
         self.inner().device_common.class = class;
     }
+
     fn driver(&self) -> Option<Arc<dyn Driver>> {
         let r = self.inner().device_common.driver.clone()?.upgrade();
         if r.is_none() {
@@ -353,24 +397,31 @@ impl Device for VethInterface {
         }
         r
     }
+
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
         self.inner().device_common.driver = driver;
     }
+
     fn is_dead(&self) -> bool {
         false
     }
+
     fn can_match(&self) -> bool {
         self.inner().device_common.can_match
     }
+
     fn set_can_match(&self, can_match: bool) {
         self.inner().device_common.can_match = can_match;
     }
+
     fn state_synced(&self) -> bool {
         true
     }
+
     fn dev_parent(&self) -> Option<Weak<dyn Device>> {
         self.inner().device_common.get_parent_weak_or_clear()
     }
+
     fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
         self.inner().device_common.parent = parent;
     }
@@ -380,35 +431,75 @@ impl Iface for VethInterface {
     fn common(&self) -> &IfaceCommon {
         &self.common
     }
+
     fn iface_name(&self) -> String {
         self.name.clone()
     }
+
     fn mac(&self) -> EthernetAddress {
-        if let HardwareAddress::Ethernet(mac) = self.common.smol_iface.lock().hardware_addr() {
+        if let HardwareAddress::Ethernet(mac) =
+            self.common.smol_iface.lock_irqsave().hardware_addr()
+        {
             mac
         } else {
             EthernetAddress([0, 0, 0, 0, 0, 0])
         }
     }
+
+    fn poll_blocking(&self, can_stop_fn: &dyn Fn() -> bool) {
+        // log::info!("VethInterface {} polling block", self.name);
+
+        loop {
+            // 检查是否有数据可用
+            self.common.poll(self.driver.force_get_mut());
+
+            let has_data = self.has_data();
+
+            // 外部 socket 是否可以接收数据，如果是的话就可以退出loop了
+            let can_stop = can_stop_fn();
+
+            if can_stop {
+                break;
+            }
+
+            // 没有数据可用时，进入等待队列
+            // 如果有数据可用，则直接跳出循环
+            if !has_data {
+                let _ = wq_wait_event_interruptible!(
+                    self.wait_queue,
+                    self.has_data() || can_stop_fn(),
+                    {}
+                );
+            }
+        }
+    }
+
     fn poll(&self) {
+        // log::info!("VethInterface {} polling normal", self.name);
         self.common.poll(self.driver.force_get_mut());
     }
+
     fn addr_assign_type(&self) -> u8 {
         self.inner().netdevice_common.addr_assign_type
     }
+
     fn net_device_type(&self) -> u16 {
         self.inner().netdevice_common.net_device_type = 1;
         self.inner().netdevice_common.net_device_type
     }
+
     fn net_state(&self) -> NetDeivceState {
         self.inner().netdevice_common.state
     }
+
     fn set_net_state(&self, state: NetDeivceState) {
         self.inner().netdevice_common.state |= state;
     }
+
     fn operstate(&self) -> Operstate {
         self.inner().netdevice_common.operstate
     }
+
     fn set_operstate(&self, state: Operstate) {
         self.inner().netdevice_common.operstate = state;
     }
@@ -424,26 +515,12 @@ impl BridgeEnableDevice for VethInterface {
             buf.copy_from_slice(frame);
         });
     }
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-    fn mac_addr(&self) -> EthernetAddress {
-        self.mac()
-    }
-    // fn bridge_receive(&self, frame: &[u8]) {
-    //     let driver = self.driver.force_get_mut();
-    //     let token = VethRxToken {
-    //         buffer: frame.to_vec(),
-    //     };
-    // }
 }
 
 pub fn veth_probe() {
     let name1 = "veth0";
     let name2 = "veth1";
-    let (drv0, drv1) = VethDriver::new_pair(name1, name2);
-    let iface1 = VethInterface::new(name1, drv0);
-    let iface2 = VethInterface::new(name2, drv1);
+    let (iface1, iface2) = VethInterface::new_pair(name1, name2);
 
     let addr1 = IpAddress::v4(10, 0, 0, 1);
     let cidr1 = IpCidr::new(addr1, 24);
@@ -452,6 +529,16 @@ pub fn veth_probe() {
     let addr2 = IpAddress::v4(10, 0, 0, 2);
     let cidr2 = IpCidr::new(addr2, 24);
     iface2.update_ip_addrs(addr2, cidr2);
+
+    let turn_on = |a: &Arc<VethInterface>| {
+        a.set_net_state(NetDeivceState::__LINK_STATE_START);
+        a.set_operstate(Operstate::IF_OPER_UP);
+        NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
+        register_netdevice(a.clone()).expect("register veth device failed");
+    };
+
+    turn_on(&iface1);
+    turn_on(&iface2);
 }
 
 #[unified_init(INITCALL_DEVICE)]

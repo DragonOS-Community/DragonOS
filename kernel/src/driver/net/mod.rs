@@ -75,14 +75,15 @@ pub trait Iface: crate::driver::base::device::Device {
         self.common().iface_id
     }
 
-    /// # `poll`
-    /// 用于轮询接口的状态。
-    /// ## 参数
-    /// - `sockets` ：一个可变引用到 `smoltcp::iface::SocketSet`，表示要轮询的套接字集
-    /// ## 返回值
-    /// - 成功返回 `Ok(())`
-    /// - 如果轮询失败，返回 `Err(SystemError::EAGAIN_OR_EWOULDBLOCK)`，表示需要再次尝试或者操作会阻塞
     fn poll(&self);
+
+    /// # `poll_blocking`
+    /// 用于在阻塞模式下轮询网卡
+    /// ## 参数
+    /// - `can_recv_fn` ：一个函数指针，用于判断是否可以接收数据
+    /// ## 返回值
+    /// - 该函数不返回任何值，但会在满足条件时阻塞当前线程，直到可以接收数据。
+    fn poll_blocking(&self, _can_recv_fn: &dyn Fn() -> bool) {}
 
     /// # `update_ip_addrs`
     /// 用于更新接口的 IP 地址
@@ -229,6 +230,12 @@ impl IfaceCommon {
         // drop sockets here to avoid deadlock
         drop(interface);
         drop(sockets);
+        // log::info!(
+        //     "polling iface {}, has_events: {}, poll_at: {:?}",
+        //     self.iface_id,
+        //     has_events,
+        //     poll_at
+        // );
 
         use core::sync::atomic::Ordering;
         if let Some(instant) = poll_at {

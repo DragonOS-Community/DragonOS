@@ -182,8 +182,8 @@ use std::time::Duration;
 fn main() -> std::io::Result<()> {
     // 启动 server 线程
     let server_thread = thread::spawn(|| {
-        let socket = UdpSocket::bind("10.0.0.2:34254")
-            .expect("Failed to bind to veth1 (10.0.0.2:34254)");
+        let socket =
+            UdpSocket::bind("10.0.0.2:34254").expect("Failed to bind to veth1 (10.0.0.2:34254)");
         println!("[server] Listening on 10.0.0.2:34254");
 
         let mut buf = [0; 1024];

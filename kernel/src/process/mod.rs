@@ -839,7 +839,11 @@ impl ProcessControlBlock {
             let main_pid_arc = alloc_pid(&parent_ns).expect("alloc_pid failed");
 
             // 根namespace中的PID号作为RawPid
-            let root_pid_nr = main_pid_arc.first_upid().expect("UPid list empty").nr as usize;
+            let root_pid_nr = main_pid_arc
+                .first_upid()
+                .expect("UPid list empty")
+                .nr
+                .data();
 
             let raw_pid = RawPid(root_pid_nr);
 

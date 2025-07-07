@@ -3,12 +3,13 @@ use core::ops::Index;
 
 use crate::libs::rwlock::RwLock;
 use crate::libs::spinlock::SpinLock;
+use crate::process::ProcessManager;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use system_error::SystemError;
 
 use super::namespace::pid_namespace::PidNamespace;
-use super::ProcessControlBlock;
+use super::{ProcessControlBlock, RawPid};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +37,7 @@ pub struct Pid {
     /// tasks[PidType::TGID as usize] = 使用该PID作为线程组ID的任务
     tasks: [SpinLock<Vec<Weak<ProcessControlBlock>>>; PidType::PIDTYPE_MAX],
     /// 在各个namespace中的PID值
-    numbers: SpinLock<Vec<UPid>>,
+    numbers: SpinLock<Vec<Option<UPid>>>,
 }
 
 impl Debug for Pid {
@@ -46,6 +47,16 @@ impl Debug for Pid {
 }
 
 impl Pid {
+    fn new(level: u32) -> Arc<Self> {
+        let pid = Arc::new_cyclic(|weak_self| Self {
+            self_ref: weak_self.clone(),
+            level,
+            tasks: core::array::from_fn(|_| SpinLock::new(Vec::new())),
+            numbers: SpinLock::new(vec![None; level as usize + 1]),
+        });
+
+        pid
+    }
     /// 获取指定PID所属的命名空间
     ///
     /// 返回该PID被分配时所在的PID命名空间的引用(Arc封装)
@@ -53,12 +64,12 @@ impl Pid {
         self.numbers
             .lock()
             .get(self.level as usize)
-            .map(|upid| upid.ns.clone())
+            .map(|upid| upid.as_ref().unwrap().ns.clone())
             .unwrap()
     }
 
     pub fn first_upid(&self) -> Option<UPid> {
-        self.numbers.lock().first().cloned()
+        self.numbers.lock().first().cloned().unwrap()
     }
 
     /// 判断当前pid是否是当前命名空间的init进程(即child reaper)
@@ -67,7 +78,12 @@ impl Pid {
     /// 因此这里通过pid号来检查。
     /// 如果当前pid在当前命名空间中的pid号为1，则返回true，否则返回false。
     pub fn is_child_reaper(&self) -> bool {
-        self.numbers.lock()[self.level as usize].nr == 1
+        self.numbers.lock()[self.level as usize]
+            .as_ref()
+            .unwrap()
+            .nr
+            .data()
+            == 1
     }
 
     pub fn has_task(&self, pid_type: PidType) -> bool {
@@ -80,14 +96,14 @@ impl Pid {
 #[derive(Clone)]
 pub struct UPid {
     /// 在该namespace中的PID值
-    pub nr: i32,
+    pub nr: RawPid,
     /// 所属的namespace
     pub ns: Arc<PidNamespace>,
 }
 
 impl UPid {
     /// 创建新的UPid
-    pub fn new(nr: i32, ns: Arc<PidNamespace>) -> Self {
+    pub fn new(nr: RawPid, ns: Arc<PidNamespace>) -> Self {
         Self { nr, ns }
     }
 }
@@ -158,7 +174,52 @@ impl Clone for PidLink {
 ///
 /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c?fi=alloc_pid#162
 pub(super) fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, SystemError> {
-    todo!("alloc_pid not implemented yet");
+    let pid = Pid::new(ns.level);
+
+    // 用于记录已分配的PID，以便失败时清理
+    let mut allocated_upids: Vec<(isize, UPid)> = Vec::new();
+
+    // 获取当前namespace的引用链
+    let mut current_ns = Some(ns.clone());
+    let mut level = ns.level as isize;
+
+    // 从最深层级开始向上分配PID
+    while level >= 0 {
+        if let Some(ref curr_ns) = current_ns {
+            // warn: 这里会造成Arc的循环引用，不过暂时没想到什么好办法
+            // 因此需要在进程退出的时候需要手动清理pid。
+            // 循环引用的路径： current_ns -> pid_map -> pid -> numbers -> upid -> ns(curr_ns)
+            match curr_ns.alloc_pid_in_ns(pid.clone()) {
+                Ok(nr) => {
+                    let upid = UPid::new(nr, curr_ns.clone());
+                    allocated_upids.push((level, upid.clone()));
+                    pid.numbers.lock()[level as usize] = Some(upid);
+                    current_ns = curr_ns.parent();
+                }
+                Err(e) => {
+                    // 分配失败，需要清理已分配的PID
+                    cleanup_allocated_pids(pid, allocated_upids);
+                    return Err(e);
+                }
+            }
+        }
+        level -= 1;
+    }
+
+    // 如果分配成功，返回新创建的PID
+    Ok(pid)
+}
+
+/// 清理已分配的PID
+fn cleanup_allocated_pids(pid: Arc<Pid>, mut allocated_upids: Vec<(isize, UPid)>) {
+    // 反转已分配的UPid列表，以便从最深层级开始清理
+    allocated_upids.reverse();
+    for (level, upid) in allocated_upids {
+        let curr_ns = upid.ns;
+        // 在当前namespace中释放UPid
+        curr_ns.release_pid_in_ns(upid.nr);
+        pid.numbers.lock()[level as usize] = None;
+    }
 }
 
 /// 释放pid
@@ -166,7 +227,28 @@ pub(super) fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, SystemError>
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c#129
 pub(super) fn free_pid(pid: Arc<Pid>) {
     // 释放PID
-    todo!("free_pid not implemented yet");
+
+    let mut level = 0;
+    while level <= pid.level {
+        let upid = pid.numbers.lock()[level as usize]
+            .take()
+            .expect("pid numbers should not be empty");
+        let mut ns_guard = upid.ns.inner();
+        let pid_allocated_after_free = ns_guard.do_pid_allocated() - 1;
+        if pid_allocated_after_free == 1 || pid_allocated_after_free == 2 {
+            if let Some(child_reaper) = upid
+                .ns
+                .child_reaper()
+                .as_ref()
+                .map(|x| x.upgrade())
+                .flatten()
+            {
+                ProcessManager::wakeup(&child_reaper);
+            }
+        }
+        ns_guard.do_release_pid_in_ns(upid.nr);
+        level += 1;
+    }
 }
 
 impl ProcessControlBlock {

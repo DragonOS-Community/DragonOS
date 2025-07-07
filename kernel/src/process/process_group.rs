@@ -219,7 +219,7 @@ impl ProcessControlBlock {
         }
     }
 
-    pub fn is_process_group_leader(&self) -> bool {
+    pub fn is_process_group_leader_old(&self) -> bool {
         if let Some(pcb) = self.self_ref.upgrade() {
             let pg = self.process_group().unwrap();
             if let Some(leader) = pg.leader() {

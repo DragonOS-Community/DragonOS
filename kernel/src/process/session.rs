@@ -163,7 +163,7 @@ impl ProcessControlBlock {
             return Ok(self.session().unwrap());
         }
 
-        if self.is_process_group_leader() {
+        if self.is_process_group_leader_old() {
             return Err(SystemError::EPERM);
         }
 
@@ -215,4 +215,11 @@ impl ProcessControlBlock {
         }
         return Sid::new(1);
     }
+}
+
+
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sys.c#1225
+pub (super) fn ksys_setsid() -> Result<Sid, SystemError> {
+    let pcb = ProcessManager::current_pcb();
+    todo!("Implement ksys_setsid logic, current pid: {}", pcb.pid);
 }

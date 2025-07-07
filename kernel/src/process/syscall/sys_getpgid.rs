@@ -29,6 +29,7 @@ impl Syscall for SysGetPgid {
     /// - 成功，指定进程的进程组id
     /// - 错误，不存在该进程
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        todo!("Implement sys_getpgid logic");
         let pid = Self::pid(args);
         if pid == RawPid(0) {
             let current_pcb = ProcessManager::current_pcb();

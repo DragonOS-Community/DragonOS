@@ -13,6 +13,7 @@ impl Syscall for SysGetTid {
     }
 
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        todo!("Implement sys_gettid logic");
         let pcb = ProcessManager::current_pcb();
         return Ok(pcb.pid.into());
     }

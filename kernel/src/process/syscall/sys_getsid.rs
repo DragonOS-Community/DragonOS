@@ -30,6 +30,7 @@ impl Syscall for SysGetsid {
     /// ## 参数
     /// - pid: 指定一个进程号
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        todo!("Implement sys_getsid logic");
         let pid = Self::pid(args);
         let session = ProcessManager::current_pcb().session().unwrap();
         let sid = session.sid().into();

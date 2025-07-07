@@ -535,9 +535,15 @@ impl ProcessManager {
         let pid = pcb.pid();
         if let Some(pid) = pid.clone() {
             if pcb.is_thread_group_leader() {
-                pcb.init_task_pid(PidType::TGID, pid.clone());
-                pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
-                pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
+                if pcb.raw_pid() == RawPid(1) {
+                    pcb.init_task_pid(PidType::TGID, pid.clone());
+                    pcb.init_task_pid(PidType::PGID, pid.clone());
+                    pcb.init_task_pid(PidType::SID, pid.clone());
+                } else {
+                    pcb.init_task_pid(PidType::TGID, pid.clone());
+                    pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
+                    pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
+                }
 
                 if pid.is_child_reaper() {
                     pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
@@ -570,7 +576,7 @@ impl ProcessManager {
                 group_leader
                     .threads_write_irqsave()
                     .group_tasks
-                    .push(pcb.clone());
+                    .push(Arc::downgrade(pcb));
             }
 
             pcb.attach_pid(PidType::PID);

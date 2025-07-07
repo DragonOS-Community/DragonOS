@@ -1,11 +1,10 @@
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::intrinsics::likely;
 use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigChildCode, Signal},
     driver::tty::tty_core::TtyCore,
-    filesystem::sysfs::group,
     ipc::syscall::sys_kill::PidConverter,
     process::pid::PidType,
     sched::{schedule, SchedMode},
@@ -306,11 +305,12 @@ impl ProcessControlBlock {
         }
 
         // 从线程组中移除
-        let self_ref = self.self_ref.upgrade().unwrap();
-        let thread_group_leader = self.threads_read_irqsave().group_leader().unwrap();
-        thread_group_leader
-            .threads_write_irqsave()
-            .group_tasks
-            .retain(|pcb| !Arc::ptr_eq(pcb, &self_ref));
+        let thread_group_leader = self.threads_read_irqsave().group_leader();
+        if let Some(leader) = thread_group_leader {
+            leader
+                .threads_write_irqsave()
+                .group_tasks
+                .retain(|pcb| !Weak::ptr_eq(pcb, &self.self_ref));
+        }
     }
 }

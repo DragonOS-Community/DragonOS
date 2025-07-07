@@ -1,5 +1,4 @@
 use core::fmt::Debug;
-use core::ops::Index;
 
 use crate::libs::rwlock::RwLock;
 use crate::libs::spinlock::SpinLock;
@@ -243,7 +242,7 @@ pub(super) fn free_pid(pid: Arc<Pid>) {
                 .map(|x| x.upgrade())
                 .flatten()
             {
-                ProcessManager::wakeup(&child_reaper);
+                ProcessManager::wakeup(&child_reaper).ok();
             }
         }
         ns_guard.do_release_pid_in_ns(upid.nr);

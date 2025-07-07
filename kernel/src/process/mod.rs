@@ -1339,7 +1339,7 @@ pub struct ThreadInfo {
     group_leader: Weak<ProcessControlBlock>,
 
     /// 当前线程为组长时，该字段存储组内所有线程的pcb
-    group_tasks: Vec<Arc<ProcessControlBlock>>,
+    group_tasks: Vec<Weak<ProcessControlBlock>>,
 }
 
 impl Default for ThreadInfo {

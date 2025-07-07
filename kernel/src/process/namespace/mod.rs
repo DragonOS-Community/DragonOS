@@ -4,6 +4,7 @@ pub mod user_namespace;
 
 /// Namespace 种类，用于运行时调试与 /proc 导出
 #[repr(u8)]
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NamespaceType {
     Pid,

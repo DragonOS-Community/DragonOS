@@ -293,7 +293,7 @@ pub struct TtyContorlInfo {
 impl TtyContorlInfo {
     pub fn set_info_by_pcb(&mut self, pcb: Arc<ProcessControlBlock>) {
         self.session = Some(pcb.sid());
-        self.pgid = Some(pcb.pgid());
+        self.pgid = Some(pcb.pgid_old());
     }
 }
 

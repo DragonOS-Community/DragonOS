@@ -136,7 +136,7 @@ impl ProcessManager {
 
 impl ProcessControlBlock {
     pub fn session(&self) -> Option<Arc<Session>> {
-        let pg = self.process_group()?;
+        let pg = self.process_group_old()?;
         pg.session()
     }
 
@@ -217,9 +217,8 @@ impl ProcessControlBlock {
     }
 }
 
-
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sys.c#1225
-pub (super) fn ksys_setsid() -> Result<Sid, SystemError> {
+pub(super) fn ksys_setsid() -> Result<Sid, SystemError> {
     let pcb = ProcessManager::current_pcb();
     todo!("Implement ksys_setsid logic, current pid: {}", pcb.pid);
 }

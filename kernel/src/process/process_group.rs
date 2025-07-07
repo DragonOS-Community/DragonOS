@@ -177,7 +177,7 @@ impl ProcessManager {
     pub fn is_current_pgrp_orphaned() -> bool {
         let current_pcb = ProcessManager::current_pcb();
         let sid = current_pcb.sid();
-        let process_group = current_pcb.process_group();
+        let process_group = current_pcb.process_group_old();
         if let Some(pg) = process_group {
             for process in pg.process_group_inner.lock().processes.values() {
                 if let Some(real_parent) = process.real_parent_pcb.read().clone().upgrade() {
@@ -186,7 +186,7 @@ impl ProcessManager {
                         log::debug!("is_current_pgrp_orphaned: real_parent is init or exited");
                         continue;
                     }
-                    let real_parent_pg = real_parent.process_group().unwrap();
+                    let real_parent_pg = real_parent.process_group_old().unwrap();
                     if real_parent_pg.pgid() != pg.pgid() && real_parent_pg.sid() == sid {
                         return false;
                     }
@@ -199,7 +199,7 @@ impl ProcessManager {
 
 impl ProcessControlBlock {
     #[inline(always)]
-    pub fn pgid(&self) -> Pgid {
+    pub fn pgid_old(&self) -> Pgid {
         if let Some(process_group) = self.process_group.lock().upgrade() {
             process_group.pgid()
         } else {
@@ -208,11 +208,11 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn process_group(&self) -> Option<Arc<ProcessGroup>> {
+    pub fn process_group_old(&self) -> Option<Arc<ProcessGroup>> {
         self.process_group.lock().upgrade()
     }
 
-    pub fn set_process_group(&self, pg: &Arc<ProcessGroup>) {
+    pub fn set_process_group_old(&self, pg: &Arc<ProcessGroup>) {
         if let Some(pcb) = self.self_ref.upgrade() {
             *pcb.process_group.lock() = Arc::downgrade(pg);
             // log::debug!("pid: {:?} set pgid: {:?}", self.pid(), pg.pgid());
@@ -221,7 +221,7 @@ impl ProcessControlBlock {
 
     pub fn is_process_group_leader_old(&self) -> bool {
         if let Some(pcb) = self.self_ref.upgrade() {
-            let pg = self.process_group().unwrap();
+            let pg = self.process_group_old().unwrap();
             if let Some(leader) = pg.leader() {
                 return Arc::ptr_eq(&pcb, &leader);
             }
@@ -242,7 +242,7 @@ impl ProcessControlBlock {
     /// 无
     pub fn join_other_group(&self, pgid: Pgid) -> Result<(), SystemError> {
         // if let Some(pcb) = self.self_ref.upgrade() {
-        if self.pgid() == pgid {
+        if self.pgid_old() == pgid {
             return Ok(());
         }
         if self.is_session_leader() {
@@ -338,7 +338,7 @@ impl ProcessControlBlock {
 
     /// ### 清除自身的进程组以及会话引用(如果有的话)，这个方法只能在进程退出时调用
     pub fn clear_pg_and_session_reference(&self) {
-        if let Some(pg) = self.process_group() {
+        if let Some(pg) = self.process_group_old() {
             let mut pg_inner = pg.process_group_inner.lock();
             pg_inner.remove_process(&self.raw_pid());
 

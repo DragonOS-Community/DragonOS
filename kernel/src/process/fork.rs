@@ -600,10 +600,10 @@ impl ProcessManager {
         parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        if parent_pcb.process_group().is_none() && parent_pcb.raw_pid() == RawPid(0) {
+        if parent_pcb.process_group_old().is_none() && parent_pcb.raw_pid() == RawPid(0) {
             return Ok(());
         }
-        let pg = parent_pcb.process_group().unwrap();
+        let pg = parent_pcb.process_group_old().unwrap();
 
         let mut pg_inner = pg.process_group_inner.lock();
 
@@ -626,7 +626,7 @@ impl ProcessManager {
             ProcessManager::remove_session(sid);
         }
 
-        child_pcb.set_process_group(&pg);
+        child_pcb.set_process_group_old(&pg);
 
         Ok(())
     }

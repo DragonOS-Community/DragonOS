@@ -36,7 +36,7 @@ impl TtyJobCtrlManager {
             return Ok(());
         }
 
-        let pgid = pcb.pgid();
+        let pgid = pcb.pgid_old();
 
         let ctrl = tty.core().contorl_info_irqsave();
         let tty_pgid = ctrl.pgid;

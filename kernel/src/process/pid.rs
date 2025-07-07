@@ -89,6 +89,41 @@ impl Pid {
         let tasks = self.tasks[pid_type as usize].lock();
         !tasks.is_empty()
     }
+
+    pub fn pid_task(&self, pid_type: PidType) -> Option<Arc<ProcessControlBlock>> {
+        let tasks = self.tasks[pid_type as usize].lock();
+        if tasks.is_empty() {
+            None
+        } else {
+            // 返回第一个进程
+            tasks.first().and_then(|task| task.upgrade())
+        }
+    }
+
+    pub fn pid_vnr(&self) -> RawPid {
+        let active_pid_ns = ProcessManager::current_pcb().active_pid_ns();
+        self.pid_nr_ns(&active_pid_ns)
+    }
+
+    /// 获取在指定namespace中的PID号
+    ///
+    /// 如果当前PID在指定namespace中不存在，则返回0。
+    ///
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c#475
+    pub fn pid_nr_ns(&self, ns: &Arc<PidNamespace>) -> RawPid {
+        if ns.level <= self.level {
+            let upid = self.numbers.lock()[ns.level as usize]
+                .as_ref()
+                .cloned()
+                .expect("pid numbers should not be empty");
+            if Arc::ptr_eq(&upid.ns, ns) {
+                return upid.nr;
+            }
+        }
+
+        // 如果没有找到对应的UPid，返回0
+        RawPid::new(0)
+    }
 }
 
 /// 在特定namespace中的PID信息
@@ -293,5 +328,20 @@ impl ProcessControlBlock {
             }
             free_pid(pid);
         }
+    }
+}
+
+impl ProcessManager {
+    pub fn find_task_by_vpid(vnr: RawPid) -> Option<Arc<ProcessControlBlock>> {
+        let active_pid_ns = ProcessManager::current_pcb().active_pid_ns();
+        return Self::find_task_by_pid_ns(vnr, &active_pid_ns);
+    }
+
+    pub fn find_task_by_pid_ns(
+        nr: RawPid,
+        ns: &Arc<PidNamespace>,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        let pid: Arc<Pid> = ns.find_pid_in_ns(nr)?;
+        return pid.pid_task(PidType::PID);
     }
 }

@@ -67,6 +67,11 @@ impl PidNamespace {
         inner.do_release_pid_in_ns(raw_pid);
     }
 
+    pub fn find_pid_in_ns(&self, raw_pid: RawPid) -> Option<Arc<Pid>> {
+        let inner = self.inner();
+        inner.pid_map.get(&raw_pid).cloned()
+    }
+
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid_namespace.c#145
     pub(super) fn copy_pid_ns(
         &self,

@@ -34,7 +34,7 @@ impl PidConverter {
         } else if id == -1 {
             PidConverter::All
         } else if id == 0 {
-            let pgid = ProcessManager::current_pcb().pgid();
+            let pgid = ProcessManager::current_pcb().pgid_old();
             PidConverter::Pgid(pgid)
         } else {
             PidConverter::Pid(RawPid::from(id as usize))

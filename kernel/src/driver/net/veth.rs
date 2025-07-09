@@ -5,7 +5,7 @@ use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::driver::Driver;
-use crate::driver::base::device::{Device, DeviceCommonData, DeviceType, IdTable};
+use crate::driver::base::device::{self, DeviceCommonData, DeviceType, IdTable};
 use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use smoltcp::phy::DeviceCapabilities;
-use smoltcp::phy::{self, TxToken};
+use smoltcp::phy::{self, RxToken, TxToken};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -58,7 +58,7 @@ impl Veth {
             drop(peer_veth);
 
             // 唤醒对端正在等待的进程
-            peer.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
+            peer.wake_up();
         }
     }
 
@@ -120,7 +120,7 @@ pub struct VethRxToken {
     buffer: Vec<u8>,
 }
 
-impl phy::RxToken for VethRxToken {
+impl RxToken for VethRxToken {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
@@ -190,7 +190,7 @@ impl phy::Device for VethDriver {
 }
 
 #[cast_to([sync] Iface)]
-#[cast_to([sync] Device)]
+#[cast_to([sync] device::Device)]
 #[derive(Debug)]
 pub struct VethInterface {
     name: String,
@@ -303,6 +303,24 @@ impl VethInterface {
 
         // log::info!("VethInterface {} updated IP address: {}", self.name, addr);
     }
+
+    pub fn add_default_route_to_peer(&self, peer_ip: IpAddress) {
+        let iface = &mut self.common.smol_iface.lock_irqsave();
+        iface.routes_mut().update(|routes_map| {
+            routes_map
+                .push(smoltcp::iface::Route {
+                    cidr: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+                    via_router: peer_ip,
+                    preferred_until: None,
+                    expires_at: None,
+                })
+                .expect("Add default route to peer failed");
+        });
+    }
+
+    pub fn wake_up(&self) {
+        self.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
+    }
 }
 
 impl KObject for VethInterface {
@@ -360,7 +378,7 @@ impl KObject for VethInterface {
     }
 }
 
-impl Device for VethInterface {
+impl device::Device for VethInterface {
     fn dev_type(&self) -> DeviceType {
         DeviceType::Net
     }
@@ -418,11 +436,11 @@ impl Device for VethInterface {
         true
     }
 
-    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+    fn dev_parent(&self) -> Option<Weak<dyn device::Device>> {
         self.inner().device_common.get_parent_weak_or_clear()
     }
 
-    fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
+    fn set_dev_parent(&self, parent: Option<Weak<dyn device::Device>>) {
         self.inner().device_common.parent = parent;
     }
 }
@@ -517,9 +535,9 @@ impl BridgeEnableDevice for VethInterface {
     }
 }
 
-pub fn veth_probe() {
-    let name1 = "veth0";
-    let name2 = "veth1";
+pub fn veth_probe(name1: &str, name2: &str) -> (Arc<VethInterface>, Arc<VethInterface>) {
+    // let name1 = "veth0";
+    // let name2 = "veth1";
     let (iface1, iface2) = VethInterface::new_pair(name1, name2);
 
     let addr1 = IpAddress::v4(10, 0, 0, 1);
@@ -530,6 +548,10 @@ pub fn veth_probe() {
     let cidr2 = IpCidr::new(addr2, 24);
     iface2.update_ip_addrs(addr2, cidr2);
 
+    // 添加默认路由
+    iface1.add_default_route_to_peer(addr2);
+    iface2.add_default_route_to_peer(addr1);
+
     let turn_on = |a: &Arc<VethInterface>| {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
@@ -539,11 +561,13 @@ pub fn veth_probe() {
 
     turn_on(&iface1);
     turn_on(&iface2);
+
+    (iface1, iface2)
 }
 
 #[unified_init(INITCALL_DEVICE)]
 pub fn veth_init() -> Result<(), SystemError> {
-    veth_probe();
+    veth_probe("veth0", "veth1");
     log::info!("Veth pair initialized.");
     Ok(())
 }

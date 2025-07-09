@@ -11,11 +11,7 @@ use alloc::{
     vec::Vec,
 };
 use log::{debug, error};
-use smoltcp::{
-    iface,
-    phy::{self, TxToken},
-    wire,
-};
+use smoltcp::{iface, phy, wire};
 use unified_init::macros::unified_init;
 use virtio_drivers::device::net::VirtIONet;
 
@@ -33,7 +29,7 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        net::{bridge::BridgeEnableDevice, register_netdevice},
+        net::register_netdevice,
         virtio::{
             irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
@@ -744,16 +740,6 @@ impl KObject for VirtioInterface {
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
         self.inner().kobj_common.kobj_type = ktype;
-    }
-}
-
-impl BridgeEnableDevice for VirtioInterface {
-    fn receive_from_bridge(&self, frame: &[u8]) {
-        let token = VirtioNetToken::new(self.device_inner.force_get_mut().clone(), None);
-
-        token.consume(frame.len(), |buf| {
-            buf.copy_from_slice(frame);
-        });
     }
 }
 

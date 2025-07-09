@@ -304,6 +304,28 @@ impl ProcessControlBlock {
         self.sig_struct().pids[pid_type as usize].clone()
     }
 
+    pub fn task_pid_vnr(&self) -> RawPid {
+        self.__task_pid_nr_ns(PidType::PID, None).unwrap()
+    }
+
+    fn __task_pid_nr_ns(
+        &self,
+        pid_type: PidType,
+        mut ns: Option<Arc<PidNamespace>>,
+    ) -> Option<RawPid> {
+        if ns.is_none() {
+            ns = Some(self.active_pid_ns());
+        }
+        let mut retval = None;
+        let ns = ns.unwrap();
+        let pid = self.task_pid_ptr(pid_type);
+        if let Some(pid) = pid {
+            retval = Some(pid.pid_nr_ns(&ns));
+        }
+
+        return retval;
+    }
+
     pub(super) fn detach_pid(&self, pid_type: PidType) {
         self.__change_pid(pid_type, None);
     }

@@ -1,6 +1,9 @@
+use alloc::sync::Arc;
+
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETPGID;
 use crate::process::Pgid;
+use crate::process::ProcessFlags;
 use crate::process::ProcessManager;
 use crate::process::RawPid;
 use crate::syscall::table::FormattedSyscallParam;
@@ -24,39 +27,54 @@ impl Syscall for SysSetPgid {
         2
     }
 
-    /// # 函数的功能
+    /// # sys_setpgid
     /// 设置指定进程的pgid
     ///
     /// ## 参数
     /// - pid: 指定进程号
     /// - pgid: 新的进程组号
+    ///
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sys.c#1073
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        let mut pid = Self::pid(args);
+        let mut pgid = Self::pgid(args);
+        let group_leader = ProcessManager::current_pcb()
+            .threads_read_irqsave()
+            .group_leader
+            .clone();
+        let group_leader = group_leader.upgrade().ok_or(SystemError::ESRCH)?;
+
+        if pid.data() == 0 {
+            pid = group_leader.task_pid_vnr();
+        }
+
+        if pgid.data() == 0 {
+            pgid = pid;
+        }
+
+        let p = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
+        if !p.is_thread_group_leader() {
+            return Err(SystemError::EINVAL);
+        }
+        let real_parent = p.real_parent_pcb.read().clone();
+        if ProcessManager::same_thread_group(&group_leader, &real_parent) {
+            if !Arc::ptr_eq(
+                &p.task_session().unwrap(),
+                &group_leader.task_session().unwrap(),
+            ) {
+                return Err(SystemError::EPERM);
+            }
+
+            if !p.flags().contains(ProcessFlags::FORKNOEXEC){
+                return Err(SystemError::EACCES);
+            }
+        }else{
+            if !Arc::ptr_eq(&p, &group_leader) {
+                return Err(SystemError::ESRCH);
+            }
+        }
+
         todo!("Implement sys_setpgid logic");
-        let pid = Self::pid(args);
-        let pgid = Self::pgid(args);
-
-        let current_pcb = ProcessManager::current_pcb();
-        let pid = if pid == RawPid(0) {
-            current_pcb.raw_pid()
-        } else {
-            pid
-        };
-        let pgid = if pgid == Pgid::from(0) {
-            Pgid::from(pid.into())
-        } else {
-            pgid
-        };
-        if pid != current_pcb.raw_pid() && !current_pcb.contain_child(&pid) {
-            return Err(SystemError::ESRCH);
-        }
-
-        if pgid.into() != pid.into() && ProcessManager::find_process_group(pgid).is_none() {
-            return Err(SystemError::EPERM);
-        }
-        let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
-        pcb.join_other_group(pgid)?;
-
-        return Ok(0);
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

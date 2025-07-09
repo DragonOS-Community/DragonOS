@@ -174,7 +174,7 @@ impl UdpSocket {
             let can_recv = move || self_ref.can_recv();
             rem.poll_blocking(&can_recv);
         }
-        // let _ = wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {});
+        let _ = wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {});
     }
 }
 

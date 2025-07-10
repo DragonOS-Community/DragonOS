@@ -804,6 +804,10 @@ impl BinaryLoader for ElfLoader {
         }
         Self::parse_gnu_property()?;
 
+        // todo: 设置exec信息的功能 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1002
+        crate::process::execve::begin_new_exec(param)
+            .map_err(|e| ExecError::Other(format!("Failed to begin new exec: {:?}", e)))?;
+
         let mut elf_brk = VirtAddr::new(0);
         let mut elf_bss = VirtAddr::new(0);
         let mut start_code: Option<VirtAddr> = None;

@@ -367,7 +367,9 @@ impl ProcessManager {
     /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
         assert!(!CurrentIrqArch::is_irq_enabled());
-
+        if next.pid().data() >= 9 {
+            log::debug!("[switch] {} -> {}", prev.pid().data(), next.pid().data());
+        }
         // 保存浮点寄存器
         prev.arch_info_irqsave().save_fp_state();
         // 切换浮点寄存器

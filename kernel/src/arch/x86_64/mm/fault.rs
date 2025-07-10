@@ -300,7 +300,8 @@ impl X86_64MMArch {
                         });
                 } else {
                     log::error!(
-                        "No mapped vma, error_code: {:?}, address: {:#x}, flags: {:?}",
+                        "pid: {} No mapped vma, error_code: {:?}, address: {:#x}, flags: {:?}",
+                        ProcessManager::current_pid().data(),
                         error_code,
                         address.data(),
                         flags

@@ -94,13 +94,27 @@ impl Syscall {
         // 首先尝试从syscall_table获取处理函数
         if let Some(handler) = syscall_table().get(syscall_num) {
             // 使用以下代码可以打印系统调用号和参数，方便调试
-            // log::debug!(
-            //     "Syscall {} called with args {}",
-            //     handler.name,
-            //     handler.args_string(args)
-            // );
 
-            return handler.inner_handle.handle(args, frame);
+            // let show = false;
+            // if show {
+            //     log::debug!(
+            //         "pid: {} Syscall {} called with args {}",
+            //         ProcessManager::current_pid().data(),
+            //         handler.name,
+            //         handler.args_string(args)
+            //     );
+            // }
+
+            let r = handler.inner_handle.handle(args, frame);
+            // if show {
+            //     log::debug!(
+            //         "pid: {} Syscall {} returned {:?}",
+            //         ProcessManager::current_pid().data(),
+            //         handler.name,
+            //         r
+            //     );
+            // }
+            return r;
         }
 
         // 如果找不到，fallback到原有逻辑

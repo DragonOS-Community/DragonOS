@@ -261,21 +261,6 @@ impl Syscall {
                 Self::mkdir_at(dirfd, path, mode)
             }
 
-            SYS_NANOSLEEP => {
-                let req = args[0] as *const PosixTimeSpec;
-                let rem = args[1] as *mut PosixTimeSpec;
-                let virt_req = VirtAddr::new(req as usize);
-                let virt_rem = VirtAddr::new(rem as usize);
-                if frame.is_from_user()
-                    && (verify_area(virt_req, core::mem::size_of::<PosixTimeSpec>()).is_err()
-                        || verify_area(virt_rem, core::mem::size_of::<PosixTimeSpec>()).is_err())
-                {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::nanosleep(req, rem)
-                }
-            }
-
             SYS_CLOCK => Self::clock(),
             SYS_UNLINKAT => {
                 let dirfd = args[0] as i32;

@@ -10,6 +10,7 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
+use crate::driver::net::bridge::BridgePort;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
@@ -26,7 +27,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use smoltcp::phy::DeviceCapabilities;
-use smoltcp::phy::{self, RxToken, TxToken};
+use smoltcp::phy::{self, RxToken};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -51,18 +52,39 @@ impl Veth {
         self.peer = Arc::downgrade(peer);
     }
 
-    pub fn send_to_peer(&self, data: Vec<u8>) {
+    pub fn send_to_peer(&self, data: &Vec<u8>) {
         if let Some(peer) = self.peer.upgrade() {
-            let mut peer_veth = peer.driver.force_get_mut().inner.lock_irqsave();
-            peer_veth.rx_queue.push_back(data.clone());
-            drop(peer_veth);
+            // log::info!("Veth {} trying to send", self.name);
 
-            // 唤醒对端正在等待的进程
-            peer.wake_up();
+            if let Some(bridge_data) = peer.inner.lock().bridge_port_data.as_ref() {
+                // log::info!("Veth {} sending data to bridge", self.name);
+                Self::to_bridge(bridge_data, data);
+                return;
+            }
+
+            Self::to_peer(&peer, data);
         }
     }
 
+    pub(self) fn to_peer(peer: &Arc<VethInterface>, data: &[u8]) {
+        let mut peer_veth = peer.driver.force_get_mut().inner.lock_irqsave();
+        peer_veth.rx_queue.push_back(data.to_vec());
+        // log::info!("DATA RECEIVED: {:?}", peer_veth.rx_queue);
+        drop(peer_veth);
+
+        // 唤醒对端正在等待的进程
+        peer.wake_up();
+    }
+
+    fn to_bridge(bridge_data: &BridgePort, data: &Vec<u8>) {
+        if let Some(bridge_driver) = bridge_data.bridge_driver.upgrade() {
+            // log::info!("Veth {} sending data to bridge", self.name);
+            bridge_driver.driver.enqueue_frame(bridge_data.id, data);
+        };
+    }
+
     pub fn recv_from_peer(&mut self) -> Option<Vec<u8>> {
+        // log::info!("Veth {} trying to receive", self.name);
         self.rx_queue.pop_front()
     }
 
@@ -111,7 +133,7 @@ impl phy::TxToken for VethTxToken {
     {
         let mut buf = vec![0; len];
         let result = f(&mut buf);
-        self.driver.inner.lock_irqsave().send_to_peer(buf);
+        self.driver.inner.lock_irqsave().send_to_peer(&buf);
         result
     }
 }
@@ -207,6 +229,20 @@ pub struct VethCommonData {
     device_common: DeviceCommonData,
     kobj_common: KObjectCommonData,
     peer_veth: Weak<VethInterface>,
+
+    bridge_port_data: Option<BridgePort>,
+}
+
+impl Default for VethCommonData {
+    fn default() -> Self {
+        VethCommonData {
+            netdevice_common: NetDeviceCommonData::default(),
+            device_common: DeviceCommonData::default(),
+            kobj_common: KObjectCommonData::default(),
+            peer_veth: Weak::new(),
+            bridge_port_data: None,
+        }
+    }
 }
 
 impl VethInterface {
@@ -246,15 +282,12 @@ impl VethInterface {
             name,
             driver: VethDriverWarpper(UnsafeCell::new(driver)),
             common: IfaceCommon::new(iface_id, true, iface),
-            inner: SpinLock::new(VethCommonData {
-                netdevice_common: NetDeviceCommonData::default(),
-                device_common: DeviceCommonData::default(),
-                kobj_common: KObjectCommonData::default(),
-                peer_veth: Weak::new(),
-            }),
+            inner: SpinLock::new(VethCommonData::default()),
             locked_kobj_state: LockedKObjectState::default(),
             wait_queue: WaitQueue::default(),
         });
+
+        // log::info!("VethInterface {} created with ID {}", device.name, iface_id);
         device
     }
 
@@ -272,10 +305,6 @@ impl VethInterface {
         iface1.set_peer_iface(&iface2);
         iface2.set_peer_iface(&iface1);
 
-        // log::info!(
-        //     "is connected: {}",
-        //     iface1.driver.inner.lock_irqsave().peer.upgrade().is_some()
-        // );
         (iface1, iface2)
     }
 
@@ -283,29 +312,37 @@ impl VethInterface {
         self.inner.lock_irqsave()
     }
 
-    pub fn update_ip_addrs(&self, addr: IpAddress, cidr: IpCidr) {
+    /// # `update_ip_addrs`
+    /// 更新虚拟以太网设备的 IP 地址
+    /// ## 参数
+    /// - `cidr`: 要添加的 IP 地址和子网掩码
+    /// ## 描述
+    /// 该方法会将指定的 IP 地址添加到虚拟以太网设备的 IP 地址列表中。
+    /// 如果添加失败（例如列表已满），则会触发 panic。
+    pub fn update_ip_addrs(&self, cidr: IpCidr) {
         let iface = &mut self.common.smol_iface.lock_irqsave();
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs.push(cidr).expect("Push ipCidr failed: full");
         });
 
-        // 默认路由
-        iface.routes_mut().update(|routes_map| {
-            routes_map
-                .push(smoltcp::iface::Route {
-                    cidr,
-                    via_router: addr,
-                    preferred_until: None,
-                    expires_at: None,
-                })
-                .expect("Add default ipv4 route failed: full");
-        });
-
         // log::info!("VethInterface {} updated IP address: {}", self.name, addr);
     }
 
+    /// # `add_default_route_to_peer`
+    /// 添加默认路由到对端虚拟以太网设备
+    /// ## 参数
+    /// - `peer_ip`: 对端设备的 IP 地址
+    /// ## 描述
+    /// 该方法会在当前虚拟以太网设备的路由表中
+    /// 添加一条默认路由，
+    /// 指向对端虚拟以太网设备的 IP 地址。
+    /// 如果添加失败，则会触发 panic。
+    ///
     pub fn add_default_route_to_peer(&self, peer_ip: IpAddress) {
         let iface = &mut self.common.smol_iface.lock_irqsave();
+        // iface.update_ip_addrs(|ip_addrs| {
+        //     ip_addrs.push(self_cidr).expect("Push ipCidr failed: full");
+        // });
         iface.routes_mut().update(|routes_map| {
             routes_map
                 .push(smoltcp::iface::Route {
@@ -317,6 +354,20 @@ impl VethInterface {
                 .expect("Add default route to peer failed");
         });
     }
+
+    // pub fn add_direct_route(&self, cidr: IpCidr, via_router: IpAddress) {
+    //     let iface = &mut self.common.smol_iface.lock_irqsave();
+    //     iface.routes_mut().update(|routes_map| {
+    //         routes_map
+    //             .push(smoltcp::iface::Route {
+    //                 cidr,
+    //                 via_router,
+    //                 preferred_until: None,
+    //                 expires_at: None,
+    //             })
+    //             .expect("Add direct route failed");
+    //     });
+    // }
 
     pub fn wake_up(&self) {
         self.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
@@ -465,7 +516,7 @@ impl Iface for VethInterface {
     }
 
     fn poll_blocking(&self, can_stop_fn: &dyn Fn() -> bool) {
-        // log::info!("VethInterface {} polling block", self.name);
+        log::info!("VethInterface {} polling block", self.name);
 
         loop {
             // 检查是否有数据可用
@@ -482,6 +533,7 @@ impl Iface for VethInterface {
 
             // 没有数据可用时，进入等待队列
             // 如果有数据可用，则直接跳出循环
+            log::info!("VethInterface {} waiting for data", self.name);
             if !has_data {
                 let _ = wq_wait_event_interruptible!(
                     self.wait_queue,
@@ -493,7 +545,7 @@ impl Iface for VethInterface {
     }
 
     fn poll(&self) {
-        // log::info!("VethInterface {} polling normal", self.name);
+        log::info!("VethInterface {} polling normal", self.name);
         self.common.poll(self.driver.force_get_mut());
     }
 
@@ -525,28 +577,40 @@ impl Iface for VethInterface {
 
 impl BridgeEnableDevice for VethInterface {
     fn receive_from_bridge(&self, frame: &[u8]) {
-        let driver = self.driver.force_get_mut();
-        let token = VethTxToken {
-            driver: driver.clone(),
-        };
-        token.consume(frame.len(), |buf| {
-            buf.copy_from_slice(frame);
-        });
+        log::info!("VethInterface {} received from bridge", self.name);
+
+        let inner = self.inner.lock_irqsave();
+
+        if let Some(_data) = inner.bridge_port_data.as_ref() {
+            log::info!("VethInterface {} sending data to peer", self.name);
+
+            // Veth::to_peer(&peer, frame);
+            self.driver
+                .inner
+                .lock_irqsave()
+                .rx_queue
+                .push_back(frame.to_vec());
+            self.poll();
+        }
+    }
+
+    fn set_common_bridge_data(&self, port: BridgePort) {
+        // log::info!("Now set bridge port data for {}", self.name);
+        let mut inner = self.inner.lock_irqsave();
+        inner.bridge_port_data = Some(port);
     }
 }
 
 pub fn veth_probe(name1: &str, name2: &str) -> (Arc<VethInterface>, Arc<VethInterface>) {
-    // let name1 = "veth0";
-    // let name2 = "veth1";
     let (iface1, iface2) = VethInterface::new_pair(name1, name2);
 
     let addr1 = IpAddress::v4(10, 0, 0, 1);
     let cidr1 = IpCidr::new(addr1, 24);
-    iface1.update_ip_addrs(addr1, cidr1);
+    iface1.update_ip_addrs(cidr1);
 
     let addr2 = IpAddress::v4(10, 0, 0, 2);
     let cidr2 = IpCidr::new(addr2, 24);
-    iface2.update_ip_addrs(addr2, cidr2);
+    iface2.update_ip_addrs(cidr2);
 
     // 添加默认路由
     iface1.add_default_route_to_peer(addr2);

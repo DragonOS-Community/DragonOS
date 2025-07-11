@@ -164,7 +164,7 @@ impl UdpSocket {
     /// 这个方法会阻塞当前线程，直到有数据可读
     /// 通过 poll_blocking 来等待数据的到来
     pub(self) fn wait_for_recv(&self) {
-        // use crate::sched::SchedMode;
+        use crate::sched::SchedMode;
         let guard = self.inner.read();
         let inner = guard.as_ref();
         if let UdpInner::Bound(bound) = inner.unwrap() {

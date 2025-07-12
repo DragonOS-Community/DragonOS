@@ -69,7 +69,8 @@ impl Veth {
     pub(self) fn to_peer(peer: &Arc<VethInterface>, data: &[u8]) {
         let mut peer_veth = peer.driver.force_get_mut().inner.lock_irqsave();
         peer_veth.rx_queue.push_back(data.to_vec());
-        // log::info!("DATA RECEIVED: {:?}", peer_veth.rx_queue);
+        log::info!("Veth {} received data from peer", peer.name);
+        log::info!("DATA RECEIVED: {:?}", peer_veth.rx_queue);
         drop(peer_veth);
 
         // 唤醒对端正在等待的进程
@@ -578,20 +579,23 @@ impl Iface for VethInterface {
 impl BridgeEnableDevice for VethInterface {
     fn receive_from_bridge(&self, frame: &[u8]) {
         log::info!("VethInterface {} received from bridge", self.name);
+        let peer = self.peer_veth();
 
-        let inner = self.inner.lock_irqsave();
+        // let inner = self.inner.lock_irqsave();
 
-        if let Some(_data) = inner.bridge_port_data.as_ref() {
+        if let Some(_data) = self.inner.lock_irqsave().bridge_port_data.as_ref() {
             log::info!("VethInterface {} sending data to peer", self.name);
 
-            // Veth::to_peer(&peer, frame);
-            self.driver
-                .inner
-                .lock_irqsave()
-                .rx_queue
-                .push_back(frame.to_vec());
-            self.poll();
+            // let peer = self.peer_veth();
+            Veth::to_peer(&peer, frame);
+            // self.driver
+            //     .inner
+            //     .lock_irqsave()
+            //     .rx_queue
+            //     .push_back(frame.to_vec());
+            // peer.poll();
         }
+        log::info!("returning");
     }
 
     fn set_common_bridge_data(&self, port: BridgePort) {

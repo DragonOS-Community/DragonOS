@@ -14,7 +14,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use alloc::{collections::BTreeMap, string::String, sync::Arc};
-use core::{panic, sync::atomic::AtomicUsize};
+use core::sync::atomic::AtomicUsize;
 use hashbrown::HashMap;
 use smoltcp::wire::{EthernetAddress, EthernetFrame, IpAddress, IpCidr};
 use system_error::SystemError;
@@ -163,7 +163,7 @@ impl Bridge {
 
         if dst_mac.is_broadcast() {
             // 广播 这里有可能是arp请求
-            self.flood(None, frame);
+            self.flood(Some(ingress_port_id), frame);
         } else {
             // 单播
             if let Some(entry) = self.mac_table.get(&dst_mac) {
@@ -362,14 +362,14 @@ fn bridge_probe() {
     let (iface1, iface2) = VethInterface::new_pair("veth_a", "veth_b");
     let (iface3, iface4) = VethInterface::new_pair("veth_c", "veth_d");
 
-    let addr1 = IpAddress::v4(100, 0, 0, 1);
+    let addr1 = IpAddress::v4(200, 0, 0, 1);
     let cidr1 = IpCidr::new(addr1, 24);
-    let addr2 = IpAddress::v4(100, 0, 0, 2);
+    let addr2 = IpAddress::v4(200, 0, 0, 2);
     let cidr2 = IpCidr::new(addr1, 24);
 
-    let addr3 = IpAddress::v4(200, 0, 0, 1);
+    let addr3 = IpAddress::v4(200, 0, 0, 3);
     let cidr3 = IpCidr::new(addr3, 24);
-    let addr4 = IpAddress::v4(200, 0, 0, 2);
+    let addr4 = IpAddress::v4(200, 0, 0, 4);
     let cidr4 = IpCidr::new(addr4, 24);
 
     iface1.update_ip_addrs(cidr1);

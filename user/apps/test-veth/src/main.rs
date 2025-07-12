@@ -174,73 +174,6 @@
 //     }
 // }
 
-use std::net::UdpSocket;
-use std::str;
-use std::thread;
-use std::time::Duration;
-
-fn main() -> std::io::Result<()> {
-    // 启动 server 线程
-    let server_thread = thread::spawn(|| {
-        let socket =
-            UdpSocket::bind("10.0.0.2:34254").expect("Failed to bind to veth1 (10.0.0.2:34254)");
-        println!("[server] Listening on 10.0.0.2:34254");
-
-        let mut buf = [0; 1024];
-        let (amt, src) = socket
-            .recv_from(&mut buf)
-            .expect("[server] Failed to receive");
-
-        let received_msg = str::from_utf8(&buf[..amt]).expect("Invalid UTF-8");
-
-        println!("[server] Received from {}: {}", src, received_msg);
-
-        socket
-            .send_to(received_msg.as_bytes(), src)
-            .expect("[server] Failed to send back");
-        println!("[server] Echoed back the message");
-    });
-
-    // 确保 server 已启动（可根据情况适当 sleep）
-    thread::sleep(Duration::from_millis(200));
-
-    // 启动 client
-    let client_thread = thread::spawn(|| {
-        let socket = UdpSocket::bind("10.0.0.1:0").expect("Failed to bind to veth0 (10.0.0.1)");
-        socket
-            .connect("10.0.0.2:34254")
-            .expect("Failed to connect to 10.0.0.2:34254");
-
-        let msg = "Hello from veth0!";
-        socket
-            .send(msg.as_bytes())
-            .expect("[client] Failed to send");
-
-        println!("[client] Sent: {}", msg);
-
-        let mut buf = [0; 1024];
-        let (amt, _src) = socket
-            .recv_from(&mut buf)
-            .expect("[client] Failed to receive");
-
-        let received_msg = str::from_utf8(&buf[..amt]).expect("Invalid UTF-8");
-
-        println!("[client] Received echo: {}", received_msg);
-
-        assert_eq!(msg, received_msg, "[client] Mismatch in echo!");
-    });
-
-    // 等待两个线程结束
-    server_thread.join().unwrap();
-    client_thread.join().unwrap();
-
-    println!("\n✅ Test completed: veth0 <--> veth1 UDP communication success");
-
-    Ok(())
-}
-
-//bridge
-
 // use std::net::UdpSocket;
 // use std::str;
 // use std::thread;
@@ -250,8 +183,8 @@ fn main() -> std::io::Result<()> {
 //     // 启动 server 线程
 //     let server_thread = thread::spawn(|| {
 //         let socket =
-//             UdpSocket::bind("200.0.0.2:34254").expect("Failed to bind to veth_d (200.0.0.2:34254)");
-//         println!("[server] Listening on 200.0.0.2:34254");
+//             UdpSocket::bind("10.0.0.2:34254").expect("Failed to bind to veth1 (10.0.0.2:34254)");
+//         println!("[server] Listening on 10.0.0.2:34254");
 
 //         let mut buf = [0; 1024];
 //         let (amt, src) = socket
@@ -273,12 +206,12 @@ fn main() -> std::io::Result<()> {
 
 //     // 启动 client
 //     let client_thread = thread::spawn(|| {
-//         let socket = UdpSocket::bind("100.0.0.1:0").expect("Failed to bind to veth_a (100.0.0.1)");
+//         let socket = UdpSocket::bind("10.0.0.1:0").expect("Failed to bind to veth0 (10.0.0.1)");
 //         socket
-//             .connect("200.0.0.2:34254")
-//             .expect("Failed to connect to 200.0.0.2:34254");
+//             .connect("10.0.0.2:34254")
+//             .expect("Failed to connect to 10.0.0.2:34254");
 
-//         let msg = "Hello from veth1!";
+//         let msg = "Hello from veth0!";
 //         socket
 //             .send(msg.as_bytes())
 //             .expect("[client] Failed to send");
@@ -305,3 +238,70 @@ fn main() -> std::io::Result<()> {
 
 //     Ok(())
 // }
+
+//bridge
+
+use std::net::UdpSocket;
+use std::str;
+use std::thread;
+use std::time::Duration;
+
+fn main() -> std::io::Result<()> {
+    // 启动 server 线程
+    let server_thread = thread::spawn(|| {
+        let socket =
+            UdpSocket::bind("200.0.0.4:34254").expect("Failed to bind to veth_d (200.0.0.4:34254)");
+        println!("[server] Listening on 200.0.0.4:34254");
+
+        let mut buf = [0; 1024];
+        let (amt, src) = socket
+            .recv_from(&mut buf)
+            .expect("[server] Failed to receive");
+
+        let received_msg = str::from_utf8(&buf[..amt]).expect("Invalid UTF-8");
+
+        println!("[server] Received from {}: {}", src, received_msg);
+
+        socket
+            .send_to(received_msg.as_bytes(), src)
+            .expect("[server] Failed to send back");
+        println!("[server] Echoed back the message");
+    });
+
+    // 确保 server 已启动（可根据情况适当 sleep）
+    thread::sleep(Duration::from_millis(200));
+
+    // 启动 client
+    let client_thread = thread::spawn(|| {
+        let socket = UdpSocket::bind("200.0.0.1:0").expect("Failed to bind to veth_a (200.0.0.1)");
+        socket
+            .connect("200.0.0.4:34254")
+            .expect("Failed to connect to 200.0.0.4:34254");
+
+        let msg = "Hello from veth1!";
+        socket
+            .send(msg.as_bytes())
+            .expect("[client] Failed to send");
+
+        println!("[client] Sent: {}", msg);
+
+        let mut buf = [0; 1024];
+        let (amt, _src) = socket
+            .recv_from(&mut buf)
+            .expect("[client] Failed to receive");
+
+        let received_msg = str::from_utf8(&buf[..amt]).expect("Invalid UTF-8");
+
+        println!("[client] Received echo: {}", received_msg);
+
+        assert_eq!(msg, received_msg, "[client] Mismatch in echo!");
+    });
+
+    // 等待两个线程结束
+    server_thread.join().unwrap();
+    client_thread.join().unwrap();
+
+    println!("\n✅ Test completed: veth0 <--> veth1 UDP communication success");
+
+    Ok(())
+}

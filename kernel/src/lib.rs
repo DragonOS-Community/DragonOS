@@ -23,6 +23,7 @@
 #![feature(vec_into_raw_parts)]
 #![feature(linkage)]
 #![feature(panic_can_unwind)]
+#![feature(let_chains)]
 #![allow(
     static_mut_refs,
     non_local_definitions,

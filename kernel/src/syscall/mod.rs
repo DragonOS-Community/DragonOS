@@ -1,4 +1,3 @@
-use crate::process::fork::CloneFlags;
 use core::{
     ffi::c_int,
     sync::atomic::{AtomicBool, Ordering},
@@ -91,6 +90,15 @@ impl Syscall {
         args: &[usize],
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
+        defer::defer!({
+            if ProcessManager::current_pcb()
+                .flags()
+                .contains(ProcessFlags::NEED_SCHEDULE)
+            {
+                schedule(SchedMode::SM_PREEMPT);
+            }
+        });
+
         // 首先尝试从syscall_table获取处理函数
         if let Some(handler) = syscall_table().get(syscall_num) {
             // 使用以下代码可以打印系统调用号和参数，方便调试
@@ -135,11 +143,6 @@ impl Syscall {
                     0,
                 )
             }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_FORK => ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into()),
-            #[cfg(target_arch = "x86_64")]
-            SYS_VFORK => ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into()),
 
             #[cfg(target_arch = "x86_64")]
             SYS_RENAMEAT => {
@@ -854,13 +857,6 @@ impl Syscall {
             }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
-
-        if ProcessManager::current_pcb()
-            .flags()
-            .contains(ProcessFlags::NEED_SCHEDULE)
-        {
-            schedule(SchedMode::SM_PREEMPT);
-        }
 
         return r;
     }

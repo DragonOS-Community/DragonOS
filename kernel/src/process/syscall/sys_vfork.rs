@@ -1,5 +1,5 @@
 use crate::arch::interrupt::TrapFrame;
-//use crate::arch::syscall::nr::SYS_VFORK;
+use crate::arch::syscall::nr::SYS_VFORK;
 use crate::process::fork::CloneFlags;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -16,7 +16,6 @@ impl Syscall for SysVfork {
     fn handle(&self, _args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         // 由于Linux vfork需要保证子进程先运行（除非子进程调用execve或者exit），
         // 而我们目前没有实现这个特性，所以暂时使用fork代替vfork（linux文档表示这样也是也可以的）
-        log::debug!("vfork");
         ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into())
 
         // 下面是以前的实现，除非我们实现了子进程先运行的特性，否则不要使用，不然会导致父进程数据损坏
@@ -32,4 +31,4 @@ impl Syscall for SysVfork {
     }
 }
 
-//syscall_table_macros::declare_syscall!(SYS_VFORK, SysVfork);
+syscall_table_macros::declare_syscall!(SYS_VFORK, SysVfork);

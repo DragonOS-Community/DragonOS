@@ -1,14 +1,13 @@
-use crate::filesystem::vfs::FilldirContext;
 use core::mem::size_of;
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc};
 
 use log::warn;
 use system_error::SystemError;
 
 use crate::syscall::user_access::UserBufferReader;
 use crate::{
-    driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
+    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::file::FileDescriptorVec,
     libs::rwlock::RwLockWriteGuard,
     process::ProcessManager,
@@ -23,23 +22,29 @@ use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{
-        do_faccessat, do_fchmodat, do_fchownat, do_sys_open, do_utimensat, do_utimes, ksys_fchown,
-    },
+    open::{do_faccessat, do_fchmodat, do_fchownat, do_utimensat, do_utimes, ksys_fchown},
     utils::{rsplit_path, user_path_at},
     vcore::{do_mkdir_at, do_remove_dir, do_unlink_at},
     FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 mod open_utils;
+mod sys_chdir;
 mod sys_close;
+mod sys_fchdir;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 mod sys_fstat;
+mod sys_getcwd;
+mod sys_getdents;
 mod sys_ioctl;
+mod sys_lseek;
 #[cfg(target_arch = "x86_64")]
 mod sys_lstat;
 #[cfg(target_arch = "x86_64")]
 mod sys_open;
+mod sys_openat;
+mod sys_pread64;
+mod sys_pwrite64;
 mod sys_read;
 mod sys_readv;
 #[cfg(target_arch = "x86_64")]
@@ -439,250 +444,6 @@ bitflags! {
 }
 
 impl Syscall {
-    pub fn openat(
-        dirfd: i32,
-        path: *const u8,
-        o_flags: u32,
-        mode: u32,
-        follow_symlink: bool,
-    ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-        let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
-        return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
-    }
-
-    /// @brief 调整文件操作指针的位置
-    ///
-    /// @param fd 文件描述符编号
-    /// @param seek 调整的方式
-    ///
-    /// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
-    /// @return Err(SystemError) 调整失败，返回posix错误码
-    pub fn lseek(fd: i32, offset: i64, seek: u32) -> Result<usize, SystemError> {
-        let seek = match seek {
-            SEEK_SET => Ok(SeekFrom::SeekSet(offset)),
-            SEEK_CUR => Ok(SeekFrom::SeekCurrent(offset)),
-            SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
-            SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
-            _ => Err(SystemError::EINVAL),
-        }?;
-
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        return file.lseek(seek);
-    }
-
-    /// # sys_pread64 系统调用的实际执行函数
-    ///
-    /// ## 参数
-    /// - `fd`: 文件描述符
-    /// - `buf`: 读出缓冲区
-    /// - `len`: 要读取的字节数
-    /// - `offset`: 文件偏移量
-    pub fn pread(fd: i32, buf: &mut [u8], len: usize, offset: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard.get_file_by_fd(fd);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
-        }
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        let file = file.unwrap();
-
-        return file.pread(offset, len, buf);
-    }
-
-    /// # sys_pwrite64 系统调用的实际执行函数
-    ///
-    /// ## 参数
-    /// - `fd`: 文件描述符
-    /// - `buf`: 写入缓冲区
-    /// - `len`: 要写入的字节数
-    /// - `offset`: 文件偏移量
-    pub fn pwrite(fd: i32, buf: &[u8], len: usize, offset: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard.get_file_by_fd(fd);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
-        }
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        let file = file.unwrap();
-
-        return file.pwrite(offset, len, buf);
-    }
-
-    /// @brief 切换工作目录
-    ///
-    /// @param dest_path 目标路径
-    ///
-    /// @return   返回码  描述  
-    ///      0       |          成功  
-    ///         
-    ///   EACCESS    |        权限不足        
-    ///
-    ///    ELOOP     | 解析path时遇到路径循环
-    ///
-    /// ENAMETOOLONG |       路径名过长       
-    ///
-    ///    ENOENT    |  目标文件或目录不存在  
-    ///
-    ///    ENODIR    |  检索期间发现非目录项  
-    ///
-    ///    ENOMEM    |      系统内存不足      
-    ///
-    ///    EFAULT    |       错误的地址      
-    ///  
-    /// ENAMETOOLONG |        路径过长        
-    pub fn chdir(path: *const u8) -> Result<usize, SystemError> {
-        if path.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        let proc = ProcessManager::current_pcb();
-        // Copy path to kernel space to avoid some security issues
-        let mut new_path = String::from("");
-        if !path.is_empty() {
-            let cwd = match path.as_bytes()[0] {
-                b'/' => String::from("/"),
-                _ => proc.basic().cwd(),
-            };
-            let mut cwd_vec: Vec<_> = cwd.split('/').filter(|&x| !x.is_empty()).collect();
-            let path_split = path.split('/').filter(|&x| !x.is_empty());
-            for seg in path_split {
-                if seg == ".." {
-                    cwd_vec.pop();
-                } else if seg == "." {
-                    // 当前目录
-                } else {
-                    cwd_vec.push(seg);
-                }
-            }
-            //proc.basic().set_path(String::from(""));
-            for seg in cwd_vec {
-                new_path.push('/');
-                new_path.push_str(seg);
-            }
-            if new_path.is_empty() {
-                new_path = String::from("/");
-            }
-        }
-        let inode =
-            match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-                Err(_) => {
-                    return Err(SystemError::ENOENT);
-                }
-                Ok(i) => i,
-            };
-        let metadata = inode.metadata()?;
-        if metadata.file_type == FileType::Dir {
-            proc.basic_mut().set_cwd(new_path);
-            proc.fs_struct_mut().set_pwd(inode);
-            return Ok(0);
-        } else {
-            return Err(SystemError::ENOTDIR);
-        }
-    }
-
-    pub fn fchdir(fd: i32) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let file = pcb
-            .fd_table()
-            .read()
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-        let inode = file.inode();
-        if inode.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        let path = inode.absolute_path()?;
-        pcb.basic_mut().set_cwd(path);
-        pcb.fs_struct_mut().set_pwd(inode);
-        return Ok(0);
-    }
-
-    /// @brief 获取当前进程的工作目录路径
-    ///
-    /// @param buf 指向缓冲区的指针
-    /// @param size 缓冲区的大小
-    ///
-    /// @return 成功，返回的指针指向包含工作目录路径的字符串
-    /// @return 错误，没有足够的空间
-    pub fn getcwd(buf: &mut [u8]) -> Result<usize, SystemError> {
-        let proc = ProcessManager::current_pcb();
-        let cwd = proc.basic().cwd();
-
-        let cwd_bytes = cwd.as_bytes();
-        let cwd_len = cwd_bytes.len();
-        if cwd_len + 1 > buf.len() {
-            return Err(SystemError::ENOMEM);
-        }
-        buf[..cwd_len].copy_from_slice(cwd_bytes);
-        buf[cwd_len] = 0;
-
-        return Ok(cwd_len + 1);
-    }
-
-    /// # 获取目录中的数据
-    ///
-    /// ## 参数
-    /// - fd 文件描述符号
-    /// - buf 输出缓冲区
-    ///
-    /// ## 返回值
-    /// - Ok(ctx.current_pos) 填充缓冲区当前指针位置
-    /// - Err(ctx.error.unwrap()) 填充缓冲区时返回的错误
-    pub fn getdents(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
-        if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
-            return Err(SystemError::EBADF);
-        }
-
-        // 获取fd
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-
-        let mut ctx = FilldirContext::new(buf);
-        match file.read_dir(&mut ctx) {
-            Ok(_) => {
-                if ctx.error.is_some() {
-                    if ctx.error == Some(SystemError::EINVAL) {
-                        return Ok(ctx.current_pos);
-                    } else {
-                        return Err(ctx.error.unwrap());
-                    }
-                }
-                return Ok(ctx.current_pos);
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
-    }
-
     /// @brief 创建文件夹
     ///
     /// @param path(r8) 路径 / mode(r9) 模式

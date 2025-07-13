@@ -162,48 +162,6 @@ impl Syscall {
                 Self::do_renameat2(oldfd, oldname, newfd, newname, flags)
             }
 
-            SYS_OPENAT => {
-                let dirfd = args[0] as i32;
-                let path = args[1] as *const u8;
-                let flags = args[2] as u32;
-                let mode = args[3] as u32;
-
-                Self::openat(dirfd, path, flags, mode, true)
-            }
-
-            SYS_LSEEK => {
-                let fd = args[0] as i32;
-                let offset = args[1] as i64;
-                let whence = args[2] as u32;
-
-                Self::lseek(fd, offset, whence)
-            }
-
-            SYS_PREAD64 => {
-                let fd = args[0] as i32;
-                let buf_vaddr = args[1];
-                let len = args[2];
-                let offset = args[3];
-
-                let mut user_buffer_writer =
-                    UserBufferWriter::new(buf_vaddr as *mut u8, len, frame.is_from_user())?;
-                let buf = user_buffer_writer.buffer(0)?;
-                Self::pread(fd, buf, len, offset)
-            }
-
-            SYS_PWRITE64 => {
-                let fd = args[0] as i32;
-                let buf_vaddr = args[1];
-                let len = args[2];
-                let offset = args[3];
-
-                let user_buffer_reader =
-                    UserBufferReader::new(buf_vaddr as *const u8, len, frame.is_from_user())?;
-
-                let buf = user_buffer_reader.read_from_user(0)?;
-                Self::pwrite(fd, buf, len, offset)
-            }
-
             SYS_SBRK => {
                 let incr = args[0] as isize;
                 crate::mm::syscall::sys_sbrk::sys_sbrk(incr)
@@ -215,38 +173,6 @@ impl Syscall {
                 let cmd = args[2] as u32;
                 let arg = args[3];
                 Self::reboot(magic1, magic2, cmd, arg)
-            }
-
-            SYS_CHDIR => {
-                let r = args[0] as *const u8;
-                Self::chdir(r)
-            }
-            SYS_FCHDIR => {
-                let fd = args[0] as i32;
-                Self::fchdir(fd)
-            }
-
-            #[allow(unreachable_patterns)]
-            SYS_GETDENTS64 | SYS_GETDENTS => {
-                let fd = args[0] as i32;
-
-                let buf_vaddr = args[1];
-                let len = args[2];
-                let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
-                // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if frame.is_from_user() && verify_area(virt_addr, len).is_err() {
-                    // 来自用户态，而buffer在内核态，这样的操作不被允许
-                    Err(SystemError::EPERM)
-                } else if buf_vaddr == 0 {
-                    Err(SystemError::EFAULT)
-                } else {
-                    let buf: &mut [u8] = unsafe {
-                        core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len)
-                    };
-                    Self::getdents(fd, buf)
-                };
-
-                res
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -479,22 +405,6 @@ impl Syscall {
                 let timeval = args[0] as *mut PosixTimeval;
                 let timezone_ptr = args[1] as *mut PosixTimeZone;
                 Self::gettimeofday(timeval, timezone_ptr)
-            }
-
-            SYS_GETCWD => {
-                let buf = args[0] as *mut u8;
-                let size = args[1];
-                let security_check = || {
-                    verify_area(VirtAddr::new(buf as usize), size)?;
-                    return Ok(());
-                };
-                let r = security_check();
-                if let Err(e) = r {
-                    Err(e)
-                } else {
-                    let buf = unsafe { core::slice::from_raw_parts_mut(buf, size) };
-                    Self::getcwd(buf)
-                }
             }
 
             SYS_FCNTL => {

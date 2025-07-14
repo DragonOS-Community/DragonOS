@@ -135,3 +135,8 @@ pub struct NsCommon {
     pub stashed: AtomicIsize,
     // todo: 添加其他公共字段
 }
+
+/// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?fi=exec_task_namespaces#259
+pub fn exec_task_namespaces() -> Result<(), SystemError> {
+    todo!("exec_task_namespaces logic here");
+}

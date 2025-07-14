@@ -804,6 +804,12 @@ impl BinaryLoader for ElfLoader {
         }
         Self::parse_gnu_property()?;
 
+        param.begin_new_exec()?;
+
+        // todo: 补充逻辑：https://code.dragonos.org.cn/xref/linux-6.6.21/fs/binfmt_elf.c#1007
+
+        param.setup_new_exec();
+
         let mut elf_brk = VirtAddr::new(0);
         let mut elf_bss = VirtAddr::new(0);
         let mut start_code: Option<VirtAddr> = None;

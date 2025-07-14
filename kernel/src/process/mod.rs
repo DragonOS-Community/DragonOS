@@ -89,6 +89,7 @@ pub mod pid;
 pub mod process_group;
 pub mod resource;
 pub mod session;
+pub mod signal;
 pub mod stdio;
 pub mod syscall;
 pub mod timer;
@@ -672,6 +673,8 @@ bitflags! {
         const HAS_PENDING_SIGNAL = 1 << 9;
         /// 进程需要恢复之前保存的信号掩码
         const RESTORE_SIG_MASK = 1 << 10;
+        /// Forked but didn't exec
+        const FORKNOEXEC = 1 << 11;
     }
 }
 
@@ -1948,6 +1951,9 @@ pub struct ProcessSignalInfo {
     ///
     /// todo: 在prctl里面实现设置这个标志位的功能
     is_child_subreaper: bool,
+
+    /// boolean value for session group leader
+    pub is_session_leader: bool,
 }
 
 impl ProcessSignalInfo {
@@ -2044,6 +2050,7 @@ impl Default for ProcessSignalInfo {
             tty: None,
             has_child_subreaper: false,
             is_child_subreaper: false,
+            is_session_leader: false,
             flags: SignalFlags::empty(),
         }
     }

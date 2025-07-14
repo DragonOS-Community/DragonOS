@@ -149,8 +149,8 @@ impl Debug for UPid {
 }
 
 impl ProcessControlBlock {
-    pub fn pid(&self) -> Option<Arc<Pid>> {
-        self.thread_pid.read().clone()
+    pub fn pid(&self) -> Arc<Pid> {
+        self.thread_pid.read().clone().unwrap()
     }
 }
 
@@ -365,5 +365,11 @@ impl ProcessManager {
     ) -> Option<Arc<ProcessControlBlock>> {
         let pid: Arc<Pid> = ns.find_pid_in_ns(nr)?;
         return pid.pid_task(PidType::PID);
+    }
+
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c?fi=find_vpid#318
+    pub fn find_vpid(nr: RawPid) -> Option<Arc<Pid>> {
+        let active_pid_ns = ProcessManager::current_pcb().active_pid_ns();
+        active_pid_ns.find_pid_in_ns(nr)
     }
 }

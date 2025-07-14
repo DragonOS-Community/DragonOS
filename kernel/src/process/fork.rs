@@ -406,6 +406,9 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
+        // 标记当前线程还未被执行exec
+        pcb.flags().insert(ProcessFlags::FORKNOEXEC);
+
         // 将子进程/线程的id存储在用户态传进的地址中
         if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
             let mut writer = UserBufferWriter::new(
@@ -533,54 +536,52 @@ impl ProcessManager {
             )
         });
         let pid = pcb.pid();
-        if let Some(pid) = pid.clone() {
-            if pcb.is_thread_group_leader() {
-                if pcb.raw_pid() == RawPid(1) {
-                    pcb.init_task_pid(PidType::TGID, pid.clone());
-                    pcb.init_task_pid(PidType::PGID, pid.clone());
-                    pcb.init_task_pid(PidType::SID, pid.clone());
-                } else {
-                    pcb.init_task_pid(PidType::TGID, pid.clone());
-                    pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
-                    pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
-                }
-
-                if pid.is_child_reaper() {
-                    pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
-                    pcb.sig_info_mut().flags.insert(SignalFlags::UNKILLABLE);
-                }
-
-                let parent_siginfo = current_pcb.sig_info_irqsave();
-                let parent_tty = parent_siginfo.tty();
-                let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
-                let parent_is_child_reaper = parent_siginfo.is_child_subreaper();
-                drop(parent_siginfo);
-                let mut sig_info_guard = pcb.sig_info_mut();
-
-                sig_info_guard.set_tty(parent_tty);
-
-                /*
-                 * Inherit has_child_subreaper flag under the same
-                 * tasklist_lock with adding child to the process tree
-                 * for propagate_has_child_subreaper optimization.
-                 */
-                sig_info_guard
-                    .set_has_child_subreaper(parent_has_child_subreaper || parent_is_child_reaper);
-                drop(sig_info_guard);
-                pcb.attach_pid(PidType::TGID);
-                pcb.attach_pid(PidType::PGID);
-                pcb.attach_pid(PidType::SID);
+        if pcb.is_thread_group_leader() {
+            if pcb.raw_pid() == RawPid(1) {
+                pcb.init_task_pid(PidType::TGID, pid.clone());
+                pcb.init_task_pid(PidType::PGID, pid.clone());
+                pcb.init_task_pid(PidType::SID, pid.clone());
             } else {
-                pcb.task_join_group_stop();
-                let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
-                group_leader
-                    .threads_write_irqsave()
-                    .group_tasks
-                    .push(Arc::downgrade(pcb));
+                pcb.init_task_pid(PidType::TGID, pid.clone());
+                pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
+                pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
             }
 
-            pcb.attach_pid(PidType::PID);
+            if pid.is_child_reaper() {
+                pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
+                pcb.sig_info_mut().flags.insert(SignalFlags::UNKILLABLE);
+            }
+
+            let parent_siginfo = current_pcb.sig_info_irqsave();
+            let parent_tty = parent_siginfo.tty();
+            let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
+            let parent_is_child_reaper = parent_siginfo.is_child_subreaper();
+            drop(parent_siginfo);
+            let mut sig_info_guard = pcb.sig_info_mut();
+
+            sig_info_guard.set_tty(parent_tty);
+
+            /*
+             * Inherit has_child_subreaper flag under the same
+             * tasklist_lock with adding child to the process tree
+             * for propagate_has_child_subreaper optimization.
+             */
+            sig_info_guard
+                .set_has_child_subreaper(parent_has_child_subreaper || parent_is_child_reaper);
+            drop(sig_info_guard);
+            pcb.attach_pid(PidType::TGID);
+            pcb.attach_pid(PidType::PGID);
+            pcb.attach_pid(PidType::SID);
+        } else {
+            pcb.task_join_group_stop();
+            let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
+            group_leader
+                .threads_write_irqsave()
+                .group_tasks
+                .push(Arc::downgrade(pcb));
         }
+
+        pcb.attach_pid(PidType::PID);
 
         sched_cgroup_fork(pcb);
 

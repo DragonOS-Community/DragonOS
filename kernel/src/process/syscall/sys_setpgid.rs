@@ -2,6 +2,7 @@ use alloc::sync::Arc;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETPGID;
+use crate::process::pid::PidType;
 use crate::process::Pgid;
 use crate::process::ProcessFlags;
 use crate::process::ProcessManager;
@@ -65,16 +66,45 @@ impl Syscall for SysSetPgid {
                 return Err(SystemError::EPERM);
             }
 
-            if !p.flags().contains(ProcessFlags::FORKNOEXEC){
+            if !p.flags().contains(ProcessFlags::FORKNOEXEC) {
                 return Err(SystemError::EACCES);
             }
-        }else{
+        } else {
             if !Arc::ptr_eq(&p, &group_leader) {
                 return Err(SystemError::ESRCH);
             }
         }
 
-        todo!("Implement sys_setpgid logic");
+        if p.sig_info_irqsave().is_session_leader {
+            return Err(SystemError::EPERM);
+        }
+        let mut pgrp = p.pid();
+        if pgid != pid {
+            pgrp = ProcessManager::find_vpid(pgid).ok_or(SystemError::EPERM)?;
+            let g = pgrp.pid_task(PidType::PGID).ok_or(SystemError::EPERM)?;
+            let s1 = g.task_session();
+            let s2 = group_leader.task_session();
+            // 模拟C的 task_session(g) != task_session(group_leader) 判断
+            // 1. 如果两个会话都是None，视为相等
+            // 2. 如果只有一个为None，视为不等
+            // 3. 如果两个都有值，比较内部Pid
+            match (s1, s2) {
+                (None, None) => (), // 都为空，允许
+                (Some(_), None) | (None, Some(_)) => return Err(SystemError::EPERM),
+                (Some(session1), Some(session2)) if !Arc::ptr_eq(&session1, &session2) => {
+                    return Err(SystemError::EPERM)
+                }
+                _ => (), // 会话相同，继续
+            }
+        }
+
+        let pp = p.task_pgrp().unwrap();
+
+        if !Arc::ptr_eq(&pp, &pgrp) {
+            p.change_pid(PidType::PGID, pgrp);
+        }
+
+        return Ok(0);
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

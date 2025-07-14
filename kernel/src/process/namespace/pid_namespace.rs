@@ -133,6 +133,6 @@ impl InnerPidNamespace {
 
 impl ProcessControlBlock {
     pub fn active_pid_ns(&self) -> Arc<PidNamespace> {
-        self.pid().unwrap().ns_of_pid()
+        self.pid().ns_of_pid()
     }
 }

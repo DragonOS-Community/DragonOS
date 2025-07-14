@@ -604,10 +604,10 @@ fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
     };
 
     // 暴力遍历每一个线程，找到相同的tgid
-    let tgid = pcb.tgid();
+    let tgid = pcb.tgid_old();
     for &pid in pcb.children_read_irqsave().iter() {
         if let Some(child) = ProcessManager::find(pid) {
-            if child.tgid() == tgid {
+            if child.tgid_old() == tgid {
                 thread_handling_function(child, &retarget);
             }
         }

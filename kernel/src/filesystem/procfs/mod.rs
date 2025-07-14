@@ -181,7 +181,7 @@ impl ProcFSInode {
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
 
         // Tgid
-        pdata.append(&mut format!("\nTgid:\t{}", pcb.tgid().into()).into());
+        pdata.append(&mut format!("\nTgid:\t{}", pcb.tgid_old().into()).into());
 
         // pid
         pdata.append(

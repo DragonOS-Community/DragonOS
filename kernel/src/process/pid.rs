@@ -326,6 +326,11 @@ impl ProcessControlBlock {
         return retval;
     }
 
+    /// 获取当前任务的线程组ID (在当前PID命名空间中的TGID)
+    pub fn task_tgid_vnr(&self) -> Option<RawPid> {
+        self.__task_pid_nr_ns(PidType::TGID, None)
+    }
+
     pub(super) fn detach_pid(&self, pid_type: PidType) {
         self.__change_pid(pid_type, None);
     }

@@ -4,7 +4,6 @@ use crate::process::ProcessManager;
 use crate::process::RawPid;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 pub struct SysGetsid;
@@ -30,18 +29,17 @@ impl Syscall for SysGetsid {
     /// ## 参数
     /// - pid: 指定一个进程号
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        todo!("Implement sys_getsid logic");
         let pid = Self::pid(args);
-        let session = ProcessManager::current_pcb().session().unwrap();
-        let sid = session.sid().into();
-        if pid == RawPid(0) {
-            return Ok(sid);
+        let sid;
+        if pid.data() == 0 {
+            sid = ProcessManager::current_pcb()
+                .task_session()
+                .ok_or(SystemError::ESRCH)?;
+        } else {
+            let p = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
+            sid = p.task_session().ok_or(SystemError::ESRCH)?;
         }
-        let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
-        if !Arc::ptr_eq(&session, &pcb.session().unwrap()) {
-            return Err(SystemError::EPERM);
-        }
-        return Ok(sid);
+        return Ok(sid.pid_vnr().into());
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

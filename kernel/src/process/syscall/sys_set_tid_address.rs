@@ -1,6 +1,5 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SET_TID_ADDRESS;
-use crate::mm::verify_area;
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -23,10 +22,7 @@ impl Syscall for SysSetTidAddress {
     /// # 函数的功能
     /// 设置线程地址
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        todo!("Implement sys_set_tid_address logic");
         let ptr = Self::ptr(args);
-        verify_area(VirtAddr::new(ptr), core::mem::size_of::<i32>())
-            .map_err(|_| SystemError::EFAULT)?;
 
         let pcb = ProcessManager::current_pcb();
         pcb.thread.write_irqsave().clear_child_tid = Some(VirtAddr::new(ptr));

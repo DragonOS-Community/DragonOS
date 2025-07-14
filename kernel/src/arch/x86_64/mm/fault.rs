@@ -282,7 +282,8 @@ impl X86_64MMArch {
                     if !space_guard.can_extend_stack(region.start() - address) {
                         // exceeds stack limit
                         log::error!(
-                            "stack limit exceeded, error_code: {:?}, address: {:#x}",
+                            "pid {} stack limit exceeded, error_code: {:?}, address: {:#x}",
+                            ProcessManager::current_pid().data(),
                             error_code,
                             address.data(),
                         );
@@ -300,8 +301,10 @@ impl X86_64MMArch {
                         });
                 } else {
                     log::error!(
-                        "No mapped vma, error_code: {:?}, address: {:#x}, flags: {:?}",
+                        "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",
+                        ProcessManager::current_pid().data(),
                         error_code,
+                        regs.rip,
                         address.data(),
                         flags
                     );

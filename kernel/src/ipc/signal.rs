@@ -461,6 +461,7 @@ pub(super) fn do_sigaction(
     if sig == Signal::INVALID {
         return Err(SystemError::EINVAL);
     }
+
     let pcb = ProcessManager::current_pcb();
     // 指向当前信号的action的引用
     let action: &mut Sigaction = &mut pcb.sig_struct().handlers[sig as usize - 1];
@@ -471,7 +472,7 @@ pub(super) fn do_sigaction(
     // }
 
     // 保存原有的 sigaction
-    let old_act: Option<&mut Sigaction> = {
+    let mut old_act: Option<&mut Sigaction> = {
         if let Some(oa) = old_act {
             *(oa) = *action;
             Some(oa)
@@ -480,7 +481,7 @@ pub(super) fn do_sigaction(
         }
     };
     // 清除所有的脏的sa_flags位（也就是清除那些未使用的）
-    let act = {
+    let mut act = {
         if let Some(ac) = act {
             *ac.flags_mut() &= SigFlags::SA_ALL;
             Some(ac)
@@ -489,17 +490,17 @@ pub(super) fn do_sigaction(
         }
     };
 
-    if let Some(act) = old_act {
+    if let Some(act) = &mut old_act {
         *act.flags_mut() &= SigFlags::SA_ALL;
     }
 
-    if let Some(ac) = act {
+    if let Some(ac) = &mut act {
         // 将act.sa_mask的SIGKILL SIGSTOP的屏蔽清除
         ac.mask_mut()
             .remove(<Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into());
 
         // 将新的sigaction拷贝到进程的action中
-        *action = *ac;
+        *action = **ac;
         /*
         * 根据POSIX 3.3.1.3规定：
         * 1.不管一个信号是否被阻塞，只要将其设置SIG_IGN，如果当前已经存在了正在pending的信号，那么就把这个信号忽略。
@@ -514,6 +515,7 @@ pub(super) fn do_sigaction(
             // todo: 当有了多个线程后，在这里进行操作，把每个线程的sigqueue都进行刷新
         }
     }
+
     return Ok(());
 }
 

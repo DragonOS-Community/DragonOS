@@ -1767,8 +1767,8 @@ unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr) {
 }
 
 impl KernelStack {
-    pub const SIZE: usize = 0x4000;
-    pub const ALIGN: usize = 0x4000;
+    pub const SIZE: usize = 0x8000;
+    pub const ALIGN: usize = 0x8000;
 
     pub fn new() -> Result<Self, SystemError> {
         if cfg!(feature = "kstack_protect") {

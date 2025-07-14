@@ -61,6 +61,20 @@ pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
     .union(Signal::into_sigset(Signal::SIGIO_OR_POLL))
     .union(Signal::into_sigset(Signal::SIGSYS));
 
+pub fn default_sighandlers() -> Vec<Sigaction> {
+    let mut r = vec![Sigaction::default(); MAX_SIG_NUM];
+    let mut sig_ign = Sigaction::default();
+    // 收到忽略的信号，重启系统调用
+    // todo: 看看linux哪些
+    sig_ign.flags_mut().insert(SigFlags::SA_RESTART);
+
+    r[Signal::SIGCHLD as usize - 1] = sig_ign;
+    r[Signal::SIGURG as usize - 1] = sig_ign;
+    r[Signal::SIGWINCH as usize - 1] = sig_ign;
+
+    r
+}
+
 /// SignalStruct 在 pcb 中加锁
 #[derive(Debug)]
 pub struct SignalStruct {
@@ -81,17 +95,9 @@ pub struct InnerSignalStruct {
 impl SignalStruct {
     #[inline(never)]
     pub fn new() -> Self {
-        let mut r = Self {
+        let r = Self {
             inner: InnerSignalStruct::default(),
         };
-        let mut sig_ign = Sigaction::default();
-        // 收到忽略的信号，重启系统调用
-        // todo: 看看linux哪些
-        sig_ign.flags_mut().insert(SigFlags::SA_RESTART);
-
-        r.inner.handlers[Signal::SIGCHLD as usize - 1] = sig_ign;
-        r.inner.handlers[Signal::SIGURG as usize - 1] = sig_ign;
-        r.inner.handlers[Signal::SIGWINCH as usize - 1] = sig_ign;
 
         r
     }
@@ -121,7 +127,7 @@ impl Default for InnerSignalStruct {
     fn default() -> Self {
         Self {
             cnt: Default::default(),
-            handlers: vec![Sigaction::default(); MAX_SIG_NUM],
+            handlers: default_sighandlers(),
             pids: core::array::from_fn(|_| None),
         }
     }

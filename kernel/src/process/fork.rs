@@ -290,6 +290,8 @@ impl ProcessManager {
                 .sig_struct_irqsave()
                 .cnt
                 .fetch_add(1, Ordering::SeqCst);
+
+            // todo: sighand结构体应该是个arc，这里要做arc赋值。下面要做创建新的arc。（现在的实现有问题）
             return Ok(());
         }
 

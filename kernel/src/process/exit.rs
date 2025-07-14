@@ -223,7 +223,12 @@ fn do_waitpid(
                 return Some(Ok(0));
             }
         }
-        ProcessState::Blocked(_) | ProcessState::Stopped => {
+        ProcessState::Blocked(_) => {
+            // 对于被阻塞的子进程（如正在sleep），waitpid应该继续等待
+            // 而不是立即返回0。只有当子进程真正退出时才应该返回。
+            return None;
+        }
+        ProcessState::Stopped => {
             // todo: 在stopped里面，添加code字段，表示停止的原因
             let exitcode = 0;
             // 由于目前不支持ptrace，因此这个值为false

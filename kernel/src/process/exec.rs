@@ -6,6 +6,7 @@ use system_error::SystemError;
 use crate::{
     driver::base::block::SeekFrom,
     filesystem::vfs::file::{File, FileMode},
+    ipc::signal_types::SignalStruct,
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -191,6 +192,8 @@ impl ExecParam {
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
 fn de_thread(pcb: &Arc<ProcessControlBlock>) {
+    // todo: 该函数未正确实现
+    *ProcessManager::current_pcb().sig_struct_irqsave() = SignalStruct::default();
     todo!("de_thread logic");
 }
 /// ## 加载二进制文件

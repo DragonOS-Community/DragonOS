@@ -289,7 +289,7 @@ impl ProcessControlBlock {
     pub(super) fn attach_pid(&self, pid_type: PidType) {
         let pid = self.task_pid_ptr(pid_type);
         if let Some(pid) = pid {
-            self.pids_links[pid_type as usize].link_pid(pid.clone());
+            self.pid_links[pid_type as usize].link_pid(pid.clone());
             pid.tasks[pid_type as usize]
                 .lock()
                 .push(self.self_ref.clone());
@@ -342,9 +342,9 @@ impl ProcessControlBlock {
 
     fn __change_pid(&self, pid_type: PidType, new_pid: Option<Arc<Pid>>) {
         let pid = self.task_pid_ptr(pid_type);
-        self.pids_links[pid_type as usize].unlink_pid();
+        self.pid_links[pid_type as usize].unlink_pid();
         if let Some(new_pid) = new_pid {
-            self.pids_links[pid_type as usize].link_pid(new_pid.clone());
+            self.pid_links[pid_type as usize].link_pid(new_pid.clone());
         }
 
         if let Some(pid) = pid {

@@ -707,7 +707,7 @@ pub struct ProcessControlBlock {
 
     thread_pid: RwLock<Option<Arc<Pid>>>,
     /// PID链接数组
-    pids_links: [PidLink; PidType::PIDTYPE_MAX],
+    pid_links: [PidLink; PidType::PIDTYPE_MAX],
 
     /// namespace代理
     nsproxy: RwLock<Arc<NsProxy>>,
@@ -871,7 +871,7 @@ impl ProcessControlBlock {
                 pid: raw_pid,
                 tgid: raw_pid,
                 thread_pid: RwLock::new(None),
-                pids_links: core::array::from_fn(|_| PidLink::default()),
+                pid_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RwLock::new(nsproxy),
                 basic: basic_info,
                 preempt_count,
@@ -1364,6 +1364,17 @@ impl ThreadInfo {
 
     pub fn group_leader(&self) -> Option<Arc<ProcessControlBlock>> {
         return self.group_leader.upgrade();
+    }
+
+    pub fn thread_group_empty(&self) -> bool {
+        let group_leader = self.group_leader();
+        if let Some(leader) = group_leader {
+            if Arc::ptr_eq(&leader, &ProcessManager::current_pcb()) {
+                return self.group_tasks.is_empty();
+            }
+            return false;
+        }
+        return true;
     }
 }
 

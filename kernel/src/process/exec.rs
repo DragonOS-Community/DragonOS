@@ -1,7 +1,9 @@
-use core::{fmt::Debug, ptr::null};
+use core::{fmt::Debug, ptr::null, sync::atomic::Ordering};
 
 use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
+
+use crate::process::Signal;
 
 use crate::{
     driver::base::block::SeekFrom,
@@ -177,7 +179,7 @@ impl ExecParam {
     pub fn begin_new_exec(&mut self) -> Result<(), ExecError> {
         let me = ProcessManager::current_pcb();
         // todo: 补充linux的逻辑
-        de_thread(&me);
+        de_thread(&me).map_err(ExecError::SystemError)?;
         me.flags().remove(ProcessFlags::FORKNOEXEC);
 
         exec_task_namespaces().map_err(ExecError::SystemError)?;
@@ -191,8 +193,13 @@ impl ExecParam {
 }
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
-fn de_thread(pcb: &Arc<ProcessControlBlock>) {
+fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     // todo: 该函数未正确实现
+    let tg_empty = pcb.threads_read_irqsave().thread_group_empty();
+    if tg_empty {
+        pcb.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+        return Ok(());
+    }
     *ProcessManager::current_pcb().sig_struct_irqsave() = SignalStruct::default();
     todo!("de_thread logic");
 }

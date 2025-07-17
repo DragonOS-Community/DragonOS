@@ -176,7 +176,8 @@ impl ProcFSInode {
 
         let priority = sched_info_guard.policy();
         let vrtime = sched_info_guard.sched_entity.vruntime;
-
+        let time = sched_info_guard.sched_entity.sum_exec_runtime;
+        let start_time = sched_info_guard.sched_entity.exec_start;
         // State
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
 
@@ -208,9 +209,12 @@ impl ProcFSInode {
         };
         pdata.append(&mut format!("\nTty:\t{}", name).as_bytes().to_owned());
 
+        // 进程在cpu上的运行时间
+        pdata.append(&mut format!("\nTime:\t{}", time).as_bytes().to_owned());
+        // 进程开始运行的时间
+        pdata.append(&mut format!("\nStime:\t{}", start_time).as_bytes().to_owned());
         // kthread
         pdata.append(&mut format!("\nKthread:\t{}", pcb.is_kthread() as usize).into());
-
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
         pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
         pdata.append(

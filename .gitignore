@@ -20,3 +20,10 @@ cppcheck.xml
 compile_commands.json
 /logs/
 *.log
+
+# Nix dev files
+/.envrc
+/.direnv/
+/flake.nix
+flake.lock
+/default.nix

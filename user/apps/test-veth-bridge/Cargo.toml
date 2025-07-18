@@ -1,5 +1,5 @@
 [package]
-name = "test-veth"
+name = "test-veth-bridge"
 version = "0.1.0"
 edition = "2021"
 description = "测试veth pair"

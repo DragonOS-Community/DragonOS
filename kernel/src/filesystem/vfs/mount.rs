@@ -256,6 +256,15 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.close(data);
     }
 
+
+    fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.inner_inode.read_sync(offset, buf)
+    }
+
+    fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.inner_inode.write_sync(offset, buf)
+    }
+
     fn create_with_data(
         &self,
         name: &str,

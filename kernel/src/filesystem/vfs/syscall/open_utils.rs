@@ -31,6 +31,14 @@ pub(super) fn do_open(
 
     let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
     let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
+    if crate::syscall::DFLAG.load(core::sync::atomic::Ordering::Relaxed) {
+        log::info!(
+            "openat: path: {}, o_flags: {:?}, mode: {:?}",
+            path,
+            open_flags,
+            mode
+        );
+    }
     return do_sys_open(
         AtFlags::AT_FDCWD.bits(),
         &path,

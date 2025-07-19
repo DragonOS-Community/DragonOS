@@ -59,7 +59,7 @@ impl Syscall {
     }
 
     pub fn umask(_mask: u32) -> Result<usize, SystemError> {
-        warn!("SYS_UMASK has not yet been implemented\n");
+        warn!("SYS_UMASK has not yet been implemented");
         return Ok(0o777);
     }
 

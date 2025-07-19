@@ -787,9 +787,14 @@ impl BinaryLoader for ElfLoader {
                     e
                 ))
             })?;
+            let pwd = ProcessManager::current_pcb().pwd_inode();
+            let inode = pwd.lookup(interpreter_path).map_err(|_| {
+                log::error!("Failed to find interpreter path: {}", interpreter_path);
+                return ExecError::InvalidParemeter;
+            })?;
             // log::debug!("opening interpreter at :{}", interpreter_path);
             interpreter = Some(
-                ExecParam::new(interpreter_path, param.vm().clone(), ExecParamFlags::EXEC)
+                ExecParam::new(inode, param.vm().clone(), ExecParamFlags::EXEC)
                     .map_err(|e| {
                         log::error!("Failed to load interpreter {interpreter_path}: {:?}", e);
                         return ExecError::NotSupported;

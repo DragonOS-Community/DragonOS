@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::block::SeekFrom,
-    filesystem::vfs::file::{File, FileMode},
+    filesystem::vfs::{file::{File, FileMode}, IndexNode},
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -111,15 +111,12 @@ pub enum ExecLoadMode {
 #[allow(dead_code)]
 impl ExecParam {
     pub fn new(
-        file_path: &str,
+        file_inode: Arc<dyn IndexNode>,
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
-        let pwd = ProcessManager::current_pcb().pwd_inode();
-        let inode = pwd.lookup(file_path)?;
-
         // 读取文件头部，用于判断文件类型
-        let file = File::new(inode, FileMode::O_RDONLY)?;
+        let file = File::new(file_inode, FileMode::O_RDONLY)?;
 
         Ok(Self {
             file,

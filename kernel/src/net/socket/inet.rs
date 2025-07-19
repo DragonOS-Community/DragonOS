@@ -497,9 +497,9 @@ impl TcpSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
+    pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024;
     /// 默认的发送缓冲区的大小 transmiss
-    pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
+    pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024;
 
     /// TcpSocket的特殊事件，用于在事件等待队列上sleep
     pub const CAN_CONNECT: u64 = 1u64 << 63;
@@ -813,6 +813,7 @@ impl Socket for TcpSocket {
         // 获取handle的数量
         let handlen = self.handles.len();
         let backlog = handlen.max(backlog);
+        let backlog = backlog.min(64); // 限制backlog的最大值为128
 
         // 添加剩余需要构建的socket
         // debug!("tcp socket:before listen, socket'len={}", self.handle_list.len());

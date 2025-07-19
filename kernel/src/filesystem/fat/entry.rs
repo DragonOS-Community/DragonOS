@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use core::{cmp::min, intrinsics::unlikely};
+use core::{cmp::min, intrinsics::unlikely, panic};
 use log::{debug, warn};
 use system_error::SystemError;
 
@@ -870,6 +870,15 @@ impl FATDir {
         } else {
             // 如果目标目录项存在，那么就返回错误
             return Err(SystemError::EEXIST);
+            // self.remove(fs.clone(), new_name, true)?;
+            // if let FATDirEntryOrShortName::ShortName(s) =
+            //     self.check_existence(new_name, None, fs.clone())?
+            // {
+            //     s
+            // } else {
+            //     // 如果目标目录项仍然存在，那么就返回错误
+            //     panic!("FATDir::rename: target directory entry still exists after remove");
+            // }
         };
 
         let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();

@@ -165,6 +165,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     }
 
     fn read_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        log::warn!("read_sync is not supported: {:?}", self.fs());
         return Err(SystemError::ENOSYS);
     }
 
@@ -351,6 +352,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
+        log::warn!("link is not supported: {:?}", self.fs());
         return Err(SystemError::ENOSYS);
     }
 
@@ -560,7 +562,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 将当前inode的内容同步到具体设备上
     fn sync(&self) -> Result<(), SystemError> {
-        return Ok(());
+        let page_cache = self.page_cache();
+        if let Some(page_cache) = page_cache {
+            return page_cache.lock_irqsave().sync();
+        }
+        Ok(())
     }
 
     /// ## 创建一个特殊文件节点

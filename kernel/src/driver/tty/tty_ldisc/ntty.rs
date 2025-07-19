@@ -57,7 +57,10 @@ impl NTtyLinediscipline {
                 todo!()
             }
             TtyIoctlCmd::TCFLSH => {
-                todo!()
+                // let data = tty.core();
+                // tty.flush_chars(data);
+                log::info!("NTTY TCFLSH cmd");
+                Ok(0)
             }
             _ => {
                 return TtyCore::tty_mode_ioctl(tty.clone(), cmd, arg);

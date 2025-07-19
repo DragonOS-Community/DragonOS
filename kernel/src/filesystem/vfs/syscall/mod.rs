@@ -65,6 +65,7 @@ mod sys_select;
 #[cfg(target_arch = "x86_64")]
 mod sys_symlink;
 mod sys_symlinkat;
+mod sys_fsync;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -454,6 +455,14 @@ impl Syscall {
 
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
         let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
+        if crate::syscall::DFLAG.load(core::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                "openat: path: {}, o_flags: {:?}, mode: {:?}",
+                path,
+                open_flags,
+                mode
+            );
+        }
         return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
     }
 
@@ -721,7 +730,6 @@ impl Syscall {
     /// - 'new': 新文件将创建的路径
     /// - 'flags': 标志位，仅以位或方式包含AT_EMPTY_PATH和AT_SYMLINK_FOLLOW
     ///
-    ///
     pub fn do_linkat(
         oldfd: i32,
         old: &str,
@@ -771,6 +779,7 @@ impl Syscall {
         let new_parent =
             new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or("/"), symlink_times)?;
 
+        log::debug!("find new parent: {:?}", new_parent_path);
         // 被调用者利用downcast_ref判断两inode是否为同一文件系统
         return new_parent.link(new_name, &old_inode).map(|_| 0);
     }
@@ -791,13 +800,15 @@ impl Syscall {
         };
         let old = get_path(old)?;
         let new = get_path(new)?;
-        return Self::do_linkat(
+        let res = Self::do_linkat(
             AtFlags::AT_FDCWD.bits(),
             &old,
             AtFlags::AT_FDCWD.bits(),
             &new,
             AtFlags::empty(),
         );
+        log::debug!("link old: {}, new: {}, res: {:?}", old, new, res);
+        res
     }
 
     pub fn linkat(
@@ -911,11 +922,16 @@ impl Syscall {
         if filename_from.len() > MAX_PATHLEN || filename_to.len() > MAX_PATHLEN {
             return Err(SystemError::ENAMETOOLONG);
         }
-
+        log::debug!(
+            "renameat2: oldfd: {}, filename_from: {}, newfd: {}, filename_to: {}",
+            oldfd, filename_from, newfd, filename_to
+        );
         //获取pcb，文件节点
         let pcb = ProcessManager::current_pcb();
         let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
         let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
+
+
         //获取父目录
         let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
         let old_parent_inode = ROOT_INODE()
@@ -1130,7 +1146,8 @@ impl Syscall {
                 // 未实现的命令，返回0，不报错。
 
                 warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
-                return Err(SystemError::ENOSYS);
+                // return Err(SystemError::ENOSYS);
+                return Ok(0);
             }
         }
     }

@@ -53,6 +53,7 @@ pub const SYS_SCHED: usize = 100003;
 #[derive(Debug)]
 pub struct Syscall;
 
+pub static DFLAG: AtomicBool = AtomicBool::new(false);
 impl Syscall {
     /// 初始化系统调用
     #[inline(never)]
@@ -91,6 +92,25 @@ impl Syscall {
         args: &[usize],
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
+
+        if ProcessManager::current_pcb()
+            .basic()
+            .name()
+            .contains("dropbear")
+        {
+            // 如果是dropbear进程，打印系统调用号和参数
+            log::debug!(
+                "Syscall {}({}) called with args: {:x?}",
+                syscall_num,
+                syscall_number_to_str(syscall_num),
+                args
+            );
+            DFLAG.store(true, Ordering::SeqCst);
+        }
+        if syscall_num == SYS_OPENAT || syscall_num == SYS_OPEN {
+            DFLAG.store(true, Ordering::SeqCst);
+        }
+
         // 首先尝试从syscall_table获取处理函数
         if let Some(handler) = syscall_table().get(syscall_num) {
             // 使用以下代码可以打印系统调用号和参数，方便调试
@@ -722,11 +742,6 @@ impl Syscall {
                 let gid = args[3];
                 let flag = args[4] as i32;
                 Self::fchownat(dirfd, pathname, uid, gid, flag)
-            }
-
-            SYS_FSYNC => {
-                warn!("SYS_FSYNC has not yet been implemented");
-                Ok(0)
             }
 
             SYS_RSEQ => {

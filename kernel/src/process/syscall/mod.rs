@@ -24,6 +24,7 @@ mod sys_setsid;
 mod sys_setuid;
 mod sys_uname;
 mod sys_wait4;
+mod sys_execveat;
 
 #[cfg(target_arch = "x86_64")]
 mod sys_fork;

@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use alloc::{ffi::CString, string::ToString};
+use alloc::{ffi::CString};
 use log::{debug, error};
 use system_error::SystemError;
 
@@ -160,9 +160,10 @@ fn run_init_process(
 ) -> Result<(), SystemError> {
     compiler_fence(Ordering::SeqCst);
     let path = proc_init_info.proc_name.to_str().unwrap();
-
+    let pwd = ProcessManager::current_pcb().pwd_inode();
+    let inode = pwd.lookup(path)?;
     do_execve(
-        path.to_string(),
+        inode,
         proc_init_info.args.clone(),
         proc_init_info.envs.clone(),
         trap_frame,

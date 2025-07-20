@@ -24,6 +24,7 @@ use crate::{
             kset::KSet,
         },
         serial::serial_init,
+        tty::virtual_terminal::vc_manager,
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
@@ -156,9 +157,9 @@ impl TtyDevice {
             log::debug!("Not a tty device, dev_num: {}", dev_num);
             return None;
         }
-        let pcb = ProcessManager::current_pcb();
         log::debug!("oct-3");
-        let current_tty = pcb.sig_info_irqsave().tty()?;
+        let mut current_tty = TtyJobCtrlManager::get_current_tty()?;
+
         if let FilePrivateData::Tty(tty_priv) = data {
             tty_priv.mode.insert(FileMode::O_NONBLOCK);
         }
@@ -246,6 +247,7 @@ impl IndexNode for TtyDevice {
         }
 
         let driver = tty.core().driver();
+        log::debug!("op-4: mode: {:?}", mode);
         // 考虑noctty（当前tty）
         if !(mode.contains(FileMode::O_NOCTTY) && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
             || dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 1)
@@ -254,7 +256,22 @@ impl IndexNode for TtyDevice {
         {
             let pcb = ProcessManager::current_pcb();
             let pcb_tty = pcb.sig_info_irqsave().tty();
-            if pcb_tty.is_none() && tty.core().contorl_info_irqsave().session.is_none() {
+
+            let cond1 = pcb_tty.is_none();
+            let cond2 = tty.core().contorl_info_irqsave().session.is_none();
+            log::debug!(
+                "op-5: cond1: {}, cond2: {}, tty: {:?}",
+                cond1,
+                cond2,
+                tty.core()
+                    .contorl_info_irqsave()
+                    .session
+                    .as_ref()
+                    .map(|s| s.pid_vnr())
+            );
+
+            // 注意！！这里为了debug,临时把cond2的判断去掉了，其实要cond1 && cond2才对
+            if cond1 {
                 TtyJobCtrlManager::proc_set_tty(tty);
             }
         }

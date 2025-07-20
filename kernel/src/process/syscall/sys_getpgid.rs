@@ -50,14 +50,13 @@ syscall_table_macros::declare_syscall!(SYS_GETPGID, SysGetPgid);
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sys.c#1144
 pub(super) fn do_getpgid(pid: RawPid) -> Result<usize, SystemError> {
-    let grp: Arc<Pid>;
-    if pid == RawPid(0) {
+    let grp: Arc<Pid> = if pid == RawPid(0) {
         let current_pcb = ProcessManager::current_pcb();
-        grp = current_pcb.task_pgrp().ok_or(SystemError::ESRCH)?;
+        current_pcb.task_pgrp().ok_or(SystemError::ESRCH)?
     } else {
         let p = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
-        grp = p.task_pgrp().ok_or(SystemError::ESRCH)?;
-    }
+        p.task_pgrp().ok_or(SystemError::ESRCH)?
+    };
 
     let retval = grp.pid_vnr();
     Ok(retval.into())

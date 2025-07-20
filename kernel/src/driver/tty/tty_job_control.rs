@@ -69,10 +69,13 @@ impl TtyJobCtrlManager {
         );
         if tty_pgid.is_some() && tty_pgid != pgid {
             let pgid = pgid.unwrap();
-            if sig == Signal::SIGTTIN && Self::sig_is_ignored(sig) {
+            if Self::sig_is_ignored(sig) {
                 // 忽略该信号
-                return Err(SystemError::EIO);
+                if sig == Signal::SIGTTIN {
+                    return Err(SystemError::EIO);
+                }
             } else if ProcessManager::is_current_pgrp_orphaned() {
+                log::debug!("tty_check_change: orphaned pgrp");
                 return Err(SystemError::EIO);
             } else {
                 crate::ipc::kill::kill_process_group(&pgid, sig)?;
@@ -119,6 +122,7 @@ impl TtyJobCtrlManager {
         let current = ProcessManager::current_pcb();
         let siginfo_guard = current.sig_info_irqsave();
 
+        log::debug!("set-1");
         // 只有会话首进程才能设置控制终端
         if !siginfo_guard.is_session_leader {
             return Err(SystemError::EPERM);
@@ -132,6 +136,7 @@ impl TtyJobCtrlManager {
                 // 如果已经是当前tty且会话相同，直接返回成功
                 return Ok(0);
             } else {
+                log::debug!("set-2");
                 // 已经有其他控制终端，返回错误
                 return Err(SystemError::EPERM);
             }
@@ -142,6 +147,7 @@ impl TtyJobCtrlManager {
         let tty_ctrl_guard = real_tty.core().contorl_info_irqsave();
 
         if let Some(ref sid) = tty_ctrl_guard.session {
+            log::debug!("set-3: sid: {}", sid.pid_vnr().data());
             // 如果当前进程是会话首进程，且tty的会话是当前进程的会话，则允许设置
             if current.task_session() == Some(sid.clone()) {
                 // 这是正常情况：会话首进程要设置自己会话的tty为控制终端
@@ -151,6 +157,7 @@ impl TtyJobCtrlManager {
                 if arg == 1 {
                     Self::session_clear_tty(sid.clone());
                 } else {
+                    log::debug!("set-3");
                     return Err(SystemError::EPERM);
                 }
             }
@@ -304,5 +311,9 @@ impl TtyJobCtrlManager {
         for task in sid.tasks_iter(PidType::SID) {
             TtyJobCtrlManager::proc_clear_tty(&task);
         }
+    }
+
+    pub fn get_current_tty() -> Option<Arc<TtyCore>> {
+        ProcessManager::current_pcb().sig_info_irqsave().tty()
     }
 }

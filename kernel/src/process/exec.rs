@@ -3,6 +3,7 @@ use core::{fmt::Debug, ptr::null, sync::atomic::Ordering};
 use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
+use crate::driver::tty::tty_job_control::TtyJobCtrlManager;
 use crate::process::Signal;
 
 use crate::{
@@ -180,6 +181,7 @@ impl ExecParam {
         let me = ProcessManager::current_pcb();
         // todo: 补充linux的逻辑
         de_thread(&me).map_err(ExecError::SystemError)?;
+
         me.flags().remove(ProcessFlags::FORKNOEXEC);
 
         exec_task_namespaces().map_err(ExecError::SystemError)?;

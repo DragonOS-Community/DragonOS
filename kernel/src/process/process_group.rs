@@ -200,7 +200,7 @@ impl ProcessManager {
             }
 
             if real_parent.task_pgrp() != Some(pgrp.clone())
-                && real_parent.task_session() != pcb.task_session()
+                && real_parent.task_session() == pcb.task_session()
             {
                 return false;
             }

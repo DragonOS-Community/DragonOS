@@ -43,7 +43,10 @@ impl Syscall for SysSetPgid {
             .threads_read_irqsave()
             .group_leader
             .clone();
+
+        log::debug!("setpgid-0");
         let group_leader = group_leader.upgrade().ok_or(SystemError::ESRCH)?;
+        log::debug!("setpgid-1");
 
         if pid.data() == 0 {
             pid = group_leader.task_pid_vnr();
@@ -72,6 +75,7 @@ impl Syscall for SysSetPgid {
             }
         } else {
             if !Arc::ptr_eq(&p, &group_leader) {
+                log::debug!("setpgid-2");
                 return Err(SystemError::ESRCH);
             }
         }

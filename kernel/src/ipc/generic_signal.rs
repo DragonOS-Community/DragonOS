@@ -131,10 +131,7 @@ impl GenericSignal {
     }
 
     pub fn kernel_only(&self) -> bool {
-        match self {
-            Self::SIGKILL | Self::SIGSTOP => true,
-            _ => false,
-        }
+        matches!(self, Self::SIGKILL | Self::SIGSTOP)
     }
 }
 

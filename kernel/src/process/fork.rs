@@ -180,6 +180,15 @@ impl ProcessManager {
             );
             e
         })?;
+        if pcb.raw_pid().data() > 1 {
+            log::debug!(
+                "fork done, pid: {}, pgid: {:?}, tgid: {:?}, sid: {}",
+                pcb.raw_pid(),
+                pcb.task_pgrp().map(|x| x.pid_vnr().data()),
+                pcb.task_tgid_vnr(),
+                pcb.task_session().map_or(0, |s| s.pid_vnr().data())
+            );
+        }
 
         // 向procfs注册进程
         procfs_register_pid(pcb.raw_pid()).unwrap_or_else(|e| {

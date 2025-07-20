@@ -151,7 +151,7 @@ pub struct PidTaskIterator<'a> {
     index: usize,
 }
 
-impl<'a> Iterator for PidTaskIterator<'a> {
+impl Iterator for PidTaskIterator<'_> {
     type Item = Arc<ProcessControlBlock>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -310,13 +310,7 @@ pub(super) fn free_pid(pid: Arc<Pid>) {
         let mut ns_guard = upid.ns.inner();
         let pid_allocated_after_free = ns_guard.do_pid_allocated() - 1;
         if pid_allocated_after_free == 1 || pid_allocated_after_free == 2 {
-            if let Some(child_reaper) = upid
-                .ns
-                .child_reaper()
-                .as_ref()
-                .map(|x| x.upgrade())
-                .flatten()
-            {
+            if let Some(child_reaper) = upid.ns.child_reaper().as_ref().and_then(|x| x.upgrade()) {
                 ProcessManager::wakeup(&child_reaper).ok();
             }
         }

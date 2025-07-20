@@ -18,7 +18,7 @@ use hashbrown::HashMap;
 use log::{debug, error, info, warn};
 use pid::{alloc_pid, Pid, PidLink, PidType};
 use process_group::{Pgid, ProcessGroup, ALL_PROCESS_GROUP};
-use session::{Session, Sid, ALL_SESSION};
+use session::{Session, ALL_SESSION};
 use system_error::SystemError;
 
 use crate::{
@@ -48,7 +48,7 @@ use crate::{
         },
         lock_free_flags::LockFreeFlags,
         mutex::Mutex,
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -433,10 +433,11 @@ impl ProcessManager {
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-        let pid: RawPid;
+        let pid: Arc<Pid>;
+        let raw_pid = ProcessManager::current_pid();
         {
             let pcb = ProcessManager::current_pcb();
-            pid = pcb.raw_pid();
+            pid = pcb.pid();
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
@@ -494,7 +495,7 @@ impl ProcessManager {
         }
 
         __schedule(SchedMode::SM_NONE);
-        error!("pid {pid:?} exited but sched again!");
+        error!("raw_pid {raw_pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
         loop {
             spin_loop();
@@ -964,13 +965,6 @@ impl ProcessControlBlock {
         return pcb;
     }
 
-    /// 生成一个新的pid
-    #[inline(always)]
-    fn generate_pid() -> RawPid {
-        static NEXT_PID: AtomicRawPid = AtomicRawPid::new(RawPid(1));
-        return NEXT_PID.fetch_add(RawPid(1), Ordering::SeqCst);
-    }
-
     /// 返回当前进程的锁持有计数
     #[inline(always)]
     pub fn preempt_count(&self) -> usize {
@@ -1108,6 +1102,19 @@ impl ProcessControlBlock {
         self.executable_path.read().clone()
     }
 
+    pub fn real_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        return self
+            .real_parent_pcb
+            .read_irqsave()
+            .upgrade()
+            .map(|p| p.clone());
+    }
+
+    /// 判断当前进程是否是全局的init进程
+    pub fn is_global_init(&self) -> bool {
+        self.task_tgid_vnr().unwrap() == RawPid(1)
+    }
+
     /// 根据文件描述符序号，获取socket对象的Arc指针
     ///
     /// ## 参数
@@ -1163,6 +1170,10 @@ impl ProcessControlBlock {
 
     pub fn sig_info_irqsave(&self) -> RwLockReadGuard<ProcessSignalInfo> {
         self.sig_info.read_irqsave()
+    }
+
+    pub fn sig_info_upgradable(&self) -> RwLockUpgradableGuard<ProcessSignalInfo> {
+        self.sig_info.upgradeable_read_irqsave()
     }
 
     pub fn try_siginfo_irqsave(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
@@ -1297,14 +1308,30 @@ impl ProcessControlBlock {
             .is_exited()
     }
 
+    pub fn exit_code(&self) -> Option<usize> {
+        self.sched_info
+            .inner_lock_read_irqsave()
+            .state()
+            .exit_code()
+    }
+
     /// 获取进程的namespace代理
     pub fn nsproxy(&self) -> Arc<NsProxy> {
         self.nsproxy.read().clone()
     }
 
     /// 设置进程的namespace代理
-    pub fn set_nsproxy(&self, nsproxy: Arc<NsProxy>) {
-        *self.nsproxy.write() = nsproxy;
+    ///
+    /// ## 参数
+    /// - `nsproxy` : 新的namespace代理
+    ///
+    /// ## 返回值
+    /// 返回旧的namespace代理
+    pub fn set_nsproxy(&self, nsproxy: Arc<NsProxy>) -> Arc<NsProxy> {
+        let mut guard = self.nsproxy.write();
+        let old = guard.clone();
+        *guard = nsproxy;
+        return old;
     }
 
     pub fn is_thread_group_leader(&self) -> bool {

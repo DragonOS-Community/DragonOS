@@ -188,7 +188,7 @@ impl ExecParam {
 
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c?fi=setup_new_exec#1443
     pub fn setup_new_exec(&mut self) {
-        todo!("setup_new_exec logic");
+        // todo!("setup_new_exec logic");
     }
 }
 
@@ -201,8 +201,11 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         return Ok(());
     }
     *ProcessManager::current_pcb().sig_struct_irqsave() = SignalStruct::default();
-    todo!("de_thread logic");
+    log::warn!("de_thread: todo impl thread group logic");
+
+    return Ok(());
 }
+
 /// ## 加载二进制文件
 pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, SystemError> {
     // 读取文件头部，用于判断文件类型

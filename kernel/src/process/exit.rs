@@ -108,9 +108,9 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
     'outer: loop {
         kwo.no_task_error = Some(SystemError::ECHILD);
-        match kwo.pid_converter {
+        match &kwo.pid_converter {
             PidConverter::Pid(pid) => {
-                let child_pcb = ProcessManager::find(pid)
+                let child_pcb = ProcessManager::find(*pid)
                     .ok_or(SystemError::ECHILD)
                     .unwrap();
                 // 获取weak引用，以便于在do_waitpid中能正常drop pcb
@@ -155,11 +155,9 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     nanosleep(Duration::from_millis(100).into())?;
                 }
             }
-            PidConverter::Pgid(pgid) => {
-                let pg = ProcessManager::find_process_group(pgid).ok_or(SystemError::ESRCH)?;
+            PidConverter::Pgid(Some(pgid)) => {
                 loop {
-                    let inner = pg.process_group_inner.lock();
-                    for (_, pcb) in inner.processes.iter() {
+                    for pcb in pgid.tasks_iter(PidType::PGID) {
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
                         if state.is_exited() {
@@ -175,10 +173,11 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             break 'outer;
                         }
                     }
-                    drop(inner);
                     nanosleep(Duration::from_millis(100).into())?;
                 }
             }
+
+            _ => {}
         }
         notask!('outer);
     }

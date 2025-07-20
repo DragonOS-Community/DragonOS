@@ -19,7 +19,7 @@ use crate::{
         wait_queue::EventWaitQueue,
     },
     mm::VirtAddr,
-    process::{process_group::Pgid, session::Sid, ProcessControlBlock},
+    process::{pid::Pid, ProcessControlBlock},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
@@ -69,7 +69,7 @@ impl TtyCore {
             port: RwLock::new(None),
             index,
             vc_index: AtomicUsize::new(usize::MAX),
-            ctrl: SpinLock::new(TtyContorlInfo::default()),
+            ctrl: SpinLock::new(TtyControlInfo::default()),
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
             link: RwLock::default(),
@@ -279,21 +279,21 @@ impl TtyCore {
 }
 
 #[derive(Debug, Default)]
-pub struct TtyContorlInfo {
+pub struct TtyControlInfo {
     /// 当前会话的SId
-    pub session: Option<Sid>,
+    pub session: Option<Arc<Pid>>,
     /// 前台进程组id
-    pub pgid: Option<Pgid>,
+    pub pgid: Option<Arc<Pid>>,
 
     /// packet模式下使用，目前未用到
     pub pktstatus: TtyPacketStatus,
     pub packet: bool,
 }
 
-impl TtyContorlInfo {
+impl TtyControlInfo {
     pub fn set_info_by_pcb(&mut self, pcb: Arc<ProcessControlBlock>) {
-        self.session = Some(pcb.sid());
-        self.pgid = Some(pcb.pgid_old());
+        self.session = pcb.task_session();
+        self.pgid = pcb.task_pgrp();
     }
 }
 
@@ -324,7 +324,7 @@ pub struct TtyCoreData {
     /// 端口
     port: RwLock<Option<Arc<dyn TtyPort>>>,
     /// 前台进程
-    ctrl: SpinLock<TtyContorlInfo>,
+    ctrl: SpinLock<TtyControlInfo>,
     /// 是否正在关闭
     closing: AtomicBool,
     /// 流控状态
@@ -417,7 +417,7 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn contorl_info_irqsave(&self) -> SpinLockGuard<TtyContorlInfo> {
+    pub fn contorl_info_irqsave(&self) -> SpinLockGuard<TtyControlInfo> {
         self.ctrl.lock_irqsave()
     }
 

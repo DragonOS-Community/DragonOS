@@ -11,7 +11,6 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use hashbrown::HashMap;
-use system_error::SystemError;
 
 /// 进程组ID
 pub type Pgid = RawPid;
@@ -134,6 +133,7 @@ impl ProcessManager {
     /// ## 返回值
     ///
     /// 如果找到了对应的进程组，那么返回该进程组，否则返回None
+    #[deprecated]
     pub fn find_process_group(pgid: Pgid) -> Option<Arc<ProcessGroup>> {
         return ALL_PROCESS_GROUP
             .lock_irqsave()
@@ -176,29 +176,43 @@ impl ProcessManager {
     // 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#345
     pub fn is_current_pgrp_orphaned() -> bool {
         let current_pcb = ProcessManager::current_pcb();
-        let sid = current_pcb.sid();
-        let process_group = current_pcb.process_group_old();
-        if let Some(pg) = process_group {
-            for process in pg.process_group_inner.lock().processes.values() {
-                if let Some(real_parent) = process.real_parent_pcb.read().clone().upgrade() {
-                    //todo 添加判断： 1.是否被忽略 2.是否已经退出（线程组是否为空）
-                    if real_parent.pid == RawPid(1) || process.is_exited() {
-                        log::debug!("is_current_pgrp_orphaned: real_parent is init or exited");
-                        continue;
-                    }
-                    let real_parent_pg = real_parent.process_group_old().unwrap();
-                    if real_parent_pg.pgid() != pg.pgid() && real_parent_pg.sid() == sid {
-                        return false;
-                    }
-                }
+        let pgrp = current_pcb.task_pgrp().unwrap();
+        Self::will_become_orphaned_pgrp(&pgrp, None)
+    }
+
+    /// 检查一个进程组是否为孤儿进程组
+    ///
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#326
+    #[inline(never)]
+    fn will_become_orphaned_pgrp(
+        pgrp: &Arc<Pid>,
+        ignored_pcb: Option<&Arc<ProcessControlBlock>>,
+    ) -> bool {
+        for pcb in pgrp.tasks_iter(PidType::PGID) {
+            let real_parent = pcb.real_parent_pcb().unwrap();
+            if ignored_pcb.is_some() && Arc::ptr_eq(&pcb, ignored_pcb.unwrap()) {
+                continue;
+            }
+            if (pcb.is_exited() && pcb.threads_read_irqsave().thread_group_empty())
+                || real_parent.is_global_init()
+            {
+                continue;
+            }
+
+            if real_parent.task_pgrp() != Some(pgrp.clone())
+                && real_parent.task_session() != pcb.task_session()
+            {
+                return false;
             }
         }
-        true
+
+        return true;
     }
 }
 
 impl ProcessControlBlock {
     #[inline(always)]
+    #[deprecated]
     pub fn pgid_old(&self) -> Pgid {
         if let Some(process_group) = self.process_group.lock().upgrade() {
             process_group.pgid()
@@ -208,132 +222,17 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    #[deprecated]
     pub fn process_group_old(&self) -> Option<Arc<ProcessGroup>> {
         self.process_group.lock().upgrade()
     }
 
+    #[deprecated]
     pub fn set_process_group_old(&self, pg: &Arc<ProcessGroup>) {
         if let Some(pcb) = self.self_ref.upgrade() {
             *pcb.process_group.lock() = Arc::downgrade(pg);
             // log::debug!("pid: {:?} set pgid: {:?}", self.pid(), pg.pgid());
         }
-    }
-
-    pub fn is_process_group_leader_old(&self) -> bool {
-        if let Some(pcb) = self.self_ref.upgrade() {
-            let pg = self.process_group_old().unwrap();
-            if let Some(leader) = pg.leader() {
-                return Arc::ptr_eq(&pcb, &leader);
-            }
-        }
-
-        return false;
-    }
-
-    /// 将进程加入到指定pgid的进程组中（无论该进程组是否已经存在）
-    ///
-    /// 如果进程组已经存在，则将进程加入到该进程组中
-    /// 如果进程组不存在，则创建一个新的进程组，并将进程加入到该进程组中
-    ///
-    /// ## 参数
-    /// `pgid` : 目标进程组的pgid
-    ///
-    /// ## 返回值
-    /// 无
-    pub fn join_other_group(&self, pgid: Pgid) -> Result<(), SystemError> {
-        // if let Some(pcb) = self.self_ref.upgrade() {
-        if self.pgid_old() == pgid {
-            return Ok(());
-        }
-        if self.is_session_leader() {
-            // 会话领导者不能加入其他进程组
-            return Err(SystemError::EPERM);
-        }
-        if let Some(pg) = ProcessManager::find_process_group(pgid) {
-            let session = self.session().unwrap();
-            if !session.contains_process_group(&pg) {
-                // 进程组和进程应该属于同一个会话
-                return Err(SystemError::EPERM);
-            }
-            self.join_specified_group(&pg)?;
-        } else {
-            if pgid != self.raw_pid() {
-                // 进程组不存在，只能加入自己的进程组
-                return Err(SystemError::EPERM);
-            }
-            self.join_new_group()?;
-        }
-        // }
-
-        Ok(())
-    }
-
-    /// 将进程加入到新创建的进程组中
-    fn join_new_group(&self) -> Result<(), SystemError> {
-        let session = self.session().unwrap();
-        let mut self_pg_mut = self.process_group.lock();
-
-        if let Some(old_pg) = self_pg_mut.upgrade() {
-            let mut old_pg_inner = old_pg.process_group_inner.lock();
-            let mut session_inner = session.session_inner.lock();
-            old_pg_inner.remove_process(&self.pid);
-            *self_pg_mut = Weak::new();
-
-            if old_pg_inner.is_empty() {
-                ProcessManager::remove_process_group(old_pg.pgid());
-                assert!(session_inner.process_groups.contains_key(&old_pg.pgid()));
-                session_inner.process_groups.remove(&old_pg.pgid());
-            }
-        }
-
-        let pcb = self.self_ref.upgrade().unwrap();
-        let new_pg = ProcessGroup::new(pcb);
-        let mut new_pg_inner = new_pg.process_group_inner.lock();
-        let mut session_inner = session.session_inner.lock();
-
-        *self_pg_mut = Arc::downgrade(&new_pg);
-        ProcessManager::add_process_group(new_pg.clone());
-
-        new_pg_inner.session = Arc::downgrade(&session);
-        session_inner
-            .process_groups
-            .insert(new_pg.pgid, new_pg.clone());
-
-        Ok(())
-    }
-
-    /// 将进程加入到指定的进程组中
-    fn join_specified_group(&self, group: &Arc<ProcessGroup>) -> Result<(), SystemError> {
-        let mut self_group = self.process_group.lock();
-
-        let mut group_inner = if let Some(old_pg) = self_group.upgrade() {
-            let (mut old_pg_inner, group_inner) = match old_pg.pgid().cmp(&group.pgid()) {
-                core::cmp::Ordering::Equal => return Ok(()),
-                core::cmp::Ordering::Less => (
-                    old_pg.process_group_inner.lock(),
-                    group.process_group_inner.lock(),
-                ),
-                core::cmp::Ordering::Greater => {
-                    let group_inner = group.process_group_inner.lock();
-                    let old_pg_inner = old_pg.process_group_inner.lock();
-                    (old_pg_inner, group_inner)
-                }
-            };
-            old_pg_inner.remove_process(&self.pid);
-            *self_group = Weak::new();
-
-            if old_pg_inner.is_empty() {
-                ProcessManager::remove_process_group(old_pg.pgid());
-            }
-            group_inner
-        } else {
-            group.process_group_inner.lock()
-        };
-
-        let pcb = self.self_ref.upgrade().unwrap();
-        group_inner.processes.insert(self.pid, pcb);
-        *self_group = Arc::downgrade(group);
-        Ok(())
     }
 
     /// ### 清除自身的进程组以及会话引用(如果有的话)，这个方法只能在进程退出时调用
@@ -359,7 +258,7 @@ impl ProcessControlBlock {
             }
         }
 
-        if let Some(session) = self.session() {
+        if let Some(session) = self.session_old() {
             let mut session_inner = session.session_inner.lock();
             if let Some(leader) = &session_inner.leader {
                 if Arc::ptr_eq(leader, &self.self_ref.upgrade().unwrap()) {

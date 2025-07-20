@@ -1,6 +1,5 @@
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
-use crate::ipc::signal_types::SignalStruct;
 use crate::process::exec::{load_binary_file, ExecParam, ExecParamFlags};
 use crate::process::ProcessManager;
 use crate::syscall::Syscall;

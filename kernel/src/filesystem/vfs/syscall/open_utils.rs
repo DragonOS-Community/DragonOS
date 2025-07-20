@@ -29,6 +29,17 @@ pub(super) fn do_open(
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 
+    let show = crate::process::ProcessManager::current_pid().data() >= 8;
+    if show {
+        log::debug!(
+            "do_open: path: {}, o_flags: {:?}, mode: {:?}, follow_symlink: {}",
+            path,
+            FileMode::from_bits(o_flags),
+            ModeType::from_bits(mode),
+            follow_symlink
+        );
+    }
+
     let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
     let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
     return do_sys_open(

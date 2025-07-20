@@ -138,5 +138,19 @@ pub struct NsCommon {
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?fi=exec_task_namespaces#259
 pub fn exec_task_namespaces() -> Result<(), SystemError> {
-    todo!("exec_task_namespaces logic here");
+    let tsk = ProcessManager::current_pcb();
+    let user_ns = tsk.cred().user_ns.clone();
+    let new_nsproxy = create_new_namespaces(&CloneFlags::empty(), &tsk, user_ns)?;
+    // todo: time_ns的逻辑
+    switch_task_namespaces(&tsk, new_nsproxy)?;
+
+    return Ok(());
+}
+
+pub fn switch_task_namespaces(
+    tsk: &Arc<ProcessControlBlock>,
+    new_nsproxy: Arc<NsProxy>,
+) -> Result<(), SystemError> {
+    tsk.set_nsproxy(new_nsproxy);
+    Ok(())
 }

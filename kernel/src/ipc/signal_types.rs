@@ -133,6 +133,12 @@ impl Default for InnerSignalStruct {
     }
 }
 
+impl InnerSignalStruct {
+    pub fn handler(&self, sig: Signal) -> Option<&Sigaction> {
+        self.handlers.get(sig as usize - 1)
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 #[allow(dead_code)]
 pub enum SigactionType {

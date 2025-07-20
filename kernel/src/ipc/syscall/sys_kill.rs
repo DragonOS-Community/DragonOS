@@ -1,13 +1,15 @@
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::c_int;
 
 use crate::arch::interrupt::TrapFrame;
+use crate::process::pid::Pid;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
     arch::{ipc::signal::Signal, syscall::nr::SYS_KILL},
-    process::{process_group::Pgid, ProcessManager, RawPid},
+    process::{ProcessManager, RawPid},
 };
 use log::warn;
 use system_error::SystemError;
@@ -19,23 +21,24 @@ use crate::ipc::kill::{kill_all, kill_process, kill_process_group};
 /// - 如果id == -1，则为所有进程
 /// - 如果id == 0，则为当前进程组
 /// - 如果id > 0，则为pid
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PidConverter {
     All,
     Pid(RawPid),
-    Pgid(Pgid),
+    Pgid(Option<Arc<Pid>>),
 }
 
 impl PidConverter {
     /// ### 为 `wait` 和 `kill` 调用使用
     pub fn from_id(id: i32) -> Self {
         if id < -1 {
-            PidConverter::Pgid(Pgid::from(-id as usize))
+            let pgid = ProcessManager::find_vpid(RawPid::from(-id as usize));
+            PidConverter::Pgid(pgid)
         } else if id == -1 {
             PidConverter::All
         } else if id == 0 {
-            let pgid = ProcessManager::current_pcb().pgid_old();
-            PidConverter::Pgid(pgid)
+            let pgid = ProcessManager::current_pcb().task_pgrp().unwrap();
+            PidConverter::Pgid(Some(pgid))
         } else {
             PidConverter::Pid(RawPid::from(id as usize))
         }
@@ -74,7 +77,7 @@ impl Syscall for SysKillHandle {
 
         match converter {
             PidConverter::Pid(pid) => kill_process(pid, sig),
-            PidConverter::Pgid(pgid) => kill_process_group(pgid, sig),
+            PidConverter::Pgid(pgid) => kill_process_group(&pgid.ok_or(SystemError::ESRCH)?, sig),
             PidConverter::All => kill_all(sig),
         }
     }

@@ -1,6 +1,8 @@
 use crate::arch::ipc::signal::{SigCode, Signal};
 use crate::ipc::signal_types::{SigInfo, SigType};
-use crate::process::{process_group::Pgid, ProcessManager, RawPid};
+use crate::process::pid::{Pid, PidType};
+use crate::process::{ProcessManager, RawPid};
+use alloc::sync::Arc;
 use core::sync::atomic::compiler_fence;
 use system_error::SystemError;
 
@@ -19,11 +21,14 @@ pub fn kill_process(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
 }
 
 /// ### 杀死一个进程组
-pub fn kill_process_group(pgid: Pgid, sig: Signal) -> Result<usize, SystemError> {
-    let pg = ProcessManager::find_process_group(pgid).ok_or(SystemError::ESRCH)?;
-    let inner = pg.process_group_inner.lock();
-    for pcb in inner.processes.values() {
-        kill_process(pcb.raw_pid(), sig)?; // Call the new common function
+///
+/// 注意！这个函数的实现跟Linux不一致。
+///
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=kill_pgrp#1921
+#[inline(never)]
+pub fn kill_process_group(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, SystemError> {
+    for pcb in pgid.tasks_iter(PidType::PGID) {
+        kill_process(pcb.raw_pid(), sig)?;
     }
     Ok(0)
 }

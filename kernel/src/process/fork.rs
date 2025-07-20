@@ -20,7 +20,7 @@ use crate::{
 use super::{
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     pid::{Pid, PidType},
-    KernelStack, Pgid, ProcessControlBlock, ProcessManager, RawPid, Sid,
+    KernelStack, ProcessControlBlock, ProcessManager, RawPid,
 };
 const MAX_PID_NS_LEVEL: usize = 32;
 
@@ -524,13 +524,6 @@ impl ProcessManager {
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }
 
-        Self::copy_group(current_pcb, pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
-
         Self::copy_fs(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
@@ -561,6 +554,7 @@ impl ProcessManager {
             drop(parent_siginfo);
             let mut sig_info_guard = pcb.sig_info_mut();
 
+            log::debug!("set tty: {:?}", parent_tty);
             sig_info_guard.set_tty(parent_tty);
 
             /*
@@ -590,50 +584,6 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// 拷贝进程组信息
-    ///
-    /// ## 参数
-    ///
-    /// `parent_pcb` - 父进程
-    /// `child_pcb` - 子进程
-    /// ## 返回值
-    ///
-    /// 无
-    fn copy_group(
-        parent_pcb: &Arc<ProcessControlBlock>,
-        child_pcb: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
-        if parent_pcb.process_group_old().is_none() && parent_pcb.raw_pid() == RawPid(0) {
-            return Ok(());
-        }
-        let pg = parent_pcb.process_group_old().unwrap();
-
-        let mut pg_inner = pg.process_group_inner.lock();
-
-        let mut children_writelock = parent_pcb.children.write();
-
-        children_writelock.push(child_pcb.raw_pid());
-
-        pg_inner
-            .processes
-            .insert(child_pcb.raw_pid(), child_pcb.clone());
-
-        // 检查是否已经存在pgid和sid
-        let pgid = Pgid::new(child_pcb.raw_pid().0);
-        let sid = Sid::new(pgid.into());
-
-        if ProcessManager::find_process_group(pgid).is_some() {
-            ProcessManager::remove_process_group(pgid);
-        }
-        if ProcessManager::find_session(sid).is_some() {
-            ProcessManager::remove_session(sid);
-        }
-
-        child_pcb.set_process_group_old(&pg);
-
-        Ok(())
-    }
-
     fn copy_fs(
         clone_flags: &CloneFlags,
         parent_pcb: &Arc<ProcessControlBlock>,
@@ -654,6 +604,11 @@ impl ProcessManager {
 impl ProcessControlBlock {
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/fork.c#1959
     pub(super) fn init_task_pid(&self, pid_type: PidType, pid: Arc<Pid>) {
+        log::debug!(
+            "init_task_pid: pid_type: {:?}, raw_pid:{}",
+            pid_type,
+            self.raw_pid().data()
+        );
         if pid_type == PidType::PID {
             self.thread_pid.write().replace(pid);
         } else {

@@ -39,7 +39,10 @@ impl Drop for PanicGuard {
 #[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {
     PANIC_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    error!("Kernel Panic Occurred.");
+    error!(
+        "Kernel Panic Occurred. raw_pid: {}",
+        process::ProcessManager::current_pid().data()
+    );
 
     match info.location() {
         Some(loc) => {

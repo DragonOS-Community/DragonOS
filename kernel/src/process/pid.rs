@@ -1,7 +1,7 @@
 use core::fmt::Debug;
 
 use crate::libs::rwlock::RwLock;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::process::ProcessManager;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -71,6 +71,11 @@ impl Pid {
         self.numbers.lock().first().cloned().unwrap()
     }
 
+    pub fn tasks_iter(&self, pid_type: PidType) -> PidTaskIterator {
+        let guard = self.tasks[pid_type as usize].lock();
+        PidTaskIterator { guard, index: 0 }
+    }
+
     /// 判断当前pid是否是当前命名空间的init进程(即child reaper)
     ///
     /// 由于在copy_process中可能在pid_ns->child_reaper被赋值前就需要检查，
@@ -123,6 +128,41 @@ impl Pid {
 
         // 如果没有找到对应的UPid，返回0
         RawPid::new(0)
+    }
+}
+
+impl PartialEq for Pid {
+    fn eq(&self, other: &Self) -> bool {
+        // 比较 `self_ref` 的指针地址（Weak 比较需要先升级为 Arc）
+        if let (Some(self_arc), Some(other_arc)) =
+            (self.self_ref.upgrade(), other.self_ref.upgrade())
+        {
+            Arc::ptr_eq(&self_arc, &other_arc)
+        } else {
+            false
+        }
+    }
+}
+
+impl Eq for Pid {}
+
+pub struct PidTaskIterator<'a> {
+    guard: SpinLockGuard<'a, Vec<Weak<ProcessControlBlock>>>,
+    index: usize,
+}
+
+impl<'a> Iterator for PidTaskIterator<'a> {
+    type Item = Arc<ProcessControlBlock>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.guard.len() {
+            if let Some(task) = self.guard[self.index].upgrade() {
+                self.index += 1;
+                return Some(task);
+            }
+            self.index += 1;
+        }
+        None
     }
 }
 
@@ -313,6 +353,9 @@ impl ProcessControlBlock {
         pid_type: PidType,
         mut ns: Option<Arc<PidNamespace>>,
     ) -> Option<RawPid> {
+        if self.raw_pid().data() == 0 {
+            return Some(self.raw_pid());
+        }
         if ns.is_none() {
             ns = Some(self.active_pid_ns());
         }
@@ -344,7 +387,7 @@ impl ProcessControlBlock {
         let pid = self.task_pid_ptr(pid_type);
         self.pid_links[pid_type as usize].unlink_pid();
         if let Some(new_pid) = new_pid {
-            self.pid_links[pid_type as usize].link_pid(new_pid.clone());
+            self.sig_struct().pids[pid_type as usize] = Some(new_pid);
         }
 
         if let Some(pid) = pid {

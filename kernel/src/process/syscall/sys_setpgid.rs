@@ -63,6 +63,7 @@ impl Syscall for SysSetPgid {
                 &p.task_session().unwrap(),
                 &group_leader.task_session().unwrap(),
             ) {
+                log::debug!("fff-1");
                 return Err(SystemError::EPERM);
             }
 
@@ -76,6 +77,7 @@ impl Syscall for SysSetPgid {
         }
 
         if p.sig_info_irqsave().is_session_leader {
+            log::debug!("fff-2");
             return Err(SystemError::EPERM);
         }
         let mut pgrp = p.pid();
@@ -90,9 +92,13 @@ impl Syscall for SysSetPgid {
             // 3. 如果两个都有值，比较内部Pid
             match (s1, s2) {
                 (None, None) => (), // 都为空，允许
-                (Some(_), None) | (None, Some(_)) => return Err(SystemError::EPERM),
+                (Some(_), None) | (None, Some(_)) => {
+                    log::debug!("fff-3");
+                    return Err(SystemError::EPERM);
+                }
                 (Some(session1), Some(session2)) if !Arc::ptr_eq(&session1, &session2) => {
-                    return Err(SystemError::EPERM)
+                    log::debug!("fff-4");
+                    return Err(SystemError::EPERM);
                 }
                 _ => (), // 会话相同，继续
             }

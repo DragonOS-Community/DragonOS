@@ -17,8 +17,7 @@ use cred::INIT_CRED;
 use hashbrown::HashMap;
 use log::{debug, error, info, warn};
 use pid::{alloc_pid, Pid, PidLink, PidType};
-use process_group::{Pgid, ProcessGroup, ALL_PROCESS_GROUP};
-use session::{Session, ALL_SESSION};
+use process_group::Pgid;
 use system_error::SystemError;
 
 use crate::{
@@ -47,7 +46,6 @@ use crate::{
             futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
-        mutex::Mutex,
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
@@ -143,8 +141,6 @@ impl ProcessManager {
         };
 
         ALL_PROCESS.lock_irqsave().replace(HashMap::new());
-        ALL_PROCESS_GROUP.lock_irqsave().replace(HashMap::new());
-        ALL_SESSION.lock_irqsave().replace(HashMap::new());
         Self::init_switch_result();
         Self::arch_init();
         debug!("process arch init done.");
@@ -489,7 +485,6 @@ impl ProcessManager {
                 }
             }
             pcb.sig_info_mut().set_tty(None);
-            pcb.clear_pg_and_session_reference();
             drop(pcb);
             ProcessManager::exit_notify();
         }
@@ -765,9 +760,6 @@ pub struct ProcessControlBlock {
 
     restart_block: SpinLock<Option<RestartBlock>>,
 
-    /// 进程组
-    process_group: Mutex<Weak<ProcessGroup>>,
-
     /// 进程的可执行文件路径
     executable_path: RwLock<String>,
 }
@@ -896,7 +888,6 @@ impl ProcessControlBlock {
                 cred: SpinLock::new(cred),
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
-                process_group: Mutex::new(Weak::new()),
                 executable_path: RwLock::new(name),
             };
 
@@ -939,15 +930,6 @@ impl ProcessControlBlock {
         }
 
         if pcb.raw_pid() > RawPid(0) && !is_idle {
-            let process_group = ProcessGroup::new(pcb.clone());
-            *pcb.process_group.lock() = Arc::downgrade(&process_group);
-            ProcessManager::add_process_group(process_group.clone());
-
-            let session = Session::new(process_group.clone());
-            process_group.process_group_inner.lock().session = Arc::downgrade(&session);
-            session.session_inner.lock().leader = Some(pcb.clone());
-            ProcessManager::add_session(session);
-
             ProcessManager::add_pcb(pcb.clone());
         }
 

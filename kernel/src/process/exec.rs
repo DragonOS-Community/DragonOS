@@ -3,7 +3,6 @@ use core::{fmt::Debug, ptr::null, sync::atomic::Ordering};
 use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::driver::tty::tty_job_control::TtyJobCtrlManager;
 use crate::process::Signal;
 
 use crate::{

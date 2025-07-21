@@ -24,7 +24,6 @@ use crate::{
             kset::KSet,
         },
         serial::serial_init,
-        tty::virtual_terminal::vc_manager,
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
@@ -158,7 +157,7 @@ impl TtyDevice {
             return None;
         }
         log::debug!("oct-3");
-        let mut current_tty = TtyJobCtrlManager::get_current_tty()?;
+        let current_tty = TtyJobCtrlManager::get_current_tty()?;
 
         if let FilePrivateData::Tty(tty_priv) = data {
             tty_priv.mode.insert(FileMode::O_NONBLOCK);

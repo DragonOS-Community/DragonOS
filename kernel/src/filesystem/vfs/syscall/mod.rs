@@ -1,14 +1,13 @@
-use crate::filesystem::vfs::FilldirContext;
 use core::mem::size_of;
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 
 use log::warn;
 use system_error::SystemError;
 
 use crate::syscall::user_access::UserBufferReader;
 use crate::{
-    driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
+    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::file::FileDescriptorVec,
     libs::rwlock::RwLockWriteGuard,
     process::ProcessManager,
@@ -23,48 +22,71 @@ use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{
-        do_faccessat, do_fchmodat, do_fchownat, do_sys_open, do_utimensat, do_utimes, ksys_fchown,
-    },
+    open::{do_faccessat, do_fchmodat, do_fchownat, do_utimensat, do_utimes, ksys_fchown},
     utils::{rsplit_path, user_path_at},
-    vcore::{do_mkdir_at, do_remove_dir, do_unlink_at},
     FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-
+mod link_utils;
 mod open_utils;
+mod rename_utils;
+mod sys_chdir;
 mod sys_close;
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-mod sys_fstat;
+mod sys_fchdir;
+mod sys_getcwd;
+mod sys_getdents;
 mod sys_ioctl;
-#[cfg(target_arch = "x86_64")]
-mod sys_lstat;
-#[cfg(target_arch = "x86_64")]
-mod sys_open;
+mod sys_linkat;
+mod sys_lseek;
+mod sys_mkdirat;
+mod sys_openat;
+mod sys_pread64;
+mod sys_pselect6;
+mod sys_pwrite64;
 mod sys_read;
 mod sys_readv;
-#[cfg(target_arch = "x86_64")]
-mod sys_stat;
+mod sys_renameat2;
+mod sys_select;
+mod sys_symlinkat;
+mod sys_unlinkat;
 mod sys_write;
 mod sys_writev;
 
 mod epoll_utils;
-#[cfg(target_arch = "x86_64")]
-mod sys_epoll_create;
 mod sys_epoll_create1;
 mod sys_epoll_ctl;
 mod sys_epoll_pwait;
-#[cfg(target_arch = "x86_64")]
-mod sys_epoll_wait;
 
+pub mod symlink_utils;
 pub mod sys_mount;
 pub mod sys_umount2;
 
-pub mod symlink_utils;
-mod sys_pselect6;
-mod sys_select;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+mod sys_fstat;
+
+#[cfg(target_arch = "x86_64")]
+mod sys_epoll_create;
+#[cfg(target_arch = "x86_64")]
+mod sys_epoll_wait;
+#[cfg(target_arch = "x86_64")]
+mod sys_link;
+#[cfg(target_arch = "x86_64")]
+mod sys_lstat;
+#[cfg(target_arch = "x86_64")]
+mod sys_mkdir;
+#[cfg(target_arch = "x86_64")]
+mod sys_open;
+#[cfg(target_arch = "x86_64")]
+mod sys_rename;
+#[cfg(target_arch = "x86_64")]
+mod sys_renameat;
+#[cfg(target_arch = "x86_64")]
+mod sys_rmdir;
+#[cfg(target_arch = "x86_64")]
+mod sys_stat;
 #[cfg(target_arch = "x86_64")]
 mod sys_symlink;
-mod sys_symlinkat;
+#[cfg(target_arch = "x86_64")]
+mod sys_unlink;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -441,492 +463,6 @@ bitflags! {
 }
 
 impl Syscall {
-    pub fn openat(
-        dirfd: i32,
-        path: *const u8,
-        o_flags: u32,
-        mode: u32,
-        follow_symlink: bool,
-    ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-        let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
-        return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
-    }
-
-    /// @brief 调整文件操作指针的位置
-    ///
-    /// @param fd 文件描述符编号
-    /// @param seek 调整的方式
-    ///
-    /// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
-    /// @return Err(SystemError) 调整失败，返回posix错误码
-    pub fn lseek(fd: i32, offset: i64, seek: u32) -> Result<usize, SystemError> {
-        let seek = match seek {
-            SEEK_SET => Ok(SeekFrom::SeekSet(offset)),
-            SEEK_CUR => Ok(SeekFrom::SeekCurrent(offset)),
-            SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
-            SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
-            _ => Err(SystemError::EINVAL),
-        }?;
-
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        return file.lseek(seek);
-    }
-
-    /// # sys_pread64 系统调用的实际执行函数
-    ///
-    /// ## 参数
-    /// - `fd`: 文件描述符
-    /// - `buf`: 读出缓冲区
-    /// - `len`: 要读取的字节数
-    /// - `offset`: 文件偏移量
-    pub fn pread(fd: i32, buf: &mut [u8], len: usize, offset: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard.get_file_by_fd(fd);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
-        }
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        let file = file.unwrap();
-
-        return file.pread(offset, len, buf);
-    }
-
-    /// # sys_pwrite64 系统调用的实际执行函数
-    ///
-    /// ## 参数
-    /// - `fd`: 文件描述符
-    /// - `buf`: 写入缓冲区
-    /// - `len`: 要写入的字节数
-    /// - `offset`: 文件偏移量
-    pub fn pwrite(fd: i32, buf: &[u8], len: usize, offset: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard.get_file_by_fd(fd);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
-        }
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-        let file = file.unwrap();
-
-        return file.pwrite(offset, len, buf);
-    }
-
-    /// @brief 切换工作目录
-    ///
-    /// @param dest_path 目标路径
-    ///
-    /// @return   返回码  描述  
-    ///      0       |          成功  
-    ///         
-    ///   EACCESS    |        权限不足        
-    ///
-    ///    ELOOP     | 解析path时遇到路径循环
-    ///
-    /// ENAMETOOLONG |       路径名过长       
-    ///
-    ///    ENOENT    |  目标文件或目录不存在  
-    ///
-    ///    ENODIR    |  检索期间发现非目录项  
-    ///
-    ///    ENOMEM    |      系统内存不足      
-    ///
-    ///    EFAULT    |       错误的地址      
-    ///  
-    /// ENAMETOOLONG |        路径过长        
-    pub fn chdir(path: *const u8) -> Result<usize, SystemError> {
-        if path.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        let proc = ProcessManager::current_pcb();
-        // Copy path to kernel space to avoid some security issues
-        let mut new_path = String::from("");
-        if !path.is_empty() {
-            let cwd = match path.as_bytes()[0] {
-                b'/' => String::from("/"),
-                _ => proc.basic().cwd(),
-            };
-            let mut cwd_vec: Vec<_> = cwd.split('/').filter(|&x| !x.is_empty()).collect();
-            let path_split = path.split('/').filter(|&x| !x.is_empty());
-            for seg in path_split {
-                if seg == ".." {
-                    cwd_vec.pop();
-                } else if seg == "." {
-                    // 当前目录
-                } else {
-                    cwd_vec.push(seg);
-                }
-            }
-            //proc.basic().set_path(String::from(""));
-            for seg in cwd_vec {
-                new_path.push('/');
-                new_path.push_str(seg);
-            }
-            if new_path.is_empty() {
-                new_path = String::from("/");
-            }
-        }
-        let inode =
-            match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-                Err(_) => {
-                    return Err(SystemError::ENOENT);
-                }
-                Ok(i) => i,
-            };
-        let metadata = inode.metadata()?;
-        if metadata.file_type == FileType::Dir {
-            proc.basic_mut().set_cwd(new_path);
-            proc.fs_struct_mut().set_pwd(inode);
-            return Ok(0);
-        } else {
-            return Err(SystemError::ENOTDIR);
-        }
-    }
-
-    pub fn fchdir(fd: i32) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let file = pcb
-            .fd_table()
-            .read()
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-        let inode = file.inode();
-        if inode.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        let path = inode.absolute_path()?;
-        pcb.basic_mut().set_cwd(path);
-        pcb.fs_struct_mut().set_pwd(inode);
-        return Ok(0);
-    }
-
-    /// @brief 获取当前进程的工作目录路径
-    ///
-    /// @param buf 指向缓冲区的指针
-    /// @param size 缓冲区的大小
-    ///
-    /// @return 成功，返回的指针指向包含工作目录路径的字符串
-    /// @return 错误，没有足够的空间
-    pub fn getcwd(buf: &mut [u8]) -> Result<usize, SystemError> {
-        let proc = ProcessManager::current_pcb();
-        let cwd = proc.basic().cwd();
-
-        let cwd_bytes = cwd.as_bytes();
-        let cwd_len = cwd_bytes.len();
-        if cwd_len + 1 > buf.len() {
-            return Err(SystemError::ENOMEM);
-        }
-        buf[..cwd_len].copy_from_slice(cwd_bytes);
-        buf[cwd_len] = 0;
-
-        return Ok(cwd_len + 1);
-    }
-
-    /// # 获取目录中的数据
-    ///
-    /// ## 参数
-    /// - fd 文件描述符号
-    /// - buf 输出缓冲区
-    ///
-    /// ## 返回值
-    /// - Ok(ctx.current_pos) 填充缓冲区当前指针位置
-    /// - Err(ctx.error.unwrap()) 填充缓冲区时返回的错误
-    pub fn getdents(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
-        if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
-            return Err(SystemError::EBADF);
-        }
-
-        // 获取fd
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-
-        let mut ctx = FilldirContext::new(buf);
-        match file.read_dir(&mut ctx) {
-            Ok(_) => {
-                if ctx.error.is_some() {
-                    if ctx.error == Some(SystemError::EINVAL) {
-                        return Ok(ctx.current_pos);
-                    } else {
-                        return Err(ctx.error.unwrap());
-                    }
-                }
-                return Ok(ctx.current_pos);
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
-    }
-
-    /// @brief 创建文件夹
-    ///
-    /// @param path(r8) 路径 / mode(r9) 模式
-    ///
-    /// @return uint64_t 负数错误码 / 0表示成功
-    pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        do_mkdir_at(
-            AtFlags::AT_FDCWD.bits(),
-            &path,
-            FileMode::from_bits_truncate(mode as u32),
-        )?;
-        return Ok(0);
-    }
-
-    pub fn mkdir_at(dirfd: i32, path: *const u8, mode: usize) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        do_mkdir_at(dirfd, &path, FileMode::from_bits_truncate(mode as u32))?;
-        return Ok(0);
-    }
-
-    /// **创建硬连接的系统调用**
-    ///    
-    /// ## 参数
-    ///
-    /// - 'oldfd': 用于解析源文件路径的文件描述符
-    /// - 'old': 源文件路径
-    /// - 'newfd': 用于解析新文件路径的文件描述符
-    /// - 'new': 新文件将创建的路径
-    /// - 'flags': 标志位，仅以位或方式包含AT_EMPTY_PATH和AT_SYMLINK_FOLLOW
-    ///
-    ///
-    pub fn do_linkat(
-        oldfd: i32,
-        old: &str,
-        newfd: i32,
-        new: &str,
-        flags: AtFlags,
-    ) -> Result<usize, SystemError> {
-        // flag包含其他未规定值时返回EINVAL
-        if !(AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_FOLLOW).contains(flags) {
-            return Err(SystemError::EINVAL);
-        }
-        // TODO AT_EMPTY_PATH标志启用时，进行调用者CAP_DAC_READ_SEARCH或相似的检查
-        let symlink_times = if flags.contains(AtFlags::AT_SYMLINK_FOLLOW) {
-            0_usize
-        } else {
-            VFS_MAX_FOLLOW_SYMLINK_TIMES
-        };
-        let pcb = ProcessManager::current_pcb();
-
-        // 得到源路径的inode
-        let old_inode: Arc<dyn IndexNode> = if old.is_empty() {
-            if flags.contains(AtFlags::AT_EMPTY_PATH) {
-                // 在AT_EMPTY_PATH启用时，old可以为空，old_inode实际为oldfd所指文件，但该文件不能为目录。
-                let binding = pcb.fd_table();
-                let fd_table_guard = binding.read();
-                let file = fd_table_guard
-                    .get_file_by_fd(oldfd)
-                    .ok_or(SystemError::EBADF)?;
-                let old_inode = file.inode();
-                old_inode
-            } else {
-                return Err(SystemError::ENONET);
-            }
-        } else {
-            let (old_begin_inode, old_remain_path) = user_path_at(&pcb, oldfd, old)?;
-            old_begin_inode.lookup_follow_symlink(&old_remain_path, symlink_times)?
-        };
-
-        // old_inode为目录时返回EPERM
-        if old_inode.metadata().unwrap().file_type == FileType::Dir {
-            return Err(SystemError::EPERM);
-        }
-
-        // 得到新创建节点的父节点
-        let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
-        let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent =
-            new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or("/"), symlink_times)?;
-
-        // 被调用者利用downcast_ref判断两inode是否为同一文件系统
-        return new_parent.link(new_name, &old_inode).map(|_| 0);
-    }
-
-    pub fn link(old: *const u8, new: *const u8) -> Result<usize, SystemError> {
-        let get_path = |cstr: *const u8| -> Result<String, SystemError> {
-            let res = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?
-                .into_string()
-                .map_err(|_| SystemError::EINVAL)?;
-
-            if res.len() >= MAX_PATHLEN {
-                return Err(SystemError::ENAMETOOLONG);
-            }
-            if res.is_empty() {
-                return Err(SystemError::ENOENT);
-            }
-            Ok(res)
-        };
-        let old = get_path(old)?;
-        let new = get_path(new)?;
-        return Self::do_linkat(
-            AtFlags::AT_FDCWD.bits(),
-            &old,
-            AtFlags::AT_FDCWD.bits(),
-            &new,
-            AtFlags::empty(),
-        );
-    }
-
-    pub fn linkat(
-        oldfd: i32,
-        old: *const u8,
-        newfd: i32,
-        new: *const u8,
-        flags: i32,
-    ) -> Result<usize, SystemError> {
-        let old = check_and_clone_cstr(old, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let new = check_and_clone_cstr(new, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        if old.len() >= MAX_PATHLEN || new.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-        // old 根据flags & AtFlags::AT_EMPTY_PATH判空
-        if new.is_empty() {
-            return Err(SystemError::ENOENT);
-        }
-        let flags = AtFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
-        Self::do_linkat(oldfd, &old, newfd, &new, flags)
-    }
-
-    /// **删除文件夹、取消文件的链接、删除文件的系统调用**
-    ///
-    /// ## 参数
-    ///
-    /// - `dirfd`：文件夹的文件描述符.目前暂未实现
-    /// - `pathname`：文件夹的路径
-    /// - `flags`：标志位
-    ///
-    ///
-    pub fn unlinkat(dirfd: i32, path: *const u8, flags: u32) -> Result<usize, SystemError> {
-        let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
-
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        if flags.contains(AtFlags::AT_REMOVEDIR) {
-            // debug!("rmdir");
-            match do_remove_dir(dirfd, &path) {
-                Err(err) => {
-                    return Err(err);
-                }
-                Ok(_) => {
-                    return Ok(0);
-                }
-            }
-        }
-
-        match do_unlink_at(dirfd, &path) {
-            Err(err) => {
-                return Err(err);
-            }
-            Ok(_) => {
-                return Ok(0);
-            }
-        }
-    }
-
-    pub fn rmdir(path: *const u8) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        return do_remove_dir(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
-    }
-
-    pub fn unlink(path: *const u8) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
-    }
-
-    /// # 修改文件名
-    ///
-    ///
-    /// ## 参数
-    ///
-    /// - oldfd: 源文件夹文件描述符
-    /// - filename_from: 源文件路径
-    /// - newfd: 目标文件夹文件描述符
-    /// - filename_to: 目标文件路径
-    /// - flags: 标志位
-    ///
-    ///
-    /// ## 返回值
-    /// - Ok(返回值类型): 返回值的说明
-    /// - Err(错误值类型): 错误的说明
-    ///
-    pub fn do_renameat2(
-        oldfd: i32,
-        filename_from: *const u8,
-        newfd: i32,
-        filename_to: *const u8,
-        _flags: u32,
-    ) -> Result<usize, SystemError> {
-        let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN))
-            .unwrap()
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let filename_to = check_and_clone_cstr(filename_to, Some(MAX_PATHLEN))
-            .unwrap()
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        // 文件名过长
-        if filename_from.len() > MAX_PATHLEN || filename_to.len() > MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-
-        //获取pcb，文件节点
-        let pcb = ProcessManager::current_pcb();
-        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
-        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
-        //获取父目录
-        let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
-        let old_parent_inode = ROOT_INODE()
-            .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-        let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent_inode = ROOT_INODE()
-            .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-        old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
-        return Ok(0);
-    }
-
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
     pub fn dup(oldfd: i32) -> Result<usize, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
@@ -943,7 +479,6 @@ impl Syscall {
         let res = fd_table_guard.alloc_fd(new_file, None).map(|x| x as usize);
         return res;
     }
-
     /// 根据提供的文件描述符的fd，和指定新fd，复制对应的文件结构体，
     /// 并返回新复制的文件结构体对应的fd.
     /// 如果新fd已经打开，则会先关闭新fd.

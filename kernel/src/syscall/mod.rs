@@ -541,14 +541,6 @@ impl Syscall {
                 let gid = args[2];
                 Self::lchown(pathname, uid, gid)
             }
-            SYS_FCHOWNAT => {
-                let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
-                let uid = args[2];
-                let gid = args[3];
-                let flag = args[4] as i32;
-                Self::fchownat(dirfd, pathname, uid, gid, flag)
-            }
 
             SYS_FSYNC => {
                 warn!("SYS_FSYNC has not yet been implemented");

@@ -52,6 +52,7 @@ mod sys_write;
 mod sys_writev;
 mod sys_utimensat;
 mod sys_fchown;
+mod sys_fchownat;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -926,20 +927,5 @@ impl Syscall {
             gid,
             AtFlags::AT_SYMLINK_NOFOLLOW,
         );
-    }
-
-    pub fn fchownat(
-        dirfd: i32,
-        pathname: *const u8,
-        uid: usize,
-        gid: usize,
-        flags: i32,
-    ) -> Result<usize, SystemError> {
-        let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let pathname = pathname.as_str().trim();
-        let flags = AtFlags::from_bits_truncate(flags);
-        return do_fchownat(dirfd, pathname, uid, gid, flags);
     }
 }

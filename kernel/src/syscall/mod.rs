@@ -537,13 +537,6 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_CHMOD => {
-                let pathname = args[0] as *const u8;
-                let mode = args[1] as u32;
-                Self::chmod(pathname, mode)
-            }
-
             SYS_SCHED_YIELD => Self::do_sched_yield(),
 
             SYS_SCHED_GETAFFINITY => {

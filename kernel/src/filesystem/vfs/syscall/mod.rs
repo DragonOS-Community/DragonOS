@@ -21,7 +21,7 @@ use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat},
+    open::do_faccessat,
     utils::{rsplit_path, user_path_at},
     FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -100,6 +100,8 @@ mod sys_futimesat;
 mod sys_lchown;
 #[cfg(target_arch = "x86_64")]
 mod sys_chown;
+#[cfg(target_arch = "x86_64")]
+mod sys_chmod;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -875,14 +877,6 @@ impl Syscall {
             pathname,
             ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
             flags,
-        );
-    }
-
-    pub fn chmod(pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
-        return do_fchmodat(
-            AtFlags::AT_FDCWD.bits(),
-            pathname,
-            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
         );
     }
 }

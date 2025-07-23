@@ -527,14 +527,6 @@ impl Syscall {
                 Self::umask(mask)
             }
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_CHOWN => {
-                let pathname = args[0] as *const u8;
-                let uid = args[1];
-                let gid = args[2];
-                Self::chown(pathname, uid, gid)
-            }
-
             SYS_FSYNC => {
                 warn!("SYS_FSYNC has not yet been implemented");
                 Ok(0)

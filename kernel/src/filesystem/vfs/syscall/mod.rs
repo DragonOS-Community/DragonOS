@@ -11,7 +11,7 @@ use crate::{
     libs::rwlock::RwLockWriteGuard,
     process::ProcessManager,
     syscall::{
-        user_access::{self, check_and_clone_cstr, UserBufferWriter},
+        user_access::{check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
     time:: PosixTimeSpec,
@@ -21,7 +21,7 @@ use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_fchownat},
+    open::{do_faccessat, do_fchmodat},
     utils::{rsplit_path, user_path_at},
     FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -96,6 +96,8 @@ mod sys_utimes;
 mod sys_futimesat;
 #[cfg(target_arch = "x86_64")]
 mod sys_lchown;
+#[cfg(target_arch = "x86_64")]
+mod sys_chown;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -902,18 +904,5 @@ impl Syscall {
         // todo: 实现fchmod
         warn!("fchmod not fully implemented");
         return Ok(0);
-    }
-
-    pub fn chown(pathname: *const u8, uid: usize, gid: usize) -> Result<usize, SystemError> {
-        let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        return do_fchownat(
-            AtFlags::AT_FDCWD.bits(),
-            &pathname,
-            uid,
-            gid,
-            AtFlags::AT_STATX_SYNC_AS_STAT,
-        );
     }
 }

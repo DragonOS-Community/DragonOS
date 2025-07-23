@@ -29,6 +29,7 @@ mod link_utils;
 mod open_utils;
 mod rename_utils;
 mod utimensat;
+mod faccessat2;
 mod sys_chdir;
 mod sys_close;
 mod sys_fchdir;
@@ -55,6 +56,8 @@ mod sys_fchown;
 mod sys_fchownat;
 mod sys_fchmod;
 mod sys_fchmodat;
+mod sys_faccessat;
+mod sys_faccessat2;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -863,20 +866,6 @@ impl Syscall {
             pathname,
             ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
             0,
-        );
-    }
-
-    pub fn faccessat2(
-        dirfd: i32,
-        pathname: *const u8,
-        mode: u32,
-        flags: u32,
-    ) -> Result<usize, SystemError> {
-        return do_faccessat(
-            dirfd,
-            pathname,
-            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
-            flags,
         );
     }
 }

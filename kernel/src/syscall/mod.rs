@@ -496,21 +496,6 @@ impl Syscall {
                 Self::access(pathname, mode)
             }
 
-            SYS_FACCESSAT => {
-                let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
-                let mode = args[2] as u32;
-                Self::faccessat2(dirfd, pathname, mode, 0)
-            }
-
-            SYS_FACCESSAT2 => {
-                let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
-                let mode = args[2] as u32;
-                let flags = args[3] as u32;
-                Self::faccessat2(dirfd, pathname, mode, flags)
-            }
-
             SYS_CLOCK_GETTIME => {
                 let clockid = args[0] as i32;
                 let timespec = args[1] as *mut PosixTimeSpec;

@@ -543,12 +543,6 @@ impl Syscall {
                 let mode = args[1] as u32;
                 Self::chmod(pathname, mode)
             }
-            SYS_FCHMODAT => {
-                let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
-                let mode = args[2] as u32;
-                Self::fchmodat(dirfd, pathname, mode)
-            }
 
             SYS_SCHED_YIELD => Self::do_sched_yield(),
 

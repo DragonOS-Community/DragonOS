@@ -54,6 +54,7 @@ mod sys_utimensat;
 mod sys_fchown;
 mod sys_fchownat;
 mod sys_fchmod;
+mod sys_fchmodat;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -880,14 +881,6 @@ impl Syscall {
     pub fn chmod(pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
         return do_fchmodat(
             AtFlags::AT_FDCWD.bits(),
-            pathname,
-            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
-        );
-    }
-
-    pub fn fchmodat(dirfd: i32, pathname: *const u8, mode: u32) -> Result<usize, SystemError> {
-        return do_fchmodat(
-            dirfd,
             pathname,
             ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
         );

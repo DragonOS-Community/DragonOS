@@ -53,6 +53,7 @@ mod sys_writev;
 mod sys_utimensat;
 mod sys_fchown;
 mod sys_fchownat;
+mod sys_fchmod;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -890,19 +891,5 @@ impl Syscall {
             pathname,
             ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
         );
-    }
-
-    pub fn fchmod(fd: i32, mode: u32) -> Result<usize, SystemError> {
-        let _mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let _file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-
-        // fchmod没完全实现，因此不修改文件的权限
-        // todo: 实现fchmod
-        warn!("fchmod not fully implemented");
-        return Ok(0);
     }
 }

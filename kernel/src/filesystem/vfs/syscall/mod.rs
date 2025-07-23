@@ -94,7 +94,8 @@ mod sys_unlink;
 mod sys_utimes;
 #[cfg(target_arch = "x86_64")]
 mod sys_futimesat;
-
+#[cfg(target_arch = "x86_64")]
+mod sys_lchown;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -913,19 +914,6 @@ impl Syscall {
             uid,
             gid,
             AtFlags::AT_STATX_SYNC_AS_STAT,
-        );
-    }
-
-    pub fn lchown(pathname: *const u8, uid: usize, gid: usize) -> Result<usize, SystemError> {
-        let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        return do_fchownat(
-            AtFlags::AT_FDCWD.bits(),
-            &pathname,
-            uid,
-            gid,
-            AtFlags::AT_SYMLINK_NOFOLLOW,
         );
     }
 }

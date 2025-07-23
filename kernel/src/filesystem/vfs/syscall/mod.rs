@@ -15,14 +15,14 @@ use crate::{
         user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
-    time::{syscall::PosixTimeval, PosixTimeSpec},
+    time:: PosixTimeSpec,
 };
 
 use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_fchownat, do_utimensat, do_utimes, ksys_fchown},
+    open::{do_faccessat, do_fchmodat, do_fchownat, do_utimensat,ksys_fchown},
     utils::{rsplit_path, user_path_at},
     FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -87,6 +87,9 @@ mod sys_stat;
 mod sys_symlink;
 #[cfg(target_arch = "x86_64")]
 mod sys_unlink;
+#[cfg(target_arch = "x86_64")]
+mod sys_utimes;
+
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -963,22 +966,5 @@ impl Syscall {
             Some([times[0], times[1]])
         };
         do_utimensat(dirfd, pathname, times, flags)
-    }
-
-    pub fn sys_utimes(
-        pathname: *const u8,
-        times: *const PosixTimeval,
-    ) -> Result<usize, SystemError> {
-        let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let times = if times.is_null() {
-            None
-        } else {
-            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeval>() * 2, true)?;
-            let times = times_reader.read_from_user::<PosixTimeval>(0)?;
-            Some([times[0], times[1]])
-        };
-        do_utimes(&pathname, times)
     }
 }

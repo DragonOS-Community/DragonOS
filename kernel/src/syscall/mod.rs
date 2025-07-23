@@ -23,7 +23,7 @@ use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
         fcntl::FcntlCommand,
-        syscall::{ModeType, UtimensFlags},
+        syscall::ModeType,
     },
     mm::{verify_area, VirtAddr},
     net::syscall::SockAddr,
@@ -620,22 +620,6 @@ impl Syscall {
                 Self::alarm(second)
             }
 
-            SYS_UTIMENSAT => Self::sys_utimensat(
-                args[0] as i32,
-                args[1] as *const u8,
-                args[2] as *const PosixTimeSpec,
-                args[3] as u32,
-            ),
-            #[cfg(target_arch = "x86_64")]
-            SYS_FUTIMESAT => {
-                let flags = UtimensFlags::empty();
-                Self::sys_utimensat(
-                    args[0] as i32,
-                    args[1] as *const u8,
-                    args[2] as *const PosixTimeSpec,
-                    flags.bits(),
-                )
-            }
             #[cfg(target_arch = "x86_64")]
             SYS_EVENTFD => {
                 let initval = args[0] as u32;

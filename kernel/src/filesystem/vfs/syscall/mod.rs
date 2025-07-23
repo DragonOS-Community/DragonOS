@@ -5,7 +5,6 @@ use alloc::sync::Arc;
 use log::warn;
 use system_error::SystemError;
 
-use crate::syscall::user_access::UserBufferReader;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::file::FileDescriptorVec,
@@ -22,13 +21,14 @@ use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_fchownat, do_utimensat,ksys_fchown},
+    open::{do_faccessat, do_fchmodat, do_fchownat,ksys_fchown},
     utils::{rsplit_path, user_path_at},
     FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 mod link_utils;
 mod open_utils;
 mod rename_utils;
+mod utimensat;
 mod sys_chdir;
 mod sys_close;
 mod sys_fchdir;
@@ -50,6 +50,7 @@ mod sys_symlinkat;
 mod sys_unlinkat;
 mod sys_write;
 mod sys_writev;
+mod sys_utimensat;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -89,6 +90,8 @@ mod sys_symlink;
 mod sys_unlink;
 #[cfg(target_arch = "x86_64")]
 mod sys_utimes;
+#[cfg(target_arch = "x86_64")]
+mod sys_futimesat;
 
 
 pub const SEEK_SET: u32 = 0;
@@ -941,30 +944,5 @@ impl Syscall {
 
     pub fn fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError> {
         return ksys_fchown(fd, uid, gid);
-    }
-
-    pub fn sys_utimensat(
-        dirfd: i32,
-        pathname: *const u8,
-        times: *const PosixTimeSpec,
-        flags: u32,
-    ) -> Result<usize, SystemError> {
-        let pathname = if pathname.is_null() {
-            None
-        } else {
-            let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
-                .into_string()
-                .map_err(|_| SystemError::EINVAL)?;
-            Some(pathname)
-        };
-        let flags = UtimensFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
-        let times = if times.is_null() {
-            None
-        } else {
-            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeSpec>() * 2, true)?;
-            let times = times_reader.read_from_user::<PosixTimeSpec>(0)?;
-            Some([times[0], times[1]])
-        };
-        do_utimensat(dirfd, pathname, times, flags)
     }
 }

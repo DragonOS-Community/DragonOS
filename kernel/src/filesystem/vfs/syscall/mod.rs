@@ -21,7 +21,7 @@ use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_fchownat,ksys_fchown},
+    open::{do_faccessat, do_fchmodat, do_fchownat},
     utils::{rsplit_path, user_path_at},
     FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -51,6 +51,7 @@ mod sys_unlinkat;
 mod sys_write;
 mod sys_writev;
 mod sys_utimensat;
+mod sys_fchown;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -940,9 +941,5 @@ impl Syscall {
         let pathname = pathname.as_str().trim();
         let flags = AtFlags::from_bits_truncate(flags);
         return do_fchownat(dirfd, pathname, uid, gid, flags);
-    }
-
-    pub fn fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError> {
-        return ksys_fchown(fd, uid, gid);
     }
 }

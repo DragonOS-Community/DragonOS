@@ -15,8 +15,7 @@ use super::stat::vfs_fstat;
 use super::{
     fcntl::AtFlags,
     file::FileMode,
-    utils::user_path_at,
-    SuperBlock, MAX_PATHLEN, ROOT_INODE,
+    SuperBlock,
 };
 mod link_utils;
 mod open_utils;
@@ -59,6 +58,7 @@ mod sys_dup3;
 mod sys_fcntl;
 mod sys_ftruncate;
 mod sys_statx;
+mod sys_statfs;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -492,26 +492,6 @@ bitflags! {
 }
 
 impl Syscall {
-    pub fn statfs(path: *const u8, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
-        let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
-        let fd = open_utils::do_open(
-            path,
-            FileMode::O_RDONLY.bits(),
-            ModeType::empty().bits(),
-            true,
-        )?;
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))
-            .unwrap()
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let pcb = ProcessManager::current_pcb();
-        let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
-        let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
-        let statfs = PosixStatfs::from(inode.fs().super_block());
-        writer.copy_one_to_user(&statfs, 0)?;
-        return Ok(0);
-    }
-
     pub fn fstatfs(fd: i32, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
         let binding = ProcessManager::current_pcb().fd_table();

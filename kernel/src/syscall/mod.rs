@@ -20,9 +20,6 @@ use table::{syscall_table, syscall_table_init};
 
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{
-        syscall::ModeType,
-    },
     mm::{verify_area, VirtAddr},
     net::syscall::SockAddr,
     time::{
@@ -305,19 +302,6 @@ impl Syscall {
                 let timeval = args[0] as *mut PosixTimeval;
                 let timezone_ptr = args[1] as *mut PosixTimeZone;
                 Self::gettimeofday(timeval, timezone_ptr)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_MKNOD => {
-                let path = args[0];
-                let flags = args[1];
-                let dev_t = args[2];
-                let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-                Self::mknod(
-                    path as *const u8,
-                    flags,
-                    crate::driver::base::device::device_number::DeviceNumber::from(dev_t as u32),
-                )
             }
 
             SYS_FUTEX => {

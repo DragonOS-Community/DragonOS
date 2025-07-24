@@ -1,11 +1,8 @@
 use core::mem::size_of;
 
-use alloc::sync::Arc;
-
 use system_error::SystemError;
 
 use crate::{
-    driver::base::device::device_number::DeviceNumber,
     process::ProcessManager,
     syscall::{
         user_access::{check_and_clone_cstr, UserBufferWriter},
@@ -18,8 +15,8 @@ use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
     fcntl::AtFlags,
     file::FileMode,
-    utils::{rsplit_path, user_path_at},
-    IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    utils::user_path_at,
+    SuperBlock, MAX_PATHLEN, ROOT_INODE,
 };
 mod link_utils;
 mod open_utils;
@@ -114,6 +111,8 @@ mod sys_access;
 mod sys_readlink;
 #[cfg(target_arch = "x86_64")]
 mod sys_dup2;
+#[cfg(target_arch = "x86_64")]
+mod sys_mknod;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -566,33 +565,5 @@ impl Syscall {
         let stat = vfs_fstat(fd)?;
         // log::debug!("newfstat fd: {}, stat.size: {:?}",fd,stat.size);
         super::stat::cp_new_stat(stat, user_stat_buf_ptr).map(|_| 0)
-    }
-
-    pub fn mknod(
-        path: *const u8,
-        mode: ModeType,
-        dev_t: DeviceNumber,
-    ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let path = path.as_str().trim();
-
-        let inode: Result<Arc<dyn IndexNode>, SystemError> =
-            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
-
-        if inode.is_ok() {
-            return Err(SystemError::EEXIST);
-        }
-
-        let (filename, parent_path) = rsplit_path(path);
-
-        // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
-            .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-        // 创建nod
-        parent_inode.mknod(filename, mode, dev_t)?;
-
-        return Ok(0);
     }
 }

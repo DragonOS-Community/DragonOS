@@ -5,7 +5,6 @@ use core::{
 
 use crate::{
     arch::syscall::nr::*,
-    filesystem::vfs::syscall::PosixStatfs,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::page::PAGE_4K_SIZE,
     net::syscall::MsgHdr,
@@ -344,12 +343,6 @@ impl Syscall {
 
                 let ret = Self::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
                 return ret;
-            }
-
-            SYS_FSTATFS => {
-                let fd = args[0] as i32;
-                let statfs = args[1] as *mut PosixStatfs;
-                Self::fstatfs(fd, statfs)
             }
 
             // 目前为了适配musl-libc,以下系统调用先这样写着

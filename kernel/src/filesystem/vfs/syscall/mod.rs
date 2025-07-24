@@ -1,11 +1,8 @@
-use core::mem::size_of;
-
 use system_error::SystemError;
 
 use crate::{
-    process::ProcessManager,
     syscall::{
-        user_access::{check_and_clone_cstr, UserBufferWriter},
+        user_access::check_and_clone_cstr,
         Syscall,
     },
     time:: PosixTimeSpec,
@@ -59,6 +56,7 @@ mod sys_fcntl;
 mod sys_ftruncate;
 mod sys_statx;
 mod sys_statfs;
+mod sys_fstatfs;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -492,19 +490,6 @@ bitflags! {
 }
 
 impl Syscall {
-    pub fn fstatfs(fd: i32, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
-        let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-        drop(fd_table_guard);
-        let statfs = PosixStatfs::from(file.inode().fs().super_block());
-        writer.copy_one_to_user(&statfs, 0)?;
-        return Ok(0);
-    }
-
     #[inline(never)]
     pub fn newfstat(fd: i32, user_stat_buf_ptr: usize) -> Result<usize, SystemError> {
         if user_stat_buf_ptr == 0 {

@@ -3,6 +3,7 @@
 use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_FSTAT;
+use crate::filesystem::vfs::syscall::newfstat::do_newfstat;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 
@@ -20,7 +21,7 @@ impl Syscall for SysFstatHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
         let usr_kstat = Self::usr_kstat(args);
-        crate::syscall::Syscall::newfstat(fd, usr_kstat)
+        do_newfstat(fd, usr_kstat)
     }
 
     /// Formats the syscall arguments for display/debugging purposes.

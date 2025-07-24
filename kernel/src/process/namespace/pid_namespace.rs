@@ -1,6 +1,6 @@
 use alloc::sync::Weak;
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 use ida::IdAllocator;
 use system_error::SystemError;
@@ -16,12 +16,16 @@ use crate::process::RawPid;
 use super::nsproxy::NsCommon;
 use super::user_namespace::UserNamespace;
 
+lazy_static! {
+    pub static ref INIT_PID_NAMESPACE: Arc<PidNamespace> = PidNamespace::new_root();
+}
 pub struct PidNamespace {
     self_ref: Weak<PidNamespace>,
     /// PID namespace的层级（root = 0）
     pub level: u32,
     /// 父namespace的弱引用
     parent: Option<Weak<PidNamespace>>,
+    user_ns: Arc<UserNamespace>,
 
     inner: SpinLock<InnerPidNamespace>,
 }
@@ -33,20 +37,26 @@ pub struct InnerPidNamespace {
     pid_map: HashMap<RawPid, Arc<Pid>>,
     /// init进程引用
     child_reaper: Option<Weak<ProcessControlBlock>>,
+    children: Vec<Arc<PidNamespace>>,
 }
 
 impl PidNamespace {
+    /// 最大PID namespace层级
+    pub const MAX_PID_NS_LEVEL: u32 = 32;
+
     /// 创建root PID namespace
-    pub fn new_root() -> Arc<Self> {
+    fn new_root() -> Arc<Self> {
         Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
             level: 0,
             parent: None,
+            user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
             inner: SpinLock::new(InnerPidNamespace {
                 ns_common: NsCommon::default(),
                 child_reaper: None,
                 ida: IdAllocator::new(1, usize::MAX).unwrap(),
                 pid_map: HashMap::new(),
+                children: Vec::new(),
             }),
         })
     }
@@ -93,7 +103,35 @@ impl PidNamespace {
 
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid_namespace.c#72
     fn create_pid_namespace(&self, user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, SystemError> {
-        todo!("Implement PID namespace creation logic with user namespace support");
+        let level = self.level + 1;
+        if !self.user_ns.is_ancestor_of(&user_ns) {
+            return Err(SystemError::EINVAL);
+        }
+
+        if level > Self::MAX_PID_NS_LEVEL {
+            return Err(SystemError::ENOSPC);
+        }
+
+        // todo: 补充ucount相关
+
+        let pidns = Arc::new_cyclic(|self_ref| Self {
+            self_ref: self_ref.clone(),
+            level: level,
+            parent: Some(self.self_ref.clone()),
+            user_ns: user_ns,
+            inner: SpinLock::new(InnerPidNamespace {
+                ns_common: NsCommon::default(),
+                child_reaper: None,
+                ida: IdAllocator::new(1, usize::MAX).unwrap(),
+                pid_map: HashMap::new(),
+                children: Vec::new(),
+            }),
+        });
+
+        // todo: procfs相关,申请inode号,赋值operations等
+
+        self.inner().children.push(pidns.clone());
+        return Ok(pidns);
     }
 
     pub fn inner(&self) -> SpinLockGuard<InnerPidNamespace> {
@@ -110,6 +148,14 @@ impl PidNamespace {
 
     pub fn parent(&self) -> Option<Arc<PidNamespace>> {
         self.parent.as_ref().and_then(|p| p.upgrade())
+    }
+
+    /// 从父namespace中删除当前PID namespace
+    pub fn delete_current_pidns_in_parent(&self) {
+        let current = self.self_ref.upgrade().unwrap();
+        if let Some(p) = self.parent() {
+            p.inner().children.retain(|c| !Arc::ptr_eq(&c, &current));
+        }
     }
 }
 

@@ -36,7 +36,7 @@ impl Debug for NsProxy {
 impl NsProxy {
     /// 创建root namespace代理
     pub fn new_root() -> Arc<Self> {
-        let root_pid_ns = PidNamespace::new_root();
+        let root_pid_ns = super::pid_namespace::INIT_PID_NAMESPACE.clone();
         Arc::new(Self {
             pid_ns_for_children: root_pid_ns,
         })

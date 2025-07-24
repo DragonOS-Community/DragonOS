@@ -5,18 +5,22 @@ use alloc::sync::{Arc, Weak};
 use crate::libs::spinlock::SpinLock;
 
 use super::nsproxy::NsCommon;
+use alloc::vec::Vec;
 
 lazy_static! {
     pub static ref INIT_USER_NAMESPACE: Arc<UserNamespace> = UserNamespace::new_root();
 }
 
 pub struct UserNamespace {
+    level: u32,
+    parent: Option<Weak<UserNamespace>>,
     self_ref: Weak<UserNamespace>,
     inner: SpinLock<InnerUserNamespace>,
 }
 
 pub struct InnerUserNamespace {
     nscommon: NsCommon,
+    children: Vec<Arc<UserNamespace>>,
 }
 
 impl UserNamespace {
@@ -24,10 +28,44 @@ impl UserNamespace {
     pub fn new_root() -> Arc<Self> {
         Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
+            parent: None,
+            level: 0,
             inner: SpinLock::new(InnerUserNamespace {
                 nscommon: NsCommon::default(),
+                children: Vec::new(),
             }),
         })
+    }
+
+    /// 检查当前用户命名空间是否是另一个用户命名空间的祖先
+    ///
+    /// # 参数
+    /// * `other` - 要检查的目标用户命名空间
+    ///
+    /// # 返回值
+    /// * `true` - 如果当前命名空间是 `other` 的祖先
+    /// * `false` - 如果当前命名空间不是 `other` 的祖先
+    ///
+    /// # 说明
+    /// 该方法通过遍历 `other` 的父命名空间链来判断当前命名空间是否为其祖先。
+    /// 如果两个命名空间处于同一层级且指向同一个对象，则认为是祖先关系。
+    /// 如果当前命名空间的层级大于目标命名空间，则不可能是祖先关系。
+    pub fn is_ancestor_of(&self, other: &Arc<Self>) -> bool {
+        let mut current = other.clone();
+        loop {
+            if current.level > self.level {
+                if let Some(parent) = current.parent.as_ref().and_then(|p| p.upgrade()) {
+                    current = parent;
+                    continue;
+                } else {
+                    return false;
+                }
+            } else if current.level == self.level {
+                return Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &current);
+            } else {
+                return false;
+            }
+        }
     }
 }
 

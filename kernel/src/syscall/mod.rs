@@ -460,9 +460,6 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-            SYS_NEWFSTATAT => Self::newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
-
             // SYS_SCHED_YIELD => Self::sched_yield(),
             SYS_PRCTL => {
                 // todo: 这个系统调用还没有实现

@@ -11,7 +11,7 @@ use crate::{
     time:: PosixTimeSpec,
 };
 
-use super::stat::{do_newfstatat, do_statx, vfs_fstat};
+use super::stat::{do_statx, vfs_fstat};
 use super::{
     fcntl::AtFlags,
     file::FileMode,
@@ -113,6 +113,8 @@ mod sys_readlink;
 mod sys_dup2;
 #[cfg(target_arch = "x86_64")]
 mod sys_mknod;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+mod sys_newfstatat;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -538,23 +540,6 @@ impl Syscall {
         let filename_str = filename.to_str().map_err(|_| SystemError::EINVAL)?;
 
         do_statx(dfd, filename_str, flags, mask, user_kstat_ptr).map(|_| 0)
-    }
-
-    #[inline(never)]
-    pub fn newfstatat(
-        dfd: i32,
-        filename_ptr: usize,
-        user_stat_buf_ptr: usize,
-        flags: u32,
-    ) -> Result<usize, SystemError> {
-        if user_stat_buf_ptr == 0 {
-            return Err(SystemError::EFAULT);
-        }
-
-        let filename = check_and_clone_cstr(filename_ptr as *const u8, Some(MAX_PATHLEN))?;
-        let filename_str = filename.to_str().map_err(|_| SystemError::EINVAL)?;
-
-        do_newfstatat(dfd, filename_str, user_stat_buf_ptr, flags).map(|_| 0)
     }
 
     #[inline(never)]

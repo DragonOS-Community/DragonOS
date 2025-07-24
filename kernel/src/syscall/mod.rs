@@ -15,14 +15,12 @@ use crate::{
 };
 
 use log::{info, warn};
-use num_traits::FromPrimitive;
 use system_error::SystemError;
 use table::{syscall_table, syscall_table_init};
 
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
-        fcntl::FcntlCommand,
         syscall::ModeType,
     },
     mm::{verify_area, VirtAddr},
@@ -150,24 +148,6 @@ impl Syscall {
                 warn!("syscall sched");
                 schedule(SchedMode::SM_NONE);
                 Ok(0)
-            }
-            SYS_DUP => {
-                let oldfd: i32 = args[0] as c_int;
-                Self::dup(oldfd)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_DUP2 => {
-                let oldfd: i32 = args[0] as c_int;
-                let newfd: i32 = args[1] as c_int;
-                Self::dup2(oldfd, newfd)
-            }
-
-            SYS_DUP3 => {
-                let oldfd: i32 = args[0] as c_int;
-                let newfd: i32 = args[1] as c_int;
-                let flags: u32 = args[2] as u32;
-                Self::dup3(oldfd, newfd, flags)
             }
 
             SYS_SOCKET => Self::socket(args[0], args[1], args[2]),
@@ -325,21 +305,6 @@ impl Syscall {
                 let timeval = args[0] as *mut PosixTimeval;
                 let timezone_ptr = args[1] as *mut PosixTimeZone;
                 Self::gettimeofday(timeval, timezone_ptr)
-            }
-
-            SYS_FCNTL => {
-                let fd = args[0] as i32;
-                let cmd: Option<FcntlCommand> =
-                    <FcntlCommand as FromPrimitive>::from_u32(args[1] as u32);
-                let arg = args[2] as i32;
-                let res = if let Some(cmd) = cmd {
-                    Self::fcntl(fd, cmd, arg)
-                } else {
-                    Err(SystemError::EINVAL)
-                };
-
-                // debug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
-                res
             }
 
             SYS_FTRUNCATE => {

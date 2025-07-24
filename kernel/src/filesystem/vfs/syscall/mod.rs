@@ -2,13 +2,10 @@ use core::mem::size_of;
 
 use alloc::sync::Arc;
 
-use log::warn;
 use system_error::SystemError;
 
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::file::FileDescriptorVec,
-    libs::rwlock::RwLockWriteGuard,
     process::ProcessManager,
     syscall::{
         user_access::{check_and_clone_cstr, UserBufferWriter},
@@ -19,7 +16,7 @@ use crate::{
 
 use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
-    fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
+    fcntl::AtFlags,
     file::FileMode,
     utils::{rsplit_path, user_path_at},
     IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -30,6 +27,7 @@ mod rename_utils;
 mod utimensat;
 mod faccessat2;
 mod readlink_at;
+mod dup2;
 mod sys_chdir;
 mod sys_close;
 mod sys_fchdir;
@@ -59,6 +57,9 @@ mod sys_fchmodat;
 mod sys_faccessat;
 mod sys_faccessat2;
 mod sys_readlinkat;
+mod sys_dup;
+mod sys_dup3;
+mod sys_fcntl;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -110,6 +111,8 @@ mod sys_chmod;
 mod sys_access;
 #[cfg(target_arch = "x86_64")]
 mod sys_readlink;
+#[cfg(target_arch = "x86_64")]
+mod sys_dup2;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -486,213 +489,6 @@ bitflags! {
 }
 
 impl Syscall {
-    /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
-    pub fn dup(oldfd: i32) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-
-        let old_file = fd_table_guard
-            .get_file_by_fd(oldfd)
-            .ok_or(SystemError::EBADF)?;
-
-        let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
-        // dup默认非cloexec
-        new_file.set_close_on_exec(false);
-        // 申请文件描述符，并把文件对象存入其中
-        let res = fd_table_guard.alloc_fd(new_file, None).map(|x| x as usize);
-        return res;
-    }
-    /// 根据提供的文件描述符的fd，和指定新fd，复制对应的文件结构体，
-    /// 并返回新复制的文件结构体对应的fd.
-    /// 如果新fd已经打开，则会先关闭新fd.
-    ///
-    /// ## 参数
-    ///
-    /// - `oldfd`：旧文件描述符
-    /// - `newfd`：新文件描述符
-    ///
-    /// ## 返回值
-    ///
-    /// - 成功：新文件描述符
-    /// - 失败：错误码
-    pub fn dup2(oldfd: i32, newfd: i32) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        return Self::do_dup2(oldfd, newfd, &mut fd_table_guard);
-    }
-
-    pub fn dup3(oldfd: i32, newfd: i32, flags: u32) -> Result<usize, SystemError> {
-        let flags = FileMode::from_bits_truncate(flags);
-        if (flags.bits() & !FileMode::O_CLOEXEC.bits()) != 0 {
-            return Err(SystemError::EINVAL);
-        }
-
-        if oldfd == newfd {
-            return Err(SystemError::EINVAL);
-        }
-
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        return Self::do_dup3(oldfd, newfd, flags, &mut fd_table_guard);
-    }
-
-    fn do_dup2(
-        oldfd: i32,
-        newfd: i32,
-        fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
-    ) -> Result<usize, SystemError> {
-        Self::do_dup3(oldfd, newfd, FileMode::empty(), fd_table_guard)
-    }
-
-    fn do_dup3(
-        oldfd: i32,
-        newfd: i32,
-        flags: FileMode,
-        fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
-    ) -> Result<usize, SystemError> {
-        // 确认oldfd, newid是否有效
-        if !(FileDescriptorVec::validate_fd(oldfd) && FileDescriptorVec::validate_fd(newfd)) {
-            return Err(SystemError::EBADF);
-        }
-
-        if oldfd == newfd {
-            // 若oldfd与newfd相等
-            return Ok(newfd as usize);
-        }
-        let new_exists = fd_table_guard.get_file_by_fd(newfd).is_some();
-        if new_exists {
-            // close newfd
-            if fd_table_guard.drop_fd(newfd).is_err() {
-                // An I/O error occurred while attempting to close fildes2.
-                return Err(SystemError::EIO);
-            }
-        }
-
-        let old_file = fd_table_guard
-            .get_file_by_fd(oldfd)
-            .ok_or(SystemError::EBADF)?;
-        let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
-
-        if flags.contains(FileMode::O_CLOEXEC) {
-            new_file.set_close_on_exec(true);
-        } else {
-            new_file.set_close_on_exec(false);
-        }
-        // 申请文件描述符，并把文件对象存入其中
-        let res = fd_table_guard
-            .alloc_fd(new_file, Some(newfd))
-            .map(|x| x as usize);
-        return res;
-    }
-
-    /// # fcntl
-    ///
-    /// ## 参数
-    ///
-    /// - `fd`：文件描述符
-    /// - `cmd`：命令
-    /// - `arg`：参数
-    pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
-        // debug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
-        match cmd {
-            FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
-                if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
-                    return Err(SystemError::EBADF);
-                }
-                let arg = arg as usize;
-                for i in arg..FileDescriptorVec::PROCESS_MAX_FD {
-                    let binding = ProcessManager::current_pcb().fd_table();
-                    let mut fd_table_guard = binding.write();
-                    if fd_table_guard.get_file_by_fd(i as i32).is_none() {
-                        if cmd == FcntlCommand::DupFd {
-                            return Self::do_dup2(fd, i as i32, &mut fd_table_guard);
-                        } else {
-                            return Self::do_dup3(
-                                fd,
-                                i as i32,
-                                FileMode::O_CLOEXEC,
-                                &mut fd_table_guard,
-                            );
-                        }
-                    }
-                }
-                return Err(SystemError::EMFILE);
-            }
-            FcntlCommand::GetFd => {
-                // Get file descriptor flags.
-                let binding = ProcessManager::current_pcb().fd_table();
-                let fd_table_guard = binding.read();
-
-                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
-                    // drop guard 以避免无法调度的问题
-                    drop(fd_table_guard);
-
-                    if file.close_on_exec() {
-                        return Ok(FD_CLOEXEC as usize);
-                    } else {
-                        return Ok(0);
-                    }
-                }
-                return Err(SystemError::EBADF);
-            }
-            FcntlCommand::SetFd => {
-                // Set file descriptor flags.
-                let binding = ProcessManager::current_pcb().fd_table();
-                let fd_table_guard = binding.write();
-
-                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
-                    // drop guard 以避免无法调度的问题
-                    drop(fd_table_guard);
-                    let arg = arg as u32;
-                    if arg & FD_CLOEXEC != 0 {
-                        file.set_close_on_exec(true);
-                    } else {
-                        file.set_close_on_exec(false);
-                    }
-                    return Ok(0);
-                }
-                return Err(SystemError::EBADF);
-            }
-
-            FcntlCommand::GetFlags => {
-                // Get file status flags.
-                let binding = ProcessManager::current_pcb().fd_table();
-                let fd_table_guard = binding.read();
-
-                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
-                    // drop guard 以避免无法调度的问题
-                    drop(fd_table_guard);
-                    return Ok(file.mode().bits() as usize);
-                }
-
-                return Err(SystemError::EBADF);
-            }
-            FcntlCommand::SetFlags => {
-                // Set file status flags.
-                let binding = ProcessManager::current_pcb().fd_table();
-                let fd_table_guard = binding.write();
-
-                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
-                    let arg = arg as u32;
-                    let mode = FileMode::from_bits(arg).ok_or(SystemError::EINVAL)?;
-                    // drop guard 以避免无法调度的问题
-                    drop(fd_table_guard);
-                    file.set_mode(mode)?;
-                    return Ok(0);
-                }
-
-                return Err(SystemError::EBADF);
-            }
-            _ => {
-                // TODO: unimplemented
-                // 未实现的命令，返回0，不报错。
-
-                warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
-                return Err(SystemError::ENOSYS);
-            }
-        }
-    }
-
     /// # ftruncate
     ///
     /// ## 描述

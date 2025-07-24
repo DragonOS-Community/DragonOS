@@ -2,8 +2,9 @@ use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::IndexNode;
 use crate::process::exec::{load_binary_file, ExecParam, ExecParamFlags};
-use crate::process::ProcessManager;
+use crate::process::{ProcessFlags, ProcessManager};
 use crate::syscall::Syscall;
+use crate::process::ptrace::PtraceEvent;
 use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
 
 use crate::arch::interrupt::TrapFrame;
@@ -27,6 +28,12 @@ pub fn do_execve(
             do_execve_switch_user_vm(old_vm);
         }
     })?;
+
+    let current_pcb = ProcessManager::current_pcb();
+    if current_pcb.flags().contains(ProcessFlags::PTRACED) {
+        log::debug!("ptrace_event Exec");
+        current_pcb.ptrace_event(PtraceEvent::Exec, current_pcb.task_pid_vnr().data());
+    }
 
     // log::debug!("load binary file done");
     // debug!("argv: {:?}, envp: {:?}", argv, envp);

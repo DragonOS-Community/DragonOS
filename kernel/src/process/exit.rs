@@ -522,28 +522,28 @@ fn do_waitpid(
             // 而不是立即返回0。只有当子进程真正退出时才应该返回。
             return None;
         }
-        ProcessState::Stopped => {
-            // 非 ptrace 停止：报告 stopsig=SIGSTOP
-            let exitcode = Signal::SIGSTOP as i32;
-            // 由于目前不支持ptrace，因此这个值为false
-            let ptrace = false;
-
-            if (!ptrace) && (!kwo.options.contains(WaitOption::WSTOPPED)) {
-                // 调用方未请求 WSTOPPED，按照 Linux 语义应当继续等待其它事件
-                // 而不是返回 0 并写回空的 siginfo。
-                return None;
+        ProcessState::Stopped(stop_signal) => {
+            // todo: 在stopped里面，添加code字段，表示停止的原因
+            if stop_signal <= 0 || stop_signal >= Signal::SIGRTMAX.into() {
+                return Some(Err(SystemError::EINVAL));
             }
-
-            // 填充 waitid 信息
-            // log::debug!("do_waitpid: report CLD_STOPPED for pid={:?}", child_pcb.raw_pid());
-            kwo.ret_info = Some(WaitIdInfo {
-                pid: child_pcb.task_pid_vnr(),
-                status: exitcode,
-                cause: SigChildCode::Stopped.into(),
-            });
-            if !kwo.options.contains(WaitOption::WNOWAIT) {
-                // 消费一次停止事件标志（若存在）
-                child_pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
+            let exitcode = stop_signal as i32;
+            let ptrace = child_pcb.is_traced();
+            // 对于被跟踪的进程，总是报告停止状态，无论 WUNTRACED 是否设置
+            // 对于非跟踪进程，只有在设置了 WUNTRACED 时才报告停止状态
+            if (!ptrace) && (!kwo.options.contains(WaitOption::WUNTRACED)) {
+                kwo.ret_status = 0;
+                return Some(Ok(0));
+            }
+            if likely(!(kwo.options.contains(WaitOption::WNOWAIT))) {
+                kwo.ret_status = (exitcode << 8) | 0x7f;
+            }
+            if let Some(infop) = &mut kwo.ret_info {
+                *infop = WaitIdInfo {
+                    pid: child_pcb.raw_pid(),
+                    status: exitcode,
+                    cause: SigChildCode::Stopped.into(),
+                };
             }
 
             return Some(Ok(child_pcb.raw_pid().data()));
@@ -574,7 +574,8 @@ fn do_waitpid(
                 drop(child_pcb);
             }
             return Some(Ok(pid.into()));
-        }
+        },
+        ProcessState::TracedStopped => todo!()
     };
 
     return None;

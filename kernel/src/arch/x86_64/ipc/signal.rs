@@ -334,6 +334,77 @@ impl UserUContext {
     }
 }
 
+/// siginfo中的si_code的可选值
+/// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+pub enum SigCode {
+    /// 描述通用来源
+    Origin(OriginCode),
+    /// 描述 SIGCHLD 的具体原因
+    SigChld(ChldCode),
+}
+
+/// 信号的通用来源码 (SI_*)
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum OriginCode {
+    /// sent by kill, sigsend, raise
+    User = 0,
+    /// sent by kernel from somewhere
+    Kernel = 0x80,
+    /// 通过sigqueue发送
+    Queue = -1,
+    /// 定时器过期时发送
+    Timer = -2,
+    /// 当实时消息队列的状态发生改变时发送
+    Mesgq = -3,
+    /// 当异步IO完成时发送
+    AsyncIO = -4,
+    /// sent by queued SIGIO
+    SigIO = -5,
+}
+
+/// SIGCHLD 专用原因码 (CLD_*)
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ChldCode {
+    Exited = 1,
+    Killed = 2,
+    Dumped = 3,
+    Trapped = 4,
+    Stopped = 5,
+    Continued = 6,
+}
+
+impl SigCode {
+    /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
+    #[allow(dead_code)]
+    pub fn from_i32(signal: Signal, code: i32) -> SigCode {
+        match signal {
+            Signal::SIGCHLD => match code {
+                1 => SigCode::SigChld(ChldCode::Exited),
+                2 => SigCode::SigChld(ChldCode::Killed),
+                3 => SigCode::SigChld(ChldCode::Dumped),
+                4 => SigCode::SigChld(ChldCode::Trapped),
+                5 => SigCode::SigChld(ChldCode::Stopped),
+                6 => SigCode::SigChld(ChldCode::Continued),
+                _ => panic!("signal code not valid in {:?}", signal),
+            },
+            // 对于其他信号，尝试匹配通用码
+            _ => match code {
+                0 => SigCode::Origin(OriginCode::User),
+                0x80 => SigCode::Origin(OriginCode::Kernel),
+                -1 => SigCode::Origin(OriginCode::Queue),
+                -2 => SigCode::Origin(OriginCode::Timer),
+                -3 => SigCode::Origin(OriginCode::Mesgq),
+                -4 => SigCode::Origin(OriginCode::AsyncIO),
+                -5 => SigCode::Origin(OriginCode::SigIO),
+                _ => panic!("signal code not valid in {:?}", signal),
+            },
+        }
+    }
+}
+
 bitflags! {
     #[repr(C,align(8))]
     #[derive(Default)]

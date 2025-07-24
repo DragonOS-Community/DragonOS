@@ -9,9 +9,10 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    process::ProcessManager,
+    process::{ptrace::handle_ptrace_signal_stop, ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
 };
+use num_traits::FromPrimitive;
 
 /// 信号处理的栈的栈指针的最小对齐
 #[allow(dead_code)]
@@ -432,8 +433,12 @@ fn sig_stop(sig: Signal) {
         // 标记停止事件，供 waitid(WSTOPPED) 可见
         pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
         pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
+        if pcb.flags().contains(ProcessFlags::PTRACED) {
+            log::debug!("sig_stop");
+            handle_ptrace_signal_stop(&current_pcb, sig);
+        }
     }
-    ProcessManager::mark_stop().unwrap_or_else(|e| {
+    ProcessManager::mark_stop(sig).unwrap_or_else(|e| {
         log::error!(
             "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
             e,

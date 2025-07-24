@@ -86,6 +86,7 @@ pub mod namespace;
 pub mod pid;
 pub mod preempt;
 pub mod process_group;
+pub mod ptrace;
 pub mod resource;
 pub mod session;
 pub mod signal;
@@ -273,10 +274,10 @@ impl ProcessManager {
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if let ProcessState::Stopped = state {
+        if let ProcessState::Stopped(_) = state {
             let mut writer = pcb.sched_info().inner_lock_write_irqsave();
             let state = writer.state();
-            if let ProcessState::Stopped = state {
+            if let ProcessState::Stopped(_) = state {
                 writer.set_state(ProcessState::Runnable);
                 // avoid deadlock
                 drop(writer);
@@ -359,7 +360,7 @@ impl ProcessManager {
     ///
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
-    pub fn mark_stop() -> Result<(), SystemError> {
+    pub fn mark_stop(sig: Signal) -> Result<(), SystemError> {
         assert!(
             !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_stop()"
@@ -368,7 +369,7 @@ impl ProcessManager {
         let pcb = ProcessManager::current_pcb();
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         if !matches!(writer.state(), ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Stopped);
+            writer.set_state(ProcessState::Stopped(sig.into()));
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             drop(writer);
 
@@ -707,7 +708,9 @@ pub enum ProcessState {
     /// - 如果该bool为false,那么，这个进程必须被显式的唤醒，才能重新进入Runnable状态。
     Blocked(bool),
     /// 进程被信号终止
-    Stopped,
+    Stopped(usize),
+    /// 用于ptrace跟踪停止的状态
+    TracedStopped,
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
 }
@@ -740,7 +743,7 @@ impl ProcessState {
     /// [`Stopped`]: ProcessState::Stopped
     #[inline(always)]
     pub fn is_stopped(&self) -> bool {
-        matches!(self, ProcessState::Stopped)
+        matches!(self, ProcessState::Stopped(_))
     }
 
     /// Returns exit code if the process state is [`Exited`].
@@ -751,6 +754,26 @@ impl ProcessState {
             _ => None,
         }
     }
+}
+
+/// ptrace 系统调用的请求类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum PtraceRequest {
+    PtraceTraceme = 0,         // PTRACE_TRACEME
+    PtraceAttach = 16,         // PTRACE_ATTACH
+    PtraceDetach = 17,         // PTRACE_DETACH
+    PtraceSyscall = 24,        // PTRACE_SYSCALL
+    PtraceSinglestep = 9,      // PTRACE_SINGLESTEP
+    PtraceCont = 7,            // PTRACE_CONT
+    PtraceGetregs = 12,        // PTRACE_GETREGS
+    PtraceSetregs = 13,        // PTRACE_SETREGS
+    PtracePeekuser = 3,        // PTRACE_PEEKUSER
+    PtracePeekdata = 2,        // PTRACE_PEEKDATA
+    PtracePokedata = 5,        // PTRACE_POKEDATA
+    PtraceGetsiginfo = 0x4202, // PTRACE_GETSIGINFO
+    PtraceSetoptions = 0x4200, // PTRACE_SETOPTIONS
+                               // ... 其他可能的请求
 }
 
 bitflags! {
@@ -781,6 +804,24 @@ bitflags! {
         const RESTORE_SIG_MASK = 1 << 10;
         /// Forked but didn't exec
         const FORKNOEXEC = 1 << 11;
+        /// 进程当前停止
+        const STOPPED = 1 << 14;
+        /// 进程当前由ptrace跟踪
+        const PTRACED = 1 << 15;
+        /// 跟踪器已发出PTRACE_SYSCALL请求
+        const TRACE_SYSCALL = 1 << 16;
+        /// 跟踪器已发出PTRACE_SINGLESTEP请求
+        const TRACE_SINGLESTEP = 1 << 17;
+        /// 跟踪器设置了TRACE_EXIT选项
+        const TRACE_EXIT = 1 << 18;
+        /// 跟踪器设置了TRACE_FORK/CLONE选项
+        const TRACE_FORK = 1 << 19;
+        /// 跟踪器设置了TRACE_VFORK选项
+        const TRACE_VFORK = 1 << 20;
+        /// 跟踪器设置了TRACE_EXEC选项
+        const TRACE_EXEC = 1 << 21;
+        /// 系统调用正在中断点（入口或出口）
+        const SYSCALL_INTERRUPT = 1 << 22;
     }
 }
 
@@ -831,6 +872,83 @@ pub struct ProcessItimers {
     pub real: Option<ProcessItimer>, // 用于 ITIMER_REAL
     pub virt: CpuItimer,             // 用于 ITIMER_REAL
     pub prof: CpuItimer,             // 用于 ITIMER_PROF
+}
+
+/// 进程被跟踪的状态信息
+#[derive(Debug, Default)]
+struct PtraceState {
+    /// 跟踪此进程的进程PID
+    tracer: Option<RawPid>,
+    /// 挂起的信号（等待调试器处理）
+    pending_signals: Vec<Signal>,
+    /// 系统调用信息 (用于 PTRACE_SYSCALL)
+    syscall_info: Option<SyscallInfo>,
+    /// ptrace选项位
+    options: PtraceOptions,
+    /// 停止状态的状态字
+    exit_code: usize,
+    /// 用于存储事件消息
+    event_message: usize,
+}
+impl PtraceState {
+    pub fn new() -> Self {
+        Self {
+            tracer: None,
+            pending_signals: Vec::new(),
+            syscall_info: None,
+            options: PtraceOptions::empty(),
+            exit_code: 0,
+            event_message: 0,
+        }
+    }
+
+    /// 获取停止状态的状态字
+    pub fn status_code(&self) -> usize {
+        // 根据信号和状态生成状态码
+        if let Some(signal) = self.pending_signals.first() {
+            (*signal as usize) << 8
+        } else {
+            0
+        }
+    }
+    /// 检查是否有挂起的信号
+    pub fn has_pending_signals(&self) -> bool {
+        !self.pending_signals.is_empty()
+    }
+    /// 添加挂起信号
+    pub fn add_pending_signal(&mut self, signal: Signal) {
+        self.pending_signals.push(signal);
+    }
+    /// 获取下一个挂起信号
+    pub fn next_pending_signal(&mut self) -> Option<Signal> {
+        if self.pending_signals.is_empty() {
+            None
+        } else {
+            Some(self.pending_signals.remove(0))
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SyscallInfo {
+    /// 系统调用入口信息（系统调用号、参数、返回值）
+    syscall_num: usize,
+    args: [usize; 6],
+    result: isize,
+}
+bitflags::bitflags! {
+    /// Ptrace选项（PTRACE_O_*）
+    #[derive(Default)]
+    pub struct PtraceOptions: usize {
+        const TRACESYSGOOD   = 1 << 0;
+        const TRACEFORK      = 1 << 1;
+        const TRACEVFORK     = 1 << 2;
+        const TRACECLONE     = 1 << 3;
+        const TRACEEXEC      = 1 << 4;
+        const TRACEVFORKDONE = 1 << 5;
+        const TRACEEXIT      = 1 << 6;
+        const TRACESECCOMP   = 1 << 7;
+    }
 }
 
 #[derive(Debug)]
@@ -911,6 +1029,11 @@ pub struct ProcessControlBlock {
     executable_path: RwLock<String>,
     /// 资源限制（rlimit）数组
     rlimits: RwLock<[RLimit64; RLimitID::Nlimits as usize]>,
+
+    /// ptrace跟踪状态
+    ptrace_state: SpinLock<PtraceState>,
+    /// 被ptrace跟踪的进程列表（跟踪器跟踪了哪些进程）
+    ptraced_list: RwLock<Vec<RawPid>>,
 }
 
 impl ProcessControlBlock {
@@ -995,6 +1118,7 @@ impl ProcessControlBlock {
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find_task_by_vpid(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
+        let ptrace_state = SpinLock::new(PtraceState::default());
 
         // 使用 Arc::new_cyclic 避免在栈上创建巨大的结构体
         let pcb = Arc::new_cyclic(|weak| {
@@ -1034,6 +1158,8 @@ impl ProcessControlBlock {
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
                 rlimits: RwLock::new(Self::default_rlimits()),
+                ptrace_state,
+                ptraced_list: RwLock::new(Vec::new()),
             };
 
             pcb.sig_info.write().set_tty(tty);

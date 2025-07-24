@@ -8,8 +8,7 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::{SigSet, Signal},
-    ipc::signal_types::SigCode,
+    arch::ipc::signal::{OriginCode, SigCode, SigFlags, SigSet, Signal},
     ipc::signal_types::SigactionType,
     mm::VirtAddr,
     process::{
@@ -127,7 +126,7 @@ impl Signal {
         // signal的信息为空
 
         if let Some(ref siginfo) = info {
-            force_send = matches!(siginfo.sig_code(), SigCode::Kernel);
+            force_send = matches!(siginfo.sig_code(), SigCode::Origin(OriginCode::Kernel));
         } else {
             // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
             //详见 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226
@@ -166,7 +165,7 @@ impl Signal {
                     SigInfo::new(
                         *self,
                         0,
-                        SigCode::User,
+                        SigCode::Origin(OriginCode::User),
                         SigType::Kill(ProcessManager::current_pcb().raw_pid()),
                     )
                 }
@@ -381,7 +380,7 @@ impl Signal {
 fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
-    // debug!("signal_wake_up");
+    log::debug!("signal_wake_up");
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
     let state = pcb.sched_info().inner_lock_read_irqsave().state();
     let mut wakeup_ok = true;

@@ -1,5 +1,5 @@
 use crate::{
-    arch::ipc::signal::Signal,
+    arch::ipc::signal::{OriginCode, SigCode, Signal},
     filesystem::{
         epoll::{
             event_poll::{EventPoll, LockedEPItemLinkedList},
@@ -407,7 +407,7 @@ impl IndexNode for LockedPipeInode {
                         let mut info = SigInfo::new(
                             sig,
                             0,
-                            SigCode::Kernel,
+                            SigCode::Origin(OriginCode::Kernel),
                             SigType::Kill(ProcessManager::current_pcb().task_pid_vnr()),
                         );
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);

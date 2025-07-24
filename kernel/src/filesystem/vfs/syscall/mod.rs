@@ -20,15 +20,16 @@ use crate::{
 use super::stat::{do_newfstatat, do_statx, vfs_fstat};
 use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
-    file::{File, FileMode},
+    file::FileMode,
     utils::{rsplit_path, user_path_at},
-    FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 mod link_utils;
 mod open_utils;
 mod rename_utils;
 mod utimensat;
 mod faccessat2;
+mod readlink_at;
 mod sys_chdir;
 mod sys_close;
 mod sys_fchdir;
@@ -57,6 +58,7 @@ mod sys_fchmod;
 mod sys_fchmodat;
 mod sys_faccessat;
 mod sys_faccessat2;
+mod sys_readlinkat;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -106,6 +108,8 @@ mod sys_chown;
 mod sys_chmod;
 #[cfg(target_arch = "x86_64")]
 mod sys_access;
+#[cfg(target_arch = "x86_64")]
+mod sys_readlink;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -823,41 +827,5 @@ impl Syscall {
         parent_inode.mknod(filename, mode, dev_t)?;
 
         return Ok(0);
-    }
-
-    pub fn readlink_at(
-        dirfd: i32,
-        path: *const u8,
-        user_buf: *mut u8,
-        buf_size: usize,
-    ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let path = path.as_str().trim();
-        let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
-
-        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
-
-        let inode = inode.lookup(path.as_str())?;
-        if inode.metadata()?.file_type != FileType::SymLink {
-            return Err(SystemError::EINVAL);
-        }
-
-        let ubuf = user_buf.buffer::<u8>(0).unwrap();
-
-        let file = File::new(inode, FileMode::O_RDONLY)?;
-
-        let len = file.read(buf_size, ubuf)?;
-
-        return Ok(len);
-    }
-
-    pub fn readlink(
-        path: *const u8,
-        user_buf: *mut u8,
-        buf_size: usize,
-    ) -> Result<usize, SystemError> {
-        return Self::readlink_at(AtFlags::AT_FDCWD.bits(), path, user_buf, buf_size);
     }
 }

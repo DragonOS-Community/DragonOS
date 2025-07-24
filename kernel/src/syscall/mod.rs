@@ -473,22 +473,6 @@ impl Syscall {
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_READLINK => {
-                let path = args[0] as *const u8;
-                let buf = args[1] as *mut u8;
-                let bufsiz = args[2];
-                Self::readlink(path, buf, bufsiz)
-            }
-
-            SYS_READLINKAT => {
-                let dirfd = args[0] as i32;
-                let path = args[1] as *const u8;
-                let buf = args[2] as *mut u8;
-                let bufsiz = args[3];
-                Self::readlink_at(dirfd, path, buf, bufsiz)
-            }
-
             SYS_CLOCK_GETTIME => {
                 let clockid = args[0] as i32;
                 let timespec = args[1] as *mut PosixTimeSpec;

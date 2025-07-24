@@ -489,13 +489,6 @@ impl Syscall {
                 Self::readlink_at(dirfd, path, buf, bufsiz)
             }
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_ACCESS => {
-                let pathname = args[0] as *const u8;
-                let mode = args[1] as u32;
-                Self::access(pathname, mode)
-            }
-
             SYS_CLOCK_GETTIME => {
                 let clockid = args[0] as i32;
                 let timespec = args[1] as *mut PosixTimeSpec;

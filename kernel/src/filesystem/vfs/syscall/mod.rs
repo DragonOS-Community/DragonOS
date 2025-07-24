@@ -1,14 +1,10 @@
-use system_error::SystemError;
-
 use crate::{
     syscall::{
         user_access::check_and_clone_cstr,
-        Syscall,
     },
     time:: PosixTimeSpec,
 };
 
-use super::stat::vfs_fstat;
 use super::{
     fcntl::AtFlags,
     file::FileMode,
@@ -21,6 +17,7 @@ mod utimensat;
 mod faccessat2;
 mod readlink_at;
 mod dup2;
+mod newfstat;
 mod sys_chdir;
 mod sys_close;
 mod sys_fchdir;
@@ -486,17 +483,5 @@ bitflags! {
         // 			return -EAGAIN if that's not
         // 			possible.
         const RESOLVE_CACHED = 0x20;
-    }
-}
-
-impl Syscall {
-    #[inline(never)]
-    pub fn newfstat(fd: i32, user_stat_buf_ptr: usize) -> Result<usize, SystemError> {
-        if user_stat_buf_ptr == 0 {
-            return Err(SystemError::EFAULT);
-        }
-        let stat = vfs_fstat(fd)?;
-        // log::debug!("newfstat fd: {}, stat.size: {:?}",fd,stat.size);
-        super::stat::cp_new_stat(stat, user_stat_buf_ptr).map(|_| 0)
     }
 }

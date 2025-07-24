@@ -1,26 +1,27 @@
-use crate::{
-    syscall::{
-        user_access::check_and_clone_cstr,
-    },
-    time:: PosixTimeSpec,
-};
+use crate::{syscall::user_access::check_and_clone_cstr, time::PosixTimeSpec};
 
-use super::{
-    fcntl::AtFlags,
-    file::FileMode,
-    SuperBlock,
-};
-mod link_utils;
-mod open_utils;
-mod rename_utils;
-mod utimensat;
-mod faccessat2;
-mod readlink_at;
+use super::{fcntl::AtFlags, file::FileMode, SuperBlock};
 mod dup2;
+mod faccessat2;
+mod link_utils;
 mod newfstat;
+mod open_utils;
+mod readlink_at;
+mod rename_utils;
 mod sys_chdir;
 mod sys_close;
+mod sys_dup;
+mod sys_dup3;
+mod sys_faccessat;
+mod sys_faccessat2;
 mod sys_fchdir;
+mod sys_fchmod;
+mod sys_fchmodat;
+mod sys_fchown;
+mod sys_fchownat;
+mod sys_fcntl;
+mod sys_fstatfs;
+mod sys_ftruncate;
 mod sys_getcwd;
 mod sys_getdents;
 mod sys_ioctl;
@@ -32,28 +33,18 @@ mod sys_pread64;
 mod sys_pselect6;
 mod sys_pwrite64;
 mod sys_read;
+mod sys_readlinkat;
 mod sys_readv;
 mod sys_renameat2;
 mod sys_select;
+mod sys_statfs;
+mod sys_statx;
 mod sys_symlinkat;
 mod sys_unlinkat;
+mod sys_utimensat;
 mod sys_write;
 mod sys_writev;
-mod sys_utimensat;
-mod sys_fchown;
-mod sys_fchownat;
-mod sys_fchmod;
-mod sys_fchmodat;
-mod sys_faccessat;
-mod sys_faccessat2;
-mod sys_readlinkat;
-mod sys_dup;
-mod sys_dup3;
-mod sys_fcntl;
-mod sys_ftruncate;
-mod sys_statx;
-mod sys_statfs;
-mod sys_fstatfs;
+mod utimensat;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -68,9 +59,21 @@ pub mod sys_umount2;
 mod sys_fstat;
 
 #[cfg(target_arch = "x86_64")]
+mod sys_access;
+#[cfg(target_arch = "x86_64")]
+mod sys_chmod;
+#[cfg(target_arch = "x86_64")]
+mod sys_chown;
+#[cfg(target_arch = "x86_64")]
+mod sys_dup2;
+#[cfg(target_arch = "x86_64")]
 mod sys_epoll_create;
 #[cfg(target_arch = "x86_64")]
 mod sys_epoll_wait;
+#[cfg(target_arch = "x86_64")]
+mod sys_futimesat;
+#[cfg(target_arch = "x86_64")]
+mod sys_lchown;
 #[cfg(target_arch = "x86_64")]
 mod sys_link;
 #[cfg(target_arch = "x86_64")]
@@ -78,7 +81,13 @@ mod sys_lstat;
 #[cfg(target_arch = "x86_64")]
 mod sys_mkdir;
 #[cfg(target_arch = "x86_64")]
+mod sys_mknod;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+mod sys_newfstatat;
+#[cfg(target_arch = "x86_64")]
 mod sys_open;
+#[cfg(target_arch = "x86_64")]
+mod sys_readlink;
 #[cfg(target_arch = "x86_64")]
 mod sys_rename;
 #[cfg(target_arch = "x86_64")]
@@ -93,24 +102,6 @@ mod sys_symlink;
 mod sys_unlink;
 #[cfg(target_arch = "x86_64")]
 mod sys_utimes;
-#[cfg(target_arch = "x86_64")]
-mod sys_futimesat;
-#[cfg(target_arch = "x86_64")]
-mod sys_lchown;
-#[cfg(target_arch = "x86_64")]
-mod sys_chown;
-#[cfg(target_arch = "x86_64")]
-mod sys_chmod;
-#[cfg(target_arch = "x86_64")]
-mod sys_access;
-#[cfg(target_arch = "x86_64")]
-mod sys_readlink;
-#[cfg(target_arch = "x86_64")]
-mod sys_dup2;
-#[cfg(target_arch = "x86_64")]
-mod sys_mknod;
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-mod sys_newfstatat;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;

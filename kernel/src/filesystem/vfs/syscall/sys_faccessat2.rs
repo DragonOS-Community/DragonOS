@@ -1,8 +1,12 @@
 use system_error::SystemError;
 
-use crate::{arch::interrupt::TrapFrame, filesystem::vfs::{syscall::faccessat2::do_faccessat2},syscall::table::{FormattedSyscallParam, Syscall}};
-use alloc::vec::Vec;
 use crate::arch::syscall::nr::SYS_FACCESSAT2;
+use crate::{
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::syscall::faccessat2::do_faccessat2,
+    syscall::table::{FormattedSyscallParam, Syscall},
+};
+use alloc::vec::Vec;
 
 pub struct SysFaccessat2Handle;
 
@@ -17,12 +21,7 @@ impl Syscall for SysFaccessat2Handle {
         let mode = Self::mode(args);
         let flags = Self::flags(args);
 
-        return do_faccessat2(
-            dirfd,
-            pathname,
-            mode,
-            flags,
-        );
+        return do_faccessat2(dirfd, pathname, mode, flags);
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

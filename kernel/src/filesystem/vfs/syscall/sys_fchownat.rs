@@ -1,8 +1,15 @@
 use system_error::SystemError;
 
-use crate::{arch::interrupt::TrapFrame, filesystem::vfs::{fcntl::AtFlags, open::do_fchownat, MAX_PATHLEN}, syscall::{table::{FormattedSyscallParam, Syscall}, user_access}};
-use alloc::vec::Vec;
 use crate::arch::syscall::nr::SYS_FCHOWNAT;
+use crate::{
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::{fcntl::AtFlags, open::do_fchownat, MAX_PATHLEN},
+    syscall::{
+        table::{FormattedSyscallParam, Syscall},
+        user_access,
+    },
+};
+use alloc::vec::Vec;
 
 pub struct SysFchownatHandle;
 
@@ -24,7 +31,6 @@ impl Syscall for SysFchownatHandle {
         let pathname = pathname.as_str().trim();
         let flags = AtFlags::from_bits_truncate(flags);
         return do_fchownat(dirfd, pathname, uid, gid, flags);
-
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -39,23 +45,23 @@ impl Syscall for SysFchownatHandle {
 }
 
 impl SysFchownatHandle {
-    fn dirfd(args:&[usize])->i32{
+    fn dirfd(args: &[usize]) -> i32 {
         args[0] as i32
     }
 
-    fn pathname(args:&[usize])->*const u8{
+    fn pathname(args: &[usize]) -> *const u8 {
         args[1] as *const u8
     }
 
-    fn uid(args:&[usize])->usize{
-        args[2] as usize
+    fn uid(args: &[usize]) -> usize {
+        args[2]
     }
 
-    fn gid(args:&[usize])->usize{
-        args[3] as usize
+    fn gid(args: &[usize]) -> usize {
+        args[3]
     }
 
-    fn flags(args:&[usize])->i32{
+    fn flags(args: &[usize]) -> i32 {
         args[4] as i32
     }
 }

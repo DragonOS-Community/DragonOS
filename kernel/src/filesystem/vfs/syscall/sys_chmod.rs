@@ -1,12 +1,16 @@
 use system_error::SystemError;
 
-use crate::{arch::interrupt::TrapFrame, filesystem::vfs::{fcntl::AtFlags, open::do_fchmodat, syscall::ModeType},syscall::table::{FormattedSyscallParam, Syscall}};
-use alloc::vec::Vec;
 use crate::arch::syscall::nr::SYS_CHMOD;
+use crate::{
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::{fcntl::AtFlags, open::do_fchmodat, syscall::ModeType},
+    syscall::table::{FormattedSyscallParam, Syscall},
+};
+use alloc::vec::Vec;
 
 pub struct SysChmodHandle;
 
-impl Syscall for SysChmodHandle{
+impl Syscall for SysChmodHandle {
     fn num_args(&self) -> usize {
         2
     }
@@ -23,18 +27,18 @@ impl Syscall for SysChmodHandle{
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("pathname", format!("{:#x}", Self::pathname(args) as usize)),    
+            FormattedSyscallParam::new("pathname", format!("{:#x}", Self::pathname(args) as usize)),
             FormattedSyscallParam::new("mode", format!("{:#x}", Self::mode(args))),
         ]
     }
 }
 
-impl SysChmodHandle{
-    fn pathname(args:&[usize])->*const u8{
+impl SysChmodHandle {
+    fn pathname(args: &[usize]) -> *const u8 {
         args[0] as *const u8
     }
 
-    fn mode(args:&[usize])->u32{
+    fn mode(args: &[usize]) -> u32 {
         args[1] as u32
     }
 }

@@ -1,5 +1,3 @@
-use system_error::SystemError;
-use alloc::vec::Vec;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STATX;
 use crate::filesystem::vfs::stat::do_statx;
@@ -7,6 +5,8 @@ use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::check_and_clone_cstr;
+use alloc::vec::Vec;
+use system_error::SystemError;
 
 pub struct SysStatxHandle;
 
@@ -30,14 +30,15 @@ impl Syscall for SysStatxHandle {
             FormattedSyscallParam::new("filename_ptr", format!("{:#x}", Self::filename_ptr(args))),
             FormattedSyscallParam::new("flags", format!("{:#x}", Self::flags(args))),
             FormattedSyscallParam::new("mask", format!("{:#x}", Self::mask(args))),
-            FormattedSyscallParam::new("user_kstat_ptr", format!("{:#x}", Self::user_kstat_ptr(args))),
+            FormattedSyscallParam::new(
+                "user_kstat_ptr",
+                format!("{:#x}", Self::user_kstat_ptr(args)),
+            ),
         ]
     }
-
-    
 }
 
-impl SysStatxHandle{
+impl SysStatxHandle {
     #[inline(never)]
     fn statx(
         dfd: i32,
@@ -56,23 +57,22 @@ impl SysStatxHandle{
         do_statx(dfd, filename_str, flags, mask, user_kstat_ptr).map(|_| 0)
     }
 
-    fn dfd(args:&[usize])->i32{
+    fn dfd(args: &[usize]) -> i32 {
         args[0] as i32
     }
 
-    fn filename_ptr(args:&[usize])->usize{
+    fn filename_ptr(args: &[usize]) -> usize {
         args[1]
     }
-    fn flags(args:&[usize])->u32{
+    fn flags(args: &[usize]) -> u32 {
         args[2] as u32
     }
-    fn mask(args:&[usize])->u32{
+    fn mask(args: &[usize]) -> u32 {
         args[3] as u32
     }
-    fn user_kstat_ptr(args:&[usize])->usize{
+    fn user_kstat_ptr(args: &[usize]) -> usize {
         args[4]
     }
 }
 
 syscall_table_macros::declare_syscall!(SYS_STATX, SysStatxHandle);
-   

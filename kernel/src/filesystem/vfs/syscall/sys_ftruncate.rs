@@ -64,4 +64,4 @@ impl SysFtruncateHandle {
     }
 }
 
-syscall_table_macros::declare_syscall!(SYS_FTRUNCATE,SysFtruncateHandle);
+syscall_table_macros::declare_syscall!(SYS_FTRUNCATE, SysFtruncateHandle);

@@ -1,5 +1,3 @@
-use system_error::SystemError;
-use alloc::vec::Vec;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_FSTATFS;
 use crate::filesystem::vfs::syscall::PosixStatfs;
@@ -7,10 +5,12 @@ use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::UserBufferWriter;
+use alloc::vec::Vec;
+use system_error::SystemError;
 
 pub struct SysFstatfsHandle;
 
-impl Syscall for SysFstatfsHandle{
+impl Syscall for SysFstatfsHandle {
     fn num_args(&self) -> usize {
         2
     }
@@ -38,13 +38,13 @@ impl Syscall for SysFstatfsHandle{
     }
 }
 
-impl SysFstatfsHandle{
-    fn fd(args:&[usize])->i32{
+impl SysFstatfsHandle {
+    fn fd(args: &[usize]) -> i32 {
         args[0] as i32
     }
-    fn statfs(args:&[usize])->*mut PosixStatfs{
+    fn statfs(args: &[usize]) -> *mut PosixStatfs {
         args[1] as *mut PosixStatfs
     }
 }
 
-syscall_table_macros::declare_syscall!(SYS_FSTATFS,SysFstatfsHandle);
+syscall_table_macros::declare_syscall!(SYS_FSTATFS, SysFstatfsHandle);

@@ -1,9 +1,14 @@
 use log::warn;
 use system_error::SystemError;
 
-use crate::{arch::interrupt::TrapFrame, filesystem::vfs::{syscall::ModeType}, process::ProcessManager, syscall::table::{FormattedSyscallParam, Syscall}};
-use alloc::vec::Vec;
 use crate::arch::syscall::nr::SYS_FCHMOD;
+use crate::{
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::syscall::ModeType,
+    process::ProcessManager,
+    syscall::table::{FormattedSyscallParam, Syscall},
+};
+use alloc::vec::Vec;
 
 pub struct SysFchmodHandle;
 
@@ -30,8 +35,8 @@ impl Syscall for SysFchmodHandle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("fd", format!("{:#x}",Self::fd(args))),
-            FormattedSyscallParam::new("mode", format!("{:#x}",Self::mode(args))),
+            FormattedSyscallParam::new("fd", format!("{:#x}", Self::fd(args))),
+            FormattedSyscallParam::new("mode", format!("{:#x}", Self::mode(args))),
         ]
     }
 }

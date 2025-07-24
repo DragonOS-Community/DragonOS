@@ -1,6 +1,9 @@
 use system_error::SystemError;
 
-use crate::{filesystem::vfs::file::{FileDescriptorVec, FileMode}, libs::rwlock::RwLockWriteGuard};
+use crate::{
+    filesystem::vfs::file::{FileDescriptorVec, FileMode},
+    libs::rwlock::RwLockWriteGuard,
+};
 
 pub fn do_dup2(
     oldfd: i32,

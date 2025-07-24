@@ -40,8 +40,8 @@ impl Syscall for SysDup2Handle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("oldfd",format!("{:#x}", Self::oldfd(args))),
-            FormattedSyscallParam::new("newfd",format!("{:#x}", Self::newfd(args)))
+            FormattedSyscallParam::new("oldfd", format!("{:#x}", Self::oldfd(args))),
+            FormattedSyscallParam::new("newfd", format!("{:#x}", Self::newfd(args))),
         ]
     }
 }

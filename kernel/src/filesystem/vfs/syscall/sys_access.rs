@@ -1,8 +1,12 @@
 use system_error::SystemError;
 
-use crate::{arch::interrupt::TrapFrame, filesystem::vfs::{fcntl::AtFlags, open::do_faccessat, syscall::ModeType},syscall::table::{FormattedSyscallParam, Syscall}};
-use alloc::vec::Vec;
 use crate::arch::syscall::nr::SYS_ACCESS;
+use crate::{
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::{fcntl::AtFlags, open::do_faccessat, syscall::ModeType},
+    syscall::table::{FormattedSyscallParam, Syscall},
+};
+use alloc::vec::Vec;
 
 pub struct SysAccessHandle;
 
@@ -24,13 +28,13 @@ impl Syscall for SysAccessHandle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("pathname",format!("{:#x}",Self::pathname(args) as usize)),
-            FormattedSyscallParam::new("mode", format!("{:#x}",Self::mode(args))),
+            FormattedSyscallParam::new("pathname", format!("{:#x}", Self::pathname(args) as usize)),
+            FormattedSyscallParam::new("mode", format!("{:#x}", Self::mode(args))),
         ]
     }
 }
 
-impl SysAccessHandle{
+impl SysAccessHandle {
     fn pathname(args: &[usize]) -> *const u8 {
         args[0] as *const u8
     }
@@ -38,6 +42,6 @@ impl SysAccessHandle{
     fn mode(args: &[usize]) -> u32 {
         args[1] as u32
     }
-} 
+}
 
-syscall_table_macros::declare_syscall!(SYS_ACCESS,SysAccessHandle);
+syscall_table_macros::declare_syscall!(SYS_ACCESS, SysAccessHandle);

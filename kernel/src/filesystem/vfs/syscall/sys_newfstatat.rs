@@ -1,12 +1,19 @@
 use system_error::SystemError;
 
-use crate::{arch::interrupt::TrapFrame, filesystem::vfs::{stat::do_newfstatat,MAX_PATHLEN},syscall::{table::{FormattedSyscallParam, Syscall}, user_access::check_and_clone_cstr}};
-use alloc::vec::Vec;
 use crate::arch::syscall::nr::SYS_NEWFSTATAT;
+use crate::{
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::{stat::do_newfstatat, MAX_PATHLEN},
+    syscall::{
+        table::{FormattedSyscallParam, Syscall},
+        user_access::check_and_clone_cstr,
+    },
+};
+use alloc::vec::Vec;
 
 pub struct SysNewFstatatHandle;
 
-impl Syscall for SysNewFstatatHandle{
+impl Syscall for SysNewFstatatHandle {
     fn num_args(&self) -> usize {
         4
     }
@@ -23,26 +30,29 @@ impl Syscall for SysNewFstatatHandle{
         vec![
             FormattedSyscallParam::new("dfd", format!("{:#x}", Self::dfd(args))),
             FormattedSyscallParam::new("filename", format!("{:#x}", Self::filename_ptr(args))),
-            FormattedSyscallParam::new("user_stat_buf_ptr", format!("{:#x}", Self::user_stat_buf_ptr(args))),
+            FormattedSyscallParam::new(
+                "user_stat_buf_ptr",
+                format!("{:#x}", Self::user_stat_buf_ptr(args)),
+            ),
             FormattedSyscallParam::new("flags", format!("{:#x}", Self::flags(args))),
         ]
     }
 }
 
-impl SysNewFstatatHandle{
-    fn dfd(args:&[usize])->i32{
+impl SysNewFstatatHandle {
+    fn dfd(args: &[usize]) -> i32 {
         args[0] as i32
     }
 
-    fn filename_ptr(args:&[usize])->usize{
+    fn filename_ptr(args: &[usize]) -> usize {
         args[1]
     }
 
-    fn user_stat_buf_ptr(args:&[usize])->usize{
+    fn user_stat_buf_ptr(args: &[usize]) -> usize {
         args[2]
     }
 
-    fn flags(args:&[usize])->u32{
+    fn flags(args: &[usize]) -> u32 {
         args[3] as u32
     }
 

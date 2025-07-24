@@ -1,12 +1,16 @@
 use system_error::SystemError;
 
-use crate::{arch::interrupt::TrapFrame, filesystem::vfs::{fcntl::AtFlags, syscall::{readlink_at::do_readlink_at}},syscall::table::{FormattedSyscallParam, Syscall}};
-use alloc::vec::Vec;
 use crate::arch::syscall::nr::SYS_READLINK;
+use crate::{
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::{fcntl::AtFlags, syscall::readlink_at::do_readlink_at},
+    syscall::table::{FormattedSyscallParam, Syscall},
+};
+use alloc::vec::Vec;
 
 pub struct SysReadlinkHandle;
 
-impl Syscall for SysReadlinkHandle{
+impl Syscall for SysReadlinkHandle {
     fn num_args(&self) -> usize {
         3
     }
@@ -16,12 +20,7 @@ impl Syscall for SysReadlinkHandle{
         let user_buf = Self::user_buf(args);
         let buf_size = Self::buf_size(args);
 
-        return do_readlink_at(
-            AtFlags::AT_FDCWD.bits(),
-            path,
-            user_buf,
-            buf_size,
-        );
+        return do_readlink_at(AtFlags::AT_FDCWD.bits(), path, user_buf, buf_size);
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -34,14 +33,14 @@ impl Syscall for SysReadlinkHandle{
 }
 
 impl SysReadlinkHandle {
-    fn path(args:&[usize])->*const u8{
+    fn path(args: &[usize]) -> *const u8 {
         args[0] as *const u8
     }
 
-    fn user_buf(args:&[usize])->*mut u8{
+    fn user_buf(args: &[usize]) -> *mut u8 {
         args[1] as *mut u8
     }
-    fn buf_size(args:&[usize])->usize{
+    fn buf_size(args: &[usize]) -> usize {
         args[2]
     }
 }

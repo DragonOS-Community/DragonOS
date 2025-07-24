@@ -1,7 +1,14 @@
-use crate::{arch::interrupt::TrapFrame, filesystem::vfs::{fcntl::AtFlags, open::do_fchownat,  MAX_PATHLEN}, syscall::{table::{FormattedSyscallParam, Syscall}, user_access}};
+use crate::arch::syscall::nr::SYS_CHOWN;
+use crate::{
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::{fcntl::AtFlags, open::do_fchownat, MAX_PATHLEN},
+    syscall::{
+        table::{FormattedSyscallParam, Syscall},
+        user_access,
+    },
+};
 use alloc::vec::Vec;
 use system_error::SystemError;
-use crate::arch::syscall::nr::SYS_CHOWN;
 
 pub struct SyschownHandle;
 
@@ -29,24 +36,24 @@ impl Syscall for SyschownHandle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("pathname", format!("{:#x}", Self::pathname(args) as usize)),    
-            FormattedSyscallParam::new("uid", format!("{:#x}", Self::uid(args) as usize)),    
-            FormattedSyscallParam::new("gid", format!("{:#x}", Self::gid(args) as usize)),    
+            FormattedSyscallParam::new("pathname", format!("{:#x}", Self::pathname(args) as usize)),
+            FormattedSyscallParam::new("uid", format!("{:#x}", Self::uid(args))),
+            FormattedSyscallParam::new("gid", format!("{:#x}", Self::gid(args))),
         ]
     }
 }
 
-impl SyschownHandle{
+impl SyschownHandle {
     fn pathname(args: &[usize]) -> *const u8 {
         args[0] as *const u8
     }
 
     fn uid(args: &[usize]) -> usize {
-        args[1] as usize
+        args[1]
     }
 
     fn gid(args: &[usize]) -> usize {
-        args[2] as usize
+        args[2]
     }
 }
 

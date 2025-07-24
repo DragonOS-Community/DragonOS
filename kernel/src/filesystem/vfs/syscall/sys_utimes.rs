@@ -20,7 +20,7 @@ impl Syscall for SysUtimesHandle {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pathname = Self::pathname(args);
-        let times=Self::times(args);
+        let times = Self::times(args);
 
         let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
             .into_string()
@@ -33,10 +33,9 @@ impl Syscall for SysUtimesHandle {
             Some([times[0], times[1]])
         };
         do_utimes(&pathname, times)
-
     }
 
-     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
+    fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
             FormattedSyscallParam::new("path", format!("{:#x}", Self::pathname(args) as usize)),
             FormattedSyscallParam::new("times", format!("{:#x}", Self::times(args) as usize)),
@@ -49,10 +48,9 @@ impl SysUtimesHandle {
         args[0] as *const u8
     }
 
-    fn times(args:&[usize])-> *const PosixTimeval{
+    fn times(args: &[usize]) -> *const PosixTimeval {
         args[1] as *const PosixTimeval
     }
 }
 
 syscall_table_macros::declare_syscall!(SYS_UTIMES, SysUtimesHandle);
-

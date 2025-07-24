@@ -1,8 +1,12 @@
 use system_error::SystemError;
 
-use crate::{arch::interrupt::TrapFrame, filesystem::vfs::open::ksys_fchown, syscall::table::{FormattedSyscallParam, Syscall}};
-use alloc::vec::Vec;
 use crate::arch::syscall::nr::SYS_FCHOWN;
+use crate::{
+    arch::interrupt::TrapFrame,
+    filesystem::vfs::open::ksys_fchown,
+    syscall::table::{FormattedSyscallParam, Syscall},
+};
+use alloc::vec::Vec;
 
 pub struct SysFchownHandle;
 
@@ -27,17 +31,17 @@ impl Syscall for SysFchownHandle {
     }
 }
 
-impl SysFchownHandle{
-    fn fd(args:&[usize])->i32{
+impl SysFchownHandle {
+    fn fd(args: &[usize]) -> i32 {
         args[0] as i32
     }
-     fn uid (args:&[usize])->usize{
-        args[1] as usize
-     }
+    fn uid(args: &[usize]) -> usize {
+        args[1]
+    }
 
-     fn gid (args:&[usize])->usize{
-        args[2] as usize
-     }
+    fn gid(args: &[usize]) -> usize {
+        args[2]
+    }
 }
 
 syscall_table_macros::declare_syscall!(SYS_FCHOWN, SysFchownHandle);

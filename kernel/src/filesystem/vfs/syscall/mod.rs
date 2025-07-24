@@ -60,6 +60,7 @@ mod sys_readlinkat;
 mod sys_dup;
 mod sys_dup3;
 mod sys_fcntl;
+mod sys_ftruncate;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -489,36 +490,6 @@ bitflags! {
 }
 
 impl Syscall {
-    /// # ftruncate
-    ///
-    /// ## 描述
-    ///
-    /// 改变文件大小.
-    /// 如果文件大小大于原来的大小，那么文件的内容将会被扩展到指定的大小，新的空间将会用0填充.
-    /// 如果文件大小小于原来的大小，那么文件的内容将会被截断到指定的大小.
-    ///
-    /// ## 参数
-    ///
-    /// - `fd`：文件描述符
-    /// - `len`：文件大小
-    ///
-    /// ## 返回值
-    ///
-    /// 如果成功，返回0，否则返回错误码.
-    pub fn ftruncate(fd: i32, len: usize) -> Result<usize, SystemError> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
-            // drop guard 以避免无法调度的问题
-            drop(fd_table_guard);
-            let r = file.ftruncate(len).map(|_| 0);
-            return r;
-        }
-
-        return Err(SystemError::EBADF);
-    }
-
     pub fn statfs(path: *const u8, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
         let fd = open_utils::do_open(

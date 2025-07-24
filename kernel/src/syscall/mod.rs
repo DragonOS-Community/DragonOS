@@ -307,14 +307,6 @@ impl Syscall {
                 Self::gettimeofday(timeval, timezone_ptr)
             }
 
-            SYS_FTRUNCATE => {
-                let fd = args[0] as i32;
-                let len = args[1];
-                let res = Self::ftruncate(fd, len);
-                // debug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
-                res
-            }
-
             #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
                 let path = args[0];

@@ -358,14 +358,6 @@ impl Syscall {
                 Self::fstatfs(fd, statfs)
             }
 
-            SYS_STATX => Self::statx(
-                args[0] as i32,
-                args[1],
-                args[2] as u32,
-                args[3] as u32,
-                args[4],
-            ),
-
             // 目前为了适配musl-libc,以下系统调用先这样写着
             SYS_GETRANDOM => {
                 let flags = GRandFlags::from_bits(args[2] as u8).ok_or(SystemError::EINVAL)?;

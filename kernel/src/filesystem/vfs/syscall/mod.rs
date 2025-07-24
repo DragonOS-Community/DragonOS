@@ -11,7 +11,7 @@ use crate::{
     time:: PosixTimeSpec,
 };
 
-use super::stat::{do_statx, vfs_fstat};
+use super::stat::vfs_fstat;
 use super::{
     fcntl::AtFlags,
     file::FileMode,
@@ -58,6 +58,7 @@ mod sys_dup;
 mod sys_dup3;
 mod sys_fcntl;
 mod sys_ftruncate;
+mod sys_statx;
 
 mod epoll_utils;
 mod sys_epoll_create1;
@@ -522,24 +523,6 @@ impl Syscall {
         let statfs = PosixStatfs::from(file.inode().fs().super_block());
         writer.copy_one_to_user(&statfs, 0)?;
         return Ok(0);
-    }
-
-    #[inline(never)]
-    pub fn statx(
-        dfd: i32,
-        filename_ptr: usize,
-        flags: u32,
-        mask: u32,
-        user_kstat_ptr: usize,
-    ) -> Result<usize, SystemError> {
-        if user_kstat_ptr == 0 {
-            return Err(SystemError::EFAULT);
-        }
-
-        let filename = check_and_clone_cstr(filename_ptr as *const u8, Some(MAX_PATHLEN))?;
-        let filename_str = filename.to_str().map_err(|_| SystemError::EINVAL)?;
-
-        do_statx(dfd, filename_str, flags, mask, user_kstat_ptr).map(|_| 0)
     }
 
     #[inline(never)]

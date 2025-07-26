@@ -1,5 +1,6 @@
 mod sys_clone;
 mod sys_execve;
+mod sys_execveat;
 mod sys_exit;
 mod sys_exit_group;
 mod sys_get_rusage;

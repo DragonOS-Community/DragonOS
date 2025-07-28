@@ -189,7 +189,7 @@ impl IndexNode for LockedDevPtsFSInode {
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
-        todo!()
+        self
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {

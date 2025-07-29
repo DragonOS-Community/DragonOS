@@ -16,6 +16,8 @@ cfg_if! {
     }
 }
 
+const MAX_PANIC_COUNT: u8 = 2;
+
 #[derive(Debug)]
 struct PanicGuard;
 
@@ -58,7 +60,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
     println!("Message:\n\t{}", info.message());
-    if PANIC_COUNTER.load(core::sync::atomic::Ordering::Relaxed) > 8 {
+    if PANIC_COUNTER.load(core::sync::atomic::Ordering::Relaxed) > MAX_PANIC_COUNT {
         println!(
             "Panic Counter: {}, too many panics, halt.",
             PANIC_COUNTER.load(core::sync::atomic::Ordering::Relaxed)

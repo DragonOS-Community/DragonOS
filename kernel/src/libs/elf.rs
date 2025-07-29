@@ -787,13 +787,17 @@ impl BinaryLoader for ElfLoader {
                     e
                 ))
             })?;
+            let pwd = ProcessManager::current_pcb().pwd_inode();
+            let inode = pwd.lookup(interpreter_path).map_err(|_| {
+                log::error!("Failed to find interpreter path: {}", interpreter_path);
+                return ExecError::InvalidParemeter;
+            })?;
             // log::debug!("opening interpreter at :{}", interpreter_path);
             interpreter = Some(
-                ExecParam::new(interpreter_path, param.vm().clone(), ExecParamFlags::EXEC)
-                    .map_err(|e| {
-                        log::error!("Failed to load interpreter {interpreter_path}: {:?}", e);
-                        return ExecError::NotSupported;
-                    })?,
+                ExecParam::new(inode, param.vm().clone(), ExecParamFlags::EXEC).map_err(|e| {
+                    log::error!("Failed to load interpreter {interpreter_path}: {:?}", e);
+                    return ExecError::NotSupported;
+                })?,
             );
         }
         //TODO 缺少一部分逻辑 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#931

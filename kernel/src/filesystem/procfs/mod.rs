@@ -218,6 +218,14 @@ impl ProcFSInode {
             );
         }
 
+        // tty
+        let name = if let Some(tty) = pcb.sig_info_irqsave().tty() {
+            tty.core().name().clone()
+        } else {
+            "none".to_string()
+        };
+        pdata.append(&mut format!("\nTty:\t{}", name).as_bytes().to_owned());
+
         // kthread
         pdata.append(&mut format!("\nKthread:\t{}", pcb.is_kthread() as usize).into());
 

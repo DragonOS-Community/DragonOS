@@ -1033,11 +1033,6 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn tgid_old(&self) -> RawPid {
-        return self.tgid;
-    }
-
-    #[inline(always)]
     pub fn fs_struct(&self) -> Arc<FsStruct> {
         self.fs.read().clone()
     }

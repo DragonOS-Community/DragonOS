@@ -16,11 +16,11 @@ pub struct UserNamespace {
     parent: Option<Weak<UserNamespace>>,
     nscommon: NsCommon,
     self_ref: Weak<UserNamespace>,
-    inner: SpinLock<InnerUserNamespace>,
+    _inner: SpinLock<InnerUserNamespace>,
 }
 
 pub struct InnerUserNamespace {
-    children: Vec<Arc<UserNamespace>>,
+    _children: Vec<Arc<UserNamespace>>,
 }
 
 impl NamespaceOps for UserNamespace {
@@ -36,8 +36,8 @@ impl UserNamespace {
             self_ref: self_ref.clone(),
             nscommon: NsCommon::new(0, NamespaceType::User),
             parent: None,
-            inner: SpinLock::new(InnerUserNamespace {
-                children: Vec::new(),
+            _inner: SpinLock::new(InnerUserNamespace {
+                _children: Vec::new(),
             }),
         })
     }

@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::process::{fork::CloneFlags, ProcessControlBlock, ProcessManager};
-use core::{fmt::Debug, intrinsics::likely, sync::atomic::AtomicIsize};
+use core::{fmt::Debug, intrinsics::likely};
 
 use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
 

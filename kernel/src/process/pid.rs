@@ -257,6 +257,7 @@ impl PidLink {
     }
 
     /// 检查是否已链接PID
+    #[allow(dead_code)]
     pub fn is_linked(&self) -> bool {
         self.pid.read().is_some()
     }

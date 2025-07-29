@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicUsize;
 
 use alloc::vec::Vec;
@@ -8,7 +8,7 @@ use super::namespace::user_namespace::{UserNamespace, INIT_USER_NAMESPACE};
 const GLOBAL_ROOT_UID: Kuid = Kuid(0);
 const GLOBAL_ROOT_GID: Kgid = Kgid(0);
 lazy_static::lazy_static! {
-    pub static ref INIT_CRED: Cred = Cred::init();
+    pub static ref INIT_CRED: Arc<Cred> = Cred::init();
 }
 
 int_like!(Kuid, AtomicKuid, usize, AtomicUsize);
@@ -30,6 +30,7 @@ pub enum CredFsCmp {
 /// 凭证集
 #[derive(Debug, Clone)]
 pub struct Cred {
+    pub self_ref: Weak<Cred>,
     /// 进程实际uid
     pub uid: Kuid,
     /// 进程实际gid
@@ -62,8 +63,9 @@ pub struct Cred {
 }
 
 impl Cred {
-    fn init() -> Self {
-        Self {
+    fn init() -> Arc<Self> {
+        Arc::new_cyclic(|weak_self| Self {
+            self_ref: weak_self.clone(),
             uid: GLOBAL_ROOT_UID,
             gid: GLOBAL_ROOT_GID,
             suid: GLOBAL_ROOT_UID,
@@ -79,65 +81,72 @@ impl Cred {
             cap_ambient: CAPFlags::CAP_FULL_SET,
             group_info: None,
             user_ns: INIT_USER_NAMESPACE.clone(),
-        }
+        })
     }
 
-    // #[allow(dead_code)]
-    // /// Compare two credentials with respect to filesystem access.
-    // pub fn fscmp(&self, other: Cred) -> CredFsCmp {
-    //     // todo: 这里判断相等的逻辑不对，Cred应该是Arc才对吧
-    //     if *self == other {
-    //         return CredFsCmp::Equal;
-    //     }
+    pub fn new_arc(cred: Cred) -> Arc<Self> {
+        Arc::new_cyclic(|weak_self| {
+            let mut new_cred = cred;
+            new_cred.self_ref = weak_self.clone();
+            new_cred
+        })
+    }
 
-    //     if self.fsuid < other.fsuid {
-    //         return CredFsCmp::Less;
-    //     }
-    //     if self.fsuid > other.fsuid {
-    //         return CredFsCmp::Greater;
-    //     }
+    #[allow(dead_code)]
+    /// Compare two credentials with respect to filesystem access.
+    pub fn fscmp(&self, other: Arc<Cred>) -> CredFsCmp {
+        if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &other) {
+            return CredFsCmp::Equal;
+        }
 
-    //     if self.fsgid < other.fsgid {
-    //         return CredFsCmp::Less;
-    //     }
-    //     if self.fsgid > other.fsgid {
-    //         return CredFsCmp::Greater;
-    //     }
+        if self.fsuid < other.fsuid {
+            return CredFsCmp::Less;
+        }
+        if self.fsuid > other.fsuid {
+            return CredFsCmp::Greater;
+        }
 
-    //     if self.group_info == other.group_info {
-    //         return CredFsCmp::Equal;
-    //     }
+        if self.fsgid < other.fsgid {
+            return CredFsCmp::Less;
+        }
+        if self.fsgid > other.fsgid {
+            return CredFsCmp::Greater;
+        }
 
-    //     if let (Some(ga), Some(gb)) = (&self.group_info, &other.group_info) {
-    //         let ga_count = ga.gids.len();
-    //         let gb_count = gb.gids.len();
+        if self.group_info == other.group_info {
+            return CredFsCmp::Equal;
+        }
 
-    //         if ga_count < gb_count {
-    //             return CredFsCmp::Less;
-    //         }
-    //         if ga_count > gb_count {
-    //             return CredFsCmp::Greater;
-    //         }
+        if let (Some(ga), Some(gb)) = (&self.group_info, &other.group_info) {
+            let ga_count = ga.gids.len();
+            let gb_count = gb.gids.len();
 
-    //         for i in 0..ga_count {
-    //             if ga.gids[i] < gb.gids[i] {
-    //                 return CredFsCmp::Less;
-    //             }
-    //             if ga.gids[i] > gb.gids[i] {
-    //                 return CredFsCmp::Greater;
-    //             }
-    //         }
-    //     } else {
-    //         if self.group_info.is_none() {
-    //             return CredFsCmp::Less;
-    //         }
-    //         if other.group_info.is_none() {
-    //             return CredFsCmp::Greater;
-    //         }
-    //     }
+            if ga_count < gb_count {
+                return CredFsCmp::Less;
+            }
+            if ga_count > gb_count {
+                return CredFsCmp::Greater;
+            }
 
-    //     return CredFsCmp::Equal;
-    // }
+            for i in 0..ga_count {
+                if ga.gids[i] < gb.gids[i] {
+                    return CredFsCmp::Less;
+                }
+                if ga.gids[i] > gb.gids[i] {
+                    return CredFsCmp::Greater;
+                }
+            }
+        } else {
+            if self.group_info.is_none() {
+                return CredFsCmp::Less;
+            }
+            if other.group_info.is_none() {
+                return CredFsCmp::Greater;
+            }
+        }
+
+        return CredFsCmp::Equal;
+    }
 
     pub fn setuid(&mut self, uid: usize) {
         self.uid.0 = uid;

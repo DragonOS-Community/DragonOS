@@ -20,6 +20,7 @@ pub enum NamespaceType {
 }
 
 /// Namespace 通用操作接口
+#[allow(dead_code)]
 pub trait NamespaceOps: Send + Sync {
     /// 返回公共字段，便于统一处理
     fn ns_common(&self) -> &NsCommon;

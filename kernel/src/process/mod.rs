@@ -774,7 +774,7 @@ pub struct ProcessControlBlock {
     robust_list: RwLock<Option<RobustListHead>>,
 
     /// 进程作为主体的凭证集
-    cred: SpinLock<Cred>,
+    cred: SpinLock<Arc<Cred>>,
     self_ref: Weak<ProcessControlBlock>,
 
     restart_block: SpinLock<Option<RestartBlock>>,
@@ -828,24 +828,33 @@ impl ProcessControlBlock {
             ProcessManager::current_pcb().nsproxy().clone()
         };
 
-        let (raw_pid, ppid, cwd, cred, tty): (RawPid, RawPid, String, Cred, Option<Arc<TtyCore>>) =
-            if is_idle {
-                let cred = INIT_CRED.clone();
-                (RawPid(0), RawPid(0), "/".to_string(), cred, None)
-            } else {
-                let ppid = ProcessManager::current_pcb().task_pid_vnr();
-                let mut cred = ProcessManager::current_pcb().cred();
-                cred.cap_permitted = cred.cap_ambient;
-                cred.cap_effective = cred.cap_ambient;
-                let cwd = ProcessManager::current_pcb().basic().cwd();
-                let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
+        let (raw_pid, ppid, cwd, cred, tty): (
+            RawPid,
+            RawPid,
+            String,
+            Arc<Cred>,
+            Option<Arc<TtyCore>>,
+        ) = if is_idle {
+            let cred = INIT_CRED.clone();
+            (RawPid(0), RawPid(0), "/".to_string(), cred, None)
+        } else {
+            let ppid = ProcessManager::current_pcb().task_pid_vnr();
+            let cred = ProcessManager::current_pcb().cred();
+            if cred.cap_ambient != cred.cap_permitted || cred.cap_ambient != cred.cap_effective {
+                todo!("create a new cred for child.")
+                //     cred.cap_permitted = cred.cap_ambient;
+                // cred.cap_effective = cred.cap_ambient;
+            }
 
-                // Here, UNASSIGNED is used to represent an unallocated pid,
-                // which will be allocated later in `copy_process`.
-                let raw_pid = RawPid::UNASSIGNED;
+            let cwd = ProcessManager::current_pcb().basic().cwd();
+            let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
 
-                (raw_pid, ppid, cwd, cred, tty)
-            };
+            // Here, UNASSIGNED is used to represent an unallocated pid,
+            // which will be allocated later in `copy_process`.
+            let raw_pid = RawPid::UNASSIGNED;
+
+            (raw_pid, ppid, cwd, cred, tty)
+        };
 
         let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
         let preempt_count = AtomicUsize::new(0);
@@ -1048,7 +1057,7 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn cred(&self) -> Cred {
+    pub fn cred(&self) -> Arc<Cred> {
         self.cred.lock().clone()
     }
 

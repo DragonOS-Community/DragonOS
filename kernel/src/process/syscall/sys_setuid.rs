@@ -3,8 +3,10 @@ use crate::arch::syscall::nr::SYS_SETUID;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
+
 pub struct SysSetUid;
 
 impl SysSetUid {
@@ -23,12 +25,15 @@ impl Syscall for SysSetUid {
         let pcb = ProcessManager::current_pcb();
         let mut guard = pcb.cred.lock();
 
-        if guard.uid.data() == 0 {
-            guard.setuid(uid);
-            guard.seteuid(uid);
-            guard.setsuid(uid);
-        } else if uid == guard.uid.data() || uid == guard.suid.data() {
-            guard.seteuid(uid);
+        let old_cred = guard.clone();
+        let new_cred_mut = Arc::make_mut(&mut guard);
+
+        if old_cred.uid.data() == 0 {
+            new_cred_mut.setuid(uid);
+            new_cred_mut.seteuid(uid);
+            new_cred_mut.setsuid(uid);
+        } else if uid == old_cred.uid.data() || uid == old_cred.suid.data() {
+            new_cred_mut.seteuid(uid);
         } else {
             return Err(SystemError::EPERM);
         }

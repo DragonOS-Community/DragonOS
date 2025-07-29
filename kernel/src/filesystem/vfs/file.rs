@@ -128,7 +128,7 @@ pub struct File {
     readdir_subdirs_name: SpinLock<Vec<String>>,
     pub private_data: SpinLock<FilePrivateData>,
     /// 文件的凭证
-    cred: Cred,
+    cred: Arc<Cred>,
 }
 
 impl File {

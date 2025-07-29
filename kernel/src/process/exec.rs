@@ -195,13 +195,15 @@ impl ExecParam {
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
 fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+    ProcessManager::current_pcb()
+        .sig_struct_irqsave()
+        .reset_sighandlers();
     // todo: 该函数未正确实现
     let tg_empty = pcb.threads_read_irqsave().thread_group_empty();
     if tg_empty {
         pcb.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
         return Ok(());
     }
-    *ProcessManager::current_pcb().sig_struct_irqsave() = SignalStruct::default();
     log::warn!("de_thread: todo impl thread group logic");
 
     return Ok(());

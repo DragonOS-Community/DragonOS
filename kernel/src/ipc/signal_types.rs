@@ -101,6 +101,11 @@ impl SignalStruct {
 
         r
     }
+
+    pub fn reset_sighandlers(&mut self) {
+        // 重置信号处理程序
+        self.inner.handlers = default_sighandlers();
+    }
 }
 
 impl Default for SignalStruct {

@@ -1,6 +1,6 @@
-use core::fmt::Debug;
-
 use alloc::sync::{Arc, Weak};
+use core::cmp::Ordering;
+use core::fmt::Debug;
 
 use crate::libs::spinlock::SpinLock;
 
@@ -65,17 +65,17 @@ impl UserNamespace {
         let self_level = self.level();
         loop {
             let current_level = current.level();
-            if current_level > self_level {
-                if let Some(parent) = current.parent.as_ref().and_then(|p| p.upgrade()) {
-                    current = parent;
-                    continue;
-                } else {
-                    return false;
+            match current_level.cmp(&self_level) {
+                Ordering::Greater => {
+                    if let Some(parent) = current.parent.as_ref().and_then(|p| p.upgrade()) {
+                        current = parent;
+                        continue;
+                    } else {
+                        return false;
+                    }
                 }
-            } else if current_level == self_level {
-                return Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &current);
-            } else {
-                return false;
+                Ordering::Equal => return Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &current),
+                Ordering::Less => return false,
             }
         }
     }

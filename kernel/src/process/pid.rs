@@ -163,10 +163,8 @@ impl Drop for Pid {
     fn drop(&mut self) {
         // 清理numbers中的UPid引用
         let numbers_guard = self.numbers.lock();
-        for upid in numbers_guard.iter() {
-            if let Some(upid) = upid {
-                upid.ns.release_pid_in_ns(upid.nr);
-            }
+        for upid in numbers_guard.iter().flatten() {
+            upid.ns.release_pid_in_ns(upid.nr);
         }
     }
 }

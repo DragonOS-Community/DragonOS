@@ -70,10 +70,8 @@ impl Syscall for SysSetPgid {
             if !p.flags().contains(ProcessFlags::FORKNOEXEC) {
                 return Err(SystemError::EACCES);
             }
-        } else {
-            if !Arc::ptr_eq(&p, &group_leader) {
-                return Err(SystemError::ESRCH);
-            }
+        } else if !Arc::ptr_eq(&p, &group_leader) {
+            return Err(SystemError::ESRCH);
         }
 
         if p.sig_info_irqsave().is_session_leader {

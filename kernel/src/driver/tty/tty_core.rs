@@ -298,7 +298,7 @@ impl TtyControlInfo {
     }
 
     /// 清除当前session的pid
-    /// 
+    ///
     /// 如果当前session已经死了，则将其清除。
     pub fn clear_dead_session(&mut self) {
         if self.session.is_none() {

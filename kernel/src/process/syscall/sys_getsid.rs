@@ -30,15 +30,14 @@ impl Syscall for SysGetsid {
     /// - pid: 指定一个进程号
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = Self::pid(args);
-        let sid;
-        if pid.data() == 0 {
-            sid = ProcessManager::current_pcb()
+        let sid = if pid.data() == 0 {
+            ProcessManager::current_pcb()
                 .task_session()
-                .ok_or(SystemError::ESRCH)?;
+                .ok_or(SystemError::ESRCH)?
         } else {
             let p = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
-            sid = p.task_session().ok_or(SystemError::ESRCH)?;
-        }
+            p.task_session().ok_or(SystemError::ESRCH)?
+        };
         return Ok(sid.pid_vnr().into());
     }
 

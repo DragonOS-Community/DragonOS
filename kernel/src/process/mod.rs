@@ -1070,11 +1070,7 @@ impl ProcessControlBlock {
     }
 
     pub fn real_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
-        return self
-            .real_parent_pcb
-            .read_irqsave()
-            .upgrade()
-            .map(|p| p.clone());
+        return self.real_parent_pcb.read_irqsave().upgrade();
     }
 
     /// 判断当前进程是否是全局的init进程

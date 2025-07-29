@@ -140,7 +140,7 @@ impl PidNamespace {
             self_ref: self_ref.clone(),
             ns_common: NsCommon::new(level, NamespaceType::Pid),
             parent: Some(self.self_ref.clone()),
-            user_ns: user_ns,
+            user_ns,
             inner: SpinLock::new(InnerPidNamespace {
                 child_reaper: None,
                 dead: false,
@@ -176,7 +176,7 @@ impl PidNamespace {
     pub fn delete_current_pidns_in_parent(&self) {
         let current = self.self_ref.upgrade().unwrap();
         if let Some(p) = self.parent() {
-            p.inner().children.retain(|c| !Arc::ptr_eq(&c, &current));
+            p.inner().children.retain(|c| !Arc::ptr_eq(c, &current));
         }
     }
 }

@@ -8,7 +8,6 @@ use crate::process::Signal;
 use crate::{
     driver::base::block::SeekFrom,
     filesystem::vfs::file::{File, FileMode},
-    ipc::signal_types::SignalStruct,
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},

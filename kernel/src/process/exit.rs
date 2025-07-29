@@ -54,7 +54,7 @@ pub fn kernel_wait4(
     options: WaitOption,
     rusage_buf: Option<&mut RUsage>,
 ) -> Result<usize, SystemError> {
-    let converter = PidConverter::from_id(pid);
+    let converter = PidConverter::from_id(pid).ok_or(SystemError::ESRCH)?;
 
     // 构造参数
     let mut kwo = KernelWaitOption::new(converter, options);
@@ -110,7 +110,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
         kwo.no_task_error = Some(SystemError::ECHILD);
         match &kwo.pid_converter {
             PidConverter::Pid(pid) => {
-                let child_pcb = ProcessManager::find(*pid)
+                let child_pcb = pid
+                    .pid_task(PidType::PID)
                     .ok_or(SystemError::ECHILD)
                     .unwrap();
                 // 获取weak引用，以便于在do_waitpid中能正常drop pcb
@@ -136,7 +137,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         break;
                     }
                     for pid in rd_childen.iter() {
-                        let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
+                        let pcb =
+                            ProcessManager::find_task_by_vpid(*pid).ok_or(SystemError::ECHILD)?;
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
                         if state.is_exited() {
@@ -146,7 +148,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             // 而是要先break到外层循环，以便释放父进程的children字段的锁,才能drop pcb。
                             // 否则会死锁。
                             tmp_child_pcb = Some(pcb.clone());
-                            unsafe { ProcessManager::release(*pid) };
+                            unsafe { ProcessManager::release(pcb.raw_pid()) };
                             retval = Ok((*pid).into());
                             break 'outer;
                         }
@@ -167,9 +169,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             // 而是要先break到外层循环，以便释放父进程的children字段的锁,才能drop pcb。
                             // 否则会死锁。
                             tmp_child_pcb = Some(pcb.clone());
-                            let pid = pcb.raw_pid();
-                            unsafe { ProcessManager::release(pid) };
-                            retval = Ok((pid).into());
+                            unsafe { ProcessManager::release(pcb.raw_pid()) };
+                            retval = Ok(pcb.task_pid_vnr().into());
                             break 'outer;
                         }
                     }
@@ -252,8 +253,13 @@ fn do_waitpid(
             return Some(Ok(child_pcb.raw_pid().data()));
         }
         ProcessState::Exited(status) => {
-            let pid = child_pcb.raw_pid();
-            // debug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
+            let pid = child_pcb.task_pid_vnr();
+            // log::debug!(
+            //     "wait4: current: {}, child exited, pid: {:?}, status: {status}, \n kwo.opt: {:?}",
+            //     ProcessManager::current_pid().data(),
+            //     child_pcb.raw_pid(),
+            //     kwo.options
+            // );
 
             if likely(!kwo.options.contains(WaitOption::WEXITED)) {
                 return None;
@@ -271,9 +277,9 @@ fn do_waitpid(
 
             kwo.ret_status = status as i32;
 
-            drop(child_pcb);
             // debug!("wait4: to release {pid:?}");
-            unsafe { ProcessManager::release(pid) };
+            unsafe { ProcessManager::release(child_pcb.raw_pid()) };
+            drop(child_pcb);
             return Some(Ok(pid.into()));
         }
     };
@@ -287,6 +293,12 @@ impl ProcessControlBlock {
         let group_dead = self.is_thread_group_leader();
         let mut sig_guard = self.sig_info_mut();
         let mut tty: Option<Arc<TtyCore>> = None;
+        // log::debug!(
+        //     "Process {} is exiting, group_dead: {}, state: {:?}",
+        //     self.raw_pid(),
+        //     group_dead,
+        //     self.sched_info().inner_lock_read_irqsave().state()
+        // );
         if group_dead {
             tty = sig_guard.tty();
             sig_guard.set_tty(None);

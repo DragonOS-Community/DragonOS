@@ -44,7 +44,7 @@ impl KernelThreadMechanism {
             unsafe { KernelThreadCreateInfo::parse_unsafe_arc_ptr(create_info) };
         })?;
 
-        ProcessManager::find(pid)
+        ProcessManager::find_task_by_vpid(pid)
             .unwrap()
             .set_name(info.name().clone());
 

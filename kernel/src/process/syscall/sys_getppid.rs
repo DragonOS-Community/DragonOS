@@ -1,6 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETPPID;
 use crate::process::ProcessManager;
+use crate::process::RawPid;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
@@ -19,7 +20,7 @@ impl Syscall for SysGetPpid {
         let parent_pcb = current_pcb.real_parent_pcb.read_irqsave().clone();
         let parent_pcb = parent_pcb.upgrade().ok_or(SystemError::ESRCH)?;
 
-        let r = parent_pcb.task_tgid_vnr().ok_or(SystemError::ESRCH)?;
+        let r = parent_pcb.task_tgid_vnr().unwrap_or(RawPid::new(0));
         return Ok(r.into());
     }
 

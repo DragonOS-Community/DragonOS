@@ -151,20 +151,19 @@ impl TtyDevice {
         dev_num: DeviceNumber,
         data: &mut FilePrivateData,
     ) -> Option<Arc<TtyCore>> {
-        log::debug!("open_current_tty: dev_num: {}", dev_num);
+        // log::debug!("open_current_tty: dev_num: {}", dev_num);
         if dev_num != DeviceNumber::new(Major::TTYAUX_MAJOR, 0) {
-            log::debug!("Not a tty device, dev_num: {}", dev_num);
+            // log::debug!("Not a tty device, dev_num: {}", dev_num);
             return None;
         }
-        log::debug!("oct-3");
+
         let current_tty = TtyJobCtrlManager::get_current_tty()?;
 
         if let FilePrivateData::Tty(tty_priv) = data {
             tty_priv.mode.insert(FileMode::O_NONBLOCK);
         }
-        log::debug!("oct-4");
+
         current_tty.reopen().ok()?;
-        log::debug!("oct-5");
         Some(current_tty)
     }
 }
@@ -211,20 +210,20 @@ impl IndexNode for TtyDevice {
         mut data: SpinLockGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
-        // if let FilePrivateData::Tty(_) = &*data {
-        //     return Ok(());
-        // }
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
             return ptmx_open(data, mode);
         }
         let dev_num = self.metadata()?.raw_dev;
-        log::debug!("op-1");
+        // log::debug!(
+        //     "TtyDevice::open: dev_num: {}, current pid: {}",
+        //     dev_num,
+        //     ProcessManager::current_pid()
+        // );
         let mut tty = self.open_current_tty(dev_num, &mut data);
         if tty.is_none() {
             let (index, driver) =
                 TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
 
-            log::debug!("op-2");
             tty = Some(driver.open_tty(Some(index))?);
         }
 
@@ -236,17 +235,17 @@ impl IndexNode for TtyDevice {
             mode: *mode,
         });
 
+        tty.core().contorl_info_irqsave().clear_dead_session();
+
         let ret = tty.open(tty.core());
         if let Err(err) = ret {
             if err == SystemError::ENOSYS {
-                log::debug!("op-3");
                 return Err(SystemError::ENODEV);
             }
             return Err(err);
         }
 
         let driver = tty.core().driver();
-        log::debug!("op-4: mode: {:?}", mode);
         // 考虑noctty（当前tty）
         if !(mode.contains(FileMode::O_NOCTTY) && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
             || dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 1)
@@ -257,17 +256,7 @@ impl IndexNode for TtyDevice {
             let pcb_tty = pcb.sig_info_irqsave().tty();
 
             let cond1 = pcb_tty.is_none();
-            let cond2 = tty.core().contorl_info_irqsave().session.is_none();
-            log::debug!(
-                "op-5: cond1: {}, cond2: {}, tty: {:?}",
-                cond1,
-                cond2,
-                tty.core()
-                    .contorl_info_irqsave()
-                    .session
-                    .as_ref()
-                    .map(|s| s.pid_vnr())
-            );
+            let _cond2 = tty.core().contorl_info_irqsave().session.is_none();
 
             // 注意！！这里为了debug,临时把cond2的判断去掉了，其实要cond1 && cond2才对
             if cond1 {
@@ -400,6 +389,7 @@ impl IndexNode for TtyDevice {
         } else {
             return Err(SystemError::EIO);
         };
+
         drop(data);
         tty.close(tty.clone())
     }

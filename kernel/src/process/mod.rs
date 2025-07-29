@@ -374,7 +374,9 @@ impl ProcessManager {
         }
         return Err(SystemError::EINTR);
     }
+
     /// 当子进程退出后向父进程发送通知
+    #[inline(never)]
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
         // 让INIT进程收养所有子进程
@@ -389,15 +391,16 @@ impl ProcessManager {
                 return;
             }
             let parent_pcb = r.unwrap();
-            let r = crate::ipc::kill::kill_process(parent_pcb.raw_pid(), Signal::SIGCHLD);
-            if r.is_err() {
+
+            let r = crate::ipc::kill::kill_process_by_pcb(parent_pcb.clone(), Signal::SIGCHLD);
+            if let Err(e) = r {
                 warn!(
-                    "failed to send kill signal to {:?}'s parent pcb {:?}",
+                    "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
                     current.raw_pid(),
-                    parent_pcb.raw_pid()
+                    parent_pcb.raw_pid(),
+                    e
                 );
             }
-            // todo: 这里需要向父进程发送SIGCHLD信号
             // todo: 这里还需要根据线程组的信息，决定信号的发送
         }
     }
@@ -497,7 +500,12 @@ impl ProcessManager {
         }
     }
 
-    pub unsafe fn release(pid: RawPid) {
+    /// 从全局进程列表中删除一个进程
+    ///
+    /// # 参数
+    ///
+    /// - `pid` : 进程的**全局** pid
+    pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if pcb.is_some() {
             // log::debug!("release pid {}", pid);
@@ -584,6 +592,17 @@ int_like!(RawPid, AtomicRawPid, usize, AtomicUsize);
 impl fmt::Display for RawPid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl RawPid {
+    /// 该RawPid暂未分配，待会会初始化它。
+    /// 这个状态只应当出现在进程/线程创建的过程中
+    pub const UNASSIGNED: RawPid = RawPid(usize::MAX - 1);
+    pub const MAX_VALID: RawPid = RawPid(usize::MAX - 32);
+
+    pub fn is_valid(&self) -> bool {
+        self.0 >= Self::MAX_VALID.0
     }
 }
 
@@ -809,42 +828,24 @@ impl ProcessControlBlock {
             ProcessManager::current_pcb().nsproxy().clone()
         };
 
-        let (raw_pid, ppid, cwd, cred, tty, main_pid_opt): (
-            RawPid,
-            RawPid,
-            String,
-            Cred,
-            Option<Arc<TtyCore>>,
-            Option<Arc<Pid>>,
-        ) = if is_idle {
-            let cred = INIT_CRED.clone();
-            (RawPid(0), RawPid(0), "/".to_string(), cred, None, None)
-        } else {
-            let ppid = ProcessManager::current_pcb().raw_pid();
-            let mut cred = ProcessManager::current_pcb().cred();
-            cred.cap_permitted = cred.cap_ambient;
-            cred.cap_effective = cred.cap_ambient;
-            let cwd = ProcessManager::current_pcb().basic().cwd();
-            let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
-            // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
-            let parent_ns = ProcessManager::current_pcb()
-                .nsproxy()
-                .pid_namespace_for_children()
-                .clone();
+        let (raw_pid, ppid, cwd, cred, tty): (RawPid, RawPid, String, Cred, Option<Arc<TtyCore>>) =
+            if is_idle {
+                let cred = INIT_CRED.clone();
+                (RawPid(0), RawPid(0), "/".to_string(), cred, None)
+            } else {
+                let ppid = ProcessManager::current_pcb().task_pid_vnr();
+                let mut cred = ProcessManager::current_pcb().cred();
+                cred.cap_permitted = cred.cap_ambient;
+                cred.cap_effective = cred.cap_ambient;
+                let cwd = ProcessManager::current_pcb().basic().cwd();
+                let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
 
-            let main_pid_arc = alloc_pid(&parent_ns).expect("alloc_pid failed");
+                // Here, UNASSIGNED is used to represent an unallocated pid,
+                // which will be allocated later in `copy_process`.
+                let raw_pid = RawPid::UNASSIGNED;
 
-            // 根namespace中的PID号作为RawPid
-            let root_pid_nr = main_pid_arc
-                .first_upid()
-                .expect("UPid list empty")
-                .nr
-                .data();
-
-            let raw_pid = RawPid(root_pid_nr);
-
-            (raw_pid, ppid, cwd, cred, tty, Some(main_pid_arc))
-        };
+                (raw_pid, ppid, cwd, cred, tty)
+            };
 
         let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
         let preempt_count = AtomicUsize::new(0);
@@ -852,7 +853,7 @@ impl ProcessControlBlock {
 
         let sched_info = ProcessSchedulerInfo::new(None);
 
-        let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
+        let ppcb: Weak<ProcessControlBlock> = ProcessManager::find_task_by_vpid(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
 
@@ -918,31 +919,6 @@ impl ProcessControlBlock {
                 .set_pcb(Arc::downgrade(&pcb))
                 .unwrap()
         };
-
-        // 将当前pcb加入父进程的子进程哈希表中
-        if pcb.raw_pid() > RawPid(1) {
-            if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
-                let mut children = ppcb_arc.children.write_irqsave();
-                children.push(pcb.raw_pid());
-            } else {
-                panic!("parent pcb is None");
-            }
-        }
-
-        if pcb.raw_pid() > RawPid(0) && !is_idle {
-            ProcessManager::add_pcb(pcb.clone());
-        }
-
-        // 初始化PID链接（仅非idle分支需要）
-        if let Some(main_pid_arc) = main_pid_opt {
-            pcb.init_task_pid(PidType::PID, main_pid_arc);
-        }
-        // log::debug!(
-        //     "A new process is created, pid: {:?}, pgid: {:?}, sid: {:?}",
-        //     pcb.pid(),
-        //     pcb.process_group().unwrap().pgid(),
-        //     pcb.session().unwrap().sid()
-        // );
 
         return pcb;
     }
@@ -1125,12 +1101,53 @@ impl ProcessControlBlock {
 
     /// 当前进程退出时,让初始进程收养所有子进程
     unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
-        match ProcessManager::find(RawPid(1)) {
+        match ProcessManager::find_task_by_vpid(RawPid(1)) {
             Some(init_pcb) => {
                 let childen_guard = self.children.write();
+                if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &init_pcb) {
+                    // 当前进程是namespace的init进程，由父进程所在的pidns的init进程去收养子进程
+                    if let Some(parent_pcb) = self.real_parent_pcb() {
+                        assert!(
+                            !Arc::ptr_eq(&parent_pcb, &init_pcb),
+                            "adopt_childen: parent_pcb is init_pcb, pid: {}",
+                            self.raw_pid()
+                        );
+                        let parent_init = ProcessManager::find_task_by_pid_ns(
+                            RawPid(1),
+                            &parent_pcb.active_pid_ns(),
+                        );
+                        if parent_init.is_none() {
+                            log::warn!(
+                                "adopt_childen: parent_init is None, pid: {}",
+                                self.raw_pid()
+                            );
+                            return Ok(());
+                        }
+                        let parent_init = parent_init.unwrap();
+                        let mut parent_children_guard = parent_init.children.write();
+                        childen_guard.iter().for_each(|pid| {
+                            log::debug!(
+                                "adopt_childen: pid {} is adopted by parent init pid {}",
+                                pid,
+                                parent_init.raw_pid()
+                            );
+                            parent_children_guard.push(*pid);
+                        });
+
+                        return Ok(());
+                    } else {
+                        log::warn!("adopt_childen: parent_pcb is None, pid: {}", self.raw_pid());
+                        return Ok(());
+                    }
+                }
                 let mut init_childen_guard = init_pcb.children.write();
 
                 childen_guard.iter().for_each(|pid| {
+                    log::debug!(
+                        "adopt_childen: pid {} is adopted by init pid {}",
+                        pid,
+                        init_pcb.raw_pid()
+                    );
                     init_childen_guard.push(*pid);
                 });
 
@@ -1324,6 +1341,7 @@ impl ProcessControlBlock {
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
         self.__exit_signal();
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.raw_pid())

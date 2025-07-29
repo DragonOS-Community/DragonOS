@@ -1,7 +1,7 @@
 use crate::arch::ipc::signal::{SigCode, Signal};
 use crate::ipc::signal_types::{SigInfo, SigType};
 use crate::process::pid::{Pid, PidType};
-use crate::process::{ProcessManager, RawPid};
+use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
 use alloc::sync::Arc;
 use core::sync::atomic::compiler_fence;
 use system_error::SystemError;
@@ -20,6 +20,20 @@ pub fn kill_process(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
     ret
 }
 
+/// 直接向指定进程发送信号，绕过PID namespace查找
+///
+/// 注意！这个函数不会检查目标进程是否在本pidns内，慎用！可能造成安全问题。
+pub fn kill_process_by_pcb(
+    pcb: Arc<ProcessControlBlock>,
+    sig: Signal,
+) -> Result<usize, SystemError> {
+    // 初始化signal info
+    let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pcb.raw_pid()));
+
+    return sig
+        .send_signal_info_to_pcb(Some(&mut info), pcb)
+        .map(|x| x as usize);
+}
 /// ### 杀死一个进程组
 ///
 /// 注意！这个函数的实现跟Linux不一致。

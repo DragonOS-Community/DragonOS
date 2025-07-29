@@ -81,8 +81,8 @@ impl Signal {
         if !self.is_valid() {
             return Err(SystemError::EINVAL);
         }
-        let mut retval = Err(SystemError::ESRCH);
-        let pcb = ProcessManager::find(pid);
+        let retval = Err(SystemError::ESRCH);
+        let pcb = ProcessManager::find_task_by_vpid(pid);
 
         if pcb.is_none() {
             warn!("No such process: pid={:?}", pid);
@@ -90,11 +90,22 @@ impl Signal {
         }
 
         let pcb = pcb.unwrap();
-        // println!("Target pcb = {:?}", pcb.as_ref().unwrap());
+        return self.send_signal_info_to_pcb(info, pcb);
+    }
+
+    /// 直接向指定进程发送信号，绕过PID namespace查找
+    pub fn send_signal_info_to_pcb(
+        &self,
+        info: Option<&mut SigInfo>,
+        pcb: Arc<ProcessControlBlock>,
+    ) -> Result<i32, SystemError> {
+        // 检查sig是否符合要求，如果不符合要求，则退出。
+        if !self.is_valid() {
+            return Err(SystemError::EINVAL);
+        }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 发送信号
-        retval = self.send_signal(info, pcb.clone(), PidType::PID);
-
+        let retval = self.send_signal(info, pcb, PidType::PID);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         return retval;
     }
@@ -608,7 +619,7 @@ fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
     // 暴力遍历每一个线程，找到相同的tgid
     let tgid = pcb.tgid_old();
     for &pid in pcb.children_read_irqsave().iter() {
-        if let Some(child) = ProcessManager::find(pid) {
+        if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
             if child.tgid_old() == tgid {
                 thread_handling_function(child, &retarget);
             }

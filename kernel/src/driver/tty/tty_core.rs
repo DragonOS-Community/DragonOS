@@ -26,6 +26,7 @@ use crate::{
 use super::{
     termios::{ControlMode, PosixTermios, Termios, TtySetTermiosOpt, WindowSize},
     tty_driver::{TtyCorePrivateField, TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
+    tty_job_control::TtyJobCtrlManager,
     tty_ldisc::{
         ntty::{NTtyData, NTtyLinediscipline},
         TtyLineDiscipline,
@@ -295,6 +296,20 @@ impl TtyControlInfo {
         self.session = pcb.task_session();
         self.pgid = pcb.task_pgrp();
     }
+
+    /// 清除当前session的pid
+    /// 
+    /// 如果当前session已经死了，则将其清除。
+    pub fn clear_dead_session(&mut self) {
+        if self.session.is_none() {
+            return;
+        }
+
+        let clean = self.session.as_ref().map(|s| s.dead()).unwrap();
+        if clean {
+            self.session = None;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -400,10 +415,21 @@ impl TtyCoreData {
         self.count.load(Ordering::SeqCst)
     }
 
+    pub fn count_valid(&self) -> bool {
+        let cnt = self.count();
+        // 暂时认为有效的count范围是(0, usize::MAX / 2)
+        cnt > 0 && cnt < usize::MAX / 2
+    }
+
     #[inline]
     pub fn add_count(&self) {
         self.count
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn dec_count(&self) -> usize {
+        self.count
+            .fetch_sub(1, core::sync::atomic::Ordering::SeqCst)
     }
 
     #[inline]
@@ -624,7 +650,15 @@ impl TtyOperation for TtyCore {
     }
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        self.core().tty_driver.driver_funcs().close(tty)
+        let r = self.core().tty_driver.driver_funcs().close(tty.clone());
+        self.core().dec_count();
+        // let cnt = self.core().count();
+        // log::debug!("TtyCore close: count: {cnt}, tty: {:?}", tty.core().name());
+        if !self.core().count_valid() {
+            // 如果计数为0或者无效，表示tty已经关闭
+            TtyJobCtrlManager::remove_session_tty(&tty);
+        }
+        r
     }
 
     fn resize(&self, tty: Arc<TtyCore>, winsize: WindowSize) -> Result<(), SystemError> {

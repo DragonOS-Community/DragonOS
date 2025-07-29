@@ -24,23 +24,24 @@ use crate::ipc::kill::{kill_all, kill_process, kill_process_group};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PidConverter {
     All,
-    Pid(RawPid),
+    Pid(Arc<Pid>),
     Pgid(Option<Arc<Pid>>),
 }
 
 impl PidConverter {
     /// ### 为 `wait` 和 `kill` 调用使用
-    pub fn from_id(id: i32) -> Self {
+    pub fn from_id(id: i32) -> Option<Self> {
         if id < -1 {
             let pgid = ProcessManager::find_vpid(RawPid::from(-id as usize));
-            PidConverter::Pgid(pgid)
+            Some(PidConverter::Pgid(pgid))
         } else if id == -1 {
-            PidConverter::All
+            Some(PidConverter::All)
         } else if id == 0 {
             let pgid = ProcessManager::current_pcb().task_pgrp().unwrap();
-            PidConverter::Pgid(Some(pgid))
+            Some(PidConverter::Pgid(Some(pgid)))
         } else {
-            PidConverter::Pid(RawPid::from(id as usize))
+            let pid = ProcessManager::find_vpid(RawPid::from(id as usize))?;
+            Some(PidConverter::Pid(pid))
         }
     }
 }
@@ -68,7 +69,7 @@ impl Syscall for SysKillHandle {
         let id = Self::pid(args);
         let sig_c_int = Self::sig(args);
 
-        let converter = PidConverter::from_id(id);
+        let converter = PidConverter::from_id(id).ok_or(SystemError::ESRCH)?;
         let sig = Signal::from(sig_c_int);
         if sig == Signal::INVALID {
             warn!("Not a valid signal number");
@@ -76,7 +77,7 @@ impl Syscall for SysKillHandle {
         }
 
         match converter {
-            PidConverter::Pid(pid) => kill_process(pid, sig),
+            PidConverter::Pid(pid) => kill_process(pid.pid_vnr(), sig),
             PidConverter::Pgid(pgid) => kill_process_group(&pgid.ok_or(SystemError::ESRCH)?, sig),
             PidConverter::All => kill_all(sig),
         }

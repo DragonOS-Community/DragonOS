@@ -32,12 +32,23 @@ pub struct PidNamespace {
 
 pub struct InnerPidNamespace {
     pub ns_common: NsCommon,
+    dead: bool,
     ida: IdAllocator,
     /// PID到进程的映射表
     pid_map: HashMap<RawPid, Arc<Pid>>,
     /// init进程引用
     child_reaper: Option<Weak<ProcessControlBlock>>,
     children: Vec<Arc<PidNamespace>>,
+}
+
+impl InnerPidNamespace {
+    pub fn dead(&self) -> bool {
+        self.dead
+    }
+
+    pub fn child_reaper(&self) -> &Option<Weak<ProcessControlBlock>> {
+        &self.child_reaper
+    }
 }
 
 impl PidNamespace {
@@ -53,6 +64,7 @@ impl PidNamespace {
             user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
             inner: SpinLock::new(InnerPidNamespace {
                 ns_common: NsCommon::default(),
+                dead: false,
                 child_reaper: None,
                 ida: IdAllocator::new(1, usize::MAX).unwrap(),
                 pid_map: HashMap::new(),
@@ -122,6 +134,7 @@ impl PidNamespace {
             inner: SpinLock::new(InnerPidNamespace {
                 ns_common: NsCommon::default(),
                 child_reaper: None,
+                dead: false,
                 ida: IdAllocator::new(1, usize::MAX).unwrap(),
                 pid_map: HashMap::new(),
                 children: Vec::new(),
@@ -161,6 +174,9 @@ impl PidNamespace {
 
 impl InnerPidNamespace {
     pub fn do_alloc_pid_in_ns(&mut self, pid: Arc<Pid>) -> Result<RawPid, SystemError> {
+        if self.dead {
+            return Err(SystemError::ESRCH);
+        }
         let raw_pid = self.ida.alloc().ok_or(SystemError::ENOMEM)?;
         let raw_pid = RawPid(raw_pid);
         self.pid_map.insert(raw_pid, pid);
@@ -168,12 +184,23 @@ impl InnerPidNamespace {
     }
 
     pub fn do_release_pid_in_ns(&mut self, raw_pid: RawPid) {
+        // log::debug!("do_release_pid_in_ns: raw_pid={}", raw_pid);
         self.pid_map.remove(&raw_pid);
         self.ida.free(raw_pid.data());
+        if self.pid_map.is_empty() {
+            // 如果当前namespace中没有任何PID了，则标记为dead
+            self.dead = true;
+        }
     }
 
     pub fn do_pid_allocated(&self) -> usize {
         self.pid_map.len()
+    }
+}
+
+impl Drop for PidNamespace {
+    fn drop(&mut self) {
+        // log::debug!("Dropping PidNamespace at level {}", self.level);
     }
 }
 

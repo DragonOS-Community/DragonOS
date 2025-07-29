@@ -1,4 +1,5 @@
 use core::fmt::Debug;
+use core::sync::atomic::AtomicBool;
 
 use crate::libs::rwlock::RwLock;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
@@ -31,6 +32,7 @@ impl PidType {
 pub struct Pid {
     self_ref: Weak<Pid>,
     pub level: u32,
+    dead: AtomicBool,
     /// 使用此PID的任务列表，按PID类型分组
     /// tasks[PidType::PID as usize] = 使用该PID作为进程ID的任务
     /// tasks[PidType::TGID as usize] = 使用该PID作为线程组ID的任务
@@ -49,6 +51,7 @@ impl Pid {
     fn new(level: u32) -> Arc<Self> {
         let pid = Arc::new_cyclic(|weak_self| Self {
             self_ref: weak_self.clone(),
+            dead: AtomicBool::new(false),
             level,
             tasks: core::array::from_fn(|_| SpinLock::new(Vec::new())),
             numbers: SpinLock::new(vec![None; level as usize + 1]),
@@ -56,6 +59,15 @@ impl Pid {
 
         pid
     }
+
+    pub fn dead(&self) -> bool {
+        self.dead.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_dead(&self) {
+        self.dead.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
     /// 获取指定PID所属的命名空间
     ///
     /// 返回该PID被分配时所在的PID命名空间的引用(Arc封装)
@@ -117,10 +129,11 @@ impl Pid {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c#475
     pub fn pid_nr_ns(&self, ns: &Arc<PidNamespace>) -> RawPid {
         if ns.level <= self.level {
-            let upid = self.numbers.lock()[ns.level as usize]
+            let numbers = self.numbers.lock();
+            let upid = numbers[ns.level as usize]
                 .as_ref()
                 .cloned()
-                .expect("pid numbers should not be empty");
+                .unwrap_or_else(|| panic!("pid numbers should not be empty: ns.level={}, self.level={}, numbers.len={}", ns.level, self.level, numbers.len()));
             if Arc::ptr_eq(&upid.ns, ns) {
                 return upid.nr;
             }
@@ -145,6 +158,18 @@ impl PartialEq for Pid {
 }
 
 impl Eq for Pid {}
+
+impl Drop for Pid {
+    fn drop(&mut self) {
+        // 清理numbers中的UPid引用
+        let numbers_guard = self.numbers.lock();
+        for upid in numbers_guard.iter() {
+            if let Some(upid) = upid {
+                upid.ns.release_pid_in_ns(upid.nr);
+            }
+        }
+    }
+}
 
 pub struct PidTaskIterator<'a> {
     guard: SpinLockGuard<'a, Vec<Weak<ProcessControlBlock>>>,
@@ -191,6 +216,13 @@ impl Debug for UPid {
 impl ProcessControlBlock {
     pub fn pid(&self) -> Arc<Pid> {
         self.thread_pid.read().clone().unwrap()
+    }
+
+    /// 强制设置当前进程的raw_pid
+    /// 注意：这个函数应该在创建进程时调用，不能在运行时随意调用
+    pub(super) unsafe fn force_set_raw_pid(&self, pid: RawPid) {
+        let self_mut = self as *const Self as *mut Self;
+        (*self_mut).pid = pid;
     }
 }
 
@@ -301,20 +333,31 @@ fn cleanup_allocated_pids(pid: Arc<Pid>, mut allocated_upids: Vec<(isize, UPid)>
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c#129
 pub(super) fn free_pid(pid: Arc<Pid>) {
     // 释放PID
-
+    pid.set_dead();
+    // let raw_pid = pid.pid_vnr().data();
     let mut level = 0;
     while level <= pid.level {
         let upid = pid.numbers.lock()[level as usize]
             .take()
             .expect("pid numbers should not be empty");
+        // log::debug!(
+        //     "Freeing pid: raw:{}, upid.nr:{}, level: {}",
+        //     raw_pid,
+        //     upid.nr.data(),
+        //     level
+        // );
         let mut ns_guard = upid.ns.inner();
         let pid_allocated_after_free = ns_guard.do_pid_allocated() - 1;
         if pid_allocated_after_free == 1 || pid_allocated_after_free == 2 {
-            if let Some(child_reaper) = upid.ns.child_reaper().as_ref().and_then(|x| x.upgrade()) {
+            if let Some(child_reaper) = ns_guard.child_reaper().as_ref().and_then(|x| x.upgrade()) {
                 ProcessManager::wakeup(&child_reaper).ok();
             }
         }
         ns_guard.do_release_pid_in_ns(upid.nr);
+        if ns_guard.dead() {
+            // log::debug!("Releasing pid namespace with level {}", level);
+            upid.ns.delete_current_pidns_in_parent();
+        }
         level += 1;
     }
 }
@@ -342,6 +385,29 @@ impl ProcessControlBlock {
         self.__task_pid_nr_ns(PidType::PID, None).unwrap()
     }
 
+    /// 获取进程在指定PID命名空间中的PID号
+    ///
+    /// 根据指定的PID类型和命名空间，返回进程对应的PID值。
+    /// 如果未指定命名空间，则使用当前进程的活跃PID命名空间。
+    ///
+    /// # 参数
+    /// * `pid_type` - PID类型（进程ID、线程组ID、进程组ID或会话ID）
+    /// * `ns` - 可选的PID命名空间引用，如果为None则使用当前命名空间
+    ///
+    /// # 返回值
+    /// 返回指定命名空间中的PID值，如果进程没有对应的PID则返回None
+    ///
+    /// # 特殊情况
+    /// * 如果进程的raw_pid为0（通常是空闲进程），则直接返回raw_pid
+    #[allow(dead_code)]
+    pub(super) fn task_pid_nr_ns(
+        &self,
+        pid_type: PidType,
+        ns: Option<Arc<PidNamespace>>,
+    ) -> Option<RawPid> {
+        self.__task_pid_nr_ns(pid_type, ns)
+    }
+
     fn __task_pid_nr_ns(
         &self,
         pid_type: PidType,
@@ -351,7 +417,7 @@ impl ProcessControlBlock {
             return Some(self.raw_pid());
         }
         if ns.is_none() {
-            ns = Some(self.active_pid_ns());
+            ns = Some(ProcessManager::current_pcb().active_pid_ns());
         }
         let mut retval = None;
         let ns = ns.unwrap();
@@ -378,18 +444,53 @@ impl ProcessControlBlock {
     }
 
     fn __change_pid(&self, pid_type: PidType, new_pid: Option<Arc<Pid>>) {
+        // log::debug!(
+        //     "Changing PID type={:?}, current_pid={:?}, new_pid={:?}",
+        //     pid_type,
+        //     self.task_pid_ptr(pid_type)
+        //         .as_ref()
+        //         .map_or("None".to_string(), |p| p.pid_vnr().data().to_string()),
+        //     new_pid
+        // );
+        // log::debug!("current name: {}", self.basic().name());
+
         let pid = self.task_pid_ptr(pid_type);
         self.pid_links[pid_type as usize].unlink_pid();
+        // log::debug!(
+        //     "Unlinked PID type={:?}, pid={}",
+        //     pid_type,
+        //     pid.as_ref()
+        //         .map_or("None".to_string(), |p| p.pid_vnr().data().to_string())
+        // );
+
         if let Some(new_pid) = new_pid {
-            self.sig_struct().pids[pid_type as usize] = Some(new_pid);
+            self.init_task_pid(pid_type, new_pid.clone());
+            // log::debug!(
+            //     "Set new PID type={:?}, pid={:?}",
+            //     pid_type,
+            //     new_pid.pid_vnr().data()
+            // );
         }
 
         if let Some(pid) = pid {
+            pid.tasks[pid_type as usize]
+                .lock()
+                .retain(|task| !Weak::ptr_eq(task, &self.self_ref));
             for x in PidType::ALL.iter().rev() {
                 if pid.has_task(*x) {
+                    // log::debug!(
+                    //     "PID type={:?}, raw={} still has tasks, not freeing",
+                    //     pid_type,
+                    //     pid.pid_vnr().data()
+                    // );
                     return;
                 }
             }
+            // log::debug!(
+            //     "Freeing PID type={:?}, pid={:?}",
+            //     pid_type,
+            //     pid.pid_vnr().data()
+            // );
             free_pid(pid);
         }
     }
@@ -397,7 +498,18 @@ impl ProcessControlBlock {
 
 impl ProcessManager {
     pub fn find_task_by_vpid(vnr: RawPid) -> Option<Arc<ProcessControlBlock>> {
-        let active_pid_ns = ProcessManager::current_pcb().active_pid_ns();
+        // 如果进程管理器未初始化，用旧的方法
+        if !ProcessManager::initialized() {
+            return Self::find(vnr);
+        }
+
+        // 如果当前进程是真实的PID 0，则用旧的方法
+        let current_pcb = ProcessManager::current_pcb();
+        if current_pcb.raw_pid().data() == 0 {
+            return Self::find(vnr);
+        }
+
+        let active_pid_ns = current_pcb.active_pid_ns();
         return Self::find_task_by_pid_ns(vnr, &active_pid_ns);
     }
 

@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::{
+    alloc_pid,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     pid::{Pid, PidType},
     KernelStack, ProcessControlBlock, ProcessManager, RawPid,
@@ -180,15 +181,15 @@ impl ProcessManager {
             );
             e
         })?;
-        if pcb.raw_pid().data() > 1 {
-            log::debug!(
-                "fork done, pid: {}, pgid: {:?}, tgid: {:?}, sid: {}",
-                pcb.raw_pid(),
-                pcb.task_pgrp().map(|x| x.pid_vnr().data()),
-                pcb.task_tgid_vnr(),
-                pcb.task_session().map_or(0, |s| s.pid_vnr().data())
-            );
-        }
+        // if pcb.raw_pid().data() > 1 {
+        //     log::debug!(
+        //         "fork done, pid: {}, pgid: {:?}, tgid: {:?}, sid: {}",
+        //         pcb.raw_pid(),
+        //         pcb.task_pgrp().map(|x| x.pid_vnr().data()),
+        //         pcb.task_tgid_vnr(),
+        //         pcb.task_session().map_or(0, |s| s.pid_vnr().data())
+        //     );
+        // }
 
         // 向procfs注册进程
         procfs_register_pid(pcb.raw_pid()).unwrap_or_else(|e| {
@@ -209,7 +210,11 @@ impl ProcessManager {
             )
         });
 
-        return Ok(pcb.raw_pid());
+        if ProcessManager::current_pid().data() == 0 {
+            return Ok(pcb.raw_pid());
+        }
+
+        return Ok(pcb.pid().pid_vnr());
     }
 
     fn copy_flags(
@@ -539,6 +544,41 @@ impl ProcessManager {
                 current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
+
+        if pcb.raw_pid() == RawPid::UNASSIGNED {
+            // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
+            let ns = pcb.nsproxy().pid_namespace_for_children().clone();
+
+            let main_pid_arc = alloc_pid(&ns).expect("alloc_pid failed");
+
+            // 根namespace中的PID号作为RawPid
+            let root_pid_nr = main_pid_arc
+                .first_upid()
+                .expect("UPid list empty")
+                .nr
+                .data();
+            // log::debug!("fork: root_pid_nr: {}", root_pid_nr);
+
+            unsafe {
+                pcb.force_set_raw_pid(RawPid(root_pid_nr));
+            }
+            pcb.init_task_pid(PidType::PID, main_pid_arc);
+        }
+
+        // 将当前pcb加入父进程的子进程哈希表中
+        if pcb.raw_pid() > RawPid(1) {
+            if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
+                let mut children = ppcb_arc.children.write_irqsave();
+                children.push(pcb.raw_pid());
+            } else {
+                panic!("parent pcb is None");
+            }
+        }
+
+        if pcb.raw_pid() > RawPid(0) {
+            ProcessManager::add_pcb(pcb.clone());
+        }
+
         let pid = pcb.pid();
         if pcb.is_thread_group_leader() {
             if pcb.raw_pid() == RawPid(1) {
@@ -563,7 +603,7 @@ impl ProcessManager {
             drop(parent_siginfo);
             let mut sig_info_guard = pcb.sig_info_mut();
 
-            log::debug!("set tty: {:?}", parent_tty);
+            // log::debug!("set tty: {:?}", parent_tty);
             sig_info_guard.set_tty(parent_tty);
 
             /*
@@ -613,11 +653,11 @@ impl ProcessManager {
 impl ProcessControlBlock {
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/fork.c#1959
     pub(super) fn init_task_pid(&self, pid_type: PidType, pid: Arc<Pid>) {
-        log::debug!(
-            "init_task_pid: pid_type: {:?}, raw_pid:{}",
-            pid_type,
-            self.raw_pid().data()
-        );
+        // log::debug!(
+        //     "init_task_pid: pid_type: {:?}, raw_pid:{}",
+        //     pid_type,
+        //     self.raw_pid().data()
+        // );
         if pid_type == PidType::PID {
             self.thread_pid.write().replace(pid);
         } else {

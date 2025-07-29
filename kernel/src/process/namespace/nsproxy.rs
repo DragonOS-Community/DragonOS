@@ -58,13 +58,13 @@ impl ProcessManager {
         parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        log::debug!(
-            "copy_namespaces: clone_flags={:?}, parent pid={}, child pid={}, child name={}",
-            clone_flags,
-            parent_pcb.raw_pid(),
-            child_pcb.raw_pid(),
-            child_pcb.basic().name()
-        );
+        // log::debug!(
+        //     "copy_namespaces: clone_flags={:?}, parent pid={}, child pid={}, child name={}",
+        //     clone_flags,
+        //     parent_pcb.raw_pid(),
+        //     child_pcb.raw_pid(),
+        //     child_pcb.basic().name()
+        // );
         if likely(!clone_flags.intersects(
             CloneFlags::CLONE_NEWNS
                 | CloneFlags::CLONE_NEWUTS

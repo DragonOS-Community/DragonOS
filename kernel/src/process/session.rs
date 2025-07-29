@@ -12,10 +12,10 @@ pub(super) fn ksys_setsid() -> Result<RawPid, SystemError> {
         .ok_or(SystemError::ESRCH)?;
     let sid = group_leader.pid();
     let session = sid.pid_vnr();
-    log::debug!(
-        "ksys_setsid: group_leader: {}",
-        group_leader.raw_pid().data()
-    );
+    // log::debug!(
+    //     "ksys_setsid: group_leader: {}",
+    //     group_leader.raw_pid().data()
+    // );
     let siginfo_lock = group_leader.sig_info_upgradable();
     // Fail if pcb already a session leader
     if siginfo_lock.is_session_leader {
@@ -48,13 +48,13 @@ fn set_special_pids(current_session_group_leader: &Arc<ProcessControlBlock>, sid
         Some(pg) => !Arc::ptr_eq(&pg, sid),
         None => true,
     };
-    log::debug!(
-        "leader: {}, change sid: {}, pgrp: {}, sid_raw: {}",
-        current_session_group_leader.raw_pid().data(),
-        change_sid,
-        change_pgrp,
-        sid.pid_vnr().data()
-    );
+    // log::debug!(
+    //     "leader: {}, change sid: {}, pgrp: {}, sid_raw: {}",
+    //     current_session_group_leader.raw_pid().data(),
+    //     change_sid,
+    //     change_pgrp,
+    //     sid.pid_vnr().data()
+    // );
     if change_sid {
         current_session_group_leader.change_pid(PidType::SID, sid.clone());
     }
@@ -62,12 +62,12 @@ fn set_special_pids(current_session_group_leader: &Arc<ProcessControlBlock>, sid
         current_session_group_leader.change_pid(PidType::PGID, sid.clone());
     }
 
-    log::debug!(
-        "after change, pgrp: {}",
-        current_session_group_leader
-            .task_pgrp()
-            .unwrap()
-            .pid_vnr()
-            .data()
-    );
+    // log::debug!(
+    //     "after change, pgrp: {}",
+    //     current_session_group_leader
+    //         .task_pgrp()
+    //         .unwrap()
+    //         .pid_vnr()
+    //         .data()
+    // );
 }

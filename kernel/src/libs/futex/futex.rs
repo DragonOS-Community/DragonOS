@@ -708,7 +708,7 @@ impl RobustListHead {
         let pcb: Arc<ProcessControlBlock> = if pid == 0 {
             ProcessManager::current_pcb()
         } else {
-            ProcessManager::find(RawPid::new(pid)).ok_or(SystemError::ESRCH)?
+            ProcessManager::find_task_by_vpid(RawPid::new(pid)).ok_or(SystemError::ESRCH)?
         };
 
         // TODO: 检查当前进程是否能ptrace另一个进程

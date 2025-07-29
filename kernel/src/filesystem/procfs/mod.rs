@@ -24,7 +24,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::allocator::page_frame::FrameAllocator,
-    process::{ProcessManager, RawPid},
+    process::{ProcessManager, ProcessState, RawPid},
     time::PosixTimeSpec,
 };
 
@@ -148,7 +148,7 @@ impl ProcFSInode {
     fn open_status(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 获取该pid对应的pcb结构体
         let pid = self.fdata.pid;
-        let pcb = ProcessManager::find(pid);
+        let pcb = ProcessManager::find_task_by_vpid(pid);
         let pcb = if let Some(pcb) = pcb {
             pcb
         } else {
@@ -158,6 +158,12 @@ impl ProcFSInode {
             );
             return Err(SystemError::ESRCH);
         };
+
+        ::log::debug!(
+            "ProcFS: Opening 'status' file for pid {:?} (cnt: {})",
+            pcb.raw_pid(),
+            Arc::strong_count(&pcb)
+        );
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
         // name
@@ -192,13 +198,25 @@ impl ProcFSInode {
 
         // ppid
         pdata.append(
-            &mut format!("\nPpid:\t{}", pcb.basic().ppid().into())
-                .as_bytes()
-                .to_owned(),
+            &mut format!(
+                "\nPpid:\t{}",
+                pcb.parent_pcb()
+                    .map(|p| p.task_pid_vnr().data() as isize)
+                    .unwrap_or(-1)
+            )
+            .as_bytes()
+            .to_owned(),
         );
 
         // fdsize
-        pdata.append(&mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into());
+        if matches!(state, ProcessState::Exited(_)) {
+            // 进程已经退出，fdsize为0
+            pdata.append(&mut format!("\nFDSize:\t{}", 0).into());
+        } else {
+            pdata.append(
+                &mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into(),
+            );
+        }
 
         // kthread
         pdata.append(&mut format!("\nKthread:\t{}", pcb.is_kthread() as usize).into());
@@ -282,7 +300,7 @@ impl ProcFSInode {
         let pcb = if pid == RawPid::from(0) {
             ProcessManager::current_pcb()
         } else {
-            ProcessManager::find(pid).ok_or(SystemError::ESRCH)?
+            ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?
         };
         let exe = pcb.execute_path();
         let exe_bytes = exe.as_bytes();

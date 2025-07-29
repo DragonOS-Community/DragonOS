@@ -316,7 +316,7 @@ impl KernelThreadMechanism {
                 CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGHAND,
             )
             .expect("Failed to create kthread daemon");
-            let pcb = ProcessManager::find(kthreadd_pid).unwrap();
+            let pcb = ProcessManager::find_task_by_vpid(kthreadd_pid).unwrap();
             ProcessManager::wakeup(&pcb).expect("Failed to wakeup kthread daemon");
             unsafe {
                 KTHREAD_DAEMON_PCB.replace(pcb);

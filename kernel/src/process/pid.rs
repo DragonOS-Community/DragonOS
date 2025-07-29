@@ -128,12 +128,12 @@ impl Pid {
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c#475
     pub fn pid_nr_ns(&self, ns: &Arc<PidNamespace>) -> RawPid {
-        if ns.level <= self.level {
+        if ns.level() <= self.level {
             let numbers = self.numbers.lock();
-            let upid = numbers[ns.level as usize]
+            let upid = numbers[ns.level() as usize]
                 .as_ref()
                 .cloned()
-                .unwrap_or_else(|| panic!("pid numbers should not be empty: ns.level={}, self.level={}, numbers.len={}", ns.level, self.level, numbers.len()));
+                .unwrap_or_else(|| panic!("pid numbers should not be empty: ns.level={}, self.level={}, numbers.len={}", ns.level(), self.level, numbers.len()));
             if Arc::ptr_eq(&upid.ns, ns) {
                 return upid.nr;
             }
@@ -280,14 +280,14 @@ impl Clone for PidLink {
 ///
 /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c?fi=alloc_pid#162
 pub(super) fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, SystemError> {
-    let pid = Pid::new(ns.level);
+    let pid = Pid::new(ns.level());
 
     // 用于记录已分配的PID，以便失败时清理
     let mut allocated_upids: Vec<(isize, UPid)> = Vec::new();
 
     // 获取当前namespace的引用链
     let mut current_ns = Some(ns.clone());
-    let mut level = ns.level as isize;
+    let mut level = ns.level() as isize;
 
     // 从最深层级开始向上分配PID
     while level >= 0 {

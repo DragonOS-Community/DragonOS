@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::process::{fork::CloneFlags, ProcessControlBlock, ProcessManager};
 use core::{fmt::Debug, intrinsics::likely, sync::atomic::AtomicIsize};
 
-use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace};
+use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///
@@ -55,7 +55,7 @@ impl ProcessManager {
     #[inline(never)]
     pub fn copy_namespaces(
         clone_flags: &CloneFlags,
-        parent_pcb: &Arc<ProcessControlBlock>,
+        _parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
         // log::debug!(
@@ -130,10 +130,33 @@ fn create_new_namespaces(
 }
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/ns_common.h#9
-#[derive(Default)]
+/// 融合了 NamespaceBase 的公共字段
+#[derive(Debug)]
 pub struct NsCommon {
-    pub stashed: AtomicIsize,
-    // todo: 添加其他公共字段
+    /// 层级（root = 0）
+    pub level: u32,
+    /// 种类
+    ty: NamespaceType,
+}
+
+impl NsCommon {
+    pub fn new(level: u32, ty: NamespaceType) -> Self {
+        Self { level, ty }
+    }
+
+    pub fn level(&self) -> u32 {
+        self.level
+    }
+
+    pub fn ty(&self) -> NamespaceType {
+        self.ty
+    }
+}
+
+impl Default for NsCommon {
+    fn default() -> Self {
+        Self::new(0, NamespaceType::Pid) // 默认值，实际使用时应该明确指定
+    }
 }
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?fi=exec_task_namespaces#259

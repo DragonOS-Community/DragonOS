@@ -5,6 +5,7 @@ use alloc::sync::{Arc, Weak};
 use crate::libs::spinlock::SpinLock;
 
 use super::nsproxy::NsCommon;
+use super::{NamespaceOps, NamespaceType};
 use alloc::vec::Vec;
 
 lazy_static! {
@@ -12,29 +13,38 @@ lazy_static! {
 }
 
 pub struct UserNamespace {
-    level: u32,
     parent: Option<Weak<UserNamespace>>,
+    nscommon: NsCommon,
     self_ref: Weak<UserNamespace>,
     inner: SpinLock<InnerUserNamespace>,
 }
 
 pub struct InnerUserNamespace {
-    nscommon: NsCommon,
     children: Vec<Arc<UserNamespace>>,
+}
+
+impl NamespaceOps for UserNamespace {
+    fn ns_common(&self) -> &NsCommon {
+        &self.nscommon
+    }
 }
 
 impl UserNamespace {
     /// 创建root user namespace
-    pub fn new_root() -> Arc<Self> {
+    fn new_root() -> Arc<Self> {
         Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
+            nscommon: NsCommon::new(0, NamespaceType::User),
             parent: None,
-            level: 0,
             inner: SpinLock::new(InnerUserNamespace {
-                nscommon: NsCommon::default(),
                 children: Vec::new(),
             }),
         })
+    }
+
+    /// 获取层级
+    pub fn level(&self) -> u32 {
+        self.nscommon.level
     }
 
     /// 检查当前用户命名空间是否是另一个用户命名空间的祖先
@@ -52,15 +62,17 @@ impl UserNamespace {
     /// 如果当前命名空间的层级大于目标命名空间，则不可能是祖先关系。
     pub fn is_ancestor_of(&self, other: &Arc<Self>) -> bool {
         let mut current = other.clone();
+        let self_level = self.level();
         loop {
-            if current.level > self.level {
+            let current_level = current.level();
+            if current_level > self_level {
                 if let Some(parent) = current.parent.as_ref().and_then(|p| p.upgrade()) {
                     current = parent;
                     continue;
                 } else {
                     return false;
                 }
-            } else if current.level == self.level {
+            } else if current_level == self_level {
                 return Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &current);
             } else {
                 return false;

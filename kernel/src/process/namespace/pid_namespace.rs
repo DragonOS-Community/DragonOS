@@ -15,14 +15,15 @@ use crate::process::RawPid;
 
 use super::nsproxy::NsCommon;
 use super::user_namespace::UserNamespace;
+use super::{NamespaceOps, NamespaceType};
 
 lazy_static! {
     pub static ref INIT_PID_NAMESPACE: Arc<PidNamespace> = PidNamespace::new_root();
 }
+
 pub struct PidNamespace {
+    ns_common: NsCommon,
     self_ref: Weak<PidNamespace>,
-    /// PID namespace的层级（root = 0）
-    pub level: u32,
     /// 父namespace的弱引用
     parent: Option<Weak<PidNamespace>>,
     user_ns: Arc<UserNamespace>,
@@ -31,7 +32,6 @@ pub struct PidNamespace {
 }
 
 pub struct InnerPidNamespace {
-    pub ns_common: NsCommon,
     dead: bool,
     ida: IdAllocator,
     /// PID到进程的映射表
@@ -51,6 +51,12 @@ impl InnerPidNamespace {
     }
 }
 
+impl NamespaceOps for PidNamespace {
+    fn ns_common(&self) -> &NsCommon {
+        &self.ns_common
+    }
+}
+
 impl PidNamespace {
     /// 最大PID namespace层级
     pub const MAX_PID_NS_LEVEL: u32 = 32;
@@ -59,11 +65,10 @@ impl PidNamespace {
     fn new_root() -> Arc<Self> {
         Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
-            level: 0,
+            ns_common: NsCommon::new(0, NamespaceType::Pid),
             parent: None,
             user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
             inner: SpinLock::new(InnerPidNamespace {
-                ns_common: NsCommon::default(),
                 dead: false,
                 child_reaper: None,
                 ida: IdAllocator::new(1, usize::MAX).unwrap(),
@@ -71,6 +76,11 @@ impl PidNamespace {
                 children: Vec::new(),
             }),
         })
+    }
+
+    /// 获取层级
+    pub fn level(&self) -> u32 {
+        self.ns_common.level
     }
 
     pub fn alloc_pid_in_ns(&self, pid: Arc<Pid>) -> Result<RawPid, SystemError> {
@@ -115,7 +125,7 @@ impl PidNamespace {
 
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid_namespace.c#72
     fn create_pid_namespace(&self, user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, SystemError> {
-        let level = self.level + 1;
+        let level = self.level() + 1;
         if !self.user_ns.is_ancestor_of(&user_ns) {
             return Err(SystemError::EINVAL);
         }
@@ -128,11 +138,10 @@ impl PidNamespace {
 
         let pidns = Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
-            level: level,
+            ns_common: NsCommon::new(level, NamespaceType::Pid),
             parent: Some(self.self_ref.clone()),
             user_ns: user_ns,
             inner: SpinLock::new(InnerPidNamespace {
-                ns_common: NsCommon::default(),
                 child_reaper: None,
                 dead: false,
                 ida: IdAllocator::new(1, usize::MAX).unwrap(),

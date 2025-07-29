@@ -159,11 +159,11 @@ impl ProcFSInode {
             return Err(SystemError::ESRCH);
         };
 
-        ::log::debug!(
-            "ProcFS: Opening 'status' file for pid {:?} (cnt: {})",
-            pcb.raw_pid(),
-            Arc::strong_count(&pcb)
-        );
+        // ::log::debug!(
+        //     "ProcFS: Opening 'status' file for pid {:?} (cnt: {})",
+        //     pcb.raw_pid(),
+        //     Arc::strong_count(&pcb)
+        // );
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
         // name

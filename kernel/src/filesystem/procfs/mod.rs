@@ -24,7 +24,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::allocator::page_frame::FrameAllocator,
-    process::{Pid, ProcessManager},
+    process::{ProcessManager, ProcessState, RawPid},
     time::PosixTimeSpec,
 };
 
@@ -73,7 +73,7 @@ impl From<u8> for ProcFileType {
 #[derive(Debug)]
 pub struct InodeInfo {
     ///进程的pid
-    pid: Pid,
+    pid: RawPid,
     ///文件类型
     ftype: ProcFileType,
     //其他需要传入的信息在此定义
@@ -148,7 +148,7 @@ impl ProcFSInode {
     fn open_status(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 获取该pid对应的pcb结构体
         let pid = self.fdata.pid;
-        let pcb = ProcessManager::find(pid);
+        let pcb = ProcessManager::find_task_by_vpid(pid);
         let pcb = if let Some(pcb) = pcb {
             pcb
         } else {
@@ -158,6 +158,12 @@ impl ProcFSInode {
             );
             return Err(SystemError::ESRCH);
         };
+
+        // ::log::debug!(
+        //     "ProcFS: Opening 'status' file for pid {:?} (cnt: {})",
+        //     pcb.raw_pid(),
+        //     Arc::strong_count(&pcb)
+        // );
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
         // name
@@ -181,24 +187,42 @@ impl ProcFSInode {
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
 
         // Tgid
-        pdata.append(&mut format!("\nTgid:\t{}", pcb.tgid().into()).into());
+        pdata.append(
+            &mut format!(
+                "\nTgid:\t{}",
+                pcb.task_tgid_vnr().unwrap_or(RawPid::new(0)).into()
+            )
+            .into(),
+        );
 
         // pid
         pdata.append(
-            &mut format!("\nPid:\t{}", pcb.pid().into())
+            &mut format!("\nPid:\t{}", pcb.task_pid_vnr().data())
                 .as_bytes()
                 .to_owned(),
         );
 
         // ppid
         pdata.append(
-            &mut format!("\nPpid:\t{}", pcb.basic().ppid().into())
-                .as_bytes()
-                .to_owned(),
+            &mut format!(
+                "\nPpid:\t{}",
+                pcb.parent_pcb()
+                    .map(|p| p.task_pid_vnr().data() as isize)
+                    .unwrap_or(-1)
+            )
+            .as_bytes()
+            .to_owned(),
         );
 
         // fdsize
-        pdata.append(&mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into());
+        if matches!(state, ProcessState::Exited(_)) {
+            // 进程已经退出，fdsize为0
+            pdata.append(&mut format!("\nFDSize:\t{}", 0).into());
+        } else {
+            pdata.append(
+                &mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into(),
+            );
+        }
 
         // tty
         let name = if let Some(tty) = pcb.sig_info_irqsave().tty() {
@@ -287,10 +311,10 @@ impl ProcFSInode {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         // 判断是否有记录pid信息，有的话就是当前进程的exe文件，没有则是当前进程的exe文件
         let pid = self.fdata.pid;
-        let pcb = if pid == Pid::from(0) {
+        let pcb = if pid == RawPid::from(0) {
             ProcessManager::current_pcb()
         } else {
-            ProcessManager::find(pid).ok_or(SystemError::ESRCH)?
+            ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?
         };
         let exe = pcb.execute_path();
         let exe_bytes = exe.as_bytes();
@@ -379,7 +403,7 @@ impl ProcFS {
                 },
                 fs: Weak::default(),
                 fdata: InodeInfo {
-                    pid: Pid::new(0),
+                    pid: RawPid::new(0),
                     ftype: ProcFileType::Default,
                 },
                 dname: DName::default(),
@@ -410,7 +434,7 @@ impl ProcFS {
                 .as_any_ref()
                 .downcast_ref::<LockedProcFSInode>()
                 .unwrap();
-            meminfo_file.0.lock().fdata.pid = Pid::new(0);
+            meminfo_file.0.lock().fdata.pid = RawPid::new(0);
             meminfo_file.0.lock().fdata.ftype = ProcFileType::ProcMeminfo;
         } else {
             panic!("create meminfo error");
@@ -423,7 +447,7 @@ impl ProcFS {
                 .as_any_ref()
                 .downcast_ref::<LockedProcFSInode>()
                 .unwrap();
-            kmsg_file.0.lock().fdata.pid = Pid::new(1);
+            kmsg_file.0.lock().fdata.pid = RawPid::new(1);
             kmsg_file.0.lock().fdata.ftype = ProcFileType::ProcKmsg;
         } else {
             panic!("create ksmg error");
@@ -464,7 +488,7 @@ impl ProcFS {
                 .as_any_ref()
                 .downcast_ref::<LockedProcFSInode>()
                 .unwrap();
-            exe_file.0.lock().fdata.pid = Pid::new(0);
+            exe_file.0.lock().fdata.pid = RawPid::new(0);
             exe_file.0.lock().fdata.ftype = ProcFileType::ProcExe;
         } else {
             panic!("create exe error");
@@ -475,7 +499,7 @@ impl ProcFS {
 
     /// @brief 进程注册函数
     /// @usage 在进程中调用并创建进程对应文件
-    pub fn register_pid(&self, pid: Pid) -> Result<(), SystemError> {
+    pub fn register_pid(&self, pid: RawPid) -> Result<(), SystemError> {
         // 获取当前inode
         let inode: Arc<dyn IndexNode> = self.root_inode();
         // 创建对应进程文件夹
@@ -519,7 +543,7 @@ impl ProcFS {
 
     /// @brief 解除进程注册
     ///
-    pub fn unregister_pid(&self, pid: Pid) -> Result<(), SystemError> {
+    pub fn unregister_pid(&self, pid: RawPid) -> Result<(), SystemError> {
         // 获取当前inode
         let proc: Arc<dyn IndexNode> = self.root_inode();
         // 获取进程文件夹
@@ -728,7 +752,7 @@ impl IndexNode for LockedProcFSInode {
                 },
                 fs: inode.fs.clone(),
                 fdata: InodeInfo {
-                    pid: Pid::new(0),
+                    pid: RawPid::new(0),
                     ftype: ProcFileType::Default,
                 },
                 dname: name.clone(),
@@ -898,7 +922,7 @@ impl IndexNode for LockedProcFSInode {
 }
 
 /// @brief 向procfs注册进程
-pub fn procfs_register_pid(pid: Pid) -> Result<(), SystemError> {
+pub fn procfs_register_pid(pid: RawPid) -> Result<(), SystemError> {
     let procfs_inode = ROOT_INODE().find("proc")?;
 
     let procfs_inode = procfs_inode
@@ -914,7 +938,7 @@ pub fn procfs_register_pid(pid: Pid) -> Result<(), SystemError> {
 }
 
 /// @brief 在ProcFS中,解除进程的注册
-pub fn procfs_unregister_pid(pid: Pid) -> Result<(), SystemError> {
+pub fn procfs_unregister_pid(pid: RawPid) -> Result<(), SystemError> {
     // 获取procfs实例
     let procfs_inode: Arc<dyn IndexNode> = ROOT_INODE().find("proc")?;
 

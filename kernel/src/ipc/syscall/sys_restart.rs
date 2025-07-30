@@ -4,7 +4,7 @@ use crate::{
     alloc::vec::Vec,
     arch::ipc::signal::{SigCode, Signal},
     arch::syscall::nr::SYS_RESTART_SYSCALL,
-    process::{Pid, ProcessManager},
+    process::{ProcessManager, RawPid},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use syscall_table_macros::declare_syscall;
@@ -22,7 +22,7 @@ pub(super) fn do_kernel_restart_syscall() -> Result<usize, SystemError> {
         return restart_block.restart_fn.call(&mut restart_block.data);
     } else {
         // 不应该走到这里，因此kill掉当前进程及同组的进程
-        let pid = Pid::new(0);
+        let pid = RawPid::new(0);
         let sig = Signal::SIGKILL;
         let mut info = SigInfo::new(sig, 0, SigCode::Kernel, SigType::Kill(pid));
 

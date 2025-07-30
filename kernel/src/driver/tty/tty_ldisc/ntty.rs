@@ -787,9 +787,10 @@ impl NTtyData {
     ) {
         // 先处理信号
         let ctrl_info = tty.core().contorl_info_irqsave();
-        let pg = ctrl_info.pgid;
+        let pg = ctrl_info.pgid.clone();
+        drop(ctrl_info);
         if let Some(pg) = pg {
-            let _ = crate::ipc::kill::kill_process_group(pg, signal);
+            let _ = crate::ipc::kill::kill_process_group(&pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {

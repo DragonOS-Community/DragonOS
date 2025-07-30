@@ -5,6 +5,7 @@ use core::{
     sync::atomic::AtomicI64,
 };
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -15,7 +16,10 @@ use crate::{
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
-    process::Pid,
+    process::{
+        pid::{Pid, PidType},
+        RawPid,
+    },
     syscall::user_access::UserBufferWriter,
 };
 
@@ -84,6 +88,8 @@ pub struct InnerSignalStruct {
     /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
     /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
     pub handlers: Vec<Sigaction>,
+
+    pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
 }
 
 impl SignalStruct {
@@ -94,6 +100,11 @@ impl SignalStruct {
         };
 
         r
+    }
+
+    pub fn reset_sighandlers(&mut self) {
+        // 重置信号处理程序
+        self.inner.handlers = default_sighandlers();
     }
 }
 
@@ -122,7 +133,14 @@ impl Default for InnerSignalStruct {
         Self {
             cnt: Default::default(),
             handlers: default_sighandlers(),
+            pids: core::array::from_fn(|_| None),
         }
+    }
+}
+
+impl InnerSignalStruct {
+    pub fn handler(&self, sig: Signal) -> Option<&Sigaction> {
+        self.handlers.get(sig as usize - 1)
     }
 }
 
@@ -354,8 +372,8 @@ impl SigInfo {
 
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
-    Kill(Pid),
-    Alarm(Pid),
+    Kill(RawPid),
+    Alarm(RawPid),
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
@@ -443,8 +461,8 @@ impl SigPending {
             return info;
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(Pid::from(0)));
-            ret.set_sig_type(SigType::Kill(Pid::new(0)));
+            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(RawPid::from(0)));
+            ret.set_sig_type(SigType::Kill(RawPid::new(0)));
             return ret;
         }
     }
@@ -561,4 +579,24 @@ pub trait SignalArch {
     unsafe fn do_signal_or_restart(frame: &mut TrapFrame);
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64;
+}
+
+bitflags! {
+
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/sched/signal.h#253
+    pub struct SignalFlags: u32 {
+        const STOP_STOPPED = 0x00000001; /* job control stop in effect */
+        const STOP_CONTINUED = 0x00000002; /* SIGCONT since WCONTINUED reap */
+        const GROUP_EXIT = 0x00000004; /* group exit in progress */
+        const CLD_STOPPED = 0x00000010; /* Pending notifications to parent */
+        const CLD_CONTINUED = 0x00000020;
+        const UNKILLABLE = 0x00000040; /* for init: ignore fatal signals */
+    }
+}
+
+impl SignalFlags {
+    pub const CLD_MASK: SignalFlags = SignalFlags::CLD_STOPPED.union(SignalFlags::CLD_CONTINUED);
+    pub const STOP_MASK: SignalFlags = SignalFlags::CLD_MASK
+        .union(SignalFlags::STOP_STOPPED)
+        .union(SignalFlags::STOP_CONTINUED);
 }

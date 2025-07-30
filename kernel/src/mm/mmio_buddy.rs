@@ -499,7 +499,7 @@ impl MmioBuddyMemPool {
             Err(_) => {
                 error!(
                     "failed to create mmio. pid = {:?}",
-                    ProcessManager::current_pcb().pid()
+                    ProcessManager::current_pcb().raw_pid()
                 );
                 return Err(SystemError::ENOMEM);
             }

@@ -90,6 +90,10 @@ pub trait TtyPort: Sync + Send + Debug {
         EventPoll::wakeup_epoll(tty.core().eptiems(), pollflag)?;
         ret
     }
+
+    fn internal_tty(&self) -> Option<Arc<TtyCore>> {
+        self.port_data().internal_tty()
+    }
 }
 
 #[derive(Debug)]

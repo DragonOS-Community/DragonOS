@@ -92,13 +92,13 @@ impl Syscall {
             ARCH_SET_FS => {
                 arch_info.fsbase = arg2;
                 // 如果是当前进程则直接写入寄存器
-                if pcb.pid() == ProcessManager::current_pcb().pid() {
+                if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
                     unsafe { arch_info.restore_fsbase() }
                 }
             }
             ARCH_SET_GS => {
                 arch_info.gsbase = arg2;
-                if pcb.pid() == ProcessManager::current_pcb().pid() {
+                if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
                     unsafe { arch_info.restore_gsbase() }
                 }
             }

@@ -1,5 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETFSUID;
+use crate::process::cred::Cred;
 use crate::process::cred::Kuid;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -25,10 +26,13 @@ impl Syscall for SysSetFsuid {
 
         let pcb = ProcessManager::current_pcb();
         let mut guard = pcb.cred.lock();
+
         let old_fsuid = guard.fsuid;
 
         if fsuid == guard.uid || fsuid == guard.euid || fsuid == guard.suid {
-            guard.setfsuid(fsuid.data());
+            let mut new_cred: Cred = (**guard).clone();
+            new_cred.setfsuid(fsuid.data());
+            *guard = Cred::new_arc(new_cred);
         }
 
         Ok(old_fsuid.data())

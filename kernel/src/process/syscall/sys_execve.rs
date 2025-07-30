@@ -73,7 +73,7 @@ impl SysExecve {
     ) -> Result<(), SystemError> {
         ProcessManager::current_pcb()
             .basic_mut()
-            .set_name(ProcessControlBlock::generate_name(&path, &argv));
+            .set_name(ProcessControlBlock::generate_name(&path));
 
         do_execve(inode, argv, envp, frame)?;
 

@@ -1,11 +1,9 @@
-use core::arch::asm;
-
 use crate::{
     arch::{asm::csr::CSR_SSTATUS, interrupt::TrapFrame},
     process::{
         fork::CloneFlags,
         kthread::{kernel_thread_bootstrap_stage2, KernelThreadCreateInfo, KernelThreadMechanism},
-        Pid, ProcessManager,
+        ProcessManager, RawPid,
     },
 };
 use alloc::sync::Arc;
@@ -24,7 +22,7 @@ impl KernelThreadMechanism {
     pub fn __inner_create(
         info: &Arc<KernelThreadCreateInfo>,
         clone_flags: CloneFlags,
-    ) -> Result<Pid, SystemError> {
+    ) -> Result<RawPid, SystemError> {
         // WARNING: If create failed, we must drop the info manually or it will cause memory leak. (refcount will not decrease when create failed)
         let create_info: *const KernelThreadCreateInfo =
             KernelThreadCreateInfo::generate_unsafe_arc_ptr(info.clone());

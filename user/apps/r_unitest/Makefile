@@ -55,3 +55,5 @@ test-release:
 .PHONY: install
 install:
 	RUSTFLAGS=$(RUSTFLAGS) cargo $(TOOLCHAIN) install --target $(RUST_TARGET) --path . --no-track --root $(INSTALL_DIR) --force
+	mv $(INSTALL_DIR)/bin/* $(INSTALL_DIR)/
+	rm $(INSTALL_DIR)/bin -d

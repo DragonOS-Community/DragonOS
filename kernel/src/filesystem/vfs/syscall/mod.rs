@@ -66,6 +66,11 @@ mod sys_select;
 mod sys_symlink;
 mod sys_symlinkat;
 
+mod xattr_utils;
+mod sys_getxattr;
+mod sys_lgetxattr;
+mod sys_fgetxattr;
+
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;

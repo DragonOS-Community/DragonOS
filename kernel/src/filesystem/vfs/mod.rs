@@ -654,6 +654,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Err(SystemError::ENOSYS)
     }
+
+    /// @brief 按文件名获取扩展属性
+    ///
+    /// @param name 属性名称
+    /// @param buf 用于存储扩展属性值的缓冲区
+    ///
+    /// @return 成功：Ok(属性值的实际长度)
+    ///         失败：Err(错误码)
+    fn getxattr(&self, _name: &str, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        log::warn!("getxattr not implemented for {}", crate::libs::name::get_type_name(&self));
+        return Err(SystemError::ENOSYS);
+    }    
 }
 
 impl DowncastArc for dyn IndexNode {

@@ -546,6 +546,10 @@ impl IndexNode for MountFSInode {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         self.inner_inode.as_pollable_inode()
     }
+
+    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.inner_inode.getxattr(name, buf)
+    }
 }
 
 impl FileSystem for MountFS {

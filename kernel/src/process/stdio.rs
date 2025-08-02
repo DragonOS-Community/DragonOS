@@ -2,10 +2,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::tty::virtual_terminal::vc_manager,
-    filesystem::vfs::{
-        file::{File, FileMode},
-        ROOT_INODE,
-    },
+    filesystem::vfs::file::{File, FileMode},
     process::{ProcessManager, RawPid},
 };
 
@@ -20,7 +17,8 @@ pub fn stdio_init() -> Result<(), SystemError> {
             .current_vc_tty_name()
             .expect("Init stdio: can't get tty name")
     );
-    let tty_inode = ROOT_INODE()
+    let root_inode = ProcessManager::current_mntns().root_inode();
+    let tty_inode = root_inode
         .lookup(&tty_path)
         .unwrap_or_else(|_| panic!("Init stdio: can't find {}", tty_path));
 

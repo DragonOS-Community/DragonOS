@@ -3,14 +3,15 @@ pub mod copy_up;
 pub mod entry;
 
 use super::ramfs::{LockedRamFSInode, RamFSInode};
+use super::vfs::FSMAKER;
 use super::vfs::{
     self, FileSystem, FileType, FsInfo, IndexNode, Metadata, MountableFileSystem, SuperBlock,
 };
-use super::vfs::{FSMAKER, ROOT_INODE};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::driver::base::device::device_number::Major;
 use crate::filesystem::vfs::{FileSystemMaker, FileSystemMakerData};
 use crate::libs::spinlock::SpinLock;
+use crate::process::ProcessManager;
 use crate::register_mountable_fs;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -146,8 +147,8 @@ impl MountableFileSystem for OverlayFS {
         let mount_data = data
             .and_then(|d| d.as_any().downcast_ref::<OverlayMountData>())
             .ok_or(SystemError::EINVAL)?;
-
-        let upper_inode = ROOT_INODE()
+        let root_inode = ProcessManager::current_mntns().root_inode();
+        let upper_inode = root_inode
             .lookup(&mount_data.upper_dir)
             .map_err(|_| SystemError::EINVAL)?;
         let upper_layer = OvlLayer {
@@ -165,7 +166,10 @@ impl MountableFileSystem for OverlayFS {
             .iter()
             .enumerate()
             .map(|(i, dir)| {
-                let lower_inode = ROOT_INODE().lookup(dir).map_err(|_| SystemError::EINVAL)?; // 处理错误
+                let lower_inode = ProcessManager::current_mntns()
+                    .root_inode()
+                    .lookup(dir)
+                    .map_err(|_| SystemError::EINVAL)?; // 处理错误
                 Ok(OvlLayer {
                     mnt: Arc::new(OvlInode::new(dir.clone(), None, Some(lower_inode))),
                     index: (i + 1) as u32,

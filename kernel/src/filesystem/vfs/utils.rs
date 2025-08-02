@@ -5,9 +5,9 @@ use core::hash::Hash;
 use alloc::{string::String, sync::Arc};
 use system_error::SystemError;
 
-use crate::process::ProcessControlBlock;
+use crate::process::{ProcessControlBlock, ProcessManager};
 
-use super::{fcntl::AtFlags, FileType, IndexNode, ROOT_INODE};
+use super::{fcntl::AtFlags, FileType, IndexNode};
 
 /// @brief 切分路径字符串，返回最左侧那一级的目录名和剩余的部分。
 ///
@@ -42,7 +42,8 @@ pub fn user_path_at(
     dirfd: i32,
     path: &str,
 ) -> Result<(Arc<dyn IndexNode>, String), SystemError> {
-    let mut inode = ROOT_INODE();
+    let current_mntns = ProcessManager::current_mntns();
+    let mut inode = current_mntns.root_inode().clone();
     let ret_path;
     // 如果path不是绝对路径，则需要拼接
     if path.is_empty() || path.as_bytes()[0] != b'/' {

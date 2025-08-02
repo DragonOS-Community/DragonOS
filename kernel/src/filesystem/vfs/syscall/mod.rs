@@ -28,7 +28,7 @@ use super::{
     },
     utils::{rsplit_path, user_path_at},
     vcore::{do_mkdir_at, do_remove_dir, do_unlink_at},
-    FileType, IndexNode, SuperBlock, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FileType, IndexNode, SuperBlock, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 mod open_utils;
@@ -587,13 +587,15 @@ impl Syscall {
                 new_path = String::from("/");
             }
         }
-        let inode =
-            match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-                Err(_) => {
-                    return Err(SystemError::ENOENT);
-                }
-                Ok(i) => i,
-            };
+
+        let root_inode = ProcessManager::current_mntns().root_inode();
+        let inode = match root_inode.lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        {
+            Err(_) => {
+                return Err(SystemError::ENOENT);
+            }
+            Ok(i) => i,
+        };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(new_path);
@@ -912,16 +914,17 @@ impl Syscall {
             return Err(SystemError::ENAMETOOLONG);
         }
 
+        let root_inode = ProcessManager::current_mntns().root_inode();
         //获取pcb，文件节点
         let pcb = ProcessManager::current_pcb();
         let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
         let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
         //获取父目录
         let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
-        let old_parent_inode = ROOT_INODE()
+        let old_parent_inode = root_inode
             .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent_inode = ROOT_INODE()
+        let new_parent_inode = root_inode
             .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
         return Ok(0);
@@ -1177,9 +1180,11 @@ impl Syscall {
             .unwrap()
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
+
+        let root_inode = ProcessManager::current_mntns().root_inode();
         let pcb = ProcessManager::current_pcb();
         let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
-        let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
+        let inode = root_inode.lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
         let statfs = PosixStatfs::from(inode.fs().super_block());
         writer.copy_one_to_user(&statfs, 0)?;
         return Ok(0);
@@ -1252,9 +1257,8 @@ impl Syscall {
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         let path = path.as_str().trim();
-
-        let inode: Result<Arc<dyn IndexNode>, SystemError> =
-            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
+        let root_inode = ProcessManager::current_mntns().root_inode();
+        let inode = root_inode.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         if inode.is_ok() {
             return Err(SystemError::EEXIST);
@@ -1263,7 +1267,7 @@ impl Syscall {
         let (filename, parent_path) = rsplit_path(path);
 
         // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
+        let parent_inode: Arc<dyn IndexNode> = root_inode
             .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         // 创建nod
         parent_inode.mknod(filename, mode, dev_t)?;

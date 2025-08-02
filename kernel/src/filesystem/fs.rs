@@ -2,8 +2,8 @@ use alloc::sync::Arc;
 
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::IndexNode;
-use crate::filesystem::vfs::ROOT_INODE;
 use crate::libs::rwlock::RwLock;
+use crate::process::ProcessManager;
 #[derive(Debug, Clone)]
 struct PathContext {
     root: Arc<dyn IndexNode>,
@@ -13,8 +13,8 @@ struct PathContext {
 impl PathContext {
     pub fn new() -> Self {
         Self {
-            root: ROOT_INODE(),
-            pwd: ROOT_INODE(),
+            root: ProcessManager::current_mntns().root_inode(),
+            pwd: ProcessManager::current_mntns().root_inode(),
         }
     }
 }

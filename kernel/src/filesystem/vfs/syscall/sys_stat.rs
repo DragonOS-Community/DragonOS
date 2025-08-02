@@ -5,6 +5,7 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STAT;
 use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::syscall::newfstat::do_newfstat;
 use crate::filesystem::vfs::syscall::sys_close::do_close;
 use crate::filesystem::vfs::ModeType;
 use crate::syscall::table::FormattedSyscallParam;
@@ -36,7 +37,7 @@ impl Syscall for SysStatHandle {
             do_close(fd as i32).ok();
         });
 
-        crate::syscall::Syscall::newfstat(fd as i32, usr_kstat)?;
+        do_newfstat(fd as i32, usr_kstat)?;
 
         return Ok(0);
     }

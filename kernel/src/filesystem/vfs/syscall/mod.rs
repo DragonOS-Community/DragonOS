@@ -66,10 +66,22 @@ mod sys_select;
 mod sys_symlink;
 mod sys_symlinkat;
 
+mod xattr_utils;
+mod sys_getxattr;
+mod sys_lgetxattr;
+mod sys_fgetxattr;
+mod sys_setxattr;
+mod sys_lsetxattr;
+mod sys_fsetxattr;
+
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
 pub const SEEK_MAX: u32 = 3;
+
+// 扩展属性操作标志
+pub const XATTR_CREATE: i32 = 0x1;   // 设置值，如果属性不存在则创建，已存在返回则失败
+pub const XATTR_REPLACE: i32 = 0x2;  // 设置值，如果属性已存在则替换，不存在返回则失败
 
 bitflags! {
     /// 文件类型和权限

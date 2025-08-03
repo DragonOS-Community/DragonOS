@@ -92,3 +92,26 @@ root:x:0:0:root:/root:/bin/sh
 - rename https://man7.org/linux/man-pages/man2/rename.2.html
 - ioctl TCFLSH
 - renameat2: oldfd: -100, filename_from: /etc/shadow+, newfd: -100, filename_to: /etc/shadow 失败
+
+
+
+## 文件系统相关
+/proc/self目录:/proc/self 是一个 符号链接，始终指向 访问它的进程自己的 /proc/[pid] 目录
+
+| 路径                   | 作用                   |
+| -------------------- | -------------------- |
+| `/proc/self/cmdline` | 当前进程的命令行参数           |
+| `/proc/self/exe`     | 当前进程的可执行文件路径（是个符号链接） |
+| `/proc/self/fd/`     | 当前进程打开的所有文件描述符       |
+| `/proc/self/environ` | 当前进程的环境变量            |
+| `/proc/self/maps`    | 当前进程的内存映射布局          |
+| `/proc/self/status`  | 当前进程的状态信息（类似于 ps 命令） |
+
+
+/proc/fd/{id} 也是一个符号链接，指向进程打开的文件描述符所对应的文件路径。
+
+## Reference
+- Linux TTY/PTS概述 https://liujunming.top/2019/09/03/Linux-TTY-PTS%E6%A6%82%E8%BF%B0/
+- 伪终端(pseudo terminal) https://zhuanlan.zhihu.com/p/678170056
+- 硬件终端 terminal(TTY)
+ https://www.cnblogs.com/sparkdev/p/11460821.html

@@ -356,8 +356,6 @@ pub const SYS_WAITID: usize = 247;
 pub const SYS_WRITE: usize = 1;
 pub const SYS_WRITEV: usize = 20;
 
-
-
 pub fn syscall_number_to_str(syscall_number: usize) -> &'static str {
     match syscall_number {
         0 => "SYS_READ",

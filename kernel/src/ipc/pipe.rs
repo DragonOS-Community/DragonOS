@@ -1,5 +1,3 @@
-use core::sync::atomic::compiler_fence;
-
 use crate::{
     arch::ipc::signal::{SigCode, Signal},
     filesystem::{
@@ -17,6 +15,8 @@ use crate::{
     sched::SchedMode,
     time::PosixTimeSpec,
 };
+use alloc::string::String;
+use core::sync::atomic::compiler_fence;
 
 use alloc::{
     collections::LinkedList,
@@ -509,5 +509,9 @@ impl IndexNode for LockedPipeInode {
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Ok(self)
+    }
+
+    fn absolute_path(&self) -> Result<String, SystemError> {
+        Ok(String::from("pipe"))
     }
 }

@@ -33,10 +33,11 @@ pub(super) fn do_open(
     let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
     if crate::syscall::DFLAG.load(core::sync::atomic::Ordering::Relaxed) {
         log::info!(
-            "openat: path: {}, o_flags: {:?}, mode: {:?}",
+            "openat: path: {}, o_flags: {:?}, mode: {:?}, follow_symlink: {}",
             path,
             open_flags,
-            mode
+            mode,
+            follow_symlink
         );
     }
     return do_sys_open(

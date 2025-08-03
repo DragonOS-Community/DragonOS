@@ -60,12 +60,12 @@ pub mod sys_mount;
 pub mod sys_umount2;
 
 pub mod symlink_utils;
+mod sys_fsync;
 mod sys_pselect6;
 mod sys_select;
 #[cfg(target_arch = "x86_64")]
 mod sys_symlink;
 mod sys_symlinkat;
-mod sys_fsync;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -924,13 +924,15 @@ impl Syscall {
         }
         log::debug!(
             "renameat2: oldfd: {}, filename_from: {}, newfd: {}, filename_to: {}",
-            oldfd, filename_from, newfd, filename_to
+            oldfd,
+            filename_from,
+            newfd,
+            filename_to
         );
         //获取pcb，文件节点
         let pcb = ProcessManager::current_pcb();
         let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
         let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
-
 
         //获取父目录
         let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
@@ -1302,7 +1304,11 @@ impl Syscall {
 
         let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
-        let inode = inode.lookup(path.as_str())?;
+        log::info!("readlink_at: dirfd: {}, path: {}", dirfd, path);
+        let inode = inode
+            .lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
+            .unwrap();
+
         if inode.metadata()?.file_type != FileType::SymLink {
             return Err(SystemError::EINVAL);
         }

@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use alloc::{ffi::CString};
+use alloc::ffi::CString;
 use log::{debug, error};
 use system_error::SystemError;
 
@@ -45,6 +45,11 @@ fn kernel_init() -> Result<(), SystemError> {
         .ok();
 
     mount_root_fs().expect("Failed to mount root fs");
+
+    // WARNING: We must keep `mount_root_fs` before stdio_init,
+    // because `migrate_virtual_filesystem` will change the root directory of the file system.
+    stdio_init().expect("Failed to initialize stdio");
+
     e1000e_init();
     net_init().unwrap_or_else(|err| {
         error!("Failed to initialize network: {:?}", err);
@@ -60,9 +65,7 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
     do_initcalls().unwrap_or_else(|err| {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
-    stdio_init().expect("Failed to initialize stdio");
     smp_init();
-
     return Ok(());
 }
 

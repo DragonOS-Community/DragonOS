@@ -1614,7 +1614,6 @@ impl IndexNode for LockedFATInode {
         return r;
     }
 
-
     fn sync(&self) -> Result<(), SystemError> {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {

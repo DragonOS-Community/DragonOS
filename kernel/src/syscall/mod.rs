@@ -79,7 +79,28 @@ impl Syscall {
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
         use crate::debug::panic::kernel_catch_unwind;
+        let binding = ProcessManager::current_pcb();
+        // let name = binding.basic().name();
+        if binding.basic().name().contains("dropbear") || binding.basic().name().contains("xxx") {
+            // 如果是dropbear进程，打印系统调用号和参数
+            print!(
+                "Syscall {}({}) called with args: {:x?}",
+                syscall_num,
+                syscall_number_to_str(syscall_num),
+                args
+            );
+            DFLAG.store(true, Ordering::Relaxed);
+        }
+
         let res = kernel_catch_unwind(|| Self::handle(syscall_num, args, frame))?;
+        let binding = ProcessManager::current_pcb();
+        // let name = binding.basic().name();
+        if binding.basic().name().contains("dropbear") || binding.basic().name().contains("xxx")
+        // || syscall_num == SYS_OPENAT
+        // || syscall_num == SYS_OPEN
+        {
+            println!("returned: {:?}", res);
+        }
         res
     }
     /// @brief 系统调用分发器，用于分发系统调用。
@@ -92,25 +113,6 @@ impl Syscall {
         args: &[usize],
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
-
-        if ProcessManager::current_pcb()
-            .basic()
-            .name()
-            .contains("dropbear")
-        {
-            // 如果是dropbear进程，打印系统调用号和参数
-            log::debug!(
-                "Syscall {}({}) called with args: {:x?}",
-                syscall_num,
-                syscall_number_to_str(syscall_num),
-                args
-            );
-            DFLAG.store(true, Ordering::SeqCst);
-        }
-        if syscall_num == SYS_OPENAT || syscall_num == SYS_OPEN {
-            DFLAG.store(true, Ordering::SeqCst);
-        }
-
         // 首先尝试从syscall_table获取处理函数
         if let Some(handler) = syscall_table().get(syscall_num) {
             // 使用以下代码可以打印系统调用号和参数，方便调试

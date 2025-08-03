@@ -14,10 +14,7 @@ use system_error::SystemError;
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{
-        vcore::{generate_inode_id, ROOT_INODE},
-        FileType,
-    },
+    filesystem::vfs::{vcore::generate_inode_id, FileType},
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -923,7 +920,8 @@ impl IndexNode for LockedProcFSInode {
 
 /// @brief 向procfs注册进程
 pub fn procfs_register_pid(pid: RawPid) -> Result<(), SystemError> {
-    let procfs_inode = ROOT_INODE().find("proc")?;
+    let root_inode = ProcessManager::current_mntns().root_inode();
+    let procfs_inode = root_inode.find("proc")?;
 
     let procfs_inode = procfs_inode
         .downcast_ref::<LockedProcFSInode>()
@@ -934,13 +932,14 @@ pub fn procfs_register_pid(pid: RawPid) -> Result<(), SystemError> {
     // 调用注册函数
     procfs.register_pid(pid)?;
 
-    return Ok(());
+    Ok(())
 }
 
 /// @brief 在ProcFS中,解除进程的注册
 pub fn procfs_unregister_pid(pid: RawPid) -> Result<(), SystemError> {
+    let root_inode = ProcessManager::current_mntns().root_inode();
     // 获取procfs实例
-    let procfs_inode: Arc<dyn IndexNode> = ROOT_INODE().find("proc")?;
+    let procfs_inode: Arc<dyn IndexNode> = root_inode.find("proc")?;
 
     let procfs_inode: &LockedProcFSInode = procfs_inode
         .downcast_ref::<LockedProcFSInode>()
@@ -959,8 +958,9 @@ pub fn procfs_init() -> Result<(), SystemError> {
         info!("Initializing ProcFS...");
         // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
+        let root_inode = ProcessManager::current_mntns().root_inode();
         // procfs 挂载
-        ROOT_INODE()
+        root_inode
             .mkdir("proc", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /proc")
             .mount(procfs)

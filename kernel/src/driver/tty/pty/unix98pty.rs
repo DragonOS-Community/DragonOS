@@ -12,12 +12,13 @@ use crate::{
         devpts::DevPtsFs,
         epoll::EPollEventType,
         vfs::{
-            file::FileMode, syscall::ModeType, FilePrivateData, FileType, MountFS, ROOT_INODE,
+            file::FileMode, syscall::ModeType, FilePrivateData, FileType, MountFS,
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
+    process::ProcessManager,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -216,11 +217,11 @@ impl TtyOperation for Unix98PtyDriverInner {
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         let driver = tty.core().driver();
-
+        let root_inode = ProcessManager::current_mntns().root_inode();
         if tty.core().driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave {
             driver.ttys().remove(&tty.core().index());
             let pts_root_inode =
-                ROOT_INODE().lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+                root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
             let _ = pts_root_inode.unlink(&tty.core().index().to_string());
         }
 
@@ -250,8 +251,9 @@ pub fn ptmx_open(
     mut data: SpinLockGuard<FilePrivateData>,
     mode: &FileMode,
 ) -> Result<(), SystemError> {
+    let root_inode = ProcessManager::current_mntns().root_inode();
     let pts_root_inode =
-        ROOT_INODE().lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     let fs = pts_root_inode
         .fs()

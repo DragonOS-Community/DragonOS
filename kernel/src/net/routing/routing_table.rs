@@ -1,6 +1,7 @@
-use core::sync::atomic::AtomicU32;
+use alloc::sync::Arc;
+use core::{net::Ipv4Addr, sync::atomic::AtomicU32};
 
-use crate::time::Instant;
+use crate::{driver::net::route_iface::RouteInterface, time::Instant};
 use alloc::vec::Vec;
 use smoltcp::wire::{IpAddress, IpCidr};
 
@@ -11,16 +12,10 @@ fn generate_table_id() -> u32 {
 }
 
 #[derive(Debug, Clone)]
-pub struct NextHop {
-    // 出口接口编号
-    pub if_index: usize,
-    pub via_router: IpAddress,
-}
-
-#[derive(Debug, Clone)]
 pub struct RouteEntry {
     pub destination: IpCidr,
-    pub next_hop: NextHop,
+    pub next_hop: Option<IpAddress>,
+    pub interface: Arc<RouteInterface>,
 
     // None 表示永久有效
     pub prefer_until: Option<Instant>,
@@ -52,10 +47,34 @@ impl RouteTable {
     }
 
     /// 根据目的IP地址查找最佳匹配的路由条目（最长前缀匹配）。
-    pub fn lookup_route(&self, dest_ip: IpAddress) -> Option<&RouteEntry> {
+    pub fn lookup_route(&self, dest_ip: Ipv4Addr) -> Option<&RouteEntry> {
         self.entries
             .iter()
-            .filter(|entry| entry.destination.contains_addr(&dest_ip))
+            .filter(|entry| entry.destination.contains_addr(&IpAddress::Ipv4(dest_ip)))
             .max_by_key(|entry| entry.destination.prefix_len()) // 最长前缀匹配
+    }
+
+    pub fn remove_route(&mut self, cidr: &IpCidr) {
+        self.entries.retain(|entry| entry.destination != *cidr);
+    }
+
+    pub fn lookup(&self, dest_ip: &IpAddress) -> Option<(Arc<RouteInterface>, Option<IpAddress>)> {
+        let mut best_match: Option<(&RouteEntry, u8)> = None;
+
+        for entry in &self.entries {
+            if entry.destination.contains_addr(dest_ip) {
+                let current_prefix_len = entry.destination.prefix_len();
+                if let Some((_, prev_prefix_len)) = best_match {
+                    // If a previous match exists, check if the current one is more specific
+                    if current_prefix_len > prev_prefix_len {
+                        best_match = Some((entry, current_prefix_len));
+                    }
+                } else {
+                    // First match found
+                    best_match = Some((entry, current_prefix_len));
+                }
+            }
+        }
+        best_match.map(|(entry, _)| (entry.interface.clone(), entry.next_hop))
     }
 }

@@ -14,13 +14,13 @@ use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::generate_iface_id;
 use crate::net::routing::router::Router;
-use crate::time::Instant;
 use alloc::collections::VecDeque;
 use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use core::net::Ipv4Addr;
 use core::ops::{Deref, DerefMut};
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::wire::{EthernetAddress, HardwareAddress};
@@ -28,6 +28,15 @@ use smoltcp::{
     phy::{self},
     wire::{IpAddress, IpCidr},
 };
+
+/// 路由动作
+#[derive(Debug, PartialEq)]
+pub enum RoutingAction {
+    DeliverToLocal, // 交给本地协议栈处理
+    Forwarded,      // 已转发给其他接口
+    Drop,           // 丢弃
+    Ignore,         // 忽略
+}
 
 pub struct RouteRxToken {
     driver: RouteDriver,
@@ -39,7 +48,46 @@ impl phy::RxToken for RouteRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(self.buffer.as_slice())
+        //? 如果buffer是L3包（来自Router注入），直接交给协议栈
+        if self.is_l3_packet() {
+            return f(self.buffer.as_slice());
+        }
+
+        // 如果是完整的以太网帧，先让Router分析
+        let routing_action = if let Some(router) = self.driver.router.upgrade() {
+            router.handle_received_frame(&self.driver.name(), &self.buffer)
+        } else {
+            RoutingAction::DeliverToLocal
+        };
+
+        match routing_action {
+            RoutingAction::DeliverToLocal => f(self.buffer.as_slice()),
+            _ => f(&[]),
+        }
+    }
+}
+
+impl RouteRxToken {
+    pub fn is_l3_packet(&self) -> bool {
+        if self.buffer.len() < 20 {
+            return false;
+        }
+
+        // 检查IPv4包特征
+        let first_byte = self.buffer[0];
+        let version = (first_byte >> 4) & 0x0F;
+        let ihl = (first_byte & 0x0F) as usize * 4;
+
+        if version != 4 || ihl < 20 || self.buffer.len() < ihl {
+            return false;
+        }
+
+        if self.buffer.len() >= 4 {
+            let total_length = u16::from_be_bytes([self.buffer[2], self.buffer[3]]) as usize;
+            return self.buffer.len() == total_length;
+        }
+
+        false
     }
 }
 
@@ -62,32 +110,45 @@ impl phy::TxToken for RouteTxToken {
 
 pub struct Route {
     name: String,
-    queue: VecDeque<Vec<u8>>,
+    rx_queue: VecDeque<Vec<u8>>,
+    tx_queue: VecDeque<Vec<u8>>,
+    l3_inject_queue: VecDeque<Vec<u8>>,
 }
 
 impl Route {
     pub fn new(name: &str) -> Self {
-        let queue = VecDeque::new();
         Route {
             name: name.to_string(),
-            queue,
+            rx_queue: VecDeque::new(),
+            tx_queue: VecDeque::new(),
+            l3_inject_queue: VecDeque::new(),
         }
+    }
+
+    pub fn inject_ether(&mut self, data: Vec<u8>) {
+        self.rx_queue.push_back(data);
     }
 
     pub fn route_receive(&mut self) -> Vec<u8> {
-        let buffer = self.queue.pop_front();
-        match buffer {
-            Some(buffer) => {
-                return buffer;
-            }
-            None => {
-                return Vec::new();
-            }
+        // 优先处理L3注入的包
+        if let Some(l3_packet) = self.l3_inject_queue.pop_front() {
+            return l3_packet;
         }
+
+        // 然后处理硬件接收的帧
+        self.rx_queue.pop_front().unwrap_or_else(|| Vec::new())
     }
 
     pub fn route_transmit(&mut self, buffer: Vec<u8>) {
-        self.queue.push_back(buffer)
+        self.tx_queue.push_back(buffer);
+    }
+
+    pub fn pop_tx_frame(&mut self) -> Option<Vec<u8>> {
+        self.tx_queue.pop_front()
+    }
+
+    pub fn inject_l3_packet(&mut self, ip_packet: Vec<u8>) {
+        self.l3_inject_queue.push_back(ip_packet);
     }
 }
 
@@ -171,13 +232,13 @@ impl phy::Device for RouteDriver {
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let buffer = self.inner.lock().route_receive();
 
-        if let Some(router) = self.router.upgrade() {
-            router.recv_from_iface(buffer);
-            return None;
-        }
+        // if let Some(router) = self.router.upgrade() {
+        //     router.recv_from_iface(buffer);
+        //     return None;
+        // }
 
         if buffer.is_empty() {
-            return Option::None;
+            return None;
         }
         let rx = RouteRxToken {
             driver: self.clone(),
@@ -186,7 +247,7 @@ impl phy::Device for RouteDriver {
         let tx = RouteTxToken {
             driver: self.clone(),
         };
-        return Option::Some((rx, tx));
+        Some((rx, tx))
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
@@ -214,6 +275,8 @@ pub struct InnerRouteInterface {
     kobj_common: KObjectCommonData,
 
     router: Weak<Router>,
+    // 本接口的子网信息
+    subnet: Option<IpCidr>,
 }
 
 impl Default for InnerRouteInterface {
@@ -223,6 +286,7 @@ impl Default for InnerRouteInterface {
             device_common: DeviceCommonData::default(),
             kobj_common: KObjectCommonData::default(),
             router: Weak::default(),
+            subnet: None,
         }
     }
 }
@@ -259,6 +323,51 @@ impl RouteInterface {
         })
     }
 
+    // fn send_via_raw_socket(&self, ip_packet: Vec<u8>, dst_ip: Ipv4Addr) {
+    //     let raw_rx_buffer =
+    //         RawSocketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 1024]);
+    //     let raw_tx_buffer =
+    //         RawSocketBuffer::new(vec![raw::PacketMetadata::EMPTY; 4], vec![0; 1024]);
+    //     let raw_socket = raw::Socket::new(
+    //         smoltcp::wire::IpVersion::Ipv4,
+    //         smoltcp::wire::IpProtocol::Unknown(0), // 接受所有协议
+    //         raw_rx_buffer,
+    //         raw_tx_buffer,
+    //     );
+    // }
+
+    pub fn inject_l3_packet_for_sending(&self, ip_packet: Vec<u8>) {
+        let mut device = self.driver.inner.lock();
+        device.inject_l3_packet(ip_packet);
+    }
+
+    pub fn receive_frame_from_hardware(&self, frame: Vec<u8>) {
+        let mut device = self.driver.inner.lock();
+        device.inject_ether(frame);
+    }
+
+    pub fn get_outgoing_frame(&self) -> Option<Vec<u8>> {
+        let mut device = self.driver.inner.lock();
+        device.pop_tx_frame()
+    }
+
+    pub fn set_subnet(&self, cidr: IpCidr) {
+        let mut inner = self.inner();
+        inner.subnet = Some(cidr);
+    }
+
+    pub fn subnet(&self) -> Option<IpCidr> {
+        self.inner().subnet
+    }
+
+    pub fn is_in_subnet(&self, ip: Ipv4Addr) -> bool {
+        if let Some(subnet) = self.subnet() {
+            subnet.contains_addr(&IpAddress::Ipv4(ip))
+        } else {
+            false
+        }
+    }
+
     pub fn attach_router(&self, router: Arc<Router>) {
         self.inner().router = Arc::downgrade(&router);
         self.driver.force_get_mut().attach_router(router);
@@ -271,7 +380,7 @@ impl RouteInterface {
         });
     }
 
-    pub fn add_default_route_to_peer(&self, ip: IpAddress) {
+    pub fn add_default_route(&self, ip: IpAddress) {
         let iface = &mut self.common.smol_iface.lock_irqsave();
 
         iface.routes_mut().update(|routes_map| {
@@ -288,6 +397,17 @@ impl RouteInterface {
 
     fn inner(&self) -> SpinLockGuard<InnerRouteInterface> {
         return self.inner.lock();
+    }
+
+    pub fn is_self_ip(&self, dst_ip: Ipv4Addr) -> bool {
+        let iface = self.common.smol_iface.lock();
+        iface.ip_addrs().iter().any(|cidr| {
+            if let IpAddress::Ipv4(ip) = cidr.address() {
+                ip == dst_ip
+            } else {
+                false
+            }
+        })
     }
 
     // pub fn send()!!!

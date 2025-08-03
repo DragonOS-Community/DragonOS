@@ -218,9 +218,14 @@ impl MountFSInode {
     }
 
     fn do_absolute_path(&self) -> Result<String, SystemError> {
-        let mut path_parts = Vec::new();
         let mut current = self.self_ref.upgrade().unwrap();
 
+        // For special inode, we can directly get the absolute path
+        if let Ok(p) = current.inner_inode.absolute_path() {
+            return Ok(p);
+        }
+
+        let mut path_parts = Vec::new();
         while current.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
             let name = current.dname()?;
             path_parts.push(name.0);
@@ -253,7 +258,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        return self.inner_inode.close(data);
+        self.inner_inode.close(data)
     }
 
     fn create_with_data(
@@ -479,15 +484,30 @@ impl IndexNode for MountFSInode {
         if self.is_mountpoint_root()? {
             return Err(SystemError::EBUSY);
         }
+        // WARNING: we can't get absolute_path from self,
+        // because new ROOT has not been set yet.
+        let path = from.absolute_path()?;
+
         // debug!("from {:?}, to {:?}", from, self);
-        let new_mount_fs = from.umount()?;
+        let old_mount_fs = from.umount()?;
+
+        // WARNING: We need to recreate the MountFS with the new mount point
+        let new_mount_fs = MountFS::new(
+            old_mount_fs.inner_filesystem.clone(),
+            Some(self.self_ref.upgrade().unwrap()),
+        );
+
+        // remember the mount point infomation
+        // replace current mountpoints with a new BTreeMap
+        // *new_mount_fs.mountpoints.lock() = old_mount_fs.mountpoints.lock().clone();
+
         self.mount_fs
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
 
-        // MOUNT_LIST().remove(from.absolute_path()?);
-        // MOUNT_LIST().insert(self.absolute_path()?, new_mount_fs.clone());
+        // update MOUNT_LIST
+        MOUNT_LIST().insert(path, new_mount_fs.clone());
         return Ok(new_mount_fs);
     }
 

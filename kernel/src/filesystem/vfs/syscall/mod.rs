@@ -1285,7 +1285,8 @@ impl Syscall {
 
         let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
-        let inode = inode.lookup(path.as_str())?;
+        let inode =
+            inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)?;
         if inode.metadata()?.file_type != FileType::SymLink {
             return Err(SystemError::EINVAL);
         }

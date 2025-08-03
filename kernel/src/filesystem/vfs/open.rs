@@ -171,14 +171,8 @@ fn do_sys_openat2(
     let path = path.trim();
 
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
-    let inode: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(
-        &path,
-        if follow_symlink {
-            VFS_MAX_FOLLOW_SYMLINK_TIMES
-        } else {
-            0
-        },
-    );
+    let inode =
+        inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_symlink);
 
     let inode: Arc<dyn IndexNode> = match inode {
         Ok(inode) => inode,

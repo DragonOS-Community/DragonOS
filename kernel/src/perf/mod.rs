@@ -282,6 +282,10 @@ impl IndexNode for PerfEventInode {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode> {
         Ok(self)
     }
+
+    fn absolute_path(&self) -> core::result::Result<String, SystemError> {
+        Ok(String::from("perf_event"))
+    }
 }
 
 impl PollableInode for PerfEventInode {

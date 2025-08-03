@@ -1,4 +1,5 @@
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
@@ -25,6 +26,7 @@ pub struct NullInode {
     fs: Weak<DevFS>,
     /// INode 元数据
     metadata: Metadata,
+    parent: Weak<LockedDevFSInode>,
 }
 
 #[derive(Debug)]
@@ -36,6 +38,7 @@ impl LockedNullInode {
             // uuid: Uuid::new_v5(),
             self_ref: Weak::default(),
             fs: Weak::default(),
+            parent: Weak::default(),
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),
@@ -65,6 +68,10 @@ impl LockedNullInode {
 impl DeviceINode for LockedNullInode {
     fn set_fs(&self, fs: Weak<DevFS>) {
         self.0.lock().fs = fs;
+    }
+
+    fn set_parent(&self, parent: Weak<super::LockedDevFSInode>) {
+        self.0.lock().parent = parent;
     }
 }
 
@@ -134,5 +141,13 @@ impl IndexNode for LockedNullInode {
         }
 
         Ok(len)
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let parent = self.0.lock().parent.upgrade();
+        if let Some(parent) = parent {
+            return Ok(parent);
+        }
+        Err(SystemError::ENOENT)
     }
 }

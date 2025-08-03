@@ -145,16 +145,18 @@ impl File {
             }
         }
 
+        let private_data = SpinLock::new(FilePrivateData::default());
+        inode.open(private_data.lock(), &mode)?;
+
         let f = File {
             inode,
             offset: AtomicUsize::new(0),
             mode: RwLock::new(mode),
             file_type,
             readdir_subdirs_name: SpinLock::new(Vec::default()),
-            private_data: SpinLock::new(FilePrivateData::default()),
+            private_data,
             cred: ProcessManager::current_pcb().cred(),
         };
-        f.inode.open(f.private_data.lock(), &mode)?;
 
         return Ok(f);
     }

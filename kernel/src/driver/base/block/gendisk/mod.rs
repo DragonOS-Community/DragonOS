@@ -13,7 +13,7 @@ use system_error::SystemError;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
-        devfs::{DevFS, DeviceINode},
+        devfs::{DevFS, DeviceINode, LockedDevFSInode},
         vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
     },
     libs::{rwlock::RwLock, spinlock::SpinLockGuard},
@@ -32,6 +32,7 @@ pub struct GenDisk {
 
     device_num: DeviceNumber,
 
+    parent: RwLock<Weak<LockedDevFSInode>>,
     fs: RwLock<Weak<DevFS>>,
     metadata: Metadata,
     /// 对应/dev/下的设备名
@@ -69,6 +70,7 @@ impl GenDisk {
             block_size_log2: bsizelog2,
             idx,
             device_num,
+            parent: RwLock::new(Weak::default()),
             fs: RwLock::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
@@ -212,9 +214,11 @@ impl IndexNode for GenDisk {
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
         self.fs.read().upgrade().unwrap()
     }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
+
     fn read_at(
         &self,
         _offset: usize,
@@ -224,6 +228,7 @@ impl IndexNode for GenDisk {
     ) -> Result<usize, SystemError> {
         Err(SystemError::EPERM)
     }
+
     fn write_at(
         &self,
         _offset: usize,
@@ -233,20 +238,50 @@ impl IndexNode for GenDisk {
     ) -> Result<usize, SystemError> {
         Err(SystemError::EPERM)
     }
+
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
         Err(SystemError::ENOSYS)
     }
+
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         Ok(self.metadata.clone())
     }
+
     fn dname(&self) -> Result<DName, SystemError> {
         Ok(self.name.clone())
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let parent = self.parent.read();
+        if let Some(parent) = parent.upgrade() {
+            return Ok(parent as Arc<dyn IndexNode>);
+        }
+        Err(SystemError::ENOENT)
+    }
+
+    fn close(
+        &self,
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn open(
+        &self,
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _mode: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        Ok(())
     }
 }
 
 impl DeviceINode for GenDisk {
     fn set_fs(&self, fs: alloc::sync::Weak<crate::filesystem::devfs::DevFS>) {
         *self.fs.write() = fs;
+    }
+
+    fn set_parent(&self, parent: Weak<LockedDevFSInode>) {
+        *self.parent.write() = parent;
     }
 }
 

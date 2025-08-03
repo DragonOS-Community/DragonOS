@@ -9,6 +9,7 @@ use crate::{
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
+        devpts::devpts_init,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         ramfs::RamFS,
@@ -61,7 +62,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
     let root_inode = mount_fs.root_inode();
     init_mountlist();
     unsafe {
-        __ROOT_INODE = Some(root_inode.clone());
+        __ROOT_INODE = Some(root_inode);
     }
 
     procfs_init().expect("Failed to initialize procfs");
@@ -112,6 +113,9 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         __ROOT_INODE = Some(new_root_inode.clone());
         drop(old_root_inode);
     }
+
+    // WARNING: mount devpts after devfs has been mounted,
+    devpts_init().expect("Failed to initialize devpts");
 
     info!("VFS: Migrate filesystems done!");
 

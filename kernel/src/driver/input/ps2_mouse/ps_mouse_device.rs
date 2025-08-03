@@ -28,7 +28,7 @@ use crate::{
     },
     exception::InterruptArch,
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
+        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         vfs::{
             syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
@@ -207,6 +207,7 @@ impl Ps2MouseDevice {
                     raw_dev: DeviceNumber::default(), // 这里用来作为device number
                 },
                 device_inode_fs: None,
+                parent: Weak::new(),
             }),
             kobj_state: LockedKObjectState::new(None),
         };
@@ -424,6 +425,7 @@ struct InnerPs2MouseDevice {
 
     /// device inode要求的字段
     device_inode_fs: Option<Weak<DevFS>>,
+    parent: Weak<LockedDevFSInode>,
     devfs_metadata: Metadata,
 }
 
@@ -587,6 +589,10 @@ impl DeviceINode for Ps2MouseDevice {
     fn set_fs(&self, fs: Weak<DevFS>) {
         self.inner.lock_irqsave().device_inode_fs = Some(fs);
     }
+
+    fn set_parent(&self, parent: Weak<crate::filesystem::devfs::LockedDevFSInode>) {
+        self.inner.lock_irqsave().parent = parent;
+    }
 }
 
 impl IndexNode for Ps2MouseDevice {
@@ -663,6 +669,14 @@ impl IndexNode for Ps2MouseDevice {
 
     fn dname(&self) -> Result<DName, SystemError> {
         Ok(DName::from(self.name()))
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let guard = self.inner.lock_irqsave();
+        if let Some(parent) = guard.parent.upgrade() {
+            return Ok(parent);
+        }
+        Err(SystemError::ENOENT)
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
@@ -23,6 +24,7 @@ pub struct ZeroInode {
     self_ref: Weak<LockedZeroInode>,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<DevFS>,
+    parent: Weak<LockedDevFSInode>,
     /// INode 元数据
     metadata: Metadata,
 }
@@ -35,6 +37,7 @@ impl LockedZeroInode {
         let inode = ZeroInode {
             // uuid: Uuid::new_v5(),
             self_ref: Weak::default(),
+            parent: Weak::default(),
             fs: Weak::default(),
             metadata: Metadata {
                 dev_id: 1,
@@ -65,6 +68,10 @@ impl LockedZeroInode {
 impl DeviceINode for LockedZeroInode {
     fn set_fs(&self, fs: Weak<DevFS>) {
         self.0.lock().fs = fs;
+    }
+
+    fn set_parent(&self, parent: Weak<LockedDevFSInode>) {
+        self.0.lock().parent = parent;
     }
 }
 
@@ -142,5 +149,13 @@ impl IndexNode for LockedZeroInode {
         }
 
         Ok(len)
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let parent = self.0.lock().parent.upgrade();
+        if let Some(parent) = parent {
+            return Ok(parent as Arc<dyn IndexNode>);
+        }
+        Err(SystemError::ENOENT)
     }
 }

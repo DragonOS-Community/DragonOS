@@ -405,6 +405,10 @@ impl IndexNode for SocketInode {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Ok(self)
     }
+
+    fn absolute_path(&self) -> Result<String, SystemError> {
+        Ok(String::from("socket"))
+    }
 }
 
 #[derive(Debug)]

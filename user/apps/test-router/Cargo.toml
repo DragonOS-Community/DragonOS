@@ -1,0 +1,12 @@
+[package]
+name = "test-router"
+version = "0.1.0"
+edition = "2021"
+description = "测试路由功能"
+authors = [ "sparkzky <sparkhhhhhhhhhh@outlook.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+smoltcp = { version = "0.9", features = ["medium-ethernet"] }
+etherparse = "0.13"

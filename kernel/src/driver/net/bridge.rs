@@ -342,6 +342,7 @@ impl BridgeIface {
         self.driver.add_port(port);
     }
 
+    #[allow(unused)]
     pub fn remove_port(&self, port_id: BridgePortId) {
         self.driver.remove_port(port_id);
     }

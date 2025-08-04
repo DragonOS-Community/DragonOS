@@ -52,7 +52,9 @@ mod sys_epoll_ctl;
 mod sys_epoll_pwait;
 
 pub mod symlink_utils;
+mod sys_fsync;
 pub mod sys_mount;
+mod sys_sync;
 pub mod sys_umount2;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
@@ -70,6 +72,7 @@ mod sys_dup2;
 mod sys_epoll_create;
 #[cfg(target_arch = "x86_64")]
 mod sys_epoll_wait;
+
 #[cfg(target_arch = "x86_64")]
 mod sys_futimesat;
 #[cfg(target_arch = "x86_64")]

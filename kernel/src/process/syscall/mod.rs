@@ -28,6 +28,9 @@ mod sys_wait4;
 
 #[cfg(target_arch = "x86_64")]
 mod sys_fork;
+
+#[cfg(target_arch = "x86_64")]
+mod sys_getpgrp;
 #[cfg(target_arch = "x86_64")]
 mod sys_getrlimit;
 #[cfg(target_arch = "x86_64")]

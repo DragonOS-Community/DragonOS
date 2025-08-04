@@ -18,7 +18,7 @@ use crate::{
     exception::InterruptArch,
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
-    process::{Pid, ProcessControlBlock, ProcessManager},
+    process::{ProcessControlBlock, ProcessManager, RawPid},
     sched::{schedule, SchedMode},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
@@ -561,7 +561,7 @@ impl Futex {
         if (encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0) && oparg > 31 {
             warn!(
                 "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
-                ProcessManager::current_pcb().pid().data(),
+                ProcessManager::current_pcb().raw_pid().data(),
                 oparg
             );
 
@@ -708,7 +708,7 @@ impl RobustListHead {
         let pcb: Arc<ProcessControlBlock> = if pid == 0 {
             ProcessManager::current_pcb()
         } else {
-            ProcessManager::find(Pid::new(pid)).ok_or(SystemError::ESRCH)?
+            ProcessManager::find_task_by_vpid(RawPid::new(pid)).ok_or(SystemError::ESRCH)?
         };
 
         // TODO: 检查当前进程是否能ptrace另一个进程
@@ -752,7 +752,7 @@ impl RobustListHead {
         };
         // 遍历当前进程/线程的robust list
         for futex_uaddr in head.futexes() {
-            let ret = Self::handle_futex_death(futex_uaddr, pcb.pid().into() as u32);
+            let ret = Self::handle_futex_death(futex_uaddr, pcb.raw_pid().into() as u32);
             if ret.is_err() {
                 return;
             }

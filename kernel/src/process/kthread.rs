@@ -22,7 +22,7 @@ use crate::{
     sched::{schedule, SchedMode},
 };
 
-use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
+use super::{fork::CloneFlags, ProcessControlBlock, ProcessFlags, RawPid};
 
 /// 内核线程的创建任务列表
 static KTHREAD_CREATE_LIST: SpinLock<LinkedList<Arc<KernelThreadCreateInfo>>> =
@@ -263,7 +263,7 @@ pub struct KernelThreadMechanism;
 
 impl KernelThreadMechanism {
     pub fn init_stage1() {
-        assert!(ProcessManager::current_pcb().pid() == Pid::new(0));
+        assert!(ProcessManager::current_pcb().raw_pid() == RawPid::new(0));
         info!("Initializing kernel thread mechanism stage1...");
 
         // 初始化第一个内核线程
@@ -311,12 +311,12 @@ impl KernelThreadMechanism {
             let info = KernelThreadCreateInfo::new(closure, "kthreadd".to_string());
             info.set_to_mark_sleep(false)
                 .expect("kthreadadd should be run first");
-            let kthreadd_pid: Pid = Self::__inner_create(
+            let kthreadd_pid: RawPid = Self::__inner_create(
                 &info,
                 CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGHAND,
             )
             .expect("Failed to create kthread daemon");
-            let pcb = ProcessManager::find(kthreadd_pid).unwrap();
+            let pcb = ProcessManager::find_task_by_vpid(kthreadd_pid).unwrap();
             ProcessManager::wakeup(&pcb).expect("Failed to wakeup kthread daemon");
             unsafe {
                 KTHREAD_DAEMON_PCB.replace(pcb);
@@ -366,7 +366,7 @@ impl KernelThreadMechanism {
     ) -> Option<Arc<ProcessControlBlock>> {
         let pcb = Self::create(func, name)?;
         ProcessManager::wakeup(&pcb)
-            .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.pid()));
+            .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.raw_pid()));
         return Some(pcb);
     }
 
@@ -387,7 +387,7 @@ impl KernelThreadMechanism {
         assert!(
             worker_private.is_some(),
             "kthread stop: worker_private is none, pid: {:?}",
-            pcb.pid()
+            pcb.raw_pid()
         );
         worker_private
             .as_mut()
@@ -434,7 +434,7 @@ impl KernelThreadMechanism {
         assert!(
             worker_private.is_some(),
             "kthread should_stop: worker_private is none, pid: {:?}",
-            pcb.pid()
+            pcb.raw_pid()
         );
         return worker_private
             .as_ref()
@@ -464,7 +464,7 @@ impl KernelThreadMechanism {
             while let Some(info) = list.pop_front() {
                 drop(list);
                 // create a new kernel thread
-                let result: Result<Pid, SystemError> = Self::__inner_create(
+                let result: Result<RawPid, SystemError> = Self::__inner_create(
                     &info,
                     CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGHAND,
                 );

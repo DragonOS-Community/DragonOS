@@ -8,8 +8,8 @@ use super::{
 };
 use crate::{
     driver::base::kobject::KObject,
-    filesystem::vfs::ROOT_INODE,
     libs::{casting::DowncastArc, once::Once},
+    process::ProcessManager,
 };
 use alloc::sync::Arc;
 use log::{info, warn};
@@ -40,9 +40,9 @@ pub fn sysfs_init() -> Result<(), SystemError> {
         // let sysfs: Arc<OldSysFS> = OldSysFS::new();
         let sysfs = SysFS::new();
         unsafe { SYSFS_INSTANCE = Some(sysfs) };
-
+        let root_inode = ProcessManager::current_mntns().root_inode();
         // sysfs 挂载
-        ROOT_INODE()
+        root_inode
             .mkdir("sys", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /sys")
             .mount(sysfs_instance().fs().clone())

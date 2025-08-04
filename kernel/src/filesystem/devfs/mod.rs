@@ -3,11 +3,8 @@ pub mod null_dev;
 pub mod zero_dev;
 
 use super::vfs::{
-    file::FileMode,
-    syscall::ModeType,
-    utils::DName,
-    vcore::{generate_inode_id, ROOT_INODE},
-    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
+    file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
+    FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
@@ -15,6 +12,7 @@ use crate::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::ProcessManager,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -143,7 +141,7 @@ impl DevFS {
                     .unwrap();
 
                 // 特殊处理 tty 设备，挂载在 /dev 下
-                if name.starts_with("tty") && name.len() > 3 {
+                if name.starts_with("tty") && name.len() >= 3 {
                     dev_root_inode.add_dev(name, device.clone())?;
                 } else if name.starts_with("hvc") && name.len() > 3 {
                     // 特殊处理 hvc 设备，挂载在 /dev 下
@@ -685,7 +683,10 @@ pub trait DeviceINode: IndexNode {
 /// @brief 获取devfs实例的强类型不可变引用
 macro_rules! devfs_exact_ref {
     () => {{
-        let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().find("dev");
+        let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> =
+            crate::process::ProcessManager::current_mntns()
+                .root_inode()
+                .find("dev");
         if let Err(e) = devfs_inode {
             error!("failed to get DevFS ref. errcode = {:?}", e);
             return Err(SystemError::ENOENT);
@@ -722,7 +723,8 @@ pub fn devfs_init() -> Result<(), SystemError> {
         // 创建 devfs 实例
         let devfs: Arc<DevFS> = DevFS::new();
         // devfs 挂载
-        ROOT_INODE()
+        let root_inode = ProcessManager::current_mntns().root_inode();
+        root_inode
             .mkdir("dev", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /dev")
             .mount(devfs)

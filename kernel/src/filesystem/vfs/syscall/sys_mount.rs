@@ -3,8 +3,8 @@
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
-        fcntl::AtFlags, mount::MOUNT_LIST, produce_fs, utils::user_path_at, FileSystem, MountFS,
-        MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        fcntl::AtFlags, produce_fs, utils::user_path_at, FileSystem, MountFS, MAX_PATHLEN,
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     process::ProcessManager,
     syscall::{
@@ -127,7 +127,8 @@ pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountF
         mount_point,
     )?;
     let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
+    let result = ProcessManager::current_mntns().get_mount_point(mount_point);
+    if let Some((_, rest, _fs)) = result {
         if rest.is_empty() {
             return Err(SystemError::EBUSY);
         }

@@ -200,36 +200,7 @@ impl SockAddr {
                         crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
                         path.trim(),
                     )?;
-                    let inode0: Result<Arc<dyn IndexNode>, SystemError> =
-                        inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
-
-                    let inode = match inode0 {
-                        Ok(inode) => inode,
-                        Err(_) => {
-                            let (filename, parent_path) =
-                                crate::filesystem::vfs::utils::rsplit_path(&path);
-                            // 查找父目录
-                            log::debug!("filename {:?} parent_path {:?}", filename, parent_path);
-
-                            let parent_inode: Arc<dyn IndexNode> =
-                                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-                            // 创建文件
-                            let inode: Arc<dyn IndexNode> = match parent_inode.create(
-                                filename,
-                                FileType::File,
-                                crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(
-                                    0o755,
-                                ),
-                            ) {
-                                Ok(inode) => inode,
-                                Err(e) => {
-                                    log::debug!("inode create fail {:?}", e);
-                                    return Err(e);
-                                }
-                            };
-                            inode
-                        }
-                    };
+                    let inode = inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
                     return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id, path)));
                 }

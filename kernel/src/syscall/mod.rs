@@ -5,7 +5,6 @@ use core::{
 
 use crate::{
     arch::syscall::nr::*,
-    filesystem::vfs::syscall::PosixStatfs,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::page::PAGE_4K_SIZE,
     net::syscall::MsgHdr,
@@ -15,16 +14,11 @@ use crate::{
 };
 
 use log::{info, warn};
-use num_traits::FromPrimitive;
 use system_error::SystemError;
 use table::{syscall_table, syscall_table_init};
 
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{
-        fcntl::{AtFlags, FcntlCommand},
-        syscall::{ModeType, UtimensFlags},
-    },
     mm::{verify_area, VirtAddr},
     net::syscall::SockAddr,
     time::{
@@ -132,79 +126,6 @@ impl Syscall {
                 Self::put_string(args[0] as *const u8, args[1] as u32, args[2] as u32)
             }
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_RENAME => {
-                let oldname: *const u8 = args[0] as *const u8;
-                let newname: *const u8 = args[1] as *const u8;
-                Self::do_renameat2(
-                    AtFlags::AT_FDCWD.bits(),
-                    oldname,
-                    AtFlags::AT_FDCWD.bits(),
-                    newname,
-                    0,
-                )
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_RENAMEAT => {
-                let oldfd = args[0] as i32;
-                let oldname: *const u8 = args[1] as *const u8;
-                let newfd = args[2] as i32;
-                let newname: *const u8 = args[3] as *const u8;
-                Self::do_renameat2(oldfd, oldname, newfd, newname, 0)
-            }
-
-            SYS_RENAMEAT2 => {
-                let oldfd = args[0] as i32;
-                let oldname: *const u8 = args[1] as *const u8;
-                let newfd = args[2] as i32;
-                let newname: *const u8 = args[3] as *const u8;
-                let flags = args[4] as u32;
-                Self::do_renameat2(oldfd, oldname, newfd, newname, flags)
-            }
-
-            SYS_OPENAT => {
-                let dirfd = args[0] as i32;
-                let path = args[1] as *const u8;
-                let flags = args[2] as u32;
-                let mode = args[3] as u32;
-
-                Self::openat(dirfd, path, flags, mode, true)
-            }
-
-            SYS_LSEEK => {
-                let fd = args[0] as i32;
-                let offset = args[1] as i64;
-                let whence = args[2] as u32;
-
-                Self::lseek(fd, offset, whence)
-            }
-
-            SYS_PREAD64 => {
-                let fd = args[0] as i32;
-                let buf_vaddr = args[1];
-                let len = args[2];
-                let offset = args[3];
-
-                let mut user_buffer_writer =
-                    UserBufferWriter::new(buf_vaddr as *mut u8, len, frame.is_from_user())?;
-                let buf = user_buffer_writer.buffer(0)?;
-                Self::pread(fd, buf, len, offset)
-            }
-
-            SYS_PWRITE64 => {
-                let fd = args[0] as i32;
-                let buf_vaddr = args[1];
-                let len = args[2];
-                let offset = args[3];
-
-                let user_buffer_reader =
-                    UserBufferReader::new(buf_vaddr as *const u8, len, frame.is_from_user())?;
-
-                let buf = user_buffer_reader.read_from_user(0)?;
-                Self::pwrite(fd, buf, len, offset)
-            }
-
             SYS_SBRK => {
                 let incr = args[0] as isize;
                 crate::mm::syscall::sys_sbrk::sys_sbrk(incr)
@@ -218,111 +139,12 @@ impl Syscall {
                 Self::reboot(magic1, magic2, cmd, arg)
             }
 
-            SYS_CHDIR => {
-                let r = args[0] as *const u8;
-                Self::chdir(r)
-            }
-            SYS_FCHDIR => {
-                let fd = args[0] as i32;
-                Self::fchdir(fd)
-            }
-
-            #[allow(unreachable_patterns)]
-            SYS_GETDENTS64 | SYS_GETDENTS => {
-                let fd = args[0] as i32;
-
-                let buf_vaddr = args[1];
-                let len = args[2];
-                let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
-                // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if frame.is_from_user() && verify_area(virt_addr, len).is_err() {
-                    // 来自用户态，而buffer在内核态，这样的操作不被允许
-                    Err(SystemError::EPERM)
-                } else if buf_vaddr == 0 {
-                    Err(SystemError::EFAULT)
-                } else {
-                    let buf: &mut [u8] = unsafe {
-                        core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len)
-                    };
-                    Self::getdents(fd, buf)
-                };
-
-                res
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_MKDIR => {
-                let path = args[0] as *const u8;
-                let mode = args[1];
-
-                Self::mkdir(path, mode)
-            }
-
-            SYS_MKDIRAT => {
-                let dirfd = args[0] as i32;
-                let path = args[1] as *const u8;
-                let mode = args[2];
-                Self::mkdir_at(dirfd, path, mode)
-            }
-
             SYS_CLOCK => Self::clock(),
-            SYS_UNLINKAT => {
-                let dirfd = args[0] as i32;
-                let path = args[1] as *const u8;
-                let flags = args[2] as u32;
-                Self::unlinkat(dirfd, path, flags)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_RMDIR => {
-                let path = args[0] as *const u8;
-                Self::rmdir(path)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_LINK => {
-                let old = args[0] as *const u8;
-                let new = args[1] as *const u8;
-                return Self::link(old, new);
-            }
-
-            SYS_LINKAT => {
-                let oldfd = args[0] as i32;
-                let old = args[1] as *const u8;
-                let newfd = args[2] as i32;
-                let new = args[3] as *const u8;
-                let flags = args[4] as i32;
-                return Self::linkat(oldfd, old, newfd, new, flags);
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_UNLINK => {
-                let path = args[0] as *const u8;
-                Self::unlink(path)
-            }
 
             SYS_SCHED => {
                 warn!("syscall sched");
                 schedule(SchedMode::SM_NONE);
                 Ok(0)
-            }
-            SYS_DUP => {
-                let oldfd: i32 = args[0] as c_int;
-                Self::dup(oldfd)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_DUP2 => {
-                let oldfd: i32 = args[0] as c_int;
-                let newfd: i32 = args[1] as c_int;
-                Self::dup2(oldfd, newfd)
-            }
-
-            SYS_DUP3 => {
-                let oldfd: i32 = args[0] as c_int;
-                let newfd: i32 = args[1] as c_int;
-                let flags: u32 = args[2] as u32;
-                Self::dup3(oldfd, newfd, flags)
             }
 
             SYS_SOCKET => Self::socket(args[0], args[1], args[2]),
@@ -482,58 +304,6 @@ impl Syscall {
                 Self::gettimeofday(timeval, timezone_ptr)
             }
 
-            SYS_GETCWD => {
-                let buf = args[0] as *mut u8;
-                let size = args[1];
-                let security_check = || {
-                    verify_area(VirtAddr::new(buf as usize), size)?;
-                    return Ok(());
-                };
-                let r = security_check();
-                if let Err(e) = r {
-                    Err(e)
-                } else {
-                    let buf = unsafe { core::slice::from_raw_parts_mut(buf, size) };
-                    Self::getcwd(buf)
-                }
-            }
-
-            SYS_FCNTL => {
-                let fd = args[0] as i32;
-                let cmd: Option<FcntlCommand> =
-                    <FcntlCommand as FromPrimitive>::from_u32(args[1] as u32);
-                let arg = args[2] as i32;
-                let res = if let Some(cmd) = cmd {
-                    Self::fcntl(fd, cmd, arg)
-                } else {
-                    Err(SystemError::EINVAL)
-                };
-
-                // debug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
-                res
-            }
-
-            SYS_FTRUNCATE => {
-                let fd = args[0] as i32;
-                let len = args[1];
-                let res = Self::ftruncate(fd, len);
-                // debug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
-                res
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_MKNOD => {
-                let path = args[0];
-                let flags = args[1];
-                let dev_t = args[2];
-                let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-                Self::mknod(
-                    path as *const u8,
-                    flags,
-                    crate::driver::base::device::device_number::DeviceNumber::from(dev_t as u32),
-                )
-            }
-
             SYS_FUTEX => {
                 let uaddr = VirtAddr::new(args[0]);
                 let operation = FutexFlag::from_bits(args[1] as u32).ok_or(SystemError::ENOSYS)?;
@@ -575,26 +345,6 @@ impl Syscall {
                 let ret = Self::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
                 return ret;
             }
-
-            SYS_STATFS => {
-                let path = args[0] as *const u8;
-                let statfs = args[1] as *mut PosixStatfs;
-                Self::statfs(path, statfs)
-            }
-
-            SYS_FSTATFS => {
-                let fd = args[0] as i32;
-                let statfs = args[1] as *mut PosixStatfs;
-                Self::fstatfs(fd, statfs)
-            }
-
-            SYS_STATX => Self::statx(
-                args[0] as i32,
-                args[1],
-                args[2] as u32,
-                args[3] as u32,
-                args[4],
-            ),
 
             // 目前为了适配musl-libc,以下系统调用先这样写着
             SYS_GETRANDOM => {
@@ -644,44 +394,6 @@ impl Syscall {
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
-            #[cfg(target_arch = "x86_64")]
-            SYS_READLINK => {
-                let path = args[0] as *const u8;
-                let buf = args[1] as *mut u8;
-                let bufsiz = args[2];
-                Self::readlink(path, buf, bufsiz)
-            }
-
-            SYS_READLINKAT => {
-                let dirfd = args[0] as i32;
-                let path = args[1] as *const u8;
-                let buf = args[2] as *mut u8;
-                let bufsiz = args[3];
-                Self::readlink_at(dirfd, path, buf, bufsiz)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_ACCESS => {
-                let pathname = args[0] as *const u8;
-                let mode = args[1] as u32;
-                Self::access(pathname, mode)
-            }
-
-            SYS_FACCESSAT => {
-                let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
-                let mode = args[2] as u32;
-                Self::faccessat2(dirfd, pathname, mode, 0)
-            }
-
-            SYS_FACCESSAT2 => {
-                let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
-                let mode = args[2] as u32;
-                let flags = args[3] as u32;
-                Self::faccessat2(dirfd, pathname, mode, flags)
-            }
-
             SYS_CLOCK_GETTIME => {
                 let clockid = args[0] as i32;
                 let timespec = args[1] as *mut PosixTimeSpec;
@@ -698,35 +410,6 @@ impl Syscall {
                 Self::umask(mask)
             }
 
-            SYS_FCHOWN => {
-                let dirfd = args[0] as i32;
-                let uid = args[1];
-                let gid = args[2];
-                Self::fchown(dirfd, uid, gid)
-            }
-            #[cfg(target_arch = "x86_64")]
-            SYS_CHOWN => {
-                let pathname = args[0] as *const u8;
-                let uid = args[1];
-                let gid = args[2];
-                Self::chown(pathname, uid, gid)
-            }
-            #[cfg(target_arch = "x86_64")]
-            SYS_LCHOWN => {
-                let pathname = args[0] as *const u8;
-                let uid = args[1];
-                let gid = args[2];
-                Self::lchown(pathname, uid, gid)
-            }
-            SYS_FCHOWNAT => {
-                let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
-                let uid = args[2];
-                let gid = args[3];
-                let flag = args[4] as i32;
-                Self::fchownat(dirfd, pathname, uid, gid, flag)
-            }
-
             SYS_FSYNC => {
                 warn!("SYS_FSYNC has not yet been implemented");
                 Ok(0)
@@ -735,24 +418,6 @@ impl Syscall {
             SYS_RSEQ => {
                 warn!("SYS_RSEQ has not yet been implemented");
                 Err(SystemError::ENOSYS)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_CHMOD => {
-                let pathname = args[0] as *const u8;
-                let mode = args[1] as u32;
-                Self::chmod(pathname, mode)
-            }
-            SYS_FCHMOD => {
-                let fd = args[0] as i32;
-                let mode = args[1] as u32;
-                Self::fchmod(fd, mode)
-            }
-            SYS_FCHMODAT => {
-                let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
-                let mode = args[2] as u32;
-                Self::fchmodat(dirfd, pathname, mode)
             }
 
             SYS_SCHED_YIELD => Self::do_sched_yield(),
@@ -775,9 +440,6 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-            SYS_NEWFSTATAT => Self::newfstatat(args[0] as i32, args[1], args[2], args[3] as u32),
-
             // SYS_SCHED_YIELD => Self::sched_yield(),
             SYS_PRCTL => {
                 // todo: 这个系统调用还没有实现
@@ -791,24 +453,6 @@ impl Syscall {
                 Self::alarm(second)
             }
 
-            SYS_UTIMENSAT => Self::sys_utimensat(
-                args[0] as i32,
-                args[1] as *const u8,
-                args[2] as *const PosixTimeSpec,
-                args[3] as u32,
-            ),
-            #[cfg(target_arch = "x86_64")]
-            SYS_FUTIMESAT => {
-                let flags = UtimensFlags::empty();
-                Self::sys_utimensat(
-                    args[0] as i32,
-                    args[1] as *const u8,
-                    args[2] as *const PosixTimeSpec,
-                    flags.bits(),
-                )
-            }
-            #[cfg(target_arch = "x86_64")]
-            SYS_UTIMES => Self::sys_utimes(args[0] as *const u8, args[1] as *const PosixTimeval),
             #[cfg(target_arch = "x86_64")]
             SYS_EVENTFD => {
                 let initval = args[0] as u32;

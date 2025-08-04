@@ -1,5 +1,6 @@
 mod sys_clone;
 mod sys_execve;
+mod sys_execveat;
 mod sys_exit;
 mod sys_exit_group;
 mod sys_get_rusage;
@@ -27,6 +28,9 @@ mod sys_wait4;
 
 #[cfg(target_arch = "x86_64")]
 mod sys_fork;
+
+#[cfg(target_arch = "x86_64")]
+mod sys_getpgrp;
 #[cfg(target_arch = "x86_64")]
 mod sys_getrlimit;
 #[cfg(target_arch = "x86_64")]

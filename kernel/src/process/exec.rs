@@ -1,11 +1,16 @@
-use core::{fmt::Debug, ptr::null};
+use core::{fmt::Debug, ptr::null, sync::atomic::Ordering};
 
 use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
+use crate::process::Signal;
+
 use crate::{
     driver::base::block::SeekFrom,
-    filesystem::vfs::file::{File, FileMode},
+    filesystem::vfs::{
+        file::{File, FileMode},
+        IndexNode,
+    },
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -13,7 +18,9 @@ use crate::{
     },
 };
 
-use super::ProcessManager;
+use super::{
+    namespace::nsproxy::exec_task_namespaces, ProcessControlBlock, ProcessFlags, ProcessManager,
+};
 
 /// 系统支持的所有二进制文件加载器的列表
 const BINARY_LOADERS: [&'static dyn BinaryLoader; 1] = [&ELF_LOADER];
@@ -49,6 +56,7 @@ impl BinaryLoaderResult {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ExecError {
+    SystemError(SystemError),
     /// 二进制文件不可执行
     NotExecutable,
     /// 二进制文件不是当前架构的
@@ -67,9 +75,11 @@ pub enum ExecError {
     BadAddress(Option<VirtAddr>),
     Other(String),
 }
+
 impl From<ExecError> for SystemError {
     fn from(val: ExecError) -> Self {
         match val {
+            ExecError::SystemError(e) => e,
             ExecError::NotExecutable => SystemError::ENOEXEC,
             ExecError::WrongArchitecture => SystemError::ENOEXEC,
             ExecError::PermissionDenied => SystemError::EACCES,
@@ -111,15 +121,12 @@ pub enum ExecLoadMode {
 #[allow(dead_code)]
 impl ExecParam {
     pub fn new(
-        file_path: &str,
+        file_inode: Arc<dyn IndexNode>,
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
-        let pwd = ProcessManager::current_pcb().pwd_inode();
-        let inode = pwd.lookup(file_path)?;
-
         // 读取文件头部，用于判断文件类型
-        let file = File::new(inode, FileMode::O_RDONLY)?;
+        let file = File::new(file_inode, FileMode::O_RDONLY)?;
 
         Ok(Self {
             file,
@@ -162,6 +169,43 @@ impl ExecParam {
     pub fn file(self) -> File {
         self.file
     }
+
+    /// Calling this is the point of no return. None of the failures will be
+    /// seen by userspace since either the process is already taking a fatal
+    /// signal.
+    ///
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1246
+    pub fn begin_new_exec(&mut self) -> Result<(), ExecError> {
+        let me = ProcessManager::current_pcb();
+        // todo: 补充linux的逻辑
+        de_thread(&me).map_err(ExecError::SystemError)?;
+
+        me.flags().remove(ProcessFlags::FORKNOEXEC);
+
+        exec_task_namespaces().map_err(ExecError::SystemError)?;
+        Ok(())
+    }
+
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c?fi=setup_new_exec#1443
+    pub fn setup_new_exec(&mut self) {
+        // todo!("setup_new_exec logic");
+    }
+}
+
+/// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
+fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+    ProcessManager::current_pcb()
+        .sig_struct_irqsave()
+        .reset_sighandlers();
+    // todo: 该函数未正确实现
+    let tg_empty = pcb.threads_read_irqsave().thread_group_empty();
+    if tg_empty {
+        pcb.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+        return Ok(());
+    }
+    log::warn!("de_thread: todo impl thread group logic");
+
+    return Ok(());
 }
 
 /// ## 加载二进制文件

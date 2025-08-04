@@ -128,7 +128,7 @@ pub struct File {
     readdir_subdirs_name: SpinLock<Vec<String>>,
     pub private_data: SpinLock<FilePrivateData>,
     /// 文件的凭证
-    cred: Cred,
+    cred: Arc<Cred>,
 }
 
 impl File {
@@ -505,7 +505,7 @@ impl Drop for File {
         if r.is_err() {
             error!(
                 "pid: {:?} failed to close file: {:?}, errno={:?}",
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 self,
                 r.as_ref().unwrap_err()
             );
@@ -642,7 +642,7 @@ impl FileDescriptorVec {
                     if let Err(r) = self.drop_fd(i as i32) {
                         error!(
                             "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
-                            ProcessManager::current_pcb().pid(),
+                            ProcessManager::current_pcb().raw_pid(),
                             i,
                             r
                         );

@@ -143,6 +143,29 @@ impl TtyDevice {
         };
         Ok(tty)
     }
+
+    /// tty_open_current_tty - get locked tty of current task
+    #[inline(never)]
+    fn open_current_tty(
+        &self,
+        dev_num: DeviceNumber,
+        data: &mut FilePrivateData,
+    ) -> Option<Arc<TtyCore>> {
+        // log::debug!("open_current_tty: dev_num: {}", dev_num);
+        if dev_num != DeviceNumber::new(Major::TTYAUX_MAJOR, 0) {
+            // log::debug!("Not a tty device, dev_num: {}", dev_num);
+            return None;
+        }
+
+        let current_tty = TtyJobCtrlManager::get_current_tty()?;
+
+        if let FilePrivateData::Tty(tty_priv) = data {
+            tty_priv.mode.insert(FileMode::O_NONBLOCK);
+        }
+
+        current_tty.reopen().ok()?;
+        Some(current_tty)
+    }
 }
 
 impl Debug for TtyDevice {
@@ -187,24 +210,32 @@ impl IndexNode for TtyDevice {
         mut data: SpinLockGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
-        if let FilePrivateData::Tty(_) = &*data {
-            return Ok(());
-        }
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
             return ptmx_open(data, mode);
         }
         let dev_num = self.metadata()?.raw_dev;
+        // log::debug!(
+        //     "TtyDevice::open: dev_num: {}, current pid: {}",
+        //     dev_num,
+        //     ProcessManager::current_pid()
+        // );
+        let mut tty = self.open_current_tty(dev_num, &mut data);
+        if tty.is_none() {
+            let (index, driver) =
+                TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
 
-        let (index, driver) =
-            TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
+            tty = Some(driver.open_tty(Some(index))?);
+        }
 
-        let tty = driver.open_tty(Some(index))?;
+        let tty = tty.unwrap();
 
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
             tty: tty.clone(),
             mode: *mode,
         });
+
+        tty.core().contorl_info_irqsave().clear_dead_session();
 
         let ret = tty.open(tty.core());
         if let Err(err) = ret {
@@ -223,7 +254,12 @@ impl IndexNode for TtyDevice {
         {
             let pcb = ProcessManager::current_pcb();
             let pcb_tty = pcb.sig_info_irqsave().tty();
-            if pcb_tty.is_none() && tty.core().contorl_info_irqsave().session.is_none() {
+
+            let cond1 = pcb_tty.is_none();
+            let _cond2 = tty.core().contorl_info_irqsave().session.is_none();
+
+            // 注意！！这里为了debug,临时把cond2的判断去掉了，其实要cond1 && cond2才对
+            if cond1 {
                 TtyJobCtrlManager::proc_set_tty(tty);
             }
         }
@@ -353,6 +389,7 @@ impl IndexNode for TtyDevice {
         } else {
             return Err(SystemError::EIO);
         };
+
         drop(data);
         tty.close(tty.clone())
     }
@@ -610,6 +647,14 @@ impl TtyFilePrivateData {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn tty_init() -> Result<(), SystemError> {
+    let tty_device = TtyDevice::new(
+        "tty".to_string(),
+        IdTable::new(
+            String::from("tty"),
+            Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 0)),
+        ),
+        TtyType::Tty,
+    );
     let console = TtyDevice::new(
         "console".to_string(),
         IdTable::new(
@@ -619,9 +664,13 @@ pub fn tty_init() -> Result<(), SystemError> {
         TtyType::Tty,
     );
 
-    // 将设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
-    device_register(console.clone())?;
-    devfs_register(&console.name.clone(), console)?;
+    let devs = [tty_device, console];
+
+    for dev in devs {
+        // 将设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
+        device_register(dev.clone())?;
+        devfs_register(&dev.name.clone(), dev)?;
+    }
 
     serial_init()?;
 

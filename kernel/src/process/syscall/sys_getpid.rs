@@ -16,13 +16,8 @@ impl Syscall for SysGetPid {
     /// 获取当前进程的pid
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        // if let Some(pid_ns) = &current_pcb.get_nsproxy().read().pid_namespace {
-        //     // 获取该进程在命名空间中的 PID
-        //     return Ok(current_pcb.pid_strcut().read().numbers[pid_ns.level].nr);
-        //     // 返回命名空间中的 PID
-        // }
-        // 默认返回 tgid
-        return Ok(current_pcb.tgid().into());
+
+        Ok(current_pcb.task_pid_vnr().into())
     }
 
     fn entry_format(&self, _args: &[usize]) -> Vec<FormattedSyscallParam> {

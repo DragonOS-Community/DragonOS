@@ -326,6 +326,46 @@ impl IndexNode for LockedExt4Inode {
     fn dname(&self) -> Result<DName, SystemError> {
         Ok(self.0.lock().dname.clone())
     }
+
+    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+        
+        // 调用another_ext4库的getxattr接口
+        let value = ext4.getxattr(inode_num, name)?;
+        
+        // 如果缓冲区为空，只返回需要的长度
+        if buf.is_empty() {
+            return Ok(value.len());
+        }
+        
+        // 检查缓冲区大小是否足够
+        if buf.len() < value.len() {
+            return Err(SystemError::ERANGE);
+        }
+        
+        // 复制数据到缓冲区
+        let copy_len = core::cmp::min(buf.len(), value.len());
+        buf[..copy_len].copy_from_slice(&value[..copy_len]);
+        
+        Ok(copy_len)
+    }
+
+    fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+        let guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        if ext4.getxattr(inode_num, name).is_ok() {
+            ext4.removexattr(inode_num, name)?;
+        }
+
+        // 调用another_ext4库的setxattr接口
+        ext4.setxattr(inode_num, name, value)?;
+        
+        Ok(0)
+    }
 }
 
 impl LockedExt4Inode {

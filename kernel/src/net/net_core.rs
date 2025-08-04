@@ -14,14 +14,17 @@ pub fn net_init() -> Result<(), SystemError> {
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
 
-    // Default iface, misspelled to net_face
     let net_face = binding
         .iter()
-        .find(|(_, iface)| iface.common().is_default_iface())
-        .unwrap()
-        .1
-        .clone();
+        .find(|(_, iface)| iface.name().starts_with("eth"))
+        .map(|(_, iface)| iface.clone());
 
+    if net_face.is_none() {
+        log::warn!("dhcp_query: No net device found!");
+        return Err(SystemError::ENODEV);
+    }
+    let net_face = net_face.unwrap();
+    log::debug!("dhcp_query: net_face={}", net_face.name());
     drop(binding);
 
     // Create sockets

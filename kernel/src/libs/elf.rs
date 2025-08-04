@@ -220,7 +220,10 @@ impl ElfLoader {
         map_flags: &MapFlags,
         total_size: usize,
     ) -> Result<(VirtAddr, bool), SystemError> {
-        // debug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
+        // log::debug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
+        // defer!({
+        //     log::debug!("load_elf_segment done");
+        // });
 
         // 映射位置的偏移量（页内偏移）
         let beginning_page_offset = Self::elf_page_offset(addr_to_map);
@@ -243,7 +246,7 @@ impl ElfLoader {
             if err == SystemError::EEXIST {
                 error!(
                     "Pid: {:?}, elf segment at {:p} overlaps with existing mapping",
-                    ProcessManager::current_pcb().pid(),
+                    ProcessManager::current_pcb().raw_pid(),
                     addr_to_map.as_ptr::<u8>()
                 );
             }
@@ -343,6 +346,9 @@ impl ElfLoader {
         load_bias: usize,
     ) -> Result<BinaryLoaderResult, ExecError> {
         // log::debug!("loading elf interp");
+        // defer!({
+        //     log::debug!("load_elf_interp done");
+        // });
         let mut head_buf = [0u8; 512];
         interp_elf_ex
             .file_mut()
@@ -781,13 +787,17 @@ impl BinaryLoader for ElfLoader {
                     e
                 ))
             })?;
+            let pwd = ProcessManager::current_pcb().pwd_inode();
+            let inode = pwd.lookup(interpreter_path).map_err(|_| {
+                log::error!("Failed to find interpreter path: {}", interpreter_path);
+                return ExecError::InvalidParemeter;
+            })?;
             // log::debug!("opening interpreter at :{}", interpreter_path);
             interpreter = Some(
-                ExecParam::new(interpreter_path, param.vm().clone(), ExecParamFlags::EXEC)
-                    .map_err(|e| {
-                        log::error!("Failed to load interpreter {interpreter_path}: {:?}", e);
-                        return ExecError::NotSupported;
-                    })?,
+                ExecParam::new(inode, param.vm().clone(), ExecParamFlags::EXEC).map_err(|e| {
+                    log::error!("Failed to load interpreter {interpreter_path}: {:?}", e);
+                    return ExecError::NotSupported;
+                })?,
             );
         }
         //TODO 缺少一部分逻辑 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#931
@@ -797,6 +807,11 @@ impl BinaryLoader for ElfLoader {
             // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#950
         }
         Self::parse_gnu_property()?;
+
+        param.begin_new_exec()?;
+
+        // todo: 补充逻辑：https://code.dragonos.org.cn/xref/linux-6.6.21/fs/binfmt_elf.c#1007
+        param.setup_new_exec();
 
         let mut elf_brk = VirtAddr::new(0);
         let mut elf_bss = VirtAddr::new(0);

@@ -36,8 +36,9 @@ fn virtio_probe() -> Result<(), SystemError> {
 fn virtio_probe_pci() {
     let virtio_list = virtio_device_search();
     for virtio_device in virtio_list {
-        let dev_id = virtio_device.common_header.device_id;
-        let dev_id = DeviceId::new(None, Some(format!("{dev_id}"))).unwrap();
+        let bdf: String = virtio_device.common_header.bus_device_function.into();
+        let dev_id = DeviceId::new(None, Some(bdf)).unwrap();
+        // log::info!("virtio device id: probe {:?}", dev_id.id());
         match PciTransport::new::<HalImpl>(virtio_device.clone(), dev_id.clone()) {
             Ok(mut transport) => {
                 debug!(
@@ -100,6 +101,7 @@ fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
     for device in result {
         let standard_device = device.as_standard_device().unwrap();
         let header = &standard_device.common_header;
+        // log::info!("header: {:?}", header);
         if header.device_id >= 0x1000 && header.device_id <= 0x103F {
             virtio_list.push(standard_device);
         }

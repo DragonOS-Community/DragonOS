@@ -142,6 +142,11 @@ impl DevName {
     pub fn id(&self) -> usize {
         return self.id;
     }
+
+    #[inline]
+    pub fn name(&self) -> &str {
+        return self.name.as_ref();
+    }
 }
 
 impl core::fmt::Debug for DevName {

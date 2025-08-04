@@ -22,7 +22,7 @@ use crate::{
             tty_device::{PtyType, TtyDevice, TtyType},
         },
     },
-    filesystem::vfs::{syscall::ModeType, vcore::do_mount_mkdir, FileType},
+    filesystem::vfs::{mount::do_mount_mkdir, syscall::ModeType, FileType},
     init::initcall::INITCALL_FS,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
@@ -189,7 +189,7 @@ impl IndexNode for LockedDevPtsFSInode {
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
-        todo!()
+        self
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {

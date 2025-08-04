@@ -4,6 +4,11 @@ use defer::defer;
 use log::error;
 use system_error::SystemError;
 
+pub use crate::ipc::generic_signal::AtomicGenericSignal as AtomicSignal;
+pub use crate::ipc::generic_signal::GenericSigChildCode as SigChildCode;
+pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
+pub use crate::ipc::generic_signal::GenericSignal as Signal;
+
 use crate::{
     arch::{
         fpu::FpState,
@@ -15,11 +20,10 @@ use crate::{
     exception::InterruptArch,
     ipc::{
         signal::{restore_saved_sigmask, set_current_blocked},
-        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch},
+        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags},
     },
     mm::MemoryManagementArch,
     process::ProcessManager,
-    sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
 };
 
@@ -27,164 +31,6 @@ use crate::{
 pub const STACK_ALIGN: u64 = 16;
 /// 信号最大值
 pub const MAX_SIG_NUM: usize = 64;
-#[allow(dead_code)]
-#[derive(Eq)]
-#[repr(usize)]
-#[allow(non_camel_case_types)]
-#[atomic_enum]
-pub enum Signal {
-    INVALID = 0,
-    SIGHUP = 1,
-    SIGINT,
-    SIGQUIT,
-    SIGILL,
-    SIGTRAP,
-    /// SIGABRT和SIGIOT共用这个号码
-    SIGABRT_OR_IOT,
-    SIGBUS,
-    SIGFPE,
-    SIGKILL,
-    SIGUSR1,
-
-    SIGSEGV = 11,
-    SIGUSR2,
-    SIGPIPE,
-    SIGALRM,
-    SIGTERM,
-    SIGSTKFLT,
-    SIGCHLD,
-    SIGCONT,
-    SIGSTOP,
-    SIGTSTP,
-
-    SIGTTIN = 21,
-    SIGTTOU,
-    SIGURG,
-    SIGXCPU,
-    SIGXFSZ,
-    SIGVTALRM,
-    SIGPROF,
-    SIGWINCH,
-    /// SIGIO和SIGPOLL共用这个号码
-    SIGIO_OR_POLL,
-    SIGPWR,
-
-    SIGSYS = 31,
-
-    SIGRTMIN = 32,
-    SIGRTMAX = 64,
-}
-
-/// 为Signal实现判断相等的trait
-impl PartialEq for Signal {
-    fn eq(&self, other: &Signal) -> bool {
-        *self as usize == *other as usize
-    }
-}
-
-impl From<usize> for Signal {
-    fn from(value: usize) -> Self {
-        if value <= MAX_SIG_NUM {
-            let ret: Signal = unsafe { core::mem::transmute(value) };
-            return ret;
-        } else {
-            error!("Try to convert an invalid number to Signal");
-            return Signal::INVALID;
-        }
-    }
-}
-
-impl From<Signal> for usize {
-    fn from(val: Signal) -> Self {
-        val as usize
-    }
-}
-
-impl From<i32> for Signal {
-    fn from(value: i32) -> Self {
-        if value < 0 {
-            error!("Try to convert an invalid number to Signal");
-            return Signal::INVALID;
-        } else {
-            return Self::from(value as usize);
-        }
-    }
-}
-
-impl From<Signal> for SigSet {
-    fn from(val: Signal) -> Self {
-        SigSet {
-            bits: (1 << (val as usize - 1) as u64),
-        }
-    }
-}
-impl Signal {
-    /// 判断一个数字是否为可用的信号
-    #[inline]
-    pub fn is_valid(&self) -> bool {
-        return (*self) as usize <= MAX_SIG_NUM;
-    }
-
-    /// const convertor between `Signal` and `SigSet`
-    pub const fn into_sigset(self) -> SigSet {
-        SigSet {
-            bits: (1 << (self as usize - 1) as u64),
-        }
-    }
-
-    /// 判断一个信号是不是实时信号
-    ///
-    /// ## 返回值
-    ///
-    /// - `true` 这个信号是实时信号
-    /// - `false` 这个信号不是实时信号
-    #[inline]
-    pub fn is_rt_signal(&self) -> bool {
-        return (*self) as usize >= Signal::SIGRTMIN.into();
-    }
-
-    /// 调用信号的默认处理函数
-    pub fn handle_default(&self) {
-        match self {
-            Signal::INVALID => {
-                error!("attempting to handler an Invalid");
-            }
-            Signal::SIGHUP => sig_terminate(*self),
-            Signal::SIGINT => sig_terminate(*self),
-            Signal::SIGQUIT => sig_terminate_dump(*self),
-            Signal::SIGILL => sig_terminate_dump(*self),
-            Signal::SIGTRAP => sig_terminate_dump(*self),
-            Signal::SIGABRT_OR_IOT => sig_terminate_dump(*self),
-            Signal::SIGBUS => sig_terminate_dump(*self),
-            Signal::SIGFPE => sig_terminate_dump(*self),
-            Signal::SIGKILL => sig_terminate(*self),
-            Signal::SIGUSR1 => sig_terminate(*self),
-            Signal::SIGSEGV => sig_terminate_dump(*self),
-            Signal::SIGUSR2 => sig_terminate(*self),
-            Signal::SIGPIPE => sig_terminate(*self),
-            Signal::SIGALRM => sig_terminate(*self),
-            Signal::SIGTERM => sig_terminate(*self),
-            Signal::SIGSTKFLT => sig_terminate(*self),
-            Signal::SIGCHLD => sig_ignore(*self),
-            Signal::SIGCONT => sig_continue(*self),
-            Signal::SIGSTOP => sig_stop(*self),
-            Signal::SIGTSTP => sig_stop(*self),
-            Signal::SIGTTIN => sig_stop(*self),
-            Signal::SIGTTOU => sig_stop(*self),
-            Signal::SIGURG => sig_ignore(*self),
-            Signal::SIGXCPU => sig_terminate_dump(*self),
-            Signal::SIGXFSZ => sig_terminate_dump(*self),
-            Signal::SIGVTALRM => sig_terminate(*self),
-            Signal::SIGPROF => sig_terminate(*self),
-            Signal::SIGWINCH => sig_ignore(*self),
-            Signal::SIGIO_OR_POLL => sig_terminate(*self),
-            Signal::SIGPWR => sig_terminate(*self),
-            Signal::SIGSYS => sig_terminate(*self),
-            Signal::SIGRTMIN => sig_terminate(*self),
-            Signal::SIGRTMAX => sig_terminate(*self),
-        }
-    }
-}
 
 /// siginfo中的si_code的可选值
 /// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
@@ -237,83 +83,6 @@ bitflags! {
         const SA_RESETHAND = 0x80000000;
         const SA_RESTORER   =0x04000000;
         const SA_ALL = Self::SA_NOCLDSTOP.bits()|Self::SA_NOCLDWAIT.bits()|Self::SA_NODEFER.bits()|Self::SA_ONSTACK.bits()|Self::SA_RESETHAND.bits()|Self::SA_RESTART.bits()|Self::SA_SIGINFO.bits()|Self::SA_RESTORER.bits();
-    }
-
-    /// 请注意，sigset 这个bitmap, 第0位表示sig=1的信号。也就是说，Signal-1才是sigset_t中对应的位
-    #[derive(Default)]
-    pub struct SigSet:u64{
-        const SIGHUP   =  1<<0;
-        const SIGINT   =  1<<1;
-        const SIGQUIT  =  1<<2;
-        const SIGILL   =  1<<3;
-        const SIGTRAP  =  1<<4;
-        /// SIGABRT和SIGIOT共用这个号码
-        const SIGABRT_OR_IOT    =    1<<5;
-        const SIGBUS   =  1<<6;
-        const SIGFPE   =  1<<7;
-        const SIGKILL  =  1<<8;
-        const SIGUSR   =  1<<9;
-        const SIGSEGV  =  1<<10;
-        const SIGUSR2  =  1<<11;
-        const SIGPIPE  =  1<<12;
-        const SIGALRM  =  1<<13;
-        const SIGTERM  =  1<<14;
-        const SIGSTKFLT=  1<<15;
-        const SIGCHLD  =  1<<16;
-        const SIGCONT  =  1<<17;
-        const SIGSTOP  =  1<<18;
-        const SIGTSTP  =  1<<19;
-        const SIGTTIN  =  1<<20;
-        const SIGTTOU  =  1<<21;
-        const SIGURG   =  1<<22;
-        const SIGXCPU  =  1<<23;
-        const SIGXFSZ  =  1<<24;
-        const SIGVTALRM=  1<<25;
-        const SIGPROF  =  1<<26;
-        const SIGWINCH =  1<<27;
-        /// SIGIO和SIGPOLL共用这个号码
-        const SIGIO_OR_POLL    =   1<<28;
-        const SIGPWR   =  1<<29;
-        const SIGSYS   =  1<<30;
-        const SIGRTMIN =  1<<31;
-        // TODO 写上实时信号
-        const SIGRTMAX =  1 << (MAX_SIG_NUM-1);
-    }
-}
-
-/// SIGCHLD si_codes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ToPrimitive)]
-#[allow(dead_code)]
-pub enum SigChildCode {
-    /// child has exited
-    ///
-    /// CLD_EXITED
-    Exited = 1,
-    /// child was killed
-    ///
-    /// CLD_KILLED
-    Killed = 2,
-    /// child terminated abnormally
-    ///
-    /// CLD_DUMPED
-    Dumped = 3,
-    /// traced child has trapped
-    ///
-    /// CLD_TRAPPED
-    Trapped = 4,
-    /// child has stopped
-    ///
-    /// CLD_STOPPED
-    Stopped = 5,
-    /// stopped child has continued
-    ///
-    /// CLD_CONTINUED
-    Continued = 6,
-}
-
-impl From<SigChildCode> for i32 {
-    fn from(value: SigChildCode) -> Self {
-        value as i32
     }
 }
 
@@ -439,7 +208,10 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         return;
     }
 
-    let sig_guard = sig_guard.unwrap();
+    let sig_guard: crate::libs::spinlock::SpinLockGuard<
+        '_,
+        crate::ipc::signal_types::SignalStruct,
+    > = sig_guard.unwrap();
     let mut siginfo_mut_guard = siginfo_mut.unwrap();
     loop {
         (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
@@ -453,7 +225,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
                 SaHandlerType::Error => {
-                    error!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
+                    error!("Trying to handle a Sigerror on Process:{:?}", pcb.raw_pid());
                     return;
                 }
                 SaHandlerType::Default => {
@@ -465,6 +237,22 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
                 }
             },
             SigactionType::SaSigaction(_) => todo!(),
+        }
+
+        /*
+         * Global init gets no signals it doesn't want.
+         * Container-init gets no signals it doesn't want from same
+         * container.
+         *
+         * Note that if global/container-init sees a sig_kernel_only()
+         * signal here, the signal must have been generated internally
+         * or must have come from an ancestor namespace. In either
+         * case, the signal cannot be dropped.
+         */
+        // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/signal.h?fi=sig_kernel_only#444
+        if siginfo_mut_guard.flags().contains(SignalFlags::UNKILLABLE) && !sig_number.kernel_only()
+        {
+            continue;
         }
 
         if sigaction.is_some() {
@@ -495,7 +283,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         error!(
             "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
             sig_number as i32,
-            ProcessManager::current_pcb().pid(),
+            ProcessManager::current_pcb().raw_pid(),
             res.as_ref().unwrap_err()
         );
     }
@@ -557,7 +345,7 @@ impl SignalArch for X86_64SignalArch {
         if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
             error!("rsp doesn't from user level");
             let _r = crate::ipc::kill::kill_process(
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             )
             .map_err(|e| e.to_posix_errno());
@@ -569,7 +357,7 @@ impl SignalArch for X86_64SignalArch {
         if !unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) {
             error!("unable to restore sigcontext");
             let _r = crate::ipc::kill::kill_process(
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             )
             .map_err(|e| e.to_posix_errno());
@@ -661,11 +449,11 @@ fn setup_frame(
                     } else {
                         error!(
                             "pid-{:?} forgot to set SA_FLAG_RESTORER for signal {:?}",
-                            ProcessManager::current_pcb().pid(),
+                            ProcessManager::current_pcb().raw_pid(),
                             sig as i32
                         );
                         let r = crate::ipc::kill::kill_process(
-                            ProcessManager::current_pcb().pid(),
+                            ProcessManager::current_pcb().raw_pid(),
                             Signal::SIGSEGV,
                         );
                         if r.is_err() {
@@ -676,7 +464,7 @@ fn setup_frame(
                     if sigaction.restorer().is_none() {
                         error!(
                             "restorer in process:{:?} is not defined",
-                            ProcessManager::current_pcb().pid()
+                            ProcessManager::current_pcb().raw_pid()
                         );
                         return Err(SystemError::EINVAL);
                     }
@@ -704,8 +492,10 @@ fn setup_frame(
     if r.is_err() {
         // 如果地址区域位于内核空间，则直接报错
         // todo: 生成一个sigsegv
-        let r =
-            crate::ipc::kill::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV);
+        let r = crate::ipc::kill::kill_process(
+            ProcessManager::current_pcb().raw_pid(),
+            Signal::SIGSEGV,
+        );
         if r.is_err() {
             error!("In setup frame: generate SIGSEGV signal failed");
         }
@@ -717,7 +507,7 @@ fn setup_frame(
     info.copy_siginfo_to_user(unsafe { &mut ((*frame).info) as *mut SigInfo })
         .map_err(|e| -> SystemError {
             let r = crate::ipc::kill::kill_process(
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             );
             if r.is_err() {
@@ -734,7 +524,7 @@ fn setup_frame(
             .setup_sigcontext(oldset, trap_frame)
             .map_err(|e: SystemError| -> SystemError {
                 let r = crate::ipc::kill::kill_process(
-                    ProcessManager::current_pcb().pid(),
+                    ProcessManager::current_pcb().raw_pid(),
                     Signal::SIGSEGV,
                 );
                 if r.is_err() {
@@ -778,45 +568,4 @@ fn get_stack(frame: &TrapFrame, size: usize) -> *mut SigFrame {
     rsp &= (!(STACK_ALIGN - 1)) as usize - 8;
     // rsp &= (!(STACK_ALIGN - 1)) as usize;
     return rsp as *mut SigFrame;
-}
-
-/// 信号默认处理函数——终止进程
-fn sig_terminate(sig: Signal) {
-    ProcessManager::exit(sig as usize);
-}
-
-/// 信号默认处理函数——终止进程并生成 core dump
-fn sig_terminate_dump(sig: Signal) {
-    ProcessManager::exit(sig as usize);
-    // TODO 生成 coredump 文件
-}
-
-/// 信号默认处理函数——暂停进程
-fn sig_stop(sig: Signal) {
-    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    ProcessManager::mark_stop().unwrap_or_else(|e| {
-        error!(
-            "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
-            e,
-            ProcessManager::current_pcb(),
-            sig
-        );
-    });
-    drop(guard);
-    schedule(SchedMode::SM_NONE);
-    // TODO 暂停进程
-}
-/// 信号默认处理函数——继续进程
-fn sig_continue(sig: Signal) {
-    ProcessManager::wakeup_stop(&ProcessManager::current_pcb()).unwrap_or_else(|_| {
-        error!(
-            "Failed to wake up process pid = {:?} with signal :{:?}",
-            ProcessManager::current_pcb().pid(),
-            sig
-        );
-    });
-}
-/// 信号默认处理函数——忽略
-fn sig_ignore(_sig: Signal) {
-    return;
 }

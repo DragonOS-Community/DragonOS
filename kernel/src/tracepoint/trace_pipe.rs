@@ -29,6 +29,7 @@ impl TracePipeRaw {
     /// Set the maximum number of records to keep in the trace pipe buffer.
     ///
     /// If the current number of records exceeds this limit, the oldest records will be removed.
+    #[allow(unused)]
     pub fn set_max_record(&mut self, max_record: usize) {
         self.max_record = max_record;
         if self.event_buf.len() > max_record {
@@ -42,11 +43,6 @@ impl TracePipeRaw {
             self.event_buf.remove(0); // Remove the oldest record
         }
         self.event_buf.push(event);
-    }
-
-    /// The number of events currently in the trace pipe buffer.
-    pub fn event_count(&self) -> usize {
-        self.event_buf.len()
     }
 
     /// Clear the trace pipe buffer.
@@ -180,6 +176,38 @@ impl TraceCmdLineCache {
             self.cmdline.truncate(max_len); // Keep only the latest records
         }
     }
+
+    /// Get the maximum number of records in the cache.
+    pub fn max_record(&self) -> usize {
+        self.max_record
+    }
+
+    /// Create a snapshot of the current state of the command line cache.
+    pub fn snapshot(&self) -> TraceCmdLineCacheSnapshot {
+        TraceCmdLineCacheSnapshot::new(self.cmdline.clone())
+    }
+}
+
+#[derive(Debug)]
+pub struct TraceCmdLineCacheSnapshot(Vec<(u32, [u8; 16])>);
+impl TraceCmdLineCacheSnapshot {
+    pub fn new(cmdline: Vec<(u32, [u8; 16])>) -> Self {
+        Self(cmdline)
+    }
+
+    /// Return the first command line entry in the cache.
+    pub fn peek(&self) -> Option<&(u32, [u8; 16])> {
+        self.0.first()
+    }
+
+    /// Remove and return the first command line entry in the cache.
+    pub fn pop(&mut self) -> Option<(u32, [u8; 16])> {
+        if self.0.is_empty() {
+            None
+        } else {
+            Some(self.0.remove(0))
+        }
+    }
 }
 
 pub struct TraceEntryParser;
@@ -196,12 +224,14 @@ impl TraceEntryParser {
         let tracepoint = tracepoint_map.get(&id).expect("TracePoint not found");
         let fmt_func = tracepoint.fmt_func();
         let offset = core::mem::size_of::<TraceEntry>();
-        let str = fmt_func(unsafe { entry.as_ptr().add(offset) });
+        let str = fmt_func(&entry[offset..]);
 
         let time = crate::time::Instant::now().total_micros() * 1000; // Convert to nanoseconds
         let cpu_id = crate::arch::cpu::current_cpu_id().data();
 
-        let pname = cmdline_cache.get(trace_entry.pid as u32).unwrap_or("<...>");
+        // Copy the packed field to a local variable to avoid unaligned reference
+        let pid = trace_entry.pid;
+        let pname = cmdline_cache.get(pid as u32).unwrap_or("<...>");
 
         let secs = time / 1_000_000_000;
         let usec_rem = time % 1_000_000_000 / 1000;
@@ -209,7 +239,7 @@ impl TraceEntryParser {
         format!(
             "{:>16}-{:<7} [{:03}] {} {:5}.{:06}: {}({})\n",
             pname,
-            trace_entry.pid,
+            pid,
             cpu_id,
             trace_entry.trace_print_lat_fmt(),
             secs,

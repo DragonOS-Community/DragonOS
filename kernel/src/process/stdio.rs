@@ -2,16 +2,13 @@ use system_error::SystemError;
 
 use crate::{
     driver::tty::virtual_terminal::vc_manager,
-    filesystem::vfs::{
-        file::{File, FileMode},
-        ROOT_INODE,
-    },
-    process::{Pid, ProcessManager},
+    filesystem::vfs::file::{File, FileMode},
+    process::{ProcessManager, RawPid},
 };
 
 /// @brief 初始化pid=1的进程的stdio
 pub fn stdio_init() -> Result<(), SystemError> {
-    if ProcessManager::current_pcb().pid() != Pid(1) {
+    if ProcessManager::current_pcb().raw_pid() != RawPid(1) {
         return Err(SystemError::EPERM);
     }
     let tty_path = format!(
@@ -20,7 +17,8 @@ pub fn stdio_init() -> Result<(), SystemError> {
             .current_vc_tty_name()
             .expect("Init stdio: can't get tty name")
     );
-    let tty_inode = ROOT_INODE()
+    let root_inode = ProcessManager::current_mntns().root_inode();
+    let tty_inode = root_inode
         .lookup(&tty_path)
         .unwrap_or_else(|_| panic!("Init stdio: can't find {}", tty_path));
 

@@ -36,12 +36,11 @@ impl PosixArgsSocketType {
 }
 
 use alloc::string::String;
-use alloc::sync::Arc;
 use core::ffi::CStr;
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::{FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
     mm::{verify_area, VirtAddr},
     net::socket::unix::ns::abs::{alloc_abs_addr, look_up_abs_addr},
     process::ProcessManager,

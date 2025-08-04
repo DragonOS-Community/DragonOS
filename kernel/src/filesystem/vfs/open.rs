@@ -6,7 +6,7 @@ use super::{
     file::{File, FileMode},
     syscall::{ModeType, OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
-    FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{
     driver::base::block::SeekFrom, process::ProcessManager,
@@ -179,6 +179,7 @@ fn do_sys_openat2(
         },
     );
 
+    let root_inode = ProcessManager::current_mntns().root_inode();
     let inode: Arc<dyn IndexNode> = match inode {
         Ok(inode) => inode,
         Err(errno) => {
@@ -190,7 +191,7 @@ fn do_sys_openat2(
                 let (filename, parent_path) = rsplit_path(&path);
                 // 查找父目录
                 let parent_inode: Arc<dyn IndexNode> =
-                    ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+                    root_inode.lookup(parent_path.unwrap_or("/"))?;
                 // 创建文件
                 let inode: Arc<dyn IndexNode> = parent_inode.create(
                     filename,

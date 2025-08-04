@@ -55,6 +55,12 @@ impl TtyDriverManager {
     pub fn lookup_tty_driver(dev_num: DeviceNumber) -> Option<(usize, Arc<TtyDriver>)> {
         let drivers_guard = TTY_DRIVERS.lock();
         for driver in drivers_guard.iter() {
+            // log::debug!(
+            //     "driver.major: {}, minor_start: {}, device_count: {}",
+            //     driver.major.data(),
+            //     driver.minor_start,
+            //     driver.device_count
+            // );
             let base = DeviceNumber::new(driver.major, driver.minor_start);
             if dev_num < base || dev_num.data() > base.data() + driver.device_count {
                 continue;

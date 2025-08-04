@@ -101,7 +101,6 @@ impl LockedFATFsInfo {
     }
 }
 
-#[derive(Debug)]
 pub struct FATInode {
     /// 指向父Inode的弱引用
     parent: Weak<LockedFATInode>,
@@ -126,6 +125,14 @@ pub struct FATInode {
 
     /// 页缓存
     page_cache: Option<Arc<PageCache>>,
+}
+
+impl Debug for FATInode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FATInode")
+            .field("inode_id", &self.metadata.inode_id)
+            .finish()
+    }
 }
 
 impl FATInode {

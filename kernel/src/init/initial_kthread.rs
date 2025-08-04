@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use alloc::{ffi::CString, string::ToString};
+use alloc::ffi::CString;
 use log::{debug, error};
 use system_error::SystemError;
 
@@ -10,7 +10,6 @@ use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::net::e1000e::e1000e::e1000e_init,
     filesystem::vfs::vcore::mount_root_fs,
-    namespaces::NsProxy,
     net::net_core::net_init,
     process::{
         exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
@@ -160,11 +159,12 @@ fn run_init_process(
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
     compiler_fence(Ordering::SeqCst);
-    ProcessManager::current_pcb().set_nsproxy(NsProxy::new()); // 初始化init进程的namespace
     let path = proc_init_info.proc_name.to_str().unwrap();
 
+    let pwd = ProcessManager::current_pcb().pwd_inode();
+    let inode = pwd.lookup(path)?;
     do_execve(
-        path.to_string(),
+        inode,
         proc_init_info.args.clone(),
         proc_init_info.envs.clone(),
         trap_frame,

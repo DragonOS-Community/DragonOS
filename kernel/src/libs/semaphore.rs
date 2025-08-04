@@ -54,7 +54,7 @@ impl Semaphore {
                 //如果唤醒失败,打印错误信息
                 debug!(
                     "Semaphore wakeup failed: current pid= {}, semaphore={:?}",
-                    ProcessManager::current_pcb().pid().into(),
+                    ProcessManager::current_pcb().raw_pid().into(),
                     self
                 );
             }

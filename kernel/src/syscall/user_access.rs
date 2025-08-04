@@ -7,8 +7,12 @@ use core::{
 };
 
 use alloc::{ffi::CString, vec::Vec};
+use defer::defer;
 
-use crate::mm::{verify_area, VirtAddr};
+use crate::{
+    arch::MMArch,
+    mm::{verify_area, MemoryManagementArch, VirtAddr},
+};
 
 use super::SystemError;
 
@@ -37,6 +41,10 @@ pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemErro
 
 pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
     verify_area(dest, src.len()).map_err(|_| SystemError::EFAULT)?;
+    MMArch::disable_kernel_wp();
+    defer!({
+        MMArch::enable_kernel_wp();
+    });
 
     let p = dest.data() as *mut u8;
     // 拷贝数据
@@ -326,11 +334,11 @@ impl<'a> UserBufferWriter<'a> {
     }
 
     fn convert_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut [T], SystemError> {
-        if offset >= src.len() {
+        if offset > src.len() {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &mut [u8] = &mut src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 || byte_buffer.is_empty() {
+        if byte_buffer.len() % core::mem::size_of::<T>() != 0 {
             return Err(SystemError::EINVAL);
         }
 

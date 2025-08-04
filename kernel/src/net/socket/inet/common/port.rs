@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::{
     arch::rand::rand,
     libs::spinlock::SpinLock,
-    process::{Pid, ProcessManager},
+    process::{ProcessManager, RawPid},
 };
 
 use super::Types::{self, *};
@@ -14,9 +14,9 @@ use super::Types::{self, *};
 #[derive(Debug)]
 pub struct PortManager {
     // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, Pid>>,
+    tcp_port_table: SpinLock<HashMap<u16, RawPid>>,
     // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, Pid>>,
+    udp_port_table: SpinLock<HashMap<u16, RawPid>>,
 }
 
 impl PortManager {

@@ -149,18 +149,37 @@ impl X86_64MMArch {
     /// - `error_code`: 错误标志
     /// - `address`: 发生缺页异常的虚拟地址
     pub fn do_kern_addr_fault(
-        _regs: &'static TrapFrame,
+        regs: &'static TrapFrame,
         error_code: X86PfErrorCode,
         address: VirtAddr,
     ) {
+        unsafe { crate::debug::traceback::lookup_kallsyms(regs.rip, 0xff) };
+        let pcb = crate::process::ProcessManager::current_pcb();
+        let kstack_guard_addr = pcb.kernel_stack().guard_page_address();
+        if let Some(guard_page) = kstack_guard_addr {
+            let guard_page_size = pcb.kernel_stack().guard_page_size().unwrap();
+            if address.data() >= guard_page.data()
+                && address.data() < guard_page.data() + guard_page_size
+            {
+                // 发生在内核栈保护页上
+                error!(
+                    "kernel stack guard page fault at {:#x}, guard page range: {:#x} - {:#x}",
+                    address.data(),
+                    guard_page.data(),
+                    guard_page.data() + guard_page_size
+                );
+            }
+        }
         panic!(
             "do_kern_addr_fault has not yet been implemented, 
-        fault address: {:#x}, 
+        fault address: {:#x},
+        rip: {:#x},
         error_code: {:#b}, 
         pid: {}\n",
             address.data(),
+            regs.rip,
             error_code,
-            crate::process::ProcessManager::current_pid().data()
+            pcb.raw_pid().data()
         );
         //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/mm/fault.c#do_kern_addr_fault
     }
@@ -263,7 +282,8 @@ impl X86_64MMArch {
                     if !space_guard.can_extend_stack(region.start() - address) {
                         // exceeds stack limit
                         log::error!(
-                            "stack limit exceeded, error_code: {:?}, address: {:#x}",
+                            "pid {} stack limit exceeded, error_code: {:?}, address: {:#x}",
+                            ProcessManager::current_pid().data(),
                             error_code,
                             address.data(),
                         );
@@ -281,8 +301,10 @@ impl X86_64MMArch {
                         });
                 } else {
                     log::error!(
-                        "No mapped vma, error_code: {:?}, address: {:#x}, flags: {:?}",
+                        "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",
+                        ProcessManager::current_pid().data(),
                         error_code,
+                        regs.rip,
                         address.data(),
                         flags
                     );

@@ -347,6 +347,7 @@ impl KernelCmdlineManager {
                             log::warn!("cmdline: parameter {} is set twice", p.name);
                             continue;
                         }
+
                         p.value = Some(CString::new(value.unwrap()).unwrap());
                         p.initialized = true;
                     }

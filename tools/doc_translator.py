@@ -24,7 +24,7 @@ import json
 from pathlib import Path
 import sys
 import threading
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import openai
 import datetime
 import time
@@ -212,14 +212,16 @@ class DocumentTranslator:
         for block in exclude_blocks:
             text = text.replace(block, '')
 
-        # 处理多行代码块
-        code_blocks = re.findall(r"```.*?\n.*?```", text, re.DOTALL)
+        # 处理多行代码块 - 修正的正则表达式
+        # 匹配以```开头（可选语言标识符）并以```结尾的多行代码块
+        code_blocks = re.findall(r"^```[a-zA-Z]*\n.*?\n```$", text, re.MULTILINE | re.DOTALL)
         for i, block in enumerate(code_blocks):
             placeholder = f"__CODE_BLOCK_{i}__"
             preserved[placeholder] = block
             text = text.replace(block, placeholder)
-        # 处理内联代码块
-        inline_code = re.findall(r"`[^`]+`", text)
+        
+        # 处理内联代码块 - 确保不匹配已经处理的多行代码块
+        inline_code = re.findall(r"`[^`\n]+`", text)
         for i, code in enumerate(inline_code):
             placeholder = f"__INLINE_CODE_{i}__"
             preserved[placeholder] = code
@@ -241,18 +243,20 @@ class DocumentTranslator:
 
         return text
 
-    def _remove_thinking(self, text: str) -> str:
+    def _remove_thinking(self, text: Optional[str]) -> str:
         """Remove <think> tags from text"""
+        if text is None:
+            return ""
         return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
 
-    def _translate_chunk(self, args: Tuple[str, str]) -> str:
+    def _translate_chunk(self, args: Tuple[str, str]) -> Optional[str]:
         """翻译单个文本块(内部方法，用于并行处理)"""
         chunk, lang = args
         retry = 3
         while retry > 0:
             try:
                 lang_name = CONFIG["target_languages"].get(lang, "English")
-                prompt = f"你是一个专业的文档翻译助手，请将以下中文技术文档准确翻译成{lang_name}，保持技术术语的正确性和格式不变。"
+                prompt = f"你是一个专业的文档翻译助手，请将以下中文技术文档准确翻译成{lang_name}，保持技术术语的正确性和格式不变.\n直接输出翻译后的内容，不要添加任何额外的无关内容。\n\n"
 
                 # disable qwen3's thinking mode
                 if "qwen3" in CONFIG["model"].lower():
@@ -273,11 +277,12 @@ class DocumentTranslator:
             except Exception as e:
                 retry -= 1
                 if retry == 0:
-                    print("翻译失败: {e}，放弃重试。")
+                    print(f"翻译失败: {e}，放弃重试。")
                     return None
 
                 print(f"翻译出错: {e}, retrying... ({retry})")
                 time.sleep(2)
+        return None
 
     def translate_text(self, text: str, lang: str) -> str:
         """使用openai接口翻译文本
@@ -396,9 +401,65 @@ class DocumentTranslator:
 
         print(f"标题已添加到 {lang_root_doc_path}")
 
-    def run(self):
-        """运行翻译流程"""
+    def cleanup_deleted_source_files(self, dry_run=False):
+        """清理源文件已删除的翻译文件
+        Args:
+            dry_run: 如果为True，仅预览而不实际执行删除操作
+        """
+        print(f"Checking for deleted source files (dry_run={dry_run})...")
+        cleaned_count = 0
+        log_file = os.path.join(CONFIG["source_dir"], "cleanup.log")
+        log_entries = []
+        
+        for lang in CONFIG["target_languages"]:
+            lang_dir = os.path.join(CONFIG["source_dir"], "locales", lang)
+            if not os.path.exists(lang_dir):
+                continue
+                
+            for root, _, files in os.walk(lang_dir):
+                for file in files:
+                    if not file.endswith((".rst", ".md")):
+                        continue
+                        
+                    # 获取翻译文件相对路径
+                    trans_rel_path = os.path.relpath(os.path.join(root, file), lang_dir)
+                    # 对应的源文件路径
+                    source_path = os.path.join(CONFIG["source_dir"], trans_rel_path)
+                    
+                    if not os.path.exists(source_path):
+                        # 源文件不存在，处理翻译文件
+                        trans_file = os.path.join(root, file)
+                        log_entry = f"[{'DRY RUN' if dry_run else 'DELETED'}] {trans_rel_path}"
+                        log_entries.append(log_entry)
+                        print(log_entry)
+                        
+                        if not dry_run:
+                            os.remove(trans_file)
+                            # 从缓存中移除
+                            cache_key = self._get_cache_key(trans_rel_path, lang)
+                            with self._cache_lock:
+                                if cache_key in self._cache:
+                                    del self._cache[cache_key]
+                                    self._save_cache()
+                        cleaned_count += 1
+        
+        if cleaned_count > 0:
+            if not dry_run:
+                self._save_cache()
+                # 写入日志文件
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write("\n".join(log_entries) + "\n")
+            print(f"Found {cleaned_count} orphaned translation files {'(dry run)' if dry_run else ''}")
+        else:
+            print("No orphaned translation files found")
 
+    def run(self, dry_run=False):
+        """运行翻译流程
+        Args:
+            dry_run: 如果为True，仅预览清理操作而不实际执行
+        """
+        self.cleanup_deleted_source_files(dry_run=dry_run)
+        
         print("Collecting all files...")
         all_files = []
         for root, dirs, files in os.walk(CONFIG["source_dir"], topdown=True):
@@ -459,6 +520,15 @@ class DocumentTranslator:
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='DragonOS文档翻译工具')
+    parser.add_argument('--cleanup-only', action='store_true', 
+                       help='仅执行清理操作，不进行翻译')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='预览清理操作而不实际执行')
+    args = parser.parse_args()
+
     print("Starting translation process...")
     print("WORKERS: ", CONFIG["max_workers"])
     print("LANGUAGES: ", CONFIG["target_languages"])
@@ -466,7 +536,11 @@ if __name__ == "__main__":
     print("MODEL: ", CONFIG["model"])
 
     translator = DocumentTranslator()
-    translator.run()
+    
+    if args.cleanup_only:
+        translator.cleanup_deleted_source_files(dry_run=args.dry_run)
+    else:
+        translator.run(dry_run=args.dry_run)
     
     if translator.fail_count > 0:
         sys.exit(1)

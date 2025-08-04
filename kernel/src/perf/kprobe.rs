@@ -11,7 +11,7 @@ use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::SpinLockGuard;
 use crate::perf::util::PerfProbeArgs;
-use crate::perf::PerfEventOps;
+use crate::perf::{BasicPerfEbpfCallBack, PerfEventOps};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt::Debug;
 use kprobe::{CallBackFunc, ProbeArgs};
-use rbpf::EbpfVmRawOwned;
+use rbpf::EbpfVmRaw;
 use system_error::SystemError;
 #[derive(Debug)]
 pub struct KprobePerfEvent {
@@ -40,33 +40,49 @@ impl KprobePerfEvent {
             .downcast_arc::<BpfProg>()
             .ok_or(SystemError::EINVAL)?;
         let prog_slice = file.insns();
-        let mut vm = EbpfVmRawOwned::new(Some(prog_slice.to_vec())).map_err(|e| {
+
+        let prog_slice =
+            unsafe { core::slice::from_raw_parts(prog_slice.as_ptr(), prog_slice.len()) };
+        let mut vm = EbpfVmRaw::new(Some(prog_slice)).map_err(|e| {
             log::error!("create ebpf vm failed: {:?}", e);
             SystemError::EINVAL
         })?;
-        vm.register_helper_set(BPF_HELPER_FUN_SET.get())
-            .map_err(|_| SystemError::EINVAL)?;
+
+        for (id, f) in BPF_HELPER_FUN_SET.get() {
+            vm.register_helper(*id, *f)
+                .map_err(|_| SystemError::EINVAL)?;
+        }
+
         // create a callback to execute the ebpf prog
-        let callback = Box::new(KprobePerfCallBack::new(file, vm));
+        let callback;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::perf::JITMem;
+
+            log::info!("Using JIT compilation for BPF program on x86_64 architecture");
+            let jit_mem = Box::new(JITMem::new());
+            let jit_mem = Box::leak(jit_mem);
+            let jit_mem_addr = core::ptr::from_ref::<JITMem>(jit_mem) as usize;
+            vm.set_jit_exec_memory(jit_mem).unwrap();
+            vm.jit_compile().unwrap();
+            let basic_callback = BasicPerfEbpfCallBack::new(file, vm, jit_mem_addr);
+            callback = Box::new(KprobePerfCallBack(basic_callback));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            vm.register_allowed_memory(0..u64::MAX);
+            let basic_callback = BasicPerfEbpfCallBack::new(file, vm);
+            callback = Box::new(KprobePerfCallBack(basic_callback));
+        }
+
         // update callback for kprobe
         self.kprobe.write().update_event_callback(callback);
         Ok(())
     }
 }
 
-pub struct KprobePerfCallBack {
-    _bpf_prog_file: Arc<BpfProg>,
-    vm: EbpfVmRawOwned,
-}
-
-impl KprobePerfCallBack {
-    fn new(bpf_prog_file: Arc<BpfProg>, vm: EbpfVmRawOwned) -> Self {
-        Self {
-            _bpf_prog_file: bpf_prog_file,
-            vm,
-        }
-    }
-}
+pub struct KprobePerfCallBack(BasicPerfEbpfCallBack);
 
 impl CallBackFunc for KprobePerfCallBack {
     fn call(&self, trap_frame: &dyn ProbeArgs) {
@@ -78,10 +94,7 @@ impl CallBackFunc for KprobePerfCallBack {
                 size_of::<KProbeContext>(),
             )
         };
-        let res = self.vm.execute_program(probe_context);
-        if res.is_err() {
-            log::error!("kprobe callback error: {:?}", res);
-        }
+        self.0.call(probe_context);
     }
 }
 

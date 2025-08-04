@@ -32,6 +32,7 @@ pub mod no_init;
 pub mod page;
 pub mod percpu;
 pub mod syscall;
+pub mod truncate;
 pub mod ucontext;
 
 /// 内核INIT进程的用户地址空间结构体（仅在process_init中初始化）
@@ -694,6 +695,14 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
         }
         ret
     }
+
+    /// 启用 内核态的 Write Protect
+    /// 这样即使在内核态，CPU也会检查页面的写保护位
+    /// 防止内核错误地写入只读页面
+    fn enable_kernel_wp();
+
+    /// 禁用 内核态的 Write Protect
+    fn disable_kernel_wp();
 }
 
 /// @brief 虚拟地址范围

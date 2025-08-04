@@ -199,7 +199,8 @@ impl SockAddr {
                         crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
                         path.trim(),
                     )?;
-                    let inode = inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+                    let inode =
+                        inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
                     return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id, path)));
                 }

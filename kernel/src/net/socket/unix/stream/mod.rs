@@ -162,12 +162,10 @@ impl Socket for StreamSocket {
         //找到对端socket
         let (peer_inode, sun_path) = match server_endpoint {
             Endpoint::Inode((inode, path)) => (inode, path),
-            Endpoint::Unixpath((inode_id, path)) => {
-                match INODE_MAP.read_irqsave().get(&inode_id) {
-                    Some(Endpoint::Inode((inode, _))) => (inode.clone(), path),
-                    _ => return Err(SystemError::EINVAL),
-                }
-            }
+            Endpoint::Unixpath((inode_id, path)) => match INODE_MAP.read_irqsave().get(&inode_id) {
+                Some(Endpoint::Inode((inode, _))) => (inode.clone(), path),
+                _ => return Err(SystemError::EINVAL),
+            },
             Endpoint::Abspath((abs_addr, path)) => {
                 match ABS_INODE_MAP.lock_irqsave().get(&abs_addr.name()) {
                     Some(Endpoint::Inode((inode, _))) => (inode.clone(), path),

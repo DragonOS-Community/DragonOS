@@ -4,9 +4,9 @@ use crate::{
     arch::interrupt::TrapFrame,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
-        syscall::ModeType, utils::rsplit_path, IndexNode, MAX_PATHLEN, ROOT_INODE,
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        syscall::ModeType, utils::rsplit_path, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
+    process::ProcessManager,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::check_and_clone_cstr,
@@ -36,8 +36,9 @@ impl Syscall for SysMknodHandle {
             .map_err(|_| SystemError::EINVAL)?;
         let path = path.as_str().trim();
 
+        let root_inode = ProcessManager::current_mntns().root_inode();
         let inode: Result<Arc<dyn IndexNode>, SystemError> =
-            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
+            root_inode.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         if inode.is_ok() {
             return Err(SystemError::EEXIST);
@@ -46,7 +47,7 @@ impl Syscall for SysMknodHandle {
         let (filename, parent_path) = rsplit_path(path);
 
         // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
+        let parent_inode: Arc<dyn IndexNode> = root_inode
             .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         // 创建nod
         parent_inode.mknod(filename, flags, dev_t)?;

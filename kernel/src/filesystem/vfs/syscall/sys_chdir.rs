@@ -6,7 +6,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CHDIR;
-use crate::filesystem::vfs::{FileType, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES};
+use crate::filesystem::vfs::{FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -83,13 +83,14 @@ impl Syscall for SysChdirHandle {
                 new_path = String::from("/");
             }
         }
-        let inode =
-            match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-                Err(_) => {
-                    return Err(SystemError::ENOENT);
-                }
-                Ok(i) => i,
-            };
+        let root_inode = ProcessManager::current_mntns().root_inode();
+        let inode = match root_inode.lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        {
+            Err(_) => {
+                return Err(SystemError::ENOENT);
+            }
+            Ok(i) => i,
+        };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(new_path);

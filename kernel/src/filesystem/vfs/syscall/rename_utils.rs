@@ -2,7 +2,6 @@ use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::SystemError;
 use crate::filesystem::vfs::MAX_PATHLEN;
-use crate::filesystem::vfs::ROOT_INODE;
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::check_and_clone_cstr;
@@ -47,11 +46,12 @@ pub fn do_renameat2(
     let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
     let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
     //获取父目录
+    let root_inode = ProcessManager::current_mntns().root_inode();
     let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
-    let old_parent_inode = ROOT_INODE()
+    let old_parent_inode = root_inode
         .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
-    let new_parent_inode = ROOT_INODE()
+    let new_parent_inode = root_inode
         .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
     return Ok(0);

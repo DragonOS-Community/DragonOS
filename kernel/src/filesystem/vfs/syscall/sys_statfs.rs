@@ -6,7 +6,6 @@ use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::syscall::PosixStatfs;
 use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::MAX_PATHLEN;
-use crate::filesystem::vfs::ROOT_INODE;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -38,7 +37,8 @@ impl Syscall for SysStatfsHandle {
             .map_err(|_| SystemError::EINVAL)?;
         let pcb = ProcessManager::current_pcb();
         let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
-        let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
+        let root_inode = ProcessManager::current_mntns().root_inode();
+        let inode = root_inode.lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
         let statfs = PosixStatfs::from(inode.fs().super_block());
         writer.copy_one_to_user(&statfs, 0)?;
         return Ok(0);

@@ -40,9 +40,6 @@ fn do_getxattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8, buf_ptr: *mut u8,
     let name = check_and_clone_cstr(name_ptr, None)?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
-    
-    let mut user_buffer_writer = UserBufferWriter::new(buf_ptr, size, true)?;
-    let user_buf = user_buffer_writer.buffer(0)?;
 
     if size == 0 {
         // 只返回需要的缓冲区大小
@@ -50,6 +47,9 @@ fn do_getxattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8, buf_ptr: *mut u8,
         let result_size = inode.getxattr(&name, &mut temp_buf)?;
         Ok(result_size)
     } else {
+        let mut user_buffer_writer = UserBufferWriter::new(buf_ptr, size, true)?;
+        let user_buf = user_buffer_writer.buffer(0)?;
+
         // 读取属性值
         let actual_size = inode.getxattr(&name, user_buf)?;
         Ok(actual_size)

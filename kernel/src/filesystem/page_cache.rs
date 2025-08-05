@@ -316,6 +316,17 @@ impl InnerPageCache {
     pub fn pages_count(&self) -> usize {
         return self.pages.len();
     }
+
+    /// Synchronize the page cache with the storage device.
+    pub fn sync(&mut self) -> Result<(), SystemError> {
+        for page in self.pages.values() {
+            let mut guard = page.write_irqsave();
+            if guard.flags().contains(PageFlags::PG_DIRTY) {
+                crate::mm::page::PageReclaimer::page_writeback(&mut guard, false);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for InnerPageCache {

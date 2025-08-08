@@ -1,3 +1,4 @@
+use crate::filesystem::vfs::vcore::do_unlink_at;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::SystemError;
@@ -45,14 +46,26 @@ pub fn do_renameat2(
     let pcb = ProcessManager::current_pcb();
     let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
     let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
+    
     //获取父目录
     let root_inode = ProcessManager::current_mntns().root_inode();
+    
     let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
     let old_parent_inode = root_inode
         .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    
     let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
     let new_parent_inode = root_inode
         .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    
+    // 检查目标文件是否存在，如果存在则删除（实现覆盖功能）
+    if new_parent_inode.find(new_filename).is_ok() {
+        // 删除目标文件以实现覆盖
+        do_unlink_at(newfd, &filename_to)?;
+    }
+
+    // 执行重命名操作
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
-    return Ok(0);
+    
+    Ok(0)
 }

@@ -1,4 +1,4 @@
-use super::page::{Page, PageFlags};
+use super::page::{page_reclaimer_lock_irqsave, Page, PageFlags};
 use crate::filesystem::page_cache::PageCache;
 use alloc::sync::Arc;
 
@@ -29,4 +29,9 @@ pub fn truncate_inode_pages(page_cache: Arc<PageCache>, start: usize) {
 fn truncate_complete_page(_page_cache: Arc<PageCache>, page: Arc<Page>) {
     let mut guard = page.write_irqsave();
     guard.remove_flags(PageFlags::PG_DIRTY);
+    drop(guard);  // 释放页面锁
+    
+    // 从页面回收器中移除该页面，避免后续访问已释放的inode
+    let paddr = page.phys_address();
+    page_reclaimer_lock_irqsave().remove_page(&paddr);
 }

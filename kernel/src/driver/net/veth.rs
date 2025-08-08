@@ -11,6 +11,7 @@ use crate::driver::base::kobject::{
 };
 use crate::driver::base::kset::KSet;
 use crate::driver::net::bridge::BridgePort;
+use crate::driver::net::route_iface::{RouterEnableDevice, RouterEnableDeviceCommon};
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
@@ -28,7 +29,7 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::phy::{self, RxToken};
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+use smoltcp::wire::{EthernetAddress, EthernetFrame, HardwareAddress, IpAddress, IpCidr};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -37,6 +38,7 @@ pub struct Veth {
     rx_queue: VecDeque<Vec<u8>>,
     /// 对端的 `VethInterface`，在完成数据发送的时候会使用到
     peer: Weak<VethInterface>,
+    self_iface_ref: Weak<VethInterface>,
 }
 
 impl Veth {
@@ -45,6 +47,7 @@ impl Veth {
             name,
             rx_queue: VecDeque::new(),
             peer: Weak::new(),
+            self_iface_ref: Weak::new(),
         }
     }
 
@@ -61,6 +64,9 @@ impl Veth {
                 Self::to_bridge(bridge_data, data);
                 return;
             }
+
+            // 如果是路由设备，则将数据发送到路由器
+            self.to_router(data);
 
             Self::to_peer(&peer, data);
         }
@@ -82,6 +88,13 @@ impl Veth {
             // log::info!("Veth {} sending data to bridge", self.name);
             bridge_driver.driver.enqueue_frame(bridge_data.id, data);
         };
+    }
+
+    fn to_router(&self, data: &[u8]) {
+        if let Some(self_iface) = self.self_iface_ref.upgrade() {
+            let frame = EthernetFrame::new_checked(data).unwrap();
+            self_iface.handle_routable_packet(frame.payload());
+        }
     }
 
     pub fn recv_from_peer(&mut self) -> Option<Vec<u8>> {
@@ -231,7 +244,10 @@ pub struct VethCommonData {
     kobj_common: KObjectCommonData,
     peer_veth: Weak<VethInterface>,
 
+    //TODO 这里其实不用整个port，反而会导致循环引用，可以只留一个BridgeIface
     bridge_port_data: Option<BridgePort>,
+
+    router_common_data: RouterEnableDeviceCommon,
 }
 
 impl Default for VethCommonData {
@@ -242,6 +258,7 @@ impl Default for VethCommonData {
             kobj_common: KObjectCommonData::default(),
             peer_veth: Weak::new(),
             bridge_port_data: None,
+            router_common_data: RouterEnableDeviceCommon::default(),
         }
     }
 }
@@ -281,12 +298,14 @@ impl VethInterface {
 
         let device = Arc::new(VethInterface {
             name,
-            driver: VethDriverWarpper(UnsafeCell::new(driver)),
+            driver: VethDriverWarpper(UnsafeCell::new(driver.clone())),
             common: IfaceCommon::new(iface_id, true, iface),
             inner: SpinLock::new(VethCommonData::default()),
             locked_kobj_state: LockedKObjectState::default(),
             wait_queue: WaitQueue::default(),
         });
+
+        driver.inner.lock().self_iface_ref = Arc::downgrade(&device);
 
         // log::info!("VethInterface {} created with ID {}", device.name, iface_id);
         device
@@ -602,6 +621,41 @@ impl BridgeEnableDevice for VethInterface {
         // log::info!("Now set bridge port data for {}", self.name);
         let mut inner = self.inner.lock_irqsave();
         inner.bridge_port_data = Some(port);
+    }
+}
+
+impl RouterEnableDevice for VethInterface {
+    fn route_and_send(&self, next_hop: IpAddress, ip_packet: &[u8]) {
+        log::info!(
+            "VethInterface {} routing packet to {}",
+            self.iface_name(),
+            next_hop
+        );
+
+        // 构造以太网帧
+        let dst_mac = self.peer_veth().mac();
+        let src_mac = self.mac();
+
+        // 以太网类型为 IPv4
+        let ethertype = [0x08, 0x00];
+
+        let mut frame = Vec::with_capacity(14 + ip_packet.len());
+        frame.extend_from_slice(&dst_mac.0);
+        frame.extend_from_slice(&src_mac.0);
+        frame.extend_from_slice(&ethertype);
+        frame.extend_from_slice(ip_packet);
+
+        // 发送到对端
+        self.driver
+            .force_get_mut()
+            .inner
+            .lock_irqsave()
+            .send_to_peer(&frame);
+    }
+
+    fn is_my_ip(&self, ip: IpAddress) -> bool {
+        let iface = self.common.smol_iface.lock_irqsave();
+        iface.ip_addrs().iter().any(|cidr| cidr.contains_addr(&ip))
     }
 }
 

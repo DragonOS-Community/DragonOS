@@ -58,7 +58,6 @@ struct MacEntryRecord {
 pub struct BridgePort {
     pub id: BridgePortId,
     pub(super) bridge_enable: Arc<dyn BridgeEnableDevice>,
-    //先把这里直接改成driver，去除weak，忽略循环依赖
     pub(super) bridge_driver: Weak<BridgeIface>,
     // 当前接口状态？forwarding, learning, blocking?
     // mac mtu信息

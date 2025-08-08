@@ -10,7 +10,6 @@ use crate::{driver::net::Iface, libs::rwlock::RwLock};
 
 pub mod net_core;
 pub mod posix;
-pub mod routing;
 pub mod socket;
 pub mod syscall;
 

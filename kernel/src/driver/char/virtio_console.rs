@@ -42,7 +42,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use bitmap::traits::BitMapOps;
+use bitmap::{static_bitmap, traits::BitMapOps};
 use core::fmt::Debug;
 use core::fmt::Formatter;
 use core::{
@@ -422,7 +422,7 @@ impl VirtIOConsoleDriver {
 
 #[derive(Debug)]
 struct InnerVirtIOConsoleDriver {
-    id_bmp: bitmap::StaticBitmap<{ VirtIOConsoleDriver::MAX_DEVICES }>,
+    id_bmp: static_bitmap!(VirtIOConsoleDriver::MAX_DEVICES),
     devname: [Option<DevName>; VirtIOConsoleDriver::MAX_DEVICES],
     virtio_driver_common: VirtIODriverCommonData,
     driver_common: DriverCommonData,

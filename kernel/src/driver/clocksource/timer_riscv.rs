@@ -29,7 +29,7 @@ use crate::{
 
 pub struct RiscVSbiTimer;
 
-static SBI_TIMER_INIT_BMP: SpinLock<StaticBitmap<{ PerCpu::MAX_CPU_NUM as usize }>> =
+static SBI_TIMER_INIT_BMP: SpinLock<static_bitmap!(PerCpu::MAX_CPU_NUM as usize)> =
     SpinLock::new(StaticBitmap::new());
 
 static mut INTERVAL_CNT: usize = 0;

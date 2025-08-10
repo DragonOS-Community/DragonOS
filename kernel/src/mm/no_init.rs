@@ -8,7 +8,7 @@
 //! 对于x86:
 //! 这里假设在内核引导文件中，已经填写了前100M的页表，其中，前50M是真实映射到内存的，后面的仅仅创建了页表，表项全部为0。
 
-use bitmap::{StaticBitmap, traits::BitMapOps};
+use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 
 use crate::{
     libs::spinlock::SpinLock,
@@ -45,7 +45,7 @@ impl EarlyRemapPage {
 #[repr(C)]
 pub struct EarlyIoRemapPages {
     pages: [EarlyRemapPage; Self::EARLY_REMAP_PAGES_NUM],
-    bmp: StaticBitmap<{ Self::EARLY_REMAP_PAGES_NUM }>,
+    bmp: static_bitmap!(Self::EARLY_REMAP_PAGES_NUM),
 }
 
 impl EarlyIoRemapPages {

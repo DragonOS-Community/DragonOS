@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <sys/xattr.h>
 #include <unistd.h>
+#include <sys/mount.h>
 
 #ifndef ENOATTR
 #define ENOATTR ENODATA
@@ -57,6 +58,28 @@ static int touch_file(const char *path) {
 	}
 	errno = saved;
 	return 0;
+}
+
+static int ensure_dir(const char *path, mode_t mode) {
+	if (mkdir(path, mode) == 0) return 0;
+	if (errno == EEXIST) return 0;
+	return -1;
+}
+
+static int mount_ext4(const char *source, const char *target) {
+	// 确保挂载点存在（/mnt 也尝试创建，忽略已存在）
+	(void)ensure_dir("/mnt", 0755);
+	if (ensure_dir(target, 0755) != 0) {
+		return -1;
+	}
+	const char *fstype = "ext4";
+	unsigned long flags = 0; // 不使用 MS_BIND
+	const void *data = NULL;
+	return mount(source, target, fstype, flags, data);
+}
+
+static int umount_ext4(const char *target) {
+	return umount(target);
 }
 
 static void test_path_get_set(const char *file) {
@@ -203,11 +226,21 @@ static void test_fd_get_set(const char *file) {
 }
 
 int main(int argc, char **argv) {
-	// 允许通过 argv[1] 指定测试文件的路径，默认当前目录的相对路径
-	const char *file = (argc >= 2 ? argv[1] : "xattr_test_file.txt");
-	const char *symlink_path = "xattr_test_link";
+	// 固定挂载配置与测试路径（无需命令行参数）
+	const char *source = "/dev/vdb";
+	const char *target = "/mnt/ext4";
+	const char *file = "/mnt/ext4/xattr_test_file.txt";
+	const char *symlink_path = "/mnt/ext4/xattr_test_link";
 
-	// 清理现场
+	// 先挂载 ext4
+	if (mount_ext4(source, target) == 0) {
+		pass("mount ext4");
+	} else {
+		fail("mount ext4");
+		goto report;
+	}
+
+	// 清理现场（位于挂载点内）
 	unlink(symlink_path);
 	unlink(file);
 
@@ -231,6 +264,13 @@ int main(int argc, char **argv) {
 	// 清理
 	unlink(symlink_path);
 	unlink(file);
+
+	// 卸载 ext4
+	if (umount_ext4(target) == 0) {
+		pass("umount ext4");
+	} else {
+		fail("umount ext4");
+	}
 
 report:
 	printf("\nSummary: PASS=%d, FAIL=%d, SKIP=%d\n", g_pass, g_fail, g_skip);

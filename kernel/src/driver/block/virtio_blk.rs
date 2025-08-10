@@ -8,7 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use bitmap::traits::BitMapOps;
+use bitmap::{static_bitmap, traits::BitMapOps};
 use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -110,7 +110,7 @@ pub struct VirtIOBlkManager {
 }
 
 struct InnerVirtIOBlkManager {
-    id_bmp: bitmap::StaticBitmap<{ VirtIOBlkManager::MAX_DEVICES }>,
+    id_bmp: static_bitmap!(VirtIOBlkManager::MAX_DEVICES),
     devname: [Option<DevName>; VirtIOBlkManager::MAX_DEVICES],
 }
 

@@ -553,7 +553,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 将当前inode的内容同步到具体设备上
     fn sync(&self) -> Result<(), SystemError> {
-        return Ok(());
+        let page_cache = self.page_cache();
+        if let Some(page_cache) = page_cache {
+            return page_cache.lock_irqsave().sync();
+        }
+        Ok(())
     }
 
     /// ## 创建一个特殊文件节点

@@ -637,6 +637,14 @@ impl IndexNode for MountFSInode {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         self.inner_inode.as_pollable_inode()
     }
+
+    fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.inner_inode.read_sync(offset, buf)
+    }
+
+    fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.inner_inode.write_sync(offset, buf)
+    }
 }
 
 impl FileSystem for MountFS {

@@ -9,7 +9,7 @@ use kdepends::memoffset::offset_of;
 /// Riscv64中断处理入口
 #[unsafe(naked)]
 #[no_mangle]
-#[repr(align(4))]
+#[rustc_align(4)]
 pub unsafe extern "C" fn handle_exception() -> ! {
     core::arch::naked_asm!(
         concat!("
@@ -188,7 +188,10 @@ pub unsafe extern "C" fn ret_from_exception() -> ! {
             ld a0, {off_status}(sp)
 
             ld a2, {off_epc}(sp)
+            .option push
+            .option arch, +zalrsc
             sc.d x0, a2, {off_epc}(sp)
+            .option pop
 
             csrw {csr_status}, a0
             csrw {csr_epc}, a2

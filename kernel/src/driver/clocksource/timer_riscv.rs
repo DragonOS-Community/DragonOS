@@ -1,7 +1,7 @@
 use core::sync::atomic::{compiler_fence, fence, Ordering};
 
 use alloc::{string::ToString, sync::Arc};
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 use system_error::SystemError;
 
 use crate::{

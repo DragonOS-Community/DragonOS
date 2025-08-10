@@ -9,6 +9,7 @@ use crate::{
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
+        devpts::devpts_init,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
@@ -94,6 +95,9 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     unsafe {
         current_mntns.force_change_root_mountfs(new_fs);
     }
+
+    // WARNING: mount devpts after devfs has been mounted,
+    devpts_init().expect("Failed to initialize devpts");
 
     info!("VFS: Migrate filesystems done!");
 

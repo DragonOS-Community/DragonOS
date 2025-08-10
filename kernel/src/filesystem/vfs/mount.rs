@@ -66,7 +66,7 @@ pub struct MountFS {
     /// 用来存储InodeID->挂载点的MountFS的B树
     mountpoints: SpinLock<BTreeMap<InodeId, Arc<MountFS>>>,
     /// 当前文件系统挂载到的那个挂载点的Inode
-    self_mountpoint: Option<Arc<MountFSInode>>,
+    self_mountpoint: RwLock<Option<Arc<MountFSInode>>>,
     /// 指向当前MountFS的弱引用
     self_ref: Weak<MountFS>,
 
@@ -105,7 +105,7 @@ impl MountFS {
         let result = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
             mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint,
+            self_mountpoint: RwLock::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: Lazy::new(),
             propagation,
@@ -125,6 +125,11 @@ impl MountFS {
 
     pub fn set_namespace(&self, namespace: Weak<MntNamespace>) {
         self.namespace.init(namespace);
+    }
+
+    #[inline(never)]
+    pub fn self_mountpoint(&self) -> Option<Arc<MountFSInode>> {
+        self.self_mountpoint.read().as_ref().cloned()
     }
 
     /// @brief 用Arc指针包裹MountFS对象。
@@ -168,10 +173,14 @@ impl MountFS {
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        self.self_mountpoint
-            .as_ref()
+        let r = self
+            .self_mountpoint()
             .ok_or(SystemError::EINVAL)?
-            .do_umount()
+            .do_umount();
+
+        self.self_mountpoint.write().take();
+
+        return r;
     }
 }
 
@@ -244,7 +253,7 @@ impl MountFSInode {
     pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
         if self.is_mountpoint_root()? {
             // 当前inode是它所在的文件系统的root inode
-            match &self.mount_fs.self_mountpoint {
+            match self.mount_fs.self_mountpoint() {
                 Some(inode) => {
                     let inner_inode = inode.parent()?;
                     return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
@@ -282,8 +291,14 @@ impl MountFSInode {
     }
 
     fn do_absolute_path(&self) -> Result<String, SystemError> {
-        let mut path_parts = Vec::new();
         let mut current = self.self_ref.upgrade().unwrap();
+
+        // For special inode, we can directly get the absolute path
+        if let Ok(p) = current.inner_inode.absolute_path() {
+            return Ok(p);
+        }
+
+        let mut path_parts = Vec::new();
         let root_inode = ProcessManager::current_mntns().root_inode();
         let inode_id = root_inode.metadata()?.inode_id;
         while current.metadata()?.inode_id != inode_id {
@@ -318,7 +333,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        return self.inner_inode.close(data);
+        self.inner_inode.close(data)
     }
 
     fn create_with_data(
@@ -559,9 +574,11 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
-
-        // MOUNT_LIST().remove(from.absolute_path()?);
-        // MOUNT_LIST().insert(self.absolute_path()?, new_mount_fs.clone());
+        // 更新当前挂载点的self_mountpoint
+        new_mount_fs
+            .self_mountpoint
+            .write()
+            .replace(self.self_ref.upgrade().unwrap());
         return Ok(new_mount_fs);
     }
 
@@ -602,7 +619,7 @@ impl IndexNode for MountFSInode {
     /// 在默认情况下，性能非常差！！！
     fn dname(&self) -> Result<DName, SystemError> {
         if self.is_mountpoint_root()? {
-            if let Some(inode) = &self.mount_fs.self_mountpoint {
+            if let Some(inode) = self.mount_fs.self_mountpoint() {
                 return inode.inner_inode.dname();
             }
         }
@@ -632,7 +649,7 @@ impl IndexNode for MountFSInode {
 
 impl FileSystem for MountFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
-        match &self.self_mountpoint {
+        match self.self_mountpoint() {
             Some(inode) => return inode.mount_fs.root_inode(),
             // 当前文件系统是rootfs
             None => self.mountpoint_root_inode(),

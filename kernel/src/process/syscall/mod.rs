@@ -13,6 +13,7 @@ mod sys_getppid;
 mod sys_getsid;
 mod sys_gettid;
 mod sys_getuid;
+mod sys_groups;
 mod sys_prlimit64;
 mod sys_set_tid_address;
 mod sys_setfsgid;

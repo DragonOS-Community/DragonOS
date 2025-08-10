@@ -25,11 +25,12 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
+    process::ProcessManager,
     time::PosixTimeSpec,
 };
 
 use self::{file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id};
-pub use self::{file::FilePrivateData, mount::MountFS, vcore::ROOT_INODE};
+pub use self::{file::FilePrivateData, mount::MountFS};
 
 use super::page_cache::PageCache;
 
@@ -713,11 +714,12 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
+        let root_inode = ProcessManager::current_mntns().root_inode();
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (ROOT_INODE().clone(), String::from(rest))
+            (root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))

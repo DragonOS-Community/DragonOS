@@ -10,20 +10,27 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use hashbrown::HashMap;
+use ida::IdAllocator;
 use system_error::SystemError;
 
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         page_cache::PageCache,
-        vfs::{fcntl::AtFlags, vcore::do_mkdir_at, ROOT_INODE},
+        vfs::{fcntl::AtFlags, vcore::do_mkdir_at},
     },
     libs::{
         casting::DowncastArc,
+        lazy_init::Lazy,
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
+    process::{
+        namespace::mnt::{MntNamespace, MountPropagation},
+        ProcessManager,
+    },
 };
 
 use super::{
@@ -31,20 +38,49 @@ use super::{
     IndexNode, InodeId, Magic, PollableInode, SuperBlock,
 };
 
+// MountId类型
+int_like!(MountId, usize);
+
+static MOUNT_ID_ALLOCATOR: SpinLock<IdAllocator> =
+    SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap());
+
+impl MountId {
+    fn alloc() -> Self {
+        let id = MOUNT_ID_ALLOCATOR.lock().alloc().unwrap();
+
+        MountId(id)
+    }
+
+    unsafe fn free(&mut self) {
+        MOUNT_ID_ALLOCATOR.lock().free(self.0);
+    }
+}
+
 const MOUNTFS_BLOCK_SIZE: u64 = 512;
 const MOUNTFS_MAX_NAMELEN: u64 = 64;
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
-#[derive(Debug)]
 pub struct MountFS {
     // MountFS内部的文件系统
     inner_filesystem: Arc<dyn FileSystem>,
     /// 用来存储InodeID->挂载点的MountFS的B树
     mountpoints: SpinLock<BTreeMap<InodeId, Arc<MountFS>>>,
     /// 当前文件系统挂载到的那个挂载点的Inode
-    self_mountpoint: Option<Arc<MountFSInode>>,
+    self_mountpoint: RwLock<Option<Arc<MountFSInode>>>,
     /// 指向当前MountFS的弱引用
     self_ref: Weak<MountFS>,
+
+    namespace: Lazy<Weak<MntNamespace>>,
+    propagation: Arc<MountPropagation>,
+    mount_id: MountId,
+}
+
+impl Debug for MountFS {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MountFS")
+            .field("mount_id", &self.mount_id)
+            .finish()
+    }
 }
 
 /// @brief MountFS的Index Node 注意，这个IndexNode只是一个中间层。它的目的是将具体文件系统的Inode与挂载机制连接在一起。
@@ -63,13 +99,37 @@ impl MountFS {
     pub fn new(
         inner_filesystem: Arc<dyn FileSystem>,
         self_mountpoint: Option<Arc<MountFSInode>>,
+        propagation: Arc<MountPropagation>,
+        mnt_ns: Option<&Arc<MntNamespace>>,
     ) -> Arc<Self> {
-        return Arc::new_cyclic(|self_ref| MountFS {
+        let result = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
             mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint,
+            self_mountpoint: RwLock::new(self_mountpoint),
             self_ref: self_ref.clone(),
+            namespace: Lazy::new(),
+            propagation,
+            mount_id: MountId::alloc(),
         });
+
+        if let Some(mnt_ns) = mnt_ns {
+            result.set_namespace(Arc::downgrade(mnt_ns));
+        }
+
+        result
+    }
+
+    pub fn propagation(&self) -> Arc<MountPropagation> {
+        self.propagation.clone()
+    }
+
+    pub fn set_namespace(&self, namespace: Weak<MntNamespace>) {
+        self.namespace.init(namespace);
+    }
+
+    #[inline(never)]
+    pub fn self_mountpoint(&self) -> Option<Arc<MountFSInode>> {
+        self.self_mountpoint.read().as_ref().cloned()
     }
 
     /// @brief 用Arc指针包裹MountFS对象。
@@ -113,10 +173,23 @@ impl MountFS {
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        self.self_mountpoint
-            .as_ref()
+        let r = self
+            .self_mountpoint()
             .ok_or(SystemError::EINVAL)?
-            .do_umount()
+            .do_umount();
+
+        self.self_mountpoint.write().take();
+
+        return r;
+    }
+}
+
+impl Drop for MountFS {
+    fn drop(&mut self) {
+        // 释放MountId
+        unsafe {
+            self.mount_id.free();
+        }
     }
 }
 
@@ -180,7 +253,7 @@ impl MountFSInode {
     pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
         if self.is_mountpoint_root()? {
             // 当前inode是它所在的文件系统的root inode
-            match &self.mount_fs.self_mountpoint {
+            match self.mount_fs.self_mountpoint() {
                 Some(inode) => {
                     let inner_inode = inode.parent()?;
                     return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
@@ -226,7 +299,9 @@ impl MountFSInode {
         }
 
         let mut path_parts = Vec::new();
-        while current.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
+        let root_inode = ProcessManager::current_mntns().root_inode();
+        let inode_id = root_inode.metadata()?.inode_id;
+        while current.metadata()?.inode_id != inode_id {
             let name = current.dname()?;
             path_parts.push(name.0);
             current = current.do_parent()?;
@@ -464,15 +539,24 @@ impl IndexNode for MountFSInode {
             .downcast_arc::<MountFS>()
             .map(|it| it.inner_filesystem())
             .unwrap_or(fs);
-        let new_mount_fs = MountFS::new(to_mount_fs, Some(self.self_ref.upgrade().unwrap()));
+
+        let new_mount_fs = MountFS::new(
+            to_mount_fs,
+            Some(self.self_ref.upgrade().unwrap()),
+            MountPropagation::new_private(), // 暂时不支持传播，后续会补充完善挂载传播性
+            Some(&ProcessManager::current_mntns()),
+        );
+
         self.mount_fs
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
 
+        // todo: 这里也许不应该存储路径到MountList，而是应该存储inode的引用。因为同一个inner inode的路径在不同的mntns中可能是不一样的。
         let mount_path = self.absolute_path();
+        let mount_path = Arc::new(MountPath::from(mount_path?));
+        ProcessManager::current_mntns().add_mount(mount_path, new_mount_fs.clone())?;
 
-        MOUNT_LIST().insert(mount_path?, new_mount_fs.clone());
         return Ok(new_mount_fs);
     }
 
@@ -484,30 +568,17 @@ impl IndexNode for MountFSInode {
         if self.is_mountpoint_root()? {
             return Err(SystemError::EBUSY);
         }
-        // WARNING: we can't get absolute_path from self,
-        // because new ROOT has not been set yet.
-        let path = from.absolute_path()?;
-
         // debug!("from {:?}, to {:?}", from, self);
-        let old_mount_fs = from.umount()?;
-
-        // WARNING: We need to recreate the MountFS with the new mount point
-        let new_mount_fs = MountFS::new(
-            old_mount_fs.inner_filesystem.clone(),
-            Some(self.self_ref.upgrade().unwrap()),
-        );
-
-        // remember the mount point infomation
-        // replace current mountpoints with a new BTreeMap
-        // *new_mount_fs.mountpoints.lock() = old_mount_fs.mountpoints.lock().clone();
-
+        let new_mount_fs = from.umount()?;
         self.mount_fs
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
-
-        // update MOUNT_LIST
-        MOUNT_LIST().insert(path, new_mount_fs.clone());
+        // 更新当前挂载点的self_mountpoint
+        new_mount_fs
+            .self_mountpoint
+            .write()
+            .replace(self.self_ref.upgrade().unwrap());
         return Ok(new_mount_fs);
     }
 
@@ -548,7 +619,7 @@ impl IndexNode for MountFSInode {
     /// 在默认情况下，性能非常差！！！
     fn dname(&self) -> Result<DName, SystemError> {
         if self.is_mountpoint_root()? {
-            if let Some(inode) = &self.mount_fs.self_mountpoint {
+            if let Some(inode) = self.mount_fs.self_mountpoint() {
                 return inode.inner_inode.dname();
             }
         }
@@ -570,7 +641,7 @@ impl IndexNode for MountFSInode {
 
 impl FileSystem for MountFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
-        match &self.self_mountpoint {
+        match self.self_mountpoint() {
             Some(inode) => return inode.mount_fs.root_inode(),
             // 当前文件系统是rootfs
             None => self.mountpoint_root_inode(),
@@ -617,7 +688,7 @@ impl FileSystem for MountFS {
 /// assert_eq!(format!("{:?}", map), "{\"/\", \"/bin\", \"/dev\", \"/proc\", \"/sys\"}");
 /// // {"/", "/bin", "/dev", "/proc", "/sys"}
 /// ```
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Hash)]
 pub struct MountPath(String);
 
 impl From<&str> for MountPath {
@@ -659,61 +730,45 @@ impl Ord for MountPath {
     }
 }
 
-// 维护一个挂载点的记录，以支持特定于文件系统的索引
-pub struct MountList(RwLock<BTreeMap<MountPath, Arc<MountFS>>>);
-// pub struct MountList(Option<Arc<MountListInner>>);
-static mut __MOUNTS_LIST: Option<Arc<MountList>> = None;
-
-/// # init_mountlist - 初始化挂载列表
-///
-/// 此函数用于初始化系统的挂载列表。挂载列表记录了系统中所有的文件系统挂载点及其属性。
-///
-/// ## 参数
-///
-/// - 无
-///
-/// ## 返回值
-///
-/// - 无
-#[inline(always)]
-pub fn init_mountlist() {
-    unsafe {
-        __MOUNTS_LIST = Some(Arc::new(MountList(RwLock::new(BTreeMap::new()))));
+impl MountPath {
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-/// # MOUNT_LIST - 获取全局挂载列表
-///
-/// 该函数用于获取一个对全局挂载列表的引用。全局挂载列表是系统中所有挂载点的集合。
-///
-/// ## 返回值
-/// - &'static Arc<MountList>: 返回全局挂载列表的引用。
-#[inline(always)]
-#[allow(non_snake_case)]
-pub fn MOUNT_LIST() -> &'static Arc<MountList> {
-    unsafe {
-        return __MOUNTS_LIST.as_ref().unwrap();
-    }
+// 维护一个挂载点的记录，以支持特定于文件系统的索引
+pub struct MountList {
+    mounts: RwLock<HashMap<Arc<MountPath>, Arc<MountFS>>>,
 }
 
 impl MountList {
-    /// # insert - 将文件系统挂载点插入到挂载表中
+    /// # new - 创建新的MountList实例
     ///
-    /// 将一个新的文件系统挂载点插入到挂载表中。如果挂载点已经存在，则会更新对应的文件系统。
-    ///
-    /// 此函数是线程安全的，因为它使用了RwLock来保证并发访问。
-    ///
-    /// ## 参数
-    ///
-    /// - `path`: &str, 挂载点的路径。这个路径会被转换成`MountPath`类型。
-    /// - `fs`: Arc<MountFS>, 共享的文件系统实例。
+    /// 创建一个空的挂载点列表。
     ///
     /// ## 返回值
     ///
-    /// - 无
+    /// - `MountList`: 新的挂载点列表实例
+    pub fn new() -> Arc<Self> {
+        Arc::new(MountList {
+            mounts: RwLock::new(HashMap::new()),
+        })
+    }
+
+    /// Inserts a filesystem mount point into the mount list.
+    ///
+    /// This function adds a new filesystem mount point to the mount list. If a mount point
+    /// already exists at the specified path, it will be updated with the new filesystem.
+    ///
+    /// # Thread Safety
+    /// This function is thread-safe as it uses a RwLock to ensure safe concurrent access.
+    ///
+    /// # Arguments
+    /// * `path` - The mount path where the filesystem will be mounted
+    /// * `fs` - The filesystem instance to be mounted at the specified path
     #[inline]
-    pub fn insert<T: AsRef<str>>(&self, path: T, fs: Arc<MountFS>) {
-        self.0.write().insert(MountPath::from(path.as_ref()), fs);
+    pub fn insert(&self, path: Arc<MountPath>, fs: Arc<MountFS>) {
+        self.mounts.write().insert(path, fs);
     }
 
     /// # get_mount_point - 获取挂载点的路径
@@ -735,11 +790,11 @@ impl MountList {
         &self,
         path: T,
     ) -> Option<(String, String, Arc<MountFS>)> {
-        self.0
+        self.mounts
             .upgradeable_read()
             .iter()
             .filter_map(|(key, fs)| {
-                let strkey = key.as_ref();
+                let strkey = key.as_str();
                 if let Some(rest) = path.as_ref().strip_prefix(strkey) {
                     return Some((strkey.to_string(), rest.to_string(), fs.clone()));
                 }
@@ -763,13 +818,13 @@ impl MountList {
     /// - `Option<Arc<MountFS>>`: 返回一个 `Arc<MountFS>` 类型的可选值，表示被移除的挂载点，如果挂载点不存在则返回 `None`。
     #[inline]
     pub fn remove<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
-        self.0.write().remove(&path.into())
+        self.mounts.write().remove(&path.into())
     }
 }
 
 impl Debug for MountList {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_map().entries(MOUNT_LIST().0.read().iter()).finish()
+        f.debug_map().entries(self.mounts.read().iter()).finish()
     }
 }
 
@@ -811,7 +866,8 @@ pub fn do_mount_mkdir(
         mount_point,
         FileMode::from_bits_truncate(0o755),
     )?;
-    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
+    let result = ProcessManager::current_mntns().get_mount_point(mount_point);
+    if let Some((_, rest, _fs)) = result {
         if rest.is_empty() {
             return Err(SystemError::EBUSY);
         }

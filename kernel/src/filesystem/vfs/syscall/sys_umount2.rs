@@ -2,9 +2,7 @@
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_UMOUNT2},
-    filesystem::vfs::{
-        fcntl::AtFlags, mount::MOUNT_LIST, utils::user_path_at, MountFS, MAX_PATHLEN,
-    },
+    filesystem::vfs::{fcntl::AtFlags, utils::user_path_at, MountFS, MAX_PATHLEN},
     process::ProcessManager,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
@@ -84,8 +82,8 @@ pub fn do_umount2(
 ) -> Result<Arc<MountFS>, SystemError> {
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
     let path = work.absolute_path()? + &rest;
-
-    if let Some(fs) = MOUNT_LIST().remove(path) {
+    let result = ProcessManager::current_mntns().remove_mount(&path);
+    if let Some(fs) = result {
         // Todo: 占用检测
         fs.umount()?;
         return Ok(fs);

@@ -128,7 +128,7 @@ impl Default for LockedDevsMap {
 
 impl LockedDevsMap {
     #[inline(always)]
-    pub fn lock(&self) -> SpinLockGuard<DevsMap> {
+    pub fn lock(&self) -> SpinLockGuard<'_, DevsMap> {
         self.0.lock()
     }
 }

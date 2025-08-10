@@ -653,7 +653,7 @@ impl FrameBufferConsole for BlittingFbConsole {
         Ok(())
     }
 
-    fn fbcon_data(&self) -> SpinLockGuard<super::FrameBufferConsoleData> {
+    fn fbcon_data(&self) -> SpinLockGuard<'_, super::FrameBufferConsoleData> {
         self.fbcon_data.lock()
     }
 

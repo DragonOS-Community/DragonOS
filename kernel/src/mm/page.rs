@@ -510,11 +510,11 @@ impl Page {
         self.phys_addr
     }
 
-    pub fn read_irqsave(&self) -> RwLockReadGuard<InnerPage> {
+    pub fn read_irqsave(&self) -> RwLockReadGuard<'_, InnerPage> {
         self.inner.read_irqsave()
     }
 
-    pub fn write_irqsave(&self) -> RwLockWriteGuard<InnerPage> {
+    pub fn write_irqsave(&self) -> RwLockWriteGuard<'_, InnerPage> {
         self.inner.write_irqsave()
     }
 }

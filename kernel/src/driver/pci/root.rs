@@ -215,7 +215,7 @@ impl PciRoot {
     pub fn external_capabilities(
         &self,
         bus_device_function: BusDeviceFunction,
-    ) -> ExternalCapabilityIterator {
+    ) -> ExternalCapabilityIterator<'_> {
         ExternalCapabilityIterator {
             root: self,
             bus_device_function,

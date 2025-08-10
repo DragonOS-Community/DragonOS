@@ -3290,7 +3290,7 @@ impl KvmVmx {
 impl VmxVCpuPriv {
     pub const PML_ENTITY_NUM: usize = 512;
 
-    pub fn loaded_vmcs(&self) -> SpinLockGuard<LoadedVmcs> {
+    pub fn loaded_vmcs(&self) -> SpinLockGuard<'_, LoadedVmcs> {
         self.loaded_vmcs.lock()
     }
 

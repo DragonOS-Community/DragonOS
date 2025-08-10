@@ -148,7 +148,7 @@ impl MbrDiskPartionTable {
     }
 
     /// # partitions_raw - 获取磁盘的分区信息，不包含磁盘设备信息
-    pub fn partitions_raw(&self) -> MbrPartitionIter {
+    pub fn partitions_raw(&self) -> MbrPartitionIter<'_> {
         MbrPartitionIter::new(self)
     }
 

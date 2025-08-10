@@ -245,7 +245,7 @@ impl TtyDriver {
     }
 
     #[inline]
-    pub fn ttys(&self) -> SpinLockGuard<HashMap<usize, Arc<TtyCore>>> {
+    pub fn ttys(&self) -> SpinLockGuard<'_, HashMap<usize, Arc<TtyCore>>> {
         self.ttys.lock()
     }
 
@@ -431,13 +431,13 @@ impl KObject for TtyDriver {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         todo!()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         todo!()
     }
 

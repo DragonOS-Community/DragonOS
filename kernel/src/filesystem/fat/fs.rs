@@ -893,7 +893,7 @@ impl FATFileSystem {
     /// @brief 获取一个簇迭代器对象
     ///
     /// @param start_cluster 整个FAT链的起始簇号
-    fn cluster_iter(&self, start_cluster: Cluster) -> ClusterIter {
+    fn cluster_iter(&self, start_cluster: Cluster) -> ClusterIter<'_> {
         return ClusterIter {
             current_cluster: Some(start_cluster),
             fs: self,

@@ -39,11 +39,11 @@ impl WaitQueue {
         }
     }
 
-    fn inner_irqsave(&self) -> SpinLockGuard<InnerWaitQueue> {
+    fn inner_irqsave(&self) -> SpinLockGuard<'_, InnerWaitQueue> {
         self.inner.lock_irqsave()
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerWaitQueue> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerWaitQueue> {
         self.inner.lock()
     }
 

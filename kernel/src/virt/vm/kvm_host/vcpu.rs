@@ -35,7 +35,7 @@ impl LockedVirtCpu {
         }
     }
 
-    pub fn lock(&self) -> SpinLockGuard<VirtCpu> {
+    pub fn lock(&self) -> SpinLockGuard<'_, VirtCpu> {
         self.inner.lock()
     }
 }

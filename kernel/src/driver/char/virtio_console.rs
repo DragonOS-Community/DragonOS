@@ -158,7 +158,7 @@ impl VirtIOConsoleDevice {
         Some(dev)
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOConsoleDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOConsoleDevice> {
         self.inner.lock_irqsave()
     }
 }
@@ -225,11 +225,11 @@ impl KObject for VirtIOConsoleDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -401,7 +401,7 @@ impl VirtIOConsoleDriver {
         Arc::new(result)
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOConsoleDriver> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOConsoleDriver> {
         self.inner.lock()
     }
 
@@ -711,11 +711,11 @@ impl KObject for VirtIOConsoleDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

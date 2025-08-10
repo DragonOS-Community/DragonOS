@@ -632,7 +632,7 @@ impl FileDescriptorVec {
     }
 
     #[allow(dead_code)]
-    pub fn iter(&self) -> FileDescriptorIterator {
+    pub fn iter(&self) -> FileDescriptorIterator<'_> {
         return FileDescriptorIterator::new(self);
     }
 

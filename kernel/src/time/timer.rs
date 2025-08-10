@@ -131,7 +131,7 @@ impl Timer {
         return result;
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerTimer> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerTimer> {
         return self.inner.lock_irqsave();
     }
 

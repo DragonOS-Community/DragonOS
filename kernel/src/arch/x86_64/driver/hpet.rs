@@ -169,16 +169,16 @@ impl Hpet {
         return Ok(());
     }
 
-    fn inner(&self) -> RwLockReadGuard<InnerHpet> {
+    fn inner(&self) -> RwLockReadGuard<'_, InnerHpet> {
         self.inner.read()
     }
 
-    fn inner_mut(&self) -> RwLockWriteGuard<InnerHpet> {
+    fn inner_mut(&self) -> RwLockWriteGuard<'_, InnerHpet> {
         self.inner.write()
     }
 
     #[allow(dead_code)]
-    fn timer(&self, index: u8) -> Option<(RwLockReadGuard<InnerHpet>, &HpetTimerRegisters)> {
+    fn timer(&self, index: u8) -> Option<(RwLockReadGuard<'_, InnerHpet>, &HpetTimerRegisters)> {
         let inner = self.inner();
         if index >= self.info.hpet_number {
             return None;
@@ -197,7 +197,7 @@ impl Hpet {
     unsafe fn timer_mut(
         &self,
         index: u8,
-    ) -> Option<(RwLockWriteGuard<InnerHpet>, &mut HpetTimerRegisters)> {
+    ) -> Option<(RwLockWriteGuard<'_, InnerHpet>, &mut HpetTimerRegisters)> {
         let inner = self.inner_mut();
         if index >= self.info.hpet_number {
             return None;
@@ -213,13 +213,13 @@ impl Hpet {
         return Some((inner, timer_regs));
     }
 
-    unsafe fn hpet_regs(&self) -> (RwLockReadGuard<InnerHpet>, &HpetRegisters) {
+    unsafe fn hpet_regs(&self) -> (RwLockReadGuard<'_, InnerHpet>, &HpetRegisters) {
         let inner = self.inner();
         let regs = unsafe { inner.registers_ptr.as_ref() };
         return (inner, regs);
     }
 
-    unsafe fn hpet_regs_mut(&self) -> (RwLockWriteGuard<InnerHpet>, &mut HpetRegisters) {
+    unsafe fn hpet_regs_mut(&self) -> (RwLockWriteGuard<'_, InnerHpet>, &mut HpetRegisters) {
         let mut inner = self.inner_mut();
         let regs = unsafe { inner.registers_ptr.as_mut() };
         return (inner, regs);

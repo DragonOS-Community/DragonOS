@@ -53,7 +53,7 @@ pub struct LockedAhciDisk {
 }
 
 impl LockedAhciDisk {
-    pub fn inner(&self) -> SpinLockGuard<AhciDisk> {
+    pub fn inner(&self) -> SpinLockGuard<'_, AhciDisk> {
         self.inner.lock()
     }
 }
@@ -431,11 +431,11 @@ impl KObject for LockedAhciDisk {
         todo!()
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         todo!()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         todo!()
     }
 

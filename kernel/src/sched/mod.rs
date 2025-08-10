@@ -359,7 +359,7 @@ impl CpuRunQueue {
     /// 获取到rq的可变引用，需要注意的是返回的第二个值需要确保其生命周期
     /// 所以可以说这个函数是unsafe的，需要确保正确性
     /// 在中断上下文，关中断的情况下，此函数是安全的
-    pub fn self_lock(&self) -> (&mut Self, Option<SpinLockGuard<()>>) {
+    pub fn self_lock(&self) -> (&mut Self, Option<SpinLockGuard<'_, ()>>) {
         if self.lock.is_locked()
             && smp_get_processor_id().data() as usize == self.lock_on_who.load(Ordering::SeqCst)
         {
@@ -386,7 +386,7 @@ impl CpuRunQueue {
         }
     }
 
-    fn lock(&self) -> SpinLockGuard<()> {
+    fn lock(&self) -> SpinLockGuard<'_, ()> {
         let guard = self.lock.lock_irqsave();
 
         // 更新在哪一个cpu上锁

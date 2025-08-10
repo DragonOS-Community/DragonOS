@@ -374,7 +374,7 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn lock_irqsave(&self) -> SpinLockGuard<InnerPageCache> {
+    pub fn lock_irqsave(&self) -> SpinLockGuard<'_, InnerPageCache> {
         if self.inner.is_locked() {
             log::error!("page cache already locked");
         }

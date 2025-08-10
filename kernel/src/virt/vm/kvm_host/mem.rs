@@ -119,12 +119,12 @@ impl LockedKvmMemSlot {
     }
 
     #[inline]
-    pub fn read(&self) -> RwLockReadGuard<KvmMemSlot> {
+    pub fn read(&self) -> RwLockReadGuard<'_, KvmMemSlot> {
         self.inner.read()
     }
 
     #[inline]
-    pub fn write(&self) -> RwLockWriteGuard<KvmMemSlot> {
+    pub fn write(&self) -> RwLockWriteGuard<'_, KvmMemSlot> {
         self.inner.write()
     }
 
@@ -192,7 +192,7 @@ impl LockedVmMemSlotSet {
         })
     }
 
-    pub fn lock(&self) -> SpinLockGuard<KvmMemSlotSet> {
+    pub fn lock(&self) -> SpinLockGuard<'_, KvmMemSlotSet> {
         self.inner.lock()
     }
 }

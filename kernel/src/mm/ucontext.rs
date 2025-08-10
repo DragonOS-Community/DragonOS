@@ -1103,7 +1103,7 @@ impl UserMappings {
     }
 
     /// @brief Get the iterator of all VMAs in this process.
-    pub fn iter_vmas(&self) -> hashbrown::hash_set::Iter<Arc<LockedVMA>> {
+    pub fn iter_vmas(&self) -> hashbrown::hash_set::Iter<'_, Arc<LockedVMA>> {
         return self.vmas.iter();
     }
 }
@@ -1153,11 +1153,11 @@ impl LockedVMA {
         self.id
     }
 
-    pub fn lock(&self) -> SpinLockGuard<VMA> {
+    pub fn lock(&self) -> SpinLockGuard<'_, VMA> {
         return self.vma.lock();
     }
 
-    pub fn lock_irqsave(&self) -> SpinLockGuard<VMA> {
+    pub fn lock_irqsave(&self) -> SpinLockGuard<'_, VMA> {
         return self.vma.lock_irqsave();
     }
 

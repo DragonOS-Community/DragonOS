@@ -42,12 +42,12 @@ pub struct NTtyLinediscipline {
 
 impl NTtyLinediscipline {
     #[inline]
-    pub fn disc_data(&self) -> SpinLockGuard<NTtyData> {
+    pub fn disc_data(&self) -> SpinLockGuard<'_, NTtyData> {
         self.data.lock_irqsave()
     }
 
     #[inline]
-    pub fn disc_data_try_lock(&self) -> Result<SpinLockGuard<NTtyData>, SystemError> {
+    pub fn disc_data_try_lock(&self) -> Result<SpinLockGuard<'_, NTtyData>, SystemError> {
         self.data.try_lock_irqsave()
     }
 

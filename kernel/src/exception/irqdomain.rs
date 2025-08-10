@@ -544,12 +544,12 @@ impl IrqDomain {
     }
 
     #[allow(dead_code)]
-    fn revmap_read_irqsave(&self) -> RwLockReadGuard<IrqDomainRevMap> {
+    fn revmap_read_irqsave(&self) -> RwLockReadGuard<'_, IrqDomainRevMap> {
         self.revmap.read_irqsave()
     }
 
     #[allow(dead_code)]
-    fn revmap_write_irqsave(&self) -> RwLockWriteGuard<IrqDomainRevMap> {
+    fn revmap_write_irqsave(&self) -> RwLockWriteGuard<'_, IrqDomainRevMap> {
         self.revmap.write_irqsave()
     }
 

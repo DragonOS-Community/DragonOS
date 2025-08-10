@@ -225,6 +225,7 @@ impl IndexNode for TtyDevice {
             if err == SystemError::ENOSYS {
                 return Err(SystemError::ENODEV);
             }
+            log::error!("Failed to open tty device: {}, error: {:?}", self.name, err);
             return Err(err);
         }
 

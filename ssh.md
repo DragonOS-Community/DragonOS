@@ -108,7 +108,42 @@ root:x:0:0:root:/root:/bin/sh
 | `/proc/self/status`  | 当前进程的状态信息（类似于 ps 命令） |
 
 
-/proc/fd/{id} 也是一个符号链接，指向进程打开的文件描述符所对应的文件路径。
+- /proc/fd/{id} 也是一个符号链接，指向进程打开的文件描述符所对应的文件路径。
+- /dev/pts/0 这些伪终端需要等待主设备/dev/ptmx被关闭的时候删除
+- /root目录必须存在
+
+### linux的setgroups和getgroups的作用和用法是什么
+
+在 Linux 中，一个进程有：
+
+- 真实用户 ID (real UID)、有效用户 ID (effective UID)
+- 真实组 ID (real GID)、有效组 ID (effective GID)
+- 附加组 ID 列表（supplementary groups）
+
+附加组 ID 让进程除了主组外，还可以属于其他多个组，从而获得对应组的访问权限
+
+
+
+#### 用户 ID (UID) 和 组 ID (GID)
+这两个是权限身份标识，用来决定一个进程能做什么。
+
+UID（User ID）表示进程属于哪个用户。
+常见种类：
+
+- 真实用户 ID (real UID)：启动该进程的用户是谁。
+- 有效用户 ID (effective UID)：实际用于权限检查的 UID（比如 setuid 程序可以让 EUID 暂时变成 root）。
+- 保存的 set-user-ID（保存切换前的 EUID，用于临时恢复）。
+
+root 用户的 UID 是 0，其它用户一般是从 1000（或 500）开始分配。
+
+GID（Group ID） 表示进程属于哪个主用户组。同样有 real/effective/saved 三种。
+另外还有 附加组列表（supplementary groups），用来赋予额外的组权限。
+
+作用：
+当进程访问文件、socket、IPC 等资源时，内核会根据 EUID/EGID + 附加组列表 来判断能否访问。
+
+
+
 
 ## Reference
 - Linux TTY/PTS概述 https://liujunming.top/2019/09/03/Linux-TTY-PTS%E6%A6%82%E8%BF%B0/

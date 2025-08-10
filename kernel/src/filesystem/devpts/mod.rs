@@ -266,16 +266,19 @@ impl IndexNode for LockedDevPtsFSInode {
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        log::error!("DevPtsFs find: {}", name);
         let guard = self.inner.lock();
 
         if let Some(dev) = guard.children_unchecked().get(name) {
             Ok(dev.clone() as Arc<dyn IndexNode>)
         } else {
+            log::error!("DevPtsFs find: {} not found", name);
             Err(SystemError::ENOENT)
         }
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        log::error!("DevPtsFs unlink: {}", name);
         let mut guard = self.inner.lock();
         guard.children_unchecked_mut().remove(name);
         Ok(())

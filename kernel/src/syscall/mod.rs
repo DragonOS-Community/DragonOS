@@ -852,7 +852,7 @@ impl Syscall {
             SYS_SETRLIMIT => Ok(0),
 
             SYS_RT_SIGTIMEDWAIT => {
-                log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
+                // log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
                 Ok(0)
             }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

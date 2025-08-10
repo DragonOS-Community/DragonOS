@@ -216,12 +216,18 @@ impl TtyOperation for Unix98PtyDriverInner {
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         let driver = tty.core().driver();
-
         if tty.core().driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave {
-            driver.ttys().remove(&tty.core().index());
-            let pts_root_inode =
-                ROOT_INODE().lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-            let _ = pts_root_inode.unlink(&tty.core().index().to_string());
+            // check master exists
+            // TODO: 如果master不存在，应该删除slave
+            let ptmx = ROOT_INODE().lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES);
+            if let Err(e) = ptmx
+                && e == SystemError::ENOENT
+            {
+                driver.ttys().remove(&tty.core().index());
+                let pts_root_inode =
+                    ROOT_INODE().lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+                let _ = pts_root_inode.unlink(&tty.core().index().to_string());
+            }
         }
 
         Ok(())

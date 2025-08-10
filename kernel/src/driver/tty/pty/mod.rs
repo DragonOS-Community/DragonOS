@@ -143,19 +143,29 @@ impl PtyCommon {
         if let Some(link) = core.link() {
             let link_core = link.core();
 
+            log::info!(
+                "pty_common_open: link_core flags: {:?}, core flags: {:?}",
+                link_core.flags(),
+                core.flags()
+            );
             if core.flags().contains(TtyFlag::OTHER_CLOSED) {
                 core.flags_write().insert(TtyFlag::IO_ERROR);
                 return Err(SystemError::EIO);
             }
 
             if link_core.flags().contains(TtyFlag::PTY_LOCK) {
-                core.flags_write().insert(TtyFlag::IO_ERROR);
-                return Err(SystemError::EIO);
+                // core.flags_write().insert(TtyFlag::IO_ERROR);
+                // return Err(SystemError::EIO);
             }
 
             if core.driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave
                 && link_core.count() != 1
             {
+                log::error!(
+                    "pty_common_open: link_core.count() = {}, core.count() = {}",
+                    link_core.count(),
+                    core.count()
+                );
                 // 只能有一个master，如果当前为slave，则link的count必须为1
                 core.flags_write().insert(TtyFlag::IO_ERROR);
                 return Err(SystemError::EIO);

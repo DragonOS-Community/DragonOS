@@ -1,13 +1,13 @@
 //! System call handler for the munmap system call.
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MUNMAP};
+use crate::mm::MemoryManagementArch;
+use crate::mm::syscall::PageFrameCount;
 use crate::mm::syscall::check_aligned;
 use crate::mm::syscall::page_align_up;
-use crate::mm::syscall::PageFrameCount;
 use crate::mm::ucontext::AddressSpace;
 use crate::mm::unlikely;
-use crate::mm::MemoryManagementArch;
-use crate::mm::{verify_area, MMArch, VirtAddr, VirtPageFrame};
+use crate::mm::{MMArch, VirtAddr, VirtPageFrame, verify_area};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::sync::Arc;
 use alloc::vec::Vec;

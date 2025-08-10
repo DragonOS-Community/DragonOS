@@ -7,9 +7,9 @@ use crate::{
         process::table::{KERNEL_CS, KERNEL_DS},
     },
     process::{
-        fork::CloneFlags,
-        kthread::{kernel_thread_bootstrap_stage2, KernelThreadCreateInfo, KernelThreadMechanism},
         ProcessManager, RawPid,
+        fork::CloneFlags,
+        kthread::{KernelThreadCreateInfo, KernelThreadMechanism, kernel_thread_bootstrap_stage2},
     },
 };
 
@@ -57,7 +57,7 @@ impl KernelThreadMechanism {
 /// 当内核线程开始执行时，会先执行这个函数，这个函数会将伪造的trapframe中的数据弹出，然后跳转到第二阶段
 ///
 /// 跳转之后，指向Box<KernelThreadClosure>的指针将传入到stage2的函数
-#[naked]
+#[unsafe(naked)]
 pub(super) unsafe extern "sysv64" fn kernel_thread_bootstrap_stage1() {
     core::arch::naked_asm!(
         concat!(

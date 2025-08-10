@@ -2,7 +2,7 @@ use log::{debug, info};
 
 use crate::{
     driver::open_firmware::fdt::open_firmware_fdt_driver,
-    time::{clocksource::HZ, TimeArch},
+    time::{TimeArch, clocksource::HZ},
 };
 pub struct RiscV64TimeArch;
 

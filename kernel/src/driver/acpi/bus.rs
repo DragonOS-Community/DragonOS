@@ -1,8 +1,8 @@
 use crate::driver::base::{
     device::{
-        bus::{bus_manager, Bus},
-        driver::Driver,
         Device,
+        bus::{Bus, bus_manager},
+        driver::Driver,
     },
     subsys::SubSysPrivate,
 };

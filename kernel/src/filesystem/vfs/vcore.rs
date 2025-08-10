@@ -13,17 +13,17 @@ use crate::{
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
-        vfs::{syscall::ModeType, AtomicInodeId, FileSystem, FileType, MountFS},
+        vfs::{AtomicInodeId, FileSystem, FileType, MountFS, syscall::ModeType},
     },
     mm::truncate::truncate_inode_pages,
-    process::{namespace::mnt::mnt_namespace_init, ProcessManager},
+    process::{ProcessManager, namespace::mnt::mnt_namespace_init},
 };
 
 use super::{
+    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     file::FileMode,
     stat::LookUpFlags,
     utils::{rsplit_path, user_path_at},
-    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表

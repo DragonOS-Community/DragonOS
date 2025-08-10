@@ -10,22 +10,22 @@ use system_error::SystemError;
 use crate::{
     driver::acpi::acpi_manager,
     exception::{
+        IrqNumber,
         handle::{edge_irq_handler, fast_eoi_irq_handler},
         irqchip::{IrqChip, IrqChipData, IrqChipFlags, IrqChipSetMaskResult, IrqChipState},
         irqdata::{IrqData, IrqLineStatus},
-        irqdesc::{irq_desc_manager, IrqDesc, IrqFlowHandler},
+        irqdesc::{IrqDesc, IrqFlowHandler, irq_desc_manager},
         manage::irq_manager,
-        IrqNumber,
     },
     libs::{
         cpumask::CpuMask,
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
-        volatile::{volwrite, Volatile},
+        volatile::{Volatile, volwrite},
     },
     mm::{
-        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
+        mmio_buddy::{MMIOSpaceGuard, mmio_pool},
     },
 };
 

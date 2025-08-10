@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::driver::base::device::bus::{bus_register, Bus};
+use crate::driver::base::device::bus::{Bus, bus_register};
 
 use self::subsys::SerioBus;
 

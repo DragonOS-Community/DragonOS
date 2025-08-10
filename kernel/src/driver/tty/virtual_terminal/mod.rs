@@ -12,8 +12,9 @@ use unified_init::macros::unified_init;
 use crate::{
     driver::{
         base::device::{
+            IdTable,
             device_number::{DeviceNumber, Major},
-            device_register, IdTable,
+            device_register,
         },
         serial::serial8250::send_to_default_serial8250_port,
     },

@@ -6,8 +6,8 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
-    process::{timer::AlarmTimer, ProcessManager},
-    syscall::{user_access::UserBufferWriter, Syscall},
+    process::{ProcessManager, timer::AlarmTimer},
+    syscall::{Syscall, user_access::UserBufferWriter},
     time::PosixTimeSpec,
 };
 

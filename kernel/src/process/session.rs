@@ -1,4 +1,4 @@
-use super::{pid::Pid, ProcessControlBlock, ProcessManager, RawPid};
+use super::{ProcessControlBlock, ProcessManager, RawPid, pid::Pid};
 use crate::{driver::tty::tty_job_control::TtyJobCtrlManager, process::pid::PidType};
 use alloc::sync::Arc;
 use system_error::SystemError;

@@ -8,7 +8,7 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         sysfs::{
-            file::sysfs_emit_str, sysfs_instance, Attribute, SysFSOpsSupport, SYSFS_ATTR_MODE_WO,
+            Attribute, SYSFS_ATTR_MODE_WO, SysFSOpsSupport, file::sysfs_emit_str, sysfs_instance,
         },
         vfs::syscall::ModeType,
     },
@@ -17,10 +17,10 @@ use crate::{
 use system_error::SystemError;
 
 use super::{
+    Device, DeviceManager,
     bus::BusNotifyEvent,
     device_manager,
-    driver::{driver_manager, Driver, DriverManager},
-    Device, DeviceManager,
+    driver::{Driver, DriverManager, driver_manager},
 };
 
 static PROBE_WAIT_QUEUE: WaitQueue = WaitQueue::default();

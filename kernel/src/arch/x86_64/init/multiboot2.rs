@@ -15,11 +15,11 @@ use crate::{
         },
     },
     init::{
-        boot::{register_boot_callbacks, BootCallbacks, BootloaderAcpiArg},
+        boot::{BootCallbacks, BootloaderAcpiArg, register_boot_callbacks},
         boot_params,
     },
     libs::lazy_init::Lazy,
-    mm::{memblock::mem_block_manager, PhysAddr},
+    mm::{PhysAddr, memblock::mem_block_manager},
 };
 
 pub(super) const MULTIBOOT2_ENTRY_MAGIC: u32 = multiboot2::MAGIC;
@@ -235,8 +235,10 @@ pub(super) fn early_multiboot2_init(boot_magic: u32, boot_info: u64) -> Result<(
 
     let boot_info =
         unsafe { BootInformation::load(MB2_RAW_INFO.as_mut_ptr() as *const BootInformationHeader) }
-            .inspect_err(|_| loop {
-                spin_loop();
+            .inspect_err(|_| {
+                loop {
+                    spin_loop();
+                }
             })
             .unwrap();
 

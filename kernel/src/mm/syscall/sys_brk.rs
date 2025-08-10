@@ -1,9 +1,9 @@
 //! System call handler for the brk system call.
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_BRK};
-use crate::mm::ucontext::AddressSpace;
 use crate::mm::MemoryManagementArch;
 use crate::mm::VirtAddr;
+use crate::mm::ucontext::AddressSpace;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;
 

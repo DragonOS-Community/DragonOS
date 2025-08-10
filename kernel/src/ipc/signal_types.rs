@@ -13,12 +13,12 @@ use crate::{
     arch::{
         asm::bitops::ffz,
         interrupt::TrapFrame,
-        ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
+        ipc::signal::{MAX_SIG_NUM, SigCode, SigFlags, SigSet, Signal},
     },
     mm::VirtAddr,
     process::{
-        pid::{Pid, PidType},
         RawPid,
+        pid::{Pid, PidType},
     },
     syscall::user_access::UserBufferWriter,
 };

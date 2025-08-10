@@ -3,7 +3,7 @@ use core::{
     arch::asm,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{Ordering, compiler_fence},
 };
 use kdepends::memoffset::offset_of;
 use log::error;
@@ -12,22 +12,22 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        interrupt::entry::ret_from_exception, process::kthread::kernel_thread_bootstrap_stage1,
-        CurrentIrqArch,
+        CurrentIrqArch, interrupt::entry::ret_from_exception,
+        process::kthread::kernel_thread_bootstrap_stage1,
     },
     exception::InterruptArch,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
+        KernelStack, PROCESS_SWITCH_RESULT, ProcessControlBlock, ProcessFlags, ProcessManager,
         fork::{CloneFlags, KernelCloneArgs},
-        switch_finish_hook, KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager,
-        PROCESS_SWITCH_RESULT,
+        switch_finish_hook,
     },
     smp::cpu::ProcessorId,
 };
 
 use super::{
-    cpu::{local_context, LocalContext},
+    cpu::{LocalContext, local_context},
     interrupt::TrapFrame,
 };
 
@@ -76,7 +76,7 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     ready_to_switch_to_user(trap_frame_vaddr.data(), new_pc.data());
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn ready_to_switch_to_user(trap_frame: usize, new_pc: usize) -> ! {
     core::arch::naked_asm!(concat!(
         "
@@ -222,7 +222,7 @@ impl ProcessManager {
 /// 切换上下文
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/kernel/entry.S#233
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBInfo) {
     core::arch::naked_asm!(concat!(
         "

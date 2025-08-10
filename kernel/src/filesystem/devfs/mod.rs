@@ -3,8 +3,8 @@ pub mod null_dev;
 pub mod zero_dev;
 
 use super::vfs::{
-    file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
-    FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
+    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
+    file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id,
 };
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
@@ -527,9 +527,18 @@ impl IndexNode for LockedDevFSInode {
                     .collect();
 
                 match key.len() {
-                    0=>{return Err(SystemError::ENOENT);}
-                    1=>{return Ok(key.remove(0));}
-                    _ => panic!("Devfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    0 => {
+                        return Err(SystemError::ENOENT);
+                    }
+                    1 => {
+                        return Ok(key.remove(0));
+                    }
+                    _ => panic!(
+                        "Devfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
+                        key_len = key.len(),
+                        inode_id = inode.metadata.inode_id,
+                        to_find = ino
+                    ),
                 }
             }
         }

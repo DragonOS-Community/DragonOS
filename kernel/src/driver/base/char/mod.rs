@@ -5,13 +5,12 @@ use system_error::SystemError;
 
 use super::{
     device::{
-        device_manager,
+        CHARDEVS, DEVMAP, Device, IdTable, device_manager,
         device_number::{DeviceNumber, Major},
-        Device, IdTable, CHARDEVS, DEVMAP,
     },
     map::{
-        kobj_map, kobj_unmap, DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END,
-        DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
+        DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE,
+        DEV_MAJOR_MAX, DeviceStruct, kobj_map, kobj_unmap,
     },
 };
 
@@ -137,8 +136,14 @@ impl CharDevOps {
             );
         }
         if minorct > DeviceNumber::MINOR_MASK + 1 - baseminor {
-            error!("DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
-                name, baseminor, baseminor + minorct - 1, 0, DeviceNumber::MINOR_MASK);
+            error!(
+                "DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
+                name,
+                baseminor,
+                baseminor + minorct - 1,
+                0,
+                DeviceNumber::MINOR_MASK
+            );
         }
         let chardev = DeviceStruct::new(DeviceNumber::new(major, baseminor), minorct, name);
         if major == Major::UNNAMED_MAJOR {

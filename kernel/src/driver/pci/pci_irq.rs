@@ -14,10 +14,10 @@ use super::root::pci_root_0;
 use crate::arch::msi::{arch_msi_message_address, arch_msi_message_data};
 
 use crate::driver::base::device::DeviceId;
+use crate::exception::IrqNumber;
 use crate::exception::irqdesc::{IrqHandleFlags, IrqHandler};
 use crate::exception::manage::irq_manager;
-use crate::exception::IrqNumber;
-use crate::libs::volatile::{volread, volwrite, Volatile};
+use crate::libs::volatile::{Volatile, volread, volwrite};
 
 /// MSIX表的一项
 #[repr(C)]

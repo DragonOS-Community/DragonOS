@@ -12,7 +12,7 @@ use bitmap::traits::BitMapOps;
 use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
-use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
+use virtio_drivers::device::blk::{SECTOR_SIZE, VirtIOBlk};
 
 use crate::{
     driver::{
@@ -20,32 +20,32 @@ use crate::{
             block::{
                 block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
                 disk_info::Partition,
-                manager::{block_dev_manager, BlockDevMeta},
+                manager::{BlockDevMeta, block_dev_manager},
             },
             class::Class,
             device::{
+                DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
                 bus::Bus,
                 device_number::Major,
                 driver::{Driver, DriverCommonData},
-                DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         virtio::{
+            VIRTIO_VENDOR_ID, VirtIODevice, VirtIODeviceIndex, VirtIODriver,
+            VirtIODriverCommonData, VirtioDeviceId,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
             transport::VirtIOTransport,
             virtio_impl::HalImpl,
-            VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
-            VIRTIO_VENDOR_ID,
         },
     },
-    exception::{irqdesc::IrqReturn, IrqNumber},
+    exception::{IrqNumber, irqdesc::IrqReturn},
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         mbr::MbrDiskPartionTable,
-        vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
+        vfs::{IndexNode, Metadata, syscall::ModeType, utils::DName},
     },
     init::initcall::INITCALL_POSTCORE,
     libs::{

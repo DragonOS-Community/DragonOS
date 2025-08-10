@@ -8,10 +8,10 @@ use crate::{
     driver::base::{
         class::Class,
         device::{
+            Device, DeviceCommonData, DevicePrivateData, DeviceType, IdTable,
             bus::{Bus, BusState},
             device_manager,
             driver::Driver,
-            Device, DeviceCommonData, DevicePrivateData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
@@ -24,7 +24,7 @@ use crate::{
 };
 use system_error::SystemError;
 
-use super::{super::device::DeviceState, platform_bus, platform_bus_device, CompatibleTable};
+use super::{super::device::DeviceState, CompatibleTable, platform_bus, platform_bus_device};
 
 /// 平台设备id分配器
 static PLATFORM_DEVID_IDA: SpinLock<IdAllocator> =

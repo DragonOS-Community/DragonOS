@@ -8,29 +8,29 @@ use system_error::SystemError;
 use crate::{
     arch::{
         driver::apic::{
-            apic_timer::{local_apic_timer_irq_desc_init, APIC_TIMER_IRQ_NUM},
+            apic_timer::{APIC_TIMER_IRQ_NUM, local_apic_timer_irq_desc_init},
             ioapic::ioapic_init,
         },
         interrupt::{
             entry::arch_setup_interrupt_gate,
-            ipi::{arch_ipi_handler_init, send_ipi, IPI_NUM_FLUSH_TLB, IPI_NUM_KICK_CPU},
-            msi::{X86MsiAddrHi, X86MsiAddrLoNormal, X86MsiDataNormal, X86_MSI_BASE_ADDRESS_LOW},
+            ipi::{IPI_NUM_FLUSH_TLB, IPI_NUM_KICK_CPU, arch_ipi_handler_init, send_ipi},
+            msi::{X86_MSI_BASE_ADDRESS_LOW, X86MsiAddrHi, X86MsiAddrLoNormal, X86MsiDataNormal},
         },
     },
     driver::open_firmware::device_node::DeviceNode,
     exception::{
+        HardwareIrqNumber, IrqNumber,
         ipi::{IpiKind, IpiTarget},
         irqchip::{IrqChip, IrqChipData, IrqChipFlags},
         irqdata::IrqData,
-        irqdomain::{irq_domain_manager, IrqDomain, IrqDomainBusToken, IrqDomainOps},
+        irqdomain::{IrqDomain, IrqDomainBusToken, IrqDomainOps, irq_domain_manager},
         msi::MsiMsg,
-        HardwareIrqNumber, IrqNumber,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
-use super::{hw_irq::HardwareIrqConfig, CurrentApic, LocalAPIC};
+use super::{CurrentApic, LocalAPIC, hw_irq::HardwareIrqConfig};
 
 static mut LOCAL_APIC_CHIP: Option<Arc<LocalApicChip>> = None;
 

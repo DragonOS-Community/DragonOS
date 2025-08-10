@@ -11,11 +11,11 @@ pub use crate::ipc::generic_signal::GenericSignal as Signal;
 
 use crate::{
     arch::{
+        CurrentIrqArch, MMArch,
         fpu::FpState,
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
         syscall::nr::SYS_RESTART_SYSCALL,
-        CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
     ipc::{

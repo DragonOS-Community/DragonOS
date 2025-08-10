@@ -9,7 +9,7 @@ use crate::{
     mm::no_init::{pseudo_map_phys, pseudo_map_phys_ro, pseudo_unmap_phys},
 };
 
-use super::{allocator::page_frame::PageFrameCount, MemoryManagementArch, PhysAddr, VirtAddr};
+use super::{MemoryManagementArch, PhysAddr, VirtAddr, allocator::page_frame::PageFrameCount};
 
 static SLOTS: SpinLock<[Slot; EarlyIoRemap::SLOT_CNT]> =
     SpinLock::new([Slot::DEFAULT; EarlyIoRemap::SLOT_CNT]);

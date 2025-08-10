@@ -10,7 +10,7 @@ pub const ACPI_PM_MASK: u64 = 0xffffff;
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub fn acpi_pm_read_early() -> u32 {
-    use crate::driver::clocksource::acpi_pm::{acpi_pm_read_verified, PMTMR_IO_PORT};
+    use crate::driver::clocksource::acpi_pm::{PMTMR_IO_PORT, acpi_pm_read_verified};
     use core::sync::atomic::Ordering;
     let port = PMTMR_IO_PORT.load(Ordering::SeqCst);
 

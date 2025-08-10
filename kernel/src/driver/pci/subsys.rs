@@ -9,10 +9,11 @@ use system_error::SystemError;
 use crate::{
     driver::base::{
         device::{
-            bus::{bus_register, Bus},
+            Device,
+            bus::{Bus, bus_register},
             device_register,
             driver::Driver,
-            sys_devices_kset, Device,
+            sys_devices_kset,
         },
         kobject::KObject,
         subsys::SubSysPrivate,

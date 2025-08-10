@@ -2,7 +2,7 @@
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_UMOUNT2},
-    filesystem::vfs::{fcntl::AtFlags, utils::user_path_at, MountFS, MAX_PATHLEN},
+    filesystem::vfs::{MAX_PATHLEN, MountFS, fcntl::AtFlags, utils::user_path_at},
     process::ProcessManager,
     syscall::{
         table::{FormattedSyscallParam, Syscall},

@@ -7,13 +7,13 @@ use crate::{
     driver::tty::tty_core::TtyCore,
     ipc::syscall::sys_kill::PidConverter,
     process::pid::PidType,
-    sched::{schedule, SchedMode},
+    sched::{SchedMode, schedule},
     syscall::user_access::UserBufferWriter,
-    time::{sleep::nanosleep, Duration},
+    time::{Duration, sleep::nanosleep},
 };
 
 use super::{
-    abi::WaitOption, resource::RUsage, ProcessControlBlock, ProcessManager, ProcessState, RawPid,
+    ProcessControlBlock, ProcessManager, ProcessState, RawPid, abi::WaitOption, resource::RUsage,
 };
 
 /// 内核wait4时的参数

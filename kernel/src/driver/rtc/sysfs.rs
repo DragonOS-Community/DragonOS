@@ -9,7 +9,7 @@ use crate::{
     driver::base::{
         class::Class,
         device::{
-            bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable,
+            Device, DeviceCommonData, DeviceType, IdTable, bus::Bus, device_manager, driver::Driver,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
@@ -17,7 +17,7 @@ use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{
-            file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
+            Attribute, AttributeGroup, SYSFS_ATTR_MODE_RO, SysFSOpsSupport, file::sysfs_emit_str,
         },
         vfs::syscall::ModeType,
     },
@@ -28,10 +28,10 @@ use crate::{
 };
 
 use super::{
+    GeneralRtcPriority, RtcClassOps, RtcDevice,
     class::sys_class_rtc_instance,
     interface::rtc_read_time,
     utils::{kobj2rtc_device, kobj2rtc_general_device},
-    GeneralRtcPriority, RtcClassOps, RtcDevice,
 };
 
 static RTC_GENERAL_DEVICE_IDA: SpinLock<IdAllocator> =

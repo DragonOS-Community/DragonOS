@@ -1,11 +1,11 @@
-use fdt::{node::FdtNode, Fdt};
+use fdt::{Fdt, node::FdtNode};
 use log::debug;
 use system_error::SystemError;
 
 use crate::{
     driver::{
         open_firmware::fdt::open_firmware_fdt_driver,
-        pci::ecam::{pci_ecam_root_info_manager, EcamRootInfo},
+        pci::ecam::{EcamRootInfo, pci_ecam_root_info_manager},
     },
     mm::PhysAddr,
 };
@@ -41,12 +41,7 @@ pub(super) fn pci_host_ecam_driver_init(fdt: &Fdt<'_>) -> Result<(), SystemError
 
         debug!(
             "pci_host_ecam_driver_init(): {} paddr: {:#x} size: {:#x} bus-range: {}-{} segement_group_number: {}",
-            node.name,
-            paddr,
-            size,
-            bus_begin,
-            bus_end,
-            segement_group_number
+            node.name, paddr, size, bus_begin, bus_end, segement_group_number
         );
 
         pci_ecam_root_info_manager().add_ecam_root_info(EcamRootInfo::new(

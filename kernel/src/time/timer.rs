@@ -1,7 +1,7 @@
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering, compiler_fence},
     time::Duration,
 };
 
@@ -16,12 +16,12 @@ use system_error::SystemError;
 use crate::{
     arch::CurrentIrqArch,
     exception::{
-        softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
+        softirq::{SoftirqNumber, SoftirqVec, softirq_vectors},
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     process::{ProcessControlBlock, ProcessManager},
-    sched::{schedule, SchedMode},
+    sched::{SchedMode, schedule},
 };
 
 use super::{jiffies::NSEC_PER_JIFFY, timekeeping::update_wall_time};

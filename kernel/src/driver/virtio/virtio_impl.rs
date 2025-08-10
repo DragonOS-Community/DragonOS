@@ -5,10 +5,10 @@ use crate::arch::MMArch;
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::EntryFlags;
 use crate::mm::{
-    allocator::page_frame::{
-        allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
-    },
     MemoryManagementArch, PhysAddr, VirtAddr,
+    allocator::page_frame::{
+        PageFrameCount, PhysPageFrame, allocate_page_frames, deallocate_page_frames,
+    },
 };
 use core::ptr::NonNull;
 use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE};

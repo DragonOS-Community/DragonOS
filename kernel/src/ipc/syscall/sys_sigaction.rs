@@ -1,6 +1,6 @@
 use super::super::signal_types::{
-    SaHandlerType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL, USER_SIG_ERR,
-    USER_SIG_IGN,
+    SaHandlerType, Sigaction, SigactionType, USER_SIG_DFL, USER_SIG_ERR, USER_SIG_IGN,
+    UserSigaction,
 };
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RT_SIGACTION;

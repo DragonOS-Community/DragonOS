@@ -5,16 +5,16 @@ use crate::{
     driver::{
         base::{
             class::Class,
-            device::{bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable},
+            device::{Device, DeviceCommonData, DeviceType, IdTable, bus::Bus, driver::Driver},
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         },
-        net::{register_netdevice, NetDeivceState, NetDevice, NetDeviceCommonData, Operstate},
+        net::{NetDeivceState, NetDevice, NetDeviceCommonData, Operstate, register_netdevice},
     },
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    net::{generate_iface_id, NET_DEVICES},
+    net::{NET_DEVICES, generate_iface_id},
     time::Instant,
 };
 use alloc::{

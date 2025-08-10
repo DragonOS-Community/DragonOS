@@ -1,19 +1,19 @@
+use crate::arch::MMArch;
 use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::vm::asm::VmxAsm;
 use crate::arch::vm::mmu::kvm_mmu::PageLevel;
 use crate::arch::vm::mmu::mmu_internal::KvmPageFault;
-use crate::arch::MMArch;
 use crate::libs::spinlock::SpinLockGuard;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::page::{
-    page_manager_lock_irqsave, EntryFlags, PageEntry, PageFlags, PageFlush, PageManager, PageType,
+    EntryFlags, PageEntry, PageFlags, PageFlush, PageManager, PageType, page_manager_lock_irqsave,
 };
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::AtomicProcessorId;
 use crate::smp::cpu::ProcessorId;
 use core::ops::Add;
-use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 use log::{debug, error, warn};
 use system_error::SystemError;
 use x86::msr;
@@ -432,7 +432,7 @@ pub fn debug_eptp() {
     unsafe {
         let entry = MMArch::read::<u64>(pml4_hva);
         debug!("Value at EPTP address: 0x{:x}", entry); //Level2M
-                                                        // 遍历并打印所有已分配的页面
+        // 遍历并打印所有已分配的页面
         traverse_ept_table(pml4_hva, 4);
     }
 }

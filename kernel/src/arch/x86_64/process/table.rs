@@ -1,7 +1,7 @@
-use x86::{current::task::TaskStateSegment, segmentation::SegmentSelector, Ring};
+use x86::{Ring, current::task::TaskStateSegment, segmentation::SegmentSelector};
 
 use crate::{
-    mm::{percpu::PerCpu, VirtAddr},
+    mm::{VirtAddr, percpu::PerCpu},
     smp::core::smp_get_processor_id,
 };
 

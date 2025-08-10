@@ -1,8 +1,8 @@
 use system_error::SystemError;
 
-use crate::arch::{mm::PageMapper, MMArch};
+use crate::arch::{MMArch, mm::PageMapper};
 
-use super::{page::Flusher, syscall::MadvFlags, ucontext::LockedVMA, VmFlags};
+use super::{VmFlags, page::Flusher, syscall::MadvFlags, ucontext::LockedVMA};
 
 impl LockedVMA {
     pub fn do_madvise(

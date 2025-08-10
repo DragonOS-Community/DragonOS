@@ -1,6 +1,6 @@
 //! 这个文件内放置初始内核线程的代码。
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use alloc::ffi::CString;
 use log::{debug, error};
@@ -12,8 +12,8 @@ use crate::{
     filesystem::vfs::vcore::mount_root_fs,
     net::net_core::net_init,
     process::{
-        exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
-        ProcessFlags, ProcessManager,
+        ProcessFlags, ProcessManager, exec::ProcInitInfo, execve::do_execve,
+        kthread::KernelThreadMechanism, stdio::stdio_init,
     },
     smp::smp_init,
 };

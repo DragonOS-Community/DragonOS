@@ -2,13 +2,13 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::process::{
-    fork::CloneFlags,
-    namespace::mnt::{root_mnt_namespace, MntNamespace},
     ProcessControlBlock, ProcessManager,
+    fork::CloneFlags,
+    namespace::mnt::{MntNamespace, root_mnt_namespace},
 };
 use core::{fmt::Debug, intrinsics::likely};
 
-use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
+use super::{NamespaceType, pid_namespace::PidNamespace, user_namespace::UserNamespace};
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///

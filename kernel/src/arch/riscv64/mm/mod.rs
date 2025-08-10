@@ -7,19 +7,19 @@ use crate::{
     driver::open_firmware::fdt::open_firmware_fdt_driver,
     libs::spinlock::SpinLock,
     mm::{
+        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags,
         allocator::{
             buddy::BuddyAllocator,
             page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
         },
         kernel_mapper::KernelMapper,
-        page::{EntryFlags, PageEntry, PAGE_1G_SHIFT},
+        page::{EntryFlags, PAGE_1G_SHIFT, PageEntry},
         ucontext::UserMapper,
-        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags,
     },
     smp::cpu::ProcessorId,
 };
 
-use self::init::{riscv_mm_init, INITIAL_PGTABLE_VALUE};
+use self::init::{INITIAL_PGTABLE_VALUE, riscv_mm_init};
 
 pub mod bump;
 pub(super) mod init;

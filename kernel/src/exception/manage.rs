@@ -9,20 +9,20 @@ use crate::{
     driver::base::device::DeviceId,
     exception::{
         irqchip::IrqChipSetMaskResult,
-        irqdesc::{irq_desc_manager, InnerIrqDesc, IrqAction},
+        irqdesc::{InnerIrqDesc, IrqAction, irq_desc_manager},
     },
     libs::{cpumask::CpuMask, mutex::MutexGuard, spinlock::SpinLockGuard},
-    process::{kthread::KernelThreadMechanism, ProcessManager},
+    process::{ProcessManager, kthread::KernelThreadMechanism},
     smp::cpu::ProcessorId,
 };
 
 use super::{
+    IrqNumber,
     dummychip::no_irq_chip,
     irqchip::IrqChipFlags,
     irqdata::{IrqData, IrqHandlerData, IrqLineStatus, IrqStatus},
     irqdesc::{InnerIrqAction, IrqDesc, IrqDescState, IrqHandleFlags, IrqHandler, IrqReturn},
     irqdomain::irq_domain_manager,
-    IrqNumber,
 };
 
 lazy_static! {
@@ -224,12 +224,14 @@ impl IrqManager {
             .flags()
             .contains(IrqHandleFlags::IRQF_PROBE_SHARED)
         {
-            error!("Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}", 
+            error!(
+                "Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}",
                 desc.irq_data().irq().data(),
                 action_guard.name(),
                 action_guard.flags(),
                 old_action_guard.name(),
-                old_action_guard.flags());
+                old_action_guard.flags()
+            );
         }
         self.handle_unlock_error(
             SystemError::EBUSY,
@@ -470,7 +472,7 @@ impl IrqManager {
             #[inline(never)]
             fn __tmp_log(irq: &IrqNumber, name: &str) {
                 error!(
-                "Requesting irq {} without a handler, and ONESHOT flags not set for irqaction: {}",
+                    "Requesting irq {} without a handler, and ONESHOT flags not set for irqaction: {}",
                     irq.data(),
                     name,
                 );
@@ -638,7 +640,10 @@ impl IrqManager {
                     new_trigger_type: IrqLineStatus,
                     irq: &IrqNumber,
                 ) {
-                    warn!("Irq {} uses trigger type: {old_trigger_type:?}, but requested trigger type: {new_trigger_type:?}.", irq.data());
+                    warn!(
+                        "Irq {} uses trigger type: {old_trigger_type:?}, but requested trigger type: {new_trigger_type:?}.",
+                        irq.data()
+                    );
                 }
 
                 ___tmp_log_irq_line_status_change(old_trigger_type, new_trigger_type, &irq);

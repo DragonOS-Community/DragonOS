@@ -3,8 +3,8 @@ use system_error::SystemError;
 use crate::arch::CurrentIrqArch;
 
 use super::{
-    dummychip::dummy_chip_init, irqdesc::early_irq_init, irqdomain::irq_domain_manager_init,
-    InterruptArch,
+    InterruptArch, dummychip::dummy_chip_init, irqdesc::early_irq_init,
+    irqdomain::irq_domain_manager_init,
 };
 
 /// 初始化中断

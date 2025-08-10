@@ -10,8 +10,8 @@ use crate::{
     },
     filesystem::{
         sysfs::{
-            file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport,
-            SYSFS_ATTR_MODE_RO,
+            Attribute, AttributeGroup, SYSFS_ATTR_MODE_RO, SysFSOps, SysFSOpsSupport,
+            file::sysfs_emit_str,
         },
         vfs::syscall::ModeType,
     },
@@ -20,8 +20,8 @@ use crate::{
 };
 
 use super::{
-    irqdesc::{irq_desc_manager, IrqDesc},
     IrqNumber,
+    irqdesc::{IrqDesc, irq_desc_manager},
 };
 
 /// `/sys/kernel/irq`的kset

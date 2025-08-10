@@ -9,15 +9,15 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        vm::mmu::kvm_mmu::{PAGE_SHIFT, PAGE_SIZE},
         MMArch,
+        vm::mmu::kvm_mmu::{PAGE_SHIFT, PAGE_SIZE},
     },
     libs::{
         rbtree::RBTree,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{kernel_mapper::KernelMapper, page::EntryFlags, MemoryManagementArch, VirtAddr},
+    mm::{MemoryManagementArch, VirtAddr, kernel_mapper::KernelMapper, page::EntryFlags},
     virt::vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion},
 };
 

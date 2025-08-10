@@ -8,7 +8,7 @@
 //! 对于x86:
 //! 这里假设在内核引导文件中，已经填写了前100M的页表，其中，前50M是真实映射到内存的，后面的仅仅创建了页表，表项全部为0。
 
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{StaticBitmap, traits::BitMapOps};
 
 use crate::{
     libs::spinlock::SpinLock,
@@ -18,9 +18,9 @@ use crate::{
 use core::marker::PhantomData;
 
 use super::{
+    PageTableKind, VirtAddr,
     allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage},
     page::EntryFlags,
-    PageTableKind, VirtAddr,
 };
 
 /// 用于存储重映射页表的位图和页面

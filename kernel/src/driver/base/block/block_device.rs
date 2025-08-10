@@ -2,15 +2,15 @@
 use crate::driver::{
     base::{
         device::{
+            BLOCKDEVS, DevName, Device, DeviceError, IdTable,
             device_number::{DeviceNumber, Major},
-            DevName, Device, DeviceError, IdTable, BLOCKDEVS,
         },
         map::{
-            DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
-            DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
+            DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE,
+            DEV_MAJOR_MAX, DeviceStruct,
         },
     },
-    block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
+    block::cache::{BLOCK_SIZE, BlockCacheError, cached_block_device::BlockCache},
 };
 
 use alloc::{sync::Arc, vec::Vec};
@@ -530,8 +530,14 @@ impl BlockDeviceOps {
             );
         }
         if minorct > DeviceNumber::MINOR_MASK + 1 - baseminor {
-            error!("DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
-                name, baseminor, baseminor + minorct - 1, 0, DeviceNumber::MINOR_MASK);
+            error!(
+                "DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
+                name,
+                baseminor,
+                baseminor + minorct - 1,
+                0,
+                DeviceNumber::MINOR_MASK
+            );
         }
         let blockdev = DeviceStruct::new(DeviceNumber::new(major, baseminor), minorct, name);
         if major == Major::UNNAMED_MAJOR {

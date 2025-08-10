@@ -1,9 +1,9 @@
 use crate::{
     arch::{asm::csr::CSR_SSTATUS, interrupt::TrapFrame},
     process::{
-        fork::CloneFlags,
-        kthread::{kernel_thread_bootstrap_stage2, KernelThreadCreateInfo, KernelThreadMechanism},
         ProcessManager, RawPid,
+        fork::CloneFlags,
+        kthread::{KernelThreadCreateInfo, KernelThreadMechanism, kernel_thread_bootstrap_stage2},
     },
 };
 use alloc::sync::Arc;
@@ -56,11 +56,11 @@ impl KernelThreadMechanism {
 /// 当内核线程开始执行时，会先执行这个函数，这个函数会将伪造的trapframe中的数据弹出，然后跳转到第二阶段
 ///
 /// 跳转之后，指向Box<KernelThreadClosure>的指针将传入到stage2的函数
-// #[naked]
+// #[unsafe(naked)]
 // pub(super) unsafe extern "C" fn kernel_thread_bootstrap_stage1() {
 //     todo!()
 // }
-#[naked]
+#[unsafe(naked)]
 pub(super) unsafe extern "C" fn kernel_thread_bootstrap_stage1() {
     // 这个函数要是naked的，只是因为现在还没有实现，而naked func不能打`unimplemented!()`
     // 所以先写成了普通函数

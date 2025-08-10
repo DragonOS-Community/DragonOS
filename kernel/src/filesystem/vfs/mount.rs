@@ -1,7 +1,7 @@
 use core::{
     any::Any,
     fmt::Debug,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{Ordering, compiler_fence},
 };
 
 use alloc::{
@@ -26,16 +26,16 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{fault::PageFaultMessage, VmFaultReason},
+    mm::{VmFaultReason, fault::PageFaultMessage},
     process::{
-        namespace::mnt::{MntNamespace, MountPropagation},
         ProcessManager,
+        namespace::mnt::{MntNamespace, MountPropagation},
     },
 };
 
 use super::{
-    file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType,
-    IndexNode, InodeId, Magic, PollableInode, SuperBlock,
+    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, Magic, PollableInode, SuperBlock,
+    file::FileMode, syscall::ModeType, utils::DName,
 };
 
 // MountId类型

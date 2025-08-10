@@ -6,7 +6,7 @@ use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     process::{ProcessFlags, ProcessManager},
-    sched::{SchedMode, __schedule},
+    sched::{__schedule, SchedMode},
 };
 
 impl ProcessManager {

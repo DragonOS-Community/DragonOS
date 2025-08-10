@@ -1,5 +1,5 @@
 use crate::driver::base::device::bus::Bus;
-use crate::driver::base::device::{device_manager, device_register, sys_devices_kset, Device};
+use crate::driver::base::device::{Device, device_manager, device_register, sys_devices_kset};
 use crate::driver::base::kobject::KObject;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::misc::events::get_event_source_bus;

@@ -1,6 +1,6 @@
 use crate::process::ProcessManager;
 
-use super::{ProcessFlags, __PROCESS_MANAGEMENT_INIT_DONE};
+use super::{__PROCESS_MANAGEMENT_INIT_DONE, ProcessFlags};
 
 pub fn current_pcb_flags() -> ProcessFlags {
     if unsafe { !__PROCESS_MANAGEMENT_INIT_DONE } {

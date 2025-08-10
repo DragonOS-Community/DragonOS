@@ -3,7 +3,7 @@ use core::{
     intrinsics::unlikely,
     mem::{self, MaybeUninit},
     ptr::null_mut,
-    sync::atomic::{compiler_fence, fence, AtomicI16, Ordering},
+    sync::atomic::{AtomicI16, Ordering, compiler_fence, fence},
 };
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};

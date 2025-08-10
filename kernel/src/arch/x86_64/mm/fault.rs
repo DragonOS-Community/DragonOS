@@ -8,17 +8,17 @@ use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
 use crate::{
     arch::{
-        interrupt::{trap::X86PfErrorCode, TrapFrame},
+        CurrentIrqArch, MMArch,
+        interrupt::{TrapFrame, trap::X86PfErrorCode},
         ipc::signal::{SigCode, Signal},
         mm::{MemoryManagementArch, X86_64MMArch},
-        CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
     ipc::signal_types::{SigInfo, SigType},
     mm::{
+        VirtAddr, VmFaultReason, VmFlags,
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
-        VirtAddr, VmFaultReason, VmFlags,
     },
     process::ProcessManager,
 };

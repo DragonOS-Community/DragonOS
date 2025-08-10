@@ -2,12 +2,12 @@ use num_traits::FromPrimitive;
 
 use crate::{
     arch::{
-        ipc::signal::{SigSet, Signal, MAX_SIG_NUM},
         CurrentIrqArch,
+        ipc::signal::{MAX_SIG_NUM, SigSet, Signal},
     },
     exception::InterruptArch,
     process::ProcessManager,
-    sched::{schedule, SchedMode},
+    sched::{SchedMode, schedule},
 };
 
 /// 信号处理的栈的栈指针的最小对齐

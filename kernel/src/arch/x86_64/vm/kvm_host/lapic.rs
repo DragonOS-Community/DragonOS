@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 
 use crate::{
     arch::kvm_arch_ops,
-    virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
+    virt::vm::kvm_host::{Vm, vcpu::VirtCpu},
 };
 
 const APIC_DEFAULT_PHYS_BASE: u64 = 0xfee00000;

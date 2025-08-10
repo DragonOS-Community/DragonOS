@@ -4,12 +4,12 @@
 /// @Description: bump allocator线性分配器
 use super::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{
+    MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea,
     allocator::page_frame::{PhysPageFrame, PhysPageFrameIter},
-    init::{mm_init_status, MMInitStatus},
+    init::{MMInitStatus, mm_init_status},
     memblock::mem_block_manager,
     no_init::pseudo_map_phys,
     page::PageMapper,
-    MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea,
 };
 use core::marker::PhantomData;
 

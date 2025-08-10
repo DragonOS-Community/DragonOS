@@ -1,4 +1,4 @@
-use crate::time::{clocksource::HZ, TimeArch};
+use crate::time::{TimeArch, clocksource::HZ};
 
 /// 这个是系统jiffies时钟源的固有频率（不是调频之后的）
 pub const CLOCK_TICK_RATE: u32 = HZ as u32 * 1000000;

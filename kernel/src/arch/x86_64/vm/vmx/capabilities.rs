@@ -8,14 +8,14 @@ use x86::{
 
 use crate::{
     arch::vm::{
-        mmu::kvm_mmu::PageLevel, CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR,
-        PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR, VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR,
-        VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR,
+        CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR, PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR,
+        VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR, VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR,
+        mmu::kvm_mmu::PageLevel,
     },
     virt::vm::kvm_host::vcpu::VirtCpu,
 };
 
-use super::{vmcs::feat::VmxFeat, Vmx};
+use super::{Vmx, vmcs::feat::VmxFeat};
 
 #[derive(Debug)]
 pub struct VmcsConfig {

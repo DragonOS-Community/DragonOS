@@ -298,7 +298,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
                 // 检测entry 是否对齐
                 if !entry.check_aligned(1 << spec_order) {
-                    panic!("entry={:?} is not aligned, spec_order={spec_order}, page_list.entry_num={}", entry, tmp_current_entry_num);
+                    panic!(
+                        "entry={:?} is not aligned, spec_order={spec_order}, page_list.entry_num={}",
+                        entry, tmp_current_entry_num
+                    );
                 }
                 return Some(entry);
             }

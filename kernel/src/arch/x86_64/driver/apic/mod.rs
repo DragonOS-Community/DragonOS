@@ -7,9 +7,9 @@ use x86::{apic::Icr, msr::IA32_APIC_BASE};
 
 use crate::{
     arch::{
+        CurrentPortIOArch,
         driver::apic::{hw_irq::ApicId, x2apic::X2Apic, xapic::XApic},
         io::PortIOArch,
-        CurrentPortIOArch,
     },
     mm::PhysAddr,
     smp::core::smp_get_processor_id,
@@ -17,7 +17,7 @@ use crate::{
 
 use self::{
     apic_timer::LocalApicTimerMode,
-    xapic::{current_xapic_instance, XApicOffset},
+    xapic::{XApicOffset, current_xapic_instance},
 };
 
 pub mod apic_timer;

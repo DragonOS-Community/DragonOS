@@ -1,12 +1,12 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
-use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
+use crate::filesystem::vfs::{FSMAKER, FileSystemMakerData};
 use crate::libs::rwlock::RwLock;
 use crate::register_mountable_fs;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{vcore::generate_inode_id, FileType},
+    filesystem::vfs::{FileType, vcore::generate_inode_id},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -23,8 +23,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    file::FilePrivateData, syscall::ModeType, utils::DName, FileSystem, FileSystemMaker, FsInfo,
-    IndexNode, InodeId, Metadata, SpecialNodeData,
+    FileSystem, FileSystemMaker, FsInfo, IndexNode, InodeId, Metadata, SpecialNodeData,
+    file::FilePrivateData, syscall::ModeType, utils::DName,
 };
 
 use linkme::distributed_slice;
@@ -538,9 +538,18 @@ impl IndexNode for LockedRamFSInode {
                     .collect();
 
                 match key.len() {
-                    0=>{return Err(SystemError::ENOENT);}
-                    1=>{return Ok(key.remove(0));}
-                    _ => panic!("Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    0 => {
+                        return Err(SystemError::ENOENT);
+                    }
+                    1 => {
+                        return Ok(key.remove(0));
+                    }
+                    _ => panic!(
+                        "Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
+                        key_len = key.len(),
+                        inode_id = inode.metadata.inode_id,
+                        to_find = ino
+                    ),
                 }
             }
         }

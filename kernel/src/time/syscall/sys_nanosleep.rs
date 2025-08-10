@@ -2,8 +2,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_NANOSLEEP;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
-use crate::time::sleep::nanosleep;
 use crate::time::PosixTimeSpec;
+use crate::time::sleep::nanosleep;
 use alloc::vec::Vec;
 use system_error::SystemError;
 

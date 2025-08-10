@@ -3,8 +3,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::{
     driver::{
         base::device::{
-            device_number::{DeviceNumber, Major},
             IdTable,
+            device_number::{DeviceNumber, Major},
         },
         tty::{
             pty::unix98pty::NR_UNIX98_PTY_MAX,
@@ -13,7 +13,7 @@ use crate::{
     },
     filesystem::{
         devfs::DeviceINode,
-        vfs::{mount::do_mount_mkdir, syscall::ModeType, FileType},
+        vfs::{FileType, mount::do_mount_mkdir, syscall::ModeType},
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
@@ -29,7 +29,7 @@ use log::info;
 use system_error::SystemError;
 
 use super::vfs::{
-    vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata,
+    FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata, vcore::generate_inode_id,
 };
 
 const DEV_PTYFS_MAX_NAMELEN: usize = 16;

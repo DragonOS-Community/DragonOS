@@ -16,14 +16,14 @@ use crate::{
         base::{
             class::Class,
             device::{
-                bus::Bus, device_manager, device_number::Major, driver::Driver, Device,
-                DeviceCommonData, DeviceKObjType, DeviceState, DeviceType, IdTable,
+                Device, DeviceCommonData, DeviceKObjType, DeviceState, DeviceType, IdTable,
+                bus::Bus, device_manager, device_number::Major, driver::Driver,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
             platform::{
-                platform_device::{platform_device_manager, PlatformDevice},
-                platform_driver::{platform_driver_manager, PlatformDriver},
+                platform_device::{PlatformDevice, platform_device_manager},
+                platform_driver::{PlatformDriver, platform_driver_manager},
             },
         },
         tty::tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType},
@@ -34,11 +34,11 @@ use crate::{
 
 #[cfg(target_arch = "x86_64")]
 use self::serial8250_pio::{
-    send_to_default_serial8250_pio_port, serial8250_pio_port_early_init,
-    serial_8250_pio_register_tty_devices, Serial8250PIOTtyDriverInner,
+    Serial8250PIOTtyDriverInner, send_to_default_serial8250_pio_port,
+    serial_8250_pio_register_tty_devices, serial8250_pio_port_early_init,
 };
 
-use super::{uart_manager, UartDriver, UartManager, UartPort, TTY_SERIAL_DEFAULT_TERMIOS};
+use super::{TTY_SERIAL_DEFAULT_TERMIOS, UartDriver, UartManager, UartPort, uart_manager};
 
 #[cfg(target_arch = "x86_64")]
 mod serial8250_pio;

@@ -3,7 +3,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     arch::syscall::nr::SYS_RT_SIGPROCMASK,
-    ipc::signal::{set_sigprocmask, SigHow},
+    ipc::signal::{SigHow, set_sigprocmask},
     mm::VirtAddr,
     syscall::{
         table::{FormattedSyscallParam, Syscall},

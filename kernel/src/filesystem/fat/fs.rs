@@ -18,15 +18,15 @@ use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
-use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::{
-    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
+    driver::base::block::{SeekFrom, block_device::LBA_SIZE, disk_info::Partition},
     filesystem::vfs::{
+        FileSystem, FileType, IndexNode, InodeId, Metadata,
         file::{FileMode, FilePrivateData},
         syscall::ModeType,
         vcore::generate_inode_id,
-        FileSystem, FileType, IndexNode, InodeId, Metadata,
     },
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -580,7 +580,10 @@ impl FATFileSystem {
                 match entry {
                     _n if (0x0ffffff7..=0x0fffffff).contains(&current_cluster) => {
                         // 当前簇号不是一个能被获得的簇（可能是文件系统出错了）
-                        error!("FAT32 get fat entry: current cluster number [{}] is not an allocatable cluster number.", current_cluster);
+                        error!(
+                            "FAT32 get fat entry: current cluster number [{}] is not an allocatable cluster number.",
+                            current_cluster
+                        );
                         FATEntry::Bad
                     }
                     0 => FATEntry::Unused,
@@ -1882,9 +1885,18 @@ impl IndexNode for LockedFATInode {
                     .collect();
 
                 match key.len() {
-                    0=>{return Err(SystemError::ENOENT);}
-                    1=>{return Ok(key.remove(0));}
-                    _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
+                    0 => {
+                        return Err(SystemError::ENOENT);
+                    }
+                    1 => {
+                        return Ok(key.remove(0));
+                    }
+                    _ => panic!(
+                        "FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
+                        key_len = key.len(),
+                        inode_id = guard.metadata.inode_id,
+                        to_find = ino
+                    ),
                 }
             }
         }

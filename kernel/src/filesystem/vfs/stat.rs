@@ -11,9 +11,9 @@ use crate::{
 use alloc::sync::Arc;
 
 use super::{
+    IndexNode,
     fcntl::AtFlags,
     syscall::{ModeType, PosixStatx, PosixStatxMask, StxAttributes},
-    IndexNode,
 };
 
 #[derive(Clone)]

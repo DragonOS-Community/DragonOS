@@ -17,13 +17,13 @@ use crate::{
     arch::{CurrentIrqArch, MMArch},
     exception::InterruptArch,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
+    mm::{MemoryManagementArch, VirtAddr, ucontext::AddressSpace},
     process::{ProcessControlBlock, ProcessManager, RawPid},
-    sched::{schedule, SchedMode},
+    sched::{SchedMode, schedule},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
-        timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         PosixTimeSpec,
+        timer::{Timer, WakeUpHelper, next_n_us_timer_jiffies},
     },
 };
 

@@ -5,7 +5,7 @@ use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     mm::VirtAddr,
-    process::{fork::KernelCloneArgs, KernelStack, ProcessControlBlock, ProcessManager},
+    process::{KernelStack, ProcessControlBlock, ProcessManager, fork::KernelCloneArgs},
 };
 
 use super::interrupt::TrapFrame;

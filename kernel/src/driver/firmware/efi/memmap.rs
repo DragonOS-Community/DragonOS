@@ -6,10 +6,10 @@ use system_error::SystemError;
 use crate::{
     driver::firmware::efi::EFIInitFlags,
     libs::align::page_align_down,
-    mm::{early_ioremap::EarlyIoRemap, PhysAddr, VirtAddr},
+    mm::{PhysAddr, VirtAddr, early_ioremap::EarlyIoRemap},
 };
 
-use super::{fdt::EFIFdtParams, tables::MemoryDescriptor, EFIManager};
+use super::{EFIManager, fdt::EFIFdtParams, tables::MemoryDescriptor};
 
 #[derive(Debug)]
 pub struct EFIMemoryMapInfo {

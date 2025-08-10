@@ -7,14 +7,14 @@ use crate::arch::driver::apic::{CurrentApic, LocalAPIC};
 use crate::{
     arch::MMArch,
     mm::MemoryManagementArch,
-    sched::{SchedMode, __schedule},
+    sched::{__schedule, SchedMode},
     smp::cpu::ProcessorId,
 };
 
 use super::{
+    HardwareIrqNumber, IrqNumber,
     irqdata::IrqHandlerData,
     irqdesc::{IrqHandler, IrqReturn},
-    HardwareIrqNumber, IrqNumber,
 };
 
 #[allow(dead_code)]

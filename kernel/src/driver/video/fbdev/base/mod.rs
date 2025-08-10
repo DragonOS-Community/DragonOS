@@ -6,7 +6,7 @@ use crate::{
     driver::{base::device::Device, tty::virtual_terminal::Color},
     init::boot_params,
     libs::rwlock::RwLock,
-    mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
+    mm::{PhysAddr, VirtAddr, ucontext::LockedVMA},
 };
 
 use self::{

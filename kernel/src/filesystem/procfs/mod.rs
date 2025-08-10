@@ -14,7 +14,7 @@ use system_error::SystemError;
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{vcore::generate_inode_id, FileType},
+    filesystem::vfs::{FileType, vcore::generate_inode_id},
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -26,10 +26,10 @@ use crate::{
 };
 
 use super::vfs::{
+    FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
     file::{FileMode, FilePrivateData},
     syscall::ModeType,
     utils::DName,
-    FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
 pub mod kmsg;
@@ -980,10 +980,19 @@ impl IndexNode for LockedProcFSInode {
                     .collect();
 
                 match key.len() {
-                        0=>{return Err(SystemError::ENOENT);}
-                        1=>{return Ok(key.remove(0));}
-                        _ => panic!("Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    0 => {
+                        return Err(SystemError::ENOENT);
                     }
+                    1 => {
+                        return Ok(key.remove(0));
+                    }
+                    _ => panic!(
+                        "Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
+                        key_len = key.len(),
+                        inode_id = inode.metadata.inode_id,
+                        to_find = ino
+                    ),
+                }
             }
         }
     }

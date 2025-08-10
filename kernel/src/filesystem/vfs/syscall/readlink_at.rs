@@ -2,12 +2,12 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
+        FileType, MAX_PATHLEN,
         file::{File, FileMode},
         utils::user_path_at,
-        FileType, MAX_PATHLEN,
     },
     process::ProcessManager,
-    syscall::user_access::{check_and_clone_cstr, UserBufferWriter},
+    syscall::user_access::{UserBufferWriter, check_and_clone_cstr},
 };
 
 pub fn do_readlink_at(

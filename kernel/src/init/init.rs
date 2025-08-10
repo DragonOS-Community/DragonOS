@@ -1,14 +1,14 @@
 use crate::{
     arch::{
+        CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
         init::{early_setup_arch, setup_arch, setup_arch_post},
         time::time_init,
-        CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
     driver::{
         acpi::acpi_init, base::init::driver_init, serial::serial_early_init,
         video::VideoRefreshManager,
     },
-    exception::{init::irq_init, softirq::softirq_init, InterruptArch},
+    exception::{InterruptArch, init::irq_init, softirq::softirq_init},
     filesystem::vfs::vcore::vfs_init,
     init::init_intertrait,
     libs::{
@@ -20,10 +20,10 @@ use crate::{
         printk::early_init_logging,
     },
     mm::init::mm_init,
-    process::{kthread::kthread_init, process_init, ProcessManager},
+    process::{ProcessManager, kthread::kthread_init, process_init},
     sched::SchedArch,
-    smp::{early_smp_init, SMPArch},
-    syscall::{syscall_init, Syscall},
+    smp::{SMPArch, early_smp_init},
+    syscall::{Syscall, syscall_init},
     time::{
         clocksource::clocksource_boot_finish, timekeeping::timekeeping_init, timer::timer_init,
     },

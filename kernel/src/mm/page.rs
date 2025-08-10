@@ -4,7 +4,7 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{Ordering, compiler_fence},
 };
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -15,7 +15,7 @@ use log::{error, info};
 use lru::LruCache;
 
 use crate::{
-    arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
+    arch::{MMArch, interrupt::ipi::send_ipi, mm::LockedFrameAllocator},
     exception::ipi::{IpiKind, IpiTarget},
     filesystem::{page_cache::PageCache, vfs::FilePrivateData},
     init::initcall::INITCALL_CORE,
@@ -25,16 +25,16 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::{ProcessControlBlock, ProcessManager},
-    time::{sleep::nanosleep, PosixTimeSpec},
+    time::{PosixTimeSpec, sleep::nanosleep},
 };
 
 use super::{
+    MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
     allocator::page_frame::{
-        deallocate_page_frames, FrameAllocator, PageFrameCount, PhysPageFrame,
+        FrameAllocator, PageFrameCount, PhysPageFrame, deallocate_page_frames,
     },
     syscall::ProtFlags,
     ucontext::LockedVMA,
-    MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
 };
 
 pub const PAGE_4K_SHIFT: usize = 12;
@@ -1078,11 +1078,7 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
 
             #[cfg(target_arch = "x86_64")]
             {
-                if user {
-                    r.set_user(true)
-                } else {
-                    r
-                }
+                if user { r.set_user(true) } else { r }
             }
 
             #[cfg(target_arch = "riscv64")]
@@ -1608,11 +1604,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let i = table.index_of(virt)?;
         let entry = unsafe { table.entry(i) }?;
 
-        if !entry.empty() {
-            Some(entry)
-        } else {
-            None
-        }
+        if !entry.empty() { Some(entry) } else { None }
 
         // let mut table = self.table();
         // if level > Arch::PAGE_LEVELS - 1 {

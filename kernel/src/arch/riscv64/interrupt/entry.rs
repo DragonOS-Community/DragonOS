@@ -7,7 +7,7 @@ use asm_macros::{restore_from_x6_to_x31, save_from_x6_to_x31};
 use kdepends::memoffset::offset_of;
 
 /// Riscv64中断处理入口
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 #[repr(align(4))]
 pub unsafe extern "C" fn handle_exception() -> ! {
@@ -30,7 +30,7 @@ pub unsafe extern "C" fn handle_exception() -> ! {
     )
 }
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 unsafe extern "C" fn _restore_kernel_tpsp() -> ! {
     core::arch::naked_asm!(
@@ -50,7 +50,7 @@ unsafe extern "C" fn _restore_kernel_tpsp() -> ! {
     )
 }
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 unsafe extern "C" fn _save_context() -> ! {
     core::arch::naked_asm!(
@@ -164,7 +164,7 @@ unsafe extern "C" fn _save_context() -> ! {
     )
 }
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn ret_from_exception() -> ! {
     core::arch::naked_asm!(

@@ -6,10 +6,10 @@ use crate::driver::base::device::DeviceId;
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
 use crate::driver::net::irq_handle::DefaultNetIrqHandler;
 use crate::driver::pci::pci::{
-    get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
-    PCI_DEVICE_LINKEDLIST,
+    PCI_DEVICE_LINKEDLIST, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
+    get_pci_device_structure_mut,
 };
-use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
+use crate::driver::pci::pci_irq::{IRQ, IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg};
 use crate::exception::IrqNumber;
 use alloc::string::ToString;
 use alloc::sync::Arc;
@@ -18,7 +18,7 @@ use core::intrinsics::unlikely;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 use log::{debug, info};
 
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
@@ -633,11 +633,7 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
         }
     }
 
-    if initialized {
-        Ok(1)
-    } else {
-        Ok(0)
-    }
+    if initialized { Ok(1) } else { Ok(0) }
 }
 
 // 用到的e1000e寄存器结构体
@@ -776,7 +772,7 @@ const E1000E_TCTL_EN: u32 = 1 << 1;
 const E1000E_TCTL_PSP: u32 = 1 << 3;
 const E1000E_TCTL_CT_VAL: u32 = 0x0f << 4; // suggested 16d collision, 手册建议值：16d
 const E1000E_TCTL_COLD_VAL: u32 = 0x03f << 12; // suggested 64 byte time for Full-Duplex, 手册建议值：64
-                                               // TXDCTL
+// TXDCTL
 const E1000E_TXDCTL_WTHRESH: u32 = 1 << 16;
 const E1000E_TXDCTL_GRAN: u32 = 1 << 24;
 // TIPG

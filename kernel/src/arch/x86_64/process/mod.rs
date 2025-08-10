@@ -2,7 +2,7 @@ use core::{
     arch::asm,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{Ordering, compiler_fence},
 };
 
 use alloc::sync::{Arc, Weak};
@@ -18,8 +18,8 @@ use crate::{
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
+        KernelStack, PROCESS_SWITCH_RESULT, ProcessControlBlock, ProcessFlags, ProcessManager,
         fork::{CloneFlags, KernelCloneArgs},
-        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, PROCESS_SWITCH_RESULT,
     },
     syscall::Syscall,
 };
@@ -27,10 +27,10 @@ use crate::{
 use self::{
     kthread::kernel_thread_bootstrap_stage1,
     syscall::ARCH_SET_FS,
-    table::{switch_fs_and_gs, KERNEL_DS, USER_DS},
+    table::{KERNEL_DS, USER_DS, switch_fs_and_gs},
 };
 
-use super::{fpu::FpState, interrupt::TrapFrame, syscall::X86_64GSData, CurrentIrqArch};
+use super::{CurrentIrqArch, fpu::FpState, interrupt::TrapFrame, syscall::X86_64GSData};
 
 pub mod idle;
 pub mod kthread;
@@ -423,7 +423,7 @@ impl ProcessManager {
 }
 
 /// 保存上下文，然后切换进程，接着jmp到`switch_finish_hook`钩子函数
-#[naked]
+#[unsafe(naked)]
 unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBInfo) {
     core::arch::naked_asm!(
         // As a quick reminder for those who are unfamiliar with the System V ABI (extern "C"):
@@ -501,7 +501,7 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
     );
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "sysv64" fn switch_back() -> ! {
     core::arch::naked_asm!("ret");
 }

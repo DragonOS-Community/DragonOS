@@ -1,7 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_VFORK;
-use crate::process::fork::CloneFlags;
 use crate::process::ProcessManager;
+use crate::process::fork::CloneFlags;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;
 use system_error::SystemError;

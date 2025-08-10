@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_NEWFSTATAT;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{stat::do_newfstatat, MAX_PATHLEN},
+    filesystem::vfs::{MAX_PATHLEN, stat::do_newfstatat},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::check_and_clone_cstr,

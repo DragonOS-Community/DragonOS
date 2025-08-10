@@ -2,12 +2,12 @@
 
 use super::ProtFlags;
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MMAP};
-use crate::mm::syscall::page_align_up;
-use crate::mm::syscall::MapFlags;
-use crate::mm::ucontext::DEFAULT_MMAP_MIN_ADDR;
-use crate::mm::verify_area;
 use crate::mm::AddressSpace;
 use crate::mm::VirtAddr;
+use crate::mm::syscall::MapFlags;
+use crate::mm::syscall::page_align_up;
+use crate::mm::ucontext::DEFAULT_MMAP_MIN_ADDR;
+use crate::mm::verify_area;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use log::error;
 use system_error::SystemError;

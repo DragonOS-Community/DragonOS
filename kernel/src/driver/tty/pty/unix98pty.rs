@@ -12,8 +12,8 @@ use crate::{
         devpts::DevPtsFs,
         epoll::EPollEventType,
         vfs::{
-            file::FileMode, syscall::ModeType, FilePrivateData, FileType, MountFS,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            FilePrivateData, FileType, MountFS, VFS_MAX_FOLLOW_SYMLINK_TIMES, file::FileMode,
+            syscall::ModeType,
         },
     },
     libs::spinlock::SpinLockGuard,
@@ -22,7 +22,7 @@ use crate::{
     syscall::user_access::UserBufferWriter,
 };
 
-use super::{ptm_driver, pts_driver, PtyCommon};
+use super::{PtyCommon, ptm_driver, pts_driver};
 
 pub const NR_UNIX98_PTY_MAX: u32 = 128;
 

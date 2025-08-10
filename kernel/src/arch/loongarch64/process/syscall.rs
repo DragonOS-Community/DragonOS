@@ -4,8 +4,8 @@ use crate::{
     arch::interrupt::TrapFrame,
     mm::VirtAddr,
     process::{
-        exec::{BinaryLoaderResult, ExecParam},
         ProcessManager,
+        exec::{BinaryLoaderResult, ExecParam},
     },
     syscall::Syscall,
 };

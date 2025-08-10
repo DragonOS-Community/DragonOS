@@ -12,7 +12,7 @@ use crate::{
     sched::completion::Completion,
 };
 
-use super::{core::smp_get_processor_id, SMPArch};
+use super::{SMPArch, core::smp_get_processor_id};
 
 int_like!(ProcessorId, AtomicProcessorId, u32, AtomicU32);
 

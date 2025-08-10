@@ -1,6 +1,6 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{Ordering, compiler_fence},
 };
 
 use log::debug;
@@ -17,11 +17,11 @@ use crate::{
 use self::boot::early_boot_init;
 
 use super::{
+    MMArch,
     driver::{
         hpet::{hpet_init, hpet_instance},
         tsc::TSCManager,
     },
-    MMArch,
 };
 
 mod boot;

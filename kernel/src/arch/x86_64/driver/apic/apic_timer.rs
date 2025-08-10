@@ -1,15 +1,15 @@
 use core::cell::RefCell;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use crate::arch::driver::tsc::TSCManager;
 use crate::arch::interrupt::TrapFrame;
 use crate::driver::base::device::DeviceId;
+use crate::exception::IrqNumber;
 use crate::exception::irqdata::{IrqHandlerData, IrqLineStatus};
 use crate::exception::irqdesc::{
-    irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandleFlags, IrqHandler, IrqReturn,
+    IrqDesc, IrqFlowHandler, IrqHandleFlags, IrqHandler, IrqReturn, irq_desc_manager,
 };
 use crate::exception::manage::irq_manager;
-use crate::exception::IrqNumber;
 
 use crate::mm::percpu::PerCpu;
 use crate::smp::core::smp_get_processor_id;
@@ -22,11 +22,11 @@ pub use drop;
 use log::debug;
 use system_error::SystemError;
 use x86::cpuid::cpuid;
-use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
+use x86::msr::{IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT, wrmsr};
 
 use super::lapic_vector::local_apic_chip;
 use super::xapic::XApicOffset;
-use super::{CurrentApic, LVTRegister, LocalAPIC, LVT};
+use super::{CurrentApic, LVT, LVTRegister, LocalAPIC};
 
 pub const APIC_TIMER_IRQ_NUM: IrqNumber = IrqNumber::new(151);
 

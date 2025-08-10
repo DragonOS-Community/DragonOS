@@ -2,8 +2,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::{
     arch::syscall::nr::SYS_PIPE2,
     filesystem::vfs::{
-        file::{File, FileMode},
         FilePrivateData,
+        file::{File, FileMode},
     },
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::spinlock::SpinLock,

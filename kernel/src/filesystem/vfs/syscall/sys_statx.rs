@@ -1,7 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STATX;
-use crate::filesystem::vfs::stat::do_statx;
 use crate::filesystem::vfs::MAX_PATHLEN;
+use crate::filesystem::vfs::stat::do_statx;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::check_and_clone_cstr;

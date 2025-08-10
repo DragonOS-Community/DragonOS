@@ -7,13 +7,13 @@ use uefi_raw::table::boot::{MemoryAttribute, MemoryType};
 use crate::{
     arch::MMArch,
     driver::{
-        firmware::efi::{esrt::efi_esrt_init, EFIInitFlags},
+        firmware::efi::{EFIInitFlags, esrt::efi_esrt_init},
         open_firmware::fdt::open_firmware_fdt_driver,
     },
     libs::align::{page_align_down, page_align_up},
     mm::{
-        allocator::page_frame::PhysPageFrame, early_ioremap::EarlyIoRemap,
-        memblock::mem_block_manager, MemoryManagementArch, PhysAddr, VirtAddr,
+        MemoryManagementArch, PhysAddr, VirtAddr, allocator::page_frame::PhysPageFrame,
+        early_ioremap::EarlyIoRemap, memblock::mem_block_manager,
     },
 };
 

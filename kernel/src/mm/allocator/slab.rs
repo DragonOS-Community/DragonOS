@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use log::debug;
 use slabmalloc::*;
 
-use crate::{arch::MMArch, mm::MemoryManagementArch, KERNEL_ALLOCATOR};
+use crate::{KERNEL_ALLOCATOR, arch::MMArch, mm::MemoryManagementArch};
 
 // 全局slab分配器
 pub(crate) static mut SLABALLOCATOR: Option<SlabAllocator> = None;

@@ -1,7 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETGID;
-use crate::process::cred::Cred;
 use crate::process::ProcessManager;
+use crate::process::cred::Cred;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;

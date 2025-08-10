@@ -1,6 +1,6 @@
 use core::hint::spin_loop;
 
-use x86::cpuid::{cpuid, CpuIdResult};
+use x86::cpuid::{CpuIdResult, cpuid};
 
 use crate::smp::cpu::ProcessorId;
 

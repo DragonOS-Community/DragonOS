@@ -8,9 +8,9 @@ use system_error::SystemError;
 use crate::{arch::time::CLOCK_TICK_RATE, libs::spinlock::SpinLock};
 
 use super::{
+    NSEC_PER_SEC,
     clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},
     timer::clock,
-    NSEC_PER_SEC,
 };
 lazy_static! {
     pub static ref DEFAULT_CLOCK: Arc<ClocksourceJiffies> = ClocksourceJiffies::new();

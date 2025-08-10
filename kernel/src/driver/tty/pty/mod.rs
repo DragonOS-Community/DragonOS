@@ -7,8 +7,9 @@ use unified_init::macros::unified_init;
 
 use crate::{
     driver::base::device::{
+        IdTable,
         device_number::{DeviceNumber, Major},
-        device_register, IdTable,
+        device_register,
     },
     filesystem::devfs::devfs_register,
     init::initcall::INITCALL_DEVICE,
@@ -17,13 +18,13 @@ use crate::{
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
-use self::unix98pty::{Unix98PtyDriverInner, NR_UNIX98_PTY_MAX};
+use self::unix98pty::{NR_UNIX98_PTY_MAX, Unix98PtyDriverInner};
 
 use super::{
     termios::{ControlMode, InputMode, LocalMode, OutputMode, TTY_STD_TERMIOS},
     tty_core::{TtyCore, TtyCoreData, TtyFlag, TtyPacketStatus},
     tty_device::{TtyDevice, TtyType},
-    tty_driver::{TtyDriver, TtyDriverManager, TtyDriverSubType, TtyDriverType, TTY_DRIVERS},
+    tty_driver::{TTY_DRIVERS, TtyDriver, TtyDriverManager, TtyDriverSubType, TtyDriverType},
     tty_port::{DefaultTtyPort, TtyPort},
 };
 

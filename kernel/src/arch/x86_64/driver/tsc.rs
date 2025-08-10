@@ -1,8 +1,8 @@
 use crate::{
-    arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch, CurrentTimeArch},
-    driver::acpi::pmtmr::{acpi_pm_read_early, ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC},
+    arch::{CurrentIrqArch, CurrentPortIOArch, CurrentTimeArch, io::PortIOArch},
+    driver::acpi::pmtmr::{ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC, acpi_pm_read_early},
     exception::InterruptArch,
-    time::{TimeArch, PIT_TICK_RATE},
+    time::{PIT_TICK_RATE, TimeArch},
 };
 use core::{
     cmp::{max, min},

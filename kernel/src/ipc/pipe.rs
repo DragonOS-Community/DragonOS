@@ -1,10 +1,10 @@
 use crate::{
     arch::ipc::signal::{SigCode, Signal},
     filesystem::{
-        epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
+        epoll::{EPollEventType, EPollItem, event_poll::EventPoll},
         vfs::{
-            file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
-            FileSystem, FileType, IndexNode, Metadata, PollableInode,
+            FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollableInode,
+            file::FileMode, syscall::ModeType, vcore::generate_inode_id,
         },
     },
     libs::{

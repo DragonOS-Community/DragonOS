@@ -5,8 +5,8 @@ use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
     process::{
-        pid::{Pid, PidType},
         ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
+        pid::{Pid, PidType},
     },
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };

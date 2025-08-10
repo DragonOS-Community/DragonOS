@@ -4,7 +4,7 @@ use core::{
     hint::spin_loop,
     intrinsics::{likely, unlikely},
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering, compiler_fence, fence},
 };
 
 use alloc::{
@@ -15,23 +15,23 @@ use alloc::{
 use cred::INIT_CRED;
 use hashbrown::HashMap;
 use log::{debug, error, info, warn};
-use pid::{alloc_pid, Pid, PidLink, PidType};
+use pid::{Pid, PidLink, PidType, alloc_pid};
 use process_group::Pgid;
 use system_error::SystemError;
 
 use crate::{
     arch::{
+        CurrentIrqArch,
         cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
-        CurrentIrqArch,
     },
     driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
         procfs::procfs_unregister_pid,
-        vfs::{file::FileDescriptorVec, FileType, IndexNode},
+        vfs::{FileType, IndexNode, file::FileDescriptorVec},
     },
     ipc::{
         signal::RestartBlock,
@@ -41,7 +41,7 @@ use crate::{
         align::AlignedBox,
         casting::DowncastArc,
         futex::{
-            constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
+            constant::{FUTEX_BITSET_MATCH_ANY, FutexFlag},
             futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
@@ -50,15 +50,15 @@ use crate::{
         wait_queue::WaitQueue,
     },
     mm::{
+        PhysAddr, VirtAddr,
         percpu::{PerCpu, PerCpuVar},
         set_IDLE_PROCESS_ADDRESS_SPACE,
         ucontext::AddressSpace,
-        PhysAddr, VirtAddr,
     },
     net::socket::SocketInode,
     sched::{
-        completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
-        EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule,
+        __schedule, DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, completion::Completion,
+        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
     },
     smp::{
         core::smp_get_processor_id,
@@ -1711,10 +1711,10 @@ static KSTACK_LOCK: SpinLock<()> = SpinLock::new(());
 
 unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
     use crate::arch::MMArch;
-    use crate::mm::allocator::page_frame::{allocate_page_frames, PageFrameCount};
+    use crate::mm::MemoryManagementArch;
+    use crate::mm::allocator::page_frame::{PageFrameCount, allocate_page_frames};
     use crate::mm::kernel_mapper::KernelMapper;
     use crate::mm::page::EntryFlags;
-    use crate::mm::MemoryManagementArch;
 
     // Layout
     // ---------------
@@ -1767,11 +1767,11 @@ unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
 }
 
 unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr) {
-    use crate::arch::mm::kernel_page_flags;
     use crate::arch::MMArch;
-    use crate::mm::allocator::page_frame::{deallocate_page_frames, PageFrameCount, PhysPageFrame};
-    use crate::mm::kernel_mapper::KernelMapper;
+    use crate::arch::mm::kernel_page_flags;
     use crate::mm::MemoryManagementArch;
+    use crate::mm::allocator::page_frame::{PageFrameCount, PhysPageFrame, deallocate_page_frames};
+    use crate::mm::kernel_mapper::KernelMapper;
 
     let _guard = KSTACK_LOCK.try_lock_irqsave().unwrap();
 

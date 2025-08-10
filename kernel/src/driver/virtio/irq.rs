@@ -6,9 +6,9 @@ use unified_init::macros::unified_init;
 use crate::{
     driver::base::device::DeviceId,
     exception::{
+        IrqNumber,
         irqdata::IrqHandlerData,
         irqdesc::{IrqHandler, IrqReturn},
-        IrqNumber,
     },
     init::initcall::INITCALL_CORE,
     libs::rwlock::RwLock,

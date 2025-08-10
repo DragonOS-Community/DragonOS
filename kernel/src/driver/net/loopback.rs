@@ -11,7 +11,7 @@ use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::net::{generate_iface_id, NET_DEVICES};
+use crate::net::{NET_DEVICES, generate_iface_id};
 use crate::time::Instant;
 use alloc::collections::VecDeque;
 use alloc::fmt::Debug;
@@ -28,7 +28,7 @@ use smoltcp::{
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use super::{register_netdevice, NetDeivceState, NetDevice, NetDeviceCommonData, Operstate};
+use super::{NetDeivceState, NetDevice, NetDeviceCommonData, Operstate, register_netdevice};
 
 const DEVICE_NAME: &str = "loopback";
 

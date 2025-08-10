@@ -1,10 +1,11 @@
 //! System call handler for the mprotect system call.
 
-use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MPROTECT, MMArch};
+use crate::arch::{MMArch, interrupt::TrapFrame, syscall::nr::SYS_MPROTECT};
 use crate::mm::{
-    syscall::{check_aligned, PageFrameCount, ProtFlags},
+    MemoryManagementArch, VirtPageFrame,
+    syscall::{PageFrameCount, ProtFlags, check_aligned},
     ucontext::AddressSpace,
-    MemoryManagementArch, VirtPageFrame, {verify_area, VirtAddr},
+    {VirtAddr, verify_area},
 };
 
 use crate::syscall::table::{FormattedSyscallParam, Syscall};

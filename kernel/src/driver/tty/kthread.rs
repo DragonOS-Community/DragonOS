@@ -8,10 +8,10 @@ use crate::{
     driver::tty::virtual_terminal::vc_manager,
     exception::InterruptArch,
     process::{
-        kthread::{KernelThreadClosure, KernelThreadMechanism},
         ProcessControlBlock, ProcessManager,
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
     },
-    sched::{schedule, SchedMode},
+    sched::{SchedMode, schedule},
 };
 
 /// 用于缓存键盘输入的缓冲区

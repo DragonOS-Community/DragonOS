@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::intrinsics::likely;
 use core::ops::BitXor;
 
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{StaticBitmap, traits::BitMapOps};
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;

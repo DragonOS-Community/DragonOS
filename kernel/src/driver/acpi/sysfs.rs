@@ -5,8 +5,8 @@ use crate::{
     },
     filesystem::{
         sysfs::{
-            file::sysfs_emit_str, sysfs_instance, Attribute, BinAttribute, SysFSOpsSupport,
-            SYSFS_ATTR_MODE_RO,
+            Attribute, BinAttribute, SYSFS_ATTR_MODE_RO, SysFSOpsSupport, file::sysfs_emit_str,
+            sysfs_instance,
         },
         vfs::syscall::ModeType,
     },
@@ -21,7 +21,7 @@ use alloc::{
 use log::{debug, error, warn};
 use system_error::SystemError;
 
-use super::{acpi_kset, AcpiManager};
+use super::{AcpiManager, acpi_kset};
 
 // 定义所有ACPI表结构体
 macro_rules! define_acpi_tables {
@@ -53,9 +53,7 @@ define_acpi_tables!(
 );
 
 macro_rules! handle_read_table {
-    ($name: ident, $name_str: expr, $tables: expr, $buf: expr, $offset: expr) => {{
-        AttrAcpiTable::do_binattr_read_table::<$name>($tables, $name_str, $buf, $offset)
-    }};
+    ($name: ident, $name_str: expr, $tables: expr, $buf: expr, $offset: expr) => {{ AttrAcpiTable::do_binattr_read_table::<$name>($tables, $name_str, $buf, $offset) }};
 }
 
 static mut __HOTPLUG_KSET_INSTANCE: Option<Arc<KSet>> = None;

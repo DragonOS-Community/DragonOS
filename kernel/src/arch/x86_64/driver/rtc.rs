@@ -9,17 +9,17 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
+    arch::{CurrentIrqArch, CurrentPortIOArch, io::PortIOArch},
     driver::{
         base::{
             class::Class,
             device::{
-                bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceState,
-                DeviceType, IdTable,
+                Device, DeviceCommonData, DeviceState, DeviceType, IdTable, bus::Bus,
+                device_manager, driver::Driver,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
-            platform::platform_device::{platform_device_manager, PlatformDevice},
+            platform::platform_device::{PlatformDevice, platform_device_manager},
         },
         rtc::{RtcClassOps, RtcDevice, RtcTime},
     },

@@ -4,7 +4,7 @@ use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::{
-    driver::base::block::{block_device::LBA_SIZE, SeekFrom},
+    driver::base::block::{SeekFrom, block_device::LBA_SIZE},
     libs::vec_cursor::VecCursor,
 };
 use alloc::{
@@ -299,7 +299,7 @@ impl FATFile {
         let new_size = self.size() + extra_bytes;
         self.set_size(new_size as u32);
         // 计算短目录项所在的位置，更新短目录项
-        let short_entry_offset = fs.cluster_bytes_offset(self.loc.1 .0) + self.loc.1 .1;
+        let short_entry_offset = fs.cluster_bytes_offset(self.loc.1.0) + self.loc.1.1;
         // todo: 更新时间信息
         // 把短目录项写入磁盘
         self.short_dir_entry.flush(fs, short_entry_offset)?;

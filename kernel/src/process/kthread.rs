@@ -1,6 +1,6 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{compiler_fence, AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, Ordering, compiler_fence},
 };
 
 use alloc::{
@@ -15,14 +15,14 @@ use system_error::SystemError;
 
 use crate::{
     arch::CurrentIrqArch,
-    exception::{irqdesc::IrqAction, InterruptArch},
+    exception::{InterruptArch, irqdesc::IrqAction},
     init::initial_kthread::initial_kernel_thread,
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
-    sched::{schedule, SchedMode},
+    sched::{SchedMode, schedule},
 };
 
-use super::{fork::CloneFlags, ProcessControlBlock, ProcessFlags, RawPid};
+use super::{ProcessControlBlock, ProcessFlags, RawPid, fork::CloneFlags};
 
 /// 内核线程的创建任务列表
 static KTHREAD_CREATE_LIST: SpinLock<LinkedList<Arc<KernelThreadCreateInfo>>> =
@@ -300,9 +300,11 @@ impl KernelThreadMechanism {
     }
 
     pub fn init_stage2() {
-        assert!(ProcessManager::current_pcb()
-            .flags()
-            .contains(ProcessFlags::KTHREAD));
+        assert!(
+            ProcessManager::current_pcb()
+                .flags()
+                .contains(ProcessFlags::KTHREAD)
+        );
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             info!("Initializing kernel thread mechanism stage2...");

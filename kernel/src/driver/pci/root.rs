@@ -7,7 +7,7 @@ use crate::{
     arch::{PciArch, TraitPciArch},
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{
-        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
+        mmio_buddy::{MMIOSpaceGuard, mmio_pool},
         page::PAGE_2M_SIZE,
     },
 };
@@ -47,10 +47,14 @@ impl core::fmt::Display for PciRoot {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         if let Some(ecam_root_info) = &self.ecam_root_info {
             write!(
-                    f,
-                    "PCI Eacm Root with segment:{}, bus begin at {}, bus end at {}, physical address at {:?},mapped at {:?}",
-                    ecam_root_info.segment_group_number, ecam_root_info.bus_begin, ecam_root_info.bus_end, ecam_root_info.physical_address_base, self.mmio_guard
-                )
+                f,
+                "PCI Eacm Root with segment:{}, bus begin at {}, bus end at {}, physical address at {:?},mapped at {:?}",
+                ecam_root_info.segment_group_number,
+                ecam_root_info.bus_begin,
+                ecam_root_info.bus_end,
+                ecam_root_info.physical_address_base,
+                self.mmio_guard
+            )
         } else {
             write!(f, "PCI Root cam is {:?}", self.cam,)
         }
@@ -110,9 +114,11 @@ impl PciRoot {
             let space_guard = Arc::new(space_guard);
             self.mmio_guard = Some(space_guard.clone());
 
-            assert!(space_guard
-                .map_phys(self.ecam_root_info.unwrap().physical_address_base, size)
-                .is_ok());
+            assert!(
+                space_guard
+                    .map_phys(self.ecam_root_info.unwrap().physical_address_base, size)
+                    .is_ok()
+            );
         }
         return Ok(0);
     }

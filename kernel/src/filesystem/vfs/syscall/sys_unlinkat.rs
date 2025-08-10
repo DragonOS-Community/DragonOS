@@ -4,9 +4,9 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_UNLINKAT;
+use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::vcore::{do_remove_dir, do_unlink_at};
-use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::check_and_clone_cstr;
 use alloc::vec::Vec;

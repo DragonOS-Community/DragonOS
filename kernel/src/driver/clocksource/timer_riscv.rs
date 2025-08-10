@@ -1,29 +1,29 @@
-use core::sync::atomic::{compiler_fence, fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence, fence};
 
 use alloc::{string::ToString, sync::Arc};
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{StaticBitmap, traits::BitMapOps};
 use system_error::SystemError;
 
 use crate::{
-    arch::{interrupt::TrapFrame, time::riscv_time_base_freq, CurrentIrqArch, CurrentTimeArch},
+    arch::{CurrentIrqArch, CurrentTimeArch, interrupt::TrapFrame, time::riscv_time_base_freq},
     driver::{
         base::device::DeviceId,
         irqchip::riscv_intc::{riscv_intc_assicate_irq, riscv_intc_hwirq_to_virq},
     },
     exception::{
+        HardwareIrqNumber, InterruptArch, IrqNumber,
         irqdata::{IrqHandlerData, IrqLineStatus},
         irqdesc::{
-            irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandleFlags, IrqHandler, IrqReturn,
+            IrqDesc, IrqFlowHandler, IrqHandleFlags, IrqHandler, IrqReturn, irq_desc_manager,
         },
         manage::irq_manager,
-        HardwareIrqNumber, InterruptArch, IrqNumber,
     },
     libs::spinlock::SpinLock,
     mm::percpu::PerCpu,
     smp::core::smp_get_processor_id,
     time::{
-        clocksource::HZ, tick_common::tick_handle_periodic, timer::try_raise_timer_softirq,
-        TimeArch,
+        TimeArch, clocksource::HZ, tick_common::tick_handle_periodic,
+        timer::try_raise_timer_softirq,
     },
 };
 

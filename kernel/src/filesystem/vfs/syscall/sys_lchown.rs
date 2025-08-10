@@ -1,7 +1,7 @@
 use crate::arch::syscall::nr::SYS_LCHOWN;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{fcntl::AtFlags, open::do_fchownat, MAX_PATHLEN},
+    filesystem::vfs::{MAX_PATHLEN, fcntl::AtFlags, open::do_fchownat},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access,

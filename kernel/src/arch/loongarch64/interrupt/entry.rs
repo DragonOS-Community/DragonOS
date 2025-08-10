@@ -38,7 +38,7 @@ macro_rules! build_handler {
     ($exception:expr, $handler:expr, $prep:ident) => {
         paste::paste! {
             /// handle exception的实现请参考 https://code.dragonos.org.cn/xref/linux-6.6.21/arch/loongarch/kernel/genex.S#69
-            #[naked]
+            #[unsafe(naked)]
             #[no_mangle]
             #[repr(align(8))]
             pub unsafe extern "C" fn [<handle_ $exception _>]() -> ! {

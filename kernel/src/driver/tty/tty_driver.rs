@@ -15,10 +15,10 @@ use crate::{
         base::{
             char::CharDevOps,
             device::{
+                IdTable,
                 device_number::{DeviceNumber, Major},
                 device_register,
                 driver::Driver,
-                IdTable,
             },
             kobject::KObject,
         },

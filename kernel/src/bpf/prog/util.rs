@@ -1,5 +1,5 @@
 use crate::include::bindings::linux_bpf::{bpf_attach_type, bpf_attr, bpf_prog_type};
-use crate::syscall::user_access::{check_and_clone_cstr, UserBufferReader};
+use crate::syscall::user_access::{UserBufferReader, check_and_clone_cstr};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ffi::CStr;

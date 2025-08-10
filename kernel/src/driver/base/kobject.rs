@@ -11,7 +11,7 @@ use log::{debug, error};
 use crate::{
     filesystem::{
         kernfs::KernFSInode,
-        sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
+        sysfs::{Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport, sysfs_instance},
     },
     libs::{
         casting::DowncastArc,

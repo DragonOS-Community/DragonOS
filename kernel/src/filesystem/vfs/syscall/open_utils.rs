@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::{
     define_event_trace,
-    filesystem::vfs::{fcntl::AtFlags, file::FileMode, open::do_sys_open, MAX_PATHLEN},
+    filesystem::vfs::{MAX_PATHLEN, fcntl::AtFlags, file::FileMode, open::do_sys_open},
     syscall::user_access::check_and_clone_cstr,
 };
 

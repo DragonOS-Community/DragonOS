@@ -6,7 +6,7 @@ use system_error::SystemError;
 
 use crate::driver::rtc::interface::rtc_read_time_default;
 
-use super::{PosixTimeSpec, NSEC_PER_SEC};
+use super::{NSEC_PER_SEC, PosixTimeSpec};
 
 // 参考：https://code.dragonos.org.cn/xref/linux-3.4.99/include/linux/time.h#110
 const KTIME_MAX: i64 = !(1u64 << 63) as i64;

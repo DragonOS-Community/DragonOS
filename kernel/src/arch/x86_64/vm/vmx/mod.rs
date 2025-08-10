@@ -21,18 +21,18 @@ use crate::process::ProcessManager;
 use crate::virt::vm::kvm_host::vcpu::GuestDebug;
 use crate::{
     arch::{
+        CurrentIrqArch, MMArch, VirtCpuArch,
         vm::{
             asm::KvmX86Asm,
-            kvm_host::{vcpu::VirtCpuRequest, X86KvmArch},
+            kvm_host::{X86KvmArch, vcpu::VirtCpuRequest},
             vmx::vmcs::vmx_area,
         },
-        CurrentIrqArch, MMArch, VirtCpuArch,
     },
     exception::InterruptArch,
     libs::spinlock::SpinLock,
     mm::{
-        percpu::{PerCpu, PerCpuVar},
         MemoryManagementArch,
+        percpu::{PerCpu, PerCpuVar},
     },
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     virt::vm::{kvm_dev::kvm_init, kvm_host::vcpu::VirtCpu, user_api::UapiKvmSegment},
@@ -43,7 +43,7 @@ use asm::VMX_EPTP_MT_WB;
 use asm::VMX_EPTP_PWL_4;
 use asm::VMX_EPTP_PWL_5;
 use bitfield_struct::bitfield;
-use bitmap::{traits::BitMapOps, AllocBitmap};
+use bitmap::{AllocBitmap, traits::BitMapOps};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::controlregs::{cr2, cr2_write};
@@ -55,7 +55,7 @@ use x86::segmentation::{ds, es, fs, gs};
 use x86::vmx::vmcs::ro;
 use x86::{
     bits64::rflags::RFlags,
-    controlregs::{cr0, cr4, Cr0, Cr4, Xcr0},
+    controlregs::{Cr0, Cr4, Xcr0, cr0, cr4},
     msr::{self, rdmsr},
     segmentation::{self},
     vmx::vmcs::{
@@ -70,8 +70,8 @@ use x86_64::{instructions::tables::sidt, registers::control::EferFlags};
 
 use crate::{
     arch::{
-        vm::{vmx::vmcs::feat::VmxFeat, x86_kvm_manager_mut, McgCap},
         KvmArch,
+        vm::{McgCap, vmx::vmcs::feat::VmxFeat, x86_kvm_manager_mut},
     },
     libs::rwlock::RwLock,
     virt::vm::kvm_host::Vm,
@@ -84,22 +84,23 @@ use self::vmcs::LoadedVmcs;
 use self::{
     capabilities::{ProcessorTraceMode, VmcsConfig, VmxCapability},
     vmcs::{
-        current_loaded_vmcs_list_mut, current_vmcs, current_vmcs_mut, ControlsType,
-        LockedLoadedVmcs, VMControlStructure, VmxMsrBitmapAccess, VmxMsrBitmapAction,
-        PERCPU_LOADED_VMCS_LIST, PERCPU_VMCS, VMXAREA,
+        ControlsType, LockedLoadedVmcs, PERCPU_LOADED_VMCS_LIST, PERCPU_VMCS, VMControlStructure,
+        VMXAREA, VmxMsrBitmapAccess, VmxMsrBitmapAction, current_loaded_vmcs_list_mut,
+        current_vmcs, current_vmcs_mut,
     },
 };
 
 use super::asm::IntrInfo;
 use super::asm::SegmentCacheField;
-use super::kvm_host::vcpu::KvmIntrType;
 use super::kvm_host::RMODE_TSS_SIZE;
+use super::kvm_host::vcpu::KvmIntrType;
 use super::x86_kvm_ops;
 use super::{
+    KvmArchManager,
     asm::{VcpuSegment, VmxAsm, VmxMsrEntry},
     init_kvm_arch,
     kvm_host::{KvmFunc, KvmInitFunc, KvmIrqChipMode, KvmReg, MsrFilterType, NotifyVmExitFlags},
-    x86_kvm_manager, KvmArchManager,
+    x86_kvm_manager,
 };
 
 pub mod asm;
@@ -1464,14 +1465,18 @@ impl Vmx {
         if !cpu_based_2nd_exec_control.contains(SecondaryControls::ENABLE_EPT)
             && !vmx_cap.ept.is_empty()
         {
-            warn!("EPT CAP should not exist if not support. 1-setting enable EPT VM-execution control");
+            warn!(
+                "EPT CAP should not exist if not support. 1-setting enable EPT VM-execution control"
+            );
             return Err(SystemError::EIO);
         }
 
         if !cpu_based_2nd_exec_control.contains(SecondaryControls::ENABLE_VPID)
             && !vmx_cap.vpid.is_empty()
         {
-            warn!("VPID CAP should not exist if not support. 1-setting enable VPID VM-execution control");
+            warn!(
+                "VPID CAP should not exist if not support. 1-setting enable VPID VM-execution control"
+            );
             return Err(SystemError::EIO);
         }
 
@@ -2738,7 +2743,9 @@ impl Vmx {
             var.type_ = 0x3;
             var.avl = 0;
             if save.base & 0xf != 0 {
-                warn!("segment base is not paragraph aligned when entering protected mode (seg={seg:?})");
+                warn!(
+                    "segment base is not paragraph aligned when entering protected mode (seg={seg:?})"
+                );
             }
         }
 

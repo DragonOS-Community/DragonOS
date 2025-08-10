@@ -12,19 +12,19 @@ use crate::{
     arch::MMArch,
     driver::firmware::efi::{
         efi_manager,
-        guid::{DragonStubPayloadEFI, DRAGONSTUB_EFI_PAYLOAD_EFI_GUID},
+        guid::{DRAGONSTUB_EFI_PAYLOAD_EFI_GUID, DragonStubPayloadEFI},
     },
     mm::{
-        early_ioremap::EarlyIoRemap, memblock::mem_block_manager, MemoryManagementArch, PhysAddr,
-        VirtAddr,
+        MemoryManagementArch, PhysAddr, VirtAddr, early_ioremap::EarlyIoRemap,
+        memblock::mem_block_manager,
     },
 };
 
 use super::{
+    EFIManager,
     guid::{
         EFI_MEMORY_ATTRIBUTES_TABLE_GUID, EFI_MEMRESERVE_TABLE_GUID, EFI_SYSTEM_RESOURCE_TABLE_GUID,
     },
-    EFIManager,
 };
 
 /// 所有的要解析的表格的解析器

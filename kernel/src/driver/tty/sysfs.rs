@@ -7,7 +7,7 @@ use unified_init::macros::unified_init;
 
 use crate::{
     driver::base::{
-        class::{class_manager, Class},
+        class::{Class, class_manager},
         device::sys_dev_char_kset,
         kobject::KObject,
         subsys::SubSysPrivate,

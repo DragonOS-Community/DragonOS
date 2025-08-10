@@ -1,7 +1,7 @@
 use crate::{
     driver::base::{kobject::KObject, kset::KSet},
     filesystem::{
-        sysfs::{sysfs_instance, Attribute, AttributeGroup},
+        sysfs::{Attribute, AttributeGroup, sysfs_instance},
         vfs::syscall::ModeType,
     },
     init::initcall::INITCALL_CORE,

@@ -3,7 +3,7 @@ use core::sync::atomic::AtomicUsize;
 
 use alloc::vec::Vec;
 
-use super::namespace::user_namespace::{UserNamespace, INIT_USER_NAMESPACE};
+use super::namespace::user_namespace::{INIT_USER_NAMESPACE, UserNamespace};
 
 const GLOBAL_ROOT_UID: Kuid = Kuid(0);
 const GLOBAL_ROOT_GID: Kgid = Kgid(0);

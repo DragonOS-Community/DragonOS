@@ -4,7 +4,7 @@ use crate::ipc::signal_types::SigType;
 use crate::process::CurrentIrqArch;
 use crate::process::RawPid;
 use crate::process::SigInfo;
-use crate::time::timer::{clock, Jiffies, Timer, TimerFunction};
+use crate::time::timer::{Jiffies, Timer, TimerFunction, clock};
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::compiler_fence;
 use core::time::Duration;

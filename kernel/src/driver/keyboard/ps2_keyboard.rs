@@ -8,22 +8,22 @@ use alloc::{
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
+    arch::{CurrentIrqArch, CurrentPortIOArch, io::PortIOArch},
     driver::{
         base::device::device_number::{DeviceNumber, Major},
         input::ps2_dev::Ps2StatusRegister,
     },
     exception::{
+        InterruptArch, IrqNumber,
         irqdata::IrqHandlerData,
         irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
         manage::irq_manager,
-        InterruptArch, IrqNumber,
     },
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
+        devfs::{DevFS, DeviceINode, LockedDevFSInode, devfs_register},
         vfs::{
-            file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
-            FileSystem, FileType, IndexNode, Metadata,
+            FilePrivateData, FileSystem, FileType, IndexNode, Metadata, file::FileMode,
+            syscall::ModeType, vcore::generate_inode_id,
         },
     },
     init::initcall::INITCALL_DEVICE,

@@ -1,10 +1,10 @@
 use crate::arch::interrupt::TrapFrame;
 pub use crate::ipc::generic_signal::AtomicGenericSignal as AtomicSignal;
+pub use crate::ipc::generic_signal::GENERIC_MAX_SIG_NUM as MAX_SIG_NUM;
+pub use crate::ipc::generic_signal::GENERIC_STACK_ALIGN as STACK_ALIGN;
 pub use crate::ipc::generic_signal::GenericSigChildCode as SigChildCode;
 pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
-pub use crate::ipc::generic_signal::GENERIC_MAX_SIG_NUM as MAX_SIG_NUM;
-pub use crate::ipc::generic_signal::GENERIC_STACK_ALIGN as STACK_ALIGN;
 
 pub use crate::ipc::generic_signal::GenericSigFlags as SigFlags;
 

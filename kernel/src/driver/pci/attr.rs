@@ -7,7 +7,7 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         sysfs::{
-            file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
+            Attribute, AttributeGroup, SYSFS_ATTR_MODE_RO, SysFSOpsSupport, file::sysfs_emit_str,
         },
         vfs::syscall::ModeType,
     },

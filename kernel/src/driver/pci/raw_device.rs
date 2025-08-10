@@ -8,7 +8,7 @@ use alloc::{
 use crate::{
     driver::base::{
         class::Class,
-        device::{bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable},
+        device::{Device, DeviceCommonData, DeviceType, IdTable, bus::Bus, driver::Driver},
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
     },

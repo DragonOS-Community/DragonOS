@@ -1,4 +1,4 @@
-use crate::driver::base::device::bus::{bus_register, Bus};
+use crate::driver::base::device::bus::{Bus, bus_register};
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::misc::events::subsys::EventSourceBus;
 use alloc::sync::Arc;

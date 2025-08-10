@@ -6,7 +6,7 @@ use crate::driver::base::block::manager::block_dev_manager;
 use crate::driver::block::cache::cached_block_device::BlockCache;
 use crate::driver::disk::ahci::ahcidisk::LockedAhciDisk;
 use crate::driver::pci::pci::{
-    get_pci_device_structure_mut, PciDeviceLinkedList, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
+    PCI_DEVICE_LINKEDLIST, PciDeviceLinkedList, PciDeviceStructure, get_pci_device_structure_mut,
 };
 use alloc::sync::Arc;
 

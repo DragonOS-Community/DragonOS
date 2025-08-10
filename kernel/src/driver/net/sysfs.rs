@@ -1,13 +1,13 @@
 use crate::{
     driver::base::{
         class::Class,
-        device::{device_manager, Device},
+        device::{Device, device_manager},
         kobject::KObject,
     },
     filesystem::{
         sysfs::{
-            file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
-            SYSFS_ATTR_MODE_RW,
+            Attribute, AttributeGroup, SYSFS_ATTR_MODE_RO, SYSFS_ATTR_MODE_RW, SysFSOpsSupport,
+            file::sysfs_emit_str,
         },
         vfs::syscall::ModeType,
     },
@@ -17,7 +17,7 @@ use intertrait::cast::CastArc;
 use log::error;
 use system_error::SystemError;
 
-use super::{class::sys_class_net_instance, NetDeivceState, NetDevice, Operstate};
+use super::{NetDeivceState, NetDevice, Operstate, class::sys_class_net_instance};
 
 /// 将设备注册到`/sys/class/net`目录下
 /// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/net-sysfs.c?fi=netdev_register_kobject#1311

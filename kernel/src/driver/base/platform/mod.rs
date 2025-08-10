@@ -2,8 +2,9 @@ use self::{platform_device::PlatformBusDevice, subsys::PlatformBus};
 
 use super::{
     device::{
-        bus::{bus_register, Bus, BusState},
-        device_unregister, sys_devices_kset, DevicePrivateData, IdTable,
+        DevicePrivateData, IdTable,
+        bus::{Bus, BusState, bus_register},
+        device_unregister, sys_devices_kset,
     },
     kobject::KObject,
 };

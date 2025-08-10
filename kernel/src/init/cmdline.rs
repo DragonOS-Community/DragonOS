@@ -1,6 +1,6 @@
 use core::{
     str,
-    sync::atomic::{fence, Ordering},
+    sync::atomic::{Ordering, fence},
 };
 
 use alloc::{ffi::CString, vec::Vec};

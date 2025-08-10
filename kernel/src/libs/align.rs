@@ -5,7 +5,7 @@ use core::{alloc::GlobalAlloc, fmt::Debug, ptr::Unique};
 
 use system_error::SystemError;
 
-use crate::{arch::MMArch, mm::MemoryManagementArch, KERNEL_ALLOCATOR};
+use crate::{KERNEL_ALLOCATOR, arch::MMArch, mm::MemoryManagementArch};
 
 /// # AlignedBox
 ///
@@ -22,11 +22,7 @@ pub struct AlignedBox<T, const ALIGN: usize> {
 impl<T, const ALIGN: usize> AlignedBox<T, ALIGN> {
     const LAYOUT: core::alloc::Layout = {
         const fn max(a: usize, b: usize) -> usize {
-            if a > b {
-                a
-            } else {
-                b
-            }
+            if a > b { a } else { b }
         }
         let layout = core::alloc::Layout::from_size_align(
             core::mem::size_of::<T>(),

@@ -12,11 +12,11 @@ use crate::{
         serial::serial8250::send_to_default_serial8250_port, video::fbdev::base::BootTimeScreenInfo,
     },
     init::{
-        boot::{register_boot_callbacks, BootCallbacks, BootloaderAcpiArg},
+        boot::{BootCallbacks, BootloaderAcpiArg, register_boot_callbacks},
         boot_params,
     },
     libs::lazy_init::Lazy,
-    mm::{memblock::mem_block_manager, MemoryManagementArch, PhysAddr},
+    mm::{MemoryManagementArch, PhysAddr, memblock::mem_block_manager},
 };
 
 mod param;

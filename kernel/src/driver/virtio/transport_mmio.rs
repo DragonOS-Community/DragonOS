@@ -5,8 +5,8 @@ use fdt::node::FdtNode;
 use log::info;
 use system_error::SystemError;
 use virtio_drivers::transport::{
-    mmio::{MmioTransport, VirtIOHeader},
     Transport,
+    mmio::{MmioTransport, VirtIOHeader},
 };
 
 use crate::{
@@ -15,8 +15,8 @@ use crate::{
     exception::HardwareIrqNumber,
     libs::align::page_align_up,
     mm::{
-        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         MemoryManagementArch, PhysAddr,
+        mmio_buddy::{MMIOSpaceGuard, mmio_pool},
     },
 };
 
@@ -55,7 +55,8 @@ impl VirtIOMmioTransport {
 
         match unsafe { MmioTransport::new(header) } {
             Ok(mmio_transport) => {
-                info!( "Detected virtio MMIO device with vendor id {:#X}, device type {:?}, version {:?}, hw irq: {}",
+                info!(
+                    "Detected virtio MMIO device with vendor id {:#X}, device type {:?}, version {:?}, hw irq: {}",
                     mmio_transport.vendor_id(),
                     mmio_transport.device_type(),
                     mmio_transport.version(),

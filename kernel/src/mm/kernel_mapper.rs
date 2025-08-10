@@ -1,14 +1,14 @@
 use system_error::SystemError;
 
-use super::{page::EntryFlags, PageTableKind, PhysAddr, VirtAddr};
+use super::{PageTableKind, PhysAddr, VirtAddr, page::EntryFlags};
 use crate::{
     arch::{
-        mm::{LockedFrameAllocator, PageMapper},
         CurrentIrqArch,
+        mm::{LockedFrameAllocator, PageMapper},
     },
     exception::InterruptArch,
     libs::align::page_align_up,
-    mm::{allocator::page_frame::PageFrameCount, MMArch, MemoryManagementArch},
+    mm::{MMArch, MemoryManagementArch, allocator::page_frame::PageFrameCount},
     smp::{
         core::smp_get_processor_id,
         cpu::{AtomicProcessorId, ProcessorId},
@@ -16,7 +16,7 @@ use crate::{
 };
 use core::{
     ops::Deref,
-    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering, compiler_fence},
 };
 
 /// 标志当前没有处理器持有内核映射器的锁

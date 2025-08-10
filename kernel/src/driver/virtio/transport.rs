@@ -7,7 +7,7 @@ use crate::{
         base::device::DeviceId,
         pci::{
             pci::{PciDeviceStructure, PciError},
-            pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqError, PciIrqMsg, IRQ},
+            pci_irq::{IRQ, IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqError, PciIrqMsg},
         },
     },
     exception::IrqNumber,

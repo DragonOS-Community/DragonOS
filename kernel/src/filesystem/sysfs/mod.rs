@@ -4,7 +4,7 @@ use self::{dir::SysKernDirPriv, file::SysKernFilePriv};
 
 use super::{
     kernfs::{KernFS, KernFSInode},
-    vfs::{syscall::ModeType, FileSystem},
+    vfs::{FileSystem, syscall::ModeType},
 };
 use crate::{
     driver::base::kobject::KObject,

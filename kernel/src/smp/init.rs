@@ -1,7 +1,7 @@
 use log::info;
 
 use crate::{
-    arch::{syscall::arch_syscall_init, CurrentIrqArch, CurrentSchedArch},
+    arch::{CurrentIrqArch, CurrentSchedArch, syscall::arch_syscall_init},
     exception::InterruptArch,
     process::ProcessManager,
     sched::SchedArch,

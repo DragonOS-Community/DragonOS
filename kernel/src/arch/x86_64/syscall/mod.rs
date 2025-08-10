@@ -1,21 +1,21 @@
 use crate::{
     arch::{
+        CurrentIrqArch,
         ipc::signal::X86_64SignalArch,
         syscall::nr::{SYS_ARCH_PRCTL, SYS_RT_SIGRETURN},
-        CurrentIrqArch,
     },
     exception::InterruptArch,
     ipc::signal_types::SignalArch,
     libs::align::SafeForZero,
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::{Syscall, SYS_SCHED},
+    syscall::{SYS_SCHED, Syscall},
 };
 use log::debug;
 use system_error::SystemError;
 
 use super::{
-    interrupt::{entry::set_system_trap_gate, TrapFrame},
+    interrupt::{TrapFrame, entry::set_system_trap_gate},
     mm::barrier::mfence,
 };
 

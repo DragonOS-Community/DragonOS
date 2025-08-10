@@ -1,6 +1,6 @@
 use core::ops::BitAnd;
 
-use bitmap::{traits::BitMapOps, AllocBitmap};
+use bitmap::{AllocBitmap, traits::BitMapOps};
 
 use crate::{mm::percpu::PerCpu, smp::cpu::ProcessorId};
 

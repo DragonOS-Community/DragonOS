@@ -10,29 +10,29 @@ use log::{debug, error};
 use system_error::SystemError;
 
 use crate::{
-    arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
+    arch::{CurrentIrqArch, CurrentPortIOArch, io::PortIOArch},
     driver::{
         base::{
             class::Class,
             device::{
-                bus::Bus, device_manager, device_number::DeviceNumber, driver::Driver, Device,
-                DeviceCommonData, DeviceType, IdTable,
+                Device, DeviceCommonData, DeviceType, IdTable, bus::Bus, device_manager,
+                device_number::DeviceNumber, driver::Driver,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         input::{
             ps2_dev::ps2_device::Ps2Device,
-            serio::serio_device::{serio_device_manager, SerioDevice},
+            serio::serio_device::{SerioDevice, serio_device_manager},
         },
     },
     exception::InterruptArch,
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
+        devfs::{DevFS, DeviceINode, LockedDevFSInode, devfs_register},
         kernfs::KernFSInode,
         vfs::{
-            syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
-            FileType, IndexNode, Metadata,
+            FilePrivateData, FileSystem, FileType, IndexNode, Metadata, syscall::ModeType,
+            utils::DName, vcore::generate_inode_id,
         },
     },
     libs::{

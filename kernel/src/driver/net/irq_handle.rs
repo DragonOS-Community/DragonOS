@@ -3,9 +3,9 @@ use system_error::SystemError;
 
 use crate::{
     exception::{
+        IrqNumber,
         irqdata::IrqHandlerData,
         irqdesc::{IrqHandler, IrqReturn},
-        IrqNumber,
     },
     net::net_core::poll_ifaces_try_lock_onetime,
 };

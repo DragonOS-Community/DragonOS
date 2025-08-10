@@ -4,14 +4,14 @@
 use super::device::pci_device_manager;
 use super::pci_irq::{IrqType, PciIrqError};
 use super::raw_device::PciGeneralDevice;
-use super::root::{pci_root_0, PciRoot};
+use super::root::{PciRoot, pci_root_0};
 
 use crate::arch::{PciArch, TraitPciArch};
 use crate::driver::pci::subsys::pci_bus_subsys_init;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
+use crate::mm::mmio_buddy::{MMIOSpaceGuard, mmio_pool};
 
 use crate::mm::VirtAddr;
 
@@ -1077,7 +1077,16 @@ pub fn pci_init() {
                 );
             }
             HeaderType::PciPciBridge if common_header.status & 0x10 != 0 => {
-                info!("Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} cap_pointer={:#x}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_pci_to_pci_bridge_device().unwrap().capability_pointer);
+                info!(
+                    "Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} cap_pointer={:#x}",
+                    common_header.class_code,
+                    common_header.subclass,
+                    common_header.status,
+                    box_pci_device
+                        .as_pci_to_pci_bridge_device()
+                        .unwrap()
+                        .capability_pointer
+                );
             }
             HeaderType::PciPciBridge => {
                 info!(

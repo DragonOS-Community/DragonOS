@@ -6,17 +6,17 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        vm::{kvm_host::KvmCommonRegs, uapi::UapiKvmSegmentRegs},
         MMArch,
+        vm::{kvm_host::KvmCommonRegs, uapi::UapiKvmSegmentRegs},
     },
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
+        devfs::{DevFS, DeviceINode, devfs_register},
         vfs::{
+            FileType, IndexNode, Metadata,
             file::{File, FileMode},
             syscall::ModeType,
             vcore::generate_inode_id,
-            FileType, IndexNode, Metadata,
         },
     },
     libs::spinlock::SpinLock,
@@ -27,7 +27,7 @@ use crate::{
     virt::vm::user_api::{KvmUserspaceMemoryRegion, PosixKvmUserspaceMemoryRegion},
 };
 
-use super::kvm_host::{vcpu::LockedVirtCpu, LockedVm};
+use super::kvm_host::{LockedVm, vcpu::LockedVirtCpu};
 
 #[derive(Debug)]
 pub struct KvmInode {

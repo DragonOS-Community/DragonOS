@@ -1,14 +1,15 @@
 //! System call handler for the msync system call.
 
 use crate::{
-    arch::{interrupt::TrapFrame, syscall::nr::SYS_MSYNC, MMArch},
+    arch::{MMArch, interrupt::TrapFrame, syscall::nr::SYS_MSYNC},
     driver::base::block::SeekFrom,
 };
 
 use crate::mm::{
-    syscall::{check_aligned, MsFlags, VmFlags},
+    MemoryManagementArch, VirtAddr,
+    syscall::{MsFlags, VmFlags, check_aligned},
     ucontext::AddressSpace,
-    unlikely, verify_area, MemoryManagementArch, VirtAddr,
+    unlikely, verify_area,
 };
 
 use crate::syscall::table::{FormattedSyscallParam, Syscall};

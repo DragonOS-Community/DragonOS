@@ -2,7 +2,7 @@ use crate::alloc::vec::Vec;
 use crate::arch::interrupt::TrapFrame;
 use crate::{
     arch::syscall::nr::SYS_SHMCTL,
-    ipc::shm::{shm_manager_lock, ShmCtlCmd, ShmId},
+    ipc::shm::{ShmCtlCmd, ShmId, shm_manager_lock},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use syscall_table_macros::declare_syscall;

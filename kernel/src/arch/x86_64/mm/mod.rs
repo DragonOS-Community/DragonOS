@@ -24,7 +24,7 @@ use crate::{
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{EntryFlags, PageEntry, PAGE_1G_SHIFT};
+use crate::mm::page::{EntryFlags, PAGE_1G_SHIFT, PageEntry};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags};
 
 use system_error::SystemError;
@@ -32,7 +32,7 @@ use system_error::SystemError;
 use core::arch::asm;
 use core::fmt::Debug;
 
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
@@ -375,7 +375,7 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 防止内核错误地写入只读页面
     fn enable_kernel_wp() {
         unsafe {
-            use x86::controlregs::{cr0, cr0_write, Cr0};
+            use x86::controlregs::{Cr0, cr0, cr0_write};
             let mut cr0_val = cr0();
             cr0_val.insert(Cr0::CR0_WRITE_PROTECT);
             cr0_write(cr0_val);
@@ -386,7 +386,7 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 禁用 内核态的 Write Protect
     fn disable_kernel_wp() {
         unsafe {
-            use x86::controlregs::{cr0, cr0_write, Cr0};
+            use x86::controlregs::{Cr0, cr0, cr0_write};
             let mut cr0_val = cr0();
             cr0_val.remove(Cr0::CR0_WRITE_PROTECT);
             cr0_write(cr0_val);
@@ -615,10 +615,12 @@ pub fn test_buddy() {
             assert!(allocated_frame_count.data().is_power_of_two());
             assert!(paddr.data() % MMArch::PAGE_SIZE == 0);
             unsafe {
-                assert!(MMArch::phys_2_virt(paddr)
-                    .as_ref()
-                    .unwrap()
-                    .check_aligned(allocated_frame_count.data() * MMArch::PAGE_SIZE));
+                assert!(
+                    MMArch::phys_2_virt(paddr)
+                        .as_ref()
+                        .unwrap()
+                        .check_aligned(allocated_frame_count.data() * MMArch::PAGE_SIZE)
+                );
             }
             allocated += allocated_frame_count.data() * MMArch::PAGE_SIZE;
             v.push((paddr, allocated_frame_count));

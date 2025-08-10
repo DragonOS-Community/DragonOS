@@ -2,7 +2,7 @@ use core::intrinsics::likely;
 use core::{arch::x86_64::_xsetbv, intrinsics::unlikely};
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use bitmap::{traits::BitMapOps, AllocBitmap, BitMapCore};
+use bitmap::{AllocBitmap, BitMapCore, traits::BitMapOps};
 use log::warn;
 use raw_cpuid::CpuId;
 use system_error::SystemError;
@@ -25,11 +25,11 @@ use crate::{
         kvm_arch_ops,
         mm::barrier,
         vm::{
-            asm::{hyperv, kvm_msr, KvmX86Asm, MiscEnable, MsrData, VcpuSegment},
+            asm::{KvmX86Asm, MiscEnable, MsrData, VcpuSegment, hyperv, kvm_msr},
             cpuid::KvmCpuidEntry2,
             kvm_host::KvmReg,
             mmu::kvm_mmu::LockedKvmMmu,
-            uapi::{UapiKvmSegmentRegs, KVM_SYNC_X86_VALID_FIELDS},
+            uapi::{KVM_SYNC_X86_VALID_FIELDS, UapiKvmSegmentRegs},
             vmx::{vmcs::ControlsType, vmx_info},
             x86_kvm_manager, x86_kvm_manager_mut, x86_kvm_ops,
         },
@@ -38,15 +38,15 @@ use crate::{
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     virt::vm::{
         kvm_host::{
+            MutilProcessorState, Vm,
             mem::GfnToHvaCache,
             vcpu::{GuestDebug, VirtCpu},
-            MutilProcessorState, Vm,
         },
         user_api::{UapiKvmRun, UapiKvmSegment},
     },
 };
 
-use super::{lapic::KvmLapic, HFlags, KvmCommonRegs, KvmIrqChipMode};
+use super::{HFlags, KvmCommonRegs, KvmIrqChipMode, lapic::KvmLapic};
 const MSR_IA32_CR_PAT_DEFAULT: u64 = 0x0007_0406_0007_0406;
 #[allow(dead_code)]
 #[derive(Debug)]

@@ -1,6 +1,6 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, Ordering, compiler_fence, fence},
 };
 
 use kdepends::memoffset::offset_of;
@@ -8,23 +8,23 @@ use log::debug;
 use system_error::SystemError;
 
 use crate::{
-    arch::{mm::LowAddressRemapping, process::table::TSSManager, MMArch},
+    arch::{MMArch, mm::LowAddressRemapping, process::table::TSSManager},
     exception::InterruptArch,
     libs::{cpumask::CpuMask, rwlock::RwLock},
-    mm::{percpu::PerCpu, MemoryManagementArch, PhysAddr, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
+    mm::{IDLE_PROCESS_ADDRESS_SPACE, MemoryManagementArch, PhysAddr, VirtAddr, percpu::PerCpu},
     process::ProcessManager,
     smp::{
-        core::smp_get_processor_id,
-        cpu::{smp_cpu_manager, CpuHpCpuState, ProcessorId, SmpCpuManager},
-        init::smp_ap_start_stage2,
         SMPArch,
+        core::smp_get_processor_id,
+        cpu::{CpuHpCpuState, ProcessorId, SmpCpuManager, smp_cpu_manager},
+        init::smp_ap_start_stage2,
     },
 };
 
 use super::{
+    CurrentIrqArch,
     acpi::early_acpi_boot_init,
     interrupt::ipi::{ipi_send_smp_init, ipi_send_smp_startup},
-    CurrentIrqArch,
 };
 
 extern "C" {
@@ -62,7 +62,7 @@ unsafe extern "C" fn smp_ap_start() -> ! {
     smp_init_switch_stack(&v);
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
     core::arch::naked_asm!(concat!("
         mov rsp, [rdi + {off_rsp}]

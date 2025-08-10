@@ -1,6 +1,7 @@
 use super::{
+    Device, DeviceMatchName, DeviceMatcher, DeviceState,
     driver::{Driver, DriverMatchName, DriverMatcher},
-    sys_devices_kset, Device, DeviceMatchName, DeviceMatcher, DeviceState,
+    sys_devices_kset,
 };
 use crate::{
     driver::base::{
@@ -11,8 +12,8 @@ use crate::{
     },
     filesystem::{
         sysfs::{
-            file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
-            SysFSOpsSupport, SYSFS_ATTR_MODE_RW, SYSFS_ATTR_MODE_WO,
+            Attribute, AttributeGroup, SYSFS_ATTR_MODE_RW, SYSFS_ATTR_MODE_WO, SysFSOps,
+            SysFSOpsSupport, file::sysfs_emit_str, sysfs_instance,
         },
         vfs::syscall::ModeType,
     },

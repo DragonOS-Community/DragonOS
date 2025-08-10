@@ -17,18 +17,18 @@ use crate::{
         timers::hpet::{HpetRegisters, HpetTimerRegisters},
     },
     exception::{
+        InterruptArch, IrqNumber,
         irqdata::IrqHandlerData,
         irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
         manage::irq_manager,
-        InterruptArch, IrqNumber,
     },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         volatile::volwrite,
     },
     mm::{
-        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
+        mmio_buddy::{MMIOSpaceGuard, mmio_pool},
     },
     time::jiffies::NSEC_PER_JIFFY,
 };

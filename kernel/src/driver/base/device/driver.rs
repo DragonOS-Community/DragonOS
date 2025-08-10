@@ -1,13 +1,13 @@
 use super::{
-    bus::{bus_manager, Bus},
     Device, DeviceMatchName, DeviceMatcher, IdTable,
+    bus::{Bus, bus_manager},
 };
 use crate::{
     driver::base::{
         device::{bus::BusNotifyEvent, dd::DeviceAttrCoredump, device_manager},
         kobject::KObject,
     },
-    filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup},
+    filesystem::sysfs::{Attribute, AttributeGroup, sysfs_instance},
 };
 use alloc::{
     string::ToString,

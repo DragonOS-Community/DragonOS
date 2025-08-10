@@ -1,7 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CLONE;
 use crate::filesystem::procfs::procfs_register_pid;
-use crate::mm::{verify_area, VirtAddr};
+use crate::mm::{VirtAddr, verify_area};
 use crate::process::fork::{CloneFlags, KernelCloneArgs};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
 use crate::sched::completion::Completion;

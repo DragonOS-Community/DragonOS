@@ -4,10 +4,10 @@ use crate::syscall::table::Syscall;
 use crate::{
     arch::MMArch,
     filesystem::vfs::file::FileDescriptorVec,
-    mm::{ucontext::UserStack, MemoryManagementArch},
+    mm::{MemoryManagementArch, ucontext::UserStack},
     process::{
-        resource::{RLimit64, RLimitID},
         RawPid,
+        resource::{RLimit64, RLimitID},
     },
     syscall::user_access::UserBufferWriter,
 };

@@ -5,7 +5,7 @@ use core::{
 };
 
 use alloc::{
-    collections::{btree_map, BTreeMap},
+    collections::{BTreeMap, btree_map},
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -13,7 +13,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{interrupt::TrapFrame, CurrentIrqArch},
+    arch::{CurrentIrqArch, interrupt::TrapFrame},
     driver::base::{
         device::DeviceId,
         kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
@@ -33,13 +33,13 @@ use crate::{
 };
 
 use super::{
+    HardwareIrqNumber, InterruptArch, IrqNumber,
     dummychip::no_irq_chip,
     handle::bad_irq_handler,
     irqchip::IrqChip,
     irqdata::{IrqCommonData, IrqData, IrqHandlerData, IrqLineStatus, IrqStatus},
-    irqdomain::{irq_domain_manager, IrqDomain},
-    sysfs::{irq_sysfs_del, IrqKObjType},
-    HardwareIrqNumber, InterruptArch, IrqNumber,
+    irqdomain::{IrqDomain, irq_domain_manager},
+    sysfs::{IrqKObjType, irq_sysfs_del},
 };
 
 /// 中断流处理程序

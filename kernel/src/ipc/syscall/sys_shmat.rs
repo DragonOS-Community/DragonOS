@@ -2,16 +2,16 @@ use crate::alloc::vec::Vec;
 use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
-    arch::syscall::nr::SYS_SHMAT,
     arch::MMArch,
-    ipc::shm::{shm_manager_lock, ShmFlags, ShmId},
+    arch::syscall::nr::SYS_SHMAT,
+    ipc::shm::{ShmFlags, ShmId, shm_manager_lock},
     libs::align::page_align_up,
     mm::{
+        VirtAddr, VmFlags,
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
-        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
+        page::{EntryFlags, PageFlushAll, page_manager_lock_irqsave},
         syscall::ProtFlags,
         ucontext::{AddressSpace, VMA},
-        VirtAddr, VmFlags,
     },
     syscall::{table::Syscall, user_access::UserBufferReader},
 };

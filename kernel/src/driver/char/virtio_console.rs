@@ -572,14 +572,18 @@ impl Driver for VirtIOConsoleDriver {
             "VirtIOConsoleDriver::add_device() failed: device is not a VirtIOConsoleDevice",
         );
         if virtio_con_dev.dev_name.initialized() {
-            panic!("VirtIOConsoleDriver::add_device() failed: dev_name has already initialized for device: '{:?}'",
-            virtio_con_dev.dev_id(),
-        );
+            panic!(
+                "VirtIOConsoleDriver::add_device() failed: dev_name has already initialized for device: '{:?}'",
+                virtio_con_dev.dev_id(),
+            );
         }
         let mut inner = self.inner();
         let dev_name = inner.alloc_id();
         if dev_name.is_none() {
-            panic!("Failed to allocate ID for VirtIO console device: '{:?}', virtio console device limit exceeded.", virtio_con_dev.dev_id())
+            panic!(
+                "Failed to allocate ID for VirtIO console device: '{:?}', virtio console device limit exceeded.",
+                virtio_con_dev.dev_id()
+            )
         }
 
         let dev_name = dev_name.unwrap();
@@ -599,7 +603,10 @@ impl Driver for VirtIOConsoleDriver {
         if devices_fast_guard[index].is_none() {
             devices_fast_guard[index] = Some(virtio_con_dev.clone());
         } else {
-            panic!("VirtIOConsoleDriver::add_device() failed: device slot already occupied at index: {}", index);
+            panic!(
+                "VirtIOConsoleDriver::add_device() failed: device slot already occupied at index: {}",
+                index
+            );
         }
         // avoid deadlock in `init_tty_device`
         drop(devices_fast_guard);

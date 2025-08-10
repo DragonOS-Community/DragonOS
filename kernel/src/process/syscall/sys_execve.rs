@@ -5,7 +5,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EXECVE;
 use crate::filesystem::vfs::{IndexNode, MAX_PATHLEN};
 use crate::mm::page::PAGE_4K_SIZE;
-use crate::mm::{verify_area, VirtAddr};
+use crate::mm::{VirtAddr, verify_area};
 use crate::process::execve::do_execve;
 use crate::process::{ProcessControlBlock, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};

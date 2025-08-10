@@ -7,13 +7,13 @@ use crate::arch::syscall::nr::SYS_SELECT;
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        poll::{do_sys_poll, poll_select_set_timeout, PollFd},
+        poll::{PollFd, do_sys_poll, poll_select_set_timeout},
     },
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::{UserBufferReader, UserBufferWriter},
     },
-    time::{syscall::PosixTimeval, Instant},
+    time::{Instant, syscall::PosixTimeval},
 };
 // Maximum number of file descriptors in a set
 const FD_SETSIZE: usize = 1024;

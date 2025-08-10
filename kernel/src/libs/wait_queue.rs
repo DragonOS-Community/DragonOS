@@ -6,10 +6,10 @@ use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
-    arch::{ipc::signal::Signal, CurrentIrqArch},
+    arch::{CurrentIrqArch, ipc::signal::Signal},
     exception::InterruptArch,
     process::{ProcessControlBlock, ProcessManager, ProcessState},
-    sched::{schedule, SchedMode},
+    sched::{SchedMode, schedule},
 };
 
 use super::{

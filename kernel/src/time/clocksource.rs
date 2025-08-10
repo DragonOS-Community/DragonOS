@@ -21,16 +21,16 @@ use crate::{
     init::initcall::INITCALL_LATE,
     libs::spinlock::SpinLock,
     process::{
-        kthread::{KernelThreadClosure, KernelThreadMechanism},
         ProcessControlBlock, ProcessManager,
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
     },
-    sched::{schedule, SchedMode},
+    sched::{SchedMode, schedule},
 };
 
 use super::{
-    jiffies::clocksource_default_clock,
-    timer::{clock, Timer, TimerFunction},
     NSEC_PER_SEC, NSEC_PER_USEC,
+    jiffies::clocksource_default_clock,
+    timer::{Timer, TimerFunction, clock},
 };
 
 lazy_static! {

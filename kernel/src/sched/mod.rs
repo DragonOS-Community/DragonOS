@@ -9,7 +9,7 @@ pub mod syscall;
 
 use core::{
     intrinsics::{likely, unlikely},
-    sync::atomic::{compiler_fence, fence, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering, compiler_fence, fence},
 };
 
 use alloc::{
@@ -21,10 +21,10 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{interrupt::ipi::send_ipi, CurrentIrqArch},
+    arch::{CurrentIrqArch, interrupt::ipi::send_ipi},
     exception::{
-        ipi::{IpiKind, IpiTarget},
         InterruptArch,
+        ipi::{IpiKind, IpiTarget},
     },
     libs::{
         lazy_init::Lazy,
@@ -39,7 +39,7 @@ use crate::{
 
 use self::{
     clock::{ClockUpdataFlag, SchedClock},
-    cputime::{irq_time_read, CpuTimeFunc, IrqTime},
+    cputime::{CpuTimeFunc, IrqTime, irq_time_read},
     fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
     prio::PrioUtil,
 };

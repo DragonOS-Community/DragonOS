@@ -22,31 +22,31 @@ use crate::{
         base::{
             class::Class,
             device::{
+                Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
                 bus::Bus,
                 driver::{Driver, DriverCommonData},
-                Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         net::register_netdevice,
         virtio::{
+            VIRTIO_VENDOR_ID, VirtIODevice, VirtIODeviceIndex, VirtIODriver,
+            VirtIODriverCommonData, VirtioDeviceId,
             irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
             transport::VirtIOTransport,
             virtio_impl::HalImpl,
-            VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
-            VIRTIO_VENDOR_ID,
         },
     },
-    exception::{irqdesc::IrqReturn, IrqNumber},
+    exception::{IrqNumber, irqdesc::IrqReturn},
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_POSTCORE,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    net::{generate_iface_id, net_core::poll_ifaces_try_lock_onetime, NET_DEVICES},
+    net::{NET_DEVICES, generate_iface_id, net_core::poll_ifaces_try_lock_onetime},
     time::Instant,
 };
 use system_error::SystemError;

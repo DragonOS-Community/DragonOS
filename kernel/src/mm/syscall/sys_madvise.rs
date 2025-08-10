@@ -1,10 +1,11 @@
 //! System call handler for the madvise system call.
 
-use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MADVISE, MMArch};
+use crate::arch::{MMArch, interrupt::TrapFrame, syscall::nr::SYS_MADVISE};
 use crate::mm::{
-    syscall::{check_aligned, MadvFlags, PageFrameCount},
+    MemoryManagementArch, VirtPageFrame,
+    syscall::{MadvFlags, PageFrameCount, check_aligned},
     ucontext::AddressSpace,
-    MemoryManagementArch, VirtPageFrame, {verify_area, VirtAddr},
+    {VirtAddr, verify_area},
 };
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;

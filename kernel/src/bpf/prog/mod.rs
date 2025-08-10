@@ -95,6 +95,10 @@ impl IndexNode for BpfProg {
     fn list(&self) -> Result<Vec<String>> {
         Err(SystemError::ENOSYS)
     }
+
+    fn absolute_path(&self) -> core::result::Result<String, SystemError> {
+        Ok(String::from("BPF Program"))
+    }
 }
 
 impl Drop for BpfProg {

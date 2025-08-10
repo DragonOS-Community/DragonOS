@@ -462,8 +462,14 @@ impl MountFSInode {
 
     #[inline(never)]
     fn do_absolute_path(&self) -> Result<String, SystemError> {
-        let mut path_parts = Vec::new();
         let mut current = self.self_ref.upgrade().unwrap();
+
+        // For special inode, we can directly get the absolute path
+        if let Ok(p) = current.inner_inode.absolute_path() {
+            return Ok(p);
+        }
+
+        let mut path_parts = Vec::new();
         let root_inode = ProcessManager::current_mntns().root_inode();
         let inode_id = root_inode.metadata()?.inode_id;
         while current.metadata()?.inode_id != inode_id {
@@ -513,7 +519,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        return self.inner_inode.close(data);
+        self.inner_inode.close(data)
     }
 
     fn create_with_data(
@@ -821,6 +827,14 @@ impl IndexNode for MountFSInode {
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         self.inner_inode.as_pollable_inode()
+    }
+
+    fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.inner_inode.read_sync(offset, buf)
+    }
+
+    fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.inner_inode.write_sync(offset, buf)
     }
 }
 

@@ -92,7 +92,9 @@ extern crate x86;
 #[macro_use]
 extern crate kcmdline_macros;
 extern crate klog_types;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 extern crate uefi;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 extern crate uefi_raw;
 #[macro_use]
 extern crate wait_queue_macros;

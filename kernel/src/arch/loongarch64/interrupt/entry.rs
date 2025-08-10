@@ -40,7 +40,7 @@ macro_rules! build_handler {
             /// handle exception的实现请参考 https://code.dragonos.org.cn/xref/linux-6.6.21/arch/loongarch/kernel/genex.S#69
             #[unsafe(naked)]
             #[no_mangle]
-            #[repr(align(8))]
+            #[rustc_align(8)]
             pub unsafe extern "C" fn [<handle_ $exception _>]() -> ! {
                 core::arch::naked_asm!(concat!(
                     backup_t0t1!(),

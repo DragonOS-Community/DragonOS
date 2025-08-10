@@ -64,8 +64,6 @@ smoltcp = { version = "=0.11.0", default-features = false, features = [
 ] }
 syscall_table_macros = { path = "crates/syscall_table_macros" }
 system_error = { path = "crates/system_error" }
-uefi = { version = "=0.26.0", features = ["alloc"] }
-uefi-raw = "=0.5.0"
 unified-init = { path = "crates/unified-init" }
 virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "415ab38ff9" }
 wait_queue_macros = { path = "crates/wait_queue_macros" }
@@ -93,6 +91,8 @@ multiboot2 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/mul
 raw-cpuid = "11.0.1"
 x86 = "=0.52.0"
 x86_64 = "=0.15.2"
+uefi = { version = "=0.26.0", features = ["alloc"] }
+uefi-raw = "=0.5.0"
 
 # target为riscv64时，使用下面的依赖
 [target.'cfg(target_arch = "riscv64")'.dependencies]
@@ -100,6 +100,8 @@ riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.gi
     "s-mode",
 ] }
 sbi-rt = { version = "=0.0.3", features = ["legacy"] }
+uefi = { version = "=0.26.0", features = ["alloc"] }
+uefi-raw = "=0.5.0"
 
 # target为loongarch64时，使用下面的依赖
 [target.'cfg(target_arch = "loongarch64")'.dependencies]

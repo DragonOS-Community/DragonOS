@@ -194,6 +194,7 @@ impl Hpet {
         return Some((inner, timer_regs));
     }
 
+    #[allow(clippy::mut_from_ref)]
     unsafe fn timer_mut(
         &self,
         index: u8,
@@ -219,6 +220,7 @@ impl Hpet {
         return (inner, regs);
     }
 
+    #[allow(clippy::mut_from_ref)]
     unsafe fn hpet_regs_mut(&self) -> (RwLockWriteGuard<'_, InnerHpet>, &mut HpetRegisters) {
         let mut inner = self.inner_mut();
         let regs = unsafe { inner.registers_ptr.as_mut() };

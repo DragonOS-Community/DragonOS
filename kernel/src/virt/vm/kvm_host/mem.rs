@@ -165,7 +165,7 @@ pub struct KvmMemSlot {
 #[allow(dead_code)]
 impl KvmMemSlot {
     pub fn check_aligned_addr(&self, align: usize) -> bool {
-        self.userspace_addr.data() % align == 0
+        self.userspace_addr.data().is_multiple_of(align)
     }
     pub fn get_flags(&self) -> UserMemRegionFlag {
         self.flags

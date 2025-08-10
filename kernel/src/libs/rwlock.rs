@@ -295,10 +295,10 @@ impl<T> RwLock<T> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::preempt_disable();
         let mut r = self.inner_try_upgradeable_read();
-        if r.is_none() {
-            ProcessManager::preempt_enable();
+        if let Some(r) = &mut r {
+            r.irq_guard = Some(irq_guard);
         } else {
-            r.as_mut().unwrap().irq_guard = Some(irq_guard);
+            ProcessManager::preempt_enable();
         }
 
         return r;

@@ -1188,7 +1188,7 @@ impl<'a> FilldirContext<'a> {
         ino: u64,
         d_type: u8,
     ) -> Result<(), SystemError> {
-        let name_len = name.as_bytes().len();
+        let name_len = name.len();
         let dirent_size = ::core::mem::size_of::<Dirent>() - ::core::mem::size_of::<u8>();
         let reclen = name_len + dirent_size + 1;
 

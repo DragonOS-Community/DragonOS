@@ -355,8 +355,8 @@ impl TtyDriver {
     pub fn open_tty(&self, index: Option<usize>) -> Result<Arc<TtyCore>, SystemError> {
         let mut tty: Option<Arc<TtyCore>> = None;
 
-        if index.is_some() {
-            if let Some(t) = self.lookup_tty(index.unwrap()) {
+        if let Some(idx) = index {
+            if let Some(t) = self.lookup_tty(idx) {
                 if t.core().port().is_none() {
                     warn!("{} port is None", t.core().name());
                 } else if t.core().port().unwrap().state() == TtyPortState::KOPENED {

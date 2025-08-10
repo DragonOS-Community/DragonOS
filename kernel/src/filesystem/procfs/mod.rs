@@ -318,7 +318,7 @@ impl ProcFSInode {
 
     fn open_self(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         let pid = ProcessManager::current_pid().data();
-        return Ok(pid.to_string().as_bytes().len() as _);
+        return Ok(pid.to_string().len() as _);
     }
 
     // 读取exe文件

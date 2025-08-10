@@ -619,7 +619,7 @@ impl FrameBufferConsole for BlittingFbConsole {
         bg: u32,
     ) -> Result<(), SystemError> {
         // 向上取整
-        let width = (vc_data.font.width + 7) / 8;
+        let width = vc_data.font.width.div_ceil(8);
         let cellsize = width * vc_data.font.height;
         let fb_info = self.fb();
         // 一次能输出的最大字数，避免帧缓冲区溢出
@@ -668,7 +668,7 @@ impl FrameBufferConsole for BlittingFbConsole {
         };
 
         // 向上取整
-        let w = (vc_data.font.width + 7) / 8;
+        let w = vc_data.font.width.div_ceil(8);
         let y = fbcon_data.display.real_y(vc_data.state.y as u32);
 
         let c = vc_data.screen_buf[vc_data.pos];

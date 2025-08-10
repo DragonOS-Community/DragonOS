@@ -477,7 +477,7 @@ impl FbConAttr {
     pub fn update_attr(&self, dst: &mut [u8], src: &[u8], vc_data: &VirtualConsoleData) {
         let mut offset = if vc_data.font.height < 10 { 1 } else { 2 } as usize;
 
-        let width = (vc_data.font.width + 7) / 8;
+        let width = vc_data.font.width.div_ceil(8);
         let cellsize = (vc_data.font.height * width) as usize;
 
         // 大于offset的部分就是下划线

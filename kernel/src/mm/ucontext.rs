@@ -1578,6 +1578,7 @@ impl VMA {
         let is_downgrade = (self.flags.has_write() || !prot_flags.contains(ProtFlags::PROT_WRITE))
             && (self.flags.has_execute() || !prot_flags.contains(ProtFlags::PROT_EXEC));
 
+        #[allow(clippy::unneeded_struct_pattern)]
         match self.provider {
             Provider::Allocated { .. } => true,
 

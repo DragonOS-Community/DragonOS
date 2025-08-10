@@ -1159,7 +1159,7 @@ impl ProcessControlBlock {
     /// 生成进程的名字
     pub fn generate_name(program_path: &str) -> String {
         // Extract just the basename from the program path
-        let name = program_path.split('/').last().unwrap_or(program_path);
+        let name = program_path.split('/').next_back().unwrap_or(program_path);
         name.to_string()
     }
 

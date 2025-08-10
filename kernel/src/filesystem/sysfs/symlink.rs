@@ -15,7 +15,7 @@ impl SysFS {
     /// ## 参数
     ///
     /// - `kobj`: object whose directory we're creating the link in. (符号链接所在目录)
-    ///    如果为None，则创建在sysfs的根目录下
+    ///   如果为None，则创建在sysfs的根目录下
     /// - `target`: object we're pointing to.
     /// - `name`: 符号链接的名称
     ///

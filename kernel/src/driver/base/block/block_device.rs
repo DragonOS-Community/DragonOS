@@ -197,7 +197,7 @@ impl BlockRange {
     /// 判断是不是多个整块连在一起
     pub fn is_multi(&self) -> bool {
         return self.len() >= (1usize << self.blk_size_log2)
-            && (self.len() % (1usize << self.blk_size_log2) == 0);
+            && self.len().is_multiple_of(1usize << self.blk_size_log2);
     }
     /// 获取 BlockRange 在块设备内部的起始位置 (单位是字节)
     pub fn origin_begin(&self) -> usize {

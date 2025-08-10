@@ -188,7 +188,7 @@ impl NTtyData {
 
             let mut room = NTTY_BUFSIZE - (self.read_head - tail);
             if termios.input_mode.contains(InputMode::PARMRK) {
-                room = (room + 2) / 3;
+                room = room.div_ceil(3);
             }
 
             room -= 1;
@@ -305,8 +305,8 @@ impl NTtyData {
         let mut f_offset = 0;
         let mut c_offset = 0;
         while count != 0 {
-            if flags.is_some() {
-                flag = flags.as_ref().unwrap()[f_offset];
+            if let Some(flags_slice) = flags.as_ref() {
+                flag = flags_slice[f_offset];
                 f_offset += 1;
             }
 

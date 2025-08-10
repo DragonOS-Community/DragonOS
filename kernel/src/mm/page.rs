@@ -378,11 +378,7 @@ impl PageReclaimer {
 
         let len = if let Ok(metadata) = inode.metadata() {
             let size = metadata.size as usize;
-            if size < page_index * MMArch::PAGE_SIZE {
-                0
-            } else {
-                size - page_index * MMArch::PAGE_SIZE
-            }
+            size.saturating_sub(page_index * MMArch::PAGE_SIZE)
         } else {
             MMArch::PAGE_SIZE
         };

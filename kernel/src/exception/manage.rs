@@ -76,8 +76,8 @@ impl IrqManager {
     ///
     /// - irq: 虚拟中断号
     /// - handler: 当中断发生时将被调用的函数，是
-    ///     线程化中断的初级处理程序。如果handler为`None`并且thread_fn不为`None`，
-    ///    将安装默认的初级处理程序
+    ///   线程化中断的初级处理程序。如果handler为`None`并且thread_fn不为`None`，
+    ///   将安装默认的初级处理程序
     /// - thread_fn: 在中断处理程序线程中调用的函数. 如果为`None`，则不会创建irq线程
     /// - flags: 中断处理标志
     ///     - IRQF_SHARED: 中断是共享的

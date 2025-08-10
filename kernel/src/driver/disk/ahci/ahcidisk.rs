@@ -122,8 +122,8 @@ impl AhciDisk {
             None
         };
 
-        if kbuf.is_some() {
-            buf_ptr = kbuf.as_mut().unwrap().as_mut_ptr() as usize;
+        if let Some(buf) = &mut kbuf {
+            buf_ptr = buf.as_mut_ptr() as usize;
         }
 
         #[allow(unused_unsafe)]
@@ -286,8 +286,8 @@ impl AhciDisk {
             None
         };
 
-        if kbuf.is_some() {
-            buf_ptr = kbuf.as_mut().unwrap().as_mut_ptr() as usize;
+        if let Some(buf) = &mut kbuf {
+            buf_ptr = buf.as_mut_ptr() as usize;
         }
 
         #[allow(unused_unsafe)]

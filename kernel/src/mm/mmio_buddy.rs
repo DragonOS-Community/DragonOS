@@ -60,7 +60,7 @@ impl MmioBuddyMemPool {
             free_regions,
         };
 
-        assert!(pool.pool_start_addr.data() % PAGE_1G_SIZE == 0);
+        assert!(pool.pool_start_addr.data().is_multiple_of(PAGE_1G_SIZE));
 
         let mut vaddr_base = MMArch::MMIO_BASE;
         let mut remain_size = MMArch::MMIO_SIZE;

@@ -66,4 +66,4 @@ impl Syscall for SysSyncFsHandle {
     }
 }
 
-syscall_table_macros::declare_syscall!(SYS_SYNCFS, SysSyncHandle);
+syscall_table_macros::declare_syscall!(SYS_SYNCFS, SysSyncFsHandle);

@@ -8,6 +8,7 @@ use super::vfs::{
 };
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
+    filesystem::vfs::mount::MountFlags,
     libs::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
@@ -727,7 +728,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
         root_inode
             .mkdir("dev", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /dev")
-            .mount(devfs)
+            .mount(devfs, MountFlags::empty())
             .expect("Failed to mount at /dev");
         info!("DevFS mounted.");
         result = Some(Ok(()));

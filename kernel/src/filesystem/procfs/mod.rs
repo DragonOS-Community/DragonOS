@@ -14,7 +14,7 @@ use system_error::SystemError;
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{vcore::generate_inode_id, FileType},
+    filesystem::vfs::{mount::MountFlags, vcore::generate_inode_id, FileType},
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -34,11 +34,12 @@ use super::vfs::{
 
 pub mod kmsg;
 pub mod log;
+mod proc_mounts;
 mod syscall;
 
 /// @brief 进程文件类型
 /// @usage 用于定义进程文件夹下的各类文件类型
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[repr(u8)]
 pub enum ProcFileType {
     ///展示进程状态信息
@@ -49,6 +50,8 @@ pub enum ProcFileType {
     ProcKmsg = 2,
     /// 可执行路径
     ProcExe = 3,
+    /// /proc/mounts
+    ProcMounts = 4,
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -61,10 +64,90 @@ impl From<u8> for ProcFileType {
             1 => ProcFileType::ProcMeminfo,
             2 => ProcFileType::ProcKmsg,
             3 => ProcFileType::ProcExe,
+            4 => ProcFileType::ProcMounts,
             _ => ProcFileType::Default,
         }
     }
 }
+/// @brief 创建 ProcFS 文件的参数结构体
+#[derive(Debug, Clone)]
+pub struct ProcFileCreationParams<'a> {
+    pub parent: Arc<dyn IndexNode>,
+    pub name: &'a str,
+    pub file_type: FileType,
+    pub mode: ModeType,
+    pub pid: RawPid,
+    pub ftype: ProcFileType,
+    pub data: Option<&'a str>,
+}
+
+impl<'a> ProcFileCreationParams<'a> {
+    pub fn builder() -> ProcFileCreationParamsBuilder<'a> {
+        ProcFileCreationParamsBuilder::default()
+    }
+}
+
+/// @brief ProcFileCreationParams 的 Builder 模式实现
+#[derive(Debug, Clone, Default)]
+pub struct ProcFileCreationParamsBuilder<'a> {
+    parent: Option<Arc<dyn IndexNode>>,
+    name: Option<&'a str>,
+    file_type: Option<FileType>,
+    mode: Option<ModeType>,
+    pid: Option<RawPid>,
+    ftype: Option<ProcFileType>,
+    data: Option<&'a str>,
+}
+
+impl<'a> ProcFileCreationParamsBuilder<'a> {
+    pub fn parent(mut self, parent: Arc<dyn IndexNode>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    pub fn name(mut self, name: &'a str) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    pub fn file_type(mut self, file_type: FileType) -> Self {
+        self.file_type = Some(file_type);
+        self
+    }
+
+    pub fn mode(mut self, mode: ModeType) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
+    pub fn pid(mut self, pid: RawPid) -> Self {
+        self.pid = Some(pid);
+        self
+    }
+
+    pub fn ftype(mut self, ftype: ProcFileType) -> Self {
+        self.ftype = Some(ftype);
+        self
+    }
+
+    pub fn data(mut self, data: &'a str) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    pub fn build(self) -> Result<ProcFileCreationParams<'a>, SystemError> {
+        Ok(ProcFileCreationParams {
+            parent: self.parent.ok_or(SystemError::EINVAL)?,
+            name: self.name.ok_or(SystemError::EINVAL)?,
+            file_type: self.file_type.ok_or(SystemError::EINVAL)?,
+            mode: self.mode.ok_or(SystemError::EINVAL)?,
+            pid: self.pid.ok_or(SystemError::EINVAL)?,
+            ftype: self.ftype.ok_or(SystemError::EINVAL)?,
+            data: self.data,
+        })
+    }
+}
+
 /// @brief 节点私有信息结构体
 /// @usage 用于传入各类文件所需的信息
 #[derive(Debug)]
@@ -368,6 +451,26 @@ impl FileSystem for ProcFS {
 }
 
 impl ProcFS {
+    #[inline(never)]
+    fn create_proc_file(&self, params: ProcFileCreationParams) -> Result<(), SystemError> {
+        let binding = params
+            .parent
+            .create(params.name, params.file_type, params.mode)?;
+        let proc_file = binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        let mut proc_file_guard = proc_file.0.lock();
+        proc_file_guard.fdata.pid = params.pid;
+        proc_file_guard.fdata.ftype = params.ftype;
+        if let Some(data_content) = params.data {
+            proc_file_guard.data = data_content.to_string().as_bytes().to_vec();
+        }
+        drop(proc_file_guard);
+        Ok(())
+    }
+
+    #[inline(never)]
     pub fn new() -> Arc<Self> {
         let super_block = SuperBlock::new(
             Magic::PROC_MAGIC,
@@ -420,35 +523,32 @@ impl ProcFS {
         drop(root_guard);
 
         // 创建meminfo文件
-        let inode = result.root_inode();
-        let binding = inode.create(
-            "meminfo",
-            FileType::File,
-            ModeType::from_bits_truncate(0o444),
-        );
-        if let Ok(meminfo) = binding {
-            let meminfo_file = meminfo
-                .as_any_ref()
-                .downcast_ref::<LockedProcFSInode>()
-                .unwrap();
-            meminfo_file.0.lock().fdata.pid = RawPid::new(0);
-            meminfo_file.0.lock().fdata.ftype = ProcFileType::ProcMeminfo;
-        } else {
-            panic!("create meminfo error");
-        }
+        let meminfo_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("meminfo")
+            .file_type(FileType::File)
+            .mode(ModeType::from_bits_truncate(0o444))
+            .pid(RawPid::new(0))
+            .ftype(ProcFileType::ProcMeminfo)
+            .build()
+            .unwrap();
+        result
+            .create_proc_file(meminfo_params)
+            .unwrap_or_else(|_| panic!("create meminfo error"));
 
         // 创建kmsg文件
-        let binding = inode.create("kmsg", FileType::File, ModeType::from_bits_truncate(0o444));
-        if let Ok(kmsg) = binding {
-            let kmsg_file = kmsg
-                .as_any_ref()
-                .downcast_ref::<LockedProcFSInode>()
-                .unwrap();
-            kmsg_file.0.lock().fdata.pid = RawPid::new(1);
-            kmsg_file.0.lock().fdata.ftype = ProcFileType::ProcKmsg;
-        } else {
-            panic!("create ksmg error");
-        }
+        let kmsg_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("kmsg")
+            .file_type(FileType::File)
+            .mode(ModeType::from_bits_truncate(0o444))
+            .pid(RawPid::new(1))
+            .ftype(ProcFileType::ProcKmsg)
+            .build()
+            .unwrap();
+        result
+            .create_proc_file(kmsg_params)
+            .unwrap_or_else(|_| panic!("create kmsg error"));
         // 这个文件是用来欺骗Aya框架识别内核版本
         /* On Ubuntu LINUX_VERSION_CODE doesn't correspond to info.release,
          * but Ubuntu provides /proc/version_signature file, as described at
@@ -460,36 +560,50 @@ impl ProcFS {
          * In the above, 5.4.8 is what kernel is actually expecting, while
          * uname() call will return 5.4.0 in info.release.
          */
-        let binding = inode.create("version_signature", FileType::File, ModeType::S_IRUGO);
-        if let Ok(version_signature) = binding {
-            let version_signature = version_signature
-                .as_any_ref()
-                .downcast_ref::<LockedProcFSInode>()
-                .unwrap();
-            version_signature.0.lock().fdata.ftype = ProcFileType::Default;
-            version_signature.0.lock().data = "DragonOS 6.0.0-generic 6.0.0\n"
-                .to_string()
-                .as_bytes()
-                .to_vec();
-        } else {
-            panic!("create version_signature error");
-        }
+        let version_signature_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("version_signature")
+            .file_type(FileType::File)
+            .mode(ModeType::S_IRUGO)
+            .pid(RawPid::new(0))
+            .ftype(ProcFileType::Default)
+            .data("DragonOS 6.0.0-generic 6.0.0\n")
+            .build()
+            .unwrap();
+        result
+            .create_proc_file(version_signature_params)
+            .unwrap_or_else(|_| panic!("create version_signature error"));
 
-        let self_dir = inode
+        let mounts_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("mounts")
+            .file_type(FileType::File)
+            .mode(ModeType::S_IRUGO)
+            .pid(RawPid::new(0))
+            .ftype(ProcFileType::ProcMounts)
+            .build()
+            .unwrap();
+        result
+            .create_proc_file(mounts_params)
+            .unwrap_or_else(|_| panic!("create mounts error"));
+
+        let self_dir = result
+            .root_inode()
             .create("self", FileType::Dir, ModeType::from_bits_truncate(0o555))
             .unwrap();
 
-        let binding = self_dir.create("exe", FileType::SymLink, ModeType::S_IRUGO);
-        if let Ok(exe) = binding {
-            let exe_file = exe
-                .as_any_ref()
-                .downcast_ref::<LockedProcFSInode>()
-                .unwrap();
-            exe_file.0.lock().fdata.pid = RawPid::new(0);
-            exe_file.0.lock().fdata.ftype = ProcFileType::ProcExe;
-        } else {
-            panic!("create exe error");
-        }
+        let exe_params = ProcFileCreationParams::builder()
+            .parent(self_dir)
+            .name("exe")
+            .file_type(FileType::SymLink)
+            .mode(ModeType::S_IRUGO)
+            .pid(RawPid::new(0))
+            .ftype(ProcFileType::ProcExe)
+            .build()
+            .unwrap();
+        result
+            .create_proc_file(exe_params)
+            .unwrap_or_else(|_| panic!("create exe error"));
 
         return result;
     }
@@ -578,6 +692,7 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
             ProcFileType::ProcExe => inode.open_exe(&mut private_data)?,
+            ProcFileType::ProcMounts => inode.open_mounts(&mut private_data)?,
             ProcFileType::Default => inode.data.len() as i64,
             _ => {
                 todo!()
@@ -637,6 +752,9 @@ impl IndexNode for LockedProcFSInode {
                 return inode.proc_read(offset, len, buf, &mut private_data)
             }
             ProcFileType::ProcExe => return inode.read_link(buf),
+            ProcFileType::ProcMounts => {
+                return inode.proc_read(offset, len, buf, &mut private_data)
+            }
             ProcFileType::ProcKmsg => (),
             ProcFileType::Default => (),
         };
@@ -963,7 +1081,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
         root_inode
             .mkdir("proc", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /proc")
-            .mount(procfs)
+            .mount(procfs, MountFlags::empty())
             .expect("Failed to mount at /proc");
         info!("ProcFS mounted.");
         result = Some(Ok(()));

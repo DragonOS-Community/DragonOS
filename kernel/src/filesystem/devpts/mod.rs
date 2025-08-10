@@ -22,7 +22,11 @@ use crate::{
             tty_device::{PtyType, TtyDevice, TtyType},
         },
     },
-    filesystem::vfs::{mount::do_mount_mkdir, syscall::ModeType, FileType},
+    filesystem::vfs::{
+        mount::{do_mount_mkdir, MountFlags},
+        syscall::ModeType,
+        FileType,
+    },
     init::initcall::INITCALL_FS,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
@@ -279,7 +283,7 @@ pub fn devpts_init() -> Result<(), SystemError> {
     // 创建 devptsfs 实例
     let ptsfs: Arc<DevPtsFs> = DevPtsFs::new();
 
-    do_mount_mkdir(ptsfs, "/dev/pts").expect("Failed to mount DevPtsFS");
+    do_mount_mkdir(ptsfs, "/dev/pts", MountFlags::empty()).expect("Failed to mount DevPtsFS");
     info!("DevPtsFs mounted.");
 
     Ok(())

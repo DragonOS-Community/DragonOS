@@ -82,7 +82,7 @@ pub struct ProcFileCreationParams<'a> {
     pub name: &'a str,
     pub file_type: FileType,
     pub mode: ModeType,
-    pub pid: RawPid,
+    pub pid: Option<RawPid>,
     pub ftype: ProcFileType,
     pub data: Option<&'a str>,
 }
@@ -105,6 +105,7 @@ pub struct ProcFileCreationParamsBuilder<'a> {
     data: Option<&'a str>,
 }
 
+#[allow(dead_code)]
 impl<'a> ProcFileCreationParamsBuilder<'a> {
     pub fn parent(mut self, parent: Arc<dyn IndexNode>) -> Self {
         self.parent = Some(parent);
@@ -146,8 +147,8 @@ impl<'a> ProcFileCreationParamsBuilder<'a> {
             parent: self.parent.ok_or(SystemError::EINVAL)?,
             name: self.name.ok_or(SystemError::EINVAL)?,
             file_type: self.file_type.ok_or(SystemError::EINVAL)?,
-            mode: self.mode.ok_or(SystemError::EINVAL)?,
-            pid: self.pid.ok_or(SystemError::EINVAL)?,
+            mode: self.mode.unwrap_or(ModeType::S_IRUGO),
+            pid: self.pid,
             ftype: self.ftype.ok_or(SystemError::EINVAL)?,
             data: self.data,
         })
@@ -159,7 +160,7 @@ impl<'a> ProcFileCreationParamsBuilder<'a> {
 #[derive(Debug)]
 pub struct InodeInfo {
     ///进程的pid
-    pid: RawPid,
+    pid: Option<RawPid>,
     ///文件类型
     ftype: ProcFileType,
     /// 文件描述符
@@ -235,7 +236,10 @@ impl ProcFSInode {
     ///
     fn open_status(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 获取该pid对应的pcb结构体
-        let pid = self.fdata.pid;
+        let pid = self
+            .fdata
+            .pid
+            .expect("ProcFS: pid is None when opening 'status' file.");
         let pcb = ProcessManager::find_task_by_vpid(pid);
         let pcb = if let Some(pcb) = pcb {
             pcb
@@ -407,12 +411,13 @@ impl ProcFSInode {
     // 读取exe文件
     fn read_exe_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         // 判断是否有记录pid信息，有的话就是当前进程的exe文件，没有则是当前进程的exe文件
-        let pid = self.fdata.pid;
-        let pcb = if pid == RawPid::from(0) {
-            ProcessManager::current_pcb()
-        } else {
+        let pcb = if let Some(pid) = self.fdata.pid {
             ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?
+        } else {
+            // 如果没有pid信息，则读取当前进程的exe文件
+            ProcessManager::current_pcb()
         };
+
         let exe = pcb.execute_path();
         let exe_bytes = exe.as_bytes();
         let len = exe_bytes.len().min(buf.len());
@@ -545,7 +550,7 @@ impl ProcFS {
                 },
                 fs: Weak::default(),
                 fdata: InodeInfo {
-                    pid: RawPid::new(0),
+                    pid: None,
                     ftype: ProcFileType::Default,
                     fd: -1,
                 },
@@ -571,7 +576,6 @@ impl ProcFS {
             .name("meminfo")
             .file_type(FileType::File)
             .mode(ModeType::from_bits_truncate(0o444))
-            .pid(RawPid::new(0))
             .ftype(ProcFileType::ProcMeminfo)
             .build()
             .unwrap();
@@ -585,7 +589,6 @@ impl ProcFS {
             .name("kmsg")
             .file_type(FileType::File)
             .mode(ModeType::from_bits_truncate(0o444))
-            .pid(RawPid::new(1))
             .ftype(ProcFileType::ProcKmsg)
             .build()
             .unwrap();
@@ -607,8 +610,6 @@ impl ProcFS {
             .parent(result.root_inode())
             .name("version_signature")
             .file_type(FileType::File)
-            .mode(ModeType::S_IRUGO)
-            .pid(RawPid::new(0))
             .ftype(ProcFileType::Default)
             .data("DragonOS 6.0.0-generic 6.0.0\n")
             .build()
@@ -621,8 +622,6 @@ impl ProcFS {
             .parent(result.root_inode())
             .name("mounts")
             .file_type(FileType::File)
-            .mode(ModeType::S_IRUGO)
-            .pid(RawPid::new(0))
             .ftype(ProcFileType::ProcMounts)
             .build()
             .unwrap();
@@ -639,8 +638,6 @@ impl ProcFS {
             .parent(self_dir)
             .name("exe")
             .file_type(FileType::SymLink)
-            .mode(ModeType::S_IRUGO)
-            .pid(RawPid::new(0))
             .ftype(ProcFileType::ProcExe)
             .build()
             .unwrap();
@@ -673,7 +670,7 @@ impl ProcFS {
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
             .unwrap();
-        status_file.0.lock().fdata.pid = pid;
+        status_file.0.lock().fdata.pid = Some(pid);
         status_file.0.lock().fdata.ftype = ProcFileType::ProcStatus;
 
         // exe文件
@@ -687,7 +684,7 @@ impl ProcFS {
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
             .unwrap();
-        exe_file.0.lock().fdata.pid = pid;
+        exe_file.0.lock().fdata.pid = Some(pid);
         exe_file.0.lock().fdata.ftype = ProcFileType::ProcExe;
 
         // fd dir
@@ -961,7 +958,7 @@ impl IndexNode for LockedProcFSInode {
                 },
                 fs: inode.fs.clone(),
                 fdata: InodeInfo {
-                    pid: RawPid::new(0),
+                    pid: None,
                     ftype: ProcFileType::Default,
                     fd: -1,
                 },
@@ -1146,6 +1143,7 @@ impl IndexNode for LockedProcFSInode {
 }
 
 /// @brief 向procfs注册进程
+#[inline(never)]
 pub fn procfs_register_pid(pid: RawPid) -> Result<(), SystemError> {
     let root_inode = ProcessManager::current_mntns().root_inode();
     let procfs_inode = root_inode.find("proc")?;
@@ -1163,6 +1161,7 @@ pub fn procfs_register_pid(pid: RawPid) -> Result<(), SystemError> {
 }
 
 /// @brief 在ProcFS中,解除进程的注册
+#[inline(never)]
 pub fn procfs_unregister_pid(pid: RawPid) -> Result<(), SystemError> {
     let root_inode = ProcessManager::current_mntns().root_inode();
     // 获取procfs实例

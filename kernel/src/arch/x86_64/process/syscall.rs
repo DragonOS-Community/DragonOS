@@ -8,10 +8,10 @@ use crate::{
     },
     mm::VirtAddr,
     process::{
-        ProcessControlBlock, ProcessManager,
         exec::{BinaryLoaderResult, ExecParam},
+        ProcessControlBlock, ProcessManager,
     },
-    syscall::{Syscall, user_access::UserBufferWriter},
+    syscall::{user_access::UserBufferWriter, Syscall},
 };
 
 impl Syscall {

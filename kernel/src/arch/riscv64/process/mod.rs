@@ -3,7 +3,7 @@ use core::{
     arch::asm,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{Ordering, compiler_fence},
+    sync::atomic::{compiler_fence, Ordering},
 };
 use kdepends::memoffset::offset_of;
 use log::error;
@@ -12,22 +12,22 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        CurrentIrqArch, interrupt::entry::ret_from_exception,
-        process::kthread::kernel_thread_bootstrap_stage1,
+        interrupt::entry::ret_from_exception, process::kthread::kernel_thread_bootstrap_stage1,
+        CurrentIrqArch,
     },
     exception::InterruptArch,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
-        KernelStack, PROCESS_SWITCH_RESULT, ProcessControlBlock, ProcessFlags, ProcessManager,
         fork::{CloneFlags, KernelCloneArgs},
-        switch_finish_hook,
+        switch_finish_hook, KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager,
+        PROCESS_SWITCH_RESULT,
     },
     smp::cpu::ProcessorId,
 };
 
 use super::{
-    cpu::{LocalContext, local_context},
+    cpu::{local_context, LocalContext},
     interrupt::TrapFrame,
 };
 

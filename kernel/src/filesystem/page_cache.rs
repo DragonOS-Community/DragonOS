@@ -13,15 +13,15 @@ use system_error::SystemError;
 use super::vfs::IndexNode;
 use crate::libs::spinlock::SpinLockGuard;
 use crate::mm::page::FileMapInfo;
+use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
     arch::MMArch,
     libs::spinlock::SpinLock,
     mm::{
+        page::{page_manager_lock_irqsave, page_reclaimer_lock_irqsave, Page, PageFlags},
         MemoryManagementArch,
-        page::{Page, PageFlags, page_manager_lock_irqsave, page_reclaimer_lock_irqsave},
     },
 };
-use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{libs::align::page_align_up, mm::page::PageType};
 
 static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);

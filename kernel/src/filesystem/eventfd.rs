@@ -2,7 +2,7 @@ use super::vfs::PollableInode;
 use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::{
-    epoll::{EPollEventType, EPollItem, event_poll::EventPoll},
+    epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
     vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
 };
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};

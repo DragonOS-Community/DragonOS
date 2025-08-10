@@ -4,8 +4,8 @@ use system_error::SystemError;
 use crate::{libs::spinlock::SpinLock, net::Endpoint};
 
 use super::{
-    PosixSocketHandleItem, Socket, SocketInode, SocketMetadata, SocketOptions, SocketType,
-    handle::GlobalSocketHandle,
+    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, SocketInode, SocketMetadata,
+    SocketOptions, SocketType,
 };
 
 #[derive(Debug, Clone)]

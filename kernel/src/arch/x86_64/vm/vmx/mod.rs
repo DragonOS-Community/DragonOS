@@ -21,18 +21,18 @@ use crate::process::ProcessManager;
 use crate::virt::vm::kvm_host::vcpu::GuestDebug;
 use crate::{
     arch::{
-        CurrentIrqArch, MMArch, VirtCpuArch,
         vm::{
             asm::KvmX86Asm,
-            kvm_host::{X86KvmArch, vcpu::VirtCpuRequest},
+            kvm_host::{vcpu::VirtCpuRequest, X86KvmArch},
             vmx::vmcs::vmx_area,
         },
+        CurrentIrqArch, MMArch, VirtCpuArch,
     },
     exception::InterruptArch,
     libs::spinlock::SpinLock,
     mm::{
-        MemoryManagementArch,
         percpu::{PerCpu, PerCpuVar},
+        MemoryManagementArch,
     },
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     virt::vm::{kvm_dev::kvm_init, kvm_host::vcpu::VirtCpu, user_api::UapiKvmSegment},
@@ -43,7 +43,7 @@ use asm::VMX_EPTP_MT_WB;
 use asm::VMX_EPTP_PWL_4;
 use asm::VMX_EPTP_PWL_5;
 use bitfield_struct::bitfield;
-use bitmap::{AllocBitmap, traits::BitMapOps};
+use bitmap::{traits::BitMapOps, AllocBitmap};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::controlregs::{cr2, cr2_write};
@@ -55,7 +55,7 @@ use x86::segmentation::{ds, es, fs, gs};
 use x86::vmx::vmcs::ro;
 use x86::{
     bits64::rflags::RFlags,
-    controlregs::{Cr0, Cr4, Xcr0, cr0, cr4},
+    controlregs::{cr0, cr4, Cr0, Cr4, Xcr0},
     msr::{self, rdmsr},
     segmentation::{self},
     vmx::vmcs::{
@@ -70,8 +70,8 @@ use x86_64::{instructions::tables::sidt, registers::control::EferFlags};
 
 use crate::{
     arch::{
+        vm::{vmx::vmcs::feat::VmxFeat, x86_kvm_manager_mut, McgCap},
         KvmArch,
-        vm::{McgCap, vmx::vmcs::feat::VmxFeat, x86_kvm_manager_mut},
     },
     libs::rwlock::RwLock,
     virt::vm::kvm_host::Vm,
@@ -84,23 +84,22 @@ use self::vmcs::LoadedVmcs;
 use self::{
     capabilities::{ProcessorTraceMode, VmcsConfig, VmxCapability},
     vmcs::{
-        ControlsType, LockedLoadedVmcs, PERCPU_LOADED_VMCS_LIST, PERCPU_VMCS, VMControlStructure,
-        VMXAREA, VmxMsrBitmapAccess, VmxMsrBitmapAction, current_loaded_vmcs_list_mut,
-        current_vmcs, current_vmcs_mut,
+        current_loaded_vmcs_list_mut, current_vmcs, current_vmcs_mut, ControlsType,
+        LockedLoadedVmcs, VMControlStructure, VmxMsrBitmapAccess, VmxMsrBitmapAction,
+        PERCPU_LOADED_VMCS_LIST, PERCPU_VMCS, VMXAREA,
     },
 };
 
 use super::asm::IntrInfo;
 use super::asm::SegmentCacheField;
-use super::kvm_host::RMODE_TSS_SIZE;
 use super::kvm_host::vcpu::KvmIntrType;
+use super::kvm_host::RMODE_TSS_SIZE;
 use super::x86_kvm_ops;
 use super::{
-    KvmArchManager,
     asm::{VcpuSegment, VmxAsm, VmxMsrEntry},
     init_kvm_arch,
     kvm_host::{KvmFunc, KvmInitFunc, KvmIrqChipMode, KvmReg, MsrFilterType, NotifyVmExitFlags},
-    x86_kvm_manager,
+    x86_kvm_manager, KvmArchManager,
 };
 
 pub mod asm;

@@ -1,13 +1,13 @@
 use crate::{
     libs::align::{page_align_down, page_align_up},
     mm::{
-        MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr,
         allocator::bump::BumpAllocator,
-        memblock::{MemoryAreaAttr, mem_block_manager},
+        memblock::{mem_block_manager, MemoryAreaAttr},
+        MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr,
     },
 };
 
-use super::{BOOTSTRAP_MM_INFO, X86_64MMBootstrapInfo};
+use super::{X86_64MMBootstrapInfo, BOOTSTRAP_MM_INFO};
 
 impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
     pub unsafe fn arch_remain_areas(

@@ -14,7 +14,7 @@ use system_error::SystemError;
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{FileType, vcore::generate_inode_id},
+    filesystem::vfs::{vcore::generate_inode_id, FileType},
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -26,10 +26,10 @@ use crate::{
 };
 
 use super::vfs::{
-    FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
     file::{FileMode, FilePrivateData},
     syscall::ModeType,
     utils::DName,
+    FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
 pub mod kmsg;

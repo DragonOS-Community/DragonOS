@@ -1,8 +1,8 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETPGID;
+use crate::process::pid::Pid;
 use crate::process::ProcessManager;
 use crate::process::RawPid;
-use crate::process::pid::Pid;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::sync::Arc;

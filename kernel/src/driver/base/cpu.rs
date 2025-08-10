@@ -14,9 +14,9 @@ use crate::{
 use super::{
     class::Class,
     device::{
-        Device, DeviceCommonData, DeviceType, IdTable,
-        bus::{Bus, subsystem_manager},
+        bus::{subsystem_manager, Bus},
         driver::Driver,
+        Device, DeviceCommonData, DeviceType, IdTable,
     },
     kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
     kset::KSet,

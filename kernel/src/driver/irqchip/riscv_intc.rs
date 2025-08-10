@@ -4,18 +4,18 @@ use system_error::SystemError;
 
 use crate::{
     arch::interrupt::TrapFrame,
-    driver::clocksource::timer_riscv::{RiscVSbiTimer, riscv_sbi_timer_irq_desc_init},
+    driver::clocksource::timer_riscv::{riscv_sbi_timer_irq_desc_init, RiscVSbiTimer},
     exception::{
-        HardwareIrqNumber, IrqNumber,
         handle::PerCpuDevIdIrqHandler,
         irqchip::{IrqChip, IrqChipFlags},
         irqdata::IrqData,
-        irqdesc::{GenericIrqHandler, irq_desc_manager},
-        irqdomain::{IrqDomain, IrqDomainOps, irq_domain_manager},
+        irqdesc::{irq_desc_manager, GenericIrqHandler},
+        irqdomain::{irq_domain_manager, IrqDomain, IrqDomainOps},
         softirq::do_softirq,
+        HardwareIrqNumber, IrqNumber,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    sched::{__schedule, SchedMode},
+    sched::{SchedMode, __schedule},
 };
 
 use super::riscv_sifive_plic::do_plic_irq;

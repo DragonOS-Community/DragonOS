@@ -4,7 +4,7 @@ use crate::mm::PhysAddr;
 
 use super::{
     pci::{PciCam, SegmentGroupNumber},
-    root::{PciRoot, pci_root_manager},
+    root::{pci_root_manager, PciRoot},
 };
 
 #[inline(always)]

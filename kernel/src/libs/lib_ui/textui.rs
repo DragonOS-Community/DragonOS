@@ -20,8 +20,8 @@ use system_error::SystemError;
 
 use super::{
     screen_manager::{
-        ScmBuffer, ScmBufferInfo, ScmFramworkType, ScmUiFramework, ScmUiFrameworkMetadata,
-        scm_register,
+        scm_register, ScmBuffer, ScmBufferInfo, ScmFramworkType, ScmUiFramework,
+        ScmUiFrameworkMetadata,
     },
     textui_no_alloc::no_init_textui_putchar_window,
 };

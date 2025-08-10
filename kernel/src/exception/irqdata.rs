@@ -10,11 +10,11 @@ use crate::libs::{
 };
 
 use super::{
-    HardwareIrqNumber, IrqNumber,
     irqchip::{IrqChip, IrqChipData},
     irqdesc::IrqDesc,
     irqdomain::IrqDomain,
     msi::MsiDesc,
+    HardwareIrqNumber, IrqNumber,
 };
 
 /// per irq chip data passed down to chip functions

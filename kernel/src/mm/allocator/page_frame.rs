@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    arch::{MMArch, mm::LockedFrameAllocator},
+    arch::{mm::LockedFrameAllocator, MMArch},
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
 };
 

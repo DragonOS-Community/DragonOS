@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
 
 use crate::{
     arch::CurrentIrqArch,

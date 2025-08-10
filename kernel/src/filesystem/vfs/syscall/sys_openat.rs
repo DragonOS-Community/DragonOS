@@ -4,10 +4,10 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_OPENAT;
-use crate::filesystem::vfs::MAX_PATHLEN;
-use crate::filesystem::vfs::ModeType;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::open::do_sys_open;
+use crate::filesystem::vfs::ModeType;
+use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::check_and_clone_cstr;

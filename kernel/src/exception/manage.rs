@@ -9,20 +9,20 @@ use crate::{
     driver::base::device::DeviceId,
     exception::{
         irqchip::IrqChipSetMaskResult,
-        irqdesc::{InnerIrqDesc, IrqAction, irq_desc_manager},
+        irqdesc::{irq_desc_manager, InnerIrqDesc, IrqAction},
     },
     libs::{cpumask::CpuMask, mutex::MutexGuard, spinlock::SpinLockGuard},
-    process::{ProcessManager, kthread::KernelThreadMechanism},
+    process::{kthread::KernelThreadMechanism, ProcessManager},
     smp::cpu::ProcessorId,
 };
 
 use super::{
-    IrqNumber,
     dummychip::no_irq_chip,
     irqchip::IrqChipFlags,
     irqdata::{IrqData, IrqHandlerData, IrqLineStatus, IrqStatus},
     irqdesc::{InnerIrqAction, IrqDesc, IrqDescState, IrqHandleFlags, IrqHandler, IrqReturn},
     irqdomain::irq_domain_manager,
+    IrqNumber,
 };
 
 lazy_static! {

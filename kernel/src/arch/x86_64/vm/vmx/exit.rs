@@ -4,10 +4,10 @@ use x86::vmx::vmcs::{guest, ro};
 
 use crate::{
     arch::vm::asm::{IntrInfo, VmxAsm},
-    virt::vm::kvm_host::{Vm, vcpu::VirtCpu},
+    virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
 };
 
-use super::{PageFaultErr, ept::EptViolationExitQual, vmx_info};
+use super::{ept::EptViolationExitQual, vmx_info, PageFaultErr};
 extern crate num_traits;
 
 #[bitfield(u32)]
@@ -285,10 +285,10 @@ impl VmxExitHandlers {
 
     fn handle_ept_violation(vcpu: &mut VirtCpu, vm: &Vm) -> Result<i32, SystemError> {
         let exit_qualification = vcpu.get_exit_qual(); //0x184
-        // EPT 违规发生在从 NMI 执行 iret 时，
-        // 在下一次 VM 进入之前必须设置 "blocked by NMI" 位。
-        // 有一些错误可能会导致该位未被设置：
-        // AAK134, BY25。
+                                                       // EPT 违规发生在从 NMI 执行 iret 时，
+                                                       // 在下一次 VM 进入之前必须设置 "blocked by NMI" 位。
+                                                       // 有一些错误可能会导致该位未被设置：
+                                                       // AAK134, BY25。
         let vmx = vcpu.vmx();
         if vmx.idt_vectoring_info.bits() & IntrInfo::INTR_INFO_VALID_MASK.bits() != 0
             && vmx_info().enable_vnmi

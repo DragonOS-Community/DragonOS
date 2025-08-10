@@ -1,10 +1,10 @@
 use crate::{
     filesystem::vfs::{
-        FileSystem, IndexNode, MountFS,
         mount::{MountList, MountPath},
+        FileSystem, IndexNode, MountFS,
     },
     libs::{once::Once, spinlock::SpinLock},
-    process::{ProcessManager, fork::CloneFlags, namespace::NamespaceType},
+    process::{fork::CloneFlags, namespace::NamespaceType, ProcessManager},
 };
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use system_error::SystemError;
 
-use super::{NamespaceOps, nsproxy::NsCommon, user_namespace::UserNamespace};
+use super::{nsproxy::NsCommon, user_namespace::UserNamespace, NamespaceOps};
 
 static mut INIT_MNT_NAMESPACE: Option<Arc<MntNamespace>> = None;
 

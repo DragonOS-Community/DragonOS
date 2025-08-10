@@ -1,5 +1,5 @@
-use crate::driver::base::device::Device;
 use crate::driver::base::device::bus::Bus;
+use crate::driver::base::device::Device;
 use crate::driver::base::subsys::SubSysPrivate;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};

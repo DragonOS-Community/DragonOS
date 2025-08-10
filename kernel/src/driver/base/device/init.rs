@@ -3,9 +3,8 @@ use log::info;
 
 use crate::driver::base::{
     device::{
-        DEV_KSET_INSTANCE, DEVICE_MANAGER, DEVICES_KSET_INSTANCE, DeviceManager,
         set_sys_dev_block_kset, set_sys_dev_char_kset, set_sys_devices_virtual_kset, sys_dev_kset,
-        sys_devices_kset,
+        sys_devices_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER, DEV_KSET_INSTANCE,
     },
     kobject::KObject,
     kset::KSet,

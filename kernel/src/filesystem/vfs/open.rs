@@ -3,11 +3,11 @@ use log::warn;
 use system_error::SystemError;
 
 use super::{
-    FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     fcntl::AtFlags,
     file::{File, FileMode},
     syscall::{ModeType, OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
+    FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{
     driver::base::block::SeekFrom, process::ProcessManager,
@@ -16,7 +16,7 @@ use crate::{
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
     process::cred::GroupInfo,
-    time::{PosixTimeSpec, syscall::PosixTimeval},
+    time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 use alloc::string::String;
 

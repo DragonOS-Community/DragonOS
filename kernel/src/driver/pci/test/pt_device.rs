@@ -10,7 +10,7 @@ use crate::{
     driver::{
         base::{
             class::Class,
-            device::{Device, DeviceCommonData, DeviceType, IdTable, bus::Bus, driver::Driver},
+            device::{bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable},
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
@@ -19,7 +19,7 @@ use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{
-            Attribute, AttributeGroup, SYSFS_ATTR_MODE_RO, SysFSOpsSupport, file::sysfs_emit_str,
+            file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
         },
         vfs::syscall::ModeType,
     },

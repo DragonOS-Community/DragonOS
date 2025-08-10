@@ -5,7 +5,6 @@
 #![feature(new_zeroed_alloc)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
-#![feature(concat_idents)]
 #![feature(const_for)]
 #![feature(const_size_of_val)]
 #![feature(const_trait_impl)]

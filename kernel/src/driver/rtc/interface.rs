@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::driver::base::kobject::KObject;
 
-use super::{RtcTime, global_default_rtc, sysfs::RtcGeneralDevice, utils::kobj2rtc_device};
+use super::{global_default_rtc, sysfs::RtcGeneralDevice, utils::kobj2rtc_device, RtcTime};
 
 /// 根据rtc general device, 读取真实时间
 pub fn rtc_read_time(general_dev: &Arc<RtcGeneralDevice>) -> Result<RtcTime, SystemError> {

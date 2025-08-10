@@ -1,6 +1,6 @@
 use crate::{
     driver::base::{
-        class::{Class, class_manager},
+        class::{class_manager, Class},
         device::sys_dev_char_kset,
         kobject::KObject,
         subsys::SubSysPrivate,

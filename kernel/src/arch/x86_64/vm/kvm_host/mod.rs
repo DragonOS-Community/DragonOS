@@ -2,7 +2,7 @@ use core::{fmt::Debug, sync::atomic::AtomicU32};
 
 use alloc::{boxed::Box, vec::Vec};
 use bit_field::BitField;
-use bitmap::{AllocBitmap, traits::BitMapOps};
+use bitmap::{traits::BitMapOps, AllocBitmap};
 use system_error::SystemError;
 use x86::{
     bits64::rflags::RFlags,
@@ -15,7 +15,7 @@ use crate::{
     smp::cpu::ProcessorId,
     virt::vm::{
         kvm_host::{
-            KVM_IRQFD_RESAMPLE_IRQ_SOURCE_ID, KVM_USERSAPCE_IRQ_SOURCE_ID, Vm, vcpu::VirtCpu,
+            vcpu::VirtCpu, Vm, KVM_IRQFD_RESAMPLE_IRQ_SOURCE_ID, KVM_USERSAPCE_IRQ_SOURCE_ID,
         },
         user_api::UapiKvmSegment,
     },

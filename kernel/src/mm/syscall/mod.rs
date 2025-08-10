@@ -3,7 +3,7 @@ use crate::{
     libs::align::{check_aligned, page_align_up},
 };
 
-use super::{MsFlags, VmFlags, allocator::page_frame::PageFrameCount};
+use super::{allocator::page_frame::PageFrameCount, MsFlags, VmFlags};
 
 mod sys_brk;
 mod sys_madvise;

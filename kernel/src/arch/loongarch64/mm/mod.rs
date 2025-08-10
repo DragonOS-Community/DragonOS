@@ -1,9 +1,9 @@
 pub mod bump;
 
 use crate::mm::{
-    MemoryManagementArch, PhysAddr, VirtAddr, VmFlags,
     allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage},
     page::EntryFlags,
+    MemoryManagementArch, PhysAddr, VirtAddr, VmFlags,
 };
 
 use crate::arch::MMArch;

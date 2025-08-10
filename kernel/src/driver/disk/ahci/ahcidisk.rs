@@ -18,12 +18,12 @@ use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::mbr::MbrDiskPartionTable;
 
 use crate::driver::disk::ahci::hba::{
-    ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT, ATA_DEV_BUSY, ATA_DEV_DRQ, FisRegH2D, FisType,
-    HbaCmdHeader,
+    FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT, ATA_DEV_BUSY,
+    ATA_DEV_DRQ,
 };
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr, verify_area};
+use crate::mm::{verify_area, MemoryManagementArch, PhysAddr, VirtAddr};
 use log::error;
 use system_error::SystemError;
 
@@ -31,7 +31,7 @@ use alloc::sync::Weak;
 use alloc::{sync::Arc, vec::Vec};
 
 use core::fmt::Debug;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, Ordering};
 use core::{mem::size_of, ptr::write_bytes};
 
 /// @brief: 只支持MBR分区格式的磁盘结构体
@@ -202,8 +202,8 @@ impl AhciDisk {
         }
 
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
-        // debug!("To wait ahci read complete.");
-        // 等待操作完成
+                                                     // debug!("To wait ahci read complete.");
+                                                     // 等待操作完成
         loop {
             if (volatile_read!(port.ci) & (1 << slot)) == 0 {
                 break;

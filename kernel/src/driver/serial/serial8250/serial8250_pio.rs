@@ -11,11 +11,11 @@ use alloc::{
 };
 
 use crate::{
-    arch::{CurrentPortIOArch, driver::apic::ioapic::IoApic, io::PortIOArch},
+    arch::{driver::apic::ioapic::IoApic, io::PortIOArch, CurrentPortIOArch},
     driver::{
         base::device::{
-            DeviceId,
             device_number::{DeviceNumber, Major},
+            DeviceId,
         },
         serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
         tty::{
@@ -24,15 +24,15 @@ use crate::{
             termios::WindowSize,
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyOperation},
-            virtual_terminal::{VirtConsole, vc_manager, virtual_console::VirtualConsoleData},
+            virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, VirtConsole},
         },
         video::console::dummycon::dummy_console,
     },
     exception::{
-        IrqNumber,
         irqdata::IrqHandlerData,
         irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
         manage::irq_manager,
+        IrqNumber,
     },
     libs::{rwlock::RwLock, spinlock::SpinLock},
 };

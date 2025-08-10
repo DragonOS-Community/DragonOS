@@ -7,7 +7,7 @@ use super::super::Result;
 use crate::bpf::map::util::round_up;
 use crate::bpf::map::{BpfCallBackFn, BpfMapCommonOps, BpfMapMeta};
 use crate::mm::percpu::{PerCpu, PerCpuVar};
-use crate::smp::cpu::{ProcessorId, smp_cpu_manager};
+use crate::smp::cpu::{smp_cpu_manager, ProcessorId};
 use alloc::{vec, vec::Vec};
 use core::{
     fmt::{Debug, Formatter},

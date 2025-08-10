@@ -2,15 +2,15 @@ use core::ffi::c_int;
 
 use crate::{
     arch::ipc::signal::SigSet,
-    filesystem::epoll::{EPollCtlOption, EPollEvent, EPollEventType, event_poll::EventPoll},
+    filesystem::epoll::{event_poll::EventPoll, EPollCtlOption, EPollEvent, EPollEventType},
     ipc::signal::{
-        RestartBlock, RestartBlockData, RestartFn, restore_saved_sigmask_unless, set_user_sigmask,
+        restore_saved_sigmask_unless, set_user_sigmask, RestartBlock, RestartBlockData, RestartFn,
     },
     mm::VirtAddr,
     process::ProcessManager,
     syscall::{
-        Syscall,
         user_access::{UserBufferReader, UserBufferWriter},
+        Syscall,
     },
     time::{Duration, Instant, PosixTimeSpec},
 };

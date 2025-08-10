@@ -2,9 +2,9 @@ use alloc::sync::Arc;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETFSGID;
-use crate::process::ProcessManager;
 use crate::process::cred::Cred;
 use crate::process::cred::Kgid;
+use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;

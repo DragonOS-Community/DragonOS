@@ -1,8 +1,8 @@
 use core::mem::size_of;
 
 use fdt::{
-    Fdt,
     node::{FdtNode, NodeProperty},
+    Fdt,
 };
 use log::{debug, error, warn};
 use system_error::SystemError;
@@ -10,7 +10,7 @@ use system_error::SystemError;
 use crate::{
     init::boot_params,
     libs::rwlock::RwLock,
-    mm::{PhysAddr, memblock::mem_block_manager, mmio_buddy::MMIOSpaceGuard},
+    mm::{memblock::mem_block_manager, mmio_buddy::MMIOSpaceGuard, PhysAddr},
 };
 
 static OPEN_FIRMWARE_FDT_DRIVER: OpenFirmwareFdtDriver = OpenFirmwareFdtDriver::new();
@@ -215,7 +215,7 @@ impl OpenFirmwareFdtDriver {
         use crate::{
             arch::MMArch,
             libs::align::page_align_down,
-            mm::{MemoryManagementArch, memblock::MemBlockManager},
+            mm::{memblock::MemBlockManager, MemoryManagementArch},
         };
 
         let mut base = base as usize;

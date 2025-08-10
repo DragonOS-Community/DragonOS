@@ -3,7 +3,7 @@ use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
-    FilePrivateData, FileSystem, FileType, IndexNode, Metadata, vcore::generate_inode_id,
+    vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
 use crate::libs::spinlock::SpinLockGuard;
 use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};

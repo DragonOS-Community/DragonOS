@@ -1,5 +1,5 @@
 use crate::{
-    arch::{CurrentSignalArch, interrupt::TrapFrame},
+    arch::{interrupt::TrapFrame, CurrentSignalArch},
     ipc::signal_types::SignalArch,
     process::{ProcessFlags, ProcessManager},
 };

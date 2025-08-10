@@ -8,10 +8,10 @@ use crate::{
     arch::MMArch,
     driver::base::firmware::sys_firmware_kset,
     init::{boot::BootloaderAcpiArg, boot_params},
-    libs::align::{AlignedBox, page_align_down, page_align_up},
+    libs::align::{page_align_down, page_align_up, AlignedBox},
     mm::{
+        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         MemoryManagementArch, PhysAddr, VirtAddr,
-        mmio_buddy::{MMIOSpaceGuard, mmio_pool},
     },
 };
 use system_error::SystemError;

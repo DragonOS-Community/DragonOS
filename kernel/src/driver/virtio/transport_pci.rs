@@ -2,8 +2,8 @@
 
 use crate::driver::base::device::DeviceId;
 use crate::driver::pci::pci::{
-    BusDeviceFunction, PCI_CAP_ID_VNDR, PciDeviceStructure, PciDeviceStructureGeneralDevice,
-    PciError, PciStandardDeviceBar,
+    BusDeviceFunction, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
+    PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
 use crate::driver::pci::root::pci_root_0;
@@ -11,7 +11,7 @@ use crate::driver::pci::root::pci_root_0;
 use crate::exception::IrqNumber;
 
 use crate::libs::volatile::{
-    ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly, volread, volwrite,
+    volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
 use crate::mm::VirtAddr;
 
@@ -19,11 +19,11 @@ use alloc::sync::Arc;
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
-    ptr::{self, NonNull, addr_of_mut},
+    ptr::{self, addr_of_mut, NonNull},
 };
 use virtio_drivers::{
-    Error, Hal, PhysAddr,
     transport::{DeviceStatus, DeviceType, Transport},
+    Error, Hal, PhysAddr,
 };
 
 use super::VIRTIO_VENDOR_ID;

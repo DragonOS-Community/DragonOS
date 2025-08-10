@@ -5,7 +5,7 @@ use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
 use crate::{
-    filesystem::epoll::{EPollEventType, event_poll::EventPoll},
+    filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 

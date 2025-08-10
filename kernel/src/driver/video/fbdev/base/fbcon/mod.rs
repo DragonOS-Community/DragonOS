@@ -11,8 +11,8 @@ use crate::{
         base::{
             class::Class,
             device::{
-                Device, DeviceCommonData, DeviceType, IdTable, bus::Bus, device_manager,
-                driver::Driver,
+                bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceType,
+                IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
@@ -21,7 +21,7 @@ use crate::{
     },
     filesystem::{
         kernfs::KernFSInode,
-        sysfs::{Attribute, AttributeGroup, SysFSOpsSupport, file::sysfs_emit_str},
+        sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
         vfs::syscall::ModeType,
     },
     libs::{
@@ -30,7 +30,7 @@ use crate::{
     },
 };
 
-use super::{FbCursor, ScrollMode, fbmem::sys_class_graphics_instance};
+use super::{fbmem::sys_class_graphics_instance, FbCursor, ScrollMode};
 
 pub mod framebuffer_console;
 

@@ -5,12 +5,13 @@ use system_error::SystemError;
 
 use super::{
     device::{
-        CHARDEVS, DEVMAP, Device, IdTable, device_manager,
+        device_manager,
         device_number::{DeviceNumber, Major},
+        Device, IdTable, CHARDEVS, DEVMAP,
     },
     map::{
-        DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE,
-        DEV_MAJOR_MAX, DeviceStruct, kobj_map, kobj_unmap,
+        kobj_map, kobj_unmap, DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END,
+        DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
     },
 };
 

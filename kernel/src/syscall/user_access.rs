@@ -11,7 +11,7 @@ use defer::defer;
 
 use crate::{
     arch::MMArch,
-    mm::{MemoryManagementArch, VirtAddr, verify_area},
+    mm::{verify_area, MemoryManagementArch, VirtAddr},
 };
 
 use super::SystemError;

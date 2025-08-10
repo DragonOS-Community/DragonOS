@@ -6,8 +6,8 @@ use crate::driver::tty::{
     termios::WindowSize,
     tty_driver::TtyOperation,
     virtual_terminal::{
-        VirtConsole,
         virtual_console::{CursorOperation, ScrollDir, VirtualConsoleData},
+        VirtConsole,
     },
 };
 

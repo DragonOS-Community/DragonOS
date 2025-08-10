@@ -3,7 +3,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMGET,
-    ipc::shm::{IPC_PRIVATE, ShmFlags, ShmKey, shm_manager_lock},
+    ipc::shm::{shm_manager_lock, ShmFlags, ShmKey, IPC_PRIVATE},
     syscall::table::Syscall,
 };
 use log::error;

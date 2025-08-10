@@ -1,7 +1,7 @@
 use core::intrinsics::unlikely;
 
 use alloc::{boxed::Box, collections::LinkedList, sync::Arc};
-use bitmap::{AllocBitmap, traits::BitMapOps};
+use bitmap::{traits::BitMapOps, AllocBitmap};
 use x86::{
     controlregs::Cr4,
     vmx::vmcs::{
@@ -13,11 +13,11 @@ use x86_64::{registers::control::Cr3Flags, structures::paging::PhysFrame};
 
 use crate::{
     arch::{
-        MMArch,
         vm::asm::{IntrInfo, IntrType, VmxAsm},
+        MMArch,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    mm::{MemoryManagementArch, PhysAddr, VirtAddr, percpu::PerCpuVar},
+    mm::{percpu::PerCpuVar, MemoryManagementArch, PhysAddr, VirtAddr},
     smp::cpu::ProcessorId,
 };
 

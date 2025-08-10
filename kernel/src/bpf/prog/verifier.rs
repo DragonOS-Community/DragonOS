@@ -1,7 +1,7 @@
 use super::super::Result;
 use crate::bpf::map::BpfMap;
-use crate::bpf::prog::BpfProg;
 use crate::bpf::prog::util::VerifierLogLevel;
+use crate::bpf::prog::BpfProg;
 use crate::filesystem::vfs::file::FileDescriptorVec;
 use crate::include::bindings::linux_bpf::*;
 use crate::libs::casting::DowncastArc;

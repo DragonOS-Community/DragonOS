@@ -2,9 +2,9 @@ use crate::arch::interrupt::TrapFrame;
 use crate::mm::page::PageFlushAll;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
-    arch::MMArch,
     arch::syscall::nr::SYS_SHMDT,
-    mm::{VirtAddr, ucontext::AddressSpace},
+    arch::MMArch,
+    mm::{ucontext::AddressSpace, VirtAddr},
     syscall::table::Syscall,
 };
 use alloc::vec::Vec;

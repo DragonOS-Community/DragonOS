@@ -1,24 +1,24 @@
-use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
     arch::{
-        MMArch,
         mm::{
-            INNER_ALLOCATOR, KERNEL_BEGIN_PA, KERNEL_BEGIN_VA, KERNEL_END_PA, KERNEL_END_VA,
-            kernel_page_flags,
+            kernel_page_flags, INNER_ALLOCATOR, KERNEL_BEGIN_PA, KERNEL_BEGIN_VA, KERNEL_END_PA,
+            KERNEL_END_VA,
         },
+        MMArch,
     },
     driver::firmware::efi::efi_manager,
     libs::lib_ui::screen_manager::scm_disable_put_to_window,
     mm::{
-        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
         allocator::{buddy::BuddyAllocator, bump::BumpAllocator, page_frame::FrameAllocator},
         kernel_mapper::KernelMapper,
         memblock::mem_block_manager,
         page::PageEntry,
+        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
     },
 };
 

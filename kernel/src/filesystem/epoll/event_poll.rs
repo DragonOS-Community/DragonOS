@@ -5,8 +5,8 @@ use core::{
 
 use crate::{
     filesystem::vfs::{
-        FilePrivateData,
         file::{File, FileMode},
+        FilePrivateData,
     },
     libs::{
         rbtree::RBTree,
@@ -14,10 +14,10 @@ use crate::{
         wait_queue::WaitQueue,
     },
     process::ProcessManager,
-    sched::{SchedMode, schedule},
+    sched::{schedule, SchedMode},
     time::{
+        timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         PosixTimeSpec,
-        timer::{Timer, WakeUpHelper, next_n_us_timer_jiffies},
     },
 };
 
@@ -28,7 +28,7 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use super::{EPollCtlOption, EPollEvent, EPollEventType, EPollItem, fs::EPollInode};
+use super::{fs::EPollInode, EPollCtlOption, EPollEvent, EPollEventType, EPollItem};
 
 /// 内核的Epoll对象结构体，当用户创建一个Epoll时，内核就会创建一个该类型对象
 /// 它对应一个epfd

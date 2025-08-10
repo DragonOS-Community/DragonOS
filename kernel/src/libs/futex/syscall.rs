@@ -1,7 +1,7 @@
 use system_error::SystemError;
 
 use crate::{
-    mm::{VirtAddr, verify_area},
+    mm::{verify_area, VirtAddr},
     syscall::Syscall,
     time::PosixTimeSpec,
 };

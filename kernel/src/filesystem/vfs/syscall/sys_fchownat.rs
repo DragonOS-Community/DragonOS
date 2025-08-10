@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_FCHOWNAT;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{MAX_PATHLEN, fcntl::AtFlags, open::do_fchownat},
+    filesystem::vfs::{fcntl::AtFlags, open::do_fchownat, MAX_PATHLEN},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access,

@@ -1,13 +1,13 @@
 use system_error::SystemError;
 
 use crate::{
-    arch::{CurrentSMPArch, interrupt::ipi::send_ipi},
+    arch::{interrupt::ipi::send_ipi, CurrentSMPArch},
     exception::ipi::{IpiKind, IpiTarget},
 };
 
 use self::{
     core::smp_get_processor_id,
-    cpu::{CpuHpCpuState, ProcessorId, smp_cpu_manager, smp_cpu_manager_init},
+    cpu::{smp_cpu_manager, smp_cpu_manager_init, CpuHpCpuState, ProcessorId},
 };
 
 pub mod core;

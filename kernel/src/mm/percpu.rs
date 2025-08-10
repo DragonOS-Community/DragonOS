@@ -6,7 +6,7 @@ use crate::{
     libs::lazy_init::Lazy,
     smp::{
         core::smp_get_processor_id,
-        cpu::{ProcessorId, smp_cpu_manager},
+        cpu::{smp_cpu_manager, ProcessorId},
     },
 };
 

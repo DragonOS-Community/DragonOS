@@ -6,16 +6,16 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{
-        PhysAddr,
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
-        page::{PageFlags, PageType, page_manager_lock_irqsave},
+        page::{page_manager_lock_irqsave, PageFlags, PageType},
+        PhysAddr,
     },
     process::{ProcessManager, RawPid},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
 use core::fmt;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, Ordering};
 use hashbrown::HashMap;
 use ida::IdAllocator;
 use log::info;

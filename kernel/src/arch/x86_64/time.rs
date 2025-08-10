@@ -1,4 +1,4 @@
-use crate::time::{TimeArch, clocksource::HZ};
+use crate::time::{clocksource::HZ, TimeArch};
 
 use super::driver::tsc::TSCManager;
 

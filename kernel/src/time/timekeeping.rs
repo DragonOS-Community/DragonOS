@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use core::intrinsics::{likely, unlikely};
-use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use log::{debug, info, warn};
 use system_error::SystemError;
 
@@ -9,17 +9,17 @@ use crate::{
     exception::InterruptArch,
     libs::rwlock::RwLock,
     time::{
-        PosixTimeSpec,
         jiffies::{clocksource_default_clock, jiffies_init},
         timekeep::ktime_get_real_ns,
+        PosixTimeSpec,
     },
 };
 
 use super::timekeep::{ktime_t, timespec_to_ktime};
 use super::{
-    NSEC_PER_SEC,
-    clocksource::{Clocksource, CycleNum, HZ, clocksource_cyc2ns},
+    clocksource::{clocksource_cyc2ns, Clocksource, CycleNum, HZ},
     syscall::PosixTimeval,
+    NSEC_PER_SEC,
 };
 /// NTP周期频率
 pub const NTP_INTERVAL_FREQ: u64 = HZ;

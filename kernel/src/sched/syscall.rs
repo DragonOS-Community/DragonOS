@@ -8,7 +8,7 @@ use crate::sched::Scheduler;
 use crate::syscall::Syscall;
 
 use super::fair::CompletelyFairScheduler;
-use super::{SchedMode, cpu_rq, schedule};
+use super::{cpu_rq, schedule, SchedMode};
 
 impl Syscall {
     pub fn do_sched_yield() -> Result<usize, SystemError> {

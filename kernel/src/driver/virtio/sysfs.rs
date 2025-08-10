@@ -12,20 +12,20 @@ use crate::{
     driver::{
         base::{
             device::{
-                Device,
-                bus::{Bus, bus_manager},
+                bus::{bus_manager, Bus},
                 device_manager,
-                driver::{Driver, driver_manager},
+                driver::{driver_manager, Driver},
+                Device,
             },
             kobject::KObject,
             subsys::SubSysPrivate,
         },
-        virtio::irq::{DefaultVirtioIrqHandler, virtio_irq_manager},
+        virtio::irq::{virtio_irq_manager, DefaultVirtioIrqHandler},
     },
     exception::{irqdesc::IrqHandleFlags, manage::irq_manager},
     filesystem::{
         sysfs::{
-            Attribute, AttributeGroup, SYSFS_ATTR_MODE_RO, SysFSOpsSupport, file::sysfs_emit_str,
+            file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
         },
         vfs::syscall::ModeType,
     },
@@ -33,7 +33,7 @@ use crate::{
     libs::spinlock::SpinLock,
 };
 
-use super::{VIRTIO_DEV_ANY_ID, VirtIODevice, VirtIODeviceIndex, VirtIODriver};
+use super::{VirtIODevice, VirtIODeviceIndex, VirtIODriver, VIRTIO_DEV_ANY_ID};
 
 static mut VIRTIO_BUS: Option<Arc<VirtIOBus>> = None;
 

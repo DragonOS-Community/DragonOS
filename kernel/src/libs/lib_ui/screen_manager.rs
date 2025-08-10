@@ -13,7 +13,7 @@ use crate::{
         video::{has_video_refresh_manager, video_refresh_manager},
     },
     libs::{lib_ui::textui::textui_is_enable_put_to_window, rwlock::RwLock, spinlock::SpinLock},
-    mm::{VirtAddr, mmio_buddy::MMIOSpaceGuard},
+    mm::{mmio_buddy::MMIOSpaceGuard, VirtAddr},
 };
 
 use super::{

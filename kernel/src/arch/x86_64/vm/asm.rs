@@ -6,16 +6,16 @@ use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
     bits64::vmx::vmxon,
-    controlregs::{Cr0, Cr4, cr0, cr0_write, cr4, cr4_write},
+    controlregs::{cr0, cr0_write, cr4, cr4_write, Cr0, Cr4},
     msr::{
-        IA32_FEATURE_CONTROL, IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1, IA32_VMX_CR4_FIXED0,
-        IA32_VMX_CR4_FIXED1, rdmsr, wrmsr,
+        rdmsr, wrmsr, IA32_FEATURE_CONTROL, IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1,
+        IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1,
     },
     vmx::vmcs::ro,
 };
 
 use crate::{
-    arch::{MMArch, mm::barrier},
+    arch::{mm::barrier, MMArch},
     mm::{MemoryManagementArch, PhysAddr},
 };
 

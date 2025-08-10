@@ -3,10 +3,10 @@ use crate::arch::vm::asm::VmxAsm;
 use crate::arch::vm::kvm_host::page::KVM_MIN_FREE_MMU_PAGES;
 use crate::mm::PhysAddr;
 use crate::{
-    arch::{MMArch, VirtCpuArch, mm::LockedFrameAllocator},
+    arch::{mm::LockedFrameAllocator, MMArch, VirtCpuArch},
     libs::spinlock::{SpinLock, SpinLockGuard},
-    mm::{MemoryManagementArch, PageTableKind, page::PageMapper},
-    virt::vm::kvm_host::{Vm, vcpu::VirtCpu},
+    mm::{page::PageMapper, MemoryManagementArch, PageTableKind},
+    virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
 };
 use alloc::{sync::Arc, vec::Vec};
 use bitfield_struct::bitfield;

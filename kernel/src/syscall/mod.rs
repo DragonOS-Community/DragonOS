@@ -9,7 +9,7 @@ use crate::{
     mm::page::PAGE_4K_SIZE,
     net::syscall::MsgHdr,
     process::{ProcessFlags, ProcessManager},
-    sched::{SchedMode, schedule},
+    sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
 
@@ -19,11 +19,11 @@ use table::{syscall_table, syscall_table_init};
 
 use crate::{
     arch::interrupt::TrapFrame,
-    mm::{VirtAddr, verify_area},
+    mm::{verify_area, VirtAddr},
     net::syscall::SockAddr,
     time::{
-        PosixTimeSpec,
         syscall::{PosixTimeZone, PosixTimeval},
+        PosixTimeSpec,
     },
 };
 

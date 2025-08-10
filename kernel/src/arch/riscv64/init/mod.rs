@@ -5,12 +5,12 @@ use system_error::SystemError;
 use crate::{
     arch::{
         driver::sbi::SbiDriver,
-        init::boot::{BootProtocol, early_boot_init},
+        init::boot::{early_boot_init, BootProtocol},
         mm::init::mm_early_init,
     },
     driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init::start_kernel},
-    mm::{PhysAddr, VirtAddr, memblock::mem_block_manager},
+    mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
     print, println,
     smp::cpu::ProcessorId,
 };

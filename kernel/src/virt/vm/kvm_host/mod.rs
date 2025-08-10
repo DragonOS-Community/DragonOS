@@ -15,8 +15,8 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        CurrentKvmManager, KvmArch, VirtCpuArch,
         vm::{kvm_host::vcpu::VirtCpuRequest, vmx::KvmVmx, x86_kvm_manager},
+        CurrentKvmManager, KvmArch, VirtCpuArch,
     },
     filesystem::vfs::file::{File, FileMode},
     libs::spinlock::{SpinLock, SpinLockGuard},

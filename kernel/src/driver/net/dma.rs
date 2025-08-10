@@ -5,10 +5,10 @@ use crate::arch::MMArch;
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::EntryFlags;
 use crate::mm::{
-    MemoryManagementArch, PhysAddr, VirtAddr,
     allocator::page_frame::{
-        PageFrameCount, PhysPageFrame, allocate_page_frames, deallocate_page_frames,
+        allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
     },
+    MemoryManagementArch, PhysAddr, VirtAddr,
 };
 use core::ptr::NonNull;
 const PAGE_SIZE: usize = 4096;

@@ -1,9 +1,9 @@
 use crate::{
     arch::{asm::csr::CSR_SSTATUS, interrupt::TrapFrame},
     process::{
-        ProcessManager, RawPid,
         fork::CloneFlags,
-        kthread::{KernelThreadCreateInfo, KernelThreadMechanism, kernel_thread_bootstrap_stage2},
+        kthread::{kernel_thread_bootstrap_stage2, KernelThreadCreateInfo, KernelThreadMechanism},
+        ProcessManager, RawPid,
     },
 };
 use alloc::sync::Arc;

@@ -13,12 +13,12 @@ use crate::{
     arch::{
         asm::bitops::ffz,
         interrupt::TrapFrame,
-        ipc::signal::{MAX_SIG_NUM, SigCode, SigFlags, SigSet, Signal},
+        ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
     process::{
-        RawPid,
         pid::{Pid, PidType},
+        RawPid,
     },
     syscall::user_access::UserBufferWriter,
 };
@@ -550,7 +550,7 @@ impl SigQueue {
             return false;
         };
         // 从sigqueue中过滤出结果
-        let mut filter_result: Vec<SigInfo> = self.q.extract_if(filter).collect();
+        let mut filter_result: Vec<SigInfo> = self.q.extract_if(.., filter).collect();
         // 筛选出的结果不能大于1个
         assert!(filter_result.len() <= 1);
 

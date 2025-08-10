@@ -26,12 +26,12 @@ use crate::{
 };
 
 use super::{
-    IrqNumber,
     irqdata::{IrqData, IrqHandlerData, IrqLineStatus},
     irqdesc::{InnerIrqDesc, IrqAction, IrqDesc, IrqFlowHandler, IrqHandler, IrqReturn},
     irqdomain::IrqDomain,
     manage::IrqManager,
     msi::MsiMsg,
+    IrqNumber,
 };
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#506

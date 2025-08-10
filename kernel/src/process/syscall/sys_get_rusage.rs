@@ -1,7 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETRUSAGE;
 use crate::process::resource::RUsageWho;
-use crate::process::{ProcessManager, resource::RUsage};
+use crate::process::{resource::RUsage, ProcessManager};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::UserBufferWriter;

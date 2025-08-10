@@ -4,9 +4,9 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::{SYS_GETDENTS, SYS_GETDENTS64};
-use crate::filesystem::vfs::FilldirContext;
 use crate::filesystem::vfs::file::FileDescriptorVec;
-use crate::mm::{VirtAddr, verify_area};
+use crate::filesystem::vfs::FilldirContext;
+use crate::mm::{verify_area, VirtAddr};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;

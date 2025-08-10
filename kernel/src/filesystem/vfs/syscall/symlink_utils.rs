@@ -2,9 +2,9 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        FilePrivateData, FileType, VFS_MAX_FOLLOW_SYMLINK_TIMES,
         fcntl::AtFlags,
         utils::{rsplit_path, user_path_at},
+        FilePrivateData, FileType, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::spinlock::SpinLock,
     process::ProcessManager,

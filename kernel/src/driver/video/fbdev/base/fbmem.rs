@@ -12,26 +12,25 @@ use unified_init::macros::unified_init;
 
 use crate::{
     driver::base::{
-        class::{Class, class_manager},
+        class::{class_manager, Class},
         device::{
-            Device, DeviceCommonData, DeviceType, IdTable,
             bus::Bus,
             device_manager,
             device_number::{DeviceNumber, Major},
             driver::Driver,
-            sys_dev_char_kset,
+            sys_dev_char_kset, Device, DeviceCommonData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
         subsys::SubSysPrivate,
     },
     filesystem::{
-        devfs::{DevFS, DeviceINode, LockedDevFSInode, devfs_register},
+        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         sysfs::AttributeGroup,
         vfs::{
-            FilePrivateData, FileSystem, FileType, IndexNode, Metadata, file::FileMode,
-            syscall::ModeType,
+            file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
+            Metadata,
         },
     },
     init::initcall::INITCALL_SUBSYS,
@@ -41,7 +40,7 @@ use crate::{
     },
 };
 
-use super::{FbId, FrameBuffer, fbcon::fb_console_init, fbsysfs::FbDeviceAttrGroup};
+use super::{fbcon::fb_console_init, fbsysfs::FbDeviceAttrGroup, FbId, FrameBuffer};
 
 /// `/sys/class/graphics` 的 class 实例
 static mut CLASS_GRAPHICS_INSTANCE: Option<Arc<GraphicsClass>> = None;

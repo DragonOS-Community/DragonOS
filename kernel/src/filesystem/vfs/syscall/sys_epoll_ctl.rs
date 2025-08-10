@@ -2,9 +2,9 @@
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EPOLL_CTL;
+use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::EPollCtlOption;
 use crate::filesystem::epoll::EPollEvent;
-use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::mm::VirtAddr;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;

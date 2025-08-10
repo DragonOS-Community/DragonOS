@@ -12,7 +12,7 @@ use crate::{
     driver::{
         acpi::acpi_manager,
         base::{
-            device::{Device, bus::Bus, driver::Driver},
+            device::{bus::Bus, driver::Driver, Device},
             kobject::KObject,
             subsys::SubSysPrivate,
         },

@@ -9,7 +9,7 @@ use system_error::SystemError;
 use crate::{
     driver::base::kobject::KObject,
     filesystem::{
-        kernfs::{KernFSInode, callback::KernInodePrivateData},
+        kernfs::{callback::KernInodePrivateData, KernFSInode},
         vfs::syscall::ModeType,
     },
 };

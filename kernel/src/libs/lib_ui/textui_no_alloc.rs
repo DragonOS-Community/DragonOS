@@ -10,7 +10,7 @@ use crate::driver::{
 };
 
 use super::textui::{
-    FontColor, LineId, LineIndex, TEXTUI_CHAR_HEIGHT, TEXTUI_CHAR_WIDTH, TextuiCharChromatic,
+    FontColor, LineId, LineIndex, TextuiCharChromatic, TEXTUI_CHAR_HEIGHT, TEXTUI_CHAR_WIDTH,
 };
 
 pub static TRUE_LINE_NUM: AtomicI32 = AtomicI32::new(0);

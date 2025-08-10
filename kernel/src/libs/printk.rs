@@ -1,9 +1,9 @@
 use core::fmt::{self, Write};
 
 use alloc::string::ToString;
-use log::{Level, Log, info};
+use log::{info, Level, Log};
 
-use super::lib_ui::textui::{FontColor, textui_putstr};
+use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
     driver::tty::{tty_driver::TtyOperation, virtual_terminal::vc_manager},

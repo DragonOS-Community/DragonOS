@@ -10,13 +10,13 @@ use crate::{
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
-        ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid, pid::PidType,
+        pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
     time::Instant,
 };
 
 use super::signal_types::{
-    SIG_KERNEL_STOP_MASK, SaHandlerType, SigInfo, SigType, Sigaction, SignalStruct,
+    SaHandlerType, SigInfo, SigType, Sigaction, SignalStruct, SIG_KERNEL_STOP_MASK,
 };
 
 impl Signal {

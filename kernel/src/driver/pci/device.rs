@@ -7,7 +7,7 @@ use system_error::SystemError;
 use crate::{
     driver::base::{
         device::{
-            Device, DeviceCommonData, DeviceType, IdTable, bus::Bus, device_manager, driver::Driver,
+            bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,

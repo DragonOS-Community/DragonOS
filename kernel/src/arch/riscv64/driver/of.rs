@@ -4,7 +4,7 @@ use crate::{
     driver::open_firmware::fdt::OpenFirmwareFdtDriver,
     init::boot_params,
     libs::align::page_align_up,
-    mm::{MemoryManagementArch, PhysAddr, mmio_buddy::mmio_pool},
+    mm::{mmio_buddy::mmio_pool, MemoryManagementArch, PhysAddr},
 };
 
 impl OpenFirmwareFdtDriver {

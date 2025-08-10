@@ -1,6 +1,6 @@
 extern crate klog_types;
 
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use klog_types::{AllocatorLog, AllocatorLogType, LogSource, MMLogChannel};
 

@@ -24,7 +24,7 @@ use crate::{
         casting::DowncastArc,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{VmFaultReason, fault::PageFaultMessage},
+    mm::{fault::PageFaultMessage, VmFaultReason},
     process::ProcessManager,
     time::PosixTimeSpec,
 };

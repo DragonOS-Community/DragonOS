@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use crate::driver::base::device::{
     bus::Bus,
-    driver::{Driver, driver_manager},
+    driver::{driver_manager, Driver},
 };
 
 use system_error::SystemError;

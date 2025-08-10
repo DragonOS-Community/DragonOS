@@ -2,7 +2,7 @@ use core::hint::spin_loop;
 
 use crate::{exception::InterruptArch, sched::SchedArch, smp::core::smp_get_processor_id};
 
-use super::{CurrentIrqArch, driver::apic::apic_timer::apic_timer_init};
+use super::{driver::apic::apic_timer::apic_timer_init, CurrentIrqArch};
 
 static mut BSP_INIT_OK: bool = false;
 

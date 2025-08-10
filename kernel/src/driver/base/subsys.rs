@@ -18,9 +18,9 @@ use system_error::SystemError;
 use super::{
     class::Class,
     device::{
-        Device,
         bus::{Bus, BusNotifyEvent},
         driver::Driver,
+        Device,
     },
     kobject::KObject,
     kset::KSet,

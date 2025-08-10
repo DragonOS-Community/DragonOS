@@ -10,16 +10,16 @@ use log::warn;
 use crate::{
     driver::{
         serial::serial8250::send_to_default_serial8250_port,
-        tty::{ConsoleFont, KDMode, console::ConsoleSwitch},
+        tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
     },
     libs::{font::FontDesc, rwlock::RwLock},
     process::RawPid,
 };
 
 use super::{
-    COLOR_TABLE, Color, DEFAULT_BLUE, DEFAULT_GREEN, DEFAULT_RED, DrawRegion, VtMode, VtModeData,
     console_map::{TranslationMap, TranslationMapType},
-    vc_manager,
+    vc_manager, Color, DrawRegion, VtMode, VtModeData, COLOR_TABLE, DEFAULT_BLUE, DEFAULT_GREEN,
+    DEFAULT_RED,
 };
 
 pub(super) const NPAR: usize = 16;

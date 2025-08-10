@@ -1,6 +1,6 @@
 use crate::{syscall::user_access::check_and_clone_cstr, time::PosixTimeSpec};
 
-use super::{SuperBlock, fcntl::AtFlags, file::FileMode};
+use super::{fcntl::AtFlags, file::FileMode, SuperBlock};
 mod dup2;
 mod faccessat2;
 mod link_utils;

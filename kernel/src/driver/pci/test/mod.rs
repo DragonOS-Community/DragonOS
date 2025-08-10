@@ -6,7 +6,7 @@ use self::{pt_device::TestDevice, pt_driver::TestDriver};
 use super::{
     dev_id::PciDeviceID,
     device::pci_device_manager,
-    driver::{PciDriver, pci_driver_manager},
+    driver::{pci_driver_manager, PciDriver},
 };
 
 pub mod pt_device;

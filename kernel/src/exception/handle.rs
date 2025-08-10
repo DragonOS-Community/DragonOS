@@ -5,7 +5,7 @@ use log::{debug, error, warn};
 use system_error::SystemError;
 
 use crate::{
-    arch::{CurrentIrqArch, interrupt::TrapFrame},
+    arch::{interrupt::TrapFrame, CurrentIrqArch},
     exception::{irqchip::IrqChipFlags, irqdesc::InnerIrqDesc},
     libs::{once::Once, spinlock::SpinLockGuard},
     process::{ProcessFlags, ProcessManager},
@@ -13,13 +13,13 @@ use crate::{
 };
 
 use super::{
-    InterruptArch, IrqNumber,
     irqchip::IrqChip,
     irqdata::{IrqData, IrqHandlerData, IrqStatus},
     irqdesc::{
         InnerIrqAction, IrqDesc, IrqDescState, IrqFlowHandler, IrqReturn, ThreadedHandlerFlags,
     },
-    manage::{IrqManager, irq_manager},
+    manage::{irq_manager, IrqManager},
+    InterruptArch, IrqNumber,
 };
 
 /// 获取用于处理错误的中断的处理程序

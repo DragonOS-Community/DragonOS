@@ -3,9 +3,9 @@ use system_error::SystemError;
 use alloc::sync::Arc;
 
 use crate::process::{
-    RawPid,
     fork::CloneFlags,
     kthread::{KernelThreadCreateInfo, KernelThreadMechanism},
+    RawPid,
 };
 
 impl KernelThreadMechanism {

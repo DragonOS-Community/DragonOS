@@ -6,11 +6,11 @@ use alloc::{
 
 use crate::{
     arch::{
-        VirtCpuArch, VirtCpuStat,
         vm::{
-            kvm_host::{KvmReg, vcpu::VirtCpuRequest},
+            kvm_host::{vcpu::VirtCpuRequest, KvmReg},
             vmx::VmxVCpuPriv,
         },
+        VirtCpuArch, VirtCpuStat,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     process::RawPid,
@@ -19,8 +19,8 @@ use crate::{
 };
 
 use super::{
-    LockedVm,
     mem::{GfnToHvaCache, KvmMemSlot},
+    LockedVm,
 };
 
 #[derive(Debug)]

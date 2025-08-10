@@ -11,13 +11,13 @@ use crate::{
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::{
-        epoll::{EPollItem, event_poll::EPollPrivateData},
+        epoll::{event_poll::EPollPrivateData, EPollItem},
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
     ipc::pipe::PipeFsPrivateData,
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    process::{ProcessManager, cred::Cred},
+    process::{cred::Cred, ProcessManager},
 };
 
 /// 文件私有信息的枚举类型

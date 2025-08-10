@@ -14,22 +14,22 @@ use crate::{
         base::{
             class::Class,
             device::{
-                Device, DeviceCommonData, DeviceState, DeviceType, IdTable, bus::Bus,
-                device_manager, driver::Driver,
+                bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceState,
+                DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
             platform::{
-                platform_device::{PlatformDevice, platform_device_manager},
-                platform_driver::{PlatformDriver, platform_driver_manager},
+                platform_device::{platform_device_manager, PlatformDevice},
+                platform_driver::{platform_driver_manager, PlatformDriver},
             },
         },
         serial::serial8250::send_to_default_serial8250_port,
-        video::fbdev::base::{FRAME_BUFFER_SET, FbVisual, fbmem::frame_buffer_manager},
+        video::fbdev::base::{fbmem::frame_buffer_manager, FbVisual, FRAME_BUFFER_SET},
     },
     filesystem::{
         kernfs::KernFSInode,
-        sysfs::{Attribute, AttributeGroup, SysFSOpsSupport, file::sysfs_emit_str},
+        sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
         vfs::syscall::ModeType,
     },
     init::{boot::boot_callbacks, boot_params, initcall::INITCALL_DEVICE},
@@ -38,13 +38,13 @@ use crate::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{PhysAddr, VirtAddr, early_ioremap::EarlyIoRemap},
+    mm::{early_ioremap::EarlyIoRemap, PhysAddr, VirtAddr},
 };
 
 use super::base::{
-    BlankMode, BootTimeVideoType, FbAccel, FbActivateFlags, FbId, FbState, FbType, FbVModeFlags,
-    FbVarScreenInfo, FbVideoMode, FixedScreenInfo, FrameBuffer, FrameBufferInfo,
-    FrameBufferInfoData, FrameBufferOps, fbmem::FbDevice,
+    fbmem::FbDevice, BlankMode, BootTimeVideoType, FbAccel, FbActivateFlags, FbId, FbState, FbType,
+    FbVModeFlags, FbVarScreenInfo, FbVideoMode, FixedScreenInfo, FrameBuffer, FrameBufferInfo,
+    FrameBufferInfoData, FrameBufferOps,
 };
 
 /// 当前机器上面是否有vesa帧缓冲区

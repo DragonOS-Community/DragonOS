@@ -19,11 +19,11 @@ use crate::{
 };
 
 use super::{
-    HardwareIrqNumber, IrqNumber,
     dummychip::no_irq_chip,
     irqchip::{IrqChip, IrqChipData, IrqChipGeneric, IrqGcFlags},
     irqdata::{IrqData, IrqHandlerData},
     irqdesc::{IrqDesc, IrqFlowHandler},
+    HardwareIrqNumber, IrqNumber,
 };
 
 static mut IRQ_DOMAIN_MANAGER: Option<Arc<IrqDomainManager>> = None;

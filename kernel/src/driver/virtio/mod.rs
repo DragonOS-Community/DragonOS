@@ -1,9 +1,9 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::exception::{IrqNumber, irqdesc::IrqReturn};
+use crate::exception::{irqdesc::IrqReturn, IrqNumber};
 
-use super::base::device::{Device, DeviceId, driver::Driver};
+use super::base::device::{driver::Driver, Device, DeviceId};
 
 pub(super) mod irq;
 pub mod mmio;

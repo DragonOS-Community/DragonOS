@@ -8,25 +8,25 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        MMArch,
         vm::{
             asm::VmxAsm,
             kvm_host::{EmulType, KVM_PFN_NOSLOT},
             mmu::kvm_mmu::{PFRet, PageLevel},
             mtrr::kvm_mtrr_check_gfn_range_consistency,
-            vmx::{PageFaultErr, ept::EptPageMapper},
+            vmx::{ept::EptPageMapper, PageFaultErr},
         },
+        MMArch,
     },
     mm::PhysAddr,
     virt::vm::kvm_host::{
-        Vm,
-        mem::{__gfn_to_pfn_memslot, LockedKvmMemSlot, LockedVmMemSlotSet, UserMemRegionFlag},
+        mem::{LockedKvmMemSlot, LockedVmMemSlotSet, UserMemRegionFlag, __gfn_to_pfn_memslot},
         search_memslots,
         vcpu::VirtCpu,
+        Vm,
     },
 };
 
-use super::kvm_mmu::{KvmMmuPageRole, gfn_round_for_level, is_tdp_mmu_enabled};
+use super::kvm_mmu::{gfn_round_for_level, is_tdp_mmu_enabled, KvmMmuPageRole};
 
 #[allow(dead_code)]
 #[derive(Debug, Default)]

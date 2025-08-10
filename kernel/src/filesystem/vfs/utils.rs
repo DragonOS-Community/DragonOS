@@ -7,7 +7,7 @@ use system_error::SystemError;
 
 use crate::process::{ProcessControlBlock, ProcessManager};
 
-use super::{FileType, IndexNode, fcntl::AtFlags};
+use super::{fcntl::AtFlags, FileType, IndexNode};
 
 /// @brief 切分路径字符串，返回最左侧那一级的目录名和剩余的部分。
 ///

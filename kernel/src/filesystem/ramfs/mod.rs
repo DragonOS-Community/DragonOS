@@ -1,12 +1,12 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
-use crate::filesystem::vfs::{FSMAKER, FileSystemMakerData};
+use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
 use crate::register_mountable_fs;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{FileType, vcore::generate_inode_id},
+    filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -23,8 +23,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    FileSystem, FileSystemMaker, FsInfo, IndexNode, InodeId, Metadata, SpecialNodeData,
-    file::FilePrivateData, syscall::ModeType, utils::DName,
+    file::FilePrivateData, syscall::ModeType, utils::DName, FileSystem, FileSystemMaker, FsInfo,
+    IndexNode, InodeId, Metadata, SpecialNodeData,
 };
 
 use linkme::distributed_slice;

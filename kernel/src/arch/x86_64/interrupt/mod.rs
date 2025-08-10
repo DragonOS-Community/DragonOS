@@ -7,7 +7,7 @@ pub mod trap;
 use core::any::Any;
 use core::{
     arch::asm,
-    sync::atomic::{Ordering, compiler_fence},
+    sync::atomic::{compiler_fence, Ordering},
 };
 use kprobe::ProbeArgs;
 use log::error;
@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     asm::irqflags::{local_irq_restore, local_irq_save},
-    driver::apic::{CurrentApic, LocalAPIC, lapic_vector::arch_early_irq_init},
+    driver::apic::{lapic_vector::arch_early_irq_init, CurrentApic, LocalAPIC},
 };
 
 /// @brief 关闭中断

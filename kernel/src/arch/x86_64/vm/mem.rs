@@ -3,8 +3,8 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::virt::vm::kvm_host::{
-    Vm,
     mem::{KvmMemoryChangeMode, LockedKvmMemSlot},
+    Vm,
 };
 
 #[allow(dead_code)]

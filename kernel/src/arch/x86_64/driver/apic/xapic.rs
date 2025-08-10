@@ -8,14 +8,14 @@ use log::{debug, error, info};
 
 use crate::{
     mm::{
-        PhysAddr, VirtAddr,
-        mmio_buddy::{MMIOSpaceGuard, mmio_pool},
+        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         percpu::PerCpu,
+        PhysAddr, VirtAddr,
     },
     smp::core::smp_get_processor_id,
 };
 
-use super::{LVT, LVTRegister, LocalAPIC, hw_irq::ApicId};
+use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
 
 /// per-cpu的xAPIC的MMIO空间起始地址
 static mut XAPIC_INSTANCES: [RefCell<Option<XApic>>; PerCpu::MAX_CPU_NUM as usize] =

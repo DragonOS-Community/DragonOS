@@ -6,9 +6,9 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    mm::{IDLE_PROCESS_ADDRESS_SPACE, VirtAddr, percpu::PerCpu},
+    mm::{percpu::PerCpu, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
-    sched::{OnRq, cpu_rq},
+    sched::{cpu_rq, OnRq},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 

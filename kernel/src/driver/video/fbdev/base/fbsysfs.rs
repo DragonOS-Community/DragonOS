@@ -5,7 +5,7 @@ use system_error::SystemError;
 use crate::{
     driver::base::kobject::KObject,
     filesystem::{
-        sysfs::{Attribute, AttributeGroup, SysFSOpsSupport, file::sysfs_emit_str},
+        sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
         vfs::syscall::ModeType,
     },
 };

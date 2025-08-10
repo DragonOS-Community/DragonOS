@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::{exception::InterruptArch, process::ProcessManager, syscall::Syscall};
 
-use super::{CurrentIrqArch, interrupt::TrapFrame};
+use super::{interrupt::TrapFrame, CurrentIrqArch};
 
 /// 系统调用初始化
 pub fn arch_syscall_init() -> Result<(), SystemError> {

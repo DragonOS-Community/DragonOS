@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     libs::rwlock::RwLock,
-    time::{Instant, NSEC_PER_SEC, PosixTimeSpec},
+    time::{Instant, PosixTimeSpec, NSEC_PER_SEC},
 };
 
 use self::sysfs::RtcGeneralDevice;

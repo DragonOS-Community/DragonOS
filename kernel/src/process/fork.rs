@@ -18,9 +18,10 @@ use crate::{
 };
 
 use super::{
-    KernelStack, ProcessControlBlock, ProcessManager, RawPid, alloc_pid,
+    alloc_pid,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     pid::{Pid, PidType},
+    KernelStack, ProcessControlBlock, ProcessManager, RawPid,
 };
 const MAX_PID_NS_LEVEL: usize = 32;
 

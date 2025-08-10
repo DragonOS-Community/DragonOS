@@ -2,8 +2,8 @@ use crate::{
     filesystem::{
         page_cache::PageCache,
         vfs::{
-            self, FilePrivateData, IndexNode, InodeId, syscall::ModeType, utils::DName,
-            vcore::generate_inode_id,
+            self, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
+            IndexNode, InodeId,
         },
     },
     libs::spinlock::{SpinLock, SpinLockGuard},

@@ -1,12 +1,12 @@
 use crate::arch::io::PortIOArch;
 use crate::arch::{CurrentPortIOArch, TraitPciArch};
 use crate::driver::acpi::acpi_manager;
-use crate::driver::pci::ecam::{EcamRootInfo, pci_ecam_root_info_manager};
+use crate::driver::pci::ecam::{pci_ecam_root_info_manager, EcamRootInfo};
 use crate::driver::pci::pci::{
-    BusDeviceFunction, PORT_PCI_CONFIG_ADDRESS, PORT_PCI_CONFIG_DATA, PciAddr, PciCam, PciError,
-    pci_init,
+    pci_init, BusDeviceFunction, PciAddr, PciCam, PciError, PORT_PCI_CONFIG_ADDRESS,
+    PORT_PCI_CONFIG_DATA,
 };
-use crate::driver::pci::root::{PciRoot, pci_root_manager};
+use crate::driver::pci::root::{pci_root_manager, PciRoot};
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::mm::PhysAddr;
 

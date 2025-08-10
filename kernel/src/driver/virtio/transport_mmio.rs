@@ -5,8 +5,8 @@ use fdt::node::FdtNode;
 use log::info;
 use system_error::SystemError;
 use virtio_drivers::transport::{
-    Transport,
     mmio::{MmioTransport, VirtIOHeader},
+    Transport,
 };
 
 use crate::{
@@ -15,8 +15,8 @@ use crate::{
     exception::HardwareIrqNumber,
     libs::align::page_align_up,
     mm::{
+        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         MemoryManagementArch, PhysAddr,
-        mmio_buddy::{MMIOSpaceGuard, mmio_pool},
     },
 };
 

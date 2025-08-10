@@ -4,9 +4,9 @@ use system_error::SystemError;
 use crate::arch::CurrentIrqArch;
 
 use super::{
-    InterruptArch,
     irqchip::{IrqChip, IrqChipFlags},
     irqdata::IrqData,
+    InterruptArch,
 };
 
 static mut NO_IRQ_CHIP: Option<Arc<NoIrqChip>> = None;

@@ -2,11 +2,11 @@ use alloc::sync::Arc;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETPGID;
+use crate::process::pid::PidType;
 use crate::process::Pgid;
 use crate::process::ProcessFlags;
 use crate::process::ProcessManager;
 use crate::process::RawPid;
-use crate::process::pid::PidType;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;

@@ -7,9 +7,9 @@ use system_error::SystemError;
 use crate::{
     driver::base::kobject::KObject,
     filesystem::{
-        kernfs::{KernFSInode, callback::KernInodePrivateData},
-        sysfs::{SysFSKernPrivateData, dir::SysKernDirPriv, sysfs_instance},
-        vfs::{IndexNode, syscall::ModeType},
+        kernfs::{callback::KernInodePrivateData, KernFSInode},
+        sysfs::{dir::SysKernDirPriv, sysfs_instance, SysFSKernPrivateData},
+        vfs::{syscall::ModeType, IndexNode},
     },
     libs::casting::DowncastArc,
 };

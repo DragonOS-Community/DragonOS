@@ -2,7 +2,7 @@ use core::{
     arch::asm,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{Ordering, compiler_fence},
+    sync::atomic::{compiler_fence, Ordering},
 };
 
 use alloc::sync::{Arc, Weak};
@@ -18,8 +18,8 @@ use crate::{
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
-        KernelStack, PROCESS_SWITCH_RESULT, ProcessControlBlock, ProcessFlags, ProcessManager,
         fork::{CloneFlags, KernelCloneArgs},
+        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, PROCESS_SWITCH_RESULT,
     },
     syscall::Syscall,
 };
@@ -27,10 +27,10 @@ use crate::{
 use self::{
     kthread::kernel_thread_bootstrap_stage1,
     syscall::ARCH_SET_FS,
-    table::{KERNEL_DS, USER_DS, switch_fs_and_gs},
+    table::{switch_fs_and_gs, KERNEL_DS, USER_DS},
 };
 
-use super::{CurrentIrqArch, fpu::FpState, interrupt::TrapFrame, syscall::X86_64GSData};
+use super::{fpu::FpState, interrupt::TrapFrame, syscall::X86_64GSData, CurrentIrqArch};
 
 pub mod idle;
 pub mod kthread;

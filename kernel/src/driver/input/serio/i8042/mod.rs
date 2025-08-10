@@ -5,10 +5,10 @@ use unified_init::macros::unified_init;
 
 use crate::{
     driver::base::{
-        device::{Device, device_manager},
+        device::{device_manager, Device},
         platform::{
-            platform_device::{PlatformDevice, platform_device_manager},
-            platform_driver::{PlatformDriver, platform_driver_manager},
+            platform_device::{platform_device_manager, PlatformDevice},
+            platform_driver::{platform_driver_manager, PlatformDriver},
         },
     },
     init::initcall::INITCALL_DEVICE,
@@ -18,7 +18,7 @@ use self::{
     i8042_device::I8042PlatformDevice, i8042_driver::I8042Driver, i8042_ports::I8042AuxPort,
 };
 
-use super::serio_device::{SerioDevice, serio_device_manager};
+use super::serio_device::{serio_device_manager, SerioDevice};
 
 pub mod i8042_device;
 pub mod i8042_driver;

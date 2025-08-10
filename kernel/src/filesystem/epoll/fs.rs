@@ -1,7 +1,7 @@
 use alloc::string::String;
 
 use crate::{
-    filesystem::vfs::{FilePrivateData, IndexNode, Metadata, file::FileMode},
+    filesystem::vfs::{file::FileMode, FilePrivateData, IndexNode, Metadata},
     libs::spinlock::SpinLockGuard,
 };
 

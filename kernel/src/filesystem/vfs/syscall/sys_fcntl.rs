@@ -2,7 +2,7 @@ use crate::arch::syscall::nr::SYS_FCNTL;
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
-        fcntl::{FD_CLOEXEC, FcntlCommand},
+        fcntl::{FcntlCommand, FD_CLOEXEC},
         file::{FileDescriptorVec, FileMode},
         syscall::dup2::{do_dup2, do_dup3},
     },

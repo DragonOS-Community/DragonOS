@@ -4,7 +4,7 @@ use crate::arch::kprobe::KProbeContext;
 use crate::bpf::helper::BPF_HELPER_FUN_SET;
 use crate::bpf::prog::BpfProg;
 use crate::debug::kprobe::args::KprobeInfo;
-use crate::debug::kprobe::{LockKprobe, register_kprobe, unregister_kprobe};
+use crate::debug::kprobe::{register_kprobe, unregister_kprobe, LockKprobe};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};

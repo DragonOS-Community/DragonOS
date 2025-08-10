@@ -1,11 +1,11 @@
-use fdt::{Fdt, node::FdtNode};
+use fdt::{node::FdtNode, Fdt};
 use log::debug;
 use system_error::SystemError;
 
 use crate::{
     driver::{
         open_firmware::fdt::open_firmware_fdt_driver,
-        pci::ecam::{EcamRootInfo, pci_ecam_root_info_manager},
+        pci::ecam::{pci_ecam_root_info_manager, EcamRootInfo},
     },
     mm::PhysAddr,
 };

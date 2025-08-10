@@ -1,6 +1,6 @@
 use super::{PerfEventOps, Result};
-use crate::arch::MMArch;
 use crate::arch::mm::LockedFrameAllocator;
+use crate::arch::MMArch;
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::include::bindings::linux_bpf::{
@@ -9,7 +9,7 @@ use crate::include::bindings::linux_bpf::{
 use crate::libs::align::page_align_up;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::allocator::page_frame::{PageFrameCount, PhysPageFrame};
-use crate::mm::page::{PageFlags, PageType, page_manager_lock_irqsave};
+use crate::mm::page::{page_manager_lock_irqsave, PageFlags, PageType};
 use crate::mm::{MemoryManagementArch, PhysAddr};
 use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
 use alloc::string::String;

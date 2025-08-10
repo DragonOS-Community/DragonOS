@@ -9,18 +9,18 @@ use crate::libs::spinlock::SpinLock;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
 use crate::sched::clock::ClockUpdataFlag;
-use crate::sched::{SCHED_FEATURES, SchedFeature, cpu_rq};
+use crate::sched::{cpu_rq, SchedFeature, SCHED_FEATURES};
 use crate::smp::core::smp_get_processor_id;
-use crate::time::NSEC_PER_MSEC;
 use crate::time::jiffies::TICK_NESC;
 use crate::time::timer::clock;
+use crate::time::NSEC_PER_MSEC;
 use alloc::sync::{Arc, Weak};
 
 use super::idle::IdleScheduler;
-use super::pelt::{PELT_MIN_DIVIDER, SchedulerAvg, UpdateAvgFlags, add_positive, sub_positive};
+use super::pelt::{add_positive, sub_positive, SchedulerAvg, UpdateAvgFlags, PELT_MIN_DIVIDER};
 use super::{
-    CpuRunQueue, DequeueFlag, EnqueueFlag, LoadWeight, OnRq, SCHED_CAPACITY_SHIFT, SchedPolicy,
-    Scheduler, TaskGroup, WakeupFlags,
+    CpuRunQueue, DequeueFlag, EnqueueFlag, LoadWeight, OnRq, SchedPolicy, Scheduler, TaskGroup,
+    WakeupFlags, SCHED_CAPACITY_SHIFT,
 };
 
 /// 用于设置 CPU-bound 任务的最小抢占粒度的参数。

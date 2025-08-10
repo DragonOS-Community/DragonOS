@@ -8,13 +8,13 @@ use crate::{
     arch::{CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
     process::ProcessManager,
-    sched::{SchedMode, schedule},
+    sched::{schedule, SchedMode},
     time::timekeeping::getnstimeofday,
 };
 
 use super::{
+    timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
     PosixTimeSpec, TimeArch,
-    timer::{Timer, WakeUpHelper, next_n_us_timer_jiffies},
 };
 
 /// @brief 休眠指定时间（单位：纳秒）

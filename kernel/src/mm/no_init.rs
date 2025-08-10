@@ -18,9 +18,9 @@ use crate::{
 use core::marker::PhantomData;
 
 use super::{
-    PageTableKind, VirtAddr,
     allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage},
     page::EntryFlags,
+    PageTableKind, VirtAddr,
 };
 
 /// 用于存储重映射页表的位图和页面

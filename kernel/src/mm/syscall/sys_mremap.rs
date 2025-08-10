@@ -1,11 +1,11 @@
 //! System call handler for the mremap system call.
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MREMAP};
-use crate::mm::MemoryManagementArch;
-use crate::mm::syscall::MremapFlags;
 use crate::mm::syscall::page_align_up;
 use crate::mm::syscall::sys_munmap::do_munmap;
+use crate::mm::syscall::MremapFlags;
 use crate::mm::ucontext::AddressSpace;
+use crate::mm::MemoryManagementArch;
 use crate::mm::{MMArch, VirtAddr, VmFlags};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;

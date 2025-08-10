@@ -7,23 +7,23 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        FileType,
         fcntl::AtFlags,
         file::{File, FileMode},
         iov::{IoVec, IoVecs},
         open::do_sys_open,
         syscall::ModeType,
+        FileType,
     },
     libs::spinlock::SpinLockGuard,
-    mm::{VirtAddr, verify_area},
+    mm::{verify_area, VirtAddr},
     net::socket::{AddressFamily, SOL_SOCKET},
     process::ProcessManager,
     syscall::Syscall,
 };
 
 use super::{
+    socket::{new_socket, PosixSocketType, Socket, SocketInode},
     Endpoint, Protocol, ShutdownType,
-    socket::{PosixSocketType, Socket, SocketInode, new_socket},
 };
 
 /// Flags for socket, socketpair, accept4

@@ -11,7 +11,7 @@ use crate::{
     exception::InterruptArch,
     libs::spinlock::SpinLockGuard,
     process::{ProcessControlBlock, ProcessManager, RawPid},
-    sched::{SchedMode, schedule},
+    sched::{schedule, SchedMode},
 };
 
 use super::spinlock::SpinLock;

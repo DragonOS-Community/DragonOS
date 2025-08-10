@@ -32,13 +32,13 @@ use crate::{
     arch::interrupt::TrapFrame,
     driver::open_firmware::fdt::open_firmware_fdt_driver,
     exception::{
-        HardwareIrqNumber, IrqNumber,
         handle::fast_eoi_irq_handler,
         irqchip::{IrqChip, IrqChipData, IrqChipFlags, IrqChipSetMaskResult},
         irqdata::IrqData,
-        irqdesc::{GenericIrqHandler, irq_desc_manager},
-        irqdomain::{IrqDomain, IrqDomainOps, irq_domain_manager},
+        irqdesc::{irq_desc_manager, GenericIrqHandler},
+        irqdomain::{irq_domain_manager, IrqDomain, IrqDomainOps},
         manage::irq_manager,
+        HardwareIrqNumber, IrqNumber,
     },
     libs::{
         cpumask::CpuMask,
@@ -46,11 +46,11 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{
-        PhysAddr, VirtAddr,
-        mmio_buddy::{MMIOSpaceGuard, mmio_pool},
+        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         percpu::{PerCpu, PerCpuVar},
+        PhysAddr, VirtAddr,
     },
-    smp::cpu::{ProcessorId, smp_cpu_manager},
+    smp::cpu::{smp_cpu_manager, ProcessorId},
 };
 
 static mut PLIC_HANDLERS: Option<PerCpuVar<PlicHandler>> = None;

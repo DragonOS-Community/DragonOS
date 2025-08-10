@@ -3,12 +3,12 @@ use alloc::{string::ToString, sync::Arc};
 use core::fmt::Debug;
 
 use super::{
-    device::{Device, DeviceMatchName, DeviceMatcher, sys_dev_char_kset},
+    device::{sys_dev_char_kset, Device, DeviceMatchName, DeviceMatcher},
     kobject::{KObjType, KObject},
     kset::KSet,
     subsys::SubSysPrivate,
 };
-use crate::filesystem::sysfs::{Attribute, AttributeGroup, SysFSOps, sysfs_instance};
+use crate::filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps};
 use system_error::SystemError;
 
 /// `/sys/class`的kset

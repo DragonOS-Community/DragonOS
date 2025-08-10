@@ -8,22 +8,22 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use super::{
-    RtcClassOps, RtcDevice, RtcTime,
     class::rtc_register_device,
-    sysfs::{RtcGeneralDevice, rtc_general_device_create},
+    sysfs::{rtc_general_device_create, RtcGeneralDevice},
+    RtcClassOps, RtcDevice, RtcTime,
 };
 use crate::{
     driver::base::{
         device::{
-            Device, IdTable,
             bus::Bus,
             driver::{Driver, DriverCommonData},
+            Device, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
         platform::{
             platform_device::PlatformDevice,
-            platform_driver::{PlatformDriver, platform_driver_manager},
+            platform_driver::{platform_driver_manager, PlatformDriver},
         },
     },
     filesystem::kernfs::KernFSInode,

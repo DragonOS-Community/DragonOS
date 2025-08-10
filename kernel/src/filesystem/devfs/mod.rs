@@ -3,8 +3,8 @@ pub mod null_dev;
 pub mod zero_dev;
 
 use super::vfs::{
-    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
-    file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id,
+    file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
+    FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},

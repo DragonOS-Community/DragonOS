@@ -3,7 +3,7 @@ use intertrait::cast::CastArc;
 
 use crate::driver::base::kobject::KObject;
 
-use super::{RtcDevice, sysfs::RtcGeneralDevice};
+use super::{sysfs::RtcGeneralDevice, RtcDevice};
 
 #[inline]
 pub fn kobj2rtc_device(kobj: Arc<dyn KObject>) -> Option<Arc<dyn RtcDevice>> {

@@ -1,12 +1,12 @@
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 
 use log::info;
 use x86::msr::{
-    IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_EOI, IA32_X2APIC_SIVR, IA32_X2APIC_VERSION,
-    rdmsr, wrmsr,
+    rdmsr, wrmsr, IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_EOI, IA32_X2APIC_SIVR,
+    IA32_X2APIC_VERSION,
 };
 
-use super::{LVT, LVTRegister, LocalAPIC, hw_irq::ApicId};
+use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
 
 #[derive(Debug)]
 pub struct X2Apic;

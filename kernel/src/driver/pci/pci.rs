@@ -4,14 +4,14 @@
 use super::device::pci_device_manager;
 use super::pci_irq::{IrqType, PciIrqError};
 use super::raw_device::PciGeneralDevice;
-use super::root::{PciRoot, pci_root_0};
+use super::root::{pci_root_0, PciRoot};
 
 use crate::arch::{PciArch, TraitPciArch};
 use crate::driver::pci::subsys::pci_bus_subsys_init;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::mm::mmio_buddy::{MMIOSpaceGuard, mmio_pool};
+use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 
 use crate::mm::VirtAddr;
 

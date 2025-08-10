@@ -15,8 +15,8 @@ use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{
-            Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport, file::sysfs_emit_str,
-            sysfs_instance,
+            file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
+            SysFSOpsSupport,
         },
         vfs::syscall::ModeType,
     },
@@ -31,7 +31,7 @@ use core::{fmt::Display, intrinsics::unlikely, ops::Deref};
 use system_error::SystemError;
 
 use self::{
-    bus::{Bus, bus_add_device, bus_probe_device},
+    bus::{bus_add_device, bus_probe_device, Bus},
     device_number::{DeviceNumber, Major},
     driver::Driver,
 };

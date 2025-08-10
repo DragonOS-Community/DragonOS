@@ -2,8 +2,8 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::smp::{
-    SMPArch,
     cpu::{CpuHpCpuState, ProcessorId, SmpCpuManager},
+    SMPArch,
 };
 
 pub struct LoongArch64SMPArch;

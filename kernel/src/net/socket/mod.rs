@@ -20,8 +20,8 @@ use crate::{
     filesystem::{
         epoll::{EPollEventType, EPollItem},
         vfs::{
-            FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollableInode,
-            file::FileMode, syscall::ModeType,
+            file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
+            Metadata, PollableInode,
         },
     },
     libs::{
@@ -30,7 +30,7 @@ use crate::{
         wait_queue::EventWaitQueue,
     },
     process::{ProcessManager, RawPid},
-    sched::{SchedMode, schedule},
+    sched::{schedule, SchedMode},
 };
 
 use self::{

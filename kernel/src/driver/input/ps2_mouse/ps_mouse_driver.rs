@@ -8,23 +8,23 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::{CurrentPortIOArch, io::PortIOArch},
+    arch::{io::PortIOArch, CurrentPortIOArch},
     driver::{
         base::{
-            device::{Device, DeviceId, IdTable, bus::Bus, driver::Driver},
+            device::{bus::Bus, driver::Driver, Device, DeviceId, IdTable},
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         input::serio::{
             serio_device::SerioDevice,
-            serio_driver::{SerioDriver, serio_driver_manager},
+            serio_driver::{serio_driver_manager, SerioDriver},
         },
     },
     exception::{
-        IrqNumber,
         irqdata::IrqHandlerData,
         irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
         manage::irq_manager,
+        IrqNumber,
     },
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
@@ -34,7 +34,7 @@ use crate::{
     },
 };
 
-use super::ps_mouse_device::{Ps2MouseDevice, ps2_mouse_device};
+use super::ps_mouse_device::{ps2_mouse_device, Ps2MouseDevice};
 
 const PS2_MOUSE_IRQ_NUM: IrqNumber = IrqNumber::new(0x2c);
 

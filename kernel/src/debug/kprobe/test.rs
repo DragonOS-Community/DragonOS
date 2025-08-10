@@ -1,5 +1,5 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::debug::kprobe::{KprobeInfo, register_kprobe, unregister_kprobe};
+use crate::debug::kprobe::{register_kprobe, unregister_kprobe, KprobeInfo};
 use alloc::string::ToString;
 use kprobe::ProbeArgs;
 use log::info;

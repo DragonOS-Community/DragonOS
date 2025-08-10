@@ -8,9 +8,9 @@ use crate::perf::util::PerfProbeConfig;
 use crate::perf::{BasicPerfEbpfCallBack, JITMem};
 use crate::tracepoint::{TracePoint, TracePointCallBackFunc};
 use crate::{
-    filesystem::vfs::{FilePrivateData, FileSystem, IndexNode, file::File},
+    filesystem::vfs::{file::File, FilePrivateData, FileSystem, IndexNode},
     libs::spinlock::SpinLockGuard,
-    perf::{PerfEventOps, util::PerfProbeArgs},
+    perf::{util::PerfProbeArgs, PerfEventOps},
 };
 use alloc::boxed::Box;
 use alloc::sync::Arc;

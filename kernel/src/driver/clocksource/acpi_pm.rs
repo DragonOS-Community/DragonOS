@@ -1,14 +1,14 @@
 use crate::{
     alloc::string::ToString,
-    arch::{CurrentPortIOArch, io::PortIOArch},
+    arch::{io::PortIOArch, CurrentPortIOArch},
     driver::acpi::{
         acpi_manager,
         pmtmr::{ACPI_PM_MASK, PMTMR_TICKS_PER_SEC},
     },
     libs::spinlock::SpinLock,
     time::{
-        PIT_TICK_RATE,
         clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum},
+        PIT_TICK_RATE,
     },
 };
 use acpi::fadt::Fadt;

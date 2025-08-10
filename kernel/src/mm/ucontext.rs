@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{Ordering, compiler_fence},
+    sync::atomic::{compiler_fence, Ordering},
 };
 
 use alloc::{
@@ -18,10 +18,10 @@ use ida::IdAllocator;
 use system_error::SystemError;
 
 use crate::{
-    arch::{CurrentIrqArch, MMArch, mm::PageMapper},
+    arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
     filesystem::vfs::file::File,
-    ipc::shm::{ShmFlags, shm_manager_lock},
+    ipc::shm::{shm_manager_lock, ShmFlags},
     libs::{
         align::page_align_up,
         rwlock::RwLock,
@@ -33,12 +33,12 @@ use crate::{
 };
 
 use super::{
-    MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
     allocator::page_frame::{
-        PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter, deallocate_page_frames,
+        deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
     page::{EntryFlags, Flusher, InactiveFlusher, PageFlushAll, PageType},
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
+    MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
 };
 
 /// MMAP_MIN_ADDR的默认值

@@ -5,7 +5,7 @@ use crate::{
     arch::TraitPciArch,
     driver::{
         open_firmware::fdt::open_firmware_fdt_driver,
-        pci::pci::{BusDeviceFunction, PciAddr, pci_init},
+        pci::pci::{pci_init, BusDeviceFunction, PciAddr},
     },
     init::initcall::INITCALL_SUBSYS,
     mm::PhysAddr,

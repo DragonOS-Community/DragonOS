@@ -1,8 +1,8 @@
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::IndexNode;
+use crate::process::exec::{load_binary_file, ExecParam, ExecParamFlags};
 use crate::process::ProcessManager;
-use crate::process::exec::{ExecParam, ExecParamFlags, load_binary_file};
 use crate::syscall::Syscall;
 use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
 

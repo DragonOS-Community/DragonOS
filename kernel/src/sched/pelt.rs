@@ -5,8 +5,8 @@ use alloc::sync::Arc;
 use crate::process::ProcessControlBlock;
 
 use super::{
-    CpuRunQueue, LoadWeight, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT, SchedPolicy,
     fair::{CfsRunQueue, FairSchedEntity},
+    CpuRunQueue, LoadWeight, SchedPolicy, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
 };
 
 const RUNNABLE_AVG_Y_N_INV: [u32; 32] = [

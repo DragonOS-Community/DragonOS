@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::driver::base::device::{
     bus::Bus,
-    driver::{Driver, driver_manager},
+    driver::{driver_manager, Driver},
 };
 
 use super::{dev_id::PciDeviceID, device::PciDevice, subsys::pci_bus};

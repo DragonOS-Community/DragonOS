@@ -8,12 +8,12 @@ use core::{
 use alloc::sync::Arc;
 
 use crate::{
-    arch::{MMArch, mm::PageMapper},
+    arch::{mm::PageMapper, MMArch},
     libs::align::align_down,
     mm::{
-        VirtAddr, VmFaultReason, VmFlags,
-        page::{EntryFlags, page_manager_lock_irqsave},
+        page::{page_manager_lock_irqsave, EntryFlags},
         ucontext::LockedVMA,
+        VirtAddr, VmFaultReason, VmFlags,
     },
     process::{ProcessManager, ProcessState},
 };

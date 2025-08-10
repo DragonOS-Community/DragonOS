@@ -5,14 +5,14 @@ use x86::apic::ApicId;
 
 use crate::{
     arch::{
-        driver::apic::{CurrentApic, LocalAPIC, lapic_vector::local_apic_chip},
+        driver::apic::{lapic_vector::local_apic_chip, CurrentApic, LocalAPIC},
         smp::SMP_BOOT_DATA,
     },
     exception::{
-        HardwareIrqNumber, IrqNumber,
         ipi::{FlushTLBIpiHandler, IpiKind, IpiTarget, KickCpuIpiHandler},
         irqdata::{IrqData, IrqLineStatus},
-        irqdesc::{IrqDesc, IrqFlowHandler, IrqHandler, irq_desc_manager},
+        irqdesc::{irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandler},
+        HardwareIrqNumber, IrqNumber,
     },
     smp::cpu::ProcessorId,
 };

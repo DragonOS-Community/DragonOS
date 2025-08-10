@@ -8,12 +8,12 @@ use unified_init::macros::unified_init;
 use crate::{
     driver::base::{
         block::gendisk::GenDisk,
-        device::{DevName, device_number::Major},
+        device::{device_number::Major, DevName},
     },
     filesystem::{
         devfs::devfs_register,
         mbr::MbrDiskPartionTable,
-        vfs::{IndexNode, utils::DName},
+        vfs::{utils::DName, IndexNode},
     },
     init::initcall::INITCALL_POSTCORE,
     libs::spinlock::{SpinLock, SpinLockGuard},

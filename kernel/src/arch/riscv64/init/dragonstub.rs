@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::video::fbdev::base::BootTimeScreenInfo,
-    init::boot::{BootCallbacks, BootloaderAcpiArg, register_boot_callbacks},
+    init::boot::{register_boot_callbacks, BootCallbacks, BootloaderAcpiArg},
 };
 
 pub(super) fn early_dragonstub_init() -> Result<(), SystemError> {

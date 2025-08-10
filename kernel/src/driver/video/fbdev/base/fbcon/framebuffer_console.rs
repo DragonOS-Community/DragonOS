@@ -7,13 +7,13 @@ use crate::{
         tty::{
             console::ConsoleSwitch,
             virtual_terminal::{
-                Color, VirtConsole,
                 virtual_console::{CursorOperation, ScrollDir, VcCursor, VirtualConsoleData},
+                Color, VirtConsole,
             },
         },
         video::fbdev::base::{
-            CopyAreaData, FRAME_BUFFER_SET, FbCursor, FbCursorSetMode, FbImage, FbVisual,
-            FillRectData, FillRectROP, FrameBuffer, ScrollMode,
+            CopyAreaData, FbCursor, FbCursorSetMode, FbImage, FbVisual, FillRectData, FillRectROP,
+            FrameBuffer, ScrollMode, FRAME_BUFFER_SET,
         },
     },
     libs::{

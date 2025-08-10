@@ -7,7 +7,7 @@ use crate::{
     arch::{PciArch, TraitPciArch},
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{
-        mmio_buddy::{MMIOSpaceGuard, mmio_pool},
+        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         page::PAGE_2M_SIZE,
     },
 };
@@ -114,11 +114,9 @@ impl PciRoot {
             let space_guard = Arc::new(space_guard);
             self.mmio_guard = Some(space_guard.clone());
 
-            assert!(
-                space_guard
-                    .map_phys(self.ecam_root_info.unwrap().physical_address_base, size)
-                    .is_ok()
-            );
+            assert!(space_guard
+                .map_phys(self.ecam_root_info.unwrap().physical_address_base, size)
+                .is_ok());
         }
         return Ok(0);
     }

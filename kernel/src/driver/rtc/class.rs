@@ -8,13 +8,13 @@ use unified_init::macros::unified_init;
 
 use crate::{
     driver::base::{
-        class::{Class, class_manager},
+        class::{class_manager, Class},
         device::{device_manager, sys_dev_char_kset},
         kobject::KObject,
         subsys::SubSysPrivate,
     },
     init::initcall::INITCALL_SUBSYS,
-    time::{PosixTimeSpec, timekeeping::do_settimeofday64},
+    time::{timekeeping::do_settimeofday64, PosixTimeSpec},
 };
 
 use super::{interface::rtc_read_time, register_default_rtc, sysfs::RtcGeneralDevice};

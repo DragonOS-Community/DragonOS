@@ -19,7 +19,7 @@ use crate::{
         wait_queue::EventWaitQueue,
     },
     mm::VirtAddr,
-    process::{ProcessControlBlock, pid::Pid},
+    process::{pid::Pid, ProcessControlBlock},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
@@ -28,11 +28,11 @@ use super::{
     tty_driver::{TtyCorePrivateField, TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
     tty_ldisc::{
-        TtyLineDiscipline,
         ntty::{NTtyData, NTtyLinediscipline},
+        TtyLineDiscipline,
     },
     tty_port::TtyPort,
-    virtual_terminal::{DrawRegion, vc_manager, virtual_console::VirtualConsoleData},
+    virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, DrawRegion},
 };
 
 #[derive(Debug)]

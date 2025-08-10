@@ -2,8 +2,8 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::virtual_terminal::{
-    VirtConsole,
     virtual_console::{CursorOperation, ScrollDir, VirtualConsoleData, VirtualConsoleIntensity},
+    VirtConsole,
 };
 
 /// 终端切换相关的回调

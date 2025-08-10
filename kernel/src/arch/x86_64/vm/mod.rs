@@ -3,19 +3,19 @@ use log::{error, warn};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
-    controlregs::{Cr0, Cr4, Xcr0, cr4, xcr0},
+    controlregs::{cr4, xcr0, Cr0, Cr4, Xcr0},
     msr::{self, rdmsr, wrmsr},
 };
 use x86_64::registers::control::{Efer, EferFlags};
 
 use crate::{
-    arch::vm::vmx::{L1TF_VMX_MITIGATION, VmxL1dFlushState},
+    arch::vm::vmx::{VmxL1dFlushState, L1TF_VMX_MITIGATION},
     libs::once::Once,
     mm::percpu::{PerCpu, PerCpuVar},
 };
 
 use self::{
-    asm::{ArchCapabilities, VmxMsrEntry, hyperv::*, kvm_msr::*},
+    asm::{hyperv::*, kvm_msr::*, ArchCapabilities, VmxMsrEntry},
     kvm_host::{KvmFunc, KvmInitFunc},
 };
 

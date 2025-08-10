@@ -2,8 +2,8 @@ use log::{error, trace, warn};
 use system_error::SystemError;
 
 use super::{
-    TrapFrame,
     entry::{set_intr_gate, set_system_trap_gate},
+    TrapFrame,
 };
 use crate::exception::debug::DebugException;
 use crate::exception::ebreak::EBreak;

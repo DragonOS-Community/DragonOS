@@ -11,11 +11,11 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         kernfs::{
-            KernFSInode,
             callback::{KernCallbackData, KernFSCallback, KernInodePrivateData},
+            KernFSInode,
         },
         sysfs::{SysFSOps, SysFSOpsSupport},
-        vfs::{PollStatus, syscall::ModeType},
+        vfs::{syscall::ModeType, PollStatus},
     },
 };
 

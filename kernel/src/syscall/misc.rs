@@ -8,7 +8,7 @@ use core::cmp;
 use log::warn;
 use system_error::SystemError;
 
-use super::{Syscall, user_access::UserBufferWriter};
+use super::{user_access::UserBufferWriter, Syscall};
 
 /// 系统信息
 ///

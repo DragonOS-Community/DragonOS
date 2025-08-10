@@ -1,6 +1,6 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicBool, Ordering, compiler_fence, fence},
+    sync::atomic::{compiler_fence, fence, AtomicBool, Ordering},
 };
 
 use kdepends::memoffset::offset_of;
@@ -8,23 +8,23 @@ use log::debug;
 use system_error::SystemError;
 
 use crate::{
-    arch::{MMArch, mm::LowAddressRemapping, process::table::TSSManager},
+    arch::{mm::LowAddressRemapping, process::table::TSSManager, MMArch},
     exception::InterruptArch,
     libs::{cpumask::CpuMask, rwlock::RwLock},
-    mm::{IDLE_PROCESS_ADDRESS_SPACE, MemoryManagementArch, PhysAddr, VirtAddr, percpu::PerCpu},
+    mm::{percpu::PerCpu, MemoryManagementArch, PhysAddr, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::ProcessManager,
     smp::{
-        SMPArch,
         core::smp_get_processor_id,
-        cpu::{CpuHpCpuState, ProcessorId, SmpCpuManager, smp_cpu_manager},
+        cpu::{smp_cpu_manager, CpuHpCpuState, ProcessorId, SmpCpuManager},
         init::smp_ap_start_stage2,
+        SMPArch,
     },
 };
 
 use super::{
-    CurrentIrqArch,
     acpi::early_acpi_boot_init,
     interrupt::ipi::{ipi_send_smp_init, ipi_send_smp_startup},
+    CurrentIrqArch,
 };
 
 extern "C" {

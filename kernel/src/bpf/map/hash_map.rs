@@ -1,5 +1,5 @@
 use super::Result;
-use crate::bpf::map::util::{BpfMapUpdateElemFlags, round_up};
+use crate::bpf::map::util::{round_up, BpfMapUpdateElemFlags};
 use crate::bpf::map::{BpfCallBackFn, BpfMapCommonOps, BpfMapMeta};
 use crate::mm::percpu::{PerCpu, PerCpuVar};
 use crate::smp::cpu::ProcessorId;

@@ -1,7 +1,7 @@
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering, compiler_fence},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -16,12 +16,12 @@ use system_error::SystemError;
 use crate::{
     arch::CurrentIrqArch,
     exception::{
+        softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
-        softirq::{SoftirqNumber, SoftirqVec, softirq_vectors},
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     process::{ProcessControlBlock, ProcessManager},
-    sched::{SchedMode, schedule},
+    sched::{schedule, SchedMode},
 };
 
 use super::{jiffies::NSEC_PER_JIFFY, timekeeping::update_wall_time};
@@ -197,7 +197,7 @@ impl Timer {
         let this_arc = self.inner().self_ref.upgrade().unwrap();
         TIMER_LIST
             .lock_irqsave()
-            .extract_if(|x| Arc::ptr_eq(&this_arc, &x.1))
+            .extract_if(.., |x| Arc::ptr_eq(&this_arc, &x.1))
             .for_each(drop);
         true
     }

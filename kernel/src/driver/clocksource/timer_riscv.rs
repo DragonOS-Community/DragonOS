@@ -1,7 +1,7 @@
 use core::sync::atomic::{compiler_fence, fence, Ordering};
 
 use alloc::{string::ToString, sync::Arc};
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 use system_error::SystemError;
 
 use crate::{
@@ -29,7 +29,7 @@ use crate::{
 
 pub struct RiscVSbiTimer;
 
-static SBI_TIMER_INIT_BMP: SpinLock<StaticBitmap<{ PerCpu::MAX_CPU_NUM as usize }>> =
+static SBI_TIMER_INIT_BMP: SpinLock<static_bitmap!(PerCpu::MAX_CPU_NUM as usize)> =
     SpinLock::new(StaticBitmap::new());
 
 static mut INTERVAL_CNT: usize = 0;

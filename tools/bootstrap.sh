@@ -24,7 +24,7 @@ DEFAULT_INSTALL="false"
 export RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER:-https://rsproxy.cn}
 export RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}
 export RUST_VERSION="${RUST_VERSION:-nightly-2025-08-10}"
-export RUST_VERSION_OLD="${RUST_VERSION:-nightly-2024-11-05}"
+export RUST_VERSION_OLD="${RUST_VERSION_OLD:-nightly-2024-11-05}"
 
 banner()
 {

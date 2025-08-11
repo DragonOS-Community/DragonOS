@@ -1,6 +1,9 @@
 use crate::{
     mm::{verify_area, VirtAddr},
-    net::{posix::SockAddr, socket::unix::UnixEndpoint},
+    net::{
+        posix::SockAddr,
+        socket::{netlink::addr::NetlinkSocketAddr, unix::UnixEndpoint},
+    },
 };
 
 pub use smoltcp::wire::IpEndpoint;
@@ -11,7 +14,10 @@ pub enum Endpoint {
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
     Ip(IpEndpoint),
+    /// Unix域套接字端点
     Unix(UnixEndpoint),
+    /// Netlink端点
+    Netlink(NetlinkSocketAddr),
 }
 
 /// @brief 链路层端点

@@ -11,9 +11,10 @@ use crate::{
             tty_device::{PtyType, TtyDevice, TtyType},
         },
     },
-    filesystem::{
-        devfs::DeviceINode,
-        vfs::{mount::do_mount_mkdir, syscall::ModeType, FileType},
+    filesystem::vfs::{
+        mount::{do_mount_mkdir, MountFlags},
+        syscall::ModeType,
+        FileType,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
@@ -28,8 +29,9 @@ use ida::IdAllocator;
 use log::info;
 use system_error::SystemError;
 
-use super::vfs::{
-    vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata,
+use super::{
+    devfs::DeviceINode,
+    vfs::{vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata},
 };
 
 const DEV_PTYFS_MAX_NAMELEN: usize = 16;
@@ -286,7 +288,7 @@ pub fn devpts_init() -> Result<(), SystemError> {
     // 创建 devptsfs 实例
     let ptsfs: Arc<DevPtsFs> = DevPtsFs::new();
 
-    do_mount_mkdir(ptsfs, "/dev/pts").expect("Failed to mount DevPtsFS");
+    do_mount_mkdir(ptsfs, "/dev/pts", MountFlags::empty()).expect("Failed to mount DevPtsFS");
     info!("DevPtsFs mounted.");
 
     Ok(())

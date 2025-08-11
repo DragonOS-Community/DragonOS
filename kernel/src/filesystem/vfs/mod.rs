@@ -12,6 +12,7 @@ use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
+use mount::MountFlags;
 use system_error::SystemError;
 
 use crate::{
@@ -476,7 +477,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// - 该函数会在`MountFS`实例上创建一个新的挂载点。
     /// - 该函数会在全局的挂载列表中记录新的挂载关系。
-    fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
+    fn mount(
+        &self,
+        _fs: Arc<dyn FileSystem>,
+        _mount_flags: MountFlags,
+    ) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 

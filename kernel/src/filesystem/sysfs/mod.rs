@@ -8,6 +8,7 @@ use super::{
 };
 use crate::{
     driver::base::kobject::KObject,
+    filesystem::vfs::mount::MountFlags,
     libs::{casting::DowncastArc, once::Once},
     process::ProcessManager,
 };
@@ -45,7 +46,7 @@ pub fn sysfs_init() -> Result<(), SystemError> {
         root_inode
             .mkdir("sys", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /sys")
-            .mount(sysfs_instance().fs().clone())
+            .mount(sysfs_instance().fs().clone(), MountFlags::empty())
             .expect("Failed to mount at /sys");
         info!("SysFS mounted.");
 
@@ -207,7 +208,7 @@ pub struct SysFS {
 
 impl SysFS {
     pub fn new() -> Self {
-        let kernfs: Arc<KernFS> = KernFS::new();
+        let kernfs: Arc<KernFS> = KernFS::new("sysfs");
 
         let root_inode: Arc<KernFSInode> = kernfs.root_inode().downcast_arc().unwrap();
 

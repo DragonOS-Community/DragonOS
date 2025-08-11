@@ -2,13 +2,16 @@
 pub mod null_dev;
 pub mod zero_dev;
 
-use super::vfs::{
-    file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
-    FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
+use super::{
+    devpts::{DevPtsFs, LockedDevPtsFSInode},
+    vfs::{
+        file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
+        FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
+    },
 };
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
-    filesystem::devpts::{DevPtsFs, LockedDevPtsFSInode},
+    filesystem::vfs::mount::MountFlags,
     libs::{
         casting::DowncastArc,
         once::Once,
@@ -745,7 +748,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
         root_inode
             .mkdir("dev", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /dev")
-            .mount(devfs)
+            .mount(devfs, MountFlags::empty())
             .expect("Failed to mount at /dev");
         info!("DevFS mounted.");
         result = Some(Ok(()));

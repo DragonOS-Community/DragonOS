@@ -35,6 +35,7 @@ pub struct KvmInode {
     self_ref: Weak<LockedKvmInode>,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<DevFS>,
+    parent: Weak<crate::filesystem::devfs::LockedDevFSInode>,
     /// INode 元数据
     metadata: Metadata,
 }
@@ -52,6 +53,7 @@ impl LockedKvmInode {
         let inode = KvmInode {
             self_ref: Weak::default(),
             fs: Weak::default(),
+            parent: Weak::default(),
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),
@@ -95,6 +97,10 @@ impl LockedKvmInode {
 impl DeviceINode for LockedKvmInode {
     fn set_fs(&self, fs: Weak<DevFS>) {
         self.inner.lock().fs = fs;
+    }
+
+    fn set_parent(&self, parent: Weak<crate::filesystem::devfs::LockedDevFSInode>) {
+        self.inner.lock().parent = parent;
     }
 }
 
@@ -178,6 +184,14 @@ impl IndexNode for LockedKvmInode {
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let parent = self.inner.lock().parent.upgrade();
+        if let Some(parent) = parent {
+            return Ok(parent);
+        }
+        Err(SystemError::ENOENT)
     }
 }
 

@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::intrinsics::likely;
 use core::ops::BitXor;
 
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -119,8 +119,8 @@ pub struct NTtyData {
     read_buf: Box<[u8; NTTY_BUFSIZE]>,
     echo_buf: Box<[u8; NTTY_BUFSIZE]>,
 
-    read_flags: StaticBitmap<NTTY_BUFSIZE>,
-    char_map: StaticBitmap<256>,
+    read_flags: static_bitmap!(NTTY_BUFSIZE),
+    char_map: static_bitmap!(256),
 
     tty: Weak<TtyCore>,
 }
@@ -787,9 +787,10 @@ impl NTtyData {
     ) {
         // 先处理信号
         let ctrl_info = tty.core().contorl_info_irqsave();
-        let pg = ctrl_info.pgid;
+        let pg = ctrl_info.pgid.clone();
+        drop(ctrl_info);
         if let Some(pg) = pg {
-            let _ = crate::ipc::kill::kill_process_group(pg, signal);
+            let _ = crate::ipc::kill::kill_process_group(&pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {

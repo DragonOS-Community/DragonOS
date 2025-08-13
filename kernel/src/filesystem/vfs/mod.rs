@@ -12,6 +12,7 @@ use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
+use mount::MountFlags;
 use system_error::SystemError;
 
 use crate::{
@@ -25,11 +26,12 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
+    process::ProcessManager,
     time::PosixTimeSpec,
 };
 
 use self::{file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id};
-pub use self::{file::FilePrivateData, mount::MountFS, vcore::ROOT_INODE};
+pub use self::{file::FilePrivateData, mount::MountFS};
 
 use super::page_cache::PageCache;
 
@@ -475,7 +477,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// - 该函数会在`MountFS`实例上创建一个新的挂载点。
     /// - 该函数会在全局的挂载列表中记录新的挂载关系。
-    fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
+    fn mount(
+        &self,
+        _fs: Arc<dyn FileSystem>,
+        _mount_flags: MountFlags,
+    ) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -528,25 +534,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
-    /// # absolute_path 获取目录项绝对路径
+    /// Returns the absolute path of the inode.
     ///
-    /// ## 参数
+    /// This function only works for `MountFS` and should not be implemented by other file systems.
+    /// The performance of this function is O(n) for path queries, and it is extremely
+    /// inefficient in file systems that do not implement DName caching.
     ///
-    /// 无
+    /// **WARNING**
     ///
-    /// ## 返回值
+    /// For special inodes(e.g., sockets,pipes, etc.), this function will
+    /// return an special name according to the inode type directly.
     ///
-    /// - Ok(String): 路径
-    /// - Err(SystemError): 文件系统不支持dname parent api
-    ///
-    /// ## Behavior
-    ///
-    /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
-    ///
-    /// # Performance
-    ///
-    /// 这是一个O(n)的路径查询，并且在未实现DName缓存的文件系统中，性能极差；
-    /// 即使实现了DName也尽量不要用。
     fn absolute_path(&self) -> Result<String, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -560,7 +558,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 将当前inode的内容同步到具体设备上
     fn sync(&self) -> Result<(), SystemError> {
-        return Ok(());
+        let page_cache = self.page_cache();
+        if let Some(page_cache) = page_cache {
+            return page_cache.lock_irqsave().sync();
+        }
+        Ok(())
     }
 
     /// ## 创建一个特殊文件节点
@@ -746,11 +748,12 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
+        let root_inode = ProcessManager::current_mntns().root_inode();
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (ROOT_INODE().clone(), String::from(rest))
+            (root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))
@@ -793,7 +796,7 @@ impl dyn IndexNode {
             if file_type == FileType::SymLink && max_follow_times > 0 {
                 let mut content = [0u8; 256];
                 // 读取符号链接
-
+                // TODO:We need to clarify which interfaces require private data and which do not
                 let len = inode.read_at(
                     0,
                     256,

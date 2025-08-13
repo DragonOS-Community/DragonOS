@@ -13,6 +13,7 @@ mod sys_getppid;
 mod sys_getsid;
 mod sys_gettid;
 mod sys_getuid;
+mod sys_groups;
 mod sys_prlimit64;
 mod sys_set_tid_address;
 mod sys_setfsgid;
@@ -28,6 +29,9 @@ mod sys_wait4;
 
 #[cfg(target_arch = "x86_64")]
 mod sys_fork;
+
+#[cfg(target_arch = "x86_64")]
+mod sys_getpgrp;
 #[cfg(target_arch = "x86_64")]
 mod sys_getrlimit;
 #[cfg(target_arch = "x86_64")]

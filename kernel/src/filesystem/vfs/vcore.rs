@@ -9,19 +9,18 @@ use crate::{
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
+        devpts::devpts_init,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
-        ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
+        vfs::{syscall::ModeType, AtomicInodeId, FileSystem, FileType, MountFS},
     },
     mm::truncate::truncate_inode_pages,
-    process::ProcessManager,
+    process::{namespace::mnt::mnt_namespace_init, ProcessManager},
 };
 
 use super::{
     file::FileMode,
-    mount::init_mountlist,
     stat::LookUpFlags,
     utils::{rsplit_path, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -41,28 +40,10 @@ pub fn generate_inode_id() -> InodeId {
     return INO.fetch_add(InodeId::new(1), Ordering::SeqCst);
 }
 
-static mut __ROOT_INODE: Option<Arc<dyn IndexNode>> = None;
-
-/// @brief 获取全局的根节点
-#[inline(always)]
-#[allow(non_snake_case)]
-pub fn ROOT_INODE() -> Arc<dyn IndexNode> {
-    unsafe {
-        return __ROOT_INODE.as_ref().unwrap().clone();
-    }
-}
-
 /// 初始化虚拟文件系统
 #[inline(never)]
 pub fn vfs_init() -> Result<(), SystemError> {
-    // 使用Ramfs作为默认的根文件系统
-    let ramfs = RamFS::new();
-    let mount_fs = MountFS::new(ramfs, None);
-    let root_inode = mount_fs.root_inode();
-    init_mountlist();
-    unsafe {
-        __ROOT_INODE = Some(root_inode.clone());
-    }
+    mnt_namespace_init();
 
     procfs_init().expect("Failed to initialize procfs");
 
@@ -70,7 +51,10 @@ pub fn vfs_init() -> Result<(), SystemError> {
 
     sysfs_init().expect("Failed to initialize sysfs");
 
-    let root_entries = ROOT_INODE().list().expect("VFS init failed");
+    let root_entries = ProcessManager::current_mntns()
+        .root_inode()
+        .list()
+        .expect("VFS init failed");
     if !root_entries.is_empty() {
         info!("Successfully initialized VFS!");
     }
@@ -82,36 +66,44 @@ pub fn vfs_init() -> Result<(), SystemError> {
 fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemError> {
     info!("VFS: Migrating filesystems...");
 
-    let new_fs = MountFS::new(new_fs, None);
+    let current_mntns = ProcessManager::current_mntns();
+    let old_root_inode = current_mntns.root_inode();
+    let old_mntfs = current_mntns.root_mntfs().clone();
+    let new_fs = MountFS::new(
+        new_fs,
+        None,
+        old_mntfs.propagation(),
+        Some(&current_mntns),
+        old_mntfs.mount_flags(),
+    );
+
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
-
     // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
     // 因为是换根所以路径没有变化
     // 不需要重新注册挂载目录
     new_root_inode
         .mkdir("proc", ModeType::from_bits_truncate(0o755))
         .expect("Unable to create /proc")
-        .mount_from(ROOT_INODE().find("proc").expect("proc not mounted!"))
+        .mount_from(old_root_inode.find("proc").expect("proc not mounted!"))
         .expect("Failed to migrate filesystem of proc");
     new_root_inode
         .mkdir("dev", ModeType::from_bits_truncate(0o755))
         .expect("Unable to create /dev")
-        .mount_from(ROOT_INODE().find("dev").expect("dev not mounted!"))
+        .mount_from(old_root_inode.find("dev").expect("dev not mounted!"))
         .expect("Failed to migrate filesystem of dev");
     new_root_inode
         .mkdir("sys", ModeType::from_bits_truncate(0o755))
         .expect("Unable to create /sys")
-        .mount_from(ROOT_INODE().find("sys").expect("sys not mounted!"))
+        .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
         .expect("Failed to migrate filesystem of sys");
 
     unsafe {
-        // drop旧的Root inode
-        let old_root_inode = __ROOT_INODE.take().unwrap();
-        // 设置全局的新的ROOT Inode
-        __ROOT_INODE = Some(new_root_inode.clone());
-        drop(old_root_inode);
+        current_mntns.force_change_root_mountfs(new_fs);
     }
+
+    // WARNING: mount devpts after devfs has been mounted,
+    devpts_init().expect("Failed to initialize devpts");
 
     info!("VFS: Migrate filesystems done!");
 

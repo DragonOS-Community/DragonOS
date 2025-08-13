@@ -313,7 +313,7 @@ impl WaitQueue {
 
             if wake {
                 ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
-                    error!("wakeup pid: {:?} error: {:?}", to_wakeup.pid(), e);
+                    error!("wakeup pid: {:?} error: {:?}", to_wakeup.raw_pid(), e);
                 });
                 continue;
             } else {
@@ -348,7 +348,7 @@ fn before_sleep_check(max_preempt: usize) {
     if unlikely(pcb.preempt_count() > max_preempt) {
         warn!(
             "Process {:?}: Try to sleep when preempt count is {}",
-            pcb.pid().data(),
+            pcb.raw_pid().data(),
             pcb.preempt_count()
         );
     }

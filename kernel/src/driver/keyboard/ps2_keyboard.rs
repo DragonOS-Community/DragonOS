@@ -20,7 +20,7 @@ use crate::{
         InterruptArch, IrqNumber,
     },
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
+        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         vfs::{
             file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
             FileSystem, FileType, IndexNode, Metadata,
@@ -66,6 +66,7 @@ pub struct PS2KeyBoardInode {
     /// 指向自身的弱引用
     self_ref: Weak<LockedPS2KeyBoardInode>,
     /// 指向inode所在的文件系统对象的指针
+    parent: Weak<LockedDevFSInode>,
     fs: Weak<DevFS>,
     /// INode 元数据
     metadata: Metadata,
@@ -76,6 +77,7 @@ impl LockedPS2KeyBoardInode {
         let inode = PS2KeyBoardInode {
             // uuid: Uuid::new_v5(),
             self_ref: Weak::default(),
+            parent: Weak::default(),
             fs: Weak::default(),
             metadata: Metadata {
                 dev_id: 1,
@@ -106,6 +108,11 @@ impl LockedPS2KeyBoardInode {
 impl DeviceINode for LockedPS2KeyBoardInode {
     fn set_fs(&self, fs: Weak<DevFS>) {
         self.0.write().fs = fs;
+    }
+
+    fn set_parent(&self, parent: Weak<LockedDevFSInode>) {
+        let mut inode = self.0.write();
+        inode.parent = parent;
     }
 }
 
@@ -174,6 +181,14 @@ impl IndexNode for LockedPS2KeyBoardInode {
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let parent = self.0.read().parent.upgrade();
+        if let Some(parent) = parent {
+            return Ok(parent as Arc<dyn IndexNode>);
+        }
+        Err(SystemError::ENOENT)
     }
 }
 

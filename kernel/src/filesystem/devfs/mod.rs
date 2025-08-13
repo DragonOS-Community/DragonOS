@@ -2,19 +2,22 @@
 pub mod null_dev;
 pub mod zero_dev;
 
-use super::vfs::{
-    file::FileMode,
-    syscall::ModeType,
-    utils::DName,
-    vcore::{generate_inode_id, ROOT_INODE},
-    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
+use super::{
+    devpts::{DevPtsFs, LockedDevPtsFSInode},
+    vfs::{
+        file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
+        FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
+    },
 };
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
+    filesystem::vfs::mount::MountFlags,
     libs::{
+        casting::DowncastArc,
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::ProcessManager,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -75,6 +78,8 @@ impl DevFS {
             DevFSInode::new(FileType::Dir, ModeType::from_bits_truncate(0o755), 0),
         )));
 
+        // panic!("devfs root inode id: {:?}", root.0.lock().metadata.inode_id);
+
         let devfs: Arc<DevFS> = Arc::new(DevFS {
             root_inode: root,
             super_block,
@@ -123,7 +128,7 @@ impl DevFS {
         name: &str,
         device: Arc<T>,
     ) -> Result<(), SystemError> {
-        let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
+        let dev_root_inode = self.root_inode.clone();
         let metadata = device.metadata()?;
         match metadata.file_type {
             // 字节设备挂载在 /dev/char
@@ -137,13 +142,12 @@ impl DevFS {
                 }
 
                 let any_char_inode = dev_root_inode.find("char")?;
-                let dev_char_inode: &LockedDevFSInode = any_char_inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedDevFSInode>()
-                    .unwrap();
+                let dev_char_inode = any_char_inode.downcast_arc::<LockedDevFSInode>().unwrap();
 
+                device.set_fs(dev_root_inode.0.lock().fs.clone());
+                device.set_parent(Arc::downgrade(&dev_root_inode));
                 // 特殊处理 tty 设备，挂载在 /dev 下
-                if name.starts_with("tty") && name.len() > 3 {
+                if name.starts_with("tty") && name.len() >= 3 {
                     dev_root_inode.add_dev(name, device.clone())?;
                 } else if name.starts_with("hvc") && name.len() > 3 {
                     // 特殊处理 hvc 设备，挂载在 /dev 下
@@ -156,8 +160,8 @@ impl DevFS {
                 } else {
                     // 在 /dev/char 下创建设备节点
                     dev_char_inode.add_dev(name, device.clone())?;
+                    device.set_parent(Arc::downgrade(&dev_char_inode));
                 }
-                device.set_fs(dev_char_inode.0.lock().fs.clone());
             }
             FileType::BlockDevice => {
                 if dev_root_inode.find("block").is_err() {
@@ -169,10 +173,11 @@ impl DevFS {
                 }
 
                 let any_block_inode = dev_root_inode.find("block")?;
-                let dev_block_inode: &LockedDevFSInode = any_block_inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedDevFSInode>()
-                    .unwrap();
+                let dev_block_inode = any_block_inode.downcast_arc::<LockedDevFSInode>().unwrap();
+
+                // default parent is dev_root_inode
+                device.set_parent(Arc::downgrade(&dev_root_inode));
+                device.set_fs(dev_root_inode.0.lock().fs.clone());
 
                 if name.starts_with("vd") && name.len() > 2 {
                     // 虚拟磁盘设备挂载在 /dev 下
@@ -190,24 +195,22 @@ impl DevFS {
                     dev_root_inode.add_dev(name, device.clone())?;
                 } else {
                     dev_block_inode.add_dev(name, device.clone())?;
+                    device.set_parent(Arc::downgrade(&dev_block_inode));
                 }
-                device.set_fs(dev_block_inode.0.lock().fs.clone());
             }
-            FileType::KvmDevice => {
+            FileType::KvmDevice | FileType::FramebufferDevice => {
                 dev_root_inode
                     .add_dev(name, device.clone())
-                    .expect("DevFS: Failed to register /dev/kvm");
-            }
-            FileType::FramebufferDevice => {
-                dev_root_inode
-                    .add_dev(name, device.clone())
-                    .expect("DevFS: Failed to register /dev/fb");
+                    .unwrap_or_else(|_| panic!("DevFS: Failed to register /dev/{}", name));
+
+                // default parent is dev_root_inode
+                device.set_parent(Arc::downgrade(&dev_root_inode));
+                device.set_fs(dev_root_inode.0.lock().fs.clone());
             }
             _ => {
                 return Err(SystemError::ENOSYS);
             }
         }
-
         return Ok(());
     }
 
@@ -679,13 +682,23 @@ impl IndexNode for LockedDevFSInode {
 /// @brief 所有的设备INode都需要额外实现这个trait
 pub trait DeviceINode: IndexNode {
     fn set_fs(&self, fs: Weak<DevFS>);
+    fn set_parent(&self, parent: Weak<LockedDevFSInode>);
+    fn set_devpts_fs(&self, _devpts: Weak<DevPtsFs>) {
+        panic!("DeviceINode: set_devpts_fs is not implemented!");
+    }
+    fn set_devpts_parent(&self, _parent: Weak<LockedDevPtsFSInode>) {
+        panic!("DeviceINode: set_devpts_parent is not implemented!");
+    }
     // TODO: 增加 unregister 方法
 }
 
 /// @brief 获取devfs实例的强类型不可变引用
 macro_rules! devfs_exact_ref {
     () => {{
-        let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().find("dev");
+        let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> =
+            crate::process::ProcessManager::current_mntns()
+                .root_inode()
+                .find("dev");
         if let Err(e) = devfs_inode {
             error!("failed to get DevFS ref. errcode = {:?}", e);
             return Err(SystemError::ENOENT);
@@ -722,10 +735,11 @@ pub fn devfs_init() -> Result<(), SystemError> {
         // 创建 devfs 实例
         let devfs: Arc<DevFS> = DevFS::new();
         // devfs 挂载
-        ROOT_INODE()
+        let root_inode = ProcessManager::current_mntns().root_inode();
+        root_inode
             .mkdir("dev", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /dev")
-            .mount(devfs)
+            .mount(devfs, MountFlags::empty())
             .expect("Failed to mount at /dev");
         info!("DevFS mounted.");
         result = Some(Ok(()));

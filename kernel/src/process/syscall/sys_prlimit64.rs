@@ -7,7 +7,7 @@ use crate::{
     mm::{ucontext::UserStack, MemoryManagementArch},
     process::{
         resource::{RLimit64, RLimitID},
-        Pid,
+        RawPid,
     },
     syscall::user_access::UserBufferWriter,
 };
@@ -18,8 +18,8 @@ use crate::arch::interrupt::TrapFrame;
 pub struct SysPrlimit64;
 
 impl SysPrlimit64 {
-    fn pid(args: &[usize]) -> Pid {
-        Pid::new(args[0])
+    fn pid(args: &[usize]) -> RawPid {
+        RawPid::new(args[0])
     }
 
     fn resource(args: &[usize]) -> usize {
@@ -84,7 +84,7 @@ syscall_table_macros::declare_syscall!(SYS_PRLIMIT64, SysPrlimit64);
 /// - 如果old_limit不为NULL，则返回旧的资源限制到old_limit
 ///
 pub(super) fn do_prlimit64(
-    _pid: Pid,
+    _pid: RawPid,
     resource: usize,
     _new_limit: *const RLimit64,
     old_limit: *mut RLimit64,

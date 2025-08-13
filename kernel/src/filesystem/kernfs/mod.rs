@@ -32,6 +32,7 @@ pub mod callback;
 #[derive(Debug)]
 pub struct KernFS {
     root_inode: Arc<KernFSInode>,
+    fsname: &'static str,
 }
 
 impl FileSystem for KernFS {
@@ -51,7 +52,7 @@ impl FileSystem for KernFS {
     }
 
     fn name(&self) -> &str {
-        "kernfs"
+        self.fsname
     }
 
     fn super_block(&self) -> SuperBlock {
@@ -66,19 +67,15 @@ impl FileSystem for KernFS {
 impl KernFS {
     pub const MAX_NAMELEN: usize = 4096;
     pub const KERNFS_BLOCK_SIZE: u64 = 512;
-    #[allow(dead_code)]
-    pub fn new() -> Arc<Self> {
+
+    #[inline(never)]
+    pub fn new(fsname: &'static str) -> Arc<Self> {
         let root_inode = Self::create_root_inode();
         let fs = Arc::new(Self {
             root_inode: root_inode.clone(),
+            fsname,
         });
 
-        {
-            let ptr = root_inode.as_ref() as *const KernFSInode as *mut KernFSInode;
-            unsafe {
-                (*ptr).self_ref = Arc::downgrade(&root_inode);
-            }
-        }
         root_inode.inner.write().parent = Arc::downgrade(&root_inode);
         *root_inode.fs.write() = Arc::downgrade(&fs);
         return fs;
@@ -102,7 +99,7 @@ impl KernFS {
             nlinks: 1,
             raw_dev: DeviceNumber::default(),
         };
-        let root_inode = Arc::new(KernFSInode {
+        let root_inode = Arc::new_cyclic(|self_ref| KernFSInode {
             name: String::from(""),
             inner: RwLock::new(InnerKernFSInode {
                 parent: Weak::new(),
@@ -110,7 +107,7 @@ impl KernFS {
                 symlink_target: None,
                 symlink_target_absolute_path: None,
             }),
-            self_ref: Weak::new(),
+            self_ref: self_ref.clone(),
             fs: RwLock::new(Weak::new()),
             private_data: SpinLock::new(None),
             callback: None,

@@ -1,6 +1,3 @@
-#![allow(incomplete_features)]
-#![feature(generic_const_exprs)]
-
 extern crate clap;
 
 extern crate lazy_static;

@@ -3,7 +3,7 @@
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
-        fcntl::AtFlags, mount::MOUNT_LIST, produce_fs, utils::user_path_at, FileSystem, MountFS,
+        fcntl::AtFlags, mount::MountFlags, produce_fs, utils::user_path_at, FileSystem, MountFS,
         MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     process::ProcessManager,
@@ -25,7 +25,7 @@ use system_error::SystemError;
 /// - source       挂载设备(目前只支持ext4格式的硬盘)
 /// - target       挂载目录
 /// - filesystemtype   文件系统
-/// - mountflags     挂载选项（暂未实现）
+/// - mountflags     挂载选项
 /// - data        带数据挂载
 ///
 /// ## 返回值
@@ -43,6 +43,9 @@ impl Syscall for SysMountHandle {
         let filesystemtype = Self::filesystemtype(args);
         let data = Self::raw_data(args);
         let source = Self::source(args);
+        let mount_flags = Self::mountflags(args);
+
+        let mount_flags = MountFlags::from_bits_truncate(mount_flags);
 
         let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
             .into_string()
@@ -57,12 +60,14 @@ impl Syscall for SysMountHandle {
 
         let fs = produce_fs(fstype_str, data, source)?;
 
-        do_mount(fs, &target)?;
+        do_mount(fs, &target, mount_flags)?;
 
         return Ok(0);
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
+        let flags = MountFlags::from_bits(Self::mountflags(args)).unwrap_or(MountFlags::empty());
+
         vec![
             FormattedSyscallParam::new("source", format!("{:#x}", Self::source(args) as usize)),
             FormattedSyscallParam::new("target", format!("{:#x}", Self::target(args) as usize)),
@@ -70,7 +75,10 @@ impl Syscall for SysMountHandle {
                 "filesystem type",
                 format!("{:#x}", Self::filesystemtype(args) as usize),
             ),
-            FormattedSyscallParam::new("mountflags", format!("{:#x}", Self::mountflags(args))),
+            FormattedSyscallParam::new(
+                "mountflags",
+                format!("{:?} ({:#x})", flags, Self::mountflags(args)),
+            ),
             FormattedSyscallParam::new("data", format!("{:?}", Self::raw_data(args))),
         ]
     }
@@ -86,8 +94,8 @@ impl SysMountHandle {
     fn filesystemtype(args: &[usize]) -> *const u8 {
         args[2] as *const u8
     }
-    fn mountflags(args: &[usize]) -> usize {
-        args[3]
+    fn mountflags(args: &[usize]) -> u32 {
+        args[3] as u32
     }
     fn raw_data(args: &[usize]) -> Option<&'static str> {
         let raw = args[4] as *const u8;
@@ -120,18 +128,23 @@ syscall_table_macros::declare_syscall!(SYS_MOUNT, SysMountHandle);
 ///
 /// - `Ok(Arc<MountFS>)`: 挂载成功后返回挂载的文件系统。
 /// - `Err(SystemError)`: 挂载失败时返回错误。
-pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountFS>, SystemError> {
+pub fn do_mount(
+    fs: Arc<dyn FileSystem>,
+    mount_point: &str,
+    mount_flags: MountFlags,
+) -> Result<Arc<MountFS>, SystemError> {
     let (current_node, rest_path) = user_path_at(
         &ProcessManager::current_pcb(),
         AtFlags::AT_FDCWD.bits(),
         mount_point,
     )?;
     let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
+    let result = ProcessManager::current_mntns().get_mount_point(mount_point);
+    if let Some((_, rest, _fs)) = result {
         if rest.is_empty() {
             return Err(SystemError::EBUSY);
         }
     }
     // 移至IndexNode.mount()来记录
-    return inode.mount(fs);
+    return inode.mount(fs, mount_flags);
 }

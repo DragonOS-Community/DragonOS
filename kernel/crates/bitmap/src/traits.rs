@@ -241,9 +241,10 @@ pub trait BitMapOps<T: BitOps> {
     ///
     /// ```
     /// use bitmap::StaticBitmap;
+    /// use bitmap::static_bitmap;
     /// use bitmap::traits::BitMapOps;
     ///
-    /// let mut bitmap = StaticBitmap::<34>::new();
+    /// let mut bitmap: static_bitmap!(34) = StaticBitmap::new();
     /// assert_eq!(bitmap.len(), 34);
     /// ```
     ///

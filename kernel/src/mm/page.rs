@@ -330,6 +330,40 @@ impl PageReclaimer {
         let _ = ProcessManager::wakeup(unsafe { PAGE_RECLAIMER_THREAD.as_ref().unwrap() });
     }
 
+    /// 清理页面映射的辅助函数
+    /// ## 参数
+    /// - `page_guard`: 页面的写锁保护
+    /// - `page_index`: 页面索引
+    /// - `unmap`: 是否取消映射
+    fn cleanup_page_mappings(page_guard: &RwLockWriteGuard<InnerPage>, page_index: usize, unmap: bool) {
+        for vma in page_guard.vma_set() {
+            let address_space = vma.lock_irqsave().address_space().and_then(|x| x.upgrade());
+            if address_space.is_none() {
+                continue;
+            }
+            let address_space = address_space.unwrap();
+            let mut as_guard = address_space.write();
+            let mapper = &mut as_guard.user_mapper.utable;
+            
+            // 安全地获取虚拟地址
+            if let Ok(virt) = vma.lock_irqsave().page_address(page_index) {
+                if unmap {
+                    unsafe {
+                        // 取消页表映射，忽略可能的错误
+                        let _ = mapper.unmap(virt, false).map(|flush| flush.flush());
+                    }
+                } else {
+                    unsafe {
+                        // 保护位设为只读，安全处理可能的错误
+                        if let Some(entry) = mapper.get_entry(virt, 0) {
+                            mapper.remap(virt, entry.flags().set_write(false));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 脏页回写函数
     /// ## 参数
     ///
@@ -339,8 +373,6 @@ impl PageReclaimer {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub fn page_writeback(guard: &mut RwLockWriteGuard<InnerPage>, unmap: bool) {
-        // log::debug!("page writeback: {:?}", guard.phys_addr);
-
         let (page_cache, page_index) = match guard.page_type() {
             PageType::File(info) => (info.page_cache.clone(), info.index),
             _ => {
@@ -349,32 +381,23 @@ impl PageReclaimer {
             }
         };
         let paddr = guard.phys_address();
-        let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
+        
+        // 尝试获取inode，如果失败则说明文件已被删除，无需回写
+        let inode = match page_cache.inode().clone().and_then(|weak_ref| weak_ref.upgrade()) {
+            Some(inode) => inode,
+            None => {
+                log::debug!("page_writeback: inode has been dropped for file page, skip writeback. paddr: {:?}", paddr);
+                // 文件已删除，清理页面映射
+                Self::cleanup_page_mappings(&guard, page_index, unmap);
+                
+                // 清除脏位，避免再次被处理
+                guard.remove_flags(PageFlags::PG_DIRTY);
+                return;
+            }
+        };
 
-        for vma in guard.vma_set() {
-            let address_space = vma.lock_irqsave().address_space().and_then(|x| x.upgrade());
-            if address_space.is_none() {
-                continue;
-            }
-            let address_space = address_space.unwrap();
-            let mut guard = address_space.write();
-            let mapper = &mut guard.user_mapper.utable;
-            let virt = vma.lock_irqsave().page_address(page_index).unwrap();
-            if unmap {
-                unsafe {
-                    // 取消页表映射
-                    mapper.unmap(virt, false).unwrap().flush();
-                }
-            } else {
-                unsafe {
-                    // 保护位设为只读
-                    mapper.remap(
-                        virt,
-                        mapper.get_entry(virt, 0).unwrap().flags().set_write(false),
-                    )
-                };
-            }
-        }
+        // 正常情况下清理页面映射
+        Self::cleanup_page_mappings(&guard, page_index, unmap);
 
         let len = if let Ok(metadata) = inode.metadata() {
             let size = metadata.size as usize;
@@ -410,12 +433,32 @@ impl PageReclaimer {
     /// lru脏页刷新
     pub fn flush_dirty_pages(&mut self) {
         // log::info!("flush_dirty_pages");
+        
+        // 收集需要移除的孤儿页面
+        let mut pages_to_remove = Vec::new();
+        
         let iter = self.lru.iter();
-        for (_paddr, page) in iter {
+        for (paddr, page) in iter {
             let mut guard = page.write_irqsave();
             if guard.flags().contains(PageFlags::PG_DIRTY) {
+                // 检查是否是孤儿页面（文件已删除的页面）
+                if let PageType::File(info) = guard.page_type() {
+                    if info.page_cache.inode().clone().and_then(|weak_ref| weak_ref.upgrade()).is_none() {
+                        // 这是一个孤儿页面，清除脏位并标记为待移除
+                        guard.remove_flags(PageFlags::PG_DIRTY);
+                        pages_to_remove.push(*paddr);
+                        drop(guard);
+                        continue;
+                    }
+                }
+                
                 Self::page_writeback(&mut guard, false);
             }
+        }
+        
+        // 移除孤儿页面
+        for paddr in pages_to_remove {
+            self.remove_page(&paddr);
         }
     }
 }

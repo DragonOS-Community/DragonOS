@@ -259,6 +259,25 @@ impl LockedFATInode {
         return inode;
     }
 
+    /// 更新 inode 的名称和父目录引用的辅助函数
+    fn update_inode_metadata(
+        inode: &Arc<LockedFATInode>,
+        new_name: &str,
+        new_parent: Option<&Arc<LockedFATInode>>,
+    ) {
+        let mut inode_guard = inode.0.lock();
+        inode_guard.dname = DName::from(new_name);
+        
+        // 如果提供了新的父目录，则更新父目录引用
+        if let Some(parent) = new_parent {
+            if let Some(parent_arc) = parent.0.lock().self_ref.upgrade() {
+                inode_guard.parent = Arc::downgrade(&parent_arc);
+            } else {
+                log::warn!("update_inode_metadata: could not update parent reference - parent self_ref is None");
+            }
+        }
+    }
+
     #[inline(never)]
     fn rename_file_in_current_dir(
         &self,
@@ -267,25 +286,36 @@ impl LockedFATInode {
     ) -> Result<(), SystemError> {
         let mut guard = self.0.lock();
         let old_inode: Arc<LockedFATInode> = guard.find(old_name)?;
-        // 对目标inode上锁，以防更改
-        let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
-        let fs = old_inode_guard.fs.upgrade().unwrap();
-        // 从缓存删除
+        
+        let fs = old_inode.0.lock().fs.upgrade().unwrap();
+        
         let old_dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
             }
-            FATDirEntry::Dir(d) => d,
+            FATDirEntry::Dir(d) => d.clone(),
             FATDirEntry::UnInit => {
                 error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         };
+        
         // 检查文件是否存在
         // old_dir.check_existence(old_name, Some(false), guard.fs.upgrade().unwrap())?;
 
         old_dir.rename(fs, old_name, new_name)?;
-        let _nod = guard.children.remove(&to_search_name(old_name));
+        
+        let old_search_name = to_search_name(old_name);
+        let new_search_name = to_search_name(new_name);
+        
+        if let Some(moved_inode) = guard.children.remove(&old_search_name) {
+            // 更新inode的名字（同目录重命名，父目录不变）
+            Self::update_inode_metadata(&moved_inode, new_name, None);
+            guard.children.insert(new_search_name, moved_inode);
+        } else {
+            log::warn!("rename_file_in_current_dir: inode '{}' not found in cache during rename", old_name);
+        }
+        
         Ok(())
     }
 
@@ -296,42 +326,70 @@ impl LockedFATInode {
         new_name: &str,
         target: &Arc<dyn IndexNode>,
     ) -> Result<(), SystemError> {
-        let mut old_guard = self.0.lock();
         let other: &LockedFATInode = target
             .downcast_ref::<LockedFATInode>()
             .ok_or(SystemError::EPERM)?;
 
-        let new_guard = other.0.lock();
-        let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
-        // 对目标inode上锁，以防更改
-        let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
-        let fs = old_inode_guard.fs.upgrade().unwrap();
+        // 如果是同一个目录，使用rename_file_in_current_dir
+        let self_ptr = self as *const LockedFATInode;
+        let other_ptr = other as *const LockedFATInode;
+        if self_ptr == other_ptr {
+            return self.rename_file_in_current_dir(old_name, new_name);
+        }
 
+        let mut old_guard = self.0.lock();
+        let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
+        
+        let fs = old_inode.0.lock().fs.upgrade().unwrap();
+        
         let old_dir = match &old_guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
             }
-            FATDirEntry::Dir(d) => d,
+            FATDirEntry::Dir(d) => d.clone(),
             FATDirEntry::UnInit => {
                 error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         };
+        
+        // 获取新目录的信息
+        let new_guard = other.0.lock();
         let new_dir = match &new_guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
             }
-            FATDirEntry::Dir(d) => d,
+            FATDirEntry::Dir(d) => d.clone(),
             FATDirEntry::UnInit => {
                 error!("FATFA: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         };
-        // 检查文件是否存在
+        drop(new_guard);
+        
+        // 检查文件是否存在并重命名
         old_dir.check_existence(old_name, Some(false), old_guard.fs.upgrade().unwrap())?;
-        old_dir.rename_across(fs, new_dir, old_name, new_name)?;
-        // 从缓存删除
-        let _nod = old_guard.children.remove(&to_search_name(old_name));
+        old_dir.rename_across(fs, &new_dir, old_name, new_name)?;
+        
+        let old_search_name = to_search_name(old_name);
+        let new_search_name = to_search_name(new_name);
+        
+        if let Some(moved_inode) = old_guard.children.remove(&old_search_name) {
+            let new_parent_arc = other.0.lock().self_ref.upgrade();
+
+            if let Some(new_parent) = &new_parent_arc {
+                Self::update_inode_metadata(&moved_inode, new_name, Some(new_parent));
+            } else {
+                log::warn!("move_to_another_dir: could not get target directory Arc reference");
+                Self::update_inode_metadata(&moved_inode, new_name, None);
+            }
+            
+            drop(old_guard);
+            other.0.lock().children.insert(new_search_name, moved_inode);
+        } else {
+            log::warn!("move_to_another_dir: inode '{}' not found in cache during move", old_name);
+            drop(old_guard);
+        }
 
         Ok(())
     }
@@ -1842,8 +1900,13 @@ impl IndexNode for LockedFATInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), SystemError> {
-        let old_id = self.metadata().unwrap().inode_id;
-        let new_id = target.metadata().unwrap().inode_id;
+        // 获取inode_id时不能持有锁，避免死锁
+        let old_id = {
+            let guard = self.0.lock();
+            guard.metadata.inode_id
+        };
+        let new_id = target.metadata()?.inode_id;
+        
         // 若在同一父目录下
         if old_id == new_id {
             self.rename_file_in_current_dir(old_name, new_name)?;

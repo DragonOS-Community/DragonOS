@@ -117,6 +117,7 @@ impl Syscall {
         verify_area(head_uaddr, core::mem::size_of::<u32>())?;
 
         let ret = RobustListHead::set_robust_list(head_uaddr, len);
+        log::debug!("set_robust_list: pid: {} head_uaddr={:?}", crate::process::ProcessManager::current_pid(), head_uaddr);
         return ret;
     }
 

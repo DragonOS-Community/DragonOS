@@ -660,6 +660,11 @@ pub struct RobustListHead {
 impl RobustListHead {
     /// # 获得futex的用户空间地址
     pub fn futex_uaddr(&self, entry: VirtAddr) -> VirtAddr {
+        log::debug!(
+            "futex_uaddr: entry:{:?}, futex_offset:{}",
+            entry,
+            self.futex_offset
+        );
         return VirtAddr::new(entry.data() + self.futex_offset as usize);
     }
 
@@ -750,8 +755,18 @@ impl RobustListHead {
                 return;
             }
         };
+        log::debug!(
+            "exit_robust_list: pid:{}, head:{:?}",
+            pcb.raw_pid().data(),
+            head
+        );
         // 遍历当前进程/线程的robust list
         for futex_uaddr in head.futexes() {
+            log::debug!(
+                "futex_uaddr:{:?}, pid:{}",
+                futex_uaddr,
+                pcb.raw_pid().data()
+            );
             let ret = Self::handle_futex_death(futex_uaddr, pcb.raw_pid().into() as u32);
             if ret.is_err() {
                 return;

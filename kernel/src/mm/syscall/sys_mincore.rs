@@ -1,8 +1,15 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_MINCORE;
+use crate::arch::MMArch;
+use crate::libs::align::page_align_up;
+use crate::mm::allocator::page_frame::{PageFrameCount, VirtPageFrame};
+use crate::mm::ucontext::AddressSpace;
+use crate::mm::{verify_area, MemoryManagementArch};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use crate::syscall::user_access::UserBufferWriter;
 use system_error::SystemError;
 
+use crate::mm::VirtAddr;
 use alloc::vec::Vec;
 
 pub struct SysMincoreHandle;
@@ -14,9 +21,37 @@ impl Syscall for SysMincoreHandle {
 
     /// ## mincore系统调用
     ///
-    /// todo: 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/mm/mincore.c#232 实现mincore
-    fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOSYS);
+    /// ## 参数
+    ///
+    /// - `start_vaddr`：起始地址(已经对齐到页)
+    /// - `len`：需要遍历的长度
+    /// - `vec`：用户空间的vec指针
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        let start_vaddr = VirtAddr::new(Self::start_vaddr(args));
+        let len = Self::len(args);
+        let vec = Self::vec(args);
+        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
+
+        if verify_area(start_vaddr, len).is_err() {
+            return Err(SystemError::ENOMEM);
+        }
+        if len == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let len = page_align_up(len);
+        let current_address_space = AddressSpace::current()?;
+        let start_frame = VirtPageFrame::new(start_vaddr);
+        let page_count = len >> MMArch::PAGE_SHIFT;
+
+        let mut writer = UserBufferWriter::new(vec as *mut u8, page_count, true)?;
+        let mut tmp: Vec<u8> = vec![0; page_count];
+        let page_count = PageFrameCount::new(page_count);
+        current_address_space
+            .write()
+            .mincore(start_frame, page_count, &mut tmp)?;
+
+        writer.copy_to_user(&tmp, 0)?;
+        return Ok(0);
     }
 
     /// Formats the syscall arguments for display/debugging purposes.

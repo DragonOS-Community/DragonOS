@@ -3,6 +3,7 @@ use core::cmp::Ordering;
 use core::fmt::Debug;
 
 use crate::libs::spinlock::SpinLock;
+use crate::process::ProcessManager;
 
 use super::nsproxy::NsCommon;
 use super::{NamespaceOps, NamespaceType};
@@ -84,5 +85,16 @@ impl UserNamespace {
 impl Debug for UserNamespace {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UserNamespace").finish()
+    }
+}
+
+impl ProcessManager {
+    /// 获取当前进程的 user_ns
+    pub fn current_user_ns() -> Arc<UserNamespace> {
+        if Self::initialized() {
+            ProcessManager::current_pcb().cred().user_ns.clone()
+        } else {
+            INIT_USER_NAMESPACE.clone()
+        }
     }
 }

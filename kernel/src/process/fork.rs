@@ -339,7 +339,6 @@ impl ProcessManager {
         clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
-        // log::debug!("fork: clone_flags: {:?}", clone_args.flags);
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 

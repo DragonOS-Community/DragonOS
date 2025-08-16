@@ -452,9 +452,6 @@ impl ProcessManager {
 
             // 进行进程退出后的工作
             let thread = pcb.thread.write_irqsave();
-            if let Some(addr) = thread.set_child_tid {
-                unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
-            }
 
             if let Some(addr) = thread.clear_child_tid {
                 if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
@@ -467,9 +464,9 @@ impl ProcessManager {
                 }
                 unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
             }
+            compiler_fence(Ordering::SeqCst);
 
             RobustListHead::exit_robust_list(pcb.clone());
-
             // 如果是vfork出来的进程，则需要处理completion
             if thread.vfork_done.is_some() {
                 thread.vfork_done.as_ref().unwrap().complete_all();

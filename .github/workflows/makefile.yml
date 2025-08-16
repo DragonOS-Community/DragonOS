@@ -82,6 +82,8 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           HOME: /root
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         shell: bash -ileo pipefail {0}
         run: |
           source $HOME/.bashrc

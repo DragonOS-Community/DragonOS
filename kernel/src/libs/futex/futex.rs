@@ -2,7 +2,10 @@ use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
 };
-use core::hash::{Hash, Hasher};
+use core::{
+    hash::{Hash, Hasher},
+    ops::{Deref, DerefMut},
+};
 use core::{
     intrinsics::{likely, unlikely},
     mem,
@@ -646,25 +649,42 @@ impl Futex {
 const ROBUST_LIST_LIMIT: isize = 2048;
 
 #[derive(Debug, Copy, Clone)]
-pub struct RobustList {
+#[repr(C)]
+struct PosixRobustList {
     next: VirtAddr,
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct RobustListHead {
-    list: RobustList,
+#[repr(C)]
+pub struct PosixRobustListHead {
+    list: PosixRobustList,
     futex_offset: isize,
     list_op_pending: VirtAddr,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct RobustListHead {
+    pub posix: PosixRobustListHead,
+    pub uaddr: VirtAddr,
+}
+
+impl Deref for RobustListHead {
+    type Target = PosixRobustListHead;
+
+    fn deref(&self) -> &Self::Target {
+        &self.posix
+    }
+}
+
+impl DerefMut for RobustListHead {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.posix
+    }
 }
 
 impl RobustListHead {
     /// # 获得futex的用户空间地址
     pub fn futex_uaddr(&self, entry: VirtAddr) -> VirtAddr {
-        log::debug!(
-            "futex_uaddr: entry:{:?}, futex_offset:{}",
-            entry,
-            self.futex_offset
-        );
         return VirtAddr::new(entry.data() + self.futex_offset as usize);
     }
 
@@ -682,18 +702,21 @@ impl RobustListHead {
     /// - head_uaddr：robust list head用户空间地址
     /// - len：robust list head的长度    
     pub fn set_robust_list(head_uaddr: VirtAddr, len: usize) -> Result<usize, SystemError> {
-        let robust_list_head_len = mem::size_of::<RobustListHead>();
+        let robust_list_head_len = mem::size_of::<PosixRobustListHead>();
         if unlikely(len != robust_list_head_len) {
             return Err(SystemError::EINVAL);
         }
 
         let user_buffer_reader = UserBufferReader::new(
-            head_uaddr.as_ptr::<RobustListHead>(),
-            mem::size_of::<RobustListHead>(),
+            head_uaddr.as_ptr::<PosixRobustListHead>(),
+            mem::size_of::<PosixRobustListHead>(),
             true,
         )?;
-        let robust_list_head = *user_buffer_reader.read_one_from_user::<RobustListHead>(0)?;
-
+        let robust_list_head = *user_buffer_reader.read_one_from_user::<PosixRobustListHead>(0)?;
+        let robust_list_head = RobustListHead {
+            posix: robust_list_head,
+            uaddr: head_uaddr,
+        };
         // 向内核注册robust list
         ProcessManager::current_pcb().set_robust_list(Some(robust_list_head));
 
@@ -731,11 +754,11 @@ impl RobustListHead {
             core::mem::size_of::<usize>(),
             true,
         )?;
-        user_writer.copy_one_to_user(&mem::size_of::<RobustListHead>(), 0)?;
+        user_writer.copy_one_to_user(&mem::size_of::<PosixRobustListHead>(), 0)?;
         // 将head拷贝到用户空间head
         let mut user_writer = UserBufferWriter::new(
-            head_uaddr.as_ptr::<RobustListHead>(),
-            mem::size_of::<RobustListHead>(),
+            head_uaddr.as_ptr::<PosixRobustListHead>(),
+            mem::size_of::<PosixRobustListHead>(),
             true,
         )?;
         user_writer.copy_one_to_user(&robust_list_head, 0)?;
@@ -755,18 +778,9 @@ impl RobustListHead {
                 return;
             }
         };
-        log::debug!(
-            "exit_robust_list: pid:{}, head:{:?}",
-            pcb.raw_pid().data(),
-            head
-        );
+
         // 遍历当前进程/线程的robust list
         for futex_uaddr in head.futexes() {
-            log::debug!(
-                "futex_uaddr:{:?}, pid:{}",
-                futex_uaddr,
-                pcb.raw_pid().data()
-            );
             let ret = Self::handle_futex_death(futex_uaddr, pcb.raw_pid().into() as u32);
             if ret.is_err() {
                 return;
@@ -894,7 +908,7 @@ impl Iterator for FutexIterator<'_> {
             return None;
         }
 
-        while self.entry.data() != &self.robust_list_head.list as *const RobustList as usize {
+        while self.entry.data() != self.robust_list_head.uaddr.data() {
             if self.count == ROBUST_LIST_LIMIT {
                 break;
             }
@@ -910,8 +924,13 @@ impl Iterator for FutexIterator<'_> {
             };
 
             // 安全地读取下一个entry
-            let next_entry = RobustListHead::safe_read::<RobustList>(self.entry)
-                .and_then(|reader| reader.read_one_from_user::<RobustList>(0).ok().cloned())?;
+            let next_entry =
+                RobustListHead::safe_read::<PosixRobustList>(self.entry).and_then(|reader| {
+                    reader
+                        .read_one_from_user::<PosixRobustList>(0)
+                        .ok()
+                        .cloned()
+                })?;
 
             self.entry = next_entry.next;
 

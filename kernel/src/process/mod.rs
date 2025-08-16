@@ -415,7 +415,6 @@ impl ProcessManager {
     ///
     ///  因此注意，传入的`exit_code`应该是已经完成了移位操作的
     pub fn exit(exit_code: usize) -> ! {
-        log::debug!("exit-1: starting exit with code {}", exit_code);
         // 检查是否是init进程尝试退出，如果是则产生panic
         let current_pcb = ProcessManager::current_pcb();
         if current_pcb.raw_pid() == RawPid(1) {
@@ -434,14 +433,12 @@ impl ProcessManager {
 
         let pid: Arc<Pid>;
         let raw_pid = ProcessManager::current_pid();
-        log::debug!("exit-2: interrupts disabled, raw_pid: {:?}", raw_pid);
         {
             let pcb = ProcessManager::current_pcb();
             pid = pcb.pid();
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
-            log::debug!("exit-3: process state set to Exited");
             pcb.wait_queue.mark_dead();
             pcb.wait_queue.wakeup_all(Some(ProcessState::Blocked(true)));
 
@@ -452,7 +449,6 @@ impl ProcessManager {
                 DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
             );
             drop(guard);
-            log::debug!("exit-4: task deactivated from run queue");
 
             // 进行进程退出后的工作
             let thread = pcb.thread.write_irqsave();
@@ -469,19 +465,15 @@ impl ProcessManager {
                 unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
             }
             compiler_fence(Ordering::SeqCst);
-            log::debug!("exit-4.2: cleared clear_child_tid");
 
             RobustListHead::exit_robust_list(pcb.clone());
-            log::debug!("exit-4.3: exited robust list");
             // 如果是vfork出来的进程，则需要处理completion
             if thread.vfork_done.is_some() {
                 thread.vfork_done.as_ref().unwrap().complete_all();
             }
             drop(thread);
-            log::debug!("exit-4.4: vfork_done completed");
             unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();
-            log::debug!("exit-4.5: exited files");
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
             if let Some(tty) = pcb.sig_info_irqsave().tty() {
@@ -493,13 +485,10 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
             drop(pcb);
-            log::debug!("exit-5: cleanup completed, calling exit_notify");
             ProcessManager::exit_notify();
         }
 
-        log::debug!("exit-6: calling __schedule");
         __schedule(SchedMode::SM_NONE);
-        log::debug!("exit-7: scheduled again after exit - this should not happen!");
         error!("raw_pid {raw_pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
         loop {

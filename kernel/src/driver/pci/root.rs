@@ -47,10 +47,14 @@ impl core::fmt::Display for PciRoot {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         if let Some(ecam_root_info) = &self.ecam_root_info {
             write!(
-                    f,
-                    "PCI Eacm Root with segment:{}, bus begin at {}, bus end at {}, physical address at {:?},mapped at {:?}",
-                    ecam_root_info.segment_group_number, ecam_root_info.bus_begin, ecam_root_info.bus_end, ecam_root_info.physical_address_base, self.mmio_guard
-                )
+                f,
+                "PCI Eacm Root with segment:{}, bus begin at {}, bus end at {}, physical address at {:?},mapped at {:?}",
+                ecam_root_info.segment_group_number,
+                ecam_root_info.bus_begin,
+                ecam_root_info.bus_end,
+                ecam_root_info.physical_address_base,
+                self.mmio_guard
+            )
         } else {
             write!(f, "PCI Root cam is {:?}", self.cam,)
         }
@@ -211,7 +215,7 @@ impl PciRoot {
     pub fn external_capabilities(
         &self,
         bus_device_function: BusDeviceFunction,
-    ) -> ExternalCapabilityIterator {
+    ) -> ExternalCapabilityIterator<'_> {
         ExternalCapabilityIterator {
             root: self,
             bus_device_function,

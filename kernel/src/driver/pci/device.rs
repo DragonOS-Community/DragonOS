@@ -117,7 +117,7 @@ impl PciBusDevice {
         return Arc::new(bus_device);
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerPciBusDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerPciBusDevice> {
         self.inner.lock()
     }
 }
@@ -159,11 +159,11 @@ impl KObject for PciBusDevice {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

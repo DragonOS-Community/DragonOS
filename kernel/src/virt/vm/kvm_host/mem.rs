@@ -119,12 +119,12 @@ impl LockedKvmMemSlot {
     }
 
     #[inline]
-    pub fn read(&self) -> RwLockReadGuard<KvmMemSlot> {
+    pub fn read(&self) -> RwLockReadGuard<'_, KvmMemSlot> {
         self.inner.read()
     }
 
     #[inline]
-    pub fn write(&self) -> RwLockWriteGuard<KvmMemSlot> {
+    pub fn write(&self) -> RwLockWriteGuard<'_, KvmMemSlot> {
         self.inner.write()
     }
 
@@ -165,7 +165,7 @@ pub struct KvmMemSlot {
 #[allow(dead_code)]
 impl KvmMemSlot {
     pub fn check_aligned_addr(&self, align: usize) -> bool {
-        self.userspace_addr.data() % align == 0
+        self.userspace_addr.data().is_multiple_of(align)
     }
     pub fn get_flags(&self) -> UserMemRegionFlag {
         self.flags
@@ -192,7 +192,7 @@ impl LockedVmMemSlotSet {
         })
     }
 
-    pub fn lock(&self) -> SpinLockGuard<KvmMemSlotSet> {
+    pub fn lock(&self) -> SpinLockGuard<'_, KvmMemSlotSet> {
         self.inner.lock()
     }
 }

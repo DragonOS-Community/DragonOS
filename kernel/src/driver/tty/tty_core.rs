@@ -361,7 +361,7 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn flow_irqsave(&self) -> SpinLockGuard<TtyFlowState> {
+    pub fn flow_irqsave(&self) -> SpinLockGuard<'_, TtyFlowState> {
         self.flow.lock_irqsave()
     }
 
@@ -400,7 +400,7 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn termios_write(&self) -> RwLockWriteGuard<Termios> {
+    pub fn termios_write(&self) -> RwLockWriteGuard<'_, Termios> {
         self.termios.write_irqsave()
     }
 
@@ -443,22 +443,22 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn contorl_info_irqsave(&self) -> SpinLockGuard<TtyControlInfo> {
+    pub fn contorl_info_irqsave(&self) -> SpinLockGuard<'_, TtyControlInfo> {
         self.ctrl.lock_irqsave()
     }
 
     #[inline]
-    pub fn window_size_upgradeable(&self) -> RwLockUpgradableGuard<WindowSize> {
+    pub fn window_size_upgradeable(&self) -> RwLockUpgradableGuard<'_, WindowSize> {
         self.window_size.upgradeable_read()
     }
 
     #[inline]
-    pub fn window_size(&self) -> RwLockReadGuard<WindowSize> {
+    pub fn window_size(&self) -> RwLockReadGuard<'_, WindowSize> {
         self.window_size.read()
     }
 
     #[inline]
-    pub fn window_size_write(&self) -> RwLockWriteGuard<WindowSize> {
+    pub fn window_size_write(&self) -> RwLockWriteGuard<'_, WindowSize> {
         self.window_size.write()
     }
 

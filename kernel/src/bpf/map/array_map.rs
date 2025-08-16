@@ -43,7 +43,7 @@ impl Debug for ArrayMapData {
 
 impl ArrayMapData {
     pub fn new(elem_size: u32, max_entries: u32) -> Self {
-        debug_assert!(elem_size % 8 == 0);
+        debug_assert!(elem_size.is_multiple_of(8));
         let total_size = elem_size * max_entries;
         let data = vec![0; total_size as usize];
         ArrayMapData { elem_size, data }

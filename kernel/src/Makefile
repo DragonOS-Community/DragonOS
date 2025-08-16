@@ -39,9 +39,10 @@ LD_LIST := ""
 
 kernel_subdirs := debug
 
+TOOLCHAIN := +nightly-2025-08-10
 
 kernel_rust:
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo $(TOOLCHAIN) $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
 
 
 all: kernel
@@ -163,4 +164,4 @@ clean:
 
 .PHONY: check
 check:
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 $(CARGO_ZBUILD) check --workspace --message-format=json --target $(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo $(TOOLCHAIN) $(CARGO_ZBUILD) check --workspace --message-format=json --target $(TARGET_JSON)

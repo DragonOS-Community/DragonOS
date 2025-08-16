@@ -188,23 +188,24 @@ fn do_select(
         let revents = poll_fd.revents;
         let revents = EPollEventType::from_bits_truncate(revents as u32);
         let (readable, writable, except) = convert_events_to_rwe(revents)?;
-        if let Some(ref mut fds) = readfds
-            && readable
-        {
-            fds.set(fd)?;
-            total_revents += 1;
+        if readable {
+            if let Some(ref mut fds) = readfds {
+                fds.set(fd)?;
+                total_revents += 1;
+            }
         }
-        if let Some(ref mut fds) = writefds
-            && writable
-        {
-            fds.set(fd)?;
-            total_revents += 1;
+
+        if writable {
+            if let Some(ref mut fds) = writefds {
+                fds.set(fd)?;
+                total_revents += 1;
+            }
         }
-        if let Some(ref mut fds) = exceptfds
-            && except
-        {
-            fds.set(fd)?;
-            total_revents += 1;
+        if except {
+            if let Some(ref mut fds) = exceptfds {
+                fds.set(fd)?;
+                total_revents += 1;
+            }
         }
     }
     Ok(total_revents)

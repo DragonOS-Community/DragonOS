@@ -65,7 +65,7 @@ impl TracingEventsManager {
     }
 
     /// Get the tracepoint map
-    pub fn tracepoint_map(&self) -> SpinLockGuard<TracePointMap> {
+    pub fn tracepoint_map(&self) -> SpinLockGuard<'_, TracePointMap> {
         self.map.lock()
     }
 

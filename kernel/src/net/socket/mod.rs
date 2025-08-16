@@ -276,11 +276,11 @@ impl SocketInode {
     }
 
     #[inline]
-    pub fn inner(&self) -> SpinLockGuard<Box<dyn Socket>> {
+    pub fn inner(&self) -> SpinLockGuard<'_, Box<dyn Socket>> {
         self.0.lock()
     }
 
-    pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
+    pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<'_, Box<dyn Socket>> {
         self.0.lock_no_preempt()
     }
 
@@ -482,7 +482,7 @@ impl SocketHandleItem {
         *self.shutdown_type.read()
     }
 
-    pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
+    pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<'_, ShutdownType> {
         self.shutdown_type.write_irqsave()
     }
 

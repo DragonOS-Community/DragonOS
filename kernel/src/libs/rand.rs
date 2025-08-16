@@ -60,6 +60,6 @@ pub fn soft_rand() -> usize {
             *x = (SEED >> 33) as u8;
         }
     }
-    let x: usize = unsafe { core::mem::transmute(buf) };
+    let x: usize = usize::from_ne_bytes(buf);
     return x;
 }

@@ -550,7 +550,7 @@ impl SigQueue {
             return false;
         };
         // 从sigqueue中过滤出结果
-        let mut filter_result: Vec<SigInfo> = self.q.extract_if(filter).collect();
+        let mut filter_result: Vec<SigInfo> = self.q.extract_if(.., filter).collect();
         // 筛选出的结果不能大于1个
         assert!(filter_result.len() <= 1);
 

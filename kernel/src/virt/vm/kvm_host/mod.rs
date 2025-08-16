@@ -49,7 +49,7 @@ pub struct LockedVm {
 static KVM_USAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 impl LockedVm {
-    pub fn lock(&self) -> SpinLockGuard<Vm> {
+    pub fn lock(&self) -> SpinLockGuard<'_, Vm> {
         self.inner.lock()
     }
 

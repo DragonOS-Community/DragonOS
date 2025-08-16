@@ -269,6 +269,7 @@ impl IoApic {
         unsafe { (self.read(REG_VER).get_bits(16..24) + 1) as u8 }
     }
 
+    #[allow(dead_code)]
     pub fn pending(&mut self, irq: u8) -> bool {
         let rte_index = Self::vector_rte_index(irq);
         let data = unsafe { self.read(REG_TABLE + 2 * rte_index) };
@@ -361,7 +362,7 @@ impl IoApicChipData {
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerIoApicChipData> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerIoApicChipData> {
         self.inner.lock_irqsave()
     }
 }

@@ -8,7 +8,7 @@ version = "5.0.0"
 source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git?rev=282df2af7b#282df2af7b9edee629af391005c2a6b89e73f88c"
 dependencies = [
  "bit_field",
- "bitflags 2.9.0",
+ "bitflags 2.9.1",
  "log",
 ]
 
@@ -44,7 +44,7 @@ name = "another_ext4"
 version = "0.1.0"
 source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git?rev=bf782ff294#bf782ff2947b57ba89503824eada5eb3c20a2e2a"
 dependencies = [
- "bitflags 2.9.0",
+ "bitflags 2.9.1",
  "log",
 ]
 
@@ -127,9 +127,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.9.0"
+version = "2.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
+checksum = "1b8e56985ec62d17e9c1001dc89c88ecd7dc08e47eba5ec7c29c7b5eeecde967"
 
 [[package]]
 name = "bitmap"
@@ -464,9 +464,9 @@ dependencies = [
 
 [[package]]
 name = "gimli"
-version = "0.31.1"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
+checksum = "93563d740bc9ef04104f9ed6f86f1e3275c2cdafb95664e26584b9ca807a8ffe"
 
 [[package]]
 name = "glob"
@@ -587,9 +587,9 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.9.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "284f18f85651fe11e8a991b2adb42cb078325c996ed026d994719efcfca1d54b"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -731,7 +731,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c9f0d275c70310e2a9d2fc23250c5ac826a73fa828a5f256401f85c5c554283"
 dependencies = [
  "bit_field",
- "bitflags 2.9.0",
+ "bitflags 2.9.1",
 ]
 
 [[package]]
@@ -784,7 +784,7 @@ name = "multiboot2"
 version = "0.22.2"
 source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/multiboot2?rev=05739aab40#05739aab40916370146a078ed5297ed113781aed"
 dependencies = [
- "bitflags 2.9.0",
+ "bitflags 2.9.1",
  "derive_more",
  "log",
  "multiboot2-common",
@@ -941,10 +941,10 @@ dependencies = [
 
 [[package]]
 name = "printf-compat"
-version = "0.1.1"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat?rev=5f5c9cc363#5f5c9cc363f047411a0dccb37e0efb452ffb61d9"
+version = "0.2.1"
+source = "git+https://github.com/fslongjin/printf-compat?rev=c6f8c9c#c6f8c9c7ec2d1bfe65d823113d6e5cb7c17106d7"
 dependencies = [
- "bitflags 1.3.2",
+ "bitflags 2.9.1",
  "itertools",
 ]
 
@@ -1053,7 +1053,7 @@ version = "11.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6df7ab838ed27997ba19a4664507e6f82b41fe6e20be42929332156e5e85146"
 dependencies = [
- "bitflags 2.9.0",
+ "bitflags 2.9.1",
 ]
 
 [[package]]
@@ -1123,7 +1123,7 @@ version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
 dependencies = [
- "bitflags 2.9.0",
+ "bitflags 2.9.1",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -1422,7 +1422,7 @@ version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07ead9f748a4646479b850add36b527113a80e80a7e0f44d7b0334291850dcc5"
 dependencies = [
- "bitflags 2.9.0",
+ "bitflags 2.9.1",
  "log",
  "ptr_meta",
  "ucs2",
@@ -1448,7 +1448,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "864ac69eadd877bfb34e7814be1928122ed0057d9f975169a56ee496aa7bdfd7"
 dependencies = [
- "bitflags 2.9.0",
+ "bitflags 2.9.1",
  "ptr_meta",
  "uguid",
 ]
@@ -1489,9 +1489,9 @@ dependencies = [
 
 [[package]]
 name = "unwinding"
-version = "0.2.3"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "637d511437df708cee34bdec7ba2f1548d256b7acf3ff20e0a1c559f9bf3a987"
+checksum = "60612c845ef41699f39dc8c5391f252942c0a88b7d15da672eff0d14101bbd6d"
 dependencies = [
  "gimli",
 ]
@@ -1516,7 +1516,7 @@ name = "virtio-drivers"
 version = "0.7.2"
 source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers?rev=415ab38ff9#415ab38ff99f3c8e150269c04f65d684ba9d1365"
 dependencies = [
- "bitflags 2.9.0",
+ "bitflags 2.9.1",
  "log",
  "zerocopy 0.7.35",
 ]
@@ -1872,12 +1872,12 @@ dependencies = [
 
 [[package]]
 name = "x86_64"
-version = "0.14.10"
+version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "100555a863c0092238c2e0e814c1096c1e5cf066a309c696a87e907b5f8c5d69"
+checksum = "0f042214de98141e9c8706e8192b73f56494087cc55ebec28ce10f26c5c364ae"
 dependencies = [
  "bit_field",
- "bitflags 1.3.2",
+ "bitflags 2.9.1",
  "rustversion",
  "volatile",
 ]

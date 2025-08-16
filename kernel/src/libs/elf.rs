@@ -618,7 +618,7 @@ impl ElfLoader {
     /// - `param`：执行参数
     /// - `ehdr`：文件头
     /// - `data_buf`：用于缓存SegmentTable的Vec。
-    ///     这是因为SegmentTable的生命周期与data_buf一致。初始化这个Vec的大小为0即可。
+    ///   这是因为SegmentTable的生命周期与data_buf一致。初始化这个Vec的大小为0即可。
     ///
     /// ## 说明
     ///

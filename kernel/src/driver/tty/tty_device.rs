@@ -141,7 +141,7 @@ impl TtyDevice {
         Arc::new(dev)
     }
 
-    pub fn inner_write(&self) -> RwLockWriteGuard<InnerTtyDevice> {
+    pub fn inner_write(&self) -> RwLockWriteGuard<'_, InnerTtyDevice> {
         self.inner.write()
     }
 
@@ -581,13 +581,13 @@ impl KObject for TtyDevice {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.read()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.write()
     }
 

@@ -131,7 +131,7 @@ impl Timer {
         return result;
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerTimer> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerTimer> {
         return self.inner.lock_irqsave();
     }
 
@@ -197,7 +197,7 @@ impl Timer {
         let this_arc = self.inner().self_ref.upgrade().unwrap();
         TIMER_LIST
             .lock_irqsave()
-            .extract_if(|x| Arc::ptr_eq(&this_arc, &x.1))
+            .extract_if(.., |x| Arc::ptr_eq(&this_arc, &x.1))
             .for_each(drop);
         true
     }

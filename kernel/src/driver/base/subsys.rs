@@ -117,11 +117,11 @@ impl SubSysPrivate {
         *self.class.lock() = class;
     }
 
-    pub fn devices(&self) -> RwLockReadGuard<Vec<Arc<dyn Device>>> {
+    pub fn devices(&self) -> RwLockReadGuard<'_, Vec<Arc<dyn Device>>> {
         return self.devices.read();
     }
 
-    pub fn drivers(&self) -> RwLockReadGuard<Vec<Arc<dyn Driver>>> {
+    pub fn drivers(&self) -> RwLockReadGuard<'_, Vec<Arc<dyn Driver>>> {
         return self.drivers.read();
     }
 

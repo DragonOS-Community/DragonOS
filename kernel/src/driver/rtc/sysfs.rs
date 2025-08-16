@@ -80,7 +80,7 @@ impl RtcGeneralDevice {
         })
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerRtcGeneralDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerRtcGeneralDevice> {
         self.inner.lock()
     }
 
@@ -229,11 +229,11 @@ impl KObject for RtcGeneralDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

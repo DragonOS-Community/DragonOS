@@ -126,7 +126,7 @@ impl VirtIOBlkManager {
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkManager> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkManager> {
         self.inner.lock()
     }
 
@@ -223,7 +223,7 @@ impl VirtIOBlkDevice {
         Some(dev)
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkDevice> {
         self.inner.lock()
     }
 }
@@ -557,11 +557,11 @@ impl KObject for VirtIOBlkDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -616,7 +616,7 @@ impl VirtIOBlkDriver {
         return Arc::new(result);
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkDriver> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkDriver> {
         return self.inner.lock();
     }
 }
@@ -748,11 +748,11 @@ impl KObject for VirtIOBlkDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

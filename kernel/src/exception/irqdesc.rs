@@ -176,7 +176,7 @@ impl IrqDesc {
         *guard
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerIrqDesc> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerIrqDesc> {
         self.inner.lock_irqsave()
     }
 
@@ -185,7 +185,7 @@ impl IrqDesc {
     }
 
     /// 对中断请求过程加锁
-    pub fn request_mutex_lock(&self) -> MutexGuard<()> {
+    pub fn request_mutex_lock(&self) -> MutexGuard<'_, ()> {
         self.request_mutex.lock()
     }
 
@@ -599,11 +599,11 @@ impl KObject for IrqDesc {
 
     fn set_name(&self, _name: String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -675,7 +675,7 @@ impl IrqAction {
         return Arc::new(action);
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerIrqAction> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerIrqAction> {
         self.inner.lock_irqsave()
     }
 
@@ -717,6 +717,7 @@ impl InnerIrqAction {
         &mut self.dev_id
     }
 
+    #[allow(dead_code)]
     pub fn per_cpu_dev_id(&self) -> Option<&Arc<DeviceId>> {
         self.per_cpu_dev_id.as_ref().map(|v| v.get())
     }

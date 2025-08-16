@@ -8,6 +8,7 @@ use core::fmt::Display;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::libs::once::Once;
+use crate::num::Integer;
 use crate::syscall::SystemError;
 
 /// 定义Syscall trait
@@ -109,7 +110,7 @@ pub(super) fn syscall_table_init() -> Result<(), SystemError> {
             let size = end - start;
             let count = size / core::mem::size_of::<SyscallHandle>();
 
-            if size % core::mem::size_of::<SyscallHandle>() != 0 {
+            if !size.is_multiple_of(core::mem::size_of::<SyscallHandle>()) {
                 panic!("Invalid syscall table size: {}", size);
             }
 

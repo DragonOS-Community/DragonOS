@@ -55,15 +55,18 @@ pub trait LocalAPIC {
     fn send_eoi(&self);
 
     /// @brief 获取APIC版本号
+    #[allow(dead_code)]
     fn version(&self) -> u8;
 
     /// @brief 判断当前处理器是否支持EOI广播抑制
     fn support_eoi_broadcast_suppression(&self) -> bool;
 
     /// 获取最多支持的LVT寄存器数量
+    #[allow(dead_code)]
     fn max_lvt_entry(&self) -> u8;
 
     /// @brief 获取当前处理器的APIC ID
+    #[allow(dead_code)]
     fn id(&self) -> ApicId;
 
     /// @brief 设置LVT寄存器

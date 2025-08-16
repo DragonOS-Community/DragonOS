@@ -80,7 +80,7 @@ impl TypeOneFSMState {
             }
             TypeOneFSMState::PrtscPress(n) => return self.handle_prtsc_press(*n, scancode_status),
             TypeOneFSMState::PrtscRelease(n) => {
-                return self.handle_prtsc_release(*n, scancode_status)
+                return self.handle_prtsc_release(*n, scancode_status);
             }
         }
     }

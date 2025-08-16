@@ -132,7 +132,7 @@ impl IoVecs {
     /// # Arguments
     ///
     /// * `set_len` - If true, sets the length of the returned Vec to the total length of all IoVecs.
-    ///               If false, the returned Vec will have length 0 but capacity equal to the total length.
+    ///   If false, the returned Vec will have length 0 but capacity equal to the total length.
     ///
     /// # Returns
     ///

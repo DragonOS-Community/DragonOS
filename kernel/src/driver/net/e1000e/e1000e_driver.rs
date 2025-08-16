@@ -218,7 +218,7 @@ impl E1000EInterface {
         return result;
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerE1000EInterface> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerE1000EInterface> {
         return self.inner.lock();
     }
 }
@@ -417,11 +417,11 @@ impl KObject for E1000EInterface {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

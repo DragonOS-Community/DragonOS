@@ -83,7 +83,7 @@ impl Pid {
         self.numbers.lock().first().cloned().unwrap()
     }
 
-    pub fn tasks_iter(&self, pid_type: PidType) -> PidTaskIterator {
+    pub fn tasks_iter(&self, pid_type: PidType) -> PidTaskIterator<'_> {
         let guard = self.tasks[pid_type as usize].lock();
         PidTaskIterator { guard, index: 0 }
     }

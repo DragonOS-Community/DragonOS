@@ -65,7 +65,7 @@ pub enum TtyPortState {
 }
 
 pub trait TtyPort: Sync + Send + Debug {
-    fn port_data(&self) -> SpinLockGuard<TtyPortData>;
+    fn port_data(&self) -> SpinLockGuard<'_, TtyPortData>;
 
     /// 获取Port的状态
     fn state(&self) -> TtyPortState {
@@ -110,7 +110,7 @@ impl DefaultTtyPort {
 }
 
 impl TtyPort for DefaultTtyPort {
-    fn port_data(&self) -> SpinLockGuard<TtyPortData> {
+    fn port_data(&self) -> SpinLockGuard<'_, TtyPortData> {
         self.port_data.lock_irqsave()
     }
 }

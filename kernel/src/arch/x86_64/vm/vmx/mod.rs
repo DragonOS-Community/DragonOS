@@ -1464,14 +1464,18 @@ impl Vmx {
         if !cpu_based_2nd_exec_control.contains(SecondaryControls::ENABLE_EPT)
             && !vmx_cap.ept.is_empty()
         {
-            warn!("EPT CAP should not exist if not support. 1-setting enable EPT VM-execution control");
+            warn!(
+                "EPT CAP should not exist if not support. 1-setting enable EPT VM-execution control"
+            );
             return Err(SystemError::EIO);
         }
 
         if !cpu_based_2nd_exec_control.contains(SecondaryControls::ENABLE_VPID)
             && !vmx_cap.vpid.is_empty()
         {
-            warn!("VPID CAP should not exist if not support. 1-setting enable VPID VM-execution control");
+            warn!(
+                "VPID CAP should not exist if not support. 1-setting enable VPID VM-execution control"
+            );
             return Err(SystemError::EIO);
         }
 
@@ -2738,7 +2742,9 @@ impl Vmx {
             var.type_ = 0x3;
             var.avl = 0;
             if save.base & 0xf != 0 {
-                warn!("segment base is not paragraph aligned when entering protected mode (seg={seg:?})");
+                warn!(
+                    "segment base is not paragraph aligned when entering protected mode (seg={seg:?})"
+                );
             }
         }
 
@@ -3284,7 +3290,7 @@ impl KvmVmx {
 impl VmxVCpuPriv {
     pub const PML_ENTITY_NUM: usize = 512;
 
-    pub fn loaded_vmcs(&self) -> SpinLockGuard<LoadedVmcs> {
+    pub fn loaded_vmcs(&self) -> SpinLockGuard<'_, LoadedVmcs> {
         self.loaded_vmcs.lock()
     }
 

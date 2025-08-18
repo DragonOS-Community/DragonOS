@@ -74,11 +74,7 @@ impl AbsHandleMap {
     ///
     /// 分配到的可用的抽象端点
     pub fn alloc(&self, name: String) -> Option<Endpoint> {
-        let abs_addr = match ABS_ADDRESS_ALLOCATOR.lock().alloc() {
-            Some(addr) => addr,
-            //地址被分配
-            None => return None,
-        };
+        let abs_addr = ABS_ADDRESS_ALLOCATOR.lock().alloc()?;
 
         let result = Some(Endpoint::Abspath((AbsHandle::new(abs_addr), name)));
 

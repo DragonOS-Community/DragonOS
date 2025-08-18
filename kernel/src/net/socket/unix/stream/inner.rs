@@ -228,7 +228,7 @@ impl Listener {
     }
 
     pub(super) fn is_acceptable(&self) -> bool {
-        return self.incoming_connects.lock().len() != 0;
+        !self.incoming_connects.lock().is_empty()
     }
 
     pub(super) fn try_accept(&self) -> Result<(Arc<SocketInode>, Endpoint), SystemError> {

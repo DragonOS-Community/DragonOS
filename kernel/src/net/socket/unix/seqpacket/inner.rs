@@ -126,7 +126,7 @@ impl Listener {
     }
 
     pub(super) fn is_acceptable(&self) -> bool {
-        return self.incoming_conns.lock().len() != 0;
+        !self.incoming_conns.lock().is_empty()
     }
 }
 

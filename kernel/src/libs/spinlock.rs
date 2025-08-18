@@ -68,7 +68,7 @@ impl<T> SpinLock<T> {
     }
 
     #[inline(always)]
-    pub fn lock(&self) -> SpinLockGuard<T> {
+    pub fn lock(&self) -> SpinLockGuard<'_, T> {
         loop {
             let res = self.try_lock();
             if let Ok(res) = res {
@@ -80,7 +80,7 @@ impl<T> SpinLock<T> {
 
     /// 加锁，但是不更改preempt count
     #[inline(always)]
-    pub fn lock_no_preempt(&self) -> SpinLockGuard<T> {
+    pub fn lock_no_preempt(&self) -> SpinLockGuard<'_, T> {
         loop {
             if let Ok(guard) = self.try_lock_no_preempt() {
                 return guard;
@@ -89,7 +89,7 @@ impl<T> SpinLock<T> {
         }
     }
 
-    pub fn lock_irqsave(&self) -> SpinLockGuard<T> {
+    pub fn lock_irqsave(&self) -> SpinLockGuard<'_, T> {
         loop {
             if let Ok(guard) = self.try_lock_irqsave() {
                 return guard;
@@ -98,7 +98,7 @@ impl<T> SpinLock<T> {
         }
     }
 
-    pub fn try_lock(&self) -> Result<SpinLockGuard<T>, SystemError> {
+    pub fn try_lock(&self) -> Result<SpinLockGuard<'_, T>, SystemError> {
         // 先增加自旋锁持有计数
         ProcessManager::preempt_disable();
 
@@ -125,7 +125,7 @@ impl<T> SpinLock<T> {
         return res;
     }
 
-    pub fn try_lock_irqsave(&self) -> Result<SpinLockGuard<T>, SystemError> {
+    pub fn try_lock_irqsave(&self) -> Result<SpinLockGuard<'_, T>, SystemError> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::preempt_disable();
         if self.inner_try_lock() {
@@ -141,7 +141,7 @@ impl<T> SpinLock<T> {
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
-    pub fn try_lock_no_preempt(&self) -> Result<SpinLockGuard<T>, SystemError> {
+    pub fn try_lock_no_preempt(&self) -> Result<SpinLockGuard<'_, T>, SystemError> {
         if self.inner_try_lock() {
             return Ok(SpinLockGuard {
                 lock: self,

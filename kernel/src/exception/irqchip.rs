@@ -527,6 +527,7 @@ impl IrqManager {
         return Ok(());
     }
 
+    #[allow(dead_code)]
     pub fn irq_percpu_disable(
         &self,
         desc: &Arc<IrqDesc>,

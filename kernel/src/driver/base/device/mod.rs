@@ -1121,7 +1121,7 @@ impl ClassDir {
         });
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerClassDir> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerClassDir> {
         return self.inner.lock();
     }
 }
@@ -1171,11 +1171,11 @@ impl KObject for ClassDir {
         self.inner().name = Some(name);
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

@@ -330,7 +330,9 @@ impl KernelCmdlineManager {
                 if inner.init_path.is_some() {
                     panic!("cmdline: init proc path is set twice");
                 }
-                inner.init_path = Some(CString::new(value.unwrap()).unwrap());
+                if let Some(val) = value {
+                    inner.init_path = Some(CString::new(val).unwrap());
+                }
                 continue;
             }
             // log::debug!(

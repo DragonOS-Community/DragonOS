@@ -59,7 +59,7 @@ impl BlockDevManager {
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerBlockDevManager> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerBlockDevManager> {
         self.inner.lock()
     }
 
@@ -275,7 +275,7 @@ impl BlockDevMeta {
         }
     }
 
-    pub(crate) fn inner(&self) -> SpinLockGuard<InnerBlockDevMeta> {
+    pub(crate) fn inner(&self) -> SpinLockGuard<'_, InnerBlockDevMeta> {
         self.inner.lock()
     }
 }

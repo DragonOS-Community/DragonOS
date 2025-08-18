@@ -36,7 +36,7 @@ use crate::tables::crc64::{CRC64_ROCKSOFT_TABLE, CRC64_TABLE};
 /// ## 参数
 ///
 /// - `crc`: seed value for computation. 0 or (u64)~0 for a new CRC calculation,
-///             or the previous crc64 value if computing incrementally.
+///   or the previous crc64 value if computing incrementally.
 /// - `buf`: pointer to buffer over which CRC64 is run
 pub fn crc64_be(mut crc: u64, buf: &[u8]) -> u64 {
     for &byte in buf {
@@ -52,7 +52,7 @@ pub fn crc64_be(mut crc: u64, buf: &[u8]) -> u64 {
 /// ## 参数
 ///
 /// - `crc`: seed value for computation. 0 for a new CRC calculation, or the
-///            previous crc64 value if computing incrementally.
+///   previous crc64 value if computing incrementally.
 /// - `buf`: pointer to buffer over which CRC64 is run
 pub fn crc64_rocksoft_generic(mut crc: u64, buf: &[u8]) -> u64 {
     crc = !crc;

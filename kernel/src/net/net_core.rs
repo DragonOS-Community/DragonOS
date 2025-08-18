@@ -141,7 +141,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 
 pub fn poll_ifaces() {
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
-    if guard.len() == 0 {
+    if guard.is_empty() {
         warn!("poll_ifaces: No net driver found!");
         return;
     }
@@ -162,7 +162,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
     while i < times {
         let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> =
             NET_DEVICES.read_irqsave();
-        if guard.len() == 0 {
+        if guard.is_empty() {
             warn!("poll_ifaces: No net driver found!");
             // 没有网卡，返回错误
             return Err(SystemError::ENODEV);
@@ -192,7 +192,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
 /// @return 没有网卡，返回SystemError::ENODEV
 pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
-    if guard.len() == 0 {
+    if guard.is_empty() {
         warn!("poll_ifaces: No net driver found!");
         // 没有网卡，返回错误
         return Err(SystemError::ENODEV);

@@ -147,7 +147,7 @@ impl ApicChipData {
         }
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerApicChipData> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerApicChipData> {
         self.inner.lock_irqsave()
     }
 }

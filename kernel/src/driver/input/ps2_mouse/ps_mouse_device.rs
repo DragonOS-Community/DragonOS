@@ -407,7 +407,7 @@ impl Ps2MouseDevice {
         Err(SystemError::ETIMEDOUT)
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerPs2MouseDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerPs2MouseDevice> {
         self.inner.lock_irqsave()
     }
 }
@@ -572,11 +572,11 @@ impl KObject for Ps2MouseDevice {
 
     fn set_name(&self, _name: alloc::string::String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

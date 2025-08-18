@@ -405,7 +405,7 @@ impl ProcFSInode {
 
     fn open_self(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         let pid = ProcessManager::current_pid().data();
-        return Ok(pid.to_string().as_bytes().len() as _);
+        return Ok(pid.to_string().len() as _);
     }
 
     // 读取exe文件
@@ -1102,10 +1102,19 @@ impl IndexNode for LockedProcFSInode {
                     .collect();
 
                 match key.len() {
-                        0=>{return Err(SystemError::ENOENT);}
-                        1=>{return Ok(key.remove(0));}
-                        _ => panic!("Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    0 => {
+                        return Err(SystemError::ENOENT);
                     }
+                    1 => {
+                        return Ok(key.remove(0));
+                    }
+                    _ => panic!(
+                        "Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
+                        key_len = key.len(),
+                        inode_id = inode.metadata.inode_id,
+                        to_find = ino
+                    ),
+                }
             }
         }
     }

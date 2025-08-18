@@ -1,5 +1,6 @@
 use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
+use core::net::Ipv4Addr;
 use sysfs::netdev_register_kobject;
 
 use crate::{
@@ -304,5 +305,17 @@ impl IfaceCommon {
     // TODO: 需要在inet实现多网卡监听或路由子系统实现后移除
     pub fn is_default_iface(&self) -> bool {
         self.default_iface
+    }
+
+    pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {
+        self.smol_iface.lock().ipv4_addr()
+    }
+
+    pub fn prefix_len(&self) -> Option<u8> {
+        self.smol_iface
+            .lock()
+            .ip_addrs()
+            .first()
+            .map(|ip_addr| ip_addr.prefix_len())
     }
 }

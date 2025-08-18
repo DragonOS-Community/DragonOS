@@ -194,3 +194,19 @@ impl TryFrom<CRtMsg> for RouteSegmentBody {
         })
     }
 }
+
+impl From<RouteSegmentBody> for CRtMsg {
+    fn from(body: RouteSegmentBody) -> Self {
+        CRtMsg {
+            family: body.family as u8,
+            dst_len: body.dst_len,
+            src_len: body.src_len,
+            tos: body.tos,
+            table: body.table as u8,
+            protocol: body.protocol as u8,
+            scope: body.scope as u8,
+            type_: body.type_ as u8,
+            flags: body.flags.bits(),
+        }
+    }
+}

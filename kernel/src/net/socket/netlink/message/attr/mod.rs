@@ -65,44 +65,13 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
     where
         Self: Sized;
 
-    fn write_to_buf(&self, buf: &mut Vec<u8>) -> Result<(), SystemError> {
-        // let payload_bytes = self.payload_as_bytes();
-        // let header = CAttrHeader {
-        //     len: (core::mem::size_of::<CAttrHeader>() + payload_bytes.len()) as u16,
-        //     type_: self.type_(),
-        // };
-
-        // let total_len = header.len as usize;
-        // let padded_len = align_to(total_len, NLMSG_ALIGN);
-        // let padding_len = padded_len - total_len;
-
-        // // 确保 buf 足够大
-        // if buf.len() < offset + padded_len {
-        //     buf.resize(offset + padded_len, 0);
-        // }
-
-        // // 写入头部
-        // let header_bytes = unsafe {
-        //     core::slice::from_raw_parts(
-        //         &header as *const CAttrHeader as *const u8,
-        //         core::mem::size_of::<CAttrHeader>(),
-        //     )
-        // };
-        // buf[offset..offset + header_bytes.len()].copy_from_slice(header_bytes);
-
-        // // 写入负载
-        // buf[offset + header_bytes.len()..offset + header_bytes.len() + payload_bytes.len()]
-        //     .copy_from_slice(payload_bytes);
-
-        // // 填充部分已经在 resize 时置零，无需额外处理
-
-        // Ok(())
-
+    fn write_to_buf(&self, buf: &mut Vec<u8>) -> Result<usize, SystemError> {
+        let type_: u16 = self.type_();
         let payload_bytes = self.payload_as_bytes();
-        let header = CAttrHeader {
-            len: (size_of::<CAttrHeader>() + payload_bytes.len()) as u16,
-            type_: self.type_(),
-        };
+        let header = CAttrHeader::from_payload_len(type_, payload_bytes.len());
+        let total_len = header.total_len_with_padding();
+
+        // let mut current_offset = offset;
 
         // 写入头部
         let header_bytes = unsafe {
@@ -111,29 +80,37 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
                 size_of::<CAttrHeader>(),
             )
         };
+        // buf[current_offset..current_offset + header_bytes.len()].copy_from_slice(header_bytes);
         buf.extend_from_slice(header_bytes);
+        // current_offset += header_bytes.len();
 
         // 写入负载
+        // buf[current_offset..current_offset + payload_bytes.len()].copy_from_slice(payload_bytes);
         buf.extend_from_slice(payload_bytes);
+        // current_offset += payload_bytes.len();
 
         // 添加对齐填充
-        let total_len = header.len as usize;
-        let padded_len = align_to(total_len, NLMSG_ALIGN);
-        let padding_len = padded_len - total_len;
+        let padding_len = header.padding_len();
         if padding_len > 0 {
-            buf.extend_from_slice(&vec![0u8; padding_len]);
+            // buf[current_offset..current_offset + padding_len].fill(0);
+            buf.extend(vec![0u8; padding_len]);
         }
 
-        Ok(())
+        Ok(total_len)
     }
 
-    fn read_all_from_buf(buf: &[u8], mut offset: usize) -> Result<Vec<Self>, SystemError>
+    fn read_all_from_buf(buf: &[u8], mut total_len: usize) -> Result<Vec<Self>, SystemError>
     where
         Self: Sized,
     {
         let mut attrs = Vec::new();
+        let mut offset = 0;
 
-        while offset < buf.len() {
+        while total_len > 0 {
+            if total_len < size_of::<CAttrHeader>() {
+                return Err(SystemError::EINVAL);
+            }
+
             // 检查是否有足够的字节读取属性头部
             if buf.len() - offset < size_of::<CAttrHeader>() {
                 return Err(SystemError::EINVAL);
@@ -144,18 +121,21 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
             let attr_header = unsafe { *(attr_header_bytes.as_ptr() as *const CAttrHeader) };
 
             // 验证属性长度
-            if attr_header.len < size_of::<CAttrHeader>() as u16 {
+            if attr_header.total_len() < size_of::<CAttrHeader>() {
                 return Err(SystemError::EINVAL);
             }
 
-            let attr_total_len = attr_header.len as usize;
-            if buf.len() - offset < attr_total_len {
+            total_len = total_len
+                .checked_sub(attr_header.total_len())
+                .ok_or(SystemError::EINVAL)?;
+
+            if buf.len() - offset < attr_header.total_len() {
                 return Err(SystemError::EINVAL);
             }
 
             // 读取属性负载
             let payload_start = offset + size_of::<CAttrHeader>();
-            let payload_len = attr_total_len - size_of::<CAttrHeader>();
+            let payload_len = attr_header.payload_len();
             let payload_buf = &buf[payload_start..payload_start + payload_len];
 
             // 解析属性
@@ -164,8 +144,11 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
             }
 
             // 移动到下一个属性（考虑对齐）
-            let padded_len = align_to(attr_total_len, NLMSG_ALIGN);
-            offset += padded_len;
+            let attr_total_with_padding = attr_header.total_len_with_padding();
+            offset += attr_total_with_padding;
+
+            let padding_len = total_len.min(attr_header.padding_len());
+            total_len -= padding_len;
         }
 
         Ok(attrs)

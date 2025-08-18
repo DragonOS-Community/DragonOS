@@ -1,10 +1,9 @@
-use alloc::vec::Vec;
-use system_error::SystemError;
-
 use crate::net::socket::netlink::message::{
     attr::Attribute,
     segment::{header::CMsgSegHdr, SegmentBody},
 };
+use alloc::vec::Vec;
+use system_error::SystemError;
 
 #[derive(Debug)]
 pub struct SegmentCommon<Body, Attr> {
@@ -47,8 +46,10 @@ impl<Body: SegmentBody, Attr: Attribute> SegmentCommon<Body, Attr> {
     }
 
     pub fn read_from_buf(header: CMsgSegHdr, buf: &[u8]) -> Result<Self, SystemError> {
-        let (body, remain_len) = Body::read_from_buf(&header, buf)?;
-        let attrs = Attr::read_all_from_buf(buf, buf.len() - remain_len)?;
+        let (body, remain_len, padded_len) = Body::read_from_buf(&header, buf)?;
+
+        let attrs_buf = &buf[padded_len..];
+        let attrs = Attr::read_all_from_buf(attrs_buf, remain_len)?;
 
         Ok(Self {
             header,
@@ -64,8 +65,10 @@ impl<Body: SegmentBody, Attr: Attribute> SegmentCommon<Body, Attr> {
 
         self.body.write_to_buf(buf)?;
         for attr in self.attrs.iter() {
+            // let cur_buf = &mut buf[offset..];
             attr.write_to_buf(buf)?;
         }
+
         Ok(())
     }
 

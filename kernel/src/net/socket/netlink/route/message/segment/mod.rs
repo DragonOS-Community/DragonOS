@@ -3,7 +3,11 @@ pub mod route;
 
 use crate::net::socket::netlink::{
     message::{
-        segment::{header::CMsgSegHdr, CSegmentType},
+        segment::{
+            ack::{DoneSegment, ErrorSegment},
+            header::CMsgSegHdr,
+            CSegmentType,
+        },
         ProtocolSegment,
     },
     route::message::segment::{addr::AddrSegment, route::RouteSegment},
@@ -17,8 +21,8 @@ pub enum RouteNlSegment {
     // GetLink(LinkSegment),
     NewAddr(AddrSegment),
     GetAddr(AddrSegment),
-    // Done(DoneSegment),
-    // Error(ErrorSegment),
+    Done(DoneSegment),
+    Error(ErrorSegment),
     NewRoute(RouteSegment),
     DelRoute(RouteSegment),
     GetRoute(RouteSegment),
@@ -33,6 +37,8 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewAddr(addr_segment) | RouteNlSegment::GetAddr(addr_segment) => {
                 addr_segment.header()
             }
+            RouteNlSegment::Done(done_segment) => done_segment.header(),
+            RouteNlSegment::Error(error_segment) => error_segment.header(),
         }
     }
 
@@ -46,6 +52,8 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewAddr(addr_segment) | RouteNlSegment::GetAddr(addr_segment) => {
                 addr_segment.header_mut()
             }
+            RouteNlSegment::Done(done_segment) => done_segment.header_mut(),
+            RouteNlSegment::Error(error_segment) => error_segment.header_mut(),
         }
     }
 
@@ -71,6 +79,7 @@ impl ProtocolSegment for RouteNlSegment {
     }
 
     fn write_to(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        // 这里没有直接写入buf，而是用 Vec<u8> 来构建内核缓冲区
         let mut kernel_buf: Vec<u8> = vec![];
         match self {
             RouteNlSegment::NewAddr(addr_segment) => addr_segment.write_to_buf(&mut kernel_buf)?,

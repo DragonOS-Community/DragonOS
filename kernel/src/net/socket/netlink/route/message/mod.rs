@@ -1,5 +1,5 @@
-mod attr;
-mod segment;
+pub(super) mod attr;
+pub(super) mod segment;
 
 use crate::net::socket::netlink::{message::Message, route::message::segment::RouteNlSegment};
 

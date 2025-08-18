@@ -942,7 +942,7 @@ dependencies = [
 [[package]]
 name = "printf-compat"
 version = "0.2.1"
-source = "git+https://github.com/fslongjin/printf-compat?rev=c6f8c9c#c6f8c9c7ec2d1bfe65d823113d6e5cb7c17106d7"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat?rev=626801cb5f#626801cb5f640d7b9eead4d4eb72140eb703ed50"
 dependencies = [
  "bitflags 2.9.1",
  "itertools",

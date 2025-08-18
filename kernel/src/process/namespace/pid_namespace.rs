@@ -124,7 +124,10 @@ impl PidNamespace {
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid_namespace.c#72
-    fn create_pid_namespace(&self, user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, SystemError> {
+    pub(super) fn create_pid_namespace(
+        &self,
+        user_ns: Arc<UserNamespace>,
+    ) -> Result<Arc<Self>, SystemError> {
         let level = self.level() + 1;
         if !self.user_ns.is_ancestor_of(&user_ns) {
             return Err(SystemError::EINVAL);

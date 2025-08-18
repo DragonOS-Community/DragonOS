@@ -9,6 +9,7 @@ use crate::{
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
+        devpts::devpts_init,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
@@ -68,7 +69,13 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let current_mntns = ProcessManager::current_mntns();
     let old_root_inode = current_mntns.root_inode();
     let old_mntfs = current_mntns.root_mntfs().clone();
-    let new_fs = MountFS::new(new_fs, None, old_mntfs.propagation(), Some(&current_mntns));
+    let new_fs = MountFS::new(
+        new_fs,
+        None,
+        old_mntfs.propagation(),
+        Some(&current_mntns),
+        old_mntfs.mount_flags(),
+    );
 
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
@@ -94,6 +101,9 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     unsafe {
         current_mntns.force_change_root_mountfs(new_fs);
     }
+
+    // WARNING: mount devpts after devfs has been mounted,
+    devpts_init().expect("Failed to initialize devpts");
 
     info!("VFS: Migrate filesystems done!");
 

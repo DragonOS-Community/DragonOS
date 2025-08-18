@@ -25,7 +25,7 @@ use crate::{
         subsys::SubSysPrivate,
     },
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
+        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         sysfs::AttributeGroup,
         vfs::{
@@ -227,6 +227,7 @@ impl FbDevice {
                 device_common: DeviceCommonData::default(),
                 fb_id: id,
                 device_inode_fs: None,
+                parent: Weak::default(),
                 devfs_metadata: Metadata::new(
                     FileType::FramebufferDevice,
                     ModeType::from_bits_truncate(0o666),
@@ -272,6 +273,7 @@ struct InnerFbDevice {
 
     /// device inode要求的字段
     device_inode_fs: Option<Weak<DevFS>>,
+    parent: Weak<LockedDevFSInode>,
     devfs_metadata: Metadata,
 }
 
@@ -394,6 +396,10 @@ impl DeviceINode for FbDevice {
     fn set_fs(&self, fs: Weak<DevFS>) {
         self.inner.lock().device_inode_fs = Some(fs);
     }
+
+    fn set_parent(&self, parent: Weak<crate::filesystem::devfs::LockedDevFSInode>) {
+        self.inner.lock().parent = parent;
+    }
 }
 
 impl IndexNode for FbDevice {
@@ -454,5 +460,13 @@ impl IndexNode for FbDevice {
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         return Ok(());
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let parent = self.inner.lock().parent.upgrade();
+        if let Some(parent) = parent {
+            return Ok(parent as Arc<dyn IndexNode>);
+        }
+        Err(SystemError::ENOENT)
     }
 }

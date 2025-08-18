@@ -1,6 +1,6 @@
 use crate::{
     filesystem::vfs::{
-        mount::{MountList, MountPath},
+        mount::{MountFlags, MountList, MountPath},
         FileSystem, IndexNode, MountFS,
     },
     libs::{once::Once, spinlock::SpinLock},
@@ -62,7 +62,13 @@ impl MntNamespace {
         let mount_list = MountList::new();
 
         let ramfs = crate::filesystem::ramfs::RamFS::new();
-        let ramfs = MountFS::new(ramfs, None, MountPropagation::new_private(), None);
+        let ramfs = MountFS::new(
+            ramfs,
+            None,
+            MountPropagation::new_private(),
+            None,
+            MountFlags::empty(),
+        );
 
         let result = Arc::new_cyclic(|self_ref| Self {
             ns_common: NsCommon::new(0, NamespaceType::Mount),
@@ -75,7 +81,11 @@ impl MntNamespace {
                 _dead: false,
             }),
         });
+
         ramfs.set_namespace(Arc::downgrade(&result));
+        result
+            .add_mount(Arc::new(MountPath::from("/")), ramfs)
+            .expect("Failed to add root mount");
 
         return result;
     }
@@ -84,9 +94,13 @@ impl MntNamespace {
     ///
     /// 本方法仅供dragonos初始化时使用
     pub unsafe fn force_change_root_mountfs(&self, new_root: Arc<MountFS>) {
+        let inner_guard = self.inner.lock();
         let ptr = self as *const Self as *mut Self;
         let self_mut = (ptr).as_mut().unwrap();
-        self_mut.root_mountfs = new_root;
+        self_mut.root_mountfs = new_root.clone();
+        let (path, _, _) = inner_guard.mount_list.get_mount_point("/").unwrap();
+
+        inner_guard.mount_list.insert(path, new_root);
     }
 
     /// Creates a copy of the mount namespace for process cloning.
@@ -136,11 +150,18 @@ impl MntNamespace {
         return Ok(());
     }
 
+    pub fn mount_list(&self) -> Arc<MountList> {
+        self.inner.lock().mount_list.clone()
+    }
+
     pub fn remove_mount(&self, mount_path: &str) -> Option<Arc<MountFS>> {
         return self.inner.lock().mount_list.remove(mount_path);
     }
 
-    pub fn get_mount_point(&self, mount_point: &str) -> Option<(String, String, Arc<MountFS>)> {
+    pub fn get_mount_point(
+        &self,
+        mount_point: &str,
+    ) -> Option<(Arc<MountPath>, String, Arc<MountFS>)> {
         self.inner.lock().mount_list.get_mount_point(mount_point)
     }
 }

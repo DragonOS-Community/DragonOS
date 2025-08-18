@@ -227,7 +227,6 @@ fn find_acpi_pm_clock() -> Result<(), SystemError> {
 }
 
 /// # 初始化ACPI PM Timer作为系统时钟源
-// #[unified_init(INITCALL_FS)]
 #[inline(never)]
 #[allow(dead_code)]
 pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {

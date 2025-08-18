@@ -43,6 +43,8 @@ pub struct Cred {
     pub euid: Kuid,
     /// 进程有效的gid
     pub egid: Kgid,
+    /// supplementary groups
+    pub groups: Vec<Kgid>,
     /// UID for VFS ops
     pub fsuid: Kuid,
     /// GID for VFS ops
@@ -74,6 +76,7 @@ impl Cred {
             egid: GLOBAL_ROOT_GID,
             fsuid: GLOBAL_ROOT_UID,
             fsgid: GLOBAL_ROOT_GID,
+            groups: Vec::new(),
             cap_inheritable: CAPFlags::CAP_EMPTY_SET,
             cap_permitted: CAPFlags::CAP_FULL_SET,
             cap_effective: CAPFlags::CAP_FULL_SET,
@@ -178,6 +181,16 @@ impl Cred {
 
     pub fn setfsgid(&mut self, fsgid: usize) {
         self.fsgid.0 = fsgid;
+    }
+
+    /// Set supplementary groups
+    pub fn setgroups(&mut self, groups: Vec<Kgid>) {
+        self.groups = groups;
+    }
+
+    /// Get supplementary groups
+    pub fn getgroups(&self) -> &Vec<Kgid> {
+        &self.groups
     }
 }
 

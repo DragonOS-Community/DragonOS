@@ -182,6 +182,10 @@ impl IndexNode for BpfMap {
     fn list(&self) -> Result<Vec<String>> {
         Err(SystemError::ENOSYS)
     }
+
+    fn absolute_path(&self) -> core::result::Result<String, SystemError> {
+        Ok(String::from("BpfMap"))
+    }
 }
 
 /// Create a map and return a file descriptor that refers to

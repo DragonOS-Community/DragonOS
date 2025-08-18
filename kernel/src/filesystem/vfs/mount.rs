@@ -38,6 +38,164 @@ use super::{
     IndexNode, InodeId, Magic, PollableInode, SuperBlock,
 };
 
+bitflags! {
+    /// Mount flags for filesystem independent mount options
+    /// These flags correspond to the MS_* constants in Linux
+    ///
+    /// Reference: https://code.dragonos.org.cn/xref/linux-6.6.21/include/uapi/linux/mount.h#13
+    pub struct MountFlags: u32 {
+        /// Mount read-only (MS_RDONLY)
+        const RDONLY = 1;
+        /// Ignore suid and sgid bits (MS_NOSUID)
+        const NOSUID = 2;
+        /// Disallow access to device special files (MS_NODEV)
+        const NODEV = 4;
+        /// Disallow program execution (MS_NOEXEC)
+        const NOEXEC = 8;
+        /// Writes are synced at once (MS_SYNCHRONOUS)
+        const SYNCHRONOUS = 16;
+        /// Alter flags of a mounted FS (MS_REMOUNT)
+        const REMOUNT = 32;
+        /// Allow mandatory locks on an FS (MS_MANDLOCK)
+        const MANDLOCK = 64;
+        /// Directory modifications are synchronous (MS_DIRSYNC)
+        const DIRSYNC = 128;
+        /// Do not follow symlinks (MS_NOSYMFOLLOW)
+        const NOSYMFOLLOW = 256;
+        /// Do not update access times (MS_NOATIME)
+        const NOATIME = 1024;
+        /// Do not update directory access times (MS_NODIRATIME)
+        const NODIRATIME = 2048;
+        /// Bind mount (MS_BIND)
+        const BIND = 4096;
+        /// Move mount (MS_MOVE)
+        const MOVE = 8192;
+        /// Recursive mount (MS_REC)
+        const REC = 16384;
+        /// Silent mount (MS_SILENT, deprecated MS_VERBOSE)
+        const SILENT = 32768;
+        /// VFS does not apply the umask (MS_POSIXACL)
+        const POSIXACL = 1 << 16;
+        /// Change to unbindable (MS_UNBINDABLE)
+        const UNBINDABLE = 1 << 17;
+        /// Change to private (MS_PRIVATE)
+        const PRIVATE = 1 << 18;
+        /// Change to slave (MS_SLAVE)
+        const SLAVE = 1 << 19;
+        /// Change to shared (MS_SHARED)
+        const SHARED = 1 << 20;
+        /// Update atime relative to mtime/ctime (MS_RELATIME)
+        const RELATIME = 1 << 21;
+        /// This is a kern_mount call (MS_KERNMOUNT)
+        const KERNMOUNT = 1 << 22;
+        /// Update inode I_version field (MS_I_VERSION)
+        const I_VERSION = 1 << 23;
+        /// Always perform atime updates (MS_STRICTATIME)
+        const STRICTATIME = 1 << 24;
+        /// Update the on-disk [acm]times lazily (MS_LAZYTIME)
+        const LAZYTIME = 1 << 25;
+        /// This is a submount (MS_SUBMOUNT)
+        const SUBMOUNT = 1 << 26;
+        /// Do not allow remote locking (MS_NOREMOTELOCK)
+        const NOREMOTELOCK = 1 << 27;
+        /// Do not perform security checks (MS_NOSEC)
+        const NOSEC = 1 << 28;
+        /// This mount has been created by the kernel (MS_BORN)
+        const BORN = 1 << 29;
+        /// This mount is active (MS_ACTIVE)
+        const ACTIVE = 1 << 30;
+        /// Mount flags not allowed from userspace (MS_NOUSER)
+        const NOUSER = 1 << 31;
+
+        /// Superblock flags that can be altered by MS_REMOUNT
+        const RMT_MASK = MountFlags::RDONLY.bits() |
+            MountFlags::SYNCHRONOUS.bits() |
+            MountFlags::MANDLOCK.bits() |
+            MountFlags::I_VERSION.bits() |
+            MountFlags::LAZYTIME.bits();
+    }
+}
+
+impl MountFlags {
+    /// Convert mount flags to a comma-separated string representation
+    ///
+    /// This function converts MountFlags to a string format similar to /proc/mounts,
+    /// such as "rw,nosuid,nodev,noexec,relatime".
+    ///
+    /// # Returns
+    ///
+    /// A String containing the mount options in comma-separated format.
+    #[inline(never)]
+    pub fn options_string(&self) -> String {
+        let mut options = Vec::new();
+
+        // Check read/write flag
+        if self.contains(MountFlags::RDONLY) {
+            options.push("ro");
+        } else {
+            options.push("rw");
+        }
+
+        // Check other flags
+        if self.contains(MountFlags::NOSUID) {
+            options.push("nosuid");
+        }
+        if self.contains(MountFlags::NODEV) {
+            options.push("nodev");
+        }
+        if self.contains(MountFlags::NOEXEC) {
+            options.push("noexec");
+        }
+        if self.contains(MountFlags::SYNCHRONOUS) {
+            options.push("sync");
+        }
+        if self.contains(MountFlags::MANDLOCK) {
+            options.push("mand");
+        }
+        if self.contains(MountFlags::DIRSYNC) {
+            options.push("dirsync");
+        }
+        if self.contains(MountFlags::NOSYMFOLLOW) {
+            options.push("nosymfollow");
+        }
+        if self.contains(MountFlags::NOATIME) {
+            options.push("noatime");
+        }
+        if self.contains(MountFlags::NODIRATIME) {
+            options.push("nodiratime");
+        }
+        if self.contains(MountFlags::RELATIME) {
+            options.push("relatime");
+        }
+        if self.contains(MountFlags::STRICTATIME) {
+            options.push("strictatime");
+        }
+        if self.contains(MountFlags::LAZYTIME) {
+            options.push("lazytime");
+        }
+
+        // Mount propagation flags
+        if self.contains(MountFlags::UNBINDABLE) {
+            options.push("unbindable");
+        }
+        if self.contains(MountFlags::PRIVATE) {
+            options.push("private");
+        }
+        if self.contains(MountFlags::SLAVE) {
+            options.push("slave");
+        }
+        if self.contains(MountFlags::SHARED) {
+            options.push("shared");
+        }
+
+        // Internal flags (typically not shown in /proc/mounts)
+        // We'll skip flags like BIND, MOVE, REC, REMOUNT, etc. as they're
+        // not typically displayed in mount options
+
+        options.join(",")
+    }
+}
+
 // MountId类型
 int_like!(MountId, usize);
 
@@ -66,13 +224,15 @@ pub struct MountFS {
     /// 用来存储InodeID->挂载点的MountFS的B树
     mountpoints: SpinLock<BTreeMap<InodeId, Arc<MountFS>>>,
     /// 当前文件系统挂载到的那个挂载点的Inode
-    self_mountpoint: Option<Arc<MountFSInode>>,
+    self_mountpoint: RwLock<Option<Arc<MountFSInode>>>,
     /// 指向当前MountFS的弱引用
     self_ref: Weak<MountFS>,
 
     namespace: Lazy<Weak<MntNamespace>>,
     propagation: Arc<MountPropagation>,
     mount_id: MountId,
+
+    mount_flags: MountFlags,
 }
 
 impl Debug for MountFS {
@@ -101,15 +261,17 @@ impl MountFS {
         self_mountpoint: Option<Arc<MountFSInode>>,
         propagation: Arc<MountPropagation>,
         mnt_ns: Option<&Arc<MntNamespace>>,
+        mount_flags: MountFlags,
     ) -> Arc<Self> {
         let result = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
             mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint,
+            self_mountpoint: RwLock::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: Lazy::new(),
             propagation,
             mount_id: MountId::alloc(),
+            mount_flags,
         });
 
         if let Some(mnt_ns) = mnt_ns {
@@ -119,12 +281,25 @@ impl MountFS {
         result
     }
 
+    pub fn mount_flags(&self) -> MountFlags {
+        self.mount_flags
+    }
+
     pub fn propagation(&self) -> Arc<MountPropagation> {
         self.propagation.clone()
     }
 
     pub fn set_namespace(&self, namespace: Weak<MntNamespace>) {
         self.namespace.init(namespace);
+    }
+
+    pub fn fs_type(&self) -> &str {
+        self.inner_filesystem.name()
+    }
+
+    #[inline(never)]
+    pub fn self_mountpoint(&self) -> Option<Arc<MountFSInode>> {
+        self.self_mountpoint.read().as_ref().cloned()
     }
 
     /// @brief 用Arc指针包裹MountFS对象。
@@ -168,10 +343,14 @@ impl MountFS {
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        self.self_mountpoint
-            .as_ref()
+        let r = self
+            .self_mountpoint()
             .ok_or(SystemError::EINVAL)?
-            .do_umount()
+            .do_umount();
+
+        self.self_mountpoint.write().take();
+
+        return r;
     }
 }
 
@@ -244,7 +423,7 @@ impl MountFSInode {
     pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
         if self.is_mountpoint_root()? {
             // 当前inode是它所在的文件系统的root inode
-            match &self.mount_fs.self_mountpoint {
+            match self.mount_fs.self_mountpoint() {
                 Some(inode) => {
                     let inner_inode = inode.parent()?;
                     return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
@@ -281,14 +460,36 @@ impl MountFSInode {
             .ok_or(SystemError::ENOENT);
     }
 
+    #[inline(never)]
     fn do_absolute_path(&self) -> Result<String, SystemError> {
-        let mut path_parts = Vec::new();
         let mut current = self.self_ref.upgrade().unwrap();
+
+        // For special inode, we can directly get the absolute path
+        if let Ok(p) = current.inner_inode.absolute_path() {
+            return Ok(p);
+        }
+
+        let mut path_parts = Vec::new();
         let root_inode = ProcessManager::current_mntns().root_inode();
         let inode_id = root_inode.metadata()?.inode_id;
         while current.metadata()?.inode_id != inode_id {
             let name = current.dname()?;
             path_parts.push(name.0);
+
+            // 防循环检查：如果路径深度超过1024，抛出警告
+            if path_parts.len() > 1024 {
+                #[inline(never)]
+                fn __log_warn(root: usize, cur: usize) {
+                    log::warn!(
+                        "Path depth exceeds 1024, possible infinite loop. root: {}, cur: {}",
+                        root,
+                        cur
+                    );
+                }
+                __log_warn(inode_id.data(), current.metadata().unwrap().inode_id.data());
+                return Err(SystemError::ELOOP);
+            }
+
             current = current.do_parent()?;
         }
 
@@ -318,7 +519,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        return self.inner_inode.close(data);
+        self.inner_inode.close(data)
     }
 
     fn create_with_data(
@@ -508,7 +709,11 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.list();
     }
 
-    fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
+    fn mount(
+        &self,
+        fs: Arc<dyn FileSystem>,
+        mount_flags: MountFlags,
+    ) -> Result<Arc<MountFS>, SystemError> {
         let metadata = self.inner_inode.metadata()?;
         if metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -530,6 +735,7 @@ impl IndexNode for MountFSInode {
             Some(self.self_ref.upgrade().unwrap()),
             MountPropagation::new_private(), // 暂时不支持传播，后续会补充完善挂载传播性
             Some(&ProcessManager::current_mntns()),
+            mount_flags,
         );
 
         self.mount_fs
@@ -559,9 +765,11 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
-
-        // MOUNT_LIST().remove(from.absolute_path()?);
-        // MOUNT_LIST().insert(self.absolute_path()?, new_mount_fs.clone());
+        // 更新当前挂载点的self_mountpoint
+        new_mount_fs
+            .self_mountpoint
+            .write()
+            .replace(self.self_ref.upgrade().unwrap());
         return Ok(new_mount_fs);
     }
 
@@ -602,7 +810,7 @@ impl IndexNode for MountFSInode {
     /// 在默认情况下，性能非常差！！！
     fn dname(&self) -> Result<DName, SystemError> {
         if self.is_mountpoint_root()? {
-            if let Some(inode) = &self.mount_fs.self_mountpoint {
+            if let Some(inode) = self.mount_fs.self_mountpoint() {
                 return inode.inner_inode.dname();
             }
         }
@@ -620,11 +828,19 @@ impl IndexNode for MountFSInode {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         self.inner_inode.as_pollable_inode()
     }
+
+    fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.inner_inode.read_sync(offset, buf)
+    }
+
+    fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.inner_inode.write_sync(offset, buf)
+    }
 }
 
 impl FileSystem for MountFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
-        match &self.self_mountpoint {
+        match self.self_mountpoint() {
             Some(inode) => return inode.mount_fs.root_inode(),
             // 当前文件系统是rootfs
             None => self.mountpoint_root_inode(),
@@ -772,14 +988,14 @@ impl MountList {
     pub fn get_mount_point<T: AsRef<str>>(
         &self,
         path: T,
-    ) -> Option<(String, String, Arc<MountFS>)> {
+    ) -> Option<(Arc<MountPath>, String, Arc<MountFS>)> {
         self.mounts
             .upgradeable_read()
             .iter()
             .filter_map(|(key, fs)| {
                 let strkey = key.as_str();
                 if let Some(rest) = path.as_ref().strip_prefix(strkey) {
-                    return Some((strkey.to_string(), rest.to_string(), fs.clone()));
+                    return Some((key.clone(), rest.to_string(), fs.clone()));
                 }
                 None
             })
@@ -802,6 +1018,11 @@ impl MountList {
     #[inline]
     pub fn remove<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
         self.mounts.write().remove(&path.into())
+    }
+
+    /// # clone_inner - 克隆内部挂载点列表
+    pub fn clone_inner(&self) -> HashMap<Arc<MountPath>, Arc<MountFS>> {
+        self.mounts.read().clone()
     }
 }
 
@@ -843,6 +1064,7 @@ pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
 pub fn do_mount_mkdir(
     fs: Arc<dyn FileSystem>,
     mount_point: &str,
+    mount_flags: MountFlags,
 ) -> Result<Arc<MountFS>, SystemError> {
     let inode = do_mkdir_at(
         AtFlags::AT_FDCWD.bits(),
@@ -855,5 +1077,5 @@ pub fn do_mount_mkdir(
             return Err(SystemError::EBUSY);
         }
     }
-    return inode.mount(fs);
+    return inode.mount(fs, mount_flags);
 }

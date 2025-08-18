@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::intrinsics::likely;
 use core::ops::BitXor;
 
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -119,8 +119,8 @@ pub struct NTtyData {
     read_buf: Box<[u8; NTTY_BUFSIZE]>,
     echo_buf: Box<[u8; NTTY_BUFSIZE]>,
 
-    read_flags: StaticBitmap<NTTY_BUFSIZE>,
-    char_map: StaticBitmap<256>,
+    read_flags: static_bitmap!(NTTY_BUFSIZE),
+    char_map: static_bitmap!(256),
 
     tty: Weak<TtyCore>,
 }

@@ -30,7 +30,7 @@ impl<'a> BitmapFont<'a> {
             bitmap,
             glyph_mapping,
             size,
-            bytes_per_char: (size.width + 7) / 8 * size.height,
+            bytes_per_char: size.width.div_ceil(8) * size.height,
         }
     }
     /// Return the width of each character.

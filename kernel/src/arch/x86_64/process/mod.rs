@@ -423,7 +423,7 @@ impl ProcessManager {
 }
 
 /// 保存上下文，然后切换进程，接着jmp到`switch_finish_hook`钩子函数
-#[naked]
+#[unsafe(naked)]
 unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBInfo) {
     core::arch::naked_asm!(
         // As a quick reminder for those who are unfamiliar with the System V ABI (extern "C"):
@@ -501,7 +501,7 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
     );
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "sysv64" fn switch_back() -> ! {
     core::arch::naked_asm!("ret");
 }

@@ -258,7 +258,7 @@ impl FbDevice {
         DeviceNumber::new(Major::FB_MAJOR, inner_guard.fb_id.data())
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerFbDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerFbDevice> {
         self.inner.lock()
     }
 }
@@ -322,11 +322,11 @@ impl KObject for FbDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

@@ -65,8 +65,6 @@ smoltcp = { version = "=0.12.0", default-features = false, features = [
 ] }
 syscall_table_macros = { path = "crates/syscall_table_macros" }
 system_error = { path = "crates/system_error" }
-uefi = { version = "=0.26.0", features = ["alloc"] }
-uefi-raw = "=0.5.0"
 unified-init = { path = "crates/unified-init" }
 virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "415ab38ff9" }
 wait_queue_macros = { path = "crates/wait_queue_macros" }
@@ -77,7 +75,7 @@ kprobe = { path = "crates/kprobe" }
 lru = "0.12.3"
 
 rbpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rbpf", rev = "f31e471a29", default-features = false }
-printf-compat = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat", rev = "5f5c9cc363", default-features = false }
+printf-compat = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat", rev = "626801cb5f", default-features = false }
 
 static-keys = { version = "=0.7" }
 
@@ -92,7 +90,9 @@ derive_builder = { version = "0.20.2", default-features = false, features = [
 multiboot2 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/multiboot2", rev = "05739aab40" }
 raw-cpuid = "11.0.1"
 x86 = "=0.52.0"
-x86_64 = "=0.14.10"
+x86_64 = "=0.15.2"
+uefi = { version = "=0.26.0", features = ["alloc"] }
+uefi-raw = "=0.5.0"
 
 # target为riscv64时，使用下面的依赖
 [target.'cfg(target_arch = "riscv64")'.dependencies]
@@ -100,6 +100,8 @@ riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.gi
     "s-mode",
 ] }
 sbi-rt = { version = "=0.0.3", features = ["legacy"] }
+uefi = { version = "=0.26.0", features = ["alloc"] }
+uefi-raw = "=0.5.0"
 
 # target为loongarch64时，使用下面的依赖
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
@@ -107,7 +109,7 @@ loongArch64 = "=0.2.5"
 
 # 由于unwinding库不支持loongarch64架构，因此需要排除该依赖项
 [target.'cfg(not(target_arch = "loongarch64"))'.dependencies]
-unwinding = { version = "=0.2.3", default-features = false, features = [
+unwinding = { version = "=0.2.8", default-features = false, features = [
     "unwinder",
     "fde-gnu-eh-frame-hdr",
     "panic",

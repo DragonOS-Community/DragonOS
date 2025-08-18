@@ -656,7 +656,7 @@ impl KernFSInode {
         return self.inner.read().parent.upgrade();
     }
 
-    pub fn private_data_mut(&self) -> SpinLockGuard<Option<KernInodePrivateData>> {
+    pub fn private_data_mut(&self) -> SpinLockGuard<'_, Option<KernInodePrivateData>> {
         return self.private_data.lock();
     }
 

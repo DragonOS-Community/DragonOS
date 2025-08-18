@@ -332,7 +332,7 @@ impl LoopbackInterface {
         })
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerLoopbackInterface> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerLoopbackInterface> {
         return self.inner.lock();
     }
 }
@@ -379,11 +379,11 @@ impl KObject for LoopbackInterface {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

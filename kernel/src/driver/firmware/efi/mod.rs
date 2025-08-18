@@ -105,11 +105,11 @@ impl EFIManager {
         return Ok(());
     }
 
-    fn inner_read(&self) -> RwLockReadGuard<InnerEFIManager> {
+    fn inner_read(&self) -> RwLockReadGuard<'_, InnerEFIManager> {
         self.inner.read()
     }
 
-    fn inner_write(&self) -> RwLockWriteGuard<InnerEFIManager> {
+    fn inner_write(&self) -> RwLockWriteGuard<'_, InnerEFIManager> {
         self.inner.write()
     }
 

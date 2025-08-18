@@ -51,9 +51,9 @@ pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
 
     fn set_name(&self, name: String);
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState>;
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState>;
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState>;
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState>;
 
     fn set_kobj_state(&self, state: KObjectState);
 }

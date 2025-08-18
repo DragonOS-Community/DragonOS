@@ -137,8 +137,14 @@ impl CharDevOps {
             );
         }
         if minorct > DeviceNumber::MINOR_MASK + 1 - baseminor {
-            error!("DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
-                name, baseminor, baseminor + minorct - 1, 0, DeviceNumber::MINOR_MASK);
+            error!(
+                "DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
+                name,
+                baseminor,
+                baseminor + minorct - 1,
+                0,
+                DeviceNumber::MINOR_MASK
+            );
         }
         let chardev = DeviceStruct::new(DeviceNumber::new(major, baseminor), minorct, name);
         if major == Major::UNNAMED_MAJOR {

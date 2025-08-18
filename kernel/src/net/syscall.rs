@@ -387,19 +387,19 @@ impl Syscall {
     ///
     ///
     /// If flags is 0, then accept4() is the same as accept().  The
-    ///    following values can be bitwise ORed in flags to obtain different
-    ///    behavior:
+    ///   following values can be bitwise ORed in flags to obtain different
+    ///   behavior:
     ///
     /// - SOCK_NONBLOCK
-    ///     Set the O_NONBLOCK file status flag on the open file
-    ///     description (see open(2)) referred to by the new file
-    ///     descriptor.  Using this flag saves extra calls to fcntl(2)
-    ///     to achieve the same result.
+    ///   Set the O_NONBLOCK file status flag on the open file
+    ///   description (see open(2)) referred to by the new file
+    ///   descriptor.  Using this flag saves extra calls to fcntl(2)
+    ///   to achieve the same result.
     ///
     /// - SOCK_CLOEXEC
-    ///     Set the close-on-exec (FD_CLOEXEC) flag on the new file
-    ///     descriptor.  See the description of the O_CLOEXEC flag in
-    ///     open(2) for reasons why this may be useful.
+    ///   Set the close-on-exec (FD_CLOEXEC) flag on the new file
+    ///   descriptor.  See the description of the O_CLOEXEC flag in
+    ///   open(2) for reasons why this may be useful.
     pub fn accept4(
         fd: usize,
         addr: *mut SockAddr,

@@ -118,19 +118,20 @@ impl IrqData {
         self.inner.lock_irqsave().domain.clone()
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerIrqData> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerIrqData> {
         self.inner.lock_irqsave()
     }
 
-    pub fn chip_info_read(&self) -> RwLockReadGuard<InnerIrqChipInfo> {
+    #[allow(dead_code)]
+    pub fn chip_info_read(&self) -> RwLockReadGuard<'_, InnerIrqChipInfo> {
         self.chip_info.read()
     }
 
-    pub fn chip_info_read_irqsave(&self) -> RwLockReadGuard<InnerIrqChipInfo> {
+    pub fn chip_info_read_irqsave(&self) -> RwLockReadGuard<'_, InnerIrqChipInfo> {
         self.chip_info.read_irqsave()
     }
 
-    pub fn chip_info_write_irqsave(&self) -> RwLockWriteGuard<InnerIrqChipInfo> {
+    pub fn chip_info_write_irqsave(&self) -> RwLockWriteGuard<'_, InnerIrqChipInfo> {
         self.chip_info.write_irqsave()
     }
 
@@ -311,7 +312,7 @@ impl IrqCommonData {
         self.inner.lock_irqsave().effective_affinity = affinity;
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerIrqCommonData> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerIrqCommonData> {
         self.inner.lock_irqsave()
     }
 }

@@ -132,7 +132,7 @@ impl VirtIONetDevice {
         return Some(dev);
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIONetDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIONetDevice> {
         return self.inner.lock();
     }
 }
@@ -182,11 +182,11 @@ impl KObject for VirtIONetDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -421,7 +421,7 @@ impl VirtioInterface {
         return result;
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOInterface> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOInterface> {
         return self.inner.lock();
     }
 
@@ -725,11 +725,11 @@ impl KObject for VirtioInterface {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -782,7 +782,7 @@ impl VirtIONetDriver {
         return Arc::new(result);
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIODriver> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIODriver> {
         return self.inner.lock();
     }
 }
@@ -932,11 +932,11 @@ impl KObject for VirtIONetDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

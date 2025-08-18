@@ -45,7 +45,7 @@ impl ScsiManager {
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerScsiManager> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerScsiManager> {
         self.inner.lock()
     }
 

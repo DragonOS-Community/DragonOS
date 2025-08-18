@@ -380,7 +380,7 @@ impl UserBufferReader<'_> {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &[u8] = &src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 || byte_buffer.is_empty() {
+        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) || byte_buffer.is_empty() {
             return Err(SystemError::EINVAL);
         }
 
@@ -587,7 +587,7 @@ impl<'a> UserBufferWriter<'a> {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &mut [u8] = &mut src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 {
+        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) {
             return Err(SystemError::EINVAL);
         }
 

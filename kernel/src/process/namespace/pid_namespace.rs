@@ -159,7 +159,7 @@ impl PidNamespace {
         return Ok(pidns);
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerPidNamespace> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerPidNamespace> {
         self.inner.lock()
     }
 

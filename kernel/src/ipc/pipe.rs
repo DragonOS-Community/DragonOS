@@ -502,7 +502,7 @@ impl IndexNode for LockedPipeInode {
         return Ok((name, entry.metadata()?));
     }
 
-    fn fs(&self) -> Arc<(dyn FileSystem)> {
+    fn fs(&self) -> Arc<dyn FileSystem> {
         todo!()
     }
 

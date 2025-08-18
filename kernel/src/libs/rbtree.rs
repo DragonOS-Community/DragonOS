@@ -424,7 +424,7 @@ where
         }
 
         self.iter()
-            .all(|(key, value)| other.get(key).map_or(false, |v| *value == *v))
+            .all(|(key, value)| other.get(key).is_some_and(|v| *value == *v))
     }
 }
 
@@ -1382,19 +1382,19 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
 
     /// Return the keys iter
     #[inline]
-    pub fn keys(&self) -> Keys<K, V> {
+    pub fn keys(&self) -> Keys<'_, K, V> {
         Keys { inner: self.iter() }
     }
 
     /// Return the value iter
     #[inline]
-    pub fn values(&self) -> Values<K, V> {
+    pub fn values(&self) -> Values<'_, K, V> {
         Values { inner: self.iter() }
     }
 
     /// Return the value iter mut
     #[inline]
-    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
+    pub fn values_mut(&mut self) -> ValuesMut<'_, K, V> {
         ValuesMut {
             inner: self.iter_mut(),
         }
@@ -1402,7 +1402,7 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
 
     /// Return the key and value iter
     #[inline]
-    pub fn iter(&self) -> Iter<K, V> {
+    pub fn iter(&self) -> Iter<'_, K, V> {
         Iter {
             head: self.first_child(),
             tail: self.last_child(),
@@ -1413,7 +1413,7 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
 
     /// Return the key and mut value iter
     #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         IterMut {
             head: self.first_child(),
             tail: self.last_child(),

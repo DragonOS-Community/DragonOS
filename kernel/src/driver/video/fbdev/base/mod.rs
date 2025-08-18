@@ -126,7 +126,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         let mut fgx = fg;
         let mut bgx = bg;
         let ppw = 32 / bpp;
-        let spitch = (image.width + 7) / 8;
+        let spitch = image.width.div_ceil(8);
         let mut color_tab: [u32; 16] = [0; 16];
 
         let tab: &[u32] = match bpp {

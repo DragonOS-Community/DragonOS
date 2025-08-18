@@ -765,21 +765,50 @@ impl RobustListHead {
         return FutexIterator::new(self);
     }
 
+    /// # 安全地从用户空间读取任意类型的值，如果地址无效则返回None
+    pub fn safe_read<T>(addr: VirtAddr) -> Option<UserBufferReader<'static>> {
+        // 检查地址是否有效
+        if addr.is_null() {
+            return None;
+        }
+
+        let size = core::mem::size_of::<T>();
+        return UserBufferReader::new_checked(addr.as_ptr::<T>(), size, true).ok();
+    }
+
+    /// # 安全地从用户空间读取u32值，如果地址无效则返回None
+    fn safe_read_u32(addr: VirtAddr) -> Option<u32> {
+        Self::safe_read::<u32>(addr)
+            .and_then(|reader| reader.read_one_from_user::<u32>(0).ok().cloned())
+    }
+
+    /// # 安全地向用户空间写入u32值，如果地址无效则返回false
+    fn safe_write_u32(addr: VirtAddr, val: u32) -> bool {
+        // 尝试写入
+        let mut writer = match UserBufferWriter::new_checked(
+            addr.as_ptr::<u32>(),
+            core::mem::size_of::<u32>(),
+            true,
+        ) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+
+        writer.copy_one_to_user(&val, 0).is_ok()
+    }
+
     /// # 处理进程即将死亡时，进程已经持有的futex，唤醒其他等待该futex的线程
     /// ## 参数
     /// - futex_uaddr：futex的用户空间地址
     /// - pid: 当前进程/线程的pid
     fn handle_futex_death(futex_uaddr: VirtAddr, pid: u32) -> Result<usize, SystemError> {
-        let futex_val = {
-            if futex_uaddr.is_null() {
-                return Err(SystemError::EINVAL);
+        // 安全地读取futex值
+        let futex_val = match Self::safe_read_u32(futex_uaddr) {
+            Some(val) => val,
+            None => {
+                // 地址无效，跳过此futex
+                return Ok(0);
             }
-            let user_buffer_reader = UserBufferReader::new(
-                futex_uaddr.as_ptr::<u32>(),
-                core::mem::size_of::<u32>(),
-                true,
-            )?;
-            *user_buffer_reader.read_one_from_user::<u32>(0)?
         };
 
         let mut uval = futex_val;
@@ -793,21 +822,18 @@ impl RobustListHead {
             // 判断是否有FUTEX_WAITERS和标记FUTEX_OWNER_DIED
             let mval = (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
 
-            // 读取用户空间目前的futex字段，判断在此之前futex是否有被修改
-            let user_buffer_reader = UserBufferReader::new(
-                futex_uaddr.as_ptr::<u32>(),
-                core::mem::size_of::<u32>(),
-                true,
-            )?;
-            let nval = *user_buffer_reader.read_one_from_user::<u32>(0)?;
+            // 安全地读取当前值
+            let nval = match Self::safe_read_u32(futex_uaddr) {
+                Some(val) => val,
+                None => break, // 读取失败，退出循环
+            };
+
             if nval != mval {
                 uval = nval;
-                let mut user_buffer_writer = UserBufferWriter::new(
-                    futex_uaddr.as_ptr::<u32>(),
-                    core::mem::size_of::<u32>(),
-                    true,
-                )?;
-                user_buffer_writer.copy_one_to_user(&mval, 0)?;
+                // 安全地写入新值
+                if !Self::safe_write_u32(futex_uaddr, mval) {
+                    continue; // 写入失败，继续下一次循环
+                }
                 continue;
             }
 
@@ -815,7 +841,8 @@ impl RobustListHead {
             if nval & FUTEX_WAITERS != 0 {
                 let mut flags = FutexFlag::FLAGS_MATCH_NONE;
                 flags.insert(FutexFlag::FLAGS_SHARED);
-                Futex::futex_wake(futex_uaddr, flags, 1, FUTEX_BITSET_MATCH_ANY)?;
+                // 唤醒操作可能会失败，但不影响流程
+                let _ = Futex::futex_wake(futex_uaddr, flags, 1, FUTEX_BITSET_MATCH_ANY);
             }
             break;
         }
@@ -867,15 +894,9 @@ impl Iterator for FutexIterator<'_> {
                 None
             };
 
-            let user_buffer_reader = UserBufferReader::new(
-                self.entry.as_ptr::<RobustList>(),
-                mem::size_of::<RobustList>(),
-                true,
-            )
-            .ok()?;
-            let next_entry = user_buffer_reader
-                .read_one_from_user::<RobustList>(0)
-                .ok()?;
+            // 安全地读取下一个entry
+            let next_entry = RobustListHead::safe_read::<RobustList>(self.entry)
+                .and_then(|reader| reader.read_one_from_user::<RobustList>(0).ok().cloned())?;
 
             self.entry = next_entry.next;
 

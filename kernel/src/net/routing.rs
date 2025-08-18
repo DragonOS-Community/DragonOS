@@ -67,6 +67,11 @@ impl RouteEntry {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct RouteTable {
+    pub entries: Vec<RouteEntry>,
+}
+
 /// 路由决策结果
 #[derive(Debug)]
 pub struct RouteDecision {
@@ -80,31 +85,33 @@ pub struct RouteDecision {
 pub struct Router {
     name: String,
     /// 路由表 //todo 后面再优化LC-trie，现在先简单用一个Vec，并且应该在这上面加锁(maybe rwlock?) and 指针反而可以不加锁，在这个路由表这里加就行
-    route_table: RwLock<Vec<RouteEntry>>,
+    route_table: RwLock<RouteTable>,
 }
 
 impl Router {
     pub fn new(name: String) -> Self {
         Self {
             name,
-            route_table: RwLock::new(Vec::new()),
+            route_table: RwLock::new(RouteTable::default()),
         }
     }
 
     pub fn add_route(&mut self, route: RouteEntry) {
         let mut guard = self.route_table.write();
-        let pos = guard
+        let entries = &mut guard.entries;
+        let pos = entries
             .iter()
             .position(|r| r.metric > route.metric)
-            .unwrap_or(guard.len());
+            .unwrap_or(entries.len());
 
-        guard.insert(pos, route);
+        entries.insert(pos, route);
         log::info!("Router {}: Added route to routing table", self.name);
     }
 
     pub fn remove_route(&mut self, destination: IpCidr) {
         self.route_table
             .write()
+            .entries
             .retain(|route| route.destination != destination);
     }
 
@@ -112,6 +119,7 @@ impl Router {
         let guard = self.route_table.read();
         // 按最长前缀匹配原则查找路由
         let best = guard
+            .entries
             .iter()
             .filter(|route| {
                 route.interface.strong_count() > 0 && route.destination.contains_addr(&dest_ip)
@@ -135,6 +143,7 @@ impl Router {
     pub fn cleanup_routes(&mut self) {
         self.route_table
             .write()
+            .entries
             .retain(|route| route.interface.strong_count() > 0);
     }
 }

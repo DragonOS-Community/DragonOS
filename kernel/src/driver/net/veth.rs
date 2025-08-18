@@ -11,12 +11,12 @@ use crate::driver::base::kobject::{
 };
 use crate::driver::base::kset::KSet;
 use crate::driver::net::bridge::BridgePort;
-use crate::driver::net::route_iface::{RouterEnableDevice, RouterEnableDeviceCommon};
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::routing::{RouterEnableDevice, RouterEnableDeviceCommon};
 use crate::net::{generate_iface_id, NET_DEVICES};
 use crate::process::ProcessState;
 use crate::sched::SchedMode;

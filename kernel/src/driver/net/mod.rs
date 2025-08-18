@@ -18,7 +18,6 @@ pub mod e1000e;
 pub mod irq_handle;
 pub mod kthread;
 pub mod loopback;
-pub mod route_iface;
 pub mod sysfs;
 pub mod veth;
 pub mod virtio_net;

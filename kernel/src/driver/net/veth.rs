@@ -16,8 +16,9 @@ use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::generate_iface_id;
 use crate::net::routing::{RouterEnableDevice, RouterEnableDeviceCommon};
-use crate::net::{generate_iface_id, NET_DEVICES};
+use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use crate::process::ProcessState;
 use crate::sched::SchedMode;
 use alloc::collections::VecDeque;
@@ -677,7 +678,9 @@ pub fn veth_probe(name1: &str, name2: &str) -> (Arc<VethInterface>, Arc<VethInte
     let turn_on = |a: &Arc<VethInterface>| {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
-        NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
+        // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
+        INIT_NET_NAMESPACE.add_device(a.clone());
+        a.common().set_net_namespace(INIT_NET_NAMESPACE.clone());
         register_netdevice(a.clone()).expect("register veth device failed");
     };
 

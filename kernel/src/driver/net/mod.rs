@@ -1,8 +1,10 @@
+use alloc::sync::Weak;
 use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
 use core::net::Ipv4Addr;
 use sysfs::netdev_register_kobject;
 
+use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::socket::inet::{common::PortManager, InetSocket},
@@ -16,7 +18,6 @@ pub mod class;
 mod dma;
 pub mod e1000e;
 pub mod irq_handle;
-pub mod kthread;
 pub mod loopback;
 pub mod sysfs;
 pub mod veth;
@@ -126,6 +127,14 @@ pub trait Iface: crate::driver::base::device::Device {
     fn operstate(&self) -> Operstate;
 
     fn set_operstate(&self, state: Operstate);
+
+    fn net_namespace(&self) -> Option<Arc<NetNamespace>> {
+        self.common().net_namespace()
+    }
+
+    fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
+        self.common().set_net_namespace(ns);
+    }
 }
 
 /// 网络设备的公共数据
@@ -178,6 +187,8 @@ pub struct IfaceCommon {
     /// 默认网卡标识
     /// TODO: 此字段设置目的是解决对bind unspecified地址的分包问题，需要在inet实现多网卡监听或路由子系统实现后移除
     default_iface: bool,
+    /// 网络命名空间
+    net_namespace: RwLock<Weak<NetNamespace>>,
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -199,6 +210,7 @@ impl IfaceCommon {
             port_manager: PortManager::default(),
             poll_at_ms: core::sync::atomic::AtomicU64::new(0),
             default_iface,
+            net_namespace: RwLock::new(Weak::new()),
         }
     }
 
@@ -316,5 +328,14 @@ impl IfaceCommon {
             .ip_addrs()
             .first()
             .map(|ip_addr| ip_addr.prefix_len())
+    }
+
+    pub fn net_namespace(&self) -> Option<Arc<NetNamespace>> {
+        self.net_namespace.read().upgrade()
+    }
+
+    pub fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
+        let mut guard = self.net_namespace.write();
+        *guard = Arc::downgrade(&ns);
     }
 }

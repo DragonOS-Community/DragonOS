@@ -46,7 +46,8 @@ use crate::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    net::{generate_iface_id, NET_DEVICES},
+    net::generate_iface_id,
+    process::namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
     time::Instant,
 };
 use system_error::SystemError;
@@ -68,6 +69,9 @@ pub struct VirtIONetDevice {
     dev_id: Arc<DeviceId>,
     inner: SpinLock<InnerVirtIONetDevice>,
     locked_kobj_state: LockedKObjectState,
+
+    // 这里放netns是为了在中断到来的时候可以遍历poll当前命名空间下的网卡
+    netns: Arc<NetNamespace>,
 }
 
 impl Debug for VirtIONetDevice {
@@ -96,7 +100,11 @@ impl Debug for InnerVirtIONetDevice {
 }
 
 impl VirtIONetDevice {
-    pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+    pub fn new(
+        transport: VirtIOTransport,
+        dev_id: Arc<DeviceId>,
+        netns: Arc<NetNamespace>,
+    ) -> Option<Arc<Self>> {
         // 设置中断
         if let Err(err) = transport.setup_irq(dev_id.clone()) {
             error!("VirtIONetDevice '{dev_id:?}' setup_irq failed: {:?}", err);
@@ -125,6 +133,7 @@ impl VirtIONetDevice {
                 device_common: DeviceCommonData::default(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
+            netns,
         });
 
         // dev.set_driver(Some(Arc::downgrade(&virtio_net_driver()) as Weak<dyn Driver>));
@@ -269,8 +278,7 @@ impl Device for VirtIONetDevice {
 
 impl VirtIODevice for VirtIONetDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        // log::debug!("try to wakeup");
-        super::kthread::wakeup_poll_thread();
+        self.netns.wakeup_poll_thread();
         return Ok(IrqReturn::Handled);
     }
 
@@ -407,7 +415,7 @@ impl VirtioInterface {
 
         let iface = iface::Interface::new(iface_config, &mut device_inner, Instant::now().into());
 
-        let result = Arc::new(VirtioInterface {
+        let iface = Arc::new(VirtioInterface {
             device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
             locked_kobj_state: LockedKObjectState::default(),
             iface_name: format!("eth{}", iface_id),
@@ -419,7 +427,7 @@ impl VirtioInterface {
             }),
         });
 
-        return result;
+        iface
     }
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOInterface> {
@@ -436,7 +444,10 @@ impl VirtioInterface {
 impl Drop for VirtioInterface {
     fn drop(&mut self) {
         // 从全局的网卡接口信息表中删除这个网卡的接口信息
-        NET_DEVICES.write_irqsave().remove(&self.nic_id());
+        // NET_DEVICES.write_irqsave().remove(&self.nic_id());
+        if let Some(ns) = self.net_namespace() {
+            ns.remove_device(&self.nic_id());
+        }
     }
 }
 
@@ -623,7 +634,7 @@ pub fn virtio_net(
     dev_id: Arc<DeviceId>,
     dev_parent: Option<Arc<dyn Device>>,
 ) {
-    let virtio_net_deivce = VirtIONetDevice::new(transport, dev_id);
+    let virtio_net_deivce = VirtIONetDevice::new(transport, dev_id, INIT_NET_NAMESPACE.clone());
     if let Some(virtio_net_deivce) = virtio_net_deivce {
         debug!("VirtIONetDevice '{:?}' created", virtio_net_deivce.dev_id);
         if let Some(dev_parent) = dev_parent {
@@ -820,9 +831,14 @@ impl VirtIODriver for VirtIONetDriver {
         register_netdevice(iface.clone() as Arc<dyn Iface>)?;
 
         // 将网卡的接口信息注册到全局的网卡接口信息表中
-        NET_DEVICES
-            .write_irqsave()
-            .insert(iface.nic_id(), iface.clone());
+        // NET_DEVICES
+        //     .write_irqsave()
+        //     .insert(iface.nic_id(), iface.clone());
+        INIT_NET_NAMESPACE.add_device(iface.clone());
+        iface
+            .iface_common
+            .set_net_namespace(INIT_NET_NAMESPACE.clone());
+        INIT_NET_NAMESPACE.set_default_iface(iface.clone());
 
         virtio_irq_manager()
             .register_device(device.clone())

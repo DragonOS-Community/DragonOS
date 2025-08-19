@@ -7,6 +7,8 @@ use alloc::sync::Arc;
 use core::panic;
 use system_error::SystemError;
 
+//todo netlink和udp的操作相同，目前只是为netlink实现了下面的trait，后续为 UdpSocket实现下面的trait，提高复用性
+
 pub trait Unbound {
     type Endpoint;
     type Bound;

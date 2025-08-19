@@ -11,7 +11,8 @@ use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::net::{generate_iface_id, NET_DEVICES};
+use crate::net::generate_iface_id;
+use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use crate::time::Instant;
 use alloc::collections::VecDeque;
 use alloc::fmt::Debug;
@@ -514,6 +515,9 @@ pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
     let iface = LoopbackInterface::new(LoopbackDriver::default());
     // 标识网络设备已经启动
     iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+
+    register_netdevice(iface.clone()).expect("register lo device failed");
+
     iface
 }
 
@@ -526,11 +530,9 @@ pub fn loopback_probe() {
 pub fn loopback_driver_init() {
     let iface = generate_loopback_iface_default();
 
-    NET_DEVICES
-        .write_irqsave()
-        .insert(iface.nic_id(), iface.clone());
-
-    register_netdevice(iface.clone()).expect("register lo device failed");
+    INIT_NET_NAMESPACE.add_device(iface.clone());
+    INIT_NET_NAMESPACE.set_loopback_iface(iface.clone());
+    iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
 }
 
 /// ## lo网卡设备的注册函数

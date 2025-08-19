@@ -2,9 +2,9 @@ use crate::{
     driver::net::{register_netdevice, veth::VethInterface, Iface, NetDeivceState, Operstate},
     init::initcall::INITCALL_DEVICE,
     libs::{rwlock::RwLock, spinlock::SpinLock, wait_queue::WaitQueue},
-    net::NET_DEVICES,
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
+        namespace::net_namespace::INIT_NET_NAMESPACE,
         ProcessState,
     },
     time::Instant,
@@ -387,7 +387,10 @@ fn bridge_probe() {
     let turn_on = |a: &Arc<VethInterface>| {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
-        NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
+        // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
+        INIT_NET_NAMESPACE.add_device(a.clone());
+        a.common().set_net_namespace(INIT_NET_NAMESPACE.clone());
+
         register_netdevice(a.clone()).expect("register veth device failed");
     };
 

@@ -1,3 +1,4 @@
+use crate::filesystem::epoll::EPollEventType;
 use crate::{
     libs::{rwlock::RwLock, wait_queue::WaitQueue},
     net::socket::PMSG,
@@ -21,6 +22,8 @@ pub trait Unbound {
         endpoint: &Self::Endpoint,
         wait_queue: Arc<WaitQueue>,
     ) -> Result<Self::Bound, SystemError>;
+
+    fn check_io_events(&self) -> EPollEventType;
 }
 
 pub trait Bound {
@@ -43,6 +46,8 @@ pub trait Bound {
     ) -> Result<(usize, Self::Endpoint), SystemError>;
 
     fn try_send(&self, buf: &[u8], to: &Self::Endpoint, flags: PMSG) -> Result<usize, SystemError>;
+
+    fn check_io_events(&self) -> EPollEventType;
 }
 
 #[derive(Debug)]
@@ -106,6 +111,13 @@ where
         bound.set_remote_endpoint(remote_endpoint);
 
         Ok(())
+    }
+
+    pub fn check_io_events(&self) -> EPollEventType {
+        match self {
+            Inner::Unbound(unbound_datagram) => unbound_datagram.check_io_events(),
+            Inner::Bound(bound_datagram) => bound_datagram.check_io_events(),
+        }
     }
 
     pub fn addr(&self) -> Option<UnboundSocket::Endpoint> {

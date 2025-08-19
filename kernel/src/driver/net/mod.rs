@@ -196,7 +196,7 @@ impl IfaceCommon {
             smol_iface: SpinLock::new(iface),
             sockets: SpinLock::new(smoltcp::iface::SocketSet::new(Vec::new())),
             bounds: RwLock::new(Vec::new()),
-            port_manager: PortManager::new(),
+            port_manager: PortManager::default(),
             poll_at_ms: core::sync::atomic::AtomicU64::new(0),
             default_iface,
         }

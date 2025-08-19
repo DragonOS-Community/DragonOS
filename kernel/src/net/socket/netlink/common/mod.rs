@@ -1,4 +1,5 @@
 use crate::{
+    filesystem::epoll::EPollEventType,
     libs::{rwlock::RwLock, wait_queue::WaitQueue},
     net::socket::{
         endpoint::Endpoint,
@@ -8,7 +9,7 @@ use crate::{
             table::SupportedNetlinkProtocol,
         },
         utils::datagram_common::{select_remote_and_bind, Bound, Inner},
-        Socket,
+        Socket, PMSG,
     },
 };
 use alloc::sync::Arc;
@@ -75,6 +76,15 @@ where
 
         Ok((recv_bytes, endpoint))
     }
+
+    /// 判断当前的netlink是否可以接收数据
+    /// 目前netlink只是负责接收内核消息，所以暂时不用判断是否可以发送数据
+    pub fn can_recv(&self) -> bool {
+        self.inner
+            .read()
+            .check_io_events()
+            .contains(EPollEventType::EPOLLIN)
+    }
 }
 
 impl<P: SupportedNetlinkProtocol + 'static> Socket for NetlinkSocket<P>
@@ -122,13 +132,29 @@ where
         flags: crate::net::socket::PMSG,
         address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), system_error::SystemError> {
-        //todo 处理一下阻塞的逻辑
+        use crate::sched::SchedMode;
 
-        self.try_recv(buffer, flags)
+        if let Some(addr) = address {
+            self.connect(addr)?;
+        }
+
+        return if self.is_nonblocking() || flags.contains(PMSG::DONTWAIT) {
+            self.try_recv(buffer, flags)
+        } else {
+            loop {
+                match self.try_recv(buffer, flags) {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        let _ = wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {});
+                    }
+                    result => break result,
+                }
+            }
+        };
+        // self.try_recv(buffer, flags)
     }
 
     fn poll(&self) -> usize {
-        todo!()
+        self.inner.read().check_io_events().bits() as usize
     }
 
     fn send_buffer_size(&self) -> usize {

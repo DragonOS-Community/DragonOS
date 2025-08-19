@@ -1,12 +1,15 @@
-use crate::net::socket::{
-    netlink::{
-        addr::NetlinkSocketAddr,
-        common::bound::BoundNetlink,
-        message::ProtocolSegment,
-        route::{kernel::netlink_route_kernel, message::RouteNlMessage},
+use crate::{
+    filesystem::epoll::EPollEventType,
+    net::socket::{
+        netlink::{
+            addr::NetlinkSocketAddr,
+            common::bound::BoundNetlink,
+            message::ProtocolSegment,
+            route::{kernel::netlink_route_kernel, message::RouteNlMessage},
+        },
+        utils::datagram_common,
+        PMSG,
     },
-    utils::datagram_common,
-    PMSG,
 };
 use system_error::SystemError;
 
@@ -101,5 +104,9 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
         let remote = NetlinkSocketAddr::new_unspecified();
 
         Ok((len, remote))
+    }
+
+    fn check_io_events(&self) -> EPollEventType {
+        self.check_io_events_common()
     }
 }

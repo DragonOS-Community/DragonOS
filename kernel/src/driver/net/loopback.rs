@@ -88,6 +88,7 @@ impl phy::TxToken for LoopbackTxToken {
     }
 }
 
+#[derive(Default)]
 /// ## Loopback设备
 /// 成员是一个队列，用来存放接受到的数据包。
 /// 当使用lo发送数据包时，不会把数据包传到link层，而是直接发送到该队列，实现环回。
@@ -97,12 +98,6 @@ pub struct Loopback {
 }
 
 impl Loopback {
-    /// ## Loopback创建函数
-    /// 创建lo设备
-    pub fn new() -> Self {
-        let queue = VecDeque::new();
-        Loopback { queue }
-    }
     /// ## Loopback处理接受到的数据包函数
     /// Loopback接受到数据后会调用这个函数来弹出接收的数据，返回给协议栈
     ///
@@ -172,10 +167,10 @@ pub struct LoopbackDriver {
     pub inner: Arc<SpinLock<Loopback>>,
 }
 
-impl LoopbackDriver {
+impl Default for LoopbackDriver {
     /// ## LoopbackDriver创建函数
-    pub fn new() -> Self {
-        let inner = Arc::new(SpinLock::new(Loopback::new()));
+    fn default() -> Self {
+        let inner = Arc::new(SpinLock::new(Loopback::default()));
         LoopbackDriver { inner }
     }
 }
@@ -515,16 +510,21 @@ impl Iface for LoopbackInterface {
     }
 }
 
+pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
+    let iface = LoopbackInterface::new(LoopbackDriver::default());
+    // 标识网络设备已经启动
+    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+    iface
+}
+
 pub fn loopback_probe() {
     loopback_driver_init();
 }
+
 /// # lo网卡设备初始化函数
 /// 创建驱动和iface，初始化一个lo网卡，添加到全局NET_DEVICES中
 pub fn loopback_driver_init() {
-    let driver = LoopbackDriver::new();
-    let iface = LoopbackInterface::new(driver);
-    // 标识网络设备已经启动
-    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+    let iface = generate_loopback_iface_default();
 
     NET_DEVICES
         .write_irqsave()

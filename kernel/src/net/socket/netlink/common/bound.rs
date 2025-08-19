@@ -1,7 +1,10 @@
-use crate::net::socket::netlink::{
-    addr::{multicast::GroupIdSet, NetlinkSocketAddr},
-    receiver::MessageQueue,
-    table::BoundHandle,
+use crate::{
+    filesystem::epoll::EPollEventType,
+    net::socket::netlink::{
+        addr::{multicast::GroupIdSet, NetlinkSocketAddr},
+        receiver::MessageQueue,
+        table::BoundHandle,
+    },
 };
 use alloc::fmt::Debug;
 use system_error::SystemError;
@@ -32,16 +35,16 @@ impl<Message: 'static + Debug> BoundNetlink<Message> {
         Ok(())
     }
 
-    // pub fn check_io_events_common(&self) -> EPollEventType {
-    //     let mut events = EPollEventType::EPOLLOUT;
+    pub fn check_io_events_common(&self) -> EPollEventType {
+        let mut events = EPollEventType::EPOLLOUT;
 
-    //     let receive_queue = self.receive_queue.0.lock();
-    //     if !receive_queue.is_empty() {
-    //         events |= EPollEventType::EPOLLIN;
-    //     }
+        let receive_queue = self.receive_queue.0.lock();
+        if !receive_queue.is_empty() {
+            events |= EPollEventType::EPOLLIN;
+        }
 
-    //     events
-    // }
+        events
+    }
 
     pub(super) fn add_groups(&mut self, groups: GroupIdSet) {
         self.handle.add_groups(groups);

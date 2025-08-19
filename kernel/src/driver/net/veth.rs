@@ -328,7 +328,7 @@ impl VethInterface {
         (iface1, iface2)
     }
 
-    fn inner(&self) -> SpinLockGuard<VethCommonData> {
+    fn inner(&self) -> SpinLockGuard<'_, VethCommonData> {
         self.inner.lock_irqsave()
     }
 
@@ -432,11 +432,11 @@ impl KObject for VethInterface {
     }
 
     fn set_name(&self, _name: String) {}
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

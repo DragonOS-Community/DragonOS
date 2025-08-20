@@ -44,13 +44,11 @@ impl Syscall for SysMincoreHandle {
         let page_count = len >> MMArch::PAGE_SHIFT;
 
         let mut writer = UserBufferWriter::new(vec as *mut u8, page_count, true)?;
-        let mut tmp: Vec<u8> = vec![0; page_count];
+        let mut buf: &mut [u8] = writer.buffer(0).unwrap();
         let page_count = PageFrameCount::new(page_count);
         current_address_space
             .write()
-            .mincore(start_frame, page_count, &mut tmp)?;
-
-        writer.copy_to_user(&tmp, 0)?;
+            .mincore(start_frame, page_count, &mut buf)?;
         return Ok(0);
     }
 

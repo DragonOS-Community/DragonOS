@@ -1,6 +1,4 @@
 use crate::arch::MMArch;
-use alloc::vec::Vec;
-
 use crate::{
     arch::mm::PageMapper,
     mm::{ucontext::LockedVMA, MemoryManagementArch, VirtAddr},
@@ -76,18 +74,21 @@ impl LockedVMA {
     ) -> usize {
         let nr = (end_addr - start_addr) >> MMArch::PAGE_SHIFT;
         if self.is_anonymous() {
-            for i in 0..nr {
-                vec[vec_offset + i] = 0;
-            }
+            vec[vec_offset..vec_offset + nr].fill(0);
         } else {
             let guard = self.lock_irqsave();
             let pgoff = ((start_addr - guard.region().start()) >> MMArch::PAGE_SHIFT)
                 + guard.file_page_offset().unwrap();
+            if guard.vm_file().is_none() {
+                vec[vec_offset..vec_offset + nr].fill(0);
+                return nr;
+            }
             let page_cache = guard.vm_file().unwrap().inode().page_cache();
             match page_cache {
                 Some(page_cache) => {
+                    let cache_guard = page_cache.lock_irqsave();
                     for i in 0..nr {
-                        if page_cache.lock_irqsave().get_page(pgoff + i).is_some() {
+                        if cache_guard.get_page(pgoff + i).is_some() {
                             vec[vec_offset + i] = 1;
                         } else {
                             vec[vec_offset + i] = 0;
@@ -95,9 +96,7 @@ impl LockedVMA {
                     }
                 }
                 None => {
-                    for i in 0..nr {
-                        vec[vec_offset + i] = 0;
-                    }
+                    vec[vec_offset..vec_offset + nr].fill(0);
                 }
             }
         }

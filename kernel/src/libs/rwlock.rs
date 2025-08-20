@@ -117,7 +117,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 尝试获取READER守卫
-    pub fn try_read(&self) -> Option<RwLockReadGuard<T>> {
+    pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
         ProcessManager::preempt_disable();
         let r = self.inner_try_read();
         if r.is_none() {
@@ -126,7 +126,7 @@ impl<T> RwLock<T> {
         return r;
     }
 
-    fn inner_try_read(&self) -> Option<RwLockReadGuard<T>> {
+    fn inner_try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
         let reader_value = self.current_reader();
         //得到自增后的reader_value, 包括了尝试获得READER守卫的进程
 
@@ -153,7 +153,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 获得READER的守卫
-    pub fn read(&self) -> RwLockReadGuard<T> {
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
         loop {
             match self.try_read() {
                 Some(guard) => return guard,
@@ -163,7 +163,7 @@ impl<T> RwLock<T> {
     }
 
     /// 关中断并获取读者守卫
-    pub fn read_irqsave(&self) -> RwLockReadGuard<T> {
+    pub fn read_irqsave(&self) -> RwLockReadGuard<'_, T> {
         loop {
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             match self.try_read() {
@@ -177,7 +177,7 @@ impl<T> RwLock<T> {
     }
 
     /// 尝试关闭中断并获取读者守卫
-    pub fn try_read_irqsave(&self) -> Option<RwLockReadGuard<T>> {
+    pub fn try_read_irqsave(&self) -> Option<RwLockReadGuard<'_, T>> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         if let Some(mut guard) = self.try_read() {
             guard.irq_guard = Some(irq_guard);
@@ -205,7 +205,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 尝试获得WRITER守卫
-    pub fn try_write(&self) -> Option<RwLockWriteGuard<T>> {
+    pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
         ProcessManager::preempt_disable();
         let r = self.inner_try_write();
         if r.is_none() {
@@ -217,7 +217,7 @@ impl<T> RwLock<T> {
 
     #[allow(dead_code)]
     #[inline]
-    pub fn try_write_irqsave(&self) -> Option<RwLockWriteGuard<T>> {
+    pub fn try_write_irqsave(&self) -> Option<RwLockWriteGuard<'_, T>> {
         ProcessManager::preempt_disable();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let r = self.inner_try_write().map(|mut g| {
@@ -232,7 +232,7 @@ impl<T> RwLock<T> {
     }
 
     #[allow(dead_code)]
-    fn inner_try_write(&self) -> Option<RwLockWriteGuard<T>> {
+    fn inner_try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
         let res: bool = self
             .lock
             .compare_exchange(0, WRITER, Ordering::Acquire, Ordering::Relaxed)
@@ -252,7 +252,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 获得WRITER守卫
-    pub fn write(&self) -> RwLockWriteGuard<T> {
+    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         loop {
             match self.try_write() {
                 Some(guard) => return guard,
@@ -264,7 +264,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 获取WRITER守卫并关中断
-    pub fn write_irqsave(&self) -> RwLockWriteGuard<T> {
+    pub fn write_irqsave(&self) -> RwLockWriteGuard<'_, T> {
         loop {
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             match self.try_write() {
@@ -280,7 +280,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 尝试获得UPGRADER守卫
-    pub fn try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
+    pub fn try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<'_, T>> {
         ProcessManager::preempt_disable();
         let r = self.inner_try_upgradeable_read();
         if r.is_none() {
@@ -291,20 +291,20 @@ impl<T> RwLock<T> {
     }
 
     #[allow(dead_code)]
-    pub fn try_upgradeable_read_irqsave(&self) -> Option<RwLockUpgradableGuard<T>> {
+    pub fn try_upgradeable_read_irqsave(&self) -> Option<RwLockUpgradableGuard<'_, T>> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::preempt_disable();
         let mut r = self.inner_try_upgradeable_read();
-        if r.is_none() {
-            ProcessManager::preempt_enable();
+        if let Some(r) = &mut r {
+            r.irq_guard = Some(irq_guard);
         } else {
-            r.as_mut().unwrap().irq_guard = Some(irq_guard);
+            ProcessManager::preempt_enable();
         }
 
         return r;
     }
 
-    fn inner_try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>> {
+    fn inner_try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<'_, T>> {
         // 获得UPGRADER守卫不需要查看读者位
         // 如果获得读者锁失败,不需要撤回fetch_or的原子操作
         if self.lock.fetch_or(UPGRADED, Ordering::Acquire) & (WRITER | UPGRADED) == 0 {
@@ -321,7 +321,7 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 获得UPGRADER守卫
-    pub fn upgradeable_read(&self) -> RwLockUpgradableGuard<T> {
+    pub fn upgradeable_read(&self) -> RwLockUpgradableGuard<'_, T> {
         loop {
             match self.try_upgradeable_read() {
                 Some(guard) => return guard,
@@ -332,7 +332,7 @@ impl<T> RwLock<T> {
 
     #[inline]
     /// @brief 获得UPGRADER守卫
-    pub fn upgradeable_read_irqsave(&self) -> RwLockUpgradableGuard<T> {
+    pub fn upgradeable_read_irqsave(&self) -> RwLockUpgradableGuard<'_, T> {
         loop {
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             match self.try_upgradeable_read() {

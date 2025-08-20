@@ -37,7 +37,7 @@ pub fn trace_cmdline_push(pid: u32) {
         .next()
         .unwrap_or("unknown")
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or("unknown");
     TRACE_CMDLINE_CACHE.lock().insert(pid, pname.to_string());
 }

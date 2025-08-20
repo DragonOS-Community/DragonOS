@@ -55,7 +55,8 @@ impl VirtIOMmioTransport {
 
         match unsafe { MmioTransport::new(header) } {
             Ok(mmio_transport) => {
-                info!( "Detected virtio MMIO device with vendor id {:#X}, device type {:?}, version {:?}, hw irq: {}",
+                info!(
+                    "Detected virtio MMIO device with vendor id {:#X}, device type {:?}, version {:?}, hw irq: {}",
                     mmio_transport.vendor_id(),
                     mmio_transport.device_type(),
                     mmio_transport.version(),

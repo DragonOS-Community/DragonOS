@@ -23,8 +23,9 @@ pub struct NsProxy {
     pub pid_ns_for_children: Arc<PidNamespace>,
     /// mount namespace（挂载命名空间）
     pub mnt_ns: Arc<MntNamespace>,
+    // 注意，user_ns 存储在cred,不存储在nsproxy
+
     // 其他namespace（为未来扩展预留）
-    // pub user_ns: Option<Arc<UserNamespace>>,
     // pub net_ns: Option<Arc<NetNamespace>>,
     // pub ipc_ns: Option<Arc<IpcNamespace>>,
     // pub uts_ns: Option<Arc<UtsNamespace>>,
@@ -57,6 +58,13 @@ impl NsProxy {
     /// 获取mount namespace
     pub fn mnt_namespace(&self) -> &Arc<MntNamespace> {
         &self.mnt_ns
+    }
+
+    pub fn clone_inner(&self) -> Self {
+        Self {
+            pid_ns_for_children: self.pid_ns_for_children.clone(),
+            mnt_ns: self.mnt_ns.clone(),
+        }
     }
 }
 
@@ -123,7 +131,7 @@ impl ProcessManager {
 /// 返回新创建的nsproxy。调用者需要负责正确的加锁并将其附加到进程上。
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?r=&mo=3770&fi=151#67
-fn create_new_namespaces(
+pub(super) fn create_new_namespaces(
     clone_flags: &CloneFlags,
     pcb: &Arc<ProcessControlBlock>,
     user_ns: Arc<UserNamespace>,
@@ -133,7 +141,7 @@ fn create_new_namespaces(
         .pid_ns_for_children
         .copy_pid_ns(clone_flags, user_ns.clone())?;
 
-    let mnt_ns = nsproxy.mnt_ns.copy_mnt_ns(clone_flags, user_ns)?;
+    let mnt_ns = nsproxy.mnt_ns.copy_mnt_ns(clone_flags, user_ns.clone())?;
     let result = NsProxy {
         pid_ns_for_children,
         mnt_ns,

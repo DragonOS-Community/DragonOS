@@ -1,3 +1,5 @@
+use core::sync::atomic::compiler_fence;
+
 use system_error::SystemError;
 
 use crate::{
@@ -51,10 +53,14 @@ impl Serial8250LA64Port {
 
 #[inline(never)]
 pub(super) fn early_la64_seria8250_init() -> Result<(), SystemError> {
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let port = Serial8250LA64Port::new(UART_PADDR_COM1);
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
     unsafe {
         UART_PORT_COM1 = Some(SpinLock::new(port));
     }
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
     send_to_default_serial8250_la64_port(b"[DragonOS] loongarch64 debug uart port initialized!\n");
     Ok(())
 }

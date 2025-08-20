@@ -42,7 +42,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use bitmap::traits::BitMapOps;
+use bitmap::{static_bitmap, traits::BitMapOps};
 use core::fmt::Debug;
 use core::fmt::Formatter;
 use core::{
@@ -158,7 +158,7 @@ impl VirtIOConsoleDevice {
         Some(dev)
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOConsoleDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOConsoleDevice> {
         self.inner.lock_irqsave()
     }
 }
@@ -225,11 +225,11 @@ impl KObject for VirtIOConsoleDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -401,7 +401,7 @@ impl VirtIOConsoleDriver {
         Arc::new(result)
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOConsoleDriver> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOConsoleDriver> {
         self.inner.lock()
     }
 
@@ -422,7 +422,7 @@ impl VirtIOConsoleDriver {
 
 #[derive(Debug)]
 struct InnerVirtIOConsoleDriver {
-    id_bmp: bitmap::StaticBitmap<{ VirtIOConsoleDriver::MAX_DEVICES }>,
+    id_bmp: static_bitmap!(VirtIOConsoleDriver::MAX_DEVICES),
     devname: [Option<DevName>; VirtIOConsoleDriver::MAX_DEVICES],
     virtio_driver_common: VirtIODriverCommonData,
     driver_common: DriverCommonData,
@@ -572,14 +572,18 @@ impl Driver for VirtIOConsoleDriver {
             "VirtIOConsoleDriver::add_device() failed: device is not a VirtIOConsoleDevice",
         );
         if virtio_con_dev.dev_name.initialized() {
-            panic!("VirtIOConsoleDriver::add_device() failed: dev_name has already initialized for device: '{:?}'",
-            virtio_con_dev.dev_id(),
-        );
+            panic!(
+                "VirtIOConsoleDriver::add_device() failed: dev_name has already initialized for device: '{:?}'",
+                virtio_con_dev.dev_id(),
+            );
         }
         let mut inner = self.inner();
         let dev_name = inner.alloc_id();
         if dev_name.is_none() {
-            panic!("Failed to allocate ID for VirtIO console device: '{:?}', virtio console device limit exceeded.", virtio_con_dev.dev_id())
+            panic!(
+                "Failed to allocate ID for VirtIO console device: '{:?}', virtio console device limit exceeded.",
+                virtio_con_dev.dev_id()
+            )
         }
 
         let dev_name = dev_name.unwrap();
@@ -599,7 +603,10 @@ impl Driver for VirtIOConsoleDriver {
         if devices_fast_guard[index].is_none() {
             devices_fast_guard[index] = Some(virtio_con_dev.clone());
         } else {
-            panic!("VirtIOConsoleDriver::add_device() failed: device slot already occupied at index: {}", index);
+            panic!(
+                "VirtIOConsoleDriver::add_device() failed: device slot already occupied at index: {}",
+                index
+            );
         }
         // avoid deadlock in `init_tty_device`
         drop(devices_fast_guard);
@@ -704,11 +711,11 @@ impl KObject for VirtIOConsoleDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

@@ -437,7 +437,7 @@ impl MemBlockManager {
     }
 
     /// 生成迭代器
-    pub fn to_iter(&self) -> MemBlockIter {
+    pub fn to_iter(&self) -> MemBlockIter<'_> {
         let inner = self.inner.lock();
         return MemBlockIter {
             inner,
@@ -447,7 +447,7 @@ impl MemBlockManager {
     }
 
     /// 生成迭代器，迭代所有可用的物理内存区域
-    pub fn to_iter_available(&self) -> MemBlockIter {
+    pub fn to_iter_available(&self) -> MemBlockIter<'_> {
         let inner = self.inner.lock();
         return MemBlockIter {
             inner,

@@ -38,7 +38,6 @@ impl Drop for PanicGuard {
 ///
 #[cfg(target_os = "none")]
 #[panic_handler]
-#[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {
     PANIC_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     error!(

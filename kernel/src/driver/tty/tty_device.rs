@@ -26,12 +26,13 @@ use crate::{
         serial::serial_init,
     },
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
+        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
+        devpts::{DevPtsFs, LockedDevPtsFSInode},
         epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
-            file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
-            PollableInode,
+            file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileType, IndexNode,
+            Metadata, PollableInode,
         },
     },
     init::initcall::INITCALL_DEVICE,
@@ -107,7 +108,19 @@ pub struct TtyDevice {
     inner: RwLock<InnerTtyDevice>,
     kobj_state: LockedKObjectState,
     /// TTY所属的文件系统
-    fs: RwLock<Weak<DevFS>>,
+    fs: RwLock<TtyDeviceFs>,
+    parent: RwLock<TtyDeviceParent>,
+}
+
+pub enum TtyDeviceFs {
+    DevFs(Weak<DevFS>),
+    DevPtsFs(Weak<DevPtsFs>),
+    None,
+}
+pub enum TtyDeviceParent {
+    DevFS(Weak<LockedDevFSInode>),
+    DevPts(Weak<LockedDevPtsFSInode>),
+    None,
 }
 
 impl TtyDevice {
@@ -118,7 +131,8 @@ impl TtyDevice {
             id_table,
             inner: RwLock::new(InnerTtyDevice::new()),
             kobj_state: LockedKObjectState::new(None),
-            fs: RwLock::new(Weak::default()),
+            fs: RwLock::new(TtyDeviceFs::None),
+            parent: RwLock::new(TtyDeviceParent::None),
             tty_type,
         };
 
@@ -127,7 +141,7 @@ impl TtyDevice {
         Arc::new(dev)
     }
 
-    pub fn inner_write(&self) -> RwLockWriteGuard<InnerTtyDevice> {
+    pub fn inner_write(&self) -> RwLockWriteGuard<'_, InnerTtyDevice> {
         self.inner.write()
     }
 
@@ -361,7 +375,17 @@ impl IndexNode for TtyDevice {
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!()
+        match &*self.fs.read() {
+            TtyDeviceFs::DevFs(fs) => fs.upgrade().unwrap(),
+            TtyDeviceFs::DevPtsFs(fs) => fs.upgrade().unwrap(),
+            TtyDeviceFs::None => {
+                panic!("TtyDevice has no filesystem set");
+            }
+        }
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.name.clone().into())
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -483,11 +507,32 @@ impl IndexNode for TtyDevice {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Ok(self)
     }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let parent = self.parent.read();
+        match &*parent {
+            TtyDeviceParent::DevFS(devfs) => Ok(devfs.upgrade().unwrap()),
+            TtyDeviceParent::DevPts(devpts) => Ok(devpts.upgrade().unwrap()),
+            TtyDeviceParent::None => panic!("TtyDevice has no filesystem set"),
+        }
+    }
 }
 
 impl DeviceINode for TtyDevice {
     fn set_fs(&self, fs: alloc::sync::Weak<crate::filesystem::devfs::DevFS>) {
-        *self.fs.write() = fs;
+        *self.fs.write() = TtyDeviceFs::DevFs(fs);
+    }
+
+    fn set_parent(&self, parent: Weak<crate::filesystem::devfs::LockedDevFSInode>) {
+        *self.parent.write() = TtyDeviceParent::DevFS(parent);
+    }
+
+    fn set_devpts_fs(&self, devpts: Weak<crate::filesystem::devpts::DevPtsFs>) {
+        *self.fs.write() = TtyDeviceFs::DevPtsFs(devpts);
+    }
+
+    fn set_devpts_parent(&self, parent: Weak<LockedDevPtsFSInode>) {
+        *self.parent.write() = TtyDeviceParent::DevPts(parent);
     }
 }
 
@@ -536,13 +581,13 @@ impl KObject for TtyDevice {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.read()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.write()
     }
 

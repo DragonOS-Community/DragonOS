@@ -1,7 +1,8 @@
 use crate::driver::net::Iface;
 use crate::libs::rwlock::RwLock;
+use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use alloc::collections::BTreeMap;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use smoltcp::wire::{EthernetAddress, EthernetFrame, IpAddress, IpCidr, Ipv4Packet};
@@ -148,12 +149,8 @@ impl Router {
     }
 }
 
-lazy_static! {
-    pub static ref GLOBAL_ROUTER: Arc<Router> = Arc::new(Router::new("global_router".to_string()));
-}
-
-pub fn global_router() -> Arc<Router> {
-    GLOBAL_ROUTER.clone()
+pub fn init_netns_router() -> Arc<Router> {
+    INIT_NET_NAMESPACE.router().clone()
 }
 
 /// 可供路由设备应该实现的 trait
@@ -195,8 +192,8 @@ pub trait RouterEnableDevice: Iface {
             return;
         }
 
-        // 查询全局路由表//todo 加入namespace之后在这里改成每个设备所属命名空间的Router即可
-        let router = global_router();
+        // 查询当前网络命名空间下的路由表
+        let router = self.netns_router();
 
         let decision = match router.lookup_route(dst_ip.into()) {
             Some(d) => d,
@@ -238,27 +235,30 @@ pub trait RouterEnableDevice: Iface {
     /// 同Linux的ndo_start_xmit()
     ///
     /// todo 在这里查询arp_table，找到目标IP对应的mac地址然后拼接，如果找不到的话就需要主动发送arp请求去查询mac地址了，手伸不到smoltcp内部:(
+    /// 后续需要将arp查询的逻辑从smoltcp中抽离出来
     fn route_and_send(&self, next_hop: IpAddress, ip_packet: &[u8]);
 
     /// 检查IP地址是否是当前接口的IP
     fn is_my_ip(&self, ip: IpAddress) -> bool;
+
+    fn netns_router(&self) -> Arc<Router> {
+        self.net_namespace()
+            .map_or_else(|| init_netns_router(), |ns| ns.router())
+    }
 }
 
 /// # 每一个`RouterEnableDevice`应该有的公共数据，包含
 /// - 当前接口的arp_table，记录邻居（//todo：将网卡的发送以及处理逻辑从smoltcp中移动出来，目前只是简单为veth实现这个，因为可以直接查到对端的mac地址）
-/// - 当前接口的路由器 （//todo：引入命名空间之后在这里指向当前所属命名空间的Router）
 #[derive(Debug)]
 pub struct RouterEnableDeviceCommon {
+    /// 当前接口的邻居缓存
     pub arp_table: RwLock<BTreeMap<IpAddress, EthernetAddress>>,
-    pub router: Weak<Router>,
 }
 
 impl Default for RouterEnableDeviceCommon {
     fn default() -> Self {
-        let router = global_router();
         Self {
             arp_table: RwLock::new(BTreeMap::new()),
-            router: Arc::downgrade(&router),
         }
     }
 }

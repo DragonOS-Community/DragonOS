@@ -157,6 +157,10 @@ impl NetNamespace {
         self.inner().default_iface.clone()
     }
 
+    pub fn router(&self) -> Arc<Router> {
+        self.inner().router.clone()
+    }
+
     pub fn add_device(&self, device: Arc<dyn Iface>) {
         device.set_net_namespace(self.self_ref.upgrade().unwrap());
 

@@ -4,6 +4,9 @@ use crate::exception::InterruptArch;
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::net::routing::Router;
+use crate::net::socket::netlink::table::{
+    generate_supported_netlink_kernel_sockets, NetlinkKernelSocket, NetlinkSocketTable,
+};
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
 use crate::process::namespace::{NamespaceOps, NamespaceType};
@@ -18,6 +21,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
+use hashbrown::HashMap;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -47,6 +51,14 @@ pub struct NetNamespace {
     /// 这个列表在中断上下文会使用到，因此需要irqsave
     /// 没有放在InnerNetNamespace里面，独立出来，方便管理
     device_list: RwLock<BTreeMap<usize, Arc<dyn Iface>>>,
+
+    // -- Netlink --
+    /// # 当前网络命名空间下的 Netlink 套接字表
+    /// 负责绑定netlink套接字的接收队列，以便发送接收消息
+    netlink_socket_table: NetlinkSocketTable,
+    /// # 当前网络命名空间下的 Netlink 内核套接字
+    /// 负责接收并处理 Netlink 消息
+    netlink_kernel_socket: RwLock<HashMap<u32, Arc<dyn NetlinkKernelSocket>>>,
 }
 
 #[derive(Debug)]
@@ -54,6 +66,8 @@ pub struct InnerNetNamespace {
     router: Arc<Router>,
     /// 当前网络命名空间的loopback网卡
     loopback_iface: Option<Arc<LoopbackInterface>>,
+    /// 当前网络命名空间的默认网卡
+    /// 这个网卡会在没有指定网卡的情况下使用
     default_iface: Option<Arc<dyn Iface>>,
 }
 
@@ -78,10 +92,12 @@ impl NetNamespace {
         let netns = Arc::new_cyclic(|self_ref| Self {
             ns_common: NsCommon::new(0, NamespaceType::Net),
             self_ref: self_ref.clone(),
-            _user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
+            _user_ns: crate::process::namespace::user_namespace::INIT_USER_NAMESPACE.clone(),
             inner: RwLock::new(inner),
             net_poll_thread: SpinLock::new(None),
             device_list: RwLock::new(BTreeMap::new()),
+            netlink_socket_table: NetlinkSocketTable::default(),
+            netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
         });
 
         // Self::create_polling_thread(netns.clone(), "netns_root".to_string());
@@ -91,7 +107,7 @@ impl NetNamespace {
 
     pub fn new_empty(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, SystemError> {
         // 这里获取当前进程的pid，只是为了给后面创建的路由以及线程做唯一标识，没有其他意义
-        let pid = ProcessManager::current_pid().0;
+        let pid = ProcessManager::current_pid().data();
         let loopback = generate_loopback_iface_default();
 
         let inner = InnerNetNamespace {
@@ -107,6 +123,8 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             net_poll_thread: SpinLock::new(None),
             device_list: RwLock::new(BTreeMap::new()),
+            netlink_socket_table: NetlinkSocketTable::default(),
+            netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
         });
         Self::create_polling_thread(netns.clone(), format!("netns_{}", pid));
 
@@ -159,6 +177,17 @@ impl NetNamespace {
 
     pub fn router(&self) -> Arc<Router> {
         self.inner().router.clone()
+    }
+
+    pub fn netlink_socket_table(&self) -> &NetlinkSocketTable {
+        &self.netlink_socket_table
+    }
+
+    pub fn get_netlink_socket_by_protocol(
+        &self,
+        protocol: u32,
+    ) -> Option<Arc<dyn NetlinkKernelSocket>> {
+        self.netlink_kernel_socket.read().get(&protocol).cloned()
     }
 
     pub fn add_device(&self, device: Arc<dyn Iface>) {

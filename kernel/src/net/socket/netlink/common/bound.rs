@@ -5,8 +5,10 @@ use crate::{
         receiver::MessageQueue,
         table::BoundHandle,
     },
+    process::namespace::net_namespace::NetNamespace,
 };
 use alloc::fmt::Debug;
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 #[derive(Debug)]
@@ -14,14 +16,20 @@ pub struct BoundNetlink<Message: 'static + Debug> {
     pub(in crate::net::socket::netlink) handle: BoundHandle<Message>,
     pub(in crate::net::socket::netlink) remote_addr: NetlinkSocketAddr,
     pub(in crate::net::socket::netlink) receive_queue: MessageQueue<Message>,
+    pub(in crate::net::socket::netlink) netns: Arc<NetNamespace>,
 }
 
 impl<Message: 'static + Debug> BoundNetlink<Message> {
-    pub(super) fn new(handle: BoundHandle<Message>, message_queue: MessageQueue<Message>) -> Self {
+    pub(super) fn new(
+        handle: BoundHandle<Message>,
+        message_queue: MessageQueue<Message>,
+        netns: Arc<NetNamespace>,
+    ) -> Self {
         Self {
             handle,
             remote_addr: NetlinkSocketAddr::new_unspecified(),
             receive_queue: message_queue,
+            netns,
         }
     }
 
@@ -52,5 +60,9 @@ impl<Message: 'static + Debug> BoundNetlink<Message> {
 
     pub(super) fn drop_groups(&mut self, groups: GroupIdSet) {
         self.handle.drop_groups(groups);
+    }
+
+    pub fn netns(&self) -> Arc<NetNamespace> {
+        self.netns.clone()
     }
 }

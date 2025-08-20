@@ -1,4 +1,4 @@
-pub mod noattr;
+pub(super) mod noattr;
 
 use crate::net::socket::netlink::message::NLMSG_ALIGN;
 use alloc::vec::Vec;

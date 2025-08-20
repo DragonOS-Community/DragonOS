@@ -84,8 +84,8 @@ impl Attribute for RouteAttr {
     }
 
     fn read_from_buf(
-        header: &crate::net::socket::netlink::message::attr::CAttrHeader,
-        payload_buf: &[u8],
+        _header: &crate::net::socket::netlink::message::attr::CAttrHeader,
+        _payload_buf: &[u8],
     ) -> Result<Option<Self>, SystemError>
     where
         Self: Sized,

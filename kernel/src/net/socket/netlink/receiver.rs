@@ -27,7 +27,7 @@ impl<Message> MessageQueue<Message> {
     }
 }
 
-/// Netlink Socket 的消息接收器，记录在全局的 Netlink Socket 表中，负责将消息压入对应的消息队列，并唤醒等待的线程
+/// Netlink Socket 的消息接收器，记录在当前网络命名空间的 Netlink Socket 表中，负责将消息压入对应的消息队列，并唤醒等待的线程
 #[derive(Debug)]
 pub struct MessageReceiver<Message> {
     message_queue: MessageQueue<Message>,

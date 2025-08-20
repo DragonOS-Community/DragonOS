@@ -5,7 +5,7 @@ use crate::{
             addr::NetlinkSocketAddr,
             common::bound::BoundNetlink,
             message::ProtocolSegment,
-            route::{kernel::netlink_route_kernel, message::RouteNlMessage},
+            route::{kernel::NetlinkRouteKernelSocket, message::RouteNlMessage},
         },
         utils::datagram_common,
         PMSG,
@@ -73,7 +73,20 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
             }
         }
 
-        netlink_route_kernel().request(&nlmsg, local_port);
+        let Some(route_kernel) = self
+            .netns
+            .get_netlink_socket_by_protocol(nlmsg.protocol().into())
+        else {
+            log::warn!("No route kernel socket available in net namespace");
+            return Ok(sum_lens);
+        };
+
+        let route_kernel_socket = route_kernel
+            .as_any_ref()
+            .downcast_ref::<NetlinkRouteKernelSocket>()
+            .unwrap();
+
+        route_kernel_socket.request(&nlmsg, local_port, self.netns());
 
         Ok(sum_lens)
     }

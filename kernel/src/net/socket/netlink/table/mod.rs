@@ -1,33 +1,45 @@
 mod multicast;
 
 use crate::net::socket::netlink::addr::multicast::GroupIdSet;
+use crate::net::socket::netlink::route::kernel::NetlinkRouteKernelSocket;
 use crate::net::socket::netlink::route::message::RouteNlMessage;
 use crate::net::socket::netlink::table::multicast::MulticastMessage;
+use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::{libs::rand, net::socket::netlink::addr::NetlinkSocketAddr};
 use crate::{
-    libs::{once::Once, rwlock::RwLock},
+    libs::rwlock::RwLock,
     net::socket::netlink::{receiver::MessageReceiver, table::multicast::MulticastGroup},
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::fmt::Debug;
+use alloc::sync::Arc;
+use core::any::Any;
+use hashbrown::HashMap;
 use system_error::SystemError;
 
-static mut NETLINK_SOCKET_TABLE: Option<NetlinkSocketTable> = None;
-
-const MAX_ALLOWED_PROTOCOL_ID: u32 = 32;
+pub const MAX_ALLOWED_PROTOCOL_ID: u32 = 32;
 const MAX_GROUPS: u32 = 32;
 
-struct NetlinkSocketTable {
-    route: RwLock<ProtocolSocketTable<RouteNlMessage>>,
+#[derive(Debug)]
+pub struct NetlinkSocketTable {
+    route: Arc<RwLock<ProtocolSocketTable<RouteNlMessage>>>,
+    // 在这里继续补充其他协议下的 socket table
+    // 比如 uevent: Arc<RwLock<ProtocolSocketTable<UeventMessage>>>,
+}
+
+impl Default for NetlinkSocketTable {
+    fn default() -> Self {
+        Self {
+            route: Arc::new(RwLock::new(ProtocolSocketTable::new())),
+        }
+    }
 }
 
 impl NetlinkSocketTable {
-    pub fn new() -> Self {
-        Self {
-            route: RwLock::new(ProtocolSocketTable::new()),
-        }
+    pub fn route(&self) -> Arc<RwLock<ProtocolSocketTable<RouteNlMessage>>> {
+        self.route.clone()
     }
 }
 
@@ -48,7 +60,7 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
 
     fn bind(
         &mut self,
-        socket_table: &'static RwLock<ProtocolSocketTable<Message>>,
+        socket_table: Arc<RwLock<ProtocolSocketTable<Message>>>,
         addr: &NetlinkSocketAddr,
         receiver: MessageReceiver<Message>,
     ) -> Result<BoundHandle<Message>, SystemError> {
@@ -103,14 +115,14 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
 
 #[derive(Debug)]
 pub struct BoundHandle<Message: 'static + Debug> {
-    socket_table: &'static RwLock<ProtocolSocketTable<Message>>,
+    socket_table: Arc<RwLock<ProtocolSocketTable<Message>>>,
     port: u32,
     groups: GroupIdSet,
 }
 
 impl<Message: 'static + Debug> BoundHandle<Message> {
     fn new(
-        socket_table: &'static RwLock<ProtocolSocketTable<Message>>,
+        socket_table: Arc<RwLock<ProtocolSocketTable<Message>>>,
         port: u32,
         groups: GroupIdSet,
     ) -> Self {
@@ -184,27 +196,37 @@ impl<Message: 'static + Debug> Drop for BoundHandle<Message> {
 pub trait SupportedNetlinkProtocol: Debug {
     type Message: 'static + Send + Debug;
 
-    fn socket_table() -> &'static RwLock<ProtocolSocketTable<Self::Message>>;
+    fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwLock<ProtocolSocketTable<Self::Message>>>;
 
     fn bind(
         addr: &NetlinkSocketAddr,
         receiver: MessageReceiver<Self::Message>,
+        netns: Arc<NetNamespace>,
     ) -> Result<BoundHandle<Self::Message>, SystemError> {
-        let mut socket_table = Self::socket_table().write();
-        socket_table.bind(Self::socket_table(), addr, receiver)
+        let socket_table = Self::socket_table(netns);
+        let mut socket_table_guard = socket_table.write();
+        socket_table_guard.bind(socket_table.clone(), addr, receiver)
     }
 
-    fn unicast(dst_port: u32, message: Self::Message) -> Result<(), SystemError> {
-        let socket_table = Self::socket_table().read();
-        socket_table.unicast(dst_port, message)
+    fn unicast(
+        dst_port: u32,
+        message: Self::Message,
+        netns: Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Self::socket_table(netns).read().unicast(dst_port, message)
     }
 
-    fn multicast(dst_groups: GroupIdSet, message: Self::Message) -> Result<(), SystemError>
+    fn multicast(
+        dst_groups: GroupIdSet,
+        message: Self::Message,
+        netns: Arc<NetNamespace>,
+    ) -> Result<(), SystemError>
     where
         Self::Message: MulticastMessage,
     {
-        let socket_table = Self::socket_table().read();
-        socket_table.multicast(dst_groups, message)
+        Self::socket_table(netns)
+            .read()
+            .multicast(dst_groups, message)
     }
 }
 
@@ -214,20 +236,31 @@ pub struct NetlinkRouteProtocol;
 impl SupportedNetlinkProtocol for NetlinkRouteProtocol {
     type Message = RouteNlMessage;
 
-    fn socket_table() -> &'static RwLock<ProtocolSocketTable<Self::Message>> {
-        unsafe { &NETLINK_SOCKET_TABLE.as_ref().unwrap().route }
+    fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwLock<ProtocolSocketTable<Self::Message>>> {
+        netns.netlink_socket_table().route()
     }
-}
-
-pub fn init() {
-    let once = Once::new();
-    once.call_once(|| unsafe {
-        NETLINK_SOCKET_TABLE = Some(NetlinkSocketTable::new());
-    });
 }
 
 pub fn is_valid_protocol(protocol: u32) -> bool {
     protocol < MAX_ALLOWED_PROTOCOL_ID
+}
+
+pub trait NetlinkKernelSocket: Debug + Send + Sync {
+    fn protocol(&self) -> StandardNetlinkProtocol;
+
+    /// 用于实现动态转换
+    fn as_any_ref(&self) -> &dyn Any;
+}
+
+/// 为一个网络命名空间生成支持的 Netlink 内核套接字
+pub fn generate_supported_netlink_kernel_sockets() -> HashMap<u32, Arc<dyn NetlinkKernelSocket>> {
+    let mut sockets: HashMap<u32, Arc<dyn NetlinkKernelSocket>> =
+        HashMap::with_capacity(MAX_ALLOWED_PROTOCOL_ID as usize);
+    let route_socket = Arc::new(NetlinkRouteKernelSocket::new());
+    sockets.insert(route_socket.protocol().into(), route_socket);
+
+    // Add other supported netlink kernel sockets here
+    sockets
 }
 
 #[expect(non_camel_case_types)]
@@ -273,6 +306,12 @@ pub enum StandardNetlinkProtocol {
     CRYPTO = 21,
     /// SMC monitoring
     SMC = 22,
+}
+
+impl From<StandardNetlinkProtocol> for u32 {
+    fn from(value: StandardNetlinkProtocol) -> Self {
+        value as u32
+    }
 }
 
 impl TryFrom<u32> for StandardNetlinkProtocol {

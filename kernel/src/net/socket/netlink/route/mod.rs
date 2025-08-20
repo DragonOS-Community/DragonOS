@@ -1,7 +1,7 @@
 use crate::net::socket::netlink::{common::NetlinkSocket, table::NetlinkRouteProtocol};
 
-pub mod bound;
-mod kernel;
-pub mod message;
+pub(super) mod bound;
+pub(super) mod kernel;
+pub(super) mod message;
 
-pub type NetlinkRouteSocket = NetlinkSocket<NetlinkRouteProtocol>;
+pub(super) type NetlinkRouteSocket = NetlinkSocket<NetlinkRouteProtocol>;

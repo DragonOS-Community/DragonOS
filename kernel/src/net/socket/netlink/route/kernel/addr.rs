@@ -1,27 +1,25 @@
 use crate::{
     driver::net::Iface,
-    net::{
-        socket::{
-            netlink::{
-                message::segment::{
-                    header::{CMsgSegHdr, GetRequestFlags, SegHdrCommonFlags},
-                    CSegmentType,
-                },
-                route::{
-                    kernel::utils::finish_response,
-                    message::{
-                        attr::addr::AddrAttr,
-                        segment::{
-                            addr::{AddrMessageFlags, AddrSegment, AddrSegmentBody, RtScope},
-                            RouteNlSegment,
-                        },
+    net::socket::{
+        netlink::{
+            message::segment::{
+                header::{CMsgSegHdr, GetRequestFlags, SegHdrCommonFlags},
+                CSegmentType,
+            },
+            route::{
+                kernel::utils::finish_response,
+                message::{
+                    attr::addr::AddrAttr,
+                    segment::{
+                        addr::{AddrMessageFlags, AddrSegment, AddrSegmentBody, RtScope},
+                        RouteNlSegment,
                     },
                 },
             },
-            AddressFamily,
         },
-        NET_DEVICES,
+        AddressFamily,
     },
+    process::namespace::net_namespace::NetNamespace,
 };
 use alloc::ffi::CString;
 use alloc::sync::Arc;
@@ -31,6 +29,7 @@ use system_error::SystemError;
 
 pub(super) fn do_get_addr(
     request_segment: &AddrSegment,
+    netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
     let dump_all = {
         let flags = GetRequestFlags::from_bits_truncate(request_segment.header().flags);
@@ -42,8 +41,8 @@ pub(super) fn do_get_addr(
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    let mut responce: Vec<RouteNlSegment> = NET_DEVICES
-        .read()
+    let mut responce: Vec<RouteNlSegment> = netns
+        .device_list()
         .iter()
         .filter_map(|(_, iface)| iface_to_new_addr(request_segment.header(), iface))
         .map(RouteNlSegment::NewAddr)

@@ -1,9 +1,11 @@
-use crate::net::socket::netlink::message::segment::header::CMsgSegHdr;
+use crate::net::socket::netlink::{
+    message::segment::header::CMsgSegHdr, table::StandardNetlinkProtocol,
+};
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-pub mod attr;
-pub mod segment;
+pub(super) mod attr;
+pub(super) mod segment;
 
 #[derive(Debug)]
 pub struct Message<T: ProtocolSegment> {
@@ -50,6 +52,14 @@ impl<T: ProtocolSegment> Message<T> {
             .map(|segment| segment.header().len as usize)
             .sum()
     }
+
+    pub fn protocol(&self) -> StandardNetlinkProtocol {
+        self.segments
+            .first()
+            .map_or(StandardNetlinkProtocol::UNUSED, |segment| {
+                segment.protocol()
+            })
+    }
 }
 
 pub trait ProtocolSegment: Sized + alloc::fmt::Debug {
@@ -57,6 +67,7 @@ pub trait ProtocolSegment: Sized + alloc::fmt::Debug {
     fn header_mut(&mut self) -> &mut CMsgSegHdr;
     fn read_from(reader: &[u8]) -> Result<Self, SystemError>;
     fn write_to(&self, writer: &mut [u8]) -> Result<usize, SystemError>;
+    fn protocol(&self) -> StandardNetlinkProtocol;
 }
 
 pub(super) const NLMSG_ALIGN: usize = 4;

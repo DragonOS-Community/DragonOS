@@ -11,6 +11,7 @@ use crate::{
         utils::datagram_common::{select_remote_and_bind, Bound, Inner},
         Socket, PMSG,
     },
+    process::{namespace::net_namespace::NetNamespace, ProcessManager},
 };
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicBool;
@@ -25,6 +26,7 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
 
     is_nonblocking: AtomicBool,
     wait_queue: Arc<WaitQueue>,
+    netns: Arc<NetNamespace>,
 }
 
 impl<P: SupportedNetlinkProtocol> NetlinkSocket<P>
@@ -37,6 +39,7 @@ where
             inner: RwLock::new(Inner::Unbound(unbound)),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             wait_queue: Arc::new(WaitQueue::default()),
+            netns: ProcessManager::current_netns(),
         })
     }
 
@@ -53,6 +56,7 @@ where
                 self.inner.write().bind_ephemeral(
                     &NetlinkSocketAddr::new_unspecified(),
                     self.wait_queue.clone(),
+                    self.netns(),
                 )
             },
             |bound, remote| bound.try_send(buf, &remote, flags),
@@ -85,6 +89,10 @@ where
             .check_io_events()
             .contains(EPollEventType::EPOLLIN)
     }
+
+    pub fn netns(&self) -> Arc<NetNamespace> {
+        self.netns.clone()
+    }
 }
 
 impl<P: SupportedNetlinkProtocol + 'static> Socket for NetlinkSocket<P>
@@ -99,7 +107,7 @@ where
 
         self.inner
             .write()
-            .connect(&endpoint, self.wait_queue.clone())
+            .connect(&endpoint, self.wait_queue.clone(), self.netns())
     }
 
     fn bind(
@@ -108,7 +116,9 @@ where
     ) -> Result<(), system_error::SystemError> {
         let endpoint = endpoint.try_into()?;
 
-        self.inner.write().bind(&endpoint, self.wait_queue.clone())
+        self.inner
+            .write()
+            .bind(&endpoint, self.wait_queue.clone(), self.netns())
     }
 
     fn send_to(

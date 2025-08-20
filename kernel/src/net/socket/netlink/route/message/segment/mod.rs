@@ -103,4 +103,8 @@ impl ProtocolSegment for RouteNlSegment {
 
         Ok(copied)
     }
+
+    fn protocol(&self) -> crate::net::socket::netlink::table::StandardNetlinkProtocol {
+        crate::net::socket::netlink::table::StandardNetlinkProtocol::ROUTE
+    }
 }

@@ -243,7 +243,7 @@ pub trait RouterEnableDevice: Iface {
 
     fn netns_router(&self) -> Arc<Router> {
         self.net_namespace()
-            .map_or_else(|| init_netns_router(), |ns| ns.router())
+            .map_or_else(init_netns_router, |ns| ns.router())
     }
 }
 

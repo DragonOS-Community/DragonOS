@@ -10,6 +10,7 @@ use crate::{
         },
         utils::datagram_common,
     },
+    process::namespace::net_namespace::NetNamespace,
 };
 use alloc::sync::Arc;
 use core::marker::PhantomData;
@@ -48,8 +49,9 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
 
     fn bind(
         &mut self,
-        endpoint: &NetlinkSocketAddr,
+        endpoint: &Self::Endpoint,
         wait_queue: Arc<WaitQueue>,
+        netns: Arc<NetNamespace>,
     ) -> Result<BoundNetlink<P::Message>, SystemError> {
         let message_queue = MessageQueue::<P::Message>::new();
         let bound_handle = {
@@ -59,16 +61,17 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
                 endpoint
             };
             let receiver = MessageReceiver::new(message_queue.clone(), wait_queue);
-            <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver)?
+            <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver, netns.clone())?
         };
 
-        Ok(BoundNetlink::new(bound_handle, message_queue))
+        Ok(BoundNetlink::new(bound_handle, message_queue, netns))
     }
 
     fn bind_ephemeral(
         &mut self,
         _remote_endpoint: &Self::Endpoint,
         wait_queue: Arc<WaitQueue>,
+        netns: Arc<NetNamespace>,
     ) -> Result<BoundNetlink<P::Message>, SystemError> {
         let message_queue = MessageQueue::<P::Message>::new();
 
@@ -79,10 +82,10 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
                 endpoint
             };
             let receiver = MessageReceiver::new(message_queue.clone(), wait_queue);
-            <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver)?
+            <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver, netns.clone())?
         };
 
-        Ok(BoundNetlink::new(bound_handle, message_queue))
+        Ok(BoundNetlink::new(bound_handle, message_queue, netns))
     }
 
     fn check_io_events(&self) -> EPollEventType {

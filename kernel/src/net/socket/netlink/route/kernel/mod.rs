@@ -1,37 +1,52 @@
 //! # Netlink route kernel module
 //! 内核对于 Netlink 路由的处理模块
 
-use crate::net::socket::netlink::{
-    message::{
-        segment::{ack::ErrorSegment, CSegmentType},
-        ProtocolSegment,
+use crate::{
+    net::socket::netlink::{
+        message::{
+            segment::{ack::ErrorSegment, CSegmentType},
+            ProtocolSegment,
+        },
+        route::message::{segment::RouteNlSegment, RouteNlMessage},
+        table::{
+            NetlinkKernelSocket, NetlinkRouteProtocol, StandardNetlinkProtocol,
+            SupportedNetlinkProtocol,
+        },
     },
-    route::message::{segment::RouteNlSegment, RouteNlMessage},
-    table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
+    process::namespace::net_namespace::NetNamespace,
 };
+use alloc::sync::Arc;
 use core::marker::PhantomData;
 
 mod addr;
 mod utils;
 
-pub(super) struct NetlinkRouteKernelSocket {
+/// 负责处理 Netlink 路由相关的内核模块
+/// 每个 net namespace 都有一个独立的 NetlinkRouteKernelSocket
+#[derive(Debug)]
+pub struct NetlinkRouteKernelSocket {
     _private: PhantomData<()>,
 }
 
 impl NetlinkRouteKernelSocket {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         NetlinkRouteKernelSocket {
             _private: PhantomData,
         }
     }
 
-    pub(super) fn request(&self, request: &RouteNlMessage, dst_port: u32) {
+    pub(super) fn request(
+        &self,
+        request: &RouteNlMessage,
+        dst_port: u32,
+        netns: Arc<NetNamespace>,
+    ) {
         for segment in request.segments() {
             let header = segment.header();
 
             let seg_type = CSegmentType::try_from(header.type_).unwrap();
             let responce = match segment {
-                RouteNlSegment::GetAddr(request) => addr::do_get_addr(request),
+                RouteNlSegment::GetAddr(request) => addr::do_get_addr(request, netns.clone()),
                 RouteNlSegment::GetRoute(_new_route) => todo!(),
                 _ => {
                     log::warn!("Unsupported route request segment type: {:?}", seg_type);
@@ -48,15 +63,17 @@ impl NetlinkRouteKernelSocket {
                 }
             };
 
-            NetlinkRouteProtocol::unicast(dst_port, responce).unwrap();
+            NetlinkRouteProtocol::unicast(dst_port, responce, netns.clone()).unwrap();
         }
     }
 }
 
-/// 负责处理 Netlink 路由相关的内核模块
-/// todo net namespace 实现之后应该是每一个 namespace 都有一个独立的 NetlinkRouteKernelSocket
-static NETLINK_ROUTE_KERNEL: NetlinkRouteKernelSocket = NetlinkRouteKernelSocket::new();
+impl NetlinkKernelSocket for NetlinkRouteKernelSocket {
+    fn protocol(&self) -> StandardNetlinkProtocol {
+        StandardNetlinkProtocol::ROUTE
+    }
 
-pub(super) fn netlink_route_kernel() -> &'static NetlinkRouteKernelSocket {
-    &NETLINK_ROUTE_KERNEL
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
 }

@@ -1,4 +1,5 @@
 use crate::filesystem::epoll::EPollEventType;
+use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     libs::{rwlock::RwLock, wait_queue::WaitQueue},
     net::socket::PMSG,
@@ -17,12 +18,14 @@ pub trait Unbound {
         &mut self,
         endpoint: &Self::Endpoint,
         wait_queue: Arc<WaitQueue>,
+        netns: Arc<NetNamespace>,
     ) -> Result<Self::Bound, SystemError>;
 
     fn bind_ephemeral(
         &mut self,
         endpoint: &Self::Endpoint,
         wait_queue: Arc<WaitQueue>,
+        netns: Arc<NetNamespace>,
     ) -> Result<Self::Bound, SystemError>;
 
     fn check_io_events(&self) -> EPollEventType;
@@ -67,13 +70,14 @@ where
         &mut self,
         endpoint: &UnboundSocket::Endpoint,
         wait_queue: Arc<WaitQueue>,
+        netns: Arc<NetNamespace>,
     ) -> Result<(), SystemError> {
         let unbound = match self {
             Inner::Bound(bound) => return bound.bind(endpoint),
             Inner::Unbound(unbound) => unbound,
         };
 
-        let bound = unbound.bind(endpoint, wait_queue)?;
+        let bound = unbound.bind(endpoint, wait_queue, netns)?;
         *self = Inner::Bound(bound);
 
         Ok(())
@@ -83,13 +87,14 @@ where
         &mut self,
         remote_endpoint: &UnboundSocket::Endpoint,
         wait_queue: Arc<WaitQueue>,
+        netns: Arc<NetNamespace>,
     ) -> Result<(), SystemError> {
         let unbound_datagram = match self {
             Inner::Unbound(unbound) => unbound,
             Inner::Bound(_) => return Ok(()),
         };
 
-        let bound = unbound_datagram.bind_ephemeral(remote_endpoint, wait_queue)?;
+        let bound = unbound_datagram.bind_ephemeral(remote_endpoint, wait_queue, netns)?;
         *self = Inner::Bound(bound);
 
         Ok(())
@@ -99,8 +104,9 @@ where
         &mut self,
         remote_endpoint: &UnboundSocket::Endpoint,
         wait_queue: Arc<WaitQueue>,
+        netns: Arc<NetNamespace>,
     ) -> Result<(), SystemError> {
-        self.bind_ephemeral(remote_endpoint, wait_queue)?;
+        self.bind_ephemeral(remote_endpoint, wait_queue, netns)?;
 
         let bound = match self {
             Inner::Unbound(_) => {
@@ -125,7 +131,7 @@ where
     pub fn addr(&self) -> Option<UnboundSocket::Endpoint> {
         match self {
             Inner::Unbound(_) => None,
-            Inner::Bound(bound) => bound.remote_endpoint(),
+            Inner::Bound(bound) => Some(bound.local_endpoint()),
         }
     }
 

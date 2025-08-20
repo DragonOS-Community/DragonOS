@@ -451,16 +451,50 @@ impl BlockDevice for LoopDevice {
         Vec::new()
     }
 }
-use crate::init::initcall::INITCALL_DEVICE;
-#[unified_init(INITCALL_DEVICE)]
-pub fn register_loop_devices() -> Result<(), SystemError> {
-    for minor in 0..8 {
-        let devname = DevName::new(format!("loop{}", minor), minor);
-        let dev_id =
-            DeviceId::new(None, Some(devname.name().to_string())).ok_or(SystemError::EINVAL)?;
-        if let Some(loop_dev) = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32) {
-            log::info!(
-                "Registering loop device: {}",
+
+/// Loop设备驱动
+/// 参考Virtio_blk驱动的实现
+#[derive(Debug)]
+#[cast_to([sync] Driver)]
+pub struct LoopDeviceDriver {
+    inner: SpinLock<InnerLoopDeviceDriver>,
+    kobj_state: LockedKObjectState,
+}
+struct InnerLoopDeviceDriver{
+    driver_common: DriverCommonData,
+    kobj_common: KObjectCommonData,
+}
+impl Debug for InnerLoopDeviceDriver {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InnerLoopDeviceDriver")
+            .field("driver_common", &self.driver_common)
+            .field("kobj_common", &self.kobj_common)
+            .finish()
+    }
+}
+impl LoopDeviceDriver {
+    
+    pub fn new() -> Arc<Self> {
+        let inner = InnerLoopDeviceDriver{
+            driver_common: DriverCommonData::default(),
+            kobj_common: KObjectCommonData::default(),
+        };
+        Arc::new(Self {
+            inner: SpinLock::new(inner),
+            kobj_state: LockedKObjectState::default(),
+        })
+    }
+    fn inner(&self) -> SpinLockGuard<InnerLoopDeviceDriver> {
+        self.inner.lock()
+    }
+    fn loop_init(&self) -> Result<(), SystemError> {
+        // 创建并初始化 LoopManager 单例
+     //   let loop_mgr = LOOP_MANAGER.call_once(|| LoopManager::new());
+        for minor in 0..LoopManager::MAX_DEVICES {
+            let devname = DevName::new(format!("{}{}", LOOP_BASENAME, minor), minor);
+            if let Some(loop_dev) = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32) {
+                log::info!(
+                    "Registering loop device: {}",
                 loop_dev.block_dev_meta.devname
             );
             block_dev_manager().register(loop_dev.clone())?;
@@ -470,6 +504,118 @@ pub fn register_loop_devices() -> Result<(), SystemError> {
             error!("Failed to create loop device for minor {}", minor);
         }
     }
+        // // 创建并注册 /dev/loop-control
+        // let control_dev = Arc::new(LoopControlDevice::new()); // 假设的构造函数
+        // block_dev_manager().register(control_dev.clone())?;
+        // devfs::devfs_register("loop-control", control_dev.clone())?;
+        // info!("LoopDeviceDriver and all devices initialized.");
+        Ok(())
+    }
+}
+use crate::init::initcall::INITCALL_DEVICE;
+#[unified_init(INITCALL_DEVICE)]
+pub fn loop_init()-> Result<(), SystemError> {
+    // 获取 LoopDeviceDriver 的单例并调用初始化函数
+    let driver = LoopDeviceDriver::new();
+    driver.loop_init()
+}
 
-    Ok(())
+
+impl Driver for LoopDeviceDriver {
+    fn id_table(&self) -> Option<IdTable> {
+        Some(IdTable::new("loop".to_string(), None))
+    }
+
+     fn devices(&self) -> Vec<Arc<dyn Device>> {
+        self.inner().driver_common.devices.clone()
+    }
+
+    fn add_device(&self, device: Arc<dyn Device>) {
+        self.inner().driver_common.push_device(device);
+    }
+
+    fn delete_device(&self, device: &Arc<dyn Device>) {
+        self.inner().driver_common.delete_device(device);
+    }
+
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.inner().driver_common.bus.clone()
+    }
+
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
+        self.inner().driver_common.bus = bus;
+    }
+}
+
+impl KObject for LoopDeviceDriver {
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        self.inner().kobj_common.kern_inode = inode;
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        self.inner().kobj_common.kern_inode.clone()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        self.inner().kobj_common.parent.clone()
+    }
+
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        self.inner().kobj_common.parent = parent;
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        self.inner().kobj_common.kset.clone()
+    }
+
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        self.inner().kobj_common.kset = kset;
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        self.inner().kobj_common.kobj_type
+    }
+
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.inner().kobj_common.kobj_type = ktype;
+    }
+
+    fn name(&self) -> String {
+        "loop".to_string()
+    }
+
+    fn set_name(&self, _name: String) {
+        // do nothing
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        self.kobj_state.read()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        self.kobj_state.write()
+    }
+
+    fn set_kobj_state(&self, state: KObjectState) {
+        *self.kobj_state.write() = state;
+    }
+}
+pub struct LoopControlDevice {
+    locked_kobj_state: LockedKObjectState,
+    inner: SpinLock<LoopControlDeviceInner>,
+}
+
+pub struct LoopControlDeviceInner {
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
+}
+pub struct LoopManager {
+    devices: Vec<Arc<LoopDevice>>,
+}
+impl LoopManager {
+    const MAX_DEVICES: usize =8;
 }

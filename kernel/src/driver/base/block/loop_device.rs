@@ -47,7 +47,7 @@ pub struct LoopDevice {
     inner: SpinLock<LoopDeviceInner>, //加锁保护LoopDeviceInner
     //有主设备次设备号
     block_dev_meta: BlockDevMeta,
-    dev_id: Arc<DeviceId>,
+    //dev_id: Arc<DeviceId>,
     locked_kobj_state: LockedKObjectState, //对Kobject状态的锁
     self_ref: Weak<Self>,                  //对自身的弱引用
     fs: RwLock<Weak<DevFS>>,               //文件系统弱引用
@@ -59,7 +59,7 @@ pub struct LoopDeviceInner {
     pub file_inode: Option<Arc<dyn IndexNode>>,
     // 文件大小
     pub file_size: usize,
-    // 设备名称
+    // 设备名称 Major和Minor
     pub device_number: DeviceNumber,
     // 数据偏移量
     pub offset: usize,
@@ -73,26 +73,25 @@ pub struct LoopDeviceInner {
     pub visible: bool,
     // 使用弱引用避免循环引用
     pub self_ref: Weak<LoopDevice>,
+    // KObject的公共数据
     pub kobject_common: KObjectCommonData,
+    // 设备的公共数据
     pub device_common: DeviceCommonData,
 }
 impl Debug for LoopDevice {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LoopDevice")
             .field("devname", &self.block_dev_meta.devname)
-            .field("dev_id", &self.dev_id.id())
             .finish()
     }
 }
 impl LoopDevice {
     fn inner(&self) -> SpinLockGuard<LoopDeviceInner> {
+        // 获取 LoopDeviceInner 的自旋锁
         self.inner.lock()
     }
-    pub fn new_empty_loop_device(
-        devname: DevName,
-        dev_id: Arc<DeviceId>,
-        minor: u32,
-    ) -> Option<Arc<Self>> {
+    //注册一个新的空loop设备占位
+    pub fn new_empty_loop_device(devname: DevName, minor: u32) -> Option<Arc<Self>> {
         // 创建一个空的 LoopDevice
         let dev = Arc::new_cyclic(|self_ref| Self {
             inner: SpinLock::new(LoopDeviceInner {
@@ -110,7 +109,6 @@ impl LoopDevice {
             }),
             //只用重复8次，就会有从0-7八个次设备号
             block_dev_meta: BlockDevMeta::new(devname, Major::new(7)), // Loop 设备主设备号为 7
-            dev_id,
             locked_kobj_state: LockedKObjectState::default(),
             self_ref: self_ref.clone(),
             fs: RwLock::new(Weak::default()),
@@ -453,7 +451,6 @@ impl BlockDevice for LoopDevice {
         Vec::new()
     }
 }
-//注册8个loop设备
 use crate::init::initcall::INITCALL_DEVICE;
 #[unified_init(INITCALL_DEVICE)]
 pub fn register_loop_devices() -> Result<(), SystemError> {
@@ -461,9 +458,7 @@ pub fn register_loop_devices() -> Result<(), SystemError> {
         let devname = DevName::new(format!("loop{}", minor), minor);
         let dev_id =
             DeviceId::new(None, Some(devname.name().to_string())).ok_or(SystemError::EINVAL)?;
-        if let Some(loop_dev) =
-            LoopDevice::new_empty_loop_device(devname.clone(), dev_id, minor as u32)
-        {
+        if let Some(loop_dev) = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32) {
             log::info!(
                 "Registering loop device: {}",
                 loop_dev.block_dev_meta.devname

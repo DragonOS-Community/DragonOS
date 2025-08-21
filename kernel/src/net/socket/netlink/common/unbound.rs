@@ -91,4 +91,8 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
     fn check_io_events(&self) -> EPollEventType {
         EPollEventType::EPOLLOUT
     }
+
+    fn local_endpoint(&self) -> Option<Self::Endpoint> {
+        Some(self.addr())
+    }
 }

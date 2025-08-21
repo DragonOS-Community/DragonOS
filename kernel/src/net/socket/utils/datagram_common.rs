@@ -30,6 +30,8 @@ pub trait Unbound {
     ) -> Result<Self::Bound, SystemError>;
 
     fn check_io_events(&self) -> EPollEventType;
+
+    fn local_endpoint(&self) -> Option<Self::Endpoint>;
 }
 
 pub trait Bound {
@@ -133,7 +135,7 @@ where
 
     pub fn addr(&self) -> Option<UnboundSocket::Endpoint> {
         match self {
-            Inner::Unbound(_) => None,
+            Inner::Unbound(unbound) => unbound.local_endpoint(),
             Inner::Bound(bound) => Some(bound.local_endpoint()),
         }
     }

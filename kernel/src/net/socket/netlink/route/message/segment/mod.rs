@@ -12,7 +12,6 @@ use crate::net::socket::netlink::{
     },
     route::message::segment::{addr::AddrSegment, route::RouteSegment},
 };
-use alloc::vec::Vec;
 use system_error::SystemError;
 
 #[derive(Debug)]

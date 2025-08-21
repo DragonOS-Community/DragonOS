@@ -1,6 +1,6 @@
 pub(super) mod noattr;
 
-use crate::net::socket::netlink::message::NLMSG_ALIGN;
+use crate::{libs::align::align_up, net::socket::netlink::message::NLMSG_ALIGN};
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -40,7 +40,7 @@ impl CAttrHeader {
     }
 
     pub fn total_len_with_padding(&self) -> usize {
-        (self.len as usize).checked_add(NLMSG_ALIGN - 1).unwrap() & !(NLMSG_ALIGN - 1)
+        align_up(self.len as usize, NLMSG_ALIGN)
     }
 
     pub fn padding_len(&self) -> usize {
@@ -153,9 +153,4 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
 
         Ok(attrs)
     }
-}
-
-// 辅助函数
-fn align_to(value: usize, align: usize) -> usize {
-    (value + align - 1) & !(align - 1)
 }

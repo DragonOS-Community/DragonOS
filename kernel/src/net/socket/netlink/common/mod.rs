@@ -198,6 +198,7 @@ impl<P: SupportedNetlinkProtocol> NetlinkSocket<P> {
     }
 }
 
+// 多播消息的时候会用到，比如uevent
 impl<P: SupportedNetlinkProtocol> Inner<UnboundNetlink<P>, BoundNetlink<P::Message>> {
     fn add_groups(&mut self, groups: GroupIdSet) {
         match self {

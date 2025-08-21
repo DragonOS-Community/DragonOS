@@ -112,7 +112,7 @@ impl NetNamespace {
 
         let inner = InnerNetNamespace {
             router: Arc::new(Router::new(format!("netns_router_{}", pid))),
-            loopback_iface: Some(loopback),
+            loopback_iface: Some(loopback.clone()),
             default_iface: None,
         };
 
@@ -127,6 +127,7 @@ impl NetNamespace {
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
         });
         Self::create_polling_thread(netns.clone(), format!("netns_{}", pid));
+        netns.add_device(loopback);
 
         Ok(netns)
     }

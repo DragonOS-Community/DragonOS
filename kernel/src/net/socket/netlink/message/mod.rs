@@ -35,14 +35,22 @@ impl<T: ProtocolSegment> Message<T> {
     }
 
     pub fn write_to(&self, writer: &mut [u8]) -> Result<usize, SystemError> {
-        let total_written: usize = self
-            .segments
-            .iter()
-            .map(|segment| segment.write_to(writer))
-            .collect::<Result<Vec<usize>, SystemError>>()?
-            .iter()
-            .sum();
+        // log::info!("Message write_to");
+        let mut total_written: usize = 0;
 
+        for segment in self.segments() {
+            if total_written >= writer.len() {
+                log::warn!("Netlink write buffer is full. Some segments may be dropped.");
+                break;
+            }
+
+            let remaining_buf = &mut writer[total_written..];
+            let written = segment.write_to(remaining_buf)?;
+
+            total_written += written;
+        }
+
+        // log::info!("Total written bytes: {}", total_written);
         Ok(total_written)
     }
 

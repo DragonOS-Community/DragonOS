@@ -1,4 +1,6 @@
+use crate::libs::align::align_up;
 use crate::net::socket::netlink::message::{segment::header::CMsgSegHdr, NLMSG_ALIGN};
+use alloc::fmt::Debug;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -56,12 +58,13 @@ impl TryFrom<u16> for CSegmentType {
 }
 
 pub trait SegmentBody: Sized + Clone + Copy {
-    type CType: Copy + TryInto<Self> + From<Self>;
+    type CType: Copy + TryInto<Self> + From<Self> + Debug;
 
     fn read_from_buf(header: &CMsgSegHdr, buf: &[u8]) -> Result<(Self, usize, usize), SystemError>
     where
         Self: Sized,
     {
+        // log::info!("header: {:?}", header);
         let total_len = (header.len as usize)
             .checked_sub(size_of::<CMsgSegHdr>())
             .ok_or(SystemError::EINVAL)?;
@@ -72,6 +75,7 @@ pub trait SegmentBody: Sized + Clone + Copy {
 
         let c_type_bytes = &buf[..size_of::<Self::CType>()];
         let c_type = unsafe { *(c_type_bytes.as_ptr() as *const Self::CType) };
+        // log::info!("c_type: {:?}", c_type);
 
         let total_len_with_padding = Self::total_len_with_padding();
 
@@ -85,6 +89,7 @@ pub trait SegmentBody: Sized + Clone + Copy {
     }
 
     fn write_to_buf(&self, buf: &mut Vec<u8>) -> Result<(), SystemError> {
+        // log::info!("SegmentBody write_to_buf");
         let c_type = Self::CType::from(*self);
 
         let body_bytes = unsafe {
@@ -107,10 +112,11 @@ pub trait SegmentBody: Sized + Clone + Copy {
 
     fn total_len_with_padding() -> usize {
         let payload_len = size_of::<Self::CType>();
-        (payload_len.checked_add(NLMSG_ALIGN - 1).unwrap() & !(NLMSG_ALIGN - 1)) - payload_len
+        align_up(payload_len, NLMSG_ALIGN)
     }
 
     fn padding_len() -> usize {
-        Self::total_len_with_padding() - size_of::<Self::CType>()
+        let payload_len = size_of::<Self::CType>();
+        Self::total_len_with_padding() - payload_len
     }
 }

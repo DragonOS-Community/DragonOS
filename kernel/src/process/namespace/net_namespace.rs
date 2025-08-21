@@ -183,7 +183,7 @@ impl NetNamespace {
         &self.netlink_socket_table
     }
 
-    pub fn get_netlink_socket_by_protocol(
+    pub fn get_netlink_kernel_socket_by_protocol(
         &self,
         protocol: u32,
     ) -> Option<Arc<dyn NetlinkKernelSocket>> {

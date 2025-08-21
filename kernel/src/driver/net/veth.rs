@@ -566,7 +566,7 @@ impl Iface for VethInterface {
     }
 
     fn poll(&self) {
-        log::info!("VethInterface {} polling normal", self.name);
+        // log::info!("VethInterface {} polling normal", self.name);
         self.common.poll(self.driver.force_get_mut());
     }
 

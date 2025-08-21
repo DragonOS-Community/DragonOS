@@ -365,7 +365,7 @@ fn bridge_probe() {
     let addr1 = IpAddress::v4(200, 0, 0, 1);
     let cidr1 = IpCidr::new(addr1, 24);
     let addr2 = IpAddress::v4(200, 0, 0, 2);
-    let cidr2 = IpCidr::new(addr1, 24);
+    let cidr2 = IpCidr::new(addr2, 24);
 
     let addr3 = IpAddress::v4(200, 0, 0, 3);
     let cidr3 = IpCidr::new(addr3, 24);

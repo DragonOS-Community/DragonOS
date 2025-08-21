@@ -82,7 +82,6 @@ impl Attribute for AddrAttr {
 
         // TODO: Currently, `IS_NET_BYTEORDER_MASK` and `IS_NESTED_MASK` are ignored.
         let Ok(addr_class) = AddrAttrClass::try_from(header.type_()) else {
-            //todo 或许这里我应该返回偏移值
             //reader.skip_some(payload_len);
             return Ok(None);
         };

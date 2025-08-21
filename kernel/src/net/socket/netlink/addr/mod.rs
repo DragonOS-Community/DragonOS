@@ -1,7 +1,7 @@
 use crate::net::socket::{endpoint::Endpoint, netlink::addr::multicast::GroupIdSet};
 use system_error::SystemError;
 
-pub(super) mod multicast;
+pub mod multicast;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetlinkSocketAddr {

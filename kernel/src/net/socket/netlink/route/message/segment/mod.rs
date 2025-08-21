@@ -58,19 +58,21 @@ impl ProtocolSegment for RouteNlSegment {
     }
 
     fn read_from(buf: &[u8]) -> Result<Self, SystemError> {
-        if buf.len() < size_of::<CMsgSegHdr>() {
+        let header_size = size_of::<CMsgSegHdr>();
+        if buf.len() < header_size {
             log::warn!("the buffer is too small to read a netlink segment header");
             return Err(SystemError::EINVAL);
         }
 
         let header = unsafe { *(buf.as_ptr() as *const CMsgSegHdr) };
+        let payload_buf = &buf[header_size..];
 
         let segment = match CSegmentType::try_from(header.type_)? {
             CSegmentType::GETADDR => {
-                RouteNlSegment::GetAddr(AddrSegment::read_from_buf(header, buf)?)
+                RouteNlSegment::GetAddr(AddrSegment::read_from_buf(header, payload_buf)?)
             }
             CSegmentType::GETROUTE => {
-                RouteNlSegment::GetRoute(RouteSegment::read_from_buf(header, buf)?)
+                RouteNlSegment::GetRoute(RouteSegment::read_from_buf(header, payload_buf)?)
             }
             _ => return Err(SystemError::EINVAL),
         };
@@ -79,26 +81,16 @@ impl ProtocolSegment for RouteNlSegment {
     }
 
     fn write_to(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        // 这里没有直接写入buf，而是用 Vec<u8> 来构建内核缓冲区
-        let mut kernel_buf: Vec<u8> = vec![];
-        match self {
-            RouteNlSegment::NewAddr(addr_segment) => addr_segment.write_to_buf(&mut kernel_buf)?,
-            RouteNlSegment::NewRoute(route_segment) => {
-                route_segment.write_to_buf(&mut kernel_buf)?
-            }
+        // log::info!("RouteNlSegment write_to");
+        let copied = match self {
+            RouteNlSegment::NewAddr(addr_segment) => addr_segment.write_to_buf(buf)?,
+            RouteNlSegment::NewRoute(route_segment) => route_segment.write_to_buf(buf)?,
+            RouteNlSegment::Done(done_segment) => done_segment.write_to_buf(buf)?,
+            RouteNlSegment::Error(error_segment) => error_segment.write_to_buf(buf)?,
             _ => {
                 log::warn!("write_to is not implemented for this segment type");
                 return Err(SystemError::ENOSYS);
             }
-        }
-
-        let actual_len = kernel_buf.len().min(buf.len());
-        let copied = if !kernel_buf.is_empty() {
-            buf[..actual_len].copy_from_slice(&kernel_buf[..actual_len]);
-            actual_len
-        } else {
-            // 如果没有数据需要写入，返回0
-            0
         };
 
         Ok(copied)

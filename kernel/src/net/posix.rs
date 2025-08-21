@@ -41,6 +41,8 @@ use alloc::string::ToString;
 use core::ffi::CStr;
 use system_error::SystemError;
 
+use crate::net::socket::netlink::addr::{GroupIdSet, NetlinkSocketAddr};
+
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -251,6 +253,21 @@ impl SockAddr {
                     //     inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
                     return Ok(Endpoint::Unix(UnixEndpoint::File(path.to_string())));
+                }
+                AddressFamily::Netlink => {
+                    if len < addr.len()? {
+                        log::error!("len < addr.len() for Netlink");
+                        return Err(SystemError::EINVAL);
+                    }
+
+                    let addr_nl: SockAddrNl = addr.addr_nl;
+                    let nl_pid = addr_nl.nl_pid;
+                    let nl_groups = addr_nl.nl_groups;
+
+                    Ok(Endpoint::Netlink(NetlinkSocketAddr::new(
+                        nl_pid,
+                        GroupIdSet::new(nl_groups),
+                    )))
                 }
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);

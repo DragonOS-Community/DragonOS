@@ -4,6 +4,7 @@ use crate::{
     libs::{rwlock::RwLock, wait_queue::WaitQueue},
     net::socket::PMSG,
 };
+use alloc::fmt::Debug;
 use alloc::sync::Arc;
 use core::panic;
 use system_error::SystemError;
@@ -11,7 +12,7 @@ use system_error::SystemError;
 //todo netlink和udp的操作相同，目前只是为netlink实现了下面的trait，后续为 UdpSocket实现下面的trait，提高复用性
 
 pub trait Unbound {
-    type Endpoint;
+    type Endpoint: Debug;
     type Bound;
 
     fn bind(
@@ -32,7 +33,7 @@ pub trait Unbound {
 }
 
 pub trait Bound {
-    type Endpoint: Clone;
+    type Endpoint: Clone + Debug;
 
     fn bind(&mut self, _endpoint: &Self::Endpoint) -> Result<(), SystemError> {
         Err(SystemError::EINVAL)
@@ -79,6 +80,8 @@ where
 
         let bound = unbound.bind(endpoint, wait_queue, netns)?;
         *self = Inner::Bound(bound);
+
+        // log::info!("Socket bound to endpoint: {:?}", endpoint);
 
         Ok(())
     }

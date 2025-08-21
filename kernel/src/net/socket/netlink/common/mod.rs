@@ -142,6 +142,7 @@ where
         flags: crate::net::socket::PMSG,
         address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), system_error::SystemError> {
+        // log::info!("NetlinkSocket recv_from called");
         use crate::sched::SchedMode;
 
         if let Some(addr) = address {
@@ -168,13 +169,20 @@ where
     }
 
     fn send_buffer_size(&self) -> usize {
-        log::warn!("send_buffer_size is implemented to 0");
+        // log::warn!("send_buffer_size is implemented to 0");
+        // netlink sockets typically do not have a send buffer size like stream sockets.
         0
     }
 
     fn recv_buffer_size(&self) -> usize {
-        log::warn!("recv_buffer_size is implemented to 0");
+        // log::warn!("recv_buffer_size is implemented to 0");
+        // netlink sockets typically do not have a recv buffer size like stream sockets.
         0
+    }
+
+    fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
+        let (len, _) = self.recv_from(buffer, flags, None)?;
+        Ok(len)
     }
 }
 

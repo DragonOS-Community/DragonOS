@@ -42,10 +42,6 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
             return Err(SystemError::ENOTCONN);
         }
 
-        if *to != NetlinkSocketAddr::new_unspecified() {
-            return Err(SystemError::ECONNREFUSED);
-        }
-
         let sum_lens = buf.len();
 
         let mut nlmsg = match RouteNlMessage::read_from(buf) {
@@ -75,7 +71,7 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
 
         let Some(route_kernel) = self
             .netns
-            .get_netlink_socket_by_protocol(nlmsg.protocol().into())
+            .get_netlink_kernel_socket_by_protocol(nlmsg.protocol().into())
         else {
             log::warn!("No route kernel socket available in net namespace");
             return Ok(sum_lens);

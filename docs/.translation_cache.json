@@ -150,7 +150,7 @@
     "hash": "c931f3fcfca7d8d10cd16a8b68e6274a"
   },
   "en:community/ChangeLog/index.rst": {
-    "hash": "aa1979d81b79f64b12962f885a6820af"
+    "hash": "1a269fe56fa594f041bf009462d0e450"
   },
   "en:kernel/trace/index.rst": {
     "hash": "3c466a411a5bd71514f8fa4f15d06241"
@@ -279,6 +279,6 @@
     "hash": "d2ba6ab80dfbc436408ee23e81bbe2ae"
   },
   "en:community/ChangeLog/V0.2.x/V0.2.0.md": {
-    "hash": "a14e68302c9478f8acc7368b9f30a95a"
+    "hash": "de9331f8d0bc5fe8c4705ad5807c9e8d"
   }
 }

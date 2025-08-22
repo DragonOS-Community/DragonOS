@@ -153,7 +153,7 @@ pub(super) fn create_new_namespaces(
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/ns_common.h#9
 /// 融合了 NamespaceBase 的公共字段
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NsCommon {
     /// 层级（root = 0）
     pub level: u32,

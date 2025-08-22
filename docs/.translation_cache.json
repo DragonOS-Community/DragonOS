@@ -277,5 +277,8 @@
   },
   "en:kernel/filesystem/vfs/mountable_fs.md": {
     "hash": "d2ba6ab80dfbc436408ee23e81bbe2ae"
+  },
+  "en:community/ChangeLog/V0.2.x/V0.2.0.md": {
+    "hash": "a14e68302c9478f8acc7368b9f30a95a"
   }
 }

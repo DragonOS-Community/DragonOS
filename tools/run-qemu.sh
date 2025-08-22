@@ -99,6 +99,7 @@ QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
 QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
+# QEMU_ARGUMENT+=" -S "
 
 if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
   QEMU_DRIVE+=" -drive id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw"

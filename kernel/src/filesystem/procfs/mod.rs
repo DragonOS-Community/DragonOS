@@ -14,7 +14,11 @@ use system_error::SystemError;
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{mount::MountFlags, vcore::generate_inode_id, FileType},
+    filesystem::vfs::{
+        mount::{MountFlags, MountPath},
+        vcore::generate_inode_id,
+        FileType,
+    },
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -1195,11 +1199,16 @@ pub fn procfs_init() -> Result<(), SystemError> {
         let procfs: Arc<ProcFS> = ProcFS::new();
         let root_inode = ProcessManager::current_mntns().root_inode();
         // procfs 挂载
-        root_inode
+        let mntfs = root_inode
             .mkdir("proc", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /proc")
             .mount(procfs, MountFlags::empty())
             .expect("Failed to mount at /proc");
+        let ino = root_inode.metadata().unwrap().inode_id;
+        let mount_path = Arc::new(MountPath::from("/proc"));
+        ProcessManager::current_mntns()
+            .add_mount(Some(ino), mount_path, mntfs)
+            .expect("Failed to add mount for /proc");
         info!("ProcFS mounted.");
         result = Some(Ok(()));
     });

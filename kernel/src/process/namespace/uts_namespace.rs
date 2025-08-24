@@ -182,6 +182,23 @@ impl UtsNamespace {
         Ok(())
     }
 
+    pub fn set_domainname(&self, domainname: &str) -> Result<(), SystemError> {
+        // 验证长度
+        if !NewUtsName::validate_str(domainname) {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        // 检查权限（需要 CAP_SYS_ADMIN）
+        // TODO: 实现完整的 capability 检查
+        if !self.check_uts_modify_permission() {
+            return Err(SystemError::EPERM);
+        }
+        let s = domainname.to_string();
+        let mut utsname = self.utsname.lock();
+        utsname.domain_name = s;
+        Ok(())
+    }
+
     /// 检查是否有权限修改 UTS 信息
     fn check_uts_modify_permission(&self) -> bool {
         // TODO: 实现完整的 capability 检查

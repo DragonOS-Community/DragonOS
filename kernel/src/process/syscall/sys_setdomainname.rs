@@ -1,7 +1,7 @@
 use alloc::string::ToString;
 
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::syscall::nr::SYS_SETHOSTNAME;
+use crate::arch::syscall::nr::SYS_SETDOMAINNAME;
 use crate::process::namespace::uts_namespace::NewUtsName;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -9,9 +9,9 @@ use crate::syscall::user_access::check_and_clone_cstr;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-pub struct SysSethostname;
+pub struct SysSetdomainname;
 
-impl SysSethostname {
+impl SysSetdomainname {
     fn name(args: &[usize]) -> *mut u8 {
         args[0] as *mut u8
     }
@@ -21,7 +21,7 @@ impl SysSethostname {
     }
 }
 
-impl Syscall for SysSethostname {
+impl Syscall for SysSetdomainname {
     fn num_args(&self) -> usize {
         2
     }
@@ -41,8 +41,8 @@ impl Syscall for SysSethostname {
         // 获取当前进程的 UTS namespace
         let uts_ns = ProcessManager::current_utsns();
 
-        // 设置主机名
-        uts_ns.set_hostname(ss)?;
+        // 设置域名
+        uts_ns.set_domainname(ss)?;
 
         Ok(0)
     }
@@ -55,4 +55,4 @@ impl Syscall for SysSethostname {
     }
 }
 
-syscall_table_macros::declare_syscall!(SYS_SETHOSTNAME, SysSethostname);
+syscall_table_macros::declare_syscall!(SYS_SETDOMAINNAME, SysSetdomainname);

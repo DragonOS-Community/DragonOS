@@ -526,7 +526,7 @@ impl<'a> UserBufferWriter<'a> {
     /// # Returns
     /// * Ok(()) on success
     ///
-    pub fn copy_one_to_user<T: core::marker::Copy>(
+    pub fn copy_one_to_user<T: Clone>(
         &'a mut self,
         src: &T,
         offset: usize,
@@ -550,7 +550,7 @@ impl<'a> UserBufferWriter<'a> {
     ///
     /// # Errors
     /// * `EFAULT` - Pages are not mapped or lack required permissions
-    pub fn copy_one_to_user_checked<T: core::marker::Copy>(
+    pub fn copy_one_to_user_checked<T: Clone>(
         &'a mut self,
         src: &T,
         offset: usize,

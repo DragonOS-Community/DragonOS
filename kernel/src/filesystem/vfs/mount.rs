@@ -331,7 +331,7 @@ impl MountFS {
         Ok(())
     }
 
-    pub fn mountpoints(&self) -> SpinLockGuard<BTreeMap<InodeId, Arc<MountFS>>> {
+    pub fn mountpoints(&self) -> SpinLockGuard<'_, BTreeMap<InodeId, Arc<MountFS>>> {
         self.mountpoints.lock()
     }
 

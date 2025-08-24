@@ -449,7 +449,18 @@ impl MountFSInode {
     ///
     /// @return Arc<MountFSInode>
     fn overlaid_inode(&self) -> Arc<MountFSInode> {
-        let inode_id = self.metadata().unwrap().inode_id;
+        // 某些情况下，底层 inode 可能已被删除或失效，此时 metadata() 可能返回错误
+        // 为避免因 unwrap 导致内核 panic，这里将错误视作“非挂载点”，直接返回自身
+        let inode_id = match self.metadata() {
+            Ok(md) => md.inode_id,
+            Err(e) => {
+                log::warn!(
+                    "MountFSInode::overlaid_inode: metadata() failed: {:?}; treat as non-mountpoint",
+                    e
+                );
+                return self.self_ref.upgrade().unwrap();
+            }
+        };
 
         if let Some(sub_mountfs) = self.mount_fs.mountpoints.lock().get(&inode_id) {
             return sub_mountfs.mountpoint_root_inode();
@@ -907,6 +918,14 @@ impl IndexNode for MountFSInode {
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         self.inner_inode.write_sync(offset, buf)
+    }
+
+    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.inner_inode.getxattr(name, buf)
+    }
+
+    fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+        self.inner_inode.setxattr(name, value)
     }
 }
 

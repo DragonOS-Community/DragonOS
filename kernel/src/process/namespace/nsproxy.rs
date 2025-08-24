@@ -152,7 +152,7 @@ pub(super) fn create_new_namespaces(
     let result = NsProxy {
         pid_ns_for_children,
         mnt_ns,
-        uts_ns
+        uts_ns,
     };
 
     let result = Arc::new(result);

@@ -80,7 +80,7 @@ pub struct NewUtsName {
 }
 
 impl NewUtsName {
-    const MAXLEN: usize = 65;
+    pub const MAXLEN: usize = 65;
     fn validate_str(s: &str) -> bool {
         s.len() < Self::MAXLEN
     }
@@ -163,6 +163,30 @@ impl UtsNamespace {
         ReadOnlyUtsNameWrapper {
             inner: self.utsname.lock(),
         }
+    }
+
+    pub fn set_hostname(&self, hostname: &str) -> Result<(), SystemError> {
+        // 验证长度
+        if !NewUtsName::validate_str(hostname) {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        // 检查权限（需要 CAP_SYS_ADMIN）
+        // TODO: 实现完整的 capability 检查
+        if !self.check_uts_modify_permission() {
+            return Err(SystemError::EPERM);
+        }
+        let s = hostname.to_string();
+        let mut utsname = self.utsname.lock();
+        utsname.node_name = s;
+        Ok(())
+    }
+
+    /// 检查是否有权限修改 UTS 信息
+    fn check_uts_modify_permission(&self) -> bool {
+        // TODO: 实现完整的 capability 检查
+        // 目前暂时返回 true，后续需要检查 CAP_SYS_ADMIN
+        true
     }
 }
 

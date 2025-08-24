@@ -19,6 +19,7 @@ mod sys_set_tid_address;
 mod sys_setfsgid;
 mod sys_setfsuid;
 mod sys_setgid;
+mod sys_sethostname;
 mod sys_setpgid;
 mod sys_setresgid;
 mod sys_setresuid;

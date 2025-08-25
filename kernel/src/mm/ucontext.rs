@@ -704,6 +704,38 @@ impl InnerAddressSpace {
         return Ok(());
     }
 
+    pub fn mincore(
+        &self,
+        start_page: VirtPageFrame,
+        page_count: PageFrameCount,
+        vec: &mut [u8],
+    ) -> Result<(), SystemError> {
+        let mapper = &self.user_mapper.utable;
+
+        if self.mappings.contains(start_page.virt_address()).is_none() {
+            return Err(SystemError::ENOMEM);
+        }
+
+        let mut last_vaddr = start_page.virt_address();
+        let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+        let vmas = self.mappings.conflicts(region).collect::<Vec<_>>();
+        let mut offset = 0;
+        for v in vmas {
+            let region = *v.lock_irqsave().region();
+            // 保证相邻的两个vma连续
+            if region.start() != last_vaddr && last_vaddr != start_page.virt_address() {
+                return Err(SystemError::ENOMEM);
+            }
+            let start_vaddr = last_vaddr;
+            let end_vaddr = core::cmp::min(region.end(), start_vaddr + page_count.bytes());
+            v.do_mincore(mapper, vec, start_vaddr, end_vaddr, offset)?;
+            let page_count_this_vma = (end_vaddr - start_vaddr) >> MMArch::PAGE_SHIFT;
+            offset += page_count_this_vma;
+            last_vaddr = end_vaddr;
+        }
+
+        return Ok(());
+    }
     pub fn madvise(
         &mut self,
         start_page: VirtPageFrame,

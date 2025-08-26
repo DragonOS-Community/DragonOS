@@ -1,6 +1,6 @@
 use super::bridge::BridgeEnableDevice;
-use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
 use super::{Iface, IfaceCommon};
+use super::{NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
@@ -10,16 +10,17 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
-use crate::driver::net::bridge::BridgePort;
+use crate::driver::net::bridge::{BridgeCommonData, BridgePort};
+use crate::driver::net::register_netdevice;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::generate_iface_id;
-use crate::net::routing::{RouterEnableDevice, RouterEnableDeviceCommon};
-use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
-use crate::process::ProcessState;
+use crate::net::routing::{RouteEntry, RouterEnableDevice};
+use crate::process::namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE};
+use crate::process::{ProcessManager, ProcessState};
 use crate::sched::SchedMode;
 use alloc::collections::VecDeque;
 use alloc::fmt::Debug;
@@ -60,14 +61,17 @@ impl Veth {
         if let Some(peer) = self.peer.upgrade() {
             // log::info!("Veth {} trying to send", self.name);
 
-            if let Some(bridge_data) = peer.inner.lock().bridge_port_data.as_ref() {
+            if let Some(bridge_common_data) = peer.inner.lock().bridge_common_data.as_ref() {
                 // log::info!("Veth {} sending data to bridge", self.name);
-                Self::to_bridge(bridge_data, data);
+                Self::to_bridge(bridge_common_data, data);
                 return;
             }
 
             // 如果是路由设备，则将数据发送到路由器
-            self.to_router(data);
+            if self.to_router(data) {
+                // log::info!("Veth {} sent data to router", self.name);
+                return;
+            }
 
             Self::to_peer(&peer, data);
         }
@@ -77,24 +81,48 @@ impl Veth {
         let mut peer_veth = peer.driver.force_get_mut().inner.lock_irqsave();
         peer_veth.rx_queue.push_back(data.to_vec());
         log::info!("Veth {} received data from peer", peer.name);
-        log::info!("DATA RECEIVED: {:?}", peer_veth.rx_queue);
+        log::info!("{:?}", peer_veth.rx_queue);
         drop(peer_veth);
 
         // 唤醒对端正在等待的进程
         peer.wake_up();
+
+        if let Some(ns) = peer.net_namespace() {
+            ns.wakeup_poll_thread();
+        }
     }
 
-    fn to_bridge(bridge_data: &BridgePort, data: &Vec<u8>) {
-        if let Some(bridge_driver) = bridge_data.bridge_driver.upgrade() {
-            // log::info!("Veth {} sending data to bridge", self.name);
-            bridge_driver.driver.enqueue_frame(bridge_data.id, data);
+    fn to_bridge(bridge_data: &BridgeCommonData, data: &Vec<u8>) {
+        // log::info!("Veth {} sending data to bridge", self.name);
+        let Some(bridge) = bridge_data.bridge_iface.upgrade() else {
+            log::warn!("Bridge has been dropped");
+            return;
         };
+        bridge.driver.enqueue_frame(bridge_data.id, data)
     }
 
-    fn to_router(&self, data: &[u8]) {
-        if let Some(self_iface) = self.self_iface_ref.upgrade() {
-            let frame = EthernetFrame::new_checked(data).unwrap();
-            self_iface.handle_routable_packet(frame.payload());
+    /// 经过路由发送，返回是否发送成功
+    fn to_router(&self, data: &[u8]) -> bool {
+        let Some(self_iface) = self.self_iface_ref.upgrade() else {
+            return false;
+        };
+
+        let frame: EthernetFrame<&[u8]> = EthernetFrame::new_checked(data).unwrap();
+        log::info!("trying to go to router");
+        match self_iface.handle_routable_packet(&frame) {
+            Ok(_) => {
+                log::info!("successfully sent to router");
+                return true;
+            }
+            // 先不管错误，直接告诉外面没有经过路由发送出去
+            Err(Some(err)) => {
+                log::error!("Router error: {:?}", err);
+                return false;
+            }
+            Err(_) => {
+                log::info!("not routed");
+                return false;
+            }
         }
     }
 
@@ -245,10 +273,7 @@ pub struct VethCommonData {
     kobj_common: KObjectCommonData,
     peer_veth: Weak<VethInterface>,
 
-    //TODO 这里其实不用整个port，反而会导致循环引用，可以只留一个BridgeIface
-    bridge_port_data: Option<BridgePort>,
-
-    router_common_data: RouterEnableDeviceCommon,
+    bridge_common_data: Option<BridgeCommonData>,
 }
 
 impl Default for VethCommonData {
@@ -258,8 +283,7 @@ impl Default for VethCommonData {
             device_common: DeviceCommonData::default(),
             kobj_common: KObjectCommonData::default(),
             peer_veth: Weak::new(),
-            bridge_port_data: None,
-            router_common_data: RouterEnableDeviceCommon::default(),
+            bridge_common_data: None,
         }
     }
 }
@@ -330,7 +354,7 @@ impl VethInterface {
     }
 
     fn inner(&self) -> SpinLockGuard<'_, VethCommonData> {
-        self.inner.lock_irqsave()
+        self.inner.lock()
     }
 
     /// # `update_ip_addrs`
@@ -345,6 +369,15 @@ impl VethInterface {
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs.push(cidr).expect("Push ipCidr failed: full");
         });
+
+        // // 直接更新对端的arp_table
+        // self.inner.lock().peer_veth.upgrade().map(|peer| {
+        //     peer.common
+        //         .router_common_data
+        //         .arp_table
+        //         .write()
+        //         .insert(cidr.address(), self.mac())
+        // });
 
         // log::info!("VethInterface {} updated IP address: {}", self.name, addr);
     }
@@ -565,9 +598,10 @@ impl Iface for VethInterface {
         }
     }
 
-    fn poll(&self) {
+    fn poll(&self) -> bool {
         // log::info!("VethInterface {} polling normal", self.name);
-        self.common.poll(self.driver.force_get_mut());
+        self.common.poll(self.driver.force_get_mut())
+        // self.clear_recv_buffer();
     }
 
     fn addr_assign_type(&self) -> u8 {
@@ -603,7 +637,16 @@ impl BridgeEnableDevice for VethInterface {
 
         // let inner = self.inner.lock_irqsave();
 
-        if let Some(_data) = self.inner.lock_irqsave().bridge_port_data.as_ref() {
+        if self
+            .inner
+            .lock_irqsave()
+            .bridge_common_data
+            .as_ref()
+            .unwrap()
+            .bridge_iface
+            .upgrade()
+            .is_some()
+        {
             log::info!("VethInterface {} sending data to peer", self.name);
 
             // let peer = self.peer_veth();
@@ -621,8 +664,16 @@ impl BridgeEnableDevice for VethInterface {
     fn set_common_bridge_data(&self, port: BridgePort) {
         // log::info!("Now set bridge port data for {}", self.name);
         let mut inner = self.inner.lock_irqsave();
-        inner.bridge_port_data = Some(port);
+        let data = BridgeCommonData {
+            id: port.id,
+            bridge_iface: port.bridge_iface.clone(),
+        };
+        inner.bridge_common_data = Some(data);
     }
+
+    // fn common_bridge_data(&self) -> Option<BridgeCommonData> {
+    //     self.inner().bridge_common_data.clone()
+    // }
 }
 
 impl RouterEnableDevice for VethInterface {
@@ -655,44 +706,122 @@ impl RouterEnableDevice for VethInterface {
     }
 
     fn is_my_ip(&self, ip: IpAddress) -> bool {
-        let iface = self.common.smol_iface.lock_irqsave();
-        iface.ip_addrs().iter().any(|cidr| cidr.contains_addr(&ip))
+        self.common
+            .ip_addrs()
+            .iter()
+            .any(|cidr| cidr.contains_addr(&ip))
     }
 }
 
-pub fn veth_probe(name1: &str, name2: &str) -> (Arc<VethInterface>, Arc<VethInterface>) {
-    let (iface1, iface2) = VethInterface::new_pair(name1, name2);
+// pub fn veth_probe(name1: &str, name2: &str) -> (Arc<VethInterface>, Arc<VethInterface>) {
+//     let (iface1, iface2) = VethInterface::new_pair(name1, name2);
 
-    let addr1 = IpAddress::v4(10, 0, 0, 1);
+//     let addr1 = IpAddress::v4(10, 0, 0, 1);
+//     let cidr1 = IpCidr::new(addr1, 24);
+//     iface1.update_ip_addrs(cidr1);
+
+//     let addr2 = IpAddress::v4(10, 0, 0, 2);
+//     let cidr2 = IpCidr::new(addr2, 24);
+//     iface2.update_ip_addrs(cidr2);
+
+//     // 添加默认路由
+//     iface1.add_default_route_to_peer(addr2);
+//     iface2.add_default_route_to_peer(addr1);
+
+//     let turn_on = |a: &Arc<VethInterface>| {
+//         a.set_net_state(NetDeivceState::__LINK_STATE_START);
+//         a.set_operstate(Operstate::IF_OPER_UP);
+//         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
+//         INIT_NET_NAMESPACE.add_device(a.clone());
+//         a.common().set_net_namespace(INIT_NET_NAMESPACE.clone());
+//         register_netdevice(a.clone()).expect("register veth device failed");
+//     };
+
+//     turn_on(&iface1);
+//     turn_on(&iface2);
+
+//     (iface1, iface2)
+// }
+
+fn veth_route_test() {
+    let (iface_ns1, iface_host1) = VethInterface::new_pair("veth-ns1", "veth-host1");
+    let (iface_ns2, iface_host2) = VethInterface::new_pair("veth-ns2", "veth-host2");
+
+    let addr1 = IpAddress::v4(192, 168, 1, 1);
     let cidr1 = IpCidr::new(addr1, 24);
-    iface1.update_ip_addrs(cidr1);
+    iface_ns1.update_ip_addrs(cidr1);
 
-    let addr2 = IpAddress::v4(10, 0, 0, 2);
+    let addr2 = IpAddress::v4(192, 168, 1, 254);
     let cidr2 = IpCidr::new(addr2, 24);
-    iface2.update_ip_addrs(cidr2);
+    iface_host1.update_ip_addrs(cidr2);
+
+    let addr3 = IpAddress::v4(192, 168, 2, 254);
+    let cidr3 = IpCidr::new(addr3, 24);
+    iface_host2.update_ip_addrs(cidr3);
+
+    let addr4 = IpAddress::v4(192, 168, 2, 1);
+    let cidr4 = IpCidr::new(addr4, 24);
+    iface_ns2.update_ip_addrs(cidr4);
 
     // 添加默认路由
-    iface1.add_default_route_to_peer(addr2);
-    iface2.add_default_route_to_peer(addr1);
+    iface_ns1.add_default_route_to_peer(addr2);
+    iface_host1.add_default_route_to_peer(addr1);
 
-    let turn_on = |a: &Arc<VethInterface>| {
+    iface_host2.add_default_route_to_peer(addr4);
+    iface_ns2.add_default_route_to_peer(addr3);
+
+    let turn_on = |a: &Arc<VethInterface>, ns: Arc<NetNamespace>| {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
-        INIT_NET_NAMESPACE.add_device(a.clone());
-        a.common().set_net_namespace(INIT_NET_NAMESPACE.clone());
+        ns.add_device(a.clone());
+        a.common().set_net_namespace(ns.clone());
         register_netdevice(a.clone()).expect("register veth device failed");
     };
 
-    turn_on(&iface1);
-    turn_on(&iface2);
+    let ns1 = NetNamespace::new_empty(ProcessManager::current_user_ns()).unwrap();
+    let ns2 = NetNamespace::new_empty(ProcessManager::current_user_ns()).unwrap();
 
-    (iface1, iface2)
+    let router_ns1 = ns1.router();
+    // 任何发往 192.168.1.0/24 网络的数据包都是本地邻居，可以直接从 veth-ns1 发送。
+    let dest = IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24);
+    let route = RouteEntry::new_connected(dest, iface_ns1.clone());
+    router_ns1.add_route(route);
+    // 任何不匹配其他路由的数据包，都应该通过 veth-ns1 接口发送给下一跳 192.168.1.254。
+    let next_hop = IpAddress::v4(192, 168, 1, 254);
+    let route = RouteEntry::new_default(next_hop, iface_ns1.clone());
+    router_ns1.add_route(route);
+
+    let router_ns2 = ns2.router();
+    // 任何发往 192.168.2.0/24 网络的数据包都是本地邻居，可以直接从 veth-ns2 发送
+    let dest = IpCidr::new(IpAddress::v4(192, 168, 2, 0), 24);
+    let route = RouteEntry::new_connected(dest, iface_ns2.clone());
+    router_ns2.add_route(route);
+    // 任何不匹配其他路由的数据包，都应该通过 veth-ns2 接口发送给下一跳 192.168.2.254
+    let next_hop = IpAddress::v4(192, 168, 2, 254);
+    let route = RouteEntry::new_default(next_hop, iface_ns2.clone());
+    router_ns2.add_route(route);
+
+    let host_router = INIT_NET_NAMESPACE.router();
+    // 任何发往 192.168.1.0/24 网络的数据包，都应该从 veth-host1 接口直接发送
+    let dest = IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24);
+    let route = RouteEntry::new_connected(dest, iface_host1.clone());
+    host_router.add_route(route);
+    // 任何发往 192.168.2.0/24 网络的数据包，都应该从 veth-host2 接口直接发送
+    let dest = IpCidr::new(IpAddress::v4(192, 168, 2, 0), 24);
+    let route = RouteEntry::new_connected(dest, iface_host2.clone());
+    host_router.add_route(route);
+
+    turn_on(&iface_ns1, INIT_NET_NAMESPACE.clone());
+    turn_on(&iface_ns2, INIT_NET_NAMESPACE.clone());
+    turn_on(&iface_host1, INIT_NET_NAMESPACE.clone());
+    turn_on(&iface_host2, INIT_NET_NAMESPACE.clone());
 }
 
 #[unified_init(INITCALL_DEVICE)]
 pub fn veth_init() -> Result<(), SystemError> {
-    veth_probe("veth0", "veth1");
+    // veth_probe("veth0", "veth1");
+    veth_route_test();
     log::info!("Veth pair initialized.");
     Ok(())
 }

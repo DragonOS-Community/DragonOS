@@ -1,11 +1,18 @@
 use crate::driver::net::Iface;
 use crate::libs::rwlock::RwLock;
+use crate::libs::wait_queue::WaitQueue;
+use crate::process::kthread::KernelThreadClosure;
+use crate::process::kthread::KernelThreadMechanism;
+use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
-use alloc::collections::BTreeMap;
-use alloc::string::String;
+use crate::process::ProcessState;
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use smoltcp::wire::{EthernetAddress, EthernetFrame, IpAddress, IpCidr, Ipv4Packet};
+use smoltcp::wire::{EthernetFrame, IpAddress, IpCidr, Ipv4Packet};
+use system_error::SystemError;
 
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
@@ -85,19 +92,55 @@ pub struct RouteDecision {
 #[derive(Debug)]
 pub struct Router {
     name: String,
-    /// 路由表 //todo 后面再优化LC-trie，现在先简单用一个Vec，并且应该在这上面加锁(maybe rwlock?) and 指针反而可以不加锁，在这个路由表这里加就行
+    /// 路由表 //todo 后面再优化LC-trie，现在先简单用一个Vec
     route_table: RwLock<RouteTable>,
+    pub ns: RwLock<Weak<NetNamespace>>,
+
+    wait_queue: WaitQueue,
+    rx_frames: RwLock<VecDeque<RouterFrame>>,
 }
 
 impl Router {
-    pub fn new(name: String) -> Self {
-        Self {
-            name,
+    pub fn new(name: String) -> Arc<Self> {
+        let router = Arc::new(Self {
+            name: name.clone(),
             route_table: RwLock::new(RouteTable::default()),
-        }
+            wait_queue: WaitQueue::default(),
+            rx_frames: RwLock::new(VecDeque::new()),
+            ns: RwLock::new(Weak::default()),
+        });
+
+        let self_clone: Arc<Router> = router.clone();
+
+        // 创建一个线程来处理桥接设备的轮询
+        let closure: Box<dyn Fn() -> i32 + Send + Sync + 'static> = Box::new(move || {
+            self_clone.poll_blocking();
+            0
+        });
+        let closure = KernelThreadClosure::EmptyClosure((closure, ()));
+        let name = name + "_poll";
+        log::info!("Creating router polling thread: {}", name);
+        let _pcb = KernelThreadMechanism::create_and_run(closure, name)
+            .ok_or("")
+            .expect("create router_poll thread failed");
+
+        // log::info!("Router polling thread created");
+        router
     }
 
-    pub fn add_route(&mut self, route: RouteEntry) {
+    /// 创建一个空的Router实例，主要用于初始化网络命名空间时使用
+    /// 注意： 这个Router实例不会启动轮询线程
+    pub fn new_empty() -> Arc<Self> {
+        Arc::new(Self {
+            name: "empty_router".to_string(),
+            route_table: RwLock::new(RouteTable::default()),
+            wait_queue: WaitQueue::default(),
+            rx_frames: RwLock::new(VecDeque::new()),
+            ns: RwLock::new(Weak::default()),
+        })
+    }
+
+    pub fn add_route(&self, route: RouteEntry) {
         let mut guard = self.route_table.write();
         let entries = &mut guard.entries;
         let pos = entries
@@ -109,7 +152,7 @@ impl Router {
         log::info!("Router {}: Added route to routing table", self.name);
     }
 
-    pub fn remove_route(&mut self, destination: IpCidr) {
+    pub fn remove_route(&self, destination: IpCidr) {
         self.route_table
             .write()
             .entries
@@ -147,49 +190,92 @@ impl Router {
             .entries
             .retain(|route| route.interface.strong_count() > 0);
     }
+
+    pub fn enqueue_frame(&self, frame: RouterFrame) {
+        self.rx_frames.write().push_back(frame);
+        self.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
+    }
+
+    fn poll_blocking(&self) {
+        use crate::sched::SchedMode;
+
+        loop {
+            self.poll();
+
+            log::info!("Router is going to sleep");
+            let _ =
+                wq_wait_event_interruptible!(self.wait_queue, !self.rx_frames.read().is_empty(), {
+                });
+        }
+    }
+
+    fn poll(&self) {
+        let mut inner = self.rx_frames.write();
+        while let Some((decision, frame)) = inner.pop_front() {
+            decision.interface.route_and_send(decision.next_hop, &frame);
+        }
+        log::info!("Router polled all frames");
+    }
 }
 
+/// 获取初始化网络命名空间下的路由表
 pub fn init_netns_router() -> Arc<Router> {
     INIT_NET_NAMESPACE.router().clone()
 }
 
 /// 可供路由设备应该实现的 trait
 pub trait RouterEnableDevice: Iface {
-    //todo 这里可以直接传一个IpPacket进来？如果目前只有ipv4的话
-    fn handle_routable_packet(&self, packet: &[u8]) {
-        if packet.len() < 14 {
-            return;
-        }
-
-        let ether_frame = match EthernetFrame::new_checked(packet) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-
+    /// # 网卡处理可路由的包
+    /// ## 参数
+    /// - `packet`: 需要处理的以太网帧
+    /// ## 返回值
+    /// - `Ok(())`: 通过路由处理成功
+    /// - `Err(None)`: 忽略非IPv4包或没有路由到达的包，告诉外界没有经过处理，应该交由网卡进行默认处理
+    /// - `Err(Some(SystemError))`: 处理失败，可能是包格式错误或其他系统错误
+    fn handle_routable_packet(
+        &self,
+        ether_frame: &EthernetFrame<&[u8]>,
+    ) -> Result<(), Option<SystemError>> {
         // 只处理IP包(IPv4)
         if ether_frame.ethertype() != smoltcp::wire::EthernetProtocol::Ipv4 {
-            return;
+            // 忽略非IPv4包
+            log::info!(
+                "Ignoring non-IPv4 packet on interface {}",
+                self.iface_name()
+            );
+            return Err(None);
         }
 
-        let ipv4_packet = match Ipv4Packet::new_checked(ether_frame.payload()) {
+        // log::info!(
+        //     "src_mac: {}, dst_mac: {}",
+        //     ether_frame.src_addr(),
+        //     ether_frame.dst_addr()
+        // );
+
+        let ipv4_packet: Ipv4Packet<&[u8]> = match Ipv4Packet::new_checked(ether_frame.payload()) {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => return Err(Some(SystemError::EINVAL)),
         };
+
+        // log::info!(
+        //     "src_ip: {}, dst_ip: {}",
+        //     ipv4_packet.src_addr(),
+        //     ipv4_packet.dst_addr()
+        // );
 
         let dst_ip = ipv4_packet.dst_addr();
 
         // 检查TTL
         if ipv4_packet.hop_limit() <= 1 {
             log::warn!("TTL exceeded for packet to {}", dst_ip);
-            return;
+            return Err(Some(SystemError::EINVAL));
         }
 
         // 检查是否是发给自己的包（目标IP是否是自己的IP）
         if self.is_my_ip(dst_ip.into()) {
             // 交给本地协议栈处理
             log::info!("Packet destined for local interface {}", self.iface_name());
-            //todo
-            return;
+            return Err(None);
         }
 
         // 查询当前网络命名空间下的路由表
@@ -199,7 +285,7 @@ pub trait RouterEnableDevice: Iface {
             Some(d) => d,
             None => {
                 log::warn!("No route to {}", dst_ip);
-                return;
+                return Err(None);
             }
         };
 
@@ -207,8 +293,12 @@ pub trait RouterEnableDevice: Iface {
 
         // 检查是否是从同一个接口进来又要从同一个接口出去（避免回路）
         if self.iface_name() == decision.interface.iface_name() {
-            log::warn!("Avoiding routing loop for packet to {}", dst_ip);
-            return;
+            log::info!(
+                "Ignoring packet loop from {} to {}",
+                self.iface_name(),
+                dst_ip
+            );
+            return Err(None);
         }
 
         // 创建修改后的IP包（递减TTL）
@@ -218,17 +308,13 @@ pub trait RouterEnableDevice: Iface {
         //     //todo 这里应该重新计算IP校验和，为了简化先跳过
         // }
 
-        // 交给出接口进行发送
-        decision
-            .interface
-            .route_and_send(decision.next_hop, &modified_ip_packet);
+        let frame = (decision, modified_ip_packet);
 
-        log::info!(
-            "Routed packet from {} to {} via interface {}",
-            self.iface_name(),
-            dst_ip,
-            decision.interface.iface_name()
-        );
+        // 交给出接口进行发送
+        self.netns_router().enqueue_frame(frame);
+
+        log::info!("Routed packet from {} to {} ", self.iface_name(), dst_ip,);
+        Ok(())
     }
 
     /// 路由器决定通过此接口发送包时调用此方法
@@ -247,18 +333,23 @@ pub trait RouterEnableDevice: Iface {
     }
 }
 
+pub type RouterFrame = (RouteDecision, Vec<u8>);
+
 /// # 每一个`RouterEnableDevice`应该有的公共数据，包含
 /// - 当前接口的arp_table，记录邻居（//todo：将网卡的发送以及处理逻辑从smoltcp中移动出来，目前只是简单为veth实现这个，因为可以直接查到对端的mac地址）
 #[derive(Debug)]
 pub struct RouterEnableDeviceCommon {
     /// 当前接口的邻居缓存
-    pub arp_table: RwLock<BTreeMap<IpAddress, EthernetAddress>>,
+    // pub arp_table: RwLock<BTreeMap<IpAddress, EthernetAddress>>,
+    /// 当前接口的IP地址列表
+    pub ip_addrs: RwLock<Vec<IpCidr>>,
 }
 
 impl Default for RouterEnableDeviceCommon {
     fn default() -> Self {
         Self {
-            arp_table: RwLock::new(BTreeMap::new()),
+            // arp_table: RwLock::new(BTreeMap::new()),
+            ip_addrs: RwLock::new(Vec::new()),
         }
     }
 }

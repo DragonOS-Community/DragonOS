@@ -4,6 +4,8 @@ use alloc::{string::String, sync::Arc};
 use core::net::Ipv4Addr;
 use sysfs::netdev_register_kobject;
 
+use crate::libs::rwlock::RwLockReadGuard;
+use crate::net::routing::RouterEnableDeviceCommon;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
@@ -77,7 +79,12 @@ pub trait Iface: crate::driver::base::device::Device {
         self.common().iface_id
     }
 
-    fn poll(&self);
+    /// # `poll`
+    /// 用于轮询网卡，处理网络事件
+    /// ## 返回值
+    /// - `true`：表示有网络事件发生
+    /// - `false`：表示没有网络事件
+    fn poll(&self) -> bool;
 
     /// # `poll_blocking`
     /// 用于在阻塞模式下轮询网卡
@@ -189,6 +196,8 @@ pub struct IfaceCommon {
     default_iface: bool,
     /// 网络命名空间
     net_namespace: RwLock<Weak<NetNamespace>>,
+
+    router_common_data: RouterEnableDeviceCommon,
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -202,6 +211,11 @@ impl fmt::Debug for IfaceCommon {
 
 impl IfaceCommon {
     pub fn new(iface_id: usize, default_iface: bool, iface: smoltcp::iface::Interface) -> Self {
+        let router_common_data = RouterEnableDeviceCommon::default();
+        router_common_data
+            .ip_addrs
+            .write()
+            .extend_from_slice(iface.ip_addrs());
         IfaceCommon {
             iface_id,
             smol_iface: SpinLock::new(iface),
@@ -211,10 +225,11 @@ impl IfaceCommon {
             poll_at_ms: core::sync::atomic::AtomicU64::new(0),
             default_iface,
             net_namespace: RwLock::new(Weak::new()),
+            router_common_data,
         }
     }
 
-    pub fn poll<D>(&self, device: &mut D)
+    pub fn poll<D>(&self, device: &mut D) -> bool
     where
         D: smoltcp::phy::Device + ?Sized,
     {
@@ -281,6 +296,7 @@ impl IfaceCommon {
         //     .extract_if(|closing_socket| closing_socket.is_closed())
         //     .collect::<Vec<_>>();
         // drop(closed_sockets);
+        has_events
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
@@ -320,6 +336,10 @@ impl IfaceCommon {
 
     pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {
         self.smol_iface.lock().ipv4_addr()
+    }
+
+    pub fn ip_addrs(&self) -> RwLockReadGuard<'_, Vec<smoltcp::wire::IpCidr>> {
+        self.router_common_data.ip_addrs.read()
     }
 
     pub fn prefix_len(&self) -> Option<u8> {

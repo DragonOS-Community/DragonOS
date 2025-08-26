@@ -8,8 +8,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define SERVER_IP "200.0.0.4"
-#define CLIENT_IP "200.0.0.1"
+#define SERVER_IP "192.168.2.1"
+#define CLIENT_IP "192.168.1.1"
 #define PORT 34254
 #define BUFFER_SIZE 1024
 
@@ -78,7 +78,7 @@ void *server_func(void *arg) {
                client_len) < 0) {
         handle_error_message("[server] Failed to send back");
     }
-    // sleep(5);
+    sleep(1);
     printf("[server] Echoed back the message\n");
 
     close(sockfd);

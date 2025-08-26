@@ -58,7 +58,7 @@ struct MacEntryRecord {
 pub struct BridgePort {
     pub id: BridgePortId,
     pub(super) bridge_enable: Arc<dyn BridgeEnableDevice>,
-    pub(super) bridge_driver: Weak<BridgeIface>,
+    pub(super) bridge_iface: Weak<BridgeIface>,
     // 当前接口状态？forwarding, learning, blocking?
     // mac mtu信息
 }
@@ -72,7 +72,7 @@ impl BridgePort {
         BridgePort {
             id,
             bridge_enable: device,
-            bridge_driver: Arc::downgrade(bridge),
+            bridge_iface: Arc::downgrade(bridge),
         }
     }
 
@@ -274,20 +274,17 @@ impl BridgeDriver {
         use crate::sched::SchedMode;
 
         loop {
-            let mut inner = self.inner.lock_irqsave();
-
-            let opt = inner.rx_buf.pop_front();
-            if let Some((port_id, frame)) = opt {
+            let mut inner = self.inner.lock();
+            while let Some((port_id, frame)) = inner.rx_buf.pop_front() {
                 inner.handle_frame(port_id, &frame);
-            } else {
-                drop(inner);
-                log::info!("Bridge is going to sleep");
-                let _ = wq_wait_event_interruptible!(
-                    self.wait_queue,
-                    !self.inner.lock().rx_buf.is_empty(),
-                    {}
-                );
             }
+            drop(inner);
+            // log::info!("Bridge is going to sleep");
+            let _ = wq_wait_event_interruptible!(
+                self.wait_queue,
+                !self.inner.lock().rx_buf.is_empty(),
+                {}
+            );
         }
         // inner.poll_blocking();
     }
@@ -355,7 +352,27 @@ impl BridgeIface {
 pub trait BridgeEnableDevice: Iface {
     fn receive_from_bridge(&self, frame: &[u8]);
     // fn inner_driver(&self) -> Arc<dyn InnerDriver>;
-    fn set_common_bridge_data(&self, _port: BridgePort) {}
+    fn set_common_bridge_data(&self, _port: BridgePort);
+
+    // fn common_bridge_data(&self) -> Option<BridgeCommonData>;
+    // fn port_id(&self) -> Option<usize> {
+    //     let Some(data) = self.common_bridge_data() else {
+    //         return None;
+    //     };
+    //     Some(data.id)
+    // }
+    // fn bridge(&self) -> Weak<BridgeIface> {
+    //     let Some(data) = self.common_bridge_data() else {
+    //         return Weak::default();
+    //     };
+    //     data.bridge_driver
+    // }
+}
+
+#[derive(Debug, Clone)]
+pub struct BridgeCommonData {
+    pub id: BridgePortId,
+    pub bridge_iface: Weak<BridgeIface>,
 }
 
 fn bridge_probe() {
@@ -403,15 +420,15 @@ fn bridge_probe() {
     let iface = BridgeIface::new(bridge);
 
     // BRIDGE_DEVICES.write_irqsave().push(bridge.clone());
-    log::info!("Bridge device created");
 
     iface.add_port(iface3);
     iface.add_port(iface2);
+    log::info!("Bridge device created");
 }
 
 #[unified_init(INITCALL_DEVICE)]
 pub fn bridge_init() -> Result<(), SystemError> {
     bridge_probe();
-    log::info!("bridge initialized.");
+    // log::info!("bridge initialized.");
     Ok(())
 }

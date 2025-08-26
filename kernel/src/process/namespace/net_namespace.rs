@@ -21,6 +21,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::AtomicUsize;
 use hashbrown::HashMap;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -30,13 +31,30 @@ lazy_static! {
     pub static ref INIT_NET_NAMESPACE: Arc<NetNamespace> = NetNamespace::new_root();
 }
 
+/// # 网络命名空间计数器
+/// 用于生成唯一的网络命名空间ID
+/// 每次创建新的网络命名空间时，都会增加这个计数器
+pub static mut NETNS_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 #[unified_init(INITCALL_SUBSYS)]
-pub fn root_net_namespace_thread_init() -> Result<(), SystemError> {
+pub fn root_net_namespace_init() -> Result<(), SystemError> {
     // 创建root网络命名空间的轮询线程
     let pcb =
         NetNamespace::create_polling_thread(INIT_NET_NAMESPACE.clone(), "root_netns".to_string());
     INIT_NET_NAMESPACE.set_poll_thread(pcb);
+
+    // 创建 router
+    let router = Router::new("root_netns_router".to_string());
+    INIT_NET_NAMESPACE.inner_mut().router = router.clone();
+    let mut guard = router.ns.write();
+    *guard = INIT_NET_NAMESPACE.self_ref.clone();
+
     Ok(())
+}
+
+/// # 获取下一个网络命名空间计数器的值
+fn get_next_netns_counter() -> usize {
+    unsafe { NETNS_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst) }
 }
 
 #[derive(Debug)]
@@ -84,7 +102,8 @@ impl InnerNetNamespace {
 impl NetNamespace {
     pub fn new_root() -> Arc<Self> {
         let inner = InnerNetNamespace {
-            router: Arc::new(Router::new("root_netns_router".to_string())),
+            // 这里没有直接创建 router，而是留到 init 函数中创建
+            router: Router::new_empty(),
             loopback_iface: None,
             default_iface: None,
         };
@@ -106,12 +125,11 @@ impl NetNamespace {
     }
 
     pub fn new_empty(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, SystemError> {
-        // 这里获取当前进程的pid，只是为了给后面创建的路由以及线程做唯一标识，没有其他意义
-        let pid = ProcessManager::current_pid().data();
+        let counter = get_next_netns_counter();
         let loopback = generate_loopback_iface_default();
 
         let inner = InnerNetNamespace {
-            router: Arc::new(Router::new(format!("netns_router_{}", pid))),
+            router: Router::new(format!("netns_router_{}", counter)),
             loopback_iface: Some(loopback.clone()),
             default_iface: None,
         };
@@ -126,7 +144,7 @@ impl NetNamespace {
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
         });
-        Self::create_polling_thread(netns.clone(), format!("netns_{}", pid));
+        Self::create_polling_thread(netns.clone(), format!("netns_{}", counter));
         netns.add_device(loopback);
 
         Ok(netns)
@@ -224,13 +242,24 @@ impl NetNamespace {
     fn polling(&self) {
         log::info!("net_poll thread started for namespace");
         loop {
+            let mut has_work_done = false;
             for (_, iface) in self.device_list.read_irqsave().iter() {
-                iface.poll();
+                // 这里检查poll的返回值，如果为 true 的话，则说明发生了网络事件，很有可能再次发生，则会再次调用poll
+                if iface.poll() {
+                    has_work_done = true;
+                    iface.poll();
+                }
             }
+            if has_work_done {
+                log::info!("fucking continue");
+                continue;
+            }
+
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             ProcessManager::mark_sleep(true)
                 .expect("clocksource_watchdog_kthread:mark sleep failed");
             drop(irq_guard);
+            // log::info!("net_poll thread going to sleep");
             schedule(SchedMode::SM_NONE);
         }
     }

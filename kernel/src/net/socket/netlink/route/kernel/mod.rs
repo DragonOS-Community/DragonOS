@@ -19,6 +19,7 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 
 mod addr;
+mod link;
 mod utils;
 
 /// 负责处理 Netlink 路由相关的内核模块
@@ -47,6 +48,7 @@ impl NetlinkRouteKernelSocket {
             let seg_type = CSegmentType::try_from(header.type_).unwrap();
             let responce = match segment {
                 RouteNlSegment::GetAddr(request) => addr::do_get_addr(request, netns.clone()),
+                RouteNlSegment::GetLink(request) => link::do_get_link(request, netns.clone()),
                 RouteNlSegment::GetRoute(_new_route) => todo!(),
                 _ => {
                     log::warn!("Unsupported route request segment type: {:?}", seg_type);

@@ -9,7 +9,8 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         },
         net::{
-            register_netdevice, Iface, IfaceCommon, NetDeivceState, NetDeviceCommonData, Operstate,
+            register_netdevice, types::InterfaceFlags, Iface, IfaceCommon, NetDeivceState,
+            NetDeviceCommonData, Operstate,
         },
     },
     libs::{
@@ -201,9 +202,21 @@ impl E1000EInterface {
         let iface =
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
 
+        let flags = InterfaceFlags::UP
+            | InterfaceFlags::BROADCAST
+            | InterfaceFlags::RUNNING
+            | InterfaceFlags::MULTICAST
+            | InterfaceFlags::LOWER_UP;
+
         let iface = Arc::new(E1000EInterface {
             driver: E1000EDriverWrapper(UnsafeCell::new(driver)),
-            common: IfaceCommon::new(iface_id, false, iface),
+            common: IfaceCommon::new(
+                iface_id,
+                crate::driver::net::types::InterfaceType::EETHER,
+                flags,
+                false,
+                iface,
+            ),
             name: format!("eth{}", iface_id),
             inner: SpinLock::new(InnerE1000EInterface {
                 netdevice_common: NetDeviceCommonData::default(),
@@ -332,6 +345,15 @@ impl Iface for E1000EInterface {
 
     fn set_operstate(&self, state: Operstate) {
         self.inner().netdevice_common.operstate = state;
+    }
+
+    fn mtu(&self) -> usize {
+        use smoltcp::phy::Device;
+
+        self.driver
+            .force_get_mut()
+            .capabilities()
+            .max_transmission_unit
     }
 }
 

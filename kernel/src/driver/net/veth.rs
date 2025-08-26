@@ -12,6 +12,7 @@ use crate::driver::base::kobject::{
 use crate::driver::base::kset::KSet;
 use crate::driver::net::bridge::{BridgeCommonData, BridgePort};
 use crate::driver::net::register_netdevice;
+use crate::driver::net::types::InterfaceFlags;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
@@ -321,10 +322,22 @@ impl VethInterface {
         );
         iface.set_any_ip(true);
 
+        let flags = InterfaceFlags::BROADCAST
+            | InterfaceFlags::MULTICAST
+            | InterfaceFlags::UP
+            | InterfaceFlags::RUNNING
+            | InterfaceFlags::LOWER_UP;
+
         let device = Arc::new(VethInterface {
             name,
             driver: VethDriverWarpper(UnsafeCell::new(driver.clone())),
-            common: IfaceCommon::new(iface_id, true, iface),
+            common: IfaceCommon::new(
+                iface_id,
+                super::types::InterfaceType::EETHER,
+                flags,
+                false,
+                iface,
+            ),
             inner: SpinLock::new(VethCommonData::default()),
             locked_kobj_state: LockedKObjectState::default(),
             wait_queue: WaitQueue::default(),
@@ -627,6 +640,14 @@ impl Iface for VethInterface {
 
     fn set_operstate(&self, state: Operstate) {
         self.inner().netdevice_common.operstate = state;
+    }
+
+    fn mtu(&self) -> usize {
+        use smoltcp::phy::Device;
+        self.driver
+            .force_get_mut()
+            .capabilities()
+            .max_transmission_unit
     }
 }
 

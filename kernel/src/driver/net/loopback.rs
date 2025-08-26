@@ -7,6 +7,7 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
+use crate::driver::net::types::InterfaceFlags;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
@@ -321,9 +322,20 @@ impl LoopbackInterface {
                 .expect("Add default ipv4 route failed: full");
         });
 
+        let flags = InterfaceFlags::LOOPBACK
+            | InterfaceFlags::UP
+            | InterfaceFlags::RUNNING
+            | InterfaceFlags::LOWER_UP;
+
         Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
-            common: IfaceCommon::new(iface_id, false, iface),
+            common: IfaceCommon::new(
+                iface_id,
+                super::types::InterfaceType::LOOPBACK,
+                flags,
+                false,
+                iface,
+            ),
             inner: SpinLock::new(InnerLoopbackInterface {
                 netdevice_common: NetDeviceCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -508,6 +520,15 @@ impl Iface for LoopbackInterface {
 
     fn set_operstate(&self, state: Operstate) {
         self.inner().netdevice_common.operstate = state;
+    }
+
+    fn mtu(&self) -> usize {
+        use smoltcp::phy::Device;
+
+        self.driver
+            .force_get_mut()
+            .capabilities()
+            .max_transmission_unit
     }
 }
 

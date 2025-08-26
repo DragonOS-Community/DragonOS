@@ -4,6 +4,7 @@ use alloc::{string::String, sync::Arc};
 use core::net::Ipv4Addr;
 use sysfs::netdev_register_kobject;
 
+use crate::driver::net::types::{InterfaceFlags, InterfaceType};
 use crate::libs::rwlock::RwLockReadGuard;
 use crate::net::routing::RouterEnableDeviceCommon;
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -22,6 +23,7 @@ pub mod e1000e;
 pub mod irq_handle;
 pub mod loopback;
 pub mod sysfs;
+pub mod types;
 pub mod veth;
 pub mod virtio_net;
 
@@ -142,6 +144,16 @@ pub trait Iface: crate::driver::base::device::Device {
     fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
         self.common().set_net_namespace(ns);
     }
+
+    fn flags(&self) -> InterfaceFlags {
+        self.common().flags()
+    }
+
+    fn type_(&self) -> InterfaceType {
+        self.common().type_()
+    }
+
+    fn mtu(&self) -> usize;
 }
 
 /// 网络设备的公共数据
@@ -182,6 +194,8 @@ fn register_netdevice(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
 
 pub struct IfaceCommon {
     iface_id: usize,
+    flags: InterfaceFlags,
+    type_: InterfaceType,
     smol_iface: SpinLock<smoltcp::iface::Interface>,
     /// 存smoltcp网卡的套接字集
     sockets: SpinLock<smoltcp::iface::SocketSet<'static>>,
@@ -196,7 +210,7 @@ pub struct IfaceCommon {
     default_iface: bool,
     /// 网络命名空间
     net_namespace: RwLock<Weak<NetNamespace>>,
-
+    // 路由相关数据
     router_common_data: RouterEnableDeviceCommon,
 }
 
@@ -210,7 +224,13 @@ impl fmt::Debug for IfaceCommon {
 }
 
 impl IfaceCommon {
-    pub fn new(iface_id: usize, default_iface: bool, iface: smoltcp::iface::Interface) -> Self {
+    pub fn new(
+        iface_id: usize,
+        type_: InterfaceType,
+        flags: InterfaceFlags,
+        default_iface: bool,
+        iface: smoltcp::iface::Interface,
+    ) -> Self {
         let router_common_data = RouterEnableDeviceCommon::default();
         router_common_data
             .ip_addrs
@@ -226,6 +246,8 @@ impl IfaceCommon {
             default_iface,
             net_namespace: RwLock::new(Weak::new()),
             router_common_data,
+            flags,
+            type_,
         }
     }
 
@@ -357,5 +379,13 @@ impl IfaceCommon {
     pub fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
         let mut guard = self.net_namespace.write();
         *guard = Arc::downgrade(&ns);
+    }
+
+    pub fn flags(&self) -> InterfaceFlags {
+        self.flags
+    }
+
+    pub fn type_(&self) -> InterfaceType {
+        self.type_
     }
 }

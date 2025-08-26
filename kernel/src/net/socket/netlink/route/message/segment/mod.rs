@@ -1,4 +1,5 @@
 pub mod addr;
+pub mod link;
 pub mod route;
 
 use crate::net::socket::netlink::{
@@ -10,14 +11,14 @@ use crate::net::socket::netlink::{
         },
         ProtocolSegment,
     },
-    route::message::segment::{addr::AddrSegment, route::RouteSegment},
+    route::message::segment::{addr::AddrSegment, link::LinkSegment, route::RouteSegment},
 };
 use system_error::SystemError;
 
 #[derive(Debug)]
 pub enum RouteNlSegment {
-    // NewLink(LinkSegment),
-    // GetLink(LinkSegment),
+    NewLink(LinkSegment),
+    GetLink(LinkSegment),
     NewAddr(AddrSegment),
     GetAddr(AddrSegment),
     Done(DoneSegment),
@@ -36,6 +37,9 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewAddr(addr_segment) | RouteNlSegment::GetAddr(addr_segment) => {
                 addr_segment.header()
             }
+            RouteNlSegment::NewLink(link_segment) | RouteNlSegment::GetLink(link_segment) => {
+                link_segment.header()
+            }
             RouteNlSegment::Done(done_segment) => done_segment.header(),
             RouteNlSegment::Error(error_segment) => error_segment.header(),
         }
@@ -50,6 +54,9 @@ impl ProtocolSegment for RouteNlSegment {
             | RouteNlSegment::GetRoute(route_segment) => route_segment.header_mut(),
             RouteNlSegment::NewAddr(addr_segment) | RouteNlSegment::GetAddr(addr_segment) => {
                 addr_segment.header_mut()
+            }
+            RouteNlSegment::NewLink(link_segment) | RouteNlSegment::GetLink(link_segment) => {
+                link_segment.header_mut()
             }
             RouteNlSegment::Done(done_segment) => done_segment.header_mut(),
             RouteNlSegment::Error(error_segment) => error_segment.header_mut(),
@@ -73,6 +80,9 @@ impl ProtocolSegment for RouteNlSegment {
             CSegmentType::GETROUTE => {
                 RouteNlSegment::GetRoute(RouteSegment::read_from_buf(header, payload_buf)?)
             }
+            CSegmentType::GETLINK => {
+                RouteNlSegment::GetLink(LinkSegment::read_from_buf(header, payload_buf)?)
+            }
             _ => return Err(SystemError::EINVAL),
         };
 
@@ -84,6 +94,7 @@ impl ProtocolSegment for RouteNlSegment {
         let copied = match self {
             RouteNlSegment::NewAddr(addr_segment) => addr_segment.write_to_buf(buf)?,
             RouteNlSegment::NewRoute(route_segment) => route_segment.write_to_buf(buf)?,
+            RouteNlSegment::NewLink(link_segment) => link_segment.write_to_buf(buf)?,
             RouteNlSegment::Done(done_segment) => done_segment.write_to_buf(buf)?,
             RouteNlSegment::Error(error_segment) => error_segment.write_to_buf(buf)?,
             _ => {

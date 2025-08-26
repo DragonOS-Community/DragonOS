@@ -29,7 +29,7 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        net::register_netdevice,
+        net::{register_netdevice, types::InterfaceFlags},
         virtio::{
             irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
@@ -398,6 +398,93 @@ pub struct VirtioInterface {
     locked_kobj_state: LockedKObjectState,
 }
 
+// // 先手糊为virtio实现这些，后面系统要是有了其他类型网卡，这些实现就得实现成一个单独的trait
+// impl VirtioInterface {
+//     /// 消耗token然后主动发送一个 arp 数据包
+//     pub fn emit_arp(arp_repr: &ArpRepr, tx_token: VirtioNetToken) {
+//         let ether_repr = match arp_repr {
+//             ArpRepr::EthernetIpv4 {
+//                 source_hardware_addr,
+//                 target_hardware_addr,
+//                 ..
+//             } => EthernetRepr {
+//                 src_addr: *source_hardware_addr,
+//                 dst_addr: *target_hardware_addr,
+//                 ethertype: EthernetProtocol::Arp,
+//             },
+//             _ => return,
+//         };
+
+//         tx_token.consume(ether_repr.buffer_len() + arp_repr.buffer_len(), |buffer| {
+//             let mut frame = EthernetFrame::new_unchecked(buffer);
+//             ether_repr.emit(&mut frame);
+
+//             let mut pkt = ArpPacket::new_unchecked(frame.payload_mut());
+//             arp_repr.emit(&mut pkt);
+//         });
+//     }
+
+//     /// 解析 arp 包并处理
+//     pub fn process_arp(&self, arp_repr: &ArpRepr) -> Option<ArpRepr> {
+//         match arp_repr {
+//             ArpRepr::EthernetIpv4 {
+//                 operation: ArpOperation::Reply,
+//                 source_hardware_addr,
+//                 source_protocol_addr,
+//                 ..
+//             } => {
+//                 if !source_hardware_addr.is_unicast()
+//                     || !self
+//                         .common()
+//                         .smol_iface
+//                         .lock()
+//                         .context()
+//                         .in_same_network(&IpAddress::Ipv4(*source_protocol_addr))
+//                 {
+//                     return None;
+//                 }
+
+//                 self.common().router_common_data.arp_table.write().insert(
+//                     IpAddress::Ipv4(*source_protocol_addr),
+//                     *source_hardware_addr,
+//                 );
+
+//                 None
+//             }
+//             ArpRepr::EthernetIpv4 {
+//                 operation: ArpOperation::Request,
+//                 source_hardware_addr,
+//                 source_protocol_addr,
+//                 target_protocol_addr,
+//                 ..
+//             } => {
+//                 if !source_hardware_addr.is_unicast() || !source_protocol_addr.x_is_unicast() {
+//                     return None;
+//                 }
+
+//                 if self
+//                     .common()
+//                     .smol_iface
+//                     .lock()
+//                     .context()
+//                     .ipv4_addr()
+//                     .is_none_or(|addr| addr != *target_protocol_addr)
+//                 {
+//                     return None;
+//                 }
+//                 Some(ArpRepr::EthernetIpv4 {
+//                     operation: ArpOperation::Reply,
+//                     source_hardware_addr: self.mac(),
+//                     source_protocol_addr: *target_protocol_addr,
+//                     target_hardware_addr: *source_hardware_addr,
+//                     target_protocol_addr: *source_protocol_addr,
+//                 })
+//             }
+//             _ => None,
+//         }
+//     }
+// }
+
 #[derive(Debug)]
 struct InnerVirtIOInterface {
     kobj_common: KObjectCommonData,
@@ -415,11 +502,23 @@ impl VirtioInterface {
 
         let iface = iface::Interface::new(iface_config, &mut device_inner, Instant::now().into());
 
+        let flags = InterfaceFlags::UP
+            | InterfaceFlags::BROADCAST
+            | InterfaceFlags::RUNNING
+            | InterfaceFlags::MULTICAST
+            | InterfaceFlags::LOWER_UP;
+
         let iface = Arc::new(VirtioInterface {
             device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
             locked_kobj_state: LockedKObjectState::default(),
             iface_name: format!("eth{}", iface_id),
-            iface_common: super::IfaceCommon::new(iface_id, true, iface),
+            iface_common: super::IfaceCommon::new(
+                iface_id,
+                crate::driver::net::types::InterfaceType::EETHER,
+                flags,
+                true,
+                iface,
+            ),
             inner: SpinLock::new(InnerVirtIOInterface {
                 kobj_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -693,6 +792,14 @@ impl Iface for VirtioInterface {
 
     fn set_operstate(&self, state: Operstate) {
         self.inner().netdevice_common.operstate = state;
+    }
+
+    fn mtu(&self) -> usize {
+        use smoltcp::phy::Device;
+        self.device_inner
+            .force_get_mut()
+            .capabilities()
+            .max_transmission_unit
     }
 }
 

@@ -7,6 +7,7 @@ use alloc::sync::{Arc, Weak};
 use cfg_if::cfg_if;
 use system_error::SystemError;
 
+use crate::init::version_info::get_kernel_build_info;
 use crate::libs::spinlock::SpinLockGuard;
 use crate::process::fork::CloneFlags;
 use crate::process::namespace::user_namespace::INIT_USER_NAMESPACE;
@@ -110,8 +111,8 @@ pub struct UtsNamespace {
 impl UtsNamespace {
     const UTS_SYSNAME: &str = "Linux";
     const UTS_NODENAME: &str = "dragonos";
-    const UTS_RELEASE: &str = "6.6.21";
-    const UTS_VERSION: &str = "6.6.21";
+    const UTS_RELEASE: &str = get_kernel_build_info().release;
+    const UTS_VERSION: &str = get_kernel_build_info().version;
 
     cfg_if! {
         if #[cfg(target_arch = "x86_64")] {

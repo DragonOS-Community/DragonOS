@@ -39,6 +39,7 @@ use super::vfs::{
 pub mod kmsg;
 pub mod log;
 mod proc_mounts;
+mod proc_version;
 mod syscall;
 
 /// @brief 进程文件类型
@@ -59,6 +60,8 @@ pub enum ProcFileType {
     ProcFdDir = 5,
     ProcFdFile = 6,
     ProcMounts = 7,
+    /// /proc/version
+    ProcVersion = 8,
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -75,6 +78,7 @@ impl From<u8> for ProcFileType {
             5 => ProcFileType::ProcFdDir,
             6 => ProcFileType::ProcFdFile,
             7 => ProcFileType::ProcMounts,
+            8 => ProcFileType::ProcVersion,
             _ => ProcFileType::Default,
         }
     }
@@ -633,6 +637,19 @@ impl ProcFS {
             .create_proc_file(mounts_params)
             .unwrap_or_else(|_| panic!("create mounts error"));
 
+        // 创建 version 文件
+        let version_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("version")
+            .file_type(FileType::File)
+            .mode(ModeType::from_bits_truncate(0o444))
+            .ftype(ProcFileType::ProcVersion)
+            .build()
+            .unwrap();
+        result
+            .create_proc_file(version_params)
+            .unwrap_or_else(|_| panic!("create version error"));
+
         let self_dir = result
             .root_inode()
             .create("self", FileType::Dir, ModeType::from_bits_truncate(0o555))
@@ -780,6 +797,7 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
             ProcFileType::ProcExe => inode.open_exe(&mut private_data)?,
             ProcFileType::ProcMounts => inode.open_mounts(&mut private_data)?,
+            ProcFileType::ProcVersion => inode.open_version(&mut private_data)?,
             ProcFileType::Default => inode.data.len() as i64,
             ProcFileType::ProcSelf => inode.open_self(&mut private_data)?,
             _ => 0,
@@ -838,7 +856,10 @@ impl IndexNode for LockedProcFSInode {
 
         // 根据文件类型读取相应数据
         match inode.fdata.ftype {
-            ProcFileType::ProcStatus | ProcFileType::ProcMeminfo | ProcFileType::ProcMounts => {
+            ProcFileType::ProcStatus
+            | ProcFileType::ProcMeminfo
+            | ProcFileType::ProcMounts
+            | ProcFileType::ProcVersion => {
                 // 获取数据信息
                 let mut private_data = match &*data {
                     FilePrivateData::Procfs(p) => p.clone(),

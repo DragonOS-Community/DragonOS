@@ -23,6 +23,12 @@ impl Default for EPollItems {
     }
 }
 
+impl AsRef<SpinLock<LinkedList<Arc<EPollItem>>>> for EPollItems {
+    fn as_ref(&self) -> &SpinLock<LinkedList<Arc<EPollItem>>> {
+        &self.items
+    }
+}
+
 impl EPollItems {
     pub fn add(&self, item: Arc<EPollItem>) {
         self.items.lock_irqsave().push_back(item);

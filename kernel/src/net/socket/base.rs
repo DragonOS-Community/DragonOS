@@ -1,8 +1,15 @@
 use crate::{
-    filesystem::vfs::{IndexNode, PollableInode},
+    filesystem::{
+        epoll::EPollEventType,
+        vfs::{IndexNode, PollableInode},
+    },
     libs::wait_queue::WaitQueue,
-    net::{posix::MsgHdr, socket::common::ShutdownBit},
+    net::{
+        posix::MsgHdr,
+        socket::common::{EPollItems, ShutdownBit},
+    },
 };
+// use crate::filesystem::epoll::event_poll::EventPoll;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -18,6 +25,10 @@ pub trait Socket: PollableInode + IndexNode {
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> &WaitQueue;
+
+    fn epoll_items(&self) -> EPollItems;
+
+    fn get_event(&self) -> EPollEventType;
 
     fn send_buffer_size(&self) -> usize;
     fn recv_buffer_size(&self) -> usize;

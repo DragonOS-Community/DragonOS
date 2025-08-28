@@ -107,12 +107,12 @@ impl From<smoltcp::wire::IpEndpoint> for SockAddr {
     fn from(value: smoltcp::wire::IpEndpoint) -> Self {
         match value.addr {
             smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => Self {
-                addr_in: SockAddrIn { 
-                    sin_family: AddressFamily::INet as u16, 
-                    sin_port: value.port, 
-                    sin_addr: ipv4_addr.to_bits(), 
-                    sin_zero: Default::default() 
-                }
+                addr_in: SockAddrIn {
+                    sin_family: AddressFamily::INet as u16,
+                    sin_port: value.port,
+                    sin_addr: ipv4_addr.to_bits(),
+                    sin_zero: Default::default(),
+                },
             },
             smoltcp::wire::IpAddress::Ipv6(ipv6_addr) => todo!(),
         }

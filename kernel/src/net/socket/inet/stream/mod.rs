@@ -2,10 +2,9 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError;
 
-use crate::filesystem::epoll::EPollItem;
-use crate::filesystem::vfs::{FilePrivateData, PollableInode};
 use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::socket::common::EPollItems;
 use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSOL};
 use crate::sched::SchedMode;
 use smoltcp;
@@ -28,6 +27,7 @@ pub struct TcpSocket {
     wait_queue: WaitQueue,
     self_ref: Weak<Self>,
     pollee: AtomicUsize,
+    epoll_items: EPollItems,
 }
 
 impl TcpSocket {
@@ -39,6 +39,7 @@ impl TcpSocket {
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new(0_usize),
+            epoll_items: EPollItems::default(),
         })
     }
 
@@ -50,6 +51,7 @@ impl TcpSocket {
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new((EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize),
+            epoll_items: EPollItems::default(),
         })
     }
 
@@ -313,6 +315,7 @@ impl Socket for TcpSocket {
         };
         self.start_connect(endpoint)?; // Only Nonblock or error will return error.
 
+        // TODO!
         return loop {
             match self.check_connect() {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {}
@@ -526,23 +529,13 @@ impl Socket for TcpSocket {
     fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError> {
         todo!()
     }
-}
 
-impl PollableInode for TcpSocket {
-    fn poll(&self, _: &FilePrivateData) -> Result<usize, SystemError> {
-        Ok(self.do_poll())
+    fn epoll_items(&self) -> EPollItems {
+        self.epoll_items.clone()
     }
 
-    fn add_epitem(&self, epitem: Arc<EPollItem>, _: &FilePrivateData) -> Result<(), SystemError> {
-        todo!()
-    }
-
-    fn remove_epitem(
-        &self,
-        epitm: &Arc<EPollItem>,
-        _: &FilePrivateData,
-    ) -> Result<(), SystemError> {
-        todo!()
+    fn get_event(&self) -> crate::filesystem::epoll::EPollEventType {
+        EP::from_bits_truncate(self.do_poll() as u32)
     }
 }
 

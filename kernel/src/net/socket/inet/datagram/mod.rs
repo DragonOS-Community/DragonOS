@@ -5,7 +5,7 @@ use system_error::SystemError;
 use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::IndexNode;
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::socket::common::ShutdownBit;
+use crate::net::socket::common::{EPollItems, ShutdownBit};
 use crate::net::socket::{Socket, PMSG};
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
@@ -25,6 +25,7 @@ pub struct UdpSocket {
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
     self_ref: Weak<UdpSocket>,
+    epoll_items: EPollItems,
 }
 
 impl UdpSocket {
@@ -34,6 +35,7 @@ impl UdpSocket {
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
+            epoll_items: Default::default(),
         });
     }
 
@@ -100,13 +102,13 @@ impl UdpSocket {
 
     #[inline]
     pub fn can_recv(&self) -> bool {
-        self.event().contains(EP::EPOLLIN)
+        self.get_event().contains(EP::EPOLLIN)
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn can_send(&self) -> bool {
-        self.event().contains(EP::EPOLLOUT)
+        self.get_event().contains(EP::EPOLLOUT)
     }
 
     pub fn try_send(
@@ -135,28 +137,6 @@ impl UdpSocket {
             _ => Err(SystemError::ENOTCONN),
         };
         return result;
-    }
-
-    pub fn event(&self) -> EPollEventType {
-        let mut event = EPollEventType::empty();
-        match self.inner.read().as_ref().unwrap() {
-            UdpInner::Unbound(_) => {
-                event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
-            }
-            UdpInner::Bound(bound) => {
-                let (can_recv, can_send) =
-                    bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
-
-                if can_recv {
-                    event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
-                }
-
-                if can_send {
-                    event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
-                }
-            }
-        }
-        return event;
     }
 }
 
@@ -322,30 +302,31 @@ impl Socket for UdpSocket {
     fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
         todo!()
     }
-}
 
-impl crate::filesystem::vfs::PollableInode for UdpSocket {
-    fn poll(
-        &self,
-        private_data: &crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        Ok(self.event().bits() as usize)
+    fn epoll_items(&self) -> crate::net::socket::common::EPollItems {
+        self.epoll_items.clone()
     }
 
-    fn add_epitem(
-        &self,
-        epitem: Arc<crate::filesystem::epoll::EPollItem>,
-        private_data: &crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<(), SystemError> {
-        todo!()
-    }
+    fn get_event(&self) -> EPollEventType {
+        let mut event = EPollEventType::empty();
+        match self.inner.read().as_ref().unwrap() {
+            UdpInner::Unbound(_) => {
+                event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
+            }
+            UdpInner::Bound(bound) => {
+                let (can_recv, can_send) =
+                    bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
 
-    fn remove_epitem(
-        &self,
-        epitm: &Arc<crate::filesystem::epoll::EPollItem>,
-        private_data: &crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<(), SystemError> {
-        todo!()
+                if can_recv {
+                    event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
+                }
+
+                if can_send {
+                    event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
+                }
+            }
+        }
+        return event;
     }
 }
 

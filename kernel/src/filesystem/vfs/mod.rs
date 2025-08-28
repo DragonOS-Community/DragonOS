@@ -26,7 +26,6 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
-    net::socket::Socket,
     process::ProcessManager,
     time::PosixTimeSpec,
 };

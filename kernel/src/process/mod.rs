@@ -1085,7 +1085,7 @@ impl ProcessControlBlock {
             .fd_table()
             .read()
             .get_file_by_fd(fd)
-            .ok_or_else(|| {
+            .ok_or({
                 // log::warn!("get_socket: fd {} not found", fd);
                 SystemError::EBADF
             })?;

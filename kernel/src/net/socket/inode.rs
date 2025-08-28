@@ -1,4 +1,9 @@
-use crate::{filesystem::vfs::{syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata, PollableInode}, libs::spinlock::SpinLockGuard};
+use crate::{
+    filesystem::vfs::{
+        syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata, PollableInode,
+    },
+    libs::spinlock::SpinLockGuard,
+};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -58,5 +63,29 @@ impl<T: Socket + 'static> IndexNode for T {
             FileType::Socket,
             ModeType::from_bits_truncate(0o755),
         ))
+    }
+}
+
+impl<T: Socket + 'static> PollableInode for T {
+    fn poll(&self, _: &FilePrivateData) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn add_epitem(
+        &self,
+        epitem: Arc<crate::filesystem::epoll::EPollItem>,
+        _: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.epoll_items().add(epitem);
+        return Ok(());
+    }
+
+    fn remove_epitem(
+        &self,
+        epitm: &Arc<crate::filesystem::epoll::EPollItem>,
+        _: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.epoll_items().remove(&epitm.epoll());
+        return Ok(());
     }
 }

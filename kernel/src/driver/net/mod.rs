@@ -248,7 +248,7 @@ impl IfaceCommon {
         self.bounds.read_irqsave().iter().for_each(|bound_socket| {
             // incase our inet socket missed the event, we manually notify it each time we poll
             if has_events {
-                bound_socket.on_iface_events();
+                bound_socket.notify();
                 let _woke = bound_socket
                     .wait_queue()
                     .wakeup(Some(ProcessState::Blocked(true)));

@@ -67,7 +67,7 @@ impl Endpoint {
         let len = kernel_addr.len()?;
 
         unsafe {
-            let to_write = core::cmp::min(len, *addr_len );
+            let to_write = core::cmp::min(len, *addr_len);
             if to_write > 0 {
                 let buf = core::slice::from_raw_parts_mut(addr as *mut u8, to_write as usize);
                 buf.copy_from_slice(core::slice::from_raw_parts(

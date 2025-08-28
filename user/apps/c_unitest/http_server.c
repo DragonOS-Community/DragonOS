@@ -158,7 +158,7 @@ int main(int argc, char const *argv[]) {
   int opt = 1;
 
   // 创建socket
-  if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+  if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
     perror("socket failed");
     exit(EXIT_CODE);
   }

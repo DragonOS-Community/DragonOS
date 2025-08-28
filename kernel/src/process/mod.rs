@@ -30,7 +30,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
-        procfs::procfs_unregister_pid,
+        procfs::{procfs_register_pid, procfs_unregister_pid, PROCFS_INSTANCE},
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
@@ -148,6 +148,9 @@ impl ProcessManager {
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
         info!("Process Manager initialized.");
+        
+        // 进程管理系统初始化完成后，初始化 ProcFS 的进程相关功能
+        Self::init_procfs_after_process_init();
     }
 
     fn init_switch_result() {
@@ -164,6 +167,23 @@ impl ProcessManager {
     #[allow(dead_code)]
     pub fn initialized() -> bool {
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE }
+    }
+
+    /// 在进程管理系统初始化完成后，初始化 ProcFS 的进程相关功能
+    fn init_procfs_after_process_init() {
+        
+        // 检查 ProcFS 是否已经初始化
+        if let Some(_) = unsafe { PROCFS_INSTANCE.as_ref() } {
+            // 为当前进程创建 ProcFS 目录
+            let current_pid = ProcessManager::current_pid();
+            if current_pid != RawPid(0) {
+                if let Err(e) = procfs_register_pid(current_pid) {
+                    warn!("Failed to register current process {} to procfs: {:?}", current_pid, e);
+                } else {
+                    info!("Successfully registered current process {} to procfs", current_pid);
+                }
+            }
+        }
     }
 
     /// 获取当前进程的pcb

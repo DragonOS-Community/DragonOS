@@ -1,1214 +1,41 @@
-use core::intrinsics::size_of;
+use core::fmt::Debug;
 
-use ::log::{error, info};
-use alloc::{
-    borrow::ToOwned,
-    collections::BTreeMap,
-    format,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-    vec::Vec,
+use super::{
+    kernfs::{
+        callback::KernInodePrivateData,
+        KernFS, KernFSInode,
+    },
+    vfs::{syscall::ModeType, FileSystem, IndexNode, mount::MountFlags},
 };
-use system_error::SystemError;
 
 use crate::{
-    arch::mm::LockedFrameAllocator,
-    driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{
-        mount::{MountFlags, MountPath},
-        vcore::generate_inode_id,
-        FileType,
-    },
-    libs::{
-        once::Once,
-        rwlock::RwLock,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
-    mm::allocator::page_frame::FrameAllocator,
-    process::{ProcessManager, ProcessState, RawPid},
-    time::PosixTimeSpec,
+    libs::{casting::DowncastArc, once::Once},
+    process::ProcessManager,
 };
+use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
+use ::log::{info, warn};
+use system_error::SystemError;
 
-use super::vfs::{
-    file::{FileMode, FilePrivateData},
-    syscall::ModeType,
-    utils::DName,
-    FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
-};
+pub mod system_info;
+pub mod process_info;
+pub mod sys_config;
+pub mod dir;
+pub mod file;
 
-pub mod kmsg;
-pub mod log;
-mod proc_mounts;
-mod proc_version;
-mod syscall;
+pub use system_info::{ProcSystemInfoType, get_system_info};
+pub use process_info::{ProcProcessInfoType, ProcessId, get_process_info};
+pub use sys_config::{ProcSysConfigType, get_sys_config, set_sys_config, ConfigValue, init_system_configs};
+pub use dir::ProcDirType;
+use file::{PROCFS_CALLBACK_RO, PROCFS_CALLBACK_RW, PROCFS_CALLBACK_WO};
 
-/// @brief 进程文件类型
-/// @usage 用于定义进程文件夹下的各类文件类型
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ProcFileType {
-    ///展示进程状态信息
-    ProcStatus = 0,
-    /// meminfo
-    ProcMeminfo = 1,
-    /// kmsg
-    ProcKmsg = 2,
-    /// 可执行路径
-    ProcExe = 3,
-    /// /proc/mounts
-    ProcSelf = 4,
-    ProcFdDir = 5,
-    ProcFdFile = 6,
-    ProcMounts = 7,
-    /// /proc/version
-    ProcVersion = 8,
-    //todo: 其他文件类型
-    ///默认文件类型
-    Default,
-}
 
-impl From<u8> for ProcFileType {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => ProcFileType::ProcStatus,
-            1 => ProcFileType::ProcMeminfo,
-            2 => ProcFileType::ProcKmsg,
-            3 => ProcFileType::ProcExe,
-            4 => ProcFileType::ProcSelf,
-            5 => ProcFileType::ProcFdDir,
-            6 => ProcFileType::ProcFdFile,
-            7 => ProcFileType::ProcMounts,
-            8 => ProcFileType::ProcVersion,
-            _ => ProcFileType::Default,
-        }
+pub static mut PROCFS_INSTANCE: Option<ProcFS> = None;
+
+#[inline(always)]
+pub fn procfs_instance() -> &'static ProcFS {
+    unsafe {
+        return PROCFS_INSTANCE.as_ref().unwrap();
     }
-}
-/// @brief 创建 ProcFS 文件的参数结构体
-#[derive(Debug, Clone)]
-pub struct ProcFileCreationParams<'a> {
-    pub parent: Arc<dyn IndexNode>,
-    pub name: &'a str,
-    pub file_type: FileType,
-    pub mode: ModeType,
-    pub pid: Option<RawPid>,
-    pub ftype: ProcFileType,
-    pub data: Option<&'a str>,
-}
-
-impl<'a> ProcFileCreationParams<'a> {
-    pub fn builder() -> ProcFileCreationParamsBuilder<'a> {
-        ProcFileCreationParamsBuilder::default()
-    }
-}
-
-/// @brief ProcFileCreationParams 的 Builder 模式实现
-#[derive(Debug, Clone, Default)]
-pub struct ProcFileCreationParamsBuilder<'a> {
-    parent: Option<Arc<dyn IndexNode>>,
-    name: Option<&'a str>,
-    file_type: Option<FileType>,
-    mode: Option<ModeType>,
-    pid: Option<RawPid>,
-    ftype: Option<ProcFileType>,
-    data: Option<&'a str>,
-}
-
-#[allow(dead_code)]
-impl<'a> ProcFileCreationParamsBuilder<'a> {
-    pub fn parent(mut self, parent: Arc<dyn IndexNode>) -> Self {
-        self.parent = Some(parent);
-        self
-    }
-
-    pub fn name(mut self, name: &'a str) -> Self {
-        self.name = Some(name);
-        self
-    }
-
-    pub fn file_type(mut self, file_type: FileType) -> Self {
-        self.file_type = Some(file_type);
-        self
-    }
-
-    pub fn mode(mut self, mode: ModeType) -> Self {
-        self.mode = Some(mode);
-        self
-    }
-
-    pub fn pid(mut self, pid: RawPid) -> Self {
-        self.pid = Some(pid);
-        self
-    }
-
-    pub fn ftype(mut self, ftype: ProcFileType) -> Self {
-        self.ftype = Some(ftype);
-        self
-    }
-
-    pub fn data(mut self, data: &'a str) -> Self {
-        self.data = Some(data);
-        self
-    }
-
-    pub fn build(self) -> Result<ProcFileCreationParams<'a>, SystemError> {
-        Ok(ProcFileCreationParams {
-            parent: self.parent.ok_or(SystemError::EINVAL)?,
-            name: self.name.ok_or(SystemError::EINVAL)?,
-            file_type: self.file_type.ok_or(SystemError::EINVAL)?,
-            mode: self.mode.unwrap_or(ModeType::S_IRUGO),
-            pid: self.pid,
-            ftype: self.ftype.ok_or(SystemError::EINVAL)?,
-            data: self.data,
-        })
-    }
-}
-
-/// @brief 节点私有信息结构体
-/// @usage 用于传入各类文件所需的信息
-#[derive(Debug)]
-pub struct InodeInfo {
-    ///进程的pid
-    pid: Option<RawPid>,
-    ///文件类型
-    ftype: ProcFileType,
-    /// 文件描述符
-    fd: i32,
-    // 其他需要传入的信息在此定义
-}
-
-/// @brief procfs的inode名称的最大长度
-const PROCFS_MAX_NAMELEN: usize = 64;
-const PROCFS_BLOCK_SIZE: u64 = 512;
-/// @brief procfs文件系统的Inode结构体
-#[derive(Debug)]
-pub struct LockedProcFSInode(SpinLock<ProcFSInode>);
-
-/// @brief procfs文件系统结构体
-#[derive(Debug)]
-pub struct ProcFS {
-    /// procfs的root inode
-    root_inode: Arc<LockedProcFSInode>,
-    super_block: RwLock<SuperBlock>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProcfsFilePrivateData {
-    data: Vec<u8>,
-}
-
-impl ProcfsFilePrivateData {
-    pub fn new() -> Self {
-        return ProcfsFilePrivateData { data: Vec::new() };
-    }
-}
-
-impl Default for ProcfsFilePrivateData {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// @brief procfs文件系统的Inode结构体(不包含锁)
-#[derive(Debug)]
-pub struct ProcFSInode {
-    /// 指向父Inode的弱引用
-    parent: Weak<LockedProcFSInode>,
-    /// 指向自身的弱引用
-    self_ref: Weak<LockedProcFSInode>,
-    /// 子Inode的B树
-    children: BTreeMap<DName, Arc<LockedProcFSInode>>,
-    /// 当前inode的数据部分
-    data: Vec<u8>,
-    /// 当前inode的元数据
-    metadata: Metadata,
-    /// 指向inode所在的文件系统对象的指针
-    fs: Weak<ProcFS>,
-    /// 储存私有信息
-    fdata: InodeInfo,
-    /// 目录项
-    dname: DName,
-}
-
-/// 对ProcFSInode实现获取各类文件信息的函数
-impl ProcFSInode {
-    /// @brief 去除Vec中所有的\0,并在结尾添加\0
-    #[inline]
-    fn trim_string(&self, data: &mut Vec<u8>) {
-        data.retain(|x| *x != 0);
-
-        data.push(0);
-    }
-    // todo:其他数据获取函数实现
-
-    /// @brief 打开status文件
-    ///
-    fn open_status(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
-        // 获取该pid对应的pcb结构体
-        let pid = self
-            .fdata
-            .pid
-            .expect("ProcFS: pid is None when opening 'status' file.");
-        let pcb = ProcessManager::find_task_by_vpid(pid);
-        let pcb = if let Some(pcb) = pcb {
-            pcb
-        } else {
-            error!(
-                "ProcFS: Cannot find pcb for pid {:?} when opening its 'status' file.",
-                pid
-            );
-            return Err(SystemError::ESRCH);
-        };
-
-        // ::log::debug!(
-        //     "ProcFS: Opening 'status' file for pid {:?} (cnt: {})",
-        //     pcb.raw_pid(),
-        //     Arc::strong_count(&pcb)
-        // );
-        // 传入数据
-        let pdata: &mut Vec<u8> = &mut pdata.data;
-        // name
-        pdata.append(
-            &mut format!("Name:\t{}", pcb.basic().name())
-                .as_bytes()
-                .to_owned(),
-        );
-
-        let sched_info_guard = pcb.sched_info();
-        let state = sched_info_guard.inner_lock_read_irqsave().state();
-        let cpu_id = sched_info_guard
-            .on_cpu()
-            .map(|cpu| cpu.data() as i32)
-            .unwrap_or(-1);
-
-        let priority = sched_info_guard.policy();
-        let vrtime = sched_info_guard.sched_entity.vruntime;
-        let time = sched_info_guard.sched_entity.sum_exec_runtime;
-        let start_time = sched_info_guard.sched_entity.exec_start;
-        // State
-        pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
-
-        // Tgid
-        pdata.append(
-            &mut format!(
-                "\nTgid:\t{}",
-                pcb.task_tgid_vnr().unwrap_or(RawPid::new(0)).into()
-            )
-            .into(),
-        );
-
-        // pid
-        pdata.append(
-            &mut format!("\nPid:\t{}", pcb.task_pid_vnr().data())
-                .as_bytes()
-                .to_owned(),
-        );
-
-        // ppid
-        pdata.append(
-            &mut format!(
-                "\nPpid:\t{}",
-                pcb.parent_pcb()
-                    .map(|p| p.task_pid_vnr().data() as isize)
-                    .unwrap_or(-1)
-            )
-            .as_bytes()
-            .to_owned(),
-        );
-
-        // fdsize
-        if matches!(state, ProcessState::Exited(_)) {
-            // 进程已经退出，fdsize为0
-            pdata.append(&mut format!("\nFDSize:\t{}", 0).into());
-        } else {
-            pdata.append(
-                &mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into(),
-            );
-        }
-
-        // tty
-        let name = if let Some(tty) = pcb.sig_info_irqsave().tty() {
-            tty.core().name().clone()
-        } else {
-            "none".to_string()
-        };
-        pdata.append(&mut format!("\nTty:\t{}", name).as_bytes().to_owned());
-
-        // 进程在cpu上的运行时间
-        pdata.append(&mut format!("\nTime:\t{}", time).as_bytes().to_owned());
-        // 进程开始运行的时间
-        pdata.append(&mut format!("\nStime:\t{}", start_time).as_bytes().to_owned());
-        // kthread
-        pdata.append(&mut format!("\nKthread:\t{}", pcb.is_kthread() as usize).into());
-        pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
-        pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
-        pdata.append(
-            &mut format!("\npreempt:\t{}", pcb.preempt_count())
-                .as_bytes()
-                .to_owned(),
-        );
-
-        pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
-
-        if let Some(user_vm) = pcb.basic().user_vm() {
-            let address_space_guard = user_vm.read();
-            // todo: 当前进程运行过程中占用内存的峰值
-            let hiwater_vm: u64 = 0;
-            // 进程代码段的大小
-            let text = (address_space_guard.end_code - address_space_guard.start_code) / 1024;
-            // 进程数据段的大小
-            let data = (address_space_guard.end_data - address_space_guard.start_data) / 1024;
-            drop(address_space_guard);
-            pdata.append(
-                &mut format!("\nVmPeak:\t{} kB", hiwater_vm)
-                    .as_bytes()
-                    .to_owned(),
-            );
-            pdata.append(&mut format!("\nVmData:\t{} kB", data).as_bytes().to_owned());
-            pdata.append(&mut format!("\nVmExe:\t{} kB", text).as_bytes().to_owned());
-        }
-
-        pdata.append(
-            &mut format!("\nflags: {:?}\n", pcb.flags().clone())
-                .as_bytes()
-                .to_owned(),
-        );
-
-        // 去除多余的\0
-        self.trim_string(pdata);
-
-        return Ok((pdata.len() * size_of::<u8>()) as i64);
-    }
-
-    /// 打开 meminfo 文件
-    fn open_meminfo(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
-        // 获取内存信息
-        let usage = unsafe { LockedFrameAllocator.usage() };
-
-        // 传入数据
-        let data: &mut Vec<u8> = &mut pdata.data;
-
-        data.append(
-            &mut format!("MemTotal:\t{} kB\n", usage.total().bytes() >> 10)
-                .as_bytes()
-                .to_owned(),
-        );
-
-        data.append(
-            &mut format!("MemFree:\t{} kB\n", usage.free().bytes() >> 10)
-                .as_bytes()
-                .to_owned(),
-        );
-
-        // 去除多余的\0
-        self.trim_string(data);
-
-        return Ok((data.len() * size_of::<u8>()) as i64);
-    }
-
-    // 打开 exe 文件
-    fn open_exe(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
-        // 这个文件是一个软链接，直接返回0即可
-        return Ok(0);
-    }
-
-    fn open_self(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
-        let pid = ProcessManager::current_pid().data();
-        return Ok(pid.to_string().len() as _);
-    }
-
-    // 读取exe文件
-    fn read_exe_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        // 判断是否有记录pid信息，有的话就是当前进程的exe文件，没有则是当前进程的exe文件
-        let pcb = if let Some(pid) = self.fdata.pid {
-            ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?
-        } else {
-            // 如果没有pid信息，则读取当前进程的exe文件
-            ProcessManager::current_pcb()
-        };
-
-        let exe = pcb.execute_path();
-        let exe_bytes = exe.as_bytes();
-        let len = exe_bytes.len().min(buf.len());
-        buf[..len].copy_from_slice(&exe_bytes[..len]);
-        Ok(len)
-    }
-
-    /// read current task pid dynamically
-    fn read_self_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let pid = ProcessManager::current_pid().data();
-        let pid_bytes = pid.to_string();
-        let len = pid_bytes.len().min(buf.len());
-        buf[..len].copy_from_slice(&pid_bytes.as_bytes()[..len]);
-        Ok(len)
-    }
-
-    fn read_fd_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let fd = self.fdata.fd;
-        let fd_table = ProcessManager::current_pcb().fd_table();
-        let fd_table = fd_table.read();
-        let file = fd_table.get_file_by_fd(fd);
-        if let Some(file) = file {
-            let inode = file.inode();
-            let path = inode.absolute_path().unwrap();
-            let len = path.len().min(buf.len());
-            buf[..len].copy_from_slice(&path.as_bytes()[..len]);
-            Ok(len)
-        } else {
-            return Err(SystemError::EBADF);
-        }
-    }
-
-    /// proc文件系统读取函数
-    fn proc_read(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        pdata: &mut ProcfsFilePrivateData,
-    ) -> Result<usize, SystemError> {
-        let start = pdata.data.len().min(offset);
-        let end = pdata.data.len().min(offset + len);
-
-        // buffer空间不足
-        if buf.len() < (end - start) {
-            return Err(SystemError::ENOBUFS);
-        }
-
-        // 拷贝数据
-        let src = &pdata.data[start..end];
-        buf[0..src.len()].copy_from_slice(src);
-        return Ok(src.len());
-    }
-}
-
-impl FileSystem for ProcFS {
-    fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
-        return self.root_inode.clone();
-    }
-
-    fn info(&self) -> FsInfo {
-        return FsInfo {
-            blk_dev_id: 0,
-            max_name_len: PROCFS_MAX_NAMELEN,
-        };
-    }
-
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "procfs"
-    }
-
-    fn super_block(&self) -> SuperBlock {
-        self.super_block.read().clone()
-    }
-}
-
-impl ProcFS {
-    #[inline(never)]
-    fn create_proc_file(&self, params: ProcFileCreationParams) -> Result<(), SystemError> {
-        let binding = params
-            .parent
-            .create(params.name, params.file_type, params.mode)?;
-        let proc_file = binding
-            .as_any_ref()
-            .downcast_ref::<LockedProcFSInode>()
-            .unwrap();
-        let mut proc_file_guard = proc_file.0.lock();
-        proc_file_guard.fdata.pid = params.pid;
-        proc_file_guard.fdata.ftype = params.ftype;
-        if let Some(data_content) = params.data {
-            proc_file_guard.data = data_content.to_string().as_bytes().to_vec();
-        }
-        drop(proc_file_guard);
-        Ok(())
-    }
-
-    #[inline(never)]
-    pub fn new() -> Arc<Self> {
-        let super_block = SuperBlock::new(
-            Magic::PROC_MAGIC,
-            PROCFS_BLOCK_SIZE,
-            PROCFS_MAX_NAMELEN as u64,
-        );
-        // 初始化root inode
-        let root: Arc<LockedProcFSInode> =
-            Arc::new(LockedProcFSInode(SpinLock::new(ProcFSInode {
-                parent: Weak::default(),
-                self_ref: Weak::default(),
-                children: BTreeMap::new(),
-                data: Vec::new(),
-                metadata: Metadata {
-                    dev_id: 0,
-                    inode_id: generate_inode_id(),
-                    size: 0,
-                    blk_size: 0,
-                    blocks: 0,
-                    atime: PosixTimeSpec::default(),
-                    mtime: PosixTimeSpec::default(),
-                    ctime: PosixTimeSpec::default(),
-                    btime: PosixTimeSpec::default(),
-                    file_type: FileType::Dir,
-                    mode: ModeType::from_bits_truncate(0o555),
-                    nlinks: 1,
-                    uid: 0,
-                    gid: 0,
-                    raw_dev: DeviceNumber::default(),
-                },
-                fs: Weak::default(),
-                fdata: InodeInfo {
-                    pid: None,
-                    ftype: ProcFileType::Default,
-                    fd: -1,
-                },
-                dname: DName::default(),
-            })));
-
-        let result: Arc<ProcFS> = Arc::new(ProcFS {
-            root_inode: root,
-            super_block: RwLock::new(super_block),
-        });
-
-        // 对root inode加锁，并继续完成初始化工作
-        let mut root_guard: SpinLockGuard<ProcFSInode> = result.root_inode.0.lock();
-        root_guard.parent = Arc::downgrade(&result.root_inode);
-        root_guard.self_ref = Arc::downgrade(&result.root_inode);
-        root_guard.fs = Arc::downgrade(&result);
-        // 释放锁
-        drop(root_guard);
-
-        // 创建meminfo文件
-        let meminfo_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("meminfo")
-            .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
-            .ftype(ProcFileType::ProcMeminfo)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(meminfo_params)
-            .unwrap_or_else(|_| panic!("create meminfo error"));
-
-        // 创建kmsg文件
-        let kmsg_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("kmsg")
-            .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
-            .ftype(ProcFileType::ProcKmsg)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(kmsg_params)
-            .unwrap_or_else(|_| panic!("create kmsg error"));
-        // 这个文件是用来欺骗Aya框架识别内核版本
-        /* On Ubuntu LINUX_VERSION_CODE doesn't correspond to info.release,
-         * but Ubuntu provides /proc/version_signature file, as described at
-         * https://ubuntu.com/kernel, with an example contents below, which we
-         * can use to get a proper LINUX_VERSION_CODE.
-         *
-         *   Ubuntu 5.4.0-12.15-generic 5.4.8
-         *
-         * In the above, 5.4.8 is what kernel is actually expecting, while
-         * uname() call will return 5.4.0 in info.release.
-         */
-        let version_signature_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("version_signature")
-            .file_type(FileType::File)
-            .ftype(ProcFileType::Default)
-            .data("DragonOS 6.0.0-generic 6.0.0\n")
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(version_signature_params)
-            .unwrap_or_else(|_| panic!("create version_signature error"));
-
-        let mounts_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("mounts")
-            .file_type(FileType::File)
-            .ftype(ProcFileType::ProcMounts)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(mounts_params)
-            .unwrap_or_else(|_| panic!("create mounts error"));
-
-        // 创建 version 文件
-        let version_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("version")
-            .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
-            .ftype(ProcFileType::ProcVersion)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(version_params)
-            .unwrap_or_else(|_| panic!("create version error"));
-
-        let self_dir = result
-            .root_inode()
-            .create("self", FileType::Dir, ModeType::from_bits_truncate(0o555))
-            .unwrap();
-
-        let exe_params = ProcFileCreationParams::builder()
-            .parent(self_dir)
-            .name("exe")
-            .file_type(FileType::SymLink)
-            .ftype(ProcFileType::ProcExe)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(exe_params)
-            .unwrap_or_else(|_| panic!("create exe error"));
-
-        return result;
-    }
-
-    /// @brief 进程注册函数
-    /// @usage 在进程中调用并创建进程对应文件
-    pub fn register_pid(&self, pid: RawPid) -> Result<(), SystemError> {
-        // 获取当前inode
-        let inode = self.root_inode();
-        // 创建对应进程文件夹
-        let pid_dir = inode.create(
-            &pid.to_string(),
-            FileType::Dir,
-            ModeType::from_bits_truncate(0o555),
-        )?;
-        // 创建相关文件
-        // status文件
-        let status_binding = pid_dir.create(
-            "status",
-            FileType::File,
-            ModeType::from_bits_truncate(0o444),
-        )?;
-        let status_file: &LockedProcFSInode = status_binding
-            .as_any_ref()
-            .downcast_ref::<LockedProcFSInode>()
-            .unwrap();
-        status_file.0.lock().fdata.pid = Some(pid);
-        status_file.0.lock().fdata.ftype = ProcFileType::ProcStatus;
-
-        // exe文件
-        let exe_binding = pid_dir.create_with_data(
-            "exe",
-            FileType::SymLink,
-            ModeType::from_bits_truncate(0o444),
-            0,
-        )?;
-        let exe_file = exe_binding
-            .as_any_ref()
-            .downcast_ref::<LockedProcFSInode>()
-            .unwrap();
-        exe_file.0.lock().fdata.pid = Some(pid);
-        exe_file.0.lock().fdata.ftype = ProcFileType::ProcExe;
-
-        // fd dir
-        let fd = pid_dir.create("fd", FileType::Dir, ModeType::from_bits_truncate(0o555))?;
-        let fd = fd.as_any_ref().downcast_ref::<LockedProcFSInode>().unwrap();
-        fd.0.lock().fdata.ftype = ProcFileType::ProcFdDir;
-        //todo: 创建其他文件
-
-        return Ok(());
-    }
-
-    /// @brief 解除进程注册
-    ///
-    pub fn unregister_pid(&self, pid: RawPid) -> Result<(), SystemError> {
-        // 获取当前inode
-        let proc: Arc<dyn IndexNode> = self.root_inode();
-        // 获取进程文件夹
-        let pid_dir: Arc<dyn IndexNode> = proc.find(&pid.to_string())?;
-        // 删除进程文件夹下文件
-        pid_dir.unlink("status")?;
-        pid_dir.unlink("exe")?;
-        pid_dir.rmdir("fd")?;
-
-        // 查看进程文件是否还存在
-        // let pf= pid_dir.find("status").expect("Cannot find status");
-
-        // 删除进程文件夹
-        proc.unlink(&pid.to_string())?;
-
-        return Ok(());
-    }
-}
-
-impl LockedProcFSInode {
-    fn dynamical_find_fd(&self, fd: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // ::log::info!("ProcFS: Dynamically opening fd files for current process.");
-        let fd = fd.parse::<i32>().map_err(|_| SystemError::EINVAL)?;
-        let pcb = ProcessManager::current_pcb();
-        let fd_table = pcb.fd_table();
-        let fd_table = fd_table.read();
-        let file = fd_table.get_file_by_fd(fd);
-        if file.is_some() {
-            let _ = self.unlink(&fd.to_string());
-            let fd_file = self.create(
-                &fd.to_string(),
-                FileType::SymLink,
-                ModeType::from_bits_truncate(0o444),
-            )?;
-            let fd_file_proc = fd_file
-                .as_any_ref()
-                .downcast_ref::<LockedProcFSInode>()
-                .unwrap();
-            fd_file_proc.0.lock().fdata.fd = fd;
-            fd_file_proc.0.lock().fdata.ftype = ProcFileType::ProcFdFile;
-            return Ok(fd_file);
-        } else {
-            return Err(SystemError::ENOENT);
-        }
-    }
-
-    fn dynamical_list_fd(&self) -> Result<Vec<String>, SystemError> {
-        // ::log::info!("ProcFS: Dynamically listing fd files for current process");
-        let pcb = ProcessManager::current_pcb();
-        let fd_table = pcb.fd_table();
-        let fd_table = fd_table.read();
-        let res = fd_table.iter().map(|(fd, _)| fd.to_string()).collect();
-        return Ok(res);
-    }
-}
-
-impl IndexNode for LockedProcFSInode {
-    fn open(
-        &self,
-        mut data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
-    ) -> Result<(), SystemError> {
-        // 加锁
-        let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
-        let proc_ty = inode.fdata.ftype;
-
-        // 如果inode类型为文件夹，则直接返回成功
-        if let FileType::Dir = inode.metadata.file_type {
-            return Ok(());
-        }
-        let mut private_data = ProcfsFilePrivateData::new();
-        // 根据文件类型获取相应数据
-        let file_size = match proc_ty {
-            ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
-            ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
-            ProcFileType::ProcExe => inode.open_exe(&mut private_data)?,
-            ProcFileType::ProcMounts => inode.open_mounts(&mut private_data)?,
-            ProcFileType::ProcVersion => inode.open_version(&mut private_data)?,
-            ProcFileType::Default => inode.data.len() as i64,
-            ProcFileType::ProcSelf => inode.open_self(&mut private_data)?,
-            _ => 0,
-        };
-        *data = FilePrivateData::Procfs(private_data);
-        // 更新metadata里面的文件大小数值
-        inode.metadata.size = file_size;
-        drop(inode);
-        return Ok(());
-    }
-
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
-        let mut guard = self.0.lock();
-        if guard.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        let name = DName::from(name);
-        guard.children.remove(&name);
-        return Ok(());
-    }
-
-    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let parent = self.0.lock().parent.upgrade().ok_or(SystemError::ENOENT)?;
-        return Ok(parent as Arc<dyn IndexNode>);
-    }
-
-    fn close(&self, mut data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        let guard: SpinLockGuard<ProcFSInode> = self.0.lock();
-        // 如果inode类型为文件夹，则直接返回成功
-        if let FileType::Dir = guard.metadata.file_type {
-            return Ok(());
-        }
-        // 释放data
-        *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
-
-        return Ok(());
-    }
-
-    fn read_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
-        // 加锁
-        let inode = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-
-        // 根据文件类型读取相应数据
-        match inode.fdata.ftype {
-            ProcFileType::ProcStatus
-            | ProcFileType::ProcMeminfo
-            | ProcFileType::ProcMounts
-            | ProcFileType::ProcVersion => {
-                // 获取数据信息
-                let mut private_data = match &*data {
-                    FilePrivateData::Procfs(p) => p.clone(),
-                    _ => {
-                        panic!("ProcFS: FilePrivateData mismatch!");
-                    }
-                };
-                return inode.proc_read(offset, len, buf, &mut private_data);
-            }
-            ProcFileType::ProcExe => return inode.read_exe_link(buf),
-            ProcFileType::ProcSelf => return inode.read_self_link(buf),
-            ProcFileType::ProcFdFile => return inode.read_fd_link(buf),
-
-            _ => (),
-        };
-
-        // 默认读取
-        let start = inode.data.len().min(offset);
-        let end = inode.data.len().min(offset + len);
-
-        // buffer空间不足
-        if buf.len() < (end - start) {
-            return Err(SystemError::ENOBUFS);
-        }
-
-        // 拷贝数据
-        let src = &inode.data[start..end];
-        buf[0..src.len()].copy_from_slice(src);
-        return Ok(src.len());
-    }
-
-    fn write_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
-
-    fn fs(&self) -> Arc<dyn FileSystem> {
-        return self.0.lock().fs.upgrade().unwrap();
-    }
-
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn metadata(&self) -> Result<Metadata, SystemError> {
-        let inode = self.0.lock();
-        let metadata = inode.metadata.clone();
-        return Ok(metadata);
-    }
-
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-        inode.metadata.atime = metadata.atime;
-        inode.metadata.mtime = metadata.mtime;
-        inode.metadata.ctime = metadata.ctime;
-        inode.metadata.btime = metadata.btime;
-        inode.metadata.mode = metadata.mode;
-        inode.metadata.uid = metadata.uid;
-        inode.metadata.gid = metadata.gid;
-
-        return Ok(());
-    }
-
-    fn resize(&self, len: usize) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-        if inode.metadata.file_type == FileType::File {
-            inode.data.resize(len, 0);
-            return Ok(());
-        } else {
-            return Err(SystemError::EINVAL);
-        }
-    }
-
-    fn create_with_data(
-        &self,
-        name: &str,
-        file_type: FileType,
-        mode: ModeType,
-        data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // 获取当前inode
-        let mut inode = self.0.lock();
-        // 如果当前inode不是文件夹，则返回
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        let name = DName::from(name);
-        // 如果有重名的，则返回
-        if inode.children.contains_key(&name) {
-            return Err(SystemError::EEXIST);
-        }
-
-        // 创建inode
-        let result: Arc<LockedProcFSInode> =
-            Arc::new(LockedProcFSInode(SpinLock::new(ProcFSInode {
-                parent: inode.self_ref.clone(),
-                self_ref: Weak::default(),
-                children: BTreeMap::new(),
-                data: Vec::new(),
-                metadata: Metadata {
-                    dev_id: 0,
-                    inode_id: generate_inode_id(),
-                    size: 0,
-                    blk_size: 0,
-                    blocks: 0,
-                    atime: PosixTimeSpec::default(),
-                    mtime: PosixTimeSpec::default(),
-                    ctime: PosixTimeSpec::default(),
-                    btime: PosixTimeSpec::default(),
-                    file_type,
-                    mode,
-                    nlinks: 1,
-                    uid: 0,
-                    gid: 0,
-                    raw_dev: DeviceNumber::from(data as u32),
-                },
-                fs: inode.fs.clone(),
-                fdata: InodeInfo {
-                    pid: None,
-                    ftype: ProcFileType::Default,
-                    fd: -1,
-                },
-                dname: name.clone(),
-            })));
-
-        // 初始化inode的自引用的weak指针
-        result.0.lock().self_ref = Arc::downgrade(&result);
-
-        // 将子inode插入父inode的B树中
-        inode.children.insert(name, result.clone());
-
-        return Ok(result);
-    }
-
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        let other: &LockedProcFSInode = other
-            .downcast_ref::<LockedProcFSInode>()
-            .ok_or(SystemError::EPERM)?;
-        let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
-        let mut other_locked: SpinLockGuard<ProcFSInode> = other.0.lock();
-
-        // 如果当前inode不是文件夹，那么报错
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        // 如果另一个inode是文件夹，那么也报错
-        if other_locked.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-        let name = DName::from(name);
-        // 如果当前文件夹下已经有同名文件，也报错。
-        if inode.children.contains_key(&name) {
-            return Err(SystemError::EEXIST);
-        }
-
-        inode
-            .children
-            .insert(name, other_locked.self_ref.upgrade().unwrap());
-
-        // 增加硬链接计数
-        other_locked.metadata.nlinks += 1;
-        return Ok(());
-    }
-
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
-        let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
-        // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        // 不允许删除当前文件夹，也不允许删除上一个目录
-        if name == "." || name == ".." {
-            return Err(SystemError::ENOTEMPTY);
-        }
-        let name = DName::from(name);
-        // 获得要删除的文件的inode
-        let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
-
-        // 减少硬链接计数
-        to_delete.0.lock().metadata.nlinks -= 1;
-
-        // 在当前目录中删除这个子目录项
-        inode.children.remove(&name);
-
-        return Ok(());
-    }
-
-    fn move_to(
-        &self,
-        _old_name: &str,
-        _target: &Arc<dyn IndexNode>,
-        _new_name: &str,
-    ) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
-
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if self.0.lock().metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        match name {
-            "" | "." => {
-                return Ok(self
-                    .0
-                    .lock()
-                    .self_ref
-                    .upgrade()
-                    .ok_or(SystemError::ENOENT)?);
-            }
-
-            ".." => {
-                return Ok(self.0.lock().parent.upgrade().ok_or(SystemError::ENOENT)?);
-            }
-
-            name => {
-                if self.0.lock().fdata.ftype == ProcFileType::ProcFdDir {
-                    return self.dynamical_find_fd(name);
-                }
-                // 在子目录项中查找
-                return Ok(self
-                    .0
-                    .lock()
-                    .children
-                    .get(&DName::from(name))
-                    .ok_or(SystemError::ENOENT)?
-                    .clone());
-            }
-        }
-    }
-
-    fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
-        let inode: SpinLockGuard<ProcFSInode> = self.0.lock();
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        match ino.into() {
-            0 => {
-                return Ok(String::from("."));
-            }
-            1 => {
-                return Ok(String::from(".."));
-            }
-            ino => {
-                // 暴力遍历所有的children，判断inode id是否相同
-                // TODO: 优化这里，这个地方性能很差！
-                let mut key: Vec<String> = inode
-                    .children
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        if v.0.lock().metadata.inode_id.into() == ino {
-                            Some(k.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                match key.len() {
-                    0 => {
-                        return Err(SystemError::ENOENT);
-                    }
-                    1 => {
-                        return Ok(key.remove(0));
-                    }
-                    _ => panic!(
-                        "Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
-                        key_len = key.len(),
-                        inode_id = inode.metadata.inode_id,
-                        to_find = ino
-                    ),
-                }
-            }
-        }
-    }
-
-    fn list(&self) -> Result<Vec<String>, SystemError> {
-        let info = self.metadata()?;
-        if info.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        let mut keys = Vec::new();
-        keys.push(String::from("."));
-        keys.push(String::from(".."));
-
-        if self.0.lock().fdata.ftype == ProcFileType::ProcFdDir {
-            return self.dynamical_list_fd();
-        }
-
-        keys.append(
-            &mut self
-                .0
-                .lock()
-                .children
-                .keys()
-                .map(ToString::to_string)
-                .collect(),
-        );
-
-        return Ok(keys);
-    }
-
-    fn dname(&self) -> Result<DName, SystemError> {
-        Ok(self.0.lock().dname.clone())
-    }
-}
-
-/// @brief 向procfs注册进程
-#[inline(never)]
-pub fn procfs_register_pid(pid: RawPid) -> Result<(), SystemError> {
-    let root_inode = ProcessManager::current_mntns().root_inode();
-    let procfs_inode = root_inode.find("proc")?;
-
-    let procfs_inode = procfs_inode
-        .downcast_ref::<LockedProcFSInode>()
-        .expect("Failed to find procfs' root inode");
-    let fs = procfs_inode.fs();
-    let procfs: &ProcFS = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
-
-    // 调用注册函数
-    procfs.register_pid(pid)?;
-
-    Ok(())
-}
-
-/// @brief 在ProcFS中,解除进程的注册
-#[inline(never)]
-pub fn procfs_unregister_pid(pid: RawPid) -> Result<(), SystemError> {
-    let root_inode = ProcessManager::current_mntns().root_inode();
-    // 获取procfs实例
-    let procfs_inode: Arc<dyn IndexNode> = root_inode.find("proc")?;
-
-    let procfs_inode: &LockedProcFSInode = procfs_inode
-        .downcast_ref::<LockedProcFSInode>()
-        .expect("Failed to find procfs' root inode");
-    let fs: Arc<dyn FileSystem> = procfs_inode.fs();
-    let procfs: &ProcFS = fs.as_any_ref().downcast_ref::<ProcFS>().unwrap();
-
-    // 调用解除注册函数
-    return procfs.unregister_pid(pid);
 }
 
 pub fn procfs_init() -> Result<(), SystemError> {
@@ -1216,23 +43,664 @@ pub fn procfs_init() -> Result<(), SystemError> {
     let mut result = None;
     INIT.call_once(|| {
         info!("Initializing ProcFS...");
-        // 创建 procfs 实例
-        let procfs: Arc<ProcFS> = ProcFS::new();
+
+        let procfs = ProcFS::new();
+        unsafe { PROCFS_INSTANCE = Some(procfs) };
         let root_inode = ProcessManager::current_mntns().root_inode();
-        // procfs 挂载
-        let mntfs = root_inode
+        
+        root_inode
             .mkdir("proc", ModeType::from_bits_truncate(0o755))
-            .expect("Unabled to find /proc")
-            .mount(procfs, MountFlags::empty())
+            .expect("Unable to create /proc")
+            .mount(procfs_instance().fs().clone(), MountFlags::empty())
             .expect("Failed to mount at /proc");
-        let ino = root_inode.metadata().unwrap().inode_id;
-        let mount_path = Arc::new(MountPath::from("/proc"));
-        ProcessManager::current_mntns()
-            .add_mount(Some(ino), mount_path, mntfs)
-            .expect("Failed to add mount for /proc");
-        info!("ProcFS mounted.");
+        
+        match process_info::register_all_current_processes() {
+            Ok(_) => info!("Successfully registered all current processes"),
+            Err(e) => warn!("Failed to register some processes: {:?}", e),
+        }
+        
+        info!("ProcFS mounted and initialized");
         result = Some(Ok(()));
     });
 
     return result.unwrap();
+}
+
+pub fn procfs_register_pid(pid: ProcessId) -> Result<(), SystemError> {
+    if let Some(procfs) = unsafe { PROCFS_INSTANCE.as_ref() } {
+        procfs.create_single_process_directory(pid)?;
+    }
+    Ok(())
+}
+
+pub fn procfs_unregister_pid(pid: ProcessId) -> Result<(), SystemError> {
+    if let Some(procfs) = unsafe { PROCFS_INSTANCE.as_ref() } {
+        procfs.remove_process_directory(pid)?
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum ProcFSKernPrivateData {
+    /// 系统信息文件
+    SystemInfo(ProcSystemInfoType),
+    /// 进程信息文件 
+    ProcessInfo(ProcessId, ProcProcessInfoType),
+    /// 系统配置文件
+    SysConfig(ProcSysConfigType),
+    /// 目录类型
+    Dir(ProcDirType),
+    /// 进程列表
+    ProcessList(Vec<ProcessId>),
+}
+
+impl ProcFSKernPrivateData {
+    /// 统一的读取接口
+    pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
+        use ::log::info;
+        // info!("ProcFSKernPrivateData::callback_read called, type: {:?}", self);
+        
+        let content = match self {
+            ProcFSKernPrivateData::SystemInfo(info_type) => {
+                // info!("Getting system info for type: {:?}", info_type);
+                get_system_info(*info_type)?
+            }
+            ProcFSKernPrivateData::ProcessInfo(pid, info_type) => {
+                // info!("Getting process info for PID: {}, type: {:?}", pid.data(), info_type);
+                
+                if ProcessManager::find(*pid).is_none() {
+                    return Err(SystemError::ESRCH);
+                }
+                
+                get_process_info(*pid, *info_type)?
+            }
+            ProcFSKernPrivateData::SysConfig(config_type) => {
+                get_sys_config(*config_type)?
+            }
+            ProcFSKernPrivateData::Dir(dir_type) => {
+                match dir_type {
+                    ProcDirType::ProcessDir(pid) => {
+                        if ProcessManager::find(*pid).is_none() {
+                            return Err(SystemError::ENOENT);
+                        }
+                        return Err(SystemError::EISDIR);
+                    }
+                    _ => return Err(SystemError::EISDIR),
+                }
+            }
+            ProcFSKernPrivateData::ProcessList(process_list) => {
+                let mut content = String::new();
+                for pid in process_list {
+                    if ProcessManager::find(*pid).is_some() {
+                        content.push_str(&format!("{}\n", pid.data()));
+                    }
+                }
+                content
+            }
+        };
+
+        // info!("Generated content length: {}", content.len());
+        
+        let content_bytes = content.as_bytes();
+        if offset >= content_bytes.len() {
+            return Ok(0);
+        }
+
+        let len = core::cmp::min(buf.len(), content_bytes.len() - offset);
+        buf[..len].copy_from_slice(&content_bytes[offset..offset + len]);
+        // info!("Returning {} bytes", len);
+        Ok(len)
+    }
+
+    /// 统一的写入接口
+    pub fn callback_write(&self, buf: &[u8], _offset: usize) -> Result<usize, SystemError> {
+        match self {
+            ProcFSKernPrivateData::SysConfig(config_type) => {
+                set_sys_config(*config_type, buf)
+            }
+            _ => Err(SystemError::EPERM), 
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcFS {
+    /// 根inode
+    root_inode: Arc<KernFSInode>,
+    /// kernfs实例
+    kernfs: Arc<KernFS>,
+}
+
+impl ProcFS {
+    pub fn new() -> Self {
+        let kernfs: Arc<KernFS> = KernFS::new("proc");
+        let root_inode: Arc<KernFSInode> = kernfs.root_inode().downcast_arc().unwrap();
+        
+        let procfs = ProcFS { root_inode, kernfs };
+        
+        init_system_configs();
+        
+        procfs.init_directory_structure().expect("Failed to initialize ProcFS");
+        
+        procfs
+    }
+
+    pub fn root_inode(&self) -> &Arc<KernFSInode> {
+        &self.root_inode
+    }
+
+    pub fn fs(&self) -> &Arc<KernFS> {
+        &self.kernfs
+    }
+    
+    pub fn get_current_process_list(&self) -> Result<Vec<ProcessId>, SystemError> {
+        if !ProcessManager::initialized() {
+            // info!("Process management system not initialized yet, returning empty process list");
+            return Ok(Vec::new());
+        }
+        
+        let all_pids = ProcessManager::get_all_processes();
+        
+        let mut process_list = Vec::new();
+        for pid in all_pids {
+            if ProcessManager::find(pid).is_some() {
+                process_list.push(pid);
+            }
+        }
+        
+        // info!("Found {} active processes", process_list.len());
+        Ok(process_list)
+    }
+
+    pub fn readdir_root(&self, offset: usize) -> Result<Vec<String>, SystemError> {
+        let mut entries = Vec::new();
+        
+        let static_entries = vec![
+            ".", "..", "version", "cpuinfo", "meminfo", "uptime", 
+            "loadavg", "stat", "interrupts", "devices", "filesystems", 
+            "mounts", "cmdline", "sys"
+        ];
+        
+        for (i, entry) in static_entries.iter().enumerate() {
+            if i >= offset {
+                entries.push(entry.to_string());
+            }
+        }
+        
+        let current_processes = self.get_current_process_list()?;
+        let process_offset = if offset > static_entries.len() { 
+            offset - static_entries.len() 
+        } else { 
+            0 
+        };
+        
+        for (i, pid) in current_processes.iter().enumerate() {
+            if i >= process_offset {
+                entries.push(pid.to_string());
+            }
+        }
+        
+        Ok(entries)
+    }
+
+    pub fn custom_find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match self.root_inode.find(name) {
+            Ok(inode) => return Ok(inode),
+            Err(SystemError::ENOENT) => {
+                if let Ok(pid_num) = name.parse::<u32>() {
+                    let pid = ProcessId::new(pid_num.try_into().map_err(|_| SystemError::EINVAL)?);
+                    if ProcessManager::find(pid).is_some() {
+                        match self.create_single_process_directory(pid) {
+                            Ok(process_dir) => {
+                                info!("Dynamically created /proc/{} directory", pid.data());
+                                return Ok(process_dir);
+                            }
+                            Err(e) => {
+                                warn!("Failed to create process directory for PID {}: {:?}", pid.data(), e);
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                return Err(SystemError::ENOENT);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+ 
+    fn init_directory_structure(&self) -> Result<(), SystemError> {
+        let root = &self.root_inode;
+        
+        self.create_system_files(root)?;
+        
+        self.init_dynamic_process_discovery(root)?;
+        
+        self.create_sys_directory(root)?;
+        
+        Ok(())
+    }
+    
+    fn init_dynamic_process_discovery(&self, _root: &Arc<KernFSInode>) -> Result<(), SystemError> {
+        // info!("初始化动态进程发现机制");
+        Ok(())
+    }
+    
+    pub fn find_process_directory(&self, name: &str) -> Result<Arc<KernFSInode>, SystemError> {
+        let pid = name.parse::<u32>().map_err(|_| SystemError::ENOENT)?;
+        let process_id = ProcessId::new(pid.try_into().unwrap());
+        
+        let _pcb = ProcessManager::find(process_id).ok_or(SystemError::ENOENT)?;
+        
+        if let Ok(existing_dir) = self.root_inode.find(name) {
+            return Ok(existing_dir.downcast_arc::<KernFSInode>().ok_or(SystemError::EINVAL)?);
+        }
+        
+        // info!("动态创建进程目录: /proc/{}", pid);
+        self.create_single_process_directory(process_id)
+    }
+
+    fn create_system_files(&self, root: &Arc<KernFSInode>) -> Result<(), SystemError> {
+        self.create_system_info_file(root, "version", ProcSystemInfoType::Version, 
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "cpuinfo", ProcSystemInfoType::CpuInfo,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "meminfo", ProcSystemInfoType::MemInfo,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "uptime", ProcSystemInfoType::Uptime,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "loadavg", ProcSystemInfoType::LoadAvg,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "stat", ProcSystemInfoType::Stat,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "interrupts", ProcSystemInfoType::Interrupts,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "devices", ProcSystemInfoType::Devices,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "filesystems", ProcSystemInfoType::FileSystems,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "mounts", ProcSystemInfoType::Mounts,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_system_info_file(root, "cmdline", ProcSystemInfoType::CmdLine,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        Ok(())
+    }
+
+    pub fn create_system_info_file(
+        &self,
+        parent: &Arc<KernFSInode>,
+        name: &str,
+        info_type: ProcSystemInfoType,
+        mode: ModeType,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let private_data = ProcFSKernPrivateData::SystemInfo(info_type);
+        
+        parent.add_file(
+            name.to_string(),
+            mode,
+            Some(4096),
+            Some(KernInodePrivateData::ProcFS(private_data)),
+            Some(&PROCFS_CALLBACK_RO),
+        )
+    }
+
+    pub fn create_dir(
+        &self,
+        parent: &Arc<KernFSInode>,
+        name: &str,
+        dir_type: ProcDirType,
+        mode: ModeType,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let private_data = ProcFSKernPrivateData::Dir(dir_type);
+        
+        parent.add_dir(
+            name.to_string(),
+            mode,
+            Some(KernInodePrivateData::ProcFS(private_data)),
+            None,
+        )
+    }
+
+    pub fn create_single_process_directory(&self, pid: ProcessId) -> Result<Arc<KernFSInode>, SystemError> {
+        let _process = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+        
+        let pid_str = pid.to_string();
+        let process_dir = self.create_dir(&self.root_inode, &pid_str, 
+            ProcDirType::ProcessDir(pid),
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+
+        self.create_process_info_file(&process_dir, "stat", pid, ProcProcessInfoType::Stat,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_process_info_file(&process_dir, "status", pid, ProcProcessInfoType::Status,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_process_info_file(&process_dir, "cmdline", pid, ProcProcessInfoType::CmdLine,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_process_info_file(&process_dir, "comm", pid, ProcProcessInfoType::Comm,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?;
+        
+        self.create_process_info_file(&process_dir, "environ", pid, ProcProcessInfoType::Environ,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o400))?;
+        
+        self.create_process_info_file(&process_dir, "maps", pid, ProcProcessInfoType::Maps,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_process_info_file(&process_dir, "limits", pid, ProcProcessInfoType::Limits,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_process_info_file(&process_dir, "statm", pid, ProcProcessInfoType::StatM,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_process_info_file(&process_dir, "oom_score", pid, ProcProcessInfoType::OomScore,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_process_info_file(&process_dir, "oom_adj", pid, ProcProcessInfoType::OomAdj,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?;
+
+        self.create_process_info_file(&process_dir, "cgroup", pid, ProcProcessInfoType::Cgroup,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+        
+        self.create_process_info_file(&process_dir, "oom_score_adj", pid, ProcProcessInfoType::OomScoreAdj,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?;
+        
+        self.create_process_info_file(&process_dir, "loginuid", pid, ProcProcessInfoType::Loginuid,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?;
+        
+        self.create_process_info_file(&process_dir, "sessionid", pid, ProcProcessInfoType::Sessionid,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?;
+
+        self.create_process_ns_directory(&process_dir, pid)?;
+        
+        // 创建文件描述符目录（容器文件系统隔离）
+        // TODO: 需要完善文件描述符管理后启用
+        // self.create_process_fd_directory(&process_dir, pid)?;
+        
+        // info!("Created /proc/{} directory with all process files for verified process", pid);
+        Ok(process_dir)
+    }
+
+    pub fn create_process_info_file(
+        &self,
+        parent: &Arc<KernFSInode>,
+        name: &str,
+        pid: ProcessId,
+        info_type: ProcProcessInfoType,
+        mode: ModeType,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let private_data = ProcFSKernPrivateData::ProcessInfo(pid, info_type);
+        
+        parent.add_file(
+            name.to_string(),
+            mode,
+            Some(4096),
+            Some(KernInodePrivateData::ProcFS(private_data)),
+            Some(&PROCFS_CALLBACK_RO),
+        )
+    }
+
+    pub fn create_process_ns_directory(&self, process_dir: &Arc<KernFSInode>, pid: ProcessId) -> Result<Arc<KernFSInode>, SystemError> {
+        let ns_dir = self.create_dir(process_dir, "ns", ProcDirType::ProcessNsDir(pid),
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+        
+        self.create_process_info_file(&ns_dir, "mnt", pid, ProcProcessInfoType::NsMnt,
+            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777))?;
+        
+        self.create_process_info_file(&ns_dir, "pid", pid, ProcProcessInfoType::NsPid,
+            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777))?;
+        
+        // 预留其他namespace类型的符号链接
+        // TODO: 等DragonOS namespace子系统完善后启用
+        // 当前返回占位符数据
+        self.create_process_info_file(&ns_dir, "cgroup", pid, ProcProcessInfoType::NsCgroup,
+            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777))?;
+        
+        self.create_process_info_file(&ns_dir, "ipc", pid, ProcProcessInfoType::NsIpc,
+            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777))?;
+        
+        self.create_process_info_file(&ns_dir, "net", pid, ProcProcessInfoType::NsNet,
+            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777))?;
+        
+        self.create_process_info_file(&ns_dir, "user", pid, ProcProcessInfoType::NsUser,
+            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777))?;
+        
+        self.create_process_info_file(&ns_dir, "uts", pid, ProcProcessInfoType::NsUts,
+            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777))?;
+        
+        // 预留接口
+        self.create_process_info_file(&ns_dir, "time", pid, ProcProcessInfoType::NsTime,
+            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777))?;
+        
+        // info!("Created /proc/{}/ns directory with namespace symlinks", pid);
+        Ok(ns_dir)
+    }
+
+    pub fn remove_process_directory(&self, pid: ProcessId) -> Result<(), SystemError> {
+        let pid_str = pid.to_string();
+        if let Ok(process_dir) = self.root_inode.find(&pid_str) {
+            if let Some(kernfs_inode) = process_dir.downcast_arc::<KernFSInode>() {
+                kernfs_inode.remove_inode_include_self();
+                // info!("Successfully removed /proc/{} directory and all its contents", pid);
+            } else {
+                warn!("Failed to downcast process_dir to KernFSInode for PID {}", pid);
+                return Err(SystemError::EINVAL);
+            }
+        }
+        Ok(())
+    }
+
+    fn create_sys_directory(&self, root: &Arc<KernFSInode>) -> Result<(), SystemError> {
+        let sys_dir = self.create_dir(root, "sys", ProcDirType::SysDir,
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+
+        self.create_sys_kernel_directory(&sys_dir)?;
+      
+        self.create_sys_vm_directory(&sys_dir)?;
+   
+        self.create_sys_fs_directory(&sys_dir)?;
+        
+        self.create_sys_net_directory(&sys_dir)?;
+        
+        // info!("Created /proc/sys directory structure");
+        Ok(())
+    }
+
+    fn create_sys_kernel_directory(&self, sys_dir: &Arc<KernFSInode>) -> Result<(), SystemError> {
+        let kernel_dir = self.create_dir(sys_dir, "kernel", ProcDirType::SysKernelDir,
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+
+        self.create_sys_config_file(&kernel_dir, "version", ProcSysConfigType::KernelVersion,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?; // 只读
+        
+        self.create_sys_config_file(&kernel_dir, "hostname", ProcSysConfigType::KernelHostname,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&kernel_dir, "domainname", ProcSysConfigType::KernelDomainname,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&kernel_dir, "ostype", ProcSysConfigType::KernelOstype,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?; // 只读
+        
+        self.create_sys_config_file(&kernel_dir, "osrelease", ProcSysConfigType::KernelOsrelease,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?; // 只读
+        
+        self.create_sys_config_file(&kernel_dir, "panic", ProcSysConfigType::KernelPanic,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&kernel_dir, "panic_on_oops", ProcSysConfigType::KernelPanicOnOops,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&kernel_dir, "pid_max", ProcSysConfigType::KernelPidMax,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&kernel_dir, "threads-max", ProcSysConfigType::KernelThreadsMax,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+
+        let random_dir = self.create_dir(&kernel_dir, "random", ProcDirType::SysKernelDir,
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+        
+        self.create_sys_config_file(&random_dir, "boot_id", ProcSysConfigType::KernelRandomBootId,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?; // 只读
+        
+        // info!("Created /proc/sys/kernel directory");
+        Ok(())
+    }
+
+    fn create_sys_vm_directory(&self, sys_dir: &Arc<KernFSInode>) -> Result<(), SystemError> {
+        let vm_dir = self.create_dir(sys_dir, "vm", ProcDirType::SysVmDir,
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+        
+        self.create_sys_config_file(&vm_dir, "swappiness", ProcSysConfigType::VmSwappiness,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&vm_dir, "dirty_ratio", ProcSysConfigType::VmDirtyRatio,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&vm_dir, "dirty_background_ratio", ProcSysConfigType::VmDirtyBackgroundRatio,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&vm_dir, "drop_caches", ProcSysConfigType::VmDropCaches,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o200))?; // 只写
+        
+        self.create_sys_config_file(&vm_dir, "overcommit_memory", ProcSysConfigType::VmOvercommitMemory,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&vm_dir, "overcommit_ratio", ProcSysConfigType::VmOvercommitRatio,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&vm_dir, "min_free_kbytes", ProcSysConfigType::VmMinFreeKbytes,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        // info!("Created /proc/sys/vm directory");
+        Ok(())
+    }
+
+    fn create_sys_fs_directory(&self, sys_dir: &Arc<KernFSInode>) -> Result<(), SystemError> {
+        let fs_dir = self.create_dir(sys_dir, "fs", ProcDirType::SysFsDir,
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+        
+        self.create_sys_config_file(&fs_dir, "file-max", ProcSysConfigType::FsFileMax,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&fs_dir, "file-nr", ProcSysConfigType::FsFileNr,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?; // 只读
+        
+        self.create_sys_config_file(&fs_dir, "inode-max", ProcSysConfigType::FsInodeMax,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&fs_dir, "inode-nr", ProcSysConfigType::FsInodeNr,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o444))?; // 只读
+        
+        self.create_sys_config_file(&fs_dir, "aio-max-nr", ProcSysConfigType::FsAioMaxNr,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        // info!("Created /proc/sys/fs directory");
+        Ok(())
+    }
+
+    fn create_sys_net_directory(&self, sys_dir: &Arc<KernFSInode>) -> Result<(), SystemError> {
+        let net_dir = self.create_dir(sys_dir, "net", ProcDirType::SysNetDir,
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+        
+        self.create_sys_net_core_directory(&net_dir)?;
+        
+        self.create_sys_net_ipv4_directory(&net_dir)?;
+        
+        // info!("Created /proc/sys/net directory");
+        Ok(())
+    }
+
+    fn create_sys_net_core_directory(&self, net_dir: &Arc<KernFSInode>) -> Result<(), SystemError> {
+        let core_dir = self.create_dir(net_dir, "core", ProcDirType::SysNetCoreDir,
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+        
+        self.create_sys_config_file(&core_dir, "rmem_default", ProcSysConfigType::NetCoreRmemDefault,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&core_dir, "rmem_max", ProcSysConfigType::NetCoreRmemMax,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&core_dir, "wmem_default", ProcSysConfigType::NetCoreWmemDefault,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&core_dir, "wmem_max", ProcSysConfigType::NetCoreWmemMax,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&core_dir, "somaxconn", ProcSysConfigType::NetCoreSomaxconn,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&core_dir, "netdev_max_backlog", ProcSysConfigType::NetCoreNetdevMaxBacklog,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        // info!("Created /proc/sys/net/core directory");
+        Ok(())
+    }
+
+    fn create_sys_net_ipv4_directory(&self, net_dir: &Arc<KernFSInode>) -> Result<(), SystemError> {
+        let ipv4_dir = self.create_dir(net_dir, "ipv4", ProcDirType::SysNetIpv4Dir,
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555))?;
+        
+        self.create_sys_config_file(&ipv4_dir, "ip_forward", ProcSysConfigType::NetIpv4IpForward,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&ipv4_dir, "tcp_syncookies", ProcSysConfigType::NetIpv4TcpSyncookies,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&ipv4_dir, "tcp_timestamps", ProcSysConfigType::NetIpv4TcpTimestamps,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&ipv4_dir, "tcp_window_scaling", ProcSysConfigType::NetIpv4TcpWindowScaling,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&ipv4_dir, "tcp_keepalive_time", ProcSysConfigType::NetIpv4TcpKeepaliveTime,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        self.create_sys_config_file(&ipv4_dir, "tcp_fin_timeout", ProcSysConfigType::NetIpv4TcpFinTimeout,
+            ModeType::S_IFREG | ModeType::from_bits_truncate(0o644))?; // 可读写
+        
+        // info!("Created /proc/sys/net/ipv4 directory");
+        Ok(())
+    }
+
+    pub fn create_sys_config_file(
+        &self,
+        parent: &Arc<KernFSInode>,
+        name: &str,
+        config_type: ProcSysConfigType,
+        mode: ModeType,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let private_data = ProcFSKernPrivateData::SysConfig(config_type);
+        
+        let callback: Option<&dyn crate::filesystem::kernfs::callback::KernFSCallback> = if mode.contains(ModeType::S_IWUSR) && mode.contains(ModeType::S_IRUSR) {
+            // 可读写文件
+            Some(&PROCFS_CALLBACK_RW)
+        } else if mode.contains(ModeType::S_IWUSR) {
+            // 只写文件
+            Some(&PROCFS_CALLBACK_WO)
+        } else {
+            // 只读文件
+            Some(&PROCFS_CALLBACK_RO)
+        };
+
+        parent.add_file(
+            name.to_string(),
+            mode,
+            Some(4096),
+            Some(KernInodePrivateData::ProcFS(private_data)),
+            callback,
+        )
+    }
 }

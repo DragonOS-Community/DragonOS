@@ -12,7 +12,7 @@ use crate::{
     },
     filesystem::{
         epoll::{event_poll::EPollPrivateData, EPollItem},
-        procfs::ProcfsFilePrivateData,
+        procfs::ProcFSKernPrivateData,
         vfs::FilldirContext,
     },
     ipc::pipe::PipeFsPrivateData,
@@ -27,7 +27,7 @@ pub enum FilePrivateData {
     /// 管道文件私有信息
     Pipefs(PipeFsPrivateData),
     /// procfs文件私有信息
-    Procfs(ProcfsFilePrivateData),
+    Procfs(crate::filesystem::procfs::ProcFSKernPrivateData),
     /// 设备文件的私有信息
     DevFS(DevicePrivateData),
     /// tty设备文件的私有信息

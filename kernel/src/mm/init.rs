@@ -5,6 +5,7 @@ use log::info;
 use crate::{
     arch::MMArch,
     driver::serial::serial8250::send_to_default_serial8250_port,
+    ipc::shm::shm_manager_init,
     filesystem::procfs::kmsg::kmsg_init,
     libs::printk::PrintkWriter,
     mm::{
@@ -53,8 +54,6 @@ pub unsafe fn mm_init() {
     slab_init();
     // enable mmio
     mmio_init();
-    // enable KMSG
-    kmsg_init();
     // enable PAGE_MANAGER
     page_manager_init();
     // enable PAGE_RECLAIMER

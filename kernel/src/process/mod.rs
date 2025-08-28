@@ -57,8 +57,8 @@ use crate::{
     },
     net::socket::SocketInode,
     sched::{
-        completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
-        EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule,
+        DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
+        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
     },
     smp::{
         core::smp_get_processor_id,
@@ -452,9 +452,6 @@ impl ProcessManager {
 
             // 进行进程退出后的工作
             let thread = pcb.thread.write_irqsave();
-            if let Some(addr) = thread.set_child_tid {
-                unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
-            }
 
             if let Some(addr) = thread.clear_child_tid {
                 if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
@@ -467,9 +464,9 @@ impl ProcessManager {
                 }
                 unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
             }
+            compiler_fence(Ordering::SeqCst);
 
             RobustListHead::exit_robust_list(pcb.clone());
-
             // 如果是vfork出来的进程，则需要处理completion
             if thread.vfork_done.is_some() {
                 thread.vfork_done.as_ref().unwrap().complete_all();
@@ -968,7 +965,7 @@ impl ProcessControlBlock {
     /// 请注意，这个值能在中断上下文中读取，但不能被中断上下文修改
     /// 否则会导致死锁
     #[inline(always)]
-    pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo> {
+    pub fn basic(&self) -> RwLockReadGuard<'_, ProcessBasicInfo> {
         return self.basic.read_irqsave();
     }
 
@@ -978,13 +975,13 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn basic_mut(&self) -> RwLockWriteGuard<ProcessBasicInfo> {
+    pub fn basic_mut(&self) -> RwLockWriteGuard<'_, ProcessBasicInfo> {
         return self.basic.write_irqsave();
     }
 
     /// # 获取arch info的锁，同时关闭中断
     #[inline(always)]
-    pub fn arch_info_irqsave(&self) -> SpinLockGuard<ArchPCBInfo> {
+    pub fn arch_info_irqsave(&self) -> SpinLockGuard<'_, ArchPCBInfo> {
         return self.arch_info.lock_irqsave();
     }
 
@@ -997,12 +994,12 @@ impl ProcessControlBlock {
     /// - 在中断上下文中（中断已经禁用），获取arch info的锁。
     /// - 刚刚创建新的pcb
     #[inline(always)]
-    pub unsafe fn arch_info(&self) -> SpinLockGuard<ArchPCBInfo> {
+    pub unsafe fn arch_info(&self) -> SpinLockGuard<'_, ArchPCBInfo> {
         return self.arch_info.lock();
     }
 
     #[inline(always)]
-    pub fn kernel_stack(&self) -> RwLockReadGuard<KernelStack> {
+    pub fn kernel_stack(&self) -> RwLockReadGuard<'_, KernelStack> {
         return self.kernel_stack.read();
     }
 
@@ -1012,7 +1009,7 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn kernel_stack_mut(&self) -> RwLockWriteGuard<KernelStack> {
+    pub fn kernel_stack_mut(&self) -> RwLockWriteGuard<'_, KernelStack> {
         return self.kernel_stack.write();
     }
 
@@ -1022,7 +1019,7 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn worker_private(&self) -> SpinLockGuard<Option<WorkerPrivate>> {
+    pub fn worker_private(&self) -> SpinLockGuard<'_, Option<WorkerPrivate>> {
         return self.worker_private.lock();
     }
 
@@ -1036,7 +1033,7 @@ impl ProcessControlBlock {
         self.fs.read().clone()
     }
 
-    pub fn fs_struct_mut(&self) -> RwLockWriteGuard<Arc<FsStruct>> {
+    pub fn fs_struct_mut(&self) -> RwLockWriteGuard<'_, Arc<FsStruct>> {
         self.fs.write()
     }
 
@@ -1159,19 +1156,19 @@ impl ProcessControlBlock {
     /// 生成进程的名字
     pub fn generate_name(program_path: &str) -> String {
         // Extract just the basename from the program path
-        let name = program_path.split('/').last().unwrap_or(program_path);
+        let name = program_path.split('/').next_back().unwrap_or(program_path);
         name.to_string()
     }
 
-    pub fn sig_info_irqsave(&self) -> RwLockReadGuard<ProcessSignalInfo> {
+    pub fn sig_info_irqsave(&self) -> RwLockReadGuard<'_, ProcessSignalInfo> {
         self.sig_info.read_irqsave()
     }
 
-    pub fn sig_info_upgradable(&self) -> RwLockUpgradableGuard<ProcessSignalInfo> {
+    pub fn sig_info_upgradable(&self) -> RwLockUpgradableGuard<'_, ProcessSignalInfo> {
         self.sig_info.upgradeable_read_irqsave()
     }
 
-    pub fn try_siginfo_irqsave(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
+    pub fn try_siginfo_irqsave(&self, times: u8) -> Option<RwLockReadGuard<'_, ProcessSignalInfo>> {
         for _ in 0..times {
             if let Some(r) = self.sig_info.try_read_irqsave() {
                 return Some(r);
@@ -1181,11 +1178,11 @@ impl ProcessControlBlock {
         return None;
     }
 
-    pub fn sig_info_mut(&self) -> RwLockWriteGuard<ProcessSignalInfo> {
+    pub fn sig_info_mut(&self) -> RwLockWriteGuard<'_, ProcessSignalInfo> {
         self.sig_info.write_irqsave()
     }
 
-    pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<ProcessSignalInfo>> {
+    pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<'_, ProcessSignalInfo>> {
         for _ in 0..times {
             if let Some(r) = self.sig_info.try_write_irqsave() {
                 return Some(r);
@@ -1226,11 +1223,11 @@ impl ProcessControlBlock {
         return has_not_masked;
     }
 
-    pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
+    pub fn sig_struct(&self) -> SpinLockGuard<'_, SignalStruct> {
         self.sig_struct.lock_irqsave()
     }
 
-    pub fn try_sig_struct_irqsave(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
+    pub fn try_sig_struct_irqsave(&self, times: u8) -> Option<SpinLockGuard<'_, SignalStruct>> {
         for _ in 0..times {
             if let Ok(r) = self.sig_struct.try_lock_irqsave() {
                 return Some(r);
@@ -1240,12 +1237,12 @@ impl ProcessControlBlock {
         return None;
     }
 
-    pub fn sig_struct_irqsave(&self) -> SpinLockGuard<SignalStruct> {
+    pub fn sig_struct_irqsave(&self) -> SpinLockGuard<'_, SignalStruct> {
         self.sig_struct.lock_irqsave()
     }
 
     #[inline(always)]
-    pub fn get_robust_list(&self) -> RwLockReadGuard<Option<RobustListHead>> {
+    pub fn get_robust_list(&self) -> RwLockReadGuard<'_, Option<RobustListHead>> {
         return self.robust_list.read_irqsave();
     }
 
@@ -1254,7 +1251,7 @@ impl ProcessControlBlock {
         *self.robust_list.write_irqsave() = new_robust_list;
     }
 
-    pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<Option<AlarmTimer>> {
+    pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<'_, Option<AlarmTimer>> {
         return self.alarm_timer.lock_irqsave();
     }
 
@@ -1268,19 +1265,19 @@ impl ProcessControlBlock {
         drop(old)
     }
 
-    pub fn children_read_irqsave(&self) -> RwLockReadGuard<Vec<RawPid>> {
+    pub fn children_read_irqsave(&self) -> RwLockReadGuard<'_, Vec<RawPid>> {
         self.children.read_irqsave()
     }
 
-    pub fn threads_read_irqsave(&self) -> RwLockReadGuard<ThreadInfo> {
+    pub fn threads_read_irqsave(&self) -> RwLockReadGuard<'_, ThreadInfo> {
         self.thread.read_irqsave()
     }
 
-    pub fn threads_write_irqsave(&self) -> RwLockWriteGuard<ThreadInfo> {
+    pub fn threads_write_irqsave(&self) -> RwLockWriteGuard<'_, ThreadInfo> {
         self.thread.write_irqsave()
     }
 
-    pub fn restart_block(&self) -> SpinLockGuard<Option<RestartBlock>> {
+    pub fn restart_block(&self) -> SpinLockGuard<'_, Option<RestartBlock>> {
         self.restart_block.lock()
     }
 
@@ -1626,11 +1623,11 @@ impl ProcessSchedulerInfo {
     //     }
     // }
 
-    pub fn inner_lock_write_irqsave(&self) -> RwLockWriteGuard<InnerSchedInfo> {
+    pub fn inner_lock_write_irqsave(&self) -> RwLockWriteGuard<'_, InnerSchedInfo> {
         return self.inner_locked.write_irqsave();
     }
 
-    pub fn inner_lock_read_irqsave(&self) -> RwLockReadGuard<InnerSchedInfo> {
+    pub fn inner_lock_read_irqsave(&self) -> RwLockReadGuard<'_, InnerSchedInfo> {
         return self.inner_locked.read_irqsave();
     }
 

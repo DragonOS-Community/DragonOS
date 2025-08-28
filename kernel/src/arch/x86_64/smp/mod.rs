@@ -62,7 +62,7 @@ unsafe extern "C" fn smp_ap_start() -> ! {
     smp_init_switch_stack(&v);
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
     core::arch::naked_asm!(concat!("
         mov rsp, [rdi + {off_rsp}]

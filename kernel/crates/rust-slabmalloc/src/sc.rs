@@ -189,7 +189,7 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
     ///
     /// # Arguments
     ///  * `sc_layout`: This is not the original layout but adjusted for the
-    ///     SCAllocator size (>= original).
+    ///    SCAllocator size (>= original).
     fn try_allocate_from_pagelist(&mut self, sc_layout: Layout) -> *mut u8 {
         // TODO: Do we really need to check multiple slab pages (due to alignment)
         // If not we can get away with a singly-linked list and have 8 more bytes

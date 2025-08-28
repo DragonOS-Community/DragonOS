@@ -14,7 +14,11 @@ use system_error::SystemError;
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{mount::MountFlags, vcore::generate_inode_id, FileType},
+    filesystem::vfs::{
+        mount::{MountFlags, MountPath},
+        vcore::generate_inode_id,
+        FileType,
+    },
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -35,6 +39,7 @@ use super::vfs::{
 pub mod kmsg;
 pub mod log;
 mod proc_mounts;
+mod proc_version;
 mod syscall;
 
 /// @brief 进程文件类型
@@ -55,6 +60,8 @@ pub enum ProcFileType {
     ProcFdDir = 5,
     ProcFdFile = 6,
     ProcMounts = 7,
+    /// /proc/version
+    ProcVersion = 8,
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -71,6 +78,7 @@ impl From<u8> for ProcFileType {
             5 => ProcFileType::ProcFdDir,
             6 => ProcFileType::ProcFdFile,
             7 => ProcFileType::ProcMounts,
+            8 => ProcFileType::ProcVersion,
             _ => ProcFileType::Default,
         }
     }
@@ -405,7 +413,7 @@ impl ProcFSInode {
 
     fn open_self(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         let pid = ProcessManager::current_pid().data();
-        return Ok(pid.to_string().as_bytes().len() as _);
+        return Ok(pid.to_string().len() as _);
     }
 
     // 读取exe文件
@@ -629,6 +637,19 @@ impl ProcFS {
             .create_proc_file(mounts_params)
             .unwrap_or_else(|_| panic!("create mounts error"));
 
+        // 创建 version 文件
+        let version_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("version")
+            .file_type(FileType::File)
+            .mode(ModeType::from_bits_truncate(0o444))
+            .ftype(ProcFileType::ProcVersion)
+            .build()
+            .unwrap();
+        result
+            .create_proc_file(version_params)
+            .unwrap_or_else(|_| panic!("create version error"));
+
         let self_dir = result
             .root_inode()
             .create("self", FileType::Dir, ModeType::from_bits_truncate(0o555))
@@ -776,6 +797,7 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
             ProcFileType::ProcExe => inode.open_exe(&mut private_data)?,
             ProcFileType::ProcMounts => inode.open_mounts(&mut private_data)?,
+            ProcFileType::ProcVersion => inode.open_version(&mut private_data)?,
             ProcFileType::Default => inode.data.len() as i64,
             ProcFileType::ProcSelf => inode.open_self(&mut private_data)?,
             _ => 0,
@@ -834,7 +856,10 @@ impl IndexNode for LockedProcFSInode {
 
         // 根据文件类型读取相应数据
         match inode.fdata.ftype {
-            ProcFileType::ProcStatus | ProcFileType::ProcMeminfo | ProcFileType::ProcMounts => {
+            ProcFileType::ProcStatus
+            | ProcFileType::ProcMeminfo
+            | ProcFileType::ProcMounts
+            | ProcFileType::ProcVersion => {
                 // 获取数据信息
                 let mut private_data = match &*data {
                     FilePrivateData::Procfs(p) => p.clone(),
@@ -1102,10 +1127,19 @@ impl IndexNode for LockedProcFSInode {
                     .collect();
 
                 match key.len() {
-                        0=>{return Err(SystemError::ENOENT);}
-                        1=>{return Ok(key.remove(0));}
-                        _ => panic!("Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    0 => {
+                        return Err(SystemError::ENOENT);
                     }
+                    1 => {
+                        return Ok(key.remove(0));
+                    }
+                    _ => panic!(
+                        "Procfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
+                        key_len = key.len(),
+                        inode_id = inode.metadata.inode_id,
+                        to_find = ino
+                    ),
+                }
             }
         }
     }
@@ -1186,11 +1220,16 @@ pub fn procfs_init() -> Result<(), SystemError> {
         let procfs: Arc<ProcFS> = ProcFS::new();
         let root_inode = ProcessManager::current_mntns().root_inode();
         // procfs 挂载
-        root_inode
+        let mntfs = root_inode
             .mkdir("proc", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /proc")
             .mount(procfs, MountFlags::empty())
             .expect("Failed to mount at /proc");
+        let ino = root_inode.metadata().unwrap().inode_id;
+        let mount_path = Arc::new(MountPath::from("/proc"));
+        ProcessManager::current_mntns()
+            .add_mount(Some(ino), mount_path, mntfs)
+            .expect("Failed to add mount for /proc");
         info!("ProcFS mounted.");
         result = Some(Ok(()));
     });

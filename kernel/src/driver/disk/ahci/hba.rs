@@ -42,7 +42,7 @@ pub enum HbaPortType {
 }
 
 /// 声明了 HBA 的所有属性
-#[repr(packed)]
+#[repr(C, packed)]
 #[allow(dead_code)]
 pub struct HbaPort {
     pub clb: u64,         // 0x00, command list base address, 1K-byte aligned
@@ -65,7 +65,7 @@ pub struct HbaPort {
 }
 
 /// 全称 HBA Memory Register，是HBA的寄存器在内存中的映射
-#[repr(packed)]
+#[repr(C, packed)]
 #[allow(dead_code)]
 pub struct HbaMem {
     pub cap: u32,             // 0x00, Host capability
@@ -86,7 +86,7 @@ pub struct HbaMem {
 
 /// HBA Command Table 里面的 PRDT 项
 /// 作用: 记录了内存中读/写数据的位置，以及长度。你可以把他类比成一个指针？
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct HbaPrdtEntry {
     pub dba: u64, // Data base address
     _rsv0: u32,   // Reserved
@@ -95,7 +95,7 @@ pub struct HbaPrdtEntry {
 
 /// HAB Command Table
 /// 每个 Port 一个 Table，主机和设备的交互都靠这个数据结构
-#[repr(packed)]
+#[repr(C, packed)]
 #[allow(dead_code)]
 pub struct HbaCmdTable {
     // 0x00
@@ -111,7 +111,7 @@ pub struct HbaCmdTable {
 /// HBA Command Header
 /// 作用: 你可以把他类比成 Command Table 的指针。
 /// 猜测: 这里多了一层 Header，而不是直接在 HbaMem 结构体指向 CmdTable，可能是为了兼容和可移植性？
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct HbaCmdHeader {
     // DW0
     pub cfl: u8,
@@ -286,7 +286,7 @@ pub enum FisType {
     DevBits = 0xA1,
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[allow(dead_code)]
 pub struct FisRegH2D {
     // DWORD 0
@@ -321,7 +321,7 @@ pub struct FisRegH2D {
     pub rsv1: [u8; 4], // Reserved
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[allow(dead_code)]
 pub struct FisRegD2H {
     // DWORD 0
@@ -353,7 +353,7 @@ pub struct FisRegD2H {
     pub rsv4: [u8; 4], // Reserved
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[allow(dead_code)]
 pub struct FisData {
     // DWORD 0
@@ -367,7 +367,7 @@ pub struct FisData {
     pub data: [u8; 252], // Payload
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[allow(dead_code)]
 pub struct FisPioSetup {
     // DWORD 0
@@ -401,7 +401,7 @@ pub struct FisPioSetup {
     pub rsv4: [u8; 2], // Reserved
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[allow(dead_code)]
 pub struct FisDmaSetup {
     // DWORD 0

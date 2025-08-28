@@ -26,10 +26,10 @@ impl KernFSCallback for EnableCallBack {
         let pri_data = data.private_data().as_ref().unwrap();
         let tracepoint_info = pri_data.debugfs_tracepoint().unwrap();
         let enable_value = tracepoint_info.enable_file().read();
-        if offset >= enable_value.as_bytes().len() {
+        if offset >= enable_value.len() {
             return Ok(0); // Offset is beyond the length of the string
         }
-        let len = buf.len().min(enable_value.as_bytes().len() - offset);
+        let len = buf.len().min(enable_value.len() - offset);
         buf[..len].copy_from_slice(&enable_value.as_bytes()[offset..offset + len]);
         Ok(len)
     }
@@ -71,10 +71,10 @@ impl KernFSCallback for FormatCallBack {
         let pri_data = data.private_data().as_ref().unwrap();
         let tracepoint = pri_data.debugfs_tracepoint().unwrap();
         let format_str = tracepoint.format_file().read();
-        if offset >= format_str.as_bytes().len() {
+        if offset >= format_str.len() {
             return Ok(0); // Offset is beyond the length of the string
         }
-        let len = buf.len().min(format_str.as_bytes().len() - offset);
+        let len = buf.len().min(format_str.len() - offset);
         buf[..len].copy_from_slice(&format_str.as_bytes()[offset..offset + len]);
         Ok(len)
     }
@@ -110,10 +110,10 @@ impl KernFSCallback for IDCallBack {
         let tracepoint = pri_data.debugfs_tracepoint().unwrap();
         let id_str = tracepoint.id_file().read();
 
-        if offset >= id_str.as_bytes().len() {
+        if offset >= id_str.len() {
             return Ok(0); // Offset is beyond the length of the string
         }
-        let len = buf.len().min(id_str.as_bytes().len() - offset);
+        let len = buf.len().min(id_str.len() - offset);
         buf[..len].copy_from_slice(&id_str.as_bytes()[offset..offset + len]);
         Ok(len)
     }

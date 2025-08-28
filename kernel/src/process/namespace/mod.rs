@@ -1,7 +1,9 @@
 pub mod mnt;
 pub mod nsproxy;
 pub mod pid_namespace;
+pub mod unshare;
 pub mod user_namespace;
+pub mod uts_namespace;
 
 use nsproxy::NsCommon;
 

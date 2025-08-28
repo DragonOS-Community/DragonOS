@@ -142,6 +142,7 @@ impl HvmStartInfo {
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
+#[allow(dead_code)]
 pub struct HvmModlistEntry {
     pub paddr: u64,
     pub size: u64,

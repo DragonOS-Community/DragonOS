@@ -126,7 +126,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if allocator_select_condition(layout) || ((ptr as usize) % 4096) == 0 {
+        if allocator_select_condition(layout) || (ptr as usize).is_multiple_of(4096) {
             dealloc_debug_log(klog_types::LogSource::Buddy, layout, ptr);
         } else {
             dealloc_debug_log(klog_types::LogSource::Slab, layout, ptr);

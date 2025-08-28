@@ -1,63 +1,67 @@
 use alloc::string::String;
+use alloc::sync::Weak;
 use alloc::{collections::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicUsize, Ordering};
+use alloc::boxed::Box;
 
 use super::SeqpacketSocket;
-use crate::net::socket::common::shutdown::ShutdownTemp;
+use crate::filesystem::vfs::IndexNode;
+use crate::libs::spinlock::SpinLock;
+use crate::net::socket::common::shutdown::ShutdownBit;
+use crate::net::socket::unix::UnixEndpoint;
 use crate::{
     libs::mutex::Mutex,
-    net::socket::{buffer::Buffer, endpoint::Endpoint, SocketInode},
+    net::socket::{endpoint::Endpoint},
 };
 use system_error::SystemError;
 
-#[derive(Debug)]
-pub(super) struct Init {
-    inode: Option<Endpoint>,
-}
+pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
-impl Init {
-    pub(super) fn new() -> Self {
-        Self { inode: None }
-    }
+// #[derive(Debug)]
+// pub(super) struct Init {
+//     inode: Option<(Arc<SocketInode>, String)>,
+// }
 
-    pub(super) fn bind(&mut self, epoint_to_bind: Endpoint) -> Result<(), SystemError> {
-        if self.inode.is_some() {
-            log::error!("the socket is already bound");
-            return Err(SystemError::EINVAL);
-        }
-        match epoint_to_bind {
-            Endpoint::Inode(_) => self.inode = Some(epoint_to_bind),
-            _ => return Err(SystemError::EINVAL),
-        }
+// impl Init {
+//     pub(super) fn new() -> Self {
+//         Self { inode: None }
+//     }
 
-        return Ok(());
-    }
+//     pub(super) fn bind(&mut self, epoint_to_bind: Arc<SocketInode>) -> Result<(), SystemError> {
+//         if self.inode.is_some() {
+//             log::error!("the socket is already bound");
+//             return Err(SystemError::EINVAL);
+//         }
+//         self.inode = Some(epoint_to_bind);
 
-    pub fn bind_path(&mut self, sun_path: String) -> Result<Endpoint, SystemError> {
-        if self.inode.is_none() {
-            log::error!("the socket is not bound");
-            return Err(SystemError::EINVAL);
-        }
-        if let Some(Endpoint::Inode((inode, mut path))) = self.inode.take() {
-            path = sun_path;
-            let epoint = Endpoint::Inode((inode, path));
-            self.inode.replace(epoint.clone());
-            return Ok(epoint);
-        };
+//         return Ok(());
+//     }
 
-        return Err(SystemError::EINVAL);
-    }
+//     pub fn bind_path(&mut self, sun_path: String) -> Result<Endpoint, SystemError> {
+//         if self.inode.is_none() {
+//             log::error!("the socket is not bound");
+//             return Err(SystemError::EINVAL);
+//         }
+//         if let Some((inode, _)) = self.inode.take() {
+//             let inode_id = inode.metadata()?.inode_id;
+//             let epoint = (inode, sun_path.clone());
+//             self.inode.replace(epoint.clone());
+//             return Ok(Endpoint::Unixpath((inode_id, sun_path)));
+//         };
 
-    pub fn endpoint(&self) -> Option<&Endpoint> {
-        return self.inode.as_ref();
-    }
-}
+//         return Err(SystemError::EINVAL);
+//     }
+
+//     pub fn endpoint(&self) -> Option<&Endpoint> {
+//         return self.inode.as_ref();
+//     }
+// }
 
 #[derive(Debug)]
 pub(super) struct Listener {
     inode: Endpoint,
     backlog: AtomicUsize,
-    incoming_conns: Mutex<VecDeque<Arc<SocketInode>>>,
+    incoming_conns: Mutex<VecDeque<Arc<dyn Socket>>>,
 }
 
 impl Listener {
@@ -83,7 +87,7 @@ impl Listener {
         let socket =
             Arc::downcast::<SeqpacketSocket>(conn.inner()).map_err(|_| SystemError::EINVAL)?;
         let peer = match &*socket.inner.read() {
-            Inner::Connected(connected) => connected.peer_endpoint().unwrap().clone(),
+            Status::Connected(connected) => connected.peer_endpoint().unwrap().clone(),
             _ => return Err(SystemError::ENOTCONN),
         };
 
@@ -117,7 +121,7 @@ impl Listener {
             Some(Endpoint::Inode((new_inode.clone(), path))),
             client_epoint,
         );
-        *new_server.inner.write() = Inner::Connected(server_conn);
+        *new_server.inner.write() = Status::Connected(server_conn);
         incoming_conns.push_back(new_inode);
 
         // TODO: epollin
@@ -132,50 +136,36 @@ impl Listener {
 
 #[derive(Debug)]
 pub struct Connected {
-    inode: Option<Endpoint>,
-    peer_inode: Option<Endpoint>,
-    buffer: Arc<Buffer>,
+    peer_buffer: Weak<SpinLock<Box<[u8]>>>,
+    buffer: Arc<SpinLock<Box<[u8]>>>,
 }
 
 impl Connected {
-    /// 默认的缓冲区大小
-    #[allow(dead_code)]
-    pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
     pub fn new_pair(
         inode: Option<Endpoint>,
         peer_inode: Option<Endpoint>,
     ) -> (Connected, Connected) {
         let this = Connected {
-            inode: inode.clone(),
-            peer_inode: peer_inode.clone(),
+            local_endpoint: inode.clone(),
+            peer_endpoint: peer_inode.clone(),
             buffer: Buffer::new(),
         };
         let peer = Connected {
-            inode: peer_inode,
-            peer_inode: inode,
+            local_endpoint: peer_inode,
+            peer_endpoint: inode,
             buffer: Buffer::new(),
         };
 
         (this, peer)
     }
 
-    #[allow(dead_code)]
-    pub fn set_peer_inode(&mut self, peer_epoint: Option<Endpoint>) {
-        self.peer_inode = peer_epoint;
-    }
-
-    #[allow(dead_code)]
-    pub fn set_inode(&mut self, epoint: Option<Endpoint>) {
-        self.inode = epoint;
-    }
-
     pub fn endpoint(&self) -> Option<&Endpoint> {
-        self.inode.as_ref()
+        self.local_endpoint.as_ref()
     }
 
     pub fn peer_endpoint(&self) -> Option<&Endpoint> {
-        self.peer_inode.as_ref()
+        self.peer_endpoint.as_ref()
     }
 
     pub fn try_read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -203,14 +193,14 @@ impl Connected {
     pub fn can_send(&self) -> Result<bool, SystemError> {
         // let sebuffer = self.sebuffer.lock(); // 获取锁
         // sebuffer.capacity()-sebuffer.len() ==0;
-        let peer_inode = match self.peer_inode.as_ref().unwrap() {
+        let peer_inode = match self.peer_endpoint.as_ref().unwrap() {
             Endpoint::Inode((inode, _)) => inode,
             _ => return Err(SystemError::EINVAL),
         };
         let peer_socket = Arc::downcast::<SeqpacketSocket>(peer_inode.inner())
             .map_err(|_| SystemError::EINVAL)?;
         let is_full = match &*peer_socket.inner.read() {
-            Inner::Connected(connected) => connected.buffer.is_read_buf_full(),
+            Status::Connected(connected) => connected.buffer.is_read_buf_full(),
             _ => return Err(SystemError::EINVAL),
         };
         Ok(!is_full)
@@ -222,14 +212,14 @@ impl Connected {
 
     pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         //找到peer_inode，并将write_buffer的内容写入对端的read_buffer
-        let peer_inode = match self.peer_inode.as_ref().unwrap() {
+        let peer_inode = match self.peer_endpoint.as_ref().unwrap() {
             Endpoint::Inode((inode, _)) => inode,
             _ => return Err(SystemError::EINVAL),
         };
         let peer_socket = Arc::downcast::<SeqpacketSocket>(peer_inode.inner())
             .map_err(|_| SystemError::EINVAL)?;
         let usize = match &*peer_socket.inner.write() {
-            Inner::Connected(connected) => {
+            Status::Connected(connected) => {
                 let usize = connected.buffer.write_read_buffer(buf)?;
                 usize
             }
@@ -239,13 +229,12 @@ impl Connected {
         Ok(usize)
     }
 
-    pub fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
-        if how.is_empty() {
-            return Err(SystemError::EINVAL);
-        } else if how.is_send_shutdown() {
-            unimplemented!("unimplemented!");
-        } else if how.is_recv_shutdown() {
-            unimplemented!("unimplemented!");
+    pub fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
+        if how.is_send_shutdown() {
+            log::warn!("shutdown is unimplement");
+        }
+        if how.is_recv_shutdown() {
+            log::warn!("shutdown is unimplement!");
         }
 
         Ok(())
@@ -253,8 +242,20 @@ impl Connected {
 }
 
 #[derive(Debug)]
-pub(super) enum Inner {
-    Init(Init),
+pub(super) enum Status {
+    Init,
+    Bound,
     Listen(Listener),
     Connected(Connected),
+}
+
+// For a u8:
+//                  0000 0000 <- non_blocking bit
+//                  ^..^ ^.^
+// Init ~ Connected <-|   |-> shutdown bits
+
+pub struct SeqSockInner {
+    inner: Status,
+    non_blocking: bool,
+
 }

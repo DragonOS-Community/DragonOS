@@ -39,7 +39,6 @@ use crate::{
     },
     libs::{
         align::AlignedBox,
-        casting::DowncastArc,
         futex::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::{Futex, RobustListHead},
@@ -55,7 +54,6 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    net::socket::SocketInode,
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
         cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
@@ -1071,6 +1069,8 @@ impl ProcessControlBlock {
 
     /// 根据文件描述符序号，获取socket对象的Arc指针
     ///
+    /// this is a helper function
+    ///
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
@@ -1078,7 +1078,7 @@ impl ProcessControlBlock {
     /// ## 返回值
     ///
     /// Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
-    pub fn get_socket(&self, fd: i32) -> Option<Arc<SocketInode>> {
+    pub fn get_socket(&self, fd: i32) -> Option<Arc<dyn IndexNode>> {
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
@@ -1088,11 +1088,8 @@ impl ProcessControlBlock {
         if f.file_type() != FileType::Socket {
             return None;
         }
-        let socket: Arc<SocketInode> = f
-            .inode()
-            .downcast_arc::<SocketInode>()
-            .expect("Not a socket inode");
-        return Some(socket);
+        let inode = f.inode();
+        return Some(inode);
     }
 
     /// 当前进程退出时,让初始进程收养所有子进程

@@ -657,10 +657,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Err(SystemError::ENOSYS)
     }
-
-    fn as_socket(&self) -> Option<&dyn Socket> {
-        None
-    }
 }
 
 impl DowncastArc for dyn IndexNode {

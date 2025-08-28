@@ -18,7 +18,7 @@ use smoltcp::wire::Ipv4Address;
 use smoltcp::wire::Ipv6Address;
 
 pub use stream::TcpSocket;
-pub use syscall::Inet;
+// pub use syscall::Inet;
 
 use super::Socket;
 

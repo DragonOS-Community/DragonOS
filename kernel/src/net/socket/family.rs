@@ -110,16 +110,3 @@ impl core::convert::TryFrom<u16> for AddressFamily {
         return <Self as FromPrimitive>::from_u16(x).ok_or(Self::Error::EINVAL);
     }
 }
-
-use crate::filesystem::vfs::IndexNode;
-use alloc::sync::Arc;
-
-use super::PSOCK;
-
-pub trait Family {
-    fn socket(
-        stype: PSOCK,
-        protocol: u32,
-        is_nonblock: bool,
-    ) -> Result<Arc<dyn IndexNode>, system_error::SystemError>;
-}

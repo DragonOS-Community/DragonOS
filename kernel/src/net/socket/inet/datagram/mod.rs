@@ -5,6 +5,7 @@ use system_error::SystemError;
 use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::IndexNode;
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::socket::common::ShutdownBit;
 use crate::net::socket::{Socket, PMSG};
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
@@ -17,6 +18,7 @@ pub mod inner;
 type EP = crate::filesystem::epoll::EPollEventType;
 
 // Udp Socket 负责提供状态切换接口、执行状态切换
+#[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct UdpSocket {
     inner: RwLock<Option<UdpInner>>,
@@ -271,7 +273,7 @@ impl Socket for UdpSocket {
         Ok(())
     }
 
-    fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
         todo!()
     }
 
@@ -317,7 +319,7 @@ impl Socket for UdpSocket {
         todo!()
     }
 
-    fn shutdown(&self, how: usize) -> Result<(), SystemError> {
+    fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
         todo!()
     }
 }

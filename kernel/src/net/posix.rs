@@ -40,8 +40,8 @@ use core::ffi::CStr;
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::{FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES},
-    net::socket::unix::UnixEndpoint,
+    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    // net::socket::unix::UnixEndpoint,
     process::ProcessManager,
 };
 
@@ -101,6 +101,31 @@ pub union SockAddr {
     pub addr_ll: SockAddrLl,
     pub addr_nl: SockAddrNl,
     pub addr_ph: SockAddrPlaceholder,
+}
+
+impl From<smoltcp::wire::IpEndpoint> for SockAddr {
+    fn from(value: smoltcp::wire::IpEndpoint) -> Self {
+        match value.addr {
+            smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => Self {
+                addr_in: SockAddrIn { 
+                    sin_family: AddressFamily::INet as u16, 
+                    sin_port: value.port, 
+                    sin_addr: ipv4_addr.to_bits(), 
+                    sin_zero: Default::default() 
+                }
+            },
+            smoltcp::wire::IpAddress::Ipv6(ipv6_addr) => todo!(),
+        }
+    }
+}
+
+impl From<Endpoint> for SockAddr {
+    fn from(value: Endpoint) -> Self {
+        match value {
+            Endpoint::LinkLayer(link_layer_endpoint) => todo!(),
+            Endpoint::Ip(endpoint) => Self::from(endpoint),
+        }
+    }
 }
 
 impl SockAddr {
@@ -208,10 +233,12 @@ impl SockAddr {
                         crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
                         path.trim(),
                     )?;
-                    let inode =
+                    let _inode =
                         inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-                    return Ok(Endpoint::Unix(UnixEndpoint::File(file_abs_path)));
+                    // return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id, path)));
+                    // return Err(SystemError::ENOSYS);
+                    unreachable!("fuck unix")
                 }
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);

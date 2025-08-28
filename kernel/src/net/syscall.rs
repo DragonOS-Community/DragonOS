@@ -5,14 +5,13 @@ use crate::{
         file::{File, FileMode},
         iov::IoVecs,
     },
-    net::socket::AddressFamily,
     process::ProcessManager,
     syscall::Syscall,
 };
 
 use super::{
     posix::{MsgHdr, PosixArgsSocketType, SockAddr},
-    socket::{self, endpoint::Endpoint, unix::Unix},
+    socket::{self, common::ShutdownBit, endpoint::Endpoint},
 };
 
 /// Flags for socket, socketpair, accept4
@@ -54,10 +53,11 @@ impl Syscall {
 
         let file = File::new(inode, FileMode::O_RDWR)?;
         // 把socket添加到当前进程的文件描述符表中
-        let binding = ProcessManager::current_pcb().fd_table();
-
-        let fd = binding.write().alloc_fd(file, None).map(|x| x as usize);
-        return fd;
+        ProcessManager::current_pcb()
+            .fd_table()
+            .write()
+            .alloc_fd(file, None)
+            .map(|x| x as usize)
     }
 
     /// # sys_socketpair系统调用的实际执行函数
@@ -68,36 +68,37 @@ impl Syscall {
     /// - `protocol`: 传输协议
     /// - `fds`: 用于返回文件描述符的数组
     pub fn socketpair(
-        address_family: usize,
-        socket_type: usize,
-        protocol: usize,
-        fds: &mut [i32],
+        _address_family: usize,
+        _socket_type: usize,
+        _protocol: usize,
+        _fds: &mut [i32],
     ) -> Result<usize, SystemError> {
-        let address_family = AddressFamily::try_from(address_family as u16)?;
-        let socket_type = PosixArgsSocketType::from_bits_truncate(socket_type as u32);
-        let stype = socket::PSOCK::try_from(socket_type)?;
+        return Err(SystemError::ENOSYS);
+        // let address_family = AddressFamily::try_from(address_family as u16)?;
+        // let socket_type = PosixArgsSocketType::from_bits_truncate(socket_type as u32);
+        // let stype = socket::PSOCK::try_from(socket_type)?;
 
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
+        // let binding = ProcessManager::current_pcb().fd_table();
+        // let mut fd_table_guard = binding.write();
 
-        // check address family, only support AF_UNIX
-        if address_family != AddressFamily::Unix {
-            log::warn!(
-                "only support AF_UNIX, {:?} with protocol {:?} is not supported",
-                address_family,
-                protocol
-            );
-            return Err(SystemError::EAFNOSUPPORT);
-        }
+        // // check address family, only support AF_UNIX
+        // if address_family != AddressFamily::Unix {
+        //     log::warn!(
+        //         "only support AF_UNIX, {:?} with protocol {:?} is not supported",
+        //         address_family,
+        //         protocol
+        //     );
+        //     return Err(SystemError::EAFNOSUPPORT);
+        // }
 
-        // 创建一对新的unix socket pair
-        let (inode0, inode1) = Unix::new_pairs(stype, socket_type.is_nonblock())?;
+        // // 创建一对新的unix socket pair
+        // let (inode0, inode1) = Unix::new_pairs(stype, socket_type.is_nonblock())?;
 
-        fds[0] = fd_table_guard.alloc_fd(File::new(inode0, FileMode::O_RDWR)?, None)?;
-        fds[1] = fd_table_guard.alloc_fd(File::new(inode1, FileMode::O_RDWR)?, None)?;
+        // fds[0] = fd_table_guard.alloc_fd(File::new(inode0, FileMode::O_RDWR)?, None)?;
+        // fds[1] = fd_table_guard.alloc_fd(File::new(inode1, FileMode::O_RDWR)?, None)?;
 
-        drop(fd_table_guard);
-        Ok(0)
+        // drop(fd_table_guard);
+        // Ok(0)
     }
 
     /// @brief sys_setsockopt系统调用的实际执行函数
@@ -114,10 +115,7 @@ impl Syscall {
         optval: &[u8],
     ) -> Result<usize, SystemError> {
         let sol = socket::PSOL::try_from(level as u32)?;
-        let socket = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = socket.as_socket().unwrap();
+        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
         log::debug!("setsockopt: level = {:?} ", sol);
         return socket.set_option(sol, optname, optval).map(|_| 0);
     }
@@ -140,10 +138,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 获取socket
         let optval = optval as *mut u32;
-        let inode = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = inode.as_socket().unwrap();
+        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
 
         use socket::{PSO, PSOL};
 
@@ -173,7 +168,6 @@ impl Syscall {
                 }
             }
         }
-        drop(inode);
 
         // To manipulate options at any other level the
         // protocol number of the appropriate protocol controlling the
@@ -204,10 +198,7 @@ impl Syscall {
     /// @return 成功返回0，失败返回错误码
     pub fn connect(fd: usize, addr: *const SockAddr, addrlen: u32) -> Result<usize, SystemError> {
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = socket.as_socket().unwrap();
+        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
         socket.connect(endpoint)?;
         Ok(0)
     }
@@ -228,10 +219,7 @@ impl Syscall {
         //     addrlen
         // );
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = socket.as_socket().unwrap();
+        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
         // log::debug!("bind: socket={:?}", socket);
         socket.bind(endpoint)?;
         Ok(0)
@@ -261,10 +249,7 @@ impl Syscall {
 
         let flags = socket::PMSG::from_bits_truncate(flags);
 
-        let inode = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = inode.as_socket().unwrap();
+        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
 
         if let Some(endpoint) = endpoint {
             return socket.send_to(buf, flags, endpoint);
@@ -289,10 +274,8 @@ impl Syscall {
         addr: *mut SockAddr,
         addr_len: *mut u32,
     ) -> Result<usize, SystemError> {
-        let inode = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = inode.as_socket().unwrap();
+        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
+
         let flags = socket::PMSG::from_bits_truncate(flags);
 
         if addr.is_null() {
@@ -328,10 +311,7 @@ impl Syscall {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
         let (buf, recv_size) = {
-            let inode = ProcessManager::current_pcb()
-                .get_socket(fd as i32)
-                .ok_or(SystemError::EBADF)?;
-            let socket = inode.as_socket().unwrap();
+            let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
 
             let flags = socket::PMSG::from_bits_truncate(flags);
 
@@ -355,11 +335,8 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn listen(fd: usize, backlog: usize) -> Result<usize, SystemError> {
-        let inode = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = inode.as_socket().unwrap();
-        socket.listen(backlog).map(|_| 0)
+        let inode = ProcessManager::current_pcb().get_socket(fd as i32)?;
+        inode.listen(backlog).map(|_| 0)
     }
 
     /// @brief sys_shutdown系统调用的实际执行函数
@@ -369,11 +346,8 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn shutdown(fd: usize, how: usize) -> Result<usize, SystemError> {
-        let inode = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = inode.as_socket().unwrap();
-        socket.shutdown(how).map(|()| 0)
+        let inode = ProcessManager::current_pcb().get_socket(fd as i32)?;
+        inode.shutdown(ShutdownBit::try_from(how)?).map(|()| 0)
     }
 
     /// @brief sys_accept系统调用的实际执行函数
@@ -429,13 +403,9 @@ impl Syscall {
         flags: u32,
     ) -> Result<usize, SystemError> {
         let (new_socket, remote_endpoint) = {
-            let inode = ProcessManager::current_pcb()
-                .get_socket(fd as i32)
-                .ok_or(SystemError::EBADF)?;
-            let socket = inode.as_socket().unwrap();
-
-            // 从socket中接收连接
-            socket.accept()?
+            ProcessManager::current_pcb()
+                .get_socket(fd as i32)?
+                .accept()?
         };
 
         // debug!("accept: new_socket={:?}", new_socket);
@@ -480,10 +450,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?
-            .as_socket()
-            .unwrap()
+            .get_socket(fd as i32)?
             .get_name()?
             .write_to_user(addr, addrlen)?;
         return Ok(0);
@@ -506,10 +473,7 @@ impl Syscall {
         }
 
         ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?
-            .as_socket()
-            .unwrap()
+            .get_socket(fd as i32)?
             .get_peer_name()?
             .write_to_user(addr, addrlen)?;
 

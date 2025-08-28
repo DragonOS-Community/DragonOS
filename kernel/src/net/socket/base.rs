@@ -1,24 +1,20 @@
 use crate::{
     filesystem::vfs::{IndexNode, PollableInode},
     libs::wait_queue::WaitQueue,
-    net::posix::MsgHdr,
+    net::{posix::MsgHdr, socket::common::ShutdownBit},
 };
 use alloc::sync::Arc;
-use core::any::Any;
-use core::fmt::Debug;
 use system_error::SystemError;
 
 use super::{
-    common::shutdown::ShutdownBit,
     endpoint::Endpoint,
     posix::{PMSG, PSOL},
-    // SocketInode,
 };
 
 /// # `Socket` methods
 /// ## Reference
 /// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
-pub trait Socket: PollableInode {
+pub trait Socket: PollableInode + IndexNode {
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> &WaitQueue;
@@ -29,7 +25,7 @@ pub trait Socket: PollableInode {
     /// 接受连接，仅用于listening stream socket
     /// ## Block
     /// 如果没有连接到来，会阻塞
-    fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError>;
+    fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError>;
 
     /// # `bind`
     /// 对应于POSIX的bind函数，用于绑定到本机指定的端点
@@ -86,9 +82,8 @@ pub trait Socket: PollableInode {
 
     // select
     /// # `send`
-    fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
-    }
+    fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError>;
+
     /// # `send_msg`
     fn send_msg(&self, msg: &MsgHdr, flags: PMSG) -> Result<usize, SystemError>;
 
@@ -106,7 +101,7 @@ pub trait Socket: PollableInode {
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError>;
 
     /// # `shutdown`
-    fn shutdown(&self, how: usize) -> Result<(), SystemError>;
+    fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError>;
 
     // sockatmark
     // socket

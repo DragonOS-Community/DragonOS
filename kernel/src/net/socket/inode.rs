@@ -1,16 +1,28 @@
-use crate::filesystem::vfs::{IndexNode, PollableInode};
+use crate::{filesystem::vfs::{syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata, PollableInode}, libs::spinlock::SpinLockGuard};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use super::Socket;
 
 impl<T: Socket + 'static> IndexNode for T {
+    fn open(
+        &self,
+        _: SpinLockGuard<FilePrivateData>,
+        _: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn close(&self, _: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+        self.do_close()
+    }
+
     fn read_at(
         &self,
-        _offset: usize,
-        _len: usize,
+        _: usize,
+        _: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         self.read(buf)
     }
@@ -20,7 +32,7 @@ impl<T: Socket + 'static> IndexNode for T {
         _offset: usize,
         _len: usize,
         buf: &[u8],
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         self.write(buf)
     }
@@ -41,7 +53,10 @@ impl<T: Socket + 'static> IndexNode for T {
         Ok(self)
     }
 
-    fn as_socket(&self) -> Option<&dyn Socket> {
-        Some(self)
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        Ok(Metadata::new(
+            FileType::Socket,
+            ModeType::from_bits_truncate(0o755),
+        ))
     }
 }

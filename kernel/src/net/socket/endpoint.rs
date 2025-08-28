@@ -1,11 +1,7 @@
 use crate::{
-    filesystem::vfs::InodeId,
-    net::{
-        posix::SockAddr,
-        socket::{self, unix::UnixEndpoint},
-    },
+    mm::{verify_area, VirtAddr},
+    net::posix::SockAddr,
 };
-use alloc::{string::String, sync::Arc};
 
 pub use smoltcp::wire::IpEndpoint;
 
@@ -15,8 +11,7 @@ pub enum Endpoint {
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
     Ip(IpEndpoint),
-
-    Unix(UnixEndpoint),
+    // Unix(UnixEndpoint),
 }
 
 /// @brief 链路层端点
@@ -49,8 +44,39 @@ impl Endpoint {
         addr: *mut SockAddr,
         addr_len: *mut u32,
     ) -> Result<(), system_error::SystemError> {
-        // use system_error::SystemError;
+        use system_error::SystemError::*;
 
-        todo!("write_to_user: {:?}", self);
+        if addr.is_null() || addr_len.is_null() {
+            return Ok(());
+        }
+
+        // 检查用户传入的地址是否合法
+        verify_area(
+            VirtAddr::new(addr as usize),
+            core::mem::size_of::<SockAddr>(),
+        )
+        .map_err(|_| EFAULT)?;
+
+        verify_area(
+            VirtAddr::new(addr_len as usize),
+            core::mem::size_of::<u32>(),
+        )
+        .map_err(|_| EFAULT)?;
+
+        let kernel_addr = SockAddr::from(self.clone());
+        let len = kernel_addr.len()?;
+
+        unsafe {
+            let to_write = core::cmp::min(len, *addr_len );
+            if to_write > 0 {
+                let buf = core::slice::from_raw_parts_mut(addr as *mut u8, to_write as usize);
+                buf.copy_from_slice(core::slice::from_raw_parts(
+                    &kernel_addr as *const SockAddr as *const u8,
+                    to_write as usize,
+                ));
+            }
+            *addr_len = len;
+            return Ok(());
+        }
     }
 }

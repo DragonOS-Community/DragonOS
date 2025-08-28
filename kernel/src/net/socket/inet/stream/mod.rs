@@ -2,9 +2,11 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError;
 
+use crate::filesystem::epoll::EPollItem;
+use crate::filesystem::vfs::{FilePrivateData, PollableInode};
 use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::socket::{common::shutdown::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSOL};
+use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSOL};
 use crate::sched::SchedMode;
 use smoltcp;
 
@@ -16,6 +18,8 @@ pub use option::Options as TcpOption;
 use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
 
 type EP = crate::filesystem::epoll::EPollEventType;
+
+#[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct TcpSocket {
     inner: RwLock<Option<inner::Inner>>,
@@ -246,8 +250,14 @@ impl TcpSocket {
         }
     }
 
+    #[inline]
     fn incoming(&self) -> bool {
-        EP::from_bits_truncate(self.poll() as u32).contains(EP::EPOLLIN)
+        EP::from_bits_truncate(self.do_poll() as u32).contains(EP::EPOLLIN)
+    }
+
+    #[inline]
+    fn do_poll(&self) -> usize {
+        self.pollee.load(core::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -311,10 +321,6 @@ impl Socket for TcpSocket {
         };
     }
 
-    fn poll(&self) -> usize {
-        self.pollee.load(core::sync::atomic::Ordering::SeqCst)
-    }
-
     fn listen(&self, backlog: usize) -> Result<(), SystemError> {
         self.do_listen(backlog)
     }
@@ -332,6 +338,7 @@ impl Socket for TcpSocket {
                 }
             }
         }
+        .map(|(sock, ep)| (sock as Arc<dyn Socket>, Endpoint::Ip(ep)))
     }
 
     fn recv(&self, buffer: &mut [u8], _flags: PMSG) -> Result<usize, SystemError> {
@@ -517,6 +524,24 @@ impl Socket for TcpSocket {
     }
 
     fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError> {
+        todo!()
+    }
+}
+
+impl PollableInode for TcpSocket {
+    fn poll(&self, _: &FilePrivateData) -> Result<usize, SystemError> {
+        Ok(self.do_poll())
+    }
+
+    fn add_epitem(&self, epitem: Arc<EPollItem>, _: &FilePrivateData) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    fn remove_epitem(
+        &self,
+        epitm: &Arc<EPollItem>,
+        _: &FilePrivateData,
+    ) -> Result<(), SystemError> {
         todo!()
     }
 }

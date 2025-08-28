@@ -42,6 +42,11 @@ impl<T: Socket + 'static> IndexNode for T {
         self.write(buf)
     }
 
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+        log::warn!("wtf logic we need to consider resize of socket? why would trigger it");
+        Ok(())
+    }
+
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
         unreachable!("Socket does not have a file system")
     }
@@ -68,7 +73,7 @@ impl<T: Socket + 'static> IndexNode for T {
 
 impl<T: Socket + 'static> PollableInode for T {
     fn poll(&self, _: &FilePrivateData) -> Result<usize, SystemError> {
-        todo!()
+        Ok(self.get_event().bits() as usize)
     }
 
     fn add_epitem(
@@ -85,7 +90,7 @@ impl<T: Socket + 'static> PollableInode for T {
         epitm: &Arc<crate::filesystem::epoll::EPollItem>,
         _: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        self.epoll_items().remove(&epitm.epoll());
+        let _ = self.epoll_items().remove(&epitm.epoll());
         return Ok(());
     }
 }

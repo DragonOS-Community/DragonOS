@@ -63,7 +63,7 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
 
     /// @brief 在通知链中取消注册节点
     pub fn unregister(&mut self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
-        let remove = self.0.extract_if(|b| Arc::ptr_eq(&block, b));
+        let remove = self.0.extract_if(.., |b| Arc::ptr_eq(&block, b));
         match remove.count() {
             0 => return Err(SystemError::ENOENT),
             _ => return Ok(()),

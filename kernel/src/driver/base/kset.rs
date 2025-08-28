@@ -141,7 +141,7 @@ impl KSet {
         return self.self_ref.upgrade().unwrap();
     }
 
-    pub fn kobjects(&self) -> RwLockReadGuard<Vec<Weak<dyn KObject>>> {
+    pub fn kobjects(&self) -> RwLockReadGuard<'_, Vec<Weak<dyn KObject>>> {
         return self.kobjects.read();
     }
 }
@@ -167,11 +167,11 @@ impl KObject for KSet {
         self.parent_data.write().parent = parent;
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

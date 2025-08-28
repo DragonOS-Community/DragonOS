@@ -158,7 +158,13 @@ impl IrqDomainManager {
     ) {
         for i in 0..count {
             if let Err(e) = self.domain_associate(domain, first_irq + i, first_hwirq + i) {
-                warn!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), (first_hwirq + i).data(), (first_irq + i).data());
+                warn!(
+                    "domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.",
+                    e,
+                    domain.name(),
+                    (first_hwirq + i).data(),
+                    (first_irq + i).data()
+                );
             }
         }
     }
@@ -204,7 +210,13 @@ impl IrqDomainManager {
         if let Err(e) = r {
             if e != SystemError::ENOSYS {
                 if e != SystemError::EPERM {
-                    info!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), hwirq.data(), irq.data());
+                    info!(
+                        "domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.",
+                        e,
+                        domain.name(),
+                        hwirq.data(),
+                        irq.data()
+                    );
                 }
                 let mut irq_data_guard = irq_data.inner();
                 irq_data_guard.set_domain(None);
@@ -532,12 +544,12 @@ impl IrqDomain {
     }
 
     #[allow(dead_code)]
-    fn revmap_read_irqsave(&self) -> RwLockReadGuard<IrqDomainRevMap> {
+    fn revmap_read_irqsave(&self) -> RwLockReadGuard<'_, IrqDomainRevMap> {
         self.revmap.read_irqsave()
     }
 
     #[allow(dead_code)]
-    fn revmap_write_irqsave(&self) -> RwLockWriteGuard<IrqDomainRevMap> {
+    fn revmap_write_irqsave(&self) -> RwLockWriteGuard<'_, IrqDomainRevMap> {
         self.revmap.write_irqsave()
     }
 

@@ -32,7 +32,7 @@ impl Syscall for SysGetRlimit {
         let rlimit = Self::rlimit(args);
 
         do_prlimit64(
-            ProcessManager::current_pcb().pid(),
+            ProcessManager::current_pcb().raw_pid(),
             resource,
             core::ptr::null::<RLimit64>(),
             rlimit,

@@ -7,6 +7,7 @@ pub mod cmdline;
 pub mod init;
 pub mod initcall;
 pub mod initial_kthread;
+pub mod version_info;
 
 /// 启动参数
 static BOOT_PARAMS: RwLock<BootParams> = RwLock::new(BootParams::new());

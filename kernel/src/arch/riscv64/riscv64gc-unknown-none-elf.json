@@ -6,7 +6,7 @@
   "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
   "eh-frame-header": false,
   "emit-debug-gdb-scripts": false,
-  "features": "+m,+a,+f,+d,+c",
+  "features": "+m,+a,+f,+d,+c,+zicsr,+zifencei,+zalrsc,+zaamo",
   "linker": "rust-lld",
   "linker-flavor": "gnu-lld",
   "llvm-abiname": "lp64d",

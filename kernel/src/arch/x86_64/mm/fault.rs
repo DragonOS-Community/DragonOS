@@ -179,7 +179,7 @@ impl X86_64MMArch {
             address.data(),
             regs.rip,
             error_code,
-            pcb.pid().data()
+            pcb.raw_pid().data()
         );
         //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/mm/fault.c#do_kern_addr_fault
     }

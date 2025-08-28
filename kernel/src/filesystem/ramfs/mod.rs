@@ -538,9 +538,18 @@ impl IndexNode for LockedRamFSInode {
                     .collect();
 
                 match key.len() {
-                    0=>{return Err(SystemError::ENOENT);}
-                    1=>{return Ok(key.remove(0));}
-                    _ => panic!("Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    0 => {
+                        return Err(SystemError::ENOENT);
+                    }
+                    1 => {
+                        return Ok(key.remove(0));
+                    }
+                    _ => panic!(
+                        "Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
+                        key_len = key.len(),
+                        inode_id = inode.metadata.inode_id,
+                        to_find = ino
+                    ),
                 }
             }
         }

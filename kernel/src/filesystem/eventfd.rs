@@ -274,6 +274,10 @@ impl IndexNode for EventFdInode {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Ok(self)
     }
+
+    fn absolute_path(&self) -> Result<String, SystemError> {
+        Ok(String::from("eventfd"))
+    }
 }
 
 impl Syscall {

@@ -1,5 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETGID;
+use crate::process::cred::Cred;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -23,18 +24,21 @@ impl Syscall for SysSetGid {
         let gid = Self::gid(args);
         let pcb = ProcessManager::current_pcb();
         let mut guard = pcb.cred.lock();
+        let mut new_cred: Cred = (**guard).clone();
 
         if guard.egid.data() == 0 {
-            guard.setgid(gid);
-            guard.setegid(gid);
-            guard.setsgid(gid);
-            guard.setfsgid(gid);
+            new_cred.setgid(gid);
+            new_cred.setegid(gid);
+            new_cred.setsgid(gid);
+            new_cred.setfsgid(gid);
         } else if guard.gid.data() == gid || guard.sgid.data() == gid {
-            guard.setegid(gid);
-            guard.setfsgid(gid);
+            new_cred.setegid(gid);
+            new_cred.setfsgid(gid);
         } else {
             return Err(SystemError::EPERM);
         }
+
+        *guard = Cred::new_arc(new_cred);
 
         return Ok(0);
     }

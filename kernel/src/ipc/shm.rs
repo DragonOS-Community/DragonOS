@@ -10,7 +10,7 @@ use crate::{
         page::{page_manager_lock_irqsave, PageFlags, PageType},
         PhysAddr,
     },
-    process::{Pid, ProcessManager},
+    process::{ProcessManager, RawPid},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
@@ -396,9 +396,9 @@ pub struct KernelShm {
     /// 最后一次更改信息的时间
     shm_ctim: PosixTimeSpec,
     /// 创建者进程id
-    shm_cprid: Pid,
+    shm_cprid: RawPid,
     /// 最后操作者进程id
-    shm_lprid: Pid,
+    shm_lprid: RawPid,
 }
 
 impl KernelShm {

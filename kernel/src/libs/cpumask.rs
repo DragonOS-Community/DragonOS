@@ -79,7 +79,7 @@ impl CpuMask {
     }
 
     /// 迭代所有被置位的cpu
-    pub fn iter_cpu(&self) -> CpuMaskIter {
+    pub fn iter_cpu(&self) -> CpuMaskIter<'_> {
         CpuMaskIter {
             mask: self,
             index: None,
@@ -89,7 +89,7 @@ impl CpuMask {
     }
 
     /// 迭代所有未被置位的cpu
-    pub fn iter_zero_cpu(&self) -> CpuMaskIter {
+    pub fn iter_zero_cpu(&self) -> CpuMaskIter<'_> {
         CpuMaskIter {
             mask: self,
             index: None,

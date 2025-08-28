@@ -117,7 +117,7 @@ impl FbConsoleDevice {
         });
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerFbConsoleDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerFbConsoleDevice> {
         self.inner.lock()
     }
 }
@@ -168,11 +168,11 @@ impl KObject for FbConsoleDevice {
         warn!("fbcon name can not be changed");
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -364,7 +364,7 @@ pub struct FrameBufferConsoleData {
 }
 
 pub trait FrameBufferConsole {
-    fn fbcon_data(&self) -> SpinLockGuard<FrameBufferConsoleData>;
+    fn fbcon_data(&self) -> SpinLockGuard<'_, FrameBufferConsoleData>;
 
     /// ## 将位块移动到目标位置
     /// 坐标均以字体为单位而不是pixel
@@ -477,7 +477,7 @@ impl FbConAttr {
     pub fn update_attr(&self, dst: &mut [u8], src: &[u8], vc_data: &VirtualConsoleData) {
         let mut offset = if vc_data.font.height < 10 { 1 } else { 2 } as usize;
 
-        let width = (vc_data.font.width + 7) / 8;
+        let width = vc_data.font.width.div_ceil(8);
         let cellsize = (vc_data.font.height * width) as usize;
 
         // 大于offset的部分就是下划线

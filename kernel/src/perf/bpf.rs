@@ -322,6 +322,10 @@ impl IndexNode for BpfPerfEvent {
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         Some(self.data.lock().page_cache.clone())
     }
+
+    fn absolute_path(&self) -> core::result::Result<String, SystemError> {
+        Ok(String::from("bpf_perf_event"))
+    }
 }
 
 impl PerfEventOps for BpfPerfEvent {

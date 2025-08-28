@@ -1,4 +1,7 @@
-use core::hash::{Hash, Hasher};
+use core::{
+    fmt::Display,
+    hash::{Hash, Hasher},
+};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Major(u32);
@@ -94,5 +97,11 @@ impl Default for DeviceNumber {
 impl From<u32> for DeviceNumber {
     fn from(x: u32) -> Self {
         Self { data: x }
+    }
+}
+
+impl Display for DeviceNumber {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}:{}", self.major().data(), self.minor())
     }
 }

@@ -1,10 +1,15 @@
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicUsize;
 
 use alloc::vec::Vec;
 
+use super::namespace::user_namespace::{UserNamespace, INIT_USER_NAMESPACE};
+
 const GLOBAL_ROOT_UID: Kuid = Kuid(0);
 const GLOBAL_ROOT_GID: Kgid = Kgid(0);
-pub static INIT_CRED: Cred = Cred::init();
+lazy_static::lazy_static! {
+    pub static ref INIT_CRED: Arc<Cred> = Cred::init();
+}
 
 int_like!(Kuid, AtomicKuid, usize, AtomicUsize);
 int_like!(Kgid, AtomicKgid, usize, AtomicUsize);
@@ -23,8 +28,9 @@ pub enum CredFsCmp {
 }
 
 /// 凭证集
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Cred {
+    pub self_ref: Weak<Cred>,
     /// 进程实际uid
     pub uid: Kuid,
     /// 进程实际gid
@@ -37,6 +43,8 @@ pub struct Cred {
     pub euid: Kuid,
     /// 进程有效的gid
     pub egid: Kgid,
+    /// supplementary groups
+    pub groups: Vec<Kgid>,
     /// UID for VFS ops
     pub fsuid: Kuid,
     /// GID for VFS ops
@@ -53,11 +61,13 @@ pub struct Cred {
     pub cap_ambient: CAPFlags,
     /// supplementary groups for euid/fsgid
     pub group_info: Option<GroupInfo>,
+    pub user_ns: Arc<UserNamespace>,
 }
 
 impl Cred {
-    pub const fn init() -> Self {
-        Self {
+    fn init() -> Arc<Self> {
+        Arc::new_cyclic(|weak_self| Self {
+            self_ref: weak_self.clone(),
             uid: GLOBAL_ROOT_UID,
             gid: GLOBAL_ROOT_GID,
             suid: GLOBAL_ROOT_UID,
@@ -66,19 +76,29 @@ impl Cred {
             egid: GLOBAL_ROOT_GID,
             fsuid: GLOBAL_ROOT_UID,
             fsgid: GLOBAL_ROOT_GID,
+            groups: Vec::new(),
             cap_inheritable: CAPFlags::CAP_EMPTY_SET,
             cap_permitted: CAPFlags::CAP_FULL_SET,
             cap_effective: CAPFlags::CAP_FULL_SET,
             cap_bset: CAPFlags::CAP_FULL_SET,
             cap_ambient: CAPFlags::CAP_FULL_SET,
             group_info: None,
-        }
+            user_ns: INIT_USER_NAMESPACE.clone(),
+        })
+    }
+
+    pub fn new_arc(cred: Cred) -> Arc<Self> {
+        Arc::new_cyclic(|weak_self| {
+            let mut new_cred = cred;
+            new_cred.self_ref = weak_self.clone();
+            new_cred
+        })
     }
 
     #[allow(dead_code)]
     /// Compare two credentials with respect to filesystem access.
-    pub fn fscmp(&self, other: Cred) -> CredFsCmp {
-        if *self == other {
+    pub fn fscmp(&self, other: Arc<Cred>) -> CredFsCmp {
+        if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &other) {
             return CredFsCmp::Equal;
         }
 
@@ -161,6 +181,16 @@ impl Cred {
 
     pub fn setfsgid(&mut self, fsgid: usize) {
         self.fsgid.0 = fsgid;
+    }
+
+    /// Set supplementary groups
+    pub fn setgroups(&mut self, groups: Vec<Kgid>) {
+        self.groups = groups;
+    }
+
+    /// Get supplementary groups
+    pub fn getgroups(&self) -> &Vec<Kgid> {
+        &self.groups
     }
 }
 

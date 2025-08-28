@@ -246,7 +246,7 @@ impl ElfLoader {
             if err == SystemError::EEXIST {
                 error!(
                     "Pid: {:?}, elf segment at {:p} overlaps with existing mapping",
-                    ProcessManager::current_pcb().pid(),
+                    ProcessManager::current_pcb().raw_pid(),
                     addr_to_map.as_ptr::<u8>()
                 );
             }
@@ -618,7 +618,7 @@ impl ElfLoader {
     /// - `param`：执行参数
     /// - `ehdr`：文件头
     /// - `data_buf`：用于缓存SegmentTable的Vec。
-    ///     这是因为SegmentTable的生命周期与data_buf一致。初始化这个Vec的大小为0即可。
+    ///   这是因为SegmentTable的生命周期与data_buf一致。初始化这个Vec的大小为0即可。
     ///
     /// ## 说明
     ///
@@ -808,9 +808,10 @@ impl BinaryLoader for ElfLoader {
         }
         Self::parse_gnu_property()?;
 
-        // todo: 设置exec信息的功能 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1002
-        crate::process::execve::begin_new_exec(param)
-            .map_err(|e| ExecError::Other(format!("Failed to begin new exec: {:?}", e)))?;
+        param.begin_new_exec()?;
+
+        // todo: 补充逻辑：https://code.dragonos.org.cn/xref/linux-6.6.21/fs/binfmt_elf.c#1007
+        param.setup_new_exec();
 
         let mut elf_brk = VirtAddr::new(0);
         let mut elf_bss = VirtAddr::new(0);

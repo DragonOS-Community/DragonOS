@@ -1,6 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETPPID;
 use crate::process::ProcessManager;
+use crate::process::RawPid;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
@@ -16,7 +17,11 @@ impl Syscall for SysGetPpid {
     /// 获取当前进程的父进程id
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        return Ok(current_pcb.basic().ppid().into());
+        let parent_pcb = current_pcb.real_parent_pcb.read_irqsave().clone();
+        let parent_pcb = parent_pcb.upgrade().ok_or(SystemError::ESRCH)?;
+
+        let r = parent_pcb.task_tgid_vnr().unwrap_or(RawPid::new(0));
+        return Ok(r.into());
     }
 
     fn entry_format(&self, _args: &[usize]) -> Vec<FormattedSyscallParam> {

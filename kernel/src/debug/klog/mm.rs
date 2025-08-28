@@ -4,7 +4,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use klog_types::{AllocatorLog, AllocatorLogType, LogSource, MMLogChannel};
 
-use crate::{arch::CurrentTimeArch, libs::spinlock::SpinLock, process::Pid, time::TimeArch};
+use crate::{arch::CurrentTimeArch, libs::spinlock::SpinLock, process::RawPid, time::TimeArch};
 
 /// 全局的内存分配器日志通道
 ///
@@ -50,7 +50,7 @@ impl MMDebugLogManager {
     /// - `source`：日志来源
     /// - `pid`：日志来源的pid
     #[allow(dead_code)]
-    pub fn log(log_type: AllocatorLogType, source: LogSource, pid: Option<Pid>) {
+    pub fn log(log_type: AllocatorLogType, source: LogSource, pid: Option<RawPid>) {
         let id = __MM_DEBUG_LOG_IDA.lock_irqsave().alloc().unwrap();
         let log = AllocatorLog::new(
             id as u64,

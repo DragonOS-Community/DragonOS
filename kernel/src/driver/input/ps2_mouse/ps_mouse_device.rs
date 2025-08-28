@@ -28,7 +28,7 @@ use crate::{
     },
     exception::InterruptArch,
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
+        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         vfs::{
             syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
@@ -207,6 +207,7 @@ impl Ps2MouseDevice {
                     raw_dev: DeviceNumber::default(), // 这里用来作为device number
                 },
                 device_inode_fs: None,
+                parent: Weak::new(),
             }),
             kobj_state: LockedKObjectState::new(None),
         };
@@ -406,7 +407,7 @@ impl Ps2MouseDevice {
         Err(SystemError::ETIMEDOUT)
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerPs2MouseDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerPs2MouseDevice> {
         self.inner.lock_irqsave()
     }
 }
@@ -424,6 +425,7 @@ struct InnerPs2MouseDevice {
 
     /// device inode要求的字段
     device_inode_fs: Option<Weak<DevFS>>,
+    parent: Weak<LockedDevFSInode>,
     devfs_metadata: Metadata,
 }
 
@@ -570,11 +572,11 @@ impl KObject for Ps2MouseDevice {
 
     fn set_name(&self, _name: alloc::string::String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -586,6 +588,10 @@ impl KObject for Ps2MouseDevice {
 impl DeviceINode for Ps2MouseDevice {
     fn set_fs(&self, fs: Weak<DevFS>) {
         self.inner.lock_irqsave().device_inode_fs = Some(fs);
+    }
+
+    fn set_parent(&self, parent: Weak<crate::filesystem::devfs::LockedDevFSInode>) {
+        self.inner.lock_irqsave().parent = parent;
     }
 }
 
@@ -663,6 +669,14 @@ impl IndexNode for Ps2MouseDevice {
 
     fn dname(&self) -> Result<DName, SystemError> {
         Ok(DName::from(self.name()))
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let guard = self.inner.lock_irqsave();
+        if let Some(parent) = guard.parent.upgrade() {
+            return Ok(parent);
+        }
+        Err(SystemError::ENOENT)
     }
 }
 

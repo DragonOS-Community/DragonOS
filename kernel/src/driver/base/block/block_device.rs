@@ -197,7 +197,7 @@ impl BlockRange {
     /// 判断是不是多个整块连在一起
     pub fn is_multi(&self) -> bool {
         return self.len() >= (1usize << self.blk_size_log2)
-            && (self.len() % (1usize << self.blk_size_log2) == 0);
+            && self.len().is_multiple_of(1usize << self.blk_size_log2);
     }
     /// 获取 BlockRange 在块设备内部的起始位置 (单位是字节)
     pub fn origin_begin(&self) -> usize {
@@ -530,8 +530,14 @@ impl BlockDeviceOps {
             );
         }
         if minorct > DeviceNumber::MINOR_MASK + 1 - baseminor {
-            error!("DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
-                name, baseminor, baseminor + minorct - 1, 0, DeviceNumber::MINOR_MASK);
+            error!(
+                "DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
+                name,
+                baseminor,
+                baseminor + minorct - 1,
+                0,
+                DeviceNumber::MINOR_MASK
+            );
         }
         let blockdev = DeviceStruct::new(DeviceNumber::new(major, baseminor), minorct, name);
         if major == Major::UNNAMED_MAJOR {

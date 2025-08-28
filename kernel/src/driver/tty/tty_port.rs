@@ -65,7 +65,7 @@ pub enum TtyPortState {
 }
 
 pub trait TtyPort: Sync + Send + Debug {
-    fn port_data(&self) -> SpinLockGuard<TtyPortData>;
+    fn port_data(&self) -> SpinLockGuard<'_, TtyPortData>;
 
     /// 获取Port的状态
     fn state(&self) -> TtyPortState {
@@ -90,6 +90,10 @@ pub trait TtyPort: Sync + Send + Debug {
         EventPoll::wakeup_epoll(tty.core().eptiems(), pollflag)?;
         ret
     }
+
+    fn internal_tty(&self) -> Option<Arc<TtyCore>> {
+        self.port_data().internal_tty()
+    }
 }
 
 #[derive(Debug)]
@@ -106,7 +110,7 @@ impl DefaultTtyPort {
 }
 
 impl TtyPort for DefaultTtyPort {
-    fn port_data(&self) -> SpinLockGuard<TtyPortData> {
+    fn port_data(&self) -> SpinLockGuard<'_, TtyPortData> {
         self.port_data.lock_irqsave()
     }
 }

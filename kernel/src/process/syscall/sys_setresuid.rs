@@ -1,10 +1,12 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETRESUID;
+use crate::process::cred::Cred;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
 use system_error::SystemError;
+
 pub struct SysSetResUid;
 
 impl SysSetResUid {
@@ -26,13 +28,16 @@ impl Syscall for SysSetResUid {
         if euid == usize::MAX || (euid == guard.euid.data() && euid == guard.fsuid.data()) {
             return Ok(0);
         }
+        let mut new_cred = (**guard).clone();
 
         if euid != usize::MAX {
-            guard.seteuid(euid);
+            new_cred.seteuid(euid);
         }
 
         let euid = guard.euid.data();
-        guard.setfsuid(euid);
+        new_cred.setfsuid(euid);
+
+        *guard = Cred::new_arc(new_cred);
 
         return Ok(0);
     }

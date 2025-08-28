@@ -26,12 +26,13 @@ use crate::{
         serial::serial_init,
     },
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
+        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
+        devpts::{DevPtsFs, LockedDevPtsFSInode},
         epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
-            file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
-            PollableInode,
+            file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileType, IndexNode,
+            Metadata, PollableInode,
         },
     },
     init::initcall::INITCALL_DEVICE,
@@ -107,7 +108,19 @@ pub struct TtyDevice {
     inner: RwLock<InnerTtyDevice>,
     kobj_state: LockedKObjectState,
     /// TTY所属的文件系统
-    fs: RwLock<Weak<DevFS>>,
+    fs: RwLock<TtyDeviceFs>,
+    parent: RwLock<TtyDeviceParent>,
+}
+
+pub enum TtyDeviceFs {
+    DevFs(Weak<DevFS>),
+    DevPtsFs(Weak<DevPtsFs>),
+    None,
+}
+pub enum TtyDeviceParent {
+    DevFS(Weak<LockedDevFSInode>),
+    DevPts(Weak<LockedDevPtsFSInode>),
+    None,
 }
 
 impl TtyDevice {
@@ -118,7 +131,8 @@ impl TtyDevice {
             id_table,
             inner: RwLock::new(InnerTtyDevice::new()),
             kobj_state: LockedKObjectState::new(None),
-            fs: RwLock::new(Weak::default()),
+            fs: RwLock::new(TtyDeviceFs::None),
+            parent: RwLock::new(TtyDeviceParent::None),
             tty_type,
         };
 
@@ -127,7 +141,7 @@ impl TtyDevice {
         Arc::new(dev)
     }
 
-    pub fn inner_write(&self) -> RwLockWriteGuard<InnerTtyDevice> {
+    pub fn inner_write(&self) -> RwLockWriteGuard<'_, InnerTtyDevice> {
         self.inner.write()
     }
 
@@ -142,6 +156,29 @@ impl TtyDevice {
             return Err(SystemError::EIO);
         };
         Ok(tty)
+    }
+
+    /// tty_open_current_tty - get locked tty of current task
+    #[inline(never)]
+    fn open_current_tty(
+        &self,
+        dev_num: DeviceNumber,
+        data: &mut FilePrivateData,
+    ) -> Option<Arc<TtyCore>> {
+        // log::debug!("open_current_tty: dev_num: {}", dev_num);
+        if dev_num != DeviceNumber::new(Major::TTYAUX_MAJOR, 0) {
+            // log::debug!("Not a tty device, dev_num: {}", dev_num);
+            return None;
+        }
+
+        let current_tty = TtyJobCtrlManager::get_current_tty()?;
+
+        if let FilePrivateData::Tty(tty_priv) = data {
+            tty_priv.mode.insert(FileMode::O_NONBLOCK);
+        }
+
+        current_tty.reopen().ok()?;
+        Some(current_tty)
     }
 }
 
@@ -187,24 +224,32 @@ impl IndexNode for TtyDevice {
         mut data: SpinLockGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
-        if let FilePrivateData::Tty(_) = &*data {
-            return Ok(());
-        }
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
             return ptmx_open(data, mode);
         }
         let dev_num = self.metadata()?.raw_dev;
+        // log::debug!(
+        //     "TtyDevice::open: dev_num: {}, current pid: {}",
+        //     dev_num,
+        //     ProcessManager::current_pid()
+        // );
+        let mut tty = self.open_current_tty(dev_num, &mut data);
+        if tty.is_none() {
+            let (index, driver) =
+                TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
 
-        let (index, driver) =
-            TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
+            tty = Some(driver.open_tty(Some(index))?);
+        }
 
-        let tty = driver.open_tty(Some(index))?;
+        let tty = tty.unwrap();
 
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
             tty: tty.clone(),
             mode: *mode,
         });
+
+        tty.core().contorl_info_irqsave().clear_dead_session();
 
         let ret = tty.open(tty.core());
         if let Err(err) = ret {
@@ -223,7 +268,12 @@ impl IndexNode for TtyDevice {
         {
             let pcb = ProcessManager::current_pcb();
             let pcb_tty = pcb.sig_info_irqsave().tty();
-            if pcb_tty.is_none() && tty.core().contorl_info_irqsave().session.is_none() {
+
+            let cond1 = pcb_tty.is_none();
+            let _cond2 = tty.core().contorl_info_irqsave().session.is_none();
+
+            // 注意！！这里为了debug,临时把cond2的判断去掉了，其实要cond1 && cond2才对
+            if cond1 {
                 TtyJobCtrlManager::proc_set_tty(tty);
             }
         }
@@ -325,7 +375,17 @@ impl IndexNode for TtyDevice {
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!()
+        match &*self.fs.read() {
+            TtyDeviceFs::DevFs(fs) => fs.upgrade().unwrap(),
+            TtyDeviceFs::DevPtsFs(fs) => fs.upgrade().unwrap(),
+            TtyDeviceFs::None => {
+                panic!("TtyDevice has no filesystem set");
+            }
+        }
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.name.clone().into())
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -353,6 +413,7 @@ impl IndexNode for TtyDevice {
         } else {
             return Err(SystemError::EIO);
         };
+
         drop(data);
         tty.close(tty.clone())
     }
@@ -446,11 +507,32 @@ impl IndexNode for TtyDevice {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Ok(self)
     }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let parent = self.parent.read();
+        match &*parent {
+            TtyDeviceParent::DevFS(devfs) => Ok(devfs.upgrade().unwrap()),
+            TtyDeviceParent::DevPts(devpts) => Ok(devpts.upgrade().unwrap()),
+            TtyDeviceParent::None => panic!("TtyDevice has no filesystem set"),
+        }
+    }
 }
 
 impl DeviceINode for TtyDevice {
     fn set_fs(&self, fs: alloc::sync::Weak<crate::filesystem::devfs::DevFS>) {
-        *self.fs.write() = fs;
+        *self.fs.write() = TtyDeviceFs::DevFs(fs);
+    }
+
+    fn set_parent(&self, parent: Weak<crate::filesystem::devfs::LockedDevFSInode>) {
+        *self.parent.write() = TtyDeviceParent::DevFS(parent);
+    }
+
+    fn set_devpts_fs(&self, devpts: Weak<crate::filesystem::devpts::DevPtsFs>) {
+        *self.fs.write() = TtyDeviceFs::DevPtsFs(devpts);
+    }
+
+    fn set_devpts_parent(&self, parent: Weak<LockedDevPtsFSInode>) {
+        *self.parent.write() = TtyDeviceParent::DevPts(parent);
     }
 }
 
@@ -499,13 +581,13 @@ impl KObject for TtyDevice {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.read()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.write()
     }
 
@@ -610,6 +692,14 @@ impl TtyFilePrivateData {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn tty_init() -> Result<(), SystemError> {
+    let tty_device = TtyDevice::new(
+        "tty".to_string(),
+        IdTable::new(
+            String::from("tty"),
+            Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 0)),
+        ),
+        TtyType::Tty,
+    );
     let console = TtyDevice::new(
         "console".to_string(),
         IdTable::new(
@@ -619,9 +709,13 @@ pub fn tty_init() -> Result<(), SystemError> {
         TtyType::Tty,
     );
 
-    // 将设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
-    device_register(console.clone())?;
-    devfs_register(&console.name.clone(), console)?;
+    let devs = [tty_device, console];
+
+    for dev in devs {
+        // 将设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
+        device_register(dev.clone())?;
+        devfs_register(&dev.name.clone(), dev)?;
+    }
 
     serial_init()?;
 

@@ -76,10 +76,10 @@ impl Syscall for SysClone {
         ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
         // 向procfs注册进程
-        procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {
+        procfs_register_pid(pcb.raw_pid()).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to register pid to procfs, pid: [{:?}]. Error: {:?}",
-                pcb.pid(),
+                pcb.raw_pid(),
                 e
             )
         });
@@ -92,13 +92,13 @@ impl Syscall for SysClone {
             let addr = pcb.thread.read_irqsave().set_child_tid.unwrap();
             let mut writer =
                 UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
-            writer.copy_one_to_user(&(pcb.pid().data() as i32), 0)?;
+            writer.copy_one_to_user(&(pcb.raw_pid().data() as i32), 0)?;
         }
 
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
-                pcb.pid(),
+                pcb.raw_pid(),
                 e
             )
         });
@@ -108,7 +108,7 @@ impl Syscall for SysClone {
             vfork.wait_for_completion_interruptible()?;
         }
 
-        return Ok(pcb.pid().0);
+        return Ok(pcb.raw_pid().0);
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

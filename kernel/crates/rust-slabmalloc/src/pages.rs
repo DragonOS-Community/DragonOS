@@ -72,7 +72,7 @@ impl Bitfield for [AtomicU64] {
                 }
 
                 let addr: usize = base_addr + offset;
-                let alignment_ok = addr % layout.align() == 0;
+                let alignment_ok = addr.is_multiple_of(layout.align());
                 let block_is_free = bitval & (1 << first_free) == 0;
                 if alignment_ok && block_is_free {
                     return Some((idx, addr));
@@ -209,7 +209,7 @@ pub trait AllocablePage {
             layout
         );
         let page_offset = (ptr.as_ptr() as usize) & (Self::SIZE - 1);
-        assert!(page_offset % layout.size() == 0);
+        assert!(page_offset.is_multiple_of(layout.size()));
         let idx = page_offset / layout.size();
         assert!(
             self.bitfield().is_allocated(idx),

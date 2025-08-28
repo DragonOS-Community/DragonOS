@@ -50,7 +50,7 @@ impl EFIMemoryMapInfo {
     }
 
     /// 迭代所有的内存描述符
-    pub fn iter(&self) -> EFIMemoryDescIter {
+    pub fn iter(&self) -> EFIMemoryDescIter<'_> {
         EFIMemoryDescIter::new(self)
     }
 }

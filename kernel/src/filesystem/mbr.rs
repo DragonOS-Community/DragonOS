@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// @brief MBR硬盘分区表项的结构
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MbrDiskPartitionTableEntry {
     pub flags: u8,                     // 引导标志符，标记此分区为活动分区
@@ -51,7 +51,7 @@ impl MbrDiskPartitionTableEntry {
 }
 
 /// @brief MBR磁盘分区表结构体
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct MbrDiskPartionTable {
     pub _reserved: [u8; 446],
@@ -148,7 +148,7 @@ impl MbrDiskPartionTable {
     }
 
     /// # partitions_raw - 获取磁盘的分区信息，不包含磁盘设备信息
-    pub fn partitions_raw(&self) -> MbrPartitionIter {
+    pub fn partitions_raw(&self) -> MbrPartitionIter<'_> {
         MbrPartitionIter::new(self)
     }
 

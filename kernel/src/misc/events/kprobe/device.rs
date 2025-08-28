@@ -44,7 +44,7 @@ impl KprobeDevice {
         return Arc::new(bus_device);
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerKprobeDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerKprobeDevice> {
         self.inner.lock()
     }
 }
@@ -92,11 +92,11 @@ impl KObject for KprobeDevice {
 
     fn set_name(&self, _name: String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

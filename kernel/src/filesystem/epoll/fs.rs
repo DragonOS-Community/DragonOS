@@ -1,3 +1,5 @@
+use alloc::string::String;
+
 use crate::{
     filesystem::vfs::{file::FileMode, FilePrivateData, IndexNode, Metadata},
     libs::spinlock::SpinLockGuard,
@@ -73,5 +75,9 @@ impl IndexNode for EPollInode {
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn absolute_path(&self) -> Result<String, SystemError> {
+        Ok(String::from("epoll"))
     }
 }

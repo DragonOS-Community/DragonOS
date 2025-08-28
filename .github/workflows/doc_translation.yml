@@ -52,7 +52,6 @@ jobs:
           branch: "dragonosbot/docs-translation-update"
           branch-suffix: "timestamp"
           base: ${{ github.ref_name }}
-          author: bot <bot@dragonos.org>
           delete-branch: true
           reviewers: fslongjin
           assignees: fslongjin

@@ -1,6 +1,6 @@
 //! 静态位图的集成测试
 
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 
 /// 测试空的位图
 ///
@@ -10,7 +10,7 @@ use bitmap::{traits::BitMapOps, StaticBitmap};
 /// 测试空的位图
 #[test]
 fn test_empty_bitmap_32() {
-    let mut bitmap = StaticBitmap::<32>::new();
+    let mut bitmap: static_bitmap!(32) = StaticBitmap::new();
     assert_eq!(bitmap.len(), 32);
     assert_eq!(bitmap.size(), 8);
     assert_eq!(bitmap.first_index(), None);
@@ -40,7 +40,7 @@ fn test_empty_bitmap_32() {
 
 #[test]
 fn test_empty_bitmap_64() {
-    let mut bitmap = StaticBitmap::<64>::new();
+    let mut bitmap: static_bitmap!(64) = StaticBitmap::new();
     assert_eq!(bitmap.len(), 64);
     assert_eq!(bitmap.size(), 8);
     assert_eq!(bitmap.first_index(), None);
@@ -71,7 +71,7 @@ fn test_empty_bitmap_64() {
 /// 测试长度为32的bmp，其中第一个元素为1
 #[test]
 fn test_static_bitmap_32_first_1() {
-    let mut bitmap = StaticBitmap::<32>::new();
+    let mut bitmap: static_bitmap!(32) = StaticBitmap::new();
     bitmap.set(0, true);
     assert_eq!(bitmap.len(), 32);
     assert_eq!(bitmap.size(), 8);
@@ -112,7 +112,7 @@ fn test_static_bitmap_32_first_1() {
 /// 测试长度为32的bmp，其中中间某个元素为1
 #[test]
 fn test_static_bitmap_32_middle_1() {
-    let mut bitmap = StaticBitmap::<32>::new();
+    let mut bitmap: static_bitmap!(32) = StaticBitmap::new();
     bitmap.set(15, true);
     assert_eq!(bitmap.len(), 32);
     assert_eq!(bitmap.size(), 8);
@@ -154,7 +154,7 @@ fn test_static_bitmap_32_middle_1() {
 /// 测试长度为32的bmp，其中最后一个元素为1
 #[test]
 fn test_static_bitmap_32_last_1() {
-    let mut bitmap = StaticBitmap::<32>::new();
+    let mut bitmap: static_bitmap!(32) = StaticBitmap::new();
     bitmap.set(31, true);
     assert_eq!(bitmap.len(), 32);
     assert_eq!(bitmap.size(), 8);
@@ -196,7 +196,7 @@ fn test_static_bitmap_32_last_1() {
 /// 测试长度为64的bmp，其中第一个元素为1
 #[test]
 fn test_static_bitmap_64_first_1() {
-    let mut bitmap = StaticBitmap::<64>::new();
+    let mut bitmap: static_bitmap!(64) = StaticBitmap::new();
     bitmap.set(0, true);
     assert_eq!(bitmap.len(), 64);
     assert_eq!(bitmap.size(), 8);
@@ -237,7 +237,7 @@ fn test_static_bitmap_64_first_1() {
 /// 测试长度为64的bmp，其中中间某个元素为1
 #[test]
 fn test_static_bitmap_64_middle_1() {
-    let mut bitmap = StaticBitmap::<64>::new();
+    let mut bitmap: static_bitmap!(64) = StaticBitmap::new();
     bitmap.set(15, true);
     assert_eq!(bitmap.len(), 64);
     assert_eq!(bitmap.size(), 8);
@@ -279,7 +279,7 @@ fn test_static_bitmap_64_middle_1() {
 /// 测试长度为64的bmp，其中最后一个元素为1
 #[test]
 fn test_static_bitmap_64_last_1() {
-    let mut bitmap = StaticBitmap::<64>::new();
+    let mut bitmap: static_bitmap!(64) = StaticBitmap::new();
     bitmap.set(63, true);
     assert_eq!(bitmap.len(), 64);
     assert_eq!(bitmap.size(), 8);
@@ -321,7 +321,7 @@ fn test_static_bitmap_64_last_1() {
 /// 测试长度为64的bmp，其中第一个和最后一个元素为1
 #[test]
 fn test_static_bitmap_64_two_1_first() {
-    let mut bitmap = StaticBitmap::<64>::new();
+    let mut bitmap: static_bitmap!(64) = StaticBitmap::new();
     bitmap.set(0, true);
     bitmap.set(63, true);
 
@@ -362,7 +362,7 @@ fn test_static_bitmap_64_two_1_first() {
 /// 测试长度为64的bmp，中间两个不相邻的元素为1
 #[test]
 fn test_static_bitmap_64_two_1_middle() {
-    let mut bitmap = StaticBitmap::<64>::new();
+    let mut bitmap: static_bitmap!(64) = StaticBitmap::new();
     bitmap.set(15, true);
     bitmap.set(63, true);
 
@@ -404,7 +404,7 @@ fn test_static_bitmap_64_two_1_middle() {
 
 #[test]
 fn test_static_bitmap_128_two_1_seperate_first() {
-    let mut bitmap = StaticBitmap::<128>::new();
+    let mut bitmap: static_bitmap!(128) = StaticBitmap::new();
 
     bitmap.set(0, true);
     bitmap.set(127, true);
@@ -444,7 +444,7 @@ fn test_static_bitmap_128_two_1_seperate_first() {
 /// 长度128, 第63、64bit为1
 #[test]
 fn test_static_bitmap_128_two_1_nearby_middle() {
-    let mut bitmap = StaticBitmap::<128>::new();
+    let mut bitmap: static_bitmap!(128) = StaticBitmap::new();
 
     bitmap.set(63, true);
     bitmap.set(64, true);
@@ -494,7 +494,7 @@ fn test_static_bitmap_128_two_1_nearby_middle() {
 
 #[test]
 fn test_static_bitmap_full_32() {
-    let mut bitmap = StaticBitmap::<32>::new();
+    let mut bitmap: static_bitmap!(32) = StaticBitmap::new();
     bitmap.set_all(true);
 
     assert_eq!(bitmap.len(), 32);
@@ -532,7 +532,7 @@ fn test_static_bitmap_full_32() {
 
 #[test]
 fn test_static_bitmap_full_64() {
-    let mut bitmap = StaticBitmap::<64>::new();
+    let mut bitmap: static_bitmap!(64) = StaticBitmap::new();
     bitmap.set_all(true);
 
     assert_eq!(bitmap.len(), 64);
@@ -570,7 +570,7 @@ fn test_static_bitmap_full_64() {
 
 #[test]
 fn test_static_bitmap_full_100() {
-    let mut bitmap = StaticBitmap::<100>::new();
+    let mut bitmap: static_bitmap!(100) = StaticBitmap::new();
     bitmap.set_all(true);
 
     assert_eq!(bitmap.len(), 100);
@@ -608,7 +608,7 @@ fn test_static_bitmap_full_100() {
 
 #[test]
 fn test_static_bitmap_full_128() {
-    let mut bitmap = StaticBitmap::<128>::new();
+    let mut bitmap: static_bitmap!(128) = StaticBitmap::new();
     bitmap.set_all(true);
 
     assert_eq!(bitmap.len(), 128);

@@ -358,6 +358,7 @@ fn warn_no_thread(irq: IrqNumber, action_inner: &mut SpinLockGuard<'_, InnerIrqA
 /// `action->percpu_dev_id`是一个指向per-cpu变量的指针，这些变量
 /// 包含调用此处理程序的cpu的真实设备id
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PerCpuDevIdIrqHandler;
 
 impl IrqFlowHandler for PerCpuDevIdIrqHandler {

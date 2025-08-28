@@ -29,7 +29,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
-    process::{Pid, ProcessManager},
+    process::{ProcessManager, RawPid},
     sched::{schedule, SchedMode},
 };
 
@@ -276,11 +276,11 @@ impl SocketInode {
     }
 
     #[inline]
-    pub fn inner(&self) -> SpinLockGuard<Box<dyn Socket>> {
+    pub fn inner(&self) -> SpinLockGuard<'_, Box<dyn Socket>> {
         self.0.lock()
     }
 
-    pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
+    pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<'_, Box<dyn Socket>> {
         self.0.lock_no_preempt()
     }
 
@@ -405,6 +405,10 @@ impl IndexNode for SocketInode {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Ok(self)
     }
+
+    fn absolute_path(&self) -> Result<String, SystemError> {
+        Ok(String::from("socket"))
+    }
 }
 
 #[derive(Debug)]
@@ -478,7 +482,7 @@ impl SocketHandleItem {
         *self.shutdown_type.read()
     }
 
-    pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
+    pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<'_, ShutdownType> {
         self.shutdown_type.write_irqsave()
     }
 
@@ -495,9 +499,9 @@ impl SocketHandleItem {
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
 pub struct PortManager {
     // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, Pid>>,
+    tcp_port_table: SpinLock<HashMap<u16, RawPid>>,
     // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, Pid>>,
+    udp_port_table: SpinLock<HashMap<u16, RawPid>>,
 }
 
 impl PortManager {

@@ -134,6 +134,10 @@ impl IndexNode for KprobePerfEvent {
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         None
     }
+
+    fn absolute_path(&self) -> core::result::Result<String, SystemError> {
+        Ok(String::from("kprobe_perf_event"))
+    }
 }
 
 impl PerfEventOps for KprobePerfEvent {

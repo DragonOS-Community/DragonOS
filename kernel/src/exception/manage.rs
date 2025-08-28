@@ -76,8 +76,8 @@ impl IrqManager {
     ///
     /// - irq: 虚拟中断号
     /// - handler: 当中断发生时将被调用的函数，是
-    ///     线程化中断的初级处理程序。如果handler为`None`并且thread_fn不为`None`，
-    ///    将安装默认的初级处理程序
+    ///   线程化中断的初级处理程序。如果handler为`None`并且thread_fn不为`None`，
+    ///   将安装默认的初级处理程序
     /// - thread_fn: 在中断处理程序线程中调用的函数. 如果为`None`，则不会创建irq线程
     /// - flags: 中断处理标志
     ///     - IRQF_SHARED: 中断是共享的
@@ -224,12 +224,14 @@ impl IrqManager {
             .flags()
             .contains(IrqHandleFlags::IRQF_PROBE_SHARED)
         {
-            error!("Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}", 
+            error!(
+                "Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}",
                 desc.irq_data().irq().data(),
                 action_guard.name(),
                 action_guard.flags(),
                 old_action_guard.name(),
-                old_action_guard.flags());
+                old_action_guard.flags()
+            );
         }
         self.handle_unlock_error(
             SystemError::EBUSY,
@@ -470,7 +472,7 @@ impl IrqManager {
             #[inline(never)]
             fn __tmp_log(irq: &IrqNumber, name: &str) {
                 error!(
-                "Requesting irq {} without a handler, and ONESHOT flags not set for irqaction: {}",
+                    "Requesting irq {} without a handler, and ONESHOT flags not set for irqaction: {}",
                     irq.data(),
                     name,
                 );
@@ -638,7 +640,10 @@ impl IrqManager {
                     new_trigger_type: IrqLineStatus,
                     irq: &IrqNumber,
                 ) {
-                    warn!("Irq {} uses trigger type: {old_trigger_type:?}, but requested trigger type: {new_trigger_type:?}.", irq.data());
+                    warn!(
+                        "Irq {} uses trigger type: {old_trigger_type:?}, but requested trigger type: {new_trigger_type:?}.",
+                        irq.data()
+                    );
                 }
 
                 ___tmp_log_irq_line_status_change(old_trigger_type, new_trigger_type, &irq);

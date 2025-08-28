@@ -131,7 +131,7 @@ impl BootCallbacks for Mb2Callback {
             }
         };
 
-        scinfo.lfb_size = (width * height * ((scinfo.lfb_depth as u32 + 7) / 8)) as usize;
+        scinfo.lfb_size = (width * height * (scinfo.lfb_depth as u32).div_ceil(8)) as usize;
 
         scinfo.lfb_virt_base = Some(vesafb_early_map(scinfo.lfb_base, scinfo.lfb_size)?);
 

@@ -112,7 +112,7 @@ impl LockedVMControlStructure {
         })
     }
 
-    pub fn lock(&self) -> SpinLockGuard<Box<VMControlStructure>> {
+    pub fn lock(&self) -> SpinLockGuard<'_, Box<VMControlStructure>> {
         self.inner.lock()
     }
 
@@ -348,7 +348,7 @@ impl LockedLoadedVmcs {
         })
     }
 
-    pub fn lock(&self) -> SpinLockGuard<LoadedVmcs> {
+    pub fn lock(&self) -> SpinLockGuard<'_, LoadedVmcs> {
         self.inner.lock()
     }
 }

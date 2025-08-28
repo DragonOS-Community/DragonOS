@@ -644,8 +644,7 @@ impl CfsRunQueue {
 
         let mut vruntime = self.min_vruntime;
 
-        if curr.is_some() {
-            let curr = curr.as_ref().unwrap();
+        if let Some(curr) = curr.as_ref() {
             if curr.on_rq() {
                 vruntime = curr.vruntime;
             } else {

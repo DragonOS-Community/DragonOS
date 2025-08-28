@@ -147,7 +147,7 @@ impl EarlyIoRemap {
     ///
     /// - Ok: 成功
     /// - Err(SystemError::EINVAL): 传入的虚拟地址不在early io remap范围内,
-    ///     或者虚拟地址未映射
+    ///   或者虚拟地址未映射
     #[allow(dead_code)]
     pub fn unmap(virt: VirtAddr) -> Result<(), SystemError> {
         if virt < MMArch::FIXMAP_START_VADDR || virt >= MMArch::FIXMAP_END_VADDR {

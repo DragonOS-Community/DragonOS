@@ -112,7 +112,7 @@ impl PciTransport {
     ///
     /// - `device` - The PCI device structure for the VirtIO device.
     /// - `irq_handler` - An optional handler for the device's interrupt. If `None`, a default
-    ///     handler `DefaultVirtioIrqHandler` will be used.
+    ///   handler `DefaultVirtioIrqHandler` will be used.
     /// - `irq_number_offset` - Currently, this parameter is just simple make a offset to the irq number, cause it's not be allowed to have the same irq number within different device
     #[allow(clippy::extra_unused_type_parameters)]
     pub fn new<H: Hal>(
@@ -533,7 +533,7 @@ fn get_bar_region<T>(
         .virtual_address()
         .ok_or(VirtioPciError::BarGetVaddrFailed)?)
         + struct_info.offset as usize;
-    if vaddr.data() % align_of::<T>() != 0 {
+    if !vaddr.data().is_multiple_of(align_of::<T>()) {
         return Err(VirtioPciError::Misaligned {
             vaddr,
             alignment: align_of::<T>(),

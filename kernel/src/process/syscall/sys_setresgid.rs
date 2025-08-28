@@ -1,10 +1,12 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETRESGID;
+use crate::process::cred::Cred;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
 use system_error::SystemError;
+
 pub struct SysSetResGid;
 
 impl SysSetResGid {
@@ -27,12 +29,16 @@ impl Syscall for SysSetResGid {
             return Ok(0);
         }
 
+        let mut new_cred = (**guard).clone();
+
         if egid != usize::MAX {
-            guard.setegid(egid);
+            new_cred.setegid(egid);
         }
 
         let egid = guard.egid.data();
-        guard.setfsgid(egid);
+        new_cred.setfsgid(egid);
+
+        *guard = Cred::new_arc(new_cred);
 
         return Ok(0);
     }

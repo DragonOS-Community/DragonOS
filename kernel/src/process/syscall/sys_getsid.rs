@@ -1,17 +1,16 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSID;
-use crate::process::Pid;
 use crate::process::ProcessManager;
+use crate::process::RawPid;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 pub struct SysGetsid;
 
 impl SysGetsid {
-    fn pid(args: &[usize]) -> Pid {
-        Pid::new(args[0])
+    fn pid(args: &[usize]) -> RawPid {
+        RawPid::new(args[0])
     }
 }
 
@@ -31,16 +30,15 @@ impl Syscall for SysGetsid {
     /// - pid: 指定一个进程号
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = Self::pid(args);
-        let session = ProcessManager::current_pcb().session().unwrap();
-        let sid = session.sid().into();
-        if pid == Pid(0) {
-            return Ok(sid);
-        }
-        let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
-        if !Arc::ptr_eq(&session, &pcb.session().unwrap()) {
-            return Err(SystemError::EPERM);
-        }
-        return Ok(sid);
+        let sid = if pid.data() == 0 {
+            ProcessManager::current_pcb()
+                .task_session()
+                .ok_or(SystemError::ESRCH)?
+        } else {
+            let p = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
+            p.task_session().ok_or(SystemError::ESRCH)?
+        };
+        return Ok(sid.pid_vnr().into());
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

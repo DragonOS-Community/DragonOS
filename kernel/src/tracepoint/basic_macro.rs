@@ -110,7 +110,7 @@ macro_rules! define_event_trace{
                 };
 
                 let process = $crate::process::ProcessManager::current_pcb();
-                let pid = process.pid().data() as _;
+                let pid = process.raw_pid().data() as _;
 
                 let common = $crate::tracepoint::TraceEntry {
                     type_: [<__ $name>].id() as _,

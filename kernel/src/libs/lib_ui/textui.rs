@@ -300,7 +300,7 @@ pub struct TextuiBuf<'a> {
 }
 
 impl TextuiBuf<'_> {
-    pub fn new(buf: &mut ScmBufferInfo) -> TextuiBuf {
+    pub fn new(buf: &mut ScmBufferInfo) -> TextuiBuf<'_> {
         let len = buf.buf_size() / 4;
         let depth = video_refresh_manager().device_buffer().bit_depth();
         match &buf.buf {

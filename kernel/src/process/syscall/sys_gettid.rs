@@ -14,7 +14,7 @@ impl Syscall for SysGetTid {
 
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        return Ok(pcb.pid.into());
+        return Ok(pcb.task_pid_vnr().into());
     }
 
     fn entry_format(&self, _args: &[usize]) -> Vec<FormattedSyscallParam> {

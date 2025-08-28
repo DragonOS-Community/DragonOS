@@ -16,6 +16,8 @@ cfg_if! {
     }
 }
 
+const MAX_PANIC_COUNT: u8 = 2;
+
 #[derive(Debug)]
 struct PanicGuard;
 
@@ -36,10 +38,12 @@ impl Drop for PanicGuard {
 ///
 #[cfg(target_os = "none")]
 #[panic_handler]
-#[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {
     PANIC_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    error!("Kernel Panic Occurred.");
+    error!(
+        "Kernel Panic Occurred. raw_pid: {}",
+        process::ProcessManager::current_pid().data()
+    );
 
     match info.location() {
         Some(loc) => {
@@ -55,7 +59,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
     println!("Message:\n\t{}", info.message());
-    if PANIC_COUNTER.load(core::sync::atomic::Ordering::Relaxed) > 8 {
+    if PANIC_COUNTER.load(core::sync::atomic::Ordering::Relaxed) > MAX_PANIC_COUNT {
         println!(
             "Panic Counter: {}, too many panics, halt.",
             PANIC_COUNTER.load(core::sync::atomic::Ordering::Relaxed)

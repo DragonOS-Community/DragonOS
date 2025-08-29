@@ -1,18 +1,15 @@
 use crate::{
-    driver::net::{register_netdevice, veth::VethInterface, Iface, NetDeivceState, Operstate},
-    init::initcall::INITCALL_DEVICE,
-    libs::{rwlock::RwLock, spinlock::SpinLock, wait_queue::WaitQueue},
-    process::{
-        kthread::{KernelThreadClosure, KernelThreadMechanism},
-        namespace::net_namespace::INIT_NET_NAMESPACE,
-        ProcessState,
+    driver::net::{
+        napi::napi_schedule, register_netdevice, veth::VethInterface, Iface, NetDeivceState,
+        Operstate,
     },
+    init::initcall::INITCALL_DEVICE,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+    process::namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
     time::Instant,
 };
-use alloc::boxed::Box;
-use alloc::collections::VecDeque;
+use alloc::string::ToString;
 use alloc::sync::Weak;
-use alloc::vec::Vec;
 use alloc::{collections::BTreeMap, string::String, sync::Arc};
 use core::sync::atomic::AtomicUsize;
 use hashbrown::HashMap;
@@ -58,7 +55,7 @@ struct MacEntryRecord {
 pub struct BridgePort {
     pub id: BridgePortId,
     pub(super) bridge_enable: Arc<dyn BridgeEnableDevice>,
-    pub(super) bridge_iface: Weak<BridgeIface>,
+    pub(super) bridge_driver_ref: Weak<BridgeDriver>,
     // 当前接口状态？forwarding, learning, blocking?
     // mac mtu信息
 }
@@ -67,21 +64,19 @@ impl BridgePort {
     fn new(
         id: BridgePortId,
         device: Arc<dyn BridgeEnableDevice>,
-        bridge: &Arc<BridgeIface>,
+        bridge: &Arc<BridgeDriver>,
     ) -> Self {
-        BridgePort {
+        let port = BridgePort {
             id,
-            bridge_enable: device,
-            bridge_iface: Arc::downgrade(bridge),
-        }
+            bridge_enable: device.clone(),
+            bridge_driver_ref: Arc::downgrade(bridge),
+        };
+
+        device.set_common_bridge_data(&port);
+
+        port
     }
-
-    // fn mac(&self) -> EthernetAddress {
-    //     self.bridge_enable.mac()
-    // }
 }
-
-type ReceivedFrame = (BridgePortId, Vec<u8>);
 
 #[derive(Debug)]
 pub struct Bridge {
@@ -92,10 +87,6 @@ pub struct Bridge {
     mac_table: HashMap<EthernetAddress, MacEntry>,
     // 配置参数，比如aging timeout, max age, hello time, forward delay
     // bridge_mac: EthernetAddress,
-    next_port_id: AtomicUsize,
-    wait_queue: Arc<WaitQueue>,
-
-    rx_buf: VecDeque<ReceivedFrame>,
 }
 
 impl Bridge {
@@ -104,15 +95,7 @@ impl Bridge {
             name: name.into(),
             ports: BTreeMap::new(),
             mac_table: HashMap::new(),
-            next_port_id: AtomicUsize::new(0),
-            wait_queue: Arc::new(WaitQueue::default()),
-            rx_buf: VecDeque::new(),
         }
-    }
-
-    fn next_port_id(&self) -> BridgePortId {
-        self.next_port_id
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn add_port(&mut self, id: BridgePortId, port: BridgePort) {
@@ -208,6 +191,9 @@ impl Bridge {
 
     fn transmit_to_device(&self, device: &BridgePort, frame: &[u8]) {
         device.bridge_enable.receive_from_bridge(frame);
+        if let Some(napi) = device.bridge_enable.napi_struct() {
+            napi_schedule(napi);
+        }
     }
 
     pub fn sweep_mac_table(&mut self) {
@@ -220,147 +206,89 @@ impl Bridge {
         });
     }
 
-    // pub fn poll_blocking(&mut self) {
-    //     use crate::sched::SchedMode;
-    //     loop {
-    //         let opt = self.rx_buf.pop_front();
-    //         if let Some((port_id, frame)) = opt {
-    //             self.handle_frame(port_id, &frame);
-    //         } else {
-    //             log::info!("Bridge is going to sleep");
-    //             let _ = wq_wait_event_interruptible!(self.wait_queue, !self.rx_buf.is_empty(), {});
-    //         }
-    //     }
-    // }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BridgeDriver {
-    pub inner: Arc<SpinLock<Bridge>>,
-    wait_queue: Arc<WaitQueue>,
+    pub inner: SpinLock<Bridge>,
+    pub netns: RwLock<Weak<NetNamespace>>,
+    self_ref: Weak<BridgeDriver>,
+    next_port_id: AtomicUsize,
 }
 
 impl BridgeDriver {
-    pub fn new(name: &str) -> Self {
-        let inner = Arc::new(SpinLock::new(Bridge::new(name)));
-        let wait_queue = inner.lock().wait_queue.clone();
-
-        let driver = BridgeDriver { inner, wait_queue };
-
-        // let closure: Box<dyn Fn() -> i32 + Send + Sync + 'static> = Box::new(move || {
-        //     driver_clone.poll_blocking();
-        //     0
-        // });
-        // let closure = KernelThreadClosure::EmptyClosure((closure, ()));
-        // let name = format!("bridge_{}", name);
-        // let _pcb = KernelThreadMechanism::create_and_run(closure, name)
-        //     .ok_or("")
-        //     .expect("create bridge_poll thread failed");
-
-        driver
+    pub fn new(name: &str) -> Arc<Self> {
+        Arc::new_cyclic(|self_ref| BridgeDriver {
+            inner: SpinLock::new(Bridge::new(name)),
+            netns: RwLock::new(Weak::new()),
+            self_ref: self_ref.clone(),
+            next_port_id: AtomicUsize::new(0),
+        })
     }
 
-    pub fn add_port(&self, port: BridgePort) {
+    fn next_port_id(&self) -> BridgePortId {
+        self.next_port_id
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn add_device(&self, device: Arc<dyn BridgeEnableDevice>) {
+        if let Some(netns) = self.netns() {
+            if !Arc::ptr_eq(
+                &netns,
+                &device.net_namespace().unwrap_or(INIT_NET_NAMESPACE.clone()),
+            ) {
+                log::warn!("Port and bridge are in different net namespaces");
+                return;
+            }
+        }
+        let port = BridgePort::new(
+            self.next_port_id(),
+            device.clone(),
+            &self.self_ref.upgrade().unwrap(),
+        );
         log::info!("Adding port with id: {}", port.id);
 
         self.inner.lock().add_port(port.id, port);
     }
 
-    pub fn remove_port(&self, port_id: BridgePortId) {
-        self.inner.lock().remove_port(port_id);
+    pub fn remove_device(&self, device: Arc<dyn BridgeEnableDevice>) {
+        let Some(common_data) = device.common_bridge_data() else {
+            log::warn!("Device is not part of any bridge");
+            return;
+        };
+        self.inner.lock().remove_port(common_data.id);
     }
 
-    fn poll_blocking(&self) {
-        use crate::sched::SchedMode;
-
-        loop {
-            let mut inner = self.inner.lock();
-            while let Some((port_id, frame)) = inner.rx_buf.pop_front() {
-                inner.handle_frame(port_id, &frame);
-            }
-            drop(inner);
-            // log::info!("Bridge is going to sleep");
-            let _ = wq_wait_event_interruptible!(
-                self.wait_queue,
-                !self.inner.lock().rx_buf.is_empty(),
-                {}
-            );
-        }
-        // inner.poll_blocking();
+    pub fn handle_frame(&self, ingress_port_id: BridgePortId, frame: &[u8]) {
+        self.inner.lock().handle_frame(ingress_port_id, frame);
     }
 
-    pub fn enqueue_frame(&self, port_id: BridgePortId, frame: &Vec<u8>) {
-        {
-            let mut bridge = self.inner.lock();
-            log::info!("Enqueuing frame on port {}: {:?}", port_id, frame);
-            log::warn!("{:?}", frame);
-            bridge.rx_buf.push_back((port_id, frame.clone()));
-        }
-        self.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
-    }
-}
-
-pub struct BridgeIface {
-    pub driver: BridgeDriver,
-    self_ref: Weak<BridgeIface>,
-}
-
-impl BridgeIface {
-    pub fn new(driver: BridgeDriver) -> Arc<Self> {
-        let name = driver.inner.lock().name.clone();
-
-        let iface = Arc::new_cyclic(|me| BridgeIface {
-            driver,
-            self_ref: me.clone(),
-        });
-        let iface_clone = iface.clone();
-
-        // 创建一个线程来处理桥接设备的轮询
-        let closure: Box<dyn Fn() -> i32 + Send + Sync + 'static> = Box::new(move || {
-            iface_clone.poll_blocking();
-            0
-        });
-        let closure = KernelThreadClosure::EmptyClosure((closure, ()));
-        let name = format!("bridge_{}", name);
-        let _pcb = KernelThreadMechanism::create_and_run(closure, name)
-            .ok_or("")
-            .expect("create bridge_poll thread failed");
-
-        iface
+    pub fn name(&self) -> String {
+        self.inner.lock().name().to_string()
     }
 
-    pub fn add_port(&self, port_device: Arc<dyn BridgeEnableDevice>) {
-        let id = self.driver.inner.lock().next_port_id();
-        let port = BridgePort::new(id, port_device.clone(), &self.self_ref.upgrade().unwrap());
-
-        port_device.set_common_bridge_data(port.clone());
-
-        self.driver.add_port(port);
+    pub fn set_netns(&self, netns: &Arc<NetNamespace>) {
+        *self.netns.write() = Arc::downgrade(netns);
     }
 
-    #[allow(unused)]
-    pub fn remove_port(&self, port_id: BridgePortId) {
-        self.driver.remove_port(port_id);
-    }
-
-    pub fn poll_blocking(&self) {
-        self.driver.poll_blocking();
+    pub fn netns(&self) -> Option<Arc<NetNamespace>> {
+        self.netns.read().upgrade()
     }
 }
 
 /// 可供桥接设备应该实现的 trait
 pub trait BridgeEnableDevice: Iface {
+    /// 接收来自桥的数据帧
     fn receive_from_bridge(&self, frame: &[u8]);
-    // fn inner_driver(&self) -> Arc<dyn InnerDriver>;
-    fn set_common_bridge_data(&self, _port: BridgePort);
 
-    // fn common_bridge_data(&self) -> Option<BridgeCommonData>;
-    // fn port_id(&self) -> Option<usize> {
-    //     let Some(data) = self.common_bridge_data() else {
-    //         return None;
-    //     };
-    //     Some(data.id)
-    // }
+    /// 设置桥接相关的公共数据
+    fn set_common_bridge_data(&self, _port: &BridgePort);
+
+    /// 获取桥接相关的公共数据
+    fn common_bridge_data(&self) -> Option<BridgeCommonData>;
     // fn bridge(&self) -> Weak<BridgeIface> {
     //     let Some(data) = self.common_bridge_data() else {
     //         return Weak::default();
@@ -372,7 +300,7 @@ pub trait BridgeEnableDevice: Iface {
 #[derive(Debug, Clone)]
 pub struct BridgeCommonData {
     pub id: BridgePortId,
-    pub bridge_iface: Weak<BridgeIface>,
+    pub bridge_driver_ref: Weak<BridgeDriver>,
 }
 
 fn bridge_probe() {
@@ -417,12 +345,12 @@ fn bridge_probe() {
     turn_on(&iface4);
 
     let bridge = BridgeDriver::new("bridge0");
-    let iface = BridgeIface::new(bridge);
+    bridge.set_netns(&INIT_NET_NAMESPACE);
+    INIT_NET_NAMESPACE.insert_bridge(bridge.clone());
 
-    // BRIDGE_DEVICES.write_irqsave().push(bridge.clone());
+    bridge.add_device(iface3);
+    bridge.add_device(iface2);
 
-    iface.add_port(iface3);
-    iface.add_port(iface2);
     log::info!("Bridge device created");
 }
 

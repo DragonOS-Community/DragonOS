@@ -214,7 +214,6 @@ impl E1000EInterface {
                 iface_id,
                 crate::driver::net::types::InterfaceType::EETHER,
                 flags,
-                false,
                 iface,
             ),
             name: format!("eth{}", iface_id),

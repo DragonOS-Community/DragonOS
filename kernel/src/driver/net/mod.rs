@@ -22,6 +22,7 @@ mod dma;
 pub mod e1000e;
 pub mod irq_handle;
 pub mod loopback;
+pub mod napi;
 pub mod sysfs;
 pub mod types;
 pub mod veth;
@@ -88,14 +89,6 @@ pub trait Iface: crate::driver::base::device::Device {
     /// - `false`：表示没有网络事件
     fn poll(&self) -> bool;
 
-    /// # `poll_blocking`
-    /// 用于在阻塞模式下轮询网卡
-    /// ## 参数
-    /// - `can_recv_fn` ：一个函数指针，用于判断是否可以接收数据
-    /// ## 返回值
-    /// - 该函数不返回任何值，但会在满足条件时阻塞当前线程，直到可以接收数据。
-    fn poll_blocking(&self, _can_recv_fn: &dyn Fn() -> bool) {}
-
     /// # `update_ip_addrs`
     /// 用于更新接口的 IP 地址
     /// ## 参数
@@ -154,6 +147,12 @@ pub trait Iface: crate::driver::base::device::Device {
     }
 
     fn mtu(&self) -> usize;
+
+    /// # 获取当前iface的napi结构体
+    /// 默认返回None，表示不支持napi
+    fn napi_struct(&self) -> Option<Arc<napi::NapiStruct>> {
+        None
+    }
 }
 
 /// 网络设备的公共数据
@@ -205,9 +204,6 @@ pub struct IfaceCommon {
     port_manager: PortManager,
     /// 下次轮询的时间
     poll_at_ms: core::sync::atomic::AtomicU64,
-    /// 默认网卡标识
-    /// TODO: 此字段设置目的是解决对bind unspecified地址的分包问题，需要在inet实现多网卡监听或路由子系统实现后移除
-    default_iface: bool,
     /// 网络命名空间
     net_namespace: RwLock<Weak<NetNamespace>>,
     // 路由相关数据
@@ -228,7 +224,6 @@ impl IfaceCommon {
         iface_id: usize,
         type_: InterfaceType,
         flags: InterfaceFlags,
-        default_iface: bool,
         iface: smoltcp::iface::Interface,
     ) -> Self {
         let router_common_data = RouterEnableDeviceCommon::default();
@@ -243,7 +238,6 @@ impl IfaceCommon {
             bounds: RwLock::new(Vec::new()),
             port_manager: PortManager::default(),
             poll_at_ms: core::sync::atomic::AtomicU64::new(0),
-            default_iface,
             net_namespace: RwLock::new(Weak::new()),
             router_common_data,
             flags,
@@ -349,11 +343,6 @@ impl IfaceCommon {
             bounds.remove(index);
             log::debug!("unbind socket success");
         }
-    }
-
-    // TODO: 需要在inet实现多网卡监听或路由子系统实现后移除
-    pub fn is_default_iface(&self) -> bool {
-        self.default_iface
     }
 
     pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {

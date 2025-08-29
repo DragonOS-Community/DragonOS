@@ -1,13 +1,7 @@
 use crate::driver::net::Iface;
 use crate::libs::rwlock::RwLock;
-use crate::libs::wait_queue::WaitQueue;
-use crate::process::kthread::KernelThreadClosure;
-use crate::process::kthread::KernelThreadMechanism;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
-use crate::process::ProcessState;
-use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -95,37 +89,15 @@ pub struct Router {
     /// 路由表 //todo 后面再优化LC-trie，现在先简单用一个Vec
     route_table: RwLock<RouteTable>,
     pub ns: RwLock<Weak<NetNamespace>>,
-
-    wait_queue: WaitQueue,
-    rx_frames: RwLock<VecDeque<RouterFrame>>,
 }
 
 impl Router {
     pub fn new(name: String) -> Arc<Self> {
-        let router = Arc::new(Self {
+        Arc::new(Self {
             name: name.clone(),
             route_table: RwLock::new(RouteTable::default()),
-            wait_queue: WaitQueue::default(),
-            rx_frames: RwLock::new(VecDeque::new()),
             ns: RwLock::new(Weak::default()),
-        });
-
-        let self_clone: Arc<Router> = router.clone();
-
-        // 创建一个线程来处理桥接设备的轮询
-        let closure: Box<dyn Fn() -> i32 + Send + Sync + 'static> = Box::new(move || {
-            self_clone.poll_blocking();
-            0
-        });
-        let closure = KernelThreadClosure::EmptyClosure((closure, ()));
-        let name = name + "_poll";
-        log::info!("Creating router polling thread: {}", name);
-        let _pcb = KernelThreadMechanism::create_and_run(closure, name)
-            .ok_or("")
-            .expect("create router_poll thread failed");
-
-        // log::info!("Router polling thread created");
-        router
+        })
     }
 
     /// 创建一个空的Router实例，主要用于初始化网络命名空间时使用
@@ -134,8 +106,6 @@ impl Router {
         Arc::new(Self {
             name: "empty_router".to_string(),
             route_table: RwLock::new(RouteTable::default()),
-            wait_queue: WaitQueue::default(),
-            rx_frames: RwLock::new(VecDeque::new()),
             ns: RwLock::new(Weak::default()),
         })
     }
@@ -189,32 +159,6 @@ impl Router {
             .write()
             .entries
             .retain(|route| route.interface.strong_count() > 0);
-    }
-
-    pub fn enqueue_frame(&self, frame: RouterFrame) {
-        self.rx_frames.write().push_back(frame);
-        self.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
-    }
-
-    fn poll_blocking(&self) {
-        use crate::sched::SchedMode;
-
-        loop {
-            self.poll();
-
-            log::info!("Router is going to sleep");
-            let _ =
-                wq_wait_event_interruptible!(self.wait_queue, !self.rx_frames.read().is_empty(), {
-                });
-        }
-    }
-
-    fn poll(&self) {
-        let mut inner = self.rx_frames.write();
-        while let Some((decision, frame)) = inner.pop_front() {
-            decision.interface.route_and_send(decision.next_hop, &frame);
-        }
-        log::info!("Router polled all frames");
     }
 }
 
@@ -308,10 +252,11 @@ pub trait RouterEnableDevice: Iface {
         //     //todo 这里应该重新计算IP校验和，为了简化先跳过
         // }
 
-        let frame = (decision, modified_ip_packet);
-
         // 交给出接口进行发送
-        self.netns_router().enqueue_frame(frame);
+        let next_hop = &decision.next_hop;
+        decision
+            .interface
+            .route_and_send(next_hop, &modified_ip_packet);
 
         log::info!("Routed packet from {} to {} ", self.iface_name(), dst_ip,);
         Ok(())
@@ -322,7 +267,7 @@ pub trait RouterEnableDevice: Iface {
     ///
     /// todo 在这里查询arp_table，找到目标IP对应的mac地址然后拼接，如果找不到的话就需要主动发送arp请求去查询mac地址了，手伸不到smoltcp内部:(
     /// 后续需要将arp查询的逻辑从smoltcp中抽离出来
-    fn route_and_send(&self, next_hop: IpAddress, ip_packet: &[u8]);
+    fn route_and_send(&self, next_hop: &IpAddress, ip_packet: &[u8]);
 
     /// 检查IP地址是否是当前接口的IP
     fn is_my_ip(&self, ip: IpAddress) -> bool;
@@ -333,15 +278,13 @@ pub trait RouterEnableDevice: Iface {
     }
 }
 
-pub type RouterFrame = (RouteDecision, Vec<u8>);
-
 /// # 每一个`RouterEnableDevice`应该有的公共数据，包含
 /// - 当前接口的arp_table，记录邻居（//todo：将网卡的发送以及处理逻辑从smoltcp中移动出来，目前只是简单为veth实现这个，因为可以直接查到对端的mac地址）
 #[derive(Debug)]
 pub struct RouterEnableDeviceCommon {
     /// 当前接口的邻居缓存
     // pub arp_table: RwLock<BTreeMap<IpAddress, EthernetAddress>>,
-    /// 当前接口的IP地址列表
+    /// 当前接口的IP地址列表（因为如果直接通过smoltcp获取ip的话可能导致死锁，因此则这里维护一份）
     pub ip_addrs: RwLock<Vec<IpCidr>>,
 }
 

@@ -1,4 +1,5 @@
 use crate::arch::CurrentIrqArch;
+use crate::driver::net::bridge::BridgeDriver;
 use crate::driver::net::loopback::{generate_loopback_iface_default, LoopbackInterface};
 use crate::exception::InterruptArch;
 use crate::init::initcall::INITCALL_SUBSYS;
@@ -69,6 +70,8 @@ pub struct NetNamespace {
     /// 这个列表在中断上下文会使用到，因此需要irqsave
     /// 没有放在InnerNetNamespace里面，独立出来，方便管理
     device_list: RwLock<BTreeMap<usize, Arc<dyn Iface>>>,
+    ///当前网络命名空间下的桥接设备列表
+    bridge_list: RwLock<BTreeMap<String, Arc<BridgeDriver>>>,
 
     // -- Netlink --
     /// # 当前网络命名空间下的 Netlink 套接字表
@@ -115,6 +118,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             net_poll_thread: SpinLock::new(None),
             device_list: RwLock::new(BTreeMap::new()),
+            bridge_list: RwLock::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
         });
@@ -141,6 +145,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             net_poll_thread: SpinLock::new(None),
             device_list: RwLock::new(BTreeMap::new()),
+            bridge_list: RwLock::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
         });
@@ -162,12 +167,12 @@ impl NetNamespace {
         Self::new_empty(user_ns)
     }
 
-    pub fn device_list_write(&self) -> RwLockWriteGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
-        self.device_list.write_irqsave()
+    pub fn device_list_mut(&self) -> RwLockWriteGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
+        self.device_list.write()
     }
 
     pub fn device_list(&self) -> RwLockReadGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
-        self.device_list.read_irqsave()
+        self.device_list.read()
     }
 
     pub fn inner(&self) -> RwLockReadGuard<'_, InnerNetNamespace> {
@@ -212,18 +217,20 @@ impl NetNamespace {
     pub fn add_device(&self, device: Arc<dyn Iface>) {
         device.set_net_namespace(self.self_ref.upgrade().unwrap());
 
-        self.device_list
-            .write_irqsave()
-            .insert(device.nic_id(), device);
+        self.device_list_mut().insert(device.nic_id(), device);
 
         log::info!(
             "Network device added to namespace count: {:?}",
-            self.device_list.read_irqsave().len()
+            self.device_list().len()
         );
     }
 
     pub fn remove_device(&self, nic_id: &usize) {
-        self.device_list.write_irqsave().remove(nic_id);
+        self.device_list_mut().remove(nic_id);
+    }
+
+    pub fn insert_bridge(&self, bridge: Arc<BridgeDriver>) {
+        self.bridge_list.write().insert(bridge.name(), bridge);
     }
 
     /// # 拉起网络命名空间的轮询线程
@@ -242,22 +249,12 @@ impl NetNamespace {
     fn polling(&self) {
         log::info!("net_poll thread started for namespace");
         loop {
-            let mut has_work_done = false;
             for (_, iface) in self.device_list.read_irqsave().iter() {
-                // 这里检查poll的返回值，如果为 true 的话，则说明发生了网络事件，很有可能再次发生，则会再次调用poll
-                if iface.poll() {
-                    has_work_done = true;
-                    iface.poll();
-                }
-            }
-            if has_work_done {
-                log::info!("fucking continue");
-                continue;
+                iface.poll();
             }
 
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            ProcessManager::mark_sleep(true)
-                .expect("clocksource_watchdog_kthread:mark sleep failed");
+            ProcessManager::mark_sleep(true).expect("netns_poll_kthread:mark sleep failed");
             drop(irq_guard);
             // log::info!("net_poll thread going to sleep");
             schedule(SchedMode::SM_NONE);

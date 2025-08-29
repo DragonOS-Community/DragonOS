@@ -13,7 +13,7 @@ pub fn net_init() -> Result<(), SystemError> {
 
 fn dhcp_query() -> Result<(), SystemError> {
     // let binding = NET_DEVICES.write_irqsave();
-    let binding = INIT_NET_NAMESPACE.device_list_write();
+    let binding = INIT_NET_NAMESPACE.device_list_mut();
 
     let net_face = binding
         .iter()

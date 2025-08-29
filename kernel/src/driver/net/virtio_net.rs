@@ -516,7 +516,6 @@ impl VirtioInterface {
                 iface_id,
                 crate::driver::net::types::InterfaceType::EETHER,
                 flags,
-                true,
                 iface,
             ),
             inner: SpinLock::new(InnerVirtIOInterface {

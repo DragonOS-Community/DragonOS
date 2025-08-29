@@ -83,6 +83,7 @@ impl From<LinkSegmentBody> for CIfinfoMsg {
 
 bitflags! {
     /// Flags in [`CIfinfoMsg`].
+    /// <https://elixir.bootlin.com/linux/v6.13/source/include/uapi/linux/if.h#L82>.
     pub struct LinkMessageFlags: u32 {
         // sysfs
         const IFF_UP            = 1<<0;

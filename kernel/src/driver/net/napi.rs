@@ -130,22 +130,17 @@ fn net_rx_action() {
 
         // log::info!("NAPI softirq processing {} instances", poll_list.len());
 
-        let size = poll_list.len();
         // 如果此时长度为0,则让当前进程休眠，等待被唤醒
-        if size == 0 {
+        if poll_list.is_empty() {
             GLOBAL_NAPI_MANAGER
                 .inner()
                 .has_pending_signal
                 .store(false, Ordering::SeqCst);
         }
 
-        for _ in 0..size {
-            let Some(napi) = poll_list.pop() else {
-                break;
-            };
-
+        while let Some(napi) = poll_list.pop() {
             let has_work_left = napi.poll();
-            log::info!("yes");
+            // log::info!("yes");
 
             if has_work_left {
                 poll_list.push(napi);

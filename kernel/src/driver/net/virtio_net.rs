@@ -29,7 +29,11 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        net::{register_netdevice, types::InterfaceFlags},
+        net::{
+            napi::{napi_schedule, NapiStruct},
+            register_netdevice,
+            types::InterfaceFlags,
+        },
         virtio::{
             irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
@@ -43,11 +47,11 @@ use crate::{
     filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     init::initcall::INITCALL_POSTCORE,
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     net::generate_iface_id,
-    process::namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
+    process::namespace::net_namespace::INIT_NET_NAMESPACE,
     time::Instant,
 };
 use system_error::SystemError;
@@ -70,8 +74,8 @@ pub struct VirtIONetDevice {
     inner: SpinLock<InnerVirtIONetDevice>,
     locked_kobj_state: LockedKObjectState,
 
-    // 这里放netns是为了在中断到来的时候可以遍历poll当前命名空间下的网卡
-    netns: Arc<NetNamespace>,
+    // 指向对应的interface
+    iface_ref: RwLock<Weak<VirtioInterface>>,
 }
 
 impl Debug for VirtIONetDevice {
@@ -100,11 +104,7 @@ impl Debug for InnerVirtIONetDevice {
 }
 
 impl VirtIONetDevice {
-    pub fn new(
-        transport: VirtIOTransport,
-        dev_id: Arc<DeviceId>,
-        netns: Arc<NetNamespace>,
-    ) -> Option<Arc<Self>> {
+    pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
         // 设置中断
         if let Err(err) = transport.setup_irq(dev_id.clone()) {
             error!("VirtIONetDevice '{dev_id:?}' setup_irq failed: {:?}", err);
@@ -133,7 +133,7 @@ impl VirtIONetDevice {
                 device_common: DeviceCommonData::default(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
-            netns,
+            iface_ref: RwLock::new(Weak::new()),
         });
 
         // dev.set_driver(Some(Arc::downgrade(&virtio_net_driver()) as Weak<dyn Driver>));
@@ -143,6 +143,14 @@ impl VirtIONetDevice {
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIONetDevice> {
         return self.inner.lock();
+    }
+
+    pub fn set_iface(&self, iface: &Arc<VirtioInterface>) {
+        *self.iface_ref.write() = Arc::downgrade(iface);
+    }
+
+    pub fn iface(&self) -> Option<Arc<VirtioInterface>> {
+        self.iface_ref.read().upgrade()
     }
 }
 
@@ -278,7 +286,22 @@ impl Device for VirtIONetDevice {
 
 impl VirtIODevice for VirtIONetDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        self.netns.wakeup_poll_thread();
+        let Some(iface) = self.iface() else {
+            error!(
+                "VirtIONetDevice '{:?}' has no associated iface to handle irq",
+                self.dev_id.id()
+            );
+            return Ok(IrqReturn::NotHandled);
+        };
+
+        let Some(napi) = iface.napi_struct() else {
+            log::error!("Virtio net device {} has no napi_struct", iface.name());
+            return Ok(IrqReturn::NotHandled);
+        };
+
+        napi_schedule(napi);
+
+        // self.netns.wakeup_poll_thread();
         return Ok(IrqReturn::Handled);
     }
 
@@ -525,6 +548,10 @@ impl VirtioInterface {
             }),
         });
 
+        // 设置napi struct
+        let napi_struct = NapiStruct::new(iface.clone(), 10);
+        *iface.common().napi_struct.write() = Some(napi_struct);
+
         iface
     }
 
@@ -732,7 +759,7 @@ pub fn virtio_net(
     dev_id: Arc<DeviceId>,
     dev_parent: Option<Arc<dyn Device>>,
 ) {
-    let virtio_net_deivce = VirtIONetDevice::new(transport, dev_id, INIT_NET_NAMESPACE.clone());
+    let virtio_net_deivce = VirtIONetDevice::new(transport, dev_id);
     if let Some(virtio_net_deivce) = virtio_net_deivce {
         debug!("VirtIONetDevice '{:?}' created", virtio_net_deivce.dev_id);
         if let Some(dev_parent) = dev_parent {
@@ -935,6 +962,9 @@ impl VirtIODriver for VirtIONetDriver {
         iface.set_dev_parent(Some(Arc::downgrade(&virtio_net_device) as Weak<dyn Device>));
         // 在sysfs中注册iface
         register_netdevice(iface.clone() as Arc<dyn Iface>)?;
+
+        // 将virtio_net_device和iface关联起来
+        virtio_net_device.set_iface(&iface);
 
         // 将网卡的接口信息注册到全局的网卡接口信息表中
         // NET_DEVICES

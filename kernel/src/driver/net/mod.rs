@@ -4,6 +4,7 @@ use alloc::{string::String, sync::Arc};
 use core::net::Ipv4Addr;
 use sysfs::netdev_register_kobject;
 
+use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};
 use crate::libs::rwlock::RwLockReadGuard;
 use crate::net::routing::RouterEnableDeviceCommon;
@@ -151,7 +152,7 @@ pub trait Iface: crate::driver::base::device::Device {
     /// # 获取当前iface的napi结构体
     /// 默认返回None，表示不支持napi
     fn napi_struct(&self) -> Option<Arc<napi::NapiStruct>> {
-        None
+        self.common().napi_struct.read().clone()
     }
 }
 
@@ -206,8 +207,10 @@ pub struct IfaceCommon {
     poll_at_ms: core::sync::atomic::AtomicU64,
     /// 网络命名空间
     net_namespace: RwLock<Weak<NetNamespace>>,
-    // 路由相关数据
+    /// 路由相关数据
     router_common_data: RouterEnableDeviceCommon,
+    /// NAPI 结构体
+    napi_struct: RwLock<Option<Arc<NapiStruct>>>,
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -242,6 +245,7 @@ impl IfaceCommon {
             router_common_data,
             flags,
             type_,
+            napi_struct: RwLock::new(None),
         }
     }
 

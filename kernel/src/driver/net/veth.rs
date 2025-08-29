@@ -72,7 +72,12 @@ impl Veth {
         log::info!("{:?}", peer_veth.rx_queue);
         drop(peer_veth);
 
-        napi_schedule(peer.napi_struct());
+        let Some(napi) = peer.napi_struct() else {
+            log::error!("Veth {} has no napi_struct", peer.name);
+            return;
+        };
+
+        napi_schedule(napi);
     }
 
     fn to_bridge(bridge_data: &BridgeCommonData, data: &[u8]) {
@@ -267,7 +272,6 @@ pub struct VethInterface {
     common: IfaceCommon,
     inner: SpinLock<VethCommonData>,
     locked_kobj_state: LockedKObjectState,
-    napi_struct: SpinLock<Option<Arc<NapiStruct>>>,
 }
 
 #[derive(Debug)]
@@ -330,10 +334,9 @@ impl VethInterface {
             common: IfaceCommon::new(iface_id, super::types::InterfaceType::EETHER, flags, iface),
             inner: SpinLock::new(VethCommonData::default()),
             locked_kobj_state: LockedKObjectState::default(),
-            napi_struct: SpinLock::new(None),
         });
         let napi_struct = NapiStruct::new(device.clone(), 10);
-        *device.napi_struct.lock() = Some(napi_struct);
+        *device.common.napi_struct.write() = Some(napi_struct);
 
         driver.inner.lock().self_iface_ref = Arc::downgrade(&device);
 
@@ -428,10 +431,6 @@ impl VethInterface {
     //             .expect("Add direct route failed");
     //     });
     // }
-
-    pub fn napi_struct(&self) -> Arc<NapiStruct> {
-        self.napi_struct.lock().as_ref().unwrap().clone()
-    }
 }
 
 impl KObject for VethInterface {
@@ -612,10 +611,6 @@ impl Iface for VethInterface {
             .force_get_mut()
             .capabilities()
             .max_transmission_unit
-    }
-
-    fn napi_struct(&self) -> Option<Arc<super::napi::NapiStruct>> {
-        Some(self.napi_struct())
     }
 }
 

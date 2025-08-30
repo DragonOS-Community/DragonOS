@@ -635,7 +635,7 @@ impl EventPoll {
 
     /// ### epoll的回调，支持epoll的文件有事件到来时直接调用该方法即可
     pub fn wakeup_epoll(
-        epitems: &SpinLock<LinkedList<Arc<EPollItem>>>,
+        epitems: &LockedEPItemLinkedList,
         pollflags: EPollEventType,
     ) -> Result<(), SystemError> {
         let epitems_guard = epitems.try_lock_irqsave()?;
@@ -675,6 +675,14 @@ impl EventPoll {
             }
         }
         Ok(())
+    }
+}
+
+pub type LockedEPItemLinkedList = SpinLock<LinkedList<Arc<EPollItem>>>;
+
+impl Default for LockedEPItemLinkedList {
+    fn default() -> Self {
+        SpinLock::new(LinkedList::new())
     }
 }
 

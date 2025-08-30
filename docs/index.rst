@@ -45,6 +45,7 @@
    kernel/cpu_arch/index
    kernel/container/index
    kernel/libs/index
+   kernel/net/index
    kernel/trace/index
    kernel/syscall/index
 

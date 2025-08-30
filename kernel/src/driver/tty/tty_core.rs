@@ -4,7 +4,6 @@ use core::{
 };
 
 use alloc::{
-    collections::LinkedList,
     string::String,
     sync::{Arc, Weak},
 };
@@ -12,7 +11,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::{base::device::device_number::DeviceNumber, tty::pty::ptm_driver},
-    filesystem::epoll::{EPollEventType, EPollItem},
+    filesystem::epoll::{event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -74,7 +73,7 @@ impl TtyCore {
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
             link: RwLock::default(),
-            epitems: SpinLock::new(LinkedList::new()),
+            epitems: LockedEPItemLinkedList::default(),
             device_number,
             privete_fields: SpinLock::new(None),
         };
@@ -347,7 +346,7 @@ pub struct TtyCoreData {
     /// 链接tty
     link: RwLock<Weak<TtyCore>>,
     /// epitems
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
+    epitems: LockedEPItemLinkedList,
     /// 设备号
     device_number: DeviceNumber,
 
@@ -533,7 +532,7 @@ impl TtyCoreData {
         Err(SystemError::ENOENT)
     }
 
-    pub fn eptiems(&self) -> &SpinLock<LinkedList<Arc<EPollItem>>> {
+    pub fn epitems(&self) -> &LockedEPItemLinkedList {
         &self.epitems
     }
 

@@ -14,6 +14,7 @@ use alloc::{
 };
 use cred::INIT_CRED;
 use hashbrown::HashMap;
+use intertrait::cast::CastArc;
 use log::{debug, error, info, warn};
 use pid::{alloc_pid, Pid, PidLink, PidType};
 use process_group::Pgid;
@@ -39,7 +40,6 @@ use crate::{
     },
     libs::{
         align::AlignedBox,
-        casting::DowncastArc,
         futex::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::{Futex, RobustListHead},
@@ -55,7 +55,7 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    net::socket::SocketInode,
+    net::socket::Socket,
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
         cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
@@ -1071,6 +1071,8 @@ impl ProcessControlBlock {
 
     /// 根据文件描述符序号，获取socket对象的Arc指针
     ///
+    /// this is a helper function
+    ///
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
@@ -1078,21 +1080,24 @@ impl ProcessControlBlock {
     /// ## 返回值
     ///
     /// Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
-    pub fn get_socket(&self, fd: i32) -> Option<Arc<SocketInode>> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let f = fd_table_guard.get_file_by_fd(fd)?;
-        drop(fd_table_guard);
+    pub fn get_socket(&self, fd: i32) -> Result<Arc<dyn Socket>, SystemError> {
+        let f = ProcessManager::current_pcb()
+            .fd_table()
+            .read()
+            .get_file_by_fd(fd)
+            .ok_or({
+                // log::warn!("get_socket: fd {} not found", fd);
+                SystemError::EBADF
+            })?;
 
         if f.file_type() != FileType::Socket {
-            return None;
+            return Err(SystemError::EBADF);
         }
-        let socket: Arc<SocketInode> = f
-            .inode()
-            .downcast_arc::<SocketInode>()
-            .expect("Not a socket inode");
-        return Some(socket);
+        // log::info!("get_socket: fd {} is a socket", fd);
+        f.inode().cast::<dyn Socket>().map_err(|_| {
+            log::error!("get_socket: fd {} is not a socket", fd);
+            SystemError::EBADF
+        })
     }
 
     /// 当前进程退出时,让初始进程收养所有子进程

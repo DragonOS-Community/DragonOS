@@ -216,6 +216,8 @@ pub trait SupportedNetlinkProtocol: Debug {
         Self::socket_table(netns).read().unicast(dst_port, message)
     }
 
+    //todo 多播消息用
+    #[allow(unused)]
     fn multicast(
         dst_groups: GroupIdSet,
         message: Self::Message,

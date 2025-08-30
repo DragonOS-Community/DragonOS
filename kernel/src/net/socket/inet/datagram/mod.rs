@@ -3,9 +3,8 @@ use smoltcp;
 use system_error::SystemError;
 
 use crate::filesystem::epoll::EPollEventType;
-use crate::filesystem::vfs::IndexNode;
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::socket::common::{EPollItems, ShutdownBit};
+use crate::net::socket::common::EPollItems;
 use crate::net::socket::{Socket, PMSG};
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
@@ -35,7 +34,7 @@ impl UdpSocket {
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
-            epoll_items: Default::default(),
+            epoll_items: EPollItems::default(),
         });
     }
 
@@ -102,13 +101,13 @@ impl UdpSocket {
 
     #[inline]
     pub fn can_recv(&self) -> bool {
-        self.get_event().contains(EP::EPOLLIN)
+        self.check_io_event().contains(EP::EPOLLIN)
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn can_send(&self) -> bool {
-        self.get_event().contains(EP::EPOLLOUT)
+        self.check_io_event().contains(EP::EPOLLOUT)
     }
 
     pub fn try_send(
@@ -253,61 +252,35 @@ impl Socket for UdpSocket {
         Ok(())
     }
 
-    fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
+    fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
         todo!()
     }
 
-    fn get_peer_name(&self) -> Result<Endpoint, SystemError> {
-        todo!()
-    }
-
-    fn get_name(&self) -> Result<Endpoint, SystemError> {
-        todo!()
-    }
-
-    fn get_option(
-        &self,
-        level: crate::net::socket::PSOL,
-        name: usize,
-        value: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        todo!()
-    }
-
-    fn listen(&self, backlog: usize) -> Result<(), SystemError> {
+    fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
         todo!()
     }
 
     fn recv_msg(
         &self,
-        msg: &mut crate::net::posix::MsgHdr,
-        flags: PMSG,
+        _msg: &mut crate::net::posix::MsgHdr,
+        _flags: PMSG,
     ) -> Result<usize, SystemError> {
         todo!()
     }
 
-    fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
-        todo!()
-    }
-
-    fn set_option(
+    fn send_msg(
         &self,
-        level: crate::net::socket::PSOL,
-        name: usize,
-        val: &[u8],
-    ) -> Result<(), SystemError> {
+        _msg: &crate::net::posix::MsgHdr,
+        _flags: PMSG,
+    ) -> Result<usize, SystemError> {
         todo!()
     }
 
-    fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
-        todo!()
+    fn epoll_items(&self) -> &crate::net::socket::common::EPollItems {
+        &self.epoll_items
     }
 
-    fn epoll_items(&self) -> crate::net::socket::common::EPollItems {
-        self.epoll_items.clone()
-    }
-
-    fn get_event(&self) -> EPollEventType {
+    fn check_io_event(&self) -> EPollEventType {
         let mut event = EPollEventType::empty();
         match self.inner.read().as_ref().unwrap() {
             UdpInner::Unbound(_) => {

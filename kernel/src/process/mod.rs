@@ -1095,7 +1095,7 @@ impl ProcessControlBlock {
         }
         // log::info!("get_socket: fd {} is a socket", fd);
         f.inode().cast::<dyn Socket>().map_err(|_| {
-            log::error!("not socket");
+            log::error!("get_socket: fd {} is not a socket", fd);
             SystemError::EBADF
         })
     }

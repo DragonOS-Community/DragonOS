@@ -73,7 +73,7 @@ impl<T: Socket + 'static> IndexNode for T {
 
 impl<T: Socket + 'static> PollableInode for T {
     fn poll(&self, _: &FilePrivateData) -> Result<usize, SystemError> {
-        Ok(self.get_event().bits() as usize)
+        Ok(self.check_io_event().bits() as usize)
     }
 
     fn add_epitem(

@@ -114,7 +114,7 @@ impl From<smoltcp::wire::IpEndpoint> for SockAddr {
                     sin_zero: Default::default(),
                 },
             },
-            smoltcp::wire::IpAddress::Ipv6(ipv6_addr) => todo!(),
+            smoltcp::wire::IpAddress::Ipv6(_ipv6_addr) => todo!(),
         }
     }
 }
@@ -122,7 +122,7 @@ impl From<smoltcp::wire::IpEndpoint> for SockAddr {
 impl From<Endpoint> for SockAddr {
     fn from(value: Endpoint) -> Self {
         match value {
-            Endpoint::LinkLayer(link_layer_endpoint) => todo!(),
+            Endpoint::LinkLayer(_link_layer_endpoint) => todo!(),
             Endpoint::Ip(endpoint) => Self::from(endpoint),
         }
     }
@@ -238,7 +238,7 @@ impl SockAddr {
 
                     // return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id, path)));
                     // return Err(SystemError::ENOSYS);
-                    unreachable!("fuck unix")
+                    unreachable!("Unix socket is not supported yet");
                 }
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);

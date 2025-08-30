@@ -451,7 +451,7 @@ impl Syscall {
         }
         ProcessManager::current_pcb()
             .get_socket(fd as i32)?
-            .get_name()?
+            .local_endpoint()?
             .write_to_user(addr, addrlen)?;
         return Ok(0);
     }
@@ -474,7 +474,7 @@ impl Syscall {
 
         ProcessManager::current_pcb()
             .get_socket(fd as i32)?
-            .get_peer_name()?
+            .remote_endpoint()?
             .write_to_user(addr, addrlen)?;
 
         return Ok(0);

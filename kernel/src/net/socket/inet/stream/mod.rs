@@ -268,7 +268,7 @@ impl Socket for TcpSocket {
         &self.wait_queue
     }
 
-    fn get_name(&self) -> Result<Endpoint, SystemError> {
+    fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
         match self
             .inner
             .read()
@@ -286,7 +286,7 @@ impl Socket for TcpSocket {
         }
     }
 
-    fn get_peer_name(&self) -> Result<Endpoint, SystemError> {
+    fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
         match self
             .inner
             .read()
@@ -315,7 +315,7 @@ impl Socket for TcpSocket {
         };
         self.start_connect(endpoint)?; // Only Nonblock or error will return error.
 
-        // TODO!
+        // TODO! 这里改用事件驱动，而不是一直忙等
         return loop {
             match self.check_connect() {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {}
@@ -368,7 +368,7 @@ impl Socket for TcpSocket {
             .recv_buffer_size()
     }
 
-    fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
+    fn shutdown(&self, _how: ShutdownBit) -> Result<(), SystemError> {
         // let self_shutdown = self.shutdown.get().bits();
         // let diff = how.bits().difference(self_shutdown);
         // match diff.is_empty() {
@@ -501,40 +501,45 @@ impl Socket for TcpSocket {
         Ok(())
     }
 
-    fn get_option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
-        todo!()
-    }
-
     fn recv_from(
         &self,
-        buffer: &mut [u8],
-        flags: PMSG,
-        address: Option<Endpoint>,
+        _buffer: &mut [u8],
+        _flags: PMSG,
+        _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         todo!()
     }
 
     fn recv_msg(
         &self,
-        msg: &mut crate::net::posix::MsgHdr,
-        flags: PMSG,
+        _msg: &mut crate::net::posix::MsgHdr,
+        _flags: PMSG,
     ) -> Result<usize, SystemError> {
         todo!()
     }
 
-    fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
+    fn send_msg(
+        &self,
+        _msg: &crate::net::posix::MsgHdr,
+        _flags: PMSG,
+    ) -> Result<usize, SystemError> {
         todo!()
     }
 
-    fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError> {
+    fn send_to(
+        &self,
+        _buffer: &[u8],
+        _flags: PMSG,
+        _address: Endpoint,
+    ) -> Result<usize, SystemError> {
         todo!()
     }
 
-    fn epoll_items(&self) -> EPollItems {
-        self.epoll_items.clone()
+    fn epoll_items(&self) -> &EPollItems {
+        &self.epoll_items
     }
 
-    fn get_event(&self) -> crate::filesystem::epoll::EPollEventType {
+    fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {
         EP::from_bits_truncate(self.do_poll() as u32)
     }
 }

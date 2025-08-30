@@ -26,9 +26,9 @@ pub trait Socket: PollableInode + IndexNode {
     /// 获取socket的wait queue
     fn wait_queue(&self) -> &WaitQueue;
 
-    fn epoll_items(&self) -> EPollItems;
+    fn epoll_items(&self) -> &EPollItems;
 
-    fn get_event(&self) -> EPollEventType;
+    fn check_io_event(&self) -> EPollEventType;
 
     fn send_buffer_size(&self) -> usize;
     fn recv_buffer_size(&self) -> usize;
@@ -36,7 +36,9 @@ pub trait Socket: PollableInode + IndexNode {
     /// 接受连接，仅用于listening stream socket
     /// ## Block
     /// 如果没有连接到来，会阻塞
-    fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError>;
+    fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     /// # `bind`
     /// 对应于POSIX的bind函数，用于绑定到本机指定的端点
@@ -54,21 +56,29 @@ pub trait Socket: PollableInode + IndexNode {
     // freeaddrinfo
     // getaddrinfo
     // getnameinfo
-    /// # `get_peer_name`
+    /// # `remote_endpoint`
     /// 获取对端的地址
-    fn get_peer_name(&self) -> Result<Endpoint, SystemError>;
+    fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
-    /// # `get_name`
+    /// # `local_endpoint`
     /// 获取socket的地址
-    fn get_name(&self) -> Result<Endpoint, SystemError>;
+    fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     /// # `get_option`
     /// 对应于 Posix `getsockopt` ，获取socket选项
-    fn get_option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError>;
+    fn option(&self, _level: PSOL, _name: usize, _value: &mut [u8]) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     /// # `listen`
     /// 监听socket，仅用于stream socket
-    fn listen(&self, backlog: usize) -> Result<(), SystemError>;
+    fn listen(&self, _backlog: usize) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     // poll
     // pselect
@@ -76,6 +86,7 @@ pub trait Socket: PollableInode + IndexNode {
     fn read(&self, buffer: &mut [u8]) -> Result<usize, SystemError> {
         self.recv(buffer, PMSG::empty())
     }
+
     /// # `recv`
     /// 接收数据，`read` = `recv` with flags = 0
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError>;
@@ -109,10 +120,16 @@ pub trait Socket: PollableInode + IndexNode {
     /// - value 选项的值
     /// ## Reference
     /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
-    fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError>;
+    fn set_option(&self, _level: PSOL, _name: usize, _val: &[u8]) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     /// # `shutdown`
-    fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError>;
+    fn shutdown(&self, _how: ShutdownBit) -> Result<(), SystemError> {
+        // TODO 构建shutdown系统调用
+        // set shutdown bit
+        Err(SystemError::ENOSYS)
+    }
 
     // sockatmark
     // socket

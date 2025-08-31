@@ -100,3 +100,4 @@ fn do_setxattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8, value_ptr: *const
 
     inode.setxattr(&name, value_buf)
 }
+    

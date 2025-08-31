@@ -19,7 +19,7 @@ use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::generate_iface_id;
-use crate::net::routing::{RouteEntry, RouterEnableDevice};
+use crate::net::routing::{DnatRule, RouteEntry, RouterEnableDevice, SnatRule};
 use crate::process::namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE};
 use crate::process::ProcessManager;
 use alloc::collections::VecDeque;
@@ -709,7 +709,7 @@ fn veth_route_test() {
     let cidr3 = IpCidr::new(addr3, 24);
     iface_host2.update_ip_addrs(cidr3);
 
-    let addr4 = IpAddress::v4(192, 168, 2, 1);
+    let addr4 = IpAddress::v4(192, 168, 2, 3);
     let cidr4 = IpCidr::new(addr4, 24);
     iface_ns2.update_ip_addrs(cidr4);
 
@@ -766,6 +766,23 @@ fn veth_route_test() {
     turn_on(&iface_ns2, INIT_NET_NAMESPACE.clone());
     turn_on(&iface_host1, INIT_NET_NAMESPACE.clone());
     turn_on(&iface_host2, INIT_NET_NAMESPACE.clone());
+
+    let snat_rules = vec![SnatRule {
+        // 匹配所有来自 192.168.1.0/24 网络的流量
+        source_cidr: "192.168.1.0/24".parse().unwrap(),
+        // 将源地址转换为 192.168.2.254(hardcode)
+        nat_ip: IpAddress::v4(192, 168, 2, 254),
+    }];
+
+    let dnat_rules = vec![DnatRule {
+        external_addr: IpAddress::v4(192, 168, 2, 1),
+        internal_addr: IpAddress::v4(192, 168, 2, 3),
+        internal_port: None,
+        external_port: None,
+    }];
+
+    host_router.nat_tracker().update_snat_rules(snat_rules);
+    host_router.nat_tracker().update_dnat_rules(dnat_rules);
 }
 
 #[unified_init(INITCALL_DEVICE)]

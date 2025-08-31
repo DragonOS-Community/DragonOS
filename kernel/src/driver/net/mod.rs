@@ -154,6 +154,10 @@ pub trait Iface: crate::driver::base::device::Device {
     fn napi_struct(&self) -> Option<Arc<napi::NapiStruct>> {
         self.common().napi_struct.read().clone()
     }
+
+    fn router_common(&self) -> &RouterEnableDeviceCommon {
+        &self.common().router_common_data
+    }
 }
 
 /// 网络设备的公共数据

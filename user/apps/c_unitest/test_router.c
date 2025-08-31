@@ -8,7 +8,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define SERVER_IP "192.168.2.1"
+#define SERVER_IP "192.168.2.3"
+#define FAKE_SERVER_IP "192.168.2.1"
 #define CLIENT_IP "192.168.1.1"
 #define PORT 34254
 #define BUFFER_SIZE 1024
@@ -113,7 +114,7 @@ void *client_func(void *arg) {
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, FAKE_SERVER_IP, &server_addr.sin_addr) <= 0) {
         handle_error_message("[client] Invalid server IP address for connect");
     }
 

@@ -37,7 +37,7 @@ pub struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub fn new(_nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
+    pub fn new(nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
         let netns = ProcessManager::current_netns();
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Some(inner::Inner::Init(inner::Init::new(ver)))),
@@ -192,6 +192,7 @@ impl TcpSocket {
         writer.replace(inner);
         drop(writer);
 
+        // log::info!("TcpSocket::finish_connect: {:?}", result);
         result
     }
 

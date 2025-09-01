@@ -40,6 +40,7 @@ pub trait InetSocket: Socket {
     fn on_iface_events(&self);
 
     fn notify(&self) {
+        // log::info!("InetSocket::notify");
         self.on_iface_events();
         let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
     }

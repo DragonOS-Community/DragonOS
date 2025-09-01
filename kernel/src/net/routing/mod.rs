@@ -230,7 +230,7 @@ pub trait RouterEnableDevice: Iface {
                 // 检查是否是发给自己的包（目标IP是否是自己的IP）
                 if self.is_my_ip(dst_ip.into()) {
                     // 交给本地协议栈处理
-                    log::info!("Packet destined for local interface {}", self.iface_name());
+                    // log::info!("Packet destined for local interface {}", self.iface_name());
                     return Err(None);
                 }
 
@@ -285,10 +285,10 @@ pub trait RouterEnableDevice: Iface {
             }
             smoltcp::wire::EthernetProtocol::Arp => {
                 // 忽略ARP包
-                log::info!(
-                    "Ignoring non-IPv4 packet on interface {}",
-                    self.iface_name()
-                );
+                // log::info!(
+                //     "Ignoring non-IPv4 packet on interface {}",
+                //     self.iface_name()
+                // );
                 Err(None)
             }
             smoltcp::wire::EthernetProtocol::Ipv6 => {

@@ -338,6 +338,7 @@ impl Listening {
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
+        // log::info!("Listening::update_io_events");
         let position = self.inners.iter().position(|inner| {
             inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
         });

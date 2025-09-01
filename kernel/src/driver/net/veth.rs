@@ -68,8 +68,40 @@ impl Veth {
     pub(self) fn to_peer(peer: &Arc<VethInterface>, data: &[u8]) {
         let mut peer_veth = peer.driver.inner.lock();
         peer_veth.rx_queue.push_back(data.to_vec());
-        log::info!("Veth {} received data from peer", peer.name);
-        log::info!("{:?}", peer_veth.rx_queue);
+
+        // {
+        //     let ether = EthernetFrame::new_checked(data).unwrap();
+        //     if ether.ethertype() == smoltcp::wire::EthernetProtocol::Ipv4 {
+        //         if let Some(ipv4_packet) =
+        //             smoltcp::wire::Ipv4Packet::new_checked(ether.payload()).ok()
+        //         {
+        //             log::info!(
+        //                 "Veth {} sending IPv4 packet to peer: {} -> {}",
+        //                 peer.name,
+        //                 ipv4_packet.src_addr(),
+        //                 ipv4_packet.dst_addr()
+        //             );
+        //         }
+        //     } else if ether.ethertype() == smoltcp::wire::EthernetProtocol::Ipv6 {
+        //         if let Some(ipv6_packet) =
+        //             smoltcp::wire::Ipv6Packet::new_checked(ether.payload()).ok()
+        //         {
+        //             log::info!(
+        //                 "Veth {} sending IPv6 packet to peer: {} -> {}",
+        //                 peer.name,
+        //                 ipv6_packet.src_addr(),
+        //                 ipv6_packet.dst_addr()
+        //             );
+        //         }
+        //     } else {
+        //         log::info!(
+        //             "Veth {} sending non-IP packet to peer: ethertype={:?}",
+        //             peer.name,
+        //             ether.ethertype()
+        //         );
+        //     }
+        // }
+
         drop(peer_veth);
 
         let Some(napi) = peer.napi_struct() else {
@@ -96,20 +128,20 @@ impl Veth {
         };
 
         let frame: EthernetFrame<&[u8]> = EthernetFrame::new_checked(data).unwrap();
-        log::info!("trying to go to router");
+        // log::info!("trying to go to router");
         match self_iface.handle_routable_packet(&frame) {
             Ok(_) => {
-                log::info!("successfully sent to router");
-                return true;
+                // log::info!("successfully sent to router");
+                true
             }
             // 先不管错误，直接告诉外面没有经过路由发送出去
             Err(Some(err)) => {
                 log::error!("Router error: {:?}", err);
-                return false;
+                false
             }
             Err(_) => {
-                log::info!("not routed");
-                return false;
+                // log::info!("not routed");
+                false
             }
         }
     }
@@ -785,9 +817,36 @@ fn veth_route_test() {
     host_router.nat_tracker().update_dnat_rules(dnat_rules);
 }
 
+fn veth_epoll_test() {
+    let (iface1, iface2) = VethInterface::new_pair("veth1", "veth2");
+
+    let addr1 = IpAddress::v4(111, 111, 11, 1);
+    let cidr1 = IpCidr::new(addr1, 24);
+    iface1.update_ip_addrs(cidr1);
+
+    let addr2 = IpAddress::v4(111, 111, 11, 2);
+    let cidr2 = IpCidr::new(addr2, 24);
+    iface2.update_ip_addrs(cidr2);
+
+    iface1.add_default_route_to_peer(addr2);
+    iface2.add_default_route_to_peer(addr1);
+
+    let turn_on = |a: &Arc<VethInterface>, ns: Arc<NetNamespace>| {
+        a.set_net_state(NetDeivceState::__LINK_STATE_START);
+        a.set_operstate(Operstate::IF_OPER_UP);
+        // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
+        ns.add_device(a.clone());
+        a.common().set_net_namespace(ns.clone());
+        register_netdevice(a.clone()).expect("register veth device failed");
+    };
+
+    turn_on(&iface1, INIT_NET_NAMESPACE.clone());
+    turn_on(&iface2, INIT_NET_NAMESPACE.clone());
+}
+
 #[unified_init(INITCALL_DEVICE)]
 pub fn veth_init() -> Result<(), SystemError> {
-    // veth_probe("veth0", "veth1");
+    veth_epoll_test();
     veth_route_test();
     log::info!("Veth pair initialized.");
     Ok(())

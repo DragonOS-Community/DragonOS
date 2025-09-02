@@ -652,10 +652,10 @@ impl EventPoll {
             let event_guard = binding.event().read();
             let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
             // 检查事件合理性以及是否有感兴趣的事件
-            if !(ep_events
+            if !ep_events
                 .difference(EPollEventType::EP_PRIVATE_BITS)
                 .is_empty()
-                || pollflags.difference(ep_events).is_empty())
+                || pollflags.contains(ep_events)
             {
                 // TODO: 未处理pm相关
 

@@ -31,11 +31,11 @@ pub struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub fn new(_nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
+    pub fn new(nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Some(inner::Inner::Init(inner::Init::new(ver)))),
             // shutdown: Shutdown::new(),
-            nonblock: AtomicBool::new(false),
+            nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new(0_usize),
@@ -309,17 +309,32 @@ impl Socket for TcpSocket {
     }
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+        use crate::sched::SchedMode;
         let Endpoint::Ip(endpoint) = endpoint else {
             log::debug!("TcpSocket::connect: invalid endpoint");
             return Err(SystemError::EINVAL);
         };
         self.start_connect(endpoint)?; // Only Nonblock or error will return error.
 
-        // TODO! 这里改用事件驱动，而不是一直忙等
         return loop {
             match self.check_connect() {
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {}
-                result => break result,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    // log::info!("TcpSocket::connect: wait");
+                    wq_wait_event_interruptible!(
+                        self.wait_queue(),
+                        {
+                            match self.inner.read().as_ref() {
+                                Some(inner::Inner::Established(_)) => true,
+                                _ => false,
+                            }
+                        },
+                        {}
+                    )?;
+                }
+                result => {
+                    // log::info!("TcpSocket::connect: done");
+                    break result;
+                }
             }
         };
     }

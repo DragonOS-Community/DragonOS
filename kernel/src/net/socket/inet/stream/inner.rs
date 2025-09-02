@@ -339,12 +339,12 @@ impl Listening {
             self.connect
                 .store(position, core::sync::atomic::Ordering::Relaxed);
             pollee.fetch_or(
-                EPollEventType::EPOLLIN.bits() as usize,
+                EPollEventType::EPOLL_LISTEN_CAN_ACCEPT.bits() as usize,
                 core::sync::atomic::Ordering::Relaxed,
             );
         } else {
             pollee.fetch_and(
-                !EPollEventType::EPOLLIN.bits() as usize,
+                !EPollEventType::EPOLL_LISTEN_CAN_ACCEPT.bits() as usize,
                 core::sync::atomic::Ordering::Relaxed,
             );
         }

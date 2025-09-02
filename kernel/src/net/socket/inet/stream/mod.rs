@@ -323,10 +323,10 @@ impl Socket for TcpSocket {
                     wq_wait_event_interruptible!(
                         self.wait_queue(),
                         {
-                            match self.inner.read().as_ref() {
-                                Some(inner::Inner::Established(_)) => true,
-                                _ => false,
-                            }
+                            matches!(
+                                self.inner.read().as_ref(),
+                                Some(inner::Inner::Established(_))
+                            )
                         },
                         {}
                     )?;

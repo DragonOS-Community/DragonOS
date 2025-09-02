@@ -245,7 +245,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     // 查找父目录，需要跟随符号链接
     let parent_inode: Arc<dyn IndexNode> =
-        inode_begin.lookup_follow_symlink(parent_path.unwrap_or("."), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        inode_begin.lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     // 检查父路径是否为目录
     if parent_inode.metadata()?.file_type != FileType::Dir {
@@ -253,7 +253,6 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     }
 
     // 查找目标 inode，但 *不* 跟随最后的符号链接
-    //    `lookup_follow_symlink` 的第二个参数为 0 意味着不跟随
     let target_inode = parent_inode.lookup_follow_symlink(filename, 0)?;
 
     // 如果目标是目录，则返回 EISDIR

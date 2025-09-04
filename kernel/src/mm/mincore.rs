@@ -18,8 +18,11 @@ impl LockedVMA {
         if vec.len() < total_pages + offset {
             return Err(SystemError::EINVAL);
         }
-        if !(self.is_anonymous()) {
-            //todo: 当进程是否拥有文件写权限或是文件所有者，才允许对映射了文件的vma调用mincore，否则将对应地址范围的位图置为0
+
+        if !self.can_do_mincore() {
+            let pages = (end_addr - start_addr) >> MMArch::PAGE_SHIFT;
+            vec[offset..offset + pages].fill(0);
+            return Ok(());
         }
         //todo: 处理大页
         self.mincore_walk_page_range(mapper, start_addr, end_addr, 3, vec, offset);
@@ -101,5 +104,15 @@ impl LockedVMA {
             }
         }
         nr
+    }
+
+    pub fn can_do_mincore(&self) -> bool {
+        //todo: 没有实现vm_ops,这里只能找到匿名映射和文件映射。对于设备映射和其他特殊映射（对应linux中vm_ops有值，但不是文件映射的vma），返回false
+        if self.is_accessible() {
+            return true;
+        } else {
+            //todo: 若文件不是当前用户所有，需要当前用户对文件有写权限,否则返回false
+            return true;
+        }
     }
 }

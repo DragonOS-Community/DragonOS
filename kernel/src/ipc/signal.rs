@@ -5,7 +5,7 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
+    arch::ipc::signal::{SigCode, SigSet, Signal},
     ipc::signal_types::SigactionType,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
@@ -15,9 +15,7 @@ use crate::{
     time::Instant,
 };
 
-use super::signal_types::{
-    SaHandlerType, SigInfo, SigType, Sigaction, SignalStruct, SIG_KERNEL_STOP_MASK,
-};
+use super::signal_types::{SigInfo, SigType, SignalStruct, SIG_KERNEL_STOP_MASK};
 
 impl Signal {
     pub fn signal_pending_state(
@@ -272,7 +270,8 @@ impl Signal {
     #[allow(dead_code)]
     #[inline]
     fn sig_fatal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
-        let action = pcb.sig_struct().handlers[*self as usize - 1].action();
+        let sa = pcb.sighand().handler(*self).unwrap();
+        let action = sa.action();
         // 如果handler是空，采用默认函数，signal处理可能会导致进程退出。
         match action {
             SigactionType::SaHandler(handler) => handler.is_sig_default(),
@@ -321,7 +320,7 @@ impl Signal {
         {
             return true;
         }
-        return !pcb.sig_struct().handlers[*self as usize - 1].is_ignore();
+        return !pcb.sighand().handler(*self).unwrap().is_ignore();
 
         //TODO 仿照 linux 中的prepare signal完善逻辑，linux 中还会根据例如当前进程状态(Existing)进行判断，现在的信号能否发出就只是根据 ignored 来判断
     }
@@ -438,96 +437,6 @@ pub fn restore_saved_sigmask_unless(interrupted: bool) {
     } else {
         restore_saved_sigmask();
     }
-}
-
-/// 刷新指定进程的sighand的sigaction，将满足条件的sigaction恢复为默认状态。
-/// 除非某个信号被设置为忽略且 `force_default` 为 `false`，否则都不会将其恢复。
-///
-/// # 参数
-///
-/// - `pcb`: 要被刷新的pcb。
-/// - `force_default`: 是否强制将sigaction恢复成默认状态。
-pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool) {
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // debug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
-    let actions = &mut pcb.sig_struct_irqsave().handlers;
-
-    for sigaction in actions.iter_mut() {
-        if force_default || !sigaction.is_ignore() {
-            sigaction.set_action(SigactionType::SaHandler(SaHandlerType::Default));
-        }
-        // 清除flags中，除了DFL和IGN以外的所有标志
-        sigaction.set_restorer(None);
-        sigaction.mask_mut().remove(SigSet::all());
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    }
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-}
-
-pub(super) fn do_sigaction(
-    sig: Signal,
-    act: Option<&mut Sigaction>,
-    old_act: Option<&mut Sigaction>,
-) -> Result<(), SystemError> {
-    if sig == Signal::INVALID {
-        return Err(SystemError::EINVAL);
-    }
-
-    let pcb = ProcessManager::current_pcb();
-    // 指向当前信号的action的引用
-    let action: &mut Sigaction = &mut pcb.sig_struct().handlers[sig as usize - 1];
-
-    // 对比 MUSL 和 relibc ， 暂时不设置这个标志位
-    // if action.flags().contains(SigFlags::SA_FLAG_IMMUTABLE) {
-    //     return Err(SystemError::EINVAL);
-    // }
-
-    // 保存原有的 sigaction
-    let mut old_act: Option<&mut Sigaction> = {
-        if let Some(oa) = old_act {
-            *(oa) = *action;
-            Some(oa)
-        } else {
-            None
-        }
-    };
-    // 清除所有的脏的sa_flags位（也就是清除那些未使用的）
-    let mut act = {
-        if let Some(ac) = act {
-            *ac.flags_mut() &= SigFlags::SA_ALL;
-            Some(ac)
-        } else {
-            None
-        }
-    };
-
-    if let Some(act) = &mut old_act {
-        *act.flags_mut() &= SigFlags::SA_ALL;
-    }
-
-    if let Some(ac) = &mut act {
-        // 将act.sa_mask的SIGKILL SIGSTOP的屏蔽清除
-        ac.mask_mut()
-            .remove(<Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into());
-
-        // 将新的sigaction拷贝到进程的action中
-        *action = **ac;
-        /*
-        * 根据POSIX 3.3.1.3规定：
-        * 1.不管一个信号是否被阻塞，只要将其设置SIG_IGN，如果当前已经存在了正在pending的信号，那么就把这个信号忽略。
-        *
-        * 2.不管一个信号是否被阻塞，只要将其设置SIG_DFL，如果当前已经存在了正在pending的信号，
-              并且对这个信号的默认处理方式是忽略它，那么就会把pending的信号忽略。
-        */
-        if action.is_ignore() {
-            let mut mask: SigSet = SigSet::from_bits_truncate(0);
-            mask.insert(sig.into());
-            pcb.sig_info_mut().sig_pending_mut().flush_by_mask(&mask);
-            // todo: 当有了多个线程后，在这里进行操作，把每个线程的sigqueue都进行刷新
-        }
-    }
-
-    return Ok(());
 }
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/uapi/asm-generic/signal-defs.h#72

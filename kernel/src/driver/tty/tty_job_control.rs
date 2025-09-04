@@ -103,7 +103,7 @@ impl TtyJobCtrlManager {
         let pcb = ProcessManager::current_pcb();
         let siginfo_guard = pcb.sig_info_irqsave();
         siginfo_guard.sig_blocked().contains(SigSet::from(sig))
-            || pcb.sig_struct_irqsave().handler(sig).unwrap().is_ignore()
+            || pcb.sighand().handler(sig).unwrap().is_ignore()
     }
 
     pub fn job_ctrl_ioctl(

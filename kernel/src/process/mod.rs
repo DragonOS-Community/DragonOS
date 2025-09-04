@@ -35,6 +35,7 @@ use crate::{
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
+        sighand::SigHand,
         signal::RestartBlock,
         signal_types::{SigInfo, SigPending, SignalFlags, SignalStruct},
     },
@@ -743,6 +744,9 @@ pub struct ProcessControlBlock {
     sig_info: RwLock<ProcessSignalInfo>,
     /// 信号处理结构体
     sig_struct: SpinLock<SignalStruct>,
+
+    sighand: RwLock<Arc<SigHand>>,
+
     /// 退出信号S
     exit_signal: AtomicSignal,
 
@@ -882,6 +886,7 @@ impl ProcessControlBlock {
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sig_struct: SpinLock::new(SignalStruct::new()),
+                sighand: RwLock::new(SigHand::new()),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb),

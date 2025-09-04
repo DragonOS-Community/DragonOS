@@ -212,6 +212,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         '_,
         crate::ipc::signal_types::SignalStruct,
     > = sig_guard.unwrap();
+
     let mut siginfo_mut_guard = siginfo_mut.unwrap();
     loop {
         (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
@@ -220,7 +221,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         if sig_number == Signal::INVALID {
             return;
         }
-        let sa = sig_guard.handlers[sig_number as usize - 1];
+        let sa = pcb.sighand().handler(sig_number).unwrap();
 
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {

@@ -48,7 +48,7 @@ impl Syscall for SysMincoreHandle {
         let page_count = PageFrameCount::new(page_count);
         current_address_space
             .write()
-            .mincore(start_frame, page_count, &mut buf)?;
+            .mincore(start_frame, page_count, buf)?;
         return Ok(0);
     }
 

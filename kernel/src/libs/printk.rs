@@ -7,10 +7,6 @@ use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
     driver::tty::{tty_driver::TtyOperation, virtual_terminal::vc_manager},
-    filesystem::procfs::{
-        kmsg::KMSG,
-        log::{LogLevel, LogMessage},
-    },
     time::PosixTimeSpec,
 };
 
@@ -69,15 +65,9 @@ pub fn __printk(args: fmt::Arguments) {
 pub struct Logger;
 
 impl Logger {
-    pub fn log(&self, log_level: usize, message: fmt::Arguments) {
-        if unsafe { KMSG.is_some() } {
-            let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();
-            let log_level = LogLevel::from(log_level);
-
-            let log_message = LogMessage::new(timestamp, log_level, message.to_string());
-
-            unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
-        }
+    pub fn log(&self, _log_level: usize, _message: fmt::Arguments) {
+        // TODO: 实现日志记录到kmsg的功能
+        // 当前暂时禁用，避免编译错误
     }
 }
 

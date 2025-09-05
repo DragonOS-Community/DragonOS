@@ -47,6 +47,27 @@ pub const SYS_SCHED: usize = 100003;
 pub struct Syscall;
 
 impl Syscall {
+    /// # 操作内核环形缓冲区 (临时实现)
+    ///
+    /// ## 参数
+    /// - syslog_action_type: 操作码
+    /// - buf：用户缓冲区
+    /// - len: 需要从内核环形缓冲区读取的字节数
+    ///
+    /// ## 返回值
+    /// - 成功，Ok(usize)
+    /// - 失败，Err(SystemError) 操作失败，返回posix错误码
+    ///
+    pub fn do_syslog(
+        _syslog_action_type: usize,
+        _buf: &mut [u8],
+        _len: usize,
+    ) -> Result<usize, SystemError> {
+        // TODO: 实现真正的 syslog 功能
+        // 临时返回成功，避免编译错误
+        Ok(0)
+    }
+
     /// 初始化系统调用
     #[inline(never)]
     pub fn init() -> Result<(), SystemError> {

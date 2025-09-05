@@ -17,6 +17,8 @@
 
 #define DEFAULT_PAGE "/index.html"
 
+static int request_counter = 0;
+
 int security_check(char *path) {
   // 检查路径是否包含 ..
   if (strstr(path, "..")) {
@@ -156,7 +158,7 @@ int main(int argc, char const *argv[]) {
   int opt = 1;
 
   // 创建socket
-  if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+  if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
     perror("socket failed");
     exit(EXIT_CODE);
   }
@@ -187,7 +189,7 @@ int main(int argc, char const *argv[]) {
   }
 
   while (1) {
-    printf("Waiting for a client...\n");
+    printf("[#%d] Waiting for a client...\n", request_counter++);
 
     // 等待并接受客户端连接
     if ((new_socket = accept(server_fd, (struct sockaddr *)&address,

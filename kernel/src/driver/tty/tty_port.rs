@@ -87,7 +87,7 @@ pub trait TtyPort: Sync + Send + Debug {
         }
         let event: usize = ld.poll(tty.clone())?;
         let pollflag = EPollEventType::from_bits_truncate(event as u32);
-        EventPoll::wakeup_epoll(tty.core().eptiems(), pollflag)?;
+        EventPoll::wakeup_epoll(tty.core().epitems(), pollflag)?;
         ret
     }
 

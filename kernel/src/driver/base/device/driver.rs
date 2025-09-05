@@ -17,7 +17,6 @@ use alloc::{
 use core::fmt::Debug;
 use log::error;
 use system_error::SystemError;
-
 /// @brief: Driver error
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -219,7 +218,8 @@ impl DriverManager {
                 bus_manager().remove_driver(&driver);
             })?;
 
-        // todo: 发送uevent
+        // todo: 发送uevent，类型问题
+        // deferred_probe_extend_timeout();
 
         return Ok(());
     }

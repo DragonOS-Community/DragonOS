@@ -22,7 +22,14 @@ impl Syscall for SysSetxattrHandle {
         let size = Self::size(args);
         let flags = Self::flags(args);
 
-        path_setxattr(path_ptr, name_ptr, value_ptr, size, VFS_MAX_FOLLOW_SYMLINK_TIMES, flags)
+        path_setxattr(
+            path_ptr,
+            name_ptr,
+            value_ptr,
+            size,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            flags,
+        )
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

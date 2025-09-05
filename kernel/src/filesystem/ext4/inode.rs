@@ -80,7 +80,7 @@ impl IndexNode for LockedExt4Inode {
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if data == 0 {
-            return Ok(self.create(name, file_type, mode)?)
+            return self.create(name, file_type, mode);
         }
 
         Err(SystemError::ENOSYS)
@@ -416,7 +416,7 @@ impl IndexNode for LockedExt4Inode {
         let guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
-        
+
         if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
             return Err(SystemError::EPERM);
         }

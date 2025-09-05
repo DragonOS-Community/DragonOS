@@ -20,9 +20,15 @@ impl Syscall for SysGetxattrHandle {
         let path_ptr = Self::path(args);
         let name_ptr = Self::name(args);
         let buf_ptr = Self::buf(args);
-        let size = Self::size(args);        
+        let size = Self::size(args);
 
-        path_getxattr(path_ptr, name_ptr, buf_ptr, size, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        path_getxattr(
+            path_ptr,
+            name_ptr,
+            buf_ptr,
+            size,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        )
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

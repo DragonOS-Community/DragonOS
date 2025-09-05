@@ -665,7 +665,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok(属性值的实际长度)
     ///         失败：Err(错误码)
     fn getxattr(&self, _name: &str, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        log::warn!("getxattr not implemented for {}", crate::libs::name::get_type_name(&self));
+        log::warn!(
+            "getxattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
         return Err(SystemError::ENOSYS);
     }
 
@@ -678,7 +681,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok(0)
     ///         失败：Err(错误码)
     fn setxattr(&self, _name: &str, _value: &[u8]) -> Result<usize, SystemError> {
-        log::warn!("setxattr not implemented for {}", crate::libs::name::get_type_name(&self));
+        log::warn!(
+            "setxattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
         return Err(SystemError::ENOSYS);
     }
 }

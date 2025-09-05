@@ -1,6 +1,6 @@
 use super::{XATTR_CREATE, XATTR_REPLACE};
 use crate::{
-    filesystem::vfs::{IndexNode, utils::user_path_at, MAX_PATHLEN, syscall::AtFlags},
+    filesystem::vfs::{syscall::AtFlags, utils::user_path_at, IndexNode, MAX_PATHLEN},
     process::ProcessManager,
     syscall::user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
 };
@@ -8,21 +8,30 @@ use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 /// Extended attribute GET operations
-
-pub(super) fn path_getxattr(path_ptr: *const u8, name_ptr: *const u8, buf_ptr: *mut u8, size: usize, lookup_flags: usize) -> Result<usize, SystemError> {
+pub(super) fn path_getxattr(
+    path_ptr: *const u8,
+    name_ptr: *const u8,
+    buf_ptr: *mut u8,
+    size: usize,
+    lookup_flags: usize,
+) -> Result<usize, SystemError> {
     let path = check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 
     let pcb = ProcessManager::current_pcb();
-    let (current_node, rest_path) =
-        user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
+    let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
     let inode = current_node.lookup_follow_symlink(&rest_path, lookup_flags)?;
 
     do_getxattr(inode, name_ptr, buf_ptr, size)
 }
 
-pub(super) fn fd_getxattr(fd: i32, name_ptr: *const u8, buf_ptr: *mut u8, size: usize) -> Result<usize, SystemError> {
+pub(super) fn fd_getxattr(
+    fd: i32,
+    name_ptr: *const u8,
+    buf_ptr: *mut u8,
+    size: usize,
+) -> Result<usize, SystemError> {
     // 获取文件描述符对应的文件节点
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
@@ -36,7 +45,12 @@ pub(super) fn fd_getxattr(fd: i32, name_ptr: *const u8, buf_ptr: *mut u8, size: 
     do_getxattr(inode, name_ptr, buf_ptr, size)
 }
 
-fn do_getxattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8, buf_ptr: *mut u8, size: usize) -> Result<usize, SystemError> {
+fn do_getxattr(
+    inode: Arc<dyn IndexNode>,
+    name_ptr: *const u8,
+    buf_ptr: *mut u8,
+    size: usize,
+) -> Result<usize, SystemError> {
     let name = check_and_clone_cstr(name_ptr, None)?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
@@ -57,21 +71,32 @@ fn do_getxattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8, buf_ptr: *mut u8,
 }
 
 /// Extended attribute SET operations
-
-pub(super) fn path_setxattr(path_ptr: *const u8, name_ptr: *const u8, value_ptr: *const u8, size: usize, lookup_flags: usize, flags: i32) -> Result<usize, SystemError> {
+pub(super) fn path_setxattr(
+    path_ptr: *const u8,
+    name_ptr: *const u8,
+    value_ptr: *const u8,
+    size: usize,
+    lookup_flags: usize,
+    flags: i32,
+) -> Result<usize, SystemError> {
     let path = check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 
     let pcb = ProcessManager::current_pcb();
-    let (current_node, rest_path) =
-        user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
+    let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
     let inode = current_node.lookup_follow_symlink(&rest_path, lookup_flags)?;
 
     do_setxattr(inode, name_ptr, value_ptr, size, flags)
 }
 
-pub(super) fn fd_setxattr(fd: i32, name_ptr: *const u8, value_ptr: *const u8, size: usize, flags: i32) -> Result<usize, SystemError> {
+pub(super) fn fd_setxattr(
+    fd: i32,
+    name_ptr: *const u8,
+    value_ptr: *const u8,
+    size: usize,
+    flags: i32,
+) -> Result<usize, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 
@@ -83,21 +108,26 @@ pub(super) fn fd_setxattr(fd: i32, name_ptr: *const u8, value_ptr: *const u8, si
     do_setxattr(inode, name_ptr, value_ptr, size, flags)
 }
 
-fn do_setxattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8, value_ptr: *const u8, size: usize, flags: i32) -> Result<usize, SystemError> {
+fn do_setxattr(
+    inode: Arc<dyn IndexNode>,
+    name_ptr: *const u8,
+    value_ptr: *const u8,
+    size: usize,
+    flags: i32,
+) -> Result<usize, SystemError> {
     let name = check_and_clone_cstr(name_ptr, None)?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
-    
+
     if (flags & XATTR_CREATE != 0) && inode.getxattr(&name, &mut Vec::new()).is_ok() {
         return Err(SystemError::EEXIST);
     }
     if (flags & XATTR_REPLACE != 0) && inode.getxattr(&name, &mut Vec::new()).is_err() {
         return Err(SystemError::ENODATA);
     }
-    
+
     let user_buffer_reader = UserBufferReader::new(value_ptr, size, true)?;
-    let value_buf = user_buffer_reader.buffer(0)?; 
+    let value_buf = user_buffer_reader.buffer(0)?;
 
     inode.setxattr(&name, value_buf)
 }
-    

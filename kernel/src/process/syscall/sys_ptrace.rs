@@ -79,14 +79,6 @@ impl SysPtrace {
         tracee.detach(signal)
     }
 
-    /// 处理 PTRACE_CONT 请求
-    fn handle_cont(
-        tracee: &ProcessControlBlock,
-        signal: Option<Signal>,
-    ) -> Result<isize, SystemError> {
-        tracee.ptrace_cont(signal)
-    }
-
     /// 处理 PTRACE_SYSCALL 请求（在系统调用入口和出口暂停）
     fn handle_syscall(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
         // 检查调用者是否是该进程的跟踪器
@@ -231,7 +223,7 @@ impl Syscall for SysPtrace {
         4
     }
 
-    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         if args.len() < 4 {
             return Err(SystemError::EINVAL);
         }
@@ -259,9 +251,9 @@ impl Syscall for SysPtrace {
             // 分离目标进程
             PtraceRequest::PtraceDetach => Self::handle_detach(&tracee, signal)?,
             // 继续执行目标进程
-            PtraceRequest::PtraceCont => Self::handle_cont(&tracee, signal)?,
-            // 在系统调用入口和出口暂停
-            PtraceRequest::PtraceSyscall => Self::handle_syscall(&tracee)?,
+            PtraceRequest::PtraceCont
+            | PtraceRequest::PtraceSinglestep
+            | PtraceRequest::PtraceSyscall => tracee.ptrace_resume(request, signal, frame)?,
             // 设置跟踪选项
             PtraceRequest::PtraceSetoptions => Self::handle_set_options(&tracee, data)?,
             // 获取信号信息
@@ -270,7 +262,6 @@ impl Syscall for SysPtrace {
             PtraceRequest::PtracePeekuser => Self::handle_peek_user(&tracee, addr)?,
             // 读取进程内存
             PtraceRequest::PtracePeekdata => Self::handle_peek_data(&tracee, addr)?,
-            PtraceRequest::PtraceSinglestep => todo!(),
             // 其他请求类型
             _ => {
                 log::warn!("Unimplemented ptrace request: {:?}", request);

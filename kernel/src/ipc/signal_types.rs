@@ -173,7 +173,7 @@ impl SaHandlerType {
 #[derive(Debug, Copy, Clone)]
 pub struct Sigaction {
     action: SigactionType,
-    pub(crate) flags: SigFlags,
+    flags: SigFlags,
     mask: SigSet, // 为了可扩展性而设置的sa_mask
     /// 信号处理函数执行结束后，将会跳转到这个函数内进行执行，然后执行sigreturn系统调用
     restorer: Option<VirtAddr>,
@@ -572,7 +572,12 @@ impl SigPending {
             return info;
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-            let mut ret = SigInfo::new(sig, 0, SigCode::Origin(OriginCode::User), SigType::Kill(RawPid::from(0)));
+            let mut ret = SigInfo::new(
+                sig,
+                0,
+                SigCode::Origin(OriginCode::User),
+                SigType::Kill(RawPid::from(0)),
+            );
             ret.set_sig_type(SigType::Kill(RawPid::new(0)));
             return ret;
         }

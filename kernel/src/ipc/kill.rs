@@ -10,7 +10,12 @@ use system_error::SystemError;
 /// ### 杀死一个进程
 pub fn kill_process(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
     // 初始化signal info
-    let mut info = SigInfo::new(sig, 0, SigCode::Origin(OriginCode::User), SigType::Kill(pid));
+    let mut info = SigInfo::new(
+        sig,
+        0,
+        SigCode::Origin(OriginCode::User),
+        SigType::Kill(pid),
+    );
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     let ret = sig
@@ -29,7 +34,12 @@ pub fn kill_process_by_pcb(
     sig: Signal,
 ) -> Result<usize, SystemError> {
     // 初始化signal info
-    let mut info = SigInfo::new(sig, 0, SigCode::Origin(OriginCode::User), SigType::Kill(pcb.raw_pid()));
+    let mut info = SigInfo::new(
+        sig,
+        0,
+        SigCode::Origin(OriginCode::User),
+        SigType::Kill(pcb.raw_pid()),
+    );
 
     return sig
         .send_signal_info_to_pcb(Some(&mut info), pcb)

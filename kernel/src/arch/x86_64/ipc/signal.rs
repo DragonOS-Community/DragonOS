@@ -11,6 +11,8 @@ pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
 pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
 
+// 调用一个 ptrace_signal 辅助函数
+use crate::process::{ptrace::ptrace_signal, ProcessFlags};
 use crate::{
     arch::{
         fpu::FpState,
@@ -513,7 +515,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         return;
     }
 
-    let mut sig_number: Signal;
+    let mut sig: Signal;
     let mut info: Option<SigInfo>;
     let mut sigaction: Option<Sigaction>;
     let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
@@ -527,10 +529,10 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
 
     let mut siginfo_mut_guard = siginfo_mut.unwrap();
     loop {
-        (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
+        (sig, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
 
         // 如果信号非法，则直接返回
-        if sig_number == Signal::INVALID {
+        if sig == Signal::INVALID {
             return;
         }
 
@@ -732,6 +734,7 @@ fn handle_signal(
     oldset: &SigSet,
     frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
+    log::debug!("handle_signal {:?}", sig);
     if unsafe { frame.syscall_nr() }.is_some() {
         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
             match syscall_err {

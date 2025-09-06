@@ -291,7 +291,12 @@ impl X86_64MMArch {
 
         let send_segv = || {
             let pid = ProcessManager::current_pid();
-            let mut info = SigInfo::new(Signal::SIGSEGV, 0, SigCode::Origin(OriginCode::User), SigType::Kill(pid));
+            let mut info = SigInfo::new(
+                Signal::SIGSEGV,
+                0,
+                SigCode::Origin(OriginCode::User),
+                SigType::Kill(pid),
+            );
             Signal::SIGSEGV
                 .send_signal_info(Some(&mut info), pid)
                 .expect("failed to send SIGSEGV to process");

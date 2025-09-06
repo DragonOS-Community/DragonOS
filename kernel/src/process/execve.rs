@@ -1,10 +1,12 @@
+use crate::arch::ipc::signal::{ChldCode, SigCode, Signal};
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::IndexNode;
+use crate::ipc::signal_types::{SigChldInfo, SigFaultInfo, SigInfo, SigType, SignalFlags};
 use crate::process::exec::{load_binary_file, ExecParam, ExecParamFlags};
+use crate::process::PtraceEvent;
 use crate::process::{ProcessFlags, ProcessManager};
 use crate::syscall::Syscall;
-use crate::process::ptrace::PtraceEvent;
 use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
 
 use crate::arch::interrupt::TrapFrame;
@@ -28,12 +30,6 @@ pub fn do_execve(
             do_execve_switch_user_vm(old_vm);
         }
     })?;
-
-    let current_pcb = ProcessManager::current_pcb();
-    if current_pcb.flags().contains(ProcessFlags::PTRACED) {
-        log::debug!("ptrace_event Exec");
-        current_pcb.ptrace_event(PtraceEvent::Exec, current_pcb.task_pid_vnr().data());
-    }
 
     // log::debug!("load binary file done");
     // debug!("argv: {:?}, envp: {:?}", argv, envp);
@@ -66,7 +62,7 @@ pub fn do_execve(
 
     // execve 成功后，如果是 vfork 创建的子进程，需要通知父进程继续执行
     // 在通知父进程之前，必须先清除 vfork_done，防止子进程退出时再次通知
-    let pcb = ProcessManager::current_pcb();
+    let pcb = ProcessManager::pcb();
     let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
 
     if let Some(completion) = vfork_done {
@@ -83,6 +79,29 @@ pub fn do_execve(
     // 重置所有信号处理器为默认行为(SIG_DFL)，禁用并清空备用信号栈。
     pcb.flush_signal_handlers(false);
     *pcb.sig_altstack_mut() = crate::arch::SigStackArch::new();
+
+    if pcb.is_traced() {
+        if pcb.ptrace_event_enabled(PtraceEvent::Exec) {
+            log::debug!("ptrace_event Exec");
+            pcb.ptrace_event(PtraceEvent::Exec, pcb.task_pid_vnr().data());
+        } else {
+            // 经典 traceme 发送 SIGTRAP
+            log::debug!("execve hook: classic traceme send SIGTRAP.");
+            let mut info = SigInfo::new(
+                Signal::SIGTRAP,
+                0,
+                SigCode::SigChld(ChldCode::Trapped),
+                SigType::SigChld(SigChldInfo {
+                    pid: pcb.task_pid_vnr(),
+                    uid: pcb.cred().uid.data(),
+                    status: 0, // todo
+                    utime: 0,  // 可以根据需要填充实际值
+                    stime: 0,  // 可以根据需要填充实际值
+                }),
+            );
+            Signal::SIGTRAP.send_signal_info_to_pcb(Some(&mut info), pcb);
+        }
+    }
 
     Syscall::arch_do_execve(regs, &param, &load_result, user_sp, argv_ptr)
 }
@@ -102,7 +121,7 @@ pub fn do_execve(
 fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
     // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let pcb = ProcessManager::current_pcb();
+    let pcb = ProcessManager::pcb();
     // log::debug!(
     //     "pid: {:?}  do_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
     //     pcb.pid(),

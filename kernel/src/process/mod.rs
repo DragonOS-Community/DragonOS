@@ -1,16 +1,15 @@
-use core::{
-    fmt,
-    hash::Hash,
-    hint::spin_loop,
-    intrinsics::unlikely,
-    mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
-};
-
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
+};
+use core::{
+    fmt,
+    hash::Hash,
+    hint::spin_loop,
+    intrinsics::{likely, unlikely},
+    mem::{ManuallyDrop, MaybeUninit},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use cred::INIT_CRED;
 use hashbrown::HashMap;
@@ -760,20 +759,19 @@ impl ProcessState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum PtraceRequest {
-    PtraceTraceme = 0,         // PTRACE_TRACEME
-    PtraceAttach = 16,         // PTRACE_ATTACH
-    PtraceDetach = 17,         // PTRACE_DETACH
-    PtraceSyscall = 24,        // PTRACE_SYSCALL
-    PtraceSinglestep = 9,      // PTRACE_SINGLESTEP
-    PtraceCont = 7,            // PTRACE_CONT
-    PtraceGetregs = 12,        // PTRACE_GETREGS
-    PtraceSetregs = 13,        // PTRACE_SETREGS
-    PtracePeekuser = 3,        // PTRACE_PEEKUSER
-    PtracePeekdata = 2,        // PTRACE_PEEKDATA
-    PtracePokedata = 5,        // PTRACE_POKEDATA
-    PtraceGetsiginfo = 0x4202, // PTRACE_GETSIGINFO
-    PtraceSetoptions = 0x4200, // PTRACE_SETOPTIONS
-                               // ... 其他可能的请求
+    PtraceTraceme = 0,
+    PtraceAttach = 16,
+    PtraceDetach = 17,
+    PtraceSyscall = 24,
+    PtraceSinglestep = 9,
+    PtraceCont = 7,
+    PtraceGetregs = 12,
+    PtraceSetregs = 13,
+    PtracePeekuser = 3,
+    PtracePeekdata = 2,
+    PtracePokedata = 5,
+    PtraceGetsiginfo = 0x4202,
+    PtraceSetoptions = 0x4200,
 }
 
 bitflags! {
@@ -874,6 +872,78 @@ pub struct ProcessItimers {
     pub prof: CpuItimer,             // 用于 ITIMER_PROF
 }
 
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum PtraceSyscallInfoOp {
+    None = 0,
+    Entry = 1,
+    Exit = 2,
+    Seccomp = 3,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PtraceSyscallInfoEntry {
+    pub nr: u64,
+    pub args: [u64; 6],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PtraceSyscallInfoExit {
+    pub rval: i64,
+    pub is_error: u8,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PtraceSyscallInfoSeccomp {
+    pub nr: u64,
+    pub args: [u64; 6],
+    pub ret_data: u32,
+}
+
+#[repr(C)]
+pub union PtraceSyscallInfoData {
+    pub entry: PtraceSyscallInfoEntry,
+    pub exit: PtraceSyscallInfoExit,
+    pub seccomp: PtraceSyscallInfoSeccomp,
+    _uninit: MaybeUninit<[u8; 64]>,
+}
+
+#[repr(C)]
+pub struct PtraceSyscallInfo {
+    /// PTRACE_SYSCALL_INFO_*
+    pub op: PtraceSyscallInfoOp,
+    pub pad: [u8; 3],
+    pub arch: u32,
+    pub instruction_pointer: u64,
+    pub stack_pointer: u64,
+    /// The union containing event-specific data.
+    pub data: PtraceSyscallInfoData,
+}
+
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum PtraceStopReason {
+    #[default]
+    None,
+    SyscallEntry,
+    SyscallExit,
+    Signal(Signal),
+    Event(PtraceEvent),
+}
+
+/// ptrace 系统调用的事件类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtraceEvent {
+    Fork = 1,
+    VFork,
+    Clone,
+    Exec,
+    VForkDone,
+    Exit,
+    Seccomp,
+    Stop = 128, // 信号或单步执行导致的停止
+}
+
 /// 进程被跟踪的状态信息
 #[derive(Debug, Default)]
 struct PtraceState {
@@ -883,6 +953,7 @@ struct PtraceState {
     pending_signals: Vec<Signal>,
     /// 系统调用信息 (用于 PTRACE_SYSCALL)
     syscall_info: Option<SyscallInfo>,
+    stop_reason: PtraceStopReason,
     /// ptrace选项位
     options: PtraceOptions,
     /// 停止状态的状态字
@@ -896,6 +967,7 @@ impl PtraceState {
             tracer: None,
             pending_signals: Vec::new(),
             syscall_info: None,
+            stop_reason: PtraceStopReason::None,
             options: PtraceOptions::empty(),
             exit_code: 0,
             event_message: 0,

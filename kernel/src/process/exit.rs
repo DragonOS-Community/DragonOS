@@ -574,8 +574,8 @@ fn do_waitpid(
                 drop(child_pcb);
             }
             return Some(Ok(pid.into()));
-        },
-        ProcessState::TracedStopped => todo!()
+        }
+        ProcessState::TracedStopped => todo!(),
     };
 
     return None;

@@ -5,7 +5,7 @@ mod family;
 pub mod inet;
 mod inode;
 mod posix;
-// pub mod unix;
+pub mod unix;
 mod utils;
 
 pub use base::Socket;

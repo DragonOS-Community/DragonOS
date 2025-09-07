@@ -1,4 +1,6 @@
-use crate::net::socket::{self, inet::syscall::create_inet_socket, Socket};
+use crate::net::socket::{
+    self, inet::syscall::create_inet_socket, unix::create_unix_socket, Socket,
+};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -24,7 +26,7 @@ pub fn create_socket(
             smoltcp::wire::IpProtocol::from(protocol as u8),
             is_nonblock,
         )?,
-        // AF::Unix => socket::unix::Unix::socket(socket_type, protocol, is_nonblock)?,
+        AF::Unix => create_unix_socket(socket_type, is_nonblock)?,
         _ => {
             log::warn!("unsupport address family");
             return Err(SystemError::EAFNOSUPPORT);

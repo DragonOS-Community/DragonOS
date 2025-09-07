@@ -1,93 +1,113 @@
+use crate::libs::rwlock::RwLock;
 use alloc::collections::BTreeMap;
-
-use hashbrown::HashMap;
+use alloc::string::String;
+use alloc::sync::{Arc, Weak};
+use alloc::{collections::btree_map::Entry, format};
 use system_error::SystemError;
 
-use crate::net::socket::unix::UnixEndpoint;
-use crate::net::socket::Socket;
-use crate::{filesystem::vfs::InodeId, libs::rwlock::RwLock};
-
-use alloc::string::String;
-use alloc::sync::Arc;
-
-lazy_static! {
-    // and unnamed unix socket, they don't have a path, so we don't store them in the map.
-    // they will be removed when the socket is closed.
-    pub static ref ABS_UNIX_MAP: RwLock<HashMap<AbstractUnixPath, Arc<dyn Socket>>> = RwLock::new(HashMap::new());
-    pub static ref INO_UNIX_MAP: RwLock<BTreeMap<InodeId, Arc<dyn Socket>>> = RwLock::new(BTreeMap::new());
+/// Unix Socket的抽象路径
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AbstractHandle {
+    name: Arc<[u8]>,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
-pub struct AbstractUnixPath(String);
-
-impl AbstractUnixPath {
-    pub fn new(path: String) -> Self {
-        Self(path)
+impl AbstractHandle {
+    fn new(name: Arc<[u8]>) -> Self {
+        Self { name }
     }
 
-    pub fn sun_path(&self, path: &mut [u8]) {
-        let mut path_bytes = self.0.as_bytes().to_vec();
-        if path_bytes.len() > 108 {
-            path_bytes.truncate(108);
-        }
-        path_bytes.push(0); // null-terminate
-        path[0] = 0; // abstract socket starts with a null byte
-        path[1..path_bytes.len()].copy_from_slice(&path_bytes);
+    pub fn name(&self) -> Arc<[u8]> {
+        self.name.clone()
     }
 }
 
-pub(super) struct UnixSockMap<S: Socket> {
-    /// A map of abstract unix sockets, they don't have a path, so we don't store them in the map.
-    /// They will be removed when the socket is closed.
-    pub abs_unix_map: RwLock<HashMap<AbstractUnixPath, Arc<S>>>,
-    /// A map of inode unix sockets, they have a path, so we store them in the map.
-    pub ino_unix_map: RwLock<BTreeMap<String, Arc<S>>>,
+impl Drop for AbstractHandle {
+    fn drop(&mut self) {
+        HANDLE_TABLE.remove(self.name());
+    }
 }
 
-impl<S: Socket> UnixSockMap<S> {
-    pub fn new() -> Self {
+static HANDLE_TABLE: HandleTable = HandleTable::new();
+
+struct HandleTable {
+    handles: RwLock<BTreeMap<Arc<[u8]>, Weak<AbstractHandle>>>,
+}
+
+impl HandleTable {
+    const fn new() -> Self {
         Self {
-            abs_unix_map: RwLock::new(HashMap::new()),
-            ino_unix_map: RwLock::new(BTreeMap::new()),
+            handles: RwLock::new(BTreeMap::new()),
         }
     }
 
-    /// Try to insert a socket into the map. If the socket already exists, return EEXIST.
-    pub fn try_insert(&self, endpoint: UnixEndpoint, socket: Arc<S>) -> Result<(), SystemError> {
-        use UnixEndpoint::*;
-        match endpoint {
-            File(path) => {
-                use alloc::collections::btree_map::Entry::*;
-                match self.ino_unix_map.write().entry(path) {
-                    Vacant(vacant_entry) => {
-                        vacant_entry.insert(socket);
-                        return Ok(());
-                    }
-                    Occupied(_) => {
-                        return Err(SystemError::EEXIST);
-                    }
-                }
+    fn create(&self, name: Arc<[u8]>) -> Option<Arc<AbstractHandle>> {
+        let mut handles = self.handles.write();
+
+        let mut entry = handles.entry(name.clone());
+
+        if let Entry::Occupied(ref occupied) = entry {
+            // 如果引用计数大于0，说明名字已经被占用
+            if occupied.get().strong_count() > 0 {
+                return None;
             }
-            Abstract(path) => {
-                use hashbrown::hash_map::Entry::*;
-                match self.abs_unix_map.write().entry(path) {
-                    Vacant(vacant_entry) => {
-                        vacant_entry.insert(socket);
-                        return Ok(());
-                    }
-                    Occupied(_) => {
-                        return Err(SystemError::EEXIST);
-                    }
-                }
+        }
+
+        let new_handle = Arc::new(AbstractHandle::new(name));
+        let weak_handle = Arc::downgrade(&new_handle);
+
+        match entry {
+            Entry::Occupied(ref mut occupied) => {
+                occupied.insert(weak_handle);
             }
+            Entry::Vacant(vacant) => {
+                vacant.insert(weak_handle);
+            }
+        }
+
+        Some(new_handle)
+    }
+
+    fn remove(&self, name: Arc<[u8]>) {
+        let mut handles = self.handles.write();
+
+        let Entry::Occupied(occupied) = handles.entry(name) else {
+            return;
+        };
+
+        // 如果引用计数为0，说明名字已经不再使用，可以移除
+        if occupied.get().strong_count() == 0 {
+            occupied.remove();
         }
     }
 
-    pub fn get(&self, endpoint: &UnixEndpoint) -> Option<Arc<S>> {
-        use UnixEndpoint::*;
-        match endpoint {
-            File(ino) => self.ino_unix_map.read().get(ino).cloned(),
-            Abstract(path) => self.abs_unix_map.read().get(path).cloned(),
-        }
+    fn lookup(&self, name: &[u8]) -> Option<Arc<AbstractHandle>> {
+        let handles = self.handles.read();
+
+        handles.get(name).and_then(Weak::upgrade)
     }
+
+    fn alloc_ephemeral(&self) -> Option<Arc<AbstractHandle>> {
+        // todo 随机化
+        // 尝试分配一个临时的抽象名字
+        (0..(1 << 20))
+            .map(|num| format!("{:05x}", num))
+            .map(|name| Arc::from(name.as_bytes()))
+            .filter_map(|name| self.create(name))
+            .next()
+    }
+}
+
+pub fn create_abstract_name(name: String) -> Result<Arc<AbstractHandle>, SystemError> {
+    let name = Arc::from(name.into_bytes().as_slice());
+    HANDLE_TABLE.create(name).ok_or(SystemError::EADDRINUSE)
+}
+
+pub fn alloc_ephemeral_abstract_name() -> Result<Arc<AbstractHandle>, SystemError> {
+    HANDLE_TABLE
+        .alloc_ephemeral()
+        .ok_or(SystemError::ECONNREFUSED)
+}
+
+pub fn lookup_abstract_name(name: &[u8]) -> Result<Arc<AbstractHandle>, SystemError> {
+    HANDLE_TABLE.lookup(name).ok_or(SystemError::ECONNREFUSED)
 }

@@ -5,6 +5,7 @@ use crate::{
         file::{File, FileMode},
         iov::IoVecs,
     },
+    net::socket::{unix::stream::UnixStreamSocket, AddressFamily, PSOCK},
     process::ProcessManager,
     syscall::Syscall,
 };
@@ -68,37 +69,45 @@ impl Syscall {
     /// - `protocol`: 传输协议
     /// - `fds`: 用于返回文件描述符的数组
     pub fn socketpair(
-        _address_family: usize,
-        _socket_type: usize,
-        _protocol: usize,
-        _fds: &mut [i32],
+        address_family: usize,
+        socket_type: usize,
+        protocol: usize,
+        fds: &mut [i32],
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOSYS);
-        // let address_family = AddressFamily::try_from(address_family as u16)?;
-        // let socket_type = PosixArgsSocketType::from_bits_truncate(socket_type as u32);
-        // let stype = socket::PSOCK::try_from(socket_type)?;
+        let address_family = AddressFamily::try_from(address_family as u16)?;
+        let socket_type = PosixArgsSocketType::from_bits_truncate(socket_type as u32);
+        let stype = socket::PSOCK::try_from(socket_type)?;
 
-        // let binding = ProcessManager::current_pcb().fd_table();
-        // let mut fd_table_guard = binding.write();
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
 
-        // // check address family, only support AF_UNIX
-        // if address_family != AddressFamily::Unix {
-        //     log::warn!(
-        //         "only support AF_UNIX, {:?} with protocol {:?} is not supported",
-        //         address_family,
-        //         protocol
-        //     );
-        //     return Err(SystemError::EAFNOSUPPORT);
-        // }
+        // check address family, only support AF_UNIX
+        if address_family != AddressFamily::Unix {
+            log::warn!(
+                "only support AF_UNIX, {:?} with protocol {:?} is not supported",
+                address_family,
+                protocol
+            );
+            return Err(SystemError::EAFNOSUPPORT);
+        }
 
-        // // 创建一对新的unix socket pair
-        // let (inode0, inode1) = Unix::new_pairs(stype, socket_type.is_nonblock())?;
+        let nonblocking = socket_type.contains(PosixArgsSocketType::NONBLOCK);
 
-        // fds[0] = fd_table_guard.alloc_fd(File::new(inode0, FileMode::O_RDWR)?, None)?;
-        // fds[1] = fd_table_guard.alloc_fd(File::new(inode1, FileMode::O_RDWR)?, None)?;
+        let (socket_a, socket_b) = match (address_family, stype) {
+            (AddressFamily::Unix, PSOCK::Stream) => UnixStreamSocket::new_pair(nonblocking, false),
+            (AddressFamily::Unix, PSOCK::SeqPacket) => {
+                UnixStreamSocket::new_pair(nonblocking, true)
+            }
+            _ => {
+                return Err(SystemError::EAFNOSUPPORT);
+            }
+        };
 
-        // drop(fd_table_guard);
-        // Ok(0)
+        fds[0] = fd_table_guard.alloc_fd(File::new(socket_a, FileMode::O_RDWR)?, None)?;
+        fds[1] = fd_table_guard.alloc_fd(File::new(socket_b, FileMode::O_RDWR)?, None)?;
+
+        drop(fd_table_guard);
+        Ok(0)
     }
 
     /// @brief sys_setsockopt系统调用的实际执行函数

@@ -35,17 +35,11 @@ impl PosixArgsSocketType {
     }
 }
 
-use alloc::string::String;
+use super::socket::{endpoint::Endpoint, AddressFamily};
+use crate::net::socket::unix::UnixEndpoint;
+use alloc::string::ToString;
 use core::ffi::CStr;
 use system_error::SystemError;
-
-use crate::{
-    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
-    // net::socket::unix::UnixEndpoint,
-    process::ProcessManager,
-};
-
-use super::socket::{endpoint::Endpoint, AddressFamily};
 
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
 #[repr(C)]
@@ -119,11 +113,45 @@ impl From<smoltcp::wire::IpEndpoint> for SockAddr {
     }
 }
 
+impl From<UnixEndpoint> for SockAddr {
+    fn from(value: UnixEndpoint) -> Self {
+        let mut sun_path = [0u8; 108];
+
+        match value {
+            UnixEndpoint::File(path) => {
+                let path_bytes = path.as_bytes();
+                let copy_len = core::cmp::min(path_bytes.len(), 107); // 留一个字节给null终止符
+                sun_path[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
+                // 确保以null结尾
+                sun_path[copy_len] = 0;
+            }
+            UnixEndpoint::Abstract(name) => {
+                // Abstract namespace以null字节开头
+                sun_path[0] = 0;
+                let name_bytes = name.as_bytes();
+                let copy_len = core::cmp::min(name_bytes.len(), 107);
+                sun_path[1..1 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+            }
+            UnixEndpoint::Unnamed => {
+                // Unnamed socket，所有字节保持为0
+            }
+        }
+
+        SockAddr {
+            addr_un: SockAddrUn {
+                sun_family: AddressFamily::Unix as u16,
+                sun_path,
+            },
+        }
+    }
+}
+
 impl From<Endpoint> for SockAddr {
     fn from(value: Endpoint) -> Self {
         match value {
             Endpoint::LinkLayer(_link_layer_endpoint) => todo!(),
             Endpoint::Ip(endpoint) => Self::from(endpoint),
+            Endpoint::Unix(unix_endpoint) => Self::from(unix_endpoint),
         }
     }
 }
@@ -169,6 +197,8 @@ impl SockAddr {
                 //     return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
                 // }
                 AddressFamily::Unix => {
+                    // 在这里并没有分配抽象地址或者创建文件系统节点，这里只是简单的获取，等到bind时再创建
+
                     let addr_un: SockAddrUn = addr.addr_un;
 
                     if addr_un.sun_path[0] == 0 {
@@ -193,28 +223,12 @@ impl SockAddr {
                                 SystemError::EINVAL
                             })?;
 
-                        // 向抽象地址管理器申请或查找抽象地址
-                        let spath = String::from(path);
-                        log::debug!("abs path: {}", spath);
-                        todo!("abstract address space not implemented yet");
-                        // let abs_find = match look_up_abs_addr(&spath) {
-                        //     Ok(result) => result,
-                        //     Err(_) => {
-                        //         //未找到尝试分配abs
-                        //         match alloc_abs_addr(spath.clone()) {
-                        //             Ok(result) => {
-                        //                 log::debug!("alloc abs addr success!");
-                        //                 return Ok(result);
-                        //             }
-                        //             Err(e) => {
-                        //                 log::debug!("alloc abs addr failed!");
-                        //                 return Err(e);
-                        //             }
-                        //         };
-                        //     }
-                        // };
-                        // log::debug!("find alloc abs addr success!");
-                        // return Ok(abs_find);
+                        // // 向抽象地址管理器申请或查找抽象地址
+                        // let spath = String::from(path);
+                        // log::info!("abs path: {}", spath);
+                        // let path = create_abstract_name(spath)?;
+
+                        return Ok(Endpoint::Unix(UnixEndpoint::Abstract(path.to_string())));
                     }
 
                     let path = CStr::from_bytes_until_nul(&addr_un.sun_path)
@@ -228,17 +242,15 @@ impl SockAddr {
                             SystemError::EINVAL
                         })?;
 
-                    let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(
-                        &ProcessManager::current_pcb(),
-                        crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
-                        path.trim(),
-                    )?;
-                    let _inode =
-                        inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+                    // let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(
+                    //     &ProcessManager::current_pcb(),
+                    //     crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
+                    //     path.trim(),
+                    // )?;
+                    // let _inode =
+                    //     inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-                    // return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id, path)));
-                    // return Err(SystemError::ENOSYS);
-                    unreachable!("Unix socket is not supported yet");
+                    return Ok(Endpoint::Unix(UnixEndpoint::File(path.to_string())));
                 }
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);

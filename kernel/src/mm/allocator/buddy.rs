@@ -429,7 +429,6 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 }
             }
 
-            // 如果没有找到伙伴块
             if let Some(buddy_entry_virt_addr) = buddy_entry_virt_vaddr {
                 // 如果找到了伙伴块，合并，向上递归
 
@@ -539,6 +538,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     let new_page_list = PageList::new(0, first_page_list_paddr);
                     Self::write_page(new_page_list_addr, new_page_list);
                     self.free_area[Self::order2index(order as u8)] = new_page_list_addr;
+
+                    if new_page_list_addr == base {
+                        return;
+                    }
                 }
 
                 // 由于上面可能更新了第一个链表页，因此需要重新获取这个值
@@ -549,7 +552,13 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 let second_page_list = if first_page_list.next_page.is_null() {
                     None
                 } else {
-                    Some(Self::read_page::<PageList<A>>(first_page_list.next_page))
+                    let second_page_list =
+                        Self::read_page::<PageList<A>>(first_page_list.next_page);
+                    if second_page_list.entry_num < Self::BUDDY_ENTRIES {
+                        Some(second_page_list)
+                    } else {
+                        None
+                    }
                 };
 
                 let (paddr, mut page_list) = if let Some(second) = second_page_list {

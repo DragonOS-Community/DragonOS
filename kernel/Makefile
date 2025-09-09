@@ -31,7 +31,7 @@ clean:
 fmt:
 	RUSTFLAGS="$(RUSTFLAGS)" cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2025-08-10 clippy --all-features --target x86_64-unknown-none
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2025-08-10 clippy -Zbuild-std=core,alloc,compiler_builtins --all-features --target x86_64-unknown-none
 endif
 
 

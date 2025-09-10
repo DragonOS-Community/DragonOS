@@ -366,8 +366,11 @@ impl Futex {
             flags.contains(FutexFlag::FLAGS_SHARED),
             FutexAccess::FutexRead,
         )?;
+
         let mut binding = FutexData::futex_map();
-        let bucket_mut = binding.get_mut(&key).ok_or(SystemError::EINVAL)?;
+        let bucket_mut = binding.entry(key.clone()).or_insert(FutexHashBucket {
+            chain: LinkedList::new(),
+        });
 
         // 确保后面的唤醒操作是有意义的
         if bucket_mut.chain.is_empty() {

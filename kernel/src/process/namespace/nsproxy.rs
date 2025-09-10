@@ -3,7 +3,10 @@ use system_error::SystemError;
 
 use crate::process::{
     fork::CloneFlags,
-    namespace::mnt::{root_mnt_namespace, MntNamespace},
+    namespace::{
+        mnt::{root_mnt_namespace, MntNamespace},
+        uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
+    },
     ProcessControlBlock, ProcessManager,
 };
 use core::{fmt::Debug, intrinsics::likely};
@@ -17,18 +20,17 @@ use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, Namespac
 /// Namespace references are counted by the number of nsproxies pointing to them, not by the number of tasks.
 ///
 /// The nsproxy is shared by tasks that share all namespaces. It will be copied when any namespace is cloned or unshared.
+/// 注意，user_ns 存储在cred,不存储在nsproxy
 #[derive(Clone)]
 pub struct NsProxy {
     /// PID namespace（用于子进程）
     pub pid_ns_for_children: Arc<PidNamespace>,
     /// mount namespace（挂载命名空间）
     pub mnt_ns: Arc<MntNamespace>,
-    // 注意，user_ns 存储在cred,不存储在nsproxy
-
+    pub uts_ns: Arc<UtsNamespace>,
     // 其他namespace（为未来扩展预留）
     // pub net_ns: Option<Arc<NetNamespace>>,
     // pub ipc_ns: Option<Arc<IpcNamespace>>,
-    // pub uts_ns: Option<Arc<UtsNamespace>>,
     // pub cgroup_ns: Option<Arc<CgroupNamespace>>,
     // pub time_ns: Option<Arc<TimeNamespace>>,
 }
@@ -44,9 +46,11 @@ impl NsProxy {
     pub fn new_root() -> Arc<Self> {
         let root_pid_ns = super::pid_namespace::INIT_PID_NAMESPACE.clone();
         let root_mnt_ns = root_mnt_namespace();
+        let root_uts_ns = INIT_UTS_NAMESPACE.clone();
         Arc::new(Self {
             pid_ns_for_children: root_pid_ns,
             mnt_ns: root_mnt_ns,
+            uts_ns: root_uts_ns,
         })
     }
 
@@ -64,6 +68,7 @@ impl NsProxy {
         Self {
             pid_ns_for_children: self.pid_ns_for_children.clone(),
             mnt_ns: self.mnt_ns.clone(),
+            uts_ns: self.uts_ns.clone(),
         }
     }
 }
@@ -142,9 +147,12 @@ pub(super) fn create_new_namespaces(
         .copy_pid_ns(clone_flags, user_ns.clone())?;
 
     let mnt_ns = nsproxy.mnt_ns.copy_mnt_ns(clone_flags, user_ns.clone())?;
+
+    let uts_ns = nsproxy.uts_ns.copy_uts_ns(clone_flags, user_ns.clone())?;
     let result = NsProxy {
         pid_ns_for_children,
         mnt_ns,
+        uts_ns,
     };
 
     let result = Arc::new(result);
@@ -153,7 +161,7 @@ pub(super) fn create_new_namespaces(
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/ns_common.h#9
 /// 融合了 NamespaceBase 的公共字段
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NsCommon {
     /// 层级（root = 0）
     pub level: u32,

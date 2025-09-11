@@ -1618,6 +1618,12 @@ impl IndexNode for LockedFATInode {
                 }
 
                 FileType::SymLink => return Err(SystemError::ENOSYS),
+
+                FileType::Socket => {
+                    d.create_file(name, fs)?;
+                    return Ok(guard.find(name)?);
+                }
+
                 _ => return Err(SystemError::EINVAL),
             },
             FATDirEntry::UnInit => {

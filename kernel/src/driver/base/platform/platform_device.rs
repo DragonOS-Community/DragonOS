@@ -16,7 +16,7 @@ use crate::{
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
     },
-    filesystem::kernfs::KernFSInode,
+    filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -328,5 +328,9 @@ impl Device for PlatformBusDevice {
 
     fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
         self.inner().device_common.parent = dev_parent;
+    }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        None
     }
 }

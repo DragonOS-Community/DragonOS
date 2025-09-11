@@ -7,11 +7,6 @@ busybox_dir := $(build_dir)/busybox-$(busybox_version)
 prefix := $(ARCH)-linux-musl-
 bin := build/$(ARCH)/busybox
 
-# 特殊架构处理
-ifeq ($(ARCH), mipsel)
-	prefix := mipsel-linux-musln32-
-endif
-
 cc := $(prefix)gcc
 strip := $(prefix)strip
 

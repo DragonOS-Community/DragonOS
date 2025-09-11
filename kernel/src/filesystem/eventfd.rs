@@ -1,4 +1,5 @@
 use super::vfs::PollableInode;
+use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::{
@@ -10,7 +11,6 @@ use crate::libs::wait_queue::WaitQueue;
 use crate::process::{ProcessFlags, ProcessManager};
 use crate::sched::SchedMode;
 use crate::syscall::Syscall;
-use alloc::collections::LinkedList;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -54,7 +54,7 @@ impl EventFd {
 pub struct EventFdInode {
     eventfd: SpinLock<EventFd>,
     wait_queue: WaitQueue,
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
+    epitems: LockedEPItemLinkedList,
 }
 
 impl EventFdInode {
@@ -62,7 +62,7 @@ impl EventFdInode {
         EventFdInode {
             eventfd: SpinLock::new(eventfd),
             wait_queue: WaitQueue::default(),
-            epitems: SpinLock::new(LinkedList::new()),
+            epitems: LockedEPItemLinkedList::default(),
         }
     }
     fn readable(&self) -> bool {

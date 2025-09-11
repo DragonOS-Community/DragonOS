@@ -1,7 +1,10 @@
 use crate::{
     arch::ipc::signal::{SigCode, Signal},
     filesystem::{
-        epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
+        epoll::{
+            event_poll::{EventPoll, LockedEPItemLinkedList},
+            EPollEventType, EPollItem,
+        },
         vfs::{
             file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
             FileSystem, FileType, IndexNode, Metadata, PollableInode,
@@ -18,10 +21,7 @@ use crate::{
 use alloc::string::String;
 use core::sync::atomic::compiler_fence;
 
-use alloc::{
-    collections::LinkedList,
-    sync::{Arc, Weak},
-};
+use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 use super::signal_types::{SigInfo, SigType};
@@ -50,7 +50,7 @@ pub struct LockedPipeInode {
     inner: SpinLock<InnerPipeInode>,
     read_wait_queue: WaitQueue,
     write_wait_queue: WaitQueue,
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
+    epitems: LockedEPItemLinkedList,
 }
 
 /// @brief 管道文件i节点(无锁)
@@ -145,7 +145,7 @@ impl LockedPipeInode {
             inner: SpinLock::new(inner),
             read_wait_queue: WaitQueue::default(),
             write_wait_queue: WaitQueue::default(),
-            epitems: SpinLock::new(LinkedList::new()),
+            epitems: LockedEPItemLinkedList::default(),
         });
         let mut guard = result.inner.lock();
         guard.self_ref = Arc::downgrade(&result);

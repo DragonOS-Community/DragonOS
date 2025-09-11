@@ -7,7 +7,7 @@ use crate::{
     arch::syscall::nr::*,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::page::PAGE_4K_SIZE,
-    net::syscall::MsgHdr,
+    net::posix::{MsgHdr, SockAddr},
     process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
@@ -20,7 +20,6 @@ use table::{syscall_table, syscall_table_init};
 use crate::{
     arch::interrupt::TrapFrame,
     mm::{verify_area, VirtAddr},
-    net::syscall::SockAddr,
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         PosixTimeSpec,
@@ -218,9 +217,10 @@ impl Syscall {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
-                    Self::connect(args[0], addr, addrlen)
+                    Self::connect(args[0], addr, addrlen as u32)
                 }
             }
+
             SYS_BIND => {
                 let addr = args[1] as *const SockAddr;
                 let addrlen = args[2];
@@ -230,7 +230,7 @@ impl Syscall {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
-                    Self::bind(args[0], addr, addrlen)
+                    Self::bind(args[0], addr, addrlen as u32)
                 }
             }
 
@@ -248,7 +248,7 @@ impl Syscall {
                     Err(SystemError::EFAULT)
                 } else {
                     let data: &[u8] = unsafe { core::slice::from_raw_parts(buf, len) };
-                    Self::sendto(args[0], data, flags, addr, addrlen)
+                    Self::sendto(args[0], data, flags, addr, addrlen as u32)
                 }
             }
 
@@ -257,7 +257,7 @@ impl Syscall {
                 let len = args[2];
                 let flags = args[3] as u32;
                 let addr = args[4] as *mut SockAddr;
-                let addrlen = args[5] as *mut usize;
+                let addrlen = args[5] as *mut u32;
                 let virt_buf = VirtAddr::new(buf as usize);
                 let virt_addrlen = VirtAddr::new(addrlen as usize);
                 let virt_addr = VirtAddr::new(addr as usize);
@@ -269,7 +269,7 @@ impl Syscall {
                     }
 
                     // 验证addrlen的地址是否合法
-                    if verify_area(virt_addrlen, core::mem::size_of::<u32>()).is_err() {
+                    if verify_area(virt_addrlen, core::mem::size_of::<usize>()).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
@@ -280,12 +280,11 @@ impl Syscall {
                     }
                     return Ok(());
                 };
-                let r = security_check();
-                if let Err(e) = r {
+                if let Err(e) = security_check() {
                     Err(e)
                 } else {
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-                    Self::recvfrom(args[0], buf, flags, addr, addrlen as *mut u32)
+                    Self::recvfrom(args[0], buf, flags, addr, addrlen)
                 }
             }
 

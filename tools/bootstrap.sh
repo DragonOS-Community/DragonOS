@@ -171,6 +171,46 @@ install_osx_pkg()
     exit 1
 }
 
+freebsd()
+{
+    echo "Checking QEMU installation on FreeBSD..."
+    
+    # 检查 QEMU 是否已安装
+    if pkg info -q qemu; then
+        echo "✓ QEMU is already installed."
+        echo "QEMU version: $(qemu-system-x86_64 --version | head -n 1)"
+        return 0
+    else
+        echo "QEMU is not installed. Installing via pkg..."
+        
+        # 更新包数据库
+        if ! sudo pkg update; then
+            echo "✗ Failed to update package database" >&2
+            return 1
+        fi
+        
+        # 安装 QEMU
+        if sudo pkg install -y qemu; then
+            echo "✓ QEMU installed successfully."
+            echo "QEMU version: $(qemu-system-x86_64 --version | head -n 1)"
+            
+            # 可选：将当前用户添加到kvm组以获得更好的性能
+            if pw groupshow kvm >/dev/null 2>&1; then
+                echo "Adding user to kvm group for better performance..."
+                sudo pw usermod $(whoami) -G kvm
+                echo "You may need to logout and login again for group changes to take effect."
+            fi
+            
+            return 0
+        else
+            echo "✗ Failed to install QEMU" >&2
+            return 1
+        fi
+    fi
+}
+
+
+
 ####################################################################################
 # This function takes care of everything associated to rust, and the version manager
 # That controls it, it can install rustup and uninstall multirust as well as making
@@ -257,7 +297,7 @@ rustInstall() {
 		cargo install cargo-binutils
 		cargo install bpf-linker
 		
-		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 以使rust在当前窗口生效！"
+		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 或 . ~/cargo/env 以使rust在当前窗口生效！"
 	fi
 }
 
@@ -265,7 +305,7 @@ install_python_pkg()
 {
 	echo "正在安装python依赖项..."
 	# 安装文档生成工具
-	sh -c "cd ../docs && pip3 install -r requirements.txt"
+	sh -c "cd ../docs && python3 -m pip install -r requirements.txt"
 }
 
 
@@ -338,7 +378,7 @@ rustInstall
 install_python_pkg
 
 # 安装dadk
-cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.4.0 || exit 1
+cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.4.0 || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 

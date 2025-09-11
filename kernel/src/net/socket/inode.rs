@@ -43,7 +43,6 @@ impl<T: Socket + 'static> IndexNode for T {
     }
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
-        log::warn!("wtf logic we need to consider resize of socket? why would trigger it");
         Ok(())
     }
 

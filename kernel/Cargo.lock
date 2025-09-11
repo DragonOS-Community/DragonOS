@@ -665,7 +665,7 @@ dependencies = [
 [[package]]
 name = "inherit-methods-macro"
 version = "0.1.0"
-source = "git+https://github.com/asterinas/inherit-methods-macro?rev=98f7e3e#98f7e3eb9efdac98faf5a7076f154f30894b9b02"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/inherit-methods-macro?rev=98f7e3e#98f7e3eb9efdac98faf5a7076f154f30894b9b02"
 dependencies = [
  "darling 0.13.4",
  "proc-macro2",

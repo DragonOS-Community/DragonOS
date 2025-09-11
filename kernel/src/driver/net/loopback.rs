@@ -139,7 +139,6 @@ impl Loopback {
 /// 为实现获得不可变引用的Interface的内部可变性，故为Driver提供UnsafeCell包裹器
 ///
 /// 参考virtio_net.rs
-#[derive(Debug)]
 struct LoopbackDriverWapper(UnsafeCell<LoopbackDriver>);
 unsafe impl Send for LoopbackDriverWapper {}
 unsafe impl Sync for LoopbackDriverWapper {}
@@ -255,7 +254,6 @@ impl phy::Device for LoopbackDriver {
 /// 封装驱动包裹器和iface，设置接口名称
 #[cast_to([sync] Iface)]
 #[cast_to([sync] Device)]
-#[derive(Debug)]
 pub struct LoopbackInterface {
     driver: LoopbackDriverWapper,
     common: IfaceCommon,
@@ -263,11 +261,18 @@ pub struct LoopbackInterface {
     locked_kobj_state: LockedKObjectState,
 }
 
-#[derive(Debug)]
 pub struct InnerLoopbackInterface {
     netdevice_common: NetDeviceCommonData,
     device_common: DeviceCommonData,
     kobj_common: KObjectCommonData,
+}
+
+impl Debug for LoopbackInterface {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoopbackInterface")
+            .field("common", &self.common)
+            .finish()
+    }
 }
 
 impl LoopbackInterface {

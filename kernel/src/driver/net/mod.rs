@@ -180,9 +180,6 @@ impl fmt::Debug for IfaceCommon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IfaceCommon")
             .field("iface_id", &self.iface_id)
-            .field("sockets", &self.sockets)
-            .field("bounds", &self.bounds)
-            .field("port_manager", &self.port_manager)
             .field("poll_at_ms", &self.poll_at_ms)
             .finish()
     }

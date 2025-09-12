@@ -521,7 +521,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                             .0
                     };
 
-                    // 清空这个页面
+                    // 清空这个页面：注意这里只分配了1页作为page_list元数据页，
+                    // 因此清零长度应固定为一页大小，而非按当前order的块大小。
                     core::ptr::write_bytes(
                         A::phys_2_virt(new_page_list_addr)
                             .expect(
@@ -529,7 +530,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                             )
                             .as_ptr::<u8>(),
                         0,
-                        1 << order,
+                        A::PAGE_SIZE,
                     );
                     assert!(
                         first_page_list_paddr == self.free_area[Self::order2index(order as u8)]

@@ -7,9 +7,12 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
-    ipc::signal_types::{SaHandlerType, SigactionType},
+    ipc::signal_types::{SaHandlerType, SigInfo, SigPending, SigactionType, SignalFlags},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-    process::{ProcessControlBlock, ProcessManager},
+    process::{
+        pid::{Pid, PidType},
+        ProcessControlBlock, ProcessManager,
+    },
 };
 
 use super::signal_types::Sigaction;
@@ -26,6 +29,12 @@ impl Debug for SigHand {
 
 pub struct InnerSigHand {
     pub handlers: Vec<Sigaction>,
+    /// 当前线程所属进程要处理的信号
+    pub shared_pending: SigPending,
+    pub flags: SignalFlags,
+    pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
+    /// 在 sighand 上维护的引用计数（与 Linux 一致的布局位置）
+    pub cnt: i64,
 }
 
 impl SigHand {
@@ -66,12 +75,71 @@ impl SigHand {
         let mut self_guard = self.inner_mut();
         self_guard.handlers = other_guard.handlers.clone();
     }
+
+    // ===== Shared pending helpers =====
+    pub fn shared_pending_signal(&self) -> SigSet {
+        let g = self.inner();
+        g.shared_pending.signal()
+    }
+
+    pub fn shared_pending_flush_by_mask(&self, mask: &SigSet) {
+        let mut g = self.inner_mut();
+        g.shared_pending.flush_by_mask(mask);
+    }
+
+    pub fn shared_pending_queue_has(&self, sig: Signal) -> bool {
+        let g = self.inner();
+        g.shared_pending.queue().find(sig).0.is_some()
+    }
+
+    pub fn shared_pending_dequeue(&self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+        let mut g = self.inner_mut();
+        g.shared_pending.dequeue_signal(sig_mask)
+    }
+
+    // ===== Signal flags helpers =====
+    pub fn flags(&self) -> SignalFlags {
+        self.inner().flags
+    }
+
+    pub fn flags_contains(&self, flag: SignalFlags) -> bool {
+        self.inner().flags.contains(flag)
+    }
+
+    pub fn flags_insert(&self, flag: SignalFlags) {
+        let mut g = self.inner_mut();
+        g.flags.insert(flag);
+    }
+
+    pub fn flags_remove(&self, flag: SignalFlags) {
+        let mut g = self.inner_mut();
+        g.flags.remove(flag);
+    }
+
+    // ===== PIDs helpers =====
+    pub fn pid(&self, ty: PidType) -> Option<Arc<Pid>> {
+        self.inner().pids[ty as usize].clone()
+    }
+
+    pub fn set_pid(&self, ty: PidType, pid: Option<Arc<Pid>>) {
+        let mut g = self.inner_mut();
+        g.pids[ty as usize] = pid;
+    }
+
+    // ===== Refcount helpers =====
+    pub fn load_count(&self) -> i64 {
+        self.inner().cnt
+    }
 }
 
 impl Default for InnerSigHand {
     fn default() -> Self {
         Self {
             handlers: default_sighandlers(),
+            pids: core::array::from_fn(|_| None),
+            shared_pending: SigPending::default(),
+            flags: SignalFlags::empty(),
+            cnt: 0,
         }
     }
 }

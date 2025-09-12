@@ -45,11 +45,11 @@ impl ProcessManager {
 
 impl ProcessControlBlock {
     pub fn task_pgrp(&self) -> Option<Arc<Pid>> {
-        self.sig_struct().pids[PidType::PGID as usize].clone()
+        self.sighand().pid(PidType::PGID)
     }
 
     pub fn task_session(&self) -> Option<Arc<Pid>> {
-        self.sig_struct().pids[PidType::SID as usize].clone()
+        self.sighand().pid(PidType::SID)
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=task_join_group_stop#393

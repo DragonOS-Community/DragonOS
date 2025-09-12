@@ -363,9 +363,8 @@ impl ProcessManager {
         // 需要阻止全局init和容器内init进程创建兄弟进程。
         if clone_flags.contains(CloneFlags::CLONE_PARENT)
             && current_pcb
-                .sig_info_irqsave()
-                .flags
-                .contains(SignalFlags::UNKILLABLE)
+                .sighand()
+                .flags_contains(SignalFlags::UNKILLABLE)
         {
             return Err(SystemError::EINVAL);
         }
@@ -585,7 +584,7 @@ impl ProcessManager {
 
             if pid.is_child_reaper() {
                 pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
-                pcb.sig_info_mut().flags.insert(SignalFlags::UNKILLABLE);
+                pcb.sighand().flags_insert(SignalFlags::UNKILLABLE);
             }
 
             let parent_siginfo = current_pcb.sig_info_irqsave();
@@ -653,7 +652,7 @@ impl ProcessControlBlock {
         if pid_type == PidType::PID {
             self.thread_pid.write().replace(pid);
         } else {
-            self.sig_struct().pids[pid_type as usize] = Some(pid);
+            self.sighand().set_pid(pid_type, Some(pid));
         }
     }
 }

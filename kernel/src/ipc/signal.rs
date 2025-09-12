@@ -7,7 +7,6 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::{SigCode, SigSet, Signal},
     ipc::signal_types::SigactionType,
-    libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
         pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
@@ -15,7 +14,7 @@ use crate::{
     time::Instant,
 };
 
-use super::signal_types::{SigInfo, SigType, SignalStruct, SIG_KERNEL_STOP_MASK};
+use super::signal_types::{SigInfo, SigType, SIG_KERNEL_STOP_MASK};
 
 impl Signal {
     pub fn signal_pending_state(
@@ -134,11 +133,7 @@ impl Signal {
         }
         // debug!("force send={}", force_send);
         let pcb_info = pcb.sig_info_irqsave();
-        let pending = if matches!(pt, PidType::PID) {
-            pcb_info.sig_shared_pending()
-        } else {
-            pcb_info.sig_pending()
-        };
+        let is_shared_target = matches!(pt, PidType::PID);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 如果是kill或者目标pcb是内核线程，则无需获取sigqueue，直接发送信号即可
         if matches!(self, Signal::SIGKILL) || pcb.flags().contains(ProcessFlags::KTHREAD) {
@@ -147,7 +142,10 @@ impl Signal {
             self.complete_signal(pcb.clone(), pt);
         }
         // 如果不是实时信号的话，同一时刻信号队列里只会有一个待处理的信号，如果重复接收就不做处理
-        else if !self.is_rt_signal() && pending.queue().find(*self).0.is_some() {
+        else if !self.is_rt_signal()
+            && ((is_shared_target && pcb.sighand().shared_pending_queue_has(*self))
+                || (!is_shared_target && pcb_info.sig_pending().queue().find(*self).0.is_some()))
+        {
             return Ok(0);
         } else {
             // TODO signalfd_notify 完善 signalfd 机制
@@ -226,8 +224,7 @@ impl Signal {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // TODO: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
         if let Some(target_pcb) = target_pcb {
-            let guard = target_pcb.sig_struct();
-            signal_wake_up(target_pcb.clone(), guard, *self == Signal::SIGKILL);
+            signal_wake_up(target_pcb.clone(), *self == Signal::SIGKILL);
         }
     }
 
@@ -297,16 +294,12 @@ impl Signal {
         let flush: SigSet;
         if !(self.into_sigset() & SIG_KERNEL_STOP_MASK).is_empty() {
             flush = Signal::SIGCONT.into_sigset();
-            pcb.sig_info_mut()
-                .sig_shared_pending_mut()
-                .flush_by_mask(&flush);
+            pcb.sighand().shared_pending_flush_by_mask(&flush);
             // TODO 对每个子线程 flush mask
         } else if *self == Signal::SIGCONT {
             flush = SIG_KERNEL_STOP_MASK;
             assert!(!flush.is_empty());
-            pcb.sig_info_mut()
-                .sig_shared_pending_mut()
-                .flush_by_mask(&flush);
+            pcb.sighand().shared_pending_flush_by_mask(&flush);
             let _r = ProcessManager::wakeup_stop(&pcb);
             // TODO 对每个子线程 flush mask
             // 这里需要补充一段逻辑，详见https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#952
@@ -334,7 +327,7 @@ impl Signal {
 /// - `_guard` 信号结构体锁守卫，来保证信号结构体已上锁
 /// - `fatal` 表明这个信号是不是致命的(会导致进程退出)
 #[inline]
-fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStruct>, fatal: bool) {
+fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
     // debug!("signal_wake_up");
@@ -403,7 +396,7 @@ impl ProcessControlBlock {
 impl ProcessSignalInfo {
     fn do_recalc_sigpending_tsk(&self, pcb: &ProcessControlBlock) -> bool {
         if has_pending_signals(&self.sig_pending().signal(), self.sig_blocked())
-            || has_pending_signals(&self.sig_shared_pending().signal(), self.sig_blocked())
+            || has_pending_signals(&pcb.sighand().shared_pending_signal(), self.sig_blocked())
         {
             pcb.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
             return true;
@@ -486,15 +479,11 @@ fn __set_current_blocked(new_set: &SigSet) {
     if pcb.sig_info_irqsave().sig_blocked().eq(new_set) {
         return;
     }
-    let guard: SpinLockGuard<'_, SignalStruct> = pcb.sig_struct_irqsave();
-
     __set_task_blocked(&pcb, new_set);
-
-    drop(guard);
 }
 
 fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
-    let retarget = pcb.sig_info_irqsave().sig_shared_pending().signal();
+    let retarget = pcb.sighand().shared_pending_signal();
     retarget.intersects(which);
     if retarget.is_empty() {
         return;
@@ -510,15 +499,14 @@ fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
             return;
         }
 
-        let blocked = pcb.sig_info_irqsave().sig_shared_pending().signal();
+        let blocked = pcb.sighand().shared_pending_signal();
         if retarget.difference(blocked).is_empty() {
             return;
         }
 
         retarget.intersects(blocked);
         if !pcb.has_pending_signal() {
-            let guard = pcb.sig_struct_irqsave();
-            signal_wake_up(pcb.clone(), guard, false);
+            signal_wake_up(pcb.clone(), false);
         }
         // 之前的对retarget的判断移动到最前面，因为对于当前线程的线程的处理已经结束，对于后面的线程在一开始判断retarget为空即可结束处理
 

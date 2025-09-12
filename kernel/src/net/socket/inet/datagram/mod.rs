@@ -142,29 +142,6 @@ impl UdpSocket {
         return result;
     }
 
-    pub fn event(&self) -> EPollEventType {
-        // log::info!("UdpSocket::event");
-        let mut event = EPollEventType::empty();
-        match self.inner.read().as_ref().unwrap() {
-            UdpInner::Unbound(_) => {
-                event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
-            }
-            UdpInner::Bound(bound) => {
-                let (can_recv, can_send) =
-                    bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
-
-                if can_recv {
-                    event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
-                }
-
-                if can_send {
-                    event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
-                }
-            }
-        }
-        return event;
-    }
-
     pub fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()
     }

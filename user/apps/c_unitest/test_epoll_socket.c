@@ -97,7 +97,6 @@ void server_process() {
             perror("[Server] epoll_wait failed");
             exit(EXIT_FAILURE);
         }
-        printf("Fuck epoll_wait returned %d\n", nfds);
 
         for (int n = 0; n < nfds; ++n) {
             if (events[n].data.fd == listen_sock) {

@@ -4,13 +4,10 @@ use system_error::SystemError;
 
 use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::socket::common::shutdown::{ShutdownBit, ShutdownTemp};
 use crate::net::socket::common::EPollItems;
-use crate::net::socket::endpoint::Endpoint;
-use crate::net::socket::{Socket, SocketInode, PMSG, PSOL};
+use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSOL};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
-
 use crate::sched::SchedMode;
 use smoltcp;
 
@@ -268,7 +265,7 @@ impl TcpSocket {
 
     #[inline]
     fn incoming(&self) -> bool {
-        EP::from_bits_truncate(self.poll() as u32).contains(EP::EPOLLIN)
+        EP::from_bits_truncate(self.do_poll() as u32).contains(EP::EPOLLIN)
     }
 
     #[inline]

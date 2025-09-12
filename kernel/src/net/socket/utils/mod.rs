@@ -1,9 +1,9 @@
-use crate::net::socket::{
-    self, inet::syscall::create_inet_socket, unix::create_unix_socket, Socket,
-};
 pub(super) mod datagram_common;
 
-use crate::net::socket;
+use crate::net::socket::{
+    self, inet::syscall::create_inet_socket, netlink::create_netlink_socket,
+    unix::create_unix_socket, Socket,
+};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -17,10 +17,20 @@ pub fn create_socket(
     // log::info!("Creating socket: {:?}, {:?}, {:?}", family, socket_type, protocol);
     type AF = socket::AddressFamily;
     let inode = match family {
-        AF::INet => socket::inet::Inet::socket(socket_type, protocol)?,
-        // AF::INet6 => socket::inet::Inet6::socket(socket_type, protocol)?,
-        AF::Unix => socket::unix::Unix::socket(socket_type, protocol)?,
-        AF::Netlink => socket::netlink::Netlink::socket(socket_type, protocol)?,
+        AF::INet => create_inet_socket(
+            smoltcp::wire::IpVersion::Ipv4,
+            socket_type,
+            smoltcp::wire::IpProtocol::from(protocol as u8),
+            is_nonblock,
+        )?,
+        AF::INet6 => create_inet_socket(
+            smoltcp::wire::IpVersion::Ipv6,
+            socket_type,
+            smoltcp::wire::IpProtocol::from(protocol as u8),
+            is_nonblock,
+        )?,
+        AF::Unix => create_unix_socket(socket_type, is_nonblock)?,
+        AF::Netlink => create_netlink_socket(socket_type, protocol, is_nonblock)?,
         _ => {
             log::warn!("unsupport address family");
             return Err(SystemError::EAFNOSUPPORT);

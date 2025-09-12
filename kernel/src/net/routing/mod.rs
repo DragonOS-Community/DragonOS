@@ -230,7 +230,7 @@ pub trait RouterEnableDevice: Iface {
                 // 检查是否是发给自己的包（目标IP是否是自己的IP）
                 if self.is_my_ip(dst_ip.into()) {
                     // todo 按照linux的逻辑，只要包的目标ip在当前网络命名空间里面，就直接进入本地协议栈处理
-                    // todo 但是我们的操作系统中每个接口都是独立的，并没有统一处理和分发（socket），所有这里必须将包放到对应iface的接收队列里面 
+                    // todo 但是我们的操作系统中每个接口都是独立的，并没有统一处理和分发（socket），所有这里必须将包放到对应iface的接收队列里面
                     // 交给本地协议栈处理
                     // log::info!("Packet destined for local interface {}", self.iface_name());
                     return Err(None);
@@ -422,13 +422,13 @@ pub trait RouterEnableDevice: Iface {
 
         let mut snat_guard = tracker.snat.lock();
         if let Some((new_src_ip, new_src_port)) = snat_guard.process_new_connection(tuple) {
-            // log::info!(
-            //     "SNAT: Translating {}:{} -> {}:{}",
-            //     tuple.src_addr,
-            //     tuple.src_port,
-            //     new_src_ip,
-            //     new_src_port
-            // );
+            log::info!(
+                "SNAT: Translating {}:{} -> {}:{}",
+                tuple.src_addr,
+                tuple.src_port,
+                new_src_ip,
+                new_src_port
+            );
 
             //TODO 应该加一个判断snat，可以支持直接改成出口接口的ip
             // // 修改源IP地址

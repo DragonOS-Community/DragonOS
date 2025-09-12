@@ -68,6 +68,10 @@ impl<T: Socket + 'static> IndexNode for T {
             ModeType::from_bits_truncate(0o755),
         ))
     }
+
+    fn as_socket(&self) -> Option<&dyn Socket> {
+        Some(self)
+    }
 }
 
 impl<T: Socket + 'static> PollableInode for T {

@@ -90,6 +90,10 @@ where
             .contains(EPollEventType::EPOLLIN)
     }
 
+    pub fn do_poll(&self) -> usize {
+        self.inner.read().check_io_events().bits() as usize
+    }
+
     pub fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()
     }
@@ -164,8 +168,8 @@ where
         // self.try_recv(buffer, flags)
     }
 
-    fn poll(&self) -> usize {
-        self.inner.read().check_io_events().bits() as usize
+    fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {
+        EPollEventType::from_bits_truncate(self.do_poll() as u32)
     }
 
     fn send_buffer_size(&self) -> usize {
@@ -183,6 +187,51 @@ where
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         let (len, _) = self.recv_from(buffer, flags, None)?;
         Ok(len)
+    }
+
+    fn recv_msg(
+        &self,
+        _msg: &mut crate::net::posix::MsgHdr,
+        _flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        todo!("implement recv_msg for netlink socket");
+    }
+
+    fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
+        self.try_send(buffer, None, flags)
+    }
+
+    fn send_msg(
+        &self,
+        _msg: &crate::net::posix::MsgHdr,
+        _flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        todo!("implement send_msg for netlink socket");
+    }
+
+    fn do_close(&self) -> Result<(), SystemError> {
+        //TODO close the socket properly
+        Ok(())
+    }
+
+    fn epoll_items(&self) -> &crate::net::socket::common::EPollItems {
+        todo!("implement epoll_items for netlink socket");
+    }
+
+    fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
+        if let Some(addr) = self.inner.read().addr() {
+            Ok(addr.into())
+        } else {
+            Err(SystemError::ENOTCONN)
+        }
+    }
+
+    fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
+        if let Some(addr) = self.inner.read().peer_addr() {
+            Ok(addr.into())
+        } else {
+            Err(SystemError::ENOTCONN)
+        }
     }
 }
 

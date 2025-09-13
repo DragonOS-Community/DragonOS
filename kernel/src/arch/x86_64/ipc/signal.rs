@@ -199,19 +199,12 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
     drop(siginfo_read_guard);
 
-    let sig_guard = pcb.try_sig_struct_irqsave(5);
-    if unlikely(sig_guard.is_none()) {
-        return;
-    }
+    // x86_64 上不再需要 sig_struct 自旋锁
     let siginfo_mut = pcb.try_siginfo_mut(5);
     if unlikely(siginfo_mut.is_none()) {
         return;
     }
 
-    let sig_guard: crate::libs::spinlock::SpinLockGuard<
-        '_,
-        crate::ipc::signal_types::SignalStruct,
-    > = sig_guard.unwrap();
     let mut siginfo_mut_guard = siginfo_mut.unwrap();
     loop {
         (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
@@ -220,7 +213,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         if sig_number == Signal::INVALID {
             return;
         }
-        let sa = sig_guard.handlers[sig_number as usize - 1];
+        let sa = pcb.sighand().handler(sig_number).unwrap();
 
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
@@ -250,7 +243,10 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
          * case, the signal cannot be dropped.
          */
         // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/signal.h?fi=sig_kernel_only#444
-        if siginfo_mut_guard.flags().contains(SignalFlags::UNKILLABLE) && !sig_number.kernel_only()
+        if ProcessManager::current_pcb()
+            .sighand()
+            .flags_contains(SignalFlags::UNKILLABLE)
+            && !sig_number.kernel_only()
         {
             continue;
         }
@@ -263,7 +259,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let oldset = *siginfo_mut_guard.sig_blocked();
     //避免死锁
     drop(siginfo_mut_guard);
-    drop(sig_guard);
+    // no sig_struct guard to drop
     drop(pcb);
     // 做完上面的检查后，开中断
     CurrentIrqArch::interrupt_enable();

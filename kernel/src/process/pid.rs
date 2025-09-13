@@ -377,7 +377,7 @@ impl ProcessControlBlock {
             return self.thread_pid.read().clone();
         }
 
-        self.sig_struct().pids[pid_type as usize].clone()
+        self.sighand().pid(pid_type)
     }
 
     pub fn task_pid_vnr(&self) -> RawPid {

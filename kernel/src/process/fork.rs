@@ -8,7 +8,7 @@ use system_error::SystemError;
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
     filesystem::procfs::procfs_register_pid,
-    ipc::{signal::flush_signal_handlers, signal_types::SignalFlags},
+    ipc::signal_types::SignalFlags,
     libs::rwlock::RwLock,
     mm::VirtAddr,
     process::ProcessFlags,
@@ -297,23 +297,16 @@ impl ProcessManager {
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // todo SignalStruct结构需要更改，属于线程组逻辑
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
-            // log::debug!("copy_sighand: CLONE_SIGHAND");
-            current_pcb
-                .sig_struct_irqsave()
-                .cnt
-                .fetch_add(1, Ordering::SeqCst);
-
-            // todo: sighand结构体应该是个arc，这里要做arc赋值。下面要做创建新的arc。（现在的实现有问题）
+            new_pcb.replace_sighand(current_pcb.sighand());
             return Ok(());
         }
 
         // log::debug!("Just copy sighand");
-        new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers.clone();
+        new_pcb.sighand().copy_handlers_from(&current_pcb.sighand());
 
         if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
-            flush_signal_handlers(new_pcb.clone(), false);
+            new_pcb.flush_signal_handlers(false);
         }
         return Ok(());
     }
@@ -370,9 +363,8 @@ impl ProcessManager {
         // 需要阻止全局init和容器内init进程创建兄弟进程。
         if clone_flags.contains(CloneFlags::CLONE_PARENT)
             && current_pcb
-                .sig_info_irqsave()
-                .flags
-                .contains(SignalFlags::UNKILLABLE)
+                .sighand()
+                .flags_contains(SignalFlags::UNKILLABLE)
         {
             return Err(SystemError::EINVAL);
         }
@@ -592,7 +584,7 @@ impl ProcessManager {
 
             if pid.is_child_reaper() {
                 pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
-                pcb.sig_info_mut().flags.insert(SignalFlags::UNKILLABLE);
+                pcb.sighand().flags_insert(SignalFlags::UNKILLABLE);
             }
 
             let parent_siginfo = current_pcb.sig_info_irqsave();
@@ -660,7 +652,7 @@ impl ProcessControlBlock {
         if pid_type == PidType::PID {
             self.thread_pid.write().replace(pid);
         } else {
-            self.sig_struct().pids[pid_type as usize] = Some(pid);
+            self.sighand().set_pid(pid_type, Some(pid));
         }
     }
 }

@@ -194,9 +194,7 @@ impl ExecParam {
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
 fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-    ProcessManager::current_pcb()
-        .sig_struct_irqsave()
-        .reset_sighandlers();
+    ProcessManager::current_pcb().sighand().reset_handlers();
     // todo: 该函数未正确实现
     let tg_empty = pcb.threads_read_irqsave().thread_group_empty();
     if tg_empty {

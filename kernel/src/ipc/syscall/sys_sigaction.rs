@@ -97,7 +97,7 @@ pub(super) fn do_kernel_sigaction(
         return Err(SystemError::EINVAL);
     }
 
-    let retval = super::super::signal::do_sigaction(
+    let retval = super::super::sighand::do_sigaction(
         sig,
         if act.is_null() {
             None

@@ -193,6 +193,8 @@ impl DevFS {
                 } else if name.starts_with("nvme") {
                     // NVMe设备挂载在 /dev 下
                     dev_root_inode.add_dev(name, device.clone())?;
+                } else if name.starts_with("loop"){
+                    dev_root_inode.add_dev(name, device.clone())?;
                 } else {
                     dev_block_inode.add_dev(name, device.clone())?;
                     device.set_parent(Arc::downgrade(&dev_block_inode));

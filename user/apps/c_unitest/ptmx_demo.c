@@ -83,7 +83,9 @@ int main() {
 
     // 关闭不再需要的文件描述符
     close(master_fd); // 子进程不需要主设备
-    close(slave_fd);  // 因为已经 dup2 了，这个原始的也可以关了
+    // printf("close slave_fd in child\n");
+    close(slave_fd); // 因为已经 dup2 了，这个原始的也可以关了
+    // printf("closed master_fd and slave_fd in child over\n");
 
     // 执行一个新的 bash shell
     printf("--- Starting Bash Shell in Slave PTY ---\n\n");
@@ -113,7 +115,7 @@ int main() {
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(STDIN_FILENO, &read_fds); // 监听当前终端的输入
-    FD_SET(master_fd, &read_fds);    // 监听主设备的输出 (来自子进程shell)
+    FD_SET(master_fd, &read_fds); // 监听主设备的输出 (来自子进程shell)
 
     // 使用 select 阻塞，直到有数据可读
     if (select(master_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
@@ -123,8 +125,10 @@ int main() {
 
     // 检查是否是当前终端有输入
     if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+      // printf("stdin is ready to read\n");
       nread = read(STDIN_FILENO, buffer, sizeof(buffer));
       if (nread > 0) {
+        // printf("read %ld bytes from stdin\n", nread);
         // 将用户的输入写入主设备，数据会流向子进程的shell
         write(master_fd, buffer, nread);
       } else {

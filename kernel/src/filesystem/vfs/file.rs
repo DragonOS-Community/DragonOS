@@ -411,6 +411,7 @@ impl File {
             cred: self.cred.clone(),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
+        // TODO: reopen is not a good idea for some inodes, need a better design
         if self
             .inode
             .open(res.private_data.lock(), &res.mode())

@@ -75,8 +75,7 @@ impl<'a> PollAdapter<'a> {
             len,
             remain_timeout,
         )?;
-
-        for event in epoll_events.iter() {
+        for event in epoll_events.iter().take(events) {
             let index = event.data() as usize;
             if index >= self.poll_fds.len() {
                 log::warn!("poll_all_fds: Invalid index in epoll event: {}", index);
@@ -84,7 +83,6 @@ impl<'a> PollAdapter<'a> {
             }
             self.poll_fds[index].revents = (event.events() & 0xffff) as u16;
         }
-
         Ok(events)
     }
 }

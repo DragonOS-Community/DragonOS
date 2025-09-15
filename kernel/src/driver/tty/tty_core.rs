@@ -649,15 +649,23 @@ impl TtyOperation for TtyCore {
     }
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        let r = self.core().tty_driver.driver_funcs().close(tty.clone());
         self.core().dec_count();
-        // let cnt = self.core().count();
-        // log::debug!("TtyCore close: count: {cnt}, tty: {:?}", tty.core().name());
-        if !self.core().count_valid() {
+        let cnt = self.core().count();
+        // TODO: fix pty slave close issue
+        let is_pty_slave_last =
+            cnt == 1 && tty.core().driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave;
+        if !self.core().count_valid() || is_pty_slave_last {
+            // log::debug!(
+            //     "TtyCore close: ref count: {}, tty: {}",
+            //     cnt,
+            //     tty.core().name()
+            // );
+            let r = self.core().tty_driver.driver_funcs().close(tty.clone());
             // 如果计数为0或者无效，表示tty已经关闭
             TtyJobCtrlManager::remove_session_tty(&tty);
+            return r;
         }
-        r
+        Ok(())
     }
 
     fn resize(&self, tty: Arc<TtyCore>, winsize: WindowSize) -> Result<(), SystemError> {

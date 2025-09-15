@@ -505,7 +505,14 @@ impl Syscall {
                 log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
                 Ok(0)
             }
-            _ => panic!("Unsupported syscall ID: {}", syscall_num),
+            _ => {
+                panic!(
+                    "Unsupported syscall ID: {} -> {}, args: {:?}",
+                    syscall_num,
+                    syscall_number_to_str(syscall_num),
+                    args
+                );
+            }
         };
 
         return r;

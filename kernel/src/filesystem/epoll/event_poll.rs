@@ -456,17 +456,17 @@ impl EventPoll {
                 push_back.push(epitem);
                 break;
             }
-            let ep_events = EPollEventType::from_bits_truncate(epitem.event.read().events);
-
+            let mut ep_events = EPollEventType::from_bits_truncate(epitem.event.read().events);
             // 再次poll获取事件(为了防止水平触发一直加入队列)
             let revents = epitem.ep_item_poll();
             if revents.is_empty() {
-                continue;
+                // TODO: one-shot event will be lost here
+                // continue;
             }
-
+            ep_events |= revents;
             // 构建触发事件结构体
             let event = EPollEvent {
-                events: revents.bits,
+                events: ep_events.bits,
                 data: epitem.event.read().data,
             };
 

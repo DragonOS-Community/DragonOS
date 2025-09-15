@@ -251,6 +251,12 @@ pub fn ptmx_open(
     mut data: SpinLockGuard<FilePrivateData>,
     mode: &FileMode,
 ) -> Result<(), SystemError> {
+    if let FilePrivateData::Tty(data) = &*data {
+        let tty = data.tty();
+        // log::debug!("ptmx_open: already opened :{:p}, tty core: {:?}", tty, tty.core().name());
+        tty.core().add_count();
+        return Ok(());
+    }
     let root_inode = ProcessManager::current_mntns().root_inode();
     let pts_root_inode =
         root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;

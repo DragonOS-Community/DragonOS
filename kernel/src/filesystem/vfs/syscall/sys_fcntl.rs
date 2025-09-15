@@ -155,9 +155,8 @@ impl SysFcntlHandle {
             _ => {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。
-
                 warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
-                return Err(SystemError::ENOSYS);
+                return Ok(0);
             }
         }
     }

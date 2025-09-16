@@ -25,6 +25,7 @@ const INIT_PROC_TRYLIST: [(&str, Option<&str>); 4] = [
     ("/bin/busybox", Some("init")),
     ("/bin/init", None),
     ("/bin/sh", None),
+    ("/bin/riscv_rust_init", None),// 对vf2, 目前没做cmdline的适配, 加个默认寻找
 ];
 
 pub fn initial_kernel_thread() -> i32 {

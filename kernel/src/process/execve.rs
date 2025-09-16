@@ -1,24 +1,24 @@
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
-use crate::ipc::signal_types::SignalStruct;
+use crate::filesystem::vfs::IndexNode;
 use crate::process::exec::{load_binary_file, ExecParam, ExecParamFlags};
 use crate::process::ProcessManager;
 use crate::syscall::Syscall;
 use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
 
 use crate::arch::interrupt::TrapFrame;
-use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
+use alloc::{ffi::CString, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 pub fn do_execve(
-    path: String,
+    file_inode: Arc<dyn IndexNode>,
     argv: Vec<CString>,
     envp: Vec<CString>,
     regs: &mut TrapFrame,
 ) -> Result<(), SystemError> {
     let address_space = AddressSpace::new(true).expect("Failed to create new address space");
     // debug!("to load binary file");
-    let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC)?;
+    let mut param = ExecParam::new(file_inode, address_space.clone(), ExecParamFlags::EXEC)?;
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
     // 加载可执行文件
@@ -112,20 +112,4 @@ fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpac
     drop(irq_guard);
 
     old_address_space
-}
-
-/// todo: 该函数未正确实现
-/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/exec.c?fi=begin_new_exec#1244
-pub fn begin_new_exec(_param: &mut ExecParam) -> Result<(), SystemError> {
-    de_thread()?;
-
-    Ok(())
-}
-
-/// todo: 该函数未正确实现
-/// https://code.dragonos.org.cn/xref/linux-6.1.9/fs/exec.c?fi=begin_new_exec#1042
-fn de_thread() -> Result<(), SystemError> {
-    *ProcessManager::current_pcb().sig_struct_irqsave() = SignalStruct::default();
-
-    Ok(())
 }

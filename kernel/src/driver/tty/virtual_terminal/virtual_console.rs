@@ -4,7 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 use log::warn;
 
 use crate::{
@@ -13,7 +13,7 @@ use crate::{
         tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
     },
     libs::{font::FontDesc, rwlock::RwLock},
-    process::Pid,
+    process::RawPid,
 };
 
 use super::{
@@ -91,7 +91,7 @@ pub struct VirtualConsoleData {
 
     pub cursor_blink_ms: u16,
 
-    pub pid: Option<Pid>,
+    pub pid: Option<RawPid>,
     pub index: usize,
 
     pub vc_state: VirtualConsoleState,
@@ -132,7 +132,7 @@ pub struct VirtualConsoleData {
     /// 字符转换表 用于将输入字符映射到特定的字符
     pub translate: TranslationMap,
 
-    pub tab_stop: StaticBitmap<256>,
+    pub tab_stop: static_bitmap!(256),
 
     pub attr: u8,
 

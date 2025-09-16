@@ -63,7 +63,7 @@ impl InnerPageCache {
     }
 
     fn create_pages(&mut self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
-        assert!(buf.len() % MMArch::PAGE_SIZE == 0);
+        assert!(buf.len().is_multiple_of(MMArch::PAGE_SIZE));
 
         let page_num = buf.len() / MMArch::PAGE_SIZE;
 
@@ -194,11 +194,7 @@ impl InnerPageCache {
             let copy_len = core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
                 - copy_offset;
 
-            let page_buf_offset = if page_index * MMArch::PAGE_SIZE < copy_offset {
-                copy_offset - page_index * MMArch::PAGE_SIZE
-            } else {
-                0
-            };
+            let page_buf_offset = copy_offset.saturating_sub(page_index * MMArch::PAGE_SIZE);
 
             let buf_offset = copy_offset.saturating_sub(offset);
 
@@ -316,6 +312,17 @@ impl InnerPageCache {
     pub fn pages_count(&self) -> usize {
         return self.pages.len();
     }
+
+    /// Synchronize the page cache with the storage device.
+    pub fn sync(&mut self) -> Result<(), SystemError> {
+        for page in self.pages.values() {
+            let mut guard = page.write_irqsave();
+            if guard.flags().contains(PageFlags::PG_DIRTY) {
+                crate::mm::page::PageReclaimer::page_writeback(&mut guard, false);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for InnerPageCache {
@@ -363,7 +370,7 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn lock_irqsave(&self) -> SpinLockGuard<InnerPageCache> {
+    pub fn lock_irqsave(&self) -> SpinLockGuard<'_, InnerPageCache> {
         if self.inner.is_locked() {
             log::error!("page cache already locked");
         }

@@ -53,7 +53,7 @@ pub struct LockedAhciDisk {
 }
 
 impl LockedAhciDisk {
-    pub fn inner(&self) -> SpinLockGuard<AhciDisk> {
+    pub fn inner(&self) -> SpinLockGuard<'_, AhciDisk> {
         self.inner.lock()
     }
 }
@@ -122,8 +122,8 @@ impl AhciDisk {
             None
         };
 
-        if kbuf.is_some() {
-            buf_ptr = kbuf.as_mut().unwrap().as_mut_ptr() as usize;
+        if let Some(buf) = &mut kbuf {
+            buf_ptr = buf.as_mut_ptr() as usize;
         }
 
         #[allow(unused_unsafe)]
@@ -286,8 +286,8 @@ impl AhciDisk {
             None
         };
 
-        if kbuf.is_some() {
-            buf_ptr = kbuf.as_mut().unwrap().as_mut_ptr() as usize;
+        if let Some(buf) = &mut kbuf {
+            buf_ptr = buf.as_mut_ptr() as usize;
         }
 
         #[allow(unused_unsafe)]
@@ -431,11 +431,11 @@ impl KObject for LockedAhciDisk {
         todo!()
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         todo!()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         todo!()
     }
 

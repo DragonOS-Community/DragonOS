@@ -20,7 +20,7 @@ use crate::{
     exception::InterruptArch,
     ipc::{
         signal::{restore_saved_sigmask, set_current_blocked},
-        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch},
+        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags},
     },
     mm::MemoryManagementArch,
     process::ProcessManager,
@@ -199,16 +199,12 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
     drop(siginfo_read_guard);
 
-    let sig_guard = pcb.try_sig_struct_irqsave(5);
-    if unlikely(sig_guard.is_none()) {
-        return;
-    }
+    // x86_64 上不再需要 sig_struct 自旋锁
     let siginfo_mut = pcb.try_siginfo_mut(5);
     if unlikely(siginfo_mut.is_none()) {
         return;
     }
 
-    let sig_guard = sig_guard.unwrap();
     let mut siginfo_mut_guard = siginfo_mut.unwrap();
     loop {
         (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
@@ -217,12 +213,12 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         if sig_number == Signal::INVALID {
             return;
         }
-        let sa = sig_guard.handlers[sig_number as usize - 1];
+        let sa = pcb.sighand().handler(sig_number).unwrap();
 
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
                 SaHandlerType::Error => {
-                    error!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
+                    error!("Trying to handle a Sigerror on Process:{:?}", pcb.raw_pid());
                     return;
                 }
                 SaHandlerType::Default => {
@@ -236,6 +232,25 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             SigactionType::SaSigaction(_) => todo!(),
         }
 
+        /*
+         * Global init gets no signals it doesn't want.
+         * Container-init gets no signals it doesn't want from same
+         * container.
+         *
+         * Note that if global/container-init sees a sig_kernel_only()
+         * signal here, the signal must have been generated internally
+         * or must have come from an ancestor namespace. In either
+         * case, the signal cannot be dropped.
+         */
+        // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/signal.h?fi=sig_kernel_only#444
+        if ProcessManager::current_pcb()
+            .sighand()
+            .flags_contains(SignalFlags::UNKILLABLE)
+            && !sig_number.kernel_only()
+        {
+            continue;
+        }
+
         if sigaction.is_some() {
             break;
         }
@@ -244,7 +259,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let oldset = *siginfo_mut_guard.sig_blocked();
     //避免死锁
     drop(siginfo_mut_guard);
-    drop(sig_guard);
+    // no sig_struct guard to drop
     drop(pcb);
     // 做完上面的检查后，开中断
     CurrentIrqArch::interrupt_enable();
@@ -264,7 +279,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         error!(
             "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
             sig_number as i32,
-            ProcessManager::current_pcb().pid(),
+            ProcessManager::current_pcb().raw_pid(),
             res.as_ref().unwrap_err()
         );
     }
@@ -326,7 +341,7 @@ impl SignalArch for X86_64SignalArch {
         if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
             error!("rsp doesn't from user level");
             let _r = crate::ipc::kill::kill_process(
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             )
             .map_err(|e| e.to_posix_errno());
@@ -338,7 +353,7 @@ impl SignalArch for X86_64SignalArch {
         if !unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) {
             error!("unable to restore sigcontext");
             let _r = crate::ipc::kill::kill_process(
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             )
             .map_err(|e| e.to_posix_errno());
@@ -430,11 +445,11 @@ fn setup_frame(
                     } else {
                         error!(
                             "pid-{:?} forgot to set SA_FLAG_RESTORER for signal {:?}",
-                            ProcessManager::current_pcb().pid(),
+                            ProcessManager::current_pcb().raw_pid(),
                             sig as i32
                         );
                         let r = crate::ipc::kill::kill_process(
-                            ProcessManager::current_pcb().pid(),
+                            ProcessManager::current_pcb().raw_pid(),
                             Signal::SIGSEGV,
                         );
                         if r.is_err() {
@@ -445,7 +460,7 @@ fn setup_frame(
                     if sigaction.restorer().is_none() {
                         error!(
                             "restorer in process:{:?} is not defined",
-                            ProcessManager::current_pcb().pid()
+                            ProcessManager::current_pcb().raw_pid()
                         );
                         return Err(SystemError::EINVAL);
                     }
@@ -473,8 +488,10 @@ fn setup_frame(
     if r.is_err() {
         // 如果地址区域位于内核空间，则直接报错
         // todo: 生成一个sigsegv
-        let r =
-            crate::ipc::kill::kill_process(ProcessManager::current_pcb().pid(), Signal::SIGSEGV);
+        let r = crate::ipc::kill::kill_process(
+            ProcessManager::current_pcb().raw_pid(),
+            Signal::SIGSEGV,
+        );
         if r.is_err() {
             error!("In setup frame: generate SIGSEGV signal failed");
         }
@@ -486,7 +503,7 @@ fn setup_frame(
     info.copy_siginfo_to_user(unsafe { &mut ((*frame).info) as *mut SigInfo })
         .map_err(|e| -> SystemError {
             let r = crate::ipc::kill::kill_process(
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             );
             if r.is_err() {
@@ -503,7 +520,7 @@ fn setup_frame(
             .setup_sigcontext(oldset, trap_frame)
             .map_err(|e: SystemError| -> SystemError {
                 let r = crate::ipc::kill::kill_process(
-                    ProcessManager::current_pcb().pid(),
+                    ProcessManager::current_pcb().raw_pid(),
                     Signal::SIGSEGV,
                 );
                 if r.is_err() {

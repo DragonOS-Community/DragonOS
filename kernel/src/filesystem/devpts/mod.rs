@@ -1,16 +1,5 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-    vec::Vec,
-};
-use ida::IdAllocator;
-use log::info;
-use system_error::SystemError;
-use unified_init::macros::unified_init;
-
 use crate::{
     driver::{
         base::device::{
@@ -22,14 +11,27 @@ use crate::{
             tty_device::{PtyType, TtyDevice, TtyType},
         },
     },
-    filesystem::vfs::{mount::do_mount_mkdir, syscall::ModeType, FileType},
-    init::initcall::INITCALL_FS,
+    filesystem::vfs::{
+        mount::{do_mount_mkdir, MountFlags},
+        syscall::ModeType,
+        FileType,
+    },
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
 };
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use ida::IdAllocator;
+use log::info;
+use system_error::SystemError;
 
-use super::vfs::{
-    vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata,
+use super::{
+    devfs::DeviceINode,
+    vfs::{vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata},
 };
 
 const DEV_PTYFS_MAX_NAMELEN: usize = 16;
@@ -48,6 +50,8 @@ pub struct DevPtsFs {
 impl DevPtsFs {
     pub fn new() -> Arc<Self> {
         let root_inode = Arc::new(LockedDevPtsFSInode::new());
+        root_inode.inner.lock().parent = Arc::downgrade(&root_inode);
+        root_inode.inner.lock().self_ref = Arc::downgrade(&root_inode);
         let ret = Arc::new(Self {
             root_inode,
             pts_ida: SpinLock::new(IdAllocator::new(0, NR_UNIX98_PTY_MAX as usize).unwrap()),
@@ -100,6 +104,8 @@ impl LockedDevPtsFSInode {
             inner: SpinLock::new(PtsDevInode {
                 fs: Weak::new(),
                 children: Some(BTreeMap::new()),
+                parent: Weak::new(),
+                self_ref: Weak::new(),
                 metadata: Metadata {
                     dev_id: 0,
                     inode_id: generate_inode_id(),
@@ -131,6 +137,8 @@ pub struct PtsDevInode {
     fs: Weak<DevPtsFs>,
     children: Option<BTreeMap<String, Arc<TtyDevice>>>,
     metadata: Metadata,
+    parent: Weak<LockedDevPtsFSInode>,
+    self_ref: Weak<LockedDevPtsFSInode>,
 }
 
 impl PtsDevInode {
@@ -189,7 +197,7 @@ impl IndexNode for LockedDevPtsFSInode {
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
-        todo!()
+        self
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
@@ -247,6 +255,9 @@ impl IndexNode for LockedDevPtsFSInode {
 
         result.set_metadata(&metadata)?;
 
+        result.set_devpts_fs(Arc::downgrade(&fs));
+        result.set_devpts_parent(guard.self_ref.clone());
+
         guard
             .children_unchecked_mut()
             .insert(name.to_string(), result.clone());
@@ -273,13 +284,11 @@ impl IndexNode for LockedDevPtsFSInode {
     }
 }
 
-#[unified_init(INITCALL_FS)]
-#[inline(never)]
 pub fn devpts_init() -> Result<(), SystemError> {
     // 创建 devptsfs 实例
     let ptsfs: Arc<DevPtsFs> = DevPtsFs::new();
 
-    do_mount_mkdir(ptsfs, "/dev/pts").expect("Failed to mount DevPtsFS");
+    do_mount_mkdir(ptsfs, "/dev/pts", MountFlags::empty()).expect("Failed to mount DevPtsFS");
     info!("DevPtsFs mounted.");
 
     Ok(())

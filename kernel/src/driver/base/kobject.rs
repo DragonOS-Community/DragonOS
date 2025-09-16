@@ -51,9 +51,9 @@ pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
 
     fn set_name(&self, name: String);
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState>;
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState>;
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState>;
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState>;
 
     fn set_kobj_state(&self, state: KObjectState);
 }
@@ -103,10 +103,9 @@ bitflags! {
         const ADD_UEVENT_SENT = 1 << 1;
         const REMOVE_UEVENT_SENT = 1 << 2;
         const INITIALIZED = 1 << 3;
+        const UEVENT_SUPPRESS = 1 << 4;
     }
-
 }
-
 #[derive(Debug)]
 pub struct LockedKObjectState(RwLock<KObjectState>);
 
@@ -251,7 +250,7 @@ impl KObjectManager {
         }
 
         // todo: 发送uevent: KOBJ_REMOVE
-
+        // kobject_uevent();
         sysfs_instance().remove_dir(&kobj);
         kobj.update_kobj_state(None, Some(KObjectState::IN_SYSFS));
         let kset = kobj.kset();

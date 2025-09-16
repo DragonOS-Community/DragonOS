@@ -128,7 +128,7 @@ pub struct File {
     readdir_subdirs_name: SpinLock<Vec<String>>,
     pub private_data: SpinLock<FilePrivateData>,
     /// 文件的凭证
-    cred: Cred,
+    cred: Arc<Cred>,
 }
 
 impl File {
@@ -145,16 +145,18 @@ impl File {
             }
         }
 
+        let private_data = SpinLock::new(FilePrivateData::default());
+        inode.open(private_data.lock(), &mode)?;
+
         let f = File {
             inode,
             offset: AtomicUsize::new(0),
             mode: RwLock::new(mode),
             file_type,
             readdir_subdirs_name: SpinLock::new(Vec::default()),
-            private_data: SpinLock::new(FilePrivateData::default()),
+            private_data,
             cred: ProcessManager::current_pcb().cred(),
         };
-        f.inode.open(f.private_data.lock(), &mode)?;
 
         return Ok(f);
     }
@@ -409,6 +411,7 @@ impl File {
             cred: self.cred.clone(),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
+        // TODO: reopen is not a good idea for some inodes, need a better design
         if self
             .inode
             .open(res.private_data.lock(), &res.mode())
@@ -505,7 +508,7 @@ impl Drop for File {
         if r.is_err() {
             error!(
                 "pid: {:?} failed to close file: {:?}, errno={:?}",
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 self,
                 r.as_ref().unwrap_err()
             );
@@ -630,7 +633,7 @@ impl FileDescriptorVec {
     }
 
     #[allow(dead_code)]
-    pub fn iter(&self) -> FileDescriptorIterator {
+    pub fn iter(&self) -> FileDescriptorIterator<'_> {
         return FileDescriptorIterator::new(self);
     }
 
@@ -642,7 +645,7 @@ impl FileDescriptorVec {
                     if let Err(r) = self.drop_fd(i as i32) {
                         error!(
                             "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
-                            ProcessManager::current_pcb().pid(),
+                            ProcessManager::current_pcb().raw_pid(),
                             i,
                             r
                         );

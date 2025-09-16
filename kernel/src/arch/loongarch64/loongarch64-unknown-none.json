@@ -3,7 +3,7 @@
     "code-model": "medium",
     "crt-objects-fallback": "false",
     "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
-    "features": "+f,+d",
+    "features": "-lsx",
     "linker": "rust-lld",
     "linker-flavor": "gnu-lld",
     "llvm-abiname": "lp64d",

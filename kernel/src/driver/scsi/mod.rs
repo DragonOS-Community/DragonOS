@@ -1,4 +1,4 @@
-use bitmap::traits::BitMapOps;
+use bitmap::{static_bitmap, traits::BitMapOps};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -29,7 +29,7 @@ pub struct ScsiManager {
 }
 
 struct InnerScsiManager {
-    id_bmp: bitmap::StaticBitmap<{ ScsiManager::MAX_DEVICES }>,
+    id_bmp: static_bitmap!(ScsiManager::MAX_DEVICES),
     devname: [Option<DevName>; ScsiManager::MAX_DEVICES],
 }
 
@@ -45,7 +45,7 @@ impl ScsiManager {
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerScsiManager> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerScsiManager> {
         self.inner.lock()
     }
 

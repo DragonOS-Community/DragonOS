@@ -1,17 +1,19 @@
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::intrinsics::likely;
 use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigChildCode, Signal},
+    driver::tty::tty_core::TtyCore,
     ipc::syscall::sys_kill::PidConverter,
+    process::pid::PidType,
     sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
     time::{sleep::nanosleep, Duration},
 };
 
 use super::{
-    abi::WaitOption, resource::RUsage, Pid, ProcessControlBlock, ProcessManager, ProcessState,
+    abi::WaitOption, resource::RUsage, ProcessControlBlock, ProcessManager, ProcessState, RawPid,
 };
 
 /// 内核wait4时的参数
@@ -28,7 +30,7 @@ pub struct KernelWaitOption<'a> {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct WaitIdInfo {
-    pub pid: Pid,
+    pub pid: RawPid,
     pub status: i32,
     pub cause: i32,
 }
@@ -52,7 +54,7 @@ pub fn kernel_wait4(
     options: WaitOption,
     rusage_buf: Option<&mut RUsage>,
 ) -> Result<usize, SystemError> {
-    let converter = PidConverter::from_id(pid);
+    let converter = PidConverter::from_id(pid).ok_or(SystemError::ESRCH)?;
 
     // 构造参数
     let mut kwo = KernelWaitOption::new(converter, options);
@@ -106,9 +108,10 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
     'outer: loop {
         kwo.no_task_error = Some(SystemError::ECHILD);
-        match kwo.pid_converter {
+        match &kwo.pid_converter {
             PidConverter::Pid(pid) => {
-                let child_pcb = ProcessManager::find(pid)
+                let child_pcb = pid
+                    .pid_task(PidType::PID)
                     .ok_or(SystemError::ECHILD)
                     .unwrap();
                 // 获取weak引用，以便于在do_waitpid中能正常drop pcb
@@ -134,7 +137,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         break;
                     }
                     for pid in rd_childen.iter() {
-                        let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
+                        let pcb =
+                            ProcessManager::find_task_by_vpid(*pid).ok_or(SystemError::ECHILD)?;
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
                         if state.is_exited() {
@@ -144,7 +148,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             // 而是要先break到外层循环，以便释放父进程的children字段的锁,才能drop pcb。
                             // 否则会死锁。
                             tmp_child_pcb = Some(pcb.clone());
-                            unsafe { ProcessManager::release(*pid) };
+                            unsafe { ProcessManager::release(pcb.raw_pid()) };
                             retval = Ok((*pid).into());
                             break 'outer;
                         }
@@ -153,11 +157,9 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     nanosleep(Duration::from_millis(100).into())?;
                 }
             }
-            PidConverter::Pgid(pgid) => {
-                let pg = ProcessManager::find_process_group(pgid).ok_or(SystemError::ESRCH)?;
+            PidConverter::Pgid(Some(pgid)) => {
                 loop {
-                    let inner = pg.process_group_inner.lock();
-                    for (_, pcb) in inner.processes.iter() {
+                    for pcb in pgid.tasks_iter(PidType::PGID) {
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
                         if state.is_exited() {
@@ -167,16 +169,16 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             // 而是要先break到外层循环，以便释放父进程的children字段的锁,才能drop pcb。
                             // 否则会死锁。
                             tmp_child_pcb = Some(pcb.clone());
-                            let pid = pcb.pid();
-                            unsafe { ProcessManager::release(pid) };
-                            retval = Ok((pid).into());
+                            unsafe { ProcessManager::release(pcb.raw_pid()) };
+                            retval = Ok(pcb.task_pid_vnr().into());
                             break 'outer;
                         }
                     }
-                    drop(inner);
                     nanosleep(Duration::from_millis(100).into())?;
                 }
             }
+
+            _ => {}
         }
         notask!('outer);
     }
@@ -210,7 +212,7 @@ fn do_waitpid(
             {
                 if let Some(info) = &mut kwo.ret_info {
                     *info = WaitIdInfo {
-                        pid: child_pcb.pid(),
+                        pid: child_pcb.raw_pid(),
                         status: Signal::SIGCONT as i32,
                         cause: SigChildCode::Continued.into(),
                     };
@@ -242,17 +244,22 @@ fn do_waitpid(
             }
             if let Some(infop) = &mut kwo.ret_info {
                 *infop = WaitIdInfo {
-                    pid: child_pcb.pid(),
+                    pid: child_pcb.raw_pid(),
                     status: exitcode,
                     cause: SigChildCode::Stopped.into(),
                 };
             }
 
-            return Some(Ok(child_pcb.pid().data()));
+            return Some(Ok(child_pcb.raw_pid().data()));
         }
         ProcessState::Exited(status) => {
-            let pid = child_pcb.pid();
-            // debug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
+            let pid = child_pcb.task_pid_vnr();
+            // log::debug!(
+            //     "wait4: current: {}, child exited, pid: {:?}, status: {status}, \n kwo.opt: {:?}",
+            //     ProcessManager::current_pid().data(),
+            //     child_pcb.raw_pid(),
+            //     kwo.options
+            // );
 
             if likely(!kwo.options.contains(WaitOption::WEXITED)) {
                 return None;
@@ -270,13 +277,55 @@ fn do_waitpid(
 
             kwo.ret_status = status as i32;
 
-            child_pcb.clear_pg_and_session_reference();
-            drop(child_pcb);
             // debug!("wait4: to release {pid:?}");
-            unsafe { ProcessManager::release(pid) };
+            unsafe { ProcessManager::release(child_pcb.raw_pid()) };
+            drop(child_pcb);
             return Some(Ok(pid.into()));
         }
     };
 
     return None;
+}
+
+impl ProcessControlBlock {
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#143
+    pub(super) fn __exit_signal(&mut self) {
+        let group_dead = self.is_thread_group_leader();
+        let mut sig_guard = self.sig_info_mut();
+        let mut tty: Option<Arc<TtyCore>> = None;
+        // log::debug!(
+        //     "Process {} is exiting, group_dead: {}, state: {:?}",
+        //     self.raw_pid(),
+        //     group_dead,
+        //     self.sched_info().inner_lock_read_irqsave().state()
+        // );
+        if group_dead {
+            tty = sig_guard.tty();
+            sig_guard.set_tty(None);
+        } else {
+            // todo: 通知那些等待当前线程组退出的进程
+        }
+        self.__unhash_process(group_dead);
+
+        drop(tty);
+    }
+
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#123
+    fn __unhash_process(&self, group_dead: bool) {
+        self.detach_pid(PidType::PID);
+        if group_dead {
+            self.detach_pid(PidType::TGID);
+            self.detach_pid(PidType::PGID);
+            self.detach_pid(PidType::SID);
+        }
+
+        // 从线程组中移除
+        let thread_group_leader = self.threads_read_irqsave().group_leader();
+        if let Some(leader) = thread_group_leader {
+            leader
+                .threads_write_irqsave()
+                .group_tasks
+                .retain(|pcb| !Weak::ptr_eq(pcb, &self.self_ref));
+        }
+    }
 }

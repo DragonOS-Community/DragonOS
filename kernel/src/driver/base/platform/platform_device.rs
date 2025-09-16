@@ -16,7 +16,7 @@ use crate::{
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
     },
-    filesystem::kernfs::KernFSInode,
+    filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -187,7 +187,7 @@ impl PlatformBusDevice {
         return state;
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerPlatformBusDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerPlatformBusDevice> {
         self.inner.lock()
     }
 }
@@ -243,11 +243,11 @@ impl KObject for PlatformBusDevice {
         self.inner().kobject_common.kset.clone()
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -328,5 +328,9 @@ impl Device for PlatformBusDevice {
 
     fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
         self.inner().device_common.parent = dev_parent;
+    }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        None
     }
 }

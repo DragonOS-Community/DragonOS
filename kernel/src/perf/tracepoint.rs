@@ -73,6 +73,14 @@ impl IndexNode for TracepointPerfEvent {
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         None
     }
+
+    fn absolute_path(&self) -> core::result::Result<String, SystemError> {
+        Ok(format!(
+            "tracepoint: {}:{}",
+            self.tp.system(),
+            self.tp.name()
+        ))
+    }
 }
 
 pub struct TracePointPerfCallBack(BasicPerfEbpfCallBack);

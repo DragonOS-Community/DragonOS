@@ -1,9 +1,4 @@
-use core::{
-    ffi::c_void,
-    mem::size_of,
-    ops::{Deref, DerefMut},
-    sync::atomic::AtomicI64,
-};
+use core::{ffi::c_void, mem::size_of};
 
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -15,7 +10,7 @@ use crate::{
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
-    process::Pid,
+    process::RawPid,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -57,74 +52,7 @@ pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
     .union(Signal::into_sigset(Signal::SIGIO_OR_POLL))
     .union(Signal::into_sigset(Signal::SIGSYS));
 
-pub fn default_sighandlers() -> Vec<Sigaction> {
-    let mut r = vec![Sigaction::default(); MAX_SIG_NUM];
-    let mut sig_ign = Sigaction::default();
-    // 收到忽略的信号，重启系统调用
-    // todo: 看看linux哪些
-    sig_ign.flags_mut().insert(SigFlags::SA_RESTART);
-
-    r[Signal::SIGCHLD as usize - 1] = sig_ign;
-    r[Signal::SIGURG as usize - 1] = sig_ign;
-    r[Signal::SIGWINCH as usize - 1] = sig_ign;
-
-    r
-}
-
-/// SignalStruct 在 pcb 中加锁
-#[derive(Debug)]
-pub struct SignalStruct {
-    inner: InnerSignalStruct,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct InnerSignalStruct {
-    pub cnt: AtomicI64,
-    /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
-    /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
-    pub handlers: Vec<Sigaction>,
-}
-
-impl SignalStruct {
-    #[inline(never)]
-    pub fn new() -> Self {
-        let r = Self {
-            inner: InnerSignalStruct::default(),
-        };
-
-        r
-    }
-}
-
-impl Default for SignalStruct {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Deref for SignalStruct {
-    type Target = InnerSignalStruct;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for SignalStruct {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl Default for InnerSignalStruct {
-    fn default() -> Self {
-        Self {
-            cnt: Default::default(),
-            handlers: default_sighandlers(),
-        }
-    }
-}
+// Removed SignalStruct; refcount moved into Sighand
 
 #[derive(Debug, Copy, Clone)]
 #[allow(dead_code)]
@@ -354,8 +282,8 @@ impl SigInfo {
 
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
-    Kill(Pid),
-    Alarm(Pid),
+    Kill(RawPid),
+    Alarm(RawPid),
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
@@ -443,8 +371,8 @@ impl SigPending {
             return info;
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(Pid::from(0)));
-            ret.set_sig_type(SigType::Kill(Pid::new(0)));
+            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(RawPid::from(0)));
+            ret.set_sig_type(SigType::Kill(RawPid::new(0)));
             return ret;
         }
     }
@@ -532,7 +460,7 @@ impl SigQueue {
             return false;
         };
         // 从sigqueue中过滤出结果
-        let mut filter_result: Vec<SigInfo> = self.q.extract_if(filter).collect();
+        let mut filter_result: Vec<SigInfo> = self.q.extract_if(.., filter).collect();
         // 筛选出的结果不能大于1个
         assert!(filter_result.len() <= 1);
 
@@ -561,4 +489,24 @@ pub trait SignalArch {
     unsafe fn do_signal_or_restart(frame: &mut TrapFrame);
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64;
+}
+
+bitflags! {
+
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/sched/signal.h#253
+    pub struct SignalFlags: u32 {
+        const STOP_STOPPED = 0x00000001; /* job control stop in effect */
+        const STOP_CONTINUED = 0x00000002; /* SIGCONT since WCONTINUED reap */
+        const GROUP_EXIT = 0x00000004; /* group exit in progress */
+        const CLD_STOPPED = 0x00000010; /* Pending notifications to parent */
+        const CLD_CONTINUED = 0x00000020;
+        const UNKILLABLE = 0x00000040; /* for init: ignore fatal signals */
+    }
+}
+
+impl SignalFlags {
+    pub const CLD_MASK: SignalFlags = SignalFlags::CLD_STOPPED.union(SignalFlags::CLD_CONTINUED);
+    pub const STOP_MASK: SignalFlags = SignalFlags::CLD_MASK
+        .union(SignalFlags::STOP_STOPPED)
+        .union(SignalFlags::STOP_CONTINUED);
 }

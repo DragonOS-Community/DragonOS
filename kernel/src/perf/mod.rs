@@ -5,6 +5,7 @@ mod util;
 
 use crate::arch::MMArch;
 use crate::bpf::prog::BpfProg;
+use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileMode};
@@ -161,7 +162,7 @@ impl Drop for BasicPerfEbpfCallBack {
 #[derive(Debug)]
 pub struct PerfEventInode {
     event: Box<dyn PerfEventOps>,
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
+    epitems: LockedEPItemLinkedList,
 }
 
 impl PerfEventInode {
@@ -281,6 +282,10 @@ impl IndexNode for PerfEventInode {
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode> {
         Ok(self)
+    }
+
+    fn absolute_path(&self) -> core::result::Result<String, SystemError> {
+        Ok(String::from("perf_event"))
     }
 }
 

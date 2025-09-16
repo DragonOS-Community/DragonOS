@@ -41,12 +41,7 @@ pub(super) fn pci_host_ecam_driver_init(fdt: &Fdt<'_>) -> Result<(), SystemError
 
         debug!(
             "pci_host_ecam_driver_init(): {} paddr: {:#x} size: {:#x} bus-range: {}-{} segement_group_number: {}",
-            node.name,
-            paddr,
-            size,
-            bus_begin,
-            bus_end,
-            segement_group_number
+            node.name, paddr, size, bus_begin, bus_end, segement_group_number
         );
 
         pci_ecam_root_info_manager().add_ecam_root_info(EcamRootInfo::new(

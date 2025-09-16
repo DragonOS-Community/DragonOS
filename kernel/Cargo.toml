@@ -98,6 +98,7 @@ x86_64 = "=0.14.10"
 riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", rev = "4241a97", features = [
     "s-mode",
 ] }
+byte-slice-cast = { version = "1.2.2", default-features = false }
 sbi-rt = { version = "=0.0.3", features = ["legacy"] }
 
 # target为loongarch64时，使用下面的依赖

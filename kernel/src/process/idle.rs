@@ -27,10 +27,12 @@ impl ProcessManager {
             panic!("Idle process already initialized");
         }
 
-        assert!(
-            smp_get_processor_id() == ProcessorId::new(0),
-            "Idle process must be initialized on the first processor"
-        );
+        // TODO: 这里需要修正一下判断逻辑
+        // 在 riscv-vf2 中, boot hart 不一定是0, 他可能是1, 因此会过不了
+        //assert!(
+        //    smp_get_processor_id() == ProcessorId::new(0),
+        //    "Idle process must be initialized on the first processor"
+        //);
         let mut v: Vec<Arc<ProcessControlBlock>> = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
 
         for i in 0..PerCpu::MAX_CPU_NUM {

@@ -29,6 +29,7 @@ impl Major {
     /// Disk
     pub const AHCI_BLK_MAJOR: Self = Self::new(8);
     pub const VIRTIO_BLK_MAJOR: Self = Self::new(254);
+    pub const MMC_BLK_MAJOR: Self = Self::new(179);
 
     pub const HVC_MAJOR: Self = Self::new(229);
 

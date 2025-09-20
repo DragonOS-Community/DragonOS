@@ -46,27 +46,6 @@ pub const SYS_SCHED: usize = 100003;
 pub struct Syscall;
 
 impl Syscall {
-    /// # 操作内核环形缓冲区 (临时实现)
-    ///
-    /// ## 参数
-    /// - syslog_action_type: 操作码
-    /// - buf：用户缓冲区
-    /// - len: 需要从内核环形缓冲区读取的字节数
-    ///
-    /// ## 返回值
-    /// - 成功，Ok(usize)
-    /// - 失败，Err(SystemError) 操作失败，返回posix错误码
-    ///
-    pub fn do_syslog(
-        _syslog_action_type: usize,
-        _buf: &mut [u8],
-        _len: usize,
-    ) -> Result<usize, SystemError> {
-        // TODO: 实现真正的 syslog 功能
-        // 临时返回成功，避免编译错误
-        Ok(0)
-    }
-
     /// 初始化系统调用
     #[inline(never)]
     pub fn init() -> Result<(), SystemError> {
@@ -394,12 +373,12 @@ impl Syscall {
 
             SYS_TKILL => {
                 warn!("SYS_TKILL has not yet been implemented");
-                Ok(0)
+                Err(SystemError::ENOSYS)
             }
 
             SYS_SIGALTSTACK => {
                 warn!("SYS_SIGALTSTACK has not yet been implemented");
-                Ok(0)
+                Err(SystemError::ENOSYS)
             }
 
             SYS_SYSLOG => {
@@ -503,7 +482,9 @@ impl Syscall {
 
             SYS_RT_SIGTIMEDWAIT => {
                 log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
-                Ok(0)
+                // 返回 ENOSYS (功能未实现) 错误，而不是成功
+                // 这样可以避免调用程序陷入无限循环
+                Err(SystemError::ENOSYS)
             }
             _ => {
                 panic!(

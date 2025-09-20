@@ -139,6 +139,21 @@ impl Pid {
             }
         }
 
+        // 特殊处理：如果当前进程是在父命名空间中，但查询的是子命名空间
+        // 并且当前进程是该子命名空间的 init 进程（child_reaper），则返回 PID 1
+        if ns.level() > self.level {
+            if let Some(child_reaper) = ns.child_reaper() {
+                if let Some(child_reaper_pcb) = child_reaper.upgrade() {
+                    // 检查当前 PID 是否与子命名空间的 init 进程相同
+                    if let Some(current_pid) = child_reaper_pcb.thread_pid.read().as_ref() {
+                        if Arc::ptr_eq(current_pid, &(self.self_ref.upgrade().unwrap())) {
+                            return RawPid::new(1); // 在子命名空间中，init 进程的 PID 是 1
+                        }
+                    }
+                }
+            }
+        }
+
         // 如果没有找到对应的UPid，返回0
         RawPid::new(0)
     }
@@ -315,6 +330,32 @@ pub(super) fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, SystemError>
     Ok(pid)
 }
 
+/// 为新分配的PID设置child_reaper（如果它是新命名空间的init进程）
+///
+/// 这个函数应该在进程创建完成后调用，用于设置新PID命名空间的init进程
+pub(super) fn setup_child_reaper_if_needed(
+    pcb: &Arc<ProcessControlBlock>,
+    pid: &Arc<Pid>,
+) {
+    // 检查是否是新命名空间的第一个进程（PID 1）
+    if pid.is_child_reaper() {
+        let ns = pid.ns_of_pid();
+        // 如果该命名空间还没有设置child_reaper，则设置当前进程为child_reaper
+        if ns.child_reaper().is_none() {
+            ns.set_child_reaper(Arc::downgrade(pcb));
+            
+            // TODO: 设置进程为不可杀死的（类似于 init 进程）
+            // 这需要在 ProcessFlags 中添加 UNKILLABLE 标志或使用其他机制
+            
+            // log::debug!(
+            //     "[PID_NAMESPACE] Set process {} as child_reaper for namespace level {}",
+            //     pcb.raw_pid().data(),
+            //     ns.level()
+            // );
+        }
+    }
+}
+
 /// 清理已分配的PID
 fn cleanup_allocated_pids(pid: Arc<Pid>, mut allocated_upids: Vec<(isize, UPid)>) {
     // 反转已分配的UPid列表，以便从最深层级开始清理
@@ -331,30 +372,36 @@ fn cleanup_allocated_pids(pid: Arc<Pid>, mut allocated_upids: Vec<(isize, UPid)>
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid.c#129
 pub(super) fn free_pid(pid: Arc<Pid>) {
+    // 简化日志，避免系统卡死 - 只记录关键信息
+    if pid.level > 0 {
+        log::debug!("[PID_FREE] Freeing pid in namespace level: {}", pid.level);
+    }
+    
     // 释放PID
     pid.set_dead();
-    // let raw_pid = pid.pid_vnr().data();
     let mut level = 0;
     while level <= pid.level {
         let upid = pid.numbers.lock()[level as usize]
             .take()
             .expect("pid numbers should not be empty");
-        // log::debug!(
-        //     "Freeing pid: raw:{}, upid.nr:{}, level: {}",
-        //     raw_pid,
-        //     upid.nr.data(),
-        //     level
-        // );
+        
         let mut ns_guard = upid.ns.inner();
-        let pid_allocated_after_free = ns_guard.do_pid_allocated() - 1;
-        if pid_allocated_after_free == 1 || pid_allocated_after_free == 2 {
+        let pid_allocated_before_free = ns_guard.do_pid_allocated();
+        
+        if pid_allocated_before_free == 1 || pid_allocated_before_free == 2 {
             if let Some(child_reaper) = ns_guard.child_reaper().as_ref().and_then(|x| x.upgrade()) {
                 ProcessManager::wakeup(&child_reaper).ok();
             }
         }
+        
+        // 只记录新命名空间的关键信息
+        if upid.ns.level() > 0 {
+            log::debug!("[PID_RELEASE] Releasing PID {} in ns_level: {}", upid.nr.data(), upid.ns.level());
+        }
+        
         ns_guard.do_release_pid_in_ns(upid.nr);
+        
         if ns_guard.dead() {
-            // log::debug!("Releasing pid namespace with level {}", level);
             upid.ns.delete_current_pidns_in_parent();
         }
         level += 1;
@@ -434,7 +481,10 @@ impl ProcessControlBlock {
     }
 
     pub(super) fn detach_pid(&self, pid_type: PidType) {
+        // log::debug!("[PID_DETACH] detach_pid called: pid_type={:?}, process_pid={}, process_name={}", 
+        //            pid_type, self.raw_pid(), self.basic().name());
         self.__change_pid(pid_type, None);
+        // log::debug!("[PID_DETACH] detach_pid completed: pid_type={:?}", pid_type);
     }
 
     pub(super) fn change_pid(&self, pid_type: PidType, new_pid: Arc<Pid>) {

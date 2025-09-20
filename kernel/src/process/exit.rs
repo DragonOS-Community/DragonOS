@@ -294,10 +294,11 @@ impl ProcessControlBlock {
         let mut sig_guard = self.sig_info_mut();
         let mut tty: Option<Arc<TtyCore>> = None;
         // log::debug!(
-        //     "Process {} is exiting, group_dead: {}, state: {:?}",
+        //     "Process {} is exiting, group_dead: {}, exit_signal: {:?}, ns_level: {}",
         //     self.raw_pid(),
         //     group_dead,
-        //     self.sched_info().inner_lock_read_irqsave().state()
+        //     self.exit_signal.load(core::sync::atomic::Ordering::SeqCst),
+        //     self.active_pid_ns().level()
         // );
         if group_dead {
             tty = sig_guard.tty();

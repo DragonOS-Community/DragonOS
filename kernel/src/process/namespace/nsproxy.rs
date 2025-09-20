@@ -1,13 +1,15 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::process::{
-    fork::CloneFlags,
-    namespace::{
-        mnt::{root_mnt_namespace, MntNamespace},
-        uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
+use crate::{
+    process::{
+        fork::CloneFlags,
+        namespace::{
+            mnt::{root_mnt_namespace, MntNamespace},
+            uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
+        },
+        ProcessControlBlock, ProcessManager,
     },
-    ProcessControlBlock, ProcessManager,
 };
 use core::{fmt::Debug, intrinsics::likely};
 

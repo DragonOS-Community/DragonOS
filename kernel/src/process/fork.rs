@@ -553,7 +553,10 @@ impl ProcessManager {
             unsafe {
                 pcb.force_set_raw_pid(RawPid(root_pid_nr));
             }
-            pcb.init_task_pid(PidType::PID, main_pid_arc);
+            pcb.init_task_pid(PidType::PID, main_pid_arc.clone());
+            
+            // 如果这是新PID命名空间的第一个进程（PID 1），设置为child_reaper
+            super::pid::setup_child_reaper_if_needed(&pcb, &main_pid_arc);
         }
 
         // 将当前pcb加入父进程的子进程哈希表中

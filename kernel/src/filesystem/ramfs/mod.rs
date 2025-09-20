@@ -1,7 +1,7 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
-use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
+use crate::filesystem::vfs::FileSystemMakerData;
 use crate::libs::rwlock::RwLock;
 use crate::register_mountable_fs;
 use crate::{
@@ -23,11 +23,11 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    file::FilePrivateData, syscall::ModeType, utils::DName, FileSystem, FileSystemMaker, FsInfo,
+    file::FilePrivateData, syscall::ModeType, utils::DName, FileSystem, FsInfo,
     IndexNode, InodeId, Metadata, SpecialNodeData,
 };
 
-use linkme::distributed_slice;
+
 
 use super::vfs::{Magic, MountableFileSystem, SuperBlock};
 

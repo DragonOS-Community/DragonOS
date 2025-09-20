@@ -31,7 +31,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
-        procfs::{procfs_register_pid, procfs_unregister_pid, PROCFS_INSTANCE},
+        procfs::{procfs_register_pid, procfs_unregister_pid},
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
@@ -172,17 +172,13 @@ impl ProcessManager {
 
     /// 在进程管理系统初始化完成后，初始化 ProcFS 的进程相关功能
     fn init_procfs_after_process_init() {
-        
-        // 检查 ProcFS 是否已经初始化
-        if let Some(_) = unsafe { PROCFS_INSTANCE.as_ref() } {
-            // 为当前进程创建 ProcFS 目录
-            let current_pid = ProcessManager::current_pid();
-            if current_pid != RawPid(0) {
-                if let Err(e) = procfs_register_pid(current_pid) {
-                    warn!("Failed to register current process {} to procfs: {:?}", current_pid, e);
-                } else {
-                    info!("Successfully registered current process {} to procfs", current_pid);
-                }
+        // 旧的全局 PROCFS_INSTANCE 已移除。直接通过通知机制为当前进程注册到已挂载的 /proc 实例。
+        let current_pid = ProcessManager::current_pid();
+        if current_pid != RawPid(0) {
+            if let Err(e) = procfs_register_pid(current_pid) {
+                warn!("Failed to register current process {} to procfs: {:?}", current_pid, e);
+            } else {
+                info!("Successfully registered current process {} to procfs", current_pid);
             }
         }
     }

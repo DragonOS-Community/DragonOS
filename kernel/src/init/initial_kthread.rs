@@ -162,6 +162,15 @@ fn run_init_process(
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
     compiler_fence(Ordering::SeqCst);
+    
+    // 在 init 进程启动前挂载 ProcFS，确保系统工具可以正常工作
+    if let Err(e) = crate::filesystem::procfs::mount_proc_current_ns() {
+        log::warn!("Failed to mount ProcFS during init: {:?}", e);
+        // 不要因为 ProcFS 挂载失败而阻止 init 进程启动
+    } else {
+        log::info!("ProcFS mounted early during init process startup");
+    }
+    
     let path = proc_init_info.proc_name.to_str().unwrap();
 
     let pwd = ProcessManager::current_pcb().pwd_inode();

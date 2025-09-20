@@ -21,6 +21,7 @@ lazy_static! {
     pub static ref INIT_PID_NAMESPACE: Arc<PidNamespace> = PidNamespace::new_root();
 }
 
+#[derive(Debug)]
 pub struct PidNamespace {
     ns_common: NsCommon,
     self_ref: Weak<PidNamespace>,
@@ -31,6 +32,7 @@ pub struct PidNamespace {
     inner: SpinLock<InnerPidNamespace>,
 }
 
+#[derive(Debug)]
 pub struct InnerPidNamespace {
     dead: bool,
     ida: IdAllocator,
@@ -171,6 +173,16 @@ impl PidNamespace {
         self.inner().child_reaper = Some(child_reaper);
     }
 
+    /// 获取IDA分配器已使用的ID数量
+    pub fn ida_used(&self) -> usize {
+        self.inner().ida.used()
+    }
+
+    /// 获取IDA分配器当前ID
+    pub fn ida_current_id(&self) -> usize {
+        self.inner().ida.current_id()
+    }
+
     pub fn parent(&self) -> Option<Arc<PidNamespace>> {
         self.parent.as_ref().and_then(|p| p.upgrade())
     }
@@ -182,6 +194,33 @@ impl PidNamespace {
             p.inner().children.retain(|c| !Arc::ptr_eq(c, &current));
         }
     }
+
+    /// 获取当前 PID namespace 中的所有进程 ID
+    pub fn get_all_pids(&self) -> Vec<RawPid> {
+        let inner = self.inner();
+        inner.pid_map.keys().copied().collect()
+    }
+
+    /// 检查指定的 PID 是否在当前 namespace 中
+    pub fn contains_pid(&self, raw_pid: RawPid) -> bool {
+        let inner = self.inner();
+        inner.pid_map.contains_key(&raw_pid)
+    }
+
+    /// 正确的方式来标记PID namespace为dead
+    /// 只有当init进程（PID 1）退出时才应该调用
+    pub fn mark_dead_on_init_exit(&self) {
+        let mut inner = self.inner();
+        if !inner.dead {
+            log::debug!("[PID_NAMESPACE] Marking namespace level {} as dead due to init process exit", self.level());
+            inner.dead = true;
+        }
+    }
+
+    /// 检查namespace是否为dead状态
+    pub fn is_dead(&self) -> bool {
+        self.inner().dead
+    }
 }
 
 impl InnerPidNamespace {
@@ -191,18 +230,35 @@ impl InnerPidNamespace {
         }
         let raw_pid = self.ida.alloc().ok_or(SystemError::ENOMEM)?;
         let raw_pid = RawPid(raw_pid);
+        // log::debug!("do_alloc_pid_in_ns: allocated raw_pid={}, ida.used={}", raw_pid, self.ida.used());
         self.pid_map.insert(raw_pid, pid);
         Ok(raw_pid)
     }
 
     pub fn do_release_pid_in_ns(&mut self, raw_pid: RawPid) {
-        // log::debug!("do_release_pid_in_ns: raw_pid={}", raw_pid);
+        // 注意：self是InnerPidNamespace，无法直接获取level信息
+        // level信息需要在调用此函数的外部记录
+        
+        // 原有的PID映射移除逻辑，添加调试信息
+        let _existed_before = self.pid_map.contains_key(&raw_pid);
         self.pid_map.remove(&raw_pid);
+        // log::debug!("[PID_RELEASE] PID {} removed from pid_map: existed_before={}", raw_pid, _existed_before);
+        
+        // IDA释放前后的状态记录
+        let _ida_used_before = self.ida.used();
         self.ida.free(raw_pid.data());
-        if self.pid_map.is_empty() {
-            // 如果当前namespace中没有任何PID了，则标记为dead
-            self.dead = true;
-        }
+        let _ida_used_after = self.ida.used();
+        // log::debug!("[PID_RELEASE] IDA free operation: raw_pid={}, ida.used_before={}, ida.used_after={}", 
+        //            raw_pid, _ida_used_before, _ida_used_after);
+        
+        // 移除错误的dead标记逻辑
+        // PID namespace不应该因为临时进程退出而被标记为dead
+        // 只有当init进程退出或namespace被显式销毁时才应该标记为dead
+        // 这修复了PID复用问题：当namespace被错误标记为dead时，
+        // 后续的PID分配会返回ESRCH，导致PID无法复用
+        
+        // log::debug!("[PID_RELEASE] do_release_pid_in_ns completed: raw_pid={}, final_ida.used={}", 
+        //            raw_pid, self.ida.used());
     }
 
     pub fn do_pid_allocated(&self) -> usize {

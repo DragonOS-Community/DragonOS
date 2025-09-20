@@ -1,7 +1,7 @@
 use super::KernFSInode;
 use crate::tracepoint::{TraceCmdLineCacheSnapshot, TracePipeSnapshot, TracePointInfo};
 use crate::{
-    filesystem::{sysfs::SysFSKernPrivateData, procfs::ProcFSKernPrivateData, vfs::PollStatus},
+    filesystem::{sysfs::SysFSKernPrivateData, procfs::file::ProcFSKernPrivateData, vfs::PollStatus},
     libs::spinlock::SpinLockGuard,
 };
 use alloc::sync::Arc;

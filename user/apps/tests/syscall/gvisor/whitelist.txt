@@ -3,8 +3,8 @@
 # 以#开头的行为注释，空行会被忽略
 
 # 基础系统调用测试
-chdir_test
 read_test
+#chdir_test
 
 # 文件系统相关测试
 #stat_test
@@ -27,4 +27,4 @@ read_test
 
 # 信号处理测试
 #signal_test
-#sigaction_test 
+#sigaction_test

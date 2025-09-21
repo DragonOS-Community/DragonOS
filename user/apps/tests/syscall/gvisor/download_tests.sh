@@ -150,21 +150,44 @@ cleanup_temp_files() {
 
 # 主函数
 main() {
+    local skip_if_exists=false
+    local force_download=false
+
+    # 检查参数
+    for arg in "$@"; do
+        case "$arg" in
+            --skip-if-exists)
+                skip_if_exists=true
+                ;;
+            --force-download)
+                force_download=true
+                ;;
+        esac
+    done
+
     print_info "开始检查和下载gvisor系统调用测试套件"
-    
+
     # 检查依赖
     check_dependencies
-    
+
     # 检查是否已存在测试套件
     if check_existing_tests; then
-        read -p "测试套件已存在，是否重新下载？(y/N) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            print_info "使用现有测试套件"
+        if [ "$skip_if_exists" = true ]; then
+            print_info "测试套件已存在，跳过下载"
             exit 0
+        elif [ "$force_download" = true ]; then
+            print_warn "强制重新下载，删除现有测试套件..."
+            rm -rf "$TESTS_DIR"
+        else
+            read -p "测试套件已存在，是否重新下载？(y/N) " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                print_info "使用现有测试套件"
+                exit 0
+            fi
+            print_warn "删除现有测试套件..."
+            rm -rf "$TESTS_DIR"
         fi
-        print_warn "删除现有测试套件..."
-        rm -rf "$TESTS_DIR"
     fi
     
     # 下载测试套件

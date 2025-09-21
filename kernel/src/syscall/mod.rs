@@ -45,6 +45,7 @@ pub const SYS_SCHED: usize = 100003;
 #[derive(Debug)]
 pub struct Syscall;
 
+static DFLAG: AtomicBool = AtomicBool::new(false);
 impl Syscall {
     /// 初始化系统调用
     #[inline(never)]
@@ -70,7 +71,30 @@ impl Syscall {
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
         use crate::debug::panic::kernel_catch_unwind;
+        {
+            let binding = ProcessManager::current_pcb();
+            if binding.basic().name().contains("dropbear") {
+                // 如果是dropbear进程，打印系统调用号和参数
+                log::debug!(
+                    "Syscall {}({}) called with args: {:x?}",
+                    syscall_num,
+                    syscall_number_to_str(syscall_num),
+                    args
+                );
+                DFLAG.store(true, Ordering::Relaxed);
+            }
+        }
+
         let res = kernel_catch_unwind(|| Self::handle(syscall_num, args, frame))?;
+        {
+            let binding = ProcessManager::current_pcb();
+            if binding.basic().name().contains("dropbear") || binding.basic().name().contains("xxx")
+            // || syscall_num == SYS_OPENAT
+            // || syscall_num == SYS_OPEN
+            {
+                println!("returned: {:?}", res);
+            }
+        }
         res
     }
     /// @brief 系统调用分发器，用于分发系统调用。

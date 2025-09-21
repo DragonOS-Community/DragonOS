@@ -149,8 +149,8 @@ impl PtyCommon {
             }
 
             if link_core.flags().contains(TtyFlag::PTY_LOCK) {
-                core.flags_write().insert(TtyFlag::IO_ERROR);
-                return Err(SystemError::EIO);
+                // core.flags_write().insert(TtyFlag::IO_ERROR);
+                // return Err(SystemError::EIO);
             }
 
             core.flags_write().remove(TtyFlag::IO_ERROR);

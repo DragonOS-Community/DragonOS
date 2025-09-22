@@ -4,7 +4,7 @@ use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMAT,
     arch::MMArch,
-    ipc::shm::{shm_manager_lock, ShmFlags, ShmId},
+    ipc::shm::{ShmFlags, ShmId},
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
@@ -13,6 +13,7 @@ use crate::{
         ucontext::{AddressSpace, VMA},
         VirtAddr, VmFlags,
     },
+    process::ProcessManager,
     syscall::{table::Syscall, user_access::UserBufferReader},
 };
 use syscall_table_macros::declare_syscall;
@@ -36,7 +37,8 @@ pub(super) fn do_kernel_shmat(
     vaddr: VirtAddr,
     shmflg: ShmFlags,
 ) -> Result<usize, SystemError> {
-    let mut shm_manager_guard = shm_manager_lock();
+    let nsproxy = ProcessManager::current_pcb().nsproxy();
+    let mut shm_manager_guard = nsproxy.ipc_ns.shm.lock();
     let current_address_space = AddressSpace::current()?;
     let mut address_write_guard = current_address_space.write();
 
@@ -67,6 +69,7 @@ pub(super) fn do_kernel_shmat(
                 page_flags,
                 &mut address_write_guard.user_mapper.utable,
                 flusher,
+                Some(id),
             )?;
 
             // 将VMA加入到当前进程的VMA列表中
@@ -126,6 +129,7 @@ pub(super) fn do_kernel_shmat(
 
             // 更新vma的映射状态
             vma.lock_irqsave().set_mapped(true);
+            vma.lock_irqsave().set_shm_id(Some(id));
 
             vaddr.data()
         }

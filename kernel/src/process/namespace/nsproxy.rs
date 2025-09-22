@@ -12,6 +12,7 @@ use crate::process::{
 use core::{fmt::Debug, intrinsics::likely};
 
 use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
+use super::ipc_namespace::{IpcNamespace, INIT_IPC_NAMESPACE};
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///
@@ -28,9 +29,10 @@ pub struct NsProxy {
     /// mount namespace（挂载命名空间）
     pub mnt_ns: Arc<MntNamespace>,
     pub uts_ns: Arc<UtsNamespace>,
+    /// ipc namespace（SysV IPC、POSIX mqueue 等）
+    pub ipc_ns: Arc<IpcNamespace>,
     // 其他namespace（为未来扩展预留）
     // pub net_ns: Option<Arc<NetNamespace>>,
-    // pub ipc_ns: Option<Arc<IpcNamespace>>,
     // pub cgroup_ns: Option<Arc<CgroupNamespace>>,
     // pub time_ns: Option<Arc<TimeNamespace>>,
 }
@@ -47,10 +49,12 @@ impl NsProxy {
         let root_pid_ns = super::pid_namespace::INIT_PID_NAMESPACE.clone();
         let root_mnt_ns = root_mnt_namespace();
         let root_uts_ns = INIT_UTS_NAMESPACE.clone();
+        let root_ipc_ns = INIT_IPC_NAMESPACE.clone();
         Arc::new(Self {
             pid_ns_for_children: root_pid_ns,
             mnt_ns: root_mnt_ns,
             uts_ns: root_uts_ns,
+            ipc_ns: root_ipc_ns,
         })
     }
 
@@ -69,6 +73,7 @@ impl NsProxy {
             pid_ns_for_children: self.pid_ns_for_children.clone(),
             mnt_ns: self.mnt_ns.clone(),
             uts_ns: self.uts_ns.clone(),
+            ipc_ns: self.ipc_ns.clone(),
         }
     }
 }
@@ -149,10 +154,12 @@ pub(super) fn create_new_namespaces(
     let mnt_ns = nsproxy.mnt_ns.copy_mnt_ns(clone_flags, user_ns.clone())?;
 
     let uts_ns = nsproxy.uts_ns.copy_uts_ns(clone_flags, user_ns.clone())?;
+    let ipc_ns = nsproxy.ipc_ns.copy_ipc_ns(clone_flags, user_ns.clone());
     let result = NsProxy {
         pid_ns_for_children,
         mnt_ns,
         uts_ns,
+        ipc_ns,
     };
 
     let result = Arc::new(result);

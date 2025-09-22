@@ -6,7 +6,7 @@ use crate::{
     arch::MMArch,
     driver::serial::serial8250::send_to_default_serial8250_port,
     filesystem::procfs::kmsg::kmsg_init,
-    ipc::shm::shm_manager_init,
+    // ipc::shm::shm_manager_init, // 改为 per-ns，不在此初始化
     libs::printk::PrintkWriter,
     mm::{
         allocator::slab::slab_init,
@@ -59,8 +59,7 @@ pub unsafe fn mm_init() {
     kmsg_init();
     // enable PAGE_MANAGER
     page_manager_init();
-    // enable SHM_MANAGER
-    shm_manager_init();
+    // per-ns SHM：不在此初始化
     // enable PAGE_RECLAIMER
     page_reclaimer_init();
 

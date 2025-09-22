@@ -1,10 +1,7 @@
 use crate::{
     arch::mm::LockedFrameAllocator,
     filesystem::vfs::syscall::ModeType,
-    libs::{
-        align::page_align_up,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
+    libs::align::page_align_up,
     mm::{
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
         page::{page_manager_lock_irqsave, PageFlags, PageType},
@@ -15,32 +12,16 @@ use crate::{
     time::PosixTimeSpec,
 };
 use core::fmt;
-use core::sync::atomic::{compiler_fence, Ordering};
 use hashbrown::HashMap;
 use ida::IdAllocator;
-use log::info;
+// use log::info; // 阶段一不需要
 use num::ToPrimitive;
 use system_error::SystemError;
-pub static mut SHM_MANAGER: Option<SpinLock<ShmManager>> = None;
 
 /// 用于创建新的私有IPC对象
 pub const IPC_PRIVATE: ShmKey = ShmKey::new(0);
 
-/// 初始化SHM_MANAGER
-pub fn shm_manager_init() {
-    info!("shm_manager_init");
-    let shm_manager = SpinLock::new(ShmManager::new());
-
-    compiler_fence(Ordering::SeqCst);
-    unsafe { SHM_MANAGER = Some(shm_manager) };
-    compiler_fence(Ordering::SeqCst);
-
-    info!("shm_manager_init done");
-}
-
-pub fn shm_manager_lock() -> SpinLockGuard<'static, ShmManager> {
-    unsafe { SHM_MANAGER.as_ref().unwrap().lock() }
-}
+// 注意：阶段一取消全局 SHM_MANAGER；改为从当前进程的 `ipc_ns` 内部获取
 
 int_like!(ShmId, usize);
 int_like!(ShmKey, usize);

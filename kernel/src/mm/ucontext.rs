@@ -21,7 +21,7 @@ use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
     filesystem::vfs::file::File,
-    ipc::shm::{shm_manager_lock, ShmFlags},
+    ipc::shm::{ShmFlags, ShmId},
     libs::{
         align::page_align_up,
         rwlock::RwLock,
@@ -1203,9 +1203,10 @@ impl LockedVMA {
             // 如果是共享页，执行释放操作
             let page = page_manager_guard.get(&paddr).unwrap();
             let page_guard = page.read_irqsave();
-            if let PageType::Shm(shm_id) = page_guard.page_type() {
-                let mut shm_manager_guard = shm_manager_lock();
-                if let Some(kernel_shm) = shm_manager_guard.get_mut(shm_id) {
+            if let Some(shm_id) = guard.shm_id {
+                let nsproxy = ProcessManager::current_pcb().nsproxy();
+                let mut shm_manager_guard = nsproxy.ipc_ns.shm.lock();
+                if let Some(kernel_shm) = shm_manager_guard.get_mut(&shm_id) {
                     // 更新最后一次断开连接时间
                     kernel_shm.update_dtim();
 
@@ -1213,9 +1214,10 @@ impl LockedVMA {
                     kernel_shm.decrease_count();
 
                     // 释放shm_id
-                    if kernel_shm.map_count() == 0 && kernel_shm.mode().contains(ShmFlags::SHM_DEST)
+                    if kernel_shm.map_count() == 0
+                        && kernel_shm.mode().contains(ShmFlags::SHM_DEST)
                     {
-                        shm_manager_guard.free_id(shm_id);
+                        shm_manager_guard.free_id(&shm_id);
                     }
                 }
             }
@@ -1425,6 +1427,8 @@ pub struct VMA {
     file_pgoff: Option<usize>,
 
     provider: Provider,
+    /// 关联的 SysV SHM 标识（当此 VMA 来自 shmat 时设置）
+    shm_id: Option<ShmId>,
 }
 
 impl core::hash::Hash for VMA {
@@ -1461,6 +1465,7 @@ impl VMA {
             provider: Provider::Allocated,
             vm_file: file,
             file_pgoff: pgoff,
+            shm_id: None,
         }
     }
 
@@ -1496,6 +1501,11 @@ impl VMA {
         self.flags = MMArch::vm_get_page_prot(self.vm_flags);
     }
 
+    #[inline(always)]
+    pub fn set_shm_id(&mut self, shm: Option<ShmId>) {
+        self.shm_id = shm;
+    }
+
     /// # 拷贝当前VMA的内容
     ///
     /// ### 安全性
@@ -1512,6 +1522,7 @@ impl VMA {
             provider: Provider::Allocated,
             file_pgoff: self.file_pgoff,
             vm_file: self.vm_file.clone(),
+            shm_id: self.shm_id,
         };
     }
 
@@ -1526,6 +1537,7 @@ impl VMA {
             provider: Provider::Allocated,
             file_pgoff: self.file_pgoff,
             vm_file: self.vm_file.clone(),
+            shm_id: self.shm_id,
         };
     }
 
@@ -1605,6 +1617,7 @@ impl VMA {
         flags: EntryFlags<MMArch>,
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
+        shm_id: Option<ShmId>,
     ) -> Result<Arc<LockedVMA>, SystemError> {
         let mut cur_phy = phys;
         let mut cur_dest = destination;
@@ -1632,6 +1645,9 @@ impl VMA {
             None,
             true,
         ));
+        if let Some(id) = shm_id {
+            r.lock_irqsave().set_shm_id(Some(id));
+        }
 
         // 将VMA加入到anon_vma中
         let mut page_manager_guard = page_manager_lock_irqsave();

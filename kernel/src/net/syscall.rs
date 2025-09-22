@@ -124,9 +124,13 @@ impl Syscall {
         optval: &[u8],
     ) -> Result<usize, SystemError> {
         let sol = socket::PSOL::try_from(level as u32)?;
-        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
+        let socket = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
         log::debug!("setsockopt: level = {:?} ", sol);
-        return socket.set_option(sol, optname, optval).map(|_| 0);
+        return socket
+            .as_socket()
+            .unwrap()
+            .set_option(sol, optname, optval)
+            .map(|_| 0);
     }
 
     /// @brief sys_getsockopt系统调用的实际执行函数
@@ -147,7 +151,8 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 获取socket
         let optval = optval as *mut u32;
-        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
+        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+        let socket = socket_inode.as_socket().unwrap();
 
         use socket::{PSO, PSOL};
 
@@ -207,8 +212,11 @@ impl Syscall {
     /// @return 成功返回0，失败返回错误码
     pub fn connect(fd: usize, addr: *const SockAddr, addrlen: u32) -> Result<usize, SystemError> {
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
-        socket.connect(endpoint)?;
+        ProcessManager::current_pcb()
+            .get_socket_inode(fd as i32)?
+            .as_socket()
+            .unwrap()
+            .connect(endpoint)?;
         Ok(0)
     }
 
@@ -228,9 +236,11 @@ impl Syscall {
         //     addrlen
         // );
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
-        // log::debug!("bind: socket={:?}", socket);
-        socket.bind(endpoint)?;
+        ProcessManager::current_pcb()
+            .get_socket_inode(fd as i32)?
+            .as_socket()
+            .unwrap()
+            .bind(endpoint)?;
         Ok(0)
     }
 
@@ -258,7 +268,8 @@ impl Syscall {
 
         let flags = socket::PMSG::from_bits_truncate(flags);
 
-        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
+        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+        let socket = socket_inode.as_socket().unwrap();
 
         if let Some(endpoint) = endpoint {
             return socket.send_to(buf, flags, endpoint);
@@ -283,7 +294,8 @@ impl Syscall {
         addr: *mut SockAddr,
         addr_len: *mut u32,
     ) -> Result<usize, SystemError> {
-        let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
+        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+        let socket = socket_inode.as_socket().unwrap();
 
         let flags = socket::PMSG::from_bits_truncate(flags);
 
@@ -320,7 +332,8 @@ impl Syscall {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
         let (buf, recv_size) = {
-            let socket = ProcessManager::current_pcb().get_socket(fd as i32)?;
+            let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+            let socket = socket_inode.as_socket().unwrap();
 
             let flags = socket::PMSG::from_bits_truncate(flags);
 
@@ -344,8 +357,12 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn listen(fd: usize, backlog: usize) -> Result<usize, SystemError> {
-        let inode = ProcessManager::current_pcb().get_socket(fd as i32)?;
-        inode.listen(backlog).map(|_| 0)
+        ProcessManager::current_pcb()
+            .get_socket_inode(fd as i32)?
+            .as_socket()
+            .unwrap()
+            .listen(backlog)
+            .map(|_| 0)
     }
 
     /// @brief sys_shutdown系统调用的实际执行函数
@@ -355,8 +372,12 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn shutdown(fd: usize, how: usize) -> Result<usize, SystemError> {
-        let inode = ProcessManager::current_pcb().get_socket(fd as i32)?;
-        inode.shutdown(ShutdownBit::try_from(how)?).map(|()| 0)
+        ProcessManager::current_pcb()
+            .get_socket_inode(fd as i32)?
+            .as_socket()
+            .unwrap()
+            .shutdown(ShutdownBit::try_from(how)?)
+            .map(|()| 0)
     }
 
     /// @brief sys_accept系统调用的实际执行函数
@@ -413,7 +434,9 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let (new_socket, remote_endpoint) = {
             ProcessManager::current_pcb()
-                .get_socket(fd as i32)?
+                .get_socket_inode(fd as i32)?
+                .as_socket()
+                .unwrap()
                 .accept()?
         };
 
@@ -459,7 +482,9 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         ProcessManager::current_pcb()
-            .get_socket(fd as i32)?
+            .get_socket_inode(fd as i32)?
+            .as_socket()
+            .unwrap()
             .local_endpoint()?
             .write_to_user(addr, addrlen)?;
         return Ok(0);
@@ -482,7 +507,9 @@ impl Syscall {
         }
 
         ProcessManager::current_pcb()
-            .get_socket(fd as i32)?
+            .get_socket_inode(fd as i32)?
+            .as_socket()
+            .unwrap()
             .remote_endpoint()?
             .write_to_user(addr, addrlen)?;
 

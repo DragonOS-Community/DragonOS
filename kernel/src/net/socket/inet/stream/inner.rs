@@ -1,8 +1,10 @@
+use alloc::sync::Arc;
 use core::sync::atomic::AtomicUsize;
 
 use crate::filesystem::epoll::EPollEventType;
 use crate::libs::rwlock::RwLock;
 use crate::net::socket::{self, inet::Types};
+use crate::process::namespace::net_namespace::NetNamespace;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use smoltcp;
@@ -57,10 +59,11 @@ impl Init {
     pub(super) fn bind(
         self,
         local_endpoint: smoltcp::wire::IpEndpoint,
+        netns: Arc<NetNamespace>,
     ) -> Result<Self, SystemError> {
         match self {
             Init::Unbound((socket, _)) => {
-                let bound = socket::inet::BoundInner::bind(*socket, &local_endpoint.addr)?;
+                let bound = socket::inet::BoundInner::bind(*socket, &local_endpoint.addr, netns)?;
                 bound
                     .port_manager()
                     .bind_port(Types::Tcp, local_endpoint.port)?;
@@ -77,11 +80,12 @@ impl Init {
     pub(super) fn bind_to_ephemeral(
         self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
+        netns: Arc<NetNamespace>,
     ) -> Result<(socket::inet::BoundInner, smoltcp::wire::IpEndpoint), (Self, SystemError)> {
         match self {
             Init::Unbound((socket, ver)) => {
                 let (bound, address) =
-                    socket::inet::BoundInner::bind_ephemeral(*socket, remote_endpoint.addr)
+                    socket::inet::BoundInner::bind_ephemeral(*socket, remote_endpoint.addr, netns)
                         .map_err(|err| (Self::new(ver), err))?;
                 let bound_port = bound
                     .port_manager()
@@ -97,9 +101,10 @@ impl Init {
     pub(super) fn connect(
         self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
+        netns: Arc<NetNamespace>,
     ) -> Result<Connecting, (Self, SystemError)> {
         let (inner, local) = match self {
-            Init::Unbound(_) => self.bind_to_ephemeral(remote_endpoint)?,
+            Init::Unbound(_) => self.bind_to_ephemeral(remote_endpoint, netns)?,
             Init::Bound(inner) => inner,
         };
         if local.addr.is_unspecified() {
@@ -146,6 +151,7 @@ impl Init {
                         .unwrap_or(&smoltcp::wire::IpAddress::from(
                             smoltcp::wire::Ipv4Address::UNSPECIFIED,
                         )),
+                    inner.netns(),
                 )?;
                 inners.push(new_listen);
             }
@@ -321,6 +327,7 @@ impl Listening {
                 .unwrap_or(&smoltcp::wire::IpAddress::from(
                     smoltcp::wire::Ipv4Address::UNSPECIFIED,
                 )),
+            connected.netns(),
         )?;
 
         // swap the connected socket with the new_listen socket
@@ -331,6 +338,7 @@ impl Listening {
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
+        // log::info!("Listening::update_io_events");
         let position = self.inners.iter().position(|inner| {
             inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
         });

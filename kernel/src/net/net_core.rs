@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::Operstate,
-    net::NET_DEVICES,
+    process::namespace::net_namespace::INIT_NET_NAMESPACE,
     time::{sleep::nanosleep, PosixTimeSpec},
 };
 
@@ -12,7 +12,8 @@ pub fn net_init() -> Result<(), SystemError> {
 }
 
 fn dhcp_query() -> Result<(), SystemError> {
-    let binding = NET_DEVICES.write_irqsave();
+    // let binding = NET_DEVICES.write_irqsave();
+    let binding = INIT_NET_NAMESPACE.device_list_mut();
 
     let net_face = binding
         .iter()
@@ -43,7 +44,7 @@ fn dhcp_query() -> Result<(), SystemError> {
         sockets().remove(dhcp_handle);
     });
 
-    const DHCP_TRY_ROUND: u8 = 100;
+    const DHCP_TRY_ROUND: u8 = 10;
     for i in 0..DHCP_TRY_ROUND {
         log::debug!("DHCP try round: {}", i);
         net_face.poll();

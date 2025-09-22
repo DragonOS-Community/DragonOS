@@ -1,5 +1,8 @@
+pub(super) mod datagram_common;
+
 use crate::net::socket::{
-    self, inet::syscall::create_inet_socket, unix::create_unix_socket, Socket,
+    self, inet::syscall::create_inet_socket, netlink::create_netlink_socket,
+    unix::create_unix_socket, Socket,
 };
 use alloc::sync::Arc;
 use system_error::SystemError;
@@ -27,6 +30,7 @@ pub fn create_socket(
             is_nonblock,
         )?,
         AF::Unix => create_unix_socket(socket_type, is_nonblock)?,
+        AF::Netlink => create_netlink_socket(socket_type, protocol, is_nonblock)?,
         _ => {
             log::warn!("unsupport address family");
             return Err(SystemError::EAFNOSUPPORT);

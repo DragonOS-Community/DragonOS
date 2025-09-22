@@ -7,11 +7,13 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
+use crate::driver::net::types::InterfaceFlags;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::net::{generate_iface_id, NET_DEVICES};
+use crate::net::generate_iface_id;
+use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use crate::time::Instant;
 use alloc::collections::VecDeque;
 use alloc::fmt::Debug;
@@ -88,6 +90,7 @@ impl phy::TxToken for LoopbackTxToken {
     }
 }
 
+#[derive(Default)]
 /// ## Loopback设备
 /// 成员是一个队列，用来存放接受到的数据包。
 /// 当使用lo发送数据包时，不会把数据包传到link层，而是直接发送到该队列，实现环回。
@@ -97,12 +100,6 @@ pub struct Loopback {
 }
 
 impl Loopback {
-    /// ## Loopback创建函数
-    /// 创建lo设备
-    pub fn new() -> Self {
-        let queue = VecDeque::new();
-        Loopback { queue }
-    }
     /// ## Loopback处理接受到的数据包函数
     /// Loopback接受到数据后会调用这个函数来弹出接收的数据，返回给协议栈
     ///
@@ -172,10 +169,10 @@ pub struct LoopbackDriver {
     pub inner: Arc<SpinLock<Loopback>>,
 }
 
-impl LoopbackDriver {
+impl Default for LoopbackDriver {
     /// ## LoopbackDriver创建函数
-    pub fn new() -> Self {
-        let inner = Arc::new(SpinLock::new(Loopback::new()));
+    fn default() -> Self {
+        let inner = Arc::new(SpinLock::new(Loopback::default()));
         LoopbackDriver { inner }
     }
 }
@@ -325,9 +322,19 @@ impl LoopbackInterface {
                 .expect("Add default ipv4 route failed: full");
         });
 
+        let flags = InterfaceFlags::LOOPBACK
+            | InterfaceFlags::UP
+            | InterfaceFlags::RUNNING
+            | InterfaceFlags::LOWER_UP;
+
         Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
-            common: IfaceCommon::new(iface_id, false, iface),
+            common: IfaceCommon::new(
+                iface_id,
+                super::types::InterfaceType::LOOPBACK,
+                flags,
+                iface,
+            ),
             inner: SpinLock::new(InnerLoopbackInterface {
                 netdevice_common: NetDeviceCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -485,7 +492,7 @@ impl Iface for LoopbackInterface {
         smoltcp::wire::EthernetAddress(mac)
     }
 
-    fn poll(&self) {
+    fn poll(&self) -> bool {
         self.common.poll(self.driver.force_get_mut())
     }
 
@@ -513,24 +520,39 @@ impl Iface for LoopbackInterface {
     fn set_operstate(&self, state: Operstate) {
         self.inner().netdevice_common.operstate = state;
     }
+
+    fn mtu(&self) -> usize {
+        use smoltcp::phy::Device;
+
+        self.driver
+            .force_get_mut()
+            .capabilities()
+            .max_transmission_unit
+    }
+}
+
+pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
+    let iface = LoopbackInterface::new(LoopbackDriver::default());
+    // 标识网络设备已经启动
+    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+
+    register_netdevice(iface.clone()).expect("register lo device failed");
+
+    iface
 }
 
 pub fn loopback_probe() {
     loopback_driver_init();
 }
+
 /// # lo网卡设备初始化函数
 /// 创建驱动和iface，初始化一个lo网卡，添加到全局NET_DEVICES中
 pub fn loopback_driver_init() {
-    let driver = LoopbackDriver::new();
-    let iface = LoopbackInterface::new(driver);
-    // 标识网络设备已经启动
-    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+    let iface = generate_loopback_iface_default();
 
-    NET_DEVICES
-        .write_irqsave()
-        .insert(iface.nic_id(), iface.clone());
-
-    register_netdevice(iface.clone()).expect("register lo device failed");
+    INIT_NET_NAMESPACE.add_device(iface.clone());
+    INIT_NET_NAMESPACE.set_loopback_iface(iface.clone());
+    iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
 }
 
 /// ## lo网卡设备的注册函数

@@ -36,8 +36,8 @@ pub(super) fn do_kernel_shmget(
     }
 
     // 从当前进程的 IPC 命名空间获取 per-ns SHM 管理器
-    let nsproxy = ProcessManager::current_pcb().nsproxy();
-    let mut shm_manager_guard = nsproxy.ipc_ns.shm.lock();
+    let ipcns = ProcessManager::current_ipcns();
+    let mut shm_manager_guard = ipcns.shm.lock();
     match key {
         // 创建共享内存段
         IPC_PRIVATE => shm_manager_guard.add(key, size, shmflg),

@@ -30,8 +30,8 @@ pub(super) fn do_kernel_shmctl(
     from_user: bool,
 ) -> Result<usize, SystemError> {
     // per-ns 管理器
-    let nsproxy = ProcessManager::current_pcb().nsproxy();
-    let mut shm_manager_guard = nsproxy.ipc_ns.shm.lock();
+    let ipcns = ProcessManager::current_ipcns();
+    let mut shm_manager_guard = ipcns.shm.lock();
 
     match cmd {
         // 查看共享内存元信息

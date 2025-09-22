@@ -11,8 +11,8 @@ use crate::process::{
 };
 use core::{fmt::Debug, intrinsics::likely};
 
-use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
 use super::ipc_namespace::{IpcNamespace, INIT_IPC_NAMESPACE};
+use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///

@@ -1,8 +1,10 @@
 use alloc::sync::{Arc, Weak};
 
-use crate::libs::spinlock::SpinLock;
-use crate::process::namespace::{nsproxy::NsCommon, user_namespace::UserNamespace, NamespaceOps, NamespaceType};
 use crate::ipc::shm::ShmManager;
+use crate::libs::spinlock::SpinLock;
+use crate::process::namespace::{
+    nsproxy::NsCommon, user_namespace::UserNamespace, NamespaceOps, NamespaceType,
+};
 use crate::process::ProcessManager;
 
 // 根 IPC 命名空间
@@ -66,5 +68,3 @@ impl ProcessManager {
         }
     }
 }
-
-

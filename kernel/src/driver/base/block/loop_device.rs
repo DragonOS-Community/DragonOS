@@ -33,7 +33,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use bitmap::traits::BitMapOps;
 use core::{
     any::Any,
     fmt::{Debug, Formatter},
@@ -55,18 +54,27 @@ pub struct LoopDevice {
 }
 //Inner内数据会改变所以加锁
 pub struct LoopDeviceInner {
+    // 设备名称 Major和Minor
+    pub device_number: DeviceNumber,
+    //状态管理
+    state: LoopState,
+    state_lock: SpinLock<()>,
+    //后端文件相关
     // 关联的文件节点
     pub file_inode: Option<Arc<dyn IndexNode>>,
     // 文件大小
     pub file_size: usize,
-    // 设备名称 Major和Minor
-    pub device_number: DeviceNumber,
     // 数据偏移量
     pub offset: usize,
     // 数据大小限制
     pub size_limit: usize,
+    //文件名缓存
+    pub file_name: u8,
+
     // 是否允许用户直接 I/O 操作
     pub user_direct_io: bool,
+    //标志位
+    pub flags: u32,
     // 是否只读
     pub read_only: bool,
     // 是否可见
@@ -77,6 +85,31 @@ pub struct LoopDeviceInner {
     pub kobject_common: KObjectCommonData,
     // 设备的公共数据
     pub device_common: DeviceCommonData,
+    //工作管理 todo
+    //work_queue: Option<Arc<WorkQueue>>,
+}
+impl LoopDeviceInner{
+    fn set_state(&mut self, new_state: LoopState) -> Result<(), SystemError> {
+        let _guard = self.state_lock.lock();
+        
+        // 状态转换检查
+        match (&self.state, &new_state) {
+            (LoopState::Unbound, LoopState::Bound) => {},
+            (LoopState::Bound, LoopState::Unbound) => {},
+            (LoopState::Bound, LoopState::Rundown) => {},
+            (LoopState::Rundown, LoopState::Deleting) => {},
+            _ => return Err(SystemError::EINVAL),
+        }
+        
+        self.state = new_state;
+        Ok(())
+    }
+}
+pub enum LoopState {
+    Unbound,
+    Bound,
+    Rundown,
+    Deleting,
 }
 impl Debug for LoopDevice {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
@@ -106,6 +139,11 @@ impl LoopDevice {
                 self_ref: self_ref.clone(),
                 kobject_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
+                file_name: 0,
+                flags: 0,
+                state: LoopState::Unbound,
+                state_lock: SpinLock::new(()),
+                //work_queue: None,
             }),
             //只用重复8次，就会有从0-7八个次设备号
             block_dev_meta: BlockDevMeta::new(devname, Major::new(7)), // Loop 设备主设备号为 7
@@ -460,7 +498,7 @@ pub struct LoopDeviceDriver {
     inner: SpinLock<InnerLoopDeviceDriver>,
     kobj_state: LockedKObjectState,
 }
-struct InnerLoopDeviceDriver{
+struct InnerLoopDeviceDriver {
     driver_common: DriverCommonData,
     kobj_common: KObjectCommonData,
 }
@@ -473,9 +511,8 @@ impl Debug for InnerLoopDeviceDriver {
     }
 }
 impl LoopDeviceDriver {
-    
     pub fn new() -> Arc<Self> {
-        let inner = InnerLoopDeviceDriver{
+        let inner = InnerLoopDeviceDriver {
             driver_common: DriverCommonData::default(),
             kobj_common: KObjectCommonData::default(),
         };
@@ -487,14 +524,11 @@ impl LoopDeviceDriver {
     fn inner(&self) -> SpinLockGuard<InnerLoopDeviceDriver> {
         self.inner.lock()
     }
-    fn loop_init(&self) -> Result<(), SystemError> {
-        // 创建并初始化 LoopManager 单例
-     //   let loop_mgr = LOOP_MANAGER.call_once(|| LoopManager::new());
-        for minor in 0..LoopManager::MAX_DEVICES {
-            let devname = DevName::new(format!("{}{}", LOOP_BASENAME, minor), minor);
-            if let Some(loop_dev) = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32) {
-                log::info!(
-                    "Registering loop device: {}",
+    fn new_loop_device(&self, minor: usize) -> Result<(), SystemError> {
+        let devname = DevName::new(format!("{}{}", LOOP_BASENAME, minor), minor);
+        if let Some(loop_dev) = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32) {
+            log::info!(
+                "Registering loop device: {}",
                 loop_dev.block_dev_meta.devname
             );
             block_dev_manager().register(loop_dev.clone())?;
@@ -503,30 +537,34 @@ impl LoopDeviceDriver {
         } else {
             error!("Failed to create loop device for minor {}", minor);
         }
-    }
-        // // 创建并注册 /dev/loop-control
-        // let control_dev = Arc::new(LoopControlDevice::new()); // 假设的构造函数
-        // block_dev_manager().register(control_dev.clone())?;
-        // devfs::devfs_register("loop-control", control_dev.clone())?;
-        // info!("LoopDeviceDriver and all devices initialized.");
         Ok(())
     }
+    // pub fn new_loop_ctrl_device(&self)-> Result<(), SystemError>{
+    //     // 创建并注册 /dev/loop-control
+    //     let control_dev = Arc::new(LoopControlDevice::new()); // 假设的构造函数
+    //     block_dev_manager().register(control_dev.clone())?;
+    //     devfs::devfs_register("loop-control", control_dev.clone())?;
+    //     log::info!("LoopDeviceDriver and all devices initialized.");
+    //     Ok(())
+    // }
 }
 use crate::init::initcall::INITCALL_DEVICE;
 #[unified_init(INITCALL_DEVICE)]
-pub fn loop_init()-> Result<(), SystemError> {
+pub fn loop_init() -> Result<(), SystemError> {
+    let loop_mgr = LoopManager::new();
     // 获取 LoopDeviceDriver 的单例并调用初始化函数
     let driver = LoopDeviceDriver::new();
-    driver.loop_init()
-}
+    loop_mgr.loop_init(driver)?;
 
+    Ok(())
+}
 
 impl Driver for LoopDeviceDriver {
     fn id_table(&self) -> Option<IdTable> {
         Some(IdTable::new("loop".to_string(), None))
     }
 
-     fn devices(&self) -> Vec<Arc<dyn Device>> {
+    fn devices(&self) -> Vec<Arc<dyn Device>> {
         self.inner().driver_common.devices.clone()
     }
 
@@ -604,18 +642,76 @@ impl KObject for LoopDeviceDriver {
         *self.kobj_state.write() = state;
     }
 }
-pub struct LoopControlDevice {
-    locked_kobj_state: LockedKObjectState,
-    inner: SpinLock<LoopControlDeviceInner>,
-}
 
-pub struct LoopControlDeviceInner {
-    kobject_common: KObjectCommonData,
-    device_common: DeviceCommonData,
-}
 pub struct LoopManager {
-    devices: Vec<Arc<LoopDevice>>,
+    inner: SpinLock<LoopManagerInner>,
+}
+pub struct LoopManagerInner {
+    devices: [Option<Arc<LoopDevice>>; LoopManager::MAX_DEVICES],
 }
 impl LoopManager {
-    const MAX_DEVICES: usize =8;
+    const MAX_DEVICES: usize = 8;
+    pub fn new() -> Self {
+        Self {
+            inner: SpinLock::new(LoopManagerInner {
+                devices: [const { None }; Self::MAX_DEVICES],
+            }),
+        }
+    }
+    fn inner(&self) -> SpinLockGuard<LoopManagerInner> {
+        self.inner.lock()
+    }
+    //index: 次设备号
+    pub fn register_device(&self, index: usize, device: Arc<LoopDevice>) {
+        if index < Self::MAX_DEVICES {
+            self.inner().devices[index] = Some(device);
+        }
+    }
+
+    // 动态分配空闲的loop设备，与指定文件inode关联
+    pub fn alloc_device(
+        &self,
+        file_inode: Arc<dyn IndexNode>,
+    ) -> Result<Arc<LoopDevice>, SystemError> {
+        let mut inner = self.inner();
+        for (i, device) in inner.devices.iter_mut().enumerate() {
+            if device.is_none() {
+                let devname = DevName::new(format!("{}{}", LOOP_BASENAME, i), i as usize);
+                let loop_device = LoopDevice::new_empty_loop_device(devname, i as u32)
+                    .ok_or(SystemError::ENOMEM)?;
+                loop_device.set_file(file_inode.clone())?;
+                *device = Some(loop_device.clone());
+                return Ok(loop_device);
+            }
+        }
+        Err(SystemError::ENOSPC)
+    }
+    pub fn loop_init(&self, driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {
+
+        //注册loop_control设备
+        // let loop_ctl=Arc::new(LoopControlDevice::new());
+        // DevFS::register_device("loop-control",loop_ctl.clone())?;
+
+        // 注册 loop 设备
+        for minor in 0..Self::MAX_DEVICES {
+            driver.new_loop_device(minor)?;
+        }
+        log::info!("Loop devices initialized");
+
+        //添加到loop_manager中
+
+        log::info!("LoopDeviceDriver and all devices initialized.");
+        Ok(())
+    }
+    // pub fn loop_add(&self)
+
+    // pub fn loop_control_remove
+    // pub loop_control_get_free(&self) -> Result<usize, SystemError> {
+    //     let inner = self.inner();
+    //     for (i, device) in inner.devices.iter().enumerate() {
+    //         if device.is_none() {
+    //             return Ok(i);
+    //         }
+    //     }
+    //     Err(SystemError::ENOSPC)
 }

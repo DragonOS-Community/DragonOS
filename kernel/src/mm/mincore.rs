@@ -24,7 +24,7 @@ impl LockedVMA {
             vec[offset..offset + pages].fill(0);
             return Ok(());
         }
-        //todo: 处理大页
+        // 支持多级页表遍历；在遇到大页时按4K粒度填充
         self.mincore_walk_page_range(mapper, start_addr, end_addr, 3, vec, offset);
         Ok(())
     }
@@ -44,7 +44,13 @@ impl LockedVMA {
             let entry_size = MMArch::PAGE_SIZE << (level * MMArch::PAGE_ENTRY_SHIFT);
             let next = core::cmp::min(end_addr, start + entry_size);
             if let Some(entry) = mapper.get_entry(start, level) {
-                if level > 0 {
+                // 大页处理：当上层条目标记为大页时，按子页数量批量填充
+                if level > 0 && entry.flags().has_flag(MMArch::ENTRY_FLAG_HUGE_PAGE) {
+                    let sub_pages = (next - start) >> MMArch::PAGE_SHIFT;
+                    let val = if entry.present() { 1 } else { 0 };
+                    vec[vec_offset + page_count..vec_offset + page_count + sub_pages].fill(val);
+                    page_count += sub_pages;
+                } else if level > 0 {
                     let sub_pages = self.mincore_walk_page_range(
                         mapper,
                         start,

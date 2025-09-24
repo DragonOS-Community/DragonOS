@@ -30,7 +30,10 @@ impl Syscall for SysMincoreHandle {
         let start_vaddr = VirtAddr::new(Self::start_vaddr(args));
         let len = Self::len(args);
         let vec = Self::vec(args);
-        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
+        // 未对齐返回 EINVAL，而不是触发 panic
+        if !start_vaddr.check_aligned(MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
 
         if verify_area(start_vaddr, len).is_err() {
             return Err(SystemError::ENOMEM);
@@ -43,11 +46,12 @@ impl Syscall for SysMincoreHandle {
         let start_frame = VirtPageFrame::new(start_vaddr);
         let page_count = len >> MMArch::PAGE_SHIFT;
 
-        let mut writer = UserBufferWriter::new(vec as *mut u8, page_count, true)?;
-        let mut buf: &mut [u8] = writer.buffer(0).unwrap();
+        // 严格验证 vec 映射与写权限，失败返回 EFAULT
+        let mut writer = UserBufferWriter::new_checked(vec as *mut u8, page_count, true)?;
+        let buf: &mut [u8] = writer.buffer(0)?;
         let page_count = PageFrameCount::new(page_count);
         current_address_space
-            .write()
+            .read()
             .mincore(start_frame, page_count, buf)?;
         return Ok(0);
     }

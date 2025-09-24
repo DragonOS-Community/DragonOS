@@ -54,21 +54,19 @@ build:
 # 下载测试套件
 download:
 	@echo "下载gvisor测试套件..."
-	@./download_tests.sh
+	@./download_tests.sh --skip-if-exists
 
 # 安装到目标目录
-install: build
+install: build download
 	@echo "安装gvisor测试套件到 $(INSTALL_DIR)"
 	@mkdir -p $(INSTALL_DIR)
 	# 安装Rust测试运行器二进制文件
 	@cp -f runner/target/$(RUST_TARGET)/release/runner $(INSTALL_DIR)/gvisor-test-runner
+	@chmod +x $(INSTALL_DIR)/gvisor-test-runner
 	# 安装测试配置文件
 	@cp -f whitelist.txt $(INSTALL_DIR)/
 	@cp -rf blocklists $(INSTALL_DIR)/
-	# 安装下载脚本（用于目标系统上下载测试）
-	@cp -f download_tests.sh $(INSTALL_DIR)/
-	@chmod +x $(INSTALL_DIR)/download_tests.sh
-	@chmod +x $(INSTALL_DIR)/gvisor-test-runner
+	@cp -rf tests $(INSTALL_DIR)/
 	@echo "安装完成"
 
 # 运行测试

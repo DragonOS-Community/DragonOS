@@ -398,7 +398,7 @@ impl InnerAddressSpace {
         drop(fd_table_guard);
 
         // offset需要4K对齐
-        if !offset & (MMArch::PAGE_SIZE - 1) == 0 {
+        if (offset & (MMArch::PAGE_SIZE - 1)) != 0 {
             return Err(SystemError::EINVAL);
         }
         let pgoff = offset >> MMArch::PAGE_SHIFT;
@@ -435,7 +435,10 @@ impl InnerAddressSpace {
         // todo!(impl mmap for other file)
         // https://github.com/DragonOS-Community/DragonOS/pull/912#discussion_r1765334272
         let file = file.unwrap();
-        let _ = file.inode().mmap(start_vaddr.data(), len, offset);
+        // 传入实际映射后的起始虚拟地址，而非用户传入的 hint
+        let _ = file
+            .inode()
+            .mmap(start_page.virt_address().data(), len, offset);
         return Ok(start_page);
     }
 
@@ -704,6 +707,45 @@ impl InnerAddressSpace {
         return Ok(());
     }
 
+    pub fn mincore(
+        &self,
+        start_page: VirtPageFrame,
+        page_count: PageFrameCount,
+        vec: &mut [u8],
+    ) -> Result<(), SystemError> {
+        let mapper = &self.user_mapper.utable;
+
+        if self.mappings.contains(start_page.virt_address()).is_none() {
+            return Err(SystemError::ENOMEM);
+        }
+
+        let mut last_vaddr = start_page.virt_address();
+        let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+        let mut vmas = self.mappings.conflicts(region).collect::<Vec<_>>();
+        // 为保证与地址连续性的判断正确，这里按起始地址升序遍历
+        vmas.sort_by_key(|v| v.lock_irqsave().region().start().data());
+        let mut offset = 0;
+        for v in vmas {
+            let region = *v.lock_irqsave().region();
+            // 保证相邻的两个vma连续
+            if region.start() != last_vaddr && last_vaddr != start_page.virt_address() {
+                return Err(SystemError::ENOMEM);
+            }
+            let start_vaddr = last_vaddr;
+            let end_vaddr = core::cmp::min(region.end(), start_vaddr + page_count.bytes());
+            v.do_mincore(mapper, vec, start_vaddr, end_vaddr, offset)?;
+            let page_count_this_vma = (end_vaddr - start_vaddr) >> MMArch::PAGE_SHIFT;
+            offset += page_count_this_vma;
+            last_vaddr = end_vaddr;
+        }
+
+        // 校验覆盖完整性：若末尾未覆盖到请求范围，则返回 ENOMEM
+        if last_vaddr != region.end() {
+            return Err(SystemError::ENOMEM);
+        }
+
+        return Ok(());
+    }
     pub fn madvise(
         &mut self,
         start_page: VirtPageFrame,
@@ -974,9 +1016,10 @@ impl UserMappings {
             if guard.region.contains(vaddr) {
                 return Some(v.clone());
             }
-            if guard.region.start >= vaddr
-                && if let Some(ref nearest) = nearest {
-                    guard.region.start < nearest.lock_irqsave().region.start
+            // 选择起始地址不大于 vaddr 的 VMA 中，起始地址最大的一个
+            if guard.region.start <= vaddr
+                && if let Some(ref current) = nearest {
+                    guard.region.start > current.lock_irqsave().region.start
                 } else {
                     true
                 }

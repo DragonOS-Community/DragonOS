@@ -126,7 +126,7 @@
     "hash": "72efe542c7854926ac0f33287345b856"
   },
   "en:kernel/ipc/index.rst": {
-    "hash": "bbc40e0a41a1467dbdd42196c443f1ef"
+    "hash": "e75d2ff6a7b8a4e6f32b2adee7756298"
   },
   "en:kernel/boot/index.rst": {
     "hash": "8fe854f9c48d4e2e3fee0cf7f3526dfe"
@@ -289,5 +289,8 @@
   },
   "en:kernel/net/unix.md": {
     "hash": "73ec9615b972824183480217036a89a7"
+  },
+  "en:kernel/ipc/ipc_namespace.md": {
+    "hash": "52df04d6a276b42617f7b79bbbffa61e"
   }
 }

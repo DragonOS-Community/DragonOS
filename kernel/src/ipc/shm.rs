@@ -1,10 +1,7 @@
 use crate::{
     arch::mm::LockedFrameAllocator,
     filesystem::vfs::syscall::ModeType,
-    libs::{
-        align::page_align_up,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
+    libs::align::page_align_up,
     mm::{
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
         page::{page_manager_lock_irqsave, PageFlags, PageType},
@@ -15,32 +12,13 @@ use crate::{
     time::PosixTimeSpec,
 };
 use core::fmt;
-use core::sync::atomic::{compiler_fence, Ordering};
 use hashbrown::HashMap;
 use ida::IdAllocator;
-use log::info;
 use num::ToPrimitive;
 use system_error::SystemError;
-pub static mut SHM_MANAGER: Option<SpinLock<ShmManager>> = None;
 
 /// 用于创建新的私有IPC对象
 pub const IPC_PRIVATE: ShmKey = ShmKey::new(0);
-
-/// 初始化SHM_MANAGER
-pub fn shm_manager_init() {
-    info!("shm_manager_init");
-    let shm_manager = SpinLock::new(ShmManager::new());
-
-    compiler_fence(Ordering::SeqCst);
-    unsafe { SHM_MANAGER = Some(shm_manager) };
-    compiler_fence(Ordering::SeqCst);
-
-    info!("shm_manager_init done");
-}
-
-pub fn shm_manager_lock() -> SpinLockGuard<'static, ShmManager> {
-    unsafe { SHM_MANAGER.as_ref().unwrap().lock() }
-}
 
 int_like!(ShmId, usize);
 int_like!(ShmKey, usize);
@@ -138,6 +116,12 @@ pub struct ShmManager {
     key2id: HashMap<ShmKey, ShmId>,
 }
 
+impl Default for ShmManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShmManager {
     pub fn new() -> Self {
         ShmManager {
@@ -178,7 +162,7 @@ impl ShmManager {
         // 创建共享内存page，并添加到PAGE_MANAGER中
         let mut page_manager_guard = page_manager_lock_irqsave();
         let (paddr, _page) = page_manager_guard.create_pages(
-            PageType::Shm(shm_id),
+            PageType::Shm,
             PageFlags::PG_UNEVICTABLE,
             &mut LockedFrameAllocator,
             page_count,

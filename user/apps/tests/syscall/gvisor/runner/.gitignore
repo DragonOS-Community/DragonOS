@@ -1,0 +1,21 @@
+# Rust构建产物
+/target/
+Cargo.lock
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*~
+*.tmp
+*.bak
+
+# 测试输出文件（如果在此目录运行）
+/results/

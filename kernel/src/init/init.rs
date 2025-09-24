@@ -33,6 +33,7 @@ use log::warn;
 use super::{
     boot::{boot_callback_except_early, boot_callbacks},
     cmdline::kenrel_cmdline_param_manager,
+    version_info::get_kernel_build_info,
 };
 
 /// The entry point for the kernel
@@ -54,6 +55,9 @@ pub fn start_kernel() -> ! {
 #[inline(never)]
 fn do_start_kernel() {
     init_before_mem_init();
+
+    // Print kernel version information after early init
+    print_kernel_version();
 
     unsafe { mm_init() };
 
@@ -120,4 +124,28 @@ fn init_before_mem_init() {
         })
         .ok();
     kenrel_cmdline_param_manager().early_init();
+}
+
+/// Print kernel version information similar to Linux boot message
+#[inline(never)]
+fn print_kernel_version() {
+    let info = get_kernel_build_info();
+
+    // Log version information similar to Linux format
+    log::info!(
+        "DragonOS release {} version {} ({}) #{}",
+        info.release,
+        info.version,
+        info.compiler_info.split(' ').next().unwrap_or("unknown"),
+        info.git_commit,
+    );
+
+    log::info!(
+        "build time: {} | git branch: {} | git commit: {} | build: {}@{}",
+        info.build_time,
+        info.git_branch,
+        info.git_commit,
+        info.build_user,
+        info.build_host,
+    );
 }

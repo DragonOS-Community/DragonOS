@@ -1,7 +1,7 @@
 use crate::{
     filesystem::vfs::{
         mount::{MountFlags, MountList, MountPath},
-        FileSystem, IndexNode, MountFS,
+        FileSystem, IndexNode, InodeId, MountFS,
     },
     libs::{once::Once, spinlock::SpinLock},
     process::{fork::CloneFlags, namespace::NamespaceType, ProcessManager},
@@ -39,8 +39,6 @@ pub fn root_mnt_namespace() -> Arc<MntNamespace> {
 pub struct MntNamespace {
     ns_common: NsCommon,
     self_ref: Weak<MntNamespace>,
-    /// 父namespace的弱引用
-    _parent: Option<Weak<MntNamespace>>,
     _user_ns: Arc<UserNamespace>,
     root_mountfs: Arc<MountFS>,
     inner: SpinLock<InnerMntNamespace>,
@@ -73,7 +71,6 @@ impl MntNamespace {
         let result = Arc::new_cyclic(|self_ref| Self {
             ns_common: NsCommon::new(0, NamespaceType::Mount),
             self_ref: self_ref.clone(),
-            _parent: None,
             _user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
             root_mountfs: ramfs.clone(),
             inner: SpinLock::new(InnerMntNamespace {
@@ -84,7 +81,7 @@ impl MntNamespace {
 
         ramfs.set_namespace(Arc::downgrade(&result));
         result
-            .add_mount(Arc::new(MountPath::from("/")), ramfs)
+            .add_mount(None, Arc::new(MountPath::from("/")), ramfs)
             .expect("Failed to add root mount");
 
         return result;
@@ -100,7 +97,32 @@ impl MntNamespace {
         self_mut.root_mountfs = new_root.clone();
         let (path, _, _) = inner_guard.mount_list.get_mount_point("/").unwrap();
 
-        inner_guard.mount_list.insert(path, new_root);
+        inner_guard.mount_list.insert(None, path, new_root);
+
+        // update mount list ino
+    }
+
+    fn copy_with_mountfs(&self, new_root: Arc<MountFS>, _user_ns: Arc<UserNamespace>) -> Arc<Self> {
+        let mut ns_common = self.ns_common.clone();
+        ns_common.level += 1;
+
+        let result = Arc::new_cyclic(|self_ref| Self {
+            ns_common,
+            self_ref: self_ref.clone(),
+            _user_ns,
+            root_mountfs: new_root.clone(),
+            inner: SpinLock::new(InnerMntNamespace {
+                _dead: false,
+                mount_list: MountList::new(),
+            }),
+        });
+
+        new_root.set_namespace(Arc::downgrade(&result));
+        result
+            .add_mount(None, Arc::new(MountPath::from("/")), new_root)
+            .expect("Failed to add root mount");
+
+        result
     }
 
     /// Creates a copy of the mount namespace for process cloning.
@@ -119,17 +141,94 @@ impl MntNamespace {
     /// # Behavior
     /// - If `CLONE_NEWNS` is not set, returns the current mount namespace
     /// - If `CLONE_NEWNS` is set, creates a new mount namespace (currently unimplemented)
+    #[inline(never)]
     pub fn copy_mnt_ns(
         &self,
         clone_flags: &CloneFlags,
-        _user_ns: Arc<UserNamespace>,
+        user_ns: Arc<UserNamespace>,
     ) -> Result<Arc<MntNamespace>, SystemError> {
         if !clone_flags.contains(CloneFlags::CLONE_NEWNS) {
             // Return the current mount namespace if CLONE_NEWNS is not set
             return Ok(self.self_ref.upgrade().unwrap());
         }
+        let inner = self.inner.lock();
 
-        todo!("Implement MntNamespace::copy_mnt_ns");
+        let old_root_mntfs = self.root_mntfs().clone();
+        let mut queue: Vec<MountFSCopyInfo> = Vec::new();
+
+        // 由于root mntfs比较特殊，因此单独复制。
+        let new_root_mntfs = old_root_mntfs.deepcopy(None);
+        let new_mntns = self.copy_with_mountfs(new_root_mntfs, user_ns);
+        new_mntns
+            .add_mount(
+                None,
+                Arc::new(MountPath::from("/")),
+                new_mntns.root_mntfs().clone(),
+            )
+            .expect("Failed to add root mount");
+
+        for x in inner.mount_list.clone_inner().values() {
+            if Arc::ptr_eq(x, new_mntns.root_mntfs()) {
+                continue; // Skip the root mountfs
+            }
+        }
+        // 将root mntfs下的所有挂载点复制到新的mntns中
+        for (ino, mfs) in old_root_mntfs.mountpoints().iter() {
+            let mount_path = inner
+                .mount_list
+                .get_mount_path_by_ino(*ino)
+                .ok_or_else(|| {
+                    panic!(
+                        "mount_path not found for inode {:?}, mfs name: {}",
+                        ino,
+                        mfs.name()
+                    );
+                })
+                .unwrap();
+
+            queue.push(MountFSCopyInfo {
+                old_mount_fs: mfs.clone(),
+                parent_mount_fs: new_mntns.root_mntfs().clone(),
+                self_mp_inode_id: *ino,
+                mount_path,
+            });
+        }
+
+        // 处理队列中的挂载点
+        while let Some(data) = queue.pop() {
+            let old_self_mp = data.old_mount_fs.self_mountpoint().unwrap();
+            let new_self_mp = old_self_mp.clone_with_new_mount_fs(data.parent_mount_fs.clone());
+            let new_mount_fs = data.old_mount_fs.deepcopy(Some(new_self_mp));
+            data.parent_mount_fs
+                .add_mount(data.self_mp_inode_id, new_mount_fs.clone())
+                .expect("Failed to add mount");
+            new_mntns
+                .add_mount(
+                    Some(data.self_mp_inode_id),
+                    data.mount_path.clone(),
+                    new_mount_fs.clone(),
+                )
+                .expect("Failed to add mount to mount namespace");
+
+            // 原有的挂载点的子挂载点加入队列中
+
+            for (child_ino, child_mfs) in data.old_mount_fs.mountpoints().iter() {
+                queue.push(MountFSCopyInfo {
+                    old_mount_fs: child_mfs.clone(),
+                    parent_mount_fs: new_mount_fs.clone(),
+                    self_mp_inode_id: *child_ino,
+                    mount_path: inner
+                        .mount_list
+                        .get_mount_path_by_ino(*child_ino)
+                        .expect("mount_path not found"),
+                });
+            }
+        }
+
+        // todo: 注册到procfs
+
+        // 返回新创建的mount namespace
+        Ok(new_mntns)
     }
 
     pub fn root_mntfs(&self) -> &Arc<MountFS> {
@@ -143,10 +242,11 @@ impl MntNamespace {
 
     pub fn add_mount(
         &self,
+        ino: Option<InodeId>,
         mount_path: Arc<MountPath>,
         mntfs: Arc<MountFS>,
     ) -> Result<(), SystemError> {
-        self.inner.lock().mount_list.insert(mount_path, mntfs);
+        self.inner.lock().mount_list.insert(ino, mount_path, mntfs);
         return Ok(());
     }
 
@@ -276,3 +376,16 @@ impl ProcessManager {
         }
     }
 }
+
+struct MountFSCopyInfo {
+    old_mount_fs: Arc<MountFS>,
+    parent_mount_fs: Arc<MountFS>,
+    self_mp_inode_id: InodeId,
+    mount_path: Arc<MountPath>,
+}
+
+// impl Drop for MntNamespace {
+//     fn drop(&mut self) {
+//         log::warn!("mntns (level: {}) dropped", self.ns_common.level);
+//     }
+// }

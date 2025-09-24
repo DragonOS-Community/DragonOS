@@ -14,6 +14,7 @@ use alloc::{
 };
 use cred::INIT_CRED;
 use hashbrown::HashMap;
+use intertrait::cast::CastArc;
 use log::{debug, error, info, warn};
 use pid::{alloc_pid, Pid, PidLink, PidType};
 use process_group::Pgid;
@@ -34,12 +35,12 @@ use crate::{
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
+        sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending, SignalFlags, SignalStruct},
+        signal_types::{SigInfo, SigPending},
     },
     libs::{
         align::AlignedBox,
-        casting::DowncastArc,
         futex::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::{Futex, RobustListHead},
@@ -55,7 +56,7 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    net::socket::SocketInode,
+    net::socket::Socket,
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
         cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
@@ -741,8 +742,8 @@ pub struct ProcessControlBlock {
     arch_info: SpinLock<ArchPCBInfo>,
     /// 与信号处理相关的信息(似乎可以是无锁的)
     sig_info: RwLock<ProcessSignalInfo>,
-    /// 信号处理结构体
-    sig_struct: SpinLock<SignalStruct>,
+    sighand: RwLock<Arc<SigHand>>,
+
     /// 退出信号S
     exit_signal: AtomicSignal,
 
@@ -881,7 +882,7 @@ impl ProcessControlBlock {
                 sched_info,
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
-                sig_struct: SpinLock::new(SignalStruct::new()),
+                sighand: RwLock::new(SigHand::new()),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb),
@@ -1071,6 +1072,8 @@ impl ProcessControlBlock {
 
     /// 根据文件描述符序号，获取socket对象的Arc指针
     ///
+    /// this is a helper function
+    ///
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
@@ -1078,21 +1081,24 @@ impl ProcessControlBlock {
     /// ## 返回值
     ///
     /// Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
-    pub fn get_socket(&self, fd: i32) -> Option<Arc<SocketInode>> {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let f = fd_table_guard.get_file_by_fd(fd)?;
-        drop(fd_table_guard);
+    pub fn get_socket(&self, fd: i32) -> Result<Arc<dyn Socket>, SystemError> {
+        let f = ProcessManager::current_pcb()
+            .fd_table()
+            .read()
+            .get_file_by_fd(fd)
+            .ok_or({
+                // log::warn!("get_socket: fd {} not found", fd);
+                SystemError::EBADF
+            })?;
 
         if f.file_type() != FileType::Socket {
-            return None;
+            return Err(SystemError::EBADF);
         }
-        let socket: Arc<SocketInode> = f
-            .inode()
-            .downcast_arc::<SocketInode>()
-            .expect("Not a socket inode");
-        return Some(socket);
+        // log::info!("get_socket: fd {} is a socket", fd);
+        f.inode().cast::<dyn Socket>().map_err(|_| {
+            log::error!("get_socket: fd {} is not a socket", fd);
+            SystemError::EBADF
+        })
     }
 
     /// 当前进程退出时,让初始进程收养所有子进程
@@ -1195,9 +1201,14 @@ impl ProcessControlBlock {
     /// 判断当前进程是否有未处理的信号
     pub fn has_pending_signal(&self) -> bool {
         let sig_info = self.sig_info_irqsave();
-        let has_pending = sig_info.sig_pending().has_pending();
+        let has_pending_thread = sig_info.sig_pending().has_pending();
         drop(sig_info);
-        return has_pending;
+        if has_pending_thread {
+            return true;
+        }
+        // also check shared-pending in sighand
+        let shared = self.sighand().shared_pending_signal();
+        return !shared.is_empty();
     }
 
     /// 根据 pcb 的 flags 判断当前进程是否有未处理的信号
@@ -1221,24 +1232,6 @@ impl ProcessControlBlock {
         // );
         let has_not_masked = !pending.is_empty();
         return has_not_masked;
-    }
-
-    pub fn sig_struct(&self) -> SpinLockGuard<'_, SignalStruct> {
-        self.sig_struct.lock_irqsave()
-    }
-
-    pub fn try_sig_struct_irqsave(&self, times: u8) -> Option<SpinLockGuard<'_, SignalStruct>> {
-        for _ in 0..times {
-            if let Ok(r) = self.sig_struct.try_lock_irqsave() {
-                return Some(r);
-            }
-        }
-
-        return None;
-    }
-
-    pub fn sig_struct_irqsave(&self) -> SpinLockGuard<'_, SignalStruct> {
-        self.sig_struct.lock_irqsave()
     }
 
     #[inline(always)]
@@ -1971,9 +1964,7 @@ pub struct ProcessSignalInfo {
     saved_sigmask: SigSet,
     // sig_pending 中存储当前线程要处理的信号
     sig_pending: SigPending,
-    // sig_shared_pending 中存储当前线程所属进程要处理的信号
-    sig_shared_pending: SigPending,
-    flags: SignalFlags,
+
     // 当前进程对应的tty
     tty: Option<Arc<TtyCore>>,
     has_child_subreaper: bool,
@@ -2012,24 +2003,12 @@ impl ProcessSignalInfo {
         &mut self.saved_sigmask
     }
 
-    pub fn sig_shared_pending_mut(&mut self) -> &mut SigPending {
-        &mut self.sig_shared_pending
-    }
-
-    pub fn sig_shared_pending(&self) -> &SigPending {
-        &self.sig_shared_pending
-    }
-
     pub fn tty(&self) -> Option<Arc<TtyCore>> {
         self.tty.clone()
     }
 
     pub fn set_tty(&mut self, tty: Option<Arc<TtyCore>>) {
         self.tty = tty;
-    }
-
-    pub fn flags(&self) -> SignalFlags {
-        self.flags
     }
 
     /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号
@@ -2048,7 +2027,8 @@ impl ProcessSignalInfo {
         if res.0 != Signal::INVALID {
             return res;
         } else {
-            let res = self.sig_shared_pending.dequeue_signal(sig_mask);
+            let sighand = pcb.sighand();
+            let res = sighand.shared_pending_dequeue(sig_mask);
             pcb.recalc_sigpending(Some(self));
             return res;
         }
@@ -2077,12 +2057,10 @@ impl Default for ProcessSignalInfo {
             sig_blocked: SigSet::empty(),
             saved_sigmask: SigSet::empty(),
             sig_pending: SigPending::default(),
-            sig_shared_pending: SigPending::default(),
             tty: None,
             has_child_subreaper: false,
             is_child_subreaper: false,
             is_session_leader: false,
-            flags: SignalFlags::empty(),
         }
     }
 }

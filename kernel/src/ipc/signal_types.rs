@@ -1,11 +1,5 @@
-use core::{
-    ffi::c_void,
-    mem::size_of,
-    ops::{Deref, DerefMut},
-    sync::atomic::AtomicI64,
-};
+use core::{ffi::c_void, mem::size_of};
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -16,10 +10,7 @@ use crate::{
         ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
-    process::{
-        pid::{Pid, PidType},
-        RawPid,
-    },
+    process::RawPid,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -61,88 +52,7 @@ pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
     .union(Signal::into_sigset(Signal::SIGIO_OR_POLL))
     .union(Signal::into_sigset(Signal::SIGSYS));
 
-pub fn default_sighandlers() -> Vec<Sigaction> {
-    let mut r = vec![Sigaction::default(); MAX_SIG_NUM];
-    let mut sig_ign = Sigaction::default();
-    // 收到忽略的信号，重启系统调用
-    // todo: 看看linux哪些
-    sig_ign.flags_mut().insert(SigFlags::SA_RESTART);
-
-    r[Signal::SIGCHLD as usize - 1] = sig_ign;
-    r[Signal::SIGURG as usize - 1] = sig_ign;
-    r[Signal::SIGWINCH as usize - 1] = sig_ign;
-
-    r
-}
-
-/// SignalStruct 在 pcb 中加锁
-#[derive(Debug)]
-pub struct SignalStruct {
-    inner: InnerSignalStruct,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct InnerSignalStruct {
-    pub cnt: AtomicI64,
-    /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
-    /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
-    pub handlers: Vec<Sigaction>,
-
-    pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
-}
-
-impl SignalStruct {
-    #[inline(never)]
-    pub fn new() -> Self {
-        let r = Self {
-            inner: InnerSignalStruct::default(),
-        };
-
-        r
-    }
-
-    pub fn reset_sighandlers(&mut self) {
-        // 重置信号处理程序
-        self.inner.handlers = default_sighandlers();
-    }
-}
-
-impl Default for SignalStruct {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Deref for SignalStruct {
-    type Target = InnerSignalStruct;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for SignalStruct {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl Default for InnerSignalStruct {
-    fn default() -> Self {
-        Self {
-            cnt: Default::default(),
-            handlers: default_sighandlers(),
-            pids: core::array::from_fn(|_| None),
-        }
-    }
-}
-
-impl InnerSignalStruct {
-    pub fn handler(&self, sig: Signal) -> Option<&Sigaction> {
-        self.handlers.get(sig as usize - 1)
-    }
-}
+// Removed SignalStruct; refcount moved into Sighand
 
 #[derive(Debug, Copy, Clone)]
 #[allow(dead_code)]

@@ -10,3 +10,6 @@ bindgen = "0.61.0"
 lazy_static = "1.4.0"
 cc = { version = "1.0.83", features = ["parallel"] }
 toml = "0.8.6"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

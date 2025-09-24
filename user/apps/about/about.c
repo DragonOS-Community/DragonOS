@@ -1,6 +1,6 @@
-#include "sys_version.h" // 这是系统的版本头文件，在编译过程中自动生成
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/utsname.h>
 
 void print_ascii_logo()
 {
@@ -15,11 +15,18 @@ void print_ascii_logo()
 void print_copyright()
 {
     printf(" DragonOS - An opensource operating system.\n");
-    printf(" Copyright: DragonOS Community. 2022-2024, All rights reserved.\n");
-    printf(" Version: ");
-    printf("\033[1;32m%s\033[0m", "V0.1.10\n");
-    printf(" Git commit SHA1: %s\n", DRAGONOS_GIT_COMMIT_SHA1);
-    printf(" Build time: %s %s\n", __DATE__, __TIME__);
+    printf(" Copyright: DragonOS Community. 2022-2025, All rights reserved.\n");
+    
+    // 使用 uname 获取版本信息
+    struct utsname buf;
+    if (uname(&buf) == 0) {
+        printf(" Version: ");
+        printf("\033[1;32m%s\033[0m\n", buf.version);
+    } else {
+        printf(" Version: ");
+        printf("\033[1;32m%s\033[0m", "Unknown\n");
+    }
+    
     printf(" \nYou can visit the project via:\n");
     printf("\n");
     printf("\x1B[1;36m%s\x1B[0m", "    Official Website: https://DragonOS.org\n");

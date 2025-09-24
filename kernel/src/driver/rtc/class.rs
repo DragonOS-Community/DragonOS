@@ -13,6 +13,7 @@ use crate::{
         kobject::KObject,
         subsys::SubSysPrivate,
     },
+    filesystem::sysfs::AttributeGroup,
     init::initcall::INITCALL_SUBSYS,
     time::{timekeeping::do_settimeofday64, PosixTimeSpec},
 };
@@ -77,6 +78,9 @@ impl Class for RtcClass {
 
     fn subsystem(&self) -> &SubSysPrivate {
         return &self.subsystem;
+    }
+    fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
+        return &[];
     }
 }
 

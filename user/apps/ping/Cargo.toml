@@ -1,0 +1,18 @@
+[package]
+name = "ping"
+version = "0.1.0"
+edition = "2021"
+description = "ping for dragonOS"
+authors = [ "smallc <2628035541@qq.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.11", features = ["derive"] }
+crossbeam-channel = "0.5.13"
+pnet = "0.35.0"
+rand = "0.8.5"
+signal-hook = "0.3.17"
+socket2 = "0.5.7"
+thiserror = "1.0.63"

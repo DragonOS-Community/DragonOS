@@ -42,7 +42,7 @@ kernel_subdirs := debug
 TOOLCHAIN := +nightly-2025-08-10
 
 kernel_rust:
-	RUSTFLAGS="$(RUSTFLAGS)" cargo $(TOOLCHAIN) $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
+	DRAGONOS_ACTUAL_BUILD=1 RUSTFLAGS="$(RUSTFLAGS)" cargo $(TOOLCHAIN) $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
 
 
 all: kernel

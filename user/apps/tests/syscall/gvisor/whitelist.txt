@@ -1,0 +1,30 @@
+# gvisor测试程序白名单
+# 每行一个测试程序名称，只有在此列表中的测试程序才会被执行
+# 以#开头的行为注释，空行会被忽略
+
+# 基础系统调用测试
+read_test
+#chdir_test
+
+# 文件系统相关测试
+#stat_test
+#chmod_test
+#chown_test
+
+# 进程相关测试
+#fork_test
+#exec_test
+#wait_test
+
+# 内存管理测试
+#mmap_test
+#brk_test
+
+# 网络相关测试
+#bind_test
+#connect_test
+#listen_test
+
+# 信号处理测试
+#signal_test
+#sigaction_test

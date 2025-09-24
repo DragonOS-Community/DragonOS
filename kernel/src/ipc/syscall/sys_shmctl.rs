@@ -2,7 +2,8 @@ use crate::alloc::vec::Vec;
 use crate::arch::interrupt::TrapFrame;
 use crate::{
     arch::syscall::nr::SYS_SHMCTL,
-    ipc::shm::{shm_manager_lock, ShmCtlCmd, ShmId},
+    ipc::shm::{ShmCtlCmd, ShmId},
+    process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use syscall_table_macros::declare_syscall;
@@ -28,7 +29,9 @@ pub(super) fn do_kernel_shmctl(
     user_buf: *const u8,
     from_user: bool,
 ) -> Result<usize, SystemError> {
-    let mut shm_manager_guard = shm_manager_lock();
+    // per-ns 管理器
+    let ipcns = ProcessManager::current_ipcns();
+    let mut shm_manager_guard = ipcns.shm.lock();
 
     match cmd {
         // 查看共享内存元信息

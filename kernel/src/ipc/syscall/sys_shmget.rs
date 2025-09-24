@@ -3,7 +3,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMGET,
-    ipc::shm::{shm_manager_lock, ShmFlags, ShmKey, IPC_PRIVATE},
+    ipc::shm::{ShmFlags, ShmKey, IPC_PRIVATE},
+    process::ProcessManager,
     syscall::table::Syscall,
 };
 use log::error;
@@ -34,7 +35,9 @@ pub(super) fn do_kernel_shmget(
         return Err(SystemError::ENOSYS);
     }
 
-    let mut shm_manager_guard = shm_manager_lock();
+    // 从当前进程的 IPC 命名空间获取 per-ns SHM 管理器
+    let ipcns = ProcessManager::current_ipcns();
+    let mut shm_manager_guard = ipcns.shm.lock();
     match key {
         // 创建共享内存段
         IPC_PRIVATE => shm_manager_guard.add(key, size, shmflg),

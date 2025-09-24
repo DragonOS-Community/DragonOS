@@ -19,7 +19,6 @@ use crate::{
     exception::ipi::{IpiKind, IpiTarget},
     filesystem::{page_cache::PageCache, vfs::FilePrivateData},
     init::initcall::INITCALL_CORE,
-    ipc::shm::ShmId,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -672,7 +671,7 @@ pub enum PageType {
     /// 文件映射页，含文件映射相关信息
     File(FileMapInfo),
     /// 共享内存页，记录ShmId
-    Shm(ShmId),
+    Shm,
 }
 
 #[derive(Debug, Clone)]

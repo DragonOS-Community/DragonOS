@@ -4,15 +4,16 @@ use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMAT,
     arch::MMArch,
-    ipc::shm::{shm_manager_lock, ShmFlags, ShmId},
+    ipc::shm::{ShmFlags, ShmId},
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
         page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
         syscall::ProtFlags,
-        ucontext::{AddressSpace, VMA},
+        ucontext::{AddressSpace, PhysmapParams, VMA},
         VirtAddr, VmFlags,
     },
+    process::ProcessManager,
     syscall::{table::Syscall, user_access::UserBufferReader},
 };
 use syscall_table_macros::declare_syscall;
@@ -36,7 +37,8 @@ pub(super) fn do_kernel_shmat(
     vaddr: VirtAddr,
     shmflg: ShmFlags,
 ) -> Result<usize, SystemError> {
-    let mut shm_manager_guard = shm_manager_lock();
+    let ipcns = ProcessManager::current_ipcns();
+    let mut shm_manager_guard = ipcns.shm.lock();
     let current_address_space = AddressSpace::current()?;
     let mut address_write_guard = current_address_space.write();
 
@@ -59,15 +61,15 @@ pub(super) fn do_kernel_shmat(
             let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
 
             // 将共享内存映射到对应虚拟区域
-            let vma = VMA::physmap(
+            let params = PhysmapParams {
                 phys,
                 destination,
                 count,
                 vm_flags,
-                page_flags,
-                &mut address_write_guard.user_mapper.utable,
-                flusher,
-            )?;
+                flags: page_flags,
+                shm_id: Some(id),
+            };
+            let vma = VMA::physmap(params, &mut address_write_guard.user_mapper.utable, flusher)?;
 
             // 将VMA加入到当前进程的VMA列表中
             address_write_guard.mappings.insert_vma(vma);
@@ -125,7 +127,10 @@ pub(super) fn do_kernel_shmat(
             }
 
             // 更新vma的映射状态
-            vma.lock_irqsave().set_mapped(true);
+            let mut vma_guard = vma.lock_irqsave();
+            vma_guard.set_mapped(true);
+            vma_guard.set_shm_id(Some(id));
+            drop(vma_guard);
 
             vaddr.data()
         }

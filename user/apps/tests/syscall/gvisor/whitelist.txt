@@ -6,6 +6,7 @@
 read_test
 chdir_test
 bad_test
+uname_test
 
 # 文件系统相关测试
 #stat_test

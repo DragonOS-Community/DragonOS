@@ -30,19 +30,28 @@ impl Syscall for SysSetdomainname {
         let name_ptr = Self::name(args);
         let len = Self::len(args);
 
+        // 获取当前进程的 UTS namespace
+        let uts_ns = ProcessManager::current_utsns();
+
+        // 检查权限（需要 CAP_SYS_ADMIN）- 权限检查应该在长度验证之前
+        if !uts_ns.check_uts_modify_permission() {
+            return Err(SystemError::EPERM);
+        }
+
         // 检查长度是否合法
         if len == 0 || len >= NewUtsName::MAXLEN {
             return Err(SystemError::EINVAL);
         }
-        let s = check_and_clone_cstr(name_ptr, Some(NewUtsName::MAXLEN + 1))?;
 
+        // 使用check_and_clone_cstr安全地从用户空间读取字符串，但限制长度为len
+        let s = check_and_clone_cstr(name_ptr, Some(core::cmp::min(len, NewUtsName::MAXLEN) + 1))?;
         let ss = s.to_str().map_err(|_| SystemError::EINVAL)?;
 
-        // 获取当前进程的 UTS namespace
-        let uts_ns = ProcessManager::current_utsns();
+        // 截断到指定长度
+        let truncated = if ss.len() > len { &ss[..len] } else { ss };
 
         // 设置域名
-        uts_ns.set_domainname(ss)?;
+        uts_ns.set_domainname(truncated)?;
 
         Ok(0)
     }

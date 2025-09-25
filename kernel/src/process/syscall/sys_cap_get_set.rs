@@ -125,7 +125,7 @@ impl Syscall for SysCapset {
         // - 拥有 CAP_SETPCAP：pI_new ⊆ (pI_old ∪ pP_old) ∩ bset
         // - 不拥有：pI_new ⊆ (pI_old ∪ pP_old) 且 pI_new ⊆ (pI_old ∪ bset)
         // 使用公开常量 CAP_SETPCAP_BIT 判定是否拥有 CAP_SETPCAP
-        let has_setpcap = p_e_old.contains(CAPFlags::CAP_SETPCAP_BIT);
+        let has_setpcap = p_e_old.contains(CAPFlags::CAP_SETPCAP);
         if has_setpcap {
             let inh_cap_allow = (p_i_old | p_p_old) & bset;
             if (p_i_new & !inh_cap_allow) != 0 {

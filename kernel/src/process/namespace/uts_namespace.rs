@@ -201,10 +201,11 @@ impl UtsNamespace {
     }
 
     /// 检查是否有权限修改 UTS 信息
-    fn check_uts_modify_permission(&self) -> bool {
-        // TODO: 实现完整的 capability 检查
-        // 目前暂时返回 true，后续需要检查 CAP_SYS_ADMIN
-        true
+    pub fn check_uts_modify_permission(&self) -> bool {
+        // 检查当前进程是否具有 CAP_SYS_ADMIN 权限
+        let pcb = ProcessManager::current_pcb();
+        let cred = pcb.cred();
+        cred.has_cap_sys_admin()
     }
 }
 

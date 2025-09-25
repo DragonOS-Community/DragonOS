@@ -8,3 +8,4 @@
    :caption: 目录
 
    syscall_table
+   sys_capget_capset

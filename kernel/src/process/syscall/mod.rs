@@ -1,3 +1,4 @@
+mod sys_cap_get_set;
 mod sys_clone;
 mod sys_execve;
 mod sys_execveat;

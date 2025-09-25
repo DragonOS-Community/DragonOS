@@ -485,7 +485,7 @@ impl Syscall {
                 Ok(0)
             }
             _ => {
-                log::warn!(
+                log::error!(
                     "Unsupported syscall ID: {} -> {}, args: {:?}",
                     syscall_num,
                     syscall_number_to_str(syscall_num),

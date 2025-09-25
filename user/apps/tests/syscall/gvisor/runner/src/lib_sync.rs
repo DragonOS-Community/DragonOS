@@ -351,9 +351,9 @@ impl TestRunner {
         let start_time = Instant::now();
         let mut cmd = Command::new(&test_path);
         if !blocked_subtests.is_empty() {
-            cmd.arg("--gtest_filter")
-                .arg(format!("-{}", blocked_subtests.join(":")));
+            cmd.arg(format!("--gtest_filter=-{}", blocked_subtests.join(":")));
         }
+
         let status = cmd
             .current_dir(&self.config.tests_dir)
             .env("TEST_TMPDIR", &self.config.temp_dir)

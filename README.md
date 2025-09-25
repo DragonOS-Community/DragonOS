@@ -66,7 +66,17 @@ We guarantee that all sponsorship funds and items will be used for:
 ## 🌟 Sponsor List
 **Special thanks to these generous financial supporters** (in reverse chronological order):
 
-- **[中国雅云](https://yacloud.net)** 雅安大数据产业园 - 🥇 Long-term supporter
+- **[中国雅云](https://yacloud.net)** 雅安大数据产业园 - 🥇 Long-term supporter (since 2023)
+- **[Tencent Cloud EdgeOne](https://edgeone.ai/?from=github)** EdgeOne CDN by TencentCloud
+
+### CDN Sponsor
+
+<div align="center">
+  <p>This project's CDN acceleration and security protection are sponsored by Tencent EdgeOne.</p>
+  <a href="https://edgeone.ai/?from=github">
+    <img src="https://edgeone.ai/media/34fe3a45-492d-4ea4-ae5d-ea1087ca7b4b.png" alt="腾讯EdgeOne CDN" width="200">
+  </a>
+</div>
 
 ### Individual Sponsors List
 See [Supporters.md](./SUPPORTERS.md)

@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use uefi::table::boot::PAGE_SIZE;
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use alloc::{string::ToString, sync::Arc};
@@ -14,16 +15,17 @@ use crate::{
     process::ProcessFlags,
     sched::{sched_cgroup_fork, sched_fork},
     smp::core::smp_get_processor_id,
-    syscall::user_access::UserBufferWriter,
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::{
     alloc_pid,
+    syscall::clone_utils::{CloneArgs, CLONE_ARGS_SIZE_VER0, CLONE_ARGS_SIZE_VER1, CLONE_ARGS_SIZE_VER2},
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     pid::{Pid, PidType},
     KernelStack, ProcessControlBlock, ProcessManager, RawPid,
 };
-const MAX_PID_NS_LEVEL: usize = 32;
+pub const MAX_PID_NS_LEVEL: usize = 32;
 
 bitflags! {
     /// 进程克隆标志
@@ -79,6 +81,8 @@ bitflags! {
         const CLONE_IO = 0x80000000;
         /// 克隆时，将原本被设置为SIG_IGNORE的信号，设置回SIG_DEFAULT
         const CLONE_CLEAR_SIGHAND = 0x100000000;
+        /// 克隆到具有正确权限的特定cgroup中
+        const CLONE_INTO_CGROUP = 0x200000000;
     }
 }
 
@@ -138,6 +142,48 @@ impl KernelCloneArgs {
             func: null_addr,
             fn_arg: null_addr,
         }
+    }
+
+    pub fn copy_clone_args_from_user(&mut self, uargs_ptr: usize, size: usize) -> Result<(), SystemError>{
+        // 编译时检查
+        use kdepends::memoffset::offset_of;
+        const { assert!(offset_of!(CloneArgs, tls) + core::mem::size_of::<u64>() == CLONE_ARGS_SIZE_VER0) };
+        const { assert!(offset_of!(CloneArgs, set_tid_size) + core::mem::size_of::<u64>() == CLONE_ARGS_SIZE_VER1) };
+        const { assert!(offset_of!(CloneArgs, cgroup) + core::mem::size_of::<u64>() == CLONE_ARGS_SIZE_VER2) };
+        const { assert!(core::mem::size_of::<CloneArgs>() == CLONE_ARGS_SIZE_VER2) };
+        
+        if unlikely(size as u64 > PAGE_SIZE as u64){
+            return Err(SystemError::E2BIG);
+        }
+        if unlikely(size < CLONE_ARGS_SIZE_VER0){
+            return Err(SystemError::EINVAL);
+        }
+
+        let bufreader = UserBufferReader::new(uargs_ptr as *mut CloneArgs, core::mem::size_of::<CloneArgs>(), true)?;
+        let args = *bufreader.read_one_from_user::<CloneArgs>(0)?;
+
+        args.check_valid(size)?;
+
+        self.flags = CloneFlags::from_bits_truncate(args.flags);
+        self.pidfd = VirtAddr::new(args.pidfd as usize);
+        self.child_tid = VirtAddr::new(args.child_tid as usize);
+        self.parent_tid = VirtAddr::new(args.parent_tid as usize);
+        self.exit_signal = Signal::from(args.exit_signal as i32);
+        self.stack = args.stack as usize;
+        self.stack_size = args.stack_size as usize;
+        self.tls = args.tls as usize;
+        self.set_tid_size = args.set_tid_size as usize;
+        self.cgroup = args.cgroup as i32;
+
+        if self.set_tid_size > 0 {
+            let bufreader = UserBufferReader::new(args.set_tid as *mut core::ffi::c_int, core::mem::size_of::<core::ffi::c_int>() * self.set_tid_size, true)?;
+            for i in 0..self.set_tid_size {
+                let tid = *bufreader.read_one_from_user::<core::ffi::c_int>(i)?;
+                self.set_tid.push(tid as usize);
+            }
+        }
+
+        Ok(())
     }
 }
 

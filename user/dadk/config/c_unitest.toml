@@ -25,7 +25,7 @@ source-path = "user/apps/c_unitest"
 # 构建相关信息
 [build]
 # （可选）构建命令
-build-command = "make install"
+build-command = "make install -j8"
 # 安装相关信息
 [install]
 # （可选）安装到DragonOS的路径

@@ -17,6 +17,7 @@ int_like!(Kgid, AtomicKgid, usize, AtomicUsize);
 bitflags! {
     pub struct CAPFlags:u64{
         const CAP_EMPTY_SET = 0;
+        const CAP_SETPCAP_BIT = 1 << 8;
         const CAP_FULL_SET = (1 << 41) - 1;
     }
 }

@@ -1053,6 +1053,15 @@ impl ProcessControlBlock {
         self.cred.lock().clone()
     }
 
+    /// 原子替换当前进程的凭据集（cred）
+    ///
+    /// - 使用 irqsave 写锁保证并发安全
+    /// - 返回 Result 以便调用方在需要时扩展错误处理
+    pub fn set_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
+        *self.cred.lock_irqsave() = new;
+        Ok(())
+    }
+
     pub fn set_execute_path(&self, path: String) {
         *self.executable_path.write() = path;
     }

@@ -33,7 +33,7 @@
     "hash": "777fe6a902720949596f5a35bdf26372"
   },
   "en:kernel/syscall/index.rst": {
-    "hash": "d94e7cff4242362399e96051df1e7aad"
+    "hash": "0644dde8c9154be097b329e787073542"
   },
   "en:kernel/libs/lib_ui/scm.md": {
     "hash": "a03d756677c64b1247cfe40b6d73f1b1"
@@ -63,7 +63,7 @@
     "hash": "52dd12d566da2003602ee21c4a3d007f"
   },
   "en:kernel/ktest/index.rst": {
-    "hash": "91a6018265b0505ee81ba83c0a7a172a"
+    "hash": "d9f0d9b2df4f1ce9d7f0da23639afafb"
   },
   "en:kernel/filesystem/vfs/api.md": {
     "hash": "1b0b3fe0cc2918cc2c53a5af392a96ff"
@@ -295,5 +295,8 @@
   },
   "en:kernel/ktest/gvisor_syscall_test.rst": {
     "hash": "019ff2a7240a60e49be0633625da88f6"
+  },
+  "en:kernel/syscall/sys_capget_capset.md": {
+    "hash": "f3b86c00e9f28df5c0e6c15905e53907"
   }
 }

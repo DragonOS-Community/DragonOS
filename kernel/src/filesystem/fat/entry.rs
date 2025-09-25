@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use core::{cmp::min, intrinsics::unlikely, panic};
+use core::{cmp::min, intrinsics::unlikely};
 use log::{debug, warn};
 use system_error::SystemError;
 

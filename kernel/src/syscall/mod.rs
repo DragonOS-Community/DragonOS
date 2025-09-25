@@ -80,11 +80,12 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         use crate::debug::panic::kernel_catch_unwind;
         let binding = ProcessManager::current_pcb();
-        // let name = binding.basic().name();
-        if binding.basic().name().contains("dropbear") || binding.basic().name().contains("xxx") {
+        // todo: remove it
+        if binding.basic().name().contains("dropbear") {
             // 如果是dropbear进程，打印系统调用号和参数
             print!(
-                "Syscall {}({}) called with args: {:x?}",
+                "[{}] Syscall {}({}) called with args: {:x?}",
+                binding.basic().ppid(),
                 syscall_num,
                 syscall_number_to_str(syscall_num),
                 args
@@ -94,12 +95,9 @@ impl Syscall {
 
         let res = kernel_catch_unwind(|| Self::handle(syscall_num, args, frame))?;
         let binding = ProcessManager::current_pcb();
-        // let name = binding.basic().name();
-        if binding.basic().name().contains("dropbear") || binding.basic().name().contains("xxx")
-        // || syscall_num == SYS_OPENAT
-        // || syscall_num == SYS_OPEN
-        {
-            println!("returned: {:?}", res);
+        // todo: remove it
+        if binding.basic().name().contains("dropbear") {
+            println!(" {} returned: {:?}", syscall_num, res);
         }
         res
     }

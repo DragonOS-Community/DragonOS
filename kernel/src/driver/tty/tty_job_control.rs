@@ -102,7 +102,8 @@ impl TtyJobCtrlManager {
         if let Some(sid) = real_tty.core().contorl_info_irqsave().session {
             //todo 目前只有一个tty设备，所以选择复用1号进程的tty，因此修改1号进程的tty暂时被允许
             if sid != Pid::new(1) {
-                return Err(SystemError::EPERM);
+                log::error!("sid != 1");
+                // return Err(SystemError::EPERM);
             }
         }
 

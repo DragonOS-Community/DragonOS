@@ -116,6 +116,9 @@ impl DevFS {
         dev_root
             .add_dev("zero", LockedZeroInode::new())
             .expect("DevFS: Failed to register /dev/zero");
+        dev_root
+            .add_dev("urandom", LockedZeroInode::new())
+            .expect("DevFS: Failed to register /dev/urandom");
     }
 
     /// @brief 在devfs内注册设备
@@ -146,7 +149,7 @@ impl DevFS {
                 device.set_fs(dev_root_inode.0.lock().fs.clone());
                 device.set_parent(Arc::downgrade(&dev_root_inode));
                 // 特殊处理 tty 设备，挂载在 /dev 下
-                if name.starts_with("tty") && name.len() > 3 {
+                if name.starts_with("tty") && name.len() >= 3 {
                     dev_root_inode.add_dev(name, device.clone())?;
                 } else if name.starts_with("hvc") && name.len() > 3 {
                     // 特殊处理 hvc 设备，挂载在 /dev 下

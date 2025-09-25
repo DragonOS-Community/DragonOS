@@ -656,6 +656,14 @@ impl TtyFilePrivateData {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn tty_init() -> Result<(), SystemError> {
+    let tty_device = TtyDevice::new(
+        "tty".to_string(),
+        IdTable::new(
+            String::from("tty"),
+            Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 0)),
+        ),
+        TtyType::Tty,
+    );
     let console = TtyDevice::new(
         "console".to_string(),
         IdTable::new(
@@ -665,9 +673,13 @@ pub fn tty_init() -> Result<(), SystemError> {
         TtyType::Tty,
     );
 
-    // 将设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
-    device_register(console.clone())?;
-    devfs_register(&console.name.clone(), console)?;
+    let devs = [tty_device, console];
+
+    for dev in devs {
+        // 将设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
+        device_register(dev.clone())?;
+        devfs_register(&dev.name.clone(), dev)?;
+    }
 
     serial_init()?;
 

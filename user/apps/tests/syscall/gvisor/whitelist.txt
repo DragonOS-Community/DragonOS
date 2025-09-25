@@ -5,6 +5,7 @@
 # 基础系统调用测试
 read_test
 chdir_test
+bad_test
 
 # 文件系统相关测试
 #stat_test
@@ -18,7 +19,7 @@ chdir_test
 
 # 内存管理测试
 #mmap_test
-#brk_test
+brk_test
 
 # 网络相关测试
 #bind_test

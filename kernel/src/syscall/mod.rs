@@ -485,12 +485,13 @@ impl Syscall {
                 Ok(0)
             }
             _ => {
-                panic!(
+                log::error!(
                     "Unsupported syscall ID: {} -> {}, args: {:?}",
                     syscall_num,
                     syscall_number_to_str(syscall_num),
                     args
                 );
+                Err(SystemError::ENOSYS)
             }
         };
 

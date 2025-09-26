@@ -21,6 +21,7 @@ uname_test
 # 内存管理测试
 #mmap_test
 brk_test
+mincore_test
 
 # 网络相关测试
 #bind_test

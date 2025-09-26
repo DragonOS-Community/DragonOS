@@ -546,9 +546,7 @@ impl FileDescriptorVec {
         let mut res = FileDescriptorVec::new();
         for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
             if let Some(file) = &self.fds[i] {
-                if let Some(file) = file.try_clone() {
-                    res.fds[i] = Some(Arc::new(file));
-                }
+                res.fds[i] = Some(file.clone());
             }
         }
         return res;

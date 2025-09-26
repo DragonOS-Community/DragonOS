@@ -159,7 +159,8 @@ impl TtyJobCtrlManager {
                 if arg == 1 {
                     Self::session_clear_tty(sid.clone());
                 } else {
-                    return Err(SystemError::EPERM);
+                    log::warn!("job_ctrl_ioctl: TIOCSCTTY: tty is occupied");
+                    // return Err(SystemError::EPERM);
                 }
             }
         }

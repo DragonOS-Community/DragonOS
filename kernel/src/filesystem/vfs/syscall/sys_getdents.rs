@@ -4,7 +4,6 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::{SYS_GETDENTS, SYS_GETDENTS64};
-use crate::filesystem::vfs::file::FileDescriptorVec;
 use crate::filesystem::vfs::FilldirContext;
 use crate::mm::{verify_area, VirtAddr};
 use crate::process::ProcessManager;
@@ -48,7 +47,7 @@ impl Syscall for SysGetdentsHandle {
             let buf: &mut [u8] = unsafe {
                 core::slice::from_raw_parts_mut::<'static, u8>(buf_vaddr as *mut u8, len)
             };
-            if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
+            if fd < 0 {
                 return Err(SystemError::EBADF);
             }
 

@@ -477,8 +477,6 @@ impl Syscall {
                 let flags = args[4] as u32;
                 Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
-            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-            SYS_SETRLIMIT => Ok(0),
 
             SYS_RT_SIGTIMEDWAIT => {
                 log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");

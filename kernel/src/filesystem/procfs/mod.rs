@@ -650,21 +650,17 @@ impl ProcFS {
             .create_proc_file(version_params)
             .unwrap_or_else(|_| panic!("create version error"));
 
-        let self_dir = result
-            .root_inode()
-            .create("self", FileType::Dir, ModeType::from_bits_truncate(0o555))
-            .unwrap();
-
-        let exe_params = ProcFileCreationParams::builder()
-            .parent(self_dir)
-            .name("exe")
+        let self_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("self")
             .file_type(FileType::SymLink)
-            .ftype(ProcFileType::ProcExe)
+            .mode(ModeType::from_bits_truncate(0o555))
+            .ftype(ProcFileType::ProcSelf)
             .build()
             .unwrap();
         result
-            .create_proc_file(exe_params)
-            .unwrap_or_else(|_| panic!("create exe error"));
+            .create_proc_file(self_params)
+            .unwrap_or_else(|_| panic!("create self error"));
 
         return result;
     }

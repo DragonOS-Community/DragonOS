@@ -39,7 +39,7 @@ impl Syscall for SysMincoreHandle {
             return Err(SystemError::ENOMEM);
         }
         if len == 0 {
-            return Err(SystemError::EINVAL);
+            return Ok(0);
         }
         let len = page_align_up(len);
         let current_address_space = AddressSpace::current()?;

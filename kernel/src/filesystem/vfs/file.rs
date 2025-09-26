@@ -560,9 +560,7 @@ impl FileDescriptorVec {
 
         for i in 0..self.fds.len() {
             if let Some(file) = &self.fds[i] {
-                if let Some(file) = file.try_clone() {
-                    res.fds[i] = Some(Arc::new(file));
-                }
+                res.fds[i] = Some(file.clone());
             }
         }
         return res;

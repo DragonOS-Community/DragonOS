@@ -4,7 +4,7 @@ use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
         utils::user_path_at,
-        FileType, MAX_PATHLEN,
+        FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     process::ProcessManager,
     syscall::user_access::{check_and_clone_cstr, UserBufferWriter},
@@ -24,7 +24,7 @@ pub fn do_readlink_at(
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
-    let inode = inode.lookup(path.as_str())?;
+    let inode = inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)?;
     if inode.metadata()?.file_type != FileType::SymLink {
         return Err(SystemError::EINVAL);
     }

@@ -10,6 +10,7 @@ use crate::{
         device::{
             bus::{bus_manager, Bus},
             device_number::{DeviceNumber, Major},
+            device_register,
             driver::{Driver, DriverCommonData},
             DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
         },
@@ -88,19 +89,19 @@ pub struct LoopDeviceInner {
     //工作管理 todo
     //work_queue: Option<Arc<WorkQueue>>,
 }
-impl LoopDeviceInner{
+impl LoopDeviceInner {
     fn set_state(&mut self, new_state: LoopState) -> Result<(), SystemError> {
         let _guard = self.state_lock.lock();
-        
+
         // 状态转换检查
         match (&self.state, &new_state) {
-            (LoopState::Unbound, LoopState::Bound) => {},
-            (LoopState::Bound, LoopState::Unbound) => {},
-            (LoopState::Bound, LoopState::Rundown) => {},
-            (LoopState::Rundown, LoopState::Deleting) => {},
+            (LoopState::Unbound, LoopState::Bound) => {}
+            (LoopState::Bound, LoopState::Unbound) => {}
+            (LoopState::Bound, LoopState::Rundown) => {}
+            (LoopState::Rundown, LoopState::Deleting) => {}
             _ => return Err(SystemError::EINVAL),
         }
-        
+
         self.state = new_state;
         Ok(())
     }
@@ -168,17 +169,17 @@ impl LoopDevice {
         Ok(())
     }
 
-    /// 获取文件大小
+    // 获取文件大小
     pub fn file_size(&self) -> usize {
         self.inner().file_size
     }
 
-    /// 设置只读模式
+    // 设置只读模式
     pub fn set_read_only(&self, read_only: bool) {
         self.inner().read_only = read_only;
     }
 
-    /// 检查是否为只读
+    // 检查是否为只读
     pub fn is_read_only(&self) -> bool {
         self.inner().read_only
     }
@@ -650,7 +651,8 @@ pub struct LoopManagerInner {
     devices: [Option<Arc<LoopDevice>>; LoopManager::MAX_DEVICES],
 }
 impl LoopManager {
-    const MAX_DEVICES: usize = 8;
+    const MAX_DEVICES: usize = 256; // 支持的最大 loop 设备数量
+    const MAX_INIT_DEVICES: usize = 8; //初始化loop设备数量
     pub fn new() -> Self {
         Self {
             inner: SpinLock::new(LoopManagerInner {
@@ -664,7 +666,8 @@ impl LoopManager {
     //index: 次设备号
     pub fn register_device(&self, index: usize, device: Arc<LoopDevice>) {
         if index < Self::MAX_DEVICES {
-            self.inner().devices[index] = Some(device);
+            let mut inner = self.inner();
+            inner.devices[index] = Some(device);
         }
     }
 
@@ -686,14 +689,18 @@ impl LoopManager {
         }
         Err(SystemError::ENOSPC)
     }
+    pub fn deallocate_device(&self, device: &Arc<LoopDevice>) -> Result<(), SystemError> {
+        todo!()
+    }
     pub fn loop_init(&self, driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {
-
         //注册loop_control设备
-        // let loop_ctl=Arc::new(LoopControlDevice::new());
-        // DevFS::register_device("loop-control",loop_ctl.clone())?;
-
+        let loop_ctl = LoopControlDevice::new();
+        device_register(loop_ctl.clone())?;
+        log::info!("Loop control device registered.");
+        devfs_register("loop-control", loop_ctl.clone())?;
+        log::info!("Loop control device initialized.");
         // 注册 loop 设备
-        for minor in 0..Self::MAX_DEVICES {
+        for minor in 0..Self::MAX_INIT_DEVICES {
             driver.new_loop_device(minor)?;
         }
         log::info!("Loop devices initialized");
@@ -703,15 +710,237 @@ impl LoopManager {
         log::info!("LoopDeviceDriver and all devices initialized.");
         Ok(())
     }
-    // pub fn loop_add(&self)
+}
+//一个字符设备，作为一个抽象接口控制loop设备的创建，绑定和删除
+/*
+设备分配和查找
+设备绑定和解绑
+设备状态查询和配置（配置设备参数，如偏移量、大小限制等）
+*/
 
-    // pub fn loop_control_remove
-    // pub loop_control_get_free(&self) -> Result<usize, SystemError> {
-    //     let inner = self.inner();
-    //     for (i, device) in inner.devices.iter().enumerate() {
-    //         if device.is_none() {
-    //             return Ok(i);
-    //         }
-    //     }
-    //     Err(SystemError::ENOSPC)
+pub struct LoopControlDevice {
+    inner: SpinLock<LoopControlDeviceInner>,
+    locked_kobj_state: LockedKObjectState,
+}
+struct LoopControlDeviceInner {
+    // 设备的公共数据
+    pub device_common: DeviceCommonData,
+    // KObject的公共数据
+    pub kobject_common: KObjectCommonData,
+
+    parent: RwLock<Weak<LockedDevFSInode>>,
+    device_inode_fs: RwLock<Option<Weak<DevFS>>>,
+    devfs_metadata: Metadata,
+}
+impl LoopControlDevice {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: SpinLock::new(LoopControlDeviceInner {
+                kobject_common: KObjectCommonData::default(),
+                device_common: DeviceCommonData::default(),
+                parent: RwLock::new(Weak::default()),
+                device_inode_fs: RwLock::new(None),
+                devfs_metadata: Metadata::default(),
+            }),
+            locked_kobj_state: LockedKObjectState::default(),
+        })
+    }
+    pub fn inner(&self) -> SpinLockGuard<LoopControlDeviceInner> {
+        self.inner.lock()
+    }
+}
+impl DeviceINode for LoopControlDevice {
+    fn set_fs(&self, fs: alloc::sync::Weak<crate::filesystem::devfs::DevFS>) {
+        *self.inner().device_inode_fs.write() = Some(fs);
+    }
+    fn set_parent(&self, parent: Weak<crate::filesystem::devfs::LockedDevFSInode>) {
+        *self.inner().parent.write() = parent;
+    }
+}
+impl Debug for LoopControlDevice {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoopControlDevice").finish()
+    }
+}
+impl IndexNode for LoopControlDevice {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        use crate::filesystem::vfs::{syscall::ModeType, FileType, InodeId};
+        use crate::time::PosixTimeSpec;
+
+        let metadata = Metadata {
+            dev_id: 0,
+            inode_id: InodeId::new(0), // Loop control 设备的 inode ID
+            size: 0,                   // 字符设备大小通常为0
+            blk_size: 0,               // 字符设备不使用块大小
+            blocks: 0,                 // 字符设备不使用块数
+            atime: PosixTimeSpec::default(),
+            mtime: PosixTimeSpec::default(),
+            ctime: PosixTimeSpec::default(),
+            btime: PosixTimeSpec::default(),
+            file_type: FileType::CharDevice,           // 字符设备类型
+            mode: ModeType::from_bits_truncate(0o600), // 读写权限，仅owner可访问
+            nlinks: 1,
+            uid: 0,                                          // root用户
+            gid: 0,                                          // root组
+            raw_dev: DeviceNumber::new(Major::new(10), 237), // loop-control设备号通常是(10, 237)
+        };
+        Ok(metadata)
+    }
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        todo!()
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    // fn metadata(&self) -> Result<Metadata, SystemError> {
+    //    Metadata
+    // }
+}
+impl Device for LoopControlDevice {
+    fn dev_type(&self) -> DeviceType {
+        DeviceType::Char
+    }
+
+    fn id_table(&self) -> IdTable {
+        IdTable::new(LOOP_BASENAME.to_string(), None)
+    }
+
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.inner().device_common.bus.clone()
+    }
+
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
+        self.inner().device_common.bus = bus;
+    }
+
+    fn class(&self) -> Option<Arc<dyn Class>> {
+        let mut guard = self.inner();
+        let r = guard.device_common.class.clone()?.upgrade();
+        if r.is_none() {
+            guard.device_common.class = None;
+        }
+        return r;
+    }
+
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
+        self.inner().device_common.class = class;
+    }
+
+    fn driver(&self) -> Option<Arc<dyn Driver>> {
+        let r = self.inner().device_common.driver.clone()?.upgrade();
+        if r.is_none() {
+            self.inner().device_common.driver = None;
+        }
+        return r;
+    }
+
+    fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
+        self.inner().device_common.driver = driver;
+    }
+
+    fn is_dead(&self) -> bool {
+        false
+    }
+
+    fn can_match(&self) -> bool {
+        self.inner().device_common.can_match
+    }
+
+    fn set_can_match(&self, can_match: bool) {
+        self.inner().device_common.can_match = can_match;
+    }
+
+    fn state_synced(&self) -> bool {
+        true
+    }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = parent;
+    }
+}
+impl KObject for LoopControlDevice {
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        self.inner().kobject_common.kern_inode = inode;
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        self.inner().kobject_common.kern_inode.clone()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        self.inner().kobject_common.parent.clone()
+    }
+
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        self.inner().kobject_common.parent = parent;
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        self.inner().kobject_common.kset.clone()
+    }
+
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        self.inner().kobject_common.kset = kset;
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        self.inner().kobject_common.kobj_type
+    }
+
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.inner().kobject_common.kobj_type = ktype;
+    }
+
+    fn name(&self) -> String {
+        "loop-control".to_string()
+    }
+
+    fn set_name(&self, _name: String) {
+        // do nothing
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        self.locked_kobj_state.read()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        self.locked_kobj_state.write()
+    }
+
+    fn set_kobj_state(&self, state: KObjectState) {
+        *self.locked_kobj_state.write() = state;
+    }
 }

@@ -1,8 +1,8 @@
 //! 内存策略工具和定义
 
-use system_error::SystemError;
-use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use crate::mm::VirtAddr;
+use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
+use system_error::SystemError;
 
 /// NUMA内存策略类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,10 +86,7 @@ impl Mempolicy {
 }
 
 /// 将策略信息写入用户空间
-pub fn write_policy_to_user(
-    policy_ptr: VirtAddr,
-    mode: u32,
-) -> Result<(), SystemError> {
+pub fn write_policy_to_user(policy_ptr: VirtAddr, mode: u32) -> Result<(), SystemError> {
     if !policy_ptr.is_null() {
         let mut writer = UserBufferWriter::new(
             policy_ptr.data() as *mut u32,
@@ -108,15 +105,11 @@ pub fn write_nodemask_to_user(
     maxnode: usize,
 ) -> Result<(), SystemError> {
     if !nmask_ptr.is_null() && maxnode > 0 {
-        let bytes_to_write = (maxnode + 7) / 8; // 将位转换为字节
+        let bytes_to_write = maxnode.div_ceil(8); // 将位转换为字节
         let bytes_to_write = bytes_to_write.min(8); // 限制为u64大小
-        
-        let mut writer = UserBufferWriter::new(
-            nmask_ptr.data() as *mut u8,
-            bytes_to_write,
-            true,
-        )?;
-        
+
+        let mut writer = UserBufferWriter::new(nmask_ptr.data() as *mut u8, bytes_to_write, true)?;
+
         let mask_bytes = nodemask.to_ne_bytes();
         writer.copy_to_user(&mask_bytes[..bytes_to_write], 0)?;
     }
@@ -124,25 +117,18 @@ pub fn write_nodemask_to_user(
 }
 
 /// 从用户空间读取节点掩码
-pub fn _read_nodemask_from_user(
-    nmask_ptr: VirtAddr,
-    maxnode: usize,
-) -> Result<u64, SystemError> {
+pub fn _read_nodemask_from_user(nmask_ptr: VirtAddr, maxnode: usize) -> Result<u64, SystemError> {
     if nmask_ptr.is_null() || maxnode == 0 {
         return Ok(0);
     }
 
-    let bytes_to_read = (maxnode + 7) / 8; // 将位转换为字节
+    let bytes_to_read = maxnode.div_ceil(8); // 将位转换为字节
     let bytes_to_read = bytes_to_read.min(8); // 限制为u64大小
-    
-    let reader = UserBufferReader::new(
-        nmask_ptr.data() as *const u8,
-        bytes_to_read,
-        true,
-    )?;
-    
+
+    let reader = UserBufferReader::new(nmask_ptr.data() as *const u8, bytes_to_read, true)?;
+
     let mut mask_bytes = [0u8; 8];
     reader.copy_from_user(&mut mask_bytes[..bytes_to_read], 0)?;
-    
+
     Ok(u64::from_ne_bytes(mask_bytes))
 }

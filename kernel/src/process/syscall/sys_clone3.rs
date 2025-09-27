@@ -32,8 +32,8 @@ impl Syscall for SysClone3 {
 }
 
 impl SysClone3 {
-    fn uargs(args: &[usize]) -> usize { 
-        args[0] as usize
+    fn uargs(args: &[usize]) -> usize {
+        args[0]
     }
 
     fn size(args: &[usize]) -> usize {

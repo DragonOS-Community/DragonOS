@@ -1,16 +1,13 @@
 //! System call handler for the get_mempolicy system call.
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_GET_MEMPOLICY};
+use crate::mm::{ucontext::AddressSpace, VirtAddr};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::mm::{
-    VirtAddr, ucontext::AddressSpace,
-};
 use alloc::vec::Vec;
 use system_error::SystemError;
 
 use super::mempolice_utils::{
-    Mempolicy, MempolicyFlags,
-    write_policy_to_user, write_nodemask_to_user
+    write_nodemask_to_user, write_policy_to_user, Mempolicy, MempolicyFlags,
 };
 
 /// ## get_mempolicy系统调用
@@ -27,7 +24,7 @@ use super::mempolice_utils::{
 ///
 /// ## 返回值
 ///
-/// 成功时返回0，失败时返回错误码 
+/// 成功时返回0，失败时返回错误码
 pub struct SysGetMempolicy;
 
 impl Syscall for SysGetMempolicy {
@@ -44,18 +41,22 @@ impl Syscall for SysGetMempolicy {
         let addr = VirtAddr::new(Self::addr(args));
         let flags = Self::flags(args) as u32;
 
-        if flags &
-		    !((MempolicyFlags::MPOL_F_NODE.bits())
-			| (MempolicyFlags::MPOL_F_ADDR.bits())
-			| (MempolicyFlags::MPOL_F_MEMS_ALLOWED.bits())) > 0
-		{ return Err(SystemError::EINVAL); }
-
-        if flags & MempolicyFlags::MPOL_F_MEMS_ALLOWED.bits() > 0 {
-            if (flags & (MempolicyFlags::MPOL_F_NODE.bits() | MempolicyFlags::MPOL_F_ADDR.bits())) > 0 {
-                return Err(SystemError::EINVAL);
-            }
+        if flags
+            & !((MempolicyFlags::MPOL_F_NODE.bits())
+                | (MempolicyFlags::MPOL_F_ADDR.bits())
+                | (MempolicyFlags::MPOL_F_MEMS_ALLOWED.bits()))
+            > 0
+        {
+            return Err(SystemError::EINVAL);
         }
-        
+
+        if flags & MempolicyFlags::MPOL_F_MEMS_ALLOWED.bits() > 0
+            && (flags & (MempolicyFlags::MPOL_F_NODE.bits() | MempolicyFlags::MPOL_F_ADDR.bits()))
+                > 0
+        {
+            return Err(SystemError::EINVAL);
+        }
+
         // 验证参数
         if maxnode > 1024 {
             return Err(SystemError::EINVAL);
@@ -76,7 +77,7 @@ impl Syscall for SysGetMempolicy {
         } else {
             // 返回策略模式
             write_policy_to_user(policy_ptr, mempolicy.mode_as_u32())?;
-            
+
             // 返回节点掩码
             if mempolicy.is_node_policy() {
                 write_nodemask_to_user(nmask_ptr, mempolicy.nodemask, maxnode)?;
@@ -116,10 +117,7 @@ impl SysGetMempolicy {
     }
 
     /// 获取进程的内存策略
-    fn get_process_mempolicy(
-        addr: VirtAddr, 
-        flags: u32
-    ) -> Result<Mempolicy, SystemError> {
+    fn get_process_mempolicy(addr: VirtAddr, flags: u32) -> Result<Mempolicy, SystemError> {
         if flags & MempolicyFlags::MPOL_F_ADDR.bits() > 0 {
             // 查询特定地址的策略
             Self::get_vma_mempolicy(addr)
@@ -133,7 +131,7 @@ impl SysGetMempolicy {
     fn get_vma_mempolicy(addr: VirtAddr) -> Result<Mempolicy, SystemError> {
         let current_as = AddressSpace::current()?;
         let as_guard = current_as.read();
-        
+
         // 检查地址是否在有效的VMA中
         if let Some(_vma) = as_guard.mappings.contains(addr) {
             // 目前DragonOS还没有实现per-VMA的内存策略

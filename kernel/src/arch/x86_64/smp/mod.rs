@@ -138,7 +138,7 @@ impl SmpBootData {
     }
 }
 
-pub(super) static SMP_BOOT_DATA: SmpBootData = SmpBootData {
+pub static SMP_BOOT_DATA: SmpBootData = SmpBootData {
     initialized: AtomicBool::new(false),
     cpu_count: 0,
     phys_id: [0; PerCpu::MAX_CPU_NUM as usize],

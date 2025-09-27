@@ -482,6 +482,9 @@ impl ProcessManager {
             )
         });
 
+        // 继承 rlimit
+        pcb.inherit_rlimits_from(current_pcb);
+
         // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {

@@ -19,8 +19,16 @@ pub fn do_dup3(
     flags: FileMode,
     fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
 ) -> Result<usize, SystemError> {
+    // 检查 RLIMIT_NOFILE：newfd 必须小于软限制
+    let nofile = crate::process::ProcessManager::current_pcb()
+        .get_rlimit(crate::process::resource::RLimitID::Nofile)
+        .rlim_cur;
+    if newfd as u64 >= nofile {
+        return Err(SystemError::EMFILE);
+    }
+
     // 确认oldfd, newid是否有效
-    if !(FileDescriptorVec::validate_fd(oldfd) && FileDescriptorVec::validate_fd(newfd)) {
+    if !(fd_table_guard.validate_fd(oldfd) && fd_table_guard.validate_fd(newfd)) {
         return Err(SystemError::EBADF);
     }
 

@@ -57,6 +57,7 @@ use crate::{
         PhysAddr, VirtAddr,
     },
     net::socket::Socket,
+    process::resource::{RLimit64, RLimitID},
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
         cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
@@ -778,6 +779,8 @@ pub struct ProcessControlBlock {
 
     /// 进程的可执行文件路径
     executable_path: RwLock<String>,
+    /// 资源限制（rlimit）数组
+    rlimits: RwLock<[RLimit64; RLimitID::Nlimits as usize]>,
 }
 
 impl ProcessControlBlock {
@@ -896,6 +899,7 @@ impl ProcessControlBlock {
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
+                rlimits: RwLock::new(Self::default_rlimits()),
             };
 
             pcb.sig_info.write().set_tty(tty);
@@ -927,6 +931,123 @@ impl ProcessControlBlock {
         };
 
         return pcb;
+    }
+
+    fn default_rlimits() -> [crate::process::resource::RLimit64; RLimitID::Nlimits as usize] {
+        use crate::mm::ucontext::UserStack;
+        use crate::process::resource::{RLimit64, RLimitID};
+
+        let mut arr = [RLimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        }; RLimitID::Nlimits as usize];
+
+        // Linux 典型默认值：软限制1024，硬限制65536
+        // 文件描述符表会根据RLIMIT_NOFILE自动扩容
+        arr[RLimitID::Nofile as usize] = RLimit64 {
+            rlim_cur: 1024,
+            rlim_max: 65536,
+        };
+
+        arr[RLimitID::Stack as usize] = RLimit64 {
+            rlim_cur: UserStack::DEFAULT_USER_STACK_SIZE as u64,
+            rlim_max: UserStack::DEFAULT_USER_STACK_SIZE as u64,
+        };
+
+        arr[RLimitID::As as usize] = {
+            let end = <crate::arch::MMArch as crate::mm::MemoryManagementArch>::USER_END_VADDR;
+            RLimit64 {
+                rlim_cur: end.data() as u64,
+                rlim_max: end.data() as u64,
+            }
+        };
+        arr[RLimitID::Rss as usize] = arr[RLimitID::As as usize];
+
+        arr
+    }
+
+    #[inline(always)]
+    pub fn get_rlimit(&self, res: RLimitID) -> crate::process::resource::RLimit64 {
+        self.rlimits.read()[res as usize]
+    }
+
+    pub fn set_rlimit(
+        &self,
+        res: RLimitID,
+        newv: crate::process::resource::RLimit64,
+    ) -> Result<(), system_error::SystemError> {
+        use system_error::SystemError;
+        if newv.rlim_cur > newv.rlim_max {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 注意：允许RLIMIT_NOFILE设置为0，这是测试用例的预期行为
+        // 当rlim_cur为0时，无法分配新的文件描述符，但现有fd仍可使用
+
+        // 对于RLIMIT_NOFILE，检查是否超过系统实现的最大容量限制
+        if res == RLimitID::Nofile {
+            if newv.rlim_cur > FileDescriptorVec::MAX_CAPACITY as u64 {
+                return Err(SystemError::EINVAL);
+            }
+            if newv.rlim_max > FileDescriptorVec::MAX_CAPACITY as u64 {
+                return Err(SystemError::EINVAL);
+            }
+        }
+
+        let cur = self.rlimits.read()[res as usize];
+        if newv.rlim_max > cur.rlim_max {
+            let cred = self.cred();
+            if !cred.has_capability(crate::process::cred::CAPFlags::CAP_SYS_RESOURCE) {
+                return Err(SystemError::EPERM);
+            }
+        }
+
+        // 更新rlimit
+        self.rlimits.write()[res as usize] = newv;
+
+        // 如果是RLIMIT_NOFILE变化，调整文件描述符表
+        if res == RLimitID::Nofile {
+            if let Err(e) = self.adjust_fd_table_for_rlimit_change(newv.rlim_cur as usize) {
+                // 如果调整失败，回滚rlimit设置
+                self.rlimits.write()[res as usize] = cur;
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 继承父进程的全部rlimit
+    pub fn inherit_rlimits_from(&self, parent: &Arc<ProcessControlBlock>) {
+        let src = *parent.rlimits.read();
+        *self.rlimits.write() = src;
+
+        // 继承后调整文件描述符表以匹配新的RLIMIT_NOFILE
+        let nofile_limit = src[RLimitID::Nofile as usize].rlim_cur as usize;
+        if let Err(e) = self.adjust_fd_table_for_rlimit_change(nofile_limit) {
+            // 如果调整失败，记录错误但不影响继承过程
+            error!(
+                "Failed to adjust fd table after inheriting rlimits: {:?}",
+                e
+            );
+        }
+    }
+
+    /// 当RLIMIT_NOFILE变化时调整文件描述符表
+    ///
+    /// ## 参数
+    /// - `new_rlimit_nofile`: 新的RLIMIT_NOFILE值
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 调整成功
+    /// - `Err(SystemError)`: 调整失败
+    fn adjust_fd_table_for_rlimit_change(
+        &self,
+        new_rlimit_nofile: usize,
+    ) -> Result<(), system_error::SystemError> {
+        let fd_table = self.basic.read().try_fd_table().unwrap();
+        let mut fd_table_guard = fd_table.write();
+        fd_table_guard.adjust_for_rlimit_change(new_rlimit_nofile)
     }
 
     /// 返回当前进程的锁持有计数

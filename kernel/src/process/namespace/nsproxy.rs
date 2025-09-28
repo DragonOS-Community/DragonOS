@@ -13,8 +13,7 @@ use crate::{
 };
 use core::{fmt::Debug, intrinsics::likely};
 
-use super::ipc_namespace::{IpcNamespace, INIT_IPC_NAMESPACE};
-use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
+use super::{ipc_namespace::IpcNamespace, pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///
@@ -31,7 +30,6 @@ pub struct NsProxy {
     /// mount namespace（挂载命名空间）
     pub mnt_ns: Arc<MntNamespace>,
     pub uts_ns: Arc<UtsNamespace>,
-    /// ipc namespace（SysV IPC、POSIX mqueue 等）
     pub ipc_ns: Arc<IpcNamespace>,
     // 其他namespace（为未来扩展预留）
     // pub net_ns: Option<Arc<NetNamespace>>,
@@ -51,7 +49,7 @@ impl NsProxy {
         let root_pid_ns = super::pid_namespace::INIT_PID_NAMESPACE.clone();
         let root_mnt_ns = root_mnt_namespace();
         let root_uts_ns = INIT_UTS_NAMESPACE.clone();
-        let root_ipc_ns = INIT_IPC_NAMESPACE.clone();
+        let root_ipc_ns = super::ipc_namespace::root_ipc_namespace();
         Arc::new(Self {
             pid_ns_for_children: root_pid_ns,
             mnt_ns: root_mnt_ns,
@@ -68,6 +66,11 @@ impl NsProxy {
     /// 获取mount namespace
     pub fn mnt_namespace(&self) -> &Arc<MntNamespace> {
         &self.mnt_ns
+    }
+    
+    /// 获取 IPC namespace
+    pub fn ipc_namespace(&self) -> &Arc<IpcNamespace> {
+        &self.ipc_ns
     }
 
     pub fn clone_inner(&self) -> Self {
@@ -156,7 +159,9 @@ pub(super) fn create_new_namespaces(
     let mnt_ns = nsproxy.mnt_ns.copy_mnt_ns(clone_flags, user_ns.clone())?;
 
     let uts_ns = nsproxy.uts_ns.copy_uts_ns(clone_flags, user_ns.clone())?;
-    let ipc_ns = nsproxy.ipc_ns.copy_ipc_ns(clone_flags, user_ns.clone());
+
+    let ipc_ns = nsproxy.ipc_ns.copy_ipc_ns(clone_flags, user_ns.clone())?;
+
     let result = NsProxy {
         pid_ns_for_children,
         mnt_ns,

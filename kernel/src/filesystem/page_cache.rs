@@ -72,6 +72,29 @@ impl InnerPageCache {
             return Ok(());
         }
 
+        // 检查是否为 tmpfs inode，如果是则需要设置 PG_SWAPBACKED 标志
+        let is_tmpfs = if let Some(page_cache) = self.page_cache_ref.upgrade() {
+            if let Some(inode_weak) = page_cache.inode() {
+                if let Some(inode) = inode_weak.upgrade() {
+                    // 检查 inode 是否为 LockedTmpFSInode 类型
+                    inode.as_any_ref().downcast_ref::<crate::mm::shmem::LockedTmpFSInode>().is_some()
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // 根据文件系统类型设置页面标志
+        let page_flags = if is_tmpfs {
+            PageFlags::PG_LRU | PageFlags::PG_SWAPBACKED
+        } else {
+            PageFlags::PG_LRU
+        };
+
         let mut page_manager_guard = page_manager_lock_irqsave();
 
         for i in 0..page_num {
@@ -86,7 +109,7 @@ impl InnerPageCache {
                         .expect("failed to get self_arc of pagecache"),
                     index: page_index,
                 }),
-                PageFlags::PG_LRU,
+                page_flags,
                 &mut LockedFrameAllocator,
             )?;
 
@@ -294,16 +317,19 @@ impl InnerPageCache {
             let _ = reclaimer.remove_page(&page.phys_address());
         }
 
-        if page_num > 0 {
+        // 如果需要截断最后一页的内容
+        if page_num > 0 && len % MMArch::PAGE_SIZE != 0 {
             let last_page_index = page_num - 1;
             let last_len = len - last_page_index * MMArch::PAGE_SIZE;
+            
+            // 只有当页面存在时才需要截断
+            // 如果页面不存在，说明这部分还没有数据，不需要截断
             if let Some(page) = self.get_page(last_page_index) {
                 unsafe {
                     page.write_irqsave().truncate(last_len);
                 };
-            } else {
-                return Err(SystemError::EIO);
             }
+            // 页面不存在时不是错误，直接继续
         }
 
         Ok(())
@@ -311,6 +337,56 @@ impl InnerPageCache {
 
     pub fn pages_count(&self) -> usize {
         return self.pages.len();
+    }
+
+    /// 只从已存在的页面读取数据，不创建新页面
+    /// 用于tmpfs等内存文件系统，避免循环依赖
+    pub fn read_existing_pages(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let len = buf.len();
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
+
+        let mut buf_offset = 0;
+        let mut ret = 0;
+        
+        for i in 0..page_num {
+            let page_index = start_page_index + i;
+
+            // 第一个页可能需要计算页内偏移
+            let page_offset = if i == 0 {
+                offset % MMArch::PAGE_SIZE
+            } else {
+                0
+            };
+
+            // 第一个页和最后一个页可能不满
+            let sub_len = if i == 0 {
+                core::cmp::min(len, MMArch::PAGE_SIZE - page_offset)
+            } else if i == page_num - 1 {
+                (offset + len - 1) % MMArch::PAGE_SIZE + 1
+            } else {
+                MMArch::PAGE_SIZE
+            };
+
+            if let Some(page) = self.get_page(page_index) {
+                let sub_buf = &mut buf[buf_offset..(buf_offset + sub_len)];
+                unsafe {
+                    sub_buf.copy_from_slice(
+                        &page.read_irqsave().as_slice()[page_offset..page_offset + sub_len],
+                    );
+                }
+                ret += sub_len;
+            }
+            // 如果页面不存在，保持缓冲区为零（已在调用者处清零）
+
+            buf_offset += sub_len;
+        }
+
+        Ok(ret)
     }
 
     /// Synchronize the page cache with the storage device.

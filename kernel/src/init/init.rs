@@ -75,11 +75,19 @@ fn do_start_kernel() {
 
     syscall_init().expect("syscall init failed");
 
+    // 早期初始化 IPC namespace（不依赖进程上下文）
+    crate::process::namespace::ipc_namespace::init_ipc_namespace()
+        .expect("IPC namespace early init failed");
+
     vfs_init().expect("vfs init failed");
     driver_init().expect("driver init failed");
 
     acpi_init().expect("acpi init failed");
     crate::sched::sched_init();
+
+    // 提前初始化时间子系统，避免在 process_init 中创建 tmpfs 时出现 panic
+    timekeeping_init();
+
     process_init();
     early_smp_init().expect("early smp init failed");
     irq_init().expect("irq init failed");
@@ -89,7 +97,6 @@ fn do_start_kernel() {
     // sched_init();
     softirq_init().expect("softirq init failed");
     Syscall::init().expect("syscall init failed");
-    timekeeping_init();
     time_init();
     timer_init();
     kthread_init();

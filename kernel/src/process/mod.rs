@@ -153,6 +153,11 @@ impl ProcessManager {
         
         // 进程管理系统初始化完成后，初始化 ProcFS 的进程相关功能
         Self::init_procfs_after_process_init();
+        
+        // 进程管理系统初始化完成后，完成 IPC namespace 子系统的完整初始化
+        if let Err(e) = crate::process::namespace::ipc_namespace::init_ipc_namespace_full() {
+            log::warn!("Failed to initialize IPC namespace subsystem: {:?}", e);
+        }
     }
 
     fn init_switch_result() {

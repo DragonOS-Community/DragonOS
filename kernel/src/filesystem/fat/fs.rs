@@ -293,11 +293,11 @@ impl LockedFATInode {
             let mut offset = 0;
             let mut buf = [0u8; 4096];
             loop {
-                let read_len = old_inode.read_sync(offset, &mut buf).unwrap();
+                let read_len = old_inode.read_pagecache(offset, &mut buf).unwrap();
                 if read_len == 0 {
                     break;
                 }
-                let write_len = new_inode.write_sync(offset, &buf[0..read_len]).unwrap();
+                let write_len = new_inode.write_pagecache(offset, &buf[0..read_len]).unwrap();
                 if write_len < read_len {
                     error!(
                         "FATFS: write link file failed, read_len={read_len}, write_len={write_len}"
@@ -1504,6 +1504,31 @@ impl FATFsInfo {
             self.trail_sig = cursor.read_u32()?;
         }
         return Ok(());
+    }
+}
+
+impl LockedFATInode {
+    fn read_pagecache(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let page_cache = self.0.lock().page_cache.clone();
+        if let Some(page_cache) = page_cache {
+            let r = page_cache.lock_irqsave().read(offset, buf);
+            return r;
+        } else {
+            return self.read_sync(offset, buf);
+        }
+    }
+
+    fn write_pagecache(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let page_cache = self.0.lock().page_cache.clone();
+        if let Some(page_cache) = page_cache {
+            let write_len = page_cache.lock_irqsave().write(offset, buf)?;
+            let mut guard = self.0.lock();
+            let old_size = guard.metadata.size;
+            guard.update_metadata(Some(core::cmp::max(old_size, (offset + write_len) as i64)));
+            return Ok(write_len);
+        } else {
+            return self.write_sync(offset, buf);
+        }
     }
 }
 

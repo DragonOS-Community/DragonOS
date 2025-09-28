@@ -1,17 +1,16 @@
 use alloc::vec::Vec;
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
-use uefi::table::boot::PAGE_SIZE;
 
 use alloc::{string::ToString, sync::Arc};
 use log::error;
 use system_error::SystemError;
 
 use crate::{
-    arch::{interrupt::TrapFrame, ipc::signal::Signal},
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, MMArch},
     filesystem::procfs::procfs_register_pid,
     ipc::signal_types::SignalFlags,
     libs::rwlock::RwLock,
-    mm::VirtAddr,
+    mm::{MemoryManagementArch, VirtAddr},
     process::ProcessFlags,
     sched::{sched_cgroup_fork, sched_fork},
     smp::core::smp_get_processor_id,
@@ -171,7 +170,7 @@ impl KernelCloneArgs {
         };
         const { assert!(core::mem::size_of::<CloneArgs>() == CLONE_ARGS_SIZE_VER2) };
 
-        if unlikely(size as u64 > PAGE_SIZE as u64) {
+        if unlikely(size as u64 > MMArch::PAGE_SIZE as u64) {
             return Err(SystemError::E2BIG);
         }
         if unlikely(size < CLONE_ARGS_SIZE_VER0) {

@@ -1,4 +1,5 @@
 use crate::filesystem::devfs::LockedDevFSInode;
+use crate::filesystem::vfs::FilePrivateData;
 use crate::{
     driver::base::{
         block::{
@@ -42,6 +43,36 @@ use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 const LOOP_BASENAME: &str = "loop";
+// loop device 加密类型
+pub const LO_CRYPT_NONE: u32 = 0;
+pub const LO_CRYPT_XOR: u32 = 1;
+pub const LO_CRYPT_DES: u32 = 2;
+pub const LO_CRYPT_FISH2: u32 = 3; // Twofish encryption
+pub const LO_CRYPT_BLOW: u32 = 4;
+pub const LO_CRYPT_CAST128: u32 = 5;
+pub const LO_CRYPT_IDEA: u32 = 6;
+pub const LO_CRYPT_DUMMY: u32 = 9;
+pub const LO_CRYPT_SKIPJACK: u32 = 10;
+pub const LO_CRYPT_CRYPTOAPI: u32 = 18;
+pub const MAX_LO_CRYPT: u32 = 20;
+
+// IOCTL 命令 - 使用 0x4C ('L')
+pub const LOOP_SET_FD: u32 = 0x4C00;
+pub const LOOP_CLR_FD: u32 = 0x4C01;
+pub const LOOP_SET_STATUS: u32 = 0x4C02;
+pub const LOOP_GET_STATUS: u32 = 0x4C03;
+pub const LOOP_SET_STATUS64: u32 = 0x4C04;
+pub const LOOP_GET_STATUS64: u32 = 0x4C05;
+pub const LOOP_CHANGE_FD: u32 = 0x4C06;
+pub const LOOP_SET_CAPACITY: u32 = 0x4C07;
+pub const LOOP_SET_DIRECT_IO: u32 = 0x4C08;
+pub const LOOP_SET_BLOCK_SIZE: u32 = 0x4C09;
+pub const LOOP_CONFIGURE: u32 = 0x4C0A;
+
+// /dev/loop-control 接口
+pub const LOOP_CTL_ADD: u32 = 0x4C80;
+pub const LOOP_CTL_REMOVE: u32 = 0x4C81;
+pub const LOOP_CTL_GET_FREE: u32 = 0x4C82;
 //LoopDevice是一个虚拟的块设备，它将文件映射到块设备上.
 pub struct LoopDevice {
     inner: SpinLock<LoopDeviceInner>, //加锁保护LoopDeviceInner
@@ -285,8 +316,8 @@ impl IndexNode for LoopDevice {
             dev_id: 0,
             inode_id: InodeId::new(0), // Loop 设备通常没有实际的 inode ID
             size: self.inner().file_size as i64,
-            blk_size: LBA_SIZE as usize,
-            blocks: (self.inner().file_size + LBA_SIZE - 1) / LBA_SIZE as usize, // 计算块数
+            blk_size: LBA_SIZE,
+            blocks: (self.inner().file_size + LBA_SIZE - 1) / LBA_SIZE, // 计算块数
             atime: file_metadata.atime,
             mtime: file_metadata.mtime,
             ctime: file_metadata.ctime,
@@ -549,6 +580,7 @@ impl LoopDeviceDriver {
     //     Ok(())
     // }
 }
+//初始化函数，注册1个loopcontrol设备和8个loop设备备用
 use crate::init::initcall::INITCALL_DEVICE;
 #[unified_init(INITCALL_DEVICE)]
 pub fn loop_init() -> Result<(), SystemError> {
@@ -556,7 +588,6 @@ pub fn loop_init() -> Result<(), SystemError> {
     // 获取 LoopDeviceDriver 的单例并调用初始化函数
     let driver = LoopDeviceDriver::new();
     loop_mgr.loop_init(driver)?;
-
     Ok(())
 }
 
@@ -679,7 +710,7 @@ impl LoopManager {
         let mut inner = self.inner();
         for (i, device) in inner.devices.iter_mut().enumerate() {
             if device.is_none() {
-                let devname = DevName::new(format!("{}{}", LOOP_BASENAME, i), i as usize);
+                let devname = DevName::new(format!("{}{}", LOOP_BASENAME, i), i);
                 let loop_device = LoopDevice::new_empty_loop_device(devname, i as u32)
                     .ok_or(SystemError::ENOMEM)?;
                 loop_device.set_file(file_inode.clone())?;
@@ -793,7 +824,14 @@ impl IndexNode for LoopControlDevice {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
-
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        todo!()
+    }
     fn read_at(
         &self,
         _offset: usize,

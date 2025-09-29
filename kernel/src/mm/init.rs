@@ -3,7 +3,7 @@ use core::{fmt::Write, sync::atomic::Ordering};
 use log::info;
 
 use crate::{
-    arch::MMArch,
+    arch::{init::setup_arch, MMArch},
     driver::serial::serial8250::send_to_default_serial8250_port,
     filesystem::procfs::kmsg::kmsg_init,
     libs::printk::PrintkWriter,
@@ -69,6 +69,10 @@ pub unsafe fn mm_init() {
             Ordering::SeqCst,
         )
         .unwrap();
+
+    #[cfg(target_arch = "riscv64")]
+    setup_arch().expect("setup_arch failed");
+
     MMArch::arch_post_init();
     info!("mm init done.");
 }

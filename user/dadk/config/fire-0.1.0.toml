@@ -1,0 +1,58 @@
+# 用户程序名称
+name = "fire"
+# 版本号
+version = "0.1.0"
+# 用户程序描述信息
+description = "Fire OCI 兼容容器运行时"
+# 是否只构建一次，如果为true，DADK会在构建成功后，将构建结果缓存起来，下次构建时，直接使用缓存的构建结果
+build-once = false
+# 是否只安装一次，如果为true，DADK会在安装成功后，不再重复安装
+install-once = false
+# 目标架构
+# 可选值："x86_64", "aarch64", "riscv64"
+target-arch = ["x86_64"]
+
+# 任务源
+[task-source]
+# 构建类型
+# 可选值："build-from-source", "install-from-prebuilt"
+type = "build-from-source"
+# 构建来源
+# "build_from_source" 可选值："git", "local", "archive"
+# "install_from_prebuilt" 可选值："local", "archive"
+source = "git"
+Git 仓库 URL（fire 项目 URL）
+source-path = "https://github.com/wu-eee/fire.git"
+Git 分支或标签
+branch = "main"
+# source = "local"
+# source-path = "bin/dadk_cache/source/fire_0_1_0"
+
+
+# 构建相关信息
+[build]
+# 构建命令 - 使用 make install 来构建和安装
+build-command = "make install"
+
+# 安装相关信息
+[install]
+# 安装到DragonOS的路径
+in-dragonos-path = "/usr"
+
+# 清除相关信息
+[clean]
+# 清除命令
+clean-command = "make clean"
+
+# 环境变量
+[[envs]]
+key = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
+value = "x86_64-linux-musl-gcc"
+
+[[envs]]
+key = "CC"
+value = "x86_64-linux-musl-gcc"
+
+[[envs]]
+key = "CXX"
+value = "x86_64-linux-musl-g++"

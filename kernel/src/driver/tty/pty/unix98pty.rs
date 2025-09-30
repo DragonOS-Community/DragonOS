@@ -77,7 +77,10 @@ impl TtyOperation for Unix98PtyDriverInner {
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<(), SystemError> {
         let core = tty.core();
         if core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster {
-            return Err(SystemError::ENOIOCTLCMD);
+            log::warn!("Unix98PtyDriver: ioctl called on non-pty master");
+            // return Err(SystemError::ENOIOCTLCMD);
+            // todo: implement other ioctl commands
+            return Ok(());
         }
 
         match cmd {
@@ -100,7 +103,10 @@ impl TtyOperation for Unix98PtyDriverInner {
                 return user_writer.copy_one_to_user(&(core.index() as u32), 0);
             }
             _ => {
-                return Err(SystemError::ENOIOCTLCMD);
+                log::warn!("Unix98PtyDriver: Unsupported ioctl cmd: {cmd:#x}");
+                // return Err(SystemError::ENOIOCTLCMD);
+                // todo: implement other ioctl commands
+                return Ok(());
             }
         }
     }

@@ -62,6 +62,7 @@ impl UnboundUdp {
         Ok(BoundUdp {
             inner,
             remote: SpinLock::new(None),
+            local_endpoint: smoltcp::wire::IpEndpoint::new(bind_addr, bind_port),
         })
     }
 
@@ -73,6 +74,7 @@ impl UnboundUdp {
         Ok(BoundUdp {
             inner,
             remote: SpinLock::new(Some(endpoint)),
+            local_endpoint: endpoint,
         })
     }
 }
@@ -81,6 +83,7 @@ impl UnboundUdp {
 pub struct BoundUdp {
     inner: BoundInner,
     remote: SpinLock<Option<smoltcp::wire::IpEndpoint>>,
+    local_endpoint: smoltcp::wire::IpEndpoint,
 }
 
 impl BoundUdp {
@@ -150,6 +153,10 @@ impl BoundUdp {
         self.with_mut_socket(|socket| {
             socket.close();
         });
+    }
+
+    pub fn local_endpoint(&self) -> smoltcp::wire::IpEndpoint {
+        self.local_endpoint
     }
 }
 

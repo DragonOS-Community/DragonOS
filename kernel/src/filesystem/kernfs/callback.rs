@@ -87,6 +87,7 @@ impl<'a> KernCallbackData<'a> {
 pub enum KernInodePrivateData {
     SysFS(SysFSKernPrivateData),
     ProcFS(ProcFSKernPrivateData),
+    CgroupFS(crate::cgroup::cgroup_fs::CgroupKernPrivateData),
     DebugFS(Arc<TracePointInfo>),
     TracePipe(TracePipeSnapshot),
     TraceSavedCmdlines(TraceCmdLineCacheSnapshot),
@@ -98,6 +99,7 @@ impl KernInodePrivateData {
         return match self {
             KernInodePrivateData::SysFS(private_data) => private_data.callback_read(buf, offset),
             KernInodePrivateData::ProcFS(private_data) => private_data.callback_read(buf, offset),
+            KernInodePrivateData::CgroupFS(private_data) => private_data.callback_read(buf, offset),
             _ => Err(SystemError::ENOSYS),
         };
     }
@@ -107,6 +109,7 @@ impl KernInodePrivateData {
         return match self {
             KernInodePrivateData::SysFS(private_data) => private_data.callback_write(buf, offset),
             KernInodePrivateData::ProcFS(private_data) => private_data.callback_write(buf, offset),
+            KernInodePrivateData::CgroupFS(private_data) => private_data.callback_write(buf, offset),
             _ => Err(SystemError::ENOSYS),
         };
     }

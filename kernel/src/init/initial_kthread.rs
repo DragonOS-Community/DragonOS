@@ -8,6 +8,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
+    cgroup::init_cgroups,
     driver::net::e1000e::e1000e::e1000e_init,
     filesystem::vfs::vcore::mount_root_fs,
     net::net_core::net_init,
@@ -169,6 +170,14 @@ fn run_init_process(
         // 不要因为 ProcFS 挂载失败而阻止 init 进程启动
     } else {
         log::info!("ProcFS mounted early during init process startup");
+    }
+    
+    // 初始化 cgroup 子系统
+    if let Err(e) = init_cgroups() {
+        log::warn!("Failed to initialize cgroups: {:?}", e);
+        // 不要因为 cgroup 初始化失败而阻止 init 进程启动
+    } else {
+        log::info!("Cgroup subsystem initialized successfully");
     }
     
     let path = proc_init_info.proc_name.to_str().unwrap();

@@ -161,7 +161,7 @@ pub(super) fn create_new_namespaces(
     let uts_ns = nsproxy.uts_ns.copy_uts_ns(clone_flags, user_ns.clone())?;
 
     let ipc_ns = nsproxy.ipc_ns.copy_ipc_ns(clone_flags, user_ns.clone())?;
-
+  
     let result = NsProxy {
         pid_ns_for_children,
         mnt_ns,

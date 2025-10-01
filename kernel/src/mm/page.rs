@@ -375,16 +375,27 @@ impl PageReclaimer {
             }
         }
 
-        let len = if let Ok(metadata) = inode.metadata() {
-            let size = metadata.size as usize;
-            size.saturating_sub(page_index * MMArch::PAGE_SIZE)
+        // 检查是否为 swap-backed 页面（如 tmpfs/shmem）
+        // 根据 Linux 内核设计，这类页面应该写入 swap 而不是文件系统
+        if guard.flags().contains(PageFlags::PG_SWAPBACKED) {
+            // 对于 swap-backed 页面（如 tmpfs/shmem），我们有几个选择：
+            // 1. 如果有 swap，写入 swap（当前 DragonOS 还未实现）
+            // 2. 如果没有 swap，跳过写回操作（因为数据已经在内存中）
+            // 
+            // 目前 DragonOS 还没有完整的 swap 实现，所以我们选择跳过写回
+            // 这符合 Linux 内核在没有 swap 时对 tmpfs 的处理方式
+            log::debug!("Skipping writeback for swap-backed page (tmpfs/shmem)");
         } else {
-            MMArch::PAGE_SIZE
-        };
+            // 对于常规文件页面，执行正常的写回操作
+            let len = if let Ok(metadata) = inode.metadata() {
+                let size = metadata.size as usize;
+                size.saturating_sub(page_index * MMArch::PAGE_SIZE)
+            } else {
+                MMArch::PAGE_SIZE
+            };
 
-        if len > 0 {
-            inode
-                .write_direct(
+            if len > 0 {
+                if let Err(e) = inode.write_direct(
                     page_index * MMArch::PAGE_SIZE,
                     len,
                     unsafe {
@@ -394,8 +405,12 @@ impl PageReclaimer {
                         )
                     },
                     SpinLock::new(FilePrivateData::Unused).lock(),
-                )
-                .unwrap();
+                ) {
+                    log::error!("Failed to write back page: {:?}", e);
+                    // 对于写回失败的情况，我们仍然清除脏标记以避免无限重试
+                    // 这可能导致数据丢失，但比内核 panic 要好
+                }
+            }
         }
 
         // 清除标记

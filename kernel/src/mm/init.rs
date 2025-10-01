@@ -51,7 +51,6 @@ pub unsafe fn mm_init() {
 
     // init slab
     slab_init();
-
     // enable mmio
     mmio_init();
     // enable KMSG

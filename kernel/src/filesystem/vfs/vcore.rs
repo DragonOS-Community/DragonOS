@@ -82,11 +82,18 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
     // 因为是换根所以路径没有变化
     // 不需要重新注册挂载目录
-    new_root_inode
-        .mkdir("proc", ModeType::from_bits_truncate(0o755))
-        .expect("Unable to create /proc")
-        .mount_from(old_root_inode.find("proc").expect("proc not mounted!"))
-        .expect("Failed to migrate filesystem of proc");
+    // 处理 /proc 目录迁移，支持懒挂载方式
+    if let Ok(proc_inode) = old_root_inode.find("proc") {
+        // /proc 实际存在并已挂载，迁移它
+        new_root_inode
+            .mkdir("proc", ModeType::from_bits_truncate(0o755))
+            .expect("Unable to create /proc")
+            .mount_from(proc_inode)
+            .expect("Failed to migrate filesystem of proc");
+    } else {
+        // /proc 还不存在（懒挂载），只创建目录
+        let _ = new_root_inode.mkdir("proc", ModeType::from_bits_truncate(0o755));
+    }
     new_root_inode
         .mkdir("dev", ModeType::from_bits_truncate(0o755))
         .expect("Unable to create /dev")

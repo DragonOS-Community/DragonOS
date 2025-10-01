@@ -373,12 +373,12 @@ impl Syscall {
 
             SYS_TKILL => {
                 warn!("SYS_TKILL has not yet been implemented");
-                Ok(0)
+                Err(SystemError::ENOSYS)
             }
 
             SYS_SIGALTSTACK => {
                 warn!("SYS_SIGALTSTACK has not yet been implemented");
-                Ok(0)
+                Err(SystemError::ENOSYS)
             }
 
             SYS_SYSLOG => {
@@ -480,7 +480,9 @@ impl Syscall {
 
             SYS_RT_SIGTIMEDWAIT => {
                 log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
-                Ok(0)
+                // 返回 ENOSYS (功能未实现) 错误，而不是成功
+                // 这样可以避免调用程序陷入无限循环
+                Err(SystemError::ENOSYS)
             }
             _ => {
                 log::error!(

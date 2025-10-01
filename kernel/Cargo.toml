@@ -30,6 +30,7 @@ kstack_protect = []
 
 # 运行时依赖项
 [dependencies]
+# once_cell = { version = "=1.19.0", default-features = false, features = ["alloc"] }
 acpi = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "282df2af7b" }
 asm_macros = { path = "crates/asm_macros" }
 atomic_enum = "=0.2.0"

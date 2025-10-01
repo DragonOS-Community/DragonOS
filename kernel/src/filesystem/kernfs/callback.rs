@@ -1,7 +1,7 @@
 use super::KernFSInode;
 use crate::tracepoint::{TraceCmdLineCacheSnapshot, TracePipeSnapshot, TracePointInfo};
 use crate::{
-    filesystem::{sysfs::SysFSKernPrivateData, vfs::PollStatus},
+    filesystem::{sysfs::SysFSKernPrivateData, procfs::file::ProcFSKernPrivateData, vfs::PollStatus},
     libs::spinlock::SpinLockGuard,
 };
 use alloc::sync::Arc;
@@ -86,6 +86,8 @@ impl<'a> KernCallbackData<'a> {
 #[derive(Debug)]
 pub enum KernInodePrivateData {
     SysFS(SysFSKernPrivateData),
+    ProcFS(ProcFSKernPrivateData),
+    CgroupFS(crate::cgroup::cgroup_fs::CgroupKernPrivateData),
     DebugFS(Arc<TracePointInfo>),
     TracePipe(TracePipeSnapshot),
     TraceSavedCmdlines(TraceCmdLineCacheSnapshot),
@@ -96,6 +98,8 @@ impl KernInodePrivateData {
     pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
         return match self {
             KernInodePrivateData::SysFS(private_data) => private_data.callback_read(buf, offset),
+            KernInodePrivateData::ProcFS(private_data) => private_data.callback_read(buf, offset),
+            KernInodePrivateData::CgroupFS(private_data) => private_data.callback_read(buf, offset),
             _ => Err(SystemError::ENOSYS),
         };
     }
@@ -104,6 +108,8 @@ impl KernInodePrivateData {
     pub fn callback_write(&self, buf: &[u8], offset: usize) -> Result<usize, SystemError> {
         return match self {
             KernInodePrivateData::SysFS(private_data) => private_data.callback_write(buf, offset),
+            KernInodePrivateData::ProcFS(private_data) => private_data.callback_write(buf, offset),
+            KernInodePrivateData::CgroupFS(private_data) => private_data.callback_write(buf, offset),
             _ => Err(SystemError::ENOSYS),
         };
     }

@@ -21,9 +21,9 @@ type = "build-from-source"
 # "build_from_source" 可选值："git", "local", "archive"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "git"
-Git 仓库 URL（fire 项目 URL）
+# Git 仓库 URL（fire 项目 URL）
 source-path = "https://github.com/wu-eee/fire.git"
-Git 分支或标签
+# Git 分支或标签
 branch = "main"
 # source = "local"
 # source-path = "bin/dadk_cache/source/fire_0_1_0"

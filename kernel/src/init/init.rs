@@ -4,6 +4,7 @@ use crate::{
         time::time_init,
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
+    cgroup::{cgroup_init_early, cgroup_init},
     driver::{
         acpi::acpi_init, base::init::driver_init, serial::serial_early_init,
         video::VideoRefreshManager,
@@ -61,6 +62,10 @@ fn do_start_kernel() {
 
     unsafe { mm_init() };
 
+    // 早期初始化 cgroup 核心基础设施
+    // 在内存管理初始化后，其他子系统之前调用（仿照Linux cgroup_init_early）
+    cgroup_init_early().expect("cgroup early init failed");
+
     // crate::debug::jump_label::static_keys_init();
     if scm_reinit().is_ok() {
         if let Err(e) = textui_init() {
@@ -80,6 +85,11 @@ fn do_start_kernel() {
         .expect("IPC namespace early init failed");
 
     vfs_init().expect("vfs init failed");
+    
+    // 主要的 cgroup 初始化
+    // 在VFS初始化完成后调用（仿照Linux cgroup_init）
+    cgroup_init().expect("cgroup init failed");
+    
     driver_init().expect("driver init failed");
 
     acpi_init().expect("acpi init failed");

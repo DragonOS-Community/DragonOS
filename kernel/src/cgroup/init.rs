@@ -12,14 +12,28 @@ use super::{
     cgroup_fs::{cgroup_fs_init, mount_cgroup_current_ns},
 };
 
-/// Initialize all cgroup subsystems
+/// Early cgroup initialization (similar to Linux cgroup_init_early)
 /// 
-/// This function should be called during kernel initialization to set up
-/// the cgroup v2 infrastructure and register all built-in subsystems.
-pub fn init_cgroups() -> Result<(), SystemError> {
-    log::info!("Initializing cgroup subsystem");
+/// This should be called early in kernel initialization, after memory management
+/// but before most other subsystems. It sets up the basic cgroup infrastructure.
+pub fn cgroup_init_early() -> Result<(), SystemError> {
+    log::info!("Early cgroup initialization - setting up core infrastructure");
     
-    // Initialize core cgroup infrastructure
+    // Initialize core cgroup infrastructure (manager, root cgroup)
+    super::cgroup_core_init()?;
+    
+    log::info!("Cgroup core infrastructure initialized successfully");
+    Ok(())
+}
+
+/// Main cgroup initialization (similar to Linux cgroup_init)
+/// 
+/// This should be called after VFS initialization. It registers subsystems
+/// and sets up the cgroup filesystem infrastructure.
+pub fn cgroup_init() -> Result<(), SystemError> {
+    log::info!("Main cgroup initialization - registering subsystems");
+    
+    // Initialize cgroup filesystem infrastructure
     cgroup_fs_init()?;
     
     // Initialize memory cgroup subsystem
@@ -31,12 +45,15 @@ pub fn init_cgroups() -> Result<(), SystemError> {
     // TODO: Mount cgroup filesystem at /sys/fs/cgroup
     // 暂时禁用挂载以避免与其他子系统的冲突
     // mount_cgroup_current_ns()?;
-    log::info!("Cgroup filesystem mount deferred");
+    log::info!("Cgroup filesystem mount deferred until VFS integration is complete");
     
-    log::info!("Cgroup v2 subsystem initialized successfully");
-    
+    log::info!("Cgroup subsystem initialized successfully");
     Ok(())
 }
+
+
+
+
 
 /// Cgroup subsystem initialization order
 /// 
@@ -63,6 +80,7 @@ mod tests {
     fn test_cgroup_init() {
         // Test that cgroup initialization doesn't panic
         // In a real kernel environment, this would verify proper setup
-        assert!(init_cgroups().is_ok());
+        assert!(cgroup_init_early().is_ok());
+        assert!(cgroup_init().is_ok());
     }
 }

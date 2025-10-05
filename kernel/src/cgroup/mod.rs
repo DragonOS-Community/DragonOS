@@ -30,7 +30,8 @@ use crate::{
 };
 
 // Re-export important types
-pub use init::init_cgroups;
+// Standard Linux-style function names
+pub use init::{cgroup_init_early, cgroup_init};
 
 pub mod mem_cgroup;
 pub mod cpu_cgroup;

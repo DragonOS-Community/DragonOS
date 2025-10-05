@@ -487,25 +487,14 @@ impl CgroupKernPrivateData {
 pub fn cgroup_fs_init() -> Result<(), SystemError> {
     // This will be called during kernel initialization
     // to set up the cgroup filesystem
-    
-    // First initialize the core cgroup infrastructure
-    super::cgroup_core_init()?;
-    
+    // Note: Core cgroup infrastructure should already be initialized
+    // by cgroup_init_early() before this function is called
     // TODO: Register filesystem type
     // TODO: Create mount point
     // TODO: Mount cgroup filesystem
     
+    log::info!("Cgroup filesystem infrastructure initialized");
     Ok(())
-}
-
-/// Mount cgroup filesystem
-pub fn mount_cgroup_fs() -> Result<Arc<CgroupFS>, SystemError> {
-    let cgroupfs = CgroupFS::new()?;
-    
-    // TODO: Actually mount the filesystem at /sys/fs/cgroup
-    // This would involve VFS integration
-    
-    Ok(cgroupfs)
 }
 
 /// Implementation of MountableFileSystem for CgroupFS
@@ -543,7 +532,7 @@ pub fn mount_cgroup_current_ns() -> Result<(), SystemError> {
         }
         Err(_) => {
             log::info!("mount_cgroup_current_ns: Creating new /sys directory");
-            root_inode.create("sys", crate::filesystem::vfs::FileType::Dir, ModeType::from_bits_truncate(0o755))?
+            root_inode.mkdir("sys", ModeType::from_bits_truncate(0o755))?
         }
     };
 
@@ -555,7 +544,7 @@ pub fn mount_cgroup_current_ns() -> Result<(), SystemError> {
         }
         Err(_) => {
             log::info!("mount_cgroup_current_ns: Creating new /sys/fs directory");
-            sys_dir.create("fs", crate::filesystem::vfs::FileType::Dir, ModeType::from_bits_truncate(0o755))?
+            sys_dir.mkdir("fs", ModeType::from_bits_truncate(0o755))?
         }
     };
 
@@ -575,16 +564,7 @@ pub fn mount_cgroup_current_ns() -> Result<(), SystemError> {
         }
         Err(_) => {
             log::info!("mount_cgroup_current_ns: Creating new /sys/fs/cgroup directory");
-            match fs_dir.create("cgroup", crate::filesystem::vfs::FileType::Dir, ModeType::from_bits_truncate(0o755)) {
-                Ok(dir) => {
-                    log::info!("mount_cgroup_current_ns: Successfully created /sys/fs/cgroup directory");
-                    dir
-                }
-                Err(mkdir_err) => {
-                    log::error!("mount_cgroup_current_ns: Failed to create /sys/fs/cgroup directory: {:?}", mkdir_err);
-                    return Err(mkdir_err);
-                }
-            }
+            fs_dir.mkdir("cgroup", ModeType::from_bits_truncate(0o755))?
         }
     };
 

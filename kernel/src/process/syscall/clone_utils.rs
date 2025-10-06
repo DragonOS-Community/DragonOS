@@ -1,20 +1,21 @@
+use core::intrinsics::unlikely;
+
 use crate::arch::interrupt::TrapFrame;
+use crate::arch::ipc::signal::Signal;
 use crate::arch::ipc::signal::MAX_SIG_NUM;
+use crate::arch::MMArch;
 use crate::filesystem::procfs::procfs_register_pid;
+use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
 use crate::sched::completion::Completion;
-use crate::syscall::user_access::UserBufferWriter;
+use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
-pub const CLONE_ARGS_SIZE_VER0: usize = 64; /* sizeof first published struct */
-pub const CLONE_ARGS_SIZE_VER1: usize = 80; /* sizeof second published struct */
-pub const CLONE_ARGS_SIZE_VER2: usize = 88; /* sizeof third published struct */
-
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct CloneArgs {
+#[derive(Clone, Copy)]
+struct PosixCloneArgs {
     pub flags: u64,
     pub pidfd: u64,
     pub child_tid: u64,
@@ -28,7 +29,11 @@ pub struct CloneArgs {
     pub cgroup: u64,
 }
 
-impl CloneArgs {
+impl PosixCloneArgs {
+    const CLONE_ARGS_SIZE_VER0: usize = 64; /* sizeof first published struct */
+    const CLONE_ARGS_SIZE_VER1: usize = 80; /* sizeof second published struct */
+    const CLONE_ARGS_SIZE_VER2: usize = 88; /* sizeof third published struct */
+
     pub fn check_valid(&self, size: usize) -> Result<(), SystemError> {
         if self.set_tid_size > MAX_PID_NS_LEVEL as u64 {
             return Err(SystemError::EINVAL);
@@ -39,11 +44,11 @@ impl CloneArgs {
         if self.set_tid > 0 && self.set_tid_size == 0 {
             return Err(SystemError::EINVAL);
         }
-        if self.exit_signal > 0xFF || self.exit_signal <= MAX_SIG_NUM as u64 {
+        if self.exit_signal >= MAX_SIG_NUM as u64 {
             return Err(SystemError::EINVAL);
         }
         if self.flags & CloneFlags::CLONE_INTO_CGROUP.bits() != 0
-            && (self.cgroup > i32::MAX as u64 || size < CLONE_ARGS_SIZE_VER2)
+            && (self.cgroup > i32::MAX as u64 || size < Self::CLONE_ARGS_SIZE_VER2)
         {
             return Err(SystemError::EINVAL);
         }
@@ -102,4 +107,83 @@ pub fn do_clone(clone_args: KernelCloneArgs, frame: &mut TrapFrame) -> Result<us
     }
 
     return Ok(pcb.raw_pid().0);
+}
+
+impl KernelCloneArgs {
+    pub fn copy_clone_args_from_user(
+        &mut self,
+        uargs_ptr: usize,
+        size: usize,
+    ) -> Result<(), SystemError> {
+        // 编译时检查
+        use kdepends::memoffset::offset_of;
+        const {
+            assert!(
+                offset_of!(PosixCloneArgs, tls) + core::mem::size_of::<u64>()
+                    == PosixCloneArgs::CLONE_ARGS_SIZE_VER0
+            )
+        };
+        const {
+            assert!(
+                offset_of!(PosixCloneArgs, set_tid_size) + core::mem::size_of::<u64>()
+                    == PosixCloneArgs::CLONE_ARGS_SIZE_VER1
+            )
+        };
+        const {
+            assert!(
+                offset_of!(PosixCloneArgs, cgroup) + core::mem::size_of::<u64>()
+                    == PosixCloneArgs::CLONE_ARGS_SIZE_VER2
+            )
+        };
+        const { assert!(core::mem::size_of::<PosixCloneArgs>() == PosixCloneArgs::CLONE_ARGS_SIZE_VER2) };
+
+        if unlikely(size as u64 > MMArch::PAGE_SIZE as u64) {
+            return Err(SystemError::E2BIG);
+        }
+        if unlikely(size < PosixCloneArgs::CLONE_ARGS_SIZE_VER0) {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 仅根据用户提供的size从用户态读取，避免越界读取
+        let bufreader = UserBufferReader::new(uargs_ptr as *const u8, size, true)?;
+
+        // 默认零初始化整个结构体，然后仅覆盖前size字节，保证未提供部分为0
+        let mut args: PosixCloneArgs = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
+        let copy_size = core::cmp::min(size, core::mem::size_of::<PosixCloneArgs>());
+        let args_prefix = unsafe {
+            core::slice::from_raw_parts_mut(
+                (&mut args as *mut PosixCloneArgs) as *mut u8,
+                copy_size,
+            )
+        };
+        // 从用户空间拷贝size字节到结构体前缀
+        bufreader.copy_from_user::<u8>(args_prefix, 0)?;
+
+        args.check_valid(size)?;
+
+        self.flags = CloneFlags::from_bits_truncate(args.flags);
+        self.pidfd = VirtAddr::new(args.pidfd as usize);
+        self.child_tid = VirtAddr::new(args.child_tid as usize);
+        self.parent_tid = VirtAddr::new(args.parent_tid as usize);
+        self.exit_signal = Signal::from(args.exit_signal as i32);
+        self.stack = args.stack as usize;
+        self.stack_size = args.stack_size as usize;
+        self.tls = args.tls as usize;
+        self.set_tid_size = args.set_tid_size as usize;
+        self.cgroup = args.cgroup as i32;
+
+        if self.set_tid_size > 0 {
+            let bufreader = UserBufferReader::new(
+                args.set_tid as *mut core::ffi::c_int,
+                core::mem::size_of::<core::ffi::c_int>() * self.set_tid_size,
+                true,
+            )?;
+            for i in 0..self.set_tid_size {
+                let tid = *bufreader.read_one_from_user::<core::ffi::c_int>(i)?;
+                self.set_tid.push(tid as usize);
+            }
+        }
+
+        Ok(())
+    }
 }

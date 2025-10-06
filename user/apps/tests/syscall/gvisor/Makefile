@@ -67,6 +67,7 @@ install: build download
 	@cp -f whitelist.txt $(INSTALL_DIR)/
 	@cp -rf blocklists $(INSTALL_DIR)/
 	@cp -rf tests $(INSTALL_DIR)/
+	@cp -f run_tests.sh $(INSTALL_DIR)/
 	@echo "安装完成"
 
 # 运行测试

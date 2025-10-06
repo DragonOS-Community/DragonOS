@@ -174,12 +174,13 @@ impl KernelCloneArgs {
 
         if self.set_tid_size > 0 {
             let bufreader = UserBufferReader::new(
-                args.set_tid as *mut core::ffi::c_int,
+                args.set_tid as *const core::ffi::c_int,
                 core::mem::size_of::<core::ffi::c_int>() * self.set_tid_size,
                 true,
             )?;
             for i in 0..self.set_tid_size {
-                let tid = *bufreader.read_one_from_user::<core::ffi::c_int>(i)?;
+                let byte_offset = i * core::mem::size_of::<core::ffi::c_int>();
+                let tid = *bufreader.read_one_from_user::<core::ffi::c_int>(byte_offset)?;
                 self.set_tid.push(tid as usize);
             }
         }

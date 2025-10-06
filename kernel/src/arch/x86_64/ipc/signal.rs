@@ -385,10 +385,20 @@ fn handle_signal(
     if unsafe { frame.syscall_nr() }.is_some() {
         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
             match syscall_err {
-                SystemError::ERESTARTNOHAND | SystemError::ERESTART_RESTARTBLOCK => {
+                SystemError::ERESTARTNOHAND => {
                     frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                 }
                 SystemError::ERESTARTSYS => {
+                    if !sigaction.flags().contains(SigFlags::SA_RESTART) {
+                        frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
+                    } else {
+                        frame.rax = frame.errcode;
+                        frame.rip -= 2;
+                    }
+                }
+                SystemError::ERESTART_RESTARTBLOCK => {
+                    // 为了让带 SA_RESTART 的时序（例如 clock_nanosleep 相对睡眠）也能自动重启，
+                    // 当 SA_RESTART 设置时，按 ERESTARTSYS 的语义处理；否则返回 EINTR。
                     if !sigaction.flags().contains(SigFlags::SA_RESTART) {
                         frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                     } else {

@@ -5,7 +5,9 @@ use crate::{
 
 use super::{allocator::page_frame::PageFrameCount, MsFlags, VmFlags};
 
+mod mempolice_utils;
 mod sys_brk;
+mod sys_get_mempolicy;
 mod sys_madvise;
 mod sys_mincore;
 mod sys_mmap;

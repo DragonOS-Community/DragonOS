@@ -23,7 +23,7 @@ use super::{
     pid::{Pid, PidType},
     KernelStack, ProcessControlBlock, ProcessManager, RawPid,
 };
-const MAX_PID_NS_LEVEL: usize = 32;
+pub const MAX_PID_NS_LEVEL: usize = 32;
 
 bitflags! {
     /// 进程克隆标志
@@ -79,6 +79,8 @@ bitflags! {
         const CLONE_IO = 0x80000000;
         /// 克隆时，将原本被设置为SIG_IGNORE的信号，设置回SIG_DEFAULT
         const CLONE_CLEAR_SIGHAND = 0x100000000;
+        /// 克隆到具有正确权限的特定cgroup中
+        const CLONE_INTO_CGROUP = 0x200000000;
     }
 }
 

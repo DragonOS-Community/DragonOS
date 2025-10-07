@@ -28,13 +28,13 @@ impl Syscall for SysPauseHandle {
         }
 
         // 禁用中断
-        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
         // 设置进程为可中断睡眠状态
         ProcessManager::mark_sleep(true)?;
 
         // 释放中断保护
-        drop(_irq_guard);
+        drop(irq_guard);
 
         // 调度出去，等待信号唤醒
         crate::sched::schedule(crate::sched::SchedMode::SM_NONE);

@@ -1,5 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CLOCK_NANOSLEEP;
+use crate::ipc::signal::{RestartBlock, RestartBlockData};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
@@ -152,37 +153,36 @@ impl Syscall for SysClockNanosleep {
         let wait_res = Self::do_wait_until(&deadline, clockid);
         match wait_res {
             Ok(()) => {
-                log::debug!(
-                    "clock_nanosleep: completed normally (flags={} is_abs={})",
-                    flags,
-                    is_abstime
-                );
+                // log::debug!(
+                //     "clock_nanosleep: completed normally (flags={} is_abs={})",
+                //     flags,
+                //     is_abstime
+                // );
                 return Ok(0);
             }
             Err(_e) => {
                 // 信号打断
                 if is_abstime {
                     // 绝对睡眠：返回 -ERESTARTNOHAND，不写 rmtp
-                    log::debug!("clock_nanosleep: ABS interrupted -> ERESTARTNOHAND");
+                    // log::debug!("clock_nanosleep: ABS interrupted -> ERESTARTNOHAND");
                     return Err(SystemError::ERESTARTNOHAND);
                 } else {
                     // 相对睡眠：写回剩余时间，并设置restart block
                     if let Some(ref mut w) = rmtp_writer {
                         let now = Self::ktime_now(clockid);
                         let remain = Self::calc_remaining(&deadline, &now);
-                        log::debug!(
-                            "clock_nanosleep: REL interrupted -> write rem {{sec={}, nsec={}}}",
-                            remain.tv_sec,
-                            remain.tv_nsec
-                        );
+                        // log::debug!(
+                        //     "clock_nanosleep: REL interrupted -> write rem {{sec={}, nsec={}}}",
+                        //     remain.tv_sec,
+                        //     remain.tv_nsec
+                        // );
                         w.copy_one_to_user(&remain, 0)?;
                     }
                     // 设置重启函数
-                    use crate::ipc::signal::{RestartBlock, RestartBlockData};
                     let data = RestartBlockData::Nanosleep { deadline, clockid };
-                    log::debug!(
-                        "clock_nanosleep: set restart block and return ERESTART_RESTARTBLOCK"
-                    );
+                    // log::debug!(
+                    //     "clock_nanosleep: set restart block and return ERESTART_RESTARTBLOCK"
+                    // );
                     let rb = RestartBlock::new(&crate::ipc::signal::RestartFnNanosleep, data);
                     return ProcessManager::current_pcb().set_restart_fn(Some(rb));
                 }

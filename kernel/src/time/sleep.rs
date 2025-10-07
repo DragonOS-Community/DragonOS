@@ -59,7 +59,7 @@ pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError
     let end_time = getnstimeofday();
 
     // 如果定时器没有超时（被信号或其他原因唤醒），则立即视为被中断
-    let mut was_interrupted = false;
+    let was_interrupted;
     if !timer.timeout() {
         timer.cancel();
         was_interrupted = true;

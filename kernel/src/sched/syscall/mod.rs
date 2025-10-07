@@ -10,6 +10,8 @@ use crate::syscall::Syscall;
 use super::fair::CompletelyFairScheduler;
 use super::{cpu_rq, schedule, SchedMode};
 
+mod sys_pause;
+
 impl Syscall {
     pub fn do_sched_yield() -> Result<usize, SystemError> {
         // 禁用中断

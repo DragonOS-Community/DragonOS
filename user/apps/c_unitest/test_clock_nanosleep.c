@@ -77,6 +77,10 @@ static void sigalrm_handler(int sig)
 
 static pthread_t g_main_thread;
 
+#define MAX_THREADS 10
+static pthread_t g_threads[MAX_THREADS];
+static int g_thread_count = 0;
+
 typedef struct {
     int signo;
     int ms;
@@ -102,9 +106,17 @@ static int trigger_signal_after_ms(int signo, int ms)
     args->signo = signo;
     args->ms = ms;
     int r = pthread_create(&th, NULL, signal_after_ms_thread, args);
-    if (r != 0) return -1;
-    // 分离线程，不阻塞主流程
-    pthread_detach(th);
+    if (r != 0) {
+        free(args);
+        return -1;
+    }
+    // 跟踪线程，等待主线程结束时回收
+    if (g_thread_count < MAX_THREADS) {
+        g_threads[g_thread_count++] = th;
+    } else {
+        // 如果超出限制，仍然分离线程
+        pthread_detach(th);
+    }
     return 0;
 }
 
@@ -213,6 +225,22 @@ int main(void)
     print_run("clock_nanosleep: abs EINTR");
     if (test_abs_interrupt_eintr() == 0) print_pass("clock_nanosleep: abs EINTR");
     else { print_failed("clock_nanosleep: abs EINTR"); fails++; }
+
+    // 等待所有信号线程完成
+    for (int i = 0; i < g_thread_count; i++) {
+        void *retval;
+        pthread_join(g_threads[i], &retval);
+    }
+
+    // DragonOS下pthread实现可能使用独立进程模拟线程，
+    // 这里主动回收任何遗留的"子线程"(子进程)，避免程序退出时被init接管。
+    int status;
+    for (;;) {
+        pid_t reaped = waitpid(-1, &status, WNOHANG);
+        if (reaped <= 0) {
+            break;
+        }
+    }
 
     if (fails == 0) return 0; else return 1;
 }

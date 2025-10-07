@@ -51,6 +51,8 @@ pub enum SigCode {
     AsyncIO = -4,
     /// sent by queued SIGIO
     SigIO = -5,
+    /// sent by tgkill/tkill
+    Tkill = -6,
 }
 
 impl SigCode {
@@ -65,6 +67,7 @@ impl SigCode {
             -3 => Self::Mesgq,
             -4 => Self::AsyncIO,
             -5 => Self::SigIO,
+            -6 => Self::Tkill,
             _ => panic!("signal code not valid"),
         }
     }

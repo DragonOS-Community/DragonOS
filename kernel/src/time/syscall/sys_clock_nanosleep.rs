@@ -109,7 +109,7 @@ impl Syscall for SysClockNanosleep {
             true,
         )?;
         let rq_user = rq_reader.read_one_from_user::<PosixTimeSpec>(0)?;
-        if !Self::is_valid_timespec(&rq_user) {
+        if !Self::is_valid_timespec(rq_user) {
             return Err(SystemError::EINVAL);
         }
         let rq = PosixTimeSpec {
@@ -180,7 +180,9 @@ impl Syscall for SysClockNanosleep {
                     // 设置重启函数
                     use crate::ipc::signal::{RestartBlock, RestartBlockData};
                     let data = RestartBlockData::Nanosleep { deadline, clockid };
-                    log::debug!("clock_nanosleep: set restart block and return ERESTART_RESTARTBLOCK");
+                    log::debug!(
+                        "clock_nanosleep: set restart block and return ERESTART_RESTARTBLOCK"
+                    );
                     let rb = RestartBlock::new(&crate::ipc::signal::RestartFnNanosleep, data);
                     return ProcessManager::current_pcb().set_restart_fn(Some(rb));
                 }

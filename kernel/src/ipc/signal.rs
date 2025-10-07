@@ -606,7 +606,10 @@ pub trait RestartFn: Debug + Sync + Send + 'static {
 #[derive(Debug, Clone)]
 pub enum RestartBlockData {
     Poll(PollRestartBlockData),
-    Nanosleep { deadline: crate::time::PosixTimeSpec, clockid: crate::time::syscall::PosixClockID },
+    Nanosleep {
+        deadline: crate::time::PosixTimeSpec,
+        clockid: crate::time::syscall::PosixClockID,
+    },
     // todo: futex_wait
     FutexWait(),
 }
@@ -620,7 +623,10 @@ impl RestartBlockData {
         })
     }
 
-    pub fn new_nanosleep(deadline: crate::time::PosixTimeSpec, clockid: crate::time::syscall::PosixClockID) -> Self {
+    pub fn new_nanosleep(
+        deadline: crate::time::PosixTimeSpec,
+        clockid: crate::time::syscall::PosixClockID,
+    ) -> Self {
         Self::Nanosleep { deadline, clockid }
     }
 }
@@ -638,8 +644,6 @@ pub struct RestartFnNanosleep;
 
 impl RestartFn for RestartFnNanosleep {
     fn call(&self, data: &mut RestartBlockData) -> Result<usize, SystemError> {
-        
-
         fn ktime_now(_clockid: PosixClockID) -> PosixTimeSpec {
             // 暂时使用 realtime 近似；后续区分 monotonic/boottime
             getnstimeofday()
@@ -649,7 +653,10 @@ impl RestartFn for RestartFnNanosleep {
             let now = ktime_now(*clockid);
             let mut sec = deadline.tv_sec - now.tv_sec;
             let mut nsec = deadline.tv_nsec - now.tv_nsec;
-            if nsec < 0 { sec -= 1; nsec += 1_000_000_000; }
+            if nsec < 0 {
+                sec -= 1;
+                nsec += 1_000_000_000;
+            }
             if sec < 0 || (sec == 0 && nsec == 0) {
                 return Ok(0);
             }

@@ -79,6 +79,12 @@ fn main() -> Result<()> {
                 .value_name("PATTERN")
                 .action(clap::ArgAction::Append)
                 .help("测试名称模式"),
+        )
+        .arg(
+            Arg::new("stdout")
+                .long("stdout")
+                .action(clap::ArgAction::SetTrue)
+                .help("将测试输出直接显示到控制台，而不是保存到文件"),
         );
 
     let matches = app.get_matches();
@@ -110,6 +116,9 @@ fn main() -> Result<()> {
     if let Some(patterns) = matches.get_many::<String>("test-patterns") {
         config.test_patterns = patterns.cloned().collect();
     }
+
+    // 设置输出方式
+    config.output_to_stdout = matches.get_flag("stdout");
 
     // 创建测试运行器
     let runner = TestRunner::new(config);

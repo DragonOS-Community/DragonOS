@@ -4,6 +4,7 @@ use crate::{
         time::time_init,
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
+    cgroup::cgroup_init_early,
     driver::{
         acpi::acpi_init, base::init::driver_init, serial::serial_early_init,
         video::VideoRefreshManager,
@@ -61,6 +62,10 @@ fn do_start_kernel() {
 
     unsafe { mm_init() };
 
+    // 早期初始化 cgroup 核心基础设施
+    // 在内存管理初始化后，其他子系统之前调用（仿照Linux cgroup_init_early）
+    cgroup_init_early().expect("cgroup early init failed");
+
     // crate::debug::jump_label::static_keys_init();
     if scm_reinit().is_ok() {
         if let Err(e) = textui_init() {
@@ -75,11 +80,20 @@ fn do_start_kernel() {
 
     syscall_init().expect("syscall init failed");
 
-    vfs_init().expect("vfs init failed");
+    // 早期初始化 IPC namespace（不依赖进程上下文）
+    crate::process::namespace::ipc_namespace::init_ipc_namespace()
+        .expect("IPC namespace early init failed");
+
+    vfs_init().expect("vfs init failed");    
+    
     driver_init().expect("driver init failed");
 
     acpi_init().expect("acpi init failed");
     crate::sched::sched_init();
+
+    // 提前初始化时间子系统，避免在 process_init 中创建 tmpfs 时出现 panic
+    timekeeping_init();
+
     process_init();
     early_smp_init().expect("early smp init failed");
     irq_init().expect("irq init failed");
@@ -89,7 +103,6 @@ fn do_start_kernel() {
     // sched_init();
     softirq_init().expect("softirq init failed");
     Syscall::init().expect("syscall init failed");
-    timekeeping_init();
     time_init();
     timer_init();
     kthread_init();

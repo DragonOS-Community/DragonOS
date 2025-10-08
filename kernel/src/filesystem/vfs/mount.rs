@@ -1108,7 +1108,8 @@ impl MountList {
                 }
                 None
             })
-            .next()
+            // .next()
+            .max_by_key(|(key, _, _)| key.as_str().len())  // 选择最长匹配而不是第一个匹配
     }
 
     /// # remove - 移除挂载点

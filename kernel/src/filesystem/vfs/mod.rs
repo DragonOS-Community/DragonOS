@@ -19,7 +19,7 @@ use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
-    filesystem::epoll::EPollItem,
+    filesystem::{epoll::EPollItem, procfs},
     ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
@@ -790,9 +790,90 @@ impl dyn IndexNode {
                 continue;
             }
 
-            let inode = result.find(&name)?;
-            let file_type = inode.metadata()?.file_type;
+            // 懒加载：首次访问 /proc 时，若尚未挂载，则自动挂载到当前命名空间
+            if name == "proc" {
+                // log::info!("VFS lookup: Attempting to access proc directory");
+                let root_inode2 = ProcessManager::current_mntns().root_inode();
+                // 使用 inode_id 判断是否为系统根，而不是 Arc::ptr_eq（Arc 每次包装不同）
+                let is_root = match (root_inode2.metadata(), result.metadata()) {
+                    (Ok(rm), Ok(cm)) => rm.inode_id == cm.inode_id,
+                    _ => false,
+                };
+                if is_root {
+                    // 若已精确挂载，则直接跳过，避免重复尝试
+                    let mntns = ProcessManager::current_mntns();
+                    if let Some((_mp, rest, _)) = mntns.get_mount_point("/proc") {
+                        if rest.is_empty() {
+                            // log::info!("VFS lookup: /proc already mounted, skipping");
+                        } else {
+                            log::info!("VFS lookup: Current inode is root, attempting to mount /proc");
+                            if let Err(e) = procfs::mount_proc_current_ns() {
+                                log::error!("Failed to mount /proc via lazy loading: {:?}", e);
+                            }
+                        }
+                    } else {
+                        log::info!("VFS lookup: Current inode is root, attempting to mount /proc");
+                        if let Err(e) = procfs::mount_proc_current_ns() {
+                            log::error!("Failed to mount /proc via lazy loading: {:?}", e);
+                        }
+                    }
+                } else {
+                    log::info!("VFS lookup: Current inode is not root, skipping proc mount");
+                }
+            }
+
+            // let inode = result.find(&name)?;
+            // let file_type = inode.metadata()?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
+
+            
+            // 挂载点目录不需要预先存在：挂载操作会“覆盖”路径
+            // 路径解析通过挂载表找到对应的挂载点
+            // 先尝试常规查找
+            let inode = match result.find(&name) {
+                Ok(found_inode) => found_inode,
+                Err(_) => {
+                    // 常规查找失败，检查是否有挂载点覆盖当前路径
+                    let current_path = if path.starts_with('/') {
+                        // 绝对路径：重新构建到当前位置的路径
+                        let original_path = path;
+                        let remaining_len = if rest_path.is_empty() { 0 } else { rest_path.len() + 1 }; // +1 for '/'
+                        let current_len = original_path.len() - remaining_len;
+                        &original_path[..current_len]
+                    } else {
+                        // 相对路径：这种情况比较复杂，暂时跳过挂载点检查
+                        // TODO: 实现相对路径的挂载点检查支持
+                        log::debug!("VFS lookup: Relative path mount point checking not implemented, skipping mount point check for path component '{}'", name);
+                        ""
+                    };
+
+                    if !current_path.is_empty() {
+                        let mntns = ProcessManager::current_mntns();
+                        if let Some((_mp, rest_mount, mount_fs)) = mntns.get_mount_point(current_path) {
+                            if rest_mount.is_empty() {
+                                // 精确匹配挂载点，使用挂载的文件系统根节点
+                                log::debug!("VFS lookup: Found exact mount point at '{}', using mounted filesystem", current_path);
+                                return Ok(mount_fs.root_inode());
+                            } else {
+                                // 没有精确匹配的挂载点，返回原始错误
+                                // log::debug!("VFS lookup: Found mount point at '{}' but with remaining path '{}', file '{}' not found", current_path, rest_mount, name);
+                                return Err(SystemError::ENOENT);
+                            }
+                        } else {
+                            // 没有找到挂载点，返回原始错误
+                            log::debug!("VFS lookup: No mount point found for path '{}', file '{}' not found", current_path, name);
+                            return Err(SystemError::ENOENT);
+                        }
+                    } else {
+                        // 相对路径且没有挂载点检查，返回原始错误
+                        log::debug!("VFS lookup: Relative path mount point checking skipped, file '{}' not found", name);
+                        return Err(SystemError::ENOENT);
+                    }
+                }
+            };
+            
+            let file_type = inode.metadata()?.file_type;
+
             if rest_path.is_empty() && !follow_final_symlink && file_type == FileType::SymLink {
                 // 返回符号链接本身
                 return Ok(inode);
@@ -1036,32 +1117,32 @@ macro_rules! register_mountable_fs {
     ($fs:ident, $maker_name:ident, $fs_name:literal) => {
         impl $fs {
             fn make_fs_bridge(
-                data: Option<&dyn FileSystemMakerData>,
-            ) -> Result<Arc<dyn FileSystem>, SystemError> {
-                <$fs as MountableFileSystem>::make_fs(data)
+                data: Option<&dyn $crate::filesystem::vfs::FileSystemMakerData>,
+            ) -> Result<::alloc::sync::Arc<dyn $crate::filesystem::vfs::FileSystem>, ::system_error::SystemError> {
+                <$fs as $crate::filesystem::vfs::MountableFileSystem>::make_fs(data)
             }
 
             fn make_mount_data_bridge(
                 raw_data: Option<&str>,
                 source: &str,
-            ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-                <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
+            ) -> Result<Option<::alloc::sync::Arc<dyn $crate::filesystem::vfs::FileSystemMakerData + 'static>>, ::system_error::SystemError> {
+                <$fs as $crate::filesystem::vfs::MountableFileSystem>::make_mount_data(raw_data, source)
             }
         }
 
-        #[distributed_slice(FSMAKER)]
-        static $maker_name: FileSystemMaker = FileSystemMaker::new(
+        #[::linkme::distributed_slice(crate::filesystem::vfs::FSMAKER)]
+        static $maker_name: $crate::filesystem::vfs::FileSystemMaker = $crate::filesystem::vfs::FileSystemMaker::new(
             $fs_name,
             &($fs::make_fs_bridge
                 as fn(
-                    Option<&dyn FileSystemMakerData>,
-                ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+                    Option<&dyn $crate::filesystem::vfs::FileSystemMakerData>,
+                ) -> Result<::alloc::sync::Arc<dyn $crate::filesystem::vfs::FileSystem + 'static>, ::system_error::SystemError>),
             &($fs::make_mount_data_bridge
                 as fn(
                     Option<&str>,
                     &str,
                 )
-                    -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+                    -> Result<Option<::alloc::sync::Arc<dyn $crate::filesystem::vfs::FileSystemMakerData + 'static>>, ::system_error::SystemError>),
         );
     };
 }

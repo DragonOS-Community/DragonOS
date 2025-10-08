@@ -31,7 +31,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
-        procfs::procfs_unregister_pid,
+        procfs::{procfs_register_pid, procfs_unregister_pid},
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
@@ -150,6 +150,14 @@ impl ProcessManager {
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
         info!("Process Manager initialized.");
+        
+        // 进程管理系统初始化完成后，初始化 ProcFS 的进程相关功能
+        Self::init_procfs_after_process_init();
+        
+        // 进程管理系统初始化完成后，完成 IPC namespace 子系统的完整初始化
+        if let Err(e) = crate::process::namespace::ipc_namespace::init_ipc_namespace_full() {
+            log::warn!("Failed to initialize IPC namespace subsystem: {:?}", e);
+        }
     }
 
     fn init_switch_result() {
@@ -166,6 +174,19 @@ impl ProcessManager {
     #[allow(dead_code)]
     pub fn initialized() -> bool {
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE }
+    }
+
+    /// 在进程管理系统初始化完成后，初始化 ProcFS 的进程相关功能
+    fn init_procfs_after_process_init() {
+        // 旧的全局 PROCFS_INSTANCE 已移除。直接通过通知机制为当前进程注册到已挂载的 /proc 实例。
+        let current_pid = ProcessManager::current_pid();
+        if current_pid != RawPid(0) {
+            if let Err(e) = procfs_register_pid(current_pid) {
+                warn!("Failed to register current process {} to procfs: {:?}", current_pid, e);
+            } else {
+                info!("Successfully registered current process {} to procfs", current_pid);
+            }
+        }
     }
 
     /// 获取当前进程的pcb

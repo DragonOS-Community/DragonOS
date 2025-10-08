@@ -1,0 +1,32 @@
+# Cargo 配置文件 - 用于 DragonOS 交叉编译
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+]
+
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[env]
+CC_x86_64_unknown_linux_musl = "x86_64-linux-musl-gcc"
+CXX_x86_64_unknown_linux_musl = "x86_64-linux-musl-g++"
+AR_x86_64_unknown_linux_musl = "x86_64-linux-musl-ar"
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "x86_64-linux-musl-gcc"
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+]
+
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[env]
+CC_x86_64_unknown_linux_musl = "x86_64-linux-musl-gcc"
+CXX_x86_64_unknown_linux_musl = "x86_64-linux-musl-g++"
+AR_x86_64_unknown_linux_musl = "x86_64-linux-musl-ar"
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "x86_64-linux-musl-gcc"

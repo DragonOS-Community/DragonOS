@@ -1522,8 +1522,8 @@ impl AnonSharedMapping {
         return NEXT_ID.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn new() -> alloc::sync::Arc<Self> {
-        alloc::sync::Arc::new(Self { id: Self::new_id() })
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { id: Self::new_id() })
     }
 }
 

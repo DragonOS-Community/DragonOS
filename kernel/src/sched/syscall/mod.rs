@@ -10,6 +10,7 @@ use crate::syscall::Syscall;
 use super::fair::CompletelyFairScheduler;
 use super::{cpu_rq, schedule, SchedMode};
 
+#[cfg(target_arch = "x86_64")]
 mod sys_pause;
 
 impl Syscall {

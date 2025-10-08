@@ -7,12 +7,53 @@ use crate::{
     arch::{
         asm::bitops::ffz,
         interrupt::TrapFrame,
-        ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
+        ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
     process::RawPid,
     syscall::user_access::UserBufferWriter,
 };
+
+/// siginfo中的si_code的可选值
+/// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
+#[derive(Copy, Debug, Clone)]
+#[repr(i32)]
+pub enum SigCode {
+    /// sent by kill, sigsend, raise
+    User = 0,
+    /// sent by kernel from somewhere
+    Kernel = 0x80,
+    /// 通过sigqueue发送
+    Queue = -1,
+    /// 定时器过期时发送
+    Timer = -2,
+    /// 当实时消息队列的状态发生改变时发送
+    Mesgq = -3,
+    /// 当异步IO完成时发送
+    AsyncIO = -4,
+    /// sent by queued SIGIO
+    SigIO = -5,
+    /// sent by tgkill/tkill
+    Tkill = -6,
+}
+
+impl SigCode {
+    /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
+    #[allow(dead_code)]
+    pub fn from_i32(x: i32) -> SigCode {
+        match x {
+            0 => Self::User,
+            0x80 => Self::Kernel,
+            -1 => Self::Queue,
+            -2 => Self::Timer,
+            -3 => Self::Mesgq,
+            -4 => Self::AsyncIO,
+            -5 => Self::SigIO,
+            -6 => Self::Tkill,
+            _ => panic!("signal code not valid"),
+        }
+    }
+}
 
 /// 用户态程序传入的SIG_DFL的值
 pub const USER_SIG_DFL: u64 = 0;

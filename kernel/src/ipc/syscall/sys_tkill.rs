@@ -7,10 +7,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
-    arch::{
-        ipc::signal::{SigCode, Signal},
-        syscall::nr::SYS_TKILL,
-    },
+    arch::{ipc::signal::Signal, syscall::nr::SYS_TKILL},
+    ipc::signal_types::SigCode,
     process::{ProcessControlBlock, ProcessManager, RawPid},
 };
 use system_error::SystemError;

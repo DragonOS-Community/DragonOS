@@ -5,7 +5,8 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::{SigCode, SigSet, Signal},
+    arch::ipc::signal::{SigSet, Signal},
+    ipc::signal_types::SigCode,
     ipc::signal_types::SigactionType,
     mm::VirtAddr,
     process::{

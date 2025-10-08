@@ -130,12 +130,10 @@ impl Pid {
     pub fn pid_nr_ns(&self, ns: &Arc<PidNamespace>) -> RawPid {
         if ns.level() <= self.level {
             let numbers = self.numbers.lock();
-            let upid = numbers[ns.level() as usize]
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| panic!("pid numbers should not be empty: ns.level={}, self.level={}, numbers.len={}", ns.level(), self.level, numbers.len()));
-            if Arc::ptr_eq(&upid.ns, ns) {
-                return upid.nr;
+            if let Some(upid) = numbers.get(ns.level() as usize).and_then(|x| x.as_ref()) {
+                if Arc::ptr_eq(&upid.ns, ns) {
+                    return upid.nr;
+                }
             }
         }
 

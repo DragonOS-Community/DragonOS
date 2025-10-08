@@ -18,6 +18,7 @@ dup_test
 #fork_test
 #exec_test
 #wait_test
+futex_test
 
 # 内存管理测试
 #mmap_test

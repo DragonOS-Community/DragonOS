@@ -620,6 +620,15 @@ impl ProcessManager {
                 .threads_write_irqsave()
                 .group_tasks
                 .push(Arc::downgrade(pcb));
+
+            // 确保非组长线程的 TGID 与组长一致
+            let leader_tgid_pid = group_leader.pid();
+            pcb.init_task_pid(PidType::TGID, leader_tgid_pid.clone());
+            pcb.init_task_pid(PidType::PGID, leader_tgid_pid.clone());
+            pcb.init_task_pid(PidType::SID, leader_tgid_pid.clone());
+            pcb.attach_pid(PidType::TGID);
+            pcb.attach_pid(PidType::PGID);
+            pcb.attach_pid(PidType::SID);
         }
 
         pcb.attach_pid(PidType::PID);

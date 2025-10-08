@@ -45,7 +45,37 @@ impl Syscall {
                 return Futex::futex_wait(uaddr, flags, val, timeout, FUTEX_BITSET_MATCH_ANY);
             }
             FutexArg::FUTEX_WAIT_BITSET => {
-                return Futex::futex_wait(uaddr, flags, val, timeout, val3);
+                // Linux 语义：WAIT_BITSET 的超时为绝对时间（clock_nanosleep 风格）。
+                // 这里将绝对截止时间转换为相对剩余时间，past 则立即 ETIMEDOUT。
+                let adjusted_timeout = if let Some(deadline) = timeout {
+                    // 校验 timespec 合法性
+                    if deadline.tv_nsec < 0 || deadline.tv_nsec >= 1_000_000_000 {
+                        return Err(SystemError::EINVAL);
+                    }
+
+                    // 选择时钟：若带 FUTEX_CLOCK_REALTIME 则使用 realtime；否则使用 monotonic（当前实现等价）
+                    let now = crate::time::timekeeping::getnstimeofday();
+
+                    // 计算剩余时间 = deadline - now，若 <=0 则立即超时
+                    let mut sec = deadline.tv_sec - now.tv_sec;
+                    let mut nsec = deadline.tv_nsec - now.tv_nsec;
+                    if nsec < 0 {
+                        nsec += 1_000_000_000;
+                        sec -= 1;
+                    }
+                    if sec < 0 || (sec == 0 && nsec == 0) {
+                        return Err(SystemError::ETIMEDOUT);
+                    }
+
+                    Some(PosixTimeSpec {
+                        tv_sec: sec,
+                        tv_nsec: nsec,
+                    })
+                } else {
+                    None
+                };
+
+                return Futex::futex_wait(uaddr, flags, val, adjusted_timeout, val3);
             }
             FutexArg::FUTEX_WAKE => {
                 return Futex::futex_wake(uaddr, flags, val, FUTEX_BITSET_MATCH_ANY);

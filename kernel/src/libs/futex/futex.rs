@@ -90,7 +90,6 @@ impl FutexHashBucket {
     /// ## 唤醒队列中的最多nr_wake个进程
     ///
     /// return: 唤醒的进程数
-    #[inline(always)]
     pub fn wake_up(
         &mut self,
         key: FutexKey,
@@ -104,7 +103,7 @@ impl FutexHashBucket {
                 // TODO: 考虑优先级继承的机制
 
                 if let Some(bitset) = bitset {
-                    if futex_q.bitset != bitset {
+                    if futex_q.bitset & bitset == 0 {
                         self.chain.push_back(futex_q);
                         continue;
                     }

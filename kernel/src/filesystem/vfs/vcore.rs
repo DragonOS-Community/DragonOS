@@ -189,7 +189,6 @@ pub fn do_mkdir_at(
     mode: FileMode,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     trace_do_mkdir_at(path, mode);
-    // debug!("Call do mkdir at");
     let (mut current_inode, path) =
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
     let (name, parent) = rsplit_path(&path);
@@ -197,7 +196,6 @@ pub fn do_mkdir_at(
         current_inode =
             current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     }
-    // debug!("mkdir at {:?}", current_inode.metadata()?.inode_id);
     return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
 }
 
@@ -288,17 +286,12 @@ pub(super) fn do_file_lookup_at(
 /// - 只读挂载返回 EROFS
 #[inline(never)]
 pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
-    // log::debug!("vfs_truncate: called with len={}", len);
-
     let md = inode.metadata()?;
-    // log::debug!("vfs_truncate: metadata - file_type={:?}, current_size={}", md.file_type, md.size);
 
     if md.file_type == FileType::Dir {
-        // log::debug!("vfs_truncate: rejecting directory truncate");
         return Err(SystemError::EISDIR);
     }
     if md.file_type != FileType::File {
-        // log::debug!("vfs_truncate: rejecting non-file truncate, type={:?}", md.file_type);
         return Err(SystemError::EINVAL);
     }
 
@@ -306,22 +299,12 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
     let fs = inode.fs();
     if let Some(mfs) = fs.clone().downcast_arc::<MountFS>() {
         let mount_flags = mfs.mount_flags();
-        // log::debug!("vfs_truncate: mount_flags={:?}", mount_flags);
         if mount_flags.contains(crate::filesystem::vfs::mount::MountFlags::RDONLY) {
-            // log::debug!("vfs_truncate: rejecting truncate on read-only mount");
             return Err(SystemError::EROFS);
         }
     }
 
-    // log::debug!("vfs_truncate: calling inode.resize({})", len);
     let result = inode.resize(len);
-    // log::debug!("vfs_truncate: inode.resize result={:?}", result);
-
-    // // 验证截断后的文件大小
-    // if result.is_ok() {
-    //     let new_md = inode.metadata()?;
-    //     log::debug!("vfs_truncate: after resize - new_size={}", new_md.size);
-    // }
 
     result
 }

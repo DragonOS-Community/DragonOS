@@ -19,7 +19,7 @@ $(dropbear_tarball_path):
 $(dropbear_dir): $(dropbear_tarball_path)
 	mkdir -p $(build_dir)
 	tar -xjf $< -C $(build_dir)
-	sudo apt-get install libcrypt-dev
+
 # 配置和编译
 $(bin): $(dropbear_dir)
 	cd $(dropbear_dir) && \

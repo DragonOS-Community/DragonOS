@@ -1655,8 +1655,9 @@ impl IndexNode for LockedFATInode {
         Ok(())
     }
     fn resize(&self, len: usize) -> Result<(), SystemError> {
+        // 先调整页缓存大小，但不要提前返回；后续仍需同步到底层文件并更新元数据
         if let Some(page_cache) = self.page_cache() {
-            return page_cache.lock_irqsave().resize(len);
+            page_cache.lock_irqsave().resize(len)?;
         }
 
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
@@ -1690,7 +1691,9 @@ impl IndexNode for LockedFATInode {
                         file.truncate(fs, len as u64)?;
                     }
                 }
+                // 同步元数据：从文件对象获取最新大小，并确保一致
                 guard.synchronize_metadata();
+                guard.metadata.size = len as i64;
                 return Ok(());
             }
             FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),

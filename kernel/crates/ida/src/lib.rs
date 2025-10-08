@@ -148,6 +148,11 @@ impl IdAllocator {
     pub fn get_max_id(&self) -> usize {
         self.max_id
     }
+
+    /// 获取当前ID指针的位置（用于调试）
+    pub fn current_id(&self) -> usize {
+        self.current_id
+    }
 }
 
 impl core::fmt::Debug for IdAllocator {

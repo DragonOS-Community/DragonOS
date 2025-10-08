@@ -312,7 +312,7 @@ impl Syscall {
                 let val3 = args[5] as u32;
 
                 let mut timespec = None;
-                if utime != 0 && operation.contains(FutexFlag::FLAGS_HAS_TIMEOUT) {
+                if utime != 0 {
                     let reader = UserBufferReader::new(
                         utime as *const PosixTimeSpec,
                         core::mem::size_of::<PosixTimeSpec>(),

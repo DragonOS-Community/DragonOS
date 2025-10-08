@@ -237,12 +237,18 @@ impl Futex {
             flags.contains(FutexFlag::FLAGS_SHARED),
             FutexAccess::FutexRead,
         )?;
-        
+
         // Debug: 打印futex_wait信息
         let current_pid = ProcessManager::current_pcb().raw_pid().data();
         let is_shared = flags.contains(FutexFlag::FLAGS_SHARED);
-        warn!("[FUTEX_DEBUG] futex_wait: pid={}, uaddr=0x{:x}, val={}, is_shared={}, key={:?}", 
-              current_pid, uaddr.data(), val, is_shared, key);
+        warn!(
+            "[FUTEX_DEBUG] futex_wait: pid={}, uaddr=0x{:x}, val={}, is_shared={}, key={:?}",
+            current_pid,
+            uaddr.data(),
+            val,
+            is_shared,
+            key
+        );
 
         let mut futex_map_guard = FutexData::futex_map();
         let bucket = futex_map_guard.get_mut(&key);
@@ -277,13 +283,27 @@ impl Futex {
         let pcb = ProcessManager::current_pcb();
         // 创建超时计时器任务
         let mut timer = None;
+        log::warn!("[FUTEX_DEBUG] futex_wait: abs_time={:?}", abs_time);
         if let Some(time) = abs_time {
-            let wakeup_helper = WakeUpHelper::new(pcb.clone());
-
             let sec = time.tv_sec;
             let nsec = time.tv_nsec;
-            let jiffies = next_n_us_timer_jiffies((nsec / 1000 + sec * 1_000_000) as u64);
+            let total_us = (nsec / 1000 + sec * 1_000_000) as u64;
 
+            warn!(
+                "[FUTEX_DEBUG] timeout: sec={}, nsec={}, total_us={}",
+                sec, nsec, total_us
+            );
+
+            // 如果超时时间为0，直接返回ETIMEDOUT
+            if total_us == 0 {
+                warn!("[FUTEX_DEBUG] zero timeout, returning ETIMEDOUT immediately");
+                return Err(SystemError::ETIMEDOUT);
+            }
+
+            let wakeup_helper = WakeUpHelper::new(pcb.clone());
+            let jiffies = next_n_us_timer_jiffies(total_us);
+
+            warn!("[FUTEX_DEBUG] creating timer with jiffies={}", jiffies);
             let wake_up = Timer::new(wakeup_helper, jiffies);
 
             wake_up.activate();
@@ -372,12 +392,18 @@ impl Futex {
             flags.contains(FutexFlag::FLAGS_SHARED),
             FutexAccess::FutexRead,
         )?;
-        
+
         // Debug: 打印futex_wake信息
         let current_pid = ProcessManager::current_pcb().raw_pid().data();
         let is_shared = flags.contains(FutexFlag::FLAGS_SHARED);
-        warn!("[FUTEX_DEBUG] futex_wake: pid={}, uaddr=0x{:x}, nr_wake={}, is_shared={}, key={:?}", 
-              current_pid, uaddr.data(), nr_wake, is_shared, key);
+        warn!(
+            "[FUTEX_DEBUG] futex_wake: pid={}, uaddr=0x{:x}, nr_wake={}, is_shared={}, key={:?}",
+            current_pid,
+            uaddr.data(),
+            nr_wake,
+            is_shared,
+            key
+        );
 
         let mut binding = FutexData::futex_map();
         let bucket_mut = binding.entry(key.clone()).or_insert(FutexHashBucket {
@@ -389,12 +415,15 @@ impl Futex {
             warn!("[FUTEX_DEBUG] futex_wake: bucket is empty, no processes to wake");
             return Ok(0);
         }
-        
-        warn!("[FUTEX_DEBUG] futex_wake: bucket has {} waiting processes", bucket_mut.chain.len());
-        
+
+        warn!(
+            "[FUTEX_DEBUG] futex_wake: bucket has {} waiting processes",
+            bucket_mut.chain.len()
+        );
+
         // 从队列中唤醒
         let count = bucket_mut.wake_up(key.clone(), Some(bitset), nr_wake)?;
-        
+
         warn!("[FUTEX_DEBUG] futex_wake: woke up {} processes", count);
 
         drop(binding);
@@ -558,11 +587,15 @@ impl Futex {
         // 共享：区分文件映射与匿名共享映射
         let address_space = AddressSpace::current()?;
         let as_guard = address_space.read();
-        let vma = as_guard.mappings.contains(uaddr).ok_or(SystemError::EINVAL)?;
+        let vma = as_guard
+            .mappings
+            .contains(uaddr)
+            .ok_or(SystemError::EINVAL)?;
         let vma_guard = vma.lock_irqsave();
 
         // 页内索引（相对VMA起始地址）
-        let page_index = ((uaddr.data() - vma_guard.region().start().data()) >> MMArch::PAGE_SHIFT) as u64;
+        let page_index =
+            ((uaddr.data() - vma_guard.region().start().data()) >> MMArch::PAGE_SHIFT) as u64;
 
         if let Some(file) = vma_guard.vm_file() {
             // 共享文件映射：使用 inode 唯一标识 + 文件页偏移
@@ -571,8 +604,16 @@ impl Futex {
             let ino = md.inode_id.into() as u64;
             let i_seq = (dev << 32) ^ ino;
             let base_pgoff = vma_guard.file_page_offset().unwrap_or(0) as u64;
-            let shared = SharedKey { i_seq, page_offset: base_pgoff + page_index };
-            let key = FutexKey { ptr: 0, word: 0, offset: offset as u32, key: InnerFutexKey::Shared(shared.clone()) };
+            let shared = SharedKey {
+                i_seq,
+                page_offset: base_pgoff + page_index,
+            };
+            let key = FutexKey {
+                ptr: 0,
+                word: 0,
+                offset: offset as u32,
+                key: InnerFutexKey::Shared(shared.clone()),
+            };
             warn!(
                 "[FUTEX_DEBUG] get_futex_key: shared file, dev=0x{:x}, ino=0x{:x}, pgoff={}, page_index={}, key={:?}",
                 dev, ino, base_pgoff, page_index, key
@@ -582,8 +623,16 @@ impl Futex {
             // 匿名共享：使用共享匿名映射的稳定身份 + 页偏移
             if let Some(shared_anon) = &vma_guard.shared_anon {
                 let i_seq = shared_anon.id;
-                let shared = SharedKey { i_seq, page_offset: page_index };
-                let key = FutexKey { ptr: 0, word: 0, offset: offset as u32, key: InnerFutexKey::Shared(shared.clone()) };
+                let shared = SharedKey {
+                    i_seq,
+                    page_offset: page_index,
+                };
+                let key = FutexKey {
+                    ptr: 0,
+                    word: 0,
+                    offset: offset as u32,
+                    key: InnerFutexKey::Shared(shared.clone()),
+                };
                 warn!(
                     "[FUTEX_DEBUG] get_futex_key: shared anon, anon_id=0x{:x}, page_index={}, key={:?}",
                     i_seq, page_index, key

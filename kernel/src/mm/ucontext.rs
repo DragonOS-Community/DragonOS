@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{compiler_fence, Ordering, AtomicU64},
+    sync::atomic::{compiler_fence, AtomicU64, Ordering},
 };
 
 use alloc::{
@@ -316,7 +316,8 @@ impl InnerAddressSpace {
             map_flags,
             move |page, count, vm_flags, flags, mapper, flusher| {
                 if allocate_at_once {
-                    let vma = VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)?;
+                    let vma =
+                        VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)?;
                     // 如果是共享匿名映射，则分配稳定身份
                     if vm_flags.contains(VmFlags::VM_SHARED) {
                         vma.lock_irqsave().shared_anon = Some(AnonSharedMapping::new());

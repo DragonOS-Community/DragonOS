@@ -21,7 +21,6 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         verify_area(uaddr, core::mem::size_of::<u32>())?;
         verify_area(uaddr2, core::mem::size_of::<u32>())?;
-
         let cmd = FutexArg::from_bits(operation.bits() & FutexFlag::FUTEX_CMD_MASK.bits())
             .ok_or(SystemError::ENOSYS)?;
 

@@ -5,13 +5,14 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::{SigCode, SigSet, Signal},
+    arch::ipc::signal::{SigSet, Signal},
+    ipc::signal_types::SigCode,
     ipc::signal_types::SigactionType,
     mm::VirtAddr,
     process::{
         pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
-    time::Instant,
+    time::{syscall::PosixClockID, timekeeping::getnstimeofday, Instant, PosixTimeSpec},
 };
 
 use super::signal_types::{SigInfo, SigType, SIG_KERNEL_STOP_MASK};
@@ -606,8 +607,10 @@ pub trait RestartFn: Debug + Sync + Send + 'static {
 #[derive(Debug, Clone)]
 pub enum RestartBlockData {
     Poll(PollRestartBlockData),
-    // todo: nanosleep
-    Nanosleep(),
+    Nanosleep {
+        deadline: crate::time::PosixTimeSpec,
+        clockid: crate::time::syscall::PosixClockID,
+    },
     // todo: futex_wait
     FutexWait(),
 }
@@ -620,6 +623,13 @@ impl RestartBlockData {
             timeout_instant,
         })
     }
+
+    pub fn new_nanosleep(
+        deadline: crate::time::PosixTimeSpec,
+        clockid: crate::time::syscall::PosixClockID,
+    ) -> Self {
+        Self::Nanosleep { deadline, clockid }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -627,4 +637,34 @@ pub struct PollRestartBlockData {
     pub pollfd_ptr: VirtAddr,
     pub nfds: u32,
     pub timeout_instant: Option<Instant>,
+}
+
+/// Nanosleep 的重启函数：根据保存的 deadline/clockid 继续等待或重启
+#[derive(Debug)]
+pub struct RestartFnNanosleep;
+
+impl RestartFn for RestartFnNanosleep {
+    fn call(&self, data: &mut RestartBlockData) -> Result<usize, SystemError> {
+        fn ktime_now(_clockid: PosixClockID) -> PosixTimeSpec {
+            // 暂时使用 realtime 近似；后续区分 monotonic/boottime
+            getnstimeofday()
+        }
+
+        if let RestartBlockData::Nanosleep { deadline, clockid } = data {
+            let now = ktime_now(*clockid);
+            let mut sec = deadline.tv_sec - now.tv_sec;
+            let mut nsec = deadline.tv_nsec - now.tv_nsec;
+            if nsec < 0 {
+                sec -= 1;
+                nsec += 1_000_000_000;
+            }
+            if sec < 0 || (sec == 0 && nsec == 0) {
+                return Ok(0);
+            }
+            // 仍未到期：设置重启块并返回 -ERESTART_RESTARTBLOCK
+            let rb = RestartBlock::new(&RestartFnNanosleep, data.clone());
+            return crate::process::ProcessManager::current_pcb().set_restart_fn(Some(rb));
+        }
+        panic!("RestartFnNanosleep called with wrong data type: {:?}", data);
+    }
 }

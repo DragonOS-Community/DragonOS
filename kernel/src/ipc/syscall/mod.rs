@@ -8,6 +8,8 @@ mod sys_shmdt;
 mod sys_shmget;
 mod sys_sigaction;
 mod sys_sigpending;
+pub mod sys_tgkill;
+pub mod sys_tkill;
 
 #[cfg(target_arch = "x86_64")]
 pub mod sys_pipe;

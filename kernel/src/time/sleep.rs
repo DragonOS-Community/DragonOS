@@ -58,15 +58,20 @@ pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError
 
     let end_time = getnstimeofday();
 
-    // 检查是否被信号中断，如果是则取消定时器
-    let current_pcb = ProcessManager::current_pcb();
-    let was_interrupted = current_pcb.has_pending_signal_fast()
-        || Signal::signal_pending_state(true, false, &current_pcb);
-
-    // 如果定时器没有超时（被信号中断或其他原因唤醒），则取消定时器
-    if !timer.timeout() {
+    // 如果定时器没有超时（被信号或其他原因唤醒），则立即视为被中断
+    let was_interrupted = if !timer.timeout() {
         timer.cancel();
-    }
+        true
+        // log::debug!("nanosleep: woken up before timeout -> interrupted");
+    } else {
+        // 附加检查：存在待处理信号也视为被中断
+        let current_pcb = ProcessManager::current_pcb();
+        current_pcb.has_pending_signal_fast()
+            || Signal::signal_pending_state(true, false, &current_pcb)
+        // if was_interrupted {
+        //     log::debug!("nanosleep: timeout but pending signal detected");
+        // }
+    };
 
     // 返回正确的剩余时间
     let real_sleep_time = end_time - start_time;
@@ -74,6 +79,7 @@ pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError
 
     // 如果被信号中断，返回 ERESTARTSYS 错误
     if was_interrupted {
+        // log::debug!("nanosleep: return ERESTARTSYS");
         return Err(SystemError::ERESTARTSYS);
     }
 

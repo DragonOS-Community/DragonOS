@@ -9,12 +9,12 @@ use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 use crate::{
     arch::{
         interrupt::{trap::X86PfErrorCode, TrapFrame},
-        ipc::signal::{SigCode, Signal},
+        ipc::signal::Signal,
         mm::{MemoryManagementArch, X86_64MMArch},
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
-    ipc::signal_types::{SigInfo, SigType},
+    ipc::signal_types::{SigCode, SigInfo, SigType},
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},

@@ -16,7 +16,21 @@ gVisor 是 Google 开发的容器运行时沙箱，包含了大量的系统调�
 - **黑名单过滤**：可针对每个测试程序屏蔽特定的测试用例
 - **自动化运行**：提供 Makefile 和脚本简化测试流程
 
-快速开始
+自动测试
+==========
+
+执行`make test-syscall`命令。该命令将启动DragonOS并自动执行gvisor syscall测试套，测试完成后会退出qemu。同时根据测试用例成功率选择是成功返回还是失败返回，成功率不等于100%则失败返回。该命令的执行流程如下：
+
+1. 执行`enable_compile_gvisor.sh`注释`app-blocklist.toml`中有关于屏蔽gvisor测试套的配置
+2. 编译DragonOS
+3. 写入镜像
+4. 后台qemu无图形模式启动DragonOS，同时设置环境变量`AUTO_TEST`（自动测试选项，目前仅支持syscall测试）和`SYSCALL_TEST_DIR`（测试套所在目录），这两个环境变量会通过命令行参数传递到DragonOS。然后当busybox init进程执行rcS脚本时，该脚本会通过`AUTO_TEST`选项执行对应的测试
+5. 执行`monitor_test_results.sh`定时查看qemu串口输出内容，并根据测试结果选择成功返回还是失败返回
+6. 执行`disable_compile_gvisor.sh`取消`app-blocklist.toml`中有关于屏蔽gvisor测试套的配置注释
+
+对应的workflow配置文件为`test-x86.yml`
+
+手动测试
 ==========
 
 1. 进入测试目录：

@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::timekeeping::{do_gettimeofday, getnstimeofday};
+mod sys_clock_nanosleep;
 mod sys_nanosleep;
 
 pub type PosixTimeT = c_longlong;

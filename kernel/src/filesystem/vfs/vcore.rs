@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use log::{error, info};
 use system_error::SystemError;
 
+use crate::libs::casting::DowncastArc;
 use crate::{
     define_event_trace,
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
@@ -195,7 +196,6 @@ pub fn do_mkdir_at(
     mode: FileMode,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     trace_do_mkdir_at(path, mode);
-    // debug!("Call do mkdir at");
     let (mut current_inode, path) =
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
     let (name, parent) = rsplit_path(&path);
@@ -203,7 +203,6 @@ pub fn do_mkdir_at(
         current_inode =
             current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     }
-    // debug!("mkdir at {:?}", current_inode.metadata()?.inode_id);
     return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
 }
 
@@ -286,4 +285,33 @@ pub(super) fn do_file_lookup_at(
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dfd, path)?;
     let follow_final = lookup_flags.contains(LookUpFlags::FOLLOW);
     return inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final);
+}
+
+/// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
+/// - 目录返回 EISDIR
+/// - 非普通文件返回 EINVAL
+/// - 只读挂载返回 EROFS
+#[inline(never)]
+pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
+    let md = inode.metadata()?;
+
+    if md.file_type == FileType::Dir {
+        return Err(SystemError::EISDIR);
+    }
+    if md.file_type != FileType::File {
+        return Err(SystemError::EINVAL);
+    }
+
+    // 只读挂载检查：若当前 fs 是 MountFS 且带 RDONLY 标志，拒绝写
+    let fs = inode.fs();
+    if let Some(mfs) = fs.clone().downcast_arc::<MountFS>() {
+        let mount_flags = mfs.mount_flags();
+        if mount_flags.contains(crate::filesystem::vfs::mount::MountFlags::RDONLY) {
+            return Err(SystemError::EROFS);
+        }
+    }
+
+    let result = inode.resize(len);
+
+    result
 }

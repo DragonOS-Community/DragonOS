@@ -1,3 +1,4 @@
+ARCH ?= x86_64
 ifeq ($(ARCH), x86_64)
 	CROSS_COMPILE=x86_64-linux-musl-
 else ifeq ($(ARCH), riscv64)

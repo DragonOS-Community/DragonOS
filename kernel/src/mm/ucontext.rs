@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, Ordering, AtomicU64},
 };
 
 use alloc::{
@@ -316,16 +316,25 @@ impl InnerAddressSpace {
             map_flags,
             move |page, count, vm_flags, flags, mapper, flusher| {
                 if allocate_at_once {
-                    VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)
+                    let vma = VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)?;
+                    // 如果是共享匿名映射，则分配稳定身份
+                    if vm_flags.contains(VmFlags::VM_SHARED) {
+                        vma.lock_irqsave().shared_anon = Some(AnonSharedMapping::new());
+                    }
+                    Ok(vma)
                 } else {
-                    Ok(LockedVMA::new(VMA::new(
+                    let vma = LockedVMA::new(VMA::new(
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
                         None,
                         None,
                         false,
-                    )))
+                    ));
+                    if vm_flags.contains(VmFlags::VM_SHARED) {
+                        vma.lock_irqsave().shared_anon = Some(AnonSharedMapping::new());
+                    }
+                    Ok(vma)
                 }
             },
         )?;
@@ -1482,6 +1491,8 @@ pub struct VMA {
     provider: Provider,
     /// 关联的 SysV SHM 标识（当此 VMA 来自 shmat 时设置）
     shm_id: Option<ShmId>,
+    /// 共享匿名映射的稳定身份（用于跨进程共享 futex key）
+    pub(crate) shared_anon: Option<Arc<AnonSharedMapping>>,
 }
 
 impl core::hash::Hash for VMA {
@@ -1496,6 +1507,23 @@ impl core::hash::Hash for VMA {
 #[derive(Debug)]
 pub enum Provider {
     Allocated, // TODO:其他
+}
+
+/// 共享匿名映射的稳定身份
+#[derive(Debug)]
+pub struct AnonSharedMapping {
+    pub id: u64,
+}
+
+impl AnonSharedMapping {
+    fn new_id() -> u64 {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        return NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn new() -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self { id: Self::new_id() })
+    }
 }
 
 #[allow(dead_code)]
@@ -1519,6 +1547,7 @@ impl VMA {
             vm_file: file,
             file_pgoff: pgoff,
             shm_id: None,
+            shared_anon: None,
         }
     }
 
@@ -1576,6 +1605,7 @@ impl VMA {
             file_pgoff: self.file_pgoff,
             vm_file: self.vm_file.clone(),
             shm_id: self.shm_id,
+            shared_anon: self.shared_anon.clone(),
         };
     }
 
@@ -1591,6 +1621,7 @@ impl VMA {
             file_pgoff: self.file_pgoff,
             vm_file: self.vm_file.clone(),
             shm_id: self.shm_id,
+            shared_anon: self.shared_anon.clone(),
         };
     }
 

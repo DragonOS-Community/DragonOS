@@ -237,6 +237,12 @@ impl Futex {
             flags.contains(FutexFlag::FLAGS_SHARED),
             FutexAccess::FutexRead,
         )?;
+        
+        // Debug: 打印futex_wait信息
+        let current_pid = ProcessManager::current_pcb().raw_pid().data();
+        let is_shared = flags.contains(FutexFlag::FLAGS_SHARED);
+        warn!("[FUTEX_DEBUG] futex_wait: pid={}, uaddr=0x{:x}, val={}, is_shared={}, key={:?}", 
+              current_pid, uaddr.data(), val, is_shared, key);
 
         let mut futex_map_guard = FutexData::futex_map();
         let bucket = futex_map_guard.get_mut(&key);
@@ -366,6 +372,12 @@ impl Futex {
             flags.contains(FutexFlag::FLAGS_SHARED),
             FutexAccess::FutexRead,
         )?;
+        
+        // Debug: 打印futex_wake信息
+        let current_pid = ProcessManager::current_pcb().raw_pid().data();
+        let is_shared = flags.contains(FutexFlag::FLAGS_SHARED);
+        warn!("[FUTEX_DEBUG] futex_wake: pid={}, uaddr=0x{:x}, nr_wake={}, is_shared={}, key={:?}", 
+              current_pid, uaddr.data(), nr_wake, is_shared, key);
 
         let mut binding = FutexData::futex_map();
         let bucket_mut = binding.entry(key.clone()).or_insert(FutexHashBucket {
@@ -374,10 +386,16 @@ impl Futex {
 
         // 确保后面的唤醒操作是有意义的
         if bucket_mut.chain.is_empty() {
+            warn!("[FUTEX_DEBUG] futex_wake: bucket is empty, no processes to wake");
             return Ok(0);
         }
+        
+        warn!("[FUTEX_DEBUG] futex_wake: bucket has {} waiting processes", bucket_mut.chain.len());
+        
         // 从队列中唤醒
         let count = bucket_mut.wake_up(key.clone(), Some(bitset), nr_wake)?;
+        
+        warn!("[FUTEX_DEBUG] futex_wake: woke up {} processes", count);
 
         drop(binding);
 
@@ -521,34 +539,71 @@ impl Futex {
         // 目前address指向所在页面的起始地址
         address -= offset;
 
-        // 若不是进程间共享的futex，则返回Private
+        // 非共享：使用地址空间+页首虚拟地址作为私有键
         if !fshared {
-            return Ok(FutexKey {
+            let address_space = AddressSpace::current()?;
+            let key = FutexKey {
                 ptr: 0,
                 word: 0,
                 offset: offset as u32,
                 key: InnerFutexKey::Private(PrivateKey {
                     address: address as u64,
-                    address_space: None,
+                    address_space: Some(Arc::downgrade(&address_space)),
                 }),
-            });
+            };
+            warn!("[FUTEX_DEBUG] get_futex_key: private futex, key={:?}", key);
+            return Ok(key);
         }
 
-        // 获取到地址所在地址空间
+        // 共享：区分文件映射与匿名共享映射
         let address_space = AddressSpace::current()?;
-        // TODO： 判断是否为匿名映射，是匿名映射才返回PrivateKey
-        return Ok(FutexKey {
-            ptr: 0,
-            word: 0,
-            offset: offset as u32,
-            key: InnerFutexKey::Private(PrivateKey {
-                address: address as u64,
-                address_space: Some(Arc::downgrade(&address_space)),
-            }),
-        });
+        let as_guard = address_space.read();
+        let vma = as_guard.mappings.contains(uaddr).ok_or(SystemError::EINVAL)?;
+        let vma_guard = vma.lock_irqsave();
 
-        // 未实现共享内存机制,贡献内存部分应该通过inode构建SharedKey
-        // todo!("Shared memory not implemented");
+        // 页内索引（相对VMA起始地址）
+        let page_index = ((uaddr.data() - vma_guard.region().start().data()) >> MMArch::PAGE_SHIFT) as u64;
+
+        if let Some(file) = vma_guard.vm_file() {
+            // 共享文件映射：使用 inode 唯一标识 + 文件页偏移
+            let md = file.metadata()?;
+            let dev = md.dev_id as u64;
+            let ino = md.inode_id.into() as u64;
+            let i_seq = (dev << 32) ^ ino;
+            let base_pgoff = vma_guard.file_page_offset().unwrap_or(0) as u64;
+            let shared = SharedKey { i_seq, page_offset: base_pgoff + page_index };
+            let key = FutexKey { ptr: 0, word: 0, offset: offset as u32, key: InnerFutexKey::Shared(shared.clone()) };
+            warn!(
+                "[FUTEX_DEBUG] get_futex_key: shared file, dev=0x{:x}, ino=0x{:x}, pgoff={}, page_index={}, key={:?}",
+                dev, ino, base_pgoff, page_index, key
+            );
+            return Ok(key);
+        } else {
+            // 匿名共享：使用共享匿名映射的稳定身份 + 页偏移
+            if let Some(shared_anon) = &vma_guard.shared_anon {
+                let i_seq = shared_anon.id;
+                let shared = SharedKey { i_seq, page_offset: page_index };
+                let key = FutexKey { ptr: 0, word: 0, offset: offset as u32, key: InnerFutexKey::Shared(shared.clone()) };
+                warn!(
+                    "[FUTEX_DEBUG] get_futex_key: shared anon, anon_id=0x{:x}, page_index={}, key={:?}",
+                    i_seq, page_index, key
+                );
+                return Ok(key);
+            } else {
+                // 理论上不会发生；为安全起见，退化为私有键（不跨进程匹配）
+                warn!("[FUTEX_DEBUG] get_futex_key: shared anon without id; fallback to private");
+                let key = FutexKey {
+                    ptr: 0,
+                    word: 0,
+                    offset: offset as u32,
+                    key: InnerFutexKey::Private(PrivateKey {
+                        address: address as u64,
+                        address_space: Some(Arc::downgrade(&address_space)),
+                    }),
+                };
+                return Ok(key);
+            }
+        }
     }
 
     pub fn futex_atomic_op_inuser(encoded_op: u32, uaddr: VirtAddr) -> Result<bool, SystemError> {

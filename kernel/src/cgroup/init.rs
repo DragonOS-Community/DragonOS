@@ -5,11 +5,13 @@
 //! all registered cgroup controllers.
 
 use system_error::SystemError;
+use crate::init::initcall::INITCALL_FS;
+use unified_init::macros::unified_init;
 
 use super::{
     mem_cgroup::mem_cgroup_init,
     cpu_cgroup::cpu_cgroup_init,
-    cgroup_fs::{cgroup_fs_init, mount_cgroup_current_ns},
+    cgroup_fs::cgroup_fs_init,
 };
 
 /// Early cgroup initialization (similar to Linux cgroup_init_early)
@@ -28,13 +30,13 @@ pub fn cgroup_init_early() -> Result<(), SystemError> {
 
 /// Main cgroup initialization (similar to Linux cgroup_init)
 /// 
-/// This should be called after VFS initialization. It registers subsystems
-/// and sets up the cgroup filesystem infrastructure.
+/// This should be called after VFS initialization and sysfs initialization.
+/// It registers subsystems and sets up the cgroup filesystem infrastructure.
+/// 
+/// Note: Uses INITCALL_FS to ensure it runs after INITCALL_SUBSYS (which includes fs_sysfs_init)
+#[unified_init(INITCALL_FS)]
 pub fn cgroup_init() -> Result<(), SystemError> {
     log::info!("Main cgroup initialization - registering subsystems");
-    
-    // Initialize cgroup filesystem infrastructure
-    cgroup_fs_init()?;
     
     // Initialize memory cgroup subsystem
     mem_cgroup_init()?;
@@ -42,10 +44,7 @@ pub fn cgroup_init() -> Result<(), SystemError> {
     // Initialize CPU cgroup subsystem
     cpu_cgroup_init()?;
     
-    // TODO: Mount cgroup filesystem at /sys/fs/cgroup
-    // 暂时禁用挂载以避免与其他子系统的冲突
-    // mount_cgroup_current_ns()?;
-    log::info!("Cgroup filesystem mount deferred until VFS integration is complete");
+    cgroup_fs_init()?;
     
     log::info!("Cgroup subsystem initialized successfully");
     Ok(())

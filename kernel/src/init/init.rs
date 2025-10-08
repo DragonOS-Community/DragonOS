@@ -4,7 +4,7 @@ use crate::{
         time::time_init,
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
-    cgroup::{cgroup_init_early, cgroup_init},
+    cgroup::cgroup_init_early,
     driver::{
         acpi::acpi_init, base::init::driver_init, serial::serial_early_init,
         video::VideoRefreshManager,
@@ -84,11 +84,7 @@ fn do_start_kernel() {
     crate::process::namespace::ipc_namespace::init_ipc_namespace()
         .expect("IPC namespace early init failed");
 
-    vfs_init().expect("vfs init failed");
-    
-    // 主要的 cgroup 初始化
-    // 在VFS初始化完成后调用（仿照Linux cgroup_init）
-    cgroup_init().expect("cgroup init failed");
+    vfs_init().expect("vfs init failed");    
     
     driver_init().expect("driver init failed");
 

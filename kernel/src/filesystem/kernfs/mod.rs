@@ -17,6 +17,7 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::{ProcessManager, namespace::mnt::MountPropagation},
     time::PosixTimeSpec,
 };
 
@@ -28,6 +29,7 @@ use self::{
 use super::vfs::{
     file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
     FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
+    mount::{MountFS, MountFlags, MountPath},
 };
 
 pub mod callback;
@@ -451,6 +453,43 @@ impl IndexNode for KernFSInode {
             .as_ref()
             .unwrap()
             .write(callback_data, &buf[..len], offset);
+    }
+
+    fn mount(
+        &self,
+        fs: Arc<dyn FileSystem>,
+        mount_flags: MountFlags,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        let metadata = self.metadata()?;
+        if metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // 创建 MountFS 来处理挂载
+        let new_mount_fs = MountFS::new(
+            fs,
+            None, // KernFS 节点没有父挂载点
+            MountPropagation::new_private(),
+            Some(&ProcessManager::current_mntns()),
+            mount_flags,
+        );
+
+        // KernFSInode 不应该调用 absolute_path()，因为该方法只为 MountFS 设计
+        // 对于 KernFS 挂载，我们采用更直接的方式：
+        // 1. 如果是特定已知路径（如 cgroup），使用预定义路径
+        // 2. 否则返回错误，要求调用者使用其他方式挂载
+        let mount_path = self.get_known_mount_path().ok_or_else(|| {
+            log::error!("KernFSInode::mount: Cannot determine mount path for KernFS inode. Consider using MountFSInode for mounting.");
+            SystemError::ENOSYS
+        })?;
+        let mount_path = Arc::new(MountPath::from(mount_path));
+        ProcessManager::current_mntns().add_mount(
+            Some(metadata.inode_id),
+            mount_path,
+            new_mount_fs.clone(),
+        )?;
+
+        Ok(new_mount_fs)
     }
 }
 
@@ -932,6 +971,31 @@ impl KernFSInode {
     /// 检查当前节点是否为临时节点
     pub fn is_temporary(&self) -> bool {
         self.is_temporary
+    }
+
+    /// 获取已知的挂载路径
+    /// 
+    /// 这个方法为特定的 KernFSInode 返回预定义的挂载路径。
+    /// 主要用于处理特殊用途的 KernFS 节点，如 cgroup 目录。
+    fn get_known_mount_path(&self) -> Option<String> {
+        // 检查节点的私有数据，确定是否为已知的挂载点
+        if let Some(private_data) = self.private_data.lock().as_ref() {
+            match private_data {
+                KernInodePrivateData::CgroupFS(_) => {
+                    // 这是一个 cgroup 相关的节点，返回 cgroup 挂载点路径
+                    log::debug!("KernFSInode::get_known_mount_path: Identified cgroup mount point for node '{}'", self.name);
+                    return Some("/sys/fs/cgroup".to_string());
+                }
+                _ => {
+                    log::debug!("KernFSInode::get_known_mount_path: Node '{}' has non-cgroup private data", self.name);
+                }
+            }
+        } else {
+            log::debug!("KernFSInode::get_known_mount_path: Node '{}' has no private data", self.name);
+        }
+
+        // 对于没有私有数据或非已知类型的节点，返回 None
+        None
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

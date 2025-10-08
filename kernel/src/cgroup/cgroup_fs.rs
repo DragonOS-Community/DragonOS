@@ -13,6 +13,7 @@ use core::any::Any;
 use system_error::SystemError;
 
 use crate::{
+    driver::base::kobject::KObject,
     filesystem::{
         kernfs::{
             KernFS, KernFSInode, 
@@ -23,7 +24,7 @@ use crate::{
             FileSystem, FileSystemMakerData, FsInfo, IndexNode, Magic, 
             SuperBlock, MountableFileSystem,
             syscall::ModeType,
-            mount::MountFlags,
+            mount::{MountFlags},
         },
     },
     libs::{
@@ -240,15 +241,18 @@ pub enum CgroupFileType {
     MemoryMax,
     CpuWeight,
     CpuMax,
+    CgroupDir, // 用于 cgroup 目录本身
 }
 
 /// Cgroup file callback implementation
+/// 
+/// This is a simple callback that delegates to the private_data's callback_read/write methods.
+/// Similar to ProcFS implementation pattern.
 #[derive(Debug)]
 struct CgroupFileCallback;
 
 impl KernFSCallback for CgroupFileCallback {
     fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
-        // cgroup 文件打开时不需要特殊处理
         Ok(())
     }
 
@@ -258,58 +262,23 @@ impl KernFSCallback for CgroupFileCallback {
         buf: &mut [u8],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let private_data = data.private_data();
-        if let Some(KernInodePrivateData::CgroupFS(cgroup_data)) = private_data.as_ref() {
-            match cgroup_data.file_type {
-                CgroupFileType::Controllers => {
-                    let content = "memory cpu\n";
-                    let content_bytes = content.as_bytes();
-                    if offset >= content_bytes.len() {
-                        return Ok(0);
-                    }
-                    let len = core::cmp::min(buf.len(), content_bytes.len() - offset);
-                    buf[..len].copy_from_slice(&content_bytes[offset..offset + len]);
-                    Ok(len)
-                }
-                CgroupFileType::Procs => {
-                    let content = "1\n"; // 简化实现，显示 init 进程
-                    let content_bytes = content.as_bytes();
-                    if offset >= content_bytes.len() {
-                        return Ok(0);
-                    }
-                    let len = core::cmp::min(buf.len(), content_bytes.len() - offset);
-                    buf[..len].copy_from_slice(&content_bytes[offset..offset + len]);
-                    Ok(len)
-                }
-                _ => {
-                    let content = "\n"; // 其他文件返回空内容
-                    let content_bytes = content.as_bytes();
-                    if offset >= content_bytes.len() {
-                        return Ok(0);
-                    }
-                    let len = core::cmp::min(buf.len(), content_bytes.len() - offset);
-                    buf[..len].copy_from_slice(&content_bytes[offset..offset + len]);
-                    Ok(len)
-                }
-            }
-        } else {
-            Err(SystemError::EINVAL)
-        }
+        // 委托给 private_data 的 callback_read 方法
+        data.callback_read(buf, offset)
     }
 
     fn write(
         &self,
-        _data: KernCallbackData,
-        _buf: &[u8],
-        _offset: usize,
+        data: KernCallbackData,
+        buf: &[u8],
+        offset: usize,
     ) -> Result<usize, SystemError> {
-        // 简化实现，暂不支持写入
-        Err(SystemError::ENOSYS)
+        // 委托给 private_data 的 callback_write 方法
+        data.callback_write(buf, offset)
     }
 
     fn poll(&self, _data: KernCallbackData) -> Result<crate::filesystem::vfs::PollStatus, SystemError> {
-        // cgroup 文件默认可读
-        Ok(crate::filesystem::vfs::PollStatus::READ)
+        // cgroup 文件支持读写
+        Ok(crate::filesystem::vfs::PollStatus::READ | crate::filesystem::vfs::PollStatus::WRITE)
     }
 }
 
@@ -389,7 +358,7 @@ impl CgroupDynamicLookup {
             ModeType::from_bits_truncate(0o644),
             Some(4096),
             Some(KernInodePrivateData::CgroupFS(private_data)),
-            Some(&CGROUP_FILE_CALLBACK),
+            Some(&CGROUP_FILE_CALLBACK), // 使用通用 callback，委托给 private_data
         )?;
 
         Ok(Some(temp_file))
@@ -417,10 +386,50 @@ impl DynamicLookup for CgroupDynamicLookup {
         self.get_available_files().contains(&name)
     }
 
-    fn create_temporary_entry(&self, _name: &str) -> Result<Option<Arc<dyn IndexNode>>, SystemError> {
-        // For cgroup files, we don't create temporary entries
-        // Instead, we rely on the parent directory to create files when needed
-        Ok(None)
+    fn create_temporary_entry(&self, name: &str) -> Result<Option<Arc<dyn IndexNode>>, SystemError> {
+        // 检查是否是有效的 cgroup 名称
+        if !self.is_valid_entry(name) {
+            return Ok(None);
+        }
+
+        // 获取父 inode（应该是 CgroupFS 的根目录）
+        let parent_inode = match self.parent_inode.upgrade() {
+            Some(inode) => inode,
+            None => {
+                log::warn!("CgroupDynamicLookup::create_temporary_entry: parent inode not available");
+                return Ok(None);
+            }
+        };
+
+        log::debug!("CgroupDynamicLookup::create_temporary_entry: Creating temporary cgroup directory '{}'", name);
+
+        // 使用 kernfs 的 create_temporary_dir 方法创建临时目录
+        let temp_dir = parent_inode.create_temporary_dir(
+            name,
+            ModeType::S_IFDIR | ModeType::from_bits_truncate(0o755),
+            Some(KernInodePrivateData::CgroupFS(
+                CgroupKernPrivateData::new(self.cgroup.clone(), CgroupFileType::Type)
+            )),
+        )?;
+
+        // 在临时目录中创建基本的 cgroup 控制文件
+        let basic_files = [
+            "cgroup.controllers",
+            "cgroup.subtree_control", 
+            "cgroup.procs",
+            "cgroup.threads",
+            "cgroup.type",
+        ];
+        
+        for file_name in basic_files.iter() {
+            if let Some(_file_node) = self.create_cgroup_file(file_name)? {
+                // 文件创建成功，可以进行额外的初始化操作
+                log::debug!("Created cgroup file: {}", file_name);
+            }
+        }
+
+        log::debug!("CgroupDynamicLookup::create_temporary_entry: Successfully created temporary cgroup directory '{}'", name);
+        Ok(Some(temp_dir as Arc<dyn IndexNode>))
     }
 }
 
@@ -440,44 +449,52 @@ impl CgroupKernPrivateData {
         self.file_type
     }
 
-    pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
-        match self.file_type {
-            CgroupFileType::Controllers => {
-                let content = "memory cpu\n";
-                let content_bytes = content.as_bytes();
-                if offset >= content_bytes.len() {
-                    return Ok(0);
-                }
-                let len = core::cmp::min(buf.len(), content_bytes.len() - offset);
-                buf[..len].copy_from_slice(&content_bytes[offset..offset + len]);
-                Ok(len)
-            }
-            CgroupFileType::Procs => {
-                let content = "1\n"; // 简化实现，显示 init 进程
-                let content_bytes = content.as_bytes();
-                if offset >= content_bytes.len() {
-                    return Ok(0);
-                }
-                let len = core::cmp::min(buf.len(), content_bytes.len() - offset);
-                buf[..len].copy_from_slice(&content_bytes[offset..offset + len]);
-                Ok(len)
-            }
-            _ => {
-                let content = "\n"; // 其他文件返回空内容
-                let content_bytes = content.as_bytes();
-                if offset >= content_bytes.len() {
-                    return Ok(0);
-                }
-                let len = core::cmp::min(buf.len(), content_bytes.len() - offset);
-                buf[..len].copy_from_slice(&content_bytes[offset..offset + len]);
-                Ok(len)
-            }
+    /// 统一的内容读取函数，消除重复代码
+    fn read_content_helper(content: &str, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
+        let content_bytes = content.as_bytes();
+        if offset >= content_bytes.len() {
+            return Ok(0);
         }
+        let len = core::cmp::min(buf.len(), content_bytes.len() - offset);
+        buf[..len].copy_from_slice(&content_bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
+        let content = match self.file_type {
+            CgroupFileType::Controllers => "memory cpu\n",
+            CgroupFileType::Procs => "1\n", // 简化实现，显示 init 进程
+            CgroupFileType::SubtreeControl => "memory cpu\n", // 显示可用的控制器
+            CgroupFileType::Type => "domain\n", // cgroup v2 默认类型
+            CgroupFileType::Threads => "1\n", // 简化实现，显示 init 线程
+            CgroupFileType::MemoryCurrent => "0\n", // 简化实现，显示当前内存使用
+            CgroupFileType::MemoryMax => "max\n", // 简化实现，显示内存限制
+            CgroupFileType::CpuWeight => "100\n", // 简化实现，显示 CPU 权重
+            CgroupFileType::CpuMax => "max 100000\n", // 简化实现，显示 CPU 限制
+            CgroupFileType::CgroupDir => return Err(SystemError::EISDIR), // 目录不能读取
+        };
+        
+        Self::read_content_helper(content, buf, offset)
     }
 
     pub fn callback_write(&self, _buf: &[u8], _offset: usize) -> Result<usize, SystemError> {
         // 简化实现，暂不支持写入
-        Err(SystemError::ENOSYS)
+        // 未来可以根据 file_type 实现不同的写入逻辑
+        match self.file_type {
+            CgroupFileType::Procs | 
+            CgroupFileType::Threads |
+            CgroupFileType::SubtreeControl |
+            CgroupFileType::MemoryMax |
+            CgroupFileType::CpuWeight |
+            CgroupFileType::CpuMax => {
+                // 这些文件理论上应该支持写入，但目前简化实现
+                Err(SystemError::ENOSYS)
+            }
+            _ => {
+                // 只读文件
+                Err(SystemError::EACCES)
+            }
+        }
     }
 }
 
@@ -485,15 +502,15 @@ impl CgroupKernPrivateData {
 
 /// Initialize cgroup filesystem infrastructure
 pub fn cgroup_fs_init() -> Result<(), SystemError> {
-    // This will be called during kernel initialization
-    // to set up the cgroup filesystem
-    // Note: Core cgroup infrastructure should already be initialized
-    // by cgroup_init_early() before this function is called
-    // TODO: Register filesystem type
-    // TODO: Create mount point
-    // TODO: Mount cgroup filesystem
-    
-    log::info!("Cgroup filesystem infrastructure initialized");
+    // Called during kernel initialization to set up the cgroup filesystem.
+    // Core cgroup infrastructure should already be initialized by cgroup_init_early().
+    // Perform the actual mount of cgroup2 at /sys/fs/cgroup.
+    if let Err(e) = mount_cgroup_current_ns() {
+        log::error!("cgroup_fs_init: failed to mount cgroup2 at /sys/fs/cgroup: {:?}", e);
+        return Err(e);
+    }
+
+    log::info!("Cgroup filesystem infrastructure initialized and mounted at /sys/fs/cgroup");
     Ok(())
 }
 
@@ -515,92 +532,66 @@ impl MountableFileSystem for CgroupFS {
     }
 }
 
-/// Mount cgroup filesystem at /sys/fs/cgroup (similar to mount_proc_current_ns)
+/// Mount cgroup filesystem at /sys/fs/cgroup using kernfs dynamic directory creation
 pub fn mount_cgroup_current_ns() -> Result<(), SystemError> {
     log::info!("mount_cgroup_current_ns: Starting cgroup mount");
 
-    // Get the root mount filesystem to ensure we're working with MountFSInode
-    let current_mntns = crate::process::ProcessManager::current_mntns();
-    let root_mount_fs = current_mntns.root_mntfs();
-    let root_inode = root_mount_fs.mountpoint_root_inode();
-    
-    // Create /sys directory if it doesn't exist
-    let sys_dir = match root_inode.find("sys") {
-        Ok(existing_dir) => {
-            log::info!("mount_cgroup_current_ns: Found existing /sys directory");
-            existing_dir
-        }
-        Err(_) => {
-            log::info!("mount_cgroup_current_ns: Creating new /sys directory");
-            root_inode.mkdir("sys", ModeType::from_bits_truncate(0o755))?
-        }
-    };
-
-    // Create /sys/fs directory if it doesn't exist
-    let fs_dir = match sys_dir.find("fs") {
-        Ok(existing_dir) => {
-            log::info!("mount_cgroup_current_ns: Found existing /sys/fs directory");
-            existing_dir
-        }
-        Err(_) => {
-            log::info!("mount_cgroup_current_ns: Creating new /sys/fs directory");
-            sys_dir.mkdir("fs", ModeType::from_bits_truncate(0o755))?
-        }
-    };
-
-    // Create /sys/fs/cgroup directory if it doesn't exist
-    let cgroup_dir = match fs_dir.find("cgroup") {
-        Ok(existing_dir) => {
-            log::info!("mount_cgroup_current_ns: Found existing /sys/fs/cgroup directory");
-            // Check if already mounted by looking for cgroup files
-            if let Ok(entries) = existing_dir.list() {
-                log::info!("mount_cgroup_current_ns: /sys/fs/cgroup has {} entries: {:?}", entries.len(), entries);
-                if entries.iter().any(|e| e.starts_with("cgroup.")) {
-                    log::info!("mount_cgroup_current_ns: /sys/fs/cgroup already has cgroup files, skipping mount");
-                    return Ok(());
-                }
-            }
-            existing_dir
-        }
-        Err(_) => {
-            log::info!("mount_cgroup_current_ns: Creating new /sys/fs/cgroup directory");
-            fs_dir.mkdir("cgroup", ModeType::from_bits_truncate(0o755))?
-        }
-    };
+    // Create directory hierarchy using the existing function
+    let cgroup_dir = create_cgroup_mount_point()?;
 
     log::info!("mount_cgroup_current_ns: Creating CgroupFS instance");
-    let cgroupfs = match CgroupFS::new() {
-        Ok(fs) => {
-            log::info!("mount_cgroup_current_ns: CgroupFS instance created successfully");
-            fs
-        }
-        Err(e) => {
-            log::error!("mount_cgroup_current_ns: Failed to create CgroupFS instance: {:?}", e);
-            return Err(e);
-        }
-    };
+    let cgroupfs = CgroupFS::new().map_err(|e| {
+        log::error!("mount_cgroup_current_ns: Failed to create CgroupFS instance: {:?}", e);
+        e
+    })?;
 
     log::info!("mount_cgroup_current_ns: Mounting cgroupfs to /sys/fs/cgroup");
-    // Mount the filesystem on the directory
-    match cgroup_dir.mount(cgroupfs, MountFlags::empty()) {
-        Ok(mount_fs) => {
-            log::info!("mount_cgroup_current_ns: Successfully mounted /sys/fs/cgroup");
-            log::info!("mount_cgroup_current_ns: Mount filesystem: {:?}", mount_fs.name());
-            
-            // Verify mount by listing directory contents
-            if let Ok(entries) = cgroup_dir.list() {
-                log::info!("mount_cgroup_current_ns: After mount, /sys/fs/cgroup has {} entries: {:?}", entries.len(), entries);
-            } else {
-                log::warn!("mount_cgroup_current_ns: Failed to list /sys/fs/cgroup contents after mount");
-            }
-        }
-        Err(e) => {
-            log::error!("mount_cgroup_current_ns: Failed to mount /sys/fs/cgroup: {:?}", e);
-            return Err(e);
-        }
-    }
+    
+    // Mount the filesystem using the KernFSInode mount method
+    cgroup_dir.mount(cgroupfs as Arc<dyn FileSystem>, MountFlags::empty()).map_err(|e| {
+        log::error!("mount_cgroup_current_ns: Failed to mount /sys/fs/cgroup: {:?}", e);
+        e
+    })?;
 
     Ok(())
+}
+
+/// Create the cgroup mount point directory hierarchy using kernfs
+fn create_cgroup_mount_point() -> Result<Arc<KernFSInode>, SystemError> {
+    log::info!("create_cgroup_mount_point: Creating /sys/fs/cgroup mount point");
+
+    // 获取 /sys/fs 的 KSet 实例（由 fs_sysfs_init 创建）
+    let fs_kset = crate::filesystem::sys_fs::sys_fs_kset();
+    log::debug!("create_cgroup_mount_point: Retrieved /sys/fs KSet instance");
+
+    // 从 KSet 中获取底层的 KernFSInode
+    let fs_kern_inode = fs_kset.inode()
+        .ok_or_else(|| {
+            log::error!("create_cgroup_mount_point: /sys/fs KSet has no associated KernFSInode");
+            SystemError::ENOENT
+        })?;
+
+    // 使用 KernFSInode 的 create_temporary_dir 创建 cgroup 目录
+    let cgroup_dir = fs_kern_inode.create_temporary_dir(
+        "cgroup",
+        ModeType::S_IFDIR | ModeType::from_bits_truncate(0o755),
+        Some(KernInodePrivateData::CgroupFS(
+            CgroupKernPrivateData::new(Weak::new(), CgroupFileType::CgroupDir)
+        )),
+    )?;
+    
+    log::debug!("create_cgroup_mount_point: Created cgroup directory using KernFS");
+    
+    // 为创建的 cgroup 目录设置动态查找功能，让它能够动态创建子目录和文件
+    let dynamic_lookup = Arc::new(CgroupDynamicLookup::new(
+        Weak::new(),
+        Arc::downgrade(&cgroup_dir)
+    ));
+    
+    cgroup_dir.set_dynamic_lookup(dynamic_lookup);
+    log::info!("create_cgroup_mount_point: Successfully created cgroup mount point with dynamic lookup");
+
+    Ok(cgroup_dir)
 }
 
 

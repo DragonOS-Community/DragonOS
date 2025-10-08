@@ -56,8 +56,11 @@ download:
 	@echo "下载gvisor测试套件..."
 	@./download_tests.sh --skip-if-exists
 
+# 获取blocklists目录下的所有文件
+BLOCKLIST_FILES := $(shell find blocklists -type f 2>/dev/null)
+
 # 安装到目标目录
-install: build download
+install: build download whitelist.txt $(BLOCKLIST_FILES)
 	@echo "安装gvisor测试套件到 $(INSTALL_DIR)"
 	@mkdir -p $(INSTALL_DIR)
 	# 安装Rust测试运行器二进制文件

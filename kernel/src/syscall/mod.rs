@@ -371,11 +371,6 @@ impl Syscall {
 
             SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
 
-            SYS_TKILL => {
-                warn!("SYS_TKILL has not yet been implemented");
-                Ok(0)
-            }
-
             SYS_SIGALTSTACK => {
                 warn!("SYS_SIGALTSTACK has not yet been implemented");
                 Ok(0)

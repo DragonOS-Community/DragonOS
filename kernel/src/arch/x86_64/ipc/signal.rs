@@ -32,44 +32,6 @@ pub const STACK_ALIGN: u64 = 16;
 /// 信号最大值
 pub const MAX_SIG_NUM: usize = 64;
 
-/// siginfo中的si_code的可选值
-/// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
-#[derive(Copy, Debug, Clone)]
-#[repr(i32)]
-pub enum SigCode {
-    /// sent by kill, sigsend, raise
-    User = 0,
-    /// sent by kernel from somewhere
-    Kernel = 0x80,
-    /// 通过sigqueue发送
-    Queue = -1,
-    /// 定时器过期时发送
-    Timer = -2,
-    /// 当实时消息队列的状态发生改变时发送
-    Mesgq = -3,
-    /// 当异步IO完成时发送
-    AsyncIO = -4,
-    /// sent by queued SIGIO
-    SigIO = -5,
-}
-
-impl SigCode {
-    /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
-    #[allow(dead_code)]
-    pub fn from_i32(x: i32) -> SigCode {
-        match x {
-            0 => Self::User,
-            0x80 => Self::Kernel,
-            -1 => Self::Queue,
-            -2 => Self::Timer,
-            -3 => Self::Mesgq,
-            -4 => Self::AsyncIO,
-            -5 => Self::SigIO,
-            _ => panic!("signal code not valid"),
-        }
-    }
-}
-
 bitflags! {
     #[repr(C,align(8))]
     #[derive(Default)]
@@ -385,10 +347,20 @@ fn handle_signal(
     if unsafe { frame.syscall_nr() }.is_some() {
         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
             match syscall_err {
-                SystemError::ERESTARTNOHAND | SystemError::ERESTART_RESTARTBLOCK => {
+                SystemError::ERESTARTNOHAND => {
                     frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                 }
                 SystemError::ERESTARTSYS => {
+                    if !sigaction.flags().contains(SigFlags::SA_RESTART) {
+                        frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
+                    } else {
+                        frame.rax = frame.errcode;
+                        frame.rip -= 2;
+                    }
+                }
+                SystemError::ERESTART_RESTARTBLOCK => {
+                    // 为了让带 SA_RESTART 的时序（例如 clock_nanosleep 相对睡眠）也能自动重启，
+                    // 当 SA_RESTART 设置时，按 ERESTARTSYS 的语义处理；否则返回 EINTR。
                     if !sigaction.flags().contains(SigFlags::SA_RESTART) {
                         frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                     } else {

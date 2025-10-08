@@ -481,8 +481,8 @@ impl File {
         // 如果文件不可写，返回错误
         self.writeable()?;
 
-        // 调用inode的truncate方法
-        self.inode.resize(len)?;
+        // 统一通过 VFS 封装，复用类型/只读检查
+        crate::filesystem::vfs::vcore::vfs_truncate(self.inode(), len)?;
         return Ok(());
     }
 

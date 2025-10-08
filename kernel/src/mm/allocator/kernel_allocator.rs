@@ -67,7 +67,7 @@ impl LocalAlloc for KernelAllocator {
             return self
                 .alloc_in_buddy(layout)
                 .map(|x| x.as_mut_ptr())
-                .unwrap_or(core::ptr::null_mut());
+                .unwrap_or_default();
         } else {
             if let Some(ref mut slab) = SLABALLOCATOR {
                 return slab.allocate(layout);
@@ -85,7 +85,7 @@ impl LocalAlloc for KernelAllocator {
                     core::ptr::write_bytes(ptr, 0, x.len());
                     ptr
                 })
-                .unwrap_or(core::ptr::null_mut());
+                .unwrap_or_default();
         } else {
             if let Some(ref mut slab) = SLABALLOCATOR {
                 return slab.allocate(layout);
@@ -126,7 +126,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if allocator_select_condition(layout) || ((ptr as usize) % 4096) == 0 {
+        if allocator_select_condition(layout) || (ptr as usize).is_multiple_of(4096) {
             dealloc_debug_log(klog_types::LogSource::Buddy, layout, ptr);
         } else {
             dealloc_debug_log(klog_types::LogSource::Slab, layout, ptr);

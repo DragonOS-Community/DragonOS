@@ -2,13 +2,13 @@ English
 ==========================================
 .. note:: AI Translation Notice
 
-   This document was automatically translated by `Qwen/Qwen3-8B` model, for reference only.
+   This document was automatically translated by `hunyuan-turbos-latest` model, for reference only.
 
    - Source document: index.rst
 
-   - Translation time: 2025-05-22 09:21:59
+   - Translation time: 2025-09-11 16:37:17
 
-   - Translation model: `Qwen/Qwen3-8B`
+   - Translation model: `hunyuan-turbos-latest`
 
 
    Please report issues via `Community Channel <https://github.com/DragonOS-Community/DragonOS/issues>`_
@@ -44,12 +44,13 @@ English
    kernel/cpu_arch/index
    kernel/container/index
    kernel/libs/index
+   kernel/net/index
    kernel/trace/index
    kernel/syscall/index
 
 .. toctree::
    :maxdepth: 1
-   :caption: Userland Layer
+   :caption: Application Layer
 
    userland/appdev/index
 

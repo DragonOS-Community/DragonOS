@@ -1,0 +1,15 @@
+[package]
+name = "r_unitest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2.0"
+nix = { version = "0.29.0", features = ["sched", "process"] }
+errno = "0.3.9"
+syscalls = '0.6.18'
+sc = "0.2.7"
+actix-web = { version = "3.0.0", default-features = false, features = [
+    "rust-tls",
+] }
+

@@ -1,23 +1,24 @@
 .. note:: AI Translation Notice
 
-   This document was automatically translated by `Qwen/Qwen3-8B` model, for reference only.
+   This document was automatically translated by `hunyuan-turbos-latest` model, for reference only.
 
    - Source document: kernel/ipc/index.rst
 
-   - Translation time: 2025-05-19 01:41:19
+   - Translation time: 2025-09-24 08:15:51
 
-   - Translation model: `Qwen/Qwen3-8B`
+   - Translation model: `hunyuan-turbos-latest`
 
 
    Please report issues via `Community Channel <https://github.com/DragonOS-Community/DragonOS/issues>`_
 
 ====================================
-Inter-Process Communication
+Interprocess Communication
 ====================================
 
-   This is the documentation for DragonOS Inter-Process Communication (IPC).
+   This is the documentation for interprocess communication (IPC) in DragonOS.
 
 .. toctree::
    :maxdepth: 1
 
    signal
+   ipc_namespace

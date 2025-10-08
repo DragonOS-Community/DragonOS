@@ -1,4 +1,4 @@
-//! 这个文件用于放置一些内核态访问用户态数据的函数
+//! This file contains functions for kernel-space access to user-space data
 
 use core::{
     mem::size_of,
@@ -12,29 +12,30 @@ use defer::defer;
 use crate::{
     arch::MMArch,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
+    process::ProcessManager,
 };
 
 use super::SystemError;
 
-/// 清空用户空间指定范围内的数据
+/// Clear data in the specified range of user space
 ///
-/// ## 参数
+/// ## Arguments
 ///
-/// - `dest`：用户空间的目标地址
-/// - `len`：要清空的数据长度
+/// - `dest`: Destination address in user space
+/// - `len`: Length of data to clear
 ///
-/// ## 返回值
+/// ## Returns
 ///
-/// 返回清空的数据长度
+/// Returns the length of cleared data
 ///
-/// ## 错误
+/// ## Errors
 ///
-/// - `EFAULT`：目标地址不合法
+/// - `EFAULT`: Destination address is invalid
 pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemError> {
     verify_area(dest, len).map_err(|_| SystemError::EFAULT)?;
 
     let p = dest.data() as *mut u8;
-    // 清空用户空间的数据
+    // Clear user space data
     p.write_bytes(0, len);
     return Ok(len);
 }
@@ -52,7 +53,7 @@ pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemEr
     return Ok(src.len());
 }
 
-/// 从用户空间拷贝数据到内核空间
+/// Copy data from user space to kernel space
 pub unsafe fn copy_from_user(dst: &mut [u8], src: VirtAddr) -> Result<usize, SystemError> {
     verify_area(src, dst.len()).map_err(|_| SystemError::EFAULT)?;
 
@@ -63,23 +64,23 @@ pub unsafe fn copy_from_user(dst: &mut [u8], src: VirtAddr) -> Result<usize, Sys
     return Ok(dst.len());
 }
 
-/// 检查并从用户态拷贝一个 C 字符串。
+/// Check and copy a C string from user space.
 ///
-/// 一旦遇到非法地址，就会返回错误
+/// Returns an error when encountering an invalid address.
 ///
-/// ## 参数
+/// ## Arguments
 ///
-/// - `user`：用户态的 C 字符串指针
-/// - `max_length`：最大拷贝长度
+/// - `user`: Pointer to the C string in user space
+/// - `max_length`: Maximum copy length
 ///
-/// ## 返回值
+/// ## Returns
 ///
-/// 返回拷贝的 C 字符串
+/// Returns the copied C string
 ///
-/// ## 错误
+/// ## Errors
 ///
-/// - `EFAULT`：用户态地址不合法
-/// - `EINVAL`：字符串不是合法的 C 字符串
+/// - `EFAULT`: User space address is invalid
+/// - `EINVAL`: String is not a valid C string
 pub fn check_and_clone_cstr(
     user: *const u8,
     max_length: Option<usize>,
@@ -88,7 +89,7 @@ pub fn check_and_clone_cstr(
         return Err(SystemError::EFAULT);
     }
 
-    // 从用户态读取，直到遇到空字符 '\0' 或者达到最大长度
+    // Read from user space until null character '\0' or maximum length is reached
     let mut buffer = Vec::new();
     for i in 0.. {
         if max_length.is_some() && max_length.as_ref().unwrap() <= &i {
@@ -111,20 +112,20 @@ pub fn check_and_clone_cstr(
     return Ok(cstr);
 }
 
-/// 检查并从用户态拷贝一个 C 字符串数组
+/// Check and copy a C string array from user space
 ///
-/// 一旦遇到空指针，就会停止拷贝. 一旦遇到非法地址，就会返回错误
-/// ## 参数
+/// Stops copying when encountering a null pointer. Returns an error when encountering an invalid address.
+/// ## Arguments
 ///
-/// - `user`：用户态的 C 字符串指针数组
+/// - `user`: Pointer array to C strings in user space
 ///
-/// ## 返回值
+/// ## Returns
 ///
-/// 返回拷贝的 C 字符串数组
+/// Returns the copied C string array
 ///
-/// ## 错误
+/// ## Errors
 ///
-/// - `EFAULT`：用户态地址不合法
+/// - `EFAULT`: User space address is invalid
 pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<CString>, SystemError> {
     if user.is_null() {
         Ok(Vec::new())
@@ -134,7 +135,7 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<CString>
         for i in 0.. {
             let addr = unsafe { user.add(i) };
             let str_ptr: *const u8;
-            // 读取这个地址的值（这个值也是一个指针）
+            // Read the value at this address (which is also a pointer)
             unsafe {
                 let dst = [0usize; 1];
                 let mut dst = core::mem::transmute::<[usize; 1], [u8; size_of::<usize>()]>(dst);
@@ -148,9 +149,9 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<CString>
             if str_ptr.is_null() {
                 break;
             }
-            // 读取这个指针指向的字符串
+            // Read the string pointed to by this pointer
             let string = check_and_clone_cstr(str_ptr, None)?;
-            // 将字符串放入 buffer 中
+            // Put the string into the buffer
             buffer.push(string);
         }
         return Ok(buffer);
@@ -167,14 +168,17 @@ pub struct UserBufferReader<'a> {
     buffer: &'a [u8],
 }
 
-#[allow(dead_code)]
 impl UserBufferReader<'_> {
-    /// 构造一个指向用户空间位置的BufferReader，为了兼容类似传入 *const u8 的情况，使用单独的泛型来进行初始化
+    /// Construct a BufferReader pointing to a user space location.
+    /// Uses a separate generic for initialization to support cases like passing *const u8.
     ///
-    /// @param addr 用户空间指针
-    /// @param len 缓冲区的字节长度
-    /// @param frm_user 代表是否要检验地址来自用户空间
-    /// @return 构造成功返回UserbufferReader实例，否则返回错误码
+    /// # Arguments
+    /// * `addr` - User space pointer
+    /// * `len` - Byte length of the buffer
+    /// * `from_user` - Whether to verify the address is from user space
+    ///
+    /// # Returns
+    /// * Returns UserBufferReader instance on success, error code otherwise
     ///
     pub fn new<U>(addr: *const U, len: usize, from_user: bool) -> Result<Self, SystemError> {
         if from_user && verify_area(VirtAddr::new(addr as usize), len).is_err() {
@@ -185,31 +189,86 @@ impl UserBufferReader<'_> {
         });
     }
 
+    pub fn new_checked<U>(
+        addr: *const U,
+        len: usize,
+        from_user: bool,
+    ) -> Result<Self, SystemError> {
+        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, false) {
+            return Err(SystemError::EFAULT);
+        }
+
+        return Self::new(addr, len, from_user);
+    }
+
     pub fn size(&self) -> usize {
         return self.buffer.len();
     }
 
-    /// 从用户空间读取数据(到变量中)
+    /// Read data from user space with page mapping and permission verification
     ///
-    /// @param offset 字节偏移量
-    /// @return 返回用户空间数据的切片(对单个结构体就返回长度为一的切片)
+    /// This function verifies that the pages are mapped AND have the required permissions,
+    /// not just performing permission checks.
+    ///
+    /// # Arguments
+    /// * `offset` - Byte offset
+    ///
+    /// # Returns
+    /// * Returns a slice of user space data (returns a slice of length 1 for a single struct)
+    ///
+    /// # Errors
+    /// * `EFAULT` - Pages are not mapped or lack required permissions
+    pub fn read_from_user_checked<T>(&self, offset: usize) -> Result<&[T], SystemError> {
+        return self.convert_with_offset_checked(self.buffer, offset);
+    }
+
+    /// Read data from user space (into variables)
+    ///
+    /// # Arguments
+    /// * `offset` - Byte offset
+    ///
+    /// # Returns
+    /// * Returns a slice of user space data (returns a slice of length 1 for a single struct)
     ///
     pub fn read_from_user<T>(&self, offset: usize) -> Result<&[T], SystemError> {
         return self.convert_with_offset(self.buffer, offset);
     }
-    /// 从用户空间读取一个指定偏移量的数据(到变量中)
+    /// Read one data item with specified offset from user space (into variable)
     ///
-    /// @param offset 字节偏移量
-    /// @return 返回用户空间数据的引用
-    ///    
+    /// # Arguments
+    /// * `offset` - Byte offset
+    ///
+    /// # Returns
+    /// * Returns a reference to the user space data
+    ///
     pub fn read_one_from_user<T>(&self, offset: usize) -> Result<&T, SystemError> {
         return self.convert_one_with_offset(self.buffer, offset);
     }
 
-    /// 从用户空间拷贝数据(到指定地址中)
+    /// Read one data item from user space with page mapping and permission verification
     ///
-    /// @param dst 目标地址指针
-    /// @return 拷贝成功的话返回拷贝的元素数量
+    /// This function verifies that the pages are mapped AND have the required permissions,
+    /// not just performing permission checks.
+    ///
+    /// # Arguments
+    /// * `offset` - Byte offset
+    ///
+    /// # Returns
+    /// * Returns a reference to the user space data
+    ///
+    /// # Errors
+    /// * `EFAULT` - Pages are not mapped or lack required permissions
+    pub fn read_one_from_user_checked<T>(&self, offset: usize) -> Result<&T, SystemError> {
+        return self.convert_one_with_offset_checked(self.buffer, offset);
+    }
+
+    /// Copy data from user space (to specified address)
+    ///
+    /// # Arguments
+    /// * `dst` - Destination address pointer
+    ///
+    /// # Returns
+    /// * Returns number of elements copied on success
     ///
     pub fn copy_from_user<T: core::marker::Copy>(
         &self,
@@ -221,10 +280,37 @@ impl UserBufferReader<'_> {
         return Ok(dst.len());
     }
 
-    /// 从用户空间拷贝数据(到指定地址中)
+    /// Copy data from user space with page mapping and permission verification
     ///
-    /// @param dst 目标地址指针
-    /// @return 拷贝成功的话返回拷贝的元素数量
+    /// This function verifies that the pages are mapped AND have the required permissions,
+    /// not just performing permission checks.
+    ///
+    /// # Arguments
+    /// * `dst` - Destination address pointer
+    /// * `offset` - Byte offset
+    ///
+    /// # Returns
+    /// * Returns number of elements copied on success
+    ///
+    /// # Errors
+    /// * `EFAULT` - Pages are not mapped or lack required permissions
+    pub fn copy_from_user_checked<T: core::marker::Copy>(
+        &self,
+        dst: &mut [T],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        let data = self.convert_with_offset_checked(self.buffer, offset)?;
+        dst.copy_from_slice(data);
+        return Ok(dst.len());
+    }
+
+    /// Copy one data item from user space (to specified address)
+    ///
+    /// # Arguments
+    /// * `dst` - Destination address pointer
+    ///
+    /// # Returns
+    /// * Ok(()) on success
     ///
     pub fn copy_one_from_user<T: core::marker::Copy>(
         &self,
@@ -236,13 +322,56 @@ impl UserBufferReader<'_> {
         return Ok(());
     }
 
-    /// 把用户空间的数据转换成指定类型的切片
+    /// Copy one data item from user space with page mapping and permission verification
     ///
-    /// ## 参数
+    /// This function verifies that the pages are mapped AND have the required permissions,
+    /// not just performing permission checks.
     ///
-    /// - `offset`：字节偏移量
+    /// # Arguments
+    /// * `dst` - Destination address pointer
+    /// * `offset` - Byte offset
+    ///
+    /// # Returns
+    /// * Ok(()) on success
+    ///
+    /// # Errors
+    /// * `EFAULT` - Pages are not mapped or lack required permissions
+    pub fn copy_one_from_user_checked<T: core::marker::Copy>(
+        &self,
+        dst: &mut T,
+        offset: usize,
+    ) -> Result<(), SystemError> {
+        let data = self.convert_one_with_offset_checked::<T>(self.buffer, offset)?;
+        dst.clone_from(data);
+        return Ok(());
+    }
+
+    /// Convert user space data to a slice of specified type
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Byte offset
     pub fn buffer<T>(&self, offset: usize) -> Result<&[T], SystemError> {
         self.convert_with_offset::<T>(self.buffer, offset)
+            .map_err(|_| SystemError::EINVAL)
+    }
+
+    /// Convert user space data to a slice of specified type with page mapping and permission verification
+    ///
+    /// This function verifies that the pages are mapped AND have the required permissions,
+    /// not just performing permission checks.
+    ///
+    /// # Arguments
+    /// * `offset` - Byte offset
+    ///
+    /// # Returns
+    /// * Returns a slice of the specified type
+    ///
+    /// # Errors
+    /// * `EINVAL` - Invalid offset or alignment
+    /// * `EFAULT` - Pages are not mapped or lack required permissions
+    pub fn buffer_checked<T>(&self, offset: usize) -> Result<&[T], SystemError> {
+        self.convert_with_offset_checked(self.buffer, offset)
             .map_err(|_| SystemError::EINVAL)
     }
 
@@ -251,7 +380,7 @@ impl UserBufferReader<'_> {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &[u8] = &src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 || byte_buffer.is_empty() {
+        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) || byte_buffer.is_empty() {
             return Err(SystemError::EINVAL);
         }
 
@@ -264,6 +393,24 @@ impl UserBufferReader<'_> {
         return Ok(chunks);
     }
 
+    fn convert_with_offset_checked<T>(
+        &self,
+        src: &[u8],
+        offset: usize,
+    ) -> Result<&[T], SystemError> {
+        let size = src.len().saturating_sub(offset);
+        if size > 0
+            && !check_user_access_by_page_table(
+                VirtAddr::new(src.as_ptr() as usize + offset),
+                size,
+                false,
+            )
+        {
+            return Err(SystemError::EFAULT);
+        }
+        self.convert_with_offset(src, offset)
+    }
+
     fn convert_one_with_offset<T>(&self, src: &[u8], offset: usize) -> Result<&T, SystemError> {
         if offset + core::mem::size_of::<T>() > src.len() {
             return Err(SystemError::EINVAL);
@@ -274,15 +421,37 @@ impl UserBufferReader<'_> {
         let data = &chunks[0];
         return Ok(data);
     }
+
+    fn convert_one_with_offset_checked<T>(
+        &self,
+        src: &[u8],
+        offset: usize,
+    ) -> Result<&T, SystemError> {
+        let size = core::mem::size_of::<T>();
+        if offset + size > src.len() {
+            return Err(SystemError::EINVAL);
+        }
+        if !check_user_access_by_page_table(
+            VirtAddr::new(src.as_ptr() as usize + offset),
+            size,
+            false,
+        ) {
+            return Err(SystemError::EFAULT);
+        }
+        self.convert_one_with_offset(src, offset)
+    }
 }
 
 #[allow(dead_code)]
 impl<'a> UserBufferWriter<'a> {
-    /// 构造一个指向用户空间位置的BufferWriter
+    /// Construct a BufferWriter pointing to a user space location
     ///
-    /// @param addr 用户空间指针
-    /// @param len 缓冲区的字节长度
-    /// @return 构造成功返回UserbufferWriter实例，否则返回错误码
+    /// # Arguments
+    /// * `addr` - User space pointer
+    /// * `len` - Byte length of the buffer
+    ///
+    /// # Returns
+    /// * Returns UserBufferWriter instance on success, error code otherwise
     ///
     pub fn new<U>(addr: *mut U, len: usize, from_user: bool) -> Result<Self, SystemError> {
         if from_user && verify_area(VirtAddr::new(addr as usize), len).is_err() {
@@ -293,15 +462,26 @@ impl<'a> UserBufferWriter<'a> {
         });
     }
 
+    pub fn new_checked<U>(addr: *mut U, len: usize, from_user: bool) -> Result<Self, SystemError> {
+        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, true) {
+            return Err(SystemError::EFAULT);
+        }
+
+        return Self::new(addr, len, from_user);
+    }
+
     pub fn size(&self) -> usize {
         return self.buffer.len();
     }
 
-    /// 从指定地址写入数据到用户空间
+    /// Write data from specified address to user space
     ///
-    /// @param data 要写入的数据地址
-    /// @param offset 在UserBuffer中的字节偏移量
-    /// @return 返回写入元素的数量
+    /// # Arguments
+    /// * `src` - Source data address
+    /// * `offset` - Byte offset in UserBuffer
+    ///
+    /// # Returns
+    /// * Returns number of elements written
     ///
     pub fn copy_to_user<T: core::marker::Copy>(
         &'a mut self,
@@ -313,13 +493,40 @@ impl<'a> UserBufferWriter<'a> {
         return Ok(src.len());
     }
 
-    /// 从指定地址写入一个数据到用户空间
+    /// Write data from specified address to user space with page mapping and permission verification
     ///
-    /// @param data 要写入的数据地址
-    /// @param offset 在UserBuffer中的字节偏移量
-    /// @return Ok/Err
+    /// This function verifies that the pages are mapped AND have the required permissions,
+    /// not just performing permission checks.
     ///
-    pub fn copy_one_to_user<T: core::marker::Copy>(
+    /// # Arguments
+    /// * `src` - Source data address
+    /// * `offset` - Byte offset in UserBuffer
+    ///
+    /// # Returns
+    /// * Returns number of elements written
+    ///
+    /// # Errors
+    /// * `EFAULT` - Pages are not mapped or lack required permissions
+    pub fn copy_to_user_checked<T: core::marker::Copy>(
+        &'a mut self,
+        src: &[T],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        let dst = Self::convert_with_offset_checked(self.buffer, offset)?;
+        dst.copy_from_slice(src);
+        return Ok(src.len());
+    }
+
+    /// Write one data item from specified address to user space
+    ///
+    /// # Arguments
+    /// * `src` - Source data address
+    /// * `offset` - Byte offset in UserBuffer
+    ///
+    /// # Returns
+    /// * Ok(()) on success
+    ///
+    pub fn copy_one_to_user<T: Clone>(
         &'a mut self,
         src: &T,
         offset: usize,
@@ -329,16 +536,58 @@ impl<'a> UserBufferWriter<'a> {
         return Ok(());
     }
 
+    /// Write one data item from specified address to user space with page mapping and permission verification
+    ///
+    /// This function verifies that the pages are mapped AND have the required permissions,
+    /// not just performing permission checks.
+    ///
+    /// # Arguments
+    /// * `src` - Source data address
+    /// * `offset` - Byte offset in UserBuffer
+    ///
+    /// # Returns
+    /// * Ok(()) on success
+    ///
+    /// # Errors
+    /// * `EFAULT` - Pages are not mapped or lack required permissions
+    pub fn copy_one_to_user_checked<T: Clone>(
+        &'a mut self,
+        src: &T,
+        offset: usize,
+    ) -> Result<(), SystemError> {
+        let dst = Self::convert_one_with_offset_checked::<T>(self.buffer, offset)?;
+        dst.clone_from(src);
+        return Ok(());
+    }
+
     pub fn buffer<T>(&'a mut self, offset: usize) -> Result<&'a mut [T], SystemError> {
         Self::convert_with_offset::<T>(self.buffer, offset).map_err(|_| SystemError::EINVAL)
     }
 
+    /// Convert to a mutable slice of specified type with page mapping and permission verification
+    ///
+    /// This function verifies that the pages are mapped AND have the required permissions,
+    /// not just performing permission checks.
+    ///
+    /// # Arguments
+    /// * `offset` - Byte offset
+    ///
+    /// # Returns
+    /// * Returns a mutable slice of the specified type
+    ///
+    /// # Errors
+    /// * `EINVAL` - Invalid offset or alignment
+    /// * `EFAULT` - Pages are not mapped or lack required permissions
+    pub fn buffer_checked<T>(&'a mut self, offset: usize) -> Result<&'a mut [T], SystemError> {
+        Self::convert_with_offset_checked::<T>(self.buffer, offset).map_err(|_| SystemError::EINVAL)
+    }
+
     fn convert_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut [T], SystemError> {
-        if offset >= src.len() {
+        if offset > src.len() {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &mut [u8] = &mut src[offset..];
-        if byte_buffer.len() % core::mem::size_of::<T>() != 0 || byte_buffer.is_empty() {
+        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) {
             return Err(SystemError::EINVAL);
         }
 
@@ -351,6 +600,23 @@ impl<'a> UserBufferWriter<'a> {
         return Ok(chunks);
     }
 
+    fn convert_with_offset_checked<T>(
+        src: &mut [u8],
+        offset: usize,
+    ) -> Result<&mut [T], SystemError> {
+        let size = src.len().saturating_sub(offset);
+        if size > 0
+            && !check_user_access_by_page_table(
+                VirtAddr::new(src.as_ptr() as usize + offset),
+                size,
+                true,
+            )
+        {
+            return Err(SystemError::EFAULT);
+        }
+        Self::convert_with_offset(src, offset)
+    }
+
     fn convert_one_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut T, SystemError> {
         if offset + core::mem::size_of::<T>() > src.len() {
             return Err(SystemError::EINVAL);
@@ -361,4 +627,79 @@ impl<'a> UserBufferWriter<'a> {
         let data = &mut chunks[0];
         return Ok(data);
     }
+
+    fn convert_one_with_offset_checked<T>(
+        src: &mut [u8],
+        offset: usize,
+    ) -> Result<&mut T, SystemError> {
+        let size = core::mem::size_of::<T>();
+        if offset + size > src.len() {
+            return Err(SystemError::EINVAL);
+        }
+        if !check_user_access_by_page_table(
+            VirtAddr::new(src.as_ptr() as usize + offset),
+            size,
+            true,
+        ) {
+            return Err(SystemError::EFAULT);
+        }
+        Self::convert_one_with_offset(src, offset)
+    }
+}
+
+/// Check user access by page table - verifies both page mapping AND permissions
+///
+/// This function checks if pages are mapped in the page table AND verifies
+/// the required permissions (user access, and write access if requested).
+/// It returns false if pages are not mapped or lack required permissions.
+///
+/// # Arguments
+/// * `addr` - Virtual address to check
+/// * `size` - Size of the memory region to check
+/// * `check_write` - Whether to check for write permission
+///
+/// # Returns
+/// * `true` if all pages are mapped and have required permissions
+/// * `false` if any page is not mapped or lacks required permissions
+fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: bool) -> bool {
+    // Check if address is valid
+    if addr.is_null() {
+        return false;
+    }
+    // Get address space and check mapping
+    let vm = match ProcessManager::current_pcb().basic().user_vm() {
+        Some(vm) => vm,
+        None => return false,
+    };
+
+    // Calculate page-aligned address and size
+    let page_mask = MMArch::PAGE_SIZE - 1;
+    let aligned_addr = addr.data() & (!page_mask); // Align down to page boundary
+    let offset = (addr - aligned_addr).data();
+    let aligned_size = (offset + size).next_multiple_of(MMArch::PAGE_SIZE);
+
+    // Calculate number of pages to check (rounded up)
+    let pages = aligned_size / MMArch::PAGE_SIZE;
+
+    let guard = vm.read_irqsave();
+    for i in 0..pages {
+        let page_addr = aligned_addr + i * MMArch::PAGE_SIZE;
+        let flags = match guard.user_mapper.utable.translate(VirtAddr::new(page_addr)) {
+            Some((_, flags)) => flags,
+            None => return false,
+        };
+
+        if !flags.has_user() {
+            // If no user access permission, return false
+            return false;
+        }
+
+        if check_write && !flags.has_write() {
+            // If write permission check is required but no write permission, return false
+            return false;
+        }
+    }
+    drop(guard);
+
+    return true;
 }

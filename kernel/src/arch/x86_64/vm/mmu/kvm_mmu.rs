@@ -128,7 +128,7 @@ impl LockedKvmMmu {
         })
     }
 
-    pub fn lock(&self) -> SpinLockGuard<KvmMmu> {
+    pub fn lock(&self) -> SpinLockGuard<'_, KvmMmu> {
         self.inner.lock()
     }
 }
@@ -513,7 +513,7 @@ impl VirtCpuArch {
     }
 
     #[inline]
-    pub fn mmu(&self) -> SpinLockGuard<KvmMmu> {
+    pub fn mmu(&self) -> SpinLockGuard<'_, KvmMmu> {
         self.mmu.as_ref().unwrap().lock()
     }
 

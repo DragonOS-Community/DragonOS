@@ -1,23 +1,17 @@
 #![no_main] // <1>
 #![no_std]
 #![feature(alloc_error_handler)]
-#![feature(asm_goto)]
 #![feature(new_zeroed_alloc)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
-#![feature(concat_idents)]
 #![feature(const_for)]
-#![feature(const_size_of_val)]
 #![feature(const_trait_impl)]
 #![feature(core_intrinsics)]
 #![feature(c_variadic)]
 #![feature(c_void_variant)]
-#![feature(extract_if)]
 #![feature(fn_align)]
 #![feature(linked_list_retain)]
-#![feature(naked_functions)]
 #![feature(ptr_internals)]
-#![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
 #![feature(sync_unsafe_cell)]
 #![feature(vec_into_raw_parts)]
@@ -67,7 +61,6 @@ mod init;
 mod ipc;
 mod misc;
 mod mm;
-mod namespaces;
 mod net;
 mod perf;
 mod process;
@@ -99,7 +92,9 @@ extern crate x86;
 #[macro_use]
 extern crate kcmdline_macros;
 extern crate klog_types;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 extern crate uefi;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 extern crate uefi_raw;
 #[macro_use]
 extern crate wait_queue_macros;

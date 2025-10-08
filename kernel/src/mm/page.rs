@@ -19,7 +19,6 @@ use crate::{
     exception::ipi::{IpiKind, IpiTarget},
     filesystem::{page_cache::PageCache, vfs::FilePrivateData},
     init::initcall::INITCALL_CORE,
-    ipc::shm::ShmId,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -378,11 +377,7 @@ impl PageReclaimer {
 
         let len = if let Ok(metadata) = inode.metadata() {
             let size = metadata.size as usize;
-            if size < page_index * MMArch::PAGE_SIZE {
-                0
-            } else {
-                size - page_index * MMArch::PAGE_SIZE
-            }
+            size.saturating_sub(page_index * MMArch::PAGE_SIZE)
         } else {
             MMArch::PAGE_SIZE
         };
@@ -510,11 +505,11 @@ impl Page {
         self.phys_addr
     }
 
-    pub fn read_irqsave(&self) -> RwLockReadGuard<InnerPage> {
+    pub fn read_irqsave(&self) -> RwLockReadGuard<'_, InnerPage> {
         self.inner.read_irqsave()
     }
 
-    pub fn write_irqsave(&self) -> RwLockWriteGuard<InnerPage> {
+    pub fn write_irqsave(&self) -> RwLockWriteGuard<'_, InnerPage> {
         self.inner.write_irqsave()
     }
 }
@@ -676,7 +671,7 @@ pub enum PageType {
     /// 文件映射页，含文件映射相关信息
     File(FileMapInfo),
     /// 共享内存页，记录ShmId
-    Shm(ShmId),
+    Shm,
 }
 
 #[derive(Debug, Clone)]

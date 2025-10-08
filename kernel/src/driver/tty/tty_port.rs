@@ -65,7 +65,7 @@ pub enum TtyPortState {
 }
 
 pub trait TtyPort: Sync + Send + Debug {
-    fn port_data(&self) -> SpinLockGuard<TtyPortData>;
+    fn port_data(&self) -> SpinLockGuard<'_, TtyPortData>;
 
     /// 获取Port的状态
     fn state(&self) -> TtyPortState {
@@ -87,8 +87,12 @@ pub trait TtyPort: Sync + Send + Debug {
         }
         let event: usize = ld.poll(tty.clone())?;
         let pollflag = EPollEventType::from_bits_truncate(event as u32);
-        EventPoll::wakeup_epoll(tty.core().eptiems(), pollflag)?;
+        EventPoll::wakeup_epoll(tty.core().epitems(), pollflag)?;
         ret
+    }
+
+    fn internal_tty(&self) -> Option<Arc<TtyCore>> {
+        self.port_data().internal_tty()
     }
 }
 
@@ -106,7 +110,7 @@ impl DefaultTtyPort {
 }
 
 impl TtyPort for DefaultTtyPort {
-    fn port_data(&self) -> SpinLockGuard<TtyPortData> {
+    fn port_data(&self) -> SpinLockGuard<'_, TtyPortData> {
         self.port_data.lock_irqsave()
     }
 }

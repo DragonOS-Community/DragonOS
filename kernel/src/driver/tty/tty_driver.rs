@@ -55,6 +55,12 @@ impl TtyDriverManager {
     pub fn lookup_tty_driver(dev_num: DeviceNumber) -> Option<(usize, Arc<TtyDriver>)> {
         let drivers_guard = TTY_DRIVERS.lock();
         for driver in drivers_guard.iter() {
+            // log::debug!(
+            //     "driver.major: {}, minor_start: {}, device_count: {}",
+            //     driver.major.data(),
+            //     driver.minor_start,
+            //     driver.device_count
+            // );
             let base = DeviceNumber::new(driver.major, driver.minor_start);
             if dev_num < base || dev_num.data() > base.data() + driver.device_count {
                 continue;
@@ -239,7 +245,7 @@ impl TtyDriver {
     }
 
     #[inline]
-    pub fn ttys(&self) -> SpinLockGuard<HashMap<usize, Arc<TtyCore>>> {
+    pub fn ttys(&self) -> SpinLockGuard<'_, HashMap<usize, Arc<TtyCore>>> {
         self.ttys.lock()
     }
 
@@ -349,8 +355,8 @@ impl TtyDriver {
     pub fn open_tty(&self, index: Option<usize>) -> Result<Arc<TtyCore>, SystemError> {
         let mut tty: Option<Arc<TtyCore>> = None;
 
-        if index.is_some() {
-            if let Some(t) = self.lookup_tty(index.unwrap()) {
+        if let Some(idx) = index {
+            if let Some(t) = self.lookup_tty(idx) {
                 if t.core().port().is_none() {
                     warn!("{} port is None", t.core().name());
                 } else if t.core().port().unwrap().state() == TtyPortState::KOPENED {
@@ -425,13 +431,13 @@ impl KObject for TtyDriver {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         todo!()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         todo!()
     }
 

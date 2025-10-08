@@ -8,10 +8,9 @@ use system_error::SystemError;
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
     filesystem::procfs::procfs_register_pid,
-    ipc::signal::flush_signal_handlers,
+    ipc::signal_types::SignalFlags,
     libs::rwlock::RwLock,
     mm::VirtAddr,
-    namespaces::{create_new_namespaces, namespace::USER_NS, pid_namespace::PidStrcut},
     process::ProcessFlags,
     sched::{sched_cgroup_fork, sched_fork},
     smp::core::smp_get_processor_id,
@@ -19,14 +18,17 @@ use crate::{
 };
 
 use super::{
+    alloc_pid,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
-    KernelStack, Pgid, Pid, ProcessControlBlock, ProcessManager, Sid,
+    pid::{Pid, PidType},
+    KernelStack, ProcessControlBlock, ProcessManager, RawPid,
 };
-const MAX_PID_NS_LEVEL: usize = 32;
+pub const MAX_PID_NS_LEVEL: usize = 32;
 
 bitflags! {
     /// 进程克隆标志
     pub struct CloneFlags: u64 {
+        const CLONE_NEWTIME = 0x00000080;
         /// 在进程间共享虚拟内存空间
         const CLONE_VM = 0x00000100;
         /// 在进程间共享文件系统信息
@@ -77,6 +79,8 @@ bitflags! {
         const CLONE_IO = 0x80000000;
         /// 克隆时，将原本被设置为SIG_IGNORE的信号，设置回SIG_DEFAULT
         const CLONE_CLEAR_SIGHAND = 0x100000000;
+        /// 克隆到具有正确权限的特定cgroup中
+        const CLONE_INTO_CGROUP = 0x200000000;
     }
 }
 
@@ -158,7 +162,7 @@ impl ProcessManager {
     pub fn fork(
         current_trapframe: &TrapFrame,
         clone_flags: CloneFlags,
-    ) -> Result<Pid, SystemError> {
+    ) -> Result<RawPid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
 
         let new_kstack: KernelStack = KernelStack::new()?;
@@ -173,18 +177,27 @@ impl ProcessManager {
         Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
             error!(
                 "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(),
-                pcb.pid(),
+                current_pcb.raw_pid(),
+                pcb.raw_pid(),
                 e
             );
             e
         })?;
+        // if pcb.raw_pid().data() > 1 {
+        //     log::debug!(
+        //         "fork done, pid: {}, pgid: {:?}, tgid: {:?}, sid: {}",
+        //         pcb.raw_pid(),
+        //         pcb.task_pgrp().map(|x| x.pid_vnr().data()),
+        //         pcb.task_tgid_vnr(),
+        //         pcb.task_session().map_or(0, |s| s.pid_vnr().data())
+        //     );
+        // }
 
         // 向procfs注册进程
-        procfs_register_pid(pcb.pid()).unwrap_or_else(|e| {
+        procfs_register_pid(pcb.raw_pid()).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to register pid to procfs, pid: [{:?}]. Error: {:?}",
-                pcb.pid(),
+                pcb.raw_pid(),
                 e
             )
         });
@@ -194,12 +207,16 @@ impl ProcessManager {
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
-                pcb.pid(),
+                pcb.raw_pid(),
                 e
             )
         });
 
-        return Ok(pcb.pid());
+        if ProcessManager::current_pid().data() == 0 {
+            return Ok(pcb.raw_pid());
+        }
+
+        return Ok(pcb.pid().pid_vnr());
     }
 
     fn copy_flags(
@@ -237,7 +254,7 @@ impl ProcessManager {
         let old_address_space = current_pcb.basic().user_vm().unwrap_or_else(|| {
             panic!(
                 "copy_mm: Failed to get address space of current process, current pid: [{:?}]",
-                current_pcb.pid()
+                current_pcb.raw_pid()
             )
         });
 
@@ -248,39 +265,11 @@ impl ProcessManager {
         let new_address_space = old_address_space.write_irqsave().try_clone().unwrap_or_else(|e| {
             panic!(
                 "copy_mm: Failed to clone address space of current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), new_pcb.pid(), e
+                current_pcb.raw_pid(), new_pcb.raw_pid(), e
             )
         });
         unsafe { new_pcb.basic_mut().set_user_vm(Some(new_address_space)) };
         return Ok(());
-    }
-
-    #[inline(never)]
-    fn copy_namespaces(
-        clone_flags: &CloneFlags,
-        current_pcb: &Arc<ProcessControlBlock>,
-        new_pcb: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
-        if !clone_flags.contains(CloneFlags::CLONE_NEWNS)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWUTS)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWIPC)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWPID)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWNET)
-            && !clone_flags.contains(CloneFlags::CLONE_NEWCGROUP)
-        {
-            new_pcb.set_nsproxy(current_pcb.get_nsproxy().read().clone());
-            return Ok(());
-        }
-
-        if clone_flags.contains(CloneFlags::CLONE_NEWIPC)
-            && clone_flags.contains(CloneFlags::CLONE_SYSVSEM)
-        {
-            return Err(SystemError::EINVAL);
-        }
-
-        let new_nsproxy = create_new_namespaces(clone_flags.bits(), current_pcb, USER_NS.clone())?;
-        *new_pcb.nsproxy.write() = new_nsproxy;
-        Ok(())
     }
 
     #[inline(never)]
@@ -310,21 +299,16 @@ impl ProcessManager {
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // todo SignalStruct结构需要更改，属于线程组逻辑
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
-            // log::debug!("copy_sighand: CLONE_SIGHAND");
-            current_pcb
-                .sig_struct_irqsave()
-                .cnt
-                .fetch_add(1, Ordering::SeqCst);
+            new_pcb.replace_sighand(current_pcb.sighand());
             return Ok(());
         }
 
         // log::debug!("Just copy sighand");
-        new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers.clone();
+        new_pcb.sighand().copy_handlers_from(&current_pcb.sighand());
 
         if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
-            flush_signal_handlers(new_pcb.clone(), false);
+            new_pcb.flush_signal_handlers(false);
         }
         return Ok(());
     }
@@ -350,7 +334,6 @@ impl ProcessManager {
         clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
-        // log::debug!("fork: clone_flags: {:?}", clone_args.flags);
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
@@ -377,7 +360,16 @@ impl ProcessManager {
             return Err(SystemError::EINVAL);
         }
 
-        // TODO: 处理CLONE_PARENT 与 SIGNAL_UNKILLABLE的情况
+        // 当全局init进程或其容器内init进程的兄弟进程退出时，由于它们的父进程（swapper）不会回收它们，
+        // 这些进程会保持僵尸状态。为了避免这种情况以及防止出现多根进程树，
+        // 需要阻止全局init和容器内init进程创建兄弟进程。
+        if clone_flags.contains(CloneFlags::CLONE_PARENT)
+            && current_pcb
+                .sighand()
+                .flags_contains(SignalFlags::UNKILLABLE)
+        {
+            return Err(SystemError::EINVAL);
+        }
 
         // 如果新进程使用不同的 pid 或 namespace，
         // 则不允许它与分叉任务共享线程组。
@@ -423,6 +415,9 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
+        // 标记当前线程还未被执行exec
+        pcb.flags().insert(ProcessFlags::FORKNOEXEC);
+
         // 将子进程/线程的id存储在用户态传进的地址中
         if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
             let mut writer = UserBufferWriter::new(
@@ -431,13 +426,13 @@ impl ProcessManager {
                 true,
             )?;
 
-            writer.copy_one_to_user(&(pcb.pid().0 as i32), 0)?;
+            writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
         }
 
         sched_fork(pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to set sched info from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -445,7 +440,7 @@ impl ProcessManager {
         Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy flags from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -453,20 +448,15 @@ impl ProcessManager {
         Self::copy_mm(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy mm from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
-        });
-
-        Self::copy_namespaces(&clone_flags, current_pcb, pcb).unwrap_or_else(|e|{
-            panic!("fork: Failed to copy namespace form current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e)
         });
 
         // 拷贝文件描述符表
         Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy files from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -474,7 +464,15 @@ impl ProcessManager {
         Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
+
+        // 拷贝namespace
+        Self::copy_namespaces(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy namespaces from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
@@ -482,16 +480,12 @@ impl ProcessManager {
         Self::copy_thread(current_pcb, pcb, &clone_args, current_trapframe).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy thread from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
-        if current_pcb.pid() != Pid(0) {
-            let new_pid = PidStrcut::alloc_pid(
-                pcb.get_nsproxy().read().pid_namespace.clone(), // 获取命名空间
-                clone_args.set_tid.clone(),
-            )?;
-            *pcb.thread_pid.write() = new_pid;
-        }
+
+        // 继承 rlimit
+        pcb.inherit_rlimits_from(current_pcb);
 
         // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长
@@ -524,7 +518,7 @@ impl ProcessManager {
                 if unlikely(leader.is_none()) {
                     panic!(
                         "fork: Failed to get leader of current process, current pid: [{:?}]",
-                        current_pcb.pid()
+                        current_pcb.raw_pid()
                     );
                 }
 
@@ -540,67 +534,97 @@ impl ProcessManager {
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }
 
-        // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
-
-        Self::copy_group(current_pcb, pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to set the process group for the new pcb, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
-            )
-        });
-
         Self::copy_fs(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.pid(), pcb.pid(), e
+                current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
 
+        if pcb.raw_pid() == RawPid::UNASSIGNED {
+            // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
+            let ns = pcb.nsproxy().pid_namespace_for_children().clone();
+
+            let main_pid_arc = alloc_pid(&ns).expect("alloc_pid failed");
+
+            // 根namespace中的PID号作为RawPid
+            let root_pid_nr = main_pid_arc
+                .first_upid()
+                .expect("UPid list empty")
+                .nr
+                .data();
+            // log::debug!("fork: root_pid_nr: {}", root_pid_nr);
+
+            unsafe {
+                pcb.force_set_raw_pid(RawPid(root_pid_nr));
+            }
+            pcb.init_task_pid(PidType::PID, main_pid_arc);
+        }
+
+        // 将当前pcb加入父进程的子进程哈希表中
+        if pcb.raw_pid() > RawPid(1) {
+            if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
+                let mut children = ppcb_arc.children.write_irqsave();
+                children.push(pcb.raw_pid());
+            } else {
+                panic!("parent pcb is None");
+            }
+        }
+
+        if pcb.raw_pid() > RawPid(0) {
+            ProcessManager::add_pcb(pcb.clone());
+        }
+
+        let pid = pcb.pid();
+        if pcb.is_thread_group_leader() {
+            if pcb.raw_pid() == RawPid(1) {
+                pcb.init_task_pid(PidType::TGID, pid.clone());
+                pcb.init_task_pid(PidType::PGID, pid.clone());
+                pcb.init_task_pid(PidType::SID, pid.clone());
+            } else {
+                pcb.init_task_pid(PidType::TGID, pid.clone());
+                pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
+                pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
+            }
+
+            if pid.is_child_reaper() {
+                pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
+                pcb.sighand().flags_insert(SignalFlags::UNKILLABLE);
+            }
+
+            let parent_siginfo = current_pcb.sig_info_irqsave();
+            let parent_tty = parent_siginfo.tty();
+            let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
+            let parent_is_child_reaper = parent_siginfo.is_child_subreaper();
+            drop(parent_siginfo);
+            let mut sig_info_guard = pcb.sig_info_mut();
+
+            // log::debug!("set tty: {:?}", parent_tty);
+            sig_info_guard.set_tty(parent_tty);
+
+            /*
+             * Inherit has_child_subreaper flag under the same
+             * tasklist_lock with adding child to the process tree
+             * for propagate_has_child_subreaper optimization.
+             */
+            sig_info_guard
+                .set_has_child_subreaper(parent_has_child_subreaper || parent_is_child_reaper);
+            drop(sig_info_guard);
+            pcb.attach_pid(PidType::TGID);
+            pcb.attach_pid(PidType::PGID);
+            pcb.attach_pid(PidType::SID);
+        } else {
+            pcb.task_join_group_stop();
+            let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
+            group_leader
+                .threads_write_irqsave()
+                .group_tasks
+                .push(Arc::downgrade(pcb));
+        }
+
+        pcb.attach_pid(PidType::PID);
+
         sched_cgroup_fork(pcb);
-
-        Ok(())
-    }
-
-    /// 拷贝进程组信息
-    ///
-    /// ## 参数
-    ///
-    /// `parent_pcb` - 父进程
-    /// `child_pcb` - 子进程
-    /// ## 返回值
-    ///
-    /// 无
-    fn copy_group(
-        parent_pcb: &Arc<ProcessControlBlock>,
-        child_pcb: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
-        if parent_pcb.process_group().is_none() && parent_pcb.pid() == Pid(0) {
-            return Ok(());
-        }
-        let pg = parent_pcb.process_group().unwrap();
-
-        let mut pg_inner = pg.process_group_inner.lock();
-
-        let mut children_writelock = parent_pcb.children.write();
-
-        children_writelock.push(child_pcb.pid());
-
-        pg_inner
-            .processes
-            .insert(child_pcb.pid(), child_pcb.clone());
-
-        // 检查是否已经存在pgid和sid
-        let pgid = Pgid::new(child_pcb.pid().0);
-        let sid = Sid::new(pgid.into());
-
-        if ProcessManager::find_process_group(pgid).is_some() {
-            ProcessManager::remove_process_group(pgid);
-        }
-        if ProcessManager::find_session(sid).is_some() {
-            ProcessManager::remove_session(sid);
-        }
-
-        child_pcb.set_process_group(&pg);
 
         Ok(())
     }
@@ -619,5 +643,21 @@ impl ProcessManager {
             *guard = Arc::new(new_fs);
         }
         Ok(())
+    }
+}
+
+impl ProcessControlBlock {
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/fork.c#1959
+    pub(super) fn init_task_pid(&self, pid_type: PidType, pid: Arc<Pid>) {
+        // log::debug!(
+        //     "init_task_pid: pid_type: {:?}, raw_pid:{}",
+        //     pid_type,
+        //     self.raw_pid().data()
+        // );
+        if pid_type == PidType::PID {
+            self.thread_pid.write().replace(pid);
+        } else {
+            self.sighand().set_pid(pid_type, Some(pid));
+        }
     }
 }

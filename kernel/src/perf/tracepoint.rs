@@ -5,6 +5,7 @@ use crate::filesystem::page_cache::PageCache;
 use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::SpinLock;
 use crate::perf::util::PerfProbeConfig;
+use crate::perf::{BasicPerfEbpfCallBack, JITMem};
 use crate::tracepoint::{TracePoint, TracePointCallBackFunc};
 use crate::{
     filesystem::vfs::{file::File, FilePrivateData, FileSystem, IndexNode},
@@ -16,7 +17,7 @@ use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 use core::any::Any;
 use core::sync::atomic::AtomicUsize;
-use rbpf::EbpfVmRawOwned;
+use rbpf::EbpfVmRaw;
 use system_error::SystemError;
 
 #[derive(Debug)]
@@ -72,31 +73,24 @@ impl IndexNode for TracepointPerfEvent {
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         None
     }
-}
 
-pub struct TracePointPerfCallBack {
-    _bpf_prog_file: Arc<BpfProg>,
-    vm: EbpfVmRawOwned,
-}
-
-impl TracePointPerfCallBack {
-    fn new(bpf_prog_file: Arc<BpfProg>, vm: EbpfVmRawOwned) -> Self {
-        Self {
-            _bpf_prog_file: bpf_prog_file,
-            vm,
-        }
+    fn absolute_path(&self) -> core::result::Result<String, SystemError> {
+        Ok(format!(
+            "tracepoint: {}:{}",
+            self.tp.system(),
+            self.tp.name()
+        ))
     }
 }
+
+pub struct TracePointPerfCallBack(BasicPerfEbpfCallBack);
 
 impl TracePointCallBackFunc for TracePointPerfCallBack {
     fn call(&self, entry: &[u8]) {
         // ebpf needs a mutable slice
         let entry =
             unsafe { core::slice::from_raw_parts_mut(entry.as_ptr() as *mut u8, entry.len()) };
-        let res = self.vm.execute_program(entry);
-        if res.is_err() {
-            log::error!("tracepoint callback error: {:?}", res);
-        }
+        self.0.call(entry);
     }
 }
 
@@ -109,15 +103,39 @@ impl PerfEventOps for TracepointPerfEvent {
             .downcast_arc::<BpfProg>()
             .ok_or(SystemError::EINVAL)?;
         let prog_slice = file.insns();
-        let mut vm = EbpfVmRawOwned::new(Some(prog_slice.to_vec())).map_err(|e| {
+
+        let prog_slice =
+            unsafe { core::slice::from_raw_parts(prog_slice.as_ptr(), prog_slice.len()) };
+        let mut vm = EbpfVmRaw::new(Some(prog_slice)).map_err(|e| {
             log::error!("create ebpf vm failed: {:?}", e);
             SystemError::EINVAL
         })?;
-        vm.register_helper_set(BPF_HELPER_FUN_SET.get())
-            .map_err(|_| SystemError::EINVAL)?;
+        for (id, f) in BPF_HELPER_FUN_SET.get() {
+            vm.register_helper(*id, *f)
+                .map_err(|_| SystemError::EINVAL)?;
+        }
 
         // create a callback to execute the ebpf prog
-        let callback = Box::new(TracePointPerfCallBack::new(file, vm));
+        let callback;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            log::info!("Using JIT compilation for BPF program on x86_64 architecture");
+            let jit_mem = Box::new(JITMem::new());
+            let jit_mem = Box::leak(jit_mem);
+            let jit_mem_addr = core::ptr::from_ref::<JITMem>(jit_mem) as usize;
+            vm.set_jit_exec_memory(jit_mem).unwrap();
+            vm.jit_compile().unwrap();
+            let basic_callback = BasicPerfEbpfCallBack::new(file, vm, jit_mem_addr);
+            callback = Box::new(TracePointPerfCallBack(basic_callback));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            vm.register_allowed_memory(0..u64::MAX);
+            let basic_callback = BasicPerfEbpfCallBack::new(file, vm);
+            callback = Box::new(TracePointPerfCallBack(basic_callback));
+        }
+
         let id = CALLBACK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.tp.register_raw_callback(id, callback);
 

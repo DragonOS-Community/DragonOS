@@ -11,14 +11,14 @@ jobs:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.12
+    container: dragonos/dragonos-dev:v1.14
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.12"
+      - run: echo "Running in dragonos/dragonos-dev:v1.14"
       - uses: actions/checkout@v3
 
       - name: Format check
@@ -28,6 +28,7 @@ jobs:
         shell: bash -ileo pipefail {0}
         run: |
           printf "\n" >> kernel/src/include/bindings/bindings.rs
+          printf "\n" >> kernel/src/init/version_info.rs
           sed -i 's/arch = ".*"/arch = "${{ matrix.arch }}"/' dadk-manifest.toml
           FMT_CHECK=1 make fmt
 
@@ -35,14 +36,14 @@ jobs:
     name: Kernel static test ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.12
+    container: dragonos/dragonos-dev:v1.14
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.12"
+      - run: echo "Running in dragonos/dragonos-dev:v1.14"
 
       - uses: actions/checkout@v3
 
@@ -51,12 +52,12 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           HOME: /root
-        run: bash -c "source /root/.cargo/env && cd kernel && make test && make test-rbpf"
+        run: bash -c "source /root/.cargo/env && cd kernel && make test"
 
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.12
+    container: dragonos/dragonos-dev:v1.14
     continue-on-error: true
     strategy:
       matrix:
@@ -73,7 +74,7 @@ jobs:
             checkout_params: {}
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.12"
+      - run: echo "Running in dragonos/dragonos-dev:v1.14"
       
       - uses: actions/checkout@v3
         with: ${{ matrix.checkout_params }}
@@ -82,6 +83,8 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           HOME: /root
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         shell: bash -ileo pipefail {0}
         run: |
           source $HOME/.bashrc

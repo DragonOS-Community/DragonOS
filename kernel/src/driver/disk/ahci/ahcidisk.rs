@@ -6,6 +6,7 @@ use crate::driver::base::block::manager::BlockDevMeta;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
 
+use crate::driver::base::device::device_number::Major;
 use crate::driver::base::device::driver::Driver;
 use crate::driver::base::device::{DevName, Device, DeviceType, IdTable};
 use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
@@ -52,7 +53,7 @@ pub struct LockedAhciDisk {
 }
 
 impl LockedAhciDisk {
-    pub fn inner(&self) -> SpinLockGuard<AhciDisk> {
+    pub fn inner(&self) -> SpinLockGuard<'_, AhciDisk> {
         self.inner.lock()
     }
 }
@@ -121,8 +122,8 @@ impl AhciDisk {
             None
         };
 
-        if kbuf.is_some() {
-            buf_ptr = kbuf.as_mut().unwrap().as_mut_ptr() as usize;
+        if let Some(buf) = &mut kbuf {
+            buf_ptr = buf.as_mut_ptr() as usize;
         }
 
         #[allow(unused_unsafe)]
@@ -285,8 +286,8 @@ impl AhciDisk {
             None
         };
 
-        if kbuf.is_some() {
-            buf_ptr = kbuf.as_mut().unwrap().as_mut_ptr() as usize;
+        if let Some(buf) = &mut kbuf {
+            buf_ptr = buf.as_mut_ptr() as usize;
         }
 
         #[allow(unused_unsafe)]
@@ -381,7 +382,7 @@ impl LockedAhciDisk {
         let devname = scsi_manager().alloc_id().ok_or(SystemError::EBUSY)?;
         // 构建磁盘结构体
         let result: Arc<LockedAhciDisk> = Arc::new_cyclic(|self_ref| LockedAhciDisk {
-            blkdev_meta: BlockDevMeta::new(devname),
+            blkdev_meta: BlockDevMeta::new(devname, Major::AHCI_BLK_MAJOR),
             inner: SpinLock::new(AhciDisk {
                 partitions: Vec::new(),
                 ctrl_num,
@@ -430,11 +431,11 @@ impl KObject for LockedAhciDisk {
         todo!()
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         todo!()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         todo!()
     }
 

@@ -1,14 +1,16 @@
-use core::sync::atomic::compiler_fence;
-
 use crate::{
-    arch::ipc::signal::{SigCode, Signal},
+    arch::ipc::signal::Signal,
     filesystem::{
-        epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
+        epoll::{
+            event_poll::{EventPoll, LockedEPItemLinkedList},
+            EPollEventType, EPollItem,
+        },
         vfs::{
             file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
             FileSystem, FileType, IndexNode, Metadata, PollableInode,
         },
     },
+    ipc::signal_types::SigCode,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
@@ -17,11 +19,10 @@ use crate::{
     sched::SchedMode,
     time::PosixTimeSpec,
 };
+use alloc::string::String;
+use core::sync::atomic::compiler_fence;
 
-use alloc::{
-    collections::LinkedList,
-    sync::{Arc, Weak},
-};
+use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 use super::signal_types::{SigInfo, SigType};
@@ -50,7 +51,7 @@ pub struct LockedPipeInode {
     inner: SpinLock<InnerPipeInode>,
     read_wait_queue: WaitQueue,
     write_wait_queue: WaitQueue,
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
+    epitems: LockedEPItemLinkedList,
 }
 
 /// @brief 管道文件i节点(无锁)
@@ -145,7 +146,7 @@ impl LockedPipeInode {
             inner: SpinLock::new(inner),
             read_wait_queue: WaitQueue::default(),
             write_wait_queue: WaitQueue::default(),
-            epitems: SpinLock::new(LinkedList::new()),
+            epitems: LockedEPItemLinkedList::default(),
         });
         let mut guard = result.inner.lock();
         guard.self_ref = Arc::downgrade(&result);
@@ -412,12 +413,15 @@ impl IndexNode for LockedPipeInode {
                             sig,
                             0,
                             SigCode::Kernel,
-                            SigType::Kill(ProcessManager::current_pid()),
+                            SigType::Kill(ProcessManager::current_pcb().task_pid_vnr()),
                         );
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
                         let _retval = sig
-                            .send_signal_info(Some(&mut info), ProcessManager::current_pid())
+                            .send_signal_info(
+                                Some(&mut info),
+                                ProcessManager::current_pcb().task_pid_vnr(),
+                            )
                             .map(|x| x as usize);
 
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -499,7 +503,7 @@ impl IndexNode for LockedPipeInode {
         return Ok((name, entry.metadata()?));
     }
 
-    fn fs(&self) -> Arc<(dyn FileSystem)> {
+    fn fs(&self) -> Arc<dyn FileSystem> {
         todo!()
     }
 
@@ -509,5 +513,9 @@ impl IndexNode for LockedPipeInode {
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Ok(self)
+    }
+
+    fn absolute_path(&self) -> Result<String, SystemError> {
+        Ok(String::from("pipe"))
     }
 }

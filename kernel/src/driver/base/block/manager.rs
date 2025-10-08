@@ -1,4 +1,4 @@
-use core::fmt::Formatter;
+use core::{fmt::Formatter, sync::atomic::AtomicU32};
 
 use alloc::sync::Arc;
 use hashbrown::HashMap;
@@ -6,8 +6,15 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::base::{block::gendisk::GenDisk, device::DevName},
-    filesystem::mbr::MbrDiskPartionTable,
+    driver::base::{
+        block::gendisk::GenDisk,
+        device::{device_number::Major, DevName},
+    },
+    filesystem::{
+        devfs::devfs_register,
+        mbr::MbrDiskPartionTable,
+        vfs::{utils::DName, IndexNode},
+    },
     init::initcall::INITCALL_POSTCORE,
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
@@ -39,17 +46,20 @@ pub struct BlockDevManager {
 
 struct InnerBlockDevManager {
     disks: HashMap<DevName, Arc<dyn BlockDevice>>,
+    /// 记录每个major对应的下一个可用的minor号
+    minors: HashMap<Major, AtomicU32>,
 }
 impl BlockDevManager {
     pub fn new() -> Self {
         BlockDevManager {
             inner: SpinLock::new(InnerBlockDevManager {
                 disks: HashMap::new(),
+                minors: HashMap::new(),
             }),
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerBlockDevManager> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerBlockDevManager> {
         self.inner.lock()
     }
 
@@ -62,18 +72,18 @@ impl BlockDevManager {
         }
         inner.disks.insert(dev_name.clone(), dev.clone());
 
-        let mut out_remove = || {
+        // 检测分区表，并创建gendisk
+        let res = self.check_partitions(&dev);
+        if res.is_err() {
             inner.disks.remove(dev_name);
         };
-
-        // 检测分区表，并创建gendisk
-        self.check_partitions(&dev).inspect_err(|_| out_remove())?;
+        res?;
         Ok(())
     }
 
     /// 检测分区表，并创建gendisk
     fn check_partitions(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
-        if self.check_mbr(dev).is_ok() {
+        if self.try_register_disk_by_mbr(dev).is_ok() {
             return Ok(());
         }
 
@@ -81,11 +91,13 @@ impl BlockDevManager {
         self.register_entire_disk_as_gendisk(dev)
     }
 
-    fn check_mbr(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
+    fn try_register_disk_by_mbr(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
         let mbr = MbrDiskPartionTable::from_disk(dev.clone())?;
         let piter = mbr.partitions_raw();
+        let mut idx;
         for p in piter {
-            self.register_gendisk_with_range(dev, p.try_into()?)?;
+            idx = dev.blkdev_meta().inner().gendisks.alloc_idx();
+            self.register_gendisk_with_range(dev, p.try_into()?, idx)?;
         }
         Ok(())
     }
@@ -96,20 +108,29 @@ impl BlockDevManager {
         dev: &Arc<dyn BlockDevice>,
     ) -> Result<(), SystemError> {
         let range = dev.disk_range();
-        self.register_gendisk_with_range(dev, range)
+        self.register_gendisk_with_range(dev, range, GenDisk::ENTIRE_DISK_IDX)
     }
 
     fn register_gendisk_with_range(
         &self,
         dev: &Arc<dyn BlockDevice>,
         range: GeneralBlockRange,
+        idx: u32,
     ) -> Result<(), SystemError> {
         let weak_dev = Arc::downgrade(dev);
-        let gendisk = GenDisk::new(
-            weak_dev,
-            range,
-            Some(dev.blkdev_meta().inner().gendisks.alloc_idx()),
-        );
+
+        // 这里先拿到硬盘的设备名，然后在根据idx来生成gendisk的名字
+        // 如果是整个磁盘，则idx为 None，名字为/dev/sda
+        // 如果是分区，例如idx为1，则名字为/dev/sda1
+        // 以此类推
+        let dev_name = dev.dev_name();
+        let (idx, dev_name) = match idx {
+            GenDisk::ENTIRE_DISK_IDX => (None, DName::from(dev_name.name())),
+            id => (Some(id), DName::from(format!("{}{}", dev_name.name(), idx))),
+        };
+
+        let gendisk = GenDisk::new(weak_dev, range, idx, dev_name);
+        // log::info!("Registering gendisk");
         self.register_gendisk(dev, gendisk)
     }
 
@@ -129,6 +150,17 @@ impl BlockDevManager {
         meta_inner.gendisks.insert(idx, gendisk.clone());
         dev.callback_gendisk_registered(&gendisk).inspect_err(|_| {
             meta_inner.gendisks.remove(&idx);
+        })?;
+
+        // 注册到devfs
+        let dname = gendisk.dname()?;
+        devfs_register(dname.as_ref(), gendisk.clone()).map_err(|e| {
+            log::error!(
+                "Failed to register gendisk {:?} to devfs: {:?}",
+                dname.as_ref(),
+                e
+            );
+            e
         })?;
         Ok(())
     }
@@ -204,28 +236,46 @@ impl BlockDevManager {
 
         Some((path, partno))
     }
+
+    /// 获取对应major下一个可用的minor号
+    pub(self) fn next_minor(&self, major: Major) -> u32 {
+        let mut inner = self.inner();
+        let base = inner
+            .minors
+            .entry(major)
+            .or_insert_with(|| AtomicU32::new(0));
+        let base_minor = base.load(core::sync::atomic::Ordering::SeqCst);
+        base.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        base_minor
+    }
 }
 
 pub struct BlockDevMeta {
     pub devname: DevName,
+    pub major: Major,
+    pub base_minor: u32,
     inner: SpinLock<InnerBlockDevMeta>,
 }
 
 pub struct InnerBlockDevMeta {
     pub gendisks: GenDiskMap,
+    pub dev_idx: usize,
 }
 
 impl BlockDevMeta {
-    pub fn new(devname: DevName) -> Self {
+    pub fn new(devname: DevName, major: Major) -> Self {
         BlockDevMeta {
             devname,
+            major,
+            base_minor: block_dev_manager().next_minor(major),
             inner: SpinLock::new(InnerBlockDevMeta {
                 gendisks: GenDiskMap::new(),
+                dev_idx: 0, // 默认索引为0
             }),
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerBlockDevMeta> {
+    pub(crate) fn inner(&self) -> SpinLockGuard<'_, InnerBlockDevMeta> {
         self.inner.lock()
     }
 }

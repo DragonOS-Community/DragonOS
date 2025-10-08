@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::intrinsics::likely;
 use core::ops::BitXor;
 
-use bitmap::{traits::BitMapOps, StaticBitmap};
+use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -42,12 +42,12 @@ pub struct NTtyLinediscipline {
 
 impl NTtyLinediscipline {
     #[inline]
-    pub fn disc_data(&self) -> SpinLockGuard<NTtyData> {
+    pub fn disc_data(&self) -> SpinLockGuard<'_, NTtyData> {
         self.data.lock_irqsave()
     }
 
     #[inline]
-    pub fn disc_data_try_lock(&self) -> Result<SpinLockGuard<NTtyData>, SystemError> {
+    pub fn disc_data_try_lock(&self) -> Result<SpinLockGuard<'_, NTtyData>, SystemError> {
         self.data.try_lock_irqsave()
     }
 
@@ -57,7 +57,8 @@ impl NTtyLinediscipline {
                 todo!()
             }
             TtyIoctlCmd::TCFLSH => {
-                todo!()
+                log::warn!("NTTY TCFLSH has not been implemented yet");
+                Ok(0)
             }
             _ => {
                 return TtyCore::tty_mode_ioctl(tty.clone(), cmd, arg);
@@ -119,8 +120,8 @@ pub struct NTtyData {
     read_buf: Box<[u8; NTTY_BUFSIZE]>,
     echo_buf: Box<[u8; NTTY_BUFSIZE]>,
 
-    read_flags: StaticBitmap<NTTY_BUFSIZE>,
-    char_map: StaticBitmap<256>,
+    read_flags: static_bitmap!(NTTY_BUFSIZE),
+    char_map: static_bitmap!(256),
 
     tty: Weak<TtyCore>,
 }
@@ -188,7 +189,7 @@ impl NTtyData {
 
             let mut room = NTTY_BUFSIZE - (self.read_head - tail);
             if termios.input_mode.contains(InputMode::PARMRK) {
-                room = (room + 2) / 3;
+                room = room.div_ceil(3);
             }
 
             room -= 1;
@@ -305,8 +306,8 @@ impl NTtyData {
         let mut f_offset = 0;
         let mut c_offset = 0;
         while count != 0 {
-            if flags.is_some() {
-                flag = flags.as_ref().unwrap()[f_offset];
+            if let Some(flags_slice) = flags.as_ref() {
+                flag = flags_slice[f_offset];
                 f_offset += 1;
             }
 
@@ -787,9 +788,10 @@ impl NTtyData {
     ) {
         // 先处理信号
         let ctrl_info = tty.core().contorl_info_irqsave();
-        let pg = ctrl_info.pgid;
+        let pg = ctrl_info.pgid.clone();
+        drop(ctrl_info);
         if let Some(pg) = pg {
-            let _ = crate::ipc::kill::kill_process_group(pg, signal);
+            let _ = crate::ipc::kill::kill_process_group(&pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {

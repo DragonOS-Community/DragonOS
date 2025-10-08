@@ -3,6 +3,9 @@ mod kprobe;
 mod tracepoint;
 mod util;
 
+use crate::arch::MMArch;
+use crate::bpf::prog::BpfProg;
+use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileMode};
@@ -15,8 +18,11 @@ use crate::include::bindings::linux_bpf::{
 };
 use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::mm::allocator::page_frame::{
+    allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
+};
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::VmFaultReason;
+use crate::mm::{MemoryManagementArch, VirtAddr, VmFaultReason};
 use crate::perf::bpf::BpfPerfEvent;
 use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs, PerfProbeConfig};
 use crate::process::ProcessManager;
@@ -30,10 +36,11 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::ffi::c_void;
 use core::fmt::Debug;
-use core::ops::Deref;
+use core::ops::{Deref, DerefMut};
 use intertrait::{CastFrom, CastFromSync};
 use log::info;
 use num_traits::FromPrimitive;
+use rbpf::EbpfVmRaw;
 use system_error::SystemError;
 
 type Result<T> = core::result::Result<T, SystemError>;
@@ -55,10 +62,107 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
     fn readable(&self) -> bool;
 }
 
+pub struct JITMem {
+    virt_addr: VirtAddr,
+}
+
+impl JITMem {
+    pub fn new() -> Self {
+        let vaddr = unsafe {
+            let (paddr, _count) =
+                allocate_page_frames(PageFrameCount::new(1)).expect("JITMem alloc failed");
+            MMArch::phys_2_virt(paddr).unwrap()
+        };
+        Self { virt_addr: vaddr }
+    }
+}
+
+impl Deref for JITMem {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            let ptr = self.virt_addr.as_ptr();
+            core::slice::from_raw_parts(ptr, 4096)
+        }
+    }
+}
+
+impl DerefMut for JITMem {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {
+            let ptr = self.virt_addr.as_ptr();
+            core::slice::from_raw_parts_mut(ptr, 4096)
+        }
+    }
+}
+
+impl Drop for JITMem {
+    fn drop(&mut self) {
+        unsafe {
+            let paddr = MMArch::virt_2_phys(self.virt_addr).expect("JITMem drop failed");
+            let count = PageFrameCount::new(1);
+            deallocate_page_frames(PhysPageFrame::new(paddr), count);
+        }
+    }
+}
+
+pub struct BasicPerfEbpfCallBack {
+    _bpf_prog_file: Arc<BpfProg>,
+    vm: EbpfVmRaw<'static>,
+    #[cfg(target_arch = "x86_64")]
+    jit_mem_ptr: usize,
+}
+
+unsafe impl Send for BasicPerfEbpfCallBack {}
+unsafe impl Sync for BasicPerfEbpfCallBack {}
+
+impl BasicPerfEbpfCallBack {
+    #[cfg(not(target_arch = "x86_64"))]
+    fn new(bpf_prog_file: Arc<BpfProg>, vm: EbpfVmRaw<'static>) -> Self {
+        Self {
+            _bpf_prog_file: bpf_prog_file,
+            vm,
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn new(bpf_prog_file: Arc<BpfProg>, vm: EbpfVmRaw<'static>, jit_mem_ptr: usize) -> Self {
+        Self {
+            _bpf_prog_file: bpf_prog_file,
+            vm,
+            jit_mem_ptr,
+        }
+    }
+
+    pub fn call(&self, entry: &mut [u8]) {
+        let res = if cfg!(target_arch = "x86_64") {
+            unsafe { self.vm.execute_program_jit(entry) }
+        } else {
+            self.vm.execute_program(entry)
+        };
+        if res.is_err() {
+            log::error!("kprobe callback error: {:?}", res);
+        }
+    }
+}
+
+impl Drop for BasicPerfEbpfCallBack {
+    fn drop(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            unsafe {
+                let jit_mem = &mut *(self.jit_mem_ptr as *mut JITMem);
+                let jit_mem = Box::from_raw(jit_mem);
+                drop(jit_mem);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PerfEventInode {
     event: Box<dyn PerfEventOps>,
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
+    epitems: LockedEPItemLinkedList,
 }
 
 impl PerfEventInode {
@@ -178,6 +282,10 @@ impl IndexNode for PerfEventInode {
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode> {
         Ok(self)
+    }
+
+    fn absolute_path(&self) -> core::result::Result<String, SystemError> {
+        Ok(String::from("perf_event"))
     }
 }
 

@@ -1,6 +1,14 @@
 use num_traits::FromPrimitive;
 
-use crate::arch::ipc::signal::{SigSet, MAX_SIG_NUM};
+use crate::{
+    arch::{
+        ipc::signal::{SigSet, Signal, MAX_SIG_NUM},
+        CurrentIrqArch,
+    },
+    exception::InterruptArch,
+    process::ProcessManager,
+    sched::{schedule, SchedMode},
+};
 
 /// 信号处理的栈的栈指针的最小对齐
 #[allow(dead_code)]
@@ -78,6 +86,52 @@ impl GenericSignal {
     #[inline]
     pub fn is_rt_signal(&self) -> bool {
         return (*self) as usize >= Self::SIGRTMIN.into();
+    }
+
+    /// 调用信号的默认处理函数
+    pub fn handle_default(&self) {
+        match self {
+            Self::INVALID => {
+                log::error!("attempting to handler an Invalid");
+            }
+            Self::SIGHUP => sig_terminate(*self),
+            Self::SIGINT => sig_terminate(*self),
+            Self::SIGQUIT => sig_terminate_dump(*self),
+            Self::SIGILL => sig_terminate_dump(*self),
+            Self::SIGTRAP => sig_terminate_dump(*self),
+            Self::SIGABRT_OR_IOT => sig_terminate_dump(*self),
+            Self::SIGBUS => sig_terminate_dump(*self),
+            Self::SIGFPE => sig_terminate_dump(*self),
+            Self::SIGKILL => sig_terminate(*self),
+            Self::SIGUSR1 => sig_terminate(*self),
+            Self::SIGSEGV => sig_terminate_dump(*self),
+            Self::SIGUSR2 => sig_terminate(*self),
+            Self::SIGPIPE => sig_terminate(*self),
+            Self::SIGALRM => sig_terminate(*self),
+            Self::SIGTERM => sig_terminate(*self),
+            Self::SIGSTKFLT => sig_terminate(*self),
+            Self::SIGCHLD => sig_ignore(*self),
+            Self::SIGCONT => sig_continue(*self),
+            Self::SIGSTOP => sig_stop(*self),
+            Self::SIGTSTP => sig_stop(*self),
+            Self::SIGTTIN => sig_stop(*self),
+            Self::SIGTTOU => sig_stop(*self),
+            Self::SIGURG => sig_ignore(*self),
+            Self::SIGXCPU => sig_terminate_dump(*self),
+            Self::SIGXFSZ => sig_terminate_dump(*self),
+            Self::SIGVTALRM => sig_terminate(*self),
+            Self::SIGPROF => sig_terminate(*self),
+            Self::SIGWINCH => sig_ignore(*self),
+            Self::SIGIO_OR_POLL => sig_terminate(*self),
+            Self::SIGPWR => sig_terminate(*self),
+            Self::SIGSYS => sig_terminate(*self),
+            Self::SIGRTMIN => sig_terminate(*self),
+            Self::SIGRTMAX => sig_terminate(*self),
+        }
+    }
+
+    pub fn kernel_only(&self) -> bool {
+        matches!(self, Self::SIGKILL | Self::SIGSTOP)
     }
 }
 
@@ -203,4 +257,46 @@ bitflags! {
         const SA_RESTORER   =0x04000000;
         const SA_ALL = Self::SA_NOCLDSTOP.bits()|Self::SA_NOCLDWAIT.bits()|Self::SA_NODEFER.bits()|Self::SA_ONSTACK.bits()|Self::SA_RESETHAND.bits()|Self::SA_RESTART.bits()|Self::SA_SIGINFO.bits()|Self::SA_RESTORER.bits();
     }
+}
+
+/// 信号默认处理函数——终止进程
+fn sig_terminate(sig: Signal) {
+    ProcessManager::exit(sig as usize);
+}
+
+/// 信号默认处理函数——终止进程并生成 core dump
+fn sig_terminate_dump(sig: Signal) {
+    ProcessManager::exit(sig as usize);
+    // TODO 生成 coredump 文件
+}
+
+/// 信号默认处理函数——暂停进程
+fn sig_stop(sig: Signal) {
+    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    ProcessManager::mark_stop().unwrap_or_else(|e| {
+        log::error!(
+            "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
+            e,
+            ProcessManager::current_pcb().pid(),
+            sig
+        );
+    });
+    drop(guard);
+    schedule(SchedMode::SM_NONE);
+    // TODO 暂停进程
+}
+/// 信号默认处理函数——继续进程
+fn sig_continue(sig: Signal) {
+    ProcessManager::wakeup_stop(&ProcessManager::current_pcb()).unwrap_or_else(|_| {
+        log::error!(
+            "Failed to wake up process pid = {:?} with signal :{:?}",
+            ProcessManager::current_pcb().pid(),
+            sig
+        );
+    });
+}
+
+/// 信号默认处理函数——忽略
+fn sig_ignore(_sig: Signal) {
+    return;
 }

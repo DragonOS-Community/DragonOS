@@ -12,6 +12,7 @@ use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
+use mount::MountFlags;
 use system_error::SystemError;
 
 use crate::{
@@ -25,11 +26,12 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
+    process::ProcessManager,
     time::PosixTimeSpec,
 };
 
 use self::{file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id};
-pub use self::{file::FilePrivateData, mount::MountFS, vcore::ROOT_INODE};
+pub use self::{file::FilePrivateData, mount::MountFS};
 
 use super::page_cache::PageCache;
 
@@ -475,7 +477,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// - 该函数会在`MountFS`实例上创建一个新的挂载点。
     /// - 该函数会在全局的挂载列表中记录新的挂载关系。
-    fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
+    fn mount(
+        &self,
+        _fs: Arc<dyn FileSystem>,
+        _mount_flags: MountFlags,
+    ) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -528,25 +534,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
-    /// # absolute_path 获取目录项绝对路径
+    /// Returns the absolute path of the inode.
     ///
-    /// ## 参数
+    /// This function only works for `MountFS` and should not be implemented by other file systems.
+    /// The performance of this function is O(n) for path queries, and it is extremely
+    /// inefficient in file systems that do not implement DName caching.
     ///
-    /// 无
+    /// **WARNING**
     ///
-    /// ## 返回值
+    /// For special inodes(e.g., sockets,pipes, etc.), this function will
+    /// return an special name according to the inode type directly.
     ///
-    /// - Ok(String): 路径
-    /// - Err(SystemError): 文件系统不支持dname parent api
-    ///
-    /// ## Behavior
-    ///
-    /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
-    ///
-    /// # Performance
-    ///
-    /// 这是一个O(n)的路径查询，并且在未实现DName缓存的文件系统中，性能极差；
-    /// 即使实现了DName也尽量不要用。
     fn absolute_path(&self) -> Result<String, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -560,7 +558,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 将当前inode的内容同步到具体设备上
     fn sync(&self) -> Result<(), SystemError> {
-        return Ok(());
+        let page_cache = self.page_cache();
+        if let Some(page_cache) = page_cache {
+            return page_cache.lock_irqsave().sync();
+        }
+        Ok(())
     }
 
     /// ## 创建一个特殊文件节点
@@ -654,6 +656,37 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Err(SystemError::ENOSYS)
     }
+
+    /// @brief 按文件名获取扩展属性
+    ///
+    /// @param name 属性名称
+    /// @param buf 用于存储扩展属性值的缓冲区
+    ///
+    /// @return 成功：Ok(属性值的实际长度)
+    ///         失败：Err(错误码)
+    fn getxattr(&self, _name: &str, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        log::warn!(
+            "getxattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 按文件名设置扩展属性
+    ///
+    /// @param name 属性名称
+    /// @param buf 用于存储扩展属性值的缓冲区
+    /// @param value 要设置的扩展属性值
+    ///
+    /// @return 成功：Ok(0)
+    ///         失败：Err(错误码)
+    fn setxattr(&self, _name: &str, _value: &[u8]) -> Result<usize, SystemError> {
+        log::warn!(
+            "setxattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
+        return Err(SystemError::ENOSYS);
+    }
 }
 
 impl DowncastArc for dyn IndexNode {
@@ -721,11 +754,12 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
+        let root_inode = ProcessManager::current_mntns().root_inode();
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (ROOT_INODE().clone(), String::from(rest))
+            (root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))
@@ -768,7 +802,7 @@ impl dyn IndexNode {
             if file_type == FileType::SymLink && max_follow_times > 0 {
                 let mut content = [0u8; 256];
                 // 读取符号链接
-
+                // TODO:We need to clarify which interfaces require private data and which do not
                 let len = inode.read_at(
                     0,
                     256,
@@ -921,6 +955,7 @@ bitflags! {
     pub struct Magic: u64 {
         const DEVFS_MAGIC = 0x1373;
         const FAT_MAGIC =  0xf2f52011;
+        const EXT4_MAGIC = 0xef53;
         const KER_MAGIC = 0x3153464b;
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
@@ -970,6 +1005,67 @@ impl DowncastArc for dyn FileSystem {
     }
 }
 
+/// # 可以被挂载的文件系统应该实现的trait
+pub trait MountableFileSystem: FileSystem {
+    fn make_mount_data(
+        _raw_data: Option<&str>,
+        _source: &str,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        log::error!("This filesystem does not support make_mount_data");
+        Err(SystemError::ENOSYS)
+    }
+
+    fn make_fs(
+        _data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        log::error!("This filesystem does not support make_fs");
+        Err(SystemError::ENOSYS)
+    }
+}
+
+/// # 注册一个可以被挂载文件系统
+/// 此宏用于注册一个可以被挂载的文件系统。
+/// 它会将文件系统的创建函数和挂载数据创建函数注册到全局的`FSMAKER`数组中。
+///
+/// ## 参数
+/// - `$fs`: 文件系统对应的结构体
+/// - `$maker_name`: 文件系统的注册名
+/// - `$fs_name`: 文件系统的名称（字符串字面量）
+#[macro_export]
+macro_rules! register_mountable_fs {
+    ($fs:ident, $maker_name:ident, $fs_name:literal) => {
+        impl $fs {
+            fn make_fs_bridge(
+                data: Option<&dyn FileSystemMakerData>,
+            ) -> Result<Arc<dyn FileSystem>, SystemError> {
+                <$fs as MountableFileSystem>::make_fs(data)
+            }
+
+            fn make_mount_data_bridge(
+                raw_data: Option<&str>,
+                source: &str,
+            ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+                <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
+            }
+        }
+
+        #[distributed_slice(FSMAKER)]
+        static $maker_name: FileSystemMaker = FileSystemMaker::new(
+            $fs_name,
+            &($fs::make_fs_bridge
+                as fn(
+                    Option<&dyn FileSystemMakerData>,
+                ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+            &($fs::make_mount_data_bridge
+                as fn(
+                    Option<&str>,
+                    &str,
+                )
+                    -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+        );
+    };
+}
+
 #[derive(Debug)]
 pub struct FsInfo {
     /// 文件系统所在的块设备的id
@@ -1011,23 +1107,32 @@ impl Metadata {
     }
 }
 pub struct FileSystemMaker {
-    function: &'static FileSystemNewFunction,
+    /// 文件系统的创建函数
+    maker: &'static FSMakerFunction,
+    /// 文件系统的名称
     name: &'static str,
+    /// 用于创建挂载数据的函数
+    builder: &'static MountDataBuilder,
 }
 
 impl FileSystemMaker {
     pub const fn new(
         name: &'static str,
-        function: &'static FileSystemNewFunction,
+        maker: &'static FSMakerFunction,
+        builder: &'static MountDataBuilder,
     ) -> FileSystemMaker {
-        FileSystemMaker { function, name }
+        FileSystemMaker {
+            maker,
+            name,
+            builder,
+        }
     }
 
-    pub fn call(
+    pub fn build(
         &self,
         data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
-        (self.function)(data)
+        (self.maker)(data)
     }
 }
 
@@ -1035,8 +1140,13 @@ pub trait FileSystemMakerData: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub type FileSystemNewFunction =
+pub type FSMakerFunction =
     fn(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError>;
+pub type MountDataBuilder =
+    fn(
+        raw_data: Option<&str>,
+        source: &str,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>;
 
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
@@ -1049,27 +1159,34 @@ macro_rules! define_filesystem_maker_slice {
     };
 }
 
-/// 调用指定数组中的所有初始化器
-#[macro_export]
-macro_rules! producefs {
-    ($initializer_slice:ident,$filesystem:ident,$raw_data : ident) => {
-        match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
-            Some(maker) => {
-                let mount_data = match $filesystem {
-                    "overlay" => OverlayMountData::from_row($raw_data).ok(),
-                    _ => None,
-                };
-                let data: Option<&dyn FileSystemMakerData> =
-                    mount_data.as_ref().map(|d| d as &dyn FileSystemMakerData);
-
-                maker.call(data)
-            }
-            None => {
-                log::error!("mismatch filesystem type : {}", $filesystem);
-                Err(SystemError::EINVAL)
-            }
+/// # 通过文件系统的名称和数据创建一个文件系统实例
+///
+/// ## 参数
+/// - `filesystem`: 文件系统的名称
+/// - `data`: 可选的挂载数据
+/// - `source`: 挂载源
+///
+/// ## 返回值
+/// - `Ok(Arc<dyn FileSystem>)`: 成功时返回文件系统的共享引用
+/// - `Err(SystemError)`: 如果找不到对应的文件系统或创建失败，则返回错误
+///
+/// 这个是之前的`produce_fs!`的函数版本，改成了函数之后ext4的挂载会慢一点，仅作记录
+pub fn produce_fs(
+    filesystem: &str,
+    data: Option<&str>,
+    source: &str,
+) -> Result<Arc<dyn FileSystem>, SystemError> {
+    match FSMAKER.iter().find(|&m| m.name == filesystem) {
+        Some(maker) => {
+            let mount_data = (maker.builder)(data, source)?;
+            let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
+            maker.build(mount_data_ref)
         }
-    };
+        None => {
+            log::error!("mismatch filesystem type : {}", filesystem);
+            Err(SystemError::EINVAL)
+        }
+    }
 }
 
 define_filesystem_maker_slice!(FSMAKER);
@@ -1107,7 +1224,7 @@ impl<'a> FilldirContext<'a> {
         ino: u64,
         d_type: u8,
     ) -> Result<(), SystemError> {
-        let name_len = name.as_bytes().len();
+        let name_len = name.len();
         let dirent_size = ::core::mem::size_of::<Dirent>() - ::core::mem::size_of::<u8>();
         let reclen = name_len + dirent_size + 1;
 

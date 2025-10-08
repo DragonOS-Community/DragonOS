@@ -80,12 +80,12 @@ impl PciDeviceLinkedList {
     }
     /// @brief 获取可读的linkedlist(读锁守卫)
     /// @return RwLockReadGuard<LinkedList<Box<dyn PciDeviceStructure>>>  读锁守卫
-    pub fn read(&self) -> RwLockReadGuard<LinkedList<Arc<dyn PciDeviceStructure>>> {
+    pub fn read(&self) -> RwLockReadGuard<'_, LinkedList<Arc<dyn PciDeviceStructure>>> {
         self.list.read()
     }
     /// @brief 获取可写的linkedlist(写锁守卫)
     /// @return RwLockWriteGuard<LinkedList<Box<dyn PciDeviceStructure>>>  写锁守卫
-    pub fn write(&self) -> RwLockWriteGuard<LinkedList<Arc<dyn PciDeviceStructure>>> {
+    pub fn write(&self) -> RwLockWriteGuard<'_, LinkedList<Arc<dyn PciDeviceStructure>>> {
         self.list.write()
     }
     /// @brief 获取链表中PCI结构体数目
@@ -116,8 +116,8 @@ impl PciDeviceLinkedList {
 pub fn get_pci_device_structures_mut_by_vendor_id(
     list: &PciDeviceLinkedList,
     vendor_id: u16,
-) -> Vec<Arc<(dyn PciDeviceStructure)>> {
-    let mut result: Vec<Arc<(dyn PciDeviceStructure)>> = Vec::new();
+) -> Vec<Arc<dyn PciDeviceStructure>> {
+    let mut result: Vec<Arc<dyn PciDeviceStructure>> = Vec::new();
     for box_pci_device_structure in list.write().iter() {
         if box_pci_device_structure.common_header().vendor_id == vendor_id {
             result.push(box_pci_device_structure.clone());
@@ -173,7 +173,7 @@ pub fn get_pci_device_structure<'a>(
     list: &'a mut RwLockReadGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
     class_code: u8,
     subclass: u8,
-) -> Vec<&'a Box<(dyn PciDeviceStructure)>> {
+) -> Vec<&'a Box<dyn PciDeviceStructure>> {
     let mut result = Vec::new();
     for box_pci_device_structure in list.iter() {
         let common_header = (*box_pci_device_structure).common_header();
@@ -1077,7 +1077,16 @@ pub fn pci_init() {
                 );
             }
             HeaderType::PciPciBridge if common_header.status & 0x10 != 0 => {
-                info!("Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} cap_pointer={:#x}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_pci_to_pci_bridge_device().unwrap().capability_pointer);
+                info!(
+                    "Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} cap_pointer={:#x}",
+                    common_header.class_code,
+                    common_header.subclass,
+                    common_header.status,
+                    box_pci_device
+                        .as_pci_to_pci_bridge_device()
+                        .unwrap()
+                        .capability_pointer
+                );
             }
             HeaderType::PciPciBridge => {
                 info!(

@@ -9,7 +9,7 @@ const QEMU_DTB_PADDR: usize = 0x100000;
 /// The earliest entry point for the primary CPU.
 ///
 /// We can't use bl to jump to higher address, so we use jirl to jump to higher address.
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 #[link_section = ".text.entry"]
 unsafe extern "C" fn _start() -> ! {
@@ -59,7 +59,7 @@ unsafe extern "C" fn _start() -> ! {
 /// The earliest entry point for the primary CPU.
 ///
 /// We can't use bl to jump to higher address, so we use jirl to jump to higher address.
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub(crate) unsafe extern "C" fn _start_secondary() -> ! {

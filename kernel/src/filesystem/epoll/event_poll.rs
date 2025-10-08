@@ -456,17 +456,17 @@ impl EventPoll {
                 push_back.push(epitem);
                 break;
             }
-            let ep_events = EPollEventType::from_bits_truncate(epitem.event.read().events);
-
+            let mut ep_events = EPollEventType::from_bits_truncate(epitem.event.read().events);
             // 再次poll获取事件(为了防止水平触发一直加入队列)
             let revents = epitem.ep_item_poll();
             if revents.is_empty() {
-                continue;
+                // TODO: one-shot event will be lost here
+                // continue;
             }
-
+            ep_events |= revents;
             // 构建触发事件结构体
             let event = EPollEvent {
-                events: revents.bits,
+                events: ep_events.bits,
                 data: epitem.event.read().data,
             };
 
@@ -635,7 +635,7 @@ impl EventPoll {
 
     /// ### epoll的回调，支持epoll的文件有事件到来时直接调用该方法即可
     pub fn wakeup_epoll(
-        epitems: &SpinLock<LinkedList<Arc<EPollItem>>>,
+        epitems: &LockedEPItemLinkedList,
         pollflags: EPollEventType,
     ) -> Result<(), SystemError> {
         let epitems_guard = epitems.try_lock_irqsave()?;
@@ -652,10 +652,10 @@ impl EventPoll {
             let event_guard = binding.event().read();
             let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
             // 检查事件合理性以及是否有感兴趣的事件
-            if !(ep_events
+            if !ep_events
                 .difference(EPollEventType::EP_PRIVATE_BITS)
                 .is_empty()
-                || pollflags.difference(ep_events).is_empty())
+                || pollflags.contains(ep_events)
             {
                 // TODO: 未处理pm相关
 
@@ -675,6 +675,14 @@ impl EventPoll {
             }
         }
         Ok(())
+    }
+}
+
+pub type LockedEPItemLinkedList = SpinLock<LinkedList<Arc<EPollItem>>>;
+
+impl Default for LockedEPItemLinkedList {
+    fn default() -> Self {
+        SpinLock::new(LinkedList::new())
     }
 }
 

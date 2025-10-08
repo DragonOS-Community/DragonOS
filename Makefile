@@ -167,7 +167,6 @@ log-monitor:
 update-submodules:
 	@echo "更新子模块"
 	@git submodule update --recursive --init
-	@git submodule foreach git pull origin master
 
 .PHONY: update-submodules-by-mirror
 update-submodules-by-mirror:

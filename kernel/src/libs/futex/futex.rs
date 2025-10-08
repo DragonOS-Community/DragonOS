@@ -2,7 +2,10 @@ use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
 };
-use core::hash::{Hash, Hasher};
+use core::{
+    hash::{Hash, Hasher},
+    ops::{Deref, DerefMut},
+};
 use core::{
     intrinsics::{likely, unlikely},
     mem,
@@ -18,7 +21,7 @@ use crate::{
     exception::InterruptArch,
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
-    process::{Pid, ProcessControlBlock, ProcessManager},
+    process::{ProcessControlBlock, ProcessManager, RawPid},
     sched::{schedule, SchedMode},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
@@ -363,8 +366,11 @@ impl Futex {
             flags.contains(FutexFlag::FLAGS_SHARED),
             FutexAccess::FutexRead,
         )?;
+
         let mut binding = FutexData::futex_map();
-        let bucket_mut = binding.get_mut(&key).ok_or(SystemError::EINVAL)?;
+        let bucket_mut = binding.entry(key.clone()).or_insert(FutexHashBucket {
+            chain: LinkedList::new(),
+        });
 
         // 确保后面的唤醒操作是有意义的
         if bucket_mut.chain.is_empty() {
@@ -561,7 +567,7 @@ impl Futex {
         if (encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0) && oparg > 31 {
             warn!(
                 "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
-                ProcessManager::current_pcb().pid().data(),
+                ProcessManager::current_pcb().raw_pid().data(),
                 oparg
             );
 
@@ -646,15 +652,37 @@ impl Futex {
 const ROBUST_LIST_LIMIT: isize = 2048;
 
 #[derive(Debug, Copy, Clone)]
-pub struct RobustList {
+#[repr(C)]
+struct PosixRobustList {
     next: VirtAddr,
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct RobustListHead {
-    list: RobustList,
+#[repr(C)]
+pub struct PosixRobustListHead {
+    list: PosixRobustList,
     futex_offset: isize,
     list_op_pending: VirtAddr,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct RobustListHead {
+    pub posix: PosixRobustListHead,
+    pub uaddr: VirtAddr,
+}
+
+impl Deref for RobustListHead {
+    type Target = PosixRobustListHead;
+
+    fn deref(&self) -> &Self::Target {
+        &self.posix
+    }
+}
+
+impl DerefMut for RobustListHead {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.posix
+    }
 }
 
 impl RobustListHead {
@@ -677,18 +705,21 @@ impl RobustListHead {
     /// - head_uaddr：robust list head用户空间地址
     /// - len：robust list head的长度    
     pub fn set_robust_list(head_uaddr: VirtAddr, len: usize) -> Result<usize, SystemError> {
-        let robust_list_head_len = mem::size_of::<RobustListHead>();
+        let robust_list_head_len = mem::size_of::<PosixRobustListHead>();
         if unlikely(len != robust_list_head_len) {
             return Err(SystemError::EINVAL);
         }
 
         let user_buffer_reader = UserBufferReader::new(
-            head_uaddr.as_ptr::<RobustListHead>(),
-            mem::size_of::<RobustListHead>(),
+            head_uaddr.as_ptr::<PosixRobustListHead>(),
+            mem::size_of::<PosixRobustListHead>(),
             true,
         )?;
-        let robust_list_head = *user_buffer_reader.read_one_from_user::<RobustListHead>(0)?;
-
+        let robust_list_head = *user_buffer_reader.read_one_from_user::<PosixRobustListHead>(0)?;
+        let robust_list_head = RobustListHead {
+            posix: robust_list_head,
+            uaddr: head_uaddr,
+        };
         // 向内核注册robust list
         ProcessManager::current_pcb().set_robust_list(Some(robust_list_head));
 
@@ -708,7 +739,7 @@ impl RobustListHead {
         let pcb: Arc<ProcessControlBlock> = if pid == 0 {
             ProcessManager::current_pcb()
         } else {
-            ProcessManager::find(Pid::new(pid)).ok_or(SystemError::ESRCH)?
+            ProcessManager::find_task_by_vpid(RawPid::new(pid)).ok_or(SystemError::ESRCH)?
         };
 
         // TODO: 检查当前进程是否能ptrace另一个进程
@@ -726,11 +757,11 @@ impl RobustListHead {
             core::mem::size_of::<usize>(),
             true,
         )?;
-        user_writer.copy_one_to_user(&mem::size_of::<RobustListHead>(), 0)?;
+        user_writer.copy_one_to_user(&mem::size_of::<PosixRobustListHead>(), 0)?;
         // 将head拷贝到用户空间head
         let mut user_writer = UserBufferWriter::new(
-            head_uaddr.as_ptr::<RobustListHead>(),
-            mem::size_of::<RobustListHead>(),
+            head_uaddr.as_ptr::<PosixRobustListHead>(),
+            mem::size_of::<PosixRobustListHead>(),
             true,
         )?;
         user_writer.copy_one_to_user(&robust_list_head, 0)?;
@@ -750,9 +781,10 @@ impl RobustListHead {
                 return;
             }
         };
+
         // 遍历当前进程/线程的robust list
         for futex_uaddr in head.futexes() {
-            let ret = Self::handle_futex_death(futex_uaddr, pcb.pid().into() as u32);
+            let ret = Self::handle_futex_death(futex_uaddr, pcb.raw_pid().into() as u32);
             if ret.is_err() {
                 return;
             }
@@ -765,21 +797,50 @@ impl RobustListHead {
         return FutexIterator::new(self);
     }
 
+    /// # 安全地从用户空间读取任意类型的值，如果地址无效则返回None
+    pub fn safe_read<T>(addr: VirtAddr) -> Option<UserBufferReader<'static>> {
+        // 检查地址是否有效
+        if addr.is_null() {
+            return None;
+        }
+
+        let size = core::mem::size_of::<T>();
+        return UserBufferReader::new_checked(addr.as_ptr::<T>(), size, true).ok();
+    }
+
+    /// # 安全地从用户空间读取u32值，如果地址无效则返回None
+    fn safe_read_u32(addr: VirtAddr) -> Option<u32> {
+        Self::safe_read::<u32>(addr)
+            .and_then(|reader| reader.read_one_from_user::<u32>(0).ok().cloned())
+    }
+
+    /// # 安全地向用户空间写入u32值，如果地址无效则返回false
+    fn safe_write_u32(addr: VirtAddr, val: u32) -> bool {
+        // 尝试写入
+        let mut writer = match UserBufferWriter::new_checked(
+            addr.as_ptr::<u32>(),
+            core::mem::size_of::<u32>(),
+            true,
+        ) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+
+        writer.copy_one_to_user(&val, 0).is_ok()
+    }
+
     /// # 处理进程即将死亡时，进程已经持有的futex，唤醒其他等待该futex的线程
     /// ## 参数
     /// - futex_uaddr：futex的用户空间地址
     /// - pid: 当前进程/线程的pid
     fn handle_futex_death(futex_uaddr: VirtAddr, pid: u32) -> Result<usize, SystemError> {
-        let futex_val = {
-            if futex_uaddr.is_null() {
-                return Err(SystemError::EINVAL);
+        // 安全地读取futex值
+        let futex_val = match Self::safe_read_u32(futex_uaddr) {
+            Some(val) => val,
+            None => {
+                // 地址无效，跳过此futex
+                return Ok(0);
             }
-            let user_buffer_reader = UserBufferReader::new(
-                futex_uaddr.as_ptr::<u32>(),
-                core::mem::size_of::<u32>(),
-                true,
-            )?;
-            *user_buffer_reader.read_one_from_user::<u32>(0)?
         };
 
         let mut uval = futex_val;
@@ -793,21 +854,18 @@ impl RobustListHead {
             // 判断是否有FUTEX_WAITERS和标记FUTEX_OWNER_DIED
             let mval = (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
 
-            // 读取用户空间目前的futex字段，判断在此之前futex是否有被修改
-            let user_buffer_reader = UserBufferReader::new(
-                futex_uaddr.as_ptr::<u32>(),
-                core::mem::size_of::<u32>(),
-                true,
-            )?;
-            let nval = *user_buffer_reader.read_one_from_user::<u32>(0)?;
+            // 安全地读取当前值
+            let nval = match Self::safe_read_u32(futex_uaddr) {
+                Some(val) => val,
+                None => break, // 读取失败，退出循环
+            };
+
             if nval != mval {
                 uval = nval;
-                let mut user_buffer_writer = UserBufferWriter::new(
-                    futex_uaddr.as_ptr::<u32>(),
-                    core::mem::size_of::<u32>(),
-                    true,
-                )?;
-                user_buffer_writer.copy_one_to_user(&mval, 0)?;
+                // 安全地写入新值
+                if !Self::safe_write_u32(futex_uaddr, mval) {
+                    continue; // 写入失败，继续下一次循环
+                }
                 continue;
             }
 
@@ -815,7 +873,8 @@ impl RobustListHead {
             if nval & FUTEX_WAITERS != 0 {
                 let mut flags = FutexFlag::FLAGS_MATCH_NONE;
                 flags.insert(FutexFlag::FLAGS_SHARED);
-                Futex::futex_wake(futex_uaddr, flags, 1, FUTEX_BITSET_MATCH_ANY)?;
+                // 唤醒操作可能会失败，但不影响流程
+                let _ = Futex::futex_wake(futex_uaddr, flags, 1, FUTEX_BITSET_MATCH_ANY);
             }
             break;
         }
@@ -852,7 +911,7 @@ impl Iterator for FutexIterator<'_> {
             return None;
         }
 
-        while self.entry.data() != &self.robust_list_head.list as *const RobustList as usize {
+        while self.entry.data() != self.robust_list_head.uaddr.data() {
             if self.count == ROBUST_LIST_LIMIT {
                 break;
             }
@@ -867,15 +926,14 @@ impl Iterator for FutexIterator<'_> {
                 None
             };
 
-            let user_buffer_reader = UserBufferReader::new(
-                self.entry.as_ptr::<RobustList>(),
-                mem::size_of::<RobustList>(),
-                true,
-            )
-            .ok()?;
-            let next_entry = user_buffer_reader
-                .read_one_from_user::<RobustList>(0)
-                .ok()?;
+            // 安全地读取下一个entry
+            let next_entry =
+                RobustListHead::safe_read::<PosixRobustList>(self.entry).and_then(|reader| {
+                    reader
+                        .read_one_from_user::<PosixRobustList>(0)
+                        .ok()
+                        .cloned()
+                })?;
 
             self.entry = next_entry.next;
 

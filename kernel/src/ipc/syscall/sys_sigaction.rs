@@ -83,7 +83,7 @@ pub(super) fn do_kernel_sigaction(
         } else if new_ka.action().is_customized() {
             error!(
                 "pid:{:?}: in sys_sigaction: User must manually sprcify a sa_restorer for signal {}.",
-                ProcessManager::current_pcb().pid(),
+                ProcessManager::current_pcb().raw_pid(),
                 sig
             );
             return Err(SystemError::EINVAL);
@@ -97,7 +97,7 @@ pub(super) fn do_kernel_sigaction(
         return Err(SystemError::EINVAL);
     }
 
-    let retval = super::super::signal::do_sigaction(
+    let retval = super::super::sighand::do_sigaction(
         sig,
         if act.is_null() {
             None

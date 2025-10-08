@@ -131,7 +131,7 @@ impl Timer {
         return result;
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerTimer> {
+    pub fn inner(&self) -> SpinLockGuard<'_, InnerTimer> {
         return self.inner.lock_irqsave();
     }
 
@@ -197,7 +197,7 @@ impl Timer {
         let this_arc = self.inner().self_ref.upgrade().unwrap();
         TIMER_LIST
             .lock_irqsave()
-            .extract_if(|x| Arc::ptr_eq(&this_arc, &x.1))
+            .extract_if(.., |x| Arc::ptr_eq(&this_arc, &x.1))
             .for_each(drop);
         true
     }
@@ -284,6 +284,7 @@ pub fn timer_init() {
 }
 
 /// 计算接下来n毫秒对应的定时器时间片
+#[allow(dead_code)]
 pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_ms * 1000000 / NSEC_PER_JIFFY as u64;
 }

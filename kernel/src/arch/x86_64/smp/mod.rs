@@ -62,7 +62,7 @@ unsafe extern "C" fn smp_ap_start() -> ! {
     smp_init_switch_stack(&v);
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
     core::arch::naked_asm!(concat!("
         mov rsp, [rdi + {off_rsp}]
@@ -138,7 +138,7 @@ impl SmpBootData {
     }
 }
 
-pub(super) static SMP_BOOT_DATA: SmpBootData = SmpBootData {
+pub static SMP_BOOT_DATA: SmpBootData = SmpBootData {
     initialized: AtomicBool::new(false),
     cpu_count: 0,
     phys_id: [0; PerCpu::MAX_CPU_NUM as usize],

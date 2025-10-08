@@ -15,7 +15,7 @@ use smoltcp::{iface, phy, wire};
 use unified_init::macros::unified_init;
 use virtio_drivers::device::net::VirtIONet;
 
-use super::{NetDeivceState, NetDevice, NetDeviceCommonData, Operstate};
+use super::{Iface, NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::{
     arch::rand::rand,
     driver::{
@@ -40,13 +40,13 @@ use crate::{
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::kernfs::KernFSInode,
+    filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     init::initcall::INITCALL_POSTCORE,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    net::{generate_iface_id, net_core::poll_ifaces_try_lock_onetime, NET_DEVICES},
+    net::{generate_iface_id, NET_DEVICES},
     time::Instant,
 };
 use system_error::SystemError;
@@ -132,7 +132,7 @@ impl VirtIONetDevice {
         return Some(dev);
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIONetDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIONetDevice> {
         return self.inner.lock();
     }
 }
@@ -182,11 +182,11 @@ impl KObject for VirtIONetDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -261,13 +261,16 @@ impl Device for VirtIONetDevice {
     fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
         self.inner().device_common.parent = parent;
     }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        None
+    }
 }
 
 impl VirtIODevice for VirtIONetDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        if poll_ifaces_try_lock_onetime().is_err() {
-            log::error!("virtio_net: try lock failed");
-        }
+        // log::debug!("try to wakeup");
+        super::kthread::wakeup_poll_thread();
         return Ok(IrqReturn::Handled);
     }
 
@@ -376,13 +379,13 @@ impl Debug for VirtIONicDeviceInner {
     }
 }
 
-#[cast_to([sync] NetDevice)]
+#[cast_to([sync] Iface)]
 #[cast_to([sync] Device)]
+#[derive(Debug)]
 pub struct VirtioInterface {
     device_inner: VirtIONicDeviceInnerWrapper,
-    iface_id: usize,
     iface_name: String,
-    iface: SpinLock<iface::Interface>,
+    iface_common: super::IfaceCommon,
     inner: SpinLock<InnerVirtIOInterface>,
     locked_kobj_state: LockedKObjectState,
 }
@@ -392,17 +395,6 @@ struct InnerVirtIOInterface {
     kobj_common: KObjectCommonData,
     device_common: DeviceCommonData,
     netdevice_common: NetDeviceCommonData,
-}
-
-impl core::fmt::Debug for VirtioInterface {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("VirtioInterface")
-            .field("iface_id", &self.iface_id)
-            .field("iface_name", &self.iface_name)
-            .field("inner", &self.inner)
-            .field("locked_kobj_state", &self.locked_kobj_state)
-            .finish()
-    }
 }
 
 impl VirtioInterface {
@@ -417,10 +409,9 @@ impl VirtioInterface {
 
         let result = Arc::new(VirtioInterface {
             device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
-            iface_id,
             locked_kobj_state: LockedKObjectState::default(),
-            iface: SpinLock::new(iface),
             iface_name: format!("eth{}", iface_id),
+            iface_common: super::IfaceCommon::new(iface_id, true, iface),
             inner: SpinLock::new(InnerVirtIOInterface {
                 kobj_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -431,7 +422,7 @@ impl VirtioInterface {
         return result;
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOInterface> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOInterface> {
         return self.inner.lock();
     }
 
@@ -445,7 +436,7 @@ impl VirtioInterface {
 impl Drop for VirtioInterface {
     fn drop(&mut self) {
         // 从全局的网卡接口信息表中删除这个网卡的接口信息
-        NET_DEVICES.write_irqsave().remove(&self.iface_id);
+        NET_DEVICES.write_irqsave().remove(&self.nic_id());
     }
 }
 
@@ -612,11 +603,11 @@ impl phy::TxToken for VirtioNetToken {
 impl phy::RxToken for VirtioNetToken {
     fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
         // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
-        let mut rx_buf = self.rx_buffer.unwrap();
-        let result = f(rx_buf.packet_mut());
+        let rx_buf = self.rx_buffer.unwrap();
+        let result = f(rx_buf.packet());
         self.driver
             .inner
             .lock()
@@ -644,15 +635,14 @@ pub fn virtio_net(
     }
 }
 
-impl NetDevice for VirtioInterface {
+impl Iface for VirtioInterface {
+    fn common(&self) -> &super::IfaceCommon {
+        &self.iface_common
+    }
+
     fn mac(&self) -> wire::EthernetAddress {
         let mac: [u8; 6] = self.device_inner.inner.lock().mac_address();
         return wire::EthernetAddress::from_bytes(&mac);
-    }
-
-    #[inline]
-    fn nic_id(&self) -> usize {
-        return self.iface_id;
     }
 
     #[inline]
@@ -660,41 +650,11 @@ impl NetDevice for VirtioInterface {
         return self.iface_name.clone();
     }
 
-    fn update_ip_addrs(&self, ip_addrs: &[wire::IpCidr]) -> Result<(), SystemError> {
-        if ip_addrs.len() != 1 {
-            return Err(SystemError::EINVAL);
-        }
-
-        self.iface.lock().update_ip_addrs(|addrs| {
-            let dest = addrs.iter_mut().next();
-
-            if let Some(dest) = dest {
-                *dest = ip_addrs[0];
-            } else {
-                addrs
-                    .push(ip_addrs[0])
-                    .expect("Push wire::IpCidr failed: full");
-            }
-        });
-        return Ok(());
+    fn poll(&self) {
+        // log::debug!("VirtioInterface: poll");
+        self.iface_common.poll(self.device_inner.force_get_mut())
     }
 
-    fn poll(&self, sockets: &mut iface::SocketSet) -> Result<(), SystemError> {
-        let timestamp: smoltcp::time::Instant = Instant::now().into();
-        let mut guard = self.iface.lock();
-        let poll_res = guard.poll(timestamp, self.device_inner.force_get_mut(), sockets);
-        // todo: notify!!!
-        // debug!("Virtio Interface poll:{poll_res}");
-        if poll_res {
-            return Ok(());
-        }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-
-    #[inline(always)]
-    fn inner_iface(&self) -> &SpinLock<iface::Interface> {
-        return &self.iface;
-    }
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
     //     return self;
     // }
@@ -766,11 +726,11 @@ impl KObject for VirtioInterface {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -786,9 +746,7 @@ impl KObject for VirtioInterface {
 #[unified_init(INITCALL_POSTCORE)]
 fn virtio_net_driver_init() -> Result<(), SystemError> {
     let driver = VirtIONetDriver::new();
-    virtio_driver_manager()
-        .register(driver.clone() as Arc<dyn VirtIODriver>)
-        .expect("Add virtio net driver failed");
+    virtio_driver_manager().register(driver.clone() as Arc<dyn VirtIODriver>)?;
     unsafe {
         VIRTIO_NET_DRIVER = Some(driver);
     }
@@ -825,7 +783,7 @@ impl VirtIONetDriver {
         return Arc::new(result);
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIODriver> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIODriver> {
         return self.inner.lock();
     }
 }
@@ -859,7 +817,7 @@ impl VirtIODriver for VirtIONetDriver {
         // 设置iface的父设备为virtio_net_device
         iface.set_dev_parent(Some(Arc::downgrade(&virtio_net_device) as Weak<dyn Device>));
         // 在sysfs中注册iface
-        register_netdevice(iface.clone() as Arc<dyn NetDevice>)?;
+        register_netdevice(iface.clone() as Arc<dyn Iface>)?;
 
         // 将网卡的接口信息注册到全局的网卡接口信息表中
         NET_DEVICES
@@ -975,11 +933,11 @@ impl KObject for VirtIONetDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

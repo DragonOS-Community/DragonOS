@@ -3,6 +3,7 @@ use core::intrinsics::unlikely;
 
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
+use crate::register_mountable_fs;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{vcore::generate_inode_id, FileType},
@@ -28,7 +29,7 @@ use super::vfs::{
 
 use linkme::distributed_slice;
 
-use super::vfs::{Magic, SuperBlock};
+use super::vfs::{Magic, MountableFileSystem, SuperBlock};
 
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
@@ -153,22 +154,25 @@ impl RamFS {
 
         return result;
     }
+}
 
-    pub fn make_ramfs(
+impl MountableFileSystem for RamFS {
+    fn make_mount_data(
+        _raw_data: Option<&str>,
+        _source: &str,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        // 目前ramfs不需要任何额外的mount数据
+        Ok(None)
+    }
+    fn make_fs(
         _data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
         let fs = RamFS::new();
         return Ok(fs);
     }
 }
-#[distributed_slice(FSMAKER)]
-static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
-    "ramfs",
-    &(RamFS::make_ramfs
-        as fn(
-            Option<&dyn FileSystemMakerData>,
-        ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
-);
+
+register_mountable_fs!(RamFS, RAMFSMAKER, "ramfs");
 
 impl IndexNode for LockedRamFSInode {
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
@@ -534,9 +538,18 @@ impl IndexNode for LockedRamFSInode {
                     .collect();
 
                 match key.len() {
-                    0=>{return Err(SystemError::ENOENT);}
-                    1=>{return Ok(key.remove(0));}
-                    _ => panic!("Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
+                    0 => {
+                        return Err(SystemError::ENOENT);
+                    }
+                    1 => {
+                        return Ok(key.remove(0));
+                    }
+                    _ => panic!(
+                        "Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
+                        key_len = key.len(),
+                        inode_id = inode.metadata.inode_id,
+                        to_find = ino
+                    ),
                 }
             }
         }

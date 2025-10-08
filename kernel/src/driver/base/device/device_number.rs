@@ -1,3 +1,8 @@
+use core::{
+    fmt::Display,
+    hash::{Hash, Hasher},
+};
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Major(u32);
 
@@ -24,6 +29,10 @@ impl Major {
     pub const UNIX98_PTY_SLAVE_MAJOR: Self =
         Self::new(Self::UNIX98_PTY_MASTER_MAJOR.0 + Self::UNIX98_PTY_MAJOR_COUNT.0);
 
+    /// Disk
+    pub const AHCI_BLK_MAJOR: Self = Self::new(8);
+    pub const VIRTIO_BLK_MAJOR: Self = Self::new(254);
+
     pub const HVC_MAJOR: Self = Self::new(229);
 
     pub const fn new(x: u32) -> Self {
@@ -31,6 +40,12 @@ impl Major {
     }
     pub const fn data(&self) -> u32 {
         self.0
+    }
+}
+
+impl Hash for Major {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state); // 使用 Major 内部的 u32 值来计算哈希值
     }
 }
 
@@ -82,5 +97,11 @@ impl Default for DeviceNumber {
 impl From<u32> for DeviceNumber {
     fn from(x: u32) -> Self {
         Self { data: x }
+    }
+}
+
+impl Display for DeviceNumber {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}:{}", self.major().data(), self.minor())
     }
 }

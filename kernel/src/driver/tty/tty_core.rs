@@ -4,7 +4,6 @@ use core::{
 };
 
 use alloc::{
-    collections::LinkedList,
     string::String,
     sync::{Arc, Weak},
 };
@@ -12,20 +11,21 @@ use system_error::SystemError;
 
 use crate::{
     driver::{base::device::device_number::DeviceNumber, tty::pty::ptm_driver},
-    filesystem::epoll::{EPollEventType, EPollItem},
+    filesystem::epoll::{event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
     mm::VirtAddr,
-    process::{process_group::Pgid, session::Sid, ProcessControlBlock},
+    process::{pid::Pid, ProcessControlBlock},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::{
     termios::{ControlMode, PosixTermios, Termios, TtySetTermiosOpt, WindowSize},
     tty_driver::{TtyCorePrivateField, TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
+    tty_job_control::TtyJobCtrlManager,
     tty_ldisc::{
         ntty::{NTtyData, NTtyLinediscipline},
         TtyLineDiscipline,
@@ -69,11 +69,11 @@ impl TtyCore {
             port: RwLock::new(None),
             index,
             vc_index: AtomicUsize::new(usize::MAX),
-            ctrl: SpinLock::new(TtyContorlInfo::default()),
+            ctrl: SpinLock::new(TtyControlInfo::default()),
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
             link: RwLock::default(),
-            epitems: SpinLock::new(LinkedList::new()),
+            epitems: LockedEPItemLinkedList::default(),
             device_number,
             privete_fields: SpinLock::new(None),
         };
@@ -279,21 +279,35 @@ impl TtyCore {
 }
 
 #[derive(Debug, Default)]
-pub struct TtyContorlInfo {
+pub struct TtyControlInfo {
     /// 当前会话的SId
-    pub session: Option<Sid>,
+    pub session: Option<Arc<Pid>>,
     /// 前台进程组id
-    pub pgid: Option<Pgid>,
+    pub pgid: Option<Arc<Pid>>,
 
     /// packet模式下使用，目前未用到
     pub pktstatus: TtyPacketStatus,
     pub packet: bool,
 }
 
-impl TtyContorlInfo {
+impl TtyControlInfo {
     pub fn set_info_by_pcb(&mut self, pcb: Arc<ProcessControlBlock>) {
-        self.session = Some(pcb.sid());
-        self.pgid = Some(pcb.pgid());
+        self.session = pcb.task_session();
+        self.pgid = pcb.task_pgrp();
+    }
+
+    /// 清除当前session的pid
+    ///
+    /// 如果当前session已经死了，则将其清除。
+    pub fn clear_dead_session(&mut self) {
+        if self.session.is_none() {
+            return;
+        }
+
+        let clean = self.session.as_ref().map(|s| s.dead()).unwrap();
+        if clean {
+            self.session = None;
+        }
     }
 }
 
@@ -324,7 +338,7 @@ pub struct TtyCoreData {
     /// 端口
     port: RwLock<Option<Arc<dyn TtyPort>>>,
     /// 前台进程
-    ctrl: SpinLock<TtyContorlInfo>,
+    ctrl: SpinLock<TtyControlInfo>,
     /// 是否正在关闭
     closing: AtomicBool,
     /// 流控状态
@@ -332,7 +346,7 @@ pub struct TtyCoreData {
     /// 链接tty
     link: RwLock<Weak<TtyCore>>,
     /// epitems
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
+    epitems: LockedEPItemLinkedList,
     /// 设备号
     device_number: DeviceNumber,
 
@@ -346,7 +360,7 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn flow_irqsave(&self) -> SpinLockGuard<TtyFlowState> {
+    pub fn flow_irqsave(&self) -> SpinLockGuard<'_, TtyFlowState> {
         self.flow.lock_irqsave()
     }
 
@@ -385,7 +399,7 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn termios_write(&self) -> RwLockWriteGuard<Termios> {
+    pub fn termios_write(&self) -> RwLockWriteGuard<'_, Termios> {
         self.termios.write_irqsave()
     }
 
@@ -400,10 +414,21 @@ impl TtyCoreData {
         self.count.load(Ordering::SeqCst)
     }
 
+    pub fn count_valid(&self) -> bool {
+        let cnt = self.count();
+        // 暂时认为有效的count范围是(0, usize::MAX / 2)
+        cnt > 0 && cnt < usize::MAX / 2
+    }
+
     #[inline]
     pub fn add_count(&self) {
         self.count
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn dec_count(&self) -> usize {
+        self.count
+            .fetch_sub(1, core::sync::atomic::Ordering::SeqCst)
     }
 
     #[inline]
@@ -417,22 +442,22 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn contorl_info_irqsave(&self) -> SpinLockGuard<TtyContorlInfo> {
+    pub fn contorl_info_irqsave(&self) -> SpinLockGuard<'_, TtyControlInfo> {
         self.ctrl.lock_irqsave()
     }
 
     #[inline]
-    pub fn window_size_upgradeable(&self) -> RwLockUpgradableGuard<WindowSize> {
+    pub fn window_size_upgradeable(&self) -> RwLockUpgradableGuard<'_, WindowSize> {
         self.window_size.upgradeable_read()
     }
 
     #[inline]
-    pub fn window_size(&self) -> RwLockReadGuard<WindowSize> {
+    pub fn window_size(&self) -> RwLockReadGuard<'_, WindowSize> {
         self.window_size.read()
     }
 
     #[inline]
-    pub fn window_size_write(&self) -> RwLockWriteGuard<WindowSize> {
+    pub fn window_size_write(&self) -> RwLockWriteGuard<'_, WindowSize> {
         self.window_size.write()
     }
 
@@ -507,7 +532,7 @@ impl TtyCoreData {
         Err(SystemError::ENOENT)
     }
 
-    pub fn eptiems(&self) -> &SpinLock<LinkedList<Arc<EPollItem>>> {
+    pub fn epitems(&self) -> &LockedEPItemLinkedList {
         &self.epitems
     }
 
@@ -624,7 +649,23 @@ impl TtyOperation for TtyCore {
     }
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        self.core().tty_driver.driver_funcs().close(tty)
+        self.core().dec_count();
+        let cnt = self.core().count();
+        // TODO: fix pty slave close issue
+        let is_pty_slave_last =
+            cnt == 1 && tty.core().driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave;
+        if !self.core().count_valid() || is_pty_slave_last {
+            // log::debug!(
+            //     "TtyCore close: ref count: {}, tty: {}",
+            //     cnt,
+            //     tty.core().name()
+            // );
+            let r = self.core().tty_driver.driver_funcs().close(tty.clone());
+            // 如果计数为0或者无效，表示tty已经关闭
+            TtyJobCtrlManager::remove_session_tty(&tty);
+            return r;
+        }
+        Ok(())
     }
 
     fn resize(&self, tty: Arc<TtyCore>, winsize: WindowSize) -> Result<(), SystemError> {

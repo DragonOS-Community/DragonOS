@@ -160,7 +160,7 @@ impl AcpiManager {
             acpi_table_attr_list().write().push(attr);
             self.acpi_table_data_init(&header)?;
         }
-
+        // TODO:UEVENT
         return Ok(());
     }
 

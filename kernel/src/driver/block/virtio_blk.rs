@@ -8,7 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use bitmap::traits::BitMapOps;
+use bitmap::{static_bitmap, traits::BitMapOps};
 use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -25,6 +25,7 @@ use crate::{
             class::Class,
             device::{
                 bus::Bus,
+                device_number::Major,
                 driver::{Driver, DriverCommonData},
                 DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
@@ -40,10 +41,15 @@ use crate::{
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable},
+    filesystem::{
+        devfs::{DevFS, DeviceINode, LockedDevFSInode},
+        kernfs::KernFSInode,
+        mbr::MbrDiskPartionTable,
+        vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
+    },
     init::initcall::INITCALL_POSTCORE,
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -104,7 +110,7 @@ pub struct VirtIOBlkManager {
 }
 
 struct InnerVirtIOBlkManager {
-    id_bmp: bitmap::StaticBitmap<{ VirtIOBlkManager::MAX_DEVICES }>,
+    id_bmp: static_bitmap!(VirtIOBlkManager::MAX_DEVICES),
     devname: [Option<DevName>; VirtIOBlkManager::MAX_DEVICES],
 }
 
@@ -120,7 +126,7 @@ impl VirtIOBlkManager {
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkManager> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkManager> {
         self.inner.lock()
     }
 
@@ -158,6 +164,9 @@ pub struct VirtIOBlkDevice {
     inner: SpinLock<InnerVirtIOBlkDevice>,
     locked_kobj_state: LockedKObjectState,
     self_ref: Weak<Self>,
+    parent: RwLock<Weak<LockedDevFSInode>>,
+    fs: RwLock<Weak<DevFS>>,
+    metadata: Metadata,
 }
 
 impl Debug for VirtIOBlkDevice {
@@ -191,7 +200,7 @@ impl VirtIOBlkDevice {
         let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
         device_inner.enable_interrupts();
         let dev = Arc::new_cyclic(|self_ref| Self {
-            blkdev_meta: BlockDevMeta::new(devname),
+            blkdev_meta: BlockDevMeta::new(devname, Major::VIRTIO_BLK_MAJOR),
             self_ref: self_ref.clone(),
             dev_id,
             locked_kobj_state: LockedKObjectState::default(),
@@ -203,13 +212,93 @@ impl VirtIOBlkDevice {
                 kobject_common: KObjectCommonData::default(),
                 irq,
             }),
+            parent: RwLock::new(Weak::default()),
+            fs: RwLock::new(Weak::default()),
+            metadata: Metadata::new(
+                crate::filesystem::vfs::FileType::BlockDevice,
+                ModeType::from_bits_truncate(0o755),
+            ),
         });
 
         Some(dev)
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkDevice> {
         self.inner.lock()
+    }
+}
+
+impl IndexNode for VirtIOBlkDevice {
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        self.fs
+            .read()
+            .upgrade()
+            .expect("VirtIOBlkDevice fs is not set")
+    }
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        Ok(self.metadata.clone())
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let parent = self.parent.read();
+        if let Some(parent) = parent.upgrade() {
+            return Ok(parent as Arc<dyn IndexNode>);
+        }
+        Err(SystemError::ENOENT)
+    }
+
+    fn close(
+        &self,
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        let dname = DName::from(self.blkdev_meta.devname.clone().as_ref());
+        Ok(dname)
+    }
+
+    fn open(
+        &self,
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _mode: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+}
+
+impl DeviceINode for VirtIOBlkDevice {
+    fn set_fs(&self, fs: alloc::sync::Weak<crate::filesystem::devfs::DevFS>) {
+        *self.fs.write() = fs;
+    }
+
+    fn set_parent(&self, parent: Weak<crate::filesystem::devfs::LockedDevFSInode>) {
+        *self.parent.write() = parent;
     }
 }
 
@@ -342,6 +431,7 @@ impl VirtIODevice for VirtIOBlkDevice {
 
     fn set_virtio_device_index(&self, index: VirtIODeviceIndex) {
         self.inner().virtio_index = Some(index);
+        self.blkdev_meta.inner().dev_idx = index.into();
     }
 
     fn virtio_device_index(&self) -> Option<VirtIODeviceIndex> {
@@ -467,11 +557,11 @@ impl KObject for VirtIOBlkDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -526,7 +616,7 @@ impl VirtIOBlkDriver {
         return Arc::new(result);
     }
 
-    fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkDriver> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkDriver> {
         return self.inner.lock();
     }
 }
@@ -658,11 +748,11 @@ impl KObject for VirtIOBlkDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

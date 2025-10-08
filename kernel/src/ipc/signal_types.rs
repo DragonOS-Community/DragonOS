@@ -1,9 +1,4 @@
-use core::{
-    ffi::c_void,
-    mem::size_of,
-    ops::{Deref, DerefMut},
-    sync::atomic::AtomicI64,
-};
+use core::{ffi::c_void, mem::size_of};
 
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -12,12 +7,53 @@ use crate::{
     arch::{
         asm::bitops::ffz,
         interrupt::TrapFrame,
-        ipc::signal::{SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
+        ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
-    process::Pid,
+    process::RawPid,
     syscall::user_access::UserBufferWriter,
 };
+
+/// siginfo中的si_code的可选值
+/// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
+#[derive(Copy, Debug, Clone)]
+#[repr(i32)]
+pub enum SigCode {
+    /// sent by kill, sigsend, raise
+    User = 0,
+    /// sent by kernel from somewhere
+    Kernel = 0x80,
+    /// 通过sigqueue发送
+    Queue = -1,
+    /// 定时器过期时发送
+    Timer = -2,
+    /// 当实时消息队列的状态发生改变时发送
+    Mesgq = -3,
+    /// 当异步IO完成时发送
+    AsyncIO = -4,
+    /// sent by queued SIGIO
+    SigIO = -5,
+    /// sent by tgkill/tkill
+    Tkill = -6,
+}
+
+impl SigCode {
+    /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
+    #[allow(dead_code)]
+    pub fn from_i32(x: i32) -> SigCode {
+        match x {
+            0 => Self::User,
+            0x80 => Self::Kernel,
+            -1 => Self::Queue,
+            -2 => Self::Timer,
+            -3 => Self::Mesgq,
+            -4 => Self::AsyncIO,
+            -5 => Self::SigIO,
+            -6 => Self::Tkill,
+            _ => panic!("signal code not valid"),
+        }
+    }
+}
 
 /// 用户态程序传入的SIG_DFL的值
 pub const USER_SIG_DFL: u64 = 0;
@@ -57,68 +93,7 @@ pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
     .union(Signal::into_sigset(Signal::SIGIO_OR_POLL))
     .union(Signal::into_sigset(Signal::SIGSYS));
 
-/// SignalStruct 在 pcb 中加锁
-#[derive(Debug)]
-pub struct SignalStruct {
-    inner: InnerSignalStruct,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct InnerSignalStruct {
-    pub cnt: AtomicI64,
-    /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
-    /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
-    pub handlers: Vec<Sigaction>,
-}
-
-impl SignalStruct {
-    #[inline(never)]
-    pub fn new() -> Self {
-        let mut r = Self {
-            inner: InnerSignalStruct::default(),
-        };
-        let mut sig_ign = Sigaction::default();
-        // 收到忽略的信号，重启系统调用
-        // todo: 看看linux哪些
-        sig_ign.flags_mut().insert(SigFlags::SA_RESTART);
-
-        r.inner.handlers[Signal::SIGCHLD as usize - 1] = sig_ign;
-        r.inner.handlers[Signal::SIGURG as usize - 1] = sig_ign;
-        r.inner.handlers[Signal::SIGWINCH as usize - 1] = sig_ign;
-
-        r
-    }
-}
-
-impl Default for SignalStruct {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Deref for SignalStruct {
-    type Target = InnerSignalStruct;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for SignalStruct {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl Default for InnerSignalStruct {
-    fn default() -> Self {
-        Self {
-            cnt: Default::default(),
-            handlers: vec![Sigaction::default(); MAX_SIG_NUM],
-        }
-    }
-}
+// Removed SignalStruct; refcount moved into Sighand
 
 #[derive(Debug, Copy, Clone)]
 #[allow(dead_code)]
@@ -348,8 +323,8 @@ impl SigInfo {
 
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
-    Kill(Pid),
-    Alarm(Pid),
+    Kill(RawPid),
+    Alarm(RawPid),
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
@@ -437,8 +412,8 @@ impl SigPending {
             return info;
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(Pid::from(0)));
-            ret.set_sig_type(SigType::Kill(Pid::new(0)));
+            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(RawPid::from(0)));
+            ret.set_sig_type(SigType::Kill(RawPid::new(0)));
             return ret;
         }
     }
@@ -526,7 +501,7 @@ impl SigQueue {
             return false;
         };
         // 从sigqueue中过滤出结果
-        let mut filter_result: Vec<SigInfo> = self.q.extract_if(filter).collect();
+        let mut filter_result: Vec<SigInfo> = self.q.extract_if(.., filter).collect();
         // 筛选出的结果不能大于1个
         assert!(filter_result.len() <= 1);
 
@@ -555,4 +530,24 @@ pub trait SignalArch {
     unsafe fn do_signal_or_restart(frame: &mut TrapFrame);
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64;
+}
+
+bitflags! {
+
+    /// https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/sched/signal.h#253
+    pub struct SignalFlags: u32 {
+        const STOP_STOPPED = 0x00000001; /* job control stop in effect */
+        const STOP_CONTINUED = 0x00000002; /* SIGCONT since WCONTINUED reap */
+        const GROUP_EXIT = 0x00000004; /* group exit in progress */
+        const CLD_STOPPED = 0x00000010; /* Pending notifications to parent */
+        const CLD_CONTINUED = 0x00000020;
+        const UNKILLABLE = 0x00000040; /* for init: ignore fatal signals */
+    }
+}
+
+impl SignalFlags {
+    pub const CLD_MASK: SignalFlags = SignalFlags::CLD_STOPPED.union(SignalFlags::CLD_CONTINUED);
+    pub const STOP_MASK: SignalFlags = SignalFlags::CLD_MASK
+        .union(SignalFlags::STOP_STOPPED)
+        .union(SignalFlags::STOP_CONTINUED);
 }

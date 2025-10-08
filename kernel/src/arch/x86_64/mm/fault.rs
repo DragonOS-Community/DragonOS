@@ -9,12 +9,12 @@ use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 use crate::{
     arch::{
         interrupt::{trap::X86PfErrorCode, TrapFrame},
-        ipc::signal::{SigCode, Signal},
+        ipc::signal::Signal,
         mm::{MemoryManagementArch, X86_64MMArch},
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
-    ipc::signal_types::{SigInfo, SigType},
+    ipc::signal_types::{SigCode, SigInfo, SigType},
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
@@ -179,7 +179,7 @@ impl X86_64MMArch {
             address.data(),
             regs.rip,
             error_code,
-            pcb.pid().data()
+            pcb.raw_pid().data()
         );
         //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/mm/fault.c#do_kern_addr_fault
     }
@@ -282,7 +282,8 @@ impl X86_64MMArch {
                     if !space_guard.can_extend_stack(region.start() - address) {
                         // exceeds stack limit
                         log::error!(
-                            "stack limit exceeded, error_code: {:?}, address: {:#x}",
+                            "pid {} stack limit exceeded, error_code: {:?}, address: {:#x}",
+                            ProcessManager::current_pid().data(),
                             error_code,
                             address.data(),
                         );
@@ -300,8 +301,10 @@ impl X86_64MMArch {
                         });
                 } else {
                     log::error!(
-                        "No mapped vma, error_code: {:?}, address: {:#x}, flags: {:?}",
+                        "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",
+                        ProcessManager::current_pid().data(),
                         error_code,
+                        regs.rip,
                         address.data(),
                         flags
                     );

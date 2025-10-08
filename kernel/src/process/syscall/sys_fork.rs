@@ -1,5 +1,5 @@
 use crate::arch::interrupt::TrapFrame;
-//use crate::arch::syscall::nr::SYS_FORK;
+use crate::arch::syscall::nr::SYS_FORK;
 use crate::process::fork::CloneFlags;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -14,7 +14,6 @@ impl Syscall for SysFork {
     }
 
     fn handle(&self, _args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        log::debug!("fork");
         ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into())
     }
 
@@ -23,4 +22,4 @@ impl Syscall for SysFork {
     }
 }
 
-//syscall_table_macros::declare_syscall!(SYS_FORK, SysFork);
+syscall_table_macros::declare_syscall!(SYS_FORK, SysFork);

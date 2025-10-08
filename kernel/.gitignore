@@ -7,3 +7,6 @@ src/include/bindings/bindings.rs
 # 将自动生成的Rust-C FFI加到gitignore
 src/include/bindings/bindings.h
 
+
+# Build counter
+.build_count

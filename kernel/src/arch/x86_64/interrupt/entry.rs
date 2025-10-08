@@ -42,7 +42,7 @@ macro_rules! interrupt_handler {
     ($name:expr) => {
         paste::paste! {
 
-            #[naked]
+            #[unsafe(naked)]
             #[no_mangle]
             unsafe extern "C" fn [<irq_handler $name>]() {
                 core::arch::naked_asm!(

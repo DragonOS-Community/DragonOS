@@ -580,7 +580,10 @@ impl FATFileSystem {
                 match entry {
                     _n if (0x0ffffff7..=0x0fffffff).contains(&current_cluster) => {
                         // 当前簇号不是一个能被获得的簇（可能是文件系统出错了）
-                        error!("FAT32 get fat entry: current cluster number [{}] is not an allocatable cluster number.", current_cluster);
+                        error!(
+                            "FAT32 get fat entry: current cluster number [{}] is not an allocatable cluster number.",
+                            current_cluster
+                        );
                         FATEntry::Bad
                     }
                     0 => FATEntry::Unused,
@@ -890,7 +893,7 @@ impl FATFileSystem {
     /// @brief 获取一个簇迭代器对象
     ///
     /// @param start_cluster 整个FAT链的起始簇号
-    fn cluster_iter(&self, start_cluster: Cluster) -> ClusterIter {
+    fn cluster_iter(&self, start_cluster: Cluster) -> ClusterIter<'_> {
         return ClusterIter {
             current_cluster: Some(start_cluster),
             fs: self,
@@ -1615,6 +1618,12 @@ impl IndexNode for LockedFATInode {
                 }
 
                 FileType::SymLink => return Err(SystemError::ENOSYS),
+
+                FileType::Socket => {
+                    d.create_file(name, fs)?;
+                    return Ok(guard.find(name)?);
+                }
+
                 _ => return Err(SystemError::EINVAL),
             },
             FATDirEntry::UnInit => {
@@ -1646,8 +1655,9 @@ impl IndexNode for LockedFATInode {
         Ok(())
     }
     fn resize(&self, len: usize) -> Result<(), SystemError> {
+        // 先调整页缓存大小，但不要提前返回；后续仍需同步到底层文件并更新元数据
         if let Some(page_cache) = self.page_cache() {
-            return page_cache.lock_irqsave().resize(len);
+            page_cache.lock_irqsave().resize(len)?;
         }
 
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
@@ -1681,7 +1691,9 @@ impl IndexNode for LockedFATInode {
                         file.truncate(fs, len as u64)?;
                     }
                 }
+                // 同步元数据：从文件对象获取最新大小，并确保一致
                 guard.synchronize_metadata();
+                guard.metadata.size = len as i64;
                 return Ok(());
             }
             FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
@@ -1882,9 +1894,18 @@ impl IndexNode for LockedFATInode {
                     .collect();
 
                 match key.len() {
-                    0=>{return Err(SystemError::ENOENT);}
-                    1=>{return Ok(key.remove(0));}
-                    _ => panic!("FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = guard.metadata.inode_id, to_find=ino)
+                    0 => {
+                        return Err(SystemError::ENOENT);
+                    }
+                    1 => {
+                        return Ok(key.remove(0));
+                    }
+                    _ => panic!(
+                        "FatFS get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
+                        key_len = key.len(),
+                        inode_id = guard.metadata.inode_id,
+                        to_find = ino
+                    ),
                 }
             }
         }

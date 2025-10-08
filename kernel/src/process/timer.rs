@@ -1,10 +1,10 @@
-use crate::arch::ipc::signal::{SigCode, Signal};
 use crate::exception::InterruptArch;
 use crate::ipc::signal_types::SigType;
 use crate::process::CurrentIrqArch;
-use crate::process::Pid;
+use crate::process::RawPid;
 use crate::process::SigInfo;
 use crate::time::timer::{clock, Jiffies, Timer, TimerFunction};
+use crate::{arch::ipc::signal::Signal, ipc::signal_types::SigCode};
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::compiler_fence;
 use core::time::Duration;
@@ -61,7 +61,7 @@ impl AlarmTimer {
     /// ### 函数返回值
     ///
     /// AlarmTimer结构体
-    pub fn alarm_timer_init(pid: Pid, second: u64) -> AlarmTimer {
+    pub fn alarm_timer_init(pid: RawPid, second: u64) -> AlarmTimer {
         //初始化Timerfunc
         let timerfunc = AlarmTimerFunc::new(pid);
         let alarmtimer = AlarmTimer::new(timerfunc, second);
@@ -106,11 +106,11 @@ impl AlarmTimer {
 /// pid：发送消息的目标进程的pid
 #[derive(Debug)]
 pub struct AlarmTimerFunc {
-    pid: Pid,
+    pid: RawPid,
 }
 
 impl AlarmTimerFunc {
-    pub fn new(pid: Pid) -> Box<AlarmTimerFunc> {
+    pub fn new(pid: RawPid) -> Box<AlarmTimerFunc> {
         return Box::new(AlarmTimerFunc { pid });
     }
 }

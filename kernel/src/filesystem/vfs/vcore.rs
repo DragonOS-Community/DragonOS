@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use log::{error, info};
 use system_error::SystemError;
 
+use crate::libs::casting::DowncastArc;
 use crate::{
     define_event_trace,
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
@@ -279,4 +280,48 @@ pub(super) fn do_file_lookup_at(
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dfd, path)?;
     let follow_final = lookup_flags.contains(LookUpFlags::FOLLOW);
     return inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final);
+}
+
+/// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
+/// - 目录返回 EISDIR
+/// - 非普通文件返回 EINVAL
+/// - 只读挂载返回 EROFS
+#[inline(never)]
+pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
+    // log::debug!("vfs_truncate: called with len={}", len);
+
+    let md = inode.metadata()?;
+    // log::debug!("vfs_truncate: metadata - file_type={:?}, current_size={}", md.file_type, md.size);
+
+    if md.file_type == FileType::Dir {
+        // log::debug!("vfs_truncate: rejecting directory truncate");
+        return Err(SystemError::EISDIR);
+    }
+    if md.file_type != FileType::File {
+        // log::debug!("vfs_truncate: rejecting non-file truncate, type={:?}", md.file_type);
+        return Err(SystemError::EINVAL);
+    }
+
+    // 只读挂载检查：若当前 fs 是 MountFS 且带 RDONLY 标志，拒绝写
+    let fs = inode.fs();
+    if let Some(mfs) = fs.clone().downcast_arc::<MountFS>() {
+        let mount_flags = mfs.mount_flags();
+        // log::debug!("vfs_truncate: mount_flags={:?}", mount_flags);
+        if mount_flags.contains(crate::filesystem::vfs::mount::MountFlags::RDONLY) {
+            // log::debug!("vfs_truncate: rejecting truncate on read-only mount");
+            return Err(SystemError::EROFS);
+        }
+    }
+
+    // log::debug!("vfs_truncate: calling inode.resize({})", len);
+    let result = inode.resize(len);
+    // log::debug!("vfs_truncate: inode.resize result={:?}", result);
+
+    // // 验证截断后的文件大小
+    // if result.is_ok() {
+    //     let new_md = inode.metadata()?;
+    //     log::debug!("vfs_truncate: after resize - new_size={}", new_md.size);
+    // }
+
+    result
 }

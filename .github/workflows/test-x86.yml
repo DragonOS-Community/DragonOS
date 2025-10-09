@@ -1,5 +1,4 @@
 name: Test x86_64
-description: Run tests on x86_64 architecture
 
 on:
   workflow_dispatch:

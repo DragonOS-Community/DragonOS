@@ -298,5 +298,8 @@
   },
   "en:kernel/syscall/sys_capget_capset.md": {
     "hash": "f3b86c00e9f28df5c0e6c15905e53907"
+  },
+  "en:kernel/device/tty.md": {
+    "hash": "acbc94b056e1c8f7f07275d80b70a930"
   }
 }

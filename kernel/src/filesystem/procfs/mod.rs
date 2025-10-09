@@ -412,7 +412,9 @@ impl ProcFSInode {
     // 打开 exe 文件
     fn open_exe(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 这个文件是一个软链接，直接返回0即可
-        return Ok(0);
+        let pcb = ProcessManager::current_pcb();
+        let exe = pcb.execute_path();
+        return Ok(exe.len() as _);
     }
 
     fn open_self(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
@@ -421,7 +423,7 @@ impl ProcFSInode {
     }
 
     // 读取exe文件
-    fn read_exe_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn read_exe_link(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
         // 判断是否有记录pid信息，有的话就是当前进程的exe文件，没有则是当前进程的exe文件
         let pcb = if let Some(pid) = self.fdata.pid {
             ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?
@@ -429,11 +431,13 @@ impl ProcFSInode {
             // 如果没有pid信息，则读取当前进程的exe文件
             ProcessManager::current_pcb()
         };
-
         let exe = pcb.execute_path();
         let exe_bytes = exe.as_bytes();
-        let len = exe_bytes.len().min(buf.len());
-        buf[..len].copy_from_slice(&exe_bytes[..len]);
+        if offset >= exe_bytes.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(exe_bytes.len() - offset);
+        buf[..len].copy_from_slice(&exe_bytes[offset..offset + len]);
         Ok(len)
     }
 
@@ -667,21 +671,17 @@ impl ProcFS {
             .create_proc_file(cpuinfo_params)
             .unwrap_or_else(|_| panic!("create cpuinfo error"));
 
-        let self_dir = result
-            .root_inode()
-            .create("self", FileType::Dir, ModeType::from_bits_truncate(0o555))
-            .unwrap();
-
-        let exe_params = ProcFileCreationParams::builder()
-            .parent(self_dir)
-            .name("exe")
+        let self_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("self")
             .file_type(FileType::SymLink)
-            .ftype(ProcFileType::ProcExe)
+            .mode(ModeType::from_bits_truncate(0o555))
+            .ftype(ProcFileType::ProcSelf)
             .build()
             .unwrap();
         result
-            .create_proc_file(exe_params)
-            .unwrap_or_else(|_| panic!("create exe error"));
+            .create_proc_file(self_params)
+            .unwrap_or_else(|_| panic!("create self error"));
 
         return result;
     }
@@ -888,7 +888,7 @@ impl IndexNode for LockedProcFSInode {
                 };
                 return inode.proc_read(offset, len, buf, &mut private_data);
             }
-            ProcFileType::ProcExe => return inode.read_exe_link(buf),
+            ProcFileType::ProcExe => return inode.read_exe_link(buf, offset),
             ProcFileType::ProcSelf => return inode.read_self_link(buf),
             ProcFileType::ProcFdFile => return inode.read_fd_link(buf),
 

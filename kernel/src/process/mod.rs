@@ -964,6 +964,12 @@ impl ProcessControlBlock {
         };
         arr[RLimitID::Rss as usize] = arr[RLimitID::As as usize];
 
+        // 设置文件大小限制的默认值 (Linux默认通常是unlimited)
+        arr[RLimitID::Fsize as usize] = RLimit64 {
+            rlim_cur: u64::MAX,
+            rlim_max: u64::MAX,
+        };
+
         arr
     }
 

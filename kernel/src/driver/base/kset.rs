@@ -73,23 +73,18 @@ impl KSet {
     pub fn new_and_add(
         name: String,
         parent_kobj: Option<Arc<dyn KObject>>,
-        join_kset: Option<Arc<KSet>>,
     ) -> Result<Arc<Self>, SystemError> {
         let kset = KSet::new(name);
         if let Some(parent_kobj) = parent_kobj {
             kset.set_parent(Some(Arc::downgrade(&parent_kobj)));
         }
-        kset.register(join_kset)?;
+        kset.register()?;
         return Ok(kset);
     }
 
     /// 注册一个kset
-    ///
-    /// ## 参数
-    ///
-    /// - join_kset: 如果不为None，那么这个kset会加入到join_kset中
-    pub fn register(&self, join_kset: Option<Arc<KSet>>) -> Result<(), SystemError> {
-        return KObjectManager::add_kobj(self.self_ref.upgrade().unwrap(), join_kset);
+    pub fn register(&self) -> Result<(), SystemError> {
+        return KObjectManager::add_kobj(self.self_ref.upgrade().unwrap());
         // todo: 引入uevent之后，发送uevent
         // kobject_uevent();
     }
@@ -103,13 +98,10 @@ impl KSet {
     /// 把一个kobject加入到当前kset中。
     ///
     /// 该函数不会修改kobj的parent，需要调用者自己视情况修改。
-    ///
-    /// ## Panic
-    ///
-    /// 这个kobject的kset必须是None，否则会panic
     pub fn join(&self, kobj: &Arc<dyn KObject>) {
-        assert!(kobj.kset().is_none());
-        kobj.set_kset(self.self_ref.upgrade());
+        if kobj.kset().is_none() {
+            return;
+        }
         self.kobjects.write().push(Arc::downgrade(kobj));
     }
 

@@ -10,6 +10,7 @@ uname_test
 
 # 文件系统相关测试
 dup_test
+write_test
 #stat_test
 #chmod_test
 #chown_test

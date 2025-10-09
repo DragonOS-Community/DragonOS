@@ -39,7 +39,7 @@ impl Bus for EventSourceBus {
     }
 
     fn shutdown(&self, _device: &Arc<dyn Device>) {
-        todo!()
+        // do nothing
     }
 
     fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {

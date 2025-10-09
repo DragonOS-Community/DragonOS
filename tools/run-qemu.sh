@@ -114,6 +114,13 @@ QEMU_NOGRAPHIC=false
 
 KERNEL_CMDLINE=" "
 
+# 自动测试选项，支持的选项：
+# - none: 不进行自动测试
+# - syscall: 进行gvisor系统调用测试
+AUTO_TEST=${AUTO_TEST:=none}
+# gvisor测试目录
+SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR:=/opt/tests/gvisor}
+
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
 VIRTIO_BLK_DEVICE=true
@@ -187,7 +194,7 @@ while true;do
 
 setup_kernel_init_program() {
     if [ ${ARCH} == "x86_64" ]; then
-        KERNEL_CMDLINE+=" init=/bin/busybox init "
+        KERNEL_CMDLINE+=" init=/bin/busybox init AUTO_TEST=${AUTO_TEST} SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR} "
         # KERNEL_CMDLINE+=" init=/bin/dragonreach "
     elif [ ${ARCH} == "riscv64" ]; then
         KERNEL_CMDLINE+=" init=/bin/riscv_rust_init "

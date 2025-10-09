@@ -84,6 +84,11 @@ pub struct LoopDevice {
     fs: RwLock<Weak<DevFS>>,               //文件系统弱引用
     parent: RwLock<Weak<LockedDevFSInode>>,
 }
+#[derive(Debug, Clone)]
+pub struct LoopPrivateData {
+    //索引号
+    pub parms: u32,
+}
 //Inner内数据会改变所以加锁
 pub struct LoopDeviceInner {
     // 设备名称 Major和Minor
@@ -184,7 +189,6 @@ impl LoopDevice {
             fs: RwLock::new(Weak::default()),
             parent: RwLock::new(Weak::default()),
         });
-
         Some(dev)
     }
 
@@ -564,13 +568,12 @@ impl LoopDeviceDriver {
                 loop_dev.block_dev_meta.devname
             );
             block_dev_manager().register(loop_dev.clone())?;
-        //devfs进行注册时[ ERROR ] (src/init/initcall.rs:22)      Failed to call initializer register_loop_devices: EPERM
-        //devfs_register(&format!("loop{}", minor), loop_dev.clone())?;
         } else {
             error!("Failed to create loop device for minor {}", minor);
         }
         Ok(())
     }
+
     // pub fn new_loop_ctrl_device(&self)-> Result<(), SystemError>{
     //     // 创建并注册 /dev/loop-control
     //     let control_dev = Arc::new(LoopControlDevice::new()); // 假设的构造函数
@@ -584,9 +587,15 @@ impl LoopDeviceDriver {
 use crate::init::initcall::INITCALL_DEVICE;
 #[unified_init(INITCALL_DEVICE)]
 pub fn loop_init() -> Result<(), SystemError> {
-    let loop_mgr = LoopManager::new();
+    let loop_mgr = Arc::new(LoopManager::new());
     // 获取 LoopDeviceDriver 的单例并调用初始化函数
     let driver = LoopDeviceDriver::new();
+    let loop_ctl = LoopControlDevice::new(loop_mgr.clone());
+    //注册loop_control设备
+    device_register(loop_ctl.clone())?;
+    log::info!("Loop control device registered.");
+    devfs_register("loop-control", loop_ctl.clone())?;
+    log::info!("Loop control device initialized.");
     loop_mgr.loop_init(driver)?;
     Ok(())
 }
@@ -680,6 +689,7 @@ pub struct LoopManager {
 }
 pub struct LoopManagerInner {
     devices: [Option<Arc<LoopDevice>>; LoopManager::MAX_DEVICES],
+    next_free_minor: u32,
 }
 impl LoopManager {
     const MAX_DEVICES: usize = 256; // 支持的最大 loop 设备数量
@@ -688,6 +698,7 @@ impl LoopManager {
         Self {
             inner: SpinLock::new(LoopManagerInner {
                 devices: [const { None }; Self::MAX_DEVICES],
+                next_free_minor: 0,
             }),
         }
     }
@@ -701,7 +712,76 @@ impl LoopManager {
             inner.devices[index] = Some(device);
         }
     }
+    /*
+    请求队列，工作队列未实现
+     */
+    pub fn loop_add(&self, requested_minor: Option<u32>) -> Result<Arc<LoopDevice>, SystemError> {
+        let mut inner_guard = self.inner();
+        let minor_to_use: u32 = match requested_minor {
+            Some(req_minor) => {
+                if req_minor >= Self::MAX_DEVICES as u32 {
+                    return Err(SystemError::EINVAL);
+                }
+                if inner_guard.devices[req_minor as usize].is_some() {
+                    return Err(SystemError::EEXIST);
+                }
+                req_minor
+            }
+            None => {
+                let mut found_minor_candidate = None;
+                let start_minor = inner_guard.next_free_minor;
+                let mut current_search_minor = start_minor;
 
+                for _ in 0..Self::MAX_DEVICES {
+                    if inner_guard.devices[current_search_minor as usize].is_none() {
+                        found_minor_candidate = Some(current_search_minor);
+                        // 更新 next_free_minor 以便下次从这里开始查找
+                        inner_guard.next_free_minor =
+                            (current_search_minor + 1) % (Self::MAX_DEVICES as u32);
+                        break;
+                    }
+                    current_search_minor = (current_search_minor + 1) % (Self::MAX_DEVICES as u32);
+                    if current_search_minor == start_minor {
+                        // 遍历了一圈，没有找到空闲的
+                        break;
+                    }
+                }
+
+                found_minor_candidate.ok_or(SystemError::ENOSPC)?
+            }
+        };
+        let devname = DevName::new(
+            format!("{}{}", LOOP_BASENAME, minor_to_use),
+            minor_to_use as usize,
+        );
+        let loop_dev = LoopDevice::new_empty_loop_device(devname.clone(), minor_to_use)
+            .ok_or(SystemError::ENOMEM)?;
+        log::info!("Registing loop device: {}", loop_dev.block_dev_meta.devname);
+        block_dev_manager().register(loop_dev.clone())?;
+        inner_guard.devices[minor_to_use as usize] = Some(loop_dev.clone());
+        log::info!("Loop device loop{} added successfully.", minor_to_use);
+        Ok(loop_dev)
+    }
+    pub fn find_device_by_minor(&self, minor: u32) -> Option<Arc<LoopDevice>> {
+        let inner = self.inner();
+        if minor < Self::MAX_DEVICES as u32 {
+            inner.devices[minor as usize].clone()
+        } else {
+            None
+        }
+    }
+    // pub fn loop_remove(&self ,minor:u32)-> Result<(),SystemError>{
+    //     let mut inner_guard=self.inner();
+    //     if minor >=Self::MAX_DEVICES as u32{
+    //         return Err(SystemError::EINVAL);
+    //     }
+    //     if let Some(loop_dev)=inner_guard.devices[minor as usize ].take(){
+    //         //loop_dev.clear_file()?;
+    //         //loop_dev.inner().set_stable(LoopState::Deleting)?;
+
+    //         block_dev_manager().unregister(loop_dev.dev_name())?;
+    //     }
+    // }
     // 动态分配空闲的loop设备，与指定文件inode关联
     pub fn alloc_device(
         &self,
@@ -724,12 +804,6 @@ impl LoopManager {
         todo!()
     }
     pub fn loop_init(&self, driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {
-        //注册loop_control设备
-        let loop_ctl = LoopControlDevice::new();
-        device_register(loop_ctl.clone())?;
-        log::info!("Loop control device registered.");
-        devfs_register("loop-control", loop_ctl.clone())?;
-        log::info!("Loop control device initialized.");
         // 注册 loop 设备
         for minor in 0..Self::MAX_INIT_DEVICES {
             driver.new_loop_device(minor)?;
@@ -738,7 +812,7 @@ impl LoopManager {
 
         //添加到loop_manager中
 
-        log::info!("LoopDeviceDriver and all devices initialized.");
+        log::info!("Loop devices initialized.");
         Ok(())
     }
 }
@@ -752,6 +826,7 @@ impl LoopManager {
 pub struct LoopControlDevice {
     inner: SpinLock<LoopControlDeviceInner>,
     locked_kobj_state: LockedKObjectState,
+    loop_mgr: Arc<LoopManager>,
 }
 struct LoopControlDeviceInner {
     // 设备的公共数据
@@ -764,7 +839,11 @@ struct LoopControlDeviceInner {
     devfs_metadata: Metadata,
 }
 impl LoopControlDevice {
-    pub fn new() -> Arc<Self> {
+    pub fn loop_add(&self, index: u32) -> Result<Arc<LoopDevice>, SystemError> {
+        //let loop_dri= LoopDeviceDriver::new();
+        self.loop_mgr.loop_add(Some(index))
+    }
+    pub fn new(loop_mgr: Arc<LoopManager>) -> Arc<Self> {
         Arc::new(Self {
             inner: SpinLock::new(LoopControlDeviceInner {
                 kobject_common: KObjectCommonData::default(),
@@ -774,6 +853,7 @@ impl LoopControlDevice {
                 devfs_metadata: Metadata::default(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
+            loop_mgr,
         })
     }
     pub fn inner(&self) -> SpinLockGuard<LoopControlDeviceInner> {
@@ -820,17 +900,56 @@ impl IndexNode for LoopControlDevice {
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
         todo!()
     }
-
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
     fn ioctl(
         &self,
         cmd: u32,
         data: usize,
-        _private_data: &FilePrivateData,
+        private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
-        todo!()
+        match cmd {
+            LOOP_CTL_ADD => {
+                let requested_index = data as u32;
+                match self.loop_mgr.loop_add(Some(requested_index)) {
+                    Ok(loop_dev) => Ok(loop_dev.inner().device_number.minor() as usize),
+                    Err(e) => Err(e),
+                }
+            }
+
+            LOOP_CTL_REMOVE => {
+                let minor_to_remove = data as u32;
+                //  self.loop_mgr.loop_remove(minor_to_remove)?;
+                Ok(0)
+            }
+            LOOP_CTL_GET_FREE => {
+                let mut inner_guard = self.loop_mgr.inner();
+                let start_minor = inner_guard.next_free_minor;
+                let mut found_minor = None;
+                for _ in 0..LoopManager::MAX_DEVICES {
+                    let current_minor = inner_guard.next_free_minor;
+                    //轮询找到一个空闲的loop设备好
+                    inner_guard.next_free_minor =
+                        (inner_guard.next_free_minor + 1) % LoopManager::MAX_DEVICES as u32;
+                    if inner_guard.devices[current_minor as usize].is_none() {
+                        found_minor = Some(current_minor);
+                        break;
+                    }
+                    if inner_guard.next_free_minor == start_minor {
+                        //没找到
+                        break;
+                    }
+                }
+                drop(inner_guard);
+                match found_minor {
+                    Some(minor) => Ok(minor as usize),
+                    None => Err(SystemError::ENOSPC),
+                }
+            }
+            _ => Err(SystemError::ENOSYS),
+        }
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
     }
     fn read_at(
         &self,

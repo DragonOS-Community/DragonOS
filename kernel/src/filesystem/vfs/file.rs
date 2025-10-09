@@ -7,7 +7,7 @@ use system_error::SystemError;
 use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::{
     driver::{
-        base::{block::SeekFrom, device::DevicePrivateData},
+        base::{block::loop_device::LoopPrivateData, block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::{
@@ -34,6 +34,7 @@ pub enum FilePrivateData {
     Tty(TtyFilePrivateData),
     /// epoll私有信息
     EPoll(EPollPrivateData),
+    Loop(LoopPrivateData),
     /// 不需要文件私有信息
     Unused,
 }

@@ -234,7 +234,7 @@
     "hash": "bb2435e3905e8e71eca8f6a583e31d94"
   },
   "en:introduction/build_system.md": {
-    "hash": "fafac4210fb49c9e160b46c2101df238"
+    "hash": "d15b077dd4ae71bff928efb85aa7999e"
   },
   "en:community/ChangeLog/V0.1.x/V0.1.4.md": {
     "hash": "5720af929320997f8824bcdfd3a17bdd"
@@ -294,12 +294,15 @@
     "hash": "52df04d6a276b42617f7b79bbbffa61e"
   },
   "en:kernel/ktest/gvisor_syscall_test.rst": {
-    "hash": "019ff2a7240a60e49be0633625da88f6"
+    "hash": "bfa0b1f0bcb791573c73670df23cbb32"
   },
   "en:kernel/syscall/sys_capget_capset.md": {
     "hash": "f3b86c00e9f28df5c0e6c15905e53907"
   },
   "en:kernel/device/tty.md": {
     "hash": "acbc94b056e1c8f7f07275d80b70a930"
+  },
+  "en:kernel/device/index.rst": {
+    "hash": "71c15cea87dffe58f5d70da38390a083"
   }
 }

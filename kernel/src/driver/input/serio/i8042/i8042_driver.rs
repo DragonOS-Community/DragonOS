@@ -84,7 +84,8 @@ impl PlatformDriver for I8042Driver {
 
     // TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#1322
     fn shutdown(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
-        todo!()
+        //  在probe函数中并没有对i8042的相关控制器进行初始化并使用，所以这里do nothing
+        return Ok(());
     }
 
     fn suspend(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {

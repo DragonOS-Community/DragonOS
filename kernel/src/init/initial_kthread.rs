@@ -27,6 +27,32 @@ const INIT_PROC_TRYLIST: [(&str, Option<&str>); 4] = [
     ("/bin/sh", None),
 ];
 
+static mut SYSTEM_STATE: SystemState = SystemState::Booting;
+
+#[allow(dead_code)]
+pub fn get_system_state() -> SystemState {
+    unsafe { SYSTEM_STATE }
+}
+
+pub fn set_system_state(state: SystemState) {
+    unsafe {
+        SYSTEM_STATE = state;
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SystemState {
+    Booting,
+    Scheduling,
+    FreeingInitMem,
+    Running,
+    Halt,
+    PowerOff,
+    Restart,
+    Suspend,
+}
+
 pub fn initial_kernel_thread() -> i32 {
     kernel_init().unwrap_or_else(|err| {
         log::error!("Failed to initialize kernel: {:?}", err);
@@ -39,6 +65,7 @@ pub fn initial_kernel_thread() -> i32 {
 fn kernel_init() -> Result<(), SystemError> {
     KernelThreadMechanism::init_stage2();
     kenrel_init_freeable()?;
+    set_system_state(SystemState::FreeingInitMem);
     #[cfg(target_arch = "x86_64")]
     crate::driver::disk::ahci::ahci_init()
         .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
@@ -56,6 +83,7 @@ fn kernel_init() -> Result<(), SystemError> {
     });
 
     debug!("initial kernel thread done.");
+    set_system_state(SystemState::Running);
 
     return Ok(());
 }

@@ -1,7 +1,7 @@
 use crate::{
     driver::base::{
         class::{class_manager, Class},
-        device::sys_dev_char_kset,
+        device::sys_dev_char_kobj,
         kobject::KObject,
         subsys::SubSysPrivate,
     },
@@ -66,7 +66,7 @@ impl Class for NetClass {
     }
 
     fn dev_kobj(&self) -> Option<Arc<dyn KObject>> {
-        Some(sys_dev_char_kset() as Arc<dyn KObject>)
+        Some(sys_dev_char_kobj() as Arc<dyn KObject>)
     }
 
     fn set_dev_kobj(&self, _kobj: Arc<dyn KObject>) {

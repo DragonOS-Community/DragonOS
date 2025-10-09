@@ -3,7 +3,7 @@ use alloc::{string::ToString, sync::Arc};
 use core::fmt::Debug;
 
 use super::{
-    device::{sys_dev_char_kset, Device, DeviceMatchName, DeviceMatcher},
+    device::{sys_dev_char_kobj, Device, DeviceMatchName, DeviceMatcher},
     kobject::{KObjType, KObject},
     kset::KSet,
     subsys::SubSysPrivate,
@@ -23,9 +23,7 @@ pub fn sys_class_kset() -> Arc<KSet> {
 /// 初始化`/sys/class`的kset
 pub(super) fn classes_init() -> Result<(), SystemError> {
     let class_kset = KSet::new("class".to_string());
-    class_kset
-        .register(None)
-        .expect("register class kset failed");
+    class_kset.register().expect("register class kset failed");
     unsafe {
         CLASS_KSET_INSTANCE = Some(class_kset);
     }
@@ -124,13 +122,14 @@ impl ClassManager {
         subsys.set_name(class.name().to_string());
 
         if class.dev_kobj().is_none() {
-            class.set_dev_kobj(sys_dev_char_kset() as Arc<dyn KObject>);
+            class.set_dev_kobj(sys_dev_char_kobj() as Arc<dyn KObject>);
         }
 
+        subsys.set_kset(Some(sys_class_kset()));
         subsys.set_kobj_type(Some(&ClassKObjbectType));
         subsystem.set_class(Some(Arc::downgrade(class)));
 
-        subsys.register(Some(sys_class_kset()))?;
+        subsys.register()?;
 
         sysfs_instance().create_groups(&(subsys as Arc<dyn KObject>), class.class_groups())?;
 

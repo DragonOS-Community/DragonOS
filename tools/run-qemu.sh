@@ -97,7 +97,6 @@ QEMU_SERIAL_LOG_FILE="../serial_opt.txt"
 QEMU_SERIAL="-serial file:${QEMU_SERIAL_LOG_FILE}"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
-QEMU_ARGUMENT=" -no-reboot "
 QEMU_DEVICES=""
 
 if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then

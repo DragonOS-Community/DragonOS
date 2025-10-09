@@ -15,9 +15,9 @@ use crate::{
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
-    ipc::pipe::PipeFsPrivateData,
+    ipc::{kill::kill_process, pipe::PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    process::{cred::Cred, ProcessManager},
+    process::{cred::Cred, resource::RLimitID, ProcessManager},
 };
 
 /// 文件私有信息的枚举类型
@@ -272,20 +272,50 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
+        // 检查RLIMIT_FSIZE限制
+        let current_pcb = ProcessManager::current_pcb();
+        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+
+        // 计算实际可写入的长度
+        let actual_len = if fsize_limit.rlim_cur != u64::MAX {
+            let limit = fsize_limit.rlim_cur as usize;
+
+            // 如果当前文件大小已经达到或超过限制，不允许写入
+            if offset >= limit {
+                // 发送SIGXFSZ信号
+                let _ = kill_process(
+                    current_pcb.raw_pid(),
+                    crate::arch::ipc::signal::Signal::SIGXFSZ,
+                );
+                return Err(SystemError::EFBIG);
+            }
+
+            // 计算可写入的最大长度（不超过限制）
+            let max_writable = limit.saturating_sub(offset);
+            if len > max_writable {
+                // 部分写入：只写到限制位置，不发送信号
+                max_writable
+            } else {
+                len
+            }
+        } else {
+            len
+        };
+
         // 如果文件指针已经超过了文件大小，则需要扩展文件大小
         if offset > self.inode.metadata()?.size as usize {
             self.inode.resize(offset)?;
         }
-        let len = self
+        let written_len = self
             .inode
-            .write_at(offset, len, buf, self.private_data.lock())?;
+            .write_at(offset, actual_len, buf, self.private_data.lock())?;
 
         if update_offset {
             self.offset
-                .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
+                .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
         }
 
-        Ok(len)
+        Ok(written_len)
     }
 
     /// @brief 获取文件的元数据
@@ -345,8 +375,15 @@ impl File {
     /// @brief 判断当前文件是否可写
     #[inline]
     pub fn writeable(&self) -> Result<(), SystemError> {
+        let mode = *self.mode.read();
+
+        // 检查是否是O_PATH文件描述符
+        if mode.contains(FileMode::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
         // 暂时认为只要不是read only, 就可写
-        if *self.mode.read() == FileMode::O_RDONLY {
+        if mode == FileMode::O_RDONLY {
             return Err(SystemError::EPERM);
         }
 
@@ -560,9 +597,7 @@ impl FileDescriptorVec {
 
         for i in 0..self.fds.len() {
             if let Some(file) = &self.fds[i] {
-                if let Some(file) = file.try_clone() {
-                    res.fds[i] = Some(Arc::new(file));
-                }
+                res.fds[i] = Some(file.clone());
             }
         }
         return res;

@@ -1,0 +1,6 @@
+# 由于缺少SYS_RT_SIGTIMEDWAIT而失败
+WriteTest.WriteExceedsRLimit
+# 缺少pwritev而失败
+WriteTest.PartialWriteSIGSEGV
+# 缺少pwritev而失败
+WriteTest.PartialWriteSIGBUS

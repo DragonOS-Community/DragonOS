@@ -20,10 +20,7 @@ use table::{syscall_table, syscall_table_init};
 use crate::{
     arch::interrupt::TrapFrame,
     mm::{verify_area, VirtAddr},
-    time::{
-        syscall::{PosixTimeZone, PosixTimeval},
-        PosixTimeSpec,
-    },
+    time::PosixTimeSpec,
 };
 
 use self::{
@@ -297,11 +294,6 @@ impl Syscall {
             SYS_GETPEERNAME => {
                 Self::getpeername(args[0], args[1] as *mut SockAddr, args[2] as *mut u32)
             }
-            SYS_GETTIMEOFDAY => {
-                let timeval = args[0] as *mut PosixTimeval;
-                let timezone_ptr = args[1] as *mut PosixTimeZone;
-                Self::gettimeofday(timeval, timezone_ptr)
-            }
 
             SYS_FUTEX => {
                 let uaddr = VirtAddr::new(args[0]);
@@ -388,12 +380,6 @@ impl Syscall {
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
-            SYS_CLOCK_GETTIME => {
-                let clockid = args[0] as i32;
-                let timespec = args[1] as *mut PosixTimeSpec;
-                Self::clock_gettime(clockid, timespec)
-            }
-
             SYS_SYSINFO => {
                 let info = args[0] as *mut SysInfo;
                 Self::sysinfo(info)
@@ -439,12 +425,6 @@ impl Syscall {
                 // todo: 这个系统调用还没有实现
 
                 Err(SystemError::EINVAL)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_ALARM => {
-                let second = args[0] as u32;
-                Self::alarm(second)
             }
 
             #[cfg(target_arch = "x86_64")]

@@ -2,6 +2,7 @@ pub mod sys_kill;
 pub mod sys_pipe2;
 mod sys_restart;
 mod sys_rt_sigprocmask;
+pub mod sys_rt_sigtimedwait;
 mod sys_shmat;
 mod sys_shmctl;
 mod sys_shmdt;

@@ -400,8 +400,17 @@ impl Syscall {
             }
 
             SYS_RT_SIGTIMEDWAIT => {
-                log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
-                Ok(0)
+                let uthese = args[0] as *const crate::arch::ipc::signal::SigSet;
+                let uinfo = args[1] as *mut crate::ipc::signal_types::PosixSigInfo;
+                let uts = args[2] as *const crate::time::PosixTimeSpec;
+                let sigsetsize = args[3];
+                crate::ipc::syscall::sys_rt_sigtimedwait::do_kernel_rt_sigtimedwait(
+                    uthese,
+                    uinfo,
+                    uts,
+                    sigsetsize,
+                    frame.is_from_user(),
+                )
             }
             _ => {
                 log::error!(

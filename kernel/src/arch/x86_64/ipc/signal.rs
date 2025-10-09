@@ -20,7 +20,9 @@ use crate::{
     exception::InterruptArch,
     ipc::{
         signal::{restore_saved_sigmask, set_current_blocked},
-        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags},
+        signal_types::{
+            PosixSigInfo, SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags,
+        },
     },
     mm::MemoryManagementArch,
     process::ProcessManager,
@@ -55,7 +57,7 @@ pub struct SigFrame {
     /// 指向restorer的地址的指针。（该变量必须放在sigframe的第一位，因为这样才能在handler返回的时候，跳转到对应的代码，执行sigreturn)
     pub ret_code_ptr: *mut core::ffi::c_void,
     pub handler: *mut c_void,
-    pub info: SigInfo,
+    pub info: PosixSigInfo,
     pub context: SigContext,
 }
 
@@ -472,14 +474,14 @@ fn setup_frame(
     }
 
     // 将siginfo拷贝到用户栈
-    info.copy_siginfo_to_user(unsafe { &mut ((*frame).info) as *mut SigInfo })
+    info.copy_posix_siginfo_to_user(unsafe { &mut ((*frame).info) as *mut PosixSigInfo })
         .map_err(|e| -> SystemError {
             let r = crate::ipc::kill::kill_process(
                 ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             );
             if r.is_err() {
-                error!("In copy_siginfo_to_user: generate SIGSEGV signal failed");
+                error!("In copy_posix_siginfo_to_user: generate SIGSEGV signal failed");
             }
             return e;
         })?;
@@ -510,7 +512,7 @@ fn setup_frame(
     unsafe { (*frame).handler = temp_handler };
     // 传入信号处理函数的第一个参数
     trap_frame.rdi = sig as u64;
-    trap_frame.rsi = unsafe { &(*frame).info as *const SigInfo as u64 };
+    trap_frame.rsi = unsafe { &(*frame).info as *const PosixSigInfo as u64 };
     trap_frame.rsp = frame as u64;
     trap_frame.rip = unsafe { (*frame).handler as u64 };
     // 设置cs和ds寄存器

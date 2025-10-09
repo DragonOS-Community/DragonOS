@@ -198,19 +198,18 @@ impl Signal {
 
         let target_pcb: Option<Arc<ProcessControlBlock>>;
 
-        // 判断目标进程是否想接收这个信号
+        // 无论目标进程当前是否屏蔽该信号，均应当将其标记为 pending
+        pcb.sig_info_mut()
+            .sig_pending_mut()
+            .signal_mut()
+            .insert((*self).into());
+
+        // 判断目标进程是否应该被唤醒以立即处理该信号
         if self.wants_signal(pcb.clone()) {
-            // todo: 将信号产生的消息通知到正在监听这个信号的进程（引入signalfd之后，在这里调用signalfd_notify)
-            // 将这个信号加到目标进程的sig_pending中
-            pcb.sig_info_mut()
-                .sig_pending_mut()
-                .signal_mut()
-                .insert((*self).into());
             target_pcb = Some(pcb.clone());
         } else if pt == PidType::PID {
             /*
-             * There is just one thread and it does not need to be woken.
-             * It will dequeue unblocked signals before it runs again.
+             * 单线程场景且不需要唤醒：信号已入队，等待合适时机被取走
              */
             return;
         } else {

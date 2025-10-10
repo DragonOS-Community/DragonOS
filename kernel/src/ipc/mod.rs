@@ -1,6 +1,7 @@
 pub mod generic_signal;
 pub mod kill;
 pub mod pipe;
+pub mod posix_shm;
 pub mod shm;
 pub mod sighand;
 pub mod signal;

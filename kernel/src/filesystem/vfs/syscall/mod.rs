@@ -46,6 +46,7 @@ mod sys_unlinkat;
 mod sys_utimensat;
 mod sys_write;
 mod sys_writev;
+mod sys_pwritev;
 mod utimensat;
 
 mod epoll_utils;

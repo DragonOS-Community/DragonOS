@@ -17,17 +17,23 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::{ProcessManager, namespace::mnt::MountPropagation},
     time::PosixTimeSpec,
 };
 
-use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
+use self::{
+    callback::{KernCallbackData, KernFSCallback, KernInodePrivateData},
+    dynamic::DynamicLookup,
+};
 
 use super::vfs::{
     file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
     FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
+    mount::{MountFS, MountFlags, MountPath},
 };
 
 pub mod callback;
+pub mod dynamic;
 
 #[derive(Debug)]
 pub struct KernFS {
@@ -114,6 +120,8 @@ impl KernFS {
             children: SpinLock::new(HashMap::new()),
             inode_type: KernInodeType::Dir,
             lazy_list: SpinLock::new(HashMap::new()),
+            dynamic_lookup: None,
+            is_temporary: false,
         });
 
         return root_inode;
@@ -139,6 +147,10 @@ pub struct KernFSInode {
     name: String,
     /// lazy list
     lazy_list: SpinLock<HashMap<String, fn() -> KernFSInodeArgs>>,
+    /// 动态查找提供者（可选）
+    dynamic_lookup: Option<Arc<dyn DynamicLookup>>,
+    /// 是否为临时节点（不会被添加到父目录的children中）
+    is_temporary: bool,
 }
 
 pub struct KernFSInodeArgs {
@@ -272,6 +284,15 @@ impl IndexNode for KernFSInode {
                     )?;
                     return Ok(inode);
                 }
+                
+                // 尝试动态查找
+                if let Some(provider) = &self.dynamic_lookup {
+                    match provider.dynamic_find(name)? {
+                        Some(inode) => return Ok(inode),
+                        None => {} // 继续返回 ENOENT
+                    }
+                }
+                
                 Err(SystemError::ENOENT)
             }
         }
@@ -330,10 +351,33 @@ impl IndexNode for KernFSInode {
         let mut keys: Vec<String> = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
-        self.children
-            .lock()
-            .keys()
-            .for_each(|x| keys.push(x.clone()));
+        
+        // 检查是否有动态查找提供者
+        if let Some(provider) = &self.dynamic_lookup {
+            // 添加所有静态子目录（包括非PID目录如cpuinfo, meminfo等）
+            for child_name in self.children.lock().keys() {
+                keys.push(child_name.clone());
+            }
+            
+            // 添加动态条目（PID目录应该完全通过这里提供）
+            let mut dynamic_entries = provider.dynamic_list()?;
+            
+            // 去重并合并（动态条目优先级更高）
+            for entry in dynamic_entries.drain(..) {
+                if !keys.contains(&entry) {
+                    keys.push(entry);
+                }
+            }
+            
+            // 排序以获得一致的输出
+            keys.sort();
+        } else {
+            // 没有动态查找提供者，直接添加所有静态子目录
+            self.children
+                .lock()
+                .keys()
+                .for_each(|x| keys.push(x.clone()));
+        }
 
         return Ok(keys);
     }
@@ -410,6 +454,43 @@ impl IndexNode for KernFSInode {
             .unwrap()
             .write(callback_data, &buf[..len], offset);
     }
+
+    fn mount(
+        &self,
+        fs: Arc<dyn FileSystem>,
+        mount_flags: MountFlags,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        let metadata = self.metadata()?;
+        if metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // 创建 MountFS 来处理挂载
+        let new_mount_fs = MountFS::new(
+            fs,
+            None, // KernFS 节点没有父挂载点
+            MountPropagation::new_private(),
+            Some(&ProcessManager::current_mntns()),
+            mount_flags,
+        );
+
+        // KernFSInode 不应该调用 absolute_path()，因为该方法只为 MountFS 设计
+        // 对于 KernFS 挂载，我们采用更直接的方式：
+        // 1. 如果是特定已知路径（如 cgroup），使用预定义路径
+        // 2. 否则返回错误，要求调用者使用其他方式挂载
+        let mount_path = self.get_known_mount_path().ok_or_else(|| {
+            log::error!("KernFSInode::mount: Cannot determine mount path for KernFS inode. Consider using MountFSInode for mounting.");
+            SystemError::ENOSYS
+        })?;
+        let mount_path = Arc::new(MountPath::from(mount_path));
+        ProcessManager::current_mntns().add_mount(
+            Some(metadata.inode_id),
+            mount_path,
+            new_mount_fs.clone(),
+        )?;
+
+        Ok(new_mount_fs)
+    }
 }
 
 impl KernFSInode {
@@ -420,6 +501,26 @@ impl KernFSInode {
         inode_type: KernInodeType,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
+    ) -> Arc<KernFSInode> {
+        Self::new_with_temporary(
+            parent,
+            name,
+            metadata,
+            inode_type,
+            private_data,
+            callback,
+            false, // 不是临时节点
+        )
+    }
+
+    pub fn new_with_temporary(
+        parent: Option<Arc<KernFSInode>>,
+        name: String,
+        mut metadata: Metadata,
+        inode_type: KernInodeType,
+        private_data: Option<KernInodePrivateData>,
+        callback: Option<&'static dyn KernFSCallback>,
+        is_temporary: bool,
     ) -> Arc<KernFSInode> {
         metadata.file_type = inode_type.into();
         let parent: Weak<KernFSInode> = parent.map(|x| Arc::downgrade(&x)).unwrap_or_default();
@@ -439,6 +540,8 @@ impl KernFSInode {
             children: SpinLock::new(HashMap::new()),
             inode_type,
             lazy_list: SpinLock::new(HashMap::new()),
+            dynamic_lookup: None,
+            is_temporary,
         });
 
         {
@@ -540,6 +643,86 @@ impl KernFSInode {
         Ok(())
     }
 
+    /// 在当前inode下增加临时目录
+    ///
+    /// 临时目录不会被添加到父目录的children中，适用于动态内容
+    ///
+    /// ## 参数
+    ///
+    /// - `name`：临时目录名称
+    /// - `mode`：临时目录权限
+    /// - `private_data`：临时目录私有数据
+    /// - `callback`：临时目录回调函数
+    ///
+    /// ## 返回值
+    ///
+    /// - 成功：临时目录inode
+    /// - 失败：错误码
+    #[allow(dead_code)]
+    #[inline]
+    pub fn create_temporary_dir(
+        &self,
+        name: &str,
+        mode: ModeType,
+        private_data: Option<KernInodePrivateData>,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        if unlikely(self.inode_type != KernInodeType::Dir) {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        return self.inner_create_with_temporary(
+            name.to_string(),
+            KernInodeType::Dir,
+            mode,
+            0,
+            private_data,
+            None,
+            true, // 是临时节点
+        );
+    }
+
+    /// 在当前inode下增加临时文件
+    ///
+    /// 临时文件不会被添加到父目录的children中，适用于动态内容
+    ///
+    /// ## 参数
+    ///
+    /// - `name`：临时文件名称
+    /// - `mode`：临时文件权限
+    /// - `size`：临时文件大小(如果不指定，则默认为4096)
+    /// - `private_data`：临时文件私有数据
+    /// - `callback`：临时文件回调函数
+    ///
+    /// ## 返回值
+    ///
+    /// - 成功：临时文件inode
+    /// - 失败：错误码
+    #[allow(dead_code)]
+    #[inline]
+    pub fn create_temporary_file(
+        &self,
+        name: &str,
+        mode: ModeType,
+        size: Option<usize>,
+        private_data: Option<KernInodePrivateData>,
+        callback: Option<&'static dyn KernFSCallback>,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        if unlikely(self.inode_type != KernInodeType::Dir) {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        let size = size.unwrap_or(4096);
+        return self.inner_create_with_temporary(
+            name.to_string(),
+            KernInodeType::File,
+            mode,
+            size,
+            private_data,
+            callback,
+            true, // 是临时节点
+        );
+    }
+
     fn inner_create(
         &self,
         name: String,
@@ -548,6 +731,27 @@ impl KernFSInode {
         mut size: usize,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        self.inner_create_with_temporary(
+            name,
+            file_type,
+            mode,
+            size,
+            private_data,
+            callback,
+            false, // 不是临时节点
+        )
+    }
+
+    fn inner_create_with_temporary(
+        &self,
+        name: String,
+        file_type: KernInodeType,
+        mode: ModeType,
+        mut size: usize,
+        private_data: Option<KernInodePrivateData>,
+        callback: Option<&'static dyn KernFSCallback>,
+        is_temporary: bool,
     ) -> Result<Arc<KernFSInode>, SystemError> {
         match file_type {
             KernInodeType::Dir | KernInodeType::SymLink => {
@@ -574,16 +778,20 @@ impl KernFSInode {
             raw_dev: DeviceNumber::default(),
         };
 
-        let new_inode: Arc<KernFSInode> = Self::new(
+        let new_inode: Arc<KernFSInode> = Self::new_with_temporary(
             Some(self.self_ref.upgrade().unwrap()),
             name.clone(),
             metadata,
             file_type,
             private_data,
             callback,
+            is_temporary,
         );
 
-        self.children.lock().insert(name, new_inode.clone());
+        // 只有非临时节点才被添加到父目录的children中
+        if !is_temporary {
+            self.children.lock().insert(name, new_inode.clone());
+        }
 
         return Ok(new_inode);
     }
@@ -615,6 +823,8 @@ impl KernFSInode {
             return Err(SystemError::ENOTEMPTY);
         }
     }
+
+    
 
     /// add_link - create a symlink in kernfs
     ///
@@ -674,13 +884,118 @@ impl KernFSInode {
     }
 
     /// 删除当前的inode（包括其自身、子目录和子文件）
+    /// 
+    /// 这个方法会：
+    /// 1. 递归删除所有子节点
+    /// 2. 从父目录中移除自己
+    /// 3. 清理相关资源
     #[allow(dead_code)]
     pub fn remove_inode_include_self(&self) {
-        let parent = self.parent();
-        if let Some(parent) = parent {
-            parent.children.lock().remove(self.name());
+        // 如果是目录，先递归删除所有子节点
+        if self.inode_type == KernInodeType::Dir {
+            let children_names: Vec<String> = self.children.lock().keys().cloned().collect();
+            for child_name in children_names {
+                if let Ok(child_inode) = self.find(&child_name) {
+                    if let Some(kernfs_child) = child_inode.downcast_arc::<KernFSInode>() {
+                        kernfs_child.remove_inode_include_self();
+                    }
+                }
+            }
         }
-        self.remove_recursive();
+        
+        // 从父节点的children中移除自己
+        if let Some(parent) = self.parent() {
+            let name = self.name().to_string();
+            parent.children.lock().remove(&name);
+        }
+        
+        ::log::debug!("remove_inode_include_self: removed inode '{}'", self.name());
+    }
+
+    /// 设置动态查找提供者
+    pub fn set_dynamic_lookup(&self, provider: Arc<dyn DynamicLookup>) {
+        // 使用 unsafe 来修改 dynamic_lookup 字段
+        // 这是安全的，因为我们只在初始化时调用这个方法
+        unsafe {
+            let self_ptr = self as *const Self as *mut Self;
+            (*self_ptr).dynamic_lookup = Some(provider);
+        }
+    }
+
+    /// 获取动态查找提供者
+    pub fn dynamic_lookup(&self) -> Option<&Arc<dyn DynamicLookup>> {
+        self.dynamic_lookup.as_ref()
+    }
+
+    /// 扩展的查找方法，支持动态查找
+    pub fn find_extended(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // 首先尝试静态查找
+        match self.find(name) {
+            Ok(inode) => return Ok(inode),
+            Err(SystemError::ENOENT) => {
+                // 如果静态查找失败且有动态查找提供者，尝试动态查找
+                if let Some(provider) = &self.dynamic_lookup {
+                    match provider.dynamic_find(name)? {
+                        Some(inode) => return Ok(inode),
+                        None => {} // 继续返回 ENOENT
+                    }
+                }
+                Err(SystemError::ENOENT)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 扩展的列表方法，支持动态列表
+    pub fn list_extended(&self) -> Result<Vec<String>, SystemError> {
+        let mut entries = self.list()?;
+        
+        // 如果有动态查找提供者，添加动态条目
+        if let Some(provider) = &self.dynamic_lookup {
+            let mut dynamic_entries = provider.dynamic_list()?;
+            
+            // 去重并合并
+            for entry in dynamic_entries.drain(..) {
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+            
+            // 排序以获得一致的输出
+            entries.sort();
+        }
+        
+        Ok(entries)
+    }
+
+    /// 检查当前节点是否为临时节点
+    pub fn is_temporary(&self) -> bool {
+        self.is_temporary
+    }
+
+    /// 获取已知的挂载路径
+    /// 
+    /// 这个方法为特定的 KernFSInode 返回预定义的挂载路径。
+    /// 主要用于处理特殊用途的 KernFS 节点，如 cgroup 目录。
+    fn get_known_mount_path(&self) -> Option<String> {
+        // 检查节点的私有数据，确定是否为已知的挂载点
+        if let Some(private_data) = self.private_data.lock().as_ref() {
+            match private_data {
+                KernInodePrivateData::CgroupFS(_) => {
+                    // 这是一个 cgroup 相关的节点，返回 cgroup 挂载点路径
+                    log::debug!("KernFSInode::get_known_mount_path: Identified cgroup mount point for node '{}'", self.name);
+                    return Some("/sys/fs/cgroup".to_string());
+                }
+                _ => {
+                    log::debug!("KernFSInode::get_known_mount_path: Node '{}' has non-cgroup private data", self.name);
+                }
+            }
+        } else {
+            log::debug!("KernFSInode::get_known_mount_path: Node '{}' has no private data", self.name);
+        }
+
+        // 对于没有私有数据或非已知类型的节点，返回 None
+        None
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

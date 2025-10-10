@@ -456,6 +456,8 @@ impl ProcessManager {
             let thread = pcb.thread.write_irqsave();
 
             if let Some(addr) = thread.clear_child_tid {
+                // 按 Linux 语义：先清零 userland 的 *clear_child_tid，再 futex_wake(addr)
+                unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
                 if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
                     let _ = Futex::futex_wake(
                         addr,
@@ -464,7 +466,6 @@ impl ProcessManager {
                         FUTEX_BITSET_MATCH_ANY,
                     );
                 }
-                unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
             }
             compiler_fence(Ordering::SeqCst);
 

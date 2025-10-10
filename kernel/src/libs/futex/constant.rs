@@ -17,7 +17,7 @@ bitflags! {
     }
 
     pub struct FutexFlag: u32 {
-        const FLAGS_MATCH_NONE = 0x01;
+        const FLAGS_MATCH_NONE = 0x00;
         const FLAGS_SHARED = 0x01;
         const FLAGS_CLOCKRT = 0x02;
         const FLAGS_HAS_TIMEOUT = 0x04;

@@ -65,6 +65,7 @@ pub struct Config {
     pub temp_dir: PathBuf,
     pub extra_blocklist_dirs: Vec<PathBuf>,
     pub test_patterns: Vec<String>,
+    pub output_to_stdout: bool,  // 是否输出到控制台而不是文件
 }
 
 impl Default for Config {
@@ -86,6 +87,7 @@ impl Default for Config {
             ),
             extra_blocklist_dirs: Vec::new(),
             test_patterns: Vec::new(),
+            output_to_stdout: false,
         }
     }
 }
@@ -321,12 +323,6 @@ impl TestRunner {
         // 获取blocklist
         let blocked_subtests = self.get_test_blocklist(test_name);
 
-        // 结果输出文件（使用绝对路径，避免工作目录切换影响）
-        let output_file = self
-            .config
-            .results_dir
-            .join(format!("{}.output", test_name));
-
         println!("[DEBUG] 工作目录: {:?}", self.config.tests_dir);
         println!("[DEBUG] TEST_TMPDIR: {:?}", self.config.temp_dir);
         println!("[DEBUG] 直接执行: {:?}", test_path);
@@ -334,18 +330,32 @@ impl TestRunner {
             println!("[DEBUG] gtest_filter: -{}", blocked_subtests.join(":"));
         }
 
-        // 确保结果目录存在
-        if let Err(e) = fs::create_dir_all(&self.config.results_dir) {
-            self.print_error(&format!("创建结果目录失败: {}", e));
-        }
+        // 根据配置决定输出方式
+        let (stdout, stderr) = if self.config.output_to_stdout {
+            // 单个测例：直接输出到控制台
+            (std::process::Stdio::inherit(), std::process::Stdio::inherit())
+        } else {
+            // 批量测试：输出到文件
+            // 确保结果目录存在
+            if let Err(e) = fs::create_dir_all(&self.config.results_dir) {
+                self.print_error(&format!("创建结果目录失败: {}", e));
+            }
 
-        // 打开输出文件，并将 stdout/stderr 重定向到该文件
-        let out = File::create(&output_file);
-        if let Err(e) = out.as_ref() {
-            self.print_error(&format!("创建输出文件失败: {:?}, 错误: {}", output_file, e));
-        }
-        let out = out?;
-        let err = out.try_clone()?;
+            // 结果输出文件（使用绝对路径，避免工作目录切换影响）
+            let output_file = self
+                .config
+                .results_dir
+                .join(format!("{}.output", test_name));
+
+            // 打开输出文件，并将 stdout/stderr 重定向到该文件
+            let out = File::create(&output_file);
+            if let Err(e) = out.as_ref() {
+                self.print_error(&format!("创建输出文件失败: {:?}, 错误: {}", output_file, e));
+            }
+            let out = out?;
+            let err = out.try_clone()?;
+            (std::process::Stdio::from(out), std::process::Stdio::from(err))
+        };
 
         // 构造并执行命令（不使用 shell，不捕获输出，不创建管道）
         let start_time = Instant::now();
@@ -357,8 +367,8 @@ impl TestRunner {
         let status = cmd
             .current_dir(&self.config.tests_dir)
             .env("TEST_TMPDIR", &self.config.temp_dir)
-            .stdout(std::process::Stdio::from(out))
-            .stderr(std::process::Stdio::from(err))
+            .stdout(stdout)
+            .stderr(stderr)
             .status();
 
         // 清理临时目录
@@ -373,19 +383,25 @@ impl TestRunner {
                     test_name,
                     duration.as_secs_f64()
                 ));
-                // 将输出文件尾部打印一点，便于快速查看
-                if let Ok(content) = fs::read_to_string(&output_file) {
-                    let tail: String = content
-                        .lines()
-                        .rev()
-                        .take(10)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .map(|s| format!("{}\n", s))
-                        .collect();
-                    if !tail.is_empty() {
-                        println!("[DEBUG] 输出尾部: \n{}", tail);
+                // 只在批量测试时读取文件内容
+                if !self.config.output_to_stdout {
+                    let output_file = self
+                        .config
+                        .results_dir
+                        .join(format!("{}.output", test_name));
+                    if let Ok(content) = fs::read_to_string(&output_file) {
+                        let tail: String = content
+                            .lines()
+                            .rev()
+                            .take(10)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .map(|s| format!("{}\n", s))
+                            .collect();
+                        if !tail.is_empty() {
+                            println!("[DEBUG] 输出尾部: \n{}", tail);
+                        }
                     }
                 }
                 Ok(true)
@@ -397,19 +413,25 @@ impl TestRunner {
                     duration.as_secs_f64(),
                     s.code()
                 ));
-                // 打印错误输出尾部
-                if let Ok(content) = fs::read_to_string(&output_file) {
-                    let tail: String = content
-                        .lines()
-                        .rev()
-                        .take(20)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .map(|s| format!("{}\n", s))
-                        .collect();
-                    if !tail.is_empty() {
-                        println!("[DEBUG] 错误输出尾部: \n{}", tail);
+                // 只在批量测试时读取文件内容
+                if !self.config.output_to_stdout {
+                    let output_file = self
+                        .config
+                        .results_dir
+                        .join(format!("{}.output", test_name));
+                    if let Ok(content) = fs::read_to_string(&output_file) {
+                        let tail: String = content
+                            .lines()
+                            .rev()
+                            .take(20)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .map(|s| format!("{}\n", s))
+                            .collect();
+                        if !tail.is_empty() {
+                            println!("[DEBUG] 错误输出尾部: \n{}", tail);
+                        }
                     }
                 }
                 Ok(false)

@@ -47,22 +47,39 @@ impl Syscall for SysFutexHandle {
         let uaddr = Self::uaddr(args);
         let operation = Self::operation(args)?;
         let val = Self::val(args);
-        let utime = Self::utime(args);
+        // 第4个参数：不同操作下语义不同（可能是 timeout 指针、val2、op 等）
+        let arg4 = Self::utime(args);
         let uaddr2 = Self::uaddr2(args);
         let val3 = Self::val3(args);
 
-        let mut timespec = None;
-        if utime != 0 {
-            let reader = UserBufferReader::new(
-                utime as *const PosixTimeSpec,
-                core::mem::size_of::<PosixTimeSpec>(),
-                frame.is_from_user(),
-            )?;
+        // 决定是否将第4参解释为超时指针（WAIT* 系列）或数值 val2（REQUEUE/WAKE_OP 等）
+        let cmd = FutexArg::from_bits(operation.bits() & FutexFlag::FUTEX_CMD_MASK.bits())
+            .ok_or(SystemError::ENOSYS)?;
 
-            timespec = Some(*reader.read_one_from_user::<PosixTimeSpec>(0)?);
-        }
+        let (timespec, val2): (Option<PosixTimeSpec>, u32) = match cmd {
+            // 与 Linux 语义一致：WAIT 使用相对超时；WAIT_BITSET/LOCK_PI2/WAIT_REQUEUE_PI 使用绝对时间（若带 CLOCKRT）
+            FutexArg::FUTEX_WAIT
+            | FutexArg::FUTEX_WAIT_BITSET
+            | FutexArg::FUTEX_WAIT_REQUEUE_PI
+            | FutexArg::FUTEX_LOCK_PI2 => {
+                if arg4 != 0 {
+                    let reader = UserBufferReader::new(
+                        arg4 as *const PosixTimeSpec,
+                        core::mem::size_of::<PosixTimeSpec>(),
+                        frame.is_from_user(),
+                    )?;
+                    (Some(*reader.read_one_from_user::<PosixTimeSpec>(0)?), 0)
+                } else {
+                    (None, 0)
+                }
+            }
+            _ => {
+                // 其他操作中，第4参为数值（如 REQUEUE 的 nr_requeue、WAKE_OP 的 nr_wake2 等）
+                (None, arg4 as u32)
+            }
+        };
 
-        do_futex(uaddr, operation, val, timespec, uaddr2, utime as u32, val3)
+        do_futex(uaddr, operation, val, timespec, uaddr2, val2, val3)
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -133,9 +150,20 @@ pub(super) fn do_futex(
     val3: u32,
 ) -> Result<usize, SystemError> {
     verify_area(uaddr, core::mem::size_of::<u32>())?;
-    verify_area(uaddr2, core::mem::size_of::<u32>())?;
     let cmd = FutexArg::from_bits(operation.bits() & FutexFlag::FUTEX_CMD_MASK.bits())
         .ok_or(SystemError::ENOSYS)?;
+
+    // 仅在需要 uaddr2 的操作中校验它
+    match cmd {
+        FutexArg::FUTEX_REQUEUE
+        | FutexArg::FUTEX_CMP_REQUEUE
+        | FutexArg::FUTEX_WAKE_OP
+        | FutexArg::FUTEX_WAIT_REQUEUE_PI
+        | FutexArg::FUTEX_CMP_REQUEUE_PI => {
+            verify_area(uaddr2, core::mem::size_of::<u32>())?;
+        }
+        _ => {}
+    }
 
     let mut flags = FutexFlag::FLAGS_MATCH_NONE;
 

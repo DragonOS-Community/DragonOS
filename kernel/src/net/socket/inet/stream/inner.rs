@@ -4,10 +4,12 @@ use crate::filesystem::epoll::EPollEventType;
 use crate::libs::rwlock::RwLock;
 use crate::net::socket::{self, inet::Types};
 use alloc::boxed::Box;
-use alloc::vec::Vec;
+use alloc::sync::Arc;
+use alloc::collections::VecDeque;
 use smoltcp;
 use smoltcp::socket::tcp;
 use system_error::SystemError;
+use log::debug;
 
 // pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024;
@@ -134,25 +136,7 @@ impl Init {
             smoltcp::wire::IpListenEndpoint::from(local)
         };
         log::debug!("listen at {:?}", listen_addr);
-        let mut inners = Vec::new();
-        if let Err(err) = || -> Result<(), SystemError> {
-            for _ in 0..(backlog - 1) {
-                // -1 because the first one is already bound
-                let new_listen = socket::inet::BoundInner::bind(
-                    new_listen_smoltcp_socket(listen_addr),
-                    listen_addr
-                        .addr
-                        .as_ref()
-                        .unwrap_or(&smoltcp::wire::IpAddress::from(
-                            smoltcp::wire::Ipv4Address::UNSPECIFIED,
-                        )),
-                )?;
-                inners.push(new_listen);
-            }
-            Ok(())
-        }() {
-            return Err((Init::Bound((inner, local)), err));
-        }
+        
 
         if let Err(err) = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket
@@ -162,11 +146,12 @@ impl Init {
             return Err((Init::Bound((inner, local)), err));
         }
 
-        inners.push(inner);
+        let mut inners = VecDeque::new();
+        inners.push_back(Arc::new(inner));
         return Ok(Listening {
-            inners,
-            connect: AtomicUsize::new(0),
+            inners: RwLock::new(inners),
             listen_addr,
+            backlog,
         });
     }
 
@@ -289,20 +274,44 @@ impl Connecting {
 
 #[derive(Debug)]
 pub struct Listening {
-    inners: Vec<socket::inet::BoundInner>,
-    connect: AtomicUsize,
+    inners: RwLock<VecDeque<Arc<socket::inet::BoundInner>>>,
+    backlog: usize,
     listen_addr: smoltcp::wire::IpListenEndpoint,
 }
 
 impl Listening {
     pub fn accept(&mut self) -> Result<(Established, smoltcp::wire::IpEndpoint), SystemError> {
-        let connected: &mut socket::inet::BoundInner = self
-            .inners
-            .get_mut(self.connect.load(core::sync::atomic::Ordering::Relaxed))
-            .unwrap();
+        let inners_guard = self.inners.read();
+        let inner = match inners_guard.front() {
+            Some(v) => v,
+            None => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+        };
 
-        if connected.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| !socket.is_active()) {
+        if inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| !socket.is_active()) {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        drop(inners_guard);
+
+        let mut inners_writer = self.inners.write();
+        let connected = match inners_writer.pop_front() {
+            Some(v) => v,
+            None => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+        };
+
+        if inners_writer.len() == 0 {
+            let new_listen = match socket::inet::BoundInner::bind(
+                    new_listen_smoltcp_socket(self.listen_addr),
+                    self.listen_addr
+                        .addr
+                        .as_ref()
+                        .unwrap_or(&smoltcp::wire::IpAddress::from(
+                            smoltcp::wire::Ipv4Address::UNSPECIFIED,
+                        )),
+                ) {
+                    Ok(inner) => inner,
+                    Err(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+                };
+                inners_writer.push_back(Arc::new(new_listen));
         }
 
         let remote_endpoint = connected.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
@@ -311,33 +320,32 @@ impl Listening {
                 .expect("A Connected Tcp With No Remote Endpoint")
         });
 
-        // log::debug!("local at {:?}", local_endpoint);
-
-        let mut new_listen = socket::inet::BoundInner::bind(
-            new_listen_smoltcp_socket(self.listen_addr),
-            self.listen_addr
-                .addr
-                .as_ref()
-                .unwrap_or(&smoltcp::wire::IpAddress::from(
-                    smoltcp::wire::Ipv4Address::UNSPECIFIED,
-                )),
-        )?;
-
-        // swap the connected socket with the new_listen socket
-        // TODO is smoltcp socket swappable?
-        core::mem::swap(&mut new_listen, connected);
-
-        return Ok((Established { inner: new_listen }, remote_endpoint));
+        return Ok((Established { inner: Arc::try_unwrap(connected).unwrap() }, remote_endpoint));
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
-        let position = self.inners.iter().position(|inner| {
-            inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
-        });
+        let mut inners_guard = self.inners.write();
+        let inner = match inners_guard.back() {
+            Some(inner) => inner,
+            None => return debug!("the tcp socket inners is empty"),
+        };
 
-        if let Some(position) = position {
-            self.connect
-                .store(position, core::sync::atomic::Ordering::Relaxed);
+        if inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active()) {
+                if inners_guard.len() < self.backlog {
+                let new_listen = match socket::inet::BoundInner::bind(
+                    new_listen_smoltcp_socket(self.listen_addr),
+                    self.listen_addr
+                        .addr
+                        .as_ref()
+                        .unwrap_or(&smoltcp::wire::IpAddress::from(
+                            smoltcp::wire::Ipv4Address::UNSPECIFIED,
+                        )),
+                ) {
+                    Ok(inner) => inner,
+                    Err(e) => return debug!("bind err: {:#?}", e),
+                };
+                inners_guard.push_back(Arc::new(new_listen));
+            }
             pollee.fetch_or(
                 EPollEventType::EPOLL_LISTEN_CAN_ACCEPT.bits() as usize,
                 core::sync::atomic::Ordering::Relaxed,
@@ -364,18 +372,16 @@ impl Listening {
     pub fn close(&self) {
         // log::debug!("Close Listening Socket");
         let port = self.get_name().port;
-        for inner in self.inners.iter() {
+        let inners_guard = self.inners.read();
+        for inner in inners_guard.iter() {
             inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
+            inner.port_manager().unbind_port(Types::Tcp, port);
         }
-        self.inners[0]
-            .iface()
-            .port_manager()
-            .unbind_port(Types::Tcp, port);
     }
 
     pub fn release(&self) {
         // log::debug!("Release Listening Socket");
-        for inner in self.inners.iter() {
+        for inner in self.inners.read().iter() {
             inner.release();
         }
     }
@@ -489,8 +495,14 @@ impl Inner {
             Inner::Init(_) => DEFAULT_TX_BUF_SIZE,
             Inner::Connecting(conn) => conn.with_mut(|socket| socket.send_capacity()),
             // only the first socket in the list is used for sending
-            Inner::Listening(listen) => listen.inners[0]
-                .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.send_capacity()),
+            Inner::Listening(listen) => {
+                listen
+                    .inners
+                    .read()
+                    .front()
+                    .unwrap()
+                    .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.send_capacity())
+            }
             Inner::Established(est) => est.with_mut(|socket| socket.send_capacity()),
         }
     }
@@ -500,18 +512,24 @@ impl Inner {
             Inner::Init(_) => DEFAULT_RX_BUF_SIZE,
             Inner::Connecting(conn) => conn.with_mut(|socket| socket.recv_capacity()),
             // only the first socket in the list is used for receiving
-            Inner::Listening(listen) => listen.inners[0]
-                .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.recv_capacity()),
+            Inner::Listening(listen) => {
+                listen
+                    .inners
+                    .read()
+                    .front()
+                    .unwrap()
+                    .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.recv_capacity())
+            }
             Inner::Established(est) => est.with_mut(|socket| socket.recv_capacity()),
         }
     }
 
-    pub fn iface(&self) -> Option<&alloc::sync::Arc<dyn crate::driver::net::Iface>> {
+    pub fn iface(&self) -> Option<alloc::sync::Arc<dyn crate::driver::net::Iface>> {
         match self {
             Inner::Init(_) => None,
-            Inner::Connecting(conn) => Some(conn.inner.iface()),
-            Inner::Listening(listen) => Some(listen.inners[0].iface()),
-            Inner::Established(est) => Some(est.inner.iface()),
+            Inner::Connecting(conn) => Some(conn.inner.iface().clone()),
+            Inner::Listening(listen) => Some(listen.inners.read().front().unwrap().iface().clone()),
+            Inner::Established(est) => Some(est.inner.iface().clone()),
         }
     }
 }

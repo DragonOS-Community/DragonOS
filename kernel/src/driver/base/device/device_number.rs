@@ -41,6 +41,7 @@ impl Major {
     pub const fn data(&self) -> u32 {
         self.0
     }
+    pub const LOOP_MAJOR: Self = Self::new(7);
 }
 
 impl Hash for Major {

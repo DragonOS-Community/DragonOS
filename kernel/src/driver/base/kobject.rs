@@ -339,11 +339,11 @@ impl KObject for CommonKobj {
         // Do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&'_ self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobjstate.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&'_ self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobjstate.write()
     }
 

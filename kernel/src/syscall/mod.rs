@@ -5,7 +5,7 @@ use core::{
 
 use crate::{
     arch::syscall::nr::*,
-    libs::{futex::constant::FutexFlag, rand::GRandFlags},
+    libs::rand::GRandFlags,
     mm::page::PAGE_4K_SIZE,
     net::posix::{MsgHdr, SockAddr},
     process::{ProcessFlags, ProcessManager},
@@ -20,13 +20,9 @@ use table::{syscall_table, syscall_table_init};
 use crate::{
     arch::interrupt::TrapFrame,
     mm::{verify_area, VirtAddr},
-    time::PosixTimeSpec,
 };
 
-use self::{
-    misc::SysInfo,
-    user_access::{UserBufferReader, UserBufferWriter},
-};
+use self::{misc::SysInfo, user_access::UserBufferWriter};
 
 pub mod misc;
 pub mod table;
@@ -285,48 +281,6 @@ impl Syscall {
             }
             SYS_GETPEERNAME => {
                 Self::getpeername(args[0], args[1] as *mut SockAddr, args[2] as *mut u32)
-            }
-
-            SYS_FUTEX => {
-                let uaddr = VirtAddr::new(args[0]);
-                let operation = FutexFlag::from_bits(args[1] as u32).ok_or(SystemError::ENOSYS)?;
-                let val = args[2] as u32;
-                let utime = args[3];
-                let uaddr2 = VirtAddr::new(args[4]);
-                let val3 = args[5] as u32;
-
-                let mut timespec = None;
-                if utime != 0 {
-                    let reader = UserBufferReader::new(
-                        utime as *const PosixTimeSpec,
-                        core::mem::size_of::<PosixTimeSpec>(),
-                        true,
-                    )?;
-
-                    timespec = Some(*reader.read_one_from_user::<PosixTimeSpec>(0)?);
-                }
-
-                Self::do_futex(uaddr, operation, val, timespec, uaddr2, utime as u32, val3)
-            }
-
-            SYS_SET_ROBUST_LIST => {
-                let head = args[0];
-                let head_uaddr = VirtAddr::new(head);
-                let len = args[1];
-
-                let ret = Self::set_robust_list(head_uaddr, len);
-                return ret;
-            }
-
-            SYS_GET_ROBUST_LIST => {
-                let pid = args[0];
-                let head = args[1];
-                let head_uaddr = VirtAddr::new(head);
-                let len_ptr = args[2];
-                let len_ptr_uaddr = VirtAddr::new(len_ptr);
-
-                let ret = Self::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
-                return ret;
             }
 
             // 目前为了适配musl-libc,以下系统调用先这样写着

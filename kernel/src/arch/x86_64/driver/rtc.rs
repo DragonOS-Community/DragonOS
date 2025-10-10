@@ -49,7 +49,7 @@ impl RtcLock {
         }
     }
 
-    pub fn lock(&self) -> SpinLockGuard<()> {
+    pub fn lock(&'_ self) -> SpinLockGuard<'_, ()> {
         self.rtc_lock.lock()
     }
 }

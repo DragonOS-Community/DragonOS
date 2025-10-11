@@ -1,3 +1,4 @@
+use core::sync::atomic::{compiler_fence, Ordering};
 use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
 
 use defer::defer;
@@ -239,6 +240,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
     let res: Result<i32, SystemError> =
         handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
+    compiler_fence(Ordering::SeqCst);
     if res.is_err() {
         error!(
             "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
@@ -339,6 +341,7 @@ impl SignalArch for X86_64SignalArch {
 /// @return Result<0,SystemError> 若Error, 则返回错误码,否则返回Ok(0)
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#787
+#[inline(never)]
 fn handle_signal(
     sig: Signal,
     sigaction: &mut Sigaction,

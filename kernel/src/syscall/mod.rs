@@ -399,19 +399,6 @@ impl Syscall {
                 Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
 
-            SYS_RT_SIGTIMEDWAIT => {
-                let uthese = args[0] as *const crate::arch::ipc::signal::SigSet;
-                let uinfo = args[1] as *mut crate::ipc::signal_types::PosixSigInfo;
-                let uts = args[2] as *const crate::time::PosixTimeSpec;
-                let sigsetsize = args[3];
-                crate::ipc::syscall::sys_rt_sigtimedwait::do_kernel_rt_sigtimedwait(
-                    uthese,
-                    uinfo,
-                    uts,
-                    sigsetsize,
-                    frame.is_from_user(),
-                )
-            }
             _ => {
                 log::error!(
                     "Unsupported syscall ID: {} -> {}, args: {:?}",

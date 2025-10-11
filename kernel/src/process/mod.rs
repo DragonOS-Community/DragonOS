@@ -2,7 +2,7 @@ use core::{
     fmt,
     hash::Hash,
     hint::spin_loop,
-    intrinsics::{likely, unlikely},
+    intrinsics::unlikely,
     mem::ManuallyDrop,
     sync::atomic::{compiler_fence, fence, AtomicBool, AtomicUsize, Ordering},
 };
@@ -85,6 +85,7 @@ pub mod idle;
 pub mod kthread;
 pub mod namespace;
 pub mod pid;
+pub mod preempt;
 pub mod process_group;
 pub mod resource;
 pub mod session;
@@ -188,22 +189,6 @@ impl ProcessManager {
         }
 
         return ProcessManager::current_pcb().raw_pid();
-    }
-
-    /// 增加当前进程的锁持有计数
-    #[inline(always)]
-    pub fn preempt_disable() {
-        if likely(unsafe { __PROCESS_MANAGEMENT_INIT_DONE }) {
-            ProcessManager::current_pcb().preempt_disable();
-        }
-    }
-
-    /// 减少当前进程的锁持有计数
-    #[inline(always)]
-    pub fn preempt_enable() {
-        if likely(unsafe { __PROCESS_MANAGEMENT_INIT_DONE }) {
-            ProcessManager::current_pcb().preempt_enable();
-        }
     }
 
     /// 根据pid获取进程的pcb
@@ -432,7 +417,6 @@ impl ProcessManager {
 
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
         let pid: Arc<Pid>;
         let raw_pid = ProcessManager::current_pid();
         {

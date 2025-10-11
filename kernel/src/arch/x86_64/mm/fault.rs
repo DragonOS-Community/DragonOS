@@ -264,9 +264,11 @@ impl X86_64MMArch {
                 Some(vma) => vma,
                 None => {
                     log::error!(
-                        "can not find nearest vma, error_code: {:?}, address: {:#x}",
+                        "pid:{}, can not find nearest vma, \n\terror_code: {:?}, address: {:#x}, rip: {:#x}",
+                        ProcessManager::current_pid().data(),
                         error_code,
                         address.data(),
+                        regs.rip,
                     );
                     send_segv();
                     return;

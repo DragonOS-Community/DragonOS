@@ -94,10 +94,14 @@ static void *delayed_kill_sender(void *arg) {
     ts.tv_sec = a->delay_ms / 1000;
     ts.tv_nsec = (long)(a->delay_ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
+
+    printf("[TEST_DEBUG]:delayed_kill_sender to kill %d sig %d\n", a->pid, a->sig);
     // 进程定向发送
     kill(a->pid, a->sig);
+    printf("[TEST_DEBUG]:delayed_kill_sender killed %d sig %d\n", a->pid, a->sig);
     // 还原该线程掩码
     pthread_sigmask(SIG_SETMASK, &oldset, NULL);
+    printf("[TEST_DEBUG]:delayed_kill_sender unblocked %d sig %d\n", a->pid, a->sig);
     return NULL;
 }
 
@@ -203,20 +207,21 @@ static void test_rt_sigtimedwait_null_timeout_with_delayed_rt_signal() {
     sigemptyset(&waitset);
     sigaddset(&waitset, rtsig);
     siginfo_t info;
-
+    printf("[TEST_DEBUG]: to call rt_sigtimedwait_libc\n");
     // NULL超时：按规范为无限等待，但我们确保100ms内会到信号
     int ret = rt_sigtimedwait_libc(&waitset, &info, NULL);
+    printf("[TEST_DEBUG]: rt_sigtimedwait_libc returned %d\n", ret);
     TEST_ASSERT(ret == rtsig, "rt_sigtimedwait(NULL) 收到实时信号");
     if (ret == rtsig) {
         TEST_ASSERT(info.si_signo == rtsig, "info.si_signo == 发送的实时信号");
         TEST_ASSERT((info.si_code == SI_USER) || (info.si_code == SI_TKILL) || (info.si_code == SI_QUEUE), "info.si_code 合理");
         TEST_ASSERT(info.si_pid == getpid(), "info.si_pid 为当前进程");
     }
-
+    printf("[TEST_DEBUG]: to join thread\n");
     if (rc == 0) {
         pthread_join(th, NULL);
     }
-
+    printf("[TEST_DEBUG]: to unblock signal\n");
     rc = unblock_signal(rtsig, &oldset);
     TEST_ASSERT(rc == 0, "恢复原有信号屏蔽集");
 }

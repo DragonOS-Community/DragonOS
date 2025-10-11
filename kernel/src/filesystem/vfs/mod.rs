@@ -790,8 +790,58 @@ impl dyn IndexNode {
                 continue;
             }
 
-            let inode = result.find(&name)?;
+            // let inode = result.find(&name)?;
+            // let file_type = inode.metadata()?.file_type;
+            // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
+
+            
+            // 挂载点目录不需要预先存在：挂载操作会“覆盖”路径
+            // 路径解析通过挂载表找到对应的挂载点
+            // 先尝试常规查找
+            let inode = match result.find(&name) {
+                Ok(found_inode) => found_inode,
+                Err(_) => {
+                    // 常规查找失败，检查是否有挂载点覆盖当前路径
+                    let current_path = if path.starts_with('/') {
+                        // 绝对路径：重新构建到当前位置的路径
+                        let original_path = path;
+                        let remaining_len = if rest_path.is_empty() { 0 } else { rest_path.len() + 1 }; // +1 for '/'
+                        let current_len = original_path.len() - remaining_len;
+                        &original_path[..current_len]
+                    } else {
+                        // 相对路径：这种情况比较复杂，暂时跳过挂载点检查
+                        // TODO: 实现相对路径的挂载点检查支持
+                        log::debug!("VFS lookup: Relative path mount point checking not implemented, skipping mount point check for path component '{}'", name);
+                        ""
+                    };
+
+                    if !current_path.is_empty() {
+                        let mntns = ProcessManager::current_mntns();
+                        if let Some((_mp, rest_mount, mount_fs)) = mntns.get_mount_point(current_path) {
+                            if rest_mount.is_empty() {
+                                // 精确匹配挂载点，使用挂载的文件系统根节点
+                                log::debug!("VFS lookup: Found exact mount point at '{}', using mounted filesystem", current_path);
+                                return Ok(mount_fs.root_inode());
+                            } else {
+                                // 没有精确匹配的挂载点，返回原始错误
+                                // log::debug!("VFS lookup: Found mount point at '{}' but with remaining path '{}', file '{}' not found", current_path, rest_mount, name);
+                                return Err(SystemError::ENOENT);
+                            }
+                        } else {
+                            // 没有找到挂载点，返回原始错误
+                            log::debug!("VFS lookup: No mount point found for path '{}', file '{}' not found", current_path, name);
+                            return Err(SystemError::ENOENT);
+                        }
+                    } else {
+                        // 相对路径且没有挂载点检查，返回原始错误
+                        log::debug!("VFS lookup: Relative path mount point checking skipped, file '{}' not found", name);
+                        return Err(SystemError::ENOENT);
+                    }
+                }
+            };
+            
             let file_type = inode.metadata()?.file_type;
+
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
             if rest_path.is_empty() && !follow_final_symlink && file_type == FileType::SymLink {
                 // 返回符号链接本身

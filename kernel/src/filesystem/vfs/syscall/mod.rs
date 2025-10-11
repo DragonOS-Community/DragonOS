@@ -33,6 +33,7 @@ mod sys_openat;
 mod sys_pread64;
 mod sys_pselect6;
 mod sys_pwrite64;
+mod sys_pwritev;
 mod sys_read;
 mod sys_readlinkat;
 mod sys_readv;
@@ -46,7 +47,6 @@ mod sys_unlinkat;
 mod sys_utimensat;
 mod sys_write;
 mod sys_writev;
-mod sys_pwritev;
 mod utimensat;
 
 mod epoll_utils;

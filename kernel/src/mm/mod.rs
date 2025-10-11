@@ -32,6 +32,7 @@ pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
 pub mod percpu;
+pub mod shmem;
 pub mod syscall;
 pub mod truncate;
 pub mod ucontext;

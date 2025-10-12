@@ -120,7 +120,7 @@ impl KernFS {
             children: SpinLock::new(HashMap::new()),
             inode_type: KernInodeType::Dir,
             lazy_list: SpinLock::new(HashMap::new()),
-            dynamic_lookup: None,
+            dynamic_lookup: RwLock::new(None),
             is_temporary: false,
         });
 
@@ -148,7 +148,7 @@ pub struct KernFSInode {
     /// lazy list
     lazy_list: SpinLock<HashMap<String, fn() -> KernFSInodeArgs>>,
     /// 动态查找提供者（可选）
-    dynamic_lookup: Option<Arc<dyn DynamicLookup>>,
+    dynamic_lookup: RwLock<Option<Arc<dyn DynamicLookup>>>,
     /// 是否为临时节点（不会被添加到父目录的children中）
     is_temporary: bool,
 }
@@ -286,7 +286,7 @@ impl IndexNode for KernFSInode {
                 }
                 
                 // 尝试动态查找
-                if let Some(provider) = &self.dynamic_lookup {
+                if let Some(provider) = self.dynamic_lookup.read().as_ref() {
                     match provider.dynamic_find(name)? {
                         Some(inode) => return Ok(inode),
                         None => {} // 继续返回 ENOENT
@@ -353,7 +353,7 @@ impl IndexNode for KernFSInode {
         keys.push(String::from(".."));
         
         // 检查是否有动态查找提供者
-        if let Some(provider) = &self.dynamic_lookup {
+        if let Some(provider) = self.dynamic_lookup.read().as_ref() {
             // 添加所有静态子目录（包括非PID目录如cpuinfo, meminfo等）
             for child_name in self.children.lock().keys() {
                 keys.push(child_name.clone());
@@ -540,7 +540,7 @@ impl KernFSInode {
             children: SpinLock::new(HashMap::new()),
             inode_type,
             lazy_list: SpinLock::new(HashMap::new()),
-            dynamic_lookup: None,
+            dynamic_lookup: RwLock::new(None),
             is_temporary,
         });
 
@@ -914,17 +914,12 @@ impl KernFSInode {
 
     /// 设置动态查找提供者
     pub fn set_dynamic_lookup(&self, provider: Arc<dyn DynamicLookup>) {
-        // 使用 unsafe 来修改 dynamic_lookup 字段
-        // 这是安全的，因为我们只在初始化时调用这个方法
-        unsafe {
-            let self_ptr = self as *const Self as *mut Self;
-            (*self_ptr).dynamic_lookup = Some(provider);
-        }
+        *self.dynamic_lookup.write() = Some(provider);
     }
 
     /// 获取动态查找提供者
-    pub fn dynamic_lookup(&self) -> Option<&Arc<dyn DynamicLookup>> {
-        self.dynamic_lookup.as_ref()
+    pub fn dynamic_lookup(&self) -> Option<Arc<dyn DynamicLookup>> {
+        self.dynamic_lookup.read().clone()
     }
 
     /// 扩展的查找方法，支持动态查找
@@ -934,7 +929,7 @@ impl KernFSInode {
             Ok(inode) => return Ok(inode),
             Err(SystemError::ENOENT) => {
                 // 如果静态查找失败且有动态查找提供者，尝试动态查找
-                if let Some(provider) = &self.dynamic_lookup {
+                if let Some(provider) = self.dynamic_lookup.read().as_ref() {
                     match provider.dynamic_find(name)? {
                         Some(inode) => return Ok(inode),
                         None => {} // 继续返回 ENOENT
@@ -951,7 +946,7 @@ impl KernFSInode {
         let mut entries = self.list()?;
         
         // 如果有动态查找提供者，添加动态条目
-        if let Some(provider) = &self.dynamic_lookup {
+        if let Some(provider) = self.dynamic_lookup.read().as_ref() {
             let mut dynamic_entries = provider.dynamic_list()?;
             
             // 去重并合并

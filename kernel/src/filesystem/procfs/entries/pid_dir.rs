@@ -443,22 +443,6 @@ impl IndexNode for ProcFSNsInode {
 
 impl ProcFS {
 
-    #[allow(dead_code)] // 查找或创建 /proc/<pid> 目录（按名称）
-    fn find_process_directory(&self, name: &str) -> Result<Arc<KernFSInode>, SystemError> {
-        // name 是命名空间内的 PID 字符串
-        let _ = name.parse::<usize>().map_err(|_| SystemError::ENOENT)?;
-
-        // 如果目录已存在，直接返回
-        if let Ok(existing_dir) = self.root_inode().find(name) {
-            return Ok(existing_dir.downcast_arc::<KernFSInode>().ok_or(SystemError::EINVAL)?);
-        }
-
-        // 无法从字符串安全构造 RawPid（构造器私有），这里不尝试反查 PCB。
-        // 由上层在拿到真实 ProcessId 后调用 create_single_process_directory。
-        Err(SystemError::ENOENT)
-    }
-
-
     /// 创建临时的进程目录，不挂载到父目录的children中
     /// 这是纯动态模式的核心方法，所有PID目录都通过此方法临时创建
     /// 返回包装后的PID目录inode，提供正确的list实现
@@ -482,9 +466,6 @@ impl ProcFS {
         //               pid.data(), ns_pid.data(), ns.level());
 
         // 3) 创建临时进程目录，使用 KernFS 的临时节点创建功能
-        use crate::filesystem::kernfs::callback::KernInodePrivateData;
-        use crate::filesystem::vfs::syscall::ModeType;
-        
         let process_dir = self.root_inode().create_temporary_dir(
             ns_pid_name,
             ModeType::S_IFDIR | ModeType::from_bits_truncate(0o555),

@@ -140,9 +140,6 @@ impl DynamicLookup for ProcFSDynamicPidLookup {
 
         // 排序保证稳定输出
         ns_pids.sort_by_key(|raw| raw.data());
-
-        // 获取 ProcFS 实例来清理已退出进程的目录
-        let _procfs_weak = &self.procfs;
         
         for raw in ns_pids {
             // 仅列出仍存在且未退出的条目

@@ -284,7 +284,7 @@ pub struct UserSigaction {
  */
 #[derive(Copy, Clone, Debug)]
 pub struct SigInfo {
-    pub sig_no: i32,
+    sig_no: i32,
     sig_code: SigCode,
     errno: i32,
     sig_type: SigType,

@@ -13,20 +13,14 @@ use alloc::{
 use hashbrown::HashMap;
 use crate::process::RawPid;
 use core::{
-    any::Any,
     fmt,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use system_error::SystemError;
 
-use crate::{
-    filesystem::{
-        vfs::{FileSystem, FsInfo, IndexNode},
-    },
-    libs::{
-        rwlock::{RwLock, RwLockReadGuard},
-        spinlock::SpinLock,
-    },
+use crate::libs::{
+    rwlock::{RwLock, RwLockReadGuard},
+    spinlock::SpinLock,
 };
 
 // Re-export important types
@@ -911,39 +905,6 @@ pub fn current_task_cgroup(subsys_id: CgroupSubsysId) -> Option<Arc<Cgroup>> {
     manager.task_cgroup(current_pid, subsys_id)
 }
 
-/// Cgroup filesystem interface
-#[derive(Debug)]
-pub struct CgroupFs {
-    root: Arc<CgroupRoot>,
-}
-
-impl CgroupFs {
-    pub fn new(root: Arc<CgroupRoot>) -> Self {
-        Self { root }
-    }
-}
-
-impl FileSystem for CgroupFs {
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "cgroup2"
-    }
-
-    fn super_block(&self) -> crate::filesystem::vfs::SuperBlock {
-        todo!("Implement cgroup filesystem super block")
-    }
-
-    fn root_inode(&self) -> Arc<dyn IndexNode> {
-        todo!("Implement cgroup filesystem root inode")
-    }
-
-    fn info(&self) -> FsInfo {
-        todo!("Implement cgroup filesystem info")
-    }
-}
 
 #[cfg(test)]
 mod tests {

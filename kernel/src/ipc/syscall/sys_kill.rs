@@ -70,9 +70,13 @@ impl Syscall for SysKillHandle {
         let sig_c_int = Self::sig(args);
 
         let converter = PidConverter::from_id(id).ok_or(SystemError::ESRCH)?;
+
         let sig = Signal::from(sig_c_int);
         if sig == Signal::INVALID {
-            warn!("Not a valid signal number");
+            warn!(
+                "Failed to convert signal number {} to Signal enum",
+                sig_c_int
+            );
             return Err(SystemError::EINVAL);
         }
 

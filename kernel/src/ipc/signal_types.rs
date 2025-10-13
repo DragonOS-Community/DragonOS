@@ -10,7 +10,7 @@ use crate::{
         ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
-    process::RawPid,
+    process::{ProcessManager, RawPid},
     syscall::user_access::UserBufferWriter,
 };
 
@@ -279,16 +279,120 @@ pub struct UserSigaction {
 }
 
 /**
- * siginfo中，根据signal的来源不同，该info中对应了不同的数据./=
- * 请注意，该info最大占用16字节
+ * 内核内部使用的SigInfo结构体，不直接暴露给用户态
+ * 用于内核内部的信号信息存储和处理
  */
-#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct SigInfo {
     sig_no: i32,
     sig_code: SigCode,
     errno: i32,
     sig_type: SigType,
+}
+
+/**
+ * 标准POSIX siginfo_t结构体，用于用户态接口
+ * 完全兼容Linux标准，大小为128字节
+ */
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PosixSigInfo {
+    pub si_signo: i32,
+    pub si_code: i32,
+    pub si_errno: i32,
+    pub _sifields: PosixSiginfoFields,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union PosixSiginfoFields {
+    pub _kill: PosixSiginfoKill,
+    pub _timer: PosixSiginfoTimer,
+    pub _rt: PosixSiginfoRt,
+    pub _sigchld: PosixSiginfoSigchld,
+    pub _sigfault: PosixSiginfoSigfault,
+    pub _sigpoll: PosixSiginfoSigpoll,
+    pub _sigsys: PosixSiginfoSigsys,
+    // 填充到128字节
+    _pad: [u8; 128 - 16],
+}
+
+impl core::fmt::Debug for PosixSiginfoFields {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // 由于是联合体，我们只显示_kill字段作为默认表示
+        f.debug_struct("PosixSiginfoFields")
+            .field("_kill", unsafe { &self._kill })
+            .finish()
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PosixSiginfoKill {
+    pub si_pid: i32,
+    pub si_uid: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PosixSiginfoTimer {
+    pub si_tid: i32,
+    pub si_overrun: i32,
+    pub si_sigval: PosixSigval,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PosixSiginfoRt {
+    pub si_pid: i32,
+    pub si_uid: u32,
+    pub si_sigval: PosixSigval,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PosixSiginfoSigchld {
+    pub si_pid: i32,
+    pub si_uid: u32,
+    pub si_status: i32,
+    pub si_utime: i64,
+    pub si_stime: i64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PosixSiginfoSigfault {
+    pub si_addr: u64,
+    pub si_addr_lsb: u16,
+    pub si_band: i32,
+    pub si_fd: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PosixSiginfoSigpoll {
+    pub si_band: i64,
+    pub si_fd: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PosixSiginfoSigsys {
+    pub _call_addr: u64,
+    pub _syscall: i32,
+    pub _arch: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PosixSigval {
+    pub sival_int: i32,
+    pub sival_ptr: u64,
+}
+
+/// 获取当前进程的UID
+fn get_current_uid() -> u32 {
+    ProcessManager::current_pcb().cred().uid.data() as u32
 }
 
 impl SigInfo {
@@ -299,24 +403,59 @@ impl SigInfo {
     pub fn set_sig_type(&mut self, sig_type: SigType) {
         self.sig_type = sig_type;
     }
-    /// @brief 将siginfo结构体拷贝到用户栈
+
+    /// 将内核SigInfo转换为标准PosixSigInfo
+    #[inline(never)]
+    pub fn convert_to_posix_siginfo(&self) -> PosixSigInfo {
+        match self.sig_type {
+            SigType::Kill(pid) => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_code: self.sig_code as i32,
+                si_errno: self.errno,
+                _sifields: PosixSiginfoFields {
+                    _kill: PosixSiginfoKill {
+                        si_pid: pid.data() as i32,
+                        si_uid: get_current_uid(),
+                    },
+                },
+            },
+            SigType::Alarm(pid) => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_code: self.sig_code as i32,
+                si_errno: self.errno,
+                _sifields: PosixSiginfoFields {
+                    _timer: PosixSiginfoTimer {
+                        si_tid: pid.data() as i32,
+                        si_overrun: 0,
+                        si_sigval: PosixSigval {
+                            sival_int: 0,
+                            sival_ptr: 0,
+                        },
+                    },
+                },
+            },
+        }
+    }
+
+    /// @brief 将PosixSigInfo结构体拷贝到用户栈
     /// ## 参数
     ///
     /// `to` 用户空间指针
     ///
     /// ## 注意
     ///
+    /// 该函数将内核SigInfo转换为标准PosixSigInfo后拷贝到用户态
+    ///
     /// 该函数对应Linux中的https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#3323
-    /// Linux还提供了 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#3383 用来实现
-    /// kernel_siginfo 保存到 用户的 compact_siginfo 的功能，但是我们系统内还暂时没有对这两种
-    /// siginfo做区分，因此暂时不需要第二个函数
-    pub fn copy_siginfo_to_user(&self, to: *mut SigInfo) -> Result<i32, SystemError> {
+    #[inline(never)]
+    pub fn copy_posix_siginfo_to_user(&self, to: *mut PosixSigInfo) -> Result<i32, SystemError> {
         // 验证目标地址是否为用户空间
-        let mut user_buffer = UserBufferWriter::new(to, size_of::<SigInfo>(), true)?;
+        let posix_siginfo = self.convert_to_posix_siginfo();
+        let mut user_buffer = UserBufferWriter::new(to, size_of::<PosixSigInfo>(), true)?;
 
         let retval: Result<i32, SystemError> = Ok(0);
 
-        user_buffer.copy_one_to_user(self, 0)?;
+        user_buffer.copy_one_to_user(&posix_siginfo, 0)?;
         return retval;
     }
 }
@@ -421,7 +560,6 @@ impl SigPending {
     /// @brief 从当前进程的sigpending中取出下一个待处理的signal，并返回给调用者。（调用者应当处理这个信号）
     /// 请注意，进入本函数前，当前进程应当持有current_pcb().sighand.siglock
     pub fn dequeue_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
-        // debug!("dequeue signal");
         // 获取下一个要处理的信号的编号
         let sig = self.next_signal(sig_mask);
 

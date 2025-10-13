@@ -399,10 +399,6 @@ impl Syscall {
                 Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
 
-            SYS_RT_SIGTIMEDWAIT => {
-                log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
-                Ok(0)
-            }
             _ => {
                 log::error!(
                     "Unsupported syscall ID: {} -> {}, args: {:?}",

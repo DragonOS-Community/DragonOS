@@ -1,4 +1,7 @@
-use core::{fmt::Debug, sync::atomic::compiler_fence};
+use core::{
+    fmt::Debug,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use alloc::sync::Arc;
 use log::warn;
@@ -129,7 +132,8 @@ impl Signal {
             //详见 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226
         }
 
-        if !self.prepare_sianal(pcb.clone(), force_send) {
+        let prepare_result = self.prepare_sianal(pcb.clone(), force_send);
+        if !prepare_result {
             return Ok(0);
         }
         // debug!("force send={}", force_send);
@@ -187,8 +191,6 @@ impl Signal {
     /// @param pt siginfo结构体中，pid字段代表的含义
     #[allow(clippy::if_same_then_else)]
     fn complete_signal(&self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
-        // debug!("complete_signal");
-
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // ===== 寻找需要wakeup的目标进程 =====
         // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。
@@ -198,19 +200,20 @@ impl Signal {
 
         let target_pcb: Option<Arc<ProcessControlBlock>>;
 
-        // 判断目标进程是否想接收这个信号
-        if self.wants_signal(pcb.clone()) {
-            // todo: 将信号产生的消息通知到正在监听这个信号的进程（引入signalfd之后，在这里调用signalfd_notify)
-            // 将这个信号加到目标进程的sig_pending中
-            pcb.sig_info_mut()
-                .sig_pending_mut()
-                .signal_mut()
-                .insert((*self).into());
+        // 无论目标进程当前是否屏蔽该信号，均应当将其标记为 pending
+        pcb.sig_info_mut()
+            .sig_pending_mut()
+            .signal_mut()
+            .insert((*self).into());
+        // 根据实际 pending/blocked 关系更新 HAS_PENDING_SIGNAL，避免长时间误置位
+        pcb.recalc_sigpending(None);
+        // 判断目标进程是否应该被唤醒以立即处理该信号
+        let wants_signal = self.wants_signal(pcb.clone());
+        if wants_signal {
             target_pcb = Some(pcb.clone());
         } else if pt == PidType::PID {
             /*
-             * There is just one thread and it does not need to be woken.
-             * It will dequeue unblocked signals before it runs again.
+             * 单线程场景且不需要唤醒：信号已入队，等待合适时机被取走
              */
             return;
         } else {
@@ -235,32 +238,42 @@ impl Signal {
     /// 这么做是为了防止我们把信号发送给了一个正在或已经退出的进程，或者是不响应该信号的进程。
     #[inline]
     fn wants_signal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
-        // 如果改进程屏蔽了这个signal，则不能接收
-        if pcb
-            .sig_info_irqsave()
-            .sig_blocked()
-            .contains((*self).into())
-        {
-            return false;
-        }
-
-        // 如果进程正在退出，则不能接收信号
+        // 若进程正在退出，则不能接收
         if pcb.flags().contains(ProcessFlags::EXITING) {
             return false;
         }
 
+        // SIGKILL 总是唤醒
         if *self == Signal::SIGKILL {
             return true;
         }
+
+        // 若线程正处于可中断阻塞，且当前在 set_user_sigmask 语义下（如 rt_sigtimedwait/pselect 等）
+        // 则无论该信号是否在常规 blocked 集内，都应唤醒，由具体系统调用在返回路径上判定。
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if state.is_blocked() && (!state.is_blocked_interruptable()) {
+        let is_blocked_interruptable = state.is_blocked_interruptable();
+        let has_restore_sig_mask = pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK);
+
+        if is_blocked_interruptable && has_restore_sig_mask {
+            return true;
+        }
+
+        // 常规规则：被屏蔽则不唤醒；否则在可中断阻塞下唤醒
+        let blocked = *pcb.sig_info_irqsave().sig_blocked();
+        let is_blocked = blocked.contains((*self).into());
+
+        if is_blocked {
             return false;
         }
 
-        // todo: 检查目标进程是否正在一个cpu上执行，如果是，则返回true，否则继续检查下一项
+        let is_blocked_non_interruptable =
+            state.is_blocked() && (!state.is_blocked_interruptable());
 
-        // 检查目标进程是否有信号正在等待处理，如果是，则返回false，否则返回true
-        return pcb.sig_info_irqsave().sig_pending().signal().bits() == 0;
+        if is_blocked_non_interruptable {
+            return false;
+        }
+
+        return true;
     }
 
     /// @brief 判断signal的处理是否可能使得整个进程组退出
@@ -334,7 +347,6 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // debug!("signal_wake_up");
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
     let state = pcb.sched_info().inner_lock_read_irqsave().state();
-    pcb.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
     let mut wakeup_ok = true;
     if state.is_blocked_interruptable() {
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
@@ -421,6 +433,7 @@ pub fn restore_saved_sigmask() {
             .saved_sigmask();
         __set_current_blocked(&saved);
     }
+    compiler_fence(Ordering::SeqCst);
 }
 
 pub fn restore_saved_sigmask_unless(interrupted: bool) {

@@ -148,7 +148,8 @@ fn default_sighandlers() -> Vec<Sigaction> {
     let mut r = vec![Sigaction::default(); MAX_SIG_NUM];
     let mut sig_ign = Sigaction::default();
     // 收到忽略的信号，重启系统调用
-    // todo: 看看linux哪些
+    // Linux 对 SIGCHLD/SIGURG/SIGWINCH 默认忽略；这里显式设置 Ignore
+    sig_ign.set_action(SigactionType::SaHandler(SaHandlerType::Ignore));
     sig_ign.flags_mut().insert(SigFlags::SA_RESTART);
 
     r[Signal::SIGCHLD as usize - 1] = sig_ign;

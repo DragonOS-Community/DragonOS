@@ -1266,11 +1266,11 @@ impl ProcessControlBlock {
                 let mut init_childen_guard = init_pcb.children.write();
 
                 childen_guard.iter().for_each(|pid| {
-                    log::debug!(
-                        "adopt_childen: pid {} is adopted by init pid {}",
-                        pid,
-                        init_pcb.raw_pid()
-                    );
+                    // log::debug!(
+                    //     "adopt_childen: pid {} is adopted by init pid {}",
+                    //     pid,
+                    //     init_pcb.raw_pid()
+                    // );
                     init_childen_guard.push(*pid);
                 });
 

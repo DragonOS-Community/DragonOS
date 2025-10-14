@@ -13,6 +13,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use defer::defer;
 use hashbrown::HashSet;
 use ida::IdAllocator;
 use system_error::SystemError;
@@ -620,6 +621,10 @@ impl InnerAddressSpace {
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
     ) -> Result<(), SystemError> {
+        defer!({
+            compiler_fence(Ordering::SeqCst);
+        });
+
         let to_unmap = VirtRegion::new(start_page.virt_address(), page_count.bytes());
         let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
 

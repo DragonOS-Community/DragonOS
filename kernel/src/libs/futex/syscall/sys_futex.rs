@@ -1,3 +1,5 @@
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use system_error::SystemError;
 
 use crate::libs::futex::{constant::*, futex::Futex};
@@ -149,6 +151,10 @@ pub(super) fn do_futex(
     val2: u32,
     val3: u32,
 ) -> Result<usize, SystemError> {
+    defer::defer!({
+        compiler_fence(Ordering::SeqCst);
+    });
+
     verify_area(uaddr, core::mem::size_of::<u32>())?;
     let cmd = FutexArg::from_bits(operation.bits() & FutexFlag::FUTEX_CMD_MASK.bits())
         .ok_or(SystemError::ENOSYS)?;

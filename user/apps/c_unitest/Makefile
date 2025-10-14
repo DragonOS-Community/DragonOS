@@ -6,7 +6,7 @@ else ifeq ($(ARCH), riscv64)
 endif
 
 CC=$(CROSS_COMPILE)gcc
-CFLAGS := -Wall -O2 -static
+CFLAGS := -Wall -O2 -static -lpthread
 
 SRCS := $(wildcard *.c)
 BINS := $(SRCS:.c=)

@@ -9,22 +9,20 @@ use crate::{
         },
         class::Class,
         device::{
-            bus::{bus_manager, Bus},
+            bus:: Bus,
             device_number::{DeviceNumber, Major},
-            device_register,
+            device_register,device_unregister,
             driver::{Driver, DriverCommonData},
-            DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
+            DevName, Device, DeviceCommonData,DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
-        subsys::SubSysPrivate,
     },
     filesystem::{
-        devfs::{self, devfs_register, DevFS, DeviceINode},
+        devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
         vfs::{IndexNode, InodeId, Metadata},
     },
-    init::initcall::INITCALL_POSTCORE,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -43,31 +41,31 @@ use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 const LOOP_BASENAME: &str = "loop";
-// loop device 加密类型
-pub const LO_CRYPT_NONE: u32 = 0;
-pub const LO_CRYPT_XOR: u32 = 1;
-pub const LO_CRYPT_DES: u32 = 2;
-pub const LO_CRYPT_FISH2: u32 = 3; // Twofish encryption
-pub const LO_CRYPT_BLOW: u32 = 4;
-pub const LO_CRYPT_CAST128: u32 = 5;
-pub const LO_CRYPT_IDEA: u32 = 6;
-pub const LO_CRYPT_DUMMY: u32 = 9;
-pub const LO_CRYPT_SKIPJACK: u32 = 10;
-pub const LO_CRYPT_CRYPTOAPI: u32 = 18;
-pub const MAX_LO_CRYPT: u32 = 20;
+// // loop device 加密类型
+// pub const LO_CRYPT_NONE: u32 = 0;
+// pub const LO_CRYPT_XOR: u32 = 1;
+// pub const LO_CRYPT_DES: u32 = 2;
+// pub const LO_CRYPT_FISH2: u32 = 3; // Twofish encryption
+// pub const LO_CRYPT_BLOW: u32 = 4;
+// pub const LO_CRYPT_CAST128: u32 = 5;
+// pub const LO_CRYPT_IDEA: u32 = 6;
+// pub const LO_CRYPT_DUMMY: u32 = 9;
+// pub const LO_CRYPT_SKIPJACK: u32 = 10;
+// pub const LO_CRYPT_CRYPTOAPI: u32 = 18;
+// pub const MAX_LO_CRYPT: u32 = 20;
 
-// IOCTL 命令 - 使用 0x4C ('L')
-pub const LOOP_SET_FD: u32 = 0x4C00;
-pub const LOOP_CLR_FD: u32 = 0x4C01;
-pub const LOOP_SET_STATUS: u32 = 0x4C02;
-pub const LOOP_GET_STATUS: u32 = 0x4C03;
-pub const LOOP_SET_STATUS64: u32 = 0x4C04;
-pub const LOOP_GET_STATUS64: u32 = 0x4C05;
-pub const LOOP_CHANGE_FD: u32 = 0x4C06;
-pub const LOOP_SET_CAPACITY: u32 = 0x4C07;
-pub const LOOP_SET_DIRECT_IO: u32 = 0x4C08;
-pub const LOOP_SET_BLOCK_SIZE: u32 = 0x4C09;
-pub const LOOP_CONFIGURE: u32 = 0x4C0A;
+// // IOCTL 命令 - 使用 0x4C ('L')
+// pub const LOOP_SET_FD: u32 = 0x4C00;
+// pub const LOOP_CLR_FD: u32 = 0x4C01;
+// pub const LOOP_SET_STATUS: u32 = 0x4C02;
+// pub const LOOP_GET_STATUS: u32 = 0x4C03;
+// pub const LOOP_SET_STATUS64: u32 = 0x4C04;
+// pub const LOOP_GET_STATUS64: u32 = 0x4C05;
+// pub const LOOP_CHANGE_FD: u32 = 0x4C06;
+// pub const LOOP_SET_CAPACITY: u32 = 0x4C07;
+// pub const LOOP_SET_DIRECT_IO: u32 = 0x4C08;
+// pub const LOOP_SET_BLOCK_SIZE: u32 = 0x4C09;
+// pub const LOOP_CONFIGURE: u32 = 0x4C0A;
 
 // /dev/loop-control 接口
 pub const LOOP_CTL_ADD: u32 = 0x4C80;
@@ -573,15 +571,6 @@ impl LoopDeviceDriver {
         }
         Ok(())
     }
-
-    // pub fn new_loop_ctrl_device(&self)-> Result<(), SystemError>{
-    //     // 创建并注册 /dev/loop-control
-    //     let control_dev = Arc::new(LoopControlDevice::new()); // 假设的构造函数
-    //     block_dev_manager().register(control_dev.clone())?;
-    //     devfs::devfs_register("loop-control", control_dev.clone())?;
-    //     log::info!("LoopDeviceDriver and all devices initialized.");
-    //     Ok(())
-    // }
 }
 //初始化函数，注册1个loopcontrol设备和8个loop设备备用
 use crate::init::initcall::INITCALL_DEVICE;
@@ -801,7 +790,35 @@ impl LoopManager {
         Err(SystemError::ENOSPC)
     }
     pub fn deallocate_device(&self, device: &Arc<LoopDevice>) -> Result<(), SystemError> {
-        todo!()
+        /*
+        重置状态unbound
+         */
+        let  mut inner_guard =device.inner();
+        inner_guard.set_state(LoopState::Unbound)?;
+        inner_guard.file_inode=None;
+        inner_guard.file_size-0;
+        inner_guard.offset=0;
+            inner_guard.size_limit = 0;
+    inner_guard.read_only = false;
+    inner_guard.user_direct_io = false;
+    inner_guard.flags = 0;
+    inner_guard.file_name = 0;
+    drop(inner_guard);
+    let minor = device.inner().device_number.minor() as usize; 
+    let mut loop_mgr_inner = self.inner(); // Lock the LoopManager
+    if minor < LoopManager::MAX_DEVICES {
+        if let Some(removed_device) = loop_mgr_inner.devices[minor].take() {
+            log::info!("Deallocated loop device loop{} from manager.", minor);
+            // Unregister from block device manager
+            device_unregister(removed_device.clone());
+        } else {
+            log::warn!("Attempted to deallocate loop device loop{} but it was not found in manager.", minor);
+        }
+    } else {
+        return Err(SystemError::EINVAL); // Minor out of bounds
+    }
+
+    Ok(()) // Indicate success
     }
     pub fn loop_init(&self, driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {
         // 注册 loop 设备

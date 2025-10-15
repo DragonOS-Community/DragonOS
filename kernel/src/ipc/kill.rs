@@ -1,8 +1,10 @@
-use crate::arch::ipc::signal::{OriginCode, SigCode, Signal};
 use crate::ipc::signal_types::{SigInfo, SigType};
 use crate::process::pid::{Pid, PidType};
 use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
-use crate::{arch::ipc::signal::Signal, ipc::signal_types::SigCode};
+use crate::{
+    arch::ipc::signal::Signal,
+    ipc::signal_types::{OriginCode, SigCode},
+};
 use alloc::sync::Arc;
 use core::sync::atomic::compiler_fence;
 use system_error::SystemError;

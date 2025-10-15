@@ -1,5 +1,5 @@
 use crate::{
-    arch::ipc::signal::{OriginCode, SigCode, Signal},
+    arch::ipc::signal::Signal,
     filesystem::{
         epoll::{
             event_poll::{EventPoll, LockedEPItemLinkedList},
@@ -10,7 +10,7 @@ use crate::{
             FileSystem, FileType, IndexNode, Metadata, PollableInode,
         },
     },
-    ipc::signal_types::SigCode,
+    ipc::signal_types::{OriginCode, SigCode},
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,

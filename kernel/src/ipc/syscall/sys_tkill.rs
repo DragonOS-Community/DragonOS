@@ -8,7 +8,7 @@ use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
     arch::{ipc::signal::Signal, syscall::nr::SYS_TKILL},
-    ipc::signal_types::SigCode,
+    ipc::signal_types::{OriginCode, SigCode},
     process::{ProcessControlBlock, ProcessManager, RawPid},
 };
 use system_error::SystemError;
@@ -169,7 +169,7 @@ fn send_signal_to_thread(
     let mut info = SigInfo::new(
         sig,
         0,
-        SigCode::Tkill, // 使用SI_TKILL语义
+        SigCode::Origin(OriginCode::Tkill), // 使用SI_TKILL语义
         SigType::Kill(current_tgid),
     );
 

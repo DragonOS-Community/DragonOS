@@ -2,9 +2,9 @@ use super::super::signal_types::{SigInfo, SigType};
 use crate::arch::interrupt::TrapFrame;
 use crate::{
     alloc::vec::Vec,
-    arch::ipc::signal::{OriginCode, SigCode, Signal},
+    arch::ipc::signal::Signal,
     arch::syscall::nr::SYS_RESTART_SYSCALL,
-    ipc::signal_types::SigCode,
+    ipc::signal_types::{OriginCode, SigCode},
     process::{ProcessManager, RawPid},
     syscall::table::{FormattedSyscallParam, Syscall},
 };

@@ -7,7 +7,7 @@ use crate::{
     arch::{
         asm::bitops::ffz,
         interrupt::TrapFrame,
-        ipc::signal::{OriginCode, SigCode, SigFlags, SigSet, Signal, MAX_SIG_NUM},
+        ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
     process::{ProcessManager, RawPid},
@@ -19,6 +19,25 @@ use crate::{
 #[derive(Copy, Debug, Clone)]
 #[repr(i32)]
 pub enum SigCode {
+    /// 描述通用来源
+    Origin(OriginCode),
+    /// 描述 SIGCHLD 的具体原因
+    SigChld(ChldCode),
+}
+
+impl From<SigCode> for i32 {
+    fn from(code: SigCode) -> i32 {
+        match code {
+            SigCode::Origin(origin) => origin as i32,
+            SigCode::SigChld(chld) => chld as i32,
+        }
+    }
+}
+
+/// 信号的通用来源码 (SI_*)
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum OriginCode {
     /// sent by kill, sigsend, raise
     User = 0,
     /// sent by kernel from somewhere
@@ -37,20 +56,43 @@ pub enum SigCode {
     Tkill = -6,
 }
 
+/// SIGCHLD 专用原因码 (CLD_*)
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ChldCode {
+    Exited = 1,
+    Killed = 2,
+    Dumped = 3,
+    Trapped = 4,
+    Stopped = 5,
+    Continued = 6,
+}
+
 impl SigCode {
     /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
     #[allow(dead_code)]
-    pub fn from_i32(x: i32) -> SigCode {
-        match x {
-            0 => Self::User,
-            0x80 => Self::Kernel,
-            -1 => Self::Queue,
-            -2 => Self::Timer,
-            -3 => Self::Mesgq,
-            -4 => Self::AsyncIO,
-            -5 => Self::SigIO,
-            -6 => Self::Tkill,
-            _ => panic!("signal code not valid"),
+    pub fn from_i32(signal: Signal, code: i32) -> SigCode {
+        match signal {
+            Signal::SIGCHLD => match code {
+                1 => SigCode::SigChld(ChldCode::Exited),
+                2 => SigCode::SigChld(ChldCode::Killed),
+                3 => SigCode::SigChld(ChldCode::Dumped),
+                4 => SigCode::SigChld(ChldCode::Trapped),
+                5 => SigCode::SigChld(ChldCode::Stopped),
+                6 => SigCode::SigChld(ChldCode::Continued),
+                _ => panic!("signal code not valid in {:?}", signal),
+            },
+            // 对于其他信号，尝试匹配通用码
+            _ => match code {
+                0 => SigCode::Origin(OriginCode::User),
+                0x80 => SigCode::Origin(OriginCode::Kernel),
+                -1 => SigCode::Origin(OriginCode::Queue),
+                -2 => SigCode::Origin(OriginCode::Timer),
+                -3 => SigCode::Origin(OriginCode::Mesgq),
+                -4 => SigCode::Origin(OriginCode::AsyncIO),
+                -5 => SigCode::Origin(OriginCode::SigIO),
+                _ => panic!("signal code not valid in {:?}", signal),
+            },
         }
     }
 }
@@ -415,8 +457,8 @@ impl SigInfo {
         match self.sig_type {
             SigType::Kill(pid) => PosixSigInfo {
                 si_signo: self.sig_no,
+                si_code: i32::from(self.sig_code),
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
                 _sifields: PosixSiginfoFields {
                     _kill: PosixSiginfoKill {
                         si_pid: pid.data() as i32,
@@ -426,8 +468,8 @@ impl SigInfo {
             },
             SigType::Alarm(pid) => PosixSigInfo {
                 si_signo: self.sig_no,
+                si_code: i32::from(self.sig_code),
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
                 _sifields: PosixSiginfoFields {
                     _timer: PosixSiginfoTimer {
                         si_tid: pid.data() as i32,
@@ -439,6 +481,8 @@ impl SigInfo {
                     },
                 },
             },
+            SigType::SigFault(sig_fault_info) => todo!(),
+            SigType::SigChld(sig_chld_info) => todo!(),
         }
     }
 

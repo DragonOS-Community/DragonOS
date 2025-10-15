@@ -1,10 +1,11 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::ipc::signal::{ChldCode, OriginCode, SigCode, SigFlags, Signal};
+use crate::arch::ipc::signal::{SigFlags, Signal};
 use crate::arch::kprobe;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::ipc::signal_types::{
-    SigChldInfo, SigFaultInfo, SigInfo, SigType, Sigaction, SigactionType, SignalFlags,
+    ChldCode, OriginCode, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType, Sigaction,
+    SigactionType, SignalFlags,
 };
 use crate::process::{
     ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, PtraceEvent, PtraceOptions,
@@ -84,16 +85,16 @@ pub fn do_notify_parent(child: &ProcessControlBlock, signal: Signal) -> Result<b
     let mut effective_signal = Some(signal);
     // 检查父进程的信号处理方式以确定是否自动回收
     {
-        let sighand_lock = parent.sig_struct_irqsave();
-        let sa = &sighand_lock.handlers[Signal::SIGCHLD as usize - 1];
+        let sighand_lock = parent.sighand();
+        let sa = sighand_lock.handler(Signal::SIGCHLD);
         // 这里简化了 !ptrace 的检查
         if signal == Signal::SIGCHLD {
-            if sa.action().is_ignore() {
+            if sa.map(|s| s.action().is_ignore()).unwrap_or(true) {
                 // 父进程忽略 SIGCHLD，子进程应被自动回收
                 autoreap = true;
                 // 并且不发送信号
                 effective_signal = None;
-            } else if sa.flags().contains(SigFlags::SA_NOCLDWAIT) {
+            } else if sa.map(|s| s.flags().contains(SigFlags::SA_NOCLDWAIT)).unwrap_or(true) {
                 // 父进程不等待子进程，子进程应被自动回收
                 autoreap = true;
                 // 但根据POSIX，信号仍然可以发送
@@ -257,7 +258,7 @@ impl ProcessControlBlock {
             return Err(SystemError::EINVAL);
         }
         // 获取信号处理锁
-        let sighand_lock = current_pcb.sig_struct_irqsave();
+        let sighand_lock = current_pcb.sighand();
         let result = Self::ptrace_do_notify(Signal::SIGTRAP, exit_code, None);
         drop(sighand_lock);
         result
@@ -336,13 +337,13 @@ impl ProcessControlBlock {
                 self.preempt_count()
             );
         }
-        // 先释放 sighand_lock 锁，再获取锁
-        // 不会写，先手动维护一下 preempt
-        unsafe { self.sig_struct.force_unlock() };
-        self.preempt_count.fetch_sub(1, Ordering::SeqCst);
-        schedule(SchedMode::SM_NONE);
-        self.preempt_count.fetch_add(1, Ordering::SeqCst);
-        let sighand_lock = self.sig_struct_irqsave();
+        // // 先释放 sighand_lock 锁，再获取锁
+        // // 不会写，先手动维护一下 preempt
+        // unsafe { self.sig_struct.force_unlock() };
+        // self.preempt_count.fetch_sub(1, Ordering::SeqCst);
+        // schedule(SchedMode::SM_NONE);
+        // self.preempt_count.fetch_add(1, Ordering::SeqCst);
+        // let sighand_lock = self.sig_struct_irqsave();
         // 为下次stop恢复
         // self.last_siginfo = None;
         self.ptrace_state.lock().event_message = 0;
@@ -369,9 +370,14 @@ impl ProcessControlBlock {
             }),
         );
         let should_send = {
-            let tracer_sighand = tracer.sig_struct_irqsave();
-            let sa = &tracer_sighand.handlers[Signal::SIGCHLD as usize - 1];
-            !sa.action().is_ignore() && !sa.flags().contains(SigFlags::SA_NOCLDSTOP)
+            let tracer_sighand = tracer.sighand();
+            let sa = tracer_sighand.handler(Signal::SIGCHLD);
+            if let Some(sa) = sa {
+                !sa.action().is_ignore() && !sa.flags().contains(SigFlags::SA_NOCLDSTOP)
+            } else {
+                // 当 sa 为 None 时，使用默认行为忽略
+                false
+            }
         };
         if should_send {
             Signal::SIGCHLD.send_signal_info_to_pcb(Some(&mut info), Arc::clone(tracer));
@@ -435,7 +441,7 @@ impl ProcessControlBlock {
             // todo *cred = self.original_cred().clone();
         }
         // 获取信号锁保护信号相关操作
-        let sighand_lock = self.sig_struct_irqsave();
+        let sighand_lock = self.sighand();
         self.clear_tracer();
         self.flags()
             .remove(ProcessFlags::PTRACED | ProcessFlags::TRACE_SYSCALL);
@@ -500,7 +506,7 @@ impl ProcessControlBlock {
             return Err(e);
         }
         // {
-        //     let guard = tracer.sig_struct_irqsave();
+        //     let guard = tracer.sighand();
         //     signal_wake_up(self.self_ref.upgrade().unwrap(), guard, false);
         // }
         // todo proc_ptrace_connector(self, PTRACE_ATTACH);
@@ -527,10 +533,14 @@ impl ProcessControlBlock {
                 log::debug!("do_notify_parent, sig={:?}", signal.unwrap());
                 dead = do_notify_parent(self, signal.unwrap())?;
                 return Ok(0);
-            } else if self.sig_struct_irqsave().handlers[Signal::SIGCHLD as usize - 1]
+            } else if self
+                .sighand()
+                .handler(Signal::SIGCHLD)
+                .unwrap_or_default()
                 .action()
                 .is_ignore()
             {
+                // todo unwrap?
                 self.wake_up_parent(None);
                 dead = true;
             }

@@ -20,7 +20,6 @@ mod sys_groups;
 mod sys_pidfdopen;
 mod sys_prctl;
 pub mod sys_prlimit64;
-mod sys_prlimit64;
 mod sys_ptrace;
 mod sys_set_tid_address;
 mod sys_setdomainname;

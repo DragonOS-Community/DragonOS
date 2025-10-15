@@ -8,8 +8,8 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::{OriginCode, SigCode, SigFlags, SigSet, Signal},
-    ipc::signal_types::SigactionType,
+    arch::ipc::signal::{SigFlags, SigSet, Signal},
+    ipc::signal_types::{OriginCode, SigCode, SigactionType},
     mm::VirtAddr,
     process::{
         pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
@@ -195,9 +195,6 @@ impl Signal {
         // ===== 寻找需要wakeup的目标进程 =====
         // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。
         //      todo: 当引入进程组的概念后，需要完善这里，使得它能寻找一个目标进程来唤醒，接着执行信号处理的操作。
-
-        // let _signal = pcb.sig_struct();
-
         let target_pcb: Option<Arc<ProcessControlBlock>>;
 
         // 无论目标进程当前是否屏蔽该信号，均应当将其标记为 pending

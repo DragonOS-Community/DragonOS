@@ -176,6 +176,6 @@ impl KernelLogger {
 
 pub fn early_init_logging() {
     log::set_logger(&KernelLogger).unwrap();
-    log::set_max_level(log::LevelFilter::Debug);
+    // log::set_max_level(log::LevelFilter::Debug);
     info!("Logging initialized");
 }

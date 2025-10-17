@@ -17,7 +17,7 @@ use crate::{
     },
     ipc::pipe::PipeFsPrivateData,
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    process::{cred::Cred, ProcessManager},
+    process::{cred::Cred, Pid, ProcessControlBlock, ProcessManager},
 };
 
 /// 文件私有信息的枚举类型
@@ -129,6 +129,8 @@ pub struct File {
     pub private_data: SpinLock<FilePrivateData>,
     /// 文件的凭证
     cred: Cred,
+    /// owner
+    pid: SpinLock<Option<Arc<ProcessControlBlock>>>,
 }
 
 impl File {
@@ -156,6 +158,7 @@ impl File {
             readdir_subdirs_name: SpinLock::new(Vec::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
+            pid: SpinLock::new(None),
         };
 
         return Ok(f);
@@ -409,6 +412,7 @@ impl File {
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
             private_data: SpinLock::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
+            pid: SpinLock::new(None),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         if self
@@ -497,6 +501,22 @@ impl File {
     pub fn poll(&self) -> Result<usize, SystemError> {
         let private_data = self.private_data.lock();
         self.inode.as_pollable_inode()?.poll(&private_data)
+    }
+
+    pub fn owner(&self) -> Option<Pid> {
+        self.pid.lock().as_ref().map(|pcb| pcb.pid())
+    }
+
+    pub fn set_owner(&self, pid: Option<Arc<ProcessControlBlock>>) -> Result<(), SystemError> {
+        let Some(pcb) = pid else {
+            *self.pid.lock() = None;
+            return Ok(());
+        };
+
+        self.pid.lock().replace(pcb);
+        // todo: update inode owner
+        log::error!("set_owner has not been implemented yet");
+        Ok(())
     }
 }
 

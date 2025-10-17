@@ -384,6 +384,15 @@ impl IndexNode for SocketInode {
         self
     }
 
+    fn ioctl(
+        &self,
+        _cmd: u32,
+        _data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        self.0.lock_irqsave().ioctl(_cmd as usize, _data, 0, 0)
+    }
+
     fn list(&self) -> Result<Vec<String>, SystemError> {
         return Err(SystemError::ENOTDIR);
     }

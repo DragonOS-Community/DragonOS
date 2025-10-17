@@ -58,6 +58,17 @@ impl Socket for StreamSocket {
         self.handle
     }
 
+    fn ioctl(
+        &self,
+        _cmd: usize,
+        _arg0: usize,
+        _arg1: usize,
+        _arg2: usize,
+    ) -> Result<usize, SystemError> {
+        log::error!("Stream Socket not support ioctl");
+        return Ok(0);
+    }
+
     fn close(&mut self) {}
 
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {

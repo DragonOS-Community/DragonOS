@@ -432,7 +432,8 @@ impl Socket for UdpSocket {
         _arg1: usize,
         _arg2: usize,
     ) -> Result<usize, SystemError> {
-        todo!()
+        log::error!("Raw Socket not support ioctl");
+        return Ok(0);
     }
 
     fn metadata(&self) -> SocketMetadata {
@@ -999,6 +1000,17 @@ impl Socket for TcpSocket {
         // debug!("tcp socket:socket_handle, socket'len={}",self.handle.len());
 
         *self.handles.first().unwrap()
+    }
+
+    fn ioctl(
+        &self,
+        _cmd: usize,
+        _arg0: usize,
+        _arg1: usize,
+        _arg2: usize,
+    ) -> Result<usize, SystemError> {
+        log::error!("Tcp Socket not support ioctl");
+        return Ok(0);
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

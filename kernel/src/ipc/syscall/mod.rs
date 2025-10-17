@@ -8,6 +8,6 @@ mod sys_shmdt;
 mod sys_shmget;
 mod sys_sigaction;
 mod sys_sigpending;
-
+mod sys_rtsigsuspend;
 #[cfg(target_arch = "x86_64")]
 pub mod sys_pipe;

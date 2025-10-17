@@ -81,23 +81,23 @@ impl Syscall {
         use crate::debug::panic::kernel_catch_unwind;
         let binding = ProcessManager::current_pcb();
         // todo: remove it
-        if binding.basic().name().contains("dropbear") {
+        if binding.basic().name().contains("dropbear") || binding.basic().name().contains("nginx") {
             // 如果是dropbear进程，打印系统调用号和参数
-            print!(
-                "[{}] Syscall {}({}) called with args: {:x?}",
-                binding.basic().ppid(),
-                syscall_num,
-                syscall_number_to_str(syscall_num),
-                args
-            );
-            DFLAG.store(true, Ordering::Relaxed);
+            // print!(
+            //     "[{}] Syscall {}({}) called with args: {:x?}",
+            //     binding.basic().ppid(),
+            //     syscall_num,
+            //     syscall_number_to_str(syscall_num),
+            //     args
+            // );
+            // DFLAG.store(true, Ordering::Relaxed);
         }
 
         let res = kernel_catch_unwind(|| Self::handle(syscall_num, args, frame))?;
         let binding = ProcessManager::current_pcb();
         // todo: remove it
-        if binding.basic().name().contains("dropbear") {
-            println!(" {} returned: {:?}", syscall_num, res);
+        if binding.basic().name().contains("dropbear") || binding.basic().name().contains("nginx") {
+            // println!(" {} returned: {:?}", syscall_num, res);
         }
         res
     }

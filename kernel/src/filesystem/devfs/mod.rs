@@ -157,6 +157,9 @@ impl DevFS {
                 } else if name == "ptmx" {
                     // ptmx设备
                     dev_root_inode.add_dev(name, device.clone())?;
+                } else if name == "loop-control" {
+                    // loop-control设备
+                    dev_root_inode.add_dev(name, device.clone())?;
                 } else {
                     // 在 /dev/char 下创建设备节点
                     dev_char_inode.add_dev(name, device.clone())?;
@@ -192,6 +195,8 @@ impl DevFS {
                     dev_block_inode.add_dev_symlink(&path, &symlink_name)?;
                 } else if name.starts_with("nvme") {
                     // NVMe设备挂载在 /dev 下
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else if name.starts_with("loop") {
                     dev_root_inode.add_dev(name, device.clone())?;
                 } else {
                     dev_block_inode.add_dev(name, device.clone())?;

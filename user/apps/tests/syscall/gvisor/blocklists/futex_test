@@ -1,5 +1,4 @@
 # PrivateFutexTest needs FUTEX_WAKE_OP
-PrivateFutexTest.*
 RobustFutexTest.*
 SharedFutexTest.WakeInterprocessFile_NoRandomSave
 

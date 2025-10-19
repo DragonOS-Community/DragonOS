@@ -155,7 +155,6 @@ pub(super) fn do_futex(
         compiler_fence(Ordering::SeqCst);
     });
 
-    verify_area(uaddr, core::mem::size_of::<u32>())?;
     let cmd = FutexArg::from_bits(operation & FutexFlag::FUTEX_CMD_MASK.bits())
         .ok_or(SystemError::ENOSYS)?;
 
@@ -185,6 +184,16 @@ pub(super) fn do_futex(
         {
             return Err(SystemError::ENOSYS);
         }
+    }
+
+    // 对于 FUTEX_WAKE_OP 的私有 futex，允许 uaddr 为 NULL（Linux 兼容行为）。
+    // 仅在不满足该例外时才校验 uaddr。
+    let skip_uaddr_check = cmd == FutexArg::FUTEX_WAKE_OP
+        && (operation & FutexFlag::FUTEX_PRIVATE_FLAG.bits()) != 0
+        && uaddr.data() == 0;
+
+    if !skip_uaddr_check {
+        verify_area(uaddr, core::mem::size_of::<u32>())?;
     }
 
     match cmd {

@@ -4,6 +4,7 @@ use core::{
     mem::size_of,
     num::NonZero,
     slice::{from_raw_parts, from_raw_parts_mut},
+    sync::atomic::{compiler_fence, Ordering},
 };
 
 use alloc::{ffi::CString, vec::Vec};
@@ -37,6 +38,7 @@ pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemErro
     let p = dest.data() as *mut u8;
     // Clear user space data
     p.write_bytes(0, len);
+    compiler_fence(Ordering::SeqCst);
     return Ok(len);
 }
 

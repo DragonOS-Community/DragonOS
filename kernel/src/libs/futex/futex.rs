@@ -779,10 +779,19 @@ impl RobustListHead {
     /// # 获取robust list head到用户空间
     /// ## 参数
     /// - pid：当前进程/线程的pid
-    /// -
+    /// - head_ptr_uaddr: 指向用户空间指针的指针(即 struct robust_list_head **head_ptr)
+    /// - len_ptr_uaddr: 指向用户空间size_t的指针(即 size_t *len_ptr)
+    ///
+    /// ## 返回
+    /// - Ok(0) 成功
+    /// - Err(SystemError) 失败
+    ///
+    /// ## 说明
+    /// 该函数将目标进程的robust list head的用户空间地址写入到*head_ptr_uaddr,
+    /// 将robust list head的大小写入到*len_ptr_uaddr
     pub fn get_robust_list(
         pid: usize,
-        head_uaddr: VirtAddr,
+        head_ptr_uaddr: VirtAddr,
         len_ptr_uaddr: VirtAddr,
     ) -> Result<usize, SystemError> {
         // 获取当前进程的process control block
@@ -798,23 +807,25 @@ impl RobustListHead {
             return Err(SystemError::EPERM);
         }
 
-        //获取当前线程的robust list head 和 长度
+        //获取当前线程的robust list head
         let robust_list_head = (*pcb.get_robust_list()).ok_or(SystemError::EINVAL)?;
 
-        // 将len拷贝到用户空间len_ptr
+        // 将len(即sizeof(PosixRobustListHead))拷贝到用户空间len_ptr
         let mut user_writer = UserBufferWriter::new(
             len_ptr_uaddr.as_ptr::<usize>(),
             core::mem::size_of::<usize>(),
             true,
         )?;
         user_writer.copy_one_to_user(&mem::size_of::<PosixRobustListHead>(), 0)?;
-        // 将head拷贝到用户空间head
+
+        // 将robust list head的用户空间地址拷贝到用户空间head_ptr
+        // 注意: head_ptr_uaddr是二级指针,我们要写入的是robust_list_head.uaddr(一级指针)
         let mut user_writer = UserBufferWriter::new(
-            head_uaddr.as_ptr::<PosixRobustListHead>(),
-            mem::size_of::<PosixRobustListHead>(),
+            head_ptr_uaddr.as_ptr::<usize>(),
+            mem::size_of::<usize>(),
             true,
         )?;
-        user_writer.copy_one_to_user(&robust_list_head, 0)?;
+        user_writer.copy_one_to_user(&robust_list_head.uaddr.data(), 0)?;
 
         return Ok(0);
     }

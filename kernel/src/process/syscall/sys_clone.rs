@@ -10,20 +10,19 @@ use system_error::SystemError;
 pub struct SysClone;
 
 impl SysClone {
-    fn parent_tid(args: &[usize]) -> VirtAddr {
-        VirtAddr::new(args[2])
-    }
-
-    fn child_tid(args: &[usize]) -> VirtAddr {
-        VirtAddr::new(args[3])
-    }
-
     fn flags(args: &[usize]) -> CloneFlags {
         CloneFlags::from_bits_truncate(args[0] as u64)
     }
 
     fn stack(args: &[usize]) -> usize {
         args[1]
+    }
+    fn parent_tid(args: &[usize]) -> VirtAddr {
+        VirtAddr::new(args[2])
+    }
+
+    fn child_tid(args: &[usize]) -> VirtAddr {
+        VirtAddr::new(args[3])
     }
 
     fn tls(args: &[usize]) -> usize {

@@ -1,3 +1,5 @@
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use system_error::SystemError;
 
 use crate::libs::futex::{constant::*, futex::Futex};
@@ -45,7 +47,7 @@ impl Syscall for SysFutexHandle {
     /// * `Err(SystemError)` - Error code if operation fails
     fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let uaddr = Self::uaddr(args);
-        let operation = Self::operation(args)?;
+        let operation = Self::operation(args);
         let val = Self::val(args);
         // 第4个参数：不同操作下语义不同（可能是 timeout 指针、val2、op 等）
         let arg4 = Self::utime(args);
@@ -53,7 +55,7 @@ impl Syscall for SysFutexHandle {
         let val3 = Self::val3(args);
 
         // 决定是否将第4参解释为超时指针（WAIT* 系列）或数值 val2（REQUEUE/WAKE_OP 等）
-        let cmd = FutexArg::from_bits(operation.bits() & FutexFlag::FUTEX_CMD_MASK.bits())
+        let cmd = FutexArg::from_bits(operation & FutexFlag::FUTEX_CMD_MASK.bits())
             .ok_or(SystemError::ENOSYS)?;
 
         let (timespec, val2): (Option<PosixTimeSpec>, u32) = match cmd {
@@ -108,8 +110,8 @@ impl SysFutexHandle {
     }
 
     /// Extracts the futex operation from syscall arguments
-    fn operation(args: &[usize]) -> Result<FutexFlag, SystemError> {
-        FutexFlag::from_bits(args[1] as u32).ok_or(SystemError::ENOSYS)
+    fn operation(args: &[usize]) -> u32 {
+        args[1] as u32
     }
 
     /// Extracts the raw futex operation from syscall arguments (for formatting)
@@ -142,15 +144,19 @@ syscall_table_macros::declare_syscall!(SYS_FUTEX, SysFutexHandle);
 
 pub(super) fn do_futex(
     uaddr: VirtAddr,
-    operation: FutexFlag,
+    operation: u32,
     val: u32,
     timeout: Option<PosixTimeSpec>,
     uaddr2: VirtAddr,
     val2: u32,
     val3: u32,
 ) -> Result<usize, SystemError> {
+    defer::defer!({
+        compiler_fence(Ordering::SeqCst);
+    });
+
     verify_area(uaddr, core::mem::size_of::<u32>())?;
-    let cmd = FutexArg::from_bits(operation.bits() & FutexFlag::FUTEX_CMD_MASK.bits())
+    let cmd = FutexArg::from_bits(operation & FutexFlag::FUTEX_CMD_MASK.bits())
         .ok_or(SystemError::ENOSYS)?;
 
     // 仅在需要 uaddr2 的操作中校验它
@@ -167,11 +173,11 @@ pub(super) fn do_futex(
 
     let mut flags = FutexFlag::FLAGS_MATCH_NONE;
 
-    if !operation.contains(FutexFlag::FUTEX_PRIVATE_FLAG) {
+    if (operation & FutexFlag::FUTEX_PRIVATE_FLAG.bits()) == 0 {
         flags.insert(FutexFlag::FLAGS_SHARED);
     }
 
-    if operation.contains(FutexFlag::FUTEX_CLOCK_REALTIME) {
+    if (operation & FutexFlag::FUTEX_CLOCK_REALTIME.bits()) != 0 {
         flags.insert(FutexFlag::FLAGS_CLOCKRT);
         if cmd != FutexArg::FUTEX_WAIT_BITSET
             && cmd != FutexArg::FUTEX_WAIT_REQUEUE_PI

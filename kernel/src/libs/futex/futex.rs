@@ -476,6 +476,7 @@ impl Futex {
         nr_wake2: i32,
         op: i32,
     ) -> Result<usize, SystemError> {
+        // Linux 语义：对于私有 futex，允许 uaddr1 为 NULL，此时只执行 op，不从 uaddr1 唤醒任何等待者。
         let key1 = Futex::get_futex_key(
             uaddr1,
             flags.contains(FutexFlag::FLAGS_SHARED),
@@ -488,11 +489,13 @@ impl Futex {
         )?;
 
         let mut futex_data_guard = FutexData::futex_map();
-        let bucket1 = futex_data_guard.get_mut(&key1).ok_or(SystemError::EINVAL)?;
         let mut wake_count = 0;
 
-        // 唤醒uaddr1中的进程
-        wake_count += bucket1.wake_up(key1, None, nr_wake as u32)?;
+        // 若 uaddr1 没有关联任何等待者，则按照 Linux 行为返回 0 而不是 EINVAL。
+        if let Some(bucket1) = futex_data_guard.get_mut(&key1) {
+            // 唤醒uaddr1中的进程
+            wake_count += bucket1.wake_up(key1, None, nr_wake as u32)?;
+        }
 
         match Self::futex_atomic_op_inuser(op as u32, uaddr2) {
             Ok(ret) => {
@@ -687,8 +690,9 @@ impl Futex {
             FutexOP::FUTEX_OP_OR => unsafe {
                 *((*ptr) as *mut u32) |= oparg;
             },
+            // ANDN 语义：new = old & ~oparg
             FutexOP::FUTEX_OP_ANDN => unsafe {
-                *((*ptr) as *mut u32) &= oparg;
+                *((*ptr) as *mut u32) &= !oparg;
             },
             FutexOP::FUTEX_OP_XOR => unsafe {
                 *((*ptr) as *mut u32) ^= oparg;

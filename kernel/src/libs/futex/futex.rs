@@ -284,8 +284,6 @@ impl Futex {
             let jiffies = next_n_us_timer_jiffies(total_us);
 
             let wake_up = Timer::new(wakeup_helper, jiffies);
-
-            wake_up.activate();
             timer = Some(wake_up);
         }
 
@@ -297,6 +295,12 @@ impl Futex {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // 满足条件则将当前进程在该bucket上挂起
         bucket_mut.sleep_no_sched(futex_q.clone())?;
+
+        // 在关中断并且已经标记阻塞后，激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
+        if let Some(ref t) = timer {
+            t.activate();
+        }
+
         drop(futex_map_guard);
         drop(irq_guard);
         schedule(SchedMode::SM_NONE);

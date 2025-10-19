@@ -14,7 +14,7 @@ use crate::{
 use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
 use core::sync::atomic::{compiler_fence, Ordering};
-use log::{debug, error};
+use log::error;
 use system_error::SystemError;
 pub struct SysSigactionHandle;
 

@@ -268,7 +268,7 @@ int test_stress() {
 
     // Join all threads; we intentionally pass NULL for the result pointer
     // to avoid any kernel-side write-back to userspace buffers.
-    for (int i = 0; i < TEST_ITERATIONS; i++) {\
+    for (int i = 0; i < TEST_ITERATIONS; i++) {
         printf("pthread_join at iteration %d\n", i);
         int rc = pthread_join(threads[i], NULL);
         if (rc != 0) {

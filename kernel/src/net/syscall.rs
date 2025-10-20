@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::{
@@ -57,7 +58,7 @@ impl Syscall {
         ProcessManager::current_pcb()
             .fd_table()
             .write()
-            .alloc_fd(file, None)
+            .alloc_fd(Arc::new(file), None)
             .map(|x| x as usize)
     }
 
@@ -103,8 +104,8 @@ impl Syscall {
             }
         };
 
-        fds[0] = fd_table_guard.alloc_fd(File::new(socket_a, FileMode::O_RDWR)?, None)?;
-        fds[1] = fd_table_guard.alloc_fd(File::new(socket_b, FileMode::O_RDWR)?, None)?;
+        fds[0] = fd_table_guard.alloc_fd(Arc::new(File::new(socket_a, FileMode::O_RDWR)?), None)?;
+        fds[1] = fd_table_guard.alloc_fd(Arc::new(File::new(socket_b, FileMode::O_RDWR)?), None)?;
 
         drop(fd_table_guard);
         Ok(0)
@@ -431,7 +432,7 @@ impl Syscall {
         let new_fd = ProcessManager::current_pcb()
             .fd_table()
             .write()
-            .alloc_fd(File::new(new_socket, file_mode)?, None)?;
+            .alloc_fd(Arc::new(File::new(new_socket, file_mode)?), None)?;
         // debug!("accept: new_fd={}", new_fd);
         if !addr.is_null() {
             // 将对端地址写入用户空间

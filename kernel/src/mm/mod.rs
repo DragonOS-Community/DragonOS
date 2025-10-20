@@ -23,6 +23,7 @@ use self::{
 pub mod allocator;
 pub mod early_ioremap;
 pub mod fault;
+pub mod ident_map;
 pub mod init;
 pub mod kernel_mapper;
 pub mod madvise;
@@ -33,6 +34,7 @@ pub mod no_init;
 pub mod page;
 pub mod percpu;
 pub mod syscall;
+pub mod sysfs;
 pub mod truncate;
 pub mod ucontext;
 

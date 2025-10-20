@@ -7,6 +7,7 @@ use crate::debug::kprobe::args::KprobeInfo;
 use crate::debug::kprobe::{register_kprobe, unregister_kprobe, LockKprobe};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::File;
+use crate::filesystem::vfs::file_operations::FileOperations;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::SpinLockGuard;

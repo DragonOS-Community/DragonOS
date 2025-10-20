@@ -67,8 +67,8 @@ pub struct SigFrame {
 pub struct SigContext {
     /// sigcontext的标志位
     pub sc_flags: u64,
-    pub sc_stack: SigStack, // 信号处理程序备用栈信息
-    pub frame: TrapFrame,   // 暂存的系统调用/中断返回时，原本要弹出的内核栈帧
+    pub sc_stack: X86SigStack, // 信号处理程序备用栈信息
+    pub frame: TrapFrame,      // 暂存的系统调用/中断返回时，原本要弹出的内核栈帧
     // pub trap_num: u64,    // 用来保存线程结构体中的trap_num字段
     pub oldmask: SigSet, // 暂存的执行信号处理函数之前的，被设置block的信号
     pub cr2: u64,        // 用来保存线程结构体中的cr2字段
@@ -134,7 +134,7 @@ impl SigContext {
 /// @brief 信号处理备用栈的信息
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-pub struct SigStack {
+pub struct X86SigStack {
     pub sp: *mut c_void,
     pub flags: u32,
     pub size: u32,
@@ -457,8 +457,8 @@ fn setup_frame(
             return Err(SystemError::EINVAL);
         }
     }
-    let frame: *mut SigFrame = get_stack(trap_frame, size_of::<SigFrame>());
-
+    let frame: *mut SigFrame = get_stack(sigaction, trap_frame, size_of::<SigFrame>());
+    // debug!("frame=0x{:016x}", frame as usize);
     // 要求这个frame的地址位于用户空间，因此进行校验
     let r: Result<UserBufferWriter<'_>, SystemError> =
         UserBufferWriter::new(frame, size_of::<SigFrame>(), true);
@@ -529,16 +529,31 @@ fn setup_frame(
 }
 
 #[inline(always)]
-fn get_stack(frame: &TrapFrame, size: usize) -> *mut SigFrame {
+fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> *mut SigFrame {
     // TODO:在 linux 中会根据 Sigaction 中的一个flag 的值来确定是否使用pcb中的 signal 处理程序备用堆栈，现在的
     // pcb中也没有这个备用堆栈
 
-    // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小 并且16字节对齐
-    let mut rsp: usize = (frame.rsp as usize) - 128 - size;
+    // 目前对于备用栈的实现不完善, 需要补全, 来自https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#241
+    let mut _entering_altstack = false;
+    let binding = ProcessManager::current_pcb();
+    let stack = binding.sig_altstack();
+
+    let mut _rsp: usize = 0;
+
+    // 检查是否使用备用栈
+    if sigaction.flags().contains(SigFlags::SA_ONSTACK) {
+        // 这里还需要检查当前是否在信号栈上, 未实现
+        _rsp = stack.sp + stack.size as usize - size; // 栈指向顶部, 与 else 中一样, 需要减 size
+        _entering_altstack = true;
+    } else {
+        // 这里 else 的判断条件也没实现全, 同样未实现, 应该使用 else if
+        // 默认使用 用户栈的栈顶指针-128字节的红区-sigframe的大小 并且16字节对齐
+        _rsp = (frame.rsp as usize) - 128 - size;
+    }
     // 按照要求进行对齐，别问为什么减8，不减8就是错的，可以看
     // https://sourcegraph.com/github.com/torvalds/linux@dd72f9c7e512da377074d47d990564959b772643/-/blob/arch/x86/kernel/signal.c?L124
     // 我猜测是跟x86汇编的某些弹栈行为有关系，它可能会出于某种原因递增 rsp
-    rsp &= (!(STACK_ALIGN - 1)) as usize - 8;
+    _rsp &= (!(STACK_ALIGN - 1)) as usize - 8;
     // rsp &= (!(STACK_ALIGN - 1)) as usize;
-    return rsp as *mut SigFrame;
+    return _rsp as *mut SigFrame;
 }

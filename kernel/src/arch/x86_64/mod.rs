@@ -9,6 +9,7 @@ pub mod fpu;
 pub mod init;
 pub mod interrupt;
 pub mod ipc;
+pub mod kexec;
 pub mod kprobe;
 pub mod libs;
 pub mod mm;
@@ -50,6 +51,8 @@ pub use crate::arch::vm::x86_kvm_ops as kvm_arch_ops;
 
 pub use crate::arch::vm::kvm_host::vcpu::X86VcpuArch as VirtCpuArch;
 pub use crate::arch::vm::kvm_host::KvmVcpuStat as VirtCpuStat;
+
+pub use crate::arch::kexec as KexecArch;
 
 pub fn panic_pre_work() {}
 pub fn panic_post_work() {}

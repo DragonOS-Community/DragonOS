@@ -13,6 +13,7 @@ use core::{
 };
 use log::warn;
 
+use crate::filesystem::vfs::file_operations::FileOperations;
 use hashbrown::HashMap;
 use system_error::SystemError;
 

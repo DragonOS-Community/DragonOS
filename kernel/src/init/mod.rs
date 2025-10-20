@@ -7,6 +7,7 @@ pub mod cmdline;
 pub mod init;
 pub mod initcall;
 pub mod initial_kthread;
+pub mod kexec;
 pub mod version_info;
 
 /// 启动参数

@@ -1,4 +1,5 @@
 use crate::arch::interrupt::TrapFrame;
+use crate::filesystem::vfs::file_operations::FileOperations;
 use crate::{
     arch::syscall::nr::SYS_PIPE2,
     filesystem::vfs::{
@@ -13,6 +14,7 @@ use crate::{
         user_access::UserBufferWriter,
     },
 };
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::c_int;
 use system_error::SystemError;
@@ -54,8 +56,8 @@ pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileMode) -> Result<usize, Sy
     }
     let fd_table_ptr = ProcessManager::current_pcb().fd_table();
     let mut fd_table_guard = fd_table_ptr.write();
-    let read_fd = fd_table_guard.alloc_fd(read_file, None)?;
-    let write_fd = fd_table_guard.alloc_fd(write_file, None)?;
+    let read_fd = fd_table_guard.alloc_fd(Arc::new(read_file), None)?;
+    let write_fd = fd_table_guard.alloc_fd(Arc::new(write_file), None)?;
 
     drop(fd_table_guard);
 

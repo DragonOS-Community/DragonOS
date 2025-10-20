@@ -119,10 +119,12 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         }
         _ => {}
     }
+    //log::info!("------------syscall:{}", syscall_num);
     let mut syscall_handle = || -> u64 {
         Syscall::catch_handle(syscall_num, &args, frame)
             .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
     };
+    //log::info!("------------syscall:{} end", syscall_num);
     syscall_return!(syscall_handle(), frame, show);
 }
 

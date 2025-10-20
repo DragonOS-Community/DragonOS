@@ -1,5 +1,6 @@
 use core::{fmt::Debug, ptr::null, sync::atomic::Ordering};
 
+use crate::filesystem::vfs::file_operations::FileOperations;
 use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 

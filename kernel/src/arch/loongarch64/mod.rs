@@ -5,6 +5,7 @@ pub mod filesystem;
 pub mod init;
 pub mod interrupt;
 pub mod ipc;
+pub mod kexec;
 pub mod kprobe;
 pub mod mm;
 pub mod msi;
@@ -27,6 +28,7 @@ pub use self::pio::LoongArch64PortIOArch as CurrentPortIOArch;
 pub use self::sched::LoongArch64SchedArch as CurrentSchedArch;
 pub use self::smp::LoongArch64SMPArch as CurrentSMPArch;
 pub use self::time::LoongArch64TimeArch as CurrentTimeArch;
+pub use crate::arch::kexec as KexecArch;
 
 pub fn panic_pre_work() {}
 pub fn panic_post_work() {}

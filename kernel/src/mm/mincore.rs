@@ -1,4 +1,5 @@
 use crate::arch::MMArch;
+use crate::filesystem::vfs::file_operations::FileOperations;
 use crate::{
     arch::mm::PageMapper,
     mm::{ucontext::LockedVMA, MemoryManagementArch, VirtAddr},

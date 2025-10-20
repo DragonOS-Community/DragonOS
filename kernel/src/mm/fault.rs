@@ -7,6 +7,7 @@ use core::{
 
 use alloc::sync::Arc;
 
+use crate::filesystem::vfs::file_operations::FileOperations;
 use crate::{
     arch::{mm::PageMapper, MMArch},
     libs::align::align_down,

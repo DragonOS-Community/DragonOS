@@ -211,6 +211,45 @@ impl BootCallbacks for Mb2Callback {
 
         Ok(())
     }
+
+    fn init_initramfs(&self) -> Result<(), SystemError> {
+        log::error!("x86 mb2, init_initramfs is not impled");
+        Ok(())
+    }
+
+    fn early_init_memmap_sysfs(&self) -> Result<(), SystemError> {
+        // 没测试过, 可能有问题
+        crate::mm::sysfs::early_memmap_init();
+
+        let mb2_info = MB2_INFO.get();
+        let mem_regions_tag = mb2_info
+            .memory_map_tag()
+            .expect("MB2: Memory map tag not found!");
+
+        for (i, region) in mem_regions_tag.memory_areas().iter().enumerate() {
+            let t = match MemoryAreaType::from(region.typ()) {
+                MemoryAreaType::Available => 1,
+                MemoryAreaType::Reserved => 2,
+                MemoryAreaType::AcpiAvailable => 3,
+                _ => 4,
+            };
+
+            let memmapd = crate::mm::sysfs::MemmapDesc::new(
+                i.to_string(),
+                region.start_address() as usize,
+                (region.start_address() + region.size()) as usize,
+                t,
+            );
+            crate::mm::sysfs::memmap_desc_manager().insert(i, memmapd);
+        }
+
+        Ok(())
+    }
+
+    fn init_memmap_bp(&self) -> Result<(), SystemError> {
+        log::error!("mb2, init_memmap_bp is not impled");
+        Ok(())
+    }
 }
 
 impl Mb2Callback {

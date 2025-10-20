@@ -67,7 +67,7 @@ impl Kmsg {
     }
 
     /// 读取缓冲区所有日志消息
-    fn read_all(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
+    pub fn read_all(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
         let len = self.data.len().min(buf.len());
 
         // 拷贝数据

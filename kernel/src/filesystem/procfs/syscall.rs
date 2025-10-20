@@ -12,6 +12,8 @@ enum SyslogAction {
     Open = 1,
     /// Read from the log.
     Read = 2,
+    ///  Read all messages from the ring buffer.
+    ReadAll = 3,
     /// Read and clear all messages remaining in the ring buffer.
     ReadClear = 4,
     /// Clear ring buffer.
@@ -30,6 +32,7 @@ impl From<usize> for SyslogAction {
             0 => SyslogAction::Close,
             1 => SyslogAction::Open,
             2 => SyslogAction::Read,
+            3 => SyslogAction::ReadAll,
             4 => SyslogAction::ReadClear,
             5 => SyslogAction::Clear,
             8 => SyslogAction::ConsoleLevel,
@@ -64,6 +67,7 @@ impl Syscall {
             SyslogAction::Close => Ok(0),
             SyslogAction::Open => Ok(0),
             SyslogAction::Read => kmsg_guard.read(buf),
+            SyslogAction::ReadAll => kmsg_guard.read_all(buf),
             SyslogAction::ReadClear => kmsg_guard.read_clear(buf),
             SyslogAction::Clear => kmsg_guard.clear(),
             SyslogAction::SizeBuffer => kmsg_guard.data_size(),

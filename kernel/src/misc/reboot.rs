@@ -177,8 +177,8 @@ pub(super) fn do_sys_reboot(
             return Err(SystemError::ENOSYS);
         }
         RebootCommand::Kexec => {
-            log::warn!("do_sys_reboot: Kexec not implemented");
-            return Err(SystemError::ENOSYS);
+            crate::init::kexec::kexec_core::kernel_kexec();
+            return Ok(());
         }
     }
 }

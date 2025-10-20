@@ -1,4 +1,5 @@
 use super::vfs::file::File;
+use crate::filesystem::vfs::file_operations::FileOperations;
 use crate::libs::{rwlock::RwLock, spinlock::SpinLock};
 use alloc::sync::Weak;
 use core::fmt::Debug;

@@ -8,6 +8,7 @@ use super::{
     utils::{rsplit_path, user_path_at},
     FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+use crate::filesystem::vfs::file_operations::FileOperations;
 use crate::{
     driver::base::block::SeekFrom, process::ProcessManager,
     syscall::user_access::check_and_clone_cstr,
@@ -226,7 +227,7 @@ fn do_sys_openat2(
     let r = ProcessManager::current_pcb()
         .fd_table()
         .write()
-        .alloc_fd(file, None)
+        .alloc_fd(Arc::new(file), None)
         .map(|fd| fd as usize);
 
     return r;

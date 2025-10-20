@@ -6,6 +6,7 @@ pub mod filesystem;
 pub mod init;
 pub mod interrupt;
 pub mod ipc;
+pub mod kexec;
 pub mod kprobe;
 mod kvm;
 pub mod mm;
@@ -34,6 +35,8 @@ pub use self::ipc::signal::RiscV64SignalArch as CurrentSignalArch;
 pub use crate::arch::smp::RiscV64SMPArch as CurrentSMPArch;
 
 pub use crate::arch::sched::RiscV64SchedArch as CurrentSchedArch;
+
+pub use crate::arch::kexec as KexecArch;
 
 pub fn panic_pre_work() {
     unsafe { riscv::register::sstatus::set_fs(riscv::register::sstatus::FS::Initial) };

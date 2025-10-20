@@ -5,6 +5,7 @@ use crate::{
     driver::base::block::SeekFrom,
 };
 
+use crate::filesystem::vfs::file_operations::FileOperations;
 use crate::mm::{
     syscall::{check_aligned, MsFlags, VmFlags},
     ucontext::AddressSpace,

@@ -1,0 +1,8 @@
+[package]
+name = "initram_macros"
+version = "0.1.0"
+edition = "2021"
+authors = ["JingxuanWei <Jensenwei007@gmail.com>"]
+build = "build.rs"
+
+[dependencies]

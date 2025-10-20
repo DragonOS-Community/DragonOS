@@ -257,6 +257,7 @@ impl IndexNode for PerfEventInode {
                     .read()
                     .get_file_by_fd(bpf_prog_fd as _)
                     .ok_or(SystemError::EBADF)?;
+                let file = file.downcast_arc::<File>().unwrap();
                 self.event.set_bpf_prog(file)?;
                 Ok(0)
             }
@@ -423,7 +424,10 @@ pub fn perf_event_open(
     }
     let file = File::new(perf_event, file_mode)?;
     let fd_table = ProcessManager::current_pcb().fd_table();
-    let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
+    let fd = fd_table
+        .write()
+        .alloc_fd(Arc::new(file), None)
+        .map(|x| x as usize)?;
     Ok(fd)
 }
 

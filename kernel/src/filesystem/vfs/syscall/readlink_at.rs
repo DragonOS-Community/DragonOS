@@ -1,3 +1,4 @@
+use crate::filesystem::vfs::file_operations::FileOperations;
 use system_error::SystemError;
 
 use crate::{

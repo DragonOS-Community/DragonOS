@@ -8,6 +8,7 @@ use core::{
     sync::atomic::{compiler_fence, AtomicU64, Ordering},
 };
 
+use crate::filesystem::vfs::file_operations::FileOperations;
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -405,6 +406,7 @@ impl InnerAddressSpace {
         if file.is_none() {
             return Err(SystemError::EBADF);
         }
+        let file = file.unwrap().downcast_arc::<File>().unwrap();
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
@@ -428,7 +430,7 @@ impl InnerAddressSpace {
                         flags,
                         mapper,
                         flusher,
-                        file.clone(),
+                        Some(file.clone()),
                         Some(pgoff),
                     )
                 } else {
@@ -436,7 +438,7 @@ impl InnerAddressSpace {
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
-                        file.clone(),
+                        Some(file.clone()),
                         Some(pgoff),
                         false,
                     )))
@@ -445,7 +447,6 @@ impl InnerAddressSpace {
         )?;
         // todo!(impl mmap for other file)
         // https://github.com/DragonOS-Community/DragonOS/pull/912#discussion_r1765334272
-        let file = file.unwrap();
         // 传入实际映射后的起始虚拟地址，而非用户传入的 hint
         let _ = file
             .inode()

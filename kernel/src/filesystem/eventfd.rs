@@ -308,7 +308,9 @@ impl Syscall {
         let file = File::new(inode, filemode)?;
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-        let fd = fd_table_guard.alloc_fd(file, None).map(|x| x as usize);
+        let fd = fd_table_guard
+            .alloc_fd(Arc::new(file), None)
+            .map(|x| x as usize);
         return fd;
     }
 }

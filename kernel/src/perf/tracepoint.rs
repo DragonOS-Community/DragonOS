@@ -2,6 +2,7 @@ use super::Result;
 use crate::bpf::helper::BPF_HELPER_FUN_SET;
 use crate::bpf::prog::BpfProg;
 use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::vfs::file_operations::FileOperations;
 use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::SpinLock;
 use crate::perf::util::PerfProbeConfig;

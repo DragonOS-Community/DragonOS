@@ -227,7 +227,7 @@ fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError> {
     let r = ProcessManager::current_pcb()
         .fd_table()
         .write()
-        .alloc_fd(file, None)
+        .alloc_fd(Arc::new(file), None)
         .map(|fd| fd as usize);
     return r;
 }

@@ -2,6 +2,8 @@
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_IOCTL;
+use crate::filesystem::vfs::file::File;
+use crate::filesystem::vfs::file_operations::FileOperations;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -41,6 +43,7 @@ impl Syscall for SysIoctlHandle {
         let file = fd_table_guard
             .get_file_by_fd(fd as i32)
             .ok_or(SystemError::EBADF)?;
+        let file = file.downcast_arc::<File>().unwrap();
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);

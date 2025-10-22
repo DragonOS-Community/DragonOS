@@ -55,7 +55,6 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    net::socket::Socket,
     process::resource::{RLimit64, RLimitID},
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,

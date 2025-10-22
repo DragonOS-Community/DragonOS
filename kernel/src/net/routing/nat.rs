@@ -145,6 +145,7 @@ impl<P: NatPolicy> NatTracker<P> {
         }
     }
 
+    #[allow(unused)]
     pub fn insert_rule(&mut self, rule: P::Rule) {
         self.rules.push(rule);
     }
@@ -211,7 +212,7 @@ impl NatPolicy for SnatPolicy {
 
         let mapping = SnatMapping {
             original: *original_tuple,
-            translated: translated_tuple,
+            _translated: translated_tuple,
             last_seen: Instant::now(),
         };
 
@@ -261,7 +262,7 @@ impl NatPolicy for DnatPolicy {
 
         let mapping = DnatMapping {
             from_client: *original,
-            to_server: translated_tuple,
+            _to_server: translated_tuple,
             last_seen: Instant::now(),
         };
 
@@ -322,7 +323,7 @@ pub struct SnatRule {
 #[derive(Debug, Clone, Copy)]
 pub struct SnatMapping {
     pub original: FiveTuple,
-    pub translated: FiveTuple,
+    pub _translated: FiveTuple,
     pub last_seen: Instant,
 }
 
@@ -339,7 +340,7 @@ pub struct DnatMapping {
     // The original tuple from the external client's perspective
     pub from_client: FiveTuple,
     // The tuple after DNAT, as seen by the internal server
-    pub to_server: FiveTuple,
+    pub _to_server: FiveTuple,
     pub last_seen: Instant,
 }
 

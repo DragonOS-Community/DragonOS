@@ -306,7 +306,7 @@ pub struct VethInterface {
     locked_kobj_state: LockedKObjectState,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct VethCommonData {
     netdevice_common: NetDeviceCommonData,
     device_common: DeviceCommonData,
@@ -314,18 +314,6 @@ pub struct VethCommonData {
     peer_veth: Weak<VethInterface>,
 
     bridge_common_data: Option<BridgeCommonData>,
-}
-
-impl Default for VethCommonData {
-    fn default() -> Self {
-        VethCommonData {
-            netdevice_common: NetDeviceCommonData::default(),
-            device_common: DeviceCommonData::default(),
-            kobj_common: KObjectCommonData::default(),
-            peer_veth: Weak::new(),
-            bridge_common_data: None,
-        }
-    }
 }
 
 impl VethInterface {

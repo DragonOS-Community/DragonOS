@@ -21,7 +21,7 @@ pub fn ksys_unshare(flags: CloneFlags) -> Result<(), SystemError> {
         switch_task_namespaces(&current_pcb, new_nsproxy)?;
     }
     // TODO: 处理其他命名空间的 unshare 操作
-    // CLONE_NEWNS, CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_VM, CLONE_THREAD, CLONE_SYSVSEM,
+    // CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_VM, CLONE_THREAD, CLONE_SYSVSEM,
     // CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWUSER, CLONE_NEWNET, CLONE_NEWCGROUP, CLONE_NEWTIME
 
     Ok(())

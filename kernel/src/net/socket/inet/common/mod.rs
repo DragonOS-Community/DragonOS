@@ -1,4 +1,4 @@
-use crate::net::{Iface, NET_DEVICES};
+use crate::{net::Iface, process::namespace::net_namespace::NetNamespace};
 use alloc::sync::Arc;
 
 pub mod port;
@@ -24,6 +24,7 @@ pub enum Types {
 pub struct BoundInner {
     handle: smoltcp::iface::SocketHandle,
     iface: Arc<dyn Iface>,
+    netns: Arc<NetNamespace>,
     // inner: Vec<(smoltcp::iface::SocketHandle, Arc<dyn Iface>)>
     // address: smoltcp::wire::IpAddress,
 }
@@ -35,30 +36,42 @@ impl BoundInner {
         socket: T,
         // socket_type: Types,
         address: &smoltcp::wire::IpAddress,
+        netns: Arc<NetNamespace>,
     ) -> Result<Self, SystemError>
     where
         T: smoltcp::socket::AnySocket<'static>,
     {
         if address.is_unspecified() {
+            let Some(iface) = netns.default_iface() else {
+                return Err(SystemError::ENODEV);
+            };
             // 强绑VirtualIO
-            let iface = NET_DEVICES
-                .read_irqsave()
-                .iter()
-                .find_map(|(_, v)| {
-                    if v.common().is_default_iface() {
-                        Some(v.clone())
-                    } else {
-                        None
-                    }
-                })
-                .expect("No default interface");
+            // let iface = NET_DEVICES
+            //     .read_irqsave()
+            //     .iter()
+            //     .find_map(|(_, v)| {
+            //         if v.common().is_default_iface() {
+            //             Some(v.clone())
+            //         } else {
+            //             None
+            //         }
+            //     })
+            //     .expect("No default interface");
 
             let handle = iface.sockets().lock().add(socket);
-            return Ok(Self { handle, iface });
+            return Ok(Self {
+                handle,
+                iface,
+                netns,
+            });
         } else {
-            let iface = get_iface_to_bind(address).ok_or(SystemError::ENODEV)?;
+            let iface = get_iface_to_bind(address, netns.clone()).ok_or(SystemError::ENODEV)?;
             let handle = iface.sockets().lock().add(socket);
-            return Ok(Self { handle, iface });
+            return Ok(Self {
+                handle,
+                iface,
+                netns,
+            });
         }
     }
 
@@ -66,15 +79,23 @@ impl BoundInner {
         socket: T,
         // socket_type: Types,
         remote: smoltcp::wire::IpAddress,
+        netns: Arc<NetNamespace>,
     ) -> Result<(Self, smoltcp::wire::IpAddress), SystemError>
     where
         T: smoltcp::socket::AnySocket<'static>,
     {
-        let (iface, address) = get_ephemeral_iface(&remote);
+        let (iface, address) = get_ephemeral_iface(&remote, netns.clone());
         // let bound_port = iface.port_manager().bind_ephemeral_port(socket_type)?;
         let handle = iface.sockets().lock().add(socket);
         // let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);
-        Ok((Self { handle, iface }, address))
+        Ok((
+            Self {
+                handle,
+                iface,
+                netns,
+            },
+            address,
+        ))
     }
 
     pub fn port_manager(&self) -> &PortManager {
@@ -99,14 +120,21 @@ impl BoundInner {
     pub fn release(&self) {
         self.iface.sockets().lock().remove(self.handle);
     }
+
+    pub fn netns(&self) -> Arc<NetNamespace> {
+        self.netns.clone()
+    }
 }
 
 #[inline]
-pub fn get_iface_to_bind(ip_addr: &smoltcp::wire::IpAddress) -> Option<Arc<dyn Iface>> {
+pub fn get_iface_to_bind(
+    ip_addr: &smoltcp::wire::IpAddress,
+    netns: Arc<NetNamespace>,
+) -> Option<Arc<dyn Iface>> {
     // log::debug!("get_iface_to_bind: {:?}", ip_addr);
     // if ip_addr.is_unspecified()
-    crate::net::NET_DEVICES
-        .read_irqsave()
+    netns
+        .device_list()
         .iter()
         .find(|(_, iface)| {
             let guard = iface.smol_iface().lock();
@@ -121,11 +149,12 @@ pub fn get_iface_to_bind(ip_addr: &smoltcp::wire::IpAddress) -> Option<Arc<dyn I
 /// Otherwise, we will use a default interface.
 fn get_ephemeral_iface(
     remote_ip_addr: &smoltcp::wire::IpAddress,
+    netns: Arc<NetNamespace>,
 ) -> (Arc<dyn Iface>, smoltcp::wire::IpAddress) {
-    get_iface_to_bind(remote_ip_addr)
+    get_iface_to_bind(remote_ip_addr, netns.clone())
         .map(|iface| (iface, *remote_ip_addr))
         .or({
-            let ifaces = NET_DEVICES.read_irqsave();
+            let ifaces = netns.device_list();
             ifaces.iter().find_map(|(_, iface)| {
                 iface
                     .smol_iface()
@@ -137,7 +166,7 @@ fn get_ephemeral_iface(
             })
         })
         .or({
-            NET_DEVICES.read_irqsave().values().next().map(|iface| {
+            netns.device_list().values().next().map(|iface| {
                 (
                     iface.clone(),
                     iface.smol_iface().lock().ip_addrs()[0].address(),

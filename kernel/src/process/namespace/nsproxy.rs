@@ -5,6 +5,7 @@ use crate::process::{
     fork::CloneFlags,
     namespace::{
         mnt::{root_mnt_namespace, MntNamespace},
+        net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
         uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
     },
     ProcessControlBlock, ProcessManager,
@@ -31,8 +32,11 @@ pub struct NsProxy {
     pub uts_ns: Arc<UtsNamespace>,
     /// ipc namespace（SysV IPC、POSIX mqueue 等）
     pub ipc_ns: Arc<IpcNamespace>,
+    /// 网络命名空间
+    pub net_ns: Arc<NetNamespace>,
+    // 注意，user_ns 存储在cred,不存储在nsproxy
+
     // 其他namespace（为未来扩展预留）
-    // pub net_ns: Option<Arc<NetNamespace>>,
     // pub cgroup_ns: Option<Arc<CgroupNamespace>>,
     // pub time_ns: Option<Arc<TimeNamespace>>,
 }
@@ -48,11 +52,13 @@ impl NsProxy {
     pub fn new_root() -> Arc<Self> {
         let root_pid_ns = super::pid_namespace::INIT_PID_NAMESPACE.clone();
         let root_mnt_ns = root_mnt_namespace();
+        let root_net_ns = INIT_NET_NAMESPACE.clone();
         let root_uts_ns = INIT_UTS_NAMESPACE.clone();
         let root_ipc_ns = INIT_IPC_NAMESPACE.clone();
         Arc::new(Self {
             pid_ns_for_children: root_pid_ns,
             mnt_ns: root_mnt_ns,
+            net_ns: root_net_ns,
             uts_ns: root_uts_ns,
             ipc_ns: root_ipc_ns,
         })
@@ -68,10 +74,16 @@ impl NsProxy {
         &self.mnt_ns
     }
 
+    /// 获取 net namespace
+    pub fn net_namespace(&self) -> &Arc<NetNamespace> {
+        &self.net_ns
+    }
+
     pub fn clone_inner(&self) -> Self {
         Self {
             pid_ns_for_children: self.pid_ns_for_children.clone(),
             mnt_ns: self.mnt_ns.clone(),
+            net_ns: self.net_ns.clone(),
             uts_ns: self.uts_ns.clone(),
             ipc_ns: self.ipc_ns.clone(),
         }
@@ -152,12 +164,14 @@ pub(super) fn create_new_namespaces(
         .copy_pid_ns(clone_flags, user_ns.clone())?;
 
     let mnt_ns = nsproxy.mnt_ns.copy_mnt_ns(clone_flags, user_ns.clone())?;
+    let net_ns = nsproxy.net_ns.copy_net_ns(clone_flags, user_ns.clone())?;
 
     let uts_ns = nsproxy.uts_ns.copy_uts_ns(clone_flags, user_ns.clone())?;
     let ipc_ns = nsproxy.ipc_ns.copy_ipc_ns(clone_flags, user_ns.clone());
     let result = NsProxy {
         pid_ns_for_children,
         mnt_ns,
+        net_ns,
         uts_ns,
         ipc_ns,
     };

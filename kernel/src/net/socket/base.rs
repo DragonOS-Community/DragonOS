@@ -138,11 +138,4 @@ pub trait Socket: PollableInode + IndexNode {
     fn write(&self, buffer: &[u8]) -> Result<usize, SystemError> {
         self.send(buffer, PMSG::empty())
     }
-
-    fn into_socket(this: Arc<Self>) -> Option<Arc<dyn Socket>>
-    where
-        Self: Sized,
-    {
-        Some(this)
-    }
 }

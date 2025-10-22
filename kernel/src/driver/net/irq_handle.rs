@@ -1,10 +1,13 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::exception::{
-    irqdata::IrqHandlerData,
-    irqdesc::{IrqHandler, IrqReturn},
-    IrqNumber,
+use crate::{
+    exception::{
+        irqdata::IrqHandlerData,
+        irqdesc::{IrqHandler, IrqReturn},
+        IrqNumber,
+    },
+    process::namespace::net_namespace::INIT_NET_NAMESPACE,
 };
 
 /// 默认的网卡中断处理函数
@@ -18,7 +21,8 @@ impl IrqHandler for DefaultNetIrqHandler {
         _static_data: Option<&dyn IrqHandlerData>,
         _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
-        super::kthread::wakeup_poll_thread();
+        // 这里先暂时唤醒 INIT 网络命名空间的轮询线程
+        INIT_NET_NAMESPACE.wakeup_poll_thread();
         Ok(IrqReturn::Handled)
     }
 }

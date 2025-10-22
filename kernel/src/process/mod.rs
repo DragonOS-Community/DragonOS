@@ -2,7 +2,7 @@ use core::{
     fmt,
     hash::Hash,
     hint::spin_loop,
-    intrinsics::{likely, unlikely},
+    intrinsics::unlikely,
     mem::ManuallyDrop,
     sync::atomic::{compiler_fence, fence, AtomicBool, AtomicUsize, Ordering},
 };
@@ -34,8 +34,9 @@ use crate::{
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
+        sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending, SignalFlags, SignalStruct},
+        signal_types::{SigInfo, SigPending},
     },
     libs::{
         align::AlignedBox,
@@ -54,6 +55,8 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
+    net::socket::Socket,
+    process::resource::{RLimit64, RLimitID},
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
         cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
@@ -81,6 +84,7 @@ pub mod idle;
 pub mod kthread;
 pub mod namespace;
 pub mod pid;
+pub mod preempt;
 pub mod process_group;
 pub mod resource;
 pub mod session;
@@ -184,22 +188,6 @@ impl ProcessManager {
         }
 
         return ProcessManager::current_pcb().raw_pid();
-    }
-
-    /// 增加当前进程的锁持有计数
-    #[inline(always)]
-    pub fn preempt_disable() {
-        if likely(unsafe { __PROCESS_MANAGEMENT_INIT_DONE }) {
-            ProcessManager::current_pcb().preempt_disable();
-        }
-    }
-
-    /// 减少当前进程的锁持有计数
-    #[inline(always)]
-    pub fn preempt_enable() {
-        if likely(unsafe { __PROCESS_MANAGEMENT_INIT_DONE }) {
-            ProcessManager::current_pcb().preempt_enable();
-        }
     }
 
     /// 根据pid获取进程的pcb
@@ -428,7 +416,6 @@ impl ProcessManager {
 
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
         let pid: Arc<Pid>;
         let raw_pid = ProcessManager::current_pid();
         {
@@ -452,6 +439,8 @@ impl ProcessManager {
             let thread = pcb.thread.write_irqsave();
 
             if let Some(addr) = thread.clear_child_tid {
+                // 按 Linux 语义：先清零 userland 的 *clear_child_tid，再 futex_wake(addr)
+                unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
                 if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
                     let _ = Futex::futex_wake(
                         addr,
@@ -460,7 +449,6 @@ impl ProcessManager {
                         FUTEX_BITSET_MATCH_ANY,
                     );
                 }
-                unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
             }
             compiler_fence(Ordering::SeqCst);
 
@@ -739,8 +727,8 @@ pub struct ProcessControlBlock {
     arch_info: SpinLock<ArchPCBInfo>,
     /// 与信号处理相关的信息(似乎可以是无锁的)
     sig_info: RwLock<ProcessSignalInfo>,
-    /// 信号处理结构体
-    sig_struct: SpinLock<SignalStruct>,
+    sighand: RwLock<Arc<SigHand>>,
+
     /// 退出信号S
     exit_signal: AtomicSignal,
 
@@ -775,6 +763,8 @@ pub struct ProcessControlBlock {
 
     /// 进程的可执行文件路径
     executable_path: RwLock<String>,
+    /// 资源限制（rlimit）数组
+    rlimits: RwLock<[RLimit64; RLimitID::Nlimits as usize]>,
 }
 
 impl ProcessControlBlock {
@@ -879,7 +869,7 @@ impl ProcessControlBlock {
                 sched_info,
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
-                sig_struct: SpinLock::new(SignalStruct::new()),
+                sighand: RwLock::new(SigHand::new()),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb),
@@ -893,6 +883,7 @@ impl ProcessControlBlock {
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
+                rlimits: RwLock::new(Self::default_rlimits()),
             };
 
             pcb.sig_info.write().set_tty(tty);
@@ -924,6 +915,129 @@ impl ProcessControlBlock {
         };
 
         return pcb;
+    }
+
+    fn default_rlimits() -> [crate::process::resource::RLimit64; RLimitID::Nlimits as usize] {
+        use crate::mm::ucontext::UserStack;
+        use crate::process::resource::{RLimit64, RLimitID};
+
+        let mut arr = [RLimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        }; RLimitID::Nlimits as usize];
+
+        // Linux 典型默认值：软限制1024，硬限制65536
+        // 文件描述符表会根据RLIMIT_NOFILE自动扩容
+        arr[RLimitID::Nofile as usize] = RLimit64 {
+            rlim_cur: 1024,
+            rlim_max: 65536,
+        };
+
+        arr[RLimitID::Stack as usize] = RLimit64 {
+            rlim_cur: UserStack::DEFAULT_USER_STACK_SIZE as u64,
+            rlim_max: UserStack::DEFAULT_USER_STACK_SIZE as u64,
+        };
+
+        arr[RLimitID::As as usize] = {
+            let end = <crate::arch::MMArch as crate::mm::MemoryManagementArch>::USER_END_VADDR;
+            RLimit64 {
+                rlim_cur: end.data() as u64,
+                rlim_max: end.data() as u64,
+            }
+        };
+        arr[RLimitID::Rss as usize] = arr[RLimitID::As as usize];
+
+        // 设置文件大小限制的默认值 (Linux默认通常是unlimited)
+        arr[RLimitID::Fsize as usize] = RLimit64 {
+            rlim_cur: u64::MAX,
+            rlim_max: u64::MAX,
+        };
+
+        arr
+    }
+
+    #[inline(always)]
+    pub fn get_rlimit(&self, res: RLimitID) -> crate::process::resource::RLimit64 {
+        self.rlimits.read()[res as usize]
+    }
+
+    pub fn set_rlimit(
+        &self,
+        res: RLimitID,
+        newv: crate::process::resource::RLimit64,
+    ) -> Result<(), system_error::SystemError> {
+        use system_error::SystemError;
+        if newv.rlim_cur > newv.rlim_max {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 注意：允许RLIMIT_NOFILE设置为0，这是测试用例的预期行为
+        // 当rlim_cur为0时，无法分配新的文件描述符，但现有fd仍可使用
+
+        // 对于RLIMIT_NOFILE，检查是否超过系统实现的最大容量限制
+        if res == RLimitID::Nofile {
+            if newv.rlim_cur > FileDescriptorVec::MAX_CAPACITY as u64 {
+                return Err(SystemError::EINVAL);
+            }
+            if newv.rlim_max > FileDescriptorVec::MAX_CAPACITY as u64 {
+                return Err(SystemError::EINVAL);
+            }
+        }
+
+        let cur = self.rlimits.read()[res as usize];
+        if newv.rlim_max > cur.rlim_max {
+            let cred = self.cred();
+            if !cred.has_capability(crate::process::cred::CAPFlags::CAP_SYS_RESOURCE) {
+                return Err(SystemError::EPERM);
+            }
+        }
+
+        // 更新rlimit
+        self.rlimits.write()[res as usize] = newv;
+
+        // 如果是RLIMIT_NOFILE变化，调整文件描述符表
+        if res == RLimitID::Nofile {
+            if let Err(e) = self.adjust_fd_table_for_rlimit_change(newv.rlim_cur as usize) {
+                // 如果调整失败，回滚rlimit设置
+                self.rlimits.write()[res as usize] = cur;
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 继承父进程的全部rlimit
+    pub fn inherit_rlimits_from(&self, parent: &Arc<ProcessControlBlock>) {
+        let src = *parent.rlimits.read();
+        *self.rlimits.write() = src;
+
+        // 继承后调整文件描述符表以匹配新的RLIMIT_NOFILE
+        let nofile_limit = src[RLimitID::Nofile as usize].rlim_cur as usize;
+        if let Err(e) = self.adjust_fd_table_for_rlimit_change(nofile_limit) {
+            // 如果调整失败，记录错误但不影响继承过程
+            error!(
+                "Failed to adjust fd table after inheriting rlimits: {:?}",
+                e
+            );
+        }
+    }
+
+    /// 当RLIMIT_NOFILE变化时调整文件描述符表
+    ///
+    /// ## 参数
+    /// - `new_rlimit_nofile`: 新的RLIMIT_NOFILE值
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 调整成功
+    /// - `Err(SystemError)`: 调整失败
+    fn adjust_fd_table_for_rlimit_change(
+        &self,
+        new_rlimit_nofile: usize,
+    ) -> Result<(), system_error::SystemError> {
+        let fd_table = self.basic.read().try_fd_table().unwrap();
+        let mut fd_table_guard = fd_table.write();
+        fd_table_guard.adjust_for_rlimit_change(new_rlimit_nofile)
     }
 
     /// 返回当前进程的锁持有计数
@@ -1050,6 +1164,15 @@ impl ProcessControlBlock {
         self.cred.lock().clone()
     }
 
+    /// 原子替换当前进程的凭据集（cred）
+    ///
+    /// - 使用 irqsave 写锁保证并发安全
+    /// - 返回 Result 以便调用方在需要时扩展错误处理
+    pub fn set_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
+        *self.cred.lock_irqsave() = new;
+        Ok(())
+    }
+
     pub fn set_execute_path(&self, path: String) {
         *self.executable_path.write() = path;
     }
@@ -1151,11 +1274,11 @@ impl ProcessControlBlock {
                 let mut init_childen_guard = init_pcb.children.write();
 
                 childen_guard.iter().for_each(|pid| {
-                    log::debug!(
-                        "adopt_childen: pid {} is adopted by init pid {}",
-                        pid,
-                        init_pcb.raw_pid()
-                    );
+                    // log::debug!(
+                    //     "adopt_childen: pid {} is adopted by init pid {}",
+                    //     pid,
+                    //     init_pcb.raw_pid()
+                    // );
                     init_childen_guard.push(*pid);
                 });
 
@@ -1207,9 +1330,14 @@ impl ProcessControlBlock {
     /// 判断当前进程是否有未处理的信号
     pub fn has_pending_signal(&self) -> bool {
         let sig_info = self.sig_info_irqsave();
-        let has_pending = sig_info.sig_pending().has_pending();
+        let has_pending_thread = sig_info.sig_pending().has_pending();
         drop(sig_info);
-        return has_pending;
+        if has_pending_thread {
+            return true;
+        }
+        // also check shared-pending in sighand
+        let shared = self.sighand().shared_pending_signal();
+        return !shared.is_empty();
     }
 
     /// 根据 pcb 的 flags 判断当前进程是否有未处理的信号
@@ -1233,24 +1361,6 @@ impl ProcessControlBlock {
         // );
         let has_not_masked = !pending.is_empty();
         return has_not_masked;
-    }
-
-    pub fn sig_struct(&self) -> SpinLockGuard<'_, SignalStruct> {
-        self.sig_struct.lock_irqsave()
-    }
-
-    pub fn try_sig_struct_irqsave(&self, times: u8) -> Option<SpinLockGuard<'_, SignalStruct>> {
-        for _ in 0..times {
-            if let Ok(r) = self.sig_struct.try_lock_irqsave() {
-                return Some(r);
-            }
-        }
-
-        return None;
-    }
-
-    pub fn sig_struct_irqsave(&self) -> SpinLockGuard<'_, SignalStruct> {
-        self.sig_struct.lock_irqsave()
     }
 
     #[inline(always)]
@@ -1983,9 +2093,7 @@ pub struct ProcessSignalInfo {
     saved_sigmask: SigSet,
     // sig_pending 中存储当前线程要处理的信号
     sig_pending: SigPending,
-    // sig_shared_pending 中存储当前线程所属进程要处理的信号
-    sig_shared_pending: SigPending,
-    flags: SignalFlags,
+
     // 当前进程对应的tty
     tty: Option<Arc<TtyCore>>,
     has_child_subreaper: bool,
@@ -2024,24 +2132,12 @@ impl ProcessSignalInfo {
         &mut self.saved_sigmask
     }
 
-    pub fn sig_shared_pending_mut(&mut self) -> &mut SigPending {
-        &mut self.sig_shared_pending
-    }
-
-    pub fn sig_shared_pending(&self) -> &SigPending {
-        &self.sig_shared_pending
-    }
-
     pub fn tty(&self) -> Option<Arc<TtyCore>> {
         self.tty.clone()
     }
 
     pub fn set_tty(&mut self, tty: Option<Arc<TtyCore>>) {
         self.tty = tty;
-    }
-
-    pub fn flags(&self) -> SignalFlags {
-        self.flags
     }
 
     /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号
@@ -2060,7 +2156,8 @@ impl ProcessSignalInfo {
         if res.0 != Signal::INVALID {
             return res;
         } else {
-            let res = self.sig_shared_pending.dequeue_signal(sig_mask);
+            let sighand = pcb.sighand();
+            let res = sighand.shared_pending_dequeue(sig_mask);
             pcb.recalc_sigpending(Some(self));
             return res;
         }
@@ -2089,12 +2186,10 @@ impl Default for ProcessSignalInfo {
             sig_blocked: SigSet::empty(),
             saved_sigmask: SigSet::empty(),
             sig_pending: SigPending::default(),
-            sig_shared_pending: SigPending::default(),
             tty: None,
             has_child_subreaper: false,
             is_child_subreaper: false,
             is_session_leader: false,
-            flags: SignalFlags::empty(),
         }
     }
 }

@@ -1,3 +1,4 @@
+ARCH ?= x86_64
 ifeq ($(ARCH), x86_64)
 	CROSS_COMPILE=x86_64-linux-musl-
 else ifeq ($(ARCH), riscv64)
@@ -5,7 +6,7 @@ else ifeq ($(ARCH), riscv64)
 endif
 
 CC=$(CROSS_COMPILE)gcc
-CFLAGS := -Wall -O2 -static
+CFLAGS := -Wall -O2 -static -lpthread
 
 SRCS := $(wildcard *.c)
 BINS := $(SRCS:.c=)

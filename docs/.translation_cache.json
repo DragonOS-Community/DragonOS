@@ -33,7 +33,7 @@
     "hash": "777fe6a902720949596f5a35bdf26372"
   },
   "en:kernel/syscall/index.rst": {
-    "hash": "d94e7cff4242362399e96051df1e7aad"
+    "hash": "0644dde8c9154be097b329e787073542"
   },
   "en:kernel/libs/lib_ui/scm.md": {
     "hash": "a03d756677c64b1247cfe40b6d73f1b1"
@@ -63,7 +63,7 @@
     "hash": "52dd12d566da2003602ee21c4a3d007f"
   },
   "en:kernel/ktest/index.rst": {
-    "hash": "5a4565952877c82b9a0ed3b67103c141"
+    "hash": "d9f0d9b2df4f1ce9d7f0da23639afafb"
   },
   "en:kernel/filesystem/vfs/api.md": {
     "hash": "1b0b3fe0cc2918cc2c53a5af392a96ff"
@@ -126,7 +126,7 @@
     "hash": "72efe542c7854926ac0f33287345b856"
   },
   "en:kernel/ipc/index.rst": {
-    "hash": "bbc40e0a41a1467dbdd42196c443f1ef"
+    "hash": "e75d2ff6a7b8a4e6f32b2adee7756298"
   },
   "en:kernel/boot/index.rst": {
     "hash": "8fe854f9c48d4e2e3fee0cf7f3526dfe"
@@ -234,7 +234,7 @@
     "hash": "bb2435e3905e8e71eca8f6a583e31d94"
   },
   "en:introduction/build_system.md": {
-    "hash": "fafac4210fb49c9e160b46c2101df238"
+    "hash": "d15b077dd4ae71bff928efb85aa7999e"
   },
   "en:community/ChangeLog/V0.1.x/V0.1.4.md": {
     "hash": "5720af929320997f8824bcdfd3a17bdd"
@@ -289,5 +289,20 @@
   },
   "en:kernel/net/unix.md": {
     "hash": "73ec9615b972824183480217036a89a7"
+  },
+  "en:kernel/ipc/ipc_namespace.md": {
+    "hash": "52df04d6a276b42617f7b79bbbffa61e"
+  },
+  "en:kernel/ktest/gvisor_syscall_test.rst": {
+    "hash": "bfa0b1f0bcb791573c73670df23cbb32"
+  },
+  "en:kernel/syscall/sys_capget_capset.md": {
+    "hash": "f3b86c00e9f28df5c0e6c15905e53907"
+  },
+  "en:kernel/device/tty.md": {
+    "hash": "acbc94b056e1c8f7f07275d80b70a930"
+  },
+  "en:kernel/device/index.rst": {
+    "hash": "71c15cea87dffe58f5d70da38390a083"
   }
 }

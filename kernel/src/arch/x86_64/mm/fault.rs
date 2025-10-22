@@ -9,12 +9,12 @@ use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 use crate::{
     arch::{
         interrupt::{trap::X86PfErrorCode, TrapFrame},
-        ipc::signal::{SigCode, Signal},
+        ipc::signal::Signal,
         mm::{MemoryManagementArch, X86_64MMArch},
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
-    ipc::signal_types::{SigInfo, SigType},
+    ipc::signal_types::{SigCode, SigInfo, SigType},
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
@@ -264,9 +264,11 @@ impl X86_64MMArch {
                 Some(vma) => vma,
                 None => {
                     log::error!(
-                        "can not find nearest vma, error_code: {:?}, address: {:#x}",
+                        "pid:{}, can not find nearest vma, \n\terror_code: {:?}, address: {:#x}, rip: {:#x}",
+                        ProcessManager::current_pid().data(),
                         error_code,
                         address.data(),
+                        regs.rip,
                     );
                     send_segv();
                     return;

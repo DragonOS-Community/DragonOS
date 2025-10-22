@@ -1,4 +1,7 @@
+pub mod clone_utils;
+mod sys_cap_get_set;
 mod sys_clone;
+mod sys_clone3;
 mod sys_execve;
 mod sys_execveat;
 mod sys_exit;
@@ -14,7 +17,7 @@ mod sys_getsid;
 mod sys_gettid;
 mod sys_getuid;
 mod sys_groups;
-mod sys_prlimit64;
+pub mod sys_prlimit64;
 mod sys_set_tid_address;
 mod sys_setdomainname;
 mod sys_setfsgid;
@@ -37,5 +40,7 @@ mod sys_fork;
 mod sys_getpgrp;
 #[cfg(target_arch = "x86_64")]
 mod sys_getrlimit;
+#[cfg(target_arch = "x86_64")]
+mod sys_setrlimit;
 #[cfg(target_arch = "x86_64")]
 mod sys_vfork;

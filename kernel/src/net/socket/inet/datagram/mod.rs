@@ -265,7 +265,10 @@ impl Socket for UdpSocket {
     }
 
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
-        todo!()
+        match self.inner.read().as_ref().unwrap() {
+            UdpInner::Bound(bound) => Ok(Endpoint::Ip(bound.local_endpoint())),
+            _ => Err(SystemError::ENOTCONN),
+        }
     }
 
     fn recv_msg(

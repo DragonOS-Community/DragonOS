@@ -3,10 +3,11 @@ use log::info;
 
 use crate::driver::base::{
     device::{
-        set_sys_dev_block_kset, set_sys_dev_char_kset, set_sys_devices_virtual_kset, sys_dev_kset,
-        sys_devices_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER, DEV_KSET_INSTANCE,
+        set_sys_dev_block_kobj, set_sys_dev_char_kobj, set_sys_devices_virtual_kobj, sys_dev_kobj,
+        sys_devices_kset, DeviceManager, DEVICES_KSET_INSTANCE, DEVICE_MANAGER,
+        DEV_KOBJECT_INSTANCE,
     },
-    kobject::KObject,
+    kobject::{CommonKobj, DynamicKObjKType, KObject, KObjectManager},
     kset::KSet,
 };
 
@@ -17,7 +18,7 @@ pub fn devices_init() -> Result<(), SystemError> {
     {
         let devices_kset = KSet::new("devices".to_string());
         devices_kset
-            .register(None)
+            .register()
             .expect("register devices kset failed");
 
         unsafe {
@@ -30,53 +31,43 @@ pub fn devices_init() -> Result<(), SystemError> {
     // 创建 `/sys/devices/virtual` 目录
     {
         let devices_kset = sys_devices_kset();
-        let virtual_kset = KSet::new("virtual".to_string());
+        let virtual_kobj = CommonKobj::new("virtual".to_string());
         let parent = devices_kset.clone() as Arc<dyn KObject>;
-        virtual_kset.set_parent(Some(Arc::downgrade(&parent)));
+        virtual_kobj.set_parent(Some(Arc::downgrade(&parent)));
+        KObjectManager::init_and_add_kobj(virtual_kobj.clone(), Some(&DynamicKObjKType))?;
 
-        virtual_kset
-            .register(Some(devices_kset))
-            .expect("register virtual kset failed");
-        unsafe { set_sys_devices_virtual_kset(virtual_kset) };
+        unsafe { set_sys_devices_virtual_kobj(virtual_kobj) };
     }
 
     // 创建 `/sys/dev` 目录
     {
-        let dev_kset = KSet::new("dev".to_string());
-        dev_kset.register(None).expect("register dev kset failed");
+        let dev_kobj = CommonKobj::new("dev".to_string());
+        KObjectManager::init_and_add_kobj(dev_kobj.clone(), Some(&DynamicKObjKType))?;
         unsafe {
-            DEV_KSET_INSTANCE = Some(dev_kset);
+            DEV_KOBJECT_INSTANCE = Some(dev_kobj);
         }
     }
 
     // 创建 `/sys/dev/block` 目录
     {
-        // debug!("create /sys/dev/block");
-        let dev_kset = sys_dev_kset();
-        let dev_block_kset = KSet::new("block".to_string());
-        let parent = dev_kset.clone() as Arc<dyn KObject>;
-        dev_block_kset.set_parent(Some(Arc::downgrade(&parent)));
+        let dev_kobj = sys_dev_kobj();
+        let dev_block_kobj = CommonKobj::new("block".to_string());
+        let parent = dev_kobj.clone() as Arc<dyn KObject>;
+        dev_block_kobj.set_parent(Some(Arc::downgrade(&parent)));
+        KObjectManager::init_and_add_kobj(dev_block_kobj.clone(), Some(&DynamicKObjKType))?;
 
-        dev_block_kset
-            .register(Some(dev_kset))
-            .expect("register dev block kset failed");
-
-        unsafe { set_sys_dev_block_kset(dev_block_kset) };
+        unsafe { set_sys_dev_block_kobj(dev_block_kobj) };
     }
 
     // 创建 `/sys/dev/char` 目录
     {
-        // debug!("create /sys/dev/char");
-        let dev_kset = sys_dev_kset();
-        let dev_char_kset = KSet::new("char".to_string());
-        let parent = dev_kset.clone() as Arc<dyn KObject>;
-        dev_char_kset.set_parent(Some(Arc::downgrade(&parent)));
+        let dev_kobj = sys_dev_kobj();
+        let dev_char_kobj = CommonKobj::new("char".to_string());
+        let parent = dev_kobj.clone() as Arc<dyn KObject>;
+        dev_char_kobj.set_parent(Some(Arc::downgrade(&parent)));
+        KObjectManager::init_and_add_kobj(dev_char_kobj.clone(), Some(&DynamicKObjKType))?;
 
-        dev_char_kset
-            .register(Some(dev_kset))
-            .expect("register dev char kset failed");
-
-        unsafe { set_sys_dev_char_kset(dev_char_kset) };
+        unsafe { set_sys_dev_char_kobj(dev_char_kobj) };
     }
 
     info!("devices init success");

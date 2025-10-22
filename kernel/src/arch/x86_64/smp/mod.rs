@@ -138,7 +138,7 @@ impl SmpBootData {
     }
 }
 
-pub(super) static SMP_BOOT_DATA: SmpBootData = SmpBootData {
+pub static SMP_BOOT_DATA: SmpBootData = SmpBootData {
     initialized: AtomicBool::new(false),
     cpu_count: 0,
     phys_id: [0; PerCpu::MAX_CPU_NUM as usize],
@@ -168,7 +168,7 @@ impl X86_64SmpManager {
         unsafe {
             smp_cpu_manager().set_possible_cpu(ProcessorId::new(0), true);
             smp_cpu_manager().set_present_cpu(ProcessorId::new(0), true);
-            smp_cpu_manager().set_online_cpu(ProcessorId::new(0));
+            smp_cpu_manager().set_online_cpu(ProcessorId::new(0), true);
         }
 
         for cpu in 1..SMP_BOOT_DATA.cpu_count() {

@@ -27,6 +27,7 @@ pub mod init;
 pub mod kernel_mapper;
 pub mod madvise;
 pub mod memblock;
+pub mod mincore;
 pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;

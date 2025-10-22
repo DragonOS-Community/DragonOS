@@ -1,3 +1,4 @@
+use core::sync::atomic::{compiler_fence, Ordering};
 use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
 
 use defer::defer;
@@ -20,7 +21,9 @@ use crate::{
     exception::InterruptArch,
     ipc::{
         signal::{restore_saved_sigmask, set_current_blocked},
-        signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags},
+        signal_types::{
+            PosixSigInfo, SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags,
+        },
     },
     mm::MemoryManagementArch,
     process::ProcessManager,
@@ -31,44 +34,6 @@ use crate::{
 pub const STACK_ALIGN: u64 = 16;
 /// 信号最大值
 pub const MAX_SIG_NUM: usize = 64;
-
-/// siginfo中的si_code的可选值
-/// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
-#[derive(Copy, Debug, Clone)]
-#[repr(i32)]
-pub enum SigCode {
-    /// sent by kill, sigsend, raise
-    User = 0,
-    /// sent by kernel from somewhere
-    Kernel = 0x80,
-    /// 通过sigqueue发送
-    Queue = -1,
-    /// 定时器过期时发送
-    Timer = -2,
-    /// 当实时消息队列的状态发生改变时发送
-    Mesgq = -3,
-    /// 当异步IO完成时发送
-    AsyncIO = -4,
-    /// sent by queued SIGIO
-    SigIO = -5,
-}
-
-impl SigCode {
-    /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
-    #[allow(dead_code)]
-    pub fn from_i32(x: i32) -> SigCode {
-        match x {
-            0 => Self::User,
-            0x80 => Self::Kernel,
-            -1 => Self::Queue,
-            -2 => Self::Timer,
-            -3 => Self::Mesgq,
-            -4 => Self::AsyncIO,
-            -5 => Self::SigIO,
-            _ => panic!("signal code not valid"),
-        }
-    }
-}
 
 bitflags! {
     #[repr(C,align(8))]
@@ -93,7 +58,7 @@ pub struct SigFrame {
     /// 指向restorer的地址的指针。（该变量必须放在sigframe的第一位，因为这样才能在handler返回的时候，跳转到对应的代码，执行sigreturn)
     pub ret_code_ptr: *mut core::ffi::c_void,
     pub handler: *mut c_void,
-    pub info: SigInfo,
+    pub info: PosixSigInfo,
     pub context: SigContext,
 }
 
@@ -199,19 +164,12 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
     drop(siginfo_read_guard);
 
-    let sig_guard = pcb.try_sig_struct_irqsave(5);
-    if unlikely(sig_guard.is_none()) {
-        return;
-    }
+    // x86_64 上不再需要 sig_struct 自旋锁
     let siginfo_mut = pcb.try_siginfo_mut(5);
     if unlikely(siginfo_mut.is_none()) {
         return;
     }
 
-    let sig_guard: crate::libs::spinlock::SpinLockGuard<
-        '_,
-        crate::ipc::signal_types::SignalStruct,
-    > = sig_guard.unwrap();
     let mut siginfo_mut_guard = siginfo_mut.unwrap();
     loop {
         (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
@@ -220,7 +178,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         if sig_number == Signal::INVALID {
             return;
         }
-        let sa = sig_guard.handlers[sig_number as usize - 1];
+        let sa = pcb.sighand().handler(sig_number).unwrap();
 
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
@@ -250,7 +208,10 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
          * case, the signal cannot be dropped.
          */
         // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/signal.h?fi=sig_kernel_only#444
-        if siginfo_mut_guard.flags().contains(SignalFlags::UNKILLABLE) && !sig_number.kernel_only()
+        if ProcessManager::current_pcb()
+            .sighand()
+            .flags_contains(SignalFlags::UNKILLABLE)
+            && !sig_number.kernel_only()
         {
             continue;
         }
@@ -263,7 +224,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let oldset = *siginfo_mut_guard.sig_blocked();
     //避免死锁
     drop(siginfo_mut_guard);
-    drop(sig_guard);
+    // no sig_struct guard to drop
     drop(pcb);
     // 做完上面的检查后，开中断
     CurrentIrqArch::interrupt_enable();
@@ -279,6 +240,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
     let res: Result<i32, SystemError> =
         handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
+    compiler_fence(Ordering::SeqCst);
     if res.is_err() {
         error!(
             "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
@@ -379,6 +341,7 @@ impl SignalArch for X86_64SignalArch {
 /// @return Result<0,SystemError> 若Error, 则返回错误码,否则返回Ok(0)
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#787
+#[inline(never)]
 fn handle_signal(
     sig: Signal,
     sigaction: &mut Sigaction,
@@ -389,10 +352,20 @@ fn handle_signal(
     if unsafe { frame.syscall_nr() }.is_some() {
         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
             match syscall_err {
-                SystemError::ERESTARTNOHAND | SystemError::ERESTART_RESTARTBLOCK => {
+                SystemError::ERESTARTNOHAND => {
                     frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                 }
                 SystemError::ERESTARTSYS => {
+                    if !sigaction.flags().contains(SigFlags::SA_RESTART) {
+                        frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
+                    } else {
+                        frame.rax = frame.errcode;
+                        frame.rip -= 2;
+                    }
+                }
+                SystemError::ERESTART_RESTARTBLOCK => {
+                    // 为了让带 SA_RESTART 的时序（例如 clock_nanosleep 相对睡眠）也能自动重启，
+                    // 当 SA_RESTART 设置时，按 ERESTARTSYS 的语义处理；否则返回 EINTR。
                     if !sigaction.flags().contains(SigFlags::SA_RESTART) {
                         frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                     } else {
@@ -485,7 +458,7 @@ fn setup_frame(
         }
     }
     let frame: *mut SigFrame = get_stack(trap_frame, size_of::<SigFrame>());
-    // debug!("frame=0x{:016x}", frame as usize);
+
     // 要求这个frame的地址位于用户空间，因此进行校验
     let r: Result<UserBufferWriter<'_>, SystemError> =
         UserBufferWriter::new(frame, size_of::<SigFrame>(), true);
@@ -504,14 +477,14 @@ fn setup_frame(
     }
 
     // 将siginfo拷贝到用户栈
-    info.copy_siginfo_to_user(unsafe { &mut ((*frame).info) as *mut SigInfo })
+    info.copy_posix_siginfo_to_user(unsafe { &mut ((*frame).info) as *mut PosixSigInfo })
         .map_err(|e| -> SystemError {
             let r = crate::ipc::kill::kill_process(
                 ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             );
             if r.is_err() {
-                error!("In copy_siginfo_to_user: generate SIGSEGV signal failed");
+                error!("In copy_posix_siginfo_to_user: generate SIGSEGV signal failed");
             }
             return e;
         })?;
@@ -542,7 +515,7 @@ fn setup_frame(
     unsafe { (*frame).handler = temp_handler };
     // 传入信号处理函数的第一个参数
     trap_frame.rdi = sig as u64;
-    trap_frame.rsi = unsafe { &(*frame).info as *const SigInfo as u64 };
+    trap_frame.rsi = unsafe { &(*frame).info as *const PosixSigInfo as u64 };
     trap_frame.rsp = frame as u64;
     trap_frame.rip = unsafe { (*frame).handler as u64 };
     // 设置cs和ds寄存器

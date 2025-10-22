@@ -21,7 +21,7 @@ impl SysNanosleep {
 
 impl Syscall for SysNanosleep {
     fn num_args(&self) -> usize {
-        1
+        2
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {

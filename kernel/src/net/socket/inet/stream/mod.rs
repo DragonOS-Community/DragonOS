@@ -230,6 +230,7 @@ impl TcpSocket {
 
     pub fn try_send(&self, buf: &[u8]) -> Result<usize, SystemError> {
         // TODO: add nonblock check of connecting socket
+        self.inner.read().as_ref().unwrap().iface().unwrap().poll();
         let sent = match self
             .inner
             .read()
@@ -271,6 +272,11 @@ impl TcpSocket {
     #[inline]
     fn do_poll(&self) -> usize {
         self.pollee.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[inline]
+    pub fn can_recv(&self) -> bool {
+        self.check_io_event().contains(EP::EPOLLIN)
     }
 
     pub fn netns(&self) -> Arc<NetNamespace> {
@@ -374,8 +380,20 @@ impl Socket for TcpSocket {
         .map(|(sock, ep)| (sock as Arc<dyn Socket>, Endpoint::Ip(ep)))
     }
 
-    fn recv(&self, buffer: &mut [u8], _flags: PMSG) -> Result<usize, SystemError> {
-        self.try_recv(buffer)
+    fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
+        use crate::sched::SchedMode;
+        return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
+            self.try_recv(buffer)
+        } else {
+            loop {
+                match self.try_recv(buffer) {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) | Err(SystemError::ENOBUFS) => {
+                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                    }
+                    result => break result,
+                }
+            }
+        };
     }
 
     fn send(&self, buffer: &[u8], _flags: PMSG) -> Result<usize, SystemError> {

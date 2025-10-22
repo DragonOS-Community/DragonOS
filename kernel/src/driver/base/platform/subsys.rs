@@ -84,8 +84,32 @@ impl Bus for PlatformBus {
         todo!()
     }
 
-    fn shutdown(&self, _device: &Arc<dyn Device>) {
-        todo!()
+    /// # 功能
+    ///
+    /// platform bus上的设备被关闭时调用
+    ///
+    /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_bus_type#1428
+    fn shutdown(&self, device: &Arc<dyn Device>) {
+        let platform_device = device
+            .clone()
+            .cast::<dyn PlatformDevice>()
+            .expect("PlatformBus::shutdown() failed: this device is not a PlatformDevice");
+        let driver = platform_device.driver();
+        if driver.is_none() {
+            return;
+        }
+
+        let platform_driver = driver
+            .unwrap()
+            .cast::<dyn PlatformDriver>()
+            .expect("PlatformBus::shutdown() failed: this driver is not a PlatformDriver");
+        if let Err(err) = platform_driver.shutdown(&platform_device) {
+            error!(
+                "PlatformBus::shutdown() failed: '{:?}', Error: '{:?}'",
+                platform_device.name(),
+                err
+            );
+        }
     }
 
     fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {

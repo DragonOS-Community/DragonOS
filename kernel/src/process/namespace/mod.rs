@@ -1,3 +1,4 @@
+pub mod ipc_namespace;
 pub mod mnt;
 pub mod net_namespace;
 pub mod nsproxy;

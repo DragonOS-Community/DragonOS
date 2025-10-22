@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
@@ -15,9 +15,9 @@ use crate::{
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
-    ipc::pipe::PipeFsPrivateData,
+    ipc::{kill::kill_process, pipe::PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    process::{cred::Cred, ProcessManager},
+    process::{cred::Cred, resource::RLimitID, ProcessManager},
 };
 
 /// 文件私有信息的枚举类型
@@ -129,6 +129,8 @@ pub struct File {
     pub private_data: SpinLock<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
+    /// 文件描述符标志：是否在execve时关闭
+    close_on_exec: AtomicBool,
 }
 
 impl File {
@@ -136,7 +138,7 @@ impl File {
     ///
     /// @param inode 文件对象对应的inode
     /// @param mode 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mode: FileMode) -> Result<Self, SystemError> {
+    pub fn new(inode: Arc<dyn IndexNode>, mut mode: FileMode) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
         if file_type == FileType::Pipe {
@@ -144,6 +146,8 @@ impl File {
                 inode = pipe_inode;
             }
         }
+        let close_on_exec = mode.contains(FileMode::O_CLOEXEC);
+        mode.remove(FileMode::O_CLOEXEC);
 
         let private_data = SpinLock::new(FilePrivateData::default());
         inode.open(private_data.lock(), &mode)?;
@@ -156,6 +160,7 @@ impl File {
             readdir_subdirs_name: SpinLock::new(Vec::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
+            close_on_exec: AtomicBool::new(close_on_exec),
         };
 
         return Ok(f);
@@ -267,20 +272,50 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
+        // 检查RLIMIT_FSIZE限制
+        let current_pcb = ProcessManager::current_pcb();
+        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+
+        // 计算实际可写入的长度
+        let actual_len = if fsize_limit.rlim_cur != u64::MAX {
+            let limit = fsize_limit.rlim_cur as usize;
+
+            // 如果当前文件大小已经达到或超过限制，不允许写入
+            if offset >= limit {
+                // 发送SIGXFSZ信号
+                let _ = kill_process(
+                    current_pcb.raw_pid(),
+                    crate::arch::ipc::signal::Signal::SIGXFSZ,
+                );
+                return Err(SystemError::EFBIG);
+            }
+
+            // 计算可写入的最大长度（不超过限制）
+            let max_writable = limit.saturating_sub(offset);
+            if len > max_writable {
+                // 部分写入：只写到限制位置，不发送信号
+                max_writable
+            } else {
+                len
+            }
+        } else {
+            len
+        };
+
         // 如果文件指针已经超过了文件大小，则需要扩展文件大小
         if offset > self.inode.metadata()?.size as usize {
             self.inode.resize(offset)?;
         }
-        let len = self
+        let written_len = self
             .inode
-            .write_at(offset, len, buf, self.private_data.lock())?;
+            .write_at(offset, actual_len, buf, self.private_data.lock())?;
 
         if update_offset {
             self.offset
-                .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
+                .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
         }
 
-        Ok(len)
+        Ok(written_len)
     }
 
     /// @brief 获取文件的元数据
@@ -340,8 +375,15 @@ impl File {
     /// @brief 判断当前文件是否可写
     #[inline]
     pub fn writeable(&self) -> Result<(), SystemError> {
+        let mode = *self.mode.read();
+
+        // 检查是否是O_PATH文件描述符
+        if mode.contains(FileMode::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
         // 暂时认为只要不是read only, 就可写
-        if *self.mode.read() == FileMode::O_RDONLY {
+        if mode == FileMode::O_RDONLY {
             return Err(SystemError::EPERM);
         }
 
@@ -409,8 +451,10 @@ impl File {
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
             private_data: SpinLock::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
+            close_on_exec: AtomicBool::new(self.close_on_exec.load(Ordering::SeqCst)),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
+        // TODO: reopen is not a good idea for some inodes, need a better design
         if self
             .inode
             .open(res.private_data.lock(), &res.mode())
@@ -437,25 +481,27 @@ impl File {
     /// 获取文件是否在execve时关闭
     #[inline]
     pub fn close_on_exec(&self) -> bool {
-        return self.mode().contains(FileMode::O_CLOEXEC);
+        return self.close_on_exec.load(Ordering::SeqCst);
     }
 
     /// 设置文件是否在execve时关闭
     #[inline]
     pub fn set_close_on_exec(&self, close_on_exec: bool) {
-        let mut mode_guard = self.mode.write();
-        if close_on_exec {
-            mode_guard.insert(FileMode::O_CLOEXEC);
-        } else {
-            mode_guard.remove(FileMode::O_CLOEXEC);
-        }
+        self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
     }
 
-    pub fn set_mode(&self, mode: FileMode) -> Result<(), SystemError> {
+    pub fn set_mode(&self, mut mode: FileMode) -> Result<(), SystemError> {
         // todo: 是否需要调用inode的open方法，以更新private data（假如它与mode有关的话）?
         // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
 
-        // 直接修改文件的打开模式
+        // 提取 O_CLOEXEC 状态并更新 close_on_exec 字段
+        let close_on_exec = mode.contains(FileMode::O_CLOEXEC);
+        self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
+
+        // 从 mode 中移除 O_CLOEXEC 标志，保持与构造函数一致的行为
+        mode.remove(FileMode::O_CLOEXEC);
+
+        // 更新文件的打开模式
         *self.mode.write() = mode;
         self.private_data.lock().update_mode(mode);
         return Ok(());
@@ -472,8 +518,8 @@ impl File {
         // 如果文件不可写，返回错误
         self.writeable()?;
 
-        // 调用inode的truncate方法
-        self.inode.resize(len)?;
+        // 统一通过 VFS 封装，复用类型/只读检查
+        crate::filesystem::vfs::vcore::vfs_truncate(self.inode(), len)?;
         return Ok(());
     }
 
@@ -527,12 +573,15 @@ impl Default for FileDescriptorVec {
     }
 }
 impl FileDescriptorVec {
-    pub const PROCESS_MAX_FD: usize = 1024;
+    /// 文件描述符表的初始容量
+    pub const INITIAL_CAPACITY: usize = 1024;
+    /// 文件描述符表的最大容量限制（防止无限扩容）
+    pub const MAX_CAPACITY: usize = 65536;
 
     #[inline(never)]
     pub fn new() -> FileDescriptorVec {
-        let mut data = Vec::with_capacity(FileDescriptorVec::PROCESS_MAX_FD);
-        data.resize(FileDescriptorVec::PROCESS_MAX_FD, None);
+        let mut data = Vec::with_capacity(FileDescriptorVec::INITIAL_CAPACITY);
+        data.resize(FileDescriptorVec::INITIAL_CAPACITY, None);
 
         // 初始化文件描述符数组结构体
         return FileDescriptorVec { fds: data };
@@ -543,14 +592,55 @@ impl FileDescriptorVec {
     /// @return FileDescriptorVec 克隆后的文件描述符数组
     pub fn clone(&self) -> FileDescriptorVec {
         let mut res = FileDescriptorVec::new();
-        for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+        // 调整容量以匹配源文件描述符表
+        let _ = res.resize_to_capacity(self.fds.len());
+
+        for i in 0..self.fds.len() {
             if let Some(file) = &self.fds[i] {
-                if let Some(file) = file.try_clone() {
-                    res.fds[i] = Some(Arc::new(file));
-                }
+                res.fds[i] = Some(file.clone());
             }
         }
         return res;
+    }
+
+    /// 返回当前已占用的最高文件描述符索引（若无则为None）
+    #[inline]
+    fn highest_open_index(&self) -> Option<usize> {
+        // 从高到低查找第一个占用的槽位
+        (0..self.fds.len()).rev().find(|&i| self.fds[i].is_some())
+    }
+
+    /// 扩容文件描述符表到指定容量
+    ///
+    /// ## 参数
+    /// - `new_capacity`: 新的容量大小
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 扩容成功
+    /// - `Err(SystemError)`: 扩容失败
+    fn resize_to_capacity(&mut self, new_capacity: usize) -> Result<(), SystemError> {
+        if new_capacity > FileDescriptorVec::MAX_CAPACITY {
+            return Err(SystemError::EMFILE);
+        }
+
+        let current_len = self.fds.len();
+        if new_capacity > current_len {
+            // 扩容：扩展向量并填充None
+            // 使用 try_reserve 先检查内存分配是否可能成功
+            if self.fds.try_reserve(new_capacity - current_len).is_err() {
+                return Err(SystemError::ENOMEM);
+            }
+            self.fds.resize(new_capacity, None);
+        } else if new_capacity < current_len {
+            // 缩容：允许，但不能丢弃仍在使用的高位fd。
+            // 若高位fd仍在使用，将缩容目标提升到 (最高已用fd + 1)。
+            let floor = self.highest_open_index().map(|idx| idx + 1).unwrap_or(0);
+            let target = core::cmp::max(new_capacity, floor);
+            if target < current_len {
+                self.fds.truncate(target);
+            }
+        }
+        Ok(())
     }
 
     /// 返回 `已经打开的` 文件描述符的数量
@@ -570,8 +660,8 @@ impl FileDescriptorVec {
     ///
     /// @return false 不合法
     #[inline]
-    pub fn validate_fd(fd: i32) -> bool {
-        return !(fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD);
+    pub fn validate_fd(&self, fd: i32) -> bool {
+        return !(fd < 0 || fd as usize >= self.fds.len());
     }
 
     /// 申请文件描述符，并把文件对象存入其中。
@@ -586,7 +676,22 @@ impl FileDescriptorVec {
     /// - `Ok(i32)` 申请成功，返回申请到的文件描述符
     /// - `Err(SystemError)` 申请失败，返回错误码，并且，file对象将被drop掉
     pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
+        // 获取RLIMIT_NOFILE限制
+        let nofile_limit = crate::process::ProcessManager::current_pcb()
+            .get_rlimit(crate::process::resource::RLimitID::Nofile)
+            .rlim_cur as usize;
+
         if let Some(new_fd) = fd {
+            // 检查指定的文件描述符是否在有效范围内
+            if new_fd < 0 || new_fd as usize >= nofile_limit {
+                return Err(SystemError::EMFILE);
+            }
+
+            // 如果指定的fd超出当前容量，需要扩容
+            if new_fd as usize >= self.fds.len() {
+                self.resize_to_capacity(new_fd as usize + 1)?;
+            }
+
             let x = &mut self.fds[new_fd as usize];
             if x.is_none() {
                 *x = Some(Arc::new(file));
@@ -595,8 +700,9 @@ impl FileDescriptorVec {
                 return Err(SystemError::EBADF);
             }
         } else {
-            // 没有指定要申请的文件描述符编号
-            for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+            // 没有指定要申请的文件描述符编号，在有效范围内查找空位
+            let max_search = core::cmp::min(self.fds.len(), nofile_limit);
+            for i in 0..max_search {
                 if self.fds[i].is_none() {
                     self.fds[i] = Some(Arc::new(file));
                     return Ok(i as i32);
@@ -612,10 +718,35 @@ impl FileDescriptorVec {
     ///
     /// - `fd` 文件描述符序号
     pub fn get_file_by_fd(&self, fd: i32) -> Option<Arc<File>> {
-        if !FileDescriptorVec::validate_fd(fd) {
+        if !self.validate_fd(fd) {
             return None;
         }
         self.fds[fd as usize].clone()
+    }
+
+    /// 当RLIMIT_NOFILE变化时调整文件描述符表容量
+    ///
+    /// ## 参数
+    /// - `new_rlimit_nofile`: 新的RLIMIT_NOFILE值
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 调整成功
+    /// - `Err(SystemError)`: 调整失败
+    pub fn adjust_for_rlimit_change(
+        &mut self,
+        new_rlimit_nofile: usize,
+    ) -> Result<(), SystemError> {
+        // 目标容量不超过实现上限
+        let desired = core::cmp::min(new_rlimit_nofile, FileDescriptorVec::MAX_CAPACITY);
+        if desired >= self.fds.len() {
+            // rlimit 变大：扩容到 desired
+            self.resize_to_capacity(desired)
+        } else {
+            // rlimit 变小：按用户建议，缩容到 max(desired, 最高已用fd+1)
+            let floor = self.highest_open_index().map(|idx| idx + 1).unwrap_or(0);
+            let target = core::cmp::max(desired, floor);
+            self.resize_to_capacity(target)
+        }
     }
 
     /// 释放文件描述符，同时关闭文件。
@@ -637,7 +768,7 @@ impl FileDescriptorVec {
     }
 
     pub fn close_on_exec(&mut self) {
-        for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
+        for i in 0..self.fds.len() {
             if let Some(file) = &self.fds[i] {
                 let to_drop = file.close_on_exec();
                 if to_drop {
@@ -671,7 +802,7 @@ impl Iterator for FileDescriptorIterator<'_> {
     type Item = (i32, Arc<File>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < FileDescriptorVec::PROCESS_MAX_FD {
+        while self.index < self.fds.fds.len() {
             let fd = self.index as i32;
             self.index += 1;
             if let Some(file) = self.fds.get_file_by_fd(fd) {

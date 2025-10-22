@@ -116,8 +116,28 @@ impl Bus for PciBus {
         todo!()
     }
 
-    fn shutdown(&self, _device: &Arc<dyn Device>) {
-        todo!()
+    /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci-driver.c#505
+    fn shutdown(&self, device: &Arc<dyn Device>) {
+        let pci_device = device
+            .clone()
+            .cast::<dyn PciDevice>()
+            .expect("PciBus::shutdown() failed: device is not a PciDevice");
+        let driver = pci_device.driver();
+        if driver.is_none() {
+            return;
+        }
+
+        let pci_driver = driver
+            .unwrap()
+            .cast::<dyn PciDriver>()
+            .expect("PciBus::shutdown() failed: device.driver() is not a PciDriver");
+        if let Err(err) = pci_driver.shutdown(&pci_device) {
+            error!(
+                "PciBus::shutdown() failed: device.driver().shutdown() failed. Device: '{:?}', Error: '{:?}'",
+                device.name(),
+                err
+            );
+        }
     }
 
     fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {

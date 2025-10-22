@@ -12,8 +12,8 @@ use smoltcp::socket::tcp;
 use system_error::SystemError;
 
 // pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
-pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
+pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024;
+pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024;
 
 fn new_smoltcp_socket() -> smoltcp::socket::tcp::Socket<'static> {
     let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; DEFAULT_RX_BUF_SIZE]);
@@ -426,7 +426,7 @@ impl Established {
     pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         self.inner
             .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-                if socket.can_send() {
+                if socket.can_recv() {
                     match socket.recv_slice(buf) {
                         Ok(size) => Ok(size),
                         Err(tcp::RecvError::InvalidState) => {

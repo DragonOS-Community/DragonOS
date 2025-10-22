@@ -270,8 +270,10 @@ impl SerioDriver for Ps2MouseDriver {
         todo!()
     }
 
+    // TODO: https://elixir.bootlin.com/linux/v6.6/source/drivers/input/mouse/psmouse-base.c#L1428
     fn cleanup(&self, _device: &Arc<dyn SerioDevice>) -> Result<(), system_error::SystemError> {
-        todo!()
+        // 目前并没有初始化并使用相关资源，所以do nothing
+        return Ok(());
     }
 }
 

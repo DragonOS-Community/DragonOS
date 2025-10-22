@@ -20,11 +20,12 @@ use crate::{
 
 use super::{cmdline::kenrel_cmdline_param_manager, initcall::do_initcalls};
 
-const INIT_PROC_TRYLIST: [(&str, Option<&str>); 4] = [
+const INIT_PROC_TRYLIST: [(&str, Option<&str>); 5] = [
     ("/bin/dragonreach", None),
     ("/bin/busybox", Some("init")),
     ("/bin/init", None),
     ("/bin/sh", None),
+    ("/bin/riscv_rust_init", None), // 对vf2, 目前没做cmdline的适配, 加个默认寻找
 ];
 
 static mut SYSTEM_STATE: SystemState = SystemState::Booting;

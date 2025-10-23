@@ -5,6 +5,7 @@ pub mod eventfd;
 pub mod ext4;
 pub mod fat;
 pub mod fs;
+pub mod i_cache;
 pub mod kernfs;
 pub mod mbr;
 pub mod overlayfs;

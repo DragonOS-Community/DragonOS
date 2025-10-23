@@ -3,14 +3,15 @@ use system_error::SystemError;
 use log::debug;
 
 use crate::{
-    libs::{casting::DowncastArc, spinlock::SpinLockGuard},
+    libs::spinlock::SpinLockGuard,
     filesystem::{
         kernfs::{KernFSInode, callback::KernInodePrivateData},
         vfs::{
             syscall::ModeType, IndexNode, Metadata, FilePrivateData,
-            FileType, file::FileMode
+            FileType, file::FileMode, Magic, InodeId,
         },
         procfs::ProcFS,
+        i_cache::{lookup_inode_by_pid, cache_pid_inode, uncache_pid_inode, allocate_pid_inode_id},
     },
     process::ProcessManager,
 };
@@ -255,13 +256,13 @@ impl IndexNode for ProcFSPidInode {
         self.kernfs_inode.move_to(old_name, target, new_name)
     }
 
-    fn get_entry_name(&self, ino: crate::filesystem::vfs::InodeId) -> Result<String, SystemError> {
+    fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
         self.kernfs_inode.get_entry_name(ino)
     }
 
     fn get_entry_name_and_metadata(
         &self,
-        ino: crate::filesystem::vfs::InodeId,
+        ino: InodeId,
     ) -> Result<(String, Metadata), SystemError> {
         self.kernfs_inode.get_entry_name_and_metadata(ino)
     }
@@ -412,13 +413,13 @@ impl IndexNode for ProcFSNsInode {
         self.kernfs_inode.move_to(old_name, target, new_name)
     }
 
-    fn get_entry_name(&self, ino: crate::filesystem::vfs::InodeId) -> Result<String, SystemError> {
+    fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
         self.kernfs_inode.get_entry_name(ino)
     }
 
     fn get_entry_name_and_metadata(
         &self,
-        ino: crate::filesystem::vfs::InodeId,
+        ino: InodeId,
     ) -> Result<(String, Metadata), SystemError> {
         self.kernfs_inode.get_entry_name_and_metadata(ino)
     }
@@ -447,8 +448,21 @@ impl ProcFS {
     /// 这是纯动态模式的核心方法，所有PID目录都通过此方法临时创建
     /// 返回包装后的PID目录inode，提供正确的list实现
     pub fn create_temporary_process_directory(&self, pid: ProcessId, ns_pid_name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // 1) 确认进程存在
+
+        // 1) 先确认进程存在
         let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+
+        // 检查缓存中是否存在已有的PID目录inode
+        // lookup_inode_by_pid 会自动验证PCB是否匹配，避免PID复用问题
+        if let Some(cached_inode) = lookup_inode_by_pid(Magic::PROC_MAGIC, pid, &pcb) {
+            let inode_id = allocate_pid_inode_id(Magic::PROC_MAGIC, pid, &pcb);
+            debug!("create_temporary_process_directory: Found cached PID directory for PID {} (inode_id: {:?})", 
+                   pid.data(), inode_id);
+            return Ok(cached_inode);
+        }
+
+        debug!("create_temporary_process_directory: Cache miss for PID {}, creating new directory", 
+               pid.data());
 
         // 2) 获取该进程在当前挂载实例的 pidns 中的 PID 号
         let ns = &self.pid_namespace();
@@ -484,11 +498,23 @@ impl ProcFS {
         
         // 5) 返回包装后的PID目录inode，提供Linux风格的动态文件创建
         let wrapped_pid_dir = ProcFSPidInode::new(process_dir, pid);
-        Ok(wrapped_pid_dir as Arc<dyn IndexNode>)
+        let wrapped_pid_dir_arc = wrapped_pid_dir as Arc<dyn IndexNode>;
+        
+        // 6) 缓存新创建的inode以供后续复用
+        if let Err(e) = cache_pid_inode(Magic::PROC_MAGIC, pid, &pcb, wrapped_pid_dir_arc.clone()) {
+            debug!("create_temporary_process_directory: Failed to cache PID directory for PID {}: {:?}", 
+                   pid.data(), e);
+            // 缓存失败不影响正常功能，继续返回inode
+        } else {
+            let inode_id = allocate_pid_inode_id(Magic::PROC_MAGIC, pid, &pcb);
+            debug!("create_temporary_process_directory: Successfully cached PID directory for PID {} (inode_id: {:?})", 
+                   pid.data(), inode_id);
+        }
+        
+        Ok(wrapped_pid_dir_arc)
     }
 
     /// 在纯动态模式下的进程目录清理
-    /// 不再依赖PCB存在来清理目录，因为目录本身就是临时创建的
     pub fn remove_process_directory(&self, pid: ProcessId) -> Result<(), SystemError> {
         ::log::info!(
             "remove_process_directory: Process {} exited in namespace level {} (pure dynamic mode - no active cleanup needed)",
@@ -496,9 +522,14 @@ impl ProcFS {
             self.pid_namespace().level()
         );
         
-        // 在纯动态模式下，进程目录是临时创建的，不需要主动清理
-        // 当进程不存在时，dynamic_find 和 dynamic_list 会自动排除该进程
-        // 临时节点的生命周期由Arc引用计数管理
+        // 从缓存中移除对应的PID目录inode
+        if let Some(_) = uncache_pid_inode(Magic::PROC_MAGIC, pid) {
+            debug!("remove_process_directory: Successfully removed cached PID directory for PID {}", 
+                   pid.data());
+        } else {
+            debug!("remove_process_directory: No cached PID directory found for PID {}", 
+                   pid.data());
+        }
         
         // 记录日志以便调试
         if !ProcessManager::initialized() {

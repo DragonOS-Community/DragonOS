@@ -28,7 +28,13 @@ use super::{
 };
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表
-const ROOTFS_TRY_LIST: [&str; 4] = ["/dev/sda1", "/dev/sda", "/dev/vda1", "/dev/vda"];
+const ROOTFS_TRY_LIST: [&str; 5] = [
+    "/dev/sda1",
+    "/dev/sda",
+    "/dev/vda1",
+    "/dev/vda",
+    "/dev/sdio1",
+];
 kernel_cmdline_param_kv!(ROOTFS_PATH_PARAM, root, "");
 
 /// @brief 原子地生成新的Inode号。

@@ -23,6 +23,10 @@ pub enum FcntlCommand {
     SetLock = 6,
     /// set record locking info (blocking)
     SetLockWait = 7,
+    /// set owner
+    SetOwn = 8,
+    /// get owner
+    GetOwn = 9,
 
     SetLease = F_LINUX_SPECIFIC_BASE,
     GetLease = F_LINUX_SPECIFIC_BASE + 1,

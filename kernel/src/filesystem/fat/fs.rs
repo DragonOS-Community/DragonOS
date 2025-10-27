@@ -18,6 +18,7 @@ use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
+use crate::libs::casting::DowncastArc;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::{
@@ -266,11 +267,11 @@ impl LockedFATInode {
         new_name: &str,
     ) -> Result<(), SystemError> {
         let mut guard = self.0.lock();
-        let old_inode: Arc<LockedFATInode> = guard.find(old_name)?;
+        let old_inode = guard.find(old_name)?;
         // 对目标inode上锁，以防更改
-        let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
+        let old_inode_guard = old_inode.0.lock();
         let fs = old_inode_guard.fs.upgrade().unwrap();
-        // 从缓存删除
+
         let old_dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
@@ -281,11 +282,14 @@ impl LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         };
-        // 检查文件是否存在
-        // old_dir.check_existence(old_name, Some(false), guard.fs.upgrade().unwrap())?;
 
+        // remove entries
         old_dir.rename(fs, old_name, new_name)?;
-        let _nod = guard.children.remove(&to_search_name(old_name));
+
+        let old_inode = guard.children.remove(&to_search_name(old_name)).unwrap();
+        // the new_name should refer to old_inode
+        guard.children.insert(to_search_name(new_name), old_inode);
+
         Ok(())
     }
 
@@ -1486,6 +1490,31 @@ impl FATFsInfo {
     }
 }
 
+impl LockedFATInode {
+    fn try_read_pagecache(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let page_cache = self.0.lock().page_cache.clone();
+        if let Some(page_cache) = page_cache {
+            let r = page_cache.lock_irqsave().read(offset, buf);
+            return r;
+        } else {
+            return self.read_sync(offset, buf);
+        }
+    }
+
+    fn try_write_pagecache(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let page_cache = self.0.lock().page_cache.clone();
+        if let Some(page_cache) = page_cache {
+            let write_len = page_cache.lock_irqsave().write(offset, buf)?;
+            let mut guard = self.0.lock();
+            let old_size = guard.metadata.size;
+            guard.update_metadata(Some(core::cmp::max(old_size, (offset + write_len) as i64)));
+            return Ok(write_len);
+        } else {
+            return self.write_sync(offset, buf);
+        }
+    }
+}
+
 impl IndexNode for LockedFATInode {
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let guard: SpinLockGuard<FATInode> = self.0.lock();
@@ -1531,18 +1560,11 @@ impl IndexNode for LockedFATInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         let buf = &mut buf[0..len];
-
-        let page_cache = self.0.lock().page_cache.clone();
-        if let Some(page_cache) = page_cache {
-            let r = page_cache.lock_irqsave().read(offset, &mut buf[0..len]);
-            return r;
-        } else {
-            return self.read_direct(offset, len, buf, data);
-        }
+        self.try_read_pagecache(offset, buf)
     }
 
     fn write_at(
@@ -1550,21 +1572,11 @@ impl IndexNode for LockedFATInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         let buf = &buf[0..len];
-
-        let page_cache = self.0.lock().page_cache.clone();
-        if let Some(page_cache) = page_cache {
-            let write_len = page_cache.lock_irqsave().write(offset, buf)?;
-            let mut guard = self.0.lock();
-            let old_size = guard.metadata.size;
-            guard.update_metadata(Some(core::cmp::max(old_size, (offset + write_len) as i64)));
-            return Ok(write_len);
-        } else {
-            return self.write_direct(offset, len, buf, data);
-        }
+        self.try_write_pagecache(offset, buf)
     }
 
     fn read_direct(
@@ -1631,6 +1643,41 @@ impl IndexNode for LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         }
+    }
+
+    // fat32 does not support hard link
+    // TODO: remove this function
+    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        let ty = other.metadata()?.file_type;
+        let mode = other.metadata()?.mode;
+        let other = other
+            .downcast_ref::<LockedFATInode>()
+            .ok_or(SystemError::EINVAL)?;
+
+        let new_inode = self
+            .create(name, ty, mode)?
+            .downcast_arc::<LockedFATInode>()
+            .ok_or(SystemError::EINVAL)?;
+
+        let mut offset = 0;
+        let mut buf = [0u8; 512];
+        loop {
+            let read_len = other.try_read_pagecache(offset, &mut buf)?;
+            if read_len == 0 {
+                break;
+            }
+            log::error!("Fake FATFS(link): read_len={read_len}, offset={offset}");
+            let write_len = new_inode.try_write_pagecache(offset, &buf[0..read_len])?;
+            if write_len < read_len {
+                log::error!(
+                    "Fake FATFS(link): write link file failed, read_len={read_len}, write_len={write_len}"
+                );
+                return Err(SystemError::EIO);
+            }
+            offset += write_len;
+        }
+        log::error!("Fake FATFS(link): link file {name} success, size={offset}");
+        Ok(())
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

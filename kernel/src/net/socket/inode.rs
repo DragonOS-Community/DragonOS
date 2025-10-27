@@ -69,6 +69,17 @@ impl<T: Socket + 'static> IndexNode for T {
         ))
     }
 
+    // TODO: implement ioctl for socket
+    fn ioctl(
+        &self,
+        _cmd: u32,
+        _data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        log::warn!("Socket not support ioctl");
+        return Ok(0);
+    }
+
     fn as_socket(&self) -> Option<&dyn Socket> {
         Some(self)
     }

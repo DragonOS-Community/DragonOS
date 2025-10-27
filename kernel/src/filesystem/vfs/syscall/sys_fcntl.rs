@@ -1,4 +1,5 @@
 use crate::arch::syscall::nr::SYS_FCNTL;
+use crate::process::RawPid;
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
@@ -157,6 +158,37 @@ impl SysFcntlHandle {
                 }
 
                 return Err(SystemError::EBADF);
+            }
+            FcntlCommand::SetOwn => {
+                let pid = arg.unsigned_abs();
+                if pid > i32::MAX as u32 {
+                    return Err(SystemError::EINVAL);
+                }
+                let pb = if pid == 0 {
+                    None
+                } else {
+                    let pb =
+                        ProcessManager::find(RawPid::from(pid as _)).ok_or(SystemError::ESRCH)?;
+                    Some(pb)
+                };
+                let binding = ProcessManager::current_pcb().fd_table();
+                let file = binding
+                    .read()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                file.set_owner(pb)?;
+                Ok(0)
+            }
+
+            FcntlCommand::GetOwn => {
+                let binding = ProcessManager::current_pcb().fd_table();
+                let file = binding
+                    .read()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                let owner = file.owner().unwrap_or(RawPid::from(0));
+
+                return Ok(owner.data());
             }
             _ => {
                 // TODO: unimplemented

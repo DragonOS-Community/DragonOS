@@ -144,7 +144,7 @@ impl BoundUdp {
         let remote = to.or(*self.remote.lock()).ok_or(SystemError::ENOTCONN)?;
         let result = self.with_mut_socket(|socket| {
             if socket.can_send() && socket.send_slice(buf, remote).is_ok() {
-                log::debug!("send {} bytes", buf.len());
+                // log::debug!("send {} bytes", buf.len());
                 return Ok(buf.len());
             }
             return Err(SystemError::ENOBUFS);

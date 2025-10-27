@@ -83,7 +83,7 @@ void *server_func(void *arg) {
     printf("[server] Echoed back the message\n");
 
     close(sockfd);
-    printf("server goning to exit\n");
+    printf("server going to exit\n");
     return NULL;
 }
 

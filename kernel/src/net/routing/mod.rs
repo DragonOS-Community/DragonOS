@@ -282,7 +282,7 @@ pub trait RouterEnableDevice: Iface {
                     .interface
                     .route_and_send(next_hop, ipv4_packet_mut.as_ref());
 
-                log::info!("Routed packet from {} to {} ", self.iface_name(), dst_ip);
+                // log::info!("Routed packet from {} to {} ", self.iface_name(), dst_ip);
                 Ok(())
             }
             smoltcp::wire::EthernetProtocol::Arp => {
@@ -320,13 +320,13 @@ pub trait RouterEnableDevice: Iface {
 
         if let Some((new_dst_ip, new_dst_port)) = tracker.snat.lock().process_return_traffic(tuple)
         {
-            log::info!(
-                "Reverse SNAT: Translating {}:{} to {}:{}",
-                tuple.src_addr,
-                tuple.src_port,
-                new_dst_ip,
-                new_dst_port
-            );
+            // log::info!(
+            //     "Reverse SNAT: Translating {}:{} to {}:{}",
+            //     tuple.src_addr,
+            //     tuple.src_port,
+            //     new_dst_ip,
+            //     new_dst_port
+            // );
 
             SnatPolicy::update_dst(
                 tuple.src_addr,
@@ -349,13 +349,13 @@ pub trait RouterEnableDevice: Iface {
 
         let mut dnat_guard = tracker.dnat.lock();
         if let Some((new_dst_ip, new_dst_port)) = dnat_guard.process_new_connection(tuple) {
-            log::info!(
-                "DNAT: Translating {}:{} to {}:{}",
-                tuple.dst_addr,
-                tuple.dst_port,
-                new_dst_ip,
-                new_dst_port
-            );
+            // log::info!(
+            //     "DNAT: Translating {}:{} to {}:{}",
+            //     tuple.dst_addr,
+            //     tuple.dst_port,
+            //     new_dst_ip,
+            //     new_dst_port
+            // );
 
             DnatPolicy::update_dst(
                 tuple.src_addr,
@@ -401,13 +401,13 @@ pub trait RouterEnableDevice: Iface {
 
         if let Some((new_src_ip, new_src_port)) = tracker.dnat.lock().process_return_traffic(tuple)
         {
-            log::info!(
-                "Reverse DNAT: Translating src {}:{} -> {}:{}",
-                tuple.src_addr,
-                tuple.src_port,
-                new_src_ip,
-                new_src_port
-            );
+            // log::info!(
+            //     "Reverse DNAT: Translating src {}:{} -> {}:{}",
+            //     tuple.src_addr,
+            //     tuple.src_port,
+            //     new_src_ip,
+            //     new_src_port
+            // );
 
             DnatPolicy::update_src(
                 tuple.dst_addr,
@@ -422,13 +422,13 @@ pub trait RouterEnableDevice: Iface {
 
         let mut snat_guard = tracker.snat.lock();
         if let Some((new_src_ip, new_src_port)) = snat_guard.process_new_connection(tuple) {
-            log::info!(
-                "SNAT: Translating {}:{} -> {}:{}",
-                tuple.src_addr,
-                tuple.src_port,
-                new_src_ip,
-                new_src_port
-            );
+            // log::info!(
+            //     "SNAT: Translating {}:{} -> {}:{}",
+            //     tuple.src_addr,
+            //     tuple.src_port,
+            //     new_src_ip,
+            //     new_src_port
+            // );
 
             //TODO 应该加一个判断snat，可以支持直接改成出口接口的ip
             // // 修改源IP地址
@@ -458,7 +458,7 @@ pub trait RouterEnableDevice: Iface {
     fn route_and_send(&self, next_hop: &IpAddress, ip_packet: &[u8]);
 
     /// 检查IP地址是否是当前接口的IP
-    /// todo 这里实现有误，不应该判断是否当前接口的IP，而是应该判断是否是当前网络命名空间的IP，然脏
+    /// todo 这里实现有误，不应该判断是否当前接口的IP，而是应该判断是否是当前网络命名空间的IP
     fn is_my_ip(&self, ip: IpAddress) -> bool;
 
     fn netns_router(&self) -> Arc<Router> {

@@ -246,7 +246,7 @@ impl Socket for UdpSocket {
                 match self.try_recv(buffer) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
-                        log::debug!("UdpSocket::recv_from: wake up");
+                        // log::debug!("UdpSocket::recv_from: wake up");
                     }
                     result => break result,
                 }

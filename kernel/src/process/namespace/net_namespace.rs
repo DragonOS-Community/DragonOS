@@ -219,10 +219,10 @@ impl NetNamespace {
 
         self.device_list_mut().insert(device.nic_id(), device);
 
-        log::info!(
-            "Network device added to namespace count: {:?}",
-            self.device_list().len()
-        );
+        // log::info!(
+        //     "Network device added to namespace count: {:?}",
+        //     self.device_list().len()
+        // );
     }
 
     pub fn remove_device(&self, nic_id: &usize) {
@@ -247,7 +247,7 @@ impl NetNamespace {
     /// 并调用它们的poll方法
     /// 注意： 此方法仅可在初始化当前net namespace时创建进程使用
     fn polling(&self) {
-        log::info!("net_poll thread started for namespace");
+        // log::info!("net_poll thread started for namespace");
         loop {
             for (_, iface) in self.device_list.read_irqsave().iter() {
                 iface.poll();

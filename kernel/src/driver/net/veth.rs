@@ -255,7 +255,6 @@ impl DerefMut for VethDriverWarpper {
 
 impl VethDriverWarpper {
     #[allow(clippy::mut_from_ref)]
-    #[allow(clippy::mut_from_ref)]
     fn force_get_mut(&self) -> &mut VethDriver {
         unsafe { &mut *self.0.get() }
     }
@@ -636,10 +635,8 @@ impl Iface for VethInterface {
 
 impl BridgeEnableDevice for VethInterface {
     fn receive_from_bridge(&self, frame: &[u8]) {
-        log::info!("VethInterface {} received from bridge", self.name);
+        // log::info!("VethInterface {} received from bridge", self.name);
         let peer = self.peer_veth();
-
-        // let inner = self.inner.lock_irqsave();
 
         if self
             .inner
@@ -651,18 +648,11 @@ impl BridgeEnableDevice for VethInterface {
             .upgrade()
             .is_some()
         {
-            log::info!("VethInterface {} sending data to peer", self.name);
+            // log::info!("VethInterface {} sending data to peer", self.name);
 
             // let peer = self.peer_veth();
             Veth::to_peer(&peer, frame);
-            // self.driver
-            //     .inner
-            //     .lock_irqsave()
-            //     .rx_queue
-            //     .push_back(frame.to_vec());
-            // peer.poll();
         }
-        log::info!("returning");
     }
 
     fn set_common_bridge_data(&self, port: &BridgePort) {
@@ -681,12 +671,12 @@ impl BridgeEnableDevice for VethInterface {
 }
 
 impl RouterEnableDevice for VethInterface {
-    fn route_and_send(&self, next_hop: &IpAddress, ip_packet: &[u8]) {
-        log::info!(
-            "VethInterface {} routing packet to {}",
-            self.iface_name(),
-            next_hop
-        );
+    fn route_and_send(&self, _next_hop: &IpAddress, ip_packet: &[u8]) {
+        // log::info!(
+        //     "VethInterface {} routing packet to {}",
+        //     self.iface_name(),
+        //     next_hop
+        // );
 
         // 构造以太网帧
         let dst_mac = self.peer_veth().mac();

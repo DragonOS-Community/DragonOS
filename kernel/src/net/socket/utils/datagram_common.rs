@@ -191,7 +191,7 @@ where
             break bound_datagram;
         }
 
-        panic!("");
+        panic!("Socket binding state inconsistent after bind_ephemeral");
     };
 
     let remote_endpoint = match remote {

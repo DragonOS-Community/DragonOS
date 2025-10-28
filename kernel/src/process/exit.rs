@@ -78,6 +78,47 @@ pub fn kernel_wait4(
     return Ok(r);
 }
 
+pub fn kernel_waitid(
+    which: i32,
+    pid: i32,
+    _siginfo: *mut i32,
+    options: WaitOption,
+    _rusage_buf: Option<&mut RUsage>,
+) -> Result<usize, SystemError> {
+    let mut pid = pid;
+    if which == 0 {
+        pid = -1;
+    } else if which == 2 {
+        pid = -pid;
+    } else if which == 3 {
+        let file = ProcessManager::current_pcb()
+            .fd_table()
+            .read()
+            .get_file_by_fd(pid)
+            .unwrap();
+        if file.private_data.lock().is_pid() {
+            pid = file.private_data.lock().get_pid();
+        }
+    }
+    /*
+        log::info!(
+            "waitid, which:{}, tgid:{},cur:{}",
+            which,
+            pid,
+            ProcessManager::current_pcb().tgid().data()
+        );
+    */
+    let converter = PidConverter::from_id(pid).unwrap();
+    let mut kwo = KernelWaitOption::new(converter, options);
+
+    let r = do_wait(&mut kwo)?;
+
+    // TODO: 需要向用户写入信号相关信息
+
+    //log::info!("waitid done");
+    return Ok(r);
+}
+
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/exit.c#1573
 fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
     let mut retval: Result<usize, SystemError>;
@@ -110,6 +151,9 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
         kwo.no_task_error = Some(SystemError::ECHILD);
         match &kwo.pid_converter {
             PidConverter::Pid(pid) => {
+                if pid.pid_vnr().data() == ProcessManager::current_pcb().raw_tgid().data() {
+                    return Err(SystemError::ECHILD);
+                }
                 let child_pcb = pid
                     .pid_task(PidType::PID)
                     .ok_or(SystemError::ECHILD)

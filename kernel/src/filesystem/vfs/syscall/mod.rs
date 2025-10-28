@@ -28,6 +28,7 @@ mod sys_ioctl;
 mod sys_linkat;
 mod sys_lseek;
 mod sys_mkdirat;
+pub mod sys_mknodat;
 mod sys_openat;
 mod sys_pread64;
 mod sys_pselect6;

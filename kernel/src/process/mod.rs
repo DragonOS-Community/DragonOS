@@ -37,7 +37,7 @@ use crate::{
     ipc::{
         sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending},
+        signal_types::{SigInfo, SigPending, SigStack},
     },
     libs::{
         align::AlignedBox,
@@ -729,6 +729,8 @@ pub struct ProcessControlBlock {
     /// 与信号处理相关的信息(似乎可以是无锁的)
     sig_info: RwLock<ProcessSignalInfo>,
     sighand: RwLock<Arc<SigHand>>,
+    /// 备用信号栈
+    sig_altstack: RwLock<SigStack>,
 
     /// 退出信号S
     exit_signal: AtomicSignal,
@@ -871,6 +873,7 @@ impl ProcessControlBlock {
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RwLock::new(SigHand::new()),
+                sig_altstack: RwLock::new(SigStack::new()),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb),
@@ -1131,6 +1134,14 @@ impl ProcessControlBlock {
         return &self.sched_info;
     }
 
+    pub fn sig_altstack(&self) -> RwLockReadGuard<'_, SigStack> {
+        self.sig_altstack.read_irqsave()
+    }
+
+    pub fn sig_altstack_mut(&self) -> RwLockWriteGuard<'_, SigStack> {
+        self.sig_altstack.write_irqsave()
+    }
+
     #[inline(always)]
     pub fn worker_private(&self) -> SpinLockGuard<'_, Option<WorkerPrivate>> {
         return self.worker_private.lock();
@@ -1138,6 +1149,11 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn raw_pid(&self) -> RawPid {
+        return self.pid;
+    }
+
+    #[inline(always)]
+    pub fn raw_tgid(&self) -> RawPid {
         return self.pid;
     }
 

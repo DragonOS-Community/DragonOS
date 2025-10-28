@@ -14,6 +14,7 @@ impl CFilesArch for X86_64CFilesArch {
         files.insert(PathBuf::from("src/arch/x86_64/asm/head.S"));
         files.insert(PathBuf::from("src/arch/x86_64/asm/entry.S"));
         files.insert(PathBuf::from("src/arch/x86_64/asm/apu_boot.S"));
+        files.insert(PathBuf::from("src/arch/x86_64/asm/relocate_kernel_64.S"));
         files.insert(PathBuf::from("src/arch/x86_64/vm/vmx/vmenter.S"));
     }
 

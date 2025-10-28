@@ -5,7 +5,7 @@ use crate::{
             addr::NetlinkSocketAddr,
             common::bound::BoundNetlink,
             message::ProtocolSegment,
-            route::{kernel::NetlinkRouteKernelSocket, message::RouteNlMessage},
+            route::{kern::NetlinkRouteKernelSocket, message::RouteNlMessage},
         },
         utils::datagram_common,
         PMSG,

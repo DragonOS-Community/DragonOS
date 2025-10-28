@@ -1,7 +1,7 @@
 mod multicast;
 
 use crate::net::socket::netlink::addr::multicast::GroupIdSet;
-use crate::net::socket::netlink::route::kernel::NetlinkRouteKernelSocket;
+use crate::net::socket::netlink::route::kern::NetlinkRouteKernelSocket;
 use crate::net::socket::netlink::route::message::RouteNlMessage;
 use crate::net::socket::netlink::table::multicast::MulticastMessage;
 use crate::process::namespace::net_namespace::NetNamespace;

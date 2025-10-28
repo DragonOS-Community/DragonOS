@@ -7,7 +7,7 @@ use crate::{
                 CSegmentType,
             },
             route::{
-                kernel::utils::finish_response,
+                kern::utils::finish_response,
                 message::{
                     attr::addr::AddrAttr,
                     segment::{

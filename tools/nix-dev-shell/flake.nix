@@ -12,7 +12,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         rustVer = fenix.packages.${system}.fromToolchainName {
-          name = "nightly-2024-11-05";
+          name = "nightly-2025-08-10";
           sha256 = "sha256-muM2tfsMpo2gsFsofhwHutPWgiPjjuwfBUvYCrwomAY=";
         };
         # 组合工具链并提取二进制路径

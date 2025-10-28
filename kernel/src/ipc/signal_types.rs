@@ -297,9 +297,10 @@ pub struct SigInfo {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct PosixSigInfo {
+    // 注意：与 Linux 保持一致的字段顺序：si_signo, si_errno, si_code
     pub si_signo: i32,
-    pub si_code: i32,
     pub si_errno: i32,
+    pub si_code: i32,
     pub _sifields: PosixSiginfoFields,
 }
 
@@ -316,6 +317,9 @@ pub union PosixSiginfoFields {
     // 填充到128字节
     _pad: [u8; 128 - 16],
 }
+
+// 编译期校验：确保 PosixSigInfo 与 Linux 的 siginfo_t 大小一致（128 字节）
+const _: [(); 128] = [(); core::mem::size_of::<PosixSigInfo>()];
 
 impl core::fmt::Debug for PosixSiginfoFields {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -577,6 +581,8 @@ impl SigPending {
         // 定义过滤器，从sigqueue中删除mask中被置位的信号
         let filter = |x: &SigInfo| !mask.contains(SigSet::from_bits_truncate(x.sig_no as u64));
         self.queue.q.retain(filter);
+        // 同步清理位图中的相应位，避免仅删除队列项但仍因位图残留被视为pending
+        self.signal.remove(*mask);
     }
 }
 

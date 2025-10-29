@@ -4,20 +4,13 @@
 //! 敬请注意。
 use core::sync::atomic::AtomicUsize;
 
-use alloc::{collections::BTreeMap, sync::Arc};
-
-use crate::{driver::net::Iface, libs::rwlock::RwLock};
+use crate::driver::net::Iface;
 
 pub mod net_core;
 pub mod posix;
+pub mod routing;
 pub mod socket;
 pub mod syscall;
-
-lazy_static! {
-    /// # 所有网络接口的列表
-    /// 这个列表在中断上下文会使用到，因此需要irqsave
-    pub static ref NET_DEVICES: RwLock<BTreeMap<usize, Arc<dyn Iface>>> = RwLock::new(BTreeMap::new());
-}
 
 /// 生成网络接口的id (全局自增)
 pub fn generate_iface_id() -> usize {

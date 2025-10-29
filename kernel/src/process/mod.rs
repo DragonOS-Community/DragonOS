@@ -14,7 +14,6 @@ use alloc::{
 };
 use cred::INIT_CRED;
 use hashbrown::HashMap;
-use intertrait::cast::CastArc;
 use log::{debug, error, info, warn};
 use pid::{alloc_pid, Pid, PidLink, PidType};
 use process_group::Pgid;
@@ -56,7 +55,6 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    net::socket::Socket,
     process::resource::{RLimit64, RLimitID},
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
@@ -1191,7 +1189,7 @@ impl ProcessControlBlock {
         self.task_tgid_vnr().unwrap() == RawPid(1)
     }
 
-    /// 根据文件描述符序号，获取socket对象的Arc指针
+    /// 根据文件描述符序号，获取socket相应的IndexNode的Arc指针
     ///
     /// this is a helper function
     ///
@@ -1201,8 +1199,13 @@ impl ProcessControlBlock {
     ///
     /// ## 返回值
     ///
-    /// Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
-    pub fn get_socket(&self, fd: i32) -> Result<Arc<dyn Socket>, SystemError> {
+    /// 如果fd对应的文件是一个socket，那么返回这个socket相应的IndexNode的Arc指针，否则返回错误码
+    ///
+    /// # 注意
+    /// 因为底层的Socket中可能包含泛型，经过类型擦除转换成Arc<dyn Socket>的时候内部的泛型信息会丢失;
+    /// 因此这里返回Arc<dyn IndexNode>，可在外部直接通过 `as_socket()` 转换成 `Option<&dyn Socket>`;
+    /// 因为内部已经经过检查，因此在外部可以直接 `unwarp` 来获取 `&dyn Socket`
+    pub fn get_socket_inode(&self, fd: i32) -> Result<Arc<dyn IndexNode>, SystemError> {
         let f = ProcessManager::current_pcb()
             .fd_table()
             .read()
@@ -1215,11 +1218,15 @@ impl ProcessControlBlock {
         if f.file_type() != FileType::Socket {
             return Err(SystemError::EBADF);
         }
+
+        let inode = f.inode();
         // log::info!("get_socket: fd {} is a socket", fd);
-        f.inode().cast::<dyn Socket>().map_err(|_| {
-            log::error!("get_socket: fd {} is not a socket", fd);
-            SystemError::EBADF
-        })
+        if let Some(_sock) = inode.as_socket() {
+            // log::info!("{:?}", sock);
+            return Ok(inode);
+        }
+
+        Err(SystemError::EBADF)
     }
 
     /// 当前进程退出时,让初始进程收养所有子进程

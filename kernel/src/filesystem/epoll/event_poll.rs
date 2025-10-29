@@ -663,6 +663,7 @@ impl EventPoll {
                 epoll_guard.ep_add_ready(epitem.clone());
 
                 if epoll_guard.ep_has_waiter() {
+                    // log::info!("wakeup epoll waiters");
                     if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
                         && !pollflags.contains(EPollEventType::POLLFREE)
                     {

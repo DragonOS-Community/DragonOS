@@ -26,6 +26,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
+    net::socket::Socket,
     process::ProcessManager,
     time::PosixTimeSpec,
 };
@@ -686,6 +687,19 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
             crate::libs::name::get_type_name(&self)
         );
         return Err(SystemError::ENOSYS);
+    }
+
+    /// # 将当前Inode转换为 Socket 引用
+    ///
+    /// # 返回值
+    /// - Some(&dyn Socket): 当前Inode是Socket类型，返回其引用
+    /// - None: 当前Inode不是Socket类型
+    ///
+    /// # 注意
+    /// 这个方法已经为dyn Socket实现，
+    /// 所以如果可以确定当前`dyn IndexNode`是`dyn Socket`类型，则可以直接调用此方法进行转换
+    fn as_socket(&self) -> Option<&dyn Socket> {
+        None
     }
 }
 

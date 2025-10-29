@@ -195,3 +195,9 @@ bitflags! {
         const EPOLL_LISTEN_CAN_ACCEPT = Self::EPOLLIN.bits | Self::EPOLLRDNORM.bits;
     }
 }
+
+impl EPollEventType {
+    pub fn filter(&self, events: &EPollEventType) -> bool {
+        self.intersects(*events)
+    }
+}

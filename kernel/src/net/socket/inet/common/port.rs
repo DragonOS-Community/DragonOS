@@ -19,14 +19,16 @@ pub struct PortManager {
     udp_port_table: SpinLock<HashMap<u16, RawPid>>,
 }
 
-impl PortManager {
-    pub fn new() -> Self {
-        return Self {
+impl Default for PortManager {
+    fn default() -> Self {
+        Self {
             tcp_port_table: SpinLock::new(HashMap::new()),
             udp_port_table: SpinLock::new(HashMap::new()),
-        };
+        }
     }
+}
 
+impl PortManager {
     /// @brief 自动分配一个相对应协议中未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
     pub fn get_ephemeral_port(&self, socket_type: Types) -> Result<u16, SystemError> {
         // TODO: selects non-conflict high port

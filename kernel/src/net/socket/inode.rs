@@ -79,6 +79,10 @@ impl<T: Socket + 'static> IndexNode for T {
         log::warn!("Socket not support ioctl");
         return Ok(0);
     }
+
+    fn as_socket(&self) -> Option<&dyn Socket> {
+        Some(self)
+    }
 }
 
 impl<T: Socket + 'static> PollableInode for T {

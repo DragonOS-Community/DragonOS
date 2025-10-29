@@ -1,7 +1,14 @@
+use alloc::sync::Weak;
 use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
+use core::net::Ipv4Addr;
 use sysfs::netdev_register_kobject;
 
+use crate::driver::net::napi::NapiStruct;
+use crate::driver::net::types::{InterfaceFlags, InterfaceType};
+use crate::libs::rwlock::RwLockReadGuard;
+use crate::net::routing::RouterEnableDeviceCommon;
+use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::socket::inet::{common::PortManager, InetSocket},
@@ -10,13 +17,16 @@ use crate::{
 use smoltcp;
 use system_error::SystemError;
 
+pub mod bridge;
 pub mod class;
 mod dma;
 pub mod e1000e;
 pub mod irq_handle;
-pub mod kthread;
 pub mod loopback;
+pub mod napi;
 pub mod sysfs;
+pub mod types;
+pub mod veth;
 pub mod virtio_net;
 
 bitflags! {
@@ -74,13 +84,11 @@ pub trait Iface: crate::driver::base::device::Device {
     }
 
     /// # `poll`
-    /// 用于轮询接口的状态。
-    /// ## 参数
-    /// - `sockets` ：一个可变引用到 `smoltcp::iface::SocketSet`，表示要轮询的套接字集
+    /// 用于轮询网卡，处理网络事件
     /// ## 返回值
-    /// - 成功返回 `Ok(())`
-    /// - 如果轮询失败，返回 `Err(SystemError::EAGAIN_OR_EWOULDBLOCK)`，表示需要再次尝试或者操作会阻塞
-    fn poll(&self);
+    /// - `true`：表示有网络事件发生
+    /// - `false`：表示没有网络事件
+    fn poll(&self) -> bool;
 
     /// # `update_ip_addrs`
     /// 用于更新接口的 IP 地址
@@ -122,6 +130,34 @@ pub trait Iface: crate::driver::base::device::Device {
     fn operstate(&self) -> Operstate;
 
     fn set_operstate(&self, state: Operstate);
+
+    fn net_namespace(&self) -> Option<Arc<NetNamespace>> {
+        self.common().net_namespace()
+    }
+
+    fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
+        self.common().set_net_namespace(ns);
+    }
+
+    fn flags(&self) -> InterfaceFlags {
+        self.common().flags()
+    }
+
+    fn type_(&self) -> InterfaceType {
+        self.common().type_()
+    }
+
+    fn mtu(&self) -> usize;
+
+    /// # 获取当前iface的napi结构体
+    /// 默认返回None，表示不支持napi
+    fn napi_struct(&self) -> Option<Arc<napi::NapiStruct>> {
+        self.common().napi_struct.read().clone()
+    }
+
+    fn router_common(&self) -> &RouterEnableDeviceCommon {
+        &self.common().router_common_data
+    }
 }
 
 /// 网络设备的公共数据
@@ -162,6 +198,8 @@ fn register_netdevice(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
 
 pub struct IfaceCommon {
     iface_id: usize,
+    flags: InterfaceFlags,
+    type_: InterfaceType,
     smol_iface: SpinLock<smoltcp::iface::Interface>,
     /// 存smoltcp网卡的套接字集
     sockets: SpinLock<smoltcp::iface::SocketSet<'static>>,
@@ -171,9 +209,12 @@ pub struct IfaceCommon {
     port_manager: PortManager,
     /// 下次轮询的时间
     poll_at_ms: core::sync::atomic::AtomicU64,
-    /// 默认网卡标识
-    /// TODO: 此字段设置目的是解决对bind unspecified地址的分包问题，需要在inet实现多网卡监听或路由子系统实现后移除
-    default_iface: bool,
+    /// 网络命名空间
+    net_namespace: RwLock<Weak<NetNamespace>>,
+    /// 路由相关数据
+    router_common_data: RouterEnableDeviceCommon,
+    /// NAPI 结构体
+    napi_struct: RwLock<Option<Arc<NapiStruct>>>,
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -186,19 +227,33 @@ impl fmt::Debug for IfaceCommon {
 }
 
 impl IfaceCommon {
-    pub fn new(iface_id: usize, default_iface: bool, iface: smoltcp::iface::Interface) -> Self {
+    pub fn new(
+        iface_id: usize,
+        type_: InterfaceType,
+        flags: InterfaceFlags,
+        iface: smoltcp::iface::Interface,
+    ) -> Self {
+        let router_common_data = RouterEnableDeviceCommon::default();
+        router_common_data
+            .ip_addrs
+            .write()
+            .extend_from_slice(iface.ip_addrs());
         IfaceCommon {
             iface_id,
             smol_iface: SpinLock::new(iface),
             sockets: SpinLock::new(smoltcp::iface::SocketSet::new(Vec::new())),
             bounds: RwLock::new(Vec::new()),
-            port_manager: PortManager::new(),
+            port_manager: PortManager::default(),
             poll_at_ms: core::sync::atomic::AtomicU64::new(0),
-            default_iface,
+            net_namespace: RwLock::new(Weak::new()),
+            router_common_data,
+            flags,
+            type_,
+            napi_struct: RwLock::new(None),
         }
     }
 
-    pub fn poll<D>(&self, device: &mut D)
+    pub fn poll<D>(&self, device: &mut D) -> bool
     where
         D: smoltcp::phy::Device + ?Sized,
     {
@@ -227,6 +282,12 @@ impl IfaceCommon {
         // drop sockets here to avoid deadlock
         drop(interface);
         drop(sockets);
+        // log::info!(
+        //     "polling iface {}, has_events: {}, poll_at: {:?}",
+        //     self.iface_id,
+        //     has_events,
+        //     poll_at
+        // );
 
         use core::sync::atomic::Ordering;
         if let Some(instant) = poll_at {
@@ -259,6 +320,7 @@ impl IfaceCommon {
         //     .extract_if(|closing_socket| closing_socket.is_closed())
         //     .collect::<Vec<_>>();
         // drop(closed_sockets);
+        has_events
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
@@ -291,8 +353,36 @@ impl IfaceCommon {
         }
     }
 
-    // TODO: 需要在inet实现多网卡监听或路由子系统实现后移除
-    pub fn is_default_iface(&self) -> bool {
-        self.default_iface
+    pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {
+        self.smol_iface.lock().ipv4_addr()
+    }
+
+    pub fn ip_addrs(&self) -> RwLockReadGuard<'_, Vec<smoltcp::wire::IpCidr>> {
+        self.router_common_data.ip_addrs.read()
+    }
+
+    pub fn prefix_len(&self) -> Option<u8> {
+        self.smol_iface
+            .lock()
+            .ip_addrs()
+            .first()
+            .map(|ip_addr| ip_addr.prefix_len())
+    }
+
+    pub fn net_namespace(&self) -> Option<Arc<NetNamespace>> {
+        self.net_namespace.read().upgrade()
+    }
+
+    pub fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
+        let mut guard = self.net_namespace.write();
+        *guard = Arc::downgrade(&ns);
+    }
+
+    pub fn flags(&self) -> InterfaceFlags {
+        self.flags
+    }
+
+    pub fn type_(&self) -> InterfaceType {
+        self.type_
     }
 }

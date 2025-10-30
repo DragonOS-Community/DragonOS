@@ -21,7 +21,7 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
-        vfs::{IndexNode, InodeId, Metadata},
+        vfs::{IndexNode, InodeId, Metadata,file::FileMode},
     },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -891,6 +891,16 @@ impl Debug for LoopControlDevice {
     }
 }
 impl IndexNode for LoopControlDevice {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
+
+
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Ok(());
+    }
     fn metadata(&self) -> Result<Metadata, SystemError> {
         use crate::filesystem::vfs::{syscall::ModeType, FileType, InodeId};
         use crate::time::PosixTimeSpec;
@@ -925,6 +935,7 @@ impl IndexNode for LoopControlDevice {
     ) -> Result<usize, SystemError> {
         match cmd {
             LOOP_CTL_ADD => {
+                log::info!("Starting LOOP_CTL_ADD ioctl");
                 let requested_index = data as u32;
                 match self.loop_mgr.loop_add(Some(requested_index)) {
                     Ok(loop_dev) => Ok(loop_dev.inner().device_number.minor() as usize),

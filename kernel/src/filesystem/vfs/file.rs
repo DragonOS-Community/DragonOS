@@ -5,6 +5,7 @@ use log::error;
 use system_error::SystemError;
 
 use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use crate::process::pid::PidPrivateData;
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
@@ -34,6 +35,8 @@ pub enum FilePrivateData {
     Tty(TtyFilePrivateData),
     /// epoll私有信息
     EPoll(EPollPrivateData),
+    /// pid私有信息
+    Pid(PidPrivateData),
     /// 不需要文件私有信息
     Unused,
 }
@@ -49,6 +52,20 @@ impl FilePrivateData {
         if let FilePrivateData::Pipefs(pdata) = self {
             pdata.set_mode(mode);
         }
+    }
+
+    pub fn is_pid(&self) -> bool {
+        if let FilePrivateData::Pid(_data) = self {
+            return true;
+        }
+        false
+    }
+
+    pub fn get_pid(&self) -> i32 {
+        if let FilePrivateData::Pid(data) = self {
+            return data.pid();
+        }
+        -1
     }
 }
 

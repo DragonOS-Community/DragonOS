@@ -28,4 +28,6 @@ pub mod wait_queue;
 pub mod font;
 pub mod name;
 
+pub mod decompress;
+
 pub mod pod;

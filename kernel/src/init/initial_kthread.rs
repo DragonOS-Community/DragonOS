@@ -6,6 +6,9 @@ use alloc::ffi::CString;
 use log::{debug, error};
 use system_error::SystemError;
 
+#[cfg(feature = "initram")]
+use crate::filesystem::vfs::vcore::change_root_fs;
+
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::net::e1000e::e1000e::e1000e_init,
@@ -72,7 +75,14 @@ fn kernel_init() -> Result<(), SystemError> {
         .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
         .ok();
 
-    mount_root_fs().expect("Failed to mount root fs");
+    if super::enable_initramfs() {
+        // 使用 initramfs, 迁移文件系统
+        #[cfg(feature = "initram")]
+        change_root_fs().expect("Failed to mount root fs");
+    } else {
+        // 不使用 initramfs, 正常启动
+        mount_root_fs().expect("Failed to mount root fs");
+    }
 
     // WARNING: We must keep `mount_root_fs` before stdio_init,
     // because `migrate_virtual_filesystem` will change the root directory of the file system.
@@ -117,7 +127,15 @@ fn switch_to_user() -> ! {
 
     let mut trap_frame = TrapFrame::new();
 
-    if let Some(path) = kenrel_cmdline_param_manager().init_proc_path() {
+    if super::enable_initramfs() {
+        // 使用 initramfs, 启动 /init
+        log::info!("Initramfs, Boot with specified init process: /init");
+
+        try_to_run_init_process("/init", &mut proc_init_info, &None, &mut trap_frame)
+            .unwrap_or_else(|e| {
+                panic!("Failed to run specified init process: /init, err: {:?}", e)
+            });
+    } else if let Some(path) = kenrel_cmdline_param_manager().init_proc_path() {
         log::info!("Boot with specified init process: {:?}", path);
 
         try_to_run_init_process(

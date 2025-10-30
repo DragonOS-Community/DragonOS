@@ -162,6 +162,23 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     return Ok(());
 }
 
+#[cfg(feature = "initram")]
+pub fn change_root_fs() -> Result<(), SystemError> {
+    info!("Try to change root fs to initramfs...");
+    let initramfs = crate::init::initram::INIT_ROOT_INODE().fs();
+    let r = migrate_virtual_filesystem(initramfs);
+
+    if r.is_err() {
+        error!("Failed to migrate virtual filesystem to initramfs!");
+        loop {
+            spin_loop();
+        }
+    }
+    info!("Successfully migrate rootfs to initramfs!");
+
+    return Ok(());
+}
+
 define_event_trace!(
     do_mkdir_at,
     TP_system(vfs),

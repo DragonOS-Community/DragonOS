@@ -309,11 +309,6 @@ impl Syscall {
 
             SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
 
-            SYS_SIGALTSTACK => {
-                warn!("SYS_SIGALTSTACK has not yet been implemented");
-                Ok(0)
-            }
-
             SYS_SYSLOG => {
                 let syslog_action_type = args[0];
                 let buf_vaddr = args[1];

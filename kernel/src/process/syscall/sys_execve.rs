@@ -1,4 +1,6 @@
 use alloc::string::String;
+#[allow(unused_imports)]
+use alloc::string::ToString;
 use alloc::sync::Arc;
 
 use crate::arch::interrupt::TrapFrame;
@@ -59,8 +61,22 @@ impl SysExecve {
         envp: *const *const u8,
     ) -> Result<(CString, Vec<CString>, Vec<CString>), SystemError> {
         let path: CString = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        #[cfg(not(feature = "initram"))]
         let argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
+        #[cfg(feature = "initram")]
+        let mut argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
         let envp: Vec<CString> = check_and_clone_cstr_array(envp)?;
+
+        // 这里需要处理符号链接, 目前内核没有完整实现, 这里是个简易的替代
+        // 例如执行/bin/echo, 必须拿到echo这个名字, 目前内核只有硬链接, 会执行/bin/busybox, 导致无法识别命令
+        #[cfg(feature = "initram")]
+        {
+            let real =
+                crate::filesystem::vfs::get_link_true_file(argv[0].to_string_lossy().to_string())
+                    .unwrap();
+            argv[0] = CString::new(real).unwrap();
+        }
+
         Ok((path, argv, envp))
     }
 

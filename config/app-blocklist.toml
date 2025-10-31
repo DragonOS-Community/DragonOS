@@ -65,3 +65,6 @@ log_skipped = true
 [[blocked_apps]]
 name = "gvisor syscall tests"
 reason = "由于文件较大，因此屏蔽。如果要允许系统调用测试，则把这几行取消注释即可"
+[[blocked_apps]]
+name = "NovaShell"
+reason = "工具链版本有问题，应为nightly-2025-8-10"

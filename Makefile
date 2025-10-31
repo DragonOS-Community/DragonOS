@@ -153,6 +153,16 @@ run-docker: check_arch
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
 
+test-syscall: check_arch
+	@echo "构建运行并执行syscall测试"
+	bash user/apps/tests/syscall/gvisor/enable_compile_gvisor.sh
+	$(MAKE) all -j $(NPROCS)
+	$(MAKE) write_diskimage || exit 1
+	$(MAKE) qemu-nographic AUTO_TEST=syscall SYSCALL_TEST_DIR=/opt/tests/gvisor &
+	QEMU_PID=$$!
+	bash user/apps/tests/syscall/gvisor/monitor_test_results.sh || { bash user/apps/tests/syscall/gvisor/disable_compile_gvisor.sh; exit 1; }
+	bash user/apps/tests/syscall/gvisor/disable_compile_gvisor.sh
+
 fmt: check_arch
 	@echo "格式化代码" 
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C kernel
@@ -199,6 +209,7 @@ help:
 	@echo "  make log-monitor      - 启动日志监控"
 	@echo "  make docs             - 生成文档"
 	@echo "  make clean-docs       - 清理文档"
+	@echo "  make test-syscall     - 构建运行并执行syscall测试"
 	@echo ""
 	@echo "  make update-submodules - 更新子模块"
 	@echo "  make update-submodules-by-mirror - 从镜像更新子模块"

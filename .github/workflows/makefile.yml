@@ -28,6 +28,7 @@ jobs:
         shell: bash -ileo pipefail {0}
         run: |
           printf "\n" >> kernel/src/include/bindings/bindings.rs
+          printf "\n" >> kernel/src/init/version_info.rs
           sed -i 's/arch = ".*"/arch = "${{ matrix.arch }}"/' dadk-manifest.toml
           FMT_CHECK=1 make fmt
 

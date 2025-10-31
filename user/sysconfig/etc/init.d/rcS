@@ -1,3 +1,8 @@
 #!/bin/sh
 echo "[rcS] Running system init script..."
 /bin/about.elf
+
+# 根据环境变量AUTO_TEST决定是否进行自动测试
+if [ "$AUTO_TEST" = "syscall" ]; then
+    /bin/busybox sh $SYSCALL_TEST_DIR/run_tests.sh
+fi

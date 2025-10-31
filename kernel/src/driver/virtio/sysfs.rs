@@ -107,7 +107,7 @@ impl Bus for VirtIOBus {
     }
 
     fn shutdown(&self, _device: &Arc<dyn Device>) {
-        todo!()
+        // do nothing
     }
 
     fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {

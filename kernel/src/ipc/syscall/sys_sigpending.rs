@@ -29,9 +29,9 @@ pub(super) fn do_kernel_rt_sigpending(
     let pcb = ProcessManager::current_pcb();
     let siginfo_guard = pcb.sig_info_irqsave();
     let pending_set = siginfo_guard.sig_pending().signal();
-    let shared_pending_set = siginfo_guard.sig_shared_pending().signal();
     let blocked_set = *siginfo_guard.sig_blocked();
     drop(siginfo_guard);
+    let shared_pending_set = pcb.sighand().shared_pending_signal();
 
     let mut result = pending_set.union(shared_pending_set);
     result = result.difference(blocked_set);

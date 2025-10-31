@@ -1,20 +1,32 @@
+use alloc::sync::Weak;
+use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
-use smoltcp::{
-    iface,
-    wire::{self, EthernetAddress},
-};
+use core::net::Ipv4Addr;
 use sysfs::netdev_register_kobject;
 
-use super::base::device::Device;
-use crate::libs::spinlock::SpinLock;
+use crate::driver::net::napi::NapiStruct;
+use crate::driver::net::types::{InterfaceFlags, InterfaceType};
+use crate::libs::rwlock::RwLockReadGuard;
+use crate::net::routing::RouterEnableDeviceCommon;
+use crate::process::namespace::net_namespace::NetNamespace;
+use crate::{
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+    net::socket::inet::{common::PortManager, InetSocket},
+    process::ProcessState,
+};
+use smoltcp;
 use system_error::SystemError;
 
+pub mod bridge;
 pub mod class;
 mod dma;
 pub mod e1000e;
 pub mod irq_handle;
 pub mod loopback;
+pub mod napi;
 pub mod sysfs;
+pub mod types;
+pub mod veth;
 pub mod virtio_net;
 
 bitflags! {
@@ -52,22 +64,60 @@ pub enum Operstate {
 }
 
 #[allow(dead_code)]
-pub trait NetDevice: Device {
-    /// @brief 获取网卡的MAC地址
-    fn mac(&self) -> EthernetAddress;
+pub trait Iface: crate::driver::base::device::Device {
+    /// # `common`
+    /// 获取网卡的公共信息
+    fn common(&self) -> &IfaceCommon;
 
+    /// # `mac`
+    /// 获取网卡的MAC地址
+    fn mac(&self) -> smoltcp::wire::EthernetAddress;
+
+    /// # `name`
+    /// 获取网卡名
     fn iface_name(&self) -> String;
 
-    /// @brief 获取网卡的id
-    fn nic_id(&self) -> usize;
+    /// # `nic_id`
+    /// 获取网卡id
+    fn nic_id(&self) -> usize {
+        self.common().iface_id
+    }
 
-    fn poll(&self, sockets: &mut iface::SocketSet) -> Result<(), SystemError>;
+    /// # `poll`
+    /// 用于轮询网卡，处理网络事件
+    /// ## 返回值
+    /// - `true`：表示有网络事件发生
+    /// - `false`：表示没有网络事件
+    fn poll(&self) -> bool;
 
-    fn update_ip_addrs(&self, ip_addrs: &[wire::IpCidr]) -> Result<(), SystemError>;
+    /// # `update_ip_addrs`
+    /// 用于更新接口的 IP 地址
+    /// ## 参数
+    /// - `ip_addrs` ：一个包含 `smoltcp::wire::IpCidr` 的切片，表示要设置的 IP 地址和子网掩码
+    /// ## 返回值
+    /// - 如果 `ip_addrs` 的长度不为 1，返回 `Err(SystemError::EINVAL)`，表示输入参数无效
+    fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
+        self.common().update_ip_addrs(ip_addrs)
+    }
 
     /// @brief 获取smoltcp的网卡接口类型
-    fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface>;
+    #[inline(always)]
+    fn smol_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
+        &self.common().smol_iface
+    }
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
+
+    /// # `sockets`
+    /// 获取网卡的套接字集
+    fn sockets(&self) -> &SpinLock<smoltcp::iface::SocketSet<'static>> {
+        &self.common().sockets
+    }
+
+    /// # `port_manager`
+    /// 用于管理网卡的端口
+    fn port_manager(&self) -> &PortManager {
+        &self.common().port_manager
+    }
 
     fn addr_assign_type(&self) -> u8;
 
@@ -80,6 +130,34 @@ pub trait NetDevice: Device {
     fn operstate(&self) -> Operstate;
 
     fn set_operstate(&self, state: Operstate);
+
+    fn net_namespace(&self) -> Option<Arc<NetNamespace>> {
+        self.common().net_namespace()
+    }
+
+    fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
+        self.common().set_net_namespace(ns);
+    }
+
+    fn flags(&self) -> InterfaceFlags {
+        self.common().flags()
+    }
+
+    fn type_(&self) -> InterfaceType {
+        self.common().type_()
+    }
+
+    fn mtu(&self) -> usize;
+
+    /// # 获取当前iface的napi结构体
+    /// 默认返回None，表示不支持napi
+    fn napi_struct(&self) -> Option<Arc<napi::NapiStruct>> {
+        self.common().napi_struct.read().clone()
+    }
+
+    fn router_common(&self) -> &RouterEnableDeviceCommon {
+        &self.common().router_common_data
+    }
 }
 
 /// 网络设备的公共数据
@@ -108,7 +186,7 @@ impl Default for NetDeviceCommonData {
 
 /// 将网络设备注册到sysfs中
 /// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/dev.c?fi=register_netdev#5373
-fn register_netdevice(dev: Arc<dyn NetDevice>) -> Result<(), SystemError> {
+fn register_netdevice(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
     // 在sysfs中注册设备
     netdev_register_kobject(dev.clone())?;
 
@@ -116,4 +194,195 @@ fn register_netdevice(dev: Arc<dyn NetDevice>) -> Result<(), SystemError> {
     dev.set_net_state(NetDeivceState::__LINK_STATE_PRESENT);
 
     return Ok(());
+}
+
+pub struct IfaceCommon {
+    iface_id: usize,
+    flags: InterfaceFlags,
+    type_: InterfaceType,
+    smol_iface: SpinLock<smoltcp::iface::Interface>,
+    /// 存smoltcp网卡的套接字集
+    sockets: SpinLock<smoltcp::iface::SocketSet<'static>>,
+    /// 存 kernel wrap smoltcp socket 的集合
+    bounds: RwLock<Vec<Arc<dyn InetSocket>>>,
+    /// 端口管理器
+    port_manager: PortManager,
+    /// 下次轮询的时间
+    poll_at_ms: core::sync::atomic::AtomicU64,
+    /// 网络命名空间
+    net_namespace: RwLock<Weak<NetNamespace>>,
+    /// 路由相关数据
+    router_common_data: RouterEnableDeviceCommon,
+    /// NAPI 结构体
+    napi_struct: RwLock<Option<Arc<NapiStruct>>>,
+}
+
+impl fmt::Debug for IfaceCommon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IfaceCommon")
+            .field("iface_id", &self.iface_id)
+            .field("poll_at_ms", &self.poll_at_ms)
+            .finish()
+    }
+}
+
+impl IfaceCommon {
+    pub fn new(
+        iface_id: usize,
+        type_: InterfaceType,
+        flags: InterfaceFlags,
+        iface: smoltcp::iface::Interface,
+    ) -> Self {
+        let router_common_data = RouterEnableDeviceCommon::default();
+        router_common_data
+            .ip_addrs
+            .write()
+            .extend_from_slice(iface.ip_addrs());
+        IfaceCommon {
+            iface_id,
+            smol_iface: SpinLock::new(iface),
+            sockets: SpinLock::new(smoltcp::iface::SocketSet::new(Vec::new())),
+            bounds: RwLock::new(Vec::new()),
+            port_manager: PortManager::default(),
+            poll_at_ms: core::sync::atomic::AtomicU64::new(0),
+            net_namespace: RwLock::new(Weak::new()),
+            router_common_data,
+            flags,
+            type_,
+            napi_struct: RwLock::new(None),
+        }
+    }
+
+    pub fn poll<D>(&self, device: &mut D) -> bool
+    where
+        D: smoltcp::phy::Device + ?Sized,
+    {
+        let timestamp = crate::time::Instant::now().into();
+        let mut sockets = self.sockets.lock_irqsave();
+        let mut interface = self.smol_iface.lock_irqsave();
+
+        let (has_events, poll_at) = {
+            (
+                matches!(
+                    interface.poll(timestamp, device, &mut sockets),
+                    smoltcp::iface::PollResult::SocketStateChanged
+                ),
+                loop {
+                    let poll_at = interface.poll_at(timestamp, &sockets);
+                    let Some(instant) = poll_at else {
+                        break poll_at;
+                    };
+                    if instant > timestamp {
+                        break poll_at;
+                    }
+                },
+            )
+        };
+
+        // drop sockets here to avoid deadlock
+        drop(interface);
+        drop(sockets);
+        // log::info!(
+        //     "polling iface {}, has_events: {}, poll_at: {:?}",
+        //     self.iface_id,
+        //     has_events,
+        //     poll_at
+        // );
+
+        use core::sync::atomic::Ordering;
+        if let Some(instant) = poll_at {
+            let _old_instant = self.poll_at_ms.load(Ordering::Relaxed);
+            let new_instant = instant.total_millis() as u64;
+            self.poll_at_ms.store(new_instant, Ordering::Relaxed);
+
+            // TODO: poll at
+            // if old_instant == 0 || new_instant < old_instant {
+            //     self.polling_wait_queue.wake_all();
+            // }
+        } else {
+            self.poll_at_ms.store(0, Ordering::Relaxed);
+        }
+
+        self.bounds.read_irqsave().iter().for_each(|bound_socket| {
+            // incase our inet socket missed the event, we manually notify it each time we poll
+            if has_events {
+                bound_socket.notify();
+                let _woke = bound_socket
+                    .wait_queue()
+                    .wakeup(Some(ProcessState::Blocked(true)));
+            }
+        });
+
+        // TODO: remove closed sockets
+        // let closed_sockets = self
+        //     .closing_sockets
+        //     .lock_irq_disabled()
+        //     .extract_if(|closing_socket| closing_socket.is_closed())
+        //     .collect::<Vec<_>>();
+        // drop(closed_sockets);
+        has_events
+    }
+
+    pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
+        if ip_addrs.len() != 1 {
+            return Err(SystemError::EINVAL);
+        }
+
+        self.smol_iface.lock().update_ip_addrs(|addrs| {
+            let dest = addrs.iter_mut().next();
+
+            if let Some(dest) = dest {
+                *dest = ip_addrs[0];
+            } else {
+                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
+            }
+        });
+        return Ok(());
+    }
+
+    // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发
+    pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
+        self.bounds.write().push(socket);
+    }
+
+    pub fn unbind_socket(&self, socket: Arc<dyn InetSocket>) {
+        let mut bounds = self.bounds.write();
+        if let Some(index) = bounds.iter().position(|s| Arc::ptr_eq(s, &socket)) {
+            bounds.remove(index);
+            log::debug!("unbind socket success");
+        }
+    }
+
+    pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {
+        self.smol_iface.lock().ipv4_addr()
+    }
+
+    pub fn ip_addrs(&self) -> RwLockReadGuard<'_, Vec<smoltcp::wire::IpCidr>> {
+        self.router_common_data.ip_addrs.read()
+    }
+
+    pub fn prefix_len(&self) -> Option<u8> {
+        self.smol_iface
+            .lock()
+            .ip_addrs()
+            .first()
+            .map(|ip_addr| ip_addr.prefix_len())
+    }
+
+    pub fn net_namespace(&self) -> Option<Arc<NetNamespace>> {
+        self.net_namespace.read().upgrade()
+    }
+
+    pub fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
+        let mut guard = self.net_namespace.write();
+        *guard = Arc::downgrade(&ns);
+    }
+
+    pub fn flags(&self) -> InterfaceFlags {
+        self.flags
+    }
+
+    pub fn type_(&self) -> InterfaceType {
+        self.type_
+    }
 }

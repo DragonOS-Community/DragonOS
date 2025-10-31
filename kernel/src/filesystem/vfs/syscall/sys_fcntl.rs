@@ -1,9 +1,10 @@
 use crate::arch::syscall::nr::SYS_FCNTL;
+use crate::process::RawPid;
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
         fcntl::{FcntlCommand, FD_CLOEXEC},
-        file::{FileDescriptorVec, FileMode},
+        file::FileMode,
         syscall::dup2::{do_dup2, do_dup3},
     },
     process::ProcessManager,
@@ -70,13 +71,19 @@ impl SysFcntlHandle {
         // debug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
             FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
-                if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
+                // RLIMIT_NOFILE 检查
+                let nofile = ProcessManager::current_pcb()
+                    .get_rlimit(crate::process::resource::RLimitID::Nofile)
+                    .rlim_cur as usize;
+                if arg < 0 || arg as usize >= nofile {
                     return Err(SystemError::EBADF);
                 }
                 let arg = arg as usize;
-                for i in arg..FileDescriptorVec::PROCESS_MAX_FD {
-                    let binding = ProcessManager::current_pcb().fd_table();
-                    let mut fd_table_guard = binding.write();
+                let binding = ProcessManager::current_pcb().fd_table();
+                let mut fd_table_guard = binding.write();
+
+                // 在RLIMIT_NOFILE范围内查找可用的文件描述符
+                for i in arg..nofile {
                     if fd_table_guard.get_file_by_fd(i as i32).is_none() {
                         if cmd == FcntlCommand::DupFd {
                             return do_dup2(fd, i as i32, &mut fd_table_guard);
@@ -152,12 +159,42 @@ impl SysFcntlHandle {
 
                 return Err(SystemError::EBADF);
             }
+            FcntlCommand::SetOwn => {
+                let pid = arg.unsigned_abs();
+                if pid > i32::MAX as u32 {
+                    return Err(SystemError::EINVAL);
+                }
+                let pb = if pid == 0 {
+                    None
+                } else {
+                    let pb =
+                        ProcessManager::find(RawPid::from(pid as _)).ok_or(SystemError::ESRCH)?;
+                    Some(pb)
+                };
+                let binding = ProcessManager::current_pcb().fd_table();
+                let file = binding
+                    .read()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                file.set_owner(pb)?;
+                Ok(0)
+            }
+
+            FcntlCommand::GetOwn => {
+                let binding = ProcessManager::current_pcb().fd_table();
+                let file = binding
+                    .read()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                let owner = file.owner().unwrap_or(RawPid::from(0));
+
+                return Ok(owner.data());
+            }
             _ => {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。
-
                 warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
-                return Err(SystemError::ENOSYS);
+                return Ok(0);
             }
         }
     }

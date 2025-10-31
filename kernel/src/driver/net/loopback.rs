@@ -7,11 +7,13 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
+use crate::driver::net::types::InterfaceFlags;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::net::{generate_iface_id, NET_DEVICES};
+use crate::net::generate_iface_id;
+use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use crate::time::Instant;
 use alloc::collections::VecDeque;
 use alloc::fmt::Debug;
@@ -28,7 +30,9 @@ use smoltcp::{
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use super::{register_netdevice, NetDeivceState, NetDevice, NetDeviceCommonData, Operstate};
+use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
+
+use super::{Iface, IfaceCommon};
 
 const DEVICE_NAME: &str = "loopback";
 
@@ -48,11 +52,11 @@ impl phy::RxToken for LoopbackRxToken {
     ///
     /// ## 返回值
     /// 返回函数 `f` 在 `self.buffer` 上的调用结果。
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(self.buffer.as_mut_slice())
+        f(self.buffer.as_slice())
     }
 }
 
@@ -81,10 +85,12 @@ impl phy::TxToken for LoopbackTxToken {
         let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
         device.loopback_transmit(buffer);
+        // debug!("lo transmit!");
         result
     }
 }
 
+#[derive(Default)]
 /// ## Loopback设备
 /// 成员是一个队列，用来存放接受到的数据包。
 /// 当使用lo发送数据包时，不会把数据包传到link层，而是直接发送到该队列，实现环回。
@@ -94,12 +100,6 @@ pub struct Loopback {
 }
 
 impl Loopback {
-    /// ## Loopback创建函数
-    /// 创建lo设备
-    pub fn new() -> Self {
-        let queue = VecDeque::new();
-        Loopback { queue }
-    }
     /// ## Loopback处理接受到的数据包函数
     /// Loopback接受到数据后会调用这个函数来弹出接收的数据，返回给协议栈
     ///
@@ -112,7 +112,7 @@ impl Loopback {
         let buffer = self.queue.pop_front();
         match buffer {
             Some(buffer) => {
-                //debug!("lo receive:{:?}", buffer);
+                // debug!("lo receive:{:?}", buffer);
                 return buffer;
             }
             None => {
@@ -127,7 +127,7 @@ impl Loopback {
     /// - &mut self：自身可变引用
     /// - buffer：需要发送的数据包
     pub fn loopback_transmit(&mut self, buffer: Vec<u8>) {
-        //debug!("lo transmit!");
+        // debug!("lo transmit:{:?}", buffer);
         self.queue.push_back(buffer)
     }
 }
@@ -169,10 +169,10 @@ pub struct LoopbackDriver {
     pub inner: Arc<SpinLock<Loopback>>,
 }
 
-impl LoopbackDriver {
+impl Default for LoopbackDriver {
     /// ## LoopbackDriver创建函数
-    pub fn new() -> Self {
-        let inner = Arc::new(SpinLock::new(Loopback::new()));
+    fn default() -> Self {
+        let inner = Arc::new(SpinLock::new(Loopback::default()));
         LoopbackDriver { inner }
     }
 }
@@ -200,7 +200,7 @@ impl phy::Device for LoopbackDriver {
         let mut result = phy::DeviceCapabilities::default();
         result.max_transmission_unit = 65535;
         result.max_burst_size = Some(1);
-        result.medium = smoltcp::phy::Medium::Ethernet;
+        result.medium = smoltcp::phy::Medium::Ip;
         return result;
     }
     /// ## Loopback驱动处理接受数据事件
@@ -220,8 +220,10 @@ impl phy::Device for LoopbackDriver {
         let buffer = self.inner.lock().loopback_receive();
         //receive队列为为空，返回NONE值以通知上层没有可以receive的包
         if buffer.is_empty() {
+            // log::debug!("lo receive none!");
             return Option::None;
         }
+        // log::debug!("lo receive!");
         let rx = LoopbackRxToken { buffer };
         let tx = LoopbackTxToken {
             driver: self.clone(),
@@ -238,6 +240,7 @@ impl phy::Device for LoopbackDriver {
     /// ## 返回值
     /// - 返回一个 `Some`，其中包含一个发送令牌，该令牌包含一个对自身的克隆引用
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        // log::debug!("lo transmit!");
         Some(LoopbackTxToken {
             driver: self.clone(),
         })
@@ -246,25 +249,32 @@ impl phy::Device for LoopbackDriver {
 
 /// ## LoopbackInterface结构
 /// 封装驱动包裹器和iface，设置接口名称
-#[cast_to([sync] NetDevice)]
+#[cast_to([sync] Iface)]
 #[cast_to([sync] Device)]
 pub struct LoopbackInterface {
     driver: LoopbackDriverWapper,
-    iface_id: usize,
-    iface: SpinLock<smoltcp::iface::Interface>,
-    name: String,
+    common: IfaceCommon,
     inner: SpinLock<InnerLoopbackInterface>,
     locked_kobj_state: LockedKObjectState,
 }
 
-#[derive(Debug)]
 pub struct InnerLoopbackInterface {
     netdevice_common: NetDeviceCommonData,
     device_common: DeviceCommonData,
     kobj_common: KObjectCommonData,
 }
 
+impl Debug for LoopbackInterface {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoopbackInterface")
+            .field("common", &self.common)
+            .finish()
+    }
+}
+
 impl LoopbackInterface {
+    pub const DEVICE_NAME: &str = "lo";
+
     /// ## `new` 是一个公共函数，用于创建一个新的 `LoopbackInterface` 实例。
     /// 生成一个新的接口 ID。创建一个新的接口配置，设置其硬件地址和随机种子，使用接口配置和驱动器创建一个新的 `smoltcp::iface::Interface` 实例。
     /// 设置接口的 IP 地址为 127.0.0.1。
@@ -277,25 +287,54 @@ impl LoopbackInterface {
     /// 返回一个 `Arc<Self>`，即一个指向新创建的 `LoopbackInterface` 实例的智能指针。
     pub fn new(mut driver: LoopbackDriver) -> Arc<Self> {
         let iface_id = generate_iface_id();
-        let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
-            smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
-        ));
+
+        // let hardware_addr = HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([
+        //     0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // ]));
+
+        let hardware_addr = HardwareAddress::Ip;
+
+        let mut iface_config = smoltcp::iface::Config::new(hardware_addr);
+
         iface_config.random_seed = rand() as u64;
 
         let mut iface =
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
+
+        iface.set_any_ip(true);
+
+        let addr = IpAddress::v4(127, 0, 0, 1);
+        let cidr = IpCidr::new(addr, 8);
+
         //设置网卡地址为127.0.0.1
         iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs
-                .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
-                .unwrap();
+            ip_addrs.push(cidr).expect("Push ipCidr failed: full");
         });
-        let driver = LoopbackDriverWapper(UnsafeCell::new(driver));
+
+        iface.routes_mut().update(|routes_map| {
+            routes_map
+                .push(smoltcp::iface::Route {
+                    cidr,
+                    via_router: addr,
+                    preferred_until: None,
+                    expires_at: None,
+                })
+                .expect("Add default ipv4 route failed: full");
+        });
+
+        let flags = InterfaceFlags::LOOPBACK
+            | InterfaceFlags::UP
+            | InterfaceFlags::RUNNING
+            | InterfaceFlags::LOWER_UP;
+
         Arc::new(LoopbackInterface {
-            driver,
-            iface_id,
-            iface: SpinLock::new(iface),
-            name: "lo".to_string(),
+            driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
+            common: IfaceCommon::new(
+                iface_id,
+                super::types::InterfaceType::LOOPBACK,
+                flags,
+                iface,
+            ),
             inner: SpinLock::new(InnerLoopbackInterface {
                 netdevice_common: NetDeviceCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -310,16 +349,7 @@ impl LoopbackInterface {
     }
 }
 
-impl Debug for LoopbackInterface {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("LoopbackInterface")
-            .field("iface_id", &self.iface_id)
-            .field("iface", &"smtoltcp::iface::Interface")
-            .field("name", &self.name)
-            .finish()
-    }
-}
-
+//TODO: 向sysfs注册lo设备
 impl KObject for LoopbackInterface {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
@@ -354,7 +384,7 @@ impl KObject for LoopbackInterface {
     }
 
     fn name(&self) -> String {
-        self.name.clone()
+        Self::DEVICE_NAME.to_string()
     }
 
     fn set_name(&self, _name: String) {
@@ -447,72 +477,23 @@ impl Device for LoopbackInterface {
     }
 }
 
-impl NetDevice for LoopbackInterface {
+impl Iface for LoopbackInterface {
+    fn common(&self) -> &IfaceCommon {
+        &self.common
+    }
+
+    fn iface_name(&self) -> String {
+        Self::DEVICE_NAME.to_string()
+    }
+
     /// 由于lo网卡设备不是实际的物理设备，其mac地址需要手动设置为一个默认值，这里默认为00:00:00:00:00
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
         let mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         smoltcp::wire::EthernetAddress(mac)
     }
 
-    #[inline]
-    fn nic_id(&self) -> usize {
-        self.iface_id
-    }
-
-    #[inline]
-    fn iface_name(&self) -> String {
-        self.name.clone()
-    }
-    /// ## `update_ip_addrs` 用于更新接口的 IP 地址。
-    ///
-    /// ## 参数
-    /// - `&self` ：自身引用
-    /// - `ip_addrs` ：一个包含 `smoltcp::wire::IpCidr` 的切片，表示要设置的 IP 地址和子网掩码
-    ///
-    /// ## 返回值
-    /// - 如果 `ip_addrs` 的长度不为 1，返回 `Err(SystemError::EINVAL)`，表示输入参数无效
-    /// - 如果更新成功，返回 `Ok(())`
-    fn update_ip_addrs(
-        &self,
-        ip_addrs: &[smoltcp::wire::IpCidr],
-    ) -> Result<(), system_error::SystemError> {
-        if ip_addrs.len() != 1 {
-            return Err(SystemError::EINVAL);
-        }
-
-        self.iface.lock().update_ip_addrs(|addrs| {
-            let dest = addrs.iter_mut().next();
-
-            if let Some(dest) = dest {
-                *dest = ip_addrs[0];
-            } else {
-                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
-            }
-        });
-        return Ok(());
-    }
-    /// ## `poll` 用于轮询接口的状态。
-    ///
-    /// ## 参数
-    /// - `&self` ：自身引用
-    /// - `sockets` ：一个可变引用到 `smoltcp::iface::SocketSet`，表示要轮询的套接字集
-    ///
-    /// ## 返回值
-    /// - 如果轮询成功，返回 `Ok(())`
-    /// - 如果轮询失败，返回 `Err(SystemError::EAGAIN_OR_EWOULDBLOCK)`，表示需要再次尝试或者操作会阻塞
-    fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
-        let timestamp: smoltcp::time::Instant = Instant::now().into();
-        let mut guard = self.iface.lock();
-        let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
-        if poll_res {
-            return Ok(());
-        }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-
-    #[inline(always)]
-    fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
-        return &self.iface;
+    fn poll(&self) -> bool {
+        self.common.poll(self.driver.force_get_mut())
     }
 
     fn addr_assign_type(&self) -> u8 {
@@ -539,29 +520,45 @@ impl NetDevice for LoopbackInterface {
     fn set_operstate(&self, state: Operstate) {
         self.inner().netdevice_common.operstate = state;
     }
+
+    fn mtu(&self) -> usize {
+        use smoltcp::phy::Device;
+
+        self.driver
+            .force_get_mut()
+            .capabilities()
+            .max_transmission_unit
+    }
+}
+
+pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
+    let iface = LoopbackInterface::new(LoopbackDriver::default());
+    // 标识网络设备已经启动
+    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+
+    register_netdevice(iface.clone()).expect("register lo device failed");
+
+    iface
 }
 
 pub fn loopback_probe() {
     loopback_driver_init();
 }
-/// ## lo网卡设备初始化函数
+
+/// # lo网卡设备初始化函数
 /// 创建驱动和iface，初始化一个lo网卡，添加到全局NET_DEVICES中
 pub fn loopback_driver_init() {
-    let driver = LoopbackDriver::new();
-    let iface = LoopbackInterface::new(driver);
-    // 标识网络设备已经启动
-    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+    let iface = generate_loopback_iface_default();
 
-    NET_DEVICES
-        .write_irqsave()
-        .insert(iface.iface_id, iface.clone());
-
-    register_netdevice(iface.clone()).expect("register lo device failed");
+    INIT_NET_NAMESPACE.add_device(iface.clone());
+    INIT_NET_NAMESPACE.set_loopback_iface(iface.clone());
+    iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
 }
 
 /// ## lo网卡设备的注册函数
 #[unified_init(INITCALL_DEVICE)]
 pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();
+    log::debug!("Successfully init loopback device");
     return Ok(());
 }

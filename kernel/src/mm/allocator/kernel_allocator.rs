@@ -67,7 +67,7 @@ impl LocalAlloc for KernelAllocator {
             return self
                 .alloc_in_buddy(layout)
                 .map(|x| x.as_mut_ptr())
-                .unwrap_or(core::ptr::null_mut());
+                .unwrap_or_default();
         } else {
             if let Some(ref mut slab) = SLABALLOCATOR {
                 return slab.allocate(layout);
@@ -85,7 +85,7 @@ impl LocalAlloc for KernelAllocator {
                     core::ptr::write_bytes(ptr, 0, x.len());
                     ptr
                 })
-                .unwrap_or(core::ptr::null_mut());
+                .unwrap_or_default();
         } else {
             if let Some(ref mut slab) = SLABALLOCATOR {
                 return slab.allocate(layout);

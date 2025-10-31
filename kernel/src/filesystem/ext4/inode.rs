@@ -6,6 +6,7 @@ use crate::{
             IndexNode, InodeId,
         },
     },
+    libs::casting::DowncastArc,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
 };
@@ -54,7 +55,7 @@ impl IndexNode for LockedExt4Inode {
         file_type: vfs::FileType,
         mode: vfs::syscall::ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let guard = self.0.lock();
+        let mut guard = self.0.lock();
         // another_ext4的高4位是文件类型，低12位是权限
         let file_mode = ModeType::from(file_type).union(mode);
         let ext4 = &guard.concret_fs().fs;
@@ -63,9 +64,26 @@ impl IndexNode for LockedExt4Inode {
             name,
             another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16),
         )?;
-        let inode = LockedExt4Inode::new(id, guard.fs_ptr.clone(), DName::from(name));
+        let dname = DName::from(name);
+        let inode = LockedExt4Inode::new(id, guard.fs_ptr.clone(), dname.clone());
+        // 更新 children 缓存
+        guard.children.insert(dname, inode.clone());
         drop(guard);
-        return Ok(inode as Arc<dyn IndexNode>);
+        Ok(inode as Arc<dyn IndexNode>)
+    }
+
+    fn create_with_data(
+        &self,
+        name: &str,
+        file_type: vfs::FileType,
+        mode: ModeType,
+        data: usize,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if data == 0 {
+            return self.create(name, file_type, mode);
+        }
+
+        Err(SystemError::ENOSYS)
     }
 
     fn read_at(
@@ -217,15 +235,21 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        let guard = self.0.lock();
+        let mut guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
+
+        let other_arc = other
+            .clone()
+            .downcast_arc::<LockedExt4Inode>()
+            .ok_or(SystemError::EINVAL)?;
         let other = other
             .downcast_ref::<LockedExt4Inode>()
             .ok_or(SystemError::EPERM)?;
+        let other_inode_num = other.0.lock().inner_inode_num;
 
         let my_attr = ext4.getattr(inode_num)?;
-        let other_attr = ext4.getattr(inode_num)?;
+        let other_attr = ext4.getattr(other_inode_num)?;
 
         if my_attr.ftype != another_ext4::FileType::Directory {
             return Err(SystemError::ENOTDIR);
@@ -239,12 +263,16 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EEXIST);
         }
 
-        ext4.link(inode_num, other.0.lock().inner_inode_num, name)?;
+        ext4.link(other_inode_num, inode_num, name)?;
+
+        let dname = DName::from(name);
+        guard.children.insert(dname, other_arc);
+
         Ok(())
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
-        let guard = self.0.lock();
+        let mut guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
         let attr = ext4.getattr(inode_num)?;
@@ -252,6 +280,8 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::ENOTDIR);
         }
         ext4.unlink(inode_num, name)?;
+        // 清理 children 缓存
+        let _ = guard.children.remove(&DName::from(name));
         Ok(())
     }
 
@@ -311,20 +341,94 @@ impl IndexNode for LockedExt4Inode {
         Ok(())
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
         let guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        // 仅调整文件大小，其他属性保持不变
+        ext4.setattr(
+            guard.inner_inode_num,
+            None,
+            None,
+            None,
+            Some(len as u64),
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(SystemError::from)?;
+        Ok(())
+    }
+
+    fn truncate(&self, len: usize) -> Result<(), SystemError> {
+        // 复用 resize 的实现
+        self.resize(len)
+    }
+
+    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+        let mut guard = self.0.lock();
         let concret_fs = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
         if concret_fs.getattr(inode_num)?.ftype != FileType::Directory {
             return Err(SystemError::ENOTDIR);
         }
         concret_fs.rmdir(inode_num, name)?;
+        // 清理 children 缓存
+        let _ = guard.children.remove(&DName::from(name));
 
         Ok(())
     }
 
     fn dname(&self) -> Result<DName, SystemError> {
         Ok(self.0.lock().dname.clone())
+    }
+
+    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
+            return Err(SystemError::EPERM);
+        }
+
+        // 调用another_ext4库的getxattr接口
+        let value = ext4.getxattr(inode_num, name)?;
+
+        // 如果缓冲区为空，只返回需要的长度
+        if buf.is_empty() {
+            return Ok(value.len());
+        }
+
+        // 检查缓冲区大小是否足够
+        if buf.len() < value.len() {
+            return Err(SystemError::ERANGE);
+        }
+
+        // 复制数据到缓冲区
+        let copy_len = core::cmp::min(buf.len(), value.len());
+        buf[..copy_len].copy_from_slice(&value[..copy_len]);
+
+        Ok(copy_len)
+    }
+
+    fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+        let guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
+            return Err(SystemError::EPERM);
+        }
+
+        if ext4.getxattr(inode_num, name).is_ok() {
+            ext4.removexattr(inode_num, name)?;
+        }
+
+        // 调用another_ext4库的setxattr接口
+        ext4.setxattr(inode_num, name, value)?;
+
+        Ok(0)
     }
 }
 

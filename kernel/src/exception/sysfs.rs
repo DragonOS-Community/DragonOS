@@ -4,9 +4,8 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::base::{
-        kobject::{KObjType, KObject, KObjectManager, KObjectSysFSOps},
-        kset::KSet,
+    driver::base::kobject::{
+        CommonKobj, DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectSysFSOps,
     },
     filesystem::{
         sysfs::{
@@ -16,7 +15,7 @@ use crate::{
         vfs::syscall::ModeType,
     },
     init::initcall::INITCALL_POSTCORE,
-    misc::ksysfs::sys_kernel_kset,
+    misc::ksysfs::sys_kernel_kobj,
 };
 
 use super::{
@@ -24,13 +23,13 @@ use super::{
     IrqNumber,
 };
 
-/// `/sys/kernel/irq`的kset
-static mut SYS_KERNEL_IRQ_KSET_INSTANCE: Option<Arc<KSet>> = None;
+/// `/sys/kernel/irq`的kobject
+static mut SYS_KERNEL_IRQ_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
 
 #[inline(always)]
 #[allow(dead_code)]
-pub fn sys_kernel_irq_kset() -> Arc<KSet> {
-    unsafe { SYS_KERNEL_IRQ_KSET_INSTANCE.clone().unwrap() }
+pub fn sys_kernel_irq_kobj() -> Arc<CommonKobj> {
+    unsafe { SYS_KERNEL_IRQ_KOBJECT_INSTANCE.clone().unwrap() }
 }
 
 /// 中断描述符的kobjtype
@@ -92,14 +91,13 @@ impl AttributeGroup for IrqAttrGroup {
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/irqdesc.c#313
 #[unified_init(INITCALL_POSTCORE)]
 fn irq_sysfs_init() -> Result<(), SystemError> {
-    // todo!("irq_sysfs_init");
-
-    let irq_kset = KSet::new("irq".to_string());
-    irq_kset
-        .register(Some(sys_kernel_kset()))
-        .expect("register irq kset failed");
+    let irq_kobj = CommonKobj::new("irq".to_string());
+    irq_kobj.set_parent(Some(Arc::downgrade(
+        &(sys_kernel_kobj() as Arc<dyn KObject>),
+    )));
+    KObjectManager::init_and_add_kobj(irq_kobj.clone(), Some(&DynamicKObjKType))?;
     unsafe {
-        SYS_KERNEL_IRQ_KSET_INSTANCE = Some(irq_kset);
+        SYS_KERNEL_IRQ_KOBJECT_INSTANCE = Some(irq_kobj);
     }
 
     // 把所有的irq都注册到/sys/kernel/irq下
@@ -112,12 +110,13 @@ fn irq_sysfs_init() -> Result<(), SystemError> {
 
 /// 把irqdesc添加到sysfs
 fn irq_sysfs_add(irq: &IrqNumber, desc: &Arc<IrqDesc>) {
-    if unsafe { SYS_KERNEL_IRQ_KSET_INSTANCE.is_none() } {
+    if unsafe { SYS_KERNEL_IRQ_KOBJECT_INSTANCE.is_none() } {
         return;
     }
 
-    let kset = sys_kernel_irq_kset();
-    KObjectManager::add_kobj(desc.clone() as Arc<dyn KObject>, Some(kset)).unwrap_or_else(|e| {
+    let kobj = sys_kernel_irq_kobj();
+    desc.set_parent(Some(Arc::downgrade(&(kobj as Arc<dyn KObject>))));
+    KObjectManager::add_kobj(desc.clone() as Arc<dyn KObject>).unwrap_or_else(|e| {
         warn!("Failed to add irq({irq:?}) kobject to sysfs: {:?}", e);
     });
 

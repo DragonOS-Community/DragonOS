@@ -8,3 +8,4 @@
    :maxdepth: 1
 
    signal
+   ipc_namespace

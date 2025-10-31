@@ -4,7 +4,6 @@ use core::{
 };
 
 use alloc::{
-    collections::LinkedList,
     string::String,
     sync::{Arc, Weak},
 };
@@ -12,7 +11,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::{base::device::device_number::DeviceNumber, tty::pty::ptm_driver},
-    filesystem::epoll::{EPollEventType, EPollItem},
+    filesystem::epoll::{event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -74,7 +73,7 @@ impl TtyCore {
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
             link: RwLock::default(),
-            epitems: SpinLock::new(LinkedList::new()),
+            epitems: LockedEPItemLinkedList::default(),
             device_number,
             privete_fields: SpinLock::new(None),
         };
@@ -347,7 +346,7 @@ pub struct TtyCoreData {
     /// 链接tty
     link: RwLock<Weak<TtyCore>>,
     /// epitems
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
+    epitems: LockedEPItemLinkedList,
     /// 设备号
     device_number: DeviceNumber,
 
@@ -533,7 +532,7 @@ impl TtyCoreData {
         Err(SystemError::ENOENT)
     }
 
-    pub fn eptiems(&self) -> &SpinLock<LinkedList<Arc<EPollItem>>> {
+    pub fn epitems(&self) -> &LockedEPItemLinkedList {
         &self.epitems
     }
 
@@ -650,15 +649,23 @@ impl TtyOperation for TtyCore {
     }
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        let r = self.core().tty_driver.driver_funcs().close(tty.clone());
         self.core().dec_count();
-        // let cnt = self.core().count();
-        // log::debug!("TtyCore close: count: {cnt}, tty: {:?}", tty.core().name());
-        if !self.core().count_valid() {
+        let cnt = self.core().count();
+        // TODO: fix pty slave close issue
+        let is_pty_slave_last =
+            cnt == 1 && tty.core().driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave;
+        if !self.core().count_valid() || is_pty_slave_last {
+            // log::debug!(
+            //     "TtyCore close: ref count: {}, tty: {}",
+            //     cnt,
+            //     tty.core().name()
+            // );
+            let r = self.core().tty_driver.driver_funcs().close(tty.clone());
             // 如果计数为0或者无效，表示tty已经关闭
             TtyJobCtrlManager::remove_session_tty(&tty);
+            return r;
         }
-        r
+        Ok(())
     }
 
     fn resize(&self, tty: Arc<TtyCore>, winsize: WindowSize) -> Result<(), SystemError> {

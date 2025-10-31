@@ -250,6 +250,7 @@ make run-docker
 - 编译文档: `make docs` （需要手动安装sphinx以及docs下的`requirements.txt`中的依赖）
 - 清理文档: `make clean-docs`
 - 格式化代码: `make fmt`
+- 运行并执行syscall测试: `make test-syscall`
 
 :::{note}
 如果您需要在vnc中运行DragonOS，请在上述命令后加上`-vnc`后缀。如：`make run-vnc`

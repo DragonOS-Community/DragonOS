@@ -62,6 +62,38 @@ pub enum GenericSignal {
     SIGSYS = 31,
 
     SIGRTMIN = 32,
+    // 实时信号：SIGRTMIN+1 到 SIGRTMAX-1
+    SIGRTMIN_1 = 33,
+    SIGRTMIN_2 = 34,
+    SIGRTMIN_3 = 35,
+    SIGRTMIN_4 = 36,
+    SIGRTMIN_5 = 37,
+    SIGRTMIN_6 = 38,
+    SIGRTMIN_7 = 39,
+    SIGRTMIN_8 = 40,
+    SIGRTMIN_9 = 41,
+    SIGRTMIN_10 = 42,
+    SIGRTMIN_11 = 43,
+    SIGRTMIN_12 = 44,
+    SIGRTMIN_13 = 45,
+    SIGRTMIN_14 = 46,
+    SIGRTMIN_15 = 47,
+    SIGRTMIN_16 = 48,
+    SIGRTMIN_17 = 49,
+    SIGRTMIN_18 = 50,
+    SIGRTMIN_19 = 51,
+    SIGRTMIN_20 = 52,
+    SIGRTMIN_21 = 53,
+    SIGRTMIN_22 = 54,
+    SIGRTMIN_23 = 55,
+    SIGRTMIN_24 = 56,
+    SIGRTMIN_25 = 57,
+    SIGRTMIN_26 = 58,
+    SIGRTMIN_27 = 59,
+    SIGRTMIN_28 = 60,
+    SIGRTMIN_29 = 61,
+    SIGRTMIN_30 = 62,
+    SIGRTMIN_31 = 63,
     SIGRTMAX = 64,
 }
 
@@ -86,6 +118,18 @@ impl GenericSignal {
     #[inline]
     pub fn is_rt_signal(&self) -> bool {
         return (*self) as usize >= Self::SIGRTMIN.into();
+    }
+
+    /// 判断一个信号号是否为实时信号
+    #[inline]
+    pub fn is_rt_signal_number(sig_num: i32) -> bool {
+        sig_num >= Self::SIGRTMIN as i32 && sig_num <= Self::SIGRTMAX as i32
+    }
+
+    /// 获取实时信号的范围
+    #[inline]
+    pub fn rt_signal_range() -> (i32, i32) {
+        (Self::SIGRTMIN as i32, Self::SIGRTMAX as i32)
     }
 
     /// 调用信号的默认处理函数
@@ -125,7 +169,39 @@ impl GenericSignal {
             Self::SIGIO_OR_POLL => sig_terminate(*self),
             Self::SIGPWR => sig_terminate(*self),
             Self::SIGSYS => sig_terminate(*self),
+            // 实时信号默认处理：终止进程
             Self::SIGRTMIN => sig_terminate(*self),
+            Self::SIGRTMIN_1 => sig_terminate(*self),
+            Self::SIGRTMIN_2 => sig_terminate(*self),
+            Self::SIGRTMIN_3 => sig_terminate(*self),
+            Self::SIGRTMIN_4 => sig_terminate(*self),
+            Self::SIGRTMIN_5 => sig_terminate(*self),
+            Self::SIGRTMIN_6 => sig_terminate(*self),
+            Self::SIGRTMIN_7 => sig_terminate(*self),
+            Self::SIGRTMIN_8 => sig_terminate(*self),
+            Self::SIGRTMIN_9 => sig_terminate(*self),
+            Self::SIGRTMIN_10 => sig_terminate(*self),
+            Self::SIGRTMIN_11 => sig_terminate(*self),
+            Self::SIGRTMIN_12 => sig_terminate(*self),
+            Self::SIGRTMIN_13 => sig_terminate(*self),
+            Self::SIGRTMIN_14 => sig_terminate(*self),
+            Self::SIGRTMIN_15 => sig_terminate(*self),
+            Self::SIGRTMIN_16 => sig_terminate(*self),
+            Self::SIGRTMIN_17 => sig_terminate(*self),
+            Self::SIGRTMIN_18 => sig_terminate(*self),
+            Self::SIGRTMIN_19 => sig_terminate(*self),
+            Self::SIGRTMIN_20 => sig_terminate(*self),
+            Self::SIGRTMIN_21 => sig_terminate(*self),
+            Self::SIGRTMIN_22 => sig_terminate(*self),
+            Self::SIGRTMIN_23 => sig_terminate(*self),
+            Self::SIGRTMIN_24 => sig_terminate(*self),
+            Self::SIGRTMIN_25 => sig_terminate(*self),
+            Self::SIGRTMIN_26 => sig_terminate(*self),
+            Self::SIGRTMIN_27 => sig_terminate(*self),
+            Self::SIGRTMIN_28 => sig_terminate(*self),
+            Self::SIGRTMIN_29 => sig_terminate(*self),
+            Self::SIGRTMIN_30 => sig_terminate(*self),
+            Self::SIGRTMIN_31 => sig_terminate(*self),
             Self::SIGRTMAX => sig_terminate(*self),
         }
     }
@@ -150,7 +226,17 @@ impl From<usize> for GenericSignal {
 impl From<i32> for GenericSignal {
     fn from(value: i32) -> Self {
         if value < 0 {
-            log::error!("Try to convert an invalid number to GenericSignal");
+            log::error!(
+                "Try to convert a negative number {} to GenericSignal",
+                value
+            );
+            return GenericSignal::INVALID;
+        } else if value as usize > GENERIC_MAX_SIG_NUM {
+            log::error!(
+                "Try to convert an out-of-range number {} to GenericSignal (max: {})",
+                value,
+                GENERIC_MAX_SIG_NUM
+            );
             return GenericSignal::INVALID;
         } else {
             return Self::from(value as usize);
@@ -240,8 +326,39 @@ bitflags! {
         const SIGPWR   =  1<<29;
         const SIGSYS   =  1<<30;
         const SIGRTMIN =  1<<31;
-        // TODO 写上实时信号
-        const SIGRTMAX =  1 << (GENERIC_MAX_SIG_NUM-1);
+        // 实时信号位图：SIGRTMIN+1 到 SIGRTMAX-1
+        const SIGRTMIN_1 =  1<<32;
+        const SIGRTMIN_2 =  1<<33;
+        const SIGRTMIN_3 =  1<<34;
+        const SIGRTMIN_4 =  1<<35;
+        const SIGRTMIN_5 =  1<<36;
+        const SIGRTMIN_6 =  1<<37;
+        const SIGRTMIN_7 =  1<<38;
+        const SIGRTMIN_8 =  1<<39;
+        const SIGRTMIN_9 =  1<<40;
+        const SIGRTMIN_10 = 1<<41;
+        const SIGRTMIN_11 = 1<<42;
+        const SIGRTMIN_12 = 1<<43;
+        const SIGRTMIN_13 = 1<<44;
+        const SIGRTMIN_14 = 1<<45;
+        const SIGRTMIN_15 = 1<<46;
+        const SIGRTMIN_16 = 1<<47;
+        const SIGRTMIN_17 = 1<<48;
+        const SIGRTMIN_18 = 1<<49;
+        const SIGRTMIN_19 = 1<<50;
+        const SIGRTMIN_20 = 1<<51;
+        const SIGRTMIN_21 = 1<<52;
+        const SIGRTMIN_22 = 1<<53;
+        const SIGRTMIN_23 = 1<<54;
+        const SIGRTMIN_24 = 1<<55;
+        const SIGRTMIN_25 = 1<<56;
+        const SIGRTMIN_26 = 1<<57;
+        const SIGRTMIN_27 = 1<<58;
+        const SIGRTMIN_28 = 1<<59;
+        const SIGRTMIN_29 = 1<<60;
+        const SIGRTMIN_30 = 1<<61;
+        const SIGRTMIN_31 = 1<<62;
+        const SIGRTMAX =  1<<63;
     }
 
     #[repr(C,align(8))]

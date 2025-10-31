@@ -74,6 +74,16 @@
 **Special thanks to these generous financial supporters** (in reverse chronological order):
 
 - **[中国雅云](https://yacloud.net)** 雅安大数据产业园 - 🥇 Long-term supporter
+- **[Tencent Cloud EdgeOne](https://edgeone.ai/?from=github)** 腾讯云 EdgeOne CDN
+
+### CDN 赞助商
+
+<div align="center">
+  <p>本项目的CDN加速和安全防护由腾讯EdgeOne赞助。</p>
+  <a href="https://edgeone.ai/?from=github">
+    <img src="https://edgeone.ai/media/34fe3a45-492d-4ea4-ae5d-ea1087ca7b4b.png" alt="腾讯EdgeOne CDN" width="200">
+  </a>
+</div>
 
 ### 个人赞赏者列表
 

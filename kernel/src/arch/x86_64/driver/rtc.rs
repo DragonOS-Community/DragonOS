@@ -33,6 +33,43 @@ use crate::{
     },
 };
 
+lazy_static! {
+    /// RtcLock全局实例
+    pub static ref RTC_LOCK: RtcLock = RtcLock::new();
+}
+
+pub struct RtcLock {
+    rtc_lock: SpinLock<()>,
+}
+
+impl RtcLock {
+    fn new() -> RtcLock {
+        RtcLock {
+            rtc_lock: SpinLock::new(()),
+        }
+    }
+
+    pub fn lock(&'_ self) -> SpinLockGuard<'_, ()> {
+        self.rtc_lock.lock()
+    }
+}
+
+#[inline]
+pub fn read_cmos(addr: u8) -> u8 {
+    unsafe {
+        CurrentPortIOArch::out8(0x70, 0x80 | addr);
+        return CurrentPortIOArch::in8(0x71);
+    }
+}
+
+#[inline]
+pub fn write_cmos(addr: u8, data: u8) {
+    unsafe {
+        CurrentPortIOArch::out8(0x70, 0x80 | addr);
+        CurrentPortIOArch::out8(0x71, data);
+    }
+}
+
 #[derive(Debug)]
 #[cast_to([sync] Device, PlatformDevice, RtcDevice)]
 struct CmosRtcDevice {
@@ -61,15 +98,6 @@ impl CmosRtcDevice {
 
     fn inner(&self) -> SpinLockGuard<'_, InnerCmosRtc> {
         self.inner.lock()
-    }
-
-    ///置位0x70的第7位，禁止不可屏蔽中断
-    #[inline]
-    fn read_cmos(&self, addr: u8) -> u8 {
-        unsafe {
-            CurrentPortIOArch::out8(0x70, 0x80 | addr);
-            return CurrentPortIOArch::in8(0x71);
-        }
     }
 }
 
@@ -247,21 +275,21 @@ impl RtcClassOps for CmosRtcClassOps {
         // 为防止中断请求打断该过程，需要先关中断
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         //0x0B
-        let status_register_b: u8 = dev.read_cmos(0x0B); // 读取状态寄存器B
+        let status_register_b: u8 = read_cmos(0x0B); // 读取状态寄存器B
         let is_24h: bool = (status_register_b & 0x02) != 0;
         // 判断是否启用24小时模式
         let is_binary: bool = (status_register_b & 0x04) != 0; // 判断是否为二进制码
         let mut res = RtcTime::default();
 
         loop {
-            res.year = dev.read_cmos(CMOSTimeSelector::Year as u8) as i32;
-            res.month = dev.read_cmos(CMOSTimeSelector::Month as u8) as i32;
-            res.mday = dev.read_cmos(CMOSTimeSelector::Day as u8) as i32;
-            res.hour = dev.read_cmos(CMOSTimeSelector::Hour as u8) as i32;
-            res.minute = dev.read_cmos(CMOSTimeSelector::Minute as u8) as i32;
-            res.second = dev.read_cmos(CMOSTimeSelector::Second as u8) as i32;
+            res.year = read_cmos(CMOSTimeSelector::Year as u8) as i32;
+            res.month = read_cmos(CMOSTimeSelector::Month as u8) as i32;
+            res.mday = read_cmos(CMOSTimeSelector::Day as u8) as i32;
+            res.hour = read_cmos(CMOSTimeSelector::Hour as u8) as i32;
+            res.minute = read_cmos(CMOSTimeSelector::Minute as u8) as i32;
+            res.second = read_cmos(CMOSTimeSelector::Second as u8) as i32;
 
-            if res.second == dev.read_cmos(CMOSTimeSelector::Second as u8) as i32 {
+            if res.second == read_cmos(CMOSTimeSelector::Second as u8) as i32 {
                 break;
             } // 若读取时间过程中时间发生跳变则重新读取
         }

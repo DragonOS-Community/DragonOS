@@ -28,6 +28,7 @@ mod sys_ioctl;
 mod sys_linkat;
 mod sys_lseek;
 mod sys_mkdirat;
+pub mod sys_mknodat;
 mod sys_openat;
 mod sys_pread64;
 mod sys_pselect6;
@@ -40,6 +41,7 @@ mod sys_select;
 mod sys_statfs;
 mod sys_statx;
 mod sys_symlinkat;
+mod sys_truncate;
 mod sys_unlinkat;
 mod sys_utimensat;
 mod sys_write;
@@ -52,13 +54,13 @@ mod sys_epoll_ctl;
 mod sys_epoll_pwait;
 
 pub mod symlink_utils;
-mod sys_fsync;
-pub mod sys_mount;
-mod sys_sync;
-pub mod sys_umount2;
-
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 mod sys_fstat;
+mod sys_fsync;
+pub mod sys_mount;
+mod sys_sendfile;
+mod sys_sync;
+pub mod sys_umount2;
 
 #[cfg(target_arch = "x86_64")]
 mod sys_access;
@@ -106,10 +108,22 @@ mod sys_unlink;
 #[cfg(target_arch = "x86_64")]
 mod sys_utimes;
 
+mod sys_fgetxattr;
+mod sys_fsetxattr;
+mod sys_getxattr;
+mod sys_lgetxattr;
+mod sys_lsetxattr;
+mod sys_setxattr;
+mod xattr_utils;
+
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
 pub const SEEK_MAX: u32 = 3;
+
+// 扩展属性操作标志
+pub const XATTR_CREATE: i32 = 0x1; // 设置值，如果属性不存在则创建，已存在返回则失败
+pub const XATTR_REPLACE: i32 = 0x2; // 设置值，如果属性已存在则替换，不存在返回则失败
 
 bitflags! {
     /// 文件类型和权限

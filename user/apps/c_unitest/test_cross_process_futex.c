@@ -3,7 +3,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
-#include <linux/futex.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <errno.h>

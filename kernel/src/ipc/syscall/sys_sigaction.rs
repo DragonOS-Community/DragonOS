@@ -13,6 +13,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
+use core::sync::atomic::{compiler_fence, Ordering};
 use log::error;
 use system_error::SystemError;
 pub struct SysSigactionHandle;
@@ -48,6 +49,7 @@ pub(super) fn do_kernel_sigaction(
         }
         let mask: SigSet = unsafe { (*act).mask };
         let input_sighandler = unsafe { (*act).handler as u64 };
+
         match input_sighandler {
             USER_SIG_DFL => {
                 new_ka = Sigaction::DEFAULT_SIGACTION;
@@ -97,7 +99,7 @@ pub(super) fn do_kernel_sigaction(
         return Err(SystemError::EINVAL);
     }
 
-    let retval = super::super::signal::do_sigaction(
+    let retval = super::super::sighand::do_sigaction(
         sig,
         if act.is_null() {
             None
@@ -145,6 +147,7 @@ pub(super) fn do_kernel_sigaction(
             }
         }
     }
+    compiler_fence(Ordering::SeqCst);
     return retval.map(|_| 0);
 }
 
@@ -177,7 +180,9 @@ impl Syscall for SysSigactionHandle {
         let act = Self::act(args);
         let old_act = Self::old_act(args);
 
-        do_kernel_sigaction(sig, act, old_act, frame.is_from_user())
+        let r = do_kernel_sigaction(sig, act, old_act, frame.is_from_user());
+        compiler_fence(Ordering::SeqCst);
+        return r;
     }
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![

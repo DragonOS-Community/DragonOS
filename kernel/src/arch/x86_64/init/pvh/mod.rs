@@ -55,6 +55,11 @@ impl BootCallbacks for PvhBootCallback {
         Ok(())
     }
 
+    fn init_initramfs(&self) -> Result<(), SystemError> {
+        log::error!("x86 pvh, init_initramfs is not impled");
+        Ok(())
+    }
+
     fn early_init_framebuffer_info(
         &self,
         _scinfo: &mut BootTimeScreenInfo,
@@ -117,6 +122,75 @@ impl BootCallbacks for PvhBootCallback {
             total_mem_size,
             usable_mem_size
         );
+        Ok(())
+    }
+
+    fn early_init_memmap_sysfs(&self) -> Result<(), SystemError> {
+        crate::mm::sysfs::early_memmap_init();
+
+        let start_info = START_INFO.get();
+        if (start_info.version > 0) && start_info.memmap_entries > 0 {
+            let mut ep = unsafe {
+                MMArch::phys_2_virt(PhysAddr::new(start_info.memmap_paddr as usize)).unwrap()
+            }
+            .data() as *const HvmMemmapTableEntry;
+
+            for i in 0..start_info.memmap_entries {
+                let entry = unsafe { *ep };
+
+                let t = match E820Type::from(entry.type_) {
+                    E820Type::Ram => 1,
+                    E820Type::Reserved => 2,
+                    E820Type::Acpi => 3,
+                    _ => 4,
+                };
+
+                let memmapd = crate::mm::sysfs::MemmapDesc::new(
+                    i.to_string(),
+                    entry.addr as usize,
+                    (entry.addr + entry.size) as usize,
+                    t,
+                );
+                crate::mm::sysfs::memmap_desc_manager().insert(i as usize, memmapd);
+
+                ep = unsafe { ep.add(1) };
+            }
+        }
+
+        Ok(())
+    }
+
+    fn init_memmap_bp(&self) -> Result<(), SystemError> {
+        let start_info = START_INFO.get();
+        if (start_info.version > 0) && start_info.memmap_entries > 0 {
+            let mut ep = unsafe {
+                MMArch::phys_2_virt(PhysAddr::new(start_info.memmap_paddr as usize)).unwrap()
+            }
+            .data() as *const HvmMemmapTableEntry;
+
+            for _ in 0..start_info.memmap_entries {
+                let entry = unsafe { *ep };
+
+                let t = match E820Type::from(entry.type_) {
+                    E820Type::Ram => 1,
+                    E820Type::Reserved => 2,
+                    E820Type::Acpi => 3,
+                    E820Type::Nvs => 4,
+                    E820Type::Unusable => 5,
+                    E820Type::Pmem => 7,
+                    E820Type::Pram => 12,
+                    E820Type::SoftReserved => 0xefffffff,
+                    E820Type::ReservedKern => 128,
+                };
+
+                boot_params()
+                    .write_irqsave()
+                    .arch
+                    .add_e820_entry(entry.addr, entry.size, t);
+
+                ep = unsafe { ep.add(1) };
+            }
+        }
         Ok(())
     }
 }

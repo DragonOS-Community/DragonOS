@@ -59,6 +59,8 @@ pub struct RamFSInode {
     self_ref: Weak<LockedRamFSInode>,
     /// 子Inode的B树
     children: BTreeMap<DName, Arc<LockedRamFSInode>>,
+    /// 子Syms的B树, 记录符号到符号的链接
+    syms: BTreeMap<DName, DName>,
     /// 当前inode的数据部分
     data: Vec<u8>,
     /// 当前inode的元数据
@@ -77,6 +79,7 @@ impl RamFSInode {
             parent: Weak::default(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
+            syms: BTreeMap::new(),
             data: Vec::new(),
             metadata: Metadata {
                 dev_id: 0,
@@ -328,6 +331,7 @@ impl IndexNode for LockedRamFSInode {
             parent: inode.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
+            syms: BTreeMap::new(),
             data: Vec::new(),
             metadata: Metadata {
                 dev_id: 0,
@@ -414,6 +418,63 @@ impl IndexNode for LockedRamFSInode {
         // 在当前目录中删除这个子目录项
         inode.children.remove(&name);
         return Ok(());
+    }
+
+    fn symlink(
+        &self,
+        name1: &str,
+        name2: &str,
+        other: &Arc<dyn IndexNode>,
+    ) -> Result<(), SystemError> {
+        // TODO: 判断是否指向的other为一个符号链接
+        // 也就是需要判断 test1 -> echo -> busybox 的情况下, other的name是busybox,但是name2是echo
+        let other: &LockedRamFSInode = other
+            .downcast_ref::<LockedRamFSInode>()
+            .ok_or(SystemError::EPERM)?;
+        let name = DName::from(name1);
+        let other_name = DName::from(name2);
+        let mut inode: SpinLockGuard<RamFSInode> = self.0.lock();
+        let other_locked: SpinLockGuard<RamFSInode> = other.0.lock();
+
+        // 如果当前inode不是文件夹，那么报错
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // 如果另一个inode是文件夹，那么也报错
+        if other_locked.metadata.file_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
+
+        // 如果当前文件夹下已经有同名文件，也报错。
+        if inode.children.contains_key(&name) {
+            return Err(SystemError::EEXIST);
+        }
+
+        // 将子name插入父syms的B树中
+        inode.syms.insert(name.clone(), other_name.clone());
+
+        inode
+            .children
+            .insert(name, other_locked.self_ref.upgrade().unwrap());
+
+        return Ok(());
+    }
+
+    fn symunlink(&self, _name: &str) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::ENOSYS);
+    }
+
+    fn get_nextsym(&self, name: &str) -> Result<String, SystemError> {
+        let name = DName::from(name);
+        let inode: SpinLockGuard<RamFSInode> = self.0.lock();
+
+        if let Some(r) = inode.syms.get(&name) {
+            return Ok(r.0.to_string());
+        }
+
+        return Ok(name.to_string());
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
@@ -600,6 +661,7 @@ impl IndexNode for LockedRamFSInode {
             parent: inode.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
+            syms: BTreeMap::new(),
             data: Vec::new(),
             metadata: Metadata {
                 dev_id: 0,

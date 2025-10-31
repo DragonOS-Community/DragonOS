@@ -90,7 +90,6 @@ impl FutexHashBucket {
     /// ## 唤醒队列中的最多nr_wake个进程
     ///
     /// return: 唤醒的进程数
-    #[inline(always)]
     pub fn wake_up(
         &mut self,
         key: FutexKey,
@@ -104,7 +103,7 @@ impl FutexHashBucket {
                 // TODO: 考虑优先级继承的机制
 
                 if let Some(bitset) = bitset {
-                    if futex_q.bitset != bitset {
+                    if futex_q.bitset & bitset == 0 {
                         self.chain.push_back(futex_q);
                         continue;
                     }
@@ -272,15 +271,19 @@ impl Futex {
         // 创建超时计时器任务
         let mut timer = None;
         if let Some(time) = abs_time {
-            let wakeup_helper = WakeUpHelper::new(pcb.clone());
-
             let sec = time.tv_sec;
             let nsec = time.tv_nsec;
-            let jiffies = next_n_us_timer_jiffies((nsec / 1000 + sec * 1_000_000) as u64);
+            let total_us = (nsec / 1000 + sec * 1_000_000) as u64;
+
+            // 如果超时时间为0，直接返回ETIMEDOUT
+            if total_us == 0 {
+                return Err(SystemError::ETIMEDOUT);
+            }
+
+            let wakeup_helper = WakeUpHelper::new(pcb.clone());
+            let jiffies = next_n_us_timer_jiffies(total_us);
 
             let wake_up = Timer::new(wakeup_helper, jiffies);
-
-            wake_up.activate();
             timer = Some(wake_up);
         }
 
@@ -291,10 +294,13 @@ impl Futex {
         });
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // 满足条件则将当前进程在该bucket上挂起
-        bucket_mut.sleep_no_sched(futex_q.clone()).map_err(|e| {
-            warn!("error:{e:?}");
-            e
-        })?;
+        bucket_mut.sleep_no_sched(futex_q.clone())?;
+
+        // 在关中断并且已经标记阻塞后，激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
+        if let Some(ref t) = timer {
+            t.activate();
+        }
+
         drop(futex_map_guard);
         drop(irq_guard);
         schedule(SchedMode::SM_NONE);
@@ -366,13 +372,17 @@ impl Futex {
             flags.contains(FutexFlag::FLAGS_SHARED),
             FutexAccess::FutexRead,
         )?;
+
         let mut binding = FutexData::futex_map();
-        let bucket_mut = binding.get_mut(&key).ok_or(SystemError::EINVAL)?;
+        let bucket_mut = binding.entry(key.clone()).or_insert(FutexHashBucket {
+            chain: LinkedList::new(),
+        });
 
         // 确保后面的唤醒操作是有意义的
         if bucket_mut.chain.is_empty() {
             return Ok(0);
         }
+
         // 从队列中唤醒
         let count = bucket_mut.wake_up(key.clone(), Some(bitset), nr_wake)?;
 
@@ -466,6 +476,7 @@ impl Futex {
         nr_wake2: i32,
         op: i32,
     ) -> Result<usize, SystemError> {
+        // Linux 语义：对于私有 futex，允许 uaddr1 为 NULL，此时只执行 op，不从 uaddr1 唤醒任何等待者。
         let key1 = Futex::get_futex_key(
             uaddr1,
             flags.contains(FutexFlag::FLAGS_SHARED),
@@ -478,11 +489,13 @@ impl Futex {
         )?;
 
         let mut futex_data_guard = FutexData::futex_map();
-        let bucket1 = futex_data_guard.get_mut(&key1).ok_or(SystemError::EINVAL)?;
         let mut wake_count = 0;
 
-        // 唤醒uaddr1中的进程
-        wake_count += bucket1.wake_up(key1, None, nr_wake as u32)?;
+        // 若 uaddr1 没有关联任何等待者，则按照 Linux 行为返回 0 而不是 EINVAL。
+        if let Some(bucket1) = futex_data_guard.get_mut(&key1) {
+            // 唤醒uaddr1中的进程
+            wake_count += bucket1.wake_up(key1, None, nr_wake as u32)?;
+        }
 
         match Self::futex_atomic_op_inuser(op as u32, uaddr2) {
             Ok(ret) => {
@@ -518,34 +531,81 @@ impl Futex {
         // 目前address指向所在页面的起始地址
         address -= offset;
 
-        // 若不是进程间共享的futex，则返回Private
+        // 非共享：使用地址空间+页首虚拟地址作为私有键
         if !fshared {
-            return Ok(FutexKey {
+            let address_space = AddressSpace::current()?;
+            let key = FutexKey {
                 ptr: 0,
                 word: 0,
                 offset: offset as u32,
                 key: InnerFutexKey::Private(PrivateKey {
                     address: address as u64,
-                    address_space: None,
+                    address_space: Some(Arc::downgrade(&address_space)),
                 }),
-            });
+            };
+            return Ok(key);
         }
 
-        // 获取到地址所在地址空间
+        // 共享：区分文件映射与匿名共享映射
         let address_space = AddressSpace::current()?;
-        // TODO： 判断是否为匿名映射，是匿名映射才返回PrivateKey
-        return Ok(FutexKey {
-            ptr: 0,
-            word: 0,
-            offset: offset as u32,
-            key: InnerFutexKey::Private(PrivateKey {
-                address: address as u64,
-                address_space: Some(Arc::downgrade(&address_space)),
-            }),
-        });
+        let as_guard = address_space.read();
+        let vma = as_guard
+            .mappings
+            .contains(uaddr)
+            .ok_or(SystemError::EINVAL)?;
+        let vma_guard = vma.lock_irqsave();
 
-        // 未实现共享内存机制,贡献内存部分应该通过inode构建SharedKey
-        // todo!("Shared memory not implemented");
+        // 页内索引（相对VMA起始地址）
+        let page_index =
+            ((uaddr.data() - vma_guard.region().start().data()) >> MMArch::PAGE_SHIFT) as u64;
+
+        if let Some(file) = vma_guard.vm_file() {
+            // 共享文件映射：使用 inode 唯一标识 + 文件页偏移
+            let md = file.metadata()?;
+            let dev = md.dev_id as u64;
+            let ino = md.inode_id.into() as u64;
+            let i_seq = (dev << 32) ^ ino;
+            let base_pgoff = vma_guard.file_page_offset().unwrap_or(0) as u64;
+            let shared = SharedKey {
+                i_seq,
+                page_offset: base_pgoff + page_index,
+            };
+            let key = FutexKey {
+                ptr: 0,
+                word: 0,
+                offset: offset as u32,
+                key: InnerFutexKey::Shared(shared.clone()),
+            };
+            return Ok(key);
+        } else {
+            // 匿名共享：使用共享匿名映射的稳定身份 + 页偏移
+            if let Some(shared_anon) = &vma_guard.shared_anon {
+                let i_seq = shared_anon.id;
+                let shared = SharedKey {
+                    i_seq,
+                    page_offset: page_index,
+                };
+                let key = FutexKey {
+                    ptr: 0,
+                    word: 0,
+                    offset: offset as u32,
+                    key: InnerFutexKey::Shared(shared.clone()),
+                };
+                return Ok(key);
+            } else {
+                // 理论上不会发生；为安全起见，退化为私有键（不跨进程匹配）
+                let key = FutexKey {
+                    ptr: 0,
+                    word: 0,
+                    offset: offset as u32,
+                    key: InnerFutexKey::Private(PrivateKey {
+                        address: address as u64,
+                        address_space: Some(Arc::downgrade(&address_space)),
+                    }),
+                };
+                return Ok(key);
+            }
+        }
     }
 
     pub fn futex_atomic_op_inuser(encoded_op: u32, uaddr: VirtAddr) -> Result<bool, SystemError> {
@@ -630,8 +690,9 @@ impl Futex {
             FutexOP::FUTEX_OP_OR => unsafe {
                 *((*ptr) as *mut u32) |= oparg;
             },
+            // ANDN 语义：new = old & ~oparg
             FutexOP::FUTEX_OP_ANDN => unsafe {
-                *((*ptr) as *mut u32) &= oparg;
+                *((*ptr) as *mut u32) &= !oparg;
             },
             FutexOP::FUTEX_OP_XOR => unsafe {
                 *((*ptr) as *mut u32) ^= oparg;
@@ -726,10 +787,19 @@ impl RobustListHead {
     /// # 获取robust list head到用户空间
     /// ## 参数
     /// - pid：当前进程/线程的pid
-    /// -
+    /// - head_ptr_uaddr: 指向用户空间指针的指针(即 struct robust_list_head **head_ptr)
+    /// - len_ptr_uaddr: 指向用户空间size_t的指针(即 size_t *len_ptr)
+    ///
+    /// ## 返回
+    /// - Ok(0) 成功
+    /// - Err(SystemError) 失败
+    ///
+    /// ## 说明
+    /// 该函数将目标进程的robust list head的用户空间地址写入到*head_ptr_uaddr,
+    /// 将robust list head的大小写入到*len_ptr_uaddr
     pub fn get_robust_list(
         pid: usize,
-        head_uaddr: VirtAddr,
+        head_ptr_uaddr: VirtAddr,
         len_ptr_uaddr: VirtAddr,
     ) -> Result<usize, SystemError> {
         // 获取当前进程的process control block
@@ -745,23 +815,25 @@ impl RobustListHead {
             return Err(SystemError::EPERM);
         }
 
-        //获取当前线程的robust list head 和 长度
+        //获取当前线程的robust list head
         let robust_list_head = (*pcb.get_robust_list()).ok_or(SystemError::EINVAL)?;
 
-        // 将len拷贝到用户空间len_ptr
+        // 将len(即sizeof(PosixRobustListHead))拷贝到用户空间len_ptr
         let mut user_writer = UserBufferWriter::new(
             len_ptr_uaddr.as_ptr::<usize>(),
             core::mem::size_of::<usize>(),
             true,
         )?;
         user_writer.copy_one_to_user(&mem::size_of::<PosixRobustListHead>(), 0)?;
-        // 将head拷贝到用户空间head
+
+        // 将robust list head的用户空间地址拷贝到用户空间head_ptr
+        // 注意: head_ptr_uaddr是二级指针,我们要写入的是robust_list_head.uaddr(一级指针)
         let mut user_writer = UserBufferWriter::new(
-            head_uaddr.as_ptr::<PosixRobustListHead>(),
-            mem::size_of::<PosixRobustListHead>(),
+            head_ptr_uaddr.as_ptr::<usize>(),
+            mem::size_of::<usize>(),
             true,
         )?;
-        user_writer.copy_one_to_user(&robust_list_head, 0)?;
+        user_writer.copy_one_to_user(&robust_list_head.uaddr.data(), 0)?;
 
         return Ok(0);
     }

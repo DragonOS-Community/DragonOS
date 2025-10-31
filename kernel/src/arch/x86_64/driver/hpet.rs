@@ -6,9 +6,10 @@ use core::{
 };
 
 use acpi::HpetInfo;
-use alloc::{string::ToString, sync::Arc};
-use log::{debug, error, info};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
+use log::{debug, error, info, warn};
 use system_error::SystemError;
+use x86::time::rdtsc;
 
 use crate::{
     arch::CurrentIrqArch,
@@ -22,16 +23,17 @@ use crate::{
         manage::irq_manager,
         InterruptArch, IrqNumber,
     },
-    libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-        volatile::volwrite,
-    },
+    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
     },
     time::jiffies::NSEC_PER_JIFFY,
 };
+
+// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/include/asm/hpet.h#39
+const HPET_CFG_ENABLE: u64 = 0x001;
+const HPET_CFG_LEGACY: u64 = 0x002;
 
 static mut HPET_INSTANCE: Option<Hpet> = None;
 
@@ -53,11 +55,16 @@ pub struct Hpet {
     _mmio_guard: MMIOSpaceGuard,
     inner: RwLock<InnerHpet>,
     enabled: AtomicBool,
+    boot_cfg: u64,
 }
 
 struct InnerHpet {
+    /// 指向HPET核心寄存器数组，包含HPET的功能寄存器、周期寄存器、通用配置寄存器、通用中断状态寄存器、计数器值寄存器
     registers_ptr: NonNull<HpetRegisters>,
+    /// 指向HPET定时器寄存器数组，在功能上跟linux源码中channels类似
     timer_registers_ptr: NonNull<HpetTimerRegisters>,
+    /// 定时器启动时配置
+    timer_boot_cfg: Vec<u64>,
 }
 
 impl Hpet {
@@ -92,10 +99,25 @@ impl Hpet {
 
         unsafe { mmio.map_phys(paddr, bytes_to_map)? };
         let ptr = NonNull::new(mmio.vaddr().data() as *mut HpetRegisters).unwrap();
+        // 记录hpet启动时配置
+        let reg = unsafe { ptr.as_ptr().as_mut().unwrap() };
+        let mut cfg = reg.general_config();
+        let boot_cfg = cfg;
+        // 设置hpet通用配置寄存器，禁用HPET、禁用legacy模式
+        cfg &= !(HPET_CFG_ENABLE | HPET_CFG_LEGACY);
+        unsafe { reg.write_general_config(cfg) };
+
         let timer_ptr = NonNull::new(
             (mmio.vaddr().data() + size_of::<HpetRegisters>()) as *mut HpetTimerRegisters,
         )
         .unwrap();
+        // 记录hpet定时器启动时配置
+        let mut timer_boot_cfg = Vec::with_capacity(tm_num as usize);
+        for i in 0..tm_num {
+            let timer_reg = unsafe { timer_ptr.as_ptr().add(i).as_ref().unwrap() };
+            let cfg = timer_reg.config();
+            timer_boot_cfg.push(cfg);
+        }
 
         let hpet = Hpet {
             info: hpet_info,
@@ -103,8 +125,10 @@ impl Hpet {
             inner: RwLock::new(InnerHpet {
                 registers_ptr: ptr,
                 timer_registers_ptr: timer_ptr,
+                timer_boot_cfg,
             }),
             enabled: AtomicBool::new(false),
+            boot_cfg,
         };
 
         return Ok(hpet);
@@ -131,18 +155,18 @@ impl Hpet {
             return Err(SystemError::ENODEV);
         }
 
-        unsafe { regs.write_main_counter_value(0) };
-
         drop(inner_guard);
+
+        if !self.is_counting() {
+            return Err(SystemError::ENODEV);
+        }
 
         let (inner_guard, timer_reg) = unsafe { self.timer_mut(0).ok_or(SystemError::ENODEV) }?;
 
-        let timer_reg = NonNull::new(timer_reg as *mut HpetTimerRegisters).unwrap();
-
+        // 设置定时器0为周期定时，边沿触发，默认投递到IO APIC的2号引脚(看conf寄存器的高32bit，哪一位被置1，则可以投递到哪一个I/O apic引脚)
         unsafe {
-            // 设置定时器0为周期定时，边沿触发，默认投递到IO APIC的2号引脚(看conf寄存器的高32bit，哪一位被置1，则可以投递到哪一个I/O apic引脚)
-            volwrite!(timer_reg, config, 0x004c);
-            volwrite!(timer_reg, comparator_value, ticks);
+            timer_reg.write_config(0x004c);
+            timer_reg.write_comparator_value(ticks);
         }
         drop(inner_guard);
 
@@ -158,8 +182,10 @@ impl Hpet {
 
         let (inner_guard, regs) = unsafe { self.hpet_regs_mut() };
 
-        // 置位旧设备中断路由兼容标志位、定时器组使能标志位
-        unsafe { regs.write_general_config(3) };
+        // 置位旧设备中断路由兼容标志位
+        let mut cfg = regs.general_config();
+        cfg |= HPET_CFG_LEGACY;
+        unsafe { regs.write_general_config(cfg) };
 
         drop(inner_guard);
 
@@ -248,6 +274,94 @@ impl Hpet {
     pub(super) fn handle_irq(&self, timer_num: u32) {
         if timer_num == 0 {
             assert!(!CurrentIrqArch::is_irq_enabled());
+        }
+    }
+
+    /// 验证hpet计数器是否正在计数
+    /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/hpet.c#895
+    fn is_counting(&self) -> bool {
+        self.restart_counter();
+
+        let (_, regs) = unsafe { self.hpet_regs() };
+        let t = regs.main_counter_value();
+        // 获取当前时间戳(TSC)值
+        let start = unsafe { rdtsc() };
+
+        loop {
+            // 如果hpet计数器值发生变化，说明hpet计数器正在计数
+            if t != regs.main_counter_value() {
+                return true;
+            }
+            // 获取当前时间戳(TSC)值
+            let now = unsafe { rdtsc() };
+            if (now - start) >= 200_000 {
+                break;
+            }
+        }
+
+        // 如果在200,000个TSC周期内，HPET计数器值没有发生变化，则HPET计数器没有在计数
+        warn!("HPET counter is not counting");
+        return false;
+    }
+
+    /// 重置HPET计数器
+    fn restart_counter(&self) {
+        self.stop_counter();
+        self.reset_counter();
+        self.start_counter();
+    }
+
+    /// 停止HPET计数器
+    fn stop_counter(&self) {
+        let (inner_guard, regs) = unsafe { self.hpet_regs_mut() };
+        debug!("HPET general config: {:#x}", regs.general_config());
+        let mut cfg = regs.general_config();
+        cfg &= !HPET_CFG_ENABLE;
+        unsafe { regs.write_general_config(cfg) };
+
+        drop(inner_guard);
+    }
+
+    /// 重置HPET计数器
+    fn reset_counter(&self) {
+        let (_, regs) = unsafe { self.hpet_regs_mut() };
+        unsafe { regs.write_main_counter_value(0) };
+    }
+
+    /// 启动HPET计数器
+    fn start_counter(&self) {
+        let (_, regs) = unsafe { self.hpet_regs_mut() };
+        let mut cfg = regs.general_config();
+        cfg |= HPET_CFG_ENABLE;
+        unsafe { regs.write_general_config(cfg) };
+    }
+
+    /// 关闭hpet
+    pub fn hpet_disable(&self) {
+        debug!("HPET disable");
+        if !is_hpet_enabled() {
+            return;
+        }
+
+        // 恢复启动时的配置
+        let mut cfg = self.boot_cfg;
+        cfg &= !HPET_CFG_ENABLE;
+        let (_, regs) = unsafe { self.hpet_regs_mut() };
+        unsafe { regs.write_general_config(cfg) };
+
+        // 恢复各个定时器启动时的配置
+        for i in 0..self.info.hpet_number {
+            let (inner_guard, timer_reg) = unsafe { self.timer_mut(i).unwrap() };
+            unsafe {
+                timer_reg.write_config(inner_guard.timer_boot_cfg[i as usize]);
+            }
+            drop(inner_guard);
+        }
+
+        // 如果HPET在启动时已经启用了，重新启用它
+        if (self.boot_cfg & HPET_CFG_ENABLE) != 0 {
+            let (_, regs) = unsafe { self.hpet_regs_mut() };
+            unsafe { regs.write_general_config(self.boot_cfg) };
         }
     }
 }

@@ -1,0 +1,3 @@
+# 需要添加SYS_CLONE3之后，才能开始验证这个测试，否则内核会panic
+UnameTest.UnshareUTS
+

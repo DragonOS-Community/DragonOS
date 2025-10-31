@@ -57,7 +57,8 @@ impl NTtyLinediscipline {
                 todo!()
             }
             TtyIoctlCmd::TCFLSH => {
-                todo!()
+                log::warn!("NTTY TCFLSH has not been implemented yet");
+                Ok(0)
             }
             _ => {
                 return TtyCore::tty_mode_ioctl(tty.clone(), cmd, arg);

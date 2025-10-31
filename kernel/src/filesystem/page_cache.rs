@@ -301,9 +301,9 @@ impl InnerPageCache {
                 unsafe {
                     page.write_irqsave().truncate(last_len);
                 };
-            } else {
-                return Err(SystemError::EIO);
             }
+            // 对于新文件，最后一页不存在是正常的，不需要返回错误
+            // 只有当文件需要截断到更小的尺寸时，才需要处理最后一页
         }
 
         Ok(())

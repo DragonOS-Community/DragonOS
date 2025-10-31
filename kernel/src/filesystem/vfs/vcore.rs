@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use log::{error, info};
 use system_error::SystemError;
 
+use crate::libs::casting::DowncastArc;
 use crate::{
     define_event_trace,
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
@@ -27,7 +28,13 @@ use super::{
 };
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表
-const ROOTFS_TRY_LIST: [&str; 4] = ["/dev/sda1", "/dev/sda", "/dev/vda1", "/dev/vda"];
+const ROOTFS_TRY_LIST: [&str; 5] = [
+    "/dev/sda1",
+    "/dev/sda",
+    "/dev/vda1",
+    "/dev/vda",
+    "/dev/sdio1",
+];
 kernel_cmdline_param_kv!(ROOTFS_PATH_PARAM, root, "");
 
 /// @brief 原子地生成新的Inode号。
@@ -155,6 +162,23 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     return Ok(());
 }
 
+#[cfg(feature = "initram")]
+pub fn change_root_fs() -> Result<(), SystemError> {
+    info!("Try to change root fs to initramfs...");
+    let initramfs = crate::init::initram::INIT_ROOT_INODE().fs();
+    let r = migrate_virtual_filesystem(initramfs);
+
+    if r.is_err() {
+        error!("Failed to migrate virtual filesystem to initramfs!");
+        loop {
+            spin_loop();
+        }
+    }
+    info!("Successfully migrate rootfs to initramfs!");
+
+    return Ok(());
+}
+
 define_event_trace!(
     do_mkdir_at,
     TP_system(vfs),
@@ -188,7 +212,6 @@ pub fn do_mkdir_at(
     mode: FileMode,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     trace_do_mkdir_at(path, mode);
-    // debug!("Call do mkdir at");
     let (mut current_inode, path) =
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
     let (name, parent) = rsplit_path(&path);
@@ -196,7 +219,6 @@ pub fn do_mkdir_at(
         current_inode =
             current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     }
-    // debug!("mkdir at {:?}", current_inode.metadata()?.inode_id);
     return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
 }
 
@@ -239,36 +261,34 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
-    let inode: Result<Arc<dyn IndexNode>, SystemError> =
-        inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
-    if inode.is_err() {
-        let errno = inode.clone().unwrap_err();
-        // 文件不存在，且需要创建
-        if errno == SystemError::ENOENT {
-            return Err(SystemError::ENOENT);
-        }
-    }
-    // 禁止在目录上unlink
-    if inode.as_ref().unwrap().metadata()?.file_type == FileType::Dir {
-        return Err(SystemError::EPERM);
-    }
-
+    // 分离父路径和文件名
     let (filename, parent_path) = rsplit_path(&remain_path);
-    // 查找父目录
+
+    // 查找父目录，需要跟随符号链接
     let parent_inode: Arc<dyn IndexNode> = inode_begin
         .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
+    // 检查父路径是否为目录
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
-    // 删除文件
-    parent_inode.unlink(filename)?;
+    // 查找目标 inode，但 *不* 跟随最后的符号链接
+    let target_inode = parent_inode.lookup_follow_symlink(filename, 0)?;
 
-    if let Some(page_cache) = inode.unwrap().page_cache().clone() {
+    // 如果目标是目录，则返回 EISDIR
+    if target_inode.metadata()?.file_type == FileType::Dir {
+        return Err(SystemError::EISDIR);
+    }
+
+    // 对目标 inode 执行页缓存清理
+    if let Some(page_cache) = target_inode.page_cache().clone() {
         truncate_inode_pages(page_cache, 0);
     }
+
+    // 在父目录上执行 unlink 操作
+    parent_inode.unlink(filename)?;
 
     return Ok(0);
 }
@@ -281,4 +301,33 @@ pub(super) fn do_file_lookup_at(
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dfd, path)?;
     let follow_final = lookup_flags.contains(LookUpFlags::FOLLOW);
     return inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final);
+}
+
+/// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
+/// - 目录返回 EISDIR
+/// - 非普通文件返回 EINVAL
+/// - 只读挂载返回 EROFS
+#[inline(never)]
+pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
+    let md = inode.metadata()?;
+
+    if md.file_type == FileType::Dir {
+        return Err(SystemError::EISDIR);
+    }
+    if md.file_type != FileType::File {
+        return Err(SystemError::EINVAL);
+    }
+
+    // 只读挂载检查：若当前 fs 是 MountFS 且带 RDONLY 标志，拒绝写
+    let fs = inode.fs();
+    if let Some(mfs) = fs.clone().downcast_arc::<MountFS>() {
+        let mount_flags = mfs.mount_flags();
+        if mount_flags.contains(crate::filesystem::vfs::mount::MountFlags::RDONLY) {
+            return Err(SystemError::EROFS);
+        }
+    }
+
+    let result = inode.resize(len);
+
+    result
 }

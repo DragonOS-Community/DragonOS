@@ -1,0 +1,2 @@
+# 暂时不支持该测例，因为/proc/sys/fs/nr_open没支持
+RlimitTest.DupLimitedByNROpenSysctl

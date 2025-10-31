@@ -28,12 +28,9 @@ mod boot;
 mod multiboot2;
 mod pvh;
 
-#[derive(Debug)]
-pub struct ArchBootParams {}
+mod boot_params;
 
-impl ArchBootParams {
-    pub const DEFAULT: Self = ArchBootParams {};
-}
+pub use self::boot_params::ArchBootParams;
 
 extern "C" {
     static mut GDT_Table: [usize; 0usize];

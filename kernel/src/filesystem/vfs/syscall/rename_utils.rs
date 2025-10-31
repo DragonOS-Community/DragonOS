@@ -26,7 +26,7 @@ pub fn do_renameat2(
     filename_from: *const u8,
     newfd: i32,
     filename_to: *const u8,
-    _flags: u32,
+    flags: u32,
 ) -> Result<usize, SystemError> {
     let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN))
         .unwrap()
@@ -39,6 +39,12 @@ pub fn do_renameat2(
     // 文件名过长
     if filename_from.len() > MAX_PATHLEN || filename_to.len() > MAX_PATHLEN {
         return Err(SystemError::ENAMETOOLONG);
+    }
+
+    let flags = Flags::from_bits_truncate(flags);
+    if !flags.is_empty() {
+        log::warn!("renameat2 flags {flags:?} not supported yet");
+        return Err(SystemError::EINVAL);
     }
 
     //获取pcb，文件节点
@@ -55,4 +61,17 @@ pub fn do_renameat2(
         .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
     return Ok(0);
+}
+
+bitflags! {
+    /// Flags used in the `renameat2` system call.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v6.16.3/source/include/uapi/linux/fcntl.h#L140-L143>.
+    ///
+    /// Reference: <https://man7.org/linux/man-pages/man2/renameat.2.html>.
+    struct Flags: u32 {
+        const NOREPLACE = 1 << 0;
+        const EXCHANGE  = 1 << 1;
+        const WHITEOUT  = 1 << 2;
+    }
 }

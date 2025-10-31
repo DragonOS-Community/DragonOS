@@ -1,17 +1,24 @@
-use core::sync::atomic::Ordering;
+use core::{
+    ptr::{read_volatile, write_volatile},
+    sync::atomic::Ordering,
+};
 
 use atomic_enum::atomic_enum;
 use log::{debug, info};
 use system_error::SystemError;
-use x86::{apic::Icr, msr::IA32_APIC_BASE};
+use x86::{
+    apic::Icr,
+    msr::{rdmsr, wrmsr, IA32_APIC_BASE},
+};
 
 use crate::{
     arch::{
+        asm::irqflags::{local_irq_restore, local_irq_save},
         driver::apic::{hw_irq::ApicId, x2apic::X2Apic, xapic::XApic},
         io::PortIOArch,
         CurrentPortIOArch,
     },
-    mm::PhysAddr,
+    mm::{early_ioremap::EarlyIoRemap, PhysAddr},
     smp::core::smp_get_processor_id,
 };
 
@@ -26,6 +33,16 @@ pub mod ioapic;
 pub mod lapic_vector;
 pub mod x2apic;
 pub mod xapic;
+
+// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/tools/arch/x86/include/asm/irq_vectors.h#69
+const ERROR_APIC_VECTOR: u32 = 0xFE;
+// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/tools/testing/selftests/kvm/include/x86_64/apic.h#33
+const APIC_SPIV: u32 = 0xF0;
+// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/tools/testing/selftests/kvm/include/x86_64/apic.h#35
+const APIC_SPIV_APIC_ENABLED: u32 = 1 << 8;
+const APIC_BASE_MSR: u32 = 0x800;
+// 参考: https://elixir.bootlin.com/linux/v6.6/source/arch/x86/include/asm/fixmap.h#L95
+const FIX_APIC_BASE: usize = 0x2;
 
 /// 当前启用的APIC类型
 #[atomic_enum]
@@ -128,7 +145,9 @@ impl From<LVTRegister> for u32 {
 
 #[derive(Debug)]
 pub struct LVT {
+    /// 寄存器类型
     register: LVTRegister,
+    /// 寄存器上的值
     data: u32,
 }
 
@@ -296,7 +315,7 @@ impl LVT {
     pub fn set_mask(&mut self, mask: bool) {
         self.data &= 0xFFFE_FFFF;
         if mask {
-            self.data |= 1 << 16;
+            self.data |= Self::MASKED;
         }
     }
 
@@ -476,6 +495,106 @@ impl CurrentApic {
         CurrentPortIOArch::out8(0x22, 0x70);
         CurrentPortIOArch::out8(0x23, 0x01);
     }
+
+    /// # 功能
+    ///
+    /// 清理和关闭本地APIC中断，释放硬件资源
+    ///
+    /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/apic.c#1253
+    pub(crate) fn lapic_shutdown(&mut self) {
+        debug!("lapic shutdown");
+        let flags = local_irq_save();
+        self.apic_soft_disable();
+        local_irq_restore(flags);
+    }
+
+    /// # 功能
+    ///
+    /// 以软件的方式禁用当前cpu的local apic
+    ///
+    /// 参考: https://elixir.bootlin.com/linux/v6.6/source/arch/x86/kernel/apic/apic.c#L1190
+    pub(crate) fn disable_local_apic(&mut self) {
+        debug!("disable local apic");
+        self.apic_soft_disable();
+    }
+
+    fn apic_soft_disable(&mut self) {
+        debug!("apic soft disable");
+        self.clear_local_apic();
+
+        // 软禁用APIC（意味着清除 82489DX 寄存器）
+        let mut value = apic_read(APIC_SPIV);
+        value &= !APIC_SPIV_APIC_ENABLED;
+        apic_write(APIC_SPIV, value);
+    }
+
+    /// 确保Local APIC的状态没有残留信息
+    fn clear_local_apic(&mut self) {
+        debug!("clear local apic");
+        // 获取Local APIC的最多支持的LVT项数量
+        let max_lvt = self.max_lvt_entry();
+        let mut lvt;
+
+        // 开始禁用目前已有的LVT项
+        // 如果vector是零，禁用LVT项会触发Local APIC错误，所以先禁用LVTERR项
+        if max_lvt >= 3 {
+            lvt = LVT::new(LVTRegister::ErrorReg, ERROR_APIC_VECTOR).unwrap();
+            lvt.set_mask(true);
+            self.set_lvt(lvt);
+        }
+        // 禁用Timer、LINT0、LINT1项
+        lvt = self.read_lvt(LVTRegister::Timer);
+        lvt.set_mask(true);
+        self.set_lvt(lvt);
+        lvt = self.read_lvt(LVTRegister::LINT0);
+        lvt.set_mask(true);
+        self.set_lvt(lvt);
+        lvt = self.read_lvt(LVTRegister::LINT1);
+        lvt.set_mask(true);
+        self.set_lvt(lvt);
+        // 禁用LVTPC项
+        if max_lvt >= 4 {
+            lvt = self.read_lvt(LVTRegister::PerformanceMonitor);
+            lvt.set_mask(true);
+            self.set_lvt(lvt);
+        }
+        // 禁用LVTTHMR项
+        if max_lvt >= 5 {
+            lvt = self.read_lvt(LVTRegister::Thermal);
+            lvt.set_mask(true);
+            self.set_lvt(lvt);
+        }
+        // 禁用LVTCMCI项 这段代码不能执行，好像是因为 kernel/src/arch/x86_64/driver/apic/x2apic.rs/104 的注释没有启用这一项
+        // if max_lvt >= 6 {
+        //     debug!("7");
+        //     lvt = self.read_lvt(LVTRegister::CMCI);
+        //     if (lvt.data() & LVT::MASKED) == 0 {
+        //         lvt.set_mask(true);
+        //         self.set_lvt(lvt);
+        //     }
+        // }
+
+        // 确保所有中断配置完全禁用，彻底清除APIC的状态
+        lvt = LVT::new(LVTRegister::Timer, LVT::MASKED).unwrap();
+        self.set_lvt(lvt);
+        lvt = LVT::new(LVTRegister::LINT0, LVT::MASKED).unwrap();
+        self.set_lvt(lvt);
+        lvt = LVT::new(LVTRegister::LINT1, LVT::MASKED).unwrap();
+        self.set_lvt(lvt);
+        if max_lvt >= 3 {
+            lvt = LVT::new(LVTRegister::ErrorReg, LVT::MASKED).unwrap();
+            self.set_lvt(lvt);
+        }
+        if max_lvt >= 4 {
+            lvt = LVT::new(LVTRegister::PerformanceMonitor, LVT::MASKED).unwrap();
+            self.set_lvt(lvt);
+        }
+
+        if max_lvt > 3 {
+            apic_write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR as u32, 0);
+        }
+        apic_read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR as u32);
+    }
 }
 
 impl LocalAPIC for CurrentApic {
@@ -612,6 +731,35 @@ impl LocalAPIC for CurrentApic {
             X2Apic.write_icr(icr);
         } else if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
             xapic.write_icr(icr);
+        }
+    }
+}
+
+#[inline(always)]
+fn apic_read(reg: u32) -> u32 {
+    if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+        return unsafe { rdmsr(APIC_BASE_MSR + (reg >> 4)) as u32 };
+    } else {
+        return unsafe {
+            read_volatile(
+                (EarlyIoRemap::idx_to_virt(FIX_APIC_BASE).data() + reg as usize) as *const u32,
+            ) as u32
+        };
+    }
+}
+
+#[inline(always)]
+fn apic_write(reg: u32, value: u32) {
+    if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+        unsafe {
+            wrmsr(APIC_BASE_MSR + (reg >> 4), value as u64);
+        };
+    } else {
+        unsafe {
+            write_volatile(
+                (EarlyIoRemap::idx_to_virt(FIX_APIC_BASE).data() + reg as usize) as *mut u32,
+                value,
+            );
         }
     }
 }

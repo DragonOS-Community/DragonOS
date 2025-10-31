@@ -854,7 +854,7 @@ impl FATDir {
         new_name: &str,
     ) -> Result<FATDirEntry, SystemError> {
         // 判断源目录项是否存在
-        let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
+        let old_dentry = if let FATDirEntryOrShortName::DirEntry(dentry) =
             self.check_existence(old_name, None, fs.clone())?
         {
             dentry
@@ -863,22 +863,26 @@ impl FATDir {
             return Err(SystemError::ENOENT);
         };
 
-        let short_name = if let FATDirEntryOrShortName::ShortName(s) =
-            self.check_existence(new_name, None, fs.clone())?
-        {
-            s
-        } else {
-            // 如果目标目录项存在，那么就返回错误
-            return Err(SystemError::EEXIST);
+        let short_name = match self.check_existence(new_name, None, fs.clone())? {
+            FATDirEntryOrShortName::ShortName(s) => s,
+            // If newpath already exists, it will be atomically replaced, so that
+            // there is no point at which another process attempting to access
+            // newpath will find it missing.
+            // TODO: support other flags like RENAME_EXCHANGE
+            FATDirEntryOrShortName::DirEntry(e) => {
+                // remove the existing entry
+                self.remove(fs.clone(), new_name, true)?;
+                e.short_name_raw()
+            }
         };
 
-        let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
+        let old_short_dentry = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
             // 删除原来的目录项
             self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
 
             // 创建新的目录项
-            let new_dentry: FATDirEntry = self.create_dir_entries(
+            let new_dentry = self.create_dir_entries(
                 new_name,
                 &short_name,
                 Some(se),

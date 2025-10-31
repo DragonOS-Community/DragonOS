@@ -139,6 +139,9 @@ void test_all_ports() {
     }
 
     count++;
+
+    close(tcp_fd);
+    if (count>=100) break;
   }
   printf("===TEST 10===\n");
   printf("count: %d\n", count);

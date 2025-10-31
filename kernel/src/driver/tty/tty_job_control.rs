@@ -103,7 +103,7 @@ impl TtyJobCtrlManager {
         let pcb = ProcessManager::current_pcb();
         let siginfo_guard = pcb.sig_info_irqsave();
         siginfo_guard.sig_blocked().contains(SigSet::from(sig))
-            || pcb.sig_struct_irqsave().handler(sig).unwrap().is_ignore()
+            || pcb.sighand().handler(sig).unwrap().is_ignore()
     }
 
     pub fn job_ctrl_ioctl(
@@ -159,7 +159,8 @@ impl TtyJobCtrlManager {
                 if arg == 1 {
                     Self::session_clear_tty(sid.clone());
                 } else {
-                    return Err(SystemError::EPERM);
+                    log::warn!("job_ctrl_ioctl: TIOCSCTTY: tty is occupied");
+                    // return Err(SystemError::EPERM);
                 }
             }
         }

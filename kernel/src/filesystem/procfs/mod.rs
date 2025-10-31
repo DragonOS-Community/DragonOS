@@ -14,7 +14,11 @@ use system_error::SystemError;
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{mount::MountFlags, vcore::generate_inode_id, FileType},
+    filesystem::vfs::{
+        mount::{MountFlags, MountPath},
+        vcore::generate_inode_id,
+        FileType,
+    },
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -34,7 +38,9 @@ use super::vfs::{
 
 pub mod kmsg;
 pub mod log;
+mod proc_cpuinfo;
 mod proc_mounts;
+mod proc_version;
 mod syscall;
 
 /// @brief 进程文件类型
@@ -55,6 +61,10 @@ pub enum ProcFileType {
     ProcFdDir = 5,
     ProcFdFile = 6,
     ProcMounts = 7,
+    /// /proc/version
+    ProcVersion = 8,
+    /// /proc/cpuinfo
+    ProcCpuinfo = 9,
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -71,6 +81,8 @@ impl From<u8> for ProcFileType {
             5 => ProcFileType::ProcFdDir,
             6 => ProcFileType::ProcFdFile,
             7 => ProcFileType::ProcMounts,
+            8 => ProcFileType::ProcVersion,
+            9 => ProcFileType::ProcCpuinfo,
             _ => ProcFileType::Default,
         }
     }
@@ -400,7 +412,9 @@ impl ProcFSInode {
     // 打开 exe 文件
     fn open_exe(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 这个文件是一个软链接，直接返回0即可
-        return Ok(0);
+        let pcb = ProcessManager::current_pcb();
+        let exe = pcb.execute_path();
+        return Ok(exe.len() as _);
     }
 
     fn open_self(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
@@ -409,7 +423,7 @@ impl ProcFSInode {
     }
 
     // 读取exe文件
-    fn read_exe_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn read_exe_link(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
         // 判断是否有记录pid信息，有的话就是当前进程的exe文件，没有则是当前进程的exe文件
         let pcb = if let Some(pid) = self.fdata.pid {
             ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?
@@ -417,11 +431,13 @@ impl ProcFSInode {
             // 如果没有pid信息，则读取当前进程的exe文件
             ProcessManager::current_pcb()
         };
-
         let exe = pcb.execute_path();
         let exe_bytes = exe.as_bytes();
-        let len = exe_bytes.len().min(buf.len());
-        buf[..len].copy_from_slice(&exe_bytes[..len]);
+        if offset >= exe_bytes.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(exe_bytes.len() - offset);
+        buf[..len].copy_from_slice(&exe_bytes[offset..offset + len]);
         Ok(len)
     }
 
@@ -629,21 +645,43 @@ impl ProcFS {
             .create_proc_file(mounts_params)
             .unwrap_or_else(|_| panic!("create mounts error"));
 
-        let self_dir = result
-            .root_inode()
-            .create("self", FileType::Dir, ModeType::from_bits_truncate(0o555))
-            .unwrap();
-
-        let exe_params = ProcFileCreationParams::builder()
-            .parent(self_dir)
-            .name("exe")
-            .file_type(FileType::SymLink)
-            .ftype(ProcFileType::ProcExe)
+        // 创建 version 文件
+        let version_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("version")
+            .file_type(FileType::File)
+            .mode(ModeType::from_bits_truncate(0o444))
+            .ftype(ProcFileType::ProcVersion)
             .build()
             .unwrap();
         result
-            .create_proc_file(exe_params)
-            .unwrap_or_else(|_| panic!("create exe error"));
+            .create_proc_file(version_params)
+            .unwrap_or_else(|_| panic!("create version error"));
+
+        // 创建 cpuinfo 文件
+        let cpuinfo_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("cpuinfo")
+            .file_type(FileType::File)
+            .mode(ModeType::from_bits_truncate(0o444))
+            .ftype(ProcFileType::ProcCpuinfo)
+            .build()
+            .unwrap();
+        result
+            .create_proc_file(cpuinfo_params)
+            .unwrap_or_else(|_| panic!("create cpuinfo error"));
+
+        let self_params = ProcFileCreationParams::builder()
+            .parent(result.root_inode())
+            .name("self")
+            .file_type(FileType::SymLink)
+            .mode(ModeType::from_bits_truncate(0o555))
+            .ftype(ProcFileType::ProcSelf)
+            .build()
+            .unwrap();
+        result
+            .create_proc_file(self_params)
+            .unwrap_or_else(|_| panic!("create self error"));
 
         return result;
     }
@@ -776,6 +814,8 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
             ProcFileType::ProcExe => inode.open_exe(&mut private_data)?,
             ProcFileType::ProcMounts => inode.open_mounts(&mut private_data)?,
+            ProcFileType::ProcVersion => inode.open_version(&mut private_data)?,
+            ProcFileType::ProcCpuinfo => inode.open_cpuinfo(&mut private_data)?,
             ProcFileType::Default => inode.data.len() as i64,
             ProcFileType::ProcSelf => inode.open_self(&mut private_data)?,
             _ => 0,
@@ -834,7 +874,11 @@ impl IndexNode for LockedProcFSInode {
 
         // 根据文件类型读取相应数据
         match inode.fdata.ftype {
-            ProcFileType::ProcStatus | ProcFileType::ProcMeminfo | ProcFileType::ProcMounts => {
+            ProcFileType::ProcStatus
+            | ProcFileType::ProcMeminfo
+            | ProcFileType::ProcMounts
+            | ProcFileType::ProcVersion
+            | ProcFileType::ProcCpuinfo => {
                 // 获取数据信息
                 let mut private_data = match &*data {
                     FilePrivateData::Procfs(p) => p.clone(),
@@ -844,7 +888,7 @@ impl IndexNode for LockedProcFSInode {
                 };
                 return inode.proc_read(offset, len, buf, &mut private_data);
             }
-            ProcFileType::ProcExe => return inode.read_exe_link(buf),
+            ProcFileType::ProcExe => return inode.read_exe_link(buf, offset),
             ProcFileType::ProcSelf => return inode.read_self_link(buf),
             ProcFileType::ProcFdFile => return inode.read_fd_link(buf),
 
@@ -1195,11 +1239,16 @@ pub fn procfs_init() -> Result<(), SystemError> {
         let procfs: Arc<ProcFS> = ProcFS::new();
         let root_inode = ProcessManager::current_mntns().root_inode();
         // procfs 挂载
-        root_inode
+        let mntfs = root_inode
             .mkdir("proc", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /proc")
             .mount(procfs, MountFlags::empty())
             .expect("Failed to mount at /proc");
+        let ino = root_inode.metadata().unwrap().inode_id;
+        let mount_path = Arc::new(MountPath::from("/proc"));
+        ProcessManager::current_mntns()
+            .add_mount(Some(ino), mount_path, mntfs)
+            .expect("Failed to add mount for /proc");
         info!("ProcFS mounted.");
         result = Some(Ok(()));
     });

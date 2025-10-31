@@ -15,7 +15,7 @@ use smoltcp::{iface, phy, wire};
 use unified_init::macros::unified_init;
 use virtio_drivers::device::net::VirtIONet;
 
-use super::{NetDeivceState, NetDevice, NetDeviceCommonData, Operstate};
+use super::{Iface, NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::{
     arch::rand::rand,
     driver::{
@@ -29,7 +29,11 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        net::register_netdevice,
+        net::{
+            napi::{napi_schedule, NapiStruct},
+            register_netdevice,
+            types::InterfaceFlags,
+        },
         virtio::{
             irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
@@ -40,13 +44,14 @@ use crate::{
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::kernfs::KernFSInode,
+    filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     init::initcall::INITCALL_POSTCORE,
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    net::{generate_iface_id, net_core::poll_ifaces_try_lock_onetime, NET_DEVICES},
+    net::generate_iface_id,
+    process::namespace::net_namespace::INIT_NET_NAMESPACE,
     time::Instant,
 };
 use system_error::SystemError;
@@ -68,6 +73,9 @@ pub struct VirtIONetDevice {
     dev_id: Arc<DeviceId>,
     inner: SpinLock<InnerVirtIONetDevice>,
     locked_kobj_state: LockedKObjectState,
+
+    // 指向对应的interface
+    iface_ref: RwLock<Weak<VirtioInterface>>,
 }
 
 impl Debug for VirtIONetDevice {
@@ -125,6 +133,7 @@ impl VirtIONetDevice {
                 device_common: DeviceCommonData::default(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
+            iface_ref: RwLock::new(Weak::new()),
         });
 
         // dev.set_driver(Some(Arc::downgrade(&virtio_net_driver()) as Weak<dyn Driver>));
@@ -134,6 +143,14 @@ impl VirtIONetDevice {
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIONetDevice> {
         return self.inner.lock();
+    }
+
+    pub fn set_iface(&self, iface: &Arc<VirtioInterface>) {
+        *self.iface_ref.write() = Arc::downgrade(iface);
+    }
+
+    pub fn iface(&self) -> Option<Arc<VirtioInterface>> {
+        self.iface_ref.read().upgrade()
     }
 }
 
@@ -261,13 +278,30 @@ impl Device for VirtIONetDevice {
     fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
         self.inner().device_common.parent = parent;
     }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        None
+    }
 }
 
 impl VirtIODevice for VirtIONetDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        if poll_ifaces_try_lock_onetime().is_err() {
-            log::error!("virtio_net: try lock failed");
-        }
+        let Some(iface) = self.iface() else {
+            error!(
+                "VirtIONetDevice '{:?}' has no associated iface to handle irq",
+                self.dev_id.id()
+            );
+            return Ok(IrqReturn::NotHandled);
+        };
+
+        let Some(napi) = iface.napi_struct() else {
+            log::error!("Virtio net device {} has no napi_struct", iface.name());
+            return Ok(IrqReturn::NotHandled);
+        };
+
+        napi_schedule(napi);
+
+        // self.netns.wakeup_poll_thread();
         return Ok(IrqReturn::Handled);
     }
 
@@ -376,33 +410,109 @@ impl Debug for VirtIONicDeviceInner {
     }
 }
 
-#[cast_to([sync] NetDevice)]
+#[cast_to([sync] Iface)]
 #[cast_to([sync] Device)]
+#[derive(Debug)]
 pub struct VirtioInterface {
     device_inner: VirtIONicDeviceInnerWrapper,
-    iface_id: usize,
     iface_name: String,
-    iface: SpinLock<iface::Interface>,
+    iface_common: super::IfaceCommon,
     inner: SpinLock<InnerVirtIOInterface>,
     locked_kobj_state: LockedKObjectState,
 }
+
+// // 先手糊为virtio实现这些，后面系统要是有了其他类型网卡，这些实现就得实现成一个单独的trait
+// impl VirtioInterface {
+//     /// 消耗token然后主动发送一个 arp 数据包
+//     pub fn emit_arp(arp_repr: &ArpRepr, tx_token: VirtioNetToken) {
+//         let ether_repr = match arp_repr {
+//             ArpRepr::EthernetIpv4 {
+//                 source_hardware_addr,
+//                 target_hardware_addr,
+//                 ..
+//             } => EthernetRepr {
+//                 src_addr: *source_hardware_addr,
+//                 dst_addr: *target_hardware_addr,
+//                 ethertype: EthernetProtocol::Arp,
+//             },
+//             _ => return,
+//         };
+
+//         tx_token.consume(ether_repr.buffer_len() + arp_repr.buffer_len(), |buffer| {
+//             let mut frame = EthernetFrame::new_unchecked(buffer);
+//             ether_repr.emit(&mut frame);
+
+//             let mut pkt = ArpPacket::new_unchecked(frame.payload_mut());
+//             arp_repr.emit(&mut pkt);
+//         });
+//     }
+
+//     /// 解析 arp 包并处理
+//     pub fn process_arp(&self, arp_repr: &ArpRepr) -> Option<ArpRepr> {
+//         match arp_repr {
+//             ArpRepr::EthernetIpv4 {
+//                 operation: ArpOperation::Reply,
+//                 source_hardware_addr,
+//                 source_protocol_addr,
+//                 ..
+//             } => {
+//                 if !source_hardware_addr.is_unicast()
+//                     || !self
+//                         .common()
+//                         .smol_iface
+//                         .lock()
+//                         .context()
+//                         .in_same_network(&IpAddress::Ipv4(*source_protocol_addr))
+//                 {
+//                     return None;
+//                 }
+
+//                 self.common().router_common_data.arp_table.write().insert(
+//                     IpAddress::Ipv4(*source_protocol_addr),
+//                     *source_hardware_addr,
+//                 );
+
+//                 None
+//             }
+//             ArpRepr::EthernetIpv4 {
+//                 operation: ArpOperation::Request,
+//                 source_hardware_addr,
+//                 source_protocol_addr,
+//                 target_protocol_addr,
+//                 ..
+//             } => {
+//                 if !source_hardware_addr.is_unicast() || !source_protocol_addr.x_is_unicast() {
+//                     return None;
+//                 }
+
+//                 if self
+//                     .common()
+//                     .smol_iface
+//                     .lock()
+//                     .context()
+//                     .ipv4_addr()
+//                     .is_none_or(|addr| addr != *target_protocol_addr)
+//                 {
+//                     return None;
+//                 }
+//                 Some(ArpRepr::EthernetIpv4 {
+//                     operation: ArpOperation::Reply,
+//                     source_hardware_addr: self.mac(),
+//                     source_protocol_addr: *target_protocol_addr,
+//                     target_hardware_addr: *source_hardware_addr,
+//                     target_protocol_addr: *source_protocol_addr,
+//                 })
+//             }
+//             _ => None,
+//         }
+//     }
+// }
 
 #[derive(Debug)]
 struct InnerVirtIOInterface {
     kobj_common: KObjectCommonData,
     device_common: DeviceCommonData,
     netdevice_common: NetDeviceCommonData,
-}
-
-impl core::fmt::Debug for VirtioInterface {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("VirtioInterface")
-            .field("iface_id", &self.iface_id)
-            .field("iface_name", &self.iface_name)
-            .field("inner", &self.inner)
-            .field("locked_kobj_state", &self.locked_kobj_state)
-            .finish()
-    }
 }
 
 impl VirtioInterface {
@@ -415,12 +525,22 @@ impl VirtioInterface {
 
         let iface = iface::Interface::new(iface_config, &mut device_inner, Instant::now().into());
 
-        let result = Arc::new(VirtioInterface {
+        let flags = InterfaceFlags::UP
+            | InterfaceFlags::BROADCAST
+            | InterfaceFlags::RUNNING
+            | InterfaceFlags::MULTICAST
+            | InterfaceFlags::LOWER_UP;
+
+        let iface = Arc::new(VirtioInterface {
             device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
-            iface_id,
             locked_kobj_state: LockedKObjectState::default(),
-            iface: SpinLock::new(iface),
             iface_name: format!("eth{}", iface_id),
+            iface_common: super::IfaceCommon::new(
+                iface_id,
+                crate::driver::net::types::InterfaceType::EETHER,
+                flags,
+                iface,
+            ),
             inner: SpinLock::new(InnerVirtIOInterface {
                 kobj_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -428,7 +548,11 @@ impl VirtioInterface {
             }),
         });
 
-        return result;
+        // 设置napi struct
+        let napi_struct = NapiStruct::new(iface.clone(), 10);
+        *iface.common().napi_struct.write() = Some(napi_struct);
+
+        iface
     }
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOInterface> {
@@ -445,7 +569,10 @@ impl VirtioInterface {
 impl Drop for VirtioInterface {
     fn drop(&mut self) {
         // 从全局的网卡接口信息表中删除这个网卡的接口信息
-        NET_DEVICES.write_irqsave().remove(&self.iface_id);
+        // NET_DEVICES.write_irqsave().remove(&self.nic_id());
+        if let Some(ns) = self.net_namespace() {
+            ns.remove_device(&self.nic_id());
+        }
     }
 }
 
@@ -612,11 +739,11 @@ impl phy::TxToken for VirtioNetToken {
 impl phy::RxToken for VirtioNetToken {
     fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
         // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
-        let mut rx_buf = self.rx_buffer.unwrap();
-        let result = f(rx_buf.packet_mut());
+        let rx_buf = self.rx_buffer.unwrap();
+        let result = f(rx_buf.packet());
         self.driver
             .inner
             .lock()
@@ -644,15 +771,14 @@ pub fn virtio_net(
     }
 }
 
-impl NetDevice for VirtioInterface {
+impl Iface for VirtioInterface {
+    fn common(&self) -> &super::IfaceCommon {
+        &self.iface_common
+    }
+
     fn mac(&self) -> wire::EthernetAddress {
         let mac: [u8; 6] = self.device_inner.inner.lock().mac_address();
         return wire::EthernetAddress::from_bytes(&mac);
-    }
-
-    #[inline]
-    fn nic_id(&self) -> usize {
-        return self.iface_id;
     }
 
     #[inline]
@@ -660,41 +786,11 @@ impl NetDevice for VirtioInterface {
         return self.iface_name.clone();
     }
 
-    fn update_ip_addrs(&self, ip_addrs: &[wire::IpCidr]) -> Result<(), SystemError> {
-        if ip_addrs.len() != 1 {
-            return Err(SystemError::EINVAL);
-        }
-
-        self.iface.lock().update_ip_addrs(|addrs| {
-            let dest = addrs.iter_mut().next();
-
-            if let Some(dest) = dest {
-                *dest = ip_addrs[0];
-            } else {
-                addrs
-                    .push(ip_addrs[0])
-                    .expect("Push wire::IpCidr failed: full");
-            }
-        });
-        return Ok(());
+    fn poll(&self) -> bool {
+        // log::debug!("VirtioInterface: poll");
+        self.iface_common.poll(self.device_inner.force_get_mut())
     }
 
-    fn poll(&self, sockets: &mut iface::SocketSet) -> Result<(), SystemError> {
-        let timestamp: smoltcp::time::Instant = Instant::now().into();
-        let mut guard = self.iface.lock();
-        let poll_res = guard.poll(timestamp, self.device_inner.force_get_mut(), sockets);
-        // todo: notify!!!
-        // debug!("Virtio Interface poll:{poll_res}");
-        if poll_res {
-            return Ok(());
-        }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-
-    #[inline(always)]
-    fn inner_iface(&self) -> &SpinLock<iface::Interface> {
-        return &self.iface;
-    }
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
     //     return self;
     // }
@@ -722,6 +818,14 @@ impl NetDevice for VirtioInterface {
 
     fn set_operstate(&self, state: Operstate) {
         self.inner().netdevice_common.operstate = state;
+    }
+
+    fn mtu(&self) -> usize {
+        use smoltcp::phy::Device;
+        self.device_inner
+            .force_get_mut()
+            .capabilities()
+            .max_transmission_unit
     }
 }
 
@@ -786,9 +890,7 @@ impl KObject for VirtioInterface {
 #[unified_init(INITCALL_POSTCORE)]
 fn virtio_net_driver_init() -> Result<(), SystemError> {
     let driver = VirtIONetDriver::new();
-    virtio_driver_manager()
-        .register(driver.clone() as Arc<dyn VirtIODriver>)
-        .expect("Add virtio net driver failed");
+    virtio_driver_manager().register(driver.clone() as Arc<dyn VirtIODriver>)?;
     unsafe {
         VIRTIO_NET_DRIVER = Some(driver);
     }
@@ -859,12 +961,20 @@ impl VirtIODriver for VirtIONetDriver {
         // 设置iface的父设备为virtio_net_device
         iface.set_dev_parent(Some(Arc::downgrade(&virtio_net_device) as Weak<dyn Device>));
         // 在sysfs中注册iface
-        register_netdevice(iface.clone() as Arc<dyn NetDevice>)?;
+        register_netdevice(iface.clone() as Arc<dyn Iface>)?;
+
+        // 将virtio_net_device和iface关联起来
+        virtio_net_device.set_iface(&iface);
 
         // 将网卡的接口信息注册到全局的网卡接口信息表中
-        NET_DEVICES
-            .write_irqsave()
-            .insert(iface.nic_id(), iface.clone());
+        // NET_DEVICES
+        //     .write_irqsave()
+        //     .insert(iface.nic_id(), iface.clone());
+        INIT_NET_NAMESPACE.add_device(iface.clone());
+        iface
+            .iface_common
+            .set_net_namespace(INIT_NET_NAMESPACE.clone());
+        INIT_NET_NAMESPACE.set_default_iface(iface.clone());
 
         virtio_irq_manager()
             .register_device(device.clone())

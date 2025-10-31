@@ -8,7 +8,7 @@ use core::{
 use alloc::sync::{Arc, Weak};
 
 use kdepends::memoffset::offset_of;
-use log::{error, warn};
+use log::{error, info, warn};
 use system_error::SystemError;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
@@ -21,6 +21,7 @@ use crate::{
         fork::{CloneFlags, KernelCloneArgs},
         KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, PROCESS_SWITCH_RESULT,
     },
+    smp::cpu::smp_cpu_manager,
     syscall::Syscall,
 };
 
@@ -30,7 +31,10 @@ use self::{
     table::{switch_fs_and_gs, KERNEL_DS, USER_DS},
 };
 
-use super::{fpu::FpState, interrupt::TrapFrame, syscall::X86_64GSData, CurrentIrqArch};
+use super::{
+    cpu::current_cpu_id, driver::apic::CurrentApic, fpu::FpState, interrupt::TrapFrame,
+    syscall::X86_64GSData, CurrentIrqArch,
+};
 
 pub mod idle;
 pub mod kthread;
@@ -603,3 +607,30 @@ unsafe extern "sysv64" fn ready_to_switch_to_user(
 //     const TIF_ADDR32		= 1 << 29;	/* 32-bit address space on 64 bits */
 //     }
 // }
+
+/// # 功能
+///
+/// 停止当前CPU的运行，系统进入最终的停机状态
+pub(super) fn stop_this_cpu() -> ! {
+    let cpu_id = current_cpu_id();
+
+    unsafe {
+        CurrentIrqArch::interrupt_disable();
+    }
+
+    // 将当前cpu标记为offline
+    smp_cpu_manager().set_online_cpu(cpu_id, false);
+    CurrentApic.disable_local_apic();
+
+    loop {
+        native_halt();
+    }
+}
+
+#[inline(always)]
+fn native_halt() {
+    info!("Starting System Halt...");
+    unsafe {
+        asm!("hlt", options(nomem, nostack, preserves_flags));
+    }
+}

@@ -6,6 +6,7 @@ mod cfiles;
 mod constant;
 mod kconfig;
 mod utils;
+mod version_gen;
 
 /// 运行构建
 pub fn run() {
@@ -13,4 +14,5 @@ pub fn run() {
 
     crate::cfiles::CFilesBuilder::build();
     crate::kconfig::KConfigBuilder::build();
+    crate::version_gen::generate_version();
 }

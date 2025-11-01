@@ -9,11 +9,11 @@ use crate::{
         },
         class::Class,
         device::{
-            bus:: Bus,
+            bus::Bus,
             device_number::{DeviceNumber, Major},
-            device_register,device_unregister,
+            device_register, device_unregister,
             driver::{Driver, DriverCommonData},
-            DevName, Device, DeviceCommonData,DeviceType, IdTable,
+            DevName, Device, DeviceCommonData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
@@ -21,7 +21,7 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
-        vfs::{IndexNode, InodeId, Metadata,file::FileMode},
+        vfs::{file::FileMode, IndexNode, InodeId, Metadata},
     },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -793,32 +793,35 @@ impl LoopManager {
         /*
         重置状态unbound
          */
-        let  mut inner_guard =device.inner();
+        let mut inner_guard = device.inner();
         inner_guard.set_state(LoopState::Unbound)?;
-        inner_guard.file_inode=None;
-        inner_guard.file_size-0;
-        inner_guard.offset=0;
-            inner_guard.size_limit = 0;
-    inner_guard.read_only = false;
-    inner_guard.user_direct_io = false;
-    inner_guard.flags = 0;
-    inner_guard.file_name = 0;
-    drop(inner_guard);
-    let minor = device.inner().device_number.minor() as usize; 
-    let mut loop_mgr_inner = self.inner(); // Lock the LoopManager
-    if minor < LoopManager::MAX_DEVICES {
-        if let Some(removed_device) = loop_mgr_inner.devices[minor].take() {
-            log::info!("Deallocated loop device loop{} from manager.", minor);
-            // Unregister from block device manager
-            device_unregister(removed_device.clone());
+        inner_guard.file_inode = None;
+        inner_guard.file_size - 0;
+        inner_guard.offset = 0;
+        inner_guard.size_limit = 0;
+        inner_guard.read_only = false;
+        inner_guard.user_direct_io = false;
+        inner_guard.flags = 0;
+        inner_guard.file_name = 0;
+        drop(inner_guard);
+        let minor = device.inner().device_number.minor() as usize;
+        let mut loop_mgr_inner = self.inner(); // Lock the LoopManager
+        if minor < LoopManager::MAX_DEVICES {
+            if let Some(removed_device) = loop_mgr_inner.devices[minor].take() {
+                log::info!("Deallocated loop device loop{} from manager.", minor);
+                // Unregister from block device manager
+                device_unregister(removed_device.clone());
+            } else {
+                log::warn!(
+                    "Attempted to deallocate loop device loop{} but it was not found in manager.",
+                    minor
+                );
+            }
         } else {
-            log::warn!("Attempted to deallocate loop device loop{} but it was not found in manager.", minor);
+            return Err(SystemError::EINVAL); // Minor out of bounds
         }
-    } else {
-        return Err(SystemError::EINVAL); // Minor out of bounds
-    }
 
-    Ok(()) // Indicate success
+        Ok(()) // Indicate success
     }
     pub fn loop_init(&self, driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {
         // 注册 loop 设备
@@ -896,8 +899,6 @@ impl IndexNode for LoopControlDevice {
         _data: SpinLockGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
-
-
         // 若文件系统没有实现此方法，则返回“不支持”
         return Ok(());
     }

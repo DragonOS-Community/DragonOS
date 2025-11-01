@@ -569,8 +569,10 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
+            let current_cpu_id = smp_get_processor_id();
+            // Do not kick the current CPU, as it is already running and cannot preempt itself.
             if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid()
-                && cpu_id != smp_get_processor_id()
+                && cpu_id != current_cpu_id
             {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }

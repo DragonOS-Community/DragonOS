@@ -297,7 +297,6 @@ pub struct SigInfo {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct PosixSigInfo {
-    // 注意：与 Linux 保持一致的字段顺序：si_signo, si_errno, si_code
     pub si_signo: i32,
     pub si_errno: i32,
     pub si_code: i32,

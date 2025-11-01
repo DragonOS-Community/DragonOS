@@ -423,7 +423,7 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
         let _r = ProcessManager::wakeup(&pcb).map(|_| {
             ProcessManager::kick(&pcb);
         });
-    } else {
+    } else if !state.is_stopped() {
         // log::debug!(
         //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick only",
         //     pcb.raw_pid(),

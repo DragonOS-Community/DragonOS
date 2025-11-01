@@ -208,6 +208,10 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         let _ = nanosleep(Duration::from_millis(1).into());
                         if e == SystemError::ERESTARTSYS {
                             continue;
+                        } else {
+                            // 对于其他错误（如ESRCH），应该返回错误而不是无限循环
+                            retval = Err(e);
+                            break 'outer;
                         }
                     }
 

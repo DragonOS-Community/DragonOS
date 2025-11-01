@@ -285,14 +285,16 @@ pub struct UserSigaction {
 #[derive(Copy, Clone, Debug)]
 pub struct SigInfo {
     sig_no: i32,
-    sig_code: SigCode,
     errno: i32,
+    sig_code: SigCode,
     sig_type: SigType,
 }
 
 /**
  * 标准POSIX siginfo_t结构体，用于用户态接口
  * 完全兼容Linux标准，大小为128字节
+ *
+ * 字段顺序必须严格按照Linux标准：si_signo, si_errno, si_code
  */
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -413,8 +415,8 @@ impl SigInfo {
         match self.sig_type {
             SigType::Kill(pid) => PosixSigInfo {
                 si_signo: self.sig_no,
-                si_code: self.sig_code as i32,
                 si_errno: self.errno,
+                si_code: self.sig_code as i32,
                 _sifields: PosixSiginfoFields {
                     _kill: PosixSiginfoKill {
                         si_pid: pid.data() as i32,
@@ -424,8 +426,8 @@ impl SigInfo {
             },
             SigType::Alarm(pid) => PosixSigInfo {
                 si_signo: self.sig_no,
-                si_code: self.sig_code as i32,
                 si_errno: self.errno,
+                si_code: self.sig_code as i32,
                 _sifields: PosixSiginfoFields {
                     _timer: PosixSiginfoTimer {
                         si_tid: pid.data() as i32,

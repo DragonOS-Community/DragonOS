@@ -108,8 +108,8 @@ pub fn kernel_waitid(
         use crate::ipc::signal_types::{PosixSigInfo, PosixSiginfoFields, PosixSiginfoSigchld};
         let mut si = PosixSigInfo {
             si_signo: 0,
-            si_code: 0,
             si_errno: 0,
+            si_code: 0,
             _sifields: PosixSiginfoFields {
                 _kill: crate::ipc::signal_types::PosixSiginfoKill {
                     si_pid: 0,
@@ -119,8 +119,8 @@ pub fn kernel_waitid(
         };
         if let Some(info) = &kwo.ret_info {
             si.si_signo = Signal::SIGCHLD as i32; // SIGCHLD
-            si.si_code = info.cause; // CLD_*
             si.si_errno = 0;
+            si.si_code = info.cause; // CLD_*
             si._sifields = PosixSiginfoFields {
                 _sigchld: PosixSiginfoSigchld {
                     si_pid: info.pid.data() as i32,

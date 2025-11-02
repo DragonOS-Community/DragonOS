@@ -13,7 +13,7 @@
 #define LOOP_DEVICE_CONTROL "/dev/loop-control"
 #define TEST_FILE_NAME "test_image.img"
 #define TEST_FILE_SIZE (1024 * 1024) // 1MB for the test image
-
+//创建测试文件
 void create_test_file() {
     printf("Creating test file: %s with size %d bytes\n", TEST_FILE_NAME, TEST_FILE_SIZE);
     int fd = open(TEST_FILE_NAME, O_CREAT | O_TRUNC | O_RDWR, 0644);
@@ -69,10 +69,13 @@ int main() {
     int returned_minor = ioctl(control_fd, LOOP_CTL_ADD, loop_minor);
     if (returned_minor < 0) {
         perror("Failed to add loop device");
+        printf("returned_minor: %d\n", returned_minor);
         close(control_fd);
         exit(EXIT_FAILURE);
     }
     if (returned_minor != loop_minor) {
+
+        
         fprintf(stderr, "Warning: LOOP_CTL_ADD returned minor %d, expected %d\n", returned_minor, loop_minor);
     }
     printf("Loop device loop%d added (kernel returned minor: %d).\n", loop_minor, returned_minor);

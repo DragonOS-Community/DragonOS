@@ -558,18 +558,22 @@ impl LoopDeviceDriver {
     fn inner(&self) -> SpinLockGuard<InnerLoopDeviceDriver> {
         self.inner.lock()
     }
-    fn new_loop_device(&self, minor: usize) -> Result<(), SystemError> {
+    fn new_loop_device(&self, minor: usize) -> Result<Arc<LoopDevice>, SystemError> {
         let devname = DevName::new(format!("{}{}", LOOP_BASENAME, minor), minor);
-        if let Some(loop_dev) = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32) {
-            log::info!(
-                "Registering loop device: {}",
-                loop_dev.block_dev_meta.devname
-            );
-            block_dev_manager().register(loop_dev.clone())?;
-        } else {
-            error!("Failed to create loop device for minor {}", minor);
-        }
-        Ok(())
+         let loop_dev = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32)
+            .ok_or_else(|| {
+                error!("Failed to create loop device for minor {}", minor);
+                SystemError::ENOMEM // 如果创建失败，返回具体的错误
+            })?;
+        log::info!(
+            "Registering loop device: {}",
+            loop_dev.block_dev_meta.devname
+        );
+        // 先注册到块设备管理器，让它可用
+        block_dev_manager().register(loop_dev.clone())?;
+        
+        // 返回创建的设备，让 LoopManager 能够存储它
+        Ok(loop_dev)
     }
 }
 //初始化函数，注册1个loopcontrol设备和8个loop设备备用
@@ -704,51 +708,112 @@ impl LoopManager {
     /*
     请求队列，工作队列未实现
      */
-    pub fn loop_add(&self, requested_minor: Option<u32>) -> Result<Arc<LoopDevice>, SystemError> {
-        let mut inner_guard = self.inner();
+
+    /*
+    loop_a思路
+    1.检查请求的次设备号是否有效且未被占用-》直接返回当前设备
+    2.如果未指定次设备号，遍历设备数组寻找第一个未被占用的次设备号
+    3.如果都不行，创建LoopDevice实例，注册到块设备管理器
+     */
+   pub fn loop_add(&self, requested_minor: Option<u32>) -> Result<Arc<LoopDevice>, SystemError> {
+        // 锁定 LoopManager，获取可变访问权限
+        let mut inner_manager_guard = self.inner(); 
+        log::info!("Adding loop device with requested minor: {:?}", requested_minor);
         let minor_to_use: u32 = match requested_minor {
+            // ======================================================
+            // 1. 指定次设备号 (Some) 逻辑
+            // ======================================================
             Some(req_minor) => {
                 if req_minor >= Self::MAX_DEVICES as u32 {
+                    // 检查次设备号是否超出最大限制
                     return Err(SystemError::EINVAL);
                 }
-                if inner_guard.devices[req_minor as usize].is_some() {
-                    return Err(SystemError::EEXIST);
+
+                // 检查设备数组中该位置是否有设备 (Option<Arc<LoopDevice>>)
+                if let Some(existing_dev) = &inner_manager_guard.devices[req_minor as usize] {
+                    let inner_dev_guard = existing_dev.inner();
+                    // 如果设备已存在且处于 Bound 状态，则不能复用，返回 EEXIST。
+                    if matches!(inner_dev_guard.state, LoopState::Bound) {
+                        return Err(SystemError::EEXIST); // 设备已绑定，不可用
+                    }
+                    
+                    // 如果设备已存在但处于 Unbound 或 Dead 状态，则复用该次设备号
+                    req_minor
+                } else {
+                    // 设备数组中该位置为空 (None)，直接使用该次设备号创建新设备
+                    req_minor
                 }
-                req_minor
             }
+            
+            // ======================================================
+            // 2. 未指定次设备号 (None) 逻辑：查找第一个可用的次设备号
+            // ======================================================
             None => {
-                let mut found_minor_candidate = None;
-                let start_minor = inner_guard.next_free_minor;
+                let start_minor = inner_manager_guard.next_free_minor;
                 let mut current_search_minor = start_minor;
+                let mut found_minor_candidate = None;
 
+                // 遍历整个设备数组寻找空闲次设备号
                 for _ in 0..Self::MAX_DEVICES {
-                    if inner_guard.devices[current_search_minor as usize].is_none() {
+                    let index = current_search_minor as usize;
+                    
+                    if let Some(dev) = &inner_manager_guard.devices[index] {
+                        let inner_dev_guard = dev.inner();
+                        
+                        // 找到一个已存在但处于 Unbound 状态的设备，可以选择复用
+                        if matches!(inner_dev_guard.state, LoopState::Unbound) {
+                            found_minor_candidate = Some(current_search_minor);
+                            break;
+                        }
+                        // 如果是 Bound 状态，则跳过继续查找下一个
+                    } else {
+                        // 找到一个数组中为 None 的位置（完全空闲）
                         found_minor_candidate = Some(current_search_minor);
-                        // 更新 next_free_minor 以便下次从这里开始查找
-                        inner_guard.next_free_minor =
-                            (current_search_minor + 1) % (Self::MAX_DEVICES as u32);
                         break;
                     }
+                    
+                    // 循环到下一个次设备号
                     current_search_minor = (current_search_minor + 1) % (Self::MAX_DEVICES as u32);
+                    
+                    // 检查是否已经循环回起点
                     if current_search_minor == start_minor {
-                        // 遍历了一圈，没有找到空闲的
-                        break;
+                        break; // 遍历了一圈，没有找到空闲的，退出循环
                     }
                 }
 
+                // 更新 next_free_minor，以便下次查找时从找到的次设备号的下一个开始
+                if let Some(minor) = found_minor_candidate {
+                    inner_manager_guard.next_free_minor = (minor + 1) % (Self::MAX_DEVICES as u32);
+                }
+
+                // 如果找到，则使用；否则返回 ENOSPC (没有空间/资源)
                 found_minor_candidate.ok_or(SystemError::ENOSPC)?
             }
         };
+
+        // ======================================================
+        // 3. 创建和注册 LoopDevice
+        // ======================================================
+        
         let devname = DevName::new(
             format!("{}{}", LOOP_BASENAME, minor_to_use),
             minor_to_use as usize,
         );
+        
+        // 创建新的 LoopDevice 实例
         let loop_dev = LoopDevice::new_empty_loop_device(devname.clone(), minor_to_use)
             .ok_or(SystemError::ENOMEM)?;
+            
+        // 注册到块设备管理器
         log::info!("Registing loop device: {}", loop_dev.block_dev_meta.devname);
         block_dev_manager().register(loop_dev.clone())?;
-        inner_guard.devices[minor_to_use as usize] = Some(loop_dev.clone());
+        
+        // 将新设备存入 Manager 的设备数组
+        inner_manager_guard.devices[minor_to_use as usize] = Some(loop_dev.clone());
+        
         log::info!("Loop device loop{} added successfully.", minor_to_use);
+        
+        // 返回新创建的 LoopDevice
         Ok(loop_dev)
     }
     pub fn find_device_by_minor(&self, minor: u32) -> Option<Arc<LoopDevice>> {
@@ -824,9 +889,11 @@ impl LoopManager {
         Ok(()) // Indicate success
     }
     pub fn loop_init(&self, driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {
+        let mut inner =self.inner();
         // 注册 loop 设备
         for minor in 0..Self::MAX_INIT_DEVICES {
-            driver.new_loop_device(minor)?;
+            let loop_dev =driver.new_loop_device(minor)?;
+            inner.devices[minor]=Some(loop_dev);
         }
         log::info!("Loop devices initialized");
 
@@ -939,11 +1006,14 @@ impl IndexNode for LoopControlDevice {
                 log::info!("Starting LOOP_CTL_ADD ioctl");
                 let requested_index = data as u32;
                 match self.loop_mgr.loop_add(Some(requested_index)) {
-                    Ok(loop_dev) => Ok(loop_dev.inner().device_number.minor() as usize),
+                    
+                    Ok(loop_dev) => 
+                    {   log::info!("LOOP_CTL_ADD ioctl succeeded, allocated loop device loop{}", loop_dev.inner().device_number.minor());
+                        Ok(loop_dev.inner().device_number.minor() as usize)
+                    }                                              
                     Err(e) => Err(e),
                 }
             }
-
             LOOP_CTL_REMOVE => {
                 let minor_to_remove = data as u32;
                 //  self.loop_mgr.loop_remove(minor_to_remove)?;

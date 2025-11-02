@@ -1,6 +1,6 @@
 # The toolchain we use.
 # You can get it by running DragonOS' `tools/bootstrap.sh`
-TOOLCHAIN="+nightly-2024-11-05-x86_64-unknown-linux-gnu"
+TOOLCHAIN="+nightly-2025-08-10-x86_64-unknown-linux-gnu"
 
 ifeq ($(ARCH), riscv64)
 RUSTFLAGS+="-C target-feature=+crt-static"

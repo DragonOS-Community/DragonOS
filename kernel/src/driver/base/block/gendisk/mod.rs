@@ -309,9 +309,7 @@ impl IndexNode for GenDisk {
         private_data: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
         let bdev = self.block_device();
-        if let Some(loop_dev) =
-            BlockDevice::as_any_ref(&*bdev).downcast_ref::<LoopDevice>()
-        {
+        if let Some(loop_dev) = BlockDevice::as_any_ref(&*bdev).downcast_ref::<LoopDevice>() {
             loop_dev.ioctl(cmd, data, private_data)
         } else {
             Err(SystemError::ENOSYS)

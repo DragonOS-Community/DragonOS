@@ -19,9 +19,7 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
-        vfs::{
-            file::FileMode, FilePrivateData, FileType, IndexNode, InodeId, Metadata,
-        },
+        vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, InodeId, Metadata},
     },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -384,7 +382,8 @@ impl IndexNode for LoopDevice {
                 .ok_or(SystemError::EBADF)?;
 
                 let mode = file.mode();
-                let read_only = !mode.contains(FileMode::O_WRONLY) && !mode.contains(FileMode::O_RDWR);
+                let read_only =
+                    !mode.contains(FileMode::O_WRONLY) && !mode.contains(FileMode::O_RDWR);
 
                 let inode = file.inode();
                 let metadata = inode.metadata()?;
@@ -513,9 +512,7 @@ impl BlockDevice for LoopDevice {
         if count == 0 {
             return Ok(0);
         }
-        let len = count
-            .checked_mul(LBA_SIZE)
-            .ok_or(SystemError::EOVERFLOW)?;
+        let len = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
         if len > buf.len() {
             return Err(SystemError::EINVAL);
         }
@@ -548,9 +545,7 @@ impl BlockDevice for LoopDevice {
         if count == 0 {
             return Ok(0);
         }
-        let len = count
-            .checked_mul(LBA_SIZE)
-            .ok_or(SystemError::EOVERFLOW)?;
+        let len = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
         if len > buf.len() {
             return Err(SystemError::EINVAL);
         }
@@ -652,7 +647,7 @@ impl LoopDeviceDriver {
     }
     fn new_loop_device(&self, minor: usize) -> Result<Arc<LoopDevice>, SystemError> {
         let devname = DevName::new(format!("{}{}", LOOP_BASENAME, minor), minor);
-         let loop_dev = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32)
+        let loop_dev = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32)
             .ok_or_else(|| {
                 error!("Failed to create loop device for minor {}", minor);
                 SystemError::ENOMEM // 如果创建失败，返回具体的错误
@@ -663,7 +658,7 @@ impl LoopDeviceDriver {
         );
         // 先注册到块设备管理器，让它可用
         block_dev_manager().register(loop_dev.clone())?;
-        
+
         // 返回创建的设备，让 LoopManager 能够存储它
         Ok(loop_dev)
     }
@@ -1023,11 +1018,11 @@ impl LoopManager {
         Ok(()) // Indicate success
     }
     pub fn loop_init(&self, driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {
-        let mut inner =self.inner();
+        let mut inner = self.inner();
         // 注册 loop 设备
         for minor in 0..Self::MAX_INIT_DEVICES {
-            let loop_dev =driver.new_loop_device(minor)?;
-            inner.devices[minor]=Some(loop_dev);
+            let loop_dev = driver.new_loop_device(minor)?;
+            inner.devices[minor] = Some(loop_dev);
         }
         log::info!("Loop devices initialized");
 
@@ -1103,10 +1098,7 @@ impl IndexNode for LoopControlDevice {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Ok(());
     }
-    fn close(
-        &self,
-        _data: SpinLockGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -1166,12 +1158,10 @@ impl IndexNode for LoopControlDevice {
                 self.loop_mgr.loop_remove(minor_to_remove)?;
                 Ok(0)
             }
-            LOOP_CTL_GET_FREE => {
-                match self.loop_mgr.find_free_minor() {
-                    Some(minor) => Ok(minor as usize),
-                    None => Err(SystemError::ENOSPC),
-                }
-            }
+            LOOP_CTL_GET_FREE => match self.loop_mgr.find_free_minor() {
+                Some(minor) => Ok(minor as usize),
+                None => Err(SystemError::ENOSPC),
+            },
             _ => Err(SystemError::ENOSYS),
         }
     }

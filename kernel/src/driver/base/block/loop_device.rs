@@ -1,5 +1,3 @@
-use crate::filesystem::devfs::LockedDevFSInode;
-use crate::filesystem::vfs::FilePrivateData;
 use crate::{
     driver::base::{
         block::{
@@ -19,14 +17,17 @@ use crate::{
         kset::KSet,
     },
     filesystem::{
-        devfs::{devfs_register, DevFS, DeviceINode},
+        devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
-        vfs::{file::FileMode, IndexNode, InodeId, Metadata},
+        vfs::{
+            file::FileMode, FilePrivateData, FileType, IndexNode, InodeId, Metadata,
+        },
     },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::ProcessManager,
 };
 use alloc::{
     string::{String, ToString},
@@ -55,8 +56,8 @@ const LOOP_BASENAME: &str = "loop";
 // pub const MAX_LO_CRYPT: u32 = 20;
 
 // // IOCTL 命令 - 使用 0x4C ('L')
-// pub const LOOP_SET_FD: u32 = 0x4C00;
-// pub const LOOP_CLR_FD: u32 = 0x4C01;
+pub const LOOP_SET_FD: u32 = 0x4C00;
+pub const LOOP_CLR_FD: u32 = 0x4C01;
 // pub const LOOP_SET_STATUS: u32 = 0x4C02;
 // pub const LOOP_GET_STATUS: u32 = 0x4C03;
 // pub const LOOP_SET_STATUS64: u32 = 0x4C04;
@@ -140,6 +141,7 @@ impl LoopDeviceInner {
         Ok(())
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoopState {
     Unbound,
     Bound,
@@ -192,12 +194,17 @@ impl LoopDevice {
 
     /// 设置 loop 设备关联的文件
     pub fn set_file(&self, file_inode: Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        let mut inner = self.inner();
-        // 获取文件大小
-        let file_size = file_inode.metadata()?.size;
+        let metadata = file_inode.metadata()?;
+        if metadata.size < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let file_size = metadata.size as usize;
 
+        let mut inner = self.inner();
         inner.file_inode = Some(file_inode);
-        inner.file_size = file_size as usize;
+        inner.file_size = file_size;
+        inner.size_limit = file_size;
+        inner.offset = 0;
 
         Ok(())
     }
@@ -215,6 +222,61 @@ impl LoopDevice {
     // 检查是否为只读
     pub fn is_read_only(&self) -> bool {
         self.inner().read_only
+    }
+
+    pub fn is_bound(&self) -> bool {
+        matches!(self.inner().state, LoopState::Bound)
+    }
+
+    pub fn bind_file(
+        &self,
+        file_inode: Arc<dyn IndexNode>,
+        read_only: bool,
+    ) -> Result<(), SystemError> {
+        {
+            let inner = self.inner();
+            if matches!(inner.state, LoopState::Bound) {
+                return Err(SystemError::EBUSY);
+            }
+        }
+
+        self.set_file(file_inode.clone())?;
+
+        let metadata = file_inode.metadata()?;
+        if metadata.size < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let file_size = metadata.size as usize;
+
+        let mut inner = self.inner();
+        inner.set_state(LoopState::Bound)?;
+        inner.read_only = read_only;
+        inner.size_limit = file_size;
+        inner.flags = 0;
+        inner.user_direct_io = false;
+        inner.visible = true;
+        // file_name目前仅作为占位字段
+        inner.file_name = 0;
+        Ok(())
+    }
+
+    pub fn clear_file(&self) -> Result<(), SystemError> {
+        let mut inner = self.inner();
+        match inner.state {
+            LoopState::Bound | LoopState::Rundown => inner.set_state(LoopState::Unbound)?,
+            LoopState::Unbound => {}
+            LoopState::Deleting => return Err(SystemError::EBUSY),
+        }
+
+        inner.file_inode = None;
+        inner.file_size = 0;
+        inner.size_limit = 0;
+        inner.offset = 0;
+        inner.read_only = false;
+        inner.user_direct_io = false;
+        inner.flags = 0;
+        inner.file_name = 0;
+        Ok(())
     }
 }
 
@@ -286,22 +348,28 @@ impl IndexNode for LoopDevice {
 
     fn read_at(
         &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
         _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+        if len > buf.len() {
+            return Err(SystemError::ENOBUFS);
+        }
+        BlockDevice::read_at_bytes(self, offset, len, buf)
     }
 
     fn write_at(
         &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &[u8],
+        offset: usize,
+        len: usize,
+        buf: &[u8],
         _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+        if len > buf.len() {
+            return Err(SystemError::E2BIG);
+        }
+        BlockDevice::write_at_bytes(self, offset, len, &buf[..len])
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
@@ -332,6 +400,42 @@ impl IndexNode for LoopDevice {
             raw_dev: self.inner().device_number,
         };
         Ok(metadata.clone())
+    }
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        match cmd {
+            LOOP_SET_FD => {
+                let file_fd = data as i32;
+                let fd_table = ProcessManager::current_pcb().fd_table();
+                let file = {
+                    let guard = fd_table.read();
+                    guard.get_file_by_fd(file_fd)
+                }
+                .ok_or(SystemError::EBADF)?;
+
+                let mode = file.mode();
+                let read_only = !mode.contains(FileMode::O_WRONLY) && !mode.contains(FileMode::O_RDWR);
+
+                let inode = file.inode();
+                let metadata = inode.metadata()?;
+                match metadata.file_type {
+                    FileType::File | FileType::BlockDevice => {}
+                    _ => return Err(SystemError::EINVAL),
+                }
+
+                self.bind_file(inode, read_only)?;
+                Ok(0)
+            }
+            LOOP_CLR_FD => {
+                self.clear_file()?;
+                Ok(0)
+            }
+            _ => Err(SystemError::ENOSYS),
+        }
     }
 }
 
@@ -422,7 +526,12 @@ impl BlockDevice for LoopDevice {
 
     fn disk_range(&self) -> GeneralBlockRange {
         let inner = self.inner();
-        let blocks = inner.file_size / LBA_SIZE;
+        let blocks = if inner.file_size == 0 {
+            0
+        } else {
+            //饱和式加法，溢出返回类型最大值
+            inner.file_size.saturating_add(LBA_SIZE - 1) / LBA_SIZE
+        };
         drop(inner);
         GeneralBlockRange::new(0, blocks).unwrap_or(GeneralBlockRange {
             lba_start: 0,
@@ -435,29 +544,33 @@ impl BlockDevice for LoopDevice {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        let inner = self.inner();
-        let offset = inner.offset + lba_id_start * LBA_SIZE;
-        let len = count * LBA_SIZE;
+        if count == 0 {
+            return Ok(0);
+        }
+        let len = count
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if len > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
 
-        // 通过文件 inode 读取数据
-        // 使用一个空的 FilePrivateData 作为占位符
-        use crate::filesystem::vfs::FilePrivateData;
-        use crate::libs::spinlock::SpinLock;
+        let (file_inode, base_offset) = {
+            let inner = self.inner();
+            let inode = inner.file_inode.clone().ok_or(SystemError::ENODEV)?;
+            (inode, inner.offset)
+        };
+
+        let block_offset = lba_id_start
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let file_offset = base_offset
+            .checked_add(block_offset)
+            .ok_or(SystemError::EOVERFLOW)?;
+
         let data = SpinLock::new(FilePrivateData::Unused);
         let data_guard = data.lock();
 
-        // 处理 Option 类型的 file_inode
-        match &inner.file_inode {
-            Some(inode) => {
-                // 计算实际的文件偏移量
-                let file_offset = inner.offset + offset;
-                inode.read_at(file_offset, len, buf, data_guard)
-            }
-            None => {
-                // 如果没有关联的文件，返回错误
-                Err(SystemError::ENODEV)
-            }
-        }
+        file_inode.read_at(file_offset, len, &mut buf[..len], data_guard)
     }
 
     fn write_at_sync(
@@ -466,35 +579,48 @@ impl BlockDevice for LoopDevice {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        let inner = self.inner();
+        if count == 0 {
+            return Ok(0);
+        }
+        let len = count
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if len > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
 
-        // 检查是否只读
-        if inner.read_only {
+        let (file_inode, base_offset, read_only) = {
+            let inner = self.inner();
+            let inode = inner.file_inode.clone().ok_or(SystemError::ENODEV)?;
+            (inode, inner.offset, inner.read_only)
+        };
+
+        if read_only {
             return Err(SystemError::EROFS);
         }
 
-        let offset = inner.offset + lba_id_start * LBA_SIZE;
-        let len = count * LBA_SIZE;
+        let block_offset = lba_id_start
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let file_offset = base_offset
+            .checked_add(block_offset)
+            .ok_or(SystemError::EOVERFLOW)?;
 
-        // 通过文件 inode 写入数据
-        // 使用一个空的 FilePrivateData 作为占位符
-        use crate::filesystem::vfs::FilePrivateData;
-        use crate::libs::spinlock::SpinLock;
         let data = SpinLock::new(FilePrivateData::Unused);
         let data_guard = data.lock();
 
-        // 处理 Option 类型的 file_inode
-        match &inner.file_inode {
-            Some(inode) => {
-                // 计算实际的文件偏移量
-                let file_offset = inner.offset + offset;
-                inode.write_at(file_offset, len, buf, data_guard)
-            }
-            None => {
-                // 如果没有关联的文件，返回错误
-                Err(SystemError::ENODEV)
+        let written = file_inode.write_at(file_offset, len, &buf[..len], data_guard)?;
+
+        if written > 0 {
+            if let Ok(metadata) = file_inode.metadata() {
+                if metadata.size >= 0 {
+                    let mut inner = self.inner();
+                    inner.file_size = metadata.size as usize;
+                }
             }
         }
+
+        Ok(written)
     }
 
     fn sync(&self) -> Result<(), SystemError> {
@@ -709,112 +835,112 @@ impl LoopManager {
     请求队列，工作队列未实现
      */
 
-    /*
-    loop_a思路
-    1.检查请求的次设备号是否有效且未被占用-》直接返回当前设备
-    2.如果未指定次设备号，遍历设备数组寻找第一个未被占用的次设备号
-    3.如果都不行，创建LoopDevice实例，注册到块设备管理器
-     */
-   pub fn loop_add(&self, requested_minor: Option<u32>) -> Result<Arc<LoopDevice>, SystemError> {
-        // 锁定 LoopManager，获取可变访问权限
-        let mut inner_manager_guard = self.inner(); 
-        log::info!("Adding loop device with requested minor: {:?}", requested_minor);
-        let minor_to_use: u32 = match requested_minor {
-            // ======================================================
-            // 1. 指定次设备号 (Some) 逻辑
-            // ======================================================
-            Some(req_minor) => {
-                if req_minor >= Self::MAX_DEVICES as u32 {
-                    // 检查次设备号是否超出最大限制
-                    return Err(SystemError::EINVAL);
-                }
+    pub fn loop_add(&self, requested_minor: Option<u32>) -> Result<Arc<LoopDevice>, SystemError> {
+        let mut inner = self.inner();
+        match requested_minor {
+            Some(req_minor) => self.loop_add_specific_locked(&mut inner, req_minor),
+            None => self.loop_add_first_available_locked(&mut inner),
+        }
+    }
 
-                // 检查设备数组中该位置是否有设备 (Option<Arc<LoopDevice>>)
-                if let Some(existing_dev) = &inner_manager_guard.devices[req_minor as usize] {
-                    let inner_dev_guard = existing_dev.inner();
-                    // 如果设备已存在且处于 Bound 状态，则不能复用，返回 EEXIST。
-                    if matches!(inner_dev_guard.state, LoopState::Bound) {
-                        return Err(SystemError::EEXIST); // 设备已绑定，不可用
-                    }
-                    
-                    // 如果设备已存在但处于 Unbound 或 Dead 状态，则复用该次设备号
-                    req_minor
-                } else {
-                    // 设备数组中该位置为空 (None)，直接使用该次设备号创建新设备
-                    req_minor
+    fn loop_add_specific_locked(
+        &self,
+        inner: &mut LoopManagerInner,
+        minor: u32,
+    ) -> Result<Arc<LoopDevice>, SystemError> {
+        if minor >= Self::MAX_DEVICES as u32 {
+            return Err(SystemError::EINVAL);
+        }
+
+        if let Some(device) = inner.devices[minor as usize].as_ref() {
+            if device.is_bound() {
+                return Err(SystemError::EEXIST);
+            }
+            inner.next_free_minor = (minor + 1) % Self::MAX_DEVICES as u32;
+            return Ok(device.clone());
+        }
+
+        self.create_and_register_device_locked(inner, minor)
+    }
+
+    fn loop_add_first_available_locked(
+        &self,
+        inner: &mut LoopManagerInner,
+    ) -> Result<Arc<LoopDevice>, SystemError> {
+        for _ in 0..Self::MAX_DEVICES {
+            let idx = inner.next_free_minor;
+            inner.next_free_minor = (inner.next_free_minor + 1) % Self::MAX_DEVICES as u32;
+
+            match &inner.devices[idx as usize] {
+                Some(device) if !device.is_bound() => return Ok(device.clone()),
+                Some(_) => continue,
+                None => {
+                    return self.create_and_register_device_locked(inner, idx);
                 }
             }
-            
-            // ======================================================
-            // 2. 未指定次设备号 (None) 逻辑：查找第一个可用的次设备号
-            // ======================================================
-            None => {
-                let start_minor = inner_manager_guard.next_free_minor;
-                let mut current_search_minor = start_minor;
-                let mut found_minor_candidate = None;
+        }
 
-                // 遍历整个设备数组寻找空闲次设备号
-                for _ in 0..Self::MAX_DEVICES {
-                    let index = current_search_minor as usize;
-                    
-                    if let Some(dev) = &inner_manager_guard.devices[index] {
-                        let inner_dev_guard = dev.inner();
-                        
-                        // 找到一个已存在但处于 Unbound 状态的设备，可以选择复用
-                        if matches!(inner_dev_guard.state, LoopState::Unbound) {
-                            found_minor_candidate = Some(current_search_minor);
-                            break;
-                        }
-                        // 如果是 Bound 状态，则跳过继续查找下一个
-                    } else {
-                        // 找到一个数组中为 None 的位置（完全空闲）
-                        found_minor_candidate = Some(current_search_minor);
-                        break;
-                    }
-                    
-                    // 循环到下一个次设备号
-                    current_search_minor = (current_search_minor + 1) % (Self::MAX_DEVICES as u32);
-                    
-                    // 检查是否已经循环回起点
-                    if current_search_minor == start_minor {
-                        break; // 遍历了一圈，没有找到空闲的，退出循环
-                    }
+        Err(SystemError::ENOSPC)
+    }
+
+    fn create_and_register_device_locked(
+        &self,
+        inner: &mut LoopManagerInner,
+        minor: u32,
+    ) -> Result<Arc<LoopDevice>, SystemError> {
+        if minor >= Self::MAX_DEVICES as u32 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let devname = DevName::new(format!("{}{}", LOOP_BASENAME, minor), minor as usize);
+        let loop_dev =
+            LoopDevice::new_empty_loop_device(devname, minor).ok_or(SystemError::ENOMEM)?;
+
+        if let Err(e) = block_dev_manager().register(loop_dev.clone()) {
+            if e == SystemError::EEXIST {
+                if let Some(existing) = inner.devices[minor as usize].clone() {
+                    return Ok(existing);
                 }
-
-                // 更新 next_free_minor，以便下次查找时从找到的次设备号的下一个开始
-                if let Some(minor) = found_minor_candidate {
-                    inner_manager_guard.next_free_minor = (minor + 1) % (Self::MAX_DEVICES as u32);
-                }
-
-                // 如果找到，则使用；否则返回 ENOSPC (没有空间/资源)
-                found_minor_candidate.ok_or(SystemError::ENOSPC)?
             }
-        };
+            return Err(e);
+        }
 
-        // ======================================================
-        // 3. 创建和注册 LoopDevice
-        // ======================================================
-        
-        let devname = DevName::new(
-            format!("{}{}", LOOP_BASENAME, minor_to_use),
-            minor_to_use as usize,
-        );
-        
-        // 创建新的 LoopDevice 实例
-        let loop_dev = LoopDevice::new_empty_loop_device(devname.clone(), minor_to_use)
-            .ok_or(SystemError::ENOMEM)?;
-            
-        // 注册到块设备管理器
-        log::info!("Registing loop device: {}", loop_dev.block_dev_meta.devname);
-        block_dev_manager().register(loop_dev.clone())?;
-        
-        // 将新设备存入 Manager 的设备数组
-        inner_manager_guard.devices[minor_to_use as usize] = Some(loop_dev.clone());
-        
-        log::info!("Loop device loop{} added successfully.", minor_to_use);
-        
-        // 返回新创建的 LoopDevice
+        inner.devices[minor as usize] = Some(loop_dev.clone());
+        inner.next_free_minor = (minor + 1) % Self::MAX_DEVICES as u32;
+        log::info!("Loop device loop{} added successfully.", minor);
         Ok(loop_dev)
+    }
+
+    pub fn loop_clear(&self, minor: u32) -> Result<(), SystemError> {
+        if minor >= Self::MAX_DEVICES as u32 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let device = {
+            let inner = self.inner();
+            inner.devices[minor as usize].clone()
+        }
+        .ok_or(SystemError::ENODEV)?;
+
+        device.clear_file()?;
+
+        let mut inner = self.inner();
+        inner.next_free_minor = minor;
+        log::info!("Loop device loop{} cleared.", minor);
+        Ok(())
+    }
+
+    pub fn find_free_minor(&self) -> Option<u32> {
+        let mut inner = self.inner();
+        for _ in 0..Self::MAX_DEVICES {
+            let idx = inner.next_free_minor;
+            inner.next_free_minor = (inner.next_free_minor + 1) % Self::MAX_DEVICES as u32;
+            match &inner.devices[idx as usize] {
+                Some(device) if device.is_bound() => continue,
+                _ => return Some(idx),
+            }
+        }
+        None
     }
     pub fn find_device_by_minor(&self, minor: u32) -> Option<Arc<LoopDevice>> {
         let inner = self.inner();
@@ -861,7 +987,7 @@ impl LoopManager {
         let mut inner_guard = device.inner();
         inner_guard.set_state(LoopState::Unbound)?;
         inner_guard.file_inode = None;
-        inner_guard.file_size - 0;
+        inner_guard.file_size = 0;
         inner_guard.offset = 0;
         inner_guard.size_limit = 0;
         inner_guard.read_only = false;
@@ -969,6 +1095,12 @@ impl IndexNode for LoopControlDevice {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Ok(());
     }
+    fn close(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
     fn metadata(&self) -> Result<Metadata, SystemError> {
         use crate::filesystem::vfs::{syscall::ModeType, FileType, InodeId};
         use crate::time::PosixTimeSpec;
@@ -999,46 +1131,35 @@ impl IndexNode for LoopControlDevice {
         &self,
         cmd: u32,
         data: usize,
-        private_data: &FilePrivateData,
+        _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         match cmd {
             LOOP_CTL_ADD => {
                 log::info!("Starting LOOP_CTL_ADD ioctl");
                 let requested_index = data as u32;
-                match self.loop_mgr.loop_add(Some(requested_index)) {
-                    
-                    Ok(loop_dev) => 
-                    {   log::info!("LOOP_CTL_ADD ioctl succeeded, allocated loop device loop{}", loop_dev.inner().device_number.minor());
-                        Ok(loop_dev.inner().device_number.minor() as usize)
-                    }                                              
-                    Err(e) => Err(e),
-                }
+                let loop_dev = if requested_index == u32::MAX {
+                    self.loop_mgr.loop_add(None)?
+                } else {
+                    self.loop_mgr.loop_add(Some(requested_index))?
+                };
+                let minor = {
+                    let inner = loop_dev.inner();
+                    let minor = inner.device_number.minor();
+                    log::info!(
+                        "LOOP_CTL_ADD ioctl succeeded, allocated loop device loop{}",
+                        minor
+                    );
+                    minor
+                };
+                Ok(minor as usize)
             }
             LOOP_CTL_REMOVE => {
                 let minor_to_remove = data as u32;
-                //  self.loop_mgr.loop_remove(minor_to_remove)?;
+                self.loop_mgr.loop_clear(minor_to_remove)?;
                 Ok(0)
             }
             LOOP_CTL_GET_FREE => {
-                let mut inner_guard = self.loop_mgr.inner();
-                let start_minor = inner_guard.next_free_minor;
-                let mut found_minor = None;
-                for _ in 0..LoopManager::MAX_DEVICES {
-                    let current_minor = inner_guard.next_free_minor;
-                    //轮询找到一个空闲的loop设备好
-                    inner_guard.next_free_minor =
-                        (inner_guard.next_free_minor + 1) % LoopManager::MAX_DEVICES as u32;
-                    if inner_guard.devices[current_minor as usize].is_none() {
-                        found_minor = Some(current_minor);
-                        break;
-                    }
-                    if inner_guard.next_free_minor == start_minor {
-                        //没找到
-                        break;
-                    }
-                }
-                drop(inner_guard);
-                match found_minor {
+                match self.loop_mgr.find_free_minor() {
                     Some(minor) => Ok(minor as usize),
                     None => Err(SystemError::ENOSPC),
                 }

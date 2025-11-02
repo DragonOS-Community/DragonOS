@@ -9,6 +9,8 @@
 #define LOOP_CTL_ADD        0x4C80
 #define LOOP_CTL_REMOVE     0x4C81
 #define LOOP_CTL_GET_FREE   0x4C82
+#define LOOP_SET_FD         0x4C00
+#define LOOP_CLR_FD         0x4C01
 //调用open和ioctl（）接口实现通信
 #define LOOP_DEVICE_CONTROL "/dev/loop-control"
 #define TEST_FILE_NAME "test_image.img"
@@ -39,16 +41,24 @@ int main() {
     int loop_minor;
     char loop_dev_path[64];
     int loop_fd;
+    int backing_fd = -1;
     char write_buf[512] = "Hello Loop Device!";
     char read_buf[512];
 
     create_test_file(); // Create a file to back a loop device
+
+    backing_fd = open(TEST_FILE_NAME, O_RDWR);
+    if (backing_fd < 0) {
+        perror("Failed to open backing file");
+        exit(EXIT_FAILURE);
+    }
 
     // 1. Open the loop-control device
     printf("Opening loop control device: %s\n", LOOP_DEVICE_CONTROL);
     control_fd = open(LOOP_DEVICE_CONTROL, O_RDWR);
     if (control_fd < 0) {
         perror("Failed to open loop control device. Make sure your kernel module is loaded and /dev/loop-control exists.");
+        close(backing_fd);
         exit(EXIT_FAILURE);
     }
     printf("Loop control device opened successfully (fd=%d).\n", control_fd);
@@ -57,6 +67,7 @@ int main() {
     printf("Requesting a free loop device minor...\n");
     if (ioctl(control_fd, LOOP_CTL_GET_FREE, &loop_minor) < 0) {
         perror("Failed to get free loop device minor");
+        close(backing_fd);
         close(control_fd);
         exit(EXIT_FAILURE);
     }
@@ -70,19 +81,14 @@ int main() {
     if (returned_minor < 0) {
         perror("Failed to add loop device");
         printf("returned_minor: %d\n", returned_minor);
+        close(backing_fd);
         close(control_fd);
         exit(EXIT_FAILURE);
     }
-    if (returned_minor != loop_minor) {
-
-        
+    if (returned_minor != loop_minor) {  
         fprintf(stderr, "Warning: LOOP_CTL_ADD returned minor %d, expected %d\n", returned_minor, loop_minor);
     }
     printf("Loop device loop%d added (kernel returned minor: %d).\n", loop_minor, returned_minor);
-
-    // In a real system, you would now open the test_image.img and associate it with the loop device.
-    // Your Rust code `set_file` is internal. For user-space, you'd typically use another ioctl on /dev/loopX
-    // to bind a file descriptor to it. Let's simulate opening the block device.
 
     // 4. Try to open the newly created loop block device
     sprintf(loop_dev_path, "/dev/loop%d", loop_minor);
@@ -91,30 +97,36 @@ int main() {
     if (loop_fd < 0) {
         perror("Failed to open loop block device. This might mean the block device node wasn't created/registered correctly, or permissions.");
         fprintf(stderr, "Make sure /dev/loop%d exists as a block device.\n", loop_minor);
+        close(backing_fd);
         close(control_fd);
         exit(EXIT_FAILURE);
     }
     printf("Loop block device %s opened successfully (fd=%d).\n", loop_dev_path, loop_fd);
 
+    printf("Associating backing file %s with loop device using LOOP_SET_FD...\n", TEST_FILE_NAME);
+    if (ioctl(loop_fd, LOOP_SET_FD, backing_fd) < 0) {
+        perror("Failed to associate backing file with loop device");
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+    printf("Backing file associated successfully.\n");
+
     // 5. Test read/write operations on the loop block device
-    // NOTE: For these to work, your Rust LoopDevice needs to be bound to `TEST_FILE_NAME`
-    // This binding mechanism is not exposed via an IOCTL in your current Rust code.
-    // In a full implementation, you would have an IOCTL like LOOP_SET_FD to pass the file descriptor of `TEST_FILE_NAME`
-    // to the kernel loop device. For this test, we'll assume the kernel somehow handles this or mock it.
-    
-    // For now, let's assume the kernel has a way to bind a file to the loop device,
-    // and we are simply interacting with the block device /dev/loopX.
 
     printf("Writing to loop device %s...\n", loop_dev_path);
     if (lseek(loop_fd, 0, SEEK_SET) < 0) {
         perror("lseek failed before write");
         close(loop_fd);
+        close(backing_fd);
         close(control_fd);
         exit(EXIT_FAILURE);
     }
     if (write(loop_fd, write_buf, sizeof(write_buf)) != sizeof(write_buf)) {
         perror("Failed to write to loop device");
         close(loop_fd);
+        close(backing_fd);
         close(control_fd);
         exit(EXIT_FAILURE);
     }
@@ -125,12 +137,14 @@ int main() {
     if (lseek(loop_fd, 0, SEEK_SET) < 0) {
         perror("lseek failed before read");
         close(loop_fd);
+        close(backing_fd);
         close(control_fd);
         exit(EXIT_FAILURE);
     }
     if (read(loop_fd, read_buf, sizeof(read_buf)) != sizeof(read_buf)) {
         perror("Failed to read from loop device");
         close(loop_fd);
+        close(backing_fd);
         close(control_fd);
         exit(EXIT_FAILURE);
     }
@@ -143,10 +157,16 @@ int main() {
     }
 
     // 6. Remove the loop device
+    printf("Clearing loop device loop%d backing file...\n", loop_minor);
+    if (ioctl(loop_fd, LOOP_CLR_FD, 0) < 0) {
+        perror("Failed to clear loop device backing file");
+    }
+
     printf("Removing loop device loop%d...\n", loop_minor);
     if (ioctl(control_fd, LOOP_CTL_REMOVE, loop_minor) < 0) {
         perror("Failed to remove loop device");
         close(loop_fd);
+        close(backing_fd);
         close(control_fd);
         exit(EXIT_FAILURE);
     }
@@ -154,6 +174,7 @@ int main() {
 
     // Clean up
     close(loop_fd);
+    close(backing_fd);
     close(control_fd);
     unlink(TEST_FILE_NAME);
     printf("All tests completed. Cleaned up.\n");

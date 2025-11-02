@@ -285,21 +285,23 @@ pub struct UserSigaction {
 #[derive(Copy, Clone, Debug)]
 pub struct SigInfo {
     sig_no: i32,
-    sig_code: SigCode,
     errno: i32,
+    sig_code: SigCode,
     sig_type: SigType,
 }
 
 /**
  * 标准POSIX siginfo_t结构体，用于用户态接口
  * 完全兼容Linux标准，大小为128字节
+ *
+ * 字段顺序必须严格按照Linux标准：si_signo, si_errno, si_code
  */
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct PosixSigInfo {
     pub si_signo: i32,
-    pub si_code: i32,
     pub si_errno: i32,
+    pub si_code: i32,
     pub _sifields: PosixSiginfoFields,
 }
 
@@ -316,6 +318,9 @@ pub union PosixSiginfoFields {
     // 填充到128字节
     _pad: [u8; 128 - 16],
 }
+
+// 编译期校验：确保 PosixSigInfo 与 Linux 的 siginfo_t 大小一致（128 字节）
+const _: [(); 128] = [(); core::mem::size_of::<PosixSigInfo>()];
 
 impl core::fmt::Debug for PosixSiginfoFields {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -410,8 +415,8 @@ impl SigInfo {
         match self.sig_type {
             SigType::Kill(pid) => PosixSigInfo {
                 si_signo: self.sig_no,
-                si_code: self.sig_code as i32,
                 si_errno: self.errno,
+                si_code: self.sig_code as i32,
                 _sifields: PosixSiginfoFields {
                     _kill: PosixSiginfoKill {
                         si_pid: pid.data() as i32,
@@ -421,8 +426,8 @@ impl SigInfo {
             },
             SigType::Alarm(pid) => PosixSigInfo {
                 si_signo: self.sig_no,
-                si_code: self.sig_code as i32,
                 si_errno: self.errno,
+                si_code: self.sig_code as i32,
                 _sifields: PosixSiginfoFields {
                     _timer: PosixSiginfoTimer {
                         si_tid: pid.data() as i32,
@@ -577,6 +582,8 @@ impl SigPending {
         // 定义过滤器，从sigqueue中删除mask中被置位的信号
         let filter = |x: &SigInfo| !mask.contains(SigSet::from_bits_truncate(x.sig_no as u64));
         self.queue.q.retain(filter);
+        // 同步清理位图中的相应位，避免仅删除队列项但仍因位图残留被视为pending
+        self.signal.remove(*mask);
     }
 }
 

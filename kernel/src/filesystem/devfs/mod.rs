@@ -242,17 +242,21 @@ impl DevFS {
                 dev_char_inode.remove(name)?;
             }
             FileType::BlockDevice => {
-                if dev_root_inode.find("block").is_err() {
-                    return Err(SystemError::ENOENT);
+                if name.starts_with("loop") {
+                    dev_root_inode.remove(name)?;
+                } else {
+                    if dev_root_inode.find("block").is_err() {
+                        return Err(SystemError::ENOENT);
+                    }
+
+                    let any_block_inode = dev_root_inode.find("block")?;
+                    let dev_block_inode = any_block_inode
+                        .as_any_ref()
+                        .downcast_ref::<LockedDevFSInode>()
+                        .unwrap();
+
+                    dev_block_inode.remove(name)?;
                 }
-
-                let any_block_inode = dev_root_inode.find("block")?;
-                let dev_block_inode = any_block_inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedDevFSInode>()
-                    .unwrap();
-
-                dev_block_inode.remove(name)?;
             }
             _ => {
                 return Err(SystemError::ENOSYS);

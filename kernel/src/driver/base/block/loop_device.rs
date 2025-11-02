@@ -102,21 +102,8 @@ pub struct LoopDeviceInner {
     pub file_size: usize,
     // 数据偏移量
     pub offset: usize,
-    // 数据大小限制
-    pub size_limit: usize,
-    //文件名缓存
-    pub file_name: u8,
-
-    // 是否允许用户直接 I/O 操作
-    pub user_direct_io: bool,
-    //标志位
-    pub flags: u32,
     // 是否只读
     pub read_only: bool,
-    // 是否可见
-    pub visible: bool,
-    // 使用弱引用避免循环引用
-    pub self_ref: Weak<LoopDevice>,
     // KObject的公共数据
     pub kobject_common: KObjectCommonData,
     // 设备的公共数据
@@ -134,6 +121,8 @@ impl LoopDeviceInner {
             (LoopState::Bound, LoopState::Unbound) => {}
             (LoopState::Bound, LoopState::Rundown) => {}
             (LoopState::Rundown, LoopState::Deleting) => {}
+            (LoopState::Rundown, LoopState::Unbound) => {}
+            (LoopState::Unbound, LoopState::Deleting) => {}
             _ => return Err(SystemError::EINVAL),
         }
 
@@ -169,15 +158,9 @@ impl LoopDevice {
                 file_size: 0,
                 device_number: DeviceNumber::new(Major::LOOP_MAJOR, minor), // Loop 设备主设备号为 7
                 offset: 0,
-                size_limit: 0,
-                user_direct_io: false,
                 read_only: false,
-                visible: true,
-                self_ref: self_ref.clone(),
                 kobject_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
-                file_name: 0,
-                flags: 0,
                 state: LoopState::Unbound,
                 state_lock: SpinLock::new(()),
                 //work_queue: None,
@@ -203,7 +186,6 @@ impl LoopDevice {
         let mut inner = self.inner();
         inner.file_inode = Some(file_inode);
         inner.file_size = file_size;
-        inner.size_limit = file_size;
         inner.offset = 0;
 
         Ok(())
@@ -242,21 +224,9 @@ impl LoopDevice {
 
         self.set_file(file_inode.clone())?;
 
-        let metadata = file_inode.metadata()?;
-        if metadata.size < 0 {
-            return Err(SystemError::EINVAL);
-        }
-        let file_size = metadata.size as usize;
-
         let mut inner = self.inner();
         inner.set_state(LoopState::Bound)?;
         inner.read_only = read_only;
-        inner.size_limit = file_size;
-        inner.flags = 0;
-        inner.user_direct_io = false;
-        inner.visible = true;
-        // file_name目前仅作为占位字段
-        inner.file_name = 0;
         Ok(())
     }
 
@@ -270,12 +240,8 @@ impl LoopDevice {
 
         inner.file_inode = None;
         inner.file_size = 0;
-        inner.size_limit = 0;
         inner.offset = 0;
         inner.read_only = false;
-        inner.user_direct_io = false;
-        inner.flags = 0;
-        inner.file_name = 0;
         Ok(())
     }
 }
@@ -930,6 +896,52 @@ impl LoopManager {
         Ok(())
     }
 
+    pub fn loop_remove(&self, minor: u32) -> Result<(), SystemError> {
+        if minor >= Self::MAX_DEVICES as u32 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let device = {
+            let inner = self.inner();
+            inner.devices[minor as usize].clone()
+        };
+
+        let device = match device {
+            Some(dev) => dev,
+            None => return Err(SystemError::ENODEV),
+        };
+
+        {
+            let mut guard = device.inner();
+            match guard.state {
+                LoopState::Bound => {
+                    guard.set_state(LoopState::Rundown)?;
+                }
+                LoopState::Rundown | LoopState::Unbound => {}
+                LoopState::Deleting => return Ok(()),
+            }
+        }
+
+        device.clear_file()?;
+
+        {
+            let mut guard = device.inner();
+            guard.set_state(LoopState::Deleting)?;
+        }
+
+        let block_dev: Arc<dyn BlockDevice> = device.clone();
+        block_dev_manager().unregister(&block_dev)?;
+
+        {
+            let mut inner = self.inner();
+            inner.devices[minor as usize] = None;
+            inner.next_free_minor = minor;
+        }
+
+        log::info!("Loop device loop{} removed.", minor);
+        Ok(())
+    }
+
     pub fn find_free_minor(&self) -> Option<u32> {
         let mut inner = self.inner();
         for _ in 0..Self::MAX_DEVICES {
@@ -989,11 +1001,7 @@ impl LoopManager {
         inner_guard.file_inode = None;
         inner_guard.file_size = 0;
         inner_guard.offset = 0;
-        inner_guard.size_limit = 0;
         inner_guard.read_only = false;
-        inner_guard.user_direct_io = false;
-        inner_guard.flags = 0;
-        inner_guard.file_name = 0;
         drop(inner_guard);
         let minor = device.inner().device_number.minor() as usize;
         let mut loop_mgr_inner = self.inner(); // Lock the LoopManager
@@ -1155,7 +1163,7 @@ impl IndexNode for LoopControlDevice {
             }
             LOOP_CTL_REMOVE => {
                 let minor_to_remove = data as u32;
-                self.loop_mgr.loop_clear(minor_to_remove)?;
+                self.loop_mgr.loop_remove(minor_to_remove)?;
                 Ok(0)
             }
             LOOP_CTL_GET_FREE => {

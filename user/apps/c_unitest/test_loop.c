@@ -4,18 +4,19 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <sys/stat.h> // For fstat
-// magic
+#include <sys/stat.h> // 用于 fstat
+#include <errno.h>
+// 控制命令常量
 #define LOOP_CTL_ADD        0x4C80
 #define LOOP_CTL_REMOVE     0x4C81
 #define LOOP_CTL_GET_FREE   0x4C82
 #define LOOP_SET_FD         0x4C00
 #define LOOP_CLR_FD         0x4C01
-//调用open和ioctl（）接口实现通信
+// 与内核通信的设备路径
 #define LOOP_DEVICE_CONTROL "/dev/loop-control"
 #define TEST_FILE_NAME "test_image.img"
-#define TEST_FILE_SIZE (1024 * 1024) // 1MB for the test image
-//创建测试文件
+#define TEST_FILE_SIZE (1024 * 1024) // 测试镜像大小 1MB
+// 创建测试镜像文件
 void create_test_file() {
     printf("Creating test file: %s with size %d bytes\n", TEST_FILE_NAME, TEST_FILE_SIZE);
     int fd = open(TEST_FILE_NAME, O_CREAT | O_TRUNC | O_RDWR, 0644);
@@ -23,7 +24,7 @@ void create_test_file() {
         perror("Failed to create test file");
         exit(EXIT_FAILURE);
     }
-    // Write some data to make it a non-empty file
+    // 写入零填充数据以确保文件占满容量
     char zero_block[512] = {0};
     for (int i = 0; i < TEST_FILE_SIZE / 512; ++i) {
         if (write(fd, zero_block, 512) != 512) {
@@ -43,9 +44,9 @@ int main() {
     int loop_fd;
     int backing_fd = -1;
     char write_buf[512] = "Hello Loop Device!";
-    char read_buf[512];
+   char read_buf[512];
 
-    create_test_file(); // Create a file to back a loop device
+    create_test_file(); // 创建作为 loop 设备后端的文件
 
     backing_fd = open(TEST_FILE_NAME, O_RDWR);
     if (backing_fd < 0) {
@@ -53,7 +54,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // 1. Open the loop-control device
+    // 1. 打开 loop-control 字符设备
     printf("Opening loop control device: %s\n", LOOP_DEVICE_CONTROL);
     control_fd = open(LOOP_DEVICE_CONTROL, O_RDWR);
     if (control_fd < 0) {
@@ -63,7 +64,7 @@ int main() {
     }
     printf("Loop control device opened successfully (fd=%d).\n", control_fd);
 
-    // 2. Get a free loop device minor number
+    // 2. 获取一个空闲的 loop 次设备号
     printf("Requesting a free loop device minor...\n");
     if (ioctl(control_fd, LOOP_CTL_GET_FREE, &loop_minor) < 0) {
         perror("Failed to get free loop device minor");
@@ -73,9 +74,7 @@ int main() {
     }
     printf("Got free loop minor: %d\n", loop_minor);
 
-    // 3. Add a new loop device using the minor number
-    // Note: The `LOOP_CTL_ADD` in your Rust code takes the minor as `data: usize`.
-    // We'll pass `loop_minor` directly. Your Rust code then creates an empty device.
+    // 3. 请求内核以该次设备号创建新的 loop 设备
     printf("Adding loop device loop%d...\n", loop_minor);
     int returned_minor = ioctl(control_fd, LOOP_CTL_ADD, loop_minor);
     if (returned_minor < 0) {
@@ -90,7 +89,7 @@ int main() {
     }
     printf("Loop device loop%d added (kernel returned minor: %d).\n", loop_minor, returned_minor);
 
-    // 4. Try to open the newly created loop block device
+    // 4. 打开刚创建的块设备节点
     sprintf(loop_dev_path, "/dev/loop%d", loop_minor);
     printf("Attempting to open block device: %s\n", loop_dev_path);
     loop_fd = open(loop_dev_path, O_RDWR);
@@ -113,7 +112,7 @@ int main() {
     }
     printf("Backing file associated successfully.\n");
 
-    // 5. Test read/write operations on the loop block device
+    // 5. 对 loop 块设备执行读写测试
 
     printf("Writing to loop device %s...\n", loop_dev_path);
     if (lseek(loop_fd, 0, SEEK_SET) < 0) {
@@ -156,7 +155,7 @@ int main() {
         printf("Read/write test FAILED: Mismatch in data.\n");
     }
 
-    // 6. Remove the loop device
+    // 6. 清理并删除 loop 设备
     printf("Clearing loop device loop%d backing file...\n", loop_minor);
     if (ioctl(loop_fd, LOOP_CLR_FD, 0) < 0) {
         perror("Failed to clear loop device backing file");
@@ -172,12 +171,22 @@ int main() {
     }
     printf("Loop device loop%d removed successfully.\n", loop_minor);
 
-    // Clean up
+    // 释放资源并删除测试文件
     close(loop_fd);
     close(backing_fd);
     close(control_fd);
     unlink(TEST_FILE_NAME);
     printf("All tests completed. Cleaned up.\n");
+
+    // 校验设备删除后不可再次打开
+    int reopen_fd = open(loop_dev_path, O_RDWR);
+    if (reopen_fd >= 0) {
+        printf("Unexpectedly reopened %s after removal (fd=%d).\n", loop_dev_path, reopen_fd);
+        close(reopen_fd);
+        return EXIT_FAILURE;
+    } else {
+        printf("Confirmed %s is inaccessible after removal (errno=%d).\n", loop_dev_path, errno);
+    }
 
     return 0;
 }

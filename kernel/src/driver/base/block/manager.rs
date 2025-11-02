@@ -1,6 +1,6 @@
 use core::{fmt::Formatter, sync::atomic::AtomicU32};
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -11,7 +11,7 @@ use crate::{
         device::{device_number::Major, DevName},
     },
     filesystem::{
-        devfs::devfs_register,
+        devfs::{devfs_register, devfs_unregister},
         mbr::MbrDiskPartionTable,
         vfs::{utils::DName, IndexNode},
     },
@@ -167,11 +167,28 @@ impl BlockDevManager {
 
     /// 卸载磁盘设备
     #[allow(dead_code)]
-    pub fn unregister(&self, dev: &Arc<dyn BlockDevice>) {
-        let mut inner = self.inner();
-        inner.disks.remove(dev.dev_name());
-        // todo: 这里应该callback一下磁盘设备，但是现在还没实现热插拔，所以暂时没做这里
-        todo!("BlockDevManager: unregister disk")
+    pub fn unregister(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
+        {
+            let mut inner = self.inner();
+            if inner.disks.remove(dev.dev_name()).is_none() {
+                return Err(SystemError::ENOENT);
+            }
+        }
+
+        let blk_meta = dev.blkdev_meta();
+        let gendisks = {
+            let mut meta_inner = blk_meta.inner();
+            let disks: Vec<Arc<GenDisk>> = meta_inner.gendisks.values().cloned().collect();
+            meta_inner.gendisks.clear();
+            disks
+        };
+
+        for gendisk in gendisks {
+            let dname = gendisk.dname()?;
+            devfs_unregister(dname.as_ref(), gendisk)?;
+        }
+
+        Ok(())
     }
 
     /// 通过路径查找gendisk

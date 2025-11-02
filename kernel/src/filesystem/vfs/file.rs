@@ -291,30 +291,35 @@ impl File {
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
+        // 获取文件类型
+        let md = self.inode.metadata()?;
+        let file_type = md.file_type;
 
-        // 检查RLIMIT_FSIZE限制
-        let current_pcb = ProcessManager::current_pcb();
-        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+        // 检查RLIMIT_FSIZE限制（仅对常规文件生效）
+        let actual_len = if matches!(file_type, FileType::File) {
+            let current_pcb = ProcessManager::current_pcb();
+            let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
 
-        // 计算实际可写入的长度
-        let actual_len = if fsize_limit.rlim_cur != u64::MAX {
-            let limit = fsize_limit.rlim_cur as usize;
+            if fsize_limit.rlim_cur != u64::MAX {
+                let limit = fsize_limit.rlim_cur as usize;
 
-            // 如果当前文件大小已经达到或超过限制，不允许写入
-            if offset >= limit {
-                // 发送SIGXFSZ信号
-                let _ = kill_process(
-                    current_pcb.raw_pid(),
-                    crate::arch::ipc::signal::Signal::SIGXFSZ,
-                );
-                return Err(SystemError::EFBIG);
-            }
+                // 如果当前文件大小已经达到或超过限制，不允许写入
+                if offset >= limit {
+                    // 发送SIGXFSZ信号
+                    let _ = kill_process(
+                        current_pcb.raw_pid(),
+                        crate::arch::ipc::signal::Signal::SIGXFSZ,
+                    );
+                    return Err(SystemError::EFBIG);
+                }
 
-            // 计算可写入的最大长度（不超过限制）
-            let max_writable = limit.saturating_sub(offset);
-            if len > max_writable {
-                // 部分写入：只写到限制位置，不发送信号
-                max_writable
+                // 计算可写入的最大长度（不超过限制）
+                let max_writable = limit.saturating_sub(offset);
+                if len > max_writable {
+                    max_writable
+                } else {
+                    len
+                }
             } else {
                 len
             }
@@ -322,8 +327,8 @@ impl File {
             len
         };
 
-        // 如果文件指针已经超过了文件大小，则需要扩展文件大小
-        if offset > self.inode.metadata()?.size as usize {
+        // 仅常规文件考虑“指针超过大小则扩展”语义；管道/字符设备等不应触发 resize
+        if matches!(file_type, FileType::File) && offset > md.size as usize {
             self.inode.resize(offset)?;
         }
         let written_len = self

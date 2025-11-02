@@ -254,25 +254,20 @@ impl IndexNode for LockedPipeInode {
         }
 
         let mut num = inner_guard.valid_cnt as usize;
-        //决定要输出的字节
+        // 决定要输出的字节数与起始位置
         let start = inner_guard.read_pos as usize;
-        //如果读端希望读取的字节数大于有效字节数，则输出有效字节
-        let mut end =
-            (inner_guard.valid_cnt as usize + inner_guard.read_pos as usize) % PIPE_BUFF_SIZE;
-        //如果读端希望读取的字节数少于有效字节数，则输出希望读取的字节
         if len < inner_guard.valid_cnt as usize {
-            end = (len + inner_guard.read_pos as usize) % PIPE_BUFF_SIZE;
             num = len;
         }
 
-        // 从管道拷贝数据到用户的缓冲区
-
-        if end < start {
-            buf[0..(PIPE_BUFF_SIZE - start)]
-                .copy_from_slice(&inner_guard.data[start..PIPE_BUFF_SIZE]);
-            buf[(PIPE_BUFF_SIZE - start)..num].copy_from_slice(&inner_guard.data[0..end]);
-        } else {
-            buf[0..num].copy_from_slice(&inner_guard.data[start..end]);
+        // 采用两段复制，统一处理不跨尾、跨尾、以及 end==start 的写满/读空边界
+        let first = core::cmp::min(num, PIPE_BUFF_SIZE - start);
+        let second = num as isize - first as isize;
+        // 第1段：从 start 开始直到缓冲尾部或读取完
+        buf[0..first].copy_from_slice(&inner_guard.data[start..start + first]);
+        // 第2段：如需要，从缓冲头部继续
+        if second > 0 {
+            buf[first..num].copy_from_slice(&inner_guard.data[0..second as usize]);
         }
 
         //更新读位置以及valid_cnt
@@ -432,7 +427,6 @@ impl IndexNode for LockedPipeInode {
         }
 
         // 如果管道空间不够
-
         while len + inner_guard.valid_cnt as usize > PIPE_BUFF_SIZE {
             // 唤醒读端
             self.read_wait_queue
@@ -441,7 +435,7 @@ impl IndexNode for LockedPipeInode {
             // 如果为非阻塞管道，直接返回错误
             if mode.contains(FileMode::O_NONBLOCK) {
                 drop(inner_guard);
-                return Err(SystemError::ENOMEM);
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
 
             // 解锁并睡眠
@@ -453,17 +447,15 @@ impl IndexNode for LockedPipeInode {
             inner_guard = self.inner.lock();
         }
 
-        // 决定要输入的字节
+        // 决定要输入的字节（两段复制处理 wrap 与 end==start 情况）
         let start = inner_guard.write_pos as usize;
-        let end = (inner_guard.write_pos as usize + len) % PIPE_BUFF_SIZE;
-        // 从用户的缓冲区拷贝数据到管道
-
-        if end < start {
-            inner_guard.data[start..PIPE_BUFF_SIZE]
-                .copy_from_slice(&buf[0..(PIPE_BUFF_SIZE - start)]);
-            inner_guard.data[0..end].copy_from_slice(&buf[(PIPE_BUFF_SIZE - start)..len]);
-        } else {
-            inner_guard.data[start..end].copy_from_slice(&buf[0..len]);
+        let first = core::cmp::min(len, PIPE_BUFF_SIZE - start);
+        let second = len as isize - first as isize;
+        // 第1段：写到缓冲尾部或写完
+        inner_guard.data[start..start + first].copy_from_slice(&buf[0..first]);
+        // 第2段：如需要，从缓冲头部继续
+        if second > 0 {
+            inner_guard.data[0..second as usize].copy_from_slice(&buf[first..len]);
         }
         // 更新写位置以及valid_cnt
         inner_guard.write_pos = (inner_guard.write_pos + len as i32) % PIPE_BUFF_SIZE as i32;

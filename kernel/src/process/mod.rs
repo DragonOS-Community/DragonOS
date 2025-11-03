@@ -1506,8 +1506,8 @@ impl Drop for ProcessControlBlock {
         // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
         self.__exit_signal();
         // 在ProcFS中,解除进程的注册
-        procfs_unregister_pid(self.raw_pid())
-            .unwrap_or_else(|e: SystemError| panic!("procfs_unregister_pid failed: error: {e:?}"));
+        // 这里忽略错误，因为进程可能未注册到procfs
+        procfs_unregister_pid(self.raw_pid()).ok();
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
             ppcb.children
                 .write_irqsave()

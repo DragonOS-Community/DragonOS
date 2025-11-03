@@ -1,11 +1,14 @@
 use alloc::vec::Vec;
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
+use crate::arch::MMArch;
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::file::FilePrivateData;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::FileType;
+use crate::mm::verify_area;
+use crate::mm::MemoryManagementArch;
 use crate::process::pid::PidPrivateData;
 use alloc::{string::ToString, sync::Arc};
 use log::error;
@@ -147,6 +150,14 @@ impl KernelCloneArgs {
             fn_arg: null_addr,
         }
     }
+
+    pub fn verify(&self) -> Result<(), SystemError> {
+        if self.flags.contains(CloneFlags::CLONE_SETTLS) {
+            verify_area(VirtAddr::new(self.tls), MMArch::PAGE_SIZE)
+                .map_err(|_| SystemError::EPERM)?;
+        }
+        Ok(())
+    }
 }
 
 impl ProcessManager {
@@ -175,11 +186,11 @@ impl ProcessManager {
 
         let name = current_pcb.basic().name().to_string();
 
-        let pcb = ProcessControlBlock::new(name, new_kstack);
-
         let mut args = KernelCloneArgs::new();
         args.flags = clone_flags;
         args.exit_signal = Signal::SIGCHLD;
+        args.verify()?;
+        let pcb = ProcessControlBlock::new(name, new_kstack);
         Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
             error!(
                 "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
@@ -327,7 +338,7 @@ impl ProcessManager {
     ///
     /// ## 参数
     ///
-    /// - clone_flags 标志位
+    /// - clone_args 克隆参数。注意，在传入这里之前，clone_args应当已经通过verify()函数校验。
     /// - current_pcb 拷贝源pcb
     /// - pcb 目标pcb
     ///

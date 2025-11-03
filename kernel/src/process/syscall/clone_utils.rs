@@ -57,6 +57,7 @@ impl PosixCloneArgs {
 }
 
 pub fn do_clone(clone_args: KernelCloneArgs, frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    clone_args.verify()?;
     let flags = clone_args.flags;
 
     let vfork = Arc::new(Completion::new());

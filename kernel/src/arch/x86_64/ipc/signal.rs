@@ -178,6 +178,22 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         if sig_number == Signal::INVALID {
             return;
         }
+
+        // 对 kernel-only 信号（如 SIGKILL/SIGSTOP）直接使用默认处理，避免任何用户帧构造
+        if sig_number.kernel_only() {
+            // log::error!(
+            //     "do_signal: kernel-only sig={} for pid={:?} -> default handler (no user frame)",
+            //     sig_number as i32,
+            //     pcb.raw_pid()
+            // );
+            // 释放锁，按常规路径在本线程上下文执行默认处理
+            let _oldset = *siginfo_mut_guard.sig_blocked();
+            drop(siginfo_mut_guard);
+            drop(pcb);
+            CurrentIrqArch::interrupt_enable();
+            sig_number.handle_default();
+            return;
+        }
         let sa = pcb.sighand().handler(sig_number).unwrap();
 
         match sa.action() {

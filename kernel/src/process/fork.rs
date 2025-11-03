@@ -229,7 +229,7 @@ impl ProcessManager {
         clone_flags: &CloneFlags,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        if clone_flags.contains(CloneFlags::CLONE_VM) {
+        if clone_flags.contains(CloneFlags::CLONE_VFORK) {
             new_pcb.flags().insert(ProcessFlags::VFORK);
         }
         *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();

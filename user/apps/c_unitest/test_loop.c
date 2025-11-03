@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h> // 用于 fstat
+#include <stdint.h>
 #include <errno.h>
 // 控制命令常量
 #define LOOP_CTL_ADD        0x4C80
@@ -12,10 +13,20 @@
 #define LOOP_CTL_GET_FREE   0x4C82
 #define LOOP_SET_FD         0x4C00
 #define LOOP_CLR_FD         0x4C01
+#define LOOP_SET_STATUS64   0x4C04
+#define LOOP_GET_STATUS64   0x4C05
 // 与内核通信的设备路径
 #define LOOP_DEVICE_CONTROL "/dev/loop-control"
+#define LO_FLAGS_READ_ONLY  0x1
 #define TEST_FILE_NAME "test_image.img"
 #define TEST_FILE_SIZE (1024 * 1024) // 测试镜像大小 1MB
+struct loop_status64 {
+    uint64_t lo_offset;
+    uint64_t lo_sizelimit;
+    uint32_t lo_flags;
+    uint32_t __pad;
+};
+
 // 创建测试镜像文件
 void create_test_file() {
     printf("Creating test file: %s with size %d bytes\n", TEST_FILE_NAME, TEST_FILE_SIZE);
@@ -43,8 +54,11 @@ int main() {
     char loop_dev_path[64];
     int loop_fd;
     int backing_fd = -1;
+    struct loop_status64 status;
+    memset(&status, 0, sizeof(status));
     char write_buf[512] = "Hello Loop Device!";
-   char read_buf[512];
+    char read_buf[512];
+    char verify_buf[512];
 
     create_test_file(); // 创建作为 loop 设备后端的文件
 
@@ -112,6 +126,45 @@ int main() {
     }
     printf("Backing file associated successfully.\n");
 
+    // 配置偏移和大小限制，使 loop 设备从文件第 512 字节开始映射
+    status.lo_offset = 512;
+    status.lo_sizelimit = TEST_FILE_SIZE - status.lo_offset;
+    status.lo_flags = 0;
+    status.__pad = 0;
+
+    printf("配置 loop 设备的偏移和大小限制...\n");
+    if (ioctl(loop_fd, LOOP_SET_STATUS64, &status) < 0) {
+        perror("Failed to set loop status64");
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    struct loop_status64 status_readback = {0};
+    if (ioctl(loop_fd, LOOP_GET_STATUS64, &status_readback) < 0) {
+        perror("Failed to get loop status64");
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+    printf("loop 偏移: %llu, 映射字节数: %llu, 标志: 0x%x\n",
+           (unsigned long long)status_readback.lo_offset,
+           (unsigned long long)status_readback.lo_sizelimit,
+           status_readback.lo_flags);
+
+    if (status_readback.lo_offset != status.lo_offset ||
+        status_readback.lo_sizelimit != status.lo_sizelimit) {
+        fprintf(stderr, "Loop status mismatch after configuration.\n");
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    status = status_readback;
+
     // 5. 对 loop 块设备执行读写测试
 
     printf("Writing to loop device %s...\n", loop_dev_path);
@@ -130,6 +183,41 @@ int main() {
         exit(EXIT_FAILURE);
     }
     printf("Successfully wrote '%s' to loop device.\n", write_buf);
+
+    // 校验后端文件对应偏移512字节的数据是否与写入内容一致
+    int verify_fd = open(TEST_FILE_NAME, O_RDONLY);
+    if (verify_fd < 0) {
+        perror("Failed to reopen backing file for verification");
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+    if (lseek(verify_fd, (off_t)status.lo_offset, SEEK_SET) < 0) {
+        perror("Failed to seek backing file");
+        close(verify_fd);
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+    if (read(verify_fd, verify_buf, sizeof(write_buf)) != sizeof(write_buf)) {
+        perror("Failed to read back from backing file");
+        close(verify_fd);
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+    close(verify_fd);
+    if (memcmp(write_buf, verify_buf, sizeof(write_buf)) != 0) {
+        fprintf(stderr, "Backing file data mismatch.\n");
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+    printf("镜像文件内容验证通过。\n");
 
     printf("Reading from loop device %s...\n", loop_dev_path);
     memset(read_buf, 0, sizeof(read_buf));
@@ -153,6 +241,39 @@ int main() {
         printf("Read/write test PASSED.\n");
     } else {
         printf("Read/write test FAILED: Mismatch in data.\n");
+    }
+
+    // 将设备切换到只读模式，验证写入被阻止
+    printf("切换 loop 设备为只读模式...\n");
+    status.lo_flags |= LO_FLAGS_READ_ONLY;
+    if (ioctl(loop_fd, LOOP_SET_STATUS64, &status) < 0) {
+        perror("Failed to enable read-only flag");
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    errno = 0;
+    if (lseek(loop_fd, 0, SEEK_SET) < 0) {
+        perror("Failed to seek loop device");
+    }
+    if (write(loop_fd, write_buf, sizeof(write_buf)) >= 0 || errno != EROFS) {
+        fprintf(stderr, "Write unexpectedly succeeded under read-only mode (errno=%d).\n", errno);
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
+    }
+    printf("只读模式下写入被正确阻止。\n");
+
+    status.lo_flags &= ~LO_FLAGS_READ_ONLY;
+    if (ioctl(loop_fd, LOOP_SET_STATUS64, &status) < 0) {
+        perror("Failed to restore writeable mode");
+        close(loop_fd);
+        close(backing_fd);
+        close(control_fd);
+        exit(EXIT_FAILURE);
     }
 
     // 6. 清理并删除 loop 设备

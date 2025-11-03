@@ -26,6 +26,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::ProcessManager,
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 use alloc::{
     string::{String, ToString},
@@ -58,13 +59,25 @@ pub const LOOP_SET_FD: u32 = 0x4C00;
 pub const LOOP_CLR_FD: u32 = 0x4C01;
 // pub const LOOP_SET_STATUS: u32 = 0x4C02;
 // pub const LOOP_GET_STATUS: u32 = 0x4C03;
-// pub const LOOP_SET_STATUS64: u32 = 0x4C04;
-// pub const LOOP_GET_STATUS64: u32 = 0x4C05;
+pub const LOOP_SET_STATUS64: u32 = 0x4C04;
+pub const LOOP_GET_STATUS64: u32 = 0x4C05;
 // pub const LOOP_CHANGE_FD: u32 = 0x4C06;
 // pub const LOOP_SET_CAPACITY: u32 = 0x4C07;
 // pub const LOOP_SET_DIRECT_IO: u32 = 0x4C08;
 // pub const LOOP_SET_BLOCK_SIZE: u32 = 0x4C09;
 // pub const LOOP_CONFIGURE: u32 = 0x4C0A;
+
+pub const LO_FLAGS_READ_ONLY: u32 = 1 << 0;
+pub const SUPPORTED_LOOP_FLAGS: u32 = LO_FLAGS_READ_ONLY;
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct LoopStatus64 {
+    pub lo_offset: u64,
+    pub lo_sizelimit: u64,
+    pub lo_flags: u32,
+    pub __pad: u32,
+}
 
 // /dev/loop-control 接口
 pub const LOOP_CTL_ADD: u32 = 0x4C80;
@@ -100,6 +113,10 @@ pub struct LoopDeviceInner {
     pub file_size: usize,
     // 数据偏移量
     pub offset: usize,
+    // 数据大小限制（0 表示不限制）
+    pub size_limit: usize,
+    // 标志位
+    pub flags: u32,
     // 是否只读
     pub read_only: bool,
     // KObject的公共数据
@@ -156,6 +173,8 @@ impl LoopDevice {
                 file_size: 0,
                 device_number: DeviceNumber::new(Major::LOOP_MAJOR, minor), // Loop 设备主设备号为 7
                 offset: 0,
+                size_limit: 0,
+                flags: 0,
                 read_only: false,
                 kobject_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -185,6 +204,8 @@ impl LoopDevice {
         inner.file_inode = Some(file_inode);
         inner.file_size = file_size;
         inner.offset = 0;
+        inner.size_limit = 0;
+        inner.flags = 0;
 
         Ok(())
     }
@@ -196,12 +217,43 @@ impl LoopDevice {
 
     // 设置只读模式
     pub fn set_read_only(&self, read_only: bool) {
-        self.inner().read_only = read_only;
+        let mut inner = self.inner();
+        inner.read_only = read_only;
+        if read_only {
+            inner.flags |= LO_FLAGS_READ_ONLY;
+        } else {
+            inner.flags &= !LO_FLAGS_READ_ONLY;
+        }
     }
 
     // 检查是否为只读
     pub fn is_read_only(&self) -> bool {
         self.inner().read_only
+    }
+
+    fn recalc_effective_size(&self) -> Result<(), SystemError> {
+        let (file_inode, offset, size_limit) = {
+            let inner = self.inner();
+            (inner.file_inode.clone(), inner.offset, inner.size_limit)
+        };
+
+        let inode = file_inode.ok_or(SystemError::ENODEV)?;
+        let metadata = inode.metadata()?;
+        if metadata.size < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let total_size = metadata.size as usize;
+        if offset > total_size {
+            return Err(SystemError::EINVAL);
+        }
+        let mut effective = total_size - offset;
+        if size_limit > 0 {
+            effective = effective.min(size_limit);
+        }
+
+        let mut inner = self.inner();
+        inner.file_size = effective;
+        Ok(())
     }
 
     pub fn is_bound(&self) -> bool {
@@ -225,6 +277,10 @@ impl LoopDevice {
         let mut inner = self.inner();
         inner.set_state(LoopState::Bound)?;
         inner.read_only = read_only;
+        inner.flags = if read_only { LO_FLAGS_READ_ONLY } else { 0 };
+        inner.size_limit = 0;
+        drop(inner);
+        self.recalc_effective_size()?;
         Ok(())
     }
 
@@ -239,7 +295,107 @@ impl LoopDevice {
         inner.file_inode = None;
         inner.file_size = 0;
         inner.offset = 0;
+        inner.size_limit = 0;
         inner.read_only = false;
+        inner.flags = 0;
+        Ok(())
+    }
+
+    fn set_status64(&self, user_ptr: usize) -> Result<(), SystemError> {
+        if user_ptr == 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let reader = UserBufferReader::new::<LoopStatus64>(
+            user_ptr as *const LoopStatus64,
+            core::mem::size_of::<LoopStatus64>(),
+            true,
+        )?;
+        let mut info = LoopStatus64::default();
+        reader.copy_one_from_user(&mut info, 0)?;
+
+        if info.lo_offset % LBA_SIZE as u64 != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        if info.lo_offset > usize::MAX as u64 || info.lo_sizelimit > usize::MAX as u64 {
+            return Err(SystemError::EINVAL);
+        }
+        if info.lo_sizelimit != 0 && info.lo_sizelimit % LBA_SIZE as u64 != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        if info.lo_flags & !SUPPORTED_LOOP_FLAGS != 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let new_offset = info.lo_offset as usize;
+        let new_limit = if info.lo_sizelimit == 0 {
+            0
+        } else {
+            info.lo_sizelimit as usize
+        };
+        let new_read_only = (info.lo_flags & LO_FLAGS_READ_ONLY) != 0;
+
+        let (old_offset, old_limit, old_flags, old_ro) = {
+            let inner = self.inner();
+            if !matches!(inner.state, LoopState::Bound | LoopState::Rundown) {
+                return Err(SystemError::ENXIO);
+            }
+            (inner.offset, inner.size_limit, inner.flags, inner.read_only)
+        };
+
+        {
+            let mut inner = self.inner();
+            if !matches!(inner.state, LoopState::Bound | LoopState::Rundown) {
+                return Err(SystemError::ENXIO);
+            }
+            inner.offset = new_offset;
+            inner.size_limit = new_limit;
+            inner.flags = info.lo_flags;
+            inner.read_only = new_read_only;
+        }
+
+        if let Err(err) = self.recalc_effective_size() {
+            let mut inner = self.inner();
+            inner.offset = old_offset;
+            inner.size_limit = old_limit;
+            inner.flags = old_flags;
+            inner.read_only = old_ro;
+            drop(inner);
+            let _ = self.recalc_effective_size();
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn get_status64(&self, user_ptr: usize) -> Result<(), SystemError> {
+        if user_ptr == 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let info = {
+            let inner = self.inner();
+            if !matches!(inner.state, LoopState::Bound | LoopState::Rundown) {
+                return Err(SystemError::ENXIO);
+            }
+            LoopStatus64 {
+                lo_offset: inner.offset as u64,
+                lo_sizelimit: inner.size_limit as u64,
+                lo_flags: if inner.read_only {
+                    inner.flags | LO_FLAGS_READ_ONLY
+                } else {
+                    inner.flags & !LO_FLAGS_READ_ONLY
+                },
+                __pad: 0,
+            }
+        };
+
+        let mut writer = UserBufferWriter::new::<LoopStatus64>(
+            user_ptr as *mut LoopStatus64,
+            core::mem::size_of::<LoopStatus64>(),
+            true,
+        )?;
+        writer.copy_one_to_user(&info, 0)?;
         Ok(())
     }
 }
@@ -399,6 +555,14 @@ impl IndexNode for LoopDevice {
                 self.clear_file()?;
                 Ok(0)
             }
+            LOOP_SET_STATUS64 => {
+                self.set_status64(data)?;
+                Ok(0)
+            }
+            LOOP_GET_STATUS64 => {
+                self.get_status64(data)?;
+                Ok(0)
+            }
             _ => Err(SystemError::ENOSYS),
         }
     }
@@ -517,10 +681,14 @@ impl BlockDevice for LoopDevice {
             return Err(SystemError::EINVAL);
         }
 
-        let (file_inode, base_offset) = {
+        let (file_inode, base_offset, limit_end) = {
             let inner = self.inner();
             let inode = inner.file_inode.clone().ok_or(SystemError::ENODEV)?;
-            (inode, inner.offset)
+            let limit = inner
+                .offset
+                .checked_add(inner.file_size)
+                .ok_or(SystemError::EOVERFLOW)?;
+            (inode, inner.offset, limit)
         };
 
         let block_offset = lba_id_start
@@ -529,6 +697,11 @@ impl BlockDevice for LoopDevice {
         let file_offset = base_offset
             .checked_add(block_offset)
             .ok_or(SystemError::EOVERFLOW)?;
+
+        let end = file_offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        if end > limit_end {
+            return Err(SystemError::ENOSPC);
+        }
 
         let data = SpinLock::new(FilePrivateData::Unused);
         let data_guard = data.lock();
@@ -550,10 +723,14 @@ impl BlockDevice for LoopDevice {
             return Err(SystemError::EINVAL);
         }
 
-        let (file_inode, base_offset, read_only) = {
+        let (file_inode, base_offset, limit_end, read_only) = {
             let inner = self.inner();
             let inode = inner.file_inode.clone().ok_or(SystemError::ENODEV)?;
-            (inode, inner.offset, inner.read_only)
+            let limit = inner
+                .offset
+                .checked_add(inner.file_size)
+                .ok_or(SystemError::EOVERFLOW)?;
+            (inode, inner.offset, limit, inner.read_only)
         };
 
         if read_only {
@@ -567,18 +744,18 @@ impl BlockDevice for LoopDevice {
             .checked_add(block_offset)
             .ok_or(SystemError::EOVERFLOW)?;
 
+        let end = file_offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        if end > limit_end {
+            return Err(SystemError::ENOSPC);
+        }
+
         let data = SpinLock::new(FilePrivateData::Unused);
         let data_guard = data.lock();
 
         let written = file_inode.write_at(file_offset, len, &buf[..len], data_guard)?;
 
         if written > 0 {
-            if let Ok(metadata) = file_inode.metadata() {
-                if metadata.size >= 0 {
-                    let mut inner = self.inner();
-                    inner.file_size = metadata.size as usize;
-                }
-            }
+            let _ = self.recalc_effective_size();
         }
 
         Ok(written)

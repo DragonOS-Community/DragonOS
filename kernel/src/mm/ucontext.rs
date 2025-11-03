@@ -14,6 +14,7 @@ use alloc::{
     vec::Vec,
 };
 use defer::defer;
+use hashbrown::HashMap;
 use hashbrown::HashSet;
 use ida::IdAllocator;
 use system_error::SystemError;
@@ -37,10 +38,11 @@ use super::{
     allocator::page_frame::{
         deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
-    page::{EntryFlags, Flusher, InactiveFlusher, PageFlushAll},
+    page::{EntryFlags, Flusher, InactiveFlusher, Page, PageFlags, PageFlushAll, PageType},
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
     MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
 };
+use crate::arch::mm::LockedFrameAllocator;
 
 /// MMAP_MIN_ADDR的默认值
 /// 以下内容来自linux-5.19:
@@ -1519,6 +1521,8 @@ pub enum Provider {
 #[derive(Debug)]
 pub struct AnonSharedMapping {
     pub id: u64,
+    // Per-page cache keyed by page index within the VMA; store weak to avoid leaking pages
+    pages: SpinLock<HashMap<usize, Weak<Page>>>,
 }
 
 impl AnonSharedMapping {
@@ -1528,7 +1532,32 @@ impl AnonSharedMapping {
     }
 
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { id: Self::new_id() })
+        Arc::new(Self {
+            id: Self::new_id(),
+            pages: SpinLock::new(HashMap::new()),
+        })
+    }
+
+    /// Get or create a shared page for the given offset atomically.
+    /// This prevents the double-allocation race when multiple processes fault the same page.
+    pub fn get_or_create_page(&self, pgoff: usize) -> Result<Arc<Page>, SystemError> {
+        // Fast path: try upgrade an existing weak
+        {
+            let mut guard = self.pages.lock_irqsave();
+            if let Some(weak) = guard.get(&pgoff) {
+                if let Some(p) = weak.upgrade() {
+                    return Ok(p);
+                } else {
+                    guard.remove(&pgoff);
+                }
+            }
+            // Slow path: allocate while holding the map lock to avoid duplicate creations
+            let mut pm = page_manager_lock_irqsave();
+            let mut allocator = LockedFrameAllocator;
+            let page = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
+            guard.insert(pgoff, Arc::downgrade(&page));
+            return Ok(page);
+        }
     }
 }
 

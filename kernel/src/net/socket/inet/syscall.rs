@@ -25,7 +25,7 @@ pub fn create_inet_socket(
         },
         PSOCK::Stream => match protocol {
             IpProtocol::HopByHop | IpProtocol::Tcp => {
-                log::debug!("create tcp socket");
+                // log::debug!("create tcp socket");
                 return Ok(TcpSocket::new(is_nonblock, version));
             }
             _ => {

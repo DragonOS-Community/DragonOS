@@ -28,6 +28,7 @@ mod sys_ioctl;
 mod sys_linkat;
 mod sys_lseek;
 mod sys_mkdirat;
+pub mod sys_mknodat;
 mod sys_openat;
 mod sys_pread64;
 mod sys_pselect6;
@@ -53,13 +54,13 @@ mod sys_epoll_ctl;
 mod sys_epoll_pwait;
 
 pub mod symlink_utils;
-mod sys_fsync;
-pub mod sys_mount;
-mod sys_sync;
-pub mod sys_umount2;
-
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 mod sys_fstat;
+mod sys_fsync;
+pub mod sys_mount;
+mod sys_sendfile;
+mod sys_sync;
+pub mod sys_umount2;
 
 #[cfg(target_arch = "x86_64")]
 mod sys_access;

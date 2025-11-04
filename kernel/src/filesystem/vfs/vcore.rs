@@ -28,7 +28,13 @@ use super::{
 };
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表
-const ROOTFS_TRY_LIST: [&str; 4] = ["/dev/sda1", "/dev/sda", "/dev/vda1", "/dev/vda"];
+const ROOTFS_TRY_LIST: [&str; 5] = [
+    "/dev/sda1",
+    "/dev/sda",
+    "/dev/vda1",
+    "/dev/vda",
+    "/dev/sdio1",
+];
 kernel_cmdline_param_kv!(ROOTFS_PATH_PARAM, root, "");
 
 /// @brief 原子地生成新的Inode号。
@@ -152,6 +158,23 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
         }
     }
     info!("Successfully migrate rootfs to FAT32!");
+
+    return Ok(());
+}
+
+#[cfg(feature = "initram")]
+pub fn change_root_fs() -> Result<(), SystemError> {
+    info!("Try to change root fs to initramfs...");
+    let initramfs = crate::init::initram::INIT_ROOT_INODE().fs();
+    let r = migrate_virtual_filesystem(initramfs);
+
+    if r.is_err() {
+        error!("Failed to migrate virtual filesystem to initramfs!");
+        loop {
+            spin_loop();
+        }
+    }
+    info!("Successfully migrate rootfs to initramfs!");
 
     return Ok(());
 }

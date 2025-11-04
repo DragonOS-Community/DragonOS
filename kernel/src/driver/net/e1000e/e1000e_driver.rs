@@ -9,14 +9,16 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         },
         net::{
-            register_netdevice, Iface, IfaceCommon, NetDeivceState, NetDeviceCommonData, Operstate,
+            register_netdevice, types::InterfaceFlags, Iface, IfaceCommon, NetDeivceState,
+            NetDeviceCommonData, Operstate,
         },
     },
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    net::{generate_iface_id, NET_DEVICES},
+    net::generate_iface_id,
+    process::namespace::net_namespace::INIT_NET_NAMESPACE,
     time::Instant,
 };
 use alloc::{
@@ -200,9 +202,20 @@ impl E1000EInterface {
         let iface =
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
 
-        let result = Arc::new(E1000EInterface {
+        let flags = InterfaceFlags::UP
+            | InterfaceFlags::BROADCAST
+            | InterfaceFlags::RUNNING
+            | InterfaceFlags::MULTICAST
+            | InterfaceFlags::LOWER_UP;
+
+        let iface = Arc::new(E1000EInterface {
             driver: E1000EDriverWrapper(UnsafeCell::new(driver)),
-            common: IfaceCommon::new(iface_id, false, iface),
+            common: IfaceCommon::new(
+                iface_id,
+                crate::driver::net::types::InterfaceType::EETHER,
+                flags,
+                iface,
+            ),
             name: format!("eth{}", iface_id),
             inner: SpinLock::new(InnerE1000EInterface {
                 netdevice_common: NetDeviceCommonData::default(),
@@ -212,7 +225,7 @@ impl E1000EInterface {
             locked_kobj_state: LockedKObjectState::default(),
         });
 
-        return result;
+        iface
     }
 
     pub fn inner(&self) -> SpinLockGuard<'_, InnerE1000EInterface> {
@@ -304,7 +317,7 @@ impl Iface for E1000EInterface {
         return self.name.clone();
     }
 
-    fn poll(&self) {
+    fn poll(&self) -> bool {
         self.common.poll(self.driver.force_get_mut())
     }
 
@@ -331,6 +344,15 @@ impl Iface for E1000EInterface {
 
     fn set_operstate(&self, state: Operstate) {
         self.inner().netdevice_common.operstate = state;
+    }
+
+    fn mtu(&self) -> usize {
+        use smoltcp::phy::Device;
+
+        self.driver
+            .force_get_mut()
+            .capabilities()
+            .max_transmission_unit
     }
 }
 
@@ -400,9 +422,12 @@ pub fn e1000e_driver_init(device: E1000EDevice) {
     iface.set_net_state(NetDeivceState::__LINK_STATE_START);
 
     // 将网卡的接口信息注册到全局的网卡接口信息表中
-    NET_DEVICES
-        .write_irqsave()
-        .insert(iface.nic_id(), iface.clone());
+    // NET_DEVICES
+    //     .write_irqsave()
+    //     .insert(iface.nic_id(), iface.clone());
+    INIT_NET_NAMESPACE.add_device(iface.clone());
+    iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
+
     info!("e1000e driver init successfully!\tMAC: [{}]", mac);
 
     register_netdevice(iface.clone()).expect("register lo device failed");

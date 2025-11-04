@@ -68,6 +68,21 @@ impl<T: Socket + 'static> IndexNode for T {
             ModeType::from_bits_truncate(0o755),
         ))
     }
+
+    // TODO: implement ioctl for socket
+    fn ioctl(
+        &self,
+        _cmd: u32,
+        _data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        log::warn!("Socket not support ioctl");
+        return Ok(0);
+    }
+
+    fn as_socket(&self) -> Option<&dyn Socket> {
+        Some(self)
+    }
 }
 
 impl<T: Socket + 'static> PollableInode for T {

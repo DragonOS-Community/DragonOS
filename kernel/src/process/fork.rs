@@ -1,6 +1,12 @@
 use alloc::vec::Vec;
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
+use crate::filesystem::vfs::file::File;
+use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FilePrivateData;
+use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::FileType;
+use crate::process::pid::PidPrivateData;
 use alloc::{string::ToString, sync::Arc};
 use log::error;
 use system_error::SystemError;
@@ -223,7 +229,7 @@ impl ProcessManager {
         clone_flags: &CloneFlags,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        if clone_flags.contains(CloneFlags::CLONE_VM) {
+        if clone_flags.contains(CloneFlags::CLONE_VFORK) {
             new_pcb.flags().insert(ProcessFlags::VFORK);
         }
         *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
@@ -427,6 +433,38 @@ impl ProcessManager {
             )?;
 
             writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
+        }
+
+        // 克隆 pidfd
+        if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
+            let pid = pcb.raw_pid().0 as i32;
+            let root_inode = ProcessManager::current_mntns().root_inode();
+            let name = format!(
+                "Pidfd(from {} to {})",
+                ProcessManager::current_pcb().raw_pid().data(),
+                pid
+            );
+            let new_inode = root_inode
+                .create(&name, FileType::File, ModeType::from_bits_truncate(0o777))
+                .unwrap();
+            let file = File::new(new_inode, FileMode::O_RDWR | FileMode::O_CLOEXEC).unwrap();
+            {
+                let mut guard = file.private_data.lock();
+                *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
+            }
+            let r = current_pcb
+                .fd_table()
+                .write()
+                .alloc_fd(file, None)
+                .map(|fd| fd as usize);
+
+            let mut writer = UserBufferWriter::new(
+                clone_args.parent_tid.data() as *mut i32,
+                core::mem::size_of::<i32>(),
+                true,
+            )?;
+
+            writer.copy_one_to_user(&(r.unwrap() as i32), 0)?;
         }
 
         sched_fork(pcb).unwrap_or_else(|e| {

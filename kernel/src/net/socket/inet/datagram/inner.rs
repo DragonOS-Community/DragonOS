@@ -1,9 +1,12 @@
+use alloc::sync::Arc;
+
 use smoltcp;
 use system_error::SystemError;
 
 use crate::{
     libs::spinlock::SpinLock,
     net::socket::inet::common::{BoundInner, Types as InetTypes},
+    process::namespace::net_namespace::NetNamespace,
 };
 
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
@@ -32,8 +35,12 @@ impl UnboundUdp {
         return Self { socket };
     }
 
-    pub fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<BoundUdp, SystemError> {
-        let inner = BoundInner::bind(self.socket, &local_endpoint.addr)?;
+    pub fn bind(
+        self,
+        local_endpoint: smoltcp::wire::IpEndpoint,
+        netns: Arc<NetNamespace>,
+    ) -> Result<BoundUdp, SystemError> {
+        let inner = BoundInner::bind(self.socket, &local_endpoint.addr, netns)?;
         let bind_addr = local_endpoint.addr;
         let bind_port = if local_endpoint.port == 0 {
             inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?
@@ -66,9 +73,13 @@ impl UnboundUdp {
         })
     }
 
-    pub fn bind_ephemeral(self, remote: smoltcp::wire::IpAddress) -> Result<BoundUdp, SystemError> {
+    pub fn bind_ephemeral(
+        self,
+        remote: smoltcp::wire::IpAddress,
+        netns: Arc<NetNamespace>,
+    ) -> Result<BoundUdp, SystemError> {
         // let (addr, port) = (remote.addr, remote.port);
-        let (inner, address) = BoundInner::bind_ephemeral(self.socket, remote)?;
+        let (inner, address) = BoundInner::bind_ephemeral(self.socket, remote, netns)?;
         let bound_port = inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?;
         let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
         Ok(BoundUdp {
@@ -133,7 +144,7 @@ impl BoundUdp {
         let remote = to.or(*self.remote.lock()).ok_or(SystemError::ENOTCONN)?;
         let result = self.with_mut_socket(|socket| {
             if socket.can_send() && socket.send_slice(buf, remote).is_ok() {
-                log::debug!("send {} bytes", buf.len());
+                // log::debug!("send {} bytes", buf.len());
                 return Ok(buf.len());
             }
             return Err(SystemError::ENOBUFS);

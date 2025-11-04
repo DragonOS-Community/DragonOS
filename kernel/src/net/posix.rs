@@ -36,6 +36,7 @@ impl PosixArgsSocketType {
 }
 
 use super::socket::{endpoint::Endpoint, AddressFamily};
+use crate::net::socket::netlink::addr::{multicast::GroupIdSet, NetlinkSocketAddr};
 use crate::net::socket::unix::UnixEndpoint;
 use alloc::string::ToString;
 use core::ffi::CStr;
@@ -103,8 +104,8 @@ impl From<smoltcp::wire::IpEndpoint> for SockAddr {
             smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => Self {
                 addr_in: SockAddrIn {
                     sin_family: AddressFamily::INet as u16,
-                    sin_port: value.port,
-                    sin_addr: ipv4_addr.to_bits(),
+                    sin_port: value.port.to_be(),
+                    sin_addr: ipv4_addr.to_bits().to_be(),
                     sin_zero: Default::default(),
                 },
             },
@@ -146,12 +147,26 @@ impl From<UnixEndpoint> for SockAddr {
     }
 }
 
+impl From<NetlinkSocketAddr> for SockAddr {
+    fn from(value: NetlinkSocketAddr) -> Self {
+        SockAddr {
+            addr_nl: SockAddrNl {
+                nl_family: AddressFamily::Netlink,
+                nl_pad: 0,
+                nl_pid: value.port(),
+                nl_groups: value.groups().as_u32(),
+            },
+        }
+    }
+}
+
 impl From<Endpoint> for SockAddr {
     fn from(value: Endpoint) -> Self {
         match value {
             Endpoint::LinkLayer(_link_layer_endpoint) => todo!(),
             Endpoint::Ip(endpoint) => Self::from(endpoint),
             Endpoint::Unix(unix_endpoint) => Self::from(unix_endpoint),
+            Endpoint::Netlink(netlink_addr) => Self::from(netlink_addr),
         }
     }
 }
@@ -251,6 +266,21 @@ impl SockAddr {
                     //     inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
                     return Ok(Endpoint::Unix(UnixEndpoint::File(path.to_string())));
+                }
+                AddressFamily::Netlink => {
+                    if len < addr.len()? {
+                        log::error!("len < addr.len() for Netlink");
+                        return Err(SystemError::EINVAL);
+                    }
+
+                    let addr_nl: SockAddrNl = addr.addr_nl;
+                    let nl_pid = addr_nl.nl_pid;
+                    let nl_groups = addr_nl.nl_groups;
+
+                    Ok(Endpoint::Netlink(NetlinkSocketAddr::new(
+                        nl_pid,
+                        GroupIdSet::new(nl_groups),
+                    )))
                 }
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);

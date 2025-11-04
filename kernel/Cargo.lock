@@ -157,6 +157,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
 
 [[package]]
+name = "byte-slice-cast"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -238,6 +244,15 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "cpio_reader"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5793d74f50cf1460a969f028d40963d8d6e01ebae049dea976e944335c7df492"
+dependencies = [
+ "bitflags 2.9.1",
+]
 
 [[package]]
 name = "crc"
@@ -416,7 +431,9 @@ dependencies = [
  "bitfield-struct",
  "bitflags 1.3.2",
  "bitmap",
+ "byte-slice-cast",
  "cfg-if",
+ "cpio_reader",
  "defer",
  "derive_builder",
  "driver_base_macros",
@@ -459,6 +476,7 @@ dependencies = [
  "wait_queue_macros",
  "x86",
  "x86_64",
+ "xz4rust",
 ]
 
 [[package]]
@@ -2079,6 +2097,12 @@ source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/xarray?rev=
 dependencies = [
  "smallvec",
 ]
+
+[[package]]
+name = "xz4rust"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1053c1562c16e3760559c390d3b690ae6b524c200eb9a7ddb5d43c77d000832d"
 
 [[package]]
 name = "yaxpeax-arch"

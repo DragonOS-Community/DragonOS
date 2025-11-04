@@ -29,6 +29,25 @@ impl PidType {
     pub const PIDTYPE_MAX: usize = PidType::MAX as usize;
 }
 
+/// 每个进程的 pid 私有信息, 通常作为 pidfd 的 private_data
+/// TODO: 未实现完, 参考https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/pid.h#59
+/// TODO: 应该替换所有的 pid 相关使用, 目前内核是直接使用传入的 pid, 应该全部转换为使用此结构体
+/// 例如 struct pid 应该是在进程创建时（如 fork(), clone()）必然创建的
+#[derive(Clone, Debug)]
+pub struct PidPrivateData {
+    pid: i32,
+}
+
+impl PidPrivateData {
+    pub fn new(pid: i32) -> Self {
+        Self { pid }
+    }
+
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+}
+
 pub struct Pid {
     self_ref: Weak<Pid>,
     pub level: u32,

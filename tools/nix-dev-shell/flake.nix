@@ -11,18 +11,9 @@
     utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        rustVer = fenix.packages.${system}.fromToolchainName {
-          name = "nightly-2025-08-10";
-          sha256 = "sha256-3JA9u08FrvsLdi5dGIsUeQZq3Tpn9RvWdkLus2+5cHs=";
+        rusttoolchain = fenix.packages.${system}.fromToolchainFile{
+          file = ../../kernel/rust-toolchain.toml;
         };
-        # 组合工具链并提取二进制路径
-        rustToolChain = rustVer.withComponents [
-          "cargo"
-          "clippy"
-          "rust-src"
-          "rustfmt"
-          "rust-analyzer"
-        ];
       in {
         devShells.default = pkgs.mkShell {
           # 基础工具链
@@ -30,7 +21,7 @@
             git
             llvm
             libclang
-            rustToolChain
+            rusttoolchain
           ];
 
           env = {

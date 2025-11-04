@@ -47,6 +47,12 @@ SECTIONS
 		_data = .;
 		*(.data)
 		*(.data.*)
+
+		. = ALIGN(0x100);
+		__relocate_kernel_start = .;
+		*(.relocate_kernel_text)
+    	*(.relocate_kernel_data)
+		__relocate_kernel_end = .;
 		
 		_edata = .;
 	}

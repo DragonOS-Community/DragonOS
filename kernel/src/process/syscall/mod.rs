@@ -17,6 +17,7 @@ mod sys_getsid;
 mod sys_gettid;
 mod sys_getuid;
 mod sys_groups;
+mod sys_pidfdopen;
 pub mod sys_prlimit64;
 mod sys_set_tid_address;
 mod sys_setdomainname;
@@ -32,6 +33,7 @@ mod sys_setuid;
 mod sys_uname;
 mod sys_unshare;
 mod sys_wait4;
+mod sys_waitid;
 
 #[cfg(target_arch = "x86_64")]
 mod sys_fork;

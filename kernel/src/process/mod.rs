@@ -14,7 +14,6 @@ use alloc::{
 };
 use cred::INIT_CRED;
 use hashbrown::HashMap;
-use intertrait::cast::CastArc;
 use log::{debug, error, info, warn};
 use pid::{alloc_pid, Pid, PidLink, PidType};
 use process_group::Pgid;
@@ -37,7 +36,7 @@ use crate::{
     ipc::{
         sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending},
+        signal_types::{SigInfo, SigPending, SigStack},
     },
     libs::{
         align::AlignedBox,
@@ -56,7 +55,6 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    net::socket::Socket,
     process::resource::{RLimit64, RLimitID},
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
@@ -312,6 +310,23 @@ impl ProcessManager {
         }
     }
 
+    /// 异步将目标进程置为停止状态（用于 SIGSTOP/SIGTSTP 等作业控制停止）
+    ///
+    /// 注意：该函数用于对“目标进程”进行停止标记，不要求在目标进程上下文调用。
+    /// 与 `mark_stop`（仅当前进程）相对应。
+    pub fn stop_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+        let state = writer.state();
+        if !matches!(state, ProcessState::Exited(_)) {
+            writer.set_state(ProcessState::Stopped);
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+            drop(writer);
+            return Ok(());
+        }
+        return Err(SystemError::EINTR);
+    }
+
     /// 标志当前进程永久睡眠，但是发起调度的工作，应该由调用者完成
     ///
     /// ## 注意
@@ -387,6 +402,10 @@ impl ProcessManager {
                     e
                 );
             }
+            // 额外唤醒：父进程可能阻塞在 wait 系列调用上
+            parent_pcb
+                .wait_queue
+                .wakeup_all(Some(ProcessState::Blocked(true)));
             // todo: 这里还需要根据线程组的信息，决定信号的发送
         }
     }
@@ -419,6 +438,7 @@ impl ProcessManager {
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pid: Arc<Pid>;
         let raw_pid = ProcessManager::current_pid();
+        // log::debug!("[exit: {}]", raw_pid.data());
         {
             let pcb = ProcessManager::current_pcb();
             pid = pcb.pid();
@@ -549,7 +569,11 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid() {
+            let current_cpu_id = smp_get_processor_id();
+            // Do not kick the current CPU, as it is already running and cannot preempt itself.
+            if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid()
+                && cpu_id != current_cpu_id
+            {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }
@@ -729,6 +753,8 @@ pub struct ProcessControlBlock {
     /// 与信号处理相关的信息(似乎可以是无锁的)
     sig_info: RwLock<ProcessSignalInfo>,
     sighand: RwLock<Arc<SigHand>>,
+    /// 备用信号栈
+    sig_altstack: RwLock<SigStack>,
 
     /// 退出信号S
     exit_signal: AtomicSignal,
@@ -871,6 +897,7 @@ impl ProcessControlBlock {
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RwLock::new(SigHand::new()),
+                sig_altstack: RwLock::new(SigStack::new()),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb),
@@ -1131,6 +1158,14 @@ impl ProcessControlBlock {
         return &self.sched_info;
     }
 
+    pub fn sig_altstack(&self) -> RwLockReadGuard<'_, SigStack> {
+        self.sig_altstack.read_irqsave()
+    }
+
+    pub fn sig_altstack_mut(&self) -> RwLockWriteGuard<'_, SigStack> {
+        self.sig_altstack.write_irqsave()
+    }
+
     #[inline(always)]
     pub fn worker_private(&self) -> SpinLockGuard<'_, Option<WorkerPrivate>> {
         return self.worker_private.lock();
@@ -1138,6 +1173,11 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn raw_pid(&self) -> RawPid {
+        return self.pid;
+    }
+
+    #[inline(always)]
+    pub fn raw_tgid(&self) -> RawPid {
         return self.pid;
     }
 
@@ -1191,7 +1231,7 @@ impl ProcessControlBlock {
         self.task_tgid_vnr().unwrap() == RawPid(1)
     }
 
-    /// 根据文件描述符序号，获取socket对象的Arc指针
+    /// 根据文件描述符序号，获取socket相应的IndexNode的Arc指针
     ///
     /// this is a helper function
     ///
@@ -1201,8 +1241,13 @@ impl ProcessControlBlock {
     ///
     /// ## 返回值
     ///
-    /// Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
-    pub fn get_socket(&self, fd: i32) -> Result<Arc<dyn Socket>, SystemError> {
+    /// 如果fd对应的文件是一个socket，那么返回这个socket相应的IndexNode的Arc指针，否则返回错误码
+    ///
+    /// # 注意
+    /// 因为底层的Socket中可能包含泛型，经过类型擦除转换成Arc<dyn Socket>的时候内部的泛型信息会丢失;
+    /// 因此这里返回Arc<dyn IndexNode>，可在外部直接通过 `as_socket()` 转换成 `Option<&dyn Socket>`;
+    /// 因为内部已经经过检查，因此在外部可以直接 `unwarp` 来获取 `&dyn Socket`
+    pub fn get_socket_inode(&self, fd: i32) -> Result<Arc<dyn IndexNode>, SystemError> {
         let f = ProcessManager::current_pcb()
             .fd_table()
             .read()
@@ -1215,11 +1260,15 @@ impl ProcessControlBlock {
         if f.file_type() != FileType::Socket {
             return Err(SystemError::EBADF);
         }
+
+        let inode = f.inode();
         // log::info!("get_socket: fd {} is a socket", fd);
-        f.inode().cast::<dyn Socket>().map_err(|_| {
-            log::error!("get_socket: fd {} is not a socket", fd);
-            SystemError::EBADF
-        })
+        if let Some(_sock) = inode.as_socket() {
+            // log::info!("{:?}", sock);
+            return Ok(inode);
+        }
+
+        Err(SystemError::EBADF)
     }
 
     /// 当前进程退出时,让初始进程收养所有子进程
@@ -1442,6 +1491,12 @@ impl ProcessControlBlock {
 
     pub fn is_thread_group_leader(&self) -> bool {
         self.exit_signal.load(Ordering::SeqCst) != Signal::INVALID
+    }
+
+    /// 唤醒等待在本进程 `wait_queue` 上的所有等待者
+    pub fn wake_all_waiters(&self) {
+        self.wait_queue
+            .wakeup_all(Some(ProcessState::Blocked(true)))
     }
 }
 

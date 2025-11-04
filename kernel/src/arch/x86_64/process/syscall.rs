@@ -1,18 +1,16 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
+use x86::{Ring, segmentation::SegmentSelector};
 
 use crate::{
     arch::{
-        interrupt::TrapFrame,
-        process::table::{USER_CS, USER_DS},
-    },
-    mm::VirtAddr,
-    process::{
-        exec::{BinaryLoaderResult, ExecParam},
-        ProcessControlBlock, ProcessManager,
-    },
-    syscall::{user_access::UserBufferWriter, Syscall},
+        CurrentIrqArch, interrupt::TrapFrame, process::table::{USER_CS, USER_DS}
+    }, exception::InterruptArch, mm::VirtAddr, process::{
+        ProcessControlBlock, ProcessManager, exec::{BinaryLoaderResult, ExecParam}
+    }, syscall::{Syscall, user_access::UserBufferWriter}
 };
+
+const X86_USER_SPACE_MAX: usize = 0x0000_7fff_ffff_f000;
 
 impl Syscall {
     pub fn arch_do_execve(
@@ -56,10 +54,14 @@ impl Syscall {
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/process_64.c#913
     pub fn arch_prctl(option: usize, arg2: usize) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        if let Err(SystemError::EINVAL) = Self::do_arch_prctl_64(&pcb, option, arg2, true) {
+        let result = Self::do_arch_prctl_64(&pcb, option, arg2, true);
+
+        if let Err(SystemError::EINVAL) = result {
             Self::do_arch_prctl_common(option, arg2)?;
+            Ok(0)
+        } else {
+            result
         }
-        Ok(0)
     }
 
     /// ## 64位下控制fs/gs base寄存器的方法
@@ -90,16 +92,39 @@ impl Syscall {
                 writer.copy_one_to_user(&arch_info.gsbase, 0)?;
             }
             ARCH_SET_FS => {
+                if arg2 >= X86_USER_SPACE_MAX {
+                    return Err(SystemError::EPERM);
+                }
+
                 arch_info.fsbase = arg2;
-                // 如果是当前进程则直接写入寄存器
+                arch_info.fs = SegmentSelector::new(0, Ring::Ring0); // 清零选择子
+
                 if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
+                    // 先加载段选择子为 0
+                    unsafe {
+                        x86::segmentation::load_fs(SegmentSelector::new(0, Ring::Ring0));
+                    }
+                    // 再设置 base
                     unsafe { arch_info.restore_fsbase() }
                 }
             }
+
             ARCH_SET_GS => {
+                if arg2 >= X86_USER_SPACE_MAX {
+                    return Err(SystemError::EPERM);
+                }
+
                 arch_info.gsbase = arg2;
+                arch_info.gs = SegmentSelector::new(0, Ring::Ring0); // 清零选择子
+
                 if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
+                    // GS 的处理更复杂，需要禁用中断
+                    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                    unsafe {
+                        x86::segmentation::load_gs(SegmentSelector::new(0, Ring::Ring0));
+                    }
                     unsafe { arch_info.restore_gsbase() }
+                    drop(irq_guard);
                 }
             }
             _ => {

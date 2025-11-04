@@ -435,17 +435,6 @@ impl ProcessManager {
         // 标记当前线程还未被执行exec
         pcb.flags().insert(ProcessFlags::FORKNOEXEC);
 
-        // 将子进程/线程的id存储在用户态传进的地址中
-        if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-            let mut writer = UserBufferWriter::new(
-                clone_args.parent_tid.data() as *mut i32,
-                core::mem::size_of::<i32>(),
-                true,
-            )?;
-
-            writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
-        }
-
         // 克隆 pidfd
         if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
             let pid = pcb.raw_pid().0 as i32;
@@ -681,6 +670,17 @@ impl ProcessManager {
         }
 
         pcb.attach_pid(PidType::PID);
+
+        // 将子进程/线程的id存储在用户态传进的地址中
+        if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+            let mut writer = UserBufferWriter::new(
+                clone_args.parent_tid.data() as *mut i32,
+                core::mem::size_of::<i32>(),
+                true,
+            )?;
+
+            writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
+        }
 
         sched_cgroup_fork(pcb);
 

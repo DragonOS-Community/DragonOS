@@ -442,11 +442,7 @@ impl ProcessManager {
         {
             let pcb = ProcessManager::current_pcb();
             pid = pcb.pid();
-            pcb.sched_info
-                .inner_lock_write_irqsave()
-                .set_state(ProcessState::Exited(exit_code));
             pcb.wait_queue.mark_dead();
-            pcb.wait_queue.wakeup_all(Some(ProcessState::Blocked(true)));
 
             let rq = cpu_rq(smp_get_processor_id().data() as usize);
             let (rq, guard) = rq.self_lock();
@@ -491,7 +487,14 @@ impl ProcessManager {
                 }
             }
             pcb.sig_info_mut().set_tty(None);
+
+            // 在最后，调用 exit_notify 之前，设置状态为 Exited
+            pcb.sched_info
+                .inner_lock_write_irqsave()
+                .set_state(ProcessState::Exited(exit_code));
+
             drop(pcb);
+
             ProcessManager::exit_notify();
         }
 

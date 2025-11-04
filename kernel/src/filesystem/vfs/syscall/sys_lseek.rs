@@ -13,6 +13,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::{SEEK_CUR, SEEK_END, SEEK_SET};
+use crate::filesystem::vfs::{FilePrivateData, FileType};
 
 /// System call handler for the `lseek` syscall
 ///
@@ -56,7 +57,6 @@ impl Syscall for SysLseekHandle {
 
         // Drop guard to avoid scheduling issues
         drop(fd_table_guard);
-
         // Perform the seek operation
         return file.lseek(seek);
     }

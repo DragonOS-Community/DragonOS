@@ -3,6 +3,7 @@
 use system_error::SystemError;
 
 use super::SEEK_MAX;
+use super::{SEEK_CUR, SEEK_END, SEEK_SET};
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_LSEEK;
 use crate::driver::base::block::SeekFrom;
@@ -11,7 +12,6 @@ use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use super::{SEEK_CUR, SEEK_END, SEEK_SET};
 
 /// System call handler for the `lseek` syscall
 ///

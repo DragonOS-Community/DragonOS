@@ -11,9 +11,7 @@ use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-
 use super::{SEEK_CUR, SEEK_END, SEEK_SET};
-use crate::filesystem::vfs::{FilePrivateData, FileType};
 
 /// System call handler for the `lseek` syscall
 ///

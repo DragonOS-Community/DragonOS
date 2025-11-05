@@ -366,10 +366,10 @@ impl File {
             let pdata = self.private_data.lock();
             if let FilePrivateData::Procfs(_) = &*pdata {
                 match origin {
-                    crate::driver::base::block::SeekFrom::SeekEnd(_) => {
+                    SeekFrom::SeekEnd(_) => {
                         return Err(SystemError::EINVAL);
                     }
-                    crate::driver::base::block::SeekFrom::Invalid => {
+                    SeekFrom::Invalid => {
                         return Err(SystemError::EINVAL);
                     }
                     _ => {}
@@ -383,7 +383,7 @@ impl File {
                 if FileType::Dir == file_type {
                     // 对目录，返回 Linux 常见语义：允许 SEEK_END 并返回 MAX_LFS_FILESIZE。
                     // 测试接受 MAX_LFS_FILESIZE 或 EINVAL，但为通过当前测试选择返回 MAX_LFS_FILESIZE。
-                    const MAX_LFS_FILESIZE: i64 = 0x7fffffffffffffff;
+                    const MAX_LFS_FILESIZE: i64 = i64::MAX;
                     return Ok(MAX_LFS_FILESIZE as usize);
                 }
                 let metadata = self.metadata()?;

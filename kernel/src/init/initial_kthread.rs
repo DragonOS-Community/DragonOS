@@ -12,7 +12,7 @@ use crate::filesystem::vfs::vcore::change_root_fs;
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::net::e1000e::e1000e::e1000e_init,
-    filesystem::vfs::vcore::mount_root_fs,
+    filesystem::vfs::{vcore::mount_root_fs, VFS_MAX_FOLLOW_SYMLINK_TIMES},
     net::net_core::net_init,
     process::{
         exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
@@ -75,7 +75,7 @@ fn kernel_init() -> Result<(), SystemError> {
         .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
         .ok();
 
-    if super::enable_initramfs() {
+    if super::initramfs_enabled() {
         // 使用 initramfs, 迁移文件系统
         #[cfg(feature = "initram")]
         change_root_fs().expect("Failed to mount root fs");
@@ -127,7 +127,7 @@ fn switch_to_user() -> ! {
 
     let mut trap_frame = TrapFrame::new();
 
-    if super::enable_initramfs() {
+    if super::initramfs_enabled() {
         // 使用 initramfs, 启动 /init
         log::info!("Initramfs, Boot with specified init process: /init");
 
@@ -212,7 +212,7 @@ fn run_init_process(
     let path = proc_init_info.proc_name.to_str().unwrap();
 
     let pwd = ProcessManager::current_pcb().pwd_inode();
-    let inode = pwd.lookup(path)?;
+    let inode = pwd.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     do_execve(
         inode,
         proc_init_info.args.clone(),

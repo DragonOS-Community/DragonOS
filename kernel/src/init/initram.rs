@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use crate::filesystem::ramfs::RamFS;
 use crate::filesystem::vfs::mount::MountFlags;
+use crate::filesystem::vfs::FilePrivateData;
 use crate::filesystem::vfs::FileSystem;
 use crate::filesystem::vfs::MountFS;
 use crate::init::boot::boot_callbacks;
@@ -31,49 +32,14 @@ pub fn INIT_ROOT_INODE() -> Arc<dyn IndexNode> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 #[allow(non_upper_case_globals, unexpected_cfgs)]
 #[used]
 pub static INITRAM_DATA: &[u8] = {
-    #[cfg(has_initram_x86)]
+    #[cfg(has_initram)]
     {
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/initram/x86.cpio.xz"))
+        include_bytes!(env!("INITRAM_PATH"))
     }
-    #[cfg(not(has_initram_x86))]
-    {
-        &[]
-    }
-};
-
-#[cfg(target_arch = "riscv64")]
-#[allow(non_upper_case_globals, unexpected_cfgs)]
-#[used]
-pub static INITRAM_DATA: &[u8] = {
-    #[cfg(has_initram_riscv64)]
-    {
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/initram/riscv64.cpio.xz"
-        ))
-    }
-    #[cfg(not(has_initram_riscv64))]
-    {
-        &[]
-    }
-};
-
-#[cfg(target_arch = "loongarch64")]
-#[allow(non_upper_case_globals, unexpected_cfgs)]
-#[used]
-pub static INITRAM_DATA: &[u8] = {
-    #[cfg(has_initram_loongarch64)]
-    {
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/initram/loongarch64.cpio.xz"
-        ))
-    }
-    #[cfg(not(has_initram_loongarch64))]
+    #[cfg(not(has_initram))]
     {
         &[]
     }
@@ -154,7 +120,7 @@ pub fn initramfs_init() -> Result<(), SystemError> {
         return Err(SystemError::ENOENT);
     }
 
-    let cpio_data = xz_decompress(get_initram()).unwrap();
+    let cpio_data = xz_decompress(get_initram())?;
 
     let collected_entries_vec = cpio_reader::iter_files(&cpio_data)
         .map(|entry| CpioEntryInfo {
@@ -180,7 +146,10 @@ pub fn initramfs_init() -> Result<(), SystemError> {
     for (index, entry) in collected_entries_vec.iter().enumerate() {
         // x86 的有 4 种文件：Dir, File, CharDevice, SymLink
         let name = entry.name.clone();
-        let mode = ModeType::from_bits(entry.mode.bits()).unwrap();
+        let mode = ModeType::from_bits(entry.mode.bits()).ok_or_else(|| {
+            log::error!("initramfs: failed to get mode!");
+            SystemError::EINVAL
+        })?;
         let file_type = FileType::from(mode);
         log::info!(
             "Find cpio entry, Name:{}, ModeType:{:?}, FileType:{:?}",
@@ -191,24 +160,22 @@ pub fn initramfs_init() -> Result<(), SystemError> {
         let (filename, parent_path) = rsplit_path(&name);
         let parent_inode = match parent_path {
             None => INIT_ROOT_INODE(),
-            Some(path) => INIT_ROOT_INODE().lookup(path).unwrap(),
+            Some(path) => INIT_ROOT_INODE().lookup(path)?,
         };
         match file_type {
             FileType::Dir => {
                 // 直接插入, 无需处理数据
-                parent_inode.create(filename, file_type, mode).unwrap();
+                parent_inode.create(filename, file_type, mode)?;
             }
             FileType::File => {
                 // 插入, 随后写入文件数据
-                let inode = parent_inode.create(filename, file_type, mode).unwrap();
-                inode
-                    .write_at(
-                        0,
-                        entry.file.len(),
-                        &entry.file,
-                        SpinLock::new(crate::filesystem::vfs::FilePrivateData::Unused).lock(),
-                    )
-                    .unwrap();
+                let inode = parent_inode.create(filename, file_type, mode)?;
+                inode.write_at(
+                    0,
+                    entry.file.len(),
+                    &entry.file,
+                    SpinLock::new(crate::filesystem::vfs::FilePrivateData::Unused).lock(),
+                )?;
             }
             FileType::CharDevice => {
                 // 不处理, 如果使用 initramfs 那么直接从已经初始化好的根文件系统迁移到此文件系统
@@ -223,20 +190,28 @@ pub fn initramfs_init() -> Result<(), SystemError> {
         };
     }
 
-    // 处理链接文件
-    // TODO: 正常来说必须使用软链接(符号链接), 但是现在内核没有实现软链接
-    // 这里使用硬链接在一层符号嵌套访问上不会出问题, 但是执行多层符号嵌套会出问题, 这个使用了一个小暂时的方法
+    // 处理链接文件, 使用符号链接
     for i in 0..links.len() {
         let entry = &collected_entries_vec[links[i]];
         let name = entry.name.clone();
         let (filename, parent_path) = rsplit_path(&name);
         let parent_inode = match parent_path {
             None => INIT_ROOT_INODE(),
-            Some(path) => INIT_ROOT_INODE().lookup(path).unwrap(),
+            Some(path) => INIT_ROOT_INODE().lookup(path)?,
         };
-        let other_name = String::from_utf8(entry.file.clone()).unwrap();
-        let other = parent_inode.lookup(&other_name).unwrap();
-        parent_inode.symlink(filename, &other_name, &other).unwrap();
+        let other_name = String::from_utf8(entry.file.clone()).map_err(|err| {
+            log::error!("initramfs: failed to get utf8_name, err is {}", err);
+            SystemError::EINVAL
+        })?;
+        let new_inode = parent_inode.create_with_data(
+            filename,
+            FileType::SymLink,
+            ModeType::from_bits_truncate(0o777),
+            0,
+        )?;
+        let buf = other_name.as_bytes();
+        let len = buf.len();
+        new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
     }
 
     // 下面的方式是查看外置 initramfs, 例如使用 qemu 的 -initrd 参数加载的

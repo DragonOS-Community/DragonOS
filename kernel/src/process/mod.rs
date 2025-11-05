@@ -24,7 +24,7 @@ use crate::{
         cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
-        CurrentIrqArch,
+        CurrentIrqArch, SigStackArch,
     },
     driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
@@ -36,7 +36,7 @@ use crate::{
     ipc::{
         sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending, SigStack},
+        signal_types::{SigInfo, SigPending},
     },
     libs::{
         align::AlignedBox,
@@ -754,7 +754,7 @@ pub struct ProcessControlBlock {
     sig_info: RwLock<ProcessSignalInfo>,
     sighand: RwLock<Arc<SigHand>>,
     /// 备用信号栈
-    sig_altstack: RwLock<SigStack>,
+    sig_altstack: RwLock<SigStackArch>,
 
     /// 退出信号S
     exit_signal: AtomicSignal,
@@ -897,7 +897,7 @@ impl ProcessControlBlock {
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RwLock::new(SigHand::new()),
-                sig_altstack: RwLock::new(SigStack::new()),
+                sig_altstack: RwLock::new(SigStackArch::new()),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb),
@@ -1158,11 +1158,11 @@ impl ProcessControlBlock {
         return &self.sched_info;
     }
 
-    pub fn sig_altstack(&self) -> RwLockReadGuard<'_, SigStack> {
+    pub fn sig_altstack(&self) -> RwLockReadGuard<'_, SigStackArch> {
         self.sig_altstack.read_irqsave()
     }
 
-    pub fn sig_altstack_mut(&self) -> RwLockWriteGuard<'_, SigStack> {
+    pub fn sig_altstack_mut(&self) -> RwLockWriteGuard<'_, SigStackArch> {
         self.sig_altstack.write_irqsave()
     }
 

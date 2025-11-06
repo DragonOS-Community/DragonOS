@@ -2,5 +2,5 @@
 MknodTest.RegularFilePermissions
 # symlink未实现
 MknodTest.MknodOnExistingPathFails
-# sys_socket对应功能为实现
+# sys_socket对应功能未实现
 MknodTest.Socket

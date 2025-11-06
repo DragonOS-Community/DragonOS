@@ -1964,12 +1964,11 @@ impl IndexNode for LockedFATInode {
         mode: ModeType,
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        {
-            let inode = self.0.lock();
-            if inode.metadata.file_type != FileType::Dir {
-                return Err(SystemError::ENOTDIR);
-            }
+        let inode = self.0.lock();
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
         }
+        drop(inode);
 
         // 判断需要创建的类型
         if unlikely(mode.contains(ModeType::S_IFREG)) {

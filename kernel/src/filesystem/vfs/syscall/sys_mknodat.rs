@@ -46,7 +46,7 @@ impl Syscall for SysMknodatHandle {
             current_inode =
                 current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         }
-        if (name == "") && dirfd != AtFlags::AT_FDCWD.bits() {
+        if name.is_empty() && dirfd != AtFlags::AT_FDCWD.bits() {
             return Err(SystemError::ENOENT);
         }
         // 在解析出的起始 inode 上进行 mknod（IndexNode::mknod 应负责对路径的进一步解析/校验）

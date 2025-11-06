@@ -1,14 +1,16 @@
-use alloc::string::ToString;
-
 use super::ModeType;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_MKNODAT;
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::vfs::FileType;
+use crate::filesystem::vfs::rsplit_path;
+use crate::filesystem::vfs::syscall::AtFlags;
+use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::MAX_PATHLEN;
+use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -26,26 +28,29 @@ impl Syscall for SysMknodatHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let dirfd = Self::dirfd(args);
         let path = Self::path(args);
-        let mode = Self::mode(args);
+        let mode_val = Self::mode(args);
         let dev = DeviceNumber::from(Self::dev(args));
-
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
-        let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
 
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-        let file = fd_table_guard
-            .get_file_by_fd(dirfd)
-            .ok_or(SystemError::EBADF)?;
-        drop(fd_table_guard);
-
-        if file.file_type() != FileType::Dir {
-            return Err(SystemError::EBADF);
+        let mode: ModeType = if mode_val == 0 {
+            ModeType::S_IFREG
+        } else {
+            ModeType::from_bits(mode_val).ok_or(SystemError::EINVAL)?
+        };
+        let pcb = ProcessManager::current_pcb();
+        let (mut current_inode, ret_path) = user_path_at(&pcb, dirfd, &path)?;
+        let (name, parent) = rsplit_path(&ret_path);
+        if let Some(parent) = parent {
+            current_inode =
+                current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         }
-
-        file.inode().mknod(&path, mode, dev)?;
+        if name.is_empty() && dirfd != AtFlags::AT_FDCWD.bits() {
+            return Err(SystemError::ENOENT);
+        }
+        // 在解析出的起始 inode 上进行 mknod（IndexNode::mknod 应负责对路径的进一步解析/校验）
+        current_inode.mknod(name, mode, dev)?;
 
         Ok(0)
     }

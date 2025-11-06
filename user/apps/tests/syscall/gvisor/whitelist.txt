@@ -12,6 +12,7 @@ syslog_test
 # 文件系统相关测试
 dup_test
 write_test
+mknod_test
 lseek_test
 #stat_test
 #chmod_test

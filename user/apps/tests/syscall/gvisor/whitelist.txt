@@ -18,7 +18,7 @@ lseek_test
 #chown_test
 
 # 进程相关测试
-#fork_test
+fork_test
 #exec_test
 #wait_test
 futex_test
@@ -27,6 +27,7 @@ futex_test
 #mmap_test
 brk_test
 mincore_test
+madvise_test
 
 # 网络相关测试
 #bind_test

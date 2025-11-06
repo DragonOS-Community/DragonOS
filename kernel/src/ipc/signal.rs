@@ -19,6 +19,7 @@ use crate::{
 };
 
 use super::signal_types::{SigInfo, SigType, SIG_KERNEL_STOP_MASK};
+use crate::ipc::signal_types::SignalFlags;
 
 impl Signal {
     pub fn signal_pending_state(
@@ -226,7 +227,8 @@ impl Signal {
 
         // TODO:引入进程组后，在这里挑选一个进程来唤醒，让它执行相应的操作。
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        // TODO: 到这里，信号已经被放置在共享的pending队列中，我们在这里把目标进程唤醒。
+        // 统一按既有规则唤醒：STOP 信号需要把阻塞的系统调用唤醒到信号处理路径，
+        // 由目标进程在自身上下文中执行默认处理（sig_stop），从而原地进入 Stopped，避免返回到用户态。
         if let Some(target_pcb) = target_pcb {
             signal_wake_up(target_pcb.clone(), *self == Signal::SIGKILL);
         }
@@ -309,14 +311,49 @@ impl Signal {
         if !(self.into_sigset() & SIG_KERNEL_STOP_MASK).is_empty() {
             flush = Signal::SIGCONT.into_sigset();
             pcb.sighand().shared_pending_flush_by_mask(&flush);
+            // 异步作业控制停止：立即将目标进程置为 Stopped，并上报/唤醒父进程等待
+            // 这样即便目标进程尚未返回用户态执行默认处理，也能及时观测到 WSTOPPED 事件
+            pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
+            pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
+            let _ = ProcessManager::stop_task(&pcb);
+            if let Some(parent) = pcb.parent_pcb() {
+                let _ = crate::ipc::kill::kill_process_by_pcb(parent.clone(), Signal::SIGCHLD);
+                parent.wake_all_waiters();
+            }
+            pcb.wake_all_waiters();
             // TODO 对每个子线程 flush mask
         } else if *self == Signal::SIGCONT {
             flush = SIG_KERNEL_STOP_MASK;
             assert!(!flush.is_empty());
+            // 清理 STOP 类挂起信号
             pcb.sighand().shared_pending_flush_by_mask(&flush);
-            let _r = ProcessManager::wakeup_stop(&pcb);
-            // TODO 对每个子线程 flush mask
-            // 这里需要补充一段逻辑，详见https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#952
+            pcb.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
+
+            // 仅当确实处于 job-control stopped 时，才报告 continued 事件并通知父进程
+            let was_stopped = {
+                let state = pcb.sched_info().inner_lock_read_irqsave().state();
+                state.is_stopped()
+                    || pcb.sighand().flags_contains(SignalFlags::STOP_STOPPED)
+                    || pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
+            };
+
+            if was_stopped {
+                let _ = ProcessManager::wakeup_stop(&pcb);
+                // 标记继续事件，供 waitid(WCONTINUED) 可见
+                pcb.sighand().flags_insert(SignalFlags::CLD_CONTINUED);
+                pcb.sighand().flags_insert(SignalFlags::STOP_CONTINUED);
+                // 清理停止相关标志，符合 Linux 语义
+                pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
+                pcb.sighand().flags_remove(SignalFlags::STOP_STOPPED);
+                if let Some(parent) = pcb.parent_pcb() {
+                    let _ = crate::ipc::kill::kill_process_by_pcb(parent.clone(), Signal::SIGCHLD);
+                    parent.wake_all_waiters();
+                }
+                // 唤醒等待在该子进程上的等待者
+                pcb.wake_all_waiters();
+            }
+            // 如果未处于 stopped，则不生成 CLD_CONTINUED/不通知父进程
+            // TODO 对每个子线程 flush mask；对齐 Linux 更完整语义
         }
 
         // 一个被阻塞了的信号肯定是要被处理的
@@ -359,25 +396,41 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
             );
         });
     } else if state.is_stopped() {
-        ProcessManager::wakeup_stop(&pcb).unwrap_or_else(|e| {
-            wakeup_ok = false;
-            warn!(
-                "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
-                ProcessManager::current_pcb().raw_pid(),
-                pcb.raw_pid(),
-                e
-            );
-        });
+        // 对已处于 Stopped 的任务，除非致命信号，否则不要唤醒为 Runnable
+        // SIGCONT 的唤醒在 prepare_signal(SIGCONT) 路径专门处理
+        wakeup_ok = false;
     } else {
         wakeup_ok = false;
     }
 
+    // 强制让目标CPU陷入内核，尽快处理 pending 的信号（包括作业控制停止/继续）
+    // 即使目标任务当前处于 Runnable，也需要 kick 以触发内核路径的 do_signal。
     if wakeup_ok {
+        // log::debug!(
+        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick",
+        //     pcb.raw_pid(),
+        //     state,
+        //     fatal
+        // );
         ProcessManager::kick(&pcb);
     } else if fatal {
+        // log::debug!(
+        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> wakeup+kick",
+        //     pcb.raw_pid(),
+        //     state,
+        //     fatal
+        // );
         let _r = ProcessManager::wakeup(&pcb).map(|_| {
             ProcessManager::kick(&pcb);
         });
+    } else if !state.is_stopped() {
+        // log::debug!(
+        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick only",
+        //     pcb.raw_pid(),
+        //     state,
+        //     fatal
+        // );
+        ProcessManager::kick(&pcb);
     }
 }
 

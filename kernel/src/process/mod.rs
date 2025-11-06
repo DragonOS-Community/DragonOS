@@ -310,6 +310,23 @@ impl ProcessManager {
         }
     }
 
+    /// 异步将目标进程置为停止状态（用于 SIGSTOP/SIGTSTP 等作业控制停止）
+    ///
+    /// 注意：该函数用于对“目标进程”进行停止标记，不要求在目标进程上下文调用。
+    /// 与 `mark_stop`（仅当前进程）相对应。
+    pub fn stop_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+        let state = writer.state();
+        if !matches!(state, ProcessState::Exited(_)) {
+            writer.set_state(ProcessState::Stopped);
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+            drop(writer);
+            return Ok(());
+        }
+        return Err(SystemError::EINTR);
+    }
+
     /// 标志当前进程永久睡眠，但是发起调度的工作，应该由调用者完成
     ///
     /// ## 注意
@@ -385,6 +402,10 @@ impl ProcessManager {
                     e
                 );
             }
+            // 额外唤醒：父进程可能阻塞在 wait 系列调用上
+            parent_pcb
+                .wait_queue
+                .wakeup_all(Some(ProcessState::Blocked(true)));
             // todo: 这里还需要根据线程组的信息，决定信号的发送
         }
     }
@@ -417,14 +438,11 @@ impl ProcessManager {
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pid: Arc<Pid>;
         let raw_pid = ProcessManager::current_pid();
+        // log::debug!("[exit: {}]", raw_pid.data());
         {
             let pcb = ProcessManager::current_pcb();
             pid = pcb.pid();
-            pcb.sched_info
-                .inner_lock_write_irqsave()
-                .set_state(ProcessState::Exited(exit_code));
             pcb.wait_queue.mark_dead();
-            pcb.wait_queue.wakeup_all(Some(ProcessState::Blocked(true)));
 
             let rq = cpu_rq(smp_get_processor_id().data() as usize);
             let (rq, guard) = rq.self_lock();
@@ -469,7 +487,14 @@ impl ProcessManager {
                 }
             }
             pcb.sig_info_mut().set_tty(None);
+
+            // 在最后，调用 exit_notify 之前，设置状态为 Exited
+            pcb.sched_info
+                .inner_lock_write_irqsave()
+                .set_state(ProcessState::Exited(exit_code));
+
             drop(pcb);
+
             ProcessManager::exit_notify();
         }
 
@@ -547,7 +572,11 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid() {
+            let current_cpu_id = smp_get_processor_id();
+            // Do not kick the current CPU, as it is already running and cannot preempt itself.
+            if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid()
+                && cpu_id != current_cpu_id
+            {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }
@@ -1466,6 +1495,12 @@ impl ProcessControlBlock {
     pub fn is_thread_group_leader(&self) -> bool {
         self.exit_signal.load(Ordering::SeqCst) != Signal::INVALID
     }
+
+    /// 唤醒等待在本进程 `wait_queue` 上的所有等待者
+    pub fn wake_all_waiters(&self) {
+        self.wait_queue
+            .wakeup_all(Some(ProcessState::Blocked(true)))
+    }
 }
 
 impl Drop for ProcessControlBlock {
@@ -1474,8 +1509,8 @@ impl Drop for ProcessControlBlock {
         // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
         self.__exit_signal();
         // 在ProcFS中,解除进程的注册
-        procfs_unregister_pid(self.raw_pid())
-            .unwrap_or_else(|e: SystemError| panic!("procfs_unregister_pid failed: error: {e:?}"));
+        // 这里忽略错误，因为进程可能未注册到procfs
+        procfs_unregister_pid(self.raw_pid()).ok();
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
             ppcb.children
                 .write_irqsave()

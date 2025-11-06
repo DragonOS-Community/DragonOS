@@ -57,6 +57,7 @@ impl PosixCloneArgs {
 }
 
 pub fn do_clone(clone_args: KernelCloneArgs, frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    clone_args.verify()?;
     let flags = clone_args.flags;
 
     let vfork = Arc::new(Completion::new());
@@ -161,7 +162,7 @@ impl KernelCloneArgs {
 
         args.check_valid(size)?;
 
-        self.flags = CloneFlags::from_bits_truncate(args.flags);
+        self.flags = CloneFlags::from_bits(args.flags).ok_or(SystemError::EINVAL)?;
         self.pidfd = VirtAddr::new(args.pidfd as usize);
         self.child_tid = VirtAddr::new(args.child_tid as usize);
         self.parent_tid = VirtAddr::new(args.parent_tid as usize);

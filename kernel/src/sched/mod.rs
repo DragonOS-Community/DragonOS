@@ -832,7 +832,7 @@ pub fn schedule(sched_mod: SchedMode) {
 pub fn __schedule(sched_mod: SchedMode) {
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
-
+    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     let mut prev = rq.current();
     if let ProcessState::Exited(_) = prev.clone().sched_info().inner_lock_read_irqsave().state() {
         // 从exit进的Schedule

@@ -44,6 +44,33 @@ impl PidConverter {
             Some(PidConverter::Pid(pid))
         }
     }
+
+    /// ### 为 `waitid` 使用：which/upid 已在封装层基本校验
+    /// 约定：which: 0=P_ALL, 1=P_PID(id>0), 2=P_PGID(id>=0; 0=当前组)
+    pub fn from_waitid(which: u32, upid: i32) -> Option<Self> {
+        match which {
+            0 => Some(PidConverter::All),
+            1 => {
+                if upid <= 0 {
+                    return None;
+                }
+                Self::from_id(upid)
+            }
+            2 => {
+                if upid < 0 {
+                    return None;
+                }
+                // P_PGID: upid==0 -> 当前进程组；>0 -> 指定pgid
+                // from_id: id< -1 为 pgid，因此这里将正 pgid 映射为负数传入
+                if upid == 0 {
+                    Self::from_id(0)
+                } else {
+                    Self::from_id(-upid)
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 pub struct SysKillHandle;

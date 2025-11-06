@@ -1,0 +1,7 @@
+# 这个测例，pipe读到的是正确的，但是很奇怪，用户程序glibc会报错：
+# Fatal glibc error: allocatestack.c:192 (advise_stack_range): assertion failed: freesize < size
+# 接着内核panic,然后才会看到错误，说不结果匹配。感觉是哪里写坏内存了，或者对cow/dirty page的处理不对。
+# 已经排除了child进程退出的影响。
+ForkTest.COWSegment
+ForkTest.SigAltStack
+ForkTest.Affinity

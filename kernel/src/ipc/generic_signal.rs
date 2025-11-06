@@ -1,5 +1,6 @@
 use num_traits::FromPrimitive;
 
+use crate::ipc::signal_types::SignalFlags;
 use crate::{
     arch::{
         ipc::signal::{SigSet, Signal, MAX_SIG_NUM},
@@ -389,7 +390,14 @@ fn sig_terminate_dump(sig: Signal) {
 
 /// 信号默认处理函数——暂停进程
 fn sig_stop(sig: Signal) {
+    // 在接收者上下文设置停止标志，并让当前任务进入 Stopped
     let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    {
+        let pcb = ProcessManager::current_pcb();
+        // 标记停止事件，供 waitid(WSTOPPED) 可见
+        pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
+        pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
+    }
     ProcessManager::mark_stop().unwrap_or_else(|e| {
         log::error!(
             "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
@@ -399,18 +407,33 @@ fn sig_stop(sig: Signal) {
         );
     });
     drop(guard);
+    log::debug!(
+        "sig_stop: pid={:?} entered Stopped; notifying parent and scheduler",
+        ProcessManager::current_pcb().raw_pid()
+    );
+    // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
+    let pcb = ProcessManager::current_pcb();
+    if let Some(parent) = pcb.parent_pcb() {
+        let _ = crate::ipc::kill::kill_process_by_pcb(parent.clone(), Signal::SIGCHLD);
+        parent.wake_all_waiters();
+    }
+    // 唤醒等待在该子进程等待队列上的等待者
+    pcb.wake_all_waiters();
     schedule(SchedMode::SM_NONE);
-    // TODO 暂停进程
 }
 /// 信号默认处理函数——继续进程
-fn sig_continue(sig: Signal) {
-    ProcessManager::wakeup_stop(&ProcessManager::current_pcb()).unwrap_or_else(|_| {
-        log::error!(
-            "Failed to wake up process pid = {:?} with signal :{:?}",
-            ProcessManager::current_pcb().pid(),
-            sig
-        );
-    });
+fn sig_continue(_sig: Signal) {
+    // 默认处理改为最小化：仅在已处于 Stopped 时唤醒停止，让进程继续运行。
+    let pcb = ProcessManager::current_pcb();
+    let is_stopped = pcb
+        .sched_info()
+        .inner_lock_read_irqsave()
+        .state()
+        .is_stopped();
+    if is_stopped {
+        let _ = ProcessManager::wakeup_stop(&pcb);
+    }
+    // 标志位设置与父进程通知统一由 prepare_signal(SIGCONT) 路径处理，避免重复/竞态
 }
 
 /// 信号默认处理函数——忽略

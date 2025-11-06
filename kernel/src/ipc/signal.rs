@@ -635,12 +635,6 @@ pub fn set_sigprocmask(how: SigHow, set: SigSet) -> Result<SigSet, SystemError> 
 
     let mut res_set = oset;
     drop(guard);
-    // log::debug!(
-    //     "[SIGPROCMASK_ENTRY] how={:?}, input_set={:#x}, current_mask(oset)={:#x}",
-    //     how,
-    //     set.bits(),
-    //     oset.bits()
-    // );
 
     match how {
         SigHow::Block => {

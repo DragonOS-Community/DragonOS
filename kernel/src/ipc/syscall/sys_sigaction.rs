@@ -50,6 +50,13 @@ pub(super) fn do_kernel_sigaction(
         let mask: SigSet = unsafe { (*act).mask };
         let input_sighandler = unsafe { (*act).handler as u64 };
 
+        let sig = Signal::from(sig);
+        // Linux 只判断 sig 是否合法
+        // gVisor期望：不能尝试设置 SIGKILL 或 SIGSTOP 的sighandler，任何不为NULL的sa都应该直接失败，而不是静默忽略
+        if sig == Signal::INVALID || sig == Signal::SIGKILL || sig == Signal::SIGSTOP {
+            return Err(SystemError::EINVAL);
+        }
+
         match input_sighandler {
             USER_SIG_DFL => {
                 new_ka = Sigaction::DEFAULT_SIGACTION;
@@ -84,7 +91,7 @@ pub(super) fn do_kernel_sigaction(
             new_ka.flags_mut().insert(SigFlags::SA_RESTORER);
         } else if new_ka.action().is_customized() {
             error!(
-                "pid:{:?}: in sys_sigaction: User must manually sprcify a sa_restorer for signal {}.",
+                "pid:{:?}: in sys_sigaction: User must manually sprcify a sa_restorer for signal {:?}.",
                 ProcessManager::current_pcb().raw_pid(),
                 sig
             );
@@ -94,7 +101,6 @@ pub(super) fn do_kernel_sigaction(
     }
 
     let sig = Signal::from(sig);
-    // 如果给出的信号值不合法
     if sig == Signal::INVALID {
         return Err(SystemError::EINVAL);
     }
@@ -113,7 +119,6 @@ pub(super) fn do_kernel_sigaction(
         },
     );
 
-    //
     if (retval == Ok(())) && (!old_act.is_null()) {
         let r = UserBufferWriter::new(old_act, core::mem::size_of::<UserSigaction>(), from_user);
         if r.is_err() {
@@ -167,11 +172,16 @@ impl SysSigactionHandle {
         // 第三个参数是用户空间传入的用来保存旧 Sigaction 的指针
         args[2]
     }
+    #[inline(always)]
+    fn sigsetsize(args: &[usize]) -> usize {
+        // 第四个参数是 Sigset 的大小
+        args[3]
+    }
 }
 
 impl Syscall for SysSigactionHandle {
     fn num_args(&self) -> usize {
-        3
+        4
     }
 
     #[no_mangle]
@@ -179,6 +189,11 @@ impl Syscall for SysSigactionHandle {
         let sig = Self::sig(args);
         let act = Self::act(args);
         let old_act = Self::old_act(args);
+        let sigsetsize = Self::sigsetsize(args);
+        // 与内核内部 SigSet 结构体的大小进行比较
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(SystemError::EINVAL);
+        }
 
         let r = do_kernel_sigaction(sig, act, old_act, frame.is_from_user());
         compiler_fence(Ordering::SeqCst);

@@ -1,5 +1,6 @@
 use crate::alloc::vec::Vec;
 use crate::arch::interrupt::TrapFrame;
+use crate::process::ProcessManager;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     arch::syscall::nr::SYS_RT_SIGPROCMASK,
@@ -42,28 +43,31 @@ pub(super) fn do_kernel_rt_sigprocmask(
     let nset = if newset == 0 { None } else { Some(newset) };
 
     if sigsetsize != size_of::<SigSet>() {
-        return Err(SystemError::EFAULT);
+        return Err(SystemError::EINVAL);
     }
 
     let sighow = SigHow::try_from(how)?;
 
-    let mut new_set = SigSet::default();
-    if let Some(nset) = nset {
+    let oldset_to_return = if let Some(nset) = nset {
         let reader = UserBufferReader::new(
             VirtAddr::new(nset).as_ptr::<u64>(),
             core::mem::size_of::<u64>(),
             true,
         )?;
-
         let nset = reader.read_one_from_user::<u64>(0)?;
-        new_set = SigSet::from_bits_truncate(*nset);
+        let mut new_set = SigSet::from_bits_truncate(*nset);
         // debug!("Get Newset: {}", &new_set.bits());
         let to_remove: SigSet =
             <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
         new_set.remove(to_remove);
-    }
+        set_sigprocmask(sighow, new_set)?
+    } else {
+        // 用户没有提供新信号集，只获取当前的信号屏蔽集用于返回
+        let pcb = ProcessManager::current_pcb();
+        let cur_oset = *pcb.sig_info_irqsave().sig_blocked();
+        cur_oset
+    };
 
-    let oldset_to_return = set_sigprocmask(sighow, new_set)?;
     if let Some(oldset) = oset {
         // debug!("Get Oldset to return: {}", &oldset_to_return.bits());
         let mut writer = UserBufferWriter::new(
@@ -98,7 +102,7 @@ impl SysRtSigprocmaskHandle {
 
     #[inline(always)]
     fn sigsetsize(args: &[usize]) -> usize {
-        // 第四个参数是 sigset_t 的大小
+        // 第四个参数是 Sigset 的大小
         args[3]
     }
 }

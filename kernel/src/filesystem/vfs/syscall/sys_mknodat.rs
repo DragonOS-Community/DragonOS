@@ -2,11 +2,11 @@ use super::ModeType;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_MKNODAT;
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::rsplit_path;
 use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::utils::user_path_at;
-use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
-use crate::filesystem::vfs::rsplit_path;
 use crate::filesystem::vfs::MAX_PATHLEN;
+use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -33,8 +33,6 @@ impl Syscall for SysMknodatHandle {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
-
-        
 
         let mode: ModeType = if mode_val == 0 {
             ModeType::S_IFREG

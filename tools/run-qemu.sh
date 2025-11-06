@@ -98,7 +98,7 @@ QEMU_SERIAL="-serial file:${QEMU_SERIAL_LOG_FILE}"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
 QEMU_DEVICES=""
-# QEMU_ARGUMENT+=" -S "
+QEMU_ARGUMENT+=" -S "
 
 if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
   QEMU_DRIVE+=" -drive id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw"

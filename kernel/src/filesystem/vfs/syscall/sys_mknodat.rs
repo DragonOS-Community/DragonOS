@@ -50,7 +50,7 @@ impl Syscall for SysMknodatHandle {
             return Err(SystemError::ENOENT);
         }
         // 在解析出的起始 inode 上进行 mknod（IndexNode::mknod 应负责对路径的进一步解析/校验）
-        current_inode.mknod(&name, mode, dev)?;
+        current_inode.mknod(name, mode, dev)?;
 
         Ok(0)
     }

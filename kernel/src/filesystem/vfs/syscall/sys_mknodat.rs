@@ -2,6 +2,7 @@ use super::ModeType;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_MKNODAT;
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::filesystem::vfs::rsplit_path;
@@ -32,7 +33,9 @@ impl Syscall for SysMknodatHandle {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
+
         
+
         let mode: ModeType = if mode_val == 0 {
             ModeType::S_IFREG
         } else {
@@ -44,6 +47,9 @@ impl Syscall for SysMknodatHandle {
         if let Some(parent) = parent {
             current_inode =
                 current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        }
+        if (name == "") && dirfd != AtFlags::AT_FDCWD.bits() {
+            return Err(SystemError::ENOENT);
         }
         // 在解析出的起始 inode 上进行 mknod（IndexNode::mknod 应负责对路径的进一步解析/校验）
         current_inode.mknod(&name, mode, dev)?;

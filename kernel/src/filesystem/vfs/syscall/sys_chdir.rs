@@ -6,6 +6,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CHDIR;
+use crate::filesystem::vfs::permission::check_chdir_permission;
 use crate::filesystem::vfs::{FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -30,7 +31,7 @@ impl Syscall for SysChdirHandle {
     /// @return   返回码  描述  
     ///      0       |          成功  
     ///         
-    ///   EACCESS    |        权限不足        
+    ///   EACCES    |        权限不足        
     ///
     ///    ELOOP     | 解析path时遇到路径循环
     ///
@@ -92,6 +93,10 @@ impl Syscall for SysChdirHandle {
             Ok(i) => i,
         };
         let metadata = inode.metadata()?;
+        
+        let cred = ProcessManager::current_pcb().cred();
+        check_chdir_permission(&metadata, &cred)?;
+        
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(new_path);
             proc.fs_struct_mut().set_pwd(inode);

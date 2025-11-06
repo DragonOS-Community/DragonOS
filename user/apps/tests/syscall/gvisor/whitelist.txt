@@ -13,6 +13,7 @@ syslog_test
 dup_test
 write_test
 mknod_test
+lseek_test
 #stat_test
 #chmod_test
 #chown_test
@@ -27,6 +28,7 @@ futex_test
 #mmap_test
 brk_test
 mincore_test
+madvise_test
 
 # 网络相关测试
 #bind_test

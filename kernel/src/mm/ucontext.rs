@@ -1033,10 +1033,10 @@ impl UserMappings {
             if guard.region.contains(vaddr) {
                 return Some(v.clone());
             }
-            // 选择起始地址不大于 vaddr 的 VMA 中，起始地址最大的一个
-            if guard.region.start <= vaddr
+            // 向下寻找：选择起始地址大于 vaddr 的 VMA 中，起始地址最小的一个（最近的下一个VMA）
+            if guard.region.start > vaddr
                 && if let Some(ref current) = nearest {
-                    guard.region.start > current.lock_irqsave().region.start
+                    guard.region.start < current.lock_irqsave().region.start
                 } else {
                     true
                 }

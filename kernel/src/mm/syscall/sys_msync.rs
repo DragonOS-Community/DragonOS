@@ -70,30 +70,40 @@ impl Syscall for SysMsyncHandle {
             .find_nearest(VirtAddr::new(start));
         loop {
             if let Some(vma) = next_vma.clone() {
-                let guard = vma.lock_irqsave();
-                let vm_start = guard.region().start().data();
-                let vm_end = guard.region().end().data();
-                if start < vm_start {
-                    if flags == MsFlags::MS_ASYNC {
+                // 读取VMA信息，确保在调用find_nearest前释放锁
+                let (vm_start, vm_end, vm_flags, file, file_pgoff);
+                {
+                    let guard = vma.lock_irqsave();
+                    vm_start = guard.region().start().data();
+                    vm_end = guard.region().end().data();
+                    vm_flags = *guard.vm_flags();
+                    file = guard.vm_file();
+                    file_pgoff = guard.file_page_offset();
+
+                    if start < vm_start {
+                        if flags == MsFlags::MS_ASYNC {
+                            break;
+                        }
+                        start = vm_start;
+                        if start >= vm_end {
+                            break;
+                        }
+                        unmapped_error = Err(SystemError::ENOMEM);
+                    }
+
+                    if flags.contains(MsFlags::MS_INVALIDATE)
+                        && vm_flags.contains(VmFlags::VM_LOCKED)
+                    {
+                        err = Err(SystemError::EBUSY);
                         break;
                     }
-                    start = vm_start;
-                    if start >= vm_end {
-                        break;
-                    }
-                    unmapped_error = Err(SystemError::ENOMEM);
                 }
-                let vm_flags = *guard.vm_flags();
-                if flags.contains(MsFlags::MS_INVALIDATE) && vm_flags.contains(VmFlags::VM_LOCKED) {
-                    err = Err(SystemError::EBUSY);
-                    break;
-                }
-                let file = guard.vm_file();
-                let fstart = (start - vm_start)
-                    + (guard.file_page_offset().unwrap_or(0) << MMArch::PAGE_SHIFT);
+
+                let fstart = (start - vm_start) + (file_pgoff.unwrap_or(0) << MMArch::PAGE_SHIFT);
                 let fend = fstart + (core::cmp::min(end, vm_end) - start) - 1;
                 let old_start = start;
                 start = vm_end;
+
                 if flags.contains(MsFlags::MS_SYNC) && vm_flags.contains(VmFlags::VM_SHARED) {
                     if let Some(file) = file {
                         let old_pos = file.lseek(SeekFrom::SeekCurrent(0)).unwrap();
@@ -104,25 +114,18 @@ impl Syscall for SysMsyncHandle {
                         file.lseek(SeekFrom::SeekSet(old_pos as i64)).unwrap();
                         if err.is_err() {
                             break;
-                        } else if start >= end {
-                            err = unmapped_error;
-                            break;
                         }
-                        next_vma = current_address_space
-                            .read()
-                            .mappings
-                            .find_nearest(VirtAddr::new(start));
                     }
-                } else {
-                    if start >= end {
-                        err = unmapped_error;
-                        break;
-                    }
-                    next_vma = current_address_space
-                        .read()
-                        .mappings
-                        .find_nearest(VirtAddr::new(vm_end));
                 }
+
+                if start >= end {
+                    err = unmapped_error;
+                    break;
+                }
+                next_vma = current_address_space
+                    .read()
+                    .mappings
+                    .find_nearest(VirtAddr::new(start));
             } else {
                 return Err(SystemError::ENOMEM);
             }

@@ -74,11 +74,8 @@ pub fn inode_permission(
         file_mode & 7
     };
 
-    // 将掩码转换为权限位
-    // MAY_READ  (0x4) -> 0b100 (r--)
-    // MAY_WRITE (0x2) -> 0b010 (-w-)
-    // MAY_EXEC  (0x1) -> 0b001 (--x)
-    let need = mask_to_mode_bits(mask);
+    // PermissionMask 的低 3 位已经是 Unix 权限位格式 (rwx)
+    let need = mask & 0b111;
 
     // 检查权限位是否满足请求
     if (need & !perm) == 0 {
@@ -111,21 +108,6 @@ fn in_group(metadata: &Metadata, cred: &Arc<Cred>) -> bool {
     cred.groups.iter().any(|gid| gid.data() == metadata.gid)
 }
 
-/// 将权限掩码转换为模式位
-#[inline]
-fn mask_to_mode_bits(mask: u32) -> u32 {
-    let mut mode = 0u32;
-    if mask & PermissionMask::MAY_READ.bits() != 0 {
-        mode |= 0b100; // r--
-    }
-    if mask & PermissionMask::MAY_WRITE.bits() != 0 {
-        mode |= 0b010; // -w-
-    }
-    if mask & PermissionMask::MAY_EXEC.bits() != 0 {
-        mode |= 0b001; // --x
-    }
-    mode
-}
 
 /// 尝试使用 capabilities 覆盖权限拒绝
 ///

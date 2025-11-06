@@ -57,10 +57,14 @@ impl Syscall {
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/process_64.c#913
     pub fn arch_prctl(option: usize, arg2: usize) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        if let Err(SystemError::EINVAL) = Self::do_arch_prctl_64(&pcb, option, arg2, true) {
+        let result = Self::do_arch_prctl_64(&pcb, option, arg2, true);
+
+        if let Err(SystemError::EINVAL) = result {
             Self::do_arch_prctl_common(option, arg2)?;
+            Ok(0)
+        } else {
+            result
         }
-        Ok(0)
     }
 
     /// ## 64位下控制fs/gs base寄存器的方法

@@ -93,10 +93,10 @@ impl Syscall for SysChdirHandle {
             Ok(i) => i,
         };
         let metadata = inode.metadata()?;
-        
+
         let cred = ProcessManager::current_pcb().cred();
         check_chdir_permission(&metadata, &cred)?;
-        
+
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(new_path);
             proc.fs_struct_mut().set_pwd(inode);

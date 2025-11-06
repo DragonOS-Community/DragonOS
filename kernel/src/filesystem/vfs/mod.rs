@@ -3,11 +3,11 @@ pub mod file;
 pub mod iov;
 pub mod mount;
 pub mod open;
+pub mod permission;
 pub mod stat;
 pub mod syscall;
 pub mod utils;
 pub mod vcore;
-pub mod permission;
 
 use self::utils::rsplit_path;
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
@@ -27,17 +27,14 @@ use crate::{
         casting::DowncastArc,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{VmFaultReason, fault::PageFaultMessage},
+    mm::{fault::PageFaultMessage, VmFaultReason},
     net::socket::Socket,
     process::ProcessManager,
     time::PosixTimeSpec,
 };
 
 use self::{
-    file::FileMode,
-    permission::{inode_permission},
-    syscall::ModeType,
-    utils::DName,
+    file::FileMode, permission::inode_permission, syscall::ModeType, utils::DName,
     vcore::generate_inode_id,
 };
 pub use self::{file::FilePrivateData, mount::MountFS};

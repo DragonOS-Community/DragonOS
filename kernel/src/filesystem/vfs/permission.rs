@@ -3,10 +3,10 @@
 //! 本模块为 DragonOS VFS 层提供 UNIX DAC（自主访问控制）权限检查功能，
 //! 遵循 Linux 内核语义。
 
-use system_error::SystemError;
-use crate::process::cred::{Cred, CAPFlags};
 use super::Metadata;
+use crate::process::cred::{CAPFlags, Cred};
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 bitflags! {
     pub struct PermissionMask: u32 {
@@ -60,7 +60,7 @@ pub fn inode_permission(
 ) -> Result<(), SystemError> {
     // 从 mode 中提取权限位
     let mode_bits = metadata.mode.bits();
-    let file_mode = mode_bits & 0o777;  // 只保留 rwxrwxrwx
+    let file_mode = mode_bits & 0o777; // 只保留 rwxrwxrwx
 
     // 确定要检查哪组权限位
     let perm = if is_owner(metadata, cred) {
@@ -82,7 +82,7 @@ pub fn inode_permission(
 
     // 检查权限位是否满足请求
     if (need & !perm) == 0 {
-        return Ok(());  // 通过普通检查，权限允许
+        return Ok(()); // 通过普通检查，权限允许
     }
 
     // 尝试 capability 覆盖（类似 Linux 的 capable_wrt_inode_uidgid）
@@ -116,13 +116,13 @@ fn in_group(metadata: &Metadata, cred: &Arc<Cred>) -> bool {
 fn mask_to_mode_bits(mask: u32) -> u32 {
     let mut mode = 0u32;
     if mask & PermissionMask::MAY_READ.bits() != 0 {
-        mode |= 0b100;  // r--
+        mode |= 0b100; // r--
     }
     if mask & PermissionMask::MAY_WRITE.bits() != 0 {
-        mode |= 0b010;  // -w-
+        mode |= 0b010; // -w-
     }
     if mask & PermissionMask::MAY_EXEC.bits() != 0 {
-        mode |= 0b001;  // --x
+        mode |= 0b001; // --x
     }
     mode
 }
@@ -168,15 +168,16 @@ fn try_capability_override(metadata: &Metadata, cred: &Arc<Cred>, mask: u32) -> 
 }
 
 /// 检查 chdir 操作的权限
-pub fn check_chdir_permission(
-    metadata: &Metadata,
-    cred: &Arc<Cred>,
-) -> Result<(), SystemError> {
+pub fn check_chdir_permission(metadata: &Metadata, cred: &Arc<Cred>) -> Result<(), SystemError> {
     // 验证是否为目录
     if metadata.file_type != super::FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
     // 检查执行权限（目录的搜索权限）
-    inode_permission(metadata, cred, PermissionMask::MAY_EXEC.bits() | PermissionMask::MAY_CHDIR.bits())
+    inode_permission(
+        metadata,
+        cred,
+        PermissionMask::MAY_EXEC.bits() | PermissionMask::MAY_CHDIR.bits(),
+    )
 }

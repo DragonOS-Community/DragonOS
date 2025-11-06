@@ -4,8 +4,8 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_FCHDIR;
-use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::permission::check_chdir_permission;
+use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;

@@ -235,9 +235,12 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EINVAL);
     }
 
-    // 查找父目录
-    let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
+        inode_begin.clone()
+    } else {
+        inode_begin
+            .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+    };
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);

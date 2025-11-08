@@ -6,3 +6,4 @@ Device
    :maxdepth: 1
 
    tty
+   loop_device

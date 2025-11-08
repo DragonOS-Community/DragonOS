@@ -9,7 +9,7 @@ use crate::{
         device::{
             bus::Bus,
             device_number::{DeviceNumber, Major},
-            device_register, device_unregister,
+            device_register,
             driver::{Driver, DriverCommonData},
             DevName, Device, DeviceCommonData, DeviceType, IdTable,
         },
@@ -57,12 +57,12 @@ const LOOP_BASENAME: &str = "loop";
 // // IOCTL 命令 - 使用 0x4C ('L')
 pub const LOOP_SET_FD: u32 = 0x4C00;
 pub const LOOP_CLR_FD: u32 = 0x4C01;
-// pub const LOOP_SET_STATUS: u32 = 0x4C02;
-// pub const LOOP_GET_STATUS: u32 = 0x4C03;
+pub const LOOP_SET_STATUS: u32 = 0x4C02;
+pub const LOOP_GET_STATUS: u32 = 0x4C03;
 pub const LOOP_SET_STATUS64: u32 = 0x4C04;
 pub const LOOP_GET_STATUS64: u32 = 0x4C05;
-// pub const LOOP_CHANGE_FD: u32 = 0x4C06;
-// pub const LOOP_SET_CAPACITY: u32 = 0x4C07;
+pub const LOOP_CHANGE_FD: u32 = 0x4C06;
+pub const LOOP_SET_CAPACITY: u32 = 0x4C07;
 // pub const LOOP_SET_DIRECT_IO: u32 = 0x4C08;
 // pub const LOOP_SET_BLOCK_SIZE: u32 = 0x4C09;
 // pub const LOOP_CONFIGURE: u32 = 0x4C0A;
@@ -153,14 +153,14 @@ pub enum LoopState {
     Deleting,
 }
 impl Debug for LoopDevice {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&'_ self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LoopDevice")
             .field("devname", &self.block_dev_meta.devname)
             .finish()
     }
 }
 impl LoopDevice {
-    fn inner(&self) -> SpinLockGuard<LoopDeviceInner> {
+    fn inner(&'_ self) -> SpinLockGuard<'_, LoopDeviceInner> {
         // 获取 LoopDeviceInner 的自旋锁
         self.inner.lock()
     }
@@ -205,32 +205,12 @@ impl LoopDevice {
         inner.file_size = file_size;
         inner.offset = 0;
         inner.size_limit = 0;
-        inner.flags = 0;
-
+        inner.flags = 0; // Reset flags
+        inner.read_only = false; // Reset read_only
+        drop(inner);
+        self.recalc_effective_size()?; // Recalculate size based on new file
         Ok(())
     }
-
-    // 获取文件大小
-    pub fn file_size(&self) -> usize {
-        self.inner().file_size
-    }
-
-    // 设置只读模式
-    pub fn set_read_only(&self, read_only: bool) {
-        let mut inner = self.inner();
-        inner.read_only = read_only;
-        if read_only {
-            inner.flags |= LO_FLAGS_READ_ONLY;
-        } else {
-            inner.flags &= !LO_FLAGS_READ_ONLY;
-        }
-    }
-
-    // 检查是否为只读
-    pub fn is_read_only(&self) -> bool {
-        self.inner().read_only
-    }
-
     fn recalc_effective_size(&self) -> Result<(), SystemError> {
         let (file_inode, offset, size_limit) = {
             let inner = self.inner();
@@ -398,6 +378,41 @@ impl LoopDevice {
         writer.copy_one_to_user(&info, 0)?;
         Ok(())
     }
+    fn set_status(&self, user_ptr: usize) -> Result<(), SystemError> {
+        self.set_status64(user_ptr)
+    }
+    fn get_status(&self, user_ptr: usize) -> Result<(), SystemError> {
+        self.get_status64(user_ptr)
+    }
+    fn change_fd(&self, new_file_fd: i32) -> Result<(), SystemError> {
+        let fd_table = ProcessManager::current_pcb().fd_table();
+        let file = {
+            let guard = fd_table.read();
+            guard.get_file_by_fd(new_file_fd)
+        }
+        .ok_or(SystemError::EBADF)?;
+
+        let mode = file.mode();
+        let read_only = !mode.contains(FileMode::O_WRONLY) && !mode.contains(FileMode::O_RDWR);
+
+        let inode = file.inode();
+        let metadata = inode.metadata()?;
+        match metadata.file_type {
+            FileType::File | FileType::BlockDevice => {}
+            _ => return Err(SystemError::EINVAL),
+        }
+        let mut inner = self.inner();
+        inner.file_inode = Some(inode);
+        inner.read_only = read_only;
+        inner.flags = if read_only { LO_FLAGS_READ_ONLY } else { 0 };
+        drop(inner);
+        self.recalc_effective_size()?;
+        Ok(())
+    }
+    fn set_capacity(&self, _arg: usize) -> Result<(), SystemError> {
+        self.recalc_effective_size()?;
+        Ok(())
+    }
 }
 
 impl KObject for LoopDevice {
@@ -443,11 +458,11 @@ impl KObject for LoopDevice {
         // do nothing,不支持设置loop为别的名称
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&'_ self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&'_ self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -555,12 +570,28 @@ impl IndexNode for LoopDevice {
                 self.clear_file()?;
                 Ok(0)
             }
+            LOOP_SET_STATUS => {
+                self.set_status(data)?;
+                Ok(0)
+            }
+            LOOP_GET_STATUS => {
+                self.get_status(data)?;
+                Ok(0)
+            }
             LOOP_SET_STATUS64 => {
                 self.set_status64(data)?;
                 Ok(0)
             }
             LOOP_GET_STATUS64 => {
                 self.get_status64(data)?;
+                Ok(0)
+            }
+            LOOP_CHANGE_FD => {
+                self.change_fd(data as i32)?;
+                Ok(0)
+            }
+            LOOP_SET_CAPACITY => {
+                self.set_capacity(data)?;
                 Ok(0)
             }
             _ => Err(SystemError::ENOSYS),
@@ -819,7 +850,7 @@ impl LoopDeviceDriver {
             kobj_state: LockedKObjectState::default(),
         })
     }
-    fn inner(&self) -> SpinLockGuard<InnerLoopDeviceDriver> {
+    fn inner(&'_ self) -> SpinLockGuard<'_, InnerLoopDeviceDriver> {
         self.inner.lock()
     }
     fn new_loop_device(&self, minor: usize) -> Result<Arc<LoopDevice>, SystemError> {
@@ -928,11 +959,11 @@ impl KObject for LoopDeviceDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&'_ self) -> RwLockReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&'_ self) -> RwLockWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -959,20 +990,12 @@ impl LoopManager {
             }),
         }
     }
-    fn inner(&self) -> SpinLockGuard<LoopManagerInner> {
+    fn inner(&'_ self) -> SpinLockGuard<'_, LoopManagerInner> {
         self.inner.lock()
-    }
-    //index: 次设备号
-    pub fn register_device(&self, index: usize, device: Arc<LoopDevice>) {
-        if index < Self::MAX_DEVICES {
-            let mut inner = self.inner();
-            inner.devices[index] = Some(device);
-        }
     }
     /*
     请求队列，工作队列未实现
      */
-
     pub fn loop_add(&self, requested_minor: Option<u32>) -> Result<Arc<LoopDevice>, SystemError> {
         let mut inner = self.inner();
         match requested_minor {
@@ -980,7 +1003,6 @@ impl LoopManager {
             None => self.loop_add_first_available_locked(&mut inner),
         }
     }
-
     fn loop_add_specific_locked(
         &self,
         inner: &mut LoopManagerInner,
@@ -1048,26 +1070,6 @@ impl LoopManager {
         log::info!("Loop device loop{} added successfully.", minor);
         Ok(loop_dev)
     }
-
-    pub fn loop_clear(&self, minor: u32) -> Result<(), SystemError> {
-        if minor >= Self::MAX_DEVICES as u32 {
-            return Err(SystemError::EINVAL);
-        }
-
-        let device = {
-            let inner = self.inner();
-            inner.devices[minor as usize].clone()
-        }
-        .ok_or(SystemError::ENODEV)?;
-
-        device.clear_file()?;
-
-        let mut inner = self.inner();
-        inner.next_free_minor = minor;
-        log::info!("Loop device loop{} cleared.", minor);
-        Ok(())
-    }
-
     pub fn loop_remove(&self, minor: u32) -> Result<(), SystemError> {
         if minor >= Self::MAX_DEVICES as u32 {
             return Err(SystemError::EINVAL);
@@ -1126,74 +1128,6 @@ impl LoopManager {
         }
         None
     }
-    pub fn find_device_by_minor(&self, minor: u32) -> Option<Arc<LoopDevice>> {
-        let inner = self.inner();
-        if minor < Self::MAX_DEVICES as u32 {
-            inner.devices[minor as usize].clone()
-        } else {
-            None
-        }
-    }
-    // pub fn loop_remove(&self ,minor:u32)-> Result<(),SystemError>{
-    //     let mut inner_guard=self.inner();
-    //     if minor >=Self::MAX_DEVICES as u32{
-    //         return Err(SystemError::EINVAL);
-    //     }
-    //     if let Some(loop_dev)=inner_guard.devices[minor as usize ].take(){
-    //         //loop_dev.clear_file()?;
-    //         //loop_dev.inner().set_stable(LoopState::Deleting)?;
-
-    //         block_dev_manager().unregister(loop_dev.dev_name())?;
-    //     }
-    // }
-    // 动态分配空闲的loop设备，与指定文件inode关联
-    pub fn alloc_device(
-        &self,
-        file_inode: Arc<dyn IndexNode>,
-    ) -> Result<Arc<LoopDevice>, SystemError> {
-        let mut inner = self.inner();
-        for (i, device) in inner.devices.iter_mut().enumerate() {
-            if device.is_none() {
-                let devname = DevName::new(format!("{}{}", LOOP_BASENAME, i), i);
-                let loop_device = LoopDevice::new_empty_loop_device(devname, i as u32)
-                    .ok_or(SystemError::ENOMEM)?;
-                loop_device.set_file(file_inode.clone())?;
-                *device = Some(loop_device.clone());
-                return Ok(loop_device);
-            }
-        }
-        Err(SystemError::ENOSPC)
-    }
-    pub fn deallocate_device(&self, device: &Arc<LoopDevice>) -> Result<(), SystemError> {
-        /*
-        重置状态unbound
-         */
-        let mut inner_guard = device.inner();
-        inner_guard.set_state(LoopState::Unbound)?;
-        inner_guard.file_inode = None;
-        inner_guard.file_size = 0;
-        inner_guard.offset = 0;
-        inner_guard.read_only = false;
-        drop(inner_guard);
-        let minor = device.inner().device_number.minor() as usize;
-        let mut loop_mgr_inner = self.inner(); // Lock the LoopManager
-        if minor < LoopManager::MAX_DEVICES {
-            if let Some(removed_device) = loop_mgr_inner.devices[minor].take() {
-                log::info!("Deallocated loop device loop{} from manager.", minor);
-                // Unregister from block device manager
-                device_unregister(removed_device.clone());
-            } else {
-                log::warn!(
-                    "Attempted to deallocate loop device loop{} but it was not found in manager.",
-                    minor
-                );
-            }
-        } else {
-            return Err(SystemError::EINVAL); // Minor out of bounds
-        }
-
-        Ok(()) // Indicate success
-    }
     pub fn loop_init(&self, driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {
         let mut inner = self.inner();
         // 注册 loop 设备
@@ -1223,19 +1157,14 @@ pub struct LoopControlDevice {
 }
 struct LoopControlDeviceInner {
     // 设备的公共数据
-    pub device_common: DeviceCommonData,
+    device_common: DeviceCommonData,
     // KObject的公共数据
-    pub kobject_common: KObjectCommonData,
+    kobject_common: KObjectCommonData,
 
     parent: RwLock<Weak<LockedDevFSInode>>,
     device_inode_fs: RwLock<Option<Weak<DevFS>>>,
-    devfs_metadata: Metadata,
 }
 impl LoopControlDevice {
-    pub fn loop_add(&self, index: u32) -> Result<Arc<LoopDevice>, SystemError> {
-        //let loop_dri= LoopDeviceDriver::new();
-        self.loop_mgr.loop_add(Some(index))
-    }
     pub fn new(loop_mgr: Arc<LoopManager>) -> Arc<Self> {
         Arc::new(Self {
             inner: SpinLock::new(LoopControlDeviceInner {
@@ -1243,13 +1172,13 @@ impl LoopControlDevice {
                 device_common: DeviceCommonData::default(),
                 parent: RwLock::new(Weak::default()),
                 device_inode_fs: RwLock::new(None),
-                devfs_metadata: Metadata::default(),
+                // devfs_metadata: Metadata::default(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
             loop_mgr,
         })
     }
-    pub fn inner(&self) -> SpinLockGuard<LoopControlDeviceInner> {
+    fn inner(&'_ self) -> SpinLockGuard<'_, LoopControlDeviceInner> {
         self.inner.lock()
     }
 }
@@ -1484,11 +1413,11 @@ impl KObject for LoopControlDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&'_ self) -> RwLockReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&'_ self) -> RwLockWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

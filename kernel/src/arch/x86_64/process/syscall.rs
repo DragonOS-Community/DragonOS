@@ -5,8 +5,9 @@ use crate::{
     arch::{
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
+        MMArch,
     },
-    mm::VirtAddr,
+    mm::{verify_area, MemoryManagementArch, VirtAddr},
     process::{
         exec::{BinaryLoaderResult, ExecParam},
         ProcessControlBlock, ProcessManager,
@@ -90,6 +91,9 @@ impl Syscall {
                 writer.copy_one_to_user(&arch_info.gsbase, 0)?;
             }
             ARCH_SET_FS => {
+                // 验证FS地址是否为有效的用户空间地址
+                let fs_addr = VirtAddr::new(arg2);
+                verify_area(fs_addr, MMArch::PAGE_SIZE).map_err(|_| SystemError::EPERM)?;
                 arch_info.fsbase = arg2;
                 // 如果是当前进程则直接写入寄存器
                 if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
@@ -97,6 +101,9 @@ impl Syscall {
                 }
             }
             ARCH_SET_GS => {
+                // 验证GS地址是否为有效的用户空间地址
+                let gs_addr = VirtAddr::new(arg2);
+                verify_area(gs_addr, MMArch::PAGE_SIZE).map_err(|_| SystemError::EPERM)?;
                 arch_info.gsbase = arg2;
                 if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
                     unsafe { arch_info.restore_gsbase() }

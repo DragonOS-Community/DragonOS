@@ -10,7 +10,6 @@ use crate::{
     process::pid::PidType,
     sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
-    time::{sleep::nanosleep, Duration},
 };
 
 use super::{
@@ -190,11 +189,15 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     .ok_or(SystemError::ECHILD)
                     .unwrap();
 
-                // wait loop with race-free sequence: prepare -> recheck -> sleep -> finish
+                let parent = ProcessManager::current_pcb();
+
+                // 等待指定子进程：睡眠在父进程自己的 wait_queue 上
+                // 子进程退出时会发送 SIGCHLD 并唤醒父进程的 wait_queue
                 loop {
                     // Fast path: check without sleeping
                     if let Some(r) = do_waitpid(child_pcb.clone(), kwo) {
                         retval = r;
+
                         break 'outer;
                     }
                     if kwo.options.contains(WaitOption::WNOHANG) {
@@ -202,14 +205,16 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         break 'outer;
                     }
 
-                    // Register on child's wait_queue
-                    if let Err(e) = child_pcb.wait_queue.prepare_to_wait_event(true) {
-                        // If cannot sleep (e.g., queue dead), yield briefly and retry
-                        let _ = nanosleep(Duration::from_millis(1).into());
+                    // 睡眠在父进程自己的 wait_queue 上
+                    if let Err(e) = parent.wait_queue.prepare_to_wait_event(true) {
                         if e == SystemError::ERESTARTSYS {
-                            continue;
+                            retval = Err(SystemError::ERESTARTSYS);
+                            break 'outer;
+                        } else if e == SystemError::ECHILD {
+                            // 队列已死亡，不应该发生
+                            retval = Err(SystemError::ECHILD);
+                            break 'outer;
                         } else {
-                            // 对于其他错误（如ESRCH），应该返回错误而不是无限循环
                             retval = Err(e);
                             break 'outer;
                         }
@@ -217,15 +222,17 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
                     // Re-check after registration to avoid lost wakeup
                     if let Some(r) = do_waitpid(child_pcb.clone(), kwo) {
-                        child_pcb.wait_queue.finish_wait();
+                        parent.wait_queue.finish_wait();
+
                         retval = r;
                         break 'outer;
                     }
 
-                    // Sleep until child state changes
+                    // Sleep until child state changes (will be woken by SIGCHLD or wait_queue.wakeup_all)
                     schedule(SchedMode::SM_NONE);
                     // Leave the queue before next iteration
-                    child_pcb.wait_queue.finish_wait();
+                    parent.wait_queue.finish_wait();
+                    // 继续循环，重新检查子进程状态
                 }
             }
             PidConverter::All => {
@@ -394,10 +401,6 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
     }
 
     drop(tmp_child_pcb);
-    ProcessManager::current_pcb()
-        .sched_info
-        .inner_lock_write_irqsave()
-        .set_state(ProcessState::Runnable);
 
     // log::debug!(
     //     "do_wait, kwo.pid: {}, retval = {:?}, kwo: {:?}",

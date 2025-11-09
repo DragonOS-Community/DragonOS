@@ -14,6 +14,7 @@ use alloc::{
     vec::Vec,
 };
 use defer::defer;
+use hashbrown::HashMap;
 use hashbrown::HashSet;
 use ida::IdAllocator;
 use system_error::SystemError;
@@ -37,10 +38,11 @@ use super::{
     allocator::page_frame::{
         deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
-    page::{EntryFlags, Flusher, InactiveFlusher, PageFlushAll},
+    page::{EntryFlags, Flusher, InactiveFlusher, Page, PageFlags, PageFlushAll, PageType},
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
     MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
 };
+use crate::arch::mm::LockedFrameAllocator;
 
 /// MMAP_MIN_ADDR的默认值
 /// 以下内容来自linux-5.19:
@@ -179,10 +181,21 @@ impl InnerAddressSpace {
         // 拷贝空洞
         new_guard.mappings.vm_holes = self.mappings.vm_holes.clone();
 
+        // 先收集所有需要解除映射的 VM_DONTCOPY 的 VMA 的页面范围
+        let mut dontcopy_regions = Vec::new();
+
         for vma in self.mappings.vmas.iter() {
             // TODO: 增加对VMA是否为文件映射的判断，如果是的话，就跳过
 
             let vma_guard: SpinLockGuard<'_, VMA> = vma.lock_irqsave();
+
+            // 检查是否标记为 VM_DONTCOPY (例如通过 MADV_DONTFORK 标记的)
+            if vma_guard.vm_flags().contains(VmFlags::VM_DONTCOPY) {
+                // 收集该 VMA 的页面范围，稍后解除映射
+                dontcopy_regions.push(*vma_guard.region());
+                drop(vma_guard);
+                continue;
+            }
 
             // 仅拷贝VMA信息并添加反向映射，因为UserMapper克隆时已经分配了新的物理页
             let new_vma = LockedVMA::new(vma_guard.clone_info_only());
@@ -202,6 +215,28 @@ impl InnerAddressSpace {
             drop(vma_guard);
             drop(new_vma_guard);
         }
+
+        // 解除所有 VM_DONTCOPY 的 VMA 的页面映射
+        // 这些页面在前面 clone_user_mapping 时被拷贝了，但根据 MADV_DONTFORK 的语义应该被移除
+        if !dontcopy_regions.is_empty() {
+            let new_mapper = &mut new_guard.user_mapper.utable;
+            for region in dontcopy_regions {
+                let start_page = region.start();
+                let end_page = region.end();
+                let mut current_page = start_page;
+
+                while current_page < end_page {
+                    unsafe {
+                        if let Some((_, _, flush)) = new_mapper.unmap_phys(current_page, false) {
+                            // 由于新的mapper还没有在任何cpu上运行，因此不用flush
+                            flush.ignore();
+                        }
+                    }
+                    current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
+                }
+            }
+        }
+
         drop(new_guard);
         drop(irq_guard);
         return Ok(new_addr_space);
@@ -1031,10 +1066,10 @@ impl UserMappings {
             if guard.region.contains(vaddr) {
                 return Some(v.clone());
             }
-            // 选择起始地址不大于 vaddr 的 VMA 中，起始地址最大的一个
-            if guard.region.start <= vaddr
+            // 向下寻找：选择起始地址大于 vaddr 的 VMA 中，起始地址最小的一个（最近的下一个VMA）
+            if guard.region.start > vaddr
                 && if let Some(ref current) = nearest {
-                    guard.region.start > current.lock_irqsave().region.start
+                    guard.region.start < current.lock_irqsave().region.start
                 } else {
                     true
                 }
@@ -1519,6 +1554,8 @@ pub enum Provider {
 #[derive(Debug)]
 pub struct AnonSharedMapping {
     pub id: u64,
+    // Per-page cache keyed by page index within the VMA; store weak to avoid leaking pages
+    pages: SpinLock<HashMap<usize, Weak<Page>>>,
 }
 
 impl AnonSharedMapping {
@@ -1528,7 +1565,32 @@ impl AnonSharedMapping {
     }
 
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { id: Self::new_id() })
+        Arc::new(Self {
+            id: Self::new_id(),
+            pages: SpinLock::new(HashMap::new()),
+        })
+    }
+
+    /// Get or create a shared page for the given offset atomically.
+    /// This prevents the double-allocation race when multiple processes fault the same page.
+    pub fn get_or_create_page(&self, pgoff: usize) -> Result<Arc<Page>, SystemError> {
+        // Fast path: try upgrade an existing weak
+        {
+            let mut guard = self.pages.lock_irqsave();
+            if let Some(weak) = guard.get(&pgoff) {
+                if let Some(p) = weak.upgrade() {
+                    return Ok(p);
+                } else {
+                    guard.remove(&pgoff);
+                }
+            }
+            // Slow path: allocate while holding the map lock to avoid duplicate creations
+            let mut pm = page_manager_lock_irqsave();
+            let mut allocator = LockedFrameAllocator;
+            let page = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
+            guard.insert(pgoff, Arc::downgrade(&page));
+            return Ok(page);
+        }
     }
 }
 

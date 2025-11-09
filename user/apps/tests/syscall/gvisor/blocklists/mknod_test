@@ -1,0 +1,6 @@
+# sys_umask未实现
+MknodTest.RegularFilePermissions
+# symlink未实现
+MknodTest.MknodOnExistingPathFails
+# sys_socket对应功能未实现
+MknodTest.Socket

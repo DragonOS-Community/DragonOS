@@ -442,11 +442,7 @@ impl ProcessManager {
         {
             let pcb = ProcessManager::current_pcb();
             pid = pcb.pid();
-            pcb.sched_info
-                .inner_lock_write_irqsave()
-                .set_state(ProcessState::Exited(exit_code));
             pcb.wait_queue.mark_dead();
-            pcb.wait_queue.wakeup_all(Some(ProcessState::Blocked(true)));
 
             let rq = cpu_rq(smp_get_processor_id().data() as usize);
             let (rq, guard) = rq.self_lock();
@@ -491,7 +487,14 @@ impl ProcessManager {
                 }
             }
             pcb.sig_info_mut().set_tty(None);
+
+            // 在最后，调用 exit_notify 之前，设置状态为 Exited
+            pcb.sched_info
+                .inner_lock_write_irqsave()
+                .set_state(ProcessState::Exited(exit_code));
+
             drop(pcb);
+
             ProcessManager::exit_notify();
         }
 
@@ -1506,8 +1509,8 @@ impl Drop for ProcessControlBlock {
         // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
         self.__exit_signal();
         // 在ProcFS中,解除进程的注册
-        procfs_unregister_pid(self.raw_pid())
-            .unwrap_or_else(|e: SystemError| panic!("procfs_unregister_pid failed: error: {e:?}"));
+        // 这里忽略错误，因为进程可能未注册到procfs
+        procfs_unregister_pid(self.raw_pid()).ok();
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
             ppcb.children
                 .write_irqsave()

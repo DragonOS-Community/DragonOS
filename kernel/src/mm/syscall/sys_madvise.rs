@@ -1,8 +1,9 @@
 //! System call handler for the madvise system call.
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MADVISE, MMArch};
+use crate::libs::align::page_align_up;
 use crate::mm::{
-    syscall::{check_aligned, MadvFlags, PageFrameCount},
+    syscall::{MadvFlags, PageFrameCount},
     ucontext::AddressSpace,
     MemoryManagementArch, VirtPageFrame, {verify_area, VirtAddr},
 };
@@ -23,31 +24,51 @@ impl Syscall for SysMadviseHandle {
     /// ## madvise系统调用
     ///
     /// ## 参数
-    /// - `start_vaddr`：起始地址(已经对齐到页)
-    /// - `len`：长度(已经对齐到页)
+    /// - `start_vaddr`：起始地址(必须页对齐)
+    /// - `len`：长度(不需要页对齐，会自动向上舍入到页边界)
     /// - `madv_flags`：建议标志
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let start_vaddr = VirtAddr::new(Self::start_vaddr(args));
         let len = Self::len(args);
         let madv_flags =
             MadvFlags::from_bits(Self::madv_flags(args) as u64).ok_or(SystemError::EINVAL)?;
-        if Self::start_vaddr(args) & (MMArch::PAGE_SIZE - 1) != 0 {
+
+        // 长度为 0 时直接返回成功
+        if len == 0 {
+            return Ok(0);
+        }
+
+        // 起始地址必须页对齐
+        if !start_vaddr.check_aligned(MMArch::PAGE_SIZE) {
             return Err(SystemError::EINVAL);
         }
 
-        if !start_vaddr.check_aligned(MMArch::PAGE_SIZE) || !check_aligned(len, MMArch::PAGE_SIZE) {
+        // 检查向上舍入到页边界后是否会溢出
+        // page_align_up 的计算方式是 (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+        // 我们需要确保 len + PAGE_SIZE - 1 不会溢出
+        let page_size = MMArch::PAGE_SIZE;
+        if len > usize::MAX - (page_size - 1) {
+            // 向上舍入会导致溢出
             return Err(SystemError::EINVAL);
         }
-        if verify_area(start_vaddr, len).is_err() {
+
+        // 将长度向上舍入到页边界
+        let aligned_len = page_align_up(len);
+
+        // 检查地址范围是否会溢出
+        // 检查 start + aligned_len 是否溢出
+        if start_vaddr.data().checked_add(aligned_len).is_none() {
             return Err(SystemError::EINVAL);
         }
-        if len == 0 {
+
+        // 验证地址范围的有效性
+        if verify_area(start_vaddr, aligned_len).is_err() {
             return Err(SystemError::EINVAL);
         }
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current()?;
         let start_frame = VirtPageFrame::new(start_vaddr);
-        let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
+        let page_count = PageFrameCount::new(aligned_len / MMArch::PAGE_SIZE);
 
         current_address_space
             .write()

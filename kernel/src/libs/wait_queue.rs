@@ -51,7 +51,7 @@ impl WaitQueue {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
         let pcb = ProcessManager::current_pcb();
         if !guard.can_sleep() {
-            return Err(SystemError::ESRCH);
+            return Err(SystemError::ECHILD);
         }
         if Signal::signal_pending_state(interruptible, false, &pcb) {
             return Err(SystemError::ERESTARTSYS);

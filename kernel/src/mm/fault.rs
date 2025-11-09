@@ -236,10 +236,40 @@ impl PageFaultHandler {
     pub unsafe fn do_anonymous_page(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
-        let guard = vma.lock_irqsave();
         let mapper = &mut pfm.mapper;
 
-        if let Some(flush) = mapper.map(address, guard.flags()) {
+        // If this is an anonymous shared mapping, use a shared backing so pages are visible across fork
+        {
+            let guard = vma.lock_irqsave();
+            if guard.vm_flags().contains(VmFlags::VM_SHARED) {
+                let shared = guard.shared_anon.clone();
+                if let Some(shared) = shared {
+                    // compute page index within VMA
+                    let pgoff = (address - guard.region().start()) >> MMArch::PAGE_SHIFT;
+                    drop(guard);
+
+                    // Atomically get or create the shared page to avoid races
+                    let page = match shared.get_or_create_page(pgoff) {
+                        Ok(p) => p,
+                        Err(_) => return VmFaultReason::VM_FAULT_OOM,
+                    };
+
+                    // Map the shared page into current process
+                    let flags = vma.lock_irqsave().flags();
+                    if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
+                        flush.flush();
+                        page.write_irqsave().insert_vma(vma.clone());
+                        return VmFaultReason::VM_FAULT_COMPLETED;
+                    } else {
+                        return VmFaultReason::VM_FAULT_OOM;
+                    }
+                }
+            }
+        }
+
+        // Fallback: private anonymous page (MAP_PRIVATE or non-shared anon)
+        let flags = vma.lock_irqsave().flags();
+        if let Some(flush) = mapper.map(address, flags) {
             flush.flush();
             crate::debug::klog::mm::mm_debug_log(
                 klog_types::AllocatorLogType::LazyAlloc(klog_types::AllocLogItem::new(

@@ -187,7 +187,7 @@ fn do_sys_openat2(
                     inode_begin.clone()
                 } else {
                     inode_begin.lookup_follow_symlink(
-                        parent_path.unwrap_or("/"),
+                        parent_path.unwrap(),
                         VFS_MAX_FOLLOW_SYMLINK_TIMES,
                     )?
                 };

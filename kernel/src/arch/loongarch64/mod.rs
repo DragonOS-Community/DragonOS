@@ -21,6 +21,7 @@ pub mod time;
 
 pub use self::elf::LoongArch64ElfArch as CurrentElfArch;
 pub use self::interrupt::LoongArch64InterruptArch as CurrentIrqArch;
+pub use self::ipc::signal::LoongArch64SigStack as SigStackArch;
 pub use self::ipc::signal::LoongArch64SignalArch as CurrentSignalArch;
 pub use self::mm::LoongArch64MMArch as MMArch;
 pub use self::pci::LoongArch64PciArch as PciArch;

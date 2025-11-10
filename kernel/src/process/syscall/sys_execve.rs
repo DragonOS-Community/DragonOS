@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EXECVE;
-use crate::filesystem::vfs::{IndexNode, MAX_PATHLEN};
+use crate::filesystem::vfs::{IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::mm::page::PAGE_4K_SIZE;
 use crate::mm::{verify_area, VirtAddr};
 use crate::process::execve::do_execve;
@@ -61,20 +61,19 @@ impl SysExecve {
         envp: *const *const u8,
     ) -> Result<(CString, Vec<CString>, Vec<CString>), SystemError> {
         let path: CString = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-        #[cfg(not(feature = "initram"))]
-        let argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
-        #[cfg(feature = "initram")]
         let mut argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
         let envp: Vec<CString> = check_and_clone_cstr_array(envp)?;
 
-        // 这里需要处理符号链接, 目前内核没有完整实现, 这里是个简易的替代
-        // 例如执行/bin/echo, 必须拿到echo这个名字, 目前内核只有硬链接, 会执行/bin/busybox, 导致无法识别命令
-        #[cfg(feature = "initram")]
-        {
-            let real =
-                crate::filesystem::vfs::get_link_true_file(argv[0].to_string_lossy().to_string())
-                    .unwrap();
-            argv[0] = CString::new(real).unwrap();
+        // 这里需要处理符号链接, 应用程序一般不支持嵌套符号链接
+        // 如 test -> echo -> busybox, 需要内核代为解析到 echo, 传入 test 则不会让程序执行 echo 命令
+        let root = ProcessManager::current_mntns().root_inode();
+        if let Ok(real_inode) = root.lookup_follow_symlink2(
+            argv[0].to_string_lossy().as_ref(),
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            false,
+        ) {
+            let real_path = real_inode.absolute_path()?;
+            argv[0] = CString::new(real_path).unwrap();
         }
 
         Ok((path, argv, envp))
@@ -127,7 +126,7 @@ impl Syscall for SysExecve {
         let path = path.into_string().map_err(|_| SystemError::EINVAL)?;
 
         let pwd = ProcessManager::current_pcb().pwd_inode();
-        let inode = pwd.lookup(&path)?;
+        let inode = pwd.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
         Self::execve(inode, path, argv, envp, frame)?;
         return Ok(0);

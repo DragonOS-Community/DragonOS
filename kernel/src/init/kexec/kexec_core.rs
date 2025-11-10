@@ -32,20 +32,18 @@ pub fn do_kexec_load(
         return Ok(0);
     }
 
-    let image = kimage_alloc_init(entry, nr_segments, ksegments, flags).unwrap();
+    let image = kimage_alloc_init(entry, nr_segments, ksegments, flags)?;
 
     // load segment 的解析: https://zhuanlan.zhihu.com/p/105284305
     for i in 0..nr_segments {
-        kimage_load_normal_segment(image.clone(), i);
+        kimage_load_normal_segment(image.clone(), i)?;
     }
 
     kimage_terminate(image.clone());
 
-    KexecArch::init_pgtable(image.clone());
+    KexecArch::init_pgtable(image.clone())?;
 
-    if !KexecArch::machine_kexec_prepare(image.clone()) {
-        return Err(SystemError::EADV);
-    }
+    KexecArch::machine_kexec_prepare(image.clone())?;
 
     unsafe {
         KEXEC_IMAGE = Some(image.clone());
@@ -91,10 +89,10 @@ pub fn kimage_alloc_init(
 
     image.lock().segment[..ksegments.len()].copy_from_slice(ksegments);
 
-    let temp_c = kimage_alloc_pages(image.clone(), 0, false);
+    let temp_c = kimage_alloc_pages(image.clone(), 0, false)?;
     image.lock().control_code_page = temp_c.clone();
 
-    let temp_st = kimage_alloc_pages(image.clone(), 0, true);
+    let temp_st = kimage_alloc_pages(image.clone(), 0, true)?;
     image.lock().stack_page = temp_st.clone();
 
     Ok(image)
@@ -104,7 +102,7 @@ pub fn kimage_alloc_pages(
     kimage: Rc<SpinLock<Kimage>>,
     order: usize,
     store: bool,
-) -> Option<Arc<Page>> {
+) -> Result<Option<Arc<Page>>, SystemError> {
     let mut _page = None;
     let mut extra_pages: Vec<Arc<Page>> = Vec::new();
     let mut alloc = page_manager_lock_irqsave();
@@ -113,13 +111,11 @@ pub fn kimage_alloc_pages(
 
     // 目前只分配一个页面, 后面改成多个, 使用 order 控制
     loop {
-        let p = alloc
-            .create_one_page(
-                PageType::Normal,
-                PageFlags::PG_RESERVED | PageFlags::PG_PRIVATE,
-                &mut LockedFrameAllocator,
-            )
-            .unwrap();
+        let p = alloc.create_one_page(
+            PageType::Normal,
+            PageFlags::PG_RESERVED | PageFlags::PG_PRIVATE,
+            &mut LockedFrameAllocator,
+        )?;
 
         if check_isdst(kimage.clone(), p.clone()) {
             extra_pages.push(p);
@@ -136,7 +132,7 @@ pub fn kimage_alloc_pages(
         alloc.remove_page(&p.phys_address());
     }
 
-    _page
+    Ok(_page)
 }
 
 pub fn check_isdst(kimage: Rc<SpinLock<Kimage>>, page: Arc<Page>) -> bool {
@@ -170,7 +166,10 @@ pub fn kernel_kexec() {
     }
 }
 
-pub fn kimage_add_entry(kimage: Rc<SpinLock<Kimage>>, entry: KimageEntry) {
+pub fn kimage_add_entry(
+    kimage: Rc<SpinLock<Kimage>>,
+    entry: KimageEntry,
+) -> Result<(), SystemError> {
     unsafe {
         if *kimage.lock().entry != 0 {
             let t = kimage.lock().entry.add(1);
@@ -180,7 +179,7 @@ pub fn kimage_add_entry(kimage: Rc<SpinLock<Kimage>>, entry: KimageEntry) {
         let k_entry = kimage.lock().entry;
         let k_last_entry = kimage.lock().last_entry;
         if k_entry == k_last_entry {
-            let page = kimage_alloc_pages(kimage.clone(), 0, true).unwrap();
+            let page = kimage_alloc_pages(kimage.clone(), 0, true)?.unwrap();
 
             let ind_page =
                 MMArch::phys_2_virt(page.phys_address()).unwrap().data() as *mut KimageEntry;
@@ -198,19 +197,26 @@ pub fn kimage_add_entry(kimage: Rc<SpinLock<Kimage>>, entry: KimageEntry) {
         kimage.lock().entry = t;
         *kimage.lock().entry = 0;
     }
+    Ok(())
 }
 
-pub fn kimage_set_destination(kimage: Rc<SpinLock<Kimage>>, destination: usize) {
+pub fn kimage_set_destination(
+    kimage: Rc<SpinLock<Kimage>>,
+    destination: usize,
+) -> Result<(), SystemError> {
     let d = destination & MMArch::PAGE_MASK;
-    kimage_add_entry(kimage.clone(), d | IND_DESTINATION);
+    kimage_add_entry(kimage.clone(), d | IND_DESTINATION)
 }
 
-pub fn kimage_add_page(kimage: Rc<SpinLock<Kimage>>, page: usize) {
+pub fn kimage_add_page(kimage: Rc<SpinLock<Kimage>>, page: usize) -> Result<(), SystemError> {
     let p = page & MMArch::PAGE_MASK;
-    kimage_add_entry(kimage.clone(), p | IND_SOURCE);
+    kimage_add_entry(kimage.clone(), p | IND_SOURCE)
 }
 
-pub fn kimage_load_normal_segment(kimage: Rc<SpinLock<Kimage>>, index: usize) {
+pub fn kimage_load_normal_segment(
+    kimage: Rc<SpinLock<Kimage>>,
+    index: usize,
+) -> Result<(), SystemError> {
     let segment = kimage.lock().segment[index];
 
     let mut maddr = segment.mem;
@@ -218,11 +224,11 @@ pub fn kimage_load_normal_segment(kimage: Rc<SpinLock<Kimage>>, index: usize) {
     let mut buf = unsafe { segment.buffer.buf } as *mut u8;
     let mut ubytes = segment.bufsz;
 
-    kimage_set_destination(kimage.clone(), maddr);
+    kimage_set_destination(kimage.clone(), maddr)?;
 
     loop {
-        let page = kimage_alloc_pages(kimage.clone(), 0, true).unwrap();
-        kimage_add_page(kimage.clone(), page.phys_address().data());
+        let page = (kimage_alloc_pages(kimage.clone(), 0, true)?).unwrap();
+        kimage_add_page(kimage.clone(), page.phys_address().data())?;
 
         let mut virt_data = unsafe { MMArch::phys_2_virt(page.phys_address()).unwrap().data() };
         virt_data += maddr & !(MMArch::PAGE_MASK);
@@ -233,8 +239,8 @@ pub fn kimage_load_normal_segment(kimage: Rc<SpinLock<Kimage>>, index: usize) {
         let uchunk = min(ubytes, mchunk);
 
         if uchunk != 0 {
-            let usegments_buf = UserBufferReader::new::<u8>(buf, uchunk, true).unwrap();
-            let ksegment: &[u8] = usegments_buf.read_from_user(0).unwrap();
+            let usegments_buf = UserBufferReader::new::<u8>(buf, uchunk, true)?;
+            let ksegment: &[u8] = usegments_buf.read_from_user(0)?;
             unsafe { core::ptr::copy(ksegment.as_ptr(), virt_data as *mut u8, uchunk) };
 
             ubytes -= uchunk;
@@ -245,7 +251,7 @@ pub fn kimage_load_normal_segment(kimage: Rc<SpinLock<Kimage>>, index: usize) {
         mbytes -= mchunk as isize;
 
         if mbytes <= 0 {
-            return;
+            return Ok(());
         }
     }
 }

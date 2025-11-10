@@ -6,6 +6,7 @@ use super::{
     file::{File, FileMode},
     syscall::{ModeType, OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
+    vcore::resolve_parent_inode,
     FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{
@@ -183,12 +184,8 @@ fn do_sys_openat2(
             {
                 let (filename, parent_path) = rsplit_path(&path);
                 // 查找父目录
-                let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
-                    inode_begin.clone()
-                } else {
-                    inode_begin
-                        .lookup_follow_symlink(parent_path.unwrap(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
-                };
+                let parent_inode: Arc<dyn IndexNode> =
+                    resolve_parent_inode(inode_begin, parent_path)?;
                 // 创建文件
                 let inode: Arc<dyn IndexNode> = parent_inode.create(
                     filename,

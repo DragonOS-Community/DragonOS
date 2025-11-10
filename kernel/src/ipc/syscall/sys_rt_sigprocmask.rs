@@ -46,9 +46,11 @@ pub(super) fn do_kernel_rt_sigprocmask(
         return Err(SystemError::EINVAL);
     }
 
-    let sighow = SigHow::try_from(how)?;
-
     let oldset_to_return = if let Some(nset) = nset {
+        // 只有当 newset 不为 NULL 时，才验证 how 参数
+        // 根据 POSIX 语义，当 newset 为 NULL 时，how 参数被忽略
+        let sighow = SigHow::try_from(how)?;
+
         let reader = UserBufferReader::new(
             VirtAddr::new(nset).as_ptr::<u64>(),
             core::mem::size_of::<u64>(),

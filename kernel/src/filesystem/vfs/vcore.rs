@@ -234,7 +234,7 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     if filename == "." {
         return Err(SystemError::EINVAL);
     }
-
+   
     let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
         inode_begin.clone()
     } else {
@@ -245,9 +245,9 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
-
     // 在目标点为symlink时也返回ENOTDIR
     let target_inode = parent_inode.find(filename)?;
+
     if target_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
@@ -267,12 +267,13 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     // 分离父路径和文件名
     let (filename, parent_path) = rsplit_path(&remain_path);
+    let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
+        inode_begin.clone()
+    } else {
+        inode_begin
+            .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+    };
 
-    // 查找父目录，需要跟随符号链接
-    let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-
-    // 检查父路径是否为目录
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }

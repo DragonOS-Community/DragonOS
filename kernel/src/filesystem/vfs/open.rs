@@ -173,7 +173,6 @@ fn do_sys_openat2(
     let inode =
         inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_symlink);
 
-    let root_inode = ProcessManager::current_mntns().root_inode();
     let inode: Arc<dyn IndexNode> = match inode {
         Ok(inode) => inode,
         Err(errno) => {
@@ -184,8 +183,14 @@ fn do_sys_openat2(
             {
                 let (filename, parent_path) = rsplit_path(&path);
                 // 查找父目录
-                let parent_inode: Arc<dyn IndexNode> =
-                    root_inode.lookup(parent_path.unwrap_or("/"))?;
+                let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
+                    inode_begin.clone()
+                } else {
+                    inode_begin.lookup_follow_symlink(
+                        parent_path.unwrap_or("/"),
+                        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    )?
+                };
                 // 创建文件
                 let inode: Arc<dyn IndexNode> = parent_inode.create(
                     filename,

@@ -226,6 +226,13 @@ pub fn do_mkdir_at(
 pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     let path = path.trim();
 
+    if path == "/" {
+        return Err(SystemError::EBUSY);
+    }
+    if path == "" {
+        return Err(SystemError::ENOENT);
+    }
+
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
     let (filename, parent_path) = rsplit_path(&remain_path);
@@ -234,7 +241,7 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     if filename == "." {
         return Err(SystemError::EINVAL);
     }
-   
+
     let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
         inode_begin.clone()
     } else {
@@ -261,19 +268,23 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 /// @brief 删除文件
 pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     let path = path.trim();
-
+    if path == "" {
+        return Err(SystemError::ENOENT);
+    }
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
-
+    if remain_path.ends_with('/') {
+        return Err(SystemError::ENOTDIR);
+    }
     // 分离父路径和文件名
     let (filename, parent_path) = rsplit_path(&remain_path);
+
     let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
         inode_begin.clone()
     } else {
         inode_begin
             .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
     };
-
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }

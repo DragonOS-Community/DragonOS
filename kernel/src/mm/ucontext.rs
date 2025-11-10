@@ -17,6 +17,7 @@ use defer::defer;
 use hashbrown::HashMap;
 use hashbrown::HashSet;
 use ida::IdAllocator;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -167,7 +168,7 @@ impl InnerAddressSpace {
         let new_addr_space = AddressSpace::new(false)?;
         let mut new_guard = new_addr_space.write();
 
-        // 拷贝用户栈的结构体信息
+        // 仅拷贝用户栈的结构体信息（元数据），实际的用户栈页面内容会在下面的 VMA 循环中处理
         unsafe {
             new_guard.user_stack = Some(self.user_stack.as_ref().unwrap().clone_info_only());
         }
@@ -213,6 +214,7 @@ impl InnerAddressSpace {
 
             let old_mapper = &mut self.user_mapper.utable;
             let new_mapper = &mut new_guard.user_mapper.utable;
+            let mut page_manager_guard = page_manager_lock_irqsave();
 
             while current_page < end_page {
                 if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
@@ -220,7 +222,13 @@ impl InnerAddressSpace {
                         if is_shared {
                             // 共享映射：直接映射到相同的物理页，不使用COW
                             // 保持原有的flags
-                            let _ = new_mapper.map_phys(current_page, phys_addr, page_flags);
+                            if new_mapper
+                                .map_phys(current_page, phys_addr, page_flags)
+                                .is_none()
+                            {
+                                warn!("Failed to map shared page at {:?} to phys {:?} in child process (current_pid: {:?})",
+                                      current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
+                            }
                         } else {
                             // 私有映射：使用COW机制
                             // 将父进程和子进程的页表项都设置为只读
@@ -234,18 +242,23 @@ impl InnerAddressSpace {
                             }
 
                             // 子进程也映射为只读
-                            let _ = new_mapper.map_phys(current_page, phys_addr, cow_flags);
+                            if new_mapper
+                                .map_phys(current_page, phys_addr, cow_flags)
+                                .is_none()
+                            {
+                                warn!("Failed to map COW page at {:?} to phys {:?} in child process (current_pid: {:?})",
+                                      current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
+                            }
                         }
                         // 为新进程的VMA添加反向映射
-                        let mut page_manager_guard = page_manager_lock_irqsave();
                         if let Some(page) = page_manager_guard.get(&phys_addr) {
                             page.write_irqsave().insert_vma(new_vma.clone());
                         }
-                        drop(page_manager_guard);
                     }
                 }
                 current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
             }
+            drop(page_manager_guard);
 
             drop(vma_guard);
         }

@@ -229,7 +229,7 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     if path == "/" {
         return Err(SystemError::EBUSY);
     }
-    if path == "" {
+    if path.is_empty() {
         return Err(SystemError::ENOENT);
     }
 
@@ -245,8 +245,7 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
         inode_begin.clone()
     } else {
-        inode_begin
-            .lookup_follow_symlink(parent_path.unwrap(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+        inode_begin.lookup_follow_symlink(parent_path.unwrap(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
     };
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
@@ -282,8 +281,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
         inode_begin.clone()
     } else {
-        inode_begin
-            .lookup_follow_symlink(parent_path.unwrap(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+        inode_begin.lookup_follow_symlink(parent_path.unwrap(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
     };
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);

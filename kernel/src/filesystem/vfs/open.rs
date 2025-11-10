@@ -186,10 +186,8 @@ fn do_sys_openat2(
                 let parent_inode: Arc<dyn IndexNode> = if parent_path.is_none() {
                     inode_begin.clone()
                 } else {
-                    inode_begin.lookup_follow_symlink(
-                        parent_path.unwrap(),
-                        VFS_MAX_FOLLOW_SYMLINK_TIMES,
-                    )?
+                    inode_begin
+                        .lookup_follow_symlink(parent_path.unwrap(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
                 };
                 // 创建文件
                 let inode: Arc<dyn IndexNode> = parent_inode.create(

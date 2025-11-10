@@ -18,7 +18,7 @@ jobs:
     name: Integration Test
     runs-on: ubuntu-latest
     container: 
-      image: dragonos/dragonos-dev:v1.14
+      image: dragonos/dragonos-dev:v1.15
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code

@@ -217,7 +217,7 @@ impl BootCallbacks for Mb2Callback {
         Ok(())
     }
 
-    fn early_init_memmap_sysfs(&self) -> Result<(), SystemError> {
+    fn init_memmap_sysfs(&self) -> Result<(), SystemError> {
         // 没测试过, 可能有问题
         crate::mm::sysfs::early_memmap_init();
 

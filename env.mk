@@ -10,5 +10,6 @@ ifeq ($(EMULATOR), )
 export EMULATOR=__NO_EMULATION__
 endif
 
+export INITRAM_PATH?=$(ROOT_PATH)/x86.cpio.xz
 
 export DADK?=$(shell which dadk)

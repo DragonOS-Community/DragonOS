@@ -131,14 +131,32 @@ impl SigContext {
         return true;
     }
 }
+
 /// @brief 信号处理备用栈的信息
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct X86SigStack {
-    pub sp: *mut c_void,
+    pub sp: usize,
     pub flags: u32,
     pub size: u32,
     pub fpstate: FpState,
+}
+
+impl X86SigStack {
+    pub fn new() -> Self {
+        Self {
+            sp: 0,
+            flags: 0,
+            size: 0,
+            fpstate: FpState::new(),
+        }
+    }
+}
+
+impl Default for X86SigStack {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {

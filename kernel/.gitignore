@@ -10,7 +10,3 @@ src/include/bindings/bindings.h
 
 # Build counter
 .build_count
-
-# initram
-initram/*.cpio
-initram/*.cpio.xz

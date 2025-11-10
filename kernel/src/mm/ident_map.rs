@@ -8,6 +8,7 @@ use crate::mm::{
 use core::marker::PhantomData;
 use core::sync::atomic::compiler_fence;
 use core::sync::atomic::Ordering;
+use system_error::SystemError;
 
 /// 恒等页表映射器( paddr == vaddr )
 #[derive(Hash)]
@@ -55,7 +56,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> IdentPageMapper<Arch, F> {
         virt: VirtAddr,
         phys: PhysAddr,
         mut allocator: F,
-    ) -> Option<PageFlush<Arch>> {
+    ) -> Result<Option<PageFlush<Arch>>, SystemError> {
         // 验证虚拟地址和物理地址是否对齐
         if !(virt.check_aligned(Arch::PAGE_SIZE) && phys.check_aligned(Arch::PAGE_SIZE)) {
             log::error!(
@@ -63,7 +64,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> IdentPageMapper<Arch, F> {
                 virt,
                 phys
             );
-            return None;
+            return Err(SystemError::EFAULT);
         }
 
         let virt = VirtAddr::new(virt.data() & (!Arch::PAGE_NEGATIVE_MASK));
@@ -80,7 +81,10 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> IdentPageMapper<Arch, F> {
         let entry = PageEntry::new(phys, flags);
         let mut table = PageTable::new(VirtAddr::new(0), table_paddr, Arch::PAGE_LEVELS - 1);
         loop {
-            let i = table.index_of(virt).unwrap();
+            let i = table.index_of(virt).ok_or_else(|| {
+                log::error!("ident_mapper, map_phys: failed to get index of addr!");
+                SystemError::EINVAL
+            })?;
 
             assert!(i < Arch::PAGE_ENTRY_NUM);
             if table.level() == 0 {
@@ -88,14 +92,17 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> IdentPageMapper<Arch, F> {
 
                 table.set_entry(i, entry);
                 compiler_fence(Ordering::SeqCst);
-                return Some(PageFlush::new(virt));
+                return Ok(Some(PageFlush::new(virt)));
             } else {
                 let next_table = table.next_level_table(i);
                 if let Some(next_table) = next_table {
                     table = next_table;
                 } else {
                     // 分配下一级页表
-                    let frame = allocator.allocate_one().unwrap();
+                    let frame = allocator.allocate_one().ok_or_else(|| {
+                        log::error!("ident_mapper, map_phys: allocate table failed");
+                        SystemError::ENOMEM
+                    })?;
 
                     // 清空这个页帧
                     MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
@@ -106,7 +113,10 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> IdentPageMapper<Arch, F> {
                     table.set_entry(i, PageEntry::new(frame, flags));
 
                     // 获取新分配的页表
-                    table = table.next_level_table(i).unwrap();
+                    table = table.next_level_table(i).ok_or_else(|| {
+                        log::error!("ident_mapper, map_phys: get next_level_table failed");
+                        SystemError::EPERM
+                    })?;
                 }
             }
         }
@@ -119,21 +129,27 @@ pub fn ident_pt_alloc() -> usize {
     new_imapper.paddr().data()
 }
 
-pub fn ident_map_page(table_paddr: usize, virt: usize, phys: usize) {
+pub fn ident_map_page(table_paddr: usize, virt: usize, phys: usize) -> Result<(), SystemError> {
     unsafe {
         IdentPageMapper::<MMArch, LockedFrameAllocator>::map_phys(
             PhysAddr::new(table_paddr),
             VirtAddr::new(virt),
             PhysAddr::new(phys),
             LockedFrameAllocator,
-        )
+        )?
         .unwrap()
         .flush();
     };
+    Ok(())
 }
 
 /// 需要对齐
-pub fn ident_map_pages(table_paddr: usize, virt: usize, phys: usize, nums: usize) {
+pub fn ident_map_pages(
+    table_paddr: usize,
+    virt: usize,
+    phys: usize,
+    nums: usize,
+) -> Result<(), SystemError> {
     for i in 0..nums {
         let virt = virt + i * MMArch::PAGE_SIZE;
         let phys = phys + i * MMArch::PAGE_SIZE;
@@ -143,9 +159,10 @@ pub fn ident_map_pages(table_paddr: usize, virt: usize, phys: usize, nums: usize
                 VirtAddr::new(virt),
                 PhysAddr::new(phys),
                 LockedFrameAllocator,
-            )
+            )?
             .unwrap()
             .flush()
         };
     }
+    Ok(())
 }

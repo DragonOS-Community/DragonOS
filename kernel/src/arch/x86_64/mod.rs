@@ -37,6 +37,8 @@ pub use crate::arch::asm::pio::X86_64PortIOArch as CurrentPortIOArch;
 pub use crate::arch::ipc::signal::X86_64SignalArch as CurrentSignalArch;
 pub use crate::arch::time::X86_64TimeArch as CurrentTimeArch;
 
+pub use crate::arch::ipc::signal::X86SigStack as SigStackArch;
+
 pub use crate::arch::elf::X86_64ElfArch as CurrentElfArch;
 
 pub use crate::arch::smp::X86_64SMPArch as CurrentSMPArch;

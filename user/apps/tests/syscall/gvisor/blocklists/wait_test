@@ -10,7 +10,7 @@ Waiters/WaitAnyChildTest.IgnoredChildRusage/*
 # 缺少 SYS_SCHED_GETPARAM SYS_SCHED_GETSCHEDULER
 Waiters/WaitSpecificChildTest.SiblingChildrenWNOTHREAD/*
 
-Waiters/WaitSpecificChildTest.CloneNoSIGCHLD/*
 Waiters/WaitSpecificChildTest.CloneThread/*
 Waiters/WaitSpecificChildTest.ForkWCLONE/*
+# 缺少 /bin/true
 Waiters/WaitSpecificChildTest.AfterChildExecve/*

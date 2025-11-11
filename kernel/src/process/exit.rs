@@ -1,5 +1,5 @@
 use alloc::sync::{Arc, Weak};
-use core::intrinsics::likely;
+use core::{intrinsics::likely, sync::atomic::Ordering};
 use system_error::SystemError;
 
 use crate::{
@@ -21,6 +21,26 @@ use super::{
 #[inline(always)]
 fn wstatus_to_waitid_status(raw_wstatus: i32) -> i32 {
     (raw_wstatus >> 8) & 0xff
+}
+
+/// 检查子进程的 exit_signal 是否与等待选项匹配
+///
+/// 根据 Linux wait 语义：
+/// - __WALL: 等待所有子进程，忽略 exit_signal
+/// - __WCLONE: 只等待"克隆"子进程（exit_signal != SIGCHLD）
+/// - 默认（无 __WCLONE）: 只等待"正常"子进程（exit_signal == SIGCHLD）
+fn child_matches_wait_options(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) -> bool {
+    // __WALL 匹配所有子进程
+    if options.contains(WaitOption::WALL) {
+        return true;
+    }
+
+    let child_exit_signal = child_pcb.exit_signal.load(Ordering::SeqCst);
+    let is_clone_child = child_exit_signal != Signal::SIGCHLD;
+    let wants_clone = options.contains(WaitOption::WCLONE);
+
+    // 子进程类型必须与等待选项匹配
+    is_clone_child == wants_clone
 }
 
 /// 内核wait4时的参数
@@ -185,20 +205,23 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     return Err(SystemError::ECHILD);
                 }
 
-                // 获取目标进程PCB，如果不存在则返回ECHILD
                 let child_pcb = pid.pid_task(PidType::PID).ok_or(SystemError::ECHILD)?;
 
                 let parent = ProcessManager::current_pcb();
 
-                // 检查是否是当前进程的子进程
-                // 如果指定的PID不是当前进程的子进程，应该返回ECHILD
+                // 检查是否是当前进程的子进程，否则返回ECHILD
                 let is_child = parent.children.read().contains(&child_pcb.raw_pid());
                 if !is_child {
                     return Err(SystemError::ECHILD);
                 }
 
+                // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
+                if !child_matches_wait_options(&child_pcb, kwo.options) {
+                    return Err(SystemError::ECHILD);
+                }
+
                 // 等待指定子进程：睡眠在父进程自己的 wait_queue 上
-                // 子进程退出时会发送 SIGCHLD 并唤醒父进程的 wait_queue
+                // 子进程退出时会发送信号并唤醒父进程的 wait_queue
                 loop {
                     // Fast path: check without sleeping
                     if let Some(r) = do_waitpid(child_pcb.clone(), kwo) {
@@ -259,6 +282,12 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     for pid in rd_childen.iter() {
                         let pcb =
                             ProcessManager::find_task_by_vpid(*pid).ok_or(SystemError::ECHILD)?;
+
+                        // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
+                        if !child_matches_wait_options(&pcb, kwo.options) {
+                            continue;
+                        }
+
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
 
@@ -352,6 +381,11 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     let mut found = false;
                     let mut all_children_exited = true;
                     for pcb in pgid.tasks_iter(PidType::PGID) {
+                        // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
+                        if !child_matches_wait_options(&pcb, kwo.options) {
+                            continue;
+                        }
+
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
 

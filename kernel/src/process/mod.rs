@@ -393,19 +393,23 @@ impl ProcessManager {
             }
             let parent_pcb = r.unwrap();
 
-            let r = crate::ipc::kill::kill_process_by_pcb(parent_pcb.clone(), Signal::SIGCHLD);
-            if let Err(e) = r {
-                warn!(
-                    "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
-                    current.raw_pid(),
-                    parent_pcb.raw_pid(),
-                    e
-                );
+            // 检查子进程的exit_signal，只有在有效时才发送信号
+            let exit_signal = current.exit_signal.load(Ordering::SeqCst);
+            if exit_signal != Signal::INVALID {
+                let r = crate::ipc::kill::kill_process_by_pcb(parent_pcb.clone(), exit_signal);
+                if let Err(e) = r {
+                    warn!(
+                        "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
+                        current.raw_pid(),
+                        parent_pcb.raw_pid(),
+                        e
+                    );
+                }
+                // 额外唤醒：父进程可能阻塞在 wait 系列调用上
+                parent_pcb
+                    .wait_queue
+                    .wakeup_all(Some(ProcessState::Blocked(true)));
             }
-            // 额外唤醒：父进程可能阻塞在 wait 系列调用上
-            parent_pcb
-                .wait_queue
-                .wakeup_all(Some(ProcessState::Blocked(true)));
             // todo: 这里还需要根据线程组的信息，决定信号的发送
         }
     }

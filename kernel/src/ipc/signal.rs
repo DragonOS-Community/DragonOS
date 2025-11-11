@@ -638,14 +638,15 @@ pub fn set_sigprocmask(how: SigHow, set: SigSet) -> Result<SigSet, SystemError> 
 
     match how {
         SigHow::Block => {
-            // debug!("SIG_BLOCK\tGoing to insert is: {}", set.bits());
+            // log::debug!("SIG_BLOCK\tGoing to insert is: {:#x}", set.bits());
             res_set.insert(set);
         }
         SigHow::Unblock => {
+            // log::debug!("SIG_UNBLOCK\tGoing to set is: {:#x}", set.bits());
             res_set.remove(set);
         }
         SigHow::SetMask => {
-            // debug!("SIG_SETMASK\tGoing to set is: {}", set.bits());
+            // log::debug!("SIG_SETMASK\tGoing to set is: {:#x}", set.bits());
             res_set = set;
         }
     }

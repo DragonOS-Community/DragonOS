@@ -108,7 +108,6 @@ fn in_group(metadata: &Metadata, cred: &Arc<Cred>) -> bool {
     cred.groups.iter().any(|gid| gid.data() == metadata.gid)
 }
 
-
 /// 尝试使用 capabilities 覆盖权限拒绝
 ///
 /// 实现 Linux 的 capable_wrt_inode_uidgid() 逻辑：

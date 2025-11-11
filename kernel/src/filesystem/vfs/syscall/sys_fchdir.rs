@@ -5,7 +5,6 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_FCHDIR;
 use crate::filesystem::vfs::permission::check_chdir_permission;
-use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -46,9 +45,6 @@ impl Syscall for SysFchdirHandle {
         let cred = pcb.cred();
         check_chdir_permission(&metadata, &cred)?;
 
-        if metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
         let path = inode.absolute_path()?;
         pcb.basic_mut().set_cwd(path);
         pcb.fs_struct_mut().set_pwd(inode);

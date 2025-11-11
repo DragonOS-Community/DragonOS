@@ -43,6 +43,7 @@ impl Major {
         self.0
     }
     pub const LOOP_MAJOR: Self = Self::new(7);
+    pub const LOOP_CONTROL_MAJOR: Self = Self::new(10);
 }
 
 impl Hash for Major {

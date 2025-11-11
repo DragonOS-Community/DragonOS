@@ -43,21 +43,7 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 const LOOP_BASENAME: &str = "loop";
 const LOOP_CONTROL_BASENAME: &str = "loop-control";
-// // loop device 加密类型
-// pub const LO_CRYPT_NONE: u32 = 0;
-// pub const LO_CRYPT_XOR: u32 = 1;
-// pub const LO_CRYPT_DES: u32 = 2;
-// pub const LO_CRYPT_FISH2: u32 = 3; // Twofish encryption
-// pub const LO_CRYPT_BLOW: u32 = 4;
-// pub const LO_CRYPT_CAST128: u32 = 5;
-// pub const LO_CRYPT_IDEA: u32 = 6;
-// pub const LO_CRYPT_DUMMY: u32 = 9;
-// pub const LO_CRYPT_SKIPJACK: u32 = 10;
-// pub const LO_CRYPT_CRYPTOAPI: u32 = 18;
-// pub const MAX_LO_CRYPT: u32 = 20;
-
-// // IOCTL 命令 - 使用 0x4C ('L')
-#[repr(u32)] // 这一行告诉 Rust 将枚举表示为 u32 类型
+#[repr(u32)]
 #[derive(Debug, FromPrimitive)]
 pub enum LoopIoctl {
     LoopSetFd = 0x4C00,
@@ -89,54 +75,35 @@ pub struct LoopStatus64 {
     pub lo_flags: u32,
     pub __pad: u32,
 }
-//LoopDevice是一个虚拟的块设备，它将文件映射到块设备上.
 pub struct LoopDevice {
-    inner: SpinLock<LoopDeviceInner>, //加锁保护LoopDeviceInner
-    //有主设备次设备号
+    inner: SpinLock<LoopDeviceInner>,
     block_dev_meta: BlockDevMeta,
-    //dev_id: Arc<DeviceId>,
-    locked_kobj_state: LockedKObjectState, //对Kobject状态的锁
-    self_ref: Weak<Self>,                  //对自身的弱引用
-    fs: RwLock<Weak<DevFS>>,               //文件系统弱引用
+    locked_kobj_state: LockedKObjectState,
+    self_ref: Weak<Self>,
+    fs: RwLock<Weak<DevFS>>,
     parent: RwLock<Weak<LockedDevFSInode>>,
 }
 #[derive(Debug, Clone)]
 pub struct LoopPrivateData {
-    //索引号
     pub parms: u32,
 }
-//Inner内数据会改变所以加锁
 pub struct LoopDeviceInner {
-    // 设备名称 Major和Minor
     pub device_number: DeviceNumber,
-    //状态管理
     state: LoopState,
     state_lock: SpinLock<()>,
-    //后端文件相关
-    // 关联的文件节点
     pub file_inode: Option<Arc<dyn IndexNode>>,
-    // 文件大小
     pub file_size: usize,
-    // 数据偏移量
     pub offset: usize,
-    // 数据大小限制（0 表示不限制）
     pub size_limit: usize,
-    // 标志位
     pub flags: u32,
-    // 是否只读
     pub read_only: bool,
-    // KObject的公共数据
     pub kobject_common: KObjectCommonData,
-    // 设备的公共数据
     pub device_common: DeviceCommonData,
-    //工作管理 todo
-    //work_queue: Option<Arc<WorkQueue>>,
 }
 impl LoopDeviceInner {
     fn set_state(&mut self, new_state: LoopState) -> Result<(), SystemError> {
         let _guard = self.state_lock.lock();
 
-        // 状态转换检查
         match (&self.state, &new_state) {
             (LoopState::Unbound, LoopState::Bound) => {}
             (LoopState::Bound, LoopState::Unbound) => {}
@@ -167,12 +134,21 @@ impl Debug for LoopDevice {
 }
 impl LoopDevice {
     fn inner(&'_ self) -> SpinLockGuard<'_, LoopDeviceInner> {
-        // 获取 LoopDeviceInner 的自旋锁
         self.inner.lock()
     }
-    //注册一个新的空loop设备占位
+    /// # 功能
+    ///
+    /// 创建一个未绑定文件的 loop 设备实例。
+    ///
+    /// ## 参数
+    ///
+    /// - `devname`: 设备名称。
+    /// - `minor`: 次设备号。
+    ///
+    /// ## 返回值
+    /// - `Some(Arc<Self>)`: 成功创建的 loop 设备。
+    /// - `None`: 内存不足或创建失败。
     pub fn new_empty_loop_device(devname: DevName, minor: u32) -> Option<Arc<Self>> {
-        // 创建一个空的 LoopDevice
         let dev = Arc::new_cyclic(|self_ref| Self {
             inner: SpinLock::new(LoopDeviceInner {
                 file_inode: None, // 默认的虚拟 inode
@@ -188,8 +164,7 @@ impl LoopDevice {
                 state_lock: SpinLock::new(()),
                 //work_queue: None,
             }),
-            //只用重复8次，就会有从0-7八个次设备号
-            block_dev_meta: BlockDevMeta::new(devname, Major::new(7)), // Loop 设备主设备号为 7
+            block_dev_meta: BlockDevMeta::new(devname, Major::LOOP_MAJOR), // Loop 设备主设备号为 7
             locked_kobj_state: LockedKObjectState::default(),
             self_ref: self_ref.clone(),
             fs: RwLock::new(Weak::default()),
@@ -198,7 +173,17 @@ impl LoopDevice {
         Some(dev)
     }
 
-    /// 设置 loop 设备关联的文件
+    /// # 功能
+    ///
+    /// 为 loop 设备绑定后端文件并重置相关状态。
+    ///
+    /// ## 参数
+    ///
+    /// - `file_inode`: 需要绑定的文件节点。
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 成功绑定文件。
+    /// - `Err(SystemError)`: 绑定失败的错误原因。
     pub fn set_file(&self, file_inode: Arc<dyn IndexNode>) -> Result<(), SystemError> {
         let metadata = file_inode.metadata()?;
         if metadata.size < 0 {
@@ -245,7 +230,18 @@ impl LoopDevice {
     pub fn is_bound(&self) -> bool {
         matches!(self.inner().state, LoopState::Bound)
     }
-
+    /// # 功能
+    ///
+    /// 将文件绑定到 loop 设备并设置访问权限。
+    ///
+    /// ## 参数
+    ///
+    /// - `file_inode`: 需要绑定的文件节点。
+    /// - `read_only`: 是否以只读方式绑定。
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 成功绑定。
+    /// - `Err(SystemError)`: 绑定失败的原因。
     pub fn bind_file(
         &self,
         file_inode: Arc<dyn IndexNode>,
@@ -269,7 +265,17 @@ impl LoopDevice {
         self.recalc_effective_size()?;
         Ok(())
     }
-
+    /// # 功能
+    ///
+    /// 清除 loop 设备的文件绑定并复位状态。
+    ///
+    /// ## 参数
+    ///
+    /// - 无。
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 成功清除。
+    /// - `Err(SystemError)`: 清除过程中的错误。
     pub fn clear_file(&self) -> Result<(), SystemError> {
         let mut inner = self.inner();
         match inner.state {
@@ -286,20 +292,7 @@ impl LoopDevice {
         inner.flags = 0;
         Ok(())
     }
-
-    fn set_status64(&self, user_ptr: usize) -> Result<(), SystemError> {
-        if user_ptr == 0 {
-            return Err(SystemError::EINVAL);
-        }
-
-        let reader = UserBufferReader::new::<LoopStatus64>(
-            user_ptr as *const LoopStatus64,
-            core::mem::size_of::<LoopStatus64>(),
-            true,
-        )?;
-        let mut info = LoopStatus64::default();
-        reader.copy_one_from_user(&mut info, 0)?;
-
+    fn validate_loop_status64_params(info: &LoopStatus64) -> Result<(), SystemError> {
         if info.lo_offset % LBA_SIZE as u64 != 0 {
             return Err(SystemError::EINVAL);
         }
@@ -312,7 +305,31 @@ impl LoopDevice {
         if info.lo_flags & !SUPPORTED_LOOP_FLAGS != 0 {
             return Err(SystemError::EINVAL);
         }
+        Ok(())
+    }
+    /// 设置 loop 设备的状态（64 位版本）。
+    ///
+    /// ## 参数
+    ///
+    /// - `user_ptr`: 用户空间传入的 `LoopStatus64` 结构体指针。
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 状态设置成功。
+    /// - `Err(SystemError::EINVAL)`: 无效的参数或标志位。
+    /// - `Err(SystemError::ENXIO)`: 设备未绑定或已卸载。
+    fn set_status64(&self, user_ptr: usize) -> Result<(), SystemError> {
+        if user_ptr == 0 {
+            return Err(SystemError::EINVAL);
+        }
 
+        let reader = UserBufferReader::new::<LoopStatus64>(
+            user_ptr as *const LoopStatus64,
+            core::mem::size_of::<LoopStatus64>(),
+            true,
+        )?;
+        let mut info = LoopStatus64::default();
+        reader.copy_one_from_user(&mut info, 0)?;
+        Self::validate_loop_status64_params(&info)?;
         let new_offset = info.lo_offset as usize;
         let new_limit = if info.lo_sizelimit == 0 {
             0
@@ -353,7 +370,18 @@ impl LoopDevice {
 
         Ok(())
     }
-
+    /// # 功能
+    ///
+    /// 获取 loop 设备的 LoopStatus64 信息并写回用户态。
+    ///
+    /// ## 参数
+    ///
+    /// - `user_ptr`: 用户态缓冲区地址。
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 信息写回成功。
+    /// - `Err(SystemError)`: 读取状态失败。
+    ///
     fn get_status64(&self, user_ptr: usize) -> Result<(), SystemError> {
         if user_ptr == 0 {
             return Err(SystemError::EINVAL);
@@ -390,6 +418,17 @@ impl LoopDevice {
     fn get_status(&self, user_ptr: usize) -> Result<(), SystemError> {
         self.get_status64(user_ptr)
     }
+    /// # 功能
+    ///
+    /// 将 loop 设备切换到新的文件描述符。
+    ///
+    /// ## 参数
+    ///
+    /// - `new_file_fd`: 新的文件描述符。
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 成功切换。
+    /// - `Err(SystemError)`: 切换失败原因。
     fn change_fd(&self, new_file_fd: i32) -> Result<(), SystemError> {
         let fd_table = ProcessManager::current_pcb().fd_table();
         let file = {
@@ -477,7 +516,6 @@ impl KObject for LoopDevice {
     }
 }
 
-//对loopdevice进行抽象
 impl IndexNode for LoopDevice {
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
         todo!()
@@ -525,10 +563,10 @@ impl IndexNode for LoopDevice {
         };
         let metadata = Metadata {
             dev_id: 0,
-            inode_id: InodeId::new(0), // Loop 设备通常没有实际的 inode ID
+            inode_id: InodeId::new(0),
             size: self.inner().file_size as i64,
             blk_size: LBA_SIZE,
-            blocks: (self.inner().file_size + LBA_SIZE - 1) / LBA_SIZE, // 计算块数
+            blocks: (self.inner().file_size + LBA_SIZE - 1) / LBA_SIZE,
             atime: file_metadata.atime,
             mtime: file_metadata.mtime,
             ctime: file_metadata.ctime,
@@ -536,8 +574,8 @@ impl IndexNode for LoopDevice {
             file_type: crate::filesystem::vfs::FileType::BlockDevice,
             mode: crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o644),
             nlinks: 1,
-            uid: 0, // 默认用户 ID
-            gid: 0, // 默认组 ID
+            uid: 0,
+            gid: 0,
             raw_dev: self.inner().device_number,
         };
         Ok(metadata.clone())
@@ -695,7 +733,6 @@ impl BlockDevice for LoopDevice {
         let blocks = if inner.file_size == 0 {
             0
         } else {
-            //饱和式加法，溢出返回类型最大值
             inner.file_size.saturating_add(LBA_SIZE - 1) / LBA_SIZE
         };
         drop(inner);
@@ -799,12 +836,11 @@ impl BlockDevice for LoopDevice {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        // Loop 设备的同步操作
         Ok(())
     }
 
     fn blk_size_log2(&self) -> u8 {
-        9 // 512 bytes = 2^9
+        9
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -820,7 +856,6 @@ impl BlockDevice for LoopDevice {
     }
 
     fn partitions(&self) -> Vec<Arc<Partition>> {
-        // Loop 设备通常不支持分区
         Vec::new()
     }
 }
@@ -859,33 +894,39 @@ impl LoopDeviceDriver {
     fn inner(&'_ self) -> SpinLockGuard<'_, InnerLoopDeviceDriver> {
         self.inner.lock()
     }
+    /// # 功能
+    ///
+    /// 创建并注册指定次设备号的 loop 设备。
+    ///
+    /// ## 参数
+    ///
+    /// - `minor`: 目标次设备号。
+    ///
+    /// ## 返回值
+    /// - `Ok(Arc<LoopDevice>)`: 成功创建并注册的设备。
+    /// - `Err(SystemError)`: 创建或注册失败原因。
     fn new_loop_device(&self, minor: usize) -> Result<Arc<LoopDevice>, SystemError> {
         let devname = DevName::new(format!("{}{}", LOOP_BASENAME, minor), minor);
         let loop_dev = LoopDevice::new_empty_loop_device(devname.clone(), minor as u32)
             .ok_or_else(|| {
                 error!("Failed to create loop device for minor {}", minor);
-                SystemError::ENOMEM // 如果创建失败，返回具体的错误
+                SystemError::ENOMEM
             })?;
         log::info!(
             "Registering loop device: {}",
             loop_dev.block_dev_meta.devname
         );
-        // 先注册到块设备管理器，让它可用
         block_dev_manager().register(loop_dev.clone())?;
-
-        // 返回创建的设备，让 LoopManager 能够存储它
         Ok(loop_dev)
     }
 }
-//初始化函数，注册1个loopcontrol设备和8个loop设备备用
 use crate::init::initcall::INITCALL_DEVICE;
 #[unified_init(INITCALL_DEVICE)]
 pub fn loop_init() -> Result<(), SystemError> {
     let loop_mgr = Arc::new(LoopManager::new());
-    // 获取 LoopDeviceDriver 的单例并调用初始化函数
     let driver = LoopDeviceDriver::new();
     let loop_ctl = LoopControlDevice::new(loop_mgr.clone());
-    //注册loop_control设备
+
     device_register(loop_ctl.clone())?;
     log::info!("Loop control device registered.");
     devfs_register(LOOP_CONTROL_BASENAME, loop_ctl.clone())?;
@@ -986,8 +1027,8 @@ pub struct LoopManagerInner {
     next_free_minor: u32,
 }
 impl LoopManager {
-    const MAX_DEVICES: usize = 256; // 支持的最大 loop 设备数量
-    const MAX_INIT_DEVICES: usize = 8; //初始化loop设备数量
+    const MAX_DEVICES: usize = 256;
+    const MAX_INIT_DEVICES: usize = 8;
     pub fn new() -> Self {
         Self {
             inner: SpinLock::new(LoopManagerInner {
@@ -1002,6 +1043,17 @@ impl LoopManager {
     /*
     请求队列，工作队列未实现
      */
+    /// # 功能
+    ///
+    /// 根据请求的次设备号分配或复用 loop 设备。
+    ///
+    /// ## 参数
+    ///
+    /// - `requested_minor`: 指定的次设备号，`None` 表示自动分配。
+    ///
+    /// ## 返回值
+    /// - `Ok(Arc<LoopDevice>)`: 成功获得的设备。
+    /// - `Err(SystemError)`: 无可用设备或参数错误。
     pub fn loop_add(&self, requested_minor: Option<u32>) -> Result<Arc<LoopDevice>, SystemError> {
         let mut inner = self.inner();
         match requested_minor {
@@ -1009,6 +1061,18 @@ impl LoopManager {
             None => self.loop_add_first_available_locked(&mut inner),
         }
     }
+    /// # 功能
+    ///
+    /// 在锁作用域内分配指定次设备号的 loop 设备。
+    ///
+    /// ## 参数
+    ///
+    /// - `inner`: 管理器内部状态锁。
+    /// - `minor`: 目标次设备号。
+    ///
+    /// ## 返回值
+    /// - `Ok(Arc<LoopDevice>)`: 成功获得的设备实例。
+    /// - `Err(SystemError)`: 参数无效或设备已被占用。
     fn loop_add_specific_locked(
         &self,
         inner: &mut LoopManagerInner,
@@ -1230,9 +1294,9 @@ impl IndexNode for LoopControlDevice {
             file_type: FileType::CharDevice,           // 字符设备类型
             mode: ModeType::from_bits_truncate(0o600), // 读写权限，仅owner可访问
             nlinks: 1,
-            uid: 0,                                          // root用户
-            gid: 0,                                          // root组
-            raw_dev: DeviceNumber::new(Major::new(10), 237), // loop-control设备号通常是(10, 237)
+            uid: 0,                                                     // root用户
+            gid: 0,                                                     // root组
+            raw_dev: DeviceNumber::new(Major::LOOP_CONTROL_MAJOR, 237), // loop-control设备号通常是(10, 237)
         };
         Ok(metadata)
     }

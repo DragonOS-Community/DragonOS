@@ -1,6 +1,7 @@
 //! This file contains functions for kernel-space access to user-space data
 
 use core::{
+    cmp::min,
     mem::size_of,
     num::NonZero,
     slice::{from_raw_parts, from_raw_parts_mut},
@@ -704,4 +705,50 @@ fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: boo
     drop(guard);
 
     return true;
+}
+
+/// Compute the contiguous accessible length starting at `addr`.
+///
+/// Returns the number of bytes that can be accessed before hitting an unmapped
+/// page or a page that lacks the requested permissions.
+pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> usize {
+    if size == 0 || addr.is_null() {
+        return 0;
+    }
+
+    let vm = match ProcessManager::current_pcb().basic().user_vm() {
+        Some(vm) => vm,
+        None => return 0,
+    };
+
+    let guard = vm.read_irqsave();
+    let mapper = &guard.user_mapper.utable;
+
+    let page_mask = MMArch::PAGE_SIZE - 1;
+    let mut checked = 0usize;
+    let mut current = addr;
+
+    while checked < size {
+        let Some((_phys, flags)) = mapper.translate(current) else {
+            break;
+        };
+
+        if !flags.has_user() {
+            break;
+        }
+        if check_write && !flags.has_write() {
+            break;
+        }
+
+        let offset = current.data() & page_mask;
+        let step = min(MMArch::PAGE_SIZE - offset, size - checked);
+        checked += step;
+
+        let Some(next) = current.data().checked_add(step) else {
+            break;
+        };
+        current = VirtAddr::new(next);
+    }
+
+    checked
 }

@@ -167,8 +167,8 @@ impl SysFcntlHandle {
                 let pb = if pid == 0 {
                     None
                 } else {
-                    let pb =
-                        ProcessManager::find(RawPid::from(pid as _)).ok_or(SystemError::ESRCH)?;
+                    let pb = ProcessManager::find_task_by_vpid(RawPid::from(pid as _))
+                        .ok_or(SystemError::ESRCH)?;
                     Some(pb)
                 };
                 let binding = ProcessManager::current_pcb().fd_table();

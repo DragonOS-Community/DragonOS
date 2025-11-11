@@ -333,7 +333,14 @@ impl ProcessManager {
             *trap_frame_ptr = child_trapframe;
         }
 
-        let current_arch_guard = current_pcb.arch_info_irqsave();
+        // 获取并拷贝父进程的架构信息
+        // 注意：需要使用mut guard以便保存FP状态
+        let mut current_arch_guard = current_pcb.arch_info_irqsave();
+
+        // 在拷贝FP状态之前，先从硬件寄存器保存当前的FP状态
+        // 这样确保即使在信号处理函数中fork，子进程也能继承fork时刻的真实FP寄存器状态
+        current_arch_guard.save_fp_state();
+
         new_arch_guard.fsbase = current_arch_guard.fsbase;
         new_arch_guard.gsbase = current_arch_guard.gsbase;
         new_arch_guard.fs = current_arch_guard.fs;

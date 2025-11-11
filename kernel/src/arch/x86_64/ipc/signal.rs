@@ -103,10 +103,18 @@ impl SigContext {
         // context.trap_num = unsafe { (*current_thread).trap_num };
         // context.err_code = unsafe { (*current_thread).err_code };
         // context.cr2 = unsafe { (*current_thread).cr2 };
+
+        // 先保存当前硬件寄存器的FP状态到PCB
+        // 确保能够正确保存用户设置的FP状态
+        archinfo_guard.save_fp_state();
         self.reserved_for_x87_state = *archinfo_guard.fp_state();
 
-        // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
+        // 根据Linux语义，在进入信号处理函数之前，应该加载一个"干净"的FP环境
+        // 这样信号处理函数在一个标准的FP状态下执行（mxcsr=0x1f80等）
+        // 同时，PCB中保留的是默认FP状态，以便在信号处理函数中fork时，
+        // 子进程继承的是标准的FP环境（而不是被用户修改的非标准状态）
         archinfo_guard.clear_fp_state();
+
         return Ok(0);
     }
 

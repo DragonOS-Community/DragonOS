@@ -45,7 +45,7 @@ impl Syscall for SysWriteVHandle {
 
         // IoVecs会进行用户态检验
         let iovecs = unsafe { IoVecs::from_user(iov, count, false) }?;
-        let data = iovecs.gather();
+        let data = iovecs.gather()?;
         do_write(fd, &data)
     }
 

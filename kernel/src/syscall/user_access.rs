@@ -1,6 +1,7 @@
 //! This file contains functions for kernel-space access to user-space data
 
 use core::{
+    cmp::min,
     mem::size_of,
     num::NonZero,
     slice::{from_raw_parts, from_raw_parts_mut},
@@ -12,7 +13,7 @@ use defer::defer;
 
 use crate::{
     arch::MMArch,
-    mm::{verify_area, MemoryManagementArch, VirtAddr},
+    mm::{verify_area, MemoryManagementArch, VirtAddr, VmFlags},
     process::ProcessManager,
 };
 
@@ -918,4 +919,109 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
         0 => Ok(len),
         _ => Err(SystemError::EFAULT),
     }
+}
+
+/// Compute the contiguous accessible length starting at `addr`.
+///
+/// Returns the number of bytes that can be accessed before hitting an unmapped
+/// page or a page that lacks the requested permissions.
+pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> usize {
+    // log::error!(
+    //     "user_accessible_len(addr: {:?}, size:{:?}, check_write:{:?}",
+    //     addr,
+    //     size,
+    //     check_write
+    // );
+    if size == 0 || addr.is_null() {
+        return 0;
+    }
+
+    // 获取当前进程的 VMA （可访问的地址空间）
+    let vm = match ProcessManager::current_pcb().basic().user_vm() {
+        Some(vm) => vm,
+        None => return 0,
+    };
+
+    let vma_read_guard = vm.read_irqsave();
+    let mappings = &vma_read_guard.mappings;
+
+    let mut checked = 0usize;
+    let mut current = addr;
+
+    while checked < size {
+        // 判断当前地址是否落在一个有效 VMA 中
+        let Some(vma) = mappings.contains(current) else {
+            break;
+        };
+
+        // 获取地址所在内存页的起始地址 和结束地址，以及访问权限标志 和文件后备长度
+        let (region_start, region_end, vm_flags, file_backed_len) = {
+            let guard = vma.lock_irqsave();
+            let region_start = guard.region().start().data();
+            let region_end = guard.region().end().data();
+            let vm_flags = *guard.vm_flags();
+            let vma_size = region_end.saturating_sub(region_start);
+
+            let file_backed_len = guard.vm_file().and_then(|file| {
+                let file_offset_pages = guard.file_page_offset().unwrap_or(0);
+                let file_offset_bytes = file_offset_pages.saturating_mul(MMArch::PAGE_SIZE);
+                let file_size = match file.metadata() {
+                    Ok(md) if md.size > 0 => {
+                        let capped = core::cmp::min(md.size as u128, usize::MAX as u128);
+                        capped as usize
+                    }
+                    Ok(_) => 0,
+                    Err(_) => return None,
+                };
+
+                let backed = file_size.saturating_sub(file_offset_bytes);
+                Some(core::cmp::min(backed, vma_size))
+            });
+
+            (region_start, region_end, vm_flags, file_backed_len)
+        };
+
+        // 根据 vm_flags 判断是否具备访问权限
+        let has_permission = if check_write {
+            vm_flags.contains(VmFlags::VM_WRITE)
+        } else {
+            vm_flags.contains(VmFlags::VM_READ)
+        };
+
+        if !has_permission {
+            break;
+        }
+
+        let current_addr = current.data();
+        let mut available = region_end.saturating_sub(current_addr);
+
+        if let Some(backed_len) = file_backed_len {
+            let offset_in_vma = current_addr.saturating_sub(region_start);
+            let backed_available = backed_len.saturating_sub(offset_in_vma);
+            // Clamp to the range actually backed by the file to avoid walking into holes.
+            available = min(available, backed_available);
+        }
+        if available == 0 {
+            break;
+        }
+
+        // 这里的 `step` 要区分两种情况
+        // - 第一种情况：`available`（当前 VMA 剩余长度）已经覆盖了 `size - checked`，说明
+        //   本次检查的剩余数据全部落在这个 VMA 内，`step` 直接等于 `size - checked`。
+        // - 第二种情况：`available` 比 `size - checked` 小，意味着我们会在这个 VMA 的末尾停下，
+        //   需要等下一次循环再确认后续地址是否仍有 VMA 覆盖。
+        // - 例如 (addr = 0x1, size = 10)，若某个 VMA 只覆盖 [0x0, 0x5)，则第一轮只能推进 4 个字节，
+        //   后续是否继续完全取决于下一个 VMA 是否与 0x5 处相接且具有相同访问权限。
+        //   若下一轮 VMA 覆盖 [0x5, 0xf)，虽然这块 VMA 可访问空间 available == 10 ,但是我们需要检查的部分就只剩 10 - 4 = 6 bytes。
+        //   所以 `step` 选择为  size - checked
+        let step = min(available, size - checked);
+        checked += step;
+
+        let Some(next) = current_addr.checked_add(step) else {
+            break;
+        };
+        current = VirtAddr::new(next);
+    }
+
+    checked
 }

@@ -26,7 +26,7 @@ fpsig_fork_test
 fpsig_mut_test
 fpsig_nested_test
 #exec_test
-#wait_test
+wait_test
 futex_test
 
 # 内存管理测试

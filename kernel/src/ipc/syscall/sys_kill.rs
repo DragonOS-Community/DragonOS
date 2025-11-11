@@ -73,6 +73,76 @@ impl PidConverter {
     }
 }
 
+/// Check if the current process has permission to send a signal to the target process.
+///
+/// # Arguments
+/// * `target_pid` - The PID of the target process
+///
+/// # Returns
+/// * `Ok(())` - Permission check passed
+/// * `Err(SystemError::ESRCH)` - Target process does not exist
+/// * `Err(SystemError::EPERM)` - Permission denied
+///
+/// # POSIX Requirements
+/// The permission check follows POSIX requirements:
+/// - Root (euid == 0) can signal any process
+/// - Sender's real or effective UID must match target's real or saved set-user-ID
+fn check_signal_permission(target_pid: RawPid) -> Result<(), SystemError> {
+    let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
+
+    let current_pcb = ProcessManager::current_pcb();
+    let current_cred = current_pcb.cred();
+    let target_cred = target.cred();
+
+    // Root can signal any process
+    if current_cred.euid.data() == 0 {
+        return Ok(());
+    }
+
+    // Check if sender's UID matches target's UID or saved UID
+    if current_cred.euid == target_cred.uid
+        || current_cred.euid == target_cred.suid
+        || current_cred.uid == target_cred.uid
+        || current_cred.uid == target_cred.suid
+    {
+        return Ok(());
+    }
+
+    Err(SystemError::EPERM)
+}
+
+/// Handle signal 0 (null signal) which is used to check process existence and permissions.
+///
+/// According to POSIX, if sig is 0, no signal is sent, but error checking is still performed.
+/// See: https://pubs.opengroup.org/onlinepubs/9699919799/functions/kill.html
+///
+/// # Arguments
+/// * `converter` - The PID converter indicating the target (process, group, or all)
+///
+/// # Returns
+/// * `Ok(0)` - Target exists and permission check passed
+/// * `Err(SystemError::ESRCH)` - Target does not exist
+/// * `Err(SystemError::EPERM)` - Permission denied
+fn handle_null_signal(converter: &PidConverter) -> Result<usize, SystemError> {
+    match converter {
+        PidConverter::Pid(pid) => {
+            // Check existence and permissions for a specific process
+            check_signal_permission(pid.pid_vnr())?;
+            Ok(0)
+        }
+        PidConverter::Pgid(pgid) => {
+            // For process groups, verify the group exists
+            // A more complete implementation could check all processes in the group
+            pgid.as_ref().ok_or(SystemError::ESRCH)?;
+            Ok(0)
+        }
+        PidConverter::All => {
+            // Signal 0 to all processes: just verify the syscall is valid
+            Ok(0)
+        }
+    }
+}
+
 pub struct SysKillHandle;
 
 impl SysKillHandle {
@@ -97,6 +167,11 @@ impl Syscall for SysKillHandle {
         let sig_c_int = Self::sig(args);
 
         let converter = PidConverter::from_id(id).ok_or(SystemError::ESRCH)?;
+
+        // Handle null signal (signal 0) - used for existence and permission checks
+        if sig_c_int == 0 {
+            return handle_null_signal(&converter);
+        }
 
         let sig = Signal::from(sig_c_int);
         if sig == Signal::INVALID {

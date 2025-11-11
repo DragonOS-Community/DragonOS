@@ -168,13 +168,10 @@ impl BlockDevManager {
     /// 卸载磁盘设备
     #[allow(dead_code)]
     pub fn unregister(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
-        {
             let mut inner = self.inner();
             if inner.disks.remove(dev.dev_name()).is_none() {
                 return Err(SystemError::ENOENT);
             }
-        }
-
         let blk_meta = dev.blkdev_meta();
         let gendisks = {
             let mut meta_inner = blk_meta.inner();
@@ -182,15 +179,12 @@ impl BlockDevManager {
             meta_inner.gendisks.clear();
             disks
         };
-
         for gendisk in gendisks {
             let dname = gendisk.dname()?;
             devfs_unregister(dname.as_ref(), gendisk)?;
         }
-
         Ok(())
     }
-
     /// 通过路径查找gendisk
     ///
     /// # 参数

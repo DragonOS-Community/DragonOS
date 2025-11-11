@@ -13,5 +13,4 @@ Waiters/WaitSpecificChildTest.SiblingChildrenWNOTHREAD/*
 Waiters/WaitSpecificChildTest.CloneNoSIGCHLD/*
 Waiters/WaitSpecificChildTest.CloneThread/*
 Waiters/WaitSpecificChildTest.ForkWCLONE/*
-Waiters/WaitSpecificChildTest.BadChild/*
 Waiters/WaitSpecificChildTest.AfterChildExecve/*

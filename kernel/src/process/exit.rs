@@ -61,7 +61,7 @@ pub fn kernel_wait4(
     options: WaitOption,
     rusage_buf: Option<&mut RUsage>,
 ) -> Result<usize, SystemError> {
-    let converter = PidConverter::from_id(pid).ok_or(SystemError::ESRCH)?;
+    let converter = PidConverter::from_id(pid).ok_or(SystemError::ECHILD)?;
 
     // 构造参数
     let mut kwo = KernelWaitOption::new(converter, options);
@@ -184,12 +184,18 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 if pid.pid_vnr().data() == ProcessManager::current_pcb().raw_tgid().data() {
                     return Err(SystemError::ECHILD);
                 }
-                let child_pcb = pid
-                    .pid_task(PidType::PID)
-                    .ok_or(SystemError::ECHILD)
-                    .unwrap();
+
+                // 获取目标进程PCB，如果不存在则返回ECHILD
+                let child_pcb = pid.pid_task(PidType::PID).ok_or(SystemError::ECHILD)?;
 
                 let parent = ProcessManager::current_pcb();
+
+                // 检查是否是当前进程的子进程
+                // 如果指定的PID不是当前进程的子进程，应该返回ECHILD
+                let is_child = parent.children.read().contains(&child_pcb.raw_pid());
+                if !is_child {
+                    return Err(SystemError::ECHILD);
+                }
 
                 // 等待指定子进程：睡眠在父进程自己的 wait_queue 上
                 // 子进程退出时会发送 SIGCHLD 并唤醒父进程的 wait_queue

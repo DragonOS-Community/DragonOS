@@ -524,6 +524,11 @@ impl ProcessManager {
         // 继承 rlimit
         pcb.inherit_rlimits_from(current_pcb);
 
+        // 继承 executable_path
+        // 修复：fork时需要复制父进程的可执行文件路径，而不是使用进程名
+        // 这样才能正确支持通过/proc/self/exe重新执行程序
+        pcb.set_execute_path(current_pcb.execute_path());
+
         // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {

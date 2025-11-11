@@ -845,7 +845,13 @@ impl dyn IndexNode {
                 let link_path = String::from(
                     ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
                 );
-                let new_path = link_path + "/" + &rest_path;
+
+                // 拼接路径时，如果rest_path为空，则不添加斜杠
+                let new_path = if rest_path.is_empty() {
+                    link_path
+                } else {
+                    link_path + "/" + &rest_path
+                };
 
                 // 继续查找符号链接
                 return result.lookup_follow_symlink2(

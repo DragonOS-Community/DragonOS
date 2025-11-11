@@ -1,2 +1,0 @@
-VforkTest.ParentStopsUntilChildExecves
-VforkTest.ExecedChildExitDoesntUnstopParent

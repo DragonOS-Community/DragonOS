@@ -128,7 +128,11 @@ impl Syscall for SysExecve {
         let pwd = ProcessManager::current_pcb().pwd_inode();
         let inode = pwd.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-        Self::execve(inode, path, argv, envp, frame)?;
+        // 获取inode的绝对路径，而不是使用用户传入的原始路径
+        // 这样可以正确处理符号链接（如/proc/self/exe）
+        let resolved_path = inode.absolute_path().unwrap_or(path.clone());
+
+        Self::execve(inode, resolved_path, argv, envp, frame)?;
         return Ok(0);
     }
 

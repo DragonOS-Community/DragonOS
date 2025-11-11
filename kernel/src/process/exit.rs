@@ -248,11 +248,19 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         break;
                     }
                     let mut found = false;
+                    // 标记是否所有子进程都已退出（僵尸状态，不会再改变）
+                    let mut all_children_exited = true;
                     for pid in rd_childen.iter() {
                         let pcb =
                             ProcessManager::find_task_by_vpid(*pid).ok_or(SystemError::ECHILD)?;
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
+
+                        // 如果有子进程不是 Exited 状态，则标记为 false
+                        if !state.is_exited() {
+                            all_children_exited = false;
+                        }
+
                         if matches!(state, ProcessState::Stopped)
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
@@ -283,7 +291,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             }
                             retval = Ok((*pid).into());
                             found = true;
-                        } else if state.is_exited() {
+                        } else if state.is_exited() && kwo.options.contains(WaitOption::WEXITED) {
                             let raw = state.exit_code().unwrap() as i32;
                             kwo.ret_status = raw;
                             let status8 = wstatus_to_waitid_status(raw);
@@ -315,6 +323,15 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         retval = Ok(0);
                         break 'outer;
                     }
+
+                    // 关键修复：如果所有子进程都已退出（僵尸状态），且没有请求 WEXITED
+                    // 那么永远不会有匹配的事件发生，应该立即返回 ECHILD 而不是继续等待
+                    if all_children_exited && !kwo.options.contains(WaitOption::WEXITED) {
+                        parent.wait_queue.finish_wait();
+                        retval = Err(SystemError::ECHILD);
+                        break 'outer; // 直接退出到外层循环，绕过 notask! 宏
+                    }
+
                     // 无事件，睡眠
                     schedule(SchedMode::SM_NONE);
                     parent.wait_queue.finish_wait();
@@ -327,9 +344,15 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     let _ = parent.wait_queue.prepare_to_wait_event(true);
 
                     let mut found = false;
+                    let mut all_children_exited = true;
                     for pcb in pgid.tasks_iter(PidType::PGID) {
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
+
+                        if !state.is_exited() {
+                            all_children_exited = false;
+                        }
+
                         if matches!(state, ProcessState::Stopped)
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
@@ -359,7 +382,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             }
                             retval = Ok(pcb.task_pid_vnr().into());
                             found = true;
-                        } else if state.is_exited() {
+                        } else if state.is_exited() && kwo.options.contains(WaitOption::WEXITED) {
                             let raw = state.exit_code().unwrap() as i32;
                             kwo.ret_status = raw;
                             let status8 = wstatus_to_waitid_status(raw);
@@ -390,6 +413,15 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         retval = Ok(0);
                         break 'outer;
                     }
+
+                    // 关键修复：如果进程组中所有进程都已退出，且没有请求 WEXITED
+                    // 那么永远不会有匹配的事件发生，应该立即返回 ECHILD
+                    if all_children_exited && !kwo.options.contains(WaitOption::WEXITED) {
+                        parent.wait_queue.finish_wait();
+                        retval = Err(SystemError::ECHILD);
+                        break 'outer;
+                    }
+
                     schedule(SchedMode::SM_NONE);
                     parent.wait_queue.finish_wait();
                 }

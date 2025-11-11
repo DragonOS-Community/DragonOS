@@ -13,8 +13,6 @@ impl ArchBootParams {
 
     pub fn set_scratch(&mut self, _scratch: u32) {}
 
-    pub fn add_e820_entry(&mut self, _addr: u64, _size: u64, _mtype: u32) {}
-
     pub fn init_setupheader(&mut self) {}
 
     pub fn convert_to_buf(&self) -> &[u8] {

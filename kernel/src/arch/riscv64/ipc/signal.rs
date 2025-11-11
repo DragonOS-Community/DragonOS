@@ -40,3 +40,28 @@ bitflags! {
     }
 
 }
+
+/// @brief 信号处理备用栈的信息
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct RiscV64SigStack {
+    pub sp: usize,
+    pub flags: u32,
+    pub size: u32,
+}
+
+impl RiscV64SigStack {
+    pub fn new() -> Self {
+        Self {
+            sp: 0,
+            flags: 0,
+            size: 0,
+        }
+    }
+}
+
+impl Default for RiscV64SigStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -6,6 +6,7 @@ use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::process::ProcessManager;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use log::warn;
 use system_error::SystemError;
 
 use super::namespace::pid_namespace::PidNamespace;
@@ -353,9 +354,18 @@ pub(super) fn free_pid(pid: Arc<Pid>) {
     // let raw_pid = pid.pid_vnr().data();
     let mut level = 0;
     while level <= pid.level {
-        let upid = pid.numbers.lock()[level as usize]
-            .take()
-            .expect("pid numbers should not be empty");
+        let upid = match pid.numbers.lock()[level as usize].take() {
+            Some(upid) => upid,
+            None => {
+                // PID numbers 已经被释放过了,这可能发生在进程被多次detach的场景
+                // 虽然理论上不应该发生,但为了防御性编程,我们在这里直接返回
+                warn!(
+                    "PID numbers at level {} already freed, skipping remaining levels",
+                    level
+                );
+                return;
+            }
+        };
         // log::debug!(
         //     "Freeing pid: raw:{}, upid.nr:{}, level: {}",
         //     raw_pid,

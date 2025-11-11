@@ -313,7 +313,7 @@ fn memmap_sysfs_init() -> Result<(), SystemError> {
         .init_memmap_bp()
         .expect("init bp memmap failed");
     boot_callbacks()
-        .early_init_memmap_sysfs()
+        .init_memmap_sysfs()
         .expect("init sysfs memmap failed");
 
     let memmap_kobj = CommonKobj::new("memmap".to_string());

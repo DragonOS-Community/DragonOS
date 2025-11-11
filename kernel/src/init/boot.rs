@@ -173,7 +173,7 @@ pub trait BootCallbacks: Send + Sync {
     /// 初始化内存块
     fn early_init_memory_blocks(&self) -> Result<(), SystemError>;
     /// 初始化内存 memmap 信息到 sysfs
-    fn early_init_memmap_sysfs(&self) -> Result<(), SystemError>;
+    fn init_memmap_sysfs(&self) -> Result<(), SystemError>;
     /// 初始化内存 memmap 信息到 boot_params
     fn init_memmap_bp(&self) -> Result<(), SystemError>;
 }

@@ -50,7 +50,7 @@ impl Syscall for SysPidfdSendSignalHandle {
             .fd_table()
             .read()
             .get_file_by_fd(pidfd)
-            .unwrap();
+            .ok_or(SystemError::EBADF)?;
         if file.private_data.lock().is_pid() {
             pid = file.private_data.lock().get_pid();
         }

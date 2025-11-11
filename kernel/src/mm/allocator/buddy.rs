@@ -225,12 +225,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     ///
     /// - `order` - 伙伴块的阶数
     fn pop_front(&mut self, order: u8) -> Option<PhysAddr> {
-        let mut alloc_in_specific_order = |spec_order: u8| {
+        let alloc_in_specific_order = |spec_order: u8| {
             // 先尝试在order阶的“空闲链表”的开头位置分配一个伙伴块
             let mut page_list_addr = self.free_area[Self::order2index(spec_order)];
             let mut page_list: PageList<A> = Self::read_page(page_list_addr);
 
-            // 循环删除头部的空闲链表页
+            // 循环跳过头部的空闲链表页（不删除它们，避免在buddy_free过程中触发buddy_alloc导致递归死锁）
             while page_list.entry_num == 0 {
                 let next_page_list_addr = page_list.next_page;
                 // 找完了，都是空的
@@ -238,19 +238,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     return None;
                 }
 
-                if !next_page_list_addr.is_null() {
-                    // 此时page_list已经没有空闲伙伴块了，又因为非唯一页，需要删除该page_list
-                    self.free_area[Self::order2index(spec_order)] = next_page_list_addr;
-                    // debug!("FREE: page_list_addr={:b}", page_list_addr.data());
-                    unsafe {
-                        self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8);
-                    }
-                }
-                // 由于buddy_free可能导致首部的链表页发生变化，因此需要重新读取
-                let next_page_list_addr = self.free_area[Self::order2index(spec_order)];
-                assert!(!next_page_list_addr.is_null());
-                page_list = Self::read_page(next_page_list_addr);
+                // 直接跳过空页，不释放它们，避免触发buddy_free导致递归
                 page_list_addr = next_page_list_addr;
+                page_list = Self::read_page(page_list_addr);
             }
 
             // 有空闲页面，直接分配
@@ -281,20 +271,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 // 更新page_list的entry_num
                 page_list.entry_num -= 1;
                 let tmp_current_entry_num = page_list.entry_num;
-                if page_list.entry_num == 0 {
-                    if !page_list.next_page.is_null() {
-                        // 此时page_list已经没有空闲伙伴块了，又因为非唯一页，需要删除该page_list
-                        self.free_area[Self::order2index(spec_order)] = page_list.next_page;
-                        let _ = page_list;
-                        unsafe { self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8) };
-                    } else {
-                        Self::write_page(page_list_addr, page_list);
-                    }
-                } else {
-                    // 若entry_num不为0，说明该page_list还有空闲伙伴块，需要更新该page_list
-                    // 把更新后的page_list写回
-                    Self::write_page(page_list_addr, page_list.clone());
-                }
+                // 无论entry_num是否为0，都需要写回更新后的page_list
+                // 即使变为空页，也保留在链表中，避免触发buddy_free导致递归死锁
+                Self::write_page(page_list_addr, page_list);
 
                 // 检测entry 是否对齐
                 if !entry.check_aligned(1 << spec_order) {
@@ -549,28 +528,30 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 let first_page_list_paddr = self.free_area[Self::order2index(order as u8)];
                 let first_page_list: PageList<A> = Self::read_page(first_page_list_paddr);
 
-                // 检查第二个page_list是否有空位
-                let second_page_list = if first_page_list.next_page.is_null() {
-                    None
-                } else {
-                    let second_page_list =
-                        Self::read_page::<PageList<A>>(first_page_list.next_page);
-                    if second_page_list.entry_num < Self::BUDDY_ENTRIES {
-                        Some(second_page_list)
-                    } else {
-                        None
-                    }
-                };
-
-                let (paddr, mut page_list) = if let Some(second) = second_page_list {
-                    // 第二个page_list有空位
-                    // 应当符合之前的假设：还有1个空位
-                    assert!(second.entry_num == Self::BUDDY_ENTRIES - 1);
-
-                    (first_page_list.next_page, second)
-                } else {
-                    // 在第一个page list中分配
+                // 找到第一个有空位的page_list（可能是第一个或第二个）
+                let (paddr, mut page_list) = if first_page_list.entry_num < Self::BUDDY_ENTRIES {
+                    // 第一个page_list有空位，直接使用
                     (first_page_list_paddr, first_page_list)
+                } else if !first_page_list.next_page.is_null() {
+                    // 第一个满了，尝试第二个
+                    let second_page_list_paddr = first_page_list.next_page;
+                    let second_page_list = Self::read_page::<PageList<A>>(second_page_list_paddr);
+                    if second_page_list.entry_num < Self::BUDDY_ENTRIES {
+                        // 第二个有空位
+                        (second_page_list_paddr, second_page_list)
+                    } else {
+                        // 两个都满了，这不应该发生，因为我们在上面应该已经分配了新的page_list
+                        panic!(
+                            "buddy_free: both first and second page_list are full, order={}",
+                            order
+                        );
+                    }
+                } else {
+                    // 只有第一个page_list且已满，这不应该发生
+                    panic!(
+                        "buddy_free: first page_list is full and no second page_list, order={}",
+                        order
+                    );
                 };
 
                 // debug!("to write entry, page_list_base={paddr:?}, page_list.entry_num={}, value={base:?}", page_list.entry_num);

@@ -587,31 +587,6 @@ impl SigPending {
     }
 }
 
-/// @brief 信号处理备用栈的信息
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub struct SigStack {
-    pub sp: usize,
-    pub flags: u32,
-    pub size: u32,
-}
-
-impl SigStack {
-    pub fn new() -> Self {
-        Self {
-            sp: 0,
-            flags: 0,
-            size: 0,
-        }
-    }
-}
-
-impl Default for SigStack {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// @brief 进程接收到的信号的队列
 #[derive(Debug, Clone, Default)]
 pub struct SigQueue {

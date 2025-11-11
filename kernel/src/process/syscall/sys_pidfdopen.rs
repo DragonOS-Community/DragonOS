@@ -37,9 +37,15 @@ impl Syscall for SysPidFdOpen {
         let pid = Self::pid(args);
         let flags = Self::flags(args);
 
-        let mode = ModeType::from_bits(flags).unwrap();
+        let mode = ModeType::from_bits(flags).ok_or_else(|| {
+            log::error!("SysPidFdOpen: failed to get mode!");
+            SystemError::EINVAL
+        })?;
         let file_type = FileType::from(mode);
-        let file_mode = FileMode::from_bits(flags).unwrap();
+        let file_mode = FileMode::from_bits(flags).ok_or_else(|| {
+            log::error!("SysPidFdOpen: failed to get file_mode!");
+            SystemError::EINVAL
+        })?;
 
         let root_inode = ProcessManager::current_mntns().root_inode();
         let name = format!(
@@ -47,20 +53,19 @@ impl Syscall for SysPidFdOpen {
             ProcessManager::current_pcb().raw_pid().data(),
             pid
         );
-        let new_inode = root_inode.create(&name, file_type, mode).unwrap();
-        let file = File::new(new_inode, file_mode).unwrap();
+        let new_inode = root_inode.create(&name, file_type, mode)?;
+        let file = File::new(new_inode, file_mode)?;
         {
             let mut guard = file.private_data.lock();
             *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
         }
 
         // 存入pcb
-        let r = ProcessManager::current_pcb()
+        ProcessManager::current_pcb()
             .fd_table()
             .write()
             .alloc_fd(file, None)
-            .map(|fd| fd as usize);
-        r
+            .map(|fd| fd as usize)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

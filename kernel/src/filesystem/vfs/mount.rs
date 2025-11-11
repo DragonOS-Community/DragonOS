@@ -709,24 +709,6 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.unlink(name);
     }
 
-    fn symlink(
-        &self,
-        name1: &str,
-        name2: &str,
-        other: &Arc<dyn IndexNode>,
-    ) -> Result<(), SystemError> {
-        return self.inner_inode.symlink(name1, name2, other);
-    }
-
-    fn symunlink(&self, _name: &str) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::ENOSYS);
-    }
-
-    fn get_nextsym(&self, name: &str) -> Result<String, SystemError> {
-        return self.inner_inode.get_nextsym(name);
-    }
-
     #[inline]
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;

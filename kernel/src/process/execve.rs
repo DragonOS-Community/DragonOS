@@ -57,6 +57,15 @@ pub fn do_execve(
     };
     address_space.write().user_stack = Some(ustack_message);
 
+    // execve 成功后，如果是 vfork 创建的子进程，需要通知父进程继续执行
+    // 在通知父进程之前，必须先清除 vfork_done，防止子进程退出时再次通知
+    let pcb = ProcessManager::current_pcb();
+    let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
+
+    if let Some(completion) = vfork_done {
+        completion.complete_all();
+    }
+
     Syscall::arch_do_execve(regs, &param, &load_result, user_sp, argv_ptr)
 }
 

@@ -8,11 +8,12 @@ use crate::mm::MemoryManagementArch;
 use crate::mm::{page::EntryFlags, PhysAddr};
 use alloc::rc::Rc;
 use core::mem::transmute;
+use system_error::SystemError;
 
 type RelocateKernelFn =
     unsafe extern "C" fn(indirection_page: usize, start_address: usize, stack_page_address: usize);
 
-pub fn machine_kexec_prepare(kimage: Rc<SpinLock<Kimage>>) -> bool {
+pub fn machine_kexec_prepare(kimage: Rc<SpinLock<Kimage>>) -> Result<(), SystemError> {
     unsafe {
         unsafe extern "C" {
             unsafe fn __relocate_kernel_start();
@@ -69,10 +70,10 @@ pub fn machine_kexec_prepare(kimage: Rc<SpinLock<Kimage>>) -> bool {
         mess_buf.resize(2048, 0);
         slice.copy_from_slice(&mess_buf);
     }
-    true
+    Ok(())
 }
 
-pub fn init_pgtable(kimage: Rc<SpinLock<Kimage>>) {
+pub fn init_pgtable(kimage: Rc<SpinLock<Kimage>>) -> Result<(), SystemError> {
     let pgd = ident_pt_alloc();
     kimage.lock().pgd = pgd;
 
@@ -92,7 +93,7 @@ pub fn init_pgtable(kimage: Rc<SpinLock<Kimage>>) {
         let size = kimage.lock().segment[i].memsz;
         // TODO:处理可能不是页面整数的情况, 但是目前, 传入的参数都是在用户层页面对其和取整了
         let pages_nums = size / MMArch::PAGE_SIZE;
-        ident_map_pages(pgd, addr, addr, pages_nums);
+        ident_map_pages(pgd, addr, addr, pages_nums)?;
     }
 
     // pages
@@ -106,7 +107,7 @@ pub fn init_pgtable(kimage: Rc<SpinLock<Kimage>>) {
     for i in 0..len {
         let page = kimage.lock().pages[i].clone();
         let addr = page.phys_address().data();
-        ident_map_page(pgd, addr, addr);
+        ident_map_page(pgd, addr, addr)?;
     }
 
     // efi
@@ -126,11 +127,11 @@ pub fn init_pgtable(kimage: Rc<SpinLock<Kimage>>) {
         pgd,
         unsafe { MMArch::phys_2_virt(control_page_pa).unwrap().data() },
         control_page_pa.data(),
-    );
+    )?;
 
     // cmdline
     let cmdline_ptr = boot_params().read().arch.hdr.cmd_line_ptr as usize;
-    ident_map_page(pgd, cmdline_ptr, cmdline_ptr);
+    ident_map_page(pgd, cmdline_ptr, cmdline_ptr)
 }
 
 pub fn machine_kexec(kimage: Rc<SpinLock<Kimage>>) {

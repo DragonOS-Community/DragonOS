@@ -56,7 +56,6 @@ impl BootCallbacks for PvhBootCallback {
     }
 
     fn init_initramfs(&self) -> Result<(), SystemError> {
-        log::error!("x86 pvh, init_initramfs is not impled");
         Ok(())
     }
 
@@ -125,7 +124,7 @@ impl BootCallbacks for PvhBootCallback {
         Ok(())
     }
 
-    fn early_init_memmap_sysfs(&self) -> Result<(), SystemError> {
+    fn init_memmap_sysfs(&self) -> Result<(), SystemError> {
         crate::mm::sysfs::early_memmap_init();
 
         let start_info = START_INFO.get();

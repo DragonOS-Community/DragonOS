@@ -222,9 +222,39 @@ pub fn do_mkdir_at(
     return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
 }
 
+/// 解析父目录inode
+///
+/// 当 `parent_path` 为 `None` 时，使用当前 inode；
+/// 否则查找父目录路径
+///
+/// # 参数
+///
+/// * `inode_begin` - 起始 inode
+/// * `parent_path` - 父目录路径（可选）
+///
+/// # 返回值
+///
+/// 返回解析后的父目录 inode
+pub(super) fn resolve_parent_inode(
+    inode_begin: Arc<dyn IndexNode>,
+    parent_path: Option<&str>,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
+    match parent_path {
+        None => Ok(inode_begin),
+        Some(path) => inode_begin.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES),
+    }
+}
+
 /// @brief 删除文件夹
 pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     let path = path.trim();
+
+    if path == "/" {
+        return Err(SystemError::EBUSY);
+    }
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
 
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
@@ -235,16 +265,14 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EINVAL);
     }
 
-    // 查找父目录
-    let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let parent_inode: Arc<dyn IndexNode> = resolve_parent_inode(inode_begin, parent_path)?;
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
-
     // 在目标点为symlink时也返回ENOTDIR
     let target_inode = parent_inode.find(filename)?;
+
     if target_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
@@ -258,18 +286,18 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 /// @brief 删除文件
 pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     let path = path.trim();
-
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
-
+    if remain_path.ends_with('/') {
+        return Err(SystemError::ENOTDIR);
+    }
     // 分离父路径和文件名
     let (filename, parent_path) = rsplit_path(&remain_path);
 
-    // 查找父目录，需要跟随符号链接
-    let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-
-    // 检查父路径是否为目录
+    let parent_inode: Arc<dyn IndexNode> = resolve_parent_inode(inode_begin, parent_path)?;
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }

@@ -27,3 +27,8 @@ compile_commands.json
 /flake.nix
 flake.lock
 /default.nix
+
+# initram
+*.cpio
+*.cpio.xz
+*.cpio*

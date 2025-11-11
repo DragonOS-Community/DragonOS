@@ -444,10 +444,9 @@ impl ProcessManager {
                 ProcessManager::current_pcb().raw_pid().data(),
                 pid
             );
-            let new_inode = root_inode
-                .create(&name, FileType::File, ModeType::from_bits_truncate(0o777))
-                .unwrap();
-            let file = File::new(new_inode, FileMode::O_RDWR | FileMode::O_CLOEXEC).unwrap();
+            let new_inode =
+                root_inode.create(&name, FileType::File, ModeType::from_bits_truncate(0o777))?;
+            let file = File::new(new_inode, FileMode::O_RDWR | FileMode::O_CLOEXEC)?;
             {
                 let mut guard = file.private_data.lock();
                 *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
@@ -524,6 +523,11 @@ impl ProcessManager {
 
         // 继承 rlimit
         pcb.inherit_rlimits_from(current_pcb);
+
+        // 继承 executable_path
+        // 修复：fork时需要复制父进程的可执行文件路径，而不是使用进程名
+        // 这样才能正确支持通过/proc/self/exe重新执行程序
+        pcb.set_execute_path(current_pcb.execute_path());
 
         // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长

@@ -17,6 +17,7 @@ use defer::defer;
 use hashbrown::HashMap;
 use hashbrown::HashSet;
 use ida::IdAllocator;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -166,75 +167,100 @@ impl InnerAddressSpace {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let new_addr_space = AddressSpace::new(false)?;
         let mut new_guard = new_addr_space.write();
-        unsafe {
-            new_guard
-                .user_mapper
-                .clone_from(&mut self.user_mapper, MMArch::PAGE_FAULT_ENABLED)
-        };
 
-        // 拷贝用户栈的结构体信息，但是不拷贝用户栈的内容（因为后面VMA的拷贝会拷贝用户栈的内容）
+        // 仅拷贝用户栈的结构体信息（元数据），实际的用户栈页面内容会在下面的 VMA 循环中处理
         unsafe {
             new_guard.user_stack = Some(self.user_stack.as_ref().unwrap().clone_info_only());
         }
-        let _current_stack_size = self.user_stack.as_ref().unwrap().stack_size();
 
         // 拷贝空洞
         new_guard.mappings.vm_holes = self.mappings.vm_holes.clone();
 
-        // 先收集所有需要解除映射的 VM_DONTCOPY 的 VMA 的页面范围
-        let mut dontcopy_regions = Vec::new();
+        // 拷贝其他地址空间属性
+        new_guard.brk = self.brk;
+        new_guard.brk_start = self.brk_start;
+        new_guard.mmap_min = self.mmap_min;
+        new_guard.elf_brk = self.elf_brk;
+        new_guard.elf_brk_start = self.elf_brk_start;
+        new_guard.start_code = self.start_code;
+        new_guard.end_code = self.end_code;
+        new_guard.start_data = self.start_data;
+        new_guard.end_data = self.end_data;
 
+        // 遍历父进程的每个VMA，根据VMA属性进行适当的复制
+        // 参考 Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
         for vma in self.mappings.vmas.iter() {
-            // TODO: 增加对VMA是否为文件映射的判断，如果是的话，就跳过
+            let vma_guard = vma.lock_irqsave();
 
-            let vma_guard: SpinLockGuard<'_, VMA> = vma.lock_irqsave();
-
-            // 检查是否标记为 VM_DONTCOPY (例如通过 MADV_DONTFORK 标记的)
+            // VM_DONTCOPY: 跳过不复制的VMA (例如 MADV_DONTFORK 标记的)
             if vma_guard.vm_flags().contains(VmFlags::VM_DONTCOPY) {
-                // 收集该 VMA 的页面范围，稍后解除映射
-                dontcopy_regions.push(*vma_guard.region());
                 drop(vma_guard);
                 continue;
             }
 
-            // 仅拷贝VMA信息并添加反向映射，因为UserMapper克隆时已经分配了新的物理页
+            let vm_flags = vma_guard.vm_flags();
+            let is_shared = vm_flags.contains(VmFlags::VM_SHARED);
+            let region = *vma_guard.region();
+            let page_flags = vma_guard.flags();
+
+            // 创建新的VMA
             let new_vma = LockedVMA::new(vma_guard.clone_info_only());
             new_guard.mappings.vmas.insert(new_vma.clone());
-            // debug!("new vma: {:x?}", new_vma);
-            let new_vma_guard = new_vma.lock_irqsave();
-            let new_mapper = &new_guard.user_mapper.utable;
-            let mut page_manager_guard = page_manager_lock_irqsave();
-            for page in new_vma_guard.pages().map(|p| p.virt_address()) {
-                if let Some((paddr, _)) = new_mapper.translate(page) {
-                    let page = page_manager_guard.get_unwrap(&paddr);
-                    page.write_irqsave().insert_vma(new_vma.clone());
-                }
-            }
 
-            drop(page_manager_guard);
-            drop(vma_guard);
-            drop(new_vma_guard);
-        }
+            // 根据VMA类型进行不同的页面复制策略
+            let start_page = region.start();
+            let end_page = region.end();
+            let mut current_page = start_page;
 
-        // 解除所有 VM_DONTCOPY 的 VMA 的页面映射
-        // 这些页面在前面 clone_user_mapping 时被拷贝了，但根据 MADV_DONTFORK 的语义应该被移除
-        if !dontcopy_regions.is_empty() {
+            let old_mapper = &mut self.user_mapper.utable;
             let new_mapper = &mut new_guard.user_mapper.utable;
-            for region in dontcopy_regions {
-                let start_page = region.start();
-                let end_page = region.end();
-                let mut current_page = start_page;
+            let mut page_manager_guard = page_manager_lock_irqsave();
 
-                while current_page < end_page {
+            while current_page < end_page {
+                if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
                     unsafe {
-                        if let Some((_, _, flush)) = new_mapper.unmap_phys(current_page, false) {
-                            // 由于新的mapper还没有在任何cpu上运行，因此不用flush
-                            flush.ignore();
+                        if is_shared {
+                            // 共享映射：直接映射到相同的物理页，不使用COW
+                            // 保持原有的flags
+                            if new_mapper
+                                .map_phys(current_page, phys_addr, page_flags)
+                                .is_none()
+                            {
+                                warn!("Failed to map shared page at {:?} to phys {:?} in child process (current_pid: {:?})",
+                                      current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
+                            }
+                        } else {
+                            // 私有映射：使用COW机制
+                            // 将父进程和子进程的页表项都设置为只读
+                            let cow_flags = page_flags.set_write(false);
+
+                            // 更新父进程的页表项为只读
+                            if old_flags.has_write() {
+                                if let Some(flush) = old_mapper.remap(current_page, cow_flags) {
+                                    flush.flush();
+                                }
+                            }
+
+                            // 子进程也映射为只读
+                            if new_mapper
+                                .map_phys(current_page, phys_addr, cow_flags)
+                                .is_none()
+                            {
+                                warn!("Failed to map COW page at {:?} to phys {:?} in child process (current_pid: {:?})",
+                                      current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
+                            }
+                        }
+                        // 为新进程的VMA添加反向映射
+                        if let Some(page) = page_manager_guard.get(&phys_addr) {
+                            page.write_irqsave().insert_vma(new_vma.clone());
                         }
                     }
-                    current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
                 }
+                current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
             }
+            drop(page_manager_guard);
+
+            drop(vma_guard);
         }
 
         drop(new_guard);
@@ -1388,6 +1414,7 @@ impl LockedVMA {
             let mut vma: VMA = unsafe { guard.clone() };
             vma.region = virt_region;
             vma.mapped = false;
+            // file_pgoff 保持不变，before VMA 使用原始的offset
             let vma: Arc<LockedVMA> = LockedVMA::new(vma);
             vma
         });
@@ -1396,6 +1423,13 @@ impl LockedVMA {
             let mut vma: VMA = unsafe { guard.clone() };
             vma.region = virt_region;
             vma.mapped = false;
+            // after VMA 需要调整file_pgoff
+            // after 区域的起始地址相对于原始VMA起始地址的偏移（以页为单位）
+            if let Some(original_pgoff) = vma.file_pgoff {
+                let offset_pages =
+                    (virt_region.start() - guard.region.start()) >> MMArch::PAGE_SHIFT;
+                vma.file_pgoff = Some(original_pgoff + offset_pages);
+            }
             let vma: Arc<LockedVMA> = LockedVMA::new(vma);
             vma
         });
@@ -1428,7 +1462,15 @@ impl LockedVMA {
             }
         }
 
+        // 调整middle VMA的region和file_pgoff
+        let original_start = guard.region.start();
         guard.region = region;
+        // middle VMA 需要调整file_pgoff
+        // middle 区域的起始地址相对于原始VMA起始地址的偏移（以页为单位）
+        if let Some(original_pgoff) = guard.file_pgoff {
+            let offset_pages = (region.start() - original_start) >> MMArch::PAGE_SHIFT;
+            guard.file_pgoff = Some(original_pgoff + offset_pages);
+        }
 
         return Some(VMASplitResult::new(
             before,

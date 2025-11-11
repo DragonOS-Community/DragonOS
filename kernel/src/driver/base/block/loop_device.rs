@@ -38,9 +38,11 @@ use core::{
     fmt::{Debug, Formatter},
 };
 use log::error;
+use num_traits::FromPrimitive;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 const LOOP_BASENAME: &str = "loop";
+const LOOP_CONTROL_BASENAME: &str = "loop-control";
 // // loop device 加密类型
 // pub const LO_CRYPT_NONE: u32 = 0;
 // pub const LO_CRYPT_XOR: u32 = 1;
@@ -55,21 +57,30 @@ const LOOP_BASENAME: &str = "loop";
 // pub const MAX_LO_CRYPT: u32 = 20;
 
 // // IOCTL 命令 - 使用 0x4C ('L')
-pub const LOOP_SET_FD: u32 = 0x4C00;
-pub const LOOP_CLR_FD: u32 = 0x4C01;
-pub const LOOP_SET_STATUS: u32 = 0x4C02;
-pub const LOOP_GET_STATUS: u32 = 0x4C03;
-pub const LOOP_SET_STATUS64: u32 = 0x4C04;
-pub const LOOP_GET_STATUS64: u32 = 0x4C05;
-pub const LOOP_CHANGE_FD: u32 = 0x4C06;
-pub const LOOP_SET_CAPACITY: u32 = 0x4C07;
-// pub const LOOP_SET_DIRECT_IO: u32 = 0x4C08;
-// pub const LOOP_SET_BLOCK_SIZE: u32 = 0x4C09;
-// pub const LOOP_CONFIGURE: u32 = 0x4C0A;
-
+#[repr(u32)] // 这一行告诉 Rust 将枚举表示为 u32 类型
+#[derive(Debug, FromPrimitive)]
+pub enum LoopIoctl {
+    LoopSetFd = 0x4C00,
+    LoopClrFd = 0x4C01,
+    LoopSetStatus = 0x4C02,
+    LoopGetStatus = 0x4C03,
+    LoopSetStatus64 = 0x4C04,
+    LoopGetStatus64 = 0x4C05,
+    LoopChangeFd = 0x4C06,
+    LoopSetCapacity = 0x4C07,
+    LoopSetDirectIo = 0x4c08,
+    LoopSetBlockSize = 0x4c09,
+    LoopConfigure = 0x4c0a,
+}
+#[repr(u32)]
+#[derive(Debug, FromPrimitive)]
+pub enum LoopControlIoctl {
+    LoopCtlAdd = 0x4C80,
+    LoopCtlRemove = 0x4C81,
+    LoopCtlGetFree = 0x4C82,
+}
 pub const LO_FLAGS_READ_ONLY: u32 = 1 << 0;
 pub const SUPPORTED_LOOP_FLAGS: u32 = LO_FLAGS_READ_ONLY;
-
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct LoopStatus64 {
@@ -78,11 +89,6 @@ pub struct LoopStatus64 {
     pub lo_flags: u32,
     pub __pad: u32,
 }
-
-// /dev/loop-control 接口
-pub const LOOP_CTL_ADD: u32 = 0x4C80;
-pub const LOOP_CTL_REMOVE: u32 = 0x4C81;
-pub const LOOP_CTL_GET_FREE: u32 = 0x4C82;
 //LoopDevice是一个虚拟的块设备，它将文件映射到块设备上.
 pub struct LoopDevice {
     inner: SpinLock<LoopDeviceInner>, //加锁保护LoopDeviceInner
@@ -542,8 +548,8 @@ impl IndexNode for LoopDevice {
         data: usize,
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
-        match cmd {
-            LOOP_SET_FD => {
+        match LoopIoctl::from_u32(cmd) {
+            Some(LoopIoctl::LoopSetFd) => {
                 let file_fd = data as i32;
                 let fd_table = ProcessManager::current_pcb().fd_table();
                 let file = {
@@ -566,31 +572,31 @@ impl IndexNode for LoopDevice {
                 self.bind_file(inode, read_only)?;
                 Ok(0)
             }
-            LOOP_CLR_FD => {
+            Some(LoopIoctl::LoopClrFd) => {
                 self.clear_file()?;
                 Ok(0)
             }
-            LOOP_SET_STATUS => {
+            Some(LoopIoctl::LoopSetStatus) => {
                 self.set_status(data)?;
                 Ok(0)
             }
-            LOOP_GET_STATUS => {
+            Some(LoopIoctl::LoopGetStatus) => {
                 self.get_status(data)?;
                 Ok(0)
             }
-            LOOP_SET_STATUS64 => {
+            Some(LoopIoctl::LoopSetStatus64) => {
                 self.set_status64(data)?;
                 Ok(0)
             }
-            LOOP_GET_STATUS64 => {
+            Some(LoopIoctl::LoopGetStatus64) => {
                 self.get_status64(data)?;
                 Ok(0)
             }
-            LOOP_CHANGE_FD => {
+            Some(LoopIoctl::LoopChangeFd) => {
                 self.change_fd(data as i32)?;
                 Ok(0)
             }
-            LOOP_SET_CAPACITY => {
+            Some(LoopIoctl::LoopSetCapacity) => {
                 self.set_capacity(data)?;
                 Ok(0)
             }
@@ -882,7 +888,7 @@ pub fn loop_init() -> Result<(), SystemError> {
     //注册loop_control设备
     device_register(loop_ctl.clone())?;
     log::info!("Loop control device registered.");
-    devfs_register("loop-control", loop_ctl.clone())?;
+    devfs_register(LOOP_CONTROL_BASENAME, loop_ctl.clone())?;
     log::info!("Loop control device initialized.");
     loop_mgr.loop_init(driver)?;
     Ok(())
@@ -890,7 +896,7 @@ pub fn loop_init() -> Result<(), SystemError> {
 
 impl Driver for LoopDeviceDriver {
     fn id_table(&self) -> Option<IdTable> {
-        Some(IdTable::new("loop".to_string(), None))
+        Some(IdTable::new(LOOP_BASENAME.to_string(), None))
     }
 
     fn devices(&self) -> Vec<Arc<dyn Device>> {
@@ -952,7 +958,7 @@ impl KObject for LoopDeviceDriver {
     }
 
     fn name(&self) -> String {
-        "loop".to_string()
+        LOOP_BASENAME.to_string()
     }
 
     fn set_name(&self, _name: String) {
@@ -1239,8 +1245,8 @@ impl IndexNode for LoopControlDevice {
         data: usize,
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
-        match cmd {
-            LOOP_CTL_ADD => {
+        match LoopControlIoctl::from_u32(cmd) {
+            Some(LoopControlIoctl::LoopCtlAdd) => {
                 log::info!("Starting LOOP_CTL_ADD ioctl");
                 let requested_index = data as u32;
                 let loop_dev = if requested_index == u32::MAX {
@@ -1259,12 +1265,12 @@ impl IndexNode for LoopControlDevice {
                 };
                 Ok(minor as usize)
             }
-            LOOP_CTL_REMOVE => {
+            Some(LoopControlIoctl::LoopCtlRemove) => {
                 let minor_to_remove = data as u32;
                 self.loop_mgr.loop_remove(minor_to_remove)?;
                 Ok(0)
             }
-            LOOP_CTL_GET_FREE => match self.loop_mgr.find_free_minor() {
+            Some(LoopControlIoctl::LoopCtlGetFree) => match self.loop_mgr.find_free_minor() {
                 Some(minor) => Ok(minor as usize),
                 None => Err(SystemError::ENOSPC),
             },
@@ -1406,7 +1412,7 @@ impl KObject for LoopControlDevice {
     }
 
     fn name(&self) -> String {
-        "loop-control".to_string()
+        LOOP_CONTROL_BASENAME.to_string()
     }
 
     fn set_name(&self, _name: String) {

@@ -57,6 +57,7 @@ pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemEr
 
 /// Copy data from user space to kernel space
 pub unsafe fn copy_from_user(dst: &mut [u8], src: VirtAddr) -> Result<usize, SystemError> {
+    // 这里使用的函数错误了, verify_area() 函数只简单的检查 `src` 是否存在于用户地址空间，而不检查 `src` 是否真的被分配给用户进程使用。
     verify_area(src, dst.len()).map_err(|_| SystemError::EFAULT)?;
 
     let src: &[u8] = core::slice::from_raw_parts(src.data() as *const u8, dst.len());

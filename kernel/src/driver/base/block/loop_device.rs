@@ -62,9 +62,9 @@ pub enum LoopIoctl {
 #[repr(u32)]
 #[derive(Debug, FromPrimitive)]
 pub enum LoopControlIoctl {
-    LoopCtlAdd = 0x4C80,
-    LoopCtlRemove = 0x4C81,
-    LoopCtlGetFree = 0x4C82,
+    Add = 0x4C80,
+    Remove = 0x4C81,
+    GetFree = 0x4C82,
 }
 pub const LO_FLAGS_READ_ONLY: u32 = 1 << 0;
 pub const SUPPORTED_LOOP_FLAGS: u32 = LO_FLAGS_READ_ONLY;
@@ -305,13 +305,13 @@ impl LoopDevice {
         Ok(())
     }
     fn validate_loop_status64_params(info: &LoopStatus64) -> Result<(), SystemError> {
-        if info.lo_offset % LBA_SIZE as u64 != 0 {
+        if info.lo_offset.is_multiple_of(LBA_SIZE as u64) == false {
             return Err(SystemError::EINVAL);
         }
         if info.lo_offset > usize::MAX as u64 || info.lo_sizelimit > usize::MAX as u64 {
             return Err(SystemError::EINVAL);
         }
-        if info.lo_sizelimit != 0 && info.lo_sizelimit % LBA_SIZE as u64 != 0 {
+        if info.lo_sizelimit != 0 && info.lo_sizelimit.is_multiple_of(LBA_SIZE as u64) == false {
             return Err(SystemError::EINVAL);
         }
         if info.lo_flags & !SUPPORTED_LOOP_FLAGS != 0 {
@@ -578,7 +578,7 @@ impl IndexNode for LoopDevice {
             inode_id: InodeId::new(0),
             size: self.inner().file_size as i64,
             blk_size: LBA_SIZE,
-            blocks: (self.inner().file_size + LBA_SIZE - 1) / LBA_SIZE,
+            blocks: (self.inner().file_size.div_ceil(LBA_SIZE)),
             atime: file_metadata.atime,
             mtime: file_metadata.mtime,
             ctime: file_metadata.ctime,
@@ -1382,7 +1382,7 @@ impl IndexNode for LoopControlDevice {
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         match LoopControlIoctl::from_u32(cmd) {
-            Some(LoopControlIoctl::LoopCtlAdd) => {
+            Some(LoopControlIoctl::Add) => {
                 log::info!("Starting LOOP_CTL_ADD ioctl");
                 let requested_index = data as u32;
                 let loop_dev = if requested_index == u32::MAX {
@@ -1401,12 +1401,12 @@ impl IndexNode for LoopControlDevice {
                 };
                 Ok(minor as usize)
             }
-            Some(LoopControlIoctl::LoopCtlRemove) => {
+            Some(LoopControlIoctl::Remove) => {
                 let minor_to_remove = data as u32;
                 self.loop_mgr.loop_remove(minor_to_remove)?;
                 Ok(0)
             }
-            Some(LoopControlIoctl::LoopCtlGetFree) => match self.loop_mgr.find_free_minor() {
+            Some(LoopControlIoctl::GetFree) => match self.loop_mgr.find_free_minor() {
                 Some(minor) => Ok(minor as usize),
                 None => Err(SystemError::ENOSPC),
             },

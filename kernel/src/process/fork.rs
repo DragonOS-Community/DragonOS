@@ -158,6 +158,21 @@ impl KernelCloneArgs {
         }
         Ok(())
     }
+
+    /// 规范化 exit_signal 字段，根据 Linux clone 语义处理
+    ///
+    /// ## 规则
+    ///
+    /// 1. 如果设置了 CLONE_THREAD，进程是线程组成员，不应发送 exit_signal（设为 INVALID）
+    /// 2. 其他情况保持 exit_signal 不变
+    ///
+    /// 这个方法应该在 do_clone() 之前调用，确保 exit_signal 的语义正确。
+    pub fn normalize_exit_signal(&mut self) {
+        if self.flags.contains(CloneFlags::CLONE_THREAD) {
+            // 线程组成员不发送 exit_signal
+            self.exit_signal = Signal::INVALID;
+        }
+    }
 }
 
 impl ProcessManager {

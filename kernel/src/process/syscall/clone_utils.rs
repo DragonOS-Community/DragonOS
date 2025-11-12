@@ -56,7 +56,11 @@ impl PosixCloneArgs {
     }
 }
 
-pub fn do_clone(clone_args: KernelCloneArgs, frame: &mut TrapFrame) -> Result<usize, SystemError> {
+pub fn do_clone(
+    mut clone_args: KernelCloneArgs,
+    frame: &mut TrapFrame,
+) -> Result<usize, SystemError> {
+    clone_args.normalize_exit_signal();
     clone_args.verify()?;
     let flags = clone_args.flags;
 

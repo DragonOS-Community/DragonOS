@@ -17,7 +17,8 @@ jobs:
   integration-test:
     name: Integration Test
     runs-on: ubuntu-latest
-    container: 
+    timeout-minutes: 60
+    container:
       image: dragonos/dragonos-dev:v1.15
       options: --privileged -v /dev:/dev
     steps:

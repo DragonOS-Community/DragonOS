@@ -159,7 +159,7 @@ test-syscall: check_arch
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-nographic AUTO_TEST=syscall SYSCALL_TEST_DIR=/opt/tests/gvisor &
-	QEMU_PID=$$!
+	sleep 5
 	bash user/apps/tests/syscall/gvisor/monitor_test_results.sh || { bash user/apps/tests/syscall/gvisor/disable_compile_gvisor.sh; exit 1; }
 	bash user/apps/tests/syscall/gvisor/disable_compile_gvisor.sh
 

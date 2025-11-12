@@ -38,7 +38,7 @@ pub enum FilePrivateData {
     EPoll(EPollPrivateData),
     /// pid私有信息
     Pid(PidPrivateData),
-    //lop私有信息
+    //loop私有信息
     Loop(LoopPrivateData),
     /// 不需要文件私有信息
     Unused,

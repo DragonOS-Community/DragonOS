@@ -305,13 +305,13 @@ impl LoopDevice {
         Ok(())
     }
     fn validate_loop_status64_params(info: &LoopStatus64) -> Result<(), SystemError> {
-        if info.lo_offset.is_multiple_of(LBA_SIZE as u64) == false {
+        if !info.lo_offset.is_multiple_of(LBA_SIZE as u64) {
             return Err(SystemError::EINVAL);
         }
         if info.lo_offset > usize::MAX as u64 || info.lo_sizelimit > usize::MAX as u64 {
             return Err(SystemError::EINVAL);
         }
-        if info.lo_sizelimit != 0 && info.lo_sizelimit.is_multiple_of(LBA_SIZE as u64) == false {
+        if info.lo_sizelimit != 0 && !info.lo_sizelimit.is_multiple_of(LBA_SIZE as u64) {
             return Err(SystemError::EINVAL);
         }
         if info.lo_flags & !SUPPORTED_LOOP_FLAGS != 0 {
@@ -590,7 +590,7 @@ impl IndexNode for LoopDevice {
             gid: 0,
             raw_dev: self.inner().device_number,
         };
-        Ok(metadata.clone())
+        Ok(metadata)
     }
     fn ioctl(
         &self,
@@ -1253,7 +1253,6 @@ impl LoopManager {
     }
     pub fn loop_init(&self, _driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {
         let mut inner = self.inner();
-        // 注册 loop 设备
         for minor in 0..Self::MAX_INIT_DEVICES {
             let minor_u32 = minor as u32;
             if Self::find_device_by_minor_locked(&inner, minor_u32).is_some() {
@@ -1266,10 +1265,6 @@ impl LoopManager {
             }
         }
         log::info!("Loop devices initialized");
-
-        //添加到loop_manager中
-
-        log::info!("Loop devices initialized.");
         Ok(())
     }
 }
@@ -1302,7 +1297,6 @@ impl LoopControlDevice {
                 device_common: DeviceCommonData::default(),
                 parent: RwLock::new(Weak::default()),
                 device_inode_fs: RwLock::new(None),
-                // devfs_metadata: Metadata::default(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
             loop_mgr,
@@ -1440,9 +1434,6 @@ impl IndexNode for LoopControlDevice {
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
         Err(SystemError::ENOSYS)
     }
-    // fn metadata(&self) -> Result<Metadata, SystemError> {
-    //    Metadata
-    // }
 }
 impl Device for LoopControlDevice {
     fn dev_type(&self) -> DeviceType {
@@ -1450,7 +1441,7 @@ impl Device for LoopControlDevice {
     }
 
     fn id_table(&self) -> IdTable {
-        IdTable::new(LOOP_BASENAME.to_string(), None)
+        IdTable::new(LOOP_CONTROL_BASENAME.to_string(), None)
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {

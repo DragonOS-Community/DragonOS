@@ -197,7 +197,7 @@ impl UserBufferReader<'_> {
         len: usize,
         from_user: bool,
     ) -> Result<Self, SystemError> {
-        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, false) {
+        if !is_user_accessable(VirtAddr::new(addr as usize), len, false) {
             return Err(SystemError::EFAULT);
         }
 
@@ -403,7 +403,7 @@ impl UserBufferReader<'_> {
     ) -> Result<&[T], SystemError> {
         let size = src.len().saturating_sub(offset);
         if size > 0
-            && !check_user_access_by_page_table(
+            && !is_user_accessable(
                 VirtAddr::new(src.as_ptr() as usize + offset),
                 size,
                 false,
@@ -434,7 +434,7 @@ impl UserBufferReader<'_> {
         if offset + size > src.len() {
             return Err(SystemError::EINVAL);
         }
-        if !check_user_access_by_page_table(
+        if !is_user_accessable(
             VirtAddr::new(src.as_ptr() as usize + offset),
             size,
             false,
@@ -466,7 +466,7 @@ impl<'a> UserBufferWriter<'a> {
     }
 
     pub fn new_checked<U>(addr: *mut U, len: usize, from_user: bool) -> Result<Self, SystemError> {
-        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, true) {
+        if !is_user_accessable(VirtAddr::new(addr as usize), len, true) {
             return Err(SystemError::EFAULT);
         }
 
@@ -609,7 +609,7 @@ impl<'a> UserBufferWriter<'a> {
     ) -> Result<&mut [T], SystemError> {
         let size = src.len().saturating_sub(offset);
         if size > 0
-            && !check_user_access_by_page_table(
+            && !is_user_accessable(
                 VirtAddr::new(src.as_ptr() as usize + offset),
                 size,
                 true,
@@ -639,7 +639,7 @@ impl<'a> UserBufferWriter<'a> {
         if offset + size > src.len() {
             return Err(SystemError::EINVAL);
         }
-        if !check_user_access_by_page_table(
+        if !is_user_accessable(
             VirtAddr::new(src.as_ptr() as usize + offset),
             size,
             true,
@@ -664,7 +664,7 @@ impl<'a> UserBufferWriter<'a> {
 /// # Returns
 /// * `true` if all pages are mapped and have required permissions
 /// * `false` if any page is not mapped or lacks required permissions
-fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: bool) -> bool {
+fn is_user_accessable(addr: VirtAddr, size: usize, check_write: bool) -> bool {
     // Check if address is valid
     if addr.is_null() {
         return false;

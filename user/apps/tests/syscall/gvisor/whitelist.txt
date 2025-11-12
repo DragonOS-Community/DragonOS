@@ -17,6 +17,7 @@ write_test
 mknod_test
 unlink_test
 lseek_test
+sync_test
 #stat_test
 #chmod_test
 #chown_test

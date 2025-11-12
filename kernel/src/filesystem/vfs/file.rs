@@ -8,7 +8,8 @@ use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::process::pid::PidPrivateData;
 use crate::{
     driver::{
-        base::{block::loop_device::LoopPrivateData, block::SeekFrom, device::DevicePrivateData},
+        base::{block::SeekFrom, device::DevicePrivateData},
+        block::loop_device::loop_device::LoopPrivateData,
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::{

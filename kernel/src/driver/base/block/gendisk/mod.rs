@@ -11,18 +11,15 @@ use alloc::{
 use hashbrown::HashMap;
 use system_error::SystemError;
 
+use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 use crate::{
     driver::base::device::device_number::DeviceNumber,
+    driver::block::loop_device::loop_device::LoopDevice,
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
     },
     libs::{rwlock::RwLock, spinlock::SpinLockGuard},
-};
-
-use super::{
-    block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
-    loop_device::LoopDevice,
 };
 
 const MINORS_PER_DISK: u32 = 256;

@@ -21,13 +21,15 @@ lseek_test
 
 # 进程相关测试
 fork_test
+futex_test
 vfork_test
 fpsig_fork_test
 fpsig_mut_test
 fpsig_nested_test
 #exec_test
 wait_test
-futex_test
+tkill_test
+tgkill_test
 
 # 内存管理测试
 #mmap_test

@@ -345,6 +345,47 @@ impl ProcessManager {
         return Ok(());
     }
 
+    /// 拷贝信号备用栈
+    ///
+    /// ## 参数
+    ///
+    /// - `clone_flags`: 克隆标志
+    /// - `current_pcb`: 当前进程的PCB
+    /// - `new_pcb`: 新进程的PCB
+    ///
+    /// ## 返回值
+    ///
+    /// - 成功：返回Ok(())
+    /// - 失败：返回Err(SystemError)
+    ///
+    /// ## 说明
+    ///
+    /// 根据Linux语义：
+    /// - fork()时，子进程应该继承父进程的sigaltstack设置
+    /// - clone(CLONE_THREAD)时（创建线程），新线程应该有一个清空的sigaltstack
+    ///
+    /// 参考：
+    /// - https://man7.org/linux/man-pages/man2/sigaltstack.2.html
+    fn copy_sigaltstack(
+        clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        // 如果是创建线程（CLONE_THREAD），则不继承sigaltstack
+        // 新线程应该有一个空的信号备用栈
+        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+            // 新线程的sig_altstack已经在new()时初始化为空，无需额外操作
+            return Ok(());
+        }
+
+        // fork()时，子进程继承父进程的sigaltstack设置
+        let parent_altstack = current_pcb.sig_altstack();
+        let mut child_altstack = new_pcb.sig_altstack_mut();
+        *child_altstack = *parent_altstack;
+
+        Ok(())
+    }
+
     /// 拷贝进程信息
     ///
     /// ## panic:
@@ -516,6 +557,14 @@ impl ProcessManager {
         Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
+
+        // 拷贝信号备用栈
+        Self::copy_sigaltstack(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy sigaltstack from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });

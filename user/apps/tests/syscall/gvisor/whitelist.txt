@@ -8,6 +8,8 @@ chdir_test
 bad_test
 uname_test
 syslog_test
+getcpu_test
+getcpu_host_test
 
 # 文件系统相关测试
 dup_test

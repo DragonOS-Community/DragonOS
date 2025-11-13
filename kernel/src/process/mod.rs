@@ -726,6 +726,20 @@ impl ProcessFlags {
         r
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct ProcessItimer {
+    pub timer: Arc<crate::time::timer::Timer>,
+    pub config: crate::time::syscall::Itimerval,
+}
+
+#[derive(Debug, Default)]
+pub struct ProcessItimers {
+    pub real: Option<ProcessItimer>,
+    pub virt: Option<ProcessItimer>,
+    pub prof: Option<ProcessItimer>,
+}
+
 #[derive(Debug)]
 pub struct ProcessControlBlock {
     /// 当前进程的pid
@@ -784,6 +798,7 @@ pub struct ProcessControlBlock {
 
     ///闹钟定时器
     alarm_timer: SpinLock<Option<AlarmTimer>>,
+    pub itimers: SpinLock<ProcessItimers>,
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
@@ -912,6 +927,7 @@ impl ProcessControlBlock {
                 thread: RwLock::new(ThreadInfo::new()),
                 fs: RwLock::new(Arc::new(FsStruct::new())),
                 alarm_timer: SpinLock::new(None),
+                itimers: SpinLock::new(ProcessItimers::default()),
                 robust_list: RwLock::new(None),
                 cred: SpinLock::new(cred),
                 self_ref: weak.clone(),

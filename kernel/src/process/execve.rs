@@ -66,6 +66,14 @@ pub fn do_execve(
         completion.complete_all();
     }
 
+    if pcb.sighand().is_shared() {
+        let new_sighand = pcb.sighand().clone();
+        pcb.replace_sighand(new_sighand);
+    }
+    // 重置所有信号处理器为默认行为(SIG_DFL)，禁用并清空备用信号栈。
+    pcb.flush_signal_handlers(false);
+    *pcb.sig_altstack_mut() = crate::arch::SigStackArch::new();
+
     Syscall::arch_do_execve(regs, &param, &load_result, user_sp, argv_ptr)
 }
 

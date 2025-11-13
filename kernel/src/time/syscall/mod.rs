@@ -8,8 +8,10 @@ use crate::syscall::Syscall;
 mod sys_alarm;
 mod sys_clock_gettime;
 mod sys_clock_nanosleep;
+mod sys_getitimer;
 mod sys_gettimeofday;
 mod sys_nanosleep;
+mod sys_setitimer;
 
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
@@ -19,6 +21,13 @@ pub type PosixSusecondsT = c_int;
 pub struct PosixTimeval {
     pub tv_sec: PosixTimeT,
     pub tv_usec: PosixSusecondsT,
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Copy, Clone)]
+pub struct Itimerval {
+    pub it_interval: PosixTimeval,
+    pub it_value: PosixTimeval,
 }
 
 #[repr(C)]

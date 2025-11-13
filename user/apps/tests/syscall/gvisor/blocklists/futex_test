@@ -1,8 +1,3 @@
-# PrivateFutexTest needs FUTEX_WAKE_OP
-RobustFutexTest.*
-
-SharedPrivate/PrivateAndSharedFutexTest.NoWakeInterprocessPrivateAnon_NoRandomSave/*
-
 SharedPrivate/PrivateAndSharedFutexTest.PIBasic/*
 SharedPrivate/PrivateAndSharedFutexTest.PIConcurrency_NoRandomSave/*
 SharedPrivate/PrivateAndSharedFutexTest.PIWaiters/*

@@ -9,7 +9,6 @@ pub mod syscall;
 pub mod utils;
 pub mod vcore;
 
-use self::utils::rsplit_path;
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use derive_builder::Builder;
@@ -386,46 +385,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     fn unlink(&self, _name: &str) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::ENOSYS);
-    }
-
-    /// @brief 在当前目录下，创建一个名为Name的符号链接(软链接)，指向另一个IndexNode，支持链接向一个符号链接
-    ///
-    /// @param name1 符号链接的名称, 将会在此目录下创建名为name的inode
-    /// @param name1 要被指向的 name 名称, 会根据此name与other的name区分是否指向一个符号链接
-    /// @param other 要被指向的IndexNode的Arc指针
-    ///
-    /// @return 成功：Ok(新的inode的Arc指针)
-    ///         失败：Err(错误码)
-    fn symlink(
-        &self,
-        _name1: &str,
-        _name2: &str,
-        _other: &Arc<dyn IndexNode>,
-    ) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::ENOSYS);
-    }
-
-    /// @brief 在当前目录下，删除一个名为Name的符号链接(软链接)
-    ///
-    /// @param name 符号链接的名称
-    ///
-    /// @return 成功：Ok()
-    ///         失败：Err(错误码)
-    fn symunlink(&self, _name: &str) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::ENOSYS);
-    }
-
-    /// @brief 在当前目录下，获取名为Name的符号链接(软链接)的执行的文件名称
-    ///
-    /// @param name 符号链接的名称
-    ///
-    /// @return 成功：Ok()
-    ///         失败：Err(错误码)
-    fn get_nextsym(&self, _name: &str) -> Result<String, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
     }
@@ -899,7 +858,13 @@ impl dyn IndexNode {
                 let link_path = String::from(
                     ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
                 );
-                let new_path = link_path + "/" + &rest_path;
+
+                // 拼接路径时，如果rest_path为空，则不添加斜杠
+                let new_path = if rest_path.is_empty() {
+                    link_path
+                } else {
+                    link_path + "/" + &rest_path
+                };
 
                 // 继续查找符号链接
                 return result.lookup_follow_symlink2(
@@ -1346,21 +1311,4 @@ impl<'a> FilldirContext<'a> {
 
         return Ok(());
     }
-}
-
-/// 查找链接文件的最底层链接, 目的是解决循环嵌套链接
-/// 如 test -> echo, echo -> busybox, 需要解析 test 的链接情况
-/// 返回 name 指向的文件的名称（可能为绝对路径, 具体值为symlink传入的参数值）
-/// 如果返回其本身(最底层文件名, 经过路径处理后的), 说明此文件不是链接文件
-#[allow(dead_code)]
-pub fn get_link_true_file(name: String) -> Result<String, SystemError> {
-    let (filename, parent_path) = rsplit_path(&name);
-    let parent_inode = match parent_path {
-        None => ProcessManager::current_mntns().root_inode(),
-        Some(path) => ProcessManager::current_mntns()
-            .root_inode()
-            .lookup(path)
-            .unwrap(),
-    };
-    parent_inode.get_nextsym(filename)
 }

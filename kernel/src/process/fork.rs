@@ -158,6 +158,21 @@ impl KernelCloneArgs {
         }
         Ok(())
     }
+
+    /// 规范化 exit_signal 字段，根据 Linux clone 语义处理
+    ///
+    /// ## 规则
+    ///
+    /// 1. 如果设置了 CLONE_THREAD，进程是线程组成员，不应发送 exit_signal（设为 INVALID）
+    /// 2. 其他情况保持 exit_signal 不变
+    ///
+    /// 这个方法应该在 do_clone() 之前调用，确保 exit_signal 的语义正确。
+    pub fn normalize_exit_signal(&mut self) {
+        if self.flags.contains(CloneFlags::CLONE_THREAD) {
+            // 线程组成员不发送 exit_signal
+            self.exit_signal = Signal::INVALID;
+        }
+    }
 }
 
 impl ProcessManager {
@@ -330,6 +345,47 @@ impl ProcessManager {
         return Ok(());
     }
 
+    /// 拷贝信号备用栈
+    ///
+    /// ## 参数
+    ///
+    /// - `clone_flags`: 克隆标志
+    /// - `current_pcb`: 当前进程的PCB
+    /// - `new_pcb`: 新进程的PCB
+    ///
+    /// ## 返回值
+    ///
+    /// - 成功：返回Ok(())
+    /// - 失败：返回Err(SystemError)
+    ///
+    /// ## 说明
+    ///
+    /// 根据Linux语义：
+    /// - fork()时，子进程应该继承父进程的sigaltstack设置
+    /// - clone(CLONE_THREAD)时（创建线程），新线程应该有一个清空的sigaltstack
+    ///
+    /// 参考：
+    /// - https://man7.org/linux/man-pages/man2/sigaltstack.2.html
+    fn copy_sigaltstack(
+        clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        // 如果是创建线程（CLONE_THREAD），则不继承sigaltstack
+        // 新线程应该有一个空的信号备用栈
+        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+            // 新线程的sig_altstack已经在new()时初始化为空，无需额外操作
+            return Ok(());
+        }
+
+        // fork()时，子进程继承父进程的sigaltstack设置
+        let parent_altstack = current_pcb.sig_altstack();
+        let mut child_altstack = new_pcb.sig_altstack_mut();
+        *child_altstack = *parent_altstack;
+
+        Ok(())
+    }
+
     /// 拷贝进程信息
     ///
     /// ## panic:
@@ -444,10 +500,9 @@ impl ProcessManager {
                 ProcessManager::current_pcb().raw_pid().data(),
                 pid
             );
-            let new_inode = root_inode
-                .create(&name, FileType::File, ModeType::from_bits_truncate(0o777))
-                .unwrap();
-            let file = File::new(new_inode, FileMode::O_RDWR | FileMode::O_CLOEXEC).unwrap();
+            let new_inode =
+                root_inode.create(&name, FileType::File, ModeType::from_bits_truncate(0o777))?;
+            let file = File::new(new_inode, FileMode::O_RDWR | FileMode::O_CLOEXEC)?;
             {
                 let mut guard = file.private_data.lock();
                 *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
@@ -506,6 +561,14 @@ impl ProcessManager {
             )
         });
 
+        // 拷贝信号备用栈
+        Self::copy_sigaltstack(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy sigaltstack from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
+
         // 拷贝namespace
         Self::copy_namespaces(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
@@ -524,6 +587,11 @@ impl ProcessManager {
 
         // 继承 rlimit
         pcb.inherit_rlimits_from(current_pcb);
+
+        // 继承 executable_path
+        // 修复：fork时需要复制父进程的可执行文件路径，而不是使用进程名
+        // 这样才能正确支持通过/proc/self/exe重新执行程序
+        pcb.set_execute_path(current_pcb.execute_path());
 
         // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长

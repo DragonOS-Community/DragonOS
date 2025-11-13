@@ -22,7 +22,10 @@ pub fn xz_decompress(compressed_data: &[u8]) -> Result<Vec<u8>, SystemError> {
                 decompressed_data.extend_from_slice(&temp_buffer[..output_produced]);
                 break;
             }
-            Err(err) => panic!("Decompression failed {}", err),
+            Err(err) => {
+                log::error!("Decompression failed {}", err);
+                return Err(SystemError::E2BIG);
+            }
         };
     }
 

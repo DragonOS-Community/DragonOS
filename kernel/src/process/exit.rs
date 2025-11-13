@@ -1,5 +1,5 @@
 use alloc::sync::{Arc, Weak};
-use core::intrinsics::likely;
+use core::{intrinsics::likely, sync::atomic::Ordering};
 use system_error::SystemError;
 
 use crate::{
@@ -21,6 +21,26 @@ use super::{
 #[inline(always)]
 fn wstatus_to_waitid_status(raw_wstatus: i32) -> i32 {
     (raw_wstatus >> 8) & 0xff
+}
+
+/// 检查子进程的 exit_signal 是否与等待选项匹配
+///
+/// 根据 Linux wait 语义：
+/// - __WALL: 等待所有子进程，忽略 exit_signal
+/// - __WCLONE: 只等待"克隆"子进程（exit_signal != SIGCHLD）
+/// - 默认（无 __WCLONE）: 只等待"正常"子进程（exit_signal == SIGCHLD）
+fn child_matches_wait_options(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) -> bool {
+    // __WALL 匹配所有子进程
+    if options.contains(WaitOption::WALL) {
+        return true;
+    }
+
+    let child_exit_signal = child_pcb.exit_signal.load(Ordering::SeqCst);
+    let is_clone_child = child_exit_signal != Signal::SIGCHLD;
+    let wants_clone = options.contains(WaitOption::WCLONE);
+
+    // 子进程类型必须与等待选项匹配
+    is_clone_child == wants_clone
 }
 
 /// 内核wait4时的参数
@@ -61,7 +81,7 @@ pub fn kernel_wait4(
     options: WaitOption,
     rusage_buf: Option<&mut RUsage>,
 ) -> Result<usize, SystemError> {
-    let converter = PidConverter::from_id(pid).ok_or(SystemError::ESRCH)?;
+    let converter = PidConverter::from_id(pid).ok_or(SystemError::ECHILD)?;
 
     // 构造参数
     let mut kwo = KernelWaitOption::new(converter, options);
@@ -184,15 +204,24 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 if pid.pid_vnr().data() == ProcessManager::current_pcb().raw_tgid().data() {
                     return Err(SystemError::ECHILD);
                 }
-                let child_pcb = pid
-                    .pid_task(PidType::PID)
-                    .ok_or(SystemError::ECHILD)
-                    .unwrap();
+
+                let child_pcb = pid.pid_task(PidType::PID).ok_or(SystemError::ECHILD)?;
 
                 let parent = ProcessManager::current_pcb();
 
+                // 检查是否是当前进程的子进程，否则返回ECHILD
+                let is_child = parent.children.read().contains(&child_pcb.raw_pid());
+                if !is_child {
+                    return Err(SystemError::ECHILD);
+                }
+
+                // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
+                if !child_matches_wait_options(&child_pcb, kwo.options) {
+                    return Err(SystemError::ECHILD);
+                }
+
                 // 等待指定子进程：睡眠在父进程自己的 wait_queue 上
-                // 子进程退出时会发送 SIGCHLD 并唤醒父进程的 wait_queue
+                // 子进程退出时会发送信号并唤醒父进程的 wait_queue
                 loop {
                     // Fast path: check without sleeping
                     if let Some(r) = do_waitpid(child_pcb.clone(), kwo) {
@@ -248,11 +277,25 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         break;
                     }
                     let mut found = false;
+                    // 标记是否所有子进程都已退出（僵尸状态，不会再改变）
+                    let mut all_children_exited = true;
                     for pid in rd_childen.iter() {
                         let pcb =
                             ProcessManager::find_task_by_vpid(*pid).ok_or(SystemError::ECHILD)?;
+
+                        // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
+                        if !child_matches_wait_options(&pcb, kwo.options) {
+                            continue;
+                        }
+
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
+
+                        // 如果有子进程不是 Exited 状态，则标记为 false
+                        if !state.is_exited() {
+                            all_children_exited = false;
+                        }
+
                         if matches!(state, ProcessState::Stopped)
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
@@ -283,7 +326,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             }
                             retval = Ok((*pid).into());
                             found = true;
-                        } else if state.is_exited() {
+                        } else if state.is_exited() && kwo.options.contains(WaitOption::WEXITED) {
                             let raw = state.exit_code().unwrap() as i32;
                             kwo.ret_status = raw;
                             let status8 = wstatus_to_waitid_status(raw);
@@ -315,6 +358,15 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         retval = Ok(0);
                         break 'outer;
                     }
+
+                    // 关键修复：如果所有子进程都已退出（僵尸状态），且没有请求 WEXITED
+                    // 那么永远不会有匹配的事件发生，应该立即返回 ECHILD 而不是继续等待
+                    if all_children_exited && !kwo.options.contains(WaitOption::WEXITED) {
+                        parent.wait_queue.finish_wait();
+                        retval = Err(SystemError::ECHILD);
+                        break 'outer; // 直接退出到外层循环，绕过 notask! 宏
+                    }
+
                     // 无事件，睡眠
                     schedule(SchedMode::SM_NONE);
                     parent.wait_queue.finish_wait();
@@ -327,9 +379,20 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     let _ = parent.wait_queue.prepare_to_wait_event(true);
 
                     let mut found = false;
+                    let mut all_children_exited = true;
                     for pcb in pgid.tasks_iter(PidType::PGID) {
+                        // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
+                        if !child_matches_wait_options(&pcb, kwo.options) {
+                            continue;
+                        }
+
                         let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                         let state = sched_guard.state();
+
+                        if !state.is_exited() {
+                            all_children_exited = false;
+                        }
+
                         if matches!(state, ProcessState::Stopped)
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
@@ -359,7 +422,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             }
                             retval = Ok(pcb.task_pid_vnr().into());
                             found = true;
-                        } else if state.is_exited() {
+                        } else if state.is_exited() && kwo.options.contains(WaitOption::WEXITED) {
                             let raw = state.exit_code().unwrap() as i32;
                             kwo.ret_status = raw;
                             let status8 = wstatus_to_waitid_status(raw);
@@ -390,6 +453,15 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         retval = Ok(0);
                         break 'outer;
                     }
+
+                    // 关键修复：如果进程组中所有进程都已退出，且没有请求 WEXITED
+                    // 那么永远不会有匹配的事件发生，应该立即返回 ECHILD
+                    if all_children_exited && !kwo.options.contains(WaitOption::WEXITED) {
+                        parent.wait_queue.finish_wait();
+                        retval = Err(SystemError::ECHILD);
+                        break 'outer;
+                    }
+
                     schedule(SchedMode::SM_NONE);
                     parent.wait_queue.finish_wait();
                 }

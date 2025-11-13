@@ -26,7 +26,7 @@ fn init_intertrait() {
     intertrait::init_caster_map();
 }
 
-pub fn enable_initramfs() -> bool {
+pub fn initramfs_enabled() -> bool {
     #[cfg(feature = "initram")]
     unsafe {
         self::initram::__INIT_ROOT_ENABLED

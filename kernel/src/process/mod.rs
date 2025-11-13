@@ -24,7 +24,7 @@ use crate::{
         cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
-        CurrentIrqArch,
+        CurrentIrqArch, SigStackArch,
     },
     driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
@@ -36,7 +36,7 @@ use crate::{
     ipc::{
         sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending, SigStack},
+        signal_types::{SigInfo, SigPending},
     },
     libs::{
         align::AlignedBox,
@@ -393,19 +393,23 @@ impl ProcessManager {
             }
             let parent_pcb = r.unwrap();
 
-            let r = crate::ipc::kill::kill_process_by_pcb(parent_pcb.clone(), Signal::SIGCHLD);
-            if let Err(e) = r {
-                warn!(
-                    "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
-                    current.raw_pid(),
-                    parent_pcb.raw_pid(),
-                    e
-                );
+            // 检查子进程的exit_signal，只有在有效时才发送信号
+            let exit_signal = current.exit_signal.load(Ordering::SeqCst);
+            if exit_signal != Signal::INVALID {
+                let r = crate::ipc::kill::kill_process_by_pcb(parent_pcb.clone(), exit_signal);
+                if let Err(e) = r {
+                    warn!(
+                        "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
+                        current.raw_pid(),
+                        parent_pcb.raw_pid(),
+                        e
+                    );
+                }
+                // 额外唤醒：父进程可能阻塞在 wait 系列调用上
+                parent_pcb
+                    .wait_queue
+                    .wakeup_all(Some(ProcessState::Blocked(true)));
             }
-            // 额外唤醒：父进程可能阻塞在 wait 系列调用上
-            parent_pcb
-                .wait_queue
-                .wakeup_all(Some(ProcessState::Blocked(true)));
             // todo: 这里还需要根据线程组的信息，决定信号的发送
         }
     }
@@ -757,7 +761,7 @@ pub struct ProcessControlBlock {
     sig_info: RwLock<ProcessSignalInfo>,
     sighand: RwLock<Arc<SigHand>>,
     /// 备用信号栈
-    sig_altstack: RwLock<SigStack>,
+    sig_altstack: RwLock<SigStackArch>,
 
     /// 退出信号S
     exit_signal: AtomicSignal,
@@ -900,7 +904,7 @@ impl ProcessControlBlock {
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RwLock::new(SigHand::new()),
-                sig_altstack: RwLock::new(SigStack::new()),
+                sig_altstack: RwLock::new(SigStackArch::new()),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb),
@@ -1161,11 +1165,11 @@ impl ProcessControlBlock {
         return &self.sched_info;
     }
 
-    pub fn sig_altstack(&self) -> RwLockReadGuard<'_, SigStack> {
+    pub fn sig_altstack(&self) -> RwLockReadGuard<'_, SigStackArch> {
         self.sig_altstack.read_irqsave()
     }
 
-    pub fn sig_altstack_mut(&self) -> RwLockWriteGuard<'_, SigStack> {
+    pub fn sig_altstack_mut(&self) -> RwLockWriteGuard<'_, SigStackArch> {
         self.sig_altstack.write_irqsave()
     }
 

@@ -95,38 +95,45 @@ impl FutexHashBucket {
         nr_wake: u32,
     ) -> Result<usize, SystemError> {
         let mut count = 0;
-        let mut pop_count = 0;
-        while let Some(futex_q) = self.chain.pop_front() {
-            if futex_q.key == key {
-                // TODO: 考虑优先级继承的机制
+        // 记录初始队列长度，确保只遍历一次
+        let initial_len = self.chain.len();
+        let mut processed = 0;
 
+        while processed < initial_len && count < nr_wake {
+            if let Some(futex_q) = self.chain.pop_front() {
+                // 检查key是否匹配
+                if futex_q.key != key {
+                    // key不匹配，放回队列尾部
+                    self.chain.push_back(futex_q);
+                    processed += 1;
+                    continue;
+                }
+
+                // 检查bitset是否匹配
                 if let Some(bitset) = bitset {
                     if futex_q.bitset & bitset == 0 {
+                        // bitset不匹配，放回队列尾部
                         self.chain.push_back(futex_q);
+                        processed += 1;
                         continue;
                     }
                 }
 
-                // 唤醒
-                if futex_q.pcb.upgrade().is_some() {
-                    self.remove(futex_q.clone());
-                    ProcessManager::wakeup(&futex_q.pcb.upgrade().unwrap())?;
+                // key和bitset都匹配，尝试唤醒
+                // 注意：pop_front已经将futex_q从队列中移除，无需再次调用remove
+                if let Some(pcb) = futex_q.pcb.upgrade() {
+                    // TODO: 考虑优先级继承的机制
+                    ProcessManager::wakeup(&pcb)?;
+                    count += 1;
                 }
-
-                // 判断唤醒数
-                count += 1;
-                if count >= nr_wake {
-                    break;
-                }
+                // 如果pcb已经被释放，也算处理了一个，继续下一个
+                processed += 1;
             } else {
-                self.chain.push_back(futex_q);
-            }
-            // 判断是否循环完队列了
-            pop_count += 1;
-            if pop_count >= self.chain.len() {
+                // 队列为空，退出
                 break;
             }
         }
+
         Ok(count as usize)
     }
 
@@ -354,6 +361,10 @@ impl Futex {
     }
 
     // ### 唤醒指定futex上挂起的最多nr_wake个进程
+    ///
+    /// ### Linux 语义
+    /// 根据 Linux 的实际行为，即使 nr_wake 为 0，FUTEX_WAKE 也会唤醒至少一个等待者。
+    /// 这是 FUTEX_WAKE 特有的行为，其他操作如 FUTEX_REQUEUE 不适用此规则。
     pub fn futex_wake(
         uaddr: VirtAddr,
         flags: FutexFlag,
@@ -381,8 +392,11 @@ impl Futex {
             return Ok(0);
         }
 
+        // Linux 行为：即使 nr_wake 为 0，也至少唤醒一个等待者
+        let effective_nr_wake = if nr_wake == 0 { 1 } else { nr_wake };
+
         // 从队列中唤醒
-        let count = bucket_mut.wake_up(key.clone(), Some(bitset), nr_wake)?;
+        let count = bucket_mut.wake_up(key.clone(), Some(bitset), effective_nr_wake)?;
 
         drop(binding);
 

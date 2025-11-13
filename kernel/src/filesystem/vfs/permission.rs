@@ -4,22 +4,31 @@
 //! 遵循 Linux 内核语义。
 
 use super::Metadata;
-use crate::process::cred::{CAPFlags, Cred};
+use crate::{
+    filesystem::vfs::{syscall::ModeType, FileType},
+    process::cred::{CAPFlags, Cred},
+};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
 bitflags! {
     pub struct PermissionMask: u32 {
         /// 测试执行权限
-        const MAY_EXEC = 0x00000001;
+        const MAY_EXEC = 0x1;
         /// 测试写权限
-        const MAY_WRITE = 0x00000002;
+        const MAY_WRITE = 0x2;
         /// 测试读权限
-        const MAY_READ = 0x00000004;
+        const MAY_READ = 0x4;
         /// 测试追加权限
-        const MAY_APPEND = 0x00000008;
+        const MAY_APPEND = 0x8;
+        /// access() 系统调用使用
+        const MAY_ACCESS = 0x10;
+        /// 打开文件操作
+        const MAY_OPEN = 0x20;
         /// 测试 chdir 操作（用于审计/LSM）
-        const MAY_CHDIR = 0x00000040;
+        const MAY_CHDIR = 0x40;
+
+        const MAY_RWX = Self::MAY_READ.bits + Self::MAY_WRITE.bits + Self::MAY_EXEC.bits;
     }
 }
 
@@ -59,23 +68,22 @@ pub fn inode_permission(
     mask: u32,
 ) -> Result<(), SystemError> {
     // 从 mode 中提取权限位
-    let mode_bits = metadata.mode.bits();
-    let file_mode = mode_bits & 0o777; // 只保留 rwxrwxrwx
+    let file_mode = metadata.mode.bits();
 
     // 确定要检查哪组权限位
     let perm = if is_owner(metadata, cred) {
         // 所有者权限（第 6-8 位）
-        (file_mode >> 6) & 7
+        file_mode & ModeType::S_IRWXU.bits() >> 6
     } else if in_group(metadata, cred) {
         // 组权限（第 3-5 位）
-        (file_mode >> 3) & 7
+        file_mode & ModeType::S_IRWXG.bits() >> 3
     } else {
         // 其他用户权限（第 0-2 位）
-        file_mode & 7
+        file_mode & ModeType::S_IRWXO.bits()
     };
 
     // PermissionMask 的低 3 位已经是 Unix 权限位格式 (rwx)
-    let need = mask & 0b111;
+    let need = mask & PermissionMask::MAY_RWX.bits();
 
     // 检查权限位是否满足请求
     if (need & !perm) == 0 {
@@ -117,7 +125,6 @@ fn try_capability_override(metadata: &Metadata, cred: &Arc<Cred>, mask: u32) -> 
     // CAP_DAC_OVERRIDE: 绕过所有文件读、写和执行权限检查
     if cred.has_capability(CAPFlags::CAP_DAC_OVERRIDE) {
         // 对于目录：总是允许
-        log::debug!("CAP_DAC_OVERRIDE");
         if metadata.file_type == super::FileType::Dir {
             return true;
         }
@@ -126,7 +133,7 @@ fn try_capability_override(metadata: &Metadata, cred: &Arc<Cred>, mask: u32) -> 
         if mask != PermissionMask::MAY_EXEC.bits() {
             return true;
         }
-        if metadata.mode.bits() & 0o111 != 0 {
+        if metadata.mode.bits() & PermissionMask::MAY_RWX.bits() != 0 {
             return true;
         }
     }
@@ -134,13 +141,12 @@ fn try_capability_override(metadata: &Metadata, cred: &Arc<Cred>, mask: u32) -> 
     // CAP_DAC_READ_SEARCH: 绕过读和搜索（目录上的执行）检查
     if cred.has_capability(CAPFlags::CAP_DAC_READ_SEARCH) {
         // 允许读任何文件
-        log::debug!("CAP_DAC_READ_SEARCH");
         if mask == PermissionMask::MAY_READ.bits() {
             return true;
         }
 
         // 允许搜索（执行）目录
-        if metadata.file_type == super::FileType::Dir && mask == PermissionMask::MAY_EXEC.bits() {
+        if metadata.file_type == FileType::Dir && mask == PermissionMask::MAY_EXEC.bits() {
             return true;
         }
     }
@@ -151,7 +157,7 @@ fn try_capability_override(metadata: &Metadata, cred: &Arc<Cred>, mask: u32) -> 
 /// 检查 chdir 操作的权限
 pub fn check_chdir_permission(metadata: &Metadata, cred: &Arc<Cred>) -> Result<(), SystemError> {
     // 验证是否为目录
-    if metadata.file_type != super::FileType::Dir {
+    if metadata.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 

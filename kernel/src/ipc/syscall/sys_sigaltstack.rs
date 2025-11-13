@@ -10,6 +10,13 @@ use system_error::SystemError;
 
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 
+// 根据Linux UAPI定义
+const SS_ONSTACK: c_int = 1;
+const SS_DISABLE: c_int = 2;
+
+// 最小信号栈大小
+const MINSIGSTKSZ: usize = 2048;
+
 /// C 中定义的信号栈, 等于 C 中的 stack_t
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -49,7 +56,7 @@ impl Syscall for SysAltStackHandle {
         2
     }
 
-    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         //warn!("SYS_SIGALTSTACK has not yet been fully realized and still needs to be supplemented");
         //warn!("SYS_SIGALTSTACK has not yet been fully realized and still needs to be supplemented");
         //warn!("SYS_SIGALTSTACK has not yet been fully realized and still needs to be supplemented");
@@ -59,31 +66,57 @@ impl Syscall for SysAltStackHandle {
 
         let binding = ProcessManager::current_pcb();
         let mut stack = binding.sig_altstack_mut();
+        let is_on_stack = stack.on_sig_stack(frame.rsp as usize);
 
         if !old_ss.is_null() {
-            // 需要从 current() 中读结构体写入 old_ss
-            //log::info!("old_ss impl");
-            let mut temp = StackUser::new();
+            let mut old_stack_user = StackUser::new();
+            old_stack_user.ss_sp = stack.sp as *mut c_void;
+            old_stack_user.ss_size = stack.size as usize;
 
-            temp.ss_sp = stack.sp as *mut c_void;
-            temp.ss_size = stack.size as usize;
-            // temp.ss_flags = 0; 这个要根据情况设置
+            if stack.flags == SS_DISABLE as u32 {
+                old_stack_user.ss_flags = SS_DISABLE;
+            } else if is_on_stack {
+                old_stack_user.ss_flags = SS_ONSTACK;
+            } else {
+                old_stack_user.ss_flags = 0; // 栈已启用但当前不在其上
+            }
 
-            let mut user_buffer = UserBufferWriter::new(old_ss, size_of::<StackUser>(), true)?;
-            user_buffer.copy_one_to_user(&temp, 0)?;
+            let mut writer = UserBufferWriter::new(old_ss, size_of::<StackUser>(), true)?;
+            writer.copy_one_to_user(&old_stack_user, 0)?;
         }
 
         if !ss.is_null() {
             // 需要向 current() 中结构体写入 ss 的内容
             //log::info!("ss impl");
+            if is_on_stack {
+                return Err(SystemError::EPERM);
+            }
 
-            let user_buffer = UserBufferReader::new(ss, size_of::<StackUser>(), true)?;
-            let sus: &[StackUser] = user_buffer.read_from_user(0)?;
+            let reader = UserBufferReader::new(ss, size_of::<StackUser>(), true)?;
+            let sus: &[StackUser] = reader.read_from_user(0)?;
             let ss: StackUser = sus[0];
 
-            stack.sp = ss.ss_sp as usize;
-            stack.size = ss.ss_size as u32;
-            stack.flags = ss.ss_flags as u32;
+            // stack.sp = ss.ss_sp as usize;
+            // stack.flags = ss.ss_flags as u32;
+            // stack.size = ss.ss_size as u32;
+            if (ss.ss_flags & !SS_DISABLE) != 0 {
+                return Err(SystemError::EINVAL);
+            }
+            // 如果用户请求禁用备用栈
+            if ss.ss_flags & SS_DISABLE != 0 {
+                stack.flags = SS_DISABLE as u32;
+            } else {
+                // 如果用户请求设置一个新的栈
+                if ss.ss_sp.is_null() {
+                    return Err(SystemError::EFAULT); // 或者 EINVAL ?
+                }
+                if ss.ss_size < MINSIGSTKSZ {
+                    return Err(SystemError::ENOMEM);
+                }
+                stack.sp = ss.ss_sp as usize;
+                stack.flags = 0; // 标记为已启用
+                stack.size = ss.ss_size as u32;
+            }
         }
         Ok(0)
     }

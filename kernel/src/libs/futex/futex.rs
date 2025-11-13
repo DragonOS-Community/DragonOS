@@ -59,7 +59,7 @@ pub struct Futex;
 // 对于同一个futex的进程或线程将会在这个bucket等待
 pub struct FutexHashBucket {
     // 该futex维护的等待队列
-    chain: LinkedList<Arc<FutexObj>>,
+    pub(super) chain: LinkedList<Arc<FutexObj>>,
 }
 
 impl FutexHashBucket {
@@ -140,9 +140,9 @@ impl FutexHashBucket {
 
 #[derive(Debug)]
 pub struct FutexObj {
-    pcb: Weak<ProcessControlBlock>,
-    key: FutexKey,
-    bitset: u32,
+    pub(super) pcb: Weak<ProcessControlBlock>,
+    pub(super) key: FutexKey,
+    pub(super) bitset: u32,
     // TODO: 优先级继承
 }
 
@@ -512,7 +512,7 @@ impl Futex {
         Ok(wake_count)
     }
 
-    fn get_futex_key(
+    pub(super) fn get_futex_key(
         uaddr: VirtAddr,
         fshared: bool,
         _access: FutexAccess,

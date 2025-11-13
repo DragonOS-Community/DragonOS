@@ -1,8 +1,3 @@
-SharedPrivate/PrivateAndSharedFutexTest.PIBasic/*
-SharedPrivate/PrivateAndSharedFutexTest.PIConcurrency_NoRandomSave/*
-SharedPrivate/PrivateAndSharedFutexTest.PIWaiters/*
-SharedPrivate/PrivateAndSharedFutexTest.PITryLock/*
-SharedPrivate/PrivateAndSharedFutexTest.PITryLockConcurrency_NoRandomSave/*
 # WakeAll_NoRandomSave/* encounters a segmenation fault
 SharedPrivate/PrivateAndSharedFutexTest.WakeAll_NoRandomSave/0
 SharedPrivate/PrivateAndSharedFutexTest.WakeAll_NoRandomSave/1
@@ -20,5 +15,4 @@ SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_WakeBitsetNoMatch/*
 # 这个会出现错误： [ ERROR ] (src/arch/x86_64/mm/fault.rs:266)      can not find nearest vma, error_code: (empty), address: 0x1
 SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondSuccess/*
 
-SharedPrivate/PrivateAndSharedFutexTest.PI*
 

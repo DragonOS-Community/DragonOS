@@ -67,7 +67,7 @@ impl Syscall for SysAltStackHandle {
 
         let pcb = ProcessManager::current_pcb();
         let mut stack = pcb.sig_altstack_mut();
-        let is_on_stack = stack.on_sig_stack(frame.rsp as usize);
+        let is_on_stack = stack.on_sig_stack(frame.stack_pointer());
 
         if !old_ss.is_null() {
             let mut old_stack_user = StackUser::new();

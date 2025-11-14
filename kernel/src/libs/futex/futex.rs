@@ -4,12 +4,10 @@ use alloc::{
 };
 use core::{
     hash::{Hash, Hasher},
-    ops::{Deref, DerefMut},
-};
-use core::{
     intrinsics::{likely, unlikely},
     mem,
-    sync::atomic::AtomicU64,
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicU32, Ordering},
 };
 use log::warn;
 
@@ -61,7 +59,7 @@ pub struct Futex;
 // 对于同一个futex的进程或线程将会在这个bucket等待
 pub struct FutexHashBucket {
     // 该futex维护的等待队列
-    chain: LinkedList<Arc<FutexObj>>,
+    pub(super) chain: LinkedList<Arc<FutexObj>>,
 }
 
 impl FutexHashBucket {
@@ -97,38 +95,45 @@ impl FutexHashBucket {
         nr_wake: u32,
     ) -> Result<usize, SystemError> {
         let mut count = 0;
-        let mut pop_count = 0;
-        while let Some(futex_q) = self.chain.pop_front() {
-            if futex_q.key == key {
-                // TODO: 考虑优先级继承的机制
+        // 记录初始队列长度，确保只遍历一次
+        let initial_len = self.chain.len();
+        let mut processed = 0;
 
+        while processed < initial_len && count < nr_wake {
+            if let Some(futex_q) = self.chain.pop_front() {
+                // 检查key是否匹配
+                if futex_q.key != key {
+                    // key不匹配，放回队列尾部
+                    self.chain.push_back(futex_q);
+                    processed += 1;
+                    continue;
+                }
+
+                // 检查bitset是否匹配
                 if let Some(bitset) = bitset {
                     if futex_q.bitset & bitset == 0 {
+                        // bitset不匹配，放回队列尾部
                         self.chain.push_back(futex_q);
+                        processed += 1;
                         continue;
                     }
                 }
 
-                // 唤醒
-                if futex_q.pcb.upgrade().is_some() {
-                    self.remove(futex_q.clone());
-                    ProcessManager::wakeup(&futex_q.pcb.upgrade().unwrap())?;
+                // key和bitset都匹配，尝试唤醒
+                // 注意：pop_front已经将futex_q从队列中移除，无需再次调用remove
+                if let Some(pcb) = futex_q.pcb.upgrade() {
+                    // TODO: 考虑优先级继承的机制
+                    ProcessManager::wakeup(&pcb)?;
+                    count += 1;
                 }
-
-                // 判断唤醒数
-                count += 1;
-                if count >= nr_wake {
-                    break;
-                }
+                // 如果pcb已经被释放，也算处理了一个，继续下一个
+                processed += 1;
             } else {
-                self.chain.push_back(futex_q);
-            }
-            // 判断是否循环完队列了
-            pop_count += 1;
-            if pop_count >= self.chain.len() {
+                // 队列为空，退出
                 break;
             }
         }
+
         Ok(count as usize)
     }
 
@@ -142,9 +147,9 @@ impl FutexHashBucket {
 
 #[derive(Debug)]
 pub struct FutexObj {
-    pcb: Weak<ProcessControlBlock>,
-    key: FutexKey,
-    bitset: u32,
+    pub(super) pcb: Weak<ProcessControlBlock>,
+    pub(super) key: FutexKey,
+    pub(super) bitset: u32,
     // TODO: 优先级继承
 }
 
@@ -356,6 +361,10 @@ impl Futex {
     }
 
     // ### 唤醒指定futex上挂起的最多nr_wake个进程
+    ///
+    /// ### Linux 语义
+    /// 根据 Linux 的实际行为，即使 nr_wake 为 0，FUTEX_WAKE 也会唤醒至少一个等待者。
+    /// 这是 FUTEX_WAKE 特有的行为，其他操作如 FUTEX_REQUEUE 不适用此规则。
     pub fn futex_wake(
         uaddr: VirtAddr,
         flags: FutexFlag,
@@ -383,8 +392,11 @@ impl Futex {
             return Ok(0);
         }
 
+        // Linux 行为：即使 nr_wake 为 0，也至少唤醒一个等待者
+        let effective_nr_wake = if nr_wake == 0 { 1 } else { nr_wake };
+
         // 从队列中唤醒
-        let count = bucket_mut.wake_up(key.clone(), Some(bitset), nr_wake)?;
+        let count = bucket_mut.wake_up(key.clone(), Some(bitset), effective_nr_wake)?;
 
         drop(binding);
 
@@ -514,7 +526,7 @@ impl Futex {
         Ok(wake_count)
     }
 
-    fn get_futex_key(
+    pub(super) fn get_futex_key(
         uaddr: VirtAddr,
         fshared: bool,
         _access: FutexAccess,
@@ -677,25 +689,25 @@ impl Futex {
 
         let oldval = reader.read_one_from_user::<u32>(0)?;
 
-        let atomic_addr = AtomicU64::new(uaddr.data() as u64);
-        // 这个指针是指向指针的指针
-        let ptr = atomic_addr.as_ptr();
+        // 直接获取用户空间地址的原始指针
+        let ptr = uaddr.as_ptr::<u32>();
+
         match op {
             FutexOP::FUTEX_OP_SET => unsafe {
-                *((*ptr) as *mut u32) = oparg;
+                *ptr = oparg;
             },
             FutexOP::FUTEX_OP_ADD => unsafe {
-                *((*ptr) as *mut u32) += oparg;
+                *ptr = (*ptr).wrapping_add(oparg);
             },
             FutexOP::FUTEX_OP_OR => unsafe {
-                *((*ptr) as *mut u32) |= oparg;
+                *ptr |= oparg;
             },
             // ANDN 语义：new = old & ~oparg
             FutexOP::FUTEX_OP_ANDN => unsafe {
-                *((*ptr) as *mut u32) &= !oparg;
+                *ptr &= !oparg;
             },
             FutexOP::FUTEX_OP_XOR => unsafe {
-                *((*ptr) as *mut u32) ^= oparg;
+                *ptr ^= oparg;
             },
             _ => return Err(SystemError::ENOSYS),
         }
@@ -797,6 +809,11 @@ impl RobustListHead {
     /// ## 说明
     /// 该函数将目标进程的robust list head的用户空间地址写入到*head_ptr_uaddr,
     /// 将robust list head的大小写入到*len_ptr_uaddr
+    ///
+    /// ## 注意
+    /// 根据Linux的行为，即使没有设置robust list，该函数也应该返回成功(0)，
+    /// 并将head设置为NULL/0，len设置为sizeof(PosixRobustListHead)。
+    /// 这是为了让用户态程序能够检测内核是否支持robust futex功能。
     pub fn get_robust_list(
         pid: usize,
         head_ptr_uaddr: VirtAddr,
@@ -815,9 +832,6 @@ impl RobustListHead {
             return Err(SystemError::EPERM);
         }
 
-        //获取当前线程的robust list head
-        let robust_list_head = (*pcb.get_robust_list()).ok_or(SystemError::EINVAL)?;
-
         // 将len(即sizeof(PosixRobustListHead))拷贝到用户空间len_ptr
         let mut user_writer = UserBufferWriter::new(
             len_ptr_uaddr.as_ptr::<usize>(),
@@ -826,14 +840,20 @@ impl RobustListHead {
         )?;
         user_writer.copy_one_to_user(&mem::size_of::<PosixRobustListHead>(), 0)?;
 
+        // 获取当前线程的robust list head
+        let robust_list_head_opt = *pcb.get_robust_list();
+
         // 将robust list head的用户空间地址拷贝到用户空间head_ptr
         // 注意: head_ptr_uaddr是二级指针,我们要写入的是robust_list_head.uaddr(一级指针)
+        // 如果没有设置robust list，则写入0（NULL）
+        let head_uaddr = robust_list_head_opt.map(|rh| rh.uaddr.data()).unwrap_or(0);
+
         let mut user_writer = UserBufferWriter::new(
             head_ptr_uaddr.as_ptr::<usize>(),
             mem::size_of::<usize>(),
             true,
         )?;
-        user_writer.copy_one_to_user(&robust_list_head.uaddr.data(), 0)?;
+        user_writer.copy_one_to_user(&head_uaddr, 0)?;
 
         return Ok(0);
     }
@@ -844,11 +864,36 @@ impl RobustListHead {
     /// - pid：当前进程/线程的pid
     pub fn exit_robust_list(pcb: Arc<ProcessControlBlock>) {
         //指向当前进程的robust list头部的指针
-        let head = match *pcb.get_robust_list() {
+        let head_info = match *pcb.get_robust_list() {
             Some(rl) => rl,
             None => {
                 return;
             }
+        };
+
+        // 重新从用户空间读取 robust list head 的最新内容
+        // 因为用户态可能在锁定 mutex 后已经更新了链表
+        let user_buffer_reader = match UserBufferReader::new(
+            head_info.uaddr.as_ptr::<PosixRobustListHead>(),
+            core::mem::size_of::<PosixRobustListHead>(),
+            true,
+        ) {
+            Ok(reader) => reader,
+            Err(_) => {
+                return;
+            }
+        };
+
+        let posix_head = match user_buffer_reader.read_one_from_user::<PosixRobustListHead>(0) {
+            Ok(head) => *head,
+            Err(_) => {
+                return;
+            }
+        };
+
+        let head = RobustListHead {
+            posix: posix_head,
+            uaddr: head_info.uaddr,
         };
 
         // 遍历当前进程/线程的robust list
@@ -883,21 +928,6 @@ impl RobustListHead {
             .and_then(|reader| reader.read_one_from_user::<u32>(0).ok().cloned())
     }
 
-    /// # 安全地向用户空间写入u32值，如果地址无效则返回false
-    fn safe_write_u32(addr: VirtAddr, val: u32) -> bool {
-        // 尝试写入
-        let mut writer = match UserBufferWriter::new_checked(
-            addr.as_ptr::<u32>(),
-            core::mem::size_of::<u32>(),
-            true,
-        ) {
-            Ok(w) => w,
-            Err(_) => return false,
-        };
-
-        writer.copy_one_to_user(&val, 0).is_ok()
-    }
-
     /// # 处理进程即将死亡时，进程已经持有的futex，唤醒其他等待该futex的线程
     /// ## 参数
     /// - futex_uaddr：futex的用户空间地址
@@ -913,6 +943,12 @@ impl RobustListHead {
         };
 
         let mut uval = futex_val;
+
+        // 获取futex的原子操作指针
+        // 使用 AtomicU32::from_ptr() 从原始指针创建原子操作对象
+        // 注意：这里我们已经通过safe_read验证了地址的有效性
+        let atomic_futex = unsafe { AtomicU32::from_ptr(futex_uaddr.as_ptr::<u32>()) };
+
         loop {
             // 该futex可能被其他进程占有
             let owner = uval & FUTEX_TID_MASK;
@@ -920,32 +956,27 @@ impl RobustListHead {
                 break;
             }
 
-            // 判断是否有FUTEX_WAITERS和标记FUTEX_OWNER_DIED
+            // 计算新值: 保留FUTEX_WAITERS标志，设置FUTEX_OWNER_DIED，清除TID
             let mval = (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
 
-            // 安全地读取当前值
-            let nval = match Self::safe_read_u32(futex_uaddr) {
-                Some(val) => val,
-                None => break, // 读取失败，退出循环
-            };
-
-            if nval != mval {
-                uval = nval;
-                // 安全地写入新值
-                if !Self::safe_write_u32(futex_uaddr, mval) {
-                    continue; // 写入失败，继续下一次循环
+            // 使用真正的原子CAS操作
+            match atomic_futex.compare_exchange(uval, mval, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => {
+                    // CAS成功，检查是否需要唤醒等待者
+                    if mval & FUTEX_WAITERS != 0 {
+                        let mut flags = FutexFlag::FLAGS_MATCH_NONE;
+                        flags.insert(FutexFlag::FLAGS_SHARED);
+                        // 唤醒操作可能会失败，但不影响流程
+                        let _ = Futex::futex_wake(futex_uaddr, flags, 1, FUTEX_BITSET_MATCH_ANY);
+                    }
+                    break;
                 }
-                continue;
+                Err(current) => {
+                    // CAS失败，说明值被其他线程修改了，更新uval并重试
+                    uval = current;
+                    continue;
+                }
             }
-
-            // 有等待者,进行唤醒操作
-            if nval & FUTEX_WAITERS != 0 {
-                let mut flags = FutexFlag::FLAGS_MATCH_NONE;
-                flags.insert(FutexFlag::FLAGS_SHARED);
-                // 唤醒操作可能会失败，但不影响流程
-                let _ = Futex::futex_wake(futex_uaddr, flags, 1, FUTEX_BITSET_MATCH_ANY);
-            }
-            break;
         }
 
         return Ok(0);
@@ -970,6 +1001,13 @@ impl<'a> FutexIterator<'a> {
     fn is_end(&mut self) -> bool {
         return self.count < 0;
     }
+
+    /// 检查是否到达链表末尾（entry 指回 head.list）
+    fn is_sentinel(&self) -> bool {
+        // 链表的哨兵是 &head.list，其地址就是 head.uaddr
+        // 因为 list 是 head 结构的第一个字段
+        self.entry.data() == self.robust_list_head.uaddr.data()
+    }
 }
 
 impl Iterator for FutexIterator<'_> {
@@ -980,8 +1018,14 @@ impl Iterator for FutexIterator<'_> {
             return None;
         }
 
-        while self.entry.data() != self.robust_list_head.uaddr.data() {
-            if self.count == ROBUST_LIST_LIMIT {
+        // 如果初始 entry 就是哨兵，说明链表为空
+        if self.count == 0 && self.is_sentinel() {
+            self.count = -1;
+            return self.robust_list_head.pending_uaddr();
+        }
+
+        while !self.is_sentinel() {
+            if self.count >= ROBUST_LIST_LIMIT {
                 break;
             }
             if self.entry.is_null() {
@@ -1005,14 +1049,14 @@ impl Iterator for FutexIterator<'_> {
                 })?;
 
             self.entry = next_entry.next;
-
             self.count += 1;
 
             if futex_uaddr.is_some() {
                 return futex_uaddr;
             }
         }
-        self.count -= 1;
+
+        self.count = -1;
         self.robust_list_head.pending_uaddr()
     }
 }

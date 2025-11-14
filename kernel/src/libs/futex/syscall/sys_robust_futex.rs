@@ -41,7 +41,9 @@ impl Syscall for SysSetRobustListHandle {
         // 判断用户空间地址的合法性
         verify_area(head, core::mem::size_of::<u32>())?;
 
-        crate::libs::futex::futex::RobustListHead::set_robust_list(head, len)
+        let result = crate::libs::futex::futex::RobustListHead::set_robust_list(head, len);
+
+        result
     }
 
     /// Formats the syscall parameters for display/debug purposes

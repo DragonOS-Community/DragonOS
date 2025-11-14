@@ -30,7 +30,7 @@ impl Syscall for SysGetitimerHandle {
         let which = args[0] as i32;
         let curr_value_ptr = args[1] as *mut Itimerval;
 
-        if which < ITIMER_REAL || which > ITIMER_PROF {
+        if !(ITIMER_REAL..=ITIMER_PROF).contains(&which) {
             return Err(SystemError::EINVAL);
         }
 

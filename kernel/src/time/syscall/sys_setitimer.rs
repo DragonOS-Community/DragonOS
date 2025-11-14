@@ -206,7 +206,7 @@ impl Syscall for SysSetitimerHandle {
         let new_value_ptr = args[1] as *const Itimerval;
         let old_value_ptr = args[2] as *mut Itimerval;
 
-        if which < ITIMER_REAL || which > ITIMER_PROF {
+        if !(ITIMER_REAL..=ITIMER_PROF).contains(&which) {
             return Err(SystemError::EINVAL);
         }
 

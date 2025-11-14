@@ -9,6 +9,7 @@ use crate::process::pid::PidPrivateData;
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
+        block::loop_device::loop_device::LoopPrivateData,
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::{
@@ -38,6 +39,8 @@ pub enum FilePrivateData {
     EPoll(EPollPrivateData),
     /// pid私有信息
     Pid(PidPrivateData),
+    //loop私有信息
+    Loop(LoopPrivateData),
     /// 不需要文件私有信息
     Unused,
 }

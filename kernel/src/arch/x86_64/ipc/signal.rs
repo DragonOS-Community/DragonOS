@@ -842,7 +842,7 @@ fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> *mut 
     }
 
     // 16字节对齐，减8是为了保持 x86_64 ABI 的栈对齐约定
-    rsp &= (!(STACK_ALIGN - 1)) as usize - 8;
+    rsp = (rsp & !(STACK_ALIGN - 1) as usize) - 8;
 
     rsp as *mut SigFrame
 }

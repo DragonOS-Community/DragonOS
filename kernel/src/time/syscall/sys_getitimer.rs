@@ -6,12 +6,13 @@ use crate::{
         user_access::UserBufferWriter,
     },
     time::{
-        syscall::Itimerval,
+        ns_to_timeval,
+        syscall::{Itimerval, PosixSusecondsT, PosixTimeT},
         timer::{self, Jiffies},
     },
 };
 use alloc::{string::ToString, vec::Vec};
-use core::{mem::size_of, time::Duration};
+use core::mem::size_of;
 use system_error::SystemError;
 
 const ITIMER_REAL: i32 = 0;
@@ -34,34 +35,41 @@ impl Syscall for SysGetitimerHandle {
         }
 
         let pcb = ProcessManager::current_pcb();
-        let itimers = pcb.itimers.lock();
-
-        let timer_slot = match which {
-            ITIMER_REAL => &itimers.real,
-            // TODO: 未完全实现，应使用进程的用户态CPU时间记账。
-            ITIMER_VIRTUAL => &itimers.virt,
-            // TODO: 未完全实现，应使用进程的用户态+内核态CPU时间记账。
-            ITIMER_PROF => &itimers.prof,
-            _ => unreachable!(),
-        };
-
+        let itimers = pcb.itimers_irqsave(); // 假设使用Mutex
         let mut itv = Itimerval::default();
-        if let Some(current_itimer) = timer_slot.as_ref() {
-            itv.it_interval = current_itimer.config.it_interval;
-            // TODO: timer::clock()获取的是系统启动以来的真实时间，但对于 ITIMER_VIRTUAL 和 ITIMER_PROF，这里应该获取进程对应的CPU时间。
-            let now = timer::clock();
-            let expires = current_itimer.timer.inner().expire_jiffies;
 
-            if expires > now {
-                let remaining_jiffies = Jiffies::new(expires - now);
-                let remaining_duration = Duration::from(remaining_jiffies);
-                itv.it_value.tv_sec = remaining_duration.as_secs() as i64;
-                itv.it_value.tv_usec = remaining_duration.subsec_micros() as i32;
+        match which {
+            ITIMER_REAL => {
+                // 读取真实时间定时器
+                if let Some(current_itimer) = itimers.real.as_ref() {
+                    itv.it_interval = current_itimer.config.it_interval;
+                    let now = timer::clock();
+                    let expires = current_itimer.timer.inner().expire_jiffies;
+
+                    if expires > now {
+                        let remaining_jiffies = Jiffies::new(expires - now);
+                        let remaining_duration = core::time::Duration::from(remaining_jiffies);
+                        itv.it_value.tv_sec = remaining_duration.as_secs() as PosixTimeT;
+                        itv.it_value.tv_usec =
+                            remaining_duration.subsec_micros() as PosixSusecondsT;
+                    }
+                }
             }
-            // 如果已过期，it_value 默认是 0，这是正确的
+            ITIMER_VIRTUAL => {
+                if itimers.virt.is_active {
+                    itv.it_value = ns_to_timeval(itimers.virt.value);
+                    itv.it_interval = ns_to_timeval(itimers.virt.interval);
+                }
+            }
+            ITIMER_PROF => {
+                if itimers.prof.is_active {
+                    itv.it_value = ns_to_timeval(itimers.prof.value);
+                    itv.it_interval = ns_to_timeval(itimers.prof.interval);
+                }
+            }
+            _ => unreachable!(),
         }
 
-        // 写入用户空间
         if !curr_value_ptr.is_null() {
             let mut writer = UserBufferWriter::new(curr_value_ptr, size_of::<Itimerval>(), true)?;
             writer.copy_one_to_user(&itv, 0)?;

@@ -463,12 +463,10 @@ impl ProcessManager {
                 // 按 Linux 语义：先清零 userland 的 *clear_child_tid，再 futex_wake(addr)
                 unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
                 if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
-                    let _ = Futex::futex_wake(
-                        addr,
-                        FutexFlag::FLAGS_MATCH_NONE,
-                        1,
-                        FUTEX_BITSET_MATCH_ANY,
-                    );
+                    // Linux 使用 FUTEX_SHARED 标志来唤醒 clear_child_tid
+                    // 这允许跨进程/线程的同步（例如 pthread_join）
+                    let _ =
+                        Futex::futex_wake(addr, FutexFlag::FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY);
                 }
             }
             compiler_fence(Ordering::SeqCst);
@@ -479,6 +477,7 @@ impl ProcessManager {
                 thread.vfork_done.as_ref().unwrap().complete_all();
             }
             drop(thread);
+
             unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空

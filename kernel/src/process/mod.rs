@@ -4,7 +4,7 @@ use core::{
     hint::spin_loop,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -727,6 +727,21 @@ impl ProcessFlags {
     }
 }
 
+// TODO 完善相关的方法
+#[derive(Debug, Default)]
+pub struct ProcessCpuTime {
+    pub utime: AtomicU64,
+    pub stime: AtomicU64,
+    pub sum_exec_runtime: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+pub struct CpuItimer {
+    pub value: u64,    // 剩余时间 ns
+    pub interval: u64, // 间隔时间 ns
+    pub is_active: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProcessItimer {
     pub timer: Arc<crate::time::timer::Timer>,
@@ -735,9 +750,9 @@ pub struct ProcessItimer {
 
 #[derive(Debug, Default)]
 pub struct ProcessItimers {
-    pub real: Option<ProcessItimer>,
-    pub virt: Option<ProcessItimer>,
-    pub prof: Option<ProcessItimer>,
+    pub real: Option<ProcessItimer>, // 用于 ITIMER_REAL
+    pub virt: CpuItimer,             // 用于 ITIMER_REAL
+    pub prof: CpuItimer,             // 用于 ITIMER_PROF
 }
 
 #[derive(Debug)]
@@ -798,7 +813,10 @@ pub struct ProcessControlBlock {
 
     ///闹钟定时器
     alarm_timer: SpinLock<Option<AlarmTimer>>,
-    pub itimers: SpinLock<ProcessItimers>,
+    itimers: SpinLock<ProcessItimers>,
+
+    /// CPU时间片
+    cpu_time: Arc<ProcessCpuTime>,
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
@@ -928,6 +946,7 @@ impl ProcessControlBlock {
                 fs: RwLock::new(Arc::new(FsStruct::new())),
                 alarm_timer: SpinLock::new(None),
                 itimers: SpinLock::new(ProcessItimers::default()),
+                cpu_time: Arc::new(ProcessCpuTime::default()),
                 robust_list: RwLock::new(None),
                 cred: SpinLock::new(cred),
                 self_ref: weak.clone(),
@@ -1436,8 +1455,39 @@ impl ProcessControlBlock {
         *self.robust_list.write_irqsave() = new_robust_list;
     }
 
+    #[inline(always)]
     pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<'_, Option<AlarmTimer>> {
         return self.alarm_timer.lock_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn itimers_irqsave(&self) -> SpinLockGuard<'_, ProcessItimers> {
+        return self.itimers.lock_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn cputime(&self) -> Arc<ProcessCpuTime> {
+        return self.cpu_time.clone();
+    }
+    #[inline(always)]
+    pub fn account_utime(&self, ns: u64) {
+        if ns == 0 {
+            return;
+        }
+        self.cpu_time.utime.fetch_add(ns, Ordering::Relaxed);
+    }
+    #[inline(always)]
+    pub fn account_stime(&self, ns: u64) {
+        if ns == 0 {
+            return;
+        }
+        self.cpu_time.stime.fetch_add(ns, Ordering::Relaxed);
+    }
+    #[inline(always)]
+    pub fn add_sum_exec_runtime(&self, ns: u64) {
+        self.cpu_time
+            .sum_exec_runtime
+            .fetch_add(ns, Ordering::Relaxed);
     }
 
     /// Exit fd table when process exit

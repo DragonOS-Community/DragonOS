@@ -13,6 +13,7 @@ use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 // 根据Linux UAPI定义
 const SS_ONSTACK: c_int = 1;
 const SS_DISABLE: c_int = 2;
+const SS_AUTODISARM: c_int = 1 << 31;
 
 // 最小信号栈大小
 const MINSIGSTKSZ: usize = 2048;
@@ -64,8 +65,8 @@ impl Syscall for SysAltStackHandle {
         let ss = Self::ss(args);
         let old_ss = Self::old_ss(args);
 
-        let binding = ProcessManager::current_pcb();
-        let mut stack = binding.sig_altstack_mut();
+        let pcb = ProcessManager::current_pcb();
+        let mut stack = pcb.sig_altstack_mut();
         let is_on_stack = stack.on_sig_stack(frame.rsp as usize);
 
         if !old_ss.is_null() {
@@ -78,7 +79,8 @@ impl Syscall for SysAltStackHandle {
             } else if is_on_stack {
                 old_stack_user.ss_flags = SS_ONSTACK;
             } else {
-                old_stack_user.ss_flags = 0; // 栈已启用但当前不在其上
+                // 栈已启用但当前不在其上
+                old_stack_user.ss_flags = stack.flags as c_int; // 保留 SS_AUTODISARM 等标志
             }
 
             let mut writer = UserBufferWriter::new(old_ss, size_of::<StackUser>(), true)?;
@@ -86,8 +88,6 @@ impl Syscall for SysAltStackHandle {
         }
 
         if !ss.is_null() {
-            // 需要向 current() 中结构体写入 ss 的内容
-            //log::info!("ss impl");
             if is_on_stack {
                 return Err(SystemError::EPERM);
             }
@@ -96,25 +96,21 @@ impl Syscall for SysAltStackHandle {
             let sus: &[StackUser] = reader.read_from_user(0)?;
             let ss: StackUser = sus[0];
 
-            // stack.sp = ss.ss_sp as usize;
-            // stack.flags = ss.ss_flags as u32;
-            // stack.size = ss.ss_size as u32;
-            if (ss.ss_flags & !SS_DISABLE) != 0 {
+            if (ss.ss_flags & !(SS_DISABLE | SS_AUTODISARM)) != 0 {
                 return Err(SystemError::EINVAL);
             }
             // 如果用户请求禁用备用栈
             if ss.ss_flags & SS_DISABLE != 0 {
+                stack.sp = 0;
                 stack.flags = SS_DISABLE as u32;
+                stack.size = 0;
             } else {
                 // 如果用户请求设置一个新的栈
-                if ss.ss_sp.is_null() {
-                    return Err(SystemError::EFAULT); // 或者 EINVAL ?
-                }
                 if ss.ss_size < MINSIGSTKSZ {
                     return Err(SystemError::ENOMEM);
                 }
                 stack.sp = ss.ss_sp as usize;
-                stack.flags = 0; // 标记为已启用
+                stack.flags = ss.ss_flags as u32; // 保留 SS_AUTODISARM 等标志
                 stack.size = ss.ss_size as u32;
             }
         }

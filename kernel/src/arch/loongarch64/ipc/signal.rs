@@ -42,6 +42,12 @@ impl LoongArch64SigStack {
             size: 0,
         }
     }
+
+    /// 检查给定的栈指针 `sp` 是否在当前备用信号栈的范围内。
+    #[inline]
+    pub fn on_sig_stack(&self, sp: usize) -> bool {
+        self.sp != 0 && self.size != 0 && (sp.wrapping_sub(self.sp) < self.size as usize)
+    }
 }
 
 impl Default for LoongArch64SigStack {

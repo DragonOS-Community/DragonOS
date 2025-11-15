@@ -40,7 +40,7 @@ impl Syscall for SysPwriteVHandle {
 
         // 将用户态传入的指向用户态应用的数据结构重新在内核栈上构造
         let iovecs = unsafe { IoVecs::from_user(iov, iov_count, false) }?;
-        let data = iovecs.gather();
+        let data = iovecs.gather()?;
 
         do_pwritev(fd, &data, offset)
     }

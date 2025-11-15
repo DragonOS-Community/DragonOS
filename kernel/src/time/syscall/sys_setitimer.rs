@@ -7,10 +7,8 @@ use crate::{
         user_access::{UserBufferReader, UserBufferWriter},
     },
     time::{
-        ns_to_timeval,
-        syscall::{Itimerval, PosixTimeval},
+        syscall::{ItimerType, Itimerval, PosixTimeval},
         timer::{self, Jiffies, Timer, TimerFunction},
-        timeval_to_ns,
     },
 };
 use alloc::{
@@ -22,19 +20,19 @@ use alloc::{
 use core::{mem::size_of, time::Duration};
 use system_error::SystemError;
 
-const ITIMER_REAL: i32 = 0;
-const ITIMER_VIRTUAL: i32 = 1;
-const ITIMER_PROF: i32 = 2;
-
 #[derive(Debug)]
 struct ItimerHelper {
     target_pcb: Weak<ProcessControlBlock>,
-    which: i32,
+    which: ItimerType,
     interval: PosixTimeval,
 }
 
 impl ItimerHelper {
-    fn new(target_pcb: Arc<ProcessControlBlock>, which: i32, interval: PosixTimeval) -> Box<Self> {
+    fn new(
+        target_pcb: Arc<ProcessControlBlock>,
+        which: ItimerType,
+        interval: PosixTimeval,
+    ) -> Box<Self> {
         Box::new(Self {
             target_pcb: Arc::downgrade(&target_pcb),
             which,
@@ -135,7 +133,7 @@ fn handle_itimer_real(
             let expire_jiffies =
                 timer::clock() + <Jiffies as From<Duration>>::from(value_duration).data();
 
-            let helper = ItimerHelper::new(pcb.clone(), ITIMER_REAL, new_config.it_interval);
+            let helper = ItimerHelper::new(pcb.clone(), ItimerType::Real, new_config.it_interval);
             let new_timer = Timer::new(helper, expire_jiffies);
             new_timer.activate();
 
@@ -152,12 +150,12 @@ fn handle_itimer_real(
 /// 处理 ITIMER_VIRTUAL 和 ITIMER_PROF
 fn handle_itimer_cpu(
     pcb: Arc<ProcessControlBlock>,
-    which: i32,
+    which: ItimerType,
     new_value_ptr: *const Itimerval,
     old_value_ptr: *mut Itimerval,
 ) -> Result<usize, SystemError> {
     let mut itimers = pcb.itimers_irqsave();
-    let cpu_timer_slot = if which == ITIMER_VIRTUAL {
+    let cpu_timer_slot = if which == ItimerType::Virtual {
         &mut itimers.virt
     } else {
         &mut itimers.prof
@@ -167,8 +165,8 @@ fn handle_itimer_cpu(
     if !old_value_ptr.is_null() {
         let mut old_itv = Itimerval::default();
         if cpu_timer_slot.is_active {
-            old_itv.it_value = ns_to_timeval(cpu_timer_slot.value);
-            old_itv.it_interval = ns_to_timeval(cpu_timer_slot.interval);
+            old_itv.it_value = PosixTimeval::from_ns(cpu_timer_slot.value);
+            old_itv.it_interval = PosixTimeval::from_ns(cpu_timer_slot.interval);
         }
         let mut writer = UserBufferWriter::new(old_value_ptr, size_of::<Itimerval>(), true)?;
         writer.copy_one_to_user(&old_itv, 0)?;
@@ -180,11 +178,11 @@ fn handle_itimer_cpu(
         let reader = UserBufferReader::new(new_value_ptr, size_of::<Itimerval>(), true)?;
         reader.copy_one_from_user(&mut new_config, 0)?;
 
-        let value_ns = timeval_to_ns(&new_config.it_value);
+        let value_ns = new_config.it_value.to_ns();
         if value_ns > 0 {
             // 激活或重置定时器
             cpu_timer_slot.value = value_ns;
-            cpu_timer_slot.interval = timeval_to_ns(&new_config.it_interval);
+            cpu_timer_slot.interval = new_config.it_interval.to_ns();
             cpu_timer_slot.is_active = true;
         } else {
             // value 为 0，表示取消定时器
@@ -196,35 +194,50 @@ fn handle_itimer_cpu(
 
 pub struct SysSetitimerHandle;
 
+impl SysSetitimerHandle {
+    fn which(args: &[usize]) -> Result<ItimerType, SystemError> {
+        ItimerType::try_from(args[0] as i32)
+    }
+
+    fn new_value_ptr(args: &[usize]) -> *const Itimerval {
+        args[1] as *const Itimerval
+    }
+
+    fn old_value_ptr(args: &[usize]) -> *mut Itimerval {
+        args[2] as *mut Itimerval
+    }
+}
+
 impl Syscall for SysSetitimerHandle {
     fn num_args(&self) -> usize {
         3
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let which = args[0] as i32;
-        let new_value_ptr = args[1] as *const Itimerval;
-        let old_value_ptr = args[2] as *mut Itimerval;
-
-        if !(ITIMER_REAL..=ITIMER_PROF).contains(&which) {
-            return Err(SystemError::EINVAL);
-        }
+        let which = Self::which(args)?;
+        let new_value_ptr = Self::new_value_ptr(args);
+        let old_value_ptr = Self::old_value_ptr(args);
 
         let pcb = ProcessManager::current_pcb();
 
         // 根据定时器类型，分派到不同的处理函数
         match which {
-            ITIMER_REAL => handle_itimer_real(pcb, new_value_ptr, old_value_ptr),
-            ITIMER_VIRTUAL | ITIMER_PROF => {
+            ItimerType::Real => handle_itimer_real(pcb, new_value_ptr, old_value_ptr),
+            ItimerType::Virtual | ItimerType::Prof => {
                 handle_itimer_cpu(pcb, which, new_value_ptr, old_value_ptr)
             }
-            _ => unreachable!(),
         }
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
+        let which_str = match ItimerType::try_from(args[0] as i32) {
+            Ok(ItimerType::Real) => "ITIMER_REAL".to_string(),
+            Ok(ItimerType::Virtual) => "ITIMER_VIRTUAL".to_string(),
+            Ok(ItimerType::Prof) => "ITIMER_PROF".to_string(),
+            Err(_) => format!("Invalid({})", args[0]),
+        };
         vec![
-            FormattedSyscallParam::new("which", (args[0] as i32).to_string()),
+            FormattedSyscallParam::new("which", which_str),
             FormattedSyscallParam::new("new_value", format!("{:#x}", args[1])),
             FormattedSyscallParam::new("old_value", format!("{:#x}", args[2])),
         ]

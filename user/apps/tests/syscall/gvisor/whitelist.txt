@@ -18,6 +18,7 @@ mknod_test
 unlink_test
 lseek_test
 sync_test
+chroot_test
 #stat_test
 #chmod_test
 #chown_test

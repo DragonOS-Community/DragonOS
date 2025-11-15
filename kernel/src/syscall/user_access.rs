@@ -57,6 +57,7 @@ pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemEr
 
 /// Copy data from user space to kernel space
 pub unsafe fn copy_from_user(dst: &mut [u8], src: VirtAddr) -> Result<usize, SystemError> {
+    // 这里使用的函数错误了, verify_area() 函数只简单的检查 `src` 是否存在于用户地址空间，而不检查 `src` 是否真的被分配给用户进程使用。
     verify_area(src, dst.len()).map_err(|_| SystemError::EFAULT)?;
     let src: &[u8] = core::slice::from_raw_parts(src.data() as *const u8, dst.len());
     // 拷贝数据
@@ -195,7 +196,7 @@ impl UserBufferReader<'_> {
         len: usize,
         from_user: bool,
     ) -> Result<Self, SystemError> {
-        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, false) {
+        if !is_user_accessable(VirtAddr::new(addr as usize), len, false) {
             return Err(SystemError::EFAULT);
         }
 
@@ -401,7 +402,7 @@ impl UserBufferReader<'_> {
     ) -> Result<&[T], SystemError> {
         let size = src.len().saturating_sub(offset);
         if size > 0
-            && !check_user_access_by_page_table(
+            && !is_user_accessable(
                 VirtAddr::new(src.as_ptr() as usize + offset),
                 size,
                 false,
@@ -432,7 +433,7 @@ impl UserBufferReader<'_> {
         if offset + size > src.len() {
             return Err(SystemError::EINVAL);
         }
-        if !check_user_access_by_page_table(
+        if !is_user_accessable(
             VirtAddr::new(src.as_ptr() as usize + offset),
             size,
             false,
@@ -464,7 +465,7 @@ impl<'a> UserBufferWriter<'a> {
     }
 
     pub fn new_checked<U>(addr: *mut U, len: usize, from_user: bool) -> Result<Self, SystemError> {
-        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, true) {
+        if !is_user_accessable(VirtAddr::new(addr as usize), len, true) {
             return Err(SystemError::EFAULT);
         }
 
@@ -607,7 +608,7 @@ impl<'a> UserBufferWriter<'a> {
     ) -> Result<&mut [T], SystemError> {
         let size = src.len().saturating_sub(offset);
         if size > 0
-            && !check_user_access_by_page_table(
+            && !is_user_accessable(
                 VirtAddr::new(src.as_ptr() as usize + offset),
                 size,
                 true,
@@ -637,7 +638,7 @@ impl<'a> UserBufferWriter<'a> {
         if offset + size > src.len() {
             return Err(SystemError::EINVAL);
         }
-        if !check_user_access_by_page_table(
+        if !is_user_accessable(
             VirtAddr::new(src.as_ptr() as usize + offset),
             size,
             true,
@@ -662,7 +663,7 @@ impl<'a> UserBufferWriter<'a> {
 /// # Returns
 /// * `true` if all pages are mapped and have required permissions
 /// * `false` if any page is not mapped or lacks required permissions
-fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: bool) -> bool {
+fn is_user_accessable(addr: VirtAddr, size: usize, check_write: bool) -> bool {
     // Check if address is valid
     if addr.is_null() {
         return false;

@@ -377,6 +377,16 @@ bitflags! {
     }
 }
 
+bitflags! {
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct GenericSigStackFlags:u32{
+        const SS_ONSTACK = 1;
+        const SS_DISABLE = 2;
+        const SS_AUTODISARM = 1 << 31;
+    }
+}
+
 /// 信号默认处理函数——终止进程
 fn sig_terminate(sig: Signal) {
     ProcessManager::exit(sig as usize);

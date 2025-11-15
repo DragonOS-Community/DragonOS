@@ -8,6 +8,7 @@ use system_error::SystemError;
 pub use crate::ipc::generic_signal::AtomicGenericSignal as AtomicSignal;
 pub use crate::ipc::generic_signal::GenericSigChildCode as SigChildCode;
 pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
+pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
 
 use crate::{
@@ -349,13 +350,11 @@ bitflags! {
     }
 }
 
-pub const SS_DISABLE: u32 = 2;
-
 /// 信号处理备用栈的信息（用于 sigaltstack）
 #[derive(Debug, Clone, Copy)]
 pub struct X86SigStack {
     pub sp: usize,
-    pub flags: u32,
+    pub flags: SigStackFlags,
     pub size: u32,
 }
 
@@ -363,7 +362,7 @@ impl X86SigStack {
     pub fn new() -> Self {
         Self {
             sp: 0,
-            flags: SS_DISABLE,
+            flags: SigStackFlags::SS_DISABLE,
             size: 0,
         }
     }
@@ -832,7 +831,7 @@ fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> *mut 
 
     // 检查是否使用备用栈
     if sigaction.flags().contains(SigFlags::SA_ONSTACK)
-        && (stack.flags & SS_DISABLE) == 0
+        && !stack.flags.contains(SigStackFlags::SS_DISABLE)
         && !stack.on_sig_stack(frame.rsp as usize)
     {
         rsp = stack.sp + stack.size as usize - size;

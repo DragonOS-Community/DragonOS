@@ -559,27 +559,3 @@ pub trait TimeArch {
     /// 将CPU的时钟周期数转换为纳秒
     fn cycles2ns(cycles: usize) -> usize;
 }
-
-const NANOS_PER_SEC: u64 = 1_000_000_000;
-const MICROS_PER_SEC: u64 = 1_000_000;
-const NANOS_PER_USEC: u64 = 1_000;
-
-/// 将用户空间的 PosixTimeval 精确转换为内核统一使用的纳秒 (u64)。
-pub fn timeval_to_ns(tv: &PosixTimeval) -> u64 {
-    // 检查 tv_usec 是否在有效范围内，防止负数或超范围值导致算术错误。
-    if tv.tv_usec < 0 || tv.tv_usec >= MICROS_PER_SEC as syscall::PosixSusecondsT {
-        (tv.tv_sec as u64).saturating_mul(NANOS_PER_SEC)
-    } else {
-        let sec_ns = (tv.tv_sec as u64).saturating_mul(NANOS_PER_SEC);
-        let usec_ns = (tv.tv_usec as u64).saturating_mul(NANOS_PER_USEC);
-        sec_ns.saturating_add(usec_ns)
-    }
-}
-
-/// 将内核中的 u64 纳秒精确转换为用户空间的 PosixTimeval。
-pub fn ns_to_timeval(ns: u64) -> PosixTimeval {
-    PosixTimeval {
-        tv_sec: (ns / NANOS_PER_SEC) as syscall::PosixTimeT,
-        tv_usec: ((ns % NANOS_PER_SEC) / NANOS_PER_USEC) as syscall::PosixSusecondsT,
-    }
-}

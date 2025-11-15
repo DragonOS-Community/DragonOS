@@ -31,7 +31,7 @@ impl SignalArch for LoongArch64SignalArch {
 #[derive(Debug, Clone, Copy)]
 pub struct LoongArch64SigStack {
     pub sp: usize,
-    pub flags: u32,
+    pub flags: SigStackFlags,
     pub size: u32,
 }
 
@@ -39,7 +39,7 @@ impl LoongArch64SigStack {
     pub fn new() -> Self {
         Self {
             sp: 0,
-            flags: 0,
+            flags: SigStackFlags::SS_DISABLE,
             size: 0,
         }
     }

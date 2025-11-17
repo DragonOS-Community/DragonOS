@@ -53,17 +53,22 @@ pub(super) fn do_faccessat(
     return Ok(0);
 }
 
-pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize, SystemError> {
+pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: ModeType) -> Result<usize, SystemError> {
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
-    // 如果找不到文件，则返回错误码ENOENT
-    let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let target_inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-    log::warn!("do_fchmodat: not implemented yet\n");
-    // todo: 真正去改变文件的权限
+    let mut metadata = target_inode.metadata()?;
+
+    // 只修改权限位，保留文件类型位
+    let old_file_type_bits = metadata.mode.bits() & ModeType::S_IFMT.bits();
+    let new_permission_bits = mode.bits() & !ModeType::S_IFMT.bits();
+    metadata.mode = ModeType::from_bits_truncate(old_file_type_bits | new_permission_bits);
+
+    target_inode.set_metadata(&metadata)?;
 
     return Ok(0);
 }

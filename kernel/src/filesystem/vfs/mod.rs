@@ -3,6 +3,7 @@ pub mod file;
 pub mod iov;
 pub mod mount;
 pub mod open;
+pub mod permission;
 pub mod stat;
 pub mod syscall;
 pub mod utils;
@@ -19,7 +20,7 @@ use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
-    filesystem::epoll::EPollItem,
+    filesystem::{epoll::EPollItem, vfs::permission::PermissionMask},
     ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
@@ -786,6 +787,10 @@ impl dyn IndexNode {
         }
 
         let root_inode = ProcessManager::current_mntns().root_inode();
+
+        // 获取当前进程的凭证（用于路径遍历的权限检查）
+        let cred = ProcessManager::current_pcb().cred();
+
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
@@ -802,6 +807,11 @@ impl dyn IndexNode {
             if result.metadata()?.file_type != FileType::Dir {
                 return Err(SystemError::ENOTDIR);
             }
+
+            // 检查当前目录的执行权限（搜索权限）
+            // 这确保了进程有权限遍历到此目录
+            let metadata = result.metadata()?;
+            cred.inode_permission(&metadata, PermissionMask::MAY_EXEC.bits())?;
 
             let name;
             // 寻找“/”

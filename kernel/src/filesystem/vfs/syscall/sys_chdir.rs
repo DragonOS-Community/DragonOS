@@ -6,7 +6,6 @@ use alloc::{string::String, vec::Vec};
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CHDIR;
-use crate::filesystem::vfs::permission::check_chdir_permission;
 use crate::filesystem::vfs::{FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -95,7 +94,7 @@ impl Syscall for SysChdirHandle {
         let metadata = inode.metadata()?;
 
         let cred = ProcessManager::current_pcb().cred();
-        check_chdir_permission(&metadata, &cred)?;
+        cred.check_chdir_permission(&metadata)?;
 
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(new_path);

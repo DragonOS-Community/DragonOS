@@ -32,10 +32,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{
-    file::FileMode, permission::inode_permission, syscall::ModeType, utils::DName,
-    vcore::generate_inode_id,
-};
+use self::{file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id};
 pub use self::{file::FilePrivateData, mount::MountFS};
 
 use super::page_cache::PageCache;
@@ -814,7 +811,7 @@ impl dyn IndexNode {
             // 检查当前目录的执行权限（搜索权限）
             // 这确保了进程有权限遍历到此目录
             let metadata = result.metadata()?;
-            inode_permission(&metadata, &cred, PermissionMask::MAY_EXEC.bits())?;
+            cred.inode_permission(&metadata, PermissionMask::MAY_EXEC.bits())?;
 
             let name;
             // 寻找“/”

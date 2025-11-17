@@ -54,7 +54,17 @@ impl Syscall {
     }
 
     /// ## 用于控制和查询与体系结构相关的进程特定选项
-    /// https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/process_64.c#913
+    ///
+    /// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/process_64.c#913
+    ///
+    /// ## 错误处理逻辑
+    ///
+    /// 该函数采用分层处理策略:
+    /// 1. 首先尝试 `do_arch_prctl_64` 处理x86_64特定选项(FS/GS base)
+    /// 2. **仅当返回 EINVAL 时**,说明该选项不是x86_64特定的,尝试 `do_arch_prctl_common` 处理通用选项
+    /// 3. 其他错误(EPERM, EFAULT等)直接返回,**不会**fallback到common handler
+    ///
+    /// 这种设计符合Linux语义:EINVAL表示"无效选项",其他错误表示"选项有效但操作失败"
     pub fn arch_prctl(option: usize, arg2: usize) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let result = Self::do_arch_prctl_64(&pcb, option, arg2, true);

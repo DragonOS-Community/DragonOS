@@ -535,8 +535,10 @@ impl Futex {
             Ok(ret) => {
                 // 操作成功则唤醒uaddr2中的进程
                 if ret {
-                    let bucket2 = futex_data_guard.get_mut(&key2).ok_or(SystemError::EINVAL)?;
-                    wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
+                    // 若 uaddr2 没有关联任何等待者，则按照 Linux 行为跳过唤醒，而不是返回 EINVAL。
+                    if let Some(bucket2) = futex_data_guard.get_mut(&key2) {
+                        wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
+                    }
                 }
             }
             Err(e) => {
@@ -735,6 +737,8 @@ impl Futex {
             UserBufferReader::new(uaddr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
 
         let oldval = reader.read_one_from_user::<u32>(0)?;
+        // 保存旧值的副本，因为后续的修改操作会改变内存中的值
+        let oldval_copy = *oldval;
 
         // 直接获取用户空间地址的原始指针
         let ptr = uaddr.as_ptr::<u32>();
@@ -761,7 +765,7 @@ impl Futex {
 
         drop(guard);
 
-        Ok(*oldval)
+        Ok(oldval_copy)
     }
 }
 

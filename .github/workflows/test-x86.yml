@@ -27,5 +27,58 @@ jobs:
 
       - name: Run syscall test
         shell: bash -ileo pipefail {0}
+        continue-on-error: true
+        env:
+          DISK_SAVE_MODE: "1"
         run: |
           make test-syscall
+
+      - name: Upload test results
+        if: github.repository == 'DragonOS-Community/DragonOS'
+        shell: bash -ileo pipefail {0}
+        env:
+          API_KEY: ${{ secrets.CI_DASHBOARD_UPLOAD_API_KEY }}
+        run: |
+          # 更新包列表并安装pip
+          apt-get update
+          apt-get install -y python3-pip python3-venv
+
+          # 创建虚拟环境（可选，但更安全）
+          python3 -m venv /tmp/venv
+          source /tmp/venv/bin/activate
+
+          # 升级pip
+          pip install --upgrade pip
+
+          # 安装Python依赖
+          pip install -r tools/test-upload/requirements.txt
+          
+          # 设置变量
+          BRANCH_NAME="${{ github.ref_name }}"
+          COMMIT_ID="${{ github.sha }}"
+          API_URL="https://ci-dashboard.dragonos.org/api/v1"
+          
+          # 如果是PR，使用PR的分支名
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            BRANCH_NAME="${{ github.head_ref }}"
+          fi
+          
+          # 检查API_KEY是否存在
+          if [ -z "$API_KEY" ]; then
+            echo "警告: CI_DASHBOARD_UPLOAD_API_KEY secret未设置，跳过上传"
+            exit 0
+          fi
+          
+          # 检查日志文件是否存在
+          if [ ! -f "serial_opt.txt" ]; then
+            echo "警告: serial_opt.txt文件不存在，跳过上传"
+            exit 0
+          fi
+          
+          # 上传测试结果
+          python3 tools/test-upload/parse_and_upload.py \
+            serial_opt.txt \
+            "$API_URL" \
+            --branch "$BRANCH_NAME" \
+            --commit "$COMMIT_ID" \
+            --test-type "gvisor"

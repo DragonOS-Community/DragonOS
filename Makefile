@@ -157,6 +157,10 @@ test-syscall: check_arch
 	@echo "构建运行并执行syscall测试"
 	bash user/apps/tests/syscall/gvisor/enable_compile_gvisor.sh
 	$(MAKE) all -j $(NPROCS)
+	@if [ "$(DISK_SAVE_MODE)" = "1" ]; then \
+		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
+		$(DADK) user clean --level in-src; \
+	fi
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-nographic AUTO_TEST=syscall SYSCALL_TEST_DIR=/opt/tests/gvisor &
 	sleep 5
@@ -210,6 +214,10 @@ help:
 	@echo "  make docs             - 生成文档"
 	@echo "  make clean-docs       - 清理文档"
 	@echo "  make test-syscall     - 构建运行并执行syscall测试"
+	@echo "                         - 可通过DISK_SAVE_MODE=1启用磁盘节省模式"
+	@echo ""
+	@echo "环境变量:"
+	@echo "  DISK_SAVE_MODE=1     - 启用磁盘节省模式，在写入磁盘镜像前清理构建缓存"
 	@echo ""
 	@echo "  make update-submodules - 更新子模块"
 	@echo "  make update-submodules-by-mirror - 从镜像更新子模块"

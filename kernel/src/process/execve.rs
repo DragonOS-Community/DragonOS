@@ -67,7 +67,10 @@ pub fn do_execve(
     }
 
     if pcb.sighand().is_shared() {
-        let new_sighand = pcb.sighand().clone();
+        // Linux出于进程和线程隔离，要确保在execve时，对共享的 SigHand 进行深拷贝
+        // 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1187
+        let new_sighand = crate::ipc::sighand::SigHand::new();
+        new_sighand.copy_handlers_from(&pcb.sighand());
         pcb.replace_sighand(new_sighand);
     }
     // 重置所有信号处理器为默认行为(SIG_DFL)，禁用并清空备用信号栈。

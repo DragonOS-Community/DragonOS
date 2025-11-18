@@ -16,10 +16,6 @@ mod sys_setitimer;
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
 
-const NANOS_PER_SEC: u64 = 1_000_000_000;
-const MICROS_PER_SEC: u64 = 1_000_000;
-const NANOS_PER_USEC: u64 = 1_000;
-
 #[repr(C)]
 #[derive(Default, Debug, Copy, Clone)]
 pub struct PosixTimeval {
@@ -31,18 +27,18 @@ impl PosixTimeval {
     /// 从内核统一使用的 u64 纳秒创建一个 PosixTimeval 实例
     pub fn from_ns(ns: u64) -> Self {
         Self {
-            tv_sec: (ns / NANOS_PER_SEC) as PosixTimeT,
-            tv_usec: ((ns % NANOS_PER_SEC) / NANOS_PER_USEC) as PosixSusecondsT,
+            tv_sec: (ns / 1_000_000_000) as PosixTimeT,
+            tv_usec: ((ns % 1_000_000_000) / 1000) as PosixSusecondsT,
         }
     }
 
     /// 将当前的 PosixTimeval 精确转换为内核统一使用的 u64 纳秒
     pub fn to_ns(self) -> u64 {
-        if self.tv_usec < 0 || self.tv_usec >= MICROS_PER_SEC as PosixSusecondsT {
-            (self.tv_sec as u64).saturating_mul(NANOS_PER_SEC)
+        if self.tv_usec < 0 || self.tv_usec >= 1_000_000 as PosixSusecondsT {
+            (self.tv_sec as u64).saturating_mul(1_000_000_000)
         } else {
-            let sec_ns = (self.tv_sec as u64).saturating_mul(NANOS_PER_SEC);
-            let usec_ns = (self.tv_usec as u64).saturating_mul(NANOS_PER_USEC);
+            let sec_ns = (self.tv_sec as u64).saturating_mul(1_000_000_000);
+            let usec_ns = (self.tv_usec as u64).saturating_mul(1000);
             sec_ns.saturating_add(usec_ns)
         }
     }

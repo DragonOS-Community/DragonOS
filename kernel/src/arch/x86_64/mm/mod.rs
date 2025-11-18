@@ -393,6 +393,98 @@ impl MemoryManagementArch for X86_64MMArch {
             // log::debug!("CR0.WP bit disabled for kernel write protection");
         }
     }
+
+    /// 带异常表保护的内存拷贝
+    #[inline(always)]
+    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> i32 {
+        let mut result: i32;
+
+        core::arch::asm!(
+            // 保存原始值
+            "xor {result:e}, {result:e}",
+
+            // 标记为可能出错的访问点
+            "2:",
+            // 执行拷贝
+            "rep movsb",
+
+            // 正常完成,跳过错误处理
+            "jmp 3f",
+
+            // 错误处理: 设置返回值为-1
+            "4:",
+            "mov {result:e}, -1",
+
+            "3:",
+
+            // 添加异常表条目
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - .",
+            ".popsection",
+
+            result = out(reg) result,
+            inout("rdi") dst => _,
+            inout("rsi") src => _,
+            inout("rcx") len => _,
+            options(att_syntax, nostack)
+        );
+
+        result
+    }
+
+    /// 带异常表保护的内存设置（memset）
+    ///
+    /// 参考 Asterinas 的实现和 Linux 内核的 memset_64.S
+    ///
+    /// ## 参数
+    /// - `dst`: 目标地址（rdi）
+    /// - `value`: 要设置的字节值
+    /// - `len`: 要设置的字节数
+    ///
+    /// ## 返回值
+    /// - 0: 成功
+    /// - -1: 发生页错误
+    #[inline(always)]
+    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> i32 {
+        let mut result: i32;
+
+        core::arch::asm!(
+            // 初始化返回值为0
+            "xor {result:e}, {result:e}",
+
+            // 标记为可能出错的访问点
+            "2:",
+            // 执行内存设置，将 al 的值写入 [rdi] 并重复 rcx 次
+            // rep stosb 使用: al=value, rdi=dst, rcx=count
+            "rep stosb",
+
+            // 正常完成，跳过错误处理
+            "jmp 3f",
+
+            // 错误处理: 设置返回值为-1
+            "4:",
+            "mov {result:e}, -1",
+
+            "3:",
+
+            // 添加异常表条目
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - .",
+            ".popsection",
+
+            result = out(reg) result,
+            inout("rdi") dst => _,
+            inout("rcx") len => _,
+            inout("al") value => _,
+            options(att_syntax, nostack)
+        );
+
+        result
+    }
 }
 
 /// 获取保护标志的映射表

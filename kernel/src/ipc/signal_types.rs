@@ -270,7 +270,7 @@ impl Sigaction {
 /// 用户态传入的sigaction结构体（符合posix规范）
 /// 请注意，我们会在sys_sigaction函数里面将其转换成内核使用的sigaction结构体
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct UserSigaction {
     pub handler: *mut core::ffi::c_void,
     pub flags: SigFlags,

@@ -65,7 +65,7 @@ use crate::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
-    syscall::user_access::clear_user,
+    syscall::user_access::clear_user_protected,
 };
 use timer::AlarmTimer;
 
@@ -461,7 +461,10 @@ impl ProcessManager {
 
             if let Some(addr) = thread.clear_child_tid {
                 // 按 Linux 语义：先清零 userland 的 *clear_child_tid，再 futex_wake(addr)
-                unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
+                unsafe {
+                    clear_user_protected(addr, core::mem::size_of::<i32>())
+                        .expect("clear tid failed")
+                };
                 if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
                     // Linux 使用 FUTEX_SHARED 标志来唤醒 clear_child_tid
                     // 这允许跨进程/线程的同步（例如 pthread_join）

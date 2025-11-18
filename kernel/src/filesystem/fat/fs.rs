@@ -266,6 +266,9 @@ impl LockedFATInode {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), SystemError> {
+        if old_name == new_name {
+            return Ok(());
+        }
         let mut guard = self.0.lock();
         let old_inode = guard.find(old_name)?;
         // 对目标inode上锁，以防更改
@@ -332,7 +335,7 @@ impl LockedFATInode {
             }
         };
         // 检查文件是否存在
-        old_dir.check_existence(old_name, Some(false), old_guard.fs.upgrade().unwrap())?;
+        // old_dir.check_existence(old_name, Some(false), old_guard.fs.upgrade().unwrap())?;
         old_dir.rename_across(fs, new_dir, old_name, new_name)?;
         // 从缓存删除
         let _nod = old_guard.children.remove(&to_search_name(old_name));

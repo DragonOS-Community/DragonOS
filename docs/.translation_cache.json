@@ -1,6 +1,6 @@
 {
   "en:kernel/memory_management/index.rst": {
-    "hash": "e394aa123a0030c0ec4276485fc764b7"
+    "hash": "cdc8a53e6bd469f798f021642fd989fb"
   },
   "en:kernel/debug/index.rst": {
     "hash": "6dc058a954b8620162e8293faa4959b2"
@@ -304,5 +304,8 @@
   },
   "en:kernel/device/index.rst": {
     "hash": "71c15cea87dffe58f5d70da38390a083"
+  },
+  "en:kernel/memory_management/extable_safe_copy_design.md": {
+    "hash": "b337bca913e9e0de881ed5f81dcb5210"
   }
 }

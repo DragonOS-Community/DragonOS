@@ -865,12 +865,21 @@ impl FATDir {
 
         let short_name = match self.check_existence(new_name, None, fs.clone())? {
             FATDirEntryOrShortName::ShortName(s) => s,
-            // If newpath already exists, it will be atomically replaced, so that
-            // there is no point at which another process attempting to access
-            // newpath will find it missing.
-            // TODO: support other flags like RENAME_EXCHANGE
+            // 目标已存在：根据类型关系决定是否允许覆盖
             FATDirEntryOrShortName::DirEntry(e) => {
-                // remove the existing entry
+                let old_is_dir = old_dentry.is_dir();
+                let new_is_dir = e.is_dir();
+
+                // 目录不能覆盖文件
+                if old_is_dir && !new_is_dir {
+                    return Err(SystemError::ENOTDIR);
+                }
+                // 文件不能覆盖目录
+                if !old_is_dir && new_is_dir {
+                    return Err(SystemError::EISDIR);
+                }
+
+                // 允许覆盖：若为非空目录，remove 会返回 ENOTEMPTY
                 self.remove(fs.clone(), new_name, true)?;
                 e.short_name_raw()
             }
@@ -918,13 +927,26 @@ impl FATDir {
 
         let short_name = match target.check_existence(new_name, None, fs.clone())? {
             FATDirEntryOrShortName::ShortName(s) => s,
-            // 目标已存在：允许覆盖文件或空目录；非空目录返回 ENOTEMPTY
+            // 目标已存在：根据类型关系决定是否允许覆盖
             FATDirEntryOrShortName::DirEntry(e) => {
-                // remove the existing entry
+                let old_is_dir = old_dentry.is_dir();
+                let new_is_dir = e.is_dir();
+
+                // 目录不能覆盖文件
+                if old_is_dir && !new_is_dir {
+                    return Err(SystemError::ENOTDIR);
+                }
+                // 文件不能覆盖目录
+                if !old_is_dir && new_is_dir {
+                    return Err(SystemError::EISDIR);
+                }
+
+                // 允许覆盖：若为非空目录，remove 会返回 ENOTEMPTY
                 target.remove(fs.clone(), new_name, true)?;
                 e.short_name_raw()
             }
         };
+        
         let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
             // 删除原来的目录项

@@ -130,6 +130,10 @@ impl SigHand {
     pub fn load_count(&self) -> i64 {
         self.inner().cnt
     }
+
+    pub fn is_shared(&self) -> bool {
+        self.load_count() > 1
+    }
 }
 
 impl Default for InnerSigHand {
@@ -179,7 +183,8 @@ impl ProcessControlBlock {
             }
             // 清除flags中，除了DFL和IGN以外的所有标志
             sigaction.set_restorer(None);
-            sigaction.mask_mut().remove(SigSet::all());
+            *sigaction.mask_mut() = SigSet::empty();
+            *sigaction.flags_mut() = SigFlags::empty();
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);

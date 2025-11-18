@@ -916,23 +916,12 @@ impl FATDir {
             return Err(SystemError::ENOENT);
         };
 
-        // let short_name = if let FATDirEntryOrShortName::ShortName(s) =
-        //     target.check_existence(new_name, None, fs.clone())?
-        // {
-        //     s
-        // } else {
-        //     // 如果目标目录项存在，那么就返回错误
-        //     return Err(SystemError::EEXIST);
-        // };
-
         let short_name = match target.check_existence(new_name, None, fs.clone())? {
             FATDirEntryOrShortName::ShortName(s) => s,
             // 目标已存在：允许覆盖文件或空目录；非空目录返回 ENOTEMPTY
             FATDirEntryOrShortName::DirEntry(e) => {
-                // 检查目录是否为空；非空时返回 ENOTEMPTY
-                if e.is_dir() && !(e.to_dir().unwrap().is_empty(fs.clone())) {
-                    return Err(SystemError::ENOTEMPTY);
-                }
+                // remove the existing entry
+                target.remove(fs.clone(), new_name, true)?;
                 e.short_name_raw()
             }
         };

@@ -334,8 +334,7 @@ impl LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         };
-        // 检查文件是否存在
-        // old_dir.check_existence(old_name, Some(false), old_guard.fs.upgrade().unwrap())?;
+        
         old_dir.rename_across(fs, new_dir, old_name, new_name)?;
         // 从缓存删除
         let _nod = old_guard.children.remove(&to_search_name(old_name));

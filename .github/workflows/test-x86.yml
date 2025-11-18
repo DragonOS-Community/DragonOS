@@ -25,6 +25,12 @@ jobs:
       - name: Checkout DragonOS code
         uses: actions/checkout@v4
 
+      - name: Build DragonOS
+        shell: bash -ileo pipefail {0}
+        run: |
+          make clean
+          make -j$(nproc) all
+      
       - name: Run syscall test
         shell: bash -ileo pipefail {0}
         continue-on-error: true

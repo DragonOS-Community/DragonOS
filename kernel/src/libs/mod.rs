@@ -30,4 +30,6 @@ pub mod name;
 
 pub mod decompress;
 
+pub mod log2;
 pub mod pod;
+pub mod ranges;

@@ -7,6 +7,7 @@ use system_error::SystemError;
 use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::process::pid::PidPrivateData;
 use crate::{
+    arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
@@ -14,10 +15,12 @@ use crate::{
     filesystem::{
         epoll::{event_poll::EPollPrivateData, EPollItem},
         procfs::ProcfsFilePrivateData,
+        readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
         vfs::FilldirContext,
     },
     ipc::{kill::kill_process, pipe::PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
+    mm::{page::PageFlags, MemoryManagementArch},
     process::{cred::Cred, resource::RLimitID, ProcessControlBlock, ProcessManager, RawPid},
 };
 
@@ -151,6 +154,8 @@ pub struct File {
     close_on_exec: AtomicBool,
     /// owner
     pid: SpinLock<Option<Arc<ProcessControlBlock>>>,
+    /// 预读状态
+    ra_state: SpinLock<FileReadaheadState>,
 }
 
 impl File {
@@ -182,6 +187,7 @@ impl File {
             cred: ProcessManager::current_pcb().cred(),
             close_on_exec: AtomicBool::new(close_on_exec),
             pid: SpinLock::new(None),
+            ra_state: SpinLock::new(FileReadaheadState::new()),
         };
 
         return Ok(f);
@@ -264,6 +270,66 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
+        if self.file_type == FileType::File && !self.mode().contains(FileMode::O_DIRECT) {
+            if let Some(page_cache) = self.inode.page_cache() {
+                let start_page = offset >> MMArch::PAGE_SHIFT;
+                let end_page = (offset + len - 1) >> MMArch::PAGE_SHIFT;
+
+                let (async_trigger_page, missing_page) = {
+                    let page_cache_guard = page_cache.lock_irqsave();
+                    let mut async_trigger_page = None;
+                    let mut missing_page = None;
+
+                    for index in start_page..=end_page {
+                        match page_cache_guard.get_page(index) {
+                            Some(page)
+                                if page
+                                    .read_irqsave()
+                                    .flags()
+                                    .contains(PageFlags::PG_READAHEAD) =>
+                            {
+                                async_trigger_page = Some((index, page.clone()));
+                                break;
+                            }
+                            None => {
+                                missing_page = Some(index);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    (async_trigger_page, missing_page)
+                };
+
+                if let Some((index, page)) = async_trigger_page {
+                    let mut ra_state = self.ra_state.lock().clone();
+                    let req_pages = end_page - index + 1;
+                    page.write_irqsave().remove_flags(PageFlags::PG_READAHEAD);
+
+                    page_cache_async_readahead(
+                        &page_cache,
+                        &self.inode,
+                        &mut ra_state,
+                        index,
+                        req_pages,
+                    )?;
+                    *self.ra_state.lock() = ra_state;
+                } else if let Some(index) = missing_page {
+                    let mut ra_state = self.ra_state.lock().clone();
+                    let req_pages = end_page - index + 1;
+
+                    page_cache_sync_readahead(
+                        &page_cache,
+                        &self.inode,
+                        &mut ra_state,
+                        index,
+                        req_pages,
+                    )?;
+                    *self.ra_state.lock() = ra_state;
+                }
+            }
+        }
+
         let len = if self.mode().contains(FileMode::O_DIRECT) {
             self.inode
                 .read_direct(offset, len, buf, self.private_data.lock())
@@ -272,11 +338,15 @@ impl File {
                 .read_at(offset, len, buf, self.private_data.lock())
         }?;
 
+        if len > 0 {
+            let last_page_readed = (offset + len - 1) >> MMArch::PAGE_SHIFT;
+            self.ra_state.lock().prev_index = last_page_readed as i64;
+        }
+
         if update_offset {
             self.offset
                 .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
         }
-
         Ok(len)
     }
 
@@ -496,6 +566,7 @@ impl File {
             cred: self.cred.clone(),
             close_on_exec: AtomicBool::new(self.close_on_exec.load(Ordering::SeqCst)),
             pid: SpinLock::new(None),
+            ra_state: SpinLock::new(self.ra_state.lock().clone()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design

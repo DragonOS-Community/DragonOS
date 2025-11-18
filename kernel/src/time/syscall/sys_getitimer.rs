@@ -10,7 +10,7 @@ use crate::{
         timer::{self, Jiffies},
     },
 };
-use alloc::{string::ToString, vec::Vec};
+use alloc::vec::Vec;
 use core::mem::size_of;
 use system_error::SystemError;
 
@@ -80,9 +80,7 @@ impl Syscall for SysGetitimerHandle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         let which_str = match ItimerType::try_from(args[0] as i32) {
-            Ok(ItimerType::Real) => "ITIMER_REAL".to_string(),
-            Ok(ItimerType::Virtual) => "ITIMER_VIRTUAL".to_string(),
-            Ok(ItimerType::Prof) => "ITIMER_PROF".to_string(),
+            Ok(v) => format!("{:?}", v),
             Err(_) => format!("Invalid({})", args[0]),
         };
         vec![

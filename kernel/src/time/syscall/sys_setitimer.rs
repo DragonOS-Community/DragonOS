@@ -235,7 +235,7 @@ impl Syscall for SysSetitimerHandle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         let which_str = match ItimerType::try_from(args[0] as i32) {
-            Ok(which) => format!("ITIMER_{:?}", which).to_uppercase(),
+            Ok(which) => format!("{:?}", which),
             Err(_) => format!("Invalid({})", args[0]),
         };
         vec![

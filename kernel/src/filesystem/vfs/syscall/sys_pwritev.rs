@@ -41,7 +41,7 @@ impl Syscall for SysPwriteVHandle {
         // 将用户态传入的数据结构 `IoVecs` 重新在内核上构造
         let iovecs = unsafe { IoVecs::from_user(iov, iov_count, false) }?;
         let data = iovecs.gather()?;
-        
+
         // TODO: 支持零内核拷贝的分散写 （需要文件系统底层支持分散写）
         // - 直接将传入的用户态 IoVec 使用 vma 做校验以后传入底层文件系统进行分散写，避免内核拷贝
         // - 实现路径（linux）：wirtev --> vfs_writev --> do_iter_write --> do_loop_readv_writev/do_iter_readv_writev

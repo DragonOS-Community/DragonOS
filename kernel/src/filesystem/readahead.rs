@@ -91,21 +91,18 @@ impl<'a> ReadaheadControl<'a> {
         let page_cache = self.page_cache;
         let start_index = self.ra_state.start;
 
-        let set_flag = {
-            // 异步窗口的第一个页若未缓存则设置异步标志
-            page_cache
-                .lock_irqsave()
-                .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
-                .is_none()
-        };
+        let page_cache_guard = page_cache.lock_irqsave();
 
-        let missing_pages = {
-            let page_cache_gaurd = page_cache.lock_irqsave();
-            (0..number_to_read)
-                .map(|i| start_index + i)
-                .filter(|&idx| page_cache_gaurd.get_page(idx).is_none())
-                .collect::<Vec<_>>()
-        };
+        let set_flag = page_cache_guard
+            .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+            .is_none();
+
+        let missing_pages: Vec<_> = (0..number_to_read)
+            .map(|i| start_index + i)
+            .filter(|&idx| page_cache_guard.get_page(idx).is_none())
+            .collect();
+
+        drop(page_cache_guard);
 
         if missing_pages.is_empty() {
             return Ok(0);
@@ -117,7 +114,6 @@ impl<'a> ReadaheadControl<'a> {
         for (page_index, count) in ranges {
             let mut page_buf = alloc::vec![0u8; MMArch::PAGE_SIZE * count];
             let offset = page_index << MMArch::PAGE_SHIFT;
-
             let read_len = self.inode.read_sync(offset, &mut page_buf)?;
 
             if read_len == 0 {
@@ -125,7 +121,6 @@ impl<'a> ReadaheadControl<'a> {
             }
 
             page_buf.truncate(read_len);
-
             let actual_page_count = (read_len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
 
             let mut page_cache_guard = page_cache.lock_irqsave();
@@ -136,8 +131,8 @@ impl<'a> ReadaheadControl<'a> {
         }
 
         if set_flag {
-            if let Some(page) = page_cache
-                .lock_irqsave()
+            let page_cache_guard = page_cache.lock_irqsave();
+            if let Some(page) = page_cache_guard
                 .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
             {
                 log::debug!("set ra flag at {}", self.ra_state.start + self.ra_state.size - self.ra_state.async_size);

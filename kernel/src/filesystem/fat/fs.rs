@@ -270,11 +270,13 @@ impl LockedFATInode {
             return Ok(());
         }
         let mut guard = self.0.lock();
+        println!("AAAAAAAAAAAAAAAAA");
         let old_inode = guard.find(old_name)?;
+        let new_inode = guard.find(new_name).ok();
         // 对目标inode上锁，以防更改
         let old_inode_guard = old_inode.0.lock();
         let fs = old_inode_guard.fs.upgrade().unwrap();
-
+        drop(old_inode_guard);
         let old_dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
@@ -285,9 +287,9 @@ impl LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         };
-
         // remove entries
-        old_dir.rename(fs, old_name, new_name)?;
+        println!("bbbbbbbbbbbbbbbbbbbbbbbb");
+        old_dir.rename(fs, old_name, new_name,new_inode,&old_inode)?;
 
         let old_inode = guard.children.remove(&to_search_name(old_name)).unwrap();
         // the new_name should refer to old_inode
@@ -308,12 +310,13 @@ impl LockedFATInode {
             .downcast_ref::<LockedFATInode>()
             .ok_or(SystemError::EPERM)?;
 
-        let new_guard = other.0.lock();
+        let mut new_guard = other.0.lock();
         let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
+        let new_inode = new_guard.find(new_name);
         // 对目标inode上锁，以防更改
         let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
         let fs = old_inode_guard.fs.upgrade().unwrap();
-
+        drop(old_inode_guard);
         let old_dir = match &old_guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
@@ -335,7 +338,7 @@ impl LockedFATInode {
             }
         };
         
-        old_dir.rename_across(fs, new_dir, old_name, new_name)?;
+        old_dir.rename_across(fs, new_dir, old_name, new_name,new_inode,&old_inode)?;
         // 从缓存删除
         let _nod = old_guard.children.remove(&to_search_name(old_name));
 
@@ -2023,7 +2026,7 @@ impl IndexNode for LockedFATInode {
             .ok_or(SystemError::EINVAL)
     }
 
-    fn page_cache(&self) -> Option<Arc<PageCache>> {
+    fn page_cache(&self) -> Option<Arc<PageCache>> {                    
         self.0.lock().page_cache.clone()
     }
 }

@@ -36,6 +36,7 @@ wait_test
 tkill_test
 tgkill_test
 prctl_test
+exit_test
 
 # 内存管理测试
 #mmap_test

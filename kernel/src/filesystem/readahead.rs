@@ -91,6 +91,14 @@ impl<'a> ReadaheadControl<'a> {
         let page_cache = self.page_cache;
         let start_index = self.ra_state.start;
 
+        let set_flag = {
+            // 异步窗口的第一个页若未缓存则设置异步标志
+            page_cache
+                .lock_irqsave()
+                .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+                .is_none()
+        };
+
         let missing_pages = {
             let page_cache_gaurd = page_cache.lock_irqsave();
             (0..number_to_read)
@@ -127,12 +135,16 @@ impl<'a> ReadaheadControl<'a> {
             total_read += actual_page_count;
         }
 
-        let page_cache_guard = page_cache.lock_irqsave();
-        if let Some(page) = page_cache_guard
-            .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
-        {
-            page.write_irqsave().add_flags(PageFlags::PG_READAHEAD);
+        if set_flag {
+            if let Some(page) = page_cache
+                .lock_irqsave()
+                .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+            {
+                log::debug!("set ra flag at {}", self.ra_state.start + self.ra_state.size - self.ra_state.async_size);
+                page.write_irqsave().add_flags(PageFlags::PG_READAHEAD);
+            }
         }
+
         Ok(total_read)
     }
 
@@ -160,7 +172,25 @@ impl<'a> ReadaheadControl<'a> {
             return Ok(0);
         };
 
-        if start_index == 0 || ra_state.first_sequential(start_index) {
+        if is_async {
+            // 第二次及以后的连续读
+            let page_cache_gaurd = self.page_cache.lock_irqsave();
+            let next_missing_pages = {
+                (start_index..start_index + max_pages)
+                    .find(|idx| page_cache_gaurd.get_page(idx.clone()).is_none())
+            };
+            log::debug!("next_missing_pages: {:?}", next_missing_pages);
+
+            if next_missing_pages.is_none() || next_missing_pages.unwrap() - start_index > max_pages
+            {
+                return Ok(0);
+            }
+
+            ra_state.start = next_missing_pages.unwrap();
+            ra_state.size = ra_state.start - start_index + req_size;
+            ra_state.size = Self::get_next_ra_size(ra_state.size, max_pages);
+            ra_state.async_size = ra_state.size;
+        } else if start_index == 0 || ra_state.first_sequential(start_index) {
             // 从头读或者第一次顺序读
 
             let mut number_to_read = Self::get_init_ra_size(req_size, max_pages);
@@ -179,23 +209,6 @@ impl<'a> ReadaheadControl<'a> {
             } else {
                 ra_state.size
             };
-        } else if is_async {
-            // 第二次及以后的连续读
-            let page_cache_gaurd = self.page_cache.lock_irqsave();
-            let next_missing_pages = {
-                (start_index + 1..start_index + max_pages)
-                    .find(|idx| page_cache_gaurd.get_page(idx.clone()).is_none())
-            };
-
-            if next_missing_pages.is_none() || next_missing_pages.unwrap() - start_index > max_pages
-            {
-                return Ok(0);
-            }
-
-            ra_state.start = next_missing_pages.unwrap();
-            ra_state.size = ra_state.start - start_index + req_size;
-            ra_state.size = Self::get_next_ra_size(ra_state.size, max_pages);
-            ra_state.async_size = ra_state.size;
         } else {
             return Ok(0);
         };
@@ -211,7 +224,7 @@ impl<'a> ReadaheadControl<'a> {
                 ra_state.async_size = max_pages >> 1;
             }
         }
-        // log::debug!("is_async: {}, start: {}, size: {}", is_async, ra_state.start, ra_state.size);
+        // log::debug!("is_async: {}, start: {}, size: {}, async_size: {}", is_async, ra_state.start, ra_state.size, ra_state.async_size);
 
         let nr_to_read = ra_state.size;
         let read_count = self.do_page_cache_readahead(nr_to_read)?;

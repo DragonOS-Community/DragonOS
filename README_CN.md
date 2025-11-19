@@ -23,6 +23,10 @@
 
 &emsp;&emsp;DragonOS目前在社区驱动下正在快速发展中，目前DragonOS已经实现了约1/4的Linux接口，在未来我们将提供对Linux的100%兼容性，并且提供新特性。
 
+## 📰 社区新闻
+
+- **2025-11-20**: 🚀 DragonOS 0.3.0 已发布！可支持go程序直接运行！
+- **2025-11-18**: 📊 DragonOS CI Dashboard已上线！[立刻查看DragonOS的Linux兼容性数据！](https://ci-dashboard.dragonos.org)
 
 ## 如何运行？
 

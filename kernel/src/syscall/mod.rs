@@ -350,13 +350,6 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            // SYS_SCHED_YIELD => Self::sched_yield(),
-            SYS_PRCTL => {
-                // todo: 这个系统调用还没有实现
-
-                Err(SystemError::EINVAL)
-            }
-
             #[cfg(target_arch = "x86_64")]
             SYS_EVENTFD => {
                 let initval = args[0] as u32;

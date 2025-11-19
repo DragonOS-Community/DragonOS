@@ -21,6 +21,11 @@
 
 &emsp;&emsp;DragonOS is rapidly evolving under community-driven development. Currently, DragonOS has implemented approximately 1/4 of Linux interfaces. In the future, we will provide 100% Linux compatibility along with new features.
 
+## 📰 Community News
+
+- **2025-11-20**: 🚀 DragonOS 0.3.0 has been released! Now supports running Go programs directly!
+- **2025-11-18**: 📊 DragonOS CI Dashboard is now live! [Check out DragonOS Linux compatibility data now!](https://ci-dashboard.dragonos.org)
+
 ## How to Run?
 
 &emsp;&emsp;Running DragonOS is straightforward. You can refer to the following resources to get DragonOS up and running in as little as 15 minutes!

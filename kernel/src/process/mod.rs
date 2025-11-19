@@ -796,6 +796,8 @@ pub struct ProcessControlBlock {
 
     /// 退出信号S
     exit_signal: AtomicSignal,
+    /// 父进程退出时要发送给当前进程的信号（PR_SET_PDEATHSIG）
+    pdeath_signal: AtomicSignal,
 
     /// 父进程指针
     parent_pcb: RwLock<Weak<ProcessControlBlock>>,
@@ -941,6 +943,7 @@ impl ProcessControlBlock {
                 sighand: RwLock::new(SigHand::new()),
                 sig_altstack: RwLock::new(SigStackArch::new()),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
+                pdeath_signal: AtomicSignal::new(Signal::INVALID),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
@@ -1159,6 +1162,16 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    pub fn set_pdeath_signal(&self, signal: Signal) {
+        self.pdeath_signal.store(signal, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn pdeath_signal(&self) -> Signal {
+        self.pdeath_signal.load(Ordering::SeqCst)
+    }
+
+    #[inline(always)]
     pub fn basic_mut(&self) -> RwLockWriteGuard<'_, ProcessBasicInfo> {
         return self.basic.write_irqsave();
     }
@@ -1317,9 +1330,15 @@ impl ProcessControlBlock {
 
     /// 当前进程退出时,让初始进程收养所有子进程
     unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
+        let child_pids = {
+            let childen_guard = self.children.write();
+            childen_guard.clone()
+        };
+
+        self.notify_parent_exit_for_children(&child_pids);
+
         match ProcessManager::find_task_by_vpid(RawPid(1)) {
             Some(init_pcb) => {
-                let childen_guard = self.children.write();
                 if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &init_pcb) {
                     // 当前进程是namespace的init进程，由父进程所在的pidns的init进程去收养子进程
                     if let Some(parent_pcb) = self.real_parent_pcb() {
@@ -1341,7 +1360,7 @@ impl ProcessControlBlock {
                         }
                         let parent_init = parent_init.unwrap();
                         let mut parent_children_guard = parent_init.children.write();
-                        childen_guard.iter().for_each(|pid| {
+                        child_pids.iter().for_each(|pid| {
                             log::debug!(
                                 "adopt_childen: pid {} is adopted by parent init pid {}",
                                 pid,
@@ -1358,18 +1377,32 @@ impl ProcessControlBlock {
                 }
                 let mut init_childen_guard = init_pcb.children.write();
 
-                childen_guard.iter().for_each(|pid| {
-                    // log::debug!(
-                    //     "adopt_childen: pid {} is adopted by init pid {}",
-                    //     pid,
-                    //     init_pcb.raw_pid()
-                    // );
+                child_pids.iter().for_each(|pid| {
                     init_childen_guard.push(*pid);
                 });
 
                 return Ok(());
             }
             _ => Err(SystemError::ECHILD),
+        }
+    }
+
+    fn notify_parent_exit_for_children(&self, child_pids: &[RawPid]) {
+        for pid in child_pids {
+            if let Some(child) = ProcessManager::find_task_by_vpid(*pid) {
+                let sig = child.pdeath_signal();
+                if sig == Signal::INVALID {
+                    continue;
+                }
+                if let Err(e) = crate::ipc::kill::kill_process_by_pcb(child.clone(), sig) {
+                    warn!(
+                        "adopt_childen: failed to deliver pdeath_signal {:?} to child {:?}: {:?}",
+                        sig,
+                        child.raw_pid(),
+                        e
+                    );
+                }
+            }
         }
     }
 

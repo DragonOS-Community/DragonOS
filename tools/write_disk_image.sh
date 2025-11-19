@@ -99,6 +99,7 @@ fi
 
 # 拷贝用户程序到磁盘镜像
 mkdir -p ${mount_folder}/bin
+mkdir -p ${mount_folder}/sbin
 mkdir -p ${mount_folder}/dev
 mkdir -p ${mount_folder}/proc
 mkdir -p ${mount_folder}/usr

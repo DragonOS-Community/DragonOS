@@ -32,6 +32,9 @@ pub struct InnerSigHand {
     /// 当前线程所属进程要处理的信号
     pub shared_pending: SigPending,
     pub flags: SignalFlags,
+    /// 线程组退出码（仿照 Linux 的 signal_struct::group_exit_code）
+    /// 仅当 flags 中包含 GROUP_EXIT 时才有效
+    pub group_exit_code: usize,
     pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
     /// 在 sighand 上维护的引用计数（与 Linux 一致的布局位置）
     pub cnt: i64,
@@ -116,6 +119,30 @@ impl SigHand {
         g.flags.remove(flag);
     }
 
+    /// 若当前线程组已经处于 group-exit 状态，则返回统一的退出码；否则返回 None
+    pub fn group_exit_code_if_set(&self) -> Option<usize> {
+        let g = self.inner();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) {
+            Some(g.group_exit_code)
+        } else {
+            None
+        }
+    }
+
+    /// 启动线程组退出：
+    /// - 若此前尚未标记 GROUP_EXIT，则设置标志与退出码，并返回本次传入的退出码
+    /// - 若已经有线程设置了 GROUP_EXIT，则直接返回已存在的 group_exit_code
+    pub fn start_group_exit(&self, exit_code: usize) -> usize {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) {
+            g.group_exit_code
+        } else {
+            g.flags.insert(SignalFlags::GROUP_EXIT);
+            g.group_exit_code = exit_code;
+            exit_code
+        }
+    }
+
     // ===== PIDs helpers =====
     pub fn pid(&self, ty: PidType) -> Option<Arc<Pid>> {
         self.inner().pids[ty as usize].clone()
@@ -143,6 +170,7 @@ impl Default for InnerSigHand {
             pids: core::array::from_fn(|_| None),
             shared_pending: SigPending::default(),
             flags: SignalFlags::empty(),
+            group_exit_code: 0,
             cnt: 0,
         }
     }

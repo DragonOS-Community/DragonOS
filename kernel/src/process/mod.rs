@@ -34,6 +34,7 @@ use crate::{
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
+        kill::kill_process_by_pcb,
         sighand::SigHand,
         signal::RestartBlock,
         signal_types::{SigInfo, SigPending},
@@ -427,6 +428,7 @@ impl ProcessManager {
     pub fn exit(exit_code: usize) -> ! {
         // 检查是否是init进程尝试退出，如果是则产生panic
         let current_pcb = ProcessManager::current_pcb();
+
         if current_pcb.raw_pid() == RawPid(1) {
             log::error!(
                 "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
@@ -510,6 +512,79 @@ impl ProcessManager {
         loop {
             spin_loop();
         }
+    }
+
+    /// 线程组整体退出（仿照 Linux do_group_exit 语义）
+    ///
+    /// - `exit_code`:
+    ///   - 对于 sys_exit_group：应当已经左移 8 位（wstatus 编码）
+    ///   - 对于致命信号：低 7 位为信号编号，无需移位
+    pub fn group_exit(exit_code: usize) -> ! {
+        let final_exit_code: usize;
+
+        // 使用闭包，确保这里所有指针都释放了
+        {
+            // 检查是否是 init 进程
+            let current_pcb = ProcessManager::current_pcb();
+
+            if current_pcb.raw_pid() == RawPid(1) {
+                log::error!(
+                "Init process (pid=1) attempted to group_exit with code {}. This should not happen and indicates a serious system error.",
+                exit_code
+            );
+                loop {
+                    spin_loop();
+                }
+            }
+
+            // 1. 在共享的 sighand 上原子性地设置 GROUP_EXIT 标志与 group_exit_code
+            //    若已有线程抢先设置，则复用已存在的退出码。
+            let sighand = current_pcb.sighand();
+            final_exit_code = sighand.start_group_exit(exit_code);
+
+            // 2. 向同一线程组内的其他线程发送 SIGKILL，唤醒并强制终止它们
+            //    仿照 Linux zap_other_threads 的语义，这里仅负责投递 SIGKILL，
+            //    实际退出在各线程上下文中完成。
+            {
+                // 统一从线程组组长的 ThreadInfo 中获取完整的线程列表，
+                // 避免从非组长线程看到的 group_tasks 为空导致遗漏。
+                let leader = {
+                    let ti = current_pcb.thread.read_irqsave();
+                    ti.group_leader().unwrap_or_else(|| current_pcb.clone())
+                };
+
+                let group_tasks = {
+                    let ti = leader.threads_read_irqsave();
+                    ti.group_tasks.clone()
+                };
+
+                // 先尝试对组长发送 SIGKILL（若当前线程不是组长）
+                if !Arc::ptr_eq(&leader, &current_pcb)
+                    && !leader.flags().contains(ProcessFlags::EXITING)
+                {
+                    let _ = kill_process_by_pcb(leader.clone(), Signal::SIGKILL);
+                }
+
+                // 再遍历组长维护的 group_tasks，向其他线程发送 SIGKILL
+                for weak in group_tasks {
+                    if let Some(task) = weak.upgrade() {
+                        // 跳过当前线程自身
+                        if task.raw_pid() == current_pcb.raw_pid() {
+                            continue;
+                        }
+                        if task.flags().contains(ProcessFlags::EXITING) {
+                            continue;
+                        }
+                        let _ = kill_process_by_pcb(task.clone(), Signal::SIGKILL);
+                    }
+                }
+            }
+
+            drop(current_pcb);
+        }
+        // 3. 当前线程按照统一的退出码执行常规退出流程
+
+        ProcessManager::exit(final_exit_code);
     }
 
     /// 从全局进程列表中删除一个进程

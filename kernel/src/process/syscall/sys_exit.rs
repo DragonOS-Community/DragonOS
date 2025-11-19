@@ -20,7 +20,7 @@ impl Syscall for SysExit {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let exit_code = Self::exit_code(args);
-        ProcessManager::exit((exit_code & 0xff) << 8);
+        ProcessManager::group_exit((exit_code & 0xff) << 8);
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

@@ -257,6 +257,58 @@ impl File {
         self.do_write(offset, len, buf, false)
     }
 
+    fn file_readahead(&self, offset: usize, len: usize) -> Result<usize, SystemError> {
+        let page_cache = match self.inode.page_cache() {
+            Some(page_cahce) => page_cahce,
+            None => return Ok(0),
+        };
+
+        let start_page = offset >> MMArch::PAGE_SHIFT;
+        let end_page = (offset + len - 1) >> MMArch::PAGE_SHIFT;
+
+        let (async_trigger_page, missing_page) = {
+            let page_cache_guard = page_cache.lock_irqsave();
+            let mut async_trigger_page = None;
+            let mut missing_page = None;
+
+            for index in start_page..=end_page {
+                match page_cache_guard.get_page(index) {
+                    Some(page)
+                        if page
+                            .read_irqsave()
+                            .flags()
+                            .contains(PageFlags::PG_READAHEAD) =>
+                    {
+                        async_trigger_page = Some((index, page.clone()));
+                        break;
+                    }
+                    None => {
+                        missing_page = Some(index);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            (async_trigger_page, missing_page)
+        };
+
+        if let Some((index, page)) = async_trigger_page {
+            let mut ra_state = self.ra_state.lock().clone();
+            let req_pages = end_page - index + 1;
+            page.write_irqsave().remove_flags(PageFlags::PG_READAHEAD);
+
+            page_cache_async_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
+            *self.ra_state.lock() = ra_state;
+        } else if let Some(index) = missing_page {
+            let mut ra_state = self.ra_state.lock().clone();
+            let req_pages = end_page - index + 1;
+
+            page_cache_sync_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
+            *self.ra_state.lock() = ra_state;
+        }
+        Ok(0)
+    }
+
     pub fn do_read(
         &self,
         offset: usize,
@@ -271,63 +323,7 @@ impl File {
         }
 
         if self.file_type == FileType::File && !self.mode().contains(FileMode::O_DIRECT) {
-            if let Some(page_cache) = self.inode.page_cache() {
-                let start_page = offset >> MMArch::PAGE_SHIFT;
-                let end_page = (offset + len - 1) >> MMArch::PAGE_SHIFT;
-
-                let (async_trigger_page, missing_page) = {
-                    let page_cache_guard = page_cache.lock_irqsave();
-                    let mut async_trigger_page = None;
-                    let mut missing_page = None;
-
-                    for index in start_page..=end_page {
-                        match page_cache_guard.get_page(index) {
-                            Some(page)
-                                if page
-                                    .read_irqsave()
-                                    .flags()
-                                    .contains(PageFlags::PG_READAHEAD) =>
-                            {
-                                async_trigger_page = Some((index, page.clone()));
-                                break;
-                            }
-                            None => {
-                                missing_page = Some(index);
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                    (async_trigger_page, missing_page)
-                };
-
-                if let Some((index, page)) = async_trigger_page {
-                    let mut ra_state = self.ra_state.lock().clone();
-                    let req_pages = end_page - index + 1;
-                    page.write_irqsave().remove_flags(PageFlags::PG_READAHEAD);
-
-                    page_cache_async_readahead(
-                        &page_cache,
-                        &self.inode,
-                        &mut ra_state,
-                        index,
-                        req_pages,
-                    )?;
-                    *self.ra_state.lock() = ra_state;
-                } else if let Some(index) = missing_page {
-                    let mut ra_state = self.ra_state.lock().clone();
-                    let req_pages = end_page - index + 1;
-
-                    page_cache_sync_readahead(
-                        &page_cache,
-                        &self.inode,
-                        &mut ra_state,
-                        index,
-                        req_pages,
-                    )?;
-                    *self.ra_state.lock() = ra_state;
-                }
-            }
+            self.file_readahead(offset, len)?;
         }
 
         let len = if self.mode().contains(FileMode::O_DIRECT) {

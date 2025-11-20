@@ -248,9 +248,12 @@ fn copy_posix_siginfo_to_user(
 fn has_any_pending_signal() -> bool {
     let pcb = ProcessManager::current_pcb();
     let siginfo_guard = pcb.sig_info_irqsave();
-    let blocked = *siginfo_guard.sig_blocked();
+    let mut blocked = *siginfo_guard.sig_blocked();
     let thread_pending = siginfo_guard.sig_pending().signal();
     drop(siginfo_guard);
+
+    blocked.remove(SigSet::from(Signal::SIGKILL));
+    blocked.remove(SigSet::from(Signal::SIGSTOP));
 
     let shared_pending = pcb.sighand().shared_pending_signal();
 

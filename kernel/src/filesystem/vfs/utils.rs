@@ -91,11 +91,8 @@ pub fn is_ancestor_except_self(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn Ind
         Err(_) => return false,
     };
 
-    loop {
-        let cur_id = match cur.metadata() {
-            Ok(m) => m.inode_id,
-            Err(_) => break,
-        };
+    while let Ok(m) = cur.metadata() {
+        let cur_id = m.inode_id;
         if cur_id == ancestor_id {
             return true;
         }

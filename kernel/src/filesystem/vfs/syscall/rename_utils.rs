@@ -66,18 +66,13 @@ pub fn do_renameat2(
         if new_filename == "." || new_filename == ".." {
             return Err(SystemError::EEXIST);
         }
-        if let Ok(_) = new_parent_inode.lookup(new_filename) {
+        if new_parent_inode.lookup(new_filename).is_ok() {
             return Err(SystemError::EEXIST);
         }
     }
 
     if old_filename == "." || old_filename == ".." || new_filename == "." || new_filename == ".." {
         return Err(SystemError::EBUSY);
-    }
-
-    if !flags.is_empty() {
-        log::warn!("renameat2 flags {flags:?} not supported yet");
-        return Err(SystemError::EINVAL);
     }
 
     let old_inode = old_parent_inode.lookup(old_filename)?;

@@ -78,37 +78,34 @@ pub fn user_path_at(
     return Ok((inode, ret_path));
 }
 
-pub fn is_ancestor_except_self(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> bool {
-    // 严格祖先关系：不把 node 本身视为其祖先
+pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> bool {
     let ancestor_id = match ancestor.metadata() {
         Ok(m) => m.inode_id,
         Err(_) => return false,
     };
 
-    // 从父节点开始比较，排除 self == ancestor 的情况
-    let mut cur = match node.parent() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-
-    while let Ok(m) = cur.metadata() {
-        let cur_id = m.inode_id;
+    // 从当前节点开始（包含自身）逐级向上
+    let mut cur: Arc<dyn IndexNode> = node.clone();
+    loop {
+        let cur_id = match cur.metadata() {
+            Ok(m) => m.inode_id,
+            Err(_) => break,
+        };
         if cur_id == ancestor_id {
             return true;
         }
 
-        // 走到父目录；到达文件系统根时 parent() 可能返回自身或错误
         let parent = match cur.parent() {
             Ok(p) => p,
             Err(_) => break,
         };
-        // 根处自循环保护
         let parent_id = match parent.metadata() {
             Ok(m) => m.inode_id,
             Err(_) => break,
         };
         if parent_id == cur_id {
-            break; // 到根了
+            // 到根或自循环
+            break;
         }
         cur = parent;
     }

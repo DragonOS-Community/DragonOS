@@ -1,5 +1,5 @@
 use crate::filesystem::vfs::syscall::RenameFlags;
-use crate::filesystem::vfs::utils::is_ancestor_except_self;
+use crate::filesystem::vfs::utils::is_ancestor;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::SystemError;
@@ -78,11 +78,7 @@ pub fn do_renameat2(
     let old_inode = old_parent_inode.lookup(old_filename)?;
     if old_inode.metadata()?.file_type == crate::filesystem::vfs::FileType::Dir {
         // 仅当把目录移动到其自身或其子树下时拦截
-        let old_meta = old_inode.metadata()?;
-        let new_parent_meta = new_parent_inode.metadata()?;
-        if old_meta.inode_id == new_parent_meta.inode_id
-            || is_ancestor_except_self(&old_inode, &new_parent_inode)
-        {
+        if is_ancestor(&old_inode, &new_parent_inode) {
             return Err(SystemError::EINVAL);
         }
     }

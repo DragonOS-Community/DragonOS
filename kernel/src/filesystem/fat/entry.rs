@@ -870,20 +870,8 @@ impl FATDir {
             FATDirEntryOrShortName::ShortName(s) => s,
             // 目标已存在：根据类型关系决定是否允许覆盖
             FATDirEntryOrShortName::DirEntry(e) => {
-                let old_is_dir = old_dentry.is_dir();
-                let new_is_dir = e.is_dir();
+                validate_rename_target(&old_dentry, &e, fs.clone())?;
 
-                // 目录不能覆盖文件
-                if old_is_dir && !new_is_dir {
-                    return Err(SystemError::ENOTDIR);
-                }
-                // 文件不能覆盖目录
-                if !old_is_dir && new_is_dir {
-                    return Err(SystemError::EISDIR);
-                }
-                if e.is_dir() && !(e.to_dir().unwrap().is_empty(fs.clone())) {
-                    return Err(SystemError::ENOTEMPTY);
-                }
                 if let Some(page_cache) = new_inode.unwrap().page_cache().clone() {
                     truncate_inode_pages(page_cache, 0);
                 }
@@ -934,20 +922,8 @@ impl FATDir {
             FATDirEntryOrShortName::ShortName(s) => s,
             // 目标已存在：根据类型关系决定是否允许覆盖
             FATDirEntryOrShortName::DirEntry(e) => {
-                let old_is_dir = old_dentry.is_dir();
-                let new_is_dir = e.is_dir();
+                validate_rename_target(&old_dentry, &e, fs.clone())?;
 
-                // 目录不能覆盖文件
-                if old_is_dir && !new_is_dir {
-                    return Err(SystemError::ENOTDIR);
-                }
-                // 文件不能覆盖目录
-                if !old_is_dir && new_is_dir {
-                    return Err(SystemError::EISDIR);
-                }
-                if e.is_dir() && !(e.to_dir().unwrap().is_empty(fs.clone())) {
-                    return Err(SystemError::ENOTEMPTY);
-                }
                 if let Some(page_cache) = new_inode.unwrap().page_cache().clone() {
                     truncate_inode_pages(page_cache, 0);
                 }
@@ -2492,4 +2468,24 @@ pub fn get_raw_dir_entry(
             }
         }
     }
+}
+
+pub fn validate_rename_target(
+    old_entry: &FATDirEntry,
+    new_entry: &FATDirEntry,
+    fs: Arc<FATFileSystem>,
+) -> Result<(), SystemError> {
+    let old_is_dir = old_entry.is_dir();
+    let new_is_dir = new_entry.is_dir();
+
+    if old_is_dir && !new_is_dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    if !old_is_dir && new_is_dir {
+        return Err(SystemError::EISDIR);
+    }
+    if new_entry.is_dir() && !(new_entry.to_dir().unwrap().is_empty(fs)) {
+        return Err(SystemError::ENOTEMPTY);
+    }
+    Ok(())
 }

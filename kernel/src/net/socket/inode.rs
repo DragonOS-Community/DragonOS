@@ -27,8 +27,9 @@ impl<T: Socket + 'static> IndexNode for T {
         _: usize,
         _: usize,
         buf: &mut [u8],
-        _: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        drop(data);
         self.read(buf)
     }
 

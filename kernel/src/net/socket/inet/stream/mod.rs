@@ -120,12 +120,25 @@ impl TcpSocket {
             .as_mut()
             .expect("Tcp inner::Inner is None")
         {
-            inner::Inner::Listening(listening) => listening.accept().map(|(stream, remote)| {
-                (
-                    TcpSocket::new_established(stream, self.is_nonblock(), self.netns()),
-                    remote,
-                )
-            }),
+            inner::Inner::Listening(listening) => {
+                let (socket, point) = listening.accept().map(|(stream, remote)| {
+                    (
+                        TcpSocket::new_established(stream, self.is_nonblock(), self.netns()),
+                        remote,
+                    )
+                })?;
+                let bound = socket
+                    .inner
+                    .write()
+                    .take()
+                    .expect("Tcp inner::Inner is None");
+
+                if let inner::Inner::Established(ref established) = bound {
+                    established.iface().common().bind_socket(socket.clone());
+                }
+                socket.inner.write().replace(bound);
+                Ok((socket, point))
+            }
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -387,7 +400,7 @@ impl Socket for TcpSocket {
         } else {
             loop {
                 match self.try_recv(buffer) {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) | Err(SystemError::ENOBUFS) => {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
                     }
                     result => break result,
@@ -588,6 +601,7 @@ impl Socket for TcpSocket {
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {
+        self.update_events();
         EP::from_bits_truncate(self.do_poll() as u32)
     }
 }
@@ -598,5 +612,8 @@ impl InetSocket for TcpSocket {
             let _result = self.finish_connect();
             // set error
         }
+        let pollflag = self.check_io_event();
+        use crate::filesystem::epoll::event_poll::EventPoll;
+        EventPoll::wakeup_epoll(self.epoll_items().as_ref(), pollflag).unwrap();
     }
 }

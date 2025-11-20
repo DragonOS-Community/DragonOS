@@ -102,6 +102,7 @@ mkdir -p ${mount_folder}/bin
 mkdir -p ${mount_folder}/dev
 mkdir -p ${mount_folder}/proc
 mkdir -p ${mount_folder}/usr
+mkdir -p ${mount_folder}/root
 
 if [ "$FS_TYPE" = "vfat" ] || [ "$FS_TYPE" = "fat32" ]; then
     cp -rL ${root_folder}/bin/sysroot/* ${mount_folder}/

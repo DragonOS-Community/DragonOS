@@ -177,7 +177,7 @@ impl<'a> ReadaheadControl<'a> {
                 (start_index..start_index + max_pages)
                     .find(|idx| page_cache_gaurd.get_page(*idx).is_none())
             };
-            log::debug!("next_missing_pages: {:?}", next_missing_pages);
+            // log::debug!("next_missing_pages: {:?}", next_missing_pages);
 
             if let Some(next_missing_page) = next_missing_pages {
                 if next_missing_page - start_index > max_pages {

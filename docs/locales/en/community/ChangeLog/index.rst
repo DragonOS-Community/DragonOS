@@ -4,7 +4,7 @@
 
    - Source document: community/ChangeLog/index.rst
 
-   - Translation time: 2025-08-22 15:17:54
+   - Translation time: 2025-11-19 16:58:52
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -19,6 +19,7 @@ This is the release log for DragonOS, documenting the updates for each version o
 ..  toctree::  
     :maxdepth: 1  
 
+    V0.3.x/V0.3.0  
     V0.2.x/V0.2.0  
     V0.1.x/V0.1.10  
     V0.1.x/V0.1.9  

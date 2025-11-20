@@ -128,9 +128,9 @@ username:password:lastchg:min:max:warn:inactive:expire:flag
 
 ### 不同hash算法生成的密码前缀
 
-- \$5$ 前缀（SHA-256）
-- \$6$ 前缀（SHA-512）
-- \$y$ 前缀（Yarrow）
+- `\$5$` 前缀（SHA-256）
+- `\$6$` 前缀（SHA-512）
+- `\$y$` 前缀（Yarrow）
 
 
 

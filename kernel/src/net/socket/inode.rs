@@ -29,6 +29,9 @@ impl<T: Socket + 'static> IndexNode for T {
         buf: &mut [u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        // Drop the lock guard before calling self.read() to avoid holding the lock
+        // across a potentially blocking or reentrant operation. This prevents deadlocks
+        // and preemption issues.
         drop(data);
         self.read(buf)
     }

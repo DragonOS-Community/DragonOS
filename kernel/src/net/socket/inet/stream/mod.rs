@@ -127,16 +127,13 @@ impl TcpSocket {
                         remote,
                     )
                 })?;
-                let bound = socket
-                    .inner
-                    .write()
-                    .take()
-                    .expect("Tcp inner::Inner is None");
-
-                if let inner::Inner::Established(ref established) = bound {
-                    established.iface().common().bind_socket(socket.clone());
+                {
+                    let mut inner_guard = socket.inner.write();
+                    if let Some(inner::Inner::Established(established)) = inner_guard.as_mut() {
+                        established.iface().common().bind_socket(socket.clone());
+                    }
                 }
-                socket.inner.write().replace(bound);
+
                 Ok((socket, point))
             }
             _ => Err(SystemError::EINVAL),
@@ -614,6 +611,6 @@ impl InetSocket for TcpSocket {
         }
         let pollflag = self.check_io_event();
         use crate::filesystem::epoll::event_poll::EventPoll;
-        EventPoll::wakeup_epoll(self.epoll_items().as_ref(), pollflag).unwrap();
+        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), pollflag);
     }
 }

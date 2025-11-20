@@ -1,18 +1,19 @@
 #![allow(dead_code)]
-use core::{cmp::min, intrinsics::unlikely};
-use log::{debug, warn};
-use system_error::SystemError;
+use crate::filesystem::fat::fs::LockedFATInode;
 use crate::filesystem::vfs::IndexNode;
 use crate::mm::truncate::truncate_inode_pages;
-use crate::filesystem::fat::fs::LockedFATInode;
 use crate::{
-    driver::base::block::{SeekFrom, block_device::LBA_SIZE}, filesystem::fat::fs::LockedFATFsInfo, libs::vec_cursor::VecCursor
+    driver::base::block::{block_device::LBA_SIZE, SeekFrom},
+    libs::vec_cursor::VecCursor,
 };
 use alloc::{
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
+use core::{cmp::min, intrinsics::unlikely};
+use log::{debug, warn};
+use system_error::SystemError;
 
 use super::{
     fs::{Cluster, FATFileSystem, MAX_FILE_SIZE},
@@ -856,7 +857,6 @@ impl FATDir {
         new_inode: Option<Arc<LockedFATInode>>,
     ) -> Result<FATDirEntry, SystemError> {
         // 判断源目录项是否存在
-        println!("cccccccccccccccccccccc");
         let old_dentry = if let FATDirEntryOrShortName::DirEntry(dentry) =
             self.check_existence(old_name, None, fs.clone())?
         {
@@ -865,7 +865,6 @@ impl FATDir {
             // 如果目标目录项不存在，则返回错误
             return Err(SystemError::ENOENT);
         };
-        println!("dddddddddddddddddddddd");
         let short_name = match self.check_existence(new_name, None, fs.clone())? {
             FATDirEntryOrShortName::ShortName(s) => s,
             // 目标已存在：根据类型关系决定是否允许覆盖
@@ -885,9 +884,7 @@ impl FATDir {
                     return Err(SystemError::ENOTEMPTY);
                 }
                 if let Some(page_cache) = new_inode.unwrap().page_cache().clone() {
-                    println!("sssssssssssssssssss");
                     truncate_inode_pages(page_cache, 0);
-                    println!("eeeeeeeeeeeeeeeeeeeeee");
                 }
                 // 允许覆盖：若为非空目录，remove 会返回 ENOTEMPTY（这里只处理空目录或文件）
                 self.remove(fs.clone(), new_name, true)?;
@@ -897,7 +894,6 @@ impl FATDir {
         let old_short_dentry = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
             self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
-            println!("gggggggggggggggggggg");
             // 创建新的目录项
             let new_dentry = self.create_dir_entries(
                 new_name,
@@ -906,7 +902,6 @@ impl FATDir {
                 se.attributes,
                 fs.clone(),
             )?;
-            println!("hhhhhhhhhhhhhhhhhhhh");
             return Ok(new_dentry);
         } else {
             // 不允许对根目录项进行重命名
@@ -922,7 +917,7 @@ impl FATDir {
         target: &FATDir,
         old_name: &str,
         new_name: &str,
-        new_inode:Result<Arc<LockedFATInode>, SystemError>,
+        new_inode: Result<Arc<LockedFATInode>, SystemError>,
     ) -> Result<FATDirEntry, SystemError> {
         // 判断源目录项是否存在
         let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
@@ -953,16 +948,14 @@ impl FATDir {
                     return Err(SystemError::ENOTEMPTY);
                 }
                 if let Some(page_cache) = new_inode.unwrap().page_cache().clone() {
-                    println!("sssssssssssssssssss");
                     truncate_inode_pages(page_cache, 0);
-                    println!("eeeeeeeeeeeeeeeeeeeeee");
                 }
                 // 覆盖前删除目标目录项（空目录或文件），不截断源内容
                 target.remove(fs.clone(), new_name, true)?;
                 e.short_name_raw()
             }
         };
-        
+
         let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
             self.remove(fs.clone(), old_dentry.name().as_str(), false)?;

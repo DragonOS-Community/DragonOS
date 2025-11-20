@@ -1,0 +1,11 @@
+RenameTest.DirectoryOverwritesDirectoryLinkCount
+RenameTest.DirectoryOverwritesEmptyDirectory
+RenameTest.DirectoryWithOpenFdOverwritesEmptyDirectory
+# 权限相关未实现
+RenameTest.FailsWhenOldParentNotWritable
+RenameTest.FailsWhenNewParentNotWritable
+RenameTest.OverwriteFailsWhenNewParentNotWritable
+RenameTest.FileDoesNotExistWhenNewParentNotExecutable
+# 相关系统调用未实现
+RenameTest.SysfsFileToSelf
+RenameTest.SysfsDirectoryToSelf

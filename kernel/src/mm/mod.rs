@@ -33,11 +33,11 @@ pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
 pub mod percpu;
+pub mod readahead;
 pub mod syscall;
 pub mod sysfs;
 pub mod truncate;
 pub mod ucontext;
-pub mod readahead;
 
 /// 内核INIT进程的用户地址空间结构体（仅在process_init中初始化）
 static mut __IDLE_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;

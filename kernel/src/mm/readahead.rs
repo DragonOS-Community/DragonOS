@@ -135,7 +135,10 @@ impl<'a> ReadaheadControl<'a> {
             if let Some(page) = page_cache_guard
                 .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
             {
-                log::debug!("set ra flag at {}", self.ra_state.start + self.ra_state.size - self.ra_state.async_size);
+                log::debug!(
+                    "set ra flag at {}",
+                    self.ra_state.start + self.ra_state.size - self.ra_state.async_size
+                );
                 page.write_irqsave().add_flags(PageFlags::PG_READAHEAD);
             }
         }
@@ -172,7 +175,7 @@ impl<'a> ReadaheadControl<'a> {
             let page_cache_gaurd = self.page_cache.lock_irqsave();
             let next_missing_pages = {
                 (start_index..start_index + max_pages)
-                    .find(|idx| page_cache_gaurd.get_page(idx.clone()).is_none())
+                    .find(|idx| page_cache_gaurd.get_page(*idx).is_none())
             };
             log::debug!("next_missing_pages: {:?}", next_missing_pages);
 

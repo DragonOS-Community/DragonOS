@@ -20,8 +20,9 @@ use crate::{
     ipc::{kill::kill_process, pipe::PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
     mm::{
-        page::PageFlags, MemoryManagementArch,
+        page::PageFlags,
         readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
+        MemoryManagementArch,
     },
     process::{cred::Cred, resource::RLimitID, ProcessControlBlock, ProcessManager, RawPid},
 };

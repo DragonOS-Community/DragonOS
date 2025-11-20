@@ -8,7 +8,7 @@ use alloc::{sync::Arc, vec::Vec};
 use num_traits::abs_sub;
 use system_error::SystemError;
 
-// 以后其他方面提高了io速度，可以减小到32
+// TODO: 以后其他方面提高了io速度，可以减小到32
 pub const MAX_READAHEAD: usize = 128;
 
 /// 文件预读状态
@@ -179,15 +179,17 @@ impl<'a> ReadaheadControl<'a> {
             };
             log::debug!("next_missing_pages: {:?}", next_missing_pages);
 
-            if next_missing_pages.is_none() || next_missing_pages.unwrap() - start_index > max_pages
-            {
+            if let Some(next_missing_page) = next_missing_pages {
+                if next_missing_page - start_index > max_pages {
+                    return Ok(0);
+                }
+                ra_state.start = next_missing_page;
+                ra_state.size = ra_state.start - start_index + req_size;
+                ra_state.size = Self::get_next_ra_size(ra_state.size, max_pages);
+                ra_state.async_size = ra_state.size;
+            } else {
                 return Ok(0);
             }
-
-            ra_state.start = next_missing_pages.unwrap();
-            ra_state.size = ra_state.start - start_index + req_size;
-            ra_state.size = Self::get_next_ra_size(ra_state.size, max_pages);
-            ra_state.async_size = ra_state.size;
         } else if start_index == 0 || ra_state.first_sequential(start_index) {
             // 从头读或者第一次顺序读
 
@@ -261,7 +263,7 @@ pub fn page_cache_async_readahead(
         page_cache,
         inode,
         ra_state,
-        index: index + 1, // linux没有+1，但是这里去掉行为就不对了
+        index: index + 1,
     };
 
     ractl.ondemand_readahead(req_size, true)

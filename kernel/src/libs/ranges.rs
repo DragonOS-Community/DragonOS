@@ -10,7 +10,7 @@ use crate::alloc::vec::Vec;
 ///
 /// ## 示例
 /// ```
-/// merge_page_ranges(&[1, 2, 3, 5, 6, 8])
+/// merge_ranges(&[1, 2, 3, 5, 6, 8])
 /// // 返回 [(1, 3), (5, 2), (8, 1)]
 /// ```
 pub fn merge_ranges(set: &[usize]) -> Vec<(usize, usize)> {

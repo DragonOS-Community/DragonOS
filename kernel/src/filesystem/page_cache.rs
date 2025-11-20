@@ -72,21 +72,29 @@ impl InnerPageCache {
 
         let pages = {
             let mut page_manager_guard = page_manager_lock_irqsave();
-            (0..page_count)
-                .map(|i| {
-                    page_manager_guard.create_one_page(
-                        PageType::File(FileMapInfo {
-                            page_cache: self
-                                .page_cache_ref
-                                .upgrade()
-                                .expect("failed to get self_arc of pagecache"),
-                            index: start_page_index + i,
-                        }),
-                        PageFlags::PG_LRU,
-                        &mut LockedFrameAllocator,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?
+            let mut allocated_pages = Vec::with_capacity(page_count);
+            for i in 0..page_count {
+                match page_manager_guard.create_one_page(
+                    PageType::File(FileMapInfo {
+                        page_cache: self
+                            .page_cache_ref
+                            .upgrade()
+                            .expect("failed to get self_arc of pagecache"),
+                        index: start_page_index + i,
+                    }),
+                    PageFlags::PG_LRU,
+                    &mut LockedFrameAllocator,
+                ) {
+                    Ok(page) => allocated_pages.push(page),
+                    Err(e) => {
+                        for page in allocated_pages {
+                            page_manager_guard.remove_page(&page.phys_address());
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            allocated_pages
         };
 
         for (i, page) in pages.iter().enumerate() {

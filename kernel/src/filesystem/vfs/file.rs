@@ -260,10 +260,10 @@ impl File {
         self.do_write(offset, len, buf, false)
     }
 
-    fn file_readahead(&self, offset: usize, len: usize) -> Result<usize, SystemError> {
+    fn file_readahead(&self, offset: usize, len: usize) -> Result<(), SystemError> {
         let page_cache = match self.inode.page_cache() {
             Some(page_cahce) => page_cahce,
-            None => return Ok(0),
+            None => return Ok(()),
         };
 
         let start_page = offset >> MMArch::PAGE_SHIFT;
@@ -309,7 +309,7 @@ impl File {
             page_cache_sync_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
             *self.ra_state.lock() = ra_state;
         }
-        Ok(0)
+        Ok(())
     }
 
     pub fn do_read(

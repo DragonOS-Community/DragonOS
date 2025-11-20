@@ -65,6 +65,10 @@ pub fn do_renameat2(
     let new_parent_inode = root_inode
         .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
+    if old_filename == "." || old_filename == ".." || new_filename == "." || new_filename == ".." {
+        return Err(SystemError::EBUSY);
+    }
+
     if flags.contains(Flags::NOREPLACE) {
         if let Ok(_) = new_parent_inode.lookup(new_filename) {
             return Err(SystemError::EEXIST);

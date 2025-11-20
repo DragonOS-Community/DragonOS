@@ -1,16 +1,16 @@
+use crate::filesystem::vfs::syscall::RenameFlags;
 use alloc::string::ToString;
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::cmp::Ordering;
 use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
 use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
-
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
 
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
@@ -265,6 +265,7 @@ impl LockedFATInode {
         &self,
         old_name: &str,
         new_name: &str,
+        flags: RenameFlags,
     ) -> Result<(), SystemError> {
         if old_name == new_name {
             return Ok(());
@@ -272,6 +273,15 @@ impl LockedFATInode {
         let mut guard = self.0.lock();
         let old_inode = guard.find(old_name)?;
         let new_inode = guard.find(new_name).ok();
+        // do_rename2_at has checked NOREPLACE
+        if flags.contains(RenameFlags::EXCHANGE) {
+            if new_inode.is_none() {
+                return Err(SystemError::ENOENT);
+            }
+            // TODO: Implement EXCHANGE logic
+            return Err(SystemError::ENOSYS);
+        }
+
         // 对目标inode上锁，以防更改
         let mut old_inode_guard = old_inode.0.lock();
         let fs = old_inode_guard.fs.upgrade().unwrap();
@@ -300,6 +310,7 @@ impl LockedFATInode {
         old_name: &str,
         new_name: &str,
         target: &Arc<dyn IndexNode>,
+        flags: RenameFlags,
     ) -> Result<(), SystemError> {
         let mut old_guard = self.0.lock();
         let other: &LockedFATInode = target
@@ -309,6 +320,15 @@ impl LockedFATInode {
         let mut new_guard = other.0.lock();
         let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
         let new_inode = new_guard.find(new_name);
+        // do_rename2_at has checked NOREPLACE
+        if flags.contains(RenameFlags::EXCHANGE) {
+            if new_inode.is_err() {
+                return Err(SystemError::ENOENT);
+            }
+            // TODO: Implement EXCHANGE logic
+            return Err(SystemError::ENOSYS);
+        }
+
         // 对目标inode上锁，以防更改
         let mut old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
         // let new_inode_guard = new_inode.0.lock();
@@ -1905,14 +1925,15 @@ impl IndexNode for LockedFATInode {
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
+        flags: RenameFlags,
     ) -> Result<(), SystemError> {
         let old_id = self.metadata().unwrap().inode_id;
         let new_id = target.metadata().unwrap().inode_id;
         // 若在同一父目录下
         if old_id == new_id {
-            self.rename_file_in_current_dir(old_name, new_name)?;
+            self.rename_file_in_current_dir(old_name, new_name, flags)?;
         } else {
-            self.move_to_another_dir(old_name, new_name, target)?;
+            self.move_to_another_dir(old_name, new_name, target, flags)?;
         }
 
         return Ok(());

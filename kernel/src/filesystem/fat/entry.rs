@@ -791,7 +791,8 @@ impl FATDir {
         let e: FATDirEntry = self.find_entry(name, None, None, fs.clone())?;
 
         // 判断文件夹是否为空，如果空，则不删除，报错。
-        if e.is_dir() && !(e.to_dir().unwrap().is_empty(fs.clone())) {
+        //  remove_clusters 为 false 时（即重命名/移动操作），不再检查目录是否为空，从而允许非空目录被“搬运”到新位置。
+        if e.is_dir() && remove_clusters && !(e.to_dir().unwrap().is_empty(fs.clone())) {
             return Err(SystemError::ENOTEMPTY);
         }
 

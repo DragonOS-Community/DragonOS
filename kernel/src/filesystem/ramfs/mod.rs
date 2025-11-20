@@ -1,6 +1,7 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
+use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
 use crate::register_mountable_fs;
@@ -440,6 +441,7 @@ impl IndexNode for LockedRamFSInode {
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
+        _flags: RenameFlags,
     ) -> Result<(), SystemError> {
         let inode_to_move = self
             .find(old_name)?

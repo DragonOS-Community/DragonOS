@@ -16,6 +16,7 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
         mount::{MountFlags, MountPath},
+        syscall::RenameFlags,
         vcore::generate_inode_id,
         FileType,
     },
@@ -1078,6 +1079,7 @@ impl IndexNode for LockedProcFSInode {
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
+        _flag: RenameFlags,
     ) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }

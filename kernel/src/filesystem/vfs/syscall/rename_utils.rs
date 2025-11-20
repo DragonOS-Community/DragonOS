@@ -1,3 +1,4 @@
+use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::is_ancestor_except_self;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
@@ -47,11 +48,6 @@ pub fn do_renameat2(
         return Err(SystemError::EBUSY);
     }
 
-    let flags = Flags::from_bits_truncate(flags);
-    if !flags.is_empty() {
-        log::warn!("renameat2 flags {flags:?} not supported yet");
-        return Err(SystemError::EINVAL);
-    }
     //获取pcb，文件节点
     let pcb = ProcessManager::current_pcb();
     let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
@@ -65,14 +61,23 @@ pub fn do_renameat2(
     let new_parent_inode = root_inode
         .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
+    let flags = RenameFlags::from_bits_truncate(flags);
+    if flags.contains(RenameFlags::NOREPLACE) {
+        if new_filename == "." || new_filename == ".." {
+            return Err(SystemError::EEXIST);
+        }
+        if let Ok(_) = new_parent_inode.lookup(new_filename) {
+            return Err(SystemError::EEXIST);
+        }
+    }
+
     if old_filename == "." || old_filename == ".." || new_filename == "." || new_filename == ".." {
         return Err(SystemError::EBUSY);
     }
 
-    if flags.contains(Flags::NOREPLACE) {
-        if let Ok(_) = new_parent_inode.lookup(new_filename) {
-            return Err(SystemError::EEXIST);
-        }
+    if !flags.is_empty() {
+        log::warn!("renameat2 flags {flags:?} not supported yet");
+        return Err(SystemError::EINVAL);
     }
 
     let old_inode = old_parent_inode.lookup(old_filename)?;
@@ -91,19 +96,6 @@ pub fn do_renameat2(
     // 这会把同目录/向上移动的合法情况误判为 ENOTEMPTY。
     // 非空目录覆盖应由具体文件系统在 move_to/rename 实现中返回 ENOTEMPTY。
 
-    old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
+    old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
     return Ok(0);
-}
-
-bitflags! {
-    /// Flags used in the `renameat2` system call.
-    ///
-    /// Reference: <https://elixir.bootlin.com/linux/v6.16.3/source/include/uapi/linux/fcntl.h#L140-L143>.
-    ///
-    /// Reference: <https://man7.org/linux/man-pages/man2/renameat.2.html>.
-    struct Flags: u32 {
-        const NOREPLACE = 1 << 0;
-        const EXCHANGE  = 1 << 1;
-        const WHITEOUT  = 1 << 2;
-    }
 }

@@ -84,31 +84,33 @@ pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> 
         Err(_) => return false,
     };
 
-    // 从当前节点开始（包含自身）逐级向上
-    let mut cur: Arc<dyn IndexNode> = node.clone();
-    loop {
-        let cur_id = match cur.metadata() {
+    let mut next_node: Option<Arc<dyn IndexNode>> = Some(node.clone());
+    while let Some(current) = next_node {
+        let cur_id = match current.metadata() {
             Ok(m) => m.inode_id,
             Err(_) => break,
         };
+
         if cur_id == ancestor_id {
             return true;
         }
 
-        let parent = match cur.parent() {
+        let parent = match current.parent() {
             Ok(p) => p,
-            Err(_) => break,
+            Err(_) => break, // 没有父节点，到达根或错误，停止循环
         };
+
         let parent_id = match parent.metadata() {
             Ok(m) => m.inode_id,
             Err(_) => break,
         };
+
         if parent_id == cur_id {
-            // 到根或自循环
             break;
         }
-        cur = parent;
+        next_node = Some(parent);
     }
+
     false
 }
 

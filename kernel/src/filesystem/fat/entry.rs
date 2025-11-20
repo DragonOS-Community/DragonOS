@@ -854,7 +854,6 @@ impl FATDir {
         old_name: &str,
         new_name: &str,
         new_inode: Option<Arc<LockedFATInode>>,
-        old_inode: &Arc<LockedFATInode>,
     ) -> Result<FATDirEntry, SystemError> {
         // 判断源目录项是否存在
         println!("cccccccccccccccccccccc");
@@ -897,17 +896,7 @@ impl FATDir {
         };
         let old_short_dentry = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
-            // 删除源目录项：目录可为非空，不能用 remove() 的 ENOTEMPTY 检查
-            if old_dentry.is_dir() {
-                if let Some(range) = old_dentry.get_dir_range() {
-                    self.remove_dir_entries(fs.clone(), range)?;
-                }
-            } else {
-                // if let Some(page_cache) = old_inode.page_cache().clone() {
-                //     truncate_inode_pages(page_cache, 0);
-                // }
-                self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
-            }
+            self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
             println!("gggggggggggggggggggg");
             // 创建新的目录项
             let new_dentry = self.create_dir_entries(
@@ -934,7 +923,6 @@ impl FATDir {
         old_name: &str,
         new_name: &str,
         new_inode:Result<Arc<LockedFATInode>, SystemError>,
-        old_inode: &Arc<LockedFATInode>,
     ) -> Result<FATDirEntry, SystemError> {
         // 判断源目录项是否存在
         let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
@@ -977,18 +965,7 @@ impl FATDir {
         
         let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
-            // 删除源目录项（目录可非空，直接移除目录项链）
-            if old_dentry.is_dir() {
-                if let Some(range) = old_dentry.get_dir_range() {
-                    self.remove_dir_entries(fs.clone(), range)?;
-                }
-            } else {
-                if let Some(page_cache) = old_inode.page_cache().clone() {
-                    truncate_inode_pages(page_cache, 0);
-                }
-                self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
-            }
-
+            self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
             // 创建新的目录项
             let new_dentry: FATDirEntry = target.create_dir_entries(
                 new_name,

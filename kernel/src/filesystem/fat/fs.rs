@@ -274,9 +274,8 @@ impl LockedFATInode {
         let old_inode = guard.find(old_name)?;
         let new_inode = guard.find(new_name).ok();
         // 对目标inode上锁，以防更改
-        let old_inode_guard = old_inode.0.lock();
+        let mut old_inode_guard = old_inode.0.lock();
         let fs = old_inode_guard.fs.upgrade().unwrap();
-        drop(old_inode_guard);
         let old_dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
@@ -289,8 +288,7 @@ impl LockedFATInode {
         };
         // remove entries
         println!("bbbbbbbbbbbbbbbbbbbbbbbb");
-        old_dir.rename(fs, old_name, new_name,new_inode,&old_inode)?;
-
+        old_inode_guard.inode_type = old_dir.rename(fs, old_name, new_name,new_inode)?;
         let old_inode = guard.children.remove(&to_search_name(old_name)).unwrap();
         // the new_name should refer to old_inode
         guard.children.insert(to_search_name(new_name), old_inode);
@@ -314,9 +312,9 @@ impl LockedFATInode {
         let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
         let new_inode = new_guard.find(new_name);
         // 对目标inode上锁，以防更改
-        let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
+        let mut old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
+        // let new_inode_guard = new_inode.0.lock();
         let fs = old_inode_guard.fs.upgrade().unwrap();
-        drop(old_inode_guard);
         let old_dir = match &old_guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
@@ -338,10 +336,11 @@ impl LockedFATInode {
             }
         };
         
-        old_dir.rename_across(fs, new_dir, old_name, new_name,new_inode,&old_inode)?;
+        old_inode_guard.inode_type = old_dir.rename_across(fs, new_dir, old_name, new_name,new_inode)?;
         // 从缓存删除
+        drop(old_inode_guard);
         let _nod = old_guard.children.remove(&to_search_name(old_name));
-
+        new_guard.children.insert(to_search_name(new_name), old_inode);
         Ok(())
     }
 }

@@ -88,15 +88,15 @@ impl CpuTimeFunc {
             return;
         }
 
-        if user_tick {
-            pcb.account_utime(cputime);
-        } else {
-            pcb.account_stime(cputime);
-        }
-        pcb.add_sum_exec_runtime(cputime);
+        let accounted_cputime = cputime - other;
 
-        let cputime_ns = TICK_NESC as u64 * ticks;
-        let accounted_cputime = cputime_ns - other;
+        if user_tick {
+            pcb.account_utime(accounted_cputime);
+        } else {
+            pcb.account_stime(accounted_cputime);
+        }
+        pcb.add_sum_exec_runtime(accounted_cputime);
+
         // 检查并处理CPU时间定时器
         let mut itimers = pcb.itimers_irqsave();
         // 处理 ITIMER_VIRTUAL (仅在用户态tick时消耗时间)

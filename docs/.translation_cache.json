@@ -1,6 +1,6 @@
 {
   "en:kernel/memory_management/index.rst": {
-    "hash": "e394aa123a0030c0ec4276485fc764b7"
+    "hash": "cdc8a53e6bd469f798f021642fd989fb"
   },
   "en:kernel/debug/index.rst": {
     "hash": "6dc058a954b8620162e8293faa4959b2"
@@ -150,7 +150,7 @@
     "hash": "c931f3fcfca7d8d10cd16a8b68e6274a"
   },
   "en:community/ChangeLog/index.rst": {
-    "hash": "1a269fe56fa594f041bf009462d0e450"
+    "hash": "dbf244ec28b422b0b7d8b8bcfa72e94d"
   },
   "en:kernel/trace/index.rst": {
     "hash": "3c466a411a5bd71514f8fa4f15d06241"
@@ -304,5 +304,11 @@
   },
   "en:kernel/device/index.rst": {
     "hash": "71c15cea87dffe58f5d70da38390a083"
+  },
+  "en:kernel/memory_management/extable_safe_copy_design.md": {
+    "hash": "b337bca913e9e0de881ed5f81dcb5210"
+  },
+  "en:community/ChangeLog/V0.3.x/V0.3.0.md": {
+    "hash": "a3b5ae01c7a5f3ad9d26f71b54d01790"
   }
 }

@@ -1,3 +1,5 @@
+use core::sync::atomic::compiler_fence;
+
 use num_traits::FromPrimitive;
 
 use crate::ipc::signal_types::SignalFlags;
@@ -377,14 +379,47 @@ bitflags! {
     }
 }
 
+bitflags! {
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct GenericSigStackFlags:u32{
+        const SS_ONSTACK = 1;
+        const SS_DISABLE = 2;
+        const SS_AUTODISARM = 1 << 31;
+    }
+}
+
 /// 信号默认处理函数——终止进程
 fn sig_terminate(sig: Signal) {
-    ProcessManager::exit(sig as usize);
+    let code = ProcessManager::current_pcb()
+        .sighand()
+        .group_exit_code_if_set();
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    // 若线程组退出已经在进行中，则所有后续致命信号都应当使用统一的 group_exit_code，
+    // 避免多次触发 zap_other_threads 等逻辑。
+    if let Some(code) = code {
+        ProcessManager::exit(code);
+    } else {
+        // 还未进入 group-exit：按照 Linux 语义，
+        // 第一个致命信号负责设置 group_exit_code 并终止整个线程组。
+        //
+        // 对于信号导致的退出，exit_code 不需要左移（低 7 位即为信号编号）。
+        ProcessManager::group_exit(sig as usize);
+    }
 }
 
 /// 信号默认处理函数——终止进程并生成 core dump
 fn sig_terminate_dump(sig: Signal) {
-    ProcessManager::exit(sig as usize);
+    let code = ProcessManager::current_pcb()
+        .sighand()
+        .group_exit_code_if_set();
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    if let Some(code) = code {
+        ProcessManager::exit(code);
+    } else {
+        // TODO: 未来在这里补充 coredump 逻辑；目前先复用 group_exit 语义
+        ProcessManager::group_exit(sig as usize);
+    }
     // TODO 生成 coredump 文件
 }
 

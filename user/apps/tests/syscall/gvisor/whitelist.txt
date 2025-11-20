@@ -35,6 +35,8 @@ fpsig_nested_test
 wait_test
 tkill_test
 tgkill_test
+prctl_test
+exit_test
 
 # 内存管理测试
 #mmap_test
@@ -51,3 +53,8 @@ madvise_test
 #signal_test
 sigaction_test
 sigprocmask_test
+sigaltstack_test
+sigreturn_test
+
+# 其他测试
+itimer_test

@@ -8,6 +8,7 @@ use system_error::SystemError;
 pub use crate::ipc::generic_signal::AtomicGenericSignal as AtomicSignal;
 pub use crate::ipc::generic_signal::GenericSigChildCode as SigChildCode;
 pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
+pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
 
 use crate::{
@@ -353,7 +354,7 @@ bitflags! {
 #[derive(Debug, Clone, Copy)]
 pub struct X86SigStack {
     pub sp: usize,
-    pub flags: u32,
+    pub flags: SigStackFlags,
     pub size: u32,
 }
 
@@ -361,9 +362,15 @@ impl X86SigStack {
     pub fn new() -> Self {
         Self {
             sp: 0,
-            flags: 0,
+            flags: SigStackFlags::SS_DISABLE,
             size: 0,
         }
+    }
+
+    /// 检查给定的栈指针 `sp` 是否在当前备用信号栈的范围内。
+    #[inline]
+    pub fn on_sig_stack(&self, sp: usize) -> bool {
+        self.sp != 0 && self.size != 0 && (sp.wrapping_sub(self.sp) < self.size as usize)
     }
 }
 
@@ -534,13 +541,15 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let res: Result<i32, SystemError> =
         handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
     compiler_fence(Ordering::SeqCst);
-    if res.is_err() {
-        error!(
-            "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
-            sig_number as i32,
-            ProcessManager::current_pcb().raw_pid(),
-            res.as_ref().unwrap_err()
-        );
+    if let Err(e) = res {
+        if e != SystemError::EFAULT {
+            error!(
+                "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
+                sig_number as i32,
+                ProcessManager::current_pcb().raw_pid(),
+                &e
+            );
+        }
     }
 }
 
@@ -706,16 +715,14 @@ fn setup_frame(
                 return Ok(0);
             }
             SaHandlerType::Customized(handler) => {
-                // 如果handler位于内核空间
+                // 如果handler地址大于等于用户空间末尾，说明它在内核空间，这是非法的。
                 if handler >= MMArch::USER_END_VADDR {
-                    if sig == Signal::SIGSEGV {
-                        sig.handle_default();
-                        return Ok(0);
-                    } else {
-                        error!("attempting to execute a signal handler from kernel");
-                        sig.handle_default();
-                        return Err(SystemError::EINVAL);
-                    }
+                    error!("attempting to execute a signal handler from kernel");
+                    let _ = crate::ipc::kill::kill_process(
+                        ProcessManager::current_pcb().raw_pid(),
+                        Signal::SIGSEGV,
+                    );
+                    return Err(SystemError::EFAULT);
                 } else {
                     // 64位程序必须由用户自行指定restorer
                     if sigaction.flags().contains(SigFlags::SA_RESTORER) {
@@ -729,13 +736,6 @@ fn setup_frame(
                         let _ = crate::ipc::kill::kill_process(
                             ProcessManager::current_pcb().raw_pid(),
                             Signal::SIGSEGV,
-                        );
-                        return Err(SystemError::EINVAL);
-                    }
-                    if sigaction.restorer().is_none() {
-                        error!(
-                            "restorer in process:{:?} is not defined",
-                            ProcessManager::current_pcb().raw_pid()
                         );
                         return Err(SystemError::EINVAL);
                     }
@@ -824,13 +824,16 @@ fn setup_frame(
 
 #[inline(always)]
 fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> *mut SigFrame {
-    let binding = ProcessManager::current_pcb();
-    let stack = binding.sig_altstack();
+    let pcb = ProcessManager::current_pcb();
+    let stack = pcb.sig_altstack();
 
     let mut rsp: usize;
 
     // 检查是否使用备用栈
-    if sigaction.flags().contains(SigFlags::SA_ONSTACK) {
+    if sigaction.flags().contains(SigFlags::SA_ONSTACK)
+        && !stack.flags.contains(SigStackFlags::SS_DISABLE)
+        && !stack.on_sig_stack(frame.rsp as usize)
+    {
         rsp = stack.sp + stack.size as usize - size;
     } else {
         // 默认使用用户栈：rsp - 红区(128) - size
@@ -838,7 +841,7 @@ fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> *mut 
     }
 
     // 16字节对齐，减8是为了保持 x86_64 ABI 的栈对齐约定
-    rsp &= (!(STACK_ALIGN - 1)) as usize - 8;
+    rsp = (rsp & !(STACK_ALIGN - 1) as usize) - 8;
 
     rsp as *mut SigFrame
 }

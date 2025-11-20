@@ -1,6 +1,4 @@
 RenameTest.DirectoryOverwritesDirectoryLinkCount
-RenameTest.DirectoryOverwritesEmptyDirectory
-RenameTest.DirectoryWithOpenFdOverwritesEmptyDirectory
 # 权限相关未实现
 RenameTest.FailsWhenOldParentNotWritable
 RenameTest.FailsWhenNewParentNotWritable

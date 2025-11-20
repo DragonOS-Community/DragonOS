@@ -12,6 +12,5 @@ pub mod page_cache;
 pub mod poll;
 pub mod procfs;
 pub mod ramfs;
-pub mod readahead;
 pub mod sysfs;
 pub mod vfs;

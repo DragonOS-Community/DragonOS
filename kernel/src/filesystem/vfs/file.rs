@@ -15,12 +15,14 @@ use crate::{
     filesystem::{
         epoll::{event_poll::EPollPrivateData, EPollItem},
         procfs::ProcfsFilePrivateData,
-        readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
         vfs::FilldirContext,
     },
     ipc::{kill::kill_process, pipe::PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    mm::{page::PageFlags, MemoryManagementArch},
+    mm::{
+        page::PageFlags, MemoryManagementArch,
+        readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
+    },
     process::{cred::Cred, resource::RLimitID, ProcessControlBlock, ProcessManager, RawPid},
 };
 

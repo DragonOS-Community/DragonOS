@@ -66,11 +66,6 @@ pub fn do_kernel_rt_sigtimedwait(
         result
     };
 
-    // 如果信号集合为空，直接返回 EINVAL（根据 POSIX 标准）
-    if these.is_empty() {
-        return Err(SystemError::EINVAL);
-    }
-
     // 构造等待/屏蔽语义：与Linux一致
     // - 等待集合 these
     // - 临时屏蔽集合 = 旧blocked ∪ these（将这些信号作为masked的常规语义，但仍由本系统调用专门消费）
@@ -134,13 +129,20 @@ pub fn do_kernel_rt_sigtimedwait(
             }
         }
 
-        // 第四步：释放中断，然后真正进入调度睡眠（窗口期内，线程保持可中断阻塞，发送侧会唤醒）
+        // 第四步：检查是否有其他信号打断，若被其他信号唤醒了，必须返回 EINTR 让内核去处理那个信号
+        if has_any_pending_signal() {
+            drop(preempt_guard);
+            restore_saved_sigmask();
+            return Err(SystemError::EINTR);
+        }
 
+        // 第五步：释放中断，然后真正进入调度睡眠（窗口期内，线程保持可中断阻塞，发送侧会唤醒）
         // 计算剩余等待时间
         let remaining_time = if let Some(deadline) = deadline {
             let now = PosixTimeSpec::now();
             let remaining = deadline.total_nanos() - now.total_nanos();
             if remaining <= 0 {
+                drop(preempt_guard);
                 restore_saved_sigmask();
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
@@ -239,6 +241,24 @@ fn copy_posix_siginfo_to_user(
     let mut writer = UserBufferWriter::new(uinfo, size_of::<PosixSigInfo>(), from_user)?;
     writer.copy_one_to_user(&posix_siginfo, 0)?;
     Ok(())
+}
+
+/// 检查当前进程/线程是否有任何未屏蔽的待处理信号
+/// 用于判断 sigtimedwait 是否应该被 EINTR 中断
+fn has_any_pending_signal() -> bool {
+    let pcb = ProcessManager::current_pcb();
+    let siginfo_guard = pcb.sig_info_irqsave();
+    let blocked = *siginfo_guard.sig_blocked();
+    let thread_pending = siginfo_guard.sig_pending().signal();
+    drop(siginfo_guard);
+
+    let shared_pending = pcb.sighand().shared_pending_signal();
+
+    let total_pending = thread_pending.union(shared_pending);
+
+    let effective_pending = total_pending.difference(blocked);
+
+    !effective_pending.is_empty()
 }
 
 impl SysRtSigtimedwaitHandle {

@@ -85,6 +85,8 @@ pub fn do_kernel_rt_sigtimedwait(
     let mut new_blocked = *pcb.sig_info_irqsave().sig_blocked();
     // 按Linux：等待期间屏蔽 these
     new_blocked.insert(awaited);
+    new_blocked.remove(SigSet::from(Signal::SIGKILL));
+    new_blocked.remove(SigSet::from(Signal::SIGSTOP));
     set_user_sigmask(&mut new_blocked);
 
     // 计算超时时间
@@ -129,8 +131,9 @@ pub fn do_kernel_rt_sigtimedwait(
             }
         }
 
-        // 第四步：检查是否有其他信号打断，若被其他信号唤醒了，必须返回 EINTR 让内核去处理那个信号
-        if has_any_pending_signal() {
+        // 第四步：检查是否有其他未屏蔽的待处理信号打断，若被其他信号唤醒了，必须返回 EINTR 让内核去处理那个信号
+        pcb.recalc_sigpending(None);
+        if pcb.has_pending_signal_fast() {
             drop(preempt_guard);
             restore_saved_sigmask();
             return Err(SystemError::EINTR);
@@ -241,27 +244,6 @@ fn copy_posix_siginfo_to_user(
     let mut writer = UserBufferWriter::new(uinfo, size_of::<PosixSigInfo>(), from_user)?;
     writer.copy_one_to_user(&posix_siginfo, 0)?;
     Ok(())
-}
-
-/// 检查当前进程/线程是否有任何未屏蔽的待处理信号
-/// 用于判断 sigtimedwait 是否应该被 EINTR 中断
-fn has_any_pending_signal() -> bool {
-    let pcb = ProcessManager::current_pcb();
-    let siginfo_guard = pcb.sig_info_irqsave();
-    let mut blocked = *siginfo_guard.sig_blocked();
-    let thread_pending = siginfo_guard.sig_pending().signal();
-    drop(siginfo_guard);
-
-    blocked.remove(SigSet::from(Signal::SIGKILL));
-    blocked.remove(SigSet::from(Signal::SIGSTOP));
-
-    let shared_pending = pcb.sighand().shared_pending_signal();
-
-    let total_pending = thread_pending.union(shared_pending);
-
-    let effective_pending = total_pending.difference(blocked);
-
-    !effective_pending.is_empty()
 }
 
 impl SysRtSigtimedwaitHandle {

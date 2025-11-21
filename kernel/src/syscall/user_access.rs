@@ -965,9 +965,15 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
             let file_page_offset = guard.file_page_offset();
 
             drop(guard);
-            (region_start, region_end, vm_flags, vma_size, file, file_page_offset)
+            (
+                region_start,
+                region_end,
+                vm_flags,
+                vma_size,
+                file,
+                file_page_offset,
+            )
         };
-
 
         // 根据 vm_flags 判断是否具备访问权限
         let has_permission = if check_write {
@@ -979,7 +985,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
             break;
         }
 
-        let file_backed_len= file.and_then(|file| {
+        let file_backed_len = file.and_then(|file| {
             let file_offset_pages = file_page_offset.unwrap_or(0);
             let file_offset_bytes = file_offset_pages.saturating_mul(MMArch::PAGE_SIZE);
             let file_size = match file.metadata() {

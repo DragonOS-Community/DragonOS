@@ -23,6 +23,7 @@ sync_test
 #chown_test
 chdir_test
 fchdir_test
+getdents_test
 
 # 进程相关测试
 fork_test

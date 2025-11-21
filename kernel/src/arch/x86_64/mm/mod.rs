@@ -395,13 +395,10 @@ impl MemoryManagementArch for X86_64MMArch {
     }
 
     /// 带异常表保护的内存拷贝
-    #[inline(always)]
-    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> i32 {
-        let mut result: i32;
+    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        let mut result: usize;
 
         core::arch::asm!(
-            // 保存原始值
-            "xor {result:e}, {result:e}",
 
             // 标记为可能出错的访问点
             "2:",
@@ -411,9 +408,8 @@ impl MemoryManagementArch for X86_64MMArch {
             // 正常完成,跳过错误处理
             "jmp 3f",
 
-            // 错误处理: 设置返回值为-1
+            // 错误处理: 将剩余未拷贝的字节数返回(rcx会输出出去)
             "4:",
-            "mov {result:e}, -1",
 
             "3:",
 
@@ -421,13 +417,12 @@ impl MemoryManagementArch for X86_64MMArch {
             ".pushsection __ex_table, \"a\"",
             ".balign 8",
             ".quad 2b - .",
-            ".quad 4b - .",
+            ".quad 4b - . + 8",
             ".popsection",
 
-            result = out(reg) result,
             inout("rdi") dst => _,
             inout("rsi") src => _,
-            inout("rcx") len => _,
+            inout("rcx") len => result,
             options(att_syntax, nostack)
         );
 
@@ -446,13 +441,10 @@ impl MemoryManagementArch for X86_64MMArch {
     /// ## 返回值
     /// - 0: 成功
     /// - -1: 发生页错误
-    #[inline(always)]
-    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> i32 {
-        let mut result: i32;
+    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
+        let mut result: usize;
 
         core::arch::asm!(
-            // 初始化返回值为0
-            "xor {result:e}, {result:e}",
 
             // 标记为可能出错的访问点
             "2:",
@@ -463,9 +455,8 @@ impl MemoryManagementArch for X86_64MMArch {
             // 正常完成，跳过错误处理
             "jmp 3f",
 
-            // 错误处理: 设置返回值为-1
+            // 错误处理: 将剩余未设置的字节数返回
             "4:",
-            "mov {result:e}, -1",
 
             "3:",
 
@@ -473,12 +464,11 @@ impl MemoryManagementArch for X86_64MMArch {
             ".pushsection __ex_table, \"a\"",
             ".balign 8",
             ".quad 2b - .",
-            ".quad 4b - .",
+            ".quad 4b - . + 8",
             ".popsection",
 
-            result = out(reg) result,
             inout("rdi") dst => _,
-            inout("rcx") len => _,
+            inout("rcx") len => result,
             inout("al") value => _,
             options(att_syntax, nostack)
         );

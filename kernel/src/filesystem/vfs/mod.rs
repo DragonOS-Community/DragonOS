@@ -29,6 +29,7 @@ use crate::{
     mm::{fault::PageFaultMessage, VmFaultReason},
     net::socket::Socket,
     process::ProcessManager,
+    syscall::user_buffer::UserBuffer,
     time::PosixTimeSpec,
 };
 
@@ -1122,17 +1123,6 @@ pub struct FsInfo {
     pub max_name_len: usize,
 }
 
-/// @brief
-#[repr(C)]
-#[derive(Debug)]
-pub struct Dirent {
-    d_ino: u64,    // 文件序列号
-    d_off: i64,    // dir偏移量
-    d_reclen: u16, // 目录下的记录数
-    d_type: u8,    // entry的类型
-    d_name: u8,    // 文件entry的名字(是一个零长数组)， 本字段仅用于占位
-}
-
 impl Metadata {
     pub fn new(file_type: FileType, mode: ModeType) -> Self {
         Metadata {
@@ -1239,22 +1229,34 @@ pub fn produce_fs(
 
 define_filesystem_maker_slice!(FSMAKER);
 
+/// Dirent 格式类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirentFormat {
+    /// 旧格式 getdents (linux_dirent)，不包含 d_type 字段
+    Getdents,
+    /// 新格式 getdents64 (linux_dirent64)，包含 d_type 字段
+    Getdents64,
+}
+
 /// # 批量填充Dirent时的上下文Add commentMore actions
 /// linux语义是通过getdents_callback *类型来实现类似链表的迭代填充，这里考虑通过填充传入的缓冲区来实现
 pub struct FilldirContext<'a> {
-    buf: &'a mut [u8],
+    user_buf: UserBuffer<'a>,
     current_pos: usize,
     remain_size: usize,
     error: Option<SystemError>,
+    format: DirentFormat,
 }
 
 impl<'a> FilldirContext<'a> {
-    pub fn new(user_buf: &'a mut [u8]) -> Self {
+    pub fn new(user_buf: UserBuffer<'a>, format: DirentFormat) -> Self {
+        let len = user_buf.len();
         Self {
-            remain_size: user_buf.len(),
-            buf: user_buf,
+            remain_size: len,
+            user_buf,
             current_pos: 0,
             error: None,
+            format,
         }
     }
 
@@ -1265,7 +1267,7 @@ impl<'a> FilldirContext<'a> {
     /// - offset 当前目录项偏移量
     /// - ino 目录项的inode的inode_id
     /// - d_type 目录项的inode的file_type_num
-    fn fill_dir(
+    pub(crate) fn fill_dir(
         &mut self,
         name: &str,
         offset: usize,
@@ -1273,40 +1275,104 @@ impl<'a> FilldirContext<'a> {
         d_type: u8,
     ) -> Result<(), SystemError> {
         let name_len = name.len();
-        let dirent_size = ::core::mem::size_of::<Dirent>() - ::core::mem::size_of::<u8>();
-        let reclen = name_len + dirent_size + 1;
+        let name_bytes = name.as_bytes();
 
-        // 将reclen向上对齐usize大小
-        let align_up = |len: usize, align: usize| -> usize { (len + align - 1) & !(align - 1) };
-        let align_up_reclen = align_up(reclen, ::core::mem::size_of::<usize>());
+        // 根据格式计算基础结构大小
+        // linux_dirent (旧格式): d_ino(8) + d_off(8) + d_reclen(2) = 18 bytes
+        // linux_dirent64 (新格式): d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) = 19 bytes
+        let base_size = match self.format {
+            DirentFormat::Getdents => 18,   // d_ino + d_off + d_reclen
+            DirentFormat::Getdents64 => 19, // d_ino + d_off + d_reclen + d_type
+        };
 
-        // 当前缓冲区空间已不足，返回EINVAL
+        // 计算总长度：基础结构 + 文件名 + null terminator
+        let total_size = base_size + name_len + 1;
+
+        // 对齐到 8 字节（Linux 要求 d_reclen 必须是 8 的倍数）
+        const ALIGN: usize = 8;
+        let align_up = |len: usize| -> usize { (len + ALIGN - 1) & !(ALIGN - 1) };
+        let align_up_reclen = align_up(total_size);
+
+        // 检查缓冲区空间是否足够
         if align_up_reclen > self.remain_size {
             self.error = Some(SystemError::EINVAL);
             return Err(SystemError::EINVAL);
         }
 
-        // 获取剩余缓冲区
-        let current_dirent_slice = &mut self.buf[self.current_pos..];
-        let dirent = unsafe { (current_dirent_slice.as_mut_ptr() as *mut Dirent).as_mut() }
-            .ok_or(SystemError::EFAULT)?;
-
-        // 填充dirent
-        dirent.d_ino = ino;
-        dirent.d_type = d_type;
-        dirent.d_reclen = align_up_reclen as u16;
-        dirent.d_off = offset as i64;
-        unsafe {
-            let ptr = &mut dirent.d_name as *mut u8;
-            let buf: &mut [u8] =
-                ::core::slice::from_raw_parts_mut::<'static, u8>(ptr, name_len + 1);
-            buf[0..name_len].copy_from_slice(name.as_bytes());
-            buf[name_len] = 0;
+        // 获取当前写入位置的偏移量
+        let buf_start = self.current_pos;
+        // 清零缓冲区（确保对齐部分为0）
+        // 如果清零失败（例如访问不可写页面），视为缓冲区空间不足
+        if let Err(_e) = self.user_buf.clear_range(buf_start, align_up_reclen) {
+            // 将 EFAULT 或其他写入错误转换为 EINVAL，表示缓冲区空间不足
+            // 这样 read_dir 会正常返回，而不是传播错误
+            self.error = Some(SystemError::EINVAL);
+            return Err(SystemError::EINVAL);
         }
+        // 在内核空间构建完整的 dirent 数据
+        let mut dirent_data = vec![0u8; align_up_reclen];
 
+        // 根据格式填充结构
+        match self.format {
+            DirentFormat::Getdents => {
+                // linux_dirent 格式：
+                // d_ino: unsigned long (8 bytes)
+                // d_off: unsigned long (8 bytes)
+                // d_reclen: unsigned short (2 bytes)
+                // d_name[0]: char[] (可变长度)
+
+                // 写入 d_ino (offset 0, 8 bytes)
+                dirent_data[0..8].copy_from_slice(&ino.to_le_bytes());
+
+                // 写入 d_off (offset 8, 8 bytes) - 注意：旧格式使用 unsigned long
+                let d_off = offset as u64;
+                dirent_data[8..16].copy_from_slice(&d_off.to_le_bytes());
+
+                // 写入 d_reclen (offset 16, 2 bytes)
+                dirent_data[16..18].copy_from_slice(&(align_up_reclen as u16).to_le_bytes());
+
+                // 写入 d_name (offset 18)
+                dirent_data[18..18 + name_len].copy_from_slice(name_bytes);
+                dirent_data[18 + name_len] = 0; // null terminator
+            }
+            DirentFormat::Getdents64 => {
+                // linux_dirent64 格式：
+                // d_ino: uint64_t (8 bytes)
+                // d_off: int64_t (8 bytes)
+                // d_reclen: unsigned short (2 bytes)
+                // d_type: unsigned char (1 byte)
+                // d_name[0]: char[] (可变长度)
+
+                // 写入 d_ino (offset 0, 8 bytes)
+                dirent_data[0..8].copy_from_slice(&ino.to_le_bytes());
+
+                // 写入 d_off (offset 8, 8 bytes) - 注意：新格式使用 int64_t
+                let d_off = offset as i64;
+                dirent_data[8..16].copy_from_slice(&d_off.to_le_bytes());
+
+                // 写入 d_reclen (offset 16, 2 bytes)
+                dirent_data[16..18].copy_from_slice(&(align_up_reclen as u16).to_le_bytes());
+
+                // 写入 d_type (offset 18, 1 byte)
+                dirent_data[18] = d_type;
+
+                // 写入 d_name (offset 19)
+                dirent_data[19..19 + name_len].copy_from_slice(name_bytes);
+                dirent_data[19 + name_len] = 0; // null terminator
+            }
+        }
+        // 使用受保护的方法写入用户缓冲区
+        // 如果写入失败（例如访问不可写页面），视为缓冲区空间不足
+        if let Err(_e) = self.user_buf.write_to_user(buf_start, &dirent_data) {
+            // 将 EFAULT 或其他写入错误转换为 EINVAL，表示缓冲区空间不足
+            // 这样 read_dir 会正常返回，而不是传播错误
+            self.error = Some(SystemError::EINVAL);
+            return Err(SystemError::EINVAL);
+        }
+        // 更新位置
         self.current_pos += align_up_reclen;
         self.remain_size -= align_up_reclen;
 
-        return Ok(());
+        Ok(())
     }
 }

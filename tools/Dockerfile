@@ -18,8 +18,7 @@ COPY *.sh ./
 RUN apt update && \
     apt install -y ca-certificates curl gnupg wget sudo apt-utils && \
     bash bootstrap.sh --default && \
-    sudo cp /tmp/docker-entrypoint.sh /root/entrypoint.sh && \
-    sudo chmod a+rwx /root/entrypoint.sh && \
+    bash change_rust_src_to_official.sh && \
     git config --global --add safe.directory '*' && \
     sudo apt autoremove -q -y && \         
     sudo apt clean -q -y && \
@@ -27,6 +26,5 @@ RUN apt update && \
 
 WORKDIR /root
 
-ENTRYPOINT [ "/root/entrypoint.sh" ]
 # 设置容器启动后执行的命令
 CMD ["/bin/bash"]

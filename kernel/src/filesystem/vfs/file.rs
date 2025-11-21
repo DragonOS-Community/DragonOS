@@ -407,9 +407,16 @@ impl File {
     /// @brief 判断当前文件是否可读
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
+        let mode = *self.mode.read();
+
+        // 检查是否是O_PATH文件描述符
+        if mode.contains(FileMode::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
         // 暂时认为只要不是write only, 就可读
-        if *self.mode.read() == FileMode::O_WRONLY {
-            return Err(SystemError::EPERM);
+        if mode.accmode() == FileMode::O_WRONLY.bits() {
+            return Err(SystemError::EBADF);
         }
 
         return Ok(());

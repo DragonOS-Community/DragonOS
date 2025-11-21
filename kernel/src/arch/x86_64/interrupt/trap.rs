@@ -363,7 +363,7 @@ Segment Selector Index: {:#x}\n
 
 /// 处理页错误 14 #PF
 #[no_mangle]
-unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_page_fault(regs: &'static mut TrapFrame, error_code: u64) {
     // error!(
     //     "do_page_fault(14), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}, \nFault Address: {:#x}",
     //     error_code,

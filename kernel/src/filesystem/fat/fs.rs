@@ -273,7 +273,6 @@ impl LockedFATInode {
         let mut guard = self.0.lock();
         let old_inode = guard.find(old_name)?;
         let new_inode = guard.find(new_name).ok();
-        
         if flags.contains(RenameFlags::NOREPLACE) && new_inode.is_some() {
             return Err(SystemError::EEXIST);
         }
@@ -324,7 +323,7 @@ impl LockedFATInode {
         let mut new_guard = other.0.lock();
         let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
         let new_inode = new_guard.find(new_name);
-        
+
         if flags.contains(RenameFlags::NOREPLACE) && new_inode.is_ok() {
             return Err(SystemError::EEXIST);
         }

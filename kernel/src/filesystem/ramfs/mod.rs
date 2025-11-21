@@ -457,7 +457,8 @@ impl IndexNode for LockedRamFSInode {
         let mut self_inode = self.0.lock();
         // 判断是否在同一目录下, 是则进行重命名
         if target_id == self_inode.metadata.inode_id {
-            if flags.contains(RenameFlags::NOREPLACE) && self_inode.children.contains_key(&new_name) {
+            if flags.contains(RenameFlags::NOREPLACE) && self_inode.children.contains_key(&new_name)
+            {
                 return Err(SystemError::EEXIST);
             }
             self_inode.children.remove(&DName::from(old_name));

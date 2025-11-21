@@ -62,10 +62,8 @@ pub fn do_renameat2(
         .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     let flags = RenameFlags::from_bits_truncate(flags);
-    if flags.contains(RenameFlags::NOREPLACE) {
-        if new_filename == "." || new_filename == ".." {
-            return Err(SystemError::EEXIST);
-        }
+    if flags.contains(RenameFlags::NOREPLACE) && new_filename == "." || new_filename == ".." {
+        return Err(SystemError::EEXIST);
     }
 
     if old_filename == "." || old_filename == ".." || new_filename == "." || new_filename == ".." {

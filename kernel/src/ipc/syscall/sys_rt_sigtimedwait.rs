@@ -85,8 +85,6 @@ pub fn do_kernel_rt_sigtimedwait(
     let mut new_blocked = *pcb.sig_info_irqsave().sig_blocked();
     // 按Linux：等待期间屏蔽 these
     new_blocked.insert(awaited);
-    new_blocked.remove(SigSet::from(Signal::SIGKILL));
-    new_blocked.remove(SigSet::from(Signal::SIGSTOP));
     set_user_sigmask(&mut new_blocked);
 
     // 计算超时时间

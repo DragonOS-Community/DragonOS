@@ -1,0 +1,4 @@
+# SYS_MEMFD_CREATE未实现
+Pread64Test.Overflow
+# 会卡死
+Pread64Test.CantReadPipe

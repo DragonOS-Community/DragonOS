@@ -936,7 +936,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         return 0;
     }
 
-    // 获取当前进程的 VMA （可访问的地址空间）
+    // 获取当前进程的 vm （可访问的地址空间）
     let vm = match ProcessManager::current_pcb().basic().user_vm() {
         Some(vm) => vm,
         None => return 0,
@@ -954,32 +954,20 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
             break;
         };
 
-        // 获取地址所在内存页的起始地址 和结束地址，以及访问权限标志 和文件后备长度
-        let (region_start, region_end, vm_flags, file_backed_len) = {
+        // 获取地址所在 VMA 的起始地址 和结束地址，访问权限标志，后备的文件和当前VMA第一页映射到文件的哪一页
+        let (region_start, region_end, vm_flags, vma_size, file, file_page_offset) = {
             let guard = vma.lock_irqsave();
             let region_start = guard.region().start().data();
             let region_end = guard.region().end().data();
             let vm_flags = *guard.vm_flags();
             let vma_size = region_end.saturating_sub(region_start);
+            let file = guard.vm_file();
+            let file_page_offset = guard.file_page_offset();
 
-            let file_backed_len = guard.vm_file().and_then(|file| {
-                let file_offset_pages = guard.file_page_offset().unwrap_or(0);
-                let file_offset_bytes = file_offset_pages.saturating_mul(MMArch::PAGE_SIZE);
-                let file_size = match file.metadata() {
-                    Ok(md) if md.size > 0 => {
-                        let capped = core::cmp::min(md.size as u128, usize::MAX as u128);
-                        capped as usize
-                    }
-                    Ok(_) => 0,
-                    Err(_) => return None,
-                };
-
-                let backed = file_size.saturating_sub(file_offset_bytes);
-                Some(core::cmp::min(backed, vma_size))
-            });
-
-            (region_start, region_end, vm_flags, file_backed_len)
+            drop(guard);
+            (region_start, region_end, vm_flags, vma_size, file, file_page_offset)
         };
+
 
         // 根据 vm_flags 判断是否具备访问权限
         let has_permission = if check_write {
@@ -987,11 +975,27 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         } else {
             vm_flags.contains(VmFlags::VM_READ)
         };
-
         if !has_permission {
             break;
         }
 
+        let file_backed_len= file.and_then(|file| {
+            let file_offset_pages = file_page_offset.unwrap_or(0);
+            let file_offset_bytes = file_offset_pages.saturating_mul(MMArch::PAGE_SIZE);
+            let file_size = match file.metadata() {
+                Ok(md) if md.size > 0 => {
+                    let capped = core::cmp::min(md.size as u128, usize::MAX as u128);
+                    capped as usize
+                }
+                Ok(_) => 0,
+                Err(_) => return None,
+            };
+
+            let backed = file_size.saturating_sub(file_offset_bytes);
+            Some(core::cmp::min(backed, vma_size))
+        });
+
+        // 计算当前 VMA 内从 current 地址开始的可用长度
         let current_addr = current.data();
         let mut available = region_end.saturating_sub(current_addr);
 

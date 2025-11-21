@@ -714,8 +714,8 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     ///
     /// ## 返回值
     /// - 0: 成功
-    /// - -1: 发生页错误
-    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> i32 {
+    /// - 其他值： 剩余未拷贝的字节数
+    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> usize {
         // 对于不支持异常表的架构，直接使用普通的内存拷贝
         ptr::copy_nonoverlapping(src, dst, len);
         0
@@ -734,8 +734,8 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     ///
     /// ## 返回值
     /// - 0: 成功
-    /// - -1: 发生页错误
-    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> i32 {
+    /// - 其他值： 剩余未设置的字节数
+    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
         // 对于不支持异常表的架构，直接使用普通的内存设置
         ptr::write_bytes(dst, value, len);
         0

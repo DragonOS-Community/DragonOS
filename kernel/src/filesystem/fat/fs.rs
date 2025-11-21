@@ -273,13 +273,17 @@ impl LockedFATInode {
         let mut guard = self.0.lock();
         let old_inode = guard.find(old_name)?;
         let new_inode = guard.find(new_name).ok();
-        // do_renameat2 has checked NOREPLACE
+        
+        if flags.contains(RenameFlags::NOREPLACE) && new_inode.is_some() {
+            return Err(SystemError::EEXIST);
+        }
+
         if flags.contains(RenameFlags::EXCHANGE) {
             if new_inode.is_none() {
                 return Err(SystemError::ENOENT);
             }
             // TODO: Implement EXCHANGE logic
-            return Err(SystemError::ENOSYS);
+            return Err(SystemError::EINVAL);
         }
 
         // 对目标inode上锁，以防更改
@@ -320,13 +324,17 @@ impl LockedFATInode {
         let mut new_guard = other.0.lock();
         let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
         let new_inode = new_guard.find(new_name);
-        // do_renameat2 has checked NOREPLACE
+        
+        if flags.contains(RenameFlags::NOREPLACE) && new_inode.is_ok() {
+            return Err(SystemError::EEXIST);
+        }
+
         if flags.contains(RenameFlags::EXCHANGE) {
             if new_inode.is_err() {
                 return Err(SystemError::ENOENT);
             }
             // TODO: Implement EXCHANGE logic
-            return Err(SystemError::ENOSYS);
+            return Err(SystemError::EINVAL);
         }
 
         // 对目标inode上锁，以防更改
@@ -356,9 +364,11 @@ impl LockedFATInode {
 
         old_inode_guard.inode_type =
             old_dir.rename_across(fs, new_dir, old_name, new_name, new_inode)?;
-        // 从缓存删除
-        drop(old_inode_guard);
-        let _nod = old_guard.children.remove(&to_search_name(old_name));
+        // 将源节点从父目录中删除
+        let old_inode = old_guard
+            .children
+            .remove(&to_search_name(old_name))
+            .unwrap();
         new_guard
             .children
             .insert(to_search_name(new_name), old_inode);

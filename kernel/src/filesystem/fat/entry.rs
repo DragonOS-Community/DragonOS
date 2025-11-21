@@ -872,9 +872,12 @@ impl FATDir {
             FATDirEntryOrShortName::DirEntry(e) => {
                 validate_rename_target(&old_dentry, &e, fs.clone())?;
 
-                if let Some(page_cache) = new_inode.unwrap().page_cache().clone() {
-                    truncate_inode_pages(page_cache, 0);
+                if let Some(new_inode) = new_inode {
+                    if let Some(page_cache) = new_inode.page_cache().clone() {
+                        truncate_inode_pages(page_cache, 0);
+                    }
                 }
+
                 // 允许覆盖：若为非空目录，remove 会返回 ENOTEMPTY（这里只处理空目录或文件）
                 self.remove(fs.clone(), new_name, true)?;
                 e.short_name_raw()
@@ -2484,6 +2487,7 @@ pub fn validate_rename_target(
     if !old_is_dir && new_is_dir {
         return Err(SystemError::EISDIR);
     }
+    // new_entry是目录，直接unwrap
     if new_entry.is_dir() && !(new_entry.to_dir().unwrap().is_empty(fs)) {
         return Err(SystemError::ENOTEMPTY);
     }

@@ -66,9 +66,6 @@ pub fn do_renameat2(
         if new_filename == "." || new_filename == ".." {
             return Err(SystemError::EEXIST);
         }
-        if new_parent_inode.lookup(new_filename).is_ok() {
-            return Err(SystemError::EEXIST);
-        }
     }
 
     if old_filename == "." || old_filename == ".." || new_filename == "." || new_filename == ".." {

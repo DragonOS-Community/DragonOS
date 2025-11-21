@@ -1,7 +1,7 @@
 use crate::{
     arch::MMArch,
     filesystem::{page_cache::PageCache, vfs::IndexNode},
-    libs::{log2::round_up_pow_of_two, ranges::merge_ranges},
+    libs::ranges::merge_ranges,
     mm::{page::PageFlags, MemoryManagementArch},
 };
 use alloc::{sync::Arc, vec::Vec};
@@ -66,7 +66,10 @@ pub struct ReadaheadControl<'a> {
 
 impl<'a> ReadaheadControl<'a> {
     fn get_init_ra_size(req_size: usize, max_pages: usize) -> usize {
-        let newsize = round_up_pow_of_two(req_size);
+        let newsize = match req_size.checked_next_power_of_two(){
+            Some(newsize) => newsize,
+            None => req_size,
+        };
 
         if newsize < max_pages / 32 {
             newsize * 4

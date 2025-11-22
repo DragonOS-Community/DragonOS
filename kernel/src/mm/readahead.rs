@@ -66,7 +66,7 @@ pub struct ReadaheadControl<'a> {
 
 impl<'a> ReadaheadControl<'a> {
     fn get_init_ra_size(req_size: usize, max_pages: usize) -> usize {
-        let newsize = match req_size.checked_next_power_of_two(){
+        let newsize = match req_size.checked_next_power_of_two() {
             Some(newsize) => newsize,
             None => req_size,
         };

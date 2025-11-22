@@ -1,0 +1,5 @@
+# 
+ItimerTest.DeliversSIGALRMToMainThread
+# 多线程信号公平性未实现
+ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyActive
+ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyIdle

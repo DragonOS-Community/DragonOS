@@ -1176,7 +1176,10 @@ impl IndexNode for LockedProcFSInode {
         keys.push(String::from(".."));
 
         if self.0.lock().fdata.ftype == ProcFileType::ProcFdDir {
-            return self.dynamical_list_fd();
+            // 对于 /proc/self/fd 目录，需要包含 "." 和 ".."，然后添加所有fd
+            let mut fd_list = self.dynamical_list_fd()?;
+            keys.append(&mut fd_list);
+            return Ok(keys);
         }
 
         keys.append(

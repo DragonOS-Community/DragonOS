@@ -73,7 +73,7 @@ impl UAddCheck {
             info.home_dir = home_dir;
         }
         if info.shell.is_empty() {
-            info.shell = "/bin/NovaShell".to_string();
+            info.shell = "/bin/sh".to_string();
         }
 
         // 校验终端是否有效

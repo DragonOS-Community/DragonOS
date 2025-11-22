@@ -20,6 +20,8 @@ impl Syscall for SysExit {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let exit_code = Self::exit_code(args);
+        // 仿照 Linux sys_exit：只取低 8 位并左移 8 位，形成 wstatus 编码，
+        // 然后只退出当前线程（不退出整个线程组）。
         ProcessManager::exit((exit_code & 0xff) << 8);
     }
 

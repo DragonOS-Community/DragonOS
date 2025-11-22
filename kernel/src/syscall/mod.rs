@@ -27,6 +27,7 @@ use self::{misc::SysInfo, user_access::UserBufferWriter};
 pub mod misc;
 pub mod table;
 pub mod user_access;
+pub mod user_buffer;
 
 // 与linux不一致的调用，在linux基础上累加
 pub const SYS_PUT_STRING: usize = 100000;
@@ -347,13 +348,6 @@ impl Syscall {
                 // todo: 这个系统调用还没有实现
 
                 Err(SystemError::ENOSYS)
-            }
-
-            // SYS_SCHED_YIELD => Self::sched_yield(),
-            SYS_PRCTL => {
-                // todo: 这个系统调用还没有实现
-
-                Err(SystemError::EINVAL)
             }
 
             #[cfg(target_arch = "x86_64")]

@@ -42,7 +42,9 @@ impl Syscall for SysPread64Handle {
         }
 
         // 检查offset + len是否溢出
-        if offset.checked_add(len).is_none() || offset > i64::MAX as usize {
+
+        let end_pos = offset.checked_add(len).ok_or(SystemError::EINVAL)?;
+        if offset > i64::MAX as usize || end_pos > i64::MAX as usize {
             return Err(SystemError::EINVAL);
         }
 
@@ -62,7 +64,10 @@ impl Syscall for SysPread64Handle {
 
         // 检查是否是管道/Socket (ESPIPE)
         let md = file.metadata()?;
-        if md.file_type == FileType::Pipe || md.file_type == FileType::Socket {
+        if md.file_type == FileType::Pipe
+            || md.file_type == FileType::Socket
+            || md.file_type == FileType::CharDevice
+        {
             return Err(SystemError::ESPIPE);
         }
 

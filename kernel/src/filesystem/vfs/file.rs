@@ -410,12 +410,7 @@ impl File {
         let mode = *self.mode.read();
 
         // 检查是否是O_PATH文件描述符
-        if mode.contains(FileMode::O_PATH) {
-            return Err(SystemError::EBADF);
-        }
-
-        // 暂时认为只要不是write only, 就可读
-        if mode.accmode() == FileMode::O_WRONLY.bits() {
+        if mode == FileMode::O_WRONLY ||mode.contains(FileMode::O_PATH) {
             return Err(SystemError::EBADF);
         }
 

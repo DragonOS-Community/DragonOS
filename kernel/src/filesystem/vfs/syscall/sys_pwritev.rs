@@ -38,10 +38,15 @@ impl Syscall for SysPwriteVHandle {
         let iov_count = Self::iov_count(args);
         let offset = Self::offset(args);
 
-        // 将用户态传入的指向用户态应用的数据结构重新在内核栈上构造
+        // 将用户态传入的数据结构 `IoVecs` 重新在内核上构造
         let iovecs = unsafe { IoVecs::from_user(iov, iov_count, false) }?;
-        let data = iovecs.gather();
+        let data = iovecs.gather()?;
 
+        // TODO: 支持零内核拷贝的分散写 （需要文件系统底层支持分散写）
+        // - 直接将传入的用户态 IoVec 使用 vma 做校验以后传入底层文件系统进行分散写，避免内核拷贝
+        // - 实现路径（linux）：wirtev --> vfs_writev --> do_iter_write --> do_loop_readv_writev/do_iter_readv_writev
+        // - 目前内核文件子系统尚未实现分散写功能，即无法直接使用用户态的 IoVec 进行写操作
+        // - 目前先将用户态的 IoVec 聚合成一个连续的内核缓冲区 `data`，然后进行写操作，避免多次发起写操作的开销。
         do_pwritev(fd, &data, offset)
     }
 

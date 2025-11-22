@@ -507,6 +507,17 @@ impl File {
     /// ## 参数
     /// - ctx 填充目录项的上下文
     pub fn read_dir(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
+        // O_PATH 文件描述符只能用于有限的操作，getdents/getdents64
+        // 在 Linux 中会返回 EBADF。提前检测并返回相同语义。
+        if self.mode().contains(FileMode::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 仅目录允许读取目录项，其它类型遵循 POSIX 语义返回 ENOTDIR。
+        if self.file_type() != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
         let inode: &Arc<dyn IndexNode> = &self.inode;
         let mut current_pos = self.offset.load(Ordering::SeqCst);
 
@@ -514,7 +525,15 @@ impl File {
         // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理
 
         // 迭代读取目录项
-        let readdir_subdirs_name = inode.list()?;
+        // 为了保证在目录内容动态变化（例如 /proc/self/fd）时不会因为重新
+        // 创建列表而丢失尚未读取的目录项，这里缓存第一次生成的列表，在
+        // 文件偏移被 seek 到 0 之前复用该缓存。
+        let mut cached_names = self.readdir_subdirs_name.lock();
+        if current_pos == 0 || cached_names.is_empty() {
+            *cached_names = inode.list()?;
+        }
+        let readdir_subdirs_name = cached_names.clone();
+        drop(cached_names);
 
         let subdirs_name_len = readdir_subdirs_name.len();
         while current_pos < subdirs_name_len {
@@ -522,6 +541,12 @@ impl File {
             let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
                 Ok(i) => i,
                 Err(e) => {
+                    if e == SystemError::ENOENT {
+                        // 目录项在本次读取过程中被移除，跳过它，继续读取后续条目
+                        self.offset.fetch_add(1, Ordering::SeqCst);
+                        current_pos += 1;
+                        continue;
+                    }
                     error!("Readdir error: Failed to find sub inode");
                     return Err(e);
                 }

@@ -6,22 +6,22 @@
 #[derive(Debug, Clone, Copy)]
 pub struct ExceptionTableEntry {
     /// 可能触发异常的指令地址(相对于表项地址的偏移)
-    pub insn_offset: i32,
+    pub insn_offset: i64,
     /// 修复代码地址(相对于表项地址的偏移)
-    pub fixup_offset: i32,
+    pub fixup_offset: i64,
 }
 
 impl ExceptionTableEntry {
     /// 获取指令的绝对地址
     pub fn insn_addr(&self) -> usize {
         let self_addr = self as *const Self as usize;
-        (self_addr as i64 + self.insn_offset as i64) as usize
+        (self_addr as i64 + self.insn_offset) as usize
     }
 
     /// 获取修复代码的绝对地址
     pub fn fixup_addr(&self) -> usize {
         let self_addr = self as *const Self as usize;
-        (self_addr as i64 + self.fixup_offset as i64) as usize
+        (self_addr as i64 + self.fixup_offset) as usize
     }
 }
 

@@ -67,37 +67,26 @@ impl InnerPageCache {
             return Ok(());
         }
 
-        let mut buf_offset = 0;
-        let page_count = ((buf.len() - 1) >> MMArch::PAGE_SHIFT) + 1;
+        let page_num = ((buf.len() - 1) >> MMArch::PAGE_SHIFT) + 1;
 
-        let pages = {
-            let mut page_manager_guard = page_manager_lock_irqsave();
-            let mut allocated_pages = Vec::with_capacity(page_count);
-            for i in 0..page_count {
-                match page_manager_guard.create_one_page(
-                    PageType::File(FileMapInfo {
-                        page_cache: self
-                            .page_cache_ref
-                            .upgrade()
-                            .expect("failed to get self_arc of pagecache"),
-                        index: start_page_index + i,
-                    }),
-                    PageFlags::PG_LRU,
-                    &mut LockedFrameAllocator,
-                ) {
-                    Ok(page) => allocated_pages.push(page),
-                    Err(e) => {
-                        for page in allocated_pages {
-                            page_manager_guard.remove_page(&page.phys_address());
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-            allocated_pages
-        };
+        let mut page_manager_guard = page_manager_lock_irqsave();
 
-        for (i, page) in pages.iter().enumerate() {
+        for i in 0..page_num {
+            let buf_offset = i * MMArch::PAGE_SIZE;
+            let page_index = start_page_index + i;
+
+            let page = page_manager_guard.create_one_page(
+                PageType::File(FileMapInfo {
+                    page_cache: self
+                        .page_cache_ref
+                        .upgrade()
+                        .expect("failed to get self_arc of pagecache"),
+                    index: page_index,
+                }),
+                PageFlags::PG_LRU,
+                &mut LockedFrameAllocator,
+            )?;
+
             let page_len = core::cmp::min(MMArch::PAGE_SIZE, buf.len() - buf_offset);
 
             let mut page_guard = page.write_irqsave();
@@ -105,12 +94,8 @@ impl InnerPageCache {
                 let dst = page_guard.as_slice_mut();
                 dst[..page_len].copy_from_slice(&buf[buf_offset..buf_offset + page_len]);
             }
-            page_guard.add_flags(PageFlags::PG_UPTODATE);
-            drop(page_guard);
 
-            self.add_page(start_page_index + i, page);
-
-            buf_offset += page_len;
+            self.add_page(start_page_index + i, &page);
         }
 
         Ok(())

@@ -41,8 +41,9 @@ impl<T: Socket + 'static> IndexNode for T {
         _offset: usize,
         _len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        drop(data);
         self.write(buf)
     }
 

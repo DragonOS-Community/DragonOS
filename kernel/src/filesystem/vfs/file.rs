@@ -410,7 +410,7 @@ impl File {
         let mode = *self.mode.read();
 
         // 检查是否是O_PATH文件描述符
-        if mode == FileMode::O_WRONLY ||mode.contains(FileMode::O_PATH) {
+        if mode == FileMode::O_WRONLY || mode.contains(FileMode::O_PATH) {
             return Err(SystemError::EBADF);
         }
 

@@ -3,7 +3,7 @@
 解析 serial_opt.txt 日志文件并上报测试结果到后端API
 
 用法:
-    python parse_and_upload.py <log_file> <api_url> --branch <branch_name> --commit <commit_id> [--test-type <test_type>] [--dry-run]
+    python parse_and_upload.py <log_file> <api_url> --branch <branch_name> --commit <commit_id> [--test-type <test_type>] [--dry-run] [--verbose]
 
 环境变量:
     API_KEY: 后端API的认证密钥（非dry-run模式需要）
@@ -13,8 +13,11 @@
     export API_KEY=your_api_key_here
     python parse_and_upload.py serial_opt.txt http://localhost:8080/api/v1 --branch main --commit abc123def456
     
-    # Dry-run模式（调试用，不需要API_KEY）
+    # Dry-run模式（默认只显示统计信息，不需要API_KEY）
     python parse_and_upload.py serial_opt.txt http://localhost:8080/api/v1 --branch main --commit abc123def456 --dry-run
+    
+    # Dry-run模式（显示完整详细信息，包括测试用例详情和JSON数据）
+    python parse_and_upload.py serial_opt.txt http://localhost:8080/api/v1 --branch main --commit abc123def456 --dry-run --verbose
 """
 
 import os
@@ -572,6 +575,14 @@ def main():
         help='干运行模式：只解析并显示结果，不上传到服务器'
     )
     
+    parser.add_argument(
+        '--verbose',
+        '--full-output',
+        dest='verbose',
+        action='store_true',
+        help='详细输出模式：在dry-run模式下显示完整的测试用例详情和JSON数据（默认只显示统计信息）'
+    )
+    
     args = parser.parse_args()
     
     # 在dry-run模式下，不需要API Key
@@ -600,17 +611,11 @@ def main():
             print("警告: 未找到任何测试用例", file=sys.stderr)
             sys.exit(1)
         
-        print(f"✓ 找到 {len(test_cases)} 个测试用例")
-        
-        # 显示解析结果摘要
+        # 统计测试用例状态
         status_count = {}
         for tc in test_cases:
             status = tc.get('status', 'unknown')
             status_count[status] = status_count.get(status, 0) + 1
-        
-        print("\n测试用例状态统计:")
-        for status, count in sorted(status_count.items()):
-            print(f"  {status}: {count}")
         
         # 根据测试用例状态确定整体状态
         overall_status = "passed"
@@ -618,8 +623,6 @@ def main():
             if tc.get('status') == 'failed':
                 overall_status = "failed"
                 break
-        
-        print(f"\n整体状态: {overall_status}")
         
         # 构建将要上传的payload
         payload = {
@@ -630,31 +633,52 @@ def main():
             "test_cases": test_cases
         }
         
-        # 在dry-run模式下，显示详细信息
+        # 在dry-run模式下，显示信息
         if args.dry_run:
-            # 显示测试用例详情
-            print_test_cases_details(test_cases)
-            
-            # 显示将要上传的JSON
-            print("\n" + "="*80)
-            print("将要上传的JSON数据:")
-            print("="*80)
-            print(json.dumps(payload, indent=2, ensure_ascii=False))
-            
-            # 显示API信息
-            if not args.api_url.endswith('/test-runs'):
-                if args.api_url.endswith('/'):
-                    url = f"{args.api_url}test-runs"
+            # 非verbose模式：只显示简洁的统计信息
+            if not args.verbose:
+                passed_count = status_count.get('passed', 0)
+                failed_count = status_count.get('failed', 0)
+                skipped_count = status_count.get('skipped', 0)
+                print(f"测试通过 {passed_count} 个，失败 {failed_count} 个", end="")
+                if skipped_count > 0:
+                    print(f"，跳过 {skipped_count} 个")
                 else:
-                    url = f"{args.api_url}/test-runs"
+                    print()
             else:
-                url = args.api_url
+                # verbose模式：显示详细信息
+                print(f"✓ 找到 {len(test_cases)} 个测试用例")
+                
+                print("\n测试用例状态统计:")
+                for status, count in sorted(status_count.items()):
+                    print(f"  {status}: {count}")
+                
+                print(f"\n整体状态: {overall_status}")
+                
+                # 显示测试用例详情
+                print_test_cases_details(test_cases)
+                
+                # 显示将要上传的JSON
+                print("\n" + "="*80)
+                print("将要上传的JSON数据:")
+                print("="*80)
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+                
+                # 显示API信息
+                if not args.api_url.endswith('/test-runs'):
+                    if args.api_url.endswith('/'):
+                        url = f"{args.api_url}test-runs"
+                    else:
+                        url = f"{args.api_url}/test-runs"
+                else:
+                    url = args.api_url
+                
+                print("\n" + "="*80)
+                print(f"目标API地址: {url}")
+                print(f"请求方法: POST")
+                print(f"Content-Type: application/json")
+                print("="*80)
             
-            print("\n" + "="*80)
-            print(f"目标API地址: {url}")
-            print(f"请求方法: POST")
-            print(f"Content-Type: application/json")
-            print("="*80)
             print("\n✓ Dry-run 完成，未实际上传数据")
             return
         

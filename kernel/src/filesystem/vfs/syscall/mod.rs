@@ -31,6 +31,7 @@ mod sys_mkdirat;
 pub mod sys_mknodat;
 mod sys_openat;
 mod sys_pread64;
+mod sys_preadv;
 mod sys_pselect6;
 mod sys_pwrite64;
 mod sys_pwritev;
@@ -48,7 +49,6 @@ mod sys_utimensat;
 mod sys_write;
 mod sys_writev;
 mod utimensat;
-mod sys_preadv;
 
 mod epoll_utils;
 mod sys_epoll_create1;

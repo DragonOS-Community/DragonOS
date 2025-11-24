@@ -48,6 +48,7 @@ mod sys_utimensat;
 mod sys_write;
 mod sys_writev;
 mod utimensat;
+mod sys_preadv;
 
 mod epoll_utils;
 mod sys_epoll_create1;

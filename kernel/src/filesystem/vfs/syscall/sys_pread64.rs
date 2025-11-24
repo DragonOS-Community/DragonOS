@@ -36,12 +36,7 @@ impl Syscall for SysPread64Handle {
         let len = Self::len(args);
         let offset = Self::offset(args);
 
-        // 检查offset是否为负数
-        if (offset as isize) < 0 {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 检查offset + len是否溢出
+        // 检查offset + len是否溢出 同时检查offset是否为负数
 
         let end_pos = offset.checked_add(len).ok_or(SystemError::EINVAL)?;
         if offset > i64::MAX as usize || end_pos > i64::MAX as usize {

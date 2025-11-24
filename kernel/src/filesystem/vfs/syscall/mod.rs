@@ -175,6 +175,19 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// Flags used in the `renameat2` system call.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v6.16.3/source/include/uapi/linux/fcntl.h#L140-L143>.
+    ///
+    /// Reference: <https://man7.org/linux/man-pages/man2/renameat.2.html>.
+    pub struct RenameFlags: u32 {
+        const NOREPLACE = 1 << 0;
+        const EXCHANGE  = 1 << 1;
+        const WHITEOUT  = 1 << 2;
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 /// # 文件信息结构体X

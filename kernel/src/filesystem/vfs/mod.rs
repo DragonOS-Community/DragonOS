@@ -20,7 +20,10 @@ use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
-    filesystem::{epoll::EPollItem, vfs::permission::PermissionMask},
+    filesystem::{
+        epoll::EPollItem,
+        vfs::{permission::PermissionMask, syscall::RenameFlags},
+    },
     ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
@@ -407,6 +410,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
+        _flag: RenameFlags,
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);

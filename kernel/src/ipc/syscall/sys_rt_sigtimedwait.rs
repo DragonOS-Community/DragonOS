@@ -58,18 +58,11 @@ pub fn do_kernel_rt_sigtimedwait(
         let reader = UserBufferReader::new(uthese, size_of::<SigSet>(), from_user)?;
         let sigset = reader.read_one_from_user::<SigSet>(0)?;
         // 移除不可屏蔽的信号（SIGKILL 和 SIGSTOP）
-        let sigset_val: SigSet = SigSet::from_bits(sigset.bits()).ok_or(SystemError::EINVAL)?;
-        let kill_stop_mask: SigSet =
-            SigSet::from_bits_truncate((Signal::SIGKILL as u64) | (Signal::SIGSTOP as u64));
-        let result = sigset_val & !kill_stop_mask;
-
-        result
+        let mut sigset_val = SigSet::from_bits(sigset.bits()).ok_or(SystemError::EINVAL)?;
+        sigset_val.remove(SigSet::from(Signal::SIGKILL));
+        sigset_val.remove(SigSet::from(Signal::SIGSTOP));
+        sigset_val
     };
-
-    // 如果信号集合为空，直接返回 EINVAL（根据 POSIX 标准）
-    if these.is_empty() {
-        return Err(SystemError::EINVAL);
-    }
 
     // 构造等待/屏蔽语义：与Linux一致
     // - 等待集合 these
@@ -134,13 +127,21 @@ pub fn do_kernel_rt_sigtimedwait(
             }
         }
 
-        // 第四步：释放中断，然后真正进入调度睡眠（窗口期内，线程保持可中断阻塞，发送侧会唤醒）
+        // 第四步：检查是否有其他未屏蔽的待处理信号打断，若被其他信号唤醒了，必须返回 EINTR 让内核去处理那个信号
+        pcb.recalc_sigpending(None);
+        if pcb.has_pending_signal_fast() {
+            drop(preempt_guard);
+            restore_saved_sigmask();
+            return Err(SystemError::EINTR);
+        }
 
+        // 第五步：释放中断，然后真正进入调度睡眠（窗口期内，线程保持可中断阻塞，发送侧会唤醒）
         // 计算剩余等待时间
         let remaining_time = if let Some(deadline) = deadline {
             let now = PosixTimeSpec::now();
             let remaining = deadline.total_nanos() - now.total_nanos();
             if remaining <= 0 {
+                drop(preempt_guard);
                 restore_saved_sigmask();
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }

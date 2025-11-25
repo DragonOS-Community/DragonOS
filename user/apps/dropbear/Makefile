@@ -35,7 +35,7 @@ $(bin): $(dropbear_dir)
 all: $(bin)
 
 install: all
-	mv $(bin) $(DADK_CURRENT_BUILD_DIR)/dropbear
+	cp $(bin) $(DADK_CURRENT_BUILD_DIR)/dropbear
 
 clean:
 	rm -rf build

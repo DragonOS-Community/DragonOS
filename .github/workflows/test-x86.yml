@@ -32,15 +32,15 @@ jobs:
           make -j$(nproc) all
       
       - name: Run syscall test
+        id: test-syscall
         shell: bash -ileo pipefail {0}
-        continue-on-error: true
         env:
           DISK_SAVE_MODE: "1"
         run: |
           make test-syscall
 
       - name: Upload test results
-        if: github.repository == 'DragonOS-Community/DragonOS'
+        if: always() && github.repository == 'DragonOS-Community/DragonOS'
         shell: bash -ileo pipefail {0}
         env:
           API_KEY: ${{ secrets.CI_DASHBOARD_UPLOAD_API_KEY }}
@@ -69,22 +69,28 @@ jobs:
             BRANCH_NAME="${{ github.head_ref }}"
           fi
           
-          # 检查API_KEY是否存在
-          if [ -z "$API_KEY" ]; then
-            echo "警告: CI_DASHBOARD_UPLOAD_API_KEY secret未设置，跳过上传"
-            exit 0
-          fi
-          
           # 检查日志文件是否存在
           if [ ! -f "serial_opt.txt" ]; then
             echo "警告: serial_opt.txt文件不存在，跳过上传"
             exit 0
           fi
           
-          # 上传测试结果
-          python3 tools/test-upload/parse_and_upload.py \
-            serial_opt.txt \
-            "$API_URL" \
-            --branch "$BRANCH_NAME" \
-            --commit "$COMMIT_ID" \
-            --test-type "gvisor"
+          # 检查API_KEY是否存在，如果不存在则使用dry-run模式
+          if [ -z "$API_KEY" ]; then
+            echo "警告: CI_DASHBOARD_UPLOAD_API_KEY secret未设置，使用dry-run模式"
+            python3 tools/test-upload/parse_and_upload.py \
+              serial_opt.txt \
+              "$API_URL" \
+              --branch "$BRANCH_NAME" \
+              --commit "$COMMIT_ID" \
+              --test-type "gvisor" \
+              --dry-run
+          else
+            # 上传测试结果
+            python3 tools/test-upload/parse_and_upload.py \
+              serial_opt.txt \
+              "$API_URL" \
+              --branch "$BRANCH_NAME" \
+              --commit "$COMMIT_ID" \
+              --test-type "gvisor"
+          fi

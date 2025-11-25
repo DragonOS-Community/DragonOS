@@ -48,6 +48,7 @@
    kernel/net/index
    kernel/trace/index
    kernel/syscall/index
+   kernel/device/index
 
 
 

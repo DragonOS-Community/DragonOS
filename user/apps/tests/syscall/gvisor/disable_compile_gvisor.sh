@@ -61,7 +61,7 @@ if ! awk '
     matched = 0
   }
 
-  # 匹配块开始，并根据这个块是否为第一个块，决定是输出前一个块还是开始新块
+  # 匹配块开始。如果已在块内，则输出前一个块；然后开始新块。
   /^[[:space:]]*#?[[:space:]]*\[\[blocked_apps\]\]/ {
     if (in_block) {
       emit_block(block_has_target)

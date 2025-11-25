@@ -155,7 +155,7 @@ run-docker: check_arch
 
 test-syscall: check_arch
 	@echo "构建运行并执行syscall测试"
-	bash user/apps/tests/syscall/gvisor/enable_compile_gvisor.sh
+	bash user/apps/tests/syscall/gvisor/toggle_compile_gvisor.sh enable
 	$(MAKE) all -j $(NPROCS)
 	@if [ "$(DISK_SAVE_MODE)" = "1" ]; then \
 		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
@@ -164,8 +164,12 @@ test-syscall: check_arch
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-nographic AUTO_TEST=syscall SYSCALL_TEST_DIR=/opt/tests/gvisor &
 	sleep 5
-	bash user/apps/tests/syscall/gvisor/monitor_test_results.sh || { bash user/apps/tests/syscall/gvisor/disable_compile_gvisor.sh; exit 1; }
-	bash user/apps/tests/syscall/gvisor/disable_compile_gvisor.sh
+	@{ \
+		status=0; \
+		bash user/apps/tests/syscall/gvisor/monitor_test_results.sh || status=$$?; \
+		bash user/apps/tests/syscall/gvisor/toggle_compile_gvisor.sh disable; \
+		exit $$status; \
+	}
 
 fmt: check_arch
 	@echo "格式化代码" 

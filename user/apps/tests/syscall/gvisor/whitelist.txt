@@ -25,6 +25,7 @@ chdir_test
 fchdir_test
 rename_test
 getdents_test
+preadv_test
 
 # 进程相关测试
 fork_test

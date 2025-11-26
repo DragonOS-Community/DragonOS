@@ -29,7 +29,12 @@ use crate::{
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
     process::{
-        namespace::mnt::{MntNamespace, MountPropagation},
+        namespace::{
+            mnt::MntNamespace,
+            propagation::{
+                propagate_mount, propagate_umount, register_peer, unregister_peer, MountPropagation,
+            },
+        },
         ProcessManager,
     },
 };
@@ -301,13 +306,16 @@ impl MountFS {
     }
 
     pub fn deepcopy(&self, self_mountpoint: Option<Arc<MountFSInode>>) -> Arc<Self> {
+        // Clone propagation state for the new mount copy
+        let new_propagation = self.propagation.clone_for_copy();
+
         let mountfs = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem: self.inner_filesystem.clone(),
             mountpoints: SpinLock::new(BTreeMap::new()),
             self_mountpoint: RwLock::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: Lazy::new(),
-            propagation: self.propagation.clone(),
+            propagation: new_propagation,
             mount_id: MountId::alloc(),
             mount_flags: self.mount_flags,
         });
@@ -337,6 +345,11 @@ impl MountFS {
 
     pub fn propagation(&self) -> Arc<MountPropagation> {
         self.propagation.clone()
+    }
+
+    /// Get the mount ID
+    pub fn mount_id(&self) -> MountId {
+        self.mount_id
     }
 
     pub fn set_namespace(&self, namespace: Weak<MntNamespace>) {
@@ -393,6 +406,13 @@ impl MountFS {
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
+        // Unregister from peer group before unmounting
+        let propagation = self.propagation();
+        if propagation.is_shared() {
+            let group_id = propagation.peer_group_id();
+            unregister_peer(group_id, &self.self_ref());
+        }
+
         let r = self
             .self_mountpoint()
             .ok_or(SystemError::EINVAL)?
@@ -513,11 +533,39 @@ impl MountFSInode {
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
+
+        let mountpoint_id = self.inner_inode.metadata()?.inode_id;
+
+        // Get the child mount that will be unmounted
+        let child_mount = self
+            .mount_fs
+            .mountpoints
+            .lock()
+            .get(&mountpoint_id)
+            .cloned();
+
+        if let Some(ref child) = child_mount {
+            // Unregister from peer group if shared
+            let child_prop = child.propagation();
+            if child_prop.is_shared() {
+                unregister_peer(child_prop.peer_group_id(), child);
+            }
+        }
+
+        // Propagate umount to peers and slaves of the parent mount
+        let parent_prop = self.mount_fs.propagation();
+        if parent_prop.is_shared() {
+            if let Err(e) = propagate_umount(&self.mount_fs, mountpoint_id) {
+                log::warn!("do_umount: propagation failed: {:?}", e);
+            }
+        }
+
+        // Remove the mount
         return self
             .mount_fs
             .mountpoints
             .lock()
-            .remove(&self.inner_inode.metadata()?.inode_id)
+            .remove(&mountpoint_id)
             .ok_or(SystemError::ENOENT);
     }
 
@@ -800,13 +848,24 @@ impl IndexNode for MountFSInode {
             .map(|it| it.inner_filesystem())
             .unwrap_or(fs);
 
+        // Check if parent mount is shared - if so, new mount should also be shared
+        let parent_propagation = self.mount_fs.propagation();
+        let new_propagation = if parent_propagation.is_shared() {
+            // Create shared propagation with a new group
+            MountPropagation::new_shared()
+        } else {
+            MountPropagation::new_private()
+        };
+
         let new_mount_fs = MountFS::new(
             to_mount_fs,
             Some(self.self_ref.upgrade().unwrap()),
-            MountPropagation::new_private(), // 暂时不支持传播，后续会补充完善挂载传播性
+            new_propagation,
             Some(&ProcessManager::current_mntns()),
             mount_flags,
         );
+
+        // Perform all potentially-failing operations first before registering in peer group
         self.mount_fs
             .add_mount(metadata.inode_id, new_mount_fs.clone())?;
 
@@ -817,6 +876,21 @@ impl IndexNode for MountFSInode {
             mount_path,
             new_mount_fs.clone(),
         )?;
+
+        // Now that all operations succeeded, register in peer group if shared
+        // This ensures we don't leave dangling registrations if earlier operations fail
+        if new_mount_fs.propagation().is_shared() {
+            let group_id = new_mount_fs.propagation().peer_group_id();
+            register_peer(group_id, &new_mount_fs);
+        }
+
+        // Propagate this mount to all peers and slaves of the parent mount
+        if parent_propagation.is_shared() {
+            if let Err(e) = propagate_mount(&self.mount_fs, metadata.inode_id, &new_mount_fs) {
+                log::warn!("mount: propagation failed: {:?}", e);
+                // Don't fail the mount, just log warning
+            }
+        }
 
         return Ok(new_mount_fs);
     }

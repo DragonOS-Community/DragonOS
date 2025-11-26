@@ -8,6 +8,7 @@ VFS是DragonOS文件系统的核心，它提供了一套统一的文件系统接
 
 - 提供统一的文件系统接口
 - 提供文件系统的挂载和卸载机制（MountFS）
+- 提供挂载传播性机制（Shared/Private/Slave/Unbindable）
 - 提供文件抽象（File）
 - 提供文件系统的抽象（FileSystem）
 - 提供IndexNode抽象
@@ -20,6 +21,7 @@ VFS是DragonOS文件系统的核心，它提供了一套统一的文件系统接
    :caption: 目录
 
    design
+   mount_propagation
    api
    mountable_fs
 

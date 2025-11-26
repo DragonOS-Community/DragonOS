@@ -12,7 +12,7 @@ use crate::init::boot::boot_callbacks;
 use crate::init::initcall::INITCALL_ROOTFS;
 use crate::libs::decompress::xz_decompress;
 use crate::libs::spinlock::SpinLock;
-use crate::process::namespace::mnt::MountPropagation;
+use crate::process::namespace::propagation::MountPropagation;
 use cpio_reader::Mode;
 use system_error::SystemError;
 use unified_init::macros::unified_init;

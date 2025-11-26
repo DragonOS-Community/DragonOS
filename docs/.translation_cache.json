@@ -69,7 +69,7 @@
     "hash": "1b0b3fe0cc2918cc2c53a5af392a96ff"
   },
   "en:kernel/filesystem/vfs/index.rst": {
-    "hash": "ab891fde3149c7b4f28cf2197584e1eb"
+    "hash": "2473c51e754a34545c65fb0162aa57b3"
   },
   "en:kernel/debug/profiling-kernel-with-dadk.md": {
     "hash": "966d07272ad19e1afbdc64bb6cfcea73"
@@ -313,5 +313,8 @@
   },
   "en:kernel/net/ssh.md": {
     "hash": "7ebf2f5934c0ef1ff4f922e48d5d1748"
+  },
+  "en:kernel/filesystem/vfs/mount_propagation.md": {
+    "hash": "11140afc1e5daa1667d40cae29a80b9a"
   }
 }

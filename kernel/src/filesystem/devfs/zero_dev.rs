@@ -1,6 +1,6 @@
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::devfs::LockedDevFSInode;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
@@ -83,7 +83,7 @@ impl IndexNode for LockedZeroInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }

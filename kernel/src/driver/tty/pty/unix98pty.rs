@@ -12,7 +12,7 @@ use crate::{
         devpts::DevPtsFs,
         epoll::{event_poll::EventPoll, EPollEventType},
         vfs::{
-            file::FileMode, syscall::ModeType, FilePrivateData, FileType, MountFS,
+            file::FileFlags, syscall::ModeType, FilePrivateData, FileType, MountFS,
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
@@ -263,7 +263,7 @@ impl TtyOperation for Unix98PtyDriverInner {
 
 pub fn ptmx_open(
     mut data: SpinLockGuard<FilePrivateData>,
-    mode: &FileMode,
+    mode: &FileFlags,
 ) -> Result<(), SystemError> {
     if let FilePrivateData::Tty(data) = &*data {
         let tty = data.tty();

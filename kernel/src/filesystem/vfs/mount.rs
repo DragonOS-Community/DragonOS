@@ -35,7 +35,7 @@ use crate::{
 };
 
 use super::{
-    file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType,
+    file::FileFlags, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType,
     IndexNode, InodeId, Magic, PollableInode, SuperBlock,
 };
 
@@ -582,7 +582,7 @@ impl IndexNode for MountFSInode {
     fn open(
         &self,
         data: SpinLockGuard<FilePrivateData>,
-        mode: &FileMode,
+        mode: &FileFlags,
     ) -> Result<(), SystemError> {
         return self.inner_inode.open(data, mode);
     }
@@ -1203,7 +1203,7 @@ pub fn do_mount_mkdir(
     let inode = do_mkdir_at(
         AtFlags::AT_FDCWD.bits(),
         mount_point,
-        FileMode::from_bits_truncate(0o755),
+        FileFlags::from_bits_truncate(0o755),
     )?;
     let result = ProcessManager::current_mntns().get_mount_point(mount_point);
     if let Some((_, rest, _fs)) = result {

@@ -24,7 +24,7 @@ use crate::{
 use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
-    file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
+    file::FileFlags, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
     FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
@@ -169,7 +169,7 @@ impl IndexNode for KernFSInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         if let Some(callback) = self.callback {
             let callback_data =

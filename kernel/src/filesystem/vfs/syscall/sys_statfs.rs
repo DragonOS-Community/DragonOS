@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STATFS;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::syscall::open_utils;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::syscall::PosixStatfs;
@@ -27,7 +27,7 @@ impl Syscall for SysStatfsHandle {
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
         let fd = open_utils::do_open(
             path,
-            FileMode::O_RDONLY.bits(),
+            FileFlags::O_RDONLY.bits(),
             ModeType::empty().bits(),
             true,
         )?;

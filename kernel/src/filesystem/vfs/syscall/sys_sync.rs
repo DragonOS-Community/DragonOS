@@ -7,7 +7,7 @@ use crate::{
         interrupt::TrapFrame,
         syscall::nr::{SYS_SYNC, SYS_SYNCFS},
     },
-    filesystem::vfs::file::FileMode,
+    filesystem::vfs::file::FileFlags,
     mm::page::page_reclaimer_lock_irqsave,
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
@@ -74,7 +74,7 @@ impl Syscall for SysSyncFsHandle {
         drop(fd_table_guard);
 
         // Check if the file descriptor was opened with O_PATH
-        if file.mode().contains(FileMode::O_PATH) {
+        if file.mode().contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 

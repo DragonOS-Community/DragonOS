@@ -36,7 +36,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id};
+use self::{file::FileFlags, syscall::ModeType, utils::DName, vcore::generate_inode_id};
 pub use self::{file::FilePrivateData, mount::MountFS};
 
 use super::page_cache::PageCache;
@@ -204,7 +204,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);

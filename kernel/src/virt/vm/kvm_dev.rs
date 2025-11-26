@@ -13,7 +13,7 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{
-            file::{File, FileMode},
+            file::{File, FileFlags},
             syscall::ModeType,
             vcore::generate_inode_id,
             FileType, IndexNode, Metadata,
@@ -88,7 +88,7 @@ impl LockedKvmInode {
 
         let current = ProcessManager::current_pcb();
 
-        let file = File::new(instance, FileMode::O_RDWR)?;
+        let file = File::new(instance, FileFlags::O_RDWR)?;
         let fd = current.fd_table().write().alloc_fd(file, None)?;
         return Ok(fd as usize);
     }
@@ -108,7 +108,7 @@ impl IndexNode for LockedKvmInode {
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -233,7 +233,7 @@ impl IndexNode for KvmInstance {
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &crate::filesystem::vfs::file::FileMode,
+        _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -364,7 +364,7 @@ impl IndexNode for KvmVcpuDev {
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

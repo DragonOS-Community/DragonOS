@@ -155,7 +155,7 @@ impl IndexNode for LockedDevPtsFSInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &super::vfs::file::FileMode,
+        _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

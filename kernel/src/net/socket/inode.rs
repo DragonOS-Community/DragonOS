@@ -13,7 +13,7 @@ impl<T: Socket + 'static> IndexNode for T {
     fn open(
         &self,
         _: SpinLockGuard<FilePrivateData>,
-        _: &crate::filesystem::vfs::file::FileMode,
+        _: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

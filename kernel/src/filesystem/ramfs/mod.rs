@@ -198,7 +198,7 @@ impl IndexNode for LockedRamFSInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &super::vfs::file::FileMode,
+        _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }

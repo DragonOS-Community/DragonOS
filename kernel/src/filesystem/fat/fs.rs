@@ -24,7 +24,7 @@ use crate::mm::VmFaultReason;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
-        file::{FileMode, FilePrivateData},
+        file::{FileFlags, FilePrivateData},
         syscall::ModeType,
         vcore::generate_inode_id,
         FileSystem, FileType, IndexNode, InodeId, Metadata,
@@ -1848,7 +1848,7 @@ impl IndexNode for LockedFATInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }

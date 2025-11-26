@@ -21,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    file::FileMode,
+    file::FileFlags,
     stat::LookUpFlags,
     utils::{rsplit_path, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -182,9 +182,9 @@ pub fn change_root_fs() -> Result<(), SystemError> {
 define_event_trace!(
     do_mkdir_at,
     TP_system(vfs),
-    TP_PROTO(path:&str, mode: FileMode),
+    TP_PROTO(path:&str, mode: FileFlags),
     TP_STRUCT__entry {
-        fmode: FileMode,
+        fmode: FileFlags,
         path: [u8;64],
     },
     TP_fast_assign {
@@ -209,7 +209,7 @@ define_event_trace!(
 pub fn do_mkdir_at(
     dirfd: i32,
     path: &str,
-    mode: FileMode,
+    mode: FileFlags,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     trace_do_mkdir_at(path, mode);
     let (mut current_inode, path) =

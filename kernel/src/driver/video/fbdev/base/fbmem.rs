@@ -29,7 +29,7 @@ use crate::{
         kernfs::KernFSInode,
         sysfs::AttributeGroup,
         vfs::{
-            file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
+            file::FileFlags, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
             Metadata,
         },
     },
@@ -406,7 +406,7 @@ impl IndexNode for FbDevice {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

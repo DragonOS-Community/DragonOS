@@ -5,7 +5,7 @@ pub mod zero_dev;
 use super::{
     devpts::{DevPtsFs, LockedDevPtsFSInode},
     vfs::{
-        file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
+        file::FileFlags, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
         FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
     },
 };
@@ -450,7 +450,7 @@ impl IndexNode for LockedDevFSInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }

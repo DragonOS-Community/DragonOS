@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READ;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -101,7 +101,7 @@ pub(super) fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
     // drop guard 以避免无法调度的问题
     drop(fd_table_guard);
 
-    if file.mode().contains(FileMode::O_PATH) {
+    if file.mode().contains(FileFlags::O_PATH) {
         return Err(SystemError::EBADF);
     }
 

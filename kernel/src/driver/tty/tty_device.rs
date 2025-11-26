@@ -31,7 +31,7 @@ use crate::{
         epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
-            file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileType, IndexNode,
+            file::FileFlags, syscall::ModeType, utils::DName, FilePrivateData, FileType, IndexNode,
             Metadata, PollableInode,
         },
     },
@@ -174,7 +174,7 @@ impl TtyDevice {
         let current_tty = TtyJobCtrlManager::get_current_tty()?;
 
         if let FilePrivateData::Tty(tty_priv) = data {
-            tty_priv.mode.insert(FileMode::O_NONBLOCK);
+            tty_priv.mode.insert(FileFlags::O_NONBLOCK);
         }
 
         current_tty.reopen().ok()?;
@@ -222,7 +222,7 @@ impl IndexNode for TtyDevice {
     fn open(
         &self,
         mut data: SpinLockGuard<FilePrivateData>,
-        mode: &crate::filesystem::vfs::file::FileMode,
+        mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
             return ptmx_open(data, mode);
@@ -261,7 +261,7 @@ impl IndexNode for TtyDevice {
 
         let driver = tty.core().driver();
         // 考虑noctty（当前tty）
-        if !(mode.contains(FileMode::O_NOCTTY) && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
+        if !(mode.contains(FileFlags::O_NOCTTY) && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
             || dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 1)
             || (driver.tty_driver_type() == TtyDriverType::Pty
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
@@ -679,7 +679,7 @@ impl CharDevice for TtyDevice {
 #[derive(Debug, Clone)]
 pub struct TtyFilePrivateData {
     pub tty: Arc<TtyCore>,
-    pub mode: FileMode,
+    pub mode: FileFlags,
 }
 
 impl TtyFilePrivateData {

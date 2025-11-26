@@ -8,7 +8,7 @@ use super::Result;
 use crate::bpf::map::array_map::{ArrayMap, PerCpuArrayMap, PerfEventArrayMap};
 use crate::bpf::map::hash_map::PerCpuHashMap;
 use crate::bpf::map::util::{BpfMapGetNextKeyArg, BpfMapMeta, BpfMapUpdateArg};
-use crate::filesystem::vfs::file::{File, FileMode};
+use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
 use crate::include::bindings::linux_bpf::{bpf_attr, bpf_map_type};
@@ -132,7 +132,7 @@ impl BpfMap {
 }
 
 impl IndexNode for BpfMap {
-    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _mode: &FileMode) -> Result<()> {
+    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _mode: &FileFlags) -> Result<()> {
         Ok(())
     }
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<()> {
@@ -246,7 +246,7 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
     };
     let bpf_map = BpfMap::new(map, map_meta);
     let fd_table = ProcessManager::current_pcb().fd_table();
-    let file = File::new(Arc::new(bpf_map), FileMode::O_RDWR | FileMode::O_CLOEXEC)?;
+    let file = File::new(Arc::new(bpf_map), FileFlags::O_RDWR | FileFlags::O_CLOEXEC)?;
     let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
     info!("create map with fd: [{}]", fd);
     Ok(fd)

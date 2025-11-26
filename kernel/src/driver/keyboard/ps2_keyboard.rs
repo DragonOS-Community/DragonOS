@@ -22,7 +22,7 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         vfs::{
-            file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
+            file::FileFlags, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
             FileSystem, FileType, IndexNode, Metadata,
         },
     },
@@ -145,7 +145,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }

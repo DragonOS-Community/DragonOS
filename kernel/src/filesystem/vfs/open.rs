@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use super::{
     fcntl::AtFlags,
-    file::{File, FileMode},
+    file::{File, FileFlags},
     syscall::{ModeType, OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
     vcore::resolve_parent_inode,
@@ -158,7 +158,7 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
 pub fn do_sys_open(
     dfd: i32,
     path: &str,
-    o_flags: FileMode,
+    o_flags: FileFlags,
     mode: ModeType,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
@@ -183,8 +183,8 @@ fn do_sys_openat2(
         Ok(inode) => inode,
         Err(errno) => {
             // 文件不存在，且需要创建
-            if how.o_flags.contains(FileMode::O_CREAT)
-                && !how.o_flags.contains(FileMode::O_DIRECTORY)
+            if how.o_flags.contains(FileFlags::O_CREAT)
+                && !how.o_flags.contains(FileFlags::O_DIRECTORY)
                 && errno == SystemError::ENOENT
             {
                 let (filename, parent_path) = rsplit_path(&path);
@@ -207,7 +207,7 @@ fn do_sys_openat2(
 
     let file_type: FileType = inode.metadata()?.file_type;
     // 如果要打开的是文件夹，而目标不是文件夹
-    if how.o_flags.contains(FileMode::O_DIRECTORY) && file_type != FileType::Dir {
+    if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
@@ -216,13 +216,13 @@ fn do_sys_openat2(
     let file: File = File::new(inode, how.o_flags)?;
 
     // 打开模式为“追加”
-    if how.o_flags.contains(FileMode::O_APPEND) {
+    if how.o_flags.contains(FileFlags::O_APPEND) {
         file.lseek(SeekFrom::SeekEnd(0))?;
     }
 
     // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
-    if how.o_flags.contains(FileMode::O_TRUNC)
-        && (how.o_flags.contains(FileMode::O_RDWR) || how.o_flags.contains(FileMode::O_WRONLY))
+    if how.o_flags.contains(FileFlags::O_TRUNC)
+        && (how.o_flags.contains(FileFlags::O_RDWR) || how.o_flags.contains(FileFlags::O_WRONLY))
         && file_type == FileType::File
     {
         file.ftruncate(0)?;

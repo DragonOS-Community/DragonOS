@@ -49,7 +49,7 @@ impl Default for FilePrivateData {
 }
 
 impl FilePrivateData {
-    pub fn update_mode(&mut self, mode: FileMode) {
+    pub fn update_mode(&mut self, mode: FileFlags) {
         if let FilePrivateData::Pipefs(pdata) = self {
             pdata.set_mode(mode);
         }
@@ -77,7 +77,7 @@ bitflags! {
     /// 与Linux 5.19.10的uapi/asm-generic/fcntl.h相同
     /// https://code.dragonos.org.cn/xref/linux-5.19.10/tools/include/uapi/asm-generic/fcntl.h#19
     #[allow(clippy::bad_bit_mask)]
-    pub struct FileMode: u32{
+    pub struct FileFlags: u32{
         /* File access modes for `open' and `fcntl'.  */
         /// Open Read-only
         const O_RDONLY = 0o0;
@@ -124,11 +124,11 @@ bitflags! {
     }
 }
 
-impl FileMode {
+impl FileFlags {
     /// @brief 获取文件的访问模式的值
     #[inline]
     pub fn accmode(&self) -> u32 {
-        return self.bits() & FileMode::O_ACCMODE.bits();
+        return self.bits() & FileFlags::O_ACCMODE.bits();
     }
 }
 
@@ -139,7 +139,7 @@ pub struct File {
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
     offset: AtomicUsize,
     /// 文件的打开模式
-    mode: RwLock<FileMode>,
+    file_flags: RwLock<FileFlags>,
     /// 文件类型
     file_type: FileType,
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
@@ -158,7 +158,7 @@ impl File {
     ///
     /// @param inode 文件对象对应的inode
     /// @param mode 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mut mode: FileMode) -> Result<Self, SystemError> {
+    pub fn new(inode: Arc<dyn IndexNode>, mut mode: FileFlags) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
         if file_type == FileType::Pipe {
@@ -166,8 +166,8 @@ impl File {
                 inode = pipe_inode;
             }
         }
-        let close_on_exec = mode.contains(FileMode::O_CLOEXEC);
-        mode.remove(FileMode::O_CLOEXEC);
+        let close_on_exec = mode.contains(FileFlags::O_CLOEXEC);
+        mode.remove(FileFlags::O_CLOEXEC);
 
         let private_data = SpinLock::new(FilePrivateData::default());
         inode.open(private_data.lock(), &mode)?;
@@ -175,7 +175,7 @@ impl File {
         let f = File {
             inode,
             offset: AtomicUsize::new(0),
-            mode: RwLock::new(mode),
+            file_flags: RwLock::new(mode),
             file_type,
             readdir_subdirs_name: SpinLock::new(Vec::default()),
             private_data,
@@ -264,7 +264,7 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
-        let len = if self.mode().contains(FileMode::O_DIRECT) {
+        let len = if self.mode().contains(FileFlags::O_DIRECT) {
             self.inode
                 .read_direct(offset, len, buf, self.private_data.lock())
         } else {
@@ -408,7 +408,7 @@ impl File {
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
         // 暂时认为只要不是write only, 就可读
-        if *self.mode.read() == FileMode::O_WRONLY {
+        if *self.file_flags.read() == FileFlags::O_WRONLY {
             return Err(SystemError::EPERM);
         }
 
@@ -418,15 +418,15 @@ impl File {
     /// @brief 判断当前文件是否可写
     #[inline]
     pub fn writeable(&self) -> Result<(), SystemError> {
-        let mode = *self.mode.read();
+        let mode = *self.file_flags.read();
 
         // 检查是否是O_PATH文件描述符
-        if mode.contains(FileMode::O_PATH) {
+        if mode.contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 
         // 暂时认为只要不是read only, 就可写
-        if mode == FileMode::O_RDONLY {
+        if mode == FileFlags::O_RDONLY {
             return Err(SystemError::EPERM);
         }
 
@@ -440,7 +440,7 @@ impl File {
     pub fn read_dir(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
         // O_PATH 文件描述符只能用于有限的操作，getdents/getdents64
         // 在 Linux 中会返回 EBADF。提前检测并返回相同语义。
-        if self.mode().contains(FileMode::O_PATH) {
+        if self.mode().contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 
@@ -514,7 +514,7 @@ impl File {
         let res = Self {
             inode: self.inode.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
-            mode: RwLock::new(self.mode()),
+            file_flags: RwLock::new(self.mode()),
             file_type: self.file_type,
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
             private_data: SpinLock::new(self.private_data.lock().clone()),
@@ -543,8 +543,8 @@ impl File {
 
     /// @brief 获取文件的打开模式
     #[inline]
-    pub fn mode(&self) -> FileMode {
-        return *self.mode.read();
+    pub fn mode(&self) -> FileFlags {
+        return *self.file_flags.read();
     }
 
     /// 获取文件是否在execve时关闭
@@ -559,19 +559,19 @@ impl File {
         self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
     }
 
-    pub fn set_mode(&self, mut mode: FileMode) -> Result<(), SystemError> {
+    pub fn set_mode(&self, mut mode: FileFlags) -> Result<(), SystemError> {
         // todo: 是否需要调用inode的open方法，以更新private data（假如它与mode有关的话）?
         // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
 
         // 提取 O_CLOEXEC 状态并更新 close_on_exec 字段
-        let close_on_exec = mode.contains(FileMode::O_CLOEXEC);
+        let close_on_exec = mode.contains(FileFlags::O_CLOEXEC);
         self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
 
         // 从 mode 中移除 O_CLOEXEC 标志，保持与构造函数一致的行为
-        mode.remove(FileMode::O_CLOEXEC);
+        mode.remove(FileFlags::O_CLOEXEC);
 
         // 更新文件的打开模式
-        *self.mode.write() = mode;
+        *self.file_flags.write() = mode;
         self.private_data.lock().update_mode(mode);
         return Ok(());
     }

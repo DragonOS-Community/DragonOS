@@ -286,7 +286,7 @@ impl IndexNode for VirtIOBlkDevice {
     fn open(
         &self,
         _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &crate::filesystem::vfs::file::FileMode,
+        _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

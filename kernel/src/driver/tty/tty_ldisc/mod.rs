@@ -3,7 +3,7 @@ use core::fmt::Debug;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 
 use super::{
     termios::Termios,
@@ -32,14 +32,14 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
         len: usize,
         cookie: &mut bool,
         offset: usize,
-        mode: FileMode,
+        mode: FileFlags,
     ) -> Result<usize, SystemError>;
     fn write(
         &self,
         tty: Arc<TtyCore>,
         buf: &[u8],
         len: usize,
-        mode: FileMode,
+        mode: FileFlags,
     ) -> Result<usize, SystemError>;
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError>;
 

@@ -1,7 +1,7 @@
 use alloc::string::String;
 
 use crate::{
-    filesystem::vfs::{file::FileMode, FilePrivateData, IndexNode, Metadata},
+    filesystem::vfs::{file::FileFlags, FilePrivateData, IndexNode, Metadata},
     libs::spinlock::SpinLockGuard,
 };
 
@@ -72,7 +72,7 @@ impl IndexNode for EPollInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

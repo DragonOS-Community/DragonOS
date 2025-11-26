@@ -31,7 +31,7 @@ use crate::{
 };
 
 use super::vfs::{
-    file::{FileMode, FilePrivateData},
+    file::{FileFlags, FilePrivateData},
     syscall::ModeType,
     utils::DName,
     FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
@@ -798,7 +798,7 @@ impl IndexNode for LockedProcFSInode {
     fn open(
         &self,
         mut data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();

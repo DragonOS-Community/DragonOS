@@ -44,7 +44,7 @@ impl IndexNode for LockedExt4Inode {
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
-        _mode: &vfs::file::FileMode,
+        _mode: &vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

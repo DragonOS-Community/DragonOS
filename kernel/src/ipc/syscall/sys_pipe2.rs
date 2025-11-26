@@ -2,7 +2,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::{
     arch::syscall::nr::SYS_PIPE2,
     filesystem::vfs::{
-        file::{File, FileMode},
+        file::{File, FileFlags},
         FilePrivateData,
     },
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
@@ -20,9 +20,9 @@ pub struct SysPipe2Handle;
 
 // Extracted core logic for pipe2
 // pub(super) makes it visible to other modules in kernel/src/ipc/syscall/
-pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileMode) -> Result<usize, SystemError> {
+pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileFlags) -> Result<usize, SystemError> {
     if !flags
-        .difference(FileMode::O_CLOEXEC | FileMode::O_NONBLOCK | FileMode::O_DIRECT)
+        .difference(FileFlags::O_CLOEXEC | FileFlags::O_NONBLOCK | FileFlags::O_DIRECT)
         .is_empty()
     {
         return Err(SystemError::EINVAL);
@@ -34,21 +34,21 @@ pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileMode) -> Result<usize, Sy
 
     let mut read_file = File::new(
         pipe_ptr.clone(),
-        FileMode::O_RDONLY | (flags & FileMode::O_NONBLOCK),
+        FileFlags::O_RDONLY | (flags & FileFlags::O_NONBLOCK),
     )?;
     read_file.private_data = SpinLock::new(FilePrivateData::Pipefs(PipeFsPrivateData::new(
-        FileMode::O_RDONLY,
+        FileFlags::O_RDONLY,
     )));
 
     let mut write_file = File::new(
         pipe_ptr.clone(),
-        FileMode::O_WRONLY | (flags & (FileMode::O_NONBLOCK | FileMode::O_DIRECT)),
+        FileFlags::O_WRONLY | (flags & (FileFlags::O_NONBLOCK | FileFlags::O_DIRECT)),
     )?;
     write_file.private_data = SpinLock::new(FilePrivateData::Pipefs(PipeFsPrivateData::new(
-        FileMode::O_WRONLY | (flags & (FileMode::O_NONBLOCK | FileMode::O_DIRECT)),
+        FileFlags::O_WRONLY | (flags & (FileFlags::O_NONBLOCK | FileFlags::O_DIRECT)),
     )));
 
-    if flags.contains(FileMode::O_CLOEXEC) {
+    if flags.contains(FileFlags::O_CLOEXEC) {
         read_file.set_close_on_exec(true);
         write_file.set_close_on_exec(true);
     }
@@ -70,8 +70,8 @@ impl SysPipe2Handle {
         args[0] as *mut c_int
     }
     #[inline(always)]
-    fn flags(args: &[usize]) -> FileMode {
-        FileMode::from_bits_truncate(args[1] as u32)
+    fn flags(args: &[usize]) -> FileFlags {
+        FileFlags::from_bits_truncate(args[1] as u32)
     }
 }
 
@@ -85,7 +85,7 @@ impl Syscall for SysPipe2Handle {
         if fd_ptr.is_null() {
             return Err(SystemError::EFAULT);
         } else {
-            let flags = FileMode::from_bits_truncate(args[1] as u32);
+            let flags = FileFlags::from_bits_truncate(args[1] as u32);
             do_kernel_pipe2(fd_ptr, flags)
         }
     }

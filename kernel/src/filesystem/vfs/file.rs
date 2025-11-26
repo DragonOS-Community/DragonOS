@@ -49,9 +49,9 @@ impl Default for FilePrivateData {
 }
 
 impl FilePrivateData {
-    pub fn update_mode(&mut self, mode: FileFlags) {
+    pub fn update_mode(&mut self, file_flags: FileFlags) {
         if let FilePrivateData::Pipefs(pdata) = self {
-            pdata.set_mode(mode);
+            pdata.set_flags(file_flags);
         }
     }
 
@@ -127,7 +127,7 @@ bitflags! {
 impl FileFlags {
     /// @brief 获取文件的访问模式的值
     #[inline]
-    pub fn accmode(&self) -> u32 {
+    pub fn accflags(&self) -> u32 {
         return self.bits() & FileFlags::O_ACCMODE.bits();
     }
 }
@@ -264,7 +264,7 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
-        let len = if self.mode().contains(FileFlags::O_DIRECT) {
+        let len = if self.flags().contains(FileFlags::O_DIRECT) {
             self.inode
                 .read_direct(offset, len, buf, self.private_data.lock())
         } else {
@@ -408,7 +408,7 @@ impl File {
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
         // 暂时认为只要不是write only, 就可读
-        if *self.file_flags.read() == FileFlags::O_WRONLY {
+        if self.file_flags.read().accflags() == FileFlags::O_WRONLY.bits() {
             return Err(SystemError::EPERM);
         }
 
@@ -426,7 +426,7 @@ impl File {
         }
 
         // 暂时认为只要不是read only, 就可写
-        if mode == FileFlags::O_RDONLY {
+        if mode.accflags() == FileFlags::O_RDONLY.bits() {
             return Err(SystemError::EPERM);
         }
 
@@ -440,7 +440,7 @@ impl File {
     pub fn read_dir(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
         // O_PATH 文件描述符只能用于有限的操作，getdents/getdents64
         // 在 Linux 中会返回 EBADF。提前检测并返回相同语义。
-        if self.mode().contains(FileFlags::O_PATH) {
+        if self.flags().contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 
@@ -514,7 +514,7 @@ impl File {
         let res = Self {
             inode: self.inode.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
-            file_flags: RwLock::new(self.mode()),
+            file_flags: RwLock::new(self.flags()),
             file_type: self.file_type,
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
             private_data: SpinLock::new(self.private_data.lock().clone()),
@@ -526,7 +526,7 @@ impl File {
         // TODO: reopen is not a good idea for some inodes, need a better design
         if self
             .inode
-            .open(res.private_data.lock(), &res.mode())
+            .open(res.private_data.lock(), &res.flags())
             .is_err()
         {
             return None;
@@ -543,7 +543,7 @@ impl File {
 
     /// @brief 获取文件的打开模式
     #[inline]
-    pub fn mode(&self) -> FileFlags {
+    pub fn flags(&self) -> FileFlags {
         return *self.file_flags.read();
     }
 

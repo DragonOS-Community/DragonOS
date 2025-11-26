@@ -74,7 +74,7 @@ impl Syscall for SysSyncFsHandle {
         drop(fd_table_guard);
 
         // Check if the file descriptor was opened with O_PATH
-        if file.mode().contains(FileFlags::O_PATH) {
+        if file.flags().contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 

@@ -101,7 +101,7 @@ pub(super) fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
     // drop guard 以避免无法调度的问题
     drop(fd_table_guard);
 
-    if file.mode().contains(FileFlags::O_PATH) {
+    if file.flags().contains(FileFlags::O_PATH) {
         return Err(SystemError::EBADF);
     }
 

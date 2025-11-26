@@ -138,7 +138,7 @@ impl SysFcntlHandle {
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    return Ok(file.mode().bits() as usize);
+                    return Ok(file.flags().bits() as usize);
                 }
 
                 return Err(SystemError::EBADF);

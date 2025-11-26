@@ -24,6 +24,9 @@ sync_test
 chdir_test
 fchdir_test
 pread64_test
+rename_test
+getdents_test
+preadv_test
 
 # 进程相关测试
 fork_test
@@ -56,6 +59,7 @@ sigaction_test
 sigprocmask_test
 sigaltstack_test
 sigreturn_test
+sigtimedwait_test
 
 # 其他测试
 itimer_test

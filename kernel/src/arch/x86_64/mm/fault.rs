@@ -199,12 +199,12 @@ impl X86_64MMArch {
 
         // 在异常表中查找修复代码
         if let Some(fixup_addr) = ExceptionTableManager::search_exception_table(regs.rip as usize) {
-            log::debug!(
-                "Page fault at {:#x} accessing user address {:#x}, fixed up to {:#x}",
-                regs.rip,
-                address.data(),
-                fixup_addr
-            );
+            // log::debug!(
+            //     "Page fault at {:#x} accessing user address {:#x}, fixed up to {:#x}",
+            //     regs.rip,
+            //     address.data(),
+            //     fixup_addr
+            // );
 
             // 修改trap frame的RIP到修复代码
             regs.rip = fixup_addr as u64;
@@ -385,16 +385,16 @@ impl X86_64MMArch {
             }
 
             if unlikely(Self::vma_access_error(vma.clone(), error_code)) {
+                // VMA权限错误，检查是否需要异常表修复
+                if handle_kernel_access_failed(regs) {
+                    return; // 已通过异常表修复
+                }
+
                 log::error!(
                     "vma access error, error_code: {:?}, address: {:#x}",
                     error_code,
                     address.data(),
                 );
-
-                // VMA权限错误，检查是否需要异常表修复
-                if handle_kernel_access_failed(regs) {
-                    return; // 已通过异常表修复
-                }
 
                 send_segv();
             }

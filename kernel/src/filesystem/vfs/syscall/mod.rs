@@ -31,6 +31,7 @@ mod sys_mkdirat;
 pub mod sys_mknodat;
 mod sys_openat;
 mod sys_pread64;
+mod sys_preadv;
 mod sys_pselect6;
 mod sys_pwrite64;
 mod sys_pwritev;
@@ -172,6 +173,19 @@ bitflags! {
         const S_IXUGO = Self::S_IXUSR.bits | Self::S_IXGRP.bits | Self::S_IXOTH.bits;
 
 
+    }
+}
+
+bitflags! {
+    /// Flags used in the `renameat2` system call.
+    ///
+    /// Reference: <https://elixir.bootlin.com/linux/v6.16.3/source/include/uapi/linux/fcntl.h#L140-L143>.
+    ///
+    /// Reference: <https://man7.org/linux/man-pages/man2/renameat.2.html>.
+    pub struct RenameFlags: u32 {
+        const NOREPLACE = 1 << 0;
+        const EXCHANGE  = 1 << 1;
+        const WHITEOUT  = 1 << 2;
     }
 }
 

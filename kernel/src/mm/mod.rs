@@ -33,6 +33,7 @@ pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
 pub mod percpu;
+pub mod readahead;
 pub mod syscall;
 pub mod sysfs;
 pub mod truncate;
@@ -554,13 +555,13 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// @brief 读取指定虚拟地址的值，并假设它是类型T的指针
     #[inline(always)]
-    unsafe fn read<T>(address: VirtAddr) -> T {
+    unsafe fn read<T: Sized>(address: VirtAddr) -> T {
         return ptr::read(address.data() as *const T);
     }
 
     /// @brief 将value写入到指定的虚拟地址
     #[inline(always)]
-    unsafe fn write<T>(address: VirtAddr, value: T) {
+    unsafe fn write<T: Sized>(address: VirtAddr, value: T) {
         ptr::write(address.data() as *mut T, value);
     }
 

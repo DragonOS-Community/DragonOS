@@ -43,8 +43,7 @@ impl Syscall for SysPread64Handle {
             return Err(SystemError::EINVAL);
         }
 
-        let mut user_buffer_writer =
-            UserBufferWriter::new(buf_vaddr, len, frame.is_from_user())?;
+        let mut user_buffer_writer = UserBufferWriter::new(buf_vaddr, len, frame.is_from_user())?;
         let user_buf = user_buffer_writer.buffer(0)?;
 
         let binding = ProcessManager::current_pcb().fd_table();

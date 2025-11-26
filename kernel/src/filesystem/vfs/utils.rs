@@ -78,6 +78,42 @@ pub fn user_path_at(
     return Ok((inode, ret_path));
 }
 
+pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> bool {
+    let ancestor_id = match ancestor.metadata() {
+        Ok(m) => m.inode_id,
+        Err(_) => return false,
+    };
+
+    let mut next_node: Option<Arc<dyn IndexNode>> = Some(node.clone());
+    while let Some(current) = next_node {
+        let cur_id = match current.metadata() {
+            Ok(m) => m.inode_id,
+            Err(_) => break,
+        };
+
+        if cur_id == ancestor_id {
+            return true;
+        }
+
+        let parent = match current.parent() {
+            Ok(p) => p,
+            Err(_) => break, // 没有父节点，到达根或错误，停止循环
+        };
+
+        let parent_id = match parent.metadata() {
+            Ok(m) => m.inode_id,
+            Err(_) => break,
+        };
+
+        if parent_id == cur_id {
+            break;
+        }
+        next_node = Some(parent);
+    }
+
+    false
+}
+
 /// Directory Name
 /// 可以用来作为原地提取目录名及比较的
 /// Dentry的对标（x

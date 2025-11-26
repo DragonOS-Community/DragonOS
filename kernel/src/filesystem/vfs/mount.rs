@@ -19,7 +19,7 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         page_cache::PageCache,
-        vfs::{fcntl::AtFlags, vcore::do_mkdir_at},
+        vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
     },
     libs::{
         casting::DowncastArc,
@@ -729,8 +729,9 @@ impl IndexNode for MountFSInode {
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
+        flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        return self.inner_inode.move_to(old_name, target, new_name);
+        return self.inner_inode.move_to(old_name, target, new_name, flags);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

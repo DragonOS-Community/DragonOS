@@ -44,7 +44,7 @@ impl Syscall for SysPread64Handle {
         }
 
         let mut user_buffer_writer =
-            UserBufferWriter::new_checked(buf_vaddr, len, frame.is_from_user())?;
+            UserBufferWriter::new(buf_vaddr, len, frame.is_from_user())?;
         let user_buf = user_buffer_writer.buffer(0)?;
 
         let binding = ProcessManager::current_pcb().fd_table();

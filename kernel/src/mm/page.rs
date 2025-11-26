@@ -434,6 +434,7 @@ bitflags! {
         const PG_RECLAIM = 1 << 18;
         const PG_SWAPBACKED = 1 << 19;
         const PG_UNEVICTABLE = 1 << 20;
+        const PG_READAHEAD = 1 << 21;
     }
 }
 

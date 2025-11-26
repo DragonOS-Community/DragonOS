@@ -50,24 +50,15 @@ impl MMLogMonitor {
             mpsc::Receiver<MMLogWorkerResult>,
         ) = mpsc::channel::<MMLogWorkerResult>();
 
-        let r = Self {
+        Arc::new_cyclic(|me| Self {
             channel_symbol: mm_log_buffer_symbol,
             shared_data,
             threads: Mutex::new(Vec::new()),
             stop_child_threads: AtomicBool::new(false),
-            self_ref: Weak::new(),
+            self_ref: me.clone(),
             mm_log_receiver: Mutex::new(mm_log_worker_mpsc.1),
             mm_log_sender: mm_log_worker_mpsc.0,
-        };
-
-        let r = Arc::new(r);
-        unsafe {
-            let self_ref = Arc::downgrade(&r);
-            let r_ptr = r.as_ref() as *const Self as *mut Self;
-            (*r_ptr).self_ref = self_ref;
-        }
-
-        return r;
+        })
     }
 
     pub fn run(&self) {

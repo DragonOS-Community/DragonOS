@@ -423,19 +423,12 @@ struct Serial8250ISADriver {
 
 impl Serial8250ISADriver {
     pub fn new() -> Arc<Self> {
-        let r = Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             inner: RwLock::new(InnerSerial8250ISADriver::new()),
             name: "serial8250",
             kobj_state: LockedKObjectState::new(None),
-            self_ref: Weak::default(),
-        });
-
-        unsafe {
-            let p = r.as_ref() as *const Self as *mut Self;
-            (*p).self_ref = Arc::downgrade(&r);
-        }
-
-        return r;
+            self_ref: me.clone(),
+        })
     }
 }
 

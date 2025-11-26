@@ -426,7 +426,7 @@ impl KernFSInode {
         metadata.file_type = inode_type.into();
         let parent: Weak<KernFSInode> = parent.map(|x| Arc::downgrade(&x)).unwrap_or_default();
 
-        let inode = Arc::new(KernFSInode {
+        let inode = Arc::new_cyclic(|me| KernFSInode {
             name,
             inner: RwLock::new(InnerKernFSInode {
                 parent: parent.clone(),
@@ -434,7 +434,7 @@ impl KernFSInode {
                 symlink_target: None,
                 symlink_target_absolute_path: None,
             }),
-            self_ref: Weak::new(),
+            self_ref: me.clone(),
             fs: RwLock::new(Weak::new()),
             private_data: SpinLock::new(private_data),
             callback,
@@ -443,12 +443,6 @@ impl KernFSInode {
             lazy_list: SpinLock::new(HashMap::new()),
         });
 
-        {
-            let ptr = inode.as_ref() as *const KernFSInode as *mut KernFSInode;
-            unsafe {
-                (*ptr).self_ref = Arc::downgrade(&inode);
-            }
-        }
         if parent.strong_count() > 0 {
             let kernfs = parent
                 .upgrade()

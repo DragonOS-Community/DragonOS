@@ -45,22 +45,13 @@ impl core::cmp::PartialEq for KSet {
 
 impl KSet {
     pub fn new(name: String) -> Arc<Self> {
-        let r = Self {
+        Arc::new_cyclic(|me| Self {
             kobjects: RwLock::new(Vec::new()),
             inner: RwLock::new(InnerKSet::new(name)),
             kobj_state: LockedKObjectState::new(None),
             parent_data: RwLock::new(KSetParentData::new(None, None)),
-            self_ref: Weak::default(),
-        };
-
-        let r = Arc::new(r);
-
-        unsafe {
-            let p = r.as_ref() as *const Self as *mut Self;
-            (*p).self_ref = Arc::downgrade(&r);
-        }
-
-        return r;
+            self_ref: me.clone(),
+        })
     }
 
     /// 创建一个kset，并且设置它的父亲为parent_kobj。然后把这个kset注册到sysfs

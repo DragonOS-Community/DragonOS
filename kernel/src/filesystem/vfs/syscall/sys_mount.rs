@@ -51,10 +51,10 @@ impl Syscall for SysMountHandle {
         let filesystemtype = Self::filesystemtype(args);
         let data = Self::raw_data(args);
         let mount_flags = Self::mountflags(args);
-        log::debug!(
-            "sys_mount: source: {:?}, target: {:?}, filesystemtype: {:?}, mount_flags: {:?}, data: {:?}",
-            source, target, filesystemtype, mount_flags, data
-        );
+        // log::debug!(
+        //     "sys_mount: source: {:?}, target: {:?}, filesystemtype: {:?}, mount_flags: {:?}, data: {:?}",
+        //     source, target, filesystemtype, mount_flags, data
+        // );
         let mount_flags = MountFlags::from_bits_truncate(mount_flags);
 
         let target = copy_mount_string(target).inspect_err(|e| {
@@ -313,11 +313,11 @@ fn do_bind_mount(
 ) -> Result<(), SystemError> {
     let source_path = source.ok_or(SystemError::EINVAL)?;
 
-    log::debug!(
-        "do_bind_mount: source={}, recursive={}",
-        source_path,
-        flags.contains(MountFlags::REC)
-    );
+    // log::debug!(
+    //     "do_bind_mount: source={}, recursive={}",
+    //     source_path,
+    //     flags.contains(MountFlags::REC)
+    // );
 
     // Resolve the source path to get the source inode
     let (current_node, rest_path) = user_path_at(
@@ -345,7 +345,7 @@ fn do_bind_mount(
     // Check if source is unbindable - if so, reject the bind mount
     if let Some(ref mfs) = source_mfs {
         if mfs.propagation().is_unbindable() {
-            log::debug!("do_bind_mount: source is unbindable, rejecting bind mount");
+            // log::debug!("do_bind_mount: source is unbindable, rejecting bind mount");
             return Err(SystemError::EINVAL);
         }
     }
@@ -401,11 +401,11 @@ fn do_change_type(target_inode: Arc<dyn IndexNode>, flags: MountFlags) -> Result
         SystemError::EINVAL
     })?;
 
-    log::debug!(
-        "do_change_type: changing propagation to {:?}, recursive={}",
-        prop_type,
-        recursive
-    );
+    // log::debug!(
+    //     "do_change_type: changing propagation to {:?}, recursive={}",
+    //     prop_type,
+    //     recursive
+    // );
 
     // Change the propagation type
     change_mnt_propagation_recursive(&mount_fs, prop_type, recursive)?;

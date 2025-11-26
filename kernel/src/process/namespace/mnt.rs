@@ -221,10 +221,10 @@ impl MntNamespace {
             if old_propagation.is_shared() {
                 let group_id = old_propagation.peer_group_id();
                 register_peer(group_id, &new_mount_fs);
-                log::debug!(
-                    "copy_mnt_ns: registered new mount in peer group {}",
-                    group_id.data()
-                );
+                // log::debug!(
+                //     "copy_mnt_ns: registered new mount in peer group {}",
+                //     group_id.data()
+                // );
             }
 
             data.parent_mount_fs

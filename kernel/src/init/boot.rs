@@ -8,7 +8,7 @@ use alloc::string::String;
 use system_error::SystemError;
 
 use crate::driver::base::kobject::KObjectState;
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::init::initcall::INITCALL_POSTCORE;
 use crate::libs::rwlock::RwLockReadGuard;
 use crate::libs::rwlock::RwLockWriteGuard;
@@ -266,7 +266,7 @@ impl AttributeGroup for BootParamsAttrGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         Some(attr.mode())
     }
 }
@@ -367,7 +367,7 @@ impl Attribute for AttrData {
         "data"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -396,7 +396,7 @@ impl Attribute for AttrVersion {
         "version"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 

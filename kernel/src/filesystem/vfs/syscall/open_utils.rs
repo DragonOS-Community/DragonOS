@@ -6,7 +6,7 @@ use crate::{
     syscall::user_access::check_and_clone_cstr,
 };
 
-use super::ModeType;
+use super::InodeMode;
 
 /// Performs the actual file opening operation.
 ///
@@ -30,7 +30,7 @@ pub(super) fn do_open(
         .map_err(|_| SystemError::EINVAL)?;
 
     let open_flags: FileFlags = FileFlags::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-    let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
+    let mode = InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?;
     return do_sys_open(
         AtFlags::AT_FDCWD.bits(),
         &path,

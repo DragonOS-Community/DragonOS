@@ -18,7 +18,7 @@ use crate::{
             file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
             SysFSOpsSupport,
         },
-        vfs::syscall::ModeType,
+        vfs::syscall::InodeMode,
     },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -879,7 +879,7 @@ impl DeviceManager {
         attr: &'static dyn Attribute,
     ) -> Result<(), SystemError> {
         if unlikely(
-            attr.mode().contains(ModeType::S_IRUGO)
+            attr.mode().contains(InodeMode::S_IRUGO)
                 && (!attr.support().contains(SysFSOpsSupport::ATTR_SHOW)),
         ) {
             warn!(
@@ -888,7 +888,7 @@ impl DeviceManager {
             );
         }
         if unlikely(
-            attr.mode().contains(ModeType::S_IWUGO)
+            attr.mode().contains(InodeMode::S_IWUGO)
                 && (!attr.support().contains(SysFSOpsSupport::ATTR_STORE)),
         ) {
             warn!(
@@ -1019,9 +1019,9 @@ pub fn device_shutdown() {
 pub struct DeviceAttrDev;
 
 impl Attribute for DeviceAttrDev {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         // 0o444
-        return ModeType::S_IRUGO;
+        return InodeMode::S_IRUGO;
     }
 
     fn name(&self) -> &str {

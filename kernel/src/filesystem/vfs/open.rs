@@ -4,7 +4,7 @@ use system_error::SystemError;
 use super::{
     fcntl::AtFlags,
     file::{File, FileFlags},
-    syscall::{ModeType, OpenHow, OpenHowResolve},
+    syscall::{InodeMode, OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
     vcore::resolve_parent_inode,
     FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -23,10 +23,10 @@ use alloc::string::String;
 pub(super) fn do_faccessat(
     dirfd: i32,
     path: *const u8,
-    mode: ModeType,
+    mode: InodeMode,
     flags: u32,
 ) -> Result<usize, SystemError> {
-    if (mode.bits() & (!ModeType::S_IRWXO.bits())) != 0 {
+    if (mode.bits() & (!InodeMode::S_IRWXO.bits())) != 0 {
         return Err(SystemError::EINVAL);
     }
 
@@ -53,7 +53,7 @@ pub(super) fn do_faccessat(
     return Ok(0);
 }
 
-pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: ModeType) -> Result<usize, SystemError> {
+pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize, SystemError> {
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
@@ -64,9 +64,9 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: ModeType) -> Result<usize,
     let mut metadata = target_inode.metadata()?;
 
     // 只修改权限位，保留文件类型位
-    let old_file_type_bits = metadata.mode.bits() & ModeType::S_IFMT.bits();
-    let new_permission_bits = mode.bits() & !ModeType::S_IFMT.bits();
-    metadata.mode = ModeType::from_bits_truncate(old_file_type_bits | new_permission_bits);
+    let old_file_type_bits = metadata.mode.bits() & InodeMode::S_IFMT.bits();
+    let new_permission_bits = mode.bits() & !InodeMode::S_IFMT.bits();
+    metadata.mode = InodeMode::from_bits_truncate(old_file_type_bits | new_permission_bits);
 
     target_inode.set_metadata(&metadata)?;
 
@@ -136,7 +136,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         }
     }
 
-    meta.mode.remove(ModeType::S_ISUID | ModeType::S_ISGID);
+    meta.mode.remove(InodeMode::S_ISUID | InodeMode::S_ISGID);
     inode.set_metadata(&meta)?;
 
     return Ok(0);
@@ -159,7 +159,7 @@ pub fn do_sys_open(
     dfd: i32,
     path: &str,
     o_flags: FileFlags,
-    mode: ModeType,
+    mode: InodeMode,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
     let how = OpenHow::new(o_flags, mode, OpenHowResolve::empty());
@@ -195,7 +195,7 @@ fn do_sys_openat2(
                 let inode: Arc<dyn IndexNode> = parent_inode.create(
                     filename,
                     FileType::File,
-                    ModeType::from_bits_truncate(0o755),
+                    InodeMode::from_bits_truncate(0o755),
                 )?;
                 inode
             } else {

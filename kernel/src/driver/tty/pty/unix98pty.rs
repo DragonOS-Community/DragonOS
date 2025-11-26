@@ -12,7 +12,7 @@ use crate::{
         devpts::DevPtsFs,
         epoll::{event_poll::EventPoll, EPollEventType},
         vfs::{
-            file::FileFlags, syscall::ModeType, FilePrivateData, FileType, MountFS,
+            file::FileFlags, syscall::InodeMode, FilePrivateData, FileType, MountFS,
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
@@ -299,7 +299,7 @@ pub fn ptmx_open(
     let _ = pts_root_inode.create(
         &index.to_string(),
         FileType::CharDevice,
-        ModeType::from_bits_truncate(0x666),
+        InodeMode::from_bits_truncate(0x666),
     )?;
 
     ptm_driver().driver_funcs().open(core)?;

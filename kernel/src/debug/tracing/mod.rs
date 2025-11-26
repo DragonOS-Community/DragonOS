@@ -5,7 +5,7 @@ use crate::debug::sysfs::debugfs_kobj;
 use crate::driver::base::kobject::KObject;
 use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 use crate::filesystem::kernfs::KernFSInode;
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::filesystem::vfs::PollStatus;
 use crate::libs::spinlock::SpinLock;
 use crate::tracepoint::{TraceCmdLineCacheSnapshot, TracePointInfo};
@@ -107,13 +107,13 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
     let root_dir = debugfs.inode().ok_or(SystemError::ENOENT)?;
     let tracing_root = root_dir.add_dir(
         "tracing".to_string(),
-        ModeType::from_bits_truncate(0o555),
+        InodeMode::from_bits_truncate(0o555),
         None,
         Some(&TracingDirCallBack),
     )?;
     let events_root = tracing_root.add_dir(
         "events".to_string(),
-        ModeType::from_bits_truncate(0o755),
+        InodeMode::from_bits_truncate(0o755),
         None,
         Some(&TracingDirCallBack),
     )?;
@@ -122,7 +122,7 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
 
     tracing_root.add_file(
         "trace_pipe".to_string(),
-        ModeType::from_bits_truncate(0o444),
+        InodeMode::from_bits_truncate(0o444),
         Some(4096),
         None,
         Some(&trace_pipe::TracePipeCallBack),
@@ -133,7 +133,7 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
     )?;
     tracing_root.add_file(
         "saved_cmdlines_size".to_string(),
-        ModeType::from_bits_truncate(0o444),
+        InodeMode::from_bits_truncate(0o444),
         None,
         None,
         Some(&trace_pipe::SavedCmdlinesSizeCallBack),

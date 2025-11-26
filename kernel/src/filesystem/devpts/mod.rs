@@ -13,7 +13,7 @@ use crate::{
     },
     filesystem::vfs::{
         mount::{do_mount_mkdir, MountFlags},
-        syscall::ModeType,
+        syscall::InodeMode,
         FileType,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -117,7 +117,7 @@ impl LockedDevPtsFSInode {
                     ctime: PosixTimeSpec::default(),
                     btime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
-                    mode: ModeType::from_bits_truncate(0o777),
+                    mode: InodeMode::from_bits_truncate(0o777),
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
@@ -226,7 +226,7 @@ impl IndexNode for LockedDevPtsFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        _mode: super::vfs::syscall::ModeType,
+        _mode: super::vfs::syscall::InodeMode,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if file_type != FileType::CharDevice {
@@ -249,7 +249,7 @@ impl IndexNode for LockedDevPtsFSInode {
 
         let mut metadata = result.metadata()?;
 
-        metadata.mode.insert(ModeType::S_IFCHR);
+        metadata.mode.insert(InodeMode::S_IFCHR);
         metadata.raw_dev =
             DeviceNumber::new(Major::UNIX98_PTY_SLAVE_MAJOR, name.parse::<u32>().unwrap());
 

@@ -36,7 +36,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{file::FileFlags, syscall::ModeType, utils::DName, vcore::generate_inode_id};
+use self::{file::FileFlags, syscall::InodeMode, utils::DName, vcore::generate_inode_id};
 pub use self::{file::FilePrivateData, mount::MountFS};
 
 use super::page_cache::PageCache;
@@ -70,33 +70,33 @@ pub enum FileType {
     Socket,
 }
 
-impl From<FileType> for ModeType {
+impl From<FileType> for InodeMode {
     fn from(val: FileType) -> Self {
         match val {
-            FileType::File => ModeType::S_IFREG,
-            FileType::Dir => ModeType::S_IFDIR,
-            FileType::BlockDevice => ModeType::S_IFBLK,
-            FileType::CharDevice => ModeType::S_IFCHR,
-            FileType::SymLink => ModeType::S_IFLNK,
-            FileType::Socket => ModeType::S_IFSOCK,
-            FileType::Pipe => ModeType::S_IFIFO,
-            FileType::KvmDevice => ModeType::S_IFCHR,
-            FileType::FramebufferDevice => ModeType::S_IFCHR,
+            FileType::File => InodeMode::S_IFREG,
+            FileType::Dir => InodeMode::S_IFDIR,
+            FileType::BlockDevice => InodeMode::S_IFBLK,
+            FileType::CharDevice => InodeMode::S_IFCHR,
+            FileType::SymLink => InodeMode::S_IFLNK,
+            FileType::Socket => InodeMode::S_IFSOCK,
+            FileType::Pipe => InodeMode::S_IFIFO,
+            FileType::KvmDevice => InodeMode::S_IFCHR,
+            FileType::FramebufferDevice => InodeMode::S_IFCHR,
         }
     }
 }
 
-impl From<ModeType> for FileType {
-    fn from(mode: ModeType) -> Self {
+impl From<InodeMode> for FileType {
+    fn from(mode: InodeMode) -> Self {
         // 提取文件类型部分
-        match mode & ModeType::S_IFMT {
-            t if t == ModeType::S_IFREG => FileType::File,
-            t if t == ModeType::S_IFDIR => FileType::Dir,
-            t if t == ModeType::S_IFBLK => FileType::BlockDevice,
-            t if t == ModeType::S_IFCHR => FileType::CharDevice,
-            t if t == ModeType::S_IFLNK => FileType::SymLink,
-            t if t == ModeType::S_IFSOCK => FileType::Socket,
-            t if t == ModeType::S_IFIFO => FileType::Pipe,
+        match mode & InodeMode::S_IFMT {
+            t if t == InodeMode::S_IFREG => FileType::File,
+            t if t == InodeMode::S_IFDIR => FileType::Dir,
+            t if t == InodeMode::S_IFBLK => FileType::BlockDevice,
+            t if t == InodeMode::S_IFCHR => FileType::CharDevice,
+            t if t == InodeMode::S_IFLNK => FileType::SymLink,
+            t if t == InodeMode::S_IFSOCK => FileType::Socket,
+            t if t == InodeMode::S_IFIFO => FileType::Pipe,
             // 默认情况，通常应该不会发生，因为 S_IFMT 应该覆盖所有情况
             _ => FileType::File,
         }
@@ -342,7 +342,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-ENOSYS)的返回值
         return self.create_with_data(name, file_type, mode, 0);
@@ -361,7 +361,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         _name: &str,
         _file_type: FileType,
-        _mode: ModeType,
+        _mode: InodeMode,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
@@ -596,7 +596,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn mknod(
         &self,
         _filename: &str,
-        _mode: ModeType,
+        _mode: InodeMode,
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Err(SystemError::ENOSYS);
@@ -617,7 +617,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// - `Ok(Arc<dyn IndexNode>)`: 成功时返回`name`目录项的共享引用。
     /// - `Err(SystemError)`: 出错时返回错误信息。
-    fn mkdir(&self, name: &str, mode: ModeType) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn mkdir(&self, name: &str, mode: InodeMode) -> Result<Arc<dyn IndexNode>, SystemError> {
         match self.find(name) {
             Ok(inode) => {
                 if inode.metadata()?.file_type == FileType::Dir {
@@ -924,7 +924,7 @@ pub struct Metadata {
     pub file_type: FileType,
 
     /// 权限
-    pub mode: ModeType,
+    pub mode: InodeMode,
 
     /// 硬链接的数量
     pub nlinks: usize,
@@ -952,7 +952,7 @@ impl Default for Metadata {
             ctime: PosixTimeSpec::default(),
             btime: PosixTimeSpec::default(),
             file_type: FileType::File,
-            mode: ModeType::empty(),
+            mode: InodeMode::empty(),
             nlinks: 1,
             uid: 0,
             gid: 0,
@@ -1128,7 +1128,7 @@ pub struct FsInfo {
 }
 
 impl Metadata {
-    pub fn new(file_type: FileType, mode: ModeType) -> Self {
+    pub fn new(file_type: FileType, mode: InodeMode) -> Self {
         Metadata {
             dev_id: 0,
             inode_id: generate_inode_id(),

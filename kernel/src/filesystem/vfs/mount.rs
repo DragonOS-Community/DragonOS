@@ -35,7 +35,7 @@ use crate::{
 };
 
 use super::{
-    file::FileFlags, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType,
+    file::FileFlags, syscall::InodeMode, utils::DName, FilePrivateData, FileSystem, FileType,
     IndexNode, InodeId, Magic, PollableInode, SuperBlock,
 };
 
@@ -595,7 +595,7 @@ impl IndexNode for MountFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inner_inode = self
@@ -682,7 +682,7 @@ impl IndexNode for MountFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inner_inode = self.inner_inode.create(name, file_type, mode)?;
         return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
@@ -872,7 +872,7 @@ impl IndexNode for MountFSInode {
     fn mknod(
         &self,
         filename: &str,
-        mode: ModeType,
+        mode: InodeMode,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inner_inode = self.inner_inode.mknod(filename, mode, dev_t)?;

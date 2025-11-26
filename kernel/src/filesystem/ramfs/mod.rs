@@ -24,7 +24,7 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    file::FilePrivateData, syscall::ModeType, utils::DName, FileSystem, FileSystemMaker, FsInfo,
+    file::FilePrivateData, syscall::InodeMode, utils::DName, FileSystem, FileSystemMaker, FsInfo,
     IndexNode, InodeId, Metadata, SpecialNodeData,
 };
 
@@ -90,7 +90,7 @@ impl RamFSInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
-                mode: ModeType::from_bits_truncate(0o777),
+                mode: InodeMode::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -309,7 +309,7 @@ impl IndexNode for LockedRamFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let name = DName::from(name);
@@ -586,7 +586,7 @@ impl IndexNode for LockedRamFSInode {
     fn mknod(
         &self,
         filename: &str,
-        mode: ModeType,
+        mode: InodeMode,
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
@@ -595,7 +595,7 @@ impl IndexNode for LockedRamFSInode {
         }
 
         // 判断需要创建的类型
-        if unlikely(mode.contains(ModeType::S_IFREG)) {
+        if unlikely(mode.contains(InodeMode::S_IFREG)) {
             // 普通文件
             return self.create(filename, FileType::File, mode);
         }
@@ -631,16 +631,16 @@ impl IndexNode for LockedRamFSInode {
 
         nod.0.lock().self_ref = Arc::downgrade(&nod);
 
-        if mode.contains(ModeType::S_IFIFO) {
+        if mode.contains(InodeMode::S_IFIFO) {
             nod.0.lock().metadata.file_type = FileType::Pipe;
             // 创建pipe文件
             let pipe_inode = LockedPipeInode::new();
             // 设置special_node
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-        } else if mode.contains(ModeType::S_IFBLK) {
+        } else if mode.contains(InodeMode::S_IFBLK) {
             nod.0.lock().metadata.file_type = FileType::BlockDevice;
             unimplemented!()
-        } else if mode.contains(ModeType::S_IFCHR) {
+        } else if mode.contains(InodeMode::S_IFCHR) {
             nod.0.lock().metadata.file_type = FileType::CharDevice;
             unimplemented!()
         }

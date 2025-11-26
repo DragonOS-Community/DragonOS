@@ -14,7 +14,7 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
-        vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
+        vfs::{syscall::InodeMode, utils::DName, IndexNode, Metadata},
     },
     libs::{rwlock::RwLock, spinlock::SpinLockGuard},
 };
@@ -74,7 +74,7 @@ impl GenDisk {
             fs: RwLock::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
-                ModeType::from_bits_truncate(0o755),
+                InodeMode::from_bits_truncate(0o755),
             ),
             name: dev_name,
         });

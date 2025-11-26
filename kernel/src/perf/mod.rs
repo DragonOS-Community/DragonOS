@@ -9,7 +9,7 @@ use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileFlags};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::filesystem::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
 };
@@ -226,7 +226,7 @@ impl IndexNode for PerfEventInode {
 
     fn metadata(&self) -> Result<Metadata> {
         let meta = Metadata {
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             file_type: FileType::File,
             ..Default::default()
         };

@@ -1,7 +1,7 @@
 use super::vfs::PollableInode;
 use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::vfs::file::{File, FileFlags};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
     vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
@@ -248,7 +248,7 @@ impl IndexNode for EventFdInode {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let meta = Metadata {
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             file_type: FileType::File,
             ..Default::default()
         };

@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_ACCESS;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{fcntl::AtFlags, open::do_faccessat, syscall::ModeType},
+    filesystem::vfs::{fcntl::AtFlags, open::do_faccessat, syscall::InodeMode},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::vec::Vec;
@@ -21,7 +21,7 @@ impl Syscall for SysAccessHandle {
         return do_faccessat(
             AtFlags::AT_FDCWD.bits(),
             pathname,
-            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+            InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?,
             0,
         );
     }

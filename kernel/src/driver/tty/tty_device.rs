@@ -31,7 +31,7 @@ use crate::{
         epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
-            file::FileFlags, syscall::ModeType, utils::DName, FilePrivateData, FileType, IndexNode,
+            file::FileFlags, syscall::InodeMode, utils::DName, FilePrivateData, FileType, IndexNode,
             Metadata, PollableInode,
         },
     },
@@ -79,7 +79,7 @@ impl InnerTtyDevice {
             inode: None,
             driver: None,
             can_match: false,
-            metadata: Metadata::new(FileType::CharDevice, ModeType::from_bits_truncate(0o755)),
+            metadata: Metadata::new(FileType::CharDevice, InodeMode::from_bits_truncate(0o755)),
         }
     }
 

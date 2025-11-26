@@ -4,7 +4,7 @@ use crate::{
     arch::interrupt::TrapFrame,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
-        syscall::ModeType, utils::rsplit_path, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        syscall::InodeMode, utils::rsplit_path, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     process::ProcessManager,
     syscall::{
@@ -28,7 +28,7 @@ impl Syscall for SysMknodHandle {
         let path = Self::path(args);
         let flags = Self::flags(args);
         let dev_t = Self::dev_t(args);
-        let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
+        let flags: InodeMode = InodeMode::from_bits_truncate(flags as u32);
         let dev_t = DeviceNumber::from(dev_t as u32);
 
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?

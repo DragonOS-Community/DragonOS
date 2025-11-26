@@ -12,14 +12,14 @@ use alloc::sync::Arc;
 
 use super::{
     fcntl::AtFlags,
-    syscall::{ModeType, PosixStatx, PosixStatxMask, StxAttributes},
+    syscall::{InodeMode, PosixStatx, PosixStatxMask, StxAttributes},
     IndexNode,
 };
 
 #[derive(Clone)]
 pub struct KStat {
     pub result_mask: PosixStatxMask, // What fields the user got
-    pub mode: ModeType,              // umode_t
+    pub mode: InodeMode,              // umode_t
     pub nlink: u32,
     pub blksize: u32, // Preferred I/O size
     pub attributes: StxAttributes,
@@ -44,7 +44,7 @@ impl Default for KStat {
     fn default() -> Self {
         Self {
             result_mask: PosixStatxMask::empty(),
-            mode: ModeType::empty(),
+            mode: InodeMode::empty(),
             nlink: Default::default(),
             blksize: Default::default(),
             attributes: StxAttributes::empty(),

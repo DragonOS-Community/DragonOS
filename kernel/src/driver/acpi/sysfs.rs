@@ -8,7 +8,7 @@ use crate::{
             file::sysfs_emit_str, sysfs_instance, Attribute, BinAttribute, SysFSOpsSupport,
             SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::ModeType,
+        vfs::syscall::InodeMode,
     },
     libs::rwlock::RwLock,
 };
@@ -179,7 +179,7 @@ impl Attribute for AttrForceRemove {
         "force_remove"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -516,8 +516,8 @@ impl Attribute for AttrAcpiTable {
         return &self.filename;
     }
 
-    fn mode(&self) -> ModeType {
-        return ModeType::from_bits_truncate(0o400);
+    fn mode(&self) -> InodeMode {
+        return InodeMode::from_bits_truncate(0o400);
     }
 
     fn support(&self) -> SysFSOpsSupport {

@@ -24,7 +24,7 @@ use crate::{
 use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
-    file::FileFlags, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
+    file::FileFlags, syscall::InodeMode, vcore::generate_inode_id, FilePrivateData, FileSystem,
     FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
@@ -85,7 +85,7 @@ impl KernFS {
     fn create_root_inode() -> Arc<KernFSInode> {
         let metadata = Metadata {
             size: 0,
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             uid: 0,
             gid: 0,
             blk_size: 0,
@@ -143,7 +143,7 @@ pub struct KernFSInode {
 }
 
 pub struct KernFSInodeArgs {
-    pub mode: ModeType,
+    pub mode: InodeMode,
     pub inode_type: KernInodeType,
     pub size: Option<usize>,
     pub private_data: Option<KernInodePrivateData>,
@@ -201,7 +201,7 @@ impl IndexNode for KernFSInode {
         &self,
         _name: &str,
         _file_type: FileType,
-        _mode: ModeType,
+        _mode: InodeMode,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 应当通过kernfs的其它方法来创建文件，而不能从用户态直接调用此方法。
@@ -479,7 +479,7 @@ impl KernFSInode {
     pub fn add_dir(
         &self,
         name: String,
-        mode: ModeType,
+        mode: InodeMode,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
@@ -510,7 +510,7 @@ impl KernFSInode {
     pub fn add_file(
         &self,
         name: String,
-        mode: ModeType,
+        mode: InodeMode,
         size: Option<usize>,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
@@ -546,7 +546,7 @@ impl KernFSInode {
         &self,
         name: String,
         file_type: KernInodeType,
-        mode: ModeType,
+        mode: InodeMode,
         mut size: usize,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
@@ -639,7 +639,7 @@ impl KernFSInode {
         let inode = self.inner_create(
             name,
             KernInodeType::SymLink,
-            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777),
+            InodeMode::S_IFLNK | InodeMode::from_bits_truncate(0o777),
             0,
             None,
             None,

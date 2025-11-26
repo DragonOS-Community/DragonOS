@@ -2,7 +2,7 @@ use crate::{
     filesystem::{
         page_cache::PageCache,
         vfs::{
-            self, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
+            self, syscall::InodeMode, utils::DName, vcore::generate_inode_id, FilePrivateData,
             IndexNode, InodeId,
         },
     },
@@ -53,11 +53,11 @@ impl IndexNode for LockedExt4Inode {
         &self,
         name: &str,
         file_type: vfs::FileType,
-        mode: vfs::syscall::ModeType,
+        mode: vfs::syscall::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut guard = self.0.lock();
         // another_ext4的高4位是文件类型，低12位是权限
-        let file_mode = ModeType::from(file_type).union(mode);
+        let file_mode = InodeMode::from(file_type).union(mode);
         let ext4 = &guard.concret_fs().fs;
         let id = ext4.create(
             guard.inner_inode_num,
@@ -76,7 +76,7 @@ impl IndexNode for LockedExt4Inode {
         &self,
         name: &str,
         file_type: vfs::FileType,
-        mode: ModeType,
+        mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if data == 0 {
@@ -300,7 +300,7 @@ impl IndexNode for LockedExt4Inode {
             mtime: PosixTimeSpec::new(attr.mtime.into(), 0),
             ctime: PosixTimeSpec::new(attr.ctime.into(), 0),
             file_type: Self::file_type(attr.ftype),
-            mode: ModeType::from_bits_truncate(attr.perm.bits() as u32),
+            mode: InodeMode::from_bits_truncate(attr.perm.bits() as u32),
             nlinks: attr.links as usize,
             uid: attr.uid as usize,
             gid: attr.gid as usize,
@@ -319,7 +319,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
         use another_ext4::InodeMode;
-        let mode = metadata.mode.union(ModeType::from(metadata.file_type));
+        let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
 
         let to_ext4_time =
             |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };

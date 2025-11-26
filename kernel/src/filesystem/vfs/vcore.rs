@@ -14,7 +14,7 @@ use crate::{
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
-        vfs::{syscall::ModeType, AtomicInodeId, FileSystem, FileType, MountFS},
+        vfs::{syscall::InodeMode, AtomicInodeId, FileSystem, FileType, MountFS},
     },
     mm::truncate::truncate_inode_pages,
     process::{namespace::mnt::mnt_namespace_init, ProcessManager},
@@ -90,17 +90,17 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     // 因为是换根所以路径没有变化
     // 不需要重新注册挂载目录
     new_root_inode
-        .mkdir("proc", ModeType::from_bits_truncate(0o755))
+        .mkdir("proc", InodeMode::from_bits_truncate(0o755))
         .expect("Unable to create /proc")
         .mount_from(old_root_inode.find("proc").expect("proc not mounted!"))
         .expect("Failed to migrate filesystem of proc");
     new_root_inode
-        .mkdir("dev", ModeType::from_bits_truncate(0o755))
+        .mkdir("dev", InodeMode::from_bits_truncate(0o755))
         .expect("Unable to create /dev")
         .mount_from(old_root_inode.find("dev").expect("dev not mounted!"))
         .expect("Failed to migrate filesystem of dev");
     new_root_inode
-        .mkdir("sys", ModeType::from_bits_truncate(0o755))
+        .mkdir("sys", InodeMode::from_bits_truncate(0o755))
         .expect("Unable to create /sys")
         .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
         .expect("Failed to migrate filesystem of sys");
@@ -219,7 +219,7 @@ pub fn do_mkdir_at(
         current_inode =
             current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     }
-    return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
+    return current_inode.mkdir(name, InodeMode::from_bits_truncate(mode.bits()));
 }
 
 /// 解析父目录inode

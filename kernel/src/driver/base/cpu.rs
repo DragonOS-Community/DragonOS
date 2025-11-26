@@ -24,7 +24,7 @@ use super::{
 };
 use crate::filesystem::sysfs::file::sysfs_emit_str;
 use crate::filesystem::sysfs::{Attribute, AttributeGroup, SysFSOpsSupport};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::libs::lazy_init::Lazy;
 use system_error::SystemError;
 
@@ -273,7 +273,7 @@ impl AttributeGroup for AttrGroupCpu {
         &self,
         _kobj: Arc<dyn KObject>,
         _attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         None
     }
 }
@@ -286,8 +286,8 @@ impl Attribute for AttrCpuPossible {
         "possible"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -310,8 +310,8 @@ impl Attribute for AttrCpuOnline {
         "online"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO
     }
 
     fn support(&self) -> SysFSOpsSupport {

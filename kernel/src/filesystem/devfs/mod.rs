@@ -5,7 +5,7 @@ pub mod zero_dev;
 use super::{
     devpts::{DevPtsFs, LockedDevPtsFSInode},
     vfs::{
-        file::FileFlags, syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData,
+        file::FileFlags, syscall::InodeMode, utils::DName, vcore::generate_inode_id, FilePrivateData,
         FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
     },
 };
@@ -75,7 +75,7 @@ impl DevFS {
         let root: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(
             // /dev 的权限设置为 读+执行，root 可以读写
             // root 的 parent 是空指针
-            DevFSInode::new(FileType::Dir, ModeType::from_bits_truncate(0o755), 0),
+            DevFSInode::new(FileType::Dir, InodeMode::from_bits_truncate(0o755), 0),
         )));
 
         // panic!("devfs root inode id: {:?}", root.0.lock().metadata.inode_id);
@@ -137,7 +137,7 @@ impl DevFS {
                     dev_root_inode.create(
                         "char",
                         FileType::Dir,
-                        ModeType::from_bits_truncate(0o755),
+                        InodeMode::from_bits_truncate(0o755),
                     )?;
                 }
 
@@ -168,7 +168,7 @@ impl DevFS {
                     dev_root_inode.create(
                         "block",
                         FileType::Dir,
-                        ModeType::from_bits_truncate(0o755),
+                        InodeMode::from_bits_truncate(0o755),
                     )?;
                 }
 
@@ -282,14 +282,14 @@ pub struct DevFSInode {
 }
 
 impl DevFSInode {
-    pub fn new(dev_type_: FileType, mode: ModeType, data_: usize) -> Self {
+    pub fn new(dev_type_: FileType, mode: InodeMode, data_: usize) -> Self {
         return Self::new_with_parent(Weak::default(), dev_type_, mode, data_);
     }
 
     pub fn new_with_parent(
         parent: Weak<LockedDevFSInode>,
         dev_type_: FileType,
-        mode: ModeType,
+        mode: InodeMode,
         data_: usize,
     ) -> Self {
         return DevFSInode {
@@ -332,7 +332,7 @@ impl LockedDevFSInode {
             guard,
             name,
             FileType::Dir,
-            ModeType::from_bits_truncate(0o755),
+            InodeMode::from_bits_truncate(0o755),
             0,
         ) {
             Ok(inode) => inode,
@@ -364,7 +364,7 @@ impl LockedDevFSInode {
         let new_inode = self.create_with_data(
             symlink_name,
             FileType::SymLink,
-            ModeType::from_bits_truncate(0o777),
+            InodeMode::from_bits_truncate(0o777),
             0,
         )?;
 
@@ -394,7 +394,7 @@ impl LockedDevFSInode {
         mut guard: SpinLockGuard<DevFSInode>,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
         dev: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if guard.metadata.file_type != FileType::Dir {
@@ -463,7 +463,7 @@ impl IndexNode for LockedDevFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
@@ -746,7 +746,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
         // devfs 挂载
         let root_inode = ProcessManager::current_mntns().root_inode();
         root_inode
-            .mkdir("dev", ModeType::from_bits_truncate(0o755))
+            .mkdir("dev", InodeMode::from_bits_truncate(0o755))
             .expect("Unabled to find /dev")
             .mount(devfs, MountFlags::empty())
             .expect("Failed to mount at /dev");

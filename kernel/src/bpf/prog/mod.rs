@@ -6,7 +6,7 @@ use crate::bpf::map::BpfMap;
 use crate::bpf::prog::util::{BpfProgMeta, BpfProgVerifierInfo};
 use crate::bpf::prog::verifier::BpfProgVerifier;
 use crate::filesystem::vfs::file::{File, FileFlags};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
 use crate::include::bindings::linux_bpf::bpf_attr;
 use crate::libs::spinlock::SpinLockGuard;
@@ -73,7 +73,7 @@ impl IndexNode for BpfProg {
 
     fn metadata(&self) -> Result<Metadata> {
         let meta = Metadata {
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             file_type: FileType::File,
             ..Default::default()
         };

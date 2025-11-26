@@ -9,7 +9,7 @@ use crate::bpf::map::array_map::{ArrayMap, PerCpuArrayMap, PerfEventArrayMap};
 use crate::bpf::map::hash_map::PerCpuHashMap;
 use crate::bpf::map::util::{BpfMapGetNextKeyArg, BpfMapMeta, BpfMapUpdateArg};
 use crate::filesystem::vfs::file::{File, FileFlags};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
 use crate::include::bindings::linux_bpf::{bpf_attr, bpf_map_type};
 use crate::libs::casting::DowncastArc;
@@ -160,7 +160,7 @@ impl IndexNode for BpfMap {
 
     fn metadata(&self) -> Result<Metadata> {
         let meta = Metadata {
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             file_type: FileType::File,
             ..Default::default()
         };

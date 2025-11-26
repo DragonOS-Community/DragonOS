@@ -19,7 +19,7 @@ use crate::{
     },
     filesystem::{
         sysfs::{Attribute, AttributeGroup},
-        vfs::syscall::ModeType,
+        vfs::syscall::InodeMode,
     },
 };
 use system_error::SystemError;
@@ -187,7 +187,7 @@ impl AttributeGroup for PlatformDeviceAttrGroup {
         return &[];
     }
 
-    fn is_visible(&self, _kobj: Arc<dyn KObject>, attr: &dyn Attribute) -> Option<ModeType> {
+    fn is_visible(&self, _kobj: Arc<dyn KObject>, attr: &dyn Attribute) -> Option<InodeMode> {
         return Some(attr.mode());
     }
 }

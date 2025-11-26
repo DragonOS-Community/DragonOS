@@ -1,6 +1,6 @@
 use crate::{
     arch::mm::LockedFrameAllocator,
-    filesystem::vfs::syscall::ModeType,
+    filesystem::vfs::syscall::InodeMode,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
@@ -176,7 +176,7 @@ impl ShmManager {
             gid: 0,
             _cuid: 0,
             _cgid: 0,
-            mode: shmflg & ShmFlags::from_bits_truncate(ModeType::S_IRWXUGO.bits()),
+            mode: shmflg & ShmFlags::from_bits_truncate(InodeMode::S_IRWXUGO.bits()),
             _seq: 0,
         };
         let shm_kernel = KernelShm::new(kern_ipc_perm, paddr, size);

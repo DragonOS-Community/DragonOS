@@ -45,7 +45,7 @@ use crate::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         mbr::MbrDiskPartionTable,
-        vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
+        vfs::{syscall::InodeMode, utils::DName, IndexNode, Metadata},
     },
     init::initcall::INITCALL_POSTCORE,
     libs::{
@@ -216,7 +216,7 @@ impl VirtIOBlkDevice {
             fs: RwLock::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
-                ModeType::from_bits_truncate(0o755),
+                InodeMode::from_bits_truncate(0o755),
             ),
         });
 

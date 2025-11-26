@@ -10,7 +10,7 @@ use crate::{
         sysfs::{
             file::sysfs_emit_str, sysfs_instance, Attribute, SysFSOpsSupport, SYSFS_ATTR_MODE_WO,
         },
-        vfs::syscall::ModeType,
+        vfs::syscall::InodeMode,
     },
     libs::wait_queue::WaitQueue,
 };
@@ -591,9 +591,9 @@ impl DriverManager {
 pub struct DeviceAttrStateSynced;
 
 impl Attribute for DeviceAttrStateSynced {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         // 0o444
-        return ModeType::S_IRUGO;
+        return InodeMode::S_IRUGO;
     }
 
     fn name(&self) -> &str {
@@ -627,7 +627,7 @@ impl Attribute for DeviceAttrCoredump {
         "coredump"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_WO
     }
 

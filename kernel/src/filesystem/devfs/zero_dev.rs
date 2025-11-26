@@ -1,7 +1,7 @@
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::filesystem::vfs::{
     vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
@@ -50,7 +50,7 @@ impl LockedZeroInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::CharDevice, // 文件夹，block设备，char设备
-                mode: ModeType::from_bits_truncate(0o666),
+                mode: InodeMode::from_bits_truncate(0o666),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

@@ -1,6 +1,6 @@
 use system_error::SystemError;
 
-use crate::filesystem::vfs::{open::do_faccessat, syscall::ModeType};
+use crate::filesystem::vfs::{open::do_faccessat, syscall::InodeMode};
 
 pub fn do_faccessat2(
     dirfd: i32,
@@ -11,7 +11,7 @@ pub fn do_faccessat2(
     return do_faccessat(
         dirfd,
         pathname,
-        ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+        InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?,
         flags,
     );
 }

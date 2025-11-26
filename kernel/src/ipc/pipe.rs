@@ -6,7 +6,7 @@ use crate::{
             EPollEventType, EPollItem,
         },
         vfs::{
-            file::FileFlags, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
+            file::FileFlags, syscall::InodeMode, vcore::generate_inode_id, FilePrivateData,
             FileSystem, FileType, IndexNode, Metadata, PollableInode,
         },
     },
@@ -133,7 +133,7 @@ impl LockedPipeInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Pipe,
-                mode: ModeType::from_bits_truncate(0o666),
+                mode: InodeMode::from_bits_truncate(0o666),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

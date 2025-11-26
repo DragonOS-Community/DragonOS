@@ -32,14 +32,14 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
         len: usize,
         cookie: &mut bool,
         offset: usize,
-        mode: FileFlags,
+        file_flags: FileFlags,
     ) -> Result<usize, SystemError>;
     fn write(
         &self,
         tty: Arc<TtyCore>,
         buf: &[u8],
         len: usize,
-        mode: FileFlags,
+        file_flags: FileFlags,
     ) -> Result<usize, SystemError>;
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError>;
 

@@ -125,10 +125,30 @@ bitflags! {
 }
 
 impl FileFlags {
-    /// @brief 获取文件的访问模式的值
+    /// @brief 获取文件的访问模式 (O_RDONLY/O_WRONLY/O_RDWR)
+    ///
+    /// 这是正确提取访问模式的方法,因为O_RDONLY=0不能用contains()检查
     #[inline]
     pub fn accflags(&self) -> u32 {
-        return self.bits() & FileFlags::O_ACCMODE.bits();
+        self.bits() & Self::O_ACCMODE.bits()
+    }
+
+    /// @brief 检查是否是只读模式
+    #[inline]
+    pub fn is_rdonly(&self) -> bool {
+        self.accflags() == Self::O_RDONLY.bits()
+    }
+
+    /// @brief 检查是否是只写模式
+    #[inline]
+    pub fn is_wronly(&self) -> bool {
+        self.accflags() == Self::O_WRONLY.bits()
+    }
+
+    /// @brief 检查是否是读写模式
+    #[inline]
+    pub fn is_rdwr(&self) -> bool {
+        self.accflags() == Self::O_RDWR.bits()
     }
 }
 
@@ -157,8 +177,8 @@ impl File {
     /// @brief 创建一个新的文件对象
     ///
     /// @param inode 文件对象对应的inode
-    /// @param mode 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mut mode: FileFlags) -> Result<Self, SystemError> {
+    /// @param file_flags 文件的打开模式
+    pub fn new(inode: Arc<dyn IndexNode>, mut flags: FileFlags) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
         if file_type == FileType::Pipe {
@@ -166,16 +186,16 @@ impl File {
                 inode = pipe_inode;
             }
         }
-        let close_on_exec = mode.contains(FileFlags::O_CLOEXEC);
-        mode.remove(FileFlags::O_CLOEXEC);
+        let close_on_exec = flags.contains(FileFlags::O_CLOEXEC);
+        flags.remove(FileFlags::O_CLOEXEC);
 
         let private_data = SpinLock::new(FilePrivateData::default());
-        inode.open(private_data.lock(), &mode)?;
+        inode.open(private_data.lock(), &flags)?;
 
         let f = File {
             inode,
             offset: AtomicUsize::new(0),
-            file_flags: RwLock::new(mode),
+            file_flags: RwLock::new(flags),
             file_type,
             readdir_subdirs_name: SpinLock::new(Vec::default()),
             private_data,
@@ -559,20 +579,20 @@ impl File {
         self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
     }
 
-    pub fn set_mode(&self, mut mode: FileFlags) -> Result<(), SystemError> {
-        // todo: 是否需要调用inode的open方法，以更新private data（假如它与mode有关的话）?
+    pub fn set_flags(&self, mut flags: FileFlags) -> Result<(), SystemError> {
+        // todo: 是否需要调用inode的open方法，以更新private data（假如它与file_flags有关的话）?
         // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
 
         // 提取 O_CLOEXEC 状态并更新 close_on_exec 字段
-        let close_on_exec = mode.contains(FileFlags::O_CLOEXEC);
+        let close_on_exec = flags.contains(FileFlags::O_CLOEXEC);
         self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
 
-        // 从 mode 中移除 O_CLOEXEC 标志，保持与构造函数一致的行为
-        mode.remove(FileFlags::O_CLOEXEC);
+        // 从 file_flags 中移除 O_CLOEXEC 标志，保持与构造函数一致的行为
+        flags.remove(FileFlags::O_CLOEXEC);
 
         // 更新文件的打开模式
-        *self.file_flags.write() = mode;
-        self.private_data.lock().update_mode(mode);
+        *self.file_flags.write() = flags;
+        self.private_data.lock().update_mode(flags);
         return Ok(());
     }
 

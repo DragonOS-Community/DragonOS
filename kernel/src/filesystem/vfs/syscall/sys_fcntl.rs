@@ -153,7 +153,7 @@ impl SysFcntlHandle {
                     let mode = FileFlags::from_bits(arg).ok_or(SystemError::EINVAL)?;
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    file.set_mode(mode)?;
+                    file.set_flags(mode)?;
                     return Ok(0);
                 }
 

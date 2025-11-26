@@ -643,10 +643,22 @@ pub fn change_mnt_propagation(
     prop_type: PropagationType,
 ) -> Result<(), SystemError> {
     let propagation = mount.propagation();
+    let old_type = propagation.prop_type();
+    let old_group_id = propagation.peer_group_id();
+
+    // If transitioning FROM shared, unregister from the peer group first
+    if old_type == PropagationType::Shared && prop_type != PropagationType::Shared {
+        unregister_peer(old_group_id, mount);
+    }
 
     match prop_type {
         PropagationType::Shared => {
             propagation.set_shared();
+            // Register in peer group if newly shared
+            if old_type != PropagationType::Shared {
+                let new_group_id = propagation.peer_group_id();
+                register_peer(new_group_id, mount);
+            }
         }
         PropagationType::Private => {
             propagation.set_private();
@@ -774,6 +786,9 @@ pub fn propagate_mount(
 }
 
 /// Propagate mount to a single target mount.
+///
+/// The cloned child mount joins the SAME peer group as the source child,
+/// so that all propagated children can propagate events to each other.
 fn propagate_one(
     target_mnt: &Arc<MountFS>,
     mountpoint_id: InodeId,
@@ -790,21 +805,18 @@ fn propagate_one(
     // Clone the child mount for this target
     let cloned_child = source_child.deepcopy(None);
 
-    // If target is shared, the cloned mount should also be shared in the same group
-    let target_prop = target_mnt.propagation();
-    if target_prop.is_shared() {
-        let group_id = target_prop.peer_group_id();
+    // The cloned child should join the SAME peer group as source_child,
+    // NOT the target parent's group. This way, all propagated children
+    // form a peer group and can propagate events to each other.
+    let source_child_prop = source_child.propagation();
+    if source_child_prop.is_shared() {
+        let group_id = source_child_prop.peer_group_id();
         cloned_child.propagation().set_shared_with_group(group_id);
         register_peer(group_id, &cloned_child);
     }
 
     // Add the cloned mount to the target
     target_mnt.add_mount(mountpoint_id, cloned_child.clone())?;
-
-    // log::debug!(
-    //     "propagate_one: propagated mount to target, mountpoint_id={:?}",
-    //     mountpoint_id
-    // );
 
     Ok(())
 }

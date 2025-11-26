@@ -236,6 +236,7 @@ impl PeerGroupRegistry {
     ///
     /// # Returns
     /// The number of active (non-stale) mounts in the group.
+    #[allow(dead_code)]
     pub fn peer_count(&self, group_id: PropagationGroupId) -> usize {
         if !group_id.is_valid() {
             return 0;
@@ -256,6 +257,7 @@ impl PeerGroupRegistry {
     ///
     /// # Returns
     /// `true` if the group exists and has at least one active member.
+    #[allow(dead_code)]
     pub fn group_exists(&self, group_id: PropagationGroupId) -> bool {
         self.peer_count(group_id) > 0
     }
@@ -268,6 +270,7 @@ impl PeerGroupRegistry {
     ///
     /// # Arguments
     /// * `group_id` - The peer group to clean up
+    #[allow(dead_code)]
     pub fn cleanup_stale(&self, group_id: PropagationGroupId) {
         if !group_id.is_valid() {
             return;

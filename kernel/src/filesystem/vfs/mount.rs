@@ -31,7 +31,9 @@ use crate::{
     process::{
         namespace::{
             mnt::MntNamespace,
-            propagation::{unregister_peer, MountPropagation},
+            propagation::{
+                propagate_mount, propagate_umount, register_peer, unregister_peer, MountPropagation,
+            },
         },
         ProcessManager,
     },
@@ -528,8 +530,6 @@ impl MountFSInode {
 
     /// 移除挂载点下的文件系统
     fn do_umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        use crate::process::namespace::propagation::{propagate_umount, unregister_peer};
-
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -832,8 +832,6 @@ impl IndexNode for MountFSInode {
         fs: Arc<dyn FileSystem>,
         mount_flags: MountFlags,
     ) -> Result<Arc<MountFS>, SystemError> {
-        use crate::process::namespace::propagation::{propagate_mount, register_peer};
-
         let metadata = self.inner_inode.metadata()?;
         if metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -867,12 +865,7 @@ impl IndexNode for MountFSInode {
             mount_flags,
         );
 
-        // If the new mount is shared, register it in the peer group
-        if new_mount_fs.propagation().is_shared() {
-            let group_id = new_mount_fs.propagation().peer_group_id();
-            register_peer(group_id, &new_mount_fs);
-        }
-
+        // Perform all potentially-failing operations first before registering in peer group
         self.mount_fs
             .add_mount(metadata.inode_id, new_mount_fs.clone())?;
 
@@ -883,6 +876,13 @@ impl IndexNode for MountFSInode {
             mount_path,
             new_mount_fs.clone(),
         )?;
+
+        // Now that all operations succeeded, register in peer group if shared
+        // This ensures we don't leave dangling registrations if earlier operations fail
+        if new_mount_fs.propagation().is_shared() {
+            let group_id = new_mount_fs.propagation().peer_group_id();
+            register_peer(group_id, &new_mount_fs);
+        }
 
         // Propagate this mount to all peers and slaves of the parent mount
         if parent_propagation.is_shared() {

@@ -4,7 +4,7 @@ use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
         fcntl::AtFlags, mount::MountFlags, produce_fs, utils::user_path_at, FileType, IndexNode,
-        MountFS, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        InodeId, MountFS, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
     process::{
@@ -350,6 +350,9 @@ fn do_bind_mount(
         }
     }
 
+    // Clone source_mfs for recursive bind mount (need to keep it for later use)
+    let source_mfs_for_recursive = source_mfs.clone();
+
     // Get the inner filesystem for mounting
     let inner_fs = source_mfs
         .map(|mfs| mfs.inner_filesystem())
@@ -357,14 +360,15 @@ fn do_bind_mount(
 
     // Use the target_inode.mount() method which handles all the mounting logic
     // This properly creates a new MountFS and registers it
-    target_inode.mount(inner_fs, MountFlags::empty())?;
+    let target_mfs = target_inode.mount(inner_fs, MountFlags::empty())?;
 
-    // TODO: If MS_REC is set, we should recursively bind submounts as well
-    // This is a more complex operation that requires traversing the source mount tree
+    // If MS_REC is set, recursively bind all submounts from source to target
     if flags.contains(MountFlags::REC) {
-        log::debug!("do_bind_mount: recursive bind mount requested (submounts not yet copied)");
-        // For now, we just bind the top-level mount
-        // Full recursive bind would need to copy all submounts from source to target
+        if let Some(ref mfs) = source_mfs_for_recursive {
+            let source_path = source_inode.absolute_path()?;
+            let target_path = target_inode.absolute_path()?;
+            do_recursive_bind_mount(mfs, &target_mfs, &source_path, &target_path)?;
+        }
     }
 
     Ok(())
@@ -409,6 +413,145 @@ fn do_change_type(target_inode: Arc<dyn IndexNode>, flags: MountFlags) -> Result
 
     // Change the propagation type
     change_mnt_propagation_recursive(&mount_fs, prop_type, recursive)?;
+
+    Ok(())
+}
+
+/// Recursively bind mount all submounts from source to target.
+///
+/// This function traverses the source mount tree and creates corresponding
+/// bind mounts at the target location for all submounts.
+///
+/// # Arguments
+/// * `source_mfs` - The source MountFS to copy submounts from
+/// * `target_mfs` - The target MountFS to create submounts in
+/// * `source_base_path` - The absolute path of the source mount point
+/// * `target_base_path` - The absolute path of the target mount point
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(SystemError)` on failure
+fn do_recursive_bind_mount(
+    source_mfs: &Arc<MountFS>,
+    _target_mfs: &Arc<MountFS>,
+    source_base_path: &str,
+    target_base_path: &str,
+) -> Result<(), SystemError> {
+    let mnt_ns = ProcessManager::current_mntns();
+    let mount_list = mnt_ns.mount_list();
+
+    // Queue for BFS traversal: (source_submount, source_mountpoint_ino)
+    struct SubmountInfo {
+        source_mfs: Arc<MountFS>,
+        source_mp_ino: InodeId,
+    }
+
+    let mut queue: Vec<SubmountInfo> = Vec::new();
+
+    // Add all direct submounts of source to the queue
+    for (child_ino, child_mfs) in source_mfs.mountpoints().iter() {
+        queue.push(SubmountInfo {
+            source_mfs: child_mfs.clone(),
+            source_mp_ino: *child_ino,
+        });
+    }
+
+    // Process all submounts
+    while let Some(info) = queue.pop() {
+        // Get the mount path of this submount
+        let child_mount_path = match mount_list.get_mount_path_by_ino(info.source_mp_ino) {
+            Some(path) => path,
+            None => {
+                log::warn!(
+                    "do_recursive_bind_mount: mount path not found for inode {:?}",
+                    info.source_mp_ino
+                );
+                continue;
+            }
+        };
+
+        // Calculate the relative path from source base
+        let relative_path = match child_mount_path.as_str().strip_prefix(source_base_path) {
+            Some(rel) => {
+                if rel.is_empty() {
+                    continue; // Skip if it's the source itself
+                }
+                rel
+            }
+            None => {
+                log::warn!(
+                    "do_recursive_bind_mount: path {} is not under source base {}",
+                    child_mount_path.as_str(),
+                    source_base_path
+                );
+                continue;
+            }
+        };
+
+        // Calculate target path
+        let target_child_path = if target_base_path.ends_with('/') {
+            alloc::format!(
+                "{}{}",
+                target_base_path.trim_end_matches('/'),
+                relative_path
+            )
+        } else {
+            alloc::format!("{}{}", target_base_path, relative_path)
+        };
+
+        // log::debug!(
+        //     "do_recursive_bind_mount: binding submount {} -> {}",
+        //     child_mount_path.as_str(),
+        //     target_child_path
+        // );
+
+        // Look up the target directory inode
+        let root_inode = mnt_ns.root_inode();
+        let target_child_inode = match root_inode
+            .lookup_follow_symlink(&target_child_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        {
+            Ok(inode) => inode,
+            Err(e) => {
+                log::warn!(
+                    "do_recursive_bind_mount: failed to lookup target path {}: {:?}",
+                    target_child_path,
+                    e
+                );
+                continue;
+            }
+        };
+
+        // Skip if not a directory
+        if target_child_inode.metadata()?.file_type != FileType::Dir {
+            log::warn!(
+                "do_recursive_bind_mount: target {} is not a directory",
+                target_child_path
+            );
+            continue;
+        }
+
+        // Get the inner filesystem for mounting
+        // source_mfs is already Arc<MountFS>, so we can directly call inner_filesystem()
+        let child_inner_fs = info.source_mfs.inner_filesystem();
+
+        // Create the bind mount
+        if let Err(e) = target_child_inode.mount(child_inner_fs, MountFlags::empty()) {
+            log::warn!(
+                "do_recursive_bind_mount: failed to mount at {}: {:?}",
+                target_child_path,
+                e
+            );
+            continue;
+        }
+
+        // Add this submount's children to the queue
+        for (grandchild_ino, grandchild_mfs) in info.source_mfs.mountpoints().iter() {
+            queue.push(SubmountInfo {
+                source_mfs: grandchild_mfs.clone(),
+                source_mp_ino: *grandchild_ino,
+            });
+        }
+    }
 
     Ok(())
 }

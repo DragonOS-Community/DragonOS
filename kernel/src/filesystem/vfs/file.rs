@@ -407,9 +407,16 @@ impl File {
     /// @brief 判断当前文件是否可读
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
-        // 暂时认为只要不是write only, 就可读
-        if *self.mode.read() == FileMode::O_WRONLY {
-            return Err(SystemError::EPERM);
+        let mode = *self.mode.read();
+
+        // O_PATH descriptors cannot be used for I/O
+        if mode.contains(FileMode::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // O_WRONLY cannot be read
+        if mode.accmode() == FileMode::O_WRONLY.accmode() {
+            return Err(SystemError::EBADF);
         }
 
         return Ok(());
@@ -425,9 +432,9 @@ impl File {
             return Err(SystemError::EBADF);
         }
 
-        // 暂时认为只要不是read only, 就可写
-        if mode == FileMode::O_RDONLY {
-            return Err(SystemError::EPERM);
+        // O_RDONLY cannot be written
+        if mode.accmode() == FileMode::O_RDONLY.accmode() {
+            return Err(SystemError::EBADF);
         }
 
         return Ok(());
@@ -532,6 +539,13 @@ impl File {
     #[inline]
     pub fn set_close_on_exec(&self, close_on_exec: bool) {
         self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
+    }
+
+    /// @brief 设置文件偏移量（仅用于O_APPEND等内部操作）
+    ///
+    /// @param offset 新的文件偏移量
+    pub fn set_offset(&self, offset: usize) {
+        self.offset.store(offset, Ordering::SeqCst);
     }
 
     pub fn set_mode(&self, mut mode: FileMode) -> Result<(), SystemError> {

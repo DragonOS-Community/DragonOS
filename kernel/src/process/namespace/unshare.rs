@@ -88,11 +88,10 @@ fn check_unshare_flags(flags: CloneFlags) -> Result<(), SystemError> {
 
     // 如果请求 unshare CLONE_SIGHAND 或 CLONE_VM，
     // 必须确保信号处理结构的引用计数为1
-    if flags.intersects(CloneFlags::CLONE_SIGHAND | CloneFlags::CLONE_VM) {
-        let sighand_count = current_pcb.sighand().load_count();
-        if sighand_count > 1 {
-            return Err(SystemError::EINVAL);
-        }
+    if flags.intersects(CloneFlags::CLONE_SIGHAND | CloneFlags::CLONE_VM)
+        && current_pcb.sighand().is_shared()
+    {
+        return Err(SystemError::EINVAL);
     }
 
     // TODO: 如果请求 unshare CLONE_VM，

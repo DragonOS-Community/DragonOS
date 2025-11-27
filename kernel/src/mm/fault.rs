@@ -119,6 +119,7 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
+    #[inline(never)]
     pub unsafe fn handle_mm_fault(mut pfm: PageFaultMessage) -> VmFaultReason {
         let flags = pfm.flags();
         let vma = pfm.vma();

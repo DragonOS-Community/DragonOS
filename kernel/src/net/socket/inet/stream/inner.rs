@@ -402,6 +402,10 @@ impl Established {
         self.inner.with_mut(f)
     }
 
+    pub fn iface(&self) -> &Arc<dyn crate::driver::net::Iface> {
+        self.inner.iface()
+    }
+
     pub fn close(&self) {
         self.inner
             .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
@@ -429,14 +433,11 @@ impl Established {
                 if socket.can_recv() {
                     match socket.recv_slice(buf) {
                         Ok(size) => Ok(size),
-                        Err(tcp::RecvError::InvalidState) => {
-                            log::error!("TcpSocket::try_recv: InvalidState");
-                            Err(SystemError::ENOTCONN)
-                        }
+                        Err(tcp::RecvError::InvalidState) => Err(SystemError::ENOTCONN),
                         Err(tcp::RecvError::Finished) => Ok(0),
                     }
                 } else {
-                    Err(SystemError::ENOBUFS)
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                 }
             })
     }
@@ -449,7 +450,7 @@ impl Established {
                         .send_slice(buf)
                         .map_err(|_| SystemError::ECONNABORTED)
                 } else {
-                    Err(SystemError::ENOBUFS)
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                 }
             })
     }

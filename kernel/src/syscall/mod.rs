@@ -27,6 +27,7 @@ use self::{misc::SysInfo, user_access::UserBufferWriter};
 pub mod misc;
 pub mod table;
 pub mod user_access;
+pub mod user_buffer;
 
 // 与linux不一致的调用，在linux基础上累加
 pub const SYS_PUT_STRING: usize = 100000;
@@ -343,29 +344,10 @@ impl Syscall {
 
             SYS_SCHED_YIELD => Self::do_sched_yield(),
 
-            SYS_SCHED_GETAFFINITY => {
-                let pid = args[0] as i32;
-                let size = args[1];
-                let set_vaddr = args[2];
-
-                let mut user_buffer_writer =
-                    UserBufferWriter::new(set_vaddr as *mut u8, size, frame.is_from_user())?;
-                let set: &mut [u8] = user_buffer_writer.buffer(0)?;
-
-                Self::getaffinity(pid, set)
-            }
-
             SYS_FADVISE64 => {
                 // todo: 这个系统调用还没有实现
 
                 Err(SystemError::ENOSYS)
-            }
-
-            // SYS_SCHED_YIELD => Self::sched_yield(),
-            SYS_PRCTL => {
-                // todo: 这个系统调用还没有实现
-
-                Err(SystemError::EINVAL)
             }
 
             #[cfg(target_arch = "x86_64")]

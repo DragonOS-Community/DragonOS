@@ -35,20 +35,18 @@ pub(super) fn do_kernel_sigaction(
     old_act: usize,
     from_user: bool,
 ) -> Result<usize, SystemError> {
-    // 请注意：用户态传进来的user_sigaction结构体类型，请注意，这个结构体与内核实际的不一样
-    let act: *mut UserSigaction = new_act as *mut UserSigaction;
-    let old_act = old_act as *mut UserSigaction;
     let mut new_ka: Sigaction = Default::default();
     let mut old_sigaction: Sigaction = Default::default();
     // 如果传入的，新的sigaction不为空
-    if !act.is_null() {
-        // 如果参数的范围不在用户空间，则返回错误
-        let r = UserBufferWriter::new(act, core::mem::size_of::<Sigaction>(), from_user);
-        if r.is_err() {
-            return Err(SystemError::EFAULT);
-        }
-        let mask: SigSet = unsafe { (*act).mask };
-        let input_sighandler = unsafe { (*act).handler as u64 };
+    if new_act != 0 {
+        let mut act_writer = UserBufferWriter::new(
+            new_act as *mut UserSigaction,
+            core::mem::size_of::<UserSigaction>(),
+            from_user,
+        )?;
+        let act: UserSigaction = act_writer.buffer_protected(0)?.read_one(0)?;
+        let mask: SigSet = act.mask;
+        let input_sighandler = act.handler as u64;
 
         let sig = Signal::from(sig);
         // Linux 只判断 sig 是否合法
@@ -60,13 +58,13 @@ pub(super) fn do_kernel_sigaction(
         match input_sighandler {
             USER_SIG_DFL => {
                 new_ka = Sigaction::DEFAULT_SIGACTION;
-                *new_ka.flags_mut() = unsafe { (*act).flags };
+                *new_ka.flags_mut() = act.flags;
                 new_ka.set_restorer(None);
             }
 
             USER_SIG_IGN => {
                 new_ka = Sigaction::DEFAULT_SIGACTION_IGNORE;
-                *new_ka.flags_mut() = unsafe { (*act).flags };
+                *new_ka.flags_mut() = act.flags;
 
                 new_ka.set_restorer(None);
             }
@@ -74,12 +72,12 @@ pub(super) fn do_kernel_sigaction(
                 // 从用户空间获得sigaction结构体
                 // TODO mask是default还是用户空间传入
                 new_ka = Sigaction::new(
-                    SigactionType::SaHandler(SaHandlerType::Customized(unsafe {
-                        VirtAddr::new((*act).handler as usize)
-                    })),
-                    unsafe { (*act).flags },
+                    SigactionType::SaHandler(SaHandlerType::Customized(VirtAddr::new(
+                        input_sighandler as usize,
+                    ))),
+                    act.flags,
                     SigSet::default(),
-                    unsafe { Some(VirtAddr::new((*act).restorer as usize)) },
+                    Some(VirtAddr::new(act.restorer as usize)),
                 );
             }
         }
@@ -107,23 +105,24 @@ pub(super) fn do_kernel_sigaction(
 
     let retval = super::super::sighand::do_sigaction(
         sig,
-        if act.is_null() {
+        if new_act == 0 {
             None
         } else {
             Some(&mut new_ka)
         },
-        if old_act.is_null() {
+        if old_act == 0 {
             None
         } else {
             Some(&mut old_sigaction)
         },
     );
 
-    if (retval == Ok(())) && (!old_act.is_null()) {
-        let r = UserBufferWriter::new(old_act, core::mem::size_of::<UserSigaction>(), from_user);
-        if r.is_err() {
-            return Err(SystemError::EFAULT);
-        }
+    if (retval == Ok(())) && (old_act != 0) {
+        let mut old_act_writer = UserBufferWriter::new(
+            old_act as *mut UserSigaction,
+            core::mem::size_of::<UserSigaction>(),
+            from_user,
+        )?;
 
         let sigaction_handler = match old_sigaction.action() {
             SigactionType::SaHandler(handler) => {
@@ -142,15 +141,17 @@ pub(super) fn do_kernel_sigaction(
                 VirtAddr::new(USER_SIG_DFL as usize)
             }
         };
+        let mut old_act_buf = old_act_writer.buffer_protected(0)?;
 
-        unsafe {
-            (*old_act).handler = sigaction_handler.data() as *mut c_void;
-            (*old_act).flags = old_sigaction.flags();
-            (*old_act).mask = old_sigaction.mask();
-            if old_sigaction.restorer().is_some() {
-                (*old_act).restorer = old_sigaction.restorer().unwrap().data() as *mut c_void;
-            }
+        let mut old_act: UserSigaction = old_act_buf.read_one::<UserSigaction>(0)?;
+
+        old_act.handler = sigaction_handler.data() as *mut c_void;
+        old_act.flags = old_sigaction.flags();
+        old_act.mask = old_sigaction.mask();
+        if old_sigaction.restorer().is_some() {
+            old_act.restorer = old_sigaction.restorer().unwrap().data() as *mut c_void;
         }
+        old_act_buf.write_one(0, &old_act)?;
     }
     compiler_fence(Ordering::SeqCst);
     return retval.map(|_| 0);

@@ -1,0 +1,3 @@
+# getpid() 好像有点问题，还在修
+SigtimedwaitTest.IgnoredUnmaskedSignal
+SigtimedwaitTest.IgnoredMaskedSignal

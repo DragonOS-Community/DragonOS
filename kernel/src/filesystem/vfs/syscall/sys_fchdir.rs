@@ -4,7 +4,6 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_FCHDIR;
-use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -40,9 +39,11 @@ impl Syscall for SysFchdirHandle {
             .get_file_by_fd(fd)
             .ok_or(SystemError::EBADF)?;
         let inode = file.inode();
-        if inode.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
+        let metadata = inode.metadata()?;
+
+        let cred = pcb.cred();
+        cred.check_chdir_permission(&metadata)?;
+
         let path = inode.absolute_path()?;
         pcb.basic_mut().set_cwd(path);
         pcb.fs_struct_mut().set_pwd(inode);

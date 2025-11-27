@@ -13,7 +13,7 @@ use crate::{
         mm::{MemoryManagementArch, X86_64MMArch},
         CurrentIrqArch, MMArch,
     },
-    exception::InterruptArch,
+    exception::{extable::ExceptionTableManager, InterruptArch},
     ipc::signal_types::{SigCode, SigInfo, SigType},
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
@@ -66,11 +66,7 @@ impl X86_64MMArch {
         false
     }
 
-    pub fn show_fault_oops(
-        regs: &'static TrapFrame,
-        error_code: X86PfErrorCode,
-        address: VirtAddr,
-    ) {
+    pub fn show_fault_oops(regs: &TrapFrame, error_code: X86PfErrorCode, address: VirtAddr) {
         let mapper =
             unsafe { PageMapper::current(crate::mm::PageTableKind::User, LockedFrameAllocator) };
         if let Some(entry) = mapper.get_entry(address, 0) {
@@ -131,11 +127,7 @@ impl X86_64MMArch {
         );
     }
 
-    pub fn page_fault_oops(
-        regs: &'static TrapFrame,
-        error_code: X86PfErrorCode,
-        address: VirtAddr,
-    ) {
+    pub fn page_fault_oops(regs: &TrapFrame, error_code: X86PfErrorCode, address: VirtAddr) {
         if regs.is_from_user() {
             Self::show_fault_oops(regs, error_code, address);
         }
@@ -149,10 +141,16 @@ impl X86_64MMArch {
     /// - `error_code`: 错误标志
     /// - `address`: 发生缺页异常的虚拟地址
     pub fn do_kern_addr_fault(
-        regs: &'static TrapFrame,
+        regs: &'static mut TrapFrame,
         error_code: X86PfErrorCode,
         address: VirtAddr,
     ) {
+        // 尝试异常表修复
+        if Self::try_fixup_exception(regs, error_code, address) {
+            // 成功修复,直接返回
+            return;
+        }
+
         unsafe { crate::debug::traceback::lookup_kallsyms(regs.rip, 0xff) };
         let pcb = crate::process::ProcessManager::current_pcb();
         let kstack_guard_addr = pcb.kernel_stack().guard_page_address();
@@ -184,6 +182,40 @@ impl X86_64MMArch {
         //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/mm/fault.c#do_kern_addr_fault
     }
 
+    /// 尝试使用异常表修复页错误
+    ///
+    /// ## 返回值
+    /// - `true`: 成功修复,可以继续执行
+    /// - `false`: 无法修复,是真正的内核错误
+    #[inline(never)]
+    fn try_fixup_exception(
+        regs: &mut TrapFrame,
+        _error_code: X86PfErrorCode,
+        address: VirtAddr,
+    ) -> bool {
+        // 只处理用户空间地址的访问错误
+        if !address.check_user() {
+            return false;
+        }
+
+        // 在异常表中查找修复代码
+        if let Some(fixup_addr) = ExceptionTableManager::search_exception_table(regs.rip as usize) {
+            // log::debug!(
+            //     "Page fault at {:#x} accessing user address {:#x}, fixed up to {:#x}",
+            //     regs.rip,
+            //     address.data(),
+            //     fixup_addr
+            // );
+
+            // 修改trap frame的RIP到修复代码
+            regs.rip = fixup_addr as u64;
+
+            return true;
+        }
+
+        false
+    }
+
     /// 用户态缺页异常处理
     /// ## 参数
     ///
@@ -191,7 +223,7 @@ impl X86_64MMArch {
     /// - `error_code`: 错误标志
     /// - `address`: 发生缺页异常的虚拟地址
     pub unsafe fn do_user_addr_fault(
-        regs: &'static TrapFrame,
+        regs: &'static mut TrapFrame,
         error_code: X86PfErrorCode,
         address: VirtAddr,
     ) {
@@ -255,6 +287,25 @@ impl X86_64MMArch {
                 .expect("failed to send SIGSEGV to process");
         };
 
+        // 辅助函数：处理内核访问用户地址失败的情况
+        let handle_kernel_access_failed = |r: &mut TrapFrame| {
+            // 如果是内核代码访问用户地址，尝试异常表修复
+            if !r.is_from_user() {
+                if Self::try_fixup_exception(r, error_code, address) {
+                    return true; // 成功修复
+                }
+                // 如果异常表中没有，说明是bug
+                error!(
+                    "Kernel code at {:#x} illegally accessed user address {:#x} \
+                     without exception table entry",
+                    r.rip,
+                    address.data()
+                );
+                panic!("Illegal user space access from kernel");
+            }
+            false // 不是内核访问，继续正常流程
+        };
+
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
         let mut space_guard = current_address_space.write_irqsave();
         let mut fault;
@@ -270,6 +321,12 @@ impl X86_64MMArch {
                         address.data(),
                         regs.rip,
                     );
+
+                    // VMA不存在，检查是否需要异常表修复
+                    if handle_kernel_access_failed(regs) {
+                        return; // 已通过异常表修复
+                    }
+
                     send_segv();
                     return;
                 }
@@ -289,6 +346,12 @@ impl X86_64MMArch {
                             error_code,
                             address.data(),
                         );
+
+                        // 栈溢出，检查是否需要异常表修复
+                        if handle_kernel_access_failed(regs) {
+                            return; // 已通过异常表修复
+                        }
+
                         send_segv();
                         return;
                     }
@@ -312,17 +375,28 @@ impl X86_64MMArch {
                     );
                     log::error!("fault rip: {:#x}", regs.rip);
 
+                    // 地址不在VMA范围内，检查是否需要异常表修复
+                    if handle_kernel_access_failed(regs) {
+                        return; // 已通过异常表修复
+                    }
+
                     send_segv();
                     return;
                 }
             }
 
             if unlikely(Self::vma_access_error(vma.clone(), error_code)) {
+                // VMA权限错误，检查是否需要异常表修复
+                if handle_kernel_access_failed(regs) {
+                    return; // 已通过异常表修复
+                }
+
                 log::error!(
                     "vma access error, error_code: {:?}, address: {:#x}",
                     error_code,
                     address.data(),
                 );
+
                 send_segv();
             }
             let mapper = &mut space_guard.user_mapper.utable;

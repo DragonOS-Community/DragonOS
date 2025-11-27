@@ -12,6 +12,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::syscall::RenameFlags,
     libs::{
         casting::DowncastArc,
         rwlock::RwLock,
@@ -227,6 +228,7 @@ impl IndexNode for KernFSInode {
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
+        _flags: RenameFlags,
     ) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
         return Err(SystemError::ENOSYS);

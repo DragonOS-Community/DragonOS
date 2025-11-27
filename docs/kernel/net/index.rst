@@ -7,3 +7,4 @@ DragonOS 网络子系统
 
    inet
    unix
+   ssh

@@ -2,7 +2,7 @@
 use core::intrinsics::unlikely;
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
-use log::{error, warn};
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -313,7 +313,7 @@ impl WaitQueue {
 
             if wake {
                 ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
-                    error!("wakeup pid: {:?} error: {:?}", to_wakeup.raw_pid(), e);
+                    log::debug!("wakeup pid: {:?} error: {:?}", to_wakeup.raw_pid(), e);
                 });
                 continue;
             } else {

@@ -272,16 +272,18 @@ pub(super) fn do_futex(
             );
         }
         FutexArg::FUTEX_LOCK_PI => {
-            todo!()
+            return Futex::futex_lock_pi(uaddr, flags, timeout);
         }
         FutexArg::FUTEX_LOCK_PI2 => {
-            todo!()
+            // FUTEX_LOCK_PI2 与 FUTEX_LOCK_PI 行为相同，只是支持 FUTEX_CLOCK_REALTIME
+            // 超时处理已在上层完成，这里直接调用 futex_lock_pi
+            return Futex::futex_lock_pi(uaddr, flags, timeout);
         }
         FutexArg::FUTEX_UNLOCK_PI => {
-            todo!()
+            return Futex::futex_unlock_pi(uaddr, flags);
         }
         FutexArg::FUTEX_TRYLOCK_PI => {
-            todo!()
+            return Futex::futex_trylock_pi(uaddr, flags);
         }
         FutexArg::FUTEX_WAIT_REQUEUE_PI => {
             todo!()

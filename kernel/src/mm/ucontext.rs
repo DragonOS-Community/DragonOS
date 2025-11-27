@@ -62,18 +62,33 @@ pub const DEFAULT_MMAP_MIN_ADDR: usize = 65536;
 static LOCKEDVMA_ID_ALLOCATOR: SpinLock<IdAllocator> =
     SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap());
 
+/// AddressSpace的全局唯一ID分配器
+/// 用于为每个地址空间分配一个全局唯一且递增的ID
+static ADDRESS_SPACE_ID_ALLOCATOR: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug)]
 pub struct AddressSpace {
+    /// 全局唯一的地址空间ID，用于标识不同的地址空间
+    /// 该ID在地址空间的整个生命周期内保持不变，且永不重复
+    id: u64,
     inner: RwLock<InnerAddressSpace>,
 }
 
 impl AddressSpace {
     pub fn new(create_stack: bool) -> Result<Arc<Self>, SystemError> {
         let inner = InnerAddressSpace::new(create_stack)?;
+        let id = ADDRESS_SPACE_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
         let result = Self {
+            id,
             inner: RwLock::new(inner),
         };
         return Ok(Arc::new(result));
+    }
+
+    /// 获取地址空间的全局唯一ID
+    #[inline(always)]
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// 从pcb中获取当前进程的地址空间结构体的Arc指针

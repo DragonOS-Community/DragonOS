@@ -104,6 +104,12 @@ impl TrapFrame {
         loongArch64::register::crmd::Crmd::from(self.csr_crmd).plv() == CpuMode::Ring3
     }
 
+    /// 返回当前 TrapFrame 对应的用户态栈指针。
+    #[inline(always)]
+    pub fn stack_pointer(&self) -> usize {
+        self.usp as usize
+    }
+
     #[inline(never)]
     pub const fn new() -> Self {
         let x = core::mem::MaybeUninit::<Self>::zeroed();

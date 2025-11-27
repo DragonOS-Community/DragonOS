@@ -216,10 +216,10 @@ fn do_select(
 fn convert_rwe_to_events(readable: bool, writable: bool, except: bool) -> EPollEventType {
     let mut events = EPollEventType::empty();
     if readable {
-        events |= EPollEventType::EPOLLIN;
+        events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLHUP | EPollEventType::EPOLLERR;
     }
     if writable {
-        events |= EPollEventType::EPOLLOUT;
+        events |= EPollEventType::EPOLLOUT | EPollEventType::EPOLLERR;
     }
     if except {
         events |= EPollEventType::EPOLLPRI;

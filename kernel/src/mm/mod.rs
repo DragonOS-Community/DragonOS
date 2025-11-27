@@ -33,6 +33,7 @@ pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
 pub mod percpu;
+pub mod readahead;
 pub mod syscall;
 pub mod sysfs;
 pub mod truncate;
@@ -554,13 +555,13 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// @brief 读取指定虚拟地址的值，并假设它是类型T的指针
     #[inline(always)]
-    unsafe fn read<T>(address: VirtAddr) -> T {
+    unsafe fn read<T: Sized>(address: VirtAddr) -> T {
         return ptr::read(address.data() as *const T);
     }
 
     /// @brief 将value写入到指定的虚拟地址
     #[inline(always)]
-    unsafe fn write<T>(address: VirtAddr, value: T) {
+    unsafe fn write<T: Sized>(address: VirtAddr, value: T) {
         ptr::write(address.data() as *mut T, value);
     }
 
@@ -706,6 +707,40 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// 禁用 内核态的 Write Protect
     fn disable_kernel_wp();
+
+    /// 带异常表保护的内存拷贝
+    ///
+    /// 这个函数使用内联汇编实现，并在可能出错的指令处添加异常表条目。
+    /// 当发生页错误时，异常表会将RIP修复到错误处理代码。
+    ///
+    /// ## 返回值
+    /// - 0: 成功
+    /// - 其他值： 剩余未拷贝的字节数
+    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        // 对于不支持异常表的架构，直接使用普通的内存拷贝
+        ptr::copy_nonoverlapping(src, dst, len);
+        0
+    }
+
+    /// 带异常表保护的内存设置（memset）
+    ///
+    /// 将 `len` 字节的内存设置为指定的值 `value`。
+    /// 这个函数使用内联汇编实现，并在可能出错的指令处添加异常表条目。
+    /// 当发生页错误时，异常表会将RIP修复到错误处理代码。
+    ///
+    /// ## 参数
+    /// - `dst`: 目标地址
+    /// - `value`: 要设置的字节值
+    /// - `len`: 要设置的字节数
+    ///
+    /// ## 返回值
+    /// - 0: 成功
+    /// - 其他值： 剩余未设置的字节数
+    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
+        // 对于不支持异常表的架构，直接使用普通的内存设置
+        ptr::write_bytes(dst, value, len);
+        0
+    }
 }
 
 /// @brief 虚拟地址范围

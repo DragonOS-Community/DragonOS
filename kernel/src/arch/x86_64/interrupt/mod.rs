@@ -185,6 +185,12 @@ impl TrapFrame {
         self.rip = pc as u64;
     }
 
+    /// 返回当前 TrapFrame 对应的用户态栈指针。
+    #[inline(always)]
+    pub fn stack_pointer(&self) -> usize {
+        self.rsp as usize
+    }
+
     /// 获取系统调用号
     ///
     /// # Safety

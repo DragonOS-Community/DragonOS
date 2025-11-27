@@ -20,7 +20,9 @@ impl Syscall for SysExitGroup {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let exit_code = Self::exit_code(args);
-        ProcessManager::exit((exit_code & 0xff) << 8);
+        // 仿照 Linux sys_exit_group：只取低 8 位并左移 8 位，形成 wstatus 编码，
+        // 然后触发线程组整体退出。
+        ProcessManager::group_exit((exit_code & 0xff) << 8);
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

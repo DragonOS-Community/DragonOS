@@ -1,8 +1,8 @@
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use core::ffi::{c_int, c_void};
+use core::ffi::c_void;
 
-use crate::arch::interrupt::TrapFrame;
+use crate::arch::{interrupt::TrapFrame, ipc::signal::SigStackFlags};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{arch::syscall::nr::SYS_SIGALTSTACK, process::ProcessManager};
@@ -10,23 +10,16 @@ use system_error::SystemError;
 
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 
+// 最小信号栈大小
+const MINSIGSTKSZ: usize = 2048;
+
 /// C 中定义的信号栈, 等于 C 中的 stack_t
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct StackUser {
-    pub ss_sp: *mut c_void, // 栈的基地址
-    pub ss_flags: c_int,    // 标志
-    pub ss_size: usize,     // 栈的字节数
-}
-
-impl StackUser {
-    pub fn new() -> Self {
-        Self {
-            ss_sp: core::ptr::null_mut(),
-            ss_flags: 0,
-            ss_size: 0,
-        }
-    }
+    pub ss_sp: *mut c_void,      // 栈的基地址
+    pub ss_flags: SigStackFlags, // 标志
+    pub ss_size: usize,          // 栈的字节数
 }
 
 pub struct SysAltStackHandle;
@@ -49,7 +42,7 @@ impl Syscall for SysAltStackHandle {
         2
     }
 
-    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         //warn!("SYS_SIGALTSTACK has not yet been fully realized and still needs to be supplemented");
         //warn!("SYS_SIGALTSTACK has not yet been fully realized and still needs to be supplemented");
         //warn!("SYS_SIGALTSTACK has not yet been fully realized and still needs to be supplemented");
@@ -57,33 +50,60 @@ impl Syscall for SysAltStackHandle {
         let ss = Self::ss(args);
         let old_ss = Self::old_ss(args);
 
-        let binding = ProcessManager::current_pcb();
-        let mut stack = binding.sig_altstack_mut();
+        let pcb = ProcessManager::current_pcb();
+        let mut stack = pcb.sig_altstack_mut();
+        let is_on_stack = stack.on_sig_stack(frame.stack_pointer());
 
         if !old_ss.is_null() {
-            // 需要从 current() 中读结构体写入 old_ss
-            //log::info!("old_ss impl");
-            let mut temp = StackUser::new();
+            let mut old_stack_user = StackUser {
+                ss_sp: stack.sp as *mut c_void,
+                ss_size: stack.size as usize,
+                ..Default::default()
+            };
 
-            temp.ss_sp = stack.sp as *mut c_void;
-            temp.ss_size = stack.size as usize;
-            // temp.ss_flags = 0; 这个要根据情况设置
+            if stack.size == 0 {
+                old_stack_user.ss_flags = SigStackFlags::SS_DISABLE;
+            } else if is_on_stack {
+                old_stack_user.ss_flags = SigStackFlags::SS_ONSTACK;
+            } else {
+                // 栈已启用但当前不在其上
+                old_stack_user.ss_flags = stack.flags; // 保留 SS_AUTODISARM 等标志
+            }
 
-            let mut user_buffer = UserBufferWriter::new(old_ss, size_of::<StackUser>(), true)?;
-            user_buffer.copy_one_to_user(&temp, 0)?;
+            let mut writer = UserBufferWriter::new(old_ss, size_of::<StackUser>(), true)?;
+            writer.copy_one_to_user(&old_stack_user, 0)?;
         }
 
         if !ss.is_null() {
-            // 需要向 current() 中结构体写入 ss 的内容
-            //log::info!("ss impl");
+            if is_on_stack {
+                return Err(SystemError::EPERM);
+            }
 
-            let user_buffer = UserBufferReader::new(ss, size_of::<StackUser>(), true)?;
-            let sus: &[StackUser] = user_buffer.read_from_user(0)?;
+            let reader = UserBufferReader::new(ss, size_of::<StackUser>(), true)?;
+            let sus: &[StackUser] = reader.read_from_user(0)?;
             let ss: StackUser = sus[0];
 
-            stack.sp = ss.ss_sp as usize;
-            stack.size = ss.ss_size as u32;
-            stack.flags = ss.ss_flags as u32;
+            if !ss
+                .ss_flags
+                .difference(SigStackFlags::SS_DISABLE | SigStackFlags::SS_AUTODISARM)
+                .is_empty()
+            {
+                return Err(SystemError::EINVAL);
+            }
+            // 如果用户请求禁用备用栈
+            if ss.ss_flags.contains(SigStackFlags::SS_DISABLE) {
+                stack.sp = 0;
+                stack.flags = SigStackFlags::SS_DISABLE;
+                stack.size = 0;
+            } else {
+                // 如果用户请求设置一个新的栈
+                if ss.ss_size < MINSIGSTKSZ {
+                    return Err(SystemError::ENOMEM);
+                }
+                stack.sp = ss.ss_sp as usize;
+                stack.flags = ss.ss_flags; // 保留 SS_AUTODISARM 等标志
+                stack.size = ss.ss_size as u32;
+            }
         }
         Ok(0)
     }

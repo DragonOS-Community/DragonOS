@@ -6,7 +6,7 @@ English
 
    - Source document: index.rst
 
-   - Translation time: 2025-09-11 16:37:17
+   - Translation time: 2025-11-22 06:50:01
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -47,6 +47,7 @@ English
    kernel/net/index
    kernel/trace/index
    kernel/syscall/index
+   kernel/device/index
 
 .. toctree::
    :maxdepth: 1

@@ -7,9 +7,13 @@ use crate::{
         interrupt::TrapFrame,
         syscall::nr::{SYS_SYNC, SYS_SYNCFS},
     },
+    filesystem::vfs::file::FileMode,
     mm::page::page_reclaimer_lock_irqsave,
+    process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
+
+use system_error::SystemError;
 
 /// sync() causes all pending modifications to filesystem metadata and
 /// cached file data to be written to the underlying filesystems.
@@ -52,9 +56,28 @@ impl Syscall for SysSyncFsHandle {
 
     fn handle(
         &self,
-        _args: &[usize],
+        args: &[usize],
         _frame: &mut TrapFrame,
     ) -> Result<usize, system_error::SystemError> {
+        let fd = args[0] as i32;
+
+        // Get the file descriptor table
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        // Validate that the fd exists
+        let file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+
+        // Check if the file descriptor was opened with O_PATH
+        if file.mode().contains(FileMode::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
         // TODO: now, we ignore the fd and sync all filesystems.
         // In the future, we should sync only the filesystem of the given fd.
         page_reclaimer_lock_irqsave().flush_dirty_pages();

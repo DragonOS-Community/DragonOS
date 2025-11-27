@@ -1673,7 +1673,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             let core = tty.core();
             if !ldata.input_available(core.termios(), false) {
                 if core.flags().contains(TtyFlag::OTHER_CLOSED) {
-                    ret = Err(SystemError::EIO);
+                    // 对端已关闭且无数据可读，返回EOF而不是EIO，符合常规PTY语义
+                    ret = Ok(0);
                     break;
                 }
 
@@ -1779,7 +1780,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
                 return Err(SystemError::ERESTARTSYS);
             }
-            if core.flags().contains(TtyFlag::HUPPED) {
+            if core.flags().contains(TtyFlag::HUPPED)
+                || core.flags().contains(TtyFlag::OTHER_CLOSED)
+                || core.flags().contains(TtyFlag::HUPPING)
+            {
                 return Err(SystemError::EIO);
             }
             if termios.output_mode.contains(OutputMode::OPOST) {

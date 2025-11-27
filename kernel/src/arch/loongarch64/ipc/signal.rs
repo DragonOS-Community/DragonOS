@@ -1,12 +1,13 @@
 use crate::arch::interrupt::TrapFrame;
 pub use crate::ipc::generic_signal::AtomicGenericSignal as AtomicSignal;
 pub use crate::ipc::generic_signal::GenericSigChildCode as SigChildCode;
+pub use crate::ipc::generic_signal::GenericSigFlags as SigFlags;
 pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
+pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
+
 pub use crate::ipc::generic_signal::GENERIC_MAX_SIG_NUM as MAX_SIG_NUM;
 pub use crate::ipc::generic_signal::GENERIC_STACK_ALIGN as STACK_ALIGN;
-
-pub use crate::ipc::generic_signal::GenericSigFlags as SigFlags;
 
 use crate::ipc::signal_types::SignalArch;
 
@@ -30,7 +31,7 @@ impl SignalArch for LoongArch64SignalArch {
 #[derive(Debug, Clone, Copy)]
 pub struct LoongArch64SigStack {
     pub sp: usize,
-    pub flags: u32,
+    pub flags: SigStackFlags,
     pub size: u32,
 }
 
@@ -38,9 +39,15 @@ impl LoongArch64SigStack {
     pub fn new() -> Self {
         Self {
             sp: 0,
-            flags: 0,
+            flags: SigStackFlags::SS_DISABLE,
             size: 0,
         }
+    }
+
+    /// 检查给定的栈指针 `sp` 是否在当前备用信号栈的范围内。
+    #[inline]
+    pub fn on_sig_stack(&self, sp: usize) -> bool {
+        self.sp != 0 && self.size != 0 && (sp.wrapping_sub(self.sp) < self.size as usize)
     }
 }
 

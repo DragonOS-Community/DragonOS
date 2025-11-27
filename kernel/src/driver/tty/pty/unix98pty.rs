@@ -10,7 +10,7 @@ use crate::{
     },
     filesystem::{
         devpts::DevPtsFs,
-        epoll::EPollEventType,
+        epoll::{event_poll::EventPoll, EPollEventType},
         vfs::{
             file::FileMode, syscall::ModeType, FilePrivateData, FileType, MountFS,
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -77,12 +77,10 @@ impl TtyOperation for Unix98PtyDriverInner {
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<(), SystemError> {
         let core = tty.core();
         if core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster {
-            log::warn!("Unix98PtyDriver: ioctl called on non-pty master");
-            // return Err(SystemError::ENOIOCTLCMD);
-            // todo: implement other ioctl commands
-            return Ok(());
+            // TODO:implement other ioctl commands
+            // log::warn!("Unix98PtyDriver: ioctl called on non-pty master: {cmd:#x}");
+            return Err(SystemError::ENOIOCTLCMD);
         }
-
         match cmd {
             TtyIoctlCmd::TIOCSPTLCK => {
                 return PtyCommon::pty_set_lock(core, VirtAddr::new(arg));
@@ -103,10 +101,9 @@ impl TtyOperation for Unix98PtyDriverInner {
                 return user_writer.copy_one_to_user(&(core.index() as u32), 0);
             }
             _ => {
-                log::warn!("Unix98PtyDriver: Unsupported ioctl cmd: {cmd:#x}");
-                // return Err(SystemError::ENOIOCTLCMD);
-                // todo: implement other ioctl commands
-                return Ok(());
+                // TODO: implement other ioctl commands
+                // log::error!("Unix98PtyDriver: Unsupported ioctl cmd: {cmd:#x}");
+                return Err(SystemError::ENOIOCTLCMD);
             }
         }
     }
@@ -229,6 +226,17 @@ impl TtyOperation for Unix98PtyDriverInner {
             let pts_root_inode =
                 root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
             let _ = pts_root_inode.unlink(&tty.core().index().to_string());
+            if let Some(link) = tty.core().link() {
+                let link_core = link.core();
+                // set OTHER_CLOSED flag to tell master side that the slave side is closed
+                link_core.flags_write().insert(TtyFlag::OTHER_CLOSED);
+                // wake up waiting read/write queues on master side
+                link_core.read_wq().wakeup_all();
+                link_core.write_wq().wakeup_all();
+                // wake up epoll events
+                let epitems = link_core.epitems();
+                let _ = EventPoll::wakeup_epoll(epitems, EPollEventType::EPOLLHUP);
+            }
         }
 
         Ok(())

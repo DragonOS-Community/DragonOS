@@ -1,16 +1,16 @@
+use crate::filesystem::vfs::syscall::RenameFlags;
 use alloc::string::ToString;
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::cmp::Ordering;
 use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
 use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
-
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
 
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
@@ -265,13 +265,29 @@ impl LockedFATInode {
         &self,
         old_name: &str,
         new_name: &str,
+        flags: RenameFlags,
     ) -> Result<(), SystemError> {
+        if old_name == new_name {
+            return Ok(());
+        }
         let mut guard = self.0.lock();
         let old_inode = guard.find(old_name)?;
-        // 对目标inode上锁，以防更改
-        let old_inode_guard = old_inode.0.lock();
-        let fs = old_inode_guard.fs.upgrade().unwrap();
+        let new_inode = guard.find(new_name).ok();
+        if flags.contains(RenameFlags::NOREPLACE) && new_inode.is_some() {
+            return Err(SystemError::EEXIST);
+        }
 
+        if flags.contains(RenameFlags::EXCHANGE) {
+            if new_inode.is_none() {
+                return Err(SystemError::ENOENT);
+            }
+            // TODO: Implement EXCHANGE logic
+            return Err(SystemError::EINVAL);
+        }
+
+        // 对目标inode上锁，以防更改
+        let mut old_inode_guard = old_inode.0.lock();
+        let fs = old_inode_guard.fs.upgrade().unwrap();
         let old_dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
@@ -282,10 +298,8 @@ impl LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         };
-
         // remove entries
-        old_dir.rename(fs, old_name, new_name)?;
-
+        old_inode_guard.inode_type = old_dir.rename(fs, old_name, new_name, new_inode)?;
         let old_inode = guard.children.remove(&to_search_name(old_name)).unwrap();
         // the new_name should refer to old_inode
         guard.children.insert(to_search_name(new_name), old_inode);
@@ -299,18 +313,33 @@ impl LockedFATInode {
         old_name: &str,
         new_name: &str,
         target: &Arc<dyn IndexNode>,
+        flags: RenameFlags,
     ) -> Result<(), SystemError> {
         let mut old_guard = self.0.lock();
         let other: &LockedFATInode = target
             .downcast_ref::<LockedFATInode>()
             .ok_or(SystemError::EPERM)?;
 
-        let new_guard = other.0.lock();
+        let mut new_guard = other.0.lock();
         let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
-        // 对目标inode上锁，以防更改
-        let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
-        let fs = old_inode_guard.fs.upgrade().unwrap();
+        let new_inode = new_guard.find(new_name);
 
+        if flags.contains(RenameFlags::NOREPLACE) && new_inode.is_ok() {
+            return Err(SystemError::EEXIST);
+        }
+
+        if flags.contains(RenameFlags::EXCHANGE) {
+            if new_inode.is_err() {
+                return Err(SystemError::ENOENT);
+            }
+            // TODO: Implement EXCHANGE logic
+            return Err(SystemError::EINVAL);
+        }
+
+        // 对目标inode上锁，以防更改
+        let mut old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
+        // let new_inode_guard = new_inode.0.lock();
+        let fs = old_inode_guard.fs.upgrade().unwrap();
         let old_dir = match &old_guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                 return Err(SystemError::ENOTDIR);
@@ -331,12 +360,17 @@ impl LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         };
-        // 检查文件是否存在
-        old_dir.check_existence(old_name, Some(false), old_guard.fs.upgrade().unwrap())?;
-        old_dir.rename_across(fs, new_dir, old_name, new_name)?;
-        // 从缓存删除
-        let _nod = old_guard.children.remove(&to_search_name(old_name));
 
+        old_inode_guard.inode_type =
+            old_dir.rename_across(fs, new_dir, old_name, new_name, new_inode)?;
+        // 将源节点从父目录中删除
+        let old_inode = old_guard
+            .children
+            .remove(&to_search_name(old_name))
+            .unwrap();
+        new_guard
+            .children
+            .insert(to_search_name(new_name), old_inode);
         Ok(())
     }
 }
@@ -1900,14 +1934,15 @@ impl IndexNode for LockedFATInode {
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
+        flags: RenameFlags,
     ) -> Result<(), SystemError> {
         let old_id = self.metadata().unwrap().inode_id;
         let new_id = target.metadata().unwrap().inode_id;
         // 若在同一父目录下
         if old_id == new_id {
-            self.rename_file_in_current_dir(old_name, new_name)?;
+            self.rename_file_in_current_dir(old_name, new_name, flags)?;
         } else {
-            self.move_to_another_dir(old_name, new_name, target)?;
+            self.move_to_another_dir(old_name, new_name, target, flags)?;
         }
 
         return Ok(());

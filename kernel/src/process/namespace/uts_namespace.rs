@@ -11,7 +11,7 @@ use crate::init::version_info::get_kernel_build_info;
 use crate::libs::spinlock::SpinLockGuard;
 use crate::process::fork::CloneFlags;
 use crate::process::namespace::user_namespace::INIT_USER_NAMESPACE;
-use crate::process::namespace::NamespaceType;
+use crate::process::namespace::{NamespaceOps, NamespaceType};
 use crate::process::ProcessManager;
 use crate::{
     libs::spinlock::SpinLock,
@@ -106,6 +106,12 @@ pub struct UtsNamespace {
     /// 关联的 user namespace (权限判断使用)
     _user_ns: Arc<UserNamespace>,
     utsname: SpinLock<NewUtsName>,
+}
+
+impl NamespaceOps for UtsNamespace {
+    fn ns_common(&self) -> &NsCommon {
+        &self.ns_common
+    }
 }
 
 impl UtsNamespace {

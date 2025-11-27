@@ -119,9 +119,10 @@ impl ProcessManager {
 
         // 拷贝栈帧
         unsafe {
-            let usp = clone_args.stack;
-            if usp != 0 {
-                child_trapframe.sp = usp;
+            if clone_args.stack != 0 {
+                // stack 是栈的顶部（低地址），栈底需要加上 stack_size
+                // 注意：栈向下增长，所以 sp 应该指向高地址
+                child_trapframe.sp = clone_args.stack + clone_args.stack_size;
             }
             let trap_frame_ptr = trap_frame_vaddr.data() as *mut TrapFrame;
             *trap_frame_ptr = child_trapframe;

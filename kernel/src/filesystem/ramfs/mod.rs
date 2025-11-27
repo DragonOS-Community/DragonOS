@@ -1,6 +1,7 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
+use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
 use crate::register_mountable_fs;
@@ -440,6 +441,7 @@ impl IndexNode for LockedRamFSInode {
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
+        flags: RenameFlags,
     ) -> Result<(), SystemError> {
         let inode_to_move = self
             .find(old_name)?
@@ -455,6 +457,10 @@ impl IndexNode for LockedRamFSInode {
         let mut self_inode = self.0.lock();
         // 判断是否在同一目录下, 是则进行重命名
         if target_id == self_inode.metadata.inode_id {
+            if flags.contains(RenameFlags::NOREPLACE) && self_inode.children.contains_key(&new_name)
+            {
+                return Err(SystemError::EEXIST);
+            }
             self_inode.children.remove(&DName::from(old_name));
             self_inode.children.insert(new_name, inode_to_move);
             return Ok(());

@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::driver::base::kobject::KObject;
+use crate::driver::base::device::Device;
 
 use super::{global_default_rtc, sysfs::RtcGeneralDevice, utils::kobj2rtc_device, RtcTime};
 
@@ -10,7 +10,7 @@ pub fn rtc_read_time(general_dev: &Arc<RtcGeneralDevice>) -> Result<RtcTime, Sys
     let class_ops = general_dev.class_ops().ok_or(SystemError::EINVAL)?;
 
     let real_dev = general_dev
-        .parent()
+        .dev_parent()
         .and_then(|p| p.upgrade())
         .ok_or(SystemError::ENODEV)?;
 

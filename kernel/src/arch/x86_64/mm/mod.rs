@@ -393,6 +393,88 @@ impl MemoryManagementArch for X86_64MMArch {
             // log::debug!("CR0.WP bit disabled for kernel write protection");
         }
     }
+
+    /// 带异常表保护的内存拷贝
+    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        let mut result: usize;
+
+        core::arch::asm!(
+
+            // 标记为可能出错的访问点
+            "2:",
+            // 执行拷贝
+            "rep movsb",
+
+            // 正常完成,跳过错误处理
+            "jmp 3f",
+
+            // 错误处理: 将剩余未拷贝的字节数返回(rcx会输出出去)
+            "4:",
+
+            "3:",
+
+            // 添加异常表条目
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+
+            inout("rdi") dst => _,
+            inout("rsi") src => _,
+            inout("rcx") len => result,
+            options(att_syntax, nostack)
+        );
+
+        result
+    }
+
+    /// 带异常表保护的内存设置（memset）
+    ///
+    /// 参考 Asterinas 的实现和 Linux 内核的 memset_64.S
+    ///
+    /// ## 参数
+    /// - `dst`: 目标地址（rdi）
+    /// - `value`: 要设置的字节值
+    /// - `len`: 要设置的字节数
+    ///
+    /// ## 返回值
+    /// - 0: 成功
+    /// - -1: 发生页错误
+    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
+        let mut result: usize;
+
+        core::arch::asm!(
+
+            // 标记为可能出错的访问点
+            "2:",
+            // 执行内存设置，将 al 的值写入 [rdi] 并重复 rcx 次
+            // rep stosb 使用: al=value, rdi=dst, rcx=count
+            "rep stosb",
+
+            // 正常完成，跳过错误处理
+            "jmp 3f",
+
+            // 错误处理: 将剩余未设置的字节数返回
+            "4:",
+
+            "3:",
+
+            // 添加异常表条目
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+
+            inout("rdi") dst => _,
+            inout("rcx") len => result,
+            inout("al") value => _,
+            options(att_syntax, nostack)
+        );
+
+        result
+    }
 }
 
 /// 获取保护标志的映射表

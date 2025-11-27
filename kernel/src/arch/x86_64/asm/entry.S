@@ -407,6 +407,11 @@ ENTRY(syscall_64)
     popq %rax
     addq $0x10, %rsp    // 弹出变量FUNC和errcode
 
+    cmpq (%rsp), %rcx
+    jne .L_syscall_must_use_iret
+    cmpq 0x10(%rsp), %r11
+    jne .L_syscall_must_use_iret
+
     popq %rcx           // pop rip到rcx
 
     addq $0x8, %rsp     // 弹出cs
@@ -415,3 +420,9 @@ ENTRY(syscall_64)
 
     swapgs
     sysretq
+
+// 适用于 sigreturn, ptrace, 或任何修改了上下文的情况
+// 此时栈结构完美符合 iretq 要求: [RIP, CS, RFLAGS, RSP, SS]
+.L_syscall_must_use_iret: 
+    swapgs
+    iretq

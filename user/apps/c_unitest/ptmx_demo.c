@@ -87,10 +87,10 @@ int main() {
     close(slave_fd); // 因为已经 dup2 了，这个原始的也可以关了
     // printf("closed master_fd and slave_fd in child over\n");
 
-    // 执行一个新的 bash shell
-    printf("--- Starting Bash Shell in Slave PTY ---\n\n");
+    // 执行一个新的 sh shell
+    printf("--- Starting sh Shell in Slave PTY ---\n\n");
     fflush(stdout);
-    execlp("/bin/bash", "bash", NULL);
+    execlp("/bin/sh", "sh", NULL);
 
     // 如果 execlp 成功，下面的代码不会被执行
     perror("execlp failed");
@@ -115,7 +115,7 @@ int main() {
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(STDIN_FILENO, &read_fds); // 监听当前终端的输入
-    FD_SET(master_fd, &read_fds); // 监听主设备的输出 (来自子进程shell)
+    FD_SET(master_fd, &read_fds);    // 监听主设备的输出 (来自子进程shell)
 
     // 使用 select 阻塞，直到有数据可读
     if (select(master_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {

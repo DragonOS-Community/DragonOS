@@ -1,12 +1,12 @@
 .. note:: AI Translation Notice
 
-   This document was automatically translated by `Qwen/Qwen3-8B` model, for reference only.
+   This document was automatically translated by `hunyuan-turbos-latest` model, for reference only.
 
    - Source document: kernel/memory_management/index.rst
 
-   - Translation time: 2025-05-19 01:41:10
+   - Translation time: 2025-11-18 13:02:47
 
-   - Translation model: `Qwen/Qwen3-8B`
+   - Translation model: `hunyuan-turbos-latest`
 
 
    Please report issues via `Community Channel <https://github.com/DragonOS-Community/DragonOS/issues>`_
@@ -17,7 +17,7 @@
 Memory Management
 ====================================
 
-   This section explains the design and implementation principles of the memory management module, along with the corresponding interfaces.
+   This section explains the design and implementation principles of the memory management module, as well as the corresponding interfaces.
 
 .. toctree::
    :maxdepth: 1
@@ -25,3 +25,4 @@ Memory Management
    intro
    allocate-memory
    mmio
+   extable_safe_copy_design

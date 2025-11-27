@@ -66,6 +66,17 @@ pub fn do_execve(
         completion.complete_all();
     }
 
+    if pcb.sighand().is_shared() {
+        // Linux出于进程和线程隔离，要确保在execve时，对共享的 SigHand 进行深拷贝
+        // 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1187
+        let new_sighand = crate::ipc::sighand::SigHand::new();
+        new_sighand.copy_handlers_from(&pcb.sighand());
+        pcb.replace_sighand(new_sighand);
+    }
+    // 重置所有信号处理器为默认行为(SIG_DFL)，禁用并清空备用信号栈。
+    pcb.flush_signal_handlers(false);
+    *pcb.sig_altstack_mut() = crate::arch::SigStackArch::new();
+
     Syscall::arch_do_execve(regs, &param, &load_result, user_sp, argv_ptr)
 }
 

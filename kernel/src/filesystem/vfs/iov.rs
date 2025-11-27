@@ -1,7 +1,10 @@
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
+use crate::{
+    mm::VirtAddr,
+    syscall::user_access::{user_accessible_len, UserBufferReader, UserBufferWriter},
+};
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IoVec {
@@ -73,24 +76,55 @@ impl IoVecs {
     /// This function reads data from each IoVec in sequence and combines them into
     /// a single contiguous buffer.
     ///
-    /// # Returns
+    /// **Returns:**
     ///
-    /// Returns a [`Vec<u8>`] containing all the data from the IoVecs.
+    /// Returns a [`Vec<u8>`] containing the data copied from the IoVecs.
     ///
-    /// # Examples
+    /// **To Be patient:**
     ///
-    /// ```rust
-    /// let iovecs = IoVecs::from_user(/* ... */)?;
-    /// let buffer = iovecs.gather();
-    /// ```
-    pub fn gather(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for slice in self.0.iter() {
-            let buf_reader = UserBufferReader::new(slice.iov_base, slice.iov_len, true).unwrap();
-            let slice = buf_reader.buffer::<u8>(0).unwrap();
-            buf.extend_from_slice(slice);
+    /// If a buffer is only partially accessible, data is copied up to **the first
+    /// inaccessible byte** and the remaining iovecs are ignored. If no data can be
+    /// read at all, `Err(SystemError::EFAULT)` is returned.
+    pub fn gather(&self) -> Result<Vec<u8>, SystemError> {
+        let mut buf = Vec::with_capacity(self.total_len());
+
+        for iov in self.0.iter() {
+            // 检查从 iov_base 开始有多少 bytes 在 vma 内部且实际可以访问
+            let accessible =
+                user_accessible_len(VirtAddr::new(iov.iov_base as usize), iov.iov_len, false);
+
+            // log::debug!(
+            //     "iov is {:?}. iov_len: {}; accessible len:{}",
+            //     iov,
+            //     iov.iov_len,
+            //     accessible
+            // );
+
+            // 如果一个字节都不能访问
+            if accessible == 0 {
+                if buf.is_empty() {
+                    // log::error!(
+                    //     "The first iov is empty, returning EFAULT. iov shape: {:?}",
+                    //     iov
+                    // );
+                    return Err(SystemError::EFAULT);
+                }
+                return Ok(buf);
+            }
+
+            // 复制可访问的部分
+            unsafe {
+                let src = core::slice::from_raw_parts(iov.iov_base as *const u8, accessible);
+                buf.extend_from_slice(src);
+            }
+
+            // 如果没有读取完整个 iov，说明遇到了不可访问的区域
+            if accessible < iov.iov_len {
+                return Ok(buf);
+            }
         }
-        return buf;
+
+        Ok(buf)
     }
 
     /// Scatters the given data into the IoVecs.

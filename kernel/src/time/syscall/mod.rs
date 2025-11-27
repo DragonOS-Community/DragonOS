@@ -8,8 +8,10 @@ use crate::syscall::Syscall;
 mod sys_alarm;
 mod sys_clock_gettime;
 mod sys_clock_nanosleep;
+mod sys_getitimer;
 mod sys_gettimeofday;
 mod sys_nanosleep;
+mod sys_setitimer;
 
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
@@ -19,6 +21,53 @@ pub type PosixSusecondsT = c_int;
 pub struct PosixTimeval {
     pub tv_sec: PosixTimeT,
     pub tv_usec: PosixSusecondsT,
+}
+
+impl PosixTimeval {
+    /// 从内核统一使用的 u64 纳秒创建一个 PosixTimeval 实例
+    pub fn from_ns(ns: u64) -> Self {
+        Self {
+            tv_sec: (ns / 1_000_000_000) as PosixTimeT,
+            tv_usec: ((ns % 1_000_000_000) / 1000) as PosixSusecondsT,
+        }
+    }
+
+    /// 将当前的 PosixTimeval 精确转换为内核统一使用的 u64 纳秒
+    pub fn to_ns(self) -> u64 {
+        if self.tv_usec < 0 || self.tv_usec >= 1_000_000 as PosixSusecondsT {
+            (self.tv_sec as u64).saturating_mul(1_000_000_000)
+        } else {
+            let sec_ns = (self.tv_sec as u64).saturating_mul(1_000_000_000);
+            let usec_ns = (self.tv_usec as u64).saturating_mul(1000);
+            sec_ns.saturating_add(usec_ns)
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Copy, Clone)]
+pub struct Itimerval {
+    pub it_interval: PosixTimeval,
+    pub it_value: PosixTimeval,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive)]
+pub enum ItimerType {
+    /// 真实时间定时器，基于时钟时间。触发 SIGALRM
+    Real = 0,
+    /// 虚拟时间定时器，仅计算进程在用户态下的CPU时间。触发 SIGVTALRM
+    Virtual = 1,
+    /// 性能分析定时器，计算进程在用户态和内核态下的总CPU时间。触发 SIGPROF
+    Prof = 2,
+}
+
+impl TryFrom<i32> for ItimerType {
+    type Error = SystemError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        <Self as num_traits::FromPrimitive>::from_i32(value).ok_or(SystemError::EINVAL)
+    }
 }
 
 #[repr(C)]

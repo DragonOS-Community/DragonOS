@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::process::{
@@ -14,6 +15,23 @@ use core::{fmt::Debug, intrinsics::likely};
 
 use super::ipc_namespace::{IpcNamespace, INIT_IPC_NAMESPACE};
 use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
+
+int_like!(NamespaceId, AtomicNamespaceId, usize, AtomicUsize);
+// ============================================================================
+// Namespace ID Allocator
+// ============================================================================
+
+/// Global namespace inode number counter.
+/// Namespace IDs start from 1 (0 means invalid/uninitialized).
+/// This provides a stable, unique identifier for each namespace instance,
+static NEXT_NS_INO: AtomicNamespaceId = AtomicNamespaceId::new(NamespaceId(1));
+
+/// Allocate a new unique namespace id.
+/// This ID remains stable throughout the namespace's lifetime and is used
+/// for /proc/.../ns/ files (e.g., "ipc:[4026531839]").
+pub fn alloc_ns_id() -> NamespaceId {
+    NEXT_NS_INO.fetch_add(NamespaceId(1), Ordering::Relaxed)
+}
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///
@@ -188,11 +206,21 @@ pub struct NsCommon {
     pub level: u32,
     /// 种类
     ty: NamespaceType,
+    /// Namespace的唯一标识符（inode number），用于/proc/.../ns/文件
+    /// 这个ID在namespace创建时分配，在整个namespace生命周期内保持不变
+    /// 类似于Linux内核中的ns_common.inum字段
+    pub nsid: NamespaceId,
 }
 
 impl NsCommon {
+    /// Create a new NsCommon with an automatically allocated inode number.
+    /// This is the preferred way to create NsCommon for new namespaces.
     pub fn new(level: u32, ty: NamespaceType) -> Self {
-        Self { level, ty }
+        Self {
+            level,
+            ty,
+            nsid: alloc_ns_id(),
+        }
     }
 
     pub fn level(&self) -> u32 {
@@ -206,7 +234,8 @@ impl NsCommon {
 
 impl Default for NsCommon {
     fn default() -> Self {
-        Self::new(0, NamespaceType::Pid) // 默认值，实际使用时应该明确指定
+        // Note: This should rarely be used. Prefer explicit creation with new().
+        Self::new(0, NamespaceType::Pid)
     }
 }
 

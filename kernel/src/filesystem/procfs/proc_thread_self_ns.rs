@@ -85,12 +85,13 @@ impl TryFrom<&str> for ThreadSelfNsFileType {
     }
 }
 
-/// Generate namespace ID string in the format "namespace_type:[id]"
+/// Get current thread's namespace "inode number" (nsid) for a given type.
 ///
-/// The ID comes from the namespace's ino field, which is allocated when the namespace
-/// is created and remains stable throughout its lifetime. This matches Linux's behavior
-/// where /proc/.../ns/ files show the namespace's inode number.
-fn generate_namespace_id(ns_type: ThreadSelfNsFileType) -> String {
+/// This value is stable for the lifetime of the namespace and is used both
+/// as the numeric component of `/proc/thread-self/ns/*` readlink output and
+/// as the `st_ino` reported by `stat(2)` on these entries.
+#[inline(never)]
+pub fn current_thread_self_ns_ino(ns_type: ThreadSelfNsFileType) -> usize {
     let pcb = ProcessManager::current_pcb();
     let nsproxy = pcb.nsproxy();
 
@@ -139,7 +140,17 @@ fn generate_namespace_id(ns_type: ThreadSelfNsFileType) -> String {
         }
     };
 
-    format!("{}:[{}]", ns_type.name(), ino.data())
+    ino.data()
+}
+
+/// Generate namespace ID string in the format "namespace_type:[id]"
+///
+/// The ID is derived from `current_thread_self_ns_ino` and remains stable
+/// throughout the namespace's lifetime.
+fn generate_namespace_id(ns_type: ThreadSelfNsFileType) -> String {
+    let ino = current_thread_self_ns_ino(ns_type);
+
+    format!("{}:[{}]", ns_type.name(), ino)
 }
 
 /// Open a namespace file (for symlink, this just returns the target length)

@@ -16,7 +16,8 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         procfs::proc_thread_self_ns::{
-            open_thread_self_ns_file, read_thread_self_ns_link, ThreadSelfNsFileType,
+            current_thread_self_ns_ino, open_thread_self_ns_file, read_thread_self_ns_link,
+            ThreadSelfNsFileType,
         },
         vfs::{
             mount::{MountFlags, MountPath},
@@ -36,7 +37,7 @@ use crate::{
 };
 
 use super::vfs::{
-    file::{FileMode, FilePrivateData},
+    file::{FileMode, FilePrivateData, NamespaceFilePrivateData},
     syscall::ModeType,
     utils::DName,
     FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
@@ -680,12 +681,11 @@ impl LockedProcFSInode {
             }
         }
 
-        // Create the namespace file as a symlink
-        let ns_file = self.create(
-            ns_name,
-            FileType::SymLink,
-            ModeType::from_bits_truncate(0o777),
-        )?;
+        // Create the namespace file. In Linux these appear as symlinks whose
+        // contents look like "ipc:[4026531839]". For now we model them as
+        // regular procfs files and implement the textual target via readlink,
+        // while `open()` returns a namespace fd.
+        let ns_file = self.create(ns_name, FileType::File, ModeType::from_bits_truncate(0o444))?;
 
         let ns_file_proc = ns_file
             .as_any_ref()
@@ -734,6 +734,31 @@ impl LockedProcFSInode {
     }
 }
 
+/// 为 `/proc/thread-self/ns/*` 节点构造 namespace fd 绑定的私有数据。
+#[inline(never)]
+fn make_thread_self_ns_file_private_data(ns_type: ThreadSelfNsFileType) -> FilePrivateData {
+    let pcb = ProcessManager::current_pcb();
+    let nsproxy = pcb.nsproxy();
+    let ns_data = match ns_type {
+        ThreadSelfNsFileType::Ipc => NamespaceFilePrivateData::Ipc(nsproxy.ipc_ns.clone()),
+        ThreadSelfNsFileType::Uts => NamespaceFilePrivateData::Uts(nsproxy.uts_ns.clone()),
+        ThreadSelfNsFileType::Mnt => NamespaceFilePrivateData::Mnt(nsproxy.mnt_ns.clone()),
+        ThreadSelfNsFileType::Net => NamespaceFilePrivateData::Net(nsproxy.net_ns.clone()),
+        ThreadSelfNsFileType::Pid => NamespaceFilePrivateData::Pid(pcb.active_pid_ns()),
+        ThreadSelfNsFileType::PidForChildren => {
+            NamespaceFilePrivateData::PidForChildren(nsproxy.pid_ns_for_children.clone())
+        }
+        ThreadSelfNsFileType::User => NamespaceFilePrivateData::User(pcb.cred().user_ns.clone()),
+        // time/cgroup namespace 暂未实现，退化为普通 user namespace 占位
+        ThreadSelfNsFileType::Time
+        | ThreadSelfNsFileType::TimeForChildren
+        | ThreadSelfNsFileType::Cgroup => {
+            NamespaceFilePrivateData::User(pcb.cred().user_ns.clone())
+        }
+    };
+    FilePrivateData::Namespace(ns_data)
+}
+
 impl IndexNode for LockedProcFSInode {
     #[inline(never)]
     fn open(
@@ -749,23 +774,34 @@ impl IndexNode for LockedProcFSInode {
         if let FileType::Dir = inode.metadata.file_type {
             return Ok(());
         }
-        let mut private_data = ProcfsFilePrivateData::new();
+        let mut proc_private = ProcfsFilePrivateData::new();
         // 根据文件类型获取相应数据
         let file_size = match proc_ty {
-            ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
-            ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
-            ProcFileType::ProcExe => inode.open_exe(&mut private_data)?,
-            ProcFileType::ProcMounts => inode.open_mounts(&mut private_data)?,
-            ProcFileType::ProcVersion => inode.open_version(&mut private_data)?,
-            ProcFileType::ProcCpuinfo => inode.open_cpuinfo(&mut private_data)?,
-            ProcFileType::Default => inode.data.len() as i64,
-            ProcFileType::ProcSelf => inode.open_self(&mut private_data)?,
+            ProcFileType::ProcStatus => inode.open_status(&mut proc_private)?,
+            ProcFileType::ProcMeminfo => inode.open_meminfo(&mut proc_private)?,
+            ProcFileType::ProcExe => inode.open_exe(&mut proc_private)?,
+            ProcFileType::ProcMounts => inode.open_mounts(&mut proc_private)?,
+            ProcFileType::ProcVersion => inode.open_version(&mut proc_private)?,
+            ProcFileType::ProcCpuinfo => inode.open_cpuinfo(&mut proc_private)?,
+            ProcFileType::ProcSelf => inode.open_self(&mut proc_private)?,
             ProcFileType::ProcThreadSelfNsChild(ns_type) => {
-                open_thread_self_ns_file(ns_type, &mut private_data)?
+                // 仅用于计算文件大小；具体读写由 read_thread_self_ns_link 动态生成
+                open_thread_self_ns_file(ns_type, &mut proc_private)?
             }
-            _ => 0,
+            ProcFileType::Default => inode.data.len() as i64,
+            ProcFileType::ProcKmsg
+            | ProcFileType::ProcFdDir
+            | ProcFileType::ProcFdFile
+            | ProcFileType::ProcThreadSelfNsRoot => 0,
         };
-        *data = FilePrivateData::Procfs(private_data);
+
+        // 为不同类型的 procfs 节点设置文件私有数据
+        *data = match proc_ty {
+            ProcFileType::ProcThreadSelfNsChild(ns_type) => {
+                make_thread_self_ns_file_private_data(ns_type)
+            }
+            _ => FilePrivateData::Procfs(proc_private),
+        };
         // 更新metadata里面的文件大小数值
         inode.metadata.size = file_size;
         drop(inode);
@@ -878,8 +914,17 @@ impl IndexNode for LockedProcFSInode {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let inode = self.0.lock();
-        let metadata = inode.metadata.clone();
-        return Ok(metadata);
+        let mut metadata = inode.metadata.clone();
+
+        // For /proc/thread-self/ns/*, dynamically expose the current namespace
+        // nsid as st_ino, matching Linux behaviour where stat() on these
+        // entries reflects the namespace identity.
+        if let ProcFileType::ProcThreadSelfNsChild(ns_type) = inode.fdata.ftype {
+            let ino = current_thread_self_ns_ino(ns_type);
+            metadata.inode_id = InodeId::new(ino);
+        }
+
+        Ok(metadata)
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {

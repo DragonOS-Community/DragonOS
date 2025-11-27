@@ -1,4 +1,7 @@
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{
+    fmt,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
@@ -24,10 +27,51 @@ use crate::{
         readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
         MemoryManagementArch,
     },
-    process::{cred::Cred, resource::RLimitID, ProcessControlBlock, ProcessManager, RawPid},
+    process::{
+        cred::Cred,
+        namespace::{
+            ipc_namespace::IpcNamespace, mnt::MntNamespace, net_namespace::NetNamespace,
+            pid_namespace::PidNamespace, user_namespace::UserNamespace,
+            uts_namespace::UtsNamespace,
+        },
+        resource::RLimitID,
+        ProcessControlBlock, ProcessManager, RawPid,
+    },
 };
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
+/// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub enum NamespaceFilePrivateData {
+    Ipc(Arc<IpcNamespace>),
+    Uts(Arc<UtsNamespace>),
+    Mnt(Arc<MntNamespace>),
+    Net(Arc<NetNamespace>),
+    /// Current thread PID namespace.
+    Pid(Arc<PidNamespace>),
+    /// PID namespace for children.
+    PidForChildren(Arc<PidNamespace>),
+    User(Arc<UserNamespace>),
+    // Time/cgroup namespaces are not implemented yet.
+}
+
+impl fmt::Debug for NamespaceFilePrivateData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NamespaceFilePrivateData::Ipc(_) => f.write_str("NamespaceFilePrivateData::Ipc(..)"),
+            NamespaceFilePrivateData::Uts(_) => f.write_str("NamespaceFilePrivateData::Uts(..)"),
+            NamespaceFilePrivateData::Mnt(_) => f.write_str("NamespaceFilePrivateData::Mnt(..)"),
+            NamespaceFilePrivateData::Net(_) => f.write_str("NamespaceFilePrivateData::Net(..)"),
+            NamespaceFilePrivateData::Pid(_) => f.write_str("NamespaceFilePrivateData::Pid(..)"),
+            NamespaceFilePrivateData::PidForChildren(_) => {
+                f.write_str("NamespaceFilePrivateData::PidForChildren(..)")
+            }
+            NamespaceFilePrivateData::User(_) => f.write_str("NamespaceFilePrivateData::User(..)"),
+        }
+    }
+}
+
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -44,6 +88,8 @@ pub enum FilePrivateData {
     EPoll(EPollPrivateData),
     /// pid私有信息
     Pid(PidPrivateData),
+    /// namespace fd 私有信息（/proc/thread-self/ns/* 打开后得到）
+    Namespace(NamespaceFilePrivateData),
     /// 不需要文件私有信息
     Unused,
 }

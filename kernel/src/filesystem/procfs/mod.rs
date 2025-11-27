@@ -14,11 +14,17 @@ use system_error::SystemError;
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{
-        mount::{MountFlags, MountPath},
-        syscall::RenameFlags,
-        vcore::generate_inode_id,
-        FileType,
+    filesystem::{
+        procfs::proc_thread_self_ns::{
+            current_thread_self_ns_ino, open_thread_self_ns_file, read_thread_self_ns_link,
+            ThreadSelfNsFileType,
+        },
+        vfs::{
+            mount::{MountFlags, MountPath},
+            syscall::RenameFlags,
+            vcore::generate_inode_id,
+            FileType,
+        },
     },
     libs::{
         once::Once,
@@ -31,7 +37,7 @@ use crate::{
 };
 
 use super::vfs::{
-    file::{FileMode, FilePrivateData},
+    file::{FileMode, FilePrivateData, NamespaceFilePrivateData},
     syscall::ModeType,
     utils::DName,
     FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
@@ -41,53 +47,41 @@ pub mod kmsg;
 pub mod log;
 mod proc_cpuinfo;
 mod proc_mounts;
+mod proc_thread_self_ns;
 mod proc_version;
+mod procfs_setup;
 mod syscall;
 
 /// @brief 进程文件类型
 /// @usage 用于定义进程文件夹下的各类文件类型
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
 pub enum ProcFileType {
     ///展示进程状态信息
-    ProcStatus = 0,
+    ProcStatus,
     /// meminfo
-    ProcMeminfo = 1,
+    ProcMeminfo,
     /// kmsg
-    ProcKmsg = 2,
+    ProcKmsg,
     /// 可执行路径
-    ProcExe = 3,
+    ProcExe,
     /// /proc/mounts
-    ProcSelf = 4,
-    ProcFdDir = 5,
-    ProcFdFile = 6,
-    ProcMounts = 7,
+    ProcSelf,
+    ProcFdDir,
+    ProcFdFile,
+    ProcMounts,
     /// /proc/version
-    ProcVersion = 8,
+    ProcVersion,
     /// /proc/cpuinfo
-    ProcCpuinfo = 9,
+    ProcCpuinfo,
+    /// /proc/thread-self/ns itself
+    ProcThreadSelfNsRoot,
+    /// /proc/thread-self/ns/* namespace files
+    ProcThreadSelfNsChild(ThreadSelfNsFileType),
     //todo: 其他文件类型
     ///默认文件类型
     Default,
 }
 
-impl From<u8> for ProcFileType {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => ProcFileType::ProcStatus,
-            1 => ProcFileType::ProcMeminfo,
-            2 => ProcFileType::ProcKmsg,
-            3 => ProcFileType::ProcExe,
-            4 => ProcFileType::ProcSelf,
-            5 => ProcFileType::ProcFdDir,
-            6 => ProcFileType::ProcFdFile,
-            7 => ProcFileType::ProcMounts,
-            8 => ProcFileType::ProcVersion,
-            9 => ProcFileType::ProcCpuinfo,
-            _ => ProcFileType::Default,
-        }
-    }
-}
 /// @brief 创建 ProcFS 文件的参数结构体
 #[derive(Debug, Clone)]
 pub struct ProcFileCreationParams<'a> {
@@ -516,7 +510,10 @@ impl FileSystem for ProcFS {
 
 impl ProcFS {
     #[inline(never)]
-    fn create_proc_file(&self, params: ProcFileCreationParams) -> Result<(), SystemError> {
+    pub(crate) fn create_proc_file(
+        &self,
+        params: ProcFileCreationParams,
+    ) -> Result<(), SystemError> {
         let binding = params
             .parent
             .create(params.name, params.file_type, params.mode)?;
@@ -587,102 +584,11 @@ impl ProcFS {
         // 释放锁
         drop(root_guard);
 
-        // 创建meminfo文件
-        let meminfo_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("meminfo")
-            .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
-            .ftype(ProcFileType::ProcMeminfo)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(meminfo_params)
-            .unwrap_or_else(|_| panic!("create meminfo error"));
+        // 创建根目录下的所有文件
+        result.create_root_files();
 
-        // 创建kmsg文件
-        let kmsg_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("kmsg")
-            .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
-            .ftype(ProcFileType::ProcKmsg)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(kmsg_params)
-            .unwrap_or_else(|_| panic!("create kmsg error"));
-        // 这个文件是用来欺骗Aya框架识别内核版本
-        /* On Ubuntu LINUX_VERSION_CODE doesn't correspond to info.release,
-         * but Ubuntu provides /proc/version_signature file, as described at
-         * https://ubuntu.com/kernel, with an example contents below, which we
-         * can use to get a proper LINUX_VERSION_CODE.
-         *
-         *   Ubuntu 5.4.0-12.15-generic 5.4.8
-         *
-         * In the above, 5.4.8 is what kernel is actually expecting, while
-         * uname() call will return 5.4.0 in info.release.
-         */
-        let version_signature_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("version_signature")
-            .file_type(FileType::File)
-            .ftype(ProcFileType::Default)
-            .data("DragonOS 6.0.0-generic 6.0.0\n")
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(version_signature_params)
-            .unwrap_or_else(|_| panic!("create version_signature error"));
-
-        let mounts_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("mounts")
-            .file_type(FileType::File)
-            .ftype(ProcFileType::ProcMounts)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(mounts_params)
-            .unwrap_or_else(|_| panic!("create mounts error"));
-
-        // 创建 version 文件
-        let version_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("version")
-            .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
-            .ftype(ProcFileType::ProcVersion)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(version_params)
-            .unwrap_or_else(|_| panic!("create version error"));
-
-        // 创建 cpuinfo 文件
-        let cpuinfo_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("cpuinfo")
-            .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
-            .ftype(ProcFileType::ProcCpuinfo)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(cpuinfo_params)
-            .unwrap_or_else(|_| panic!("create cpuinfo error"));
-
-        let self_params = ProcFileCreationParams::builder()
-            .parent(result.root_inode())
-            .name("self")
-            .file_type(FileType::SymLink)
-            .mode(ModeType::from_bits_truncate(0o555))
-            .ftype(ProcFileType::ProcSelf)
-            .build()
-            .unwrap();
-        result
-            .create_proc_file(self_params)
-            .unwrap_or_else(|_| panic!("create self error"));
+        // 创建 thread-self 目录结构
+        result.create_thread_self_directories();
 
         return result;
     }
@@ -758,6 +664,40 @@ impl ProcFS {
 }
 
 impl LockedProcFSInode {
+    #[inline(never)]
+    fn dynamical_find_thread_self_ns(
+        &self,
+        ns_name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // Convert namespace name to type
+        let ns_type = ThreadSelfNsFileType::try_from(ns_name)?;
+
+        // Check if file already exists without triggering recursive lookup
+        {
+            let name = DName::from(ns_name);
+            let guard = self.0.lock();
+            if let Some(existing) = guard.children.get(&name) {
+                return Ok(existing.clone());
+            }
+        }
+
+        // Create the namespace file. In Linux these appear as symlinks whose
+        // contents look like "ipc:[4026531839]". For now we model them as
+        // regular procfs files and implement the textual target via readlink,
+        // while `open()` returns a namespace fd.
+        let ns_file = self.create(ns_name, FileType::File, ModeType::from_bits_truncate(0o444))?;
+
+        let ns_file_proc = ns_file
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+
+        // Store namespace type in fd field (as u8 cast to i32)
+        ns_file_proc.0.lock().fdata.ftype = ProcFileType::ProcThreadSelfNsChild(ns_type);
+
+        Ok(ns_file)
+    }
+
     fn dynamical_find_fd(&self, fd: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         // ::log::info!("ProcFS: Dynamically opening fd files for current process.");
         let fd = fd.parse::<i32>().map_err(|_| SystemError::EINVAL)?;
@@ -794,7 +734,33 @@ impl LockedProcFSInode {
     }
 }
 
+/// 为 `/proc/thread-self/ns/*` 节点构造 namespace fd 绑定的私有数据。
+#[inline(never)]
+fn make_thread_self_ns_file_private_data(ns_type: ThreadSelfNsFileType) -> FilePrivateData {
+    let pcb = ProcessManager::current_pcb();
+    let nsproxy = pcb.nsproxy();
+    let ns_data = match ns_type {
+        ThreadSelfNsFileType::Ipc => NamespaceFilePrivateData::Ipc(nsproxy.ipc_ns.clone()),
+        ThreadSelfNsFileType::Uts => NamespaceFilePrivateData::Uts(nsproxy.uts_ns.clone()),
+        ThreadSelfNsFileType::Mnt => NamespaceFilePrivateData::Mnt(nsproxy.mnt_ns.clone()),
+        ThreadSelfNsFileType::Net => NamespaceFilePrivateData::Net(nsproxy.net_ns.clone()),
+        ThreadSelfNsFileType::Pid => NamespaceFilePrivateData::Pid(pcb.active_pid_ns()),
+        ThreadSelfNsFileType::PidForChildren => {
+            NamespaceFilePrivateData::PidForChildren(nsproxy.pid_ns_for_children.clone())
+        }
+        ThreadSelfNsFileType::User => NamespaceFilePrivateData::User(pcb.cred().user_ns.clone()),
+        // time/cgroup namespace 暂未实现，退化为普通 user namespace 占位
+        ThreadSelfNsFileType::Time
+        | ThreadSelfNsFileType::TimeForChildren
+        | ThreadSelfNsFileType::Cgroup => {
+            NamespaceFilePrivateData::User(pcb.cred().user_ns.clone())
+        }
+    };
+    FilePrivateData::Namespace(ns_data)
+}
+
 impl IndexNode for LockedProcFSInode {
+    #[inline(never)]
     fn open(
         &self,
         mut data: SpinLockGuard<FilePrivateData>,
@@ -808,20 +774,34 @@ impl IndexNode for LockedProcFSInode {
         if let FileType::Dir = inode.metadata.file_type {
             return Ok(());
         }
-        let mut private_data = ProcfsFilePrivateData::new();
+        let mut proc_private = ProcfsFilePrivateData::new();
         // 根据文件类型获取相应数据
         let file_size = match proc_ty {
-            ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
-            ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
-            ProcFileType::ProcExe => inode.open_exe(&mut private_data)?,
-            ProcFileType::ProcMounts => inode.open_mounts(&mut private_data)?,
-            ProcFileType::ProcVersion => inode.open_version(&mut private_data)?,
-            ProcFileType::ProcCpuinfo => inode.open_cpuinfo(&mut private_data)?,
+            ProcFileType::ProcStatus => inode.open_status(&mut proc_private)?,
+            ProcFileType::ProcMeminfo => inode.open_meminfo(&mut proc_private)?,
+            ProcFileType::ProcExe => inode.open_exe(&mut proc_private)?,
+            ProcFileType::ProcMounts => inode.open_mounts(&mut proc_private)?,
+            ProcFileType::ProcVersion => inode.open_version(&mut proc_private)?,
+            ProcFileType::ProcCpuinfo => inode.open_cpuinfo(&mut proc_private)?,
+            ProcFileType::ProcSelf => inode.open_self(&mut proc_private)?,
+            ProcFileType::ProcThreadSelfNsChild(ns_type) => {
+                // 仅用于计算文件大小；具体读写由 read_thread_self_ns_link 动态生成
+                open_thread_self_ns_file(ns_type, &mut proc_private)?
+            }
             ProcFileType::Default => inode.data.len() as i64,
-            ProcFileType::ProcSelf => inode.open_self(&mut private_data)?,
-            _ => 0,
+            ProcFileType::ProcKmsg
+            | ProcFileType::ProcFdDir
+            | ProcFileType::ProcFdFile
+            | ProcFileType::ProcThreadSelfNsRoot => 0,
         };
-        *data = FilePrivateData::Procfs(private_data);
+
+        // 为不同类型的 procfs 节点设置文件私有数据
+        *data = match proc_ty {
+            ProcFileType::ProcThreadSelfNsChild(ns_type) => {
+                make_thread_self_ns_file_private_data(ns_type)
+            }
+            _ => FilePrivateData::Procfs(proc_private),
+        };
         // 更新metadata里面的文件大小数值
         inode.metadata.size = file_size;
         drop(inode);
@@ -892,6 +872,9 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcExe => return inode.read_exe_link(buf, offset),
             ProcFileType::ProcSelf => return inode.read_self_link(buf),
             ProcFileType::ProcFdFile => return inode.read_fd_link(buf),
+            ProcFileType::ProcThreadSelfNsChild(ns_type) => {
+                return read_thread_self_ns_link(ns_type, buf, offset)
+            }
 
             _ => (),
         };
@@ -931,8 +914,17 @@ impl IndexNode for LockedProcFSInode {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let inode = self.0.lock();
-        let metadata = inode.metadata.clone();
-        return Ok(metadata);
+        let mut metadata = inode.metadata.clone();
+
+        // For /proc/thread-self/ns/*, dynamically expose the current namespace
+        // nsid as st_ino, matching Linux behaviour where stat() on these
+        // entries reflects the namespace identity.
+        if let ProcFileType::ProcThreadSelfNsChild(ns_type) = inode.fdata.ftype {
+            let ino = current_thread_self_ns_ino(ns_type);
+            metadata.inode_id = InodeId::new(ino);
+        }
+
+        Ok(metadata)
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
@@ -1104,9 +1096,17 @@ impl IndexNode for LockedProcFSInode {
             }
 
             name => {
-                if self.0.lock().fdata.ftype == ProcFileType::ProcFdDir {
-                    return self.dynamical_find_fd(name);
+                let ftype = self.0.lock().fdata.ftype;
+                match ftype {
+                    ProcFileType::ProcFdDir => {
+                        return self.dynamical_find_fd(name);
+                    }
+                    ProcFileType::ProcThreadSelfNsRoot => {
+                        return self.dynamical_find_thread_self_ns(name);
+                    }
+                    _ => {}
                 }
+
                 // 在子目录项中查找
                 return Ok(self
                     .0
@@ -1174,12 +1174,20 @@ impl IndexNode for LockedProcFSInode {
         let mut keys = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
+        let ftype = self.0.lock().fdata.ftype;
 
-        if self.0.lock().fdata.ftype == ProcFileType::ProcFdDir {
-            // 对于 /proc/self/fd 目录，需要包含 "." 和 ".."，然后添加所有fd
-            let mut fd_list = self.dynamical_list_fd()?;
-            keys.append(&mut fd_list);
-            return Ok(keys);
+        match ftype {
+            ProcFileType::ProcFdDir => {
+                let mut fd_list = self.dynamical_list_fd()?;
+                keys.append(&mut fd_list);
+                return Ok(keys);
+            }
+            ProcFileType::ProcThreadSelfNsRoot => {
+                keys.extend(ThreadSelfNsFileType::ALL_NAME.iter().map(|s| s.to_string()));
+
+                return Ok(keys);
+            }
+            _ => {}
         }
 
         keys.append(

@@ -318,7 +318,6 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
-        use another_ext4::InodeMode;
         let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
 
         let to_ext4_time =
@@ -328,7 +327,7 @@ impl IndexNode for LockedExt4Inode {
         let ext4 = &guard.concret_fs().fs;
         ext4.setattr(
             guard.inner_inode_num,
-            Some(InodeMode::from_bits_truncate(mode.bits() as u16)),
+            Some(another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16)),
             Some(metadata.uid as u32),
             Some(metadata.gid as u32),
             Some(metadata.size as u64),

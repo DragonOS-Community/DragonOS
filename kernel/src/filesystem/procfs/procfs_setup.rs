@@ -13,6 +13,7 @@ impl ProcFS {
         self.create_version_file();
         self.create_cpuinfo_file();
         self.create_self_file();
+        self.create_sysctl_files();
     }
 
     /// @brief 创建 /proc/meminfo 文件

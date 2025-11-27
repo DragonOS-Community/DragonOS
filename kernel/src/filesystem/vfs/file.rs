@@ -296,6 +296,18 @@ impl File {
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
+        // O_APPEND: 每次写入前自动移动到文件末尾
+        let actual_offset = if self.mode().contains(FileMode::O_APPEND) && matches!(file_type, FileType::File) {
+            let file_size = md.size as usize;
+            // 对于 O_APPEND，总是写入到文件末尾
+            if update_offset {
+                self.offset.store(file_size, core::sync::atomic::Ordering::SeqCst);
+            }
+            file_size
+        } else {
+            offset
+        };
+
         // 检查RLIMIT_FSIZE限制（仅对常规文件生效）
         let actual_len = if matches!(file_type, FileType::File) {
             let current_pcb = ProcessManager::current_pcb();
@@ -305,7 +317,7 @@ impl File {
                 let limit = fsize_limit.rlim_cur as usize;
 
                 // 如果当前文件大小已经达到或超过限制，不允许写入
-                if offset >= limit {
+                if actual_offset >= limit {
                     // 发送SIGXFSZ信号
                     let _ = kill_process(
                         current_pcb.raw_pid(),
@@ -315,7 +327,7 @@ impl File {
                 }
 
                 // 计算可写入的最大长度（不超过限制）
-                let max_writable = limit.saturating_sub(offset);
+                let max_writable = limit.saturating_sub(actual_offset);
                 if len > max_writable {
                     max_writable
                 } else {
@@ -328,17 +340,21 @@ impl File {
             len
         };
 
-        // 仅常规文件考虑“指针超过大小则扩展”语义；管道/字符设备等不应触发 resize
-        if matches!(file_type, FileType::File) && offset > md.size as usize {
-            self.inode.resize(offset)?;
+        if matches!(file_type, FileType::File) && actual_offset > md.size as usize {
+            self.inode.resize(actual_offset)?;
         }
         let written_len = self
             .inode
-            .write_at(offset, actual_len, buf, self.private_data.lock())?;
+            .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
 
         if update_offset {
-            self.offset
-                .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+            if self.mode().contains(FileMode::O_APPEND) {
+                self.offset
+                    .store(actual_offset + written_len, core::sync::atomic::Ordering::SeqCst);
+            } else {
+                self.offset
+                    .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+            }
         }
 
         Ok(written_len)
@@ -414,8 +430,15 @@ impl File {
             return Err(SystemError::EBADF);
         }
 
+        let access_mode = mode.accmode();
         // O_WRONLY cannot be read
-        if mode.accmode() == FileMode::O_WRONLY.accmode() {
+        if access_mode == FileMode::O_WRONLY.accmode() {
+            return Err(SystemError::EBADF);
+        }
+
+        // Invalid access mode (e.g., O_WRONLY | O_RDWR which gives 0o3)
+        if access_mode != FileMode::O_RDONLY.accmode()
+            && access_mode != FileMode::O_RDWR.accmode() {
             return Err(SystemError::EBADF);
         }
 
@@ -432,8 +455,15 @@ impl File {
             return Err(SystemError::EBADF);
         }
 
+        let access_mode = mode.accmode();
         // O_RDONLY cannot be written
-        if mode.accmode() == FileMode::O_RDONLY.accmode() {
+        if access_mode == FileMode::O_RDONLY.accmode() {
+            return Err(SystemError::EBADF);
+        }
+
+        // Invalid access mode (e.g., O_WRONLY | O_RDWR which gives 0o3)
+        if access_mode != FileMode::O_WRONLY.accmode()
+            && access_mode != FileMode::O_RDWR.accmode() {
             return Err(SystemError::EBADF);
         }
 

@@ -155,9 +155,11 @@ pub fn do_sys_open(
     path: &str,
     o_flags: FileMode,
     mode: ModeType,
-    follow_symlink: bool,
+    _follow_symlink: bool,
 ) -> Result<usize, SystemError> {
     let how = OpenHow::new(o_flags, mode, OpenHowResolve::empty());
+    // O_NOFOLLOW 标志应该决定是否跟随符号链接
+    let follow_symlink = !o_flags.contains(FileMode::O_NOFOLLOW);
     return do_sys_openat2(dfd, path, how, follow_symlink);
 }
 
@@ -170,18 +172,73 @@ fn do_sys_openat2(
     // log::debug!("openat2: dirfd: {}, path: {}, how: {:?}",dirfd, path, how);
     let path = path.trim();
 
+    // 检查空字符串路径
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
+    // 检查路径末尾斜杠 - 如果以斜杠结尾，目标必须是目录
+    let path_ends_with_slash = path.ends_with('/');
+
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
     let inode =
         inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_symlink);
 
     let inode: Arc<dyn IndexNode> = match inode {
-        Ok(inode) => inode,
+        Ok(inode) => {
+            let file_type = inode.metadata()?.file_type;
+
+            // 如果O_NOFOLLOW被设置且最后的路径组件是符号链接，返回ELOOP
+            if !follow_symlink && file_type == FileType::SymLink {
+                return Err(SystemError::ELOOP);
+            }
+
+            // 文件存在 - 检查 O_EXCL
+            if how.o_flags.contains(FileMode::O_CREAT)
+                && how.o_flags.contains(FileMode::O_EXCL) {
+                return Err(SystemError::EEXIST);
+            }
+
+            // 如果是目录，检查不兼容的标志
+            if file_type == FileType::Dir {
+                // O_CREAT 在现有目录上应该失败
+                if how.o_flags.contains(FileMode::O_CREAT) {
+                    return Err(SystemError::EISDIR);
+                }
+                // O_TRUNC 在目录上应该失败
+                if how.o_flags.contains(FileMode::O_TRUNC) {
+                    return Err(SystemError::EISDIR);
+                }
+                // 目录不能以写模式打开
+                let access_mode = how.o_flags.accmode();
+                if access_mode == FileMode::O_WRONLY.accmode()
+                    || access_mode == FileMode::O_RDWR.accmode() {
+                    return Err(SystemError::EISDIR);
+                }
+                // O_DIRECT 在目录上应该失败
+                if how.o_flags.contains(FileMode::O_DIRECT) {
+                    return Err(SystemError::EINVAL);
+                }
+            }
+
+            // 如果路径以斜杠结尾但不是目录，返回错误
+            if path_ends_with_slash && file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
+
+            inode
+        }
         Err(errno) => {
             // 文件不存在，且需要创建
             if how.o_flags.contains(FileMode::O_CREAT)
                 && !how.o_flags.contains(FileMode::O_DIRECTORY)
                 && errno == SystemError::ENOENT
             {
+                // 如果路径以斜杠结尾，不能创建普通文件
+                if path_ends_with_slash {
+                    return Err(SystemError::EISDIR);
+                }
+
                 let (filename, parent_path) = rsplit_path(&path);
                 // 查找父目录
                 let parent_inode: Arc<dyn IndexNode> =
@@ -206,22 +263,22 @@ fn do_sys_openat2(
         return Err(SystemError::ENOTDIR);
     }
 
-    // 创建文件对象
+    // 如果O_TRUNC，并且是普通文件，清空文件
+    // 注意：必须在创建 File 对象之前截断
+    // 因为 O_TRUNC 的截断基于文件系统权限，而不是打开模式
+    // 例如：open(file, O_RDONLY | O_TRUNC) 是合法的，只要用户对文件有写权限
+    if how.o_flags.contains(FileMode::O_TRUNC) && file_type == FileType::File {
+        // 直接在 inode 层截断，绕过 File 的打开模式检查
+        inode.resize(0)?;
+    }
 
+    // 创建文件对象
     let file: File = File::new(inode, how.o_flags)?;
 
-    // 打开模式为“追加”
-    if how.o_flags.contains(FileMode::O_APPEND) {
-        file.lseek(SeekFrom::SeekEnd(0))?;
-    }
+    // 注意：O_APPEND 模式下，不在打开时设置偏移
+    // 偏移应该保持为0，只在每次 write() 时才移动到文件末尾
+    // 这样 lseek(fd, 0, SEEK_CUR) 会返回 0，符合 POSIX 语义
 
-    // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
-    if how.o_flags.contains(FileMode::O_TRUNC)
-        && (how.o_flags.contains(FileMode::O_RDWR) || how.o_flags.contains(FileMode::O_WRONLY))
-        && file_type == FileType::File
-    {
-        file.ftruncate(0)?;
-    }
     // 把文件对象存入pcb
     let r = ProcessManager::current_pcb()
         .fd_table()

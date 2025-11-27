@@ -80,7 +80,7 @@ impl InnerPipeInode {
             return Err(SystemError::EBADFD);
         };
 
-        if file_flags.accflags() != FileFlags::O_WRONLY.bits() {
+        if !file_flags.is_write_only() {
             if self.valid_cnt != 0 {
                 // 有数据可读
                 events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
@@ -92,7 +92,7 @@ impl InnerPipeInode {
             }
         }
 
-        if file_flags.accflags() != FileFlags::O_RDONLY.bits() {
+        if !file_flags.is_read_only() {
             // 管道内数据未满
             if self.valid_cnt as usize != PIPE_BUFF_SIZE {
                 events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
@@ -297,7 +297,7 @@ impl IndexNode for LockedPipeInode {
         mut data: SpinLockGuard<FilePrivateData>,
         file_flags: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
-        let accflags = file_flags.accflags();
+        let accflags = file_flags.access_flags();
         let mut guard = self.inner.lock();
         // 不能以读写方式打开管道
         if accflags == FileFlags::O_RDWR.bits() {
@@ -342,7 +342,7 @@ impl IndexNode for LockedPipeInode {
         } else {
             return Err(SystemError::EBADF);
         }
-        let accflags = file_flags.accflags();
+        let accflags = file_flags.access_flags();
         let mut guard = self.inner.lock();
 
         // 写端关闭

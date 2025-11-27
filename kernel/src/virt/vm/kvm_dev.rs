@@ -108,7 +108,7 @@ impl IndexNode for LockedKvmInode {
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &FileFlags,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -364,7 +364,7 @@ impl IndexNode for KvmVcpuDev {
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &FileFlags,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

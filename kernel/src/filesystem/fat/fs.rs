@@ -1848,7 +1848,7 @@ impl IndexNode for LockedFATInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileFlags,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }

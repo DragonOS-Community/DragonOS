@@ -771,7 +771,7 @@ impl IndexNode for LockedProcFSInode {
     fn open(
         &self,
         mut data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileFlags,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();

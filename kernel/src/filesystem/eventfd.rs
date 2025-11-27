@@ -120,7 +120,7 @@ impl IndexNode for EventFdInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileFlags,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

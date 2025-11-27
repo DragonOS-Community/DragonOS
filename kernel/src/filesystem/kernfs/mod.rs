@@ -169,7 +169,7 @@ impl IndexNode for KernFSInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileFlags,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         if let Some(callback) = self.callback {
             let callback_data =

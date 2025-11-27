@@ -630,9 +630,9 @@ impl IndexNode for MountFSInode {
     fn open(
         &self,
         data: SpinLockGuard<FilePrivateData>,
-        mode: &FileFlags,
+        flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        return self.inner_inode.open(data, mode);
+        return self.inner_inode.open(data, flags);
     }
 
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {

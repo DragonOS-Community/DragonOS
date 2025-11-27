@@ -83,7 +83,7 @@ impl IndexNode for LockedZeroInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileFlags,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }

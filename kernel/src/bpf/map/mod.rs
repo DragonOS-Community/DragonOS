@@ -132,7 +132,7 @@ impl BpfMap {
 }
 
 impl IndexNode for BpfMap {
-    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _mode: &FileFlags) -> Result<()> {
+    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
         Ok(())
     }
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<()> {

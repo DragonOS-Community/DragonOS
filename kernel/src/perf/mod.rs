@@ -198,7 +198,7 @@ impl IndexNode for PerfEventInode {
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
         self.event.mmap(start, len, offset)
     }
-    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _mode: &FileFlags) -> Result<()> {
+    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
         Ok(())
     }
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<()> {

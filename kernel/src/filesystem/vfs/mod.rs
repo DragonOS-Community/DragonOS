@@ -204,7 +204,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileFlags,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);

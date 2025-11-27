@@ -4,10 +4,10 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STAT;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::syscall::newfstat::do_newfstat;
 use crate::filesystem::vfs::syscall::sys_close::do_close;
-use crate::filesystem::vfs::ModeType;
+use crate::filesystem::vfs::InodeMode;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use defer::defer;
@@ -28,8 +28,8 @@ impl Syscall for SysStatHandle {
 
         let fd = super::open_utils::do_open(
             path,
-            FileMode::O_RDONLY.bits(),
-            ModeType::empty().bits(),
+            FileFlags::O_RDONLY.bits(),
+            InodeMode::empty().bits(),
             true,
         )?;
 

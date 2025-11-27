@@ -14,7 +14,7 @@ use crate::{
             file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
             SysFSOpsSupport, SYSFS_ATTR_MODE_RW, SYSFS_ATTR_MODE_WO,
         },
-        vfs::syscall::ModeType,
+        vfs::syscall::InodeMode,
     },
     libs::rwlock::RwLock,
 };
@@ -588,8 +588,8 @@ pub fn bus_probe_device(dev: &Arc<dyn Device>) {
 struct BusAttrDriversProbe;
 
 impl Attribute for BusAttrDriversProbe {
-    fn mode(&self) -> ModeType {
-        return ModeType::S_IWUSR;
+    fn mode(&self) -> InodeMode {
+        return InodeMode::S_IWUSR;
     }
 
     fn name(&self) -> &str {
@@ -626,7 +626,7 @@ impl Attribute for BusAttrDriversProbe {
 struct BusAttrDriversAutoprobe;
 
 impl Attribute for BusAttrDriversAutoprobe {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RW
     }
 
@@ -736,7 +736,7 @@ impl SysFSOps for BusDriverSysFSOps {
 struct DriverAttrUnbind;
 
 impl Attribute for DriverAttrUnbind {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_WO
     }
 
@@ -784,7 +784,7 @@ impl Attribute for DriverAttrBind {
         "bind"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_WO
     }
 

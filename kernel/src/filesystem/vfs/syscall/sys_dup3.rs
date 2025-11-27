@@ -1,7 +1,7 @@
 use core::ffi::c_int;
 
 use crate::arch::syscall::nr::SYS_DUP3;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::syscall::dup2::do_dup3;
 use crate::{
     arch::interrupt::TrapFrame,
@@ -21,8 +21,8 @@ impl Syscall for SysDup3Handle {
         let oldfd = Self::oldfd(args);
         let newfd = Self::newfd(args);
         let flags = Self::flags(args);
-        let flags = FileMode::from_bits_truncate(flags);
-        if (flags.bits() & !FileMode::O_CLOEXEC.bits()) != 0 {
+        let flags = FileFlags::from_bits_truncate(flags);
+        if (flags.bits() & !FileFlags::O_CLOEXEC.bits()) != 0 {
             return Err(SystemError::EINVAL);
         }
 

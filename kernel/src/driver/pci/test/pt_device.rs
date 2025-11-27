@@ -21,7 +21,7 @@ use crate::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::ModeType,
+        vfs::syscall::InodeMode,
     },
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
@@ -240,7 +240,7 @@ impl AttributeGroup for HelloAttr {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         return Some(attr.mode());
     }
 }
@@ -248,7 +248,7 @@ impl AttributeGroup for HelloAttr {
 pub struct Hello;
 
 impl Attribute for Hello {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 

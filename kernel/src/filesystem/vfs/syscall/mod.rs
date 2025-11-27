@@ -1,6 +1,6 @@
 use crate::{syscall::user_access::check_and_clone_cstr, time::PosixTimeSpec};
 
-use super::{fcntl::AtFlags, file::FileMode, SuperBlock};
+use super::{fcntl::AtFlags, file::FileFlags, SuperBlock};
 mod dup2;
 mod faccessat2;
 mod link_utils;
@@ -130,7 +130,7 @@ pub const XATTR_REPLACE: i32 = 0x2; // 设置值，如果属性已存在则替�
 bitflags! {
     /// 文件类型和权限
     #[repr(C)]
-    pub struct ModeType: u32 {
+    pub struct InodeMode: u32 {
         /// 掩码
         const S_IFMT = 0o0_170_000;
         /// 文件类型
@@ -207,7 +207,7 @@ pub struct PosixStatx {
     /// 所有者组ID
     pub stx_gid: u32,
     /// 文件权限
-    pub stx_mode: ModeType,
+    pub stx_mode: InodeMode,
 
     /* 0x20 */
     /// inode号
@@ -255,7 +255,7 @@ impl PosixStatx {
             stx_nlink: 0,
             stx_uid: 0,
             stx_gid: 0,
-            stx_mode: ModeType { bits: 0 },
+            stx_mode: InodeMode { bits: 0 },
             stx_inode: 0,
             stx_size: 0,
             stx_blocks: 0,
@@ -449,19 +449,19 @@ impl PosixOpenHow {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct OpenHow {
-    pub o_flags: FileMode,
-    pub mode: ModeType,
+    pub o_flags: FileFlags,
+    pub mode: InodeMode,
     pub resolve: OpenHowResolve,
 }
 
 impl OpenHow {
-    pub fn new(mut o_flags: FileMode, mut mode: ModeType, resolve: OpenHowResolve) -> Self {
-        if !o_flags.contains(FileMode::O_CREAT) {
-            mode = ModeType::empty();
+    pub fn new(mut o_flags: FileFlags, mut mode: InodeMode, resolve: OpenHowResolve) -> Self {
+        if !o_flags.contains(FileFlags::O_CREAT) {
+            mode = InodeMode::empty();
         }
 
-        if o_flags.contains(FileMode::O_PATH) {
-            o_flags = o_flags.intersection(FileMode::O_PATH_FLAGS);
+        if o_flags.contains(FileFlags::O_PATH) {
+            o_flags = o_flags.intersection(FileFlags::O_PATH_FLAGS);
         }
 
         Self {
@@ -474,8 +474,8 @@ impl OpenHow {
 
 impl From<PosixOpenHow> for OpenHow {
     fn from(posix_open_how: PosixOpenHow) -> Self {
-        let o_flags = FileMode::from_bits_truncate(posix_open_how.flags as u32);
-        let mode = ModeType::from_bits_truncate(posix_open_how.mode as u32);
+        let o_flags = FileFlags::from_bits_truncate(posix_open_how.flags as u32);
+        let mode = InodeMode::from_bits_truncate(posix_open_how.mode as u32);
         let resolve = OpenHowResolve::from_bits_truncate(posix_open_how.resolve);
         return Self::new(o_flags, mode, resolve);
     }

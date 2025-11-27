@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::filesystem::vfs::IndexNode;
 use crate::libs::rwlock::RwLock;
 use crate::process::ProcessManager;
@@ -21,7 +21,7 @@ impl PathContext {
 
 #[derive(Debug)]
 pub struct FsStruct {
-    umask: ModeType, //文件权限掩码
+    umask: InodeMode, //文件权限掩码
     path_context: RwLock<PathContext>,
 }
 
@@ -43,7 +43,7 @@ impl Default for FsStruct {
 impl FsStruct {
     pub fn new() -> Self {
         Self {
-            umask: ModeType::S_IWUGO,
+            umask: InodeMode::S_IWUGO,
             path_context: RwLock::new(PathContext::new()),
         }
     }

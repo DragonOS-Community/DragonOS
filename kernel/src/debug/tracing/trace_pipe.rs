@@ -1,6 +1,6 @@
 use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 use crate::filesystem::kernfs::{KernFSInodeArgs, KernInodeType};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::syscall::InodeMode;
 use crate::filesystem::vfs::PollStatus;
 use crate::libs::wait_queue::WaitQueue;
 use crate::process::{ProcessFlags, ProcessManager};
@@ -91,7 +91,7 @@ impl KernFSCallback for TraceCallBack {
 
 pub fn kernel_inode_provider_trace() -> KernFSInodeArgs {
     KernFSInodeArgs {
-        mode: ModeType::from_bits_truncate(0o444),
+        mode: InodeMode::from_bits_truncate(0o444),
         callback: Some(&TraceCallBack),
         inode_type: KernInodeType::File,
         size: Some(4096),
@@ -205,7 +205,7 @@ impl KernFSCallback for SavedCmdlinesSizeCallBack {
 
 pub fn kernel_inode_provider_saved_cmdlines() -> KernFSInodeArgs {
     KernFSInodeArgs {
-        mode: ModeType::from_bits_truncate(0o444),
+        mode: InodeMode::from_bits_truncate(0o444),
         callback: Some(&SavedCmdlinesSnapshotCallBack),
         inode_type: KernInodeType::File,
         size: Some(4096),

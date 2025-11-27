@@ -27,7 +27,7 @@ use crate::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::ModeType,
+        vfs::syscall::InodeMode,
     },
     init::initcall::INITCALL_CORE,
     libs::spinlock::SpinLock,
@@ -313,7 +313,7 @@ impl Attribute for AttrDevice {
         "device"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -340,7 +340,7 @@ impl Attribute for AttrVendor {
         "vendor"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 

@@ -2,7 +2,7 @@ use super::sys_pipe2::do_kernel_pipe2;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PIPE;
 use crate::{
-    filesystem::vfs::file::FileMode,
+    filesystem::vfs::file::FileFlags,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::vec::Vec;
@@ -29,7 +29,7 @@ impl Syscall for SysPipeHandle {
         if pipefd.is_null() {
             return Err(SystemError::EFAULT);
         } else {
-            do_kernel_pipe2(pipefd, FileMode::empty())
+            do_kernel_pipe2(pipefd, FileFlags::empty())
         }
     }
 

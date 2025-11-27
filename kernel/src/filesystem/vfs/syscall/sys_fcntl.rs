@@ -4,7 +4,7 @@ use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
         fcntl::{FcntlCommand, FD_CLOEXEC},
-        file::FileMode,
+        file::FileFlags,
         syscall::dup2::{do_dup2, do_dup3},
     },
     process::ProcessManager,
@@ -88,7 +88,7 @@ impl SysFcntlHandle {
                         if cmd == FcntlCommand::DupFd {
                             return do_dup2(fd, i as i32, &mut fd_table_guard);
                         } else {
-                            return do_dup3(fd, i as i32, FileMode::O_CLOEXEC, &mut fd_table_guard);
+                            return do_dup3(fd, i as i32, FileFlags::O_CLOEXEC, &mut fd_table_guard);
                         }
                     }
                 }
@@ -138,7 +138,7 @@ impl SysFcntlHandle {
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    return Ok(file.mode().bits() as usize);
+                    return Ok(file.flags().bits() as usize);
                 }
 
                 return Err(SystemError::EBADF);
@@ -150,10 +150,10 @@ impl SysFcntlHandle {
 
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     let arg = arg as u32;
-                    let mode = FileMode::from_bits(arg).ok_or(SystemError::EINVAL)?;
+                    let mode = FileFlags::from_bits(arg).ok_or(SystemError::EINVAL)?;
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    file.set_mode(mode)?;
+                    file.set_flags(mode)?;
                     return Ok(0);
                 }
 

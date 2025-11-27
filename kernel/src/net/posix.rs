@@ -13,8 +13,8 @@ bitflags::bitflags! {
         const DCCP      = 6;    // 0b0000_0110
         const PACKET    = 10;   // 0b0000_1010
 
-        const NONBLOCK  = crate::filesystem::vfs::file::FileMode::O_NONBLOCK.bits();
-        const CLOEXEC   = crate::filesystem::vfs::file::FileMode::O_CLOEXEC.bits();
+        const NONBLOCK  = crate::filesystem::vfs::file::FileFlags::O_NONBLOCK.bits();
+        const CLOEXEC   = crate::filesystem::vfs::file::FileFlags::O_CLOEXEC.bits();
     }
 }
 

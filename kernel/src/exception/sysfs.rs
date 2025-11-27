@@ -12,7 +12,7 @@ use crate::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport,
             SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::ModeType,
+        vfs::syscall::InodeMode,
     },
     init::initcall::INITCALL_POSTCORE,
     misc::ksysfs::sys_kernel_kobj,
@@ -81,7 +81,7 @@ impl AttributeGroup for IrqAttrGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         Some(attr.mode())
     }
 }
@@ -139,7 +139,7 @@ impl Attribute for AttrChipName {
         "chip_name"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -170,7 +170,7 @@ impl Attribute for AttrHardwareIrq {
         "hwirq"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -196,7 +196,7 @@ impl Attribute for AttrType {
         "type"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -227,7 +227,7 @@ impl Attribute for AttrWakeup {
         "wakeup"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -253,7 +253,7 @@ impl Attribute for AttrName {
         "name"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -283,7 +283,7 @@ impl Attribute for AttrActions {
         "actions"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 

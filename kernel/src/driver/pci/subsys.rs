@@ -194,7 +194,7 @@ impl AttributeGroup for PciDeviceAttrGroup {
         &self,
         _kobj: Arc<dyn crate::driver::base::kobject::KObject>,
         attr: &'static dyn crate::filesystem::sysfs::Attribute,
-    ) -> Option<crate::filesystem::vfs::syscall::ModeType> {
+    ) -> Option<crate::filesystem::vfs::syscall::InodeMode> {
         return Some(attr.mode());
     }
 }

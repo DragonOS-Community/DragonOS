@@ -10,7 +10,7 @@ use crate::{
     process::ProcessManager,
 };
 
-use super::ModeType;
+use super::InodeMode;
 
 pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, SystemError> {
     let newdfd = match newdfd {
@@ -39,7 +39,7 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     let new_inode = new_parent.create_with_data(
         new_name,
         FileType::SymLink,
-        ModeType::from_bits_truncate(0o777),
+        InodeMode::from_bits_truncate(0o777),
         0,
     )?;
 

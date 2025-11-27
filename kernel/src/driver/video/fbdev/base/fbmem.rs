@@ -29,7 +29,7 @@ use crate::{
         kernfs::KernFSInode,
         sysfs::AttributeGroup,
         vfs::{
-            file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
+            file::FileFlags, syscall::InodeMode, FilePrivateData, FileSystem, FileType, IndexNode,
             Metadata,
         },
     },
@@ -230,7 +230,7 @@ impl FbDevice {
                 parent: Weak::default(),
                 devfs_metadata: Metadata::new(
                     FileType::FramebufferDevice,
-                    ModeType::from_bits_truncate(0o666),
+                    InodeMode::from_bits_truncate(0o666),
                 ),
             }),
             kobj_state: LockedKObjectState::new(None),
@@ -406,7 +406,7 @@ impl IndexNode for FbDevice {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

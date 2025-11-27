@@ -227,7 +227,7 @@ impl OvlInode {
     }
 
     pub fn create_whiteout(&self, name: &str) -> Result<(), SystemError> {
-        let whiteout_mode = vfs::syscall::ModeType::S_IFCHR;
+        let whiteout_mode = vfs::syscall::InodeMode::S_IFCHR;
         let mut upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
@@ -340,7 +340,7 @@ impl IndexNode for OvlInode {
     fn mkdir(
         &self,
         name: &str,
-        mode: vfs::syscall::ModeType,
+        mode: vfs::syscall::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             upper_inode.mkdir(name, mode)
@@ -399,7 +399,7 @@ impl IndexNode for OvlInode {
         &self,
         name: &str,
         file_type: vfs::FileType,
-        mode: vfs::syscall::ModeType,
+        mode: vfs::syscall::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             upper_inode.create(name, file_type, mode)
@@ -431,7 +431,7 @@ impl IndexNode for OvlInode {
     fn mknod(
         &self,
         filename: &str,
-        mode: vfs::syscall::ModeType,
+        mode: vfs::syscall::InodeMode,
         dev_t: crate::driver::base::device::device_number::DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
         let upper_inode = self.upper_inode.lock();

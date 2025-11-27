@@ -9,7 +9,7 @@ use crate::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::ModeType,
+        vfs::syscall::InodeMode,
     },
 };
 
@@ -39,7 +39,7 @@ impl AttributeGroup for BasicPciReadOnlyAttrs {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         return Some(attr.mode());
     }
 }
@@ -48,7 +48,7 @@ impl AttributeGroup for BasicPciReadOnlyAttrs {
 struct Vendor;
 
 impl Attribute for Vendor {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -79,7 +79,7 @@ impl Attribute for Vendor {
 struct DeviceID;
 
 impl Attribute for DeviceID {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -110,7 +110,7 @@ impl Attribute for DeviceID {
 struct SubsystemVendor;
 
 impl Attribute for SubsystemVendor {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -141,7 +141,7 @@ impl Attribute for SubsystemVendor {
 struct SubsystemDevice;
 
 impl Attribute for SubsystemDevice {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -172,7 +172,7 @@ impl Attribute for SubsystemDevice {
 struct Revision;
 
 impl Attribute for Revision {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -203,7 +203,7 @@ impl Attribute for Revision {
 struct Class;
 
 impl Attribute for Class {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -234,7 +234,7 @@ impl Attribute for Class {
 struct Irq;
 
 impl Attribute for Irq {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -269,7 +269,7 @@ impl Attribute for Irq {
 struct Modalias;
 
 impl Attribute for Modalias {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 

@@ -37,8 +37,8 @@ use crate::{
 };
 
 use super::vfs::{
-    file::{FileMode, FilePrivateData, NamespaceFilePrivateData},
-    syscall::ModeType,
+    file::{FileFlags, FilePrivateData, NamespaceFilePrivateData},
+    syscall::InodeMode,
     utils::DName,
     FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
@@ -88,7 +88,7 @@ pub struct ProcFileCreationParams<'a> {
     pub parent: Arc<dyn IndexNode>,
     pub name: &'a str,
     pub file_type: FileType,
-    pub mode: ModeType,
+    pub mode: InodeMode,
     pub pid: Option<RawPid>,
     pub ftype: ProcFileType,
     pub data: Option<&'a str>,
@@ -106,7 +106,7 @@ pub struct ProcFileCreationParamsBuilder<'a> {
     parent: Option<Arc<dyn IndexNode>>,
     name: Option<&'a str>,
     file_type: Option<FileType>,
-    mode: Option<ModeType>,
+    mode: Option<InodeMode>,
     pid: Option<RawPid>,
     ftype: Option<ProcFileType>,
     data: Option<&'a str>,
@@ -129,7 +129,7 @@ impl<'a> ProcFileCreationParamsBuilder<'a> {
         self
     }
 
-    pub fn mode(mut self, mode: ModeType) -> Self {
+    pub fn mode(mut self, mode: InodeMode) -> Self {
         self.mode = Some(mode);
         self
     }
@@ -154,7 +154,7 @@ impl<'a> ProcFileCreationParamsBuilder<'a> {
             parent: self.parent.ok_or(SystemError::EINVAL)?,
             name: self.name.ok_or(SystemError::EINVAL)?,
             file_type: self.file_type.ok_or(SystemError::EINVAL)?,
-            mode: self.mode.unwrap_or(ModeType::S_IRUGO),
+            mode: self.mode.unwrap_or(InodeMode::S_IRUGO),
             pid: self.pid,
             ftype: self.ftype.ok_or(SystemError::EINVAL)?,
             data: self.data,
@@ -556,7 +556,7 @@ impl ProcFS {
                     ctime: PosixTimeSpec::default(),
                     btime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
-                    mode: ModeType::from_bits_truncate(0o555),
+                    mode: InodeMode::from_bits_truncate(0o555),
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
@@ -602,14 +602,14 @@ impl ProcFS {
         let pid_dir = inode.create(
             &pid.to_string(),
             FileType::Dir,
-            ModeType::from_bits_truncate(0o555),
+            InodeMode::from_bits_truncate(0o555),
         )?;
         // 创建相关文件
         // status文件
         let status_binding = pid_dir.create(
             "status",
             FileType::File,
-            ModeType::from_bits_truncate(0o444),
+            InodeMode::from_bits_truncate(0o444),
         )?;
         let status_file: &LockedProcFSInode = status_binding
             .as_any_ref()
@@ -622,7 +622,7 @@ impl ProcFS {
         let exe_binding = pid_dir.create_with_data(
             "exe",
             FileType::SymLink,
-            ModeType::from_bits_truncate(0o444),
+            InodeMode::from_bits_truncate(0o444),
             0,
         )?;
         let exe_file = exe_binding
@@ -633,7 +633,7 @@ impl ProcFS {
         exe_file.0.lock().fdata.ftype = ProcFileType::ProcExe;
 
         // fd dir
-        let fd = pid_dir.create("fd", FileType::Dir, ModeType::from_bits_truncate(0o555))?;
+        let fd = pid_dir.create("fd", FileType::Dir, InodeMode::from_bits_truncate(0o555))?;
         let fd = fd.as_any_ref().downcast_ref::<LockedProcFSInode>().unwrap();
         fd.0.lock().fdata.ftype = ProcFileType::ProcFdDir;
         //todo: 创建其他文件
@@ -686,7 +686,7 @@ impl LockedProcFSInode {
         // symlinks whose contents look like "ipc:[4026531839]". For now we model
         // them as regular procfs files and implement the textual target via
         // readlink, while `open()` returns a namespace fd.
-        match self.create(ns_name, FileType::File, ModeType::from_bits_truncate(0o444)) {
+        match self.create(ns_name, FileType::File, InodeMode::from_bits_truncate(0o444)) {
             Ok(ns_file) => Ok(ns_file),
             Err(SystemError::EEXIST) => {
                 // Lost a concurrent race: another thread created the same entry
@@ -717,7 +717,7 @@ impl LockedProcFSInode {
             let fd_file = self.create(
                 &fd.to_string(),
                 FileType::SymLink,
-                ModeType::from_bits_truncate(0o444),
+                InodeMode::from_bits_truncate(0o444),
             )?;
             let fd_file_proc = fd_file
                 .as_any_ref()
@@ -771,7 +771,7 @@ impl IndexNode for LockedProcFSInode {
     fn open(
         &self,
         mut data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
@@ -961,7 +961,7 @@ impl IndexNode for LockedProcFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
@@ -1274,7 +1274,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
         let root_inode = ProcessManager::current_mntns().root_inode();
         // procfs 挂载
         let mntfs = root_inode
-            .mkdir("proc", ModeType::from_bits_truncate(0o755))
+            .mkdir("proc", InodeMode::from_bits_truncate(0o755))
             .expect("Unabled to find /proc")
             .mount(procfs, MountFlags::empty())
             .expect("Failed to mount at /proc");

@@ -14,7 +14,7 @@ use system_error::SystemError;
 use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    driver::block::loop_device::loop_device::LoopDevice,
+    driver::block::loop_device::LoopDevice,
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},

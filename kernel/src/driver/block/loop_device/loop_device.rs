@@ -610,7 +610,6 @@ impl LoopDevice {
             );
         }
         drop(inner);
-
         let timeout_ms = 30_000;
         let check_interval_us = 10_000;
         let max_checks = timeout_ms * 1000 / check_interval_us;

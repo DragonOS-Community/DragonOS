@@ -187,6 +187,7 @@ impl X86_64MMArch {
     /// ## 返回值
     /// - `true`: 成功修复,可以继续执行
     /// - `false`: 无法修复,是真正的内核错误
+    #[inline(never)]
     fn try_fixup_exception(
         regs: &mut TrapFrame,
         _error_code: X86PfErrorCode,

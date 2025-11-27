@@ -7,6 +7,8 @@
 #include <sys/stat.h> // 用于 fstat
 #include <stdint.h>
 #include <errno.h>
+#include <pthread.h>
+#include <time.h>
 
 // 控制命令常量
 #define LOOP_CTL_ADD        0x4C80
@@ -63,6 +65,73 @@ long get_file_size(int fd) {
         return -1;
     }
     return st.st_size;
+}
+
+// ===================================================================
+// 资源回收测试辅助结构和函数
+// ===================================================================
+
+// 线程参数结构，用于并发I/O测试
+struct io_thread_args {
+    char loop_dev_path[64];
+    int duration_seconds;
+    volatile int should_stop;
+    int io_count;
+    int error_count;
+};
+
+// 并发读写线程函数
+void* io_worker_thread(void* arg) {
+    struct io_thread_args* args = (struct io_thread_args*)arg;
+    char buffer[512];
+    time_t start_time = time(NULL);
+
+    while (!args->should_stop && (time(NULL) - start_time) < args->duration_seconds) {
+        int fd = open(args->loop_dev_path, O_RDWR);
+        if (fd < 0) {
+            if (errno == ENODEV || errno == ENOENT) {
+                // 设备正在删除或已删除，这是预期的
+                break;
+            }
+            args->error_count++;
+            usleep(10000); // 10ms
+            continue;
+        }
+
+        // 尝试读取
+        if (read(fd, buffer, sizeof(buffer)) < 0) {
+            if (errno != ENODEV) {
+                args->error_count++;
+            }
+        } else {
+            args->io_count++;
+        }
+
+        close(fd);
+        usleep(1000); // 1ms
+    }
+
+    return NULL;
+}
+
+// 删除设备线程函数
+struct delete_thread_args {
+    int control_fd;
+    int loop_minor;
+    int result;
+    int error_code;
+};
+
+void* delete_worker_thread(void* arg) {
+    struct delete_thread_args* args = (struct delete_thread_args*)arg;
+
+    // 稍微延迟以确保I/O线程已经开始
+    usleep(50000); // 50ms
+
+    args->result = ioctl(args->control_fd, LOOP_CTL_REMOVE, args->loop_minor);
+    args->error_code = errno;
+
+    return NULL;
 }
 
 int main() {
@@ -310,8 +379,8 @@ int main() {
     // 并且默认的 sizelimit 是 0，表示不限制
     // 所以 effective_size 应该等于 file_size - offset
     // 我们需要重新计算预期的 effective_size
-    uint64_t expected_sizelimit_after_change = (actual_file_2_size > status_readback.lo_offset) ? (actual_file_2_size - status_readback.lo_offset) : 0;
-    
+    // uint64_t expected_sizelimit_after_change = (actual_file_2_size > status_readback.lo_offset) ? (actual_file_2_size - status_readback.lo_offset) : 0;
+
     // 注意：内核中的 `recalc_effective_size` 会将 `inner.file_size` 更新为有效大小
     // 但是 `lo_sizelimit` 字段在 `LoopStatus64` 中是用户设定的限制，它不会自动改变
     // 这里的验证需要更精确：`lo_sizelimit` 应该和我们之前设置的相同 (即 TEST_FILE_SIZE - 512)
@@ -473,6 +542,408 @@ int main() {
     }
     printf("New backing file extended content verification passed.\n");
 
+    // =======================================================
+    // 资源回收测试 1: 并发I/O期间删除设备
+    // =======================================================
+    printf("\n--- Testing Resource Reclamation: Concurrent I/O During Deletion ---\n");
+
+    // 创建新的loop设备用于此测试，使用重试机制处理可能的竞态条件
+    int test_minor = -1;
+    int returned_minor_test = -1;
+    for (int retry = 0; retry < 10; retry++) {
+        if (ioctl(control_fd, LOOP_CTL_GET_FREE, &test_minor) < 0) {
+            perror("Failed to get free loop device for reclamation test");
+            goto cleanup;
+        }
+
+        returned_minor_test = ioctl(control_fd, LOOP_CTL_ADD, test_minor);
+        if (returned_minor_test >= 0) {
+            test_minor = returned_minor_test;
+            break;
+        }
+
+        if (errno != EEXIST) {
+            perror("Failed to add loop device for reclamation test");
+            goto cleanup;
+        }
+        // 如果设备已存在，重试获取新的minor号
+        printf("Device loop%d already exists, retrying...\n", test_minor);
+    }
+
+    if (returned_minor_test < 0) {
+        fprintf(stderr, "Failed to create loop device after 10 retries\n");
+        goto cleanup;
+    }
+
+    char test_loop_path[64];
+    sprintf(test_loop_path, "/dev/loop%d", test_minor);
+    int test_loop_fd = open(test_loop_path, O_RDWR);
+    if (test_loop_fd < 0) {
+        perror("Failed to open test loop device");
+        ioctl(control_fd, LOOP_CTL_REMOVE, test_minor);
+        goto cleanup;
+    }
+
+    // 绑定到测试文件
+    if (ioctl(test_loop_fd, LOOP_SET_FD, backing_fd_1) < 0) {
+        perror("Failed to bind test loop device");
+        close(test_loop_fd);
+        ioctl(control_fd, LOOP_CTL_REMOVE, test_minor);
+        goto cleanup;
+    }
+    printf("Created test loop device loop%d for concurrent I/O test.\n", test_minor);
+
+    // 启动多个I/O线程
+    #define NUM_IO_THREADS 4
+    pthread_t io_threads[NUM_IO_THREADS];
+    struct io_thread_args io_args[NUM_IO_THREADS];
+
+    for (int i = 0; i < NUM_IO_THREADS; i++) {
+        strcpy(io_args[i].loop_dev_path, test_loop_path);
+        io_args[i].duration_seconds = 5;
+        io_args[i].should_stop = 0;
+        io_args[i].io_count = 0;
+        io_args[i].error_count = 0;
+
+        if (pthread_create(&io_threads[i], NULL, io_worker_thread, &io_args[i]) != 0) {
+            perror("Failed to create I/O thread");
+            // 清理已创建的线程
+            for (int j = 0; j < i; j++) {
+                io_args[j].should_stop = 1;
+                pthread_join(io_threads[j], NULL);
+            }
+            close(test_loop_fd);
+            ioctl(control_fd, LOOP_CTL_REMOVE, test_minor);
+            goto cleanup;
+        }
+    }
+    printf("Started %d concurrent I/O threads.\n", NUM_IO_THREADS);
+
+    // 关闭主文件描述符，避免在删除时引用计数不为0
+    // I/O线程会重新打开设备进行操作
+    close(test_loop_fd);
+    printf("Closed main loop device file descriptor.\n");
+
+    // 启动删除线程
+    pthread_t delete_thread;
+    struct delete_thread_args delete_args;
+    delete_args.control_fd = control_fd;
+    delete_args.loop_minor = test_minor;
+    delete_args.result = 0;
+    delete_args.error_code = 0;
+    //创建失败回退删除所有线程
+    if (pthread_create(&delete_thread, NULL, delete_worker_thread, &delete_args) != 0) {
+        perror("Failed to create delete thread");
+        for (int i = 0; i < NUM_IO_THREADS; i++) {
+            io_args[i].should_stop = 1;
+            pthread_join(io_threads[i], NULL);
+        }
+        close(test_loop_fd);
+        ioctl(control_fd, LOOP_CTL_REMOVE, test_minor);
+        goto cleanup;
+    }
+    printf("Started deletion thread.\n");
+
+    // 等待删除完成
+    pthread_join(delete_thread, NULL);
+    printf("Deletion thread completed with result: %d (errno: %d)\n",
+           delete_args.result, delete_args.error_code);
+
+    // 停止I/O线程
+    for (int i = 0; i < NUM_IO_THREADS; i++) {
+        io_args[i].should_stop = 1;
+    }
+
+    // 等待所有I/O线程完成
+    int total_io_count = 0;
+    int total_error_count = 0;
+    for (int i = 0; i < NUM_IO_THREADS; i++) {
+        pthread_join(io_threads[i], NULL);
+        total_io_count += io_args[i].io_count;
+        total_error_count += io_args[i].error_count;
+        printf("I/O thread %d: %d successful ops, %d errors\n",
+               i, io_args[i].io_count, io_args[i].error_count);
+    }
+    printf("Total I/O operations: %d successful, %d errors\n",
+           total_io_count, total_error_count);
+
+    // test_loop_fd 已经在删除前关闭了
+
+    if (delete_args.result == 0) {
+        printf("✓ Concurrent I/O deletion test PASSED: Device deleted successfully while I/O was active.\n");
+    } else {
+        printf("✗ Concurrent I/O deletion test FAILED: Deletion returned %d (errno: %d)\n",
+               delete_args.result, delete_args.error_code);
+    }
+
+    // 验证设备已被删除
+    int verify_test_fd = open(test_loop_path, O_RDWR);
+    if (verify_test_fd < 0 && (errno == ENOENT || errno == ENODEV)) {
+        printf("✓ Device %s is correctly inaccessible after deletion.\n", test_loop_path);
+    } else {
+        if (verify_test_fd >= 0) {
+            printf("✗ FAILED: Device %s still accessible after deletion!\n", test_loop_path);
+            close(verify_test_fd);
+        }
+    }
+
+    // =======================================================
+    // 资源回收测试 2: 删除未绑定的设备
+    // =======================================================
+    printf("\n--- Testing Resource Reclamation: Deleting Unbound Device ---\n");
+
+    int unbound_minor = -1;
+    int ret_unbound = -1;
+    for (int retry = 0; retry < 10; retry++) {
+        if (ioctl(control_fd, LOOP_CTL_GET_FREE, &unbound_minor) < 0) {
+            perror("Failed to get free loop device for unbound test");
+            goto cleanup;
+        }
+
+        ret_unbound = ioctl(control_fd, LOOP_CTL_ADD, unbound_minor);
+        if (ret_unbound >= 0) {
+            unbound_minor = ret_unbound;
+            break;
+        }
+
+        if (errno != EEXIST) {
+            perror("Failed to add loop device for unbound test");
+            goto cleanup;
+        }
+    }
+
+    if (ret_unbound < 0) {
+        fprintf(stderr, "Failed to create unbound loop device after retries\n");
+        goto cleanup;
+    }
+    printf("Created unbound loop device loop%d.\n", unbound_minor);
+
+    // 立即删除未绑定的设备
+    if (ioctl(control_fd, LOOP_CTL_REMOVE, unbound_minor) < 0) {
+        perror("Failed to remove unbound loop device");
+        printf("✗ Unbound device deletion test FAILED.\n");
+    } else {
+        printf("✓ Unbound device deletion test PASSED: Successfully deleted loop%d.\n", unbound_minor);
+    }
+
+    // =======================================================
+    // 资源回收测试 3: 重复删除同一设备
+    // =======================================================
+    printf("\n--- Testing Resource Reclamation: Duplicate Deletion ---\n");
+
+    int dup_minor = -1;
+    int ret_dup = -1;
+    for (int retry = 0; retry < 10; retry++) {
+        if (ioctl(control_fd, LOOP_CTL_GET_FREE, &dup_minor) < 0) {
+            perror("Failed to get free loop device for duplicate deletion test");
+            goto cleanup;
+        }
+
+        ret_dup = ioctl(control_fd, LOOP_CTL_ADD, dup_minor);
+        if (ret_dup >= 0) {
+            dup_minor = ret_dup;
+            break;
+        }
+
+        if (errno != EEXIST) {
+            perror("Failed to add loop device for duplicate deletion test");
+            goto cleanup;
+        }
+    }
+
+    if (ret_dup < 0) {
+        fprintf(stderr, "Failed to create loop device for duplicate deletion test after retries\n");
+        goto cleanup;
+    }
+    printf("Created loop device loop%d for duplicate deletion test.\n", dup_minor);
+
+    // 第一次删除
+    if (ioctl(control_fd, LOOP_CTL_REMOVE, dup_minor) < 0) {
+        perror("First deletion failed");
+        printf("✗ Duplicate deletion test FAILED: First deletion failed.\n");
+        goto cleanup;
+    }
+    printf("First deletion of loop%d succeeded.\n", dup_minor);
+
+    // 第二次删除（应该失败）
+    errno = 0;
+    int second_delete = ioctl(control_fd, LOOP_CTL_REMOVE, dup_minor);
+    if (second_delete < 0 && (errno == ENODEV || errno == EINVAL)) {
+        printf("✓ Duplicate deletion test PASSED: Second deletion correctly failed with errno %d.\n", errno);
+    } else {
+        printf("✗ Duplicate deletion test FAILED: Second deletion returned %d (errno: %d), expected failure.\n",
+               second_delete, errno);
+    }
+
+    // =======================================================
+    // 资源回收测试 4: 文件描述符泄漏检测
+    // =======================================================
+    printf("\n--- Testing Resource Reclamation: File Descriptor Leak Detection ---\n");
+
+    // 创建多个loop设备并快速删除，检查是否有FD泄漏
+    #define LEAK_TEST_COUNT 10
+    int leak_test_minors[LEAK_TEST_COUNT];
+    int leak_test_fds[LEAK_TEST_COUNT];
+
+    printf("Creating and deleting %d loop devices to test for FD leaks...\n", LEAK_TEST_COUNT);
+
+    for (int i = 0; i < LEAK_TEST_COUNT; i++) {
+        leak_test_minors[i] = -1;
+        leak_test_fds[i] = -1;
+
+        // 使用重试机制创建设备
+        for (int retry = 0; retry < 10; retry++) {
+            int free_minor;
+            if (ioctl(control_fd, LOOP_CTL_GET_FREE, &free_minor) < 0) {
+                perror("Failed to get free loop device for leak test");
+                // 清理已创建的设备
+                for (int j = 0; j < i; j++) {
+                    if (leak_test_minors[j] >= 0) {
+                        ioctl(control_fd, LOOP_CTL_REMOVE, leak_test_minors[j]);
+                    }
+                }
+                goto cleanup;
+            }
+
+            int ret_leak = ioctl(control_fd, LOOP_CTL_ADD, free_minor);
+            if (ret_leak >= 0) {
+                leak_test_minors[i] = ret_leak;
+                break;
+            }
+
+            if (errno != EEXIST) {
+                perror("Failed to add loop device for leak test");
+                for (int j = 0; j < i; j++) {
+                    if (leak_test_minors[j] >= 0) {
+                        ioctl(control_fd, LOOP_CTL_REMOVE, leak_test_minors[j]);
+                    }
+                }
+                goto cleanup;
+            }
+        }
+
+        if (leak_test_minors[i] < 0) {
+            fprintf(stderr, "Failed to create loop device %d for leak test\n", i);
+            for (int j = 0; j < i; j++) {
+                if (leak_test_minors[j] >= 0) {
+                    ioctl(control_fd, LOOP_CTL_REMOVE, leak_test_minors[j]);
+                }
+            }
+            goto cleanup;
+        }
+
+        // 打开并绑定设备
+        char leak_path[64];
+        sprintf(leak_path, "/dev/loop%d", leak_test_minors[i]);
+        leak_test_fds[i] = open(leak_path, O_RDWR);
+        if (leak_test_fds[i] >= 0) {
+            ioctl(leak_test_fds[i], LOOP_SET_FD, backing_fd_1);
+        }
+    }
+
+    // 删除所有设备
+    int leak_delete_success = 0;
+    for (int i = 0; i < LEAK_TEST_COUNT; i++) {
+        if (leak_test_fds[i] >= 0) {
+            ioctl(leak_test_fds[i], LOOP_CLR_FD, 0);
+            close(leak_test_fds[i]);
+        }
+
+        if (ioctl(control_fd, LOOP_CTL_REMOVE, leak_test_minors[i]) == 0) {
+            leak_delete_success++;
+        }
+    }
+
+    printf("Successfully deleted %d out of %d devices.\n", leak_delete_success, LEAK_TEST_COUNT);
+    if (leak_delete_success == LEAK_TEST_COUNT) {
+        printf("✓ FD leak test PASSED: All devices deleted successfully.\n");
+    } else {
+        printf("⚠ FD leak test: %d devices failed to delete.\n", LEAK_TEST_COUNT - leak_delete_success);
+    }
+
+    // =======================================================
+    // 资源回收测试 5: 删除后设备不可访问
+    // =======================================================
+    printf("\n--- Testing Resource Reclamation: Device Inaccessibility After Deletion ---\n");
+
+    int reject_minor = -1;
+    int ret_reject = -1;
+    for (int retry = 0; retry < 10; retry++) {
+        if (ioctl(control_fd, LOOP_CTL_GET_FREE, &reject_minor) < 0) {
+            perror("Failed to get free loop device for I/O rejection test");
+            goto cleanup;
+        }
+
+        ret_reject = ioctl(control_fd, LOOP_CTL_ADD, reject_minor);
+        if (ret_reject >= 0) {
+            reject_minor = ret_reject;
+            break;
+        }
+
+        if (errno != EEXIST) {
+            perror("Failed to add loop device for I/O rejection test");
+            goto cleanup;
+        }
+    }
+
+    if (ret_reject < 0) {
+        fprintf(stderr, "Failed to create loop device for I/O rejection test after retries\n");
+        goto cleanup;
+    }
+
+    char reject_path[64];
+    sprintf(reject_path, "/dev/loop%d", reject_minor);
+    int reject_fd = open(reject_path, O_RDWR);
+    if (reject_fd < 0) {
+        perror("Failed to open loop device for I/O rejection test");
+        ioctl(control_fd, LOOP_CTL_REMOVE, reject_minor);
+        goto cleanup;
+    }
+
+    if (ioctl(reject_fd, LOOP_SET_FD, backing_fd_1) < 0) {
+        perror("Failed to bind loop device for I/O rejection test");
+        close(reject_fd);
+        ioctl(control_fd, LOOP_CTL_REMOVE, reject_minor);
+        goto cleanup;
+    }
+    printf("Created and bound loop device loop%d for I/O rejection test.\n", reject_minor);
+
+    // 执行一次成功的I/O操作
+    char reject_buf[512] = "Test data";
+    if (write(reject_fd, reject_buf, sizeof(reject_buf)) != sizeof(reject_buf)) {
+        perror("Initial write failed");
+    } else {
+        printf("Initial write succeeded (expected).\n");
+    }
+
+    // 关闭文件描述符，准备删除
+    close(reject_fd);
+    printf("Closed device file descriptor.\n");
+
+    // 触发删除
+    printf("Triggering device deletion...\n");
+    if (ioctl(control_fd, LOOP_CTL_REMOVE, reject_minor) < 0) {
+        perror("Failed to trigger deletion for I/O rejection test");
+        goto cleanup;
+    }
+    printf("Deletion triggered successfully.\n");
+
+    // 尝试重新打开设备（应该失败）
+    errno = 0;
+    int reopen_reject_fd = open(reject_path, O_RDWR);
+    if (reopen_reject_fd < 0 && (errno == ENODEV || errno == ENOENT)) {
+        printf("✓ I/O rejection test PASSED: Device correctly inaccessible after deletion (errno: %d).\n", errno);
+    } else {
+        if (reopen_reject_fd >= 0) {
+            printf("✗ I/O rejection test FAILED: Device still accessible after deletion.\n");
+            close(reopen_reject_fd);
+        } else {
+            printf("✗ I/O rejection test FAILED: Unexpected errno %d (expected ENODEV or ENOENT).\n", errno);
+        }
+    }
+
+    printf("\n=== All Resource Reclamation Tests Completed ===\n");
+
 
 cleanup:
     // 6. 清理并删除 loop 设备
@@ -482,16 +953,19 @@ cleanup:
         perror("Failed to clear loop device backing file");
     }
 
+    // 在删除设备前先关闭文件描述符，避免引用计数问题
+    close(loop_fd);
+    printf("Closed loop device file descriptor.\n");
+
     printf("Removing loop device loop%d...\n", loop_minor);
     if (ioctl(control_fd, LOOP_CTL_REMOVE, loop_minor) < 0) {
         perror("Failed to remove loop device");
-        // 尝试关闭所有打开的fd，即使删除失败也继续清理
+        // 即使删除失败也继续清理
     } else {
         printf("Loop device loop%d removed successfully.\n", loop_minor);
     }
 
     // 释放资源并删除测试文件
-    close(loop_fd);
     close(backing_fd_1);
     close(backing_fd_2);
     close(control_fd);

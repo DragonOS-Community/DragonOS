@@ -669,33 +669,40 @@ impl LockedProcFSInode {
         &self,
         ns_name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // Convert namespace name to type
-        let ns_type = ThreadSelfNsFileType::try_from(ns_name)?;
+        // Convert namespace name to type,validate early.
+        ThreadSelfNsFileType::try_from(ns_name)?;
 
-        // Check if file already exists without triggering recursive lookup
+        let name = DName::from(ns_name);
+
+        // Fast-path: check if file already exists under the children map.
         {
-            let name = DName::from(ns_name);
             let guard = self.0.lock();
             if let Some(existing) = guard.children.get(&name) {
                 return Ok(existing.clone());
             }
         }
 
-        // Create the namespace file. In Linux these appear as symlinks whose
-        // contents look like "ipc:[4026531839]". For now we model them as
-        // regular procfs files and implement the textual target via readlink,
-        // while `open()` returns a namespace fd.
-        let ns_file = self.create(ns_name, FileType::File, ModeType::from_bits_truncate(0o444))?;
-
-        let ns_file_proc = ns_file
-            .as_any_ref()
-            .downcast_ref::<LockedProcFSInode>()
-            .unwrap();
-
-        // Store namespace type in fd field (as u8 cast to i32)
-        ns_file_proc.0.lock().fdata.ftype = ProcFileType::ProcThreadSelfNsChild(ns_type);
-
-        Ok(ns_file)
+        // Slow-path: try to create the namespace file. In Linux these appear as
+        // symlinks whose contents look like "ipc:[4026531839]". For now we model
+        // them as regular procfs files and implement the textual target via
+        // readlink, while `open()` returns a namespace fd.
+        match self.create(ns_name, FileType::File, ModeType::from_bits_truncate(0o444)) {
+            Ok(ns_file) => Ok(ns_file),
+            Err(SystemError::EEXIST) => {
+                // Lost a concurrent race: another thread created the same entry
+                // between our initial check and create(). Look it up again and
+                // return the existing node instead of failing.
+                let guard = self.0.lock();
+                if let Some(existing) = guard.children.get(&name) {
+                    Ok(existing.clone())
+                } else {
+                    // Extremely unlikely: filesystem reported EEXIST but the
+                    // child is not present in the in-memory map. Treat as ENOENT.
+                    Err(SystemError::ENOENT)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn dynamical_find_fd(&self, fd: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -963,9 +970,9 @@ impl IndexNode for LockedProcFSInode {
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-        let name = DName::from(name);
+        let dname = DName::from(name);
         // 如果有重名的，则返回
-        if inode.children.contains_key(&name) {
+        if inode.children.contains_key(&dname) {
             return Err(SystemError::EEXIST);
         }
 
@@ -999,14 +1006,28 @@ impl IndexNode for LockedProcFSInode {
                     ftype: ProcFileType::Default,
                     fd: -1,
                 },
-                dname: name.clone(),
+                dname: dname.clone(),
             })));
 
-        // 初始化inode的自引用的weak指针
-        result.0.lock().self_ref = Arc::downgrade(&result);
+        {
+            // 初始化子 inode 自引用 weak 指针，并在必要时为
+            // /proc/thread-self/ns/* 节点预先设置正确的 ftype，避免并发下
+            // 其他线程在 children.map 可见但 ftype 仍为 Default 的中间态。
+            let mut child_guard = result.0.lock();
+            child_guard.self_ref = Arc::downgrade(&result);
+
+            // Special case: creating entries under /proc/thread-self/ns
+            if let ProcFileType::ProcThreadSelfNsRoot = inode.fdata.ftype {
+                if let FileType::File = file_type {
+                    // 名称必须是合法的 namespace 名称，否则直接返回错误并“回滚”创建。
+                    let ns_type = ThreadSelfNsFileType::try_from(name)?;
+                    child_guard.fdata.ftype = ProcFileType::ProcThreadSelfNsChild(ns_type);
+                }
+            }
+        }
 
         // 将子inode插入父inode的B树中
-        inode.children.insert(name, result.clone());
+        inode.children.insert(dname, result.clone());
 
         return Ok(result);
     }

@@ -25,6 +25,7 @@ chdir_test
 fchdir_test
 rename_test
 getdents_test
+preadv_test
 
 # 进程相关测试
 fork_test
@@ -39,6 +40,7 @@ tkill_test
 tgkill_test
 prctl_test
 exit_test
+setns_test
 
 # 内存管理测试
 #mmap_test
@@ -57,6 +59,7 @@ sigaction_test
 sigprocmask_test
 sigaltstack_test
 sigreturn_test
+sigtimedwait_test
 
 # 其他测试
 itimer_test

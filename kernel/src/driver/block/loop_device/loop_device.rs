@@ -13,12 +13,16 @@ use crate::{
             driver::{Driver, DriverCommonData},
             DevName, Device, DeviceCommonData, DeviceType, IdTable,
         },
-        kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
+        kobject::{
+            KObjType, KObject, KObjectCommonData, KObjectManager, KObjectState, KObjectSysFSOps,
+            LockedKObjectState,
+        },
         kset::KSet,
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
+        sysfs::{AttributeGroup, SysFSOps},
         vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, InodeId, Metadata},
     },
     libs::{
@@ -36,8 +40,10 @@ use alloc::{
 use core::{
     any::Any,
     fmt::{Debug, Formatter},
+    sync::atomic::{AtomicU32, Ordering},
 };
 use ida::IdAllocator;
+use log::{error, info, warn};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -76,6 +82,42 @@ pub struct LoopStatus64 {
     pub lo_flags: u32,
     pub __pad: u32,
 }
+#[derive(Debug)]
+pub struct LoopDeviceKObjType;
+
+impl KObjType for LoopDeviceKObjType {
+    fn release(&self, kobj: Arc<dyn KObject>) {
+        if let Some(loop_dev) = kobj.as_any_ref().downcast_ref::<LoopDevice>() {
+            loop_dev.final_cleanup();
+        }
+    }
+
+    fn sysfs_ops(&self) -> Option<&dyn SysFSOps> {
+        Some(&KObjectSysFSOps)
+    }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        None
+    }
+}
+static LOOP_DEVICE_KOBJ_TYPE: LoopDeviceKObjType = LoopDeviceKObjType;
+struct IoGuard<'a> {
+    device: &'a LoopDevice,
+}
+
+impl<'a> IoGuard<'a> {
+    fn new(device: &'a LoopDevice) -> Result<Self, SystemError> {
+        device.io_start()?;
+        Ok(Self { device })
+    }
+}
+
+impl<'a> Drop for IoGuard<'a> {
+    fn drop(&mut self) {
+        self.device.io_end();
+    }
+}
+
 pub struct LoopDevice {
     id: usize,
     minor: u32,
@@ -85,6 +127,8 @@ pub struct LoopDevice {
     self_ref: Weak<Self>,
     fs: RwLock<Weak<DevFS>>,
     parent: RwLock<Weak<LockedDevFSInode>>,
+    /// 活跃的 I/O 操作计数
+    active_io_count: AtomicU32,
 }
 #[derive(Debug, Clone)]
 pub struct LoopPrivateData {
@@ -111,8 +155,10 @@ impl LoopDeviceInner {
             (LoopState::Unbound, LoopState::Bound) => {}
             (LoopState::Bound, LoopState::Unbound) => {}
             (LoopState::Bound, LoopState::Rundown) => {}
+            (LoopState::Rundown, LoopState::Draining) => {}
             (LoopState::Rundown, LoopState::Deleting) => {}
             (LoopState::Rundown, LoopState::Unbound) => {}
+            (LoopState::Draining, LoopState::Deleting) => {}
             (LoopState::Unbound, LoopState::Deleting) => {}
             _ => return Err(SystemError::EINVAL),
         }
@@ -126,6 +172,7 @@ pub enum LoopState {
     Unbound,
     Bound,
     Rundown,
+    Draining,
     Deleting,
 }
 impl Debug for LoopDevice {
@@ -181,7 +228,12 @@ impl LoopDevice {
             self_ref: self_ref.clone(),
             fs: RwLock::new(Weak::default()),
             parent: RwLock::new(Weak::default()),
+            active_io_count: AtomicU32::new(0),
         });
+
+        // 设置 KObjType
+        dev.set_kobj_type(Some(&LOOP_DEVICE_KOBJ_TYPE));
+
         Some(dev)
     }
 
@@ -293,7 +345,11 @@ impl LoopDevice {
         match inner.state {
             LoopState::Bound | LoopState::Rundown => inner.set_state(LoopState::Unbound)?,
             LoopState::Unbound => {}
-            LoopState::Deleting => return Err(SystemError::EBUSY),
+            LoopState::Draining => return Err(SystemError::EBUSY),
+            LoopState::Deleting => {
+                // 在删除流程中，允许清理文件
+                // 状态已经是Deleting，无需改变
+            }
         }
 
         inner.file_inode = None;
@@ -469,6 +525,164 @@ impl LoopDevice {
     fn set_capacity(&self, _arg: usize) -> Result<(), SystemError> {
         self.recalc_effective_size()?;
         Ok(())
+    }
+
+    /// # 功能
+    ///
+    /// I/O 操作开始时调用，增加活跃 I/O 计数
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 成功增加计数
+    /// - `Err(SystemError::ENODEV)`: 设备正在删除，拒绝新的 I/O
+    fn io_start(&self) -> Result<(), SystemError> {
+        let inner = self.inner();
+        if matches!(
+            inner.state,
+            LoopState::Rundown | LoopState::Draining | LoopState::Deleting
+        ) {
+            return Err(SystemError::ENODEV);
+        }
+
+        self.active_io_count.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// # 功能
+    ///
+    /// I/O 操作完成时调用，减少活跃 I/O 计数
+    fn io_end(&self) {
+        let prev = self.active_io_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 0 {
+            warn!(
+                "Loop device loop{}: I/O count underflow",
+                self.inner().device_number.minor()
+            );
+        }
+    }
+
+    /// # 功能
+    ///
+    /// 进入 Rundown 状态，停止接受新的 I/O 请求
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 成功进入 Rundown 状态
+    /// - `Err(SystemError)`: 状态转换失败
+    fn enter_rundown_state(&self) -> Result<(), SystemError> {
+        let mut inner = self.inner();
+        match inner.state {
+            LoopState::Bound => {
+                inner.set_state(LoopState::Rundown)?;
+                info!(
+                    "Loop device loop{} entering rundown state",
+                    inner.device_number.minor()
+                );
+            }
+            LoopState::Unbound => {
+                // 空设备可以直接删除
+                inner.set_state(LoopState::Deleting)?;
+                info!(
+                    "Loop device loop{} is unbound, skipping to deleting state",
+                    inner.device_number.minor()
+                );
+            }
+            LoopState::Rundown => {}
+            LoopState::Draining | LoopState::Deleting => {
+                return Err(SystemError::EBUSY);
+            }
+        }
+        Ok(())
+    }
+
+    /// # 功能
+    ///
+    /// 等待所有活跃的 I/O 操作完成
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 所有 I/O 已完成
+    /// - `Err(SystemError::ETIMEDOUT)`: 等待超时
+    fn drain_active_io(&self) -> Result<(), SystemError> {
+        let mut inner = self.inner();
+        if matches!(inner.state, LoopState::Rundown) {
+            inner.set_state(LoopState::Draining)?;
+            info!(
+                "Loop device loop{} entering draining state",
+                inner.device_number.minor()
+            );
+        }
+        drop(inner);
+
+        let timeout_ms = 30_000; 
+        let check_interval_us = 10_000; 
+        let max_checks = timeout_ms * 1000 / check_interval_us;
+
+        for _i in 0..max_checks {
+            let count = self.active_io_count.load(Ordering::Acquire);
+            if count == 0 {
+                break;
+            }
+
+            core::hint::spin_loop();
+        }
+
+        let final_count = self.active_io_count.load(Ordering::Acquire);
+        if final_count != 0 {
+            error!(
+                "Timeout waiting for I/O to drain on loop{}: {} operations still active",
+                self.minor(),
+                final_count
+            );
+            return Err(SystemError::ETIMEDOUT);
+        }
+
+        info!(
+            "All I/O operations drained for loop device loop{}",
+            self.minor()
+        );
+
+        let mut inner = self.inner();
+        inner.set_state(LoopState::Deleting)?;
+
+        Ok(())
+    }
+
+    /// # 功能
+    ///
+    /// 从 sysfs 中移除设备
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 成功移除
+    /// - `Err(SystemError)`: 移除失败
+    fn remove_from_sysfs(&self) -> Result<(), SystemError> {
+        // 使用 KObjectManager 从 sysfs 中移除
+        if let Some(kobj) = self.self_ref.upgrade() {
+            KObjectManager::remove_kobj(kobj as Arc<dyn KObject>);
+            info!("Removed loop device loop{} from sysfs", self.minor());
+        }
+        Ok(())
+    }
+
+    /// # 功能
+    ///
+    /// 最终清理函数，由 KObjType::release 调用
+    /// 执行设备删除的最后清理工作
+    fn final_cleanup(&self) {
+        info!(
+            "Final cleanup for loop device loop{} (id {})",
+            self.minor(),
+            self.id()
+        );
+        let mut inner = self.inner();
+        if let Some(file_inode) = inner.file_inode.take() {
+            drop(file_inode);
+            warn!(
+                "File inode was still present during final cleanup for loop{}",
+                self.minor()
+            );
+        }
+        inner.file_size = 0;
+        inner.offset = 0;
+        inner.size_limit = 0;
+        info!("Loop device loop{} cleanup complete", self.minor());
     }
 }
 
@@ -759,6 +973,9 @@ impl BlockDevice for LoopDevice {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
+        // 使用 IoGuard 确保 I/O 计数正确管理
+        let _io_guard = IoGuard::new(self)?;
+
         if count == 0 {
             return Ok(0);
         }
@@ -801,6 +1018,9 @@ impl BlockDevice for LoopDevice {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
+        // 使用 IoGuard 确保 I/O 计数正确管理
+        let _io_guard = IoGuard::new(self)?;
+
         if count == 0 {
             return Ok(0);
         }
@@ -1192,35 +1412,42 @@ impl LoopManager {
         );
         Ok(loop_dev)
     }
+    /// # 功能
+    ///
+    /// 删除指定 minor 的 loop 设备
+    /// 实现规范的删除流程，包括状态转换、I/O 排空、资源清理
+    ///
+    /// ## 参数
+    ///
+    /// - `minor`: 要删除的设备的次设备号
+    ///
+    /// ## 返回值
+    /// - `Ok(())`: 成功删除设备
+    /// - `Err(SystemError)`: 删除失败
     pub fn loop_remove(&self, minor: u32) -> Result<(), SystemError> {
         if minor >= Self::MAX_DEVICES as u32 {
             return Err(SystemError::EINVAL);
         }
-
         let device = {
             let inner = self.inner();
             Self::find_device_by_minor_locked(&inner, minor)
         }
         .ok_or(SystemError::ENODEV)?;
         let id = device.id();
+        info!("Starting removal of loop device loop{} (id {})", minor, id);
+        device.enter_rundown_state()?;
+        let needs_drain = {
+            let inner = device.inner();
+            !matches!(inner.state, LoopState::Deleting)
+        };
 
-        {
-            let mut guard = device.inner();
-            match guard.state {
-                LoopState::Bound => {
-                    guard.set_state(LoopState::Rundown)?;
-                }
-                LoopState::Rundown | LoopState::Unbound => {}
-                LoopState::Deleting => return Ok(()),
-            }
+        if needs_drain {
+            device.drain_active_io()?;
         }
 
         device.clear_file()?;
 
-        {
-            let mut guard = device.inner();
-            guard.set_state(LoopState::Deleting)?;
-        }
+        let _ = device.remove_from_sysfs();
 
         let block_dev: Arc<dyn BlockDevice> = device.clone();
         block_dev_manager().unregister(&block_dev)?;
@@ -1231,8 +1458,10 @@ impl LoopManager {
             Self::free_id_locked(&mut inner, id);
             inner.next_free_minor = minor;
         }
-
-        log::info!("Loop device id {} (minor {}) removed.", id, minor);
+        info!(
+            "Loop device id {} (minor {}) removed successfully.",
+            id, minor
+        );
         Ok(())
     }
 

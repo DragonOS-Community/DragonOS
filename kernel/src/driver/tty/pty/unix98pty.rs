@@ -290,7 +290,7 @@ pub fn ptmx_open(
     // 设置privdata
     *data = FilePrivateData::Tty(TtyFilePrivateData {
         tty: tty.clone(),
-        file_flags: *mode,
+        flags: *mode,
     });
 
     let core = tty.core();

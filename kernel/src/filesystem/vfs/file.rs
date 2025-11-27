@@ -101,9 +101,9 @@ impl Default for FilePrivateData {
 }
 
 impl FilePrivateData {
-    pub fn update_flags(&mut self, file_flags: FileFlags) {
+    pub fn update_flags(&mut self, flags: FileFlags) {
         if let FilePrivateData::Pipefs(pdata) = self {
-            pdata.set_flags(file_flags);
+            pdata.set_flags(flags);
         }
     }
 
@@ -342,7 +342,7 @@ pub struct File {
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
     offset: AtomicUsize,
     /// 文件的打开模式
-    file_flags: RwLock<FileFlags>,
+    flags: RwLock<FileFlags>,
     /// 文件的访问模式
     mode: RwLock<FileMode>,
     /// 文件类型
@@ -364,7 +364,7 @@ impl File {
     /// @brief 创建一个新的文件对象
     ///
     /// @param inode 文件对象对应的inode
-    /// @param file_flags 文件的打开模式
+    /// @param flags 文件的打开模式
     pub fn new(inode: Arc<dyn IndexNode>, mut flags: FileFlags) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
@@ -411,7 +411,7 @@ impl File {
         let f = File {
             inode,
             offset: AtomicUsize::new(0),
-            file_flags: RwLock::new(flags),
+            flags: RwLock::new(flags),
             mode: RwLock::new(mode),
             file_type,
             readdir_subdirs_name: SpinLock::new(Vec::default()),
@@ -829,7 +829,7 @@ impl File {
         let res = Self {
             inode: self.inode.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
-            file_flags: RwLock::new(self.flags()),
+            flags: RwLock::new(self.flags()),
             mode: RwLock::new(self.mode()),
             file_type: self.file_type,
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
@@ -861,7 +861,7 @@ impl File {
     /// @brief 获取文件的打开模式
     #[inline]
     pub fn flags(&self) -> FileFlags {
-        return *self.file_flags.read();
+        return *self.flags.read();
     }
 
     /// @brief 获取文件的访问模式
@@ -883,7 +883,7 @@ impl File {
     }
 
     pub fn set_flags(&self, mut new_flags: FileFlags) -> Result<(), SystemError> {
-        // todo: 是否需要调用inode的open方法，以更新private data（假如它与file_flags有关的话）?
+        // todo: 是否需要调用inode的open方法，以更新private data（假如它与flags有关的话）?
         // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
 
         // 访问模式不可修改
@@ -906,7 +906,7 @@ impl File {
         new_flags = FileFlags::from_bits_truncate(new_bits);
 
         // 更新文件的打开模式
-        *self.file_flags.write() = new_flags;
+        *self.flags.write() = new_flags;
         self.private_data.lock().update_flags(new_flags);
         return Ok(());
     }

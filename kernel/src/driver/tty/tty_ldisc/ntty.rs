@@ -1589,10 +1589,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         len: usize,
         cookie: &mut bool,
         _offset: usize,
-        file_flags: FileFlags,
+        flags: FileFlags,
     ) -> Result<usize, system_error::SystemError> {
         let mut ldata;
-        if file_flags.contains(FileFlags::O_NONBLOCK) {
+        if flags.contains(FileFlags::O_NONBLOCK) {
             let ret = self.disc_data_try_lock();
             if ret.is_err() {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -1683,7 +1683,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     break;
                 }
 
-                if file_flags.contains(FileFlags::O_NONBLOCK)
+                if flags.contains(FileFlags::O_NONBLOCK)
                     || core.flags().contains(TtyFlag::LDISC_CHANGING)
                 {
                     ret = Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -1757,7 +1757,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         tty: Arc<TtyCore>,
         buf: &[u8],
         len: usize,
-        _file_flags: FileFlags,
+        _flags: FileFlags,
     ) -> Result<usize, system_error::SystemError> {
         let mut nr = len;
         let mut ldata = self.disc_data();
@@ -1833,7 +1833,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 break;
             }
 
-            if _file_flags.contains(FileFlags::O_NONBLOCK) || core.flags().contains(TtyFlag::LDISC_CHANGING)
+            if _flags.contains(FileFlags::O_NONBLOCK) || core.flags().contains(TtyFlag::LDISC_CHANGING)
             {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }

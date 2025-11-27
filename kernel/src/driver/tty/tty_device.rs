@@ -151,7 +151,7 @@ impl TtyDevice {
 
     fn tty_core(private_data: &FilePrivateData) -> Result<Arc<TtyCore>, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = private_data {
-            (tty_priv.tty.clone(), tty_priv.file_flags)
+            (tty_priv.tty.clone(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -174,7 +174,7 @@ impl TtyDevice {
         let current_tty = TtyJobCtrlManager::get_current_tty()?;
 
         if let FilePrivateData::Tty(tty_priv) = data {
-            tty_priv.file_flags.insert(FileFlags::O_NONBLOCK);
+            tty_priv.flags.insert(FileFlags::O_NONBLOCK);
         }
 
         current_tty.reopen().ok()?;
@@ -246,7 +246,7 @@ impl IndexNode for TtyDevice {
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
             tty: tty.clone(),
-            file_flags: *mode,
+            flags: *mode,
         });
 
         tty.core().contorl_info_irqsave().clear_dead_session();
@@ -288,8 +288,8 @@ impl IndexNode for TtyDevice {
         buf: &mut [u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
-        let (tty, file_flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.file_flags)
+        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -301,7 +301,7 @@ impl IndexNode for TtyDevice {
         let mut cookie = false;
         loop {
             let mut size = if len > buf.len() { buf.len() } else { len };
-            size = ld.read(tty.clone(), buf, size, &mut cookie, offset, file_flags)?;
+            size = ld.read(tty.clone(), buf, size, &mut cookie, offset, flags)?;
             // 没有更多数据
             if size == 0 {
                 break;
@@ -331,8 +331,8 @@ impl IndexNode for TtyDevice {
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let mut count = len;
-        let (tty, file_flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.file_flags)
+        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -353,7 +353,7 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = ld.write(tty.clone(), &buf[written..], size, file_flags)?;
+            let ret = ld.write(tty.clone(), &buf[written..], size, flags)?;
 
             written += ret;
             count -= ret;
@@ -408,8 +408,8 @@ impl IndexNode for TtyDevice {
     }
 
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        let (tty, _file_flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.file_flags)
+        let (tty, _flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -424,7 +424,7 @@ impl IndexNode for TtyDevice {
 
     fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
-            (tty_priv.tty(), tty_priv.file_flags)
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -679,7 +679,7 @@ impl CharDevice for TtyDevice {
 #[derive(Debug, Clone)]
 pub struct TtyFilePrivateData {
     pub tty: Arc<TtyCore>,
-    pub file_flags: FileFlags,
+    pub flags: FileFlags,
 }
 
 impl TtyFilePrivateData {

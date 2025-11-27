@@ -554,7 +554,7 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
-        if self.file_type == FileType::File && !self.mode().contains(FileMode::O_DIRECT) {
+        if self.file_type == FileType::File && !self.flags().contains(FileFlags::O_DIRECT) {
             self.file_readahead(offset, len)?;
         }
 

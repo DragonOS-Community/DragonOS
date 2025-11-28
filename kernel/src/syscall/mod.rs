@@ -327,11 +327,6 @@ impl Syscall {
                 Self::sysinfo(info)
             }
 
-            SYS_UMASK => {
-                let mask = args[0] as u32;
-                Self::umask(mask)
-            }
-
             SYS_FSYNC => {
                 warn!("SYS_FSYNC has not yet been implemented");
                 Ok(0)

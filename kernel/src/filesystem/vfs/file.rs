@@ -365,7 +365,6 @@ impl File {
         buf: &mut [u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
-        // 先检查本文件在权限等规则下，是否可读取。
         self.readable()?;
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
@@ -402,16 +401,25 @@ impl File {
         buf: &[u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
-        // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-        // 获取文件类型
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        // 检查RLIMIT_FSIZE限制（仅对常规文件生效）
+        let actual_offset =
+            if self.mode().contains(FileMode::O_APPEND) && matches!(file_type, FileType::File) {
+                let file_size = md.size as usize;
+                if update_offset {
+                    self.offset
+                        .store(file_size, core::sync::atomic::Ordering::SeqCst);
+                }
+                file_size
+            } else {
+                offset
+            };
+
         let actual_len = if matches!(file_type, FileType::File) {
             let current_pcb = ProcessManager::current_pcb();
             let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
@@ -419,9 +427,7 @@ impl File {
             if fsize_limit.rlim_cur != u64::MAX {
                 let limit = fsize_limit.rlim_cur as usize;
 
-                // 如果当前文件大小已经达到或超过限制，不允许写入
-                if offset >= limit {
-                    // 发送SIGXFSZ信号
+                if actual_offset >= limit {
                     let _ = kill_process(
                         current_pcb.raw_pid(),
                         crate::arch::ipc::signal::Signal::SIGXFSZ,
@@ -429,8 +435,7 @@ impl File {
                     return Err(SystemError::EFBIG);
                 }
 
-                // 计算可写入的最大长度（不超过限制）
-                let max_writable = limit.saturating_sub(offset);
+                let max_writable = limit.saturating_sub(actual_offset);
                 if len > max_writable {
                     max_writable
                 } else {
@@ -443,17 +448,23 @@ impl File {
             len
         };
 
-        // 仅常规文件考虑“指针超过大小则扩展”语义；管道/字符设备等不应触发 resize
-        if matches!(file_type, FileType::File) && offset > md.size as usize {
-            self.inode.resize(offset)?;
+        if matches!(file_type, FileType::File) && actual_offset > md.size as usize {
+            self.inode.resize(actual_offset)?;
         }
-        let written_len = self
-            .inode
-            .write_at(offset, actual_len, buf, self.private_data.lock())?;
+        let written_len =
+            self.inode
+                .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
 
         if update_offset {
-            self.offset
-                .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+            if self.mode().contains(FileMode::O_APPEND) {
+                self.offset.store(
+                    actual_offset + written_len,
+                    core::sync::atomic::Ordering::SeqCst,
+                );
+            } else {
+                self.offset
+                    .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+            }
         }
 
         Ok(written_len)
@@ -523,8 +534,17 @@ impl File {
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
         let mode = *self.mode.read();
-        // 暂时认为只要不是write only, 就可读
-        if mode == FileMode::O_WRONLY || mode.contains(FileMode::O_PATH) {
+
+        if mode.contains(FileMode::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        let access_mode = mode.accmode();
+        if access_mode == FileMode::O_WRONLY.accmode() {
+            return Err(SystemError::EBADF);
+        }
+        if access_mode != FileMode::O_RDONLY.accmode() && access_mode != FileMode::O_RDWR.accmode()
+        {
             return Err(SystemError::EBADF);
         }
 
@@ -535,15 +555,17 @@ impl File {
     #[inline]
     pub fn writeable(&self) -> Result<(), SystemError> {
         let mode = *self.mode.read();
-
-        // 检查是否是O_PATH文件描述符
         if mode.contains(FileMode::O_PATH) {
             return Err(SystemError::EBADF);
         }
 
-        // 暂时认为只要不是read only, 就可写
-        if mode == FileMode::O_RDONLY {
-            return Err(SystemError::EPERM);
+        let access_mode = mode.accmode();
+        if access_mode == FileMode::O_RDONLY.accmode() {
+            return Err(SystemError::EBADF);
+        }
+        if access_mode != FileMode::O_WRONLY.accmode() && access_mode != FileMode::O_RDWR.accmode()
+        {
+            return Err(SystemError::EBADF);
         }
 
         return Ok(());
@@ -674,6 +696,13 @@ impl File {
     #[inline]
     pub fn set_close_on_exec(&self, close_on_exec: bool) {
         self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
+    }
+
+    /// @brief 设置文件偏移量（仅用于O_APPEND等内部操作）
+    ///
+    /// @param offset 新的文件偏移量
+    pub fn set_offset(&self, offset: usize) {
+        self.offset.store(offset, Ordering::SeqCst);
     }
 
     pub fn set_mode(&self, mut mode: FileMode) -> Result<(), SystemError> {

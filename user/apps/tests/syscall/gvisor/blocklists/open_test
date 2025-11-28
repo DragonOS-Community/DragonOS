@@ -1,0 +1,8 @@
+#没有实现软连接和权限检查，故有关测例block
+OpenTest.OpenNoFollowSymlink
+OpenTest.OpenNoFollowStillFollowsLinksInPath
+OpenTest.SymlinkRecurse
+OpenTest.SymlinkDirectory
+OpenTest.CanTruncateReadOnlyNoWritePermission
+OpenTest.CanTruncateWithStrangePermissions
+OpenTest.OpenWithOpath

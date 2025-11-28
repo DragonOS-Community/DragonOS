@@ -191,13 +191,7 @@ fn do_sys_openat2(
 
     let inode: Arc<dyn IndexNode> = match inode {
         Ok(inode) => {
-            let file_type = inode.metadata()?.file_type;
-
-            // 如果O_NOFOLLOW被设置且最后的路径组件是符号链接，返回ELOOP
-            if !follow_symlink && file_type == FileType::SymLink {
-                return Err(SystemError::ELOOP);
-            }
-
+            let file_type: FileType = inode.metadata()?.file_type;
             // 文件存在 - 检查 O_EXCL
             if how.o_flags.contains(FileMode::O_CREAT) && how.o_flags.contains(FileMode::O_EXCL) {
                 return Err(SystemError::EEXIST);

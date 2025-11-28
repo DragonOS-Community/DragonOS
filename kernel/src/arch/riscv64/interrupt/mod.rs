@@ -167,6 +167,12 @@ impl TrapFrame {
     pub fn set_pc(&mut self, pc: usize) {
         self.epc = pc;
     }
+
+    /// 返回当前 TrapFrame 对应的用户态栈指针。
+    #[inline(always)]
+    pub fn stack_pointer(&self) -> usize {
+        self.sp
+    }
 }
 
 impl ProbeArgs for TrapFrame {

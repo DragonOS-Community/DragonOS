@@ -62,9 +62,10 @@ log_skipped = true
 #    - reason：屏蔽原因说明（可选，建议提供以便调试和维护）
 
 # 屏蔽gvisor系统调用测试
-[[blocked_apps]]
-name = "gvisor syscall tests"
-reason = "由于文件较大，因此屏蔽。如果要允许系统调用测试，则把这几行取消注释即可"
-[[blocked_apps]]
-name = "NovaShell"
-reason = "工具链版本有问题，应为nightly-2025-8-10"
+blocked_apps = [
+    { name = "gvisor syscall tests", reason = "由于文件较大，因此屏蔽。如果要允许系统调用测试，则把这行取消注释即可" },
+    { name = "NovaShell", reason = "工具链版本有问题，应为nightly-2025-8-10" },
+    { name = "test_ebpf_new", reason = "2025.11.17,aya上游发版有问题，导致ci过不了，暂时禁用" },
+    { name = "test_ebpf_tp", reason = "2025.11.17,aya上游发版有问题，导致ci过不了，暂时禁用" },
+]
+

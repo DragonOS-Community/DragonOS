@@ -1,6 +1,7 @@
 //! This file contains functions for kernel-space access to user-space data
 
 use core::{
+    cmp::min,
     mem::size_of,
     num::NonZero,
     slice::{from_raw_parts, from_raw_parts_mut},
@@ -12,11 +13,34 @@ use defer::defer;
 
 use crate::{
     arch::MMArch,
-    mm::{verify_area, MemoryManagementArch, VirtAddr},
+    mm::{verify_area, MemoryManagementArch, VirtAddr, VmFlags},
     process::ProcessManager,
 };
 
-use super::SystemError;
+use super::{user_buffer::UserBuffer, SystemError};
+
+/// Clear data in the specified range of user space
+///
+/// ## Arguments
+///
+/// - `dest`: Destination address in user space
+/// - `len`: Length of data to clear
+///
+/// ## Returns
+///
+/// Returns the length of cleared data
+///
+/// ## Errors
+///
+/// - `EFAULT`: Destination address is invalid
+pub unsafe fn clear_user_protected(dest: VirtAddr, len: usize) -> Result<usize, SystemError> {
+    let mut writer = UserBufferWriter::new(dest.data() as *mut u8, len, true)?;
+
+    // Clear user space data
+    writer.buffer_protected(0)?.clear()?;
+    compiler_fence(Ordering::SeqCst);
+    return Ok(len);
+}
 
 /// Clear data in the specified range of user space
 ///
@@ -55,16 +79,6 @@ pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemEr
     return Ok(src.len());
 }
 
-/// Copy data from user space to kernel space
-pub unsafe fn copy_from_user(dst: &mut [u8], src: VirtAddr) -> Result<usize, SystemError> {
-    verify_area(src, dst.len()).map_err(|_| SystemError::EFAULT)?;
-    let src: &[u8] = core::slice::from_raw_parts(src.data() as *const u8, dst.len());
-    // 拷贝数据
-    dst.copy_from_slice(src);
-
-    return Ok(dst.len());
-}
-
 /// Check and copy a C string from user space.
 ///
 /// Returns an error when encountering an invalid address.
@@ -99,9 +113,12 @@ pub fn check_and_clone_cstr(
 
         let addr = unsafe { user.add(i) };
         let mut c = [0u8; 1];
+
+        // 使用受异常表保护的版本，如果用户地址无效会安全返回错误
         unsafe {
-            copy_from_user(&mut c, VirtAddr::new(addr as usize))?;
+            copy_from_user_protected(&mut c, VirtAddr::new(addr as usize))?;
         }
+
         if c[0] == 0 {
             break;
         }
@@ -140,7 +157,10 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<CString>
             unsafe {
                 let dst = [0usize; 1];
                 let mut dst = core::mem::transmute::<[usize; 1], [u8; size_of::<usize>()]>(dst);
-                copy_from_user(&mut dst, VirtAddr::new(addr as usize))?;
+
+                // 使用受异常表保护的版本
+                copy_from_user_protected(&mut dst, VirtAddr::new(addr as usize))?;
+
                 let dst = core::mem::transmute::<[u8; size_of::<usize>()], [usize; 1]>(dst);
                 str_ptr = dst[0] as *const u8;
 
@@ -357,6 +377,28 @@ impl UserBufferReader<'_> {
             .map_err(|_| SystemError::EINVAL)
     }
 
+    /// 返回一个受异常表保护的用户缓冲区包装
+    ///
+    /// 与 `buffer()` 不同，此方法返回的 `UserBuffer` 类型会在所有读写操作中
+    /// 使用异常表保护的拷贝函数，确保访问无效用户地址时能安全返回错误而不是panic
+    ///
+    /// # 参数
+    /// - `offset`: 字节偏移量
+    ///
+    /// # 返回值
+    /// - `Ok(UserBuffer)`: 受保护的用户缓冲区包装
+    /// - `Err(SystemError)`: 偏移量无效
+    pub fn buffer_protected(&'_ self, offset: usize) -> Result<UserBuffer<'_>, SystemError> {
+        if offset > self.buffer.len() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let addr = VirtAddr::new(self.buffer.as_ptr() as usize + offset);
+        let len = self.buffer.len() - offset;
+
+        Ok(unsafe { UserBuffer::new(addr, len) })
+    }
+
     /// Convert user space data to a slice of specified type with page mapping and permission verification
     ///
     /// This function verifies that the pages are mapped AND have the required permissions,
@@ -440,6 +482,42 @@ impl UserBufferReader<'_> {
             return Err(SystemError::EFAULT);
         }
         self.convert_one_with_offset(src, offset)
+    }
+}
+
+impl UserBufferReader<'_> {
+    /// 使用异常保护的方式从用户空间拷贝数据到内核空间
+    ///
+    /// 此方法使用异常表机制，即使在页错误时也能安全返回错误，
+    /// 而不是panic或无限循环。
+    ///
+    /// # Arguments
+    /// * `dst` - 目标缓冲区(内核空间)
+    /// * `offset` - 用户缓冲区的字节偏移
+    ///
+    /// # Returns
+    /// * `Ok(len)` - 成功拷贝的字节数
+    /// * `Err(SystemError::EFAULT)` - 访问失败
+    pub fn copy_from_user_protected(
+        &self,
+        dst: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        if offset >= self.buffer.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let src_slice = &self.buffer[offset..];
+        let copy_len = core::cmp::min(dst.len(), src_slice.len());
+        if copy_len == 0 {
+            return Ok(0);
+        }
+
+        unsafe {
+            copy_from_user_protected(
+                &mut dst[..copy_len],
+                VirtAddr::new(src_slice.as_ptr() as usize),
+            )
+        }
     }
 }
 
@@ -565,6 +643,36 @@ impl<'a> UserBufferWriter<'a> {
         Self::convert_with_offset::<T>(self.buffer, offset).map_err(|_| SystemError::EINVAL)
     }
 
+    /// 返回一个受异常表保护的用户缓冲区包装
+    ///
+    /// 与 `buffer()` 不同，此方法返回的 `UserBuffer` 类型会在所有读写操作中
+    /// 使用异常表保护的拷贝函数，确保访问无效用户地址时能安全返回错误而不是panic
+    ///
+    /// # 参数
+    /// - `offset`: 字节偏移量
+    ///
+    /// # 返回值
+    /// - `Ok(UserBuffer)`: 受保护的用户缓冲区包装
+    /// - `Err(SystemError)`: 偏移量无效
+    ///
+    /// # 示例
+    /// ```rust
+    /// let mut writer = UserBufferWriter::new(user_ptr, len, true)?;
+    /// let mut buffer = writer.buffer_protected(0)?;
+    /// // 这个写入是安全的，即使地址无效也会返回 EFAULT 而不是 panic
+    /// buffer.write_to_user(0, kernel_data)?;
+    /// ```
+    pub fn buffer_protected(&'a mut self, offset: usize) -> Result<UserBuffer<'a>, SystemError> {
+        if offset > self.buffer.len() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let addr = VirtAddr::new(self.buffer.as_ptr() as usize + offset);
+        let len = self.buffer.len() - offset;
+
+        Ok(unsafe { UserBuffer::new(addr, len) })
+    }
+
     /// Convert to a mutable slice of specified type with page mapping and permission verification
     ///
     /// This function verifies that the pages are mapped AND have the required permissions,
@@ -648,6 +756,43 @@ impl<'a> UserBufferWriter<'a> {
     }
 }
 
+impl<'a> UserBufferWriter<'a> {
+    /// 使用异常保护的方式从内核空间拷贝数据到用户空间
+    ///
+    /// 此方法使用异常表机制，即使在页错误时也能安全返回错误，
+    /// 而不是panic或无限循环。
+    ///
+    /// # Arguments
+    /// * `src` - 源缓冲区(内核空间)
+    /// * `offset` - 用户缓冲区的字节偏移
+    ///
+    /// # Returns
+    /// * `Ok(len)` - 成功拷贝的字节数
+    /// * `Err(SystemError::EFAULT)` - 访问失败
+    #[allow(dead_code)]
+    pub fn copy_to_user_protected(
+        &'a mut self,
+        src: &[u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        if offset >= self.buffer.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let dst_slice = &mut self.buffer[offset..];
+        let copy_len = core::cmp::min(src.len(), dst_slice.len());
+        if copy_len == 0 {
+            return Ok(0);
+        }
+
+        unsafe {
+            copy_to_user_protected(
+                VirtAddr::new(dst_slice.as_mut_ptr() as usize),
+                &src[..copy_len],
+            )
+        }
+    }
+}
+
 /// Check user access by page table - verifies both page mapping AND permissions
 ///
 /// This function checks if pages are mapped in the page table AND verifies
@@ -703,4 +848,190 @@ fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: boo
     drop(guard);
 
     return true;
+}
+
+/// 带异常保护的用户空间数据拷贝
+///
+/// 与`copy_from_user`不同,此函数使用异常表机制,
+/// 即使在页错误时也能安全返回错误
+///
+/// ## 参数
+/// - `dst`: 目标缓冲区(内核空间)
+/// - `src`: 源地址(用户空间)
+///
+/// ## 返回值
+/// - `Ok(len)`: 成功拷贝的字节数
+/// - `Err(SystemError::EFAULT)`: 访问失败
+pub unsafe fn copy_from_user_protected(
+    dst: &mut [u8],
+    src: VirtAddr,
+) -> Result<usize, SystemError> {
+    let len = dst.len();
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let dst_ptr = dst.as_mut_ptr();
+    let src_ptr = src.data() as *const u8;
+
+    // 快速路径: 页表检查
+    if !check_user_access_by_page_table(src, len, false) {
+        return Err(SystemError::EFAULT);
+    }
+
+    // 执行实际拷贝,使用异常表保护
+    let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);
+
+    match result {
+        0 => Ok(len),
+        _ => Err(SystemError::EFAULT),
+    }
+}
+
+/// 带异常保护的用户空间写入
+///
+/// ## 参数
+/// - `dest`: 目标地址(用户空间)
+/// - `src`: 源缓冲区(内核空间)
+///
+/// ## 返回值
+/// - `Ok(len)`: 成功写入的字节数
+/// - `Err(SystemError::EFAULT)`: 访问失败
+pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
+    let len = src.len();
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let dst_ptr = dest.data() as *mut u8;
+    let src_ptr = src.as_ptr();
+
+    // 快速路径: 页表检查
+    if !check_user_access_by_page_table(dest, len, true) {
+        return Err(SystemError::EFAULT);
+    }
+
+    MMArch::disable_kernel_wp();
+    let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);
+    MMArch::enable_kernel_wp();
+
+    match result {
+        0 => Ok(len),
+        _ => Err(SystemError::EFAULT),
+    }
+}
+
+/// Compute the contiguous accessible length starting at `addr`.
+///
+/// Returns the number of bytes that can be accessed before hitting an unmapped
+/// page or a page that lacks the requested permissions.
+pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> usize {
+    // log::error!(
+    //     "user_accessible_len(addr: {:?}, size:{:?}, check_write:{:?}",
+    //     addr,
+    //     size,
+    //     check_write
+    // );
+    if size == 0 || addr.is_null() {
+        return 0;
+    }
+
+    // 获取当前进程的 vm （可访问的地址空间）
+    let vm = match ProcessManager::current_pcb().basic().user_vm() {
+        Some(vm) => vm,
+        None => return 0,
+    };
+
+    let vma_read_guard = vm.read_irqsave();
+    let mappings = &vma_read_guard.mappings;
+
+    let mut checked = 0usize;
+    let mut current = addr;
+
+    while checked < size {
+        // 判断当前地址是否落在一个有效 VMA 中
+        let Some(vma) = mappings.contains(current) else {
+            break;
+        };
+
+        // 获取地址所在 VMA 的起始地址 和结束地址，访问权限标志，后备的文件和当前VMA第一页映射到文件的哪一页
+        let (region_start, region_end, vm_flags, vma_size, file, file_page_offset) = {
+            let guard = vma.lock_irqsave();
+            let region_start = guard.region().start().data();
+            let region_end = guard.region().end().data();
+            let vm_flags = *guard.vm_flags();
+            let vma_size = region_end.saturating_sub(region_start);
+            let file = guard.vm_file();
+            let file_page_offset = guard.file_page_offset();
+
+            drop(guard);
+            (
+                region_start,
+                region_end,
+                vm_flags,
+                vma_size,
+                file,
+                file_page_offset,
+            )
+        };
+
+        // 根据 vm_flags 判断是否具备访问权限
+        let has_permission = if check_write {
+            vm_flags.contains(VmFlags::VM_WRITE)
+        } else {
+            vm_flags.contains(VmFlags::VM_READ)
+        };
+        if !has_permission {
+            break;
+        }
+
+        let file_backed_len = file.and_then(|file| {
+            let file_offset_pages = file_page_offset.unwrap_or(0);
+            let file_offset_bytes = file_offset_pages.saturating_mul(MMArch::PAGE_SIZE);
+            let file_size = match file.metadata() {
+                Ok(md) if md.size > 0 => {
+                    let capped = core::cmp::min(md.size as u128, usize::MAX as u128);
+                    capped as usize
+                }
+                Ok(_) => 0,
+                Err(_) => return None,
+            };
+
+            let backed = file_size.saturating_sub(file_offset_bytes);
+            Some(core::cmp::min(backed, vma_size))
+        });
+
+        // 计算当前 VMA 内从 current 地址开始的可用长度
+        let current_addr = current.data();
+        let mut available = region_end.saturating_sub(current_addr);
+
+        if let Some(backed_len) = file_backed_len {
+            let offset_in_vma = current_addr.saturating_sub(region_start);
+            let backed_available = backed_len.saturating_sub(offset_in_vma);
+            // Clamp to the range actually backed by the file to avoid walking into holes.
+            available = min(available, backed_available);
+        }
+        if available == 0 {
+            break;
+        }
+
+        // 这里的 `step` 要区分两种情况
+        // - 第一种情况：`available`（当前 VMA 剩余长度）已经覆盖了 `size - checked`，说明
+        //   本次检查的剩余数据全部落在这个 VMA 内，`step` 直接等于 `size - checked`。
+        // - 第二种情况：`available` 比 `size - checked` 小，意味着我们会在这个 VMA 的末尾停下，
+        //   需要等下一次循环再确认后续地址是否仍有 VMA 覆盖。
+        // - 例如 (addr = 0x1, size = 10)，若某个 VMA 只覆盖 [0x0, 0x5)，则第一轮只能推进 4 个字节，
+        //   后续是否继续完全取决于下一个 VMA 是否与 0x5 处相接且具有相同访问权限。
+        //   若下一轮 VMA 覆盖 [0x5, 0xf)，虽然这块 VMA 可访问空间 available == 10 ,但是我们需要检查的部分就只剩 10 - 4 = 6 bytes。
+        //   所以 `step` 选择为  size - checked
+        let step = min(available, size - checked);
+        checked += step;
+
+        let Some(next) = current_addr.checked_add(step) else {
+            break;
+        };
+        current = VirtAddr::new(next);
+    }
+
+    checked
 }

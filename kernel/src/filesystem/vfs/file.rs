@@ -1,4 +1,7 @@
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{
+    fmt,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
@@ -7,6 +10,7 @@ use system_error::SystemError;
 use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::process::pid::PidPrivateData;
 use crate::{
+    arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
@@ -18,10 +22,56 @@ use crate::{
     },
     ipc::{kill::kill_process, pipe::PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    process::{cred::Cred, resource::RLimitID, ProcessControlBlock, ProcessManager, RawPid},
+    mm::{
+        page::PageFlags,
+        readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
+        MemoryManagementArch,
+    },
+    process::{
+        cred::Cred,
+        namespace::{
+            ipc_namespace::IpcNamespace, mnt::MntNamespace, net_namespace::NetNamespace,
+            pid_namespace::PidNamespace, user_namespace::UserNamespace,
+            uts_namespace::UtsNamespace,
+        },
+        resource::RLimitID,
+        ProcessControlBlock, ProcessManager, RawPid,
+    },
 };
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
+/// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub enum NamespaceFilePrivateData {
+    Ipc(Arc<IpcNamespace>),
+    Uts(Arc<UtsNamespace>),
+    Mnt(Arc<MntNamespace>),
+    Net(Arc<NetNamespace>),
+    /// Current thread PID namespace.
+    Pid(Arc<PidNamespace>),
+    /// PID namespace for children.
+    PidForChildren(Arc<PidNamespace>),
+    User(Arc<UserNamespace>),
+    // Time/cgroup namespaces are not implemented yet.
+}
+
+impl fmt::Debug for NamespaceFilePrivateData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NamespaceFilePrivateData::Ipc(_) => f.write_str("NamespaceFilePrivateData::Ipc(..)"),
+            NamespaceFilePrivateData::Uts(_) => f.write_str("NamespaceFilePrivateData::Uts(..)"),
+            NamespaceFilePrivateData::Mnt(_) => f.write_str("NamespaceFilePrivateData::Mnt(..)"),
+            NamespaceFilePrivateData::Net(_) => f.write_str("NamespaceFilePrivateData::Net(..)"),
+            NamespaceFilePrivateData::Pid(_) => f.write_str("NamespaceFilePrivateData::Pid(..)"),
+            NamespaceFilePrivateData::PidForChildren(_) => {
+                f.write_str("NamespaceFilePrivateData::PidForChildren(..)")
+            }
+            NamespaceFilePrivateData::User(_) => f.write_str("NamespaceFilePrivateData::User(..)"),
+        }
+    }
+}
+
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -38,6 +88,8 @@ pub enum FilePrivateData {
     EPoll(EPollPrivateData),
     /// pid私有信息
     Pid(PidPrivateData),
+    /// namespace fd 私有信息（/proc/thread-self/ns/* 打开后得到）
+    Namespace(NamespaceFilePrivateData),
     /// 不需要文件私有信息
     Unused,
 }
@@ -151,6 +203,8 @@ pub struct File {
     close_on_exec: AtomicBool,
     /// owner
     pid: SpinLock<Option<Arc<ProcessControlBlock>>>,
+    /// 预读状态
+    ra_state: SpinLock<FileReadaheadState>,
 }
 
 impl File {
@@ -182,6 +236,7 @@ impl File {
             cred: ProcessManager::current_pcb().cred(),
             close_on_exec: AtomicBool::new(close_on_exec),
             pid: SpinLock::new(None),
+            ra_state: SpinLock::new(FileReadaheadState::new()),
         };
 
         return Ok(f);
@@ -251,6 +306,58 @@ impl File {
         self.do_write(offset, len, buf, false)
     }
 
+    fn file_readahead(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        let page_cache = match self.inode.page_cache() {
+            Some(page_cahce) => page_cahce,
+            None => return Ok(()),
+        };
+
+        let start_page = offset >> MMArch::PAGE_SHIFT;
+        let end_page = (offset + len - 1) >> MMArch::PAGE_SHIFT;
+
+        let (async_trigger_page, missing_page) = {
+            let page_cache_guard = page_cache.lock_irqsave();
+            let mut async_trigger_page = None;
+            let mut missing_page = None;
+
+            for index in start_page..=end_page {
+                match page_cache_guard.get_page(index) {
+                    Some(page)
+                        if page
+                            .read_irqsave()
+                            .flags()
+                            .contains(PageFlags::PG_READAHEAD) =>
+                    {
+                        async_trigger_page = Some((index, page.clone()));
+                        break;
+                    }
+                    None => {
+                        missing_page = Some(index);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            (async_trigger_page, missing_page)
+        };
+
+        if let Some((index, page)) = async_trigger_page {
+            let mut ra_state = self.ra_state.lock().clone();
+            let req_pages = end_page - index + 1;
+            page.write_irqsave().remove_flags(PageFlags::PG_READAHEAD);
+
+            page_cache_async_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
+            *self.ra_state.lock() = ra_state;
+        } else if let Some(index) = missing_page {
+            let mut ra_state = self.ra_state.lock().clone();
+            let req_pages = end_page - index + 1;
+
+            page_cache_sync_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
+            *self.ra_state.lock() = ra_state;
+        }
+        Ok(())
+    }
+
     pub fn do_read(
         &self,
         offset: usize,
@@ -263,6 +370,10 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
+        if self.file_type == FileType::File && !self.mode().contains(FileMode::O_DIRECT) {
+            self.file_readahead(offset, len)?;
+        }
+
         let len = if self.mode().contains(FileMode::O_DIRECT) {
             self.inode
                 .read_direct(offset, len, buf, self.private_data.lock())
@@ -271,11 +382,15 @@ impl File {
                 .read_at(offset, len, buf, self.private_data.lock())
         }?;
 
+        if len > 0 {
+            let last_page_readed = (offset + len - 1) >> MMArch::PAGE_SHIFT;
+            self.ra_state.lock().prev_index = last_page_readed as i64;
+        }
+
         if update_offset {
             self.offset
                 .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
         }
-
         Ok(len)
     }
 
@@ -461,6 +576,17 @@ impl File {
     /// ## 参数
     /// - ctx 填充目录项的上下文
     pub fn read_dir(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
+        // O_PATH 文件描述符只能用于有限的操作，getdents/getdents64
+        // 在 Linux 中会返回 EBADF。提前检测并返回相同语义。
+        if self.mode().contains(FileMode::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 仅目录允许读取目录项，其它类型遵循 POSIX 语义返回 ENOTDIR。
+        if self.file_type() != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
         let inode: &Arc<dyn IndexNode> = &self.inode;
         let mut current_pos = self.offset.load(Ordering::SeqCst);
 
@@ -468,7 +594,15 @@ impl File {
         // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理
 
         // 迭代读取目录项
-        let readdir_subdirs_name = inode.list()?;
+        // 为了保证在目录内容动态变化（例如 /proc/self/fd）时不会因为重新
+        // 创建列表而丢失尚未读取的目录项，这里缓存第一次生成的列表，在
+        // 文件偏移被 seek 到 0 之前复用该缓存。
+        let mut cached_names = self.readdir_subdirs_name.lock();
+        if current_pos == 0 || cached_names.is_empty() {
+            *cached_names = inode.list()?;
+        }
+        let readdir_subdirs_name = cached_names.clone();
+        drop(cached_names);
 
         let subdirs_name_len = readdir_subdirs_name.len();
         while current_pos < subdirs_name_len {
@@ -476,6 +610,12 @@ impl File {
             let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
                 Ok(i) => i,
                 Err(e) => {
+                    if e == SystemError::ENOENT {
+                        // 目录项在本次读取过程中被移除，跳过它，继续读取后续条目
+                        self.offset.fetch_add(1, Ordering::SeqCst);
+                        current_pos += 1;
+                        continue;
+                    }
                     error!("Readdir error: Failed to find sub inode");
                     return Err(e);
                 }
@@ -519,6 +659,7 @@ impl File {
             cred: self.cred.clone(),
             close_on_exec: AtomicBool::new(self.close_on_exec.load(Ordering::SeqCst)),
             pid: SpinLock::new(None),
+            ra_state: SpinLock::new(self.ra_state.lock().clone()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design

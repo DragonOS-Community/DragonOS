@@ -62,15 +62,12 @@ impl InnerPageCache {
         self.pages.remove(&offset)
     }
 
-    fn create_pages(&mut self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
-        assert!(buf.len().is_multiple_of(MMArch::PAGE_SIZE));
-
-        let page_num = buf.len() / MMArch::PAGE_SIZE;
-
-        let len = buf.len();
-        if len == 0 {
+    pub fn create_pages(&mut self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
+        if buf.is_empty() {
             return Ok(());
         }
+
+        let page_num = ((buf.len() - 1) >> MMArch::PAGE_SHIFT) + 1;
 
         let mut page_manager_guard = page_manager_lock_irqsave();
 
@@ -90,12 +87,15 @@ impl InnerPageCache {
                 &mut LockedFrameAllocator,
             )?;
 
+            let page_len = core::cmp::min(MMArch::PAGE_SIZE, buf.len() - buf_offset);
+
             let mut page_guard = page.write_irqsave();
             unsafe {
-                page_guard.copy_from_slice(&buf[buf_offset..buf_offset + MMArch::PAGE_SIZE]);
+                let dst = page_guard.as_slice_mut();
+                dst[..page_len].copy_from_slice(&buf[buf_offset..buf_offset + page_len]);
             }
 
-            self.add_page(page_index, &page);
+            self.add_page(start_page_index + i, &page);
         }
 
         Ok(())

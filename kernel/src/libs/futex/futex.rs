@@ -59,7 +59,7 @@ pub struct Futex;
 // 对于同一个futex的进程或线程将会在这个bucket等待
 pub struct FutexHashBucket {
     // 该futex维护的等待队列
-    chain: LinkedList<Arc<FutexObj>>,
+    pub(super) chain: LinkedList<Arc<FutexObj>>,
 }
 
 impl FutexHashBucket {
@@ -95,38 +95,45 @@ impl FutexHashBucket {
         nr_wake: u32,
     ) -> Result<usize, SystemError> {
         let mut count = 0;
-        let mut pop_count = 0;
-        while let Some(futex_q) = self.chain.pop_front() {
-            if futex_q.key == key {
-                // TODO: 考虑优先级继承的机制
+        // 记录初始队列长度，确保只遍历一次
+        let initial_len = self.chain.len();
+        let mut processed = 0;
 
+        while processed < initial_len && count < nr_wake {
+            if let Some(futex_q) = self.chain.pop_front() {
+                // 检查key是否匹配
+                if futex_q.key != key {
+                    // key不匹配，放回队列尾部
+                    self.chain.push_back(futex_q);
+                    processed += 1;
+                    continue;
+                }
+
+                // 检查bitset是否匹配
                 if let Some(bitset) = bitset {
                     if futex_q.bitset & bitset == 0 {
+                        // bitset不匹配，放回队列尾部
                         self.chain.push_back(futex_q);
+                        processed += 1;
                         continue;
                     }
                 }
 
-                // 唤醒
-                if futex_q.pcb.upgrade().is_some() {
-                    self.remove(futex_q.clone());
-                    ProcessManager::wakeup(&futex_q.pcb.upgrade().unwrap())?;
+                // key和bitset都匹配，尝试唤醒
+                // 注意：pop_front已经将futex_q从队列中移除，无需再次调用remove
+                if let Some(pcb) = futex_q.pcb.upgrade() {
+                    // TODO: 考虑优先级继承的机制
+                    ProcessManager::wakeup(&pcb)?;
+                    count += 1;
                 }
-
-                // 判断唤醒数
-                count += 1;
-                if count >= nr_wake {
-                    break;
-                }
+                // 如果pcb已经被释放，也算处理了一个，继续下一个
+                processed += 1;
             } else {
-                self.chain.push_back(futex_q);
-            }
-            // 判断是否循环完队列了
-            pop_count += 1;
-            if pop_count >= self.chain.len() {
+                // 队列为空，退出
                 break;
             }
         }
+
         Ok(count as usize)
     }
 
@@ -140,9 +147,9 @@ impl FutexHashBucket {
 
 #[derive(Debug)]
 pub struct FutexObj {
-    pcb: Weak<ProcessControlBlock>,
-    key: FutexKey,
-    bitset: u32,
+    pub(super) pcb: Weak<ProcessControlBlock>,
+    pub(super) key: FutexKey,
+    pub(super) bitset: u32,
     // TODO: 优先级继承
 }
 
@@ -167,10 +174,22 @@ pub struct FutexKey {
     key: InnerFutexKey,
 }
 
-/// 不同进程间通过文件共享futex变量，表明该变量在文件中的位置
+/// 共享 futex 的类型
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+pub enum SharedKeyKind {
+    /// 文件映射的 futex
+    File { dev: u64, ino: u64 },
+    /// 显式共享的匿名映射（MAP_SHARED | MAP_ANONYMOUS）
+    SharedAnon { id: u64 },
+    /// 私有匿名映射上的 FUTEX_SHARED（栈、堆等）
+    /// 只能在同一进程的线程间同步
+    PrivateAnonShared { as_id: u64 },
+}
+
+/// 不同进程间通过文件或共享内存共享futex变量
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct SharedKey {
-    i_seq: u64,
+    kind: SharedKeyKind,
     page_offset: u64,
 }
 
@@ -303,57 +322,71 @@ impl Futex {
         drop(irq_guard);
         schedule(SchedMode::SM_NONE);
 
-        // 被唤醒后的检查
+        // ========== 被唤醒后的检查 ==========
+        // 进程被唤醒可能有以下几种情况：
+        // 1. futex_wake 显式唤醒（正常情况）- futex_q 已从队列移除
+        // 2. 超时唤醒 - futex_q 仍在队列中
+        // 3. 信号唤醒 - futex_q 仍在队列中
+        // 4. 伪唤醒 - futex_q 仍在队列中
+
         let mut futex_map_guard = FutexData::futex_map();
+
+        // 首先检查超时，优先级最高
+        // 注意：必须在检查队列之前先检查超时，否则可能漏掉超时情况
+        let is_timeout = timer.as_ref().is_some_and(|t| t.timeout());
+
+        if is_timeout {
+            // 超时唤醒：从队列中移除并返回 ETIMEDOUT
+            if let Some(bucket_mut) = futex_map_guard.get_mut(&key) {
+                bucket_mut.remove(futex_q.clone());
+            }
+            return Err(SystemError::ETIMEDOUT);
+        }
+
+        // 检查是否被正常唤醒（futex_wake）
         let bucket = futex_map_guard.get_mut(&key);
-        let bucket_mut = match bucket {
-            // 如果该pcb不在链表里面了或者该链表已经被释放，就证明是正常的Wake操作
+        match bucket {
             Some(bucket_mut) => {
                 if !bucket_mut.contains(&futex_q) {
-                    // 取消定时器任务
+                    // futex_q 不在队列中，说明被 futex_wake 正常唤醒
                     if let Some(timer) = timer {
                         timer.cancel();
                     }
                     return Ok(0);
                 }
-                // 非正常唤醒，返回交给下层
-                bucket_mut
+                // futex_q 仍在队列中，说明是信号或伪唤醒
+                // 从队列中移除
+                bucket_mut.remove(futex_q.clone());
             }
             None => {
-                // 取消定时器任务
+                // 队列已被清空，说明被正常唤醒
                 if let Some(timer) = timer {
                     timer.cancel();
                 }
                 return Ok(0);
             }
-        };
-
-        // 如果是超时唤醒，则返回错误
-        if timer.is_some() && timer.clone().unwrap().timeout() {
-            bucket_mut.remove(futex_q);
-
-            return Err(SystemError::ETIMEDOUT);
         }
 
-        // TODO: 如果没有挂起的信号，则重新判断是否满足wait要求，重新进入wait
+        drop(futex_map_guard);
 
-        // 经过前面的几个判断，到这里之后，
-        // 当前进程被唤醒大概率是其他进程更改了uval,需要重新去判断当前进程是否满足wait
-
-        // 到这里之后，前面的唤醒条件都不满足，则是被信号唤醒
-        // 需要处理信号然后重启futex系统调用
-
-        // 取消定时器任务
+        // 取消定时器
         if let Some(timer) = timer {
-            if !timer.timeout() {
-                timer.cancel();
-            }
+            timer.cancel();
+        }
+
+        // 检查是否有待处理的信号
+        if ProcessManager::current_pcb().has_pending_signal() {
+            return Err(SystemError::ERESTARTSYS);
         }
 
         Ok(0)
     }
 
     // ### 唤醒指定futex上挂起的最多nr_wake个进程
+    ///
+    /// ### Linux 语义
+    /// 根据 Linux 的实际行为，即使 nr_wake 为 0，FUTEX_WAKE 也会唤醒至少一个等待者。
+    /// 这是 FUTEX_WAKE 特有的行为，其他操作如 FUTEX_REQUEUE 不适用此规则。
     pub fn futex_wake(
         uaddr: VirtAddr,
         flags: FutexFlag,
@@ -381,8 +414,11 @@ impl Futex {
             return Ok(0);
         }
 
+        // Linux 行为：即使 nr_wake 为 0，也至少唤醒一个等待者
+        let effective_nr_wake = if nr_wake == 0 { 1 } else { nr_wake };
+
         // 从队列中唤醒
-        let count = bucket_mut.wake_up(key.clone(), Some(bitset), nr_wake)?;
+        let count = bucket_mut.wake_up(key.clone(), Some(bitset), effective_nr_wake)?;
 
         drop(binding);
 
@@ -499,8 +535,10 @@ impl Futex {
             Ok(ret) => {
                 // 操作成功则唤醒uaddr2中的进程
                 if ret {
-                    let bucket2 = futex_data_guard.get_mut(&key2).ok_or(SystemError::EINVAL)?;
-                    wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
+                    // 若 uaddr2 没有关联任何等待者，则按照 Linux 行为跳过唤醒，而不是返回 EINVAL。
+                    if let Some(bucket2) = futex_data_guard.get_mut(&key2) {
+                        wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
+                    }
                 }
             }
             Err(e) => {
@@ -512,7 +550,7 @@ impl Futex {
         Ok(wake_count)
     }
 
-    fn get_futex_key(
+    pub(super) fn get_futex_key(
         uaddr: VirtAddr,
         fshared: bool,
         _access: FutexAccess,
@@ -544,7 +582,8 @@ impl Futex {
             return Ok(key);
         }
 
-        // 共享：区分文件映射与匿名共享映射
+        // 共享：需要生成能跨进程匹配的键
+        // 按照 Linux 语义，共享 futex 基于物理页帧号（PFN）或文件身份
         let address_space = AddressSpace::current()?;
         let as_guard = address_space.read();
         let vma = as_guard
@@ -562,44 +601,68 @@ impl Futex {
             let md = file.metadata()?;
             let dev = md.dev_id as u64;
             let ino = md.inode_id.into() as u64;
-            let i_seq = (dev << 32) ^ ino;
             let base_pgoff = vma_guard.file_page_offset().unwrap_or(0) as u64;
             let shared = SharedKey {
-                i_seq,
+                kind: SharedKeyKind::File { dev, ino },
                 page_offset: base_pgoff + page_index,
             };
             let key = FutexKey {
                 ptr: 0,
                 word: 0,
                 offset: offset as u32,
-                key: InnerFutexKey::Shared(shared.clone()),
+                key: InnerFutexKey::Shared(shared),
             };
             return Ok(key);
         } else {
-            // 匿名共享：使用共享匿名映射的稳定身份 + 页偏移
+            // 匿名映射（包括栈、堆、匿名mmap等）
             if let Some(shared_anon) = &vma_guard.shared_anon {
-                let i_seq = shared_anon.id;
+                // 显式共享的匿名映射（MAP_SHARED | MAP_ANONYMOUS）
                 let shared = SharedKey {
-                    i_seq,
+                    kind: SharedKeyKind::SharedAnon { id: shared_anon.id },
                     page_offset: page_index,
                 };
                 let key = FutexKey {
                     ptr: 0,
                     word: 0,
                     offset: offset as u32,
-                    key: InnerFutexKey::Shared(shared.clone()),
+                    key: InnerFutexKey::Shared(shared),
                 };
                 return Ok(key);
             } else {
-                // 理论上不会发生；为安全起见，退化为私有键（不跨进程匹配）
+                // 私有匿名映射（栈、堆等）+ FUTEX_SHARED 标志
+                //
+                // 按照 Linux 内核的实际实现（kernel/futex/core.c: get_futex_key）：
+                // 对于匿名页的 FUTEX_SHARED，Linux 仍然使用 mm + 虚拟地址作为 key
+                // （只是添加了一个 FUT_OFF_MMSHARED 标记）
+                //
+                // 这种设计的原因：
+                // 1. 栈/堆这种私有匿名映射本质上不能跨进程共享
+                // 2. 只能在同一进程的线程间同步（它们共享地址空间）
+                // 3. 使用虚拟地址而非物理地址，与 swap 机制兼容
+                //
+                // DragonOS 的实现：
+                // 使用 AddressSpace 的全局唯一 ID + 虚拟页号作为 shared key
+                // - 同一进程的线程共享 AddressSpace，因此会生成相同的 key
+                // - 不同进程的 AddressSpace 有不同的 ID，即使虚拟地址相同也不会冲突
+                // - AddressSpace ID 是递增分配的，永不重复，避免了地址重用问题
+
+                let address_space = AddressSpace::current()?;
+                let as_id = address_space.id();
+
+                drop(vma_guard);
+                drop(as_guard);
+
+                let shared = SharedKey {
+                    kind: SharedKeyKind::PrivateAnonShared { as_id },
+                    // 使用虚拟页号（不是物理页号！）
+                    page_offset: (address >> MMArch::PAGE_SHIFT) as u64,
+                };
+
                 let key = FutexKey {
                     ptr: 0,
                     word: 0,
                     offset: offset as u32,
-                    key: InnerFutexKey::Private(PrivateKey {
-                        address: address as u64,
-                        address_space: Some(Arc::downgrade(&address_space)),
-                    }),
+                    key: InnerFutexKey::Shared(shared),
                 };
                 return Ok(key);
             }
@@ -674,6 +737,8 @@ impl Futex {
             UserBufferReader::new(uaddr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
 
         let oldval = reader.read_one_from_user::<u32>(0)?;
+        // 保存旧值的副本，因为后续的修改操作会改变内存中的值
+        let oldval_copy = *oldval;
 
         // 直接获取用户空间地址的原始指针
         let ptr = uaddr.as_ptr::<u32>();
@@ -700,7 +765,7 @@ impl Futex {
 
         drop(guard);
 
-        Ok(*oldval)
+        Ok(oldval_copy)
     }
 }
 

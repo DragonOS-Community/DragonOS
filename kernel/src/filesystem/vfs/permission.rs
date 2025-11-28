@@ -69,10 +69,10 @@ impl Cred {
         // 确定要检查哪组权限位
         let perm = if self.is_owner(metadata) {
             // 所有者权限（第 6-8 位）
-            file_mode & ModeType::S_IRWXU.bits() >> 6
+            (file_mode & ModeType::S_IRWXU.bits()) >> 6
         } else if self.in_group(metadata) {
             // 组权限（第 3-5 位）
-            file_mode & ModeType::S_IRWXG.bits() >> 3
+            (file_mode & ModeType::S_IRWXG.bits()) >> 3
         } else {
             // 其他用户权限（第 0-2 位）
             file_mode & ModeType::S_IRWXO.bits()
@@ -107,7 +107,6 @@ impl Cred {
         if self.fsgid.data() == metadata.gid {
             return true;
         }
-
         // 检查附加组
         self.groups.iter().any(|gid| gid.data() == metadata.gid)
     }
@@ -121,30 +120,31 @@ impl Cred {
     fn try_capability_override(&self, metadata: &Metadata, mask: u32) -> bool {
         // CAP_DAC_OVERRIDE: 绕过所有文件读、写和执行权限检查
         if self.has_capability(CAPFlags::CAP_DAC_OVERRIDE) {
-            // 对于目录：总是允许
-            if metadata.file_type == super::FileType::Dir {
-                return true;
-            }
-
-            // 对于文件：如果不是仅执行请求，或文件对某人可执行，则允许
-            if mask != PermissionMask::MAY_EXEC.bits() {
-                return true;
-            }
-            if metadata.mode.bits() & PermissionMask::MAY_RWX.bits() != 0 {
+            // 对于目录或文件，只要满足下列条件之一就允许
+            if metadata.file_type == super::FileType::Dir
+                || mask & PermissionMask::MAY_EXEC.bits() == 0
+                || metadata.mode.bits() & PermissionMask::MAY_RWX.bits() != 0
+            {
                 return true;
             }
         }
 
         // CAP_DAC_READ_SEARCH: 绕过读和搜索（目录上的执行）检查
         if self.has_capability(CAPFlags::CAP_DAC_READ_SEARCH) {
-            // 允许读任何文件
-            if mask == PermissionMask::MAY_READ.bits() {
-                return true;
-            }
-
-            // 允许搜索（执行）目录
-            if metadata.file_type == FileType::Dir && mask == PermissionMask::MAY_EXEC.bits() {
-                return true;
+            // 目录：只要不请求写权限，就允许 (即允许 Read 和 Exec/Search)
+            if metadata.file_type == FileType::Dir {
+                if (mask & PermissionMask::MAY_WRITE.bits()) == 0 {
+                    return true;
+                }
+            } else {
+                // 文件：仅允许只读权限
+                let check_mask = mask
+                    & (PermissionMask::MAY_READ.bits()
+                        | PermissionMask::MAY_EXEC.bits()
+                        | PermissionMask::MAY_WRITE.bits());
+                if check_mask == PermissionMask::MAY_READ.bits() {
+                    return true;
+                }
             }
         }
 

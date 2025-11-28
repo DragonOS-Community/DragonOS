@@ -118,7 +118,7 @@ pub trait AttributeGroup: Debug + Send + Sync {
 }
 
 /// sysfs只读属性文件的权限
-pub const SYSFS_ATTR_MODE_RO: ModeType = ModeType::from_bits_truncate(0o444);
+pub const SYSFS_ATTR_MODE_RO: ModeType = ModeType::S_IRUGO;
 /// sysfs只写属性文件的权限
 pub const SYSFS_ATTR_MODE_WO: ModeType = ModeType::from_bits_truncate(0o200);
 /// sysfs读写属性文件的权限

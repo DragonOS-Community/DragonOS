@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use alloc::sync::Arc;
 
 use crate::filesystem::vfs::syscall::ModeType;
@@ -21,14 +23,15 @@ impl PathContext {
 
 #[derive(Debug)]
 pub struct FsStruct {
-    umask: ModeType, //文件权限掩码
+    umask: AtomicU32, // 文件权限掩码 ModeType
     path_context: RwLock<PathContext>,
 }
 
 impl Clone for FsStruct {
     fn clone(&self) -> Self {
+        let current_umask = self.umask.load(Ordering::Relaxed);
         Self {
-            umask: self.umask,
+            umask: AtomicU32::new(current_umask),
             path_context: RwLock::new(self.path_context.read().clone()),
         }
     }
@@ -43,9 +46,19 @@ impl Default for FsStruct {
 impl FsStruct {
     pub fn new() -> Self {
         Self {
-            umask: ModeType::S_IWUGO,
+            umask: AtomicU32::new(ModeType::S_IWUGO.bits()),
             path_context: RwLock::new(PathContext::new()),
         }
+    }
+
+    pub fn umask(&self) -> u32 {
+        self.umask.load(Ordering::SeqCst)
+    }
+
+    /// Linux: xchg(&current->fs->umask, mask & S_IRWXUGO)
+    pub fn set_umask(&self, mask: u32) -> u32 {
+        self.umask
+            .swap(mask & ModeType::S_IRWXUGO.bits(), Ordering::SeqCst)
     }
 
     pub fn set_root(&self, inode: Arc<dyn IndexNode>) {

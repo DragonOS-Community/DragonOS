@@ -14,6 +14,7 @@ getcpu_host_test
 # 文件系统相关测试
 dup_test
 write_test
+mkdir_test
 mknod_test
 unlink_test
 lseek_test
@@ -54,7 +55,6 @@ madvise_test
 #listen_test
 
 # 信号处理测试
-#signal_test
 sigaction_test
 sigprocmask_test
 sigaltstack_test

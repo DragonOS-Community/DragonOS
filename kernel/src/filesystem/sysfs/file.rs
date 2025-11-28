@@ -154,7 +154,7 @@ impl SysFS {
         let sys_priv = SysFSKernPrivateData::File(SysKernFilePriv::new(&kobj, Some(attr), None));
         let r = parent.add_file(
             attr.name().to_string(),
-            mode.bitand(ModeType::from_bits_truncate(0o777)),
+            mode.bitand(ModeType::S_IRWXUGO),
             Some(4096),
             Some(KernInodePrivateData::SysFS(sys_priv)),
             Some(kern_callback),
@@ -266,7 +266,7 @@ impl SysFS {
             SysFSKernPrivateData::File(SysKernFilePriv::new(&kobj, None, Some(attr.clone())));
         let r = parent.add_file(
             attr.name().to_string(),
-            mode.bitand(ModeType::from_bits_truncate(0o777)),
+            mode.bitand(ModeType::S_IRWXUGO),
             Some(attr.size()),
             Some(KernInodePrivateData::SysFS(sys_priv)),
             Some(kern_callback),

@@ -606,11 +606,7 @@ impl ProcFS {
         )?;
         // 创建相关文件
         // status文件
-        let status_binding = pid_dir.create(
-            "status",
-            FileType::File,
-            ModeType::from_bits_truncate(0o444),
-        )?;
+        let status_binding = pid_dir.create("status", FileType::File, ModeType::S_IRUGO)?;
         let status_file: &LockedProcFSInode = status_binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
@@ -619,12 +615,8 @@ impl ProcFS {
         status_file.0.lock().fdata.ftype = ProcFileType::ProcStatus;
 
         // exe文件
-        let exe_binding = pid_dir.create_with_data(
-            "exe",
-            FileType::SymLink,
-            ModeType::from_bits_truncate(0o444),
-            0,
-        )?;
+        let exe_binding =
+            pid_dir.create_with_data("exe", FileType::SymLink, ModeType::S_IRUGO, 0)?;
         let exe_file = exe_binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
@@ -714,11 +706,7 @@ impl LockedProcFSInode {
         let file = fd_table.get_file_by_fd(fd);
         if file.is_some() {
             let _ = self.unlink(&fd.to_string());
-            let fd_file = self.create(
-                &fd.to_string(),
-                FileType::SymLink,
-                ModeType::from_bits_truncate(0o444),
-            )?;
+            let fd_file = self.create(&fd.to_string(), FileType::SymLink, ModeType::S_IRUGO)?;
             let fd_file_proc = fd_file
                 .as_any_ref()
                 .downcast_ref::<LockedProcFSInode>()

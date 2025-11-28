@@ -122,7 +122,7 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
 
     tracing_root.add_file(
         "trace_pipe".to_string(),
-        ModeType::from_bits_truncate(0o444),
+        ModeType::S_IRUGO,
         Some(4096),
         None,
         Some(&trace_pipe::TracePipeCallBack),
@@ -133,7 +133,7 @@ pub fn init_debugfs_tracing() -> Result<(), SystemError> {
     )?;
     tracing_root.add_file(
         "saved_cmdlines_size".to_string(),
-        ModeType::from_bits_truncate(0o444),
+        ModeType::S_IRUGO,
         None,
         None,
         Some(&trace_pipe::SavedCmdlinesSizeCallBack),

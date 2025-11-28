@@ -194,8 +194,7 @@ fn do_sys_openat2(
             }
 
             // 文件存在 - 检查 O_EXCL
-            if how.o_flags.contains(FileMode::O_CREAT)
-                && how.o_flags.contains(FileMode::O_EXCL) {
+            if how.o_flags.contains(FileMode::O_CREAT) && how.o_flags.contains(FileMode::O_EXCL) {
                 return Err(SystemError::EEXIST);
             }
 
@@ -212,7 +211,8 @@ fn do_sys_openat2(
                 // 目录不能以写模式打开
                 let access_mode = how.o_flags.accmode();
                 if access_mode == FileMode::O_WRONLY.accmode()
-                    || access_mode == FileMode::O_RDWR.accmode() {
+                    || access_mode == FileMode::O_RDWR.accmode()
+                {
                     return Err(SystemError::EISDIR);
                 }
                 // O_DIRECT 在目录上应该失败
@@ -268,7 +268,6 @@ fn do_sys_openat2(
     // 因为 O_TRUNC 的截断基于文件系统权限，而不是打开模式
     // 例如：open(file, O_RDONLY | O_TRUNC) 是合法的，只要用户对文件有写权限
     if how.o_flags.contains(FileMode::O_TRUNC) && file_type == FileType::File {
-        // 直接在 inode 层截断，绕过 File 的打开模式检查
         inode.resize(0)?;
     }
 

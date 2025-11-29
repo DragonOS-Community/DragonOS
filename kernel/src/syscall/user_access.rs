@@ -215,7 +215,8 @@ impl UserBufferReader<'_> {
         len: usize,
         from_user: bool,
     ) -> Result<Self, SystemError> {
-        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, false) {
+        let accessible_len = user_accessible_len(VirtAddr::new(addr as usize), len, false);
+        if accessible_len < len {
             return Err(SystemError::EFAULT);
         }
 
@@ -442,14 +443,12 @@ impl UserBufferReader<'_> {
         offset: usize,
     ) -> Result<&[T], SystemError> {
         let size = src.len().saturating_sub(offset);
-        if size > 0
-            && !check_user_access_by_page_table(
-                VirtAddr::new(src.as_ptr() as usize + offset),
-                size,
-                false,
-            )
-        {
-            return Err(SystemError::EFAULT);
+        if size > 0 {
+            let accessible_len =
+                user_accessible_len(VirtAddr::new(src.as_ptr() as usize + offset), size, false);
+            if accessible_len < size {
+                return Err(SystemError::EFAULT);
+            }
         }
         self.convert_with_offset(src, offset)
     }
@@ -542,7 +541,8 @@ impl<'a> UserBufferWriter<'a> {
     }
 
     pub fn new_checked<U>(addr: *mut U, len: usize, from_user: bool) -> Result<Self, SystemError> {
-        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, true) {
+        let accessible_len = user_accessible_len(VirtAddr::new(addr as usize), len, true);
+        if accessible_len < len {
             return Err(SystemError::EFAULT);
         }
 
@@ -714,14 +714,12 @@ impl<'a> UserBufferWriter<'a> {
         offset: usize,
     ) -> Result<&mut [T], SystemError> {
         let size = src.len().saturating_sub(offset);
-        if size > 0
-            && !check_user_access_by_page_table(
-                VirtAddr::new(src.as_ptr() as usize + offset),
-                size,
-                true,
-            )
-        {
-            return Err(SystemError::EFAULT);
+        if size > 0 {
+            let accessible_len =
+                user_accessible_len(VirtAddr::new(src.as_ptr() as usize + offset), size, true);
+            if accessible_len < size {
+                return Err(SystemError::EFAULT);
+            }
         }
         Self::convert_with_offset(src, offset)
     }

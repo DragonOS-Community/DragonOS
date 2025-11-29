@@ -21,7 +21,6 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
         CurrentIrqArch, SigStackArch,
@@ -243,15 +242,24 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let rq =
-                    cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+                let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
+
+                // 使用负载均衡器选择目标CPU
+                let target_cpu =
+                    crate::sched::load_balance::LoadBalancer::select_task_rq(pcb, prev_cpu, 0);
+
+                let rq = cpu_rq(target_cpu.data() as usize);
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();
-                rq.activate_task(
-                    pcb,
-                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-                );
+
+                // 如果目标CPU与原CPU不同，添加迁移标志
+                let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
+                if target_cpu != prev_cpu {
+                    flags |= EnqueueFlag::ENQUEUE_MIGRATED;
+                }
+
+                rq.activate_task(pcb, flags);
 
                 rq.check_preempt_currnet(pcb, WakeupFlags::empty());
 
@@ -281,19 +289,24 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let rq = cpu_rq(
-                    pcb.sched_info()
-                        .on_cpu()
-                        .unwrap_or(smp_get_processor_id())
-                        .data() as usize,
-                );
+                let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
+
+                // 使用负载均衡器选择目标CPU
+                let target_cpu =
+                    crate::sched::load_balance::LoadBalancer::select_task_rq(pcb, prev_cpu, 0);
+
+                let rq = cpu_rq(target_cpu.data() as usize);
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();
-                rq.activate_task(
-                    pcb,
-                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-                );
+
+                // 如果目标CPU与原CPU不同，添加迁移标志
+                let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
+                if target_cpu != prev_cpu {
+                    flags |= EnqueueFlag::ENQUEUE_MIGRATED;
+                }
+
+                rq.activate_task(pcb, flags);
 
                 rq.check_preempt_currnet(pcb, WakeupFlags::empty());
 

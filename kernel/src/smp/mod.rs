@@ -54,4 +54,9 @@ pub fn smp_init() {
     smp_cpu_manager().bringup_nonboot_cpus();
 
     CurrentSMPArch::post_init().expect("SMP post init failed");
+
+    // 启用负载均衡
+    crate::sched::load_balance::enable_load_balance();
+
+    log::info!("SMP initialized.");
 }

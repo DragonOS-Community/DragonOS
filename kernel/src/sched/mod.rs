@@ -3,6 +3,7 @@ pub mod completion;
 pub mod cputime;
 pub mod fair;
 pub mod idle;
+pub mod load_balance;
 pub mod pelt;
 pub mod prio;
 pub mod syscall;
@@ -397,6 +398,12 @@ impl CpuRunQueue {
         guard
     }
 
+    /// 获取运行队列的任务数（不加锁），用于负载均衡决策
+    #[inline]
+    pub fn nr_running_lockless(&self) -> usize {
+        self.nr_running
+    }
+
     pub fn enqueue_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: EnqueueFlag) {
         if !flags.contains(EnqueueFlag::ENQUEUE_NOCLOCK) {
             self.update_rq_clock();
@@ -455,7 +462,10 @@ impl CpuRunQueue {
         }
 
         if flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
-            todo!()
+            // 任务被迁移到新的CPU，需要更新其CFS队列引用
+            // 在入队之前更新，确保 h_nr_running 计数器在正确的队列上增加
+            let se = pcb.sched_info().sched_entity();
+            se.force_mut().set_cfs(Arc::downgrade(&self.cfs));
         }
 
         self.enqueue_task(pcb.clone(), flags);
@@ -814,7 +824,11 @@ pub fn scheduler_tick() {
     rq.calculate_global_load_tick();
 
     drop(guard);
-    // TODO:处理负载均衡
+
+    //todo 检查并执行负载均衡（只检测不均衡，migrate_tasks 内部是空的）
+    if load_balance::LoadBalancer::should_balance() {
+        load_balance::LoadBalancer::run_load_balance();
+    }
 }
 
 /// ## 执行调度

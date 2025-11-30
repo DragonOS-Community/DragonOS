@@ -4,7 +4,8 @@ use crate::{
     arch::interrupt::TrapFrame,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
-        syscall::InodeMode, utils::rsplit_path, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        syscall::InodeMode, utils::rsplit_path, IndexNode, MAX_PATHLEN,
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     process::ProcessManager,
     syscall::{

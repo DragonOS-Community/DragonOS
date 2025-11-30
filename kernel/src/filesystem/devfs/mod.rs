@@ -5,8 +5,8 @@ pub mod zero_dev;
 use super::{
     devpts::{DevPtsFs, LockedDevPtsFSInode},
     vfs::{
-        file::FileFlags, syscall::InodeMode, utils::DName, vcore::generate_inode_id, FilePrivateData,
-        FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
+        file::FileFlags, syscall::InodeMode, utils::DName, vcore::generate_inode_id,
+        FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
     },
 };
 use crate::{

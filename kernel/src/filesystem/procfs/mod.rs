@@ -686,7 +686,11 @@ impl LockedProcFSInode {
         // symlinks whose contents look like "ipc:[4026531839]". For now we model
         // them as regular procfs files and implement the textual target via
         // readlink, while `open()` returns a namespace fd.
-        match self.create(ns_name, FileType::File, InodeMode::from_bits_truncate(0o444)) {
+        match self.create(
+            ns_name,
+            FileType::File,
+            InodeMode::from_bits_truncate(0o444),
+        ) {
             Ok(ns_file) => Ok(ns_file),
             Err(SystemError::EEXIST) => {
                 // Lost a concurrent race: another thread created the same entry

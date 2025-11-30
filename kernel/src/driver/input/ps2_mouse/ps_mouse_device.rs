@@ -31,8 +31,8 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         vfs::{
-            syscall::ModeType, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
-            FileType, IndexNode, Metadata,
+            syscall::InodeMode, utils::DName, vcore::generate_inode_id, FilePrivateData,
+            FileSystem, FileType, IndexNode, Metadata,
         },
     },
     libs::{
@@ -200,7 +200,7 @@ impl Ps2MouseDevice {
                     ctime: PosixTimeSpec::default(),
                     btime: PosixTimeSpec::default(),
                     file_type: FileType::CharDevice, // 文件夹，block设备，char设备
-                    mode: ModeType::from_bits_truncate(0o644),
+                    mode: InodeMode::from_bits_truncate(0o644),
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
@@ -599,7 +599,7 @@ impl IndexNode for Ps2MouseDevice {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &crate::filesystem::vfs::file::FileMode,
+        _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         let mut guard = self.inner.lock_irqsave();
         guard.buf.clear();

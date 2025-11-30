@@ -31,8 +31,8 @@ use crate::{
         epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
-            file::FileFlags, syscall::InodeMode, utils::DName, FilePrivateData, FileType, IndexNode,
-            Metadata, PollableInode,
+            file::FileFlags, syscall::InodeMode, utils::DName, FilePrivateData, FileType,
+            IndexNode, Metadata, PollableInode,
         },
     },
     init::initcall::INITCALL_DEVICE,
@@ -261,7 +261,8 @@ impl IndexNode for TtyDevice {
 
         let driver = tty.core().driver();
         // 考虑noctty（当前tty）
-        if !(mode.contains(FileFlags::O_NOCTTY) && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
+        if !(mode.contains(FileFlags::O_NOCTTY)
+            && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
             || dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 1)
             || (driver.tty_driver_type() == TtyDriverType::Pty
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))

@@ -37,7 +37,7 @@ pub struct PipeFsPrivateData {
 
 impl PipeFsPrivateData {
     pub fn new(flags: FileFlags) -> Self {
-        return PipeFsPrivateData { flags: flags };
+        return PipeFsPrivateData { flags };
     }
 
     pub fn set_flags(&mut self, flags: FileFlags) {

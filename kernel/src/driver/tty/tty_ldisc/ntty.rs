@@ -1833,7 +1833,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 break;
             }
 
-            if _flags.contains(FileFlags::O_NONBLOCK) || core.flags().contains(TtyFlag::LDISC_CHANGING)
+            if _flags.contains(FileFlags::O_NONBLOCK)
+                || core.flags().contains(TtyFlag::LDISC_CHANGING)
             {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }

@@ -19,7 +19,7 @@ use super::{
 #[derive(Clone)]
 pub struct KStat {
     pub result_mask: PosixStatxMask, // What fields the user got
-    pub mode: InodeMode,              // umode_t
+    pub mode: InodeMode,             // umode_t
     pub nlink: u32,
     pub blksize: u32, // Preferred I/O size
     pub attributes: StxAttributes,

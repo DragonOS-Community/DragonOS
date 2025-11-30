@@ -88,7 +88,12 @@ impl SysFcntlHandle {
                         if cmd == FcntlCommand::DupFd {
                             return do_dup2(fd, i as i32, &mut fd_table_guard);
                         } else {
-                            return do_dup3(fd, i as i32, FileFlags::O_CLOEXEC, &mut fd_table_guard);
+                            return do_dup3(
+                                fd,
+                                i as i32,
+                                FileFlags::O_CLOEXEC,
+                                &mut fd_table_guard,
+                            );
                         }
                     }
                 }

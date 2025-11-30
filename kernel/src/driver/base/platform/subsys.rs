@@ -19,7 +19,7 @@ use crate::{
     },
     filesystem::{
         sysfs::{Attribute, AttributeGroup},
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
 };
 use system_error::SystemError;

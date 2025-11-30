@@ -6,7 +6,7 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
 };
 

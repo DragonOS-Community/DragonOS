@@ -27,7 +27,7 @@ use crate::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
     init::initcall::INITCALL_CORE,
     libs::spinlock::SpinLock,

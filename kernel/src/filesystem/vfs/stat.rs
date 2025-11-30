@@ -12,8 +12,8 @@ use alloc::sync::Arc;
 
 use super::{
     fcntl::AtFlags,
-    syscall::{InodeMode, PosixStatx, PosixStatxMask, StxAttributes},
-    IndexNode,
+    syscall::{PosixStatx, PosixStatxMask, StxAttributes},
+    IndexNode, InodeMode,
 };
 
 #[derive(Clone)]

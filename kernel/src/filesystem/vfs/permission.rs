@@ -5,7 +5,7 @@
 
 use super::Metadata;
 use crate::{
-    filesystem::vfs::{syscall::InodeMode, FileType},
+    filesystem::vfs::{FileType, InodeMode},
     process::cred::{CAPFlags, Cred},
 };
 use system_error::SystemError;

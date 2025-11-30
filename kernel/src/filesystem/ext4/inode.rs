@@ -2,8 +2,8 @@ use crate::{
     filesystem::{
         page_cache::PageCache,
         vfs::{
-            self, syscall::InodeMode, utils::DName, vcore::generate_inode_id, FilePrivateData,
-            IndexNode, InodeId,
+            self, utils::DName, vcore::generate_inode_id, FilePrivateData, IndexNode, InodeId,
+            InodeMode,
         },
     },
     libs::casting::DowncastArc,
@@ -53,7 +53,7 @@ impl IndexNode for LockedExt4Inode {
         &self,
         name: &str,
         file_type: vfs::FileType,
-        mode: vfs::syscall::InodeMode,
+        mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut guard = self.0.lock();
         // another_ext4的高4位是文件类型，低12位是权限

@@ -22,8 +22,8 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         vfs::{
-            file::FileFlags, syscall::InodeMode, vcore::generate_inode_id, FilePrivateData,
-            FileSystem, FileType, IndexNode, Metadata,
+            file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
+            IndexNode, InodeMode, Metadata,
         },
     },
     init::initcall::INITCALL_DEVICE,

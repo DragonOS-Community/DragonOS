@@ -15,7 +15,7 @@ use crate::{
             KernFSInode,
         },
         sysfs::{SysFSOps, SysFSOpsSupport},
-        vfs::{syscall::InodeMode, PollStatus},
+        vfs::{InodeMode, PollStatus},
     },
 };
 

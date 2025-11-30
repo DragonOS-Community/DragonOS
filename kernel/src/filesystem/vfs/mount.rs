@@ -40,8 +40,8 @@ use crate::{
 };
 
 use super::{
-    file::FileFlags, syscall::InodeMode, utils::DName, FilePrivateData, FileSystem, FileType,
-    IndexNode, InodeId, Magic, PollableInode, SuperBlock,
+    file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+    InodeMode, Magic, PollableInode, SuperBlock,
 };
 
 bitflags! {

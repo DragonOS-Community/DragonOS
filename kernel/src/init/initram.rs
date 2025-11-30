@@ -17,7 +17,10 @@ use cpio_reader::Mode;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use crate::filesystem::vfs::{syscall::ModeType, utils::rsplit_path, FileType, IndexNode};
+use crate::filesystem::vfs::{
+    InodeMode,
+    {utils::rsplit_path, FileType, IndexNode},
+};
 
 static mut __INIT_ROOT_INODE: Option<Arc<dyn IndexNode>> = None;
 
@@ -146,13 +149,13 @@ pub fn initramfs_init() -> Result<(), SystemError> {
     for (index, entry) in collected_entries_vec.iter().enumerate() {
         // x86 的有 4 种文件：Dir, File, CharDevice, SymLink
         let name = entry.name.clone();
-        let mode = ModeType::from_bits(entry.mode.bits()).ok_or_else(|| {
+        let mode = InodeMode::from_bits(entry.mode.bits()).ok_or_else(|| {
             log::error!("initramfs: failed to get mode!");
             SystemError::EINVAL
         })?;
         let file_type = FileType::from(mode);
         log::info!(
-            "Find cpio entry, Name:{}, ModeType:{:?}, FileType:{:?}",
+            "Find cpio entry, Name:{}, InodeMode:{:?}, FileType:{:?}",
             name,
             mode,
             file_type
@@ -206,7 +209,7 @@ pub fn initramfs_init() -> Result<(), SystemError> {
         let new_inode = parent_inode.create_with_data(
             filename,
             FileType::SymLink,
-            ModeType::from_bits_truncate(0o777),
+            InodeMode::from_bits_truncate(0o777),
             0,
         )?;
         let buf = other_name.as_bytes();

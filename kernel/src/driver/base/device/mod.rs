@@ -18,7 +18,7 @@ use crate::{
             file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
             SysFSOpsSupport,
         },
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},

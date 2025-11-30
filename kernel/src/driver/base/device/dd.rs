@@ -10,7 +10,7 @@ use crate::{
         sysfs::{
             file::sysfs_emit_str, sysfs_instance, Attribute, SysFSOpsSupport, SYSFS_ATTR_MODE_WO,
         },
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
     libs::wait_queue::WaitQueue,
 };

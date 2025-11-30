@@ -31,8 +31,8 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         vfs::{
-            syscall::InodeMode, utils::DName, vcore::generate_inode_id, FilePrivateData,
-            FileSystem, FileType, IndexNode, Metadata,
+            utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
+            IndexNode, InodeMode, Metadata,
         },
     },
     libs::{

@@ -38,9 +38,8 @@ use crate::{
 
 use super::vfs::{
     file::{FileFlags, FilePrivateData, NamespaceFilePrivateData},
-    syscall::InodeMode,
     utils::DName,
-    FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
+    FileSystem, FsInfo, IndexNode, InodeId, InodeMode, Magic, Metadata, SuperBlock,
 };
 
 pub mod kmsg;

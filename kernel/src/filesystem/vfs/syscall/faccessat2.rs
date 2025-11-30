@@ -1,6 +1,6 @@
 use system_error::SystemError;
 
-use crate::filesystem::vfs::{open::do_faccessat, syscall::InodeMode};
+use crate::filesystem::vfs::{open::do_faccessat, InodeMode};
 
 pub fn do_faccessat2(
     dirfd: i32,

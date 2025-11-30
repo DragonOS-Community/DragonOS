@@ -1,6 +1,6 @@
 use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 use crate::filesystem::kernfs::{KernFSInodeArgs, KernInodeType};
-use crate::filesystem::vfs::syscall::InodeMode;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::PollStatus;
 use crate::libs::wait_queue::WaitQueue;
 use crate::process::{ProcessFlags, ProcessManager};

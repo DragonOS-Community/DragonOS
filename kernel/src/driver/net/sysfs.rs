@@ -9,7 +9,7 @@ use crate::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
             SYSFS_ATTR_MODE_RW,
         },
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
 };
 use alloc::sync::Arc;

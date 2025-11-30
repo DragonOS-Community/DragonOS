@@ -14,9 +14,8 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{
             file::{File, FileFlags},
-            syscall::InodeMode,
             vcore::generate_inode_id,
-            FileType, IndexNode, Metadata,
+            FileType, IndexNode, InodeMode, Metadata,
         },
     },
     libs::spinlock::SpinLock,

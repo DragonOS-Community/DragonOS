@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 
-use crate::filesystem::vfs::syscall::InodeMode;
 use crate::filesystem::vfs::IndexNode;
+use crate::filesystem::vfs::InodeMode;
 use crate::libs::rwlock::RwLock;
 use crate::process::ProcessManager;
 #[derive(Debug, Clone)]

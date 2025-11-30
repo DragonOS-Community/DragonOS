@@ -19,7 +19,7 @@ use crate::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},

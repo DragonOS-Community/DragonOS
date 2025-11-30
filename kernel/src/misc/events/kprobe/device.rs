@@ -8,7 +8,7 @@ use crate::driver::base::kobject::{
 use crate::driver::base::kset::KSet;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::sysfs::{Attribute, SysFSOpsSupport};
-use crate::filesystem::vfs::syscall::InodeMode;
+use crate::filesystem::vfs::InodeMode;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use alloc::string::{String, ToString};

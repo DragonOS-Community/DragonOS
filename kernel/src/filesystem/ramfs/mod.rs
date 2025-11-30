@@ -24,8 +24,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    file::FilePrivateData, syscall::InodeMode, utils::DName, FileSystem, FileSystemMaker, FsInfo,
-    IndexNode, InodeId, Metadata, SpecialNodeData,
+    file::FilePrivateData, utils::DName, FileSystem, FileSystemMaker, FsInfo, IndexNode, InodeId,
+    InodeMode, Metadata, SpecialNodeData,
 };
 
 use linkme::distributed_slice;

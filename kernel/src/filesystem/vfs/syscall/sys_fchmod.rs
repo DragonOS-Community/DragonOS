@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_FCHMOD;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::syscall::InodeMode,
+    filesystem::vfs::InodeMode,
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };

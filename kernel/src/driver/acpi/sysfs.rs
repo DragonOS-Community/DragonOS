@@ -8,7 +8,7 @@ use crate::{
             file::sysfs_emit_str, sysfs_instance, Attribute, BinAttribute, SysFSOpsSupport,
             SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
     libs::rwlock::RwLock,
 };

@@ -6,7 +6,7 @@ use crate::bpf::map::BpfMap;
 use crate::bpf::prog::util::{BpfProgMeta, BpfProgVerifierInfo};
 use crate::bpf::prog::verifier::BpfProgVerifier;
 use crate::filesystem::vfs::file::{File, FileFlags};
-use crate::filesystem::vfs::syscall::InodeMode;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
 use crate::include::bindings::linux_bpf::bpf_attr;
 use crate::libs::spinlock::SpinLockGuard;

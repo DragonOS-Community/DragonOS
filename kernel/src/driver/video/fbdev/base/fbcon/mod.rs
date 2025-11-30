@@ -22,7 +22,7 @@ use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},

@@ -9,7 +9,7 @@ use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileFlags};
-use crate::filesystem::vfs::syscall::InodeMode;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
 };

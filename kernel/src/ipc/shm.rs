@@ -1,6 +1,6 @@
 use crate::{
     arch::mm::LockedFrameAllocator,
-    filesystem::vfs::syscall::InodeMode,
+    filesystem::vfs::InodeMode,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},

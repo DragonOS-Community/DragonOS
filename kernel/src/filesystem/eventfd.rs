@@ -1,7 +1,7 @@
 use super::vfs::PollableInode;
 use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::vfs::file::{File, FileFlags};
-use crate::filesystem::vfs::syscall::InodeMode;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
     vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata},

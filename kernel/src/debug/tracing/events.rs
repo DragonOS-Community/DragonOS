@@ -3,7 +3,7 @@ use alloc::string::ToString;
 use crate::debug::tracing::TracingDirCallBack;
 use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 use crate::filesystem::kernfs::KernFSInode;
-use crate::filesystem::vfs::syscall::InodeMode;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::PollStatus;
 use crate::tracepoint::*;
 use alloc::sync::Arc;

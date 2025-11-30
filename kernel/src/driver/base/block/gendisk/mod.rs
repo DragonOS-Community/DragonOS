@@ -14,7 +14,7 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
-        vfs::{syscall::InodeMode, utils::DName, IndexNode, Metadata},
+        vfs::{utils::DName, IndexNode, InodeMode, Metadata},
     },
     libs::{rwlock::RwLock, spinlock::SpinLockGuard},
 };

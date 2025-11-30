@@ -5,7 +5,7 @@ use crate::debug::sysfs::debugfs_kobj;
 use crate::driver::base::kobject::KObject;
 use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 use crate::filesystem::kernfs::KernFSInode;
-use crate::filesystem::vfs::syscall::InodeMode;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::PollStatus;
 use crate::libs::spinlock::SpinLock;
 use crate::tracepoint::{TraceCmdLineCacheSnapshot, TracePointInfo};

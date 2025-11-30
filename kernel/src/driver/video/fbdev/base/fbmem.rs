@@ -29,8 +29,7 @@ use crate::{
         kernfs::KernFSInode,
         sysfs::AttributeGroup,
         vfs::{
-            file::FileFlags, syscall::InodeMode, FilePrivateData, FileSystem, FileType, IndexNode,
-            Metadata,
+            file::FileFlags, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata,
         },
     },
     init::initcall::INITCALL_SUBSYS,

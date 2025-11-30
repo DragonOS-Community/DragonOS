@@ -12,7 +12,7 @@ use crate::{
         devpts::DevPtsFs,
         epoll::{event_poll::EventPoll, EPollEventType},
         vfs::{
-            file::FileFlags, syscall::InodeMode, FilePrivateData, FileType, MountFS,
+            file::FileFlags, FilePrivateData, FileType, InodeMode, MountFS,
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },

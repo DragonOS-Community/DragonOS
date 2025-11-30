@@ -17,7 +17,7 @@ use crate::{
     },
     filesystem::{
         sysfs::{Attribute, AttributeGroup},
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
 };
 

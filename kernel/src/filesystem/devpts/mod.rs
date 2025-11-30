@@ -13,8 +13,7 @@ use crate::{
     },
     filesystem::vfs::{
         mount::{do_mount_mkdir, MountFlags},
-        syscall::InodeMode,
-        FileType,
+        FileType, InodeMode,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
@@ -226,7 +225,7 @@ impl IndexNode for LockedDevPtsFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        _mode: super::vfs::syscall::InodeMode,
+        _mode: super::vfs::InodeMode,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if file_type != FileType::CharDevice {

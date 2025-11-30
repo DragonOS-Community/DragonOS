@@ -10,7 +10,7 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         kernfs::{callback::KernInodePrivateData, KernFSInode},
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
 };
 

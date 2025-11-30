@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_FCHMODAT;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{open::do_fchmodat, syscall::InodeMode},
+    filesystem::vfs::{open::do_fchmodat, InodeMode},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::vec::Vec;

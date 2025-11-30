@@ -6,8 +6,8 @@ use crate::{
             EPollEventType, EPollItem,
         },
         vfs::{
-            file::FileFlags, syscall::InodeMode, vcore::generate_inode_id, FilePrivateData,
-            FileSystem, FileType, IndexNode, Metadata, PollableInode,
+            file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
+            IndexNode, InodeMode, Metadata, PollableInode,
         },
     },
     ipc::signal_types::SigCode,

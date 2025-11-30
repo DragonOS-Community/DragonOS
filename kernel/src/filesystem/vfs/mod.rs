@@ -36,7 +36,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{file::FileFlags, syscall::InodeMode, utils::DName, vcore::generate_inode_id};
+use self::{file::FileFlags, utils::DName, vcore::generate_inode_id};
 pub use self::{file::FilePrivateData, mount::MountFS};
 
 use super::page_cache::PageCache;
@@ -68,6 +68,53 @@ pub enum FileType {
     SymLink,
     /// 套接字
     Socket,
+}
+
+bitflags! {
+    /// 文件类型和权限
+    #[repr(C)]
+    pub struct InodeMode: u32 {
+        /// 掩码
+        const S_IFMT = 0o0_170_000;
+        /// 文件类型
+        const S_IFSOCK = 0o140000;
+        const S_IFLNK = 0o120000;
+        const S_IFREG = 0o100000;
+        const S_IFBLK = 0o060000;
+        const S_IFDIR = 0o040000;
+        const S_IFCHR = 0o020000;
+        const S_IFIFO = 0o010000;
+
+        const S_ISUID = 0o004000;
+        const S_ISGID = 0o002000;
+        const S_ISVTX = 0o001000;
+        /// 文件用户权限
+        const S_IRWXU = 0o0700;
+        const S_IRUSR = 0o0400;
+        const S_IWUSR = 0o0200;
+        const S_IXUSR = 0o0100;
+        /// 文件组权限
+        const S_IRWXG = 0o0070;
+        const S_IRGRP = 0o0040;
+        const S_IWGRP = 0o0020;
+        const S_IXGRP = 0o0010;
+        /// 文件其他用户权限
+        const S_IRWXO = 0o0007;
+        const S_IROTH = 0o0004;
+        const S_IWOTH = 0o0002;
+        const S_IXOTH = 0o0001;
+
+        /// 0o777
+        const S_IRWXUGO = Self::S_IRWXU.bits | Self::S_IRWXG.bits | Self::S_IRWXO.bits;
+        /// 0o7777
+        const S_IALLUGO = Self::S_ISUID.bits | Self::S_ISGID.bits | Self::S_ISVTX.bits| Self::S_IRWXUGO.bits;
+        /// 0o444
+        const S_IRUGO = Self::S_IRUSR.bits | Self::S_IRGRP.bits | Self::S_IROTH.bits;
+        /// 0o222
+        const S_IWUGO = Self::S_IWUSR.bits | Self::S_IWGRP.bits | Self::S_IWOTH.bits;
+        /// 0o111
+        const S_IXUGO = Self::S_IXUSR.bits | Self::S_IXGRP.bits | Self::S_IXOTH.bits;
+    }
 }
 
 impl From<FileType> for InodeMode {

@@ -4,10 +4,10 @@ use system_error::SystemError;
 use super::{
     fcntl::AtFlags,
     file::{File, FileFlags},
-    syscall::{InodeMode, OpenHow, OpenHowResolve},
+    syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
     vcore::resolve_parent_inode,
-    FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{
     driver::base::block::SeekFrom, process::ProcessManager,

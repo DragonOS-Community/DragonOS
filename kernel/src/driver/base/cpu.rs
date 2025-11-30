@@ -24,7 +24,7 @@ use super::{
 };
 use crate::filesystem::sysfs::file::sysfs_emit_str;
 use crate::filesystem::sysfs::{Attribute, AttributeGroup, SysFSOpsSupport};
-use crate::filesystem::vfs::syscall::InodeMode;
+use crate::filesystem::vfs::InodeMode;
 use crate::libs::lazy_init::Lazy;
 use system_error::SystemError;
 

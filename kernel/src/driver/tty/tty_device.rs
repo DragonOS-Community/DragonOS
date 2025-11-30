@@ -31,8 +31,8 @@ use crate::{
         epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
-            file::FileFlags, syscall::InodeMode, utils::DName, FilePrivateData, FileType,
-            IndexNode, Metadata, PollableInode,
+            file::FileFlags, utils::DName, FilePrivateData, FileType, IndexNode, InodeMode,
+            Metadata, PollableInode,
         },
     },
     init::initcall::INITCALL_DEVICE,

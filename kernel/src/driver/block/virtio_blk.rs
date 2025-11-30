@@ -45,7 +45,7 @@ use crate::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         mbr::MbrDiskPartionTable,
-        vfs::{syscall::InodeMode, utils::DName, IndexNode, Metadata},
+        vfs::{utils::DName, IndexNode, InodeMode, Metadata},
     },
     init::initcall::INITCALL_POSTCORE,
     libs::{

@@ -1,7 +1,5 @@
 use crate::{
-    filesystem::vfs::{
-        syscall::InodeMode, FilePrivateData, FileType, IndexNode, Metadata, PollableInode,
-    },
+    filesystem::vfs::{FilePrivateData, FileType, IndexNode, InodeMode, Metadata, PollableInode},
     libs::spinlock::SpinLockGuard,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};

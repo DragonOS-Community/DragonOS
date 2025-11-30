@@ -25,9 +25,8 @@ use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
         file::{FileFlags, FilePrivateData},
-        syscall::InodeMode,
         vcore::generate_inode_id,
-        FileSystem, FileType, IndexNode, InodeId, Metadata,
+        FileSystem, FileType, IndexNode, InodeId, InodeMode, Metadata,
     },
     libs::{
         spinlock::{SpinLock, SpinLockGuard},

@@ -8,7 +8,7 @@ use alloc::string::String;
 use system_error::SystemError;
 
 use crate::driver::base::kobject::KObjectState;
-use crate::filesystem::vfs::syscall::InodeMode;
+use crate::filesystem::vfs::InodeMode;
 use crate::init::initcall::INITCALL_POSTCORE;
 use crate::libs::rwlock::RwLockReadGuard;
 use crate::libs::rwlock::RwLockWriteGuard;

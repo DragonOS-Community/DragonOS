@@ -1,4 +1,4 @@
-use crate::filesystem::vfs::{syscall::InodeMode, FileSystem, FileType};
+use crate::filesystem::vfs::{FileSystem, FileType, InodeMode};
 
 use super::{LockedProcFSInode, ProcFS, ProcFileCreationParams, ProcFileType};
 

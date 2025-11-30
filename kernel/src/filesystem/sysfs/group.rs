@@ -9,7 +9,7 @@ use crate::{
     filesystem::{
         kernfs::{callback::KernInodePrivateData, KernFSInode},
         sysfs::{dir::SysKernDirPriv, sysfs_instance, SysFSKernPrivateData},
-        vfs::{syscall::InodeMode, IndexNode},
+        vfs::{IndexNode, InodeMode},
     },
     libs::casting::DowncastArc,
 };

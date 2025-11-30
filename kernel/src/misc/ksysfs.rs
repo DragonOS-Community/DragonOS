@@ -2,7 +2,7 @@ use crate::{
     driver::base::kobject::{CommonKobj, DynamicKObjKType, KObject, KObjectManager},
     filesystem::{
         sysfs::{sysfs_instance, Attribute, AttributeGroup},
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
     init::initcall::INITCALL_CORE,
 };

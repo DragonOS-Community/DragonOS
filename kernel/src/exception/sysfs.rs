@@ -12,7 +12,7 @@ use crate::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport,
             SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::InodeMode,
+        vfs::InodeMode,
     },
     init::initcall::INITCALL_POSTCORE,
     misc::ksysfs::sys_kernel_kobj,

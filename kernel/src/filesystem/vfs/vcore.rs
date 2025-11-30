@@ -14,7 +14,7 @@ use crate::{
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
-        vfs::{syscall::InodeMode, AtomicInodeId, FileSystem, FileType, MountFS},
+        vfs::{AtomicInodeId, FileSystem, FileType, InodeMode, MountFS},
     },
     mm::truncate::truncate_inode_pages,
     process::{namespace::mnt::mnt_namespace_init, ProcessManager},

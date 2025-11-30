@@ -24,8 +24,8 @@ use crate::{
 use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
-    file::FileFlags, syscall::InodeMode, vcore::generate_inode_id, FilePrivateData, FileSystem,
-    FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
+    file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, FsInfo,
+    IndexNode, InodeId, InodeMode, Magic, Metadata, SuperBlock,
 };
 
 pub mod callback;

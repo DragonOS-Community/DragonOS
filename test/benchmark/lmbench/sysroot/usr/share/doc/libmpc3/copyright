@@ -1,0 +1,27 @@
+This package was debianized by Laurent Fousse <laurent@komite.net> on
+Tue, 14 Oct 2008 16:21:17 +0200.
+
+It was downloaded from <http://www.multiprecision.org/mpc/>
+
+Upstream Author:
+
+    Andreas Enge
+    Philippe Théveny
+    Paul Zimmermann
+
+Copyright:
+
+    <Copyright (C) 2002-2020 INRIA>
+
+License:
+
+    This library is distributed under the terms of the GNU Lesser General
+    Public License as published by the Free Software Foundation; either version
+    3 of the License, or (at your option) any later version.
+
+On Debian systems, a copy of the licence is located in file
+/usr/share/common-licenses/LGPL-3.
+
+The initial and current Debian packaging was made by Laurent Fousse
+<laurent@komite.net> in 2008 and is put into public domain.
+

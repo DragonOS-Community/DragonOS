@@ -1,0 +1,62 @@
+.KS
+.TS
+expand doublebox;
+l c c c
+l c c c
+l r r r.
+	Level 1	Level 2	Main
+System	cache	cache	memory
+=
+Linux i586	8	103	151\ 
+DEC Alpha	12	67	291\ 
+Linux i586	8	107	150\ 
+DEC Alpha	10	56	321\ 
+Unixware/i686	14	34	196\ 
+DEC Alpha	9	51	288\ 
+DEC Alpha	7	47	458\ 
+DEC Alpha	12	57	468\ 
+SunOS-5.4 sun4m	13	--	180\ 
+SunOS-5.4 sun4m	20	--	291\ 
+SunOS-5.4 sun4m	16	115	816\ 
+Sun Ultra1	6	42	270\ 
+SunOS-5.4 sun4d	16	116	995\ 
+IBM Power2	--	13	141\ 
+IBM PowerPC	6	164	394\ 
+DEC Alpha	10	53	477\ 
+FreeBSD/i586	10	115	179\ 
+FreeBSD/i586	7	111	181\ 
+DEC Alpha	13	104	957\ 
+FreeBSD/i586	10	118	180\ 
+FreeBSD/i586	10	101	180\ 
+HP-UX 9000/735	--	10	347\ 
+Sun SC1000	20	140	1236\ 
+HP-UX 9000/770	--	9	376\ 
+SunOS-5.4 sun4d	24	173	1246\ 
+Linux i686	12	90	194\ 
+Linux i586	10	190	320\ 
+Linux i586	10	148	320\ 
+Linux i586	10	198	321\ 
+Linux i586	10	222	321\ 
+Linux i486	12	234	336\ 
+Linux alpha	3	83	354\ 
+Linux alpha	3	43	361\ 
+DEC Alpha	3	42	396\ 
+HP-UX 9000/735	--	10	348\ 
+IRIX5.3 IP22	10	76	1018\ 
+IRIX64 IP25	8	58	1134\ 
+HP-UX 9000/735	--	10	347\ 
+HP-UX 9000/897	--	11	424\ 
+HP-UX 9000/819	--	10	430\ 
+IRIX64 IP21	11	100	709\ 
+IRIX64 IP19	10	75	1150\ 
+IRIX IP19	8	64	1189\ 
+IRIX5.3 IP19	10	75	1149\ 
+IRIX64 IP19	10	70	1152\ 
+IRIX IP22	8	64	1170\ 
+FreeBSD/i586	10	106	181\ 
+HP-UX 9000/735	--	10	348\ 
+HP-UX 9000/755	--	10	393\ 
+dgux mc88110	22	319	753\ 
+IRIX64-601 IP26	13	120	1244\ 
+.TE
+.KE

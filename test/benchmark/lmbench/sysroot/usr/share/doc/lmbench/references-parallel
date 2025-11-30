@@ -1,0 +1,171 @@
+%z Article
+%K Tullsen96
+%A Dean Tullsen
+%A Susan Eggers
+%A Joel Emer
+%A Henry Levy
+%A Jack Lo
+%A Rebecca Stamm
+%T Exploiting choice: Instruction fetch and issue on an implementable simultaneous multithreading processor
+%C Proceedings of the 23rd Annual International Symposium on Computer Architecture
+%D May 1996
+%P 191-202
+%O http://www.cs.washington.edu/research/smt/papers/ISCA96.ps
+
+%z Article
+%K Tullsen99
+%A Dean Tullsen
+%A Jack Lo
+%A Susan Eggers
+%A Henry Levy
+%T Suppoerting fine-grain synchronization on a simultaneous multithreaded processor
+%C Proceedings of the 5th International Symposium on High Performance Computer Architecture
+%D January 1999
+%P 54-58
+%O http://www.cs.washington.edu/research/smt/papers/hpca.ps
+
+%z Article
+%K Kumar97
+%A A. Kumar
+%T The HP PA-8000 RISC CPU
+%J IEEE Micro
+%V 17
+%N 2
+%D March-April 1997
+%P 27-32
+
+%z Article
+%K Schlansker00
+%A M.S. Schlansker
+%A B.R. Rau
+%T EPIC: Explicitly parallel instruction computing
+%J IEEE Computer
+%V 33
+%N 2
+%D Feb. 2000
+%P 37-45
+
+%z Article
+%K Smith95
+%A James E. Smith
+%A Gurindar S. Sohi
+%T The microarchitecture of superscalar processors
+%J Proceedings of the IEEE
+%V 83
+%D October 1995
+%P 1609-1624
+
+%z Thesis
+%K Munoz97
+%A Raul E. Silvera Munoz
+%T Static instruction scheduling for dynamic issue processors
+%I ACAPS Laboratory, School of Computer Science, McGill University
+%D 1997
+
+%z Article
+%K Agarwal96
+%A Ramesh K. Agarwal
+%T A super scalar sort algorithm for RISC processors
+%C Processings 1996 ACM SIGMOD International Conference on Management of Data
+%D 1996
+%P 240-246
+%O http://citeseer.nj.nec.com/agarwal96super.html
+
+%z Article
+%K Staelin01a
+%A Carl Staelin
+%T Analyzing the memory hierarchy
+%D October 2001
+%I Hewlett-Packard Laboratories
+%C Palo Alto, CA
+
+%z Article
+%K Staelin01b
+%A Carl Staelin
+%T lmbench3: Measuring scalability
+%D October 2001
+%I Hewlett-Packard Laboratories
+%C Palo Alto, CA
+
+%z Article
+%K Frigo98
+%A M. Frigo
+%A S.G. Johnson
+%T FFTW: An adaptive software architecture for the FFT
+%C Proceedings 1998 ICASSP
+%V 3
+%P 1381-1384
+%O http://www.fftw.org/fftw-paper-icassp.pdf
+
+%z Article
+%K Whaley98
+%A R. Clint Whaley
+%A Jack Dongarra
+%T Automatically tuned linear algebra software
+%C Proceedings of the 1998 ACM/IEEE SC98 Conference
+%D 1998
+%O http://sourceforge.net/projects/math-atlas
+
+%z Article
+%K Staelin98
+%A Carl Staelin
+%A Larry McVoy
+%T mhz: Anatomy of a microbenchmark
+%C Proceedings USENIX Annual Technical Conference
+%c New Orleans, LA
+%D June 1998
+%P 155-166
+
+%z Article
+%K McVoy96
+%A Larry McVoy
+%A Carl Staelin
+%T lmbench: Portable tools for performance analysis
+%C Proceedings USENIX Winter Conference
+%c San Diego, CA
+%D January 1996
+%P 279-284
+
+%z Thesis
+%K Prestor01
+%A Uros Prestor
+%T Evaluating the memory performance of a ccNUMA system
+%R Masters Thesis
+%I School of Computing, University of Utah
+%C Salt Lake City, Utah
+%D May 2001
+%O http://www.cs.utah.edu/~uros/thesis/thesis.pdf
+
+%z Article
+%K Saavedra95
+%A R.H. Saavedra
+%A A.J. Smith
+%T Measuring cache and TLB performance and their effect on benchmark runtimes
+%J IEEE Transactions on Computers
+%V 44
+%N 10
+%D October 1995
+%P 1223-1235
+
+%z Book
+%K Knuth73
+%A Donald E. Knuth
+%T The Art of computer programming, 2nd Edition
+%I Addison-Wesley
+%D 1973
+
+%z Book
+%K Hennessy96
+%A John L. Hennessy
+%A David A. Patterson
+%T Computer Architecture A Quantitative Approach, 2nd Edition
+%I Morgan Kaufman
+%D 1996
+
+
+%z Article
+%K McCalpin95
+%A John D. McCalpin
+%T Memory bandwidth and machine balance in current high performance computers
+%J IEEE Technical Committee on Computer Architecture newsletter
+%D December 1995

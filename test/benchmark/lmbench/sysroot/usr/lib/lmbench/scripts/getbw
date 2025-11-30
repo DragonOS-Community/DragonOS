@@ -1,0 +1,260 @@
+#!/usr/bin/perl
+# Extract the bandwith information.
+# Usage: getbw file file....
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+#
+# Default is file bandwidth which lists: mem read, file read (both),
+# mmap read (both), bcopy.
+#
+# -mem turns off the file stuff but turns on rd, wr, rdwr, frd, fwr, 
+# bcopy, bzero, cp, fcp.
+#
+foreach $file (@ARGV) {
+	open(FD, $file);
+	&cache;
+	open(FD, $file);
+	($f = $file) =~ s|/|-|;
+	if ($mem || $all) {
+		print "tmp/bwmem.$f\n";
+		open(OUT, ">tmp/bwmem.$f");
+	} else {
+		print "tmp/bwfile.$f\n";
+		open(OUT, ">tmp/bwfile.$f");
+	}
+	print OUT "%X Memory size \n%Y Bandwidth in MB/sec\n";
+	while (<FD>) {
+		chop;
+		if (/^\[lmbench/) {
+			@_ = split;
+			if ($_[3] eq "SunOS") {
+				$_[3] .= "-$_[5]";
+			}
+			$uname = "@_";
+		}
+		if (/^\d+.*Mhz/) {
+			@_ = split;
+			$mhz = $_[0];
+			$tmp = &getinfo("$uname", $mhz);
+			if ($mem) {
+				print OUT "%T Memory bandwidth for $tmp\n";
+			} else {
+				print OUT "%T Reread bandwidth for $tmp\n";
+			}
+		}
+		if (/MHZ/) {
+			@_ = split;
+			$mhz = $_[1];
+			chop($mhz) if $mhz =~ /]$/;
+			$tmp = &getinfo("$uname", $mhz);
+			if ($mem) {
+				print OUT "%T Memory bandwidth for $tmp\n";
+			} else {
+				print OUT "%T Reread bandwidth for $tmp\n";
+			}
+		}
+		if ((!$all && !$mem) && /^"read bandwidth/) {
+			print OUT "\"File reread\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if ((!$all && !$mem) && /^"read open2close bandwidth/) {
+			print OUT "\"File open2close reread\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if ((!$all && !$mem) && /^"Mmap read bandwidth/) {
+			print OUT "\"File mmap reread\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if ((!$all && !$mem) && /^"Mmap read open2close bandwidth/) {
+			print OUT "\"File mmap open2close reread\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if ($all && /^"libc bcopy aligned/) {
+			print OUT "\"libc bcopy aligned\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if (/^"libc bcopy unaligned/) {
+			print OUT "\"libc bcopy unaligned\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if ($all && /^"unrolled bcopy aligned/) {
+			print OUT "\"libc bcopy unaligned\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if (($all || $mem) && /^"unrolled bcopy unaligned/) {
+			print OUT "\"unrolled bcopy unaligned\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if (($all || $mem) && /^"unrolled partial bcopy unaligned/) {
+			print OUT "\"unrolled partial bcopy unaligned\n";
+			while (<FD>) {
+				last if /^\s*$/;
+				@_ = split; next unless $_[0] > $cache;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if (/^Memory read bandwidth/) {
+			print OUT "\"$_\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if (($all || $mem) && /^Memory partial read bandwidth/) {
+			print OUT "\"$_\n";
+			while (<FD>) {
+				last if /^\s*$/;
+				@_ = split; next unless $_[0] > $cache;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if (($all || $mem) && /^Memory partial read.write bandwidth/) {
+			print OUT "\"$_\n";
+			while (<FD>) {
+				last if /^\s*$/;
+				@_ = split; next unless $_[0] > $cache;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if (($all || $mem) && /^Memory partial write bandwidth/) {
+			print OUT "\"$_\n";
+			while (<FD>) {
+				last if /^\s*$/;
+				@_ = split; next unless $_[0] > $cache;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if (($all || $mem) && /^Memory write bandwidth/) {
+			print OUT "\"$_\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+		if (($all || $mem) && /^Memory bzero bandwidth/) {
+			print OUT "\"$_\n";
+			while (<FD>) {
+				last if /^\s*$/;
+			    	print OUT;
+			}
+			print OUT "\n";
+			next;
+		}
+	}
+}
+
+# Paw through the data and figure out how big the L1 cache is.
+# We look at the memory read performance and look for cluster breaks
+# at 4, 8, 16, 32, 64, 126, and 256k.
+sub cache
+{
+	local($in) = 0;
+	local($n, $sum, $avg) = (0,0,0);
+
+	$cache = 0;
+	while (<FD>) {
+		if (/^Memory partial read bandwidth/) {
+			$in = 1;
+			next;
+		}
+		next unless $in;
+		@_ = split;
+		if ($n == 0) {
+			$sum += $_[1];
+			$n++;
+			next;
+		}
+		$avg = $sum/$n;
+		if ($_[1] < .75*$avg) {
+			$cache = $last;
+			return;
+		}
+		$last = $_[0];
+		$sum += $_[1];
+		$n++;
+	}
+}
+
+# Try and create sensible names from uname -a output
+sub getinfo
+{
+	local(@info);
+	local($name);
+	local($mhz);
+
+	$mhz = $_[1];
+	$_ = $_[0];
+	@info = split;
+	$name = pop(@info);
+	chop($name);
+	if ($name eq "unknown") {
+		$name = pop(@info);
+	}
+	if ($name eq "mips") {
+		$name = "$info[$#info]\@$mhz";
+	} elsif ($_[0] =~ /HP-UX/) {
+		$name = "$info[7]\@$mhz";
+	} elsif ($_[0] =~ /SunOS/) {
+		$name = "$info[7]\@$mhz";
+	} else {
+		$name .= "\@$mhz";
+	}
+	"$info[3] $name";
+}

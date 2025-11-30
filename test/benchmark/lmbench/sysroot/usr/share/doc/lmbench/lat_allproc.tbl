@@ -1,0 +1,60 @@
+.KS
+.TS
+expand doublebox;
+l|c|c|c
+l|r|r|r.
+	fork	\fBfork, exec\fP	fork, exec
+System	& exit	\fB& exit\fP	sh -c & exit
+=
+DEC Alpha	4.6	13\ 	42\ 
+DEC Alpha	3.3	11\ 	44\ 
+Linux alpha	0.7	3\ 	12\ 
+Linux alpha	1.0	2\ 	16\ 
+DEC Alpha	2.0	6\ 	43\ 
+DEC Alpha	4.8	16\ 	64\ 
+Linux i686	0.5	5\ 	17\ 
+DEC Alpha	3.1	10\ 	281\ 
+Linux i586	0.9	5\ 	16\ 
+DEC Alpha	5.3	14\ 	27\ 
+DEC Alpha	5.1	15\ 	89\ 
+Sun Ultra1	3.7	20\ 	10\ 
+SunOS-5.4 sun4m	8.0	46\ 	237\ 
+SunOS-5.4 sun4m	18.0	83\ 	37\ 
+SunOS-5.4 sun4m	10.7	57\ 	87\ 
+Linux i486	3.3	10\ 	112\ 
+Linux i586	1.6	12\ 	44\ 
+SunOS-5.4 sun4d	13.7	75\ 	113\ 
+IBM Power2	1.2	8\ 	16\ 
+IBM PowerPC	2.9	8\ 	50\ 
+SunOS-5.4 sun4d	20.8	93\ 	136\ 
+HP-UX 9000/735	1.3	3\ 	17\ 
+IRIX5.3 IP19	4.3	8\ 	20\ 
+IRIX5.3 IP22	3.1	8\ 	19\ 
+IRIX64-601 IP26	4.6	24\ 	39\ 
+IRIX IP22	3.0	8\ 	22\ 
+Linux i586	2.4	9\ 	26\ 
+Linux i586	1.8	15\ 	30\ 
+Linux i586	1.9	15\ 	30\ 
+Linux i586	3.1	24\ 	73\ 
+DEC Alpha	13.4	33\ 	39\ 
+Sun SC1000	14.0	69\ 	175\ 
+FreeBSD/i586	2.9	14\ 	22\ 
+FreeBSD/i586	2.7	13\ 	21\ 
+IRIX64 IP21	4.2	14\ 	30\ 
+HP-UX 9000/770	3.1	9\ 	18\ 
+FreeBSD/i586	2.8	13\ 	22\ 
+HP-UX 9000/735	3.5	10\ 	20\ 
+HP-UX 9000/735	3.5	10\ 	19\ 
+IRIX64 IP19	4.5	19\ 	37\ 
+HP-UX 9000/819	4.2	67\ 	118\ 
+HP-UX 9000/755	3.6	10\ 	18\ 
+HP-UX 9000/897	6.7	15\ 	37\ 
+IRIX IP19	6.2	19\ 	46\ 
+HP-UX 9000/735	3.5	10\ 	20\ 
+FreeBSD/i586	2.7	12\ 	20\ 
+FreeBSD/i586	3.0	14\ 	23\ 
+IRIX64 IP25	3.3	12\ 	24\ 
+IRIX64 IP19	4.0	14\ 	24\ 
+dgux mc88110	8.8	13\ 	67\ 
+.TE
+.KE

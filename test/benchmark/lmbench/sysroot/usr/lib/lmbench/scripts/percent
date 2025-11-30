@@ -1,0 +1,95 @@
+#!/usr/bin/perl
+eval "exec perl -sS $0 $*"
+	if 0;
+
+$fmt = 0;
+@fmts = (
+"%24s %4s %4s %3s %4s %5s %4s %4s %4s %5s %4s %3s\n",
+"%24s %4s %6s %5s %5s %6s %7s %7s\n",
+"%24s %4s %5s %4s %5s %5s %5s %5s %4s\n",
+"%24s %6s %6s %6s %8s %5s %7s\n",
+"%24s %3s %4s %4s %6s %7s %6s %5s %5s %5s\n",
+"%24s %5s %5s %5s %12s\n",
+);
+while (<>) {
+	print;
+	next unless /^Host/;
+	$_ = <>; print;
+	unless (/^-/) {
+		$_ = <>; print;
+	}
+	@values = ();
+	@a = @b = @c = @d = @e = @f = @g = @h = @i = @j = @k = ();
+	$i = 0;
+	while (<>) {
+		last if /^\s/;
+		print;
+		s/.......................\s+//;
+		($a[$i],$b[$i],$c[$i],$d[$i],$e[$i],$f[$i],$g[$i],$h[$i],$i[$i],$j[$i],$k[$i]) = split;
+		$i++;
+	}
+	$a = &sss(@a) if $#a != -1;
+	$b = &sss(@b) if $#b != -1;
+	$c = &sss(@c) if $#c != -1;
+	$d = &sss(@d) if $#d != -1;
+	$e = &sss(@e) if $#e != -1;
+	$f = &sss(@f) if $#f != -1;
+	$g = &sss(@g) if $#g != -1;
+	$h = &sss(@h) if $#h != -1;
+	$i = &sss(@i) if $#i != -1;
+	$j = &sss(@j) if $#j != -1;
+	$k = &sss(@k) if $#k != -1;
+	printf $fmts[$fmt],  "", $a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k;
+	print "\n";
+	exit if $fmt++ == $#fmts;
+}
+
+sub sss
+{
+	local($i, $tmp);
+	local(@values) = ();
+	local($n, $sum, $min, $max) = (0,0,1.7E+300,2.2E-300);
+
+	foreach $_ (@_) {
+		next unless /^\d/;
+		chop if /K$/;
+		push(@values, $_);
+		$sum += $_;
+		$min = $_ if $_ < $min;
+		$max = $_ if $_ > $max;
+		$n++;
+	}
+	return "" if $#values == -1;
+	# Do some statistics.
+	@s = sort(@values);
+	if ($n & 1) {	
+		$median = $s[($n + 1)/2];
+	} else {
+		$i = $n / 2;
+		$median = ($s[$i] + $s[$i+1]) / 2;
+	}
+	$avg = $sum/$n;
+	$avgdev = $var = 0;
+	foreach $_ (@values) {
+		$var += ($_ - $median) ** 2;
+		$tmp = $_ - $median;
+		$avgdev += $tmp > 0 ? $tmp : -$tmp;
+	}
+	$var /= $n - 1;
+	$stddev = sqrt($var);
+	$avgdev /= $n;
+	#printf("%8s %8s %8s %8s %8s %4s %8s\n", "Min", "Max", "Average", "Median", "Std Dev", "%", "Avg Dev");
+	#printf "%8.2f %8.2f %8.2f %8.2f %8.2f %4.1f%% %8.2f\n", $min, $max, $avg, $median, $stddev, $stddev/$median*100, $avgdev;
+	$percent = $stddev/$median*100;
+	if ($percent > 90) {
+		printf "Huh: $percent $stddev $median @values\n";
+	}
+	if ($percent < .5) {
+		return "0 ";
+	} elsif ($percent < 1) {
+		$tmp = sprintf "%.1f%%", $percent;
+		return $tmp;
+	} else {
+		return sprintf "%.0f%%", $percent;
+	}
+}

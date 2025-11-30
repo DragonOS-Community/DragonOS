@@ -1,0 +1,10 @@
+#!/bin/sh
+trap "echo /dev/null" 20
+OUTPUT=/dev/null; export OUTPUT
+if [ -w /dev/tty ]; then
+        if echo "" > /dev/tty; then
+                OUTPUT=/dev/tty; export OUTPUT
+        fi
+fi 2>/dev/null
+echo "${OUTPUT}"
+exit 0

@@ -1,0 +1,37 @@
+#!/bin/sh
+
+# Make sure we can find: ./cmd, df, and netstat
+BINDIR=${BINDIR:-..}
+SCRIPTSDIR=${SCRIPTSDIR:-../scripts}
+PATH=.:${SCRIPTSDIR}:${BINDIR}/bin/`${SCRIPTSDIR}/os`:$PATH:/etc:/usr/etc:/sbin:/usr/sbin
+export PATH
+
+if [ X$MB = X ]
+then	MB=8
+fi
+AVAILKB=`expr $MB \* 1024`
+
+# Figure out how big we can go for stuff that wants to use
+# all and half of memory.
+HALF="512 1k 2k 4k 8k 16k 32k 64k 128k 256k 512k 1m"
+ALL="$HALF 2m"
+i=4
+while [ $i -le $MB ]
+do
+	ALL="$ALL ${i}m"
+	h=`expr $i / 2`
+	HALF="$HALF ${h}m"
+	i=`expr $i \* 2`
+done
+
+msleep 250
+if [ "X$CTX" = X ]
+then	CTX="0 4 8 16 32 64"
+fi
+if [ "X$N" = X ]
+then	N="2 4 8 16 24 32 64 96"
+fi
+for size in $CTX
+do	lat_ctx -s $size $N
+done
+exit 0

@@ -1,0 +1,28 @@
+Stack smashing protection is a feature of GCC that enables a program to
+detect buffer overflows and immediately terminate execution, rather than
+continuing execution with corrupt internal data structures. It uses
+"canaries" and local variable reordering to reduce the likelihood of
+stack corruption through buffer overflows.
+
+Options that affect stack smashing protection:
+
+-fstack-protector
+    Enables protection for functions that are vulnerable to stack
+    smashing, such as those that call alloca() or use pointers.
+
+-fstack-protector-all
+    Enables protection for all functions.
+
+-Wstack-protector
+    Warns about functions that will not be protected. Only active when
+    -fstack-protector has been used.
+
+Applications built with stack smashing protection should link with the
+ssp library by using the option "-lssp" for systems with glibc-2.3.x or
+older; glibc-2.4 and newer versions provide this functionality in libc.
+
+The Debian architectures alpha, hppa, ia64, m68k, mips, mipsel do not
+have support for stack smashing protection.
+
+More documentation can be found at the project's website:
+http://researchweb.watson.ibm.com/trl/projects/security/ssp/

@@ -1,0 +1,2 @@
+# False positive, checked at compile time.
+libacl1: hardening-no-fortify-functions [*]

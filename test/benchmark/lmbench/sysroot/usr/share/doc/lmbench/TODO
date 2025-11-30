@@ -1,0 +1,107 @@
+$Id$
+
+Add standard deviation and other statistics calculations to "make stats"
+in results.  Alternatively, we might report min, 1Q, median, 3Q, max,
+as standard deviation for non-normal distributions isn't always sensible.
+
+Add flags to various file-related benchmarks bw_file_rd, bw_mmap_rd,
+lat_fcntl.c, lat_fs, lat_mmap, and lat_pagefault, for parallelism
+which selects whether each instance has its own file or shares a
+file.
+
+Figure out how to improve lat_select.  It doesn't really work for
+multi-processor systems.  Linus suggests that we have each process
+do some amount of work, and vary the amount of work until context
+switch times for the producer degrade.  The current architecture
+of lat_select is too synchronous and favors simple hand-off
+scheduling too much.  From Linus.
+
+Look into threads vs. process scaling.  benchmp currently uses
+separate processes (via fork()); some benchmarks such as page
+faults and VM mapping might have very different performance
+for threads vs. processes since Linux (at least) has per-memory
+space locks for many of these things.  From Linus.
+
+Add a '-f' option to lat_ctx which causes the work to be floating point
+summation (so we get floating point state too).  (Suggestion by Ingo Molnar)
+
+Add a threads benchmark suite (context switch, mutex, semaphore, ...).
+
+Create a new process for each measurement, rather than reusing the same
+process.  This is mostly to get different page layouts and mostly impacts
+the memory latency benchmarks, although it can also affect lat_ctx.
+
+Write/extend the results processing system/scripts to graph/display/
+process results in the "-P <parallelism>" dimension, and to properly
+handle results with differing parallelism when reporting standard
+results.  The parallelism is stored in the results file as SYNC_MAX.
+
+Add "bw_udp" benchmark to measure UDP bandwidth
+[in progress]
+
+Make a bw_tcp mode that measures bandwidth for each block and graph that
+as offset/bandwidth.
+
+Make the disk stuff autosize such that you get the same number of data
+points regardless of disk size.
+
+Fix the getsummary to include simple calls.
+
+Think about the issues of int/long/long long/double/long double
+load/stores.  Maybe do them all.  This will (at least) require
+adding a test to scripts/build for the presence of long double
+on this system.
+
+Make all results print out bandwidths in powers of 10/sizes in powers of two.
+
+Documentation on porting.
+
+Check that file size is right in the benchmarking system.
+
+Compiler version info included in results.  XXX - do this!
+
+memory store latency (complex)
+	Why can't I just use the read one and make it write?
+	Well, because the read one is list oriented and I need to figure
+	out reasonable math for the write case.  The read one is a load
+	per statement whereas the write one will be more work, I think.
+
+RPC numbers reserved for the benchmark.
+
+Check all the error outputs and make sure they are consistent.
+
+On all the normalized graphs, make sure that they mean the same thing.
+I do not think that the bandwidth measurements are "correct" in this
+sense.
+
+Document the timing.c interfaces.
+
+Run the whole suite through gcc -Wall and fix all the errors.  Also make
+sure that it compiles and has the right sizes for 64 bit OS.
+
+[Mon Jul  1 13:30:01 PDT 1996, after meeting w/ Kevin]
+
+Do the load latency like so
+
+	loop:
+		load	r1
+		{
+		increase the number of nops until they start to make the
+		run time longer - the last one was the memory latency.
+		}
+		use the register
+		{
+		increase the number of nops until they start to make the
+		run time longer - the last one was the cache fill shadow.
+		}
+		repeat
+
+Do the same thing w/ a varying number of loads (& their uses), showing 
+the number of outstanding loads implemented to L1, L2, mem.
+
+Do hand made assembler to get accurate numbers.  Provide C source that 
+mimics the hand made assembler for new machines.
+
+Think about a report format for the hardware stuff that showed the
+numbers as triples L1/L2/mem (or quadruples for alphas).
+

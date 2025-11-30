@@ -1,0 +1,255 @@
+#!/usr/bin/perl
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+# Usage $0 manpage 
+# Parse my man page formats.
+
+die "Usage: $0  [ manpage ] \n" unless $#ARGV <= 0;
+
+$firstSH = 1;
+$inDL = 0;
+
+warn "Doing $ARGV[0]\n";
+
+open(STDIN, "$ARGV[0]") if ($#ARGV == 0);
+
+while (<>) {
+	next if (/^\.\\"/);
+
+	if (/^\.TH\s/) {
+		# .TH BW_MEM_CP 8 "$Date$" "(c)1994 Larry McVoy" "LMBENCH"
+		@_ = split;
+		print "<TITLE>$_[1]($_[2]) - LMBENCH man page</TITLE>\n";
+		print "<H2>$_[1]($_[2]) - LMBENCH man page</H2><HR>\n";
+		next;
+	}
+
+	if (/^\.SH\s/) {
+		s/.SH\s+//;
+		s/"//g;
+		chop;
+		print "</DL>\n" unless $firstSH; $firstSH = 0;
+		print "</DL>\n" if $inDL; $inDL = 0;
+		print "<DL><DT><H4>$_</H4><DD>\n";
+		next;
+	}
+
+	next if &fontfont;
+
+	if (/^\.LP\s/ || /^\.PP/) {
+		s/..P\s+//;
+		chop;
+		print "<P>\n";
+		next;
+	}
+
+	if (/^\.TP/) {		# treat as a DT list
+		$_ = <>;
+		&html;
+		chop;
+		print "</DL>\n" if ($inDL);
+		print "<DL><DT>";
+		print unless &fontfont;
+		print "<DD><BR>\n";
+		$inDL = 1;
+		next;
+	}
+
+	if (/^\.IP/) {		# treat as a DT list
+		s/^\.IP\s*//;
+		chop;
+		s/"//;
+		s/".*//;
+		&html;
+		print "</DL>\n" if ($inDL);
+		print "<DL><DT>$_<DD><BR>\n";
+		$inDL = 1;
+		next;
+	}
+
+	if (/^\.sp/) {
+		print "<PRE>\n</PRE>\n";
+		next;
+	}
+
+	next  if (/^\.in/ || /^\.ps/);	# skip this stuff.
+
+	if (/^\.br/) {
+		print "<BR>\n";
+		next;
+	}
+
+	if (/^\.nf/ || /^\.DS/) {		# starting a display
+		print "<PRE>\n";
+		while (<>) {
+			last if /^\.fi/;
+			last if /^\.DE/;
+			next if /^\./;
+			&html;
+			print "\t$_";	# XXX - a screwy way of indenting
+		}
+		print "</PRE>\n";
+		next;
+	}
+
+	if (/^\.ft C[WB]/) {
+		local($pre) = 0;
+
+		print "<CODE>\n";
+		while (<>) {
+			last if /^\.ft\s*$/;
+			if (/^\.nf/) {
+				$pre = 1;
+				print "<PRE>\n";
+				next;
+			}
+			if ($pre && /^\.fi/) {
+				print "</PRE>\n";
+				$pre = 0;
+				next;
+			}
+			next if /^\.br/;
+			&html;
+			print;
+		}
+		print "</CODE>\n";
+		next;
+	}
+
+	if (/\\f\(C[WB]/) {
+		&html;
+		s/\\f\(C[WB]/<CODE>/;
+		while (!/\\f/) {
+			&html;
+			print;
+			$_ = <>;
+		}
+		s/\\fP/<\/CODE>/;
+		print;
+		next;
+	}
+
+	if (/\\fB/) {
+		&html;
+		s/\\fB/<STRONG>/;
+		while (!/\\f/) {
+			print;
+			$_ = <>;
+			&html;
+		}
+		s/\\fP/<\/STRONG>/;
+		print;
+		next;
+	}
+
+	if (/\\fI/) {
+		&html;
+		s/\\fB/<EM>/;
+		while (!/\\f/) {
+			print;
+			$_ = <>;
+			&html;
+		}
+		s/\\fP/<\/EM>/;
+		print;
+		next;
+	}
+
+	if (/^\.ti/) {		# one line display
+		print "<PRE>\n";
+		$_ = <>;
+		&html;
+		print;
+		print "</PRE>\n";
+		next;
+	}
+
+	if (/^\.de\s+/) {
+		s/^\.de\s+//;
+		warn "$ARGV[0]: Ignoring definition: $_";
+		while (<>) {
+			last if /^\.\./;
+		}
+		next;
+	}
+	
+	# Warn about unimplemented troff/man commands
+	if (/^\./) {
+		chop;
+		warn "$ARGV[0] unimp: \"$_\"\n";
+		next;
+	}
+
+	if (/\\f/) {
+		warn "$ARGV[0]: missed font: \"$_\"\n";
+	}
+
+	# Catchall for all the weirdball things I do.
+	s/^\\\&\.\\\|\.\\\|\./.../;
+	s/\\-/-/;
+
+	&html;
+
+	print;
+}
+exit 0;
+
+sub html
+{
+	# HTML things that I've encountered.
+	s/"/&quot;/g;
+	s/</&lt;/g;
+	s/>/&gt;/g;
+}
+
+sub fontfont {
+
+	if (/^\.BI\s/) {
+		s/.BI\s+//;
+		chop;
+		@_ = split;
+		print "<STRONG>$_[0]</STRONG><EM>$_[1]</EM>\n";
+		return 1;
+	}
+
+	if (/^\.IB\s/) {
+		s/.IB\s+//;
+		chop;
+		@_ = split;
+		print "<EM>$_[0]</EM><STRONG>$_[1]</STRONG>\n";
+		return 1;
+	}
+
+	if (/^\.IR\s/) {
+		s/.IR\s+//;
+		chop;
+		@_ = split;
+		print "<EM>$_[0]</EM>$_[1]\n";
+		return 1;
+	}
+
+	if (/^\.BR\s/) {
+		s/.BR\s+//;
+		chop;
+		@_ = split;
+		print "<STRONG>$_[0]</STRONG>$_[1]\n";
+		return 1;
+	}
+
+	if (/^\.B\s/) {
+		s/.B\s+//;
+		chop;
+		print "<STRONG>$_</STRONG>\n";
+		return 1;
+	}
+
+	if (/^\.I\s/) {
+		s/.I\s+//;
+		chop;
+		print "<EM>$_</EM>\n";
+		return 1;
+	}
+
+	return 0;
+}

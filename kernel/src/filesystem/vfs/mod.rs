@@ -150,6 +150,47 @@ impl From<InodeMode> for FileType {
     }
 }
 
+bitflags! {
+    pub struct InodeFlags: u32 {
+        /// 写入时立即同步到磁盘
+        const S_SYNC = (1 << 0);
+        /// 不更新访问时间
+        const S_NOATIME = (1 << 1);
+        /// 只允许追加写入
+        const S_APPEND = (1 << 2);
+        /// 不可修改的文件
+        const S_IMMUTABLE = (1 << 3);
+        /// 目录已删除但仍被打开
+        const S_DEAD = (1 << 4);
+        /// 不计入磁盘配额
+        const S_NOQUOTA = (1 << 5);
+        /// 目录操作同步写入
+        const S_DIRSYNC = (1 << 6);
+        /// 不更新 ctime/mtime
+        const S_NOCMTIME = (1 << 7);
+        /// 交换文件，禁止截断（swapon已获取块映射）
+        const S_SWAPFILE = (1 << 8);
+        /// 文件系统内部使用的私有inode
+        const S_PRIVATE = (1 << 9);
+        /// 关联了IMA（完整性度量架构）结构
+        const S_IMA = (1 << 10);
+        /// 自动挂载点或引用目录
+        const S_AUTOMOUNT = (1 << 11);
+        /// 无suid或xattr安全属性
+        const S_NOSEC = (1 << 12);
+        /// 直接访问模式，绕过页缓存
+        const S_DAX = (1 << 13);
+        /// 加密文件（使用fs/crypto/）
+        const S_ENCRYPTED = (1 << 14);
+        /// 大小写不敏感的文件
+        const S_CASEFOLD = (1 << 15);
+        /// 完整性校验文件（使用fs/verity/）
+        const S_VERITY = (1 << 16);
+        /// 内核正在使用的文件（如cachefiles）
+        const S_KERNEL_FILE = (1 << 17);
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SpecialNodeData {

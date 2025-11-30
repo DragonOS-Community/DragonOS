@@ -15,7 +15,7 @@ use crate::{
         vfs::{
             file::{File, FileFlags},
             vcore::generate_inode_id,
-            FileType, IndexNode, InodeMode, Metadata,
+            FileType, IndexNode, InodeFlags, InodeMode, Metadata,
         },
     },
     libs::spinlock::SpinLock,
@@ -69,6 +69,7 @@ impl LockedKvmInode {
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                flags: InodeFlags::empty(),
             },
         };
 
@@ -223,6 +224,7 @@ impl KvmInstance {
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                flags: InodeFlags::empty(),
             },
         })
     }
@@ -354,6 +356,7 @@ impl KvmVcpuDev {
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                flags: InodeFlags::empty(),
             },
         })
     }

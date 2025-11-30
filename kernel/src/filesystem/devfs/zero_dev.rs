@@ -3,7 +3,7 @@ use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
-    vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
+    vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, Metadata,
 };
 use crate::libs::spinlock::SpinLockGuard;
 use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
@@ -51,6 +51,7 @@ impl LockedZeroInode {
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::CharDevice, // 文件夹，block设备，char设备
                 mode: InodeMode::from_bits_truncate(0o666),
+                flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

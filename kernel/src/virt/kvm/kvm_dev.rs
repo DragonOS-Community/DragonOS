@@ -4,7 +4,7 @@ use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::generate_inode_id,
     file::{File, FileMode},
-    FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
+    FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, Metadata,
 };
 use crate::libs::spinlock::SpinLockGuard;
 use crate::process::ProcessManager;
@@ -69,6 +69,7 @@ impl LockedKvmInode {
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                flags: InodeFlags::empty(),
             },
         };
 

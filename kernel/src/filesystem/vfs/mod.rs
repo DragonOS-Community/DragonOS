@@ -1014,6 +1014,9 @@ pub struct Metadata {
     /// 权限
     pub mode: InodeMode,
 
+    /// inode运行时状态
+    pub flags: InodeFlags,
+
     /// 硬链接的数量
     pub nlinks: usize,
 
@@ -1041,6 +1044,7 @@ impl Default for Metadata {
             btime: PosixTimeSpec::default(),
             file_type: FileType::File,
             mode: InodeMode::empty(),
+            flags: InodeFlags::empty(),
             nlinks: 1,
             uid: 0,
             gid: 0,
@@ -1229,6 +1233,7 @@ impl Metadata {
             btime: PosixTimeSpec::default(),
             file_type,
             mode,
+            flags: InodeFlags::empty(),
             nlinks: 1,
             uid: 0,
             gid: 0,

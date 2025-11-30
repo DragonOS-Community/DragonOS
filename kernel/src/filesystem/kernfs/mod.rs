@@ -25,7 +25,7 @@ use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
     file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, FsInfo,
-    IndexNode, InodeId, InodeMode, Magic, Metadata, SuperBlock,
+    IndexNode, InodeFlags, InodeId, InodeMode, Magic, Metadata, SuperBlock,
 };
 
 pub mod callback;
@@ -99,6 +99,7 @@ impl KernFS {
             file_type: FileType::Dir,
             nlinks: 1,
             raw_dev: DeviceNumber::default(),
+            flags: InodeFlags::empty(),
         };
         let root_inode = Arc::new_cyclic(|self_ref| KernFSInode {
             name: String::from(""),
@@ -574,6 +575,7 @@ impl KernFSInode {
             file_type: file_type.into(),
             nlinks: 1,
             raw_dev: DeviceNumber::default(),
+            flags: InodeFlags::empty(),
         };
 
         let new_inode: Arc<KernFSInode> = Self::new(

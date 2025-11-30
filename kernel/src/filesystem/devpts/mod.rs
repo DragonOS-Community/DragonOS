@@ -30,7 +30,7 @@ use system_error::SystemError;
 
 use super::{
     devfs::DeviceINode,
-    vfs::{vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata},
+    vfs::{vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, InodeFlags, Metadata},
 };
 
 const DEV_PTYFS_MAX_NAMELEN: usize = 16;
@@ -117,6 +117,7 @@ impl LockedDevPtsFSInode {
                     btime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
                     mode: InodeMode::from_bits_truncate(0o777),
+                    flags: InodeFlags::empty(),
                     nlinks: 1,
                     uid: 0,
                     gid: 0,

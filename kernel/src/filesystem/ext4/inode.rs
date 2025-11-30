@@ -2,12 +2,10 @@ use crate::{
     filesystem::{
         page_cache::PageCache,
         vfs::{
-            self, utils::DName, vcore::generate_inode_id, FilePrivateData, IndexNode, InodeId,
-            InodeMode,
+            self, FilePrivateData, IndexNode, InodeFlags, InodeId, InodeMode, utils::DName, vcore::generate_inode_id
         },
     },
-    libs::casting::DowncastArc,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{casting::DowncastArc, spinlock::{SpinLock, SpinLockGuard}},
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -301,6 +299,7 @@ impl IndexNode for LockedExt4Inode {
             ctime: PosixTimeSpec::new(attr.ctime.into(), 0),
             file_type: Self::file_type(attr.ftype),
             mode: InodeMode::from_bits_truncate(attr.perm.bits() as u32),
+            flags: InodeFlags::empty(),
             nlinks: attr.links as usize,
             uid: attr.uid as usize,
             gid: attr.gid as usize,

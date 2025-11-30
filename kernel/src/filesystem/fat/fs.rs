@@ -26,7 +26,7 @@ use crate::{
     filesystem::vfs::{
         file::{FileFlags, FilePrivateData},
         vcore::generate_inode_id,
-        FileSystem, FileType, IndexNode, InodeId, InodeMode, Metadata,
+        FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
     },
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -237,6 +237,7 @@ impl LockedFATInode {
                 btime: PosixTimeSpec::default(),
                 file_type,
                 mode: InodeMode::from_bits_truncate(0o777),
+                flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -502,6 +503,7 @@ impl FATFileSystem {
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode: InodeMode::from_bits_truncate(0o777),
+                flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

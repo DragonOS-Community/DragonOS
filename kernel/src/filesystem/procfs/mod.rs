@@ -39,7 +39,7 @@ use crate::{
 use super::vfs::{
     file::{FileFlags, FilePrivateData, NamespaceFilePrivateData},
     utils::DName,
-    FileSystem, FsInfo, IndexNode, InodeId, InodeMode, Magic, Metadata, SuperBlock,
+    FileSystem, FsInfo, IndexNode, InodeFlags, InodeId, InodeMode, Magic, Metadata, SuperBlock,
 };
 
 pub mod kmsg;
@@ -560,6 +560,7 @@ impl ProcFS {
                     uid: 0,
                     gid: 0,
                     raw_dev: DeviceNumber::default(),
+                    flags: InodeFlags::empty(),
                 },
                 fs: Weak::default(),
                 fdata: InodeInfo {
@@ -998,6 +999,7 @@ impl IndexNode for LockedProcFSInode {
                     btime: PosixTimeSpec::default(),
                     file_type,
                     mode,
+                    flags: InodeFlags::empty(),
                     nlinks: 1,
                     uid: 0,
                     gid: 0,

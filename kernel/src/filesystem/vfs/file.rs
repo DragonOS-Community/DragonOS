@@ -8,7 +8,7 @@ use log::error;
 use system_error::SystemError;
 
 use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::process::pid::PidPrivateData;
+use crate::{filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
     arch::MMArch,
     driver::{
@@ -587,6 +587,12 @@ impl File {
     ) -> Result<usize, SystemError> {
         // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
+
+        let metadata = self.inode.metadata()?;
+        if metadata.flags.contains(InodeFlags::S_IMMUTABLE) {
+            return Err(SystemError::EPERM);
+        }
+
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }

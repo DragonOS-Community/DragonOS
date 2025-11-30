@@ -32,7 +32,7 @@ use crate::{
         kernfs::KernFSInode,
         vfs::{
             utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            IndexNode, InodeMode, Metadata,
+            IndexNode, InodeFlags, InodeMode, Metadata,
         },
     },
     libs::{
@@ -201,6 +201,7 @@ impl Ps2MouseDevice {
                     btime: PosixTimeSpec::default(),
                     file_type: FileType::CharDevice, // 文件夹，block设备，char设备
                     mode: InodeMode::from_bits_truncate(0o644),
+                    flags: InodeFlags::empty(),
                     nlinks: 1,
                     uid: 0,
                     gid: 0,

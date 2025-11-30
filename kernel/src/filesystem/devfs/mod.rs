@@ -6,7 +6,7 @@ use super::{
     devpts::{DevPtsFs, LockedDevPtsFSInode},
     vfs::{
         file::FileFlags, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
-        FileType, FsInfo, IndexNode, InodeMode, Magic, Metadata, SuperBlock,
+        FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata, SuperBlock,
     },
 };
 use crate::{
@@ -308,6 +308,7 @@ impl DevFSInode {
                 btime: PosixTimeSpec::default(),
                 file_type: dev_type_, // 文件夹
                 mode,
+                flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -423,6 +424,7 @@ impl LockedDevFSInode {
                 btime: PosixTimeSpec::default(),
                 file_type,
                 mode,
+                flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

@@ -7,7 +7,7 @@ use crate::{
         },
         vfs::{
             file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            IndexNode, InodeMode, Metadata, PollableInode,
+            IndexNode, InodeFlags, InodeMode, Metadata, PollableInode,
         },
     },
     ipc::signal_types::SigCode,
@@ -138,6 +138,7 @@ impl LockedPipeInode {
                 uid: 0,
                 gid: 0,
                 raw_dev: Default::default(),
+                flags: InodeFlags::empty(),
             },
             reader: 0,
             writer: 0,

@@ -25,7 +25,7 @@ use system_error::SystemError;
 
 use super::vfs::{
     file::FilePrivateData, utils::DName, FileSystem, FileSystemMaker, FsInfo, IndexNode, InodeId,
-    InodeMode, Metadata, SpecialNodeData,
+    InodeFlags, InodeMode, Metadata, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -95,6 +95,7 @@ impl RamFSInode {
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(),
+                flags: InodeFlags::empty(),
             },
             fs: Weak::default(),
             special_node: None,
@@ -342,6 +343,7 @@ impl IndexNode for LockedRamFSInode {
                 btime: PosixTimeSpec::default(),
                 file_type,
                 mode,
+                flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -623,6 +625,7 @@ impl IndexNode for LockedRamFSInode {
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(),
+                flags: InodeFlags::empty(),
             },
             fs: inode.fs.clone(),
             special_node: None,

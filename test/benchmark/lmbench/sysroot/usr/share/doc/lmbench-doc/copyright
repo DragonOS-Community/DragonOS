@@ -1,0 +1,40 @@
+This package was debianized by 
+Javier Fernandez-Sanguino <jfs@computer.org> on
+Tue, 19 Feb 2002 22:01:31 +0100.
+
+It was downloaded from http://www.bitmover.com/lmbench
+
+Upstream Authors: 
+Larry McVoy - Silicon Graphics
+Carl Staelin - Hewlett Packard Laboratories 
+
+Copyright (c) 1996-2009, Larry McVoy and Carl Staelin
+
+Lmbench is distributed under the GNU GPL license, you can
+find a copy of this license in a Debian system under the
+/usr/share/common-licenses/ directory.
+
+The authors, however, impose several restrictions (shown
+below).  Note that these restrictions affect *only* the
+distribution of results collected from running lmbench,
+and do *not* preclude one from building, modifying or
+distributing the lmbench source code or the binaries
+resulting from compiling the source code; i.e., the 
+*results* of running the benchmarks have restrictions, 
+but the *source code* for lmbench is distributed under 
+the GPL.
+
+---------------------------------------------------------------------
+The set of programs and documentation known as "lmbench" are distributed
+under the Free Software Foundation's General Public License with the
+following additional restrictions (which override any conflicting
+restrictions in the GPL):
+
+1. You may not distribute results in any public forum, in any publication,
+   or in any other way if you have modified the benchmarks.  
+
+2. You may not distribute the results for a fee of any kind.  This includes
+   web sites which generate revenue from advertising.
+
+If you have modifications or enhancements that you wish included in
+future versions, please mail those to me, Larry McVoy, at lm@bitmover.com.

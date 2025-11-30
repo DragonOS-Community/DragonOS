@@ -1,0 +1,431 @@
+#!/usr/bin/perl
+# $Id$
+eval 'exec perl -Ss $0 "$@"'
+	if 0;
+
+# A simple bargraph preprocessor for GNU pic / troff package.
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+#
+# TODO
+#	Make this work with sideways graphs.
+#
+# Input format is:
+#
+#	3 foo bar 
+#	9 bigger foo 
+#	"Silly example
+#
+# and output is
+#
+#                         bigger
+#                          foo
+#                      +----------+
+#                      |          |
+#           foo        |          |
+#           bar        |          |
+#       +----------+   |          |
+#       |          |   |          |
+#       +----------+   +----------+
+#     -------------------------------
+#            3              9
+#
+#             Silly example
+#
+# Input options:
+#	specifier	value					default
+#	%ps		<point size>				10
+#	%ft		<font>					HB
+#	%labelgap	<space in inches between fill labels>	1.5
+#	%xsize		<size of graph width in inches>		7
+#	%ysize		<size of graph height in inches>	6
+#	%Title n|s 	<Bargraph title>			none
+#	%titleplus 	<increase in points of titlesize>	0
+#	%label%d	<label name>				none
+#	%boxpercent	<100% means columns touch>		75
+#	%worse up|down n|w|e|s|nw|ne|sw|se - idiot arrow
+#	%better up|down n|w|e|s|nw|ne|sw|se - idiot arrow
+#	%fakemax	<pretend one data point was this big>
+#
+#	The data can be optionally followed by a %fill%d that gets turned into
+#	the fill value (darkness) for that bar of the bar graph.  The default
+#	fill value is whatever pic defaults to.
+#	The %label control is used to provide a legend for the different fill
+#	values.
+#
+# Command line options:
+#
+#	-big	make the x/y defaults be 7.5 inches, crank up title size, and
+#		don't put a spacer at the top.
+#	-nobox	do not put an outline box around the bargraph.
+#
+#	-sideways
+#		do the bars towards the right.
+#
+# Much thanks to James Clark for providing such a nice replacement for
+# the Unix troff package.  
+
+@lines = <>;	# sluuuuuuuuuuuurp
+$titleplus = 2;
+$bottomplus = 0;
+$fill = "fillval";
+$SP = ".sp 1i";
+$PO = "0i";
+# All of these can be set in the graph with %xxx value
+$ps = 10;
+$ft = "CB";
+$xsize = 4;
+$ysize = 6;
+$boxpercent = 75;
+$labelgap = 1.5;
+if ($nobox) {
+	$invis = "invis";
+} else {
+	$invis = "";
+}
+if ($big) {
+	$slide = 0;
+	$xsize = 7.5;
+	$ysize = 7.5;
+	$SP = "";
+	$titleplus = 4;
+	$bottomplus = 2;
+	# XXX - you may need to screw with this.
+	$xsize -= 3.75 if ($sideways);
+}
+if ($slide) {
+	$big = 0;
+	$xsize = 6.5;
+	$ysize = 4.20;
+	$SP = ".sp .75i";
+	$PO = ".23i";
+	$titleplus = 2;
+	$bottomplus = 0;
+	# XXX - you may need to screw with this.
+	$xsize -= 2.2 if ($sideways);
+}
+
+$vs = $ps + 1;
+
+# Calculate max to autosize the graph.
+foreach $_ (@lines) {
+	next if /^\s*#/;
+	next if /^\s*$/;
+
+	if (/^\s*"/) {
+		($title = $_) =~ s/\s*"//;
+		chop($title);
+		push(@title, "\"\\s+$titleplus$title\\s0\"");
+		next;
+	}
+	if (/^\s*%/) {
+		&control(0);
+		push(@control, $_);
+		next;
+	}
+
+	@_ = split;
+	if (!defined $maxdata) {
+		$maxdata = $_[0];
+	} else {
+		$maxdata = $_[0] if ($maxdata < $_[0]);
+	}
+	push(@data, $_);
+}
+
+foreach $_ (@control) {
+	&control(1);
+}
+
+$n = $#data + 1;
+$tps = $ps + $titleplus;
+$tvs = int($tps * 1.2);
+print <<EOF;
+$SP
+.po $PO
+.ft $ft
+.ps $ps
+.vs $tvs
+.ce 100
+EOF
+foreach $_ (@title_n) {
+	print;
+}
+# Spit out the pic stuff.
+# The idea here is to spit the variables and let pic do most of the math.
+# This allows tweeking of the output by hand.
+print <<EOF;
+.ce 0
+.vs 
+.PS
+.ps $ps
+.vs $vs
+[
+# Variables, tweek these.
+	fillval = .12		# default fill value boxes
+	xsize = $xsize		# width of the graph
+	ysize = $ysize		# height of the graph
+	n = $n
+	boxpercent = $boxpercent / 100
+	gap = xsize / n * (1 - boxpercent)
+	maxdata = $maxdata
+	yscale = ysize / maxdata
+	xscale = xsize / maxdata
+
+# Draw the graph borders 
+	O:	box invis ht ysize wid xsize
+EOF
+# line thick 2 from O.sw - (0, .1) to O.se - (0, .1)
+
+#foreach $_ (@control) {
+#	&control(1);
+#}
+
+#	boxwid = xsize / n * boxpercent
+if ($sideways) {
+	print "boxht = ysize / n * boxpercent\n";
+	# Each data point.
+	for ($i = 0; $i <= $#data; $i++) {
+		$_ = $data[$i];
+		@_ = &getfill;
+		print "box fill $fill wid $_[0] * xscale " .
+		    "with .nw at O.nw - (0, gap /2 + $i * (ysize/n))\n";
+		$value = shift(@_);
+		# XXXXXXX
+		if ($_[$#_] =~ /secs/) {
+			#print "\"@_\" ljust at last box.e + .1,0\n";
+			$units = pop(@_);
+			$each = pop(@_);
+			print "\"\\s+1$value\\s0,  @_,\\  \\s+1$each $units\\s0\" ljust at last box.e + .1,0\n";
+		} else {
+			print "\"\\s+2$value\\s0  @_\" ljust at last box.e + .1,0\n";
+		}
+	}
+} else {
+	print "boxwid = xsize / n * boxpercent\n";
+	# Each data point.
+	for ($i = 0; $i <= $#data; $i++) {
+		$_ = $data[$i];
+		@_ = &getfill;
+		print "box fill $fill ht $_[0] * yscale " .
+		    "with .sw at O.sw + (gap /2 + $i * (xsize/n), 0)\n";
+		$value = shift(@_);
+		@_ = &fmt(@_);
+	#warn "V=$value\nT=@_\n";
+		# Make the bar titles
+		for ($j = $#_; $j >= 0; $j--) {
+			print "\t\"$_[$j]\" at last box.n + (0, .05 + .12 * $j)\n";
+		}
+		print "\t\"\\s+$bottomplus$value\\s0\" at last box.s - (0, .30)\n";
+	}
+
+}
+
+# Labels, if any
+if ($#labels > -1) {
+	print "\n# Labels.\n";
+	print "[\n    boxwid = .35; boxht = .18; y = .10; x = -.03; ";
+	print "labelgap = $labelgap\n";
+	$first = 1;
+	foreach $_ (@labels) {
+		print "    [ B: box fill $_[0]; ";
+		shift(@_);
+		print "\"@_\" ljust at B.e + (y, x) ]";
+		if ($first == 1) {
+			$first = 0;
+			print "\n";
+		} else {
+			print " \\\n\twith .w at last [].e + (labelgap, 0)\n";
+		}
+	}
+	print "] with .nw at O.sw - (0, .6)\n";
+}
+
+$invis = "invis" if $sideways;
+
+print <<EOF;
+]
+box $invis wid last [].wid + .5 ht last [].ht + .5 with .nw at last [].nw + (-.25, .25)
+move to last [].nw + 0,.25
+line thick 2 right 7
+move to last [].sw - 0,.25
+line thick 2 right 7
+.PE
+.ft
+.ps
+.vs
+.po
+EOF
+
+print <<EOF;
+.po .5i
+.ft $ft
+.ps $ps
+.vs $tvs
+.sp .5
+.ce 100
+EOF
+foreach $_ (@title_s) {
+	print;
+}
+print <<EOF;
+.po
+.ft
+.ps
+.vs
+.ce 0
+EOF
+exit 0;
+
+sub fmt
+{
+	local(@args);
+	local(@ret);
+
+	# XXX - this assumes that # is not used anywhere else in the 
+	# label line.
+	$_ = "@_";
+	s/\\ /#/g;
+	@args = split;
+	foreach $_ (@args) {
+		s/#/ /g;
+	}
+	$len = 0;
+	foreach $_ (@args) {
+		$len = length($_) if (length($_) > $len);
+	}
+	$len += 2;
+	$word = shift(@args);
+	while ($#args > -1) {
+		if (length($word) + length($args[0]) < $len) {
+			$word .= " $args[0]";
+			shift(@args);
+		} else {
+			push(@ret, $word);
+			$word = shift(@args);
+		}
+	}
+	push(@ret, $word);
+	reverse(@ret);
+}
+
+# Eat some control information
+#
+sub control
+{
+	local($pass) = $_[0];
+
+	if ($pass == 0) {
+		s/.*%//;
+		chop;
+	}
+	@_ = split;
+	if ($_[0] =~ /[Ww]orse$/ || $_[0] =~ /[Bb]etter$/) {
+		return if ($pass == 0);
+		if ($#_ != 2) {
+			die "bad control: $_\n";
+			return;
+		}
+		($label, $dir, $where) = @_;
+		print "\n# Idiot arrow\n";
+		print "[\tarrow thick 10 wid .5 ht .4 $dir 1.15\n";
+		print "\t\"\\s+9$label\\s0\" ";
+		if ($dir eq "up") {
+		    print "at last arrow.s - (0, .25)\n";
+		} elsif ($dir eq "down") {
+		    print "at last arrow.n + (0, .25)\n";
+		} else {
+			die "bad control: $_\n";
+		}
+		print "] with .$where at O.$where ";
+		if ($where eq "n") {
+			print "- (0, .5)\n";
+		} elsif ($where eq "ne") {
+			print "- (.5, .5)\n";
+		} elsif ($where eq "e") {
+			print "- (.5, 0)\n";
+		} elsif ($where eq "se") {
+			print "- (.5, -.5)\n";
+		} elsif ($where eq "s") {
+			print "+ (0, .5)\n";
+		} elsif ($where eq "sw") {
+			print "+ (.5, .5)\n";
+		} elsif ($where eq "w") {
+			print "+ (.5, 0)\n";
+		} elsif ($where eq "nw") {
+			print "+ (.5, -.5)\n";
+		} else {
+			die "bad control: $_\n";
+		}
+		print "\n";
+	} elsif ($_[0] =~ /Title/) {
+		# XXX - I haven't fixed this for -sideways
+		return if ($pass == 0);
+		if ($_[1] eq "n") {
+			shift(@_); shift(@_);
+			push(@title_n, "\\s+$titleplus@_\\s0\n");
+		} elsif ($_[1] eq "s") {
+			shift(@_); shift(@_);
+			push(@title_s, "\\s+$titleplus@_\\s0\n");
+		} else {
+			die "bad control: $_\n";
+		}
+	} elsif ($_[0] =~ /ps/) {
+		$ps = $_[1];
+	} elsif ($_[0] =~ /ft/) {
+		$ft = $_[1];
+	} elsif ($_[0] =~ /xsize/) {
+		$xsize = $_[1];
+	} elsif ($_[0] =~ /ysize/) {
+		$ysize = $_[1];
+	} elsif ($_[0] =~ /titleplus/) {
+		$titleplus = $_[1];
+	} elsif ($_[0] =~ /boxpercent/) {
+		$boxpercent = $_[1];
+	} elsif ($_[0] =~ /labelgap/) {
+		$labelgap = $_[1];
+	} elsif ($_[0] =~ /label/) {	# has to be after labelgap
+		return if ($pass == 0);
+		$_[0] =~ s/label//;
+		if (length($_[0]) > 0) {
+			$fill = $_[0];
+		} else {
+			$fill = "fillval";
+		}
+		push(@labels, "@_");
+	} elsif ($_[0] =~ /fakemax/) {
+		if (!defined $maxdata) {
+			$maxdata = $_[1];
+		} else {
+			$maxdata = $_[1] if ($maxdata < $_[1]);
+		}
+	} else {
+		die "bad control: $_\n";
+	}
+}
+
+# Look for a %fill[val], eat it, and set $fill
+sub getfill
+{
+	local (@line);
+
+	if (/%fill/) {
+		@_ = split;
+		foreach $_ (@_) {
+			if (/%fill/) {
+				s/%fill//;
+				if (length($_) > 0) {
+					$fill = $_;
+				} else {
+					$fill = "fillval";
+				}
+			} else {
+				push(@line, $_);
+			}
+		}
+	} else {
+		$fill = "fillval";
+		@line = split;
+	}
+	@line;
+}

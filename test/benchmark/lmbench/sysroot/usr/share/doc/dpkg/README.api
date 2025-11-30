@@ -1,0 +1,35 @@
+This is an (incomplete) list of currently provided APIs by dpkg, and
+their supported status.
+
+
+What: libdpkg.a (C static library)
+Status: volatile
+Description:
+ The API provided by this library is highly volatile, still in the process
+ of being cleaned up. It's only supposed to be used internally by dpkg for
+ now. Header files, functions, variables and types might get renamed,
+ removed or change semantics. If you still have a need to use it, which
+ you'd be doing anyway, say by locally building dpkg to get the library,
+ then define the C preprocessor macro LIBDPKG_VOLATILE_API in your build
+ to acknowledge that fact.
+
+What: libdpkg-perl (perl modules)
+Status: stable
+Description:
+ Among the perl modules provided by libdpkg-perl, you can safely rely on
+ those that have $VERSION set to 1.00 (or higher). Note however that the
+ API is defined by what's documented in the corresponding manual pages and
+ nothing more. You can't assume anything else based on what you read in
+ the source code. If you feel the need for further refinements in the
+ documented API, don't hesitate to file a wishlist bug against
+ libdpkg-perl.
+ .
+ In case of API-breaking changes, the major number in $VERSION will be
+ increased. For API extensions, the minor number will be increased.
+
+What: custom changelog parsers as Dpkg::Changelog derived modules
+Status: stable
+Description:
+ Since dpkg 1.18.8, custom changelog parsers are supported as modules
+ derived from the Dpkg::Changelog module. The derived modules need to
+ implement all required documented methods.

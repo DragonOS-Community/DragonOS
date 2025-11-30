@@ -1,0 +1,733 @@
+#!/usr/bin/perl
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+# Mimic the BSD tool, sccs, for RCS.
+# $Id$
+#
+# Note - this reflects a lot of my personal taste.  I'll try and list the
+# important differences here:
+#
+# A bunch of unused commands are not implemented.  It is easy to add them,
+# mail me if you want me to add something.  Please include a spec of what
+# you want the command to do.  Mail lm@engr.sgi.com.
+#
+# I look at RCS file internals and know about certain fields as of revision
+# 5.x.
+#
+# This interface does not require a list of files/directories for most
+# commands; the implied list is *,v and/or RCS/*,v.  Destructive commands,
+# such as clean -f, unedit, unget, do *not* have an implied list.  In
+# other words, 
+#	rccs diffs	is the same as		rccs diffs RCS
+# but
+#	rccs unedit	is not the same as	rccs unedit RCS
+#
+# If you add (potentially) destructive commands, please check for
+# them in main() and make sure that the autoexpand does not happen.
+#
+# TODO:
+#	Make it so that you can pass a list of files/dirs via stdin.
+#
+#	It might be nice to have all the "system" args printed out in
+#	verbose and/or learn mode.  Depends on whether you want people
+#	to learn RCS or not.
+
+&init;
+&main;
+exit 0;	# probably not reached.
+
+sub init
+{
+	$0 =~ s|.*/||;
+	# Add commands here so that -w shuts up.
+	$lint = 0;
+
+	&clean() && &create() && &example() && &get() && &edit() &&
+	&unedit() && &unget() && &diffs() && &delta() && &help() &&
+	&prs() && &prt() && &deledit() && &delget() && &enter() &&
+	&info() && &ci() && &co() && &fix() && &print()
+	    if $lint;
+}
+
+sub help
+{
+	if ($#_ == -1) {
+		&usage;
+	}
+	
+	# Handle all the aliases.
+	if ($_[0] eq "unedit" || $_[0] eq "unget") {
+		&help("clean");
+	} elsif ($_[0] eq "clean") {
+	}
+	warn "Extended help on @_ not available yet.\n";
+}
+
+sub usage
+{
+print <<EOF;
+
+usage: $0 [$0 opts] command [args] [file and/or directory list]
+
+$0 options are:
+    -debug	for debugging of $0 itself
+    -verbose	for more information about what $0 is doing
+
+More information may be had by saying "$0 help subcommand".
+
+Most commands take "-s" to mean do the work silently.
+
+Command		Effect
+-------		------
+    clean -	remove unedited (ro) working files
+	-e	remove unmodified edited (rw) & unedited (ro) files
+	-f	(force) remove modified working files as well
+    create -	add a set of files to RCS control and get (co) the working files
+	-g	do not do the get (co) of the working files
+	-y<msg>	use <msg> as the description message (aka -d<msg>)
+    delta -	check in a revision
+	-y<msg>	use <msg> as the log message (aka -d<msg>)
+	-s
+    diffs -	diff the working file against the RCS file
+    fix -	redit the last revision
+    get -	get the working file[s] (possibly for editing)
+    history -	print history of the files
+    print -	print the history and the latest contents
+
+Alias		Real command	Effect
+-----		------------	------
+    ci -	delta		check in a revision
+    co -	get		check out a revision
+    enter -	create -g	initialize a file without a get afterward
+    unedit -	clean -f	remove working file even if modified
+    unget -	clean -f	remove working file even if modified
+    edit -	get -e		check out the file for editing
+    prs -	history		print change log history
+    prt -	history		print change log history
+
+An implied list of *,v and/or RCS/*,v is implied for most commands.
+The exceptions are commands that are potentially destructive, such as
+unedit.
+
+EOF
+
+	exit 0;
+}
+
+sub main
+{
+	local($cmd);
+	local(@args);
+	local(@comma_v);
+
+	$cmd = "oops";
+	$cmd = shift(@ARGV) if $#ARGV > -1;
+	&help(@ARGV) if $cmd eq "help" || $cmd eq "oops";
+
+	$dir_specified = $file_specified = 0;
+	foreach $_ (@ARGV) {
+		# If it is an option, just pass it through.
+		if (/^-/) {
+			push(@args, $_);
+		}
+		# If they specified an RCS directory, explode it into ,v files.
+		elsif (-d $_) {
+			$dir_specified = 1;
+			warn "Exploding $_\n" if $debug;
+			push(@args, grep(/,v$/, &filelist($_)));
+			push(@args, grep(/,v$/, &filelist("$_/RCS")));
+		}
+		# If it is a file, make it be the ,v file.
+		else {
+			if (!/,v$/) {
+				# XXX - what if both ./xxx,v and ./RCS/xxx,v?
+				if (-f "$_,v") {
+					$_ .= ",v";
+				} else {
+					if (m|/|) {
+						m|(.*)/(.*)|;
+						$f = "$1/RCS/$2,v";
+					} else {
+						$f = "RCS/$_,v";
+					}
+					if (-f $f) {	
+						$_ = $f;
+					}
+				}
+			}
+			if (-f $_) {
+				$file_specified = 1;
+				warn "Adding $_\n" if $debug;
+				push(@args, $_);
+			} else {
+				warn "$0: skipping $_, no RCS file.\n";
+			}
+		}
+	}
+
+	# Figure out if it is a potentially destructive command.  These
+	# commands do not automagically expand *,v and RCS/*,v.
+	$destructive = ($cmd eq "clean" && $args[0] eq "-f") ||
+	    $cmd eq "unedit" || $cmd eq "unget";
+        
+	# If they didn't specify a file or a directory, generate a list
+	# of all ./*,v and ./RCS/*,v files.
+	unless ($destructive || $dir_specified || $file_specified) {
+		warn "Exploding . && ./RCS\n" if $debug;
+		push(@args, grep(/,v$/, &filelist(".")));
+		push(@args, grep(/,v$/, &filelist("RCS")));
+	}
+
+	unless ($cmd =~ /^create$/) {
+		@comma_v = grep(/,v$/, @args);
+		if ($#comma_v == -1) {
+			($s = "$cmd @ARGV") =~ s/\s+$//;
+			die "$0 $s: No RCS files specified.\n";
+		}
+	}
+	
+	# Exit codes:
+	#	0 - it worked
+	#	1 - unspecified error
+	#	2 - command unknown
+	$exit = 2;
+	warn "Trying &$cmd(@args)\n" if $debug;
+	eval(&$cmd(@args));
+
+	if ($exit == 2) {
+		warn "Possible unknown/unimplemented command: $cmd\n";
+		&usage;
+	} else {
+		exit $exit;
+	}
+}
+
+# Read the directory and return a list of files.
+# XXX - isn't there a builtin that does this?
+sub filelist
+{
+	local(@entries) = ();
+	local($ent);
+
+	opendir(DFD, $_[0]) || return ();
+	foreach $ent (readdir(DFD)) {
+		$ent = "$_[0]/$ent";
+		next unless -f $ent;
+		push(@entries, $ent);
+	}
+	warn "filelist($_[0]): @entries\n" if $debug;
+	@entries;
+}
+
+# Take a list of ,v files and return a list of associated working files.
+sub working
+{
+	local(@working, $working) = ();
+
+	foreach $comma_v (@_) {
+		# Strip the ,v.
+		# Strip the RCS specification.
+		($working = $comma_v) =~ s|,v$||;
+		$working =~ s|RCS/||;
+		push(@working, $working);
+	}
+	@working;
+}
+
+# Same as "clean -f" - throw away all changes
+sub unedit { &clean("-f", @_); }
+sub unget { &clean("-f", @_); }
+
+# Get rid of everything that isn't edited and has an associated RCS file.
+# -e	remove edited files that have not been changed.
+# -f	remove files that are edited with changes (CAREFUL!)
+#	This implies the -e opt.
+# -d<m>	Check in files that have been modified.  If no message, prompt
+#	on each file.  This implies -e.
+# -y<m>	Like -d for people that are used to SCCS.
+# -m<m>	Like -d for people that are used to RCS.
+#
+# Note: this does not use rcsclean; I don't know when that showed up.  And
+# the 5.x release of RCS I have does not install it.
+sub clean
+{
+	local(@working);
+	local($e_opt, $f_opt, $d_opt, $s_opt) = (0,0,0,0);
+	local($msg);
+	local(@checkins) = ();
+
+	while ($_[0] =~ /^-/) {
+		if ($_[0] eq "-s") {
+			$s_opt = 1;
+			shift(@_);
+		} elsif ($_[0] eq "-e") {
+			$e_opt = 1;
+			shift(@_);
+		} elsif ($_[0] eq "-f") {
+			$f_opt = $e_opt = 1;
+			shift(@_);
+		} elsif ($_[0] =~ /^-[dym]/) {
+			$d_opt = $e_opt = 1;
+			if ($_[0] =~ /^-[dym]$/) {
+				$msg = $_[0];
+			} else {
+				($msg = $_[0]) =~ s/-[ydm]//;
+				$msg = "-m'" . $msg . "'";
+			}
+			shift(@_);
+		} else {
+			die "$0 clean: unknown option: $_[0]\n";
+		}
+	}
+
+	@working = &working(@_);
+	for ($i = 0; $i <= $#_; ++$i) {
+		# No working file?
+		if (!-f $working[$i]) {
+			warn "No working file $working[$i] for $_[$i]\n"
+			    if $debug;
+			next;
+		}
+
+		# Read only?  Unlink.
+		if (!-w $working[$i]) {
+			warn "rm $working[$i]\n" unless $s_opt;
+			# Make sure there is an RCS file
+			if (-f $_[$i]) {
+				# XXX - what if ro and edited?
+				unlink($working[$i]) unless $n;
+			} else {
+				warn "clean: no RCS file for $working[$i]\n";
+			}
+			next;
+		}
+
+		# If they just want to know about it, tell them.
+		if ($e_opt == 0) {
+			open(RCS, $_[$i]);
+			while (defined($r = <RCS>)) {
+				last if $r =~ /locks/;
+			}
+			@locks = ();
+			while (defined($r = <RCS>)) {
+				# XXX - I use "comment" a delimiter.
+				last if $r =~ /comment/;
+				$r =~ s/^\s+//;
+				chop($r);
+				push(@locks, $r);
+			}
+			close(RCS);
+			if ($#locks > -1) {
+				warn "$working[$i]: being edited: @locks\n";
+			} else {
+				warn "$working[$i]: " .
+				    "writeable but not edited?!?\n";
+			}
+			next;
+		}
+
+		# See if there have actually been any changes.
+		# Notice that this is cmp(1) in about 10 lines of perl!
+		open(RCS, "co -q -p -kkvl $_[$i] |");
+		open(WORK, $working[$i]);
+		$diff = 0;
+		while (defined($r = <RCS>)) {
+			unless (defined($w = <WORK>) && ($r eq $w)) {
+				$diff = 1;
+				last;
+			}
+		}
+		if (defined($w = <WORK>)) {
+			$diff = 1;
+		}
+		close(RCS); close(WORK);
+		if ($diff) {
+			if ($f_opt) {
+				warn "Clean modified $working[$i]\n"
+				    unless $s_opt;
+				unless ($n) {
+					unlink($working[$i]);
+					system "rcs -q -u $_[$i]";
+				}
+			} elsif ($d_opt) {
+				push(@checkins, $_[$i]);
+			} else {
+				warn "Can't clean modified $working[$i]\n";
+			}
+			next;
+		} else {
+			warn "rm $working[$i]\n" unless $s_opt;
+			unless ($n) {
+				unlink($working[$i]);
+				system "rcs -q -u $_[$i]";
+			}
+		}
+	}
+
+	# Handle files that needed deltas.
+	if ($#checkins > -1) {
+		warn "ci -q $msg @checkins\n" if $verbose;
+		system "ci -q $msg @checkins";
+	}
+
+	$exit = 0;
+}
+
+# Create - initialize the RCS file
+# -y<c>	- use <c> as the description message for all files.
+# -d<c>	- use <c> as the description message for all files.
+# -g	- don't do the get
+#
+# Differs from sccs in that it does not preserve the original
+# files (I never found that very useful).
+sub create
+{
+	local($arg, $noget, $description, $cmd) = ("", "", "");
+
+	foreach $arg (@_) {
+		# Options...
+		if ($arg =~ /^-[yd]/) {
+			($description = $arg) =~ s/^-[yd]//;
+			$arg = "";
+			warn "Desc: $description\n" if $debug;
+			next;
+		}
+		if ($arg eq "-g") {
+			$noget = "yes";
+			$arg = "";
+			next;
+		}
+		next if ($arg =~ /^-/);
+
+		# If no RCS subdir, make one.
+		if ($arg =~ m|/|) {	# full path
+			($dir = $arg) =~ s|/[^/]+$||;
+			mkdir("$dir/RCS", 0775);
+		} else {		# in $CWD
+			mkdir("RCS", 0775);
+		}
+	}
+	$exit = 0;
+	if ($description ne "") {
+		$cmd = "ci -t-'$description' @_";
+	} else {
+		$cmd = "ci @_";
+	}
+	warn "$cmd\n" if $verbose;
+	system "$cmd";
+	system "co @_" unless $noget;
+}
+
+# Like create without the get.
+sub enter { &create("-g", @_); }
+
+# Edit - get the working file editable
+sub edit { &get("-e", @_); }
+
+# co - normal RCS
+sub co { &get(@_); }
+
+# Get - get the working file
+# -e	Retrieve a version for editing.
+#	Same as co -l.
+# -p    Print the file to stdout.
+# -k	Suppress expansion of ID keywords.
+#	Like co -kk.
+# -s	Suppress all output.
+#
+# Note that all other options are passed to co(1).
+sub get
+{
+	local($arg, $working, $f, $p);
+
+	$f = $p = 0;
+	foreach $arg (@_) {
+		# Options...
+		$arg = "-l" if ($arg eq "-e");
+		$arg = "-kk" if ($arg eq "-k");
+		$arg = "-q" if ($arg eq "-s");
+		$f = 1 if ($arg eq "-f");
+		$p = 1 if ($arg eq "-p");	# XXX - what if -sp?
+
+		next if $arg =~ /^-/ || $p;
+
+		# Check for writable files and skip them unless someone asked
+		# for co's -f option.
+		($working = $arg) =~ s|,v$||;
+		$working =~ s|RCS/||;
+		if ((-w $working) && $f == 0) {
+			warn "ERROR [$arg]: writable `$working' exists.\n";
+			$arg = "";
+		}
+	}
+	@files = grep(/,v/, @_);
+	if ($#files == -1) {
+		warn "$0 $cmd: no files to get. @_\n";
+		$exit = 1;
+	} else {
+		system "co @_";
+		$exit = 0;
+	}
+}
+
+# Aliases for history.
+sub prt { &history(@_); }
+sub prs { &history(@_); }
+
+# History - change history sub command
+sub history
+{
+	local(@history);
+
+	open(RL, "rlog @_|");
+	# Read the whole history
+	while (defined($r = <RL>)) {
+		# Read the history for one file.
+		if ($r !~ /^[=]+$/) {
+			push(@history, $r);
+			next;
+		}
+		&print_history(@history);
+		@history = ();
+	}
+	close(RL);
+	print "+-----------------------------------\n";
+	$exit = 0;
+}
+
+sub print_history
+{
+	for ($i = 0; $i <= $#_; ++$i) {
+		# Get the one time stuff
+		if ($_[$i] =~ /^RCS file:/) {
+			$_[$i] =~ s/RCS file:\s*//;
+			chop($_[$i]);
+			print "+------ $_[$i] -------\n|\n";
+		}
+
+		# Get the history
+		if ($_[$i] =~ /^----------------------------/) {
+			local($rev, $date, $author, $lines) = ("", "", "", "");
+
+			$i++;
+			die "Bad format\n" unless $_[$i] =~ /revision/;
+			$_[$i] =~ s/revision\s+//;
+			chop($_[$i]);
+			$rev = $_[$i];
+			$i++;
+			die "Bad format\n" unless $_[$i] =~ /date/;
+			@parts = split(/[\s\n;]+/, $_[$i]);
+			for ($j = 0; $j <= $#parts; $j++) {
+				if ($parts[$j] =~ /date/) {
+					$j++;
+					$date = "$parts[$j] ";
+					$j++;
+					$date .= "$parts[$j]";
+				}
+				if ($parts[$j] =~ /author/) {
+					$j++;
+					$author = $parts[$j];
+				}
+				if ($parts[$j] =~ /lines/) {
+					$j++;
+					$lines = "$parts[$j] ";
+					$j++;
+					$lines .= "$parts[$j]";
+				}
+			}
+			print "| $rev $date $author $lines\n";
+			while ($_[++$i] &&
+			    $_[$i] !~ /^----------------------------/) {
+			    	print "| $_[$i]"; ### unless $rev =~ /^1\.1$/;
+			}
+			print "|\n";
+			$i--;
+		}
+	}
+}
+
+# Show changes between working file and RCS file
+#
+# -C -> -c for compat with sccs (not sure if this is needed...).
+sub diffs
+{
+	local(@working);
+	local($diff) = "diff";
+	local($rev) = "";
+
+	while ($_[0] =~ /^-/) {
+		if ($_[0] eq "-C") {
+			$diff .= " -c";
+			shift(@_);
+		} elsif ($_[0] =~ /^-r/) {
+			$rev = $_[0];
+			shift(@_);
+		} elsif ($_[0] eq "-sdiff") {
+			$TIOCGWINSZ = 1074295912;       # IRIX 5.x, 6.x, and SunOS 4.x.  Cool.
+			$buf = "abcd";
+			if (ioctl(STDIN, $TIOCGWINSZ, $buf)) { 
+        			($row, $col) = unpack("ss", $buf);
+				$wid = $col;
+				$row = 1 if 0;	# lint
+			} else {
+				$wid = 80;
+			}
+			$diff = "sdiff -w$wid";
+			shift(@_);
+		} else {
+			$diff .= " $_[0]";
+			shift(@_);
+		}
+			
+	}
+
+	@working = &working(@_);
+	for ($i = 0; $i <= $#_; ++$i) {
+		# No working file?
+		if (!-f $working[$i]) {
+			warn "No working file $working[$i] for $_[$i]\n"
+			    if $debug;
+			next;
+		}
+
+		# Read only?  Skip.
+		next unless (-w $working[$i]);
+
+		# Show the changes
+		select(STDOUT); $| = 1;
+		print "\n------ $working[$i]$rev ------\n";
+		$| = 0;
+		# XXX - flush stdout.
+		if ($diff =~ /^sdiff/) {
+			system "co -q -p -kkvl $rev $_[$i] > /tmp/sdiff.$$" .
+			    "&& $diff /tmp/sdiff.$$ $working[$i]";
+			# XXX - interrupts?
+			unlink("/tmp/sdiff.$$");
+		} else {
+			system "co -q -p -kkvl $rev $_[$i] |" .
+			    " $diff - $working[$i]";
+		}
+	}
+
+	$exit = 0;
+}
+	
+# delta - check in the files
+sub delta
+{
+	local($description) = ("");
+	local($i, @working);
+
+	@working = &working(@_);
+	for ($i = 0; $i <= $#_; ++$i) {
+		# Options...
+		if ($_[$i] =~ /^-[yd]/) {
+			($description = $_[$i]) =~ s/^-[yd]/-m/;
+			$description = "'" . $description . "'";
+			$_[$i] = "";
+			next;
+		}
+		$_[$i] = "-q" if $_[$i] eq "-s";
+		$_[$i] = "" unless -f $working[$i];
+	}
+	$exit = 0;
+	warn "ci $description @_\n" if $verbose;
+	system "ci $description @_";
+}
+
+# Allow RCS interface ci
+sub ci
+{
+	&delta(@_);
+}
+
+# delget
+sub delget
+{
+	&delta(@_);
+	&get(@_);	# If there was a description, delta nuked it...
+}
+
+# deledit
+sub deledit
+{
+	&delta(@_);
+	&get("-e", @_);	# If there was a description, delta nuked it...
+}
+
+
+# info - who is editing what
+sub info
+{
+	local(@working);
+
+	@working = &working(@_);
+	for ($i = 0; $i <= $#_; $i++) {
+		open(RCS, $_[$i]);
+		while (defined($r = <RCS>)) {
+			last if $r =~ /locks/;
+		}
+		@locks = ();
+		while (defined($r = <RCS>)) {
+			# XXX - I use "comment" a delimter.
+			last if $r =~ /comment/;
+			$r =~ s/^\s+//;
+			chop($r);
+			push(@locks, $r);
+		}
+		close(RCS);
+		if ($#locks > -1) {
+			warn "$working[$i]: being edited: @locks\n";
+	    	}
+	}
+	$exit = 0;
+}
+
+# Fix - fix the last change to a file
+sub fix
+{
+	foreach $f (@_) {
+		next unless -f $f;
+		open(F, $f);
+		while (defined(<F>)) { last if /head\s\d/; } close(F);
+		unless ($_ && /head/) {
+			warn "$0 $cmd: No head node found in $f\n";
+			next;
+		}
+		s/head\s+//; chop; chop; $rev = $_;
+		($working = $f) =~ s/,v//;
+		$working =~ s|RCS/||;
+		system "co -q $f && rcs -o$rev $f && rcs -l $f && chmod +w $working";
+	}
+	$exit = 0;
+}
+
+# print - print the history and the latest revision of the file
+sub print
+{
+	local($file);
+
+	foreach $file (@_) {
+		&history($file);
+		&get("-s", "-p", $file);
+	}
+	$exit = 0;
+}
+
+
+# Example - example sub command
+# -Q	change this option to -q just to show how.
+sub example
+{
+	local($arg, $working);
+
+	foreach $arg (@_) {
+		# Options...
+		$arg = "-Q" if ($arg eq "-q");
+	}
+	warn "rlog @_\n" if $verbose;
+	system "rlog @_";
+	$exit = 0;
+}
+

@@ -1,0 +1,47 @@
+#!/bin/sh
+
+get_vendor()
+{
+  local origin="$DPKG_ROOT/etc/dpkg/origins/default"
+  local vendor
+
+  if [ -n "$DEB_VENDOR" ]; then
+    vendor="$DEB_VENDOR"
+  elif [ -e "$origin" ]; then
+    vendor=$(sed -ne 's/^Vendor: *\([^ ]\+\) */\1/p' "$origin" | tr A-Z a-z)
+  fi
+
+  echo "${vendor:-default}"
+}
+
+check_merged_usr_via_aliased_dirs()
+{
+  local vendor
+
+  vendor=$(get_vendor)
+
+  case "$vendor" in
+  debian)
+    # In Debian some people have gotten so offended by the following _warning_
+    # that they have resorted to bullying and abuse. Life's too short, sorry.
+    return
+    ;;
+  ubuntu)
+    # Ubuntu does not seem interested in it.
+    return
+    ;;
+  esac
+
+  for d in /bin /sbin /lib /lib32 /libo32 /libx32 /lib64; do
+    linkname="$(readlink $d)"
+    if [ "$linkname" = "usr$d" ] || [ "$linkname" = "/usr$d" ]; then
+      echo "This system uses merged-usr-via-aliased-dirs, going behind dpkg's" >&3
+      echo "back, breaking its core assumptions. This can cause silent file" >&3
+      echo "overwrites and disappearances, and its general tools misbehavior." >&3
+      echo "See <https://wiki.debian.org/Teams/Dpkg/FAQ#broken-usrmerge>." >&3
+      break
+    fi
+  done
+}
+
+check_merged_usr_via_aliased_dirs

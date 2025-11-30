@@ -1,0 +1,50 @@
+#!/usr/bin/perl
+# Convert the Y coordinate to an average
+
+eval "exec perl -sS $0 $*"
+	if 0;
+
+@values = ();
+$sum = $n = 0;
+$min = 1.7E+308;
+$max = 2.2E-308;
+while (<>) {
+	next if /^[%#]/;
+	@_ = split;
+	if ($_[0] > 1000000) {
+		#warn "$file: ignoring $_";
+		next;
+	}
+	if ($#_ >= 1) {
+		$val = $_[1];
+	} else {
+		$val = $_[0];
+	}
+	push(@values, $val);
+	$sum += $val;
+	$min = $val if $val < $min;
+	$max = $val if $val > $max;
+	$n++;
+}
+# Do some statistics.
+@s = sort(@values);
+if ($n & 1) {	
+	$median = $s[($n + 1)/2];
+} else {
+	$i = $n / 2;
+	$median = ($s[$i] + $s[$i+1]) / 2;
+}
+$avg = $sum/$n;
+$avgdev = $var = 0;
+foreach $_ (@values) {
+	$var += ($_ - $median) ** 2;
+	$tmp = $_ - $median;
+	$avgdev += $tmp > 0 ? $tmp : -$tmp;
+}
+$var /= $n - 1;
+$stddev = sqrt($var);
+$avgdev /= $n;
+#printf("%8s %8s %8s %8s %8s %4s %8s\n", "Min", "Max", "Average", "Median", "Std Dev", "%", "Avg Dev");
+#printf "%8.2f %8.2f %8.2f %8.2f %8.2f %4.1f%% %8.2f\n", $min, $max, $avg, $median, $stddev, $stddev/$median*100, $avgdev;
+printf "%4.1f%%\n", $stddev/$median*100;
+exit 0;

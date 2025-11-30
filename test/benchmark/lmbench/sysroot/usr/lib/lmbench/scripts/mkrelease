@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# %W%
+#
+# XXX - does not check for checked out files.
+
+make -s clean
+make -s get
+VERS=`egrep 'MAJOR|MINOR' src/version.h | awk '{print $3}'` 
+set `echo $VERS`
+if [ $2 -lt 0 ] 
+then	VERS=`echo $1$2 | sed s/-/alpha/`
+else	VERS=`echo $VERS |sed 's/ /./'`
+fi
+D=lmbench-$VERS
+mkdir $D $D/results
+cp -rp SCCS doc hbench-REBUTTAL lmbench-HOWTO scripts src $D
+cp -rp results/SCCS $D/results
+(cd $D && make -s get)
+/bin/rm -rf $D/SCCS $D/*/SCCS
+tar czvf $D.tgz $D
+/bin/rm -rf $D
+make -s clean

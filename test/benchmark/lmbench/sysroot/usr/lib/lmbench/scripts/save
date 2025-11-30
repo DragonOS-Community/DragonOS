@@ -1,0 +1,27 @@
+#!/usr/bin/perl
+# Save the input in the specified file if possible.  If the file exists,
+# add a numeric suffice, i.e., .1, and increment that until the file
+# does not exist.  Use the first name found as the file to save.
+#
+# Typical usage is: xroff -man -fH *.1 | save MAN.PS
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+$base = $#ARGV == 0 ? shift : "save";
+$file = $base;
+$ext = 1;
+
+while (-e $file) {
+	$file = "$base.$ext";
+	$ext++;
+}
+warn "Saving in $file\n";
+open(FD, ">$file");
+while(<>) {
+	print FD;
+}
+exit 0;

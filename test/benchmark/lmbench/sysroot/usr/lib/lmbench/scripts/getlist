@@ -1,0 +1,31 @@
+#!/usr/bin/perl
+# Find everything in my results directory that looks like lmbench output.
+#
+# Hacked into existence by Larry McVoy (lm@bitmover.com)
+# Copyright (c) 1994-1998 Larry McVoy.  
+# $Id$
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+$LIST = "no such file";
+$LIST = "LIST" if (-f "LIST");
+$LIST = $ARGV[0] if (($#ARGV == 0) && (-f $ARGV[0]));
+if (-f $LIST) {
+	open(L, $LIST);
+	$_ = <L>;
+	chop;
+	@files = split;
+	close(L);
+} else {
+	@files = <*/*>;
+}
+foreach $file (@files) {
+	next if $file =~ /\.INFO$/;
+	open(FD, $file) || next;
+	next unless defined($_ = <FD>);
+	close(FD);
+	next unless /^\[lmbench3.[01]/;
+	print "$file ";
+}
+print "\n";
+exit 0;

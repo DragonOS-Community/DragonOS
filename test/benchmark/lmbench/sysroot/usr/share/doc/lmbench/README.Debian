@@ -1,0 +1,33 @@
+lmbench for Debian
+------------------
+
+The original sources have been changed in order to work in 
+pacakged form (they were supposed to work in a single tarball).
+Lmbench scripts and binaries have been placed in /usr/lib/lmbench
+in order to avoid binary namespace pollution.
+
+I've tried to change all the scripts in order to break the dependencies
+in them:
+Results are placed at /var/lib/lmbench/results
+Scripts are placed at /usr/share/lmbench/scripts/
+Binaries are placed at /usr/lib/lmbench/
+Temporaries are no longer placed in /usr/tmp but /var/tmp
+
+Warning: some manpages have been removed from the package due to
+overlapping with other binary manpages (they take common names like
+'clock', 'timing'). If you wish to consult these manpages, until
+this issues are fixed, download the source package and go to the 
+doc/ subdirectory.
+
+Warning! Warning!: The lmbench-run wrapper script will not run unless
+run by root. However, we have not thoroughly tested lmbench code to
+see that it does not contain potential damaging scripts. Be careful
+when running the benchmark and, if in doubt, create a user/group
+which keeps control of the mentioned directories (ie can write in
+them) and run the benchmark as that user.
+
+ -- Javier Fernandez-Sanguino <jfs@computer.org>, Tue, 19 Feb 2002 22:01:31 +0100
+
+Updates by:
+ -- Al Stone <ahs3@debian.org>  Sun, 22 Feb 2009 18:20:00 -0700
+

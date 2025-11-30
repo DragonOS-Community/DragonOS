@@ -1,0 +1,69 @@
+#!/usr/bin/perl
+# Extract the memory latency graph data from lmbench result files.
+# 
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ss $0 "$@"'
+	if 0;
+
+# Uses a stride of 128
+#print "\"%X Array size\n\"%Y Latency in nanoseconds\n";
+foreach $file (@ARGV) {
+	open(FD, $file);
+	$file =~ s|.*/||;
+	while (<FD>) {
+		chop;
+		if (/^\[lmbench/) {
+			@_ = split;
+			if ($_[3] eq "SunOS") {
+				$_[3] .= "-$_[5]";
+			}
+			$uname = "@_";
+		}
+		if (/Mhz/) {
+			$mhz = $_;
+		}
+		if (/^Memory load latency/) {
+			@info = &getinfo($uname, $mhz);
+			($f = $file) =~ s|.*/||;
+			print "\"$file $info[3] $info[$#info]\n";
+			while (<FD>) {
+				next unless /^"stride=128/;
+				last;
+			}
+			while (<FD>) {
+				if (/^\s*$/) {
+					print "\n";
+					last;
+				}
+			    	print;
+			}
+			last;
+		}
+	}
+}
+exit 0;
+
+# Try and create sensible names from uname -a output
+sub getinfo
+{
+	local(@info);
+	local($name);
+	local($mhz) = sprintf("%.0f", $_[1]);
+
+	@info = split(/\s+/, $_[0]);
+	$name = pop(@info);
+	chop($name);
+	if ($name eq "mips") {
+		$name = "$info[$#info]@$mhz";
+	} elsif ($_[0] =~ /HP-UX/) {
+		$name = "$info[7]@$mhz";
+	} elsif ($_[0] =~ /SunOS/) {
+		$name = "$info[7]@$mhz";
+	} else {
+		$name .= "@$mhz";
+	}
+	push(@info, $name);
+	@info;
+}

@@ -1,0 +1,61 @@
+.KS
+.TS
+expand doublebox;
+c|c c|c c
+l|c c|c c
+l|r r|r r.
+	Libc	\fBFile\fP	Memory	File
+System	bcopy	\fBread\fP	read	mmap
+=
+DEC Alpha	38	37	64	12\ 
+DEC Alpha	45	40	79	50\ 
+DEC Alpha	36	36	55	19\ 
+DEC Alpha	40	44	69	14\ 
+DEC Alpha	46	48	88	26\ 
+DEC Alpha	39	39	76	23\ 
+SunOS-5.4 sun4m	23	31	59	31\ 
+SunOS-5.4 sun4m	26	23	80	30\ 
+SunOS-5.4 sun4d	14	23	36	25\ 
+SunOS-5.4 sun4d	21	23	47	17\ 
+Sun SC1000	15	20	38	28\ 
+DEC Alpha	15	20	46	14\ 
+Sun Ultra1	167	85	129	101\ 
+Linux alpha	40	25	74	23\ 
+Linux i586	31	17	61	14\ 
+SunOS-5.4 sun4m	23	21	64	39\ 
+Linux alpha	39	24	73	18\ 
+Unixware/i686	55	53	214	198\ 
+Linux i586	42	23	74	9\ 
+IBM Power2	171	187	205	106\ 
+IBM PowerPC	21	40	63	51\ 
+Linux i486	17	9	33	10\ 
+IRIX64 IP21	70	65	92	72\ 
+Linux i686	57	46	205	34\ 
+IRIX64-601 IP26	32	75	65	56\ 
+Linux i586	41	21	74	13\ 
+Linux i586	21	14	60	11\ 
+Linux i586	21	14	58	10\ 
+Linux i586	21	13	60	8\ 
+HP-UX 9000/735	26	47	55	36\ 
+HP-UX 9000/819	48	64	97	41\ 
+HP-UX 9000/755	25	45	49	32\ 
+FreeBSD/i586	42	38	65	49\ 
+FreeBSD/i586	42	30	73	54\ 
+FreeBSD/i586	41	29	65	46\ 
+IRIX64 IP19	34	34	65	56\ 
+FreeBSD/i586	40	28	62	47\ 
+IRIX64 IP25	41	60	87	76\ 
+HP-UX 9000/735	26	43	53	33\ 
+HP-UX 9000/735	26	43	54	34\ 
+HP-UX 9000/735	26	43	53	35\ 
+HP-UX 9000/770	33	43	56	37\ 
+HP-UX 9000/897	19	39	40	28\ 
+FreeBSD/i586	41	29	65	50\ 
+dgux mc88110	17	16	37	13\ 
+IRIX5.3 IP22	32	32	69	44\ 
+IRIX IP19	34	39	67	43\ 
+IRIX64 IP19	36	36	65	56\ 
+IRIX5.3 IP19	34	36	65	43\ 
+IRIX IP22	33	37	68	48\ 
+.TE
+.KE

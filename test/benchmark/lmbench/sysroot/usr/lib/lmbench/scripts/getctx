@@ -1,0 +1,79 @@
+#!/usr/bin/perl
+# Extract the context switching information from lmbench result files.
+# Usage: getctx file file....
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ss $0 "$@"'
+	if 0;
+
+$title = "foo" if 0;
+
+foreach $file (@ARGV) {
+	open(FD, $file);
+	while (<FD>) {
+		chop;
+		if (/^\[lmbench/) {
+			@_ = split;
+			if ($_[3] eq "SunOS") {
+				$_[3] .= "-$_[5]";
+			}
+			$uname = "@_";
+		}
+		if (/Mhz/) {
+			$mhz = $_;
+		}
+		if (/^.size=/) {
+			s/size/Process size/;
+			s/ ovr/\toverhead/;
+			@info = &getinfo($uname, $mhz);
+			($f = $file) =~ s|/|-|;
+			print "tmp/ctx.$f\n";
+			open(OUT, ">tmp/ctx.$f");
+			print OUT "\"%X Processes \n\"%Y Time in microseconds\n";
+			if ($title) {
+				print OUT "%T $f\n";
+			} else {
+				print OUT
+				    "\"%T Context switches for " . 
+				    "$info[3] $info[$#info]Mhz\n";
+			}
+			print OUT "$_\n";
+			while (<FD>) {
+				last if /^Null/ || /^Pipe/ || /^Memor/ || /^tlb:/;
+				next if /\$Id/;
+				next if m|scripts/lmbench: /dev/tty|;
+				s/ ovr/\toverhead/;
+				s/size/Process size/;
+			    	print OUT;
+			}
+			close(OUT);
+			last;
+		}
+	}
+}
+
+# Try and create sensible names from uname -a output
+sub getinfo
+{
+	local(@info);
+	local($name);
+	local($mhz);
+
+	($mhz = $_[1]) =~ s/[\. ].*//;
+	@info = split(/\s+/, $_[0]);
+	$name = pop(@info);
+	chop($name);
+	if ($name eq "mips") {
+		$name = "$info[$#info]@$mhz";
+	} elsif ($_[0] =~ /HP-UX/) {
+		$name = "$info[7]@$mhz";
+	} elsif ($_[0] =~ /SunOS/) {
+		$name = "$info[7]@$mhz";
+	} else {
+		$name .= "@$mhz";
+	}
+	push(@info, $name);
+	@info;
+}

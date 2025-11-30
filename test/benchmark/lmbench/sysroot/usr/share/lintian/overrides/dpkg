@@ -1,0 +1,4 @@
+# Yes.
+dpkg: arch-dep-package-has-big-usr-share
+# Bogus (see #1017632).
+dpkg: bin-sbin-mismatch usr/sbin/dpkg -> usr/bin/dpkg [usr/sbin/dpkg-fsys-usrunmess]

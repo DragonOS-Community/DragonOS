@@ -1,0 +1,947 @@
+#!/usr/bin/perl
+# $Id$
+eval "exec perl -Ss $0 $@"
+	if 0;
+
+# A graphing preprocessor for GNU pic / troff package.
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+#
+# Input format is like that of Xgraph, i.e., sets of X Y pairs,
+# divided up by blank lines and titled with a "title.  Like so
+#
+#	1 1
+#	2 2
+#	"straight slope
+#
+#	4 4
+#	1 4
+#	"straight down
+#
+# Optional "quartile" data input format.
+# The drawing is ----- o  ---, with the lines being from y1..y2, y4..y5,
+# and the mark at y3.
+#
+#	x y1 y2 y3 y4 y5
+#	x y1 y2 y3 y4 y5
+#	x y1 y2 y3 y4 y5
+#
+# Optional input (superset of Xgraph) is like so:
+#
+#	%T Graph title in +4 point font
+#	%X X axis title and/or units in +2 point font
+#	%Y Y axis title and/or units in +2 point font
+#	%P Page title in +4 point font
+#	%fakemax-X <value>	force graph to be that big
+#	%fakemax-Y <value>	force graph to be that big
+#	%fakemin-X <value>	force graph to be that big
+#	%fakemin-Y <value>	force graph to be that big
+#
+# Options:
+#  -lm		implies -big -below -grid -close
+#  -rev		reverse X/Y data sense (and titles)
+#  -below	put data set titles below the graph rather than to the right
+#  -close	no extra space around the data
+#  -qline	connect the quartile center points
+#  -grid	grid :-)
+#  -halfgrid	Grid lines where the major ticks are
+#  -nobox	no box around whole graph
+#  -big		make the graph take the whole page
+#  -slide	make the graph fit in my slides
+#  -small	make the graph be small so you can do a lot of them.
+#  -notitle	no Title label
+#  -nolabels	no X/Y/Title labels
+#  -nodatal	no dataset labels
+#  -nomarks	no marks on the graphs.
+#  -nolines	no lines connecting the marks (don't use w/ -nomarks :-)
+#  -k		print (absolute) values larger than 1000 as (value/1000)K
+#  -grapheach	graph each data set separately
+#  -br_title	start a new graph at each title.
+#  -nospace	no .sp at top of picture
+#  -ts		time series, X axis is implied.
+#  -hist	produce a histogram graph
+#
+# Hacks :-)
+# -xk		multiply X input by 1024.
+# -xm		multiply X input by 1024*1024.
+# -logx		take the log base 2 of X input
+# -logy		take the log base 2 of Y input
+# -cut		add cut marks so that image croppers dont crop too close
+#
+# Much thanks to James Clark for providing such a nice replacement for
+# the Unix troff package.  Thanks to the Xgraph folks for providing
+# inspiration.  Thanks to Declan Murphy for math :-)
+# Thanks to noone for floating point numbers, they suck dog doo.
+# There are lots of hacks in here to deal with rounding errors.
+#
+# TODO:
+#	All of the option parsing done manually.
+#	A filter option to print ranges of the data?
+#	A way to do each data set in it's own graph.
+#	All of the other xgraph options?
+#	For Adam, that butthead, an option to sort the labels such that they
+#	are in the same order as the right endpoints of the data sets.
+
+&init;
+&autosize;
+&pic;
+exit;
+
+# init - slurp in the data and apply any transformations.
+sub init
+{
+	# Lint for the options.
+	$qline = $ts = $close = $nolines = $thk1 = $thk2 = $k = $notitle
+	= $thk1_5 = $xm = $grid = $nospace = $lm = $hist = 0 if 0;
+
+	if ($grapheach) { $grapheach = 1; $cut = 0; } else { $grapheach = 0; }
+	if ($halfgrid) { $halfgrid = 1; } else { $halfgrid = 0; }
+	if ($hist) { $nobox = 1; $nolabels = 1; $close = 1; $nolines = 1; }
+	if ($lm) { $big = $below = $grid = $close = 1; }
+
+	# Accept %options=value on the command line.
+	while ($ARGV[0] =~ /^%/) {
+		$_ = $ARGV[0];
+		s/=/ /;
+		push(@lines, "$_\n");
+		shift(@ARGV);
+	}
+
+	# OK, sometimes we get
+	#	%T title
+	#	%X X axis, etc.
+	#	
+	#	"data set 1
+	#
+	# And this messes up the numbering later on.  So we carefully dump the
+	# whitespace between the control and data.
+	while (<>) {
+		last if /^\s*$/;
+		push(@lines, $_);
+		last if /^"/;
+		last if /^\d/;
+	}
+	push(@lines, <>);
+	$fake = "";
+	$items = 0;
+	$stat_sum = 0;
+	$min = 1.7E+308;
+	$max = 2.2E-308;
+	foreach (@lines) {
+		if (/^"?%fake/) {
+			$fake = $_;
+			s/"?%fakemax-//;
+			s/"?%fakemin-//;
+			@_ = split;
+			$_ = "$_[1] $_[1]";
+		} elsif (/^%hist\s/) {
+			@_ = split;
+			shift(@_);
+			($hist_bsize, $hist_low, $hist_high) = @_;
+			next;
+		} else {
+			next if /^\s*["%#]/;
+			next if /^\s*$/;
+		}
+		if ($ts) {
+			$_ = "$items $_";
+		}
+		$items++;
+		@_ = split;
+		if ($xk) {
+			$_[0] = $_[0] * 1024;
+		} elsif ($xm) {
+			$_[0] = $_[0] * 1024 * 1024;
+		}
+		if ($logx) {
+			$_[0] = &logbase(2, $_[0]);
+		}
+		if ($yk) {
+			$_[1] = $_[1] * 1024;
+		} elsif ($ym) {
+			$_[1] = $_[1] * 1024 * 1024;
+		}
+		if ($logy) {
+			$_[1] = &logbase(2, $_[1]);
+		}
+		if ($rev) {
+			$_ = "$_[1] $_[0]";
+			$y = $_[0];
+		} else {
+			$_ = "$_[0] $_[1]";
+			$y = $_[1];
+		}
+		$stat_sum += $y;
+		$max = $y if ($y > $max);
+		$min = $y if ($y < $min);
+		push(@y, $y);
+		if ($fake =~ /[XY]/) {
+			# XXX - reverse?  What should it do?
+			if ($fake =~ /fakemax-X/) {
+				$fakemax_X = $_[0];
+			} elsif ($fake =~ /fakemax-Y/) {
+				$fakemax_Y = $_[1];
+			} elsif ($fake =~ /fakemin-X/) {
+				$fakemin_X = $_[0];
+			} elsif ($fake =~ /fakemin-Y/) {
+				$fakemin_Y = $_[1];
+			}
+			$_ = $fake;
+			$fake = "";
+		}
+	}
+
+	# Do some statistics.
+	@s = sort(@y);
+	if ($items & 1) {	
+		$stat_median = $s[($items + 1)/2];
+	} else {
+		$i = $items / 2;
+		$stat_median = ($s[$i] + $s[$i+1]) / 2;
+	}
+	$stat_avg = $stat_sum/$items;
+	$stat_avgdev = $stat_var = 0;
+	# $stat_skew = $stat_curt = 0;
+	foreach $_ (@lines) {
+		next if /^\s*["#%]/;
+		next if /^\s*$/;
+		@_ = split;
+		$stat_var += ($_[1] - $stat_median) ** 2;
+		$tmp = $_[1] - $stat_median;
+		$stat_avgdev += $tmp > 0 ? $tmp : -$tmp;
+	}
+	$stat_var /= $items - 1;
+	$stat_stddev = sqrt($stat_var);
+	$stat_avgdev /= $items;
+	if ($ts) {
+		printf STDERR "N=$items min=$min max=$max med=%.2f avg=%.2f stddev=%.2f avgdev=%.2f\n",
+		    $stat_median, $stat_avg, $stat_stddev, $stat_avgdev;
+	}
+
+	# Diddle this to create different marks.
+	@marks = (
+	    '[ "\s+2\(bu\s0" ]',
+	    '[ "\(sq" ]',
+	    '[ "\(*D" ]',
+	    '[ "\s+2\(pl\s0" ]',
+	    '[ "\(*F" ]',
+	    '[ "\s+2\fB\(mu\fP\s0" ]',
+	    '[ circle rad .035 fill 0 ]',
+	    '[ box ht .07 wid .07 fill 1 ]',
+	    '[ "\(dd" ]',
+	    );
+	$nmarks = $#marks + 1;
+	$nomark = '[ box invis ht .05 wid .05 ]';
+
+	$first_title = 1;
+
+	if ($nospace) {
+		$graphspace = "0";
+	} elsif ($small) {
+		$graphspace = ".15i";
+	} elsif ($medium) {
+		$graphspace = ".20i";
+	} else { 
+		$graphspace = ".25i";
+	}
+
+	if ($small) {
+		$marks[0] = '[ circle rad .007 fill 1 ]';
+		$PS = 10;
+		$ft = "B";
+		$tick = .1;
+	} elsif ($medium) {
+		$PS = 11;
+		$ft = "HB";
+		$tick = .1;
+	} elsif ($slide) {
+		$ft = "HB";
+		$PS = 11;
+		$tick = .15;
+	} else {
+		$ft = "CB";
+		$PS = 12;
+		$tick = .15;
+	}
+	$thk = .75;
+	$thk = 1 if $thk1;
+	$thk = 1.5 if $thk1_5;
+	$thk = 2 if $thk2;
+	$thk = .2 if $thk_2;
+	$gthk = .25;
+	$gthk = 1 if $gthk1;
+	$gthk = .75 if $gthk_75;
+	$gthk = .5 if $gthk_5;
+	$lineinvis = $nolines ? "invis" : "";
+}
+
+# Calculate min/max to autosize the graph.
+sub autosize
+{
+	foreach $_ (@lines) {
+		next if /^\s*["#%]/;
+		next if /^\s*$/;
+		@_ = split;
+		if ($#_ == 1) {
+			$Ymax = $Ymin = $_[1];
+		} elsif ($#_ == 5) {	# Quartile plot
+			$Ymax = $Ymin = $_[1];
+			for ($i = 2; $i <= 5; ++$i) {
+				$Ymax = $_[$i] if ($Ymax < $_[$i]);
+				$Ymin = $_[$i] if ($Ymin > $_[$i]);
+			}
+		} else {
+			die "Data format error: $_\n";
+		}
+		if (!defined $xmin) {
+			$xmin = $_[0];
+			$xmax = $_[0];
+			$ymin = $Ymin;
+			$ymax = $Ymax;
+		}
+		else {
+			$xmin = $_[0] if ($xmin > $_[0]);
+			$xmax = $_[0] if ($xmax < $_[0]);
+			$ymin = $Ymin if ($ymin > $Ymin);
+			$ymax = $Ymax if ($ymax < $Ymax);
+		}
+	}
+
+	# Handle fake max
+	if (defined($fakemax_X) && $fakemax_X > $xmax) {
+		$xmax = $fakemax_X;
+	}
+	if (defined($fakemax_Y) && $fakemax_Y > $ymax) {
+		$ymax = $fakemax_Y;
+	}
+	if (defined($fakemin_X) && $fakemin_X < $xmin) {
+		$xmin = $fakemin_X;
+	}
+	if (defined($fakemin_Y) && $fakemin_Y < $ymin) {
+		$ymin = $fakemin_Y;
+	}
+	if ($hist) {
+		$xmax += $hist_bsize;
+	}
+	warn "n=$items xmin=$xmin xmax=$xmax ymin=$ymin ymax=$ymax\n" if $debug;
+	($xlower, $xupper, $xtick) = &tick($xmin, $xmax, $logx ? 2 : 10);
+	($ylower, $yupper, $ytick) = &tick($ymin, $ymax, $logy ? 2 : 10);
+	if ($ymax + $ytick*.45 < $yupper) {
+		$yupper -= $ytick;
+		$ypartial = $ymax - $yupper;
+	} else {
+		$ypartial = 0;
+	}
+	$xn = int(.9 + ($xupper - $xlower) / $xtick);
+	$yn = int(.9 + ($yupper - $ylower) / $ytick);
+	$xlower = sprintf("%.6f", $xlower);	# really ugly cast
+	$xupper = sprintf("%.6f", $xupper);	# really ugly cast
+	$xtick = sprintf("%.6f", $xtick);	# really ugly cast
+	$xn = sprintf("%.0f", $xn);		# really ugly cast
+	$ylower = sprintf("%.6f", $ylower);	# really ugly cast
+	$yupper = sprintf("%.6f", $yupper);	# really ugly cast
+	$ytick = sprintf("%.6f", $ytick);	# really ugly cast
+	$yn = sprintf("%.0f", $yn);		# really ugly cast
+}
+
+# Since I had to go rethink it, here's the explanation:
+#
+# log base e 10 = X implies e**x = 10
+# e ** (v * x) = (e ** x) ** v
+# since e ** x == 10, that implies e ** (v * x) is 10 ** v
+# Capeesh?
+sub expbase
+{
+	local($base, $val) = @_;
+
+	exp($val * log($base));
+}
+
+sub logbase
+{
+	local($base, $val) = @_;
+
+	if ($val == 0) {
+		return 0;
+	}
+	if ($val < 0) {
+		die "Input: $_: can't take log of negative value: $val\n";
+	}
+	log($val) / log($base);
+}
+
+# Figure out the tick marks.
+# XXX - the log stuff is not quite right.
+sub tick
+{
+	local($min, $max, $base) = @_;
+	local($delta, $adj, $lower, $upper, $tick);
+
+	$delta = $max - $min;
+	$tick = int(&logbase(10, $delta));
+	$tick = &expbase(10, $tick - 1);
+	if ($delta / $tick > 10) {
+		if ($base == 10) {
+			if (($delta / (2 * $tick)) > 15) {
+				$adj = 10;
+			} elsif (($delta / (2 * $tick)) > 10) {
+				$adj = 5;
+			} else {
+				$adj = 2;
+			}
+		} else {
+			$adj = 2;
+		}
+	} else {
+		$adj = 1;
+	}
+	$tick *= $adj;
+
+	# Go figure out the endpoints.  This is O(log10(n)) where N is the
+	# number of ticks from 0 to the min.
+	$lower = 0;
+	for ($i = 10e99; $i > 0; $i = int($i/$base)) {
+		$fudge = $i * $tick;
+		$bound = $min + $fudge * .00001;
+
+		# Sometimes it's too big
+		while ($lower > $bound) {
+			$lower -= $fudge;
+		}
+
+		# Sometimes it's too small
+		while (($lower + $fudge) <= $bound) {
+			$lower += $fudge;
+		}
+	}
+
+	if ($base == 2) {
+		if ($tick < 1) {
+			$tick = 1;
+		} else {
+			$tick = sprintf("%.0f", $tick);
+		}
+		$lower = sprintf("%.0f", $lower);
+	}
+	for ($upper = $lower; $upper < $max - $tick * .00001; $upper += $tick) {
+	}
+	if ($base == 2) {
+		$upper = sprintf("%.0f", $upper);
+	}
+	# If you don't like your end points on the border then do this.
+	unless ($close) {
+		if ($min - $lower < .1 * $tick) {
+			$lower -= $tick;
+		}
+		if ($max - $upper < .1 * $tick) {
+			$upper += $tick;
+		}
+	}
+	($lower, $upper, $tick);
+}
+
+# Spit out the pic stuff.
+# The idea here is to spit the variables and let pic do most of the math.
+# This allows tweaking of the output by hand.
+sub pic
+{
+	if ($k) {
+		$print = 'sprintf("%.0fK", j/1000)';
+	} else {
+		$print = 'sprintf("%.0f", j)';
+	}
+	if ($grid || $halfgrid) {
+		$nogrid = "dotted";
+	} else {
+		$nogrid = "invis";
+	}
+	if ($nobox) {
+		$nobox = "invis";
+	}
+	$log_x = $logx ? "logx = 1" : "logx = 0";
+	$log_y = $logy ? "logy = 1" : "logy = 0";
+	if ($big) {
+		print ".sp .5i\n.po .5i\n";
+		if ($below) {
+			$ysize = 7;
+		} else {
+			$ysize = 9;
+		}
+		if ($nodatal) {
+			$xsize = 7;
+		} else {
+			$xsize = 6;
+		}
+	} elsif ($small) {
+		$ysize = 1.75;
+		$xsize = 1.75;
+	} elsif ($medium) {
+		print ".po .52i\n";
+		$ysize = 1.9;
+		$xsize = 2.05;
+	} elsif ($slide) {
+		print ".sp .35i\n";
+		$xsize = 4.5;
+		$ysize = 4.1;
+	} else {
+		print ".sp 1i\n";
+		$ysize = 5;
+		$xsize = 5;
+	}
+	&graph;
+
+	# Mark the data points
+	@datasets = ();
+	for ($sub = 0; $sub <= $#lines; $sub++) {
+		$_ = $lines[$sub];
+		if (/^\s*$/) {		# end of data set
+			&data($set++);
+			if ($grapheach) {
+				&titles;
+				if ($small) {
+					if ($set == 4) {
+						print ".sp -11i\n";
+						print ".po 3.5i\n";
+					} elsif ($set == 8) {
+						print ".sp -11i\n";
+						print ".po 6i\n";
+					}
+				} else {	# ???
+					if ($set == 4) {
+						print ".sp -11i\n";
+						print ".po 3.15i\n";
+					} elsif ($set == 8) {
+						print ".sp -11i\n";
+						print ".po 5.8i\n";
+					}
+				}
+
+				if ($sub < $#lines) {
+					&graph;
+				}
+			}
+			next;
+		}
+		if (/^"?%fake/) {	# Skip this
+			next;
+		}
+		if (/^"?%T\s+/) {	# Title specification
+			# Spit out the last graph at next title.
+			if ($br_title && $graphs++ > 0) {
+				&titles;
+				if ($graphs == 5) {
+					print ".sp -11i\n";
+					print ".po 3.5i\n";
+				} elsif ($graphs == 9) {
+					print ".sp -11i\n";
+					print ".po 6i\n";
+				}
+				&graph;
+			}
+			s/^"?%T\s+//;
+			chop;
+			$Gtitle = $_;
+			next;
+		}
+		if (/^"?%X\s+/) {	# X axis title specification
+			s/^"?%X\s+//;
+			chop;
+			$Xtitle = $_;
+			next;
+		}
+		if (/^"?%Y\s+/) {	# Y axis title specification
+			s/^"?%Y\s+//;
+			chop;
+			$Ytitle = $_;
+			next;
+		}
+		if (/^"?%P\s+/) {	# Page title specification
+			s/^"?%P\s+//;
+			chop;
+			$Ptitle = $_;
+			#VERBOSE warn "Pt: $Ptitle\n";
+			next;
+		}
+		if (/^"/) {		# Data set title
+			s/^"//;
+			chop;
+			$dataset = $_;
+			push(@datasets, "$dataset");
+			next;
+		}
+		push(@data, $_);
+	}
+	unless ($grapheach) {
+		&data($set++);
+		&titles;
+	}
+	if (defined($Ptitle)) {
+		print ".po 1i\n.sp -12i\n.ps 20\n.ce 1\n";
+		print "$Ptitle\n";
+		print ".po 1i\n.sp -12i\n.sp 10.4i\n.ps 20\n.ce 1\n";
+		print "$Ptitle\n";
+	}
+}
+
+# Draw the titles and finish this graph.
+sub titles
+{
+	# Do X/Y titles, if any.
+	unless ($nolabels) {
+		$Xtitle = defined($Xtitle) ? $Xtitle : "X";
+		$Ytitle = defined($Ytitle) ? $Ytitle : "Y";
+		if ($rev && $first_title) {
+			$tmp = $Xtitle;
+			$Xtitle = $Ytitle;
+			$Ytitle = $tmp;
+		}
+		print "\n# Xaxis title.\n";
+		print "\"\\s+4$Xtitle\\s0\" rjust at O.se - (0, .6)\n";
+	
+		print "\n# Yaxis title ($Ytitle)\n.ps +2\n";
+		$tmp = $Ytitle;
+		while (length($tmp) > 0) {
+			$tmp =~ s/(.)//;
+	    		print "\"$1\" ";
+		}
+		print "\\\n    at O.w - (.75, 0)\n.ps\n";
+
+	}
+
+	# Do the graph title, if any.
+	$Gtitle = defined($Gtitle) ? $Gtitle : "Pic Graph";
+	if ($grapheach) {
+		$Gtitle = $datasets[$#datasets];
+		print "\n# Graph title.\n";
+		print "\"$Gtitle\" at O.n + (0, .1)\n";
+	}
+
+	if ($br_title) {
+		print "\n# Graph title.\n";
+		print "\"\\s+2$Gtitle\\s0\" at O.n + (0, .1)\n";
+	}
+
+	unless ($nolabels || $notitle) {
+		print "\n# Graph title.\n";
+		if ($big) {
+			print "\"\\s+8$Gtitle\\s0\" at O.n + (0, .3)\n";
+		} else {
+			print "\"\\s+4$Gtitle\\s0\" at O.n + (0, .3)\n";
+		}
+	}
+
+	if ($cut) {
+		$cutthick = .75;
+		print "\n# Cut marks\n";
+		print "move to O.n + 0,.65; line thick $cutthick right .1\n";
+		print "move to O.w - 1,0; line thick $cutthick down .1\n";
+		print "move to O.e + .35,0; line thick $cutthick down .1\n";
+	}
+
+	# Do the dataset titles.
+	$i = 0;
+	unless ($nodatal) {
+		print "\n# Title.\n";
+		if (!$grapheach) {
+			print ".ft R\n" if ($slide);
+			for ( ; $i <= $#datasets; $i++) {
+				print $marks[$i % $nmarks];
+				if ($below) {
+					print " at O.sw - (0, .75 + $i * vs)\n";
+				} else {
+					print " at O.ne + (.25, - $i * vs)\n";
+				}
+				print 
+			    "\"$datasets[$i]\" ljust at last [].e + (.1, 0)\n";
+		    	}
+			if ($cut) {
+				print "\nmove to O.s - 0,.75 + $i * vs\n";
+				print "line thick $cutthick right .1\n";
+			}
+			print ".ft\n" if ($slide);
+		}
+	}
+
+	# Finish up.
+	print "]\n.ft\n.ps\n.PE\n";
+
+	# Do the statistics
+	if ($stats) {
+		$i++;
+		$min = sprintf "%.4f", $min;
+		$max = sprintf "%.4f", $max;
+		$stat_median = sprintf "%.4f", $stat_median;
+		$stat_avg = sprintf "%.4f", $stat_avg;
+		$stat_stddev = sprintf "%.4f", $stat_stddev;
+		$stat_avgdev = sprintf "%.4f", $stat_avgdev;
+		print <<EOF;
+.ps 12
+.vs 14
+.ft CB
+.po +.7i
+.TS
+c s
+l r.
+Statistics
+=
+min	$min
+max	$max
+median	$stat_median
+average	$stat_avg
+stddev	$stat_stddev
+avgdev	$stat_avgdev
+.TE
+.po -.7i
+.ft
+.ps
+.vs
+EOF
+	}
+
+	$first_title = 0;
+}
+
+sub graph
+{
+	if ($hist) { $hist = 1; } else { $hist = 0; }
+	print ".sp ${graphspace}\n";
+	print <<EOF;
+.PS
+.ps $PS
+.vs 11
+.ft $ft
+[
+# Variables, tweak these.
+	xtick = $xtick			# width of an X tick
+	xlower = $xlower			# where the xtick start
+	xupper = $xupper			# upper range of graph
+	xn = $xn					# number of ticks to do
+	ytick = $ytick			# width of an Y tick
+	ylower = $ylower			# where the ytick start
+	yupper = $yupper			# upper range of graph
+	yn = $yn					# number of ticks to do
+	xsize = $xsize				# width of the graph
+	ysize = $ysize				# height of the graph
+	yscale = ysize / (yupper - ylower)	# scale data to paper
+	xscale = xsize / (xupper - xlower)	# scale data to paper
+	tick = $tick				# distance towards numbers
+	gthk = $gthk				# thickness of grid lines
+	thk = $thk				# thickness of data lines
+	grapheach = $grapheach			# doing lotso little ones?
+	halfgrid = $halfgrid			# fewer grid lines
+	qthk = 2.0				# thickness of quartile lines
+	vs = .15				# works for 10 point fonts
+	hist = $hist				# histogram
+	ypartial = $ypartial				# Y spillerover
+	$log_x				# 1 if x data is log base 2
+	$log_y				# 1 if y data is log base 2
+
+# Draw the graph borders and tick marks
+	O:	box $nobox thick 2 ht ysize wid xsize
+	if (hist) then {
+		# The box was invisible, draw the three sides
+		# The partial part i sbecause we are just too big.
+		line thick 2 from O.sw to O.se
+		line thick 2 from O.sw to O.nw + 0,ypartial*yscale
+		line thick 2 from O.se to O.ne + 0,ypartial*yscale
+		xgridlen = xsize + tick/2
+	} else {
+		xgridlen = xsize
+	}
+	if (ysize < 2.5) then {
+		ysp = -.15
+		xsp = -.2
+		tick = tick * .75
+	} else {
+		ysp = -.2
+		xsp = -.25 
+	}
+	j = ylower
+	t = tick * .5
+	for i = 0 to yn by 1 do {
+		ys = j - ylower
+		g = ys * yscale
+		# Draw the ticks to the numbers on the Y axis
+		line thick gthk from O.sw + (-tick, g) to O.sw + (0, g)
+		if (hist) then {
+			line thick gthk from O.se + (tick, g) to O.se + (0, g)
+		}
+		# Grid line across at same level as number ticks
+		line $nogrid thick gthk from O.sw + 0,g to O.sw + xsize,g
+		if (i < yn) then {
+			y2 = (ys + (ytick / 2)) * yscale
+			if (!halfgrid) then {
+				# Grid line across between number ticks
+				line $nogrid thick gthk from \\
+				    O.sw + (-t, y2) to O.sw + (xgridlen, y2)
+			}
+		}
+		if (logy == 1) then {
+			tmp = 2 ^ j;
+			if (tmp >= 1024*1024) then {
+				tmp = tmp / (1024*1024)
+				sprintf("%.0fM", tmp) at O.sw + ysp,g-.02
+			} else { if (tmp >= 1024) then {
+				tmp = tmp / 1024
+				sprintf("%.0fK", tmp) rjust at O.sw + ysp,g-.02
+			} else {
+				sprintf("%.0f", tmp) rjust at O.sw + ysp,g-.02
+			}}
+		} else { if (yupper - ylower > 999) then {
+			$print rjust at O.sw + ysp, g - .02
+			if (hist) then { $print ljust at O.se + -ysp,g-.02 }
+		} else { if (yupper - ylower > 10) then {
+			sprintf("%.0f", j) rjust at O.sw + ysp, g - .02
+			if (hist) then { 
+				sprintf("%.0f", j) ljust at O.se + -ysp,g-.02
+			}
+		} else { if (yupper - ylower > 1) then {
+			sprintf("%.1f", j) rjust at O.sw + ysp, g - .02
+			sprintf("%.1f", j) rjust at O.sw + ysp, g - .02
+		} else { if (yupper - ylower > .1) then {
+			sprintf("%.2f", j) rjust at O.sw + ysp, g - .02
+			if (hist) then {
+				sprintf("%.2f", j) ljust at O.se + -ysp,g-.02
+			}
+		} else {
+			sprintf("%.3f", j) rjust at O.sw + ysp, g - .02
+			if (hist) then {
+				sprintf("%.3f", j) ljust at O.se + -ysp,g-.02
+			}
+		}}}}}
+		j = j + ytick
+	}
+	j = xlower
+	even = 0
+	for i = 0 to xn by 1 do {
+		even = !even
+		doit = !grapheach || xn > 9 || even
+		xs = j - xlower
+		g = xs * xscale
+		line thick gthk from O.sw + (g, -tick) to O.sw + (g, 0)
+		if (!hist) then {
+			line $nogrid thick gthk from O.sw + g,0 to O.sw + g,ysize
+		}
+		if (i < xn) then {
+			x2 = (xs + (xtick / 2)) * xscale
+			if (!halfgrid && !hist) then {
+				line $nogrid thick gthk from O.sw+x2,-t to O.sw+x2,ysize
+			}
+		}
+		if (logx == 1) then {
+			tmp = 2 ^ j;
+			if (tmp >= 1024*1024) then {
+				tmp = tmp / (1024*1024)
+				if (doit) then {
+					sprintf("%.0fM", tmp) at O.sw + g,xsp
+				}
+			} else { if (tmp >= 1024) then {
+				tmp = tmp / 1024
+				if (doit) then {
+					sprintf("%.0fK", tmp) at O.sw + g,xsp
+				}
+			} else {
+				if (doit) then {
+					sprintf("%.0f", tmp) at O.sw + g,xsp
+				}
+			}}
+		} else { if (xupper - xlower > 999) then {
+			$print at O.sw + g, xsp
+		} else { if (xupper - xlower > 10) then {
+			sprintf("%.0f", j) at O.sw + g, xsp
+		} else { if (xupper - xlower > 1) then {
+			sprintf("%.1f", j) at O.sw + g, xsp
+		} else { if (xupper - xlower > .1) then {
+			sprintf("%.2f", j) at O.sw + g, xsp
+		} else {
+			sprintf("%.3f", j) at O.sw + g, xsp
+		}}}}}
+		j = j + xtick
+	}
+EOF
+	# Add some statistics.
+	if ($stats) {
+		print "line from O.sw + 0,(yscale * ($stat_avg - $ylower)) " .
+		    "to O.se + 0,(yscale * ($stat_avg - $ylower))\n";
+		print "\"average\" at last line.e + .2,0 ljust\n";
+		print "line from O.sw + 0,(yscale * ($stat_median - $ylower)) " .
+		    "to O.se + 0,(yscale * ($stat_median - $ylower))\n";
+		print "\"median\" at last line.e + .2,0 ljust\n";
+		$tmp = $stat_median + $stat_avgdev;
+		print "line from O.sw + 0,(yscale * ($tmp - $ylower)) " .
+		    "to O.se + 0,(yscale * ($tmp - $ylower))\n";
+		print "\"+ avgdev\" at last line.e + .2,0 ljust\n";
+		$tmp = $stat_median - $stat_avgdev;
+		print "line from O.sw + 0,(yscale * ($tmp - $ylower)) " .
+		    "to O.se + 0,(yscale * ($tmp - $ylower))\n";
+		print "\"- avgdev\" at last line.e + .2,0 ljust\n";
+	}
+}
+
+sub data
+{
+	local($mark) = int(int($_[0]) % int($nmarks));
+
+	print "\n# DATASET: $dataset, MARK $mark\n";
+	$first = 1;
+	foreach $d (@data) {
+		next if $d =~ /^\s*"/;
+		next if $d =~ /^\s*#/;
+		next if $d =~ /^\s*$/;
+		@_ = split(/[ \t\n]+/, $d);
+		$x = sprintf("%.6g", $_[0]);
+		$y = sprintf("%.6g", $_[1]);
+		if ($#_ == 1) {
+			if ($hist) {
+				print "box fill .25 " .
+				    "ht yscale * ($y - ylower) " .
+				    "wid $hist_bsize * xscale " .
+				    "with .sw at O.sw + " .
+				    "xscale * ($x - xlower),0\n";
+			} elsif ($nomarks && ($grapheach || !$first)) {
+				print $nomark . " at O.sw + \\\n\t" . 
+				    "(xscale * ($x - xlower), " . 
+				    "yscale * ($y - ylower))\n";
+			} else {
+				print $marks[$mark] . 
+				    " at O.sw + \\\n\t" . 
+				    "(xscale * ($x - xlower), " . 
+				    "yscale * ($y - ylower))\n";
+			}
+			if (!$hist && $first != 1) {
+				print "line $lineinvis thick thk from " .
+				    "2nd last [].c to last [].c\n";
+			}
+			$first = 0;
+		} elsif ($#_ == 5) {	# Quartile graph
+			# Draw the lower line
+			print "x = xscale * ($_[0] - xlower)\n";
+			print "    line thick qthk from \\\n\t" .
+			    "O.sw + x, yscale * ($_[1] - ylower) to\\\n\t" .
+			    "O.sw + x, yscale * ($_[2] - ylower)\n";
+			# Draw the mark
+			print "    $marks[$mark]" . " at O.sw + \\\n\t" . 
+			    "x, yscale * ($_[3] - ylower)\n";
+			# Draw the upper line
+			print "    line thick qthk from \\\n\t" .
+			    "O.sw + x, yscale * ($_[4] - ylower) to\\\n\t" .
+			    "O.sw + x, yscale * ($_[5] - ylower)\n";
+			# Connect the lines?
+			if ($qline) {
+				if ($first != 1) {
+					print "line thick thk from " .
+					    "2nd last [].c to last [].c\n";
+				}
+			}
+			$first = 0;
+		}
+	}
+	# Put a mark on the end point
+	if ($nomarks && !$nodatal && !$first && !$grapheach) {
+		print $marks[$mark] . 
+		    " at O.sw + \\\n\t" . 
+		    "(xscale * ($x - xlower), " . 
+		    "yscale * ($y - ylower))\n";
+	}
+	@data = ();
+}

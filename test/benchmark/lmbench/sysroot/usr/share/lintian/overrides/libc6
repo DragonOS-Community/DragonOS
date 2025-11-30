@@ -1,0 +1,13 @@
+# ld.so must be executable, otherwise the system will not work
+shared-library-is-executable 0755 [*/ld*.so.*]
+
+# It is normal that the ELF dynamic linker does not need any other 
+# library
+shared-library-lacks-prerequisites */ld*.so.*
+
+# dependency on debconf is not needed, as glibc has a fallback to tty 
+missing-debconf-dependency-for-preinst
+
+# The call to systemctl in postinst is not about restarting services,
+# but restarting systemd.
+maintainer-script-calls-systemctl

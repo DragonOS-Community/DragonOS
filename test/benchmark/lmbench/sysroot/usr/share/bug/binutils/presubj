@@ -1,0 +1,25 @@
+When reporting binutils errors, please provide the actual input files
+and options given to the tool (gas, objcopy, ld, etc.) at run time.
+This can mean the difference between a pleasant debugging experience
+and a heisenbug that becomes unreproducible when gcc's code generation
+changes.
+
+For example, to create a testcase for an "ld" problem, first find the
+"gcc" command line that triggers the error:
+
+ $ make
+ ... output ending in an error ...
+ $ make V=1 VERBOSE=1 2>&1 | head -1
+
+Add "-v" after gcc and run it again.  One of the early output lines
+will be an invocation of collect2.  Replace collect2 with "ld" and
+it should reproduce the same error.  If you collect all the objects
+(including system libraries) mentioned on the "ld" command line in a
+tarball and send it along with the ld command line then that is a
+testcase.
+
+A possible step after that is to try omitting some objects from the
+ld command line and see if it still triggers the same error, but
+that's just icing on the cake.
+
+Happy debugging!

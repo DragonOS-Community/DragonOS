@@ -24,6 +24,7 @@ sync_test
 #chown_test
 chdir_test
 fchdir_test
+pread64_test
 rename_test
 getdents_test
 preadv_test

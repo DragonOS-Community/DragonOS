@@ -524,7 +524,7 @@ impl File {
     pub fn readable(&self) -> Result<(), SystemError> {
         let mode = *self.mode.read();
         // 暂时认为只要不是write only, 就可读
-        if mode == FileMode::O_WRONLY || mode.contains(FileMode::O_PATH) {
+        if mode.accmode() == FileMode::O_WRONLY.bits || mode.contains(FileMode::O_PATH) {
             return Err(SystemError::EBADF);
         }
 

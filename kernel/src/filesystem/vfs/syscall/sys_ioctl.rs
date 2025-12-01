@@ -2,6 +2,7 @@
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_IOCTL;
+use crate::filesystem::vfs::file::FileMode;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -44,8 +45,25 @@ impl Syscall for SysIoctlHandle {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        let r = file.inode().ioctl(cmd, data, &file.private_data.lock());
-        return r;
+
+        // 检查文件是否以 O_PATH 打开，如果是则返回 EBADF
+        if file.mode().contains(FileMode::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        let r = file
+            .inode()
+            .ioctl(cmd, data, &file.private_data.lock())
+            .map_err(|e| {
+                // 将内部错误码 ENOIOCTLCMD 转换为用户空间错误码 ENOTTY
+                if e == SystemError::ENOIOCTLCMD {
+                    SystemError::ENOIOCTLCMD
+                } else {
+                    e
+                }
+            });
+
+        r
     }
 
     /// Formats the syscall arguments for display/debugging purposes.

@@ -1,4 +1,5 @@
 use crate::arch::syscall::nr::SYS_FCNTL;
+use crate::filesystem::vfs::InodeFlags;
 use crate::process::RawPid;
 use crate::{
     arch::interrupt::TrapFrame,
@@ -155,10 +156,16 @@ impl SysFcntlHandle {
 
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     let arg = arg as u32;
-                    let mode = FileFlags::from_bits(arg).ok_or(SystemError::EINVAL)?;
+                    let new_flags = FileFlags::from_bits(arg).ok_or(SystemError::EINVAL)?;
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    file.set_flags(mode)?;
+                    let inode_flags = file.get_inode_flags()?;
+                    if inode_flags.contains(InodeFlags::S_APPEND)
+                        && !new_flags.contains(FileFlags::O_APPEND)
+                    {
+                        return Err(SystemError::EPERM);
+                    }
+                    file.set_flags(new_flags)?;
                     return Ok(0);
                 }
 

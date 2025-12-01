@@ -671,6 +671,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 将当前inode的内容同步到具体设备上
     fn sync(&self) -> Result<(), SystemError> {
+        // todo：完善元数据的同步
+        self.datasync()
+    }
+
+    /// @brief 仅同步数据到磁盘（不包括元数据）
+    ///
+    /// O_DSYNC 语义：确保数据写入完成，但不保证元数据（如 mtime）更新
+    /// 默认实现调用 sync（向后兼容）
+    fn datasync(&self) -> Result<(), SystemError> {
         let page_cache = self.page_cache();
         if let Some(page_cache) = page_cache {
             return page_cache.lock_irqsave().sync();

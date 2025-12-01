@@ -30,7 +30,10 @@ use system_error::SystemError;
 
 use super::{
     devfs::DeviceINode,
-    vfs::{vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, InodeFlags, Metadata},
+    vfs::{
+        vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, InodeFlags,
+        Metadata,
+    },
 };
 
 const DEV_PTYFS_MAX_NAMELEN: usize = 16;

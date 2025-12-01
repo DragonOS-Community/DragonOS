@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use log::{error, info};
 use system_error::SystemError;
 
+use crate::filesystem::vfs::InodeFlags;
 use crate::libs::casting::DowncastArc;
 use crate::{
     define_event_trace,
@@ -344,6 +345,21 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
     }
     if md.file_type != FileType::File {
         return Err(SystemError::EINVAL);
+    }
+
+    // S_IMMUTABLE 文件不能被截断
+    if md.flags.contains(InodeFlags::S_IMMUTABLE) {
+        return Err(SystemError::EPERM);
+    }
+
+    // S_APPEND 文件不能被截断（只能追加）
+    if md.flags.contains(InodeFlags::S_APPEND) {
+        return Err(SystemError::EPERM);
+    }
+
+    // S_SWAPFILE 文件不能被截断
+    if md.flags.contains(InodeFlags::S_SWAPFILE) {
+        return Err(SystemError::ETXTBSY);
     }
 
     // 只读挂载检查：若当前 fs 是 MountFS 且带 RDONLY 标志，拒绝写

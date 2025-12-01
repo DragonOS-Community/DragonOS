@@ -8,7 +8,6 @@ use log::error;
 use system_error::SystemError;
 
 use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::{filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
     arch::MMArch,
     driver::{
@@ -38,6 +37,7 @@ use crate::{
         ProcessControlBlock, ProcessManager, RawPid,
     },
 };
+use crate::{filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
@@ -168,7 +168,8 @@ bitflags! {
         /// set close_on_exec
         const O_CLOEXEC = 0o02000000;
         /// 每次write都等到物理I/O完成，包括write引起的文件属性的更新
-        const O_SYNC = 0o04000000;
+        const __O_SYNC = 0o04000000;
+        const O_SYNC = Self::__O_SYNC.bits | Self::O_DSYNC.bits;
 
         const O_PATH = 0o10000000;
 
@@ -373,6 +374,12 @@ impl File {
                 inode = pipe_inode;
             }
         }
+
+        let metadata = inode.metadata()?;
+        if metadata.flags.contains(InodeFlags::S_APPEND) {
+            flags.insert(FileFlags::O_APPEND);
+        }
+
         let close_on_exec = flags.contains(FileFlags::O_CLOEXEC);
         flags.remove(FileFlags::O_CLOEXEC);
 
@@ -588,8 +595,14 @@ impl File {
         // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
 
-        let metadata = self.inode.metadata()?;
-        if metadata.flags.contains(InodeFlags::S_IMMUTABLE) {
+        let inode_flags = self.get_inode_flags()?;
+        // 检查 S_IMMUTABLE
+        if inode_flags.contains(InodeFlags::S_IMMUTABLE) {
+            return Err(SystemError::EPERM);
+        }
+        // S_APPEND 的 inode 只能追加写入
+        if inode_flags.contains(InodeFlags::S_APPEND) && !self.flags().contains(FileFlags::O_APPEND)
+        {
             return Err(SystemError::EPERM);
         }
 
@@ -643,6 +656,28 @@ impl File {
         if update_offset {
             self.offset
                 .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+        }
+
+        let flags = self.flags();
+        // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
+        let need_data_sync = flags.contains(FileFlags::O_DSYNC);
+        // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
+        let need_metadata_sync = flags.contains(FileFlags::__O_SYNC);
+
+        // 也检查 inode 级别的 S_SYNC 标志
+        let inode_sync = self
+            .get_inode_flags()
+            .map(|f| f.contains(InodeFlags::S_SYNC))
+            .unwrap_or(false);
+
+        if need_data_sync || inode_sync {
+            if need_metadata_sync || inode_sync {
+                // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
+                self.inode.sync()?;
+            } else {
+                // O_DSYNC: 仅数据同步
+                self.inode.datasync()?;
+            }
         }
 
         Ok(written_len)
@@ -724,7 +759,7 @@ impl File {
         }
 
         // 检查读能力
-        if !mode.contains(FileMode::FMODE_CAN_READ) {
+        if !mode.can_read() {
             return Err(SystemError::EINVAL);
         }
 
@@ -747,7 +782,7 @@ impl File {
         }
 
         // 检查写能力
-        if !mode.contains(FileMode::FMODE_CAN_WRITE) {
+        if !mode.can_write() {
             return Err(SystemError::EINVAL);
         }
 
@@ -974,6 +1009,11 @@ impl File {
         // todo: update inode owner
         log::error!("set_owner has not been implemented yet");
         Ok(())
+    }
+
+    pub fn get_inode_flags(&self) -> Result<InodeFlags, SystemError> {
+        let metadata = self.inode.metadata()?;
+        Ok(metadata.flags)
     }
 }
 

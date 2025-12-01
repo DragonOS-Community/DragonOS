@@ -9,15 +9,12 @@ use super::{
     vcore::resolve_parent_inode,
     FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-use crate::{
-    driver::base::block::SeekFrom, process::ProcessManager,
-    syscall::user_access::check_and_clone_cstr,
-};
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
     process::cred::GroupInfo,
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
+use crate::{process::ProcessManager, syscall::user_access::check_and_clone_cstr};
 use alloc::string::String;
 
 pub(super) fn do_faccessat(
@@ -214,11 +211,6 @@ fn do_sys_openat2(
     // 创建文件对象
 
     let file: File = File::new(inode, how.o_flags)?;
-
-    // 打开模式为“追加”
-    if how.o_flags.contains(FileFlags::O_APPEND) {
-        file.lseek(SeekFrom::SeekEnd(0))?;
-    }
 
     // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
     if how.o_flags.contains(FileFlags::O_TRUNC)

@@ -12,7 +12,7 @@ use crate::init::boot::boot_callbacks;
 use crate::init::initcall::INITCALL_ROOTFS;
 use crate::libs::decompress::xz_decompress;
 use crate::libs::spinlock::SpinLock;
-use crate::process::namespace::mnt::MountPropagation;
+use crate::process::namespace::propagation::MountPropagation;
 use cpio_reader::Mode;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -203,12 +203,8 @@ pub fn initramfs_init() -> Result<(), SystemError> {
             log::error!("initramfs: failed to get utf8_name, err is {}", err);
             SystemError::EINVAL
         })?;
-        let new_inode = parent_inode.create_with_data(
-            filename,
-            FileType::SymLink,
-            ModeType::from_bits_truncate(0o777),
-            0,
-        )?;
+        let new_inode =
+            parent_inode.create_with_data(filename, FileType::SymLink, ModeType::S_IRWXUGO, 0)?;
         let buf = other_name.as_bytes();
         let len = buf.len();
         new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;

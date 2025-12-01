@@ -639,7 +639,7 @@ impl KernFSInode {
         let inode = self.inner_create(
             name,
             KernInodeType::SymLink,
-            ModeType::S_IFLNK | ModeType::from_bits_truncate(0o777),
+            ModeType::S_IFLNK | ModeType::S_IRWXUGO,
             0,
             None,
             None,

@@ -1,3 +1,17 @@
+#!/bin/bash
+#
+# DragonOS QEMU启动脚本
+#
+# 环境变量支持:
+# - DRAGONOS_LOGLEVEL: 设置内核日志级别 (0-7)
+#   0: EMERG   1: ALERT   2: CRIT   3: ERR
+#   4: WARN    5: NOTICE  6: INFO   7: DEBUG
+#   示例: export DRAGONOS_LOGLEVEL=4  # 只显示WARN及以上级别的日志
+#
+# - AUTO_TEST: 自动测试选项
+# - SYSCALL_TEST_DIR: 系统调用测试目录
+#
+
 check_dependencies()
 {
     # Check if qemu is installed
@@ -201,8 +215,29 @@ setup_kernel_init_program() {
     fi
 }
 
+# 检测环境变量并设置内核命令行参数
+setup_kernel_cmdline_from_env() {
+    # 检测 DRAGONOS_LOGLEVEL 环境变量
+    # 设置内核日志级别，支持0-7:
+    # 0: EMERG   1: ALERT   2: CRIT   3: ERR
+    # 4: WARN    5: NOTICE  6: INFO   7: DEBUG
+    if [ -n "${DRAGONOS_LOGLEVEL}" ]; then
+        KERNEL_CMDLINE+=" loglevel=${DRAGONOS_LOGLEVEL} "
+        echo "[INFO] Setting kernel loglevel to ${DRAGONOS_LOGLEVEL} from environment variable"
+    fi
+
+    # 检测其他环境变量可以在这里添加
+    # 例如：
+    # if [ -n "${DRAGONOS_DEBUG}" ]; then
+    #     KERNEL_CMDLINE+=" debug "
+    # fi
+}
+
 # 设置内核init程序
 setup_kernel_init_program
+
+# 从环境变量设置内核命令行参数
+setup_kernel_cmdline_from_env
 
 
 if [ ${QEMU_NOGRAPHIC} == true ]; then

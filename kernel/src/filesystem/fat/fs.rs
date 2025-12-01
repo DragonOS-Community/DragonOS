@@ -237,7 +237,7 @@ impl LockedFATInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type,
-                mode: ModeType::from_bits_truncate(0o777),
+                mode: ModeType::S_IRWXUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -502,7 +502,7 @@ impl FATFileSystem {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
-                mode: ModeType::from_bits_truncate(0o777),
+                mode: ModeType::S_IRWXUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -1999,18 +1999,28 @@ impl IndexNode for LockedFATInode {
         mode: ModeType,
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let inode = self.0.lock();
+        let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-        drop(inode);
+
+        let mode = if (mode.bits() & ModeType::S_IFMT.bits()) == 0 {
+            mode | ModeType::S_IFREG
+        } else {
+            mode
+        };
+        let umask = crate::process::ProcessManager::current_pcb()
+            .fs_struct()
+            .umask();
+        let final_mode = mode & !umask;
 
         // 判断需要创建的类型
-        if unlikely(mode.contains(ModeType::S_IFREG)) {
+        if unlikely(final_mode.contains(ModeType::S_IFREG)) {
             // 普通文件
+            drop(inode);
             return self.create(filename, FileType::File, mode);
         }
-        let mut inode = self.0.lock();
+
         let dname = DName::from(filename);
         let nod = LockedFATInode::new(
             dname,
@@ -2019,16 +2029,16 @@ impl IndexNode for LockedFATInode {
             FATDirEntry::File(FATFile::default()),
         );
 
-        if mode.contains(ModeType::S_IFIFO) {
+        if final_mode.contains(ModeType::S_IFIFO) {
             nod.0.lock().metadata.file_type = FileType::Pipe;
             // 创建pipe文件
             let pipe_inode = LockedPipeInode::new();
             // 设置special_node
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-        } else if mode.contains(ModeType::S_IFBLK) {
+        } else if final_mode.contains(ModeType::S_IFBLK) {
             nod.0.lock().metadata.file_type = FileType::BlockDevice;
             unimplemented!()
-        } else if mode.contains(ModeType::S_IFCHR) {
+        } else if final_mode.contains(ModeType::S_IFCHR) {
             nod.0.lock().metadata.file_type = FileType::CharDevice;
             unimplemented!()
         } else {

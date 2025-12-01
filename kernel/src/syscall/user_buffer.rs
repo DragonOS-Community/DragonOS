@@ -45,6 +45,10 @@ impl<'a> UserBuffer<'a> {
         self.len == 0
     }
 
+    pub fn user_addr(&self) -> VirtAddr {
+        self.user_addr
+    }
+
     /// 从用户缓冲区读取数据到内核缓冲区
     ///
     /// # 参数

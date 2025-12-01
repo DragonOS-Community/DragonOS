@@ -247,7 +247,7 @@ pub fn do_mkdir_at(
         final_mode_bits |= ModeType::S_ISGID.bits();
     }
     let umask = pcb.fs_struct().umask();
-    let final_mode = ModeType::from_bits_truncate(final_mode_bits & !umask);
+    let final_mode = ModeType::from_bits_truncate(final_mode_bits) & !umask;
 
     // 执行创建
     return current_inode.mkdir(name, final_mode);

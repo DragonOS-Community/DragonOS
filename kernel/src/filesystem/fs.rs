@@ -51,14 +51,16 @@ impl FsStruct {
         }
     }
 
-    pub fn umask(&self) -> u32 {
-        self.umask.load(Ordering::SeqCst)
+    pub fn umask(&self) -> ModeType {
+        ModeType::from_bits_truncate(self.umask.load(Ordering::SeqCst))
     }
 
     /// Linux: xchg(&current->fs->umask, mask & S_IRWXUGO)
-    pub fn set_umask(&self, mask: u32) -> u32 {
-        self.umask
-            .swap(mask & ModeType::S_IRWXUGO.bits(), Ordering::SeqCst)
+    pub fn set_umask(&self, mask: ModeType) -> ModeType {
+        ModeType::from_bits_truncate(
+            self.umask
+                .swap(mask.bits() & ModeType::S_IRWXUGO.bits(), Ordering::SeqCst),
+        )
     }
 
     pub fn set_root(&self, inode: Arc<dyn IndexNode>) {

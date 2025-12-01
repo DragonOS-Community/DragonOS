@@ -2012,7 +2012,7 @@ impl IndexNode for LockedFATInode {
         let umask = crate::process::ProcessManager::current_pcb()
             .fs_struct()
             .umask();
-        let final_mode = ModeType::from_bits_truncate(mode.bits() & !umask);
+        let final_mode = mode & !umask;
 
         // 判断需要创建的类型
         if unlikely(final_mode.contains(ModeType::S_IFREG)) {

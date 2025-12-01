@@ -203,12 +203,8 @@ pub fn initramfs_init() -> Result<(), SystemError> {
             log::error!("initramfs: failed to get utf8_name, err is {}", err);
             SystemError::EINVAL
         })?;
-        let new_inode = parent_inode.create_with_data(
-            filename,
-            FileType::SymLink,
-            ModeType::from_bits_truncate(0o777),
-            0,
-        )?;
+        let new_inode =
+            parent_inode.create_with_data(filename, FileType::SymLink, ModeType::S_IRWXUGO, 0)?;
         let buf = other_name.as_bytes();
         let len = buf.len();
         new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;

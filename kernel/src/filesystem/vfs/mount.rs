@@ -1277,7 +1277,7 @@ pub fn do_mount_mkdir(
     let inode = do_mkdir_at(
         AtFlags::AT_FDCWD.bits(),
         mount_point,
-        FileMode::from_bits_truncate(0o755),
+        ModeType::from_bits_truncate(0o755),
     )?;
     let result = ProcessManager::current_mntns().get_mount_point(mount_point);
     if let Some((_, rest, _fs)) = result {

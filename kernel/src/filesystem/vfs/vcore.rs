@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use log::{error, info};
 use system_error::SystemError;
 
+use crate::filesystem::vfs::permission::PermissionMask;
 use crate::libs::casting::DowncastArc;
 use crate::{
     define_event_trace,
@@ -21,7 +22,6 @@ use crate::{
 };
 
 use super::{
-    file::FileMode,
     stat::LookUpFlags,
     utils::{rsplit_path, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -182,9 +182,9 @@ pub fn change_root_fs() -> Result<(), SystemError> {
 define_event_trace!(
     do_mkdir_at,
     TP_system(vfs),
-    TP_PROTO(path:&str, mode: FileMode),
+    TP_PROTO(path:&str, mode: ModeType),
     TP_STRUCT__entry {
-        fmode: FileMode,
+        fmode: ModeType,
         path: [u8;64],
     },
     TP_fast_assign {
@@ -205,21 +205,52 @@ define_event_trace!(
         format!("mkdir at {} with mode {:?}", path, mode)
     })
 );
+
 /// @brief 创建文件/文件夹
 pub fn do_mkdir_at(
     dirfd: i32,
     path: &str,
-    mode: FileMode,
+    mode: ModeType,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     trace_do_mkdir_at(path, mode);
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
     let (mut current_inode, path) =
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
-    let (name, parent) = rsplit_path(&path);
+    // Linux 返回 EEXIST
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return Err(SystemError::EEXIST);
+    }
+    let (name, parent) = rsplit_path(path);
+    if name == "." || name == ".." {
+        return Err(SystemError::EEXIST);
+    }
     if let Some(parent) = parent {
         current_inode =
             current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     }
-    return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
+    let parent_md = current_inode.metadata()?;
+    // 确保父节点是目录
+    if parent_md.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    let pcb = ProcessManager::current_pcb();
+    let cred = pcb.cred();
+    cred.inode_permission(&parent_md, PermissionMask::MAY_EXEC.bits())?;
+    if current_inode.find(name).is_ok() {
+        return Err(SystemError::EEXIST);
+    }
+    let mut final_mode_bits = mode.bits() & ModeType::S_IRWXUGO.bits();
+    if (parent_md.mode.bits() & ModeType::S_ISGID.bits()) != 0 {
+        final_mode_bits |= ModeType::S_ISGID.bits();
+    }
+    let umask = pcb.fs_struct().umask();
+    let final_mode = ModeType::from_bits_truncate(final_mode_bits) & !umask;
+
+    // 执行创建
+    return current_inode.mkdir(name, final_mode);
 }
 
 /// 解析父目录inode

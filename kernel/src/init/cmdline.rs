@@ -182,19 +182,19 @@ impl KernelCmdlineArg {
 }
 
 pub struct KernelCmdlineKV {
-    name: &'static str,
-    value: Option<CString>,
-    initialized: bool,
-    default: &'static str,
+    pub name: &'static str,
+    pub value: Option<CString>,
+    pub initialized: bool,
+    pub default: &'static str,
 }
 
 /// 在内存管理初始化之前的KV参数
 pub struct KernelCmdlineEarlyKV {
-    name: &'static str,
-    value: [u8; Self::VALUE_MAX_LEN],
-    index: usize,
-    initialized: bool,
-    default: &'static str,
+    pub name: &'static str,
+    pub value: [u8; Self::VALUE_MAX_LEN],
+    pub index: usize,
+    pub initialized: bool,
+    pub default: &'static str,
 }
 
 #[allow(dead_code)]
@@ -383,6 +383,8 @@ impl KernelCmdlineManager {
         fence(Ordering::SeqCst);
         // 初始化默认值
         self.default_initialize();
+        // 处理loglevel参数
+        crate::debug::klog::loglevel::handle_loglevel_param();
         fence(Ordering::SeqCst);
     }
 

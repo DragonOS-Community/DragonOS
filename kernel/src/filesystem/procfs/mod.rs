@@ -15,9 +15,12 @@ use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
-        procfs::proc_thread_self_ns::{
-            current_thread_self_ns_ino, open_thread_self_ns_file, read_thread_self_ns_link,
-            ThreadSelfNsFileType,
+        procfs::{
+            proc_thread_self_ns::{
+                current_thread_self_ns_ino, open_thread_self_ns_file, read_thread_self_ns_link,
+                ThreadSelfNsFileType,
+            },
+            sys::sysctl::PrintkSysctl,
         },
         vfs::{
             mount::{MountFlags, MountPath},
@@ -43,13 +46,14 @@ use super::vfs::{
     FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
+pub mod klog;
 pub mod kmsg;
-pub mod log;
 mod proc_cpuinfo;
 mod proc_mounts;
 mod proc_thread_self_ns;
 mod proc_version;
 mod procfs_setup;
+mod sys;
 mod syscall;
 
 /// @brief 进程文件类型
@@ -77,6 +81,8 @@ pub enum ProcFileType {
     ProcThreadSelfNsRoot,
     /// /proc/thread-self/ns/* namespace files
     ProcThreadSelfNsChild(ThreadSelfNsFileType),
+    /// /proc/sys/kernel/printk
+    ProcSysKernelPrintk,
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -787,7 +793,8 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcKmsg
             | ProcFileType::ProcFdDir
             | ProcFileType::ProcFdFile
-            | ProcFileType::ProcThreadSelfNsRoot => 0,
+            | ProcFileType::ProcThreadSelfNsRoot
+            | ProcFileType::ProcSysKernelPrintk => 0,
         };
 
         // 为不同类型的 procfs 节点设置文件私有数据
@@ -871,6 +878,12 @@ impl IndexNode for LockedProcFSInode {
                 return read_thread_self_ns_link(ns_type, buf, offset)
             }
 
+            ProcFileType::ProcSysKernelPrintk => {
+                // 使用 PrintkSysctl 处理 /proc/sys/kernel/printk 文件读取
+                let buflen = buf.len().min(len);
+                return PrintkSysctl.read_to_buffer(&mut buf[..buflen]);
+            }
+
             _ => (),
         };
 
@@ -891,12 +904,32 @@ impl IndexNode for LockedProcFSInode {
 
     fn write_at(
         &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &[u8],
+        offset: usize,
+        len: usize,
+        buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOSYS);
+        if offset > 0 {
+            // 不支持随机写入
+            return Err(SystemError::EINVAL);
+        }
+
+        let inode = self.0.lock();
+
+        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
+        if inode.metadata.file_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
+
+        // 根据文件类型处理写入
+        match inode.fdata.ftype {
+            ProcFileType::ProcSysKernelPrintk => {
+                // 使用 PrintkSysctl 处理 /proc/sys/kernel/printk 文件写入
+                let buflen = buf.len().min(len);
+                return PrintkSysctl.write_from_buffer(&buf[..buflen]);
+            }
+            _ => Err(SystemError::ENOSYS),
+        }
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

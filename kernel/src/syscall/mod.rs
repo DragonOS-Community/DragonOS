@@ -337,8 +337,6 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            SYS_SCHED_YIELD => Self::do_sched_yield(),
-
             SYS_FADVISE64 => {
                 // todo: 这个系统调用还没有实现
 

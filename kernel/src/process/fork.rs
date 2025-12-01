@@ -255,10 +255,17 @@ impl ProcessManager {
         clone_flags: &CloneFlags,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
+        // 先复制父进程的 flags
+        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+
+        // 然后根据 clone_flags 设置需要的标志
         if clone_flags.contains(CloneFlags::CLONE_VFORK) {
             new_pcb.flags().insert(ProcessFlags::VFORK);
         }
-        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+
+        // 标记新进程还未执行 exec
+        new_pcb.flags().insert(ProcessFlags::FORKNOEXEC);
+
         return Ok(());
     }
 
@@ -487,9 +494,6 @@ impl ProcessManager {
         if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
-
-        // 标记当前线程还未被执行exec
-        pcb.flags().insert(ProcessFlags::FORKNOEXEC);
 
         // 克隆 pidfd
         if clone_flags.contains(CloneFlags::CLONE_PIDFD) {

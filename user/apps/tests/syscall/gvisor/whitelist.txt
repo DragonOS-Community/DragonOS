@@ -39,6 +39,7 @@ fpsig_nested_test
 wait_test
 tkill_test
 tgkill_test
+kill_test
 prctl_test
 exit_test
 setns_test

@@ -182,26 +182,26 @@ impl FileFlags {
     ///
     /// 这是正确提取访问模式的方法,因为O_RDONLY=0不能用contains()检查
     #[inline]
-    pub fn access_flags(&self) -> u32 {
-        self.bits() & Self::O_ACCMODE.bits()
+    pub fn access_flags(&self) -> FileFlags {
+        *self & Self::O_ACCMODE
     }
 
     /// @brief 检查是否是只读模式
     #[inline]
     pub fn is_read_only(&self) -> bool {
-        self.access_flags() == Self::O_RDONLY.bits()
+        self.access_flags() == Self::O_RDONLY
     }
 
     /// @brief 检查是否是只写模式
     #[inline]
     pub fn is_write_only(&self) -> bool {
-        self.access_flags() == Self::O_WRONLY.bits()
+        self.access_flags() == Self::O_WRONLY
     }
 
     /// @brief 检查是否是读写模式
     #[inline]
     pub fn is_rdwr(&self) -> bool {
-        self.access_flags() == Self::O_RDWR.bits()
+        self.access_flags() == Self::O_RDWR
     }
 
     /// 检查是否设置了 FASYNC 标志
@@ -311,7 +311,7 @@ impl FileMode {
     /// - 以及对于抑制fsnotify/fanotify机制触发通知的标志FMODE_NONOTIFY
     pub fn open_fmode(flags: FileFlags) -> Self {
         let fmode = flags.bits() & FileMode::FMODE_NONOTIFY.bits()
-            | (flags.access_flags() + 1) & FileFlags::O_ACCMODE.bits();
+            | (flags.access_flags().bits + 1) & FileFlags::O_ACCMODE.bits();
 
         // 初始只设置访问模式,其他能力在后续设置
         FileMode::from_bits_truncate(fmode)
@@ -375,10 +375,21 @@ impl File {
     pub fn new(inode: Arc<dyn IndexNode>, mut flags: FileFlags) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
-        if file_type == FileType::Pipe {
+        // 检查是否为命名管道（FIFO）
+        let is_named_pipe = if file_type == FileType::Pipe {
             if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
                 inode = pipe_inode;
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+
+        // 对于命名管道，自动添加 O_LARGEFILE 标志（符合 Linux 行为）
+        if is_named_pipe {
+            flags.insert(FileFlags::O_LARGEFILE);
         }
 
         let metadata = inode.metadata()?;
@@ -1047,6 +1058,9 @@ impl Drop for File {
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     fds: Vec<Option<Arc<File>>>,
+    /// 下一个可能空闲的文件描述符号（用于优化分配，避免O(n²)扫描）
+    /// 类似于 Linux 的 fd_next_fd
+    next_fd: usize,
 }
 impl Default for FileDescriptorVec {
     fn default() -> Self {
@@ -1057,7 +1071,7 @@ impl FileDescriptorVec {
     /// 文件描述符表的初始容量
     pub const INITIAL_CAPACITY: usize = 1024;
     /// 文件描述符表的最大容量限制（防止无限扩容）
-    pub const MAX_CAPACITY: usize = 65536;
+    pub const MAX_CAPACITY: usize = 1048576;
 
     #[inline(never)]
     pub fn new() -> FileDescriptorVec {
@@ -1065,7 +1079,10 @@ impl FileDescriptorVec {
         data.resize(FileDescriptorVec::INITIAL_CAPACITY, None);
 
         // 初始化文件描述符数组结构体
-        return FileDescriptorVec { fds: data };
+        return FileDescriptorVec {
+            fds: data,
+            next_fd: 0,
+        };
     }
 
     /// @brief 克隆一个文件描述符数组
@@ -1081,6 +1098,8 @@ impl FileDescriptorVec {
                 res.fds[i] = Some(file.clone());
             }
         }
+        // 复制 next_fd 以保持相同的分配状态
+        res.next_fd = self.next_fd;
         return res;
     }
 
@@ -1119,6 +1138,10 @@ impl FileDescriptorVec {
             let target = core::cmp::max(new_capacity, floor);
             if target < current_len {
                 self.fds.truncate(target);
+                // 确保 next_fd 不超过新的容量
+                if self.next_fd > target {
+                    self.next_fd = target;
+                }
             }
         }
         Ok(())
@@ -1176,19 +1199,48 @@ impl FileDescriptorVec {
             let x = &mut self.fds[new_fd as usize];
             if x.is_none() {
                 *x = Some(Arc::new(file));
+                // 更新 next_fd：如果分配的是 next_fd 位置，则推进到下一个
+                if new_fd as usize == self.next_fd {
+                    self.next_fd = new_fd as usize + 1;
+                }
                 return Ok(new_fd);
             } else {
                 return Err(SystemError::EBADF);
             }
         } else {
-            // 没有指定要申请的文件描述符编号，在有效范围内查找空位
+            // 没有指定要申请的文件描述符编号
+            // 使用 next_fd 作为起始搜索位置，避免每次都从0开始扫描 (O(n²) -> O(n))
             let max_search = core::cmp::min(self.fds.len(), nofile_limit);
-            for i in 0..max_search {
+
+            // 从 next_fd 开始查找空位
+            for i in self.next_fd..max_search {
                 if self.fds[i].is_none() {
                     self.fds[i] = Some(Arc::new(file));
+                    // 更新 next_fd 为下一个位置
+                    self.next_fd = i + 1;
                     return Ok(i as i32);
                 }
             }
+
+            // 当前容量内没有空位，尝试扩容
+            // 计算新的容量：当前容量翻倍，但不超过 nofile_limit
+            let current_len = self.fds.len();
+            if current_len < nofile_limit {
+                // 扩容策略：翻倍或增加到 nofile_limit，取较小值
+                let new_capacity = core::cmp::min(
+                    core::cmp::max(current_len * 2, current_len + 1),
+                    nofile_limit,
+                );
+                self.resize_to_capacity(new_capacity)?;
+
+                // 扩容后，第一个新位置就是空的
+                let new_fd = current_len;
+                self.fds[new_fd] = Some(Arc::new(file));
+                // 更新 next_fd
+                self.next_fd = new_fd + 1;
+                return Ok(new_fd as i32);
+            }
+
             return Err(SystemError::EMFILE);
         }
     }
@@ -1240,6 +1292,14 @@ impl FileDescriptorVec {
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
+
+        // 更新 next_fd：如果释放的fd比当前next_fd小，则更新next_fd
+        // 这确保下次分配时可以复用较小的fd号，符合POSIX语义
+        // （POSIX要求分配最小可用的fd号）
+        if (fd as usize) < self.next_fd {
+            self.next_fd = fd as usize;
+        }
+
         return Ok(file);
     }
 

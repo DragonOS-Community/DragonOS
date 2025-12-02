@@ -609,7 +609,17 @@ impl PageFaultHandler {
         let vma = pfm.vma();
         let vma_guard = vma.lock_irqsave();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
-        let page_cache = file.inode().page_cache().unwrap();
+        let page_cache = match file.inode().page_cache() {
+            Some(cache) => cache,
+            None => {
+                // 文件没有页面缓存，可能是不支持内存映射的设备文件
+                log::warn!(
+                    "filemap_map_pages: file has no page cache, inode type: {}",
+                    crate::libs::name::get_type_name(&file.inode())
+                );
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
+        };
         let mapper = &mut pfm.mapper;
 
         // 起始页地址
@@ -650,7 +660,17 @@ impl PageFaultHandler {
         let vma = pfm.vma();
         let vma_guard = vma.lock_irqsave();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
-        let page_cache = file.inode().page_cache().unwrap();
+        let page_cache = match file.inode().page_cache() {
+            Some(cache) => cache,
+            None => {
+                // 文件没有页面缓存，可能是不支持内存映射的设备文件
+                log::warn!(
+                    "filemap_fault: file has no page cache, inode type: {}",
+                    crate::libs::name::get_type_name(&file.inode())
+                );
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
+        };
         let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
         let mut ret = VmFaultReason::empty();
 

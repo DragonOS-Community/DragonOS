@@ -170,7 +170,6 @@ impl<'a> ProcFileCreationParamsBuilder<'a> {
 
 /// @brief 节点私有信息结构体
 /// @usage 用于传入各类文件所需的信息
-#[derive(Debug)]
 pub struct InodeInfo {
     ///进程的pid
     pid: Option<RawPid>,
@@ -178,7 +177,20 @@ pub struct InodeInfo {
     ftype: ProcFileType,
     /// 文件描述符
     fd: i32,
+    /// 对于 /proc/self/fd/N 这种魔法链接，存储原始文件的 inode
+    target_inode: Option<Arc<dyn IndexNode>>,
     // 其他需要传入的信息在此定义
+}
+
+impl core::fmt::Debug for InodeInfo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InodeInfo")
+            .field("pid", &self.pid)
+            .field("ftype", &self.ftype)
+            .field("fd", &self.fd)
+            .field("target_inode", &self.target_inode.is_some())
+            .finish()
+    }
 }
 
 /// @brief procfs的inode名称的最大长度
@@ -573,6 +585,7 @@ impl ProcFS {
                     pid: None,
                     ftype: ProcFileType::Default,
                     fd: -1,
+                    target_inode: None,
                 },
                 dname: DName::default(),
             })));
@@ -710,15 +723,23 @@ impl LockedProcFSInode {
         let fd_table = pcb.fd_table();
         let fd_table = fd_table.read();
         let file = fd_table.get_file_by_fd(fd);
-        if file.is_some() {
+        if let Some(file) = file {
+            // 获取原始文件的 inode
+            let target_inode = file.inode();
+            drop(fd_table);
+
             let _ = self.unlink(&fd.to_string());
             let fd_file = self.create(&fd.to_string(), FileType::SymLink, ModeType::S_IRUGO)?;
             let fd_file_proc = fd_file
                 .as_any_ref()
                 .downcast_ref::<LockedProcFSInode>()
                 .unwrap();
-            fd_file_proc.0.lock().fdata.fd = fd;
-            fd_file_proc.0.lock().fdata.ftype = ProcFileType::ProcFdFile;
+            let mut guard = fd_file_proc.0.lock();
+            guard.fdata.fd = fd;
+            guard.fdata.ftype = ProcFileType::ProcFdFile;
+            // 存储原始文件的 inode，用于魔法链接
+            guard.fdata.target_inode = Some(target_inode);
+            drop(guard);
             return Ok(fd_file);
         } else {
             return Err(SystemError::ENOENT);
@@ -1026,6 +1047,7 @@ impl IndexNode for LockedProcFSInode {
                     pid: None,
                     ftype: ProcFileType::Default,
                     fd: -1,
+                    target_inode: None,
                 },
                 dname: dname.clone(),
             })));
@@ -1247,6 +1269,17 @@ impl IndexNode for LockedProcFSInode {
 
     fn dname(&self) -> Result<DName, SystemError> {
         Ok(self.0.lock().dname.clone())
+    }
+
+    fn special_node(&self) -> Option<super::vfs::SpecialNodeData> {
+        let guard = self.0.lock();
+        // 对于 /proc/self/fd/N 这种魔法链接，返回原始文件的 inode
+        if guard.fdata.ftype == ProcFileType::ProcFdFile {
+            if let Some(target_inode) = &guard.fdata.target_inode {
+                return Some(super::vfs::SpecialNodeData::Reference(target_inode.clone()));
+            }
+        }
+        None
     }
 }
 

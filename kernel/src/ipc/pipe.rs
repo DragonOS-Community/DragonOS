@@ -1,6 +1,5 @@
 use crate::{
-    arch::ipc::signal::Signal,
-    arch::MMArch,
+    arch::{ipc::signal::Signal, MMArch},
     filesystem::{
         epoll::{
             event_poll::{EventPoll, LockedEPItemLinkedList},
@@ -19,6 +18,7 @@ use crate::{
     mm::MemoryManagementArch,
     process::{ProcessFlags, ProcessManager, ProcessState},
     sched::SchedMode,
+    syscall::user_access::UserBufferWriter,
     time::PosixTimeSpec,
 };
 use alloc::boxed::Box;
@@ -34,6 +34,9 @@ use super::signal_types::{SigInfo, SigType};
 /// 管道缓冲区大小（至少为一页大小，以支持原子写入）
 /// Linux 的 PIPE_BUF 通常是 4096 字节，默认管道容量是 65536 字节
 pub const PIPE_BUFF_SIZE: usize = 65536;
+
+// FIONREAD: 获取管道中可读的字节数
+const FIONREAD: u32 = 0x541B;
 
 // 管道文件系统 - 全局单例
 lazy_static! {
@@ -619,5 +622,28 @@ impl IndexNode for LockedPipeInode {
 
     fn absolute_path(&self) -> Result<String, SystemError> {
         Ok(String::from("pipe"))
+    }
+
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        match cmd {
+            FIONREAD => {
+                let inner = self.inner.lock();
+                let available = inner.valid_cnt;
+                drop(inner);
+
+                let mut writer =
+                    UserBufferWriter::new(data as *mut u8, core::mem::size_of::<i32>(), true)?;
+                writer
+                    .buffer_protected(0)?
+                    .write_one::<i32>(0, &available)?;
+                Ok(0)
+            }
+            _ => Err(SystemError::ENOSYS),
+        }
     }
 }

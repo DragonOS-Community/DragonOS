@@ -112,6 +112,8 @@ pub enum SpecialNodeData {
     CharDevice(Arc<dyn CharDevice>),
     /// 块设备
     BlockDevice(Arc<dyn BlockDevice>),
+    /// 指向其他 inode 的引用（用于 /proc/self/fd/N 这种魔法链接）
+    Reference(Arc<dyn IndexNode>),
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -847,6 +849,22 @@ impl dyn IndexNode {
 
             // 跟随符号链接跳转
             if file_type == FileType::SymLink && max_follow_times > 0 {
+                // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
+                // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
+                // 但它们有一个 special_node 指向真实的 inode
+                if let Some(SpecialNodeData::Reference(target_inode)) = inode.special_node() {
+                    // 如果还有剩余路径，继续在目标 inode 上查找
+                    if rest_path.is_empty() {
+                        return Ok(target_inode);
+                    } else {
+                        return target_inode.lookup_follow_symlink2(
+                            &rest_path,
+                            max_follow_times - 1,
+                            follow_final_symlink,
+                        );
+                    }
+                }
+
                 let mut content = [0u8; 256];
                 // 读取符号链接
                 // TODO:We need to clarify which interfaces require private data and which do not

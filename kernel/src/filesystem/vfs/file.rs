@@ -177,10 +177,16 @@ bitflags! {
 }
 
 impl FileMode {
-    /// @brief 获取文件的访问模式的值
+    /// 获取文件的访问模式的值
     #[inline]
     pub fn accmode(&self) -> u32 {
         return self.bits() & FileMode::O_ACCMODE.bits();
+    }
+
+    /// 检查是否设置了 FASYNC 标志
+    #[inline]
+    pub fn fasync(&self) -> bool {
+        self.contains(FileMode::FASYNC)
     }
 }
 
@@ -732,7 +738,12 @@ impl File {
     }
 
     pub fn owner(&self) -> Option<RawPid> {
-        self.pid.lock().as_ref().map(|pcb| pcb.raw_pid())
+        self.pid.lock().as_ref().map(|pcb| pcb.pid().pid_vnr())
+    }
+
+    /// Get the owner process control block
+    pub fn get_owner(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.pid.lock().clone()
     }
 
     /// Set a process (group) as owner of the file descriptor.
@@ -748,7 +759,6 @@ impl File {
 
         self.pid.lock().replace(pcb);
         // todo: update inode owner
-        log::error!("set_owner has not been implemented yet");
         Ok(())
     }
 }

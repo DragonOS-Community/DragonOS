@@ -1,3 +1,4 @@
+pub mod fasync;
 pub mod fcntl;
 pub mod file;
 pub mod iov;
@@ -182,6 +183,26 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
         epitm: &Arc<EPollItem>,
         private_data: &FilePrivateData,
     ) -> Result<(), SystemError>;
+
+    /// Add a fasync item for SIGIO notification
+    fn add_fasync(
+        &self,
+        _fasync_item: Arc<fasync::FAsyncItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        // Default implementation: not supported
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Remove a fasync item
+    fn remove_fasync(
+        &self,
+        _file: &alloc::sync::Weak<file::File>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        // Default implementation: not supported
+        Err(SystemError::ENOSYS)
+    }
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {

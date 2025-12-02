@@ -183,6 +183,7 @@ pub fn create_unix_socket(
 ) -> Result<Arc<dyn Socket>, SystemError> {
     let socket = match socket_type {
         PSOCK::Stream => UnixStreamSocket::new(is_nonblocking, false),
+        PSOCK::SeqPacket => UnixStreamSocket::new(is_nonblocking, true),
         PSOCK::Packet => UnixStreamSocket::new(is_nonblocking, true),
         _ => {
             return Err(SystemError::ESOCKTNOSUPPORT);

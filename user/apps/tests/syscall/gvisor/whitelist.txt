@@ -67,3 +67,4 @@ sigtimedwait_test
 # 其他测试
 itimer_test
 pipe_test
+unshare_test

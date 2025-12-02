@@ -5,6 +5,7 @@ use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_PWRITEV;
 use crate::filesystem::vfs::iov::{IoVec, IoVecs};
+use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 
@@ -92,6 +93,16 @@ pub fn do_pwritev(fd: i32, buf: &[u8], offset: usize) -> Result<usize, SystemErr
 
     // 释放 fd_table_guard 的读锁
     drop(fd_table_guard);
+
+    // 检查是否是管道/Socket (ESPIPE)
+    let md = file.metadata()?;
+    if md.file_type == FileType::Pipe
+        || md.file_type == FileType::Socket
+        || md.file_type == FileType::CharDevice
+    {
+        return Err(SystemError::ESPIPE);
+    }
+
     file.pwrite(offset, buf.len(), buf)
 }
 

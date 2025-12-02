@@ -169,6 +169,47 @@ pub fn kernel_waitid(
     Ok(0)
 }
 
+/// 检查子进程是否可以被当前线程等待
+///
+/// 根据 Linux wait 语义：
+/// - 默认情况下，线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
+/// - 如果指定了 __WNOTHREAD，则只能等待当前线程自己创建的子进程
+///
+/// # 参数
+/// - `child_pcb`: 要检查的子进程
+/// - `options`: 等待选项
+///
+/// # 返回值
+/// 返回 true 如果当前线程可以等待该子进程
+fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) -> bool {
+    let current = ProcessManager::current_pcb();
+    let current_tgid = current.tgid;
+
+    // 获取子进程的 real_parent
+    let child_parent = match child_pcb.real_parent_pcb() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    if options.contains(WaitOption::WNOTHREAD) {
+        // 带 __WNOTHREAD：只能等待当前线程自己创建的子进程
+        // 检查子进程的 real_parent 是否就是当前线程
+        Arc::ptr_eq(&child_parent, &current)
+    } else {
+        // 默认情况：线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程
+        // 检查子进程的 real_parent 的 tgid 是否与当前线程的 tgid 相同
+        child_parent.tgid == current_tgid
+    }
+}
+
+/// 获取当前线程组 leader 的 PCB
+///
+/// 用于在 wait 时遍历整个线程组的 children
+fn get_thread_group_leader(pcb: &Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
+    let ti = pcb.thread.read_irqsave();
+    ti.group_leader().unwrap_or_else(|| pcb.clone())
+}
+
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/exit.c#1573
 fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
     let mut retval: Result<usize, SystemError> = Ok(0);
@@ -207,11 +248,13 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
                 let child_pcb = pid.pid_task(PidType::PID).ok_or(SystemError::ECHILD)?;
 
-                let parent = ProcessManager::current_pcb();
+                let current = ProcessManager::current_pcb();
 
-                // 检查是否是当前进程的子进程，否则返回ECHILD
-                let is_child = parent.children.read().contains(&child_pcb.raw_pid());
-                if !is_child {
+                // 检查子进程是否可以被当前线程等待
+                // 根据 Linux 语义：
+                // - 默认情况下，线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
+                // - 如果指定了 __WNOTHREAD，则只能等待当前线程自己创建的子进程
+                if !is_eligible_child(&child_pcb, kwo.options) {
                     return Err(SystemError::ECHILD);
                 }
 
@@ -219,6 +262,13 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 if !child_matches_wait_options(&child_pcb, kwo.options) {
                     return Err(SystemError::ECHILD);
                 }
+
+                // 获取用于等待的 PCB（线程组 leader 或当前线程，取决于 WNOTHREAD）
+                let parent = if kwo.options.contains(WaitOption::WNOTHREAD) {
+                    current.clone()
+                } else {
+                    get_thread_group_leader(&current)
+                };
 
                 // 等待指定子进程：睡眠在父进程自己的 wait_queue 上
                 // 子进程退出时会发送信号并唤醒父进程的 wait_queue
@@ -265,8 +315,16 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 }
             }
             PidConverter::All => {
-                // 等待任意子进程：使用父进程的 wait_queue，避免丢唤醒
-                let parent = ProcessManager::current_pcb();
+                // 等待任意子进程：使用线程组 leader 的 wait_queue 和 children 列表
+                // 这样线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
+                let current = ProcessManager::current_pcb();
+                let parent = if kwo.options.contains(WaitOption::WNOTHREAD) {
+                    // 带 __WNOTHREAD：只使用当前线程的 children
+                    current.clone()
+                } else {
+                    // 默认：使用线程组 leader 的 children
+                    get_thread_group_leader(&current)
+                };
                 loop {
                     // 注册等待
                     let _ = parent.wait_queue.prepare_to_wait_event(true);
@@ -284,6 +342,11 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     for pid in rd_childen.iter() {
                         let pcb =
                             ProcessManager::find_task_by_vpid(*pid).ok_or(SystemError::ECHILD)?;
+
+                        // 检查子进程是否可以被当前线程等待（考虑 __WNOTHREAD）
+                        if !is_eligible_child(&pcb, kwo.options) {
+                            continue;
+                        }
 
                         // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
                         if !child_matches_wait_options(&pcb, kwo.options) {
@@ -387,8 +450,13 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             PidConverter::Pgid(Some(pgid)) => {
                 // 修复：根据 Linux waitpid 语义，waitpid(-pgid, ...) 只等待调用者的
                 // **子进程**中属于指定进程组的进程，而不是进程组中的所有进程。
-                // 因此，这里遍历父进程的 children 列表，检查每个子进程是否属于目标进程组。
-                let parent = ProcessManager::current_pcb();
+                // 因此，这里遍历线程组 leader 的 children 列表，检查每个子进程是否属于目标进程组。
+                let current = ProcessManager::current_pcb();
+                let parent = if kwo.options.contains(WaitOption::WNOTHREAD) {
+                    current.clone()
+                } else {
+                    get_thread_group_leader(&current)
+                };
                 loop {
                     // 注册等待
                     let _ = parent.wait_queue.prepare_to_wait_event(true);
@@ -415,6 +483,11 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 continue;
                             }
                         };
+
+                        // 检查子进程是否可以被当前线程等待（考虑 __WNOTHREAD）
+                        if !is_eligible_child(&pcb, kwo.options) {
+                            continue;
+                        }
 
                         // 检查子进程是否属于目标进程组
                         // 注意：即使进程已退出并从进程组的 tasks 列表中 detach，

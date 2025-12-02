@@ -410,12 +410,7 @@ impl File {
 
         let actual_offset =
             if self.mode().contains(FileMode::O_APPEND) && matches!(file_type, FileType::File) {
-                let file_size = md.size as usize;
-                if update_offset {
-                    self.offset
-                        .store(file_size, core::sync::atomic::Ordering::SeqCst);
-                }
-                file_size
+                md.size as usize
             } else {
                 offset
             };
@@ -454,7 +449,6 @@ impl File {
         let written_len =
             self.inode
                 .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
-
         if update_offset {
             if self.mode().contains(FileMode::O_APPEND) {
                 self.offset.store(
@@ -466,7 +460,6 @@ impl File {
                     .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
             }
         }
-
         Ok(written_len)
     }
 
@@ -696,13 +689,6 @@ impl File {
     #[inline]
     pub fn set_close_on_exec(&self, close_on_exec: bool) {
         self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
-    }
-
-    /// @brief 设置文件偏移量（仅用于O_APPEND等内部操作）
-    ///
-    /// @param offset 新的文件偏移量
-    pub fn set_offset(&self, offset: usize) {
-        self.offset.store(offset, Ordering::SeqCst);
     }
 
     pub fn set_mode(&self, mut mode: FileMode) -> Result<(), SystemError> {

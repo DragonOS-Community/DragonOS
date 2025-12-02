@@ -188,45 +188,9 @@ fn do_sys_openat2(
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
     let inode =
         inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_symlink);
-
+    
     let inode: Arc<dyn IndexNode> = match inode {
-        Ok(inode) => {
-            let file_type: FileType = inode.metadata()?.file_type;
-            // 文件存在 - 检查 O_EXCL
-            if how.o_flags.contains(FileMode::O_CREAT) && how.o_flags.contains(FileMode::O_EXCL) {
-                return Err(SystemError::EEXIST);
-            }
-
-            // 如果是目录，检查不兼容的标志
-            if file_type == FileType::Dir {
-                // O_CREAT 在现有目录上应该失败
-                if how.o_flags.contains(FileMode::O_CREAT) {
-                    return Err(SystemError::EISDIR);
-                }
-                // O_TRUNC 在目录上应该失败
-                if how.o_flags.contains(FileMode::O_TRUNC) {
-                    return Err(SystemError::EISDIR);
-                }
-                // 目录不能以写模式打开
-                let access_mode = how.o_flags.accmode();
-                if access_mode == FileMode::O_WRONLY.accmode()
-                    || access_mode == FileMode::O_RDWR.accmode()
-                {
-                    return Err(SystemError::EISDIR);
-                }
-                // O_DIRECT 在目录上应该失败
-                if how.o_flags.contains(FileMode::O_DIRECT) {
-                    return Err(SystemError::EINVAL);
-                }
-            }
-
-            // 如果路径以斜杠结尾但不是目录，返回错误
-            if path_ends_with_slash && file_type != FileType::Dir {
-                return Err(SystemError::ENOTDIR);
-            }
-
-            inode
-        }
+        Ok(inode) => inode,
         Err(errno) => {
             // 文件不存在，且需要创建
             if how.o_flags.contains(FileMode::O_CREAT)
@@ -255,9 +219,30 @@ fn do_sys_openat2(
             }
         }
     };
-
     let file_type: FileType = inode.metadata()?.file_type;
-    // 如果要打开的是文件夹，而目标不是文件夹
+    if how.o_flags.contains(FileMode::O_CREAT) && how.o_flags.contains(FileMode::O_EXCL) {
+        return Err(SystemError::EEXIST);
+    }
+    if file_type == FileType::Dir {
+        if how.o_flags.contains(FileMode::O_CREAT) {
+            return Err(SystemError::EISDIR);
+        }
+        if how.o_flags.contains(FileMode::O_TRUNC) {
+            return Err(SystemError::EISDIR);
+        }
+        let access_mode = how.o_flags.accmode();
+        if access_mode == FileMode::O_WRONLY.accmode()
+            || access_mode == FileMode::O_RDWR.accmode()
+        {
+            return Err(SystemError::EISDIR);
+        }
+        if how.o_flags.contains(FileMode::O_DIRECT) {
+            return Err(SystemError::EINVAL);
+        }
+    }
+    if path_ends_with_slash && file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
     if how.o_flags.contains(FileMode::O_DIRECTORY) && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
@@ -269,8 +254,6 @@ fn do_sys_openat2(
     if how.o_flags.contains(FileMode::O_TRUNC) && file_type == FileType::File {
         inode.resize(0)?;
     }
-
-    // 创建文件对象
     let file: File = File::new(inode, how.o_flags)?;
 
     // 注意：O_APPEND 模式下，不在打开时设置偏移

@@ -246,7 +246,7 @@ impl LockedPipeInode {
             PIPE_MIN_SIZE
         } else {
             // 向上对齐到页面大小
-            ((size + page_size - 1) / page_size) * page_size
+            size.div_ceil(page_size) * page_size
         };
 
         // 确保不小于最小值

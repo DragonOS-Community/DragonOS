@@ -780,7 +780,8 @@ impl LockedProcFSInode {
 
             let _ = self.unlink(&fd_num.to_string());
             // fdinfo 文件是普通文件，不是符号链接
-            let fdinfo_file = self.create(&fd_num.to_string(), FileType::File, ModeType::S_IRUGO)?;
+            let fdinfo_file =
+                self.create(&fd_num.to_string(), FileType::File, ModeType::S_IRUGO)?;
             let fdinfo_file_proc = fdinfo_file
                 .as_any_ref()
                 .downcast_ref::<LockedProcFSInode>()

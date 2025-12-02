@@ -108,6 +108,8 @@ pub struct LockedPipeInode {
     inner: SpinLock<InnerPipeInode>,
     read_wait_queue: WaitQueue,
     write_wait_queue: WaitQueue,
+    /// 用于 FIFO 打开时的阻塞等待（等待另一端打开）
+    open_wait_queue: WaitQueue,
     epitems: LockedEPItemLinkedList,
 }
 
@@ -128,6 +130,9 @@ pub struct InnerPipeInode {
     reader: u32,
     writer: u32,
     had_reader: bool,
+    /// 是否为命名管道（FIFO）
+    /// 只有 FIFO 才需要在 open 时阻塞等待另一端
+    is_fifo: bool,
 }
 
 impl InnerPipeInode {
@@ -203,11 +208,13 @@ impl LockedPipeInode {
             },
             reader: 0,
             writer: 0,
+            is_fifo: false, // 默认为匿名管道
         };
         let result = Arc::new(Self {
             inner: SpinLock::new(inner),
             read_wait_queue: WaitQueue::default(),
             write_wait_queue: WaitQueue::default(),
+            open_wait_queue: WaitQueue::default(),
             epitems: LockedEPItemLinkedList::default(),
         });
         let mut guard = result.inner.lock();
@@ -215,6 +222,17 @@ impl LockedPipeInode {
         // 释放锁
         drop(guard); //这一步其实不需要，只要离开作用域，guard生命周期结束，自会解锁
         return result;
+    }
+
+    /// 标记此管道为命名管道（FIFO）
+    /// 只有 FIFO 才需要在 open 时阻塞等待另一端
+    pub fn set_fifo(&self) {
+        self.inner.lock().is_fifo = true;
+    }
+
+    /// 检查是否为命名管道（FIFO）
+    pub fn is_fifo(&self) -> bool {
+        self.inner.lock().is_fifo
     }
 
     pub fn inner(&self) -> &SpinLock<InnerPipeInode> {
@@ -229,6 +247,16 @@ impl LockedPipeInode {
     fn writeable(&self) -> bool {
         let inode = self.inner.lock();
         return !inode.buf_full() || inode.reader == 0;
+    }
+
+    /// 检查是否有写端（用于 FIFO O_RDONLY 阻塞等待）
+    fn has_writer(&self) -> bool {
+        self.inner.lock().writer > 0
+    }
+
+    /// 检查是否有读端（用于 FIFO O_WRONLY 阻塞等待）
+    fn has_reader(&self) -> bool {
+        self.inner.lock().reader > 0
     }
 
     /// 设置管道缓冲区大小
@@ -443,28 +471,112 @@ impl IndexNode for LockedPipeInode {
         flags: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         let accflags = flags.access_flags();
-        let mut guard = self.inner.lock();
-        // 根据访问模式增加读/写计数
-        // 注意：命名管道（FIFO）允许以 O_RDWR 模式打开
-        if accflags == FileFlags::O_RDONLY {
-            guard.reader += 1;
-            guard.had_reader = true;
-        } else if accflags == FileFlags::O_WRONLY {
-            // 非阻塞模式下，如果没有读者，返回 ENXIO
-            if guard.reader == 0 && flags.contains(FileFlags::O_NONBLOCK) {
-                return Err(SystemError::ENXIO);
-            }
-            guard.writer += 1;
-        } else if accflags == FileFlags::O_RDWR {
-            // O_RDWR 模式：同时作为读端和写端
-            // 这对于命名管道（FIFO）是有效的
-            guard.reader += 1;
-            guard.writer += 1;
-            guard.had_reader = true;
-        }
+        let is_nonblock = flags.contains(FileFlags::O_NONBLOCK);
+        let flags_copy = *flags;
 
-        // 设置flags
-        *data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: *flags });
+        // 先设置 private_data（在可能的睡眠之前）
+        // 这样即使睡眠，数据也已经设置好了
+        *data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: flags_copy });
+
+        // 检查是否为命名管道（FIFO）
+        // 只有 FIFO 才需要阻塞等待另一端打开
+        let is_fifo = self.inner.lock().is_fifo;
+
+        if accflags == FileFlags::O_RDONLY {
+            // 读端打开
+            let mut guard = self.inner.lock();
+            guard.reader += 1;
+            guard.had_reader = true;
+            let has_writer = guard.writer > 0;
+            drop(guard);
+
+            // 只有 FIFO 才需要处理阻塞等待
+            if is_fifo {
+                // 唤醒可能在等待读端的写者
+                self.open_wait_queue.wakeup_all(None);
+
+                // 如果是非阻塞模式，立即返回
+                if is_nonblock {
+                    return Ok(());
+                }
+
+                // 阻塞模式：等待写端打开
+                if !has_writer {
+                    // 在睡眠前必须释放 data 锁
+                    drop(data);
+                    let r =
+                        wq_wait_event_interruptible!(self.open_wait_queue, self.has_writer(), {});
+                    if r.is_err() {
+                        // 被信号中断，需要回滚 reader 计数
+                        let mut guard = self.inner.lock();
+                        guard.reader -= 1;
+                        if guard.reader == 0 {
+                            guard.had_reader = false;
+                        }
+                        drop(guard);
+                        return Err(SystemError::EINTR);
+                    }
+                }
+            }
+        } else if accflags == FileFlags::O_WRONLY {
+            // 写端打开
+            if is_fifo {
+                // FIFO 语义
+                if is_nonblock {
+                    // 非阻塞模式：如果没有读端，返回 ENXIO
+                    let mut guard = self.inner.lock();
+                    if guard.reader == 0 {
+                        return Err(SystemError::ENXIO);
+                    }
+                    guard.writer += 1;
+                    drop(guard);
+                } else {
+                    // 阻塞模式：等待读端
+                    let guard = self.inner.lock();
+                    let has_reader = guard.reader > 0;
+                    drop(guard);
+
+                    if !has_reader {
+                        // 在睡眠前必须释放 data 锁
+                        drop(data);
+                        // 等待读端打开
+                        let r = wq_wait_event_interruptible!(
+                            self.open_wait_queue,
+                            self.has_reader(),
+                            {}
+                        );
+                        if r.is_err() {
+                            return Err(SystemError::EINTR);
+                        }
+                    }
+
+                    // 现在有读端了，增加写端计数
+                    let mut guard = self.inner.lock();
+                    guard.writer += 1;
+                    drop(guard);
+                }
+
+                // 唤醒可能在等待写端的读者
+                self.open_wait_queue.wakeup_all(None);
+            } else {
+                // 匿名管道：直接增加写端计数
+                let mut guard = self.inner.lock();
+                guard.writer += 1;
+                drop(guard);
+            }
+        } else if accflags == FileFlags::O_RDWR {
+            // O_RDWR 模式：同时作为读端和写端，不阻塞
+            let mut guard = self.inner.lock();
+            guard.reader += 1;
+            guard.writer += 1;
+            guard.had_reader = true;
+            drop(guard);
+
+            // 只有 FIFO 才需要唤醒等待的进程
+            if is_fifo {
+                self.open_wait_queue.wakeup_all(None);
+            }
+        }
 
         return Ok(());
     }
@@ -491,8 +603,8 @@ impl IndexNode for LockedPipeInode {
             // 如果已经没有写端了，则唤醒读端
             if guard.writer == 0 {
                 drop(guard); // 先释放 inner 锁，避免潜在的死锁
-                self.read_wait_queue
-                    .wakeup_all(Some(ProcessState::Blocked(true)));
+                             // 唤醒所有等待的读端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
+                self.read_wait_queue.wakeup_all(None);
                 return Ok(());
             }
         }
@@ -504,8 +616,8 @@ impl IndexNode for LockedPipeInode {
             // 如果已经没有读端了，则唤醒写端
             if guard.reader == 0 {
                 drop(guard); // 先释放 inner 锁，避免死锁
-                self.write_wait_queue
-                    .wakeup_all(Some(ProcessState::Blocked(true)));
+                             // 唤醒所有等待的写端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
+                self.write_wait_queue.wakeup_all(None);
                 return Ok(());
             }
         }
@@ -522,13 +634,11 @@ impl IndexNode for LockedPipeInode {
 
             // 如果已经没有写端了，则唤醒读端
             if wake_reader {
-                self.read_wait_queue
-                    .wakeup_all(Some(ProcessState::Blocked(true)));
+                self.read_wait_queue.wakeup_all(None);
             }
             // 如果已经没有读端了，则唤醒写端
             if wake_writer {
-                self.write_wait_queue
-                    .wakeup_all(Some(ProcessState::Blocked(true)));
+                self.write_wait_queue.wakeup_all(None);
             }
         }
 
@@ -630,6 +740,7 @@ impl IndexNode for LockedPipeInode {
                 // 解锁并睡眠
                 drop(inner_guard);
                 let r = wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {});
+
                 if r.is_err() {
                     if total_written > 0 {
                         return Ok(total_written);
@@ -640,6 +751,27 @@ impl IndexNode for LockedPipeInode {
 
                 // 检查读端是否已关闭
                 if inner_guard.reader == 0 && inner_guard.had_reader {
+                    drop(inner_guard);
+
+                    // 发送 SIGPIPE 信号（阻塞模式下）
+                    if !flags.contains(FileFlags::O_NONBLOCK) {
+                        let sig = Signal::SIGPIPE;
+                        let mut info = SigInfo::new(
+                            sig,
+                            0,
+                            SigCode::Kernel,
+                            SigType::Kill(ProcessManager::current_pcb().task_pid_vnr()),
+                        );
+                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+                        let _ = sig.send_signal_info(
+                            Some(&mut info),
+                            ProcessManager::current_pcb().task_pid_vnr(),
+                        );
+
+                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                    }
+
                     if total_written > 0 {
                         return Ok(total_written);
                     }

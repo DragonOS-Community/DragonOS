@@ -786,6 +786,9 @@ impl Drop for File {
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     fds: Vec<Option<Arc<File>>>,
+    /// 下一个可能空闲的文件描述符号（用于优化分配，避免O(n²)扫描）
+    /// 类似于 Linux 的 fd_next_fd
+    next_fd: usize,
 }
 impl Default for FileDescriptorVec {
     fn default() -> Self {
@@ -804,7 +807,10 @@ impl FileDescriptorVec {
         data.resize(FileDescriptorVec::INITIAL_CAPACITY, None);
 
         // 初始化文件描述符数组结构体
-        return FileDescriptorVec { fds: data };
+        return FileDescriptorVec {
+            fds: data,
+            next_fd: 0,
+        };
     }
 
     /// @brief 克隆一个文件描述符数组
@@ -820,6 +826,8 @@ impl FileDescriptorVec {
                 res.fds[i] = Some(file.clone());
             }
         }
+        // 复制 next_fd 以保持相同的分配状态
+        res.next_fd = self.next_fd;
         return res;
     }
 
@@ -858,6 +866,10 @@ impl FileDescriptorVec {
             let target = core::cmp::max(new_capacity, floor);
             if target < current_len {
                 self.fds.truncate(target);
+                // 确保 next_fd 不超过新的容量
+                if self.next_fd > target {
+                    self.next_fd = target;
+                }
             }
         }
         Ok(())
@@ -915,16 +927,25 @@ impl FileDescriptorVec {
             let x = &mut self.fds[new_fd as usize];
             if x.is_none() {
                 *x = Some(Arc::new(file));
+                // 更新 next_fd：如果分配的是 next_fd 位置，则推进到下一个
+                if new_fd as usize == self.next_fd {
+                    self.next_fd = new_fd as usize + 1;
+                }
                 return Ok(new_fd);
             } else {
                 return Err(SystemError::EBADF);
             }
         } else {
-            // 没有指定要申请的文件描述符编号，在有效范围内查找空位
-            // 首先在当前容量内查找
-            for i in 0..self.fds.len() {
+            // 没有指定要申请的文件描述符编号
+            // 使用 next_fd 作为起始搜索位置，避免每次都从0开始扫描 (O(n²) -> O(n))
+            let max_search = core::cmp::min(self.fds.len(), nofile_limit);
+
+            // 从 next_fd 开始查找空位
+            for i in self.next_fd..max_search {
                 if self.fds[i].is_none() {
                     self.fds[i] = Some(Arc::new(file));
+                    // 更新 next_fd 为下一个位置
+                    self.next_fd = i + 1;
                     return Ok(i as i32);
                 }
             }
@@ -943,6 +964,8 @@ impl FileDescriptorVec {
                 // 扩容后，第一个新位置就是空的
                 let new_fd = current_len;
                 self.fds[new_fd] = Some(Arc::new(file));
+                // 更新 next_fd
+                self.next_fd = new_fd + 1;
                 return Ok(new_fd as i32);
             }
 
@@ -997,6 +1020,14 @@ impl FileDescriptorVec {
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
+
+        // 更新 next_fd：如果释放的fd比当前next_fd小，则更新next_fd
+        // 这确保下次分配时可以复用较小的fd号，符合POSIX语义
+        // （POSIX要求分配最小可用的fd号）
+        if (fd as usize) < self.next_fd {
+            self.next_fd = fd as usize;
+        }
+
         return Ok(file);
     }
 

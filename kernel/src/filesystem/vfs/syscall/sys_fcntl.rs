@@ -1,10 +1,11 @@
 use crate::arch::syscall::nr::SYS_FCNTL;
+use crate::filesystem::vfs::InodeFlags;
 use crate::process::RawPid;
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
         fcntl::{FcntlCommand, FD_CLOEXEC},
-        file::FileMode,
+        file::FileFlags,
         syscall::dup2::{do_dup2, do_dup3},
     },
     process::ProcessManager,
@@ -88,7 +89,12 @@ impl SysFcntlHandle {
                         if cmd == FcntlCommand::DupFd {
                             return do_dup2(fd, i as i32, &mut fd_table_guard);
                         } else {
-                            return do_dup3(fd, i as i32, FileMode::O_CLOEXEC, &mut fd_table_guard);
+                            return do_dup3(
+                                fd,
+                                i as i32,
+                                FileFlags::O_CLOEXEC,
+                                &mut fd_table_guard,
+                            );
                         }
                     }
                 }
@@ -138,7 +144,7 @@ impl SysFcntlHandle {
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    return Ok(file.mode().bits() as usize);
+                    return Ok(file.flags().bits() as usize);
                 }
 
                 return Err(SystemError::EBADF);
@@ -150,10 +156,16 @@ impl SysFcntlHandle {
 
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     let arg = arg as u32;
-                    let mode = FileMode::from_bits(arg).ok_or(SystemError::EINVAL)?;
+                    let new_flags = FileFlags::from_bits(arg).ok_or(SystemError::EINVAL)?;
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    file.set_mode(mode)?;
+                    let inode_flags = file.get_inode_flags()?;
+                    if inode_flags.contains(InodeFlags::S_APPEND)
+                        && !new_flags.contains(FileFlags::O_APPEND)
+                    {
+                        return Err(SystemError::EPERM);
+                    }
+                    file.set_flags(new_flags)?;
                     return Ok(0);
                 }
 

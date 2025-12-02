@@ -94,7 +94,7 @@ impl FAsyncItems {
         for item in guard.iter() {
             if let Some(file) = item.file() {
                 // Check if FASYNC is set
-                if !file.mode().fasync() {
+                if !file.flags().fasync() {
                     continue;
                 }
 

@@ -5,7 +5,7 @@
 
 use super::Metadata;
 use crate::{
-    filesystem::vfs::{syscall::ModeType, FileType},
+    filesystem::vfs::{FileType, InodeMode},
     process::cred::{CAPFlags, Cred},
 };
 use system_error::SystemError;
@@ -69,13 +69,13 @@ impl Cred {
         // 确定要检查哪组权限位
         let perm = if self.is_owner(metadata) {
             // 所有者权限（第 6-8 位）
-            (file_mode & ModeType::S_IRWXU.bits()) >> 6
+            (file_mode & InodeMode::S_IRWXU.bits()) >> 6
         } else if self.in_group(metadata) {
             // 组权限（第 3-5 位）
-            (file_mode & ModeType::S_IRWXG.bits()) >> 3
+            (file_mode & InodeMode::S_IRWXG.bits()) >> 3
         } else {
             // 其他用户权限（第 0-2 位）
-            file_mode & ModeType::S_IRWXO.bits()
+            file_mode & InodeMode::S_IRWXO.bits()
         };
 
         // PermissionMask 的低 3 位已经是 Unix 权限位格式 (rwx)

@@ -6,8 +6,8 @@ use crate::{
             EPollEventType, EPollItem,
         },
         vfs::{
-            file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
-            FileSystem, FileType, IndexNode, Metadata, PollableInode,
+            file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
+            IndexNode, InodeFlags, InodeMode, Metadata, PollableInode,
         },
     },
     ipc::signal_types::SigCode,
@@ -32,16 +32,16 @@ const PIPE_BUFF_SIZE: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct PipeFsPrivateData {
-    mode: FileMode,
+    flags: FileFlags,
 }
 
 impl PipeFsPrivateData {
-    pub fn new(mode: FileMode) -> Self {
-        return PipeFsPrivateData { mode };
+    pub fn new(flags: FileFlags) -> Self {
+        return PipeFsPrivateData { flags };
     }
 
-    pub fn set_mode(&mut self, mode: FileMode) {
-        self.mode = mode;
+    pub fn set_flags(&mut self, flags: FileFlags) {
+        self.flags = flags;
     }
 }
 
@@ -74,13 +74,13 @@ impl InnerPipeInode {
     pub fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
         let mut events = EPollEventType::empty();
 
-        let mode = if let FilePrivateData::Pipefs(PipeFsPrivateData { mode }) = private_data {
-            mode
+        let flags = if let FilePrivateData::Pipefs(PipeFsPrivateData { flags }) = private_data {
+            flags
         } else {
             return Err(SystemError::EBADFD);
         };
 
-        if mode.contains(FileMode::O_RDONLY) {
+        if !flags.is_write_only() {
             if self.valid_cnt != 0 {
                 // 有数据可读
                 events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
@@ -92,7 +92,7 @@ impl InnerPipeInode {
             }
         }
 
-        if mode.contains(FileMode::O_WRONLY) {
+        if !flags.is_read_only() {
             // 管道内数据未满
             if self.valid_cnt as usize != PIPE_BUFF_SIZE {
                 events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
@@ -133,11 +133,12 @@ impl LockedPipeInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Pipe,
-                mode: ModeType::from_bits_truncate(0o666),
+                mode: InodeMode::from_bits_truncate(0o666),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
                 raw_dev: Default::default(),
+                flags: InodeFlags::empty(),
             },
             reader: 0,
             writer: 0,
@@ -209,10 +210,10 @@ impl IndexNode for LockedPipeInode {
     ) -> Result<usize, SystemError> {
         let data = data_guard.clone();
         drop(data_guard);
-        // 获取mode
-        let mode: FileMode;
+        // 获取flags
+        let flags: FileFlags;
         if let FilePrivateData::Pipefs(pdata) = &data {
-            mode = pdata.mode;
+            flags = pdata.flags;
         } else {
             return Err(SystemError::EBADF);
         }
@@ -220,7 +221,7 @@ impl IndexNode for LockedPipeInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        // log::debug!("pipe mode: {:?}", mode);
+        // log::debug!("pipe flags: {:?}", flags);
         // 加锁
         let mut inner_guard = self.inner.lock();
 
@@ -235,7 +236,7 @@ impl IndexNode for LockedPipeInode {
                 .wakeup(Some(ProcessState::Blocked(true)));
 
             // 如果为非阻塞管道，直接返回错误
-            if mode.contains(FileMode::O_NONBLOCK) {
+            if flags.contains(FileFlags::O_NONBLOCK) {
                 drop(inner_guard);
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
@@ -295,34 +296,34 @@ impl IndexNode for LockedPipeInode {
     fn open(
         &self,
         mut data: SpinLockGuard<FilePrivateData>,
-        mode: &crate::filesystem::vfs::file::FileMode,
+        flags: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
-        let accmode = mode.accmode();
+        let accflags = flags.access_flags();
         let mut guard = self.inner.lock();
         // 不能以读写方式打开管道
-        if accmode == FileMode::O_RDWR.bits() {
+        if accflags == FileFlags::O_RDWR.bits() {
             return Err(SystemError::EACCES);
-        } else if accmode == FileMode::O_RDONLY.bits() {
+        } else if accflags == FileFlags::O_RDONLY.bits() {
             guard.reader += 1;
             guard.had_reader = true;
             // println!(
-            //     "FIFO:     pipe try open in read mode with reader pid:{:?}",
+            //     "FIFO:     pipe try open in read flags with reader pid:{:?}",
             //     ProcessManager::current_pid()
             // );
-        } else if accmode == FileMode::O_WRONLY.bits() {
+        } else if accflags == FileFlags::O_WRONLY.bits() {
             // println!(
-            //     "FIFO:     pipe try open in write mode with {} reader, writer pid:{:?}",
+            //     "FIFO:     pipe try open in write flags with {} reader, writer pid:{:?}",
             //     guard.reader,
             //     ProcessManager::current_pid()
             // );
-            if guard.reader == 0 && mode.contains(FileMode::O_NONBLOCK) {
+            if guard.reader == 0 && flags.contains(FileFlags::O_NONBLOCK) {
                 return Err(SystemError::ENXIO);
             }
             guard.writer += 1;
         }
 
-        // 设置mode
-        *data = FilePrivateData::Pipefs(PipeFsPrivateData { mode: *mode });
+        // 设置flags
+        *data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: *flags });
 
         return Ok(());
     }
@@ -336,17 +337,17 @@ impl IndexNode for LockedPipeInode {
     }
 
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        let mode: FileMode;
+        let flags: FileFlags;
         if let FilePrivateData::Pipefs(pipe_data) = &*data {
-            mode = pipe_data.mode;
+            flags = pipe_data.flags;
         } else {
             return Err(SystemError::EBADF);
         }
-        let accmode = mode.accmode();
+        let accflags = flags.access_flags();
         let mut guard = self.inner.lock();
 
         // 写端关闭
-        if accmode == FileMode::O_WRONLY.bits() {
+        if accflags == FileFlags::O_WRONLY.bits() {
             assert!(guard.writer > 0);
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
@@ -357,7 +358,7 @@ impl IndexNode for LockedPipeInode {
         }
 
         // 读端关闭
-        if accmode == FileMode::O_RDONLY.bits() {
+        if accflags == FileFlags::O_RDONLY.bits() {
             assert!(guard.reader > 0);
             guard.reader -= 1;
             // 如果已经没有写端了，则唤醒读端
@@ -377,10 +378,10 @@ impl IndexNode for LockedPipeInode {
         buf: &[u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // 获取mode
-        let mode: FileMode;
+        // 获取flags
+        let flags: FileFlags;
         if let FilePrivateData::Pipefs(pdata) = &*data {
-            mode = pdata.mode;
+            flags = pdata.flags;
         } else {
             return Err(SystemError::EBADF);
         }
@@ -397,7 +398,7 @@ impl IndexNode for LockedPipeInode {
                 return Err(SystemError::ENXIO);
             } else {
                 // 如果曾经有读端，现在已关闭
-                match mode.contains(FileMode::O_NONBLOCK) {
+                match flags.contains(FileFlags::O_NONBLOCK) {
                     true => {
                         // 非阻塞模式，直接返回 EPIPE
                         return Err(SystemError::EPIPE);
@@ -433,7 +434,7 @@ impl IndexNode for LockedPipeInode {
                 .wakeup(Some(ProcessState::Blocked(true)));
 
             // 如果为非阻塞管道，直接返回错误
-            if mode.contains(FileMode::O_NONBLOCK) {
+            if flags.contains(FileFlags::O_NONBLOCK) {
                 drop(inner_guard);
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }

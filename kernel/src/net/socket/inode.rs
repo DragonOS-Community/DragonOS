@@ -1,8 +1,8 @@
 use crate::{
     driver::net::Iface,
     filesystem::vfs::{
-        fasync::FAsyncItem, file::File, syscall::ModeType, FilePrivateData, FileType, IndexNode,
-        Metadata, PollableInode,
+        fasync::FAsyncItem, file::File, FilePrivateData, FileType, IndexNode, InodeMode, Metadata,
+        PollableInode,
     },
     libs::spinlock::SpinLockGuard,
     net::posix::SockAddrIn,
@@ -214,7 +214,7 @@ impl<T: Socket + 'static> IndexNode for T {
     fn open(
         &self,
         _: SpinLockGuard<FilePrivateData>,
-        _: &crate::filesystem::vfs::file::FileMode,
+        _: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -271,7 +271,7 @@ impl<T: Socket + 'static> IndexNode for T {
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         Ok(Metadata::new(
             FileType::Socket,
-            ModeType::from_bits_truncate(0o755),
+            InodeMode::from_bits_truncate(0o755),
         ))
     }
 

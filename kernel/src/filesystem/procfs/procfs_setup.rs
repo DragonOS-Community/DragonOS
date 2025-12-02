@@ -1,4 +1,4 @@
-use crate::filesystem::vfs::{syscall::ModeType, FileSystem, FileType};
+use crate::filesystem::vfs::{FileSystem, FileType, InodeMode};
 
 use super::{LockedProcFSInode, ProcFS, ProcFileCreationParams, ProcFileType};
 
@@ -23,7 +23,7 @@ impl ProcFS {
             .parent(self.root_inode())
             .name("meminfo")
             .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
+            .mode(InodeMode::from_bits_truncate(0o444))
             .ftype(ProcFileType::ProcMeminfo)
             .build()
             .unwrap();
@@ -38,7 +38,7 @@ impl ProcFS {
             .parent(self.root_inode())
             .name("kmsg")
             .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
+            .mode(InodeMode::from_bits_truncate(0o444))
             .ftype(ProcFileType::ProcKmsg)
             .build()
             .unwrap();
@@ -93,7 +93,7 @@ impl ProcFS {
             .parent(self.root_inode())
             .name("version")
             .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
+            .mode(InodeMode::from_bits_truncate(0o444))
             .ftype(ProcFileType::ProcVersion)
             .build()
             .unwrap();
@@ -108,7 +108,7 @@ impl ProcFS {
             .parent(self.root_inode())
             .name("cpuinfo")
             .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
+            .mode(InodeMode::from_bits_truncate(0o444))
             .ftype(ProcFileType::ProcCpuinfo)
             .build()
             .unwrap();
@@ -123,7 +123,7 @@ impl ProcFS {
             .parent(self.root_inode())
             .name("self")
             .file_type(FileType::SymLink)
-            .mode(ModeType::from_bits_truncate(0o555))
+            .mode(InodeMode::from_bits_truncate(0o555))
             .ftype(ProcFileType::ProcSelf)
             .build()
             .unwrap();
@@ -140,13 +140,13 @@ impl ProcFS {
             .create(
                 "thread-self",
                 FileType::Dir,
-                ModeType::from_bits_truncate(0o555),
+                InodeMode::from_bits_truncate(0o555),
             )
             .unwrap_or_else(|_| panic!("create thread-self error"));
 
         // Create /proc/thread-self/ns directory
         let ns_dir = thread_self_dir
-            .create("ns", FileType::Dir, ModeType::from_bits_truncate(0o555))
+            .create("ns", FileType::Dir, InodeMode::from_bits_truncate(0o555))
             .unwrap_or_else(|_| panic!("create thread-self/ns error"));
 
         let ns_dir_proc = ns_dir

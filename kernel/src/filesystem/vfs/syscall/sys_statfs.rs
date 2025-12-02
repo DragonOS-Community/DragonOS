@@ -1,10 +1,10 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STATFS;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::syscall::open_utils;
-use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::syscall::PosixStatfs;
 use crate::filesystem::vfs::utils::user_path_at;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -27,8 +27,8 @@ impl Syscall for SysStatfsHandle {
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
         let fd = open_utils::do_open(
             path,
-            FileMode::O_RDONLY.bits(),
-            ModeType::empty().bits(),
+            FileFlags::O_RDONLY.bits(),
+            InodeMode::empty().bits(),
             true,
         )?;
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))

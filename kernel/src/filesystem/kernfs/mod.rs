@@ -24,8 +24,8 @@ use crate::{
 use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
-    file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData, FileSystem,
-    FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
+    file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, FsInfo,
+    IndexNode, InodeFlags, InodeId, InodeMode, Magic, Metadata, SuperBlock,
 };
 
 pub mod callback;
@@ -85,7 +85,7 @@ impl KernFS {
     fn create_root_inode() -> Arc<KernFSInode> {
         let metadata = Metadata {
             size: 0,
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             uid: 0,
             gid: 0,
             blk_size: 0,
@@ -99,6 +99,7 @@ impl KernFS {
             file_type: FileType::Dir,
             nlinks: 1,
             raw_dev: DeviceNumber::default(),
+            flags: InodeFlags::empty(),
         };
         let root_inode = Arc::new_cyclic(|self_ref| KernFSInode {
             name: String::from(""),
@@ -143,7 +144,7 @@ pub struct KernFSInode {
 }
 
 pub struct KernFSInodeArgs {
-    pub mode: ModeType,
+    pub mode: InodeMode,
     pub inode_type: KernInodeType,
     pub size: Option<usize>,
     pub private_data: Option<KernInodePrivateData>,
@@ -169,7 +170,7 @@ impl IndexNode for KernFSInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         if let Some(callback) = self.callback {
             let callback_data =
@@ -201,7 +202,7 @@ impl IndexNode for KernFSInode {
         &self,
         _name: &str,
         _file_type: FileType,
-        _mode: ModeType,
+        _mode: InodeMode,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 应当通过kernfs的其它方法来创建文件，而不能从用户态直接调用此方法。
@@ -479,7 +480,7 @@ impl KernFSInode {
     pub fn add_dir(
         &self,
         name: String,
-        mode: ModeType,
+        mode: InodeMode,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
@@ -510,7 +511,7 @@ impl KernFSInode {
     pub fn add_file(
         &self,
         name: String,
-        mode: ModeType,
+        mode: InodeMode,
         size: Option<usize>,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
@@ -546,7 +547,7 @@ impl KernFSInode {
         &self,
         name: String,
         file_type: KernInodeType,
-        mode: ModeType,
+        mode: InodeMode,
         mut size: usize,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
@@ -574,6 +575,7 @@ impl KernFSInode {
             file_type: file_type.into(),
             nlinks: 1,
             raw_dev: DeviceNumber::default(),
+            flags: InodeFlags::empty(),
         };
 
         let new_inode: Arc<KernFSInode> = Self::new(
@@ -639,7 +641,7 @@ impl KernFSInode {
         let inode = self.inner_create(
             name,
             KernInodeType::SymLink,
-            ModeType::S_IFLNK | ModeType::S_IRWXUGO,
+            InodeMode::S_IFLNK | InodeMode::S_IRWXUGO,
             0,
             None,
             None,

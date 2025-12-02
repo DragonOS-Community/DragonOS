@@ -4,7 +4,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_IOCTL;
 use crate::filesystem::vfs::fasync::FAsyncItem;
 use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use system_error::SystemError;
@@ -62,7 +62,7 @@ impl Syscall for SysIoctlHandle {
         drop(fd_table_guard);
 
         // 检查文件是否以 O_PATH 打开，如果是则返回 EBADF
-        if file.mode().contains(FileMode::O_PATH) {
+        if file.flags().contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 
@@ -144,16 +144,16 @@ impl SysIoctlHandle {
             UserBufferReader::new(data as *const i32, core::mem::size_of::<i32>(), true)?;
         let value = user_reader.buffer_protected(0)?.read_one::<i32>(0)?;
 
-        // 获取当前文件模式
-        let mut mode = file.mode();
+        // 获取当前文件标志
+        let mut flags = file.flags();
         if value != 0 {
-            mode.insert(FileMode::O_NONBLOCK);
+            flags.insert(FileFlags::O_NONBLOCK);
         } else {
-            mode.remove(FileMode::O_NONBLOCK);
+            flags.remove(FileFlags::O_NONBLOCK);
         }
 
-        // 更新文件模式
-        file.set_mode(mode)?;
+        // 更新文件标志
+        file.set_flags(flags)?;
         Ok(0)
     }
 
@@ -170,9 +170,9 @@ impl SysIoctlHandle {
         let value = user_reader.buffer_protected(0)?.read_one::<i32>(0)?;
 
         // 获取当前文件模式
-        let mut mode = file.mode();
+        let mut flags = file.flags();
         if value != 0 {
-            mode.insert(FileMode::FASYNC);
+            flags.insert(FileFlags::FASYNC);
 
             // 通过 PollableInode 接口注册 FAsyncItem
             if let Ok(pollable) = file.inode().as_pollable_inode() {
@@ -181,7 +181,7 @@ impl SysIoctlHandle {
                 let _ = pollable.add_fasync(fasync_item, &file.private_data.lock());
             }
         } else {
-            mode.remove(FileMode::FASYNC);
+            flags.remove(FileFlags::FASYNC);
 
             // 通过 PollableInode 接口移除 FAsyncItem
             if let Ok(pollable) = file.inode().as_pollable_inode() {
@@ -190,8 +190,8 @@ impl SysIoctlHandle {
             }
         }
 
-        // 更新文件模式
-        file.set_mode(mode)?;
+        // 更新文件标志
+        file.set_flags(flags)?;
         Ok(0)
     }
 

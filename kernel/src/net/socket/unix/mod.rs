@@ -6,9 +6,8 @@ pub mod stream;
 use super::PSOCK;
 use crate::{
     filesystem::vfs::{
-        syscall::ModeType,
         utils::{rsplit_path, DName},
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        InodeMode, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     net::socket::{
         endpoint::Endpoint,
@@ -139,7 +138,7 @@ impl UnixEndpoint {
                 let inode = parent_inode.create(
                     filename,
                     crate::filesystem::vfs::FileType::Socket,
-                    ModeType::S_IWUSR,
+                    InodeMode::S_IWUSR,
                 )?;
                 UnixEndpointBound::Path(DName::from(inode.absolute_path()?))
             }

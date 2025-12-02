@@ -8,7 +8,6 @@ use log::error;
 use system_error::SystemError;
 
 use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::process::pid::PidPrivateData;
 use crate::{
     arch::MMArch,
     driver::{
@@ -38,6 +37,7 @@ use crate::{
         ProcessControlBlock, ProcessManager, RawPid,
     },
 };
+use crate::{filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
@@ -101,9 +101,9 @@ impl Default for FilePrivateData {
 }
 
 impl FilePrivateData {
-    pub fn update_mode(&mut self, mode: FileMode) {
+    pub fn update_flags(&mut self, flags: FileFlags) {
         if let FilePrivateData::Pipefs(pdata) = self {
-            pdata.set_mode(mode);
+            pdata.set_flags(flags);
         }
     }
 
@@ -129,7 +129,7 @@ bitflags! {
     /// 与Linux 5.19.10的uapi/asm-generic/fcntl.h相同
     /// https://code.dragonos.org.cn/xref/linux-5.19.10/tools/include/uapi/asm-generic/fcntl.h#19
     #[allow(clippy::bad_bit_mask)]
-    pub struct FileMode: u32{
+    pub struct FileFlags: u32{
         /* File access modes for `open' and `fcntl'.  */
         /// Open Read-only
         const O_RDONLY = 0o0;
@@ -168,7 +168,8 @@ bitflags! {
         /// set close_on_exec
         const O_CLOEXEC = 0o02000000;
         /// 每次write都等到物理I/O完成，包括write引起的文件属性的更新
-        const O_SYNC = 0o04000000;
+        const __O_SYNC = 0o04000000;
+        const O_SYNC = Self::__O_SYNC.bits | Self::O_DSYNC.bits;
 
         const O_PATH = 0o10000000;
 
@@ -176,17 +177,168 @@ bitflags! {
     }
 }
 
-impl FileMode {
-    /// 获取文件的访问模式的值
+impl FileFlags {
+    /// @brief 获取文件的访问模式 (O_RDONLY/O_WRONLY/O_RDWR)
+    ///
+    /// 这是正确提取访问模式的方法,因为O_RDONLY=0不能用contains()检查
     #[inline]
-    pub fn accmode(&self) -> u32 {
-        return self.bits() & FileMode::O_ACCMODE.bits();
+    pub fn access_flags(&self) -> u32 {
+        self.bits() & Self::O_ACCMODE.bits()
+    }
+
+    /// @brief 检查是否是只读模式
+    #[inline]
+    pub fn is_read_only(&self) -> bool {
+        self.access_flags() == Self::O_RDONLY.bits()
+    }
+
+    /// @brief 检查是否是只写模式
+    #[inline]
+    pub fn is_write_only(&self) -> bool {
+        self.access_flags() == Self::O_WRONLY.bits()
+    }
+
+    /// @brief 检查是否是读写模式
+    #[inline]
+    pub fn is_rdwr(&self) -> bool {
+        self.access_flags() == Self::O_RDWR.bits()
     }
 
     /// 检查是否设置了 FASYNC 标志
     #[inline]
     pub fn fasync(&self) -> bool {
-        self.contains(FileMode::FASYNC)
+        self.contains(FileFlags::FASYNC)
+    }
+}
+
+bitflags! {
+    /// 文件访问模式标志 (对应 Linux 的 file.f_mode)
+    ///
+    /// 这些标志是内核专用的，用户空间不可见。
+    ///
+    /// 参考: https://elixir.bootlin.com/linux/v6.12.6/source/include/linux/fs.h#L119
+    pub struct FileMode: u32 {
+        // ============================================================
+        // 基本访问模式 (从 f_flags 转换而来)
+        // ============================================================
+        /// 文件以读模式打开
+        const FMODE_READ = 0x1;
+        /// 文件以写模式打开
+        const FMODE_WRITE = 0x2;
+        /// 文件支持 lseek 操作
+        const FMODE_LSEEK = 0x4;
+        /// 文件支持 pread 操作
+        const FMODE_PREAD = 0x8;
+        /// 文件支持 pwrite 操作
+        const FMODE_PWRITE = 0x10;
+        /// 文件通过 sys_execve / sys_uselib 打开用于执行
+        const FMODE_EXEC = 0x20;
+        // ============================================================
+        // 目录哈希模式 (用于 llseek 偏移)
+        // ============================================================
+        /// 使用 32 位哈希作为 llseek() 偏移 (用于目录)
+        const FMODE_32BITHASH = 0x200;
+        /// 使用 64 位哈希作为 llseek() 偏移 (用于目录)
+        const FMODE_64BITHASH = 0x400;
+        // ============================================================
+        // 时间戳和访问模式控制
+        // ============================================================
+        /// 不更新 ctime 和 mtime
+        /// 目前是 XFS open_by_handle ioctl 的特殊 hack，
+        /// 未来可能会升级为 open(2) 支持的 O_CMTIME 标志
+        const FMODE_NOCMTIME = 0x800;
+        /// 期望随机访问模式 (由 fadvise 设置)
+        const FMODE_RANDOM = 0x1000;
+        /// 文件是巨大的 (如 /dev/mem): 将 loff_t 视为无符号数
+        const FMODE_UNSIGNED_OFFSET = 0x2000;
+        /// 文件以 O_PATH 方式打开 (几乎无操作权限)
+        const FMODE_PATH = 0x4000;
+        /// 需要原子性的 f_pos 访问 (常规文件/目录)
+        const FMODE_ATOMIC_POS = 0x8000;
+        // ============================================================
+        // 写权限和能力标志
+        // ============================================================
+        /// 持有对底层文件系统的写访问权限
+        const FMODE_WRITER = 0x10000;
+        /// 文件有 read 或 read_iter 方法
+        const FMODE_CAN_READ = 0x20000;
+        /// 文件有 write 或 write_iter 方法
+        const FMODE_CAN_WRITE = 0x40000;
+        // ============================================================
+        // 文件状态标志
+        // ============================================================
+        /// 文件已成功打开
+        const FMODE_OPENED = 0x80000;
+        /// 文件是新创建的 (O_CREAT 成功时设置)
+        const FMODE_CREATED = 0x100000;
+        /// 文件是流式的 (不可 seek)
+        const FMODE_STREAM = 0x200000;
+        /// 文件支持 O_DIRECT 直接 I/O
+        const FMODE_CAN_ODIRECT = 0x400000;
+        /// 文件不应被重用
+        const FMODE_NOREUSE = 0x800000;
+        // ============================================================
+        // 并发和异步 I/O 标志
+        // ============================================================
+        /// 文件支持来自多线程的非独占 O_DIRECT 写入
+        const FMODE_DIO_PARALLEL_WRITE = 0x1000000;
+        /// 文件嵌入在 backing_file 对象中
+        const FMODE_BACKING = 0x2000000;
+        /// 文件由 fanotify 打开，不应生成 fanotify 事件
+        const FMODE_NONOTIFY = 0x4000000;
+        /// 文件能够在 I/O 将阻塞时返回 -EAGAIN (支持非阻塞 I/O，如 io_uring)
+        const FMODE_NOWAIT = 0x8000000;
+        // ============================================================
+        // 挂载和资源管理标志
+        // ============================================================
+        /// 文件代表需要卸载的挂载点
+        const FMODE_NEED_UNMOUNT = 0x10000000;
+        /// 文件不计入 nr_files 计数
+        const FMODE_NOACCOUNT = 0x20000000;
+        /// 文件支持异步缓冲读取
+        const FMODE_BUF_RASYNC = 0x40000000;
+        /// 文件支持异步 nowait 缓冲写入
+        const FMODE_BUF_WASYNC = 0x80000000;
+    }
+}
+
+impl FileMode {
+    /// @brief 从FileFlags转换为FileMode (实现OPEN_FMODE)
+    ///
+    /// - O_RDONLY (0) -> FMODE_READ (1)
+    /// - O_WRONLY (1) -> FMODE_WRITE (2)
+    /// - O_RDWR   (2) -> FMODE_READ | FMODE_WRITE (3)
+    /// - 以及对于抑制fsnotify/fanotify机制触发通知的标志FMODE_NONOTIFY
+    pub fn open_fmode(flags: FileFlags) -> Self {
+        let fmode = flags.bits() & FileMode::FMODE_NONOTIFY.bits()
+            | (flags.access_flags() + 1) & FileFlags::O_ACCMODE.bits();
+
+        // 初始只设置访问模式,其他能力在后续设置
+        FileMode::from_bits_truncate(fmode)
+    }
+
+    /// @brief 检查是否可读
+    #[inline]
+    pub fn is_readable(&self) -> bool {
+        self.contains(Self::FMODE_READ)
+    }
+
+    /// @brief 检查是否可写
+    #[inline]
+    pub fn is_writeable(&self) -> bool {
+        self.contains(Self::FMODE_WRITE)
+    }
+
+    /// @brief 检查是否真的能读 (有读方法)
+    #[inline]
+    pub fn can_read(&self) -> bool {
+        self.is_readable() && self.contains(Self::FMODE_CAN_READ)
+    }
+
+    /// @brief 检查是否真的能写 (有写方法)
+    #[inline]
+    pub fn can_write(&self) -> bool {
+        self.is_writeable() && self.contains(Self::FMODE_CAN_WRITE)
     }
 }
 
@@ -197,6 +349,8 @@ pub struct File {
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
     offset: AtomicUsize,
     /// 文件的打开模式
+    flags: RwLock<FileFlags>,
+    /// 文件的访问模式
     mode: RwLock<FileMode>,
     /// 文件类型
     file_type: FileType,
@@ -217,8 +371,8 @@ impl File {
     /// @brief 创建一个新的文件对象
     ///
     /// @param inode 文件对象对应的inode
-    /// @param mode 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mut mode: FileMode) -> Result<Self, SystemError> {
+    /// @param flags 文件的打开模式
+    pub fn new(inode: Arc<dyn IndexNode>, mut flags: FileFlags) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
         if file_type == FileType::Pipe {
@@ -226,15 +380,51 @@ impl File {
                 inode = pipe_inode;
             }
         }
-        let close_on_exec = mode.contains(FileMode::O_CLOEXEC);
-        mode.remove(FileMode::O_CLOEXEC);
+
+        let metadata = inode.metadata()?;
+        if metadata.flags.contains(InodeFlags::S_APPEND) {
+            flags.insert(FileFlags::O_APPEND);
+        }
+
+        let close_on_exec = flags.contains(FileFlags::O_CLOEXEC);
+        flags.remove(FileFlags::O_CLOEXEC);
+
+        let mut mode = FileMode::open_fmode(flags);
 
         let private_data = SpinLock::new(FilePrivateData::default());
-        inode.open(private_data.lock(), &mode)?;
+        inode.open(private_data.lock(), &flags)?;
+
+        // 设置默认能力 (可以在文件系统的open()中清除)
+        if file_type == FileType::File || file_type == FileType::Dir {
+            mode.insert(
+                FileMode::FMODE_LSEEK
+                    | FileMode::FMODE_PREAD
+                    | FileMode::FMODE_PWRITE
+                    | FileMode::FMODE_ATOMIC_POS,
+            );
+        }
+
+        // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
+        // 这需要在IndexNode trait中添加相应的检查方法
+        if mode.contains(FileMode::FMODE_READ) {
+            mode.insert(FileMode::FMODE_CAN_READ);
+        }
+        if mode.contains(FileMode::FMODE_WRITE) {
+            mode.insert(FileMode::FMODE_CAN_WRITE);
+        }
+
+        // 标记为已打开
+        mode.insert(FileMode::FMODE_OPENED);
+
+        // O_PATH特殊处理
+        if flags.contains(FileFlags::O_PATH) {
+            mode = FileMode::FMODE_PATH | FileMode::FMODE_OPENED;
+        }
 
         let f = File {
             inode,
             offset: AtomicUsize::new(0),
+            flags: RwLock::new(flags),
             mode: RwLock::new(mode),
             file_type,
             readdir_subdirs_name: SpinLock::new(Vec::default()),
@@ -377,11 +567,11 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
-        if self.file_type == FileType::File && !self.mode().contains(FileMode::O_DIRECT) {
+        if self.file_type == FileType::File && !self.flags().contains(FileFlags::O_DIRECT) {
             self.file_readahead(offset, len)?;
         }
 
-        let len = if self.mode().contains(FileMode::O_DIRECT) {
+        let len = if self.flags().contains(FileFlags::O_DIRECT) {
             self.inode
                 .read_direct(offset, len, buf, self.private_data.lock())
         } else {
@@ -410,6 +600,18 @@ impl File {
     ) -> Result<usize, SystemError> {
         // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
+
+        let inode_flags = self.get_inode_flags()?;
+        // 检查 S_IMMUTABLE
+        if inode_flags.contains(InodeFlags::S_IMMUTABLE) {
+            return Err(SystemError::EPERM);
+        }
+        // S_APPEND 的 inode 只能追加写入
+        if inode_flags.contains(InodeFlags::S_APPEND) && !self.flags().contains(FileFlags::O_APPEND)
+        {
+            return Err(SystemError::EPERM);
+        }
+
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
@@ -460,6 +662,28 @@ impl File {
         if update_offset {
             self.offset
                 .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+        }
+
+        let flags = self.flags();
+        // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
+        let need_data_sync = flags.contains(FileFlags::O_DSYNC);
+        // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
+        let need_metadata_sync = flags.contains(FileFlags::__O_SYNC);
+
+        // 也检查 inode 级别的 S_SYNC 标志
+        let inode_sync = self
+            .get_inode_flags()
+            .map(|f| f.contains(InodeFlags::S_SYNC))
+            .unwrap_or(false);
+
+        if need_data_sync || inode_sync {
+            if need_metadata_sync || inode_sync {
+                // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
+                self.inode.sync()?;
+            } else {
+                // O_DSYNC: 仅数据同步
+                self.inode.datasync()?;
+            }
         }
 
         Ok(written_len)
@@ -529,12 +753,23 @@ impl File {
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
         let mode = *self.mode.read();
-        // 暂时认为只要不是write only, 就可读
-        if mode.accmode() == FileMode::O_WRONLY.bits || mode.contains(FileMode::O_PATH) {
+
+        // O_PATH文件几乎不能做任何I/O操作
+        if mode.contains(FileMode::FMODE_PATH) {
             return Err(SystemError::EBADF);
         }
 
-        return Ok(());
+        // 检查读权限
+        if !mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 检查读能力
+        if !mode.can_read() {
+            return Err(SystemError::EINVAL);
+        }
+
+        Ok(())
     }
 
     /// @brief 判断当前文件是否可写
@@ -542,17 +777,22 @@ impl File {
     pub fn writeable(&self) -> Result<(), SystemError> {
         let mode = *self.mode.read();
 
-        // 检查是否是O_PATH文件描述符
-        if mode.contains(FileMode::O_PATH) {
+        // O_PATH文件不能写
+        if mode.contains(FileMode::FMODE_PATH) {
             return Err(SystemError::EBADF);
         }
 
-        // 暂时认为只要不是read only, 就可写
-        if mode == FileMode::O_RDONLY {
-            return Err(SystemError::EPERM);
+        // 检查写权限
+        if !mode.contains(FileMode::FMODE_WRITE) {
+            return Err(SystemError::EBADF);
         }
 
-        return Ok(());
+        // 检查写能力
+        if !mode.can_write() {
+            return Err(SystemError::EINVAL);
+        }
+
+        Ok(())
     }
 
     /// # 读取目录项
@@ -562,7 +802,7 @@ impl File {
     pub fn read_dir(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
         // O_PATH 文件描述符只能用于有限的操作，getdents/getdents64
         // 在 Linux 中会返回 EBADF。提前检测并返回相同语义。
-        if self.mode().contains(FileMode::O_PATH) {
+        if self.flags().contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 
@@ -636,6 +876,7 @@ impl File {
         let res = Self {
             inode: self.inode.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
+            flags: RwLock::new(self.flags()),
             mode: RwLock::new(self.mode()),
             file_type: self.file_type,
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
@@ -649,7 +890,7 @@ impl File {
         // TODO: reopen is not a good idea for some inodes, need a better design
         if self
             .inode
-            .open(res.private_data.lock(), &res.mode())
+            .open(res.private_data.lock(), &res.flags())
             .is_err()
         {
             return None;
@@ -665,6 +906,12 @@ impl File {
     }
 
     /// @brief 获取文件的打开模式
+    #[inline]
+    pub fn flags(&self) -> FileFlags {
+        return *self.flags.read();
+    }
+
+    /// @brief 获取文件的访问模式
     #[inline]
     pub fn mode(&self) -> FileMode {
         return *self.mode.read();
@@ -682,20 +929,32 @@ impl File {
         self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
     }
 
-    pub fn set_mode(&self, mut mode: FileMode) -> Result<(), SystemError> {
-        // todo: 是否需要调用inode的open方法，以更新private data（假如它与mode有关的话）?
+    pub fn set_flags(&self, mut new_flags: FileFlags) -> Result<(), SystemError> {
+        // todo: 是否需要调用inode的open方法，以更新private data（假如它与flags有关的话）?
         // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
 
-        // 提取 O_CLOEXEC 状态并更新 close_on_exec 字段
-        let close_on_exec = mode.contains(FileMode::O_CLOEXEC);
-        self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
+        // 访问模式不可修改
+        let old_flags = self.flags();
+        let old_accflags = old_flags.access_flags();
+        let new_accflags = new_flags.access_flags();
 
-        // 从 mode 中移除 O_CLOEXEC 标志，保持与构造函数一致的行为
-        mode.remove(FileMode::O_CLOEXEC);
+        if old_accflags != new_accflags {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 只有部分标志可修改
+        const SETFL_MASK: u32 = FileFlags::O_APPEND.bits()
+            | FileFlags::O_NONBLOCK.bits()
+            | FileFlags::O_DIRECT.bits()
+            | FileFlags::O_NOATIME.bits()
+            | FileFlags::FASYNC.bits();
+
+        let new_bits = (new_flags.bits() & SETFL_MASK) | (old_flags.bits() & !SETFL_MASK);
+        new_flags = FileFlags::from_bits_truncate(new_bits);
 
         // 更新文件的打开模式
-        *self.mode.write() = mode;
-        self.private_data.lock().update_mode(mode);
+        *self.flags.write() = new_flags;
+        self.private_data.lock().update_flags(new_flags);
         return Ok(());
     }
 
@@ -760,6 +1019,11 @@ impl File {
         self.pid.lock().replace(pcb);
         // todo: update inode owner
         Ok(())
+    }
+
+    pub fn get_inode_flags(&self) -> Result<InodeFlags, SystemError> {
+        let metadata = self.inode.metadata()?;
+        Ok(metadata.flags)
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::filesystem::{
     procfs::{ProcFS, ProcFileCreationParams, ProcFileType},
-    vfs::{syscall::ModeType, FileSystem, FileType},
+    vfs::{FileSystem, FileType, InodeMode},
 };
 
 pub mod sysctl;
@@ -12,12 +12,16 @@ impl ProcFS {
         // Create /proc/sys directory
         let sys_dir = self
             .root_inode()
-            .create("sys", FileType::Dir, ModeType::from_bits_truncate(0o555))
+            .create("sys", FileType::Dir, InodeMode::from_bits_truncate(0o555))
             .unwrap_or_else(|_| panic!("create /proc/sys error"));
 
         // Create /proc/sys/kernel directory
         let kernel_dir = sys_dir
-            .create("kernel", FileType::Dir, ModeType::from_bits_truncate(0o555))
+            .create(
+                "kernel",
+                FileType::Dir,
+                InodeMode::from_bits_truncate(0o555),
+            )
             .unwrap_or_else(|_| panic!("create /proc/sys/kernel error"));
 
         // Create /proc/sys/kernel/printk file
@@ -25,7 +29,7 @@ impl ProcFS {
             .parent(kernel_dir)
             .name("printk")
             .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o644))
+            .mode(InodeMode::from_bits_truncate(0o644))
             .ftype(ProcFileType::ProcSysKernelPrintk)
             .build()
             .unwrap();

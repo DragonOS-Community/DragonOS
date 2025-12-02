@@ -9,7 +9,7 @@ use crate::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
             SYSFS_ATTR_MODE_RW,
         },
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
 };
 use alloc::sync::Arc;
@@ -76,7 +76,7 @@ impl AttributeGroup for NetAttrGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         return Some(attr.mode());
     }
 }
@@ -94,7 +94,7 @@ impl Attribute for AttrAddrAssignType {
         "addr_assign_type"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -121,7 +121,7 @@ impl Attribute for AttrAddrLen {
         "addr_len"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -143,7 +143,7 @@ impl Attribute for AttrDevId {
         "dev_id"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -165,7 +165,7 @@ impl Attribute for AttrIfalias {
         "ifalias"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RW
     }
 
@@ -191,7 +191,7 @@ impl Attribute for AttrIflink {
         "iflink"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -213,7 +213,7 @@ impl Attribute for AttrIfindex {
         "ifindex"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -235,7 +235,7 @@ impl Attribute for AttrFeatrues {
         "features"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -262,7 +262,7 @@ impl Attribute for AttrType {
         "type"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -291,7 +291,7 @@ impl Attribute for AttrLinkMode {
         "link_mode"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -313,7 +313,7 @@ impl Attribute for AttrAddress {
         "address"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -340,7 +340,7 @@ impl Attribute for AttrBroadcast {
         "broadcast"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -364,7 +364,7 @@ impl Attribute for AttrCarrier {
         "carrier"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -401,7 +401,7 @@ impl Attribute for AttrSpeed {
         "speed"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -426,7 +426,7 @@ impl Attribute for AttrDuplex {
         "duplex"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -450,7 +450,7 @@ impl Attribute for AttrDormant {
         "dormant"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -480,7 +480,7 @@ impl Attribute for AttrOperstate {
         "operstate"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -523,7 +523,7 @@ impl Attribute for AttrMtu {
         "mtu"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -565,7 +565,7 @@ impl Attribute for AttrFlags {
         "flags"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -591,7 +591,7 @@ impl Attribute for AttrTxQueueLen {
         "tx_queue_len"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -617,7 +617,7 @@ impl Attribute for AttrNetdevGroup {
         "netdev_group"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 

@@ -15,7 +15,15 @@ use log::warn;
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
-pub struct SysFcntlHandle;
+// Only allow changing these flags
+const SETFL_MASK: u32 = FileMode::O_APPEND.bits()
+    | FileMode::O_NONBLOCK.bits()
+    | FileMode::O_DSYNC.bits()
+    | FileMode::FASYNC.bits()
+    | FileMode::O_DIRECT.bits()
+    | FileMode::O_NOATIME.bits();
+
+struct SysFcntlHandle;
 
 impl Syscall for SysFcntlHandle {
     fn num_args(&self) -> usize {
@@ -145,12 +153,23 @@ impl SysFcntlHandle {
             }
             FcntlCommand::SetFlags => {
                 // Set file status flags.
+                // According to Linux man page, F_SETFL can only change:
+                // O_APPEND, O_ASYNC, O_DIRECT, O_NOATIME, and O_NONBLOCK
+                // File access mode (O_RDONLY, O_WRONLY, O_RDWR) and file creation flags
+                // (O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC) in arg are ignored.
                 let binding = ProcessManager::current_pcb().fd_table();
                 let fd_table_guard = binding.write();
 
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     let arg = arg as u32;
-                    let mode = FileMode::from_bits(arg).ok_or(SystemError::EINVAL)?;
+
+                    // Get current mode
+                    let current_mode = file.mode();
+                    // Preserve access mode and other non-changeable flags
+                    let preserved = current_mode.bits() & !SETFL_MASK;
+                    // Apply new flags (only the ones allowed to change)
+                    let new_bits = preserved | (arg & SETFL_MASK);
+                    let mode = FileMode::from_bits_truncate(new_bits);
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
                     file.set_mode(mode)?;

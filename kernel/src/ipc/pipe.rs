@@ -1,5 +1,6 @@
 use crate::{
     arch::ipc::signal::Signal,
+    arch::MMArch,
     filesystem::{
         epoll::{
             event_poll::{EventPoll, LockedEPItemLinkedList},
@@ -7,7 +8,7 @@ use crate::{
         },
         vfs::{
             file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
-            FileSystem, FileType, IndexNode, Metadata, PollableInode,
+            FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, PollableInode, SuperBlock,
         },
     },
     ipc::signal_types::SigCode,
@@ -15,20 +16,67 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
+    mm::MemoryManagementArch,
     process::{ProcessFlags, ProcessManager, ProcessState},
     sched::SchedMode,
     time::PosixTimeSpec,
 };
 use alloc::string::String;
+use core::any::Any;
 use core::sync::atomic::compiler_fence;
+use alloc::boxed::Box;
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 use super::signal_types::{SigInfo, SigType};
 
-/// 我们设定pipe_buff的总大小为1024字节
-const PIPE_BUFF_SIZE: usize = 1024;
+/// 管道缓冲区大小（至少为一页大小，以支持原子写入）
+/// Linux 的 PIPE_BUF 通常是 4096 字节，默认管道容量是 65536 字节
+const PIPE_BUFF_SIZE: usize = 65536;
+
+// 管道文件系统 - 全局单例
+lazy_static! {
+    static ref PIPEFS: Arc<PipeFS> = Arc::new(PipeFS);
+}
+
+/// 管道文件系统
+#[derive(Debug)]
+pub struct PipeFS;
+
+impl FileSystem for PipeFS {
+    fn root_inode(&self) -> Arc<dyn IndexNode> {
+        // PipeFS 没有真正的根 inode，但我们需要实现这个方法
+        // 返回一个空的 pipe inode 作为占位符
+        LockedPipeInode::new()
+    }
+
+    fn info(&self) -> FsInfo {
+        FsInfo {
+            blk_dev_id: 0,
+            max_name_len: 255,
+        }
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "pipefs"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        SuperBlock::new(Magic::PIPEFS_MAGIC, MMArch::PAGE_SIZE as u64, 255)
+    }
+}
+
+impl PipeFS {
+    /// 获取全局 PipeFS 实例
+    pub fn instance() -> Arc<PipeFS> {
+        PIPEFS.clone()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PipeFsPrivateData {
@@ -62,7 +110,7 @@ pub struct InnerPipeInode {
     valid_cnt: i32,
     read_pos: i32,
     write_pos: i32,
-    data: [u8; PIPE_BUFF_SIZE],
+    data: Box<[u8; PIPE_BUFF_SIZE]>,
     /// INode 元数据
     metadata: Metadata,
     reader: u32,
@@ -120,7 +168,7 @@ impl LockedPipeInode {
             read_pos: 0,
             write_pos: 0,
             had_reader: false,
-            data: [0; PIPE_BUFF_SIZE],
+            data: Box::new([0; PIPE_BUFF_SIZE]),
 
             metadata: Metadata {
                 dev_id: 0,
@@ -299,26 +347,23 @@ impl IndexNode for LockedPipeInode {
     ) -> Result<(), SystemError> {
         let accmode = mode.accmode();
         let mut guard = self.inner.lock();
-        // 不能以读写方式打开管道
-        if accmode == FileMode::O_RDWR.bits() {
-            return Err(SystemError::EACCES);
-        } else if accmode == FileMode::O_RDONLY.bits() {
+        // 根据访问模式增加读/写计数
+        // 注意：命名管道（FIFO）允许以 O_RDWR 模式打开
+        if accmode == FileMode::O_RDONLY.bits() {
             guard.reader += 1;
             guard.had_reader = true;
-            // println!(
-            //     "FIFO:     pipe try open in read mode with reader pid:{:?}",
-            //     ProcessManager::current_pid()
-            // );
         } else if accmode == FileMode::O_WRONLY.bits() {
-            // println!(
-            //     "FIFO:     pipe try open in write mode with {} reader, writer pid:{:?}",
-            //     guard.reader,
-            //     ProcessManager::current_pid()
-            // );
+            // 非阻塞模式下，如果没有读者，返回 ENXIO
             if guard.reader == 0 && mode.contains(FileMode::O_NONBLOCK) {
                 return Err(SystemError::ENXIO);
             }
             guard.writer += 1;
+        } else if accmode == FileMode::O_RDWR.bits() {
+            // O_RDWR 模式：同时作为读端和写端
+            // 这对于命名管道（FIFO）是有效的
+            guard.reader += 1;
+            guard.writer += 1;
+            guard.had_reader = true;
         }
 
         // 设置mode
@@ -360,7 +405,25 @@ impl IndexNode for LockedPipeInode {
         if accmode == FileMode::O_RDONLY.bits() {
             assert!(guard.reader > 0);
             guard.reader -= 1;
+            // 如果已经没有读端了，则唤醒写端
+            if guard.reader == 0 {
+                self.write_wait_queue
+                    .wakeup_all(Some(ProcessState::Blocked(true)));
+            }
+        }
+
+        // O_RDWR 模式关闭：同时减少读写计数
+        if accmode == FileMode::O_RDWR.bits() {
+            assert!(guard.reader > 0);
+            assert!(guard.writer > 0);
+            guard.reader -= 1;
+            guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
+            if guard.writer == 0 {
+                self.read_wait_queue
+                    .wakeup_all(Some(ProcessState::Blocked(true)));
+            }
+            // 如果已经没有读端了，则唤醒写端
             if guard.reader == 0 {
                 self.write_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
@@ -385,7 +448,7 @@ impl IndexNode for LockedPipeInode {
             return Err(SystemError::EBADF);
         }
 
-        if buf.len() < len || len > PIPE_BUFF_SIZE {
+        if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
         // 加锁
@@ -426,40 +489,72 @@ impl IndexNode for LockedPipeInode {
             }
         }
 
-        // 如果管道空间不够
-        while len + inner_guard.valid_cnt as usize > PIPE_BUFF_SIZE {
-            // 唤醒读端
-            self.read_wait_queue
-                .wakeup(Some(ProcessState::Blocked(true)));
+        let mut total_written: usize = 0;
 
-            // 如果为非阻塞管道，直接返回错误
-            if mode.contains(FileMode::O_NONBLOCK) {
+        // 循环写入，直到写完所有数据
+        while total_written < len {
+            // 计算本次要写入的字节数
+            let remaining = len - total_written;
+            let available_space = PIPE_BUFF_SIZE - inner_guard.valid_cnt as usize;
+
+            // 如果没有可用空间，需要等待
+            if available_space == 0 {
+                // 唤醒读端
+                self.read_wait_queue
+                    .wakeup(Some(ProcessState::Blocked(true)));
+
+                // 如果为非阻塞管道，返回已写入的字节数或 EAGAIN
+                if mode.contains(FileMode::O_NONBLOCK) {
+                    drop(inner_guard);
+                    if total_written > 0 {
+                        return Ok(total_written);
+                    }
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+
+                // 解锁并睡眠
                 drop(inner_guard);
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                let r = wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {});
+                if r.is_err() {
+                    if total_written > 0 {
+                        return Ok(total_written);
+                    }
+                    return Err(SystemError::ERESTARTSYS);
+                }
+                inner_guard = self.inner.lock();
+
+                // 检查读端是否已关闭
+                if inner_guard.reader == 0 && inner_guard.had_reader {
+                    if total_written > 0 {
+                        return Ok(total_written);
+                    }
+                    return Err(SystemError::EPIPE);
+                }
+
+                continue;
             }
 
-            // 解锁并睡眠
-            drop(inner_guard);
-            let r = wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {});
-            if r.is_err() {
-                return Err(SystemError::ERESTARTSYS);
-            }
-            inner_guard = self.inner.lock();
-        }
+            // 计算本次写入的字节数
+            let to_write = core::cmp::min(remaining, available_space);
 
-        // 决定要输入的字节（两段复制处理 wrap 与 end==start 情况）
-        let start = inner_guard.write_pos as usize;
-        let first = core::cmp::min(len, PIPE_BUFF_SIZE - start);
-        let second = len as isize - first as isize;
-        // 第1段：写到缓冲尾部或写完
-        inner_guard.data[start..start + first].copy_from_slice(&buf[0..first]);
-        // 第2段：如需要，从缓冲头部继续
-        if second > 0 {
-            inner_guard.data[0..second as usize].copy_from_slice(&buf[first..len]);
+            // 决定要输入的字节（两段复制处理 wrap 与 end==start 情况）
+            let start = inner_guard.write_pos as usize;
+            let first = core::cmp::min(to_write, PIPE_BUFF_SIZE - start);
+            let second = to_write as isize - first as isize;
+            // 第1段：写到缓冲尾部或写完
+            inner_guard.data[start..start + first]
+                .copy_from_slice(&buf[total_written..total_written + first]);
+            // 第2段：如需要，从缓冲头部继续
+            if second > 0 {
+                inner_guard.data[0..second as usize]
+                    .copy_from_slice(&buf[total_written + first..total_written + to_write]);
+            }
+            // 更新写位置以及valid_cnt
+            inner_guard.write_pos =
+                (inner_guard.write_pos + to_write as i32) % PIPE_BUFF_SIZE as i32;
+            inner_guard.valid_cnt += to_write as i32;
+            total_written += to_write;
         }
-        // 更新写位置以及valid_cnt
-        inner_guard.write_pos = (inner_guard.write_pos + len as i32) % PIPE_BUFF_SIZE as i32;
-        inner_guard.valid_cnt += len as i32;
 
         // 写完后还有位置，则唤醒下一个写者
         if (inner_guard.valid_cnt as usize) < PIPE_BUFF_SIZE {
@@ -478,7 +573,7 @@ impl IndexNode for LockedPipeInode {
         EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
 
         // 返回写入的字节数
-        return Ok(len);
+        return Ok(total_written);
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -496,7 +591,7 @@ impl IndexNode for LockedPipeInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        todo!()
+        PipeFS::instance()
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {

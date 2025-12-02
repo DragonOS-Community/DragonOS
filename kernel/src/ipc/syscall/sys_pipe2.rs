@@ -1,12 +1,8 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::{
     arch::syscall::nr::SYS_PIPE2,
-    filesystem::vfs::{
-        file::{File, FileMode},
-        FilePrivateData,
-    },
-    ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
-    libs::spinlock::SpinLock,
+    filesystem::vfs::file::{File, FileMode},
+    ipc::pipe::LockedPipeInode,
     process::ProcessManager,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
@@ -32,21 +28,15 @@ pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileMode) -> Result<usize, Sy
     let fd = user_buffer.buffer::<i32>(0)?;
     let pipe_ptr = LockedPipeInode::new();
 
-    let mut read_file = File::new(
+    let read_file = File::new(
         pipe_ptr.clone(),
         FileMode::O_RDONLY | (flags & FileMode::O_NONBLOCK),
     )?;
-    read_file.private_data = SpinLock::new(FilePrivateData::Pipefs(PipeFsPrivateData::new(
-        FileMode::O_RDONLY,
-    )));
 
-    let mut write_file = File::new(
+    let write_file = File::new(
         pipe_ptr.clone(),
         FileMode::O_WRONLY | (flags & (FileMode::O_NONBLOCK | FileMode::O_DIRECT)),
     )?;
-    write_file.private_data = SpinLock::new(FilePrivateData::Pipefs(PipeFsPrivateData::new(
-        FileMode::O_WRONLY | (flags & (FileMode::O_NONBLOCK | FileMode::O_DIRECT)),
-    )));
 
     if flags.contains(FileMode::O_CLOEXEC) {
         read_file.set_close_on_exec(true);

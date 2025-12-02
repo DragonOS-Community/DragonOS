@@ -215,11 +215,23 @@ impl File {
     pub fn new(inode: Arc<dyn IndexNode>, mut mode: FileMode) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
-        if file_type == FileType::Pipe {
+        // 检查是否为命名管道（FIFO）
+        let is_named_pipe = if file_type == FileType::Pipe {
             if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
                 inode = pipe_inode;
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+
+        // 对于命名管道，自动添加 O_LARGEFILE 标志（符合 Linux 行为）
+        if is_named_pipe {
+            mode.insert(FileMode::O_LARGEFILE);
         }
+
         let close_on_exec = mode.contains(FileMode::O_CLOEXEC);
         mode.remove(FileMode::O_CLOEXEC);
 
@@ -542,8 +554,9 @@ impl File {
         }
 
         // 暂时认为只要不是read only, 就可写
-        if mode == FileMode::O_RDONLY {
-            return Err(SystemError::EPERM);
+        // 根据 POSIX，尝试写入只读文件描述符应返回 EBADF
+        if mode.accmode() == FileMode::O_RDONLY.bits() {
+            return Err(SystemError::EBADF);
         }
 
         return Ok(());

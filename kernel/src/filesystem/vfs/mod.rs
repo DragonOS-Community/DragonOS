@@ -1013,6 +1013,7 @@ bitflags! {
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
         const MOUNT_MAGIC = 61267;
+        const PIPEFS_MAGIC = 0x50495045;
     }
 }
 

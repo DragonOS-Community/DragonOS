@@ -21,7 +21,7 @@ type = "install-from-prebuilt"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "local"
 # 本地目录路径 - 指向已解压的 sysroot 目录
-source-path = "test/benchmark/lmbench/sysroot"
+source-path = "test/src/benchmark/lmbench/sysroot"
 
 [build]
 

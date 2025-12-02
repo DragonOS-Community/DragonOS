@@ -72,6 +72,10 @@ pub enum ProcFileType {
     ProcSelf,
     ProcFdDir,
     ProcFdFile,
+    /// /proc/<pid>/fdinfo 目录
+    ProcFdInfoDir,
+    /// /proc/<pid>/fdinfo/<fd> 文件
+    ProcFdInfoFile,
     ProcMounts,
     /// /proc/version
     ProcVersion,
@@ -647,6 +651,15 @@ impl ProcFS {
         let fd = pid_dir.create("fd", FileType::Dir, ModeType::from_bits_truncate(0o555))?;
         let fd = fd.as_any_ref().downcast_ref::<LockedProcFSInode>().unwrap();
         fd.0.lock().fdata.ftype = ProcFileType::ProcFdDir;
+
+        // fdinfo dir
+        let fdinfo =
+            pid_dir.create("fdinfo", FileType::Dir, ModeType::from_bits_truncate(0o555))?;
+        let fdinfo = fdinfo
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        fdinfo.0.lock().fdata.ftype = ProcFileType::ProcFdInfoDir;
         //todo: 创建其他文件
 
         return Ok(());
@@ -663,6 +676,7 @@ impl ProcFS {
         pid_dir.unlink("status")?;
         pid_dir.unlink("exe")?;
         pid_dir.rmdir("fd")?;
+        pid_dir.rmdir("fdinfo")?;
 
         // 查看进程文件是否还存在
         // let pf= pid_dir.find("status").expect("Cannot find status");
@@ -754,6 +768,41 @@ impl LockedProcFSInode {
         let res = fd_table.iter().map(|(fd, _)| fd.to_string()).collect();
         return Ok(res);
     }
+
+    fn dynamical_find_fdinfo(&self, fd: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let fd_num = fd.parse::<i32>().map_err(|_| SystemError::EINVAL)?;
+        let pcb = ProcessManager::current_pcb();
+        let fd_table = pcb.fd_table();
+        let fd_table = fd_table.read();
+        let file = fd_table.get_file_by_fd(fd_num);
+        if file.is_some() {
+            drop(fd_table);
+
+            let _ = self.unlink(&fd_num.to_string());
+            // fdinfo 文件是普通文件，不是符号链接
+            let fdinfo_file = self.create(&fd_num.to_string(), FileType::File, ModeType::S_IRUGO)?;
+            let fdinfo_file_proc = fdinfo_file
+                .as_any_ref()
+                .downcast_ref::<LockedProcFSInode>()
+                .unwrap();
+            let mut guard = fdinfo_file_proc.0.lock();
+            guard.fdata.fd = fd_num;
+            guard.fdata.ftype = ProcFileType::ProcFdInfoFile;
+            drop(guard);
+            return Ok(fdinfo_file);
+        } else {
+            return Err(SystemError::ENOENT);
+        }
+    }
+
+    fn dynamical_list_fdinfo(&self) -> Result<Vec<String>, SystemError> {
+        // 与 fd 目录共享相同的列表逻辑
+        let pcb = ProcessManager::current_pcb();
+        let fd_table = pcb.fd_table();
+        let fd_table = fd_table.read();
+        let res = fd_table.iter().map(|(fd, _)| fd.to_string()).collect();
+        return Ok(res);
+    }
 }
 
 /// 为 `/proc/thread-self/ns/*` 节点构造 namespace fd 绑定的私有数据。
@@ -814,6 +863,8 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcKmsg
             | ProcFileType::ProcFdDir
             | ProcFileType::ProcFdFile
+            | ProcFileType::ProcFdInfoDir
+            | ProcFileType::ProcFdInfoFile
             | ProcFileType::ProcThreadSelfNsRoot
             | ProcFileType::ProcSysKernelPrintk => 0,
         };
@@ -1165,6 +1216,9 @@ impl IndexNode for LockedProcFSInode {
                     ProcFileType::ProcFdDir => {
                         return self.dynamical_find_fd(name);
                     }
+                    ProcFileType::ProcFdInfoDir => {
+                        return self.dynamical_find_fdinfo(name);
+                    }
                     ProcFileType::ProcThreadSelfNsRoot => {
                         return self.dynamical_find_thread_self_ns(name);
                     }
@@ -1244,6 +1298,11 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcFdDir => {
                 let mut fd_list = self.dynamical_list_fd()?;
                 keys.append(&mut fd_list);
+                return Ok(keys);
+            }
+            ProcFileType::ProcFdInfoDir => {
+                let mut fdinfo_list = self.dynamical_list_fdinfo()?;
+                keys.append(&mut fdinfo_list);
                 return Ok(keys);
             }
             ProcFileType::ProcThreadSelfNsRoot => {

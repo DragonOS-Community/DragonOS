@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr::SYS_FCNTL;
 use crate::filesystem::vfs::FileType;
-use crate::ipc::pipe::PIPE_BUFF_SIZE;
+use crate::ipc::pipe::LockedPipeInode;
 use crate::process::RawPid;
 use crate::{
     arch::interrupt::TrapFrame,
@@ -66,8 +66,8 @@ impl SysFcntlHandle {
         args[1] as u32
     }
 
-    fn arg(args: &[usize]) -> i32 {
-        args[2] as i32
+    fn arg(args: &[usize]) -> usize {
+        args[2]
     }
 
     /// # fcntl
@@ -76,8 +76,8 @@ impl SysFcntlHandle {
     ///
     /// - `fd`：文件描述符
     /// - `cmd`：命令
-    /// - `arg`：参数
-    pub fn do_fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
+    /// - `arg`：参数（对于某些命令，这是一个 64 位值）
+    pub fn do_fcntl(fd: i32, cmd: FcntlCommand, arg: usize) -> Result<usize, SystemError> {
         // debug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
             FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
@@ -85,10 +85,10 @@ impl SysFcntlHandle {
                 let nofile = ProcessManager::current_pcb()
                     .get_rlimit(crate::process::resource::RLimitID::Nofile)
                     .rlim_cur as usize;
-                if arg < 0 || arg as usize >= nofile {
+                let arg_i32 = arg as i32;
+                if arg_i32 < 0 || arg >= nofile {
                     return Err(SystemError::EBADF);
                 }
-                let arg = arg as usize;
                 let binding = ProcessManager::current_pcb().fd_table();
                 let mut fd_table_guard = binding.write();
 
@@ -181,7 +181,9 @@ impl SysFcntlHandle {
                 return Err(SystemError::EBADF);
             }
             FcntlCommand::SetOwn => {
-                let pid = arg.unsigned_abs();
+                // arg 作为 pid_t（有符号整数）处理
+                let arg_i32 = arg as i32;
+                let pid = arg_i32.unsigned_abs();
                 if pid > i32::MAX as u32 {
                     return Err(SystemError::EINVAL);
                 }
@@ -225,12 +227,17 @@ impl SysFcntlHandle {
                     return Err(SystemError::EBADF);
                 }
 
-                return Ok(PIPE_BUFF_SIZE);
+                // 获取 pipe inode 并返回实际大小
+                let inode = file.inode();
+                let pipe_inode = inode
+                    .as_any_ref()
+                    .downcast_ref::<LockedPipeInode>()
+                    .ok_or(SystemError::EBADF)?;
+
+                return Ok(pipe_inode.get_pipe_size());
             }
             FcntlCommand::SetPipeSize => {
                 // F_SETPIPE_SZ: 设置管道缓冲区大小
-                // 目前 DragonOS 的管道实现使用固定大小的缓冲区，
-                // 所以我们只验证文件是否是管道，然后返回当前大小
                 let binding = ProcessManager::current_pcb().fd_table();
                 let file = binding
                     .read()
@@ -243,9 +250,15 @@ impl SysFcntlHandle {
                     return Err(SystemError::EBADF);
                 }
 
-                // 目前不支持动态调整管道大小，返回当前固定大小
-                // Linux 也会将请求的大小调整为页面大小的倍数
-                return Ok(PIPE_BUFF_SIZE);
+                // 获取 pipe inode 并设置大小
+                let inode = file.inode();
+                let pipe_inode = inode
+                    .as_any_ref()
+                    .downcast_ref::<LockedPipeInode>()
+                    .ok_or(SystemError::EBADF)?;
+
+                // set_pipe_size 内部会验证大小是否合法
+                return pipe_inode.set_pipe_size(arg);
             }
             _ => {
                 // TODO: unimplemented

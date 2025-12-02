@@ -21,8 +21,9 @@ use crate::{
     syscall::user_access::UserBufferWriter,
     time::PosixTimeSpec,
 };
-use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::compiler_fence;
 
@@ -31,9 +32,14 @@ use system_error::SystemError;
 
 use super::signal_types::{SigInfo, SigType};
 
-/// 管道缓冲区大小（至少为一页大小，以支持原子写入）
-/// Linux 的 PIPE_BUF 通常是 4096 字节，默认管道容量是 65536 字节
+/// 管道缓冲区默认大小（Linux 默认 65536 字节）
 pub const PIPE_BUFF_SIZE: usize = 65536;
+
+/// 管道缓冲区最小大小（一页大小，Linux 保证原子写入的最小单位）
+pub const PIPE_MIN_SIZE: usize = 4096;
+
+/// 管道缓冲区最大大小（Linux 默认为 1MB）
+pub const PIPE_MAX_SIZE: usize = 1024 * 1024;
 
 // FIONREAD: 获取管道中可读的字节数
 const FIONREAD: u32 = 0x541B;
@@ -113,7 +119,10 @@ pub struct InnerPipeInode {
     valid_cnt: i32,
     read_pos: i32,
     write_pos: i32,
-    data: Box<[u8; PIPE_BUFF_SIZE]>,
+    /// 管道缓冲区数据（使用 Vec 支持动态大小）
+    data: Vec<u8>,
+    /// 当前缓冲区大小
+    buf_size: usize,
     /// INode 元数据
     metadata: Metadata,
     reader: u32,
@@ -145,7 +154,7 @@ impl InnerPipeInode {
 
         if mode.contains(FileMode::O_WRONLY) {
             // 管道内数据未满
-            if self.valid_cnt as usize != PIPE_BUFF_SIZE {
+            if self.valid_cnt as usize != self.buf_size {
                 events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
             }
 
@@ -159,7 +168,7 @@ impl InnerPipeInode {
     }
 
     fn buf_full(&self) -> bool {
-        return self.valid_cnt as usize == PIPE_BUFF_SIZE;
+        return self.valid_cnt as usize == self.buf_size;
     }
 }
 
@@ -171,7 +180,8 @@ impl LockedPipeInode {
             read_pos: 0,
             write_pos: 0,
             had_reader: false,
-            data: Box::new([0; PIPE_BUFF_SIZE]),
+            data: vec![0u8; PIPE_BUFF_SIZE],
+            buf_size: PIPE_BUFF_SIZE,
 
             metadata: Metadata {
                 dev_id: 0,
@@ -218,6 +228,82 @@ impl LockedPipeInode {
     fn writeable(&self) -> bool {
         let inode = self.inner.lock();
         return !inode.buf_full() || inode.reader == 0;
+    }
+
+    /// 设置管道缓冲区大小
+    /// 成功返回新的大小，失败返回错误
+    pub fn set_pipe_size(&self, size: usize) -> Result<usize, SystemError> {
+        // 验证请求的大小
+        // Linux 限制：不能超过 /proc/sys/fs/pipe-max-size（默认 1MB）
+        // 大于 i32::MAX 的值是无效的（因为在 64 位系统上 long long 可能传入超大值）
+        if size > PIPE_MAX_SIZE || size > i32::MAX as usize {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 将请求的大小向上对齐到页面大小的倍数
+        let page_size = MMArch::PAGE_SIZE;
+        let new_size = if size == 0 {
+            PIPE_MIN_SIZE
+        } else {
+            // 向上对齐到页面大小
+            ((size + page_size - 1) / page_size) * page_size
+        };
+
+        // 确保不小于最小值
+        let new_size = new_size.max(PIPE_MIN_SIZE);
+        // 确保不大于最大值
+        let new_size = new_size.min(PIPE_MAX_SIZE);
+
+        let mut inner = self.inner.lock();
+
+        // 如果新大小小于当前数据量，返回 EBUSY
+        if new_size < inner.valid_cnt as usize {
+            return Err(SystemError::EBUSY);
+        }
+
+        let old_size = inner.buf_size;
+        if new_size == old_size {
+            return Ok(new_size);
+        }
+
+        // 需要重新分配缓冲区
+        let mut new_data = vec![0u8; new_size];
+
+        // 如果有数据，需要迁移
+        if inner.valid_cnt > 0 {
+            let data_len = inner.valid_cnt as usize;
+            let read_pos = inner.read_pos as usize;
+
+            // 从旧缓冲区复制数据到新缓冲区（线性化）
+            if read_pos + data_len <= old_size {
+                // 数据没有跨越缓冲区边界
+                new_data[..data_len].copy_from_slice(&inner.data[read_pos..read_pos + data_len]);
+            } else {
+                // 数据跨越了缓冲区边界
+                let first_part = old_size - read_pos;
+                new_data[..first_part].copy_from_slice(&inner.data[read_pos..old_size]);
+                let second_part = data_len - first_part;
+                new_data[first_part..data_len].copy_from_slice(&inner.data[..second_part]);
+            }
+
+            // 重置读写位置
+            inner.read_pos = 0;
+            inner.write_pos = data_len as i32;
+        } else {
+            inner.read_pos = 0;
+            inner.write_pos = 0;
+        }
+
+        inner.data = new_data;
+        inner.buf_size = new_size;
+        inner.metadata.size = new_size as i64;
+
+        Ok(new_size)
+    }
+
+    /// 获取管道缓冲区大小
+    pub fn get_pipe_size(&self) -> usize {
+        self.inner.lock().buf_size
     }
 }
 
@@ -311,8 +397,9 @@ impl IndexNode for LockedPipeInode {
             num = len;
         }
 
+        let buf_size = inner_guard.buf_size;
         // 采用两段复制，统一处理不跨尾、跨尾、以及 end==start 的写满/读空边界
-        let first = core::cmp::min(num, PIPE_BUFF_SIZE - start);
+        let first = core::cmp::min(num, buf_size - start);
         let second = num as isize - first as isize;
         // 第1段：从 start 开始直到缓冲尾部或读取完
         buf[0..first].copy_from_slice(&inner_guard.data[start..start + first]);
@@ -322,7 +409,7 @@ impl IndexNode for LockedPipeInode {
         }
 
         //更新读位置以及valid_cnt
-        inner_guard.read_pos = (inner_guard.read_pos + num as i32) % PIPE_BUFF_SIZE as i32;
+        inner_guard.read_pos = (inner_guard.read_pos + num as i32) % buf_size as i32;
         inner_guard.valid_cnt -= num as i32;
 
         // 读完以后如果未读完，则唤醒下一个读者
@@ -511,7 +598,8 @@ impl IndexNode for LockedPipeInode {
         while total_written < len {
             // 计算本次要写入的字节数
             let remaining = len - total_written;
-            let available_space = PIPE_BUFF_SIZE - inner_guard.valid_cnt as usize;
+            let buf_size = inner_guard.buf_size;
+            let available_space = buf_size - inner_guard.valid_cnt as usize;
 
             // 如果没有可用空间，需要等待
             if available_space == 0 {
@@ -555,7 +643,7 @@ impl IndexNode for LockedPipeInode {
 
             // 决定要输入的字节（两段复制处理 wrap 与 end==start 情况）
             let start = inner_guard.write_pos as usize;
-            let first = core::cmp::min(to_write, PIPE_BUFF_SIZE - start);
+            let first = core::cmp::min(to_write, buf_size - start);
             let second = to_write as isize - first as isize;
             // 第1段：写到缓冲尾部或写完
             inner_guard.data[start..start + first]
@@ -566,14 +654,13 @@ impl IndexNode for LockedPipeInode {
                     .copy_from_slice(&buf[total_written + first..total_written + to_write]);
             }
             // 更新写位置以及valid_cnt
-            inner_guard.write_pos =
-                (inner_guard.write_pos + to_write as i32) % PIPE_BUFF_SIZE as i32;
+            inner_guard.write_pos = (inner_guard.write_pos + to_write as i32) % buf_size as i32;
             inner_guard.valid_cnt += to_write as i32;
             total_written += to_write;
         }
 
         // 写完后还有位置，则唤醒下一个写者
-        if (inner_guard.valid_cnt as usize) < PIPE_BUFF_SIZE {
+        if (inner_guard.valid_cnt as usize) < inner_guard.buf_size {
             self.write_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
         }

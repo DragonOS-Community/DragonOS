@@ -1,4 +1,0 @@
-IoctlTest/IoctlTestSIOCGIFCONF.ValidateNoArrayGetsLength/1
-IoctlTest/IoctlTestSIOCGIFCONF.ValidateNoPartialIfrsReturned/1
-IoctlTest/IoctlTestSIOCGIFCONF.ValidateNestedPointerCheck/1
-IoctlTest/IoctlTestSIOCGIFCONF.ValidateLoopbackIsPresent/1

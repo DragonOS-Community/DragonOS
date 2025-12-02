@@ -5,7 +5,10 @@ use crate::{
         file::{File, FileMode},
         iov::IoVecs,
     },
-    net::socket::{unix::stream::UnixStreamSocket, AddressFamily, PSOCK},
+    net::socket::{
+        unix::{datagram::UnixDatagramSocket, stream::UnixStreamSocket},
+        AddressFamily, PSOCK,
+    },
     process::ProcessManager,
     syscall::Syscall,
 };
@@ -93,10 +96,21 @@ impl Syscall {
 
         let nonblocking = socket_type.contains(PosixArgsSocketType::NONBLOCK);
 
-        let (socket_a, socket_b) = match (address_family, stype) {
-            (AddressFamily::Unix, PSOCK::Stream) => UnixStreamSocket::new_pair(nonblocking, false),
+        let (socket_a, socket_b): (
+            alloc::sync::Arc<dyn socket::Socket>,
+            alloc::sync::Arc<dyn socket::Socket>,
+        ) = match (address_family, stype) {
+            (AddressFamily::Unix, PSOCK::Stream) => {
+                let (a, b) = UnixStreamSocket::new_pair(nonblocking, false);
+                (a, b)
+            }
             (AddressFamily::Unix, PSOCK::SeqPacket) => {
-                UnixStreamSocket::new_pair(nonblocking, true)
+                let (a, b) = UnixStreamSocket::new_pair(nonblocking, true);
+                (a, b)
+            }
+            (AddressFamily::Unix, PSOCK::Datagram) => {
+                let (a, b) = UnixDatagramSocket::new_pair(nonblocking);
+                (a, b)
             }
             _ => {
                 return Err(SystemError::EAFNOSUPPORT);

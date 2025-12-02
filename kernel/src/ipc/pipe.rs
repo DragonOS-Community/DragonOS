@@ -180,7 +180,7 @@ impl LockedPipeInode {
             read_pos: 0,
             write_pos: 0,
             had_reader: false,
-            data: vec![0u8; PIPE_BUFF_SIZE],
+            data: Vec::new(), // 延迟分配：初始为空，第一次写入时分配
             buf_size: PIPE_BUFF_SIZE,
 
             metadata: Metadata {
@@ -266,11 +266,10 @@ impl LockedPipeInode {
             return Ok(new_size);
         }
 
-        // 需要重新分配缓冲区
-        let mut new_data = vec![0u8; new_size];
-
-        // 如果有数据，需要迁移
+        // 如果有数据，需要重新分配缓冲区并迁移数据
         if inner.valid_cnt > 0 {
+            // 需要重新分配缓冲区
+            let mut new_data = vec![0u8; new_size];
             let data_len = inner.valid_cnt as usize;
             let read_pos = inner.read_pos as usize;
 
@@ -289,12 +288,19 @@ impl LockedPipeInode {
             // 重置读写位置
             inner.read_pos = 0;
             inner.write_pos = data_len as i32;
+            inner.data = new_data;
         } else {
+            // 没有数据，只需更新大小
+            // 如果缓冲区已分配，需要重新分配（大小改变）
+            if !inner.data.is_empty() {
+                inner.data = vec![0u8; new_size];
+            }
+            // 如果缓冲区未分配，保持 data 为空（延迟分配）
+            // 重置读写位置（应该已经为0）
             inner.read_pos = 0;
             inner.write_pos = 0;
         }
 
-        inner.data = new_data;
         inner.buf_size = new_size;
         inner.metadata.size = new_size as i64;
 
@@ -464,10 +470,7 @@ impl IndexNode for LockedPipeInode {
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         let inode = self.inner.lock();
-        let mut metadata = inode.metadata.clone();
-        metadata.size = inode.data.len() as i64;
-
-        return Ok(metadata);
+        return Ok(inode.metadata.clone());
     }
 
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -590,6 +593,13 @@ impl IndexNode for LockedPipeInode {
                     }
                 }
             }
+        }
+
+        // 延迟分配：如果缓冲区未分配，在第一次写入时分配
+        if inner_guard.data.is_empty() {
+            // 分配缓冲区大小为 buf_size
+            let buf_size = inner_guard.buf_size;
+            inner_guard.data = vec![0u8; buf_size];
         }
 
         let mut total_written: usize = 0;

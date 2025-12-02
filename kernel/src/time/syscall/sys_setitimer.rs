@@ -1,6 +1,6 @@
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal, syscall::nr::SYS_SETITIMER},
-    ipc::kill::kill_process,
+    ipc::kill::send_signal_to_pid,
     process::{ProcessControlBlock, ProcessItimers, ProcessManager},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
@@ -140,9 +140,9 @@ impl TimerFunction for ItimerHelper {
         // 根据Linux行为，ITIMER_REAL (SIGALRM) 优先发送给线程组的leader。
         let thread_group_leader = pcb.threads_read_irqsave().group_leader();
         if let Some(leader) = thread_group_leader {
-            let _ = kill_process(leader.raw_pid(), Signal::SIGALRM);
+            let _ = send_signal_to_pid(leader.raw_pid(), Signal::SIGALRM);
         } else {
-            let _ = kill_process(pcb.raw_pid(), Signal::SIGALRM);
+            let _ = send_signal_to_pid(pcb.raw_pid(), Signal::SIGALRM);
         }
 
         // 周期性定时器，则重新启动定时器

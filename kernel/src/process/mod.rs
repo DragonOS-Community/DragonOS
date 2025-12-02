@@ -34,7 +34,7 @@ use crate::{
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
-        kill::kill_process_by_pcb,
+        kill::send_signal_to_pcb,
         sighand::SigHand,
         signal::RestartBlock,
         signal_types::{SigInfo, SigPending},
@@ -397,7 +397,7 @@ impl ProcessManager {
             // 检查子进程的exit_signal，只有在有效时才发送信号
             let exit_signal = current.exit_signal.load(Ordering::SeqCst);
             if exit_signal != Signal::INVALID {
-                let r = crate::ipc::kill::kill_process_by_pcb(parent_pcb.clone(), exit_signal);
+                let r = crate::ipc::kill::send_signal_to_pcb(parent_pcb.clone(), exit_signal);
                 if let Err(e) = r {
                     warn!(
                         "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
@@ -562,7 +562,7 @@ impl ProcessManager {
                 if !Arc::ptr_eq(&leader, &current_pcb)
                     && !leader.flags().contains(ProcessFlags::EXITING)
                 {
-                    let _ = kill_process_by_pcb(leader.clone(), Signal::SIGKILL);
+                    let _ = send_signal_to_pcb(leader.clone(), Signal::SIGKILL);
                 }
 
                 // 再遍历组长维护的 group_tasks，向其他线程发送 SIGKILL
@@ -575,7 +575,7 @@ impl ProcessManager {
                         if task.flags().contains(ProcessFlags::EXITING) {
                             continue;
                         }
-                        let _ = kill_process_by_pcb(task.clone(), Signal::SIGKILL);
+                        let _ = send_signal_to_pcb(task.clone(), Signal::SIGKILL);
                     }
                 }
             }
@@ -1469,7 +1469,7 @@ impl ProcessControlBlock {
                 if sig == Signal::INVALID {
                     continue;
                 }
-                if let Err(e) = crate::ipc::kill::kill_process_by_pcb(child.clone(), sig) {
+                if let Err(e) = crate::ipc::kill::send_signal_to_pcb(child.clone(), sig) {
                     warn!(
                         "adopt_childen: failed to deliver pdeath_signal {:?} to child {:?}: {:?}",
                         sig,

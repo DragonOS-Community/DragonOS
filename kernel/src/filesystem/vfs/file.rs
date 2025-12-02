@@ -20,7 +20,7 @@ use crate::{
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
-    ipc::{kill::kill_process, pipe::PipeFsPrivateData},
+    ipc::{kill::send_signal_to_pid, pipe::PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
     mm::{
         page::PageFlags,
@@ -428,7 +428,7 @@ impl File {
                 // 如果当前文件大小已经达到或超过限制，不允许写入
                 if offset >= limit {
                     // 发送SIGXFSZ信号
-                    let _ = kill_process(
+                    let _ = send_signal_to_pid(
                         current_pcb.raw_pid(),
                         crate::arch::ipc::signal::Signal::SIGXFSZ,
                     );

@@ -10,7 +10,7 @@ use alloc::{sync::Weak, vec::Vec};
 use core::sync::atomic::compiler_fence;
 
 use crate::{
-    arch::ipc::signal::Signal, ipc::kill::kill_process_by_pcb, libs::spinlock::SpinLock,
+    arch::ipc::signal::Signal, ipc::kill::send_signal_to_pcb, libs::spinlock::SpinLock,
     process::ProcessControlBlock,
 };
 use alloc::sync::Arc;
@@ -114,7 +114,7 @@ impl FAsyncItems {
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        let _ = kill_process_by_pcb(pcb, sig);
+        let _ = send_signal_to_pcb(pcb, sig);
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }

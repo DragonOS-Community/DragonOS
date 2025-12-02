@@ -5,6 +5,7 @@ use crate::{
         Metadata, PollableInode,
     },
     libs::spinlock::SpinLockGuard,
+    net::posix::SockAddrIn,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -19,18 +20,7 @@ const SIOCGIFCONF: u32 = 0x8912; // Get interface list
 // Constants for network interface structures
 const IFNAMSIZ: usize = 16;
 
-/// struct sockaddr_in for IPv4 addresses
-/// This matches the C structure layout
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct SockAddrIn {
-    sin_family: u16,   // AF_INET = 2
-    sin_port: u16,     // Port number (network byte order)
-    sin_addr: u32,     // IPv4 address (network byte order)
-    sin_zero: [u8; 8], // Padding to match struct sockaddr size (total 16 bytes)
-}
-
-/// struct ifreq - Interface request structure
+/// ## ifreq - Interface request structure
 /// Used for socket ioctls. Must match C struct layout.
 /// On Linux x86_64: sizeof(ifreq) = 40 bytes
 /// - ifr_name: 16 bytes (IFNAMSIZ)
@@ -61,7 +51,7 @@ impl IfReq {
     }
 }
 
-/// struct ifconf - Interface configuration structure
+/// ## ifconf - Interface configuration structure
 /// Used by SIOCGIFCONF. Must match C struct layout.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

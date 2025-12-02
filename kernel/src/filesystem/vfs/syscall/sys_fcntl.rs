@@ -1,4 +1,6 @@
 use crate::arch::syscall::nr::SYS_FCNTL;
+use crate::filesystem::vfs::FileType;
+use crate::ipc::pipe::PIPE_BUFF_SIZE;
 use crate::process::RawPid;
 use crate::{
     arch::interrupt::TrapFrame,
@@ -208,6 +210,42 @@ impl SysFcntlHandle {
                 let owner = file.owner().unwrap_or(RawPid::from(0));
 
                 return Ok(owner.data());
+            }
+            FcntlCommand::GetPipeSize => {
+                // F_GETPIPE_SZ: 获取管道缓冲区大小
+                let binding = ProcessManager::current_pcb().fd_table();
+                let file = binding
+                    .read()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+
+                // 检查是否是管道
+                let metadata = file.metadata()?;
+                if metadata.file_type != FileType::Pipe {
+                    return Err(SystemError::EBADF);
+                }
+
+                return Ok(PIPE_BUFF_SIZE);
+            }
+            FcntlCommand::SetPipeSize => {
+                // F_SETPIPE_SZ: 设置管道缓冲区大小
+                // 目前 DragonOS 的管道实现使用固定大小的缓冲区，
+                // 所以我们只验证文件是否是管道，然后返回当前大小
+                let binding = ProcessManager::current_pcb().fd_table();
+                let file = binding
+                    .read()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+
+                // 检查是否是管道
+                let metadata = file.metadata()?;
+                if metadata.file_type != FileType::Pipe {
+                    return Err(SystemError::EBADF);
+                }
+
+                // 目前不支持动态调整管道大小，返回当前固定大小
+                // Linux 也会将请求的大小调整为页面大小的倍数
+                return Ok(PIPE_BUFF_SIZE);
             }
             _ => {
                 // TODO: unimplemented

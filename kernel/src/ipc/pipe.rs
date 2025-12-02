@@ -21,10 +21,10 @@ use crate::{
     sched::SchedMode,
     time::PosixTimeSpec,
 };
+use alloc::boxed::Box;
 use alloc::string::String;
 use core::any::Any;
 use core::sync::atomic::compiler_fence;
-use alloc::boxed::Box;
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -33,7 +33,7 @@ use super::signal_types::{SigInfo, SigType};
 
 /// 管道缓冲区大小（至少为一页大小，以支持原子写入）
 /// Linux 的 PIPE_BUF 通常是 4096 字节，默认管道容量是 65536 字节
-const PIPE_BUFF_SIZE: usize = 65536;
+pub const PIPE_BUFF_SIZE: usize = 65536;
 
 // 管道文件系统 - 全局单例
 lazy_static! {
@@ -396,8 +396,10 @@ impl IndexNode for LockedPipeInode {
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
             if guard.writer == 0 {
+                drop(guard); // 先释放 inner 锁，避免潜在的死锁
                 self.read_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
+                return Ok(());
             }
         }
 
@@ -407,8 +409,10 @@ impl IndexNode for LockedPipeInode {
             guard.reader -= 1;
             // 如果已经没有读端了，则唤醒写端
             if guard.reader == 0 {
+                drop(guard); // 先释放 inner 锁，避免死锁
                 self.write_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
+                return Ok(());
             }
         }
 
@@ -418,13 +422,17 @@ impl IndexNode for LockedPipeInode {
             assert!(guard.writer > 0);
             guard.reader -= 1;
             guard.writer -= 1;
+            let wake_reader = guard.writer == 0;
+            let wake_writer = guard.reader == 0;
+            drop(guard); // 先释放 inner 锁
+
             // 如果已经没有写端了，则唤醒读端
-            if guard.writer == 0 {
+            if wake_reader {
                 self.read_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
             }
             // 如果已经没有读端了，则唤醒写端
-            if guard.reader == 0 {
+            if wake_writer {
                 self.write_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
             }
@@ -451,6 +459,11 @@ impl IndexNode for LockedPipeInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
+
+        // 提前释放 data 锁，因为后续可能需要睡眠
+        // 我们已经提取了需要的 mode 信息
+        drop(data);
+
         // 加锁
         let mut inner_guard = self.inner.lock();
 
@@ -566,7 +579,9 @@ impl IndexNode for LockedPipeInode {
         self.read_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
 
-        let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&data)? as u32);
+        // 构造用于 poll 的 FilePrivateData
+        let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData::new(mode));
+        let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&poll_data)? as u32);
 
         drop(inner_guard);
         // 唤醒epoll中等待的进程

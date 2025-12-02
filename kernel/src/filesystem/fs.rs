@@ -2,8 +2,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::sync::Arc;
 
-use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::IndexNode;
+use crate::filesystem::vfs::InodeMode;
 use crate::libs::rwlock::RwLock;
 use crate::process::ProcessManager;
 #[derive(Debug, Clone)]
@@ -23,7 +23,7 @@ impl PathContext {
 
 #[derive(Debug)]
 pub struct FsStruct {
-    umask: AtomicU32, // 文件权限掩码 ModeType
+    umask: AtomicU32, // 文件权限掩码
     path_context: RwLock<PathContext>,
 }
 
@@ -46,20 +46,20 @@ impl Default for FsStruct {
 impl FsStruct {
     pub fn new() -> Self {
         Self {
-            umask: AtomicU32::new(ModeType::S_IWUGO.bits()),
+            umask: AtomicU32::new(InodeMode::S_IWUGO.bits()),
             path_context: RwLock::new(PathContext::new()),
         }
     }
 
-    pub fn umask(&self) -> ModeType {
-        ModeType::from_bits_truncate(self.umask.load(Ordering::SeqCst))
+    pub fn umask(&self) -> InodeMode {
+        InodeMode::from_bits_truncate(self.umask.load(Ordering::SeqCst))
     }
 
     /// Linux: xchg(&current->fs->umask, mask & S_IRWXUGO)
-    pub fn set_umask(&self, mask: ModeType) -> ModeType {
-        ModeType::from_bits_truncate(
+    pub fn set_umask(&self, mask: InodeMode) -> InodeMode {
+        InodeMode::from_bits_truncate(
             self.umask
-                .swap(mask.bits() & ModeType::S_IRWXUGO.bits(), Ordering::SeqCst),
+                .swap(mask.bits() & InodeMode::S_IRWXUGO.bits(), Ordering::SeqCst),
         )
     }
 

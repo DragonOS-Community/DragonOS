@@ -24,10 +24,9 @@ use crate::mm::VmFaultReason;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
-        file::{FileMode, FilePrivateData},
-        syscall::ModeType,
+        file::{FileFlags, FilePrivateData},
         vcore::generate_inode_id,
-        FileSystem, FileType, IndexNode, InodeId, Metadata,
+        FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
     },
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -237,7 +236,8 @@ impl LockedFATInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type,
-                mode: ModeType::S_IRWXUGO,
+                mode: InodeMode::S_IRWXUGO,
+                flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -502,7 +502,8 @@ impl FATFileSystem {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
-                mode: ModeType::S_IRWXUGO,
+                mode: InodeMode::S_IRWXUGO,
+                flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -1643,7 +1644,7 @@ impl IndexNode for LockedFATInode {
         &self,
         name: &str,
         file_type: FileType,
-        _mode: ModeType,
+        _mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 由于FAT32不支持文件权限的功能，因此忽略mode参数
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
@@ -1848,7 +1849,7 @@ impl IndexNode for LockedFATInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
@@ -1996,7 +1997,7 @@ impl IndexNode for LockedFATInode {
     fn mknod(
         &self,
         filename: &str,
-        mode: ModeType,
+        mode: InodeMode,
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
@@ -2004,8 +2005,8 @@ impl IndexNode for LockedFATInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        let mode = if (mode.bits() & ModeType::S_IFMT.bits()) == 0 {
-            mode | ModeType::S_IFREG
+        let mode = if (mode.bits() & InodeMode::S_IFMT.bits()) == 0 {
+            mode | InodeMode::S_IFREG
         } else {
             mode
         };
@@ -2015,7 +2016,7 @@ impl IndexNode for LockedFATInode {
         let final_mode = mode & !umask;
 
         // 判断需要创建的类型
-        if unlikely(final_mode.contains(ModeType::S_IFREG)) {
+        if unlikely(final_mode.contains(InodeMode::S_IFREG)) {
             // 普通文件
             drop(inode);
             return self.create(filename, FileType::File, mode);
@@ -2029,16 +2030,16 @@ impl IndexNode for LockedFATInode {
             FATDirEntry::File(FATFile::default()),
         );
 
-        if final_mode.contains(ModeType::S_IFIFO) {
+        if final_mode.contains(InodeMode::S_IFIFO) {
             nod.0.lock().metadata.file_type = FileType::Pipe;
             // 创建pipe文件
             let pipe_inode = LockedPipeInode::new();
             // 设置special_node
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-        } else if final_mode.contains(ModeType::S_IFBLK) {
+        } else if final_mode.contains(InodeMode::S_IFBLK) {
             nod.0.lock().metadata.file_type = FileType::BlockDevice;
             unimplemented!()
-        } else if final_mode.contains(ModeType::S_IFCHR) {
+        } else if final_mode.contains(InodeMode::S_IFCHR) {
             nod.0.lock().metadata.file_type = FileType::CharDevice;
             unimplemented!()
         } else {

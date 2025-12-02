@@ -4,7 +4,6 @@ use alloc::sync::Arc;
 use log::{error, info};
 use system_error::SystemError;
 
-use crate::filesystem::vfs::permission::PermissionMask;
 use crate::libs::casting::DowncastArc;
 use crate::{
     define_event_trace,
@@ -15,7 +14,10 @@ use crate::{
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
-        vfs::{syscall::ModeType, AtomicInodeId, FileSystem, FileType, MountFS},
+        vfs::{
+            permission::PermissionMask, AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode,
+            MountFS,
+        },
     },
     mm::truncate::truncate_inode_pages,
     process::{namespace::mnt::mnt_namespace_init, ProcessManager},
@@ -90,17 +92,17 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     // 因为是换根所以路径没有变化
     // 不需要重新注册挂载目录
     new_root_inode
-        .mkdir("proc", ModeType::from_bits_truncate(0o755))
+        .mkdir("proc", InodeMode::from_bits_truncate(0o755))
         .expect("Unable to create /proc")
         .mount_from(old_root_inode.find("proc").expect("proc not mounted!"))
         .expect("Failed to migrate filesystem of proc");
     new_root_inode
-        .mkdir("dev", ModeType::from_bits_truncate(0o755))
+        .mkdir("dev", InodeMode::from_bits_truncate(0o755))
         .expect("Unable to create /dev")
         .mount_from(old_root_inode.find("dev").expect("dev not mounted!"))
         .expect("Failed to migrate filesystem of dev");
     new_root_inode
-        .mkdir("sys", ModeType::from_bits_truncate(0o755))
+        .mkdir("sys", InodeMode::from_bits_truncate(0o755))
         .expect("Unable to create /sys")
         .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
         .expect("Failed to migrate filesystem of sys");
@@ -182,9 +184,9 @@ pub fn change_root_fs() -> Result<(), SystemError> {
 define_event_trace!(
     do_mkdir_at,
     TP_system(vfs),
-    TP_PROTO(path:&str, mode: ModeType),
+    TP_PROTO(path:&str, mode: InodeMode),
     TP_STRUCT__entry {
-        fmode: ModeType,
+        fmode: InodeMode,
         path: [u8;64],
     },
     TP_fast_assign {
@@ -210,7 +212,7 @@ define_event_trace!(
 pub fn do_mkdir_at(
     dirfd: i32,
     path: &str,
-    mode: ModeType,
+    mode: InodeMode,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     trace_do_mkdir_at(path, mode);
     if path.is_empty() {
@@ -242,12 +244,12 @@ pub fn do_mkdir_at(
     if current_inode.find(name).is_ok() {
         return Err(SystemError::EEXIST);
     }
-    let mut final_mode_bits = mode.bits() & ModeType::S_IRWXUGO.bits();
-    if (parent_md.mode.bits() & ModeType::S_ISGID.bits()) != 0 {
-        final_mode_bits |= ModeType::S_ISGID.bits();
+    let mut final_mode_bits = mode.bits() & InodeMode::S_IRWXUGO.bits();
+    if (parent_md.mode.bits() & InodeMode::S_ISGID.bits()) != 0 {
+        final_mode_bits |= InodeMode::S_ISGID.bits();
     }
     let umask = pcb.fs_struct().umask();
-    let final_mode = ModeType::from_bits_truncate(final_mode_bits) & !umask;
+    let final_mode = InodeMode::from_bits_truncate(final_mode_bits) & !umask;
 
     // 执行创建
     return current_inode.mkdir(name, final_mode);
@@ -375,6 +377,21 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
     }
     if md.file_type != FileType::File {
         return Err(SystemError::EINVAL);
+    }
+
+    // S_IMMUTABLE 文件不能被截断
+    if md.flags.contains(InodeFlags::S_IMMUTABLE) {
+        return Err(SystemError::EPERM);
+    }
+
+    // S_APPEND 文件不能被截断（只能追加）
+    if md.flags.contains(InodeFlags::S_APPEND) {
+        return Err(SystemError::EPERM);
+    }
+
+    // S_SWAPFILE 文件不能被截断
+    if md.flags.contains(InodeFlags::S_SWAPFILE) {
+        return Err(SystemError::ETXTBSY);
     }
 
     // 只读挂载检查：若当前 fs 是 MountFS 且带 RDONLY 标志，拒绝写

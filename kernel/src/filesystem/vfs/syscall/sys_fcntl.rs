@@ -1,12 +1,13 @@
 use crate::arch::syscall::nr::SYS_FCNTL;
 use crate::filesystem::vfs::FileType;
+use crate::filesystem::vfs::InodeFlags;
 use crate::ipc::pipe::LockedPipeInode;
 use crate::process::RawPid;
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
         fcntl::{FcntlCommand, FD_CLOEXEC},
-        file::FileMode,
+        file::FileFlags,
         syscall::dup2::{do_dup2, do_dup3},
     },
     process::ProcessManager,
@@ -18,12 +19,12 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 // Only allow changing these flags
-const SETFL_MASK: u32 = FileMode::O_APPEND.bits()
-    | FileMode::O_NONBLOCK.bits()
-    | FileMode::O_DSYNC.bits()
-    | FileMode::FASYNC.bits()
-    | FileMode::O_DIRECT.bits()
-    | FileMode::O_NOATIME.bits();
+const SETFL_MASK: u32 = FileFlags::O_APPEND.bits()
+    | FileFlags::O_NONBLOCK.bits()
+    | FileFlags::O_DSYNC.bits()
+    | FileFlags::FASYNC.bits()
+    | FileFlags::O_DIRECT.bits()
+    | FileFlags::O_NOATIME.bits();
 
 struct SysFcntlHandle;
 
@@ -98,7 +99,12 @@ impl SysFcntlHandle {
                         if cmd == FcntlCommand::DupFd {
                             return do_dup2(fd, i as i32, &mut fd_table_guard);
                         } else {
-                            return do_dup3(fd, i as i32, FileMode::O_CLOEXEC, &mut fd_table_guard);
+                            return do_dup3(
+                                fd,
+                                i as i32,
+                                FileFlags::O_CLOEXEC,
+                                &mut fd_table_guard,
+                            );
                         }
                     }
                 }
@@ -148,7 +154,7 @@ impl SysFcntlHandle {
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    return Ok(file.mode().bits() as usize);
+                    return Ok(file.flags().bits() as usize);
                 }
 
                 return Err(SystemError::EBADF);
@@ -166,15 +172,21 @@ impl SysFcntlHandle {
                     let arg = arg as u32;
 
                     // Get current mode
-                    let current_mode = file.mode();
+                    let current_flags = file.flags();
                     // Preserve access mode and other non-changeable flags
-                    let preserved = current_mode.bits() & !SETFL_MASK;
+                    let preserved = current_flags.bits() & !SETFL_MASK;
                     // Apply new flags (only the ones allowed to change)
                     let new_bits = preserved | (arg & SETFL_MASK);
-                    let mode = FileMode::from_bits_truncate(new_bits);
+                    let new_flags = FileFlags::from_bits_truncate(new_bits);
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    file.set_mode(mode)?;
+                    let inode_flags = file.get_inode_flags()?;
+                    if inode_flags.contains(InodeFlags::S_APPEND)
+                        && !new_flags.contains(FileFlags::O_APPEND)
+                    {
+                        return Err(SystemError::EPERM);
+                    }
+                    file.set_flags(new_flags)?;
                     return Ok(0);
                 }
 

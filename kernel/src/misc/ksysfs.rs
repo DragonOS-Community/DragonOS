@@ -2,7 +2,7 @@ use crate::{
     driver::base::kobject::{CommonKobj, DynamicKObjKType, KObject, KObjectManager},
     filesystem::{
         sysfs::{sysfs_instance, Attribute, AttributeGroup},
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
     init::initcall::INITCALL_CORE,
 };
@@ -61,7 +61,7 @@ impl AttributeGroup for KernelAttrGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         Some(attr.mode())
     }
 }

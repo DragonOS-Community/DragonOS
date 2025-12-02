@@ -13,8 +13,8 @@ bitflags::bitflags! {
         const DCCP      = 6;    // 0b0000_0110
         const PACKET    = 10;   // 0b0000_1010
 
-        const NONBLOCK  = crate::filesystem::vfs::file::FileMode::O_NONBLOCK.bits();
-        const CLOEXEC   = crate::filesystem::vfs::file::FileMode::O_CLOEXEC.bits();
+        const NONBLOCK  = crate::filesystem::vfs::file::FileFlags::O_NONBLOCK.bits();
+        const CLOEXEC   = crate::filesystem::vfs::file::FileFlags::O_CLOEXEC.bits();
     }
 }
 
@@ -43,13 +43,15 @@ use core::ffi::CStr;
 use system_error::SystemError;
 
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
+/// struct sockaddr_in for IPv4 addresses
+/// This matches the C structure layout
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SockAddrIn {
-    pub sin_family: u16,
-    pub sin_port: u16,
-    pub sin_addr: u32,
-    pub sin_zero: [u8; 8],
+    pub sin_family: u16,   // AF_INET = 2
+    pub sin_port: u16,     // Port number (network byte order)
+    pub sin_addr: u32,     // IPv4 address (network byte order)
+    pub sin_zero: [u8; 8], // Padding to match struct sockaddr size (total 16 bytes)
 }
 
 #[repr(C)]

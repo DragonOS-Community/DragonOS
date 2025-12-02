@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_FCHMOD;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::syscall::ModeType,
+    filesystem::vfs::InodeMode,
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
@@ -20,7 +20,7 @@ impl Syscall for SysFchmodHandle {
         let fd = Self::fd(args);
         let mode = Self::mode(args);
 
-        let _mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
+        let _mode = InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?;
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
         let _file = fd_table_guard

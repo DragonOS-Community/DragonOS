@@ -3,10 +3,10 @@ use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use crate::arch::MMArch;
 use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::FileType;
+use crate::filesystem::vfs::InodeMode;
 use crate::mm::verify_area;
 use crate::mm::MemoryManagementArch;
 use crate::process::pid::PidPrivateData;
@@ -504,8 +504,8 @@ impl ProcessManager {
                 ProcessManager::current_pcb().raw_pid().data(),
                 pid
             );
-            let new_inode = root_inode.create(&name, FileType::File, ModeType::S_IRWXUGO)?;
-            let file = File::new(new_inode, FileMode::O_RDWR | FileMode::O_CLOEXEC)?;
+            let new_inode = root_inode.create(&name, FileType::File, InodeMode::S_IRWXUGO)?;
+            let file = File::new(new_inode, FileFlags::O_RDWR | FileFlags::O_CLOEXEC)?;
             {
                 let mut guard = file.private_data.lock();
                 *guard = FilePrivateData::Pid(PidPrivateData::new(pid));

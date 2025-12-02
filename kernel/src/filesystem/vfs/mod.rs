@@ -1,3 +1,4 @@
+pub mod fasync;
 pub mod fcntl;
 pub mod file;
 pub mod iov;
@@ -36,7 +37,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id};
+use self::{file::FileFlags, utils::DName, vcore::generate_inode_id};
 pub use self::{file::FilePrivateData, mount::MountFS};
 
 use super::page_cache::PageCache;
@@ -70,36 +71,124 @@ pub enum FileType {
     Socket,
 }
 
-impl From<FileType> for ModeType {
+bitflags! {
+    /// 文件类型和权限
+    #[repr(C)]
+    pub struct InodeMode: u32 {
+        /// 掩码
+        const S_IFMT = 0o0_170_000;
+        /// 文件类型
+        const S_IFSOCK = 0o140000;
+        const S_IFLNK = 0o120000;
+        const S_IFREG = 0o100000;
+        const S_IFBLK = 0o060000;
+        const S_IFDIR = 0o040000;
+        const S_IFCHR = 0o020000;
+        const S_IFIFO = 0o010000;
+
+        const S_ISUID = 0o004000;
+        const S_ISGID = 0o002000;
+        const S_ISVTX = 0o001000;
+        /// 文件用户权限
+        const S_IRWXU = 0o0700;
+        const S_IRUSR = 0o0400;
+        const S_IWUSR = 0o0200;
+        const S_IXUSR = 0o0100;
+        /// 文件组权限
+        const S_IRWXG = 0o0070;
+        const S_IRGRP = 0o0040;
+        const S_IWGRP = 0o0020;
+        const S_IXGRP = 0o0010;
+        /// 文件其他用户权限
+        const S_IRWXO = 0o0007;
+        const S_IROTH = 0o0004;
+        const S_IWOTH = 0o0002;
+        const S_IXOTH = 0o0001;
+
+        /// 0o777
+        const S_IRWXUGO = Self::S_IRWXU.bits | Self::S_IRWXG.bits | Self::S_IRWXO.bits;
+        /// 0o7777
+        const S_IALLUGO = Self::S_ISUID.bits | Self::S_ISGID.bits | Self::S_ISVTX.bits| Self::S_IRWXUGO.bits;
+        /// 0o444
+        const S_IRUGO = Self::S_IRUSR.bits | Self::S_IRGRP.bits | Self::S_IROTH.bits;
+        /// 0o222
+        const S_IWUGO = Self::S_IWUSR.bits | Self::S_IWGRP.bits | Self::S_IWOTH.bits;
+        /// 0o111
+        const S_IXUGO = Self::S_IXUSR.bits | Self::S_IXGRP.bits | Self::S_IXOTH.bits;
+    }
+}
+
+impl From<FileType> for InodeMode {
     fn from(val: FileType) -> Self {
         match val {
-            FileType::File => ModeType::S_IFREG,
-            FileType::Dir => ModeType::S_IFDIR,
-            FileType::BlockDevice => ModeType::S_IFBLK,
-            FileType::CharDevice => ModeType::S_IFCHR,
-            FileType::SymLink => ModeType::S_IFLNK,
-            FileType::Socket => ModeType::S_IFSOCK,
-            FileType::Pipe => ModeType::S_IFIFO,
-            FileType::KvmDevice => ModeType::S_IFCHR,
-            FileType::FramebufferDevice => ModeType::S_IFCHR,
+            FileType::File => InodeMode::S_IFREG,
+            FileType::Dir => InodeMode::S_IFDIR,
+            FileType::BlockDevice => InodeMode::S_IFBLK,
+            FileType::CharDevice => InodeMode::S_IFCHR,
+            FileType::SymLink => InodeMode::S_IFLNK,
+            FileType::Socket => InodeMode::S_IFSOCK,
+            FileType::Pipe => InodeMode::S_IFIFO,
+            FileType::KvmDevice => InodeMode::S_IFCHR,
+            FileType::FramebufferDevice => InodeMode::S_IFCHR,
         }
     }
 }
 
-impl From<ModeType> for FileType {
-    fn from(mode: ModeType) -> Self {
+impl From<InodeMode> for FileType {
+    fn from(mode: InodeMode) -> Self {
         // 提取文件类型部分
-        match mode & ModeType::S_IFMT {
-            t if t == ModeType::S_IFREG => FileType::File,
-            t if t == ModeType::S_IFDIR => FileType::Dir,
-            t if t == ModeType::S_IFBLK => FileType::BlockDevice,
-            t if t == ModeType::S_IFCHR => FileType::CharDevice,
-            t if t == ModeType::S_IFLNK => FileType::SymLink,
-            t if t == ModeType::S_IFSOCK => FileType::Socket,
-            t if t == ModeType::S_IFIFO => FileType::Pipe,
+        match mode & InodeMode::S_IFMT {
+            t if t == InodeMode::S_IFREG => FileType::File,
+            t if t == InodeMode::S_IFDIR => FileType::Dir,
+            t if t == InodeMode::S_IFBLK => FileType::BlockDevice,
+            t if t == InodeMode::S_IFCHR => FileType::CharDevice,
+            t if t == InodeMode::S_IFLNK => FileType::SymLink,
+            t if t == InodeMode::S_IFSOCK => FileType::Socket,
+            t if t == InodeMode::S_IFIFO => FileType::Pipe,
             // 默认情况，通常应该不会发生，因为 S_IFMT 应该覆盖所有情况
             _ => FileType::File,
         }
+    }
+}
+
+bitflags! {
+    pub struct InodeFlags: u32 {
+        /// 写入时立即同步到磁盘
+        const S_SYNC = (1 << 0);
+        /// 不更新访问时间
+        const S_NOATIME = (1 << 1);
+        /// 只允许追加写入
+        const S_APPEND = (1 << 2);
+        /// 不可修改的文件
+        const S_IMMUTABLE = (1 << 3);
+        /// 目录已删除但仍被打开
+        const S_DEAD = (1 << 4);
+        /// 不计入磁盘配额
+        const S_NOQUOTA = (1 << 5);
+        /// 目录操作同步写入
+        const S_DIRSYNC = (1 << 6);
+        /// 不更新 ctime/mtime
+        const S_NOCMTIME = (1 << 7);
+        /// 交换文件，禁止截断（swapon已获取块映射）
+        const S_SWAPFILE = (1 << 8);
+        /// 文件系统内部使用的私有inode
+        const S_PRIVATE = (1 << 9);
+        /// 关联了IMA（完整性度量架构）结构
+        const S_IMA = (1 << 10);
+        /// 自动挂载点或引用目录
+        const S_AUTOMOUNT = (1 << 11);
+        /// 无suid或xattr安全属性
+        const S_NOSEC = (1 << 12);
+        /// 直接访问模式，绕过页缓存
+        const S_DAX = (1 << 13);
+        /// 加密文件（使用fs/crypto/）
+        const S_ENCRYPTED = (1 << 14);
+        /// 大小写不敏感的文件
+        const S_CASEFOLD = (1 << 15);
+        /// 完整性校验文件（使用fs/verity/）
+        const S_VERITY = (1 << 16);
+        /// 内核正在使用的文件（如cachefiles）
+        const S_KERNEL_FILE = (1 << 17);
     }
 }
 
@@ -184,6 +273,26 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
         epitm: &Arc<EPollItem>,
         private_data: &FilePrivateData,
     ) -> Result<(), SystemError>;
+
+    /// Add a fasync item for SIGIO notification
+    fn add_fasync(
+        &self,
+        _fasync_item: Arc<fasync::FAsyncItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        // Default implementation: not supported
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Remove a fasync item
+    fn remove_fasync(
+        &self,
+        _file: &alloc::sync::Weak<file::File>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        // Default implementation: not supported
+        Err(SystemError::ENOSYS)
+    }
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
@@ -206,7 +315,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
@@ -344,7 +453,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-ENOSYS)的返回值
         return self.create_with_data(name, file_type, mode, 0);
@@ -363,7 +472,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         _name: &str,
         _file_type: FileType,
-        _mode: ModeType,
+        _mode: InodeMode,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
@@ -585,6 +694,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 将当前inode的内容同步到具体设备上
     fn sync(&self) -> Result<(), SystemError> {
+        // todo：完善元数据的同步
+        self.datasync()
+    }
+
+    /// @brief 仅同步数据到磁盘（不包括元数据）
+    ///
+    /// O_DSYNC 语义：确保数据写入完成，但不保证元数据（如 mtime）更新
+    /// 默认实现调用 sync（向后兼容）
+    fn datasync(&self) -> Result<(), SystemError> {
         let page_cache = self.page_cache();
         if let Some(page_cache) = page_cache {
             return page_cache.lock_irqsave().sync();
@@ -598,7 +716,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn mknod(
         &self,
         _filename: &str,
-        _mode: ModeType,
+        _mode: InodeMode,
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Err(SystemError::ENOSYS);
@@ -613,13 +731,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// # 参数
     ///
     /// - `name`: &str - 要新建的目录项的名称。
-    /// - `mode`: ModeType - 设置目录项的权限模式。
+    /// - `mode`: InodeMode - 设置目录项的权限模式。
     ///
     /// # 返回值
     ///
     /// - `Ok(Arc<dyn IndexNode>)`: 成功时返回`name`目录项的共享引用。
     /// - `Err(SystemError)`: 出错时返回错误信息。
-    fn mkdir(&self, name: &str, mode: ModeType) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn mkdir(&self, name: &str, mode: InodeMode) -> Result<Arc<dyn IndexNode>, SystemError> {
         match self.find(name) {
             Ok(inode) => {
                 if inode.metadata()?.file_type == FileType::Dir {
@@ -942,7 +1060,10 @@ pub struct Metadata {
     pub file_type: FileType,
 
     /// 权限
-    pub mode: ModeType,
+    pub mode: InodeMode,
+
+    /// inode运行时状态
+    pub flags: InodeFlags,
 
     /// 硬链接的数量
     pub nlinks: usize,
@@ -970,7 +1091,8 @@ impl Default for Metadata {
             ctime: PosixTimeSpec::default(),
             btime: PosixTimeSpec::default(),
             file_type: FileType::File,
-            mode: ModeType::empty(),
+            mode: InodeMode::empty(),
+            flags: InodeFlags::empty(),
             nlinks: 1,
             uid: 0,
             gid: 0,
@@ -1147,7 +1269,7 @@ pub struct FsInfo {
 }
 
 impl Metadata {
-    pub fn new(file_type: FileType, mode: ModeType) -> Self {
+    pub fn new(file_type: FileType, mode: InodeMode) -> Self {
         Metadata {
             dev_id: 0,
             inode_id: generate_inode_id(),
@@ -1160,6 +1282,7 @@ impl Metadata {
             btime: PosixTimeSpec::default(),
             file_type,
             mode,
+            flags: InodeFlags::empty(),
             nlinks: 1,
             uid: 0,
             gid: 0,

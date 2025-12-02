@@ -15,7 +15,7 @@ use crate::{
             KernFSInode,
         },
         sysfs::{SysFSOps, SysFSOpsSupport},
-        vfs::{syscall::ModeType, PollStatus},
+        vfs::{InodeMode, PollStatus},
     },
 };
 
@@ -116,7 +116,7 @@ impl SysFS {
         &self,
         parent: &Arc<KernFSInode>,
         attr: &'static dyn Attribute,
-        mode: ModeType,
+        mode: InodeMode,
     ) -> Result<(), SystemError> {
         let x = parent.private_data_mut();
         let kobj: Arc<dyn KObject>;
@@ -154,7 +154,7 @@ impl SysFS {
         let sys_priv = SysFSKernPrivateData::File(SysKernFilePriv::new(&kobj, Some(attr), None));
         let r = parent.add_file(
             attr.name().to_string(),
-            mode.bitand(ModeType::S_IRWXUGO),
+            mode.bitand(InodeMode::S_IRWXUGO),
             Some(4096),
             Some(KernInodePrivateData::SysFS(sys_priv)),
             Some(kern_callback),
@@ -234,7 +234,7 @@ impl SysFS {
         &self,
         parent: &Arc<KernFSInode>,
         attr: &Arc<dyn BinAttribute>,
-        mode: ModeType,
+        mode: InodeMode,
     ) -> Result<(), SystemError> {
         let x = parent.private_data_mut();
         let kobj: Arc<dyn KObject>;
@@ -266,7 +266,7 @@ impl SysFS {
             SysFSKernPrivateData::File(SysKernFilePriv::new(&kobj, None, Some(attr.clone())));
         let r = parent.add_file(
             attr.name().to_string(),
-            mode.bitand(ModeType::S_IRWXUGO),
+            mode.bitand(InodeMode::S_IRWXUGO),
             Some(attr.size()),
             Some(KernInodePrivateData::SysFS(sys_priv)),
             Some(kern_callback),

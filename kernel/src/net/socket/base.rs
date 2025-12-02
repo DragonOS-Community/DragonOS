@@ -1,7 +1,7 @@
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        vfs::{IndexNode, PollableInode},
+        vfs::{fasync::FAsyncItems, IndexNode, PollableInode},
     },
     libs::wait_queue::WaitQueue,
     net::{
@@ -27,6 +27,9 @@ pub trait Socket: PollableInode + IndexNode {
     fn wait_queue(&self) -> &WaitQueue;
 
     fn epoll_items(&self) -> &EPollItems;
+
+    /// Get the fasync items for async I/O notification
+    fn fasync_items(&self) -> &FAsyncItems;
 
     fn check_io_event(&self) -> EPollEventType;
 

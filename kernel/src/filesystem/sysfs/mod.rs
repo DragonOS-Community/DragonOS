@@ -4,7 +4,7 @@ use self::{dir::SysKernDirPriv, file::SysKernFilePriv};
 
 use super::{
     kernfs::{KernFS, KernFSInode},
-    vfs::{syscall::ModeType, FileSystem},
+    vfs::{FileSystem, InodeMode},
 };
 use crate::{
     driver::base::kobject::KObject,
@@ -44,7 +44,7 @@ pub fn sysfs_init() -> Result<(), SystemError> {
         let root_inode = ProcessManager::current_mntns().root_inode();
         // sysfs 挂载
         root_inode
-            .mkdir("sys", ModeType::from_bits_truncate(0o755))
+            .mkdir("sys", InodeMode::from_bits_truncate(0o755))
             .expect("Unabled to find /sys")
             .mount(sysfs_instance().fs().clone(), MountFlags::empty())
             .expect("Failed to mount at /sys");
@@ -107,27 +107,27 @@ pub trait AttributeGroup: Debug + Send + Sync {
     /// 如果返回None，则使用Attribute的mode()方法返回的权限
     ///
     /// 如果返回Some，则使用返回的权限。
-    /// 如果要标识属性不可见，则返回Some(ModeType::empty())
+    /// 如果要标识属性不可见，则返回Some(InodeMode::empty())
     fn is_visible(
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         return Some(attr.mode());
     }
 }
 
 /// sysfs只读属性文件的权限
-pub const SYSFS_ATTR_MODE_RO: ModeType = ModeType::S_IRUGO;
+pub const SYSFS_ATTR_MODE_RO: InodeMode = InodeMode::S_IRUGO;
 /// sysfs只写属性文件的权限
-pub const SYSFS_ATTR_MODE_WO: ModeType = ModeType::from_bits_truncate(0o200);
+pub const SYSFS_ATTR_MODE_WO: InodeMode = InodeMode::from_bits_truncate(0o200);
 /// sysfs读写属性文件的权限
-pub const SYSFS_ATTR_MODE_RW: ModeType = ModeType::from_bits_truncate(0o644);
+pub const SYSFS_ATTR_MODE_RW: InodeMode = InodeMode::from_bits_truncate(0o644);
 
 /// sysfs文件的属性
 pub trait Attribute: Debug + Send + Sync {
     fn name(&self) -> &str;
-    fn mode(&self) -> ModeType;
+    fn mode(&self) -> InodeMode;
 
     fn support(&self) -> SysFSOpsSupport;
 

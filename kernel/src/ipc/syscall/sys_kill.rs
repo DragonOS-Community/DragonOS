@@ -16,7 +16,7 @@ use crate::{
 use log::warn;
 use system_error::SystemError;
 
-use crate::ipc::kill::{send_signal_to_all, send_signal_to_pid, send_signal_to_pgid};
+use crate::ipc::kill::{send_signal_to_all, send_signal_to_pgid, send_signal_to_pid};
 
 /// ### pid转换器，将输入的id转换成对应的pid或pgid
 /// - 如果id < -1，则为pgid

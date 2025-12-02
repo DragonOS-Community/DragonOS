@@ -90,7 +90,7 @@ impl RamFSInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
-                mode: InodeMode::from_bits_truncate(0o777),
+                mode: InodeMode::S_IRWXUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

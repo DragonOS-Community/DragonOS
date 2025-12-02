@@ -91,7 +91,7 @@ impl KernFSCallback for TraceCallBack {
 
 pub fn kernel_inode_provider_trace() -> KernFSInodeArgs {
     KernFSInodeArgs {
-        mode: InodeMode::from_bits_truncate(0o444),
+        mode: InodeMode::S_IRUGO,
         callback: Some(&TraceCallBack),
         inode_type: KernInodeType::File,
         size: Some(4096),
@@ -205,7 +205,7 @@ impl KernFSCallback for SavedCmdlinesSizeCallBack {
 
 pub fn kernel_inode_provider_saved_cmdlines() -> KernFSInodeArgs {
     KernFSInodeArgs {
-        mode: InodeMode::from_bits_truncate(0o444),
+        mode: InodeMode::S_IRUGO,
         callback: Some(&SavedCmdlinesSnapshotCallBack),
         inode_type: KernInodeType::File,
         size: Some(4096),

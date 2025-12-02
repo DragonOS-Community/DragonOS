@@ -708,7 +708,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// # 参数
     ///
     /// - `name`: &str - 要新建的目录项的名称。
-    /// - `mode`: ModeType - 设置目录项的权限模式。
+    /// - `mode`: InodeMode - 设置目录项的权限模式。
     ///
     /// # 返回值
     ///

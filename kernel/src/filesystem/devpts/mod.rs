@@ -119,7 +119,7 @@ impl LockedDevPtsFSInode {
                     ctime: PosixTimeSpec::default(),
                     btime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
-                    mode: InodeMode::from_bits_truncate(0o777),
+                    mode: InodeMode::S_IRWXUGO,
                     flags: InodeFlags::empty(),
                     nlinks: 1,
                     uid: 0,

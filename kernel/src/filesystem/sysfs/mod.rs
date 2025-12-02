@@ -107,7 +107,7 @@ pub trait AttributeGroup: Debug + Send + Sync {
     /// 如果返回None，则使用Attribute的mode()方法返回的权限
     ///
     /// 如果返回Some，则使用返回的权限。
-    /// 如果要标识属性不可见，则返回Some(ModeType::empty())
+    /// 如果要标识属性不可见，则返回Some(InodeMode::empty())
     fn is_visible(
         &self,
         _kobj: Arc<dyn KObject>,
@@ -118,7 +118,7 @@ pub trait AttributeGroup: Debug + Send + Sync {
 }
 
 /// sysfs只读属性文件的权限
-pub const SYSFS_ATTR_MODE_RO: InodeMode = InodeMode::from_bits_truncate(0o444);
+pub const SYSFS_ATTR_MODE_RO: InodeMode = InodeMode::S_IRUGO;
 /// sysfs只写属性文件的权限
 pub const SYSFS_ATTR_MODE_WO: InodeMode = InodeMode::from_bits_truncate(0o200);
 /// sysfs读写属性文件的权限

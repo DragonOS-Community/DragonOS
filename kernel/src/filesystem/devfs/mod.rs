@@ -362,12 +362,8 @@ impl LockedDevFSInode {
     /// - `path`: 符号链接指向的路径
     /// - `symlink_name`: 符号链接的名称
     pub fn add_dev_symlink(&self, path: &str, symlink_name: &str) -> Result<(), SystemError> {
-        let new_inode = self.create_with_data(
-            symlink_name,
-            FileType::SymLink,
-            InodeMode::from_bits_truncate(0o777),
-            0,
-        )?;
+        let new_inode =
+            self.create_with_data(symlink_name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
 
         let buf = path.as_bytes();
         let len = buf.len();

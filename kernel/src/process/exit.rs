@@ -300,12 +300,15 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {
+                            let stopsig = Signal::SIGSTOP as i32;
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
                                 pid: pcb.task_pid_vnr(),
-                                status: Signal::SIGSTOP as i32,
+                                status: stopsig,
                                 cause: SigChildCode::Stopped.into(),
                             });
+                            // Linux wait(2) 语义：stopped 进程的 wstatus = (stopsig << 8) | 0x7f
+                            kwo.ret_status = (stopsig << 8) | 0x7f;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                             }
@@ -321,6 +324,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 status: Signal::SIGCONT as i32,
                                 cause: SigChildCode::Continued.into(),
                             });
+                            // Linux wait(2) 语义：continued 进程的 wstatus = 0xffff
+                            kwo.ret_status = 0xffff;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                             }
@@ -397,12 +402,15 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {
+                            let stopsig = Signal::SIGSTOP as i32;
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
                                 pid: pcb.task_pid_vnr(),
-                                status: Signal::SIGSTOP as i32,
+                                status: stopsig,
                                 cause: SigChildCode::Stopped.into(),
                             });
+                            // Linux wait(2) 语义：stopped 进程的 wstatus = (stopsig << 8) | 0x7f
+                            kwo.ret_status = (stopsig << 8) | 0x7f;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                             }
@@ -417,6 +425,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 status: Signal::SIGCONT as i32,
                                 cause: SigChildCode::Continued.into(),
                             });
+                            // Linux wait(2) 语义：continued 进程的 wstatus = 0xffff
+                            kwo.ret_status = 0xffff;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                             }
@@ -503,6 +513,11 @@ fn do_waitpid(
             status: Signal::SIGCONT as i32,
             cause: SigChildCode::Continued.into(),
         });
+
+        // 设置 ret_status 供 wait4 使用
+        // Linux wait(2) 语义：continued 进程的 wstatus = 0xffff
+        kwo.ret_status = 0xffff;
+
         if !kwo.options.contains(WaitOption::WNOWAIT) {
             child_pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
         }
@@ -524,7 +539,7 @@ fn do_waitpid(
         }
         ProcessState::Stopped => {
             // 非 ptrace 停止：报告 stopsig=SIGSTOP
-            let exitcode = Signal::SIGSTOP as i32;
+            let stopsig = Signal::SIGSTOP as i32;
             // 由于目前不支持ptrace，因此这个值为false
             let ptrace = false;
 
@@ -538,9 +553,14 @@ fn do_waitpid(
             // log::debug!("do_waitpid: report CLD_STOPPED for pid={:?}", child_pcb.raw_pid());
             kwo.ret_info = Some(WaitIdInfo {
                 pid: child_pcb.task_pid_vnr(),
-                status: exitcode,
+                status: stopsig,
                 cause: SigChildCode::Stopped.into(),
             });
+
+            // 设置 ret_status 供 wait4 使用
+            // Linux wait(2) 语义：stopped 进程的 wstatus = (stopsig << 8) | 0x7f
+            kwo.ret_status = (stopsig << 8) | 0x7f;
+
             if !kwo.options.contains(WaitOption::WNOWAIT) {
                 // 消费一次停止事件标志（若存在）
                 child_pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);

@@ -1071,11 +1071,11 @@ impl ProcessControlBlock {
             rlim_max: 0,
         }; RLimitID::Nlimits as usize];
 
-        // Linux 典型默认值：软限制1024，硬限制65536
+        // Linux 典型默认值：软限制1024，硬限制可通过setrlimit调整
         // 文件描述符表会根据RLIMIT_NOFILE自动扩容
         arr[RLimitID::Nofile as usize] = RLimit64 {
-            rlim_cur: 1024,
-            rlim_max: 65536,
+            rlim_cur: FileDescriptorVec::MAX_CAPACITY as u64,
+            rlim_max: FileDescriptorVec::MAX_CAPACITY as u64,
         };
 
         arr[RLimitID::Stack as usize] = RLimit64 {

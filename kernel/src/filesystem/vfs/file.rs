@@ -796,7 +796,7 @@ impl FileDescriptorVec {
     /// 文件描述符表的初始容量
     pub const INITIAL_CAPACITY: usize = 1024;
     /// 文件描述符表的最大容量限制（防止无限扩容）
-    pub const MAX_CAPACITY: usize = 65536;
+    pub const MAX_CAPACITY: usize = 1048576;
 
     #[inline(never)]
     pub fn new() -> FileDescriptorVec {
@@ -921,13 +921,31 @@ impl FileDescriptorVec {
             }
         } else {
             // 没有指定要申请的文件描述符编号，在有效范围内查找空位
-            let max_search = core::cmp::min(self.fds.len(), nofile_limit);
-            for i in 0..max_search {
+            // 首先在当前容量内查找
+            for i in 0..self.fds.len() {
                 if self.fds[i].is_none() {
                     self.fds[i] = Some(Arc::new(file));
                     return Ok(i as i32);
                 }
             }
+
+            // 当前容量内没有空位，尝试扩容
+            // 计算新的容量：当前容量翻倍，但不超过 nofile_limit
+            let current_len = self.fds.len();
+            if current_len < nofile_limit {
+                // 扩容策略：翻倍或增加到 nofile_limit，取较小值
+                let new_capacity = core::cmp::min(
+                    core::cmp::max(current_len * 2, current_len + 1),
+                    nofile_limit,
+                );
+                self.resize_to_capacity(new_capacity)?;
+
+                // 扩容后，第一个新位置就是空的
+                let new_fd = current_len;
+                self.fds[new_fd] = Some(Arc::new(file));
+                return Ok(new_fd as i32);
+            }
+
             return Err(SystemError::EMFILE);
         }
     }

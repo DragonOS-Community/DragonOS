@@ -671,13 +671,17 @@ impl ProcessManager {
         }
 
         // 将当前pcb加入父进程的子进程哈希表中
+        // 注意：根据 Linux 语义，子进程应该被添加到 **线程组 leader** 的 children 列表中
+        // 而不是创建它的线程的 children 列表中。这样线程组中的任何线程都可以 wait 这个子进程。
+        // real_parent_pcb 存储实际创建子进程的线程，用于 __WNOTHREAD 选项的判断。
         if pcb.raw_pid() > RawPid(1) {
-            if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
-                let mut children = ppcb_arc.children.write_irqsave();
-                children.push(pcb.raw_pid());
-            } else {
-                panic!("parent pcb is None");
-            }
+            // 获取线程组 leader
+            let thread_group_leader = {
+                let ti = current_pcb.thread.read_irqsave();
+                ti.group_leader().unwrap_or_else(|| current_pcb.clone())
+            };
+            let mut children = thread_group_leader.children.write_irqsave();
+            children.push(pcb.raw_pid());
         }
 
         if pcb.raw_pid() > RawPid(0) {

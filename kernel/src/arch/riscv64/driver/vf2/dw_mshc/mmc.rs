@@ -32,7 +32,7 @@ use crate::filesystem::{
     devfs::{DevFS, DeviceINode},
     kernfs::KernFSInode,
     mbr::MbrDiskPartionTable,
-    vfs::{syscall::InodeMode, IndexNode, Metadata},
+    vfs::{IndexNode, InodeMode, Metadata},
 };
 use crate::libs::{
     rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},

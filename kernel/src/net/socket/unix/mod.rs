@@ -6,9 +6,8 @@ pub mod stream;
 use super::PSOCK;
 use crate::{
     filesystem::vfs::{
-        InodeMode,
         utils::{rsplit_path, DName},
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        InodeMode, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     net::socket::{
         endpoint::Endpoint,

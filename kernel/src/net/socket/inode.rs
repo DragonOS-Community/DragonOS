@@ -1,8 +1,8 @@
 use crate::{
     driver::net::Iface,
     filesystem::vfs::{
-        fasync::FAsyncItem, file::File, InodeMode, FilePrivateData, FileType, IndexNode,
-        Metadata, PollableInode,
+        fasync::FAsyncItem, file::File, FilePrivateData, FileType, IndexNode, InodeMode, Metadata,
+        PollableInode,
     },
     libs::spinlock::SpinLockGuard,
     net::posix::SockAddrIn,

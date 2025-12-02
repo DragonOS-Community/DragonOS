@@ -34,7 +34,7 @@ use crate::{
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
-        kill::kill_process_by_pcb,
+        kill::send_signal_to_pcb,
         sighand::SigHand,
         signal::RestartBlock,
         signal_types::{SigInfo, SigPending},
@@ -397,7 +397,7 @@ impl ProcessManager {
             // 检查子进程的exit_signal，只有在有效时才发送信号
             let exit_signal = current.exit_signal.load(Ordering::SeqCst);
             if exit_signal != Signal::INVALID {
-                let r = crate::ipc::kill::kill_process_by_pcb(parent_pcb.clone(), exit_signal);
+                let r = crate::ipc::kill::send_signal_to_pcb(parent_pcb.clone(), exit_signal);
                 if let Err(e) = r {
                     warn!(
                         "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
@@ -562,7 +562,7 @@ impl ProcessManager {
                 if !Arc::ptr_eq(&leader, &current_pcb)
                     && !leader.flags().contains(ProcessFlags::EXITING)
                 {
-                    let _ = kill_process_by_pcb(leader.clone(), Signal::SIGKILL);
+                    let _ = send_signal_to_pcb(leader.clone(), Signal::SIGKILL);
                 }
 
                 // 再遍历组长维护的 group_tasks，向其他线程发送 SIGKILL
@@ -575,7 +575,7 @@ impl ProcessManager {
                         if task.flags().contains(ProcessFlags::EXITING) {
                             continue;
                         }
-                        let _ = kill_process_by_pcb(task.clone(), Signal::SIGKILL);
+                        let _ = send_signal_to_pcb(task.clone(), Signal::SIGKILL);
                     }
                 }
             }
@@ -587,28 +587,23 @@ impl ProcessManager {
         ProcessManager::exit(final_exit_code);
     }
 
-    /// 从全局进程列表中删除一个进程
+    /// 从全局进程列表中删除一个进程，并从父进程的 children 列表中移除
     ///
     /// # 参数
     ///
     /// - `pid` : 进程的**全局** pid
+    ///
+    /// # 注意
+    ///
+    /// 调用此函数前，调用者**不能持有**父进程的 children 锁，否则会死锁。
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
-        if pcb.is_some() {
-            // log::debug!("release pid {}", pid);
-            // let pcb = pcb.unwrap();
-            // 判断该pcb是否在全局没有任何引用
-            // TODO: 当前，pcb的Arc指针存在泄露问题，引用计数不正确，打算在接下来实现debug专用的Arc，方便调试，然后解决这个bug。
-            //          因此目前暂时注释掉，使得能跑
-            // if Arc::strong_count(&pcb) <= 2 {
-            //     drop(pcb);
-            //     ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
-            // } else {
-            //     // 如果不为1就panic
-            //     let msg = format!("pcb '{:?}' is still referenced, strong count={}",pcb.pid(),  Arc::strong_count(&pcb));
-            //     error!("{}", msg);
-            //     panic!()
-            // }
+        if let Some(ref pcb) = pcb {
+            // 从父进程的 children 列表中移除
+            if let Some(parent) = pcb.real_parent_pcb() {
+                let mut children = parent.children.write();
+                children.retain(|&p| p != pid);
+            }
 
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
         }
@@ -1427,26 +1422,16 @@ impl ProcessControlBlock {
                             &parent_pcb.active_pid_ns(),
                         );
                         if parent_init.is_none() {
-                            log::warn!(
-                                "adopt_childen: parent_init is None, pid: {}",
-                                self.raw_pid()
-                            );
                             return Ok(());
                         }
                         let parent_init = parent_init.unwrap();
                         let mut parent_children_guard = parent_init.children.write();
                         child_pids.iter().for_each(|pid| {
-                            log::debug!(
-                                "adopt_childen: pid {} is adopted by parent init pid {}",
-                                pid,
-                                parent_init.raw_pid()
-                            );
                             parent_children_guard.push(*pid);
                         });
 
                         return Ok(());
                     } else {
-                        log::warn!("adopt_childen: parent_pcb is None, pid: {}", self.raw_pid());
                         return Ok(());
                     }
                 }
@@ -1469,7 +1454,7 @@ impl ProcessControlBlock {
                 if sig == Signal::INVALID {
                     continue;
                 }
-                if let Err(e) = crate::ipc::kill::kill_process_by_pcb(child.clone(), sig) {
+                if let Err(e) = crate::ipc::kill::send_signal_to_pcb(child.clone(), sig) {
                     warn!(
                         "adopt_childen: failed to deliver pdeath_signal {:?} to child {:?}: {:?}",
                         sig,

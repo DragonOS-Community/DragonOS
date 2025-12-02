@@ -4,7 +4,7 @@ use core::ffi::c_int;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RT_SIGQUEUEINFO;
-use crate::ipc::kill::kill_process;
+use crate::ipc::kill::send_signal_to_pid;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::{arch::ipc::signal::Signal, process::RawPid};
 use system_error::SystemError;
@@ -56,7 +56,7 @@ impl Syscall for SysRtSigqueueinfoHandle {
 
         // 复用 kill(2) 的权限与投递逻辑。
         let raw = RawPid::from(pid as usize);
-        kill_process(raw, signal)
+        send_signal_to_pid(raw, signal)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

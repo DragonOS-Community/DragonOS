@@ -1,8 +1,10 @@
 use crate::{
+    filesystem::vfs::fasync::FAsyncItems,
     libs::rwlock::RwLock,
     net::socket::{self, *},
 };
 use crate::{
+    libs::spinlock::SpinLock,
     libs::wait_queue::WaitQueue,
     net::{
         posix::MsgHdr,
@@ -16,7 +18,7 @@ use crate::{
         },
     },
 };
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicBool;
 use inner::{Connected, Init, Inner};
 use log::debug;
@@ -30,7 +32,10 @@ pub struct UnixStreamSocket {
     inner: RwLock<Option<Inner>>,
     //todo options
     epitems: EPollItems,
+    fasync_items: FAsyncItems,
     wait_queue: Arc<WaitQueue>,
+    /// Peer socket for socket pairs (used for SIGIO notification)
+    peer: SpinLock<Option<Weak<UnixStreamSocket>>>,
 
     is_nonblocking: AtomicBool,
     is_seqpacket: bool,
@@ -50,6 +55,8 @@ impl UnixStreamSocket {
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
+            peer: SpinLock::new(None),
         })
     }
 
@@ -64,6 +71,8 @@ impl UnixStreamSocket {
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
+            peer: SpinLock::new(None),
         })
     }
 
@@ -73,10 +82,14 @@ impl UnixStreamSocket {
 
     pub fn new_pair(is_nonblocking: bool, is_seqpacket: bool) -> (Arc<Self>, Arc<Self>) {
         let (conn_a, conn_b) = Connected::new_pair(None, None);
-        (
-            Self::new_connected(conn_a, is_nonblocking, is_seqpacket),
-            Self::new_connected(conn_b, is_nonblocking, is_seqpacket),
-        )
+        let socket_a = Self::new_connected(conn_a, is_nonblocking, is_seqpacket);
+        let socket_b = Self::new_connected(conn_b, is_nonblocking, is_seqpacket);
+
+        // Set up peer references for SIGIO notification
+        *socket_a.peer.lock() = Some(Arc::downgrade(&socket_b));
+        *socket_b.peer.lock() = Some(Arc::downgrade(&socket_a));
+
+        (socket_a, socket_b)
     }
 
     fn try_send(&self, buffer: &[u8]) -> Result<usize, SystemError> {
@@ -312,7 +325,18 @@ impl Socket for UnixStreamSocket {
     }
 
     fn send(&self, buffer: &[u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
-        self.try_send(buffer)
+        let result = self.try_send(buffer);
+
+        // If send succeeded, notify peer's fasync_items for SIGIO
+        if result.is_ok() && result.as_ref().unwrap() > &0 {
+            if let Some(peer_weak) = self.peer.lock().as_ref() {
+                if let Some(peer) = peer_weak.upgrade() {
+                    peer.fasync_items.send_sigio();
+                }
+            }
+        }
+
+        result
     }
 
     fn send_msg(&self, _msg: &MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
@@ -340,6 +364,10 @@ impl Socket for UnixStreamSocket {
 
     fn epoll_items(&self) -> &EPollItems {
         &self.epitems
+    }
+
+    fn fasync_items(&self) -> &FAsyncItems {
+        &self.fasync_items
     }
 
     fn option(&self, _level: PSOL, _name: usize, _value: &mut [u8]) -> Result<usize, SystemError> {

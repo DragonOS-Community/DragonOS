@@ -791,7 +791,7 @@ impl NTtyData {
         let pg = ctrl_info.pgid.clone();
         drop(ctrl_info);
         if let Some(pg) = pg {
-            let _ = crate::ipc::kill::kill_process_group(&pg, signal);
+            let _ = crate::ipc::kill::send_signal_to_pgid(&pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {

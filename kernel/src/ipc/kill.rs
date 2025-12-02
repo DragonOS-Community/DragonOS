@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::compiler_fence;
 use system_error::SystemError;
 
-/// ### 杀死一个进程
-pub fn kill_process(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
+/// ### 向一个进程发送信号
+pub fn send_signal_to_pid(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
     // 查找目标进程
     let target = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
 
@@ -31,7 +31,7 @@ pub fn kill_process(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
 /// 直接向指定进程发送信号，绕过PID namespace查找
 ///
 /// 注意！这个函数不会检查目标进程是否在本pidns内，慎用！可能造成安全问题。
-pub fn kill_process_by_pcb(
+pub fn send_signal_to_pcb(
     pcb: Arc<ProcessControlBlock>,
     sig: Signal,
 ) -> Result<usize, SystemError> {
@@ -42,11 +42,12 @@ pub fn kill_process_by_pcb(
         .send_signal_info_to_pcb(Some(&mut info), pcb)
         .map(|x| x as usize);
 }
-/// ### 杀死一个进程组
+
+/// ### 向一个进程组发送信号
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=kill_pgrp#1921
 #[inline(never)]
-pub fn kill_process_group(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, SystemError> {
+pub fn send_signal_to_pgid(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, SystemError> {
     // 先收集进程组中的所有进程，避免在持有锁时调用复杂操作
     let tasks: Vec<Arc<ProcessControlBlock>> = pgid.tasks_iter(PidType::PGID).collect();
 
@@ -89,9 +90,9 @@ pub fn kill_process_group(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, SystemE
     Err(last_err.unwrap_or(SystemError::ESRCH))
 }
 
-/// ### 杀死所有进程
-/// - 该函数会杀死所有进程，除了当前进程和init进程
-pub fn kill_all(sig: Signal) -> Result<usize, SystemError> {
+/// ### 向所有进程发送信号
+/// - 该函数会向所有进程发送信号，除了当前进程和init进程
+pub fn send_signal_to_all(sig: Signal) -> Result<usize, SystemError> {
     let current_pid = ProcessManager::current_pcb().raw_pid();
     let all_processes = ProcessManager::get_all_processes();
 
@@ -99,7 +100,7 @@ pub fn kill_all(sig: Signal) -> Result<usize, SystemError> {
         if pid_val == current_pid || pid_val.data() == 1 {
             continue;
         }
-        kill_process(pid_val, sig)?; // Call the new common function
+        send_signal_to_pid(pid_val, sig)?; // Call the new common function
     }
     Ok(0)
 }

@@ -1,13 +1,18 @@
+pub mod datagram;
 pub mod ns;
 pub mod ring_buffer;
 pub mod stream;
 
 use super::PSOCK;
 use crate::{
-    filesystem::vfs::{syscall::ModeType, utils::rsplit_path, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    filesystem::vfs::{
+        syscall::ModeType,
+        utils::{rsplit_path, DName},
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    },
     net::socket::{
         endpoint::Endpoint,
-        unix::{ns::AbstractHandle, stream::UnixStreamSocket},
+        unix::{datagram::UnixDatagramSocket, ns::AbstractHandle, stream::UnixStreamSocket},
         Socket,
     },
     process::ProcessManager,
@@ -37,7 +42,7 @@ impl TryFrom<Endpoint> for UnixEndpoint {
 
 #[derive(Clone, Debug)]
 pub(super) enum UnixEndpointBound {
-    Path(Arc<str>),
+    Path(DName),
     Abstract(Arc<AbstractHandle>),
 }
 
@@ -94,7 +99,7 @@ impl Hash for UnixEndpointBound {
 impl From<UnixEndpointBound> for UnixEndpoint {
     fn from(endpoint: UnixEndpointBound) -> Self {
         match endpoint {
-            UnixEndpointBound::Path(path) => UnixEndpoint::File(String::from(&*path)),
+            UnixEndpointBound::Path(path) => UnixEndpoint::File(String::from(path.as_ref())),
             UnixEndpointBound::Abstract(handle) => {
                 UnixEndpoint::Abstract(String::from_utf8_lossy(&handle.name()).into_owned())
             }
@@ -136,7 +141,7 @@ impl UnixEndpoint {
                     crate::filesystem::vfs::FileType::Socket,
                     ModeType::S_IWUSR,
                 )?;
-                UnixEndpointBound::Path(Arc::from(inode.absolute_path()?.as_str()))
+                UnixEndpointBound::Path(DName::from(inode.absolute_path()?))
             }
             Self::Abstract(name) => UnixEndpointBound::Abstract(ns::create_abstract_name(name)?),
         };
@@ -169,7 +174,7 @@ impl UnixEndpoint {
                 // let inode = ProcessManager::current_mntns()
                 //     .root_inode()
                 //     .lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-                UnixEndpointBound::Path(Arc::from(abso_path.as_str()))
+                UnixEndpointBound::Path(DName::from(abso_path))
             }
         };
 
@@ -181,9 +186,11 @@ pub fn create_unix_socket(
     socket_type: PSOCK,
     is_nonblocking: bool,
 ) -> Result<Arc<dyn Socket>, SystemError> {
-    let socket = match socket_type {
+    let socket: Arc<dyn Socket> = match socket_type {
         PSOCK::Stream => UnixStreamSocket::new(is_nonblocking, false),
+        PSOCK::SeqPacket => UnixStreamSocket::new(is_nonblocking, true),
         PSOCK::Packet => UnixStreamSocket::new(is_nonblocking, true),
+        PSOCK::Datagram => UnixDatagramSocket::new(is_nonblocking),
         _ => {
             return Err(SystemError::ESOCKTNOSUPPORT);
         }

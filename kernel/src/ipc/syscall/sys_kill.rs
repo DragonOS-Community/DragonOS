@@ -16,7 +16,7 @@ use crate::{
 use log::warn;
 use system_error::SystemError;
 
-use crate::ipc::kill::{kill_all, kill_process, kill_process_group};
+use crate::ipc::kill::{send_signal_to_all, send_signal_to_pgid, send_signal_to_pid};
 
 /// ### pid转换器，将输入的id转换成对应的pid或pgid
 /// - 如果id < -1，则为pgid
@@ -222,9 +222,9 @@ impl Syscall for SysKillHandle {
         }
 
         match converter {
-            PidConverter::Pid(pid) => kill_process(pid.pid_vnr(), sig),
-            PidConverter::Pgid(pgid) => kill_process_group(&pgid.ok_or(SystemError::ESRCH)?, sig),
-            PidConverter::All => kill_all(sig),
+            PidConverter::Pid(pid) => send_signal_to_pid(pid.pid_vnr(), sig),
+            PidConverter::Pgid(pgid) => send_signal_to_pgid(&pgid.ok_or(SystemError::ESRCH)?, sig),
+            PidConverter::All => send_signal_to_all(sig),
         }
     }
 

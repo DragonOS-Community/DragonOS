@@ -252,6 +252,15 @@ pub fn do_utimensat(
     const UTIME_NOW: i64 = (1i64 << 30) - 1i64;
     const UTIME_OMIT: i64 = (1i64 << 30) - 2i64;
     // log::debug!("do_utimensat: dirfd:{}, pathname:{:?}, times:{:?}, flags:{:?}", dirfd, pathname, times, flags);
+
+    // Linux semantics: if both timestamps are UTIME_OMIT, the call succeeds
+    // without accessing the file at all (OmitNoop test).
+    if let Some([atime, mtime]) = times {
+        if atime.tv_nsec == UTIME_OMIT && mtime.tv_nsec == UTIME_OMIT {
+            return Ok(0);
+        }
+    }
+
     let inode = match pathname {
         Some(path) => {
             let (inode_begin, path) =
@@ -264,11 +273,27 @@ pub fn do_utimensat(
             inode
         }
         None => {
+            // Linux-specific extension: pathname == NULL means operate on the
+            // file referred to by dirfd (futimens). However, some combinations
+            // are invalid and must return specific errors.
+
+            // When dirfd is AT_FDCWD and pathname is NULL, Linux returns EFAULT.
+            if dirfd == AtFlags::AT_FDCWD.bits() {
+                return Err(SystemError::EFAULT);
+            }
+
             let binding = ProcessManager::current_pcb().fd_table();
             let fd_table_guard = binding.write();
             let file = fd_table_guard
                 .get_file_by_fd(dirfd)
                 .ok_or(SystemError::EBADF)?;
+
+            // If the file descriptor was opened with O_PATH, futimesat must fail
+            // with EBADF instead of operating on it.
+            if file.mode().contains(FileMode::O_PATH) {
+                return Err(SystemError::EBADF);
+            }
+
             file.inode()
         }
     };

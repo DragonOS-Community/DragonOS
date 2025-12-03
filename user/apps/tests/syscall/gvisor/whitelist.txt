@@ -68,3 +68,4 @@ sigtimedwait_test
 itimer_test
 pipe_test
 unshare_test
+pty_root_test

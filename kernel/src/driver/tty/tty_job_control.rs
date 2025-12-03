@@ -5,6 +5,7 @@ use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
     process::{
+        cred::CAPFlags,
         pid::{Pid, PidType},
         ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
@@ -154,13 +155,16 @@ impl TtyJobCtrlManager {
             if current.task_session() == Some(sid.clone()) {
                 // 这是正常情况：会话首进程要设置自己会话的tty为控制终端
             } else {
-                // tty被其他会话占用，需要强制标志或CAP_SYS_ADMIN权限
-                // todo: 这里要补充对CAP_SYS_ADMIN的检查
+                // tty被其他会话占用
                 if arg == 1 {
+                    // 强制窃取控制终端，需要CAP_SYS_ADMIN权限
+                    let cred = current.cred();
+                    if !cred.has_capability(CAPFlags::CAP_SYS_ADMIN) {
+                        return Err(SystemError::EPERM);
+                    }
                     Self::session_clear_tty(sid.clone());
                 } else {
-                    log::warn!("job_ctrl_ioctl: TIOCSCTTY: tty is occupied");
-                    // return Err(SystemError::EPERM);
+                    return Err(SystemError::EPERM);
                 }
             }
         }

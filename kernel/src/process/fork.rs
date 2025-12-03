@@ -3,10 +3,10 @@ use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use crate::arch::MMArch;
 use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::FileType;
+use crate::filesystem::vfs::InodeMode;
 use crate::mm::verify_area;
 use crate::mm::MemoryManagementArch;
 use crate::process::pid::PidPrivateData;
@@ -255,10 +255,17 @@ impl ProcessManager {
         clone_flags: &CloneFlags,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
+        // 先复制父进程的 flags
+        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+
+        // 然后根据 clone_flags 设置需要的标志
         if clone_flags.contains(CloneFlags::CLONE_VFORK) {
             new_pcb.flags().insert(ProcessFlags::VFORK);
         }
-        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+
+        // 标记新进程还未执行 exec
+        new_pcb.flags().insert(ProcessFlags::FORKNOEXEC);
+
         return Ok(());
     }
 
@@ -488,9 +495,6 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
-        // 标记当前线程还未被执行exec
-        pcb.flags().insert(ProcessFlags::FORKNOEXEC);
-
         // 克隆 pidfd
         if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
             let pid = pcb.raw_pid().0 as i32;
@@ -500,9 +504,8 @@ impl ProcessManager {
                 ProcessManager::current_pcb().raw_pid().data(),
                 pid
             );
-            let new_inode =
-                root_inode.create(&name, FileType::File, ModeType::from_bits_truncate(0o777))?;
-            let file = File::new(new_inode, FileMode::O_RDWR | FileMode::O_CLOEXEC)?;
+            let new_inode = root_inode.create(&name, FileType::File, InodeMode::S_IRWXUGO)?;
+            let file = File::new(new_inode, FileFlags::O_RDWR | FileFlags::O_CLOEXEC)?;
             {
                 let mut guard = file.private_data.lock();
                 *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
@@ -668,13 +671,17 @@ impl ProcessManager {
         }
 
         // 将当前pcb加入父进程的子进程哈希表中
+        // 注意：根据 Linux 语义，子进程应该被添加到 **线程组 leader** 的 children 列表中
+        // 而不是创建它的线程的 children 列表中。这样线程组中的任何线程都可以 wait 这个子进程。
+        // real_parent_pcb 存储实际创建子进程的线程，用于 __WNOTHREAD 选项的判断。
         if pcb.raw_pid() > RawPid(1) {
-            if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
-                let mut children = ppcb_arc.children.write_irqsave();
-                children.push(pcb.raw_pid());
-            } else {
-                panic!("parent pcb is None");
-            }
+            // 获取线程组 leader
+            let thread_group_leader = {
+                let ti = current_pcb.thread.read_irqsave();
+                ti.group_leader().unwrap_or_else(|| current_pcb.clone())
+            };
+            let mut children = thread_group_leader.children.write_irqsave();
+            children.push(pcb.raw_pid());
         }
 
         if pcb.raw_pid() > RawPid(0) {

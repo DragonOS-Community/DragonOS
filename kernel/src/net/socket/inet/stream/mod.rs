@@ -2,6 +2,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError;
 
+use crate::filesystem::vfs::fasync::FAsyncItems;
 use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
@@ -31,6 +32,7 @@ pub struct TcpSocket {
     pollee: AtomicUsize,
     netns: Arc<NetNamespace>,
     epoll_items: EPollItems,
+    fasync_items: FAsyncItems,
 }
 
 impl TcpSocket {
@@ -45,6 +47,7 @@ impl TcpSocket {
             pollee: AtomicUsize::new(0_usize),
             netns,
             epoll_items: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
         })
     }
 
@@ -62,6 +65,7 @@ impl TcpSocket {
             pollee: AtomicUsize::new((EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize),
             netns,
             epoll_items: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
         })
     }
 
@@ -595,6 +599,10 @@ impl Socket for TcpSocket {
 
     fn epoll_items(&self) -> &EPollItems {
         &self.epoll_items
+    }
+
+    fn fasync_items(&self) -> &FAsyncItems {
+        &self.fasync_items
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {

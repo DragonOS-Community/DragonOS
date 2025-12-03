@@ -75,7 +75,7 @@ impl LockedVcpuInode {
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
-                mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
+                mode: filesystem::vfs::syscall::InodeMode::S_IALLUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

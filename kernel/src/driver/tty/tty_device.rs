@@ -31,7 +31,7 @@ use crate::{
         epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
-            file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileType, IndexNode,
+            file::FileFlags, utils::DName, FilePrivateData, FileType, IndexNode, InodeMode,
             Metadata, PollableInode,
         },
     },
@@ -79,7 +79,7 @@ impl InnerTtyDevice {
             inode: None,
             driver: None,
             can_match: false,
-            metadata: Metadata::new(FileType::CharDevice, ModeType::from_bits_truncate(0o755)),
+            metadata: Metadata::new(FileType::CharDevice, InodeMode::from_bits_truncate(0o755)),
         }
     }
 
@@ -151,7 +151,7 @@ impl TtyDevice {
 
     fn tty_core(private_data: &FilePrivateData) -> Result<Arc<TtyCore>, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = private_data {
-            (tty_priv.tty.clone(), tty_priv.mode)
+            (tty_priv.tty.clone(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -174,7 +174,7 @@ impl TtyDevice {
         let current_tty = TtyJobCtrlManager::get_current_tty()?;
 
         if let FilePrivateData::Tty(tty_priv) = data {
-            tty_priv.mode.insert(FileMode::O_NONBLOCK);
+            tty_priv.flags.insert(FileFlags::O_NONBLOCK);
         }
 
         current_tty.reopen().ok()?;
@@ -222,7 +222,7 @@ impl IndexNode for TtyDevice {
     fn open(
         &self,
         mut data: SpinLockGuard<FilePrivateData>,
-        mode: &crate::filesystem::vfs::file::FileMode,
+        mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
             return ptmx_open(data, mode);
@@ -246,7 +246,7 @@ impl IndexNode for TtyDevice {
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
             tty: tty.clone(),
-            mode: *mode,
+            flags: *mode,
         });
 
         tty.core().contorl_info_irqsave().clear_dead_session();
@@ -261,7 +261,8 @@ impl IndexNode for TtyDevice {
 
         let driver = tty.core().driver();
         // 考虑noctty（当前tty）
-        if !(mode.contains(FileMode::O_NOCTTY) && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
+        if !(mode.contains(FileFlags::O_NOCTTY)
+            && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
             || dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 1)
             || (driver.tty_driver_type() == TtyDriverType::Pty
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
@@ -288,8 +289,8 @@ impl IndexNode for TtyDevice {
         buf: &mut [u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
-        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.mode)
+        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -301,7 +302,7 @@ impl IndexNode for TtyDevice {
         let mut cookie = false;
         loop {
             let mut size = if len > buf.len() { buf.len() } else { len };
-            size = ld.read(tty.clone(), buf, size, &mut cookie, offset, mode)?;
+            size = ld.read(tty.clone(), buf, size, &mut cookie, offset, flags)?;
             // 没有更多数据
             if size == 0 {
                 break;
@@ -331,8 +332,8 @@ impl IndexNode for TtyDevice {
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let mut count = len;
-        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.mode)
+        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -353,7 +354,7 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = ld.write(tty.clone(), &buf[written..], size, mode)?;
+            let ret = ld.write(tty.clone(), &buf[written..], size, flags)?;
 
             written += ret;
             count -= ret;
@@ -407,9 +408,14 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
+    fn page_cache(&self) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
+        // TTY设备是字符设备，不需要页面缓存
+        None
+    }
+
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        let (tty, _mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.mode)
+        let (tty, _flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -424,7 +430,7 @@ impl IndexNode for TtyDevice {
 
     fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
-            (tty_priv.tty(), tty_priv.mode)
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -679,7 +685,7 @@ impl CharDevice for TtyDevice {
 #[derive(Debug, Clone)]
 pub struct TtyFilePrivateData {
     pub tty: Arc<TtyCore>,
-    pub mode: FileMode,
+    pub flags: FileFlags,
 }
 
 impl TtyFilePrivateData {

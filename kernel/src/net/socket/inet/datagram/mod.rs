@@ -3,6 +3,7 @@ use smoltcp;
 use system_error::SystemError;
 
 use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::fasync::FAsyncItems;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::{Socket, PMSG};
@@ -28,6 +29,7 @@ pub struct UdpSocket {
     self_ref: Weak<UdpSocket>,
     netns: Arc<NetNamespace>,
     epoll_items: EPollItems,
+    fasync_items: FAsyncItems,
 }
 
 impl UdpSocket {
@@ -40,6 +42,7 @@ impl UdpSocket {
             self_ref: me.clone(),
             netns,
             epoll_items: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
         })
     }
 
@@ -289,6 +292,10 @@ impl Socket for UdpSocket {
 
     fn epoll_items(&self) -> &crate::net::socket::common::EPollItems {
         &self.epoll_items
+    }
+
+    fn fasync_items(&self) -> &FAsyncItems {
+        &self.fasync_items
     }
 
     fn check_io_event(&self) -> EPollEventType {

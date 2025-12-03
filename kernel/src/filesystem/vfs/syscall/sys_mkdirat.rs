@@ -2,8 +2,8 @@
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_MKDIRAT;
-use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::vcore::do_mkdir_at;
+use crate::filesystem::vfs::InodeMode;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -28,7 +28,7 @@ impl Syscall for SysMkdirAtHandle {
         )?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
-        do_mkdir_at(dirfd, &path, FileMode::from_bits_truncate(mode as u32))?;
+        do_mkdir_at(dirfd, &path, InodeMode::from_bits_truncate(mode as u32))?;
         Ok(0)
     }
 

@@ -32,7 +32,7 @@ use crate::filesystem::{
     devfs::{DevFS, DeviceINode},
     kernfs::KernFSInode,
     mbr::MbrDiskPartionTable,
-    vfs::{syscall::ModeType, IndexNode, Metadata},
+    vfs::{IndexNode, InodeMode, Metadata},
 };
 use crate::libs::{
     rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -116,7 +116,7 @@ impl MMC {
             fs: RwLock::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
-                ModeType::from_bits_truncate(0o755),
+                InodeMode::from_bits_truncate(0o755),
             ),
             fifo_offset: UnsafeCell::new(0x600),
             _frames: UnsafeCell::new(Vec::new()),

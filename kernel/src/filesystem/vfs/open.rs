@@ -288,8 +288,6 @@ pub fn do_utimensat(
                 .get_file_by_fd(dirfd)
                 .ok_or(SystemError::EBADF)?;
 
-            // If the file descriptor was opened with O_PATH, futimesat must fail
-            // with EBADF instead of operating on it.
             if file.mode().contains(FileMode::O_PATH) {
                 return Err(SystemError::EBADF);
             }

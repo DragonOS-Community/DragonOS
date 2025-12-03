@@ -34,7 +34,7 @@ pub fn do_sys_utimensat(
         const UTIME_OMIT: i64 = (1i64 << 30) - 2i64;
 
         let valid_nsec = |nsec: i64| -> bool {
-            (0 <= nsec && nsec < 1_000_000_000) || nsec == UTIME_NOW || nsec == UTIME_OMIT
+            (0..1_000_000_000).contains(&nsec) || nsec == UTIME_NOW || nsec == UTIME_OMIT
         };
 
         if !valid_nsec(atime.tv_nsec) || !valid_nsec(mtime.tv_nsec) {

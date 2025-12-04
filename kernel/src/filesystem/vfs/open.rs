@@ -235,12 +235,6 @@ fn do_sys_openat2(
     if how.o_flags.contains(FileFlags::O_CREAT) && !created && file_type == FileType::Dir {
         return Err(SystemError::EISDIR);
     }
-    // 如果目标是符号链接且不跟随最后一个符号链接，除非是 O_PATH，否则返回 ELOOP
-    if file_type == FileType::SymLink && !follow_symlink {
-        if !how.o_flags.contains(FileFlags::O_PATH) {
-            return Err(SystemError::ELOOP);
-        }
-    }
     // 目录相关检查
     if file_type == FileType::Dir {
         // 目录上不支持 O_TRUNC

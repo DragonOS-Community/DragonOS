@@ -1,5 +1,6 @@
 use core::{
     fmt::Debug,
+    intrinsics::unlikely,
     sync::atomic::{compiler_fence, Ordering},
 };
 
@@ -9,17 +10,16 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
-    ipc::signal_types::SigCode,
-    ipc::signal_types::SigactionType,
+    ipc::signal_types::{
+        SigCode, SigInfo, SigType, SigactionType, SignalFlags, SIG_KERNEL_IGNORE_MASK,
+        SIG_KERNEL_ONLY_MASK, SIG_KERNEL_STOP_MASK,
+    },
     mm::VirtAddr,
     process::{
         pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
     time::{syscall::PosixClockID, timekeeping::getnstimeofday, Instant, PosixTimeSpec},
 };
-
-use super::signal_types::{SigInfo, SigType, SIG_KERNEL_STOP_MASK};
-use crate::ipc::signal_types::SignalFlags;
 
 impl Signal {
     pub fn signal_pending_state(
@@ -293,6 +293,57 @@ impl Signal {
         // todo: 参照linux的sig_fatal实现完整功能
     }
 
+    /// @brief 检查pcb状态、Init 属性、Handler 设置
+    fn sig_task_ignored(&self, pcb: &Arc<ProcessControlBlock>, force: bool) -> bool {
+        // init 进程忽略 SIGKILL 和 SIGSTOP，防止系统意外崩溃。
+        if unlikely(pcb.raw_pid().data() == 1) && SIG_KERNEL_ONLY_MASK.contains(self.into_sigset())
+        {
+            return true;
+        }
+        let sighand = pcb.sighand();
+        if let Some(sa) = sighand.handler(*self) {
+            // 容器中的 init 进程 或者 被标记为 UNKILLABLE 的进程，如果Handler为默认且不是强制发送，永远不能忽略 SIGKILL 和 SIGSTOP
+            let is_dfl = sa.is_default();
+            if unlikely(sighand.flags_contains(SignalFlags::UNKILLABLE))
+                && is_dfl
+                && !(force && SIG_KERNEL_ONLY_MASK.contains(self.into_sigset()))
+            {
+                return true;
+            }
+            // sig_handler_ignored() 检查是否被设置为 IGNORE
+            if sa.is_ignore() || (is_dfl && SIG_KERNEL_IGNORE_MASK.contains(self.into_sigset())) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// @brief 判断信号是否应该被忽略
+    fn sig_ignored(&self, pcb: &Arc<ProcessControlBlock>, force: bool) -> bool {
+        // 即使信号处理函数是 IGN，如果该信号被阻塞，它也必须留在队列中，直到解除了阻塞（此时 handler 可能已经变了）。
+        let sig_info = pcb.sig_info_irqsave();
+        if sig_info.sig_blocked().contains(self.into_sigset())
+            || (pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK)
+                && sig_info.saved_sigmask().contains(self.into_sigset()))
+        {
+            log::debug!("sig_ignored: signal {:?} is blocked by sigmask", self);
+            log::debug!(
+                "sig_ignored: current sigblocked={:b}, saved_sigmask={:b}",
+                sig_info.sig_blocked().bits(),
+                sig_info.saved_sigmask().bits()
+            );
+            return false;
+        }
+        drop(sig_info);
+
+        // TODO: ptrace 拦截被忽略的信号
+        // if pcb.flags().contains(ProcessFlags::PTRACED) && *self != Signal::SIGKILL {
+        //     return false;
+        // }
+
+        Self::sig_task_ignored(self, pcb, force)
+    }
+
     /// 检查信号是否能被发送，并且而且要处理 SIGCONT 和 STOP 信号
     ///
     /// ## 参数
@@ -356,17 +407,8 @@ impl Signal {
             // TODO 对每个子线程 flush mask；对齐 Linux 更完整语义
         }
 
-        // 一个被阻塞了的信号肯定是要被处理的
-        if pcb
-            .sig_info_irqsave()
-            .sig_blocked()
-            .contains(self.into_sigset())
-        {
-            return true;
-        }
-        return !pcb.sighand().handler(*self).unwrap().is_ignore();
-
         //TODO 仿照 linux 中的prepare signal完善逻辑，linux 中还会根据例如当前进程状态(Existing)进行判断，现在的信号能否发出就只是根据 ignored 来判断
+        return !self.sig_ignored(&pcb, _force);
     }
 }
 

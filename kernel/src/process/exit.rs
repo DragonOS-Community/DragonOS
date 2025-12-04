@@ -279,6 +279,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                     let mut found = false;
                     // 标记是否所有子进程都已退出（僵尸状态，不会再改变）
                     let mut all_children_exited = true;
+                    // 保存需要 release 的 pid，避免在持有 children 锁时调用 release 导致死锁
+                    let mut pid_to_release: Option<RawPid> = None;
                     for pid in rd_childen.iter() {
                         let pcb =
                             ProcessManager::find_task_by_vpid(*pid).ok_or(SystemError::ECHILD)?;
@@ -300,12 +302,15 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {
+                            let stopsig = Signal::SIGSTOP as i32;
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
                                 pid: pcb.task_pid_vnr(),
-                                status: Signal::SIGSTOP as i32,
+                                status: stopsig,
                                 cause: SigChildCode::Stopped.into(),
                             });
+                            // Linux wait(2) 语义：stopped 进程的 wstatus = (stopsig << 8) | 0x7f
+                            kwo.ret_status = (stopsig << 8) | 0x7f;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                             }
@@ -321,6 +326,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 status: Signal::SIGCONT as i32,
                                 cause: SigChildCode::Continued.into(),
                             });
+                            // Linux wait(2) 语义：continued 进程的 wstatus = 0xffff
+                            kwo.ret_status = 0xffff;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                             }
@@ -338,7 +345,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             });
                             tmp_child_pcb = Some(pcb.clone());
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
-                                unsafe { ProcessManager::release(pcb.raw_pid()) };
+                                // 延迟 release，避免死锁
+                                pid_to_release = Some(pcb.raw_pid());
                             }
                             retval = Ok((*pid).into());
                             found = true;
@@ -349,6 +357,10 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         }
                     }
                     drop(rd_childen);
+                    // 在释放 children 锁后再调用 release
+                    if let Some(pid) = pid_to_release {
+                        unsafe { ProcessManager::release(pid) };
+                    }
                     if found {
                         parent.wait_queue.finish_wait();
                         break 'outer;
@@ -373,14 +385,53 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 }
             }
             PidConverter::Pgid(Some(pgid)) => {
+                // 修复：根据 Linux waitpid 语义，waitpid(-pgid, ...) 只等待调用者的
+                // **子进程**中属于指定进程组的进程，而不是进程组中的所有进程。
+                // 因此，这里遍历父进程的 children 列表，检查每个子进程是否属于目标进程组。
                 let parent = ProcessManager::current_pcb();
                 loop {
                     // 注册等待
                     let _ = parent.wait_queue.prepare_to_wait_event(true);
 
+                    let rd_children = parent.children.read();
+                    if rd_children.is_empty() {
+                        parent.wait_queue.finish_wait();
+                        // 没有任何子进程
+                        retval = Err(SystemError::ECHILD);
+                        break 'outer;
+                    }
+
                     let mut found = false;
-                    let mut all_children_exited = true;
-                    for pcb in pgid.tasks_iter(PidType::PGID) {
+                    // 是否找到了属于目标进程组的子进程（无论其状态如何）
+                    let mut has_matching_child = false;
+                    let mut all_matching_children_exited = true;
+                    // 保存需要 release 的 pid，避免在持有 children 锁时调用 release 导致死锁
+                    let mut pid_to_release: Option<RawPid> = None;
+
+                    for child_pid in rd_children.iter() {
+                        let pcb = match ProcessManager::find_task_by_vpid(*child_pid) {
+                            Some(p) => p,
+                            None => {
+                                continue;
+                            }
+                        };
+
+                        // 检查子进程是否属于目标进程组
+                        // 注意：即使进程已退出并从进程组的 tasks 列表中 detach，
+                        // task_pgrp() 仍然返回它之前所属的进程组
+                        let child_pgrp = pcb.task_pgrp();
+                        let in_target_pgrp = match &child_pgrp {
+                            Some(cp) => Arc::ptr_eq(cp, pgid),
+                            None => false,
+                        };
+
+                        if !in_target_pgrp {
+                            continue;
+                        }
+
+                        // 找到属于目标进程组的子进程
+                        has_matching_child = true;
+
                         // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
                         if !child_matches_wait_options(&pcb, kwo.options) {
                             continue;
@@ -390,19 +441,22 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         let state = sched_guard.state();
 
                         if !state.is_exited() {
-                            all_children_exited = false;
+                            all_matching_children_exited = false;
                         }
 
                         if matches!(state, ProcessState::Stopped)
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {
+                            let stopsig = Signal::SIGSTOP as i32;
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
                                 pid: pcb.task_pid_vnr(),
-                                status: Signal::SIGSTOP as i32,
+                                status: stopsig,
                                 cause: SigChildCode::Stopped.into(),
                             });
+                            // Linux wait(2) 语义：stopped 进程的 wstatus = (stopsig << 8) | 0x7f
+                            kwo.ret_status = (stopsig << 8) | 0x7f;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                             }
@@ -417,6 +471,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 status: Signal::SIGCONT as i32,
                                 cause: SigChildCode::Continued.into(),
                             });
+                            // Linux wait(2) 语义：continued 进程的 wstatus = 0xffff
+                            kwo.ret_status = 0xffff;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                             }
@@ -434,7 +490,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             });
                             tmp_child_pcb = Some(pcb.clone());
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
-                                unsafe { ProcessManager::release(pcb.raw_pid()) };
+                                // 延迟 release，避免死锁
+                                pid_to_release = Some(pcb.raw_pid());
                             }
                             retval = Ok(pcb.task_pid_vnr().into());
                             found = true;
@@ -444,19 +501,33 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             break;
                         }
                     }
+                    drop(rd_children);
+                    // 在释放 children 锁后再调用 release
+                    if let Some(pid) = pid_to_release {
+                        unsafe { ProcessManager::release(pid) };
+                    }
+
                     if found {
                         parent.wait_queue.finish_wait();
                         break 'outer;
                     }
+
+                    // 如果没有找到任何属于目标进程组的子进程，返回 ECHILD
+                    if !has_matching_child {
+                        parent.wait_queue.finish_wait();
+                        retval = Err(SystemError::ECHILD);
+                        break 'outer;
+                    }
+
                     if kwo.options.contains(WaitOption::WNOHANG) {
                         parent.wait_queue.finish_wait();
                         retval = Ok(0);
                         break 'outer;
                     }
 
-                    // 关键修复：如果进程组中所有进程都已退出，且没有请求 WEXITED
+                    // 如果所有匹配的子进程都已退出，且没有请求 WEXITED
                     // 那么永远不会有匹配的事件发生，应该立即返回 ECHILD
-                    if all_children_exited && !kwo.options.contains(WaitOption::WEXITED) {
+                    if all_matching_children_exited && !kwo.options.contains(WaitOption::WEXITED) {
                         parent.wait_queue.finish_wait();
                         retval = Err(SystemError::ECHILD);
                         break 'outer;
@@ -467,7 +538,11 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 }
             }
 
-            _ => {}
+            PidConverter::Pgid(None) => {
+                // 进程组不存在，直接返回 ECHILD
+                // 这种情况发生在：进程组中的所有进程都已退出并被回收
+                return Err(SystemError::ECHILD);
+            }
         }
         notask!('outer);
     }
@@ -503,6 +578,11 @@ fn do_waitpid(
             status: Signal::SIGCONT as i32,
             cause: SigChildCode::Continued.into(),
         });
+
+        // 设置 ret_status 供 wait4 使用
+        // Linux wait(2) 语义：continued 进程的 wstatus = 0xffff
+        kwo.ret_status = 0xffff;
+
         if !kwo.options.contains(WaitOption::WNOWAIT) {
             child_pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
         }
@@ -524,7 +604,7 @@ fn do_waitpid(
         }
         ProcessState::Stopped => {
             // 非 ptrace 停止：报告 stopsig=SIGSTOP
-            let exitcode = Signal::SIGSTOP as i32;
+            let stopsig = Signal::SIGSTOP as i32;
             // 由于目前不支持ptrace，因此这个值为false
             let ptrace = false;
 
@@ -538,9 +618,14 @@ fn do_waitpid(
             // log::debug!("do_waitpid: report CLD_STOPPED for pid={:?}", child_pcb.raw_pid());
             kwo.ret_info = Some(WaitIdInfo {
                 pid: child_pcb.task_pid_vnr(),
-                status: exitcode,
+                status: stopsig,
                 cause: SigChildCode::Stopped.into(),
             });
+
+            // 设置 ret_status 供 wait4 使用
+            // Linux wait(2) 语义：stopped 进程的 wstatus = (stopsig << 8) | 0x7f
+            kwo.ret_status = (stopsig << 8) | 0x7f;
+
             if !kwo.options.contains(WaitOption::WNOWAIT) {
                 // 消费一次停止事件标志（若存在）
                 child_pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);

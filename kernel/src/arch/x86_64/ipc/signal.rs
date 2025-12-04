@@ -608,7 +608,7 @@ impl SignalArch for X86_64SignalArch {
         // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
         if UserBufferWriter::new(frame_ptr, size_of::<SigFrame>(), true).is_err() {
             error!("sys_rt_sigreturn: rsp doesn't from user level");
-            let _ = crate::ipc::kill::kill_process(
+            let _ = crate::ipc::kill::send_signal_to_pid(
                 ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             );
@@ -718,7 +718,7 @@ fn setup_frame(
                 // 如果handler地址大于等于用户空间末尾，说明它在内核空间，这是非法的。
                 if handler >= MMArch::USER_END_VADDR {
                     error!("attempting to execute a signal handler from kernel");
-                    let _ = crate::ipc::kill::kill_process(
+                    let _ = crate::ipc::kill::send_signal_to_pid(
                         ProcessManager::current_pcb().raw_pid(),
                         Signal::SIGSEGV,
                     );
@@ -733,7 +733,7 @@ fn setup_frame(
                             ProcessManager::current_pcb().raw_pid(),
                             sig as i32
                         );
-                        let _ = crate::ipc::kill::kill_process(
+                        let _ = crate::ipc::kill::send_signal_to_pid(
                             ProcessManager::current_pcb().raw_pid(),
                             Signal::SIGSEGV,
                         );
@@ -761,7 +761,7 @@ fn setup_frame(
     // 验证地址位于用户空间
     UserBufferWriter::new(frame_ptr, size_of::<SigFrame>(), true).map_err(|_| {
         error!("In setup_frame: access check failed");
-        let _ = crate::ipc::kill::kill_process(
+        let _ = crate::ipc::kill::send_signal_to_pid(
             ProcessManager::current_pcb().raw_pid(),
             Signal::SIGSEGV,
         );
@@ -801,7 +801,7 @@ fn setup_frame(
     info.copy_posix_siginfo_to_user(&mut frame.siginfo as *mut PosixSigInfo)
         .inspect_err(|_| {
             error!("In copy_posix_siginfo_to_user: failed");
-            let _ = crate::ipc::kill::kill_process(
+            let _ = crate::ipc::kill::send_signal_to_pid(
                 ProcessManager::current_pcb().raw_pid(),
                 Signal::SIGSEGV,
             );

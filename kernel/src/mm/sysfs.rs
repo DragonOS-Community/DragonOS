@@ -9,7 +9,7 @@ use crate::{
     },
     filesystem::{
         sysfs::{Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport, SYSFS_ATTR_MODE_RO},
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
     init::initcall::INITCALL_POSTCORE,
     libs::casting::DowncastArc,
@@ -97,7 +97,7 @@ impl AttributeGroup for MemmapDescAttrGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         Some(attr.mode())
     }
 }
@@ -125,7 +125,7 @@ impl Attribute for AttrStart {
         "start"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -151,7 +151,7 @@ impl Attribute for AttrEnd {
         "end"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -177,7 +177,7 @@ impl Attribute for AttrType {
         "type"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 

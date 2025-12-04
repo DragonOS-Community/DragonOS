@@ -3,10 +3,10 @@ use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use crate::arch::MMArch;
 use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::FileType;
+use crate::filesystem::vfs::InodeMode;
 use crate::mm::verify_area;
 use crate::mm::MemoryManagementArch;
 use crate::process::pid::PidPrivateData;
@@ -255,10 +255,17 @@ impl ProcessManager {
         clone_flags: &CloneFlags,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
+        // 先复制父进程的 flags
+        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+
+        // 然后根据 clone_flags 设置需要的标志
         if clone_flags.contains(CloneFlags::CLONE_VFORK) {
             new_pcb.flags().insert(ProcessFlags::VFORK);
         }
-        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+
+        // 标记新进程还未执行 exec
+        new_pcb.flags().insert(ProcessFlags::FORKNOEXEC);
+
         return Ok(());
     }
 
@@ -488,9 +495,6 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
-        // 标记当前线程还未被执行exec
-        pcb.flags().insert(ProcessFlags::FORKNOEXEC);
-
         // 克隆 pidfd
         if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
             let pid = pcb.raw_pid().0 as i32;
@@ -500,9 +504,8 @@ impl ProcessManager {
                 ProcessManager::current_pcb().raw_pid().data(),
                 pid
             );
-            let new_inode =
-                root_inode.create(&name, FileType::File, ModeType::from_bits_truncate(0o777))?;
-            let file = File::new(new_inode, FileMode::O_RDWR | FileMode::O_CLOEXEC)?;
+            let new_inode = root_inode.create(&name, FileType::File, InodeMode::S_IRWXUGO)?;
+            let file = File::new(new_inode, FileFlags::O_RDWR | FileFlags::O_CLOEXEC)?;
             {
                 let mut guard = file.private_data.lock();
                 *guard = FilePrivateData::Pid(PidPrivateData::new(pid));

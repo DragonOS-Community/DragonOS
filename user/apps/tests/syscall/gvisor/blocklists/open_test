@@ -3,6 +3,5 @@ OpenTest.OpenNoFollowSymlink
 OpenTest.OpenNoFollowStillFollowsLinksInPath
 OpenTest.SymlinkRecurse
 OpenTest.SymlinkDirectory
-OpenTest.CanTruncateReadOnlyNoWritePermission
 OpenTest.CanTruncateWithStrangePermissions
 OpenTest.OpenWithOpath

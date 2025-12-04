@@ -14,15 +14,18 @@ getcpu_host_test
 # 文件系统相关测试
 dup_test
 write_test
+mkdir_test
 mknod_test
 unlink_test
 lseek_test
 sync_test
+ioctl_test
 #stat_test
 #chmod_test
 #chown_test
 chdir_test
 fchdir_test
+pread64_test
 rename_test
 getdents_test
 preadv_test
@@ -38,6 +41,7 @@ fpsig_nested_test
 wait_test
 tkill_test
 tgkill_test
+kill_test
 prctl_test
 exit_test
 setns_test
@@ -54,7 +58,6 @@ madvise_test
 #listen_test
 
 # 信号处理测试
-#signal_test
 sigaction_test
 sigprocmask_test
 sigaltstack_test
@@ -63,3 +66,4 @@ sigtimedwait_test
 
 # 其他测试
 itimer_test
+pipe_test

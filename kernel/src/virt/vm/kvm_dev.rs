@@ -13,10 +13,9 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{
-            file::{File, FileMode},
-            syscall::ModeType,
+            file::{File, FileFlags},
             vcore::generate_inode_id,
-            FileType, IndexNode, Metadata,
+            FileType, IndexNode, InodeFlags, InodeMode, Metadata,
         },
     },
     libs::spinlock::SpinLock,
@@ -65,11 +64,12 @@ impl LockedKvmInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
-                mode: ModeType::S_IALLUGO,
+                mode: InodeMode::S_IALLUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                flags: InodeFlags::empty(),
             },
         };
 
@@ -88,7 +88,7 @@ impl LockedKvmInode {
 
         let current = ProcessManager::current_pcb();
 
-        let file = File::new(instance, FileMode::O_RDWR)?;
+        let file = File::new(instance, FileFlags::O_RDWR)?;
         let fd = current.fd_table().write().alloc_fd(file, None)?;
         return Ok(fd as usize);
     }
@@ -108,7 +108,7 @@ impl IndexNode for LockedKvmInode {
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -219,11 +219,12 @@ impl KvmInstance {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice,
-                mode: ModeType::S_IALLUGO,
+                mode: InodeMode::S_IALLUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                flags: InodeFlags::empty(),
             },
         })
     }
@@ -233,7 +234,7 @@ impl IndexNode for KvmInstance {
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &crate::filesystem::vfs::file::FileMode,
+        _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -350,11 +351,12 @@ impl KvmVcpuDev {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
-                mode: ModeType::S_IALLUGO,
+                mode: InodeMode::S_IALLUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                flags: InodeFlags::empty(),
             },
         })
     }
@@ -364,7 +366,7 @@ impl IndexNode for KvmVcpuDev {
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

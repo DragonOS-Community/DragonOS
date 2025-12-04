@@ -2,10 +2,13 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        file::{File, FileMode},
+        file::{File, FileFlags},
         iov::IoVecs,
     },
-    net::socket::{unix::stream::UnixStreamSocket, AddressFamily, PSOCK},
+    net::socket::{
+        unix::{datagram::UnixDatagramSocket, stream::UnixStreamSocket},
+        AddressFamily, PSOCK,
+    },
     process::ProcessManager,
     syscall::Syscall,
 };
@@ -16,8 +19,8 @@ use super::{
 };
 
 /// Flags for socket, socketpair, accept4
-const SOCK_CLOEXEC: FileMode = FileMode::O_CLOEXEC;
-const SOCK_NONBLOCK: FileMode = FileMode::O_NONBLOCK;
+const SOCK_CLOEXEC: FileFlags = FileFlags::O_CLOEXEC;
+const SOCK_NONBLOCK: FileFlags = FileFlags::O_NONBLOCK;
 
 impl Syscall {
     /// @brief sys_socket系统调用的实际执行函数
@@ -52,7 +55,7 @@ impl Syscall {
             is_close_on_exec,
         )?;
 
-        let file = File::new(inode, FileMode::O_RDWR)?;
+        let file = File::new(inode, FileFlags::O_RDWR)?;
         // 把socket添加到当前进程的文件描述符表中
         ProcessManager::current_pcb()
             .fd_table()
@@ -93,18 +96,29 @@ impl Syscall {
 
         let nonblocking = socket_type.contains(PosixArgsSocketType::NONBLOCK);
 
-        let (socket_a, socket_b) = match (address_family, stype) {
-            (AddressFamily::Unix, PSOCK::Stream) => UnixStreamSocket::new_pair(nonblocking, false),
+        let (socket_a, socket_b): (
+            alloc::sync::Arc<dyn socket::Socket>,
+            alloc::sync::Arc<dyn socket::Socket>,
+        ) = match (address_family, stype) {
+            (AddressFamily::Unix, PSOCK::Stream) => {
+                let (a, b) = UnixStreamSocket::new_pair(nonblocking, false);
+                (a, b)
+            }
             (AddressFamily::Unix, PSOCK::SeqPacket) => {
-                UnixStreamSocket::new_pair(nonblocking, true)
+                let (a, b) = UnixStreamSocket::new_pair(nonblocking, true);
+                (a, b)
+            }
+            (AddressFamily::Unix, PSOCK::Datagram) => {
+                let (a, b) = UnixDatagramSocket::new_pair(nonblocking);
+                (a, b)
             }
             _ => {
                 return Err(SystemError::EAFNOSUPPORT);
             }
         };
 
-        fds[0] = fd_table_guard.alloc_fd(File::new(socket_a, FileMode::O_RDWR)?, None)?;
-        fds[1] = fd_table_guard.alloc_fd(File::new(socket_b, FileMode::O_RDWR)?, None)?;
+        fds[0] = fd_table_guard.alloc_fd(File::new(socket_a, FileFlags::O_RDWR)?, None)?;
+        fds[1] = fd_table_guard.alloc_fd(File::new(socket_b, FileFlags::O_RDWR)?, None)?;
 
         drop(fd_table_guard);
         Ok(0)
@@ -419,8 +433,8 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        if SOCK_NONBLOCK != FileMode::O_NONBLOCK && ((flags & SOCK_NONBLOCK.bits()) != 0) {
-            flags = (flags & !FileMode::O_NONBLOCK.bits()) | FileMode::O_NONBLOCK.bits();
+        if SOCK_NONBLOCK != FileFlags::O_NONBLOCK && ((flags & SOCK_NONBLOCK.bits()) != 0) {
+            flags = (flags & !FileFlags::O_NONBLOCK.bits()) | FileFlags::O_NONBLOCK.bits();
         }
 
         return Self::do_accept(fd, addr, addrlen, flags);
@@ -443,12 +457,12 @@ impl Syscall {
         // debug!("accept: new_socket={:?}", new_socket);
         // Insert the new socket into the file descriptor vector
 
-        let mut file_mode = FileMode::O_RDWR;
+        let mut file_mode = FileFlags::O_RDWR;
         if flags & SOCK_NONBLOCK.bits() != 0 {
-            file_mode |= FileMode::O_NONBLOCK;
+            file_mode |= FileFlags::O_NONBLOCK;
         }
         if flags & SOCK_CLOEXEC.bits() != 0 {
-            file_mode |= FileMode::O_CLOEXEC;
+            file_mode |= FileFlags::O_CLOEXEC;
         }
 
         let new_fd = ProcessManager::current_pcb()

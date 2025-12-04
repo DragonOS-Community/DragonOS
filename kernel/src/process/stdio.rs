@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::tty::virtual_terminal::vc_manager,
-    filesystem::vfs::file::{File, FileMode},
+    filesystem::vfs::file::{File, FileFlags},
     process::{ProcessManager, RawPid},
 };
 
@@ -23,10 +23,10 @@ pub fn stdio_init() -> Result<(), SystemError> {
         .unwrap_or_else(|_| panic!("Init stdio: can't find {}", tty_path));
 
     let stdin =
-        File::new(tty_inode.clone(), FileMode::O_RDONLY).expect("Init stdio: can't create stdin");
+        File::new(tty_inode.clone(), FileFlags::O_RDONLY).expect("Init stdio: can't create stdin");
     let stdout =
-        File::new(tty_inode.clone(), FileMode::O_WRONLY).expect("Init stdio: can't create stdout");
-    let stderr = File::new(tty_inode.clone(), FileMode::O_WRONLY | FileMode::O_SYNC)
+        File::new(tty_inode.clone(), FileFlags::O_WRONLY).expect("Init stdio: can't create stdout");
+    let stderr = File::new(tty_inode.clone(), FileFlags::O_WRONLY | FileFlags::O_SYNC)
         .expect("Init stdio: can't create stderr");
 
     /*

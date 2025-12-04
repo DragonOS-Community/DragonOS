@@ -410,6 +410,21 @@ impl ProcessManager {
                 parent_pcb
                     .wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
+
+                // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
+                // 由于子进程被添加到线程组 leader 的 children 列表中，
+                // 因此还需要唤醒线程组 leader 的 wait_queue（如果 leader 不是 parent_pcb 本身）。
+                let parent_group_leader = {
+                    let ti = parent_pcb.thread.read_irqsave();
+                    ti.group_leader()
+                };
+                if let Some(leader) = parent_group_leader {
+                    if !Arc::ptr_eq(&leader, &parent_pcb) {
+                        leader
+                            .wait_queue
+                            .wakeup_all(Some(ProcessState::Blocked(true)));
+                    }
+                }
             }
             // todo: 这里还需要根据线程组的信息，决定信号的发送
         }

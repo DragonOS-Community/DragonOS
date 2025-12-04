@@ -23,7 +23,6 @@ impl Syscall for SysGetPid {
             );
             return Ok(1);
         }
-        log::debug!("getpid: returning tgid {}", tgid);
         Ok(tgid.into())
     }
 

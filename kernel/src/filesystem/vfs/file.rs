@@ -1276,6 +1276,19 @@ impl FileDescriptorVec {
         self.fds[fd as usize].clone()
     }
 
+    /// 根据文件描述符序号，获取文件结构体的Arc指针, 并检测FileMode
+    ///
+    /// ## 参数
+    ///
+    /// - `fd` 文件描述符序号
+    pub fn get_file_by_fd_not_raw(&self, fd: i32, mask: FileMode) -> Option<Arc<File>> {
+        if !self.validate_fd(fd) {
+            return None;
+        }
+        let file = self.fds[fd as usize].clone();
+        file.filter(|f| !f.mode().contains(mask))
+    }
+
     /// 当RLIMIT_NOFILE变化时调整文件描述符表容量
     ///
     /// ## 参数

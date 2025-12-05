@@ -96,7 +96,7 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
     let file = pcb
         .fd_table()
         .read()
-        .get_file_by_fd(fd)
+        .get_file_by_fd_not_raw(fd, FileMode::FMODE_PATH)
         .ok_or(SystemError::EBADF)?;
     let inode = file.inode();
 

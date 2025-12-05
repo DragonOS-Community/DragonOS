@@ -1,0 +1,21 @@
+#!/bin/sh
+SCRIPTSDIR=${SCRIPTSDIR:-../scripts}
+
+if [ "X$OS" != "X" ] && echo "$OS" | grep '`' > /dev/null
+then
+    OS=
+fi
+
+if [ "X$OS" = "X" ]
+then	OS=bloat-os
+    MACHINE=`uname -m | sed -e 's/ //g' | sed -e 's?/?-?g'`
+    SYSTEM=`uname -s | sed -e 's/ //g' | sed -e 's?/?-?g'`
+    OS="${MACHINE}-${SYSTEM}"
+    if [ -f ${SCRIPTSDIR}/gnu-os ]
+    then	OS=`${SCRIPTSDIR}/gnu-os | sed s/unknown-//`
+    fi
+    if [ -f ../../scripts/gnu-os ]
+    then	OS=`../../scripts/gnu-os | sed s/unknown-//`
+    fi
+fi
+echo $OS

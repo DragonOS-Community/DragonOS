@@ -1,0 +1,1075 @@
+#!/usr/bin/perl
+# Generate an ascii summary from lmbench result files BY HOSTNAME
+# instead of architecture.  Sorry, I think of these tools as being
+# used to measure and prototype particular named systems, not as
+# being useful to measure once and for all "i686-linux" systems,
+# which might well have different motherboards, chipsets, memory
+# clocks, CPU's (anything from PPro through to PIII so far) and
+# so forth.  Linux systems are far to heterogeneous to be categorized
+# with two or three descriptors, so might as well just use hostname
+# for shorthand...
+#
+# Usage: statsummary file file file...
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+#
+# $Id: statsummary,v 1.5 2000/07/08 21:06:49 rgb Exp $
+#
+#
+# Edit History.  I'm starting out with Larry's getsummary.  Then I'm
+# going to splice in a very simple set of stats routines that are
+# passed an array in his standard form and return a structure containing
+# max, min, mean, median, unbiased standard deviation and we'll go from
+# there.  However I'll likely print out only mean and SD and will try
+# to preserve Larry's general layout at that.  Oh, and I'm going to add
+# COMMENTS to the script.  Drives me nuts to work on something without
+# comments.  7/6/00
+
+eval 'exec perl -Ssw $0 "$@"'
+  if 0;
+
+#
+# This segment loops through all the output files and pushes the
+# specific field values it needs into suitably named arrays.  It
+# counts while it does so so it can check to be sure that all
+# the input files are complete.
+$n = 0;
+@hosts = ();
+foreach $file (@ARGV) {
+  open(FD, $file) || die "$0: can't open $file";
+  # I just want @file to contain the hostname, not the path or architecture.
+  # However, we have reason to need the associated filename (no path) to
+  # to help with debugging.
+  # Strip off the path
+  $file =~ s/(.*)\///;
+  # Split the filename from the number.  This will probably break if the
+  # hostname contains more "."'s.  However, I'm too lazy to figure out
+  # how to make this work totally robustly.  It would be easy if the
+  # the host datafiles were all created according to the "hostname.count"
+  # format, because then a simple regexp would pull off just the hostname
+  # or the count.  Not so easy when a hostname/count might contain no "."'s
+  # at all...
+  $filecount = "";
+  ($file,$filecount) = split(/\./,$file);
+  # fix silly bug caused by starting numbering at blank.
+  if(! $filecount){ 
+    $filecount = 0;
+  }
+  # Debugging...
+  # print STDERR "Found file $file with count $filecount\n";
+  push(@file, $file);
+  push(@filecount, $filecount);
+
+  # This should just push UNIQUE new hosts onto @hosts.
+  $numhosts = @hosts;
+  if($numhosts){ 
+    $lasthost = $hosts[$numhosts-1];
+  } else {
+    $lasthost = "";
+  }
+  if($lasthost !~ /$file/){
+    push(@hosts, $file);
+  }
+
+  $mhz = 0;
+  while (<FD>) {
+    chop;
+    next if m|scripts/lmbench: /dev/tty|;
+    if (/^\[lmbench/) {
+      push(@uname, $_);
+      if (/lmbench1\./) {
+        $version = 1;
+      } else {
+        $version = 2;
+      }
+    }
+    if (/MHZ/ && !$mhz) {
+      @_ = split;
+      $_[1] =~ s/\]//;
+      push(@misc_mhz, $_[1]);
+      $mhz = 1;
+    } elsif (/Mhz/ && !$mhz) {
+      @_ = split;
+      push(@misc_mhz, $_[0]);
+      $mhz = 1;
+    }
+    if (/^Select on 100 fd/) {
+      @_ = split;
+      push(@lat_select, $_[4]);
+      $tmp = $lat_select[0];	# Just to shut up the error parser
+    }
+    if (/^Simple syscall:/) {
+      @_ = split;
+      push(@lat_syscall, $_[2]);
+      $tmp = $lat_syscall[0];	# Just to shut up the error parser
+    }
+    if (/^Simple read:/) {
+      @_ = split;
+      push(@lat_read, $_[2]);
+      $tmp = $lat_read[0];	# Just to shut up the error parser
+    }
+    if (/^Simple write:/) {
+      @_ = split;
+      push(@lat_write, $_[2]);
+      $tmp = $lat_write[0];	# Just to shut up the error parser
+    }
+    if (/^Simple stat:/) {
+      @_ = split;
+      push(@lat_stat, $_[2]);
+      $tmp = $lat_stat[0];	# Just to shut up the error parser
+    }
+    if (/^Simple open.close:/) {
+      @_ = split;
+      push(@lat_openclose, $_[2]);
+      $tmp = $lat_openclose[0];	# Just to shut up the error parser
+    }
+    if (/^Null syscall:/) {  # Old format.
+      @_ = split;
+      push(@lat_write, $_[2]);
+      $tmp = $lat_write[0];	# Just to shut up the error parser
+    }
+    if (/^Signal handler installation:/) {
+      @_ = split;
+      push(@lat_siginstall, $_[3]);
+      $tmp = $lat_siginstall[0];	# Just to shut up the error parser
+    }
+    if (/^Signal handler overhead:/) {
+      @_ = split;
+      push(@lat_sigcatch, $_[3]);
+      $tmp = $lat_sigcatch[0];	# Just to shut up the error parser
+    }
+    if (/^Protection fault:/) {
+      @_ = split;
+      push(@lat_protfault, $_[2]);
+      $tmp = $lat_protfault[0];	# Just to shut up the error parser
+    }
+    if (/^Pipe latency:/) {
+      @_ = split;
+      push(@lat_pipe, $_[2]);
+      $tmp = $lat_pipe[0];	# Just to shut up the error parser
+    }
+    if (/AF_UNIX sock stream latency:/) {
+      @_ = split;
+      push(@lat_unix, $_[4]);
+      $tmp = $lat_unix[0];	# Just to shut up the error parser
+    }
+    if (/^UDP latency using /) {
+      if(/localhost:/) {
+        @_ = split;
+        push(@lat_udp_local, $_[4]);
+        $tmp = $lat_udp_local[0];	# Just to shut up the error parser
+      } else {
+        @_ = split;
+        push(@lat_udp_net, $_[4]);
+        $tmp = $lat_udp_net[0];	# Just to shut up the error parser
+      }
+    }
+    if (/^TCP latency using /) {
+      if(/localhost:/) {
+        @_ = split;
+        push(@lat_tcp_local, $_[4]);
+        $tmp = $lat_tcp_local[0];	# Just to shut up the error parser
+      } else {
+        @_ = split;
+        push(@lat_tcp_net, $_[4]);
+        $tmp = $lat_tcp_net[0];	# Just to shut up the error parser
+      }
+    }
+    if (/^RPC\/udp latency using /) {
+      if(/localhost:/) {
+        @_ = split;
+        push(@lat_rpc_udp_local, $_[4]);
+        $tmp = $lat_rpc_udp_local[0];	# Just to shut up the error parser
+      } else {
+        @_ = split;
+        push(@lat_rpc_udp_net, $_[4]);
+        $tmp = $lat_rpc_udp_net[0];	# Just to shut up the error parser
+      }
+    }
+    if (/^RPC\/tcp latency using /) {
+      if(/localhost:/) {
+        @_ = split;
+        push(@lat_rpc_tcp_local, $_[4]);
+        $tmp = $lat_rpc_tcp_local[0];	# Just to shut up the error parser
+      } else {
+        @_ = split;
+        push(@lat_rpc_tcp_net, $_[4]);
+        $tmp = $lat_rpc_tcp_net[0];	# Just to shut up the error parser
+      }
+    }
+    if (/^TCP\/IP connection cost to /) {
+      if(/localhost:/) {
+        @_ = split;
+        push(@lat_tcp_connect_local, $_[5]);
+        $tmp = $lat_tcp_connect_local[0];	# Just to shut up the error parser
+      } else {
+        @_ = split;
+        push(@lat_tcp_connect_net, $_[5]);
+        $tmp = $lat_tcp_connect_net[0];	# Just to shut up the error parser
+      }
+    }
+    if (/^Socket bandwidth using /) {
+      if(/localhost:/) {
+        @_ = split;
+        push(@bw_tcp_local, $_[4]);
+        $tmp = $bw_tcp_local[0];	# Just to shut up the error parser
+      } else {
+        @_ = split;
+        push(@bw_tcp_net, $_[4]);
+        $tmp = $bw_tcp_net[0];	# Just to shut up the error parser
+      }
+    }
+    if (/^AF_UNIX sock stream bandwidth:/) {
+      @_ = split;
+      push(@bw_unix, $_[4]);
+      $tmp = $bw_unix[0];	# Just to shut up the error parser
+    }
+    if (/^Process fork.exit/) {
+      @_ = split;
+      push(@lat_nullproc, $_[2]);
+      $tmp = $lat_nullproc[0];	# Just to shut up the error parser
+    }
+    if (/^Process fork.execve:/) {
+      @_ = split;
+      push(@lat_simpleproc, $_[2]);
+      $tmp = $lat_simpleproc[0];	# Just to shut up the error parser
+    }
+    if (/^Process fork..bin.sh/) {
+      @_ = split;
+      push(@lat_shproc, $_[3]);
+      $tmp = $lat_shproc[0];	# Just to shut up the error parser
+    }
+    if (/^Pipe bandwidth/) {
+      @_ = split;
+      push(@bw_pipe, $_[2]);
+      $tmp = $bw_pipe[0];	# Just to shut up the error parser
+    }
+    if (/^File .* write bandwidth/) {
+      @_ = split;
+      $bw = sprintf("%.2f", $_[4] / 1024.);
+      push(@bw_file, $bw);
+      $tmp = $bw_file[0];	# Just to shut up the error parser
+    }
+    if (/^Pagefaults on/) {
+      @_ = split;
+      push(@lat_pagefault, $_[3]);
+      $tmp = $lat_pagefault[0];	# Just to shut up the error parser
+    }
+    if (/^"mappings/) {
+      $value = &getbiggest("memory mapping timing");
+      push(@lat_mappings, $value);
+      $tmp = $lat_mappings[0];	# Just to shut up the error parser
+    }
+    if (/^"read bandwidth/) {
+      $value = &getbiggest("reread timing");
+      push(@bw_reread, $value);
+      $tmp = $bw_reread[0];	# Just to shut up the error parser
+    }
+    if (/^"Mmap read bandwidth/) {
+      $value = &getbiggest("mmap reread timing");
+      push(@bw_mmap, $value);
+      $tmp = $bw_mmap[0];	# Just to shut up the error parser
+    }
+    if (/^"libc bcopy unaligned/) {
+      $value = &getbiggest("libc bcopy timing");
+      push(@bw_bcopy_libc, $value);
+      $tmp = $bw_bcopy_libc[0];	# Just to shut up the error parser
+    }
+    if (/^"unrolled bcopy unaligned/) {
+      $value = &getbiggest("unrolled bcopy timing");
+      push(@bw_bcopy_unrolled, $value);
+      $tmp = $bw_bcopy_unrolled[0];	# Just to shut up the error parser
+    }
+    if (/^Memory read/) {
+      $value = &getbiggest("memory read & sum timing");
+      push(@bw_mem_rdsum, $value);
+      $tmp = $bw_mem_rdsum[0];	# Just to shut up the error parser
+    }
+    if (/^Memory write/) {
+      $value = &getbiggest("memory write timing");
+      push(@bw_mem_wr, $value);
+      $tmp = $bw_mem_wr[0];	# Just to shut up the error parser
+    }
+    if (/^"File system latency/) {
+      while (<FD>) {
+        next if /Id:/;
+        if (/^0k/) {
+          @_ = split;
+          push(@fs_create_0k, $_[2]);
+          push(@fs_delete_0k, $_[3]);
+          $tmp = $fs_create_0k[0];	# Just to shut up the error parser
+          $tmp = $fs_delete_0k[0];	# Just to shut up the error parser
+        } elsif (/^1k/) {
+          @_ = split;
+          push(@fs_create_1k, $_[2]);
+          push(@fs_delete_1k, $_[3]);
+          $tmp = $fs_create_1k[0];	# Just to shut up the error parser
+          $tmp = $fs_delete_1k[0];	# Just to shut up the error parser
+        } elsif (/^4k/) {
+          @_ = split;
+          push(@fs_create_4k, $_[2]);
+          push(@fs_delete_4k, $_[3]);
+          $tmp = $fs_create_4k[0];	# Just to shut up the error parser
+          $tmp = $fs_delete_4k[0];	# Just to shut up the error parser
+        } elsif (/^10k/) {
+          @_ = split;
+          push(@fs_create_10k, $_[2]);
+          push(@fs_delete_10k, $_[3]);
+          $tmp = $fs_create_10k[0];	# Just to shut up the error parser
+          $tmp = $fs_delete_10k[0];	# Just to shut up the error parser
+        } else {
+          last;
+        }
+      }
+    }
+    if (/size=0/) {
+      while (<FD>) {
+        if (/^2 /) {
+          @_ = split; push(@lat_ctx0_2, $_[1]);
+          $tmp = $lat_ctx0_2[0];	# Just to shut up the error parser
+        } elsif (/^8 /) {
+          @_ = split; push(@lat_ctx0_8, $_[1]);
+          $tmp = $lat_ctx0_8[0];	# Just to shut up the error parser
+        } elsif (/^16 /) {
+          @_ = split; push(@lat_ctx0_16, $_[1]);
+          $tmp = $lat_ctx0_16[0];	# Just to shut up the error parser
+        }
+            last if /^\s*$/ || /^Memory/;
+      }
+    }
+    if (/size=16/) {
+      while (<FD>) {
+        if (/^2 /) {
+          @_ = split; push(@lat_ctx16_2, $_[1]);
+          $tmp = $lat_ctx16_2[0];	# Just to shut up the error parser
+        } elsif (/^8 /) {
+          @_ = split; push(@lat_ctx16_8, $_[1]);
+          $tmp = $lat_ctx16_8[0];	# Just to shut up the error parser
+        } elsif (/^16 /) {
+          @_ = split; push(@lat_ctx16_16, $_[1]);
+          $tmp = $lat_ctx16_16[0];	# Just to shut up the error parser
+        }
+            last if /^\s*$/;
+      }
+    }
+    if (/size=64/) {
+      while (<FD>) {
+        if (/^2 /) {
+          @_ = split; push(@lat_ctx64_2, $_[1]);
+          $tmp = $lat_ctx64_2[0];	# Just to shut up the error parser
+        } elsif (/^8 /) {
+          @_ = split; push(@lat_ctx64_8, $_[1]);
+          $tmp = $lat_ctx64_8[0];	# Just to shut up the error parser
+        } elsif (/^16 /) {
+          @_ = split; push(@lat_ctx64_16, $_[1]);
+          $tmp = $lat_ctx64_16[0];	# Just to shut up the error parser
+        }
+            last if /^\s*$/ || /^20/;
+      }
+    }
+    if (/^"stride=128/) {
+      $save = -1;
+      while (<FD>) {
+        if (/^0.00098\s/) {
+          @_ = split;
+          push(@lat_l1, $_[1]);
+          $tmp = $lat_l1[0];	# Just to shut up the error parser
+        } elsif (/^0.12500\s/) {
+          @_ = split;
+          push(@lat_l2, $_[1]);
+          $tmp = $lat_l2[0];	# Just to shut up the error parser
+        } elsif (/^[45678].00000\s/) {
+          @_ = split;
+          $size = $_[0];
+          $save = $_[1];
+          last if /^8.00000\s/;
+        } elsif (/^\s*$/) {
+          last;
+        }
+      }
+      if (!/^8/) {
+        warn "$file: No 8MB memory latency, using $size\n";
+      }
+      push(@lat_mem, $save);
+    }
+  }
+  @warn = ();
+  foreach $array (
+    'bw_bcopy_libc', 'bw_bcopy_unrolled', 'bw_file',
+    'bw_mem_rdsum', 'bw_mem_wr', 'bw_mmap', 'bw_pipe',
+    'bw_reread', 'bw_tcp_local', 'bw_unix', 
+    'fs_create_0k','fs_delete_0k',
+    'fs_create_1k','fs_delete_1k',
+    'fs_create_4k','fs_delete_4k',
+    'fs_create_10k','fs_delete_10k',
+    'lat_ctx0_16', 'lat_ctx0_2', 'lat_ctx0_8',
+    'lat_ctx16_16', 'lat_ctx16_2', 'lat_ctx16_8',
+    'lat_ctx64_16', 'lat_ctx64_2', 'lat_ctx64_8', 'lat_l1',
+    'lat_l2', 'lat_mappings', 'lat_mem', 'lat_nullproc',
+    'lat_openclose', 'lat_pagefault', 'lat_pipe',
+    'lat_protfault', 'lat_read', 
+    'lat_rpc_tcp_local','lat_rpc_udp_local',
+    'lat_tcp_connect_local', 'lat_tcp_local', 'lat_udp_local', 
+    'lat_rpc_tcp_net','lat_rpc_udp_net',
+    'lat_tcp_connect_net', 'lat_tcp_net', 'lat_udp_net', 
+    'lat_select', 'lat_shproc', 'lat_sigcatch',    
+    'lat_siginstall', 'lat_simpleproc', 'lat_stat',
+    'lat_syscall', 'lat_unix', 'lat_write', 'misc_mhz',
+  ) {
+    $last = eval '$#' . $array;
+    if ($last != $n) {
+      #warn "No data for $array in $file\n";
+      push(@warn, $array);
+      eval 'push(@' . $array . ', -1);';
+    }
+  }
+  if ($#warn != -1) {
+    warn "Missing data in $file: @warn\n";
+  }
+  $n++;
+}
+
+#
+# OK, now all those arrays are packed.  Because everything is keyed
+# on raw hostname, we can do all the stats evaluations using a combination
+# of @file and the array -- we march through @file and create a stats
+# object (a % hash) with its name and do the obvious sums and so forth.
+# should be very simple.
+#
+# However, to be fair to Larry, we do want to preserve the general flavor
+# of the summary.  However, the summary is now going to be output BY HOST
+# and so we need a separate host-description section for each host.
+#
+# First we have to evaluate the stats, though.
+#
+
+#
+# Let's test this with just one small set of values...
+foreach $array (
+    'bw_bcopy_libc', 'bw_bcopy_unrolled', 'bw_file',
+    'bw_mem_rdsum', 'bw_mem_wr', 'bw_mmap', 'bw_pipe',
+    'bw_reread', 'bw_tcp_local', 'bw_unix', 
+    'fs_create_0k','fs_delete_0k',
+    'fs_create_1k','fs_delete_1k',
+    'fs_create_4k','fs_delete_4k',
+    'fs_create_10k','fs_delete_10k',
+    'lat_l1',
+    'lat_l2', 'lat_mappings', 'lat_mem', 'lat_nullproc',
+    'lat_openclose', 'lat_pagefault', 'lat_pipe',
+    'lat_protfault', 'lat_read', 
+    'lat_rpc_tcp_local','lat_rpc_udp_local',
+    'lat_tcp_connect_local', 'lat_tcp_local', 'lat_udp_local', 
+    'lat_rpc_tcp_net','lat_rpc_udp_net',
+    'lat_tcp_connect_net', 'lat_tcp_net', 'lat_udp_net', 
+    'lat_select', 'lat_shproc', 'lat_sigcatch',    
+    'lat_siginstall', 'lat_simpleproc', 'lat_stat',
+    'lat_syscall', 'lat_unix', 'lat_write', 'misc_mhz',
+  ) { }	# Empty just to save the full list someplace handy.
+
+#
+# Oops.  For some unfathomable reason lat_fs returns something other than
+# an (average) time in nanoseconds.  Why, I cannot imagine -- one could 
+# trivially invert so that it did so.  One CANNOT DO STATS on inverse
+# quantities, so we invert here and convert to nanoseconds 
+# so we can correctly do stats below.
+foreach $array (
+    'fs_create_0k','fs_delete_0k','fs_create_1k','fs_delete_1k',
+    'fs_create_4k','fs_delete_4k','fs_create_10k','fs_delete_10k',
+    ) {
+  $cnt = 0;
+  foreach $entry (@$array){
+    $$array[$cnt++] = 1.0e+9/$entry;
+  }
+
+}
+
+# Working copy.  Let's just add things as they turn out to be
+# appropriate.  In fact, we'll add them in presentation order!
+foreach $array (
+    'lat_syscall','lat_read', 'lat_write', 'lat_syscall', 'lat_stat', 
+    'lat_openclose','lat_select','lat_siginstall','lat_sigcatch',
+    'lat_nullproc','lat_simpleproc','lat_shproc',
+    'lat_ctx0_2','lat_ctx0_16','lat_ctx0_8',
+    'lat_ctx16_16','lat_ctx16_2','lat_ctx16_8',
+    'lat_ctx64_16','lat_ctx64_2','lat_ctx64_8', 
+    'lat_pipe','lat_unix',
+    'lat_udp_local','lat_tcp_local',lat_tcp_connect_local,
+    'lat_rpc_udp_local','lat_rpc_tcp_local',
+    'lat_udp_net','lat_tcp_net',lat_tcp_connect_net,
+    'lat_rpc_udp_net','lat_rpc_tcp_net',
+    'fs_create_0k','fs_delete_0k',
+    'fs_create_1k','fs_delete_1k',
+    'fs_create_4k','fs_delete_4k',
+    'fs_create_10k','fs_delete_10k',
+    'lat_mappings','lat_protfault','lat_pagefault',
+    'bw_pipe','bw_unix',
+    'bw_tcp_local',	# Note we need bw_udp_local as soon as it exists...
+    'bw_reread','bw_mmap','bw_bcopy_libc','bw_bcopy_unrolled',
+    'bw_mem_rdsum','bw_mem_wr',
+    'bw_tcp_net',
+    'lat_l1','lat_l2','lat_mem',
+    ) {
+
+  #
+  # This should do it all, by name and collapsed by hostname
+  #
+  makestats($array);
+
+}
+
+#
+# Fine, that seems to work.  Now we break up the summary, BY HOST.
+# For each host we print just ONE TIME key values that don't really
+# vary (like its architecture information and clock).  Then we print
+# out a modified version of Larry's old summary.
+#
+
+#
+# First the header
+#
+print<<EOF;
+========================================================================
+
+                 L M B E N C H  3 . 0   S U M M A R Y
+                 ------------------------------------
+
+========================================================================
+
+EOF
+
+#
+# Now a host loop.  Notice that @hosts is a list of hosts
+#
+$numhosts = @hosts;
+for($i=0;$i<$numhosts;$i++){
+  $host = $hosts[$i];
+  # Obviously we need a better way to fill in this information.
+  # Linux provides /proc/cpuinfo, which is just perfect and trivial
+  # to parse.  However, we should probably read this in from e.g.
+  # config/$host.conf, which can be created either automagically or
+  # by hand.  This file should also be used to control the running
+  # of the benchmark suite, which in turn should be done by means of
+  # a script call, not a make target.  I'm getting there...
+  #
+  # Oh, one last note.  It would be VERY CONVENIENT to have the config
+  # information stored in perl.  So convenient that the following should
+  # BE the format of the config file... (up to the next comment)
+  $CPU = "Celeron(Mendocino)";
+  $CPUFAMILY = "i686";
+  $MHz = 400;
+  $L1CODE = 16;
+  $L1DATA = 16;
+  $L2SIZE = 128;
+  $memsize = 128;
+  $memspeed = "PC100";
+  $memtype = "SDRAM";
+  @DISKS = ("/dev/hda","/dev/hdb","/dev/hdc");
+  @DISKTYPE = ("IBM-DJNA-371350, ATA DISK drive", "Disk 2", "Disk etc.");
+  @NETWORKS = ("ethernet-100","SneakerNet @ 3 meters/second");
+  @NICTYPE = ("Lite-On 82c168 PNIC rev 32","Nike Sports (etc.)");
+  @NETHUB = ("Netgear FS108 Fast Ethernet Switch","The Floor");
+  #
+  # OK, given this wealth of detail (which can be sourced directly into
+  # the perl script from the host config file if we are clever) we now
+  # print it into the report/summary.
+  #
+  printf("HOST:\t\t$host\n");
+  printf("CPU:\t\t$CPU\n");
+  printf("CPU Family:\t$CPUFAMILY\n");
+  printf("MHz:\t\t$MHz\n");
+  printf("L1 Cache Size:\t$L1CODE KB (code)/$L1DATA KB (data)\n");
+  printf("L2 Cache Size:\t$L2SIZE KB\n");
+  printf("Memory:\t\t$memsize MB of $memspeed $memtype\n");
+  printf("OS Kernel:\t%13s\n",&getos($uname[0]));
+  printf("Disk(s):\n");
+  $numdisks = @DISKS;
+  for($j=0;$j<$numdisks;$j++){
+    printf("\t\t%d) %s: %s\n",$j+1,$DISKS[$j],$DISKTYPE[$j]);
+  }
+  printf("Network(s):\n");
+  $numnets = @NETWORKS;
+  for($j=0;$j<$numnets;$j++){
+    printf("\t\t%d) %s: %s\n",$j+1,$NETWORKS[$j],$NICTYPE[$j]);
+    printf("\t\t   Switch/Hub: %s\n",$NETHUB[$j]);
+  }
+  print<<EOF;
+                   
+
+------------------------------------------------------------------------
+Processor, Processes - average times in microseconds - smaller is better
+------------------------------------------------------------------------
+ null           null                         open/
+ call  Error    I/O   Error    stat  Error   close  Error
+------ ------  ------ ------  ------ ------  ------ ------
+EOF
+
+#
+# In all the output below, averaged arrays are accessed by the hash:
+#  $stats{$host}{$array}{mean or stddev} (or whatever)
+
+  @fs_delete_4k = @lat_ctx0_8 = @bw_file = @lat_ctx0_16 = @fs_delete_1k =
+  @fs_create_4k = @fs_create_1k
+    if 0;  # lint
+
+  # If they have no /dev/zero, use /dev/null, else average them.
+  if ($stats{$host}{lat_read}{mean} == -1) {
+    $lat_rw_mean = $stats{$host}{lat_write}{mean};
+    $lat_rw_stddev = $stats{$host}{lat_write}{stddev};
+  } else {
+    $lat_rw_mean = ($stats{$host}{lat_read}{mean} + $stats{$host}{lat_write}{mean})/2;
+    $lat_rw_stddev = ($stats{$host}{lat_read}{stddev} + $stats{$host}{lat_write}{stddev})/2;
+  }
+  # We have to pick a format adequate for these numbers.  We'll shoot for
+  # %5.2f and see how it goes.
+  printf("%6.3f %6.3f  ",$stats{$host}{lat_syscall}{mean},$stats{$host}{lat_syscall}{stddev});
+  printf("%6.3f %6.3f  ",$lat_rw_mean,$lat_rw_stddev);
+  printf("%6.3f %6.3f  ",$stats{$host}{lat_stat}{mean},$stats{$host}{lat_stat}{stddev});
+  printf("%6.3f %6.3f  ",$stats{$host}{lat_openclose}{mean},$stats{$host}{lat_openclose}{stddev});
+  # End with this to complete the line...
+  printf("\n");
+  print<<EOF;
+........................................................................
+               signal         signal
+select Error   instll Error   catch  Error
+------ ------  ------ ------  ------ ------
+EOF
+  printf("%6.1f %6.2f  ",$stats{$host}{lat_select}{mean},$stats{$host}{lat_select}{stddev});
+  printf("%6.3f %6.3f  ",$stats{$host}{lat_siginstall}{mean},$stats{$host}{lat_siginstall}{stddev});
+  printf("%6.3f %6.3f  ",$stats{$host}{lat_sigcatch}{mean},$stats{$host}{lat_sigcatch}{stddev});
+  # End with this to complete the line...
+  printf("\n");
+  print<<EOF;
+........................................................................
+ fork             exec             shell
+ proc    Error    proc    Error    proc    Error
+------- -------  ------- -------  ------- -------
+EOF
+  printf("%7.1f %7.2f  ",
+         $stats{$host}{lat_nullproc}{mean},$stats{$host}{lat_nullproc}{stddev});
+  printf("%7.1f %7.2f  ",
+         $stats{$host}{lat_simpleproc}{mean},$stats{$host}{lat_simpleproc}{stddev});
+  printf("%7.1f %7.2f  ",
+         $stats{$host}{lat_shproc}{mean},$stats{$host}{lat_shproc}{stddev});
+  # End with this to complete the line...
+  printf("\n");
+  print<<EOF;
+                   
+
+------------------------------------------------------------------------
+Context switching - times in microseconds - smaller is better
+------------------------------------------------------------------------
+2p/0K          2p/16K         2p/64K
+       Error          Error          Error
+------ ------  ------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_ctx0_2}{mean},$stats{$host}{lat_ctx0_2}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_ctx16_2}{mean},$stats{$host}{lat_ctx16_2}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_ctx64_2}{mean},$stats{$host}{lat_ctx64_2}{stddev});
+  # End with this to complete the line...
+  printf("\n");
+  print<<EOF;
+........................................................................
+8p/0K          8p/16K         8p/64K       
+       Error          Error          Error 
+------ ------  ------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_ctx0_8}{mean},$stats{$host}{lat_ctx16_8}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_ctx16_8}{mean},$stats{$host}{lat_ctx16_8}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_ctx64_8}{mean},$stats{$host}{lat_ctx64_8}{stddev});
+  # End with this to complete the line...
+  printf("\n");
+  print<<EOF;
+........................................................................
+16p/0K        16p/16K        16p/64K       
+       Error          Error          Error 
+------ ------  ------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_ctx0_16}{mean},$stats{$host}{lat_ctx0_16}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_ctx16_16}{mean},$stats{$host}{lat_ctx16_16}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_ctx64_16}{mean},$stats{$host}{lat_ctx64_16}{stddev});
+  # End with this to complete the line...
+  printf("\n");
+  print<<EOF;
+
+------------------------------------------------------------------------
+*Local* Communication latencies in microseconds - smaller is better
+------------------------------------------------------------------------
+ Pipe            AF
+       Error    UNIX  Error
+------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_pipe}{mean},$stats{$host}{lat_pipe}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_unix}{mean},$stats{$host}{lat_unix}{stddev});
+  printf("\n");
+  print<<EOF;
+........................................................................
+ UDP            TCP            TCP           
+       Error          Error  Connect Error
+------ ------  ------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_udp_local}{mean},$stats{$host}{lat_udp_local}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_tcp_local}{mean},$stats{$host}{lat_tcp_local}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_tcp_connect_local}{mean},$stats{$host}{lat_tcp_connect_local}{stddev});
+  printf("\n");
+  print<<EOF;
+........................................................................
+ RPC            RPC
+ UDP   Error    TCP Error
+------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_rpc_udp_local}{mean},$stats{$host}{lat_rpc_udp_local}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_rpc_tcp_local}{mean},$stats{$host}{lat_rpc_tcp_local}{stddev});
+  printf("\n");
+  print<<EOF;
+
+------------------------------------------------------------------------
+*Network* Communication latencies in microseconds - smaller is better
+------------------------------------------------------------------------
+ UDP            TCP            TCP           
+       Error          Error  Connect Error
+------ ------  ------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_udp_net}{mean},$stats{$host}{lat_udp_net}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_tcp_net}{mean},$stats{$host}{lat_tcp_net}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_tcp_connect_net}{mean},$stats{$host}{lat_tcp_connect_net}{stddev});
+  printf("\n");
+  print<<EOF;
+........................................................................
+ RPC            RPC
+ UDP   Error    TCP Error
+------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_rpc_udp_net}{mean},$stats{$host}{lat_rpc_udp_net}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_rpc_tcp_net}{mean},$stats{$host}{lat_rpc_tcp_net}{stddev});
+  printf("\n");
+  print<<EOF;
+
+------------------------------------------------------------------------
+File & VM system latencies in microseconds - smaller is better
+------------------------------------------------------------------------
+             0k File                           1K File
+Create   Error   Delete   Error   Create   Error   Delete   Error
+------- -------  ------- -------  ------- -------  ------- -------
+EOF
+  $c0k =    $stats{$host}{fs_create_0k}{mean} <= 0 ? -1 : $stats{$host}{fs_create_0k}{mean}/1000;
+  $c0kerr = $stats{$host}{fs_create_0k}{stddev} <= 0 ? -1 : $stats{$host}{fs_create_0k}{stddev}/1000;
+  $d0k =    $stats{$host}{fs_delete_0k}{mean} <= 0 ? -1 : $stats{$host}{fs_delete_0k}{mean}/1000;
+  $d0kerr = $stats{$host}{fs_delete_0k}{stddev} <= 0 ? -1 : $stats{$host}{fs_delete_0k}{stddev}/1000;
+  $c1k =    $stats{$host}{fs_create_1k}{mean} <= 0 ? -1 : $stats{$host}{fs_create_1k}{mean}/1000;
+  $c1kerr = $stats{$host}{fs_create_1k}{stddev} <= 0 ? -1 : $stats{$host}{fs_create_1k}{stddev}/1000;
+  $d1k =    $stats{$host}{fs_delete_1k}{mean} <= 0 ? -1 : $stats{$host}{fs_delete_1k}{mean}/1000;
+  $d1kerr = $stats{$host}{fs_delete_1k}{stddev} <= 0 ? -1 : $stats{$host}{fs_delete_1k}{stddev}/1000;
+  printf("%7.2f %7.3f  ",
+         $c0k,$c0kerr);
+  printf("%7.2f %7.3f  ",
+         $d0k,$d0kerr);
+  printf("%7.2f %7.3f  ",
+         $c1k,$c1kerr);
+  printf("%7.2f %7.3f  ",
+         $d1k,$d1kerr);
+  printf("\n");
+  print<<EOF;
+........................................................................
+             4k File                          10K File
+Create   Error   Delete   Error   Create   Error   Delete   Error
+------- -------  ------- -------  ------- -------  ------- -------
+EOF
+  $c4k =    $stats{$host}{fs_create_4k}{mean} <= 0 ? -1 : $stats{$host}{fs_create_4k}{mean}/1000;
+  $c4kerr = $stats{$host}{fs_create_4k}{stddev} <= 0 ? -1 : $stats{$host}{fs_create_4k}{stddev}/1000;
+  $d4k =    $stats{$host}{fs_delete_4k}{mean} <= 0 ? -1 : $stats{$host}{fs_delete_4k}{mean}/1000;
+  $d4kerr = $stats{$host}{fs_delete_4k}{stddev} <= 0 ? -1 : $stats{$host}{fs_delete_4k}{stddev}/1000;
+  $c10k =    $stats{$host}{fs_create_10k}{mean} <= 0 ? -1 : $stats{$host}{fs_create_10k}{mean}/1000;
+  $c10kerr = $stats{$host}{fs_create_10k}{stddev} <= 0 ? -1 : $stats{$host}{fs_create_10k}{stddev}/1000;
+  $d10k =    $stats{$host}{fs_delete_10k}{mean} <= 0 ? -1 : $stats{$host}{fs_delete_10k}{mean}/1000;
+  $d10kerr = $stats{$host}{fs_delete_10k}{stddev} <= 0 ? -1 : $stats{$host}{fs_delete_10k}{stddev}/1000;
+  printf("%7.2f %7.3f  ",
+         $c4k,$c4kerr);
+  printf("%7.2f %7.3f  ",
+         $d4k,$d4kerr);
+  printf("%7.2f %7.3f  ",
+         $c10k,$c10kerr);
+  printf("%7.2f %7.3f  ",
+         $d10k,$d10kerr);
+  printf("\n");
+  print<<EOF;
+........................................................................
+  Mmap              Prot              Page
+Latency   Error     Fault   Error     Fault   Error
+-------- --------  ------- -------  -------- --------
+EOF
+  printf("%8.2f %8.3f  ",
+         $stats{$host}{lat_mappings}{mean},$stats{$host}{lat_mappings}{stddev});
+  printf("%7.2f %7.3f  ",
+         $stats{$host}{lat_protfault}{mean},$stats{$host}{lat_protfault}{stddev});
+  printf("%8.2f %8.3f  ",
+         $stats{$host}{lat_pagefault}{mean},$stats{$host}{lat_pagefault}{stddev});
+  printf("\n");
+  print<<EOF;
+
+------------------------------------------------------------------------
+*Local* Communication bandwidths in MB/s - bigger is better
+------------------------------------------------------------------------
+ Pipe            AF
+       Error    UNIX  Error
+------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_pipe}{mean},$stats{$host}{bw_pipe}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_unix}{mean},$stats{$host}{bw_unix}{stddev});
+  printf("\n");
+  print<<EOF;
+........................................................................
+ UDP            TCP
+       Error          Error
+------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         -1,-1);
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_tcp_local}{mean},$stats{$host}{bw_tcp_local}{stddev});
+  printf("\n");
+  print<<EOF;
+........................................................................
+ File           Mmap          Bcopy          Bcopy
+reread Error   reread Error   (libc) Error   (hand) Error
+------ ------  ------ ------  ------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_reread}{mean},$stats{$host}{bw_reread}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_mmap}{mean},$stats{$host}{bw_mmap}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_bcopy_libc}{mean},$stats{$host}{bw_bcopy_libc}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_bcopy_unrolled}{mean},$stats{$host}{bw_bcopy_unrolled}{stddev});
+  printf("\n");
+  print<<EOF;
+........................................................................
+ Mem            Mem
+ read  Error   write  Error
+------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_mem_rdsum}{mean},$stats{$host}{bw_mem_rdsum}{stddev});
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_mem_wr}{mean},$stats{$host}{bw_mem_wr}{stddev});
+  printf("\n");
+  print<<EOF;
+
+------------------------------------------------------------------------
+*Net* Communication bandwidths in MB/s - bigger is better
+------------------------------------------------------------------------
+ UDP            TCP
+       Error          Error
+------ ------  ------ ------
+EOF
+  printf("%6.2f %6.3f  ",
+         -1,-1);
+  printf("%6.2f %6.3f  ",
+         $stats{$host}{bw_tcp_net}{mean},$stats{$host}{bw_tcp_net}{stddev});
+  printf("\n");
+  print<<EOF;
+
+------------------------------------------------------------------------
+Memory latencies in nanoseconds - smaller is better
+  (WARNING - may not be correct, check graphs)
+------------------------------------------------------------------------
+  L1             L2            Main 
+Cache  Error    Cache Error    mem   Error   Guesses
+------ ------  ------ ------  ------ ------  -------
+EOF
+  $msg = &check_caches;
+  if ($stats{$host}{lat_l1}{mean} < 0) {
+    printf("%6s %6s  ",
+         "------","------");
+    printf("%6s %6s  ",
+         "------","------");
+    printf("%6s %6s  ",
+         "------","------");
+    printf("%6s","Bad mhz?");
+  } else {
+    printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_l1}{mean},$stats{$host}{lat_l1}{stddev});
+    printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_l2}{mean},$stats{$host}{lat_l2}{stddev});
+    printf("%6.2f %6.3f  ",
+         $stats{$host}{lat_mem}{mean},$stats{$host}{lat_mem}{stddev});
+    print $msg if ($msg =~ /L/);
+  }
+  printf("\n");
+
+
+
+# This ends the host section...
+  print<<EOF;
+
+========================================================================
+EOF
+
+}
+
+exit 0;
+
+
+# (33, %3d)
+sub num
+{
+  local($val, $fmt) = @_;
+  local($str) = "";
+  local($i);
+
+  if ($val <= 0) {
+    $fmt =~ s/^.//;
+    while (length($fmt) > 1) { chop($fmt); }
+    for ($i = 0; $i < $fmt; $i++) {
+      $str .= " ";
+    }
+    return ($str);
+  }
+  $str = sprintf($fmt, $val);
+  $str;
+}
+
+# Input looks like
+# "benchmark name
+# size value
+# ....
+# <blank line>
+#
+# Return the biggest value before the blank line.
+sub getbiggest
+{
+  local($msg) = @_;
+  local($line) = 0;
+
+  undef $save;
+  $value = 0;
+  while (<FD>) {
+    $line++;
+    #warn "$line $_";
+    last if /^\s*$/;
+    $save = $_ if /^\d+\./;
+  }
+  if (defined $save) {
+    $_ = $save;
+    @d = split;
+    $value = $d[1];
+    if (int($d[0]) < 4) {
+      warn "$file: using $d[0] size for $msg\n";
+    }
+  } else {
+    warn "$file: no data for $msg\n";
+  }
+  $value;
+}
+
+
+# Try and create sensible names from uname -a output
+sub getos
+{
+        local(@info);
+
+        @info = split(/\s+/, $_[0]);
+        "$info[3] $info[5]";
+}
+
+# Return true if the values differe by less than 10%
+sub same
+{
+  local($a, $b) = @_;
+
+  if ($a > $b) {
+    $percent = (($a - $b) / $a) * 100;
+  } else {
+    $percent = (($b - $a) / $b) * 100;
+  }
+  return ($percent <= 20);
+}
+
+sub check_caches
+{
+  if (!&same($lat_l1[$i], $lat_l2[$i]) &&
+      &same($lat_l2[$i], $lat_mem[$i])) {
+    "    No L2 cache?";
+  } elsif (&same($lat_l1[$i], $lat_l2[$i])) {
+    "    No L1 cache?";
+  }
+}
+
+sub makestats
+{
+
+ my $cnt=0;
+ my $host;
+ # Debugging
+ # print STDERR "Ready to make stats for array $array\n";
+ # Zero the counters
+ $numhosts = @hosts;
+ for($i=0;$i<$numhosts;$i++){
+   $host = $hosts[$i];
+   $stats{$host}{$array}{mean} = 0.0;
+   $stats{$host}{$array}{stddev} = 0.0;
+   $stats{$host}{$array}{count} = 0;
+ }
+ # Loop through ALL DATA.  We use the hash to direct results to
+ # to the appropriate counters.
+ foreach $value (@$array){
+   $host = $file[$cnt];
+   if($$array[0] == -1){
+     $stats{$host}{$array}{mean} = -1;
+     $stats{$host}{$array}{stddev} = -1;
+     # Debugging (and curiosity)
+     print STDERR "Oops.  $array is empty.\n";
+     return;
+   }    
+   # Debugging
+   # print STDERR "$host/$array ($cnt): value is $value\n";
+   $stats{$host}{$array}{mean} += $value;
+   $stats{$host}{$array}{stddev} += $value*$value;
+   $stats{$host}{$array}{count}++;
+   $cnt++;
+ }
+ for($i=0;$i<$numhosts;$i++){
+   $host = $hosts[$i];
+   $cnt = $stats{$host}{$array}{count};
+   # Debugging Only
+   # print STDERR "Evaluating final mean/stddev of $cnt objects in $host/$array\n";
+   if($cnt>1) {
+     $stats{$host}{$array}{mean} = $stats{$host}{$array}{mean} / $cnt;
+     $stats{$host}{$array}{stddev} = sqrt(($stats{$host}{$array}{stddev} / $cnt 
+          - $stats{$host}{$array}{mean}*$stats{$host}{$array}{mean})/($cnt-1));
+   } elsif($cnt == 1) {
+     # Wish one could assign "infinity".  This probably breaks somewhere.
+     $stats{$host}{$array}{stddev} = 1.0e+1000;
+   } else {
+     # print STDERR "Error:  Cannot average 0 $array results on $host\n";
+   }
+
+   # Debugging Only.
+   # print STDERR "$host/$array (average): $stats{$host}{$array}{mean} +/- $stats{$host}{$array}{stddev}\n";
+ }
+
+}

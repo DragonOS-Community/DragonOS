@@ -1,0 +1,798 @@
+#!/bin/sh
+
+# Configure parameters for lmbench.
+# %I% %E% %@%
+
+BINDIR=${BINDIR:-..}
+SCRIPTSDIR=${SCRIPTSDIR:-../scripts}
+
+OS=`${SCRIPTSDIR}/os`
+L='====================================================================='
+echo $L; 
+cat<<EOF;
+
+		L M B E N C H   C ON F I G U R A T I O N
+		----------------------------------------
+
+You need to configure some parameters to lmbench.  Once you have configured
+these parameters, you may do multiple runs by saying
+
+	"make rerun"
+
+in the src subdirectory.
+
+NOTICE: please do not have any other activity on the system if you can
+help it.  Things like the second hand on your xclock or X perfmeters
+are not so good when benchmarking.  In fact, X is not so good when
+benchmarking.
+
+EOF
+
+# Figure out echo.
+if [ `echo -n "foo" | wc -l` -eq 0 ]
+then	ECHON="-n"; ECHOC=
+else	ECHON= ; ECHOC='\c'
+fi
+
+############################################################################
+# Multiple copies
+############################################################################
+echo $L
+cat<<EOF;
+
+If you are running on an MP machine and you want to try running
+multiple copies of lmbench in parallel, you can specify how many here.
+
+Using this option will make the benchmark run 100x slower (sorry).
+
+NOTE:  WARNING! This feature is experimental and many results are 
+	known to be incorrect or random!
+
+EOF
+AGAIN=Y
+while [ $AGAIN = Y ]
+do	echo $ECHON "MULTIPLE COPIES [default 1]: $ECHOC"
+	read SYNC_MAX
+	if [ "X$SYNC_MAX" != X ]
+	then	case "$SYNC_MAX" in
+		[0-9]|[0-9][0-9]|[0-9][0-9][0-9])
+			AGAIN=N
+			;;
+		*)	echo "Please enter a number between 1 and 999"
+			;;
+		esac
+	else	AGAIN=N
+		SYNC_MAX=1
+	fi
+done
+
+############################################################################
+# Job placement (for SMPs)
+############################################################################
+L='====================================================================='
+echo $L; 
+LMBENCH_SCHED=DEFAULT
+AGAIN=Y
+while [ $AGAIN = Y ]
+do
+echo ""
+cat<<EOF 
+Options to control job placement
+1) Allow scheduler to place jobs
+2) Assign each benchmark process with any attendent child processes
+   to its own processor
+3) Assign each benchmark process with any attendent child processes
+   to its own processor, except that it will be as far as possible
+   from other processes
+4) Assign each benchmark and attendent processes to their own
+   processors
+5) Assign each benchmark and attendent processes to their own
+   processors, except that they will be as far as possible from
+   each other and other processes
+6) Custom placement: you assign each benchmark process with attendent
+   child processes to processors
+7) Custom placement: you assign each benchmark and attendent
+   processes to processors
+
+Note: some benchmarks, such as bw_pipe, create attendent child
+processes for each benchmark process.  For example, bw_pipe
+needs a second process to send data down the pipe to be read
+by the benchmark process.  If you have three copies of the
+benchmark process running, then you actually have six processes;
+three attendent child processes sending data down the pipes and 
+three benchmark processes reading data and doing the measurements.
+
+EOF
+	echo $ECHON "Job placement selection [default 1]: $ECHOC"
+	read LMBENCH_SCHED
+	if [ "X$LMBENCH_SCHED" = X ]
+	then
+	    LMBENCH_SCHED=1
+	fi
+	AGAIN=N
+	case "$LMBENCH_SCHED" in
+	    1) LMBENCH_SCHED=DEFAULT;;
+	    2) LMBENCH_SCHED=BALANCED;;
+	    3) LMBENCH_SCHED=BALANCED_SPREAD;;
+	    4) LMBENCH_SCHED=UNIQUE;;
+	    5) LMBENCH_SCHED=UNIQUE_SPREAD;;
+	    6) echo $ECHON "Please enter a space-separated list of CPU ids: $ECHOC"
+	       read LMBENCH_SCHED
+	       LMBENCH_SCHED="CUSTOM $LMBENCH_SCHED"
+	       ;;
+	    7) echo $ECHON "Please enter a space-separated list of CPU ids: $ECHOC"
+	       read LMBENCH_SCHED
+	       LMBENCH_SCHED="CUSTOM_SPREAD $LMBENCH_SCHED"
+	       ;;
+	    *) AGAIN=Y
+	       ;;
+	esac
+done
+export LMBENCH_SCHED
+
+############################################################################
+# Timing granulairty, loop overhead, etc.
+############################################################################
+echo $L; echo "";
+echo "Hang on, we are calculating your timing granularity."
+${BINDIR}/bin/$OS/msleep 250
+ENOUGH=`${BINDIR}/bin/$OS/enough`
+export ENOUGH 
+echo "OK, it looks like you can time stuff down to $ENOUGH usec resolution."
+echo ""
+echo "Hang on, we are calculating your timing overhead."
+${BINDIR}/bin/$OS/msleep 250
+TIMING_O=`${BINDIR}/bin/$OS/timing_o`
+export TIMING_O
+echo "OK, it looks like your gettimeofday() costs $TIMING_O usecs."
+echo ""
+echo "Hang on, we are calculating your loop overhead."
+${BINDIR}/bin/$OS/msleep 250
+LOOP_O=`${BINDIR}/bin/$OS/loop_o`
+export LOOP_O
+echo "OK, it looks like your benchmark loop costs $LOOP_O usecs."
+echo ""
+
+############################################################################
+# Figure out memory size.
+############################################################################
+if [ -r /proc/cpuinfo ]
+then
+	PROCESSORS=`grep processor /proc/cpuinfo | wc -l`
+fi
+
+if [ -r /proc/meminfo ]
+then
+	TMP=`grep 'MemTotal:' /proc/meminfo | awk '{print $2}'`
+	if [ "X$TMP" != X ]
+	then	MB=`echo $TMP / 1024 | bc 2>/dev/null`
+		if [ X$MB = X ]
+		then	MB=`expr $TMP / 1024 2>/dev/null`
+		fi
+	fi
+	TMP=`grep 'Mem\(Free\)\?:' /proc/meminfo | awk '{print $2}'`
+	if [ "X$MB" = X -a "X$TMP" != X ]
+	then	MB=`echo $TMP / 1048576 | bc 2>/dev/null`
+		if [ X$MB = X ]
+		then	MB=`expr $TMP / 1048576 2>/dev/null`
+		fi
+	fi
+fi
+if [ X$MB = X ]
+then	$ECHON "Probing system for available memory: $ECHOC"
+	MB=`${BINDIR}/bin/$OS/memsize 4096`
+fi
+TOTAL_MEM=$MB
+MB=`echo \( $MB \* 7 \) / 10 | bc 2>/dev/null`
+if [ X$MB = X ]
+then	MB=`expr $TOTAL_MEM \* 7`
+	MB=`expr $MB / 10`
+fi
+
+echo $L
+cat<<EOF;
+
+Several benchmarks operate on a range of memory.  This memory should be
+sized such that it is at least 4 times as big as the external cache[s]
+on your system.   It should be no more than 80% of your physical memory.
+
+The bigger the range, the more accurate the results, but larger sizes
+take somewhat longer to run the benchmark.
+
+EOF
+echo $ECHON "MB [default $MB]: $ECHOC"
+read TMP
+if [ X$TMP != X ]
+then	MB=$TMP
+fi
+# Certain machines tend to barf when you try and bcopy 8MB.
+# Figure out how much we can use.
+echo "Checking to see if you have $MB MB; please wait for a moment..."
+MB=`${BINDIR}/bin/$OS/memsize $MB`
+MB=`${BINDIR}/bin/$OS/memsize $MB`
+MB=`${BINDIR}/bin/$OS/memsize $MB`
+if [ `expr $SYNC_MAX \* $MB` -gt `expr $TOTAL_MEM` ]
+then
+	MB=`expr $TOTAL_MEM / $SYNC_MAX`
+	MB=`expr $MB / 2`
+fi
+if [ $MB -lt 8 ]
+then    echo $0 aborted: Not enough memory, only ${MB}MB available. 
+	exit 1
+fi
+if [ $MB -lt 16 ]
+then	echo Warning: you have only ${MB}MB available memory. 
+	echo Some benchmark results will be less meaningful. 
+fi
+
+echo "Hang on, we are calculating your cache line size."
+${BINDIR}/bin/$OS/msleep 250
+LINE_SIZE=`${BINDIR}/bin/$OS/line -M ${MB}M`
+export LINE_SIZE
+echo "OK, it looks like your cache line is $LINE_SIZE bytes."
+echo ""
+
+############################################################################
+# Benchmarking subsets
+############################################################################
+echo $L
+cat<<EOF;
+
+lmbench measures a wide variety of system performance, and the full suite
+of benchmarks can take a long time on some platforms.  Consequently, we
+offer the capability to run only predefined subsets of benchmarks, one
+for operating system specific benchmarks and one for hardware specific
+benchmarks.  We also offer the option of running only selected benchmarks
+which is useful during operating system development.
+
+Please remember that if you intend to publish the results you either need
+to do a full run or one of the predefined OS or hardware subsets.
+
+EOF
+
+echo $ECHON "SUBSET (ALL|HARWARE|OS|DEVELOPMENT) [default all]: $ECHOC"
+read subset
+BENCHMARK_HARDWARE=NO
+BENCHMARK_OS=NO
+BENCHMARK_DEVELOPMENT=NO
+case "$subset" in
+	[hH]*)	BENCHMARK_HARDWARE=YES;;
+	[oO]*)	BENCHMARK_OS=YES;;
+	[dD]*)	BENCHMARK_DEVELOPMENT=YES;;
+	*)	BENCHMARK_HARDWARE=YES;
+		BENCHMARK_OS=YES;;
+esac
+
+if [ X$BENCHMARK_DEVELOPMENT = XYES ]; then
+	echo $L
+
+	echo $ECHON "SYSCALL [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_SYSCALL=NO;;
+	    *)		BENCHMARK_SYSCALL=YES;;
+	esac
+
+	echo $ECHON "SELECT [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_SELECT=NO;;
+	    *) 		BENCHMARK_SELECT=YES;;
+	esac
+
+	echo $ECHON "SIGNAL [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_SIG=NO;;
+	    *) 		BENCHMARK_SIG=YES;;
+	esac
+
+	echo $ECHON "PROCESS CREATION [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_PROC=NO;;
+	    *)		BENCHMARK_PROC=YES;;
+	esac
+
+	echo $ECHON "PAGEFAULT [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_PAGEFAULT=NO;;
+	    *)		BENCHMARK_PAGEFAULT=YES;;
+	esac
+
+	echo $ECHON "FILE [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_FILE=NO;;
+	    *)		BENCHMARK_FILE=YES;;
+	esac
+
+	echo $ECHON "MMAP [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_MMAP=NO;;
+	    *)		BENCHMARK_MMAP=YES;;
+	esac
+
+	echo $ECHON "CONTEXT SWITCH [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_CTX=NO;;
+	    *)		BENCHMARK_CTX=YES;;
+	esac
+
+	echo $ECHON "PIPE [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_PIPE=NO;;
+	    *)		BENCHMARK_PIPE=YES;;
+	esac
+
+	echo $ECHON "UNIX socket [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_UNIX=NO;;
+	    *)		BENCHMARK_UNIX=YES;;
+	esac
+
+	echo $ECHON "UDP [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_UDP=NO;;
+	    *)		BENCHMARK_UDP=YES;;
+	esac
+
+	echo $ECHON "TCP [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_TCP=NO;;
+	    *)		BENCHMARK_TCP=YES;;
+	esac
+
+	echo $ECHON "TCP CONNECT [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_CONNECT=NO;;
+	    *)		BENCHMARK_CONNECT=YES;;
+	esac
+
+	echo $ECHON "RPC [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_RPC=NO;;
+	    *)		BENCHMARK_RPC=YES;;
+	esac
+
+	echo $ECHON "HTTP [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_HTTP=NO;;
+	    *)		BENCHMARK_HTTP=YES;;
+	esac
+
+	echo $ECHON "BCOPY [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_BCOPY=NO;;
+	    *)		BENCHMARK_BCOPY=YES;;
+	esac
+
+	echo $ECHON "MEMORY HIERARCHY [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_MEM=NO;;
+	    *)		BENCHMARK_MEM=YES;;
+	esac
+
+	echo $ECHON "CPU OPERATIONS [default yes]: $ECHOC"
+	read bench
+	case "$bench" in
+	    [nN]*)	BENCHMARK_OPS=NO;;
+	    *)		BENCHMARK_OPS=YES;;
+	esac
+fi
+
+############################################################################
+# Memory strides for lat_mem
+############################################################################
+FASTMEM=NO
+if [ "$BENCHMARK_HARDWARE" = "YES" ]; then
+	echo $L
+	cat<<EOF;
+
+This benchmark measures, by default, memory latency for a number of
+different strides.  That can take a long time and is most useful if you
+are trying to figure out your cache line size or if your cache line size
+is greater than 128 bytes.
+
+If you are planning on sending in these results, please don't do a fast
+run.
+
+Answering yes means that we measure memory latency with a 128 byte stride.  
+
+EOF
+
+	echo $ECHON "FASTMEM [default no]: $ECHOC"
+	read fast
+	case "$fast" in
+	    [yY]*) FASTMEM=YES;;
+	    *)	   FASTMEM=NO;;
+	esac
+fi
+
+############################################################################
+# File system latency
+############################################################################
+echo $L
+cat<<EOF;
+
+This benchmark measures, by default, file system latency.  That can
+take a long time on systems with old style file systems (i.e., UFS,
+FFS, etc.).  Linux' ext2fs and Sun's tmpfs are fast enough that this
+test is not painful.
+
+If you are planning on sending in these results, please don't do a fast
+run.
+
+If you want to skip the file system latency tests, answer "yes" below.
+
+EOF
+
+echo $ECHON "SLOWFS [default no]: $ECHOC"
+read slow
+case "$slow" in
+    [yY]*) SLOWFS=YES;;
+    *)	   SLOWFS=NO;;
+esac
+
+############################################################################
+# Disk bandwidth/seek times
+############################################################################
+if [ $SYNC_MAX -gt 1 -o "${BENCHMARK_HARDWARE}" != "YES" ]; then
+	# parallel benchmarking is incompatible with disk tests
+	DISK_DESC=""
+	DISKS=""
+else
+	echo $L
+	cat<<EOF;
+
+This benchmark can measure disk zone bandwidths and seek times.  These can
+be turned into whizzy graphs that pretty much tell you everything you might
+need to know about the performance of your disk.  
+
+This takes a while and requires read access to a disk drive.  
+Write is not measured, see disk.c to see how if you want to do so.
+
+If you want to skip the disk tests, hit return below.
+
+If you want to include disk tests, then specify the path to the disk
+device, such as /dev/sda.  For each disk that is readable, you'll be
+prompted for a one line description of the drive, i.e., 
+
+	Iomega IDE ZIP
+or
+	HP C3725S 2GB on 10MB/sec NCR SCSI bus
+
+EOF
+
+	echo $ECHON "DISKS [default none]: $ECHOC"
+	read disks
+	if [ X"$disks" != X ]
+	then	
+		for i in $disks
+		do	if [ -r $i ]
+			then	${BINDIR}/bin/$OS/flushdisk $i
+				if [ $? -eq 1 ]
+				then	echo "Must be root to run disk benchmarks."
+					echo "Root is needed to flush the buffer cache"
+					exit 1
+				fi
+				echo $ECHON "$i is a $ECHOC"
+				read x
+				DISK_DESC="$DISK_DESC[${i}:${x}] "
+				DISKS="$DISKS${i} "
+			else	echo "Can't read $i, skipping it."
+			fi
+		done
+	fi
+fi
+
+############################################################################
+# Remote networking
+############################################################################
+if [ $SYNC_MAX -gt 1 ]; then
+	# remote networking is incompatible with parallel benchmarking
+	REMOTE=""
+else
+	echo $L
+
+	RSH=rsh
+	for p in `echo $PATH | sed 's/:/ /g'`
+	do	if [ -f $p/remsh ]
+		then	RSH=remsh
+		fi
+	done
+	RCP=rcp
+
+	cat<<EOF;
+
+If you are running on an idle network and there are other, identically
+configured systems, on the same wire (no gateway between you and them),
+and you have rsh access to them, then you should run the network part
+of the benchmarks to them.  Please specify any such systems as a space
+separated list such as: ether-host fddi-host hippi-host.
+
+EOF
+	echo $ECHON "REMOTE [default none]: $ECHOC"
+	read REMOTE
+
+	if [ "X$REMOTE" != X ]
+	then	cat<<EOF;
+
+Thanks for doing remote testing, that is a hard thing to get.  In 
+order to run a server on the remote system, we need a remote shell 
+to be enabled (ideally without a password) from this host to $REMOTE.  
+The original remote shell is rsh, but the use of a secure remote shell 
+like ssh is increasingly common.  We need the name of BOTH the shell 
+itself and the associated copy tool (e.g. rcp vs scp) to be entered.
+
+EOF
+		echo $ECHON "RSH [default $RSH]: $ECHOC"
+		read rsh
+		if [ -n "$rsh" ]
+		then	RSH=$rsh
+		fi
+		echo $ECHON "RCP [default $RCP]: $ECHOC"
+		read rcp
+		if [ -n "$rsh" ]
+		then	RCP=$rcp
+		fi
+
+		cat<<EOF;
+
+Could you do me one more favor and tell me the networking you think 
+will be used to get to each of the remote hosts.  By networking I 
+mean one of the following (or whatever you use if you use something 
+else):
+
+ethernet		aka 10baseT, thinnet, thicknet, etc
+ethernet-100		aka 100baseT, 100VG
+fddi			aka cddi
+hippi
+others?
+
+Please type it just like the above if you can, it makes parsing easier.
+
+EOF
+
+
+		for r in $REMOTE
+		do	echo $ECHON "Network type for $r: $ECHOC"
+			read n
+			X=`$RSH $r echo foo`
+			if [ X$X = Xfoo ]
+			then	echo Remote access to $r worked, thanks.
+			else	echo Remote access to $r did not work, please check and retry,
+				exit 1
+			fi
+			NETWORKS="${NETWORKS}[ $r:$n ]"
+		done
+	fi
+fi
+
+############################################################################
+# Processor speed
+############################################################################
+echo $L
+echo ""
+echo "Calculating mhz, please wait for a moment..."
+MHZ=`${BINDIR}/bin/$OS/mhz`
+cat<<EOF
+I think your CPU mhz is 
+
+	$MHZ
+	
+but I am frequently wrong.  If that is the wrong Mhz, type in your
+best guess as to your processor speed.  It doesn't have to be exact,
+but if you know it is around 800, say 800.  
+
+Please note that some processors, such as the P4, have a core which
+is double-clocked, so on those processors the reported clock speed
+will be roughly double the advertised clock rate.  For example, a
+1.8GHz P4 may be reported as a 3592MHz processor.
+
+EOF
+echo $ECHON "Processor mhz [default $MHZ]: $ECHOC"
+read mhz
+if [ -n "$mhz" ]
+then	MHZ=$mhz
+fi
+
+
+############################################################################
+# /var/tmp?
+############################################################################
+echo $L
+AGAIN=Y
+while [ $AGAIN = Y ]
+do
+	cat<<EOF;
+
+We need a place to store a $MB Mbyte file as well as create and delete a
+large number of small files.  We default to /var/tmp.  If /var/tmp is a
+memory resident file system (i.e., tmpfs), pick a different place.
+Please specify a directory that has enough space and is a local file
+system.
+
+EOF
+	DEFAULTFSDIR=/var/tmp/lmbench
+	echo $ECHON "FSDIR [default $DEFAULTFSDIR]: $ECHOC"
+	read FSDIR
+	if [ X$FSDIR = X ]
+	then	FSDIR=$DEFAULTFSDIR
+	else	mkdir -p $FSDIR 2>/dev/null
+	fi
+	if [ -d $FSDIR -a -w $FSDIR ]
+	then	AGAIN=N
+		FILE=$FSDIR/XXX
+	else	echo $FSDIR is not a directory or is not writable
+	fi
+done
+
+############################################################################
+# status output?
+############################################################################
+echo $L
+cat<<EOF;
+
+lmbench outputs status information as it runs various benchmarks.
+By default this output is sent to /dev/tty, but you may redirect
+it to any file you wish (such as /dev/null...).
+
+EOF
+
+echo $ECHON "Status output file [default /dev/tty]: $ECHOC"
+read OUTPUT
+if [ "X$OUTPUT" = X ]
+then	OUTPUT=/dev/tty;
+fi
+
+############################################################################
+# Submit results?
+############################################################################
+echo $L
+cat<<EOF;
+
+There is a database of benchmark results that is shipped with new
+releases of lmbench.  Your results can be included in the database
+if you wish.  The more results the better, especially if they include
+remote networking.  If your results are interesting, i.e., for a new
+fast box, they may be made available on the lmbench web page, which is
+
+	http://www.bitmover.com/lmbench
+
+EOF
+
+echo $ECHON "Mail results [default yes]: $ECHOC"
+read MAIL
+case $MAIL in 
+    [Nn]*)	MAIL=no
+		echo OK, no results mailed.
+		;;
+    *)		MAIL=yes
+		;;
+esac
+
+INFO=`${SCRIPTSDIR}/info`
+if [ $MAIL = yes ]
+then	if [ ! -f ${BINDIR}/bin/$OS/$INFO ]
+	then	cp ${SCRIPTSDIR}/info-template ${BINDIR}/bin/$OS/$INFO
+		chmod +w ${BINDIR}/bin/$OS/$INFO
+		REUSE=no
+	else	
+		REUSE=view
+		while [ $REUSE = view ]
+		do	echo ""
+			echo $ECHON \
+"Reuse previous description [default yes, other options: no|view]: $ECHOC"
+			read REUSE
+			case $REUSE in 
+	    		[Nn]*)	REUSE=no
+				;;
+			[Vv]*)	REUSE=view
+				echo $L
+				more ${BINDIR}/bin/$OS/$INFO
+				echo $L
+				;;
+	    		*)	REUSE=yes
+				;;
+			esac
+		done
+	fi
+
+	if [ $REUSE = no ]
+	then	EDITOR=vi
+		echo $L
+		cat<<EOF;
+
+Please tell us about your machine.   There is a form we would like you
+to fill out that we will make available with the results.  If you would
+prefer to use a different editor, tell us the editor at the prompt.
+
+If you want to skip filling out this form (please don't) then answer 
+"none" at the prompt.
+
+EOF
+		echo $ECHON "Editor [default $EDITOR]: $ECHOC"
+		read TMP
+		if [ X$TMP != X ]
+		then	EDITOR=$TMP
+		fi
+		if [ X$EDITOR != "none" ]
+		then	$EDITOR ${BINDIR}/bin/$OS/`${SCRIPTSDIR}/info`
+		fi
+	fi
+fi
+
+echo $L
+echo ""
+echo "Confguration done, thanks."
+cat <<EOF
+
+There is a mailing list for discussing lmbench hosted at BitMover. 
+Send mail to majordomo@bitmover.com to join the list.
+
+EOF
+
+VERSION=`${SCRIPTSDIR}/version`
+
+C=${BINDIR}/bin/$OS/`${SCRIPTSDIR}/config`
+echo DISKS=\"$DISKS\" > $C
+echo DISK_DESC=\"$DISK_DESC\" >> $C
+echo OUTPUT=$OUTPUT >> $C
+echo ENOUGH=$ENOUGH >> $C
+echo FASTMEM=\"$FASTMEM\" >> $C
+echo FILE=$FILE >> $C
+echo FSDIR=$FSDIR >> $C
+echo INFO=$INFO >> $C
+echo LINE_SIZE=$LINE_SIZE >> $C
+echo LOOP_O=$LOOP_O >> $C
+echo MAIL=$MAIL >> $C
+echo TOTAL_MEM=$TOTAL_MEM >> $C
+echo MB=$MB >> $C
+echo MHZ=\"$MHZ\" >> $C
+echo MOTHERBOARD=\"$MOTHERBOARD\" >> $C
+echo NETWORKS=\"$NETWORKS\" >> $C
+echo OS=\"$OS\" >> $C
+echo PROCESSORS=\"$PROCESSORS\" >> $C
+echo REMOTE=\"$REMOTE\" >> $C
+echo SLOWFS=\"$SLOWFS\" >> $C
+echo SYNC_MAX=\"$SYNC_MAX\" >> $C
+echo LMBENCH_SCHED=\"$LMBENCH_SCHED\" >> $C
+echo TIMING_O=$TIMING_O >> $C
+echo RSH=$RSH >> $C
+echo RCP=$RCP >> $C
+echo VERSION=$VERSION >> $C
+echo BENCHMARK_HARDWARE=$BENCHMARK_HARDWARE >> $C
+echo BENCHMARK_OS=$BENCHMARK_OS >> $C
+echo BENCHMARK_SYSCALL=$BENCHMARK_SYSCALL >> $C
+echo BENCHMARK_SELECT=$BENCHMARK_SELECT >> $C
+echo BENCHMARK_SIG=$BENCHMARK_SIG >> $C
+echo BENCHMARK_PROC=$BENCHMARK_PROC >> $C
+echo BENCHMARK_CTX=$BENCHMARK_CTX >> $C
+echo BENCHMARK_PAGEFAULT=$BENCHMARK_PAGEFAULT >> $C
+echo BENCHMARK_FILE=$BENCHMARK_FILE >> $C
+echo BENCHMARK_MMAP=$BENCHMARK_MMAP >> $C
+echo BENCHMARK_PIPE=$BENCHMARK_PIPE >> $C
+echo BENCHMARK_UNIX=$BENCHMARK_UNIX >> $C
+echo BENCHMARK_UDP=$BENCHMARK_UDP >> $C
+echo BENCHMARK_TCP=$BENCHMARK_TCP >> $C
+echo BENCHMARK_CONNECT=$BENCHMARK_CONNECT >> $C
+echo BENCHMARK_RPC=$BENCHMARK_RPC >> $C
+echo BENCHMARK_HTTP=$BENCHMARK_HTTP >> $C
+echo BENCHMARK_BCOPY=$BENCHMARK_BCOPY >> $C
+echo BENCHMARK_MEM=$BENCHMARK_MEM >> $C
+echo BENCHMARK_OPS=$BENCHMARK_OPS >> $C
+
+exit 0

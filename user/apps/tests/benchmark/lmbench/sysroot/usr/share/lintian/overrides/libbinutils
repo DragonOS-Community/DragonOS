@@ -1,0 +1,5 @@
+# the API of the shared libs is not public, don't care about the name
+libbinutils binary: package-name-doesnt-match-sonames
+
+# the upstream name, we don't care
+libbinutils binary: dev-pkg-without-shlib-symlink

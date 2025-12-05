@@ -1,0 +1,28 @@
+#!/usr/bin/perl
+# Figure out dependencies for lmbench src.
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+open(M, "Makefile");
+while(<M>) {
+	push(@Makefile, $_);
+	last if /^..MAKEDEPEND/;
+}
+close(M);
+open(G, "gcc -MM *.c | grep -v mhz.c | grep -v lat_ctx.c|");
+while (<G>) {
+	@_ = chop;
+	@_ = split(/:/);
+	$_[0] =~ s/\.o\s*$//;
+	push(@Makefile, "\$O/$_[0]: $_[1] \$O/lmbench.a\n");
+	push(@Makefile, "\t\$(COMPILE) -o \$O/$_[0] $_[0].c \$O/lmbench.a \$(LDLIBS)\n\n");
+}
+system "mv Makefile Makefile.old";
+open(M, ">Makefile");
+print M @Makefile;
+close(M);
+exit 0;

@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# X previewer like groff/nroff scripts.
+groff -P -filename -P "| groff -Z -X -Tps $*" -X -Tps "$@" 
+exit 0

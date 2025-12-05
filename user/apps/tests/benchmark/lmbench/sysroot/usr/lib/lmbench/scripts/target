@@ -1,0 +1,24 @@
+#!/bin/sh
+
+# Figure out the OS name if possible.
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+case `uname -s` in 
+	*HP-UX*)        echo hpux;;
+	*Linux*)        echo linux;;
+	*IRIX*)         echo irix;;
+	*AIX*)          echo aix;;
+	BSD/OS)         echo bsdi;;
+	*BSD*)          echo bsd;;
+	*OSF1*)         echo osf1;;
+	*ULTRIX*)       echo ultrix;;
+	*SunOS*)        case `uname -r` in 
+				4*)     echo sunos;;
+				5*)     echo solaris;;
+				*)      echo unknown;; 
+			esac;; 
+	*)              echo unknown;; 
+esac 
+exit 0

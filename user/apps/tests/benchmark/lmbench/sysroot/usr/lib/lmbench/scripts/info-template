@@ -1,0 +1,42 @@
+Thanks very much for filling this out.   The system will save it across
+runs so that you don't have to do it again unless you change what you
+are measuring (i.e., add disks to the mix).  The stuff you fill in is
+in lower case, the uppercase stuff you should leave as is.
+
+If you used "vi" and you don't know how to use it, just type ZZ and skip
+this step.
+
+VENDOR:  	i.e. SGI, Compaq, Sun, etc.  For PC clones, just say clone.
+
+MOTHERBOARD: 	this mostly for PC's - it's very important to know there.
+
+MODEL:		SGI O200, Sun Ultra2, Compaq Pressario, Gateway 10,000,000
+
+YEAR BOUGHT:	1982
+
+PRICE:		$10,000
+
+PROCESSORS:
+    NUMBER:	2
+    TYPE:	200 Mhz Pentium Pro
+
+MEMORY:		
+    AMOUNT:	32M, etc.
+    SPEED:	i.e, 60ns, 70ns, etc.
+    TYPE:	FPM, EDO, DIMM, etc
+
+CACHE:
+    ONCHIP DCACHE: 	32K, set associative (2 or 4 way, can't remember)
+    ONCHIP ICACHE: 	32K, set associative (2 or 4 way, can't remember)
+    LEVEL 2:	 	1MB, 2 way set associative, unified
+
+NETWORK:
+    ETHERNET:	100baseT, DEC Tulip chip, SMC PCI card
+    HIPPI:	100MB/sec, 64bit PCI, SGI onboard R4K processors, full duplex
+
+DISKS:
+    		/dev/sda	4GB Quantum, model 1234
+
+MISC:
+		Anything else that you think is interesting for people
+		to know about your system.

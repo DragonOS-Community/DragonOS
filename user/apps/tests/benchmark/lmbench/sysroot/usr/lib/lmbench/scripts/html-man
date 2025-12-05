@@ -1,0 +1,84 @@
+#!/usr/bin/perl
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+# Take a man tree and make an html tree out of it
+#
+# Derived from Donners man2html script
+
+from=/usr/man
+to=/u/eo/repository/system/unix/man
+
+function disambiguate
+{
+newbase=${1}
+newname="${newbase}.1"
+dis=2
+while [ -a "${newname}" ]
+   do
+      newname=$newbase"."$dis
+      dis=$(expr $dis + 1)
+      done
+}
+
+while ($ARGV[0] =~ /^-/) {
+	if ($ARGV[0] eq "-f") {
+		shift(@ARGV);
+		$from = shift(@ARGV);
+	}
+	if ($ARGV[0] eq "-t") {
+		shift(@ARGV);
+		$to = shift(@ARGV);
+	}
+}
+
+open(FD, "find $from -name '*.[0-9ln]' -print |");
+while ($find = <FD>) {
+}
+
+if [ ! "${indexonly}" ]
+   then
+      print "Processing the man pages ..."
+      for i in man${sections}/*
+	 do
+	    if [ "$verbose" ]
+	       then
+		  print $i
+	       fi
+	    # n=${i%.*}
+	    name=${to}/${i}
+	    if [ -a "${name}" ]
+	       then
+		  oldname=$name
+		  disambiguate $name
+		  name=$newname
+		  print "Collision - ${oldname} will be stored as ${name}"
+	       fi
+	    eqn $i | tbl | nroff -man | rman -f HTML | sed -e "s/MS_LOCAL_HOST/${localeo}/g" > ${name}
+	    done
+   fi
+
+print "Building the index.html files ..."
+cd $to
+for i in man${sections}
+   do
+      if [ "$verbose" ]
+	 then
+	    print $i
+	 fi
+      cd $i
+      rm -f index.html
+      echo '<ul>' > ../new.html
+      for j in *
+	 do
+	    if [ "$verbose" ]
+	       then
+		  print -n "$j "
+	       fi
+	    print
+	    print "<li> <a href=$j>$j</a>" >> ../new.html
+	    done
+      echo '</ul>' >> ../new.html
+      mv ../new.html index.html
+      cd ..
+      done

@@ -1,0 +1,16 @@
+.KS
+.TS
+expand doublebox;
+l l c c c
+l l r r r.
+System	Network	\fBTCP bw\fP	TCP latency	UDP latency
+=
+IRIX IP21	hippi	62	1068	1099
+SunOS-5.5 sun4u@167	100baseT	9.5	280	308
+HP-UX 9000/735	fddi	8.8	425	441
+IRIX IP22	10baseT	.9	543	602
+IRIX IP21	10baseT	.9	1463	1376
+HP-UX 9000/735	10baseT	.9	592	603
+Linux	10baseT	.7	2954	1912
+.TE
+.KE

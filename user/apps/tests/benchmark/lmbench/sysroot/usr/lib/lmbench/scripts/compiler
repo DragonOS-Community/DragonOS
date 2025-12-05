@@ -1,0 +1,16 @@
+#!/bin/sh
+
+if [ "X$CC" != "X" ] && echo "$CC" | grep '`' > /dev/null
+then
+    CC=
+fi
+
+if [ X$CC = X ]
+then	CC=cc
+	for p in `echo $PATH | sed 's/:/ /g'`
+	do	if [ -f $p/gcc ]
+		then	CC=gcc
+		fi
+	done
+fi
+echo $CC

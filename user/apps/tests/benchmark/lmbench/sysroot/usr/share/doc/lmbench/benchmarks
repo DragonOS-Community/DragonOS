@@ -1,0 +1,68 @@
+Theme
+	Data movement and the cost thereof
+	Latency
+		Time per operation
+		CPU cycles per operation
+	Bandwidth
+		MB / sec
+		CPU cycles / MB
+	Media
+		Memory (load, bcopy)
+		Disk (randoms, sequentials)
+		File system (directory ops, sequential)
+		Network (hot potato, transfer)
+		Pipes (hot potato, transfer)
+		VM system (mmaps/munmaps, bcopy)
+	Systems
+		All Unix systems
+		Windows NT
+		VMS (?)
+		Mainframes (?)
+Memory
+        Small transfers (randoms)
+                Load latency
+        Large transfers (sequential)
+                Bcopy bandwidth
+Processes
+        Null process execution time
+        Context switching
+Misc
+        Null entry into the system
+Networking
+        Small transfers (randoms)
+                Transfers per second
+                CPU cycles per transfer
+                socket/bind/close per second
+        Large transfers (sequential)
+                MB per second
+                CPU cycles per MB
+Disks
+        Small transfers (randoms)
+                Transfers per second
+                CPU cycles per transfer
+        Large transfers (sequential)
+                MB per second
+                CPU cycles per MB
+File system
+        Small transfers (randoms)
+                Creates / second
+                Removes / second
+                Random I/O's per second in large file
+                CPU cycles per transfer
+                MB / sec when reading many related small files
+        Large files
+                MB / second read/write
+                CPU cycles per MB
+        Hardness
+                Measure fsck time?
+Virtual memory system
+        Creation
+                mmaps per second
+                munmaps per second
+                Also vary size of mapped region
+        Small transfers (randoms)
+                Random reads per second of large mmaped file
+                CPU cycles per read
+        Large transfers (cached sequential)
+                MB per second read rate
+                CPU cycles per MB

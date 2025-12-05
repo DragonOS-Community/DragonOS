@@ -1,0 +1,203 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Comment:
+  This is the Debian GNU/Linux prepackaged version of GNU tar.
+  GNU tar, heavily based on John Gilmore's public domain version of tar,
+  was originally written by Graham Todd.
+  It is now maintained by Sergey Poznyakoff.
+ .
+  This package is maintained for Debian by Janos Lenart <ocsi@debian.org>.
+Upstream-Contact: bug-tar@gnu.org
+Source:
+  ftp://ftp.gnu.org/gnu/tar/
+  https://git.savannah.gnu.org/cgit/tar.git
+
+Files: *
+Copyright:
+   Copyright (C) 1988, 1992, 1993, 1994, 1995, 1996, 1997, 1999, 2000,
+   2001, 2003, 2004, 2005, 2006, 2007, 2014-2023 Free Software Foundation, Inc.
+License: GPL-3+
+   This program is free software; you can redistribute it and/or modify it
+   under the terms of the GNU General Public License as published by the
+   Free Software Foundation; either version 3, or (at your option) any later
+   version.
+Comment:
+ On Debian GNU/Linux systems, the complete text of the GNU General Public 
+ License version 3 can be found in /usr/share/common-licenses/GPL-3.
+
+Files:
+   gnu/parse-datetime-gen.h
+   gnu/parse-datetime.c
+Copyright:
+   Copyright (C) 1984, 1989-1990, 2000-2015 Free Software Foundation, Inc.
+License: GPL-3+ with Bison exception
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+ .
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+ .
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+ .
+   As a special exception, you may create a larger work that contains
+   part or all of the Bison parser skeleton and distribute that work
+   under terms of your choice, so long as that work isn't itself a
+   parser generator using the skeleton or a modified version thereof
+   as a parser skeleton.  Alternatively, if you modify or redistribute
+   the parser skeleton itself, you may (at your option) remove this
+   special exception, which will cause the skeleton and the resulting
+   Bison output files to be licensed under the GNU General Public
+   License without this special exception.
+ .
+   This special exception was added by the Free Software Foundation in
+   version 2.2 of Bison.
+Comment:
+ On Debian GNU/Linux systems, the complete text of the GNU General Public 
+ License version 3 can be found in /usr/share/common-licenses/GPL-3.
+
+Files:
+   gnu/acl*
+   gnu/areadlinkat*
+   gnu/argmatch*
+   gnu/argp*
+   gnu/at-func*
+   gnu/backup*
+   gnu/basename.c
+   gnu/cdefs.h
+   gnu/chdir-long.*
+   gnu/chmod.c
+   gnu/close-stream.*
+   gnu/closeout.*
+   gnu/creat-safer.c
+   gnu/dirent--.h
+   gnu/dirent-safer.h
+   gnu/dirname.c
+   gnu/dup-safer*
+   gnu/exclude.*
+   gnu/faccessat.c
+   gnu/fchdir.c
+   gnu/fchmodat.c
+   gnu/fchownat.c
+   gnu/fcntl--.h
+   gnu/fcntl-safer.h
+   gnu/fd-safer-flag.c
+   gnu/fd-safer.c
+   gnu/fdopendir.c
+   gnu/fdutimensat.c
+   gnu/file-has-acl.c
+   gnu/fileblocks.c
+   gnu/fpending.*
+   gnu/fprintftime.*
+   gnu/fstatat.c
+   gnu/futimens.c
+   gnu/get-permissions.c
+   gnu/getcwd.c
+   gnu/gettime.c
+   gnu/human.*
+   gnu/lchmod.c
+   gnu/linkat.c
+   gnu/mbscasecmp.c
+   gnu/mbuiter.*
+   gnu/memrchr.c
+   gnu/mkdirat.c
+   gnu/mkfifo.c
+   gnu/mkfifoat.c
+   gnu/mknod.c
+   gnu/mknodat.c
+   gnu/modechange.*
+   gnu/nstrftime.c
+   gnu/obstack.*
+   gnu/open-safer.c
+   gnu/openat*
+   gnu/opendir-safer.c
+   gnu/opendirat.*
+   gnu/parse-datetime*
+   gnu/pipe-safer.c
+   gnu/priv-set.*
+   gnu/progname.*
+   gnu/quote.h
+   gnu/quotearg.*
+   gnu/readlinkat.c
+   gnu/renameat*
+   gnu/rewinddir.c
+   gnu/rpmatch.c
+   gnu/save*
+   gnu/selinux-at.*
+   gnu/set-permissions.c
+   gnu/stat-macros.h
+   gnu/stdopen.*
+   gnu/strftime.h
+   gnu/strto*
+   gnu/symlink*
+   gnu/time-internal.h
+   gnu/time_rz.c
+   gnu/timespec*
+   gnu/tzset.c
+   gnu/unistd--.h
+   gnu/unistd-safer.h
+   gnu/unlinkat.c
+   gnu/unlinkdir.c
+   gnu/unlinkdir.h
+   gnu/unlocked-io.h
+   gnu/utime.c
+   gnu/utimens*
+   gnu/version-etc*
+   gnu/xalloc-die.c
+   gnu/xalloc.h
+   gnu/xasprintf.c
+   gnu/xgetcwd.*
+   gnu/xmalloc.c
+   gnu/xstrto*
+   gnu/xvasprintf.*
+Copyright:
+   Copyright (C) 1996-2023 Free Software Foundation, Inc.
+License: LGPL-2.1+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation; either version 2.1, or (at your option)
+   any later version.
+   .
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+   .
+   You should have received a copy of the GNU Lesser General Public License along
+   with this program; if not, write to the Free Software Foundation,
+   Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+   .
+Comment:
+ On Debian systems, the complete text of the GNU Lesser General Public
+ License version 2.1 can be found in ‘/usr/share/common-licenses/LGPL-2.1’.
+
+Files:
+   tests/argcv.*
+Copyright:
+   Copyright (C) 1999, 2000, 2001, 2007, 2009, 2010 Free Software
+   Foundation, Inc.
+License: LGPL-3+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public
+   License as published by the Free Software Foundation; either
+   version 3 of the License, or (at your option) any later version.
+Comment:
+ On Debian GNU/Linux systems, the complete text of the GNU Lesser General
+ Public License version 3 can be found in /usr/share/common-licenses/LGPL-3.
+
+Files:
+   debian/*
+Copyright:
+   Copyright (C) 2006, 2007 Bdale Garbee <bdale@gag.com>
+   Copyright (C) 2023 Gianfranco Costamagna <locutusofborg@debian.org>
+License: GPL-2+
+   This program is free software; you can redistribute it and/or modify it
+   under the terms of the GNU General Public License as published by the
+   Free Software Foundation; either version 2, or (at your option) any later
+   version.
+Comment:
+ On Debian GNU/Linux systems, the complete text of the GNU General Public 
+ License version 2 can be found in /usr/share/common-licenses/GPL-2.

@@ -1,0 +1,71 @@
+#!/usr/bin/perl
+# Extract the context switching information from lmbench result files.
+# Usage: getctx file file....
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ss $0 "$@"'
+	if 0;
+
+$first = 1;
+foreach $file (@ARGV) {
+	open(FD, $file);
+	$file =~ s|.*/||;
+	$file =~ s/\.\d+//;
+	while (<FD>) {
+		chop;
+		if (/^\[lmbench/) {
+			@_ = split;
+			if ($_[3] eq "SunOS") {
+				$_[3] .= "-$_[5]";
+			}
+			$uname = "@_";
+		}
+		if (/Mhz/) {
+			$mhz = $_;
+		}
+		if (/^.size=/) {
+			s/size/Process size/;
+			s/ ovr/\toverhead/;
+			@info = &getinfo($uname, $mhz);
+			($f = $file) =~ s|.*/||;
+			print "\n" unless $first;
+			$first = 0;
+			print "%T $info[3] $info[$#info]Mhz\n";
+			print "$_\n";
+			while (<FD>) {
+				last if /^Null/ || /^Pipe/ || /^Memor/;
+				next if /\$Id/;
+				s/ ovr/\toverhead/;
+				s/size/Process size/;
+			    	print ;
+			}
+			last;
+		}
+	}
+}
+exit 0;  
+
+# Try and create sensible names from uname -a output
+sub getinfo
+{
+	local(@info);
+	local($name);
+	local($mhz) = sprintf("%.0f", $_[1]);
+
+	@info = split(/\s+/, $_[0]);
+	$name = pop(@info);
+	chop($name);
+	if ($name eq "mips") {
+		$name = "$info[$#info]@$mhz";
+	} elsif ($_[0] =~ /HP-UX/) {
+		$name = "$info[7]@$mhz";
+	} elsif ($_[0] =~ /SunOS/) {
+		$name = "$info[7]@$mhz";
+	} else {
+		$name .= "@$mhz";
+	}
+	push(@info, $name);
+	@info;
+}

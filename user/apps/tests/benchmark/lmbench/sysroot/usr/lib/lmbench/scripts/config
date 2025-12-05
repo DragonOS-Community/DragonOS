@@ -1,0 +1,7 @@
+#!/bin/sh
+
+UNAME=`uname -n 2>/dev/null`
+if [ X$UNAME = X ]
+then	echo CONFIG
+else	echo CONFIG.$UNAME
+fi

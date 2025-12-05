@@ -1,0 +1,48 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Comment:
+ This is the Debian package for libselinux.
+ .
+ This package was debianized by Colin Walters <walters@debian.org> on
+ Thu,  3 Jul 2003 17:10:57 -0400.
+Source: https://github.com/SELinuxProject/selinux/wiki/Releases
+
+Files: *
+Copyright: NSA
+License: public-domain
+ This library (libselinux) is public domain software, i.e. not copyrighted.
+ .
+ Warranty Exclusion
+ ------------------
+ You agree that this software is a
+ non-commercially developed program that may contain "bugs" (as that
+ term is used in the industry) and that it may not function as intended.
+ The software is licensed "as is". NSA makes no, and hereby expressly
+ disclaims all, warranties, express, implied, statutory, or otherwise
+ with respect to the software, including noninfringement and the implied
+ warranties of merchantability and fitness for a particular purpose.
+ .
+ Limitation of Liability
+ -----------------------
+ In no event will NSA be liable for any damages, including loss of data,
+ lost profits, cost of cover, or other special, incidental,
+ consequential, direct or indirect damages arising from the software or
+ the use thereof, however caused and on any theory of liability. This
+ limitation will apply even if NSA has been advised of the possibility
+ of such damage. You acknowledge that this is a reasonable allocation of
+ risk.
+
+Files: utils/avcstat.c
+Copyright: 2004 Red Hat, Inc., James Morris <jmorris@redhat.com>
+License: GPL-2
+
+Files: debian/*
+Copyright: © 2005, 2006, Manoj Srivastava <srivasta@debian.org>
+License: GPL-2
+
+License: GPL-2
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License version 2,
+ as published by the Free Software Foundation.
+Comment:
+ On Debian GNU/Linux systems, the complete text of the GNU General
+ Public License version 2 can be found in `/usr/share/common-licenses/GPL-2'.

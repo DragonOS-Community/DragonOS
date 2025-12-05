@@ -1,0 +1,33 @@
+#!/usr/bin/perl
+# Make HTML files that will point to the right GIF files.
+# Usage: bghtml file file file....
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1995 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+&pbm;
+exit 0;
+
+sub pbm 
+{
+	@ctx = <HTML/ctx*.pbm>; pop(@ctx);
+	@mem = <HTML/mem*.pbm>; pop(@mem);
+	@bar = <HTML/bar*.pbm>; pop(@bar);
+
+	foreach $i (<HTML/*.pbm>) {
+		($out = $i) =~ s/.pbm//;
+		warn "Bitmap munging $out\n";
+		#system "pnmcrop < $i | ppmtogif -transparent 1,1,1 > $out";
+		system "
+pnmcrop < $i > HTML/___tmp 2>/dev/null
+set `pnmfile HTML/___tmp`
+newx=`expr \$4 - 2`
+newy=`expr \$6 - 2`
+pnmcut 1 1 \$newx \$newy < HTML/___tmp > HTML/___tmp.pnm
+convert -mattecolor slategrey -frame 15x15+0+6 HTML/___tmp.pnm HTML/___tmp.ppm
+ppmtogif < HTML/___tmp.ppm > $out.gif 2>/dev/null";
+	}
+}

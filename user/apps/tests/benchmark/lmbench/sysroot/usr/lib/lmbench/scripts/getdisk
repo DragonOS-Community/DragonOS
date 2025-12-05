@@ -1,0 +1,69 @@
+#!/usr/bin/perl
+# Extract the disk graph data from lmbench result files.
+# 
+# Hacked into existence by Larry McVoy 
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+foreach $file (@ARGV) {
+	open(FD, $file);
+	$file =~ s|/|-|;
+	while (<FD>) {
+		next unless /DISK_DESC/;
+		s/.DISK_DESC: //;
+		chop; chop; chop;
+		@_ = split(/[\[\]]/, $_);
+		foreach $_ (@_) {
+			next unless /:/;
+			@foo = split(/:/, $_);
+			$foo[0] =~ s|/dev/||;
+			$disks{$foo[0]} = $foo[1];
+		}
+		last;
+	}
+	while (<FD>) {
+		if (/^"Seek times for \/dev\/(.*)$/) {
+			$ok = 0;
+			foreach $key (keys %disks) {
+				next unless $key eq $1;
+				$ok = 1;
+			}
+			if ($ok != 1) {
+				die "Disk results are screwed up, no $1.\n";
+			}
+			print "tmp/seek_$1.$file\n";
+			open(OUT, ">tmp/seek_$1.$file");
+			print OUT "%T Seek times for $disks{$1}\n";
+			print OUT "%X Seek distance (MB)\n";
+			print OUT "%Y Time in millisec\n";
+			while (<FD>) {
+				last unless /^\d/;
+				print OUT;
+			}
+			close(OUT);
+		}
+		if (/^"Zone bandwidth for \/dev\/(.*)$/) {
+			$ok = 0;
+			foreach $key (keys %disks) {
+				next unless $key eq $1;
+				$ok = 1;
+			}
+			if ($ok != 1) {
+				die "Disk results are screwed up, no $1.\n";
+			}
+			print  "tmp/zone_$1.$file\n";
+			open(OUT, ">tmp/zone_$1.$file");
+			print OUT "%T Zone bandwidths for $disks{$1}\n";
+			print OUT "%X Disk offset (MB)\n";
+			print OUT "%Y Bandwidth (MB/sec)\n";
+			while (<FD>) {
+				last unless /^\d/;
+				print OUT;
+			}
+			close(OUT);
+		}
+	}
+}
+exit 0;

@@ -16,13 +16,6 @@ impl Syscall for SysGetPid {
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
         let tgid = current_pcb.task_tgid_vnr().ok_or(SystemError::ESRCH)?;
-        if current_pcb.task_pid_vnr().data() == 1 && tgid.data() != 1 {
-            log::error!(
-                "Fixing inconsistent Init PID/TGID: PID=1, TGID={}",
-                tgid.data()
-            );
-            return Ok(1);
-        }
         Ok(tgid.into())
     }
 

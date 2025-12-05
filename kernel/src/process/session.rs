@@ -12,10 +12,6 @@ pub(super) fn ksys_setsid() -> Result<RawPid, SystemError> {
         .ok_or(SystemError::ESRCH)?;
     let sid = group_leader.pid();
     let session = sid.pid_vnr();
-    // log::debug!(
-    //     "ksys_setsid: group_leader: {}",
-    //     group_leader.raw_pid().data()
-    // );
     let siginfo_lock = group_leader.sig_info_upgradable();
     // Fail if pcb already a session leader
     if siginfo_lock.is_session_leader {
@@ -24,8 +20,14 @@ pub(super) fn ksys_setsid() -> Result<RawPid, SystemError> {
 
     // Fail if a process group id already exists that equals the
     // proposed session id.
-    if sid.pid_task(PidType::PGID).is_some() {
-        return Err(SystemError::EPERM);
+    // 但是，如果这个进程组是当前进程自己的进程组，我们允许它，
+    // 因为setsid()后进程会离开原来的进程组，成为新会话的领导者。
+    let existing_pgid = sid.pid_task(PidType::PGID);
+    if let Some(ref pgid_pid) = existing_pgid {
+        // 检查找到的进程是否是当前进程自己
+        if !Arc::ptr_eq(pgid_pid, &group_leader) {
+            return Err(SystemError::EPERM);
+        }
     }
 
     let mut siginfo_guard = siginfo_lock.upgrade();

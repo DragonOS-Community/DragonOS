@@ -69,3 +69,4 @@ itimer_test
 pipe_test
 fifo_test
 unshare_test
+pty_root_test

@@ -33,12 +33,23 @@ jobs:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
+      - name: Get PR info for fork support
+        if: github.event.issue.pull_request
+        id: pr-info
+        run: |
+          PR_DATA=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }})
+          echo "pr_head_owner=$(echo "$PR_DATA" | jq -r '.head.repo.owner.login')" >> $GITHUB_OUTPUT
+          echo "pr_head_repo=$(echo "$PR_DATA" | jq -r '.head.repo.name')" >> $GITHUB_OUTPUT
+          echo "pr_head_ref=$(echo "$PR_DATA" | jq -r '.head.ref')" >> $GITHUB_OUTPUT
+          echo "is_fork=$(echo "$PR_DATA" | jq -r '.head.repo.fork')" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          token: ${{ steps.app-token.outputs.token }}
-          ref: ${{ github.event.pull_request.head.ref || github.event.issue.pull_request.head.sha }}
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.event.issue.pull_request.head.repo.full_name }}
+          repository: ${{ github.event.issue.pull_request && steps.pr-info.outputs.is_fork == 'true' && format('{0}/{1}', steps.pr-info.outputs.pr_head_owner, steps.pr-info.outputs.pr_head_repo) || github.repository }}
+          ref: ${{ github.event.issue.pull_request && steps.pr-info.outputs.pr_head_ref || github.ref }}
           fetch-depth: 20
 
       - uses: anthropics/claude-code-action@v1
@@ -46,7 +57,7 @@ jobs:
           github_token: ${{ steps.app-token.outputs.token }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: "@claude"
-          claude_args: '--max-turns 10'
+          claude_args: '--max-turns 200'
         env:
           ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
           API_TIMEOUT_MS: 600000

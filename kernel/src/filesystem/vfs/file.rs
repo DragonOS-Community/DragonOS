@@ -364,7 +364,7 @@ pub struct File {
     /// owner
     pid: SpinLock<Option<Arc<ProcessControlBlock>>>,
     /// 预读状态
-    ra_state: SpinLock<FileReadaheadState>,
+    pub ra_state: SpinLock<FileReadaheadState>,
 }
 
 impl File {
@@ -514,6 +514,10 @@ impl File {
     }
 
     fn file_readahead(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        if self.mode().contains(FileMode::FMODE_RANDOM) {
+            return Ok(());
+        }
+        
         let page_cache = match self.inode.page_cache() {
             Some(page_cahce) => page_cahce,
             None => return Ok(()),
@@ -1035,6 +1039,21 @@ impl File {
     pub fn get_inode_flags(&self) -> Result<InodeFlags, SystemError> {
         let metadata = self.inode.metadata()?;
         Ok(metadata.flags)
+    }
+
+    /// 修改文件访问模式标志
+    pub fn set_mode_flags(&self, flags: FileMode) {
+        self.mode.write().insert(flags);
+    }
+
+    /// 清除文件访问模式标志
+    pub fn remove_mode_flags(&self, flags: FileMode) {
+        self.mode.write().remove(flags);
+    }
+
+    /// 设置预读窗口大小
+    pub fn set_ra_pages(&self, pages: usize) {
+        self.ra_state.lock().ra_pages = pages;
     }
 }
 

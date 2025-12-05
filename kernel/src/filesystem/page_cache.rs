@@ -323,6 +323,52 @@ impl InnerPageCache {
         }
         Ok(())
     }
+
+    /// 写回指定范围的脏页
+    pub fn writeback_range(
+        &mut self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<(), SystemError> {
+        for idx in start_index..=end_index {
+            if let Some(page) = self.pages.get(&idx) {
+                let mut guard = page.write_irqsave();
+                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    crate::mm::page::PageReclaimer::page_writeback(&mut guard, false);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 驱逐指定范围的干净页
+    ///
+    /// 只驱逐干净的、无外部引用的页
+    pub fn invalidate_range(&mut self, start_index: usize, end_index: usize) -> usize {
+        let mut evicted = 0;
+        let mut page_reclaimer = page_reclaimer_lock_irqsave();
+
+        for idx in start_index..=end_index {
+            if let Some(page) = self.pages.get(&idx) {
+                let guard = page.read_irqsave();
+                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    continue;
+                }
+                drop(guard);
+
+                if Arc::strong_count(page) <= 3 {
+                    if let Some(removed) = self.pages.remove(&idx) {
+                        let paddr = removed.phys_address();
+                        page_manager_lock_irqsave().remove_page(&paddr);
+                        let _ = page_reclaimer.remove_page(&paddr);
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+
+        evicted
+    }
 }
 
 impl Drop for InnerPageCache {

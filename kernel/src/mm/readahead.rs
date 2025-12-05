@@ -1,8 +1,11 @@
 use crate::{
     arch::MMArch,
-    filesystem::{page_cache::PageCache, vfs::IndexNode},
+    filesystem::{
+        page_cache::PageCache,
+        vfs::IndexNode,
+    },
     libs::ranges::merge_ranges,
-    mm::{page::PageFlags, MemoryManagementArch},
+    mm::{MemoryManagementArch, page::PageFlags},
 };
 use alloc::{sync::Arc, vec::Vec};
 use num_traits::abs_sub;
@@ -90,15 +93,21 @@ impl<'a> ReadaheadControl<'a> {
     /// 执行实际的页缓存预读
     /// 由于目前DragonOS不支持异步，
     /// 所以直接把整个窗口同步读完
-    fn do_page_cache_readahead(&self, number_to_read: usize) -> Result<usize, SystemError> {
+    fn do_page_cache_readahead(
+        &self,
+        number_to_read: usize,
+        mut set_flag: bool,
+    ) -> Result<usize, SystemError> {
         let page_cache = self.page_cache;
-        let start_index = self.ra_state.start;
+        let start_index = self.index;
 
         let page_cache_guard = page_cache.lock_irqsave();
 
-        let set_flag = page_cache_guard
-            .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
-            .is_none();
+        if set_flag {
+            set_flag = page_cache_guard
+                .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+                .is_none();
+        }
 
         let missing_pages: Vec<_> = (0..number_to_read)
             .map(|i| start_index + i)
@@ -176,12 +185,12 @@ impl<'a> ReadaheadControl<'a> {
         if is_async {
             // 第二次及以后的连续读
             let page_cache_gaurd = self.page_cache.lock_irqsave();
-            let next_missing_pages = {
+            let next_missing_page = {
                 (start_index..start_index + max_pages)
                     .find(|idx| page_cache_gaurd.get_page(*idx).is_none())
             };
 
-            if let Some(next_missing_page) = next_missing_pages {
+            if let Some(next_missing_page) = next_missing_page {
                 if next_missing_page - start_index > max_pages {
                     return Ok(0);
                 }
@@ -228,8 +237,9 @@ impl<'a> ReadaheadControl<'a> {
         }
         // log::debug!("is_async: {}, start: {}, size: {}, async_size: {}", is_async, ra_state.start, ra_state.size, ra_state.async_size);
 
+        self.index = ra_state.start;
         let nr_to_read = ra_state.size;
-        let read_count = self.do_page_cache_readahead(nr_to_read)?;
+        let read_count = self.do_page_cache_readahead(nr_to_read, true)?;
 
         Ok(read_count)
     }
@@ -269,4 +279,44 @@ pub fn page_cache_async_readahead(
     };
 
     ractl.ondemand_readahead(req_size, true)
+}
+
+pub fn force_page_cache_readahead(
+    page_cache: &Arc<PageCache>,
+    inode: &Arc<dyn IndexNode>,
+    ra_state: &mut FileReadaheadState,
+    start_index: usize,
+    page_num: usize,
+) -> Result<usize, SystemError> {
+    const CHUNK_SIZE: usize = (2 * 1024 * 1024) >> MMArch::PAGE_SHIFT; // 2MB / 4KB = 512 页
+
+    let file_size = inode.metadata()?.size;
+    if file_size == 0 {
+        return Ok(0);
+    }
+
+    let mut ractl = ReadaheadControl {
+        page_cache,
+        inode,
+        ra_state,
+        index: start_index,
+    };
+
+    let end_index = ((file_size - 1) >> MMArch::PAGE_SHIFT) as usize;
+    let mut total_read = 0;
+    let mut index = ractl.index;
+    let mut remaining = page_num;
+
+    while remaining > 0 && index <= end_index {
+        let chunk = core::cmp::min(remaining, CHUNK_SIZE);
+        let chunk = core::cmp::min(chunk, end_index - index + 1);
+
+        ractl.index = index;
+        total_read += ractl.do_page_cache_readahead(chunk, false)?;
+
+        index += chunk;
+        remaining -= chunk;
+    }
+
+    Ok(total_read)
 }

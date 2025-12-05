@@ -408,6 +408,11 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
+    fn page_cache(&self) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
+        // TTY设备是字符设备，不需要页面缓存
+        None
+    }
+
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let (tty, _flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.flags)

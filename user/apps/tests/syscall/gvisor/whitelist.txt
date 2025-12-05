@@ -30,6 +30,7 @@ rename_test
 getdents_test
 preadv_test
 utimes_test
+fadvise_test
 
 # 进程相关测试
 fork_test

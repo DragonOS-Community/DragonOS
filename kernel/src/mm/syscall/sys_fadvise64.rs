@@ -1,10 +1,8 @@
-//! System call handler for the brk system call.
-
-use crate::arch::vm::mmu::kvm_mmu::PAGE_SHIFT;
 use crate::arch::MMArch;
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_FADVISE64};
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::FileType;
+use crate::libs::align::page_align_up;
 use crate::mm::readahead::{force_page_cache_readahead, MAX_READAHEAD};
 use crate::mm::MemoryManagementArch;
 use crate::process::ProcessManager;
@@ -115,9 +113,9 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
 
     // 后续需要考虑DAX和noop_backing_dev_info
 
-    let mut endbyte = offset as u64 + len as u64;
-    if len == 0 || endbyte < len as u64 {
-        endbyte = i64::MAX as u64;
+    let mut endbyte = offset.saturating_add(len) as usize;
+    if len == 0 {
+        endbyte = usize::MAX;
     }
 
     match PosixFadviseFlag::from_i32(advise)? {
@@ -133,8 +131,8 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
             file.remove_mode_flags(FileMode::FMODE_RANDOM);
         }
         PosixFadviseFlag::WillNeed => {
-            let start_page = (offset >> PAGE_SHIFT) as usize;
-            let end_page = ((endbyte - 1) >> PAGE_SHIFT) as usize;
+            let start_page = (offset >> MMArch::PAGE_SHIFT) as usize;
+            let end_page = (endbyte - 1) >> MMArch::PAGE_SHIFT;
             let mut page_num = end_page - start_page + 1;
             if page_num == 0 {
                 page_num = usize::MAX;
@@ -150,11 +148,12 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
             file.remove_mode_flags(FileMode::FMODE_NOREUSE);
         }
         PosixFadviseFlag::DontNeed => {
-            let start_index = (offset as usize + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
+            let start_index = page_align_up(offset as usize) >> MMArch::PAGE_SHIFT;
             let mut end_index = endbyte as usize >> MMArch::PAGE_SHIFT;
 
+            // 如果要驱逐的最后一页不是整页，则需要保留
             if (endbyte as usize & !(MMArch::PAGE_SIZE - 1)) != !(MMArch::PAGE_SIZE - 1)
-                && endbyte != inode.metadata()?.size as u64 - 1
+                && endbyte != inode.metadata()?.size as usize - 1
             {
                 if end_index == 0 {
                     return Ok(0);

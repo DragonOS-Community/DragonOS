@@ -356,6 +356,7 @@ impl InnerPageCache {
                 }
                 drop(guard);
 
+                // 3处引用：1. page_cache中 2. page_manager中 3. lru中
                 if Arc::strong_count(page) <= 3 {
                     if let Some(removed) = self.pages.remove(&idx) {
                         let paddr = removed.phys_address();

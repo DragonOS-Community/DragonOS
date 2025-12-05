@@ -1,11 +1,8 @@
 use crate::{
     arch::MMArch,
-    filesystem::{
-        page_cache::PageCache,
-        vfs::IndexNode,
-    },
+    filesystem::{page_cache::PageCache, vfs::IndexNode},
     libs::ranges::merge_ranges,
-    mm::{MemoryManagementArch, page::PageFlags},
+    mm::{page::PageFlags, MemoryManagementArch},
 };
 use alloc::{sync::Arc, vec::Vec};
 use num_traits::abs_sub;

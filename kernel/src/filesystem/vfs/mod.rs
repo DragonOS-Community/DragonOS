@@ -30,7 +30,7 @@ use crate::{
         casting::DowncastArc,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{VmFaultReason, fault::PageFaultMessage},
+    mm::{fault::PageFaultMessage, VmFaultReason},
     net::socket::Socket,
     process::ProcessManager,
     syscall::user_buffer::UserBuffer,
@@ -846,7 +846,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         None
     }
 
-    fn fadvise(&self, _file: &Arc<File>, _offset: i64, _len: i64, _advise: i32) -> Result<usize, SystemError> {
+    fn fadvise(
+        &self,
+        _file: &Arc<File>,
+        _offset: i64,
+        _len: i64,
+        _advise: i32,
+    ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 }

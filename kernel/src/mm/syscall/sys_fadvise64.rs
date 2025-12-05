@@ -1,14 +1,12 @@
 //! System call handler for the brk system call.
 
-use core::u64;
-
-use crate::arch::MMArch;
 use crate::arch::vm::mmu::kvm_mmu::PAGE_SHIFT;
+use crate::arch::MMArch;
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_FADVISE64};
-use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::FileType;
+use crate::mm::readahead::{force_page_cache_readahead, MAX_READAHEAD};
 use crate::mm::MemoryManagementArch;
-use crate::mm::readahead::{MAX_READAHEAD, force_page_cache_readahead};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;

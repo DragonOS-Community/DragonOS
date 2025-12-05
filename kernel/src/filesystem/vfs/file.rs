@@ -517,7 +517,7 @@ impl File {
         if self.mode().contains(FileMode::FMODE_RANDOM) {
             return Ok(());
         }
-        
+
         let page_cache = match self.inode.page_cache() {
             Some(page_cahce) => page_cahce,
             None => return Ok(()),

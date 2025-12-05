@@ -149,10 +149,10 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
         }
         PosixFadviseFlag::DontNeed => {
             let start_index = page_align_up(offset as usize) >> MMArch::PAGE_SHIFT;
-            let mut end_index = endbyte as usize >> MMArch::PAGE_SHIFT;
+            let mut end_index = endbyte >> MMArch::PAGE_SHIFT;
 
             // 如果要驱逐的最后一页不是整页，则需要保留
-            if (endbyte as usize & !(MMArch::PAGE_SIZE - 1)) != !(MMArch::PAGE_SIZE - 1)
+            if (endbyte & !(MMArch::PAGE_SIZE - 1)) != !(MMArch::PAGE_SIZE - 1)
                 && endbyte != inode.metadata()?.size as usize - 1
             {
                 if end_index == 0 {

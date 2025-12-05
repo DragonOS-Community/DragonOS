@@ -326,12 +326,12 @@ impl Signal {
             || (pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK)
                 && sig_info.saved_sigmask().contains(self.into_sigset()))
         {
-            log::debug!("sig_ignored: signal {:?} is blocked by sigmask", self);
-            log::debug!(
-                "sig_ignored: current sigblocked={:b}, saved_sigmask={:b}",
-                sig_info.sig_blocked().bits(),
-                sig_info.saved_sigmask().bits()
-            );
+            // log::debug!(
+            //     "sig_ignored: signal {:?} is blocked, current sigblocked={:b}, saved_sigmask={:b}",
+            //     self,
+            //     sig_info.sig_blocked().bits(),
+            //     sig_info.saved_sigmask().bits()
+            // );
             return false;
         }
         drop(sig_info);

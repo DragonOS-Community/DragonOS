@@ -1,0 +1,55 @@
+name: Claude Code Review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 20
+
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+          API_TIMEOUT_MS: 600000
+          ANTHROPIC_MODEL: deepseek-reasoner
+          ANTHROPIC_SMALL_FAST_MODEL: deepseek-chat
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          allowed_non_write_users: "*"
+          claude_args: '--max-turns 200'
+          prompt: |
+            # project background
+            DragonOS is a 64-bit operating system with a completely independent kernel, 
+            designed for lightweight cloud computing scenarios, offering Linux binary compatibility. 
+            It aims to provide lightweight, high-performance solutions for containerized workloads.
+            
+            # task
+            Review this pull request and provide feedback on:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Performance considerations
+            - Security concerns
+            - Test coverage

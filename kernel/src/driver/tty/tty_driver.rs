@@ -315,16 +315,16 @@ impl TtyDriver {
         } else {
             idx = self.ida.lock().alloc().ok_or(SystemError::EBUSY)?;
         }
-        log::debug!("init_tty_device: create TtyCore");
+        // log::debug!("init_tty_device: create TtyCore");
         let tty = TtyCore::new(self.self_ref(), idx);
 
-        log::debug!("init_tty_device: to driver_install_tty");
+        // log::debug!("init_tty_device: to driver_install_tty");
         self.driver_install_tty(tty.clone())?;
-        log::debug!(
-            "init_tty_device: driver_install_tty done, index: {}, dev_name: {:?}",
-            idx,
-            tty.core().name(),
-        );
+        // log::debug!(
+        //     "init_tty_device: driver_install_tty done, index: {}, dev_name: {:?}",
+        //     idx,
+        //     tty.core().name(),
+        // );
 
         let core = tty.core();
 
@@ -333,20 +333,20 @@ impl TtyDriver {
             ports[core.index()].setup_internal_tty(Arc::downgrade(&tty));
             tty.set_port(ports[core.index()].clone());
         }
-        log::debug!("init_tty_device: to ldisc_setup");
+        // log::debug!("init_tty_device: to ldisc_setup");
         TtyLdiscManager::ldisc_setup(tty.clone(), tty.core().link())?;
 
         // 在devfs创建对应的文件
 
-        log::debug!("init_tty_device: to new tty device");
+        // log::debug!("init_tty_device: to new tty device");
         let device = TtyDevice::new(
             core.name().clone(),
             IdTable::new(self.tty_line_name(idx), Some(*core.device_number())),
             super::tty_device::TtyType::Tty,
         );
-        log::debug!("init_tty_device: to devfs_register");
+        // log::debug!("init_tty_device: to devfs_register");
         devfs_register(device.name_ref(), device.clone())?;
-        log::debug!("init_tty_device: to device_register");
+        // log::debug!("init_tty_device: to device_register");
         device_register(device)?;
         Ok(tty)
     }

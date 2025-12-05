@@ -82,8 +82,10 @@ pub fn do_kernel_rt_sigtimedwait(
     let pcb = ProcessManager::current_pcb();
     let mut new_blocked = *pcb.sig_info_irqsave().sig_blocked();
     // 按Linux：等待期间屏蔽 these
-    new_blocked.insert(awaited);
+    new_blocked.remove(awaited);
     set_user_sigmask(&mut new_blocked);
+    // 必须重新计算 pending，因为 blocked 变了，可能某些 pending 信号现在变得可见了
+    pcb.recalc_sigpending(None);
 
     // 计算超时时间
     let deadline = if uts.is_null() {

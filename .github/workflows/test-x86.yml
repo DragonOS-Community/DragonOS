@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     container:
-      image: dragonos/dragonos-dev:v1.17
+      image: dragonos/dragonos-dev:v1.18
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code
@@ -30,7 +30,7 @@ jobs:
         run: |
           make clean
           make -j$(nproc) all
-      
+
       - name: Run syscall test
         id: test-syscall
         shell: bash -ileo pipefail {0}
@@ -58,23 +58,23 @@ jobs:
 
           # 安装Python依赖
           pip install -r tools/test-upload/requirements.txt
-          
+
           # 设置变量
           BRANCH_NAME="${{ github.ref_name }}"
           COMMIT_ID="${{ github.sha }}"
           API_URL="https://ci-dashboard.dragonos.org/api/v1"
-          
+
           # 如果是PR，使用PR的分支名
           if [ "${{ github.event_name }}" == "pull_request" ]; then
             BRANCH_NAME="${{ github.head_ref }}"
           fi
-          
+
           # 检查日志文件是否存在
           if [ ! -f "serial_opt.txt" ]; then
             echo "警告: serial_opt.txt文件不存在，跳过上传"
             exit 0
           fi
-          
+
           # 检查API_KEY是否存在，如果不存在则使用dry-run模式
           if [ -z "$API_KEY" ]; then
             echo "警告: CI_DASHBOARD_UPLOAD_API_KEY secret未设置，使用dry-run模式"

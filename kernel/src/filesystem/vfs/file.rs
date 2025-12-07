@@ -977,15 +977,24 @@ impl File {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     pub fn ftruncate(&self, len: usize) -> Result<(), SystemError> {
-        // 如果文件不可写，返回错误
-        self.writeable()?;
-
-        // RLIMIT_FSIZE 对常规文件生效
+        // 类型必须是普通文件，否则 EINVAL
         let md = self.inode.metadata()?;
         if md.file_type != FileType::File {
             return Err(SystemError::EINVAL);
         }
 
+        // O_PATH 直接返回 EBADF，保持与 open 时的行为一致
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 非可写打开返回 EINVAL（对齐 gVisor 预期）
+        if !mode.contains(FileMode::FMODE_WRITE) || !mode.can_write() {
+            return Err(SystemError::EINVAL);
+        }
+
+        // RLIMIT_FSIZE 检查
         let current_pcb = ProcessManager::current_pcb();
         let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
         if fsize_limit.rlim_cur != u64::MAX && len as u64 > fsize_limit.rlim_cur {

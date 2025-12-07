@@ -31,7 +31,7 @@ impl Syscall for SysFtruncateHandle {
     }
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = Self::fd(args);
-        let len = Self::len(args);
+        let len = Self::len(args)?;
 
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
@@ -49,7 +49,7 @@ impl Syscall for SysFtruncateHandle {
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
             FormattedSyscallParam::new("fd", format!("{:#x}", Self::fd(args))),
-            FormattedSyscallParam::new("len", format!("{:#x}", Self::len(args))),
+            FormattedSyscallParam::new("len", format!("{:#x}", Self::len(args).unwrap_or(0))),
         ]
     }
 }
@@ -59,8 +59,12 @@ impl SysFtruncateHandle {
         args[0] as i32
     }
 
-    fn len(args: &[usize]) -> usize {
-        args[1]
+    fn len(args: &[usize]) -> Result<usize, SystemError> {
+        let len = args[1] as isize;
+        if len < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(len as usize)
     }
 }
 

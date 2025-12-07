@@ -37,7 +37,7 @@ use crate::{
         ProcessControlBlock, ProcessManager, RawPid,
     },
 };
-use crate::{filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
+use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
@@ -979,6 +979,19 @@ impl File {
     pub fn ftruncate(&self, len: usize) -> Result<(), SystemError> {
         // 如果文件不可写，返回错误
         self.writeable()?;
+
+        // RLIMIT_FSIZE 对常规文件生效
+        let md = self.inode.metadata()?;
+        if md.file_type != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
+
+        let current_pcb = ProcessManager::current_pcb();
+        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+        if fsize_limit.rlim_cur != u64::MAX && len as u64 > fsize_limit.rlim_cur {
+            let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+            return Err(SystemError::EFBIG);
+        }
 
         // 统一通过 VFS 封装，复用类型/只读检查
         crate::filesystem::vfs::vcore::vfs_truncate(self.inode(), len)?;

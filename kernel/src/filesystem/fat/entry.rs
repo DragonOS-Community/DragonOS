@@ -202,12 +202,6 @@ impl FATFile {
                 .gendisk
                 .write_at_bytes(&buf[start..start + end_len], offset as usize)?;
 
-            // 如果写入了 0 字节，可能是磁盘错误，避免死循环
-            if w == 0 {
-                warn!("FAT write returned 0 bytes, breaking to avoid infinite loop");
-                break;
-            }
-
             // 更新偏移量数据
             write_ok += w;
             start += w;

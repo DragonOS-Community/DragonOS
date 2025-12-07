@@ -1760,10 +1760,11 @@ impl IndexNode for LockedFATInode {
                     }
                     Ordering::Greater => {
                         // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
-                        // 限制缓冲区大小为 512KB，避免分配过大内存导致容量溢出
+                        let mut buf: Vec<u8> = Vec::new();
                         let mut remain_size = len - old_size;
-                        let buf_size = core::cmp::min(remain_size, 512 * 1024);
-                        let buf: Vec<u8> = vec![0u8; buf_size];
+                        let buf_size = remain_size;
+                        // let buf_size = core::cmp::min(remain_size, 512 * 1024);
+                        buf.resize(buf_size, 0);
 
                         let mut offset = old_size;
                         while remain_size > 0 {

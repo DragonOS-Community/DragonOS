@@ -60,10 +60,8 @@ impl Syscall for SysTruncateHandle {
         if md.file_type == FileType::File {
             let fsize_limit = ProcessManager::current_pcb().get_rlimit(RLimitID::Fsize);
             if fsize_limit.rlim_cur != u64::MAX && length as u64 > fsize_limit.rlim_cur {
-                let _ = send_signal_to_pid(
-                    ProcessManager::current_pcb().raw_pid(),
-                    Signal::SIGXFSZ,
-                );
+                let _ =
+                    send_signal_to_pid(ProcessManager::current_pcb().raw_pid(), Signal::SIGXFSZ);
                 return Err(SystemError::EFBIG);
             }
         }

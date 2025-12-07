@@ -1,5 +1,5 @@
-use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::arch::MMArch;
+use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::mm::truncate::truncate_inode_pages;
 use crate::mm::MemoryManagementArch;
 use alloc::string::ToString;

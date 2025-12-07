@@ -8,6 +8,7 @@ use log::error;
 use system_error::SystemError;
 
 use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
     arch::MMArch,
     driver::{
@@ -37,7 +38,6 @@ use crate::{
         ProcessControlBlock, ProcessManager, RawPid,
     },
 };
-use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.

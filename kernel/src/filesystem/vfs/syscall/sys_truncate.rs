@@ -35,6 +35,9 @@ impl Syscall for SysTruncateHandle {
         let path_ptr = args[0] as *const u8;
         let length = args[1];
 
+        if length > 1024 * 1024 {
+            return Err(SystemError::EFBIG);
+        }
         // 复制并校验用户态路径
         let path = check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?;
         let path = path.to_str().map_err(|_| SystemError::EINVAL)?;

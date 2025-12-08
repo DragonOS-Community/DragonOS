@@ -364,7 +364,7 @@ pub struct File {
     /// owner
     pid: SpinLock<Option<Arc<ProcessControlBlock>>>,
     /// 预读状态
-    pub ra_state: SpinLock<FileReadaheadState>,
+    ra_state: SpinLock<FileReadaheadState>,
 }
 
 impl File {
@@ -1054,6 +1054,15 @@ impl File {
     /// 设置预读窗口大小
     pub fn set_ra_pages(&self, pages: usize) {
         self.ra_state.lock().ra_pages = pages;
+    }
+
+    pub fn get_ra_state(&self) -> FileReadaheadState {
+        self.ra_state.lock().clone()
+    }
+
+    pub fn set_ra_state(&self, ra_state: FileReadaheadState) -> Result<(), SystemError> {
+        *self.ra_state.lock() = ra_state;
+        Ok(())
     }
 }
 

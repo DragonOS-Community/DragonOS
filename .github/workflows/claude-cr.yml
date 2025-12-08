@@ -54,4 +54,11 @@ jobs:
             - Security concerns
             - Test coverage
 
-            After reviewing, leave a constructive comment on the PR.
+            After reviewing:
+            1. use `mcp__github_inline_comment__create_inline_comment` to provide feedback for specific issues
+              - When writing a code suggestion, take into account that the code between startLine and line will be replaced by your suggestion
+              - For single-line comments: Replace ONLY the affected line
+              - For multi-line comments: Replace ONLY the lines in the range (startLine, line)
+            2. Update your comment with `mcp__github_comment__update_claude_comment` with a single paragraph with a description if the PR is ready to be merged or not.
+            DO NOT list which issues must be fixed, just a high-level summary of the PR status.
+

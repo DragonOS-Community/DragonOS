@@ -11,14 +11,14 @@ jobs:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.18
+    container: docker.cnb.cool/dragonos-community/dragonos/dragonos-dev:v1.18
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.18"
+      - run: echo "Running in docker.cnb.cool/dragonos-community/dragonos/dragonos-dev:v1.18"
       - uses: actions/checkout@v3
 
       - name: Format check
@@ -36,14 +36,14 @@ jobs:
     name: Kernel static test ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.18
+    container: docker.cnb.cool/dragonos-community/dragonos/dragonos-dev:v1.18
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.18"
+      - run: echo "Running in docker.cnb.cool/dragonos-community/dragonos/dragonos-dev:v1.18"
 
       - uses: actions/checkout@v3
 
@@ -57,7 +57,7 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.18
+    container: docker.cnb.cool/dragonos-community/dragonos/dragonos-dev:v1.18
     continue-on-error: true
     strategy:
       matrix:
@@ -74,7 +74,7 @@ jobs:
             checkout_params: {}
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.18"
+      - run: echo "Running in docker.cnb.cool/dragonos-community/dragonos/dragonos-dev:v1.18"
 
       - uses: actions/checkout@v3
         with: ${{ matrix.checkout_params }}

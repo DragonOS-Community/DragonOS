@@ -380,17 +380,19 @@ fi
 rustInstall
 
 # 安装dadk
-cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.5.0 || exit 1
+cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.5.1 || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 
 # 编译安装musl交叉编译工具链
 $SHELL ${bashpath}/install_cross_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
 
+install_python_pkg
+
 if [ "$CI_INSTALL" = "true" ]; then
     echo "CI Skip docs, grub deps install"
 else
-    install_python_pkg
+
     $SHELL ${bashpath}/grub_auto_install.sh || (echo "grub安装失败" && exit 1)
 fi
 # 编译安装grub

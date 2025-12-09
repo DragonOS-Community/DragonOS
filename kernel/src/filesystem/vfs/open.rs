@@ -158,23 +158,16 @@ pub fn do_sys_open(
     path: &str,
     o_flags: FileFlags,
     mode: InodeMode,
-    follow_symlink: bool,
 ) -> Result<usize, SystemError> {
     let how = OpenHow::new(o_flags, mode, OpenHowResolve::empty());
-    // O_NOFOLLOW 标志应该决定是否跟随符号链接
-    let follow_symlink = !o_flags.contains(FileFlags::O_NOFOLLOW);
-    return do_sys_openat2(dfd, path, how, follow_symlink);
+
+    return do_sys_openat2(dfd, path, how);
 }
 
-fn do_sys_openat2(
-    dirfd: i32,
-    path: &str,
-    how: OpenHow,
-    follow_symlink: bool,
-) -> Result<usize, SystemError> {
+fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemError> {
     // log::debug!("openat2: dirfd: {}, path: {}, how: {:?}",dirfd, path, how);
     let path = path.trim();
-
+    let follow_symlink = !how.o_flags.contains(FileFlags::O_NOFOLLOW);
     // 检查空字符串路径
     if path.is_empty() {
         return Err(SystemError::ENOENT);

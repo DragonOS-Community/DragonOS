@@ -572,7 +572,6 @@ impl File {
         buf: &mut [u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
-        // 先检查本文件在权限等规则下，是否可读取。
         self.readable()?;
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
@@ -609,28 +608,32 @@ impl File {
         buf: &[u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
-        // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
 
         let inode_flags = self.get_inode_flags()?;
+        let flags = self.flags();
         // 检查 S_IMMUTABLE
         if inode_flags.contains(InodeFlags::S_IMMUTABLE) {
             return Err(SystemError::EPERM);
         }
         // S_APPEND 的 inode 只能追加写入
-        if inode_flags.contains(InodeFlags::S_APPEND) && !self.flags().contains(FileFlags::O_APPEND)
-        {
+        if inode_flags.contains(InodeFlags::S_APPEND) && !flags.contains(FileFlags::O_APPEND) {
             return Err(SystemError::EPERM);
         }
 
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-        // 获取文件类型
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        // 检查RLIMIT_FSIZE限制（仅对常规文件生效）
+        let actual_offset =
+            if flags.contains(FileFlags::O_APPEND) && matches!(file_type, FileType::File) {
+                md.size as usize
+            } else {
+                offset
+            };
+
         let actual_len = if matches!(file_type, FileType::File) {
             let current_pcb = ProcessManager::current_pcb();
             let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
@@ -638,9 +641,7 @@ impl File {
             if fsize_limit.rlim_cur != u64::MAX {
                 let limit = fsize_limit.rlim_cur as usize;
 
-                // 如果当前文件大小已经达到或超过限制，不允许写入
-                if offset >= limit {
-                    // 发送SIGXFSZ信号
+                if actual_offset >= limit {
                     let _ = send_signal_to_pid(
                         current_pcb.raw_pid(),
                         crate::arch::ipc::signal::Signal::SIGXFSZ,
@@ -648,8 +649,7 @@ impl File {
                     return Err(SystemError::EFBIG);
                 }
 
-                // 计算可写入的最大长度（不超过限制）
-                let max_writable = limit.saturating_sub(offset);
+                let max_writable = limit.saturating_sub(actual_offset);
                 if len > max_writable {
                     max_writable
                 } else {
@@ -662,20 +662,23 @@ impl File {
             len
         };
 
-        // 仅常规文件考虑“指针超过大小则扩展”语义；管道/字符设备等不应触发 resize
-        if matches!(file_type, FileType::File) && offset > md.size as usize {
-            self.inode.resize(offset)?;
+        if matches!(file_type, FileType::File) && actual_offset > md.size as usize {
+            self.inode.resize(actual_offset)?;
         }
-        let written_len = self
-            .inode
-            .write_at(offset, actual_len, buf, self.private_data.lock())?;
-
+        let written_len =
+            self.inode
+                .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
         if update_offset {
-            self.offset
-                .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+            if flags.contains(FileFlags::O_APPEND) {
+                self.offset.store(
+                    actual_offset + written_len,
+                    core::sync::atomic::Ordering::SeqCst,
+                );
+            } else {
+                self.offset
+                    .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+            }
         }
-
-        let flags = self.flags();
         // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
         let need_data_sync = flags.contains(FileFlags::O_DSYNC);
         // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
@@ -764,7 +767,6 @@ impl File {
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
         let mode = *self.mode.read();
-
         // O_PATH文件几乎不能做任何I/O操作
         if mode.contains(FileMode::FMODE_PATH) {
             return Err(SystemError::EBADF);
@@ -796,11 +798,6 @@ impl File {
         // 检查写权限
         if !mode.contains(FileMode::FMODE_WRITE) {
             return Err(SystemError::EBADF);
-        }
-
-        // 检查写能力
-        if !mode.can_write() {
-            return Err(SystemError::EINVAL);
         }
 
         Ok(())

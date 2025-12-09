@@ -25,7 +25,7 @@ impl Syscall for SysOpenHandle {
         let flags = Self::flags(args);
         let mode = Self::mode(args);
 
-        super::open_utils::do_open(path, flags, mode, true)
+        super::open_utils::do_open(path, flags, mode)
     }
 
     /// Formats the syscall arguments for display/debugging purposes.

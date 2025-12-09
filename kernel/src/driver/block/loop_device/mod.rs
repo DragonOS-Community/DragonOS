@@ -23,7 +23,10 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         sysfs::{AttributeGroup, SysFSOps},
-        vfs::{file::FileMode, FilePrivateData, FileType, IndexNode, InodeId, Metadata},
+        vfs::{
+            file::FileFlags, FilePrivateData, FileType, IndexNode, InodeFlags, InodeId, InodeMode,
+            Metadata,
+        },
     },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -502,8 +505,7 @@ impl LoopDevice {
         }
         .ok_or(SystemError::EBADF)?;
 
-        let mode = file.mode();
-        let read_only = !mode.contains(FileMode::O_WRONLY) && !mode.contains(FileMode::O_RDWR);
+        let read_only = file.flags().is_read_only();
 
         let inode = file.inode();
         let metadata = inode.metadata()?;
@@ -793,8 +795,9 @@ impl IndexNode for LoopDevice {
             mtime: file_metadata.mtime,
             ctime: file_metadata.ctime,
             btime: file_metadata.btime,
-            file_type: crate::filesystem::vfs::FileType::BlockDevice,
-            mode: crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o644),
+            file_type: FileType::BlockDevice,
+            mode: InodeMode::from_bits_truncate(0o644),
+            flags: InodeFlags::empty(),
             nlinks: 1,
             uid: 0,
             gid: 0,
@@ -817,11 +820,7 @@ impl IndexNode for LoopDevice {
                     guard.get_file_by_fd(file_fd)
                 }
                 .ok_or(SystemError::EBADF)?;
-
-                let mode = file.mode();
-                let read_only =
-                    !mode.contains(FileMode::O_WRONLY) && !mode.contains(FileMode::O_RDWR);
-
+                let read_only = file.flags().is_read_only();
                 let inode = file.inode();
                 let metadata = inode.metadata()?;
                 match metadata.file_type {
@@ -1548,7 +1547,7 @@ impl IndexNode for LoopControlDevice {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Ok(());
@@ -1569,7 +1568,6 @@ impl IndexNode for LoopControlDevice {
     /// - 包含设备类型、权限、设备号等信息
     ///
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        use crate::filesystem::vfs::{syscall::ModeType, FileType, InodeId};
         use crate::time::PosixTimeSpec;
 
         let metadata = Metadata {
@@ -1583,7 +1581,8 @@ impl IndexNode for LoopControlDevice {
             ctime: PosixTimeSpec::default(),
             btime: PosixTimeSpec::default(),
             file_type: FileType::CharDevice,
-            mode: ModeType::from_bits_truncate(0o600),
+            mode: InodeMode::from_bits_truncate(0o600),
+            flags: InodeFlags::empty(),
             nlinks: 1,
             uid: 0,
             gid: 0,

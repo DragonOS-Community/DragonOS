@@ -131,9 +131,7 @@ pub struct LoopDevice {
     active_io_count: AtomicU32,
 }
 #[derive(Debug, Clone)]
-pub struct LoopPrivateData {
-    pub parms: u32,
-}
+pub struct LoopPrivateData {}
 pub struct LoopDeviceInner {
     pub device_number: DeviceNumber,
     state: LoopState,
@@ -221,7 +219,6 @@ impl LoopDevice {
                 device_common: DeviceCommonData::default(),
                 state: LoopState::Unbound,
                 state_lock: SpinLock::new(()),
-                //work_queue: None,
             }),
             block_dev_meta: BlockDevMeta::new(devname, Major::LOOP_MAJOR), // Loop 设备主设备号为 7
             locked_kobj_state: LockedKObjectState::default(),

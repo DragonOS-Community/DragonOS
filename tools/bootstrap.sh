@@ -71,7 +71,7 @@ install_ubuntu_debian_pkg()
 		python3-sphinx make git
 	# 必须分开安装，否则会出现错误
 	sudo "$1" install ${APT_FLAG} -y \
-		gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu gdb-multiarch
+		gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu linux-libc-dev-riscv64-cross gdb-multiarch
 
 	# 如果python3没有安装
 	if [ -z "$(which python3)" ]; then

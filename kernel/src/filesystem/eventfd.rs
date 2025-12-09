@@ -9,7 +9,6 @@ use crate::filesystem::{
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::process::{ProcessFlags, ProcessManager};
-use crate::sched::SchedMode;
 use crate::syscall::Syscall;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -219,18 +218,23 @@ impl IndexNode for EventFdInode {
             if ProcessManager::current_pcb().has_pending_signal() {
                 return Err(SystemError::ERESTARTSYS);
             }
-            let eventfd = self.eventfd.lock();
-            if u64::MAX - eventfd.count > val {
-                break;
+            {
+                let eventfd = self.eventfd.lock();
+                if u64::MAX - eventfd.count > val {
+                    break;
+                }
+                if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
             }
-            // block until a read() is performed  on the
-            // file descriptor, or fails with the error EAGAIN if the
-            // file descriptor has been made nonblocking.
-            if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            drop(eventfd);
-            self.wait_queue.sleep().ok();
+            // 等待计数下降（被 read 消费）
+            self.wait_queue.wait_event_interruptible(
+                || {
+                    let ev = self.eventfd.lock();
+                    u64::MAX - ev.count > val
+                },
+                None::<fn()>,
+            )?;
         }
         let mut eventfd = self.eventfd.lock();
         eventfd.count += val;

@@ -1,4 +1,5 @@
 use alloc::{
+    boxed::Box,
     collections::LinkedList,
     sync::{Arc, Weak},
 };
@@ -17,13 +18,15 @@ use system_error::SystemError;
 use crate::{
     arch::{CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{
+        spinlock::{SpinLock, SpinLockGuard},
+        wait_queue::{Waiter, Waker},
+    },
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
     process::{ProcessControlBlock, ProcessManager, RawPid},
-    sched::{schedule, SchedMode},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
-        timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
+        timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
         PosixTimeSpec,
     },
 };
@@ -64,25 +67,18 @@ pub struct FutexHashBucket {
 
 impl FutexHashBucket {
     /// ## 判断是否在bucket里
+    #[allow(dead_code)]
     pub fn contains(&self, futex_q: &FutexObj) -> bool {
         self.chain
             .iter()
-            .filter(|x| futex_q.pcb.ptr_eq(&x.pcb) && x.key == futex_q.key)
+            .filter(|x| Arc::ptr_eq(&x.waker, &futex_q.waker) && x.key == futex_q.key)
             .count()
             != 0
     }
 
-    /// 让futex_q在该bucket上挂起
-    ///
-    /// 进入该函数前，需要关中断
     #[inline(always)]
-    pub fn sleep_no_sched(&mut self, futex_q: Arc<FutexObj>) -> Result<(), SystemError> {
-        assert!(!CurrentIrqArch::is_irq_enabled());
+    pub fn enqueue(&mut self, futex_q: Arc<FutexObj>) {
         self.chain.push_back(futex_q);
-
-        ProcessManager::mark_sleep(true)?;
-
-        Ok(())
     }
 
     /// ## 唤醒队列中的最多nr_wake个进程
@@ -121,9 +117,7 @@ impl FutexHashBucket {
 
                 // key和bitset都匹配，尝试唤醒
                 // 注意：pop_front已经将futex_q从队列中移除，无需再次调用remove
-                if let Some(pcb) = futex_q.pcb.upgrade() {
-                    // TODO: 考虑优先级继承的机制
-                    ProcessManager::wakeup(&pcb)?;
+                if futex_q.waker.wake() {
                     count += 1;
                 }
                 // 如果pcb已经被释放，也算处理了一个，继续下一个
@@ -138,19 +132,33 @@ impl FutexHashBucket {
     }
 
     /// 将FutexObj从bucket中删除
-    pub fn remove(&mut self, futex: Arc<FutexObj>) {
+    pub fn remove_by_waker(&mut self, waker: &Arc<Waker>) -> bool {
+        let before = self.chain.len();
         self.chain
-            .extract_if(|x| Arc::ptr_eq(x, &futex))
+            .extract_if(|x| Arc::ptr_eq(&x.waker, waker))
             .for_each(drop);
+        before != self.chain.len()
     }
 }
 
 #[derive(Debug)]
 pub struct FutexObj {
-    pub(super) pcb: Weak<ProcessControlBlock>,
+    pub(super) waker: Arc<Waker>,
     pub(super) key: FutexKey,
     pub(super) bitset: u32,
     // TODO: 优先级继承
+}
+
+#[derive(Debug)]
+struct WakerTimer {
+    waker: Arc<Waker>,
+}
+
+impl TimerFunction for WakerTimer {
+    fn run(&mut self) -> Result<(), SystemError> {
+        self.waker.wake();
+        Ok(())
+    }
 }
 
 pub enum FutexAccess {
@@ -284,7 +292,7 @@ impl Futex {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let pcb = ProcessManager::current_pcb();
+        let (waiter, waker) = Waiter::new_pair();
         // 创建超时计时器任务
         let mut timer = None;
         if let Some(time) = abs_time {
@@ -297,30 +305,31 @@ impl Futex {
                 return Err(SystemError::ETIMEDOUT);
             }
 
-            let wakeup_helper = WakeUpHelper::new(pcb.clone());
             let jiffies = next_n_us_timer_jiffies(total_us);
-
-            let wake_up = Timer::new(wakeup_helper, jiffies);
+            let wake_up = Timer::new(
+                Box::new(WakerTimer {
+                    waker: waker.clone(),
+                }),
+                jiffies,
+            );
             timer = Some(wake_up);
         }
 
         let futex_q = Arc::new(FutexObj {
-            pcb: Arc::downgrade(&pcb),
+            waker: waker.clone(),
             key: key.clone(),
             bitset,
         });
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        // 满足条件则将当前进程在该bucket上挂起
-        bucket_mut.sleep_no_sched(futex_q.clone())?;
+        bucket_mut.enqueue(futex_q.clone());
 
-        // 在关中断并且已经标记阻塞后，激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
+        // 在入队后激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
         if let Some(ref t) = timer {
             t.activate();
         }
 
         drop(futex_map_guard);
-        drop(irq_guard);
-        schedule(SchedMode::SM_NONE);
+        // 阻塞等待
+        let wait_res = waiter.wait(true);
 
         // ========== 被唤醒后的检查 ==========
         // 进程被唤醒可能有以下几种情况：
@@ -331,41 +340,14 @@ impl Futex {
 
         let mut futex_map_guard = FutexData::futex_map();
 
-        // 首先检查超时，优先级最高
-        // 注意：必须在检查队列之前先检查超时，否则可能漏掉超时情况
+        // 首先检查超时
         let is_timeout = timer.as_ref().is_some_and(|t| t.timeout());
 
-        if is_timeout {
-            // 超时唤醒：从队列中移除并返回 ETIMEDOUT
-            if let Some(bucket_mut) = futex_map_guard.get_mut(&key) {
-                bucket_mut.remove(futex_q.clone());
-            }
-            return Err(SystemError::ETIMEDOUT);
-        }
-
-        // 检查是否被正常唤醒（futex_wake）
-        let bucket = futex_map_guard.get_mut(&key);
-        match bucket {
-            Some(bucket_mut) => {
-                if !bucket_mut.contains(&futex_q) {
-                    // futex_q 不在队列中，说明被 futex_wake 正常唤醒
-                    if let Some(timer) = timer {
-                        timer.cancel();
-                    }
-                    return Ok(0);
-                }
-                // futex_q 仍在队列中，说明是信号或伪唤醒
-                // 从队列中移除
-                bucket_mut.remove(futex_q.clone());
-            }
-            None => {
-                // 队列已被清空，说明被正常唤醒
-                if let Some(timer) = timer {
-                    timer.cancel();
-                }
-                return Ok(0);
-            }
-        }
+        // 从队列中移除自身（如果仍在队列）
+        let in_queue = futex_map_guard
+            .get_mut(&key)
+            .map(|bucket| bucket.remove_by_waker(&waker))
+            .unwrap_or(false);
 
         drop(futex_map_guard);
 
@@ -374,8 +356,17 @@ impl Futex {
             timer.cancel();
         }
 
-        // 检查是否有待处理的信号
-        if ProcessManager::current_pcb().has_pending_signal() {
+        // 处理等待结果
+        if is_timeout {
+            return Err(SystemError::ETIMEDOUT);
+        }
+
+        if wait_res.is_err() || ProcessManager::current_pcb().has_pending_signal() {
+            return Err(SystemError::ERESTARTSYS);
+        }
+
+        if in_queue {
+            // 未被正常唤醒，视为伪唤醒/信号
             return Err(SystemError::ERESTARTSYS);
         }
 

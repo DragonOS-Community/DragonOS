@@ -9,7 +9,6 @@ use crate::net::socket::common::EPollItems;
 use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSOL};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
-use crate::sched::SchedMode;
 use smoltcp;
 
 mod inner;
@@ -344,7 +343,6 @@ impl Socket for TcpSocket {
     }
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
-        use crate::sched::SchedMode;
         let Endpoint::Ip(endpoint) = endpoint else {
             log::debug!("TcpSocket::connect: invalid endpoint");
             return Err(SystemError::EINVAL);
@@ -395,7 +393,6 @@ impl Socket for TcpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        use crate::sched::SchedMode;
         return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer)
         } else {

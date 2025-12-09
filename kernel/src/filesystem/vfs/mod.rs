@@ -23,7 +23,7 @@ use crate::{
     },
     filesystem::{
         epoll::EPollItem,
-        vfs::{permission::PermissionMask, syscall::RenameFlags},
+        vfs::{file::File, permission::PermissionMask, syscall::RenameFlags},
     },
     ipc::pipe::LockedPipeInode,
     libs::{
@@ -844,6 +844,16 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// 所以如果可以确定当前`dyn IndexNode`是`dyn Socket`类型，则可以直接调用此方法进行转换
     fn as_socket(&self) -> Option<&dyn Socket> {
         None
+    }
+
+    fn fadvise(
+        &self,
+        _file: &Arc<File>,
+        _offset: i64,
+        _len: i64,
+        _advise: i32,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 }
 

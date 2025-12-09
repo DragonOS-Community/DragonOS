@@ -514,6 +514,10 @@ impl File {
     }
 
     fn file_readahead(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        if self.mode().contains(FileMode::FMODE_RANDOM) {
+            return Ok(());
+        }
+
         let page_cache = match self.inode.page_cache() {
             Some(page_cahce) => page_cahce,
             None => return Ok(()),
@@ -1033,6 +1037,30 @@ impl File {
         let metadata = self.inode.metadata()?;
         Ok(metadata.flags)
     }
+
+    /// 修改文件访问模式标志
+    pub fn set_mode_flags(&self, flags: FileMode) {
+        self.mode.write().insert(flags);
+    }
+
+    /// 清除文件访问模式标志
+    pub fn remove_mode_flags(&self, flags: FileMode) {
+        self.mode.write().remove(flags);
+    }
+
+    /// 设置预读窗口大小
+    pub fn set_ra_pages(&self, pages: usize) {
+        self.ra_state.lock().ra_pages = pages;
+    }
+
+    pub fn get_ra_state(&self) -> FileReadaheadState {
+        self.ra_state.lock().clone()
+    }
+
+    pub fn set_ra_state(&self, ra_state: FileReadaheadState) -> Result<(), SystemError> {
+        *self.ra_state.lock() = ra_state;
+        Ok(())
+    }
 }
 
 impl Drop for File {
@@ -1252,6 +1280,19 @@ impl FileDescriptorVec {
             return None;
         }
         self.fds[fd as usize].clone()
+    }
+
+    /// 根据文件描述符序号，获取文件结构体的Arc指针, 并检测FileMode
+    ///
+    /// ## 参数
+    ///
+    /// - `fd` 文件描述符序号
+    pub fn get_file_by_fd_not_raw(&self, fd: i32, mask: FileMode) -> Option<Arc<File>> {
+        if !self.validate_fd(fd) {
+            return None;
+        }
+        let file = self.fds[fd as usize].clone();
+        file.filter(|f| !f.mode().contains(mask))
     }
 
     /// 当RLIMIT_NOFILE变化时调整文件描述符表容量

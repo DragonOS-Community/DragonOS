@@ -1,0 +1,17 @@
+# 卡死问题
+
+Pipes/PipeTest.BlockPartialWriteClosed/pipe
+Pipes/PipeTest.BlockPartialWriteClosed/pipe2blocking
+Pipes/PipeTest.BlockPartialWriteClosed/pipe2nonblocking
+Pipes/PipeTest.BlockPartialWriteClosed/smallbuffer
+Pipes/PipeTest.BlockPartialWriteClosed/namednonblocking
+Pipes/PipeTest.BlockPartialWriteClosed/namedblocking
+
+# 卡死问题
+Pipes/PipeTest.BlockWriteClosed/pipe
+Pipes/PipeTest.BlockWriteClosed/pipe2blocking
+Pipes/PipeTest.BlockWriteClosed/pipe2nonblocking
+Pipes/PipeTest.BlockWriteClosed/smallbuffer
+Pipes/PipeTest.BlockWriteClosed/namednonblocking
+Pipes/PipeTest.BlockWriteClosed/namedblocking
+

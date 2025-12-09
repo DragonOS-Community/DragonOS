@@ -3,7 +3,7 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EPOLL_CREATE;
 use crate::filesystem::epoll::event_poll::EventPoll;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
@@ -22,7 +22,7 @@ impl Syscall for SysEpollCreateHandle {
             return Err(SystemError::EINVAL);
         }
 
-        return EventPoll::create_epoll(FileMode::empty());
+        return EventPoll::create_epoll(FileFlags::empty());
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

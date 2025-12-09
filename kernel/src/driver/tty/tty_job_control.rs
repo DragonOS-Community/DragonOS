@@ -83,7 +83,7 @@ impl TtyJobCtrlManager {
                 log::debug!("tty_check_change: orphaned pgrp");
                 return Err(SystemError::EIO);
             } else {
-                crate::ipc::kill::kill_process_group(&pgid, sig)?;
+                crate::ipc::kill::send_signal_to_pgid(&pgid, sig)?;
                 ProcessManager::current_pcb()
                     .flags()
                     .insert(ProcessFlags::HAS_PENDING_SIGNAL);

@@ -327,11 +327,6 @@ impl Syscall {
                 Self::sysinfo(info)
             }
 
-            SYS_UMASK => {
-                let mask = args[0] as u32;
-                Self::umask(mask)
-            }
-
             SYS_FSYNC => {
                 warn!("SYS_FSYNC has not yet been implemented");
                 Ok(0)
@@ -341,8 +336,6 @@ impl Syscall {
                 warn!("SYS_RSEQ has not yet been implemented");
                 Err(SystemError::ENOSYS)
             }
-
-            SYS_SCHED_YIELD => Self::do_sched_yield(),
 
             SYS_FADVISE64 => {
                 // todo: 这个系统调用还没有实现

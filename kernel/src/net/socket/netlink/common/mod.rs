@@ -1,5 +1,5 @@
 use crate::{
-    filesystem::epoll::EPollEventType,
+    filesystem::{epoll::EPollEventType, vfs::fasync::FAsyncItems},
     libs::{rwlock::RwLock, wait_queue::WaitQueue},
     net::socket::{
         endpoint::Endpoint,
@@ -27,6 +27,7 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
     is_nonblocking: AtomicBool,
     wait_queue: Arc<WaitQueue>,
     netns: Arc<NetNamespace>,
+    fasync_items: FAsyncItems,
 }
 
 impl<P: SupportedNetlinkProtocol> NetlinkSocket<P>
@@ -40,6 +41,7 @@ where
             is_nonblocking: AtomicBool::new(is_nonblocking),
             wait_queue: Arc::new(WaitQueue::default()),
             netns: ProcessManager::current_netns(),
+            fasync_items: FAsyncItems::default(),
         })
     }
 
@@ -216,6 +218,10 @@ where
 
     fn epoll_items(&self) -> &crate::net::socket::common::EPollItems {
         todo!("implement epoll_items for netlink socket");
+    }
+
+    fn fasync_items(&self) -> &FAsyncItems {
+        &self.fasync_items
     }
 
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {

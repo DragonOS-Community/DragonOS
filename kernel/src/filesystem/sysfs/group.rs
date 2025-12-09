@@ -9,7 +9,7 @@ use crate::{
     filesystem::{
         kernfs::{callback::KernInodePrivateData, KernFSInode},
         sysfs::{dir::SysKernDirPriv, sysfs_instance, SysFSKernPrivateData},
-        vfs::{syscall::ModeType, IndexNode},
+        vfs::{IndexNode, InodeMode},
     },
     libs::casting::DowncastArc,
 };
@@ -80,7 +80,7 @@ impl SysFS {
                 parent_inode = kobj_inode
                     .add_dir(
                         group.name().unwrap().to_string(),
-                        ModeType::S_IRWXU | ModeType::S_IRUGO | ModeType::S_IXUGO,
+                        InodeMode::S_IRWXU | InodeMode::S_IRUGO | InodeMode::S_IXUGO,
                         Some(private_data),
                         None,
                     )
@@ -195,7 +195,7 @@ impl SysFS {
                 );
             }
 
-            mode = ModeType::from_bits_truncate(mode.bits() & 0o644);
+            mode = InodeMode::from_bits_truncate(mode.bits() & 0o644);
             e = sysfs_instance().add_file_with_mode(&parent, *attr, mode);
             if e.is_err() {
                 break;

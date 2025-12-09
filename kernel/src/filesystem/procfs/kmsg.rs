@@ -1,8 +1,8 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use super::log::{LogLevel, LogMessage};
+use super::klog::LogMessage;
 
-use crate::libs::spinlock::SpinLock;
+use crate::{debug::klog::loglevel::LogLevel, libs::spinlock::SpinLock};
 
 use alloc::{borrow::ToOwned, string::ToString, vec::Vec};
 
@@ -52,7 +52,7 @@ impl Kmsg {
 
     /// 添加日志消息
     pub fn push(&mut self, msg: LogMessage) {
-        self.buffer.push(msg);
+        self.buffer.push(msg.clone());
         self.is_changed = true;
     }
 

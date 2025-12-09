@@ -5,12 +5,9 @@ use crate::{
 };
 use alloc::vec::Vec;
 use core::cmp;
-use log::warn;
 use system_error::SystemError;
 
 use super::{user_access::UserBufferWriter, Syscall};
-
-static mut UMASK: usize = 0o777;
 
 /// 系统信息
 ///
@@ -58,13 +55,6 @@ impl Syscall {
         writer.copy_one_to_user(&sysinfo, 0)?;
 
         return Ok(0);
-    }
-
-    pub fn umask(mask: u32) -> Result<usize, SystemError> {
-        warn!("SYS_UMASK has not yet been implemented\n");
-        let r = unsafe { UMASK };
-        unsafe { UMASK = mask as usize };
-        return Ok(r);
     }
 
     /// ## 将随机字节填入buf

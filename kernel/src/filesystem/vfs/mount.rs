@@ -40,8 +40,8 @@ use crate::{
 };
 
 use super::{
-    file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType,
-    IndexNode, InodeId, Magic, PollableInode, SuperBlock,
+    file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+    InodeMode, Magic, PollableInode, SuperBlock,
 };
 
 bitflags! {
@@ -630,9 +630,9 @@ impl IndexNode for MountFSInode {
     fn open(
         &self,
         data: SpinLockGuard<FilePrivateData>,
-        mode: &FileMode,
+        flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        return self.inner_inode.open(data, mode);
+        return self.inner_inode.open(data, flags);
     }
 
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -643,7 +643,7 @@ impl IndexNode for MountFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inner_inode = self
@@ -730,7 +730,7 @@ impl IndexNode for MountFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inner_inode = self.inner_inode.create(name, file_type, mode)?;
         return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
@@ -946,7 +946,7 @@ impl IndexNode for MountFSInode {
     fn mknod(
         &self,
         filename: &str,
-        mode: ModeType,
+        mode: InodeMode,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inner_inode = self.inner_inode.mknod(filename, mode, dev_t)?;
@@ -1277,7 +1277,7 @@ pub fn do_mount_mkdir(
     let inode = do_mkdir_at(
         AtFlags::AT_FDCWD.bits(),
         mount_point,
-        FileMode::from_bits_truncate(0o755),
+        InodeMode::from_bits_truncate(0o755),
     )?;
     let result = ProcessManager::current_mntns().get_mount_point(mount_point);
     if let Some((_, rest, _fs)) = result {

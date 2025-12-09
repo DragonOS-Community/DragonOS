@@ -8,7 +8,7 @@ use crate::process::Signal;
 use crate::{
     driver::base::block::SeekFrom,
     filesystem::vfs::{
-        file::{File, FileMode},
+        file::{File, FileFlags},
         IndexNode,
     },
     libs::elf::ELF_LOADER,
@@ -126,7 +126,7 @@ impl ExecParam {
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
         // 读取文件头部，用于判断文件类型
-        let file = File::new(file_inode, FileMode::O_RDONLY)?;
+        let file = File::new(file_inode, FileFlags::O_RDONLY)?;
 
         Ok(Self {
             file,

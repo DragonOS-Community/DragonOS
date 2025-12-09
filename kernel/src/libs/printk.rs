@@ -6,11 +6,9 @@ use log::{info, Level, Log};
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
+    debug::klog::loglevel::{LogLevel, KERNEL_LOG_LEVEL},
     driver::tty::{tty_driver::TtyOperation, virtual_terminal::vc_manager},
-    filesystem::procfs::{
-        kmsg::KMSG,
-        log::{LogLevel, LogMessage},
-    },
+    filesystem::procfs::{klog::LogMessage, kmsg::KMSG},
     time::PosixTimeSpec,
 };
 
@@ -69,10 +67,9 @@ pub fn __printk(args: fmt::Arguments) {
 pub struct Logger;
 
 impl Logger {
-    pub fn log(&self, log_level: usize, message: fmt::Arguments) {
+    pub fn log(&self, log_level: LogLevel, message: fmt::Arguments) {
         if unsafe { KMSG.is_some() } {
             let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();
-            let log_level = LogLevel::from(log_level);
 
             let log_message = LogMessage::new(timestamp, log_level, message.to_string());
 
@@ -87,15 +84,16 @@ impl Logger {
 struct KernelLogger;
 
 impl Log for KernelLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        // 这里可以自定义日志过滤规则
-        true
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        // 根据全局日志级别过滤日志
+        KERNEL_LOG_LEVEL.should_print(metadata.level().into())
     }
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            // todo: 接入kmsg
+            // 记录到 kmsg 缓冲区
             Self::kernel_log(record);
+            // 输出到控制台
             Self::iodisplay(record)
         }
     }
@@ -131,8 +129,8 @@ impl KernelLogger {
 
     fn kernel_log(record: &log::Record) {
         match record.level() {
-            Level::Debug => Logger.log(
-                7,
+            Level::Debug | Level::Trace => Logger.log(
+                LogLevel::DEBUG,
                 format_args!(
                     "({}:{})\t {}\n",
                     record.file().unwrap_or(""),
@@ -141,7 +139,7 @@ impl KernelLogger {
                 ),
             ),
             Level::Error => Logger.log(
-                3,
+                LogLevel::ERR,
                 format_args!(
                     "({}:{})\t {}\n",
                     record.file().unwrap_or(""),
@@ -150,7 +148,7 @@ impl KernelLogger {
                 ),
             ),
             Level::Info => Logger.log(
-                6,
+                LogLevel::INFO,
                 format_args!(
                     "({}:{})\t {}\n",
                     record.file().unwrap_or(""),
@@ -159,7 +157,7 @@ impl KernelLogger {
                 ),
             ),
             Level::Warn => Logger.log(
-                4,
+                LogLevel::WARN,
                 format_args!(
                     "({}:{})\t {}\n",
                     record.file().unwrap_or(""),
@@ -167,9 +165,6 @@ impl KernelLogger {
                     record.args()
                 ),
             ),
-            Level::Trace => {
-                todo!()
-            }
         }
     }
 }

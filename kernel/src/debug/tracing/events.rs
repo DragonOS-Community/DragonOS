@@ -3,7 +3,7 @@ use alloc::string::ToString;
 use crate::debug::tracing::TracingDirCallBack;
 use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 use crate::filesystem::kernfs::KernFSInode;
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::PollStatus;
 use crate::tracepoint::*;
 use alloc::sync::Arc;
@@ -150,7 +150,7 @@ pub fn init_events(root: Arc<KernFSInode>) -> Result<(), SystemError> {
         // Register the subsystem in the root inode
         let subsystem_inode = root.add_dir(
             subsystem_name,
-            ModeType::from_bits_truncate(0o755),
+            InodeMode::from_bits_truncate(0o755),
             None,
             Some(&TracingDirCallBack),
         )?;
@@ -158,14 +158,14 @@ pub fn init_events(root: Arc<KernFSInode>) -> Result<(), SystemError> {
             let event_info = subsystem.get_event(&event_name).unwrap();
             let event_inode = subsystem_inode.add_dir(
                 event_name,
-                ModeType::from_bits_truncate(0o755),
+                InodeMode::from_bits_truncate(0o755),
                 None,
                 Some(&TracingDirCallBack),
             )?;
             // add enable file for the event
             let _enable_inode = event_inode.add_file(
                 "enable".to_string(),
-                ModeType::from_bits_truncate(0o644),
+                InodeMode::from_bits_truncate(0o644),
                 None,
                 Some(KernInodePrivateData::DebugFS(event_info.clone())),
                 Some(&EnableCallBack),
@@ -173,7 +173,7 @@ pub fn init_events(root: Arc<KernFSInode>) -> Result<(), SystemError> {
             // add format file for the event
             let _format_inode = event_inode.add_file(
                 "format".to_string(),
-                ModeType::from_bits_truncate(0o644),
+                InodeMode::from_bits_truncate(0o644),
                 None,
                 Some(KernInodePrivateData::DebugFS(event_info.clone())),
                 Some(&FormatCallBack),
@@ -181,7 +181,7 @@ pub fn init_events(root: Arc<KernFSInode>) -> Result<(), SystemError> {
             // add id file for the event
             let _id_inode = event_inode.add_file(
                 "id".to_string(),
-                ModeType::from_bits_truncate(0o644),
+                InodeMode::from_bits_truncate(0o644),
                 None,
                 Some(KernInodePrivateData::DebugFS(event_info)),
                 Some(&IDCallBack),

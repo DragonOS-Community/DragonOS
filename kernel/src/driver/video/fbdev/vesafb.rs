@@ -30,7 +30,7 @@ use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
     init::{boot::boot_callbacks, boot_params, initcall::INITCALL_DEVICE},
     libs::{
@@ -876,7 +876,7 @@ impl AttributeGroup for VesaFbAnonAttributeGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         Some(attr.mode())
     }
 }
@@ -889,8 +889,8 @@ impl Attribute for AnonAttrPhysAddr {
         "smem_start"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO
     }
 
     fn support(&self) -> SysFSOpsSupport {

@@ -10,7 +10,7 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         kernfs::{callback::KernInodePrivateData, KernFSInode},
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
 };
 
@@ -66,7 +66,7 @@ impl SysFS {
         // 在kernfs里面创建一个目录
         let dir: Arc<KernFSInode> = parent.add_dir(
             kobj.name(),
-            ModeType::from_bits_truncate(0o755),
+            InodeMode::from_bits_truncate(0o755),
             Some(KernInodePrivateData::SysFS(sysfs_dir_priv)),
             None,
         )?;

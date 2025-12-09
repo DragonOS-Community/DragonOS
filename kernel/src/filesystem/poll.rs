@@ -15,7 +15,7 @@ use crate::{
     time::{Duration, Instant, PosixTimeSpec},
 };
 
-use super::vfs::file::{File, FileMode};
+use super::vfs::file::{File, FileFlags};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -166,7 +166,7 @@ pub fn do_sys_poll(
     poll_fds: &mut [PollFd],
     timeout: Option<Instant>,
 ) -> Result<usize, SystemError> {
-    let ep_file = EventPoll::create_epoll_file(FileMode::empty())?;
+    let ep_file = EventPoll::create_epoll_file(FileFlags::empty())?;
 
     let ep_file = Arc::new(ep_file);
 

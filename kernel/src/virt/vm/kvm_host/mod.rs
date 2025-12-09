@@ -18,7 +18,7 @@ use crate::{
         vm::{kvm_host::vcpu::VirtCpuRequest, vmx::KvmVmx, x86_kvm_manager},
         CurrentKvmManager, KvmArch, VirtCpuArch,
     },
-    filesystem::vfs::file::{File, FileMode},
+    filesystem::vfs::file::{File, FileFlags},
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::ucontext::AddressSpace,
     process::ProcessManager,
@@ -173,7 +173,7 @@ impl Vm {
 
         let vcpu_inode = KvmVcpuDev::new(vcpu);
 
-        let file = File::new(vcpu_inode, FileMode::from_bits_truncate(0x777))?;
+        let file = File::new(vcpu_inode, FileFlags::from_bits_truncate(0x777))?;
 
         let fd = ProcessManager::current_pcb()
             .fd_table()

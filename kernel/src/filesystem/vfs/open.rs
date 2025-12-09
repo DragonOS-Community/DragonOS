@@ -3,30 +3,27 @@ use system_error::SystemError;
 
 use super::{
     fcntl::AtFlags,
-    file::{File, FileMode},
-    syscall::{ModeType, OpenHow, OpenHowResolve},
+    file::{File, FileFlags},
+    syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
     vcore::resolve_parent_inode,
-    FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
-};
-use crate::{
-    driver::base::block::SeekFrom, process::ProcessManager,
-    syscall::user_access::check_and_clone_cstr,
+    FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
     process::cred::GroupInfo,
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
+use crate::{process::ProcessManager, syscall::user_access::check_and_clone_cstr};
 use alloc::string::String;
 
 pub(super) fn do_faccessat(
     dirfd: i32,
     path: *const u8,
-    mode: ModeType,
+    mode: InodeMode,
     flags: u32,
 ) -> Result<usize, SystemError> {
-    if (mode.bits() & (!ModeType::S_IRWXO.bits())) != 0 {
+    if (mode.bits() & (!InodeMode::S_IRWXO.bits())) != 0 {
         return Err(SystemError::EINVAL);
     }
 
@@ -53,7 +50,7 @@ pub(super) fn do_faccessat(
     return Ok(0);
 }
 
-pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: ModeType) -> Result<usize, SystemError> {
+pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize, SystemError> {
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
@@ -64,9 +61,9 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: ModeType) -> Result<usize,
     let mut metadata = target_inode.metadata()?;
 
     // 只修改权限位，保留文件类型位
-    let old_file_type_bits = metadata.mode.bits() & ModeType::S_IFMT.bits();
-    let new_permission_bits = mode.bits() & !ModeType::S_IFMT.bits();
-    metadata.mode = ModeType::from_bits_truncate(old_file_type_bits | new_permission_bits);
+    let old_file_type_bits = metadata.mode.bits() & InodeMode::S_IFMT.bits();
+    let new_permission_bits = mode.bits() & !InodeMode::S_IFMT.bits();
+    metadata.mode = InodeMode::from_bits_truncate(old_file_type_bits | new_permission_bits);
 
     target_inode.set_metadata(&metadata)?;
 
@@ -136,7 +133,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         }
     }
 
-    meta.mode.remove(ModeType::S_ISUID | ModeType::S_ISGID);
+    meta.mode.remove(InodeMode::S_ISUID | InodeMode::S_ISGID);
     inode.set_metadata(&meta)?;
 
     return Ok(0);
@@ -158,8 +155,8 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
 pub fn do_sys_open(
     dfd: i32,
     path: &str,
-    o_flags: FileMode,
-    mode: ModeType,
+    o_flags: FileFlags,
+    mode: InodeMode,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
     let how = OpenHow::new(o_flags, mode, OpenHowResolve::empty());
@@ -183,8 +180,8 @@ fn do_sys_openat2(
         Ok(inode) => inode,
         Err(errno) => {
             // 文件不存在，且需要创建
-            if how.o_flags.contains(FileMode::O_CREAT)
-                && !how.o_flags.contains(FileMode::O_DIRECTORY)
+            if how.o_flags.contains(FileFlags::O_CREAT)
+                && !how.o_flags.contains(FileFlags::O_DIRECTORY)
                 && errno == SystemError::ENOENT
             {
                 let (filename, parent_path) = rsplit_path(&path);
@@ -195,7 +192,7 @@ fn do_sys_openat2(
                 let inode: Arc<dyn IndexNode> = parent_inode.create(
                     filename,
                     FileType::File,
-                    ModeType::from_bits_truncate(0o755),
+                    InodeMode::from_bits_truncate(0o755),
                 )?;
                 inode
             } else {
@@ -207,7 +204,7 @@ fn do_sys_openat2(
 
     let file_type: FileType = inode.metadata()?.file_type;
     // 如果要打开的是文件夹，而目标不是文件夹
-    if how.o_flags.contains(FileMode::O_DIRECTORY) && file_type != FileType::Dir {
+    if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
@@ -215,14 +212,9 @@ fn do_sys_openat2(
 
     let file: File = File::new(inode, how.o_flags)?;
 
-    // 打开模式为“追加”
-    if how.o_flags.contains(FileMode::O_APPEND) {
-        file.lseek(SeekFrom::SeekEnd(0))?;
-    }
-
     // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
-    if how.o_flags.contains(FileMode::O_TRUNC)
-        && (how.o_flags.contains(FileMode::O_RDWR) || how.o_flags.contains(FileMode::O_WRONLY))
+    if how.o_flags.contains(FileFlags::O_TRUNC)
+        && (how.o_flags.contains(FileFlags::O_RDWR) || how.o_flags.contains(FileFlags::O_WRONLY))
         && file_type == FileType::File
     {
         file.ftruncate(0)?;

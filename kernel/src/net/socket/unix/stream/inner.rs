@@ -184,7 +184,7 @@ impl Connected {
             return Err(SystemError::ENOBUFS);
         }
 
-        Ok(buffer.len())
+        Ok(buf.len())
     }
 
     pub fn try_recv(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {

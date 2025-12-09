@@ -4,6 +4,7 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PREAD64;
+use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -35,7 +36,15 @@ impl Syscall for SysPread64Handle {
         let len = Self::len(args);
         let offset = Self::offset(args);
 
-        let mut user_buffer_writer = UserBufferWriter::new(buf_vaddr, len, frame.is_from_user())?;
+        // 检查offset + len是否溢出 同时检查offset是否为负数
+
+        let end_pos = offset.checked_add(len).ok_or(SystemError::EINVAL)?;
+        if offset > i64::MAX as usize || end_pos > i64::MAX as usize {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut user_buffer_writer =
+            UserBufferWriter::new_checked(buf_vaddr, len, frame.is_from_user())?;
         let user_buf = user_buffer_writer.buffer(0)?;
 
         let binding = ProcessManager::current_pcb().fd_table();
@@ -47,6 +56,15 @@ impl Syscall for SysPread64Handle {
 
         // Drop guard to avoid scheduling issues
         drop(fd_table_guard);
+
+        // 检查是否是管道/Socket (ESPIPE)
+        let md = file.metadata()?;
+        if md.file_type == FileType::Pipe
+            || md.file_type == FileType::Socket
+            || md.file_type == FileType::CharDevice
+        {
+            return Err(SystemError::ESPIPE);
+        }
 
         return file.pread(offset, len, user_buf);
     }

@@ -19,7 +19,7 @@ use crate::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
         },
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
@@ -278,7 +278,7 @@ impl AttributeGroup for RtcAttrGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/rtc/sysfs.c#280
 
         return Some(attr.mode());
@@ -293,7 +293,7 @@ impl Attribute for AttrName {
         "name"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -322,7 +322,7 @@ impl Attribute for AttrDate {
         "date"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -346,7 +346,7 @@ impl Attribute for AttrTime {
         "time"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -369,7 +369,7 @@ impl Attribute for AttrHcToSys {
         "hctosys"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 

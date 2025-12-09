@@ -4,7 +4,9 @@ use alloc::vec::Vec;
 use core::ffi::c_int;
 
 use crate::arch::interrupt::TrapFrame;
+use crate::process::cred::CAPFlags;
 use crate::process::pid::Pid;
+use crate::process::ProcessControlBlock;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
@@ -14,7 +16,7 @@ use crate::{
 use log::warn;
 use system_error::SystemError;
 
-use crate::ipc::kill::{kill_all, kill_process, kill_process_group};
+use crate::ipc::kill::{send_signal_to_all, send_signal_to_pgid, send_signal_to_pid};
 
 /// ### pid转换器，将输入的id转换成对应的pid或pgid
 /// - 如果id < -1，则为pgid
@@ -76,23 +78,33 @@ impl PidConverter {
 /// Check if the current process has permission to send a signal to the target process.
 ///
 /// # Arguments
-/// * `target_pid` - The PID of the target process
+/// * `target` - The target PCB
+/// * `sig` - The signal to be sent (optional, for SIGCONT special handling)
 ///
 /// # Returns
 /// * `Ok(())` - Permission check passed
-/// * `Err(SystemError::ESRCH)` - Target process does not exist
 /// * `Err(SystemError::EPERM)` - Permission denied
 ///
 /// # POSIX Requirements
 /// The permission check follows POSIX requirements:
+/// - CAP_KILL capability can signal any process
 /// - Root (euid == 0) can signal any process
 /// - Sender's real or effective UID must match target's real or saved set-user-ID
-fn check_signal_permission(target_pid: RawPid) -> Result<(), SystemError> {
-    let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
-
+/// - SIGCONT can be sent to any process in the same session
+///
+/// 参考: https://man7.org/linux/man-pages/man2/kill.2.html
+pub fn check_signal_permission_pcb_with_sig(
+    target: &Arc<ProcessControlBlock>,
+    sig: Option<Signal>,
+) -> Result<(), SystemError> {
     let current_pcb = ProcessManager::current_pcb();
     let current_cred = current_pcb.cred();
     let target_cred = target.cred();
+
+    // CAP_KILL allows sending signal to any process
+    if current_cred.has_capability(CAPFlags::CAP_KILL) {
+        return Ok(());
+    }
 
     // Root can signal any process
     if current_cred.euid.data() == 0 {
@@ -108,7 +120,34 @@ fn check_signal_permission(target_pid: RawPid) -> Result<(), SystemError> {
         return Ok(());
     }
 
+    // SIGCONT can be sent to any process in the same session
+    // 参考: https://man7.org/linux/man-pages/man2/kill.2.html
+    if let Some(signal) = sig {
+        if signal == Signal::SIGCONT {
+            // 检查是否在同一会话中
+            let current_session = current_pcb.task_session();
+            let target_session = target.task_session();
+            if let (Some(cs), Some(ts)) = (current_session, target_session) {
+                if Arc::ptr_eq(&cs, &ts) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     Err(SystemError::EPERM)
+}
+
+/// Check if the current process has permission to send a signal to the target process.
+/// (不带信号参数的兼容版本)
+pub fn check_signal_permission_pcb(target: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+    check_signal_permission_pcb_with_sig(target, None)
+}
+
+/// Check if the current process has permission to send a signal to the target process.
+fn check_signal_permission(target_pid: RawPid) -> Result<(), SystemError> {
+    let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
+    check_signal_permission_pcb(&target)
 }
 
 /// Handle signal 0 (null signal) which is used to check process existence and permissions.
@@ -183,9 +222,9 @@ impl Syscall for SysKillHandle {
         }
 
         match converter {
-            PidConverter::Pid(pid) => kill_process(pid.pid_vnr(), sig),
-            PidConverter::Pgid(pgid) => kill_process_group(&pgid.ok_or(SystemError::ESRCH)?, sig),
-            PidConverter::All => kill_all(sig),
+            PidConverter::Pid(pid) => send_signal_to_pid(pid.pid_vnr(), sig),
+            PidConverter::Pgid(pgid) => send_signal_to_pgid(&pgid.ok_or(SystemError::ESRCH)?, sig),
+            PidConverter::All => send_signal_to_all(sig),
         }
     }
 

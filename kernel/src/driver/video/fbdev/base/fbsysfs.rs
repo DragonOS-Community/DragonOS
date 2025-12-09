@@ -6,7 +6,7 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
 };
 
@@ -40,7 +40,7 @@ impl AttributeGroup for FbDeviceAttrGroup {
         &self,
         _kobj: alloc::sync::Arc<dyn KObject>,
         _attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         None
     }
 }
@@ -53,8 +53,8 @@ impl Attribute for AttrName {
         "name"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -77,8 +77,8 @@ impl Attribute for AttrBitsPerPixel {
         "bits_per_pixel"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO | ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO | InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -107,8 +107,8 @@ impl Attribute for AttrBlank {
         "blank"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -130,8 +130,8 @@ impl Attribute for AttrMode {
         "mode"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO | ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO | InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -157,8 +157,8 @@ impl Attribute for AttrModes {
         "modes"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO | ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO | InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -184,8 +184,8 @@ impl Attribute for AttrPan {
         "pan"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO | ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO | InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -213,8 +213,8 @@ impl Attribute for AttrVirtualSize {
         "virtual_size"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO | ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO | InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -245,8 +245,8 @@ impl Attribute for AttrStride {
         "stride"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -269,8 +269,8 @@ impl Attribute for AttrRotate {
         "rotate"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO | ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO | InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -299,8 +299,8 @@ impl Attribute for AttrState {
         "state"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO | ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO | InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {

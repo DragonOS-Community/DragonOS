@@ -2,10 +2,10 @@ use crate::alloc::string::ToString;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PIDFD_OPEN;
 use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::FileType;
+use crate::filesystem::vfs::InodeMode;
 use crate::process::pid::PidPrivateData;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -37,12 +37,12 @@ impl Syscall for SysPidFdOpen {
         let pid = Self::pid(args);
         let flags = Self::flags(args);
 
-        let mode = ModeType::from_bits(flags).ok_or_else(|| {
+        let mode = InodeMode::from_bits(flags).ok_or_else(|| {
             log::error!("SysPidFdOpen: failed to get mode!");
             SystemError::EINVAL
         })?;
         let file_type = FileType::from(mode);
-        let file_mode = FileMode::from_bits(flags).ok_or_else(|| {
+        let file_mode = FileFlags::from_bits(flags).ok_or_else(|| {
             log::error!("SysPidFdOpen: failed to get file_mode!");
             SystemError::EINVAL
         })?;

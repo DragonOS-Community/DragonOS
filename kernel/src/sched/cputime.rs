@@ -3,7 +3,7 @@ use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
 use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch},
     exception::InterruptArch,
-    ipc::kill::kill_process_by_pcb,
+    ipc::kill::send_signal_to_pcb,
     process::ProcessControlBlock,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     time::jiffies::TICK_NESC,
@@ -102,7 +102,7 @@ impl CpuTimeFunc {
         // 处理 ITIMER_VIRTUAL (仅在用户态tick时消耗时间)
         if user_tick && itimers.virt.is_active {
             if itimers.virt.value <= accounted_cputime {
-                kill_process_by_pcb(pcb.clone(), Signal::SIGVTALRM).ok();
+                send_signal_to_pcb(pcb.clone(), Signal::SIGVTALRM).ok();
                 if itimers.virt.interval > 0 {
                     // 周期性定时器：在旧的剩余时间上增加间隔时间
                     itimers.virt.value += itimers.virt.interval;
@@ -119,7 +119,7 @@ impl CpuTimeFunc {
         // 处理 ITIMER_PROF (在用户态和内核态tick时都消耗时间)
         if itimers.prof.is_active {
             if itimers.prof.value <= accounted_cputime {
-                kill_process_by_pcb(pcb.clone(), Signal::SIGPROF).ok();
+                send_signal_to_pcb(pcb.clone(), Signal::SIGPROF).ok();
                 if itimers.prof.interval > 0 {
                     itimers.prof.value += itimers.prof.interval;
                 } else {

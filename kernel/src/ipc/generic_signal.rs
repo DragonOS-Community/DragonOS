@@ -449,7 +449,7 @@ fn sig_stop(sig: Signal) {
     // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
     let pcb = ProcessManager::current_pcb();
     if let Some(parent) = pcb.parent_pcb() {
-        let _ = crate::ipc::kill::kill_process_by_pcb(parent.clone(), Signal::SIGCHLD);
+        let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
         parent.wake_all_waiters();
     }
     // 唤醒等待在该子进程等待队列上的等待者

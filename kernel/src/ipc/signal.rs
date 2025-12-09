@@ -317,7 +317,7 @@ impl Signal {
             pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
             let _ = ProcessManager::stop_task(&pcb);
             if let Some(parent) = pcb.parent_pcb() {
-                let _ = crate::ipc::kill::kill_process_by_pcb(parent.clone(), Signal::SIGCHLD);
+                let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
                 parent.wake_all_waiters();
             }
             pcb.wake_all_waiters();
@@ -346,7 +346,7 @@ impl Signal {
                 pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                 pcb.sighand().flags_remove(SignalFlags::STOP_STOPPED);
                 if let Some(parent) = pcb.parent_pcb() {
-                    let _ = crate::ipc::kill::kill_process_by_pcb(parent.clone(), Signal::SIGCHLD);
+                    let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
                     parent.wake_all_waiters();
                 }
                 // 唤醒等待在该子进程上的等待者

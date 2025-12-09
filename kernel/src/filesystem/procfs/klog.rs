@@ -2,57 +2,7 @@ use core::fmt::{Display, Formatter, Result};
 
 use alloc::string::String;
 
-use crate::time::PosixTimeSpec;
-
-// /// 日志类型
-// #[derive(Default, Clone, Debug)]
-// pub enum LogType {
-//     /// 启动信息
-//     Startup,
-//     /// 驱动信息
-//     Driver,
-//     /// 系统信息
-//     System,
-//     /// 硬件信息
-//     Hardware,
-//     /// 内核模块信息
-//     KernelModule,
-//     /// 内核调试信息
-//     KernelDebug,
-//     #[default]
-//     Default,
-// }
-
-/// 日志级别
-#[derive(Default, Clone, PartialEq, Debug)]
-pub enum LogLevel {
-    EMERG = 0,
-    ALERT = 1,
-    CRIT = 2,
-    ERR = 3,
-    WARN = 4,
-    NOTICE = 5,
-    INFO = 6,
-    DEBUG = 7,
-    #[default]
-    DEFAULT = 8,
-}
-
-impl From<usize> for LogLevel {
-    fn from(value: usize) -> Self {
-        match value {
-            0 => LogLevel::EMERG,
-            1 => LogLevel::ALERT,
-            2 => LogLevel::CRIT,
-            3 => LogLevel::ERR,
-            4 => LogLevel::WARN,
-            5 => LogLevel::NOTICE,
-            6 => LogLevel::INFO,
-            7 => LogLevel::DEBUG,
-            _ => LogLevel::DEFAULT,
-        }
-    }
-}
+use crate::{debug::klog::loglevel::LogLevel, time::PosixTimeSpec};
 
 /// 日志消息
 #[derive(Default, Clone, Debug)]

@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        file::{File, FileMode},
+        file::{File, FileFlags},
         utils::user_path_at,
         FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
@@ -31,7 +31,7 @@ pub fn do_readlink_at(
 
     let ubuf = user_buf.buffer::<u8>(0).unwrap();
 
-    let file = File::new(inode, FileMode::O_RDONLY)?;
+    let file = File::new(inode, FileFlags::O_RDONLY)?;
 
     let len = file.read(buf_size, ubuf)?;
 

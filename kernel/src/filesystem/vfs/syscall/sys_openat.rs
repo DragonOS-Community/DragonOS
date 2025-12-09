@@ -4,9 +4,9 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_OPENAT;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::open::do_sys_open;
-use crate::filesystem::vfs::ModeType;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -49,8 +49,8 @@ impl Syscall for SysOpenatHandle {
         let path = check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
-        let open_flags = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-        let mode_type = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
+        let open_flags = FileFlags::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+        let mode_type = InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(dirfd, &path, open_flags, mode_type, true);
     }
 

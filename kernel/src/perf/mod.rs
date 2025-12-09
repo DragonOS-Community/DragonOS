@@ -8,8 +8,8 @@ use crate::bpf::prog::BpfProg;
 use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
-use crate::filesystem::vfs::file::{File, FileMode};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
 };
@@ -198,7 +198,7 @@ impl IndexNode for PerfEventInode {
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
         self.event.mmap(start, len, offset)
     }
-    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _mode: &FileMode) -> Result<()> {
+    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
         Ok(())
     }
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<()> {
@@ -226,7 +226,7 @@ impl IndexNode for PerfEventInode {
 
     fn metadata(&self) -> Result<Metadata> {
         let meta = Metadata {
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             file_type: FileType::File,
             ..Default::default()
         };
@@ -382,9 +382,9 @@ pub fn perf_event_open(
         .flags
         .contains(PerfEventOpenFlags::PERF_FLAG_FD_CLOEXEC)
     {
-        FileMode::O_RDWR | FileMode::O_CLOEXEC
+        FileFlags::O_RDWR | FileFlags::O_CLOEXEC
     } else {
-        FileMode::O_RDWR
+        FileFlags::O_RDWR
     };
 
     let event: Box<dyn PerfEventOps> = match args.type_ {

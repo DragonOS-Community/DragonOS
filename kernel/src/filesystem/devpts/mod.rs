@@ -13,8 +13,7 @@ use crate::{
     },
     filesystem::vfs::{
         mount::{do_mount_mkdir, MountFlags},
-        syscall::ModeType,
-        FileType,
+        FileType, InodeMode,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
@@ -31,7 +30,10 @@ use system_error::SystemError;
 
 use super::{
     devfs::DeviceINode,
-    vfs::{vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata},
+    vfs::{
+        vcore::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, InodeFlags,
+        Metadata,
+    },
 };
 
 const DEV_PTYFS_MAX_NAMELEN: usize = 16;
@@ -117,7 +119,8 @@ impl LockedDevPtsFSInode {
                     ctime: PosixTimeSpec::default(),
                     btime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
-                    mode: ModeType::from_bits_truncate(0o777),
+                    mode: InodeMode::S_IRWXUGO,
+                    flags: InodeFlags::empty(),
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
@@ -155,7 +158,7 @@ impl IndexNode for LockedDevPtsFSInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &super::vfs::file::FileMode,
+        _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -226,7 +229,7 @@ impl IndexNode for LockedDevPtsFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        _mode: super::vfs::syscall::ModeType,
+        _mode: super::vfs::InodeMode,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if file_type != FileType::CharDevice {
@@ -249,7 +252,7 @@ impl IndexNode for LockedDevPtsFSInode {
 
         let mut metadata = result.metadata()?;
 
-        metadata.mode.insert(ModeType::S_IFCHR);
+        metadata.mode.insert(InodeMode::S_IFCHR);
         metadata.raw_dev =
             DeviceNumber::new(Major::UNIX98_PTY_SLAVE_MAJOR, name.parse::<u32>().unwrap());
 

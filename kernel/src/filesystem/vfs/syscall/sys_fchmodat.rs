@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_FCHMODAT;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{open::do_fchmodat, syscall::ModeType},
+    filesystem::vfs::{open::do_fchmodat, InodeMode},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::vec::Vec;
@@ -23,7 +23,7 @@ impl Syscall for SysFchmodatHandle {
         return do_fchmodat(
             dirfd,
             pathname,
-            ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?,
+            InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?,
         );
     }
 

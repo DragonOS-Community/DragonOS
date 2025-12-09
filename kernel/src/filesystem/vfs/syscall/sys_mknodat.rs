@@ -1,4 +1,4 @@
-use super::ModeType;
+use super::InodeMode;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_MKNODAT;
 use crate::driver::base::device::device_number::DeviceNumber;
@@ -34,10 +34,10 @@ impl Syscall for SysMknodatHandle {
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
 
-        let mode: ModeType = if mode_val == 0 {
-            ModeType::S_IFREG
+        let mode: InodeMode = if mode_val == 0 {
+            InodeMode::S_IFREG
         } else {
-            ModeType::from_bits(mode_val).ok_or(SystemError::EINVAL)?
+            InodeMode::from_bits(mode_val).ok_or(SystemError::EINVAL)?
         };
         let pcb = ProcessManager::current_pcb();
         let (mut current_inode, ret_path) = user_path_at(&pcb, dirfd, &path)?;

@@ -1,7 +1,7 @@
 use super::vfs::PollableInode;
 use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
-use crate::filesystem::vfs::file::{File, FileMode};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
     vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
@@ -120,7 +120,7 @@ impl IndexNode for EventFdInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -248,7 +248,7 @@ impl IndexNode for EventFdInode {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let meta = Metadata {
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             file_type: FileType::File,
             ..Default::default()
         };
@@ -301,9 +301,9 @@ impl Syscall {
         let eventfd = EventFd::new(init_val as u64, flags, id);
         let inode = Arc::new(EventFdInode::new(eventfd));
         let filemode = if flags.contains(EventFdFlags::EFD_CLOEXEC) {
-            FileMode::O_RDWR | FileMode::O_CLOEXEC
+            FileFlags::O_RDWR | FileFlags::O_CLOEXEC
         } else {
-            FileMode::O_RDWR
+            FileFlags::O_RDWR
         };
         let file = File::new(inode, filemode)?;
         let binding = ProcessManager::current_pcb().fd_table();

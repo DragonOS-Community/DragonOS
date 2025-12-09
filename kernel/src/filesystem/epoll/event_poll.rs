@@ -5,7 +5,7 @@ use core::{
 
 use crate::{
     filesystem::vfs::{
-        file::{File, FileMode},
+        file::{File, FileFlags},
         FilePrivateData,
     },
     libs::{
@@ -88,7 +88,7 @@ impl EventPoll {
     ///
     /// ### 返回值
     /// - 成功则返回Ok(fd)，否则返回Err
-    pub fn create_epoll(flags: FileMode) -> Result<usize, SystemError> {
+    pub fn create_epoll(flags: FileFlags) -> Result<usize, SystemError> {
         let ep_file = Self::create_epoll_file(flags)?;
 
         let current_pcb = ProcessManager::current_pcb();
@@ -101,8 +101,8 @@ impl EventPoll {
     }
 
     /// ## 创建epoll文件
-    pub fn create_epoll_file(flags: FileMode) -> Result<File, SystemError> {
-        if !flags.difference(FileMode::O_CLOEXEC).is_empty() {
+    pub fn create_epoll_file(flags: FileFlags) -> Result<File, SystemError> {
+        if !flags.difference(FileFlags::O_CLOEXEC).is_empty() {
             return Err(SystemError::EINVAL);
         }
 
@@ -114,7 +114,7 @@ impl EventPoll {
 
         let mut ep_file = File::new(
             epoll_inode,
-            FileMode::O_RDWR | (flags & FileMode::O_CLOEXEC),
+            FileFlags::O_RDWR | (flags & FileFlags::O_CLOEXEC),
         )?;
 
         // 设置ep_file的FilePrivateData

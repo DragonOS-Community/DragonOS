@@ -17,7 +17,7 @@ use crate::{
     driver::block::loop_device::LoopDevice,
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
-        vfs::{syscall::ModeType, utils::DName, IndexNode, Metadata},
+        vfs::{utils::DName, IndexNode, InodeMode, Metadata},
     },
     libs::{rwlock::RwLock, spinlock::SpinLockGuard},
 };
@@ -75,7 +75,7 @@ impl GenDisk {
             fs: RwLock::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
-                ModeType::from_bits_truncate(0o755),
+                InodeMode::from_bits_truncate(0o755),
             ),
             name: dev_name,
         });
@@ -294,7 +294,7 @@ impl IndexNode for GenDisk {
     fn open(
         &self,
         _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &crate::filesystem::vfs::file::FileMode,
+        _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

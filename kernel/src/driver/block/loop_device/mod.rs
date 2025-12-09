@@ -1,3 +1,4 @@
+use bitflags::bitflags;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::{
     driver::base::{
@@ -80,8 +81,14 @@ pub enum LoopControlIoctl {
     GetFree = 0x4C82,
 }
 
-pub const LO_FLAGS_READ_ONLY: u32 = 1 << 0;
-pub const SUPPORTED_LOOP_FLAGS: u32 = LO_FLAGS_READ_ONLY;
+bitflags! {
+    /// Loop 设备标志位
+    #[derive(Default)]
+    pub struct LoopFlags: u32 {
+        /// 只读模式
+        const READ_ONLY = 1 << 0;
+    }
+}
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -152,7 +159,7 @@ pub struct LoopDeviceInner {
     pub file_size: usize,
     pub offset: usize,
     pub size_limit: usize,
-    pub flags: u32,
+    pub flags: LoopFlags,
     pub kobject_common: KObjectCommonData,
     pub device_common: DeviceCommonData,
 }
@@ -161,18 +168,19 @@ impl LoopDeviceInner {
     ///
     /// 注意：调用者必须持有 LoopDeviceInner 的锁
     fn set_state(&mut self, new_state: LoopState) -> Result<(), SystemError> {
-        match (&self.state, &new_state) {
-            (LoopState::Unbound, LoopState::Bound) => {}
-            (LoopState::Bound, LoopState::Unbound) => {}
-            (LoopState::Bound, LoopState::Rundown) => {}
-            (LoopState::Rundown, LoopState::Draining) => {}
-            (LoopState::Rundown, LoopState::Deleting) => {}
-            (LoopState::Rundown, LoopState::Unbound) => {}
-            (LoopState::Draining, LoopState::Deleting) => {}
-            (LoopState::Unbound, LoopState::Deleting) => {}
-            _ => return Err(SystemError::EINVAL),
+        const VALID_TRANSITIONS: &[(LoopState, LoopState)] = &[
+            (LoopState::Unbound, LoopState::Bound),
+            (LoopState::Bound, LoopState::Unbound),
+            (LoopState::Bound, LoopState::Rundown),
+            (LoopState::Rundown, LoopState::Draining),
+            (LoopState::Rundown, LoopState::Deleting),
+            (LoopState::Rundown, LoopState::Unbound),
+            (LoopState::Draining, LoopState::Deleting),
+            (LoopState::Unbound, LoopState::Deleting),
+        ];
+        if !VALID_TRANSITIONS.contains(&(self.state, new_state)) {
+            return Err(SystemError::EINVAL);
         }
-
         self.state = new_state;
         Ok(())
     }
@@ -180,7 +188,7 @@ impl LoopDeviceInner {
     /// 检查设备是否只读
     #[inline]
     fn is_read_only(&self) -> bool {
-        (self.flags & LO_FLAGS_READ_ONLY) != 0
+        self.flags.contains(LoopFlags::READ_ONLY)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,7 +239,7 @@ impl LoopDevice {
                 device_number: DeviceNumber::new(Major::LOOP_MAJOR, minor),
                 offset: 0,
                 size_limit: 0,
-                flags: 0,
+                flags: LoopFlags::empty(),
                 kobject_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
                 state: LoopState::Unbound,
@@ -273,7 +281,7 @@ impl LoopDevice {
         inner.file_size = file_size;
         inner.offset = 0;
         inner.size_limit = 0;
-        inner.flags = 0;
+        inner.flags = LoopFlags::empty();
         drop(inner);
         self.recalc_effective_size()?;
         Ok(())
@@ -334,7 +342,7 @@ impl LoopDevice {
 
         let mut inner = self.inner();
         inner.set_state(LoopState::Bound)?;
-        inner.flags = if read_only { LO_FLAGS_READ_ONLY } else { 0 };
+        inner.flags = if read_only { LoopFlags::READ_ONLY } else { LoopFlags::empty() };
         inner.size_limit = 0;
         drop(inner);
         self.recalc_effective_size()?;
@@ -367,7 +375,7 @@ impl LoopDevice {
         inner.file_size = 0;
         inner.offset = 0;
         inner.size_limit = 0;
-        inner.flags = 0;
+        inner.flags = LoopFlags::empty();
         Ok(())
     }
     fn validate_loop_status64_params(info: &LoopStatus64) -> Result<(), SystemError> {
@@ -380,7 +388,7 @@ impl LoopDevice {
         if info.lo_sizelimit != 0 && !info.lo_sizelimit.is_multiple_of(LBA_SIZE as u64) {
             return Err(SystemError::EINVAL);
         }
-        if info.lo_flags & !SUPPORTED_LOOP_FLAGS != 0 {
+        if !LoopFlags::from_bits(info.lo_flags).is_some() {
             return Err(SystemError::EINVAL);
         }
         Ok(())
@@ -425,7 +433,7 @@ impl LoopDevice {
             let old = (inner.offset, inner.size_limit, inner.flags);
             inner.offset = new_offset;
             inner.size_limit = new_limit;
-            inner.flags = info.lo_flags;
+            inner.flags = LoopFlags::from_bits_truncate(info.lo_flags);
             old
         };
 
@@ -467,7 +475,7 @@ impl LoopDevice {
             LoopStatus64 {
                 lo_offset: inner.offset as u64,
                 lo_sizelimit: inner.size_limit as u64,
-                lo_flags: inner.flags,
+                lo_flags: inner.flags.bits(),
                 __pad: 0,
             }
         };
@@ -516,7 +524,7 @@ impl LoopDevice {
 
         let mut inner = self.inner();
         inner.file_inode = Some(inode);
-        inner.flags = if read_only { LO_FLAGS_READ_ONLY } else { 0 };
+        inner.flags = if read_only { LoopFlags::READ_ONLY } else { LoopFlags::empty() };
         drop(inner);
         self.recalc_effective_size()?;
         Ok(())

@@ -25,6 +25,10 @@ jobs:
       - name: Checkout DragonOS code
         uses: actions/checkout@v4
 
+      - name: Change source
+        run: |
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+
       - name: Build DragonOS
         shell: bash -ileo pipefail {0}
         run: |

@@ -1,3 +1,4 @@
+use crate::init::initcall::INITCALL_DEVICE;
 use crate::{
     driver::base::{
         block::{
@@ -50,9 +51,11 @@ use log::{error, info, warn};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
+
 const LOOP_BASENAME: &str = "loop";
 const LOOP_CONTROL_BASENAME: &str = "loop-control";
 pub const LOOP_CONTROL_MINOR: u32 = 237;
+
 #[repr(u32)]
 #[derive(Debug, FromPrimitive)]
 pub enum LoopIoctl {
@@ -64,10 +67,11 @@ pub enum LoopIoctl {
     LoopGetStatus64 = 0x4C05,
     LoopChangeFd = 0x4C06,
     LoopSetCapacity = 0x4C07,
-    LoopSetDirectIo = 0x4c08,
-    LoopSetBlockSize = 0x4c09,
-    LoopConfigure = 0x4c0a,
+    LoopSetDirectIo = 0x4C08,
+    LoopSetBlockSize = 0x4C09,
+    LoopConfigure = 0x4C0A,
 }
+
 #[repr(u32)]
 #[derive(Debug, FromPrimitive)]
 pub enum LoopControlIoctl {
@@ -75,8 +79,10 @@ pub enum LoopControlIoctl {
     Remove = 0x4C81,
     GetFree = 0x4C82,
 }
+
 pub const LO_FLAGS_READ_ONLY: u32 = 1 << 0;
 pub const SUPPORTED_LOOP_FLAGS: u32 = LO_FLAGS_READ_ONLY;
+
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct LoopStatus64 {
@@ -85,6 +91,7 @@ pub struct LoopStatus64 {
     pub lo_flags: u32,
     pub __pad: u32,
 }
+
 #[derive(Debug)]
 pub struct LoopDeviceKObjType;
 
@@ -133,25 +140,27 @@ pub struct LoopDevice {
     /// 活跃的 I/O 操作计数
     active_io_count: AtomicU32,
 }
-#[derive(Debug, Clone)]
-pub struct LoopPrivateData {}
+
+/// Loop 设备的私有数据（目前未使用）
+#[derive(Debug, Clone, Default)]
+pub struct LoopPrivateData;
+
 pub struct LoopDeviceInner {
     pub device_number: DeviceNumber,
     state: LoopState,
-    state_lock: SpinLock<()>,
     pub file_inode: Option<Arc<dyn IndexNode>>,
     pub file_size: usize,
     pub offset: usize,
     pub size_limit: usize,
     pub flags: u32,
-    pub read_only: bool,
     pub kobject_common: KObjectCommonData,
     pub device_common: DeviceCommonData,
 }
 impl LoopDeviceInner {
+    /// 检查状态转换是否有效并执行转换
+    ///
+    /// 注意：调用者必须持有 LoopDeviceInner 的锁
     fn set_state(&mut self, new_state: LoopState) -> Result<(), SystemError> {
-        let _guard = self.state_lock.lock();
-
         match (&self.state, &new_state) {
             (LoopState::Unbound, LoopState::Bound) => {}
             (LoopState::Bound, LoopState::Unbound) => {}
@@ -166,6 +175,12 @@ impl LoopDeviceInner {
 
         self.state = new_state;
         Ok(())
+    }
+
+    /// 检查设备是否只读
+    #[inline]
+    fn is_read_only(&self) -> bool {
+        (self.flags & LO_FLAGS_READ_ONLY) != 0
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,19 +226,17 @@ impl LoopDevice {
             id,
             minor,
             inner: SpinLock::new(LoopDeviceInner {
-                file_inode: None, // 默认的虚拟 inode
+                file_inode: None,
                 file_size: 0,
-                device_number: DeviceNumber::new(Major::LOOP_MAJOR, minor), // Loop 设备主设备号为 7
+                device_number: DeviceNumber::new(Major::LOOP_MAJOR, minor),
                 offset: 0,
                 size_limit: 0,
                 flags: 0,
-                read_only: false,
                 kobject_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
                 state: LoopState::Unbound,
-                state_lock: SpinLock::new(()),
             }),
-            block_dev_meta: BlockDevMeta::new(devname, Major::LOOP_MAJOR), // Loop 设备主设备号为 7
+            block_dev_meta: BlockDevMeta::new(devname, Major::LOOP_MAJOR),
             locked_kobj_state: LockedKObjectState::default(),
             self_ref: self_ref.clone(),
             fs: RwLock::new(Weak::default()),
@@ -260,10 +273,9 @@ impl LoopDevice {
         inner.file_size = file_size;
         inner.offset = 0;
         inner.size_limit = 0;
-        inner.flags = 0; // Reset flags
-        inner.read_only = false; // Reset read_only
+        inner.flags = 0;
         drop(inner);
-        self.recalc_effective_size()?; // Recalculate size based on new file
+        self.recalc_effective_size()?;
         Ok(())
     }
     fn recalc_effective_size(&self) -> Result<(), SystemError> {
@@ -322,7 +334,6 @@ impl LoopDevice {
 
         let mut inner = self.inner();
         inner.set_state(LoopState::Bound)?;
-        inner.read_only = read_only;
         inner.flags = if read_only { LO_FLAGS_READ_ONLY } else { 0 };
         inner.size_limit = 0;
         drop(inner);
@@ -356,7 +367,6 @@ impl LoopDevice {
         inner.file_size = 0;
         inner.offset = 0;
         inner.size_limit = 0;
-        inner.read_only = false;
         inner.flags = 0;
         Ok(())
     }
@@ -398,39 +408,33 @@ impl LoopDevice {
         let mut info = LoopStatus64::default();
         reader.copy_one_from_user(&mut info, 0)?;
         Self::validate_loop_status64_params(&info)?;
+
         let new_offset = info.lo_offset as usize;
         let new_limit = if info.lo_sizelimit == 0 {
             0
         } else {
             info.lo_sizelimit as usize
         };
-        let new_read_only = (info.lo_flags & LO_FLAGS_READ_ONLY) != 0;
 
-        let (old_offset, old_limit, old_flags, old_ro) = {
-            let inner = self.inner();
-            if !matches!(inner.state, LoopState::Bound | LoopState::Rundown) {
-                return Err(SystemError::ENXIO);
-            }
-            (inner.offset, inner.size_limit, inner.flags, inner.read_only)
-        };
-
-        {
+        // 保存旧值用于回滚，并在同一个锁作用域内更新
+        let old_values = {
             let mut inner = self.inner();
             if !matches!(inner.state, LoopState::Bound | LoopState::Rundown) {
                 return Err(SystemError::ENXIO);
             }
+            let old = (inner.offset, inner.size_limit, inner.flags);
             inner.offset = new_offset;
             inner.size_limit = new_limit;
             inner.flags = info.lo_flags;
-            inner.read_only = new_read_only;
-        }
+            old
+        };
 
         if let Err(err) = self.recalc_effective_size() {
+            // 回滚
             let mut inner = self.inner();
-            inner.offset = old_offset;
-            inner.size_limit = old_limit;
-            inner.flags = old_flags;
-            inner.read_only = old_ro;
+            inner.offset = old_values.0;
+            inner.size_limit = old_values.1;
+            inner.flags = old_values.2;
             drop(inner);
             let _ = self.recalc_effective_size();
             return Err(err);
@@ -463,11 +467,7 @@ impl LoopDevice {
             LoopStatus64 {
                 lo_offset: inner.offset as u64,
                 lo_sizelimit: inner.size_limit as u64,
-                lo_flags: if inner.read_only {
-                    inner.flags | LO_FLAGS_READ_ONLY
-                } else {
-                    inner.flags & !LO_FLAGS_READ_ONLY
-                },
+                lo_flags: inner.flags,
                 __pad: 0,
             }
         };
@@ -513,9 +513,9 @@ impl LoopDevice {
             FileType::File | FileType::BlockDevice => {}
             _ => return Err(SystemError::EINVAL),
         }
+
         let mut inner = self.inner();
         inner.file_inode = Some(inode);
-        inner.read_only = read_only;
         inner.flags = if read_only { LO_FLAGS_READ_ONLY } else { 0 };
         drop(inner);
         self.recalc_effective_size()?;
@@ -541,7 +541,6 @@ impl LoopDevice {
         ) {
             return Err(SystemError::ENODEV);
         }
-
         self.active_io_count.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -551,12 +550,7 @@ impl LoopDevice {
     /// I/O 操作完成时调用，减少活跃 I/O 计数
     fn io_end(&self) {
         let prev = self.active_io_count.fetch_sub(1, Ordering::AcqRel);
-        if prev == 0 {
-            warn!(
-                "Loop device loop{}: I/O count underflow",
-                self.inner().device_number.minor()
-            );
-        }
+        debug_assert!(prev > 0, "Loop device I/O count underflow");
     }
 
     /// # 功能
@@ -1024,19 +1018,18 @@ impl BlockDevice for LoopDevice {
             return Err(SystemError::EINVAL);
         }
 
-        let (file_inode, base_offset, limit_end, read_only) = {
+        let (file_inode, base_offset, limit_end) = {
             let inner = self.inner();
+            if inner.is_read_only() {
+                return Err(SystemError::EROFS);
+            }
             let inode = inner.file_inode.clone().ok_or(SystemError::ENODEV)?;
             let limit = inner
                 .offset
                 .checked_add(inner.file_size)
                 .ok_or(SystemError::EOVERFLOW)?;
-            (inode, inner.offset, limit, inner.read_only)
+            (inode, inner.offset, limit)
         };
-
-        if read_only {
-            return Err(SystemError::EROFS);
-        }
 
         let block_offset = lba_id_start
             .checked_mul(LBA_SIZE)
@@ -1122,7 +1115,7 @@ impl LoopDeviceDriver {
         self.inner.lock()
     }
 }
-use crate::init::initcall::INITCALL_DEVICE;
+
 #[unified_init(INITCALL_DEVICE)]
 pub fn loop_init() -> Result<(), SystemError> {
     let loop_mgr = Arc::new(LoopManager::new());

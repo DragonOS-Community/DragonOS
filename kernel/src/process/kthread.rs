@@ -286,7 +286,7 @@ impl KernelThreadMechanism {
 
         KernelThreadMechanism::__inner_create(
             &create_info,
-            CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGHAND,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_FILES,
         )
         .unwrap_or_else(|e| panic!("Failed to create initial kernel thread, error: {:?}", e));
 
@@ -314,7 +314,7 @@ impl KernelThreadMechanism {
                 .expect("kthreadadd should be run first");
             let kthreadd_pid: RawPid = Self::__inner_create(
                 &info,
-                CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGHAND,
+                CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_FILES,
             )
             .expect("Failed to create kthread daemon");
             let pcb = ProcessManager::find_task_by_vpid(kthreadd_pid).unwrap();
@@ -467,7 +467,7 @@ impl KernelThreadMechanism {
                 // create a new kernel thread
                 let result: Result<RawPid, SystemError> = Self::__inner_create(
                     &info,
-                    CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGHAND,
+                    CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_FILES,
                 );
                 if result.is_err() {
                     // 创建失败

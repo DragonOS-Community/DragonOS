@@ -576,9 +576,9 @@ impl DeviceManager {
             );
         }
         let kobject_parent = self.get_device_parent(&device, deivce_parent)?;
-        if let Some(ref kobj) = kobject_parent {
-            log::debug!("kobject parent: {:?}", kobj.name());
-        }
+        // if let Some(ref kobj) = kobject_parent {
+        //     // log::debug!("kobject parent: {:?}", kobj.name());
+        // }
         if let Some(kobject_parent) = kobject_parent {
             // debug!(
             //     "device '{}' parent is '{}', strong_count: {}",

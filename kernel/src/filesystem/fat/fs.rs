@@ -2034,6 +2034,8 @@ impl IndexNode for LockedFATInode {
             nod.0.lock().metadata.file_type = FileType::Pipe;
             // 创建pipe文件
             let pipe_inode = LockedPipeInode::new();
+            // 标记为命名管道（FIFO），这样 open 时才会应用 FIFO 阻塞语义
+            pipe_inode.set_fifo();
             // 设置special_node
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
         } else if final_mode.contains(InodeMode::S_IFBLK) {

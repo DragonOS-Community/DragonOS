@@ -29,6 +29,7 @@ pread64_test
 rename_test
 getdents_test
 preadv_test
+utimes_test
 
 # 进程相关测试
 fork_test
@@ -67,4 +68,6 @@ sigtimedwait_test
 # 其他测试
 itimer_test
 pipe_test
+fifo_test
 unshare_test
+pty_root_test

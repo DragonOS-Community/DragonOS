@@ -25,7 +25,7 @@ use alloc::{
 use core::{ffi::CStr, fmt::Debug, intrinsics::unlikely};
 use hashbrown::HashMap;
 use intertrait::cast::CastArc;
-use log::{debug, error, info};
+use log::{debug, error};
 use system_error::SystemError;
 
 /// `/sys/bus`的kset
@@ -580,7 +580,7 @@ pub fn bus_add_device(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
 ///
 /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_probe_device#478
 pub fn bus_probe_device(dev: &Arc<dyn Device>) {
-    info!("bus_probe_device: dev: {:?}", dev.name());
+    // info!("bus_probe_device: dev: {:?}", dev.name());
     bus_manager().probe_device(dev);
 }
 

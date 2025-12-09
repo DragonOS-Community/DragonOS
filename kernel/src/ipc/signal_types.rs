@@ -64,7 +64,6 @@ pub const USER_SIG_ERR: u64 = 2;
 
 // 因为 Rust 编译器不能在常量声明中正确识别级联的 "|" 运算符(experimental feature： https://github.com/rust-lang/rust/issues/67792)，因此
 // 暂时只能通过这种方法来声明这些常量，这些常量暂时没有全部用到，但是都出现在 linux 的判断逻辑中，所以都保留下来了
-#[allow(dead_code)]
 pub const SIG_KERNEL_ONLY_MASK: SigSet =
     Signal::into_sigset(Signal::SIGSTOP).union(Signal::into_sigset(Signal::SIGKILL));
 
@@ -83,8 +82,13 @@ pub const SIG_KERNEL_COREDUMP_MASK: SigSet = Signal::into_sigset(Signal::SIGQUIT
     .union(Signal::into_sigset(Signal::SIGSYS))
     .union(Signal::into_sigset(Signal::SIGXCPU))
     .union(Signal::into_sigset(Signal::SIGXFSZ));
-#[allow(dead_code)]
+
 pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
+    .union(Signal::into_sigset(Signal::SIGCHLD))
+    .union(Signal::into_sigset(Signal::SIGWINCH))
+    .union(Signal::into_sigset(Signal::SIGURG));
+#[allow(dead_code)]
+pub const SIG_SPECIFIC_SICODES_MASK: SigSet = Signal::into_sigset(Signal::SIGILL)
     .union(Signal::into_sigset(Signal::SIGFPE))
     .union(Signal::into_sigset(Signal::SIGSEGV))
     .union(Signal::into_sigset(Signal::SIGBUS))
@@ -111,6 +115,12 @@ pub enum SigactionType {
 }
 
 impl SigactionType {
+    /// Returns `true` if the sa handler type is [`Self::SaHandler(SaHandlerType::Default)`].
+    ///
+    /// [`SigDefault`]: SaHandlerType::SigDefault
+    pub fn is_default(&self) -> bool {
+        return matches!(self, Self::SaHandler(SaHandlerType::Default));
+    }
     /// Returns `true` if the sa handler type is [`SaHandler(SaHandlerType::SigIgnore)`].
     ///
     /// [`SigIgnore`]: SaHandlerType::SigIgnore
@@ -191,19 +201,15 @@ impl Default for Sigaction {
 }
 
 impl Sigaction {
+    /// 判断传入的信号是否被设置为默认处理
+    pub fn is_default(&self) -> bool {
+        return self.action.is_default();
+    }
     /// 判断传入的信号是否被忽略
-    ///
-    /// ## 参数
-    ///
-    /// - `sig` 传入的信号
-    ///
-    /// ## 返回值
-    ///
-    /// - `true` 被忽略
-    /// - `false`未被忽略
     pub fn is_ignore(&self) -> bool {
         return self.action.is_ignore();
     }
+
     pub fn new(
         action: SigactionType,
         flags: SigFlags,
@@ -580,7 +586,7 @@ impl SigPending {
     /// @brief 从sigpending中删除mask中被置位的信号。也就是说，比如mask的第1位被置为1,那么就从sigqueue中删除所有signum为2的信号的信息。
     pub fn flush_by_mask(&mut self, mask: &SigSet) {
         // 定义过滤器，从sigqueue中删除mask中被置位的信号
-        let filter = |x: &SigInfo| !mask.contains(SigSet::from_bits_truncate(x.sig_no as u64));
+        let filter = |x: &SigInfo| !mask.contains(Signal::from(x.sig_no as usize).into());
         self.queue.q.retain(filter);
         // 同步清理位图中的相应位，避免仅删除队列项但仍因位图残留被视为pending
         self.signal.remove(*mask);

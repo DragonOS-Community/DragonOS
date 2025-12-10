@@ -53,7 +53,12 @@ impl Syscall for SysMmapHandle {
         let prot_flags = Self::prot(args);
         let map_flags = Self::flags(args);
         let fd = Self::fd(args);
-        let offset = Self::offset(args);
+        let offset_raw = Self::offset(args);
+        // mmap(2) takes a signed off_t. Linux returns EOVERFLOW on negative offsets.
+        if offset_raw < 0 {
+            return Err(SystemError::EOVERFLOW);
+        }
+        let offset = offset_raw as usize;
         // 基础参数校验
         if verify_area(start_vaddr, len).is_err() {
             return Err(SystemError::EFAULT);
@@ -61,6 +66,26 @@ impl Syscall for SysMmapHandle {
 
         let map_flags = MapFlags::from_bits_truncate(map_flags as u64);
         let prot_flags = ProtFlags::from_bits_truncate(prot_flags as u64);
+
+        // Check offset overflow like Linux: (pgoff + len_pages) must fit and large positive
+        // offsets that would overflow signed address space return EOVERFLOW.
+        let len_pages = len >> <MMArch as MemoryManagementArch>::PAGE_SHIFT;
+        let max_pgoff = usize::MAX >> <MMArch as MemoryManagementArch>::PAGE_SHIFT;
+        if (offset >> <MMArch as MemoryManagementArch>::PAGE_SHIFT)
+            .checked_add(len_pages)
+            .is_none_or(|v| v > max_pgoff)
+        {
+            return Err(SystemError::EOVERFLOW);
+        }
+        if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
+            let max_signed_off = isize::MAX as usize;
+            if offset > max_signed_off.saturating_sub(len) {
+                return Err(SystemError::EOVERFLOW);
+            }
+        }
+
+        // 默认按需分配物理页；仅在显式要求（MAP_POPULATE / MAP_LOCKED）时进行预分配。
+        let allocate_at_once = map_flags.intersects(MapFlags::MAP_POPULATE | MapFlags::MAP_LOCKED);
 
         // 仅允许 MAP_PRIVATE 或 MAP_SHARED 之一
         let has_private = map_flags.contains(MapFlags::MAP_PRIVATE);
@@ -76,7 +101,13 @@ impl Syscall for SysMmapHandle {
         if rlim_as != usize::MAX {
             let vm = AddressSpace::current()?;
             let usage = vm.read().vma_usage_bytes();
-            if usage.checked_add(len).is_none_or(|v| v > rlim_as) {
+            // Allow a small one-page slack to mirror Linux rounding behaviour and
+            // avoid spuriously rejecting near-limit mappings.
+            let allowance = MMArch::PAGE_SIZE;
+            if usage
+                .checked_add(len)
+                .is_none_or(|v| v > rlim_as.saturating_add(allowance))
+            {
                 return Err(SystemError::ENOMEM);
             }
         }
@@ -112,7 +143,7 @@ impl Syscall for SysMmapHandle {
                 prot_flags,
                 map_flags,
                 true,
-                false,
+                allocate_at_once,
             )?
         } else {
             // 文件映射
@@ -124,7 +155,7 @@ impl Syscall for SysMmapHandle {
                 fd,
                 offset,
                 true,
-                false,
+                allocate_at_once,
             )?
         };
         return Ok(start_page.virt_address().data());
@@ -165,8 +196,8 @@ impl SysMmapHandle {
         args[4] as i32
     }
     /// Extracts the file offset argument from syscall parameters.
-    fn offset(args: &[usize]) -> usize {
-        args[5]
+    fn offset(args: &[usize]) -> isize {
+        args[5] as isize
     }
 }
 syscall_table_macros::declare_syscall!(SYS_MMAP, SysMmapHandle);

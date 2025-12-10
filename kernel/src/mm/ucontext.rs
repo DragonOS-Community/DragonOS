@@ -501,11 +501,16 @@ impl InnerAddressSpace {
         let file = file.unwrap();
 
         // 权限检查遵循 Linux 语义：
-        // - PROT_READ/PROT_EXEC 需要可读
-        // - PROT_WRITE | MAP_SHARED 需要可写
-        // - PROT_WRITE | MAP_PRIVATE 需要可读，以便进行写时拷贝
+        // - O_PATH 直接返回 EBADF
+        // - 除 PROT_NONE 外，映射需要读权限；PROT_WRITE 另外需要写权限（MAP_PRIVATE 也需要读以便 COW）
+        // - PROT_EXEC 视为读检查
         let file_mode = file.mode();
-        if prot_flags.contains(ProtFlags::PROT_READ) && !file_mode.contains(FileMode::FMODE_READ) {
+        if file_mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        let wants_access = prot_flags != ProtFlags::PROT_NONE;
+        if wants_access && !file_mode.contains(FileMode::FMODE_READ) {
             return Err(SystemError::EACCES);
         }
         if prot_flags.contains(ProtFlags::PROT_EXEC) && !file_mode.contains(FileMode::FMODE_READ) {
@@ -1230,14 +1235,13 @@ impl UserMappings {
     /// @param size 请求的大小
     ///
     /// @return 如果找到了，返回虚拟内存范围，否则返回None
-    pub fn find_free(&self, min_vaddr: VirtAddr, size: usize) -> Option<VirtRegion> {
-        let _vaddr = min_vaddr;
+    pub fn find_free(&self, min_vaddr: VirtAddr, req_size: usize) -> Option<VirtRegion> {
         let mut iter = self
             .vm_holes
             .iter()
             .skip_while(|(hole_vaddr, hole_size)| hole_vaddr.add(**hole_size) <= min_vaddr);
 
-        let (hole_vaddr, size) = iter.find(|(hole_vaddr, hole_size)| {
+        let (hole_vaddr, hole_size) = iter.find(|(hole_vaddr, hole_size)| {
             // 计算当前空洞的可用大小
             let available_size: usize =
                 if hole_vaddr <= &&min_vaddr && min_vaddr <= hole_vaddr.add(**hole_size) {
@@ -1246,11 +1250,11 @@ impl UserMappings {
                     **hole_size
                 };
 
-            size <= available_size
+            req_size <= available_size
         })?;
 
-        // 创建一个新的虚拟内存范围。
-        let region = VirtRegion::new(cmp::max(*hole_vaddr, min_vaddr), *size);
+        // 返回恰好等于请求大小的区域，起始地址取空洞与下限的较大值。
+        let region = VirtRegion::new(cmp::max(*hole_vaddr, min_vaddr), req_size);
 
         return Some(region);
     }

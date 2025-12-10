@@ -1,5 +1,6 @@
 /// 导出devfs的模块
 pub mod null_dev;
+pub mod random_dev;
 pub mod zero_dev;
 
 use super::{
@@ -146,6 +147,7 @@ impl DevFS {
     /// @brief 注册系统内部自带的设备
     fn register_bultinin_device(&self) {
         use null_dev::LockedNullInode;
+        use random_dev::LockedRandomInode;
         use zero_dev::LockedZeroInode;
         let dev_root: Arc<LockedDevFSInode> = self.root_inode.clone();
         dev_root
@@ -154,6 +156,9 @@ impl DevFS {
         dev_root
             .add_dev("zero", LockedZeroInode::new())
             .expect("DevFS: Failed to register /dev/zero");
+        dev_root
+            .add_dev("random", LockedRandomInode::new())
+            .expect("DevFS: Failed to register /dev/random");
     }
 
     /// @brief 在devfs内注册设备

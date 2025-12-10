@@ -23,7 +23,10 @@ use system_error::SystemError;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    filesystem::vfs::{file::File, FileType},
+    filesystem::vfs::{
+        file::{File, FileMode},
+        FileType,
+    },
     ipc::shm::{ShmFlags, ShmId},
     libs::{
         align::page_align_up,
@@ -486,7 +489,32 @@ impl InnerAddressSpace {
 
         let file = file.unwrap();
 
-        if file.file_type() == FileType::Pipe {
+        // 权限检查遵循 Linux 语义：
+        // - PROT_READ/PROT_EXEC 需要可读
+        // - PROT_WRITE | MAP_SHARED 需要可写
+        // - PROT_WRITE | MAP_PRIVATE 需要可读，以便进行写时拷贝
+        let file_mode = file.mode();
+        if prot_flags.contains(ProtFlags::PROT_READ) && !file_mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EACCES);
+        }
+        if prot_flags.contains(ProtFlags::PROT_EXEC) && !file_mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EACCES);
+        }
+        if prot_flags.contains(ProtFlags::PROT_WRITE) {
+            if map_flags.contains(MapFlags::MAP_SHARED) {
+                if !file_mode.contains(FileMode::FMODE_WRITE) {
+                    return Err(SystemError::EACCES);
+                }
+            } else if !file_mode.contains(FileMode::FMODE_READ) {
+                return Err(SystemError::EACCES);
+            }
+        }
+
+        let meta = file.metadata()?;
+        if matches!(
+            meta.file_type,
+            FileType::Pipe | FileType::Dir | FileType::CharDevice
+        ) {
             return Err(SystemError::ENODEV);
         }
 

@@ -1550,6 +1550,10 @@ impl LockedFATInode {
 }
 
 impl IndexNode for LockedFATInode {
+    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {

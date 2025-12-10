@@ -25,7 +25,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::vfs::{
         file::{File, FileMode},
-        FileType,
+        FileType, InodeId,
     },
     ipc::shm::{ShmFlags, ShmId},
     libs::{
@@ -511,10 +511,7 @@ impl InnerAddressSpace {
         }
 
         let meta = file.metadata()?;
-        if matches!(
-            meta.file_type,
-            FileType::Pipe | FileType::Dir | FileType::CharDevice
-        ) {
+        if matches!(meta.file_type, FileType::Pipe | FileType::Dir) {
             return Err(SystemError::ENODEV);
         }
 
@@ -524,9 +521,10 @@ impl InnerAddressSpace {
         }
         let pgoff = offset >> MMArch::PAGE_SHIFT;
 
+        let page_count = PageFrameCount::from_bytes(len).unwrap();
         let start_page: VirtPageFrame = self.mmap(
             round_hint_to_min(start_vaddr),
-            PageFrameCount::from_bytes(len).unwrap(),
+            page_count,
             prot_flags,
             map_flags,
             |page, count, vm_flags, flags, mapper, flusher| {
@@ -556,10 +554,17 @@ impl InnerAddressSpace {
         // todo!(impl mmap for other file)
         // https://github.com/DragonOS-Community/DragonOS/pull/912#discussion_r1765334272
         // 传入实际映射后的起始虚拟地址，而非用户传入的 hint
-        let _ = file
+        match file
             .inode()
-            .mmap(start_page.virt_address().data(), len, offset);
-        return Ok(start_page);
+            .mmap(start_page.virt_address().data(), len, offset)
+        {
+            Ok(_) => Ok(start_page), // 文件系统未实现 mmap，视为成功
+            Err(e) => {
+                // 回滚已建立的映射
+                let _ = self.munmap(start_page, page_count);
+                Err(e)
+            }
+        }
     }
 
     /// 向进程的地址空间映射页面
@@ -907,6 +912,25 @@ impl InnerAddressSpace {
             }
             r.do_madvise(behavior, mapper, &mut *flusher)?;
             self.mappings.insert_vma(r);
+        }
+        Ok(())
+    }
+
+    /// 取消与指定 inode 关联的文件映射的页表项，保留 VMA 以便后续访问触发缺页并按最新文件大小处理
+    pub fn zap_file_mappings(&mut self, inode_id: InodeId) -> Result<(), SystemError> {
+        let mut targets: Vec<Arc<LockedVMA>> = Vec::new();
+        for vma in self.mappings.iter_vmas() {
+            let guard = vma.lock_irqsave();
+            if let Some(file) = guard.vm_file() {
+                if file.inode().metadata()?.inode_id == inode_id {
+                    targets.push(vma.clone());
+                }
+            }
+        }
+
+        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+        for vma in targets {
+            vma.unmap(&mut self.user_mapper.utable, &mut flusher);
         }
         Ok(())
     }

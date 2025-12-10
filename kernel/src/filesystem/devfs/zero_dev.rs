@@ -153,6 +153,11 @@ impl IndexNode for LockedZeroInode {
         Ok(len)
     }
 
+    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
+        // /dev/zero 支持 mmap，语义等同匿名零页映射
+        Ok(())
+    }
+
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         let parent = self.0.lock().parent.upgrade();
         if let Some(parent) = parent {

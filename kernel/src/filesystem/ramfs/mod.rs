@@ -177,6 +177,10 @@ impl MountableFileSystem for RamFS {
 register_mountable_fs!(RamFS, RAMFSMAKER, "ramfs");
 
 impl IndexNode for LockedRamFSInode {
+    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
 

@@ -43,6 +43,10 @@ pub struct Ext4Inode {
 pub struct LockedExt4Inode(pub(super) SpinLock<Ext4Inode>);
 
 impl IndexNode for LockedExt4Inode {
+    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn open(
         &self,
         _data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,

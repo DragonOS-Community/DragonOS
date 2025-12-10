@@ -2,7 +2,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError;
 
-use crate::filesystem::vfs::fasync::FAsyncItems;
+use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
@@ -27,6 +27,7 @@ pub struct TcpSocket {
     // shutdown: Shutdown, // TODO set shutdown status
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
+    inode_id: InodeId,
     self_ref: Weak<Self>,
     pollee: AtomicUsize,
     netns: Arc<NetNamespace>,
@@ -42,6 +43,7 @@ impl TcpSocket {
             // shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
+            inode_id: generate_inode_id(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new(0_usize),
             netns,
@@ -60,6 +62,7 @@ impl TcpSocket {
             // shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
+            inode_id: generate_inode_id(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new((EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize),
             netns,
@@ -444,6 +447,10 @@ impl Socket for TcpSocket {
         //     }
         // }
         Ok(())
+    }
+
+    fn socket_inode_id(&self) -> InodeId {
+        self.inode_id
     }
 
     fn do_close(&self) -> Result<(), SystemError> {

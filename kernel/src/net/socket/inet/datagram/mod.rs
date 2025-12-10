@@ -3,7 +3,7 @@ use smoltcp;
 use system_error::SystemError;
 
 use crate::filesystem::epoll::EPollEventType;
-use crate::filesystem::vfs::fasync::FAsyncItems;
+use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::{Socket, PMSG};
@@ -26,6 +26,7 @@ pub struct UdpSocket {
     inner: RwLock<Option<UdpInner>>,
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
+    inode_id: InodeId,
     self_ref: Weak<UdpSocket>,
     netns: Arc<NetNamespace>,
     epoll_items: EPollItems,
@@ -39,6 +40,7 @@ impl UdpSocket {
             inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
+            inode_id: generate_inode_id(),
             self_ref: me.clone(),
             netns,
             epoll_items: EPollItems::default(),
@@ -315,6 +317,10 @@ impl Socket for UdpSocket {
             }
         }
         return event;
+    }
+
+    fn socket_inode_id(&self) -> InodeId {
+        self.inode_id
     }
 }
 

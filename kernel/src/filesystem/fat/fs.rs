@@ -238,7 +238,7 @@ impl LockedFATInode {
                 file_type,
                 mode: InodeMode::S_IRWXUGO,
                 flags: InodeFlags::empty(),
-                nlinks: 1,
+                nlinks: if file_type == FileType::Dir { 2 } else { 1 },
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(),
@@ -504,7 +504,7 @@ impl FATFileSystem {
                 file_type: FileType::Dir,
                 mode: InodeMode::S_IRWXUGO,
                 flags: InodeFlags::empty(),
-                nlinks: 1,
+                nlinks: 2,
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(),
@@ -1661,6 +1661,15 @@ impl IndexNode for LockedFATInode {
                 }
                 FileType::Dir => {
                     d.create_dir(name, fs)?;
+                    // 刚创建的目录，确保自身 nlink >= 2，并更新父目录 nlink
+                    if let Some(child) = guard.children.get(&to_search_name(name)) {
+                        let mut child_md = child.0.lock();
+                        if child_md.metadata.nlinks < 2 {
+                            child_md.metadata.nlinks = 2;
+                        }
+                    }
+                    // 父目录因为新增子目录，多一个链接（来自子目录的 ".."）
+                    guard.metadata.nlinks += 1;
                     return Ok(guard.find(name)?);
                 }
 
@@ -1918,14 +1927,20 @@ impl IndexNode for LockedFATInode {
         let r: Result<(), SystemError> =
             dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
         match r {
-            Ok(_) => return r,
+            Ok(_) => {
+                // 删除子目录成功，父目录链接计数减少
+                if guard.metadata.nlinks > 0 {
+                    guard.metadata.nlinks -= 1;
+                }
+                return Ok(());
+            }
             Err(r) => {
                 if r == SystemError::ENOTEMPTY {
                     // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
                     guard.children.insert(to_search_name(name), target.clone());
                     drop(target_guard);
                 }
-                return Err(r);
+                Err(r)
             }
         }
     }

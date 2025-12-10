@@ -1,5 +1,8 @@
 use crate::{
-    filesystem::{epoll::EPollEventType, vfs::fasync::FAsyncItems},
+    filesystem::{
+        epoll::EPollEventType,
+        vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
+    },
     libs::{rwlock::RwLock, wait_queue::WaitQueue},
     net::socket::{
         endpoint::Endpoint,
@@ -28,6 +31,7 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
     wait_queue: Arc<WaitQueue>,
     netns: Arc<NetNamespace>,
     fasync_items: FAsyncItems,
+    inode_id: InodeId,
 }
 
 impl<P: SupportedNetlinkProtocol> NetlinkSocket<P>
@@ -42,6 +46,7 @@ where
             wait_queue: Arc::new(WaitQueue::default()),
             netns: ProcessManager::current_netns(),
             fasync_items: FAsyncItems::default(),
+            inode_id: generate_inode_id(),
         })
     }
 
@@ -236,6 +241,10 @@ where
         } else {
             Err(SystemError::ENOTCONN)
         }
+    }
+
+    fn socket_inode_id(&self) -> InodeId {
+        self.inode_id
     }
 }
 

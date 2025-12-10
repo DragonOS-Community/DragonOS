@@ -923,6 +923,7 @@ impl dyn IndexNode {
         }
 
         let root_inode = ProcessManager::current_mntns().root_inode();
+        let trailing_slash = path.ends_with('/');
 
         // 获取当前进程的凭证（用于路径遍历的权限检查）
         let cred = ProcessManager::current_pcb().cred();
@@ -1024,6 +1025,10 @@ impl dyn IndexNode {
             } else {
                 result = inode;
             }
+        }
+
+        if trailing_slash && result.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
         }
 
         return Ok(result);

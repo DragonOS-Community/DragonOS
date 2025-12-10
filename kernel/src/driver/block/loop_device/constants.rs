@@ -8,6 +8,12 @@ pub const LOOP_CONTROL_BASENAME: &str = "loop-control";
 /// Loop-control 设备的次设备号
 pub const LOOP_CONTROL_MINOR: u32 = 237;
 
+/// I/O 排空超时时间 (毫秒)
+pub const LOOP_IO_DRAIN_TIMEOUT_MS: u32 = 30_000;
+
+/// I/O 排空检查间隔 (微秒)
+pub const LOOP_IO_DRAIN_CHECK_INTERVAL_US: u32 = 10_000;
+
 /// Loop 设备 ioctl 命令
 #[repr(u32)]
 #[derive(Debug, FromPrimitive)]

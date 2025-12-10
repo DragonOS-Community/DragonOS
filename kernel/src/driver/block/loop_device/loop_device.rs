@@ -45,7 +45,10 @@ use log::{error, info, warn};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
-use super::constants::{LoopFlags, LoopIoctl, LoopState, LoopStatus64, LOOP_BASENAME};
+use super::constants::{
+    LoopFlags, LoopIoctl, LoopState, LoopStatus64, LOOP_BASENAME, LOOP_IO_DRAIN_CHECK_INTERVAL_US,
+    LOOP_IO_DRAIN_TIMEOUT_MS,
+};
 
 /// Loop 设备 KObject 类型
 #[derive(Debug)]
@@ -380,8 +383,7 @@ impl LoopDevice {
             core::mem::size_of::<LoopStatus64>(),
             true,
         )?;
-        let mut info = LoopStatus64::default();
-        reader.copy_one_from_user(&mut info, 0)?;
+        let info: LoopStatus64 = reader.buffer_protected(0)?.read_one(0)?;
         Self::validate_loop_status64_params(&info)?;
 
         let new_offset = info.lo_offset as usize;
@@ -452,7 +454,7 @@ impl LoopDevice {
             core::mem::size_of::<LoopStatus64>(),
             true,
         )?;
-        writer.copy_one_to_user(&info, 0)?;
+        writer.buffer_protected(0)?.write_one(0, &info)?;
         Ok(())
     }
 
@@ -586,9 +588,7 @@ impl LoopDevice {
             );
         }
         drop(inner);
-        let timeout_ms = 30_000;
-        let check_interval_us = 10_000;
-        let max_checks = timeout_ms * 1000 / check_interval_us;
+        let max_checks = LOOP_IO_DRAIN_TIMEOUT_MS * 1000 / LOOP_IO_DRAIN_CHECK_INTERVAL_US;
 
         for _i in 0..max_checks {
             let count = self.active_io_count.load(Ordering::Acquire);
@@ -792,8 +792,10 @@ impl IndexNode for LoopDevice {
         data: usize,
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
-        match LoopIoctl::from_u32(cmd) {
-            Some(LoopIoctl::LoopSetFd) => {
+        let ioctl_cmd = LoopIoctl::from_u32(cmd).ok_or(SystemError::ENOSYS)?;
+
+        match ioctl_cmd {
+            LoopIoctl::LoopSetFd => {
                 let file_fd = data as i32;
                 let fd_table = ProcessManager::current_pcb().fd_table();
                 let file = {
@@ -812,31 +814,31 @@ impl IndexNode for LoopDevice {
                 self.bind_file(inode, read_only)?;
                 Ok(0)
             }
-            Some(LoopIoctl::LoopClrFd) => {
+            LoopIoctl::LoopClrFd => {
                 self.clear_file()?;
                 Ok(0)
             }
-            Some(LoopIoctl::LoopSetStatus) => {
+            LoopIoctl::LoopSetStatus => {
                 self.set_status(data)?;
                 Ok(0)
             }
-            Some(LoopIoctl::LoopGetStatus) => {
+            LoopIoctl::LoopGetStatus => {
                 self.get_status(data)?;
                 Ok(0)
             }
-            Some(LoopIoctl::LoopSetStatus64) => {
+            LoopIoctl::LoopSetStatus64 => {
                 self.set_status64(data)?;
                 Ok(0)
             }
-            Some(LoopIoctl::LoopGetStatus64) => {
+            LoopIoctl::LoopGetStatus64 => {
                 self.get_status64(data)?;
                 Ok(0)
             }
-            Some(LoopIoctl::LoopChangeFd) => {
+            LoopIoctl::LoopChangeFd => {
                 self.change_fd(data as i32)?;
                 Ok(0)
             }
-            Some(LoopIoctl::LoopSetCapacity) => {
+            LoopIoctl::LoopSetCapacity => {
                 self.set_capacity(data)?;
                 Ok(0)
             }

@@ -17,7 +17,6 @@ use crate::{
     },
     mm::MemoryManagementArch,
     process::{ProcessFlags, ProcessManager, ProcessState},
-    sched::SchedMode,
     syscall::user_access::UserBufferWriter,
     time::PosixTimeSpec,
 };

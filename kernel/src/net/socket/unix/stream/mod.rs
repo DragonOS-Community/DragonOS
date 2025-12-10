@@ -218,8 +218,6 @@ impl Socket for UnixStreamSocket {
 
     fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
         debug!("stream server begin accept");
-        use crate::sched::SchedMode;
-
         if self.is_nonblocking() {
             self.try_accept()
         } else {

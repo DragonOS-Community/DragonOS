@@ -213,8 +213,6 @@ impl Socket for UdpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        use crate::sched::SchedMode;
-
         return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer)
         } else {
@@ -236,7 +234,6 @@ impl Socket for UdpSocket {
         flags: PMSG,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        use crate::sched::SchedMode;
         // could block io
         if let Some(endpoint) = address {
             self.connect(endpoint)?;

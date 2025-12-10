@@ -13,7 +13,6 @@ use crate::{
             Socket, PMSG, PSOL,
         },
     },
-    sched::SchedMode,
 };
 use alloc::{
     collections::VecDeque,

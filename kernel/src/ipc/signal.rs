@@ -253,6 +253,11 @@ impl Signal {
         // 若线程正处于可中断阻塞，且当前在 set_user_sigmask 语义下（如 rt_sigtimedwait/pselect 等）
         // 则无论该信号是否在常规 blocked 集内，都应唤醒，由具体系统调用在返回路径上判定。
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
+
+        // SIGCONT：即便被屏蔽或默认忽略，也应唤醒处于 Stopped 的任务，让其继续运行。
+        if *self == Signal::SIGCONT && state.is_stopped() {
+            return true;
+        }
         let is_blocked_interruptable = state.is_blocked_interruptable();
         let has_restore_sig_mask = pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK);
 
@@ -405,6 +410,9 @@ impl Signal {
             }
             // 如果未处于 stopped，则不生成 CLD_CONTINUED/不通知父进程
             // TODO 对每个子线程 flush mask；对齐 Linux 更完整语义
+            // SIGCONT 不能被忽略，否则会与 STOP 信号竞态导致任务永久停止。
+            // 始终允许其进入后续路径完成 pending/唤醒逻辑。
+            return true;
         }
 
         //TODO 仿照 linux 中的prepare signal完善逻辑，linux 中还会根据例如当前进程状态(Existing)进行判断，现在的信号能否发出就只是根据 ignored 来判断

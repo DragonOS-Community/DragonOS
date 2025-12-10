@@ -11,10 +11,9 @@ use crate::{
     libs::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
-        wait_queue::WaitQueue,
+        wait_queue::{WaitQueue, Waiter},
     },
     process::ProcessManager,
-    sched::{schedule, SchedMode},
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         PosixTimeSpec,
@@ -403,28 +402,51 @@ impl EventPoll {
                     inner.activate();
                     timer = Some(inner);
                 }
-                let guard = epoll.0.lock_irqsave();
-                // 睡眠，等待事件发生
-                // 如果wq已经dead，则直接返回错误
-                unsafe { guard.epoll_wq.sleep_without_schedule() }.inspect_err(|_| {
-                    if let Some(timer) = timer.as_ref() {
+                // 构造一次等待
+                let (waiter, waker) = Waiter::new_pair();
+                {
+                    let guard = epoll.0.lock_irqsave();
+                    // 注册前再次检查，避免错过事件
+                    if guard.ep_events_available() || guard.shutdown.load(Ordering::SeqCst) {
+                        available = true;
+                        // 不注册，直接继续
+                    } else {
+                        guard.epoll_wq.register_waker(waker.clone())?;
+                    }
+                }
+
+                if available {
+                    if let Some(timer) = timer {
                         timer.cancel();
                     }
-                })?;
-                drop(guard);
-                schedule(SchedMode::SM_NONE);
+                    continue;
+                }
 
-                // 被唤醒后,检查是否有事件可读
-                available = epoll.0.lock_irqsave().ep_events_available();
+                if let Some(ref t) = timer {
+                    t.activate();
+                }
+
+                let wait_res = waiter.wait(true);
+
+                {
+                    let guard = epoll.0.lock_irqsave();
+                    guard.epoll_wq.remove_waker(&waker);
+                    available = guard.ep_events_available();
+                    if guard.shutdown.load(Ordering::SeqCst) {
+                        // epoll 被关闭，直接退出
+                        return Err(SystemError::EINVAL);
+                    }
+                }
+
                 if let Some(timer) = timer {
                     if timer.as_ref().timeout() {
-                        // 超时
                         timeout = true;
                     } else {
-                        // 未超时，则取消计时器
                         timer.cancel();
                     }
                 }
+
+                wait_res?;
             }
         } else {
             panic!("An epoll file does not have the corresponding private information");
@@ -620,7 +642,7 @@ impl EventPoll {
 
     /// ### 判断该epoll上是否有进程在等待
     pub fn ep_has_waiter(&self) -> bool {
-        self.epoll_wq.len() != 0
+        !self.epoll_wq.is_empty()
     }
 
     /// ### 唤醒所有在epoll上等待的进程

@@ -149,8 +149,6 @@ where
         address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), system_error::SystemError> {
         // log::info!("NetlinkSocket recv_from called");
-        use crate::sched::SchedMode;
-
         if let Some(addr) = address {
             self.connect(addr)?;
         }

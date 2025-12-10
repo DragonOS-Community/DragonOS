@@ -12,17 +12,21 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{MMArch, mm::LockedFrameAllocator},
+    arch::{mm::LockedFrameAllocator, MMArch},
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         procfs::{
             proc_thread_self_ns::{
-                ThreadSelfNsFileType, current_thread_self_ns_ino, open_thread_self_ns_file, read_thread_self_ns_link
+                current_thread_self_ns_ino, open_thread_self_ns_file, read_thread_self_ns_link,
+                ThreadSelfNsFileType,
             },
             sys::sysctl::PrintkSysctl,
         },
         vfs::{
-            FileType, mount::{MountFlags, MountPath}, syscall::RenameFlags, vcore::generate_inode_id
+            mount::{MountFlags, MountPath},
+            syscall::RenameFlags,
+            vcore::generate_inode_id,
+            FileType,
         },
     },
     libs::{
@@ -30,7 +34,7 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{MemoryManagementArch, allocator::page_frame::FrameAllocator},
+    mm::{allocator::page_frame::FrameAllocator, MemoryManagementArch},
     process::{ProcessManager, ProcessState, RawPid},
     time::PosixTimeSpec,
 };
@@ -437,7 +441,9 @@ impl ProcFSInode {
             .map(|vm| {
                 let guard = vm.read();
                 // statm 第一列为总虚拟内存页数。
-                (guard.vma_usage_bytes().saturating_add(MMArch::PAGE_SIZE - 1))
+                (guard
+                    .vma_usage_bytes()
+                    .saturating_add(MMArch::PAGE_SIZE - 1))
                     >> MMArch::PAGE_SHIFT
             })
             .unwrap_or(0);

@@ -117,7 +117,7 @@ impl IndexNode for LockedExt4Inode {
                 None,
             )
             .map_err(SystemError::from)?;
-            page_cache.lock_irqsave().read(offset, buf)
+            page_cache.read(offset, buf)
         } else {
             self.read_direct(offset, len, buf, data)
         }
@@ -158,7 +158,7 @@ impl IndexNode for LockedExt4Inode {
         let len = core::cmp::min(len, buf.len());
         let buf = &buf[0..len];
         if let Some(page_cache) = &guard.page_cache {
-            let write_len = page_cache.lock_irqsave().write(offset, buf)?;
+            let write_len = PageCache::write(page_cache, offset, buf)?;
             let old_file_size = ext4.getattr(guard.inner_inode_num)?.size;
             let current_file_size = core::cmp::max(old_file_size, (offset + write_len) as u64);
             let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {

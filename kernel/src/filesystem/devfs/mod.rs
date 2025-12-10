@@ -9,6 +9,9 @@ use super::{
         FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata, SuperBlock,
     },
 };
+use crate::filesystem::devfs::zero_dev::LockedZeroInode;
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
+use crate::mm::VmFaultReason;
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
     filesystem::vfs::mount::MountFlags,
@@ -20,9 +23,6 @@ use crate::{
     process::ProcessManager,
     time::PosixTimeSpec,
 };
-use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::VmFaultReason;
-use crate::filesystem::devfs::zero_dev::LockedZeroInode;
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
@@ -48,7 +48,10 @@ fn is_zero_inode(pfm: &PageFaultMessage) -> bool {
     match vma_guard.vm_file() {
         Some(file) => {
             let inode = file.inode();
-            inode.as_any_ref().downcast_ref::<LockedZeroInode>().is_some()
+            inode
+                .as_any_ref()
+                .downcast_ref::<LockedZeroInode>()
+                .is_some()
         }
         None => false,
     }

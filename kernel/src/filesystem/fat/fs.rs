@@ -1529,8 +1529,7 @@ impl LockedFATInode {
     fn try_read_pagecache(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
-            let r = page_cache.lock_irqsave().read(offset, buf);
-            return r;
+            return PageCache::read(&page_cache, offset, buf);
         } else {
             return self.read_sync(offset, buf);
         }
@@ -1539,7 +1538,7 @@ impl LockedFATInode {
     fn try_write_pagecache(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
-            let write_len = page_cache.lock_irqsave().write(offset, buf)?;
+            let write_len = PageCache::write(&page_cache, offset, buf)?;
             let mut guard = self.0.lock();
             let old_size = guard.metadata.size;
             guard.update_metadata(Some(core::cmp::max(old_size, (offset + write_len) as i64)));

@@ -34,8 +34,9 @@ impl Syscall for SysMprotectHandle {
         let prot_flags =
             ProtFlags::from_bits(Self::prot_flags(args) as u64).ok_or(SystemError::EINVAL)?;
 
-        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
-        assert!(check_aligned(len, MMArch::PAGE_SIZE));
+        if !start_vaddr.check_aligned(MMArch::PAGE_SIZE) || !check_aligned(len, MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
 
         if verify_area(start_vaddr, len).is_err() {
             return Err(SystemError::EINVAL);

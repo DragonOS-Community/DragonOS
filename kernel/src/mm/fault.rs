@@ -17,7 +17,6 @@ use crate::{
     },
     process::{ProcessManager, ProcessState},
 };
-use crate::filesystem::devfs::zero_dev::LockedZeroInode;
 
 use crate::mm::MemoryManagementArch;
 
@@ -143,7 +142,7 @@ impl PageFaultHandler {
         if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
             //TODO: 添加handle_hugetlb_fault处理大页缺页异常
         } else {
-            Self::handle_normal_fault(&mut pfm);
+            return Self::handle_normal_fault(&mut pfm);
         }
 
         VmFaultReason::VM_FAULT_COMPLETED
@@ -301,26 +300,6 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[inline(never)]
     pub unsafe fn do_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        if pfm
-            .vma()
-            .lock_irqsave()
-            .vm_file()
-            .and_then(|f| {
-                if f.inode()
-                    .as_any_ref()
-                    .downcast_ref::<LockedZeroInode>()
-                    .is_some()
-                {
-                    Some(())
-                } else {
-                    None
-                }
-            })
-            .is_some()
-        {
-            return Self::zero_fault(pfm);
-        }
-
         if !pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE) {
             Self::do_read_fault(pfm)
         } else if !pfm
@@ -394,6 +373,11 @@ impl PageFaultHandler {
             return ret;
         }
 
+        // 出现错误类返回时，不再继续 finish_fault 以避免 unwrap/panic
+        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+            return ret;
+        }
+
         ret = ret.union(Self::finish_fault(pfm));
 
         ret
@@ -410,6 +394,10 @@ impl PageFaultHandler {
     #[inline(never)]
     pub unsafe fn do_shared_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let mut ret = Self::filemap_fault(pfm);
+
+        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+            return ret;
+        }
 
         let cache_page = pfm.page.clone().expect("no cache_page in PageFaultMessage");
 
@@ -707,19 +695,38 @@ impl PageFaultHandler {
             pfm.page = Some(page.clone());
         } else {
             // TODO 同步预读
-            //涉及磁盘IO，返回标志为VM_FAULT_MAJOR
+            // 涉及磁盘IO，返回标志为VM_FAULT_MAJOR
             ret = VmFaultReason::VM_FAULT_MAJOR;
             let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
-            file.pread(
+            match file.pread(
                 file_pgoff * MMArch::PAGE_SIZE,
                 MMArch::PAGE_SIZE,
                 buffer.as_mut_slice(),
-            )
-            .expect("failed to read file to create pagecache page");
+            ) {
+                Ok(read_len) => {
+                    // 超出文件末尾，返回SIGBUS而不是panic
+                    if read_len == 0 {
+                        return VmFaultReason::VM_FAULT_SIGBUS;
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "filemap_fault: pread failed at pgoff {}, err {:?}",
+                        file_pgoff,
+                        e
+                    );
+                    return VmFaultReason::VM_FAULT_SIGBUS;
+                }
+            }
             drop(buffer);
 
             let page = page_cache.lock_irqsave().get_page(file_pgoff);
-            pfm.page = page;
+            if let Some(page) = page {
+                pfm.page = Some(page);
+            } else {
+                // 读取后仍未获取到页面，视为错误
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
         }
         ret
     }

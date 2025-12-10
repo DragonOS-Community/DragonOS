@@ -1184,10 +1184,7 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn super_block(&self) -> SuperBlock;
 
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
-        panic!(
-            "fault() has not yet been implemented for filesystem: {}",
-            crate::libs::name::get_type_name(&self)
-        )
+        VmFaultReason::VM_FAULT_SIGBUS
     }
 
     unsafe fn map_pages(

@@ -23,7 +23,7 @@ use system_error::SystemError;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    filesystem::vfs::file::File,
+    filesystem::vfs::{file::File, FileType},
     ipc::shm::{ShmFlags, ShmId},
     libs::{
         align::page_align_up,
@@ -484,6 +484,12 @@ impl InnerAddressSpace {
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
+        let file = file.unwrap();
+
+        if file.file_type() == FileType::Pipe {
+            return Err(SystemError::ENODEV);
+        }
+
         // offset需要4K对齐
         if (offset & (MMArch::PAGE_SIZE - 1)) != 0 {
             return Err(SystemError::EINVAL);
@@ -504,7 +510,7 @@ impl InnerAddressSpace {
                         flags,
                         mapper,
                         flusher,
-                        file.clone(),
+                        Some(file.clone()),
                         Some(pgoff),
                     )
                 } else {
@@ -512,7 +518,7 @@ impl InnerAddressSpace {
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
-                        file.clone(),
+                        Some(file.clone()),
                         Some(pgoff),
                         false,
                     )))
@@ -521,7 +527,6 @@ impl InnerAddressSpace {
         )?;
         // todo!(impl mmap for other file)
         // https://github.com/DragonOS-Community/DragonOS/pull/912#discussion_r1765334272
-        let file = file.unwrap();
         // 传入实际映射后的起始虚拟地址，而非用户传入的 hint
         let _ = file
             .inode()

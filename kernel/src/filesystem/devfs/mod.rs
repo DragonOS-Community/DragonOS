@@ -20,6 +20,9 @@ use crate::{
     process::ProcessManager,
     time::PosixTimeSpec,
 };
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
+use crate::mm::VmFaultReason;
+use crate::filesystem::devfs::zero_dev::LockedZeroInode;
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
@@ -37,6 +40,18 @@ pub struct DevFS {
     // 文件系统根节点
     root_inode: Arc<LockedDevFSInode>,
     super_block: SuperBlock,
+}
+
+fn is_zero_inode(pfm: &PageFaultMessage) -> bool {
+    let vma = pfm.vma();
+    let vma_guard = vma.lock_irqsave();
+    match vma_guard.vm_file() {
+        Some(file) => {
+            let inode = file.inode();
+            inode.as_any_ref().downcast_ref::<LockedZeroInode>().is_some()
+        }
+        None => false,
+    }
 }
 
 impl FileSystem for DevFS {
@@ -61,6 +76,25 @@ impl FileSystem for DevFS {
 
     fn super_block(&self) -> SuperBlock {
         self.super_block.clone()
+    }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if !is_zero_inode(pfm) {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        PageFaultHandler::zero_fault(pfm)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        if !is_zero_inode(pfm) {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        PageFaultHandler::zero_map_pages(pfm, start_pgoff, end_pgoff)
     }
 }
 

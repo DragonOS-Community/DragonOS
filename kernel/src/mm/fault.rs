@@ -17,6 +17,7 @@ use crate::{
     },
     process::{ProcessManager, ProcessState},
 };
+use crate::filesystem::devfs::zero_dev::LockedZeroInode;
 
 use crate::mm::MemoryManagementArch;
 
@@ -300,6 +301,26 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[inline(never)]
     pub unsafe fn do_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if pfm
+            .vma()
+            .lock_irqsave()
+            .vm_file()
+            .and_then(|f| {
+                if f.inode()
+                    .as_any_ref()
+                    .downcast_ref::<LockedZeroInode>()
+                    .is_some()
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .is_some()
+        {
+            return Self::zero_fault(pfm);
+        }
+
         if !pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE) {
             Self::do_read_fault(pfm)
         } else if !pfm
@@ -368,6 +389,10 @@ impl PageFaultHandler {
         }
 
         ret = fs.fault(pfm);
+
+        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            return ret;
+        }
 
         ret = ret.union(Self::finish_fault(pfm));
 
@@ -730,6 +755,58 @@ impl PageFaultHandler {
 
         mapper.map_phys(address, page_phys, vma_guard.flags());
         page_to_map.write_irqsave().insert_vma(pfm.vma());
+        VmFaultReason::VM_FAULT_COMPLETED
+    }
+
+    /// Map a zeroed anonymous page for /dev/zero style mappings.
+    pub unsafe fn zero_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let address = pfm.address_aligned_down();
+        let vma = pfm.vma();
+        let flags = vma.lock_irqsave().flags();
+        let mapper = &mut pfm.mapper;
+
+        if let Some(flush) = mapper.map(address, flags) {
+            flush.flush();
+            let mut pm = page_manager_lock_irqsave();
+            let paddr = mapper.translate(address).unwrap().0;
+            let page = pm.get_unwrap(&paddr);
+            page.write_irqsave().insert_vma(vma);
+            VmFaultReason::VM_FAULT_COMPLETED
+        } else {
+            VmFaultReason::VM_FAULT_OOM
+        }
+    }
+
+    /// Prefault zeroed anonymous pages for /dev/zero style mappings.
+    pub unsafe fn zero_map_pages(
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        let vma = pfm.vma();
+        let vma_guard = vma.lock_irqsave();
+        let file_pgoff = match vma_guard.file_page_offset() {
+            Some(off) => off,
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+        let base = vma_guard.region().start();
+        let flags = vma_guard.flags();
+        drop(vma_guard);
+
+        let mapper = &mut pfm.mapper;
+        for pgoff in start_pgoff..end_pgoff {
+            let addr = VirtAddr::new(base.data() + ((pgoff - file_pgoff) << MMArch::PAGE_SHIFT));
+            if let Some(flush) = mapper.map(addr, flags) {
+                flush.flush();
+                let mut pm = page_manager_lock_irqsave();
+                let paddr = mapper.translate(addr).unwrap().0;
+                let page = pm.get_unwrap(&paddr);
+                page.write_irqsave().insert_vma(vma.clone());
+            } else {
+                return VmFaultReason::VM_FAULT_OOM;
+            }
+        }
+
         VmFaultReason::VM_FAULT_COMPLETED
     }
 }

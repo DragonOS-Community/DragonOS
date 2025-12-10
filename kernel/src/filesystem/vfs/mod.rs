@@ -788,10 +788,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        log::error!(
-            "function page_cache() has not yet been implemented for inode:{}",
-            crate::libs::name::get_type_name(&self)
-        );
+        // log::warn!(
+        //     "function page_cache() has not yet been implemented for inode:{}",
+        //     crate::libs::name::get_type_name(&self)
+        // );
         None
     }
 

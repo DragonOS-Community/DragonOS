@@ -12,6 +12,7 @@ use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use log::error;
 use system_error::SystemError;
 
+use crate::process::{resource::RLimitID, ProcessManager};
 use alloc::vec::Vec;
 
 /// Handler for the mmap system call, which maps files or devices into memory.
@@ -41,7 +42,14 @@ impl Syscall for SysMmapHandle {
     /// 成功时返回映射的起始地址，失败时返回错误码
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let start_vaddr = VirtAddr::new(Self::start_vaddr(args));
-        let len = page_align_up(Self::len(args));
+        let len_raw = Self::len(args);
+        if len_raw == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let len = page_align_up(len_raw);
+        if len == 0 || len < len_raw {
+            return Err(SystemError::ENOMEM);
+        }
         let prot_flags = Self::prot(args);
         let map_flags = Self::flags(args);
         let fd = Self::fd(args);
@@ -59,6 +67,18 @@ impl Syscall for SysMmapHandle {
         let has_shared = map_flags.contains(MapFlags::MAP_SHARED);
         if has_private == has_shared {
             return Err(SystemError::EINVAL);
+        }
+
+        // RLIMIT_AS 检查（粗略：累计 VMA 大小）
+        let rlim_as = ProcessManager::current_pcb()
+            .get_rlimit(RLimitID::As)
+            .rlim_cur as usize;
+        if rlim_as != usize::MAX {
+            let vm = AddressSpace::current()?;
+            let usage = vm.read().vma_usage_bytes();
+            if usage.checked_add(len).is_none_or(|v| v > rlim_as) {
+                return Err(SystemError::ENOMEM);
+            }
         }
 
         // MAP_FIXED 需页对齐

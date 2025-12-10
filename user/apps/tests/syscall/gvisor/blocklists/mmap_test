@@ -1,15 +1,8 @@
-MMapTest.ExceedLimitData
-MMapTest.ExceedLimitDataPrlimit
-MMapTest.ExceedLimitDataPrlimitPID
-MMapTest.NoExceedLimitAS
-MMapTest.ExceedLimitAS
-MMapTest.HugeLength
 MMapTest.AccessCOWInvalidatesCachedSegments
 MMapFileTest.MapLastPositivePage
 MMapFileTest.MapFirstNegativePage
 MMapFileTest.MapSecondToLastNegativePage
 MMapFileTest.MapLastNegativePage
-MMapFileTest.WriteSharedOnReadOnlyFd
 MMapFileTest.MmapFileWithOpath
 MMapFileTest.ReadSharedTruncateDownThenUp
 MMapFileTest.WriteSharedTruncateDownThenUp

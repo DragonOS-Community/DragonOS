@@ -63,6 +63,8 @@ pub enum ProcFileType {
     ProcStatus,
     /// meminfo
     ProcMeminfo,
+    /// statm
+    ProcStatm,
     /// kmsg
     ProcKmsg,
     /// 可执行路径
@@ -425,6 +427,14 @@ impl ProcFSInode {
         return Ok((data.len() * size_of::<u8>()) as i64);
     }
 
+    /// 打开 statm 文件（最小实现，占位返回七个字段）
+    fn open_statm(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
+        let data: &mut Vec<u8> = &mut pdata.data;
+        data.extend_from_slice(b"0 0 0 0 0 0 0\n");
+        self.trim_string(data);
+        Ok((data.len() * size_of::<u8>()) as i64)
+    }
+
     // 打开 exe 文件
     fn open_exe(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 这个文件是一个软链接，直接返回0即可
@@ -647,6 +657,15 @@ impl ProcFS {
         exe_file.0.lock().fdata.pid = Some(pid);
         exe_file.0.lock().fdata.ftype = ProcFileType::ProcExe;
 
+        // statm 文件
+        let statm_binding = pid_dir.create("statm", FileType::File, InodeMode::S_IRUGO)?;
+        let statm_file = statm_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        statm_file.0.lock().fdata.pid = Some(pid);
+        statm_file.0.lock().fdata.ftype = ProcFileType::ProcStatm;
+
         // fd dir
         let fd = pid_dir.create("fd", FileType::Dir, InodeMode::from_bits_truncate(0o555))?;
         let fd = fd.as_any_ref().downcast_ref::<LockedProcFSInode>().unwrap();
@@ -858,6 +877,7 @@ impl IndexNode for LockedProcFSInode {
         let file_size = match proc_ty {
             ProcFileType::ProcStatus => inode.open_status(&mut proc_private)?,
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut proc_private)?,
+            ProcFileType::ProcStatm => inode.open_statm(&mut proc_private)?,
             ProcFileType::ProcExe => inode.open_exe(&mut proc_private)?,
             ProcFileType::ProcMounts => inode.open_mounts(&mut proc_private)?,
             ProcFileType::ProcVersion => inode.open_version(&mut proc_private)?,
@@ -939,6 +959,7 @@ impl IndexNode for LockedProcFSInode {
         match inode.fdata.ftype {
             ProcFileType::ProcStatus
             | ProcFileType::ProcMeminfo
+            | ProcFileType::ProcStatm
             | ProcFileType::ProcMounts
             | ProcFileType::ProcVersion
             | ProcFileType::ProcCpuinfo => {

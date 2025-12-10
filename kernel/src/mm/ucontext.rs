@@ -34,7 +34,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::page::page_manager_lock_irqsave,
-    process::ProcessManager,
+    process::{resource::RLimitID, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
@@ -152,6 +152,17 @@ pub struct InnerAddressSpace {
 }
 
 impl InnerAddressSpace {
+    /// 当前地址空间已占用的虚拟内存字节数（简单求和所有 VMA 尺寸）
+    pub fn vma_usage_bytes(&self) -> usize {
+        self.mappings
+            .iter_vmas()
+            .map(|v| {
+                let g = v.lock_irqsave();
+                g.region().size()
+            })
+            .sum()
+    }
+
     pub fn new(create_stack: bool) -> Result<Self, SystemError> {
         let mut result = Self {
             user_mapper: MMArch::setup_new_usermapper()?,
@@ -982,11 +993,22 @@ impl InnerAddressSpace {
             return Err(SystemError::EFAULT);
         }
 
+        // 软限制：RLIMIT_DATA
+        let rlim = ProcessManager::current_pcb()
+            .get_rlimit(RLimitID::Data)
+            .rlim_cur as usize;
+        if rlim != usize::MAX {
+            let desired = new_brk.data().saturating_sub(self.brk_start.data());
+            if desired > rlim {
+                return Err(SystemError::ENOMEM);
+            }
+        }
+
         let old_brk = self.brk;
 
         if new_brk > self.brk {
             let len = new_brk - self.brk;
-            let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
+            let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
             let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
             self.map_anonymous(old_brk, len, prot_flags, map_flags, true, false)?;
 
@@ -1019,6 +1041,16 @@ impl InnerAddressSpace {
         };
 
         let new_brk = VirtAddr::new(page_align_up(new_brk.data()));
+
+        let rlim = ProcessManager::current_pcb()
+            .get_rlimit(RLimitID::Data)
+            .rlim_cur as usize;
+        if rlim != usize::MAX {
+            let desired = new_brk.data().saturating_sub(self.brk_start.data());
+            if desired > rlim {
+                return Err(SystemError::ENOMEM);
+            }
+        }
 
         return self.set_brk(new_brk);
     }

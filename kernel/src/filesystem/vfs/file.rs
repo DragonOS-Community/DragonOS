@@ -413,6 +413,14 @@ impl File {
                     | FileMode::FMODE_PWRITE
                     | FileMode::FMODE_ATOMIC_POS,
             );
+        } else {
+            // 对字符设备等，只要具备读/写权限，就允许 pread/pwrite
+            if mode.contains(FileMode::FMODE_READ) {
+                mode.insert(FileMode::FMODE_PREAD);
+            }
+            if mode.contains(FileMode::FMODE_WRITE) {
+                mode.insert(FileMode::FMODE_PWRITE);
+            }
         }
 
         // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE

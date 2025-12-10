@@ -4,11 +4,75 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <sys/stat.h> // 用于 fstat
+#include <sys/stat.h>
 #include <stdint.h>
 #include <errno.h>
 #include <pthread.h>
 #include <time.h>
+
+// ===================================================================
+// 测试框架定义
+// ===================================================================
+
+#define TEST_PASS 0
+#define TEST_FAIL 1
+
+// 测试结果统计
+static int g_tests_total = 0;
+static int g_tests_passed = 0;
+static int g_tests_failed = 0;
+
+// 测试输出宏
+#define TEST_BEGIN(name) \
+    do { \
+        g_tests_total++; \
+        printf("\n"); \
+        printf("========================================\n"); \
+        printf("[TEST %d] %s\n", g_tests_total, name); \
+        printf("========================================\n"); \
+    } while(0)
+
+#define TEST_END_PASS(name) \
+    do { \
+        g_tests_passed++; \
+        printf("----------------------------------------\n"); \
+        printf("[PASS] %s\n", name); \
+        printf("----------------------------------------\n"); \
+    } while(0)
+
+#define TEST_END_FAIL(name, reason) \
+    do { \
+        g_tests_failed++; \
+        printf("----------------------------------------\n"); \
+        printf("[FAIL] %s: %s\n", name, reason); \
+        printf("----------------------------------------\n"); \
+    } while(0)
+
+#define LOG_INFO(fmt, ...) printf("[INFO] " fmt "\n", ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+#define LOG_STEP(fmt, ...) printf("  -> " fmt "\n", ##__VA_ARGS__)
+
+// 打印最终测试汇总
+static void print_test_summary(void) {
+    printf("\n");
+    printf("+========================================+\n");
+    printf("|           TEST SUMMARY                 |\n");
+    printf("+========================================+\n");
+    printf("|  Total:  %3d                           |\n", g_tests_total);
+    printf("|  Passed: %3d                           |\n", g_tests_passed);
+    printf("|  Failed: %3d                           |\n", g_tests_failed);
+    printf("+========================================+\n");
+    if (g_tests_failed == 0) {
+        printf("|  Result: ALL TESTS PASSED              |\n");
+    } else {
+        printf("|  Result: SOME TESTS FAILED             |\n");
+    }
+    printf("+========================================+\n");
+}
+
+// ===================================================================
+// Loop 设备常量定义
+// ===================================================================
 
 // 控制命令常量
 #define LOOP_CTL_ADD        0x4C80
@@ -18,17 +82,18 @@
 #define LOOP_CLR_FD         0x4C01
 #define LOOP_SET_STATUS64   0x4C04
 #define LOOP_GET_STATUS64   0x4C05
-#define LOOP_CHANGE_FD      0x4C06 // 新增
-#define LOOP_SET_CAPACITY   0x4C07 // 新增
+#define LOOP_CHANGE_FD      0x4C06
+#define LOOP_SET_CAPACITY   0x4C07
 
-// 与内核通信的设备路径
+// 设备路径和测试参数
 #define LOOP_DEVICE_CONTROL "/dev/loop-control"
 #define LO_FLAGS_READ_ONLY  0x1
-#define TEST_FILE_NAME "test_image.img"
-#define TEST_FILE_NAME_2 "test_image_2.img" // 第二个测试文件
-#define TEST_FILE_SIZE (1024 * 1024) // 测试镜像大小 1MB
-#define TEST_FILE_SIZE_2 (512 * 1024) // 第二个测试镜像大小 512KB
+#define TEST_FILE_NAME      "test_image.img"
+#define TEST_FILE_NAME_2    "test_image_2.img"
+#define TEST_FILE_SIZE      (1024 * 1024)   // 1MB
+#define TEST_FILE_SIZE_2    (512 * 1024)    // 512KB
 
+// Loop 状态结构体
 struct loop_status64 {
     uint64_t lo_offset;
     uint64_t lo_sizelimit;
@@ -36,42 +101,73 @@ struct loop_status64 {
     uint32_t __pad;
 };
 
+// ===================================================================
+// 全局测试资源
+// ===================================================================
+
+static int g_control_fd = -1;
+static int g_backing_fd_1 = -1;
+static int g_backing_fd_2 = -1;
+
+// ===================================================================
+// 辅助函数
+// ===================================================================
+
 // 创建测试镜像文件
-void create_test_file(const char* filename, int size) {
-    printf("Creating test file: %s with size %d bytes\n", filename, size);
+static int create_test_file(const char *filename, int size) {
+    LOG_STEP("Creating test file: %s (%d bytes)", filename, size);
+
     int fd = open(filename, O_CREAT | O_TRUNC | O_RDWR, 0644);
     if (fd < 0) {
-        perror("Failed to create test file");
-        exit(EXIT_FAILURE);
+        LOG_ERROR("Failed to create test file: %s", strerror(errno));
+        return -1;
     }
-    // 写入零填充数据以确保文件占满容量
+
     char zero_block[512] = {0};
     for (int i = 0; i < size / 512; ++i) {
         if (write(fd, zero_block, 512) != 512) {
-            perror("Failed to write to test file");
+            LOG_ERROR("Failed to write to test file: %s", strerror(errno));
             close(fd);
-            exit(EXIT_FAILURE);
+            return -1;
         }
     }
-    printf("Test file %s created successfully.\n", filename);
+
     close(fd);
+    LOG_STEP("Test file created successfully");
+    return 0;
 }
 
-// 获取文件大小的辅助函数
-long get_file_size(int fd) {
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        perror("fstat failed");
-        return -1;
+// 使用重试机制创建 loop 设备
+static int create_loop_device(int control_fd, int *out_minor) {
+    for (int retry = 0; retry < 10; retry++) {
+        // LOOP_CTL_GET_FREE 通过返回值返回 free 的 minor 号
+        int free_minor = ioctl(control_fd, LOOP_CTL_GET_FREE, 0);
+        if (free_minor < 0) {
+            LOG_ERROR("Failed to get free loop device: %s", strerror(errno));
+            return -1;
+        }
+
+        int ret = ioctl(control_fd, LOOP_CTL_ADD, free_minor);
+        if (ret >= 0) {
+            *out_minor = ret;
+            return 0;
+        }
+
+        if (errno != EEXIST) {
+            LOG_ERROR("Failed to add loop device: %s", strerror(errno));
+            return -1;
+        }
+        // 设备已存在，重试
     }
-    return st.st_size;
+
+    LOG_ERROR("Failed to create loop device after 10 retries");
+    return -1;
 }
 
 // ===================================================================
-// 资源回收测试辅助结构和函数
+// 并发测试辅助结构
 // ===================================================================
 
-// 线程参数结构，用于并发I/O测试
 struct io_thread_args {
     char loop_dev_path[64];
     int duration_seconds;
@@ -80,9 +176,15 @@ struct io_thread_args {
     int error_count;
 };
 
-// 并发读写线程函数
-void* io_worker_thread(void* arg) {
-    struct io_thread_args* args = (struct io_thread_args*)arg;
+struct delete_thread_args {
+    int control_fd;
+    int loop_minor;
+    int result;
+    int error_code;
+};
+
+static void *io_worker_thread(void *arg) {
+    struct io_thread_args *args = (struct io_thread_args *)arg;
     char buffer[512];
     time_t start_time = time(NULL);
 
@@ -90,15 +192,13 @@ void* io_worker_thread(void* arg) {
         int fd = open(args->loop_dev_path, O_RDWR);
         if (fd < 0) {
             if (errno == ENODEV || errno == ENOENT) {
-                // 设备正在删除或已删除，这是预期的
                 break;
             }
             args->error_count++;
-            usleep(10000); // 10ms
+            usleep(10000);
             continue;
         }
 
-        // 尝试读取
         if (read(fd, buffer, sizeof(buffer)) < 0) {
             if (errno != ENODEV) {
                 args->error_count++;
@@ -108,25 +208,15 @@ void* io_worker_thread(void* arg) {
         }
 
         close(fd);
-        usleep(1000); // 1ms
+        usleep(1000);
     }
 
     return NULL;
 }
 
-// 删除设备线程函数
-struct delete_thread_args {
-    int control_fd;
-    int loop_minor;
-    int result;
-    int error_code;
-};
-
-void* delete_worker_thread(void* arg) {
-    struct delete_thread_args* args = (struct delete_thread_args*)arg;
-
-    // 稍微延迟以确保I/O线程已经开始
-    usleep(50000); // 50ms
+static void *delete_worker_thread(void *arg) {
+    struct delete_thread_args *args = (struct delete_thread_args *)arg;
+    usleep(50000); // 50ms 延迟确保 I/O 线程已启动
 
     args->result = ioctl(args->control_fd, LOOP_CTL_REMOVE, args->loop_minor);
     args->error_code = errno;
@@ -134,854 +224,717 @@ void* delete_worker_thread(void* arg) {
     return NULL;
 }
 
-int main() {
-    int control_fd;
-    int loop_minor;
-    char loop_dev_path[64];
-    int loop_fd;
-    int backing_fd_1 = -1;
-    int backing_fd_2 = -1; // 第二个后端文件描述符
-    struct loop_status64 status;
-    memset(&status, 0, sizeof(status));
+// ===================================================================
+// 测试用例
+// ===================================================================
+
+// 测试 1: 基本读写测试
+static int test_basic_read_write(int loop_fd, const char *loop_path,
+                                  struct loop_status64 *status) {
+    const char *test_name = "Basic Read/Write";
+    TEST_BEGIN(test_name);
+
     char write_buf[512] = "Hello Loop Device!";
-    char write_buf_2[512] = "New Backing File Data!"; // 第二个文件写入数据
-    char read_buf[512];
-    char verify_buf[512];
+    char read_buf[512] = {0};
+    char verify_buf[512] = {0};
 
-    create_test_file(TEST_FILE_NAME, TEST_FILE_SIZE); // 创建作为 loop 设备后端的文件 1
-    create_test_file(TEST_FILE_NAME_2, TEST_FILE_SIZE_2); // 创建作为 loop 设备后端的文件 2
-
-    backing_fd_1 = open(TEST_FILE_NAME, O_RDWR);
-    if (backing_fd_1 < 0) {
-        perror("Failed to open backing file 1");
-        exit(EXIT_FAILURE);
-    }
-
-    backing_fd_2 = open(TEST_FILE_NAME_2, O_RDWR);
-    if (backing_fd_2 < 0) {
-        perror("Failed to open backing file 2");
-        close(backing_fd_1);
-        exit(EXIT_FAILURE);
-    }
-
-    // 1. 打开 loop-control 字符设备
-    printf("Opening loop control device: %s\n", LOOP_DEVICE_CONTROL);
-    control_fd = open(LOOP_DEVICE_CONTROL, O_RDWR);
-    if (control_fd < 0) {
-        perror("Failed to open loop control device. Make sure your kernel module is loaded and /dev/loop-control exists.");
-        close(backing_fd_1);
-        close(backing_fd_2);
-        exit(EXIT_FAILURE);
-    }
-    printf("Loop control device opened successfully (fd=%d).\n", control_fd);
-
-    // 2. 获取一个空闲的 loop 次设备号
-    printf("Requesting a free loop device minor...\n");
-    if (ioctl(control_fd, LOOP_CTL_GET_FREE, &loop_minor) < 0) {
-        perror("Failed to get free loop device minor");
-        close(backing_fd_1);
-        close(backing_fd_2);
-        close(control_fd);
-        exit(EXIT_FAILURE);
-    }
-    printf("Got free loop minor: %d\n", loop_minor);
-
-    // 3. 请求内核以该次设备号创建新的 loop 设备
-    printf("Adding loop device loop%d...\n", loop_minor);
-    int returned_minor = ioctl(control_fd, LOOP_CTL_ADD, loop_minor);
-    if (returned_minor < 0) {
-        perror("Failed to add loop device");
-        printf("returned_minor: %d\n", returned_minor);
-        close(backing_fd_1);
-        close(backing_fd_2);
-        close(control_fd);
-        exit(EXIT_FAILURE);
-    }
-    if (returned_minor != loop_minor) {  
-        fprintf(stderr, "Warning: LOOP_CTL_ADD returned minor %d, expected %d\n", returned_minor, loop_minor);
-    }
-    printf("Loop device loop%d added (kernel returned minor: %d).\n", loop_minor, returned_minor);
-
-    // 4. 打开刚创建的块设备节点
-    sprintf(loop_dev_path, "/dev/loop%d", loop_minor);
-    printf("Attempting to open block device: %s\n", loop_dev_path);
-    loop_fd = open(loop_dev_path, O_RDWR);
-    if (loop_fd < 0) {
-        perror("Failed to open loop block device. This might mean the block device node wasn't created/registered correctly, or permissions.");
-        fprintf(stderr, "Make sure /dev/loop%d exists as a block device.\n", loop_minor);
-        close(backing_fd_1);
-        close(backing_fd_2);
-        close(control_fd);
-        exit(EXIT_FAILURE);
-    }
-    printf("Loop block device %s opened successfully (fd=%d).\n", loop_dev_path, loop_fd);
-
-    printf("Associating backing file %s with loop device using LOOP_SET_FD...\n", TEST_FILE_NAME);
-    if (ioctl(loop_fd, LOOP_SET_FD, backing_fd_1) < 0) {
-        perror("Failed to associate backing file with loop device");
-        close(loop_fd);
-        close(backing_fd_1);
-        close(backing_fd_2);
-        close(control_fd);
-        exit(EXIT_FAILURE);
-    }
-    printf("Backing file associated successfully.\n");
-
-    // 配置偏移和大小限制，使 loop 设备从文件第 512 字节开始映射
-    status.lo_offset = 512;
-    status.lo_sizelimit = TEST_FILE_SIZE - status.lo_offset;
-    status.lo_flags = 0;
-    status.__pad = 0;
-
-    printf("配置 loop 设备的偏移和大小限制...\n");
-    if (ioctl(loop_fd, LOOP_SET_STATUS64, &status) < 0) {
-        perror("Failed to set loop status64");
-        close(loop_fd);
-        close(backing_fd_1);
-        close(backing_fd_2);
-        close(control_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    struct loop_status64 status_readback = {0};
-    if (ioctl(loop_fd, LOOP_GET_STATUS64, &status_readback) < 0) {
-        perror("Failed to get loop status64");
-        close(loop_fd);
-        close(backing_fd_1);
-        close(backing_fd_2);
-        close(control_fd);
-        exit(EXIT_FAILURE);
-    }
-    printf("loop 偏移: %llu, 映射字节数: %llu, 标志: 0x%x\n",
-           (unsigned long long)status_readback.lo_offset,
-           (unsigned long long)status_readback.lo_sizelimit,
-           status_readback.lo_flags);
-
-    if (status_readback.lo_offset != status.lo_offset ||
-        status_readback.lo_sizelimit != status.lo_sizelimit) {
-        fprintf(stderr, "Loop status mismatch after configuration.\n");
-        close(loop_fd);
-        close(backing_fd_1);
-        close(backing_fd_2);
-        close(control_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    status = status_readback;
-
-    // 5. 对 loop 块设备执行读写测试 (针对第一个文件)
-
-    printf("Writing to loop device %s (via %s)...\n", loop_dev_path, TEST_FILE_NAME);
+    // 写入测试
+    LOG_STEP("Writing data to loop device...");
     if (lseek(loop_fd, 0, SEEK_SET) < 0) {
-        perror("lseek failed before write");
-        goto cleanup;
+        TEST_END_FAIL(test_name, "lseek failed before write");
+        return TEST_FAIL;
     }
-    if (write(loop_fd, write_buf, sizeof(write_buf)) != sizeof(write_buf)) {
-        perror("Failed to write to loop device");
-        goto cleanup;
-    }
-    printf("Successfully wrote '%s' to loop device.\n", write_buf);
 
-    // 校验后端文件对应偏移512字节的数据是否与写入内容一致
+    if (write(loop_fd, write_buf, sizeof(write_buf)) != sizeof(write_buf)) {
+        TEST_END_FAIL(test_name, "write failed");
+        return TEST_FAIL;
+    }
+    LOG_STEP("Write successful: '%s'", write_buf);
+
+    // 验证后端文件
+    LOG_STEP("Verifying backing file content...");
     int verify_fd = open(TEST_FILE_NAME, O_RDONLY);
     if (verify_fd < 0) {
-        perror("Failed to reopen backing file for verification");
-        goto cleanup;
+        TEST_END_FAIL(test_name, "cannot open backing file for verification");
+        return TEST_FAIL;
     }
-    if (lseek(verify_fd, (off_t)status.lo_offset, SEEK_SET) < 0) {
-        perror("Failed to seek backing file");
+
+    if (lseek(verify_fd, (off_t)status->lo_offset, SEEK_SET) < 0 ||
+        read(verify_fd, verify_buf, sizeof(write_buf)) != sizeof(write_buf)) {
         close(verify_fd);
-        goto cleanup;
-    }
-    if (read(verify_fd, verify_buf, sizeof(write_buf)) != sizeof(write_buf)) {
-        perror("Failed to read back from backing file");
-        close(verify_fd);
-        goto cleanup;
+        TEST_END_FAIL(test_name, "cannot read backing file");
+        return TEST_FAIL;
     }
     close(verify_fd);
+
     if (memcmp(write_buf, verify_buf, sizeof(write_buf)) != 0) {
-        fprintf(stderr, "Backing file data mismatch.\n");
-        goto cleanup;
+        TEST_END_FAIL(test_name, "backing file content mismatch");
+        return TEST_FAIL;
     }
-    printf("镜像文件内容验证通过。\n");
+    LOG_STEP("Backing file verification passed");
 
-    printf("Reading from loop device %s...\n", loop_dev_path);
-    memset(read_buf, 0, sizeof(read_buf));
+    // 读取测试
+    LOG_STEP("Reading data from loop device...");
     if (lseek(loop_fd, 0, SEEK_SET) < 0) {
-        perror("lseek failed before read");
-        goto cleanup;
+        TEST_END_FAIL(test_name, "lseek failed before read");
+        return TEST_FAIL;
     }
+
     if (read(loop_fd, read_buf, sizeof(read_buf)) != sizeof(read_buf)) {
-        perror("Failed to read from loop device");
-        goto cleanup;
+        TEST_END_FAIL(test_name, "read failed");
+        return TEST_FAIL;
     }
-    printf("Successfully read '%s' from loop device.\n", read_buf);
+    LOG_STEP("Read successful: '%s'", read_buf);
 
-    if (strcmp(write_buf, read_buf) == 0) {
-        printf("Read/write test PASSED.\n");
-    } else {
-        printf("Read/write test FAILED: Mismatch in data.\n");
-        goto cleanup;
+    if (strcmp(write_buf, read_buf) != 0) {
+        TEST_END_FAIL(test_name, "read data mismatch");
+        return TEST_FAIL;
     }
 
-    // 将设备切换到只读模式，验证写入被阻止
-    printf("切换 loop 设备为只读模式...\n");
-    status.lo_flags |= LO_FLAGS_READ_ONLY;
-    if (ioctl(loop_fd, LOOP_SET_STATUS64, &status) < 0) {
-        perror("Failed to enable read-only flag");
-        goto cleanup;
+    TEST_END_PASS(test_name);
+    return TEST_PASS;
+}
+
+// 测试 2: 只读模式测试
+static int test_read_only_mode(int loop_fd, struct loop_status64 *status) {
+    const char *test_name = "Read-Only Mode";
+    TEST_BEGIN(test_name);
+
+    char write_buf[512] = "Test data";
+
+    // 设置只读标志
+    LOG_STEP("Setting read-only flag...");
+    status->lo_flags |= LO_FLAGS_READ_ONLY;
+    if (ioctl(loop_fd, LOOP_SET_STATUS64, status) < 0) {
+        TEST_END_FAIL(test_name, "failed to set read-only flag");
+        return TEST_FAIL;
     }
 
+    // 尝试写入（应该失败）
+    LOG_STEP("Attempting write in read-only mode (should fail)...");
     errno = 0;
     if (lseek(loop_fd, 0, SEEK_SET) < 0) {
-        perror("Failed to seek loop device");
+        // lseek 失败不影响测试
     }
+
     if (write(loop_fd, write_buf, sizeof(write_buf)) >= 0 || errno != EROFS) {
-        fprintf(stderr, "Write unexpectedly succeeded under read-only mode (errno=%d).\n", errno);
-        goto cleanup;
+        status->lo_flags &= ~LO_FLAGS_READ_ONLY;
+        ioctl(loop_fd, LOOP_SET_STATUS64, status);
+        TEST_END_FAIL(test_name, "write should have failed with EROFS");
+        return TEST_FAIL;
     }
-    printf("只读模式下写入被正确阻止。\n");
+    LOG_STEP("Write correctly rejected with EROFS");
 
-    status.lo_flags &= ~LO_FLAGS_READ_ONLY;
-    if (ioctl(loop_fd, LOOP_SET_STATUS64, &status) < 0) {
-        perror("Failed to restore writeable mode");
-        goto cleanup;
+    // 恢复可写模式
+    LOG_STEP("Restoring writable mode...");
+    status->lo_flags &= ~LO_FLAGS_READ_ONLY;
+    if (ioctl(loop_fd, LOOP_SET_STATUS64, status) < 0) {
+        TEST_END_FAIL(test_name, "failed to restore writable mode");
+        return TEST_FAIL;
     }
 
-    // =======================================================
-    // 新增测试用例：LOOP_CHANGE_FD
-    // =======================================================
-    printf("\n--- Testing LOOP_CHANGE_FD ---\n");
-    printf("Changing backing file from %s to %s using LOOP_CHANGE_FD...\n", TEST_FILE_NAME, TEST_FILE_NAME_2);
-    if (ioctl(loop_fd, LOOP_CHANGE_FD, backing_fd_2) < 0) {
-        perror("Failed to change backing file via LOOP_CHANGE_FD");
-        goto cleanup;
+    TEST_END_PASS(test_name);
+    return TEST_PASS;
+}
+
+// 测试 3: LOOP_CHANGE_FD
+static int test_change_fd(int loop_fd, struct loop_status64 *status) {
+    const char *test_name = "LOOP_CHANGE_FD";
+    TEST_BEGIN(test_name);
+
+    char write_buf[512] = "New Backing File Data!";
+    char verify_buf[512] = {0};
+
+    // 切换后端文件
+    LOG_STEP("Changing backing file to %s...", TEST_FILE_NAME_2);
+    if (ioctl(loop_fd, LOOP_CHANGE_FD, g_backing_fd_2) < 0) {
+        TEST_END_FAIL(test_name, "LOOP_CHANGE_FD failed");
+        return TEST_FAIL;
     }
-    printf("Backing file changed successfully to %s.\n", TEST_FILE_NAME_2);
+    LOG_STEP("Backing file changed successfully");
 
-    // 验证 loop 设备现在映射到第二个文件
-    status_readback = (struct loop_status64){0};
-    if (ioctl(loop_fd, LOOP_GET_STATUS64, &status_readback) < 0) {
-        perror("Failed to get loop status64 after LOOP_CHANGE_FD");
-        goto cleanup;
+    // 获取新状态
+    struct loop_status64 new_status = {0};
+    if (ioctl(loop_fd, LOOP_GET_STATUS64, &new_status) < 0) {
+        TEST_END_FAIL(test_name, "failed to get status after change");
+        return TEST_FAIL;
     }
-    printf("After LOOP_CHANGE_FD, loop current offset: %llu, sizelimit: %llu, flags: 0x%x\n",
-           (unsigned long long)status_readback.lo_offset,
-           (unsigned long long)status_readback.lo_sizelimit,
-           status_readback.lo_flags);
+    LOG_STEP("New status - offset: %llu, sizelimit: %llu, flags: 0x%x",
+             (unsigned long long)new_status.lo_offset,
+             (unsigned long long)new_status.lo_sizelimit,
+             new_status.lo_flags);
 
-    // 确保偏移和大小限制保持，但实际大小应该基于新文件
-    long actual_file_2_size = get_file_size(backing_fd_2);
-    if (actual_file_2_size < 0) goto cleanup;
-
-    // 此时 lo_sizelimit 应该反映出 TEST_FILE_NAME_2 的大小
-    // 因为 LOOP_CHANGE_FD 会调用 recalc_effective_size
-    // 并且默认的 sizelimit 是 0，表示不限制
-    // 所以 effective_size 应该等于 file_size - offset
-    // 我们需要重新计算预期的 effective_size
-    // uint64_t expected_sizelimit_after_change = (actual_file_2_size > status_readback.lo_offset) ? (actual_file_2_size - status_readback.lo_offset) : 0;
-
-    // 注意：内核中的 `recalc_effective_size` 会将 `inner.file_size` 更新为有效大小
-    // 但是 `lo_sizelimit` 字段在 `LoopStatus64` 中是用户设定的限制，它不会自动改变
-    // 这里的验证需要更精确：`lo_sizelimit` 应该和我们之前设置的相同 (即 TEST_FILE_SIZE - 512)
-    // 但当 `LOOP_CHANGE_FD` 成功时，其内部会重新计算 `file_size`
-    // 如果 `lo_sizelimit` 保持为非0值，并且大于新文件大小，则 `file_size` 会被截断
-    // 让我们先简单地检查是否能对新文件进行读写。
-    
-    // 写入新数据到 loop 设备，应该写入到 TEST_FILE_NAME_2
-    printf("Writing to loop device %s (via %s)...\n", loop_dev_path, TEST_FILE_NAME_2);
-    if (lseek(loop_fd, 0, SEEK_SET) < 0) {
-        perror("lseek failed before write to new backing file");
-        goto cleanup;
+    // 写入新后端文件
+    LOG_STEP("Writing to new backing file...");
+    if (lseek(loop_fd, 0, SEEK_SET) < 0 ||
+        write(loop_fd, write_buf, sizeof(write_buf)) != sizeof(write_buf)) {
+        TEST_END_FAIL(test_name, "write to new backing file failed");
+        return TEST_FAIL;
     }
-    if (write(loop_fd, write_buf_2, sizeof(write_buf_2)) != sizeof(write_buf_2)) {
-        perror("Failed to write to loop device with new backing file");
-        goto cleanup;
-    }
-    printf("Successfully wrote '%s' to loop device with new backing file.\n", write_buf_2);
+    LOG_STEP("Write successful: '%s'", write_buf);
 
-    // 校验第二个后端文件对应偏移512字节的数据是否与写入内容一致
-    verify_fd = open(TEST_FILE_NAME_2, O_RDONLY);
+    // 验证新后端文件内容
+    LOG_STEP("Verifying new backing file content...");
+    int verify_fd = open(TEST_FILE_NAME_2, O_RDONLY);
     if (verify_fd < 0) {
-        perror("Failed to reopen new backing file for verification");
-        goto cleanup;
+        TEST_END_FAIL(test_name, "cannot open new backing file");
+        return TEST_FAIL;
     }
-    if (lseek(verify_fd, (off_t)status.lo_offset, SEEK_SET) < 0) { // 使用之前设置的偏移量
-        perror("Failed to seek new backing file");
+
+    if (lseek(verify_fd, (off_t)status->lo_offset, SEEK_SET) < 0 ||
+        read(verify_fd, verify_buf, sizeof(write_buf)) != sizeof(write_buf)) {
         close(verify_fd);
-        goto cleanup;
-    }
-    memset(verify_buf, 0, sizeof(verify_buf));
-    if (read(verify_fd, verify_buf, sizeof(write_buf_2)) != sizeof(write_buf_2)) {
-        perror("Failed to read back from new backing file");
-        close(verify_fd);
-        goto cleanup;
+        TEST_END_FAIL(test_name, "cannot read new backing file");
+        return TEST_FAIL;
     }
     close(verify_fd);
-    if (memcmp(write_buf_2, verify_buf, sizeof(write_buf_2)) != 0) {
-        fprintf(stderr, "New backing file data mismatch after LOOP_CHANGE_FD.\n");
-        goto cleanup;
-    }
-    printf("New backing file content verification passed after LOOP_CHANGE_FD.\n");
 
-    // =======================================================
-    // 新增测试用例：LOOP_SET_CAPACITY
-    // =======================================================
-    printf("\n--- Testing LOOP_SET_CAPACITY ---\n");
-    // 增大 TEST_FILE_NAME_2 的大小
+    if (memcmp(write_buf, verify_buf, sizeof(write_buf)) != 0) {
+        TEST_END_FAIL(test_name, "new backing file content mismatch");
+        return TEST_FAIL;
+    }
+
+    TEST_END_PASS(test_name);
+    return TEST_PASS;
+}
+
+// 测试 4: LOOP_SET_CAPACITY
+static int test_set_capacity(int loop_fd, struct loop_status64 *status) {
+    const char *test_name = "LOOP_SET_CAPACITY";
+    TEST_BEGIN(test_name);
+
+    // 扩大后端文件
+    LOG_STEP("Resizing backing file to %d bytes...", TEST_FILE_SIZE_2 * 2);
     int resize_fd = open(TEST_FILE_NAME_2, O_RDWR);
     if (resize_fd < 0) {
-        perror("Failed to open TEST_FILE_NAME_2 for resizing");
-        goto cleanup;
+        TEST_END_FAIL(test_name, "cannot open backing file for resize");
+        return TEST_FAIL;
     }
-    int new_backing_file_size = TEST_FILE_SIZE_2 * 2; // 双倍大小
-    if (ftruncate(resize_fd, new_backing_file_size) < 0) {
-        perror("Failed to ftruncate TEST_FILE_NAME_2");
+
+    int new_size = TEST_FILE_SIZE_2 * 2;
+    if (ftruncate(resize_fd, new_size) < 0) {
         close(resize_fd);
-        goto cleanup;
+        TEST_END_FAIL(test_name, "ftruncate failed");
+        return TEST_FAIL;
     }
     close(resize_fd);
-    printf("Resized %s to %d bytes.\n", TEST_FILE_NAME_2, new_backing_file_size);
+    LOG_STEP("Backing file resized successfully");
 
-    printf("Calling LOOP_SET_CAPACITY to re-evaluate loop device size...\n");
-    if (ioctl(loop_fd, LOOP_SET_CAPACITY, 0) < 0) { // 参数通常为0
-        perror("Failed to set loop capacity");
-        goto cleanup;
+    // 清除 sizelimit 以便看到扩展效果
+    LOG_STEP("Clearing sizelimit...");
+    status->lo_sizelimit = 0;
+    if (ioctl(loop_fd, LOOP_SET_STATUS64, status) < 0) {
+        TEST_END_FAIL(test_name, "failed to clear sizelimit");
+        return TEST_FAIL;
     }
-    printf("LOOP_SET_CAPACITY called successfully.\n");
 
-    // 获取并验证新的容量
-    status_readback = (struct loop_status64){0};
-    if (ioctl(loop_fd, LOOP_GET_STATUS64, &status_readback) < 0) {
-        perror("Failed to get loop status64 after LOOP_SET_CAPACITY");
-        goto cleanup;
-    }
-    printf("After LOOP_SET_CAPACITY, loop current offset: %llu, sizelimit: %llu, flags: 0x%x\n",
-           (unsigned long long)status_readback.lo_offset,
-           (unsigned long long)status_readback.lo_sizelimit,
-           status_readback.lo_flags);
-
-    // 重新计算预期大小。由于 lo_sizelimit 仍为非零值 (TEST_FILE_SIZE - 512)，
-    // 并且新文件大小 (new_backing_file_size) 仍然可能小于 (lo_offset + lo_sizelimit)
-    // 实际有效大小应为 min(new_backing_file_size - lo_offset, lo_sizelimit)
-    uint64_t expected_effective_size = (new_backing_file_size > status_readback.lo_offset) ? (new_backing_file_size - status_readback.lo_offset) : 0;
-    expected_effective_size = (status_readback.lo_sizelimit > 0) ? 
-                                expected_effective_size < status_readback.lo_sizelimit ? expected_effective_size : status_readback.lo_sizelimit :
-                                expected_effective_size;
-
-
-    // 实际验证 read/write 是否能访问到更大的区域。
-    // 由于我们之前设置了 lo_sizelimit，它会限制设备可见的大小。
-    // 如果想要反映出 ftruncate 后更大的大小，需要将 lo_sizelimit 设为 0。
-    // 让我们先将 lo_sizelimit 清零，再测试 LOOP_SET_CAPACITY。
-
-    printf("Clearing lo_sizelimit and re-testing LOOP_SET_CAPACITY...\n");
-    status.lo_sizelimit = 0; // 清零，表示不限制
-    if (ioctl(loop_fd, LOOP_SET_STATUS64, &status) < 0) {
-        perror("Failed to clear lo_sizelimit");
-        goto cleanup;
-    }
-    printf("lo_sizelimit cleared. Calling LOOP_SET_CAPACITY again.\n");
-
+    // 调用 LOOP_SET_CAPACITY
+    LOG_STEP("Calling LOOP_SET_CAPACITY...");
     if (ioctl(loop_fd, LOOP_SET_CAPACITY, 0) < 0) {
-        perror("Failed to set loop capacity after clearing sizelimit");
-        goto cleanup;
+        TEST_END_FAIL(test_name, "LOOP_SET_CAPACITY failed");
+        return TEST_FAIL;
     }
-    printf("LOOP_SET_CAPACITY called successfully after clearing sizelimit.\n");
+    LOG_STEP("LOOP_SET_CAPACITY successful");
 
-    if (ioctl(loop_fd, LOOP_GET_STATUS64, &status_readback) < 0) {
-        perror("Failed to get loop status64 after LOOP_SET_CAPACITY (sizelimit cleared)");
-        goto cleanup;
+    // 获取新状态
+    struct loop_status64 new_status = {0};
+    if (ioctl(loop_fd, LOOP_GET_STATUS64, &new_status) < 0) {
+        TEST_END_FAIL(test_name, "failed to get status after capacity change");
+        return TEST_FAIL;
     }
-    printf("After LOOP_SET_CAPACITY (sizelimit cleared), loop current offset: %llu, sizelimit: %llu, flags: 0x%x\n",
-           (unsigned long long)status_readback.lo_offset,
-           (unsigned long long)status_readback.lo_sizelimit,
-           status_readback.lo_flags);
+    LOG_STEP("New status - offset: %llu, sizelimit: %llu",
+             (unsigned long long)new_status.lo_offset,
+             (unsigned long long)new_status.lo_sizelimit);
 
-    // 现在 lo_sizelimit 应该为 0，有效大小应为 (new_backing_file_size - lo_offset)
-    expected_effective_size = (new_backing_file_size > status_readback.lo_offset) ? (new_backing_file_size - status_readback.lo_offset) : 0;
-    
-    // 尝试写入到新扩展的区域 (假设扩展区域在原文件大小之后)
-    // 计算旧文件大小的最后一个块的偏移，然后写入一个块
-    off_t write_offset_extended = (off_t)status_readback.lo_offset + TEST_FILE_SIZE_2; // 从原文件大小之后开始写
-    char extended_write_buf[512] = "Extended Data!";
-
-    printf("Attempting to write to extended region at offset %lld (device offset: %lld)...\n", 
-           (long long)write_offset_extended, (long long)(TEST_FILE_SIZE_2)); // loop 设备上的相对偏移
-    if (lseek(loop_fd, TEST_FILE_SIZE_2, SEEK_SET) < 0) { // 在 loop 设备上的相对偏移
-        perror("lseek to extended region failed");
-        goto cleanup;
+    // 尝试写入扩展区域
+    LOG_STEP("Writing to extended region...");
+    char extended_buf[512] = "Extended Data!";
+    if (lseek(loop_fd, TEST_FILE_SIZE_2, SEEK_SET) < 0 ||
+        write(loop_fd, extended_buf, sizeof(extended_buf)) != sizeof(extended_buf)) {
+        TEST_END_FAIL(test_name, "write to extended region failed");
+        return TEST_FAIL;
     }
-    if (write(loop_fd, extended_write_buf, sizeof(extended_write_buf)) != sizeof(extended_write_buf)) {
-        perror("Failed to write to extended region of loop device");
-        goto cleanup;
-    }
-    printf("Successfully wrote to extended region of loop device.\n");
+    LOG_STEP("Write to extended region successful");
 
-    // 校验第二个后端文件扩展区域的数据
-    verify_fd = open(TEST_FILE_NAME_2, O_RDONLY);
+    // 验证扩展区域内容
+    LOG_STEP("Verifying extended region content...");
+    char verify_buf[512] = {0};
+    int verify_fd = open(TEST_FILE_NAME_2, O_RDONLY);
     if (verify_fd < 0) {
-        perror("Failed to reopen new backing file for extended verification");
-        goto cleanup;
+        TEST_END_FAIL(test_name, "cannot open backing file for verification");
+        return TEST_FAIL;
     }
-    if (lseek(verify_fd, write_offset_extended, SEEK_SET) < 0) {
-        perror("Failed to seek new backing file for extended verification");
+
+    off_t verify_offset = (off_t)status->lo_offset + TEST_FILE_SIZE_2;
+    if (lseek(verify_fd, verify_offset, SEEK_SET) < 0 ||
+        read(verify_fd, verify_buf, sizeof(extended_buf)) != sizeof(extended_buf)) {
         close(verify_fd);
-        goto cleanup;
-    }
-    memset(verify_buf, 0, sizeof(verify_buf));
-    if (read(verify_fd, verify_buf, sizeof(extended_write_buf)) != sizeof(extended_write_buf)) {
-        perror("Failed to read back from new backing file extended region");
-        close(verify_fd);
-        goto cleanup;
+        TEST_END_FAIL(test_name, "cannot read extended region");
+        return TEST_FAIL;
     }
     close(verify_fd);
-    if (memcmp(extended_write_buf, verify_buf, sizeof(extended_write_buf)) != 0) {
-        fprintf(stderr, "New backing file extended data mismatch after LOOP_SET_CAPACITY.\n");
-        goto cleanup;
-    }
-    printf("New backing file extended content verification passed.\n");
 
-    // =======================================================
-    // 资源回收测试 1: 并发I/O期间删除设备
-    // =======================================================
-    printf("\n--- Testing Resource Reclamation: Concurrent I/O During Deletion ---\n");
-
-    // 创建新的loop设备用于此测试，使用重试机制处理可能的竞态条件
-    int test_minor = -1;
-    int returned_minor_test = -1;
-    for (int retry = 0; retry < 10; retry++) {
-        if (ioctl(control_fd, LOOP_CTL_GET_FREE, &test_minor) < 0) {
-            perror("Failed to get free loop device for reclamation test");
-            goto cleanup;
-        }
-
-        returned_minor_test = ioctl(control_fd, LOOP_CTL_ADD, test_minor);
-        if (returned_minor_test >= 0) {
-            test_minor = returned_minor_test;
-            break;
-        }
-
-        if (errno != EEXIST) {
-            perror("Failed to add loop device for reclamation test");
-            goto cleanup;
-        }
-        // 如果设备已存在，重试获取新的minor号
-        printf("Device loop%d already exists, retrying...\n", test_minor);
+    if (memcmp(extended_buf, verify_buf, sizeof(extended_buf)) != 0) {
+        TEST_END_FAIL(test_name, "extended region content mismatch");
+        return TEST_FAIL;
     }
 
-    if (returned_minor_test < 0) {
-        fprintf(stderr, "Failed to create loop device after 10 retries\n");
-        goto cleanup;
-    }
+    TEST_END_PASS(test_name);
+    return TEST_PASS;
+}
 
-    char test_loop_path[64];
-    sprintf(test_loop_path, "/dev/loop%d", test_minor);
-    int test_loop_fd = open(test_loop_path, O_RDWR);
-    if (test_loop_fd < 0) {
-        perror("Failed to open test loop device");
-        ioctl(control_fd, LOOP_CTL_REMOVE, test_minor);
-        goto cleanup;
-    }
+// 测试 5: 并发 I/O 期间删除设备
+static int test_concurrent_io_deletion(void) {
+    const char *test_name = "Concurrent I/O During Deletion";
+    TEST_BEGIN(test_name);
 
-    // 绑定到测试文件
-    if (ioctl(test_loop_fd, LOOP_SET_FD, backing_fd_1) < 0) {
-        perror("Failed to bind test loop device");
-        close(test_loop_fd);
-        ioctl(control_fd, LOOP_CTL_REMOVE, test_minor);
-        goto cleanup;
-    }
-    printf("Created test loop device loop%d for concurrent I/O test.\n", test_minor);
-
-    // 启动多个I/O线程
     #define NUM_IO_THREADS 4
+
+    // 创建测试用 loop 设备
+    int test_minor;
+    if (create_loop_device(g_control_fd, &test_minor) < 0) {
+        TEST_END_FAIL(test_name, "failed to create test loop device");
+        return TEST_FAIL;
+    }
+    LOG_STEP("Created loop device loop%d", test_minor);
+
+    char test_path[64];
+    sprintf(test_path, "/dev/loop%d", test_minor);
+
+    int test_fd = open(test_path, O_RDWR);
+    if (test_fd < 0) {
+        ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor);
+        TEST_END_FAIL(test_name, "failed to open test loop device");
+        return TEST_FAIL;
+    }
+
+    if (ioctl(test_fd, LOOP_SET_FD, g_backing_fd_1) < 0) {
+        close(test_fd);
+        ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor);
+        TEST_END_FAIL(test_name, "failed to bind test loop device");
+        return TEST_FAIL;
+    }
+    LOG_STEP("Bound backing file to test device");
+
+    // 启动 I/O 线程
     pthread_t io_threads[NUM_IO_THREADS];
     struct io_thread_args io_args[NUM_IO_THREADS];
 
+    LOG_STEP("Starting %d I/O threads...", NUM_IO_THREADS);
     for (int i = 0; i < NUM_IO_THREADS; i++) {
-        strcpy(io_args[i].loop_dev_path, test_loop_path);
+        strcpy(io_args[i].loop_dev_path, test_path);
         io_args[i].duration_seconds = 5;
         io_args[i].should_stop = 0;
         io_args[i].io_count = 0;
         io_args[i].error_count = 0;
 
         if (pthread_create(&io_threads[i], NULL, io_worker_thread, &io_args[i]) != 0) {
-            perror("Failed to create I/O thread");
-            // 清理已创建的线程
             for (int j = 0; j < i; j++) {
                 io_args[j].should_stop = 1;
                 pthread_join(io_threads[j], NULL);
             }
-            close(test_loop_fd);
-            ioctl(control_fd, LOOP_CTL_REMOVE, test_minor);
-            goto cleanup;
+            close(test_fd);
+            ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor);
+            TEST_END_FAIL(test_name, "failed to create I/O thread");
+            return TEST_FAIL;
         }
     }
-    printf("Started %d concurrent I/O threads.\n", NUM_IO_THREADS);
 
-    // 关闭主文件描述符，避免在删除时引用计数不为0
-    // I/O线程会重新打开设备进行操作
-    close(test_loop_fd);
-    printf("Closed main loop device file descriptor.\n");
+    close(test_fd); // 关闭主 fd
 
     // 启动删除线程
+    LOG_STEP("Starting deletion thread...");
     pthread_t delete_thread;
-    struct delete_thread_args delete_args;
-    delete_args.control_fd = control_fd;
-    delete_args.loop_minor = test_minor;
-    delete_args.result = 0;
-    delete_args.error_code = 0;
-    //创建失败回退删除所有线程
+    struct delete_thread_args delete_args = {
+        .control_fd = g_control_fd,
+        .loop_minor = test_minor,
+        .result = 0,
+        .error_code = 0
+    };
+
     if (pthread_create(&delete_thread, NULL, delete_worker_thread, &delete_args) != 0) {
-        perror("Failed to create delete thread");
         for (int i = 0; i < NUM_IO_THREADS; i++) {
             io_args[i].should_stop = 1;
             pthread_join(io_threads[i], NULL);
         }
-        close(test_loop_fd);
-        ioctl(control_fd, LOOP_CTL_REMOVE, test_minor);
-        goto cleanup;
+        ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor);
+        TEST_END_FAIL(test_name, "failed to create delete thread");
+        return TEST_FAIL;
     }
-    printf("Started deletion thread.\n");
 
     // 等待删除完成
     pthread_join(delete_thread, NULL);
-    printf("Deletion thread completed with result: %d (errno: %d)\n",
-           delete_args.result, delete_args.error_code);
+    LOG_STEP("Deletion completed with result: %d (errno: %d)",
+             delete_args.result, delete_args.error_code);
 
-    // 停止I/O线程
+    // 停止并等待 I/O 线程
     for (int i = 0; i < NUM_IO_THREADS; i++) {
         io_args[i].should_stop = 1;
     }
 
-    // 等待所有I/O线程完成
-    int total_io_count = 0;
-    int total_error_count = 0;
+    int total_io = 0, total_errors = 0;
     for (int i = 0; i < NUM_IO_THREADS; i++) {
         pthread_join(io_threads[i], NULL);
-        total_io_count += io_args[i].io_count;
-        total_error_count += io_args[i].error_count;
-        printf("I/O thread %d: %d successful ops, %d errors\n",
-               i, io_args[i].io_count, io_args[i].error_count);
+        total_io += io_args[i].io_count;
+        total_errors += io_args[i].error_count;
     }
-    printf("Total I/O operations: %d successful, %d errors\n",
-           total_io_count, total_error_count);
+    LOG_STEP("I/O statistics: %d successful, %d errors", total_io, total_errors);
 
-    // test_loop_fd 已经在删除前关闭了
-
-    if (delete_args.result == 0) {
-        printf("✓ Concurrent I/O deletion test PASSED: Device deleted successfully while I/O was active.\n");
-    } else {
-        printf("✗ Concurrent I/O deletion test FAILED: Deletion returned %d (errno: %d)\n",
-               delete_args.result, delete_args.error_code);
+    // 验证设备已删除
+    int verify_fd = open(test_path, O_RDWR);
+    if (verify_fd >= 0) {
+        close(verify_fd);
+        TEST_END_FAIL(test_name, "device still accessible after deletion");
+        return TEST_FAIL;
     }
 
-    // 验证设备已被删除
-    int verify_test_fd = open(test_loop_path, O_RDWR);
-    if (verify_test_fd < 0 && (errno == ENOENT || errno == ENODEV)) {
-        printf("✓ Device %s is correctly inaccessible after deletion.\n", test_loop_path);
-    } else {
-        if (verify_test_fd >= 0) {
-            printf("✗ FAILED: Device %s still accessible after deletion!\n", test_loop_path);
-            close(verify_test_fd);
-        }
+    if (delete_args.result != 0) {
+        TEST_END_FAIL(test_name, "deletion failed");
+        return TEST_FAIL;
     }
 
-    // =======================================================
-    // 资源回收测试 2: 删除未绑定的设备
-    // =======================================================
-    printf("\n--- Testing Resource Reclamation: Deleting Unbound Device ---\n");
+    TEST_END_PASS(test_name);
+    return TEST_PASS;
 
-    int unbound_minor = -1;
-    int ret_unbound = -1;
-    for (int retry = 0; retry < 10; retry++) {
-        if (ioctl(control_fd, LOOP_CTL_GET_FREE, &unbound_minor) < 0) {
-            perror("Failed to get free loop device for unbound test");
-            goto cleanup;
-        }
+    #undef NUM_IO_THREADS
+}
 
-        ret_unbound = ioctl(control_fd, LOOP_CTL_ADD, unbound_minor);
-        if (ret_unbound >= 0) {
-            unbound_minor = ret_unbound;
-            break;
-        }
+// 测试 6: 删除未绑定的设备
+static int test_delete_unbound_device(void) {
+    const char *test_name = "Delete Unbound Device";
+    TEST_BEGIN(test_name);
 
-        if (errno != EEXIST) {
-            perror("Failed to add loop device for unbound test");
-            goto cleanup;
-        }
+    int minor;
+    if (create_loop_device(g_control_fd, &minor) < 0) {
+        TEST_END_FAIL(test_name, "failed to create loop device");
+        return TEST_FAIL;
+    }
+    LOG_STEP("Created unbound loop device loop%d", minor);
+
+    // 立即删除
+    LOG_STEP("Deleting unbound device...");
+    if (ioctl(g_control_fd, LOOP_CTL_REMOVE, minor) < 0) {
+        TEST_END_FAIL(test_name, "failed to delete unbound device");
+        return TEST_FAIL;
     }
 
-    if (ret_unbound < 0) {
-        fprintf(stderr, "Failed to create unbound loop device after retries\n");
-        goto cleanup;
+    TEST_END_PASS(test_name);
+    return TEST_PASS;
+}
+
+// 测试 7: 重复删除设备
+static int test_duplicate_deletion(void) {
+    const char *test_name = "Duplicate Deletion";
+    TEST_BEGIN(test_name);
+
+    int minor;
+    if (create_loop_device(g_control_fd, &minor) < 0) {
+        TEST_END_FAIL(test_name, "failed to create loop device");
+        return TEST_FAIL;
     }
-    printf("Created unbound loop device loop%d.\n", unbound_minor);
-
-    // 立即删除未绑定的设备
-    if (ioctl(control_fd, LOOP_CTL_REMOVE, unbound_minor) < 0) {
-        perror("Failed to remove unbound loop device");
-        printf("✗ Unbound device deletion test FAILED.\n");
-    } else {
-        printf("✓ Unbound device deletion test PASSED: Successfully deleted loop%d.\n", unbound_minor);
-    }
-
-    // =======================================================
-    // 资源回收测试 3: 重复删除同一设备
-    // =======================================================
-    printf("\n--- Testing Resource Reclamation: Duplicate Deletion ---\n");
-
-    int dup_minor = -1;
-    int ret_dup = -1;
-    for (int retry = 0; retry < 10; retry++) {
-        if (ioctl(control_fd, LOOP_CTL_GET_FREE, &dup_minor) < 0) {
-            perror("Failed to get free loop device for duplicate deletion test");
-            goto cleanup;
-        }
-
-        ret_dup = ioctl(control_fd, LOOP_CTL_ADD, dup_minor);
-        if (ret_dup >= 0) {
-            dup_minor = ret_dup;
-            break;
-        }
-
-        if (errno != EEXIST) {
-            perror("Failed to add loop device for duplicate deletion test");
-            goto cleanup;
-        }
-    }
-
-    if (ret_dup < 0) {
-        fprintf(stderr, "Failed to create loop device for duplicate deletion test after retries\n");
-        goto cleanup;
-    }
-    printf("Created loop device loop%d for duplicate deletion test.\n", dup_minor);
+    LOG_STEP("Created loop device loop%d", minor);
 
     // 第一次删除
-    if (ioctl(control_fd, LOOP_CTL_REMOVE, dup_minor) < 0) {
-        perror("First deletion failed");
-        printf("✗ Duplicate deletion test FAILED: First deletion failed.\n");
-        goto cleanup;
+    LOG_STEP("First deletion...");
+    if (ioctl(g_control_fd, LOOP_CTL_REMOVE, minor) < 0) {
+        TEST_END_FAIL(test_name, "first deletion failed");
+        return TEST_FAIL;
     }
-    printf("First deletion of loop%d succeeded.\n", dup_minor);
+    LOG_STEP("First deletion successful");
 
     // 第二次删除（应该失败）
+    LOG_STEP("Second deletion (should fail)...");
     errno = 0;
-    int second_delete = ioctl(control_fd, LOOP_CTL_REMOVE, dup_minor);
-    if (second_delete < 0 && (errno == ENODEV || errno == EINVAL)) {
-        printf("✓ Duplicate deletion test PASSED: Second deletion correctly failed with errno %d.\n", errno);
-    } else {
-        printf("✗ Duplicate deletion test FAILED: Second deletion returned %d (errno: %d), expected failure.\n",
-               second_delete, errno);
+    int ret = ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+    if (ret >= 0) {
+        TEST_END_FAIL(test_name, "second deletion should have failed");
+        return TEST_FAIL;
     }
 
-    // =======================================================
-    // 资源回收测试 4: 文件描述符泄漏检测
-    // =======================================================
-    printf("\n--- Testing Resource Reclamation: File Descriptor Leak Detection ---\n");
+    if (errno != ENODEV && errno != EINVAL) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "unexpected errno: %d", errno);
+        TEST_END_FAIL(test_name, msg);
+        return TEST_FAIL;
+    }
+    LOG_STEP("Second deletion correctly failed with errno %d", errno);
 
-    // 创建多个loop设备并快速删除，检查是否有FD泄漏
+    TEST_END_PASS(test_name);
+    return TEST_PASS;
+}
+
+// 测试 8: 文件描述符泄漏检测
+static int test_fd_leak_detection(void) {
+    const char *test_name = "FD Leak Detection";
+    TEST_BEGIN(test_name);
+
     #define LEAK_TEST_COUNT 10
-    int leak_test_minors[LEAK_TEST_COUNT];
-    int leak_test_fds[LEAK_TEST_COUNT];
 
-    printf("Creating and deleting %d loop devices to test for FD leaks...\n", LEAK_TEST_COUNT);
+    int minors[LEAK_TEST_COUNT];
+    int fds[LEAK_TEST_COUNT];
 
+    LOG_STEP("Creating %d loop devices...", LEAK_TEST_COUNT);
     for (int i = 0; i < LEAK_TEST_COUNT; i++) {
-        leak_test_minors[i] = -1;
-        leak_test_fds[i] = -1;
+        minors[i] = -1;
+        fds[i] = -1;
 
-        // 使用重试机制创建设备
-        for (int retry = 0; retry < 10; retry++) {
-            int free_minor;
-            if (ioctl(control_fd, LOOP_CTL_GET_FREE, &free_minor) < 0) {
-                perror("Failed to get free loop device for leak test");
-                // 清理已创建的设备
-                for (int j = 0; j < i; j++) {
-                    if (leak_test_minors[j] >= 0) {
-                        ioctl(control_fd, LOOP_CTL_REMOVE, leak_test_minors[j]);
-                    }
-                }
-                goto cleanup;
-            }
-
-            int ret_leak = ioctl(control_fd, LOOP_CTL_ADD, free_minor);
-            if (ret_leak >= 0) {
-                leak_test_minors[i] = ret_leak;
-                break;
-            }
-
-            if (errno != EEXIST) {
-                perror("Failed to add loop device for leak test");
-                for (int j = 0; j < i; j++) {
-                    if (leak_test_minors[j] >= 0) {
-                        ioctl(control_fd, LOOP_CTL_REMOVE, leak_test_minors[j]);
-                    }
-                }
-                goto cleanup;
-            }
-        }
-
-        if (leak_test_minors[i] < 0) {
-            fprintf(stderr, "Failed to create loop device %d for leak test\n", i);
+        if (create_loop_device(g_control_fd, &minors[i]) < 0) {
+            // 清理已创建的设备
             for (int j = 0; j < i; j++) {
-                if (leak_test_minors[j] >= 0) {
-                    ioctl(control_fd, LOOP_CTL_REMOVE, leak_test_minors[j]);
+                if (fds[j] >= 0) {
+                    ioctl(fds[j], LOOP_CLR_FD, 0);
+                    close(fds[j]);
                 }
+                if (minors[j] >= 0) ioctl(g_control_fd, LOOP_CTL_REMOVE, minors[j]);
             }
-            goto cleanup;
+            TEST_END_FAIL(test_name, "failed to create loop device");
+            return TEST_FAIL;
         }
 
-        // 打开并绑定设备
-        char leak_path[64];
-        sprintf(leak_path, "/dev/loop%d", leak_test_minors[i]);
-        leak_test_fds[i] = open(leak_path, O_RDWR);
-        if (leak_test_fds[i] >= 0) {
-            ioctl(leak_test_fds[i], LOOP_SET_FD, backing_fd_1);
+        char path[64];
+        sprintf(path, "/dev/loop%d", minors[i]);
+        fds[i] = open(path, O_RDWR);
+        if (fds[i] < 0) {
+            // 清理已创建的设备
+            for (int j = 0; j < i; j++) {
+                if (fds[j] >= 0) {
+                    ioctl(fds[j], LOOP_CLR_FD, 0);
+                    close(fds[j]);
+                }
+                if (minors[j] >= 0) ioctl(g_control_fd, LOOP_CTL_REMOVE, minors[j]);
+            }
+            ioctl(g_control_fd, LOOP_CTL_REMOVE, minors[i]);
+            TEST_END_FAIL(test_name, "failed to open loop device");
+            return TEST_FAIL;
+        }
+
+        // 立即绑定后端文件，这样下次 GET_FREE 会返回不同的 minor
+        if (ioctl(fds[i], LOOP_SET_FD, g_backing_fd_1) < 0) {
+            // 清理已创建的设备
+            for (int j = 0; j <= i; j++) {
+                if (fds[j] >= 0) {
+                    ioctl(fds[j], LOOP_CLR_FD, 0);
+                    close(fds[j]);
+                }
+                if (minors[j] >= 0) ioctl(g_control_fd, LOOP_CTL_REMOVE, minors[j]);
+            }
+            TEST_END_FAIL(test_name, "failed to bind loop device");
+            return TEST_FAIL;
         }
     }
+    LOG_STEP("Created %d devices successfully", LEAK_TEST_COUNT);
 
     // 删除所有设备
-    int leak_delete_success = 0;
+    LOG_STEP("Deleting all devices...");
+    int success_count = 0;
     for (int i = 0; i < LEAK_TEST_COUNT; i++) {
-        if (leak_test_fds[i] >= 0) {
-            ioctl(leak_test_fds[i], LOOP_CLR_FD, 0);
-            close(leak_test_fds[i]);
+        if (fds[i] >= 0) {
+            ioctl(fds[i], LOOP_CLR_FD, 0);
+            close(fds[i]);
         }
-
-        if (ioctl(control_fd, LOOP_CTL_REMOVE, leak_test_minors[i]) == 0) {
-            leak_delete_success++;
-        }
-    }
-
-    printf("Successfully deleted %d out of %d devices.\n", leak_delete_success, LEAK_TEST_COUNT);
-    if (leak_delete_success == LEAK_TEST_COUNT) {
-        printf("✓ FD leak test PASSED: All devices deleted successfully.\n");
-    } else {
-        printf("⚠ FD leak test: %d devices failed to delete.\n", LEAK_TEST_COUNT - leak_delete_success);
-    }
-
-    // =======================================================
-    // 资源回收测试 5: 删除后设备不可访问
-    // =======================================================
-    printf("\n--- Testing Resource Reclamation: Device Inaccessibility After Deletion ---\n");
-
-    int reject_minor = -1;
-    int ret_reject = -1;
-    for (int retry = 0; retry < 10; retry++) {
-        if (ioctl(control_fd, LOOP_CTL_GET_FREE, &reject_minor) < 0) {
-            perror("Failed to get free loop device for I/O rejection test");
-            goto cleanup;
-        }
-
-        ret_reject = ioctl(control_fd, LOOP_CTL_ADD, reject_minor);
-        if (ret_reject >= 0) {
-            reject_minor = ret_reject;
-            break;
-        }
-
-        if (errno != EEXIST) {
-            perror("Failed to add loop device for I/O rejection test");
-            goto cleanup;
+        if (ioctl(g_control_fd, LOOP_CTL_REMOVE, minors[i]) == 0) {
+            success_count++;
         }
     }
 
-    if (ret_reject < 0) {
-        fprintf(stderr, "Failed to create loop device for I/O rejection test after retries\n");
-        goto cleanup;
+    LOG_STEP("Deleted %d/%d devices", success_count, LEAK_TEST_COUNT);
+
+    if (success_count != LEAK_TEST_COUNT) {
+        TEST_END_FAIL(test_name, "not all devices deleted");
+        return TEST_FAIL;
     }
 
-    char reject_path[64];
-    sprintf(reject_path, "/dev/loop%d", reject_minor);
-    int reject_fd = open(reject_path, O_RDWR);
-    if (reject_fd < 0) {
-        perror("Failed to open loop device for I/O rejection test");
-        ioctl(control_fd, LOOP_CTL_REMOVE, reject_minor);
-        goto cleanup;
+    TEST_END_PASS(test_name);
+    return TEST_PASS;
+
+    #undef LEAK_TEST_COUNT
+}
+
+// 测试 9: 删除后设备不可访问
+static int test_device_inaccessible_after_deletion(void) {
+    const char *test_name = "Device Inaccessible After Deletion";
+    TEST_BEGIN(test_name);
+
+    int minor;
+    if (create_loop_device(g_control_fd, &minor) < 0) {
+        TEST_END_FAIL(test_name, "failed to create loop device");
+        return TEST_FAIL;
     }
 
-    if (ioctl(reject_fd, LOOP_SET_FD, backing_fd_1) < 0) {
-        perror("Failed to bind loop device for I/O rejection test");
-        close(reject_fd);
-        ioctl(control_fd, LOOP_CTL_REMOVE, reject_minor);
-        goto cleanup;
-    }
-    printf("Created and bound loop device loop%d for I/O rejection test.\n", reject_minor);
+    char path[64];
+    sprintf(path, "/dev/loop%d", minor);
+    LOG_STEP("Created loop device %s", path);
 
-    // 执行一次成功的I/O操作
-    char reject_buf[512] = "Test data";
-    if (write(reject_fd, reject_buf, sizeof(reject_buf)) != sizeof(reject_buf)) {
-        perror("Initial write failed");
-    } else {
-        printf("Initial write succeeded (expected).\n");
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+        TEST_END_FAIL(test_name, "failed to open loop device");
+        return TEST_FAIL;
     }
 
-    // 关闭文件描述符，准备删除
-    close(reject_fd);
-    printf("Closed device file descriptor.\n");
-
-    // 触发删除
-    printf("Triggering device deletion...\n");
-    if (ioctl(control_fd, LOOP_CTL_REMOVE, reject_minor) < 0) {
-        perror("Failed to trigger deletion for I/O rejection test");
-        goto cleanup;
+    if (ioctl(fd, LOOP_SET_FD, g_backing_fd_1) < 0) {
+        close(fd);
+        ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+        TEST_END_FAIL(test_name, "failed to bind loop device");
+        return TEST_FAIL;
     }
-    printf("Deletion triggered successfully.\n");
+    LOG_STEP("Bound backing file");
 
-    // 尝试重新打开设备（应该失败）
+    // 执行一次成功的 I/O
+    char buf[512] = "Test data";
+    if (write(fd, buf, sizeof(buf)) != sizeof(buf)) {
+        close(fd);
+        ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+        TEST_END_FAIL(test_name, "initial write failed");
+        return TEST_FAIL;
+    }
+    LOG_STEP("Initial I/O successful");
+
+    close(fd);
+
+    // 删除设备
+    LOG_STEP("Deleting device...");
+    if (ioctl(g_control_fd, LOOP_CTL_REMOVE, minor) < 0) {
+        TEST_END_FAIL(test_name, "deletion failed");
+        return TEST_FAIL;
+    }
+
+    // 尝试重新打开
+    LOG_STEP("Attempting to reopen deleted device...");
     errno = 0;
-    int reopen_reject_fd = open(reject_path, O_RDWR);
-    if (reopen_reject_fd < 0 && (errno == ENODEV || errno == ENOENT)) {
-        printf("✓ I/O rejection test PASSED: Device correctly inaccessible after deletion (errno: %d).\n", errno);
-    } else {
-        if (reopen_reject_fd >= 0) {
-            printf("✗ I/O rejection test FAILED: Device still accessible after deletion.\n");
-            close(reopen_reject_fd);
-        } else {
-            printf("✗ I/O rejection test FAILED: Unexpected errno %d (expected ENODEV or ENOENT).\n", errno);
-        }
+    int reopen_fd = open(path, O_RDWR);
+    if (reopen_fd >= 0) {
+        close(reopen_fd);
+        TEST_END_FAIL(test_name, "device still accessible after deletion");
+        return TEST_FAIL;
     }
 
-    printf("\n=== All Resource Reclamation Tests Completed ===\n");
+    if (errno != ENODEV && errno != ENOENT) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "unexpected errno: %d", errno);
+        TEST_END_FAIL(test_name, msg);
+        return TEST_FAIL;
+    }
+    LOG_STEP("Device correctly inaccessible (errno: %d)", errno);
 
+    TEST_END_PASS(test_name);
+    return TEST_PASS;
+}
 
-cleanup:
-    // 6. 清理并删除 loop 设备
-    printf("\n--- Cleaning up ---\n");
-    printf("Clearing loop device loop%d backing file...\n", loop_minor);
-    if (ioctl(loop_fd, LOOP_CLR_FD, 0) < 0) {
-        perror("Failed to clear loop device backing file");
+// ===================================================================
+// 主函数
+// ===================================================================
+
+int main(void) {
+    printf("+========================================+\n");
+    printf("|     Loop Device Test Suite             |\n");
+    printf("+========================================+\n");
+
+    // 初始化测试环境
+    LOG_INFO("Initializing test environment...");
+
+    if (create_test_file(TEST_FILE_NAME, TEST_FILE_SIZE) < 0 ||
+        create_test_file(TEST_FILE_NAME_2, TEST_FILE_SIZE_2) < 0) {
+        LOG_ERROR("Failed to create test files");
+        return EXIT_FAILURE;
     }
 
-    // 在删除设备前先关闭文件描述符，避免引用计数问题
-    close(loop_fd);
-    printf("Closed loop device file descriptor.\n");
-
-    printf("Removing loop device loop%d...\n", loop_minor);
-    if (ioctl(control_fd, LOOP_CTL_REMOVE, loop_minor) < 0) {
-        perror("Failed to remove loop device");
-        // 即使删除失败也继续清理
-    } else {
-        printf("Loop device loop%d removed successfully.\n", loop_minor);
+    g_backing_fd_1 = open(TEST_FILE_NAME, O_RDWR);
+    g_backing_fd_2 = open(TEST_FILE_NAME_2, O_RDWR);
+    if (g_backing_fd_1 < 0 || g_backing_fd_2 < 0) {
+        LOG_ERROR("Failed to open backing files");
+        goto cleanup_files;
     }
 
-    // 释放资源并删除测试文件
-    close(backing_fd_1);
-    close(backing_fd_2);
-    close(control_fd);
+    g_control_fd = open(LOOP_DEVICE_CONTROL, O_RDWR);
+    if (g_control_fd < 0) {
+        LOG_ERROR("Failed to open loop control device: %s", strerror(errno));
+        goto cleanup_backing;
+    }
+    LOG_INFO("Test environment initialized");
+
+    // 创建主测试 loop 设备
+    int main_minor;
+    if (create_loop_device(g_control_fd, &main_minor) < 0) {
+        LOG_ERROR("Failed to create main loop device");
+        goto cleanup_control;
+    }
+
+    char main_loop_path[64];
+    sprintf(main_loop_path, "/dev/loop%d", main_minor);
+    LOG_INFO("Created main loop device: %s", main_loop_path);
+
+    int main_loop_fd = open(main_loop_path, O_RDWR);
+    if (main_loop_fd < 0) {
+        LOG_ERROR("Failed to open main loop device");
+        ioctl(g_control_fd, LOOP_CTL_REMOVE, main_minor);
+        goto cleanup_control;
+    }
+
+    if (ioctl(main_loop_fd, LOOP_SET_FD, g_backing_fd_1) < 0) {
+        LOG_ERROR("Failed to bind main loop device");
+        close(main_loop_fd);
+        ioctl(g_control_fd, LOOP_CTL_REMOVE, main_minor);
+        goto cleanup_control;
+    }
+
+    // 配置偏移和大小限制
+    struct loop_status64 status = {
+        .lo_offset = 512,
+        .lo_sizelimit = TEST_FILE_SIZE - 512,
+        .lo_flags = 0,
+        .__pad = 0
+    };
+
+    if (ioctl(main_loop_fd, LOOP_SET_STATUS64, &status) < 0) {
+        LOG_ERROR("Failed to configure main loop device");
+        close(main_loop_fd);
+        ioctl(g_control_fd, LOOP_CTL_REMOVE, main_minor);
+        goto cleanup_control;
+    }
+    LOG_INFO("Main loop device configured (offset: %llu, sizelimit: %llu)",
+             (unsigned long long)status.lo_offset,
+             (unsigned long long)status.lo_sizelimit);
+
+    // ===================================================================
+    // 运行测试用例
+    // ===================================================================
+
+    // 基本功能测试
+    test_basic_read_write(main_loop_fd, main_loop_path, &status);
+    test_read_only_mode(main_loop_fd, &status);
+    test_change_fd(main_loop_fd, &status);
+    test_set_capacity(main_loop_fd, &status);
+
+    // 资源回收测试
+    test_concurrent_io_deletion();
+    test_delete_unbound_device();
+    test_duplicate_deletion();
+    test_fd_leak_detection();
+    test_device_inaccessible_after_deletion();
+
+    // ===================================================================
+    // 清理
+    // ===================================================================
+
+    LOG_INFO("Cleaning up main loop device...");
+    ioctl(main_loop_fd, LOOP_CLR_FD, 0);
+    close(main_loop_fd);
+    ioctl(g_control_fd, LOOP_CTL_REMOVE, main_minor);
+
+cleanup_control:
+    if (g_control_fd >= 0) close(g_control_fd);
+
+cleanup_backing:
+    if (g_backing_fd_1 >= 0) close(g_backing_fd_1);
+    if (g_backing_fd_2 >= 0) close(g_backing_fd_2);
+
+cleanup_files:
     unlink(TEST_FILE_NAME);
     unlink(TEST_FILE_NAME_2);
-    printf("All tests completed. Cleaned up.\n");
 
-    // 校验设备删除后不可再次打开
-    int reopen_fd = open(loop_dev_path, O_RDWR);
-    if (reopen_fd >= 0) {
-        printf("Unexpectedly reopened %s after removal (fd=%d).\n", loop_dev_path, reopen_fd);
-        close(reopen_fd);
-        return EXIT_FAILURE;
-    } else {
-        printf("Confirmed %s is inaccessible after removal (errno=%d).\n", loop_dev_path, errno);
-    }
+    // 打印测试汇总
+    print_test_summary();
 
-    return 0;
+    return (g_tests_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

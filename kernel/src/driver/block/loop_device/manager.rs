@@ -189,8 +189,7 @@ impl LoopManager {
         if minor >= Self::MAX_DEVICES as u32 {
             return Err(SystemError::EINVAL);
         }
-
-        let devname = Self::format_name(id);
+        let devname = Self::format_name(minor as usize);
         let loop_dev =
             LoopDevice::new_empty_loop_device(devname, id, minor).ok_or(SystemError::ENOMEM)?;
 

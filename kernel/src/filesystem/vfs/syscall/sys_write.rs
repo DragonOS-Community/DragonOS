@@ -42,6 +42,11 @@ impl Syscall for SysWriteHandle {
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
 
+        // POSIX: len==0 succeeds and returns 0 without touching the buffer.
+        if len == 0 {
+            return Ok(0);
+        }
+
         // 用户态：先检查可访问长度，避免直接触碰无效页；内核态直接使用
         let (user_buffer_reader, write_len) = if frame.is_from_user() {
             let accessible = user_accessible_len(

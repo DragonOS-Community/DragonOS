@@ -41,6 +41,11 @@ impl Syscall for SysReadHandle {
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
 
+        // POSIX: len==0 succeeds and returns 0 without touching the buffer pointer.
+        if len == 0 {
+            return Ok(0);
+        }
+
         let mut user_buffer_writer = UserBufferWriter::new(buf_vaddr, len, frame.is_from_user())?;
 
         if frame.is_from_user() {

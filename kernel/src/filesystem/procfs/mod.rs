@@ -12,21 +12,17 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::mm::LockedFrameAllocator,
+    arch::{MMArch, mm::LockedFrameAllocator},
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         procfs::{
             proc_thread_self_ns::{
-                current_thread_self_ns_ino, open_thread_self_ns_file, read_thread_self_ns_link,
-                ThreadSelfNsFileType,
+                ThreadSelfNsFileType, current_thread_self_ns_ino, open_thread_self_ns_file, read_thread_self_ns_link
             },
             sys::sysctl::PrintkSysctl,
         },
         vfs::{
-            mount::{MountFlags, MountPath},
-            syscall::RenameFlags,
-            vcore::generate_inode_id,
-            FileType,
+            FileType, mount::{MountFlags, MountPath}, syscall::RenameFlags, vcore::generate_inode_id
         },
     },
     libs::{
@@ -34,7 +30,7 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::allocator::page_frame::FrameAllocator,
+    mm::{MemoryManagementArch, allocator::page_frame::FrameAllocator},
     process::{ProcessManager, ProcessState, RawPid},
     time::PosixTimeSpec,
 };
@@ -429,8 +425,25 @@ impl ProcFSInode {
 
     /// 打开 statm 文件（最小实现，占位返回七个字段）
     fn open_statm(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
+        let target_pcb = if let Some(pid) = self.fdata.pid {
+            ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?
+        } else {
+            ProcessManager::current_pcb()
+        };
+
+        let size_pages = target_pcb
+            .basic()
+            .user_vm()
+            .map(|vm| {
+                let guard = vm.read();
+                // statm 第一列为总虚拟内存页数。
+                (guard.vma_usage_bytes().saturating_add(MMArch::PAGE_SIZE - 1))
+                    >> MMArch::PAGE_SHIFT
+            })
+            .unwrap_or(0);
+
         let data: &mut Vec<u8> = &mut pdata.data;
-        data.extend_from_slice(b"0 0 0 0 0 0 0\n");
+        data.extend_from_slice(format!("{} 0 0 0 0 0 0\n", size_pages).as_bytes());
         self.trim_string(data);
         Ok((data.len() * size_of::<u8>()) as i64)
     }

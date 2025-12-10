@@ -362,12 +362,13 @@ impl Futex {
         }
 
         if wait_res.is_err() || ProcessManager::current_pcb().has_pending_signal() {
-            return Err(SystemError::ERESTARTSYS);
+            // 按 Linux 语义，将可中断唤醒视为 EINTR 而非内部重启错误
+            return Err(SystemError::EINTR);
         }
 
         if in_queue {
             // 未被正常唤醒，视为伪唤醒/信号
-            return Err(SystemError::ERESTARTSYS);
+            return Err(SystemError::EINTR);
         }
 
         Ok(0)

@@ -20,7 +20,7 @@ unlink_test
 lseek_test
 sync_test
 ioctl_test
-#stat_test
+stat_test
 #chmod_test
 #chown_test
 chdir_test

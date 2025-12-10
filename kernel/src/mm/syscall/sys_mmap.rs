@@ -1,13 +1,13 @@
 //! System call handler for the mmap system call.
 
 use super::ProtFlags;
-use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MMAP};
+use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MMAP, MMArch};
 use crate::mm::syscall::page_align_up;
 use crate::mm::syscall::MapFlags;
 use crate::mm::ucontext::DEFAULT_MMAP_MIN_ADDR;
-use crate::mm::verify_area;
 use crate::mm::AddressSpace;
 use crate::mm::VirtAddr;
+use crate::mm::{verify_area, MemoryManagementArch};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use log::error;
 use system_error::SystemError;
@@ -46,53 +46,68 @@ impl Syscall for SysMmapHandle {
         let map_flags = Self::flags(args);
         let fd = Self::fd(args);
         let offset = Self::offset(args);
+        // 基础参数校验
         if verify_area(start_vaddr, len).is_err() {
             return Err(SystemError::EFAULT);
-        } else {
-            let map_flags = MapFlags::from_bits_truncate(map_flags as u64);
-            let prot_flags = ProtFlags::from_bits_truncate(prot_flags as u64);
-
-            if start_vaddr < VirtAddr::new(DEFAULT_MMAP_MIN_ADDR)
-                && map_flags.contains(MapFlags::MAP_FIXED)
-            {
-                error!(
-                    "mmap: MAP_FIXED is not supported for address below {}",
-                    DEFAULT_MMAP_MIN_ADDR
-                );
-                return Err(SystemError::EINVAL);
-            }
-
-            // 暂时不支持巨页映射
-            if map_flags.contains(MapFlags::MAP_HUGETLB) {
-                error!("mmap: not support huge page mapping");
-                return Err(SystemError::ENOSYS);
-            }
-            let current_address_space = AddressSpace::current()?;
-            let start_page = if map_flags.contains(MapFlags::MAP_ANONYMOUS) {
-                // 匿名映射
-                current_address_space.write().map_anonymous(
-                    start_vaddr,
-                    len,
-                    prot_flags,
-                    map_flags,
-                    true,
-                    false,
-                )?
-            } else {
-                // 文件映射
-                current_address_space.write().file_mapping(
-                    start_vaddr,
-                    len,
-                    prot_flags,
-                    map_flags,
-                    fd,
-                    offset,
-                    true,
-                    false,
-                )?
-            };
-            return Ok(start_page.virt_address().data());
         }
+
+        let map_flags = MapFlags::from_bits_truncate(map_flags as u64);
+        let prot_flags = ProtFlags::from_bits_truncate(prot_flags as u64);
+
+        // 仅允许 MAP_PRIVATE 或 MAP_SHARED 之一
+        let has_private = map_flags.contains(MapFlags::MAP_PRIVATE);
+        let has_shared = map_flags.contains(MapFlags::MAP_SHARED);
+        if has_private == has_shared {
+            return Err(SystemError::EINVAL);
+        }
+
+        // MAP_FIXED 需页对齐
+        if map_flags.contains(MapFlags::MAP_FIXED)
+            && !start_vaddr.check_aligned(<MMArch as MemoryManagementArch>::PAGE_SIZE)
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        if start_vaddr < VirtAddr::new(DEFAULT_MMAP_MIN_ADDR)
+            && map_flags.contains(MapFlags::MAP_FIXED)
+        {
+            error!(
+                "mmap: MAP_FIXED is not supported for address below {}",
+                DEFAULT_MMAP_MIN_ADDR
+            );
+            return Err(SystemError::EINVAL);
+        }
+
+        // 暂时不支持巨页映射
+        if map_flags.contains(MapFlags::MAP_HUGETLB) {
+            error!("mmap: not support huge page mapping");
+            return Err(SystemError::ENOSYS);
+        }
+        let current_address_space = AddressSpace::current()?;
+        let start_page = if map_flags.contains(MapFlags::MAP_ANONYMOUS) {
+            // 匿名映射
+            current_address_space.write().map_anonymous(
+                start_vaddr,
+                len,
+                prot_flags,
+                map_flags,
+                true,
+                false,
+            )?
+        } else {
+            // 文件映射
+            current_address_space.write().file_mapping(
+                start_vaddr,
+                len,
+                prot_flags,
+                map_flags,
+                fd,
+                offset,
+                true,
+                false,
+            )?
+        };
+        return Ok(start_page.virt_address().data());
     }
 
     /// Formats the syscall arguments for display/debugging purposes.

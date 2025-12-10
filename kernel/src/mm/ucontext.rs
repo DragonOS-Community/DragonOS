@@ -558,9 +558,13 @@ impl InnerAddressSpace {
             .inode()
             .mmap(start_page.virt_address().data(), len, offset)
         {
-            Ok(_) => Ok(start_page), // 文件系统未实现 mmap，视为成功
+            Ok(_) => Ok(start_page),
+            Err(SystemError::ENOSYS) => Ok(start_page), // 文件系统未实现 mmap，视为成功
+            Err(SystemError::ENODEV) => {
+                let _ = self.munmap(start_page, page_count);
+                Err(SystemError::ENODEV)
+            }
             Err(e) => {
-                // 回滚已建立的映射
                 let _ = self.munmap(start_page, page_count);
                 Err(e)
             }

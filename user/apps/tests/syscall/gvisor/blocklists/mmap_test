@@ -1,7 +1,3 @@
-MMapDeathTest.TruncateAfterCOWBreak
-MMapTest.NotPrivateOrShared
-MMapTest.PrivateAndShared
-MMapTest.FixedAlignment
 MMapTest.MprotectHugeLength
 MMapTest.NoProtExecDeath
 MMapTest.ExceedLimitData

@@ -13,6 +13,12 @@ echo "ARCH=${ARCH}"
 export ARCH=${ARCH:=x86_64}
 export DADK=${DADK:=dadk}
 
+# CI或纯nographic运行可通过设置SKIP_GRUB=1跳过grub相关检查与安装
+export SKIP_GRUB=${SKIP_GRUB:=0}
+if [ "${SKIP_GRUB}" = "1" ]; then
+    echo "SKIP_GRUB=1: 跳过grub检查与安装，仅准备镜像文件"
+fi
+
 
 # 内核映像
 root_folder=$(dirname $(pwd))
@@ -32,6 +38,10 @@ INSTALL_GRUB_TO_IMAGE="1"
 
 else
 INSTALL_GRUB_TO_IMAGE="0"
+fi
+# 显式要求跳过grub时，不执行相关安装
+if [ "${SKIP_GRUB}" = "1" ]; then
+    INSTALL_GRUB_TO_IMAGE="0"
 fi
 
 
@@ -59,7 +69,7 @@ done
 # ===============文件检查完毕===================
 
 # 如果是 i386/x86_64，需要判断是否符合 multiboot2 标准
-if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
+if [ "${SKIP_GRUB}" != "1" ] && ([ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]); then
     if ${GRUB_PATH_I386_LEGACY_FILE} --is-x86-multiboot2 ${kernel}; then
         echo Multiboot2 Confirmed!
     else

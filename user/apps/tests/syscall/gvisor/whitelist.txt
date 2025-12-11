@@ -32,6 +32,7 @@ preadv_test
 pwrite64_test
 utimes_test
 fadvise_test
+open_test
 
 # 进程相关测试
 fork_test

@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::filesystem::stat::PosixStat,
-    driver::base::device::device_number::DeviceNumber,
+    driver::{base::device::device_number::DeviceNumber, block::cache::BLOCK_SIZE},
     filesystem::vfs::{mount::is_mountpoint_root, vcore::do_file_lookup_at},
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
@@ -152,6 +152,15 @@ pub fn vfs_statx(
     ) {
         return Err(SystemError::EINVAL);
     }
+
+    // Handle AT_EMPTY_PATH: operate on the file descriptor itself.
+    if flags.contains(AtFlags::AT_EMPTY_PATH) && filename.is_empty() {
+        if dfd < 0 {
+            return Err(SystemError::EBADF);
+        }
+        return vfs_fstat(dfd);
+    }
+
     let inode = do_file_lookup_at(dfd, filename, lookup_flags)?;
 
     let mut kstat = vfs_getattr(&inode, request_mask, flags)?;
@@ -207,20 +216,51 @@ pub fn vfs_getattr(
     at_flags &= AtFlags::AT_STATX_SYNC_TYPE;
 
     let metadata = inode.metadata()?;
+    let mut nlinks = metadata.nlinks;
+
+    // Derive directory link count dynamically only when metadata has no reliable value.
+    if metadata.file_type == crate::filesystem::vfs::FileType::Dir {
+        // Many filesystems already maintain nlinks; use it when it looks valid (>=2 for dirs).
+        if metadata.nlinks < 2 {
+            if let Ok(entries) = inode.list() {
+                let mut subdir_links = 0usize;
+                for name in entries {
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    if let Ok(child) = inode.find(&name) {
+                        if let Ok(child_md) = child.metadata() {
+                            if child_md.file_type == crate::filesystem::vfs::FileType::Dir {
+                                subdir_links += 1;
+                            }
+                        }
+                    }
+                }
+                nlinks = 2 + subdir_links;
+            }
+        }
+    }
+
     if metadata.atime.is_empty() {
         kstat.result_mask.remove(PosixStatxMask::STATX_ATIME);
     }
 
     // todo: 添加automount和dax属性
 
-    kstat.blksize = metadata.blk_size as u32;
+    let blk_size = if metadata.blk_size == 0 {
+        512
+    } else {
+        metadata.blk_size
+    };
+
+    kstat.blksize = blk_size as u32;
     if request_mask.contains(PosixStatxMask::STATX_MODE)
         || request_mask.contains(PosixStatxMask::STATX_TYPE)
     {
         kstat.mode = metadata.mode;
     }
     if request_mask.contains(PosixStatxMask::STATX_NLINK) {
-        kstat.nlink = metadata.nlinks as u32;
+        kstat.nlink = nlinks as u32;
     }
     if request_mask.contains(PosixStatxMask::STATX_UID) {
         kstat.uid = metadata.uid as u32;
@@ -248,7 +288,12 @@ pub fn vfs_getattr(
         kstat.size = metadata.size as usize;
     }
     if request_mask.contains(PosixStatxMask::STATX_BLOCKS) {
-        kstat.blocks = metadata.blocks as u64;
+        let size_bytes = if metadata.size < 0 {
+            0
+        } else {
+            metadata.size as u64
+        };
+        kstat.blocks = size_bytes.div_ceil(BLOCK_SIZE as u64);
     }
 
     if request_mask.contains(PosixStatxMask::STATX_BTIME) {

@@ -1,5 +1,5 @@
 use crate::{
-    filesystem::vfs::fasync::FAsyncItems,
+    filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
     libs::rwlock::RwLock,
     net::socket::{self, *},
 };
@@ -34,6 +34,7 @@ pub struct UnixStreamSocket {
     epitems: EPollItems,
     fasync_items: FAsyncItems,
     wait_queue: Arc<WaitQueue>,
+    inode_id: InodeId,
     /// Peer socket for socket pairs (used for SIGIO notification)
     peer: SpinLock<Option<Weak<UnixStreamSocket>>>,
 
@@ -52,6 +53,7 @@ impl UnixStreamSocket {
         Arc::new(Self {
             inner: RwLock::new(Some(Inner::Init(init))),
             wait_queue: Arc::new(WaitQueue::default()),
+            inode_id: generate_inode_id(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
@@ -68,6 +70,7 @@ impl UnixStreamSocket {
         Arc::new(Self {
             inner: RwLock::new(Some(Inner::Connected(connected))),
             wait_queue: Arc::new(WaitQueue::default()),
+            inode_id: generate_inode_id(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
@@ -386,5 +389,9 @@ impl Socket for UnixStreamSocket {
             .as_ref()
             .expect("UnixStreamSocket inner is None")
             .check_io_events()
+    }
+
+    fn socket_inode_id(&self) -> InodeId {
+        self.inode_id
     }
 }

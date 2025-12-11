@@ -121,7 +121,12 @@ impl SysPwriteV2Handle {
 ///
 /// - `offset == -1` 时行为等同于 `writev`，会推进文件偏移量
 /// - 其它非负 offset 走已有的 pwrite 语义，不会修改文件偏移量
-pub fn do_pwritev2(file: Arc<File>, offset: isize, flags: RwfFlags, data: Vec<u8>) -> Result<usize, SystemError> {
+pub fn do_pwritev2(
+    file: Arc<File>,
+    offset: isize,
+    flags: RwfFlags,
+    data: Vec<u8>,
+) -> Result<usize, SystemError> {
     // offset == -1 -> 使用当前文件偏移（行为与 writev 相同）
     if offset == -1 {
         // RWF_APPEND：强制追加写入，需先将文件偏移调整到末尾

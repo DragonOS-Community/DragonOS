@@ -322,8 +322,19 @@ impl FATFile {
             return Ok(());
         }
 
-        let zeroes: Vec<u8> = vec![0u8; (range_end - range_start) as usize];
-        fs.gendisk.write_at_bytes(&zeroes, range_start as usize)?;
+        // 限制每次写入的缓冲区大小，避免大文件扩展时分配过大内存
+        const ZERO_BUF_SIZE: usize = 512 * 1024; // 512KB
+        let zeroes: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
+        let mut offset = range_start;
+        let mut remain = (range_end - range_start) as usize;
+
+        while remain > 0 {
+            let write_size = core::cmp::min(remain, ZERO_BUF_SIZE);
+            fs.gendisk
+                .write_at_bytes(&zeroes[..write_size], offset as usize)?;
+            offset += write_size as u64;
+            remain -= write_size;
+        }
 
         return Ok(());
     }

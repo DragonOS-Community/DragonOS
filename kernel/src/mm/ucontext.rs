@@ -1241,7 +1241,7 @@ impl UserMappings {
             .iter()
             .skip_while(|(hole_vaddr, hole_size)| hole_vaddr.add(**hole_size) <= min_vaddr);
 
-        let (hole_vaddr, hole_size) = iter.find(|(hole_vaddr, hole_size)| {
+        let (hole_vaddr, _hole_size) = iter.find(|(hole_vaddr, hole_size)| {
             // 计算当前空洞的可用大小
             let available_size: usize =
                 if hole_vaddr <= &&min_vaddr && min_vaddr <= hole_vaddr.add(**hole_size) {

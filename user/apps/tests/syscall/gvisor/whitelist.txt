@@ -29,6 +29,7 @@ pread64_test
 rename_test
 getdents_test
 preadv_test
+pwrite64_test
 utimes_test
 fadvise_test
 

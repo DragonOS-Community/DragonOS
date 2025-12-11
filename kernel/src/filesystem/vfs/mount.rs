@@ -41,7 +41,7 @@ use crate::{
 
 use super::{
     file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    InodeMode, Magic, PollableInode, SuperBlock,
+    InodeMode, PollableInode, SuperBlock,
 };
 
 bitflags! {
@@ -224,8 +224,6 @@ impl MountId {
     }
 }
 
-const MOUNTFS_BLOCK_SIZE: u64 = 512;
-const MOUNTFS_MAX_NAMELEN: u64 = 64;
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
 pub struct MountFS {
@@ -1045,7 +1043,9 @@ impl FileSystem for MountFS {
         self.inner_filesystem.name()
     }
     fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(Magic::MOUNT_MAGIC, MOUNTFS_BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
+        let mut sb = self.inner_filesystem.super_block();
+        sb.flags = self.mount_flags.bits() as u64;
+        sb
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {

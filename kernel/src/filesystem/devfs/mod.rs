@@ -15,7 +15,7 @@ use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
-    filesystem::vfs::mount::MountFlags,
+    filesystem::vfs::{mount::MountFlags, produce_fs},
     libs::{
         casting::DowncastArc,
         once::Once,
@@ -30,7 +30,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::{error, info};
+use log::{error, info, warn};
 use system_error::SystemError;
 
 const DEVFS_BLOCK_SIZE: u64 = 512;
@@ -791,6 +791,29 @@ pub fn devfs_init() -> Result<(), SystemError> {
             .mount(devfs, MountFlags::empty())
             .expect("Failed to mount at /dev");
         info!("DevFS mounted.");
+        // 挂载 /dev/shm 为 tmpfs，符合 linux 语义
+        if let Ok(dev_inode) = ProcessManager::current_mntns().root_inode().find("dev") {
+            let shm_inode = dev_inode
+                .find("shm")
+                .or_else(|_| dev_inode.mkdir("shm", InodeMode::from_bits_truncate(0o1777)));
+            if let Ok(shm_inode) = shm_inode {
+                let flags = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
+                match produce_fs("tmpfs", Some("mode=1777"), "tmpfs") {
+                    Ok(fs) => {
+                        if let Err(e) = shm_inode.mount(fs, flags) {
+                            if e != SystemError::EBUSY {
+                                warn!("Mount /dev/shm failed: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => warn!("Create tmpfs for /dev/shm failed: {:?}", e),
+                }
+            } else {
+                warn!("Create /dev/shm failed: {:?}", shm_inode.err());
+            }
+        } else {
+            warn!("Cannot find /dev mountpoint for /dev/shm");
+        }
         result = Some(Ok(()));
     });
 

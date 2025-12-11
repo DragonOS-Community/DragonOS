@@ -1164,6 +1164,7 @@ bitflags! {
         const DEVFS_MAGIC = 0x1373;
         const FAT_MAGIC =  0xf2f52011;
         const EXT4_MAGIC = 0xef53;
+        const TMPFS_MAGIC = 0x01021994;
         const KER_MAGIC = 0x3153464b;
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;

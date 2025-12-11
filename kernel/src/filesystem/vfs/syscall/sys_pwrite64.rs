@@ -17,6 +17,23 @@ use alloc::vec::Vec;
 /// Writes data to a file at a specific offset without changing the file position.
 pub struct SysPwrite64Handle;
 
+/// 校验 pwrite/pwritev 的偏移和长度是否符合 Linux 语义。
+/// - 负偏移返回 EINVAL。
+/// - 偏移、长度或偏移+长度超过 i64::MAX 也返回 EINVAL。
+pub(super) fn validate_pwrite_range(offset: i64, len: usize) -> Result<usize, SystemError> {
+    if offset < 0 {
+        return Err(SystemError::EINVAL);
+    }
+    let offset_u64 = offset as u64;
+    let len_u64 = len as u64;
+    let max_off = i64::MAX as u64;
+    let end = offset_u64.checked_add(len_u64).ok_or(SystemError::EINVAL)?;
+    if offset_u64 > max_off || len_u64 > max_off || end > max_off {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(offset_u64 as usize)
+}
+
 impl Syscall for SysPwrite64Handle {
     /// Returns the number of arguments expected by the `pwrite64` syscall
     fn num_args(&self) -> usize {
@@ -35,6 +52,8 @@ impl Syscall for SysPwrite64Handle {
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
         let offset = Self::offset(args);
+
+        let offset = validate_pwrite_range(offset, len)?;
 
         let user_buffer_reader = UserBufferReader::new(buf_vaddr, len, frame.is_from_user())?;
         let user_buf = user_buffer_reader.read_from_user(0)?;
@@ -87,8 +106,8 @@ impl SysPwrite64Handle {
     }
 
     /// Extracts the file offset from syscall arguments
-    fn offset(args: &[usize]) -> usize {
-        args[3]
+    fn offset(args: &[usize]) -> i64 {
+        args[3] as i64
     }
 }
 

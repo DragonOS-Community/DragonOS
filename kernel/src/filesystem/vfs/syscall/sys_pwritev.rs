@@ -5,6 +5,7 @@ use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_PWRITEV;
 use crate::filesystem::vfs::iov::{IoVec, IoVecs};
+use crate::filesystem::vfs::syscall::sys_pwrite64::validate_pwrite_range;
 use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -42,6 +43,7 @@ impl Syscall for SysPwriteVHandle {
         // 将用户态传入的数据结构 `IoVecs` 重新在内核上构造
         let iovecs = unsafe { IoVecs::from_user(iov, iov_count, false) }?;
         let data = iovecs.gather()?;
+        let offset = validate_pwrite_range(offset, data.len())?;
 
         // TODO: 支持零内核拷贝的分散写 （需要文件系统底层支持分散写）
         // - 直接将传入的用户态 IoVec 使用 vma 做校验以后传入底层文件系统进行分散写，避免内核拷贝
@@ -78,8 +80,8 @@ impl SysPwriteVHandle {
     }
 
     /// Extracts the offset at which the output operation is to be performed
-    fn offset(args: &[usize]) -> usize {
-        args[3]
+    fn offset(args: &[usize]) -> i64 {
+        args[3] as i64
     }
 }
 

@@ -357,7 +357,7 @@ impl LoopDevice {
         if info.lo_sizelimit != 0 && !info.lo_sizelimit.is_multiple_of(LBA_SIZE as u64) {
             return Err(SystemError::EINVAL);
         }
-        if !LoopFlags::from_bits(info.lo_flags).is_some() {
+        if LoopFlags::from_bits(info.lo_flags).is_none() {
             return Err(SystemError::EINVAL);
         }
         Ok(())

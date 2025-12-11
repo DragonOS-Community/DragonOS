@@ -14,6 +14,7 @@
 mod constants;
 mod driver;
 mod loop_control;
+#[allow(clippy::module_inception)]
 mod loop_device;
 mod manager;
 

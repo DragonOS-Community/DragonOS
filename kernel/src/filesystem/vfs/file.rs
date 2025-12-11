@@ -639,6 +639,8 @@ impl File {
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
+        // 按 Linux 语义，带 O_APPEND 的文件写入（包括 pwrite）都会强制在文件末尾进行，
+        // 但偏移有效性检查仍在更上层进行。
         let actual_offset =
             if flags.contains(FileFlags::O_APPEND) && matches!(file_type, FileType::File) {
                 md.size as usize

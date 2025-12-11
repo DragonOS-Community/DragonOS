@@ -80,11 +80,11 @@ impl Syscall for SysTruncateHandle {
 
 impl SysTruncateHandle {
     fn len(args: &[usize]) -> Result<usize, SystemError> {
-        let len = args[1] as isize;
-        if len < 0 {
+        let len = args[1];
+        if len > isize::MAX as usize {
             return Err(SystemError::EINVAL);
         }
-        Ok(len as usize)
+        Ok(len)
     }
 }
 

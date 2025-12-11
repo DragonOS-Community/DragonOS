@@ -1760,16 +1760,14 @@ impl IndexNode for LockedFATInode {
                     }
                     Ordering::Greater => {
                         // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
-                        let mut buf: Vec<u8> = Vec::new();
-                        let mut remain_size = len - old_size;
-                        let buf_size = remain_size;
-                        // let buf_size = core::cmp::min(remain_size, 512 * 1024);
-                        buf.resize(buf_size, 0);
+                        const ZERO_BUF_SIZE: usize = 512 * 1024; // 与 zero_range 保持一致的上限
+                        let buf: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
 
+                        let mut remain_size = len - old_size;
                         let mut offset = old_size;
                         while remain_size > 0 {
-                            let write_size = core::cmp::min(remain_size, buf_size);
-                            file.write(fs, &buf[0..write_size], offset as u64)?;
+                            let write_size = core::cmp::min(remain_size, ZERO_BUF_SIZE);
+                            file.write(fs, &buf[..write_size], offset as u64)?;
                             remain_size -= write_size;
                             offset += write_size;
                         }

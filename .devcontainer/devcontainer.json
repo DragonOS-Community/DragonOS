@@ -20,7 +20,7 @@
       ]
     }
   },
-  "containerUser": "dragonos",
+  "containerUser": "root",
   "updateRemoteUserUID": true,
   "mounts": [
     "source=/dev,target=/dev,type=bind,bind-propagation=rslave"

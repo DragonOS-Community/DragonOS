@@ -1,0 +1,8 @@
+# FAT 文件系统尚未支持符号链接相关能力
+StatTest.FstatatSymlinkDir
+StatTest.FstatatSymlinkDirWithTrailingSlash
+StatTest.FstatatSymlinkDirWithTrailingSlashSameInode
+StatTest.LstatSymlinkDir
+StatTest.LstatELOOPPath
+StatTest.StatxSymlink
+

@@ -1,0 +1,7 @@
+# 与符号链接和权限检查相关的阻挡测试，因为尚未实现”
+OpenTest.OpenNoFollowSymlink
+OpenTest.OpenNoFollowStillFollowsLinksInPath
+OpenTest.SymlinkRecurse
+OpenTest.SymlinkDirectory
+OpenTest.CanTruncateWithStrangePermissions
+OpenTest.OpenWithOpath

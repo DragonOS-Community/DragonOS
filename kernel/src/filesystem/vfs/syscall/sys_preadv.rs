@@ -74,10 +74,7 @@ pub fn do_preadv(fd: i32, iovecs: &IoVecs, offset: usize) -> Result<usize, Syste
 
     // 检查是否是管道/Socket (ESPIPE)
     let md = file.metadata()?;
-    if md.file_type == FileType::Pipe
-        || md.file_type == FileType::Socket
-        || md.file_type == FileType::CharDevice
-    {
+    if md.file_type == FileType::Pipe || md.file_type == FileType::Socket {
         return Err(SystemError::ESPIPE);
     }
 

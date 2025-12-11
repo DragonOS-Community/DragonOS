@@ -7,9 +7,8 @@ DragonOS调度
 .. toctree::
    :maxdepth: 1
 
-   c_waiting
-   rust_waiting
    core
    cfs
    rt
    kernel_timer
+   wait_queue

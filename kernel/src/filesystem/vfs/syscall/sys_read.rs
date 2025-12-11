@@ -3,10 +3,11 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READ;
 use crate::filesystem::vfs::file::FileFlags;
+use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::UserBufferWriter;
+use crate::syscall::user_access::{user_accessible_len, UserBufferWriter};
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -40,10 +41,29 @@ impl Syscall for SysReadHandle {
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
 
+        // POSIX: len==0 succeeds and returns 0 without touching the buffer pointer.
+        if len == 0 {
+            return Ok(0);
+        }
+
         let mut user_buffer_writer = UserBufferWriter::new(buf_vaddr, len, frame.is_from_user())?;
 
-        let user_buf = user_buffer_writer.buffer(0)?;
-        do_read(fd, user_buf)
+        if frame.is_from_user() {
+            // 用户态：先计算可写入长度，避免直接写入无效用户页
+            let accessible =
+                user_accessible_len(VirtAddr::new(buf_vaddr as usize), len, true /*write*/);
+            if accessible == 0 {
+                return Err(SystemError::EFAULT);
+            }
+
+            let user_buf = user_buffer_writer.buffer(0)?;
+            let read_len = do_read(fd, &mut user_buf[..accessible])?;
+            Ok(read_len)
+        } else {
+            // 内核态：直接借用用户缓冲区
+            let user_buf = user_buffer_writer.buffer(0)?;
+            do_read(fd, user_buf)
+        }
     }
 
     /// Formats the syscall parameters for display/debug purposes

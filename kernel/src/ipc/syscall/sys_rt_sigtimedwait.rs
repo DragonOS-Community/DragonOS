@@ -174,6 +174,8 @@ fn try_dequeue_signal(awaited: &SigSet) -> Option<(Signal, SigInfo)> {
     let ignore_mask = !*awaited;
     if let (sig, Some(info)) = pending.dequeue_signal(&ignore_mask) {
         if sig != Signal::INVALID {
+            // 消费信号后及时刷新 HAS_PENDING_SIGNAL 状态，避免后续等待路径误判
+            pcb.recalc_sigpending(Some(&siginfo_guard));
             return Some((sig, info));
         }
     }
@@ -185,6 +187,8 @@ fn try_dequeue_signal(awaited: &SigSet) -> Option<(Signal, SigInfo)> {
 
     if sig != Signal::INVALID {
         if let Some(info) = info {
+            // 同步刷新 pending 标志，确保后续可中断等待依据最新状态
+            pcb.recalc_sigpending(None);
             return Some((sig, info));
         }
     }

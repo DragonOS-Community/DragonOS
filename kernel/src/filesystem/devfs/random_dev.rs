@@ -1,45 +1,40 @@
-use crate::driver::base::device::device_number::DeviceNumber;
+use crate::driver::base::device::device_number::{DeviceNumber, Major};
 use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
     vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags,
-    Metadata,
+    InodeMode, Metadata,
 };
+use crate::libs::rand::rand_bytes;
 use crate::libs::spinlock::SpinLockGuard;
-use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
+use crate::{filesystem::devfs::DevFS, libs::spinlock::SpinLock, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::{cmp::min, mem::size_of};
 use system_error::SystemError;
-// use uuid::{uuid, Uuid};
-use super::{DevFS, DeviceINode};
+
+use super::DeviceINode;
 
 #[derive(Debug)]
-pub struct ZeroInode {
-    /// uuid 暂时不知道有什么用（x
-    // uuid: Uuid,
-    /// 指向自身的弱引用
-    self_ref: Weak<LockedZeroInode>,
-    /// 指向inode所在的文件系统对象的指针
+pub struct RandomInode {
+    self_ref: Weak<LockedRandomInode>,
     fs: Weak<DevFS>,
     parent: Weak<LockedDevFSInode>,
-    /// INode 元数据
     metadata: Metadata,
 }
 
 #[derive(Debug)]
-pub struct LockedZeroInode(SpinLock<ZeroInode>);
+pub struct LockedRandomInode(SpinLock<RandomInode>);
 
-impl LockedZeroInode {
+impl LockedRandomInode {
     pub fn new() -> Arc<Self> {
-        let inode = ZeroInode {
-            // uuid: Uuid::new_v5(),
+        let inode = RandomInode {
             self_ref: Weak::default(),
-            parent: Weak::default(),
             fs: Weak::default(),
+            parent: Weak::default(),
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),
@@ -50,24 +45,23 @@ impl LockedZeroInode {
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
-                file_type: FileType::CharDevice, // 文件夹，block设备，char设备
+                file_type: FileType::CharDevice,
                 mode: InodeMode::from_bits_truncate(0o666),
                 flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                raw_dev: DeviceNumber::new(Major::new(1), 8),
             },
         };
 
-        let result = Arc::new(LockedZeroInode(SpinLock::new(inode)));
+        let result = Arc::new(LockedRandomInode(SpinLock::new(inode)));
         result.0.lock().self_ref = Arc::downgrade(&result);
-
-        return result;
+        result
     }
 }
 
-impl DeviceINode for LockedZeroInode {
+impl DeviceINode for LockedRandomInode {
     fn set_fs(&self, fs: Weak<DevFS>) {
         self.0.lock().fs = fs;
     }
@@ -77,7 +71,7 @@ impl DeviceINode for LockedZeroInode {
     }
 }
 
-impl IndexNode for LockedZeroInode {
+impl IndexNode for LockedRandomInode {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
@@ -87,19 +81,19 @@ impl IndexNode for LockedZeroInode {
         _data: SpinLockGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        return Ok(());
+        Ok(())
     }
 
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        return Ok(());
+        Ok(())
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        return Ok(self.0.lock().metadata.clone());
+        Ok(self.0.lock().metadata.clone())
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        return self.0.lock().fs.upgrade().unwrap();
+        self.0.lock().fs.upgrade().unwrap()
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -115,11 +109,13 @@ impl IndexNode for LockedZeroInode {
         inode.metadata.mode = metadata.mode;
         inode.metadata.uid = metadata.uid;
         inode.metadata.gid = metadata.gid;
-
-        return Ok(());
+        Ok(())
     }
 
-    /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写
+    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
+        Err(SystemError::ENODEV)
+    }
+
     fn read_at(
         &self,
         _offset: usize,
@@ -131,14 +127,17 @@ impl IndexNode for LockedZeroInode {
             return Err(SystemError::EINVAL);
         }
 
-        for itr in buf.iter_mut().take(len) {
-            *itr = 0;
+        let mut copied = 0;
+        while copied < len {
+            let chunk = rand_bytes::<{ size_of::<usize>() }>();
+            let copy_len = min(len - copied, chunk.len());
+            buf[copied..copied + copy_len].copy_from_slice(&chunk[..copy_len]);
+            copied += copy_len;
         }
 
-        return Ok(len);
+        Ok(len)
     }
 
-    /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
     fn write_at(
         &self,
         _offset: usize,
@@ -149,19 +148,13 @@ impl IndexNode for LockedZeroInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-
         Ok(len)
-    }
-
-    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
-        // /dev/zero 支持 mmap，语义等同匿名零页映射
-        Ok(())
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         let parent = self.0.lock().parent.upgrade();
         if let Some(parent) = parent {
-            return Ok(parent as Arc<dyn IndexNode>);
+            return Ok(parent);
         }
         Err(SystemError::ENOENT)
     }

@@ -142,7 +142,7 @@ impl PageFaultHandler {
         if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
             //TODO: 添加handle_hugetlb_fault处理大页缺页异常
         } else {
-            Self::handle_normal_fault(&mut pfm);
+            return Self::handle_normal_fault(&mut pfm);
         }
 
         VmFaultReason::VM_FAULT_COMPLETED
@@ -369,6 +369,15 @@ impl PageFaultHandler {
 
         ret = fs.fault(pfm);
 
+        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            return ret;
+        }
+
+        // 出现错误类返回时，不再继续 finish_fault 以避免 unwrap/panic
+        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+            return ret;
+        }
+
         ret = ret.union(Self::finish_fault(pfm));
 
         ret
@@ -385,6 +394,10 @@ impl PageFaultHandler {
     #[inline(never)]
     pub unsafe fn do_shared_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let mut ret = Self::filemap_fault(pfm);
+
+        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+            return ret;
+        }
 
         let cache_page = pfm.page.clone().expect("no cache_page in PageFaultMessage");
 
@@ -682,19 +695,38 @@ impl PageFaultHandler {
             pfm.page = Some(page.clone());
         } else {
             // TODO 同步预读
-            //涉及磁盘IO，返回标志为VM_FAULT_MAJOR
+            // 涉及磁盘IO，返回标志为VM_FAULT_MAJOR
             ret = VmFaultReason::VM_FAULT_MAJOR;
             let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
-            file.pread(
+            match file.pread(
                 file_pgoff * MMArch::PAGE_SIZE,
                 MMArch::PAGE_SIZE,
                 buffer.as_mut_slice(),
-            )
-            .expect("failed to read file to create pagecache page");
+            ) {
+                Ok(read_len) => {
+                    // 超出文件末尾，返回SIGBUS而不是panic
+                    if read_len == 0 {
+                        return VmFaultReason::VM_FAULT_SIGBUS;
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "filemap_fault: pread failed at pgoff {}, err {:?}",
+                        file_pgoff,
+                        e
+                    );
+                    return VmFaultReason::VM_FAULT_SIGBUS;
+                }
+            }
             drop(buffer);
 
             let page = page_cache.lock_irqsave().get_page(file_pgoff);
-            pfm.page = page;
+            if let Some(page) = page {
+                pfm.page = Some(page);
+            } else {
+                // 读取后仍未获取到页面，视为错误
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
         }
         ret
     }
@@ -730,6 +762,58 @@ impl PageFaultHandler {
 
         mapper.map_phys(address, page_phys, vma_guard.flags());
         page_to_map.write_irqsave().insert_vma(pfm.vma());
+        VmFaultReason::VM_FAULT_COMPLETED
+    }
+
+    /// Map a zeroed anonymous page for /dev/zero style mappings.
+    pub unsafe fn zero_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let address = pfm.address_aligned_down();
+        let vma = pfm.vma();
+        let flags = vma.lock_irqsave().flags();
+        let mapper = &mut pfm.mapper;
+
+        if let Some(flush) = mapper.map(address, flags) {
+            flush.flush();
+            let mut pm = page_manager_lock_irqsave();
+            let paddr = mapper.translate(address).unwrap().0;
+            let page = pm.get_unwrap(&paddr);
+            page.write_irqsave().insert_vma(vma);
+            VmFaultReason::VM_FAULT_COMPLETED
+        } else {
+            VmFaultReason::VM_FAULT_OOM
+        }
+    }
+
+    /// Prefault zeroed anonymous pages for /dev/zero style mappings.
+    pub unsafe fn zero_map_pages(
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        let vma = pfm.vma();
+        let vma_guard = vma.lock_irqsave();
+        let file_pgoff = match vma_guard.file_page_offset() {
+            Some(off) => off,
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+        let base = vma_guard.region().start();
+        let flags = vma_guard.flags();
+        drop(vma_guard);
+
+        let mapper = &mut pfm.mapper;
+        for pgoff in start_pgoff..end_pgoff {
+            let addr = VirtAddr::new(base.data() + ((pgoff - file_pgoff) << MMArch::PAGE_SHIFT));
+            if let Some(flush) = mapper.map(addr, flags) {
+                flush.flush();
+                let mut pm = page_manager_lock_irqsave();
+                let paddr = mapper.translate(addr).unwrap().0;
+                let page = pm.get_unwrap(&paddr);
+                page.write_irqsave().insert_vma(vma.clone());
+            } else {
+                return VmFaultReason::VM_FAULT_OOM;
+            }
+        }
+
         VmFaultReason::VM_FAULT_COMPLETED
     }
 }

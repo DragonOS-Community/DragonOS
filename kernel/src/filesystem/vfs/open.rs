@@ -4,6 +4,7 @@ use system_error::SystemError;
 use super::{
     fcntl::AtFlags,
     file::{File, FileFlags},
+    permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
     vcore::resolve_parent_inode,
@@ -157,25 +158,28 @@ pub fn do_sys_open(
     path: &str,
     o_flags: FileFlags,
     mode: InodeMode,
-    follow_symlink: bool,
 ) -> Result<usize, SystemError> {
     let how = OpenHow::new(o_flags, mode, OpenHowResolve::empty());
-    return do_sys_openat2(dfd, path, how, follow_symlink);
+
+    return do_sys_openat2(dfd, path, how);
 }
 
-fn do_sys_openat2(
-    dirfd: i32,
-    path: &str,
-    how: OpenHow,
-    follow_symlink: bool,
-) -> Result<usize, SystemError> {
+fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemError> {
     // log::debug!("openat2: dirfd: {}, path: {}, how: {:?}",dirfd, path, how);
     let path = path.trim();
+    let follow_symlink = !how.o_flags.contains(FileFlags::O_NOFOLLOW);
+    // 检查空字符串路径
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
+    // 检查路径末尾斜杠 - 如果以斜杠结尾，目标必须是目录
+    let path_ends_with_slash = path.ends_with('/');
 
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
     let inode =
         inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_symlink);
-
+    let mut created = false;
     let inode: Arc<dyn IndexNode> = match inode {
         Ok(inode) => inode,
         Err(errno) => {
@@ -184,6 +188,11 @@ fn do_sys_openat2(
                 && !how.o_flags.contains(FileFlags::O_DIRECTORY)
                 && errno == SystemError::ENOENT
             {
+                // 如果路径以斜杠结尾，不能创建普通文件
+                if path_ends_with_slash {
+                    return Err(SystemError::EISDIR);
+                }
+
                 let (filename, parent_path) = rsplit_path(&path);
                 // 查找父目录
                 let parent_inode: Arc<dyn IndexNode> =
@@ -194,6 +203,7 @@ fn do_sys_openat2(
                     FileType::File,
                     InodeMode::from_bits_truncate(0o755),
                 )?;
+                created = true;
                 inode
             } else {
                 // 不需要创建文件，因此返回错误码
@@ -201,24 +211,72 @@ fn do_sys_openat2(
             }
         }
     };
+    let metadata = inode.metadata()?;
+    let file_type: FileType = metadata.file_type;
+    // 如果路径以斜杠结尾，而目标不是目录，返回 ENOTDIR
+    if path_ends_with_slash && file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    // 已存在的文件且指定了 O_CREAT|O_EXCL
+    if how.o_flags.contains(FileFlags::O_CREAT)
+        && how.o_flags.contains(FileFlags::O_EXCL)
+        && !created
+    {
+        return Err(SystemError::EEXIST);
+    }
+    // 对已存在的目录使用 O_CREAT 视为错误
+    if how.o_flags.contains(FileFlags::O_CREAT) && !created && file_type == FileType::Dir {
+        return Err(SystemError::EISDIR);
+    }
+    // 目录相关检查
+    if file_type == FileType::Dir {
+        // 目录上不支持 O_TRUNC
+        if how.o_flags.contains(FileFlags::O_TRUNC) {
+            return Err(SystemError::EISDIR);
+        }
+        // 目录上不允许写访问
+        let acc_mode = how.o_flags.access_flags();
+        if acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR {
+            return Err(SystemError::EISDIR);
+        }
+        // 目录不支持 O_DIRECT
+        if how.o_flags.contains(FileFlags::O_DIRECT) {
+            return Err(SystemError::EINVAL);
+        }
+    }
+    // 非 O_PATH 需要检查访问权限（read/write/truncate）
+    if !how.o_flags.contains(FileFlags::O_PATH) {
+        let acc_mode = how.o_flags.access_flags();
+        let mut need = PermissionMask::empty();
+        match acc_mode {
+            FileFlags::O_RDONLY => need.insert(PermissionMask::MAY_READ),
+            FileFlags::O_WRONLY => need.insert(PermissionMask::MAY_WRITE),
+            FileFlags::O_RDWR => need.insert(PermissionMask::MAY_READ | PermissionMask::MAY_WRITE),
+            _ => {}
+        }
+        if how.o_flags.contains(FileFlags::O_TRUNC) {
+            need.insert(PermissionMask::MAY_WRITE);
+        }
+        if !need.is_empty() {
+            let cred = ProcessManager::current_pcb().cred();
+            cred.inode_permission(&metadata, need.bits())?;
+        }
+    }
 
-    let file_type: FileType = inode.metadata()?.file_type;
     // 如果要打开的是文件夹，而目标不是文件夹
     if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
-    // 创建文件对象
-
+    // 如果O_TRUNC，并且是普通文件，清空文件
+    // 注意：必须在创建 File 对象之前截断
+    // 因为 O_TRUNC 的截断基于文件系统权限，而不是打开模式
+    // 例如：open(file, O_RDONLY | O_TRUNC) 是合法的，只要用户对文件有写权限
+    if how.o_flags.contains(FileFlags::O_TRUNC) && file_type == FileType::File {
+        inode.resize(0)?;
+    }
     let file: File = File::new(inode, how.o_flags)?;
 
-    // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
-    if how.o_flags.contains(FileFlags::O_TRUNC)
-        && (how.o_flags.contains(FileFlags::O_RDWR) || how.o_flags.contains(FileFlags::O_WRONLY))
-        && file_type == FileType::File
-    {
-        file.ftruncate(0)?;
-    }
     // 把文件对象存入pcb
     let r = ProcessManager::current_pcb()
         .fd_table()

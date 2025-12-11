@@ -59,10 +59,7 @@ impl Syscall for SysPread64Handle {
 
         // 检查是否是管道/Socket (ESPIPE)
         let md = file.metadata()?;
-        if md.file_type == FileType::Pipe
-            || md.file_type == FileType::Socket
-            || md.file_type == FileType::CharDevice
-        {
+        if md.file_type == FileType::Pipe || md.file_type == FileType::Socket {
             return Err(SystemError::ESPIPE);
         }
 

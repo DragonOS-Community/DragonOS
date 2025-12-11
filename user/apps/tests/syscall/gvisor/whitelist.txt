@@ -20,7 +20,7 @@ unlink_test
 lseek_test
 sync_test
 ioctl_test
-#stat_test
+stat_test
 #chmod_test
 #chown_test
 chdir_test
@@ -30,6 +30,7 @@ rename_test
 getdents_test
 preadv_test
 utimes_test
+fadvise_test
 
 # 进程相关测试
 fork_test
@@ -48,7 +49,7 @@ exit_test
 setns_test
 
 # 内存管理测试
-#mmap_test
+mmap_test
 brk_test
 mincore_test
 madvise_test

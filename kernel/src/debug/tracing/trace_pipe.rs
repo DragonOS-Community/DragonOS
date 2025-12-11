@@ -4,7 +4,6 @@ use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::PollStatus;
 use crate::libs::wait_queue::WaitQueue;
 use crate::process::{ProcessFlags, ProcessManager};
-use crate::sched::SchedMode;
 use crate::tracepoint::{TraceEntryParser, TracePipeOps};
 use alloc::string::String;
 use core::fmt::Debug;

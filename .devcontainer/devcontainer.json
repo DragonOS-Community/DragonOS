@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/devcontainers/spec/refs/heads/main/schemas/devContainer.schema.json",
+  "name": "DragonOS Dev Container",
+  "image": "docker.cnb.cool/dragonos-community/dragonos/dragonos-dev:v1.19",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": "false",
+      "configureZshAsDefaultShell": "false",
+      "username": "root",
+      "userGid": "0",
+      "userUid": "0"
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": { "moby": false }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  },
+  "containerUser": "dragonos",
+  "updateRemoteUserUID": true,
+  "mounts": [
+    "source=/dev,target=/dev,type=bind,bind-propagation=rslave"
+  ],
+  "privileged": true
+}

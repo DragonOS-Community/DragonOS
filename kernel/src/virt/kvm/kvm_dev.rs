@@ -3,7 +3,7 @@ use crate::filesystem;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::generate_inode_id,
-    file::{File, FileMode},
+    file::{File, FileFlags, FileMode},
     FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, Metadata,
 };
 use crate::libs::spinlock::SpinLockGuard;
@@ -188,7 +188,7 @@ pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
 
     // 创建vm文件，返回文件描述符
     let vm_inode = LockedVmInode::new();
-    let file: File = File::new(vm_inode, FileMode::O_RDWR)?;
+    let file: File = File::new(vm_inode, FileFlags::O_RDWR)?;
     let r = ProcessManager::current_pcb()
         .fd_table()
         .write()

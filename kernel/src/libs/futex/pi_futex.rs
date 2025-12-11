@@ -1,23 +1,35 @@
-use alloc::{collections::LinkedList, sync::Arc};
+use alloc::{boxed::Box, collections::LinkedList, sync::Arc};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use system_error::SystemError;
 
 use crate::{
-    arch::CurrentIrqArch,
-    exception::InterruptArch,
-    libs::futex::{
-        constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY, FUTEX_TID_MASK, FUTEX_WAITERS},
-        futex::{Futex, FutexAccess, FutexData, FutexHashBucket, FutexObj},
+    libs::{
+        futex::{
+            constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY, FUTEX_TID_MASK, FUTEX_WAITERS},
+            futex::{Futex, FutexAccess, FutexData, FutexHashBucket, FutexObj},
+        },
+        wait_queue::{Waiter, Waker},
     },
     mm::VirtAddr,
     process::ProcessManager,
-    sched::{schedule, SchedMode},
     time::{
-        timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
+        timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
         PosixTimeSpec,
     },
 };
+
+#[derive(Debug)]
+struct WakerTimer {
+    waker: Arc<Waker>,
+}
+
+impl TimerFunction for WakerTimer {
+    fn run(&mut self) -> Result<(), SystemError> {
+        self.waker.wake();
+        Ok(())
+    }
+}
 
 impl Futex {
     /// ## FUTEX_LOCK_PI - Priority Inheritance futex lock
@@ -100,9 +112,9 @@ impl Futex {
                 }
             };
 
-            let pcb = ProcessManager::current_pcb();
+            let (waiter, waker) = Waiter::new_pair();
             let futex_q = Arc::new(FutexObj {
-                pcb: Arc::downgrade(&pcb),
+                waker: waker.clone(),
                 key: key.clone(),
                 bitset: FUTEX_BITSET_MATCH_ANY,
             });
@@ -118,23 +130,24 @@ impl Futex {
                     return Err(SystemError::ETIMEDOUT);
                 }
 
-                let wakeup_helper = WakeUpHelper::new(pcb.clone());
                 let jiffies = next_n_us_timer_jiffies(total_us);
-                let wake_up = Timer::new(wakeup_helper, jiffies);
+                let wake_up = Timer::new(
+                    Box::new(WakerTimer {
+                        waker: waker.clone(),
+                    }),
+                    jiffies,
+                );
                 timer = Some(wake_up);
             }
 
-            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            bucket_mut.sleep_no_sched(futex_q.clone())?;
+            bucket_mut.enqueue(futex_q.clone());
 
-            // 激活定时器
             if let Some(ref t) = timer {
                 t.activate();
             }
 
             drop(futex_map_guard);
-            drop(irq_guard);
-            schedule(SchedMode::SM_NONE);
+            let wait_res = waiter.wait(true);
 
             // 被唤醒后检查是否成功获取锁
             let current_val = atomic_futex.load(Ordering::SeqCst);
@@ -154,10 +167,19 @@ impl Futex {
                     // 从等待队列移除
                     let mut futex_map_guard = FutexData::futex_map();
                     if let Some(bucket) = futex_map_guard.get_mut(&key) {
-                        bucket.remove(futex_q.clone());
+                        bucket.remove_by_waker(&waker);
                     }
                     return Err(SystemError::ETIMEDOUT);
                 }
+            }
+
+            if let Err(e) = wait_res {
+                // 信号等导致的错误，移除并返回
+                let mut futex_map_guard = FutexData::futex_map();
+                if let Some(bucket) = futex_map_guard.get_mut(&key) {
+                    bucket.remove_by_waker(&waker);
+                }
+                return Err(e);
             }
 
             // 重新尝试获取锁

@@ -19,11 +19,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     container:
-      image: docker.cnb.cool/dragonos-community/dragonos/dragonos-dev:v1.19
+      image: dragonos/dragonos-dev:v1.19
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code
         uses: actions/checkout@v4
+
+      - name: Change source
+        run: |
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
 
       - name: Build DragonOS
         shell: bash -ileo pipefail {0}

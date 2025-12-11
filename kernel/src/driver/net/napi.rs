@@ -119,8 +119,6 @@ pub fn napi_init() -> Result<(), SystemError> {
 }
 
 fn net_rx_action() {
-    use crate::sched::SchedMode;
-
     loop {
         // 这里直接将全局的NAPI管理器的napi_list取出，清空全局的列表，避免占用锁时间过长
         let mut inner = GLOBAL_NAPI_MANAGER.inner();

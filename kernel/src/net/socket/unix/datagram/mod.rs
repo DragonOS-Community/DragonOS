@@ -1,5 +1,5 @@
 use crate::{
-    filesystem::vfs::{fasync::FAsyncItems, utils::DName},
+    filesystem::vfs::{fasync::FAsyncItems, utils::DName, vcore::generate_inode_id, InodeId},
     libs::rwlock::RwLock,
     libs::spinlock::SpinLock,
     libs::wait_queue::WaitQueue,
@@ -13,7 +13,6 @@ use crate::{
             Socket, PMSG, PSOL,
         },
     },
-    sched::SchedMode,
 };
 use alloc::{
     collections::VecDeque,
@@ -178,6 +177,7 @@ pub struct UnixDatagramSocket {
     epitems: EPollItems,
     fasync_items: FAsyncItems,
     wait_queue: Arc<WaitQueue>,
+    inode_id: InodeId,
     is_nonblocking: AtomicBool,
 }
 
@@ -193,6 +193,7 @@ impl UnixDatagramSocket {
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             wait_queue: Arc::new(WaitQueue::default()),
+            inode_id: generate_inode_id(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
         })
     }
@@ -506,5 +507,9 @@ impl Socket for UnixDatagramSocket {
         events |= EPollEventType::EPOLLOUT;
 
         events
+    }
+
+    fn socket_inode_id(&self) -> InodeId {
+        self.inode_id
     }
 }

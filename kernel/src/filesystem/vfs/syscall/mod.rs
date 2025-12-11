@@ -32,6 +32,7 @@ pub mod sys_mknodat;
 mod sys_openat;
 mod sys_pread64;
 mod sys_preadv;
+mod sys_preadv2;
 mod sys_pselect6;
 mod sys_pwrite64;
 mod sys_pwritev;

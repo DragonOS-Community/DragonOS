@@ -28,9 +28,8 @@ impl Syscall for SysLstatHandle {
 
         let fd = super::open_utils::do_open(
             path,
-            FileFlags::O_RDONLY.bits(),
+            FileFlags::O_RDONLY.bits() | FileFlags::O_NOFOLLOW.bits(),
             InodeMode::empty().bits(),
-            false,
         )?;
 
         defer!({

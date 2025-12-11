@@ -524,23 +524,25 @@ const fn protection_map() -> [EntryFlags<MMArch>; 16] {
 
 impl X86_64MMArch {
     fn init_xd_rsvd() {
-        // 读取ia32-EFER寄存器的值
-        let efer: EferFlags = x86_64::registers::model_specific::Efer::read();
+        // 读取并确保开启 NXE，使用户态 PROT_EXEC 正确受 NX 约束
+        let mut efer = x86_64::registers::model_specific::Efer::read();
         if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
-            // NO_EXECUTE_ENABLE是false，那么就设置xd_reserved为true
-            debug!("NO_EXECUTE_ENABLE is false, set XD_RESERVED to true");
-            XD_RESERVED.store(true, Ordering::Relaxed);
+            debug!("Enabling EFER.NXE for NX support");
+            efer.insert(EferFlags::NO_EXECUTE_ENABLE);
+            unsafe { x86_64::registers::model_specific::Efer::write(efer) };
         }
+        // 若硬件仍不支持（写入无效），标记为保留，否则可用
+        let efer_after = x86_64::registers::model_specific::Efer::read();
+        let xd_reserved = !efer_after.contains(EferFlags::NO_EXECUTE_ENABLE);
+        XD_RESERVED.store(xd_reserved, Ordering::Relaxed);
         compiler_fence(Ordering::SeqCst);
     }
 
     /// 判断XD标志位是否被保留
     pub fn is_xd_reserved() -> bool {
-        // return XD_RESERVED.load(Ordering::Relaxed);
-
-        // 由于暂时不支持execute disable，因此直接返回true
-        // 不支持的原因是，目前好像没有能正确的设置page-level的xd位，会触发page fault
-        return true;
+        // 若硬件不支持 NX/XD，则返回 true，表示执行位不可用；否则遵从检测结果
+        // 默认使用启动阶段检测到的 XD_RESERVED 值
+        return XD_RESERVED.load(Ordering::Relaxed);
     }
 
     pub unsafe fn read_array<T>(addr: VirtAddr, count: usize) -> Vec<T> {

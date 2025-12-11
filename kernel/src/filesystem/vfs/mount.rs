@@ -635,6 +635,24 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.open(data, flags);
     }
 
+    fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
+        return self.inner_inode.mmap(start, len, offset);
+    }
+
+    fn sync(&self) -> Result<(), SystemError> {
+        return self.inner_inode.sync();
+    }
+
+    fn fadvise(
+        &self,
+        file: &Arc<super::file::File>,
+        offset: i64,
+        len: i64,
+        advise: i32,
+    ) -> Result<usize, SystemError> {
+        return self.inner_inode.fadvise(file, offset, len, advise);
+    }
+
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         self.inner_inode.close(data)
     }

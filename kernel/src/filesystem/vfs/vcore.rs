@@ -405,5 +405,13 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
 
     let result = inode.resize(len);
 
+    if result.is_ok() {
+        let vm_opt: Option<Arc<crate::mm::ucontext::AddressSpace>> =
+            ProcessManager::current_pcb().basic().user_vm();
+        if let Some(vm) = vm_opt {
+            let _ = vm.write().zap_file_mappings(md.inode_id);
+        }
+    }
+
     result
 }

@@ -23,7 +23,10 @@ use system_error::SystemError;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    filesystem::vfs::file::File,
+    filesystem::vfs::{
+        file::{File, FileMode},
+        FileType, InodeId,
+    },
     ipc::shm::{ShmFlags, ShmId},
     libs::{
         align::page_align_up,
@@ -31,7 +34,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::page::page_manager_lock_irqsave,
-    process::ProcessManager,
+    process::{resource::RLimitID, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
@@ -149,6 +152,17 @@ pub struct InnerAddressSpace {
 }
 
 impl InnerAddressSpace {
+    /// 当前地址空间已占用的虚拟内存字节数（简单求和所有 VMA 尺寸）
+    pub fn vma_usage_bytes(&self) -> usize {
+        self.mappings
+            .iter_vmas()
+            .map(|v| {
+                let g = v.lock_irqsave();
+                g.region().size()
+            })
+            .sum()
+    }
+
     pub fn new(create_stack: bool) -> Result<Self, SystemError> {
         let mut result = Self {
             user_mapper: MMArch::setup_new_usermapper()?,
@@ -484,15 +498,49 @@ impl InnerAddressSpace {
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
+        let file = file.unwrap();
+
+        // 权限检查遵循 Linux 语义：
+        // - O_PATH 直接返回 EBADF
+        // - 除 PROT_NONE 外，映射需要读权限；PROT_WRITE 另外需要写权限（MAP_PRIVATE 也需要读以便 COW）
+        // - PROT_EXEC 视为读检查
+        let file_mode = file.mode();
+        if file_mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        let wants_access = prot_flags != ProtFlags::PROT_NONE;
+        if wants_access && !file_mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EACCES);
+        }
+        if prot_flags.contains(ProtFlags::PROT_EXEC) && !file_mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EACCES);
+        }
+        if prot_flags.contains(ProtFlags::PROT_WRITE) {
+            if map_flags.contains(MapFlags::MAP_SHARED) {
+                if !file_mode.contains(FileMode::FMODE_WRITE) {
+                    return Err(SystemError::EACCES);
+                }
+            } else if !file_mode.contains(FileMode::FMODE_READ) {
+                return Err(SystemError::EACCES);
+            }
+        }
+
+        let meta = file.metadata()?;
+        if matches!(meta.file_type, FileType::Pipe | FileType::Dir) {
+            return Err(SystemError::ENODEV);
+        }
+
         // offset需要4K对齐
         if (offset & (MMArch::PAGE_SIZE - 1)) != 0 {
             return Err(SystemError::EINVAL);
         }
         let pgoff = offset >> MMArch::PAGE_SHIFT;
 
+        let page_count = PageFrameCount::from_bytes(len).unwrap();
         let start_page: VirtPageFrame = self.mmap(
             round_hint_to_min(start_vaddr),
-            PageFrameCount::from_bytes(len).unwrap(),
+            page_count,
             prot_flags,
             map_flags,
             |page, count, vm_flags, flags, mapper, flusher| {
@@ -504,7 +552,7 @@ impl InnerAddressSpace {
                         flags,
                         mapper,
                         flusher,
-                        file.clone(),
+                        Some(file.clone()),
                         Some(pgoff),
                     )
                 } else {
@@ -512,7 +560,7 @@ impl InnerAddressSpace {
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
-                        file.clone(),
+                        Some(file.clone()),
                         Some(pgoff),
                         false,
                     )))
@@ -521,12 +569,22 @@ impl InnerAddressSpace {
         )?;
         // todo!(impl mmap for other file)
         // https://github.com/DragonOS-Community/DragonOS/pull/912#discussion_r1765334272
-        let file = file.unwrap();
         // 传入实际映射后的起始虚拟地址，而非用户传入的 hint
-        let _ = file
+        match file
             .inode()
-            .mmap(start_page.virt_address().data(), len, offset);
-        return Ok(start_page);
+            .mmap(start_page.virt_address().data(), len, offset)
+        {
+            Ok(_) => Ok(start_page),
+            Err(SystemError::ENOSYS) => Ok(start_page), // 文件系统未实现 mmap，视为成功
+            Err(SystemError::ENODEV) => {
+                let _ = self.munmap(start_page, page_count);
+                Err(SystemError::ENODEV)
+            }
+            Err(e) => {
+                let _ = self.munmap(start_page, page_count);
+                Err(e)
+            }
+        }
     }
 
     /// 向进程的地址空间映射页面
@@ -878,6 +936,25 @@ impl InnerAddressSpace {
         Ok(())
     }
 
+    /// 取消与指定 inode 关联的文件映射的页表项，保留 VMA 以便后续访问触发缺页并按最新文件大小处理
+    pub fn zap_file_mappings(&mut self, inode_id: InodeId) -> Result<(), SystemError> {
+        let mut targets: Vec<Arc<LockedVMA>> = Vec::new();
+        for vma in self.mappings.iter_vmas() {
+            let guard = vma.lock_irqsave();
+            if let Some(file) = guard.vm_file() {
+                if file.inode().metadata()?.inode_id == inode_id {
+                    targets.push(vma.clone());
+                }
+            }
+        }
+
+        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+        for vma in targets {
+            vma.unmap(&mut self.user_mapper.utable, &mut flusher);
+        }
+        Ok(())
+    }
+
     /// 创建新的用户栈
     ///
     /// ## 参数
@@ -921,11 +998,22 @@ impl InnerAddressSpace {
             return Err(SystemError::EFAULT);
         }
 
+        // 软限制：RLIMIT_DATA
+        let rlim = ProcessManager::current_pcb()
+            .get_rlimit(RLimitID::Data)
+            .rlim_cur as usize;
+        if rlim != usize::MAX {
+            let desired = new_brk.data().saturating_sub(self.brk_start.data());
+            if desired > rlim {
+                return Err(SystemError::ENOMEM);
+            }
+        }
+
         let old_brk = self.brk;
 
         if new_brk > self.brk {
             let len = new_brk - self.brk;
-            let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
+            let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
             let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
             self.map_anonymous(old_brk, len, prot_flags, map_flags, true, false)?;
 
@@ -958,6 +1046,16 @@ impl InnerAddressSpace {
         };
 
         let new_brk = VirtAddr::new(page_align_up(new_brk.data()));
+
+        let rlim = ProcessManager::current_pcb()
+            .get_rlimit(RLimitID::Data)
+            .rlim_cur as usize;
+        if rlim != usize::MAX {
+            let desired = new_brk.data().saturating_sub(self.brk_start.data());
+            if desired > rlim {
+                return Err(SystemError::ENOMEM);
+            }
+        }
 
         return self.set_brk(new_brk);
     }
@@ -1137,14 +1235,13 @@ impl UserMappings {
     /// @param size 请求的大小
     ///
     /// @return 如果找到了，返回虚拟内存范围，否则返回None
-    pub fn find_free(&self, min_vaddr: VirtAddr, size: usize) -> Option<VirtRegion> {
-        let _vaddr = min_vaddr;
+    pub fn find_free(&self, min_vaddr: VirtAddr, req_size: usize) -> Option<VirtRegion> {
         let mut iter = self
             .vm_holes
             .iter()
             .skip_while(|(hole_vaddr, hole_size)| hole_vaddr.add(**hole_size) <= min_vaddr);
 
-        let (hole_vaddr, size) = iter.find(|(hole_vaddr, hole_size)| {
+        let (hole_vaddr, _hole_size) = iter.find(|(hole_vaddr, hole_size)| {
             // 计算当前空洞的可用大小
             let available_size: usize =
                 if hole_vaddr <= &&min_vaddr && min_vaddr <= hole_vaddr.add(**hole_size) {
@@ -1153,11 +1250,11 @@ impl UserMappings {
                     **hole_size
                 };
 
-            size <= available_size
+            req_size <= available_size
         })?;
 
-        // 创建一个新的虚拟内存范围。
-        let region = VirtRegion::new(cmp::max(*hole_vaddr, min_vaddr), *size);
+        // 返回恰好等于请求大小的区域，起始地址取空洞与下限的较大值。
+        let region = VirtRegion::new(cmp::max(*hole_vaddr, min_vaddr), req_size);
 
         return Some(region);
     }

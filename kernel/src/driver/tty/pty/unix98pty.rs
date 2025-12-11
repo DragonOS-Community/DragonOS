@@ -1,22 +1,26 @@
-use alloc::{string::ToString, sync::Arc};
+use alloc::{
+    string::ToString,
+    sync::{Arc, Weak},
+};
+use core::sync::atomic::{AtomicBool, Ordering};
 use system_error::SystemError;
 
 use crate::{
     driver::tty::{
         termios::{ControlCharIndex, ControlMode, InputMode, LocalMode, Termios},
         tty_core::{TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
-        tty_device::TtyFilePrivateData,
+        tty_device::{TtyDevice, TtyFilePrivateData},
         tty_driver::{TtyDriver, TtyDriverPrivateData, TtyDriverSubType, TtyOperation},
     },
     filesystem::{
         devpts::DevPtsFs,
         epoll::{event_poll::EventPoll, EPollEventType},
         vfs::{
-            file::FileFlags, FilePrivateData, FileType, InodeMode, MountFS,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            file::FileFlags, mount::MountFSInode, FilePrivateData, FileSystem, FileType, IndexNode,
+            InodeMode, MountFS, VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{casting::DowncastArc, spinlock::SpinLockGuard},
     mm::VirtAddr,
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
@@ -25,6 +29,19 @@ use crate::{
 use super::{ptm_driver, pts_driver, PtyCommon};
 
 pub const NR_UNIX98_PTY_MAX: u32 = 128;
+
+#[derive(Debug)]
+struct PtyDevPtsLink {
+    pts_root: Weak<MountFSInode>,
+    index: usize,
+    freed: core::sync::atomic::AtomicBool,
+}
+
+impl crate::driver::tty::tty_driver::TtyCorePrivateField for PtyDevPtsLink {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
 
 #[derive(Debug)]
 pub struct Unix98PtyDriverInner;
@@ -220,12 +237,39 @@ impl TtyOperation for Unix98PtyDriverInner {
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         let driver = tty.core().driver();
-        let root_inode = ProcessManager::current_mntns().root_inode();
-        if tty.core().driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave {
+        let mut removed = false;
+
+        // 优先通过 hook 删除 devpts 入口并回收索引
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                // 防止重复释放
+                if !hook.freed.swap(true, Ordering::SeqCst) {
+                    if let Some(root) = hook.pts_root.upgrade() {
+                        let _ = root.unlink(&hook.index.to_string());
+                        if let Some(mfs) = root.fs().clone().downcast_arc::<MountFS>() {
+                            if let Some(devpts) =
+                                mfs.inner_filesystem().clone().downcast_arc::<DevPtsFs>()
+                            {
+                                devpts.free_index(hook.index);
+                            }
+                        }
+                        removed = true;
+                    }
+                }
+            }
+        }
+
+        if driver.tty_driver_sub_type() == TtyDriverSubType::PtySlave {
             driver.ttys().remove(&tty.core().index());
-            let pts_root_inode =
-                root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-            let _ = pts_root_inode.unlink(&tty.core().index().to_string());
+            // 兜底：如果未通过 hook 删除，则直接尝试从 /dev/pts 移除
+            if !removed {
+                let root_inode = ProcessManager::current_mntns().root_inode();
+                if let Ok(pts_root_inode) =
+                    root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)
+                {
+                    let _ = pts_root_inode.unlink(&tty.core().index().to_string());
+                }
+            }
             if let Some(link) = tty.core().link() {
                 let link_core = link.core();
                 // set OTHER_CLOSED flag to tell master side that the slave side is closed
@@ -234,6 +278,43 @@ impl TtyOperation for Unix98PtyDriverInner {
                 link_core.read_wq().wakeup_all();
                 link_core.write_wq().wakeup_all();
                 // wake up epoll events
+                let epitems = link_core.epitems();
+                let _ = EventPoll::wakeup_epoll(epitems, EPollEventType::EPOLLHUP);
+            }
+        } else if driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster {
+            // 主端关闭：尝试删除 devpts 入口；若没有 hook 也兜底一次
+            if !removed {
+                if let Some(hook_arc) = tty.private_fields() {
+                    if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                        if !hook.freed.swap(true, Ordering::SeqCst) {
+                            if let Some(root) = hook.pts_root.upgrade() {
+                                let _ = root.unlink(&hook.index.to_string());
+                                if let Some(mfs) = root.fs().clone().downcast_arc::<MountFS>() {
+                                    if let Some(devpts) =
+                                        mfs.inner_filesystem().clone().downcast_arc::<DevPtsFs>()
+                                    {
+                                        devpts.free_index(hook.index);
+                                    }
+                                }
+                                removed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !removed {
+                let root_inode = ProcessManager::current_mntns().root_inode();
+                if let Ok(pts_root_inode) =
+                    root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)
+                {
+                    let _ = pts_root_inode.unlink(&tty.core().index().to_string());
+                }
+            }
+            if let Some(link) = tty.core().link() {
+                let link_core = link.core();
+                link_core.flags_write().insert(TtyFlag::OTHER_CLOSED);
+                link_core.read_wq().wakeup_all();
+                link_core.write_wq().wakeup_all();
                 let epitems = link_core.epitems();
                 let _ = EventPoll::wakeup_epoll(epitems, EPollEventType::EPOLLHUP);
             }
@@ -262,6 +343,7 @@ impl TtyOperation for Unix98PtyDriverInner {
 }
 
 pub fn ptmx_open(
+    this: &TtyDevice,
     mut data: SpinLockGuard<FilePrivateData>,
     flags: &FileFlags,
 ) -> Result<(), SystemError> {
@@ -271,17 +353,14 @@ pub fn ptmx_open(
         tty.core().add_count();
         return Ok(());
     }
-    let root_inode = ProcessManager::current_mntns().root_inode();
-    let pts_root_inode =
-        root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-
-    let fs = pts_root_inode
-        .fs()
-        .as_any_ref()
-        .downcast_ref::<MountFS>()
-        .unwrap()
-        .inner_filesystem();
-    let fsinfo = fs.as_any_ref().downcast_ref::<DevPtsFs>().unwrap();
+    // 根据当前节点所属的文件系统决定 devpts 根
+    let (pts_root_inode, fsinfo) =
+        if let Some(devpts) = this.fs().clone().downcast_arc::<DevPtsFs>() {
+            let root_inode = devpts.root_inode();
+            (root_inode.clone(), devpts)
+        } else {
+            return Err(SystemError::ENODEV);
+        };
 
     let index = fsinfo.alloc_index()?;
 
@@ -301,6 +380,19 @@ pub fn ptmx_open(
         FileType::CharDevice,
         InodeMode::from_bits_truncate(0x666),
     )?;
+
+    // 在 master/slave 两端记录 devpts 根节点信息，便于关闭时回收 /dev/pts/ 下的节点
+    if let Some(mnt_inode) = pts_root_inode.downcast_arc::<MountFSInode>() {
+        let hook = Arc::new(PtyDevPtsLink {
+            pts_root: Arc::downgrade(&mnt_inode),
+            index,
+            freed: AtomicBool::new(false),
+        });
+        tty.set_private_fields(hook.clone());
+        if let Some(slave) = tty.core().link() {
+            slave.set_private_fields(hook);
+        }
+    }
 
     ptm_driver().driver_funcs().open(core)?;
 

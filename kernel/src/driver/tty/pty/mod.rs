@@ -1,16 +1,9 @@
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-};
+use alloc::sync::Arc;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::base::device::{
-        device_number::{DeviceNumber, Major},
-        device_register, IdTable,
-    },
-    filesystem::devfs::devfs_register,
+    driver::base::device::device_number::Major,
     init::initcall::INITCALL_DEVICE,
     libs::lazy_init::Lazy,
     mm::VirtAddr,
@@ -22,7 +15,6 @@ use self::unix98pty::{Unix98PtyDriverInner, NR_UNIX98_PTY_MAX};
 use super::{
     termios::{ControlMode, InputMode, LocalMode, OutputMode, TTY_STD_TERMIOS},
     tty_core::{TtyCore, TtyCoreData, TtyFlag, TtyPacketStatus},
-    tty_device::{TtyDevice, TtyType},
     tty_driver::{TtyDriver, TtyDriverManager, TtyDriverSubType, TtyDriverType, TTY_DRIVERS},
     tty_port::{DefaultTtyPort, TtyPort},
 };
@@ -164,20 +156,6 @@ impl PtyCommon {
         let pts_driver = pts_driver();
         ptm_driver.set_other_pty_driver(Arc::downgrade(&pts_driver));
         pts_driver.set_other_pty_driver(Arc::downgrade(&ptm_driver));
-
-        let idt = IdTable::new(
-            String::from("ptmx"),
-            Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 2)),
-        );
-        let ptmx_dev = TtyDevice::new(
-            "ptmx".to_string(),
-            idt.clone(),
-            TtyType::Pty(super::tty_device::PtyType::Ptm),
-        );
-
-        ptmx_dev.inner_write().metadata_mut().raw_dev = idt.device_number();
-        device_register(ptmx_dev.clone())?;
-        devfs_register("ptmx", ptmx_dev)?;
 
         TTY_DRIVERS.lock().push(ptm_driver);
         TTY_DRIVERS.lock().push(pts_driver);

@@ -241,7 +241,7 @@ impl LockedFATInode {
                 file_type,
                 mode: InodeMode::S_IRWXUGO,
                 flags: InodeFlags::empty(),
-                nlinks: 1,
+                nlinks: if file_type == FileType::Dir { 2 } else { 1 },
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(),
@@ -507,7 +507,7 @@ impl FATFileSystem {
                 file_type: FileType::Dir,
                 mode: InodeMode::S_IRWXUGO,
                 flags: InodeFlags::empty(),
-                nlinks: 1,
+                nlinks: 2,
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(),
@@ -1532,8 +1532,7 @@ impl LockedFATInode {
     fn try_read_pagecache(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
-            let r = page_cache.lock_irqsave().read(offset, buf);
-            return r;
+            return PageCache::read(&page_cache, offset, buf);
         } else {
             return self.read_sync(offset, buf);
         }
@@ -1542,7 +1541,7 @@ impl LockedFATInode {
     fn try_write_pagecache(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
-            let write_len = page_cache.lock_irqsave().write(offset, buf)?;
+            let write_len = PageCache::write(&page_cache, offset, buf)?;
             let mut guard = self.0.lock();
             let old_size = guard.metadata.size;
             guard.update_metadata(Some(core::cmp::max(old_size, (offset + write_len) as i64)));
@@ -1554,6 +1553,10 @@ impl LockedFATInode {
 }
 
 impl IndexNode for LockedFATInode {
+    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
@@ -1664,6 +1667,15 @@ impl IndexNode for LockedFATInode {
                 }
                 FileType::Dir => {
                     d.create_dir(name, fs)?;
+                    // 刚创建的目录，确保自身 nlink >= 2，并更新父目录 nlink
+                    if let Some(child) = guard.children.get(&to_search_name(name)) {
+                        let mut child_md = child.0.lock();
+                        if child_md.metadata.nlinks < 2 {
+                            child_md.metadata.nlinks = 2;
+                        }
+                    }
+                    // 父目录因为新增子目录，多一个链接（来自子目录的 ".."）
+                    guard.metadata.nlinks += 1;
                     return Ok(guard.find(name)?);
                 }
 
@@ -1925,14 +1937,20 @@ impl IndexNode for LockedFATInode {
         let r: Result<(), SystemError> =
             dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
         match r {
-            Ok(_) => return r,
+            Ok(_) => {
+                // 删除子目录成功，父目录链接计数减少
+                if guard.metadata.nlinks > 0 {
+                    guard.metadata.nlinks -= 1;
+                }
+                return Ok(());
+            }
             Err(r) => {
                 if r == SystemError::ENOTEMPTY {
                     // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
                     guard.children.insert(to_search_name(name), target.clone());
                     drop(target_guard);
                 }
-                return Err(r);
+                Err(r)
             }
         }
     }

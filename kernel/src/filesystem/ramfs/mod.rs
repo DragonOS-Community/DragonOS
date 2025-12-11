@@ -91,7 +91,8 @@ impl RamFSInode {
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode: InodeMode::S_IRWXUGO,
-                nlinks: 1,
+                // 根目录的链接计数至少为2（. 和 从父挂载的引用）
+                nlinks: 2,
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(),
@@ -177,6 +178,10 @@ impl MountableFileSystem for RamFS {
 register_mountable_fs!(RamFS, RAMFSMAKER, "ramfs");
 
 impl IndexNode for LockedRamFSInode {
+    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
 
@@ -344,7 +349,8 @@ impl IndexNode for LockedRamFSInode {
                 file_type,
                 mode,
                 flags: InodeFlags::empty(),
-                nlinks: 1,
+                // 目录需要包含 "." 自引用，因此初始为2
+                nlinks: if file_type == FileType::Dir { 2 } else { 1 },
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::from(data as u32),
@@ -359,6 +365,10 @@ impl IndexNode for LockedRamFSInode {
 
         // 将子inode插入父inode的B树中
         inode.children.insert(name, result.clone());
+        // 如果新建的是目录，父目录的 nlink 需要增加
+        if file_type == FileType::Dir {
+            inode.metadata.nlinks += 1;
+        }
 
         return Ok(result);
     }
@@ -435,6 +445,8 @@ impl IndexNode for LockedRamFSInode {
         to_delete.0.lock().metadata.nlinks -= 1;
         // 在当前目录中删除这个子目录项
         inode.children.remove(&name);
+        // 父目录链接计数相应减少
+        inode.metadata.nlinks -= 1;
         return Ok(());
     }
 

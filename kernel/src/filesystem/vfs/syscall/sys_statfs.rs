@@ -25,12 +25,7 @@ impl Syscall for SysStatfsHandle {
         let path = Self::path(args);
         let user_statfs = Self::statfs(args);
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
-        let fd = open_utils::do_open(
-            path,
-            FileFlags::O_RDONLY.bits(),
-            InodeMode::empty().bits(),
-            true,
-        )?;
+        let fd = open_utils::do_open(path, FileFlags::O_RDONLY.bits(), InodeMode::empty().bits())?;
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))
             .unwrap()
             .into_string()

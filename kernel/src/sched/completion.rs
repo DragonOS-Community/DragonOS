@@ -3,9 +3,12 @@
 use system_error::SystemError;
 
 use crate::{
-    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    libs::{
+        spinlock::SpinLock,
+        wait_queue::{WaitQueue, Waiter},
+    },
     process::ProcessManager,
-    time::timer::schedule_timeout,
+    time::timer::{Timer, WakeUpHelper},
 };
 
 const COMPLETE_ALL: u32 = u32::MAX;
@@ -28,43 +31,100 @@ impl Completion {
     /// @param timeout jiffies
     /// @param interuptible 设置进程是否能被打断
     /// @return 返回剩余时间或者SystemError
-    fn do_wait_for_common(&self, mut timeout: i64, interuptible: bool) -> Result<i64, SystemError> {
-        let mut inner = self.inner.lock_irqsave();
+    fn do_wait_for_common(&self, timeout: i64, interuptible: bool) -> Result<i64, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        if inner.done == 0 {
-            //loop break 类似 do while 保证进行一次信号检测
-            loop {
-                //检查当前线程是否有未处理的信号
-                if pcb.sig_info_irqsave().sig_pending().has_pending() {
-                    return Err(SystemError::ERESTARTSYS);
-                }
 
-                let e = if interuptible {
-                    unsafe { inner.wait_queue.sleep_without_schedule() }
-                } else {
-                    unsafe { inner.wait_queue.sleep_without_schedule_uninterruptible() }
-                };
-                if e.is_err() {
-                    break;
-                }
-                drop(inner);
-                timeout = schedule_timeout(timeout)?;
-                inner = self.inner.lock_irqsave();
-                if inner.done != 0 || timeout <= 0 {
-                    break;
+        // None 代表无限等待；Some(jiffies) 代表还剩多少 jiffies
+        let mut remaining = if timeout == MAX_TIMEOUT {
+            None
+        } else {
+            Some(timeout)
+        };
+
+        loop {
+            // 快路径：已完成直接消费
+            {
+                let mut inner = self.inner.lock_irqsave();
+                if inner.done != 0 {
+                    if inner.done != COMPLETE_ALL {
+                        inner.done = inner.done.saturating_sub(1);
+                    }
+                    return Ok(match remaining {
+                        Some(r) if r > 0 => r,
+                        Some(_) => 1,
+                        None => MAX_TIMEOUT,
+                    });
                 }
             }
-            inner.wait_queue.wakeup(None);
-            if inner.done == 0 {
-                drop(inner);
-                return Ok(timeout);
+
+            // 信号快速检查
+            if interuptible && pcb.sig_info_irqsave().sig_pending().has_pending() {
+                return Err(SystemError::ERESTARTSYS);
             }
+
+            if remaining.is_some_and(|r| r <= 0) {
+                return Ok(0);
+            }
+            if remaining.is_some_and(|r| r <= 0) {
+                return Ok(0);
+            }
+
+            // 构造一次等待 + 可选超时定时器
+            let (waiter, waker) = Waiter::new_pair();
+
+            // 注册 waker，并在注册前后都检查 done 以避免丢唤醒
+            {
+                let mut inner = self.inner.lock_irqsave();
+                if inner.done != 0 {
+                    if inner.done != COMPLETE_ALL {
+                        inner.done = inner.done.saturating_sub(1);
+                    }
+                    return Ok(match remaining {
+                        Some(r) if r > 0 => r,
+                        Some(_) => 1,
+                        None => MAX_TIMEOUT,
+                    });
+                }
+                inner.wait_queue.register_waker(waker.clone())?;
+            }
+
+            // 可选定时器
+            let mut timer = None;
+            if let Some(r) = remaining {
+                let jiffies = r as u64;
+                let t = Timer::new(WakeUpHelper::new(pcb.clone()), jiffies);
+                t.activate();
+                timer = Some(t);
+            }
+
+            // 阻塞等待
+            let wait_res = waiter.wait(interuptible);
+
+            // 取消定时器（如果还没超时）
+            if let Some(t) = &timer {
+                if !t.timeout() {
+                    t.cancel();
+                }
+            }
+
+            // 从队列摘除自身（若还在）
+            {
+                let inner = self.inner.lock_irqsave();
+                inner.wait_queue.remove_waker(&waiter.waker());
+            }
+
+            // 检查超时
+            if let Some(t) = timer {
+                if t.timeout() {
+                    return Ok(0);
+                }
+                if let Some(rem) = remaining.as_mut() {
+                    *rem = rem.saturating_sub(1);
+                }
+            }
+
+            wait_res?;
         }
-        if inner.done != COMPLETE_ALL {
-            inner.done -= 1;
-        }
-        drop(inner);
-        return Ok(if timeout > 0 { timeout } else { 1 });
     }
 
     /// @brief 等待指定时间，超时后就返回, 同时设置pcb state为uninteruptible.

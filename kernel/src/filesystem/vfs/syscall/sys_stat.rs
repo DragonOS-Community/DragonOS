@@ -30,7 +30,6 @@ impl Syscall for SysStatHandle {
             path,
             FileFlags::O_RDONLY.bits(),
             InodeMode::empty().bits(),
-            true,
         )?;
 
         defer!({

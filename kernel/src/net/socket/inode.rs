@@ -269,10 +269,10 @@ impl<T: Socket + 'static> IndexNode for T {
     }
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
-        Ok(Metadata::new(
-            FileType::Socket,
-            InodeMode::from_bits_truncate(0o755),
-        ))
+        let mut md = Metadata::new(FileType::Socket, InodeMode::from_bits_truncate(0o755));
+        md.inode_id = self.socket_inode_id();
+        md.mode |= InodeMode::S_IFSOCK;
+        Ok(md)
     }
 
     // TODO: implement ioctl for socket

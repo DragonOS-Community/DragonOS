@@ -48,7 +48,7 @@
     "hash": "299b0ccecf4ef174fffcce4731a98728"
   },
   "en:kernel/sched/index.rst": {
-    "hash": "76ca73ed6d47a4207d2ca193b88eae0b"
+    "hash": "cb2834d1e7bde7924e059290a1399f62"
   },
   "en:kernel/locking/locks.md": {
     "hash": "5514ff361db4677d2b4fa522852aaeea"
@@ -316,5 +316,8 @@
   },
   "en:kernel/filesystem/vfs/mount_propagation.md": {
     "hash": "11140afc1e5daa1667d40cae29a80b9a"
+  },
+  "en:kernel/sched/wait_queue.md": {
+    "hash": "550f38b4386c3755535e99e97bc98243"
   }
 }

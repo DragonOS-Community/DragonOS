@@ -23,7 +23,7 @@ use crate::{
     },
     filesystem::{
         epoll::EPollItem,
-        vfs::{permission::PermissionMask, syscall::RenameFlags},
+        vfs::{file::File, permission::PermissionMask, syscall::RenameFlags},
     },
     ipc::pipe::LockedPipeInode,
     libs::{
@@ -788,10 +788,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        log::error!(
-            "function page_cache() has not yet been implemented for inode:{}",
-            crate::libs::name::get_type_name(&self)
-        );
+        // log::warn!(
+        //     "function page_cache() has not yet been implemented for inode:{}",
+        //     crate::libs::name::get_type_name(&self)
+        // );
         None
     }
 
@@ -844,6 +844,16 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// 所以如果可以确定当前`dyn IndexNode`是`dyn Socket`类型，则可以直接调用此方法进行转换
     fn as_socket(&self) -> Option<&dyn Socket> {
         None
+    }
+
+    fn fadvise(
+        &self,
+        _file: &Arc<File>,
+        _offset: i64,
+        _len: i64,
+        _advise: i32,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 }
 
@@ -913,6 +923,7 @@ impl dyn IndexNode {
         }
 
         let root_inode = ProcessManager::current_mntns().root_inode();
+        let trailing_slash = path.ends_with('/');
 
         // 获取当前进程的凭证（用于路径遍历的权限检查）
         let cred = ProcessManager::current_pcb().cred();
@@ -1014,6 +1025,10 @@ impl dyn IndexNode {
             } else {
                 result = inode;
             }
+        }
+
+        if trailing_slash && result.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
         }
 
         return Ok(result);
@@ -1174,10 +1189,7 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn super_block(&self) -> SuperBlock;
 
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
-        panic!(
-            "fault() has not yet been implemented for filesystem: {}",
-            crate::libs::name::get_type_name(&self)
-        )
+        VmFaultReason::VM_FAULT_SIGBUS
     }
 
     unsafe fn map_pages(

@@ -456,8 +456,6 @@ impl Backlog {
     where
         F: FnMut() -> Result<(), SystemError>,
     {
-        use crate::sched::SchedMode;
-
         wq_wait_event_interruptible!(
             self.wait_queue,
             match cond() {

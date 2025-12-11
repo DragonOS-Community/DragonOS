@@ -413,6 +413,14 @@ impl File {
                     | FileMode::FMODE_PWRITE
                     | FileMode::FMODE_ATOMIC_POS,
             );
+        } else {
+            // 对字符设备等，只要具备读/写权限，就允许 pread/pwrite
+            if mode.contains(FileMode::FMODE_READ) {
+                mode.insert(FileMode::FMODE_PREAD);
+            }
+            if mode.contains(FileMode::FMODE_WRITE) {
+                mode.insert(FileMode::FMODE_PWRITE);
+            }
         }
 
         // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
@@ -514,6 +522,10 @@ impl File {
     }
 
     fn file_readahead(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        if self.mode().contains(FileMode::FMODE_RANDOM) {
+            return Ok(());
+        }
+
         let page_cache = match self.inode.page_cache() {
             Some(page_cahce) => page_cahce,
             None => return Ok(()),
@@ -572,7 +584,6 @@ impl File {
         buf: &mut [u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
-        // 先检查本文件在权限等规则下，是否可读取。
         self.readable()?;
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
@@ -609,28 +620,34 @@ impl File {
         buf: &[u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
-        // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
 
         let inode_flags = self.get_inode_flags()?;
+        let flags = self.flags();
         // 检查 S_IMMUTABLE
         if inode_flags.contains(InodeFlags::S_IMMUTABLE) {
             return Err(SystemError::EPERM);
         }
         // S_APPEND 的 inode 只能追加写入
-        if inode_flags.contains(InodeFlags::S_APPEND) && !self.flags().contains(FileFlags::O_APPEND)
-        {
+        if inode_flags.contains(InodeFlags::S_APPEND) && !flags.contains(FileFlags::O_APPEND) {
             return Err(SystemError::EPERM);
         }
 
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-        // 获取文件类型
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        // 检查RLIMIT_FSIZE限制（仅对常规文件生效）
+        // 按 Linux 语义，带 O_APPEND 的文件写入（包括 pwrite）都会强制在文件末尾进行，
+        // 但偏移有效性检查仍在更上层进行。
+        let actual_offset =
+            if flags.contains(FileFlags::O_APPEND) && matches!(file_type, FileType::File) {
+                md.size as usize
+            } else {
+                offset
+            };
+
         let actual_len = if matches!(file_type, FileType::File) {
             let current_pcb = ProcessManager::current_pcb();
             let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
@@ -638,9 +655,7 @@ impl File {
             if fsize_limit.rlim_cur != u64::MAX {
                 let limit = fsize_limit.rlim_cur as usize;
 
-                // 如果当前文件大小已经达到或超过限制，不允许写入
-                if offset >= limit {
-                    // 发送SIGXFSZ信号
+                if actual_offset >= limit {
                     let _ = send_signal_to_pid(
                         current_pcb.raw_pid(),
                         crate::arch::ipc::signal::Signal::SIGXFSZ,
@@ -648,8 +663,7 @@ impl File {
                     return Err(SystemError::EFBIG);
                 }
 
-                // 计算可写入的最大长度（不超过限制）
-                let max_writable = limit.saturating_sub(offset);
+                let max_writable = limit.saturating_sub(actual_offset);
                 if len > max_writable {
                     max_writable
                 } else {
@@ -662,20 +676,23 @@ impl File {
             len
         };
 
-        // 仅常规文件考虑“指针超过大小则扩展”语义；管道/字符设备等不应触发 resize
-        if matches!(file_type, FileType::File) && offset > md.size as usize {
-            self.inode.resize(offset)?;
+        if matches!(file_type, FileType::File) && actual_offset > md.size as usize {
+            self.inode.resize(actual_offset)?;
         }
-        let written_len = self
-            .inode
-            .write_at(offset, actual_len, buf, self.private_data.lock())?;
-
+        let written_len =
+            self.inode
+                .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
         if update_offset {
-            self.offset
-                .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+            if flags.contains(FileFlags::O_APPEND) {
+                self.offset.store(
+                    actual_offset + written_len,
+                    core::sync::atomic::Ordering::SeqCst,
+                );
+            } else {
+                self.offset
+                    .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+            }
         }
-
-        let flags = self.flags();
         // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
         let need_data_sync = flags.contains(FileFlags::O_DSYNC);
         // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
@@ -764,7 +781,6 @@ impl File {
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
         let mode = *self.mode.read();
-
         // O_PATH文件几乎不能做任何I/O操作
         if mode.contains(FileMode::FMODE_PATH) {
             return Err(SystemError::EBADF);
@@ -796,11 +812,6 @@ impl File {
         // 检查写权限
         if !mode.contains(FileMode::FMODE_WRITE) {
             return Err(SystemError::EBADF);
-        }
-
-        // 检查写能力
-        if !mode.can_write() {
-            return Err(SystemError::EINVAL);
         }
 
         Ok(())
@@ -1058,6 +1069,30 @@ impl File {
         let metadata = self.inode.metadata()?;
         Ok(metadata.flags)
     }
+
+    /// 修改文件访问模式标志
+    pub fn set_mode_flags(&self, flags: FileMode) {
+        self.mode.write().insert(flags);
+    }
+
+    /// 清除文件访问模式标志
+    pub fn remove_mode_flags(&self, flags: FileMode) {
+        self.mode.write().remove(flags);
+    }
+
+    /// 设置预读窗口大小
+    pub fn set_ra_pages(&self, pages: usize) {
+        self.ra_state.lock().ra_pages = pages;
+    }
+
+    pub fn get_ra_state(&self) -> FileReadaheadState {
+        self.ra_state.lock().clone()
+    }
+
+    pub fn set_ra_state(&self, ra_state: FileReadaheadState) -> Result<(), SystemError> {
+        *self.ra_state.lock() = ra_state;
+        Ok(())
+    }
 }
 
 impl Drop for File {
@@ -1277,6 +1312,19 @@ impl FileDescriptorVec {
             return None;
         }
         self.fds[fd as usize].clone()
+    }
+
+    /// 根据文件描述符序号，获取文件结构体的Arc指针, 并检测FileMode
+    ///
+    /// ## 参数
+    ///
+    /// - `fd` 文件描述符序号
+    pub fn get_file_by_fd_not_raw(&self, fd: i32, mask: FileMode) -> Option<Arc<File>> {
+        if !self.validate_fd(fd) {
+            return None;
+        }
+        let file = self.fds[fd as usize].clone();
+        file.filter(|f| !f.mode().contains(mask))
     }
 
     /// 当RLIMIT_NOFILE变化时调整文件描述符表容量

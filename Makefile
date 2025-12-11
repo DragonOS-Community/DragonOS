@@ -28,6 +28,21 @@ endif
 # 解析命令行参数  
 FMT_CHECK?=0
 
+# 是否跳过grub自动安装。CI环境或纯nographic运行可以设置为1以节省时间。
+SKIP_GRUB ?= 0
+# CI环境默认跳过
+ifneq ($(CI),)
+SKIP_GRUB := 1
+endif
+
+ifeq ($(SKIP_GRUB),1)
+GRUB_PREPARE_CMD := printf 'Skip grub_auto_install.sh (SKIP_GRUB=1)\n'
+GRUB_SKIP_ENV := SKIP_GRUB=1
+else
+GRUB_PREPARE_CMD := bash grub_auto_install.sh
+GRUB_SKIP_ENV :=
+endif
+
 ifeq ($(FMT_CHECK), 1)
 	FMT_CHECK=--check
 else
@@ -83,11 +98,11 @@ endif
 # 写入磁盘镜像
 write_diskimage: check_arch
 	@echo "write_diskimage arch=$(ARCH)"
-	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo DADK=$(DADK) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
+	bash -c "export ARCH=$(ARCH); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
 
 # 写入磁盘镜像(uefi)
 write_diskimage-uefi: check_arch
-	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo DADK=$(DADK) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
+	bash -c "export ARCH=$(ARCH); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu: check_arch
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."
@@ -143,7 +158,7 @@ run-vnc: check_arch
 
 run-nographic: check_arch
 	$(MAKE) all -j $(NPROCS)
-	$(MAKE) write_diskimage || exit 1
+	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-nographic
 
 # 在docker中编译，并启动QEMU
@@ -161,7 +176,7 @@ test-syscall: check_arch
 		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
 		$(DADK) user clean --level in-src; \
 	fi
-	$(MAKE) write_diskimage || exit 1
+	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-nographic AUTO_TEST=syscall SYSCALL_TEST_DIR=/opt/tests/gvisor &
 	sleep 5
 	@{ \

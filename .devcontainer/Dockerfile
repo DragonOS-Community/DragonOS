@@ -8,22 +8,25 @@ ENV FORCE_UNSAFE_CONFIGURE=1
 
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
+# 创建dragonos用户并设置sudo免密码
+RUN apt update && \
+    apt install --no-install-recommends -y \
+    ca-certificates curl gnupg wget sudo apt-utils && \
+    groupadd -g 1000 dragonos && \
+    useradd -m -u 1000 -g 1000 -s /bin/bash dragonos && \
+    echo "dragonos ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
 # 设置工作目录
+USER dragonos
 WORKDIR /tmp
 
-# 将本地的脚本复制到工作目录
-COPY *.sh ./
+COPY ../tools/*.sh ./
 
-# 设置sudo免密码
-RUN apt update && \
-    apt install --no-install-recommends -y ca-certificates curl gnupg wget sudo apt-utils && \
-    bash bootstrap.sh --default --ci && \
-    git config --global --add safe.directory '*' && \
+RUN bash bootstrap.sh --default --ci && \
     sudo apt autoremove -q -y && \
     sudo apt clean -q -y && \
     sudo rm -rf /tmp/*
 
-WORKDIR /root
+WORKDIR /home/dragonos
 
-# 设置容器启动后执行的命令
 CMD ["/bin/bash"]

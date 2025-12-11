@@ -1740,6 +1740,10 @@ impl IndexNode for LockedFATInode {
         Ok(())
     }
     fn resize(&self, len: usize) -> Result<(), SystemError> {
+        //检查是否超过fat支持的最大容量
+        if (len as u64) > MAX_FILE_SIZE {
+            return Err(SystemError::EFBIG);
+        }
         // 先调整页缓存：清除被截断区间的缓存页，再缩容缓存大小
         if let Some(page_cache) = self.page_cache() {
             let start_page = (len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;

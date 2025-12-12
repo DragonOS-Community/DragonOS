@@ -15,14 +15,10 @@ use crate::{
     filesystem::{
         devpts::DevPtsFs,
         epoll::{event_poll::EventPoll, EPollEventType},
-        vfs::{
-            file::FileFlags, mount::MountFSInode, FilePrivateData, FileSystem, FileType, IndexNode,
-            InodeMode, MountFS, VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        },
+        vfs::{file::FileFlags, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode},
     },
     libs::{casting::DowncastArc, spinlock::SpinLockGuard},
     mm::VirtAddr,
-    process::ProcessManager,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -32,14 +28,80 @@ pub const NR_UNIX98_PTY_MAX: u32 = 128;
 
 #[derive(Debug)]
 struct PtyDevPtsLink {
-    pts_root: Weak<MountFSInode>,
+    /// devpts 挂载点根目录（/dev/pts 的 inode），用于精确 unlink 目录项
+    pts_root: Weak<dyn IndexNode>,
+    /// devpts 文件系统本体，用于精确回收索引（避免再去 downcast/全局路径查找）
+    devpts: Weak<DevPtsFs>,
     index: usize,
-    freed: core::sync::atomic::AtomicBool,
+    /// master 侧（ptmx）最后一个 fd 已关闭
+    master_closed: AtomicBool,
+    /// slave 侧（/dev/pts/N）最后一个 fd 已关闭
+    slave_closed: AtomicBool,
+    /// 目录项是否已经 unlink（通常在 master close 时执行）
+    unlinked: AtomicBool,
+    /// 索引是否已经归还（仅在 master+slave 都关闭后才允许归还）
+    index_freed: AtomicBool,
 }
 
 impl crate::driver::tty::tty_driver::TtyCorePrivateField for PtyDevPtsLink {
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+}
+
+impl PtyDevPtsLink {
+    fn new(pts_root: Weak<dyn IndexNode>, devpts: Weak<DevPtsFs>, index: usize) -> Self {
+        Self {
+            pts_root,
+            devpts,
+            index,
+            master_closed: AtomicBool::new(false),
+            slave_closed: AtomicBool::new(false),
+            unlinked: AtomicBool::new(false),
+            index_freed: AtomicBool::new(false),
+        }
+    }
+
+    fn on_close(&self, subtype: TtyDriverSubType) {
+        match subtype {
+            TtyDriverSubType::PtyMaster => {
+                self.master_closed.store(true, Ordering::SeqCst);
+                // Linux 语义：master 关闭后，/dev/pts/N 目录项应从 devpts 中消失；
+                // 但索引不能立即复用（slave 可能仍持有打开的 fd），因此 unlink 与 free_index 分离。
+                self.try_unlink_once();
+            }
+            TtyDriverSubType::PtySlave => {
+                self.slave_closed.store(true, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+
+        self.try_free_index_when_fully_closed();
+    }
+
+    fn try_unlink_once(&self) {
+        if self.unlinked.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(root) = self.pts_root.upgrade() {
+            let _ = root.unlink(&self.index.to_string());
+        }
+    }
+
+    fn try_free_index_when_fully_closed(&self) {
+        if !(self.master_closed.load(Ordering::SeqCst) && self.slave_closed.load(Ordering::SeqCst))
+        {
+            return;
+        }
+        if self.index_freed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        // 兜底：如果 master 未触发 unlink（异常路径），在最终回收时再尝试一次。
+        self.try_unlink_once();
+        if let Some(devpts) = self.devpts.upgrade() {
+            devpts.free_index(self.index);
+        }
     }
 }
 
@@ -237,39 +299,15 @@ impl TtyOperation for Unix98PtyDriverInner {
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         let driver = tty.core().driver();
-        let mut removed = false;
-
-        // 优先通过 hook 删除 devpts 入口并回收索引
+        // 通过 hook 精确管理 devpts 目录项与索引生命周期
         if let Some(hook_arc) = tty.private_fields() {
             if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
-                // 防止重复释放
-                if !hook.freed.swap(true, Ordering::SeqCst) {
-                    if let Some(root) = hook.pts_root.upgrade() {
-                        let _ = root.unlink(&hook.index.to_string());
-                        if let Some(mfs) = root.fs().clone().downcast_arc::<MountFS>() {
-                            if let Some(devpts) =
-                                mfs.inner_filesystem().clone().downcast_arc::<DevPtsFs>()
-                            {
-                                devpts.free_index(hook.index);
-                            }
-                        }
-                        removed = true;
-                    }
-                }
+                hook.on_close(driver.tty_driver_sub_type());
             }
         }
 
         if driver.tty_driver_sub_type() == TtyDriverSubType::PtySlave {
             driver.ttys().remove(&tty.core().index());
-            // 兜底：如果未通过 hook 删除，则直接尝试从 /dev/pts 移除
-            if !removed {
-                let root_inode = ProcessManager::current_mntns().root_inode();
-                if let Ok(pts_root_inode) =
-                    root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)
-                {
-                    let _ = pts_root_inode.unlink(&tty.core().index().to_string());
-                }
-            }
             if let Some(link) = tty.core().link() {
                 let link_core = link.core();
                 // set OTHER_CLOSED flag to tell master side that the slave side is closed
@@ -282,34 +320,8 @@ impl TtyOperation for Unix98PtyDriverInner {
                 let _ = EventPoll::wakeup_epoll(epitems, EPollEventType::EPOLLHUP);
             }
         } else if driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster {
-            // 主端关闭：尝试删除 devpts 入口；若没有 hook 也兜底一次
-            if !removed {
-                if let Some(hook_arc) = tty.private_fields() {
-                    if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
-                        if !hook.freed.swap(true, Ordering::SeqCst) {
-                            if let Some(root) = hook.pts_root.upgrade() {
-                                let _ = root.unlink(&hook.index.to_string());
-                                if let Some(mfs) = root.fs().clone().downcast_arc::<MountFS>() {
-                                    if let Some(devpts) =
-                                        mfs.inner_filesystem().clone().downcast_arc::<DevPtsFs>()
-                                    {
-                                        devpts.free_index(hook.index);
-                                    }
-                                }
-                                removed = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if !removed {
-                let root_inode = ProcessManager::current_mntns().root_inode();
-                if let Ok(pts_root_inode) =
-                    root_inode.lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)
-                {
-                    let _ = pts_root_inode.unlink(&tty.core().index().to_string());
-                }
-            }
+            // master 侧最后关闭：从 driver 表移除自身（避免泄漏）；devpts 的释放由 hook 统一处理
+            driver.ttys().remove(&tty.core().index());
             if let Some(link) = tty.core().link() {
                 let link_core = link.core();
                 link_core.flags_write().insert(TtyFlag::OTHER_CLOSED);
@@ -357,7 +369,7 @@ pub fn ptmx_open(
     let (pts_root_inode, fsinfo) =
         if let Some(devpts) = this.fs().clone().downcast_arc::<DevPtsFs>() {
             let root_inode = devpts.root_inode();
-            (root_inode.clone(), devpts)
+            (root_inode, devpts)
         } else {
             return Err(SystemError::ENODEV);
         };
@@ -381,17 +393,17 @@ pub fn ptmx_open(
         InodeMode::from_bits_truncate(0x666),
     )?;
 
-    // 在 master/slave 两端记录 devpts 根节点信息，便于关闭时回收 /dev/pts/ 下的节点
-    if let Some(mnt_inode) = pts_root_inode.downcast_arc::<MountFSInode>() {
-        let hook = Arc::new(PtyDevPtsLink {
-            pts_root: Arc::downgrade(&mnt_inode),
-            index,
-            freed: AtomicBool::new(false),
-        });
-        tty.set_private_fields(hook.clone());
-        if let Some(slave) = tty.core().link() {
-            slave.set_private_fields(hook);
-        }
+    // 在 master/slave 两端记录 devpts 根目录与 fs，用于精确清理：
+    // - master close: unlink /dev/pts/N
+    // - master+slave 都 close: free_index(N)
+    let hook = Arc::new(PtyDevPtsLink::new(
+        Arc::downgrade(&pts_root_inode),
+        Arc::downgrade(&fsinfo),
+        index,
+    ));
+    tty.set_private_fields(hook.clone());
+    if let Some(slave) = tty.core().link() {
+        slave.set_private_fields(hook);
     }
 
     ptm_driver().driver_funcs().open(core)?;

@@ -30,6 +30,7 @@ rename_test
 getdents_test
 preadv_test
 pwrite64_test
+pwritev2_test
 utimes_test
 fadvise_test
 open_test

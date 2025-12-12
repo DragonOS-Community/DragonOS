@@ -117,6 +117,7 @@ impl TtyJobCtrlManager {
             TtyIoctlCmd::TIOCGPGRP => Self::tiocgpgrp(real_tty, arg),
             TtyIoctlCmd::TIOCGSID => Self::tiocgsid(real_tty, arg),
             TtyIoctlCmd::TIOCSCTTY => Self::tiocsctty(real_tty, arg),
+            TtyIoctlCmd::TIOCNOTTY => Self::tiocnotty(real_tty),
             _ => {
                 return Err(SystemError::ENOIOCTLCMD);
             }
@@ -310,6 +311,23 @@ impl TtyJobCtrlManager {
         let sid = p.task_session();
 
         return sid;
+    }
+
+    /// Detach controlling tty from current process if it matches `real_tty`.
+    fn tiocnotty(real_tty: Arc<TtyCore>) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut siginfo = pcb.sig_info_mut();
+        if let Some(cur) = siginfo.tty() {
+            if Arc::ptr_eq(&cur, &real_tty) {
+                Self::__proc_clear_tty(&mut siginfo);
+                drop(siginfo);
+                let mut ctrl = real_tty.core().contorl_info_irqsave();
+                ctrl.session = None;
+                ctrl.pgid = None;
+                return Ok(0);
+            }
+        }
+        Err(SystemError::ENOTTY)
     }
 
     pub(super) fn session_clear_tty(sid: Arc<Pid>) {

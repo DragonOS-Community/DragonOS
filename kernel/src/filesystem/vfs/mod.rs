@@ -1168,6 +1168,7 @@ bitflags! {
         const KER_MAGIC = 0x3153464b;
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
+        const DEVPTS_MAGIC = 0x1cd1;
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
     }
@@ -1257,19 +1258,20 @@ macro_rules! register_mountable_fs {
         }
 
         #[distributed_slice(FSMAKER)]
-        static $maker_name: FileSystemMaker = FileSystemMaker::new(
-            $fs_name,
-            &($fs::make_fs_bridge
-                as fn(
-                    Option<&dyn FileSystemMakerData>,
-                ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
-            &($fs::make_mount_data_bridge
-                as fn(
-                    Option<&str>,
-                    &str,
-                )
-                    -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
-        );
+        static $maker_name: $crate::filesystem::vfs::FileSystemMaker =
+            $crate::filesystem::vfs::FileSystemMaker::new(
+                $fs_name,
+                &($fs::make_fs_bridge
+                    as fn(
+                        Option<&dyn FileSystemMakerData>,
+                    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+                &($fs::make_mount_data_bridge
+                    as fn(
+                        Option<&str>,
+                        &str,
+                    )
+                        -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+            );
     };
 }
 

@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+use core::{any::Any, fmt::Debug};
 
 use alloc::{
     string::{String, ToString},
@@ -102,7 +102,9 @@ impl TtyDriverManager {
 
 /// tty 驱动程序的与设备相关的数据
 pub trait TtyDriverPrivateField: Debug + Send + Sync {}
-pub trait TtyCorePrivateField: Debug + Send + Sync {}
+pub trait TtyCorePrivateField: Debug + Send + Sync + Any {
+    fn as_any(&self) -> &dyn Any;
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -336,8 +338,13 @@ impl TtyDriver {
         // log::debug!("init_tty_device: to ldisc_setup");
         TtyLdiscManager::ldisc_setup(tty.clone(), tty.core().link())?;
 
-        // 在devfs创建对应的文件
+        // 对 PTY 来说，用户可见的设备节点由 devpts 挂载点下的动态节点提供，
+        // 不应再向全局 devfs 注册（否则在新实例复用索引时会因已有的 ptm/ptsX 节点返回 EEXIST）。
+        if self.tty_driver_type == TtyDriverType::Pty {
+            return Ok(tty);
+        }
 
+        // 在devfs创建对应的文件
         // log::debug!("init_tty_device: to new tty device");
         let device = TtyDevice::new(
             core.name().clone(),

@@ -3,8 +3,11 @@
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
-        fcntl::AtFlags, mount::MountFlags, produce_fs, utils::user_path_at, FileType, IndexNode,
-        InodeId, MountFS, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        fcntl::AtFlags,
+        mount::{is_mountpoint_root, MountFlags},
+        produce_fs,
+        utils::user_path_at,
+        FileType, IndexNode, InodeId, MountFS, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
     process::{
@@ -257,7 +260,7 @@ fn path_mount(
 
 fn do_new_mount(
     source: Option<String>,
-    target_inode: Arc<dyn IndexNode>,
+    mut target_inode: Arc<dyn IndexNode>,
     filesystemtype: Option<String>,
     data: Option<String>,
     mount_flags: MountFlags,
@@ -268,14 +271,17 @@ fn do_new_mount(
         log::error!("Failed to produce filesystem: {:?}", e);
     })?;
 
-    let abs_path = target_inode.absolute_path()?;
-
-    let result = ProcessManager::current_mntns().get_mount_point(&abs_path);
-    if let Some((_, rest, _fs)) = result {
-        if rest.is_empty() {
-            return Err(SystemError::EBUSY);
+    // 若目标是挂载点根，则尝试在其父目录挂载，避免 EBUSY 并与 Linux 叠加语义接近
+    if is_mountpoint_root(&target_inode) {
+        if let Ok(parent) = target_inode.parent() {
+            target_inode = parent;
         }
     }
+
+    let _abs_path = target_inode.absolute_path()?;
+
+    // 允许在已有挂载点上再次挂载（符合 Linux 允许叠加挂载的语义）
+    // MountList::insert 会替换同一路径的记录，无需提前返回 EBUSY。
     return target_inode.mount(fs, mount_flags);
 }
 #[inline(never)]

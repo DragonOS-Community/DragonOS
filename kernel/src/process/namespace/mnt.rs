@@ -275,7 +275,7 @@ impl MntNamespace {
         mntfs: Arc<MountFS>,
     ) -> Result<(), SystemError> {
         self.inner.lock().mount_list.insert(ino, mount_path, mntfs);
-        return Ok(());
+        Ok(())
     }
 
     pub fn mount_list(&self) -> Arc<MountList> {
@@ -283,7 +283,7 @@ impl MntNamespace {
     }
 
     pub fn remove_mount(&self, mount_path: &str) -> Option<Arc<MountFS>> {
-        return self.inner.lock().mount_list.remove(mount_path);
+        self.inner.lock().mount_list.remove(mount_path)
     }
 
     pub fn get_mount_point(

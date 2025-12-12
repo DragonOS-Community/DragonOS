@@ -19,9 +19,10 @@ type = "install-from-prebuilt"
 # 构建来源
 # "build_from_source" 可选值："git", "local", "archive"
 # "install_from_prebuilt" 可选值："local", "archive"
-source = "local"
+source = "archive"
 # 本地目录路径 - 指向已解压的 sysroot 目录
-source-path = "user/apps/tests/benchmark/lmbench/sysroot"
+source-path = "https://mirrors.dragonos.org.cn/pub/third_party/lmbench/lmbench-ubuntu2404-202511301014-36c2fb2d084343e098b5e343576d4fc0.tar.xz"
+archive-rootdir = "sysroot/"
 
 [build]
 

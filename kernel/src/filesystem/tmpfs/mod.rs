@@ -1,5 +1,6 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
@@ -42,6 +43,8 @@ pub struct LockedTmpfsInode(pub SpinLock<TmpfsInode>);
 pub struct Tmpfs {
     root_inode: Arc<LockedTmpfsInode>,
     super_block: RwLock<SuperBlock>,
+    size_limit: Option<u64>,
+    current_size: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -175,6 +178,8 @@ impl Tmpfs {
         let result: Arc<Tmpfs> = Arc::new(Tmpfs {
             root_inode: root,
             super_block: RwLock::new(sb),
+            size_limit: mount_data.size_bytes,
+            current_size: AtomicU64::new(0),
         });
 
         let mut root_guard: SpinLockGuard<TmpfsInode> = result.root_inode.0.lock();
@@ -185,6 +190,46 @@ impl Tmpfs {
         drop(root_guard);
 
         result
+    }
+
+    /// 原子地增加文件系统使用的大小
+    /// 返回Ok(())如果更新成功，Err(SystemError::ENOSPC)如果超过限制
+    /// 使用compare_exchange_weak循环确保并发安全
+    fn increase_size(&self, size_diff: u64) -> Result<(), SystemError> {
+        if let Some(limit) = self.size_limit {
+            // 使用compare_exchange_weak循环确保原子性
+            loop {
+                let current = self.current_size.load(Ordering::Acquire);
+                let new_total = current.saturating_add(size_diff);
+
+                if new_total > limit {
+                    return Err(SystemError::ENOSPC);
+                }
+
+                // 原子地更新，如果current没有被其他线程修改，则更新成功
+                match self.current_size.compare_exchange_weak(
+                    current,
+                    new_total,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,     // 更新成功
+                    Err(_) => continue, // 被其他线程修改，重试
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 原子地减少文件系统当前使用的大小（用于文件删除或缩小）
+    /// 使用fetch_sub确保并发安全
+    fn decrease_size(&self, size: usize) {
+        if self.size_limit.is_some() {
+            let size_to_decrease = size as u64;
+            // 使用fetch_sub原子地减少大小
+            self.current_size
+                .fetch_sub(size_to_decrease, Ordering::Release);
+        }
     }
 }
 
@@ -221,8 +266,17 @@ impl IndexNode for LockedTmpfsInode {
         if inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EINVAL);
         }
-        if inode.data.len() > len {
+        let old_size = inode.data.len();
+        if old_size > len {
+            // 执行truncate
             inode.data.resize(len, 0);
+            // 如果缩小，减少current_size
+            let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
+            let tmpfs = fs
+                .as_any_ref()
+                .downcast_ref::<Tmpfs>()
+                .ok_or(SystemError::EIO)?;
+            tmpfs.decrease_size(old_size - len);
         }
         Ok(())
     }
@@ -256,9 +310,6 @@ impl IndexNode for LockedTmpfsInode {
 
         let start = inode.data.len().min(offset);
         let end = inode.data.len().min(offset + len);
-        if buf.len() < (end - start) {
-            return Err(SystemError::ENOBUFS);
-        }
         let src = &inode.data[start..end];
         buf[0..src.len()].copy_from_slice(src);
         Ok(src.len())
@@ -278,12 +329,33 @@ impl IndexNode for LockedTmpfsInode {
         if inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
+
+        // 计算大小变化
+        let old_size = inode.data.len();
+        let new_size = (offset + len).max(old_size);
+        let size_diff = new_size.saturating_sub(old_size) as u64;
+
+        // 获取文件系统引用
+        let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
+        let tmpfs = fs
+            .as_any_ref()
+            .downcast_ref::<Tmpfs>()
+            .ok_or(SystemError::EIO)?;
+
+        // 原子地预留空间（如果超过限制则失败）
+        // 必须在持有锁的情况下进行，确保原子性
+        if size_diff > 0 {
+            tmpfs.increase_size(size_diff)?;
+        }
+
+        // 执行实际写入（持有锁，所以不会失败）
         let data: &mut Vec<u8> = &mut inode.data;
         if offset + len > data.len() {
             data.resize(offset + len, 0);
         }
         let target = &mut data[offset..offset + len];
         target.copy_from_slice(&buf[0..len]);
+
         Ok(len)
     }
 
@@ -317,7 +389,30 @@ impl IndexNode for LockedTmpfsInode {
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type == FileType::File {
+            let old_size = inode.data.len();
+            let new_size = len;
+            let size_diff = new_size.saturating_sub(old_size) as i64;
+
+            // 获取文件系统引用
+            let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
+            let tmpfs = fs
+                .as_any_ref()
+                .downcast_ref::<Tmpfs>()
+                .ok_or(SystemError::EIO)?;
+
+            // 如果扩大，原子地预留空间
+            if size_diff > 0 {
+                tmpfs.increase_size(size_diff as u64)?;
+            }
+
+            // 执行实际resize
             inode.data.resize(len, 0);
+
+            // 如果缩小，减少current_size
+            if size_diff < 0 {
+                tmpfs.decrease_size((-size_diff) as usize);
+            }
+
             Ok(())
         } else {
             Err(SystemError::EINVAL)
@@ -412,11 +507,26 @@ impl IndexNode for LockedTmpfsInode {
 
         let name = DName::from(name);
         let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
-        if to_delete.0.lock().metadata.file_type == FileType::Dir {
+        let deleted_inode = to_delete.0.lock();
+        if deleted_inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EPERM);
         }
+
+        // 获取文件大小，用于减少current_size
+        let file_size = deleted_inode.data.len();
+        let fs = deleted_inode.fs.upgrade().ok_or(SystemError::EIO)?;
+        let tmpfs = fs
+            .as_any_ref()
+            .downcast_ref::<Tmpfs>()
+            .ok_or(SystemError::EIO)?;
+
+        drop(deleted_inode);
         to_delete.0.lock().metadata.nlinks -= 1;
         inode.children.remove(&name);
+
+        // 减少文件系统使用的大小
+        tmpfs.decrease_size(file_size);
+
         Ok(())
     }
 
@@ -427,13 +537,27 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::ENOTDIR);
         }
         let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
-        if to_delete.0.lock().metadata.file_type != FileType::Dir {
+        let deleted_inode = to_delete.0.lock();
+        if deleted_inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
+        // 目录的大小通常是0（不包含数据），但为了完整性，我们也处理
+        let dir_size = deleted_inode.data.len();
+        let fs = deleted_inode.fs.upgrade().ok_or(SystemError::EIO)?;
+        let tmpfs = fs
+            .as_any_ref()
+            .downcast_ref::<Tmpfs>()
+            .ok_or(SystemError::EIO)?;
+
+        drop(deleted_inode);
         to_delete.0.lock().metadata.nlinks -= 1;
         inode.children.remove(&name);
         inode.metadata.nlinks -= 1;
+
+        // 减少文件系统使用的大小（目录通常大小为0）
+        tmpfs.decrease_size(dir_size);
+
         Ok(())
     }
 
@@ -530,12 +654,7 @@ impl IndexNode for LockedTmpfsInode {
                 match key.len() {
                     0 => Err(SystemError::ENOENT),
                     1 => Ok(key.remove(0)),
-                    _ => panic!(
-                        "Tmpfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}",
-                        key_len = key.len(),
-                        inode_id = inode.metadata.inode_id,
-                        to_find = ino
-                    ),
+                    _ => Err(SystemError::EIO),
                 }
             }
         }
@@ -615,12 +734,8 @@ impl IndexNode for LockedTmpfsInode {
             let pipe_inode = LockedPipeInode::new();
             pipe_inode.set_fifo();
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-        } else if mode.contains(InodeMode::S_IFBLK) {
-            nod.0.lock().metadata.file_type = FileType::BlockDevice;
-            unimplemented!()
-        } else if mode.contains(InodeMode::S_IFCHR) {
-            nod.0.lock().metadata.file_type = FileType::CharDevice;
-            unimplemented!()
+        } else if mode.contains(InodeMode::S_IFBLK) || mode.contains(InodeMode::S_IFCHR) {
+            return Err(SystemError::ENOSYS);
         }
 
         inode.children.insert(filename, nod.clone());

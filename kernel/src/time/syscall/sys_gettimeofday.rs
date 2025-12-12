@@ -24,33 +24,32 @@ impl Syscall for SysGettimeofday {
         2
     }
 
-    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let tv = Self::timeval_ptr(args);
         let timezone = Self::timezone_ptr(args);
 
         // TODO; 处理时区信息
-        if tv.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-        let mut tv_buf =
-            UserBufferWriter::new::<PosixTimeval>(tv, core::mem::size_of::<PosixTimeval>(), true)?;
-
-        let tz_buf = if timezone.is_null() {
-            None
-        } else {
-            Some(UserBufferWriter::new::<PosixTimeZone>(
-                timezone,
-                core::mem::size_of::<PosixTimeZone>(),
-                true,
-            )?)
-        };
-
         let posix_time = do_gettimeofday();
 
-        tv_buf.copy_one_to_user(&posix_time, 0)?;
+        // 如果 tv 不为空，使用 buffer_protected 来保护用户空间访问
+        if !tv.is_null() {
+            let mut tv_buf = UserBufferWriter::new::<PosixTimeval>(
+                tv,
+                core::mem::size_of::<PosixTimeval>(),
+                frame.is_from_user(),
+            )?;
+            tv_buf.buffer_protected(0)?.write_one(0, &posix_time)?;
+        }
 
-        if let Some(mut tz_buf) = tz_buf {
-            tz_buf.copy_one_to_user(&SYS_TIMEZONE, 0)?;
+        // 如果 timezone 不为空，使用 buffer_protected 来保护用户空间访问
+        if !timezone.is_null() {
+            let mut tz_buf = UserBufferWriter::new::<PosixTimeZone>(
+                timezone,
+                core::mem::size_of::<PosixTimeZone>(),
+                frame.is_from_user(),
+            )?;
+
+            tz_buf.buffer_protected(0)?.write_one(0, &SYS_TIMEZONE)?;
         }
 
         return Ok(0);

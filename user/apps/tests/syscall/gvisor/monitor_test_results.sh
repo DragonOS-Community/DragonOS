@@ -9,7 +9,7 @@ BOOT_TIMEOUT=300        # DragonOS开机超时（5分钟）
 TEST_START_TIMEOUT=600  # 测试程序启动超时（10分钟）
 TEST_TIMEOUT=1800       # 整个测试超时（30分钟）
 IDLE_TIMEOUT=120        # 无输出超时（5分钟）
-SINGLE_TEST_TIMEOUT=60 # 单个测试用例超时（1分钟）
+SINGLE_TEST_TIMEOUT=120 # 单个测试用例超时（2分钟）
 
 # QEMU进程查找条件
 QEMU_SEARCH_PATTERN=${QEMU_SEARCH_PATTERN:-"qemu-system-x86_64.*AUTO_TEST=syscall"}

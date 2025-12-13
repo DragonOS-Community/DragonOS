@@ -1,0 +1,162 @@
+#!/bin/sh
+
+# config-scaling - reconfigure just the scaling parameter SYNC_MAX
+#
+# Hacked by Carl Staelin (staelin@hpl.hp.com).
+# Copyright (c) 2002 Carl Staelin.  GPLed software.
+# $Id$
+
+# Make sure we can find: ./cmd, df, and netstat
+SCRIPTSDIR=${SCRIPTSDIR:-../../scripts}
+PATH=.:${SCRIPTSDIR}:$PATH:/etc:/usr/etc:/sbin:/usr/sbin
+export PATH
+
+if [ ! -f $1 ]; then exit 1; fi
+
+. $1
+echo Using config in $1
+
+OLD_SYNC_MAX=$SYNC_MAX
+
+############################################################################
+# Multiple copies
+############################################################################
+echo $L
+cat<<EOF;
+
+If you are running on an MP machine and you want to try running
+multiple copies of lmbench in parallel, you can specify how many here.
+
+Using this option will make the benchmark run 100x slower (sorry).
+
+NOTE:  WARNING! This feature is experimental and many results are 
+	known to be incorrect or random!
+
+EOF
+AGAIN=Y
+while [ $AGAIN = Y ]
+do	echo $ECHON "MULTIPLE COPIES [default 1] $ECHOC"
+	read SYNC_MAX
+	if [ "X$SYNC_MAX" != X ]
+	then	case "$SYNC_MAX" in
+		[0-9]|[0-9][0-9]|[0-9][0-9][0-9])
+			AGAIN=N
+			;;
+		*)	echo "Please enter a number between 1 and 999"
+			;;
+		esac
+	else	AGAIN=N
+		SYNC_MAX=1
+	fi
+done
+
+if [ "X$LMBENCH_SCHED" = "X" ]
+then
+	LMBENCH_SCHED=DEFAULT
+	AGAIN=Y
+	while [ "$AGAIN" = "Y" ]
+	do	cat<<EOF
+Options to control job placement
+1) Allow scheduler to place jobs
+2) Assign each benchmark process with any attendent child processes
+   to its own processor
+3) Assign each benchmark process with any attendent child processes
+   to its own processor, except that it will be as far as possible
+   from other processes
+4) Assign each benchmark and attendent processes to their own
+   processors
+5) Assign each benchmark and attendent processes to their own
+   processors, except that they will be as far as possible from
+   each other and other processes
+6) Custom placement: you assign each benchmark process with attendent
+   child processes to processors
+7) Custom placement: you assign each benchmark and attendent
+   processes to processors
+
+Note: some benchmarks, such as bw_pipe, create attendent child
+processes for each benchmark process.  For example, bw_pipe
+needs a second process to send data down the pipe to be read
+by the benchmark process.  If you have three copies of the
+benchmark process running, then you actually have six processes;
+three attendent child processes sending data down the pipes and 
+three benchmark processes reading data and doing the measurements.
+
+EOF
+		echo $ECHON "Job placement selection: $ECHOC"
+		read LMBENCH_SCHED
+		AGAIN=N
+		case "$LMBENCH_SCHED" in
+		    1) LMBENCH_SCHED=DEFAULT;;
+		    2) LMBENCH_SCHED=BALANCED;;
+		    3) LMBENCH_SCHED=BALANCED_SPREAD;;
+		    4) LMBENCH_SCHED=UNIQUE;;
+		    5) LMBENCH_SCHED=UNIQUE_SPREAD;;
+		    6) echo $ECHON "Please enter a space-separated list of CPU ids: $ECHOC"
+		       read LMBENCH_SCHED
+		       LMBENCH_SCHED="CUSTOM $LMBENCH_SCHED"
+		       ;;
+		    7) echo $ECHON "Please enter a space-separated list of CPU ids: $ECHOC"
+		       read LMBENCH_SCHED
+		       LMBENCH_SCHED="CUSTOM_SPREAD $LMBENCH_SCHED"
+		       ;;
+		    *) AGAIN=Y
+		       ;;
+		esac
+	done
+fi
+
+if [ `expr $SYNC_MAX \* $MB` -gt `expr $TOTAL_MEM  / 2` ]
+then
+	MB=`expr $TOTAL_MEM / $SYNC_MAX`
+	MB=`expr $MB / 2`
+fi
+
+C=$1
+echo DISKS=\"$DISKS\" > $C
+echo DISK_DESC=\"$DISK_DESC\" >> $C
+echo OUTPUT=$OUTPUT >> $C
+echo ENOUGH=$ENOUGH >> $C
+echo FASTMEM=\"$FASTMEM\" >> $C
+echo FILE=$FILE >> $C
+echo FSDIR=$FSDIR >> $C
+echo INFO=$INFO >> $C
+echo LINE_SIZE=$LINE_SIZE >> $C
+echo LOOP_O=$LOOP_O >> $C
+echo MAIL=$MAIL >> $C
+echo TOTAL_MEM=$TOTAL_MEM >> $C
+echo MB=$MB >> $C
+echo MHZ=\"$MHZ\" >> $C
+echo MOTHERBOARD=\"$MOTHERBOARD\" >> $C
+echo NETWORKS=\"$NETWORKS\" >> $C
+echo OS=\"$OS\" >> $C
+echo PROCESSORS=\"$PROCESSORS\" >> $C
+echo REMOTE=\"$REMOTE\" >> $C
+echo SLOWFS=\"$SLOWFS\" >> $C
+echo SYNC_MAX=\"$SYNC_MAX\" >> $C
+echo LMBENCH_SCHED=\"$LMBENCH_SCHED\" >> $C
+echo TIMING_O=$TIMING_O >> $C
+echo RSH=$RSH >> $C
+echo RCP=$RCP >> $C
+echo VERSION=$VERSION >> $C
+echo BENCHMARK_HARDWARE=$BENCHMARK_HARDWARE >> $C
+echo BENCHMARK_OS=$BENCHMARK_OS >> $C
+echo BENCHMARK_SYSCALL=$BENCHMARK_SYSCALL >> $C
+echo BENCHMARK_SELECT=$BENCHMARK_SELECT >> $C
+echo BENCHMARK_SIG=$BENCHMARK_SIG >> $C
+echo BENCHMARK_PROC=$BENCHMARK_PROC >> $C
+echo BENCHMARK_CTX=$BENCHMARK_CTX >> $C
+echo BENCHMARK_PAGEFAULT=$BENCHMARK_PAGEFAULT >> $C
+echo BENCHMARK_FILE=$BENCHMARK_FILE >> $C
+echo BENCHMARK_MMAP=$BENCHMARK_MMAP >> $C
+echo BENCHMARK_PIPE=$BENCHMARK_PIPE >> $C
+echo BENCHMARK_UNIX=$BENCHMARK_UNIX >> $C
+echo BENCHMARK_UDP=$BENCHMARK_UDP >> $C
+echo BENCHMARK_TCP=$BENCHMARK_TCP >> $C
+echo BENCHMARK_CONNECT=$BENCHMARK_CONNECT >> $C
+echo BENCHMARK_RPC=$BENCHMARK_RPC >> $C
+echo BENCHMARK_HTTP=$BENCHMARK_HTTP >> $C
+echo BENCHMARK_BCOPY=$BENCHMARK_BCOPY >> $C
+echo BENCHMARK_MEM=$BENCHMARK_MEM >> $C
+echo BENCHMARK_OPS=$BENCHMARK_OPS >> $C
+
+exit 0

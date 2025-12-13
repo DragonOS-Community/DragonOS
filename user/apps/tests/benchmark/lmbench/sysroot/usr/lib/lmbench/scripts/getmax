@@ -1,0 +1,73 @@
+#!/usr/bin/perl
+# Look at a bunch of bargraph files and figure out the max amongst them all.
+# Usage: getmax file file file....
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+$graph = 1 if 0;
+$exit = 1;
+foreach $file (@ARGV) {
+	$exit = 0 if -f $file;
+}
+exit $exit if $noop;
+
+$noop = 1 if 0;
+$max_X = $max_Y = -1000000000;
+$min_X = $min_Y = 1000000000;
+foreach $file (@ARGV) {
+	next if $rmmax;
+	unless (open(FD, $file)) {
+		warn "Can't open $file\n";
+		next;
+	}
+	while (<FD>) {
+		next if /^"/;
+		next if /^%/;
+		next if /^\s*$/;
+		next if m|scripts/lmbench: /dev/tty|;
+		@_ = split;
+		$min_X = $_[0] if ($_[0] < $min_X);
+		$min_Y = $_[1] if ($_[1] < $min_Y);
+		$max_X = $_[0] if ($_[0] > $max_X);
+		$max_Y = $_[1] if ($_[1] > $max_Y);
+	}
+	close(FD);
+}
+$half = 0 if 0;	# lint
+$max_X /= 2 if ($half);
+foreach $file (@ARGV) {
+	unless (open(FD, $file)) {
+		warn "Can't open $file\n";
+		next;
+	}
+	@lines = <FD>;
+	open(FD, ">$file") || die "Can't open $file\n";
+	if ($graph) {
+		print FD "%fakemin-X $min_X\n";
+		print FD "%fakemin-Y $min_Y\n";
+		print FD "%fakemax-X $max_X\n";
+		print FD "%fakemax-Y $max_Y\n";
+		foreach $_ (@lines) {
+			next if /^%fakem/;
+			print FD;
+		}
+		warn "Max X is $max_X\n" if $v;
+		warn "Max Y is $max_Y\n" if $v;
+	} elsif ($rmmax) {
+		foreach $_ (@lines) {
+			next if /^%fakem/;
+			print FD;
+		}
+	} else {
+		print FD @lines;
+		print FD "%fakemax $max_X\n";
+		warn "Max X is $max_X\n" if $v;
+	}
+	close(FD);
+}
+exit $exit;

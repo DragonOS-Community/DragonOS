@@ -1,0 +1,58 @@
+.KS
+.TS
+center expand doublebox;
+l r.
+SunOS-5.4 sun4m	7
+Sun SC1000	9
+SunOS-5.4 sun4d	12
+SunOS-5.4 sun4m	9
+SunOS-5.4 sun4m	13
+Linux alpha	2
+Linux i586	2
+Linux i586	2
+Unixware/i686	5
+Sun Ultra1	5
+DEC Alpha	9
+Linux i586	3
+Linux i586	3
+Linux alpha	3
+DEC Alpha	11
+DEC Alpha	12
+DEC Alpha	15
+IBM PowerPC	12
+DEC Alpha	17
+FreeBSD/i586	7
+FreeBSD/i586	9
+FreeBSD/i586	10
+DEC Alpha	17
+FreeBSD/i586	7
+SunOS-5.4 sun4d	26
+Linux i686	4
+Linux i586	5
+Linux i586	5
+Linux i486	6
+Linux i486	6
+DEC Alpha	9
+DEC Alpha	13
+HP-UX 9000/735	12
+HP-UX 9000/735	13
+HP-UX 9000/735	14
+IRIX5.3 IP19	20
+HP-UX 9000/755	14
+HP-UX 9000/819	19
+IRIX64 IP25	23
+IRIX IP22	10
+IRIX IP19	16
+IRIX64 IP19	18
+IRIX64 IP19	24
+FreeBSD/i586	9
+HP-UX 9000/770	11
+HP-UX 9000/897	92
+HP-UX 9000/735	12
+dgux mc88110	75
+IBM Power2	16
+IRIX64-601 IP26	20
+IRIX64 IP21	25
+IRIX5.3 IP22	11
+.TE
+.KE

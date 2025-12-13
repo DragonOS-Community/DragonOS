@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+
+   <head>
+ 
+ 
+ <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>
+GCC 13 Release Series &mdash; Changes, New Features, and Fixes
+- GNU Project</title>
+<link rel="stylesheet" type="text/css" href="gcc.css">
+   </head>
+ 
+
+<!-- GCC maintainers, please do not hesitate to contribute/update
+     entries concerning those part of GCC you maintain!
+-->
+
+<body>
+
+
+
+<h1>GCC 13 Release Series<br>Changes, New Features, and Fixes</h1>
+
+<p>
+This page is a "brief" summary of some of the huge number of improvements
+in GCC 13.
+You may also want to check out our
+<a href="porting_to.html">Porting to GCC 13</a> page and the
+<a href="../onlinedocs/index.html#current">full GCC documentation</a>.
+</p>
+
+<!-- .................................................................. -->
+<h2>Caveats</h2>
+<ul>
+    <li>OpenMP offloading to Intel MIC has been removed.</li>
+    <li>The support for the <code>cr16-elf</code>, <code>tilegx*-linux</code>, <code>tilepro*-linux</code>,
+      <code>hppa[12]*-*-hpux10*</code>, <code>hppa[12]*-*-hpux11*</code>
+      and <code>m32c-rtems</code> configurations has been removed.</li>
+    <li>Support for Solaris 11.3 (<code>*-*-solaris2.11.3</code>) has been
+      declared obsolete.  The next release of GCC will have corresponding
+      code permanently <strong>removed</strong>.  Details can be found in
+      the
+      <a href="https://gcc.gnu.org/pipermail/gcc/2022-December/240322.html">
+      announcement</a>.
+    </li>
+    <li>Support for emitting the STABS debugging format (including the
+      <code>-gstabs</code> and <code>-gxcoff</code> options) has been removed.
+      (This means the <strong>dbx</strong> debugger is no longer
+      supported, either.)</li>
+    <li>Legacy debug info compression option <code>-gz=zlib-gnu</code> was removed
+      and the option is ignored right now.</li>
+    <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Warning-Options.html#index-Warray-bounds"><code>-Warray-bounds=2</code></a>
+      will no longer issue warnings for out of
+      bounds accesses to trailing struct members of one-element array type
+      anymore. Instead it diagnoses accesses to trailing arrays according to
+      <code>-fstrict-flex-arrays</code>. </li>
+    <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html"><code>-fanalyzer</code></a>
+      is still only suitable for analyzing C code.
+      In particular, using it on C++ is unlikely to give meaningful output.</li>
+    <li>In the arm port, support for the iWMMXt extensions, enabled through
+      <code>-mcpu=iwmmxt</code>, has been deprecated and will be removed in a
+      future release.  This includes support for the
+      <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/ARM-iWMMXt-Built-in-Functions.html">
+      iWMMXt built-in functions</a>.
+    </li>
+</ul>
+
+
+<!-- .................................................................. -->
+<h2 id="general">General Improvements</h2>
+
+<ul>
+  <li id="openmp"><a href="https://gcc.gnu.org/projects/gomp/">OpenMP</a>
+  <ul>
+    <li>
+      Reverse offload is now supported with AMD GCN and nvptx devices.
+      Additionally, the <code>requires</code> handling has been improved and
+      all clauses are now accepted. If a requirement cannot be fulfilled for
+      an accessible device, this device is excluded from the list of
+      available devices. This may imply that the only device left is the host
+      (the initial device).
+      In particular, <code>unified_address</code> and
+      <code>unified_shared_memory</code> are unsupported by all non-host
+      devices.
+    </li>
+    <li>
+      OpenMP 5.0: Fortran now supports some non-rectangular loop nests; for
+      C/C++, the support was added in GCC 11.
+    </li>
+    <li>
+      The following OpenMP 5.1 features have been added: the
+      <code>omp_all_memory</code> reserved locator, the <code>inoutset</code>
+      modifier to the <code>depend</code> clause, the <code>nowait</code>
+      clause for the <code>taskwait</code> directive and the
+      <code>omp_target_is_accessible</code>, <code>omp_target_memcpy_async</code>,
+      <code>omp_target_memcpy_rect_async</code> and
+      <code>omp_get_mapped_ptr</code> API routines. The <code>assume</code> and
+      <code>assumes</code> directives, the <code>begin/end declare target</code>
+      syntax in C/C++ and device-specific ICV settings with environment variables
+      are now supported.</li>
+    <li>
+      Initial support for OpenMP 5.2 features has been added:
+      <code>firstprivate</code> and <code>allocate</code> clauses on the
+      <code>scope</code> construct; the OpenMP 5.2 syntax of the
+      <code>linear</code> clause; new enum/constants
+      <code>omp_initial_device</code> and <code>omp_invalid_device</code>; and
+      optionally omitting the map-type in <code>target enter/exit data</code>.
+      The <code>enter</code> clause (as alias for <code>to</code>) has been added
+      to the <code>declare target</code> directive. Also added have been the
+      <code>omp_in_explicit_task</code> routine and the <code>doacross</code>
+      clause as alias for <code>depend</code> with
+      <code>source</code>/<code>sink</code> modifier.
+    </li>
+    <li>
+      The <code>_ALL</code> suffix to the device-scope environment variables
+      added in Technical Report (TR11) is already handled.
+    </li>
+    <li>
+      For user defined allocators requesting high bandwidth or large capacity
+      memspaces or interleaved partitioning, the <a
+      href="http://memkind.github.io/memkind/">memkind</a> library is used,
+      if available at run time.
+    </li>
+  </ul>
+  </li>
+  <li>
+    AddressSanitizer defaults to <code>detect_stack_use_after_return=1</code> on GNU/Linux targets.
+    For compatibility, it can be disabled with <code>env ASAN_OPTIONS=detect_stack_use_after_return=0</code>.
+  </li>
+  <li>New debug info compression option value <code>-gz=zstd</code> has been added.</li>
+  <li>
+    Link-time optimization improvements:
+    <ul>
+        <li>LTO supports the newly added jobserver of GNU make jobserver that uses named pipes (<code>--jobserver-style=fifo</code>)
+        by default.</li>
+        <li>If make's jobserver is active, parallel LTO WPA streaming communicates with it and thus avoids
+            system overcommitting.</li>
+    </ul>
+  </li>
+  <li><code>-Ofast</code>, <code>-ffast-math</code> and <code>-funsafe-math-optimizations</code>
+      will no longer add startup code to alter the floating-point environment
+      when producing a shared object with <code>-shared</code>.
+  </li>
+  <li>
+    GCC can now emit its diagnostics using <a href="https://sarifweb.azurewebsites.net/">SARIF</a>.
+    This is a JSON-based format suited for capturing the results of static
+    analysis tools (like GCC's <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html"><code>-fanalyzer</code></a>),
+    but it can also be used to capture other GCC warnings and errors in a
+    machine-readable format.
+    Specifically, the <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Diagnostic-Message-Formatting-Options.html#index-fdiagnostics-format"><code>-fdiagnostics-format=</code></a>
+    option has been extended to support these new values:
+    <ul>
+      <li><code>-fdiagnostics-format=sarif-stderr</code></li>
+      <li><code>-fdiagnostics-format=sarif-file</code></li>
+      <li><code>-fdiagnostics-format=json-stderr</code>, a synonym for the
+	existing <code>-fdiagnostics-format=json</code></li>
+      <li><code>-fdiagnostics-format=json-file</code></li>
+    </ul>
+    where the <code>json</code>-prefixed variants refer to GCC's own JSON diagnostic format.
+  </li>
+</ul>
+
+
+<!-- .................................................................. -->
+<h2 id="languages">New Languages and Language specific improvements</h2>
+
+<h3 id="ada">Ada</h3>
+<ul>
+  <li>Traceback support added in RTEMS for the PPC ELF and ARM architectures.</li>
+  <li>Support for versions older than VxWorks 7 has been removed.</li>
+  <li>General improvements to the contracts in the standard libraries.</li>
+  <li>Addition of <code>GNAT.Binary_Search</code>.</li>
+  <li>Further additions and fixes for the Ada 2022 specification.</li>
+  <li>The Pragma <code>SPARK_Mode=&gt;Auto</code> is now accepted. Contract analysis has been further improved.</li>
+  <li>Documentation improvements.</li>
+</ul>
+
+<h3 id="c-family">C family</h3>
+<ul>
+  <li>New warnings:
+    <ul>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Warning-Options.html#index-Wxor-used-as-pow"><code>-Wxor-used-as-pow</code></a>
+	warns about uses of <code>^</code>, the exclusive or operator,
+	where it appears the user meant exponentiation
+	(<a href="https://gcc.gnu.org/PR90885">PR90885</a>)</li>
+    </ul>
+  </li>
+  <li>Three new function attributes for documenting <code>int</code> arguments that are file descriptors:
+    <ul>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Common-Function-Attributes.html#index-fd_005farg-function-attribute"><code>__attribute__((fd_arg(N)))</code></a></li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Common-Function-Attributes.html#index-fd_005farg_005fread-function-attribute"><code>__attribute__((fd_arg_read(N)))</code></a></li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Common-Function-Attributes.html#index-fd_005farg_005fwrite-function-attribute"><code>__attribute__((fd_arg_write(N)))</code></a></li>
+    </ul>
+    These are used by
+    <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html"><code>-fanalyzer</code></a>
+    to detect misuses of file descriptors.
+  </li>
+  <li>A new statement attribute for C++23 <a href="https://wg21.link/p1774r8">P1774R8</a> Portable
+      assumptions support also in C or older C++:
+      <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Statement-Attributes.html#index-assume-statement-attribute"><code>__attribute__((assume(EXPR)));</code></a>
+  </li>
+ <li>GCC can now control when to treat the trailing array of a structure as a
+     flexible array member for the purpose of accessing the elements of such
+     an array. By default, all trailing arrays in aggregates are treated as
+     flexible array members. Use the new command-line option
+     <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Warning-Options.html#index-Wstrict-flex-arrays"><code>-fstrict-flex-arrays</code></a>
+     to control which array members are treated as flexible arrays.
+ </li>
+</ul>
+
+<h3 id="c">C</h3>
+<ul>
+  <li>Several C23 features have been implemented:
+    <ul>
+      <li><a href="https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3042.htm">N3042</a>,
+	  Introduce the nullptr constant</li>
+      <li><a href="https://www.open-std.org/jtc1/sc22/wg14/www/docs/n2963.htm">N2963</a>,
+      Enhanced Enumerations (fixed underlying types)</li>
+      <li><a href="https://www.open-std.org/jtc1/sc22/wg14/www/docs/n2975.pdf">N2975</a>,
+	Relax requirements for variadic parameter lists</li>
+      <li><a href="https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3007.htm">N3007</a>,
+      Type inference for object definitions (<code>auto</code>)</li>
+      <li><a href="https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3018.htm">N3018</a>,
+	The <code>constexpr</code> specifier for object definitions</li>
+      <li><a href="https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3038.htm">N3038</a>,
+	Introduce storage-class specifiers for compound literals</li>
+      <li><code>typeof</code> (previously supported as an extension)
+	and <code>typeof_unqual</code></li>
+      <li>New
+	keywords <code>alignas</code>, <code>alignof</code>, <code>bool</code>,
+	<code>false</code>, <code>static_assert</code>, <code>thread_local</code>,
+	<code>true</code></li>
+      <li><a href="https://www.open-std.org/jtc1/sc22/wg14/www/docs/n2764.pdf">N2764</a>,
+      The <code>noreturn</code> attribute</li>
+      <li>Support for empty initializer braces</li>
+      <li><code>__STDC_VERSION_*_H__</code> header version macros</li>
+      <li>Removal of <code>ATOMIC_VAR_INIT</code></li>
+      <li><code>unreachable</code> macro
+      in <code>&lt;stddef.h&gt;</code></li>
+      <li>Removal of trigraphs</li>
+      <li>Removal of unprototyped functions</li>
+      <li><code>printf</code> and <code>scanf</code> format checking
+      with <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Warning-Options.html#index-Wformat"><code>-Wformat</code></a> for <code>%wN</code>
+      and <code>%wfN</code> format length modifiers</li>
+      <li><a href="https://www.open-std.org/jtc1/sc22/wg14/www/docs/n2836.pdf">N2836</a>,
+	Identifier Syntax using Unicode Standard Annex 31</li>
+    </ul>
+  </li>
+  <li>In addition to those C23 features, existing features adopted in
+  C23 have been adjusted to follow C23 requirements and are not diagnosed
+  with <code>-std=c2x -Wpedantic</code>.</li>
+  <li>New warnings:
+    <ul>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Warning-Options.html#index-Wenum-int-mismatch"><code>-Wenum-int-mismatch</code></a>
+	 warns about mismatches between an enumerated type and an integer type
+	  (<a href="https://gcc.gnu.org/PR105131">PR105131</a>)</li>
+    </ul>
+  </li>
+</ul>
+
+<h3 id="cxx">C++</h3>
+<ul>
+  <li>Excess precision support (which has been available in C since GCC 4.5)
+      has been implemented for C++ as well.  It is enabled by default
+      in strict standard modes like <code>-std=c++17</code>, where it
+      defaults to <code>-fexcess-precision=standard</code>, while in GNU
+      standard modes like <code>-std=gnu++20</code> it defaults to
+      <code>-fexcess-precision=fast</code>.  The option mainly affects
+      IA-32/x86-64 using x87 math and in some cases on Motorola 68000,
+      where <code>float</code> and <code>double</code> expressions
+      are evaluated in <code>long double</code> precision and S/390, System z,
+      IBM z Systems where <code>float</code> expressions are evaluated in
+      <code>double</code> precision.  Also, on several architectures where
+      <code>std::float16_t</code> or <code>std::bfloat16_t</code> types
+      are supported those are evaluated in <code>float</code> precision.
+      <code>-fexcess-precision=fast</code> restores previous behavior.
+  </li>
+  <li>Several C++23 features have been implemented:
+    <ul>
+      <li><a href="https://wg21.link/p2324">P2324R1</a>, Labels at the end of
+	  compound statements (<a href="https://gcc.gnu.org/PR103539">PR103539</a>)
+      </li>
+      <li><a href="https://wg21.link/p2255">P2255R2</a>, A type trait to detect
+	  reference binding to temporary
+	  (<a href="https://gcc.gnu.org/PR104477">PR104477</a>)
+      </li>
+      <li><a href="https://wg21.link/p2327">P2327R1</a>, De-deprecating volatile
+	  compound operations
+      </li>
+      <li><a href="https://wg21.link/p2437">P2437R1</a>, Support for
+	  <code>#warning</code>
+	  (<a href="https://gcc.gnu.org/PR106646">PR106646</a>)
+      </li>
+      <li><a href="https://wg21.link/p2290">P2290R3</a>, Delimited escape sequences
+	  (<a href="https://gcc.gnu.org/PR106645">PR106645</a>)
+      </li>
+      <li><a href="https://wg21.link/p2071">P2071R2</a>, Named universal character
+	  escapes
+	  (<a href="https://gcc.gnu.org/PR106648">PR106648</a>)
+      </li>
+      <li><a href="https://wg21.link/p2513">P2513R3</a>, <code>char8_t</code>
+	  Compatibility and Portability Fix
+	  (<a href="https://gcc.gnu.org/PR106656">PR106656</a>)
+      </li>
+      <li><a href="https://wg21.link/p1169r4">P1169R4</a>, static
+	  <code>operator()</code>
+	  (<a href="https://gcc.gnu.org/PR106651">PR106651</a>)
+      </li>
+      <li><a href="https://wg21.link/p2266r3">P2266R3</a>, Simpler implicit
+	  move
+	  (<a href="https://gcc.gnu.org/PR101165">PR101165</a>)
+      </li>
+      <li> <a href="https://wg21.link/p2468r2">P2468R2</a>, The Equality
+	Operator You Are Looking For
+	(<a href="https://gcc.gnu.org/PR106644">PR106644</a>)
+      </li>
+      <li> <a href="https://wg21.link/p2362r3">P2362R3</a>, Remove non-encodable
+          wide character literals and multicharacter wide character literals
+	(<a href="https://gcc.gnu.org/PR106647">PR106647</a>)
+      </li>
+      <li> <a href="https://wg21.link/p2448r2">P2448R2</a>, Relaxing some
+          constexpr restrictions
+	(<a href="https://gcc.gnu.org/PR106649">PR106649</a>)
+      </li>
+      <li> <a href="https://wg21.link/p1467r9">P1467R9</a>, Extended
+          floating-point types and standard names
+	(<a href="https://gcc.gnu.org/PR106652">PR106652</a>)
+      </li>
+      <li> <a href="https://wg21.link/p1774r8">P1774R8</a>, Portable
+          assumptions
+	(<a href="https://gcc.gnu.org/PR106654">PR106654</a>)
+      </li>
+      <li> <a href="https://wg21.link/p2295r6">P2295R6</a>, Support for
+          UTF-8 as a portable source file encoding
+	(<a href="https://gcc.gnu.org/PR106655">PR106655</a>)
+      </li>
+      <li> <a href="https://wg21.link/p2589r1">P2589R1</a>, static operator[]
+	(<a href="https://gcc.gnu.org/PR107684">PR107684</a>)
+      </li>
+    </ul>
+  </li>
+  <li>New warnings:
+    <ul>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Warning-Options.html#index-Wself-move"><code>-Wself-move</code></a>
+	warns when a value is moved to itself with <code>std::move</code>
+	(<a href="https://gcc.gnu.org/PR81159">PR81159</a>)</li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/C_002b_002b-Dialect-Options.html#index-Wdangling-reference"><code>-Wdangling-reference</code></a>
+	warns when a reference is bound to a temporary whose lifetime
+	has ended
+	  (<a href="https://gcc.gnu.org/PR106393">PR106393</a>)</li>
+    </ul>
+  </li>
+  <li>The <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/C_002b_002b-Dialect-Options.html#index-Wpessimizing-move"><code>-Wpessimizing-move</code></a>
+    and <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/C_002b_002b-Dialect-Options.html#index-Wredundant-move"><code>-Wredundant-move</code></a>
+    warnings have been extended to warn in more contexts.</li>
+  <li>The <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Link_Options.html#index-nostdlib_002b_002b"><code>-nostdlib++</code></a>
+    option has been added, to enable linking with <code>g++</code>
+    without implicitly linking in the C++ standard library.</li>
+</ul>
+
+<h4 id="libstdcxx">Runtime Library (libstdc++)</h4>
+<ul>
+  <li>Improved experimental support for C++20, including:
+    <ul>
+    <li><code>&lt;format&gt;</code> header and <code>std::format</code>.</li>
+    <li><code>std::chrono::utc_clock</code> and other clocks, time zones,
+      and <code>std::format</code> support in the <code>&lt;chrono&gt;</code>
+      header.
+    </li>
+    </ul>
+  </li>
+  <li>Improved experimental support for C++23, including:
+    <ul>
+    <li>Additions to the <code>&lt;ranges&gt;</code> header:
+      <code>views::zip</code>, <code>views::zip_transform</code>,
+      <code>views::adjacent</code>, <code>views::adjacent_transform</code>
+      <code>views::pairwise</code>, <code>views::slide</code>,
+      <code>views::chunk</code>, <code>views::chunk_by</code>,
+      <code>views::repeat</code>, <code>views::chunk_by</code>,
+      <code>views::cartesian_product</code>, <code>views::as_rvalue</code>,
+      <code>views::enumerate</code>, <code>views::as_const</code>.
+    </li>
+    <li>Additions to the <code>&lt;algorithm&gt;</code> header:
+      <code>ranges::contains</code>, <code>ranges::contains_subrange</code>,
+      <code>ranges::iota</code>, <code>ranges::find_last</code>,
+      <code>ranges::find_last_if</code>, <code>ranges::find_last_if_not</code>,
+      <code>ranges::fold_left</code>, <code>ranges::fold_left_first</code>,
+      <code>ranges::fold_right</code>, <code>ranges::fold_right_last</code>,
+      <code>ranges::fold_left_with_iter</code>,
+      <code>ranges::fold_left_first_with_iter</code>.
+    </li>
+    <li>Monadic operations for <code>std::expected</code>.</li>
+    <li>Constexpr <code>std::bitset</code>, <code>std::to_chars</code>
+      and <code>std::from_chars</code>.
+    </li>
+    <li>Library support for extended floating-point types.</li>
+    </ul>
+  </li>
+  <li>Support for the <code>&lt;experimental/scope&gt;</code> header
+      from v3 of the Library Fundamentals Technical Specification.
+  </li>
+  <li>Support for the <code>&lt;experimental/synchronized_value&gt;</code>
+      header from v2 of the Concurrency Technical Specification.
+  </li>
+</ul>
+
+<!-- <h3 id="d">D</h3> -->
+
+<h3 id="fortran">Fortran</h3>
+<ul>
+  <li>
+    Finalization is now fully supported.
+  </li>
+</ul>
+
+<h3 id="go">Go</h3>
+
+<ul>
+  <li>GCC 13, like GCC 12, provides a complete implementation of the
+    Go 1.18 user packages.</li>
+  <li>Although Go 1.18 includes support for generic programming, that
+    support is not yet available in GCC.</li>
+</ul>
+
+<h3 id="modula2">Modula-2</h3>
+<ul>
+  <li>Support for the language Modula-2 has been added.  This includes
+    support for the ISO/IEC 10514-1, PIM2, PIM3, PIM4 dialects
+    together with a complete set of ISO/IEC 10514-1 and PIM
+    libraries.</li>
+  <li>The <code>&lt;* noreturn *&gt;</code> attribute is supported
+    with the <code>-Wreturn-type</code>
+    <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gm2/Compiler-options.html">
+      option</a>.</li>
+</ul>
+
+<!-- .................................................................. -->
+<!-- <h2 id="jit">libgccjit</h2> -->
+
+<!-- .................................................................. -->
+<h2 id="targets">New Targets and Target Specific Improvements</h2>
+
+<h3 id="aarch64">AArch64</h3>
+<ul>
+  <li>The AArch64 target now supports Decimal Floating-point in the BID format
+      through the <code>libbid</code> library.</li>
+  <li>A number of new CPUs are supported through the <code>-mcpu</code> and
+  <code>-mtune</code> options (GCC identifiers in parentheses).
+    <ul>
+      <li>Ampere-1A (<code>ampere1a</code>).</li>
+      <li>Arm Cortex-A715 (<code>cortex-a715</code>).</li>
+      <li>Arm Cortex-X1C (<code>cortex-x1c</code>).</li>
+      <li>Arm Cortex-X3 (<code>cortex-x3</code>).</li>
+      <li>Arm Neoverse V2 (<code>neoverse-v2</code>).</li>
+    </ul>
+  <li>Support has been added for the <code>armv9.1-a, armv9.2-a</code> and
+      <code>armv9.3-a</code> arguments to the <code>-march=</code> option.</li>
+  <li>The <code>FEAT_LRCPC</code> feature is now supported by generating the
+      <code>LDAPR</code> instructions for C and C++ atomic loads with an
+      acquire memory model.  This is enabled when compiling with the
+      <code>+rcpc</code> extension to <code>-march</code> or a CPU target that
+      supports this feature.</li>
+  <li>The <code>FEAT_CSSC</code> feature from the 2022 Arm Architecture
+      extensions is supported through the <code>+cssc</code> extension option.
+      When enabled, scalar operations like integer minimum, maximum, absolute
+      value, count trailing zeroes (<code>__builtin_ctz</code>), population
+      count (<code>__builtin_popcount</code>) can be implemented in a
+      single instruction.</li>
+  <li>The <code>FEAT_LSE2</code> feature is now supported through
+      <code>libatomic</code> and provides lockless 16-byte atomics on systems
+      that implement it.</li>
+</ul>
+
+<h3 id="amdgcn">AMD Radeon (GCN)</h3>
+<ul>
+  <li>Support for the Instinct MI200 series devices (<a
+      href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/AMD-GCN-Options.html">
+      <code>gfx90a</code></a>) has been added.</li>
+  <li>SIMD vectorization support has been improved; this and stack-handling
+      changes <a
+      href="https://gcc.gnu.org/install/specific.html#amdgcn-x-amdhsa">require</a>
+      newlib 4.3.0 (or newer).</li>
+</ul>
+
+<!-- <h3 id="arc">ARC</h3> -->
+
+<h3 id="arm">arm</h3>
+<ul>
+  <li>A number of new CPUs are supported through the <code>-mcpu</code> and
+  <code>-mtune</code> options (GCC identifiers in parentheses).
+    <ul>
+      <li>STAR-MC1 (<code>star-mc1</code>).</li>
+      <li>Arm Cortex-X1C (<code>cortex-x1c</code>).</li>
+      <li>Arm Cortex-M85 (<code>cortex-m85</code>).</li>
+    </ul>
+  </li>
+  <li>Support has been added for the M-profile PACBTI extension that can help
+      harden the generated code against return-oriented and
+      jump-oriented attacks.  It can be enabled through the
+      <code>-mbranch-protection=</code> option.
+  </li>
+</ul>
+
+<!-- <h3 id="avr">AVR</h3> -->
+
+<h3 id="x86">IA-32/x86-64</h3>
+<ul>
+  <li>For both C and C++ the <code>__bf16</code> type is supported on
+      x86 systems with SSE2 and above enabled.
+  </li>
+  <li>Use real <code>__bf16</code> type for AVX512BF16 intrinsics. Previously
+  we use __bfloat16 which is typedef of short. Now we introduced real
+  <code>__bf16</code> type to x86 psABI. Users need to adjust their
+  AVX512BF16-related source code when upgrading GCC12 to GCC13.
+  </li>
+  <li>New ISA extension support for Intel AVX-IFMA was added.
+      AVX-IFMA intrinsics are available via the <code>-mavxifma</code>
+      compiler switch.
+  </li>
+  <li>New ISA extension support for Intel AVX-VNNI-INT8 was added.
+      AVX-VNNI-INT8 intrinsics are available via the <code>-mavxvnniint8</code>
+      compiler switch.
+  </li>
+  <li>New ISA extension support for Intel AVX-NE-CONVERT was added.
+      AVX-NE-CONVERT intrinsics are available via the
+      <code>-mavxneconvert</code> compiler switch.
+  </li>
+  <li>New ISA extension support for Intel CMPccXADD was added.
+      CMPccXADD intrinsics are available via the <code>-mcmpccxadd</code>
+      compiler switch.
+  </li>
+  <li>New ISA extension support for Intel AMX-FP16 was added.
+      AMX-FP16 intrinsics are available via the <code>-mamx-fp16</code>
+      compiler switch.
+  </li>
+  <li>New ISA extension support for Intel PREFETCHI was added.
+      PREFETCHI intrinsics are available via the <code>-mprefetchi</code>
+      compiler switch.
+  </li>
+  <li>New ISA extension support for Intel RAO-INT was added.
+      RAO-INT intrinsics are available via the <code>-mraoint</code>
+      compiler switch.
+  </li>
+  <li>New ISA extension support for Intel AMX-COMPLEX was added.
+      AMX-COMPLEX intrinsics are available via the <code>-mamx-complex</code>
+      compiler switch.
+  </li>
+  <li>GCC now supports the Intel CPU named Raptor Lake through
+    <code>-march=raptorlake</code>.
+    Raptor Lake is based on Alder Lake.
+  </li>
+  <li>GCC now supports the Intel CPU named Meteor Lake through
+    <code>-march=meteorlake</code>.
+    Meteor Lake is based on Alder Lake.
+  </li>
+  <li>GCC now supports the Intel CPU named Sierra Forest through
+    <code>-march=sierraforest</code>.
+    The switch enables the AVX-IFMA, AVX-VNNI-INT8, AVX-NE-CONVERT and
+    CMPccXADD ISA extensions.
+  </li>
+  <li>GCC now supports the Intel CPU named Grand Ridge through
+    <code>-march=grandridge</code>.
+    The switch enables the AVX-IFMA, AVX-VNNI-INT8, AVX-NE-CONVERT, CMPccXADD
+    and RAO-INT ISA extensions.
+  </li>
+  <li>GCC now supports the Intel CPU named Emerald Rapids through
+    <code>-march=emeraldrapids</code>.
+    Emerald Rapids is based on Sapphire Rapids.
+  </li>
+  <li>GCC now supports the Intel CPU named Granite Rapids through
+    <code>-march=graniterapids</code>.
+    The switch enables the AMX-FP16, PREFETCHI and AMX-COMPLEX ISA extensions.
+  </li>
+  <li>GCC now supports AMD CPUs based on the <code>znver4</code> core
+    via <code>-march=znver4</code>.  The switch makes GCC consider
+    using 512 bit vectors when auto-vectorizing.
+  </li>
+</ul>
+
+<h3 id="loongarch">LoongArch</h3>
+<ul>
+  <li>New features
+    <ul>
+      <li>The new command-line option <code>-mexplicit-relocs</code> decides whether
+	  to use the assembler relocation operator when dealing with symbolic addresses.
+	  It is enabled by default if a compatible assembler (binutils 2.40 or later)
+	  is present at GCC build time.
+      </li>
+      <li>The new command-line option <code>-mdirect-extern-access</code> can be used
+	  to prevent accessing external symbols through GOT.
+      </li>
+      <li>The new variable attribute <a href="https://gcc.gnu.org/onlinedocs/gcc/LoongArch-Variable-Attributes.html#LoongArch-Variable-Attributes"><code>model</code></a>
+          has been added.
+      </li>
+    </ul>
+  </li>
+  <li>Built-in functions
+    <ul>
+      <li>The <code>rint</code> and <code>copysign</code> mathematical builtins
+          (and their float variants) are now implemented as inline LoongArch intrinsics.
+      </li>
+      <li>The <code>lrint</code>, <code>logb</code>, <code>scalbln</code>,
+          <code>scalbn</code> and <code>ldexp</code> mathematical builtins (and their
+          float variants) are now implemented as inline LoongArch intrinsics when using
+          <code>-fno-math-errno</code>.
+      </li>
+      <li>The <code>lceil</code> and <code>lfloor</code> mathematical builtins
+          (and their float variants) are now implemented as inline LoongArch intrinsics
+          when using <code>-ffp-int-builtin-inexact</code>.
+      </li>
+    </ul>
+  </li>
+  <li>Subprojects Support
+    <ul>
+      <li><code>libvtv</code> now supports LoongArch.</li>
+      <li><code>libitm</code> now supports LoongArch.</li>
+      <li>Address sanitizers other than HWASan and TSan are now supported on LoongArch.</li>
+    </ul>
+  </li>
+</ul>
+
+<!-- <h3 id="mips">MIPS</h3> -->
+
+<!-- <h3 id="mep">MeP</h3> -->
+
+<!-- <h3 id="msp430">MSP430</h3> -->
+
+<!-- <h3 id="nds32">NDS32</h3> -->
+
+<!-- <h3 id="nios2">Nios II</h3> -->
+
+<h3 id="nvptx">NVPTX</h3>
+<ul>
+  <li>The default value for the <a
+      href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Nvidia-PTX-Options.html"><code>
+      -march</code></a> option can be now changed when <a
+      href="https://gcc.gnu.org/install/">building GCC</a> using the
+      <a href="https://gcc.gnu.org/install/specific.html#nvptx-x-none">
+      <code>--with-arch=</code></a> configure option. GCC's target libraries
+      are then build both with <code>sm_30</code> and the specified target
+      architecture. If not specified, GCC defaults to <code>sm_30</code>.
+  </li>
+</ul>
+
+<!-- <h3 id="hppa">PA-RISC</h3> -->
+
+<!-- <h3 id="powerpc">PowerPC / PowerPC64 / RS6000</h3> -->
+
+<!-- <h3 id="s390">S/390, System z, IBM z Systems</h3> -->
+
+<h3 id="riscv">RISC-V</h3>
+<ul>
+    <li>Support for vector intrinsics as specified in <a
+	href="https://github.com/riscv-non-isa/rvv-intrinsic-doc/tree/v0.11.x">
+	version 0.11 of the RISC-V vector intrinsic specification</a>,
+	thanks Ju-Zhe Zhong from <a href="https://rivai-ic.com.cn/">RiVAI</a>
+	for contributing most of implementation.
+    </li>
+    <li>Support for the following standard extensions has been added:
+      <ul>
+        <li>Zawrs</li>
+        <li>Zbkb</li>
+        <li>Zbkc</li>
+        <li>Zbkx</li>
+        <li>Zdinx</li>
+        <li>Zfinx</li>
+        <li>Zfh</li>
+        <li>Zfhmin</li>
+        <li>Zhinx</li>
+        <li>Zhinxmin</li>
+        <li>Zicbom</li>
+        <li>Zicbop</li>
+        <li>Zicboz</li>
+        <li>Zknd</li>
+        <li>Zkne</li>
+        <li>Zksed</li>
+        <li>Zksh</li>
+        <li>Zmmul</li>
+      </ul>
+    </li>
+    <li>Support for the following vendor extensions has been added:
+      <ul>
+        <li>XTheadBa</li>
+        <li>XTheadBb</li>
+        <li>XTheadBs</li>
+        <li>XTheadCmo</li>
+        <li>XTheadCondMov</li>
+        <li>XTheadFMemIdx</li>
+        <li>XTheadFmv</li>
+        <li>XTheadInt</li>
+        <li>XTheadMac</li>
+        <li>XTheadMemIdx</li>
+        <li>XTheadMemPair</li>
+        <li>XTheadSync</li>
+      </ul>
+    </li>
+    <li>The following new CPUs are supported through the <code>-mcpu</code>
+      option (GCC identifiers in parentheses).
+      <ul>
+        <li>T-Head's XuanTie C906 (<code>thead-c906</code>).</li>
+      </ul>
+    </li>
+    <li>Improves the multi-lib selection mechanism for the bare-metal toolchain
+	(riscv*-elf*). GCC will now automatically select the best-fit multi-lib
+	candidate instead of requiring all possible reuse rules to be listed at
+	build time.
+    </li>
+</ul>
+
+<!-- <h3 id="rx">RX</h3> -->
+
+<!-- <h3 id="sh">SH</h3> -->
+
+<!-- <h3 id="sparc">SPARC</h3> -->
+
+<!-- <h3 id="Tile">Tile</h3> -->
+
+<!-- .................................................................. -->
+<h2 id="os">Operating Systems</h2>
+
+<!-- <h3 id="aix">AIX</h3> -->
+
+<!-- <h3 id="fuchsia">Fuchsia</h3> -->
+
+<!-- <h3 id="dragonfly">DragonFly BSD</h3> -->
+
+<!-- <h3 id="freebsd">FreeBSD</h3> -->
+
+<!-- <h3 id="gnulinux">GNU/Linux</h3> -->
+
+<!-- <h3 id="rtems">RTEMS</h3> -->
+
+<!-- <h3 id="solaris">Solaris</h3> -->
+
+<!-- <h3 id="vxmils">VxWorks MILS</h3> -->
+
+<!-- <h3 id="windows">Windows</h3> -->
+
+
+<!-- .................................................................. -->
+<!-- <h2>Documentation improvements</h2> -->
+
+<h2 id="analyzer">Improvements to Static Analyzer</h2>
+<ul>
+  <li>The analyzer has gained 20 new warnings:
+    <ul>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-allocation-size"><code>-Wanalyzer-allocation-size</code></a></li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-deref-before-check"><code>-Wanalyzer-deref-before-check</code></a></li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-exposure-through-uninit-copy"><code>-Wanalyzer-exposure-through-uninit-copy</code></a></li>
+      <li>Seven new warnings relating to misuse of file descriptors:
+	<ul>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-fd-access-mode-mismatch"><code>-Wanalyzer-fd-access-mode-mismatch</code></a></li>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-fd-double-close"><code>-Wanalyzer-fd-double-close</code></a></li>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-fd-leak"><code>-Wanalyzer-fd-leak</code></a></li>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-fd-phase-mismatch"><code>-Wanalyzer-fd-phase-mismatch</code></a>
+	    (e.g. calling <code>accept</code> on a socket before calling
+	    <code>listen</code> on it)</li>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-fd-type-mismatch"><code>-Wanalyzer-fd-type-mismatch</code></a>
+	    (e.g. using a stream socket operation on a datagram socket)</li>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-fd-use-after-close"><code>-Wanalyzer-fd-use-after-close</code></a></li>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-fd-use-without-check"><code>-Wanalyzer-fd-use-without-check</code></a></li>
+	</ul>
+	<p>along with special-casing handling of the behavior of
+	  <code>open</code>, <code>close</code>, <code>creat</code>,
+	  <code>dup</code>, <code>dup2</code>, <code>dup3</code>,
+	  <code>pipe</code>, <code>pipe2</code>, <code>read</code>,
+	  and <code>write</code>.</p>
+      </li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-imprecise-fp-arithmetic"><code>-Wanalyzer-imprecise-fp-arithmetic</code></a></li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-infinite-recursion"><code>-Wanalyzer-infinite-recursion</code></a></li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-jump-through-null"><code>-Wanalyzer-jump-through-null</code></a></li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-out-of-bounds"><code>-Wanalyzer-out-of-bounds</code></a></li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-putenv-of-auto-var"><code>-Wanalyzer-putenv-of-auto-var</code></a></li>
+      <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-tainted-assertion"><code>-Wanalyzer-tainted-assertion</code></a></li>
+      <li>Four new warnings for misuses of <code>&lt;stdarg.h&gt;</code>:
+	<ul>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-va-list-leak"><code>-Wanalyzer-va-list-leak</code></a> for complaining about missing <code>va_end</code> after a <code>va_start</code> or <code>va_copy</code></li>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-va-list-use-after-va-end"><code>-Wanalyzer-va-list-use-after-va-end</code></a> for complaining about <code>va_arg</code> or <code>va_copy</code> used on a <code>va_list</code> that's had <code>va_end</code> called on it</li>
+          <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-va-arg-type-mismatch"><code>-Wanalyzer-va-arg-type-mismatch</code></a> for type-checking of <code>va_arg</code> usage in interprocedural execution paths against the types of the parameters that were actually passed to the variadic call</li>
+	  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Static-Analyzer-Options.html#index-Wanalyzer-va-list-exhausted"><code>-Wanalyzer-va-list-exhausted</code></a> for complaining in interprocedural execution paths if <code>va_arg</code> is used too many times on a <code>va_list</code></li>
+	</ul>
+      </li>
+    </ul>
+    along with numerous other improvements.
+  </li>
+</ul>
+
+<!-- .................................................................. -->
+<h2 id="plugins">Improvements for plugin authors</h2>
+
+<ul>
+  <li>GCC diagnostics can now be
+    <a href="https://gcc.gnu.org/git/?p=gcc.git;a=commitdiff;h=0b14f590e3e9d95b8211b77d992589d5ab4c25f0">associated with rules</a>
+    such as from coding standards documents, or specifications.
+    Such rules have a code name and can have a URL, which GCC can print
+    in text form or capture in its
+    <a href="https://gcc.gnu.org/onlinedocs/gcc-13.1.0/gcc/Diagnostic-Message-Formatting-Options.html#index-fdiagnostics-format">SARIF</a>
+    output when emitting diagnostics.
+  </li>
+</ul>
+
+<!-- .................................................................. -->
+<h2>Other significant improvements</h2>
+
+<!-- <h3 id="uninitialized">Eliminating uninitialized variables</h3> -->
+
+<!-- .................................................................. -->
+<h2 id="13.1">GCC 13.1</h2>
+
+<p>This is the <a href="https://gcc.gnu.org/bugzilla/buglist.cgi?bug_status=RESOLVED&amp;resolution=FIXED&amp;target_milestone=13.0">list
+of problem reports (PRs)</a> from GCC's bug tracking system that are
+known to be fixed in the 13.1 release. This list might not be
+complete (that is, it is possible that some PRs that have been fixed
+are not listed here).</p>
+
+<!-- .................................................................. -->
+
+
+
+
+<!-- ==================================================================== -->
+
+<div class="copyright">
+
+<address>For questions related to the use of GCC,
+please consult these web pages and the
+<a href="https://gcc.gnu.org/onlinedocs/">GCC manuals</a>. If that fails,
+the <a href="mailto:gcc-help@gcc.gnu.org">gcc-help@gcc.gnu.org</a>
+mailing list might help.
+Comments on these web pages and the development of GCC are welcome on our
+developer list at <a href="mailto:gcc@gcc.gnu.org">gcc@gcc.gnu.org</a>.
+All of <a href="https://gcc.gnu.org/lists.html">our lists</a>
+have public archives.
+</address>
+
+<p>Copyright (C)
+<a href="https://www.fsf.org">Free Software Foundation, Inc.</a>
+Verbatim copying and distribution of this entire article is
+permitted in any medium, provided this notice is preserved.</p>
+
+<p>These pages are
+<a href="https://gcc.gnu.org/about.html">maintained by the GCC team</a>.
+Last modified 2023-04-26.</p><!-- IGNORE DIFF -->
+
+</div>
+
+<!-- ==================================================================== -->
+
+</body>
+</html>

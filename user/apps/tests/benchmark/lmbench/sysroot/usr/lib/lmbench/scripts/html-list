@@ -1,0 +1,123 @@
+#!/usr/bin/perl
+# Take the list of files and turn them into an html file that points
+# at their context & mem latency GIFs.
+#
+# Usage: html-list file file file....
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1995 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+open(H, ">HTML/specific.html");
+print H <<EOF;
+<title>LMBENCH System Results</title>
+<h1>LMBENCH System Results</h1>
+<h2><a href=summary>Summary of results</a></h2>
+<hr>
+EOF
+
+# The order that is passed in is the order of the generated 
+# graphs so save that.
+$val = 0;
+foreach $file (@ARGV) {
+	$number{$file} = ++$val;
+}
+
+# Now sort them so we can group by OS
+@ARGV = sort(@ARGV);
+
+# Figure out the different OS
+foreach $file (@ARGV) {
+	($os = $file) =~ s|/.*||;
+	push(@os, $os);
+	$done{$os} = 0;
+}
+
+foreach $os (@os) {
+	next if $done{$os};
+	$done{$os} = 1;
+	# Print out an OS specific heading
+	print H "<hr><h2>Results from $os</h2><p>\n";
+
+	for ($i = 0; $i <= $#os; $i++) {
+		$file = $ARGV[$i];
+		next unless $file =~ /$os/;
+		open(F, $file);
+		$_ = <F>;
+		close(F);
+		next unless /lmbench1.[01]/;
+		chop;
+		$title = $_;
+		#s/.lmbench1.? results for //;
+		($sys = $file) =~ s|.*/||;
+		if ($i > 0) {
+			($prev_sys = $ARGV[$i - 1]) =~ s|.*/||;
+		}
+		if ($i < $#os) {
+			($next_sys = $ARGV[$i + 1]) =~ s|.*/||;
+		}
+		print H <<EOF;
+<h3>Dataset: $sys</h3>
+<h4>$title</h4>
+<a href="${sys}-ctx.html">Context switch details</a>,
+<a href="${sys}-bwmem.html">memory bandwidths</a>,
+<a href="${sys}-bwfile.html">file reread vs. memory bandwidths</a>,
+and
+<a href="${sys}-mem.html">memory latencies</a>.
+EOF
+
+		# Create the files referencing the data GIFs
+		$N = sprintf("%02d", $number{$file});
+		$prev = $next = "";
+		%label = ('ctx', 'context switching',
+		    	   'mem', 'memory latency',
+			   'bwmem', 'memory bandwidth',
+			   'bwfile', 'file reread bandwidth');
+		%doc = ('ctx', 'lat_ctx.8.html',
+		    	   'mem', 'lat_mem_rd.8.html',
+			   'bwmem', 'bw_mem.8.html',
+			   'bwfile', 'bw_file_rd.8.html');
+		$back = "<img align=middle src=\"../gifs/arrows/back.gif\">";
+		$forward = "<img align=middle src=\"../gifs/arrows/forward.gif\">";
+		for $what ('ctx', 'mem', 'bwmem', 'bwfile') {
+			for $scale ('', '-unscaled') {
+				open(S, ">HTML/${sys}-${what}${scale}.html");
+				if ($scale eq '') {
+					$notscale = "-unscaled";
+					$lab = "";
+					$Lab = "Unscaled ";
+				} else {
+					$notscale = "";
+					$lab = "scaled ";
+					$Lab = "Scaled ";
+				}
+				$prev =
+				    "<a href=${prev_sys}-${what}${scale}.html>
+				    Previous ${lab}$label{$what} result</a><p>"
+				    if $i > 0;
+				$next =
+				    "<a href=${next_sys}-${what}.html>
+				    Next ${lab}$label{$what} result</a><p>"
+				    if $i < $#os;
+				print S<<EOF;
+<h4>$title</h4>
+<a href=../$doc{$what}>Information on this benchmark</a> (Not up to date)
+<p><IMG SRC="${what}${scale}$N.gif">\n<p>
+<a href=../lmbench.html>
+<img align=middle src="../gifs/arrows/b_arrow.gif">LMBENCH table of contents</a>
+<a href=specific.html>
+<img align=middle src=\"../gifs/graph.gif\">System results table of contents</a>
+<p>
+$next
+$prev
+<a href=${sys}-${what}${notscale}.html>
+${Lab}$label{$what} results for this system</a>
+EOF
+			}
+		}
+
+	}
+}
+exit 0;

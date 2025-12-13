@@ -1,0 +1,58 @@
+(It is recommended to edit this file with emacs' todoo mode)
+Last updated: 2020-05-12
+
+* General
+
+- Clean up the sprawl of debian/rules.  I'm sure there are neater
+  ways to do some of it; perhaps split it up into some more files?
+  Partly done.
+
+- Make debian/rules control build the control file without unpacking
+  the sources or applying patches.  Currently, it unpacks the sources,
+  patches them, creates the control file, and a subsequent
+  dpkg-buildpackage deletes the sources, re-unpacks them, and
+  re-patches them.
+
+  This would require hard-coding things like soversions in some
+  places. Is it worth it?
+
+- Reorganise debian/rules.defs to decide which packages to build in a
+  more straightforward and less error-prone fashion: (1) start with
+  all languages; override the list of languages depending on the name
+  of the source package (gcc-4.3, gnat-4.3, gdc-4.3).  (2)
+  filter the list of languages depending on the target platform; (3)
+  depending on the languages to build, decide on which libraries to
+  build.
+
+  Now that we build all languages from one source package, should that
+  be changed?  Building from separate packages makes building the
+  cross compilers more complicated.
+
+o [Ludovic Brenta] Ada
+
+- Done: Build both the zero-cost and setjump/longjump exceptions
+  versions of libgnat.  In particular, gnat-glade (distributed systems)
+  works best with SJLJ.
+  This is disabled now in GCC 10.
+
+- Add support for multilib (not yet supported upstream).
+
+
+* Testsuite
+
+- Only run libgo/x32, if the kernel is prepared to execute the x32
+  executables.
+
+- PR target/94278: segfaults running the amdgcn target tools, based
+  on LLVM 9 and LLVM 10. https://bugs.llvm.org/show_bug.cgi?id=45887
+
+- Investigate regressions for test failures, seen when turning on the
+  hardening flags by default.
+
+- Fix gm2 link errors when running the tests.
+
+- Fix asan test errors in g++. Seen when run locally, e.g. alloca_big_alignment.c
+  ==1453818==ASan runtime does not come first in initial library list; you should either link runtime to your application or manually preload it with LD_PRELOAD.
+
+- libstdc++ locale related test failures with recent glibc versions:
+  https://gcc.gnu.org/PR71367

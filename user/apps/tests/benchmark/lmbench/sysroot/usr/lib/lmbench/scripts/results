@@ -1,0 +1,42 @@
+#!/bin/sh
+
+# $Id$
+SCRIPTSDIR=${SCRIPTSDIR:-../scripts}
+BINDIR=${BINDIR:-..}
+RESULTSDIR=${RESULTSDIR:-../results}
+
+OS=`${SCRIPTSDIR}/os`
+CONFIG=`${SCRIPTSDIR}/config`
+RESULTS=${RESULTSDIR}/$OS
+BASE=$RESULTS/`uname -n`
+EXT=0
+
+if [ ! -f "${BINDIR}/bin/$OS/$CONFIG" ]
+then	echo "No config file?"
+	exit 1
+fi
+. ${BINDIR}/bin/$OS/$CONFIG
+
+if [ ! -d $RESULTS ]
+then	mkdir -p $RESULTS
+fi
+RESULTS=$BASE.$EXT
+while [ -f $RESULTS ]
+do      EXT=`expr $EXT + 1`
+	RESULTS=$BASE.$EXT
+done
+
+cd ${BINDIR}/bin/$OS 
+PATH=.:${PATH}; export PATH
+export SYNC_MAX
+export OUTPUT
+lmbench $CONFIG 2>${RESULTS}
+
+if [ X$MAIL = Xyes ]
+then	echo Mailing results
+	(echo ---- $INFO ---
+	cat $INFO 
+	echo ---- $RESULTS ---
+	cat $RESULTS) | mail lmbench3@bitmover.com 
+fi
+exit 0

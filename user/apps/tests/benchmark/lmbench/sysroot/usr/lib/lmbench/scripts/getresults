@@ -1,0 +1,99 @@
+#!/usr/bin/perl -ws
+
+# Search through the archives splitting out stuff that has pathnames.
+
+while (1) {
+	&headers;
+	&body;
+}
+
+sub headers
+{
+	while (<>) {
+		warn "HDR $_" if ($debug);
+		return if /^\s*$/;
+	}
+	exit;
+}
+
+# Save the info for the system, skipping everything ig there is no info.
+sub body
+{
+	@info = ();
+	while (<>) {
+		last if m|^[-]+ \.\./results|;
+		last if /^\[lmbench/;
+		if (/^From[: ]/) { warn "FROM $_"; return; }
+		warn "INFO $_" if ($debug);
+		push(@info, $_);
+	}
+	if (/^[-]+ \.\.\/results/) {
+		@foo = split;
+		$path = $foo[1];
+		$path =~ s|\.\./||;
+		warn "PATH $path\n" if ($debug);
+		&results;
+		return;
+	} 
+	warn "SKIPPING one\n";
+	while (<>) {
+		warn "SKIP $_" if ($SKIP);
+		last if /^Memory load latency/;
+		if (/^From[: ]/) { warn "FROM $_"; return; }
+	}
+	die "No memory load latency" unless /^Memory load latency/;
+	while (<>) {
+		warn "SKIP $_" if ($SKIP);
+		last if /^\[/;
+		if (/^From[: ]/) { warn "FROM $_"; return; }
+	}
+	die "No date" unless /^\[/;
+	while (<>) {
+		last unless /^\s*$/;
+		if (/^From[: ]/) { warn "FROM $_"; return; }
+	}
+}
+
+sub results
+{
+	@results = ();
+	while (<>) {
+		goto done if (/^From[: ]/);
+		warn "RES $_" if ($RES);
+		push(@results, $_);
+		last if /^Memory load latency/;
+	}
+	die "No memory load latency" unless /^Memory load latency/;
+	while (<>) {
+		goto done if (/^From[: ]/);
+		warn "RES $_" if ($RES);
+		push(@results, $_);
+		last if /^\[/;
+	}
+	die "No date" unless /^\[/;
+	while (<>) {
+		last unless /^\s*$/;
+	}
+
+done:
+	($dir = $path) =~ s|/[^/]+$||;
+	warn "DIR $dir\n" if ($debug);
+	system "mkdir -p $dir";
+	if (-e $path) {
+		warn "CONFLICT on $path\n" if $debug;
+		for ($i = 0; ; $i++) {
+			$tmp = "${path}.${i}";
+			last if ! -e $tmp;
+			warn "CONFLICT on $tmp\n" if $debug;
+		}
+		$path = $tmp;
+	}
+	$info = $path . ".INFO";
+	open(O, ">$info");
+	print O @info;
+	close(O);
+	warn "Saving $path\n" if $verbose;
+	open(O, ">$path");
+	print O @results;
+	close(O);
+}

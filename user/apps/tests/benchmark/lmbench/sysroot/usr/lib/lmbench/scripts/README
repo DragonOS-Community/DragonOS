@@ -1,0 +1,7 @@
+$Id$
+
+This directory contains scripts used to generate or post process lmbench
+output.  You probably do not want to be here or run these by hand, the
+Makefiles in ../src and ../results invoke these.  There are some useful
+scripts here, however, in particular the graphing scripts.  If you are
+interested in groff graphing tools, check out ../doc/*graph.1.

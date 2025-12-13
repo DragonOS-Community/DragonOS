@@ -1,0 +1,400 @@
+#!/usr/bin/perl
+# Generate an ascii percentage summary from lmbench result files.
+# Usage: getpercent file file file...
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1994 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+$n = 0;	# apparently, hpux doesn't init to 0????
+
+foreach $file (@ARGV) {
+	push(@files, $file);
+	open(FD, $file) || die "$0: can't open $file";
+	$file =~ s|/|-|;
+	$file =~ s/\.\d+//;
+	push(@file, $file);
+	while (<FD>) {
+		chop;
+		next if m|scripts/lmbench: /dev/tty|;
+		if (/^\[lmbench/) {
+			@_ = split;
+			push(@uname, "@_");
+		}
+		if (/Mhz/) {
+			@_ = split;
+			push(@misc_mhz, $_[0]);
+		}
+		if (/^Null syscall:/) {
+			@_ = split;
+			push(@lat_nullsys, $_[2]);
+		}
+		if (/^Pipe latency:/) {
+			@_ = split;
+			push(@lat_pipe, $_[2]);
+		}
+		if (/UDP latency using localhost:/) {
+			@_ = split;
+			push(@lat_udp_local, $_[4]);
+		}
+		if (/TCP latency using localhost/) {
+			@_ = split;
+			push(@lat_tcp_local, $_[4]);
+		}
+		if (/RPC.udp latency using localhost/) {
+			@_ = split;
+			push(@lat_rpc_udp_local, $_[4]);
+		}
+		if (/RPC.tcp latency using localhost/) {
+			@_ = split;
+			push(@lat_rpc_tcp_local, $_[4]);
+		}
+		if (/^Process fork.exit/) {
+			@_ = split;
+			push(@lat_nullproc, $_[2]);
+		}
+		if (/^Process fork.execve:/) {
+			@_ = split;
+			push(@lat_simpleproc, $_[2]);
+		}
+		if (/^Process fork..bin.sh/) {
+			@_ = split;
+			push(@lat_shproc, $_[3]);
+		}
+		if (/size=0 ovr=/) {
+			while (<FD>) {
+				next unless /^2/;
+				@_ = split;
+				push(@lat_ctx, $_[1]);
+			    	last;
+			}
+			while (<FD>) {
+				next unless /^8/;
+				@_ = split;
+				push(@lat_ctx8, $_[1]);
+			    	last;
+			}
+		}
+		if (/^Pipe bandwidth/) {
+			@_ = split;
+			push(@bw_pipe, $_[2]);
+		}
+		if (/^Socket bandwidth using localhost/) {
+			@_ = split;
+			push(@bw_tcp_local, $_[4]);
+		}
+		if (/^File .* write bandwidth/) {
+			@_ = split;
+			$bw = sprintf("%.2f", $_[4] / 1024.);
+			push(@bw_file, $bw);
+		}
+		if (/^"mappings/) {
+			$value = &getbiggest("memory mapping timing");
+			push(@lat_mappings, $value);
+		}
+		if (/^"read bandwidth/) {
+			$value = &getbiggest("reread timing");
+			push(@bw_reread, $value);
+		}
+		if (/^"Mmap read bandwidth/) {
+			$value = &getbiggest("mmap reread timing");
+			push(@bw_mmap, $value);
+		}
+		if (/^"libc bcopy unaligned/) {
+			$value = &getbiggest("libc bcopy timing");
+			push(@bw_bcopy_libc, $value);
+		}
+		if (/^"unrolled bcopy unaligned/) {
+			$value = &getbiggest("unrolled bcopy timing");
+			push(@bw_bcopy_unrolled, $value);
+		}
+		if (/^Memory read/) {
+			$value = &getbiggest("memory read & sum timing");
+			push(@bw_mem_rdsum, $value);
+		}
+		if (/^Memory write/) {
+			$value = &getbiggest("memory write timing");
+			push(@bw_mem_wr, $value);
+		}
+		if (/^"stride=128/) {
+			$save = -1;
+			while (<FD>) {
+				if (/^0.00098\s/) {
+					@_ = split;
+					push(@lat_l1, $_[1]);
+				} elsif (/^0.12500\s/) {
+					@_ = split;
+					push(@lat_l2, $_[1]);
+				} elsif (/^[45678].00000\s/) {
+					@_ = split;
+					$size = $_[0];
+					$save = $_[1];
+					last if /^8.00000\s/;
+				} elsif (/^\s*$/) {
+					last;
+				}
+			}
+			if (!/^8/) {
+				warn "$file: No 8MB memory latency, using $size\n";
+			}
+			push(@lat_mem, $save);
+		}
+		if (/^"stride=8192/) {	# XXX assumes <= 8K pagesize
+			$tlb = -1;  #REVIEW was ... tbl = ...
+			while (<FD>) {
+				if (/^[45678].00000\s/) {
+					@_ = split;
+					$tlb = $_[1];
+					$size = $_[0];
+					last if /^8.00000\s/;
+				}
+			}
+			if (!/^8/) {
+				warn "$file: No 8MB tlb latency, using $size\n";
+			}
+			push(@lat_tlb, $tlb);
+		}
+	}
+	foreach $array (
+		'misc_mhz', 'lat_nullsys', 'lat_pipe', 'lat_udp_local',
+		'lat_tcp_local', 'lat_rpc_udp_local',
+		'lat_rpc_tcp_local', 'lat_nullproc', 'lat_simpleproc',
+		'lat_ctx', 'lat_ctx8', 'bw_pipe', 'bw_tcp_local',
+		'bw_file', 'lat_mappings', 'bw_reread', 'bw_mmap',
+		'bw_bcopy_libc', 'bw_bcopy_unrolled', 'bw_mem_rdsum',
+		'bw_mem_wr', 'lat_l1', 'lat_l2', 'lat_mem', 'lat_tlb',
+	) {
+		eval "if (\$#$array != $n) {
+			#VERBOSE warn \"No data for $array in $file\n\";
+			push(\@$array, -1);
+		    }";
+	}
+	$n++;
+}
+exit 0;
+
+# Input looks like
+# "benchmark name
+# size value
+# ....
+# <blank line>
+#
+# Return the biggest vvalue before the blank line.
+sub getbiggest
+{
+	local($msg) = @_;
+
+	undef $save;
+	$value = 0;
+	while (<FD>) {
+		last if /^\s*$/;
+		$save = $_ if /^\d\./;
+	}
+	if (defined $save) {
+		$_ = $save;
+		@d = split;
+		$value = $d[1];
+		if (int($d[0]) < 8) {
+			warn "$file: using $d[0] size for $msg\n";
+		}
+	} else {
+		warn "$file: no data for $msg\n";
+	}
+	$value;
+}
+
+
+print<<EOF;
+
+                L M B E N C H  1 . 0   S U M M A R Y
+                ------------------------------------
+
+                  Comparison to best of the breed
+                  -------------------------------
+
+		(Best numbers are starred, i.e., *123)
+
+
+        Processor, Processes - factor slower than the best
+        --------------------------------------------------
+Host                 OS  Mhz    Null    Null  Simple /bin/sh Mmap 2-proc 8-proc
+                             Syscall Process Process Process  lat  ctxsw  ctxsw
+--------- ------------- ---- ------- ------- ------- ------- ---- ------ ------
+EOF
+
+for ($i = 0; $i <= $#uname; $i++) {
+        printf "%-9.9s %13.13s ", $file[$i], &getos($uname[$i]);
+            printf "%4.0f %7s %7s %7s %7s %4s %6s %6s\n",
+            $misc_mhz[$i],
+            &smaller(@lat_nullsys, $i, 0),
+            &smaller(@lat_nullproc, $i, 1024),
+            &smaller(@lat_simpleproc, $i, 1024),
+            &smaller(@lat_shproc, $i, 1024),
+            &smaller(@lat_mappings, $i, 0),
+            &smaller(@lat_ctx, $i, 0),
+            &smaller(@lat_ctx8, $i, 0);
+
+}
+
+print<<EOF;
+
+        *Local* Communication latencies - factor slower than the best
+        -------------------------------------------------------------
+Host                 OS  Pipe       UDP    RPC/     TCP    RPC/
+                                            UDP             TCP
+--------- ------------- ------- ------- ------- ------- -------
+EOF
+
+for ($i = 0; $i <= $#uname; $i++) {
+        printf "%-9.9s %13.13s ", $file[$i], &getos($uname[$i]);
+        printf "%7s %7s %7s %7s %7s\n",
+            &smaller(@lat_pipe, $i, 0),
+            &smaller(@lat_udp_local, $i, 0),
+            &smaller(@lat_rpc_udp_local, $i, 0),
+            &smaller(@lat_tcp_local, $i, 0),
+            &smaller(@lat_rpc_tcp_local, $i, 0);
+
+}
+
+print<<EOF;
+
+        *Local* Communication bandwidths - percentage of the best
+        ---------------------------------------------------------
+Host                 OS Pipe  TCP  File   Mmap  Bcopy  Bcopy  Mem   Mem
+                                  reread reread (libc) (hand) read write
+--------- ------------- ---- ---- ------ ------ ------ ------ ---- -----
+EOF
+
+for ($i = 0; $i <= $#uname; $i++) {
+        printf "%-9.9s %13.13s ", $file[$i], &getos($uname[$i]);
+        printf "%4s %4s %6s %6s %6s %6s %4s %5s\n",
+            &bigger(@bw_pipe, $i),
+            &bigger(@bw_tcp_local, $i),
+            &bigger(@bw_reread, $i),
+            &bigger(@bw_mmap, $i),
+            &bigger(@bw_bcopy_libc, $i),
+            &bigger(@bw_bcopy_unrolled, $i),
+            &bigger(@bw_mem_rdsum, $i),
+            &bigger(@bw_mem_wr, $i);
+}
+
+print<<EOF;
+
+            Memory latencies in nanoseconds - factor slower than the best
+		    (WARNING - may not be correct, check graphs)
+            -------------------------------------------------------------
+Host                 OS   Mhz  L1 \$   L2 \$    Main mem    Guesses
+--------- -------------   ---  ----   ----    --------    -------
+EOF
+
+for ($i = 0; $i <= $#uname; $i++) {
+        printf "%-9.9s %13.13s   %3d",
+	    $file[$i], &getos($uname[$i]), $misc_mhz[$i];
+	if ($lat_l1[$i] < 0) {
+        	printf "%6s %6s %11s    %s",
+		    "-", "-", "-",
+		    "Bad mhz?";
+	} else {
+		$msg = &check_caches;
+		if ($msg =~ /L1/) {
+			$lat_l1[$i] = -1;
+		} elsif ($msg =~ /L2/) {
+			$lat_l2[$i] = -1;
+		}
+        	printf "%6s %6s %11s",
+		    &smaller(@lat_l1, $i, 0),
+		    &smaller(@lat_l2, $i, 0), 
+		    &smaller(@lat_mem, $i, 0);
+		if ($msg =~ /L/) {
+			print "$msg";
+		}
+	}
+	print "\n";
+}
+
+
+exit 0;
+
+# Return factor of the smallest number.
+sub smaller
+{
+        local(@values) = @_;
+        local($which, $min, $i, $units);
+
+        $units = pop(@values);
+        $which = pop(@values);
+        $min = 0x7fffffff;
+        foreach $i (@values) {
+		next if $i == -1 || $i == 0;
+                $min = $i if ($min > $i);
+        }
+        if ($values[$which] == $min) {
+                #"***";
+		if ($units == 1024) {
+			sprintf("*%.1fK", $values[$which]/1024.);
+		} else {
+			sprintf("*%d", $values[$which]);
+		}
+        } elsif ($values[$which] == -1) {
+		"???";
+        } elsif ($values[$which] == 0) {
+		"???";
+        } elsif ($values[$which] / $min < 10.0) {
+                sprintf("%.1f", $values[$which] / $min);
+        } else {
+                sprintf("%.0f", $values[$which] / $min);
+        }
+}
+
+# Return closeness to the largest number as a percentage.
+# Exact match is 100%, smaller numbers are like 15%.
+sub bigger
+{
+        local(@values) = @_;
+        local($which, $max, $i);
+
+        $which = pop(@values);
+        $max = 0;
+        foreach $i (@values) {
+                $max = $i if ($max < $i);
+        }
+        if ($values[$which] == $max) {
+                sprintf("*%d", $values[$which]);
+        } else {
+                sprintf("%d%%", $values[$which] / $max * 100);
+        }
+}
+
+# Try and create sensible names from uname -a output
+sub getos
+{
+        local(@info);
+
+        @info = split(/\s+/, $_[0]);
+        "$info[3] $info[5]";
+}
+
+# Return true if the values differe by less than 10%
+sub same
+{
+	local($a, $b) = @_;
+
+	if ($a > $b) {
+		$percent = (($a - $b) / $a) * 100;
+	} else {
+		$percent = (($b - $a) / $b) * 100;
+	}
+	return ($percent <= 20);
+}
+
+sub check_caches
+{
+	if (!&same($lat_l1[$i], $lat_l2[$i]) &&
+	    &same($lat_l2[$i], $lat_mem[$i])) {
+		"    No L2 cache?";
+	} elsif (&same($lat_l1[$i], $lat_l2[$i])) {
+		"    No L1 cache?";
+	} 
+}

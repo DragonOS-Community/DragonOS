@@ -1,0 +1,288 @@
+#!/bin/sh
+
+CC=${CC-`../scripts/compiler`}
+MAKE=${MAKE-`../scripts/make`}
+OS=${OS-`../scripts/os`}
+TARGET=${TARGET-`../scripts/target`}
+BINDIR=../bin/"${OS}"
+CONFIG=../bin/"${OS}"/`../scripts/config`
+NULL=/dev/null
+
+BASE=/tmp/dummy
+for t in /var/tmp /tmp; do
+	if [ -d $t -a -w $t ]
+	then	BASE=${t}/dummy
+		break
+	fi
+done
+
+trap 'rm -f ${BASE}$$.s ${BASE}$$.c ${BASE}$$.o ${BASE}$$; exit 1' 1 2 15
+
+LDLIBS='-ltirpc -lm'
+
+# check for HP-UX's ANSI compiler
+echo "main(int ac, char *av[]) { int i; }" > ${BASE}$$.c
+if ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c 1>${NULL} 2>${NULL}
+then
+	true;
+else
+	rm -f ${BASE}$$
+	if ${CC} ${CFLAGS} -Ae -o ${BASE}$$ ${BASE}$$.c 1>${NULL} 2>${NULL}
+	then
+		CFLAGS="${CFLAGS} -Ae"
+	fi
+fi
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+	
+# check for IA64 HP-UX w/ HP's ANSI compiler; may need pointer swizzling
+arch=`echo $OS | awk -F- '{print $1;}'`
+if [ "X$CC" = "Xcc" -a "X$arch" = "Xia64" ]
+then
+	echo "#include <stdlib.h>" > ${BASE}$$.c
+	echo "main(int ac, char *av[])" >> ${BASE}$$.c
+	echo "{ long* p = (long*)malloc(sizeof(long));" >> ${BASE}$$.c
+	echo "*p = 0; exit((int)*p); }" >> ${BASE}$$.c
+	${CC} ${CFLAGS} +DD64 -o ${BASE}$$ ${BASE}$$.c 1>${NULL} 2>${NULL} \
+		&& [ -x ${BASE}$$ ] \
+		&& ${BASE}$$ \
+		&& CFLAGS="${CFLAGS} +DD64"
+	rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+fi
+
+# check for bcopy (optionally set the SYS5 flag)
+echo "#include <string.h>" > ${BASE}$$.c
+echo "main() { char a[256], b[256]; bcopy(a, b, 256); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	|| CFLAGS="${CFLAGS} -DSYS5"
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check for valloc
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "main() { char* buf = valloc(123); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	|| CFLAGS="${CFLAGS} -Dvalloc=malloc"
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check for off64_t
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <sys/types.h>" >> ${BASE}$$.c
+echo "#include <unistd.h>" >> ${BASE}$$.c
+echo "main() { off64_t off; }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_off64_t"
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check for lseek64
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <sys/types.h>" >> ${BASE}$$.c
+echo "#include <unistd.h>" >> ${BASE}$$.c
+echo "main() { int fd = 0; off64_t off = 0; off = lseek64(fd, off, SEEK_SET); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_lseek64"
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check for getrusage
+echo "#include <sys/types.h>" > ${BASE}$$.c
+echo "#include <sys/time.h>" >> ${BASE}$$.c
+echo "#include <sys/resource.h>" >> ${BASE}$$.c
+echo "#ifndef RUSAGE_SELF" >> ${BASE}$$.c
+echo "#define RUSAGE_SELF 0" >> ${BASE}$$.c
+echo "#endif /* RUSAGE_SELF */" >> ${BASE}$$.c
+echo "main() { struct rusage ru; getrusage(RUSAGE_SELF, &ru); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DRUSAGE"
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check for -lnsl
+echo "extern int pmap_getport(); main() { pmap_getport(); }" > ${BASE}$$.c
+if ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL}; then
+	true;
+else
+	${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} -lnsl 1>${NULL} 2>${NULL} \
+		&& LDLIBS="${LDLIBS} -lnsl"
+fi
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+
+# check for -lsocket
+echo "extern void* getservent(); main() { getservent(); }" > ${BASE}$$.c
+if ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL}; then
+	true;
+else
+	${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} -lsocket 1>${NULL} 2>${NULL} \
+		&& LDLIBS="${LDLIBS} -lsocket"
+fi
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check for -lrt (solaris)
+echo "extern int nanosleep(); main() { nanosleep(); }" >${BASE}$$.c
+if ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL}; then
+       true;
+else
+       ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} -lrt 1>${NULL} 2>${NULL} \
+               && LDLIBS="${LDLIBS} -lrt"
+fi
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check for -lrpc (cygwin/Windows)
+echo "extern int pmap_set(); main() { pmap_set(); }" >${BASE}$$.c
+if ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL}; then
+       true;
+else
+       ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} -lrpc 1>${NULL} 2>${NULL} \
+               && LDLIBS="${LDLIBS} -lrpc"
+fi
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check for OSs that have S_IFFIFO instead of S_IFIFO
+echo "#include <sys/stat.h>" > ${BASE}$$.c
+echo "main() { return (S_IFIFO); }" >> ${BASE}$$.c
+if ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL}; then
+	true;
+else
+	rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+	echo "#include <sys/stat.h>" > ${BASE}$$.c
+	echo "main() { return (S_IFFIFO); }" >> ${BASE}$$.c
+	${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+		|| CFLAGS="${CFLAGS} -DS_IFIFO=S_IFFIFO"
+fi
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check that we have uint
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <sys/types.h>" >> ${BASE}$$.c
+echo "main() { uint i = 0; return (i); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_uint=1";
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check that we have uint64
+HAVE_uint64=0
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <sys/types.h>" >> ${BASE}$$.c
+echo "#include <rpc/types.h>" >> ${BASE}$$.c
+echo "main() { uint64 i = 0; return (int)(i); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_uint64=1" && HAVE_uint64=1;
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check that we have uint64_t
+if [ ${HAVE_uint64} = 0 ]; then
+    echo "#include <stdlib.h>" > ${BASE}$$.c
+    echo "#include <sys/types.h>" >> ${BASE}$$.c
+    echo "main() { uint64_t i = 0; return (int)(i); }" >> ${BASE}$$.c
+    ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_uint64_t=1";
+    rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+fi
+
+# check that we have int64
+HAVE_int64=0
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <sys/types.h>" >> ${BASE}$$.c
+echo "#include <rpc/types.h>" >> ${BASE}$$.c
+echo "main() { int64 i = 0; return (int)(i); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_int64=1" && HAVE_int64=1;
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check that we have int64_t
+if [ ${HAVE_int64} = 0 ]; then
+    echo "#include <stdlib.h>" > ${BASE}$$.c
+    echo "#include <sys/types.h>" >> ${BASE}$$.c
+    echo "main() { int64_t i = 0; return (int)(i); }" >> ${BASE}$$.c
+    ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_int64_t=1";
+    rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+fi
+
+# check for <rpc/pmap_clnt.h>
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <rpc/rpc.h>" >> ${BASE}$$.c
+echo "#include <rpc/pmap_clnt.h>" >> ${BASE}$$.c
+echo "int main() { return(0); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_pmap_clnt_h"
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check for socklen_t
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <sys/types.h>" >> ${BASE}$$.c
+echo "#include <sys/socket.h>" >> ${BASE}$$.c
+echo "main() { int s; struct sockaddr dest; socklen_t len; getsockname(s, &dest, &len); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_socklen_t"
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check that we have drand48 and srand48
+HAVE_RANDOM=0
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "main() { srand48(973); return (int)(1.0E9 * drand48()); }" >> ${BASE}$$.c
+if ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL}; then
+	CFLAGS="${CFLAGS} -DHAVE_DRAND48"
+	HAVE_RANDOM=1
+fi
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+if [ ${HAVE_RANDOM} -eq 0 ]; then
+    echo "#include <stdlib.h>" > ${BASE}$$.c
+    echo "main() { srand(973); return (10 * rand()) / RAND_MAX; }" >> ${BASE}$$.c
+    if ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL}; then
+	CFLAGS="${CFLAGS} -DHAVE_RAND"
+	HAVE_RANDOM=1
+    fi
+    rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+fi
+
+if [ ${HAVE_RANDOM} -eq 0 ]; then
+    echo "#include <stdlib.h>" > ${BASE}$$.c
+    echo "main() { srandom(973); return (10 * random()) / RAND_MAX; }" >> ${BASE}$$.c
+    if ${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL}; then
+	CFLAGS="${CFLAGS} -DHAVE_RANDOM"
+	HAVE_RANDOM=1
+    fi
+    rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+fi
+
+# check that we have sysmp
+echo "#include <sys/types.h>" > ${BASE}$$.c
+echo "#include <sys/sysmp.h>" >> ${BASE}$$.c
+echo "main() { return (int)sysmp(MP_NPROCS); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_SYSMP=1";
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check that we have bindprocessor
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <unistd.h>" >> ${BASE}$$.c
+echo "#include <sys/types.h>" >> ${BASE}$$.c
+echo "#include <sys/processor.h>" >> ${BASE}$$.c
+echo "main() { return bindprocessor(BINDPROCESS, getpid(), 0); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_BINDPROCESSOR=1";
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check that we have processor_bind
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <sys/types.h>" >> ${BASE}$$.c
+echo "#include <sys/processor.h>" >> ${BASE}$$.c
+echo "#include <sys/procset.h>" >> ${BASE}$$.c
+echo "main() { return processor(P_PID, P_MYPID, 0, NULL); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_BINDPROCESSOR=1";
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+# check that we have sched_setaffinity
+echo "#include <stdlib.h>" > ${BASE}$$.c
+echo "#include <unistd.h>" >> ${BASE}$$.c
+echo "#include <sched.h>" >> ${BASE}$$.c
+echo "main() { unsigned long mask = 1; return sched_setaffinity(0, sizeof(unsigned long), &mask); }" >> ${BASE}$$.c
+${CC} ${CFLAGS} -o ${BASE}$$ ${BASE}$$.c ${LDLIBS} 1>${NULL} 2>${NULL} \
+	&& CFLAGS="${CFLAGS} -DHAVE_SCHED_SETAFFINITY=1";
+rm -f ${BASE}$$ ${BASE}$$.o ${BASE}$$.c
+
+
+if [ ! -d ${BINDIR} ]; then mkdir -p ${BINDIR}; fi
+
+# now go ahead and build everything!
+${MAKE} OS="${OS}" CC="${CC}" CFLAGS="${CFLAGS}" LDLIBS="${LDLIBS}" O="${BINDIR}" $*

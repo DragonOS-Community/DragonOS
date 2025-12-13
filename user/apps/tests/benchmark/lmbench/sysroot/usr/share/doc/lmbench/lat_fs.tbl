@@ -1,0 +1,56 @@
+.KS
+.TS
+expand doublebox;
+l c c
+l r r.
+System	Create	\fBDelete\fP
+=
+Linux i586	1.4	0.1
+IRIX64-601 IP26	0.9	0.1
+Linux i586	1.5	0.1
+Linux i586	1.1	0.1
+Linux i586	1.4	0.1
+Linux i686	1.2	0.1
+SunOS-5.4 sun4d	0.7	0.4
+SunOS-5.4 sun4d	18.2	8.3
+Linux i586	1.4	0.1
+Linux i486	0.8	0.1
+Linux i486	0.8	0.1
+Linux i586	2.7	0.2
+Sun SC1000	3.7	1.3
+Linux alpha	4.3	4.2
+DEC Alpha	25.0	11.4
+DEC Alpha	25.0	11.1
+DEC Alpha	0.8	0.3
+DEC Alpha	1.3	0.5
+DEC Alpha	38.5	12.3
+DEC Alpha	33.3	11.9
+DEC Alpha	23.3	11.5
+IRIX64 IP25	3.5	4.0
+IRIX64 IP19	3.1	5.0
+IRIX IP22	13.3	8.4
+Linux alpha	25.0	11.5
+DEC Alpha	25.6	14.1
+dgux mc88110	2.4	0.5
+HP-UX 9000/735	2.8	3.9
+FreeBSD/i586	20.0	8.3
+FreeBSD/i586	20.4	8.3
+FreeBSD/i586	22.7	8.3
+FreeBSD/i586	22.7	8.3
+FreeBSD/i586	19.6	8.3
+IRIX IP19	12.0	11.8
+IRIX5.3 IP19	11.5	11.2
+IBM Power2	13.3	12.8
+IRIX5.3 IP22	9.4	8.5
+HP-UX 9000/735	28.6	11.5
+IRIX64 IP21	11.9	11.5
+IBM PowerPC	12.7	12.7
+HP-UX 9000/770	20.0	11.1
+HP-UX 9000/735	15.4	11.1
+HP-UX 9000/819	3.7	11.8
+HP-UX 9000/897	58.8	17.2
+HP-UX 9000/755	26.3	11.2
+IRIX64 IP19	12.5	9.8
+HP-UX 9000/735	26.3	12.0
+.TE
+.KE

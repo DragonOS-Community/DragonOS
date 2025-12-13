@@ -1,0 +1,5 @@
+# we never want these unpacked at the same time, they break maintainer scripts
+conflicts-with-version safe-rm (<< 0.8)
+# There is logic in the unicode handling code which deals with this typo
+spelling-error-in-binary usr/bin/perl Inseperable Inseparable
+spelling-error-in-binary usr/bin/perl5.32.0 Inseperable Inseparable

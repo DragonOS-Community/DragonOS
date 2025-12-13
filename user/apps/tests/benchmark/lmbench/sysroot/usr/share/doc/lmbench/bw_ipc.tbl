@@ -1,0 +1,53 @@
+.KS
+.TS
+expand doublebox;
+l c c c
+l r r r.
+System	bcopy	\fBpipe\fP	TCP
+=
+DEC Alpha	36	32	9\ 
+DEC Alpha	46	54	11\ 
+DEC Alpha	38	23	7\ 
+DEC Alpha	45	35	9\ 
+DEC Alpha	39	32	12\ 
+Linux alpha	39	73	9\ 
+Sun Ultra1	167	61	51\ 
+SunOS-5.4 sun4m	26	11	11\ 
+SunOS-5.4 sun4m	23	24	19\ 
+DEC Alpha	40	24	6\ 
+DEC Alpha	15	17	4\ 
+Linux alpha	40	73	9\ 
+Linux i586	42	34	7\ 
+Linux i486	17	16	6\ 
+Linux i586	31	24	3\ 
+IBM Power2	171	84	10\ 
+IBM PowerPC	21	30	17\ 
+SunOS-5.4 sun4d	14	7	8\ 
+HP-UX 9000/735	26	37	24\ 
+SunOS-5.4 sun4m	23	7	9\ 
+Linux i686	57	73	15\ 
+Linux i586	41	22	5\ 
+Linux i586	21	19	3\ 
+Linux i586	21	18	3\ 
+Linux i586	21	12	3\ 
+Sun SC1000	15	9	11\ 
+SunOS-5.4 sun4d	21	8	9\ 
+IRIX5.3 IP22	32	34	22\ 
+IRIX64-601 IP26	32	37	22\ 
+HP-UX 9000/770	33	53	21\ 
+HP-UX 9000/819	48	37	28\ 
+HP-UX 9000/755	25	38	35\ 
+IRIX IP22	33	32	7\ 
+IRIX64 IP21	70	28	19\ 
+HP-UX 9000/735	26	44	20\ 
+HP-UX 9000/735	26	42	18\ 
+HP-UX 9000/735	26	39	19\ 
+IRIX64 IP25	41	40	26\ 
+IRIX64 IP19	34	27	19\ 
+IRIX64 IP19	36	17	31\ 
+IRIX IP19	34	14	16\ 
+IRIX5.3 IP19	34	12	12\ 
+HP-UX 9000/897	19	26	17\ 
+dgux mc88110	17	8	5\ 
+.TE
+.KE

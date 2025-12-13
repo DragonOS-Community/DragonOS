@@ -1,0 +1,31 @@
+#!/usr/bin/perl
+# Convert the new format:
+# Context switch of 8 4k processes: 64.17 (60.02 overhead)
+# to the old format:
+#"size=0 ovr=22
+# 2 8
+# 4 14
+# 8 18
+# 16 21
+# 20 22
+
+eval 'exec perl -Ssw $0 "$@"'
+	if 0;
+
+@lines = grep(/Context switch/, <>);
+foreach $size ("0k", "4k", "16k", "32k", "64k") {
+	@data = grep(/$size/, @lines);
+	@a = @b = @c = ();
+	$i = 0;
+	foreach $n (2, 4, 8, 16, 20) {
+		@tmp = ();
+		foreach $_ (grep(/of $n/, @data)) {
+			@_ = split;
+			push(@tmp, "$_[3] $_[6]\n");
+		}
+		($a[$i],$b[$i],$c[$i]) = @tmp;
+		$i++;
+	}
+	print "\n\"size=$size \n";
+	print @c;
+}

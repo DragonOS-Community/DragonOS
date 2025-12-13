@@ -1,0 +1,39 @@
+#!/usr/bin/perl
+# Make HTML files that will point to the right GIF files.
+# Usage: bghtml file file file....
+#
+# Hacked into existence by Larry McVoy (lm@sun.com now lm@sgi.com).
+# Copyright (c) 1995 Larry McVoy.  GPLed software.
+# $Id$
+eval 'exec perl -Ss $0 "$@"'
+	if 0;
+
+$bar = 0;
+for ($i = 0; $i <= $#ARGV; ++$i) {
+	$file = $ARGV[$i]; $file =~ s|tmp/||; $file =~ s|.bg$||;
+	if ($i > 0) {
+		$prev = $ARGV[$i - 1];
+		$prev =~ s|tmp/||;
+		$prev =~ s|.bg$||;
+		$prev_html = "${prev}.html";
+	}
+	if ($i < $#ARGV) {
+		$next = $ARGV[$i + 1];
+		$next =~ s|tmp/||;
+		$next =~ s|.bg$||;
+		$next_html = "${next}.html";
+	}
+	$name = "HTML/${file}.html";
+	open(F, ">$name");
+	print F "<a href=${file}.8>Man page for this benchmark</a><p>\n";
+	$str = sprintf("<IMG SRC=\"bar%02d\">\n", ++$bar);
+	print F "$str<p>";
+	print F "<a href=lmbench-toc.html><img src=\"gifs/arrows/b_arrow.gif\"</a>\n";
+	print F "<a href=lmbench-S-6.html><img src=\"gifs/graph.gif\"</a>\n";
+	print F "<a href=${prev_html}><img src=\"gifs/arrows/back.gif\"</a>\n"
+		if $i > 0;
+	print F "<a href=${next_html}><img src=\"gifs/arrows/forward.gif\"</a>\n"
+		if $i < $#ARGV;
+	close(F);
+}
+exit 0;

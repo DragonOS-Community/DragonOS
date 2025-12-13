@@ -1,0 +1,60 @@
+#!/bin/sh
+
+# %W% %@% Copyright (c) 1998 Larry McVoy.
+#
+# Usage: SYNC_PID=3 SYNC_MAX=20 synchronize /tmp/sync_dir
+#
+# Used to sync up a bunch of processes so that they can operate in lockstep
+# as much as possible.
+#
+# The first process to try and sync will mkdir(pathname) and create a named
+# pipe in the directory.  It also creates a file, pathname/$PID where pid
+# is not the process id, it is the process number.  The group of processes
+# must be numbered from 1..N and they must each know their number.  The Nth
+# process is the master.  Whereas all the other processes block, opening the
+# pipe, the master spins in a loop, waiting for pathname/1 .. pathname/N-1
+# to show up in the directory.  When they are all there, the master opens
+# the pipe for writing and all the other processes get woken up and leave.
+#
+# It is outside of this program, but the directory must not exist before the
+# synchronization.  So you typically rm -rf it well before trying to sync.
+
+if [ X$1 = X ]; then echo "Usage: $0 pathname"; exit 1; fi
+if [ X$SYNC_PID = X ]; then echo "Must set SYNC_PID"; exit 1; fi
+if [ X$SYNC_MAX = X ]; then echo "Must set SYNC_MAX"; exit 1; fi
+
+DIR=$1
+mkdir -p $DIR 2>/dev/null
+if [ ! -e $DIR/fifo ]
+then	mkfifo $DIR/fifo 2>/dev/null
+	chmod 666 $DIR/fifo 2>/dev/null
+fi
+
+# slaves just read the pipe
+if [ $SYNC_PID != $SYNC_MAX ]
+then	touch $DIR/$SYNC_PID
+	read x < $DIR/fifo
+	exit 0
+fi
+
+# Master waits for all the other processes to get there
+PIDS=""
+I=1
+while [ $I -lt $SYNC_MAX ]
+do	PIDS=" $I$PIDS"
+	I=`expr $I + 1`
+done
+while true
+do	GO=Y
+	for s in $PIDS
+	do	if [ ! -e $DIR/$s ]
+		then	GO=N
+		fi
+	done
+	if [ $GO = Y ]
+	then	# This assumes that all the processes will 
+		echo sleep 2 > $DIR/fifo &
+		exit 0
+	fi
+	msleep 250
+done

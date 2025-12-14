@@ -79,12 +79,15 @@ impl InnerTtyDevice {
             inode: None,
             driver: None,
             can_match: false,
-            metadata: Metadata::new(FileType::CharDevice, InodeMode::from_bits_truncate(0o755)),
+            metadata: {
+                let mut md =
+                    Metadata::new(FileType::CharDevice, InodeMode::from_bits_truncate(0o755));
+                // 对于字符设备，选择与 Linux devpts/devfs 一致的首选 I/O 块大小。
+                // 1024 满足测试期望 (允许 1024 或 4096)。
+                md.blk_size = 1024;
+                md
+            },
         }
-    }
-
-    pub fn metadata_mut(&mut self) -> &mut Metadata {
-        &mut self.metadata
     }
 }
 
@@ -225,15 +228,28 @@ impl IndexNode for TtyDevice {
         mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
-            return ptmx_open(data, mode);
+            return ptmx_open(self, data, mode);
         }
         let dev_num = self.metadata()?.raw_dev;
+        // /dev/tty 仅在已有控制终端时才能打开；否则返回 ENXIO
+        let mut tty = if dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 0) {
+            if let Some(current) = self.open_current_tty(dev_num, &mut data) {
+                Some(current)
+            } else {
+                return Err(SystemError::ENXIO);
+            }
+        } else {
+            None
+        };
+
         // log::debug!(
         //     "TtyDevice::open: dev_num: {}, current pid: {}",
         //     dev_num,
         //     ProcessManager::current_pid()
         // );
-        let mut tty = self.open_current_tty(dev_num, &mut data);
+        if tty.is_none() {
+            tty = self.open_current_tty(dev_num, &mut data);
+        }
         if tty.is_none() {
             let (index, driver) =
                 TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
@@ -260,10 +276,8 @@ impl IndexNode for TtyDevice {
         }
 
         let driver = tty.core().driver();
-        // 考虑noctty（当前tty）
+        // 考虑 O_NOCTTY：显式指定则不设置控制终端；pty master 也不会成为控制终端。
         if !(mode.contains(FileFlags::O_NOCTTY)
-            && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
-            || dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 1)
             || (driver.tty_driver_type() == TtyDriverType::Pty
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
         {

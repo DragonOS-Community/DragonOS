@@ -1,0 +1,8 @@
+SocketTest.UnixSocketPairProtocol
+# SocketTest.ProtocolInet # Only Inet sockets are enabled
+SocketTest.ProtocolUnix
+SocketTest.UnixSocketStat
+SocketTest.UnixSocketStatFS
+SocketTest.UnixSCMRightsOnlyPassedOnce
+SocketTest.Permission
+OpenModes/*.Unix/*

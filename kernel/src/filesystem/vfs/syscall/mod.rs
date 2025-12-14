@@ -36,6 +36,7 @@ mod sys_preadv2;
 mod sys_pselect6;
 mod sys_pwrite64;
 mod sys_pwritev;
+mod sys_pwritev2;
 mod sys_read;
 mod sys_readlinkat;
 mod sys_readv;

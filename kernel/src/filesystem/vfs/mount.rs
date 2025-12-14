@@ -41,7 +41,7 @@ use crate::{
 
 use super::{
     file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    InodeMode, Magic, PollableInode, SuperBlock,
+    InodeMode, PollableInode, SuperBlock,
 };
 
 bitflags! {
@@ -224,8 +224,6 @@ impl MountId {
     }
 }
 
-const MOUNTFS_BLOCK_SIZE: u64 = 512;
-const MOUNTFS_MAX_NAMELEN: u64 = 64;
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
 pub struct MountFS {
@@ -855,10 +853,6 @@ impl IndexNode for MountFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        if self.is_mountpoint_root()? {
-            return Err(SystemError::EBUSY);
-        }
-
         // 若已有挂载系统，保证MountFS只包一层
         let to_mount_fs = fs
             .clone()
@@ -1045,7 +1039,9 @@ impl FileSystem for MountFS {
         self.inner_filesystem.name()
     }
     fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(Magic::MOUNT_MAGIC, MOUNTFS_BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
+        let mut sb = self.inner_filesystem.super_block();
+        sb.flags = self.mount_flags.bits() as u64;
+        sb
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
@@ -1124,9 +1120,18 @@ pub struct MountList {
     inner: RwLock<InnerMountList>,
 }
 
+#[derive(Clone, Debug)]
+struct MountRecord {
+    fs: Arc<MountFS>,
+    ino: Option<InodeId>,
+}
+
 struct InnerMountList {
-    mounts: HashMap<Arc<MountPath>, Arc<MountFS>>,
+    /// 同一路径可能被重复挂载，按栈保存，栈顶为当前可见挂载。
+    mounts: HashMap<Arc<MountPath>, Vec<MountRecord>>,
+    /// 便于通过 fs 反查挂载点 inode。
     mfs2ino: HashMap<Arc<MountFS>, InodeId>,
+    /// inode 到路径的映射，用于子挂载查找。
     ino2mp: HashMap<InodeId, Arc<MountPath>>,
 }
 
@@ -1163,12 +1168,16 @@ impl MountList {
     #[inline(never)]
     pub fn insert(&self, ino: Option<InodeId>, path: Arc<MountPath>, fs: Arc<MountFS>) {
         let mut inner = self.inner.write();
-        inner.mounts.insert(path.clone(), fs.clone());
-        // 如果不是根目录挂载点，则记录inode到挂载点的映射
+        let entry = inner.mounts.entry(path.clone()).or_default();
+        entry.push(MountRecord {
+            fs: fs.clone(),
+            ino,
+        });
         if let Some(ino) = ino {
             inner.ino2mp.insert(ino, path.clone());
-            inner.mfs2ino.insert(fs, ino);
+            inner.mfs2ino.insert(fs.clone(), ino);
         }
+        // 若 ino 为 None（如根挂载），仍然保留 mounts 栈用于后续 pop。
     }
 
     /// # get_mount_point - 获取挂载点的路径
@@ -1194,10 +1203,12 @@ impl MountList {
             .upgradeable_read()
             .mounts
             .iter()
-            .filter_map(|(key, fs)| {
+            .filter_map(|(key, stack)| {
                 let strkey = key.as_str();
                 if let Some(rest) = path.as_ref().strip_prefix(strkey) {
-                    return Some((key.clone(), rest.to_string(), fs.clone()));
+                    return stack
+                        .last()
+                        .map(|rec| (key.clone(), rest.to_string(), rec.fs.clone()));
                 }
                 None
             })
@@ -1221,19 +1232,34 @@ impl MountList {
     pub fn remove<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
         let mut inner = self.inner.write();
         let path: MountPath = path.into();
-        // 从挂载点列表中移除指定路径的挂载点
-        if let Some(fs) = inner.mounts.remove(&path) {
-            if let Some(ino) = inner.mfs2ino.remove(&fs) {
-                inner.ino2mp.remove(&ino);
+        if let Some(stack) = inner.mounts.get_mut(&path) {
+            if let Some(rec) = stack.pop() {
+                let empty = stack.is_empty();
+                let rec_fs = rec.fs.clone();
+                let rec_ino = rec.ino;
+                if empty {
+                    inner.mounts.remove(&path);
+                }
+                if let Some(ino) = inner.mfs2ino.remove(&rec_fs) {
+                    inner.ino2mp.remove(&ino);
+                }
+                if let Some(ino) = rec_ino {
+                    inner.ino2mp.remove(&ino);
+                }
+                return Some(rec_fs);
             }
-            return Some(fs);
         }
         None
     }
 
     /// # clone_inner - 克隆内部挂载点列表
     pub fn clone_inner(&self) -> HashMap<Arc<MountPath>, Arc<MountFS>> {
-        self.inner.read().mounts.clone()
+        self.inner
+            .read()
+            .mounts
+            .iter()
+            .map(|(p, stack)| (p.clone(), stack.last().unwrap().fs.clone()))
+            .collect()
     }
 
     #[inline(never)]

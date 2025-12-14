@@ -21,6 +21,7 @@ lseek_test
 sync_test
 ioctl_test
 stat_test
+statfs_test
 #chmod_test
 #chown_test
 chdir_test
@@ -30,8 +31,10 @@ rename_test
 getdents_test
 preadv_test
 pwrite64_test
+pwritev2_test
 utimes_test
 fadvise_test
+open_test
 
 # 进程相关测试
 fork_test

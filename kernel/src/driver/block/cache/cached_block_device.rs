@@ -145,10 +145,12 @@ impl BlockCache {
         let count = f_data_vec.len();
         for i in f_data_vec {
             let index = i.index();
-            Self::insert_one_block(
-                i.lba_id(),
-                data[index * BLOCK_SIZE..(index + 1) * BLOCK_SIZE].to_vec(),
-            )?;
+            let start = index * BLOCK_SIZE;
+            let end = (index + 1) * BLOCK_SIZE;
+            if end > data.len() {
+                return Err(BlockCacheError::BlockSizeError);
+            }
+            Self::insert_one_block(i.lba_id(), &data[start..end])?;
         }
         Ok(count)
     }
@@ -163,7 +165,7 @@ impl BlockCache {
     /// ## 返回值：
     /// Ok(()):表示插入成功
     /// Err(BlockCacheError) :一般来说不会产生错误，这里产生错误的原因只有插入时还没有初始化（一般也很难发生）
-    fn insert_one_block(lba_id: BlockId, data: Vec<u8>) -> Result<(), BlockCacheError> {
+    fn insert_one_block(lba_id: BlockId, data: &[u8]) -> Result<(), BlockCacheError> {
         let space = unsafe { space()? };
         space.insert(lba_id, data)
     }
@@ -181,12 +183,28 @@ impl BlockCache {
     pub fn immediate_write(
         lba_id_start: BlockId,
         count: usize,
-        _data: &[u8],
+        data: &[u8],
     ) -> Result<usize, BlockCacheError> {
+        if data.len() < count * BLOCK_SIZE {
+            return Err(BlockCacheError::BlockSizeError);
+        }
+
         let mapper = unsafe { mapper()? };
+        let space = unsafe { space()? };
         let block_iter = BlockIter::new(lba_id_start, count, BLOCK_SIZE);
-        for i in block_iter {
-            mapper.remove(i.lba_id());
+        for (idx, i) in block_iter.enumerate() {
+            let lba_id = i.lba_id();
+            let start = idx * BLOCK_SIZE;
+            let end = (idx + 1) * BLOCK_SIZE;
+            let block_data = &data[start..end];
+
+            // write-through：如果 cache 中已有该块，更新其内容；否则插入以保持 cache 热度
+            if let Some(addr) = mapper.find(lba_id) {
+                space.write(addr, block_data)?;
+            } else {
+                // 不要 remove 映射（会导致 cache 空间和 slab 使用量单调增长）
+                space.insert(lba_id, block_data)?;
+            }
         }
         Ok(count)
     }
@@ -212,8 +230,13 @@ impl LockedCacheSpace {
         todo!()
     }
 
-    pub fn insert(&mut self, lba_id: BlockId, data: Vec<u8>) -> Result<(), BlockCacheError> {
+    pub fn insert(&mut self, lba_id: BlockId, data: &[u8]) -> Result<(), BlockCacheError> {
         unsafe { self.0.get_mut().insert(lba_id, data) }
+    }
+
+    /// 写入已存在的 cache block（write-through 更新）
+    pub fn write(&mut self, addr: CacheBlockAddr, data: &[u8]) -> Result<(), BlockCacheError> {
+        unsafe { self.0.get_mut().write(addr, data) }
     }
 }
 
@@ -273,9 +296,9 @@ impl CacheSpace {
     ///
     /// ## 返回值：
     /// Ok(())
-    pub fn insert(&mut self, lba_id: BlockId, data: Vec<u8>) -> Result<(), BlockCacheError> {
-        // CacheBlock是cached block的基本单位，这里使用data生成一个CacheBlock用于向Cache空间中插入块
-        let data_block = CacheBlock::from_data(lba_id, data);
+    pub fn insert(&mut self, lba_id: BlockId, data: &[u8]) -> Result<(), BlockCacheError> {
+        // CacheBlock是cached block的基本单位
+        let data_block = CacheBlock::from_slice(lba_id, data)?;
         let mapper = unsafe { mapper()? };
         // 这里我设计了cache的一个threshold，如果不超过阈值就可以append，否则只能替换
         if self.frame_selector.can_append() {
@@ -302,6 +325,16 @@ impl CacheSpace {
             mapper.remove(removed_id);
             Ok(())
         }
+    }
+
+    pub fn write(&mut self, addr: CacheBlockAddr, data: &[u8]) -> Result<(), BlockCacheError> {
+        if addr > self.frame_selector.size() {
+            return Err(BlockCacheError::InsufficientCacheSpace);
+        }
+        if addr >= self.root.len() {
+            return Err(BlockCacheError::InsufficientCacheSpace);
+        }
+        self.root[addr].write_data(data)
     }
 }
 
@@ -345,7 +378,8 @@ impl CacheMapper {
     /// # 函数的功能
     /// 插入操作
     pub fn insert(&mut self, lba_id: BlockId, caddr: CacheBlockAddr) -> Option<()> {
-        self.map.insert(lba_id, caddr)?;
+        // HashMap::insert 返回的是旧值（新 key 时为 None），不能用 `?` 否则新插入永远失败
+        self.map.insert(lba_id, caddr);
         Some(())
     }
     /// # 函数的功能

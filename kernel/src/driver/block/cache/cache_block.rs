@@ -37,6 +37,25 @@ impl CacheBlock {
         CacheBlock::new(space_box, CacheBlockFlag::Unwrited, lba_id)
     }
 
+    /// 从 slice 创建一个 CacheBlock（避免先构造 Vec 再 into_boxed_slice 的额外分配/拷贝步骤）。
+    pub fn from_slice(lba_id: BlockId, data: &[u8]) -> Result<Self, BlockCacheError> {
+        if data.len() != BLOCK_SIZE {
+            return Err(BlockCacheError::BlockSizeError);
+        }
+        let mut v = Vec::with_capacity(BLOCK_SIZE);
+        v.extend_from_slice(data);
+        Ok(Self::from_data(lba_id, v))
+    }
+
+    /// 用新数据覆盖当前 cache block（用于 write-through 更新）。
+    pub fn write_data(&mut self, data: &[u8]) -> Result<(), BlockCacheError> {
+        if data.len() != BLOCK_SIZE {
+            return Err(BlockCacheError::BlockSizeError);
+        }
+        self.data.copy_from_slice(data);
+        Ok(())
+    }
+
     pub fn _set_flag(&mut self, _flag: CacheBlockFlag) -> Option<()> {
         todo!()
     }

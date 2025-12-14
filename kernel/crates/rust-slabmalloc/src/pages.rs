@@ -335,6 +335,7 @@ impl<'a, T: AllocablePage> PageList<'a, T> {
 
         ObjectPageIterMut {
             head: m,
+            remaining: self.elements,
             phantom: core::marker::PhantomData,
         }
     }
@@ -427,6 +428,7 @@ impl<'a, T: AllocablePage> PageList<'a, T> {
 /// Iterate over all the pages inside a slab allocator
 pub(crate) struct ObjectPageIterMut<'a, P: AllocablePage> {
     head: Rawlink<P>,
+    remaining: usize,
     phantom: core::marker::PhantomData<&'a P>,
 }
 
@@ -435,6 +437,10 @@ impl<'a, P: AllocablePage + 'a> Iterator for ObjectPageIterMut<'a, P> {
 
     #[inline]
     fn next(&mut self) -> Option<&'a mut P> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
         unsafe {
             #[allow(clippy::manual_inspect)]
             self.head.resolve_mut().map(|next| {

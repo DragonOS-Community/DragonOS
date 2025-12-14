@@ -21,6 +21,7 @@ lseek_test
 sync_test
 ioctl_test
 stat_test
+statfs_test
 #chmod_test
 #chown_test
 chdir_test
@@ -30,6 +31,7 @@ rename_test
 getdents_test
 preadv_test
 pwrite64_test
+pwritev2_test
 utimes_test
 truncate_test
 fadvise_test
@@ -61,6 +63,8 @@ madvise_test
 #bind_test
 #connect_test
 #listen_test
+socket_test
+udp_socket_test
 
 # 信号处理测试
 sigaction_test

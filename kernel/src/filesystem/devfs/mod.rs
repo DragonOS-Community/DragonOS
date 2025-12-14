@@ -15,7 +15,7 @@ use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
-    filesystem::vfs::mount::MountFlags,
+    filesystem::vfs::{mount::MountFlags, produce_fs},
     libs::{
         casting::DowncastArc,
         once::Once,
@@ -30,7 +30,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::{error, info};
+use log::{error, info, warn};
 use system_error::SystemError;
 
 const DEVFS_BLOCK_SIZE: u64 = 512;
@@ -138,6 +138,8 @@ impl DevFS {
 
         root.add_dir("block")
             .expect("DevFS: Failed to create /dev/block");
+        // 预创建 /dev/ptmx 符号链接指向 devpts 内部节点，避免早期 ENOENT
+        let _ = root.add_dev_symlink("pts/ptmx", "ptmx");
         devfs.register_bultinin_device();
 
         // debug!("ls /dev: {:?}", root.list());
@@ -175,6 +177,12 @@ impl DevFS {
         match metadata.file_type {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
+                // 对 ptmx 使用符号链接至 devpts 内部节点，避免重复注册字符设备。
+                if name == "ptmx" {
+                    dev_root_inode.add_dev_symlink("pts/ptmx", name)?;
+                    return Ok(());
+                }
+
                 if dev_root_inode.find("char").is_err() {
                     dev_root_inode.create(
                         "char",
@@ -770,6 +778,19 @@ pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), 
     return devfs_exact_ref!().register_device(name, device);
 }
 
+/// 在 /dev 下创建符号链接
+#[allow(dead_code)]
+pub fn devfs_add_symlink(link_name: &str, target: &str) -> Result<(), SystemError> {
+    let dev_inode = ProcessManager::current_mntns()
+        .root_inode()
+        .find("dev")
+        .map_err(|_| SystemError::ENOENT)?;
+    let dev_inode = dev_inode
+        .downcast_arc::<LockedDevFSInode>()
+        .ok_or(SystemError::ENOENT)?;
+    dev_inode.add_dev_symlink(target, link_name)
+}
+
 /// @brief devfs的设备卸载函数
 #[allow(dead_code)]
 pub fn devfs_unregister<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
@@ -791,6 +812,30 @@ pub fn devfs_init() -> Result<(), SystemError> {
             .mount(devfs, MountFlags::empty())
             .expect("Failed to mount at /dev");
         info!("DevFS mounted.");
+        // 挂载 /dev/shm 为 tmpfs，符合 linux 语义
+        if let Ok(dev_inode) = ProcessManager::current_mntns().root_inode().find("dev") {
+            let shm_inode = dev_inode
+                .find("shm")
+                .or_else(|_| dev_inode.mkdir("shm", InodeMode::from_bits_truncate(0o1777)));
+            if let Ok(shm_inode) = shm_inode {
+                let flags = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
+                match produce_fs("tmpfs", Some("mode=1777"), "tmpfs") {
+                    Ok(fs) => {
+                        if let Err(e) = shm_inode.mount(fs, flags) {
+                            if e != SystemError::EBUSY {
+                                warn!("Mount /dev/shm failed: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => warn!("Create tmpfs for /dev/shm failed: {:?}", e),
+                }
+            } else {
+                warn!("Create /dev/shm failed: {:?}", shm_inode.err());
+            }
+        } else {
+            warn!("Cannot find /dev mountpoint for /dev/shm");
+        }
+
         result = Some(Ok(()));
     });
 

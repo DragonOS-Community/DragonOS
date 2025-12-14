@@ -301,12 +301,16 @@ pub fn vfs_getattr(
         kstat.btime.tv_sec = metadata.btime.tv_sec;
         kstat.btime.tv_nsec = metadata.btime.tv_nsec;
     }
+
+    // 对于字符/块设备，st_rdev 在基础属性中也应被返回。
+    // 即便调用者未显式请求 STATX_ALL，也填充 rdev 以符合 Linux 语义。
+    kstat.rdev = metadata.raw_dev;
+
     if request_mask.contains(PosixStatxMask::STATX_ALL) {
         kstat.attributes = StxAttributes::STATX_ATTR_APPEND;
         kstat.attributes_mask |=
             StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
         kstat.dev = DeviceNumber::from(metadata.dev_id as u32);
-        kstat.rdev = metadata.raw_dev;
     }
 
     // 把文件类型加入mode里面 （todo: 在具体的文件系统里面去实现这个操作。这里只是权宜之计）
@@ -519,7 +523,8 @@ impl TryFrom<KStat> for GenericPosixStat {
         tmp.st_uid = kstat.uid;
         tmp.st_gid = kstat.gid;
 
-        tmp.st_rdev = kstat.rdev.data() as u64;
+        // 兼容 Linux 的 dev 编码语义，使用 new_encode_dev 返回 gnu_dev_makedev 风格的值。
+        tmp.st_rdev = kstat.rdev.new_encode_dev() as u64;
         tmp.st_size = kstat.size as i64;
 
         tmp.st_atime = kstat.atime.tv_sec;

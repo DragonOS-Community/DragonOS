@@ -14,6 +14,7 @@ env:
 jobs:
   build:
     name: Build DragonOS
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'DragonOS-Community/DragonOS'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -67,6 +68,7 @@ jobs:
 
   publish:
     name: Publish Docker Image
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'DragonOS-Community/DragonOS'
     runs-on: ubuntu-latest
     needs: build
     steps:
@@ -87,7 +89,6 @@ jobs:
         id: image-tag
         run: |
           DATE_TAG=$(date +%Y%m%d)
-          COMMIT_SHORT=$(git rev-parse --short HEAD)
           REGISTRY_URL=docker.cnb.cool
           IMAGE_NAME=dragonos-community/playground/artifacts
           

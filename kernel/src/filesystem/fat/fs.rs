@@ -1,4 +1,7 @@
+use crate::arch::MMArch;
 use crate::filesystem::vfs::syscall::RenameFlags;
+use crate::mm::truncate::truncate_inode_pages;
+use crate::mm::MemoryManagementArch;
 use alloc::string::ToString;
 use alloc::{
     string::String,
@@ -47,6 +50,9 @@ const FAT_MAX_NAMELEN: u64 = 255;
 
 /// FAT32文件系统的最大的文件大小
 pub const MAX_FILE_SIZE: u64 = 0xffff_ffff;
+
+/// 每次清零写入时的缓冲区上限（避免分配过大内存）
+pub const ZERO_BUF_SIZE: usize = 512 * 1024; // 512KB
 
 /// @brief 表示当前簇和上一个簇的关系的结构体
 /// 定义这样一个结构体的原因是，FAT文件系统的文件中，前后两个簇具有关联关系。
@@ -1749,8 +1755,14 @@ impl IndexNode for LockedFATInode {
         Ok(())
     }
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        // 先调整页缓存大小，但不要提前返回；后续仍需同步到底层文件并更新元数据
+        //检查是否超过fat支持的最大容量
+        if (len as u64) > MAX_FILE_SIZE {
+            return Err(SystemError::EFBIG);
+        }
+        // 先调整页缓存：清除被截断区间的缓存页，再缩容缓存大小
         if let Some(page_cache) = self.page_cache() {
+            let start_page = (len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
+            truncate_inode_pages(page_cache.clone(), start_page);
             page_cache.lock_irqsave().resize(len)?;
         }
 
@@ -1767,16 +1779,13 @@ impl IndexNode for LockedFATInode {
                     }
                     Ordering::Greater => {
                         // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
-                        let mut buf: Vec<u8> = Vec::new();
-                        let mut remain_size = len - old_size;
-                        let buf_size = remain_size;
-                        // let buf_size = core::cmp::min(remain_size, 512 * 1024);
-                        buf.resize(buf_size, 0);
+                        let buf: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
 
+                        let mut remain_size = len - old_size;
                         let mut offset = old_size;
                         while remain_size > 0 {
-                            let write_size = core::cmp::min(remain_size, buf_size);
-                            file.write(fs, &buf[0..write_size], offset as u64)?;
+                            let write_size = core::cmp::min(remain_size, ZERO_BUF_SIZE);
+                            file.write(fs, &buf[..write_size], offset as u64)?;
                             remain_size -= write_size;
                             offset += write_size;
                         }

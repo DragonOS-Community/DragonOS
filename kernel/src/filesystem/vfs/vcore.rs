@@ -372,6 +372,11 @@ pub(super) fn do_file_lookup_at(
 pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
     let md = inode.metadata()?;
 
+    // 防御性检查：统一拒绝超出 isize::MAX 的长度，避免后续类型转换溢出
+    if len > isize::MAX as usize {
+        return Err(SystemError::EINVAL);
+    }
+
     if md.file_type == FileType::Dir {
         return Err(SystemError::EISDIR);
     }

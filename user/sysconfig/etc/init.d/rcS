@@ -2,6 +2,12 @@
 echo "[rcS] Running system init script..."
 /bin/about.elf
 
+# 挂载tmpfs到/tmp目录
+if [ ! -d /tmp ]; then
+    mkdir -p /tmp
+fi
+mount -t tmpfs tmpfs /tmp || /bin/busybox mount -t tmpfs tmpfs /tmp
+
 # 根据环境变量AUTO_TEST决定是否进行自动测试
 if [ "$AUTO_TEST" = "syscall" ]; then
     /bin/busybox sh $SYSCALL_TEST_DIR/run_tests.sh

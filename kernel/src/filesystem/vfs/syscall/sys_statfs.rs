@@ -31,9 +31,8 @@ impl Syscall for SysStatfsHandle {
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         let pcb = ProcessManager::current_pcb();
-        let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
-        let root_inode = ProcessManager::current_mntns().root_inode();
-        let inode = root_inode.lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
+        let (inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
+        let inode = inode_begin.lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
         let statfs = PosixStatfs::from(inode.fs().super_block());
         writer.copy_one_to_user(&statfs, 0)?;
         return Ok(0);

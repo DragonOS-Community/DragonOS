@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
+use crate::mm::fault::PageFaultHandler;
 use crate::register_mountable_fs;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
@@ -134,6 +135,14 @@ impl FileSystemMakerData for TmpfsMountData {
 }
 
 impl FileSystem for Tmpfs {
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut crate::mm::fault::PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> crate::mm::VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
+    }
     fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
         self.root_inode.clone()
     }

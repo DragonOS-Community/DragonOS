@@ -50,16 +50,18 @@ pub fn do_renameat2(
 
     //获取pcb，文件节点
     let pcb = ProcessManager::current_pcb();
-    let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
-    let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
-    //获取父目录
-    let root_inode = ProcessManager::current_mntns().root_inode();
+    let (old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
+    let (new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
     let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
-    let old_parent_inode = root_inode
-        .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let old_parent_inode = match old_parent_path {
+        None => old_inode_begin,
+        Some(p) => old_inode_begin.lookup_follow_symlink(p, VFS_MAX_FOLLOW_SYMLINK_TIMES)?,
+    };
     let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
-    let new_parent_inode = root_inode
-        .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let new_parent_inode = match new_parent_path {
+        None => new_inode_begin,
+        Some(p) => new_inode_begin.lookup_follow_symlink(p, VFS_MAX_FOLLOW_SYMLINK_TIMES)?,
+    };
 
     let flags = RenameFlags::from_bits_truncate(flags);
     if flags.contains(RenameFlags::NOREPLACE) && (new_filename == "." || new_filename == "..") {

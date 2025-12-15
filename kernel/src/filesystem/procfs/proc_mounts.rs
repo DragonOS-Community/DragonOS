@@ -16,19 +16,32 @@ impl ProcFSInode {
         pdata: &mut ProcfsFilePrivateData,
     ) -> Result<i64, SystemError> {
         // 生成mount信息
-        let mount_content = Self::generate_mounts_content();
+        let mount_content = Self::generate_mounts_like_content(MountsFormat::Mounts);
 
         pdata.data = mount_content.into_bytes();
         return Ok(pdata.data.len() as i64);
     }
 
     #[inline(never)]
-    fn generate_mounts_content() -> String {
+    fn generate_mounts_like_content(fmt: MountsFormat) -> String {
         let mntns = ProcessManager::current_mntns();
         let mounts = mntns.mount_list().clone_inner();
 
+        // 以进程 fs root 为基准做 chroot 视图裁剪/重写
+        let pcb = ProcessManager::current_pcb();
+        let root_inode = pcb.fs_struct().root();
+        let root_prefix = root_inode.absolute_path().unwrap_or_else(|_| "/".to_string());
+        let is_chrooted = root_prefix != "/";
+        let root_prefix_with_slash = if root_prefix.ends_with('/') {
+            root_prefix.clone()
+        } else {
+            root_prefix.clone() + "/"
+        };
+
         let mut lines = Vec::with_capacity(mounts.len());
         let mut cap = 0;
+        let mut mid: usize = 1;
+
         for (mp, mfs) in mounts {
             let mut line = String::new();
             let fs_type = mfs.fs_type();
@@ -53,14 +66,45 @@ impl ProcFSInode {
                 }
             };
 
-            line.push_str(&format!("{source} {m} {fs_type}", m = mp.as_str()));
+            // 过滤/改写 mountpoint（chroot 后应只暴露 root 下的挂载点，并重写为 chroot 视角）
+            let mut mountpoint = mp.as_str().to_string();
+            if is_chrooted {
+                if mountpoint == root_prefix {
+                    mountpoint = "/".to_string();
+                } else if mountpoint.starts_with(&root_prefix_with_slash) {
+                    // strip_prefix 会得到 "child/.."；保持以 '/' 开头
+                    let stripped = &mountpoint[root_prefix.len()..];
+                    mountpoint = if stripped.is_empty() { "/".to_string() } else { stripped.to_string() };
+                } else {
+                    continue;
+                }
+            }
 
-            line.push(' ');
-            line.push_str(&mfs.mount_flags().options_string());
+            match fmt {
+                MountsFormat::Mounts => {
+                    line.push_str(&format!("{source} {m} {fs_type}", m = mountpoint));
+                    line.push(' ');
+                    line.push_str(&mfs.mount_flags().options_string());
+                    line.push_str(" 0 0\n");
+                }
+                MountsFormat::MountInfo => {
+                    // 极简 mountinfo：只保证 mountpoint 字段正确且不泄露 chroot 前缀
+                    // mount ID / parent ID / major:minor / root / mountpoint / options / - / fstype / source / superopts
+                    line.push_str(&format!(
+                        "{id} {pid} 0:0 / {mp} {opts} - {fst} {src} {opts}\n",
+                        id = mid,
+                        pid = if mid == 1 { 0 } else { 1 },
+                        mp = mountpoint,
+                        opts = mfs.mount_flags().options_string(),
+                        fst = fs_type,
+                        src = source
+                    ));
+                }
+            }
 
-            line.push_str(" 0 0\n");
             cap += line.len();
             lines.push(line);
+            mid += 1;
         }
 
         let mut content = String::with_capacity(cap);
@@ -70,4 +114,15 @@ impl ProcFSInode {
 
         return content;
     }
+}
+
+#[derive(Clone, Copy)]
+enum MountsFormat {
+    Mounts,
+    MountInfo,
+}
+
+/// 为 /proc/<pid>/mountinfo 生成内容（极简版，满足 gVisor chroot_test）。
+pub(super) fn generate_mountinfo_content() -> String {
+    ProcFSInode::generate_mounts_like_content(MountsFormat::MountInfo)
 }

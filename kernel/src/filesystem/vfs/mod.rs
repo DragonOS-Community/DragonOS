@@ -922,7 +922,8 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
-        let root_inode = ProcessManager::current_mntns().root_inode();
+        // Linux 语义：绝对路径应当以“进程 fs root”（可被 chroot 改变）为起点
+        let process_root_inode = ProcessManager::current_pcb().fs_struct().root();
         let trailing_slash = path.ends_with('/');
 
         // 获取当前进程的凭证（用于路径遍历的权限检查）
@@ -932,7 +933,7 @@ impl dyn IndexNode {
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (root_inode.clone(), String::from(rest))
+            (process_root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))
@@ -966,6 +967,16 @@ impl dyn IndexNode {
             // 遇到连续多个"/"的情况
             if name.is_empty() {
                 continue;
+            }
+
+            // 进程 root 边界：当解析到进程 root 时，“..” 不允许逃逸，应当停留在 root。
+            // 这对应 Linux 的路径解析语义（参照 namei.c 中对 root 的处理）。
+            if name == ".." {
+                let cur_md = result.metadata()?;
+                let root_md = process_root_inode.metadata()?;
+                if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
+                    continue;
+                }
             }
 
             let inode = result.find(&name)?;

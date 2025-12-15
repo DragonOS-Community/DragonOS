@@ -111,6 +111,15 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         current_mntns.force_change_root_mountfs(new_fs);
     }
 
+    // 换根后需要同步更新“当前进程”的 fs root/pwd。
+    // 我们的路径解析（绝对路径）以进程 fs root 为起点；若不更新，后续诸如 /dev/pts 的挂载、
+    // 以及 init stdio 的 /dev/hvc0 查找都会仍在旧 root 上执行，导致找不到设备节点。
+    let new_root_inode = current_mntns.root_inode();
+    let pcb = ProcessManager::current_pcb();
+    pcb.fs_struct_mut().set_root(new_root_inode.clone());
+    // init 通常 cwd 为 "/"，将 pwd 同步到新根，避免落在旧根造成后续语义混乱
+    pcb.fs_struct_mut().set_pwd(new_root_inode.clone());
+
     // WARNING: mount devpts after devfs has been mounted,
     devpts_init().expect("Failed to initialize devpts");
 

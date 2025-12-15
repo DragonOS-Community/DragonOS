@@ -526,6 +526,11 @@ impl File {
             return Ok(());
         }
 
+        // 检查文件系统是否支持 readahead
+        if !self.inode.fs().support_readahead() {
+            return Ok(());
+        }
+
         let page_cache = match self.inode.page_cache() {
             Some(page_cahce) => page_cahce,
             None => return Ok(()),

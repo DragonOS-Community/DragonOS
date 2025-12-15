@@ -1034,6 +1034,10 @@ impl IndexNode for MountFSInode {
 }
 
 impl FileSystem for MountFS {
+
+    fn support_readahead(&self) -> bool {
+        self.inner_filesystem.support_readahead()
+    }
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         match self.self_mountpoint() {
             Some(inode) => return inode.mount_fs.root_inode(),

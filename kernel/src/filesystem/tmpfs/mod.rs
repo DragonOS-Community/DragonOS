@@ -2,18 +2,20 @@ use core::any::Any;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
-use crate::filesystem::page_cache::PageCache;
 use crate::libs::rwlock::RwLock;
 use crate::mm::fault::PageFaultHandler;
 use crate::register_mountable_fs;
 use crate::{
+    arch::MMArch,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     libs::spinlock::{SpinLock, SpinLockGuard},
+    mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
 
@@ -166,6 +168,11 @@ impl FileSystem for Tmpfs {
     fn super_block(&self) -> SuperBlock {
         self.super_block.read().clone()
     }
+
+    fn support_readahead(&self) -> bool {
+        // tmpfs 是内存文件系统，数据已经在 page_cache 中，不需要 readahead
+        false
+    }
 }
 
 impl Tmpfs {
@@ -307,10 +314,65 @@ impl IndexNode for LockedTmpfsInode {
         if inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
+        let file_size = inode.metadata.size as usize;
         let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
         drop(inode);
 
-        page_cache.read(offset, &mut buf[..len])
+        // 计算实际读取长度
+        let read_len = if offset < file_size {
+            core::cmp::min(file_size - offset, len)
+        } else {
+            0
+        };
+
+        if read_len == 0 {
+            return Ok(0);
+        }
+
+        // 对于 tmpfs，直接操作 page_cache 内部
+        let mut page_cache_guard = page_cache.lock_irqsave();
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let end_page_index = (offset + read_len - 1) >> MMArch::PAGE_SHIFT;
+
+        let mut buf_offset = 0;
+        for page_index in start_page_index..=end_page_index {
+            let page_start = page_index * MMArch::PAGE_SIZE;
+            let page_end = page_start + MMArch::PAGE_SIZE;
+
+            // 计算当前页的读取范围
+            let read_start = core::cmp::max(offset, page_start);
+            let read_end = core::cmp::min(offset + read_len, page_end);
+            let page_read_len = read_end - read_start;
+
+            if page_read_len == 0 {
+                break;
+            }
+
+            // 获取或创建页面
+            let page = if let Some(page) = page_cache_guard.get_page(page_index) {
+                page
+            } else {
+                // 页面不存在，创建零填充的页面
+                let zero_buf = vec![0u8; crate::arch::MMArch::PAGE_SIZE];
+                page_cache_guard.create_pages(page_index, &zero_buf)?;
+                page_cache_guard
+                    .get_page(page_index)
+                    .ok_or(SystemError::EIO)?
+            };
+
+            // 从页面读取数据
+            let page_guard = page.read_irqsave();
+            let page_offset = read_start - page_start;
+            unsafe {
+                buf[buf_offset..buf_offset + page_read_len].copy_from_slice(
+                    &page_guard.as_slice()[page_offset..page_offset + page_read_len],
+                );
+            }
+            buf_offset += page_read_len;
+        }
+        drop(page_cache_guard);
+
+        Ok(read_len)
     }
 
     fn write_at(
@@ -323,7 +385,7 @@ impl IndexNode for LockedTmpfsInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        let mut inode = self.0.lock();
+        let inode = self.0.lock();
         if inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
@@ -345,21 +407,56 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         drop(inode);
-        match page_cache.write(offset, &buf[0..len]) {
-            Ok(written) => {
-                let mut inode = self.0.lock();
-                if new_size > old_size {
-                    inode.metadata.size = new_size as i64;
-                }
-                Ok(written)
+
+        // 对于 tmpfs，直接操作 page_cache 内部
+        let mut page_cache_guard = page_cache.lock_irqsave();
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let end_page_index = (offset + len - 1) >> MMArch::PAGE_SHIFT;
+
+        let mut buf_offset = 0;
+        for page_index in start_page_index..=end_page_index {
+            let page_start = page_index * MMArch::PAGE_SIZE;
+            let page_end = page_start + MMArch::PAGE_SIZE;
+
+            // 计算当前页的写入范围
+            let write_start = core::cmp::max(offset, page_start);
+            let write_end = core::cmp::min(offset + len, page_end);
+            let page_write_len = write_end - write_start;
+
+            if page_write_len == 0 {
+                break;
             }
-            Err(e) => {
-                if size_diff > 0 {
-                    tmpfs.decrease_size(size_diff as usize);
-                }
-                Err(e)
+
+            // 获取或创建页面
+            let page = if let Some(page) = page_cache_guard.get_page(page_index) {
+                page
+            } else {
+                // 页面不存在，创建零填充的页面
+                let zero_buf = vec![0u8; crate::arch::MMArch::PAGE_SIZE];
+                page_cache_guard.create_pages(page_index, &zero_buf)?;
+                page_cache_guard
+                    .get_page(page_index)
+                    .ok_or(SystemError::EIO)?
+            };
+
+            // 写入数据到页面
+            let mut page_guard = page.write_irqsave();
+            let page_offset = write_start - page_start;
+            unsafe {
+                page_guard.as_slice_mut()[page_offset..page_offset + page_write_len]
+                    .copy_from_slice(&buf[buf_offset..buf_offset + page_write_len]);
             }
+            page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
+            buf_offset += page_write_len;
         }
+        drop(page_cache_guard);
+
+        // 更新文件大小
+        let mut inode = self.0.lock();
+        if new_size > old_size {
+            inode.metadata.size = new_size as i64;
+        }
+        Ok(len)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -544,6 +641,14 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+        // 检查是否为 "." 或 ".."
+        if name == "." {
+            return Err(SystemError::EINVAL);
+        }
+        if name == ".." {
+            return Err(SystemError::ENOTEMPTY);
+        }
+
         let name = DName::from(name);
         let mut inode: SpinLockGuard<TmpfsInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
@@ -553,6 +658,11 @@ impl IndexNode for LockedTmpfsInode {
         let deleted_inode = to_delete.0.lock();
         if deleted_inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
+        }
+
+        // 检查目录是否为空（排除 "." 和 ".."）
+        if deleted_inode.children.len() > 0 {
+            return Err(SystemError::ENOTEMPTY);
         }
 
         // 目录的大小通常是0（不包含数据），但为了完整性，我们也处理
@@ -587,6 +697,8 @@ impl IndexNode for LockedTmpfsInode {
             .ok_or(SystemError::EINVAL)?;
 
         let new_name = DName::from(new_name);
+        let old_inode_type = inode_to_move.0.lock().metadata.file_type;
+        drop(inode_to_move.0.lock());
 
         inode_to_move.0.lock().name = new_name.clone();
 
@@ -594,9 +706,29 @@ impl IndexNode for LockedTmpfsInode {
 
         let mut self_inode = self.0.lock();
         if target_id == self_inode.metadata.inode_id {
-            if flags.contains(RenameFlags::NOREPLACE) && self_inode.children.contains_key(&new_name)
-            {
-                return Err(SystemError::EEXIST);
+            // 同目录重命名
+            if let Some(existing) = self_inode.children.get(&new_name) {
+                if flags.contains(RenameFlags::NOREPLACE) {
+                    return Err(SystemError::EEXIST);
+                }
+                // 检查类型匹配
+                let existing_type = existing.0.lock().metadata.file_type;
+                if old_inode_type != existing_type {
+                    if old_inode_type == FileType::Dir {
+                        return Err(SystemError::ENOTDIR);
+                    } else {
+                        return Err(SystemError::EISDIR);
+                    }
+                }
+                // 如果都是目录，检查目标目录是否为空（排除 "." 和 ".."）
+                if old_inode_type == FileType::Dir {
+                    let existing_children = &existing.0.lock().children;
+                    if existing_children.len() > 0 {
+                        return Err(SystemError::ENOTEMPTY);
+                    }
+                }
+                // 移除已存在的目标
+                self_inode.children.remove(&new_name);
             }
             self_inode.children.remove(&DName::from(old_name));
             self_inode.children.insert(new_name, inode_to_move);
@@ -604,17 +736,69 @@ impl IndexNode for LockedTmpfsInode {
         }
         drop(self_inode);
 
-        inode_to_move.0.lock().parent = Arc::downgrade(
-            &target
-                .clone()
-                .downcast_arc::<LockedTmpfsInode>()
-                .ok_or(SystemError::EINVAL)?,
-        );
+        // 跨目录移动
+        let target_locked = target
+            .clone()
+            .downcast_arc::<LockedTmpfsInode>()
+            .ok_or(SystemError::EINVAL)?;
 
-        target.link(new_name.as_ref(), &(inode_to_move as Arc<dyn IndexNode>))?;
+        // 检查目标是否已存在
+        let mut target_inode = target_locked.0.lock();
+        if let Some(existing) = target_inode.children.get(&new_name) {
+            // 检查类型匹配
+            let existing_type = existing.0.lock().metadata.file_type;
+            if old_inode_type != existing_type {
+                if old_inode_type == FileType::Dir {
+                    return Err(SystemError::ENOTDIR);
+                } else {
+                    return Err(SystemError::EISDIR);
+                }
+            }
+            // 如果都是目录，检查目标目录是否为空
+            if old_inode_type == FileType::Dir {
+                let existing_children = &existing.0.lock().children;
+                // 如果 existing 就是 inode_to_move，那么只需要检查是否有其他子项
+                let existing_id = existing.0.lock().metadata.inode_id;
+                let to_move_id = inode_to_move.0.lock().metadata.inode_id;
+                drop(inode_to_move.0.lock());
 
+                if existing_id == to_move_id {
+                    // 同一个 inode，检查是否有其他子项（排除 "." 和 ".."）
+                    if existing_children.len() > 0 {
+                        return Err(SystemError::ENOTEMPTY);
+                    }
+                } else {
+                    // 不同的 inode，检查目标目录是否为空
+                    if existing_children.len() > 0 {
+                        return Err(SystemError::ENOTEMPTY);
+                    }
+                }
+            }
+            // 移除已存在的目标
+            target_inode.children.remove(&new_name);
+        }
+        drop(target_inode);
+
+        inode_to_move.0.lock().parent = Arc::downgrade(&target_locked);
+
+        // 对于文件，使用 link；对于目录，直接操作 children
+        if old_inode_type == FileType::Dir {
+            // 目录：直接添加到目标目录的 children
+            let mut target_inode = target_locked.0.lock();
+            target_inode
+                .children
+                .insert(new_name.clone(), inode_to_move.clone());
+            drop(target_inode);
+        } else {
+            // 文件：使用 link
+            target_locked.link(new_name.as_ref(), &(inode_to_move as Arc<dyn IndexNode>))?;
+        }
+
+        // 从原目录移除
         if let Err(e) = self.unlink(old_name) {
-            target.unlink(new_name.as_ref())?;
+            // 回滚：从目标目录移除
+            let mut target_inode = target_locked.0.lock();
+            target_inode.children.remove(&new_name);
             return Err(e);
         }
 

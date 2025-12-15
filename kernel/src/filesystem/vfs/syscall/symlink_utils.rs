@@ -4,7 +4,7 @@ use crate::{
     filesystem::vfs::{
         fcntl::AtFlags,
         utils::{rsplit_path, user_path_at},
-        FilePrivateData, FileType, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        FilePrivateData, FileType, NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::spinlock::SpinLock,
     process::ProcessManager,
@@ -28,6 +28,12 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     // 得到新创建节点的父节点
     let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newdfd, to)?;
     let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
+    
+    // 检查文件名长度
+    if new_name.len() > NAME_MAX {
+        return Err(SystemError::ENAMETOOLONG);
+    }
+    
     let new_parent = new_begin_inode
         .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     // info!("new_parent={:?}", new_parent.metadata());

@@ -43,7 +43,10 @@ pub use self::{file::FilePrivateData, mount::MountFS};
 use super::page_cache::PageCache;
 
 /// vfs容许的最大的路径名称长度
-pub const MAX_PATHLEN: usize = 1024;
+pub const MAX_PATHLEN: usize = 4096;
+
+/// 单个文件名的最大长度
+pub const NAME_MAX: usize = 255;
 
 // 定义inode号
 int_like!(InodeId, AtomicInodeId, usize, AtomicUsize);
@@ -1192,6 +1195,14 @@ pub trait FileSystem: Any + Sync + Send + Debug {
 
     /// @brief 获取当前文件系统的信息
     fn info(&self) -> FsInfo;
+
+    /// @brief 文件系统是否支持 readahead
+    /// 
+    /// 对于内存文件系统（如 tmpfs），数据已经在 page_cache 中，不需要 readahead
+    /// 对于磁盘文件系统（如 ext4、fat），需要从磁盘预读数据，应该支持 readahead
+    fn support_readahead(&self) -> bool {
+        true // 默认支持 readahead
+    }
 
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self

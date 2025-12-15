@@ -238,6 +238,10 @@ pub fn do_mkdir_at(
     if name == "." || name == ".." {
         return Err(SystemError::EEXIST);
     }
+    // 检查文件名长度
+    if name.len() > super::NAME_MAX {
+        return Err(SystemError::ENAMETOOLONG);
+    }
     if let Some(parent) = parent {
         current_inode =
             current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;

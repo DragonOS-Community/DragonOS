@@ -3,7 +3,7 @@ use crate::filesystem::vfs::utils::is_ancestor;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::SystemError;
-use crate::filesystem::vfs::MAX_PATHLEN;
+use crate::filesystem::vfs::{MAX_PATHLEN, NAME_MAX};
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::check_and_clone_cstr;
@@ -62,6 +62,11 @@ pub fn do_renameat2(
         None => new_inode_begin,
         Some(p) => new_inode_begin.lookup_follow_symlink(p, VFS_MAX_FOLLOW_SYMLINK_TIMES)?,
     };
+
+    // 检查单个文件名长度
+    if old_filename.len() > NAME_MAX || new_filename.len() > NAME_MAX {
+        return Err(SystemError::ENAMETOOLONG);
+    }
 
     let flags = RenameFlags::from_bits_truncate(flags);
     if flags.contains(RenameFlags::NOREPLACE) && (new_filename == "." || new_filename == "..") {

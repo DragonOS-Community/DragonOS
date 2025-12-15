@@ -72,6 +72,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      - name: Checkout DragonOS code
+        uses: actions/checkout@v4
+
       - name: Prepare directory
         run: |
           mkdir -p bin

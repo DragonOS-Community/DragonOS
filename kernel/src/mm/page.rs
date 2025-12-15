@@ -9,7 +9,7 @@ use core::{
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use hashbrown::{HashMap, HashSet};
 use log::{error, info};
 use lru::LruCache;
@@ -332,7 +332,6 @@ impl PageReclaimer {
         for page in victims {
             let mut guard = page.write_irqsave();
             if let PageType::File(info) = guard.page_type().clone() {
-                let page_cache = info.page_cache;
                 let page_index = info.index;
                 let paddr = guard.phys_address();
 
@@ -342,7 +341,12 @@ impl PageReclaimer {
                 }
 
                 // 删除页面：顺序为 page_cache -> page_manager，避免原有的 reclaimer 锁参与死锁
-                page_cache.lock_irqsave().remove_page(page_index);
+                //
+                // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
+                // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
+                if let Some(page_cache) = info.page_cache.upgrade() {
+                    page_cache.lock_irqsave().remove_page(page_index);
+                }
                 page_manager_lock_irqsave().remove_page(&paddr);
             }
         }
@@ -366,7 +370,13 @@ impl PageReclaimer {
         // log::debug!("page writeback: {:?}", guard.phys_addr);
 
         let (page_cache, page_index) = match guard.page_type() {
-            PageType::File(info) => (info.page_cache.clone(), info.index),
+            PageType::File(info) => match info.page_cache.upgrade() {
+                Some(page_cache) => (page_cache, info.index),
+                None => {
+                    log::warn!("try to writeback a file page but page_cache already dropped");
+                    return;
+                }
+            },
             _ => {
                 log::warn!("try to writeback a non-file page");
                 return;
@@ -584,7 +594,7 @@ impl InnerPage {
 
     pub fn page_cache(&self) -> Option<Arc<PageCache>> {
         match &self.page_type {
-            PageType::File(info) => Some(info.page_cache.clone()),
+            PageType::File(info) => info.page_cache.upgrade(),
             _ => None,
         }
     }
@@ -702,7 +712,8 @@ pub enum PageType {
 
 #[derive(Debug, Clone)]
 pub struct FileMapInfo {
-    pub page_cache: Arc<PageCache>,
+    /// 指向页缓存的弱引用，避免 PageCache -> Page -> PageCache 的强引用环导致页面无法释放。
+    pub page_cache: Weak<PageCache>,
     /// 在pagecache中的偏移
     pub index: usize,
 }

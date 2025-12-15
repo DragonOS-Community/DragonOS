@@ -16,7 +16,7 @@ use log::{debug, warn};
 use system_error::SystemError;
 
 use super::{
-    fs::{Cluster, FATFileSystem, MAX_FILE_SIZE},
+    fs::{Cluster, FATFileSystem, MAX_FILE_SIZE, ZERO_BUF_SIZE},
     utils::decode_u8_ascii,
 };
 
@@ -197,10 +197,13 @@ impl FATFile {
 
             // 计算本次写入位置在分区上的偏移量
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_bytes_offset;
-            // 写入磁盘
+            // 写入磁盘（防御性检查：若设备返回0字节写入视为IO错误）
             let w = fs
                 .gendisk
                 .write_at_bytes(&buf[start..start + end_len], offset as usize)?;
+            if w == 0 {
+                return Err(SystemError::EIO);
+            }
 
             // 更新偏移量数据
             write_ok += w;
@@ -323,15 +326,16 @@ impl FATFile {
         }
 
         // 限制每次写入的缓冲区大小，避免大文件扩展时分配过大内存
-        const ZERO_BUF_SIZE: usize = 512 * 1024; // 512KB
         let zeroes: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
         let mut offset = range_start;
         let mut remain = (range_end - range_start) as usize;
 
         while remain > 0 {
             let write_size = core::cmp::min(remain, ZERO_BUF_SIZE);
-            fs.gendisk
-                .write_at_bytes(&zeroes[..write_size], offset as usize)?;
+            let w = fs.gendisk.write_at_bytes(&zeroes[..write_size], offset as usize)?;
+            if w == 0 {
+                return Err(SystemError::EIO);
+            }
             offset += write_size as u64;
             remain -= write_size;
         }

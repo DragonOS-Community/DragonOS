@@ -51,6 +51,9 @@ const FAT_MAX_NAMELEN: u64 = 255;
 /// FAT32文件系统的最大的文件大小
 pub const MAX_FILE_SIZE: u64 = 0xffff_ffff;
 
+/// 每次清零写入时的缓冲区上限（避免分配过大内存）
+pub const ZERO_BUF_SIZE: usize = 512 * 1024; // 512KB
+
 /// @brief 表示当前簇和上一个簇的关系的结构体
 /// 定义这样一个结构体的原因是，FAT文件系统的文件中，前后两个簇具有关联关系。
 #[allow(dead_code)]
@@ -1776,7 +1779,6 @@ impl IndexNode for LockedFATInode {
                     }
                     Ordering::Greater => {
                         // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
-                        const ZERO_BUF_SIZE: usize = 512 * 1024; // 与 zero_range 保持一致的上限
                         let buf: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
 
                         let mut remain_size = len - old_size;

@@ -40,6 +40,89 @@ use super::vfs::{Magic, MountableFileSystem, SuperBlock};
 const TMPFS_MAX_NAMELEN: usize = 255;
 const TMPFS_BLOCK_SIZE: u64 = 4096;
 
+fn tmpfs_move_entry_between_dirs(
+    src_dir: &mut TmpfsInode,
+    dst_dir: &mut TmpfsInode,
+    old_key: &DName,
+    new_key: &DName,
+    flags: RenameFlags,
+) -> Result<(), SystemError> {
+    if src_dir.metadata.file_type != FileType::Dir || dst_dir.metadata.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+
+    let src_self = src_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
+    let dst_self = dst_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
+
+    let inode_to_move = src_dir.children.get(old_key).cloned().ok_or(SystemError::ENOENT)?;
+    let old_type = inode_to_move.0.lock().metadata.file_type;
+
+    if let Some(existing) = dst_dir.children.get(new_key) {
+        if flags.contains(RenameFlags::NOREPLACE) {
+            return Err(SystemError::EEXIST);
+        }
+
+        // Avoid self-deadlock: `existing` may be `src_dir`/`dst_dir` itself.
+        if Arc::ptr_eq(existing, &src_self) {
+            // Example: rename("dir/subdir", "dir") -> ENOTEMPTY (dir not empty).
+            // Linux expects ENOTEMPTY for this case (TargetIsAncestorOfSource).
+            return Err(SystemError::ENOTEMPTY);
+        }
+        if Arc::ptr_eq(existing, &dst_self) {
+            // Shouldn't happen in normal tmpfs (no self entry), but treat as busy.
+            return Err(SystemError::EBUSY);
+        }
+
+        let (existing_id, existing_type, existing_dir_nonempty) = {
+            let guard = existing.0.lock();
+            let t = guard.metadata.file_type;
+            let nonempty = t == FileType::Dir && !guard.children.is_empty();
+            (guard.metadata.inode_id, t, nonempty)
+        };
+
+        let to_move_id = inode_to_move.0.lock().metadata.inode_id;
+        if existing_id == to_move_id {
+            // Destination already points to the same inode. For files this is
+            // effectively removing the old entry.
+            src_dir.children.remove(old_key);
+            return Ok(());
+        }
+
+        if old_type != existing_type {
+            return Err(if old_type == FileType::Dir {
+                SystemError::ENOTDIR
+            } else {
+                SystemError::EISDIR
+            });
+        }
+
+        if old_type == FileType::Dir && existing_dir_nonempty {
+            return Err(SystemError::ENOTEMPTY);
+        }
+
+        // Remove existing destination entry (replacement).
+        dst_dir.children.remove(new_key);
+        if old_type == FileType::Dir {
+            dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_sub(1);
+        }
+    }
+
+    // Remove from source directory.
+    src_dir.children.remove(old_key);
+    if old_type == FileType::Dir {
+        src_dir.metadata.nlinks = src_dir.metadata.nlinks.saturating_sub(1);
+        dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_add(1);
+    }
+
+    // Insert into destination directory and update inode bookkeeping.
+    dst_dir.children.insert(new_key.clone(), inode_to_move.clone());
+    let mut moved = inode_to_move.0.lock();
+    moved.parent = Arc::downgrade(&dst_self);
+    moved.name = new_key.clone();
+
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct LockedTmpfsInode(pub SpinLock<TmpfsInode>);
 
@@ -691,118 +774,83 @@ impl IndexNode for LockedTmpfsInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        let inode_to_move = self
-            .find(old_name)?
-            .downcast_arc::<LockedTmpfsInode>()
-            .ok_or(SystemError::EINVAL)?;
+        // tmpfs rename should move a directory entry (dentry move), not create
+        // a hardlink+unlink pair. The latter breaks directory moves (unlink()
+        // rejects directories) and can also lead to incorrect link/size accounting.
 
-        let new_name = DName::from(new_name);
-        let old_inode_type = inode_to_move.0.lock().metadata.file_type;
-        drop(inode_to_move.0.lock());
+        let old_key = DName::from(old_name);
+        let new_key = DName::from(new_name);
 
-        inode_to_move.0.lock().name = new_name.clone();
-
-        let target_id = target.metadata()?.inode_id;
-
-        let mut self_inode = self.0.lock();
-        if target_id == self_inode.metadata.inode_id {
-            // 同目录重命名
-            if let Some(existing) = self_inode.children.get(&new_name) {
-                if flags.contains(RenameFlags::NOREPLACE) {
-                    return Err(SystemError::EEXIST);
-                }
-                // 检查类型匹配
-                let existing_type = existing.0.lock().metadata.file_type;
-                if old_inode_type != existing_type {
-                    if old_inode_type == FileType::Dir {
-                        return Err(SystemError::ENOTDIR);
-                    } else {
-                        return Err(SystemError::EISDIR);
-                    }
-                }
-                // 如果都是目录，检查目标目录是否为空（排除 "." 和 ".."）
-                if old_inode_type == FileType::Dir {
-                    let existing_children = &existing.0.lock().children;
-                    if existing_children.len() > 0 {
-                        return Err(SystemError::ENOTEMPTY);
-                    }
-                }
-                // 移除已存在的目标
-                self_inode.children.remove(&new_name);
-            }
-            self_inode.children.remove(&DName::from(old_name));
-            self_inode.children.insert(new_name, inode_to_move);
-            return Ok(());
-        }
-        drop(self_inode);
-
-        // 跨目录移动
+        // Target must be a directory in tmpfs.
         let target_locked = target
             .clone()
             .downcast_arc::<LockedTmpfsInode>()
             .ok_or(SystemError::EINVAL)?;
 
-        // 检查目标是否已存在
-        let mut target_inode = target_locked.0.lock();
-        if let Some(existing) = target_inode.children.get(&new_name) {
-            // 检查类型匹配
-            let existing_type = existing.0.lock().metadata.file_type;
-            if old_inode_type != existing_type {
-                if old_inode_type == FileType::Dir {
-                    return Err(SystemError::ENOTDIR);
-                } else {
-                    return Err(SystemError::EISDIR);
+        // Fast path: renaming to itself.
+        if Arc::ptr_eq(&(self.0.lock().self_ref.upgrade().unwrap()), &target_locked)
+            && old_key == new_key
+        {
+            return Ok(());
+        }
+
+        // Lock ordering: lock by inode_id to avoid deadlocks.
+        let self_id = self.0.lock().metadata.inode_id;
+        let target_id = target_locked.0.lock().metadata.inode_id;
+
+        if self_id == target_id {
+            // Same directory rename.
+            let mut dir = self.0.lock();
+            let inode_to_move = dir.children.get(&old_key).cloned().ok_or(SystemError::ENOENT)?;
+            let old_type = inode_to_move.0.lock().metadata.file_type;
+
+            if let Some(existing) = dir.children.get(&new_key) {
+                if flags.contains(RenameFlags::NOREPLACE) {
+                    return Err(SystemError::EEXIST);
                 }
-            }
-            // 如果都是目录，检查目标目录是否为空
-            if old_inode_type == FileType::Dir {
-                let existing_children = &existing.0.lock().children;
-                // 如果 existing 就是 inode_to_move，那么只需要检查是否有其他子项
+
+                // If destination already refers to the same inode, it's a no-op.
                 let existing_id = existing.0.lock().metadata.inode_id;
                 let to_move_id = inode_to_move.0.lock().metadata.inode_id;
-                drop(inode_to_move.0.lock());
-
                 if existing_id == to_move_id {
-                    // 同一个 inode，检查是否有其他子项（排除 "." 和 ".."）
-                    if existing_children.len() > 0 {
-                        return Err(SystemError::ENOTEMPTY);
-                    }
-                } else {
-                    // 不同的 inode，检查目标目录是否为空
-                    if existing_children.len() > 0 {
-                        return Err(SystemError::ENOTEMPTY);
-                    }
+                    return Ok(());
                 }
+
+                let existing_type = existing.0.lock().metadata.file_type;
+                if old_type != existing_type {
+                    return Err(if old_type == FileType::Dir {
+                        SystemError::ENOTDIR
+                    } else {
+                        SystemError::EISDIR
+                    });
+                }
+
+                if old_type == FileType::Dir && !existing.0.lock().children.is_empty() {
+                    return Err(SystemError::ENOTEMPTY);
+                }
+
+                // Remove existing destination entry (replacement).
+                dir.children.remove(&new_key);
             }
-            // 移除已存在的目标
-            target_inode.children.remove(&new_name);
+
+            // Move entry within the same directory.
+            dir.children.remove(&old_key);
+            dir.children.insert(new_key.clone(), inode_to_move.clone());
+            inode_to_move.0.lock().name = new_key;
+            return Ok(());
         }
-        drop(target_inode);
 
-        inode_to_move.0.lock().parent = Arc::downgrade(&target_locked);
-
-        // 对于文件，使用 link；对于目录，直接操作 children
-        if old_inode_type == FileType::Dir {
-            // 目录：直接添加到目标目录的 children
-            let mut target_inode = target_locked.0.lock();
-            target_inode
-                .children
-                .insert(new_name.clone(), inode_to_move.clone());
-            drop(target_inode);
+        // Cross-directory move.
+        // Lock both directories in a stable order.
+        if self_id < target_id {
+            let mut src_dir = self.0.lock();
+            let mut dst_dir = target_locked.0.lock();
+            return tmpfs_move_entry_between_dirs(&mut src_dir, &mut dst_dir, &old_key, &new_key, flags);
         } else {
-            // 文件：使用 link
-            target_locked.link(new_name.as_ref(), &(inode_to_move as Arc<dyn IndexNode>))?;
+            let mut dst_dir = target_locked.0.lock();
+            let mut src_dir = self.0.lock();
+            return tmpfs_move_entry_between_dirs(&mut src_dir, &mut dst_dir, &old_key, &new_key, flags);
         }
-
-        // 从原目录移除
-        if let Err(e) = self.unlink(old_name) {
-            // 回滚：从目标目录移除
-            let mut target_inode = target_locked.0.lock();
-            target_inode.children.remove(&new_name);
-            return Err(e);
-        }
-
-        Ok(())
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

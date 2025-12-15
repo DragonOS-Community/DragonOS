@@ -812,7 +812,21 @@ impl IndexNode for MountFSInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        return self.inner_inode.move_to(old_name, target, new_name, flags);
+        // Filesystem implementations generally expect `target` to be an inode
+        // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
+        // mount wrapping is enabled, `target` is often a `MountFSInode`, which
+        // would make FS-level downcasts fail and incorrectly return EINVAL.
+        //
+        // So we unwrap the mount wrapper before delegating.
+        let target_inner: Arc<dyn IndexNode> = target
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt| mnt.inner_inode.clone())
+            .unwrap_or_else(|| target.clone());
+
+        return self
+            .inner_inode
+            .move_to(old_name, &target_inner, new_name, flags);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

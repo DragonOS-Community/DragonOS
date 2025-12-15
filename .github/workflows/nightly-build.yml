@@ -14,25 +14,29 @@ jobs:
     name: Build DragonOS and Publish Artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    container:
+      image: dragonos/dragonos-dev:v1.19
+      options: --privileged -v /dev:/dev
+    services:
+      docker:
+        image: docker:dind
+        options: --privileged
     steps:
       - name: Checkout DragonOS code
         uses: actions/checkout@v4
 
-      - name: Build DragonOS in container
+      - name: Change source
         run: |
-          docker run --rm --privileged \
-            -v /dev:/dev \
-            -v ${{ github.workspace }}:/workspace \
-            -w /workspace \
-            -e ARCH=x86_64 \
-            dragonos/dragonos-dev:v1.19 \
-            bash -c "
-            find . -type f \( -name '*.toml' -o -name 'Makefile' \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} + &&
-            make clean &&
-            SKIP_GRUB=1 make build
-            "
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+
+      - name: Build DragonOS
+        shell: bash -ileo pipefail {0}
+        run: |
+          make clean
+          SKIP_GRUB=1 make build
 
       - name: Verify build artifacts
+        shell: bash -ileo pipefail {0}
         run: |
           if [ ! -f "bin/kernel/kernel.elf" ]; then
             echo "错误: bin/kernel/kernel.elf 不存在"
@@ -50,6 +54,7 @@ jobs:
 
       - name: Generate image tag
         id: image-tag
+        shell: bash -ileo pipefail {0}
         run: |
           DATE_TAG=$(date +%Y%m%d)
           COMMIT_SHORT=$(git rev-parse --short HEAD)

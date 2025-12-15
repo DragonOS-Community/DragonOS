@@ -1,6 +1,6 @@
 use core::{
     cmp::min,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -31,6 +31,7 @@ pub struct PageCache {
     id: usize,
     inner: SpinLock<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
+    unevictable: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -82,6 +83,18 @@ impl InnerPageCache {
             let buf_offset = i * MMArch::PAGE_SIZE;
             let page_index = start_page_index + i;
 
+            let page_flags = {
+                let cache = self
+                    .page_cache_ref
+                    .upgrade()
+                    .expect("failed to get self_arc of pagecache");
+                if cache.unevictable.load(Ordering::Relaxed) {
+                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
+                } else {
+                    PageFlags::PG_LRU
+                }
+            };
+
             let page = page_manager_guard.create_one_page(
                 PageType::File(FileMapInfo {
                     page_cache: self
@@ -90,7 +103,7 @@ impl InnerPageCache {
                         .expect("failed to get self_arc of pagecache"),
                     index: page_index,
                 }),
-                PageFlags::PG_LRU,
+                page_flags,
                 &mut LockedFrameAllocator,
             )?;
 
@@ -404,6 +417,7 @@ impl PageCache {
                 }
                 v
             },
+            unevictable: AtomicBool::new(false),
         })
     }
 
@@ -435,6 +449,12 @@ impl PageCache {
 
     pub fn is_locked(&self) -> bool {
         self.inner.is_locked()
+    }
+
+    /// Mark this page cache as unevictable (or revert). When enabled, newly created
+    /// pages will carry PG_UNEVICTABLE to keep the reclaimer from reclaiming them.
+    pub fn set_unevictable(&self, unevictable: bool) {
+        self.unevictable.store(unevictable, Ordering::Relaxed);
     }
 
     /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁

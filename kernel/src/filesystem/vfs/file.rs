@@ -8,6 +8,7 @@ use log::error;
 use system_error::SystemError;
 
 use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
     arch::MMArch,
     driver::{
@@ -37,7 +38,6 @@ use crate::{
         ProcessControlBlock, ProcessManager, RawPid,
     },
 };
-use crate::{filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
@@ -993,8 +993,30 @@ impl File {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     pub fn ftruncate(&self, len: usize) -> Result<(), SystemError> {
-        // 如果文件不可写，返回错误
-        self.writeable()?;
+        // 类型必须是普通文件，否则 EINVAL
+        let md = self.inode.metadata()?;
+        if md.file_type != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
+
+        // O_PATH 直接返回 EBADF，保持与 open 时的行为一致
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 非可写打开返回 EINVAL（对齐 gVisor 预期）
+        if !mode.contains(FileMode::FMODE_WRITE) || !mode.can_write() {
+            return Err(SystemError::EINVAL);
+        }
+
+        // RLIMIT_FSIZE 检查
+        let current_pcb = ProcessManager::current_pcb();
+        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+        if fsize_limit.rlim_cur != u64::MAX && len as u64 > fsize_limit.rlim_cur {
+            let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+            return Err(SystemError::EFBIG);
+        }
 
         // 统一通过 VFS 封装，复用类型/只读检查
         crate::filesystem::vfs::vcore::vfs_truncate(self.inode(), len)?;

@@ -1197,7 +1197,7 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn info(&self) -> FsInfo;
 
     /// @brief 文件系统是否支持 readahead
-    /// 
+    ///
     /// 对于内存文件系统（如 tmpfs），数据已经在 page_cache 中，不需要 readahead
     /// 对于磁盘文件系统（如 ext4、fat），需要从磁盘预读数据，应该支持 readahead
     fn support_readahead(&self) -> bool {

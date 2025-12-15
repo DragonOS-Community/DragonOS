@@ -33,6 +33,7 @@ preadv_test
 pwrite64_test
 pwritev2_test
 utimes_test
+truncate_test
 fadvise_test
 open_test
 
@@ -78,3 +79,4 @@ pipe_test
 fifo_test
 unshare_test
 pty_root_test
+time_test

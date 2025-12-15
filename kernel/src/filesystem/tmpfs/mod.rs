@@ -7,6 +7,7 @@ use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
 use crate::mm::fault::PageFaultHandler;
+use crate::mm::page::Page;
 use crate::register_mountable_fs;
 use crate::{
     arch::MMArch,
@@ -18,7 +19,6 @@ use crate::{
     mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
-use crate::mm::page::Page;
 
 use alloc::string::ToString;
 use alloc::{
@@ -55,7 +55,11 @@ fn tmpfs_move_entry_between_dirs(
     let src_self = src_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
     let dst_self = dst_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
 
-    let inode_to_move = src_dir.children.get(old_key).cloned().ok_or(SystemError::ENOENT)?;
+    let inode_to_move = src_dir
+        .children
+        .get(old_key)
+        .cloned()
+        .ok_or(SystemError::ENOENT)?;
     let old_type = inode_to_move.0.lock().metadata.file_type;
 
     if let Some(existing) = dst_dir.children.get(new_key) {
@@ -116,7 +120,9 @@ fn tmpfs_move_entry_between_dirs(
     }
 
     // Insert into destination directory and update inode bookkeeping.
-    dst_dir.children.insert(new_key.clone(), inode_to_move.clone());
+    dst_dir
+        .children
+        .insert(new_key.clone(), inode_to_move.clone());
     let mut moved = inode_to_move.0.lock();
     moved.parent = Arc::downgrade(&dst_self);
     moved.name = new_key.clone();
@@ -222,7 +228,10 @@ impl FileSystemMakerData for TmpfsMountData {
 }
 
 impl FileSystem for Tmpfs {
-    unsafe fn fault(&self, pfm: &mut crate::mm::fault::PageFaultMessage) -> crate::mm::VmFaultReason {
+    unsafe fn fault(
+        &self,
+        pfm: &mut crate::mm::fault::PageFaultMessage,
+    ) -> crate::mm::VmFaultReason {
         // tmpfs 是纯 page-cache 后端，不应走 pread/磁盘路径。
         PageFaultHandler::pagecache_fault_zero(pfm)
     }
@@ -787,7 +796,7 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         // 检查目录是否为空（排除 "." 和 ".."）
-        if deleted_inode.children.len() > 0 {
+        if !deleted_inode.children.is_empty() {
             return Err(SystemError::ENOTEMPTY);
         }
 
@@ -844,7 +853,11 @@ impl IndexNode for LockedTmpfsInode {
         if self_id == target_id {
             // Same directory rename.
             let mut dir = self.0.lock();
-            let inode_to_move = dir.children.get(&old_key).cloned().ok_or(SystemError::ENOENT)?;
+            let inode_to_move = dir
+                .children
+                .get(&old_key)
+                .cloned()
+                .ok_or(SystemError::ENOENT)?;
             let old_type = inode_to_move.0.lock().metadata.file_type;
 
             if let Some(existing) = dir.children.get(&new_key) {
@@ -888,11 +901,23 @@ impl IndexNode for LockedTmpfsInode {
         if self_id < target_id {
             let mut src_dir = self.0.lock();
             let mut dst_dir = target_locked.0.lock();
-            return tmpfs_move_entry_between_dirs(&mut src_dir, &mut dst_dir, &old_key, &new_key, flags);
+            return tmpfs_move_entry_between_dirs(
+                &mut src_dir,
+                &mut dst_dir,
+                &old_key,
+                &new_key,
+                flags,
+            );
         } else {
             let mut dst_dir = target_locked.0.lock();
             let mut src_dir = self.0.lock();
-            return tmpfs_move_entry_between_dirs(&mut src_dir, &mut dst_dir, &old_key, &new_key, flags);
+            return tmpfs_move_entry_between_dirs(
+                &mut src_dir,
+                &mut dst_dir,
+                &old_key,
+                &new_key,
+                flags,
+            );
         }
     }
 

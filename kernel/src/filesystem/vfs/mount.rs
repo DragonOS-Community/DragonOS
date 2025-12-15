@@ -1048,7 +1048,6 @@ impl IndexNode for MountFSInode {
 }
 
 impl FileSystem for MountFS {
-
     fn support_readahead(&self) -> bool {
         self.inner_filesystem.support_readahead()
     }

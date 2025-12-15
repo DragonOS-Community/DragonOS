@@ -30,7 +30,9 @@ impl ProcFSInode {
         // 以进程 fs root 为基准做 chroot 视图裁剪/重写
         let pcb = ProcessManager::current_pcb();
         let root_inode = pcb.fs_struct().root();
-        let root_prefix = root_inode.absolute_path().unwrap_or_else(|_| "/".to_string());
+        let root_prefix = root_inode
+            .absolute_path()
+            .unwrap_or_else(|_| "/".to_string());
         let is_chrooted = root_prefix != "/";
         let root_prefix_with_slash = if root_prefix.ends_with('/') {
             root_prefix.clone()
@@ -74,7 +76,11 @@ impl ProcFSInode {
                 } else if mountpoint.starts_with(&root_prefix_with_slash) {
                     // strip_prefix 会得到 "child/.."；保持以 '/' 开头
                     let stripped = &mountpoint[root_prefix.len()..];
-                    mountpoint = if stripped.is_empty() { "/".to_string() } else { stripped.to_string() };
+                    mountpoint = if stripped.is_empty() {
+                        "/".to_string()
+                    } else {
+                        stripped.to_string()
+                    };
                 } else {
                     continue;
                 }

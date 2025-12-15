@@ -12,7 +12,9 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CHROOT;
 use crate::filesystem::vfs::permission::PermissionMask;
-use crate::filesystem::vfs::{utils::user_path_at, FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
+use crate::filesystem::vfs::{
+    utils::user_path_at, FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+};
 use crate::process::cred::CAPFlags;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -48,8 +50,13 @@ impl Syscall for SysChrootHandle {
         }
 
         // 解析路径（相对路径基于 cwd inode，绝对路径基于进程 fs root）
-        let (inode_begin, resolved_path) = user_path_at(&pcb, crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(), path)?;
-        let target = inode_begin.lookup_follow_symlink(&resolved_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let (inode_begin, resolved_path) = user_path_at(
+            &pcb,
+            crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
+            path,
+        )?;
+        let target =
+            inode_begin.lookup_follow_symlink(&resolved_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
         let meta = target.metadata()?;
         if meta.file_type != FileType::Dir {
@@ -79,5 +86,3 @@ impl SysChrootHandle {
 }
 
 syscall_table_macros::declare_syscall!(SYS_CHROOT, SysChrootHandle);
-
-

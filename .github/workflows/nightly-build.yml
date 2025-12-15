@@ -8,7 +8,6 @@ on:
 
 env:
   ARCH: x86_64
-  HOME: /root
 
 jobs:
   build-and-publish:

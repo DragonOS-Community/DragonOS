@@ -731,6 +731,62 @@ impl PageFaultHandler {
         ret
     }
 
+    /// 纯 page-cache 后端的缺页处理（不走 pread/磁盘 IO）。
+    ///
+    /// 适用场景：tmpfs/ramfs 等内存文件系统，它们以 page_cache 作为唯一数据后端。
+    ///
+    /// 行为：
+    /// - 若 inode 没有 page_cache，则返回 SIGBUS
+    /// - 若缺页落在文件末尾之后（以页粒度判断），返回 SIGBUS
+    /// - 若页已存在，直接使用该页
+    /// - 若页不存在，则创建一个零页并插入 page_cache
+    pub unsafe fn pagecache_fault_zero(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let vma = pfm.vma();
+        let vma_guard = vma.lock_irqsave();
+        let file = vma_guard.vm_file().expect("no vm_file in vma");
+        drop(vma_guard);
+
+        let inode = file.inode();
+        let page_cache = match inode.page_cache() {
+            Some(cache) => cache,
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+
+        let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
+
+        // 以“页起始是否越过 EOF”判断 SIGBUS。
+        // 特别地：size==0 时，任何访问都应 SIGBUS（符合 mmap 语义，且满足 gvisor death tests）。
+        if let Ok(md) = inode.metadata() {
+            let size = md.size.max(0) as usize;
+            if file_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
+        }
+
+        // 先尝试直接获取
+        if let Some(page) = page_cache.lock_irqsave().get_page(file_pgoff) {
+            // 标记为 UPTODATE，便于 map_pages / readahead（即便对 tmpfs 通常不会走）。
+            page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
+            pfm.page = Some(page);
+            return VmFaultReason::empty();
+        }
+
+        {
+            let mut pc = page_cache.lock_irqsave();
+            // 可能并发创建：create 后再 get（忽略已存在/并发导致的轻微差异）
+            pc.create_zero_pages(file_pgoff, 1).map_err(|_| ()).ok();
+        }
+
+        let page = page_cache.lock_irqsave().get_page(file_pgoff);
+        if let Some(page) = page {
+            page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
+            pfm.page = Some(page);
+            VmFaultReason::empty()
+        } else {
+            VmFaultReason::VM_FAULT_SIGBUS
+        }
+    }
+
     /// 将文件页映射到缺页地址
     /// ## 参数
     ///

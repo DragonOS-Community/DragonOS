@@ -121,6 +121,62 @@ impl InnerPageCache {
         Ok(())
     }
 
+    /// 创建若干个“零页”并加入 PageCache。
+    ///
+    /// 与 `create_pages()` 的区别：
+    /// - 不需要临时分配 `Vec<u8>` 作为填充缓冲区；
+    /// - 直接分配物理页后在页内 `fill(0)`；
+    ///
+    /// 适用场景：tmpfs 等内存文件系统的“空洞读/缺页补零”。
+    pub fn create_zero_pages(
+        &mut self,
+        start_page_index: usize,
+        page_num: usize,
+    ) -> Result<(), SystemError> {
+        if page_num == 0 {
+            return Ok(());
+        }
+
+        let mut page_manager_guard = page_manager_lock_irqsave();
+
+        for i in 0..page_num {
+            let page_index = start_page_index + i;
+
+            let page_flags = {
+                let cache = self
+                    .page_cache_ref
+                    .upgrade()
+                    .expect("failed to get self_arc of pagecache");
+                if cache.unevictable.load(Ordering::Relaxed) {
+                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
+                } else {
+                    PageFlags::PG_LRU
+                }
+            };
+
+            let page = page_manager_guard.create_one_page(
+                PageType::File(FileMapInfo {
+                    page_cache: self
+                        .page_cache_ref
+                        .upgrade()
+                        .expect("failed to get self_arc of pagecache"),
+                    index: page_index,
+                }),
+                page_flags,
+                &mut LockedFrameAllocator,
+            )?;
+
+            let mut page_guard = page.write_irqsave();
+            unsafe {
+                page_guard.as_slice_mut().fill(0);
+            }
+
+            self.add_page(page_index, &page);
+        }
+
+        Ok(())
+    }
+
     /// 从PageCache中读取数据。
     ///
     /// ## 参数

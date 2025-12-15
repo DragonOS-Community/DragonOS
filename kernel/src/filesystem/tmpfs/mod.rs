@@ -18,6 +18,7 @@ use crate::{
     mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
+use crate::mm::page::Page;
 
 use alloc::string::ToString;
 use alloc::{
@@ -221,6 +222,11 @@ impl FileSystemMakerData for TmpfsMountData {
 }
 
 impl FileSystem for Tmpfs {
+    unsafe fn fault(&self, pfm: &mut crate::mm::fault::PageFaultMessage) -> crate::mm::VmFaultReason {
+        // tmpfs 是纯 page-cache 后端，不应走 pread/磁盘路径。
+        PageFaultHandler::pagecache_fault_zero(pfm)
+    }
+
     unsafe fn map_pages(
         &self,
         pfm: &mut crate::mm::fault::PageFaultMessage,
@@ -412,48 +418,69 @@ impl IndexNode for LockedTmpfsInode {
             return Ok(0);
         }
 
-        // 对于 tmpfs，直接操作 page_cache 内部
-        let mut page_cache_guard = page_cache.lock_irqsave();
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let end_page_index = (offset + read_len - 1) >> MMArch::PAGE_SHIFT;
+        // 两阶段读取：
+        // 1) 持有 page_cache 锁：只做“取页/建页 + 收集引用”，绝不触碰用户缓冲区
+        // 2) 释放 page_cache 锁：再把页内容拷贝到用户缓冲区（并做 prefault）
+        struct ReadItem {
+            page: Arc<Page>,
+            page_offset: usize,
+            sub_len: usize,
+        }
 
-        let mut buf_offset = 0;
-        for page_index in start_page_index..=end_page_index {
-            let page_start = page_index * MMArch::PAGE_SIZE;
-            let page_end = page_start + MMArch::PAGE_SIZE;
+        let mut items: Vec<ReadItem> = Vec::new();
+        {
+            let mut page_cache_guard = page_cache.lock_irqsave();
+            for page_index in start_page_index..=end_page_index {
+                let page_start = page_index * MMArch::PAGE_SIZE;
+                let page_end = page_start + MMArch::PAGE_SIZE;
 
-            // 计算当前页的读取范围
-            let read_start = core::cmp::max(offset, page_start);
-            let read_end = core::cmp::min(offset + read_len, page_end);
-            let page_read_len = read_end - read_start;
+                let read_start = core::cmp::max(offset, page_start);
+                let read_end = core::cmp::min(offset + read_len, page_end);
+                let page_read_len = read_end.saturating_sub(read_start);
+                if page_read_len == 0 {
+                    continue;
+                }
 
-            if page_read_len == 0 {
-                break;
+                // tmpfs: 缺页即创建零页
+                let page = if let Some(page) = page_cache_guard.get_page(page_index) {
+                    page
+                } else {
+                    page_cache_guard.create_zero_pages(page_index, 1)?;
+                    page_cache_guard
+                        .get_page(page_index)
+                        .ok_or(SystemError::EIO)?
+                };
+
+                items.push(ReadItem {
+                    page,
+                    page_offset: read_start - page_start,
+                    sub_len: page_read_len,
+                });
+            }
+        }
+
+        let mut dst_off = 0usize;
+        for it in items {
+            if it.sub_len == 0 {
+                continue;
             }
 
-            // 获取或创建页面
-            let page = if let Some(page) = page_cache_guard.get_page(page_index) {
-                page
-            } else {
-                // 页面不存在，创建零填充的页面
-                let zero_buf = vec![0u8; crate::arch::MMArch::PAGE_SIZE];
-                page_cache_guard.create_pages(page_index, &zero_buf)?;
-                page_cache_guard
-                    .get_page(page_index)
-                    .ok_or(SystemError::EIO)?
-            };
+            // prefault：避免在任何锁持有期间缺页（SelfRead 的关键）
+            let v = volatile_read!(buf[dst_off]);
+            volatile_write!(buf[dst_off], v);
+            let v = volatile_read!(buf[dst_off + it.sub_len - 1]);
+            volatile_write!(buf[dst_off + it.sub_len - 1], v);
 
-            // 从页面读取数据
-            let page_guard = page.read_irqsave();
-            let page_offset = read_start - page_start;
+            let page_guard = it.page.read_irqsave();
             unsafe {
-                buf[buf_offset..buf_offset + page_read_len].copy_from_slice(
-                    &page_guard.as_slice()[page_offset..page_offset + page_read_len],
+                buf[dst_off..dst_off + it.sub_len].copy_from_slice(
+                    &page_guard.as_slice()[it.page_offset..it.page_offset + it.sub_len],
                 );
             }
-            buf_offset += page_read_len;
+            dst_off += it.sub_len;
         }
-        drop(page_cache_guard);
 
         Ok(read_len)
     }
@@ -491,48 +518,64 @@ impl IndexNode for LockedTmpfsInode {
 
         drop(inode);
 
-        // 对于 tmpfs，直接操作 page_cache 内部
-        let mut page_cache_guard = page_cache.lock_irqsave();
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let end_page_index = (offset + len - 1) >> MMArch::PAGE_SHIFT;
+        // 两阶段写入：同样避免在持有 page_cache 锁时触碰用户缓冲区（SelfRead）。
+        struct WriteItem {
+            page: Arc<Page>,
+            page_offset: usize,
+            sub_len: usize,
+        }
 
-        let mut buf_offset = 0;
-        for page_index in start_page_index..=end_page_index {
-            let page_start = page_index * MMArch::PAGE_SIZE;
-            let page_end = page_start + MMArch::PAGE_SIZE;
+        let mut items: Vec<WriteItem> = Vec::new();
+        {
+            let mut page_cache_guard = page_cache.lock_irqsave();
+            for page_index in start_page_index..=end_page_index {
+                let page_start = page_index * MMArch::PAGE_SIZE;
+                let page_end = page_start + MMArch::PAGE_SIZE;
 
-            // 计算当前页的写入范围
-            let write_start = core::cmp::max(offset, page_start);
-            let write_end = core::cmp::min(offset + len, page_end);
-            let page_write_len = write_end - write_start;
+                let write_start = core::cmp::max(offset, page_start);
+                let write_end = core::cmp::min(offset + len, page_end);
+                let page_write_len = write_end.saturating_sub(write_start);
+                if page_write_len == 0 {
+                    continue;
+                }
 
-            if page_write_len == 0 {
-                break;
+                let page = if let Some(page) = page_cache_guard.get_page(page_index) {
+                    page
+                } else {
+                    page_cache_guard.create_zero_pages(page_index, 1)?;
+                    page_cache_guard
+                        .get_page(page_index)
+                        .ok_or(SystemError::EIO)?
+                };
+
+                items.push(WriteItem {
+                    page,
+                    page_offset: write_start - page_start,
+                    sub_len: page_write_len,
+                });
+            }
+        }
+
+        let mut src_off = 0usize;
+        for it in items {
+            if it.sub_len == 0 {
+                continue;
             }
 
-            // 获取或创建页面
-            let page = if let Some(page) = page_cache_guard.get_page(page_index) {
-                page
-            } else {
-                // 页面不存在，创建零填充的页面
-                let zero_buf = vec![0u8; crate::arch::MMArch::PAGE_SIZE];
-                page_cache_guard.create_pages(page_index, &zero_buf)?;
-                page_cache_guard
-                    .get_page(page_index)
-                    .ok_or(SystemError::EIO)?
-            };
+            // prefault 用户缓冲区，避免后续在持页锁时缺页
+            volatile_read!(buf[src_off]);
+            volatile_read!(buf[src_off + it.sub_len - 1]);
 
-            // 写入数据到页面
-            let mut page_guard = page.write_irqsave();
-            let page_offset = write_start - page_start;
+            let mut page_guard = it.page.write_irqsave();
             unsafe {
-                page_guard.as_slice_mut()[page_offset..page_offset + page_write_len]
-                    .copy_from_slice(&buf[buf_offset..buf_offset + page_write_len]);
+                page_guard.as_slice_mut()[it.page_offset..it.page_offset + it.sub_len]
+                    .copy_from_slice(&buf[src_off..src_off + it.sub_len]);
             }
             page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
-            buf_offset += page_write_len;
+            src_off += it.sub_len;
         }
-        drop(page_cache_guard);
 
         // 更新文件大小
         let mut inode = self.0.lock();

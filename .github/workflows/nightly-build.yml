@@ -8,7 +8,6 @@ on:
 
 env:
   ARCH: x86_64
-  HOME: /root
   RUSTUP_DIST_SERVER: "https://rsproxy.cn"
   RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
 
@@ -17,6 +16,8 @@ jobs:
     name: Build DragonOS
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      HOME: /root
     container:
       image: dragonos/dragonos-dev:v1.19
       options: --privileged -v /dev:/dev

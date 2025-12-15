@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{open::do_utimensat, syscall::UtimensFlags, MAX_PATHLEN},
-    syscall::user_access::{check_and_clone_cstr, UserBufferReader},
+    syscall::user_access::{vfs_check_and_clone_cstr, UserBufferReader},
     time::PosixTimeSpec,
 };
 
@@ -15,7 +15,7 @@ pub fn do_sys_utimensat(
     let pathname = if pathname.is_null() {
         None
     } else {
-        let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
+        let pathname = vfs_check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         Some(pathname)

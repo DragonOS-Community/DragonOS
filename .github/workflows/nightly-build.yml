@@ -13,17 +13,13 @@ env:
   RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
 
 jobs:
-  build-and-publish:
-    name: Build DragonOS and Publish Artifacts
+  build:
+    name: Build DragonOS
     runs-on: ubuntu-latest
     timeout-minutes: 120
     container:
       image: dragonos/dragonos-dev:v1.19
       options: --privileged -v /dev:/dev
-    services:
-      docker:
-        image: docker:dind
-        options: --privileged
     steps:
       - name: Checkout DragonOS code
         uses: actions/checkout@v4
@@ -52,12 +48,41 @@ jobs:
           echo "构建产物验证成功"
           ls -lh bin/kernel/kernel.elf bin/disk-image-x86_64.img
 
+      - name: Compress build artifacts
+        shell: bash -ileo pipefail {0}
+        run: |
+          cd bin
+          tar -czf dragonos-artifacts.tar.gz kernel/kernel.elf disk-image-x86_64.img
+          ls -lh dragonos-artifacts.tar.gz
+          echo "压缩完成，压缩包大小:"
+          du -h dragonos-artifacts.tar.gz
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: bin/dragonos-artifacts.tar.gz
+          retention-days: 1
+
+  publish:
+    name: Publish Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout DragonOS code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: bin/
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
       - name: Generate image tag
         id: image-tag
-        shell: bash -ileo pipefail {0}
         run: |
           DATE_TAG=$(date +%Y%m%d)
           COMMIT_SHORT=$(git rev-parse --short HEAD)

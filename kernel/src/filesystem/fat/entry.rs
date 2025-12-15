@@ -332,7 +332,9 @@ impl FATFile {
 
         while remain > 0 {
             let write_size = core::cmp::min(remain, ZERO_BUF_SIZE);
-            let w = fs.gendisk.write_at_bytes(&zeroes[..write_size], offset as usize)?;
+            let w = fs
+                .gendisk
+                .write_at_bytes(&zeroes[..write_size], offset as usize)?;
             if w == 0 {
                 return Err(SystemError::EIO);
             }

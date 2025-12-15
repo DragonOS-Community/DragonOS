@@ -3,13 +3,12 @@
 
 FROM scratch
 
-# 复制构建产物到镜像中
-COPY bin/kernel/kernel.elf /artifacts/kernel.elf
-COPY bin/disk-image-x86_64.img /artifacts/disk-image-x86_64.img
+# 复制压缩的构建产物到镜像中
+COPY bin/dragonos-artifacts.tar.gz /artifacts/dragonos-artifacts.tar.gz
 
 # 添加元数据标签
 LABEL org.opencontainers.image.title="DragonOS Build Artifacts"
-LABEL org.opencontainers.image.description="DragonOS nightly build artifacts: kernel.elf and disk-image-x86_64.img"
+LABEL org.opencontainers.image.description="DragonOS nightly build artifacts: compressed archive containing kernel.elf and disk-image-x86_64.img"
 LABEL org.opencontainers.image.source="https://github.com/DragonOS-Community/DragonOS"
 
 # 设置工作目录（虽然 scratch 镜像没有 shell，但保留这个信息用于文档）

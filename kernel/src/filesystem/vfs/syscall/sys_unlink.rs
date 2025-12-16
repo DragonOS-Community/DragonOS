@@ -6,7 +6,7 @@ use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::vcore::do_unlink_at;
 use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -21,7 +21,7 @@ impl Syscall for SysUnlinkHandle {
     /// Handles the unlink syscall.
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let path = Self::path(args);
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);

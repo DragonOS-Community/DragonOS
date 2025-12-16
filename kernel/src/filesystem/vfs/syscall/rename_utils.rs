@@ -6,7 +6,7 @@ use crate::filesystem::vfs::SystemError;
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::filesystem::vfs::{MAX_PATHLEN, NAME_MAX};
 use crate::process::ProcessManager;
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 /// # 修改文件名
 ///
 ///
@@ -31,18 +31,12 @@ pub fn do_renameat2(
     filename_to: *const u8,
     flags: u32,
 ) -> Result<usize, SystemError> {
-    let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN))
-        .unwrap()
+    let filename_from = vfs_check_and_clone_cstr(filename_from, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
-    let filename_to = check_and_clone_cstr(filename_to, Some(MAX_PATHLEN))
-        .unwrap()
+    let filename_to = vfs_check_and_clone_cstr(filename_to, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
-    // 文件名过长
-    if filename_from.len() > MAX_PATHLEN || filename_to.len() > MAX_PATHLEN {
-        return Err(SystemError::ENAMETOOLONG);
-    }
 
     if filename_from == "/" || filename_to == "/" {
         return Err(SystemError::EBUSY);

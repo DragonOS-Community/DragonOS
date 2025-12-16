@@ -9,7 +9,7 @@ use crate::{
     process::{resource::RLimitID, ProcessManager},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
-        user_access::check_and_clone_cstr,
+        user_access::vfs_check_and_clone_cstr,
     },
 };
 
@@ -37,7 +37,7 @@ impl Syscall for SysTruncateHandle {
         let path_ptr = args[0] as *const u8;
         let length = Self::len(args)?;
         // 复制并校验用户态路径
-        let path = check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?;
+        let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?;
         let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
         // 解析起始 inode 与剩余路径

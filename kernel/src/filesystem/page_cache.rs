@@ -153,10 +153,7 @@ impl InnerPageCache {
 
             let page = page_manager_guard.create_one_page(
                 PageType::File(FileMapInfo {
-                    page_cache: self
-                        .page_cache_ref
-                        .upgrade()
-                        .expect("failed to get self_arc of pagecache"),
+                    page_cache: self.page_cache_ref.clone(),
                     index: page_index,
                 }),
                 page_flags,

@@ -12,7 +12,7 @@ use crate::{
     process::ProcessManager,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
-        user_access::check_and_clone_cstr,
+        user_access::vfs_check_and_clone_cstr,
     },
 };
 use alloc::sync::Arc;
@@ -34,7 +34,7 @@ impl Syscall for SysMknodHandle {
         let flags: InodeMode = InodeMode::from_bits_truncate(flags as u32);
         let dev_t = DeviceNumber::from(dev_t as u32);
 
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         let path = path.as_str().trim();

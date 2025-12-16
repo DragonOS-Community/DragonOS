@@ -11,7 +11,7 @@ use crate::filesystem::vfs::{fcntl::AtFlags, FileType, MAX_PATHLEN, VFS_MAX_FOLL
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 
 /// System call handler for the `chdir` syscall
 ///
@@ -53,7 +53,7 @@ impl Syscall for SysChdirHandle {
             return Err(SystemError::EFAULT);
         }
 
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         let path = path.trim();

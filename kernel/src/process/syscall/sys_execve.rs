@@ -11,7 +11,7 @@ use crate::mm::{verify_area, VirtAddr};
 use crate::process::execve::do_execve;
 use crate::process::{ProcessControlBlock, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::{check_and_clone_cstr, check_and_clone_cstr_array};
+use crate::syscall::user_access::{check_and_clone_cstr_array, vfs_check_and_clone_cstr};
 use alloc::{ffi::CString, vec::Vec};
 use log::error;
 use system_error::SystemError;
@@ -60,7 +60,7 @@ impl SysExecve {
         argv: *const *const u8,
         envp: *const *const u8,
     ) -> Result<(CString, Vec<CString>, Vec<CString>), SystemError> {
-        let path: CString = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path: CString = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let mut argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
         let envp: Vec<CString> = check_and_clone_cstr_array(envp)?;
 

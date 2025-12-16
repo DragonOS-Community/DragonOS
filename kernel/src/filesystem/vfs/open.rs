@@ -15,7 +15,7 @@ use crate::{
     process::cred::GroupInfo,
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
-use crate::{process::ProcessManager, syscall::user_access::check_and_clone_cstr};
+use crate::{process::ProcessManager, syscall::user_access::vfs_check_and_clone_cstr};
 use alloc::string::String;
 
 pub(super) fn do_faccessat(
@@ -38,7 +38,7 @@ pub(super) fn do_faccessat(
 
     // let follow_symlink = flags & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0;
 
-    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
     // log::debug!("do_faccessat path: {:?}", path);
 
@@ -52,7 +52,7 @@ pub(super) fn do_faccessat(
 }
 
 pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize, SystemError> {
-    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;

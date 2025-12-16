@@ -18,7 +18,7 @@ use crate::filesystem::vfs::{
 use crate::process::cred::CAPFlags;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 
 pub struct SysChrootHandle;
 
@@ -33,7 +33,7 @@ impl Syscall for SysChrootHandle {
             return Err(SystemError::EFAULT);
         }
 
-        let path = check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
+        let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         let path = path.trim();

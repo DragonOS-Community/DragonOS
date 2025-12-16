@@ -8,7 +8,7 @@ use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::vcore::{do_remove_dir, do_unlink_at};
 use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::vec::Vec;
 
 pub struct SysUnlinkAtHandle;
@@ -34,7 +34,7 @@ impl Syscall for SysUnlinkAtHandle {
         let flags = Self::flags(args);
 
         let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
 

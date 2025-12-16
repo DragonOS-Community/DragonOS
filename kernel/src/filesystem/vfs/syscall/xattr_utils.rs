@@ -2,7 +2,9 @@ use super::{XATTR_CREATE, XATTR_REPLACE};
 use crate::{
     filesystem::vfs::{syscall::AtFlags, utils::user_path_at, IndexNode, MAX_PATHLEN},
     process::ProcessManager,
-    syscall::user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
+    syscall::user_access::{
+        check_and_clone_cstr, vfs_check_and_clone_cstr, UserBufferReader, UserBufferWriter,
+    },
 };
 use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
@@ -15,7 +17,7 @@ pub(super) fn path_getxattr(
     size: usize,
     lookup_flags: usize,
 ) -> Result<usize, SystemError> {
-    let path = check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
+    let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 
@@ -79,7 +81,7 @@ pub(super) fn path_setxattr(
     lookup_flags: usize,
     flags: i32,
 ) -> Result<usize, SystemError> {
-    let path = check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
+    let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 

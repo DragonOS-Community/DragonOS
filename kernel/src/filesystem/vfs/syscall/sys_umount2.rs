@@ -26,7 +26,7 @@ impl Syscall for SysUmount2Handle {
         let target = Self::target(args);
         let flags = Self::flags(args);
 
-        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
+        let target = user_access::vfs_check_and_clone_cstr(target, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         do_umount2(

@@ -81,6 +81,8 @@ mod sys_epoll_create;
 mod sys_epoll_wait;
 
 #[cfg(target_arch = "x86_64")]
+mod sys_creat;
+#[cfg(target_arch = "x86_64")]
 mod sys_futimesat;
 #[cfg(target_arch = "x86_64")]
 mod sys_lchown;

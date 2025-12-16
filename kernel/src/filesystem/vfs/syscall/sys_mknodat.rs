@@ -14,7 +14,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 
 pub struct SysMknodatHandle;
 
@@ -30,7 +30,7 @@ impl Syscall for SysMknodatHandle {
         let path = Self::path(args);
         let mode_val = Self::mode(args);
         let dev = DeviceNumber::from(Self::dev(args));
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
 

@@ -9,7 +9,7 @@ use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use crate::syscall::user_access::UserBufferWriter;
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -26,7 +26,7 @@ impl Syscall for SysStatfsHandle {
         let user_statfs = Self::statfs(args);
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
         let fd = open_utils::do_open(path, FileFlags::O_RDONLY.bits(), InodeMode::empty().bits())?;
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))
             .unwrap()
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;

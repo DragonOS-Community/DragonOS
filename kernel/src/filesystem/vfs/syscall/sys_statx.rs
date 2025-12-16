@@ -4,7 +4,7 @@ use crate::filesystem::vfs::stat::do_statx;
 use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -51,7 +51,7 @@ impl SysStatxHandle {
             return Err(SystemError::EFAULT);
         }
 
-        let filename = check_and_clone_cstr(filename_ptr as *const u8, Some(MAX_PATHLEN))?;
+        let filename = vfs_check_and_clone_cstr(filename_ptr as *const u8, Some(MAX_PATHLEN))?;
         let filename_str = filename.to_str().map_err(|_| SystemError::EINVAL)?;
 
         do_statx(dfd, filename_str, flags, mask, user_kstat_ptr).map(|_| 0)

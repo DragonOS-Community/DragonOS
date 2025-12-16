@@ -5,6 +5,7 @@ use crate::filesystem::vfs::vcore::do_mkdir_at;
 use crate::filesystem::vfs::InodeMode;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -25,12 +26,9 @@ impl Syscall for SysMkdirHandle {
         let path = Self::path(args);
         let mode = Self::mode(args);
 
-        let path = crate::filesystem::vfs::syscall::check_and_clone_cstr(
-            path,
-            Some(crate::filesystem::vfs::MAX_PATHLEN),
-        )?
-        .into_string()
-        .map_err(|_| SystemError::EINVAL)?;
+        let path = vfs_check_and_clone_cstr(path, Some(crate::filesystem::vfs::MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
 
         do_mkdir_at(
             AtFlags::AT_FDCWD.bits(),

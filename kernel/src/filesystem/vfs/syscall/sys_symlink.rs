@@ -5,7 +5,7 @@ use crate::{
     filesystem::vfs::MAX_PATHLEN,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
-        user_access::check_and_clone_cstr,
+        user_access::vfs_check_and_clone_cstr,
     },
 };
 use alloc::string::{String, ToString};
@@ -22,39 +22,39 @@ impl Syscall for SysSymlinkHandle {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let from = Self::from(args);
-        let to = Self::to(args);
+        let from = Self::from(args)?;
+        let to = Self::to(args)?;
 
         do_symlinkat(from.as_str(), None, to.as_str())
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("from", Self::from(args)),
-            FormattedSyscallParam::new("to", Self::to(args)),
+            FormattedSyscallParam::new(
+                "from",
+                Self::from(args).unwrap_or_else(|_| "<invalid>".to_string()),
+            ),
+            FormattedSyscallParam::new(
+                "to",
+                Self::to(args).unwrap_or_else(|_| "<invalid>".to_string()),
+            ),
         ]
     }
 }
 
 impl SysSymlinkHandle {
-    fn from(args: &[usize]) -> String {
-        check_and_clone_cstr(args[0] as *const u8, Some(MAX_PATHLEN))
-            .unwrap()
+    fn from(args: &[usize]) -> Result<String, SystemError> {
+        let s = vfs_check_and_clone_cstr(args[0] as *const u8, Some(MAX_PATHLEN))?
             .into_string()
-            .map_err(|_| SystemError::EINVAL)
-            .unwrap()
-            .trim()
-            .to_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        Ok(s.trim().to_string())
     }
 
-    fn to(args: &[usize]) -> String {
-        check_and_clone_cstr(args[1] as *const u8, Some(MAX_PATHLEN))
-            .unwrap()
+    fn to(args: &[usize]) -> Result<String, SystemError> {
+        let s = vfs_check_and_clone_cstr(args[1] as *const u8, Some(MAX_PATHLEN))?
             .into_string()
-            .map_err(|_| SystemError::EINVAL)
-            .unwrap()
-            .trim()
-            .to_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        Ok(s.trim().to_string())
     }
 }
 

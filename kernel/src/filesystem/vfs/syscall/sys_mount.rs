@@ -60,10 +60,10 @@ impl Syscall for SysMountHandle {
         // );
         let mount_flags = MountFlags::from_bits_truncate(mount_flags);
 
-        let target = copy_mount_string(target).inspect_err(|e| {
+        let target = copy_mount_path_string(target).inspect_err(|e| {
             log::error!("Failed to read mount target: {:?}", e);
         })?;
-        let source = copy_mount_string(source).inspect_err(|e| {
+        let source = copy_mount_path_string(source).inspect_err(|e| {
             log::error!("Failed to read mount source: {:?}", e);
         })?;
 
@@ -290,6 +290,21 @@ fn copy_mount_string(raw: Option<*const u8>) -> Result<Option<String>, SystemErr
         let s = user_access::check_and_clone_cstr(raw, Some(MAX_PATHLEN))
             .inspect_err(|e| {
                 log::error!("Failed to read mount string: {:?}", e);
+            })?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        Ok(Some(s))
+    } else {
+        Ok(None)
+    }
+}
+
+#[inline(never)]
+fn copy_mount_path_string(raw: Option<*const u8>) -> Result<Option<String>, SystemError> {
+    if let Some(raw) = raw {
+        let s = user_access::vfs_check_and_clone_cstr(raw, Some(MAX_PATHLEN))
+            .inspect_err(|e| {
+                log::error!("Failed to read mount path string: {:?}", e);
             })?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;

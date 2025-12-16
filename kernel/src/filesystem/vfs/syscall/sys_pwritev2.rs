@@ -6,7 +6,6 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PWRITEV2;
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::iov::{IoVec, IoVecs};
-use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 
@@ -133,12 +132,6 @@ pub fn do_pwritev2(
             return file.write_append(data.len(), &data);
         }
         return file.write(data.len(), &data);
-    }
-
-    // 非负 offset：不允许作用于管道/Socket，保持与 pwrite 语义一致
-    let md = file.metadata()?;
-    if md.file_type == FileType::Pipe || md.file_type == FileType::Socket {
-        return Err(SystemError::ESPIPE);
     }
 
     // offset 为非负时，执行范围校验

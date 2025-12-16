@@ -24,6 +24,11 @@ impl EPollInode {
 }
 
 impl IndexNode for EPollInode {
+    fn is_stream(&self) -> bool {
+        // epollfd 不支持 seek/pread/pwrite，按流式对象处理，统一返回 ESPIPE。
+        true
+    }
+
     fn read_at(
         &self,
         _offset: usize,

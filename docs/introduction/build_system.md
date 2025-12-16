@@ -1,6 +1,26 @@
 (_build_dragonos)=
 # 构建DragonOS
 
+## 0.快速体验
+
+&emsp;&emsp;如果您只是想快速体验DragonOS，而不需要进行本地开发，我们强烈推荐您使用 **DragonOS Playground** 进行云原生开发。这种方式**零配置、一键启动**，无需安装任何本地依赖，即可在云端体验DragonOS的最新nightly build版本。
+
+### 使用DragonOS Playground
+   - 打开浏览器访问：<https://cnb.cool/DragonOS-Community/playground>
+   - 按照playground项目的指引，在CNB一键运行DragonOS!
+
+**优势：**
+- ✅ **零配置** - 无需安装QEMU、Docker、Rust等依赖
+- ✅ **即时体验** - 几秒钟内即可运行DragonOS
+- ✅ **云端环境** - 随时随地访问，不占用本地资源
+- ✅ **每日更新** - 自动获取最新nightly build，体验最新开发版本
+
+:::{note}
+
+如果您需要进行DragonOS的开发工作，或者希望深入了解DragonOS的构建过程，请继续阅读后续章节，了解如何在本地环境中构建DragonOS。
+
+:::
+
 ## 1.写在前面
 
 &emsp;&emsp;无论您采用后文中的何种方式来编译DragonOS，您必须先按照本小节中的步骤，初始化您的开发环境。

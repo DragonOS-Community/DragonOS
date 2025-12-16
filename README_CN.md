@@ -23,14 +23,30 @@
 
 &emsp;&emsp;DragonOS目前在社区驱动下正在快速发展中，目前DragonOS已经实现了约1/4的Linux接口，在未来我们将提供对Linux的100%兼容性，并且提供新特性。
 
+&emsp;&emsp;🌟 **想要快速体验DragonOS？** 访问 [DragonOS Playground](https://cnb.cool/DragonOS-Community/playground) 即可在云端零配置一键启动DragonOS，体验最新的nightly build版本！
+
 ## 📰 社区新闻
 
+- **2025-12-17**: ☁️ **DragonOS Playground已上线！** 在CNB平台零配置一键体验DragonOS，支持每日nightly build更新！[立即体验 →](https://cnb.cool/DragonOS-Community/playground)
 - **2025-11-20**: 🚀 DragonOS 0.3.0 已发布！可支持go程序直接运行！
 - **2025-11-18**: 📊 DragonOS CI Dashboard已上线！[立刻查看DragonOS的Linux兼容性数据！](https://ci-dashboard.dragonos.org)
 
 ## 如何运行？
 
-&emsp;&emsp;运行DragonOS的步骤非常简单，您可以参考以下几个资料，在最短15分钟内运行DragonOS！
+### 🌟 方法一：云原生开发（推荐）
+
+**零配置、一键启动！** 在CNB云原生开发平台上体验DragonOS是最简单快捷的方式，无需本地安装任何依赖！
+
+<div align="center">
+
+[![在CNB一键启动](docs/_static/cnb-launch-button-cn.svg)](https://cnb.cool/DragonOS-Community/playground)
+
+</div>
+
+
+### 方法二：本地构建运行
+
+&emsp;&emsp;如果您希望在本地环境中构建和运行DragonOS，可以参考以下文档：
 
 - [构建DragonOS — DragonOS dev 文档](https://docs.dragonos.org.cn/introduction/build_system.html)
 

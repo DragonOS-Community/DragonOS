@@ -504,12 +504,12 @@ impl MountFSInode {
             // 当前inode是它所在的文件系统的root inode
             match self.mount_fs.self_mountpoint() {
                 Some(inode) => {
-                    let inner_inode = inode.parent()?;
-                    return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
-                        inner_inode,
-                        mount_fs: self.mount_fs.clone(),
-                        self_ref: self_ref.clone(),
-                    }));
+                    // `inode` 是“父挂载树中”的挂载点 inode。
+                    // Linux 语义：从被挂载文件系统的根目录向上（..）应当回到挂载点的父目录，
+                    // 并且后续路径遍历应当发生在父挂载（inode.mount_fs）上。
+                    //
+                    // 这里直接复用挂载点 inode 的 do_parent()，确保 mount_fs 正确切换。
+                    return inode.do_parent();
                 }
                 None => {
                     return Ok(self.self_ref.upgrade().unwrap());
@@ -577,27 +577,41 @@ impl MountFSInode {
         }
 
         let mut path_parts = Vec::new();
-        let root_inode = ProcessManager::current_mntns().root_inode();
-        let inode_id = root_inode.metadata()?.inode_id;
-        while current.metadata()?.inode_id != inode_id {
+
+        // 注意：不同文件系统的 inode_id 空间可能互相独立，不能用“全局根 inode_id”作为终止条件。
+        // 正确做法应当按挂载树向上走，直到到达“命名空间根”（即 rootfs 的 mount，self_mountpoint 为 None）。
+        loop {
+            // 到达全局根（该 mount 没有挂载点）：结束
+            if current.is_mountpoint_root()? && current.mount_fs.self_mountpoint().is_none() {
+                break;
+            }
+
             let name = current.dname()?;
             path_parts.push(name.0);
 
             // 防循环检查：如果路径深度超过1024，抛出警告
             if path_parts.len() > 1024 {
                 #[inline(never)]
-                fn __log_warn(root: usize, cur: usize) {
+                fn __log_warn(cur: usize) {
                     log::warn!(
-                        "Path depth exceeds 1024, possible infinite loop. root: {}, cur: {}",
-                        root,
+                        "Path depth exceeds 1024, possible infinite loop. cur: {}",
                         cur
                     );
                 }
-                __log_warn(inode_id.data(), current.metadata().unwrap().inode_id.data());
+                __log_warn(current.metadata().unwrap().inode_id.data());
                 return Err(SystemError::ELOOP);
             }
 
-            current = current.do_parent()?;
+            let parent = current.do_parent()?;
+            if Arc::ptr_eq(&parent, &current) {
+                // parent == self 但还没达到全局根，说明挂载树信息不完整或出现环
+                log::warn!(
+                    "absolute_path: parent == self before reaching namespace root, inode_id={}",
+                    current.metadata().unwrap().inode_id.data()
+                );
+                return Err(SystemError::ELOOP);
+            }
+            current = parent;
         }
 
         // 由于我们从叶子节点向上遍历到根节点，所以需要反转路径部分
@@ -612,6 +626,9 @@ impl MountFSInode {
             absolute_path.push_str(&part);
         }
 
+        if absolute_path.is_empty() {
+            absolute_path.push('/');
+        }
         Ok(absolute_path)
     }
 
@@ -795,7 +812,21 @@ impl IndexNode for MountFSInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        return self.inner_inode.move_to(old_name, target, new_name, flags);
+        // Filesystem implementations generally expect `target` to be an inode
+        // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
+        // mount wrapping is enabled, `target` is often a `MountFSInode`, which
+        // would make FS-level downcasts fail and incorrectly return EINVAL.
+        //
+        // So we unwrap the mount wrapper before delegating.
+        let target_inner: Arc<dyn IndexNode> = target
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt| mnt.inner_inode.clone())
+            .unwrap_or_else(|| target.clone());
+
+        return self
+            .inner_inode
+            .move_to(old_name, &target_inner, new_name, flags);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -1017,6 +1048,9 @@ impl IndexNode for MountFSInode {
 }
 
 impl FileSystem for MountFS {
+    fn support_readahead(&self) -> bool {
+        self.inner_filesystem.support_readahead()
+    }
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         match self.self_mountpoint() {
             Some(inode) => return inode.mount_fs.root_inode(),

@@ -81,6 +81,8 @@ pub enum ProcFileType {
     /// /proc/<pid>/fdinfo/<fd> 文件
     ProcFdInfoFile,
     ProcMounts,
+    /// /proc/<pid>/mountinfo
+    ProcMountInfo,
     /// /proc/version
     ProcVersion,
     /// /proc/cpuinfo
@@ -517,9 +519,31 @@ impl ProcFSInode {
         let file = fd_table.get_file_by_fd(fd);
         if let Some(file) = file {
             let inode = file.inode();
-            let path = inode.absolute_path().unwrap();
-            let len = path.len().min(buf.len());
-            buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+            let full = inode
+                .absolute_path()
+                .unwrap_or_else(|_| "unknown".to_string());
+
+            // chroot 视角：若目标在进程 fs root 下，则去掉真实前缀，变为以 "/" 为根的路径。
+            let pcb = ProcessManager::current_pcb();
+            let root_inode = pcb.fs_struct().root();
+            let root_prefix = root_inode
+                .absolute_path()
+                .unwrap_or_else(|_| "/".to_string());
+
+            let shown = if root_prefix != "/" {
+                if full == root_prefix {
+                    "/".to_string()
+                } else if full.starts_with(&(root_prefix.clone() + "/")) {
+                    full[root_prefix.len()..].to_string()
+                } else {
+                    full
+                }
+            } else {
+                full
+            };
+
+            let len = shown.len().min(buf.len());
+            buf[..len].copy_from_slice(&shown.as_bytes()[..len]);
             Ok(len)
         } else {
             return Err(SystemError::EBADF);
@@ -725,6 +749,25 @@ impl ProcFS {
             .downcast_ref::<LockedProcFSInode>()
             .unwrap();
         fdinfo.0.lock().fdata.ftype = ProcFileType::ProcFdInfoDir;
+
+        // mounts file: /proc/<pid>/mounts （供 /proc/self/mounts 使用）
+        let mounts_binding = pid_dir.create("mounts", FileType::File, InodeMode::S_IRUGO)?;
+        let mounts_file = mounts_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        mounts_file.0.lock().fdata.pid = Some(pid);
+        mounts_file.0.lock().fdata.ftype = ProcFileType::ProcMounts;
+
+        // mountinfo file: /proc/<pid>/mountinfo
+        let mountinfo_binding = pid_dir.create("mountinfo", FileType::File, InodeMode::S_IRUGO)?;
+        let mountinfo_file = mountinfo_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        mountinfo_file.0.lock().fdata.pid = Some(pid);
+        mountinfo_file.0.lock().fdata.ftype = ProcFileType::ProcMountInfo;
+
         //todo: 创建其他文件
 
         return Ok(());
@@ -740,9 +783,11 @@ impl ProcFS {
         // 删除进程文件夹下文件
         pid_dir.unlink("status")?;
         pid_dir.unlink("exe")?;
-        pid_dir.unlink("maps")?;
         pid_dir.rmdir("fd")?;
         pid_dir.rmdir("fdinfo")?;
+        let _ = pid_dir.unlink("mounts");
+        let _ = pid_dir.unlink("mountinfo");
+        let _ = pid_dir.unlink("maps");
 
         // 查看进程文件是否还存在
         // let pf= pid_dir.find("status").expect("Cannot find status");
@@ -925,6 +970,12 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcMaps => inode.open_maps(&mut proc_private)?,
             ProcFileType::ProcExe => inode.open_exe(&mut proc_private)?,
             ProcFileType::ProcMounts => inode.open_mounts(&mut proc_private)?,
+            ProcFileType::ProcMountInfo => {
+                let s = proc_mounts::generate_mountinfo_content();
+                proc_private.data = s.into_bytes();
+                proc_private.data.len() as i64
+            }
+
             ProcFileType::ProcVersion => inode.open_version(&mut proc_private)?,
             ProcFileType::ProcCpuinfo => inode.open_cpuinfo(&mut proc_private)?,
             ProcFileType::ProcSelf => inode.open_self(&mut proc_private)?,
@@ -1007,6 +1058,7 @@ impl IndexNode for LockedProcFSInode {
             | ProcFileType::ProcStatm
             | ProcFileType::ProcMaps
             | ProcFileType::ProcMounts
+            | ProcFileType::ProcMountInfo
             | ProcFileType::ProcVersion
             | ProcFileType::ProcCpuinfo => {
                 // 获取数据信息

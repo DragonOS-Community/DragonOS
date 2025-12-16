@@ -80,8 +80,29 @@ pub fn do_umount2(
     target: &str,
     _flag: UmountFlag,
 ) -> Result<Arc<MountFS>, SystemError> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
-    let path = work.absolute_path()? + &rest;
+
+    // user_path_at 已经保证：
+    // - 绝对路径：rest 以 '/' 开头
+    // - 相对路径：rest 不以 '/' 开头，work 为 dirfd/cwd inode
+    //
+    // 因此这里不能无脑拼接 work.absolute_path()+rest，否则绝对路径会被重复前缀化，导致找不到挂载记录。
+    let path = if rest.starts_with('/') {
+        rest
+    } else {
+        let mut base = work.absolute_path()?;
+        if !base.ends_with('/') {
+            base.push('/');
+        }
+        base.push_str(&rest);
+        base
+    };
+
     let result = ProcessManager::current_mntns().remove_mount(&path);
     if let Some(fs) = result {
         // Todo: 占用检测

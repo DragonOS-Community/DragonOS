@@ -100,6 +100,13 @@ pub fn check_and_clone_cstr(
     user: *const u8,
     max_length: Option<usize>,
 ) -> Result<CString, SystemError> {
+    return do_check_and_clone_cstr(user, max_length, false);
+}
+fn do_check_and_clone_cstr(
+    user: *const u8,
+    max_length: Option<usize>,
+    return_name_too_long: bool,
+) -> Result<CString, SystemError> {
     if user.is_null() {
         return Err(SystemError::EFAULT);
     }
@@ -124,10 +131,20 @@ pub fn check_and_clone_cstr(
         }
         buffer.push(NonZero::new(c[0]).ok_or(SystemError::EINVAL)?);
     }
+    if return_name_too_long && buffer.len() >= max_length.unwrap_or(usize::MAX) {
+        return Err(SystemError::ENAMETOOLONG);
+    }
 
     let cstr = CString::from(buffer);
 
     return Ok(cstr);
+}
+
+pub fn vfs_check_and_clone_cstr(
+    user: *const u8,
+    max_length: Option<usize>,
+) -> Result<CString, SystemError> {
+    return do_check_and_clone_cstr(user, max_length, true);
 }
 
 /// Check and copy a C string array from user space

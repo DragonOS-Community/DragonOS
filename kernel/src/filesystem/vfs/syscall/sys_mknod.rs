@@ -4,7 +4,10 @@ use crate::{
     arch::interrupt::TrapFrame,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
-        utils::rsplit_path, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        fcntl::AtFlags,
+        utils::{rsplit_path, user_path_at},
+        vcore::resolve_parent_inode,
+        IndexNode, InodeMode, MAX_PATHLEN, NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     process::ProcessManager,
     syscall::{
@@ -36,20 +39,25 @@ impl Syscall for SysMknodHandle {
             .map_err(|_| SystemError::EINVAL)?;
         let path = path.as_str().trim();
 
-        let root_inode = ProcessManager::current_mntns().root_inode();
+        let pcb = ProcessManager::current_pcb();
+        let (inode_begin, remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), path)?;
         let inode: Result<Arc<dyn IndexNode>, SystemError> =
-            root_inode.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
+            inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         if inode.is_ok() {
             return Err(SystemError::EEXIST);
         }
 
-        let (filename, parent_path) = rsplit_path(path);
+        let (filename, parent_path) = rsplit_path(&remain_path);
+
+        // 检查文件名长度
+        if filename.len() > NAME_MAX {
+            return Err(SystemError::ENAMETOOLONG);
+        }
 
         // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = root_inode
-            .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-        // 创建nod
+        let parent_inode: Arc<dyn IndexNode> = resolve_parent_inode(inode_begin, parent_path)?;
+        // 创建 nod
         parent_inode.mknod(filename, flags, dev_t)?;
 
         return Ok(0);

@@ -6,7 +6,8 @@ use alloc::{string::String, vec::Vec};
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CHDIR;
-use crate::filesystem::vfs::{FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
+use crate::filesystem::vfs::utils::user_path_at;
+use crate::filesystem::vfs::{fcntl::AtFlags, FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -55,11 +56,26 @@ impl Syscall for SysChdirHandle {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
 
         let proc = ProcessManager::current_pcb();
-        // Copy path to kernel space to avoid some security issues
-        let mut new_path = String::from("");
-        if !path.is_empty() {
+
+        // 解析目标 inode：绝对路径以进程 fs root 为起点；相对路径以 cwd inode 为起点
+        let (inode_begin, remain_path) = user_path_at(&proc, AtFlags::AT_FDCWD.bits(), path)?;
+        let inode =
+            inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let metadata = inode.metadata()?;
+
+        let cred = ProcessManager::current_pcb().cred();
+        cred.check_chdir_permission(&metadata)?;
+
+        if metadata.file_type == FileType::Dir {
+            // 维护一个“用户可见”的 cwd 字符串（用于 getcwd 的快速路径）
+            // 注意：路径解析不再依赖该字符串，避免 chroot 后出现语义偏差。
+            let mut new_path = String::from("");
             let cwd = match path.as_bytes()[0] {
                 b'/' => String::from("/"),
                 _ => proc.basic().cwd(),
@@ -82,21 +98,7 @@ impl Syscall for SysChdirHandle {
             if new_path.is_empty() {
                 new_path = String::from("/");
             }
-        }
-        let root_inode = ProcessManager::current_mntns().root_inode();
-        let inode = match root_inode.lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
-        {
-            Err(_) => {
-                return Err(SystemError::ENOENT);
-            }
-            Ok(i) => i,
-        };
-        let metadata = inode.metadata()?;
 
-        let cred = ProcessManager::current_pcb().cred();
-        cred.check_chdir_permission(&metadata)?;
-
-        if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(new_path);
             proc.fs_struct_mut().set_pwd(inode);
             return Ok(0);

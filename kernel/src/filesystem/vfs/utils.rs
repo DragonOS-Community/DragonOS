@@ -5,7 +5,7 @@ use core::hash::Hash;
 use alloc::{string::String, sync::Arc};
 use system_error::SystemError;
 
-use crate::process::{ProcessControlBlock, ProcessManager};
+use crate::process::ProcessControlBlock;
 
 use super::{fcntl::AtFlags, FileType, IndexNode};
 
@@ -42,40 +42,42 @@ pub fn user_path_at(
     dirfd: i32,
     path: &str,
 ) -> Result<(Arc<dyn IndexNode>, String), SystemError> {
-    let current_mntns = ProcessManager::current_mntns();
-    let mut inode = current_mntns.root_inode().clone();
-    let ret_path;
-    // 如果path不是绝对路径，则需要拼接
-    if path.is_empty() || path.as_bytes()[0] != b'/' {
-        // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
-        if dirfd != AtFlags::AT_FDCWD.bits() {
-            let binding = pcb.fd_table();
-            let fd_table_guard = binding.read();
-            let file = fd_table_guard
-                .get_file_by_fd(dirfd)
-                .ok_or(SystemError::EBADF)?;
+    // Linux 语义：
+    // - 绝对路径从进程的 fs root 开始解析（chroot 会改变它）
+    // - 相对路径默认从进程的 cwd(pwd inode) 开始解析
+    // - dirfd != AT_FDCWD 时，从对应目录 fd 开始解析
 
-            // drop guard 以避免无法调度的问题
-            drop(fd_table_guard);
+    let ret_path = String::from(path);
 
-            // 如果dirfd不是目录，则返回错误码ENOTDIR
-            if file.file_type() != FileType::Dir {
-                return Err(SystemError::ENOTDIR);
-            }
-
-            inode = file.inode();
-            ret_path = String::from(path);
-        } else {
-            let mut cwd = pcb.basic().cwd();
-            cwd.push('/');
-            cwd.push_str(path);
-            ret_path = cwd;
-        }
-    } else {
-        ret_path = String::from(path);
+    // 空路径：交由上层 syscall 自己决定（open/chroot 等对空串语义不同）
+    if path.is_empty() {
+        return Ok((pcb.pwd_inode(), ret_path));
     }
 
-    return Ok((inode, ret_path));
+    // 绝对路径：从进程 root 开始
+    if path.as_bytes()[0] == b'/' {
+        return Ok((pcb.fs_struct().root(), ret_path));
+    }
+
+    // 相对路径：dirfd 优先，否则用 cwd
+    if dirfd != AtFlags::AT_FDCWD.bits() {
+        let binding = pcb.fd_table();
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard
+            .get_file_by_fd(dirfd)
+            .ok_or(SystemError::EBADF)?;
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+
+        // 如果dirfd不是目录，则返回错误码ENOTDIR
+        if file.file_type() != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        return Ok((file.inode(), ret_path));
+    }
+
+    Ok((pcb.pwd_inode(), ret_path))
 }
 
 pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> bool {

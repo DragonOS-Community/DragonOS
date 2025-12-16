@@ -194,6 +194,10 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 }
 
                 let (filename, parent_path) = rsplit_path(&path);
+                // 检查文件名长度
+                if filename.len() > crate::filesystem::vfs::NAME_MAX {
+                    return Err(SystemError::ENAMETOOLONG);
+                }
                 // 查找父目录
                 let parent_inode: Arc<dyn IndexNode> =
                     resolve_parent_inode(inode_begin, parent_path)?;

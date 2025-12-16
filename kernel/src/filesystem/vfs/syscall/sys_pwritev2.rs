@@ -4,7 +4,6 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PWRITEV2;
-use crate::driver::base::block::SeekFrom;
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::iov::{IoVec, IoVecs};
 use crate::filesystem::vfs::FileType;
@@ -129,10 +128,9 @@ pub fn do_pwritev2(
 ) -> Result<usize, SystemError> {
     // offset == -1 -> 使用当前文件偏移（行为与 writev 相同）
     if offset == -1 {
-        // RWF_APPEND：强制追加写入，需先将文件偏移调整到末尾
+        // RWF_APPEND：强制追加写入（需满足“取 EOF + 写入”的原子性），并推进文件偏移
         if flags.contains(RwfFlags::APPEND) {
-            // 对管道/Socket 的 lseek 会返回 ESPIPE，与 Linux 语义一致
-            file.lseek(SeekFrom::SeekEnd(0))?;
+            return file.write_append(data.len(), &data);
         }
         return file.write(data.len(), &data);
     }
@@ -148,7 +146,7 @@ pub fn do_pwritev2(
 
     // 若指定 RWF_APPEND，忽略 offset，改为在文件末尾写入，但不更新文件偏移
     if flags.contains(RwfFlags::APPEND) {
-        return file.pwrite(md.size as usize, data.len(), &data);
+        return file.pwrite_append(offset, data.len(), &data);
     }
 
     // 普通 pwrite 路径

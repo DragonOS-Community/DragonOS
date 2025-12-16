@@ -12,6 +12,7 @@ getcpu_test
 getcpu_host_test
 
 # 文件系统相关测试
+chroot_test
 dup_test
 write_test
 mkdir_test

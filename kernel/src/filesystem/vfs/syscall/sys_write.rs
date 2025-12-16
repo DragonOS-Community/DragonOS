@@ -2,8 +2,6 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_WRITE;
-use crate::driver::base::block::SeekFrom;
-use crate::filesystem::vfs::file::FileFlags;
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -124,12 +122,6 @@ pub(super) fn do_write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
 
     // drop guard 以避免无法调度的问题
     drop(fd_table_guard);
-
-    if file.flags().contains(FileFlags::O_APPEND) {
-        // todo：lseek和write之间不是原子操作，可能有竞态条件
-        // linux中使用inode上的rwsem来使write() with O_APPEND操作原子化
-        file.lseek(SeekFrom::SeekEnd(0))?;
-    }
 
     return file.write(buf.len(), buf);
 }

@@ -30,6 +30,8 @@ use smoltcp::{
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
+use crate::libs::once::Once;
+
 use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
 
 use super::{Iface, IfaceCommon};
@@ -548,11 +550,19 @@ pub fn loopback_probe() {
 /// # lo网卡设备初始化函数
 /// 创建驱动和iface，初始化一个lo网卡，添加到全局NET_DEVICES中
 pub fn loopback_driver_init() {
-    let iface = generate_loopback_iface_default();
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // If already initialized (e.g., by earlier init path), do nothing.
+        if INIT_NET_NAMESPACE.loopback_iface().is_some() {
+            return;
+        }
 
-    INIT_NET_NAMESPACE.add_device(iface.clone());
-    INIT_NET_NAMESPACE.set_loopback_iface(iface.clone());
-    iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
+        let iface = generate_loopback_iface_default();
+
+        INIT_NET_NAMESPACE.add_device(iface.clone());
+        INIT_NET_NAMESPACE.set_loopback_iface(iface.clone());
+        iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
+    });
 }
 
 /// ## lo网卡设备的注册函数

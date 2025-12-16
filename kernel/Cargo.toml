@@ -46,6 +46,7 @@ fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev 
 # 一个no_std的hashmap、hashset
 hashbrown = "=0.13.2"
 ida = { path = "crates/ida" }
+jhash = { path = "crates/rust-jhash" }
 intertrait = { path = "crates/intertrait" }
 kcmdline_macros = { path = "crates/kcmdline_macros" }
 kdepends = { path = "crates/kdepends" }

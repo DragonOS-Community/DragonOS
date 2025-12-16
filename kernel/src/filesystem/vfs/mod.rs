@@ -1,3 +1,4 @@
+pub mod append_lock;
 pub mod fasync;
 pub mod fcntl;
 pub mod file;

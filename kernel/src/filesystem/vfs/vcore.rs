@@ -52,6 +52,9 @@ pub fn generate_inode_id() -> InodeId {
 /// 初始化虚拟文件系统
 #[inline(never)]
 pub fn vfs_init() -> Result<(), SystemError> {
+    // Initialize global append lock manager before any file write path uses it.
+    super::append_lock::init_append_lock_manager();
+
     mnt_namespace_init();
 
     procfs_init().expect("Failed to initialize procfs");

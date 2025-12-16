@@ -8,6 +8,8 @@
 //! - taking a `RawPid` and returning textual maps content
 //! - not depending on procfs inode internals beyond `ProcfsFilePrivateData`
 
+use alloc::string::ToString;
+
 use alloc::{format, string::String, vec::Vec};
 use system_error::SystemError;
 
@@ -47,14 +49,32 @@ fn perms_from_vm_flags(vm_flags: VmFlags) -> [u8; 4] {
 }
 
 #[inline(never)]
-fn format_dev_inode_and_path(file_inode: Option<&dyn IndexNode>) -> (String, String) {
+fn format_dev_inode_and_path(
+    file_inode: Option<&dyn IndexNode>,
+    root_prefix: &str,
+) -> (String, String) {
     if let Some(inode) = file_inode {
         // Best-effort: dev/inode and path are not strictly required by the tests.
         let (dev, ino, path) = match inode.metadata() {
             Ok(md) => {
                 let dev = format!("{:02x}:{:02x}", (md.dev_id >> 8) & 0xff, md.dev_id & 0xff);
                 let ino = md.inode_id.into();
-                let path = inode.absolute_path().unwrap_or_default();
+                let mut path = inode.absolute_path().unwrap_or_default();
+                // Respect process chroot: if we can compute the process root's absolute prefix,
+                // strip it from the inode's global absolute path so `/proc/<pid>/maps` doesn't
+                // leak the pre-chroot path.
+                if !root_prefix.is_empty() && root_prefix != "/" {
+                    if let Some(rest) = path.strip_prefix(root_prefix) {
+                        // Ensure the result is rooted.
+                        path = if rest.is_empty() {
+                            "/".to_string()
+                        } else if rest.starts_with('/') {
+                            rest.to_string()
+                        } else {
+                            format!("/{}", rest)
+                        };
+                    }
+                }
                 (dev, ino, path)
             }
             Err(_) => (String::from("00:00"), 0usize, String::new()),
@@ -78,6 +98,12 @@ pub fn open_proc_maps(pid: RawPid, pdata: &mut ProcfsFilePrivateData) -> Result<
     let target_pcb = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
 
     let vm = target_pcb.basic().user_vm().ok_or(SystemError::EINVAL)?;
+    // Compute the target process root prefix for chroot-aware path formatting.
+    let root_prefix = target_pcb
+        .fs_struct()
+        .root()
+        .absolute_path()
+        .unwrap_or_default();
 
     let as_guard = vm.read();
 
@@ -102,9 +128,9 @@ pub fn open_proc_maps(pid: RawPid, pdata: &mut ProcfsFilePrivateData) -> Result<
 
         let (dev_ino, path_tail) = if let Some(f) = g.vm_file() {
             let inode = f.inode();
-            format_dev_inode_and_path(Some(inode.as_ref()))
+            format_dev_inode_and_path(Some(inode.as_ref()), &root_prefix)
         } else {
-            format_dev_inode_and_path(None)
+            format_dev_inode_and_path(None, &root_prefix)
         };
 
         // Linux prints addresses as fixed-width hex; we keep it simple but valid.

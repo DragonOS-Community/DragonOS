@@ -1,0 +1,17 @@
+[package]
+name = "jhash"
+version = "0.1.1"
+authors = ["Keunhong Lee <dlrmsghd@gmail.com>"]
+
+homepage = "https://github.com/ANLAB-KAIST/rust-jhash"
+repository = "https://github.com/ANLAB-KAIST/rust-jhash"
+documentation = "https://github.com/ANLAB-KAIST/rust-jhash"
+license = "BSD-3-Clause"
+keywords = ["Jenkins", "Hash"]
+
+description = """
+Rust implementation of Jenkins hash with 32-bit sized optimizations.
+"""
+exclude = ["tests/**"]
+
+[dependencies]

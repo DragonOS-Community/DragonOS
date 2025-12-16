@@ -1,6 +1,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use hashbrown::HashMap;
+use jhash::jhash2;
 
 use crate::libs::{lazy_init::Lazy, mutex::Mutex, spinlock::SpinLock};
 
@@ -15,6 +16,8 @@ struct AppendLockKey {
     inode_id: InodeId,
 }
 
+/// 这里51个bucket是因为，AppendLockKey的大小加起来刚好小于2048字节，
+/// 内核会分配2K给这个结构体，所以51个bucket刚好合适，避免内部碎片
 const APPEND_LOCK_SHARDS: usize = 51;
 
 struct AppendLockShard {
@@ -39,13 +42,18 @@ impl AppendLockManager {
 
     #[inline]
     fn shard_index(key: &AppendLockKey) -> usize {
-        // A simple, stable mix; correctness doesn't rely on the hash quality.
-        // Avoid using `Hash` here to keep this `const`-friendly and cheap.
-        let mut x = (key.dev_id as u64) ^ ((key.inode_id.data() as u64) << 1);
-        x ^= x >> 33;
-        x = x.wrapping_mul(0xff51afd7ed558ccd);
-        x ^= x >> 33;
-        (x as usize) % APPEND_LOCK_SHARDS
+        // Use jhash to compute a stable hash for sharding.
+        // Convert usize values to u32 arrays for jhash2.
+        let dev_id = key.dev_id as u64;
+        let inode_id = key.inode_id.data() as u64;
+        let key_array = [
+            (dev_id >> 32) as u32,
+            dev_id as u32,
+            (inode_id >> 32) as u32,
+            inode_id as u32,
+        ];
+        let hash = jhash2(&key_array, 0);
+        (hash as usize) % APPEND_LOCK_SHARDS
     }
 
     /// Run `f` while holding the per-inode append lock.

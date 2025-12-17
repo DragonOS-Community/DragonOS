@@ -4,15 +4,16 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
-    utils.url = "github:numtide/flake-utils";
+    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, fenix, utils, ... } @ inputs:
-    utils.lib.eachDefaultSystem (system:
+  outputs = { self, nixpkgs, fenix, flake-utils, ... } @ inputs:
+    flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        rusttoolchain = fenix.packages.${system}.fromToolchainFile{
+        rust-toolchain = fenix.packages.${system}.fromToolchainFile{
           file = ../../kernel/rust-toolchain.toml;
+          sha256 = "sha256-3JA9u08FrvsLdi5dGIsUeQZq3Tpn9RvWdkLus2+5cHs=";
         };
       in {
         devShells.default = pkgs.mkShell {
@@ -21,13 +22,12 @@
             git
             llvm
             libclang
-            rusttoolchain
+            rust-toolchain
           ];
 
           env = {
-              LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-            };
-
+            LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          };
 
           # Shell启动脚本
           shellHook = ''

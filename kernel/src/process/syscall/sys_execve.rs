@@ -90,6 +90,8 @@ impl SysExecve {
             .basic_mut()
             .set_name(ProcessControlBlock::generate_name(&path));
 
+        // 仅在 execve 成功后再写入 cmdline，避免失败时污染当前进程信息
+        let argv_for_cmdline = argv.clone();
         do_execve(inode, argv, envp, frame)?;
 
         let pcb = ProcessManager::current_pcb();
@@ -98,6 +100,7 @@ impl SysExecve {
         fd_table.write().close_on_exec();
 
         pcb.set_execute_path(path);
+        pcb.set_cmdline_from_argv(&argv_for_cmdline);
         Ok(())
     }
 }

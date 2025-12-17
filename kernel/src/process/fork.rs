@@ -569,6 +569,9 @@ impl ProcessManager {
         // 这样才能正确支持通过/proc/self/exe重新执行程序
         pcb.set_execute_path(current_pcb.execute_path());
 
+        // 继承 cmdline（/proc/<pid>/cmdline 语义）
+        pcb.set_cmdline_bytes(current_pcb.cmdline_bytes());
+
         // alloc_pid
         if pcb.raw_pid() == RawPid::UNASSIGNED {
             // 分层PID分配：在父进程的子PID namespace中为新任务分配PID

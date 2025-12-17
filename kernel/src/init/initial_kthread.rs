@@ -213,12 +213,14 @@ fn run_init_process(
 
     let pwd = ProcessManager::current_pcb().pwd_inode();
     let inode = pwd.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
     do_execve(
         inode,
         proc_init_info.args.clone(),
         proc_init_info.envs.clone(),
         trap_frame,
     )?;
-
+    // 初始化阶段直接调用 do_execve（绕过 sys_execve），因此这里补齐 cmdline 存储
+    ProcessManager::current_pcb().set_cmdline_from_argv(&proc_init_info.args);
     Ok(())
 }

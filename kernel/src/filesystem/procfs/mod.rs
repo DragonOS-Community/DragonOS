@@ -52,6 +52,7 @@ pub mod kmsg;
 mod proc_cpuinfo;
 mod proc_maps;
 mod proc_mounts;
+mod proc_pid_cmdline;
 mod proc_thread_self_ns;
 mod proc_version;
 mod procfs_setup;
@@ -87,6 +88,10 @@ pub enum ProcFileType {
     ProcVersion,
     /// /proc/cpuinfo
     ProcCpuinfo,
+    /// /proc/cmdline
+    ProcCmdline,
+    /// /proc/<pid>/cmdline（也覆盖 /proc/self/cmdline）
+    ProcPidCmdline,
     /// /proc/thread-self/ns itself
     ProcThreadSelfNsRoot,
     /// /proc/thread-self/ns/* namespace files
@@ -733,6 +738,15 @@ impl ProcFS {
         maps_file.0.lock().fdata.pid = Some(pid);
         maps_file.0.lock().fdata.ftype = ProcFileType::ProcMaps;
 
+        // cmdline 文件: /proc/<pid>/cmdline（供 /proc/self/cmdline 使用）
+        let cmdline_binding = pid_dir.create("cmdline", FileType::File, InodeMode::S_IRUGO)?;
+        let cmdline_file = cmdline_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        cmdline_file.0.lock().fdata.pid = Some(pid);
+        cmdline_file.0.lock().fdata.ftype = ProcFileType::ProcPidCmdline;
+
         // fd dir
         let fd = pid_dir.create("fd", FileType::Dir, InodeMode::from_bits_truncate(0o555))?;
         let fd = fd.as_any_ref().downcast_ref::<LockedProcFSInode>().unwrap();
@@ -788,6 +802,7 @@ impl ProcFS {
         let _ = pid_dir.unlink("mounts");
         let _ = pid_dir.unlink("mountinfo");
         let _ = pid_dir.unlink("maps");
+        let _ = pid_dir.unlink("cmdline");
 
         // 查看进程文件是否还存在
         // let pf= pid_dir.find("status").expect("Cannot find status");
@@ -968,6 +983,8 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut proc_private)?,
             ProcFileType::ProcStatm => inode.open_statm(&mut proc_private)?,
             ProcFileType::ProcMaps => inode.open_maps(&mut proc_private)?,
+            ProcFileType::ProcCmdline => inode.open_cmdline(&mut proc_private)?,
+            ProcFileType::ProcPidCmdline => inode.open_pid_cmdline(&mut proc_private)?,
             ProcFileType::ProcExe => inode.open_exe(&mut proc_private)?,
             ProcFileType::ProcMounts => inode.open_mounts(&mut proc_private)?,
             ProcFileType::ProcMountInfo => {
@@ -1057,6 +1074,8 @@ impl IndexNode for LockedProcFSInode {
             | ProcFileType::ProcMeminfo
             | ProcFileType::ProcStatm
             | ProcFileType::ProcMaps
+            | ProcFileType::ProcCmdline
+            | ProcFileType::ProcPidCmdline
             | ProcFileType::ProcMounts
             | ProcFileType::ProcMountInfo
             | ProcFileType::ProcVersion

@@ -39,7 +39,7 @@
         mkQemuArgs = { arch, isNographic }: 
           let
             baseArgs = [
-              "-L" "${pkgs.qemu}/share/qemu"
+              # "-L" "${pkgs.qemu}/share/qemu"
               "-m" baseConfig.memory
               # FIXED: 补全 smp 参数，和原脚本一致
               "-smp" "${baseConfig.cores},cores=${baseConfig.cores},threads=1,sockets=1"
@@ -148,8 +148,17 @@
             # --- 3. 执行 ---
             # FIXED: 加上 sudo
             ${qemuBin} --version
-            exec sudo ${qemuBin} ${qemuFlagsStr} "''${ARCH_FLAGS[@]}" -bios /usr/share/seabios/bios-256k.bin "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+            exec sudo ${qemuBin} ${qemuFlagsStr} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
           '';
+
+        # 5. QEMU 二进制选择器 (支持外部 QEMU)
+        # 用法: QEMU_X86=/usr/bin/qemu-system-x86_64 nix run --impure .#x86_64
+        getQemuBin = arch: fallback:
+          let
+            envVar = if arch == "x86_64" then "QEMU_X86" else "QEMU_RISCV";
+            externalPath = builtins.getEnv envVar;
+          in
+            if externalPath != "" then externalPath else fallback;
 
       in {
         packages = {
@@ -157,7 +166,7 @@
             name = "run-dragonos-x86";
             arch = "x86_64";
             isNographic = baseConfig.nographic;
-            qemuBin = "${pkgs.qemu_full}/bin/qemu-system-x86_64";
+            qemuBin = getQemuBin "x86_64" "${pkgs.qemu_full}/bin/qemu-system-x86_64";
             diskPath = paths.diskX86;
             kernelPath = paths.kernelX86;
           };
@@ -166,7 +175,7 @@
             name = "run-dragonos-riscv";
             arch = "riscv64";
             isNographic = true;
-            qemuBin = "${pkgs.qemu_full}/bin/qemu-system-riscv64";
+            qemuBin = getQemuBin "riscv64" "${pkgs.qemu_full}/bin/qemu-system-riscv64";
             diskPath = paths.diskRiscv;
             ubootPath = paths.ubootRiscv;
           };

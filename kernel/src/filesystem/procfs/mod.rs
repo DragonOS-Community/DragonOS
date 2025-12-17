@@ -53,6 +53,8 @@ mod proc_cpuinfo;
 mod proc_maps;
 mod proc_mounts;
 mod proc_pid_cmdline;
+mod proc_pid_stat;
+mod proc_pid_task;
 mod proc_thread_self_ns;
 mod proc_version;
 mod procfs_setup;
@@ -92,6 +94,14 @@ pub enum ProcFileType {
     ProcCmdline,
     /// /proc/<pid>/cmdline（也覆盖 /proc/self/cmdline）
     ProcPidCmdline,
+    /// /proc/<pid>/stat
+    ProcPidStat,
+    /// /proc/<pid>/task 目录
+    ProcPidTaskDir,
+    /// /proc/<pid>/task/<tid> 目录
+    ProcPidTaskTidDir,
+    /// /proc/<pid>/task/<tid>/stat 文件
+    ProcPidTaskTidStat,
     /// /proc/thread-self/ns itself
     ProcThreadSelfNsRoot,
     /// /proc/thread-self/ns/* namespace files
@@ -190,6 +200,8 @@ impl<'a> ProcFileCreationParamsBuilder<'a> {
 pub struct InodeInfo {
     ///进程的pid
     pid: Option<RawPid>,
+    /// 线程的 tid（用于 /proc/<pid>/task/<tid>）
+    tid: Option<RawPid>,
     ///文件类型
     ftype: ProcFileType,
     /// 文件描述符
@@ -203,6 +215,7 @@ impl core::fmt::Debug for InodeInfo {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("InodeInfo")
             .field("pid", &self.pid)
+            .field("tid", &self.tid)
             .field("ftype", &self.ftype)
             .field("fd", &self.fd)
             .field("target_inode", &self.target_inode.is_some())
@@ -660,6 +673,7 @@ impl ProcFS {
                 fs: Weak::default(),
                 fdata: InodeInfo {
                     pid: None,
+                    tid: None,
                     ftype: ProcFileType::Default,
                     fd: -1,
                     target_inode: None,
@@ -729,6 +743,15 @@ impl ProcFS {
         statm_file.0.lock().fdata.pid = Some(pid);
         statm_file.0.lock().fdata.ftype = ProcFileType::ProcStatm;
 
+        // stat 文件: /proc/<pid>/stat
+        let stat_binding = pid_dir.create("stat", FileType::File, InodeMode::S_IRUGO)?;
+        let stat_file = stat_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        stat_file.0.lock().fdata.pid = Some(pid);
+        stat_file.0.lock().fdata.ftype = ProcFileType::ProcPidStat;
+
         // maps 文件
         let maps_binding = pid_dir.create("maps", FileType::File, InodeMode::S_IRUGO)?;
         let maps_file = maps_binding
@@ -746,6 +769,16 @@ impl ProcFS {
             .unwrap();
         cmdline_file.0.lock().fdata.pid = Some(pid);
         cmdline_file.0.lock().fdata.ftype = ProcFileType::ProcPidCmdline;
+
+        // task dir: /proc/<pid>/task
+        let task_dir =
+            pid_dir.create("task", FileType::Dir, InodeMode::from_bits_truncate(0o555))?;
+        let task_dir = task_dir
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        task_dir.0.lock().fdata.pid = Some(pid);
+        task_dir.0.lock().fdata.ftype = ProcFileType::ProcPidTaskDir;
 
         // fd dir
         let fd = pid_dir.create("fd", FileType::Dir, InodeMode::from_bits_truncate(0o555))?;
@@ -797,6 +830,8 @@ impl ProcFS {
         // 删除进程文件夹下文件
         pid_dir.unlink("status")?;
         pid_dir.unlink("exe")?;
+        let _ = pid_dir.unlink("stat");
+        let _ = pid_dir.rmdir("task");
         pid_dir.rmdir("fd")?;
         pid_dir.rmdir("fdinfo")?;
         let _ = pid_dir.unlink("mounts");
@@ -985,6 +1020,8 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcMaps => inode.open_maps(&mut proc_private)?,
             ProcFileType::ProcCmdline => inode.open_cmdline(&mut proc_private)?,
             ProcFileType::ProcPidCmdline => inode.open_pid_cmdline(&mut proc_private)?,
+            ProcFileType::ProcPidStat => inode.open_pid_stat(&mut proc_private)?,
+            ProcFileType::ProcPidTaskTidStat => inode.open_pid_task_tid_stat(&mut proc_private)?,
             ProcFileType::ProcExe => inode.open_exe(&mut proc_private)?,
             ProcFileType::ProcMounts => inode.open_mounts(&mut proc_private)?,
             ProcFileType::ProcMountInfo => {
@@ -1002,6 +1039,8 @@ impl IndexNode for LockedProcFSInode {
             }
             ProcFileType::Default => inode.data.len() as i64,
             ProcFileType::ProcKmsg
+            | ProcFileType::ProcPidTaskDir
+            | ProcFileType::ProcPidTaskTidDir
             | ProcFileType::ProcFdDir
             | ProcFileType::ProcFdFile
             | ProcFileType::ProcFdInfoDir
@@ -1076,6 +1115,8 @@ impl IndexNode for LockedProcFSInode {
             | ProcFileType::ProcMaps
             | ProcFileType::ProcCmdline
             | ProcFileType::ProcPidCmdline
+            | ProcFileType::ProcPidStat
+            | ProcFileType::ProcPidTaskTidStat
             | ProcFileType::ProcMounts
             | ProcFileType::ProcMountInfo
             | ProcFileType::ProcVersion
@@ -1243,6 +1284,7 @@ impl IndexNode for LockedProcFSInode {
                 fs: inode.fs.clone(),
                 fdata: InodeInfo {
                     pid: None,
+                    tid: None,
                     ftype: ProcFileType::Default,
                     fd: -1,
                     target_inode: None,
@@ -1369,6 +1411,12 @@ impl IndexNode for LockedProcFSInode {
                     ProcFileType::ProcThreadSelfNsRoot => {
                         return self.dynamical_find_thread_self_ns(name);
                     }
+                    ProcFileType::ProcPidTaskDir => {
+                        return self.dynamical_find_task_tid(name);
+                    }
+                    ProcFileType::ProcPidTaskTidDir => {
+                        return self.dynamical_find_task_tid_child(name);
+                    }
                     _ => {}
                 }
 
@@ -1455,6 +1503,11 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcThreadSelfNsRoot => {
                 keys.extend(ThreadSelfNsFileType::ALL_NAME.iter().map(|s| s.to_string()));
 
+                return Ok(keys);
+            }
+            ProcFileType::ProcPidTaskDir => {
+                let mut tids = self.dynamical_list_task_tids()?;
+                keys.append(&mut tids);
                 return Ok(keys);
             }
             _ => {}

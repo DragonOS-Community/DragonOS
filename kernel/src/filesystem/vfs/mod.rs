@@ -300,6 +300,51 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
+    /// 是否为“流式”文件（不可 random access / 不可 seek）。
+    ///
+    /// 语义目标：把“pread/pwrite/lseek 应返回 ESPIPE”的判定收敛在 VFS 层，
+    /// 避免在 syscall 层枚举 FileType 或做硬编码特判。
+    ///
+    /// 默认规则仅覆盖“天然流式”的基础类型：Pipe/Socket。
+    /// 其它伪文件（eventfd/epollfd/…）应在各自 inode 中覆写此方法。
+    fn is_stream(&self) -> bool {
+        match self.metadata() {
+            Ok(md) => matches!(md.file_type, FileType::Pipe | FileType::Socket),
+            // 元数据都拿不到时，保守起见按不可 seek 处理，避免误放行 pread/pwrite。
+            Err(_) => true,
+        }
+    }
+
+    /// 是否支持 seek（lseek）。
+    ///
+    /// 默认：普通文件/目录/块设备可 seek；Pipe/Socket/CharDevice 不可 seek；
+    /// 其它类型保守按可 seek（更接近现有行为：lseek 仅显式拒绝 Pipe/CharDevice）。
+    fn supports_seek(&self) -> bool {
+        if self.is_stream() {
+            return false;
+        }
+        match self.metadata() {
+            Ok(md) => !matches!(
+                md.file_type,
+                FileType::Pipe | FileType::Socket | FileType::CharDevice
+            ),
+            Err(_) => false,
+        }
+    }
+
+    /// 是否允许 pread（随机读，不推进文件偏移）。
+    ///
+    /// 默认：对 stream 文件返回 false；对非 stream 默认允许。
+    /// 伪文件（如 eventfd/epollfd）应覆写 `is_stream()` 或此方法以匹配 Linux 语义。
+    fn supports_pread(&self) -> bool {
+        !self.is_stream()
+    }
+
+    /// 是否允许 pwrite（随机写，不推进文件偏移）。
+    fn supports_pwrite(&self) -> bool {
+        !self.is_stream()
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -1186,6 +1231,7 @@ bitflags! {
         const DEVPTS_MAGIC = 0x1cd1;
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
+        const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
     }
 }
 

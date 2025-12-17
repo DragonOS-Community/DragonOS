@@ -512,22 +512,18 @@ impl File {
         let private_data = SpinLock::new(FilePrivateData::default());
         inode.open(private_data.lock(), &flags)?;
 
-        // 设置默认能力 (可以在文件系统的open()中清除)
-        if file_type == FileType::File || file_type == FileType::Dir {
-            mode.insert(
-                FileMode::FMODE_LSEEK
-                    | FileMode::FMODE_PREAD
-                    | FileMode::FMODE_PWRITE
-                    | FileMode::FMODE_ATOMIC_POS,
-            );
-        } else {
-            // 对字符设备等，只要具备读/写权限，就允许 pread/pwrite
-            if mode.contains(FileMode::FMODE_READ) {
-                mode.insert(FileMode::FMODE_PREAD);
-            }
-            if mode.contains(FileMode::FMODE_WRITE) {
-                mode.insert(FileMode::FMODE_PWRITE);
-            }
+        // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
+        if inode.is_stream() {
+            mode.insert(FileMode::FMODE_STREAM);
+        }
+        if inode.supports_seek() {
+            mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
+        }
+        if inode.supports_pread() {
+            mode.insert(FileMode::FMODE_PREAD);
+        }
+        if inode.supports_pwrite() {
+            mode.insert(FileMode::FMODE_PWRITE);
         }
 
         // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
@@ -613,6 +609,34 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功读取的字节数
     pub fn pread(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // Linux 语义：对不可 seek 的“流式对象”（Pipe/Socket/部分伪文件等），
+        // pread/pwrite/preadv/pwritev 应返回 ESPIPE（优先于读写权限导致的 EBADF）。
+        // 这里用 FMODE_STREAM 作为 VFS 层收敛点，避免因 FMODE_PREAD/权限位组合导致误报 EBADF。
+        if mode.contains(FileMode::FMODE_STREAM) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
+        if !mode.contains(FileMode::FMODE_PREAD) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 检查读权限
+        if !mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 检查读能力
+        if !mode.can_read() {
+            return Err(SystemError::EINVAL);
+        }
+
         self.do_read(offset, len, buf, false)
     }
 
@@ -626,6 +650,27 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功写入的字节数
     pub fn pwrite(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 同 pread：流式对象不支持随机偏移写入，返回 ESPIPE（优先于权限 EBADF）。
+        if mode.contains(FileMode::FMODE_STREAM) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
+        if !mode.contains(FileMode::FMODE_PWRITE) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 检查写权限
+        if !mode.contains(FileMode::FMODE_WRITE) {
+            return Err(SystemError::EBADF);
+        }
+
         self.do_write(offset, len, buf, false, false)
     }
 
@@ -651,6 +696,10 @@ impl File {
         len: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
+        self.writeable()?;
+        if !self.mode().contains(FileMode::FMODE_PWRITE) {
+            return Err(SystemError::ESPIPE);
+        }
         self.do_write(offset, len, buf, false, true)
     }
 
@@ -841,13 +890,16 @@ impl File {
     ///
     /// @param origin 调整的起始位置
     pub fn lseek(&self, origin: SeekFrom) -> Result<usize, SystemError> {
-        let file_type = self.inode.metadata()?.file_type;
-        match file_type {
-            FileType::Pipe | FileType::CharDevice => {
-                return Err(SystemError::ESPIPE);
-            }
-            _ => {}
+        let mode = self.mode();
+        // Linux 语义：O_PATH fd 的 lseek 返回 EBADF（优先于 ESPIPE）。
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
         }
+        if mode.contains(FileMode::FMODE_STREAM) || !mode.contains(FileMode::FMODE_LSEEK) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        let file_type = self.inode.metadata()?.file_type;
         // Check for procfs private data. If this is a procfs pseudo-file, disallow SEEK_END
         // and other unsupported seek modes.
         {

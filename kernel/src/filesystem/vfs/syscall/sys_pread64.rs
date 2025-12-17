@@ -4,7 +4,6 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PREAD64;
-use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -56,12 +55,6 @@ impl Syscall for SysPread64Handle {
 
         // Drop guard to avoid scheduling issues
         drop(fd_table_guard);
-
-        // 检查是否是管道/Socket (ESPIPE)
-        let md = file.metadata()?;
-        if md.file_type == FileType::Pipe || md.file_type == FileType::Socket {
-            return Err(SystemError::ESPIPE);
-        }
 
         return file.pread(offset, len, user_buf);
     }

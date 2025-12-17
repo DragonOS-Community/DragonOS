@@ -1,13 +1,15 @@
 use super::vfs::PollableInode;
+use crate::arch::MMArch;
 use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
-    vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
+    vfs::{FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock},
 };
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
+use crate::mm::MemoryManagementArch;
 use crate::process::{ProcessFlags, ProcessManager};
 use crate::syscall::Syscall;
 use alloc::string::String;
@@ -17,8 +19,53 @@ use core::any::Any;
 use ida::IdAllocator;
 use system_error::SystemError;
 
+lazy_static::lazy_static! {
+    static ref EVENTFD_FS: Arc<EventFdFs> = Arc::new(EventFdFs);
+}
+
 static EVENTFD_ID_ALLOCATOR: SpinLock<IdAllocator> =
     SpinLock::new(IdAllocator::new(0, u32::MAX as usize).unwrap());
+
+/// EventFd 文件系统
+///
+/// EventFd 是一个伪文件系统，类似于 PipeFS，用于支持 eventfd 文件描述符
+#[derive(Debug)]
+pub struct EventFdFs;
+
+impl EventFdFs {
+    /// 获取全局 EventFdFs 实例
+    pub fn instance() -> Arc<EventFdFs> {
+        EVENTFD_FS.clone()
+    }
+}
+
+impl FileSystem for EventFdFs {
+    fn root_inode(&self) -> Arc<dyn IndexNode> {
+        // EventFdFs 没有真正的根 inode，但我们需要实现这个方法
+        // 返回一个空的 eventfd inode 作为占位符
+        // 注意：这通常不会被调用，因为 eventfd 不是挂载的文件系统
+        Arc::new(EventFdInode::new(EventFd::new(0, EventFdFlags::empty(), 0)))
+    }
+
+    fn info(&self) -> FsInfo {
+        FsInfo {
+            blk_dev_id: 0,
+            max_name_len: 255,
+        }
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "eventfd"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        SuperBlock::new(Magic::EVENTFD_MAGIC, MMArch::PAGE_SIZE as u64, 255)
+    }
+}
 
 bitflags! {
     pub struct EventFdFlags: u32{
@@ -116,6 +163,12 @@ impl PollableInode for EventFdInode {
 }
 
 impl IndexNode for EventFdInode {
+    fn is_stream(&self) -> bool {
+        // eventfd 属于典型的不可 seek 的伪文件描述符：
+        // - lseek/pread/pwrite 应返回 ESPIPE（Linux 语义）
+        true
+    }
+
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
@@ -264,7 +317,7 @@ impl IndexNode for EventFdInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        panic!("EventFd does not have a filesystem")
+        EventFdFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {

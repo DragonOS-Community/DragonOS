@@ -6,10 +6,12 @@ use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
+use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::fault::PageFaultHandler;
 use crate::mm::page::Page;
 use crate::register_mountable_fs;
 use crate::{
+    arch::mm::LockedFrameAllocator,
     arch::MMArch,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{vcore::generate_inode_id, FileType},
@@ -40,6 +42,9 @@ use super::vfs::{Magic, MountableFileSystem, SuperBlock};
 
 const TMPFS_MAX_NAMELEN: usize = 255;
 const TMPFS_BLOCK_SIZE: u64 = 4096;
+
+const TMPFS_DEFAULT_MIN_SIZE_BYTES: usize = 16 * 1024 * 1024; // 16MiB
+const TMPFS_DEFAULT_MAX_SIZE_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4GiB
 
 fn tmpfs_move_entry_between_dirs(
     src_dir: &mut TmpfsInode,
@@ -274,13 +279,48 @@ impl FileSystem for Tmpfs {
 }
 
 impl Tmpfs {
+    #[inline]
+    fn default_size_bytes() -> usize {
+        // 与 /proc/meminfo 一致：从帧分配器获取物理内存总量。
+        let total = unsafe { LockedFrameAllocator.usage() }.total().bytes();
+        let half = total / 2;
+        half.clamp(TMPFS_DEFAULT_MIN_SIZE_BYTES, TMPFS_DEFAULT_MAX_SIZE_BYTES)
+    }
+
+    #[inline]
+    fn bytes_to_blocks_ceil(bytes: u64) -> u64 {
+        bytes.div_ceil(TMPFS_BLOCK_SIZE)
+    }
+
+    fn update_superblock_free(&self, current_bytes: u64) {
+        // 只在启用 size_limit 时输出可用容量；否则保持现有行为（0-sized）。
+        let Some(limit) = self.size_limit else {
+            return;
+        };
+        let total_blocks = limit / TMPFS_BLOCK_SIZE;
+        let used_blocks = Self::bytes_to_blocks_ceil(current_bytes);
+        let free_blocks = total_blocks.saturating_sub(used_blocks);
+        let mut sb = self.super_block.write();
+        sb.blocks = total_blocks;
+        sb.bfree = free_blocks;
+        sb.bavail = free_blocks;
+        sb.frsize = TMPFS_BLOCK_SIZE;
+    }
+
     pub fn new(mount_data: &TmpfsMountData) -> Arc<Self> {
+        // 若未指定 size=，使用默认容量策略（通常为物理内存的一半）。
+        // 这样 busybox df -h（默认过滤 f_blocks==0）就能显示 /tmp。
+        let size_limit = mount_data
+            .size_bytes
+            .or_else(|| Some(Self::default_size_bytes() as u64));
+
         let mut sb = SuperBlock::new(
             Magic::TMPFS_MAGIC,
             TMPFS_BLOCK_SIZE,
             TMPFS_MAX_NAMELEN as u64,
         );
-        if let Some(size) = mount_data.size_bytes {
+        sb.frsize = TMPFS_BLOCK_SIZE;
+        if let Some(size) = size_limit {
             let blocks = size / TMPFS_BLOCK_SIZE;
             sb.blocks = blocks;
             sb.bfree = blocks;
@@ -293,7 +333,7 @@ impl Tmpfs {
         let result: Arc<Tmpfs> = Arc::new(Tmpfs {
             root_inode: root,
             super_block: RwLock::new(sb),
-            size_limit: mount_data.size_bytes,
+            size_limit,
             current_size: AtomicU64::new(0),
         });
 
@@ -328,7 +368,11 @@ impl Tmpfs {
                     Ordering::Release,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => break,     // 更新成功
+                    Ok(_) => {
+                        // 同步更新 superblock 的 free 统计，供 statfs/df 使用
+                        self.update_superblock_free(new_total);
+                        break;
+                    } // 更新成功
                     Err(_) => continue, // 被其他线程修改，重试
                 }
             }
@@ -342,8 +386,11 @@ impl Tmpfs {
         if self.size_limit.is_some() {
             let size_to_decrease = size as u64;
             // 使用fetch_sub原子地减少大小
-            self.current_size
+            let prev = self
+                .current_size
                 .fetch_sub(size_to_decrease, Ordering::Release);
+            let new = prev.saturating_sub(size_to_decrease);
+            self.update_superblock_free(new);
         }
     }
 }

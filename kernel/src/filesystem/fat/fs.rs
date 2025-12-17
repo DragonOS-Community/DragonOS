@@ -421,11 +421,29 @@ impl FileSystem for FATFileSystem {
     }
 
     fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(
+        let mut sb = SuperBlock::new(
             Magic::FAT_MAGIC,
             self.bpb.bytes_per_sector.into(),
             FAT_MAX_NAMELEN,
-        )
+        );
+
+        // statfs/statvfs 依赖这些字段：
+        // - f_frsize/f_bsize: 基本块大小
+        // - f_blocks: 总块数（BusyBox df 默认会过滤 f_blocks==0 的挂载项）
+        // - f_bfree/f_bavail: 空闲块数
+        let frsize = self.bpb.bytes_per_sector as u64;
+        sb.frsize = frsize;
+        sb.blocks = self.data_sectors();
+
+        if sb.blocks > 0 {
+            let free_clusters = self.free_clusters_cached().unwrap_or(0);
+            let free_sectors = free_clusters.saturating_mul(self.bpb.sector_per_cluster as u64);
+            let free_sectors = core::cmp::min(free_sectors, sb.blocks);
+            sb.bfree = free_sectors;
+            sb.bavail = free_sectors;
+        }
+
+        sb
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
@@ -449,6 +467,120 @@ impl FATFileSystem {
     pub const FAT16_MAX_CLUSTER: u32 = 0xFFF5;
     /// FAT32允许的最大簇号
     pub const FAT32_MAX_CLUSTER: u32 = 0x0FFFFFF7;
+
+    /// 计算 FAT 数据区的总扇区数（用于 statfs 的 f_blocks，单位为扇区）。
+    #[inline]
+    fn data_sectors(&self) -> u64 {
+        let total_sectors = if self.bpb.total_sectors_16 != 0 {
+            self.bpb.total_sectors_16 as u64
+        } else {
+            self.bpb.total_sectors_32 as u64
+        };
+        total_sectors.saturating_sub(self.first_data_sector)
+    }
+
+    /// 计算空闲簇数量：优先使用 FSInfo；否则扫描 FAT 表并回填内存缓存。
+    fn free_clusters_cached(&self) -> Result<u64, SystemError> {
+        let max_cluster = self.max_cluster_number();
+        // 先尝试使用 FSInfo（若可用）
+        {
+            let guard = self.fs_info.0.lock();
+            if let Some(n) = guard.count_free_cluster(max_cluster) {
+                return Ok(n);
+            }
+        }
+
+        // FSInfo 不可用：扫描 FAT 表（一次性），并回填缓存（FAT32 则后续可 flush 到盘）。
+        let free_clusters = self.scan_free_clusters(max_cluster)?;
+
+        if free_clusters <= u32::MAX as u64 {
+            self.fs_info
+                .0
+                .lock()
+                .update_free_count_abs(free_clusters as u32);
+        }
+        Ok(free_clusters)
+    }
+
+    /// 扫描 FAT 表统计空闲簇数量。
+    ///
+    /// 注意：这是 O(N) 操作，但仅在 FSInfo 不可用时触发，并会写入缓存。
+    fn scan_free_clusters(&self, max_cluster: Cluster) -> Result<u64, SystemError> {
+        let start_cluster = RESERVED_CLUSTERS as u64;
+        let end_cluster = max_cluster.cluster_num;
+        if end_cluster < start_cluster {
+            return Ok(0);
+        }
+
+        match self.bpb.fat_type {
+            FATType::FAT32(_) => self.scan_free_clusters_fixed_width(end_cluster, 4, 0x0FFF_FFFF),
+            FATType::FAT16(_) => self.scan_free_clusters_fixed_width(end_cluster, 2, 0xFFFF),
+            FATType::FAT12(_) => {
+                // FAT12 解析较复杂（12-bit packing），这里退化为逐簇读取；FAT12 规模通常较小。
+                let mut free = 0u64;
+                for c in start_cluster..=end_cluster {
+                    if matches!(self.get_fat_entry(Cluster::new(c))?, FATEntry::Unused) {
+                        free += 1;
+                    }
+                }
+                Ok(free)
+            }
+        }
+    }
+
+    /// 固定宽度 FAT 表扫描（FAT16=2 bytes, FAT32=4 bytes）。
+    ///
+    /// `mask` 用于 FAT32 的高 4bit 保留位屏蔽。
+    fn scan_free_clusters_fixed_width(
+        &self,
+        end_cluster: u64,
+        entry_bytes: usize,
+        mask: u32,
+    ) -> Result<u64, SystemError> {
+        let start_cluster = RESERVED_CLUSTERS as u64;
+
+        let fat_start_sector = self.fat_start_sector();
+        let fat_bytes_offset = fat_start_sector * (self.bpb.bytes_per_sector as u64);
+
+        // 只扫描 [start_cluster, end_cluster] 的 entry。
+        let start_byte = start_cluster * entry_bytes as u64;
+        let end_byte_exclusive = (end_cluster + 1) * entry_bytes as u64;
+
+        const CHUNK_BYTES: usize = 512 * 1024; // 512KB
+
+        let mut free = 0u64;
+        let mut cur = start_byte;
+        let mut remaining = end_byte_exclusive.saturating_sub(start_byte);
+
+        while remaining > 0 {
+            let mut to_read = core::cmp::min(remaining as usize, CHUNK_BYTES);
+            // 对齐到 entry_bytes，避免跨 chunk 解析 entry
+            to_read -= to_read % entry_bytes;
+            if to_read == 0 {
+                to_read = entry_bytes;
+            }
+
+            let mut buf = vec![0u8; to_read];
+            self.gendisk
+                .read_at_bytes(&mut buf, (fat_bytes_offset + cur) as usize)?;
+
+            for i in (0..buf.len()).step_by(entry_bytes) {
+                let val = match entry_bytes {
+                    2 => u16::from_le_bytes([buf[i], buf[i + 1]]) as u32,
+                    4 => u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) & mask,
+                    _ => 0,
+                };
+                if val == 0 {
+                    free += 1;
+                }
+            }
+
+            cur += to_read as u64;
+            remaining = remaining.saturating_sub(to_read as u64);
+        }
+
+        Ok(free)
+    }
 
     pub fn new(gendisk: Arc<GenDisk>) -> Result<Arc<FATFileSystem>, SystemError> {
         let bpb = BiosParameterBlock::new(&gendisk)?;
@@ -1456,7 +1588,11 @@ impl FATFsInfo {
     /// 请注意，除非手动调用`flush()`，否则本函数不会将数据刷入磁盘
     #[allow(dead_code)]
     pub fn update_free_count_delta(&mut self, delta: i32) {
-        self.free_count = (self.free_count as i32 + delta) as u32;
+        // FAT32 FSInfo 的 free_count 可能为 0xFFFFFFFF（表示不可用/未初始化）。
+        // 在这种情况下不应做增量更新，否则会发生溢出并产生错误统计值。
+        if self.free_count != 0xFFFF_FFFF {
+            self.free_count = (self.free_count as i32 + delta) as u32;
+        }
     }
 
     /// @brief 更新FsInfo中的“第一个空闲簇统计信息“为next_free.

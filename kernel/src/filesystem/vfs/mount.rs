@@ -16,7 +16,7 @@ use ida::IdAllocator;
 use system_error::SystemError;
 
 use crate::{
-    driver::base::device::device_number::DeviceNumber,
+    driver::base::device::device_number::{DeviceNumber, Major},
     filesystem::{
         page_cache::PageCache,
         vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
@@ -745,7 +745,17 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn metadata(&self) -> Result<super::Metadata, SystemError> {
-        return self.inner_inode.metadata();
+        let mut md = self.inner_inode.metadata()?;
+
+        // 为每个挂载点提供稳定且唯一的 st_dev（通过 metadata.dev_id）。
+        // 这里针对的是底层文件系统没有提供dev_id的情况
+        if md.dev_id == 0 {
+            let mnt_id: usize = self.mount_fs.mount_id().into();
+            let minor = (mnt_id as u32) & DeviceNumber::MINOR_MASK;
+            md.dev_id = DeviceNumber::new(Major::UNNAMED_MAJOR, minor).data() as usize;
+        }
+
+        Ok(md)
     }
 
     #[inline]

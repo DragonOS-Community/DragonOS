@@ -302,15 +302,14 @@ pub fn vfs_getattr(
         kstat.btime.tv_nsec = metadata.btime.tv_nsec;
     }
 
-    // 对于字符/块设备，st_rdev 在基础属性中也应被返回。
-    // 即便调用者未显式请求 STATX_ALL，也填充 rdev 以符合 Linux 语义。
+    // 即便调用者未显式请求 STATX_ALL，也填充 rdev、dev 以符合 Linux 语义。
     kstat.rdev = metadata.raw_dev;
+    kstat.dev = DeviceNumber::from(metadata.dev_id as u32);
 
     if request_mask.contains(PosixStatxMask::STATX_ALL) {
         kstat.attributes = StxAttributes::STATX_ATTR_APPEND;
         kstat.attributes_mask |=
             StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
-        kstat.dev = DeviceNumber::from(metadata.dev_id as u32);
     }
 
     // 把文件类型加入mode里面 （todo: 在具体的文件系统里面去实现这个操作。这里只是权宜之计）

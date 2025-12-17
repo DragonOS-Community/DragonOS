@@ -10,6 +10,7 @@ impl ProcFS {
         self.create_kmsg_file();
         self.create_version_signature_file();
         self.create_mounts_file();
+        self.create_cmdline_file();
         self.create_version_file();
         self.create_cpuinfo_file();
         self.create_self_file();
@@ -84,6 +85,21 @@ impl ProcFS {
             .unwrap();
         self.create_proc_file(mounts_params)
             .unwrap_or_else(|_| panic!("create mounts error"));
+    }
+
+    /// @brief 创建 /proc/cmdline 文件
+    #[inline(never)]
+    fn create_cmdline_file(&self) {
+        let cmdline_params = ProcFileCreationParams::builder()
+            .parent(self.root_inode())
+            .name("cmdline")
+            .file_type(FileType::File)
+            .mode(InodeMode::from_bits_truncate(0o444))
+            .ftype(ProcFileType::ProcCmdline)
+            .build()
+            .unwrap();
+        self.create_proc_file(cmdline_params)
+            .unwrap_or_else(|_| panic!("create cmdline error"));
     }
 
     /// @brief 创建 /proc/version 文件

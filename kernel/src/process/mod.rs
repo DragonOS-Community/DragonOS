@@ -8,6 +8,7 @@ use core::{
 };
 
 use alloc::{
+    ffi::CString,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -919,6 +920,8 @@ pub struct ProcessControlBlock {
 
     /// 进程的可执行文件路径
     executable_path: RwLock<String>,
+    /// 进程的命令行（用于 /proc/<pid>/cmdline，Linux 语义：argv 以 '\0' 分隔）
+    cmdline: RwLock<Vec<u8>>,
     /// 资源限制（rlimit）数组
     rlimits: RwLock<[RLimit64; RLimitID::Nlimits as usize]>,
 }
@@ -1043,6 +1046,7 @@ impl ProcessControlBlock {
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
+                cmdline: RwLock::new(Vec::new()),
                 rlimits: RwLock::new(Self::default_rlimits()),
             };
 
@@ -1362,6 +1366,29 @@ impl ProcessControlBlock {
 
     pub fn execute_path(&self) -> String {
         self.executable_path.read().clone()
+    }
+
+    /// 获取 /proc/<pid>/cmdline 的原始字节序列（argv 以 '\0' 分隔）。
+    #[inline(always)]
+    pub fn cmdline_bytes(&self) -> Vec<u8> {
+        self.cmdline.read().clone()
+    }
+
+    /// 直接设置 cmdline（用于 fork 继承等场景）。
+    #[inline(always)]
+    pub fn set_cmdline_bytes(&self, data: Vec<u8>) {
+        *self.cmdline.write() = data;
+    }
+
+    /// 在 exec 成功后写入 argv（Linux 语义：每个参数以 '\0' 结尾，整体通常也以 '\0' 结尾）。
+    #[inline(never)]
+    pub fn set_cmdline_from_argv(&self, argv: &[CString]) {
+        let mut buf: Vec<u8> = Vec::new();
+        for arg in argv {
+            buf.extend_from_slice(arg.as_bytes());
+            buf.push(0);
+        }
+        *self.cmdline.write() = buf;
     }
 
     pub fn real_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {

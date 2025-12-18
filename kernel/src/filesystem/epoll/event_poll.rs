@@ -1,8 +1,3 @@
-use core::{
-    fmt::Debug,
-    sync::atomic::{AtomicBool, Ordering},
-};
-
 use crate::{
     filesystem::vfs::{
         file::{File, FileFlags},
@@ -11,13 +6,17 @@ use crate::{
     libs::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
-        wait_queue::{WaitQueue, Waiter},
+        wait_queue::{WaitQueue, Waiter, Waker},
     },
     process::ProcessManager,
     time::{
-        timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
+        timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
         PosixTimeSpec,
     },
+};
+use core::{
+    fmt::Debug,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use alloc::{
@@ -28,6 +27,22 @@ use alloc::{
 use system_error::SystemError;
 
 use super::{fs::EPollInode, EPollCtlOption, EPollEvent, EPollEventType, EPollItem};
+
+use alloc::boxed::Box;
+
+#[derive(Debug)]
+struct EpollTimeoutWaker {
+    waker: Arc<Waker>,
+}
+
+impl TimerFunction for EpollTimeoutWaker {
+    fn run(&mut self) -> Result<(), SystemError> {
+        // Wake the waiter (and thus the process) in a way Waiter::wait can observe.
+        // NOTE: Timer-based wakeup must go through Waker::wake(); waking PCB alone is insufficient.
+        self.waker.wake();
+        Ok(())
+    }
+}
 
 /// 内核的Epoll对象结构体，当用户创建一个Epoll时，内核就会创建一个该类型对象
 /// 它对应一个epfd
@@ -329,6 +344,7 @@ impl EventPoll {
         }
         if let Some(epoll_data) = epolldata {
             let epoll = epoll_data.epoll.clone();
+
             let epoll_guard = epoll.0.lock_irqsave();
 
             let mut timeout = false;
@@ -391,19 +407,22 @@ impl EventPoll {
                 }
 
                 // 还未等待到事件发生，则睡眠
-                // 注册定时器
+                // 构造一次等待（先构造 Waiter/Waker，超时需要通过 Waker::wake 触发）
+                let (waiter, waker) = Waiter::new_pair();
+
+                // 注册定时器：用 waker.wake() 来触发 waiter 退出等待（而不是仅唤醒 PCB）
                 let mut timer = None;
                 if let Some(timespec) = timespec {
-                    let handle = WakeUpHelper::new(current_pcb.clone());
-                    let jiffies = next_n_us_timer_jiffies(
-                        (timespec.tv_sec * 1000000 + timespec.tv_nsec / 1000) as u64,
+                    let us = (timespec.tv_sec * 1_000_000 + timespec.tv_nsec / 1_000) as u64;
+                    let jiffies = next_n_us_timer_jiffies(us);
+                    let inner: Arc<Timer> = Timer::new(
+                        Box::new(EpollTimeoutWaker {
+                            waker: waker.clone(),
+                        }),
+                        jiffies,
                     );
-                    let inner: Arc<Timer> = Timer::new(handle, jiffies);
-                    inner.activate();
                     timer = Some(inner);
                 }
-                // 构造一次等待
-                let (waiter, waker) = Waiter::new_pair();
                 {
                     let guard = epoll.0.lock_irqsave();
                     // 注册前再次检查，避免错过事件

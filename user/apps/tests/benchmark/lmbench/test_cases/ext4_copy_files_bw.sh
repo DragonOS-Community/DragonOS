@@ -6,7 +6,10 @@
 
 set -e
 
-
+# 加载环境变量
+SCTIPDIR=$(cd $(dirname ${BASH_SOURCE[0]}) > /dev/null && pwd)
+ENV_PATH="${SCTIPDIR}/../env.sh"
+source ${ENV_PATH}
 
 
 echo "=== Running ext4_copy_files_bw test ==="

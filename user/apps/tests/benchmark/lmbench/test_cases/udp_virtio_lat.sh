@@ -5,7 +5,10 @@
 
 set -e
 
-
+# 加载环境变量
+SCTIPDIR=$(cd $(dirname ${BASH_SOURCE[0]}) > /dev/null && pwd)
+ENV_PATH="${SCTIPDIR}/../env.sh"
+source ${ENV_PATH}
 
 echo "=== Running UDP virtio latency test ==="
 echo "Note: This test requires a server running at 10.0.2.15"

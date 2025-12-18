@@ -1,4 +1,13 @@
-{ pkgs, system, fenix, target, buildDir, syscallTestDir }:
+{ 
+  pkgs, 
+  system, 
+  fenix, 
+  target, 
+  buildDir, 
+  syscallTestDir, 
+  rootfsType ? "vfat", 
+  partitionType ? "mbr" 
+}:
 
 let
   image = import ./rootfs-tar.nix { inherit pkgs system fenix syscallTestDir; };
@@ -56,9 +65,9 @@ let
       echo "  Initializing disk and copying rootfs..."
       guestfish -a "$TEMP_IMG" <<EOF
         run
-        part-init /dev/sda gpt
+        part-init /dev/sda ${partitionType}
         part-add /dev/sda primary 2048 -2048
-        mkfs ext4 /dev/sda1
+        mkfs ${rootfsType} /dev/sda1
         mount /dev/sda1 /
         tar-in $OUTPUT_TAR /
         chmod 0755 /

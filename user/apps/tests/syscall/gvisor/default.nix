@@ -31,7 +31,7 @@ in rustPlatform.buildRustPackage {
 
   postInstall = ''
     # Ensure runner binary exists and rename to gvisor-test-runner as per Makefile install
-    mkdir -p $out/bin
+    mkdir -p "$out/${installDir}"
     if [ -x "$out/bin/${runnerName}" ]; then
       mv "$out/bin/${runnerName}" "$out/${installDir}/gvisor-test-runner"
     fi

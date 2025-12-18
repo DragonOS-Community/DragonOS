@@ -1,4 +1,4 @@
-{ pkgs, system, fenix }:
+{ pkgs, system, fenix, syscallTestDir }:
 
 # Return a list of app derivations to be copied into the rootfs.
 let
@@ -16,6 +16,6 @@ in [
   (pkgs.callPackage ./tests/syscall/gvisor {
     fenix = fenix;
     system = system;
-    installDir = "share/gvisor";
+    installDir = syscallTestDir;
   })
 ]

@@ -1,9 +1,8 @@
-{ pkgs, system, fenix }:
+{ pkgs, system, fenix, syscallTestDir }:
 
 # 产物是一个可以生成 rootfs.tar 的脚本
 let
-  apps = import ./apps { inherit pkgs system fenix; };
-
+  apps = import ./apps { inherit pkgs system fenix syscallTestDir; };
   sys-config = pkgs.runCommand "sysconfig" {
     src = ./sysconfig;
   } ''
@@ -11,14 +10,14 @@ let
     cp -r $src/* $out/
   '';
 
-  # streamLayeredImage 返回一个脚本，执行后生成 docker tar，不会在 store 中存储完整镜像
-  imageStream = pkgs.dockerTools.streamLayeredImage {
+  # 使用 buildImage 创建 Docker 镜像（单层）
+  # 直接返回 dockerImage，解压逻辑在 default.nix 中处理
+  dockerImage = pkgs.dockerTools.buildImage {
     name = "busybox-rootfs";
-    tag = "latest";
-
-    contents = [
+    copyToRoot = [
       sys-config
     ] ++ apps;
+    keepContentsDirlinks = false;
   };
-  
-in imageStream
+
+in dockerImage

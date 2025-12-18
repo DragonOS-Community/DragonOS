@@ -3,6 +3,8 @@
   pkgs,
   rootfsDisk,
   kernel,
+  syscallTestDir,
+  autotest
 }:
 
 let
@@ -23,9 +25,7 @@ let
   mkQemuArgs = { arch, isNographic }: 
     let
       baseArgs = [
-        # "-L" "${pkgs.qemu}/share/qemu"
         "-m" baseConfig.memory
-        # FIXED: 补全 smp 参数，和原脚本一致
         "-smp" "${baseConfig.cores},cores=${baseConfig.cores},threads=1,sockets=1"
         "-object" "memory-backend-file,size=${baseConfig.memory},id=${baseConfig.shmId},mem-path=/dev/shm/${baseConfig.shmId},share=on"
         "-netdev" "user,id=hostnet0,hostfwd=tcp::12580-:12580"
@@ -33,18 +33,18 @@ let
         "-usb"
         "-device" "qemu-xhci,id=xhci,p2=8,p3=4"
         "-D" "qemu.log"
-        
-        # FIXED: 新增缺失的 Boot Order
+
+        # Boot Order
         "-boot" "order=d"
-        # FIXED: 新增缺失的 GDB Stub
+        # GDB Stub
         "-s"
-        # FIXED: 新增缺失的 RTC 设置
+
         "-rtc" "clock=host,base=localtime"
-        # FIXED: 新增缺失的 Trace 事件 (注意 * 号在 Nix 字符串里是安全的，escapeShellArgs 会处理它)
+        # Trace events
         "-d" "cpu_reset,guest_errors,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*"
       ];
       nographicArgs = lib.optionals isNographic ([
-        "-nographic"
+        "--nographic"
         "-serial" "chardev:mux"
         "-monitor" "chardev:mux"
         "-chardev" "stdio,id=mux,mux=on,signal=off,logfile=serial_opt.txt"
@@ -106,32 +106,25 @@ let
       # 但实际上 qemu 会自己创建，这里只需要保证清理。
       # 原脚本是 rm -rf ... -> qemu -> rm -rf ...
 
-      DRAGONOS_LOGLEVEL=''${DRAGONOS_LOGLEVEL:-4}
       EXTRA_CMDLINE="${qemuConfig.cmdlineExtra}"
       
       # FIXED: 补全缺失的默认内核参数 AUTO_TEST 和 SYSCALL_TEST_DIR
-      FINAL_CMDLINE="init=${initProgram} loglevel=$DRAGONOS_LOGLEVEL AUTO_TEST=none SYSCALL_TEST_DIR=/opt/tests/gvisor $EXTRA_CMDLINE"
+      FINAL_CMDLINE="init=${initProgram} AUTO_TEST=${autotest} SYSCALL_TEST_DIR=${syscallTestDir} $EXTRA_CMDLINE"
 
-      # --- 1. 生成动态参数 ---
       ${archSpecificArgs}
 
-      # --- 2. 命令预览 ---
-      GREEN='\033[0;32m'
-      NC='\033[0m'
-      BOLD='\033[1m'
-
-      echo -e "''${GREEN}================== DragonOS QEMU Command Preview ==================''${NC}"
-      echo -e "''${BOLD}Binary:''${NC} sudo ${qemuBin}"
-      echo -e "''${BOLD}Base Flags:''${NC} ${qemuFlagsStr}"
-      echo -e "''${BOLD}Arch Flags:''${NC} ''${ARCH_FLAGS[*]}"
-      echo -e "''${BOLD}Boot Args:''${NC} ''${BOOT_ARGS[*]}"
-      echo -e "''${BOLD}Disk Args:''${NC} ''${DISK_ARGS[*]}"
-      echo -e "''${GREEN}==================================================================''${NC}"
+      echo -e "================== DragonOS QEMU Command Preview =================="
+      echo -e "Binary: sudo ${qemuBin}"
+      echo -e "Base Flags: ${qemuFlagsStr}"
+      echo -e "Arch Flags: ''${ARCH_FLAGS[*]}"
+      echo -e "Boot Args: ''${BOOT_ARGS[*]}"
+      echo -e "Disk Args: ''${DISK_ARGS[*]}"
+      echo -e "=================================================================="
       echo ""
 
       # --- 3. 执行 ---
       ${qemuBin} --version
-      exec sudo ${qemuBin} ${qemuFlagsStr} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+      sudo ${qemuBin} ${qemuFlagsStr} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
     '';
 
   # 5. QEMU 二进制选择器 (支持外部 QEMU)

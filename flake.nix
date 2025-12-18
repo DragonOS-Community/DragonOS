@@ -15,11 +15,14 @@
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
       target = "x86_64";
+      syscallTestDir = "/usr/share/gvisor";
       qemuScripts = import ./tools/qemu/default.nix { 
         lib = pkgs.lib;
         inherit pkgs;
         rootfsDisk = "./bin/disk-image-${target}.img";
         kernel = "./bin/kernel";
+        autotest = "none";
+        syscallTestDir = syscallTestDir;
       };
     in {
       # packages.${system}.default = ;
@@ -31,7 +34,7 @@
         build-rootfs.${target} = {
           type = "app";
           program = "${pkgs.callPackage ./user/default.nix {
-            inherit pkgs system fenix target;
+            inherit pkgs system fenix target syscallTestDir;
             buildDir = "./bin";
           }}/bin/build-rootfs-image";
         };

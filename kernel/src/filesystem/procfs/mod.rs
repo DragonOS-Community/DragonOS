@@ -1,5 +1,3 @@
-use core::intrinsics::size_of;
-
 use ::log::{error, info};
 use alloc::{
     borrow::ToOwned,
@@ -9,16 +7,20 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::intrinsics::size_of;
 use system_error::SystemError;
 
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{
-        mount::{MountFlags, MountPath},
-        syscall::RenameFlags,
-        vcore::generate_inode_id,
-        FileType,
+    filesystem::{
+        procfs::template::Builder,
+        vfs::{
+            mount::{MountFlags, MountPath},
+            syscall::RenameFlags,
+            vcore::generate_inode_id,
+            FileType,
+        },
     },
     libs::{
         once::Once,
@@ -37,12 +39,23 @@ use super::vfs::{
     FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
+mod cmdline;
+mod cpuinfo;
 pub mod kmsg;
+mod kmsg_file;
 pub mod log;
+mod meminfo;
+mod mounts;
+mod pid;
 mod proc_cpuinfo;
 mod proc_mounts;
 mod proc_version;
+pub mod root;
+mod self_;
 mod syscall;
+pub(super) mod template;
+mod utils;
+mod version;
 
 /// @brief 进程文件类型
 /// @usage 用于定义进程文件夹下的各类文件类型
@@ -181,9 +194,19 @@ pub struct InodeInfo {
     // 其他需要传入的信息在此定义
 }
 
+impl Default for InodeInfo {
+    fn default() -> Self {
+        InodeInfo {
+            pid: None,
+            ftype: ProcFileType::Default,
+            fd: -1,
+        }
+    }
+}
+
 /// @brief procfs的inode名称的最大长度
-const PROCFS_MAX_NAMELEN: usize = 64;
-const PROCFS_BLOCK_SIZE: u64 = 512;
+pub(super) const PROCFS_MAX_NAMELEN: usize = 64;
+pub(super) const PROCFS_BLOCK_SIZE: u64 = 512;
 /// @brief procfs文件系统的Inode结构体
 #[derive(Debug)]
 pub struct LockedProcFSInode(SpinLock<ProcFSInode>);
@@ -592,7 +615,7 @@ impl ProcFS {
             .parent(result.root_inode())
             .name("meminfo")
             .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
+            .mode(ModeType::S_IRUGO)
             .ftype(ProcFileType::ProcMeminfo)
             .build()
             .unwrap();
@@ -605,7 +628,7 @@ impl ProcFS {
             .parent(result.root_inode())
             .name("kmsg")
             .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
+            .mode(ModeType::S_IRUGO)
             .ftype(ProcFileType::ProcKmsg)
             .build()
             .unwrap();
@@ -651,7 +674,7 @@ impl ProcFS {
             .parent(result.root_inode())
             .name("version")
             .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
+            .mode(ModeType::S_IRUGO)
             .ftype(ProcFileType::ProcVersion)
             .build()
             .unwrap();
@@ -664,7 +687,7 @@ impl ProcFS {
             .parent(result.root_inode())
             .name("cpuinfo")
             .file_type(FileType::File)
-            .mode(ModeType::from_bits_truncate(0o444))
+            .mode(ModeType::S_IRUGO)
             .ftype(ProcFileType::ProcCpuinfo)
             .build()
             .unwrap();
@@ -700,11 +723,7 @@ impl ProcFS {
         )?;
         // 创建相关文件
         // status文件
-        let status_binding = pid_dir.create(
-            "status",
-            FileType::File,
-            ModeType::from_bits_truncate(0o444),
-        )?;
+        let status_binding = pid_dir.create("status", FileType::File, ModeType::S_IRUGO)?;
         let status_file: &LockedProcFSInode = status_binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
@@ -713,12 +732,8 @@ impl ProcFS {
         status_file.0.lock().fdata.ftype = ProcFileType::ProcStatus;
 
         // exe文件
-        let exe_binding = pid_dir.create_with_data(
-            "exe",
-            FileType::SymLink,
-            ModeType::from_bits_truncate(0o444),
-            0,
-        )?;
+        let exe_binding =
+            pid_dir.create_with_data("exe", FileType::SymLink, ModeType::S_IRUGO, 0)?;
         let exe_file = exe_binding
             .as_any_ref()
             .downcast_ref::<LockedProcFSInode>()
@@ -767,11 +782,7 @@ impl LockedProcFSInode {
         let file = fd_table.get_file_by_fd(fd);
         if file.is_some() {
             let _ = self.unlink(&fd.to_string());
-            let fd_file = self.create(
-                &fd.to_string(),
-                FileType::SymLink,
-                ModeType::from_bits_truncate(0o444),
-            )?;
+            let fd_file = self.create(&fd.to_string(), FileType::SymLink, ModeType::S_IRUGO)?;
             let fd_file_proc = fd_file
                 .as_any_ref()
                 .downcast_ref::<LockedProcFSInode>()
@@ -862,6 +873,7 @@ impl IndexNode for LockedProcFSInode {
         buf: &mut [u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        info!("ProcFS: read_at called with offset {}, len {}", offset, len);
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
@@ -878,8 +890,7 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcStatus
             | ProcFileType::ProcMeminfo
             | ProcFileType::ProcMounts
-            | ProcFileType::ProcVersion
-            | ProcFileType::ProcCpuinfo => {
+            | ProcFileType::ProcVersion => {
                 // 获取数据信息
                 let mut private_data = match &*data {
                     FilePrivateData::Procfs(p) => p.clone(),
@@ -892,7 +903,7 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcExe => return inode.read_exe_link(buf, offset),
             ProcFileType::ProcSelf => return inode.read_self_link(buf),
             ProcFileType::ProcFdFile => return inode.read_fd_link(buf),
-
+            ProcFileType::ProcCpuinfo => {}
             _ => (),
         };
 

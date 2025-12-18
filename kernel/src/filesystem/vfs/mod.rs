@@ -9,7 +9,7 @@ pub mod syscall;
 pub mod utils;
 pub mod vcore;
 
-use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
+use ::core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
@@ -46,6 +46,12 @@ pub const MAX_PATHLEN: usize = 1024;
 
 // 定义inode号
 int_like!(InodeId, AtomicInodeId, usize, AtomicUsize);
+
+impl Display for InodeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,7 +482,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn as_any_ref(&self) -> &dyn Any;
 
     /// @brief 列出当前inode下的所有目录项的名字
-    fn list(&self) -> Result<Vec<String>, SystemError>;
+    fn list(&self) -> Result<Vec<String>, SystemError> {
+        Err(SystemError::ENOTDIR)
+    }
 
     /// # mount - 挂载文件系统
     ///

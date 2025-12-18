@@ -4,6 +4,7 @@ use core::{
     hint::spin_loop,
     intrinsics::unlikely,
     mem::ManuallyDrop,
+    str::FromStr,
     sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
@@ -97,6 +98,11 @@ pub mod utils;
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> =
     SpinLock::new(None);
+
+pub(crate) fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>>
+{
+    &ALL_PROCESS
+}
 
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 
@@ -683,6 +689,15 @@ int_like!(RawPid, AtomicRawPid, usize, AtomicUsize);
 impl fmt::Display for RawPid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for RawPid {
+    type Err = core::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let pid = usize::from_str(s)?;
+        Ok(RawPid(pid))
     }
 }
 

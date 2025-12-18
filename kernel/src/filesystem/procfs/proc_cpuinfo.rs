@@ -10,6 +10,7 @@ impl ProcFSInode {
         &self,
         pdata: &mut ProcfsFilePrivateData,
     ) -> Result<i64, SystemError> {
+        log::info!("Opening /proc/cpuinfo");
         let cpu_manager = smp_cpu_manager();
 
         // 遍历所有present的CPU

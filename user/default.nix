@@ -51,6 +51,32 @@ let
       TAR_SIZE=$(du -h "$OUTPUT_TAR" | cut -f1)
       echo "  ✓ rootfs.tar created ($TAR_SIZE)"
       
+      # 如果是 vfat 文件系统，需要特殊处理：排除 /nix/store，解引用符号链接
+      FINAL_TAR="$OUTPUT_TAR"
+      # shellcheck disable=SC2050
+      if [ "${rootfsType}" = "vfat" ]; then
+        echo "  Processing rootfs for vfat (excluding /nix/store, dereferencing symlinks)..."
+        
+        EXTRACT_DIR=$(mktemp -d)
+        FILTERED_TAR="${buildDir}/rootfs-filtered.tar"
+        
+        # 添加到清理列表
+        trap 'chmod +w -R "$TEMP_DIR" "$EXTRACT_DIR" && rm -rf "$TEMP_DIR" "$EXTRACT_DIR"' EXIT
+        
+        # 解压原始 tar，排除 /nix/store
+        echo "    Extracting and filtering..."
+        tar --exclude='./nix' --exclude='./nix/store' -xf "$OUTPUT_TAR" -C "$EXTRACT_DIR"
+        
+        # 重新打包，解引用符号链接和硬链接
+        echo "    Re-packing with dereferenced links..."
+        tar --dereference --hard-dereference -cf "$FILTERED_TAR" -C "$EXTRACT_DIR" .
+        
+        FILTERED_SIZE=$(du -h "$FILTERED_TAR" | cut -f1)
+        echo "  ✓ filtered rootfs.tar created ($FILTERED_SIZE, /nix/store excluded)"
+        
+        FINAL_TAR="$FILTERED_TAR"
+      fi
+      
       echo "==> Building disk image at $DISK_IMAGE"
       
       export LIBGUESTFS_CACHEDIR=/tmp
@@ -59,7 +85,7 @@ let
       # 创建磁盘镜像并初始化文件系统
       echo "  Creating disk image..."
       TEMP_IMG="$DISK_IMAGE.tmp"
-      truncate -s 2G "$TEMP_IMG"
+      truncate -s 4G "$TEMP_IMG"
       
       # 使用 guestfish 创建分区并注入 tar
       echo "  Initializing disk and copying rootfs..."
@@ -69,7 +95,7 @@ let
         part-add /dev/sda primary 2048 -2048
         mkfs ${rootfsType} /dev/sda1
         mount /dev/sda1 /
-        tar-in $OUTPUT_TAR /
+        tar-in $FINAL_TAR /
         chmod 0755 /
         umount /
         sync

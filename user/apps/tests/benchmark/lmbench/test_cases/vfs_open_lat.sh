@@ -11,7 +11,9 @@ ENV_PATH="${SCTIPDIR}/../env.sh"
 source ${ENV_PATH}
 
 echo "=== Running VFS open latency test ==="
+touch testfile
 ${LMBENCH_BIN_DIR}/lat_syscall -P 1 -W 1000 -N 1000 open testfile
+rm testfile
 
 if [ $? -eq 0 ]; then
     echo "Test completed successfully"

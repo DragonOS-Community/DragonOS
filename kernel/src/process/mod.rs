@@ -85,6 +85,7 @@ pub mod idle;
 pub mod kthread;
 pub mod namespace;
 pub mod pid;
+pub mod posix_timer;
 pub mod preempt;
 pub mod process_group;
 pub mod resource;
@@ -479,11 +480,20 @@ impl ProcessManager {
 
             if let Some(addr) = thread.clear_child_tid {
                 // 按 Linux 语义：先清零 userland 的 *clear_child_tid，再 futex_wake(addr)
-                unsafe {
-                    clear_user_protected(addr, core::mem::size_of::<i32>())
-                        .expect("clear tid failed")
+                let cleared_ok = unsafe {
+                    match clear_user_protected(addr, core::mem::size_of::<i32>()) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            // clear_child_tid 指针可能无效或已拆映射：不能因此 panic。
+                            warn!("clear tid failed: {e:?}");
+                            false
+                        }
+                    }
                 };
-                if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
+                // 若无法清零 *clear_child_tid，则也不要 futex_wake（避免进一步的非法用户态访问）
+                if cleared_ok
+                    && Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1
+                {
                     // Linux 使用 FUTEX_SHARED 标志来唤醒 clear_child_tid
                     // 这允许跨进程/线程的同步（例如 pthread_join）
                     let _ =
@@ -905,6 +915,8 @@ pub struct ProcessControlBlock {
     ///闹钟定时器
     alarm_timer: SpinLock<Option<AlarmTimer>>,
     itimers: SpinLock<ProcessItimers>,
+    /// POSIX interval timers（timer_create/timer_settime/...）
+    posix_timers: SpinLock<posix_timer::ProcessPosixTimers>,
 
     /// CPU时间片
     cpu_time: Arc<ProcessCpuTime>,
@@ -1040,6 +1052,7 @@ impl ProcessControlBlock {
                 fs: RwLock::new(Arc::new(FsStruct::new())),
                 alarm_timer: SpinLock::new(None),
                 itimers: SpinLock::new(ProcessItimers::default()),
+                posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
                 cpu_time: Arc::new(ProcessCpuTime::default()),
                 robust_list: RwLock::new(None),
                 cred: SpinLock::new(cred),
@@ -1601,6 +1614,10 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn itimers_irqsave(&self) -> SpinLockGuard<'_, ProcessItimers> {
         return self.itimers.lock_irqsave();
+    }
+
+    pub fn posix_timers_irqsave(&self) -> SpinLockGuard<'_, posix_timer::ProcessPosixTimers> {
+        return self.posix_timers.lock_irqsave();
     }
 
     #[inline(always)]

@@ -14,7 +14,7 @@ use crate::{
 };
 use alloc::{
     collections::BTreeMap,
-    string::{String,ToString},
+    string::{String, ToString},
     sync::{Arc, Weak},
 };
 use system_error::SystemError;
@@ -81,7 +81,8 @@ impl PidDirOps {
                     fn populate_children<'a>(
                         &self,
                         dir: &'a ProcDir<Self>,
-                    ) -> RwLockReadGuard<'a, BTreeMap<String, Arc<dyn IndexNode>>> {
+                    ) -> RwLockReadGuard<'a, BTreeMap<String, Arc<dyn IndexNode>>>
+                    {
                         dir.cached_children().write().downgrade()
                     }
                 }

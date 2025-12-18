@@ -3,16 +3,17 @@ use crate::{
     filesystem::{
         procfs::template::Common,
         vfs::{
-            FilePrivateData, FileSystem, FileType, IndexNode, Metadata, file::FileMode, syscall::ModeType, vcore::generate_inode_id
+            file::FileMode, syscall::ModeType, vcore::generate_inode_id, FilePrivateData,
+            FileSystem, FileType, IndexNode, Metadata,
         },
     },
     libs::spinlock::SpinLockGuard,
     time::PosixTimeSpec,
 };
 use alloc::fmt::Debug;
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use alloc::string::String;
 use inherit_methods_macro::inherit_methods;
 use system_error::SystemError;
 

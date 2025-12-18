@@ -4,7 +4,6 @@ use alloc::sync::Arc;
 use log::{error, info};
 use system_error::SystemError;
 
-use crate::filesystem::procfs::root::test_procfs_init;
 use crate::libs::casting::DowncastArc;
 use crate::{
     define_event_trace,
@@ -59,9 +58,6 @@ pub fn vfs_init() -> Result<(), SystemError> {
 
     sysfs_init().expect("Failed to initialize sysfs");
 
-    // TestProcFS 应该在文件系统迁移之后初始化
-    // test_procfs_init().expect("Failed to initialize test procfs");
-
     let root_entries = ProcessManager::current_mntns()
         .root_inode()
         .list()
@@ -108,9 +104,6 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         .expect("Unable to create /sys")
         .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
         .expect("Failed to migrate filesystem of sys");
-
-    // TestProcFS 不需要迁移，因为它是在新文件系统上直接挂载的
-    // 如果需要 testproc，应该在迁移完成后重新挂载
 
     unsafe {
         current_mntns.force_change_root_mountfs(new_fs);
@@ -159,16 +152,12 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     let r = migrate_virtual_filesystem(fatfs);
 
     if r.is_err() {
-        error!("Failed to migrate virtual filesyst  em to FAT32!");
+        error!("Failed to migrate virtual filesystem to FAT32!");
         loop {
             spin_loop();
         }
     }
     info!("Successfully migrate rootfs to FAT32!");
-
-    // 在文件系统迁移完成后初始化 TestProcFS
-    test_procfs_init().expect("Failed to initialize test procfs");
-    info!("TestProcFS initialized after rootfs migration.");
 
     return Ok(());
 }
@@ -186,10 +175,6 @@ pub fn change_root_fs() -> Result<(), SystemError> {
         }
     }
     info!("Successfully migrate rootfs to initramfs!");
-
-    // 在文件系统迁移完成后初始化 TestProcFS
-    test_procfs_init().expect("Failed to initialize test procfs");
-    info!("TestProcFS initialized after rootfs migration.");
 
     return Ok(());
 }

@@ -4,7 +4,6 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::ipc::signal::Signal;
 use crate::arch::ipc::signal::MAX_SIG_NUM;
 use crate::arch::MMArch;
-use crate::filesystem::procfs::procfs_register_pid;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
@@ -78,14 +77,8 @@ pub fn do_clone(
     // 克隆pcb
     ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
-    // 向procfs注册进程
-    procfs_register_pid(pcb.raw_pid()).unwrap_or_else(|e| {
-        panic!(
-            "fork: Failed to register pid to procfs, pid: [{:?}]. Error: {:?}",
-            pcb.raw_pid(),
-            e
-        )
-    });
+    // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
+    // 不再需要显式注册进程
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
         pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());

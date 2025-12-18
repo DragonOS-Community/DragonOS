@@ -19,13 +19,9 @@ use crate::{
             version::VersionFileOps,
             Builder, PROCFS_BLOCK_SIZE, PROCFS_MAX_NAMELEN,
         },
-        vfs::{
-            mount::{MountFlags, MountPath},
-            syscall::ModeType,
-            IndexNode,
-        },
+        vfs::{syscall::ModeType, IndexNode},
     },
-    libs::{once::Once, rwlock::RwLockReadGuard},
+    libs::rwlock::RwLockReadGuard,
     process::{ProcessManager, RawPid},
 };
 use alloc::{
@@ -42,7 +38,7 @@ pub struct RootDirOps;
 
 //  drop 的时候把对应pid的文件夹删除
 impl RootDirOps {
-    pub fn new_inode(fs: Weak<TestProcFS>) -> Arc<dyn IndexNode> {
+    pub fn new_inode(fs: Weak<ProcFS>) -> Arc<dyn IndexNode> {
         //todo 这里要注册一个observer，用于动态创建进程目录
 
         ProcDirBuilder::new(Self, ModeType::from_bits_truncate(0o555))
@@ -145,15 +141,15 @@ impl DirOps for RootDirOps {
 use crate::filesystem::vfs::{FileSystem, FsInfo, Magic, SuperBlock};
 use crate::libs::rwlock::RwLock;
 
-/// procfs 文件系统
+/// ProcFS 文件系统
 #[derive(Debug)]
-pub struct TestProcFS {
+pub struct ProcFS {
     /// procfs 的 root inode
     root_inode: Arc<dyn IndexNode>,
     super_block: RwLock<SuperBlock>,
 }
 
-impl TestProcFS {
+impl ProcFS {
     pub fn new() -> Arc<Self> {
         let super_block = SuperBlock::new(
             Magic::PROC_MAGIC,
@@ -161,7 +157,7 @@ impl TestProcFS {
             PROCFS_MAX_NAMELEN as u64,
         );
 
-        let fs: Arc<TestProcFS> = Arc::new_cyclic(|weak_fs| TestProcFS {
+        let fs: Arc<ProcFS> = Arc::new_cyclic(|weak_fs| ProcFS {
             super_block: RwLock::new(super_block),
             root_inode: RootDirOps::new_inode(weak_fs.clone()),
         });
@@ -170,7 +166,7 @@ impl TestProcFS {
     }
 }
 
-impl FileSystem for TestProcFS {
+impl FileSystem for ProcFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.root_inode.clone()
     }
@@ -187,115 +183,10 @@ impl FileSystem for TestProcFS {
     }
 
     fn name(&self) -> &str {
-        "testprocfs"
+        "procfs"
     }
 
     fn super_block(&self) -> SuperBlock {
         self.super_block.read().clone()
     }
 }
-
-pub(crate) fn test_procfs_init() -> Result<(), SystemError> {
-    static INIT: Once = Once::new();
-    let mut result = None;
-    INIT.call_once(|| {
-        ::log::info!("Initializing TestProcFS...");
-        // 创建 procfs 实例
-        let procfs: Arc<TestProcFS> = TestProcFS::new();
-        let root_inode = ProcessManager::current_mntns().root_inode();
-        // procfs 挂载
-        let mntfs = root_inode
-            .mkdir("testproc", ModeType::from_bits_truncate(0o755))
-            .expect("Unabled to find /testproc")
-            .mount(procfs, MountFlags::empty())
-            .expect("Failed to mount at /testproc");
-        let ino = root_inode.metadata().unwrap().inode_id;
-        let mount_path = Arc::new(MountPath::from("/testproc"));
-        ProcessManager::current_mntns()
-            .add_mount(Some(ino), mount_path, mntfs)
-            .expect("Failed to add mount for /testproc");
-        ::log::info!("TestProcFS mounted.");
-        result = Some(Ok(()));
-    });
-
-    return result.unwrap();
-}
-
-// #[derive(Debug)]
-// struct ProcRootDirOps;
-
-// impl ProcRootDirOps {
-//     pub fn new_inode(fs: Weak<ProcFS>) -> Arc<dyn IndexNode> {
-//         //todo 这里要注册一个observer，用于动态创建进程目录
-
-//         ProcDirBuilder::new(Self, ModeType::from_bits_truncate(0o555))
-//             .fs(fs)
-//             .build()
-//             .unwrap()
-//     }
-
-//     #[expect(clippy::type_complexity)]
-//     const STATIC_ENTRIES: &'static [(
-//         &'static str,
-//         fn(Weak<dyn IndexNode>) -> Arc<dyn IndexNode>,
-//     )] = &[("cpuinfo", CpuInfoFileOps::new_inode)];
-// }
-
-// impl DirOps for ProcRootDirOps {
-//     fn lookup_child(
-//         &self,
-//         dir: &template::ProcDir<Self>,
-//         name: &str,
-//     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-//         if let Ok(pid) = name.parse::<RawPid>() {
-//             let all_processes = all_process().lock_irqsave();
-//             if let Some(process_ref) = all_processes.as_ref().unwrap().get(&pid) {
-//                 let mut cached_children = dir.cached_children().write();
-
-//                 // put the child into cache if not exists
-//                 if let Some(child) = cached_children.get(name) {
-//                     return Ok(child.clone());
-//                 } else {
-//                     let inode =
-//                         PidDirOps::new_inode(process_ref.clone(), dir.self_ref_weak().clone());
-//                     cached_children.insert(name.to_string(), inode.clone());
-//                     return Ok(inode);
-//                 }
-//             }
-//         }
-
-//         let mut cached_children = dir.cached_children().write();
-
-//         if let Some(child) =
-//             lookup_child_from_table(name, &mut cached_children, Self::STATIC_ENTRIES, |f| {
-//                 (f)(dir.self_ref_weak().clone())
-//             })
-//         {
-//             return Ok(child);
-//         }
-
-//         Err(SystemError::ENOENT)
-//     }
-
-//     fn populate_children<'a>(
-//         &self,
-//         dir: &'a template::ProcDir<Self>,
-//     ) -> crate::libs::rwlock::RwLockReadGuard<'a, BTreeMap<String, Arc<dyn IndexNode>>> {
-//         let all_processes = all_process().lock_irqsave();
-//         let mut cached_children = dir.cached_children().write();
-
-//         for (pid, process_ref) in all_processes.as_ref().unwrap().iter() {
-//             cached_children.entry(pid.to_string()).or_insert_with(|| {
-//                 PidDirOps::new_inode(process_ref.clone(), dir.self_ref_weak().clone())
-//             });
-//         }
-
-//         drop(all_processes);
-
-//         populate_children_from_table(&mut cached_children, Self::STATIC_ENTRIES, |f| {
-//             (f)(dir.self_ref_weak().clone())
-//         });
-
-//         cached_children.downgrade()
-//     }
-// }

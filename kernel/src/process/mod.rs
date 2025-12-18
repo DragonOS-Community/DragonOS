@@ -31,7 +31,6 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
-        procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
@@ -1703,9 +1702,8 @@ impl Drop for ProcessControlBlock {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
         self.__exit_signal();
-        // 在ProcFS中,解除进程的注册
-        // 这里忽略错误，因为进程可能未注册到procfs
-        procfs_unregister_pid(self.raw_pid()).ok();
+        // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
+        // 不再需要显式注册/注销进程
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
             ppcb.children
                 .write_irqsave()

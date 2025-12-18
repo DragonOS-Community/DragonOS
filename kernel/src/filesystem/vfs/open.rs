@@ -12,11 +12,33 @@ use super::{
 };
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
+    process::cred::CAPFlags,
     process::cred::GroupInfo,
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 use crate::{process::ProcessManager, syscall::user_access::vfs_check_and_clone_cstr};
 use alloc::string::String;
+
+/// 计算创建文件/目录时使用的最终 mode（应用 umask，并丢弃非法位）。
+///
+/// Linux 语义要点：
+/// - umask 仅作用于 0o777（FsStruct 内保证 umask 只包含 S_IRWXUGO）
+/// - open/creat 的 `mode` 参数可包含 0o7777（含 suid/sgid/sticky），文件类型位无效
+#[inline]
+fn apply_umask_for_create(requested: InodeMode, umask: InodeMode) -> InodeMode {
+    // 仅保留“权限/特殊位”，不允许用户通过 open() 设定文件类型位。
+    let req = InodeMode::from_bits_truncate(requested.bits() & InodeMode::S_IALLUGO.bits());
+    // FsStruct::umask() 已保证只含 S_IRWXUGO，因此 !umask 不会影响 suid/sgid/sticky。
+    req & !umask
+}
+
+/// chmod/fchmod 的核心：保留文件类型位，仅替换权限/特殊位。
+#[inline]
+fn chmod_preserve_type(old: InodeMode, new_mode: InodeMode) -> InodeMode {
+    let old_type = old.bits() & InodeMode::S_IFMT.bits();
+    let new_perm = new_mode.bits() & InodeMode::S_IALLUGO.bits();
+    InodeMode::from_bits_truncate(old_type | new_perm)
+}
 
 pub(super) fn do_faccessat(
     dirfd: i32,
@@ -59,16 +81,22 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize
 
     let target_inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-    let mut metadata = target_inode.metadata()?;
+    do_fchmod(target_inode, mode)
+}
 
-    // 只修改权限位，保留文件类型位
-    let old_file_type_bits = metadata.mode.bits() & InodeMode::S_IFMT.bits();
-    let new_permission_bits = mode.bits() & !InodeMode::S_IFMT.bits();
-    metadata.mode = InodeMode::from_bits_truncate(old_file_type_bits | new_permission_bits);
+/// fchmod：对已解析的 inode 进行 chmod（供 `sys_fchmod` 复用）。
+pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    let mut metadata = inode.metadata()?;
 
-    target_inode.set_metadata(&metadata)?;
+    // Linux 语义：chmod/fchmod 需要是 inode 所有者，或具备 CAP_FOWNER
+    if cred.fsuid.data() != metadata.uid && !cred.has_capability(CAPFlags::CAP_FOWNER) {
+        return Err(SystemError::EPERM);
+    }
 
-    return Ok(0);
+    metadata.mode = chmod_preserve_type(metadata.mode, mode);
+    inode.set_metadata(&metadata)?;
+    Ok(0)
 }
 
 pub fn do_fchownat(
@@ -201,12 +229,25 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 // 查找父目录
                 let parent_inode: Arc<dyn IndexNode> =
                     resolve_parent_inode(inode_begin, parent_path)?;
-                // 创建文件
-                let inode: Arc<dyn IndexNode> = parent_inode.create(
-                    filename,
-                    FileType::File,
-                    InodeMode::from_bits_truncate(0o755),
+                let parent_md = parent_inode.metadata()?;
+                // 父节点必须是目录
+                if parent_md.file_type != FileType::Dir {
+                    return Err(SystemError::ENOTDIR);
+                }
+                // Linux 语义：创建文件需要对父目录拥有 W+X（写+搜索）权限
+                let cred = ProcessManager::current_pcb().cred();
+                cred.inode_permission(
+                    &parent_md,
+                    (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
                 )?;
+
+                // 计算创建 mode：应用 umask，遵循 open/creat 语义
+                let pcb = ProcessManager::current_pcb();
+                let umask = pcb.fs_struct().umask();
+                let create_mode = apply_umask_for_create(how.mode, umask);
+                // 创建文件
+                let inode: Arc<dyn IndexNode> =
+                    parent_inode.create(filename, FileType::File, create_mode)?;
                 created = true;
                 inode
             } else {
@@ -249,7 +290,9 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         }
     }
     // 非 O_PATH 需要检查访问权限（read/write/truncate）
-    if !how.o_flags.contains(FileFlags::O_PATH) {
+    // Linux 语义：若本次 open() 触发了创建，则不应因“新 inode 的 mode”而拒绝
+    // 当前这次 open() 的访问模式；权限在“后续 reopen()”时生效。
+    if !how.o_flags.contains(FileFlags::O_PATH) && !created {
         let acc_mode = how.o_flags.access_flags();
         let mut need = PermissionMask::empty();
         match acc_mode {

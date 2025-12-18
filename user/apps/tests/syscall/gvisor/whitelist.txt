@@ -38,6 +38,7 @@ utimes_test
 truncate_test
 fadvise_test
 open_test
+open_create_test
 
 # 进程相关测试
 fork_test

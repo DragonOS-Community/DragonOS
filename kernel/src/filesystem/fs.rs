@@ -46,7 +46,9 @@ impl Default for FsStruct {
 impl FsStruct {
     pub fn new() -> Self {
         Self {
-            umask: AtomicU32::new(InodeMode::S_IWUGO.bits()),
+            // Linux 常见默认 umask：0022（屏蔽 group/other 的写权限）。
+            // 这能保证新建文件默认不对组/其他可写，同时不把所有写权限都屏蔽掉。
+            umask: AtomicU32::new((InodeMode::S_IWGRP | InodeMode::S_IWOTH).bits()),
             path_context: RwLock::new(PathContext::new()),
         }
     }

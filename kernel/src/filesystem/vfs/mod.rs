@@ -233,9 +233,17 @@ pub const DT_WHT: u16 = 14;
 #[allow(dead_code)]
 pub const DT_MAX: u16 = 16;
 
-/// vfs容许的最大的符号链接跳转次数
-// Linux 6.6: MAXSYMLINKS = 40
-pub const VFS_MAX_FOLLOW_SYMLINK_TIMES: usize = 40;
+/// VFS 允许的最大符号链接跟随次数。
+///
+/// Linux 6.6: MAXSYMLINKS = 40
+///
+/// 重要约定（兼容既有调用点）：
+/// - `max_follow_times == 0` 表示 **完全禁用** symlink 跟随（旧行为：不会因为 symlink 而返回 ELOOP）
+/// - `max_follow_times == 1` 表示“计数已耗尽”，此时若仍需要跟随 symlink，应返回 `ELOOP`
+/// - `max_follow_times >= 2` 才允许继续跟随，并在每次跟随时递减
+///
+/// 因此这里取 41，以“保留 0 的禁用语义”同时实现“最多 40 次跟随”的 Linux 语义。
+pub const VFS_MAX_FOLLOW_SYMLINK_TIMES: usize = 41;
 
 impl FileType {
     pub fn get_file_type_num(&self) -> u16 {
@@ -1051,13 +1059,23 @@ impl dyn IndexNode {
                     || follow_final_symlink
                     || (trailing_slash && rest_path.is_empty());
 
-                if need_follow && max_follow_times == 0 {
-                    // Linux: 超过最大符号链接层数应返回 ELOOP
+                // 兼容旧语义：max_follow_times==0 表示完全不跟随 symlink。
+                // 在这种模式下，如果路径解析“需要跟随”（例如 symlink 位于中间，或末尾带 '/'），
+                // 我们保持旧行为：把 symlink 当作普通 inode 继续推进，后续通常会因非目录而 ENOTDIR。
+                if max_follow_times == 0 {
+                    result = inode;
+                    continue;
+                }
+
+                // Linux 语义：超过最大符号链接层数应返回 ELOOP。
+                // 根据上面的约定：max_follow_times==1 表示计数已耗尽，不允许再跟随。
+                if need_follow && max_follow_times == 1 {
                     return Err(SystemError::ELOOP);
                 }
 
-                if max_follow_times == 0 {
-                    // 不需要跟随（理论上已在上面的 early-return 处理），保底走普通路径。
+                // 若不需要跟随（理论上只可能发生在“末尾 symlink + 不跟随 + 无 trailing '/'”），
+                // 则 result=inode 由循环末尾处理即可。
+                if !need_follow {
                     result = inode;
                     continue;
                 }

@@ -153,6 +153,11 @@ pub fn vfs_statx(
         return Err(SystemError::EINVAL);
     }
 
+    // Linux: AT_STATX_FORCE_SYNC 与 AT_STATX_DONT_SYNC 互斥
+    if flags.contains(AtFlags::AT_STATX_FORCE_SYNC) && flags.contains(AtFlags::AT_STATX_DONT_SYNC) {
+        return Err(SystemError::EINVAL);
+    }
+
     // Handle AT_EMPTY_PATH: operate on the file descriptor itself.
     if flags.contains(AtFlags::AT_EMPTY_PATH) && filename.is_empty() {
         if dfd < 0 {
@@ -394,9 +399,6 @@ pub(super) fn do_statx(
     }
 
     let flags = AtFlags::from_bits_truncate(flags as i32);
-    if flags.contains(AtFlags::AT_STATX_SYNC_TYPE) {
-        return Err(SystemError::EINVAL);
-    }
 
     let kstat = vfs_statx(dfd, filename, flags, mask)?;
     cp_statx(kstat, user_kstat_ptr)

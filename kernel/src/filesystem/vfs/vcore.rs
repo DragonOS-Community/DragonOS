@@ -351,8 +351,10 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::ENOTDIR);
     }
 
-    // 查找目标 inode，但 *不* 跟随最后的符号链接
-    let target_inode = parent_inode.lookup_follow_symlink(filename, 0)?;
+    // Linux 语义：unlink(2)/unlinkat(2) 删除目录项本身，不跟随最后一个符号链接。
+    // 我们已解析到父目录，因此这里必须用 find() 直接取目录项对应 inode，
+    // 避免触发 symlink 解析（否则可能得到 ELOOP 或删错目标）。
+    let target_inode = parent_inode.find(filename)?;
 
     // 如果目标是目录，则返回 EISDIR
     if target_inode.metadata()?.file_type == FileType::Dir {

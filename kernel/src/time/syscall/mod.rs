@@ -12,6 +12,11 @@ mod sys_getitimer;
 mod sys_gettimeofday;
 mod sys_nanosleep;
 mod sys_setitimer;
+mod sys_timer_create;
+mod sys_timer_delete;
+mod sys_timer_getoverrun;
+mod sys_timer_gettime;
+mod sys_timer_settime;
 
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;

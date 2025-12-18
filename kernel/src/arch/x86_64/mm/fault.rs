@@ -337,8 +337,8 @@ impl X86_64MMArch {
                 if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
                     if !space_guard.can_extend_stack(region.start() - address) {
                         // exceeds stack limit
-                        log::error!(
-                            "pid {} stack limit exceeded, error_code: {:?}, address: {:#x}",
+                        log::warn!(
+                            "pid {} user stack limit exceeded, error_code: {:?}, address: {:#x}",
                             ProcessManager::current_pid().data(),
                             error_code,
                             address.data(),

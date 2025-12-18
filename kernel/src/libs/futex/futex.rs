@@ -828,7 +828,10 @@ impl RobustListHead {
             mem::size_of::<PosixRobustListHead>(),
             true,
         )?;
-        let robust_list_head = *user_buffer_reader.read_one_from_user::<PosixRobustListHead>(0)?;
+        // 使用异常表保护读取，避免用户地址缺页/无效导致内核崩溃
+        let robust_list_head = user_buffer_reader
+            .buffer_protected(0)?
+            .read_one::<PosixRobustListHead>(0)?;
         let robust_list_head = RobustListHead {
             posix: robust_list_head,
             uaddr: head_uaddr,
@@ -881,7 +884,10 @@ impl RobustListHead {
             core::mem::size_of::<usize>(),
             true,
         )?;
-        user_writer.copy_one_to_user(&mem::size_of::<PosixRobustListHead>(), 0)?;
+        // 使用异常表保护写回
+        user_writer
+            .buffer_protected(0)?
+            .write_one::<usize>(0, &mem::size_of::<PosixRobustListHead>())?;
 
         // 获取当前线程的robust list head
         let robust_list_head_opt = *pcb.get_robust_list();
@@ -896,7 +902,10 @@ impl RobustListHead {
             mem::size_of::<usize>(),
             true,
         )?;
-        user_writer.copy_one_to_user(&head_uaddr, 0)?;
+        // 使用异常表保护写回
+        user_writer
+            .buffer_protected(0)?
+            .write_one::<usize>(0, &head_uaddr)?;
 
         return Ok(0);
     }
@@ -927,8 +936,11 @@ impl RobustListHead {
             }
         };
 
-        let posix_head = match user_buffer_reader.read_one_from_user::<PosixRobustListHead>(0) {
-            Ok(head) => *head,
+        let posix_head = match user_buffer_reader
+            .buffer_protected(0)
+            .and_then(|b| b.read_one::<PosixRobustListHead>(0))
+        {
+            Ok(head) => head,
             Err(_) => {
                 return;
             }
@@ -967,8 +979,9 @@ impl RobustListHead {
 
     /// # 安全地从用户空间读取u32值，如果地址无效则返回None
     fn safe_read_u32(addr: VirtAddr) -> Option<u32> {
-        Self::safe_read::<u32>(addr)
-            .and_then(|reader| reader.read_one_from_user::<u32>(0).ok().cloned())
+        let reader =
+            UserBufferReader::new(addr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true).ok()?;
+        reader.buffer_protected(0).ok()?.read_one::<u32>(0).ok()
     }
 
     /// # 处理进程即将死亡时，进程已经持有的futex，唤醒其他等待该futex的线程

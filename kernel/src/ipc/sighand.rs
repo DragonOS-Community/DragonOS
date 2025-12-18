@@ -7,7 +7,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
-    ipc::signal_types::{SaHandlerType, SigInfo, SigPending, SigactionType, SignalFlags},
+    ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigPending, SigactionType, SignalFlags},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     process::{
         pid::{Pid, PidType},
@@ -93,6 +93,54 @@ impl SigHand {
     pub fn shared_pending_queue_has(&self, sig: Signal) -> bool {
         let g = self.inner();
         g.shared_pending.queue().find(sig).0.is_some()
+    }
+
+    /// 查找并判断 shared pending 队列中是否已存在指定 timerid 的 POSIX timer 信号。
+    pub fn shared_pending_posix_timer_exists(&self, sig: Signal, timerid: i32) -> bool {
+        let mut g = self.inner_mut();
+        for info in g.shared_pending.queue_mut().q.iter_mut() {
+            // bump(0) 作为“匹配探测”，不会改变值
+            if info.is_signal(sig)
+                && info.sig_code() == SigCode::Timer
+                && info.bump_posix_timer_overrun(timerid, 0)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 若 shared pending 中已存在该 timer 的信号，则将其 si_overrun 增加 bump，并返回 true。
+    pub fn shared_pending_posix_timer_bump_overrun(
+        &self,
+        sig: Signal,
+        timerid: i32,
+        bump: i32,
+    ) -> bool {
+        let mut g = self.inner_mut();
+        for info in g.shared_pending.queue_mut().q.iter_mut() {
+            if info.is_signal(sig)
+                && info.sig_code() == SigCode::Timer
+                && info.bump_posix_timer_overrun(timerid, bump)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 将 shared pending 中属于该 timer 的信号的 si_overrun 重置为 0（若找到则返回 true）。
+    pub fn shared_pending_posix_timer_reset_overrun(&self, sig: Signal, timerid: i32) -> bool {
+        let mut g = self.inner_mut();
+        for info in g.shared_pending.queue_mut().q.iter_mut() {
+            if info.is_signal(sig)
+                && info.sig_code() == SigCode::Timer
+                && info.reset_posix_timer_overrun(timerid)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn shared_pending_dequeue(&self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {

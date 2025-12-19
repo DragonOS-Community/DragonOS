@@ -39,9 +39,14 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
         return Err(SystemError::ENAMETOOLONG);
     }
 
-    let new_parent = new_begin_inode
-        .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    // info!("new_parent={:?}", new_parent.metadata());
+    // 当路径只有文件名（没有目录部分）时，new_parent_path 为 None，
+    // 此时父目录就是 new_begin_inode 本身（即 cwd 或 dirfd 指向的目录）
+    let new_parent = match new_parent_path {
+        Some(parent_path) => {
+            new_begin_inode.lookup_follow_symlink(parent_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+        }
+        None => new_begin_inode,
+    };
 
     if new_parent.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
@@ -53,5 +58,6 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     let buf = from.as_bytes();
     let len = buf.len();
     new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
+
     return Ok(0);
 }

@@ -90,6 +90,7 @@ pub mod preempt;
 pub mod process_group;
 pub mod resource;
 pub mod session;
+pub mod shebang;
 pub mod signal;
 pub mod stdio;
 pub mod syscall;

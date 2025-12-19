@@ -8,6 +8,8 @@
 }:
 
 let
+  qemuFirmware = pkgs.callPackage ./qemu-firmware.nix {};
+
   baseConfig = {
     nographic = true; 
     memory = "512M";
@@ -42,6 +44,7 @@ let
         "-rtc" "clock=host,base=localtime"
         # Trace events
         "-d" "cpu_reset,guest_errors,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*"
+        "-trace" "fw_cfg*"
       ];
       nographicArgs = lib.optionals isNographic ([
         "--nographic"
@@ -124,31 +127,22 @@ let
 
       # --- 3. 执行 ---
       ${qemuBin} --version
-      sudo ${qemuBin} ${qemuFlagsStr} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+      sudo ${qemuBin} ${qemuFlagsStr} -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
     '';
 
-  # 5. QEMU 二进制选择器 (支持外部 QEMU)
-  # 用法: QEMU_X86=/usr/bin/qemu-system-x86_64 nix run --impure .#x86_64
-  getQemuBin = arch: fallback:
-    let
-      envVar = if arch == "x86_64" then "QEMU_X86" else "QEMU_RISCV";
-      externalPath = builtins.getEnv envVar;
-    in
-      if externalPath != "" then externalPath else fallback;
-  
   script = {
     x86_64 = mkRunScript {
       name = "run-dragonos-x86";
       arch = "x86_64";
       isNographic = baseConfig.nographic;
-      qemuBin = getQemuBin "x86_64" "${pkgs.qemu_full}/bin/qemu-system-x86_64";
+      qemuBin = "${pkgs.qemu_kvm}/bin/qemu-system-x86_64";
     };
 
     riscv64 = mkRunScript {
       name = "run-dragonos-riscv";
       arch = "riscv64";
       isNographic = true;
-      qemuBin = getQemuBin "riscv64" "${pkgs.qemu_full}/bin/qemu-system-riscv64";
+      qemuBin = "${pkgs.qemu_kvm}/bin/qemu-system-riscv64";
     };
   };
 in script

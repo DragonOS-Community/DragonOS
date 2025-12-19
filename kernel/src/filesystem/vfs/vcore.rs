@@ -1,7 +1,7 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
-use alloc::sync::Arc;
-use log::{error, info};
+use alloc::{string::ToString, sync::Arc};
+use log::{error, info, warn};
 use system_error::SystemError;
 
 use crate::libs::casting::DowncastArc;
@@ -11,6 +11,8 @@ use crate::{
     filesystem::{
         devfs::devfs_init,
         devpts::devpts_init,
+        ext4::filesystem::Ext4FileSystem,
+        fat::bpb::BiosParameterBlock,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
@@ -139,6 +141,51 @@ pub(crate) fn try_find_gendisk(path: &str) -> Option<Arc<GenDisk>> {
     return None;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootFsKind {
+    Ext4,
+    Fat,
+}
+
+/// 探测 ext2/3/4：检查 superblock magic（0xEF53）。
+///
+/// Linux/ext 家族的 superblock 位于分区内偏移 1024 字节处，
+/// s_magic 位于 superblock 内偏移 0x38（56）处。
+fn probe_ext_fs(gendisk: &Arc<GenDisk>) -> Result<bool, SystemError> {
+    const EXT_SUPERBLOCK_OFFSET: usize = 1024;
+    const EXT_MAGIC_OFFSET_IN_SB: usize = 0x38;
+    const EXT_MAGIC: u16 = 0xEF53;
+
+    let mut magic = [0u8; 2];
+    gendisk.read_at_bytes(
+        &mut magic,
+        EXT_SUPERBLOCK_OFFSET + EXT_MAGIC_OFFSET_IN_SB,
+    )?;
+    Ok(u16::from_le_bytes(magic) == EXT_MAGIC)
+}
+
+/// 探测 FAT：复用 FAT BPB 解析/校验逻辑，避免误判。
+fn probe_fat_fs(gendisk: &Arc<GenDisk>) -> bool {
+    BiosParameterBlock::new(gendisk).is_ok()
+}
+
+fn probe_rootfs_kind(gendisk: &Arc<GenDisk>) -> Option<RootFsKind> {
+    match probe_ext_fs(gendisk) {
+        Ok(true) => return Some(RootFsKind::Ext4),
+        Ok(false) => {}
+        Err(e) => {
+            // 探测阶段不应阻塞启动；继续尝试其他 FS 探测/初始化。
+            warn!("Rootfs probe: read ext superblock failed: {:?}", e);
+        }
+    }
+
+    if probe_fat_fs(gendisk) {
+        return Some(RootFsKind::Fat);
+    }
+
+    None
+}
+
 pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount root fs...");
     block_dev_manager().print_gendisks();
@@ -152,26 +199,39 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             .ok_or(SystemError::ENODEV)?
     };
 
-    let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(gendisk);
-    if fatfs.is_err() {
-        error!(
-            "Failed to initialize fatfs, code={:?}",
-            fatfs.as_ref().err()
-        );
-        loop {
-            spin_loop();
-        }
-    }
-    let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
-    let r = migrate_virtual_filesystem(fatfs);
+    let kind = probe_rootfs_kind(&gendisk);
 
+    let rootfs: Result<Arc<dyn FileSystem>, SystemError> = match kind {
+        Some(RootFsKind::Ext4) => Ext4FileSystem::from_gendisk(gendisk.clone()),
+        Some(RootFsKind::Fat) => Ok(FATFileSystem::new(gendisk.clone())?),
+        None => {
+            // 兜底：按常见顺序尝试初始化（ext4 -> fat），便于未来扩展 probe 或处理特殊镜像。
+            Ext4FileSystem::from_gendisk(gendisk.clone()).or_else(|_| {
+                let fat: Arc<FATFileSystem> = FATFileSystem::new(gendisk.clone())?;
+                Ok(fat)
+            })
+        }
+    };
+
+    let rootfs = match rootfs {
+        Ok(fs) => fs,
+        Err(e) => {
+            error!("Failed to initialize rootfs filesystem: {:?}", e);
+            loop {
+                spin_loop();
+            }
+        }
+    };
+
+    let fs_name = rootfs.name().to_string();
+    let r = migrate_virtual_filesystem(rootfs.clone());
     if r.is_err() {
-        error!("Failed to migrate virtual filesyst  em to FAT32!");
+        error!("Failed to migrate virtual filesystem to rootfs ({}).", fs_name);
         loop {
             spin_loop();
         }
     }
-    info!("Successfully migrate rootfs to FAT32!");
+    info!("Successfully migrate rootfs to {}!", fs_name);
 
     return Ok(());
 }

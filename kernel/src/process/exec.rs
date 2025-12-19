@@ -231,9 +231,7 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
     assert!(param.vm().is_current());
     // debug!("load_binary_file: to load with param: {:?}", param);
 
-    let result: BinaryLoaderResult = loader
-        .load(param, &head_buf)
-        .unwrap_or_else(|e| panic!("load_binary_file failed: error: {e:?}, param: {param:?}"));
+    let result: BinaryLoaderResult = loader.load(param, &head_buf).map_err(SystemError::from)?;
 
     // debug!("load_binary_file: load success: {result:?}");
     return Ok(result);

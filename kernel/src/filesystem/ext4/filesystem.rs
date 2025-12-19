@@ -73,14 +73,18 @@ impl Ext4FileSystem {
         let raw_dev = mount_data.device_num();
         let fs = another_ext4::Ext4::load(mount_data)?;
         let root_inode: Arc<LockedExt4Inode> =
-            Arc::new(LockedExt4Inode(SpinLock::new(Ext4Inode {
-                inner_inode_num: another_ext4::EXT4_ROOT_INO,
-                fs_ptr: Weak::default(),
-                page_cache: None,
-                children: BTreeMap::new(),
-                dname: DName::from("/"),
-                vfs_inode_id: generate_inode_id(),
-            })));
+            Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
+                LockedExt4Inode(SpinLock::new(Ext4Inode {
+                    inner_inode_num: another_ext4::EXT4_ROOT_INO,
+                    fs_ptr: Weak::default(),
+                    page_cache: None,
+                    children: BTreeMap::new(),
+                    dname: DName::from("/"),
+                    vfs_inode_id: generate_inode_id(),
+                    parent: self_ref.clone(),
+                    self_ref: self_ref.clone(),
+                }))
+            });
 
         let fs = Arc::new(Ext4FileSystem {
             fs,

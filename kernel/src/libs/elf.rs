@@ -18,6 +18,7 @@ use system_error::SystemError;
 use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
+    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
@@ -788,10 +789,17 @@ impl BinaryLoader for ElfLoader {
                 ))
             })?;
             let pwd = ProcessManager::current_pcb().pwd_inode();
-            let inode = pwd.lookup(interpreter_path).map_err(|_| {
-                log::error!("Failed to find interpreter path: {}", interpreter_path);
-                return ExecError::InvalidParemeter;
-            })?;
+            let inode = pwd
+                .lookup_follow_symlink(interpreter_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+                .map_err(|e| {
+                    // Linux 语义：动态链接器（解释器）路径不存在时，execve 需返回 ENOENT。
+                    log::error!(
+                        "Failed to find interpreter path: {} (err={:?})",
+                        interpreter_path,
+                        e
+                    );
+                    ExecError::SystemError(SystemError::ENOENT)
+                })?;
             // log::debug!("opening interpreter at :{}", interpreter_path);
             interpreter = Some(
                 ExecParam::new(inode, param.vm().clone(), ExecParamFlags::EXEC).map_err(|e| {

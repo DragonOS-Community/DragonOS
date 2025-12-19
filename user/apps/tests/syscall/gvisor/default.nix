@@ -53,7 +53,9 @@ let
       "^run_tests\.sh$"
     ];
 
-    nativeBuildInputs = [ pkgs.patchelf ];
+    nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+
+    buildInputs = [ pkgs.stdenv.cc.cc.lib ];
 
     installPhase = ''
       mkdir -p $out/${installDir}
@@ -66,14 +68,9 @@ let
       mkdir -p $out/${installDir}/tests
       tar -xf ${testsArchive} -C $out/${installDir}/tests --strip-components=1
 
-      # Ensure test binaries are executable
-      find $out/${installDir}/tests -type f -name '*_test' -exec chmod +xw {} + || true
-
-      # Use patchelf to set the interpreter and RPATH for the test binaries
-      find $out/${installDir}/tests -type f -name '*_test' -exec patchelf \
-        --set-interpreter $(cat ${pkgs.stdenv.cc}/nix-support/dynamic-linker) \
-        --set-rpath ${lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]} \
-        {} \;
+      runHook preInstall
+      find $out/${installDir}/tests -type f -name '*_test' -exec install -m755 {} $out/${installDir}/tests \; || true
+      runHook postInstall
     '';
   };
 

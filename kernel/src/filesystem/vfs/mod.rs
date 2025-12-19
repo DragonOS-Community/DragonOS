@@ -233,8 +233,17 @@ pub const DT_WHT: u16 = 14;
 #[allow(dead_code)]
 pub const DT_MAX: u16 = 16;
 
-/// vfs容许的最大的符号链接跳转次数
-pub const VFS_MAX_FOLLOW_SYMLINK_TIMES: usize = 8;
+/// VFS 允许的最大符号链接跟随次数。
+///
+/// Linux 6.6: MAXSYMLINKS = 40
+///
+/// 重要约定（兼容既有调用点）：
+/// - `max_follow_times == 0` 表示 **完全禁用** symlink 跟随（旧行为：不会因为 symlink 而返回 ELOOP）
+/// - `max_follow_times == 1` 表示“计数已耗尽”，此时若仍需要跟随 symlink，应返回 `ELOOP`
+/// - `max_follow_times >= 2` 才允许继续跟随，并在每次跟随时递减
+///
+/// 因此这里取 41，以“保留 0 的禁用语义”同时实现“最多 40 次跟随”的 Linux 语义。
+pub const VFS_MAX_FOLLOW_SYMLINK_TIMES: usize = 41;
 
 impl FileType {
     pub fn get_file_type_num(&self) -> u16 {
@@ -1032,12 +1041,45 @@ impl dyn IndexNode {
             let file_type = inode.metadata()?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
             if rest_path.is_empty() && !follow_final_symlink && file_type == FileType::SymLink {
-                // 返回符号链接本身
-                return Ok(inode);
+                // Linux 语义：若 pathname 以 '/' 结尾，则必须解析为目录，
+                // 此时即使请求“不跟随最终 symlink”，也不能返回 symlink 本身。
+                if !trailing_slash {
+                    // 返回符号链接本身
+                    return Ok(inode);
+                }
             }
 
             // 跟随符号链接跳转
-            if file_type == FileType::SymLink && max_follow_times > 0 {
+            if file_type == FileType::SymLink {
+                // 需要跟随 symlink 的场景：
+                // - symlink 位于路径中间（rest_path 非空）
+                // - 需要跟随最终 symlink（follow_final_symlink=true）
+                // - 或者 pathname 以 '/' 结尾（trailing_slash=true）
+                let need_follow = !rest_path.is_empty()
+                    || follow_final_symlink
+                    || (trailing_slash && rest_path.is_empty());
+
+                // 兼容旧语义：max_follow_times==0 表示完全不跟随 symlink。
+                // 在这种模式下，如果路径解析“需要跟随”（例如 symlink 位于中间，或末尾带 '/'），
+                // 我们保持旧行为：把 symlink 当作普通 inode 继续推进，后续通常会因非目录而 ENOTDIR。
+                if max_follow_times == 0 {
+                    result = inode;
+                    continue;
+                }
+
+                // Linux 语义：超过最大符号链接层数应返回 ELOOP。
+                // 根据上面的约定：max_follow_times==1 表示计数已耗尽，不允许再跟随。
+                if need_follow && max_follow_times == 1 {
+                    return Err(SystemError::ELOOP);
+                }
+
+                // 若不需要跟随（理论上只可能发生在“末尾 symlink + 不跟随 + 无 trailing '/'”），
+                // 则 result=inode 由循环末尾处理即可。
+                if !need_follow {
+                    result = inode;
+                    continue;
+                }
+
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
                 // 但它们有一个 special_node 指向真实的 inode
@@ -1082,9 +1124,9 @@ impl dyn IndexNode {
                     max_follow_times - 1,
                     follow_final_symlink,
                 );
-            } else {
-                result = inode;
             }
+
+            result = inode;
         }
 
         if trailing_slash && result.metadata()?.file_type != FileType::Dir {

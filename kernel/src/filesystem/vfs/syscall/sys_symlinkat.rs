@@ -49,7 +49,7 @@ impl SysSymlinkAtHandle {
         let s = vfs_check_and_clone_cstr(args[0] as *const u8, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
-        Ok(s.trim().to_string())
+        Ok(s.to_string())
     }
 
     fn newdfd(args: &[usize]) -> i32 {
@@ -60,7 +60,7 @@ impl SysSymlinkAtHandle {
         let s = vfs_check_and_clone_cstr(args[2] as *const u8, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
-        Ok(s.trim().to_string())
+        Ok(s.to_string())
     }
 }
 

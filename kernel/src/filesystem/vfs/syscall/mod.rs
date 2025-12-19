@@ -59,6 +59,7 @@ mod sys_epoll_ctl;
 mod sys_epoll_pwait;
 
 pub mod symlink_utils;
+mod sys_copy_file_range;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 mod sys_fstat;
 mod sys_fsync;

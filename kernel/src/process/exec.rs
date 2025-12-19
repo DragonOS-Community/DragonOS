@@ -297,12 +297,11 @@ pub fn load_binary_file_with_context(
         let pwd = ProcessManager::current_pcb().pwd_inode();
         let interpreter_inode = pwd
             .lookup_follow_symlink(&shebang_info.interpreter_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 log::warn!(
                     "Shebang interpreter not found: {}",
                     shebang_info.interpreter_path
                 );
-                e
             })?;
 
         // 获取脚本路径

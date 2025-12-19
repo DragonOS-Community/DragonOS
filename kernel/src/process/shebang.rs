@@ -49,6 +49,7 @@ impl ShebangLoader {
     /// - shebang行格式: `#!interpreter [optional-arg]`
     /// - 最大长度256字节
     /// - 只支持一个可选参数
+    #[inline(never)]
     pub fn parse_shebang_line(buf: &[u8]) -> Result<ShebangInfo, ExecError> {
         // 1. 检查魔数 "#!"
         if buf.len() < 2 || buf[0] != SHEBANG_MAGIC[0] || buf[1] != SHEBANG_MAGIC[1] {

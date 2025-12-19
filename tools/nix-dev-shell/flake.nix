@@ -23,6 +23,7 @@
             llvm
             libclang
             rust-toolchain
+            gcc
           ];
 
           env = {

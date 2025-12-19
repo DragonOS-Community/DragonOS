@@ -69,6 +69,13 @@ impl FileSystem for Ext4FileSystem {
 }
 
 impl Ext4FileSystem {
+    /// 探测 gendisk 是否包含 ext4 文件系统
+    pub fn probe(gendisk: &Arc<GenDisk>) -> Result<bool, SystemError> {
+        Ok(another_ext4::Ext4::load(gendisk.clone())
+            .map(|_| true)
+            .unwrap_or(false))
+    }
+
     pub fn from_gendisk(mount_data: Arc<GenDisk>) -> Result<Arc<dyn FileSystem>, SystemError> {
         let raw_dev = mount_data.device_num();
         let fs = another_ext4::Ext4::load(mount_data)?;

@@ -564,7 +564,7 @@ impl Ext4Inode {
             children: BTreeMap::new(),
             dname,
             vfs_inode_id: generate_inode_id(),
-            parent: parent.unwrap_or_else(|| Weak::new()),
+            parent: parent.unwrap_or_default(),
             self_ref: Weak::new(), // 将在LockedExt4Inode::new()中设置
         }
     }

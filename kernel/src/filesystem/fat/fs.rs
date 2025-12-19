@@ -461,6 +461,11 @@ impl FileSystem for FATFileSystem {
 }
 
 impl FATFileSystem {
+    /// 探测 gendisk 是否包含 FAT 文件系统
+    pub fn probe(gendisk: &Arc<GenDisk>) -> bool {
+        BiosParameterBlock::new(gendisk).is_ok()
+    }
+
     /// FAT12允许的最大簇号
     pub const FAT12_MAX_CLUSTER: u32 = 0xFF5;
     /// FAT16允许的最大簇号

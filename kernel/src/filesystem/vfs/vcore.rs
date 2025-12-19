@@ -12,7 +12,6 @@ use crate::{
         devfs::devfs_init,
         devpts::devpts_init,
         ext4::filesystem::Ext4FileSystem,
-        fat::bpb::BiosParameterBlock,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
@@ -147,27 +146,8 @@ enum RootFsKind {
     Fat,
 }
 
-/// 探测 ext2/3/4：检查 superblock magic（0xEF53）。
-///
-/// Linux/ext 家族的 superblock 位于分区内偏移 1024 字节处，
-/// s_magic 位于 superblock 内偏移 0x38（56）处。
-fn probe_ext_fs(gendisk: &Arc<GenDisk>) -> Result<bool, SystemError> {
-    const EXT_SUPERBLOCK_OFFSET: usize = 1024;
-    const EXT_MAGIC_OFFSET_IN_SB: usize = 0x38;
-    const EXT_MAGIC: u16 = 0xEF53;
-
-    let mut magic = [0u8; 2];
-    gendisk.read_at_bytes(&mut magic, EXT_SUPERBLOCK_OFFSET + EXT_MAGIC_OFFSET_IN_SB)?;
-    Ok(u16::from_le_bytes(magic) == EXT_MAGIC)
-}
-
-/// 探测 FAT：复用 FAT BPB 解析/校验逻辑，避免误判。
-fn probe_fat_fs(gendisk: &Arc<GenDisk>) -> bool {
-    BiosParameterBlock::new(gendisk).is_ok()
-}
-
 fn probe_rootfs_kind(gendisk: &Arc<GenDisk>) -> Option<RootFsKind> {
-    match probe_ext_fs(gendisk) {
+    match Ext4FileSystem::probe(gendisk) {
         Ok(true) => return Some(RootFsKind::Ext4),
         Ok(false) => {}
         Err(e) => {
@@ -176,7 +156,7 @@ fn probe_rootfs_kind(gendisk: &Arc<GenDisk>) -> Option<RootFsKind> {
         }
     }
 
-    if probe_fat_fs(gendisk) {
+    if FATFileSystem::probe(gendisk) {
         return Some(RootFsKind::Fat);
     }
 

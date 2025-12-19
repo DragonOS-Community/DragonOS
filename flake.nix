@@ -16,7 +16,7 @@
       pkgs = nixpkgs.legacyPackages.${system};
       target = "x86_64";
       syscallTestDir = "/usr/share/gvisor";
-      qemuScripts = import ./tools/qemu/default.nix { 
+      qemuScripts = import ./tools/qemu/default.nix {
         lib = pkgs.lib;
         inherit pkgs;
         rootfsDisk = "./bin/disk-image-${target}.img";

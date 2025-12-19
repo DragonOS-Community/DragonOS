@@ -10,45 +10,76 @@ let
     cargo = toolchain;
     rustc = toolchain;
   };
-  fullSrc = ./.;
-  runnerSrc = ./runner;
-  runnerName = "runner";
-  outName = "gvisor-tests";
-  # installDir = installDir;
+
   testsArchive = pkgs.fetchurl {
     url = "https://cnb.cool/DragonOS-Community/test-suites/-/releases/download/release_20250626/gvisor-syscalls-tests.tar.xz";
     sha256 = "sha256-GSZ0N3oUOerb0lXU4LZ0z4ybD/xZdy7TtfstEoffcsk=";
   };
 
-in rustPlatform.buildRustPackage {
-  pname = outName;
-  version = "0.1.0";
+  # 1. Build the Rust runner separately
+  # This ensures that changes to test scripts or data don't trigger a Rust rebuild.
+  runner = rustPlatform.buildRustPackage {
+    pname = "gvisor-test-runner-bin";
+    version = "0.1.0";
 
-  src = runnerSrc;
-  cargoLock = {
-    lockFile = ./runner/Cargo.lock;
+    src = ./runner;
+    cargoLock = {
+      lockFile = ./runner/Cargo.lock;
+    };
+
+    # Move the binary to the expected install directory structure
+    postInstall = ''
+      mkdir -p $out/${installDir}
+      if [ -f "$out/bin/runner" ]; then
+        mv "$out/bin/runner" "$out/${installDir}/gvisor-test-runner"
+        # Clean up empty bin directory if it exists, to avoid clutter in symlinkJoin
+        rmdir "$out/bin" || true
+      fi
+    '';
   };
 
-  postInstall = ''
-    # Ensure runner binary exists and rename to gvisor-test-runner as per Makefile install
-    mkdir -p "$out/${installDir}"
-    if [ -x "$out/bin/${runnerName}" ]; then
-      mv "$out/bin/${runnerName}" "$out/${installDir}/gvisor-test-runner"
-    fi
+  # 2. Prepare the test data, scripts, and patched binaries
+  # This derivation handles downloading, extracting, and patching the tests.
+  tests = pkgs.stdenv.mkDerivation {
+    pname = "gvisor-tests-data";
+    version = "0.1.0";
 
-    # Only package files used by install target: whitelist, blocklists, run_tests.sh
-    mkdir -p $out/${installDir}
-    install -m644 ${fullSrc}/whitelist.txt $out/${installDir}/
-    cp -r ${fullSrc}/blocklists $out/${installDir}/
-    install -m755 ${fullSrc}/run_tests.sh $out/${installDir}/
+    # Use sourceByRegex to only depend on relevant files.
+    # This prevents rebuilds when files in ./runner change.
+    src = lib.sourceByRegex ./. [
+      "^whitelist\.txt$"
+      "^blocklists"
+      "^blocklists/.*"
+      "^run_tests\.sh$"
+    ];
 
-    # Bundle tests archive for offline systems
-    mkdir -p $out/${installDir}/tests
-    tar -xf ${testsArchive} -C $out/${installDir}/tests --strip-components=1
-    # Ensure test binaries are executable
-    find $out/${installDir}/tests -type f -name '*_test' -exec chmod +x {} + || true
-  '';
+    nativeBuildInputs = [ pkgs.patchelf ];
 
+    installPhase = ''
+      mkdir -p $out/${installDir}
+
+      install -m644 whitelist.txt $out/${installDir}/
+      cp -r blocklists $out/${installDir}/
+      install -m755 run_tests.sh $out/${installDir}/
+
+      # Bundle tests archive for offline systems
+      mkdir -p $out/${installDir}/tests
+      tar -xf ${testsArchive} -C $out/${installDir}/tests --strip-components=1
+
+      # Ensure test binaries are executable
+      find $out/${installDir}/tests -type f -name '*_test' -exec chmod +xw {} + || true
+
+      # Use patchelf to set the interpreter and RPATH for the test binaries
+      find $out/${installDir}/tests -type f -name '*_test' -exec patchelf \
+        --set-interpreter $(cat ${pkgs.stdenv.cc}/nix-support/dynamic-linker) \
+        --set-rpath ${lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]} \
+        {} \;
+    '';
+  };
+
+in pkgs.symlinkJoin {
+  name = "gvisor-tests";
+  paths = [ runner tests ];
   meta = with lib; {
     description = "gVisor syscall test runner and scripts";
     platforms = platforms.linux;

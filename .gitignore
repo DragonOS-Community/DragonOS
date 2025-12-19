@@ -25,3 +25,4 @@ compile_commands.json
 *.cpio
 *.cpio.xz
 *.cpio*
+.direnv/

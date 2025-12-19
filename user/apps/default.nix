@@ -8,6 +8,8 @@ in [
   static.curl
   static.dropbear
   pkgs.glibc
+  # pkgs.gccNGPackages_15.libstdcxx
+  # pkgs.libcxx
   
   # Simple C utility
   (static.callPackage ./about {})

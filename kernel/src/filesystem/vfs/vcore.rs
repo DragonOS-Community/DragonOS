@@ -157,10 +157,7 @@ fn probe_ext_fs(gendisk: &Arc<GenDisk>) -> Result<bool, SystemError> {
     const EXT_MAGIC: u16 = 0xEF53;
 
     let mut magic = [0u8; 2];
-    gendisk.read_at_bytes(
-        &mut magic,
-        EXT_SUPERBLOCK_OFFSET + EXT_MAGIC_OFFSET_IN_SB,
-    )?;
+    gendisk.read_at_bytes(&mut magic, EXT_SUPERBLOCK_OFFSET + EXT_MAGIC_OFFSET_IN_SB)?;
     Ok(u16::from_le_bytes(magic) == EXT_MAGIC)
 }
 
@@ -226,7 +223,10 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     let fs_name = rootfs.name().to_string();
     let r = migrate_virtual_filesystem(rootfs.clone());
     if r.is_err() {
-        error!("Failed to migrate virtual filesystem to rootfs ({}).", fs_name);
+        error!(
+            "Failed to migrate virtual filesystem to rootfs ({}).",
+            fs_name
+        );
         loop {
             spin_loop();
         }

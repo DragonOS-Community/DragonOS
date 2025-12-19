@@ -252,7 +252,7 @@ if [ ${QEMU_NOGRAPHIC} == true ]; then
       QEMU_DEVICES+=" -device virtio-serial-device -device virtconsole,chardev=mux "
     fi
 
-    KERNEL_CMDLINE=" root=/dev/vda console=/dev/hvc0 ${KERNEL_CMDLINE}"
+    KERNEL_CMDLINE=" console=/dev/hvc0 ${KERNEL_CMDLINE}"
     QEMU_MONITOR=""
     QEMU_ARGUMENT+=" --nographic "
 

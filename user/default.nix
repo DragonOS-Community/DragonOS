@@ -66,7 +66,8 @@ let
         echo "    Extracting and not filtering..."
         # tar --exclude='nix' -xf "$OUTPUT_TAR" -C "$EXTRACT_DIR"
         chmod +w -R "$TEMP_DIR" "$EXTRACT_DIR"
-        fakeroot tar --owner=0 --group=0 --numeric-owner -xf "$OUTPUT_TAR" -C "$EXTRACT_DIR"
+        fakeroot tar --owner=0 --group=0 --numeric-owner --exclude='proc' --exclude='dev' \
+            --exclude='sys' -xf "$OUTPUT_TAR" -C "$EXTRACT_DIR" # 当 RootFS 里包含这几个文件夹时会报错
 
         # 重新打包，解引用符号链接和硬链接
         echo "    Re-packing with dereferenced links..."
@@ -86,7 +87,11 @@ let
       # 创建磁盘镜像并初始化文件系统
       echo "  Creating disk image..."
       TEMP_IMG="$DISK_IMAGE.tmp"
-      truncate -s 5G "$TEMP_IMG"
+
+      # 计算所需磁盘大小：tar包大小 + 1G 缓冲空间
+      TAR_SIZE_KB=$(du -k "$FINAL_TAR" | cut -f1)
+      DISK_SIZE_KB=$(( TAR_SIZE_KB + 1024 * 1024 ))
+      truncate -s "''${DISK_SIZE_KB}K" "$TEMP_IMG"
 
       # 使用 guestfish 创建分区并注入 tar
       echo "  Initializing disk and copying rootfs..."

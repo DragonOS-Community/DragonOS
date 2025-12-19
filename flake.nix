@@ -35,6 +35,7 @@
           type = "app";
           program = "${pkgs.callPackage ./user/default.nix {
             inherit pkgs system fenix target syscallTestDir;
+            rootfsType = "ext4";
             buildDir = "./bin";
           }}/bin/build-rootfs-image";
         };

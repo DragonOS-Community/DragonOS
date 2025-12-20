@@ -31,6 +31,11 @@ let
       crossSystem = lib.systems.examples.riscv64-musl;
       isStatic = true;
     } else abort "Unsupported static target: ${target}";
+
+  gvisor-syscall-tests = (pkgs.callPackage ./tests/syscall/gvisor {
+    inherit fenix system;
+    installDir = syscallTestDir;
+  });
 in [
   static.busybox
   static.curl
@@ -43,9 +48,6 @@ in [
 ]
 ++ lib.optionals (target == "x86_64") [
   # gvisor test case only included on x86_64
-  (pkgs.callPackage ./tests/syscall/gvisor {
-    inherit fenix system;
-    installDir = syscallTestDir;
-  })
+  gvisor-syscall-tests
   # TODO: Add debian libcxx deps or FHS
 ]

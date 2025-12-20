@@ -9,7 +9,7 @@ use crate::{
     driver::base::block::SeekFrom,
     filesystem::vfs::{
         file::{File, FileFlags},
-        IndexNode,
+        FileType, IndexNode, InodeMode,
     },
     libs::elf::ELF_LOADER,
     mm::{
@@ -66,8 +66,6 @@ pub enum LoadBinaryResult {
     NeedReexec {
         /// 解释器inode
         interpreter_inode: Arc<dyn IndexNode>,
-        /// 解释器路径
-        interpreter_path: String,
         /// 新的argv (解释器路径 + [可选参数] + 脚本路径 + 原始参数)
         new_argv: Vec<CString>,
     },
@@ -182,6 +180,24 @@ impl ExecParam {
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
+        let metadata = file_inode.metadata()?;
+
+        // 必须是普通文件
+        if metadata.file_type != FileType::File {
+            return Err(SystemError::EACCES);
+        }
+
+        // 检查执行权限
+        // 注意：这是简化版本，完整实现应该根据当前进程的 uid/gid 检查对应的权限位
+        // TODO: 实现基于 uid/gid 的权限检查
+        let mode = metadata.mode;
+        if !mode.contains(InodeMode::S_IXUSR)
+            && !mode.contains(InodeMode::S_IXGRP)
+            && !mode.contains(InodeMode::S_IXOTH)
+        {
+            return Err(SystemError::EACCES);
+        }
+
         // 读取文件头部，用于判断文件类型
         let file = File::new(file_inode, FileFlags::O_RDONLY)?;
 
@@ -251,7 +267,6 @@ impl ExecParam {
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
 fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-    ProcessManager::current_pcb().sighand().reset_handlers();
     // todo: 该函数未正确实现
     let tg_empty = pcb.threads_read_irqsave().thread_group_empty();
     if tg_empty {
@@ -297,10 +312,11 @@ pub fn load_binary_file_with_context(
         let pwd = ProcessManager::current_pcb().pwd_inode();
         let interpreter_inode = pwd
             .lookup_follow_symlink(&shebang_info.interpreter_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
-            .inspect_err(|_e| {
+            .inspect_err(|e| {
                 log::warn!(
-                    "Shebang interpreter not found: {}",
-                    shebang_info.interpreter_path
+                    "Shebang interpreter not found: {}, error: {:?}",
+                    shebang_info.interpreter_path,
+                    e
                 );
             })?;
 
@@ -336,7 +352,6 @@ pub fn load_binary_file_with_context(
 
         return Ok(LoadBinaryResult::NeedReexec {
             interpreter_inode,
-            interpreter_path: shebang_info.interpreter_path,
             new_argv,
         });
     }

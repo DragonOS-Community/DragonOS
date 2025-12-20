@@ -211,7 +211,9 @@ impl NapiManager {
     }
 
     pub fn inner(&self) -> SpinLockGuard<'_, NapiManagerInner> {
-        self.inner.lock()
+        // 必须使用 lock_irqsave() 关闭中断，因为 napi_schedule() 可能在中断上下文中被调用
+        // 如果使用普通的 lock()，当内核线程持有锁时发生中断，中断处理程序试图获取同一把锁会死锁
+        self.inner.lock_irqsave()
     }
 
     pub fn wait_queue(&self) -> &WaitQueue {

@@ -9,7 +9,7 @@ use crate::{
     driver::base::block::SeekFrom,
     filesystem::vfs::{
         file::{File, FileFlags},
-        IndexNode,
+        FileType, IndexNode, InodeMode,
     },
     libs::elf::ELF_LOADER,
     mm::{
@@ -19,7 +19,9 @@ use crate::{
 };
 
 use super::{
-    namespace::nsproxy::exec_task_namespaces, ProcessControlBlock, ProcessFlags, ProcessManager,
+    namespace::nsproxy::exec_task_namespaces,
+    shebang::{ShebangLoader, SHEBANG_LOADER, SHEBANG_MAX_RECURSION_DEPTH},
+    ProcessControlBlock, ProcessFlags, ProcessManager,
 };
 
 /// 系统支持的所有二进制文件加载器的列表
@@ -50,6 +52,59 @@ impl BinaryLoaderResult {
 
     pub fn entry_point(&self) -> VirtAddr {
         self.entry_point
+    }
+}
+
+/// 二进制文件加载的完整结果
+///
+/// 用于区分正常加载和需要重新执行(shebang场景)的情况
+#[derive(Debug)]
+pub enum LoadBinaryResult {
+    /// 正常加载完成，返回入口点
+    Loaded(BinaryLoaderResult),
+    /// 需要重新执行解释器 (shebang场景)
+    NeedReexec {
+        /// 解释器inode
+        interpreter_inode: Arc<dyn IndexNode>,
+        /// 新的argv (解释器路径 + [可选参数] + 脚本路径 + 原始参数)
+        new_argv: Vec<CString>,
+    },
+}
+
+/// 执行上下文，用于跟踪递归执行状态
+#[derive(Debug, Clone)]
+pub struct ExecContext {
+    /// 当前递归深度
+    pub recursion_depth: usize,
+    /// 原始脚本路径 (用于argv)
+    pub original_path: Option<String>,
+}
+
+impl Default for ExecContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecContext {
+    pub fn new() -> Self {
+        Self {
+            recursion_depth: 0,
+            original_path: None,
+        }
+    }
+
+    /// 检查是否超过最大递归深度
+    pub fn check_recursion_limit(&self) -> Result<(), SystemError> {
+        if self.recursion_depth >= SHEBANG_MAX_RECURSION_DEPTH {
+            return Err(SystemError::ELOOP);
+        }
+        Ok(())
+    }
+
+    pub fn increment_depth(mut self) -> Self {
+        self.recursion_depth += 1;
+        self
     }
 }
 
@@ -125,6 +180,24 @@ impl ExecParam {
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
+        let metadata = file_inode.metadata()?;
+
+        // 必须是普通文件
+        if metadata.file_type != FileType::File {
+            return Err(SystemError::EACCES);
+        }
+
+        // 检查执行权限
+        // 注意：这是简化版本，完整实现应该根据当前进程的 uid/gid 检查对应的权限位
+        // TODO: 实现基于 uid/gid 的权限检查
+        let mode = metadata.mode;
+        if !mode.contains(InodeMode::S_IXUSR)
+            && !mode.contains(InodeMode::S_IXGRP)
+            && !mode.contains(InodeMode::S_IXOTH)
+        {
+            return Err(SystemError::EACCES);
+        }
+
         // 读取文件头部，用于判断文件类型
         let file = File::new(file_inode, FileFlags::O_RDONLY)?;
 
@@ -194,7 +267,6 @@ impl ExecParam {
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
 fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-    ProcessManager::current_pcb().sighand().reset_handlers();
     // todo: 该函数未正确实现
     let tg_empty = pcb.threads_read_irqsave().thread_group_empty();
     if tg_empty {
@@ -207,13 +279,84 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 }
 
 /// ## 加载二进制文件
-pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, SystemError> {
+///
+///
+/// ## 参数
+/// - `param`: 执行参数
+/// - `ctx`: 执行上下文，用于跟踪递归深度
+///
+/// ## 返回值
+/// - `LoadBinaryResult::Loaded`: 正常加载完成
+/// - `LoadBinaryResult::NeedReexec`: 需要递归执行解释器（shebang场景）
+pub fn load_binary_file_with_context(
+    param: &mut ExecParam,
+    ctx: &ExecContext,
+) -> Result<LoadBinaryResult, SystemError> {
+    use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
+
+    // 检查递归深度
+    ctx.check_recursion_limit()?;
+
     // 读取文件头部，用于判断文件类型
     let mut head_buf = [0u8; 512];
     param.file_mut().lseek(SeekFrom::SeekSet(0))?;
     let _bytes = param.file_mut().read(512, &mut head_buf)?;
-    // debug!("load_binary_file: read {} bytes", _bytes);
 
+    // 首先检查是否为shebang脚本
+    if SHEBANG_LOADER.probe(param, &head_buf).is_ok() {
+        // 解析shebang行
+        let shebang_info =
+            ShebangLoader::parse_shebang_line(&head_buf).map_err(|_| SystemError::ENOEXEC)?;
+
+        // 查找解释器
+        let pwd = ProcessManager::current_pcb().pwd_inode();
+        let interpreter_inode = pwd
+            .lookup_follow_symlink(&shebang_info.interpreter_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+            .inspect_err(|e| {
+                log::warn!(
+                    "Shebang interpreter not found: {}, error: {:?}",
+                    shebang_info.interpreter_path,
+                    e
+                );
+            })?;
+
+        // 获取脚本路径
+        let script_path = param
+            .file_mut()
+            .inode()
+            .absolute_path()
+            .unwrap_or_else(|_| ctx.original_path.clone().unwrap_or_default());
+
+        // 构建新的argv
+        // Linux语义: [interpreter, optional_arg, script_path, original_args[1:]...]
+        let mut new_argv = Vec::new();
+
+        // argv[0] = 解释器路径
+        new_argv.push(
+            CString::new(shebang_info.interpreter_path.clone()).map_err(|_| SystemError::EINVAL)?,
+        );
+
+        // argv[1] = 可选参数 (如果存在)
+        if let Some(ref arg) = shebang_info.interpreter_arg {
+            new_argv.push(CString::new(arg.clone()).map_err(|_| SystemError::EINVAL)?);
+        }
+
+        // argv[N] = 脚本路径
+        new_argv.push(CString::new(script_path).map_err(|_| SystemError::EINVAL)?);
+
+        // 追加原始参数 (跳过argv[0]，因为已经用脚本路径替换)
+        let original_args = &param.init_info().args;
+        if original_args.len() > 1 {
+            new_argv.extend(original_args[1..].iter().cloned());
+        }
+
+        return Ok(LoadBinaryResult::NeedReexec {
+            interpreter_inode,
+            new_argv,
+        });
+    }
+
+    // 然后尝试其他加载器 (ELF等)
     let mut loader = None;
     for bl in BINARY_LOADERS.iter() {
         let probe_result = bl.probe(param, &head_buf);
@@ -222,19 +365,17 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
             break;
         }
     }
-    // debug!("load_binary_file: loader: {:?}", loader);
+
     if loader.is_none() {
         return Err(SystemError::ENOEXEC);
     }
 
     let loader: &&dyn BinaryLoader = loader.unwrap();
     assert!(param.vm().is_current());
-    // debug!("load_binary_file: to load with param: {:?}", param);
 
     let result: BinaryLoaderResult = loader.load(param, &head_buf).map_err(SystemError::from)?;
 
-    // debug!("load_binary_file: load success: {result:?}");
-    return Ok(result);
+    Ok(LoadBinaryResult::Loaded(result))
 }
 
 /// 程序初始化信息，这些信息会被压入用户栈中

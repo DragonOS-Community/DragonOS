@@ -32,9 +32,9 @@ use crate::{
     process::{
         cred::Cred,
         namespace::{
-            ipc_namespace::IpcNamespace, mnt::MntNamespace, net_namespace::NetNamespace,
-            pid_namespace::PidNamespace, user_namespace::UserNamespace,
-            uts_namespace::UtsNamespace,
+            cgroup_namespace::CgroupNamespace, ipc_namespace::IpcNamespace, mnt::MntNamespace,
+            net_namespace::NetNamespace, pid_namespace::PidNamespace,
+            user_namespace::UserNamespace, uts_namespace::UtsNamespace,
         },
         resource::RLimitID,
         ProcessControlBlock, ProcessManager, RawPid,
@@ -76,7 +76,9 @@ pub enum NamespaceFilePrivateData {
     /// PID namespace for children.
     PidForChildren(Arc<PidNamespace>),
     User(Arc<UserNamespace>),
-    // Time/cgroup namespaces are not implemented yet.
+    /// Cgroup namespace.
+    Cgroup(Arc<CgroupNamespace>),
+    // Time namespace is not implemented yet.
 }
 
 impl fmt::Debug for NamespaceFilePrivateData {
@@ -91,6 +93,9 @@ impl fmt::Debug for NamespaceFilePrivateData {
                 f.write_str("NamespaceFilePrivateData::PidForChildren(..)")
             }
             NamespaceFilePrivateData::User(_) => f.write_str("NamespaceFilePrivateData::User(..)"),
+            NamespaceFilePrivateData::Cgroup(_) => {
+                f.write_str("NamespaceFilePrivateData::Cgroup(..)")
+            }
         }
     }
 }

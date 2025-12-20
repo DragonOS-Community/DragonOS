@@ -749,8 +749,10 @@ impl IndexNode for LockedTmpfsInode {
 
         result.0.lock().self_ref = Arc::downgrade(&result);
 
-        // 仅普通文件需要页缓存
-        if file_type == FileType::File {
+        // tmpfs 中：普通文件和符号链接都需要可读写的数据存储。
+        // 目前 VFS 使用 read_at/write_at 来读写 symlink 内容（readlink/symlink 语义），
+        // 因此 symlink 也必须有 page_cache 后端，否则会在 write_at/read_at 返回 EIO。
+        if file_type == FileType::File || file_type == FileType::SymLink {
             let pc = PageCache::new(Some(Arc::downgrade(&result) as Weak<dyn IndexNode>));
             pc.set_unevictable(true);
             result.0.lock().page_cache = Some(pc);

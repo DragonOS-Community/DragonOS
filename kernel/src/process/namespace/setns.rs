@@ -13,13 +13,13 @@ use super::nsproxy::{switch_task_namespaces, NsProxy};
 ///
 /// - `fd`：必须是通过 `pidfd_open` 或 `clone(CLONE_PIDFD)` 获得的 pidfd
 /// - `nstype`：命名空间 flag 组合，仅允许 CLONE_NEWNS/CLONE_NEWUTS/CLONE_NEWIPC/
-///   CLONE_NEWNET/CLONE_NEWPID，且不能为空
+///   CLONE_NEWNET/CLONE_NEWPID/CLONE_NEWCGROUP，且不能为空
 ///
 /// 语义（与 Linux setns(pidfd, flags) 对齐的子集）：
 /// - 针对指定 flag，从目标任务的 `NsProxy` 中拷贝对应 namespace 引用，
 ///   在当前任务上构造新的 `NsProxy` 并通过 `switch_task_namespaces` 原子替换
 /// - CLONE_NEWPID 仅影响 `pid_ns_for_children`（与 DragonOS/ Linux 一致）
-/// - 不支持 USER/CGROUP/TIME namespace 以及 `/proc/<pid>/ns/*` 路径
+/// - 不支持 USER/TIME namespace 以及 `/proc/<pid>/ns/*` 路径
 #[inline(never)]
 pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
     // 1. 解析并校验 flag
@@ -30,7 +30,8 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             | CloneFlags::CLONE_NEWUTS.bits()
             | CloneFlags::CLONE_NEWIPC.bits()
             | CloneFlags::CLONE_NEWNET.bits()
-            | CloneFlags::CLONE_NEWPID.bits(),
+            | CloneFlags::CLONE_NEWPID.bits()
+            | CloneFlags::CLONE_NEWCGROUP.bits(),
     );
 
     // 不能包含未支持的位；对 pidfd 路径，后续会额外要求非空
@@ -92,6 +93,9 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             // 与 Linux 语义一致：仅影响子进程的 PID namespace
             new_inner.pid_ns_for_children = target_nsproxy.pid_ns_for_children.clone();
         }
+        if flags.contains(CloneFlags::CLONE_NEWCGROUP) {
+            new_inner.cgroup_ns = target_nsproxy.cgroup_ns.clone();
+        }
 
         let new_nsproxy = Arc::new(new_inner);
         switch_task_namespaces(&current, new_nsproxy)?;
@@ -142,6 +146,12 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
         NamespaceFilePrivateData::User(_ns) => {
             // 暂未实现 user namespace 切换
             return Err(SystemError::EINVAL);
+        }
+        NamespaceFilePrivateData::Cgroup(ns) => {
+            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWCGROUP) {
+                return Err(SystemError::EINVAL);
+            }
+            new_inner.cgroup_ns = ns;
         }
     }
 

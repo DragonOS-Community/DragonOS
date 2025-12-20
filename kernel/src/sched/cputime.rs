@@ -4,7 +4,7 @@ use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch},
     exception::InterruptArch,
     ipc::kill::send_signal_to_pcb,
-    process::ProcessControlBlock,
+    process::{ProcessControlBlock, ProcessState},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     time::jiffies::TICK_NESC,
 };
@@ -96,6 +96,25 @@ impl CpuTimeFunc {
             pcb.account_stime(accounted_cputime);
         }
         pcb.add_sum_exec_runtime(accounted_cputime);
+
+        // 唤醒可能在等待 CPU-time 时钟的线程（clock_nanosleep: PROCESS/THREAD_CPUTIME）。
+        // 线程 CPU-time：仅在该线程运行时推进，因此唤醒该 PCB 的等待队列即可。
+        if !pcb.cputime_wait_queue().is_empty() {
+            pcb.cputime_wait_queue()
+                .wakeup_all(Some(ProcessState::Blocked(true)));
+        }
+
+        // 进程 CPU-time：需要在任一线程推进时唤醒线程组组长上的等待队列。
+        // 这样“主线程 sleep + 子线程 busy loop”的场景才能正确返回。
+        if !pcb.is_thread_group_leader() {
+            if let Some(leader) = pcb.threads_read_irqsave().group_leader() {
+                if !leader.cputime_wait_queue().is_empty() {
+                    leader
+                        .cputime_wait_queue()
+                        .wakeup_all(Some(ProcessState::Blocked(true)));
+                }
+            }
+        }
 
         // 检查并处理CPU时间定时器
         let mut itimers = pcb.itimers_irqsave();

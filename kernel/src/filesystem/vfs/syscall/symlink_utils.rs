@@ -18,12 +18,17 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
         None => AtFlags::AT_FDCWD.bits(),
     };
 
-    // TODO: 添加权限检查，确保进程拥有目标路径的权限
+    // Linux 语义：
+    // - symlink(2) 创建名为 `to` 的符号链接，其内容为 `from`
+    // - `from`（目标字符串）不要求存在，也不应被解析/规范化
+    // - 仅需解析并校验 `to` 的父目录存在且为目录，且 `to` 本身不存在
+    //
+    // TODO: 添加权限检查，确保进程拥有目标路径的权限（父目录 W+X）
+    if to.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
     let pcb = ProcessManager::current_pcb();
-    let (old_begin_inode, old_remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), from)?;
-    // info!("old_begin_inode={:?}", old_begin_inode.metadata());
-    let _ =
-        old_begin_inode.lookup_follow_symlink(&old_remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     // 得到新创建节点的父节点
     let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newdfd, to)?;
@@ -34,9 +39,14 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
         return Err(SystemError::ENAMETOOLONG);
     }
 
-    let new_parent = new_begin_inode
-        .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    // info!("new_parent={:?}", new_parent.metadata());
+    // 当路径只有文件名（没有目录部分）时，new_parent_path 为 None，
+    // 此时父目录就是 new_begin_inode 本身（即 cwd 或 dirfd 指向的目录）
+    let new_parent = match new_parent_path {
+        Some(parent_path) => {
+            new_begin_inode.lookup_follow_symlink(parent_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+        }
+        None => new_begin_inode,
+    };
 
     if new_parent.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
@@ -45,8 +55,9 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     let new_inode =
         new_parent.create_with_data(new_name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
 
-    let buf = old_remain_path.as_bytes();
+    let buf = from.as_bytes();
     let len = buf.len();
     new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
+
     return Ok(0);
 }

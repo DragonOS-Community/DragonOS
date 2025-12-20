@@ -1,42 +1,21 @@
+# 需要rootfs支持符号链接
 ExecTest.InterpreterScript
 ExecTest.InterpreterScriptArgSplit
 ExecTest.InterpreterScriptArgvZero
 ExecTest.InterpreterScriptArgvZeroRelative
 ExecTest.InterpreterScriptArgvZeroAdded
 ExecTest.InterpreterScriptArgNUL
-ExecTest.InterpreterScriptTrailingWhitespace
 ExecTest.InterpreterScriptArgWhitespace
-ExecTest.ExecFn
-ExecTest.ExecName
-ExecTest.ExecNameScript
-ExecTest.NoExecPerm
-ExecTest.CloexecNormalFile
-ExecTest.CloexecEventfd
-ExecTest.SymlinkLimitExceeded
-ExecTest.SymlinkLimitRefreshedForInterpreter
+
+# 需要支持ptrace
 ExecTest.Setpgid
-ExecStateTest.HandlerReset
-ExecStateTest.IgnorePreserved
-ExecStateTest.SignalMask
-ExecStateTest.ItimerPreserved
-ProcSelfExe.ChangesAcrossExecve
-ExecveatTest.BasicWithFDCWD
-ExecveatTest.Basic
-ExecveatTest.FDNotADirectory
-ExecveatTest.AbsolutePathWithFDCWD
-ExecveatTest.AbsolutePath
-ExecveatTest.EmptyPathBasic
-ExecveatTest.EmptyPathWithDirFD
-ExecveatTest.EmptyPathWithoutEmptyPathFlag
-ExecveatTest.AbsolutePathWithEmptyPathFlag
-ExecveatTest.RelativePathWithEmptyPathFlag
-ExecveatTest.SymlinkNoFollowWithRelativePath
-ExecveatTest.UnshareFiles
-ExecveatTest.SymlinkNoFollowWithAbsolutePath
-ExecveatTest.SymlinkNoFollowAndEmptyPath
+
+# 需要/bin/echo,而fat不支持符号链接
+ExecTest.ExecFn
+ExecTest.ExecNameScript
+ExecTest.SymlinkLimitRefreshedForInterpreter
 ExecveatTest.SymlinkNoFollowIgnoreSymlinkAncestor
 ExecveatTest.SymlinkNoFollowWithNormalFile
-ExecveatTest.BasicWithCloexecFD
-ExecveatTest.InterpreterScriptWithCloexecFD
-ExecveatTest.InterpreterScriptWithCloexecDirFD
+
+# 需要set priority
 GetpriorityTest.ExecveMaintainsPriority

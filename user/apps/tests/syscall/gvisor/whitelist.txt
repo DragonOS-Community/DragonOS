@@ -47,7 +47,7 @@ vfork_test
 fpsig_fork_test
 fpsig_mut_test
 fpsig_nested_test
-#exec_test
+exec_test
 wait_test
 tkill_test
 tgkill_test

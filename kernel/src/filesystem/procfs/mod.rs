@@ -17,8 +17,8 @@ use crate::{
     filesystem::{
         procfs::{
             proc_thread_self_ns::{
-                current_thread_self_ns_ino, open_thread_self_ns_file, read_thread_self_ns_link,
-                ThreadSelfNsFileType,
+                current_thread_self_ns_ino, open_pid_ns_file, open_thread_self_ns_file, pid_ns_ino,
+                read_pid_ns_link, read_thread_self_ns_link, ThreadSelfNsFileType,
             },
             sys::sysctl::PrintkSysctl,
         },
@@ -110,6 +110,10 @@ pub enum ProcFileType {
     ProcMaps,
     /// /proc/sys/kernel/printk
     ProcSysKernelPrintk,
+    /// /proc/<pid>/ns 目录
+    ProcPidNsDir,
+    /// /proc/<pid>/ns/* 命名空间文件
+    ProcPidNsFile(ThreadSelfNsFileType),
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -815,6 +819,15 @@ impl ProcFS {
         mountinfo_file.0.lock().fdata.pid = Some(pid);
         mountinfo_file.0.lock().fdata.ftype = ProcFileType::ProcMountInfo;
 
+        // ns dir: /proc/<pid>/ns（命名空间目录，文件动态创建）
+        let ns_dir = pid_dir.create("ns", FileType::Dir, InodeMode::from_bits_truncate(0o555))?;
+        let ns_dir = ns_dir
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        ns_dir.0.lock().fdata.pid = Some(pid);
+        ns_dir.0.lock().fdata.ftype = ProcFileType::ProcPidNsDir;
+
         //todo: 创建其他文件
 
         return Ok(());
@@ -838,6 +851,7 @@ impl ProcFS {
         let _ = pid_dir.unlink("mountinfo");
         let _ = pid_dir.unlink("maps");
         let _ = pid_dir.unlink("cmdline");
+        let _ = pid_dir.rmdir("ns");
 
         // 查看进程文件是否还存在
         // let pf= pid_dir.find("status").expect("Cannot find status");
@@ -888,6 +902,61 @@ impl LockedProcFSInode {
                 } else {
                     // Extremely unlikely: filesystem reported EEXIST but the
                     // child is not present in the in-memory map. Treat as ENOENT.
+                    Err(SystemError::ENOENT)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 动态查找 /proc/<pid>/ns/<namespace> 文件
+    ///
+    /// 类似于 `dynamical_find_thread_self_ns`，但用于 /proc/<pid>/ns/ 目录，
+    /// 会保存对应的 pid 以便读取时获取该进程的命名空间信息。
+    #[inline(never)]
+    fn dynamical_find_pid_ns(&self, ns_name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // Convert namespace name to type, validate early.
+        let ns_type = ThreadSelfNsFileType::try_from(ns_name)?;
+
+        let name = DName::from(ns_name);
+
+        // 获取这个目录关联的 pid
+        let pid = self.0.lock().fdata.pid;
+
+        // Fast-path: check if file already exists under the children map.
+        {
+            let guard = self.0.lock();
+            if let Some(existing) = guard.children.get(&name) {
+                return Ok(existing.clone());
+            }
+        }
+
+        // Slow-path: try to create the namespace file
+        match self.create(
+            ns_name,
+            FileType::File,
+            InodeMode::from_bits_truncate(0o444),
+        ) {
+            Ok(ns_file) => {
+                // 设置文件类型和 pid
+                let ns_file_proc = ns_file
+                    .as_any_ref()
+                    .downcast_ref::<LockedProcFSInode>()
+                    .unwrap();
+                let mut guard = ns_file_proc.0.lock();
+                guard.fdata.pid = pid;
+                guard.fdata.ftype = ProcFileType::ProcPidNsFile(ns_type);
+                drop(guard);
+                Ok(ns_file)
+            }
+            Err(SystemError::EEXIST) => {
+                // Lost a concurrent race: another thread created the same entry
+                // between our initial check and create(). Look it up again and
+                // return the existing node instead of failing.
+                let guard = self.0.lock();
+                if let Some(existing) = guard.children.get(&name) {
+                    Ok(existing.clone())
+                } else {
                     Err(SystemError::ENOENT)
                 }
             }
@@ -986,14 +1055,42 @@ fn make_thread_self_ns_file_private_data(ns_type: ThreadSelfNsFileType) -> FileP
             NamespaceFilePrivateData::PidForChildren(nsproxy.pid_ns_for_children.clone())
         }
         ThreadSelfNsFileType::User => NamespaceFilePrivateData::User(pcb.cred().user_ns.clone()),
-        // time/cgroup namespace 暂未实现，退化为普通 user namespace 占位
-        ThreadSelfNsFileType::Time
-        | ThreadSelfNsFileType::TimeForChildren
-        | ThreadSelfNsFileType::Cgroup => {
+        ThreadSelfNsFileType::Cgroup => NamespaceFilePrivateData::Cgroup(nsproxy.cgroup_ns.clone()),
+        // time namespace 暂未实现，退化为普通 user namespace 占位
+        ThreadSelfNsFileType::Time | ThreadSelfNsFileType::TimeForChildren => {
             NamespaceFilePrivateData::User(pcb.cred().user_ns.clone())
         }
     };
     FilePrivateData::Namespace(ns_data)
+}
+
+/// 为 `/proc/<pid>/ns/*` 节点构造 namespace fd 绑定的私有数据。
+///
+/// 与 `make_thread_self_ns_file_private_data` 类似，但用于指定 PID 的进程。
+#[inline(never)]
+fn make_pid_ns_file_private_data(
+    pid: RawPid,
+    ns_type: ThreadSelfNsFileType,
+) -> Result<FilePrivateData, SystemError> {
+    let pcb = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
+    let nsproxy = pcb.nsproxy();
+    let ns_data = match ns_type {
+        ThreadSelfNsFileType::Ipc => NamespaceFilePrivateData::Ipc(nsproxy.ipc_ns.clone()),
+        ThreadSelfNsFileType::Uts => NamespaceFilePrivateData::Uts(nsproxy.uts_ns.clone()),
+        ThreadSelfNsFileType::Mnt => NamespaceFilePrivateData::Mnt(nsproxy.mnt_ns.clone()),
+        ThreadSelfNsFileType::Net => NamespaceFilePrivateData::Net(nsproxy.net_ns.clone()),
+        ThreadSelfNsFileType::Pid => NamespaceFilePrivateData::Pid(pcb.active_pid_ns()),
+        ThreadSelfNsFileType::PidForChildren => {
+            NamespaceFilePrivateData::PidForChildren(nsproxy.pid_ns_for_children.clone())
+        }
+        ThreadSelfNsFileType::User => NamespaceFilePrivateData::User(pcb.cred().user_ns.clone()),
+        ThreadSelfNsFileType::Cgroup => NamespaceFilePrivateData::Cgroup(nsproxy.cgroup_ns.clone()),
+        // time namespace 暂未实现，退化为普通 user namespace 占位
+        ThreadSelfNsFileType::Time | ThreadSelfNsFileType::TimeForChildren => {
+            NamespaceFilePrivateData::User(pcb.cred().user_ns.clone())
+        }
+    };
+    Ok(FilePrivateData::Namespace(ns_data))
 }
 
 impl IndexNode for LockedProcFSInode {
@@ -1037,6 +1134,11 @@ impl IndexNode for LockedProcFSInode {
                 // 仅用于计算文件大小；具体读写由 read_thread_self_ns_link 动态生成
                 open_thread_self_ns_file(ns_type, &mut proc_private)?
             }
+            ProcFileType::ProcPidNsFile(ns_type) => {
+                // /proc/<pid>/ns/* 文件，需要使用对应 pid 的命名空间
+                let pid = inode.fdata.pid.ok_or(SystemError::EINVAL)?;
+                open_pid_ns_file(pid, ns_type, &mut proc_private)?
+            }
             ProcFileType::Default => inode.data.len() as i64,
             ProcFileType::ProcKmsg
             | ProcFileType::ProcPidTaskDir
@@ -1046,6 +1148,7 @@ impl IndexNode for LockedProcFSInode {
             | ProcFileType::ProcFdInfoDir
             | ProcFileType::ProcFdInfoFile
             | ProcFileType::ProcThreadSelfNsRoot
+            | ProcFileType::ProcPidNsDir
             | ProcFileType::ProcSysKernelPrintk => 0,
         };
 
@@ -1053,6 +1156,11 @@ impl IndexNode for LockedProcFSInode {
         *data = match proc_ty {
             ProcFileType::ProcThreadSelfNsChild(ns_type) => {
                 make_thread_self_ns_file_private_data(ns_type)
+            }
+            ProcFileType::ProcPidNsFile(ns_type) => {
+                // /proc/<pid>/ns/* 文件使用对应 pid 的命名空间
+                let pid = inode.fdata.pid.ok_or(SystemError::EINVAL)?;
+                make_pid_ns_file_private_data(pid, ns_type)?
             }
             _ => FilePrivateData::Procfs(proc_private),
         };
@@ -1136,6 +1244,11 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcThreadSelfNsChild(ns_type) => {
                 return read_thread_self_ns_link(ns_type, buf, offset)
             }
+            ProcFileType::ProcPidNsFile(ns_type) => {
+                // /proc/<pid>/ns/* 文件读取
+                let pid = inode.fdata.pid.ok_or(SystemError::EINVAL)?;
+                return read_pid_ns_link(pid, ns_type, buf, offset);
+            }
 
             ProcFileType::ProcSysKernelPrintk => {
                 // 使用 PrintkSysctl 处理 /proc/sys/kernel/printk 文件读取
@@ -1209,6 +1322,15 @@ impl IndexNode for LockedProcFSInode {
         if let ProcFileType::ProcThreadSelfNsChild(ns_type) = inode.fdata.ftype {
             let ino = current_thread_self_ns_ino(ns_type);
             metadata.inode_id = InodeId::new(ino);
+        }
+
+        // For /proc/<pid>/ns/*, expose that process's namespace nsid as st_ino
+        if let ProcFileType::ProcPidNsFile(ns_type) = inode.fdata.ftype {
+            if let Some(pid) = inode.fdata.pid {
+                if let Ok(ino) = pid_ns_ino(pid, ns_type) {
+                    metadata.inode_id = InodeId::new(ino);
+                }
+            }
         }
 
         Ok(metadata)
@@ -1417,6 +1539,9 @@ impl IndexNode for LockedProcFSInode {
                     ProcFileType::ProcPidTaskTidDir => {
                         return self.dynamical_find_task_tid_child(name);
                     }
+                    ProcFileType::ProcPidNsDir => {
+                        return self.dynamical_find_pid_ns(name);
+                    }
                     _ => {}
                 }
 
@@ -1510,6 +1635,11 @@ impl IndexNode for LockedProcFSInode {
                 keys.append(&mut tids);
                 return Ok(keys);
             }
+            ProcFileType::ProcPidNsDir => {
+                // /proc/<pid>/ns/ 目录列出所有命名空间类型
+                keys.extend(ThreadSelfNsFileType::ALL_NAME.iter().map(|s| s.to_string()));
+                return Ok(keys);
+            }
             _ => {}
         }
 
@@ -1539,6 +1669,28 @@ impl IndexNode for LockedProcFSInode {
             }
         }
         None
+    }
+
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        let inode = self.0.lock();
+
+        // Only /proc/[pid]/ns/* files support namespace ioctl commands
+        if let ProcFileType::ProcThreadSelfNsChild(ns_type) = inode.fdata.ftype {
+            return proc_thread_self_ns::ns_file_ioctl(ns_type, cmd, data);
+        }
+
+        // /proc/<pid>/ns/* files also support namespace ioctl commands
+        if let ProcFileType::ProcPidNsFile(ns_type) = inode.fdata.ftype {
+            return proc_thread_self_ns::ns_file_ioctl(ns_type, cmd, data);
+        }
+
+        // Other procfs files don't support ioctl
+        Err(SystemError::ENOTTY)
     }
 }
 

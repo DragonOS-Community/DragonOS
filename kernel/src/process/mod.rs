@@ -4,7 +4,7 @@ use core::{
     hint::spin_loop,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -75,6 +75,7 @@ use self::{cred::Cred, kthread::WorkerPrivate};
 use crate::process::namespace::nsproxy::NsProxy;
 
 pub mod abi;
+pub mod cputime;
 pub mod cred;
 pub mod exec;
 pub mod execve;
@@ -96,6 +97,8 @@ pub mod stdio;
 pub mod syscall;
 pub mod timer;
 pub mod utils;
+
+pub use cputime::ProcessCpuTime;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> =
@@ -830,14 +833,6 @@ impl ProcessFlags {
     }
 }
 
-// TODO 完善相关的方法
-#[derive(Debug, Default)]
-pub struct ProcessCpuTime {
-    pub utime: AtomicU64,
-    pub stime: AtomicU64,
-    pub sum_exec_runtime: AtomicU64,
-}
-
 #[derive(Debug, Default)]
 pub struct CpuItimer {
     pub value: u64,    // 剩余时间 ns
@@ -909,6 +904,9 @@ pub struct ProcessControlBlock {
 
     /// 等待队列
     wait_queue: WaitQueue,
+
+    /// CPU-time 等待队列：用于 CLOCK_{PROCESS,THREAD}_CPUTIME_ID 的 clock_nanosleep
+    cputime_wait_queue: WaitQueue,
 
     /// 线程信息
     thread: RwLock<ThreadInfo>,
@@ -1052,6 +1050,7 @@ impl ProcessControlBlock {
                 real_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
                 wait_queue: WaitQueue::default(),
+                cputime_wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
                 fs: RwLock::new(Arc::new(FsStruct::new())),
                 alarm_timer: SpinLock::new(None),
@@ -1622,31 +1621,6 @@ impl ProcessControlBlock {
 
     pub fn posix_timers_irqsave(&self) -> SpinLockGuard<'_, posix_timer::ProcessPosixTimers> {
         return self.posix_timers.lock_irqsave();
-    }
-
-    #[inline(always)]
-    pub fn cputime(&self) -> Arc<ProcessCpuTime> {
-        return self.cpu_time.clone();
-    }
-    #[inline(always)]
-    pub fn account_utime(&self, ns: u64) {
-        if ns == 0 {
-            return;
-        }
-        self.cpu_time.utime.fetch_add(ns, Ordering::Relaxed);
-    }
-    #[inline(always)]
-    pub fn account_stime(&self, ns: u64) {
-        if ns == 0 {
-            return;
-        }
-        self.cpu_time.stime.fetch_add(ns, Ordering::Relaxed);
-    }
-    #[inline(always)]
-    pub fn add_sum_exec_runtime(&self, ns: u64) {
-        self.cpu_time
-            .sum_exec_runtime
-            .fetch_add(ns, Ordering::Relaxed);
     }
 
     /// Exit fd table when process exit

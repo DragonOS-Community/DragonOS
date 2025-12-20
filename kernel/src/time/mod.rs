@@ -100,6 +100,14 @@ impl PosixTimeSpec {
     pub fn total_nanos(&self) -> i64 {
         self.tv_sec * 1000000000 + self.tv_nsec
     }
+
+    /// 从纳秒创建 PosixTimeSpec
+    pub fn from_ns(ns: u64) -> PosixTimeSpec {
+        PosixTimeSpec {
+            tv_sec: (ns / 1_000_000_000) as i64,
+            tv_nsec: (ns % 1_000_000_000) as i64,
+        }
+    }
 }
 
 impl Sub for PosixTimeSpec {

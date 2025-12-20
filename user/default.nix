@@ -1,17 +1,19 @@
 {
+  lib,
   pkgs,
+  nixpkgs,
   system,
-  fenix,
   target,
+  fenix,
   buildDir,
   syscallTestDir,
   rootfsType ? "vfat",
+  diskPath,
   partitionType ? "mbr"
 }:
 
 let
-  image = import ./rootfs-tar.nix { inherit pkgs system fenix syscallTestDir; };
-  diskName = "disk-image-${target}.img";
+  image = import ./rootfs-tar.nix { inherit lib pkgs nixpkgs system target fenix syscallTestDir; };
 
   # 构建脚本 - 在bin/目录下构建
   buildScript = pkgs.writeShellApplication {
@@ -24,7 +26,6 @@ let
       mkdir -p "${buildDir}"
 
       OUTPUT_TAR="${buildDir}/rootfs.tar"
-      DISK_IMAGE="${buildDir}/${diskName}"
 
       echo "==> Generating rootfs"
 
@@ -79,14 +80,14 @@ let
         FINAL_TAR="$FILTERED_TAR"
       fi
 
-      echo "==> Building disk image at $DISK_IMAGE"
+      echo "==> Building disk image at ${diskPath}"
 
       export LIBGUESTFS_CACHEDIR=/tmp
       export LIBGUESTFS_BACKEND=direct
 
       # 创建磁盘镜像并初始化文件系统
       echo "  Creating disk image..."
-      TEMP_IMG="$DISK_IMAGE.tmp"
+      TEMP_IMG="${diskPath}.tmp"
 
       # 计算所需磁盘大小：tar包大小 + 1G 缓冲空间
       TAR_SIZE_KB=$(du -k "$FINAL_TAR" | cut -f1)
@@ -108,14 +109,14 @@ let
         shutdown
       EOF
 
-      mv "$TEMP_IMG" "$DISK_IMAGE"
+      mv "$TEMP_IMG" "${diskPath}"
 
-      IMG_SIZE=$(du -h "$DISK_IMAGE" | cut -f1)
+      IMG_SIZE=$(du -h "${diskPath}" | cut -f1)
       echo "  ✓ disk image created ($IMG_SIZE)"
 
       echo "==> Build complete!"
       echo "    Rootfs tar: $OUTPUT_TAR"
-      echo "    Disk image: $DISK_IMAGE"
+      echo "    Disk image: ${diskPath}"
     '';
   };
 

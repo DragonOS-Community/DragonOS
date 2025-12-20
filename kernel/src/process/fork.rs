@@ -352,6 +352,32 @@ impl ProcessManager {
         return Ok(());
     }
 
+    /// 复制进程信号信息（sig_info）
+    ///
+    /// fork 时需要复制父进程的信号掩码（sig_blocked）等信息到子进程。
+    /// execve 时应该保留 sig_blocked，不重置。
+    ///
+    /// 参考 Linux: kernel/fork.c copy_process()
+    fn copy_sig_info(
+        _clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        // 只复制信号掩码 - POSIX 要求 fork 和 execve 都保留信号掩码
+        // 注意：先读取父进程的，然后释放锁，再写入子进程的，避免死锁
+        let sig_blocked = {
+            let current_sig_info = current_pcb.sig_info_irqsave();
+            *current_sig_info.sig_blocked()
+        };
+
+        {
+            let mut new_sig_info = new_pcb.sig_info_mut();
+            *new_sig_info.sig_block_mut() = sig_blocked;
+        }
+
+        Ok(())
+    }
+
     /// 拷贝信号备用栈
     ///
     /// ## 参数
@@ -525,6 +551,14 @@ impl ProcessManager {
         Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
+
+        // 拷贝信号信息（sig_info，包括信号掩码）
+        Self::copy_sig_info(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy sig_info from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });

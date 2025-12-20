@@ -117,7 +117,6 @@ fn do_execve_internal(
 
         Ok(LoadBinaryResult::NeedReexec {
             interpreter_inode,
-            interpreter_path,
             new_argv,
         }) => {
             // Shebang场景：需要递归执行解释器
@@ -125,12 +124,6 @@ fn do_execve_internal(
             if let Some(old_vm) = old_vm {
                 do_execve_switch_user_vm(old_vm);
             }
-
-            log::debug!(
-                "Shebang: executing interpreter {} with args {:?}",
-                interpreter_path,
-                new_argv
-            );
 
             // 增加递归深度并递归调用
             let new_ctx = ctx.increment_depth();

@@ -1,6 +1,8 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
+
+use log::warn;
 
 use crate::libs::wait_queue::WaitQueue;
 
@@ -27,6 +29,10 @@ impl ProcessControlBlock {
     /// 当前线程（PCB）的 CPU 时间（ns），语义对齐 Linux 的 CLOCK_THREAD_CPUTIME_ID：user+system。
     #[inline]
     pub fn thread_cputime_ns(&self) -> u64 {
+        // 这里使用 Ordering::Relaxed：
+        // - 只需要读取两个独立计数器的“某个一致快照”（不要求与其它内存状态建立 happens-before）。
+        // - 对单个 AtomicU64 保证按地址一致性（coherence），满足 CPU-time 统计的近似/观测语义。
+        // 如未来需要与其它状态强一致（例如结合序列号/结构体快照），再引入更强的同步原语。
         let ct = self.cputime();
         ct.utime.load(Ordering::Relaxed) + ct.stime.load(Ordering::Relaxed)
     }
@@ -35,6 +41,8 @@ impl ProcessControlBlock {
     ///
     /// 说明：目前通过遍历线程组成员并累加每线程的 user+system 得到。
     pub fn process_cputime_ns(&self) -> u64 {
+        static BAD_TGROUP_LOGGED: AtomicBool = AtomicBool::new(false);
+
         // 尽量选择线程组组长作为“进程”视角。
         let leader = if self.is_thread_group_leader() {
             self.self_ref
@@ -49,6 +57,18 @@ impl ProcessControlBlock {
 
         if !leader.is_thread_group_leader() {
             // 防御：线程组关系未初始化时，退化为本线程。
+            if BAD_TGROUP_LOGGED
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                warn!(
+                    "process_cputime_ns fallback: invalid thread-group relation (pid={:?} tgid={:?} leader_pid={:?} leader_tgid={:?})",
+                    self.raw_pid(),
+                    self.tgid,
+                    leader.raw_pid(),
+                    leader.tgid,
+                );
+            }
             return self.thread_cputime_ns();
         }
 

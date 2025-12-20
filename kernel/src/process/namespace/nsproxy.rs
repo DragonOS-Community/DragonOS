@@ -5,6 +5,7 @@ use system_error::SystemError;
 use crate::process::{
     fork::CloneFlags,
     namespace::{
+        cgroup_namespace::{CgroupNamespace, INIT_CGROUP_NAMESPACE},
         mnt::{root_mnt_namespace, MntNamespace},
         net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
         uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
@@ -52,10 +53,11 @@ pub struct NsProxy {
     pub ipc_ns: Arc<IpcNamespace>,
     /// 网络命名空间
     pub net_ns: Arc<NetNamespace>,
+    /// cgroup 命名空间
+    pub cgroup_ns: Arc<CgroupNamespace>,
     // 注意，user_ns 存储在cred,不存储在nsproxy
 
     // 其他namespace（为未来扩展预留）
-    // pub cgroup_ns: Option<Arc<CgroupNamespace>>,
     // pub time_ns: Option<Arc<TimeNamespace>>,
 }
 
@@ -73,12 +75,14 @@ impl NsProxy {
         let root_net_ns = INIT_NET_NAMESPACE.clone();
         let root_uts_ns = INIT_UTS_NAMESPACE.clone();
         let root_ipc_ns = INIT_IPC_NAMESPACE.clone();
+        let root_cgroup_ns = INIT_CGROUP_NAMESPACE.clone();
         Arc::new(Self {
             pid_ns_for_children: root_pid_ns,
             mnt_ns: root_mnt_ns,
             net_ns: root_net_ns,
             uts_ns: root_uts_ns,
             ipc_ns: root_ipc_ns,
+            cgroup_ns: root_cgroup_ns,
         })
     }
 
@@ -104,6 +108,7 @@ impl NsProxy {
             net_ns: self.net_ns.clone(),
             uts_ns: self.uts_ns.clone(),
             ipc_ns: self.ipc_ns.clone(),
+            cgroup_ns: self.cgroup_ns.clone(),
         }
     }
 }
@@ -186,12 +191,17 @@ pub(super) fn create_new_namespaces(
 
     let uts_ns = nsproxy.uts_ns.copy_uts_ns(clone_flags, user_ns.clone())?;
     let ipc_ns = nsproxy.ipc_ns.copy_ipc_ns(clone_flags, user_ns.clone());
+    let cgroup_ns = nsproxy
+        .cgroup_ns
+        .copy_cgroup_ns(clone_flags, user_ns.clone())?;
+
     let result = NsProxy {
         pid_ns_for_children,
         mnt_ns,
         net_ns,
         uts_ns,
         ipc_ns,
+        cgroup_ns,
     };
 
     let result = Arc::new(result);

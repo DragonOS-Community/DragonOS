@@ -79,7 +79,7 @@ pub fn do_preadv(fd: i32, iovecs: &IoVecs, offset: usize) -> Result<usize, Syste
     let read_len = file.pread(offset, data.len(), &mut data)?;
 
     // Scatter the read data back to user buffers.
-    iovecs.scatter(&data[..read_len]);
+    iovecs.scatter(&data[..read_len])?;
 
     Ok(read_len)
 }

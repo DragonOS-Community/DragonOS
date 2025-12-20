@@ -133,7 +133,7 @@ pub fn do_preadv2(
 
         let mut data = vec![0; iovecs.total_len()];
         let read_len = file.read(data.len(), &mut data)?;
-        iovecs.scatter(&data[..read_len]);
+        iovecs.scatter(&data[..read_len])?;
         return Ok(read_len);
     }
 

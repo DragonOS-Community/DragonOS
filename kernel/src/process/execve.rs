@@ -1,6 +1,7 @@
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::IndexNode;
+use crate::libs::rwlock::RwLock;
 use crate::process::exec::{
     load_binary_file_with_context, ExecContext, ExecParam, ExecParamFlags, LoadBinaryResult,
 };
@@ -99,6 +100,20 @@ fn do_execve_internal(
 
             if let Some(completion) = vfork_done {
                 completion.complete_all();
+            }
+
+            // unshare fd_table if it's shared (CLONE_FILES case)
+            // 参考 Linux: https://elixir.bootlin.com/linux/v6.1.9/source/fs/exec.c#L1857
+            // "Ensure the files table is not shared"
+            {
+                let fd_table = pcb.fd_table();
+                // 检查 fd_table 是否被共享 (Arc::strong_count() > 1)
+                if Arc::strong_count(&fd_table) > 1 {
+                    // fd_table 被共享，需要创建私有副本
+                    let new_fd_table = fd_table.read().clone();
+                    let new_fd_table = Arc::new(RwLock::new(new_fd_table));
+                    pcb.basic_mut().set_fd_table(Some(new_fd_table));
+                }
             }
 
             if pcb.sighand().is_shared() {

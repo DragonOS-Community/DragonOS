@@ -74,8 +74,11 @@ impl SysExecve {
                 VFS_MAX_FOLLOW_SYMLINK_TIMES,
                 false,
             ) {
-                let real_path = real_inode.absolute_path()?;
-                argv[0] = CString::new(real_path).unwrap();
+                // 只有当 absolute_path() 成功时才替换 argv[0]
+                // 如果失败（返回 ENOSYS），保持原路径不变
+                if let Ok(real_path) = real_inode.absolute_path() {
+                    argv[0] = CString::new(real_path).unwrap();
+                }
             }
         }
 

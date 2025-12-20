@@ -491,6 +491,71 @@ static int test_large_copy(void)
     TEST_PASS();
 }
 
+/**
+ * 测试 13: 同一文件重叠拷贝
+ */
+static int test_same_file_overlap(void)
+{
+    TEST_START("same file overlap");
+    cleanup_test_files();
+
+    const char *test_data = "0123456789";
+    size_t data_len = strlen(test_data);
+    TEST_ASSERT(create_test_file(SRC_FILE, test_data, data_len) == 0,
+                "Failed to create source file");
+
+    int fd = open(SRC_FILE, O_RDWR);
+    TEST_ASSERT(fd >= 0, "Failed to open file");
+
+    /* 尝试重叠拷贝：源 [0, 5), 目标 [2, 7) - 重叠区域 [2, 5) */
+    off_t off_in = 0;
+    off_t off_out = 2;
+    ssize_t ret = copy_file_range_wrapper(fd, &off_in, fd, &off_out, 5, 0);
+
+    TEST_ASSERT(ret == -1 && errno == EINVAL,
+                "Should fail with EINVAL for overlapping ranges");
+
+    close(fd);
+    cleanup_test_files();
+    TEST_PASS();
+}
+
+/**
+ * 测试 14: 目标偏移更新测试
+ */
+static int test_dest_offset_update(void)
+{
+    TEST_START("dest offset update");
+    cleanup_test_files();
+
+    const char *test_data = "Hello";
+    TEST_ASSERT(create_test_file(SRC_FILE, test_data, strlen(test_data)) == 0,
+                "Failed to create source file");
+    
+    int src_fd = open(SRC_FILE, O_RDONLY);
+    int dst_fd = open(DST_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    TEST_ASSERT(src_fd >= 0 && dst_fd >= 0, "Failed to open files");
+
+    off_t off_in = 0;
+    off_t off_out = 10; /* 从目标文件偏移 10 开始写 */
+    
+    ssize_t ret = copy_file_range_wrapper(src_fd, &off_in, dst_fd, &off_out, 5, 0);
+    
+    TEST_ASSERT(ret == 5, "Should copy 5 bytes");
+    TEST_ASSERT(off_in == 5, "Source offset should be updated to 5");
+    TEST_ASSERT(off_out == 15, "Dest offset should be updated to 15");
+
+    /* 验证文件大小应该是 15 (前10字节是空洞) */
+    struct stat st;
+    fstat(dst_fd, &st);
+    TEST_ASSERT(st.st_size == 15, "Dest file size should be 15");
+
+    close(src_fd);
+    close(dst_fd);
+    cleanup_test_files();
+    TEST_PASS();
+}
+
 /* 主函数 */
 int main(void)
 {
@@ -511,6 +576,8 @@ int main(void)
     test_negative_offset();
     test_zero_length();
     test_large_copy();
+    test_same_file_overlap();
+    test_dest_offset_update();
 
     /* 清理 */
     cleanup_test_files();

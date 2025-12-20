@@ -172,8 +172,8 @@ fn read_offset_from_user(off_ptr: *mut i64) -> Result<Option<usize>, SystemError
         return Ok(None);
     }
 
-    let offset = *UserBufferReader::new(off_ptr as *const i64, size_of::<i64>(), true)?
-        .read_one_from_user_checked::<i64>(0)?;
+    let reader = UserBufferReader::new(off_ptr as *const i64, size_of::<i64>(), true)?;
+    let offset = reader.buffer_protected(0)?.read_one::<i64>(0)?;
 
     if offset < 0 {
         return Err(SystemError::EINVAL);
@@ -190,7 +190,7 @@ fn write_offset_to_user(off_ptr: *mut i64, offset: Option<usize>) -> Result<(), 
 
     let offset_val = offset.unwrap() as i64;
     let mut writer = UserBufferWriter::new(off_ptr, size_of::<i64>(), true)?;
-    writer.copy_one_to_user_checked(&offset_val, 0)?;
+    writer.buffer_protected(0)?.write_one(0, &offset_val)?;
     Ok(())
 }
 
@@ -213,12 +213,18 @@ fn copy_file_range_impl(
     pos_out: Option<usize>,
     len: usize,
 ) -> Result<usize, SystemError> {
+    // 获取源文件元数据
+    let md_in = in_file.metadata()?;
+    let size_in = md_in.size;
+
     // 如果长度为 0，直接返回
     if len == 0 {
         return Ok(0);
     }
 
     // 获取起始偏移
+    // 注意：如果 use_in/out_file_offset 为 true，这里的 start_pos_in/out (0) 仅用于溢出检查占位，
+    // 实际并不代表文件当前偏移。
     let start_pos_in = pos_in.unwrap_or(0);
     let start_pos_out = pos_out.unwrap_or(0);
 
@@ -230,14 +236,14 @@ fn copy_file_range_impl(
         .checked_add(len)
         .ok_or(SystemError::EOVERFLOW)?;
 
-    // 获取源文件大小，裁剪读取长度到 EOF
-    let size_in = in_file.metadata()?.size;
     if size_in < 0 {
         return Err(SystemError::EINVAL);
     }
     let size_in = size_in as usize;
 
     // 如果起始位置已经超过文件大小，返回 0
+    // 注意：如果 use_in_file_offset 为 true，我们依赖 in_file.read() 返回 0 来处理 EOF，
+    // 因为此时我们不知道文件的当前偏移量。
     if !use_in_file_offset && start_pos_in >= size_in {
         return Ok(0);
     }
@@ -256,7 +262,6 @@ fn copy_file_range_impl(
 
     // 检查同一文件的重叠写入
     // 使用 metadata 的 inode_id 和 dev_id 来判断是否是同一文件
-    let md_in = in_file.metadata()?;
     let md_out = out_file.metadata()?;
     if md_in.inode_id == md_out.inode_id && md_in.dev_id == md_out.dev_id {
         // 同一文件，检查是否有重叠

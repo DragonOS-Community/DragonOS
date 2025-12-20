@@ -85,3 +85,4 @@ unshare_test
 pty_root_test
 time_test
 timers_test
+clock_nanosleep_test

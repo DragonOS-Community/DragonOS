@@ -1,5 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CLOCK_GETTIME;
+use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferWriter;
 use crate::time::timekeeping::getnstimeofday;
@@ -26,9 +27,6 @@ impl Syscall for SysClockGettime {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let clock_id = PosixClockID::try_from(Self::clock_id(args))?;
-        if clock_id != PosixClockID::Realtime {
-            // warn!("clock_gettime: currently only support Realtime clock, but got {:?}. Defaultly return realtime!!!\n", clock_id);
-        }
 
         let tp = Self::timespec_ptr(args);
         if tp.is_null() {
@@ -41,7 +39,26 @@ impl Syscall for SysClockGettime {
             true,
         )?;
 
-        let timespec = getnstimeofday();
+        let timespec = match clock_id {
+            PosixClockID::Realtime => getnstimeofday(),
+            // 单调/boottime 等目前仍复用 realtime（后续可补齐真正语义）。
+            PosixClockID::Monotonic
+            | PosixClockID::Boottime
+            | PosixClockID::MonotonicRaw
+            | PosixClockID::RealtimeCoarse
+            | PosixClockID::MonotonicCoarse
+            | PosixClockID::RealtimeAlarm
+            | PosixClockID::BoottimeAlarm => getnstimeofday(),
+
+            PosixClockID::ProcessCPUTimeID => {
+                let pcb = ProcessManager::current_pcb();
+                PosixTimeSpec::from_ns(pcb.process_cputime_ns())
+            }
+            PosixClockID::ThreadCPUTimeID => {
+                let pcb = ProcessManager::current_pcb();
+                PosixTimeSpec::from_ns(pcb.thread_cputime_ns())
+            }
+        };
 
         tp_buf.copy_one_to_user(&timespec, 0)?;
 

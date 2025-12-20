@@ -1340,7 +1340,7 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn raw_tgid(&self) -> RawPid {
-        return self.pid;
+        return self.tgid;
     }
 
     #[inline(always)]

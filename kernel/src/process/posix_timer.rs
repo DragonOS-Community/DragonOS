@@ -2,7 +2,7 @@
 //!
 //! This is a minimal-but-correct implementation for gVisor `timers.cc` tests:
 //! - CLOCK_MONOTONIC based timers
-//! - SIGEV_NONE / SIGEV_SIGNAL / SIGEV_THREAD_ID (thread id must be current thread)
+//! - SIGEV_NONE / SIGEV_SIGNAL / SIGEV_THREAD / SIGEV_THREAD_ID
 //! - coalescing: at most one pending signal per (signo,timerid); overruns accumulate
 
 use alloc::{
@@ -50,6 +50,7 @@ const _: [(); 64] = [(); size_of::<PosixSigevent>()];
 /// sigev_notify 常量（Linux）
 pub const SIGEV_SIGNAL: i32 = 0;
 pub const SIGEV_NONE: i32 = 1;
+pub const SIGEV_THREAD: i32 = 2;
 pub const SIGEV_THREAD_ID: i32 = 4;
 
 #[derive(Debug, Copy, Clone)]
@@ -142,10 +143,32 @@ impl ProcessPosixTimers {
                     target_tid: pcb.raw_pid(),
                 }
             }
+            SIGEV_THREAD => {
+                // 兼容 gVisor 测试：它通过 TimerCreate() 传入 SIGEV_THREAD 并期望用 signo 打断阻塞 syscall。
+                // Linux 内核并不会在内核态执行用户回调；glibc/musl 通常在用户态把 SIGEV_THREAD
+                // 转换为 SIGEV_THREAD_ID + sigwaitinfo 线程。
+                // DragonOS 这里选择退化为“投递信号到当前线程”，以满足 FIFO/OpenInterrupted 场景。
+                let signo = Signal::from(sev.sigev_signo as usize);
+                if !signo.is_valid() {
+                    return Err(SystemError::EINVAL);
+                }
+                PosixTimerNotify::Signal {
+                    signo,
+                    sigval: PosixSigval::from_ptr(sev.sigev_value),
+                    target_tid: pcb.raw_pid(),
+                }
+            }
             SIGEV_THREAD_ID => {
-                // 当前内核暂无完善的线程模型：只允许指定当前线程（tid）。
                 let tid = RawPid::new(sev.sigev_notify_thread_id as usize);
-                if tid != ProcessManager::current_pcb().raw_pid() {
+                // Linux 语义：仅允许向“同一线程组”的某个线程投递信号。
+                // musl 的 SIGEV_THREAD 实现会创建新线程，并通过 SIGEV_THREAD_ID
+                // 将内核 timer 信号定向到该线程，因此这里必须允许非当前 tid。
+                let target = ProcessManager::find_task_by_vpid(tid)
+                    // 在部分场景下 vpid 映射可能尚未就绪；退化到全局 pid 表查找。
+                    .or_else(|| ProcessManager::find(tid))
+                    .ok_or(SystemError::EINVAL)?;
+
+                if target.tgid != pcb.tgid {
                     return Err(SystemError::EINVAL);
                 }
                 let signo = Signal::from(sev.sigev_signo as usize);

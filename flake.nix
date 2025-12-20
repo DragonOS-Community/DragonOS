@@ -33,7 +33,8 @@
               # 内核位置
               kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
               # 自动测试项目，指定内核启动环境变量参数 AUTO_TEST
-              autotest = "syscall";
+              autotest = "none";
+              debug = true;
             };
 
             startPkg = qemuScripts.${target};

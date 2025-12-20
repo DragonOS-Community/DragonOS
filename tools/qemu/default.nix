@@ -4,7 +4,8 @@
   diskPath,
   kernel,
   syscallTestDir,
-  autotest
+  autotest,
+  debug ? false
 }:
 
 let
@@ -38,13 +39,14 @@ let
 
         # Boot Order
         "-boot" "order=d"
-        # GDB Stub
-        "-s"
 
         "-rtc" "clock=host,base=localtime"
         # Trace events
         "-d" "cpu_reset,guest_errors,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*"
         "-trace" "fw_cfg*"
+      ] ++ lib.optionals debug [
+        # GDB Stub
+        "-s" "-S"
       ];
       nographicArgs = lib.optionals isNographic ([
         "--nographic"

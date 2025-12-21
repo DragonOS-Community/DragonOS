@@ -3,8 +3,7 @@
   pkgs,
   diskPath,
   kernel,
-  syscallTestDir,
-  autotest,
+  testOpt,
   debug ? false
 }:
 
@@ -120,7 +119,7 @@ let
       EXTRA_CMDLINE="${qemuConfig.cmdlineExtra}"
 
       # FIXED: 补全缺失的默认内核参数 AUTO_TEST 和 SYSCALL_TEST_DIR
-      FINAL_CMDLINE="init=${initProgram} AUTO_TEST=${autotest} SYSCALL_TEST_DIR=${syscallTestDir} $EXTRA_CMDLINE"
+      FINAL_CMDLINE="init=${initProgram} AUTO_TEST=${testOpt.autotest} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} $EXTRA_CMDLINE"
 
       ARCH_FLAGS=( ${lib.escapeShellArgs commonArchArgs} )
       ${archSpecificBash}

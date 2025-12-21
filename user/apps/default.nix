@@ -5,7 +5,7 @@
   system,
   target,
   fenix,
-  syscallTestDir
+  testOpt
 }:
 
 # Return a list of app derivations to be copied into the rootfs.
@@ -34,7 +34,8 @@ let
 
   gvisor-syscall-tests = (pkgs.callPackage ./tests/syscall/gvisor {
     inherit fenix system;
-    installDir = syscallTestDir;
+    installDir = testOpt.syscall.testDir;
+    version = testOpt.syscall.version;
   });
 in [
   static.busybox
@@ -46,7 +47,7 @@ in [
   (static.callPackage ./about {})
 
 ]
-++ lib.optionals (target == "x86_64") [
+++ lib.optionals (target == "x86_64" && testOpt.syscall.enable) [
   # gvisor test case only included on x86_64
   gvisor-syscall-tests
   # TODO: Add debian libcxx deps or FHS

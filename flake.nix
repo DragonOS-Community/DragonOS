@@ -20,26 +20,34 @@
         fenix = inputs.fenix;
         pkgs = nixpkgs.legacyPackages.${system};
         lib = pkgs.lib;
-        syscallTestDir = "/usr/share/gvisor";
         rootfsType = "ext4";
         buildDir = "./bin"; # Specifying temp file location
+
+        testOpt = {
+          # 自动测试项目，指定内核启动环境变量参数 AUTO_TEST
+          autotest = "none";
+          syscall = {
+            enable = true;
+            testDir = "/opt/gvisor";
+            version = "20251218";
+          };
+        };
 
         mkOutputs = target:
           let
             diskPath = "${buildDir}/disk-image-${target}.img";
             qemuScripts = import ./tools/qemu/default.nix {
-              inherit lib pkgs syscallTestDir diskPath;
-              # 启动相关参数：
+              inherit lib pkgs testOpt diskPath;
+              # QEMU 相关参数：
               # 内核位置
               kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
-              # 自动测试项目，指定内核启动环境变量参数 AUTO_TEST
-              autotest = "none";
-              debug = true;
+              # -s -S
+              debug = false;
             };
 
             startPkg = qemuScripts.${target};
             rootfsPkg = pkgs.callPackage ./user/default.nix {
-              inherit lib pkgs nixpkgs fenix system target syscallTestDir rootfsType buildDir diskPath;
+              inherit lib pkgs nixpkgs fenix system target testOpt rootfsType buildDir diskPath;
             };
           in
           {

@@ -1,8 +1,8 @@
-{ lib, pkgs, nixpkgs, system, target, fenix, syscallTestDir }:
+{ lib, pkgs, nixpkgs, system, target, fenix, testOpt }:
 
 # 产物是一个可以生成 rootfs.tar 的脚本
 let
-  apps = import ./apps { inherit lib pkgs nixpkgs system target fenix syscallTestDir; };
+  apps = import ./apps { inherit lib pkgs nixpkgs system target fenix testOpt; };
 
   sys-config = pkgs.runCommand "sysconfig" {
     src = ./sysconfig;

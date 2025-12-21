@@ -1,4 +1,4 @@
-{ lib, pkgs, fenix, system, installDir }:
+{ lib, pkgs, fenix, system, installDir, version ? "20251218" }:
 
 let
   fenixPkgs = fenix.packages.${system};
@@ -12,8 +12,8 @@ let
   };
 
   testsArchive = pkgs.fetchurl {
-    url = "https://cnb.cool/DragonOS-Community/test-suites/-/releases/download/release_20250626/gvisor-syscalls-tests.tar.xz";
-    sha256 = "sha256-GSZ0N3oUOerb0lXU4LZ0z4ybD/xZdy7TtfstEoffcsk=";
+    url = "https://cnb.cool/DragonOS-Community/test-suites/-/releases/download/release_${version}/gvisor-syscalls-tests.tar.xz";
+    sha256 = "sha256-JVCjDtqF9iNw6B4pXGP39gZRs6rEqtLsrroihraPqQE=";
   };
 
   # 1. Build the Rust runner separately

@@ -6,14 +6,14 @@
   target,
   fenix,
   buildDir,
-  syscallTestDir,
+  testOpt,
   rootfsType ? "vfat",
   diskPath,
   partitionType ? "mbr"
 }:
 
 let
-  image = import ./rootfs-tar.nix { inherit lib pkgs nixpkgs system target fenix syscallTestDir; };
+  image = import ./rootfs-tar.nix { inherit lib pkgs nixpkgs system target fenix testOpt; };
 
   # 构建脚本 - 在bin/目录下构建
   buildScript = pkgs.writeShellApplication {

@@ -4,7 +4,9 @@ use system_error::SystemError;
 use crate::{
     mm::verify_area,
     mm::VirtAddr,
-    syscall::user_access::{user_accessible_len, UserBufferReader, UserBufferWriter},
+    syscall::user_access::{
+        copy_from_user_protected, user_accessible_len, UserBufferReader, UserBufferWriter,
+    },
 };
 
 /// Linux UIO_MAXIOV: maximum number of iovec structures per syscall
@@ -98,22 +100,13 @@ impl IoVecs {
                 continue;
             }
 
-            // Range check (prevents kernel addresses / overflow).
-            verify_area(base, one.iov_len)?;
-
             // If the first byte isn't writable/readable at all, fail early with EFAULT.
             // Partial accessibility is handled by the syscall implementation.
+            // Note: user_accessible_len returns 0 for null pointers (addr.is_null() check),
+            // so null pointer detection is covered here.
             let accessible = user_accessible_len(base, one.iov_len, _readv /* check_write */);
             if accessible == 0 {
                 return Err(SystemError::EFAULT);
-            }
-
-            // Also ensure we can build a writer/reader wrapper for the range.
-            // (This is a cheap range check; mapping faults are handled elsewhere.)
-            if _readv {
-                let _ = UserBufferWriter::new(one.iov_base, one.iov_len, true)?;
-            } else {
-                let _ = UserBufferReader::new(one.iov_base, one.iov_len, true)?;
             }
 
             slices.push(one);
@@ -138,35 +131,36 @@ impl IoVecs {
     /// read at all, `Err(SystemError::EFAULT)` is returned.
     pub fn gather(&self) -> Result<Vec<u8>, SystemError> {
         let mut buf = Vec::with_capacity(self.total_len());
+        let mut read_any = false;
 
         for iov in self.0.iter() {
+            let base = VirtAddr::new(iov.iov_base as usize);
             // 检查从 iov_base 开始有多少 bytes 在 vma 内部且实际可以访问
-            let accessible =
-                user_accessible_len(VirtAddr::new(iov.iov_base as usize), iov.iov_len, false);
-
-            // log::debug!(
-            //     "iov is {:?}. iov_len: {}; accessible len:{}",
-            //     iov,
-            //     iov.iov_len,
-            //     accessible
-            // );
+            let accessible = user_accessible_len(base, iov.iov_len, false /* read */);
 
             // 如果一个字节都不能访问
             if accessible == 0 {
-                if buf.is_empty() {
-                    // log::error!(
-                    //     "The first iov is empty, returning EFAULT. iov shape: {:?}",
-                    //     iov
-                    // );
+                if !read_any {
                     return Err(SystemError::EFAULT);
                 }
                 return Ok(buf);
             }
 
-            // 复制可访问的部分
-            unsafe {
-                let src = core::slice::from_raw_parts(iov.iov_base as *const u8, accessible);
-                buf.extend_from_slice(src);
+            // 使用异常保护的拷贝，与 scatter 保持一致
+            let mut chunk = alloc::vec![0u8; accessible];
+            match unsafe { copy_from_user_protected(&mut chunk, base) } {
+                Ok(_) => {
+                    buf.extend_from_slice(&chunk);
+                    read_any = true;
+                }
+                Err(SystemError::EFAULT) => {
+                    // Linux: return partial data if any bytes were copied.
+                    if !read_any {
+                        return Err(SystemError::EFAULT);
+                    }
+                    return Ok(buf);
+                }
+                Err(e) => return Err(e),
             }
 
             // 如果没有读取完整个 iov，说明遇到了不可访问的区域

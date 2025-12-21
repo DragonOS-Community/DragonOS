@@ -1,7 +1,7 @@
 use crate::{
     filesystem::vfs::{
         file::{File, FileFlags},
-        FilePrivateData,
+        FilePrivateData, FileType,
     },
     libs::{
         rbtree::RBTree,
@@ -87,7 +87,8 @@ impl EventPoll {
 
             if let Some(file) = file {
                 let epitm = self.ep_items.get(&fd).unwrap();
-                file.remove_epitem(epitm)?;
+                // 尝试移除epitem，忽略错误（对于普通文件，我们没有添加epitem，所以会失败）
+                let _ = file.remove_epitem(epitm);
             }
             self.ep_items.remove(&fd);
         }
@@ -571,15 +572,46 @@ impl EventPoll {
         }
 
         let test_poll = dst_file.poll();
-        if test_poll.is_err() && test_poll.unwrap_err() == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+        let file_type = dst_file
+            .inode()
+            .metadata()
+            .map(|m| m.file_type)
+            .unwrap_or(FileType::File);
+
+        // 检查是否为"总是就绪"的普通文件
+        // 普通文件和目录不会阻塞，总是可读/可写
+        let is_always_ready_file = matches!(file_type, FileType::File | FileType::Dir);
+
+        // 判断文件是否不支持poll
+        // 注意：as_pollable_inode() 默认返回 ENOSYS，所以需要同时检查这两种错误
+        let poll_not_supported = test_poll.is_err()
+            && matches!(
+                test_poll.as_ref().unwrap_err(),
+                &SystemError::EOPNOTSUPP_OR_ENOTSUP | &SystemError::ENOSYS
+            );
+
+        if poll_not_supported {
             // 如果目标文件不支持poll
-            return Err(SystemError::ENOSYS);
+            if !is_always_ready_file {
+                // 非普通文件返回错误
+                return Err(SystemError::ENOSYS);
+            }
+            // 对于普通文件，将其视为总是就绪的
         }
 
         epoll_guard.ep_items.insert(epitem.fd, epitem.clone());
 
         // 检查文件是否已经有事件发生
-        let event = epitem.ep_item_poll();
+        let event = if is_always_ready_file && poll_not_supported {
+            // 普通文件总是就绪的：可读、可写、可读普通数据、可写普通数据
+            EPollEventType::EPOLLIN
+                | EPollEventType::EPOLLOUT
+                | EPollEventType::EPOLLRDNORM
+                | EPollEventType::EPOLLWRNORM
+        } else {
+            epitem.ep_item_poll()
+        };
+
         if !event.is_empty() {
             // 加入到就绪队列
             epoll_guard.ep_add_ready(epitem.clone());
@@ -592,6 +624,11 @@ impl EventPoll {
         // 这个标志是用与电源管理相关，暂时不支持
         if epitem.event.read().events & EPollEventType::EPOLLWAKEUP.bits() != 0 {
             return Err(SystemError::ENOSYS);
+        }
+
+        // 对于普通文件，不需要添加epitem（因为它们总是就绪的，不需要等待事件通知）
+        if is_always_ready_file && poll_not_supported {
+            return Ok(());
         }
 
         dst_file.add_epitem(epitem.clone())?;

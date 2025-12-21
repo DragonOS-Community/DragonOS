@@ -17,7 +17,7 @@ let
 
   # 构建脚本 - 在bin/目录下构建
   buildScript = pkgs.writeShellApplication {
-    name = "build-rootfs-image";
+    name = "dragonos-rootfs";
     runtimeInputs = [ pkgs.coreutils pkgs.gnutar pkgs.libguestfs-with-appliance pkgs.findutils ];
     text = ''
       set -euo pipefail

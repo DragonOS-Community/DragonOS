@@ -143,7 +143,7 @@ let
     '';
 
   script = lib.genAttrs [ "x86_64" "riscv64" ] (arch: mkRunScript {
-    name = "run-dragonos";
+    name = "dragonos-run";
     inherit arch;
     isNographic = if arch == "riscv64" then true else baseConfig.nographic;
     qemuBin = "${pkgs.qemu_kvm}/bin/qemu-system-${arch}";

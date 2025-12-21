@@ -56,7 +56,7 @@
               # 脚本不占什么空间所以重复eval也没关系，并且最终产出的脚本可读性更好.
               "start-${target}" = {
                 type = "app";
-                program = "${startPkg}/bin/run-dragonos";
+                program = "${startPkg}/bin/dragonos-run";
                 meta.description = "以 ${target} 启动DragonOS";
               };
               # rootfs 中涉及到基于docker镜像的rootfs构建，修改了 user/ 下软件包相关内容后，
@@ -64,7 +64,7 @@
               # 因此可能会占很多空间，如果要清理空间请执行 nix store gc
               "rootfs-${target}" = {
                 type = "app";
-                program = "${rootfsPkg}/bin/build-rootfs-image";
+                program = "${rootfsPkg}/bin/dragonos-rootfs";
                 meta.description = "构建 ${target} rootfs 镜像";
               };
             };

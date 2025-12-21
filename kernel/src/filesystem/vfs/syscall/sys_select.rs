@@ -7,7 +7,7 @@ use crate::arch::syscall::nr::SYS_SELECT;
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        poll::{do_sys_poll, poll_select_set_timeout, PollFd},
+        poll::{do_sys_poll, poll_select_finish, poll_select_set_timeout, PollFd, PollTimeType},
     },
     syscall::{
         table::{FormattedSyscallParam, Syscall},
@@ -56,7 +56,7 @@ pub fn common_sys_select(
     //     "common_sys_select called with nfds = {}, readfds_addr = {:#x}, writefds_addr = {:#x}, exceptfds_addr = {:#x}, timeout_ptr = {:#x}",
     //     nfds, readfds_addr, writefds_addr, exceptfds_addr, timeout_ptr
     // );
-    let mut timeout: Option<Instant> = None;
+    let mut end_time: Option<Instant> = None;
     if timeout_ptr != 0 {
         let tsreader = UserBufferReader::new(
             timeout_ptr as *const PosixTimeval,
@@ -64,18 +64,24 @@ pub fn common_sys_select(
             true,
         )?;
         let ts = *tsreader.read_one_from_user::<PosixTimeval>(0)?;
+        // 检查是否为负值
+        if ts.tv_sec < 0 || ts.tv_usec < 0 {
+            return Err(SystemError::EINVAL);
+        }
         let timeout_ms = ts.tv_sec * 1000 + ts.tv_usec as i64 / 1000;
         if timeout_ms >= 0 {
-            timeout = poll_select_set_timeout(timeout_ms as u64);
+            end_time = poll_select_set_timeout(timeout_ms as u64);
         }
     }
-    do_sys_select(
+    let result = do_sys_select(
         nfds as isize,
         readfds_addr as *const FdSet,
         writefds_addr as *const FdSet,
         exceptfds_addr as *const FdSet,
-        timeout,
-    )
+        end_time,
+    );
+    // 更新用户空间的timeout为剩余时间
+    poll_select_finish(end_time, timeout_ptr, PollTimeType::TimeVal, result)
 }
 
 fn do_sys_select(

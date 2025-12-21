@@ -1,7 +1,7 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
-use alloc::sync::Arc;
-use log::{error, info};
+use alloc::{string::ToString, sync::Arc};
+use log::{error, info, warn};
 use system_error::SystemError;
 
 use crate::libs::casting::DowncastArc;
@@ -11,6 +11,7 @@ use crate::{
     filesystem::{
         devfs::devfs_init,
         devpts::devpts_init,
+        ext4::filesystem::Ext4FileSystem,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
@@ -139,6 +140,29 @@ pub(crate) fn try_find_gendisk(path: &str) -> Option<Arc<GenDisk>> {
     return None;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootFsKind {
+    Ext4,
+    Fat,
+}
+
+fn probe_rootfs_kind(gendisk: &Arc<GenDisk>) -> Option<RootFsKind> {
+    match Ext4FileSystem::probe(gendisk) {
+        Ok(true) => return Some(RootFsKind::Ext4),
+        Ok(false) => {}
+        Err(e) => {
+            // 探测阶段不应阻塞启动；继续尝试其他 FS 探测/初始化。
+            warn!("Rootfs probe: read ext superblock failed: {:?}", e);
+        }
+    }
+
+    if FATFileSystem::probe(gendisk) {
+        return Some(RootFsKind::Fat);
+    }
+
+    None
+}
+
 pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount root fs...");
     block_dev_manager().print_gendisks();
@@ -152,26 +176,42 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             .ok_or(SystemError::ENODEV)?
     };
 
-    let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(gendisk);
-    if fatfs.is_err() {
+    let kind = probe_rootfs_kind(&gendisk);
+
+    let rootfs: Result<Arc<dyn FileSystem>, SystemError> = match kind {
+        Some(RootFsKind::Ext4) => Ext4FileSystem::from_gendisk(gendisk.clone()),
+        Some(RootFsKind::Fat) => Ok(FATFileSystem::new(gendisk.clone())?),
+        None => {
+            // 兜底：按常见顺序尝试初始化（ext4 -> fat），便于未来扩展 probe 或处理特殊镜像。
+            Ext4FileSystem::from_gendisk(gendisk.clone()).or_else(|_| {
+                let fat: Arc<FATFileSystem> = FATFileSystem::new(gendisk.clone())?;
+                Ok(fat)
+            })
+        }
+    };
+
+    let rootfs = match rootfs {
+        Ok(fs) => fs,
+        Err(e) => {
+            error!("Failed to initialize rootfs filesystem: {:?}", e);
+            loop {
+                spin_loop();
+            }
+        }
+    };
+
+    let fs_name = rootfs.name().to_string();
+    let r = migrate_virtual_filesystem(rootfs.clone());
+    if r.is_err() {
         error!(
-            "Failed to initialize fatfs, code={:?}",
-            fatfs.as_ref().err()
+            "Failed to migrate virtual filesystem to rootfs ({}).",
+            fs_name
         );
         loop {
             spin_loop();
         }
     }
-    let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
-    let r = migrate_virtual_filesystem(fatfs);
-
-    if r.is_err() {
-        error!("Failed to migrate virtual filesyst  em to FAT32!");
-        loop {
-            spin_loop();
-        }
-    }
-    info!("Successfully migrate rootfs to FAT32!");
+    info!("Successfully migrate rootfs to {}!", fs_name);
 
     return Ok(());
 }

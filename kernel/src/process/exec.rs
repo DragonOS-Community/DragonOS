@@ -373,9 +373,7 @@ pub fn load_binary_file_with_context(
     let loader: &&dyn BinaryLoader = loader.unwrap();
     assert!(param.vm().is_current());
 
-    let result: BinaryLoaderResult = loader
-        .load(param, &head_buf)
-        .unwrap_or_else(|e| panic!("load_binary_file failed: error: {e:?}, param: {param:?}"));
+    let result: BinaryLoaderResult = loader.load(param, &head_buf).map_err(SystemError::from)?;
 
     Ok(LoadBinaryResult::Loaded(result))
 }

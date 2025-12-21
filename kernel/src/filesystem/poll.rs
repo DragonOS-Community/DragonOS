@@ -12,7 +12,7 @@ use crate::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall,
     },
-    time::{Duration, Instant, PosixTimeSpec},
+    time::{syscall::PosixTimeval, Duration, Instant, PosixTimeSpec},
 };
 
 use super::vfs::file::{File, FileFlags};
@@ -183,7 +183,7 @@ pub fn poll_select_set_timeout(timeout_ms: u64) -> Option<Instant> {
 }
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/select.c#298
-fn poll_select_finish(
+pub fn poll_select_finish(
     end_time: Option<Instant>,
     user_time_ptr: usize,
     poll_time_type: PollTimeType,
@@ -219,11 +219,35 @@ fn poll_select_finish(
                 size_of::<PosixTimeSpec>(),
                 true,
             )?;
-            if tswriter.copy_one_to_user(&rts, 0).is_err() {
+            if tswriter.buffer_protected(0)?.write_one(0, &rts).is_err() {
                 return result;
             }
         }
-        _ => todo!(),
+        PollTimeType::TimeVal | PollTimeType::OldTimeVal => {
+            let rtv = PosixTimeval {
+                tv_sec: rts.tv_sec,
+                tv_usec: (rts.tv_nsec / 1000) as i32,
+            };
+            let mut tvwriter = UserBufferWriter::new(
+                user_time_ptr as *mut PosixTimeval,
+                size_of::<PosixTimeval>(),
+                true,
+            )?;
+            if tvwriter.buffer_protected(0)?.write_one(0, &rtv).is_err() {
+                return result;
+            }
+        }
+        PollTimeType::OldTimeSpec => {
+            // OldTimeSpec使用与TimeSpec相同的处理方式
+            let mut tswriter = UserBufferWriter::new(
+                user_time_ptr as *mut PosixTimeSpec,
+                size_of::<PosixTimeSpec>(),
+                true,
+            )?;
+            if tswriter.buffer_protected(0)?.write_one(0, &rts).is_err() {
+                return result;
+            }
+        }
     }
 
     if result == Err(SystemError::ERESTARTNOHAND) {
@@ -235,7 +259,7 @@ fn poll_select_finish(
 
 #[allow(unused)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PollTimeType {
+pub enum PollTimeType {
     TimeVal,
     OldTimeVal,
     TimeSpec,

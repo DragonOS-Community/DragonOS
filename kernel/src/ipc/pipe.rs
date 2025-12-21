@@ -530,10 +530,15 @@ impl IndexNode for LockedPipeInode {
                     guard.writer += 1;
                     drop(guard);
                 } else {
-                    // 阻塞模式：等待读端
-                    let guard = self.inner.lock();
+                    // 阻塞模式：先增加 writer 计数，再等待读端
+                    // 这样可以避免竞态条件：读端在唤醒写端时能看到 writer > 0
+                    let mut guard = self.inner.lock();
+                    guard.writer += 1;
                     let has_reader = guard.reader > 0;
                     drop(guard);
+
+                    // 唤醒可能在等待写端的读者（在增加 writer 之后立即唤醒）
+                    self.open_wait_queue.wakeup_all(None);
 
                     if !has_reader {
                         // 在睡眠前必须释放 data 锁
@@ -545,18 +550,19 @@ impl IndexNode for LockedPipeInode {
                             {}
                         );
                         if r.is_err() {
+                            // 被信号中断，需要回滚 writer 计数
+                            let mut guard = self.inner.lock();
+                            guard.writer -= 1;
+                            drop(guard);
                             return Err(SystemError::EINTR);
                         }
                     }
-
-                    // 现在有读端了，增加写端计数
-                    let mut guard = self.inner.lock();
-                    guard.writer += 1;
-                    drop(guard);
                 }
 
-                // 唤醒可能在等待写端的读者
-                self.open_wait_queue.wakeup_all(None);
+                // 非阻塞模式下也需要唤醒可能在等待写端的读者
+                if is_nonblock {
+                    self.open_wait_queue.wakeup_all(None);
+                }
             } else {
                 // 匿名管道：直接增加写端计数
                 let mut guard = self.inner.lock();

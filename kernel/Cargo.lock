@@ -57,7 +57,15 @@ dependencies = [
 [[package]]
 name = "another_ext4"
 version = "0.1.0"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git?rev=bf782ff294#bf782ff2947b57ba89503824eada5eb3c20a2e2a"
+dependencies = [
+ "bitflags 2.9.1",
+ "log",
+]
+
+[[package]]
+name = "another_ext4"
+version = "0.1.0"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git?rev=8bc384254c#8bc384254c7b7464afcdc312fb0c0aa622e2467e"
 dependencies = [
  "bitflags 2.9.1",
  "log",
@@ -763,7 +771,7 @@ version = "0.1.0"
 name = "kdepends"
 version = "0.1.0"
 dependencies = [
- "another_ext4",
+ "another_ext4 0.1.0 (git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git?rev=8bc384254c)",
  "crc",
  "memoffset",
  "ringbuffer",

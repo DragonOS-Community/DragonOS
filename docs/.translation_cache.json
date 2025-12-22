@@ -150,7 +150,7 @@
     "hash": "c931f3fcfca7d8d10cd16a8b68e6274a"
   },
   "en:community/ChangeLog/index.rst": {
-    "hash": "dbf244ec28b422b0b7d8b8bcfa72e94d"
+    "hash": "2166fbbfcea1f1ca34fd498cf095fbc3"
   },
   "en:kernel/trace/index.rst": {
     "hash": "3c466a411a5bd71514f8fa4f15d06241"
@@ -319,5 +319,11 @@
   },
   "en:kernel/sched/wait_queue.md": {
     "hash": "550f38b4386c3755535e99e97bc98243"
+  },
+  "en:agents/release_agent_capability.md": {
+    "hash": "6c10917f7e05f9a0c5d75c7bbed4bc71"
+  },
+  "en:community/ChangeLog/V0.4.x/V0.4.0.md": {
+    "hash": "940c6a8fc47831f75df1dc8810d7c336"
   }
 }

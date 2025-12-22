@@ -39,7 +39,8 @@ impl<T> RingBuffer<T> {
             capacity.is_power_of_two(),
             "capacity must be a power of two"
         );
-
+        assert!(capacity < isize::MAX as usize, "capacity must be less than isize::MAX");
+        
         let mut buffer = Vec::with_capacity(capacity);
         // 预先填充缓冲区以确保其长度等于容量
         buffer.resize_with(capacity, || unsafe { core::mem::zeroed() });

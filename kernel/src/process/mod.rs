@@ -4,7 +4,7 @@ use core::{
     hint::spin_loop,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -894,6 +894,13 @@ pub struct ProcessControlBlock {
     /// 父进程退出时要发送给当前进程的信号（PR_SET_PDEATHSIG）
     pdeath_signal: AtomicSignal,
 
+    /// prctl(PR_SET/GET_NO_NEW_PRIVS) 状态：线程级（task）语义。
+    no_new_privs: AtomicBool,
+
+    /// prctl(PR_SET/GET_DUMPABLE) 状态。
+    /// Linux: 0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER；2(SUID_DUMP_ROOT) 不允许通过 PR_SET_DUMPABLE 设置。
+    dumpable: AtomicU8,
+
     /// 父进程指针
     parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// 真实父进程指针
@@ -1046,6 +1053,10 @@ impl ProcessControlBlock {
                 sig_altstack: RwLock::new(SigStackArch::new()),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
+
+                no_new_privs: AtomicBool::new(false),
+                // 默认设置为 SUID_DUMP_USER(=1)，满足 gVisor 的 SetGetDumpability 预期。
+                dumpable: AtomicU8::new(1),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
@@ -1277,6 +1288,33 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    pub fn no_new_privs(&self) -> usize {
+        if self.no_new_privs.load(Ordering::SeqCst) {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_no_new_privs(&self, value: bool) {
+        // Linux 语义：no_new_privs 一旦置位不可清除。
+        if value {
+            self.no_new_privs.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[inline(always)]
+    pub fn dumpable(&self) -> u8 {
+        self.dumpable.load(Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn set_dumpable(&self, value: u8) {
+        self.dumpable.store(value, Ordering::SeqCst)
+    }
+
+    #[inline(always)]
     pub fn basic_mut(&self) -> RwLockWriteGuard<'_, ProcessBasicInfo> {
         return self.basic.write_irqsave();
     }
@@ -1458,51 +1496,78 @@ impl ProcessControlBlock {
 
     /// 当前进程退出时,让初始进程收养所有子进程
     unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
-        let child_pids = {
-            let childen_guard = self.children.write();
-            childen_guard.clone()
+        // 取出并清空 children 列表，避免后续 wait/reparent 出现重复。
+        let child_pids: Vec<RawPid> = {
+            let mut children_guard = self.children.write();
+            core::mem::take(&mut *children_guard)
         };
+
+        if child_pids.is_empty() {
+            return Ok(());
+        }
 
         self.notify_parent_exit_for_children(&child_pids);
 
-        match ProcessManager::find_task_by_vpid(RawPid(1)) {
-            Some(init_pcb) => {
-                if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &init_pcb) {
-                    // 当前进程是namespace的init进程，由父进程所在的pidns的init进程去收养子进程
-                    if let Some(parent_pcb) = self.real_parent_pcb() {
-                        assert!(
-                            !Arc::ptr_eq(&parent_pcb, &init_pcb),
-                            "adopt_childen: parent_pcb is init_pcb, pid: {}",
-                            self.raw_pid()
-                        );
-                        let parent_init = ProcessManager::find_task_by_pid_ns(
-                            RawPid(1),
-                            &parent_pcb.active_pid_ns(),
-                        );
-                        if parent_init.is_none() {
-                            return Ok(());
-                        }
-                        let parent_init = parent_init.unwrap();
-                        let mut parent_children_guard = parent_init.children.write();
-                        child_pids.iter().for_each(|pid| {
-                            parent_children_guard.push(*pid);
-                        });
+        let init_pcb = ProcessManager::find_task_by_vpid(RawPid(1)).ok_or(SystemError::ECHILD)?;
 
-                        return Ok(());
-                    } else {
-                        return Ok(());
+        // 如果当前进程是 namespace 的 init，则由父进程所在 pidns 的 init 去收养。
+        if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &init_pcb) {
+            if let Some(parent_pcb) = self.real_parent_pcb() {
+                assert!(
+                    !Arc::ptr_eq(&parent_pcb, &init_pcb),
+                    "adopt_childen: parent_pcb is init_pcb, pid: {}",
+                    self.raw_pid()
+                );
+                let parent_init =
+                    ProcessManager::find_task_by_pid_ns(RawPid(1), &parent_pcb.active_pid_ns());
+                if let Some(parent_init) = parent_init {
+                    for pid in child_pids.iter().copied() {
+                        if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
+                            *child.parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
+                            *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
+                            child.basic.write_irqsave().ppid = parent_init.task_pid_vnr();
+                        }
+                        parent_init.children.write().push(pid);
                     }
                 }
-                let mut init_childen_guard = init_pcb.children.write();
-
-                child_pids.iter().for_each(|pid| {
-                    init_childen_guard.push(*pid);
-                });
-
-                return Ok(());
             }
-            _ => Err(SystemError::ECHILD),
+            return Ok(());
         }
+
+        // 常规情况：优先 reparent 到“最近祖先 subreaper”，否则 reparent 到 init。
+        let mut reaper: Arc<ProcessControlBlock> = init_pcb.clone();
+        let mut cursor = self.parent_pcb();
+        while let Some(p) = cursor {
+            // Linux 语义：child_subreaper 是线程组级；这里统一按线程组 leader 判定。
+            let leader = {
+                let ti = p.threads_read_irqsave();
+                ti.group_leader().unwrap_or_else(|| p.clone())
+            };
+
+            if leader.sig_info_irqsave().is_child_subreaper() {
+                reaper = leader;
+                break;
+            }
+
+            if leader.raw_pid() == RawPid(1) {
+                break;
+            }
+
+            cursor = leader.parent_pcb();
+        }
+
+        for pid in child_pids.iter().copied() {
+            if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
+                *child.parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
+                *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
+                child.basic.write_irqsave().ppid = reaper.task_pid_vnr();
+            }
+
+            // 按 wait 语义，将被收养子进程挂到收养者（线程组 leader）的 children 列表中。
+            reaper.children.write().push(pid);
+        }
+
+        Ok(())
     }
 
     fn notify_parent_exit_for_children(&self, child_pids: &[RawPid]) {

@@ -378,6 +378,25 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// 复制 prctl 相关的进程/线程状态。
+    ///
+    /// - no_new_privs：线程级语义，clone/fork 继承，execve 保持（execve 不走这里）。
+    /// - dumpable：fork 继承。
+    fn copy_prctl_state(
+        _clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        // NO_NEW_PRIVS
+        if current_pcb.no_new_privs() != 0 {
+            new_pcb.set_no_new_privs(true);
+        }
+
+        // DUMPABLE
+        new_pcb.set_dumpable(current_pcb.dumpable());
+        Ok(())
+    }
+
     /// 拷贝信号备用栈
     ///
     /// ## 参数
@@ -527,6 +546,14 @@ impl ProcessManager {
         Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy flags from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
+
+        // 拷贝 prctl 状态（no_new_privs/dumpable 等）
+        Self::copy_prctl_state(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy prctl state from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
@@ -721,7 +748,12 @@ impl ProcessManager {
                 pcb.sighand().flags_insert(SignalFlags::UNKILLABLE);
             }
 
-            let parent_siginfo = current_pcb.sig_info_irqsave();
+            // child_subreaper 是线程组级语义：用线程组 leader 的 siginfo 决定。
+            let parent_leader = {
+                let ti = current_pcb.thread.read_irqsave();
+                ti.group_leader().unwrap_or_else(|| current_pcb.clone())
+            };
+            let parent_siginfo = parent_leader.sig_info_irqsave();
             let parent_tty = parent_siginfo.tty();
             let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
             let parent_is_child_reaper = parent_siginfo.is_child_subreaper();

@@ -16,6 +16,7 @@ mod sys_mprotect;
 mod sys_mremap;
 mod sys_msync;
 mod sys_munmap;
+mod sys_process_vm;
 pub mod sys_sbrk;
 
 bitflags! {

@@ -743,6 +743,38 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     }
 }
 
+/// RAII guard for kernel write protection
+///
+/// Ensures write protection is re-enabled even if a panic occurs.
+/// This guard disables kernel write protection on creation and
+/// re-enables it when dropped.
+///
+/// # Example
+/// ```ignore
+/// {
+///     let _guard = KernelWpGuard::new();
+///     // Write protection is disabled here
+///     // ... perform write operations ...
+/// } // Write protection is re-enabled when _guard is dropped
+/// ```
+pub struct KernelWpGuard;
+
+impl KernelWpGuard {
+    /// Create a new guard that disables kernel write protection
+    #[inline]
+    pub fn new() -> Self {
+        MMArch::disable_kernel_wp();
+        Self
+    }
+}
+
+impl Drop for KernelWpGuard {
+    #[inline]
+    fn drop(&mut self) {
+        MMArch::enable_kernel_wp();
+    }
+}
+
 /// @brief 虚拟地址范围
 /// 该结构体用于表示一个虚拟地址范围，包括起始地址与大小
 ///

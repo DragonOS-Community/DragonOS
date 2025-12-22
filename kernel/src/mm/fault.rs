@@ -754,7 +754,7 @@ impl PageFaultHandler {
 
         let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
 
-        // 以“页起始是否越过 EOF”判断 SIGBUS。
+        // 以"页起始是否越过 EOF"判断 SIGBUS。
         // 特别地：size==0 时，任何访问都应 SIGBUS（符合 mmap 语义，且满足 gvisor death tests）。
         if let Ok(md) = inode.metadata() {
             let size = md.size.max(0) as usize;

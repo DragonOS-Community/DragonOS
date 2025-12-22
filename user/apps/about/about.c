@@ -14,8 +14,8 @@ void print_ascii_logo()
 
 void print_copyright()
 {
-    printf(" DragonOS - An opensource operating system.\n");
-    printf(" Copyright: DragonOS Community. 2022-2025, All rights reserved.\n");
+    printf(" DragonOS - Lightweight Cloud-Native Kernel\n");
+    printf(" Copyright: DragonOS Community. 2022-2026, All rights reserved.\n");
     
     // 使用 uname 获取版本信息
     struct utsname buf;
@@ -35,8 +35,7 @@ void print_copyright()
     printf(" Maintainer: longjin <longjin@DragonOS.org>\n");
     printf(" Get contact with the community: <contact@DragonOS.org>\n");
     printf("\n");
-    printf(" Join our development community:\n");
-    printf("\x1B[1;33m%s\x1B[0m", "    https://bbs.dragonos.org.cn\n");
+    printf("\x1B[1;33m%s\x1B[0m", " Welcome to join our development community on GitHub!\n");
     printf("\n");
 }
 

@@ -84,7 +84,7 @@ pub fn common_sys_select(
     poll_select_finish(end_time, timeout_ptr, PollTimeType::TimeVal, result)
 }
 
-fn do_sys_select(
+pub(super) fn do_sys_select(
     nfds: isize,
     readfds_addr: *const FdSet,
     writefds_addr: *const FdSet,
@@ -249,7 +249,7 @@ fn convert_events_to_rwe(events: EPollEventType) -> Result<(bool, bool, bool), S
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-struct FdSet {
+pub(super) struct FdSet {
     fds_bits: [usize; FD_SETSIZE / USIZE_BITS],
 }
 

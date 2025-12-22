@@ -12,7 +12,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::{SYS_PROCESS_VM_READV, SYS_PROCESS_VM_WRITEV};
 use crate::arch::MMArch;
 use crate::filesystem::vfs::iov::IoVec;
-use crate::mm::{verify_area, MemoryManagementArch, PhysAddr, VirtAddr};
+use crate::mm::{verify_area, KernelWpGuard, MemoryManagementArch, PhysAddr, VirtAddr};
+use crate::process::cred::CAPFlags;
 use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
@@ -139,6 +140,50 @@ fn find_target_process(pid: usize) -> Result<Arc<ProcessControlBlock>, SystemErr
     Ok(target_pcb)
 }
 
+/// Check if current process has permission to access target process's memory
+///
+/// This implements a simplified version of Linux's ptrace_may_access() check.
+/// Access is allowed if:
+/// 1. Target is the same process as current (self-access)
+/// 2. Current process has CAP_SYS_PTRACE capability
+/// 3. Current process's uid/gid match target's euid/suid/uid and egid/sgid/gid
+///
+/// See Linux kernel: kernel/ptrace.c __ptrace_may_access()
+fn check_process_vm_access(target_pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+    let current_pcb = ProcessManager::current_pcb();
+
+    // Self-access is always allowed
+    if Arc::ptr_eq(&current_pcb, target_pcb) {
+        return Ok(());
+    }
+
+    let current_cred = current_pcb.cred();
+    let target_cred = target_pcb.cred();
+
+    // CAP_SYS_PTRACE allows access to any process
+    if current_cred.has_capability(CAPFlags::CAP_SYS_PTRACE) {
+        return Ok(());
+    }
+
+    // Check uid/gid match (using real uid/gid as per PTRACE_MODE_REALCREDS)
+    // All of target's uid variants must match current's uid
+    // All of target's gid variants must match current's gid
+    let uid_match = current_cred.uid == target_cred.euid
+        && current_cred.uid == target_cred.suid
+        && current_cred.uid == target_cred.uid;
+
+    let gid_match = current_cred.gid == target_cred.egid
+        && current_cred.gid == target_cred.sgid
+        && current_cred.gid == target_cred.gid;
+
+    if uid_match && gid_match {
+        return Ok(());
+    }
+
+    // Permission denied - map to EPERM as Linux does for process_vm_* syscalls
+    Err(SystemError::EPERM)
+}
+
 /// Read iovec array from user space
 fn read_iovecs(iov_ptr: *const IoVec, iovcnt: usize) -> Result<Vec<IoVec>, SystemError> {
     if iovcnt == 0 {
@@ -156,9 +201,13 @@ fn read_iovecs(iov_ptr: *const IoVec, iovcnt: usize) -> Result<Vec<IoVec>, Syste
     Ok(iovecs.to_vec())
 }
 
-/// Calculate total length of iovec array
-fn total_iov_len(iovecs: &[IoVec]) -> usize {
-    iovecs.iter().map(|iov| iov.iov_len).sum()
+/// Calculate total length of iovec array with overflow checking
+fn total_iov_len(iovecs: &[IoVec]) -> Result<usize, SystemError> {
+    let mut total = 0usize;
+    for iov in iovecs {
+        total = total.checked_add(iov.iov_len).ok_or(SystemError::EINVAL)?;
+    }
+    Ok(total)
 }
 
 /// process_vm_readv implementation
@@ -183,6 +232,9 @@ fn do_process_vm_readv(
     // This ensures we return ESRCH for non-existent processes
     let target_pcb = find_target_process(pid)?;
 
+    // Check permission to access target process's memory
+    check_process_vm_access(&target_pcb)?;
+
     // Get target process's address space
     let target_vm = target_pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
 
@@ -190,9 +242,9 @@ fn do_process_vm_readv(
     let local_iovecs = read_iovecs(local_iov, liovcnt)?;
     let remote_iovecs = read_iovecs(remote_iov, riovcnt)?;
 
-    // Calculate total lengths
-    let local_len = total_iov_len(&local_iovecs);
-    let remote_len = total_iov_len(&remote_iovecs);
+    // Calculate total lengths (with overflow checking)
+    let local_len = total_iov_len(&local_iovecs)?;
+    let remote_len = total_iov_len(&remote_iovecs)?;
 
     if local_len == 0 || remote_len == 0 {
         return Ok(0);
@@ -289,10 +341,10 @@ fn do_process_vm_readv(
             let src_ptr = remote_virt.data() as *const u8;
             let dst_ptr = local_addr.data() as *mut u8;
 
-            // Disable kernel write protection for writing to user space
-            MMArch::disable_kernel_wp();
+            // Use RAII guard to ensure write protection is re-enabled even on panic
+            let _wp_guard = KernelWpGuard::new();
             let copy_result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, actual_chunk);
-            MMArch::enable_kernel_wp();
+            // _wp_guard dropped here, re-enabling write protection
 
             // If copy failed, return partial result or error
             if copy_result != 0 {
@@ -342,6 +394,9 @@ fn do_process_vm_writev(
     // This ensures we return ESRCH for non-existent processes
     let target_pcb = find_target_process(pid)?;
 
+    // Check permission to access target process's memory
+    check_process_vm_access(&target_pcb)?;
+
     // Get target process's address space
     let target_vm = target_pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
 
@@ -349,9 +404,9 @@ fn do_process_vm_writev(
     let local_iovecs = read_iovecs(local_iov, liovcnt)?;
     let remote_iovecs = read_iovecs(remote_iov, riovcnt)?;
 
-    // Calculate total lengths
-    let local_len = total_iov_len(&local_iovecs);
-    let remote_len = total_iov_len(&remote_iovecs);
+    // Calculate total lengths (with overflow checking)
+    let local_len = total_iov_len(&local_iovecs)?;
+    let remote_len = total_iov_len(&remote_iovecs)?;
 
     if local_len == 0 || remote_len == 0 {
         return Ok(0);

@@ -359,7 +359,7 @@ impl Syscall {
         };
 
         // 将数据写入用户空间的iovecs
-        iovs.scatter(&buf[..recv_size]);
+        iovs.scatter(&buf[..recv_size])?;
 
         return Ok(recv_size);
     }

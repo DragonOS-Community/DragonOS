@@ -40,6 +40,8 @@ truncate_test
 fadvise_test
 open_test
 open_create_test
+select_test
+pselect_test
 
 # 进程相关测试
 fork_test

@@ -189,7 +189,12 @@ pub fn poll_select_finish(
     poll_time_type: PollTimeType,
     mut result: Result<usize, SystemError>,
 ) -> Result<usize, SystemError> {
-    restore_saved_sigmask_unless(result == Err(SystemError::ERESTARTNOHAND));
+    // 如果系统调用被信号中断（ERESTARTNOHAND或ERESTARTSYS），不恢复信号掩码
+    // 因为信号处理函数可能需要使用新的信号掩码
+    restore_saved_sigmask_unless(matches!(
+        result,
+        Err(SystemError::ERESTARTNOHAND) | Err(SystemError::ERESTARTSYS)
+    ));
 
     if user_time_ptr == 0 {
         return result;
@@ -202,11 +207,6 @@ pub fn poll_select_finish(
     }
 
     let end_time = end_time.unwrap();
-
-    // no update for zero timeout
-    if end_time.total_millis() <= 0 {
-        return result;
-    }
 
     let ts = Instant::now();
     let duration = end_time.saturating_sub(ts);
@@ -250,7 +250,12 @@ pub fn poll_select_finish(
         }
     }
 
-    if result == Err(SystemError::ERESTARTNOHAND) {
+    // 将ERESTARTSYS和ERESTARTNOHAND转换为EINTR
+    // 这些错误码表示系统调用被信号中断，应该返回EINTR给用户态
+    if matches!(
+        result,
+        Err(SystemError::ERESTARTNOHAND) | Err(SystemError::ERESTARTSYS)
+    ) {
         result = result.map_err(|_| SystemError::EINTR);
     }
 

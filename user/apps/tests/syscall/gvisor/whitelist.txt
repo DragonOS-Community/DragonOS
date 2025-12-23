@@ -63,6 +63,7 @@ prctl_test
 
 # 内存管理测试
 mmap_test
+munmap_test
 brk_test
 mincore_test
 madvise_test

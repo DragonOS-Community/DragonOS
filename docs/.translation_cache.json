@@ -294,7 +294,7 @@
     "hash": "52df04d6a276b42617f7b79bbbffa61e"
   },
   "en:kernel/ktest/gvisor_syscall_test.rst": {
-    "hash": "60cc96606ccd50bb3e669b378693b742"
+    "hash": "75f85fb98952102269062342cdbc57cd"
   },
   "en:kernel/syscall/sys_capget_capset.md": {
     "hash": "f3b86c00e9f28df5c0e6c15905e53907"

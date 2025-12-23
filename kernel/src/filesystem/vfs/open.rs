@@ -7,7 +7,7 @@ use super::{
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
-    vcore::resolve_parent_inode,
+    vcore::{check_parent_dir_permission, resolve_parent_inode},
     FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
@@ -235,11 +235,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                     return Err(SystemError::ENOTDIR);
                 }
                 // Linux 语义：创建文件需要对父目录拥有 W+X（写+搜索）权限
-                let cred = ProcessManager::current_pcb().cred();
-                cred.inode_permission(
-                    &parent_md,
-                    (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
-                )?;
+                check_parent_dir_permission(&parent_md)?;
 
                 // 计算创建 mode：应用 umask，遵循 open/creat 语义
                 let pcb = ProcessManager::current_pcb();

@@ -359,6 +359,16 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
+
+    // Linux 语义：删除目录需要对父目录拥有 W+X（写+搜索）权限
+    // 注意：权限检查必须在 find 之前进行，否则当目录不存在时会返回 ENOENT 而不是 EACCES
+    let parent_md = parent_inode.metadata()?;
+    let cred = ProcessManager::current_pcb().cred();
+    cred.inode_permission(
+        &parent_md,
+        (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+    )?;
+
     // 在目标点为symlink时也返回ENOTDIR
     let target_inode = parent_inode.find(filename)?;
 
@@ -390,6 +400,15 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
+
+    // Linux 语义：删除文件需要对父目录拥有 W+X（写+搜索）权限
+    // 注意：权限检查必须在 find 之前进行，否则当文件不存在时会返回 ENOENT 而不是 EACCES
+    let parent_md = parent_inode.metadata()?;
+    let cred = ProcessManager::current_pcb().cred();
+    cred.inode_permission(
+        &parent_md,
+        (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+    )?;
 
     // Linux 语义：unlink(2)/unlinkat(2) 删除目录项本身，不跟随最后一个符号链接。
     // 我们已解析到父目录，因此这里必须用 find() 直接取目录项对应 inode，

@@ -26,6 +26,7 @@ stat_test
 statfs_test
 #chmod_test
 #chown_test
+poll_test
 chdir_test
 fchdir_test
 pread64_test

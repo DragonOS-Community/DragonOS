@@ -610,6 +610,10 @@ impl IndexNode for LockedPipeInode {
                 drop(guard); // 先释放 inner 锁，避免潜在的死锁
                              // 唤醒所有等待的读端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
                 self.read_wait_queue.wakeup_all(None);
+                // 唤醒 epoll 等待者，通知读端发生 EPOLLHUP
+                // 读端会看到 EPOLLHUP，这表示写端已关闭
+                let pollflag = EPollEventType::EPOLLHUP;
+                let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
                 return Ok(());
             }
         }
@@ -623,6 +627,10 @@ impl IndexNode for LockedPipeInode {
                 drop(guard); // 先释放 inner 锁，避免死锁
                              // 唤醒所有等待的写端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
                 self.write_wait_queue.wakeup_all(None);
+                // 唤醒 epoll 等待者，通知写端发生 EPOLLERR
+                // 写端会看到 EPOLLERR | EPOLLOUT，这表示读端已关闭
+                let pollflag = EPollEventType::EPOLLERR | EPollEventType::EPOLLOUT;
+                let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
                 return Ok(());
             }
         }
@@ -644,6 +652,17 @@ impl IndexNode for LockedPipeInode {
             // 如果已经没有读端了，则唤醒写端
             if wake_writer {
                 self.write_wait_queue.wakeup_all(None);
+            }
+            // 唤醒 epoll 等待者
+            if wake_reader || wake_writer {
+                let mut pollflag = EPollEventType::empty();
+                if wake_reader {
+                    pollflag |= EPollEventType::EPOLLHUP;
+                }
+                if wake_writer {
+                    pollflag |= EPollEventType::EPOLLERR | EPollEventType::EPOLLOUT;
+                }
+                let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
             }
         }
 

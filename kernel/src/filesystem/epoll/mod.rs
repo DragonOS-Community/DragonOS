@@ -1,4 +1,5 @@
 use super::vfs::file::File;
+use super::vfs::FileType;
 use crate::libs::{rwlock::RwLock, spinlock::SpinLock};
 use alloc::sync::Weak;
 use core::fmt::Debug;
@@ -99,11 +100,40 @@ impl EPollItem {
         if file.is_none() {
             return EPollEventType::empty();
         }
-        if let Ok(events) = file.unwrap().poll() {
-            let events = events as u32 & self.event.read().events;
-            return EPollEventType::from_bits_truncate(events);
+        let file = file.unwrap();
+
+        // Check file type to handle "always ready" files (directories, regular files)
+        let file_type = file
+            .inode()
+            .metadata()
+            .map(|m| m.file_type)
+            .unwrap_or(FileType::File);
+        let is_always_ready_file = matches!(file_type, FileType::File | FileType::Dir);
+
+        match file.poll() {
+            Ok(raw_events) => {
+                let registered = self.event.read().events;
+                let filtered = raw_events as u32 & registered;
+                EPollEventType::from_bits_truncate(filtered)
+            }
+            Err(e) => {
+                // For "always ready" files (directories, regular files) that don't support poll,
+                // return POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM
+                if is_always_ready_file
+                    && matches!(e, SystemError::EOPNOTSUPP_OR_ENOTSUP | SystemError::ENOSYS)
+                {
+                    let always_ready = EPollEventType::EPOLLIN
+                        | EPollEventType::EPOLLOUT
+                        | EPollEventType::EPOLLRDNORM
+                        | EPollEventType::EPOLLWRNORM;
+                    let registered = self.event.read().events;
+                    let filtered = always_ready.bits() & registered;
+                    EPollEventType::from_bits_truncate(filtered)
+                } else {
+                    EPollEventType::empty()
+                }
+            }
         }
-        return EPollEventType::empty();
     }
 }
 

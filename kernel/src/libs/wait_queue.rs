@@ -7,6 +7,7 @@ use core::{
 };
 
 use alloc::{
+    boxed::Box,
     collections::VecDeque,
     rc::Rc,
     sync::{Arc, Weak},
@@ -20,6 +21,7 @@ use crate::{
     exception::InterruptArch,
     process::{ProcessControlBlock, ProcessManager, ProcessState},
     sched::{schedule, SchedMode},
+    time::timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
 };
 
 use super::{
@@ -461,5 +463,85 @@ impl EventWaitQueue {
 
     pub fn wakeup_all(&self) {
         self.wakeup_any(u64::MAX);
+    }
+}
+
+/// A timer callback that wakes a Waker when the timer expires.
+/// Use this for safe timeout-based waiting.
+#[derive(Debug)]
+pub struct WakerTimerCallback {
+    waker: Arc<Waker>,
+}
+
+impl WakerTimerCallback {
+    pub fn new(waker: Arc<Waker>) -> Box<Self> {
+        Box::new(Self { waker })
+    }
+}
+
+impl TimerFunction for WakerTimerCallback {
+    fn run(&mut self) -> Result<(), SystemError> {
+        self.waker.wake();
+        Ok(())
+    }
+}
+
+/// Helper for safe timeout-based waiting using the Waiter/Waker pattern.
+/// This replaces the unsafe mark_sleep + schedule pattern.
+///
+/// # Example
+/// ```rust
+/// // Wait with 1 second timeout
+/// let timeout_waiter = TimeoutWaiter::new(Some(1_000_000)); // 1s in microseconds
+/// match timeout_waiter.wait(true) {
+///     Ok(true) => { /* timed out */ }
+///     Ok(false) => { /* woken by other means */ }
+///     Err(e) => { /* interrupted by signal */ }
+/// }
+/// ```
+pub struct TimeoutWaiter {
+    waiter: Waiter,
+    timer: Option<Arc<Timer>>,
+}
+
+impl TimeoutWaiter {
+    /// Create a new timeout waiter.
+    /// - If `timeout_us` is None: infinite wait (no timer)
+    /// - If `timeout_us` is Some(0): no timer, immediate timeout should be handled by caller
+    /// - If `timeout_us` is Some(n): wait up to n microseconds
+    pub fn new(timeout_us: Option<u64>) -> Self {
+        let (waiter, waker) = Waiter::new_pair();
+
+        let timer = timeout_us.and_then(|us| {
+            if us == 0 {
+                return None; // No timer for zero timeout
+            }
+            let jiffies = next_n_us_timer_jiffies(us);
+            Some(Timer::new(WakerTimerCallback::new(waker), jiffies))
+        });
+
+        Self { waiter, timer }
+    }
+
+    /// Activate the timer (if any) and wait.
+    /// Returns Ok(true) if timed out, Ok(false) if woken by other means.
+    /// Returns Err if interrupted by signal.
+    pub fn wait(&self, interruptible: bool) -> Result<bool, SystemError> {
+        if let Some(ref timer) = self.timer {
+            timer.activate();
+        }
+
+        self.waiter.wait(interruptible)?;
+
+        let timed_out = self.timer.as_ref().is_some_and(|t| t.timeout());
+
+        // Cancel timer if it hasn't fired yet
+        if let Some(ref timer) = self.timer {
+            if !timer.timeout() {
+                timer.cancel();
+            }
+        }
+
+        Ok(timed_out)
     }
 }

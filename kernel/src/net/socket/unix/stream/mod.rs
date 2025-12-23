@@ -1,5 +1,8 @@
 use crate::{
-    filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
+    filesystem::{
+        epoll::EPollEventType,
+        vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
+    },
     libs::rwlock::RwLock,
     net::socket::{self, *},
 };
@@ -164,6 +167,21 @@ impl UnixStreamSocket {
             _ => false,
         }
     }
+
+    /// Check if there's data available to receive
+    fn can_recv(&self) -> bool {
+        match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("UnixStreamSocket inner is None")
+        {
+            Inner::Connected(connected) => connected
+                .check_io_events()
+                .contains(EPollEventType::EPOLLIN),
+            _ => false,
+        }
+    }
 }
 
 impl Socket for UnixStreamSocket {
@@ -275,50 +293,65 @@ impl Socket for UnixStreamSocket {
         Ok(peer_addr.into())
     }
 
-    fn recv(&self, buffer: &mut [u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
-        self.try_recv(buffer)
+    fn recv(&self, buffer: &mut [u8], flags: socket::PMSG) -> Result<usize, SystemError> {
+        // Check if non-blocking mode (either socket is non-blocking or DONTWAIT flag is set)
+        let is_nonblocking = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+
+        if is_nonblocking {
+            self.try_recv(buffer)
+        } else {
+            // Blocking: wait until data is available
+            loop {
+                match self.try_recv(buffer) {
+                    Ok(len) => return Ok(len),
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
     }
 
     fn recv_from(
         &self,
-        _buffer: &mut [u8],
-        _flags: socket::PMSG,
+        buffer: &mut [u8],
+        flags: socket::PMSG,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        todo!()
+        // OOB is not supported for Unix domain sockets
+        if flags.contains(PMSG::OOB) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
 
-        // if flags.contains(PMSG::OOB) {
-        //     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        // }
-        // if !flags.contains(PMSG::DONTWAIT) {
-        //     loop {
-        //         log::debug!("socket try recv from");
+        // Get the peer endpoint (must be connected)
+        let peer_endpoint = match self.inner.read().as_ref().expect("inner is None") {
+            Inner::Connected(connected) => connected
+                .peer_endpoint()
+                .map(|addr| Endpoint::Unix(addr.into()))
+                .unwrap_or(Endpoint::Unix(UnixEndpoint::Unnamed)),
+            _ => return Err(SystemError::ENOTCONN),
+        };
 
-        //         wq_wait_event_interruptible!(
-        //             self.wait_queue,
-        //             self.can_recv()? || self.is_peer_shutdown()?,
-        //             {}
-        //         )?;
-        //         // connect锁和flag判断顺序不正确，应该先判断在
-        //         log::debug!("try recv");
+        // Check if non-blocking mode (either socket is non-blocking or DONTWAIT flag is set)
+        let is_nonblocking = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
 
-        //         match &*self.inner.write() {
-        //             Inner::Connected(connected) => match connected.try_recv(buffer) {
-        //                 Ok(usize) => {
-        //                     log::debug!("recvs from successfully");
-        //                     return Ok((usize, connected.peer_endpoint().unwrap().clone()));
-        //                 }
-        //                 Err(_) => continue,
-        //             },
-        //             _ => {
-        //                 log::error!("the socket is not connected");
-        //                 return Err(SystemError::ENOTCONN);
-        //             }
-        //         }
-        //     }
-        // } else {
-        //     unimplemented!("unimplemented non_block")
-        // }
+        if is_nonblocking {
+            // Non-blocking: just try once
+            let len = self.try_recv(buffer)?;
+            Ok((len, peer_endpoint))
+        } else {
+            // Blocking: wait until data is available
+            loop {
+                match self.try_recv(buffer) {
+                    Ok(len) => return Ok((len, peer_endpoint)),
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
     }
 
     fn recv_msg(&self, _msg: &mut MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {

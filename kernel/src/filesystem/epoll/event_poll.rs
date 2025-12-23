@@ -6,11 +6,11 @@ use crate::{
     libs::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
-        wait_queue::{WaitQueue, Waiter, Waker},
+        wait_queue::{WaitQueue, Waiter, WakerTimerCallback},
     },
     process::ProcessManager,
     time::{
-        timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
+        timer::{next_n_us_timer_jiffies, Timer},
         PosixTimeSpec,
     },
 };
@@ -27,22 +27,6 @@ use alloc::{
 use system_error::SystemError;
 
 use super::{fs::EPollInode, EPollCtlOption, EPollEvent, EPollEventType, EPollItem};
-
-use alloc::boxed::Box;
-
-#[derive(Debug)]
-struct EpollTimeoutWaker {
-    waker: Arc<Waker>,
-}
-
-impl TimerFunction for EpollTimeoutWaker {
-    fn run(&mut self) -> Result<(), SystemError> {
-        // Wake the waiter (and thus the process) in a way Waiter::wait can observe.
-        // NOTE: Timer-based wakeup must go through Waker::wake(); waking PCB alone is insufficient.
-        self.waker.wake();
-        Ok(())
-    }
-}
 
 /// 内核的Epoll对象结构体，当用户创建一个Epoll时，内核就会创建一个该类型对象
 /// 它对应一个epfd
@@ -416,12 +400,8 @@ impl EventPoll {
                 if let Some(timespec) = timespec {
                     let us = (timespec.tv_sec * 1_000_000 + timespec.tv_nsec / 1_000) as u64;
                     let jiffies = next_n_us_timer_jiffies(us);
-                    let inner: Arc<Timer> = Timer::new(
-                        Box::new(EpollTimeoutWaker {
-                            waker: waker.clone(),
-                        }),
-                        jiffies,
-                    );
+                    let inner: Arc<Timer> =
+                        Timer::new(WakerTimerCallback::new(waker.clone()), jiffies);
                     timer = Some(inner);
                 }
                 {
@@ -498,14 +478,17 @@ impl EventPoll {
                 push_back.push(epitem);
                 break;
             }
-            let mut ep_events = EPollEventType::from_bits_truncate(epitem.event.read().events);
+            let registered_events = epitem.event.read().events;
             // 再次poll获取事件(为了防止水平触发一直加入队列)
             let revents = epitem.ep_item_poll();
             if revents.is_empty() {
                 // TODO: one-shot event will be lost here
                 // continue;
             }
-            ep_events |= revents;
+
+            // Use revents (actual events filtered by registered) as the result
+            // Don't include registered events that didn't actually occur
+            let ep_events = revents;
             // 构建触发事件结构体
             let event = EPollEvent {
                 events: ep_events.bits,
@@ -537,11 +520,14 @@ impl EventPoll {
 
             // crate::debug!("ep send {event:?}");
 
-            if ep_events.contains(EPollEventType::EPOLLONESHOT) {
+            // Check EPOLLONESHOT and EPOLLET from registered_events (not from ep_events/revents)
+            // These flags are set at registration time and control epoll behavior
+            let registered_flags = EPollEventType::from_bits_truncate(registered_events);
+            if registered_flags.contains(EPollEventType::EPOLLONESHOT) {
                 let mut event_writer = epitem.event.write();
                 let new_event = event_writer.events & EPollEventType::EP_PRIVATE_BITS.bits;
                 event_writer.set_events(new_event);
-            } else if !ep_events.contains(EPollEventType::EPOLLET) {
+            } else if !registered_flags.contains(EPollEventType::EPOLLET) {
                 push_back.push(epitem);
             }
         }

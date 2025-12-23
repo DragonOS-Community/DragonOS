@@ -91,3 +91,5 @@ pty_root_test
 time_test
 timers_test
 clock_nanosleep_test
+clock_getres_test
+clock_gettime_test

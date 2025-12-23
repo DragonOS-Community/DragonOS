@@ -59,6 +59,7 @@ prctl_test
 exit_test
 setns_test
 eventfd_test
+prctl_test
 
 # 内存管理测试
 mmap_test

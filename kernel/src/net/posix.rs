@@ -365,6 +365,9 @@ pub struct MsgHdr {
     pub msg_name: *mut SockAddr,
     /// SockAddr结构体的大小
     pub msg_namelen: u32,
+    /// Padding to keep the same layout as Linux `struct msghdr` on 64-bit.
+    #[cfg(target_pointer_width = "64")]
+    pub _pad0: u32,
     /// scatter/gather array
     pub msg_iov: *mut crate::filesystem::vfs::iov::IoVec,
     /// elements in msg_iov
@@ -372,9 +375,12 @@ pub struct MsgHdr {
     /// 辅助数据
     pub msg_control: *mut u8,
     /// 辅助数据长度
-    pub msg_controllen: u32,
+    pub msg_controllen: usize,
     /// 接收到的消息的标志
-    pub msg_flags: u32,
+    pub msg_flags: i32,
+    /// Padding to keep the same layout as Linux `struct msghdr` on 64-bit.
+    #[cfg(target_pointer_width = "64")]
+    pub _pad1: i32,
 }
 
 // TODO: 从用户态读取MsgHdr，以及写入MsgHdr

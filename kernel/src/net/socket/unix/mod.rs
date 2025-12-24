@@ -197,6 +197,9 @@ pub fn create_unix_socket(
         PSOCK::SeqPacket => UnixStreamSocket::new(is_nonblocking, true),
         PSOCK::Packet => UnixStreamSocket::new(is_nonblocking, true),
         PSOCK::Datagram => UnixDatagramSocket::new(is_nonblocking),
+        // Linux supports AF_UNIX + SOCK_RAW and maps it to SOCK_DGRAM.
+        // See Linux 6.6 net/unix/af_unix.c:unix_create().
+        PSOCK::Raw => UnixDatagramSocket::new(is_nonblocking),
         _ => {
             return Err(SystemError::ESOCKTNOSUPPORT);
         }

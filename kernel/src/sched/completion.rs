@@ -5,10 +5,10 @@ use system_error::SystemError;
 use crate::{
     libs::{
         spinlock::SpinLock,
-        wait_queue::{WaitQueue, Waiter},
+        wait_queue::{TimeoutWaker, WaitQueue, Waiter},
     },
     process::ProcessManager,
-    time::timer::{Timer, WakeUpHelper},
+    time::timer::Timer,
 };
 
 const COMPLETE_ALL: u32 = u32::MAX;
@@ -92,7 +92,7 @@ impl Completion {
             let mut timer = None;
             if let Some(r) = remaining {
                 let jiffies = r as u64;
-                let t = Timer::new(WakeUpHelper::new(pcb.clone()), jiffies);
+                let t = Timer::new(TimeoutWaker::new(waker.clone()), jiffies);
                 t.activate();
                 timer = Some(t);
             }

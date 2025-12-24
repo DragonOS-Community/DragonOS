@@ -479,8 +479,8 @@ impl IndexNode for LockedPipeInode {
             .wakeup(Some(ProcessState::Blocked(true)));
         let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&data)? as u32);
         drop(inner_guard);
-        // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+        // 唤醒epoll中等待的进程（忽略错误，因为状态已更新，这是尽力而为的通知）
+        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
 
         //返回读取的字节数
         return Ok(num);
@@ -640,9 +640,23 @@ impl IndexNode for LockedPipeInode {
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
             if guard.writer == 0 {
+                // 写端耗尽意味着读端应收到 POLLHUP，唤醒等待者与 epoll
+                // 注意：这里需要使用读端的flags来获取POLLHUP事件
+                // 因为poll()中只在!flags.is_write_only()时才设置EPOLLHUP
+                let poll_flags = FileFlags::O_RDONLY;
+                let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: poll_flags });
+                // 忽略 poll 错误：状态已更新（writer已减为0），poll失败不应导致close失败
+                // 这与下面对 wakeup_epoll 错误的处理方式一致
+                let pollflag = guard
+                    .poll(&poll_data)
+                    .map(|v| EPollEventType::from_bits_truncate(v as u32))
+                    .unwrap_or(EPollEventType::EPOLLHUP);
                 drop(guard); // 先释放 inner 锁，避免潜在的死锁
-                             // 唤醒所有等待的读端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
-                self.read_wait_queue.wakeup_all(None);
+                self.read_wait_queue
+                    .wakeup_all(Some(ProcessState::Blocked(true)));
+                // 唤醒所有依赖 epoll 的等待者，确保 HUP 事件可见
+                // 忽略错误：状态已更新（writer已减为0），wakeup_epoll失败不影响close操作的语义
+                let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
                 return Ok(());
             }
         }
@@ -855,8 +869,8 @@ impl IndexNode for LockedPipeInode {
         let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&poll_data)? as u32);
 
         drop(inner_guard);
-        // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+        // 唤醒epoll中等待的进程（忽略错误，因为数据已写入，这是尽力而为的通知）
+        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
 
         // 返回写入的字节数
         return Ok(total_written);

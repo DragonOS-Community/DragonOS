@@ -39,7 +39,7 @@ impl Syscall for SysClockGettime {
 
         let timespec = posix_clock_now(clock_id);
 
-        tp_buf.copy_one_to_user(&timespec, 0)?;
+        tp_buf.buffer_protected(0)?.write_one(0, &timespec)?;
 
         return Ok(0);
     }

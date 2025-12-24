@@ -7,6 +7,7 @@ use core::{
 };
 
 use alloc::{
+    boxed::Box,
     collections::VecDeque,
     rc::Rc,
     sync::{Arc, Weak},
@@ -461,5 +462,32 @@ impl EventWaitQueue {
 
     pub fn wakeup_all(&self) {
         self.wakeup_any(u64::MAX);
+    }
+}
+
+/// 通用的超时唤醒辅助结构
+///
+/// 用于定时器超时时唤醒等待队列中的 Waiter。
+/// 相比直接唤醒 PCB，通过 Waker 唤醒可以：
+/// 1. 与 Waiter::wait() 正确配合，避免竞态条件
+/// 2. 使用原子标志 has_woken 标记唤醒状态
+/// 3. 保持与等待队列机制的一致性
+#[derive(Debug)]
+pub struct TimeoutWaker {
+    waker: Arc<Waker>,
+}
+
+impl TimeoutWaker {
+    pub fn new(waker: Arc<Waker>) -> Box<Self> {
+        Box::new(Self { waker })
+    }
+}
+
+impl crate::time::timer::TimerFunction for TimeoutWaker {
+    fn run(&mut self) -> Result<(), SystemError> {
+        // 通过 Waker::wake() 唤醒，这样 Waiter::wait() 可以观察到
+        // 注意：定时器唤醒必须通过 Waker::wake()，仅唤醒 PCB 是不够的
+        self.waker.wake();
+        Ok(())
     }
 }

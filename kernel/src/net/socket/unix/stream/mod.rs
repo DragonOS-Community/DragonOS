@@ -281,11 +281,26 @@ impl Socket for UnixStreamSocket {
 
     fn recv_from(
         &self,
-        _buffer: &mut [u8],
+        buffer: &mut [u8],
         _flags: socket::PMSG,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        todo!()
+        // 对于流式 Unix Socket，recv_from 与 recv 类似
+        // 直接调用 try_recv 并返回对端地址
+        let recv_len = self.try_recv(buffer)?;
+
+        // 获取对端地址
+        let peer_endpoint = match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("UnixStreamSocket inner is None")
+        {
+            Inner::Connected(connected) => connected.peer_endpoint(),
+            _ => return Err(SystemError::ENOTCONN),
+        };
+
+        Ok((recv_len, peer_endpoint.into()))
 
         // if flags.contains(PMSG::OOB) {
         //     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);

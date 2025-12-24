@@ -1206,6 +1206,12 @@ impl File {
         self.inode.as_pollable_inode()?.poll(&private_data)
     }
 
+    /// 检查文件是否支持 poll 操作
+    #[inline]
+    pub fn supports_poll(&self) -> bool {
+        self.inode.as_pollable_inode().is_ok()
+    }
+
     pub fn owner(&self) -> Option<RawPid> {
         self.pid.lock().as_ref().map(|pcb| pcb.pid().pid_vnr())
     }

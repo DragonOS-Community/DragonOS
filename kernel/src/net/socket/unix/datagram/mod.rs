@@ -327,6 +327,17 @@ impl UnixDatagramSocket {
         Err(SystemError::EINVAL)
     }
 
+    fn write_timeval(value: &mut [u8], us: u64) -> Result<usize, SystemError> {
+        if value.len() < 16 {
+            return Err(SystemError::EINVAL);
+        }
+        let sec = (us / 1_000_000) as i64;
+        let usec = (us % 1_000_000) as i64;
+        value[..8].copy_from_slice(&sec.to_ne_bytes());
+        value[8..16].copy_from_slice(&usec.to_ne_bytes());
+        Ok(16)
+    }
+
     fn effective_sockbuf(requested: usize) -> usize {
         // Linux sk_{snd,rcv}buf 通常会把用户设置值放大（常见为 2x）用于 bookkeeping。
         let requested = core::cmp::max(Self::MIN_SOCKET_BUF_SIZE, requested);
@@ -336,31 +347,26 @@ impl UnixDatagramSocket {
     fn wait_event_interruptible_timeout<F>(
         &self,
         mut cond: F,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<(), SystemError>
     where
         F: FnMut() -> bool,
     {
-        if timeout == Duration::ZERO {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-
-        let deadline = Instant::now() + timeout;
+        let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             if cond() {
                 return Ok(());
             }
 
-            if Instant::now() >= deadline {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            // 检查超时
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
             }
 
-            let remain = deadline
-                .duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO);
-            if remain == Duration::ZERO {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
+            let remain =
+                deadline.map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
 
             let (waiter, waker) = Waiter::new_pair();
             self.wait_queue.register_waker(waker.clone())?;
@@ -381,17 +387,29 @@ impl UnixDatagramSocket {
                 return Err(SystemError::ERESTARTSYS);
             }
 
-            let sleep_us = remain.total_micros();
-            let timer: Arc<Timer> = Timer::new(
-                TimeoutWaker::new(waker.clone()),
-                next_n_us_timer_jiffies(sleep_us),
-            );
-            timer.activate();
+            // 如果有超时，设置定时器
+            let timer = if let Some(remain) = remain {
+                if remain == Duration::ZERO {
+                    self.wait_queue.remove_waker(&waker);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                let sleep_us = remain.total_micros();
+                let t: Arc<Timer> = Timer::new(
+                    TimeoutWaker::new(waker.clone()),
+                    next_n_us_timer_jiffies(sleep_us),
+                );
+                t.activate();
+                Some(t)
+            } else {
+                None
+            };
 
             let wait_res = waiter.wait(true);
-            let was_timeout = timer.timeout();
+            let was_timeout = timer.as_ref().map(|t| t.timeout()).unwrap_or(false);
             if !was_timeout {
-                timer.cancel();
+                if let Some(t) = timer {
+                    t.cancel();
+                }
             }
 
             self.wait_queue.remove_waker(&waker);
@@ -435,6 +453,14 @@ impl UnixDatagramSocket {
         self.snd_used.fetch_sub(len, Ordering::SeqCst);
         self.wait_queue
             .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+    }
+
+    fn release_sender_accounting(sender_addr: &Option<UnixEndpointBound>, accounted_len: usize) {
+        if let Some(ref addr) = sender_addr {
+            if let Some(sender_socket) = BIND_TABLE.lookup(addr) {
+                sender_socket.unaccount_send_buffer(accounted_len);
+            }
+        }
     }
 
     /// 发送数据报到指定地址
@@ -539,14 +565,26 @@ impl UnixDatagramSocket {
         buffer[..copy_len].copy_from_slice(&msg.data[..copy_len]);
 
         // 释放发送端 SO_SNDBUF 记账并唤醒等待发送者。
-        if let Some(ref sender_addr) = msg.sender_addr {
-            if let Some(sender_socket) = BIND_TABLE.lookup(sender_addr) {
-                sender_socket.unaccount_send_buffer(msg.sender_accounted_len);
-            }
-        }
+        Self::release_sender_accounting(&msg.sender_addr, msg.sender_accounted_len);
 
         // 如果缓冲区太小，数据会被截断（SOCK_DGRAM 行为）
         Ok((copy_len, msg.sender_addr, orig_len))
+    }
+
+    fn recv_return_len(copy_len: usize, orig_len: usize, flags: PMSG) -> usize {
+        if flags.contains(PMSG::TRUNC) {
+            orig_len
+        } else {
+            copy_len
+        }
+    }
+
+    fn convert_enobufs_to_eagain(result: Result<usize, SystemError>) -> Result<usize, SystemError> {
+        match result {
+            Ok(len) => Ok(len),
+            Err(SystemError::ENOBUFS) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            Err(e) => Err(e),
+        }
     }
 
     fn can_recv(&self) -> bool {
@@ -656,34 +694,25 @@ impl Socket for UnixDatagramSocket {
 
     fn recv(&self, buffer: &mut [u8], flags: socket::PMSG) -> Result<usize, SystemError> {
         let peek = flags.contains(PMSG::PEEK);
-        if self.is_nonblocking() || flags.contains(PMSG::DONTWAIT) {
-            self.try_recv_from(buffer, peek)
+        let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+
+        if nonblock {
+            return self
+                .try_recv_from(buffer, peek)
                 .map(|(copy_len, _addr, orig_len)| {
-                    if flags.contains(PMSG::TRUNC) {
-                        orig_len
-                    } else {
-                        copy_len
-                    }
-                })
-        } else {
-            loop {
-                match self.try_recv_from(buffer, peek) {
-                    Ok((copy_len, _addr, orig_len)) => {
-                        return Ok(if flags.contains(PMSG::TRUNC) {
-                            orig_len
-                        } else {
-                            copy_len
-                        })
-                    }
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        if let Some(tmo) = self.recv_timeout() {
-                            self.wait_event_interruptible_timeout(|| self.can_recv(), tmo)?;
-                        } else {
-                            wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
-                        }
-                    }
-                    Err(e) => return Err(e),
+                    Self::recv_return_len(copy_len, orig_len, flags)
+                });
+        }
+
+        loop {
+            match self.try_recv_from(buffer, peek) {
+                Ok((copy_len, _addr, orig_len)) => {
+                    return Ok(Self::recv_return_len(copy_len, orig_len, flags));
                 }
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    self.wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -695,40 +724,28 @@ impl Socket for UnixDatagramSocket {
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         let peek = flags.contains(PMSG::PEEK);
-        if self.is_nonblocking() || flags.contains(PMSG::DONTWAIT) {
+        let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+
+        let do_recv = |buffer: &mut [u8]| -> Result<(usize, Endpoint), SystemError> {
             let (copy_len, addr, orig_len) = self.try_recv_from(buffer, peek)?;
             let endpoint = addr
                 .map(|a| Endpoint::Unix(a.into()))
                 .unwrap_or(Endpoint::Unix(UnixEndpoint::Unnamed));
-            let ret_len = if flags.contains(PMSG::TRUNC) {
-                orig_len
-            } else {
-                copy_len
-            };
+            let ret_len = Self::recv_return_len(copy_len, orig_len, flags);
             Ok((ret_len, endpoint))
-        } else {
-            loop {
-                match self.try_recv_from(buffer, peek) {
-                    Ok((copy_len, addr, orig_len)) => {
-                        let endpoint = addr
-                            .map(|a| Endpoint::Unix(a.into()))
-                            .unwrap_or(Endpoint::Unix(UnixEndpoint::Unnamed));
-                        let ret_len = if flags.contains(PMSG::TRUNC) {
-                            orig_len
-                        } else {
-                            copy_len
-                        };
-                        return Ok((ret_len, endpoint));
-                    }
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        if let Some(tmo) = self.recv_timeout() {
-                            self.wait_event_interruptible_timeout(|| self.can_recv(), tmo)?;
-                        } else {
-                            wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
-                        }
-                    }
-                    Err(e) => return Err(e),
+        };
+
+        if nonblock {
+            return do_recv(buffer);
+        }
+
+        loop {
+            match do_recv(buffer) {
+                Ok(result) => return Ok(result),
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    self.wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
                 }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -769,11 +786,7 @@ impl Socket for UnixDatagramSocket {
                 let copy_len = core::cmp::min(buf_cap, orig_len);
                 buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
 
-                if let Some(ref sender) = msg_in.sender_addr {
-                    if let Some(sender_socket) = BIND_TABLE.lookup(sender) {
-                        sender_socket.unaccount_send_buffer(msg_in.sender_accounted_len);
-                    }
-                }
+                Self::release_sender_accounting(&msg_in.sender_addr, msg_in.sender_accounted_len);
 
                 (copy_len, msg_in.sender_addr, orig_len)
             }
@@ -802,21 +815,16 @@ impl Socket for UnixDatagramSocket {
                         let copy_len = core::cmp::min(buf_cap, orig_len);
                         buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
 
-                        if let Some(ref sender) = msg_in.sender_addr {
-                            if let Some(sender_socket) = BIND_TABLE.lookup(sender) {
-                                sender_socket.unaccount_send_buffer(msg_in.sender_accounted_len);
-                            }
-                        }
+                        Self::release_sender_accounting(
+                            &msg_in.sender_addr,
+                            msg_in.sender_accounted_len,
+                        );
 
                         break (copy_len, msg_in.sender_addr, orig_len);
                     }
                 }
 
-                if let Some(tmo) = self.recv_timeout() {
-                    self.wait_event_interruptible_timeout(|| self.can_recv(), tmo)?;
-                } else {
-                    wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
-                }
+                self.wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
             }
         };
 
@@ -835,11 +843,7 @@ impl Socket for UnixDatagramSocket {
             msg.msg_flags |= PMSG::TRUNC.bits() as i32;
         }
 
-        Ok(if flags.contains(PMSG::TRUNC) {
-            orig_len
-        } else {
-            copy_len
-        })
+        Ok(Self::recv_return_len(copy_len, orig_len, flags))
     }
 
     fn send(&self, buffer: &[u8], flags: socket::PMSG) -> Result<usize, SystemError> {
@@ -850,32 +854,22 @@ impl Socket for UnixDatagramSocket {
             .peer_endpoint()
             .ok_or(SystemError::EDESTADDRREQ)?;
 
-        if self.is_nonblocking() || flags.contains(PMSG::DONTWAIT) {
+        let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+
+        if nonblock {
+            return Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &peer_addr));
+        }
+
+        loop {
             match self.try_send_to(buffer, &peer_addr) {
-                Ok(len) => Ok(len),
-                Err(SystemError::ENOBUFS) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-                Err(e) => Err(e),
-            }
-        } else {
-            loop {
-                match self.try_send_to(buffer, &peer_addr) {
-                    Ok(len) => return Ok(len),
-                    Err(SystemError::ENOBUFS) => {
-                        if let Some(tmo) = self.send_timeout() {
-                            self.wait_event_interruptible_timeout(
-                                || self.send_buffer_available(buffer.len()),
-                                tmo,
-                            )?;
-                        } else {
-                            wq_wait_event_interruptible!(
-                                self.wait_queue,
-                                self.send_buffer_available(buffer.len()),
-                                {}
-                            )?;
-                        }
-                    }
-                    Err(e) => return Err(e),
+                Ok(len) => return Ok(len),
+                Err(SystemError::ENOBUFS) => {
+                    self.wait_event_interruptible_timeout(
+                        || self.send_buffer_available(buffer.len()),
+                        self.send_timeout(),
+                    )?;
                 }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -893,32 +887,22 @@ impl Socket for UnixDatagramSocket {
         let unix_endpoint = UnixEndpoint::try_from(address)?;
         let target_addr = unix_endpoint.connect()?;
 
-        if self.is_nonblocking() || flags.contains(PMSG::DONTWAIT) {
+        let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+
+        if nonblock {
+            return Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &target_addr));
+        }
+
+        loop {
             match self.try_send_to(buffer, &target_addr) {
-                Ok(len) => Ok(len),
-                Err(SystemError::ENOBUFS) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-                Err(e) => Err(e),
-            }
-        } else {
-            loop {
-                match self.try_send_to(buffer, &target_addr) {
-                    Ok(len) => return Ok(len),
-                    Err(SystemError::ENOBUFS) => {
-                        if let Some(tmo) = self.send_timeout() {
-                            self.wait_event_interruptible_timeout(
-                                || self.send_buffer_available(buffer.len()),
-                                tmo,
-                            )?;
-                        } else {
-                            wq_wait_event_interruptible!(
-                                self.wait_queue,
-                                self.send_buffer_available(buffer.len()),
-                                {}
-                            )?;
-                        }
-                    }
-                    Err(e) => return Err(e),
+                Ok(len) => return Ok(len),
+                Err(SystemError::ENOBUFS) => {
+                    self.wait_event_interruptible_timeout(
+                        || self.send_buffer_available(buffer.len()),
+                        self.send_timeout(),
+                    )?;
                 }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -964,27 +948,10 @@ impl Socket for UnixDatagramSocket {
                 Ok(4)
             }
             crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
-                // 写回 timeval: { i64 sec; i64 usec }
-                if value.len() < 16 {
-                    return Err(SystemError::EINVAL);
-                }
-                let us = self.send_timeout_us.load(Ordering::Relaxed);
-                let sec = (us / 1_000_000) as i64;
-                let usec = (us % 1_000_000) as i64;
-                value[..8].copy_from_slice(&sec.to_ne_bytes());
-                value[8..16].copy_from_slice(&usec.to_ne_bytes());
-                Ok(16)
+                Self::write_timeval(value, self.send_timeout_us.load(Ordering::Relaxed))
             }
             crate::net::socket::PSO::RCVTIMEO_OLD | crate::net::socket::PSO::RCVTIMEO_NEW => {
-                if value.len() < 16 {
-                    return Err(SystemError::EINVAL);
-                }
-                let us = self.recv_timeout_us.load(Ordering::Relaxed);
-                let sec = (us / 1_000_000) as i64;
-                let usec = (us % 1_000_000) as i64;
-                value[..8].copy_from_slice(&sec.to_ne_bytes());
-                value[8..16].copy_from_slice(&usec.to_ne_bytes());
-                Ok(16)
+                Self::write_timeval(value, self.recv_timeout_us.load(Ordering::Relaxed))
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }

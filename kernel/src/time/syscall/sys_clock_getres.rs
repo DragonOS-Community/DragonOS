@@ -1,14 +1,14 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::syscall::nr::SYS_CLOCK_GETTIME;
+use crate::arch::syscall::nr::SYS_CLOCK_GETRES;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferWriter;
-use crate::time::{syscall::posix_clock_now, syscall::PosixClockID, PosixTimeSpec};
+use crate::time::{syscall::posix_clock_res, syscall::PosixClockID, PosixTimeSpec};
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-pub struct SysClockGettime;
+pub struct SysClockGetres;
 
-impl SysClockGettime {
+impl SysClockGetres {
     fn clock_id(args: &[usize]) -> i32 {
         args[0] as i32
     }
@@ -18,30 +18,29 @@ impl SysClockGettime {
     }
 }
 
-impl Syscall for SysClockGettime {
+impl Syscall for SysClockGetres {
     fn num_args(&self) -> usize {
         2
     }
 
-    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let clock_id = PosixClockID::try_from(Self::clock_id(args))?;
 
+        // Linux 语义：tp == NULL 时允许，直接返回 0。
         let tp = Self::timespec_ptr(args);
         if tp.is_null() {
-            return Err(SystemError::EFAULT);
+            return Ok(0);
         }
 
         let mut tp_buf = UserBufferWriter::new::<PosixTimeSpec>(
             tp,
             core::mem::size_of::<PosixTimeSpec>(),
-            true,
+            frame.is_from_user(),
         )?;
 
-        let timespec = posix_clock_now(clock_id);
-
-        tp_buf.copy_one_to_user(&timespec, 0)?;
-
-        return Ok(0);
+        let res = posix_clock_res(clock_id);
+        tp_buf.buffer_protected(0)?.write_one(0, &res)?;
+        Ok(0)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -55,4 +54,4 @@ impl Syscall for SysClockGettime {
     }
 }
 
-syscall_table_macros::declare_syscall!(SYS_CLOCK_GETTIME, SysClockGettime);
+syscall_table_macros::declare_syscall!(SYS_CLOCK_GETRES, SysClockGetres);

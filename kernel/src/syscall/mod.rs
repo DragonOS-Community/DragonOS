@@ -22,7 +22,7 @@ use crate::{
     mm::{verify_area, VirtAddr},
 };
 
-use self::{misc::SysInfo, user_access::UserBufferWriter};
+use self::{misc::SysInfo, user_access::UserBufferReader, user_access::UserBufferWriter};
 
 pub mod misc;
 pub mod table;
@@ -266,6 +266,19 @@ impl Syscall {
 
                 let msg = &mut buffer[0];
                 Self::recvmsg(args[0], msg, flags)
+            }
+
+            SYS_SENDMSG => {
+                let msg = args[1] as *const MsgHdr;
+                let flags = args[2] as u32;
+
+                let user_buffer_reader = UserBufferReader::new(
+                    msg,
+                    core::mem::size_of::<MsgHdr>(),
+                    frame.is_from_user(),
+                )?;
+                let msg = user_buffer_reader.read_one_from_user::<MsgHdr>(0)?;
+                Self::sendmsg(args[0], msg, flags)
             }
 
             SYS_LISTEN => Self::listen(args[0], args[1]),

@@ -10,7 +10,7 @@ use crate::{
         AddressFamily, PSOCK,
     },
     process::ProcessManager,
-    syscall::Syscall,
+    syscall::{user_access::UserBufferReader, user_access::UserBufferWriter, Syscall},
 };
 
 use super::{
@@ -94,6 +94,11 @@ impl Syscall {
             return Err(SystemError::EAFNOSUPPORT);
         }
 
+        // Linux: if protocol is non-zero and not PF_UNIX/AF_UNIX, return EPROTONOSUPPORT.
+        if protocol != 0 && protocol != AddressFamily::Unix as usize {
+            return Err(SystemError::EPROTONOSUPPORT);
+        }
+
         let nonblocking = socket_type.contains(PosixArgsSocketType::NONBLOCK);
 
         let (socket_a, socket_b): (
@@ -112,8 +117,13 @@ impl Syscall {
                 let (a, b) = UnixDatagramSocket::new_pair(nonblocking);
                 (a, b)
             }
+            // Linux supports AF_UNIX + SOCK_RAW and maps it to SOCK_DGRAM.
+            (AddressFamily::Unix, PSOCK::Raw) => {
+                let (a, b) = UnixDatagramSocket::new_pair(nonblocking);
+                (a, b)
+            }
             _ => {
-                return Err(SystemError::EAFNOSUPPORT);
+                return Err(SystemError::ESOCKTNOSUPPORT);
             }
         };
 
@@ -139,7 +149,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let sol = socket::PSOL::try_from(level as u32)?;
         let socket = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-        log::debug!("setsockopt: level = {:?} ", sol);
+        // log::debug!("setsockopt: level = {:?} ", sol);
         return socket
             .as_socket()
             .unwrap()
@@ -163,8 +173,16 @@ impl Syscall {
         optval: *mut u8,
         optlen: *mut u32,
     ) -> Result<usize, SystemError> {
+        // 参数合法性检查
+        if optlen.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+
+        // 使用 UserBufferReader 读取用户提供的缓冲区长度
+        let optlen_reader = UserBufferReader::new(optlen, core::mem::size_of::<u32>(), true)?;
+        let user_len = optlen_reader.buffer_protected(0)?.read_one::<u32>(0)? as usize;
+
         // 获取socket
-        let optval = optval as *mut u32;
         let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
         let socket = socket_inode.as_socket().unwrap();
 
@@ -173,26 +191,72 @@ impl Syscall {
         let level = PSOL::try_from(level as u32)?;
 
         if matches!(level, PSOL::SOCKET) {
-            let optname = PSO::try_from(optname as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-            match optname {
+            let opt = PSO::try_from(optname as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+
+            match opt {
                 PSO::SNDBUF => {
-                    // 返回发送缓冲区大小
-                    unsafe {
-                        *optval = socket.send_buffer_size() as u32;
-                        *optlen = core::mem::size_of::<u32>() as u32;
+                    let need = core::mem::size_of::<u32>();
+
+                    // 使用 UserBufferWriter 写入 optval（小数据）
+                    if !optval.is_null() {
+                        let to_write = core::cmp::min(user_len, need);
+                        let value = socket.send_buffer_size() as u32;
+                        let mut optval_writer = UserBufferWriter::new(optval, to_write, true)?;
+                        optval_writer
+                            .buffer_protected(0)?
+                            .write_one::<u32>(0, &value)?;
                     }
+
+                    // 写回实际需要的长度
+                    let mut optlen_writer =
+                        UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), true)?;
+                    optlen_writer
+                        .buffer_protected(0)?
+                        .write_one::<u32>(0, &(need as u32))?;
                     return Ok(0);
                 }
                 PSO::RCVBUF => {
-                    // 返回默认的接收缓冲区大小
-                    unsafe {
-                        *optval = socket.recv_buffer_size() as u32;
-                        *optlen = core::mem::size_of::<u32>() as u32;
+                    let need = core::mem::size_of::<u32>();
+                    let value = socket.recv_buffer_size() as u32;
+
+                    // 使用 UserBufferWriter 写入 optval（小数据）
+                    if !optval.is_null() {
+                        let to_write = core::cmp::min(user_len, need);
+                        let mut optval_writer = UserBufferWriter::new(optval, to_write, true)?;
+                        optval_writer
+                            .buffer_protected(0)?
+                            .write_one::<u32>(0, &value)?;
                     }
+
+                    // 写回实际需要的长度
+                    let mut optlen_writer =
+                        UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), true)?;
+                    optlen_writer
+                        .buffer_protected(0)?
+                        .write_one::<u32>(0, &(need as u32))?;
                     return Ok(0);
                 }
                 _ => {
-                    return Err(SystemError::ENOPROTOOPT);
+                    // 其它 SOL_SOCKET 选项交给具体 socket 实现。
+                    // 这里采用"内核缓冲区 -> copy_to_user"的方式，避免假设 optval 是 u32。
+                    let mut kbuf = [0u8; 64];
+                    let written = socket.option(level, optname, &mut kbuf)?;
+                    let need = written;
+
+                    // 使用 UserBufferWriter 写入 optval（可能大数据）
+                    if !optval.is_null() {
+                        let to_write = core::cmp::min(user_len, need);
+                        let mut optval_writer = UserBufferWriter::new(optval, to_write, true)?;
+                        optval_writer.copy_to_user_protected(&kbuf[..to_write], 0)?;
+                    }
+
+                    // 写回实际需要的长度
+                    let mut optlen_writer =
+                        UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), true)?;
+                    optlen_writer
+                        .buffer_protected(0)?
+                        .write_one::<u32>(0, &(need as u32))?;
+                    return Ok(0);
                 }
             }
         }
@@ -274,13 +338,24 @@ impl Syscall {
         addr: *const SockAddr,
         addrlen: u32,
     ) -> Result<usize, SystemError> {
+        // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
+        let file_nonblock = {
+            let binding = ProcessManager::current_pcb().fd_table();
+            let guard = binding.read();
+            let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
+            file.flags().contains(FileFlags::O_NONBLOCK)
+        };
+
         let endpoint = if addr.is_null() {
             None
         } else {
             Some(SockAddr::to_endpoint(addr, addrlen)?)
         };
 
-        let flags = socket::PMSG::from_bits_truncate(flags);
+        let mut flags = socket::PMSG::from_bits_truncate(flags);
+        if file_nonblock {
+            flags.insert(socket::PMSG::DONTWAIT);
+        }
 
         let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
         let socket = socket_inode.as_socket().unwrap();
@@ -308,10 +383,21 @@ impl Syscall {
         addr: *mut SockAddr,
         addr_len: *mut u32,
     ) -> Result<usize, SystemError> {
+        // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
+        let file_nonblock = {
+            let binding = ProcessManager::current_pcb().fd_table();
+            let guard = binding.read();
+            let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
+            file.flags().contains(FileFlags::O_NONBLOCK)
+        };
+
         let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
         let socket = socket_inode.as_socket().unwrap();
 
-        let flags = socket::PMSG::from_bits_truncate(flags);
+        let mut flags = socket::PMSG::from_bits_truncate(flags);
+        if file_nonblock {
+            flags.insert(socket::PMSG::DONTWAIT);
+        }
 
         if addr.is_null() {
             let (n, _) = socket.recv_from(buf, flags, None)?;
@@ -345,23 +431,97 @@ impl Syscall {
         // 检查每个缓冲区地址是否合法，生成iovecs
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
+        // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
+        let file_nonblock = {
+            let binding = ProcessManager::current_pcb().fd_table();
+            let guard = binding.read();
+            let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
+            file.flags().contains(FileFlags::O_NONBLOCK)
+        };
+
         let (buf, recv_size) = {
             let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
             let socket = socket_inode.as_socket().unwrap();
 
-            let flags = socket::PMSG::from_bits_truncate(flags);
+            let mut flags = socket::PMSG::from_bits_truncate(flags);
+            if file_nonblock {
+                flags.insert(socket::PMSG::DONTWAIT);
+            }
 
-            let mut buf = iovs.new_buf(true);
-            // 从socket中读取数据
-            let recv_size = socket.recv(&mut buf, flags)?;
-
-            (buf, recv_size)
+            // 优先使用 recv_msg 以便实现 msg_flags/msg_controllen 等语义。
+            match socket.recv_msg(msg, flags) {
+                Ok(recv_size) => (alloc::vec::Vec::new(), recv_size),
+                Err(SystemError::ENOSYS) => {
+                    let mut buf = iovs.new_buf(true);
+                    // 从socket中读取数据
+                    let recv_size = socket.recv(&mut buf, flags)?;
+                    (buf, recv_size)
+                }
+                Err(e) => return Err(e),
+            }
         };
 
-        // 将数据写入用户空间的iovecs
-        iovs.scatter(&buf[..recv_size])?;
+        // 将数据写入用户空间的iovecs（recv_msg 路径已自行处理散布写入）
+        if !buf.is_empty() {
+            iovs.scatter(&buf[..recv_size])?;
+        }
+
+        // 最小保证：不产生控制消息时必须把 msg_controllen 写回 0
+        // 否则用户态 CMSG_FIRSTHDR 可能非空。
+        msg.msg_controllen = 0;
 
         return Ok(recv_size);
+    }
+
+    /// @brief sys_sendmsg系统调用的实际执行函数
+    ///
+    /// @param fd 文件描述符
+    /// @param msg MsgHdr（来自用户态）
+    /// @param flags sendmsg flags
+    ///
+    /// @return 成功返回发送的字节数，失败返回错误码
+    pub fn sendmsg(fd: usize, msg: &MsgHdr, flags: u32) -> Result<usize, SystemError> {
+        // Validate and parse iovecs, then gather user data.
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
+
+        // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
+        let file_nonblock = {
+            let binding = ProcessManager::current_pcb().fd_table();
+            let guard = binding.read();
+            let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
+            file.flags().contains(FileFlags::O_NONBLOCK)
+        };
+
+        let mut pmsg = socket::PMSG::from_bits_truncate(flags);
+        if file_nonblock {
+            pmsg.insert(socket::PMSG::DONTWAIT);
+        }
+
+        let endpoint = if msg.msg_name.is_null() {
+            None
+        } else {
+            Some(SockAddr::to_endpoint(
+                msg.msg_name as *const SockAddr,
+                msg.msg_namelen,
+            )?)
+        };
+
+        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+        let socket = socket_inode.as_socket().unwrap();
+
+        // Prefer socket-level send_msg if implemented.
+        match socket.send_msg(msg, pmsg) {
+            Ok(n) => return Ok(n),
+            Err(SystemError::ENOSYS) => {}
+            Err(e) => return Err(e),
+        }
+
+        let buf = iovs.gather()?;
+        if let Some(endpoint) = endpoint {
+            socket.send_to(&buf, pmsg, endpoint)
+        } else {
+            socket.send(&buf, pmsg)
+        }
     }
 
     /// @brief sys_listen系统调用的实际执行函数

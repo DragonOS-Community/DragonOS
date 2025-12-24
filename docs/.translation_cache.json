@@ -303,7 +303,7 @@
     "hash": "acbc94b056e1c8f7f07275d80b70a930"
   },
   "en:kernel/device/index.rst": {
-    "hash": "71c15cea87dffe58f5d70da38390a083"
+    "hash": "f27dd3c0d3f33aac7f70f2eb90403d88"
   },
   "en:kernel/memory_management/extable_safe_copy_design.md": {
     "hash": "fabf6a20ce3a3d1974d678f039fa32b5"
@@ -325,5 +325,8 @@
   },
   "en:community/ChangeLog/V0.4.x/V0.4.0.md": {
     "hash": "940c6a8fc47831f75df1dc8810d7c336"
+  },
+  "en:kernel/device/loop_device.md": {
+    "hash": "1d637a7d292c4168b326ba46755b5622"
   }
 }

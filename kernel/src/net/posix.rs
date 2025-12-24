@@ -176,8 +176,6 @@ impl From<Endpoint> for SockAddr {
 impl SockAddr {
     /// @brief 把用户传入的SockAddr转换为Endpoint结构体
     pub fn to_endpoint(addr: *const SockAddr, len: u32) -> Result<Endpoint, SystemError> {
-        use crate::net::socket::AddressFamily;
-
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
         unsafe {
             match AddressFamily::try_from(addr.family)? {
@@ -216,9 +214,30 @@ impl SockAddr {
                 AddressFamily::Unix => {
                     // 在这里并没有分配抽象地址或者创建文件系统节点，这里只是简单的获取，等到bind时再创建
 
+                    // Linux 语义：addrlen 过长应返回 EINVAL。
+                    if len > size_of::<SockAddrUn>() as u32 {
+                        return Err(SystemError::EINVAL);
+                    }
+
+                    // 至少需要包含 sa_family_t。
+                    if len < size_of::<u16>() as u32 {
+                        return Err(SystemError::EINVAL);
+                    }
+
                     let addr_un: SockAddrUn = addr.addr_un;
 
-                    if addr_un.sun_path[0] == 0 {
+                    // 根据 addrlen 限制 sun_path 可见范围，避免忽略用户传入的长度。
+                    let sun_path_len = (len as usize)
+                        .saturating_sub(size_of::<u16>())
+                        .min(addr_un.sun_path.len());
+                    let sun_path = &addr_un.sun_path[..sun_path_len];
+
+                    if sun_path.is_empty() {
+                        // 仅包含 family 的情况目前不支持 Autobind，按参数无效处理。
+                        return Err(SystemError::EINVAL);
+                    }
+
+                    if sun_path[0] == 0 {
                         // 抽象地址空间，与文件系统没有关系
                         // TODO: Autobind feature
                         //    If a bind(2) call specifies addrlen as sizeof(sa_family_t), or the
@@ -229,7 +248,7 @@ impl SockAddr {
                         //    2^20 autobind addresses.  (From Linux 2.1.15, when the autobind
                         //    feature was added, 8 bytes were used, and the limit was thus 2^32
                         //    autobind addresses.  The change to 5 bytes came in Linux 2.3.15.)
-                        let path = CStr::from_bytes_until_nul(&addr_un.sun_path[1..])
+                        let path = CStr::from_bytes_until_nul(&sun_path[1..])
                             .map_err(|_| {
                                 log::error!("CStr::from_bytes_until_nul fail");
                                 SystemError::EINVAL
@@ -248,7 +267,7 @@ impl SockAddr {
                         return Ok(Endpoint::Unix(UnixEndpoint::Abstract(path.to_string())));
                     }
 
-                    let path = CStr::from_bytes_until_nul(&addr_un.sun_path)
+                    let path = CStr::from_bytes_until_nul(sun_path)
                         .map_err(|_| {
                             log::error!("CStr::from_bytes_until_nul fail");
                             SystemError::EINVAL

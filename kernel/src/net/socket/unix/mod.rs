@@ -135,11 +135,18 @@ impl UnixEndpoint {
                         VFS_MAX_FOLLOW_SYMLINK_TIMES,
                     )?;
                 // 创建 socket inode
-                let inode = parent_inode.create(
-                    filename,
-                    crate::filesystem::vfs::FileType::Socket,
-                    InodeMode::S_IWUSR,
-                )?;
+                let inode = parent_inode
+                    .create(
+                        filename,
+                        crate::filesystem::vfs::FileType::Socket,
+                        InodeMode::S_IWUSR,
+                    )
+                    .map_err(|e| match e {
+                        // Linux/Posix bind 语义：地址已被占用应返回 EADDRINUSE。
+                        // VFS 创建节点遇到同名条目通常返回 EEXIST，需要在 socket 层进行语义映射。
+                        SystemError::EEXIST => SystemError::EADDRINUSE,
+                        other => other,
+                    })?;
                 UnixEndpointBound::Path(DName::from(inode.absolute_path()?))
             }
             Self::Abstract(name) => UnixEndpointBound::Abstract(ns::create_abstract_name(name)?),

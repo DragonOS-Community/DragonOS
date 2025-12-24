@@ -69,7 +69,7 @@ mincore_test
 madvise_test
 
 # 网络相关测试
-#bind_test
+bind_test
 #connect_test
 #listen_test
 socket_test

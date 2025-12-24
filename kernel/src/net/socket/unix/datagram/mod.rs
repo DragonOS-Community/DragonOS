@@ -958,11 +958,30 @@ impl Socket for UnixDatagramSocket {
     }
 
     fn do_close(&self) -> Result<(), SystemError> {
-        // 从绑定表中注销
+        // 先从绑定表中注销，防止新消息进入
         let inner = self.inner.lock();
         if let Some(ref addr) = inner.local_addr {
             BIND_TABLE.unregister(addr);
         }
+        drop(inner);
+
+        // 清空接收队列并释放所有发送端记账
+        // 注意：需要在获取 inner 锁之后操作，但释放记账时不能持有 inner 锁
+        // 因为 release_sender_accounting 可能需要查找 BIND_TABLE
+        let messages_to_release: Vec<(Option<UnixEndpointBound>, usize)> = {
+            let mut inner = self.inner.lock();
+            inner
+                .recv_queue
+                .drain(..)
+                .map(|msg| (msg.sender_addr, msg.sender_accounted_len))
+                .collect()
+        };
+
+        // 释放所有发送端记账（不持有 inner 锁）
+        for (sender_addr, accounted_len) in messages_to_release {
+            Self::release_sender_accounting(&sender_addr, accounted_len);
+        }
+
         Ok(())
     }
 
@@ -986,5 +1005,18 @@ impl Socket for UnixDatagramSocket {
 
     fn socket_inode_id(&self) -> InodeId {
         self.inode_id
+    }
+}
+
+impl Drop for UnixDatagramSocket {
+    fn drop(&mut self) {
+        // 从绑定表中注销，释放地址
+        let inner = self.inner.lock();
+        if let Some(ref addr) = inner.local_addr {
+            BIND_TABLE.unregister(addr);
+        }
+        // 注意：不在这里释放接收队列中的记账
+        // 因为 Drop 运行时其他 socket 可能已经被 drop，访问它们不安全
+        // 正常的关闭流程应该通过 do_close 完成
     }
 }

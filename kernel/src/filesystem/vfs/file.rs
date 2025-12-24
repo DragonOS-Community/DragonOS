@@ -15,6 +15,7 @@ use crate::{
     arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
+        block::loop_device::LoopPrivateData,
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::{
@@ -116,6 +117,8 @@ pub enum FilePrivateData {
     EPoll(EPollPrivateData),
     /// pid私有信息
     Pid(PidPrivateData),
+    //loop私有信息
+    Loop(LoopPrivateData),
     /// namespace fd 私有信息（/proc/thread-self/ns/* 打开后得到）
     Namespace(NamespaceFilePrivateData),
     /// 不需要文件私有信息

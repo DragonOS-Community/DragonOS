@@ -151,6 +151,12 @@ impl EventPoll {
             epds.events &= !EPollEventType::EPOLLWAKEUP.bits();
         }
 
+        // Linux 语义：EPOLLERR/EPOLLHUP 会被无条件报告。
+        // 由于 EPollItem::ep_item_poll 会与 interested mask 相交，这里需要把它们强制加入 mask。
+        if op != EPollCtlOption::Del {
+            epds.events |= EPollEventType::EPOLLERR.bits() | EPollEventType::EPOLLHUP.bits();
+        }
+
         let events = EPollEventType::from_bits_truncate(epds.events);
 
         // 检查获取到的两个文件的正确性
@@ -235,12 +241,13 @@ impl EventPoll {
                         return Err(SystemError::ENOENT);
                     }
                     let ep_item = ep_item.unwrap().clone();
-                    if ep_item.event.read().events & EPollEventType::EPOLLEXCLUSIVE.bits() != 0 {
-                        epds.events |=
-                            EPollEventType::EPOLLERR.bits() | EPollEventType::EPOLLHUP.bits();
 
-                        Self::ep_modify(&mut epoll_guard, ep_item, &epds)?;
+                    // EPOLLEXCLUSIVE 只能在 ADD 时设置；如果已有该位，MOD 需要保留它。
+                    if (ep_item.event.read().events & EPollEventType::EPOLLEXCLUSIVE.bits()) != 0 {
+                        epds.events |= EPollEventType::EPOLLEXCLUSIVE.bits();
                     }
+
+                    Self::ep_modify(&mut epoll_guard, ep_item, &epds)?;
                 }
             }
         }
@@ -389,7 +396,10 @@ impl EventPoll {
                 if current_pcb.has_pending_signal_fast()
                     && current_pcb.has_pending_not_masked_signal()
                 {
-                    return Err(SystemError::ERESTARTSYS);
+                    // Linux epoll_wait(2): interrupted by signal handler -> EINTR.
+                    // Returning ERESTARTSYS would cause userspace to restart the syscall
+                    // (SA_RESTART), which breaks gVisor's UnblockWithSignal expectation.
+                    return Err(SystemError::EINTR);
                 }
 
                 // 还未等待到事件发生，则睡眠
@@ -426,7 +436,10 @@ impl EventPoll {
                     t.activate();
                 }
 
-                let wait_res = waiter.wait(true);
+                let wait_res = match waiter.wait(true) {
+                    Err(SystemError::ERESTARTSYS) => Err(SystemError::EINTR),
+                    other => other,
+                };
 
                 {
                     let guard = epoll.0.lock_irqsave();

@@ -71,14 +71,14 @@ impl Syscall for SysMsyncHandle {
         loop {
             if let Some(vma) = next_vma.clone() {
                 // 读取VMA信息，确保在调用find_nearest前释放锁
-                let (vm_start, vm_end, vm_flags, file, file_pgoff);
+                let (vm_start, vm_end, vm_flags, file, backing_pgoff);
                 {
                     let guard = vma.lock_irqsave();
                     vm_start = guard.region().start().data();
                     vm_end = guard.region().end().data();
                     vm_flags = *guard.vm_flags();
                     file = guard.vm_file();
-                    file_pgoff = guard.file_page_offset();
+                    backing_pgoff = guard.backing_page_offset();
 
                     if start < vm_start {
                         if flags == MsFlags::MS_ASYNC {
@@ -99,7 +99,7 @@ impl Syscall for SysMsyncHandle {
                     }
                 }
 
-                let fstart = (start - vm_start) + (file_pgoff.unwrap_or(0) << MMArch::PAGE_SHIFT);
+                let fstart = (start - vm_start) + (backing_pgoff.unwrap_or(0) << MMArch::PAGE_SHIFT);
                 let fend = fstart + (core::cmp::min(end, vm_end) - start) - 1;
                 let old_start = start;
                 start = vm_end;

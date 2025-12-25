@@ -122,7 +122,7 @@ pub fn open_proc_maps(pid: RawPid, pdata: &mut ProcfsFilePrivateData) -> Result<
 
         let perms = perms_from_vm_flags(vm_flags);
         let offset = g
-            .file_page_offset()
+            .backing_page_offset()
             .unwrap_or(0)
             .saturating_mul(MMArch::PAGE_SIZE);
 

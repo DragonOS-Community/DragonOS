@@ -412,8 +412,8 @@ impl InnerAddressSpace {
                     if vm_flags.contains(VmFlags::VM_SHARED) {
                         let mut g = vma.lock_irqsave();
                         g.shared_anon = Some(AnonSharedMapping::new(count.data()));
-                        // Use file_pgoff as the backing object page offset base for shared-anon.
-                        g.file_pgoff = Some(0);
+                        // Set backing_pgoff to 0 as the base offset for shared-anon mappings.
+                        g.backing_pgoff = Some(0);
                     }
                     Ok(vma)
                 } else {
@@ -428,7 +428,7 @@ impl InnerAddressSpace {
                     if vm_flags.contains(VmFlags::VM_SHARED) {
                         let mut g = vma.lock_irqsave();
                         g.shared_anon = Some(AnonSharedMapping::new(count.data()));
-                        g.file_pgoff = Some(0);
+                        g.backing_pgoff = Some(0);
                     }
                     Ok(vma)
                 }
@@ -730,7 +730,7 @@ impl InnerAddressSpace {
             let vma_start = region.start();
             let off_pages =
                 (old_vaddr.data().saturating_sub(vma_start.data())) >> MMArch::PAGE_SHIFT;
-            let base = g.file_page_offset().unwrap_or(0).saturating_add(off_pages);
+            let base = g.backing_page_offset().unwrap_or(0).saturating_add(off_pages);
             (region, g.vm_file(), g.shared_anon.clone(), base)
         };
 
@@ -826,7 +826,7 @@ impl InnerAddressSpace {
             if let Some(shared) = shared_anon.clone() {
                 let mut vg = vma.lock_irqsave();
                 vg.shared_anon = Some(shared);
-                vg.file_pgoff = Some(base_pgoff);
+                vg.backing_pgoff = Some(base_pgoff);
             }
             self.mappings.insert_vma(vma.clone());
             vma
@@ -1679,7 +1679,7 @@ impl LockedVMA {
             let mut vma: VMA = unsafe { guard.clone() };
             vma.region = virt_region;
             vma.mapped = false;
-            // file_pgoff 保持不变，before VMA 使用原始的offset
+            // backing_pgoff 保持不变，before VMA 使用原始的offset
             let vma: Arc<LockedVMA> = LockedVMA::new(vma);
             vma
         });
@@ -1688,12 +1688,12 @@ impl LockedVMA {
             let mut vma: VMA = unsafe { guard.clone() };
             vma.region = virt_region;
             vma.mapped = false;
-            // after VMA 需要调整file_pgoff
+            // after VMA 需要调整backing_pgoff
             // after 区域的起始地址相对于原始VMA起始地址的偏移（以页为单位）
-            if let Some(original_pgoff) = vma.file_pgoff {
+            if let Some(original_pgoff) = vma.backing_pgoff {
                 let offset_pages =
                     (virt_region.start() - guard.region.start()) >> MMArch::PAGE_SHIFT;
-                vma.file_pgoff = Some(original_pgoff + offset_pages);
+                vma.backing_pgoff = Some(original_pgoff + offset_pages);
             }
             let vma: Arc<LockedVMA> = LockedVMA::new(vma);
             vma
@@ -1727,14 +1727,14 @@ impl LockedVMA {
             }
         }
 
-        // 调整middle VMA的region和file_pgoff
+        // 调整middle VMA的region和backing_pgoff
         let original_start = guard.region.start();
         guard.region = region;
-        // middle VMA 需要调整file_pgoff
+        // middle VMA 需要调整backing_pgoff
         // middle 区域的起始地址相对于原始VMA起始地址的偏移（以页为单位）
-        if let Some(original_pgoff) = guard.file_pgoff {
+        if let Some(original_pgoff) = guard.backing_pgoff {
             let offset_pages = (region.start() - original_start) >> MMArch::PAGE_SHIFT;
-            guard.file_pgoff = Some(original_pgoff + offset_pages);
+            guard.backing_pgoff = Some(original_pgoff + offset_pages);
         }
 
         return Some(VMASplitResult::new(
@@ -1833,8 +1833,8 @@ pub struct VMA {
     self_ref: Weak<LockedVMA>,
 
     vm_file: Option<Arc<File>>,
-    /// VMA映射的文件部分相对于整个文件的偏移页数
-    file_pgoff: Option<usize>,
+    /// VMA映射的后备对象(文件/共享匿名)相对于整个后备对象的偏移页数
+    backing_pgoff: Option<usize>,
 
     provider: Provider,
     /// 关联的 SysV SHM 标识（当此 VMA 来自 shmat 时设置）
@@ -1949,7 +1949,7 @@ impl VMA {
             self_ref: Weak::default(),
             provider: Provider::Allocated,
             vm_file: file,
-            file_pgoff: pgoff,
+            backing_pgoff: pgoff,
             shm_id: None,
             shared_anon: None,
         }
@@ -2006,7 +2006,7 @@ impl VMA {
             user_address_space: self.user_address_space.clone(),
             self_ref: self.self_ref.clone(),
             provider: Provider::Allocated,
-            file_pgoff: self.file_pgoff,
+            backing_pgoff: self.backing_pgoff,
             vm_file: self.vm_file.clone(),
             shm_id: self.shm_id,
             shared_anon: self.shared_anon.clone(),
@@ -2022,7 +2022,7 @@ impl VMA {
             user_address_space: None,
             self_ref: Weak::default(),
             provider: Provider::Allocated,
-            file_pgoff: self.file_pgoff,
+            backing_pgoff: self.backing_pgoff,
             vm_file: self.vm_file.clone(),
             shm_id: self.shm_id,
             shared_anon: self.shared_anon.clone(),
@@ -2035,8 +2035,8 @@ impl VMA {
     }
 
     #[inline(always)]
-    pub fn file_page_offset(&self) -> Option<usize> {
-        return self.file_pgoff;
+    pub fn backing_page_offset(&self) -> Option<usize> {
+        return self.backing_pgoff;
     }
 
     pub fn pages(&self) -> VirtPageFrameIter {
@@ -2223,9 +2223,9 @@ impl VMA {
     }
 
     pub fn page_address(&self, index: usize) -> Result<VirtAddr, SystemError> {
-        if index >= self.file_pgoff.unwrap() {
+        if index >= self.backing_pgoff.unwrap() {
             let address =
-                self.region.start + ((index - self.file_pgoff.unwrap()) << MMArch::PAGE_SHIFT);
+                self.region.start + ((index - self.backing_pgoff.unwrap()) << MMArch::PAGE_SHIFT);
             if address <= self.region.end() {
                 return Ok(address);
             }

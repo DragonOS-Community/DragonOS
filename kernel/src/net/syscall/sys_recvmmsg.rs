@@ -94,12 +94,13 @@ impl Syscall for SysRecvmmsgHandle {
         let total_len = vlen
             .checked_mul(core::mem::size_of::<MMsgHdr>())
             .ok_or(SystemError::EINVAL)?;
-        let mut msg_writer = UserBufferWriter::new(msgvec, total_len, frame.is_from_user())?;
-        let msgs = msg_writer.buffer::<MMsgHdr>(0)?;
+        // Validate msgvec memory (read/write) up front.
+        let _ = UserBufferReader::new(msgvec as *const u8, total_len, frame.is_from_user())?;
+        let _ = UserBufferWriter::new(msgvec as *mut u8, total_len, frame.is_from_user())?;
 
         let mut received: usize = 0;
 
-        for msg in msgs.iter_mut().take(vlen) {
+        for i in 0..vlen {
             // For i>0, force nonblocking if we're in WAITFORONE/timeout mode.
             let mut this_flags = flags;
             if received > 0 && wait_for_one {
@@ -117,9 +118,25 @@ impl Syscall for SysRecvmmsgHandle {
                 wait_readable_with_timeout(sock, timeout_dur)?;
             }
 
-            match crate::net::syscall::sys_recvmsg::do_recvmsg(fd, &mut msg.msg_hdr, this_flags) {
+            let base = unsafe { (msgvec as *mut u8).add(i * core::mem::size_of::<MMsgHdr>()) };
+            let msg_hdr_ptr = base as *mut MsgHdr;
+
+            match crate::net::syscall::sys_recvmsg::do_recvmsg(
+                fd,
+                msg_hdr_ptr,
+                this_flags,
+                frame.is_from_user(),
+            ) {
                 Ok(n) => {
-                    msg.msg_len = n as u32;
+                    let msg_len_off = core::mem::offset_of!(MMsgHdr, msg_len);
+                    let mut writer = UserBufferWriter::new(
+                        unsafe { base.add(msg_len_off) },
+                        core::mem::size_of::<u32>(),
+                        frame.is_from_user(),
+                    )?;
+                    writer
+                        .buffer_protected(0)?
+                        .write_one::<u32>(0, &(n as u32))?;
                     received += 1;
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {

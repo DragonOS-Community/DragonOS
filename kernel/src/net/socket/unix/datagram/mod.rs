@@ -544,11 +544,12 @@ impl UnixDatagramSocket {
         rights: Vec<Arc<File>>,
         force_creds: bool,
     ) -> Result<usize, SystemError> {
-        if self.is_write_shutdown.load(Ordering::Relaxed) {
+        if self.is_write_shutdown.load(Ordering::Acquire) {
             return Err(SystemError::EPIPE);
         }
 
-        if buffer.len() > Self::MAX_MSG_SIZE {
+        let buf_len = buffer.len();
+        if buf_len > Self::MAX_MSG_SIZE {
             return Err(SystemError::EMSGSIZE);
         }
 
@@ -557,23 +558,23 @@ impl UnixDatagramSocket {
             .lookup(target_addr)
             .ok_or(SystemError::ECONNREFUSED)?;
 
-        if target_socket.is_read_shutdown.load(Ordering::Relaxed) {
+        if target_socket.is_read_shutdown.load(Ordering::Acquire) {
             return Err(SystemError::EPIPE);
         }
 
         // 获取发送方地址
-        let sender_addr = self.inner.lock().local_endpoint();
+        let sender_addr = { self.inner.lock().local_endpoint() };
 
         // 发送侧 SO_SNDBUF 记账。gVisor 用例依赖：缓冲区满时非阻塞 send 返回 EWOULDBLOCK，
         // 增大 SO_SNDBUF 后可继续 send。
-        self.try_account_send_buffer(buffer.len())?;
+        self.try_account_send_buffer(buf_len)?;
 
         // Attach SCM_CREDENTIALS if:
         // - sender explicitly asked via sendmsg SCM_CREDENTIALS, or
         // - SO_PASSCRED was enabled on either endpoint at send time.
         let attach_creds = force_creds
-            || self.passcred.load(Ordering::Relaxed)
-            || target_socket.passcred.load(Ordering::Relaxed);
+            || self.passcred.load(Ordering::Acquire)
+            || target_socket.passcred.load(Ordering::Acquire);
         let creds = if attach_creds {
             Some(current_ucred())
         } else {
@@ -588,7 +589,7 @@ impl UnixDatagramSocket {
             let mut target_inner = target_socket.inner.lock();
             if let Err(e) = target_inner.push_message(msg) {
                 // 回滚记账并返回错误
-                self.unaccount_send_buffer(buffer.len());
+                self.unaccount_send_buffer(buf_len);
                 return Err(e);
             }
         }
@@ -607,7 +608,7 @@ impl UnixDatagramSocket {
         // 发送 fasync 信号
         target_socket.fasync_items.send_sigio();
 
-        Ok(buffer.len())
+        Ok(buf_len)
     }
 
     /// 从接收队列接收数据报
@@ -809,7 +810,7 @@ impl Socket for UnixDatagramSocket {
                 let mut v = [0u8; 4];
                 v.copy_from_slice(&optval[..4]);
                 let on = i32::from_ne_bytes(v) != 0;
-                self.passcred.store(on, Ordering::Relaxed);
+                self.passcred.store(on, Ordering::Release);
                 Ok(())
             }
             _ => Err(SystemError::ENOPROTOOPT),
@@ -910,9 +911,8 @@ impl Socket for UnixDatagramSocket {
         let peek = flags.contains(PMSG::PEEK);
 
         let (payload_copy_len, sender_addr, orig_len, rights, creds) = if nonblock {
-            let mut inner = self.inner.lock();
-
             if peek {
+                let inner = self.inner.lock();
                 let msg_in = inner
                     .recv_queue
                     .front()
@@ -930,9 +930,13 @@ impl Socket for UnixDatagramSocket {
                     msg_in.creds,
                 )
             } else {
-                let msg_in = inner
-                    .pop_message()
-                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+                // Pop first (short lock), then copy/compute outside.
+                let msg_in = {
+                    let mut inner = self.inner.lock();
+                    inner
+                        .pop_message()
+                        .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+                };
 
                 let orig_len = msg_in.data.len();
                 let copy_len = core::cmp::min(buf_cap, orig_len);
@@ -1004,7 +1008,7 @@ impl Socket for UnixDatagramSocket {
         let endpoint = sender_addr
             .map(|a| Endpoint::Unix(a.into()))
             .unwrap_or(Endpoint::Unix(UnixEndpoint::Unnamed));
-        endpoint.write_to_user(msg.msg_name, &mut msg.msg_namelen as *mut u32)?;
+        msg.msg_namelen = endpoint.write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
 
         msg.msg_flags = 0;
         if orig_len > buf_cap {
@@ -1016,7 +1020,7 @@ impl Socket for UnixDatagramSocket {
         let control_len = msg.msg_controllen;
         msg.msg_controllen = 0;
 
-        let want_creds = self.passcred.load(Ordering::Relaxed);
+        let want_creds = self.passcred.load(Ordering::Acquire);
         let has_rights = !rights.is_empty();
 
         if !want_creds && !has_rights {
@@ -1132,7 +1136,6 @@ impl Socket for UnixDatagramSocket {
             .ok_or(SystemError::EDESTADDRREQ)?;
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
-
         if nonblock {
             return Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &peer_addr));
         }
@@ -1265,7 +1268,6 @@ impl Socket for UnixDatagramSocket {
         let target_addr = unix_endpoint.connect()?;
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
-
         if nonblock {
             return Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &target_addr));
         }
@@ -1334,7 +1336,7 @@ impl Socket for UnixDatagramSocket {
                 if value.len() < 4 {
                     return Err(SystemError::EINVAL);
                 }
-                let v: i32 = if self.passcred.load(Ordering::Relaxed) {
+                let v: i32 = if self.passcred.load(Ordering::Acquire) {
                     1
                 } else {
                     0
@@ -1376,10 +1378,10 @@ impl Socket for UnixDatagramSocket {
 
     fn shutdown(&self, _how: socket::common::ShutdownBit) -> Result<(), SystemError> {
         if _how.is_recv_shutdown() {
-            self.is_read_shutdown.store(true, Ordering::Relaxed);
+            self.is_read_shutdown.store(true, Ordering::Release);
         }
         if _how.is_send_shutdown() {
-            self.is_write_shutdown.store(true, Ordering::Relaxed);
+            self.is_write_shutdown.store(true, Ordering::Release);
         }
 
         self.wait_queue

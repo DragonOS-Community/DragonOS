@@ -27,7 +27,7 @@ struct ScmRecord {
 ///
 /// todo 在unix socket中使用的T是u8,后续应该改成抽象的包，而不是原始的u8数组，
 #[derive(Debug)]
-pub struct RingBuffer<T> {
+pub struct RingBuffer<T: Pod> {
     buffer: RwLock<Vec<T>>,
     head: AtomicUsize,
     tail: AtomicUsize,
@@ -45,13 +45,13 @@ pub struct RingBuffer<T> {
 }
 
 #[derive(Debug)]
-pub struct Producer<T, R: Deref<Target = RingBuffer<T>>> {
+pub struct Producer<T: Pod, R: Deref<Target = RingBuffer<T>>> {
     ring_buffer: R,
     phantom: PhantomData<T>,
 }
 
 #[derive(Debug)]
-pub struct Consumer<T, R: Deref<Target = RingBuffer<T>>> {
+pub struct Consumer<T: Pod, R: Deref<Target = RingBuffer<T>>> {
     ring_buffer: R,
     _marker: PhantomData<T>,
 }
@@ -59,7 +59,7 @@ pub struct Consumer<T, R: Deref<Target = RingBuffer<T>>> {
 pub type RbProducer<T> = Producer<T, Arc<RingBuffer<T>>>;
 pub type RbConsumer<T> = Consumer<T, Arc<RingBuffer<T>>>;
 
-impl<T> RingBuffer<T> {
+impl<T: Pod> RingBuffer<T> {
     pub fn new(capacity: usize) -> Self {
         assert!(
             capacity.is_power_of_two(),
@@ -67,8 +67,8 @@ impl<T> RingBuffer<T> {
         );
 
         let mut buffer = Vec::with_capacity(capacity);
-        // 预先填充缓冲区以确保其长度等于容量
-        buffer.resize_with(capacity, || unsafe { core::mem::zeroed() });
+        // 预先填充缓冲区以确保其长度等于容量（Pod 保证 zeroed 安全）
+        buffer.resize_with(capacity, T::new_zeroed);
 
         Self {
             buffer: RwLock::new(buffer),
@@ -291,7 +291,7 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     }
 }
 
-impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
+impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn is_recv_shutdown(&self) -> bool {
         self.ring_buffer.is_recv_shutdown()
     }
@@ -315,7 +315,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 }
 
 #[inherit_methods(from = "self.ring_buffer")]
-impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
+impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn capacity(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn is_full(&self) -> bool;
@@ -458,7 +458,7 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     }
 }
 
-impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[allow(dead_code)]
     pub fn is_recv_shutdown(&self) -> bool {
         self.ring_buffer.is_recv_shutdown()
@@ -482,7 +482,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 }
 
 #[inherit_methods(from = "self.ring_buffer")]
-impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     pub fn capacity(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn is_full(&self) -> bool;

@@ -7,7 +7,7 @@ use crate::net::posix::MsgHdr;
 use crate::net::socket;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::UserBufferWriter;
+use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -41,12 +41,7 @@ impl Syscall for SysRecvmsgHandle {
         let msg = Self::msg(args);
         let flags = Self::flags(args);
 
-        // Create UserBufferWriter for MsgHdr
-        let mut user_buffer_writer =
-            UserBufferWriter::new(msg, core::mem::size_of::<MsgHdr>(), frame.is_from_user())?;
-        let msg_hdr = user_buffer_writer.buffer::<MsgHdr>(0)?;
-
-        do_recvmsg(fd, &mut msg_hdr[0], flags)
+        do_recvmsg(fd, msg, flags, frame.is_from_user())
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -88,15 +83,28 @@ syscall_table_macros::declare_syscall!(SYS_RECVMSG, SysRecvmsgHandle);
 ///
 /// # Arguments
 /// * `fd` - File descriptor
-/// * `msg` - Message header
+/// * `msg` - Message header pointer (user space)
 /// * `flags` - Flags
 ///
 /// # Returns
 /// * `Ok(usize)` - Number of bytes received
 /// * `Err(SystemError)` - Error code if operation fails
-pub(super) fn do_recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usize, SystemError> {
-    // 检查每个缓冲区地址是否合法，生成iovecs
-    let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+pub(super) fn do_recvmsg(
+    fd: usize,
+    msg: *mut MsgHdr,
+    flags: u32,
+    from_user: bool,
+) -> Result<usize, SystemError> {
+    if msg.is_null() {
+        return Err(SystemError::EFAULT);
+    }
+
+    // Copy msghdr in once to avoid TOCTOU on pointers/lengths.
+    let reader = UserBufferReader::new(msg, core::mem::size_of::<MsgHdr>(), from_user)?;
+    let mut kmsg = reader.buffer_protected(0)?.read_one::<MsgHdr>(0)?;
+
+    // 检查每个缓冲区地址是否合法，生成iovecs（fallback path needs this).
+    let iovs = unsafe { IoVecs::from_user(kmsg.msg_iov, kmsg.msg_iovlen, true)? };
 
     // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
     let file_nonblock = {
@@ -116,7 +124,7 @@ pub(super) fn do_recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usiz
         }
 
         // 优先使用 recv_msg 以便实现 msg_flags/msg_controllen 等语义。
-        match socket.recv_msg(msg, pmsg_flags) {
+        match socket.recv_msg(&mut kmsg, pmsg_flags) {
             Ok(recv_size) => (alloc::vec::Vec::new(), recv_size, true),
             Err(SystemError::ENOSYS) => {
                 let mut buf = iovs.new_buf(true);
@@ -137,8 +145,23 @@ pub(super) fn do_recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usiz
     if !used_recv_msg {
         // 最小保证：不产生控制消息时必须把 msg_controllen 写回 0
         // 否则用户态 CMSG_FIRSTHDR 可能非空。
-        msg.msg_controllen = 0;
+        kmsg.msg_controllen = 0;
+        kmsg.msg_flags = 0;
     }
+
+    // Copy out only the result fields that Linux updates.
+    let mut writer =
+        UserBufferWriter::new(msg as *mut u8, core::mem::size_of::<MsgHdr>(), from_user)?;
+    let mut out = writer.buffer_protected(0)?;
+
+    let namelen_off = core::mem::offset_of!(MsgHdr, msg_namelen);
+    out.write_one::<u32>(namelen_off, &kmsg.msg_namelen)?;
+
+    let controllen_off = core::mem::offset_of!(MsgHdr, msg_controllen);
+    out.write_one::<usize>(controllen_off, &kmsg.msg_controllen)?;
+
+    let flags_off = core::mem::offset_of!(MsgHdr, msg_flags);
+    out.write_one::<i32>(flags_off, &kmsg.msg_flags)?;
 
     Ok(recv_size)
 }

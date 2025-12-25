@@ -7,7 +7,7 @@ use crate::{
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
-        vfs::{syscall::ModeType, IndexNode},
+        vfs::{IndexNode, InodeMode},
     },
     smp::cpu::smp_cpu_manager,
 };
@@ -21,7 +21,7 @@ pub struct CpuInfoFileOps;
 
 impl CpuInfoFileOps {
     pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self, ModeType::S_IRUGO)
+        ProcFileBuilder::new(Self, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()

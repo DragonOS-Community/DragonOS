@@ -211,16 +211,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             spin_loop();
         }
     }
-    let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
-    let r = migrate_virtual_filesystem(fatfs);
-
-    if r.is_err() {
-        error!("Failed to migrate virtual filesystem to FAT32!");
-        loop {
-            spin_loop();
-        }
-    }
-    info!("Successfully migrate rootfs to FAT32!");
+    info!("Successfully migrate rootfs to {}!", fs_name);
 
     return Ok(());
 }

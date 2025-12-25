@@ -7,20 +7,38 @@ use crate::{
             },
             Builder,
         },
-        vfs::{syscall::ModeType, IndexNode},
+        vfs::{IndexNode, InodeMode},
     },
     process::{ProcessControlBlock, ProcessManager, RawPid},
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
+mod cmdline;
 mod exe;
 mod fd;
+mod fdinfo;
+mod maps;
+mod mountinfo;
+mod mounts;
+mod ns;
+pub mod stat;
+mod statm;
 mod status;
+mod task;
 
+use cmdline::CmdlineFileOps;
 use exe::ExeSymOps;
 use fd::FdDirOps;
+use fdinfo::FdInfoDirOps;
+use maps::MapsFileOps;
+use mountinfo::MountInfoFileOps;
+use mounts::PidMountsFileOps;
+use ns::NsDirOps;
+use stat::StatFileOps;
+use statm::StatmFileOps;
 use status::StatusFileOps;
+use task::TaskDirOps;
 
 /// /proc/[pid] 目录的 DirOps 实现
 #[derive(Debug)]
@@ -31,7 +49,7 @@ pub struct PidDirOps {
 
 impl PidDirOps {
     pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self { pid }, ModeType::from_bits_truncate(0o555))
+        ProcDirBuilder::new(Self { pid }, InodeMode::from_bits_truncate(0o555))
             .parent(parent)
             .volatile() // PID 目录是易失的，因为它们与特定进程关联
             .build()
@@ -50,9 +68,29 @@ impl PidDirOps {
         &'static str,
         fn(&PidDirOps, Weak<dyn IndexNode>) -> Arc<dyn IndexNode>,
     )] = &[
+        ("cmdline", |ops, parent| {
+            CmdlineFileOps::new_inode(ops.pid, parent)
+        }),
+        ("maps", |ops, parent| {
+            MapsFileOps::new_inode(ops.pid, parent)
+        }),
+        ("mountinfo", |ops, parent| {
+            MountInfoFileOps::new_inode(ops.pid, parent)
+        }),
+        ("mounts", |ops, parent| {
+            PidMountsFileOps::new_inode(ops.pid, parent)
+        }),
+        ("ns", |ops, parent| NsDirOps::new_inode(ops.pid, parent)),
+        ("stat", |ops, parent| {
+            StatFileOps::new_inode(ops.pid, parent)
+        }),
+        ("statm", |ops, parent| {
+            StatmFileOps::new_inode(ops.pid, parent)
+        }),
         ("status", |ops, parent| {
             StatusFileOps::new_inode(ops.pid, parent)
         }),
+        ("task", |ops, parent| TaskDirOps::new_inode(ops.pid, parent)),
         ("exe", |ops, parent| ExeSymOps::new_inode(ops.pid, parent)),
         ("fd", |ops, parent| {
             // fd 目录仍然需要进程引用来列出文件描述符
@@ -78,7 +116,37 @@ impl PidDirOps {
                     }
                 }
 
-                ProcDirBuilder::new(EmptyDirOps, ModeType::from_bits_truncate(0o500))
+                ProcDirBuilder::new(EmptyDirOps, InodeMode::from_bits_truncate(0o500))
+                    .parent(parent)
+                    .build()
+                    .unwrap()
+            }
+        }),
+        ("fdinfo", |ops, parent| {
+            // fdinfo 目录也需要进程引用来列出文件描述符
+            if let Some(process) = ops.get_process() {
+                FdInfoDirOps::new_inode(process, parent)
+            } else {
+                // 进程已退出，创建空目录
+                use crate::filesystem::procfs::template::ProcDirBuilder;
+
+                #[derive(Debug)]
+                struct EmptyDirOps;
+                impl DirOps for EmptyDirOps {
+                    fn lookup_child(
+                        &self,
+                        _dir: &ProcDir<Self>,
+                        _name: &str,
+                    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+                        Err(SystemError::ENOENT)
+                    }
+
+                    fn populate_children(&self, _dir: &ProcDir<Self>) {
+                        // 空目录，无需填充
+                    }
+                }
+
+                ProcDirBuilder::new(EmptyDirOps, InodeMode::from_bits_truncate(0o500))
                     .parent(parent)
                     .build()
                     .unwrap()

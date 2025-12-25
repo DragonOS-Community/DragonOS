@@ -1,12 +1,12 @@
 use crate::filesystem::{
     procfs::template::{DirOps, FileOps, ProcDir, ProcFile, ProcSym, SymOps},
-    vfs::{syscall::ModeType, FileSystem, IndexNode},
+    vfs::{FileSystem, IndexNode, InodeMode},
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 struct BuilderCommon {
-    mode: ModeType,
+    mode: InodeMode,
     parent: Option<Weak<dyn IndexNode>>,
     fs: Option<Weak<dyn FileSystem>>,
     is_volatile: bool,
@@ -14,7 +14,7 @@ struct BuilderCommon {
 }
 
 impl BuilderCommon {
-    fn new(mode: ModeType) -> Self {
+    fn new(mode: InodeMode) -> Self {
         Self {
             mode,
             parent: None,
@@ -40,7 +40,7 @@ impl BuilderCommon {
 pub trait Builder<Ops> {
     type Output;
 
-    fn new(ops: Ops, mode: ModeType) -> Self;
+    fn new(ops: Ops, mode: InodeMode) -> Self;
     fn build(self) -> Result<Arc<Self::Output>, SystemError>;
 }
 
@@ -67,7 +67,7 @@ where
     /// # 参数
     /// - `file`: 实现了 FileOps trait 的文件操作对象
     /// - `mode`: 文件权限模式
-    fn new(file: F, mode: ModeType) -> Self {
+    fn new(file: F, mode: InodeMode) -> Self {
         Self {
             file,
             common: BuilderCommon::new(mode),
@@ -132,7 +132,7 @@ where
     /// # 参数
     /// - `dir`: 实现了 DirOps trait 的目录操作对象
     /// - `mode`: 目录权限模式
-    fn new(dir: D, mode: ModeType) -> Self {
+    fn new(dir: D, mode: InodeMode) -> Self {
         Self {
             dir,
             common: BuilderCommon::new(mode),
@@ -192,7 +192,7 @@ where
     /// # 参数
     /// - `sym`: 实现了 SymOps trait 的符号链接操作对象
     /// - `mode`: 符号链接权限模式
-    fn new(sym: S, mode: ModeType) -> Self {
+    fn new(sym: S, mode: InodeMode) -> Self {
         Self {
             sym,
             common: BuilderCommon::new(mode),

@@ -8,7 +8,7 @@ use crate::{
             template::{Builder, FileOps, ProcFileBuilder},
             utils::{proc_read, trim_string},
         },
-        vfs::{syscall::ModeType, FilePrivateData, IndexNode},
+        vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::allocator::page_frame::FrameAllocator,
 };
@@ -26,7 +26,7 @@ pub struct MeminfoFileOps;
 
 impl MeminfoFileOps {
     pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self, ModeType::S_IRUGO) // 0444 - 所有用户可读
+        ProcFileBuilder::new(Self, InodeMode::S_IRUGO) // 0444 - 所有用户可读
             .parent(parent)
             .build()
             .unwrap()

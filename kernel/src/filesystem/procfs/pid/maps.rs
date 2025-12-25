@@ -1,28 +1,44 @@
-//! Minimal implementation of `/proc/<pid>/maps`.
+//! /proc/[pid]/maps - 进程内存映射信息
 //!
-//! The gVisor syscall tests use `/proc/self/maps` to detect whether x86 vsyscall
-//! is enabled. Even if vsyscall is not mapped/enabled, `/proc/self/maps` must
-//! exist and be readable.
-//!
-//! This module keeps the implementation high-cohesion/low-coupling by:
-//! - taking a `RawPid` and returning textual maps content
-//! - not depending on procfs inode internals beyond `ProcfsFilePrivateData`
-
-use alloc::string::ToString;
-
-use alloc::{format, string::String, vec::Vec};
-use system_error::SystemError;
+//! 返回进程的内存映射信息，格式兼容 Linux procfs
 
 use crate::{
     arch::MMArch,
-    filesystem::vfs::IndexNode,
+    filesystem::{
+        procfs::{
+            template::{Builder, FileOps, ProcFileBuilder},
+            utils::proc_read,
+        },
+        vfs::{FilePrivateData, IndexNode, InodeMode},
+    },
+    libs::spinlock::SpinLockGuard,
+    mm::{ucontext::LockedVMA, MemoryManagementArch, VmFlags},
     process::{ProcessManager, RawPid},
 };
+use alloc::{
+    format,
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use system_error::SystemError;
 
-use crate::mm::{ucontext::LockedVMA, MemoryManagementArch, VmFlags};
+/// /proc/[pid]/maps 文件的 FileOps 实现
+#[derive(Debug)]
+pub struct MapsFileOps {
+    pid: RawPid,
+}
 
-use super::ProcfsFilePrivateData;
+impl MapsFileOps {
+    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { pid }, InodeMode::S_IRUGO)
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+}
 
+/// 将 VmFlags 转换为权限字符串
 #[inline(never)]
 fn perms_from_vm_flags(vm_flags: VmFlags) -> [u8; 4] {
     let r = if vm_flags.contains(VmFlags::VM_READ) {
@@ -48,24 +64,21 @@ fn perms_from_vm_flags(vm_flags: VmFlags) -> [u8; 4] {
     [r, w, x, s]
 }
 
+/// 格式化设备号、inode 和路径
 #[inline(never)]
 fn format_dev_inode_and_path(
     file_inode: Option<&dyn IndexNode>,
     root_prefix: &str,
 ) -> (String, String) {
     if let Some(inode) = file_inode {
-        // Best-effort: dev/inode and path are not strictly required by the tests.
         let (dev, ino, path) = match inode.metadata() {
             Ok(md) => {
                 let dev = format!("{:02x}:{:02x}", (md.dev_id >> 8) & 0xff, md.dev_id & 0xff);
                 let ino = md.inode_id.into();
                 let mut path = inode.absolute_path().unwrap_or_default();
-                // Respect process chroot: if we can compute the process root's absolute prefix,
-                // strip it from the inode's global absolute path so `/proc/<pid>/maps` doesn't
-                // leak the pre-chroot path.
+                // 尊重进程的 chroot：去掉根目录前缀
                 if !root_prefix.is_empty() && root_prefix != "/" {
                     if let Some(rest) = path.strip_prefix(root_prefix) {
-                        // Ensure the result is rooted.
                         path = if rest.is_empty() {
                             "/".to_string()
                         } else if rest.starts_with('/') {
@@ -89,16 +102,11 @@ fn format_dev_inode_and_path(
     (String::from("00:00 0"), String::new())
 }
 
-/// Generate `/proc/<pid>/maps` textual content into `pdata`.
-///
-/// Format (Linux-like):
-/// `start-end perms offset dev:inode pathname`
-#[inline(never)]
-pub fn open_proc_maps(pid: RawPid, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
-    let target_pcb = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
+/// 生成 /proc/[pid]/maps 内容
+fn generate_maps_content(pid: RawPid) -> Result<Vec<u8>, SystemError> {
+    let target_pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
 
     let vm = target_pcb.basic().user_vm().ok_or(SystemError::EINVAL)?;
-    // Compute the target process root prefix for chroot-aware path formatting.
     let root_prefix = target_pcb
         .fs_struct()
         .root()
@@ -107,13 +115,11 @@ pub fn open_proc_maps(pid: RawPid, pdata: &mut ProcfsFilePrivateData) -> Result<
 
     let as_guard = vm.read();
 
-    // Collect and sort by address to match Linux ordering.
-    let mut vmas: Vec<alloc::sync::Arc<LockedVMA>> =
-        as_guard.mappings.iter_vmas().cloned().collect();
+    // 收集并按地址排序
+    let mut vmas: Vec<Arc<LockedVMA>> = as_guard.mappings.iter_vmas().cloned().collect();
     vmas.sort_by_key(|v| v.lock_irqsave().region().start().data());
 
-    let out: &mut Vec<u8> = &mut pdata.data;
-    out.clear();
+    let mut out: Vec<u8> = Vec::new();
 
     for vma in vmas {
         let g = vma.lock_irqsave();
@@ -133,7 +139,6 @@ pub fn open_proc_maps(pid: RawPid, pdata: &mut ProcfsFilePrivateData) -> Result<
             format_dev_inode_and_path(None, &root_prefix)
         };
 
-        // Linux prints addresses as fixed-width hex; we keep it simple but valid.
         let line = format!(
             "{:016x}-{:016x} {}{}{}{} {:08x} {}{}\n",
             region.start().data(),
@@ -149,10 +154,23 @@ pub fn open_proc_maps(pid: RawPid, pdata: &mut ProcfsFilePrivateData) -> Result<
         out.extend_from_slice(line.as_bytes());
     }
 
-    // Ensure file ends with '\n' even for empty mappings.
+    // 确保文件以换行符结尾
     if out.is_empty() {
         out.extend_from_slice(b"\n");
     }
 
-    Ok(out.len() as i64)
+    Ok(out)
+}
+
+impl FileOps for MapsFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let content = generate_maps_content(self.pid)?;
+        proc_read(offset, len, buf, &content)
+    }
 }

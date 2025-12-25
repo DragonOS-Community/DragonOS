@@ -12,14 +12,17 @@ use crate::{
             mounts::MountsFileOps,
             pid::PidDirOps,
             self_::SelfSymOps,
+            sys::SysDirOps,
             template::{
                 lookup_child_from_table, populate_children_from_table, DirOps, ProcDir,
                 ProcDirBuilder,
             },
+            thread_self::ThreadSelfDirOps,
             version::VersionFileOps,
+            version_signature::VersionSignatureFileOps,
             Builder, PROCFS_BLOCK_SIZE, PROCFS_MAX_NAMELEN,
         },
-        vfs::{syscall::ModeType, IndexNode},
+        vfs::{IndexNode, InodeMode},
     },
     process::{ProcessManager, RawPid},
 };
@@ -39,7 +42,7 @@ impl RootDirOps {
     pub fn new_inode(fs: Weak<ProcFS>) -> Arc<dyn IndexNode> {
         //todo 这里要注册一个observer，用于动态创建进程目录
 
-        ProcDirBuilder::new(Self, ModeType::from_bits_truncate(0o555))
+        ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
             .fs(fs)
             .build()
             .unwrap()
@@ -58,7 +61,10 @@ impl RootDirOps {
         ("meminfo", MeminfoFileOps::new_inode),
         ("mounts", MountsFileOps::new_inode),
         ("self", SelfSymOps::new_inode),
+        ("sys", SysDirOps::new_inode),
+        ("thread-self", ThreadSelfDirOps::new_inode),
         ("version", VersionFileOps::new_inode),
+        ("version_signature", VersionSignatureFileOps::new_inode),
     ];
 }
 

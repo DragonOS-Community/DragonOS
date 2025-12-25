@@ -5,7 +5,7 @@
 use crate::{
     filesystem::{
         procfs::template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
-        vfs::{syscall::ModeType, IndexNode},
+        vfs::{IndexNode, InodeMode},
     },
     process::{ProcessControlBlock, ProcessManager, RawPid},
 };
@@ -30,7 +30,7 @@ impl FdDirOps {
         parent: Weak<dyn IndexNode>,
     ) -> Arc<dyn IndexNode> {
         let pid = process_ref.raw_pid();
-        ProcDirBuilder::new(Self { pid }, ModeType::from_bits_truncate(0o500)) // dr-x------
+        ProcDirBuilder::new(Self { pid }, InodeMode::from_bits_truncate(0o500)) // dr-x------
             .parent(parent)
             .volatile() // fd 是易失的，因为它们与特定进程关联
             .build()
@@ -118,7 +118,7 @@ pub struct FdSymOps {
 
 impl FdSymOps {
     pub fn new_inode(pid: RawPid, fd: i32, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcSymBuilder::new(Self { pid, fd }, ModeType::from_bits_truncate(0o700)) // lrwx------
+        ProcSymBuilder::new(Self { pid, fd }, InodeMode::from_bits_truncate(0o700)) // lrwx------
             .parent(parent)
             .volatile()
             .build()

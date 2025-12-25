@@ -5,7 +5,7 @@ use core::{
     intrinsics::unlikely,
     mem::ManuallyDrop,
     str::FromStr,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 use alloc::{

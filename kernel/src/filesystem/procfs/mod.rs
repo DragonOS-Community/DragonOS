@@ -8,22 +8,25 @@ use system_error::SystemError;
 use crate::{libs::once::Once, process::ProcessManager};
 
 use super::vfs::mount::{MountFlags, MountPath};
-use super::vfs::syscall::ModeType;
+use super::vfs::InodeMode;
 
 mod cmdline;
 mod cpuinfo;
+pub mod klog;
 pub mod kmsg;
 mod kmsg_file;
-pub mod log;
 mod meminfo;
 mod mounts;
 mod pid;
 pub mod root;
 mod self_;
+mod sys;
 mod syscall;
 pub(super) mod template;
+mod thread_self;
 mod utils;
 mod version;
+mod version_signature;
 
 // 重新导出 ProcFS
 pub use root::ProcFS;
@@ -65,7 +68,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
         let root_inode = ProcessManager::current_mntns().root_inode();
         // procfs 挂载
         let mntfs = root_inode
-            .mkdir("proc", ModeType::from_bits_truncate(0o755))
+            .mkdir("proc", InodeMode::from_bits_truncate(0o755))
             .expect("Unable to create /proc")
             .mount(procfs, MountFlags::empty())
             .expect("Failed to mount at /proc");

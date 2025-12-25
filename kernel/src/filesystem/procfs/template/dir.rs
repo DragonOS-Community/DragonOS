@@ -3,8 +3,8 @@ use crate::{
     filesystem::{
         procfs::template::Common,
         vfs::{
-            file::FileMode, syscall::ModeType, utils::DName, vcore::generate_inode_id,
-            FilePrivateData, FileSystem, FileType, IndexNode, InodeId, Metadata,
+            file::FileFlags, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
+            FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
         },
     },
     libs::{rwlock::RwLock, spinlock::SpinLockGuard},
@@ -36,7 +36,7 @@ impl<Ops: DirOps> ProcDir<Ops> {
         fs: Weak<dyn FileSystem>,
         parent: Option<Weak<dyn IndexNode>>,
         is_volatile: bool,
-        mode: ModeType,
+        mode: InodeMode,
         data: usize,
     ) -> Arc<Self> {
         let common = {
@@ -54,6 +54,7 @@ impl<Ops: DirOps> ProcDir<Ops> {
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode,
+                flags: InodeFlags::empty(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -210,7 +211,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }

@@ -8,7 +8,7 @@ use crate::{
             template::{Builder, FileOps, ProcFileBuilder},
             utils::{proc_read, trim_string},
         },
-        vfs::{syscall::ModeType, FilePrivateData, IndexNode},
+        vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     libs::spinlock::SpinLockGuard,
     process::{ProcessManager, RawPid},
@@ -35,7 +35,7 @@ impl StatusFileOps {
     }
 
     pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self::new(pid), ModeType::S_IRUGO)
+        ProcFileBuilder::new(Self::new(pid), InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -172,7 +172,7 @@ impl FileOps for StatusFileOps {
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = self.generate_status_content()?;
-        log::info!("Generated /proc/[pid]/status content");
+        // log::info!("Generated /proc/[pid]/status content");
 
         proc_read(offset, len, buf, &content)
     }

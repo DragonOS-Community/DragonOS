@@ -5,7 +5,7 @@
 use crate::{
     filesystem::{
         procfs::template::{Builder, ProcSymBuilder, SymOps},
-        vfs::{syscall::ModeType, IndexNode},
+        vfs::{IndexNode, InodeMode},
     },
     process::{ProcessManager, RawPid},
 };
@@ -25,7 +25,7 @@ impl ExeSymOps {
     }
 
     pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcSymBuilder::new(Self::new(pid), ModeType::S_IRWXUGO) // 0777 - 符号链接权限
+        ProcSymBuilder::new(Self::new(pid), InodeMode::S_IRWXUGO) // 0777 - 符号链接权限
             .parent(parent)
             .build()
             .unwrap()

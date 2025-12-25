@@ -245,8 +245,16 @@ impl PageFaultHandler {
             if guard.vm_flags().contains(VmFlags::VM_SHARED) {
                 let shared = guard.shared_anon.clone();
                 if let Some(shared) = shared {
-                    // compute page index within VMA
-                    let pgoff = (address - guard.region().start()) >> MMArch::PAGE_SHIFT;
+                    // Compute page index within the shared-anon backing object.
+                    // Base offset is stored in VMA.file_pgoff (reused for shared-anon).
+                    let base = guard.file_page_offset().unwrap_or(0);
+                    let pgoff = base + ((address - guard.region().start()) >> MMArch::PAGE_SHIFT);
+
+                    // Linux semantics: access beyond the backing size should SIGBUS.
+                    if pgoff >= shared.size_pages() {
+                        drop(guard);
+                        return VmFaultReason::VM_FAULT_SIGBUS;
+                    }
                     drop(guard);
 
                     // Atomically get or create the shared page to avoid races

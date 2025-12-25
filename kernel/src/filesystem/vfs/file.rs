@@ -121,6 +121,8 @@ pub enum FilePrivateData {
     Loop(LoopPrivateData),
     /// namespace fd 私有信息（/proc/thread-self/ns/* 打开后得到）
     Namespace(NamespaceFilePrivateData),
+    /// Socket file created by socket syscalls (not by VFS open(2)).
+    SocketCreate,
     /// 不需要文件私有信息
     Unused,
 }
@@ -488,6 +490,18 @@ impl File {
     /// @param inode 文件对象对应的inode
     /// @param flags 文件的打开模式
     pub fn new(inode: Arc<dyn IndexNode>, mut flags: FileFlags) -> Result<Self, SystemError> {
+        Self::new_with_private_data(inode, flags, FilePrivateData::default())
+    }
+
+    /// Create a new file object with an explicit initial FilePrivateData.
+    ///
+    /// This is primarily used for objects that are not created via VFS open(2)
+    /// semantics (e.g. sockets created by socket syscalls).
+    pub fn new_with_private_data(
+        inode: Arc<dyn IndexNode>,
+        mut flags: FileFlags,
+        private_data_init: FilePrivateData,
+    ) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
         // 检查是否为命名管道（FIFO）
@@ -517,7 +531,7 @@ impl File {
 
         let mut mode = FileMode::open_fmode(flags);
 
-        let private_data = SpinLock::new(FilePrivateData::default());
+        let private_data = SpinLock::new(private_data_init);
         inode.open(private_data.lock(), &flags)?;
 
         // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
@@ -566,6 +580,13 @@ impl File {
         };
 
         return Ok(f);
+    }
+
+    /// Create a file object for sockets created by socket syscalls.
+    ///
+    /// These should not be subject to open(2) pathname semantics.
+    pub fn new_socket(inode: Arc<dyn IndexNode>, flags: FileFlags) -> Result<Self, SystemError> {
+        Self::new_with_private_data(inode, flags, FilePrivateData::SocketCreate)
     }
 
     /// ## 从文件中读取指定的字节数到buffer中

@@ -1,11 +1,14 @@
+use crate::filesystem::vfs::file::File;
 use crate::libs::pod::Pod;
 use crate::libs::rwlock::RwLock;
+use crate::libs::spinlock::SpinLock;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::num::Wrapping;
 use core::ops::Deref;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 use inherit_methods_macro::inherit_methods;
 
 /// unix socket的接收队列
@@ -16,6 +19,15 @@ pub struct RingBuffer<T> {
     buffer: RwLock<Vec<T>>,
     head: AtomicUsize,
     tail: AtomicUsize,
+    /// Consumer has performed SHUT_RD (peer writes must fail with EPIPE).
+    recv_shutdown: AtomicBool,
+    /// Producer has performed SHUT_WR (consumer reads return EOF once drained).
+    send_shutdown: AtomicBool,
+    /// SCM_RIGHTS (file descriptor passing) queue associated with this byte stream.
+    ///
+    /// For SOCK_STREAM, ancillary data is delivered in the order it was sent and
+    /// is associated with the next bytes read.
+    scm_rights_queue: SpinLock<VecDeque<Vec<Arc<File>>>>,
 }
 
 #[derive(Debug)]
@@ -48,7 +60,41 @@ impl<T> RingBuffer<T> {
             buffer: RwLock::new(buffer),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
+            recv_shutdown: AtomicBool::new(false),
+            send_shutdown: AtomicBool::new(false),
+            scm_rights_queue: SpinLock::new(VecDeque::new()),
         }
+    }
+
+    pub fn set_recv_shutdown(&self) {
+        self.recv_shutdown
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_recv_shutdown(&self) -> bool {
+        self.recv_shutdown
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_send_shutdown(&self) {
+        self.send_shutdown
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_send_shutdown(&self) -> bool {
+        self.send_shutdown
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn push_scm_rights(&self, files: Vec<Arc<File>>) {
+        if files.is_empty() {
+            return;
+        }
+        self.scm_rights_queue.lock().push_back(files);
+    }
+
+    pub fn pop_scm_rights(&self) -> Option<Vec<Arc<File>>> {
+        self.scm_rights_queue.lock().pop_front()
     }
 
     pub fn split(self) -> (RbProducer<T>, RbConsumer<T>) {
@@ -203,6 +249,24 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     }
 }
 
+impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
+    pub fn is_recv_shutdown(&self) -> bool {
+        self.ring_buffer.is_recv_shutdown()
+    }
+
+    pub fn is_send_shutdown(&self) -> bool {
+        self.ring_buffer.is_send_shutdown()
+    }
+
+    pub fn set_send_shutdown(&self) {
+        self.ring_buffer.set_send_shutdown()
+    }
+
+    pub fn push_scm_rights(&self, files: Vec<Arc<File>>) {
+        self.ring_buffer.push_scm_rights(files)
+    }
+}
+
 #[inherit_methods(from = "self.ring_buffer")]
 impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn capacity(&self) -> usize;
@@ -267,6 +331,60 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         // 更新 head 指针
         rb.advance_head(head, nitems);
         Some(())
+    }
+
+    /// Peek (read without consuming) a slice from the ring buffer.
+    ///
+    /// Returns `None` if there aren't enough elements available.
+    pub fn peek_slice(&self, buf: &mut [T]) -> Option<()> {
+        let rb = &self.ring_buffer;
+        let nitems = buf.len();
+        if rb.len() < nitems {
+            return None;
+        }
+
+        let head = rb.head();
+        let offset = head.0 & (rb.capacity() - 1);
+
+        let read_guard = rb.buffer.read();
+
+        let mut start = offset;
+        let mut remaining_len = nitems;
+        let mut buf_start = 0;
+
+        // If the data wraps around the end of the buffer.
+        if start + nitems > rb.capacity() {
+            let first_part_len = rb.capacity() - start;
+            buf[..first_part_len].copy_from_slice(&read_guard[start..start + first_part_len]);
+
+            start = 0;
+            remaining_len -= first_part_len;
+            buf_start = first_part_len;
+        }
+
+        // Read the remaining part.
+        buf[buf_start..buf_start + remaining_len]
+            .copy_from_slice(&read_guard[start..start + remaining_len]);
+
+        Some(())
+    }
+}
+
+impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+    pub fn is_recv_shutdown(&self) -> bool {
+        self.ring_buffer.is_recv_shutdown()
+    }
+
+    pub fn is_send_shutdown(&self) -> bool {
+        self.ring_buffer.is_send_shutdown()
+    }
+
+    pub fn set_recv_shutdown(&self) {
+        self.ring_buffer.set_recv_shutdown()
+    }
+
+    pub fn pop_scm_rights(&self) -> Option<Vec<Arc<File>>> {
+        self.ring_buffer.pop_scm_rights()
     }
 }
 

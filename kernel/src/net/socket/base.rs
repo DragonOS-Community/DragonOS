@@ -1,7 +1,7 @@
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        vfs::{fasync::FAsyncItems, IndexNode, InodeId, PollableInode},
+        vfs::{fasync::FAsyncItems, FilePrivateData, IndexNode, InodeId, PollableInode},
     },
     libs::wait_queue::WaitQueue,
     net::{
@@ -131,6 +131,20 @@ pub trait Socket: PollableInode + IndexNode {
     fn shutdown(&self, _how: ShutdownBit) -> Result<(), SystemError> {
         // TODO 构建shutdown系统调用
         // set shutdown bit
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Socket-specific ioctl handler.
+    ///
+    /// By default sockets do not implement any ioctl commands.
+    ///
+    /// Note: caller is responsible for copying data to/from user space.
+    fn ioctl(
+        &self,
+        _cmd: u32,
+        _arg: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 

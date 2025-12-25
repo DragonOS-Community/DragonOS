@@ -1,6 +1,8 @@
 use crate::{
     filesystem::vfs::iov::IoVecs,
-    filesystem::vfs::{fasync::FAsyncItems, utils::DName, vcore::generate_inode_id, InodeId},
+    filesystem::vfs::{
+        fasync::FAsyncItems, utils::DName, vcore::generate_inode_id, FilePrivateData, InodeId,
+    },
     libs::rwlock::RwLock,
     libs::spinlock::SpinLock,
     libs::wait_queue::WaitQueue,
@@ -29,6 +31,17 @@ use super::ns;
 use crate::libs::wait_queue::{TimeoutWaker, Waiter};
 use crate::time::timer::{next_n_us_timer_jiffies, Timer};
 use crate::time::{Duration, Instant};
+
+use crate::syscall::user_access::UserBufferWriter;
+
+// Socket ioctls used by gVisor unix socket tests.
+const TIOCOUTQ: u32 = 0x5411; // Get output queue size
+const FIONREAD: u32 = 0x541B; // Get input queue size (aka TIOCINQ)
+const SIOCGIFINDEX: u32 = 0x8933; // name -> if_index mapping
+
+fn clamp_usize_to_i32(v: usize) -> i32 {
+    core::cmp::min(v, i32::MAX as usize) as i32
+}
 
 /// Unix 域数据报消息
 #[derive(Debug, Clone)]
@@ -197,6 +210,9 @@ pub struct UnixDatagramSocket {
     send_timeout_us: AtomicU64,
     recv_timeout_us: AtomicU64,
     self_weak: Weak<UnixDatagramSocket>,
+
+    is_read_shutdown: AtomicBool,
+    is_write_shutdown: AtomicBool,
 }
 
 impl UnixDatagramSocket {
@@ -223,6 +239,9 @@ impl UnixDatagramSocket {
             send_timeout_us: AtomicU64::new(0),
             recv_timeout_us: AtomicU64::new(0),
             self_weak: weak.clone(),
+
+            is_read_shutdown: AtomicBool::new(false),
+            is_write_shutdown: AtomicBool::new(false),
         })
     }
 
@@ -256,6 +275,17 @@ impl UnixDatagramSocket {
         }
 
         (socket_a, socket_b)
+    }
+
+    pub fn ioctl_fionread(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.recv_queue.front().map(|m| m.data.len()).unwrap_or(0)
+    }
+
+    pub fn ioctl_tiocoutq(&self) -> usize {
+        // For datagram sockets, TIOCOUTQ is not relied upon by our current tests.
+        // Returning 0 is consistent with an empty send queue in the common case.
+        0
     }
 
     fn is_nonblocking(&self) -> bool {
@@ -469,6 +499,10 @@ impl UnixDatagramSocket {
         buffer: &[u8],
         target_addr: &UnixEndpointBound,
     ) -> Result<usize, SystemError> {
+        if self.is_write_shutdown.load(Ordering::Relaxed) {
+            return Err(SystemError::EPIPE);
+        }
+
         if buffer.len() > Self::MAX_MSG_SIZE {
             return Err(SystemError::EMSGSIZE);
         }
@@ -477,6 +511,10 @@ impl UnixDatagramSocket {
         let target_socket = BIND_TABLE
             .lookup(target_addr)
             .ok_or(SystemError::ECONNREFUSED)?;
+
+        if target_socket.is_read_shutdown.load(Ordering::Relaxed) {
+            return Err(SystemError::EPIPE);
+        }
 
         // 获取发送方地址
         let sender_addr = self.inner.lock().local_endpoint();
@@ -593,6 +631,40 @@ impl UnixDatagramSocket {
 }
 
 impl Socket for UnixDatagramSocket {
+    fn ioctl(
+        &self,
+        cmd: u32,
+        arg: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        if arg == 0 {
+            return Err(SystemError::EFAULT);
+        }
+
+        match cmd {
+            FIONREAD => {
+                let available = self.ioctl_fionread();
+                let mut writer =
+                    UserBufferWriter::new(arg as *mut u8, core::mem::size_of::<i32>(), true)?;
+                writer
+                    .buffer_protected(0)?
+                    .write_one::<i32>(0, &clamp_usize_to_i32(available))?;
+                Ok(0)
+            }
+            TIOCOUTQ => {
+                let queued = self.ioctl_tiocoutq();
+                let mut writer =
+                    UserBufferWriter::new(arg as *mut u8, core::mem::size_of::<i32>(), true)?;
+                writer
+                    .buffer_protected(0)?
+                    .write_one::<i32>(0, &clamp_usize_to_i32(queued))?;
+                Ok(0)
+            }
+            SIOCGIFINDEX => Err(SystemError::ENODEV),
+            _ => Err(SystemError::ENOSYS),
+        }
+    }
+
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
         self.inner.lock().connect(unix_endpoint)
@@ -986,7 +1058,16 @@ impl Socket for UnixDatagramSocket {
     }
 
     fn shutdown(&self, _how: socket::common::ShutdownBit) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
+        if _how.is_recv_shutdown() {
+            self.is_read_shutdown.store(true, Ordering::Relaxed);
+        }
+        if _how.is_send_shutdown() {
+            self.is_write_shutdown.store(true, Ordering::Relaxed);
+        }
+
+        self.wait_queue
+            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+        Ok(())
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {

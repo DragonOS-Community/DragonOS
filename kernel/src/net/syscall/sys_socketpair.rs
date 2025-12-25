@@ -165,8 +165,8 @@ pub(super) fn do_socketpair(
         }
     };
 
-    fds[0] = fd_table_guard.alloc_fd(File::new(socket_a, FileFlags::O_RDWR)?, None)?;
-    fds[1] = fd_table_guard.alloc_fd(File::new(socket_b, FileFlags::O_RDWR)?, None)?;
+    fds[0] = fd_table_guard.alloc_fd(File::new_socket(socket_a, FileFlags::O_RDWR)?, None)?;
+    fds[1] = fd_table_guard.alloc_fd(File::new_socket(socket_b, FileFlags::O_RDWR)?, None)?;
 
     drop(fd_table_guard);
     Ok(0)

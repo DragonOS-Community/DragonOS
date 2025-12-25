@@ -213,10 +213,13 @@ fn handle_siocgifconf(data: usize) -> Result<usize, SystemError> {
 impl<T: Socket + 'static> IndexNode for T {
     fn open(
         &self,
-        _: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
         _: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
-        Ok(())
+        match &*data {
+            FilePrivateData::SocketCreate => Ok(()),
+            _ => Err(SystemError::ENXIO),
+        }
     }
 
     fn close(&self, _: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -280,14 +283,11 @@ impl<T: Socket + 'static> IndexNode for T {
         &self,
         cmd: u32,
         data: usize,
-        _private_data: &FilePrivateData,
+        private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         match cmd {
             SIOCGIFCONF => handle_siocgifconf(data),
-            _ => {
-                log::warn!("Socket ioctl: unsupported command {:#x}", cmd);
-                Err(SystemError::ENOIOCTLCMD)
-            }
+            _ => Socket::ioctl(self, cmd, data, private_data),
         }
     }
 

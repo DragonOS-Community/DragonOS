@@ -106,7 +106,7 @@ pub(super) fn do_recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usiz
         file.flags().contains(FileFlags::O_NONBLOCK)
     };
 
-    let (buf, recv_size) = {
+    let (buf, recv_size, used_recv_msg) = {
         let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
         let socket = socket_inode.as_socket().unwrap();
 
@@ -117,12 +117,12 @@ pub(super) fn do_recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usiz
 
         // 优先使用 recv_msg 以便实现 msg_flags/msg_controllen 等语义。
         match socket.recv_msg(msg, pmsg_flags) {
-            Ok(recv_size) => (alloc::vec::Vec::new(), recv_size),
+            Ok(recv_size) => (alloc::vec::Vec::new(), recv_size, true),
             Err(SystemError::ENOSYS) => {
                 let mut buf = iovs.new_buf(true);
                 // 从socket中读取数据
                 let recv_size = socket.recv(&mut buf, pmsg_flags)?;
-                (buf, recv_size)
+                (buf, recv_size, false)
             }
             Err(e) => return Err(e),
         }
@@ -133,9 +133,12 @@ pub(super) fn do_recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usiz
         iovs.scatter(&buf[..recv_size])?;
     }
 
-    // 最小保证：不产生控制消息时必须把 msg_controllen 写回 0
-    // 否则用户态 CMSG_FIRSTHDR 可能非空。
-    msg.msg_controllen = 0;
+    // Fallback path does not produce control messages.
+    if !used_recv_msg {
+        // 最小保证：不产生控制消息时必须把 msg_controllen 写回 0
+        // 否则用户态 CMSG_FIRSTHDR 可能非空。
+        msg.msg_controllen = 0;
+    }
 
     Ok(recv_size)
 }

@@ -1,5 +1,5 @@
 use crate::{
-    filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
+    filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, FilePrivateData, InodeId},
     libs::rwlock::RwLock,
     net::socket::{self, *},
 };
@@ -23,6 +23,38 @@ use core::sync::atomic::AtomicBool;
 use inner::{Connected, Init, Inner};
 use log::debug;
 use system_error::SystemError;
+
+use crate::filesystem::vfs::iov::IoVecs;
+use crate::process::ProcessManager;
+use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Cmsghdr {
+    cmsg_len: usize,
+    cmsg_level: i32,
+    cmsg_type: i32,
+}
+
+const SOL_SOCKET: i32 = 1;
+const SCM_RIGHTS: i32 = 1;
+
+// Linux: MSG_CTRUNC is 0x8.
+const MSG_CTRUNC: i32 = 0x8;
+
+fn cmsg_align(len: usize) -> usize {
+    let align = core::mem::size_of::<usize>();
+    (len + align - 1) & !(align - 1)
+}
+
+// Socket ioctls used by gVisor unix socket tests.
+const TIOCOUTQ: u32 = 0x5411; // Get output queue size
+const FIONREAD: u32 = 0x541B; // Get input queue size (aka TIOCINQ)
+const SIOCGIFINDEX: u32 = 0x8933; // name -> if_index mapping
+
+fn clamp_usize_to_i32(v: usize) -> i32 {
+    core::cmp::min(v, i32::MAX as usize) as i32
+}
 
 pub mod inner;
 
@@ -93,6 +125,30 @@ impl UnixStreamSocket {
         *socket_b.peer.lock() = Some(Arc::downgrade(&socket_a));
 
         (socket_a, socket_b)
+    }
+
+    pub fn ioctl_fionread(&self) -> usize {
+        match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("UnixStreamSocket inner is None")
+        {
+            Inner::Connected(connected) => connected.readable_len(self.is_seqpacket),
+            _ => 0,
+        }
+    }
+
+    pub fn ioctl_tiocoutq(&self) -> usize {
+        match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("UnixStreamSocket inner is None")
+        {
+            Inner::Connected(connected) => connected.outq_len(self.is_seqpacket),
+            _ => 0,
+        }
     }
 
     fn try_send(&self, buffer: &[u8]) -> Result<usize, SystemError> {
@@ -167,6 +223,43 @@ impl UnixStreamSocket {
 }
 
 impl Socket for UnixStreamSocket {
+    fn ioctl(
+        &self,
+        cmd: u32,
+        arg: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        if arg == 0 {
+            return Err(SystemError::EFAULT);
+        }
+
+        match cmd {
+            // Return bytes available for reading.
+            FIONREAD => {
+                let available = self.ioctl_fionread();
+                let mut writer =
+                    UserBufferWriter::new(arg as *mut u8, core::mem::size_of::<i32>(), true)?;
+                writer
+                    .buffer_protected(0)?
+                    .write_one::<i32>(0, &clamp_usize_to_i32(available))?;
+                Ok(0)
+            }
+            // Return bytes queued for transmission.
+            TIOCOUTQ => {
+                let queued = self.ioctl_tiocoutq();
+                let mut writer =
+                    UserBufferWriter::new(arg as *mut u8, core::mem::size_of::<i32>(), true)?;
+                writer
+                    .buffer_protected(0)?
+                    .write_one::<i32>(0, &clamp_usize_to_i32(queued))?;
+                Ok(0)
+            }
+            // Netdevice ioctls on AF_UNIX sockets: gVisor tests accept ENODEV.
+            SIOCGIFINDEX => Err(SystemError::ENODEV),
+            _ => Err(SystemError::ENOSYS),
+        }
+    }
+
     fn connect(&self, server_endpoint: Endpoint) -> Result<(), SystemError> {
         let remote_addr = UnixEndpoint::try_from(server_endpoint)?.connect()?;
         let backlog = get_backlog(&remote_addr)?;
@@ -337,7 +430,100 @@ impl Socket for UnixStreamSocket {
     }
 
     fn recv_msg(&self, _msg: &mut MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+        let msg = _msg;
+
+        let control_ptr = msg.msg_control;
+        let control_len = msg.msg_controllen;
+
+        // Scatter destination is described by msg_iov/msg_iovlen in user memory.
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        let mut buf = iovs.new_buf(true);
+
+        // Read payload first.
+        let recv_size = match self.recv(&mut buf, _flags) {
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        };
+        if recv_size != 0 {
+            iovs.scatter(&buf[..recv_size])?;
+        }
+
+        // Default: no flags, no control.
+        msg.msg_flags = 0;
+        msg.msg_controllen = 0;
+
+        // Try to deliver SCM_RIGHTS for the next message (if any).
+        let rights = match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("UnixStreamSocket inner is None")
+        {
+            Inner::Connected(connected) => connected.pop_scm_rights(),
+            _ => None,
+        };
+
+        let Some(rights) = rights else {
+            return Ok(recv_size);
+        };
+
+        // If userspace didn't provide a control buffer, drop rights and report truncation.
+        if control_ptr.is_null() || control_len == 0 {
+            msg.msg_flags |= MSG_CTRUNC;
+            return Ok(recv_size);
+        }
+
+        // Allocate new fds in the receiver. Note: DragonOS models close-on-exec on File,
+        // so we clone file objects and override close_on_exec based on MSG_CMSG_CLOEXEC.
+        let cloexec = _flags.contains(socket::PMSG::CMSG_CLOEXEC);
+        let mut received_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::with_capacity(rights.len());
+        {
+            let fd_table_binding = ProcessManager::current_pcb().fd_table();
+            let mut fd_table = fd_table_binding.write();
+            for file in rights.iter() {
+                let new_file = file.as_ref().try_clone().ok_or(SystemError::EINVAL)?;
+                new_file.set_close_on_exec(cloexec);
+                let new_fd = fd_table.alloc_fd(new_file, None)?;
+                received_fds.push(new_fd);
+            }
+        }
+
+        // Serialize cmsghdr + int[] into msg_control.
+        let data_len = received_fds.len() * core::mem::size_of::<i32>();
+        let hdr_len = core::mem::size_of::<Cmsghdr>();
+        let cmsg_len = hdr_len + data_len;
+        let needed = cmsg_align(cmsg_len);
+        if control_len < needed {
+            // Not enough space to report fds; indicate truncation.
+            msg.msg_flags |= MSG_CTRUNC;
+            msg.msg_controllen = 0;
+            return Ok(recv_size);
+        }
+
+        let hdr = Cmsghdr {
+            cmsg_len,
+            cmsg_level: SOL_SOCKET,
+            cmsg_type: SCM_RIGHTS,
+        };
+        {
+            let mut hdr_writer =
+                UserBufferWriter::new(control_ptr, core::mem::size_of::<Cmsghdr>(), true)?;
+            let mut protected = hdr_writer.buffer_protected(0)?;
+            protected.write_one::<Cmsghdr>(0, &hdr)?;
+        }
+
+        // Write fd array right after header.
+        let fds_off = hdr_len;
+        for (idx, fd) in received_fds.iter().enumerate() {
+            let off = fds_off + idx * core::mem::size_of::<i32>();
+            let ptr = unsafe { control_ptr.add(off) };
+            let mut fd_writer = UserBufferWriter::new(ptr, core::mem::size_of::<i32>(), true)?;
+            let mut protected = fd_writer.buffer_protected(0)?;
+            protected.write_one::<i32>(0, fd)?;
+        }
+        msg.msg_controllen = cmsg_len;
+
+        Ok(recv_size)
     }
 
     fn send(&self, buffer: &[u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
@@ -356,7 +542,78 @@ impl Socket for UnixStreamSocket {
     }
 
     fn send_msg(&self, _msg: &MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
-        todo!()
+        let msg = _msg;
+
+        if !msg.msg_name.is_null() {
+            // Connected SOCK_STREAM does not accept a destination address.
+            return Err(SystemError::EISCONN);
+        }
+
+        // Gather payload from user iovecs.
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
+        let buf = iovs.gather()?;
+
+        // Parse SCM_RIGHTS from msg_control (if present).
+        let mut rights_files: alloc::vec::Vec<
+            alloc::sync::Arc<crate::filesystem::vfs::file::File>,
+        > = alloc::vec::Vec::new();
+
+        if !msg.msg_control.is_null() && msg.msg_controllen >= core::mem::size_of::<Cmsghdr>() {
+            let reader =
+                UserBufferReader::new(msg.msg_control as *const u8, msg.msg_controllen, true)?;
+            let mut off = 0usize;
+            while off + core::mem::size_of::<Cmsghdr>() <= msg.msg_controllen {
+                let hdr = *reader.read_one_from_user::<Cmsghdr>(off)?;
+                if hdr.cmsg_len < core::mem::size_of::<Cmsghdr>() {
+                    break;
+                }
+                if off + hdr.cmsg_len > msg.msg_controllen {
+                    break;
+                }
+
+                if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_RIGHTS {
+                    let data_off = off + core::mem::size_of::<Cmsghdr>();
+                    let data_len = hdr.cmsg_len - core::mem::size_of::<Cmsghdr>();
+                    if data_len % core::mem::size_of::<i32>() != 0 {
+                        return Err(SystemError::EINVAL);
+                    }
+
+                    let fd_count = data_len / core::mem::size_of::<i32>();
+                    if fd_count != 0 {
+                        let mut fds: alloc::vec::Vec<i32> =
+                            alloc::vec::Vec::with_capacity(fd_count);
+                        fds.resize(fd_count, 0);
+                        reader.copy_from_user::<i32>(&mut fds, data_off)?;
+
+                        let fd_table_binding = ProcessManager::current_pcb().fd_table();
+                        let fd_table = fd_table_binding.read();
+                        for fd in fds {
+                            let file = fd_table.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
+                            rights_files.push(file);
+                        }
+                    }
+                }
+
+                off += cmsg_align(hdr.cmsg_len);
+            }
+        }
+
+        // Send payload first; only attach SCM_RIGHTS if the send succeeds.
+        let sent = self.send(&buf, _flags)?;
+
+        if !rights_files.is_empty() {
+            match self
+                .inner
+                .read()
+                .as_ref()
+                .expect("UnixStreamSocket inner is None")
+            {
+                Inner::Connected(connected) => connected.push_scm_rights(rights_files),
+                _ => return Err(SystemError::ENOTCONN),
+            }
+        }
+
+        Ok(sent)
     }
 
     fn send_to(
@@ -387,7 +644,7 @@ impl Socket for UnixStreamSocket {
     }
 
     fn option(&self, _level: PSOL, _name: usize, _value: &mut [u8]) -> Result<usize, SystemError> {
-        todo!()
+        Err(SystemError::ENOPROTOOPT)
     }
 
     fn do_close(&self) -> Result<(), SystemError> {
@@ -395,7 +652,30 @@ impl Socket for UnixStreamSocket {
     }
 
     fn shutdown(&self, _how: common::ShutdownBit) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
+        let inner_guard = self.inner.read();
+        let Some(inner) = inner_guard.as_ref() else {
+            return Err(SystemError::EINVAL);
+        };
+
+        let Inner::Connected(connected) = inner else {
+            return Err(SystemError::ENOTCONN);
+        };
+
+        // For a connected unix socket, shutdown updates per-direction state:
+        // - SHUT_RD: mark incoming direction as recv-shutdown (peer writes -> EPIPE)
+        // - SHUT_WR: mark outgoing direction as send-shutdown (our writes -> EPIPE, peer reads -> EOF when drained)
+        if _how.is_recv_shutdown() {
+            connected.shutdown_recv();
+        }
+        if _how.is_send_shutdown() {
+            connected.shutdown_send();
+        }
+
+        // Wake any sleepers.
+        self.wait_queue
+            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+
+        Ok(())
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {

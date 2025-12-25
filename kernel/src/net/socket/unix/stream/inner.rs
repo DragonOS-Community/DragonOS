@@ -1,4 +1,5 @@
 use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::file::File;
 use crate::libs::rwlock::RwLock;
 use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
@@ -159,6 +160,16 @@ impl Connected {
             }
         }
 
+        // shutdown(2) semantics:
+        // - If this end has SHUT_WR, sending must fail with EPIPE.
+        // - If peer has SHUT_RD, sending must fail with EPIPE.
+        {
+            let guard = self.writer.lock();
+            if guard.is_send_shutdown() || guard.is_recv_shutdown() {
+                return Err(SystemError::EPIPE);
+            }
+        }
+
         if is_seqpacket && buf.len() > UNIX_STREAM_DEFAULT_BUF_SIZE {
             return Err(SystemError::EMSGSIZE);
         }
@@ -189,8 +200,15 @@ impl Connected {
 
     pub fn try_recv(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
         if is_seqpacket {
-            if self.reader.lock().len() < size_of::<u32>() {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            {
+                let guard = self.reader.lock();
+                if guard.len() < size_of::<u32>() {
+                    // If peer has SHUT_WR and the receive queue is empty, return EOF.
+                    if guard.is_send_shutdown() {
+                        return Ok(0);
+                    }
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
             }
 
             let mut len_buf = [0u8; 4];
@@ -212,14 +230,69 @@ impl Connected {
             self.reader.lock().pop_slice(&mut buf[..len]);
             Ok(len)
         } else {
-            let avail_len = self.reader.lock().len();
-            if avail_len == 0 {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
+            let avail_len = {
+                let guard = self.reader.lock();
+                let len = guard.len();
+                if len == 0 {
+                    // If peer has SHUT_WR and the receive queue is empty, return EOF.
+                    if guard.is_send_shutdown() {
+                        return Ok(0);
+                    }
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                len
+            };
             let len = core::cmp::min(buf.len(), avail_len);
             self.reader.lock().pop_slice(&mut buf[..len]);
             Ok(len)
         }
+    }
+
+    pub(super) fn readable_len(&self, is_seqpacket: bool) -> usize {
+        if is_seqpacket {
+            let guard = self.reader.lock();
+            if guard.len() < size_of::<u32>() {
+                return 0;
+            }
+
+            let mut len_buf = [0u8; 4];
+            if guard.peek_slice(&mut len_buf).is_none() {
+                return 0;
+            }
+
+            let len = u32::from_ne_bytes(len_buf) as usize;
+            // If the header is present but the payload isn't fully queued yet,
+            // report 0 (can't read a full record without blocking).
+            if guard.len() < size_of::<u32>() + len {
+                return 0;
+            }
+
+            len
+        } else {
+            self.reader.lock().len()
+        }
+    }
+
+    pub(super) fn outq_len(&self, _is_seqpacket: bool) -> usize {
+        // Approximation: bytes sitting in the local-to-peer ring buffer,
+        // i.e. written but not yet consumed by the peer.
+        self.writer.lock().len()
+    }
+
+    pub(super) fn shutdown_recv(&self) {
+        self.reader.lock().set_recv_shutdown();
+    }
+
+    pub(super) fn shutdown_send(&self) {
+        self.writer.lock().set_send_shutdown();
+    }
+
+    pub(super) fn push_scm_rights(&self, files: Vec<Arc<File>>) {
+        self.writer.lock().push_scm_rights(files)
+    }
+
+    pub(super) fn pop_scm_rights(&self) -> Option<Vec<Arc<File>>> {
+        self.reader.lock().pop_scm_rights()
     }
 
     pub(super) fn check_io_events(&self) -> EPollEventType {

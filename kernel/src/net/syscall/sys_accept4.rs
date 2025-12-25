@@ -10,10 +10,6 @@ use alloc::vec::Vec;
 
 use super::sys_accept::do_accept;
 
-/// Flags for accept4
-const SOCK_CLOEXEC: FileFlags = FileFlags::O_CLOEXEC;
-const SOCK_NONBLOCK: FileFlags = FileFlags::O_NONBLOCK;
-
 /// System call handler for the `accept4` syscall
 ///
 /// This handler implements the `Syscall` trait to provide functionality for accepting a connection on a socket with flags.
@@ -105,15 +101,11 @@ pub(super) fn do_accept4(
     fd: usize,
     addr: *mut SockAddr,
     addrlen: *mut u32,
-    mut flags: u32,
+    flags: u32,
 ) -> Result<usize, SystemError> {
     // 如果flags不合法，返回错误
-    if (flags & (!(SOCK_CLOEXEC | SOCK_NONBLOCK)).bits()) != 0 {
+    if (flags & (!(FileFlags::O_CLOEXEC | FileFlags::O_NONBLOCK)).bits()) != 0 {
         return Err(SystemError::EINVAL);
-    }
-
-    if SOCK_NONBLOCK != FileFlags::O_NONBLOCK && ((flags & SOCK_NONBLOCK.bits()) != 0) {
-        flags = (flags & !FileFlags::O_NONBLOCK.bits()) | FileFlags::O_NONBLOCK.bits();
     }
 
     do_accept(fd, addr, addrlen, flags)

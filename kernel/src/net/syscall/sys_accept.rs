@@ -9,10 +9,6 @@ use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-/// Flags for accept4
-const SOCK_CLOEXEC: FileFlags = FileFlags::O_CLOEXEC;
-const SOCK_NONBLOCK: FileFlags = FileFlags::O_NONBLOCK;
-
 /// System call handler for the `accept` syscall
 ///
 /// This handler implements the `Syscall` trait to provide functionality for accepting a connection on a socket.
@@ -109,10 +105,10 @@ pub(crate) fn do_accept(
     };
 
     let mut file_mode = FileFlags::O_RDWR;
-    if flags & SOCK_NONBLOCK.bits() != 0 {
+    if flags & FileFlags::O_NONBLOCK.bits() != 0 {
         file_mode |= FileFlags::O_NONBLOCK;
     }
-    if flags & SOCK_CLOEXEC.bits() != 0 {
+    if flags & FileFlags::O_CLOEXEC.bits() != 0 {
         file_mode |= FileFlags::O_CLOEXEC;
     }
 

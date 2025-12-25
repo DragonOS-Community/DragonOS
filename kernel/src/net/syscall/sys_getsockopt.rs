@@ -2,13 +2,17 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSOCKOPT;
-use crate::mm::VirtAddr;
+use crate::arch::MMArch;
+use crate::mm::MemoryManagementArch;
 use crate::net::socket;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::string::ToString;
 use alloc::vec::Vec;
+
+/// getsockopt optval 最大长度限制（一页）
+const MAX_OPTVAL_LEN: usize = MMArch::PAGE_SIZE;
 
 /// System call handler for the `getsockopt` syscall
 ///
@@ -44,24 +48,7 @@ impl Syscall for SysGetsockoptHandle {
         let optval = Self::optval(args);
         let optlen = Self::optlen(args);
 
-        // Verify optlen address validity if from user space
-        if frame.is_from_user() {
-            let virt_optlen = VirtAddr::new(optlen as usize);
-            if crate::mm::verify_area(virt_optlen, core::mem::size_of::<u32>()).is_err() {
-                return Err(SystemError::EFAULT);
-            }
-
-            // Verify optval address if not null
-            if !optval.is_null() {
-                let virt_optval = VirtAddr::new(optval as usize);
-                // Use PAGE_4K_SIZE as a reasonable upper bound for verification
-                if crate::mm::verify_area(virt_optval, crate::mm::page::PAGE_4K_SIZE).is_err() {
-                    return Err(SystemError::EFAULT);
-                }
-            }
-        }
-
-        do_getsockopt(fd, level, optname, optval, optlen)
+        do_getsockopt(fd, level, optname, optval, optlen, frame.is_from_user())
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -129,6 +116,7 @@ pub(super) fn do_getsockopt(
     optname: usize,
     optval: *mut u8,
     optlen: *mut u32,
+    from_user: bool,
 ) -> Result<usize, SystemError> {
     // 参数合法性检查
     if optlen.is_null() {
@@ -136,8 +124,12 @@ pub(super) fn do_getsockopt(
     }
 
     // 使用 UserBufferReader 读取用户提供的缓冲区长度
-    let optlen_reader = UserBufferReader::new(optlen, core::mem::size_of::<u32>(), true)?;
+    let optlen_reader = UserBufferReader::new(optlen, core::mem::size_of::<u32>(), from_user)?;
     let user_len = optlen_reader.buffer_protected(0)?.read_one::<u32>(0)? as usize;
+
+    if user_len > MAX_OPTVAL_LEN {
+        return Err(SystemError::EINVAL);
+    }
 
     // 获取socket
     let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
@@ -158,7 +150,7 @@ pub(super) fn do_getsockopt(
                 if !optval.is_null() {
                     let to_write = core::cmp::min(user_len, need);
                     let value = socket.send_buffer_size() as u32;
-                    let mut optval_writer = UserBufferWriter::new(optval, to_write, true)?;
+                    let mut optval_writer = UserBufferWriter::new(optval, to_write, from_user)?;
                     optval_writer
                         .buffer_protected(0)?
                         .write_one::<u32>(0, &value)?;
@@ -166,7 +158,7 @@ pub(super) fn do_getsockopt(
 
                 // 写回实际需要的长度
                 let mut optlen_writer =
-                    UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), true)?;
+                    UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
                 optlen_writer
                     .buffer_protected(0)?
                     .write_one::<u32>(0, &(need as u32))?;
@@ -179,7 +171,7 @@ pub(super) fn do_getsockopt(
                 // 使用 UserBufferWriter 写入 optval（小数据）
                 if !optval.is_null() {
                     let to_write = core::cmp::min(user_len, need);
-                    let mut optval_writer = UserBufferWriter::new(optval, to_write, true)?;
+                    let mut optval_writer = UserBufferWriter::new(optval, to_write, from_user)?;
                     optval_writer
                         .buffer_protected(0)?
                         .write_one::<u32>(0, &value)?;
@@ -187,7 +179,7 @@ pub(super) fn do_getsockopt(
 
                 // 写回实际需要的长度
                 let mut optlen_writer =
-                    UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), true)?;
+                    UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
                 optlen_writer
                     .buffer_protected(0)?
                     .write_one::<u32>(0, &(need as u32))?;
@@ -203,13 +195,13 @@ pub(super) fn do_getsockopt(
                 // 使用 UserBufferWriter 写入 optval（可能大数据）
                 if !optval.is_null() {
                     let to_write = core::cmp::min(user_len, need);
-                    let mut optval_writer = UserBufferWriter::new(optval, to_write, true)?;
+                    let mut optval_writer = UserBufferWriter::new(optval, to_write, from_user)?;
                     optval_writer.copy_to_user_protected(&kbuf[..to_write], 0)?;
                 }
 
                 // 写回实际需要的长度
                 let mut optlen_writer =
-                    UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), true)?;
+                    UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
                 optlen_writer
                     .buffer_protected(0)?
                     .write_one::<u32>(0, &(need as u32))?;

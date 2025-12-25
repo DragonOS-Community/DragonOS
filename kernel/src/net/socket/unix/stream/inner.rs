@@ -11,8 +11,8 @@ use crate::net::socket::unix::{UnixEndpoint, UnixEndpointBound};
 use crate::net::socket::Socket;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::{string::String, sync::Arc};
 use core::mem::size_of;
 use core::num::Wrapping;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -164,6 +164,18 @@ impl Connected {
         Ok(())
     }
 
+    pub(super) fn resize_sendbuf(&self, new_capacity: usize) {
+        self.writer.lock().resize(new_capacity);
+    }
+
+    pub(super) fn resize_recvbuf(&self, new_capacity: usize) {
+        self.reader.lock().resize(new_capacity);
+    }
+
+    pub(super) fn send_free_len(&self) -> usize {
+        self.writer.lock().free_len()
+    }
+
     pub(super) fn try_send(
         &self,
         buf: &[u8],
@@ -187,10 +199,6 @@ impl Connected {
             }
         }
 
-        if is_seqpacket && buf.len() > UNIX_STREAM_DEFAULT_BUF_SIZE {
-            return Err(SystemError::EMSGSIZE);
-        }
-
         //todo 判断辅助数据
         let buffer = if is_seqpacket {
             let mut buffer = Vec::with_capacity(buf.len() + 4);
@@ -209,7 +217,6 @@ impl Connected {
         if can_send {
             guard.push_slice(&buffer);
         } else {
-            log::debug!("can not send {:?}", String::from_utf8_lossy(buf));
             return Err(SystemError::ENOBUFS);
         }
 
@@ -218,35 +225,8 @@ impl Connected {
 
     pub fn try_recv(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
         if is_seqpacket {
-            {
-                let guard = self.reader.lock();
-                if guard.len() < size_of::<u32>() {
-                    // If peer has SHUT_WR and the receive queue is empty, return EOF.
-                    if guard.is_send_shutdown() {
-                        return Ok(0);
-                    }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-            }
-
-            let mut len_buf = [0u8; 4];
-            self.reader.lock().pop_slice(&mut len_buf);
-            let len = u32::from_ne_bytes(len_buf) as usize;
-
-            if len == 0 {
-                return Ok(0);
-            }
-
-            if buf.len() < len {
-                return Err(SystemError::EMSGSIZE);
-            }
-
-            if self.reader.lock().len() < len {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-
-            self.reader.lock().pop_slice(&mut buf[..len]);
-            Ok(len)
+            let (copy_len, _orig_len, _truncated) = self.try_recv_seqpacket_meta(buf, false)?;
+            Ok(copy_len)
         } else {
             let avail_len = {
                 let guard = self.reader.lock();
@@ -268,34 +248,8 @@ impl Connected {
 
     pub fn try_peek(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
         if is_seqpacket {
-            let guard = self.reader.lock();
-            if guard.len() < size_of::<u32>() {
-                if guard.is_send_shutdown() {
-                    return Ok(0);
-                }
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-
-            let mut len_buf = [0u8; 4];
-            if guard.peek_slice(&mut len_buf).is_none() {
-                return Err(SystemError::EFAULT);
-            }
-            let len = u32::from_ne_bytes(len_buf) as usize;
-            if len == 0 {
-                return Ok(0);
-            }
-            if buf.len() < len {
-                return Err(SystemError::EMSGSIZE);
-            }
-            if guard.len() < size_of::<u32>() + len {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-
-            let payload_off = guard.head() + Wrapping(size_of::<u32>());
-            if guard.peek_slice_at(payload_off, &mut buf[..len]).is_none() {
-                return Err(SystemError::EFAULT);
-            }
-            Ok(len)
+            let (copy_len, _orig_len, _truncated) = self.try_recv_seqpacket_meta(buf, true)?;
+            Ok(copy_len)
         } else {
             let guard = self.reader.lock();
             let avail_len = guard.len();
@@ -311,6 +265,78 @@ impl Connected {
             }
             Ok(len)
         }
+    }
+
+    /// Receive exactly one SOCK_SEQPACKET record.
+    ///
+    /// Returns `(copy_len, orig_len, truncated)`.
+    /// - `copy_len` is the number of bytes copied into `buf`.
+    /// - `orig_len` is the record's original payload length.
+    /// - `truncated` is true if `buf` was smaller than the record.
+    ///
+    /// If `peek` is true, the record is not consumed.
+    pub fn try_recv_seqpacket_meta(
+        &self,
+        buf: &mut [u8],
+        peek: bool,
+    ) -> Result<(usize, usize, bool), SystemError> {
+        let mut guard = self.reader.lock();
+        if guard.len() < size_of::<u32>() {
+            // If peer has SHUT_WR and the receive queue is empty, return EOF.
+            if guard.is_send_shutdown() {
+                return Ok((0, 0, false));
+            }
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let mut len_buf = [0u8; 4];
+        if guard.peek_slice(&mut len_buf).is_none() {
+            return Err(SystemError::EFAULT);
+        }
+        let record_len = u32::from_ne_bytes(len_buf) as usize;
+
+        if guard.len() < size_of::<u32>() + record_len {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let copy_len = core::cmp::min(buf.len(), record_len);
+        let truncated = copy_len < record_len;
+
+        if peek {
+            if copy_len != 0 {
+                let payload_off = guard.head() + Wrapping(size_of::<u32>());
+                if guard
+                    .peek_slice_at(payload_off, &mut buf[..copy_len])
+                    .is_none()
+                {
+                    return Err(SystemError::EFAULT);
+                }
+            }
+            return Ok((copy_len, record_len, truncated));
+        }
+
+        // Consume header.
+        guard.pop_slice(&mut len_buf);
+        if record_len == 0 {
+            return Ok((0, 0, false));
+        }
+
+        if copy_len != 0 {
+            guard.pop_slice(&mut buf[..copy_len]);
+        }
+
+        // Discard remaining bytes of this record.
+        let mut remaining = record_len - copy_len;
+        if remaining != 0 {
+            let mut trash = [0u8; 256];
+            while remaining != 0 {
+                let chunk = core::cmp::min(remaining, trash.len());
+                guard.pop_slice(&mut trash[..chunk]);
+                remaining -= chunk;
+            }
+        }
+
+        Ok((copy_len, record_len, truncated))
     }
 
     pub(super) fn readable_len(&self, is_seqpacket: bool) -> usize {

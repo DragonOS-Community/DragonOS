@@ -153,7 +153,52 @@ impl<T: Pod> RingBuffer<T> {
     }
 
     pub fn capacity(&self) -> usize {
-        self.buffer.read().capacity()
+        // Use the vector length as the effective ring capacity.
+        // Vec::capacity() may change independently (realloc/grow), which would break
+        // the ring-buffer modulo/mask arithmetic.
+        self.buffer.read().len()
+    }
+
+    /// Resize the ring buffer to a new power-of-two capacity.
+    ///
+    /// Keeps head/tail counters in the same absolute space and remaps the stored
+    /// data to the new backing buffer. This preserves SCM offsets, which are
+    /// expressed in the same head/tail counter space.
+    ///
+    /// Safety/concurrency: protected by the internal buffer write lock; readers/writers
+    /// take the buffer lock for accessing the backing storage.
+    pub fn resize(&self, new_capacity: usize) {
+        assert!(
+            new_capacity.is_power_of_two(),
+            "capacity must be a power of two"
+        );
+
+        let mut guard = self.buffer.write();
+        let old_capacity = guard.len();
+        if new_capacity == old_capacity {
+            return;
+        }
+
+        let head = self.head();
+        let tail = self.tail();
+        let len = (tail - head).0;
+        assert!(
+            len <= new_capacity,
+            "new capacity too small for existing data"
+        );
+
+        let old = core::mem::take(&mut *guard);
+        let mut new_buf = Vec::with_capacity(new_capacity);
+        new_buf.resize_with(new_capacity, T::new_zeroed);
+
+        for i in 0..len {
+            let pos = head.0.wrapping_add(i);
+            let old_idx = pos & (old_capacity - 1);
+            let new_idx = pos & (new_capacity - 1);
+            new_buf[new_idx] = old[old_idx];
+        }
+
+        *guard = new_buf;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -311,6 +356,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         rights: Vec<Arc<File>>,
     ) {
         self.ring_buffer.push_scm_at(offset, cred, rights)
+    }
+
+    pub fn resize(&self, new_capacity: usize) {
+        self.ring_buffer.resize(new_capacity)
     }
 }
 
@@ -478,6 +527,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     pub fn next_scm_offset_after(&self, offset: Wrapping<usize>) -> Option<Wrapping<usize>> {
         self.ring_buffer.next_scm_offset_after(offset)
+    }
+
+    pub fn resize(&self, new_capacity: usize) {
+        self.ring_buffer.resize(new_capacity)
     }
 }
 

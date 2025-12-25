@@ -21,15 +21,17 @@ use crate::{
 };
 use alloc::sync::{Arc, Weak};
 use core::num::Wrapping;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use inner::{Connected, Init, Inner};
-use log::debug;
 use system_error::SystemError;
 
 use crate::filesystem::vfs::iov::IoVecs;
+use crate::libs::wait_queue::{TimeoutWaker, Waiter};
 use crate::net::socket::unix::{current_ucred, nobody_ucred, UCred};
 use crate::process::ProcessManager;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
+use crate::time::timer::{next_n_us_timer_jiffies, Timer};
+use crate::time::{Duration, Instant};
 
 // Use common ancillary message types from parent module
 use super::{cmsg_align, CmsgBuffer, Cmsghdr, MSG_CTRUNC, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET};
@@ -61,14 +63,18 @@ pub struct UnixStreamSocket {
     is_seqpacket: bool,
 
     passcred: AtomicBool,
+
+    sndbuf: AtomicUsize,
+    rcvbuf: AtomicUsize,
+    send_timeout_us: AtomicU64,
+    recv_timeout_us: AtomicU64,
 }
 
 impl UnixStreamSocket {
     /// 默认的元数据缓冲区大小
     #[allow(dead_code)]
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-    /// 默认的缓冲区大小
-    pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
+    pub const MIN_SOCKET_BUF_SIZE: usize = 1024;
 
     pub(super) fn new_init(init: Init, is_nonblocking: bool, is_seqpacket: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -81,6 +87,11 @@ impl UnixStreamSocket {
             fasync_items: FAsyncItems::default(),
             peer: SpinLock::new(None),
             passcred: AtomicBool::new(false),
+
+            sndbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
+            rcvbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
+            send_timeout_us: AtomicU64::new(0),
+            recv_timeout_us: AtomicU64::new(0),
         })
     }
 
@@ -99,7 +110,180 @@ impl UnixStreamSocket {
             fasync_items: FAsyncItems::default(),
             peer: SpinLock::new(None),
             passcred: AtomicBool::new(false),
+
+            sndbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
+            rcvbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
+            send_timeout_us: AtomicU64::new(0),
+            recv_timeout_us: AtomicU64::new(0),
         })
+    }
+
+    fn parse_u32_opt(optval: &[u8]) -> Result<u32, SystemError> {
+        if optval.len() < 4 {
+            return Err(SystemError::EINVAL);
+        }
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&optval[..4]);
+        Ok(u32::from_ne_bytes(raw))
+    }
+
+    fn parse_timeval_opt(optval: &[u8]) -> Result<Duration, SystemError> {
+        // Accept both 64-bit and 32-bit timeval layouts.
+        if optval.len() >= 16 {
+            let mut sec_raw = [0u8; 8];
+            let mut usec_raw = [0u8; 8];
+            sec_raw.copy_from_slice(&optval[..8]);
+            usec_raw.copy_from_slice(&optval[8..16]);
+            let sec = i64::from_ne_bytes(sec_raw);
+            let usec = i64::from_ne_bytes(usec_raw);
+            if sec < 0 || !(0..1_000_000).contains(&usec) {
+                return Err(SystemError::EINVAL);
+            }
+            let total_us = (sec as u64)
+                .saturating_mul(1_000_000)
+                .saturating_add(usec as u64);
+            return Ok(Duration::from_micros(total_us));
+        }
+
+        if optval.len() >= 12 {
+            let mut sec_raw = [0u8; 8];
+            let mut usec_raw = [0u8; 4];
+            sec_raw.copy_from_slice(&optval[..8]);
+            usec_raw.copy_from_slice(&optval[8..12]);
+            let sec = i64::from_ne_bytes(sec_raw);
+            let usec = i32::from_ne_bytes(usec_raw) as i64;
+            if sec < 0 || !(0..1_000_000).contains(&usec) {
+                return Err(SystemError::EINVAL);
+            }
+            let total_us = (sec as u64)
+                .saturating_mul(1_000_000)
+                .saturating_add(usec as u64);
+            return Ok(Duration::from_micros(total_us));
+        }
+
+        Err(SystemError::EINVAL)
+    }
+
+    fn write_timeval(value: &mut [u8], us: u64) -> Result<usize, SystemError> {
+        if value.len() < 16 {
+            return Err(SystemError::EINVAL);
+        }
+        let sec = (us / 1_000_000) as i64;
+        let usec = (us % 1_000_000) as i64;
+        value[..8].copy_from_slice(&sec.to_ne_bytes());
+        value[8..16].copy_from_slice(&usec.to_ne_bytes());
+        Ok(16)
+    }
+
+    fn effective_sockbuf(requested: usize) -> usize {
+        let requested = core::cmp::max(Self::MIN_SOCKET_BUF_SIZE, requested);
+        requested.saturating_mul(2)
+    }
+
+    fn send_timeout(&self) -> Option<Duration> {
+        let us = self.send_timeout_us.load(Ordering::Relaxed);
+        if us == 0 {
+            None
+        } else {
+            Some(Duration::from_micros(us))
+        }
+    }
+
+    fn recv_timeout(&self) -> Option<Duration> {
+        let us = self.recv_timeout_us.load(Ordering::Relaxed);
+        if us == 0 {
+            None
+        } else {
+            Some(Duration::from_micros(us))
+        }
+    }
+
+    fn wait_event_interruptible_timeout<F>(
+        &self,
+        mut cond: F,
+        timeout: Option<Duration>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = timeout.map(|t| Instant::now() + t);
+        loop {
+            if cond() {
+                return Ok(());
+            }
+
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+            }
+
+            let remain =
+                deadline.map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
+
+            let (waiter, waker) = Waiter::new_pair();
+            self.wait_queue.register_waker(waker.clone())?;
+
+            if cond() {
+                self.wait_queue.remove_waker(&waker);
+                return Ok(());
+            }
+
+            if crate::arch::ipc::signal::Signal::signal_pending_state(
+                true,
+                false,
+                &crate::process::ProcessManager::current_pcb(),
+            ) {
+                self.wait_queue.remove_waker(&waker);
+                return Err(SystemError::ERESTARTSYS);
+            }
+
+            // If there is a timeout, arm a timer that wakes this waiter.
+            let timer = if let Some(remain) = remain {
+                if remain == Duration::ZERO {
+                    self.wait_queue.remove_waker(&waker);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                let sleep_us = remain.total_micros();
+                let t: Arc<Timer> = Timer::new(
+                    TimeoutWaker::new(waker.clone()),
+                    next_n_us_timer_jiffies(sleep_us),
+                );
+                t.activate();
+                Some(t)
+            } else {
+                None
+            };
+
+            let wait_res = waiter.wait(true);
+            let was_timeout = timer.as_ref().map(|t| t.timeout()).unwrap_or(false);
+            if !was_timeout {
+                if let Some(t) = timer {
+                    t.cancel();
+                }
+            }
+
+            self.wait_queue.remove_waker(&waker);
+
+            if let Err(SystemError::ERESTARTSYS) = wait_res {
+                return Err(SystemError::ERESTARTSYS);
+            }
+            wait_res?;
+        }
+    }
+
+    fn wake_peer_writable(&self) {
+        if let Some(peer_weak) = self.peer.lock().as_ref() {
+            if let Some(peer) = peer_weak.upgrade() {
+                peer.wait_queue
+                    .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+                let _ = EventPoll::wakeup_epoll(
+                    peer.epoll_items().as_ref(),
+                    EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM,
+                );
+                peer.fasync_items.send_sigio();
+            }
+        }
     }
 
     pub fn new(is_nonblocking: bool, is_seqpacket: bool) -> Arc<Self> {
@@ -149,7 +333,7 @@ impl UnixStreamSocket {
         match self.inner.read().as_ref().expect("inner is None") {
             Inner::Connected(connected) => connected.try_send(buffer, self.is_seqpacket),
             _ => {
-                log::error!("the socket is not connected");
+                // log::error!("the socket is not connected");
                 return Err(SystemError::ENOTCONN);
             }
         }
@@ -324,7 +508,7 @@ impl Socket for UnixStreamSocket {
     }
 
     fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
-        debug!("stream server begin accept");
+        // debug!("stream server begin accept");
         if self.is_nonblocking() {
             self.try_accept()
         } else {
@@ -347,6 +531,45 @@ impl Socket for UnixStreamSocket {
         let opt = crate::net::socket::PSO::try_from(optname as u32)
             .map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
+            crate::net::socket::PSO::SNDBUF | crate::net::socket::PSO::SNDBUFFORCE => {
+                let requested = Self::parse_u32_opt(optval)? as usize;
+                let effective = Self::effective_sockbuf(requested);
+                self.sndbuf.store(effective, Ordering::SeqCst);
+
+                // Underlying ring buffer requires power-of-two capacity.
+                let mut new_cap = effective.next_power_of_two();
+                new_cap = core::cmp::max(new_cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
+
+                if let Some(Inner::Connected(connected)) = self.inner.read().as_ref() {
+                    connected.resize_sendbuf(new_cap);
+                }
+                Ok(())
+            }
+            crate::net::socket::PSO::RCVBUF | crate::net::socket::PSO::RCVBUFFORCE => {
+                let requested = Self::parse_u32_opt(optval)? as usize;
+                let effective = Self::effective_sockbuf(requested);
+                self.rcvbuf.store(effective, Ordering::SeqCst);
+
+                let mut new_cap = effective.next_power_of_two();
+                new_cap = core::cmp::max(new_cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
+
+                if let Some(Inner::Connected(connected)) = self.inner.read().as_ref() {
+                    connected.resize_recvbuf(new_cap);
+                }
+                Ok(())
+            }
+            crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
+                let d = Self::parse_timeval_opt(optval)?;
+                self.send_timeout_us
+                    .store(d.total_micros(), Ordering::SeqCst);
+                Ok(())
+            }
+            crate::net::socket::PSO::RCVTIMEO_OLD | crate::net::socket::PSO::RCVTIMEO_NEW => {
+                let d = Self::parse_timeval_opt(optval)?;
+                self.recv_timeout_us
+                    .store(d.total_micros(), Ordering::SeqCst);
+                Ok(())
+            }
             crate::net::socket::PSO::PASSCRED => {
                 if optval.len() < 4 {
                     return Err(SystemError::EINVAL);
@@ -400,7 +623,21 @@ impl Socket for UnixStreamSocket {
     fn recv(&self, buffer: &mut [u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
         let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
         loop {
-            let result = if _flags.contains(socket::PMSG::PEEK) {
+            let result = if self.is_seqpacket {
+                let peek = _flags.contains(socket::PMSG::PEEK);
+                match self.inner.read().as_ref().expect("inner is None") {
+                    Inner::Connected(connected) => connected
+                        .try_recv_seqpacket_meta(buffer, peek)
+                        .map(|(copy_len, orig_len, _truncated)| {
+                            if _flags.contains(socket::PMSG::TRUNC) {
+                                orig_len
+                            } else {
+                                copy_len
+                            }
+                        }),
+                    _ => Err(SystemError::ENOTCONN),
+                }
+            } else if _flags.contains(socket::PMSG::PEEK) {
                 match self.inner.read().as_ref().expect("inner is None") {
                     Inner::Connected(connected) => connected.try_peek(buffer, self.is_seqpacket),
                     _ => Err(SystemError::ENOTCONN),
@@ -411,10 +648,16 @@ impl Socket for UnixStreamSocket {
 
             match result {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                    wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                    self.wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
                     continue;
                 }
-                other => return other,
+                Ok(n) => {
+                    if n != 0 && !_flags.contains(socket::PMSG::PEEK) {
+                        self.wake_peer_writable();
+                    }
+                    return Ok(n);
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -518,18 +761,61 @@ impl Socket for UnixStreamSocket {
         };
 
         // Read payload first.
-        let recv_size = self.recv(&mut buf[..max_read], _flags)?;
-        if recv_size != 0 {
-            iovs.scatter(&buf[..recv_size])?;
+        let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
+        let peek = _flags.contains(socket::PMSG::PEEK);
+        let (payload_copy_len, orig_len, truncated, ret_len) = if self.is_seqpacket {
+            loop {
+                match self
+                    .inner
+                    .read()
+                    .as_ref()
+                    .expect("UnixStreamSocket inner is None")
+                {
+                    Inner::Connected(connected) => {
+                        match connected.try_recv_seqpacket_meta(&mut buf[..max_read], peek) {
+                            Ok((copy_len, orig_len, truncated)) => {
+                                let ret_len = if _flags.contains(socket::PMSG::TRUNC) {
+                                    orig_len
+                                } else {
+                                    copy_len
+                                };
+                                break (copy_len, orig_len, truncated, ret_len);
+                            }
+                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                                self.wait_event_interruptible_timeout(
+                                    || self.can_recv(),
+                                    self.recv_timeout(),
+                                )?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    _ => return Err(SystemError::ENOTCONN),
+                }
+            }
+        } else {
+            let recv_size = self.recv(&mut buf[..max_read], _flags)?;
+            (recv_size, recv_size, false, recv_size)
+        };
+
+        if payload_copy_len != 0 {
+            iovs.scatter(&buf[..payload_copy_len])?;
+            if !peek {
+                self.wake_peer_writable();
+            }
         }
 
         // Default: no flags.
         msg.msg_flags = 0;
+        if truncated {
+            msg.msg_flags |= socket::PMSG::TRUNC.bits() as i32;
+        }
         // Default: no control returned.
         msg.msg_controllen = 0;
 
-        // EOF: no ancillary data.
-        if recv_size == 0 {
+        // EOF (or empty record): no ancillary data.
+        if orig_len == 0 && payload_copy_len == 0 {
             return Ok(0);
         }
 
@@ -539,14 +825,14 @@ impl Socket for UnixStreamSocket {
         let has_rights = !scm_rights.is_empty();
         if !want_creds && !has_rights {
             // No ancillary to return.
-            return Ok(recv_size);
+            return Ok(ret_len);
         }
 
         // If userspace didn't provide a control buffer, just report truncation.
         if control_ptr.is_null() || control_len == 0 {
             msg.msg_flags |= MSG_CTRUNC;
             msg.msg_controllen = 0;
-            return Ok(recv_size);
+            return Ok(ret_len);
         }
 
         let hdr_len = core::mem::size_of::<Cmsghdr>();
@@ -589,7 +875,7 @@ impl Socket for UnixStreamSocket {
             if fit == 0 {
                 msg.msg_flags |= MSG_CTRUNC;
                 msg.msg_controllen = write_off;
-                return Ok(recv_size);
+                return Ok(ret_len);
             }
 
             if fit < scm_rights.len() {
@@ -631,11 +917,62 @@ impl Socket for UnixStreamSocket {
         }
 
         msg.msg_controllen = write_off;
-        Ok(recv_size)
+        Ok(ret_len)
     }
 
     fn send(&self, buffer: &[u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
-        let result = self.try_send_with_meta(buffer);
+        let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
+
+        if self.is_seqpacket {
+            // For SOCK_SEQPACKET, reject messages larger than SO_SNDBUF.
+            // Account for our internal 4-byte record header.
+            let needed = buffer.len().saturating_add(core::mem::size_of::<u32>());
+            if needed > self.sndbuf.load(Ordering::Relaxed) {
+                return Err(SystemError::EMSGSIZE);
+            }
+        }
+
+        let deadline = self.send_timeout().map(|t| Instant::now() + t);
+
+        let result = loop {
+            match self.try_send_with_meta(buffer) {
+                Ok(v) => break Ok(v),
+                Err(SystemError::ENOBUFS) if nonblock => {
+                    break Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                }
+                Err(SystemError::ENOBUFS) => {
+                    let timeout = deadline
+                        .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
+                    self.wait_event_interruptible_timeout(
+                        || match self
+                            .inner
+                            .read()
+                            .as_ref()
+                            .expect("UnixStreamSocket inner is None")
+                        {
+                            Inner::Connected(connected) => {
+                                let need = if self.is_seqpacket {
+                                    buffer.len() + core::mem::size_of::<u32>()
+                                } else {
+                                    1
+                                };
+                                connected.send_free_len() >= need
+                            }
+                            _ => true,
+                        },
+                        timeout,
+                    )?;
+
+                    if let Some(d) = deadline {
+                        if Instant::now() >= d {
+                            break Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                        }
+                    }
+                    continue;
+                }
+                Err(e) => break Err(e),
+            }
+        };
 
         // Auto-attach SCM_CREDENTIALS when SO_PASSCRED is enabled on either endpoint.
         if let Ok((sent, start, _written_len)) = result {
@@ -699,6 +1036,15 @@ impl Socket for UnixStreamSocket {
         // Gather payload from user iovecs.
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
         let buf = iovs.gather()?;
+
+        if self.is_seqpacket {
+            // For SOCK_SEQPACKET, the whole message must fit in SO_SNDBUF.
+            // gVisor expects EMSGSIZE (not ENOBUFS) when the message itself is too large.
+            let needed = buf.len().saturating_add(core::mem::size_of::<u32>());
+            if needed > self.sndbuf.load(Ordering::Relaxed) {
+                return Err(SystemError::EMSGSIZE);
+            }
+        }
 
         // Parse SCM_RIGHTS / SCM_CREDENTIALS from msg_control (if present).
         let mut rights_files: alloc::vec::Vec<
@@ -812,21 +1158,20 @@ impl Socket for UnixStreamSocket {
 
     fn send_to(
         &self,
-        _buffer: &[u8],
-        _flags: socket::PMSG,
+        buffer: &[u8],
+        flags: socket::PMSG,
         _address: Endpoint,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+        // Linux accepts sendto() on connected AF_UNIX seqpacket/stream sockets; ignore address.
+        self.send(buffer, flags)
     }
 
     fn send_buffer_size(&self) -> usize {
-        log::warn!("using default buffer size");
-        UnixStreamSocket::DEFAULT_BUF_SIZE
+        self.sndbuf.load(Ordering::Relaxed)
     }
 
     fn recv_buffer_size(&self) -> usize {
-        log::warn!("using default buffer size");
-        UnixStreamSocket::DEFAULT_BUF_SIZE
+        self.rcvbuf.load(Ordering::Relaxed)
     }
 
     fn epoll_items(&self) -> &EPollItems {
@@ -845,11 +1190,33 @@ impl Socket for UnixStreamSocket {
         let opt =
             crate::net::socket::PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
+            crate::net::socket::PSO::SNDBUF => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let v = self.send_buffer_size() as u32;
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
+            crate::net::socket::PSO::RCVBUF => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let v = self.recv_buffer_size() as u32;
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
+            crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
+                Self::write_timeval(value, self.send_timeout_us.load(Ordering::Relaxed))
+            }
+            crate::net::socket::PSO::RCVTIMEO_OLD | crate::net::socket::PSO::RCVTIMEO_NEW => {
+                Self::write_timeval(value, self.recv_timeout_us.load(Ordering::Relaxed))
+            }
             crate::net::socket::PSO::PASSCRED => {
                 if value.len() < 4 {
                     return Err(SystemError::EINVAL);
                 }
-                let v: i32 = if self.passcred.load(core::sync::atomic::Ordering::Relaxed) {
+                let v: i32 = if self.passcred.load(Ordering::Relaxed) {
                     1
                 } else {
                     0
@@ -862,6 +1229,49 @@ impl Socket for UnixStreamSocket {
     }
 
     fn do_close(&self) -> Result<(), SystemError> {
+        // Close semantics for unix stream/seqpacket sockets:
+        // - Mark both directions shutdown so peer sees EOF on read and EPIPE on write.
+        // - Drop Listener to unregister backlog.
+        let Some(inner) = self.inner.write().take() else {
+            // Already closed.
+            return Ok(());
+        };
+
+        match inner {
+            Inner::Connected(connected) => {
+                // Inform peer that we will no longer receive or send.
+                connected.shutdown_recv();
+                connected.shutdown_send();
+
+                // Wake local waiters.
+                self.wait_queue
+                    .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+
+                // Wake peer waiters/epoll so blocking read/write can observe shutdown.
+                if let Some(peer_weak) = self.peer.lock().as_ref() {
+                    if let Some(peer) = peer_weak.upgrade() {
+                        peer.wait_queue
+                            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+                        let _ = EventPoll::wakeup_epoll(
+                            peer.epoll_items().as_ref(),
+                            EPollEventType::EPOLLIN
+                                | EPollEventType::EPOLLRDNORM
+                                | EPollEventType::EPOLLHUP
+                                | EPollEventType::EPOLLOUT
+                                | EPollEventType::EPOLLWRNORM,
+                        );
+                        peer.fasync_items.send_sigio();
+                    }
+                }
+            }
+            Inner::Listener(_listener) => {
+                // Drop unregisters the backlog.
+            }
+            Inner::Init(_init) => {
+                // Nothing special.
+            }
+        }
+
         Ok(())
     }
 

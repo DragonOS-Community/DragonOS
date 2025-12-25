@@ -363,27 +363,82 @@ impl Signal {
     ///
     /// - `false` 不能发送信号
     fn prepare_sianal(&self, pcb: Arc<ProcessControlBlock>, _force: bool) -> bool {
+        // 统一从线程组组长的 ThreadInfo 中获取完整线程列表。
+        // 注意：当前 sighand 共享在 CLONE_THREAD 线程组内，因此标志位操作仍然只需要对共享 sighand 做一次。
+        let thread_group_leader = {
+            let ti = pcb.threads_read_irqsave();
+            ti.group_leader().unwrap_or_else(|| pcb.clone())
+        };
+
+        let for_each_thread_in_group = |f: &mut dyn FnMut(&Arc<ProcessControlBlock>)| {
+            // 先处理组长
+            f(&thread_group_leader);
+            // 再处理其他线程
+            let group_tasks = {
+                let ti = thread_group_leader.threads_read_irqsave();
+                ti.group_tasks_clone()
+            };
+            for weak in group_tasks {
+                if let Some(t) = weak.upgrade() {
+                    // 可能包含组长或重复；跳过重复即可
+                    if Arc::ptr_eq(&t, &thread_group_leader) {
+                        continue;
+                    }
+                    f(&t);
+                }
+            }
+        };
+
         let flush: SigSet;
         if !(self.into_sigset() & SIG_KERNEL_STOP_MASK).is_empty() {
             flush = Signal::SIGCONT.into_sigset();
-            pcb.sighand().shared_pending_flush_by_mask(&flush);
+            // Stop 类信号：清理 SIGCONT（共享 + 各线程私有 pending）
+            thread_group_leader
+                .sighand()
+                .shared_pending_flush_by_mask(&flush);
+            for_each_thread_in_group(&mut |t| {
+                t.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
+            });
             // 异步作业控制停止：立即将目标进程置为 Stopped，并上报/唤醒父进程等待
             // 这样即便目标进程尚未返回用户态执行默认处理，也能及时观测到 WSTOPPED 事件
-            pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
-            pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
-            let _ = ProcessManager::stop_task(&pcb);
+            thread_group_leader
+                .sighand()
+                .flags_insert(SignalFlags::CLD_STOPPED);
+            thread_group_leader
+                .sighand()
+                .flags_insert(SignalFlags::STOP_STOPPED);
+
+            // 线程组 stop：对组内所有线程置为 Stopped，保证 SIGSTOP 对整个线程组生效。
+            for_each_thread_in_group(&mut |t| {
+                let _ = ProcessManager::stop_task(t);
+            });
+
             if let Some(parent) = pcb.parent_pcb() {
                 let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
                 parent.wake_all_waiters();
             }
-            pcb.wake_all_waiters();
-            // TODO 对每个子线程 flush mask
+            // 唤醒等待在该子进程/线程上的等待者
+            thread_group_leader.wake_all_waiters();
+            for_each_thread_in_group(&mut |t| {
+                t.wake_all_waiters();
+            });
+
+            // SIGSTOP 是 kernel-only stop 信号：其效果是把线程组置为 stopped 并通知父进程，
+            // 不应作为“可传递到用户态”的 pending 信号继续入队。
+            // 否则在 SIGCONT 后可能错误地以 EINTR/ERESTART* 形式打断正在执行的系统调用（gVisor sigstop_test 即依赖这一点）。
+            if *self == Signal::SIGSTOP {
+                return false;
+            }
         } else if *self == Signal::SIGCONT {
             flush = SIG_KERNEL_STOP_MASK;
             assert!(!flush.is_empty());
             // 清理 STOP 类挂起信号
-            pcb.sighand().shared_pending_flush_by_mask(&flush);
-            pcb.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
+            thread_group_leader
+                .sighand()
+                .shared_pending_flush_by_mask(&flush);
+            for_each_thread_in_group(&mut |t| {
+                t.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
+            });
 
             // 仅当确实处于 job-control stopped 时，才报告 continued 事件并通知父进程
             let was_stopped = {
@@ -394,25 +449,38 @@ impl Signal {
             };
 
             if was_stopped {
-                let _ = ProcessManager::wakeup_stop(&pcb);
+                // 线程组 continue：唤醒组内所有线程（由各线程在内核路径继续执行/重新阻塞）。
+                for_each_thread_in_group(&mut |t| {
+                    let _ = ProcessManager::wakeup_stop(t);
+                });
                 // 标记继续事件，供 waitid(WCONTINUED) 可见
-                pcb.sighand().flags_insert(SignalFlags::CLD_CONTINUED);
-                pcb.sighand().flags_insert(SignalFlags::STOP_CONTINUED);
+                thread_group_leader
+                    .sighand()
+                    .flags_insert(SignalFlags::CLD_CONTINUED);
+                thread_group_leader
+                    .sighand()
+                    .flags_insert(SignalFlags::STOP_CONTINUED);
                 // 清理停止相关标志，符合 Linux 语义
-                pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
-                pcb.sighand().flags_remove(SignalFlags::STOP_STOPPED);
+                thread_group_leader
+                    .sighand()
+                    .flags_remove(SignalFlags::CLD_STOPPED);
+                thread_group_leader
+                    .sighand()
+                    .flags_remove(SignalFlags::STOP_STOPPED);
                 if let Some(parent) = pcb.parent_pcb() {
                     let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
                     parent.wake_all_waiters();
                 }
                 // 唤醒等待在该子进程上的等待者
-                pcb.wake_all_waiters();
+                thread_group_leader.wake_all_waiters();
+                for_each_thread_in_group(&mut |t| {
+                    t.wake_all_waiters();
+                });
             }
-            // 如果未处于 stopped，则不生成 CLD_CONTINUED/不通知父进程
-            // TODO 对每个子线程 flush mask；对齐 Linux 更完整语义
-            // SIGCONT 不能被忽略，否则会与 STOP 信号竞态导致任务永久停止。
-            // 始终允许其进入后续路径完成 pending/唤醒逻辑。
-            return true;
+            // 如果未处于 stopped，则不生成 CLD_CONTINUED/不通知父进程。
+            // SIGCONT 需要完成“继续运行”的语义，但若其在当前 handler 语义下会被忽略（默认忽略且未被阻塞），
+            // 则不应继续入队为 pending，否则可能错误地打断可重启系统调用。
+            return !self.sig_ignored(&pcb, _force);
         }
 
         //TODO 仿照 linux 中的prepare signal完善逻辑，linux 中还会根据例如当前进程状态(Existing)进行判断，现在的信号能否发出就只是根据 ignored 来判断

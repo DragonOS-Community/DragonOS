@@ -4,7 +4,6 @@ use alloc::{boxed::Box, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::Signal,
     arch::{CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
     process::ProcessManager,
@@ -46,42 +45,34 @@ pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError
     let handler: Box<WakeUpHelper> = WakeUpHelper::new(ProcessManager::current_pcb());
     let timer: Arc<Timer> = Timer::new(handler, next_n_us_timer_jiffies(total_sleep_time_us));
 
-    let irq_guard: crate::exception::IrqFlagsGuard =
-        unsafe { CurrentIrqArch::save_and_disable_irq() };
-    ProcessManager::mark_sleep(true).ok();
-
     let start_time = getnstimeofday();
     timer.activate();
 
-    drop(irq_guard);
-    schedule(SchedMode::SM_NONE);
+    // Linux 语义：等待可能出现伪唤醒；只有在收到未被屏蔽的信号时才中断。
+    // 对于 job-control stop/continue 这类不应直接对用户态暴露的唤醒，应继续等待直到到期。
+    loop {
+        let irq_guard: crate::exception::IrqFlagsGuard =
+            unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::mark_sleep(true).ok();
+        drop(irq_guard);
+        schedule(SchedMode::SM_NONE);
 
-    let end_time = getnstimeofday();
+        if timer.timeout() {
+            break;
+        }
 
-    // 如果定时器没有超时（被信号或其他原因唤醒），则立即视为被中断
-    let was_interrupted = if !timer.timeout() {
-        timer.cancel();
-        true
-        // log::debug!("nanosleep: woken up before timeout -> interrupted");
-    } else {
-        // 附加检查：存在待处理信号也视为被中断
+        // 未到期而被唤醒：若存在未屏蔽待处理信号，则视为被信号打断；否则认为是伪唤醒，继续等待。
         let current_pcb = ProcessManager::current_pcb();
-        current_pcb.has_pending_signal_fast()
-            || Signal::signal_pending_state(true, false, &current_pcb)
-        // if was_interrupted {
-        //     log::debug!("nanosleep: timeout but pending signal detected");
-        // }
-    };
-
-    // 返回正确的剩余时间
-    let real_sleep_time = end_time - start_time;
-    let rm_time: PosixTimeSpec = (sleep_time - real_sleep_time.into()).into();
-
-    // 如果被信号中断，返回 ERESTARTSYS 错误
-    if was_interrupted {
-        // log::debug!("nanosleep: return ERESTARTSYS");
-        return Err(SystemError::ERESTARTSYS);
+        let has_real_signal =
+            current_pcb.has_pending_signal_fast() && current_pcb.has_pending_not_masked_signal();
+        if has_real_signal {
+            timer.cancel();
+            return Err(SystemError::ERESTARTSYS);
+        }
     }
 
-    return Ok(rm_time);
+    let end_time = getnstimeofday();
+    let real_sleep_time = end_time - start_time;
+    let rm_time: PosixTimeSpec = (sleep_time - real_sleep_time.into()).into();
+    Ok(rm_time)
 }

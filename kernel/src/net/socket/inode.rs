@@ -111,37 +111,37 @@ fn handle_siocgifconf(data: usize) -> Result<usize, SystemError> {
         }
     }
 
-    // Also check loopback interface explicitly.
-    if let Some(loopback) = netns.loopback_iface() {
-        // Check if loopback already added.
-        let lo_name = "lo";
-        let already_added = ifreqs.iter().any(|req| {
-            let name_str = core::str::from_utf8(&req.ifr_name)
-                .unwrap_or("")
-                .trim_end_matches('\0');
-            name_str == lo_name
-        });
+    // Linux 语义：SIOCGIFCONF 至少应该能看到 lo（loopback）。
+    // 在 DragonOS 的某些启动/配置场景下，loopback 设备可能尚未被注册到 netns，
+    // 但用户态仍期望能通过该 ioctl 观察到 127.0.0.1。
+    let lo_name = "lo";
+    let already_added = ifreqs.iter().any(|req| {
+        // ifr_name 是以 NUL 结尾的 C 字符串。
+        let end = req
+            .ifr_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(IFNAMSIZ);
+        &req.ifr_name[..end] == lo_name.as_bytes()
+    });
 
-        if !already_added {
-            // Try to get loopback's IPv4 address.
-            let lo_iface: &dyn Iface = loopback.as_ref();
-            let ipv4_addr = lo_iface
-                .common()
-                .ipv4_addr()
-                .unwrap_or(core::net::Ipv4Addr::new(127, 0, 0, 1));
+    if !already_added {
+        let ipv4_addr = netns
+            .loopback_iface()
+            .and_then(|lo| lo.as_ref().common().ipv4_addr())
+            .unwrap_or(core::net::Ipv4Addr::new(127, 0, 0, 1));
 
-            let mut ifreq = IfReq::default();
-            ifreq.ifr_name[..2].copy_from_slice(lo_name.as_bytes());
+        let mut ifreq = IfReq::default();
+        ifreq.ifr_name[..2].copy_from_slice(lo_name.as_bytes());
 
-            let addr = SockAddrIn {
-                sin_family: 2, // AF_INET
-                sin_port: 0,
-                sin_addr: u32::from_ne_bytes(ipv4_addr.octets()),
-                sin_zero: [0u8; 8],
-            };
-            ifreq.set_sockaddr_in(&addr);
-            ifreqs.push(ifreq);
-        }
+        let addr = SockAddrIn {
+            sin_family: 2, // AF_INET
+            sin_port: 0,
+            sin_addr: u32::from_ne_bytes(ipv4_addr.octets()),
+            sin_zero: [0u8; 8],
+        };
+        ifreq.set_sockaddr_in(&addr);
+        ifreqs.push(ifreq);
     }
 
     // Move "lo" to the front if it exists (some tests expect loopback first)

@@ -1,21 +1,35 @@
 use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::file::File;
 use crate::libs::rwlock::RwLock;
 use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::unix::ring_buffer::{RbConsumer, RbProducer, RingBuffer};
 use crate::net::socket::unix::stream::UnixStreamSocket;
+use crate::net::socket::unix::UCred;
 use crate::net::socket::unix::{UnixEndpoint, UnixEndpointBound};
 use crate::net::socket::Socket;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use alloc::{string::String, sync::Arc};
+use core::mem::size_of;
+use core::num::Wrapping;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use log::debug;
 use system_error::SystemError;
 
 pub(in crate::net) const UNIX_STREAM_DEFAULT_BUF_SIZE: usize = 65536;
+
+/// SCM snapshot for recvmsg containing position and ancillary data
+pub(super) struct ScmSnapshot {
+    /// Head position in the ring buffer
+    pub(super) head: Wrapping<usize>,
+    /// SCM data at head (optional credentials and file rights)
+    pub(super) scm_data: Option<(Option<UCred>, Vec<Arc<File>>)>,
+    /// Next SCM offset after head
+    pub(super) next_scm_offset: Option<Wrapping<usize>>,
+}
 
 #[derive(Debug)]
 pub(super) enum Inner {
@@ -150,12 +164,26 @@ impl Connected {
         Ok(())
     }
 
-    pub(super) fn try_send(&self, buf: &[u8], is_seqpacket: bool) -> Result<usize, SystemError> {
+    pub(super) fn try_send(
+        &self,
+        buf: &[u8],
+        is_seqpacket: bool,
+    ) -> Result<(usize, Wrapping<usize>, usize), SystemError> {
         let is_empty = buf.is_empty();
         if is_empty {
             //todo 判断shutdown
             if !is_seqpacket {
-                return Ok(0);
+                return Ok((0, Wrapping(0), 0));
+            }
+        }
+
+        // shutdown(2) semantics:
+        // - If this end has SHUT_WR, sending must fail with EPIPE.
+        // - If peer has SHUT_RD, sending must fail with EPIPE.
+        {
+            let guard = self.writer.lock();
+            if guard.is_send_shutdown() || guard.is_recv_shutdown() {
+                return Err(SystemError::EPIPE);
             }
         }
 
@@ -174,6 +202,7 @@ impl Connected {
             buf.to_vec()
         };
         let mut guard = self.writer.lock();
+        let start = guard.tail();
         let can_send = guard.free_len() >= buffer.len();
 
         // log::info!("Going to send {} bytes", buffer.len());
@@ -184,13 +213,20 @@ impl Connected {
             return Err(SystemError::ENOBUFS);
         }
 
-        Ok(buf.len())
+        Ok((buf.len(), start, buffer.len()))
     }
 
     pub fn try_recv(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
         if is_seqpacket {
-            if self.reader.lock().len() < size_of::<u32>() {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            {
+                let guard = self.reader.lock();
+                if guard.len() < size_of::<u32>() {
+                    // If peer has SHUT_WR and the receive queue is empty, return EOF.
+                    if guard.is_send_shutdown() {
+                        return Ok(0);
+                    }
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
             }
 
             let mut len_buf = [0u8; 4];
@@ -212,13 +248,151 @@ impl Connected {
             self.reader.lock().pop_slice(&mut buf[..len]);
             Ok(len)
         } else {
-            let avail_len = self.reader.lock().len();
-            if avail_len == 0 {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
+            let avail_len = {
+                let guard = self.reader.lock();
+                let len = guard.len();
+                if len == 0 {
+                    // If peer has SHUT_WR and the receive queue is empty, return EOF.
+                    if guard.is_send_shutdown() {
+                        return Ok(0);
+                    }
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                len
+            };
             let len = core::cmp::min(buf.len(), avail_len);
             self.reader.lock().pop_slice(&mut buf[..len]);
             Ok(len)
+        }
+    }
+
+    pub fn try_peek(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
+        if is_seqpacket {
+            let guard = self.reader.lock();
+            if guard.len() < size_of::<u32>() {
+                if guard.is_send_shutdown() {
+                    return Ok(0);
+                }
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            let mut len_buf = [0u8; 4];
+            if guard.peek_slice(&mut len_buf).is_none() {
+                return Err(SystemError::EFAULT);
+            }
+            let len = u32::from_ne_bytes(len_buf) as usize;
+            if len == 0 {
+                return Ok(0);
+            }
+            if buf.len() < len {
+                return Err(SystemError::EMSGSIZE);
+            }
+            if guard.len() < size_of::<u32>() + len {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            let payload_off = guard.head() + Wrapping(size_of::<u32>());
+            if guard.peek_slice_at(payload_off, &mut buf[..len]).is_none() {
+                return Err(SystemError::EFAULT);
+            }
+            Ok(len)
+        } else {
+            let guard = self.reader.lock();
+            let avail_len = guard.len();
+            if avail_len == 0 {
+                if guard.is_send_shutdown() {
+                    return Ok(0);
+                }
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            let len = core::cmp::min(buf.len(), avail_len);
+            if guard.peek_slice(&mut buf[..len]).is_none() {
+                return Err(SystemError::EFAULT);
+            }
+            Ok(len)
+        }
+    }
+
+    pub(super) fn readable_len(&self, is_seqpacket: bool) -> usize {
+        if is_seqpacket {
+            let guard = self.reader.lock();
+            if guard.len() < size_of::<u32>() {
+                return 0;
+            }
+
+            let mut len_buf = [0u8; 4];
+            if guard.peek_slice(&mut len_buf).is_none() {
+                return 0;
+            }
+
+            let len = u32::from_ne_bytes(len_buf) as usize;
+            // If the header is present but the payload isn't fully queued yet,
+            // report 0 (can't read a full record without blocking).
+            if guard.len() < size_of::<u32>() + len {
+                return 0;
+            }
+
+            len
+        } else {
+            self.reader.lock().len()
+        }
+    }
+
+    pub(super) fn outq_len(&self, _is_seqpacket: bool) -> usize {
+        // Approximation: bytes sitting in the local-to-peer ring buffer,
+        // i.e. written but not yet consumed by the peer.
+        self.writer.lock().len()
+    }
+
+    pub(super) fn shutdown_recv(&self) {
+        self.reader.lock().set_recv_shutdown();
+    }
+
+    pub(super) fn shutdown_send(&self) {
+        self.writer.lock().set_send_shutdown();
+    }
+
+    pub(super) fn peer_send_shutdown(&self) -> bool {
+        self.reader.lock().is_send_shutdown()
+    }
+
+    pub(super) fn push_scm_at(
+        &self,
+        offset: Wrapping<usize>,
+        cred: Option<UCred>,
+        rights: Vec<Arc<File>>,
+    ) {
+        self.writer.lock().push_scm_at(offset, cred, rights)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn peek_scm_at_head(&self) -> Option<(Option<UCred>, Vec<Arc<File>>)> {
+        let guard = self.reader.lock();
+        let head = guard.head();
+        guard.peek_scm_at(head)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn read_head(&self) -> Wrapping<usize> {
+        self.reader.lock().head()
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn next_scm_offset_after_head(&self) -> Option<Wrapping<usize>> {
+        let guard = self.reader.lock();
+        let head = guard.head();
+        guard.next_scm_offset_after(head)
+    }
+
+    pub(super) fn scm_snapshot_for_recvmsg(&self) -> ScmSnapshot {
+        let guard = self.reader.lock();
+        let head = guard.head();
+        let scm_data = guard.peek_scm_at(head);
+        let next_scm_offset = guard.next_scm_offset_after(head);
+        ScmSnapshot {
+            head,
+            scm_data,
+            next_scm_offset,
         }
     }
 
@@ -266,11 +440,16 @@ impl Listener {
     pub(super) fn try_accept(
         &self,
         is_seqpacket: bool,
+        inherit_passcred: bool,
     ) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
         let connected = self.backlog.pop_incoming()?;
 
         let peer_addr = connected.peer_endpoint().into();
         let socket = UnixStreamSocket::new_connected(connected, false, is_seqpacket);
+
+        socket
+            .passcred
+            .store(inherit_passcred, core::sync::atomic::Ordering::Relaxed);
 
         Ok((socket, peer_addr))
     }

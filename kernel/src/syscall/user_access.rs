@@ -319,9 +319,29 @@ impl UserBufferReader<'_> {
         dst: &mut [T],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let data = self.convert_with_offset(self.buffer, offset)?;
-        dst.copy_from_slice(data);
-        return Ok(dst.len());
+        if dst.is_empty() {
+            return Ok(0);
+        }
+
+        let bytes_needed = dst
+            .len()
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(SystemError::EINVAL)?;
+
+        if offset
+            .checked_add(bytes_needed)
+            .filter(|end| *end <= self.buffer.len())
+            .is_none()
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        // Copy exact bytes into dst without relying on a typed view of the entire remaining buffer.
+        let src_bytes = &self.buffer[offset..offset + bytes_needed];
+        let dst_bytes =
+            unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, bytes_needed) };
+        dst_bytes.copy_from_slice(src_bytes);
+        Ok(dst.len())
     }
 
     /// Copy data from user space with page mapping and permission verification
@@ -343,9 +363,37 @@ impl UserBufferReader<'_> {
         dst: &mut [T],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let data = self.convert_with_offset_checked(self.buffer, offset)?;
-        dst.copy_from_slice(data);
-        return Ok(dst.len());
+        if dst.is_empty() {
+            return Ok(0);
+        }
+
+        let bytes_needed = dst
+            .len()
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(SystemError::EINVAL)?;
+
+        if offset
+            .checked_add(bytes_needed)
+            .filter(|end| *end <= self.buffer.len())
+            .is_none()
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let accessible_len = user_accessible_len(
+            VirtAddr::new(self.buffer.as_ptr() as usize + offset),
+            bytes_needed,
+            false,
+        );
+        if accessible_len < bytes_needed {
+            return Err(SystemError::EFAULT);
+        }
+
+        let src_bytes = &self.buffer[offset..offset + bytes_needed];
+        let dst_bytes =
+            unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, bytes_needed) };
+        dst_bytes.copy_from_slice(src_bytes);
+        Ok(dst.len())
     }
 
     /// Copy one data item from user space (to specified address)

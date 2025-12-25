@@ -28,9 +28,17 @@ impl TryFrom<usize> for ShutdownBit {
     type Error = system_error::SystemError;
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
+        // Linux/POSIX shutdown(2):
+        //   0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR
         match value {
-            0..2 => Ok(ShutdownBit {
-                bit: value as u8 + 1,
+            0 => Ok(ShutdownBit {
+                bit: Self::RCV_SHUTDOWN,
+            }),
+            1 => Ok(ShutdownBit {
+                bit: Self::SEND_SHUTDOWN,
+            }),
+            2 => Ok(ShutdownBit {
+                bit: Self::RCV_SHUTDOWN | Self::SEND_SHUTDOWN,
             }),
             _ => Err(Self::Error::EINVAL),
         }

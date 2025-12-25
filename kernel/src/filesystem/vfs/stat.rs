@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::filesystem::stat::PosixStat,
-    driver::base::device::device_number::DeviceNumber,
+    driver::{base::device::device_number::DeviceNumber, block::cache::BLOCK_SIZE},
     filesystem::vfs::{mount::is_mountpoint_root, vcore::do_file_lookup_at},
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
@@ -12,14 +12,14 @@ use alloc::sync::Arc;
 
 use super::{
     fcntl::AtFlags,
-    syscall::{ModeType, PosixStatx, PosixStatxMask, StxAttributes},
-    IndexNode,
+    syscall::{PosixStatx, PosixStatxMask, StxAttributes},
+    IndexNode, InodeMode,
 };
 
 #[derive(Clone)]
 pub struct KStat {
     pub result_mask: PosixStatxMask, // What fields the user got
-    pub mode: ModeType,              // umode_t
+    pub mode: InodeMode,             // umode_t
     pub nlink: u32,
     pub blksize: u32, // Preferred I/O size
     pub attributes: StxAttributes,
@@ -44,7 +44,7 @@ impl Default for KStat {
     fn default() -> Self {
         Self {
             result_mask: PosixStatxMask::empty(),
-            mode: ModeType::empty(),
+            mode: InodeMode::empty(),
             nlink: Default::default(),
             blksize: Default::default(),
             attributes: StxAttributes::empty(),
@@ -152,6 +152,20 @@ pub fn vfs_statx(
     ) {
         return Err(SystemError::EINVAL);
     }
+
+    // Linux: AT_STATX_FORCE_SYNC 与 AT_STATX_DONT_SYNC 互斥
+    if flags.contains(AtFlags::AT_STATX_FORCE_SYNC) && flags.contains(AtFlags::AT_STATX_DONT_SYNC) {
+        return Err(SystemError::EINVAL);
+    }
+
+    // Handle AT_EMPTY_PATH: operate on the file descriptor itself.
+    if flags.contains(AtFlags::AT_EMPTY_PATH) && filename.is_empty() {
+        if dfd < 0 {
+            return Err(SystemError::EBADF);
+        }
+        return vfs_fstat(dfd);
+    }
+
     let inode = do_file_lookup_at(dfd, filename, lookup_flags)?;
 
     let mut kstat = vfs_getattr(&inode, request_mask, flags)?;
@@ -207,20 +221,51 @@ pub fn vfs_getattr(
     at_flags &= AtFlags::AT_STATX_SYNC_TYPE;
 
     let metadata = inode.metadata()?;
+    let mut nlinks = metadata.nlinks;
+
+    // Derive directory link count dynamically only when metadata has no reliable value.
+    if metadata.file_type == crate::filesystem::vfs::FileType::Dir {
+        // Many filesystems already maintain nlinks; use it when it looks valid (>=2 for dirs).
+        if metadata.nlinks < 2 {
+            if let Ok(entries) = inode.list() {
+                let mut subdir_links = 0usize;
+                for name in entries {
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    if let Ok(child) = inode.find(&name) {
+                        if let Ok(child_md) = child.metadata() {
+                            if child_md.file_type == crate::filesystem::vfs::FileType::Dir {
+                                subdir_links += 1;
+                            }
+                        }
+                    }
+                }
+                nlinks = 2 + subdir_links;
+            }
+        }
+    }
+
     if metadata.atime.is_empty() {
         kstat.result_mask.remove(PosixStatxMask::STATX_ATIME);
     }
 
     // todo: 添加automount和dax属性
 
-    kstat.blksize = metadata.blk_size as u32;
+    let blk_size = if metadata.blk_size == 0 {
+        512
+    } else {
+        metadata.blk_size
+    };
+
+    kstat.blksize = blk_size as u32;
     if request_mask.contains(PosixStatxMask::STATX_MODE)
         || request_mask.contains(PosixStatxMask::STATX_TYPE)
     {
         kstat.mode = metadata.mode;
     }
     if request_mask.contains(PosixStatxMask::STATX_NLINK) {
-        kstat.nlink = metadata.nlinks as u32;
+        kstat.nlink = nlinks as u32;
     }
     if request_mask.contains(PosixStatxMask::STATX_UID) {
         kstat.uid = metadata.uid as u32;
@@ -248,7 +293,12 @@ pub fn vfs_getattr(
         kstat.size = metadata.size as usize;
     }
     if request_mask.contains(PosixStatxMask::STATX_BLOCKS) {
-        kstat.blocks = metadata.blocks as u64;
+        let size_bytes = if metadata.size < 0 {
+            0
+        } else {
+            metadata.size as u64
+        };
+        kstat.blocks = size_bytes.div_ceil(BLOCK_SIZE as u64);
     }
 
     if request_mask.contains(PosixStatxMask::STATX_BTIME) {
@@ -256,12 +306,15 @@ pub fn vfs_getattr(
         kstat.btime.tv_sec = metadata.btime.tv_sec;
         kstat.btime.tv_nsec = metadata.btime.tv_nsec;
     }
+
+    // 即便调用者未显式请求 STATX_ALL，也填充 rdev、dev 以符合 Linux 语义。
+    kstat.rdev = metadata.raw_dev;
+    kstat.dev = DeviceNumber::from(metadata.dev_id as u32);
+
     if request_mask.contains(PosixStatxMask::STATX_ALL) {
         kstat.attributes = StxAttributes::STATX_ATTR_APPEND;
         kstat.attributes_mask |=
             StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
-        kstat.dev = DeviceNumber::from(metadata.dev_id as u32);
-        kstat.rdev = metadata.raw_dev;
     }
 
     // 把文件类型加入mode里面 （todo: 在具体的文件系统里面去实现这个操作。这里只是权宜之计）
@@ -346,9 +399,6 @@ pub(super) fn do_statx(
     }
 
     let flags = AtFlags::from_bits_truncate(flags as i32);
-    if flags.contains(AtFlags::AT_STATX_SYNC_TYPE) {
-        return Err(SystemError::EINVAL);
-    }
 
     let kstat = vfs_statx(dfd, filename, flags, mask)?;
     cp_statx(kstat, user_kstat_ptr)
@@ -474,7 +524,8 @@ impl TryFrom<KStat> for GenericPosixStat {
         tmp.st_uid = kstat.uid;
         tmp.st_gid = kstat.gid;
 
-        tmp.st_rdev = kstat.rdev.data() as u64;
+        // 兼容 Linux 的 dev 编码语义，使用 new_encode_dev 返回 gnu_dev_makedev 风格的值。
+        tmp.st_rdev = kstat.rdev.new_encode_dev() as u64;
         tmp.st_size = kstat.size as i64;
 
         tmp.st_atime = kstat.atime.tv_sec;

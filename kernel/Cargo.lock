@@ -57,7 +57,7 @@ dependencies = [
 [[package]]
 name = "another_ext4"
 version = "0.1.0"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git?rev=bf782ff294#bf782ff2947b57ba89503824eada5eb3c20a2e2a"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git?rev=8bc384254c#8bc384254c7b7464afcdc312fb0c0aa622e2467e"
 dependencies = [
  "bitflags 2.9.1",
  "log",
@@ -422,7 +422,7 @@ checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
 
 [[package]]
 name = "dragonos_kernel"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "acpi",
  "asm_macros",
@@ -443,6 +443,7 @@ dependencies = [
  "ida",
  "inherit-methods-macro",
  "intertrait",
+ "jhash",
  "kcmdline_macros",
  "kdepends",
  "kernel_build",
@@ -730,6 +731,10 @@ name = "itoa"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
+
+[[package]]
+name = "jhash"
+version = "0.1.1"
 
 [[package]]
 name = "jobserver"

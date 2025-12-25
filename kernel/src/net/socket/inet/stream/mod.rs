@@ -2,13 +2,13 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError;
 
+use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::rwlock::RwLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSOL};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
-use crate::sched::SchedMode;
 use smoltcp;
 
 mod inner;
@@ -27,10 +27,12 @@ pub struct TcpSocket {
     // shutdown: Shutdown, // TODO set shutdown status
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
+    inode_id: InodeId,
     self_ref: Weak<Self>,
     pollee: AtomicUsize,
     netns: Arc<NetNamespace>,
     epoll_items: EPollItems,
+    fasync_items: FAsyncItems,
 }
 
 impl TcpSocket {
@@ -41,10 +43,12 @@ impl TcpSocket {
             // shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
+            inode_id: generate_inode_id(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new(0_usize),
             netns,
             epoll_items: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
         })
     }
 
@@ -58,10 +62,12 @@ impl TcpSocket {
             // shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
+            inode_id: generate_inode_id(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new((EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize),
             netns,
             epoll_items: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
         })
     }
 
@@ -340,7 +346,6 @@ impl Socket for TcpSocket {
     }
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
-        use crate::sched::SchedMode;
         let Endpoint::Ip(endpoint) = endpoint else {
             log::debug!("TcpSocket::connect: invalid endpoint");
             return Err(SystemError::EINVAL);
@@ -391,7 +396,6 @@ impl Socket for TcpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        use crate::sched::SchedMode;
         return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer)
         } else {
@@ -443,6 +447,10 @@ impl Socket for TcpSocket {
         //     }
         // }
         Ok(())
+    }
+
+    fn socket_inode_id(&self) -> InodeId {
+        self.inode_id
     }
 
     fn do_close(&self) -> Result<(), SystemError> {
@@ -595,6 +603,10 @@ impl Socket for TcpSocket {
 
     fn epoll_items(&self) -> &EPollItems {
         &self.epoll_items
+    }
+
+    fn fasync_items(&self) -> &FAsyncItems {
+        &self.fasync_items
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {

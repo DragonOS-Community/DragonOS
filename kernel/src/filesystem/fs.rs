@@ -1,7 +1,9 @@
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use alloc::sync::Arc;
 
-use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::IndexNode;
+use crate::filesystem::vfs::InodeMode;
 use crate::libs::rwlock::RwLock;
 use crate::process::ProcessManager;
 #[derive(Debug, Clone)]
@@ -21,14 +23,15 @@ impl PathContext {
 
 #[derive(Debug)]
 pub struct FsStruct {
-    umask: ModeType, //文件权限掩码
+    umask: AtomicU32, // 文件权限掩码
     path_context: RwLock<PathContext>,
 }
 
 impl Clone for FsStruct {
     fn clone(&self) -> Self {
+        let current_umask = self.umask.load(Ordering::Relaxed);
         Self {
-            umask: self.umask,
+            umask: AtomicU32::new(current_umask),
             path_context: RwLock::new(self.path_context.read().clone()),
         }
     }
@@ -43,9 +46,23 @@ impl Default for FsStruct {
 impl FsStruct {
     pub fn new() -> Self {
         Self {
-            umask: ModeType::S_IWUGO,
+            // Linux 常见默认 umask：0022（屏蔽 group/other 的写权限）。
+            // 这能保证新建文件默认不对组/其他可写，同时不把所有写权限都屏蔽掉。
+            umask: AtomicU32::new((InodeMode::S_IWGRP | InodeMode::S_IWOTH).bits()),
             path_context: RwLock::new(PathContext::new()),
         }
+    }
+
+    pub fn umask(&self) -> InodeMode {
+        InodeMode::from_bits_truncate(self.umask.load(Ordering::SeqCst))
+    }
+
+    /// Linux: xchg(&current->fs->umask, mask & S_IRWXUGO)
+    pub fn set_umask(&self, mask: InodeMode) -> InodeMode {
+        InodeMode::from_bits_truncate(
+            self.umask
+                .swap(mask.bits() & InodeMode::S_IRWXUGO.bits(), Ordering::SeqCst),
+        )
     }
 
     pub fn set_root(&self, inode: Arc<dyn IndexNode>) {

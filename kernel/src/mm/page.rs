@@ -9,7 +9,7 @@ use core::{
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use hashbrown::{HashMap, HashSet};
 use log::{error, info};
 use lru::LruCache;
@@ -258,7 +258,9 @@ fn page_reclaim_thread() -> i32 {
         // 保留4096个页面，总计16MB的空闲空间
         if usage.free().data() < 4096 {
             let page_to_free = 4096;
-            page_reclaimer_lock_irqsave().shrink_list(PageFrameCount::new(page_to_free));
+            // 分离选择和回收阶段，避免长时间持有页面回收器锁导致与
+            // page_manager/page_cache 的锁顺序反转。
+            PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
         } else {
             //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
             page_reclaimer_lock_irqsave().flush_dirty_pages();
@@ -298,27 +300,63 @@ impl PageReclaimer {
         self.lru.pop(paddr)
     }
 
-    /// lru链表缩减
-    /// ## 参数
-    ///
-    /// - `count`: 需要缩减的页面数量
-    pub fn shrink_list(&mut self, count: PageFrameCount) {
+    /// lru链表缩减（对外接口，内部自行获取/释放回收器锁）
+    /// 分两阶段：
+    /// 1) 持有回收器锁，从 LRU 中摘下目标页面列表；
+    /// 2) 释放回收器锁后，逐个执行写回与回收，避免锁顺序反转。
+    pub fn shrink_list(count: PageFrameCount) {
+        // 阶段1：仅持有回收器锁，摘取受害者
+        let victims = {
+            let mut reclaimer = page_reclaimer_lock_irqsave();
+            reclaimer.drain_lru(count)
+        };
+
+        // 阶段2：不持有回收器锁，安全地回收页面
+        Self::evict_pages(victims);
+    }
+
+    /// 从 LRU 中批量弹出页面，不做任何回收操作。
+    fn drain_lru(&mut self, count: PageFrameCount) -> Vec<Arc<Page>> {
+        let mut victims = Vec::new();
         for _ in 0..count.data() {
-            let (_, page) = self.lru.pop_lru().expect("pagecache is empty");
+            match self.lru.pop_lru() {
+                Some((_paddr, page)) => victims.push(page),
+                None => break,
+            }
+        }
+        victims
+    }
+
+    /// 在不持有回收器锁的情况下，完成页面写回与回收。
+    fn evict_pages(victims: Vec<Arc<Page>>) {
+        for page in victims {
             let mut guard = page.write_irqsave();
             if let PageType::File(info) = guard.page_type().clone() {
-                let page_cache = &info.page_cache;
+                // Never evict a file-backed page that is still mapped into any VMA.
+                // Our eviction path removes the page from page_cache/page_manager; dropping a
+                // still-mapped page will trip InnerPage::drop assertions and can crash userland.
+                if guard.map_count() != 0 {
+                    drop(guard);
+                    page_reclaimer_lock_irqsave().insert_page(page.phys_address(), &page);
+                    continue;
+                }
+
                 let page_index = info.index;
                 let paddr = guard.phys_address();
+
                 if guard.flags().contains(PageFlags::PG_DIRTY) {
                     // 先回写脏页
                     Self::page_writeback(&mut guard, true);
                 }
 
-                // 删除页面
-                page_cache.lock_irqsave().remove_page(page_index);
+                // 删除页面：顺序为 page_cache -> page_manager，避免原有的 reclaimer 锁参与死锁
+                //
+                // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
+                // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
+                if let Some(page_cache) = info.page_cache.upgrade() {
+                    page_cache.lock_irqsave().remove_page(page_index);
+                }
                 page_manager_lock_irqsave().remove_page(&paddr);
-                self.remove_page(&paddr);
             }
         }
     }
@@ -341,7 +379,13 @@ impl PageReclaimer {
         // log::debug!("page writeback: {:?}", guard.phys_addr);
 
         let (page_cache, page_index) = match guard.page_type() {
-            PageType::File(info) => (info.page_cache.clone(), info.index),
+            PageType::File(info) => match info.page_cache.upgrade() {
+                Some(page_cache) => (page_cache, info.index),
+                None => {
+                    log::warn!("try to writeback a file page but page_cache already dropped");
+                    return;
+                }
+            },
             _ => {
                 log::warn!("try to writeback a non-file page");
                 return;
@@ -434,6 +478,7 @@ bitflags! {
         const PG_RECLAIM = 1 << 18;
         const PG_SWAPBACKED = 1 << 19;
         const PG_UNEVICTABLE = 1 << 20;
+        const PG_READAHEAD = 1 << 21;
     }
 }
 
@@ -558,7 +603,7 @@ impl InnerPage {
 
     pub fn page_cache(&self) -> Option<Arc<PageCache>> {
         match &self.page_type {
-            PageType::File(info) => Some(info.page_cache.clone()),
+            PageType::File(info) => info.page_cache.upgrade(),
             _ => None,
         }
     }
@@ -676,7 +721,8 @@ pub enum PageType {
 
 #[derive(Debug, Clone)]
 pub struct FileMapInfo {
-    pub page_cache: Arc<PageCache>,
+    /// 指向页缓存的弱引用，避免 PageCache -> Page -> PageCache 的强引用环导致页面无法释放。
+    pub page_cache: Weak<PageCache>,
     /// 在pagecache中的偏移
     pub index: usize,
 }

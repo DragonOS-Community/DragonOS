@@ -1,7 +1,7 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
-use alloc::sync::Arc;
-use log::{error, info};
+use alloc::{string::ToString, sync::Arc};
+use log::{error, info, warn};
 use system_error::SystemError;
 
 use crate::libs::casting::DowncastArc;
@@ -11,17 +11,20 @@ use crate::{
     filesystem::{
         devfs::devfs_init,
         devpts::devpts_init,
+        ext4::filesystem::Ext4FileSystem,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
-        vfs::{syscall::ModeType, AtomicInodeId, FileSystem, FileType, MountFS},
+        vfs::{
+            permission::PermissionMask, AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode,
+            MountFS,
+        },
     },
     mm::truncate::truncate_inode_pages,
     process::{namespace::mnt::mnt_namespace_init, ProcessManager},
 };
 
 use super::{
-    file::FileMode,
     stat::LookUpFlags,
     utils::{rsplit_path, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -50,6 +53,9 @@ pub fn generate_inode_id() -> InodeId {
 /// 初始化虚拟文件系统
 #[inline(never)]
 pub fn vfs_init() -> Result<(), SystemError> {
+    // Initialize global append lock manager before any file write path uses it.
+    super::append_lock::init_append_lock_manager();
+
     mnt_namespace_init();
 
     procfs_init().expect("Failed to initialize procfs");
@@ -90,17 +96,17 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     // 因为是换根所以路径没有变化
     // 不需要重新注册挂载目录
     new_root_inode
-        .mkdir("proc", ModeType::from_bits_truncate(0o755))
+        .mkdir("proc", InodeMode::from_bits_truncate(0o755))
         .expect("Unable to create /proc")
         .mount_from(old_root_inode.find("proc").expect("proc not mounted!"))
         .expect("Failed to migrate filesystem of proc");
     new_root_inode
-        .mkdir("dev", ModeType::from_bits_truncate(0o755))
+        .mkdir("dev", InodeMode::from_bits_truncate(0o755))
         .expect("Unable to create /dev")
         .mount_from(old_root_inode.find("dev").expect("dev not mounted!"))
         .expect("Failed to migrate filesystem of dev");
     new_root_inode
-        .mkdir("sys", ModeType::from_bits_truncate(0o755))
+        .mkdir("sys", InodeMode::from_bits_truncate(0o755))
         .expect("Unable to create /sys")
         .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
         .expect("Failed to migrate filesystem of sys");
@@ -108,6 +114,15 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     unsafe {
         current_mntns.force_change_root_mountfs(new_fs);
     }
+
+    // 换根后需要同步更新“当前进程”的 fs root/pwd。
+    // 我们的路径解析（绝对路径）以进程 fs root 为起点；若不更新，后续诸如 /dev/pts 的挂载、
+    // 以及 init stdio 的 /dev/hvc0 查找都会仍在旧 root 上执行，导致找不到设备节点。
+    let new_root_inode = current_mntns.root_inode();
+    let pcb = ProcessManager::current_pcb();
+    pcb.fs_struct_mut().set_root(new_root_inode.clone());
+    // init 通常 cwd 为 "/"，将 pwd 同步到新根，避免落在旧根造成后续语义混乱
+    pcb.fs_struct_mut().set_pwd(new_root_inode.clone());
 
     // WARNING: mount devpts after devfs has been mounted,
     devpts_init().expect("Failed to initialize devpts");
@@ -125,6 +140,29 @@ pub(crate) fn try_find_gendisk(path: &str) -> Option<Arc<GenDisk>> {
     return None;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootFsKind {
+    Ext4,
+    Fat,
+}
+
+fn probe_rootfs_kind(gendisk: &Arc<GenDisk>) -> Option<RootFsKind> {
+    match Ext4FileSystem::probe(gendisk) {
+        Ok(true) => return Some(RootFsKind::Ext4),
+        Ok(false) => {}
+        Err(e) => {
+            // 探测阶段不应阻塞启动；继续尝试其他 FS 探测/初始化。
+            warn!("Rootfs probe: read ext superblock failed: {:?}", e);
+        }
+    }
+
+    if FATFileSystem::probe(gendisk) {
+        return Some(RootFsKind::Fat);
+    }
+
+    None
+}
+
 pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount root fs...");
     block_dev_manager().print_gendisks();
@@ -138,11 +176,36 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             .ok_or(SystemError::ENODEV)?
     };
 
-    let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(gendisk);
-    if fatfs.is_err() {
+    let kind = probe_rootfs_kind(&gendisk);
+
+    let rootfs: Result<Arc<dyn FileSystem>, SystemError> = match kind {
+        Some(RootFsKind::Ext4) => Ext4FileSystem::from_gendisk(gendisk.clone()),
+        Some(RootFsKind::Fat) => Ok(FATFileSystem::new(gendisk.clone())?),
+        None => {
+            // 兜底：按常见顺序尝试初始化（ext4 -> fat），便于未来扩展 probe 或处理特殊镜像。
+            Ext4FileSystem::from_gendisk(gendisk.clone()).or_else(|_| {
+                let fat: Arc<FATFileSystem> = FATFileSystem::new(gendisk.clone())?;
+                Ok(fat)
+            })
+        }
+    };
+
+    let rootfs = match rootfs {
+        Ok(fs) => fs,
+        Err(e) => {
+            error!("Failed to initialize rootfs filesystem: {:?}", e);
+            loop {
+                spin_loop();
+            }
+        }
+    };
+
+    let fs_name = rootfs.name().to_string();
+    let r = migrate_virtual_filesystem(rootfs.clone());
+    if r.is_err() {
         error!(
-            "Failed to initialize fatfs, code={:?}",
-            fatfs.as_ref().err()
+            "Failed to migrate virtual filesystem to rootfs ({}).",
+            fs_name
         );
         loop {
             spin_loop();
@@ -182,9 +245,9 @@ pub fn change_root_fs() -> Result<(), SystemError> {
 define_event_trace!(
     do_mkdir_at,
     TP_system(vfs),
-    TP_PROTO(path:&str, mode: FileMode),
+    TP_PROTO(path:&str, mode: InodeMode),
     TP_STRUCT__entry {
-        fmode: FileMode,
+        fmode: InodeMode,
         path: [u8;64],
     },
     TP_fast_assign {
@@ -205,21 +268,56 @@ define_event_trace!(
         format!("mkdir at {} with mode {:?}", path, mode)
     })
 );
+
 /// @brief 创建文件/文件夹
 pub fn do_mkdir_at(
     dirfd: i32,
     path: &str,
-    mode: FileMode,
+    mode: InodeMode,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     trace_do_mkdir_at(path, mode);
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
     let (mut current_inode, path) =
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
-    let (name, parent) = rsplit_path(&path);
+    // Linux 返回 EEXIST
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return Err(SystemError::EEXIST);
+    }
+    let (name, parent) = rsplit_path(path);
+    if name == "." || name == ".." {
+        return Err(SystemError::EEXIST);
+    }
+    // 检查文件名长度
+    if name.len() > super::NAME_MAX {
+        return Err(SystemError::ENAMETOOLONG);
+    }
     if let Some(parent) = parent {
         current_inode =
             current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     }
-    return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
+    let parent_md = current_inode.metadata()?;
+    // 确保父节点是目录
+    if parent_md.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    let pcb = ProcessManager::current_pcb();
+    let cred = pcb.cred();
+    cred.inode_permission(&parent_md, PermissionMask::MAY_EXEC.bits())?;
+    if current_inode.find(name).is_ok() {
+        return Err(SystemError::EEXIST);
+    }
+    let mut final_mode_bits = mode.bits() & InodeMode::S_IRWXUGO.bits();
+    if (parent_md.mode.bits() & InodeMode::S_ISGID.bits()) != 0 {
+        final_mode_bits |= InodeMode::S_ISGID.bits();
+    }
+    let umask = pcb.fs_struct().umask();
+    let final_mode = InodeMode::from_bits_truncate(final_mode_bits) & !umask;
+
+    // 执行创建
+    return current_inode.mkdir(name, final_mode);
 }
 
 /// 解析父目录inode
@@ -245,6 +343,18 @@ pub(super) fn resolve_parent_inode(
     }
 }
 
+/// 检查父目录权限（写+执行权限）
+///
+/// Linux 语义：删除/创建文件/目录需要对父目录拥有 W+X（写+执行）权限
+/// 注意：权限检查必须在 find 之前进行，否则当文件不存在时会返回 ENOENT 而不是 EACCES
+pub(super) fn check_parent_dir_permission(parent_md: &super::Metadata) -> Result<(), SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    cred.inode_permission(
+        parent_md,
+        (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+    )
+}
+
 /// @brief 删除文件夹
 pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     let path = path.trim();
@@ -266,10 +376,16 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     }
 
     let parent_inode: Arc<dyn IndexNode> = resolve_parent_inode(inode_begin, parent_path)?;
+    let parent_md = parent_inode.metadata()?;
 
-    if parent_inode.metadata()?.file_type != FileType::Dir {
+    if parent_md.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
+
+    // Linux 语义：删除目录需要对父目录拥有 W+X（写+搜索）权限
+    // 注意：权限检查必须在 find 之前进行，否则当目录不存在时会返回 ENOENT 而不是 EACCES
+    check_parent_dir_permission(&parent_md)?;
+
     // 在目标点为symlink时也返回ENOTDIR
     let target_inode = parent_inode.find(filename)?;
 
@@ -298,12 +414,20 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     let (filename, parent_path) = rsplit_path(&remain_path);
 
     let parent_inode: Arc<dyn IndexNode> = resolve_parent_inode(inode_begin, parent_path)?;
-    if parent_inode.metadata()?.file_type != FileType::Dir {
+    let parent_md = parent_inode.metadata()?;
+
+    if parent_md.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
-    // 查找目标 inode，但 *不* 跟随最后的符号链接
-    let target_inode = parent_inode.lookup_follow_symlink(filename, 0)?;
+    // Linux 语义：删除文件需要对父目录拥有 W+X（写+搜索）权限
+    // 注意：权限检查必须在 find 之前进行，否则当文件不存在时会返回 ENOENT 而不是 EACCES
+    check_parent_dir_permission(&parent_md)?;
+
+    // Linux 语义：unlink(2)/unlinkat(2) 删除目录项本身，不跟随最后一个符号链接。
+    // 我们已解析到父目录，因此这里必须用 find() 直接取目录项对应 inode，
+    // 避免触发 symlink 解析（否则可能得到 ELOOP 或删错目标）。
+    let target_inode = parent_inode.find(filename)?;
 
     // 如果目标是目录，则返回 EISDIR
     if target_inode.metadata()?.file_type == FileType::Dir {
@@ -339,11 +463,31 @@ pub(super) fn do_file_lookup_at(
 pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
     let md = inode.metadata()?;
 
+    // 防御性检查：统一拒绝超出 isize::MAX 的长度，避免后续类型转换溢出
+    if len > isize::MAX as usize {
+        return Err(SystemError::EINVAL);
+    }
+
     if md.file_type == FileType::Dir {
         return Err(SystemError::EISDIR);
     }
     if md.file_type != FileType::File {
         return Err(SystemError::EINVAL);
+    }
+
+    // S_IMMUTABLE 文件不能被截断
+    if md.flags.contains(InodeFlags::S_IMMUTABLE) {
+        return Err(SystemError::EPERM);
+    }
+
+    // S_APPEND 文件不能被截断（只能追加）
+    if md.flags.contains(InodeFlags::S_APPEND) {
+        return Err(SystemError::EPERM);
+    }
+
+    // S_SWAPFILE 文件不能被截断
+    if md.flags.contains(InodeFlags::S_SWAPFILE) {
+        return Err(SystemError::ETXTBSY);
     }
 
     // 只读挂载检查：若当前 fs 是 MountFS 且带 RDONLY 标志，拒绝写
@@ -356,6 +500,14 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
     }
 
     let result = inode.resize(len);
+
+    if result.is_ok() {
+        let vm_opt: Option<Arc<crate::mm::ucontext::AddressSpace>> =
+            ProcessManager::current_pcb().basic().user_vm();
+        if let Some(vm) = vm_opt {
+            let _ = vm.write().zap_file_mappings(md.inode_id);
+        }
+    }
 
     result
 }

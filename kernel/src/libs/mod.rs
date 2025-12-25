@@ -31,3 +31,4 @@ pub mod name;
 pub mod decompress;
 
 pub mod pod;
+pub mod ranges;

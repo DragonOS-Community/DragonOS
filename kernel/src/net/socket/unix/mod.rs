@@ -1,13 +1,17 @@
+pub mod datagram;
 pub mod ns;
 pub mod ring_buffer;
 pub mod stream;
 
 use super::PSOCK;
 use crate::{
-    filesystem::vfs::{syscall::ModeType, utils::rsplit_path, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    filesystem::vfs::{
+        utils::{rsplit_path, DName},
+        InodeMode, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    },
     net::socket::{
         endpoint::Endpoint,
-        unix::{ns::AbstractHandle, stream::UnixStreamSocket},
+        unix::{datagram::UnixDatagramSocket, ns::AbstractHandle, stream::UnixStreamSocket},
         Socket,
     },
     process::ProcessManager,
@@ -37,7 +41,7 @@ impl TryFrom<Endpoint> for UnixEndpoint {
 
 #[derive(Clone, Debug)]
 pub(super) enum UnixEndpointBound {
-    Path(Arc<str>),
+    Path(DName),
     Abstract(Arc<AbstractHandle>),
 }
 
@@ -94,7 +98,7 @@ impl Hash for UnixEndpointBound {
 impl From<UnixEndpointBound> for UnixEndpoint {
     fn from(endpoint: UnixEndpointBound) -> Self {
         match endpoint {
-            UnixEndpointBound::Path(path) => UnixEndpoint::File(String::from(&*path)),
+            UnixEndpointBound::Path(path) => UnixEndpoint::File(String::from(path.as_ref())),
             UnixEndpointBound::Abstract(handle) => {
                 UnixEndpoint::Abstract(String::from_utf8_lossy(&handle.name()).into_owned())
             }
@@ -131,12 +135,19 @@ impl UnixEndpoint {
                         VFS_MAX_FOLLOW_SYMLINK_TIMES,
                     )?;
                 // 创建 socket inode
-                let inode = parent_inode.create(
-                    filename,
-                    crate::filesystem::vfs::FileType::Socket,
-                    ModeType::S_IWUSR,
-                )?;
-                UnixEndpointBound::Path(Arc::from(inode.absolute_path()?.as_str()))
+                let inode = parent_inode
+                    .create(
+                        filename,
+                        crate::filesystem::vfs::FileType::Socket,
+                        InodeMode::S_IWUSR,
+                    )
+                    .map_err(|e| match e {
+                        // Linux/Posix bind 语义：地址已被占用应返回 EADDRINUSE。
+                        // VFS 创建节点遇到同名条目通常返回 EEXIST，需要在 socket 层进行语义映射。
+                        SystemError::EEXIST => SystemError::EADDRINUSE,
+                        other => other,
+                    })?;
+                UnixEndpointBound::Path(DName::from(inode.absolute_path()?))
             }
             Self::Abstract(name) => UnixEndpointBound::Abstract(ns::create_abstract_name(name)?),
         };
@@ -169,7 +180,7 @@ impl UnixEndpoint {
                 // let inode = ProcessManager::current_mntns()
                 //     .root_inode()
                 //     .lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-                UnixEndpointBound::Path(Arc::from(abso_path.as_str()))
+                UnixEndpointBound::Path(DName::from(abso_path))
             }
         };
 
@@ -181,9 +192,14 @@ pub fn create_unix_socket(
     socket_type: PSOCK,
     is_nonblocking: bool,
 ) -> Result<Arc<dyn Socket>, SystemError> {
-    let socket = match socket_type {
+    let socket: Arc<dyn Socket> = match socket_type {
         PSOCK::Stream => UnixStreamSocket::new(is_nonblocking, false),
+        PSOCK::SeqPacket => UnixStreamSocket::new(is_nonblocking, true),
         PSOCK::Packet => UnixStreamSocket::new(is_nonblocking, true),
+        PSOCK::Datagram => UnixDatagramSocket::new(is_nonblocking),
+        // Linux supports AF_UNIX + SOCK_RAW and maps it to SOCK_DGRAM.
+        // See Linux 6.6 net/unix/af_unix.c:unix_create().
+        PSOCK::Raw => UnixDatagramSocket::new(is_nonblocking),
         _ => {
             return Err(SystemError::ESOCKTNOSUPPORT);
         }

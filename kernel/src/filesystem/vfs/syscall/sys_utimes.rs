@@ -6,7 +6,7 @@ use crate::filesystem::vfs::open::do_utimes;
 use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use crate::syscall::user_access::UserBufferReader;
 use crate::time::syscall::PosixTimeval;
 use alloc::vec::Vec;
@@ -22,7 +22,7 @@ impl Syscall for SysUtimesHandle {
         let pathname = Self::pathname(args);
         let times = Self::times(args);
 
-        let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
+        let pathname = vfs_check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         let times = if times.is_null() {

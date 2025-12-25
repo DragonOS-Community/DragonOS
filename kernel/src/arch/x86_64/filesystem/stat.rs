@@ -55,7 +55,7 @@ impl TryFrom<KStat> for PosixStat {
         tmp.st_uid = kstat.uid;
         tmp.st_gid = kstat.gid;
 
-        tmp.st_rdev = kstat.rdev.data() as usize;
+        tmp.st_rdev = kstat.rdev.new_encode_dev() as usize;
         tmp.st_size = kstat.size as isize;
 
         tmp.st_atime = kstat.atime.tv_sec as usize;

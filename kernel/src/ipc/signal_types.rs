@@ -16,7 +16,7 @@ use crate::{
 
 /// siginfo中的si_code的可选值
 /// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
-#[derive(Copy, Debug, Clone)]
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
 #[repr(i32)]
 pub enum SigCode {
     /// sent by kill, sigsend, raise
@@ -64,7 +64,6 @@ pub const USER_SIG_ERR: u64 = 2;
 
 // 因为 Rust 编译器不能在常量声明中正确识别级联的 "|" 运算符(experimental feature： https://github.com/rust-lang/rust/issues/67792)，因此
 // 暂时只能通过这种方法来声明这些常量，这些常量暂时没有全部用到，但是都出现在 linux 的判断逻辑中，所以都保留下来了
-#[allow(dead_code)]
 pub const SIG_KERNEL_ONLY_MASK: SigSet =
     Signal::into_sigset(Signal::SIGSTOP).union(Signal::into_sigset(Signal::SIGKILL));
 
@@ -83,8 +82,13 @@ pub const SIG_KERNEL_COREDUMP_MASK: SigSet = Signal::into_sigset(Signal::SIGQUIT
     .union(Signal::into_sigset(Signal::SIGSYS))
     .union(Signal::into_sigset(Signal::SIGXCPU))
     .union(Signal::into_sigset(Signal::SIGXFSZ));
-#[allow(dead_code)]
+
 pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
+    .union(Signal::into_sigset(Signal::SIGCHLD))
+    .union(Signal::into_sigset(Signal::SIGWINCH))
+    .union(Signal::into_sigset(Signal::SIGURG));
+#[allow(dead_code)]
+pub const SIG_SPECIFIC_SICODES_MASK: SigSet = Signal::into_sigset(Signal::SIGILL)
     .union(Signal::into_sigset(Signal::SIGFPE))
     .union(Signal::into_sigset(Signal::SIGSEGV))
     .union(Signal::into_sigset(Signal::SIGBUS))
@@ -111,6 +115,12 @@ pub enum SigactionType {
 }
 
 impl SigactionType {
+    /// Returns `true` if the sa handler type is [`Self::SaHandler(SaHandlerType::Default)`].
+    ///
+    /// [`SigDefault`]: SaHandlerType::SigDefault
+    pub fn is_default(&self) -> bool {
+        return matches!(self, Self::SaHandler(SaHandlerType::Default));
+    }
     /// Returns `true` if the sa handler type is [`SaHandler(SaHandlerType::SigIgnore)`].
     ///
     /// [`SigIgnore`]: SaHandlerType::SigIgnore
@@ -191,19 +201,15 @@ impl Default for Sigaction {
 }
 
 impl Sigaction {
+    /// 判断传入的信号是否被设置为默认处理
+    pub fn is_default(&self) -> bool {
+        return self.action.is_default();
+    }
     /// 判断传入的信号是否被忽略
-    ///
-    /// ## 参数
-    ///
-    /// - `sig` 传入的信号
-    ///
-    /// ## 返回值
-    ///
-    /// - `true` 被忽略
-    /// - `false`未被忽略
     pub fn is_ignore(&self) -> bool {
         return self.action.is_ignore();
     }
+
     pub fn new(
         action: SigactionType,
         flags: SigFlags,
@@ -388,12 +394,47 @@ pub struct PosixSiginfoSigsys {
     pub _arch: u32,
 }
 
+/// 标准 POSIX sigval_t（union）。
+///
+/// 用户态会通过 `si_int` / `si_ptr` 访问同一片内存，因此必须是 union，且大小应为 8 字节。
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct PosixSigval {
+#[derive(Copy, Clone)]
+pub union PosixSigval {
     pub sival_int: i32,
     pub sival_ptr: u64,
 }
+
+impl PosixSigval {
+    #[inline(always)]
+    pub const fn from_int(v: i32) -> Self {
+        Self { sival_int: v }
+    }
+
+    #[inline(always)]
+    pub const fn from_ptr(v: u64) -> Self {
+        Self { sival_ptr: v }
+    }
+
+    #[inline(always)]
+    pub const fn zero() -> Self {
+        Self { sival_ptr: 0 }
+    }
+}
+
+impl core::fmt::Debug for PosixSigval {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // union：同时以 int/ptr 两种视角打印，便于调试
+        let as_int = unsafe { self.sival_int };
+        let as_ptr = unsafe { self.sival_ptr };
+        f.debug_struct("PosixSigval")
+            .field("sival_int", &as_int)
+            .field("sival_ptr", &as_ptr)
+            .finish()
+    }
+}
+
+// 编译期校验：sigval_t 在 64-bit 架构下应为 8 字节
+const _: [(); 8] = [(); core::mem::size_of::<PosixSigval>()];
 
 /// 获取当前进程的UID
 fn get_current_uid() -> u32 {
@@ -405,8 +446,57 @@ impl SigInfo {
         self.sig_code
     }
 
+    #[inline(always)]
+    pub fn signo_i32(&self) -> i32 {
+        self.sig_no
+    }
+
+    #[inline(always)]
+    pub fn is_signal(&self, sig: Signal) -> bool {
+        self.sig_no == sig as i32
+    }
+
     pub fn set_sig_type(&mut self, sig_type: SigType) {
         self.sig_type = sig_type;
+    }
+
+    /// 若该 SigInfo 为指定 timerid 的 POSIX timer 信号，则将其 si_overrun 增加 bump，并返回 true。
+    pub fn bump_posix_timer_overrun(&mut self, timerid: i32, bump: i32) -> bool {
+        match self.sig_type {
+            SigType::PosixTimer {
+                timerid: tid,
+                overrun,
+                sigval,
+            } if tid == timerid => {
+                let new_overrun = overrun.saturating_add(bump);
+                self.sig_type = SigType::PosixTimer {
+                    timerid: tid,
+                    overrun: new_overrun,
+                    sigval,
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 若该 SigInfo 为指定 timerid 的 POSIX timer 信号，则将其 si_overrun 重置为 0，并返回 true。
+    pub fn reset_posix_timer_overrun(&mut self, timerid: i32) -> bool {
+        match self.sig_type {
+            SigType::PosixTimer {
+                timerid: tid,
+                overrun: _,
+                sigval,
+            } if tid == timerid => {
+                self.sig_type = SigType::PosixTimer {
+                    timerid: tid,
+                    overrun: 0,
+                    sigval,
+                };
+                true
+            }
+            _ => false,
+        }
     }
 
     /// 将内核SigInfo转换为标准PosixSigInfo
@@ -432,10 +522,23 @@ impl SigInfo {
                     _timer: PosixSiginfoTimer {
                         si_tid: pid.data() as i32,
                         si_overrun: 0,
-                        si_sigval: PosixSigval {
-                            sival_int: 0,
-                            sival_ptr: 0,
-                        },
+                        si_sigval: PosixSigval::zero(),
+                    },
+                },
+            },
+            SigType::PosixTimer {
+                timerid,
+                overrun,
+                sigval,
+            } => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: self.sig_code as i32,
+                _sifields: PosixSiginfoFields {
+                    _timer: PosixSiginfoTimer {
+                        si_tid: timerid,
+                        si_overrun: overrun,
+                        si_sigval: sigval,
                     },
                 },
             },
@@ -469,6 +572,15 @@ impl SigInfo {
 pub enum SigType {
     Kill(RawPid),
     Alarm(RawPid),
+    /// POSIX interval timer 发送的信号（SI_TIMER）。
+    /// - `timerid`: 对应用户态 `siginfo_t::si_timerid`
+    /// - `overrun`: 对应用户态 `siginfo_t::si_overrun`
+    /// - `sigval`: 对应用户态 `siginfo_t::si_value`
+    PosixTimer {
+        timerid: i32,
+        overrun: i32,
+        sigval: PosixSigval,
+    },
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
@@ -511,6 +623,46 @@ impl SigPending {
 
     pub fn queue_mut(&mut self) -> &mut SigQueue {
         &mut self.queue
+    }
+
+    /// 在当前线程 pending 队列中判断是否已存在指定 timerid 的 POSIX timer 信号。
+    pub fn posix_timer_exists(&mut self, sig: Signal, timerid: i32) -> bool {
+        for info in self.queue.q.iter_mut() {
+            // bump(0) 作为“匹配探测”，不会改变值
+            if info.is_signal(sig)
+                && info.sig_code() == SigCode::Timer
+                && info.bump_posix_timer_overrun(timerid, 0)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 若当前线程 pending 队列中已存在该 timer 的信号，则将其 si_overrun 增加 bump，并返回 true。
+    pub fn posix_timer_bump_overrun(&mut self, sig: Signal, timerid: i32, bump: i32) -> bool {
+        for info in self.queue.q.iter_mut() {
+            if info.is_signal(sig)
+                && info.sig_code() == SigCode::Timer
+                && info.bump_posix_timer_overrun(timerid, bump)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 将当前线程 pending 队列中属于该 timer 的信号的 si_overrun 重置为 0（若找到则返回 true）。
+    pub fn posix_timer_reset_overrun(&mut self, sig: Signal, timerid: i32) -> bool {
+        for info in self.queue.q.iter_mut() {
+            if info.is_signal(sig)
+                && info.sig_code() == SigCode::Timer
+                && info.reset_posix_timer_overrun(timerid)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn signal_mut(&mut self) -> &mut SigSet {
@@ -580,7 +732,7 @@ impl SigPending {
     /// @brief 从sigpending中删除mask中被置位的信号。也就是说，比如mask的第1位被置为1,那么就从sigqueue中删除所有signum为2的信号的信息。
     pub fn flush_by_mask(&mut self, mask: &SigSet) {
         // 定义过滤器，从sigqueue中删除mask中被置位的信号
-        let filter = |x: &SigInfo| !mask.contains(SigSet::from_bits_truncate(x.sig_no as u64));
+        let filter = |x: &SigInfo| !mask.contains(Signal::from(x.sig_no as usize).into());
         self.queue.q.retain(filter);
         // 同步清理位图中的相应位，避免仅删除队列项但仍因位图残留被视为pending
         self.signal.remove(*mask);

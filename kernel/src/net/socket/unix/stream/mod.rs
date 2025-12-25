@@ -1,8 +1,10 @@
 use crate::{
+    filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
     libs::rwlock::RwLock,
     net::socket::{self, *},
 };
 use crate::{
+    libs::spinlock::SpinLock,
     libs::wait_queue::WaitQueue,
     net::{
         posix::MsgHdr,
@@ -16,7 +18,7 @@ use crate::{
         },
     },
 };
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicBool;
 use inner::{Connected, Init, Inner};
 use log::debug;
@@ -30,7 +32,11 @@ pub struct UnixStreamSocket {
     inner: RwLock<Option<Inner>>,
     //todo options
     epitems: EPollItems,
+    fasync_items: FAsyncItems,
     wait_queue: Arc<WaitQueue>,
+    inode_id: InodeId,
+    /// Peer socket for socket pairs (used for SIGIO notification)
+    peer: SpinLock<Option<Weak<UnixStreamSocket>>>,
 
     is_nonblocking: AtomicBool,
     is_seqpacket: bool,
@@ -47,9 +53,12 @@ impl UnixStreamSocket {
         Arc::new(Self {
             inner: RwLock::new(Some(Inner::Init(init))),
             wait_queue: Arc::new(WaitQueue::default()),
+            inode_id: generate_inode_id(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
+            peer: SpinLock::new(None),
         })
     }
 
@@ -61,9 +70,12 @@ impl UnixStreamSocket {
         Arc::new(Self {
             inner: RwLock::new(Some(Inner::Connected(connected))),
             wait_queue: Arc::new(WaitQueue::default()),
+            inode_id: generate_inode_id(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
+            peer: SpinLock::new(None),
         })
     }
 
@@ -73,10 +85,14 @@ impl UnixStreamSocket {
 
     pub fn new_pair(is_nonblocking: bool, is_seqpacket: bool) -> (Arc<Self>, Arc<Self>) {
         let (conn_a, conn_b) = Connected::new_pair(None, None);
-        (
-            Self::new_connected(conn_a, is_nonblocking, is_seqpacket),
-            Self::new_connected(conn_b, is_nonblocking, is_seqpacket),
-        )
+        let socket_a = Self::new_connected(conn_a, is_nonblocking, is_seqpacket);
+        let socket_b = Self::new_connected(conn_b, is_nonblocking, is_seqpacket);
+
+        // Set up peer references for SIGIO notification
+        *socket_a.peer.lock() = Some(Arc::downgrade(&socket_b));
+        *socket_b.peer.lock() = Some(Arc::downgrade(&socket_a));
+
+        (socket_a, socket_b)
     }
 
     fn try_send(&self, buffer: &[u8]) -> Result<usize, SystemError> {
@@ -205,8 +221,6 @@ impl Socket for UnixStreamSocket {
 
     fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
         debug!("stream server begin accept");
-        use crate::sched::SchedMode;
-
         if self.is_nonblocking() {
             self.try_accept()
         } else {
@@ -267,11 +281,26 @@ impl Socket for UnixStreamSocket {
 
     fn recv_from(
         &self,
-        _buffer: &mut [u8],
+        buffer: &mut [u8],
         _flags: socket::PMSG,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        todo!()
+        // 对于流式 Unix Socket，recv_from 与 recv 类似
+        // 直接调用 try_recv 并返回对端地址
+        let recv_len = self.try_recv(buffer)?;
+
+        // 获取对端地址
+        let peer_endpoint = match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("UnixStreamSocket inner is None")
+        {
+            Inner::Connected(connected) => connected.peer_endpoint(),
+            _ => return Err(SystemError::ENOTCONN),
+        };
+
+        Ok((recv_len, peer_endpoint.into()))
 
         // if flags.contains(PMSG::OOB) {
         //     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -312,7 +341,18 @@ impl Socket for UnixStreamSocket {
     }
 
     fn send(&self, buffer: &[u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
-        self.try_send(buffer)
+        let result = self.try_send(buffer);
+
+        // If send succeeded, notify peer's fasync_items for SIGIO
+        if result.is_ok() && result.as_ref().unwrap() > &0 {
+            if let Some(peer_weak) = self.peer.lock().as_ref() {
+                if let Some(peer) = peer_weak.upgrade() {
+                    peer.fasync_items.send_sigio();
+                }
+            }
+        }
+
+        result
     }
 
     fn send_msg(&self, _msg: &MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
@@ -342,6 +382,10 @@ impl Socket for UnixStreamSocket {
         &self.epitems
     }
 
+    fn fasync_items(&self) -> &FAsyncItems {
+        &self.fasync_items
+    }
+
     fn option(&self, _level: PSOL, _name: usize, _value: &mut [u8]) -> Result<usize, SystemError> {
         todo!()
     }
@@ -360,5 +404,9 @@ impl Socket for UnixStreamSocket {
             .as_ref()
             .expect("UnixStreamSocket inner is None")
             .check_io_events()
+    }
+
+    fn socket_inode_id(&self) -> InodeId {
+        self.inode_id
     }
 }

@@ -3,10 +3,10 @@ use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use crate::arch::MMArch;
 use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::FileType;
+use crate::filesystem::vfs::InodeMode;
 use crate::mm::verify_area;
 use crate::mm::MemoryManagementArch;
 use crate::process::pid::PidPrivateData;
@@ -245,10 +245,17 @@ impl ProcessManager {
         clone_flags: &CloneFlags,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
+        // 先复制父进程的 flags
+        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+
+        // 然后根据 clone_flags 设置需要的标志
         if clone_flags.contains(CloneFlags::CLONE_VFORK) {
             new_pcb.flags().insert(ProcessFlags::VFORK);
         }
-        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+
+        // 标记新进程还未执行 exec
+        new_pcb.flags().insert(ProcessFlags::FORKNOEXEC);
+
         return Ok(());
     }
 
@@ -333,6 +340,51 @@ impl ProcessManager {
             new_pcb.flush_signal_handlers(false);
         }
         return Ok(());
+    }
+
+    /// 复制进程信号信息（sig_info）
+    ///
+    /// fork 时需要复制父进程的信号掩码（sig_blocked）等信息到子进程。
+    /// execve 时应该保留 sig_blocked，不重置。
+    ///
+    /// 参考 Linux: kernel/fork.c copy_process()
+    fn copy_sig_info(
+        _clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        // 只复制信号掩码 - POSIX 要求 fork 和 execve 都保留信号掩码
+        // 注意：先读取父进程的，然后释放锁，再写入子进程的，避免死锁
+        let sig_blocked = {
+            let current_sig_info = current_pcb.sig_info_irqsave();
+            *current_sig_info.sig_blocked()
+        };
+
+        {
+            let mut new_sig_info = new_pcb.sig_info_mut();
+            *new_sig_info.sig_block_mut() = sig_blocked;
+        }
+
+        Ok(())
+    }
+
+    /// 复制 prctl 相关的进程/线程状态。
+    ///
+    /// - no_new_privs：线程级语义，clone/fork 继承，execve 保持（execve 不走这里）。
+    /// - dumpable：fork 继承。
+    fn copy_prctl_state(
+        _clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        // NO_NEW_PRIVS
+        if current_pcb.no_new_privs() != 0 {
+            new_pcb.set_no_new_privs(true);
+        }
+
+        // DUMPABLE
+        new_pcb.set_dumpable(current_pcb.dumpable());
+        Ok(())
     }
 
     /// 拷贝信号备用栈
@@ -473,45 +525,6 @@ impl ProcessManager {
             pcb.thread.write_irqsave().clear_child_tid = Some(clone_args.child_tid);
         }
 
-        // 设置child_tid，意味着子线程能够知道自己的id
-        if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-            pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
-        }
-
-        // 标记当前线程还未被执行exec
-        pcb.flags().insert(ProcessFlags::FORKNOEXEC);
-
-        // 克隆 pidfd
-        if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
-            let pid = pcb.raw_pid().0 as i32;
-            let root_inode = ProcessManager::current_mntns().root_inode();
-            let name = format!(
-                "Pidfd(from {} to {})",
-                ProcessManager::current_pcb().raw_pid().data(),
-                pid
-            );
-            let new_inode =
-                root_inode.create(&name, FileType::File, ModeType::from_bits_truncate(0o777))?;
-            let file = File::new(new_inode, FileMode::O_RDWR | FileMode::O_CLOEXEC)?;
-            {
-                let mut guard = file.private_data.lock();
-                *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
-            }
-            let r = current_pcb
-                .fd_table()
-                .write()
-                .alloc_fd(file, None)
-                .map(|fd| fd as usize);
-
-            let mut writer = UserBufferWriter::new(
-                clone_args.parent_tid.data() as *mut i32,
-                core::mem::size_of::<i32>(),
-                true,
-            )?;
-
-            writer.copy_one_to_user(&(r.unwrap() as i32), 0)?;
-        }
-
         sched_fork(pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to set sched info from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
@@ -527,10 +540,10 @@ impl ProcessManager {
             )
         });
 
-        // 拷贝用户地址空间
-        Self::copy_mm(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+        // 拷贝 prctl 状态（no_new_privs/dumpable 等）
+        Self::copy_prctl_state(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
-                "fork: Failed to copy mm from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                "fork: Failed to copy prctl state from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
@@ -543,6 +556,14 @@ impl ProcessManager {
             )
         });
 
+        // 拷贝文件系统信息
+        Self::copy_fs(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
+
         // 拷贝信号相关数据
         Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
@@ -551,10 +572,26 @@ impl ProcessManager {
             )
         });
 
+        // 拷贝信号信息（sig_info，包括信号掩码）
+        Self::copy_sig_info(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy sig_info from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
+
         // 拷贝信号备用栈
         Self::copy_sigaltstack(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy sigaltstack from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
+
+        // 拷贝用户地址空间
+        Self::copy_mm(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy mm from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
@@ -582,6 +619,30 @@ impl ProcessManager {
         // 修复：fork时需要复制父进程的可执行文件路径，而不是使用进程名
         // 这样才能正确支持通过/proc/self/exe重新执行程序
         pcb.set_execute_path(current_pcb.execute_path());
+
+        // 继承 cmdline（/proc/<pid>/cmdline 语义）
+        pcb.set_cmdline_bytes(current_pcb.cmdline_bytes());
+
+        // alloc_pid
+        if pcb.raw_pid() == RawPid::UNASSIGNED {
+            // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
+            let ns = pcb.nsproxy().pid_namespace_for_children().clone();
+
+            let main_pid_arc = alloc_pid(&ns).expect("alloc_pid failed");
+
+            // 根namespace中的PID号作为RawPid
+            let root_pid_nr = main_pid_arc
+                .first_upid()
+                .expect("UPid list empty")
+                .nr
+                .data();
+            // log::debug!("fork: root_pid_nr: {}", root_pid_nr);
+
+            unsafe {
+                pcb.force_set_raw_pid(RawPid(root_pid_nr));
+            }
+            pcb.init_task_pid(PidType::PID, main_pid_arc);
+        }
 
         // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长
@@ -630,45 +691,34 @@ impl ProcessManager {
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }
 
-        Self::copy_fs(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
-
-        if pcb.raw_pid() == RawPid::UNASSIGNED {
-            // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
-            let ns = pcb.nsproxy().pid_namespace_for_children().clone();
-
-            let main_pid_arc = alloc_pid(&ns).expect("alloc_pid failed");
-
-            // 根namespace中的PID号作为RawPid
-            let root_pid_nr = main_pid_arc
-                .first_upid()
-                .expect("UPid list empty")
-                .nr
-                .data();
-            // log::debug!("fork: root_pid_nr: {}", root_pid_nr);
-
-            unsafe {
-                pcb.force_set_raw_pid(RawPid(root_pid_nr));
+        // 拷贝 pidfd
+        if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
+            let pid = pcb.raw_pid().0 as i32;
+            let root_inode = ProcessManager::current_mntns().root_inode();
+            let name = format!(
+                "Pidfd(from {} to {})",
+                ProcessManager::current_pcb().raw_pid().data(),
+                pid
+            );
+            let new_inode = root_inode.create(&name, FileType::File, InodeMode::S_IRWXUGO)?;
+            let file = File::new(new_inode, FileFlags::O_RDWR | FileFlags::O_CLOEXEC)?;
+            {
+                let mut guard = file.private_data.lock();
+                *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
             }
-            pcb.init_task_pid(PidType::PID, main_pid_arc);
-        }
+            let r = current_pcb
+                .fd_table()
+                .write()
+                .alloc_fd(file, None)
+                .map(|fd| fd as usize);
 
-        // 将当前pcb加入父进程的子进程哈希表中
-        if pcb.raw_pid() > RawPid(1) {
-            if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
-                let mut children = ppcb_arc.children.write_irqsave();
-                children.push(pcb.raw_pid());
-            } else {
-                panic!("parent pcb is None");
-            }
-        }
+            let mut writer = UserBufferWriter::new(
+                clone_args.parent_tid.data() as *mut i32,
+                core::mem::size_of::<i32>(),
+                true,
+            )?;
 
-        if pcb.raw_pid() > RawPid(0) {
-            ProcessManager::add_pcb(pcb.clone());
+            writer.copy_one_to_user(&(r.unwrap() as i32), 0)?;
         }
 
         let pid = pcb.pid();
@@ -688,7 +738,12 @@ impl ProcessManager {
                 pcb.sighand().flags_insert(SignalFlags::UNKILLABLE);
             }
 
-            let parent_siginfo = current_pcb.sig_info_irqsave();
+            // child_subreaper 是线程组级语义：用线程组 leader 的 siginfo 决定。
+            let parent_leader = {
+                let ti = current_pcb.thread.read_irqsave();
+                ti.group_leader().unwrap_or_else(|| current_pcb.clone())
+            };
+            let parent_siginfo = parent_leader.sig_info_irqsave();
             let parent_tty = parent_siginfo.tty();
             let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
             let parent_is_child_reaper = parent_siginfo.is_child_subreaper();
@@ -728,6 +783,29 @@ impl ProcessManager {
         }
 
         pcb.attach_pid(PidType::PID);
+
+        // 将当前pcb加入父进程的子进程哈希表中
+        // 注意：根据 Linux 语义，子进程应该被添加到 **线程组 leader** 的 children 列表中
+        // 而不是创建它的线程的 children 列表中。这样线程组中的任何线程都可以 wait 这个子进程。
+        // real_parent_pcb 存储实际创建子进程的线程，用于 __WNOTHREAD 选项的判断。
+        if pcb.raw_pid() > RawPid(1) {
+            // 获取线程组 leader
+            let thread_group_leader = {
+                let ti = current_pcb.thread.read_irqsave();
+                ti.group_leader().unwrap_or_else(|| current_pcb.clone())
+            };
+            let mut children = thread_group_leader.children.write_irqsave();
+            children.push(pcb.raw_pid());
+        }
+
+        if pcb.raw_pid() > RawPid(0) {
+            ProcessManager::add_pcb(pcb.clone());
+        }
+
+        // 设置child_tid，意味着子线程能够知道自己的id
+        if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
+            pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
+        }
 
         // 将子进程/线程的id存储在用户态传进的地址中
         if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {

@@ -21,38 +21,30 @@ pub unsafe fn lookup_kallsyms(addr: u64, level: i32) -> bool {
     let sym_num = kallsyms_num as usize;
     let kallsyms_address_list =
         core::slice::from_raw_parts(kallsyms_address as *const u64, sym_num);
+    let mut is_kernel_main = false;
+    if addr < kallsyms_address_list[0] || addr > kallsyms_address_list[sym_num - 1] {
+        println!("[{}] function:unknown \taddress:{:#018x}", level, addr);
+        return is_kernel_main;
+    }
     let sym_names_index = kallsyms_names_index as *const u64;
     let sym_names_index = core::slice::from_raw_parts(sym_names_index, sym_num);
-    let mut index = usize::MAX;
-    for i in 0..sym_num - 1 {
-        if addr > kallsyms_address_list[i] && addr <= kallsyms_address_list[i + 1] {
-            index = i;
-            break;
-        }
-    }
-    let mut is_kernel_main = false;
-    if index < sym_num {
-        let sym_name = CStr::from_ptr(sym_names.add(sym_names_index[index] as usize) as _)
-            .to_str()
-            .unwrap();
-        if sym_name.starts_with("kernel_main") {
-            is_kernel_main = true;
-        }
-        println!(
-            "[{}] function:{}() \t(+) {:04} address:{:#018x}",
-            level,
-            sym_name,
-            addr - kallsyms_address_list[index],
-            addr
-        );
-    } else {
-        println!(
-            "[{}] function:unknown \t(+) {:04} address:{:#018x}",
-            level,
-            addr - kallsyms_address_list[sym_num - 1],
-            addr
-        );
+    let index = match kallsyms_address_list.binary_search(&addr) {
+        Ok(i) => i,
+        Err(i) => i - 1,
     };
+    let sym_name = CStr::from_ptr(sym_names.add(sym_names_index[index] as usize) as _)
+        .to_str()
+        .unwrap();
+    if sym_name.starts_with("kernel_main") {
+        is_kernel_main = true;
+    }
+    println!(
+        "[{}] function:{}() \t(+) {:04} address:{:#018x}",
+        level,
+        sym_name,
+        addr - kallsyms_address_list[index],
+        addr
+    );
     return is_kernel_main;
 }
 

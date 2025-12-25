@@ -1,5 +1,8 @@
 use super::vfs::file::File;
-use crate::libs::{rwlock::RwLock, spinlock::SpinLock};
+use crate::{
+    filesystem::vfs::FileType,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+};
 use alloc::sync::Weak;
 use core::fmt::Debug;
 use event_poll::EventPoll;
@@ -94,16 +97,65 @@ impl EPollItem {
     }
 
     /// ## 通过epoll_item来执行绑定文件的poll方法，并获取到感兴趣的事件
-    fn ep_item_poll(&self) -> EPollEventType {
-        let file = self.file.upgrade();
-        if file.is_none() {
+    ///
+    /// 返回与用户注册的事件掩码相交的就绪事件
+    pub(super) fn ep_item_poll(&self) -> EPollEventType {
+        let Some(file) = self.file.upgrade() else {
             return EPollEventType::empty();
+        };
+
+        // 对于不支持poll的普通文件/目录，返回默认掩码（总是就绪）
+        // 需要与用户注册的事件掩码相交，保持与普通文件路径的一致性
+        if Self::is_always_ready_file(&file) {
+            let interested = self.event.read().events;
+            return EPollEventType::from_bits_truncate(
+                Self::default_poll_mask().bits() & interested,
+            );
         }
-        if let Ok(events) = file.unwrap().poll() {
-            let events = events as u32 & self.event.read().events;
-            return EPollEventType::from_bits_truncate(events);
+
+        match file.poll() {
+            Ok(events) => {
+                let interested = self.event.read().events;
+                EPollEventType::from_bits_truncate(events as u32 & interested)
+            }
+            Err(_) => EPollEventType::empty(),
         }
-        return EPollEventType::empty();
+    }
+
+    /// 检查文件是否为"总是就绪"类型
+    ///
+    /// 满足以下条件的文件总是就绪：
+    /// 1. 文件类型为普通文件或目录
+    /// 2. 文件不支持poll操作
+    ///
+    /// Linux语义：普通文件和目录的I/O操作不会阻塞，因此它们总是可读/可写的
+    /// 参考 Linux 内核的 DEFAULT_POLLMASK
+    #[inline]
+    pub(super) fn is_always_ready_file(file: &File) -> bool {
+        // 先检查是否支持poll，支持的话就不是"总是就绪"
+        if file.supports_poll() {
+            return false;
+        }
+
+        // 不支持poll的普通文件和目录总是就绪
+        let file_type = file
+            .inode()
+            .metadata()
+            .map(|m| m.file_type)
+            .unwrap_or(FileType::File);
+
+        matches!(file_type, FileType::File | FileType::Dir)
+    }
+
+    /// 返回默认的poll掩码，用于不支持poll的普通文件
+    ///
+    /// 对应Linux内核的 DEFAULT_POLLMASK (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM)
+    #[inline]
+    pub(super) fn default_poll_mask() -> EPollEventType {
+        EPollEventType::EPOLLIN
+            | EPollEventType::EPOLLOUT
+            | EPollEventType::EPOLLRDNORM
+            | EPollEventType::EPOLLWRNORM
     }
 }
 

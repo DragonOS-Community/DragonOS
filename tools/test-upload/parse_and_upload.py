@@ -228,11 +228,18 @@ class GoogleTestParser(TestCaseParser):
             r'\[\s+FAILED\s+\]\s+(\S+)\s+\((\d+)\s+ms\)',
             re.MULTILINE
         )
+
+        # 匹配 [  SKIPPED  ] TestName (时间 ms)（可能不在行首）
+        # 注意：SKIPPED前面可能有空格，后面也可能有空格
+        skipped_pattern = re.compile(
+            r'\[\s+SKIPPED\s+\]\s+(\S+)\s+\((\d+)\s+ms\)',
+            re.MULTILINE
+        )
         
         # 找到所有RUN标记及其位置
         run_matches = list(run_pattern.finditer(content))
         
-        # 创建结果映射（OK和FAILED）
+        # 创建结果映射（OK、FAILED和SKIPPED）
         result_map = {}
         for match in ok_pattern.finditer(content):
             name = match.group(1).strip()
@@ -253,6 +260,16 @@ class GoogleTestParser(TestCaseParser):
                 'duration_ms': duration_ms,
                 'end_pos': match.end()
             }
+
+        for match in skipped_pattern.finditer(content):
+            name = match.group(1).strip()
+            duration_ms = int(match.group(2))
+            result_map[match.start()] = {
+                'name': name,
+                'status': 'skipped',
+                'duration_ms': duration_ms,
+                'end_pos': match.end()
+            }
         
         # 处理每个RUN标记
         for run_match in run_matches:
@@ -260,7 +277,7 @@ class GoogleTestParser(TestCaseParser):
             run_start = run_match.start()
             run_end = run_match.end()
             
-            # 查找对应的结果（OK或FAILED）
+            # 查找对应的结果（OK、FAILED或SKIPPED）
             # 结果应该在RUN之后
             result = None
             result_start = None

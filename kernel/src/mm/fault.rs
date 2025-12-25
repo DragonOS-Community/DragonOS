@@ -119,6 +119,7 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
+    #[inline(never)]
     pub unsafe fn handle_mm_fault(mut pfm: PageFaultMessage) -> VmFaultReason {
         let flags = pfm.flags();
         let vma = pfm.vma();
@@ -141,7 +142,7 @@ impl PageFaultHandler {
         if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
             //TODO: 添加handle_hugetlb_fault处理大页缺页异常
         } else {
-            Self::handle_normal_fault(&mut pfm);
+            return Self::handle_normal_fault(&mut pfm);
         }
 
         VmFaultReason::VM_FAULT_COMPLETED
@@ -368,6 +369,15 @@ impl PageFaultHandler {
 
         ret = fs.fault(pfm);
 
+        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            return ret;
+        }
+
+        // 出现错误类返回时，不再继续 finish_fault 以避免 unwrap/panic
+        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+            return ret;
+        }
+
         ret = ret.union(Self::finish_fault(pfm));
 
         ret
@@ -384,6 +394,10 @@ impl PageFaultHandler {
     #[inline(never)]
     pub unsafe fn do_shared_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let mut ret = Self::filemap_fault(pfm);
+
+        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+            return ret;
+        }
 
         let cache_page = pfm.page.clone().expect("no cache_page in PageFaultMessage");
 
@@ -608,7 +622,17 @@ impl PageFaultHandler {
         let vma = pfm.vma();
         let vma_guard = vma.lock_irqsave();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
-        let page_cache = file.inode().page_cache().unwrap();
+        let page_cache = match file.inode().page_cache() {
+            Some(cache) => cache,
+            None => {
+                // 文件没有页面缓存，可能是不支持内存映射的设备文件
+                log::warn!(
+                    "filemap_map_pages: file has no page cache, inode type: {}",
+                    crate::libs::name::get_type_name(&file.inode())
+                );
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
+        };
         let mapper = &mut pfm.mapper;
 
         // 起始页地址
@@ -649,7 +673,17 @@ impl PageFaultHandler {
         let vma = pfm.vma();
         let vma_guard = vma.lock_irqsave();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
-        let page_cache = file.inode().page_cache().unwrap();
+        let page_cache = match file.inode().page_cache() {
+            Some(cache) => cache,
+            None => {
+                // 文件没有页面缓存，可能是不支持内存映射的设备文件
+                log::warn!(
+                    "filemap_fault: file has no page cache, inode type: {}",
+                    crate::libs::name::get_type_name(&file.inode())
+                );
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
+        };
         let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
         let mut ret = VmFaultReason::empty();
 
@@ -661,21 +695,96 @@ impl PageFaultHandler {
             pfm.page = Some(page.clone());
         } else {
             // TODO 同步预读
-            //涉及磁盘IO，返回标志为VM_FAULT_MAJOR
+            // 涉及磁盘IO，返回标志为VM_FAULT_MAJOR
             ret = VmFaultReason::VM_FAULT_MAJOR;
             let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
-            file.pread(
+            match file.pread(
                 file_pgoff * MMArch::PAGE_SIZE,
                 MMArch::PAGE_SIZE,
                 buffer.as_mut_slice(),
-            )
-            .expect("failed to read file to create pagecache page");
+            ) {
+                Ok(read_len) => {
+                    // 超出文件末尾，返回SIGBUS而不是panic
+                    if read_len == 0 {
+                        return VmFaultReason::VM_FAULT_SIGBUS;
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "filemap_fault: pread failed at pgoff {}, err {:?}",
+                        file_pgoff,
+                        e
+                    );
+                    return VmFaultReason::VM_FAULT_SIGBUS;
+                }
+            }
             drop(buffer);
 
             let page = page_cache.lock_irqsave().get_page(file_pgoff);
-            pfm.page = page;
+            if let Some(page) = page {
+                pfm.page = Some(page);
+            } else {
+                // 读取后仍未获取到页面，视为错误
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
         }
         ret
+    }
+
+    /// 纯 page-cache 后端的缺页处理（不走 pread/磁盘 IO）。
+    ///
+    /// 适用场景：tmpfs/ramfs 等内存文件系统，它们以 page_cache 作为唯一数据后端。
+    ///
+    /// 行为：
+    /// - 若 inode 没有 page_cache，则返回 SIGBUS
+    /// - 若缺页落在文件末尾之后（以页粒度判断），返回 SIGBUS
+    /// - 若页已存在，直接使用该页
+    /// - 若页不存在，则创建一个零页并插入 page_cache
+    pub unsafe fn pagecache_fault_zero(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let vma = pfm.vma();
+        let vma_guard = vma.lock_irqsave();
+        let file = vma_guard.vm_file().expect("no vm_file in vma");
+        drop(vma_guard);
+
+        let inode = file.inode();
+        let page_cache = match inode.page_cache() {
+            Some(cache) => cache,
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+
+        let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
+
+        // 以"页起始是否越过 EOF"判断 SIGBUS。
+        // 特别地：size==0 时，任何访问都应 SIGBUS（符合 mmap 语义，且满足 gvisor death tests）。
+        if let Ok(md) = inode.metadata() {
+            let size = md.size.max(0) as usize;
+            if file_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
+        }
+
+        // 先尝试直接获取
+        if let Some(page) = page_cache.lock_irqsave().get_page(file_pgoff) {
+            // 标记为 UPTODATE，便于 map_pages / readahead（即便对 tmpfs 通常不会走）。
+            page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
+            pfm.page = Some(page);
+            return VmFaultReason::empty();
+        }
+
+        {
+            let mut pc = page_cache.lock_irqsave();
+            // 可能并发创建：create 后再 get（忽略已存在/并发导致的轻微差异）
+            pc.create_zero_pages(file_pgoff, 1).map_err(|_| ()).ok();
+        }
+
+        let page = page_cache.lock_irqsave().get_page(file_pgoff);
+        if let Some(page) = page {
+            page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
+            pfm.page = Some(page);
+            VmFaultReason::empty()
+        } else {
+            VmFaultReason::VM_FAULT_SIGBUS
+        }
     }
 
     /// 将文件页映射到缺页地址
@@ -709,6 +818,58 @@ impl PageFaultHandler {
 
         mapper.map_phys(address, page_phys, vma_guard.flags());
         page_to_map.write_irqsave().insert_vma(pfm.vma());
+        VmFaultReason::VM_FAULT_COMPLETED
+    }
+
+    /// Map a zeroed anonymous page for /dev/zero style mappings.
+    pub unsafe fn zero_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let address = pfm.address_aligned_down();
+        let vma = pfm.vma();
+        let flags = vma.lock_irqsave().flags();
+        let mapper = &mut pfm.mapper;
+
+        if let Some(flush) = mapper.map(address, flags) {
+            flush.flush();
+            let mut pm = page_manager_lock_irqsave();
+            let paddr = mapper.translate(address).unwrap().0;
+            let page = pm.get_unwrap(&paddr);
+            page.write_irqsave().insert_vma(vma);
+            VmFaultReason::VM_FAULT_COMPLETED
+        } else {
+            VmFaultReason::VM_FAULT_OOM
+        }
+    }
+
+    /// Prefault zeroed anonymous pages for /dev/zero style mappings.
+    pub unsafe fn zero_map_pages(
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        let vma = pfm.vma();
+        let vma_guard = vma.lock_irqsave();
+        let file_pgoff = match vma_guard.file_page_offset() {
+            Some(off) => off,
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+        let base = vma_guard.region().start();
+        let flags = vma_guard.flags();
+        drop(vma_guard);
+
+        let mapper = &mut pfm.mapper;
+        for pgoff in start_pgoff..end_pgoff {
+            let addr = VirtAddr::new(base.data() + ((pgoff - file_pgoff) << MMArch::PAGE_SHIFT));
+            if let Some(flush) = mapper.map(addr, flags) {
+                flush.flush();
+                let mut pm = page_manager_lock_irqsave();
+                let paddr = mapper.translate(addr).unwrap().0;
+                let page = pm.get_unwrap(&paddr);
+                page.write_irqsave().insert_vma(vma.clone());
+            } else {
+                return VmFaultReason::VM_FAULT_OOM;
+            }
+        }
+
         VmFaultReason::VM_FAULT_COMPLETED
     }
 }

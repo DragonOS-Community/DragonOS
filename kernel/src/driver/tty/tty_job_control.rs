@@ -5,6 +5,7 @@ use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
     process::{
+        cred::CAPFlags,
         pid::{Pid, PidType},
         ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
@@ -83,7 +84,7 @@ impl TtyJobCtrlManager {
                 log::debug!("tty_check_change: orphaned pgrp");
                 return Err(SystemError::EIO);
             } else {
-                crate::ipc::kill::kill_process_group(&pgid, sig)?;
+                crate::ipc::kill::send_signal_to_pgid(&pgid, sig)?;
                 ProcessManager::current_pcb()
                     .flags()
                     .insert(ProcessFlags::HAS_PENDING_SIGNAL);
@@ -116,6 +117,7 @@ impl TtyJobCtrlManager {
             TtyIoctlCmd::TIOCGPGRP => Self::tiocgpgrp(real_tty, arg),
             TtyIoctlCmd::TIOCGSID => Self::tiocgsid(real_tty, arg),
             TtyIoctlCmd::TIOCSCTTY => Self::tiocsctty(real_tty, arg),
+            TtyIoctlCmd::TIOCNOTTY => Self::tiocnotty(real_tty),
             _ => {
                 return Err(SystemError::ENOIOCTLCMD);
             }
@@ -154,13 +156,16 @@ impl TtyJobCtrlManager {
             if current.task_session() == Some(sid.clone()) {
                 // 这是正常情况：会话首进程要设置自己会话的tty为控制终端
             } else {
-                // tty被其他会话占用，需要强制标志或CAP_SYS_ADMIN权限
-                // todo: 这里要补充对CAP_SYS_ADMIN的检查
+                // tty被其他会话占用
                 if arg == 1 {
+                    // 强制窃取控制终端，需要CAP_SYS_ADMIN权限
+                    let cred = current.cred();
+                    if !cred.has_capability(CAPFlags::CAP_SYS_ADMIN) {
+                        return Err(SystemError::EPERM);
+                    }
                     Self::session_clear_tty(sid.clone());
                 } else {
-                    log::warn!("job_ctrl_ioctl: TIOCSCTTY: tty is occupied");
-                    // return Err(SystemError::EPERM);
+                    return Err(SystemError::EPERM);
                 }
             }
         }
@@ -306,6 +311,23 @@ impl TtyJobCtrlManager {
         let sid = p.task_session();
 
         return sid;
+    }
+
+    /// Detach controlling tty from current process if it matches `real_tty`.
+    fn tiocnotty(real_tty: Arc<TtyCore>) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut siginfo = pcb.sig_info_mut();
+        if let Some(cur) = siginfo.tty() {
+            if Arc::ptr_eq(&cur, &real_tty) {
+                Self::__proc_clear_tty(&mut siginfo);
+                drop(siginfo);
+                let mut ctrl = real_tty.core().contorl_info_irqsave();
+                ctrl.session = None;
+                ctrl.pgid = None;
+                return Ok(0);
+            }
+        }
+        Err(SystemError::ENOTTY)
     }
 
     pub(super) fn session_clear_tty(sid: Arc<Pid>) {

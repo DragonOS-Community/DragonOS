@@ -100,6 +100,13 @@ pub fn check_and_clone_cstr(
     user: *const u8,
     max_length: Option<usize>,
 ) -> Result<CString, SystemError> {
+    return do_check_and_clone_cstr(user, max_length, false);
+}
+fn do_check_and_clone_cstr(
+    user: *const u8,
+    max_length: Option<usize>,
+    return_name_too_long: bool,
+) -> Result<CString, SystemError> {
     if user.is_null() {
         return Err(SystemError::EFAULT);
     }
@@ -124,10 +131,20 @@ pub fn check_and_clone_cstr(
         }
         buffer.push(NonZero::new(c[0]).ok_or(SystemError::EINVAL)?);
     }
+    if return_name_too_long && buffer.len() >= max_length.unwrap_or(usize::MAX) {
+        return Err(SystemError::ENAMETOOLONG);
+    }
 
     let cstr = CString::from(buffer);
 
     return Ok(cstr);
+}
+
+pub fn vfs_check_and_clone_cstr(
+    user: *const u8,
+    max_length: Option<usize>,
+) -> Result<CString, SystemError> {
+    return do_check_and_clone_cstr(user, max_length, true);
 }
 
 /// Check and copy a C string array from user space
@@ -202,6 +219,11 @@ impl UserBufferReader<'_> {
     /// * Returns UserBufferReader instance on success, error code otherwise
     ///
     pub fn new<U>(addr: *const U, len: usize, from_user: bool) -> Result<Self, SystemError> {
+        // SAFETY: constructing a slice from a null pointer with non-zero length is UB.
+        // Linux semantics: passing a null pointer for a non-empty user buffer should fail with EFAULT.
+        if len != 0 && (addr as usize) == 0 {
+            return Err(SystemError::EFAULT);
+        }
         if from_user && verify_area(VirtAddr::new(addr as usize), len).is_err() {
             return Err(SystemError::EFAULT);
         }
@@ -215,7 +237,8 @@ impl UserBufferReader<'_> {
         len: usize,
         from_user: bool,
     ) -> Result<Self, SystemError> {
-        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, false) {
+        let accessible_len = user_accessible_len(VirtAddr::new(addr as usize), len, false);
+        if accessible_len < len {
             return Err(SystemError::EFAULT);
         }
 
@@ -442,14 +465,12 @@ impl UserBufferReader<'_> {
         offset: usize,
     ) -> Result<&[T], SystemError> {
         let size = src.len().saturating_sub(offset);
-        if size > 0
-            && !check_user_access_by_page_table(
-                VirtAddr::new(src.as_ptr() as usize + offset),
-                size,
-                false,
-            )
-        {
-            return Err(SystemError::EFAULT);
+        if size > 0 {
+            let accessible_len =
+                user_accessible_len(VirtAddr::new(src.as_ptr() as usize + offset), size, false);
+            if accessible_len < size {
+                return Err(SystemError::EFAULT);
+            }
         }
         self.convert_with_offset(src, offset)
     }
@@ -533,6 +554,10 @@ impl<'a> UserBufferWriter<'a> {
     /// * Returns UserBufferWriter instance on success, error code otherwise
     ///
     pub fn new<U>(addr: *mut U, len: usize, from_user: bool) -> Result<Self, SystemError> {
+        // SAFETY: constructing a slice from a null pointer with non-zero length is UB.
+        if len != 0 && (addr as usize) == 0 {
+            return Err(SystemError::EFAULT);
+        }
         if from_user && verify_area(VirtAddr::new(addr as usize), len).is_err() {
             return Err(SystemError::EFAULT);
         }
@@ -542,7 +567,8 @@ impl<'a> UserBufferWriter<'a> {
     }
 
     pub fn new_checked<U>(addr: *mut U, len: usize, from_user: bool) -> Result<Self, SystemError> {
-        if !check_user_access_by_page_table(VirtAddr::new(addr as usize), len, true) {
+        let accessible_len = user_accessible_len(VirtAddr::new(addr as usize), len, true);
+        if accessible_len < len {
             return Err(SystemError::EFAULT);
         }
 
@@ -714,14 +740,12 @@ impl<'a> UserBufferWriter<'a> {
         offset: usize,
     ) -> Result<&mut [T], SystemError> {
         let size = src.len().saturating_sub(offset);
-        if size > 0
-            && !check_user_access_by_page_table(
-                VirtAddr::new(src.as_ptr() as usize + offset),
-                size,
-                true,
-            )
-        {
-            return Err(SystemError::EFAULT);
+        if size > 0 {
+            let accessible_len =
+                user_accessible_len(VirtAddr::new(src.as_ptr() as usize + offset), size, true);
+            if accessible_len < size {
+                return Err(SystemError::EFAULT);
+            }
         }
         Self::convert_with_offset(src, offset)
     }
@@ -874,8 +898,10 @@ pub unsafe fn copy_from_user_protected(
     let dst_ptr = dst.as_mut_ptr();
     let src_ptr = src.data() as *const u8;
 
-    // 快速路径: 页表检查
-    if !check_user_access_by_page_table(src, len, false) {
+    // 预检查：只基于 VMA 做权限/范围检查（不要求 PTE 已经存在）。
+    // Linux 语义：对懒分配/按需调页的用户页，拷贝过程中触发的缺页应由缺页处理器补齐。
+    // 这里避免用“页表必须 present”作为判断条件，否则 read()/readv() 写入 mmap 区域会错误返回 -EFAULT。
+    if user_accessible_len(src, len, false) < len {
         return Err(SystemError::EFAULT);
     }
 
@@ -906,8 +932,10 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
     let dst_ptr = dest.data() as *mut u8;
     let src_ptr = src.as_ptr();
 
-    // 快速路径: 页表检查
-    if !check_user_access_by_page_table(dest, len, true) {
+    // 预检查：只基于 VMA 做权限/范围检查（不要求 PTE 已经存在）。
+    // 真实拷贝期间若遇到缺页，会进入 handle_mm_fault() 分配/映射页面；
+    // 若遇到不可访问区域（无 VMA / PROT_NONE / 无写权限），缺页处理会走异常表修复并返回 -EFAULT。
+    if user_accessible_len(dest, len, true) < len {
         return Err(SystemError::EFAULT);
     }
 

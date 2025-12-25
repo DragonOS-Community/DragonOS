@@ -33,6 +33,7 @@ pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
 pub mod percpu;
+pub mod readahead;
 pub mod syscall;
 pub mod sysfs;
 pub mod truncate;
@@ -554,13 +555,13 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// @brief 读取指定虚拟地址的值，并假设它是类型T的指针
     #[inline(always)]
-    unsafe fn read<T>(address: VirtAddr) -> T {
+    unsafe fn read<T: Sized>(address: VirtAddr) -> T {
         return ptr::read(address.data() as *const T);
     }
 
     /// @brief 将value写入到指定的虚拟地址
     #[inline(always)]
-    unsafe fn write<T>(address: VirtAddr, value: T) {
+    unsafe fn write<T: Sized>(address: VirtAddr, value: T) {
         ptr::write(address.data() as *mut T, value);
     }
 
@@ -739,6 +740,38 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
         // 对于不支持异常表的架构，直接使用普通的内存设置
         ptr::write_bytes(dst, value, len);
         0
+    }
+}
+
+/// RAII guard for kernel write protection
+///
+/// Ensures write protection is re-enabled even if a panic occurs.
+/// This guard disables kernel write protection on creation and
+/// re-enables it when dropped.
+///
+/// # Example
+/// ```ignore
+/// {
+///     let _guard = KernelWpGuard::new();
+///     // Write protection is disabled here
+///     // ... perform write operations ...
+/// } // Write protection is re-enabled when _guard is dropped
+/// ```
+pub struct KernelWpGuard;
+
+impl KernelWpGuard {
+    /// Create a new guard that disables kernel write protection
+    #[inline]
+    pub fn new() -> Self {
+        MMArch::disable_kernel_wp();
+        Self
+    }
+}
+
+impl Drop for KernelWpGuard {
+    #[inline]
+    fn drop(&mut self) {
+        MMArch::enable_kernel_wp();
     }
 }
 

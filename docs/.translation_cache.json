@@ -48,7 +48,7 @@
     "hash": "299b0ccecf4ef174fffcce4731a98728"
   },
   "en:kernel/sched/index.rst": {
-    "hash": "76ca73ed6d47a4207d2ca193b88eae0b"
+    "hash": "cb2834d1e7bde7924e059290a1399f62"
   },
   "en:kernel/locking/locks.md": {
     "hash": "5514ff361db4677d2b4fa522852aaeea"
@@ -69,7 +69,7 @@
     "hash": "1b0b3fe0cc2918cc2c53a5af392a96ff"
   },
   "en:kernel/filesystem/vfs/index.rst": {
-    "hash": "ab891fde3149c7b4f28cf2197584e1eb"
+    "hash": "2473c51e754a34545c65fb0162aa57b3"
   },
   "en:kernel/debug/profiling-kernel-with-dadk.md": {
     "hash": "966d07272ad19e1afbdc64bb6cfcea73"
@@ -150,7 +150,7 @@
     "hash": "c931f3fcfca7d8d10cd16a8b68e6274a"
   },
   "en:community/ChangeLog/index.rst": {
-    "hash": "dbf244ec28b422b0b7d8b8bcfa72e94d"
+    "hash": "2166fbbfcea1f1ca34fd498cf095fbc3"
   },
   "en:kernel/trace/index.rst": {
     "hash": "3c466a411a5bd71514f8fa4f15d06241"
@@ -234,7 +234,7 @@
     "hash": "bb2435e3905e8e71eca8f6a583e31d94"
   },
   "en:introduction/build_system.md": {
-    "hash": "d15b077dd4ae71bff928efb85aa7999e"
+    "hash": "6c0478fc622ece44830badf5afb17ec4"
   },
   "en:community/ChangeLog/V0.1.x/V0.1.4.md": {
     "hash": "5720af929320997f8824bcdfd3a17bdd"
@@ -294,7 +294,7 @@
     "hash": "52df04d6a276b42617f7b79bbbffa61e"
   },
   "en:kernel/ktest/gvisor_syscall_test.rst": {
-    "hash": "bfa0b1f0bcb791573c73670df23cbb32"
+    "hash": "75f85fb98952102269062342cdbc57cd"
   },
   "en:kernel/syscall/sys_capget_capset.md": {
     "hash": "f3b86c00e9f28df5c0e6c15905e53907"
@@ -303,7 +303,7 @@
     "hash": "acbc94b056e1c8f7f07275d80b70a930"
   },
   "en:kernel/device/index.rst": {
-    "hash": "71c15cea87dffe58f5d70da38390a083"
+    "hash": "f27dd3c0d3f33aac7f70f2eb90403d88"
   },
   "en:kernel/memory_management/extable_safe_copy_design.md": {
     "hash": "fabf6a20ce3a3d1974d678f039fa32b5"
@@ -313,5 +313,20 @@
   },
   "en:kernel/net/ssh.md": {
     "hash": "7ebf2f5934c0ef1ff4f922e48d5d1748"
+  },
+  "en:kernel/filesystem/vfs/mount_propagation.md": {
+    "hash": "11140afc1e5daa1667d40cae29a80b9a"
+  },
+  "en:kernel/sched/wait_queue.md": {
+    "hash": "550f38b4386c3755535e99e97bc98243"
+  },
+  "en:agents/release_agent_capability.md": {
+    "hash": "6c10917f7e05f9a0c5d75c7bbed4bc71"
+  },
+  "en:community/ChangeLog/V0.4.x/V0.4.0.md": {
+    "hash": "940c6a8fc47831f75df1dc8810d7c336"
+  },
+  "en:kernel/device/loop_device.md": {
+    "hash": "1d637a7d292c4168b326ba46755b5622"
   }
 }

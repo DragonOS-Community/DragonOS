@@ -1,24 +1,22 @@
-use core::{
-    fmt::Debug,
-    sync::atomic::{AtomicBool, Ordering},
-};
-
 use crate::{
     filesystem::vfs::{
-        file::{File, FileMode},
+        file::{File, FileFlags},
         FilePrivateData,
     },
     libs::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
-        wait_queue::WaitQueue,
+        wait_queue::{TimeoutWaker, WaitQueue, Waiter},
     },
     process::ProcessManager,
-    sched::{schedule, SchedMode},
     time::{
-        timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
+        timer::{next_n_us_timer_jiffies, Timer},
         PosixTimeSpec,
     },
+};
+use core::{
+    fmt::Debug,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use alloc::{
@@ -73,7 +71,8 @@ impl EventPoll {
 
             if let Some(file) = file {
                 let epitm = self.ep_items.get(&fd).unwrap();
-                file.remove_epitem(epitm)?;
+                // 尝试移除epitem，忽略错误（对于普通文件，我们没有添加epitem，所以会失败）
+                let _ = file.remove_epitem(epitm);
             }
             self.ep_items.remove(&fd);
         }
@@ -88,7 +87,7 @@ impl EventPoll {
     ///
     /// ### 返回值
     /// - 成功则返回Ok(fd)，否则返回Err
-    pub fn create_epoll(flags: FileMode) -> Result<usize, SystemError> {
+    pub fn create_epoll(flags: FileFlags) -> Result<usize, SystemError> {
         let ep_file = Self::create_epoll_file(flags)?;
 
         let current_pcb = ProcessManager::current_pcb();
@@ -101,8 +100,8 @@ impl EventPoll {
     }
 
     /// ## 创建epoll文件
-    pub fn create_epoll_file(flags: FileMode) -> Result<File, SystemError> {
-        if !flags.difference(FileMode::O_CLOEXEC).is_empty() {
+    pub fn create_epoll_file(flags: FileFlags) -> Result<File, SystemError> {
+        if !flags.difference(FileFlags::O_CLOEXEC).is_empty() {
             return Err(SystemError::EINVAL);
         }
 
@@ -114,7 +113,7 @@ impl EventPoll {
 
         let mut ep_file = File::new(
             epoll_inode,
-            FileMode::O_RDWR | (flags & FileMode::O_CLOEXEC),
+            FileFlags::O_RDWR | (flags & FileFlags::O_CLOEXEC),
         )?;
 
         // 设置ep_file的FilePrivateData
@@ -208,6 +207,7 @@ impl EventPoll {
                     if ep_item.is_some() {
                         return Err(SystemError::EEXIST);
                     }
+
                     // 设置epoll
                     let epitem = Arc::new(EPollItem::new(
                         Arc::downgrade(&epoll_data.epoll.0),
@@ -330,6 +330,7 @@ impl EventPoll {
         }
         if let Some(epoll_data) = epolldata {
             let epoll = epoll_data.epoll.clone();
+
             let epoll_guard = epoll.0.lock_irqsave();
 
             let mut timeout = false;
@@ -392,39 +393,60 @@ impl EventPoll {
                 }
 
                 // 还未等待到事件发生，则睡眠
-                // 注册定时器
+                // 构造一次等待（先构造 Waiter/Waker，超时需要通过 Waker::wake 触发）
+                let (waiter, waker) = Waiter::new_pair();
+
+                // 注册定时器：用 waker.wake() 来触发 waiter 退出等待（而不是仅唤醒 PCB）
                 let mut timer = None;
                 if let Some(timespec) = timespec {
-                    let handle = WakeUpHelper::new(current_pcb.clone());
-                    let jiffies = next_n_us_timer_jiffies(
-                        (timespec.tv_sec * 1000000 + timespec.tv_nsec / 1000) as u64,
-                    );
-                    let inner: Arc<Timer> = Timer::new(handle, jiffies);
-                    inner.activate();
+                    let us = (timespec.tv_sec * 1_000_000 + timespec.tv_nsec / 1_000) as u64;
+                    let jiffies = next_n_us_timer_jiffies(us);
+                    let inner: Arc<Timer> = Timer::new(TimeoutWaker::new(waker.clone()), jiffies);
                     timer = Some(inner);
                 }
-                let guard = epoll.0.lock_irqsave();
-                // 睡眠，等待事件发生
-                // 如果wq已经dead，则直接返回错误
-                unsafe { guard.epoll_wq.sleep_without_schedule() }.inspect_err(|_| {
-                    if let Some(timer) = timer.as_ref() {
+                {
+                    let guard = epoll.0.lock_irqsave();
+                    // 注册前再次检查，避免错过事件
+                    if guard.ep_events_available() || guard.shutdown.load(Ordering::SeqCst) {
+                        available = true;
+                        // 不注册，直接继续
+                    } else {
+                        guard.epoll_wq.register_waker(waker.clone())?;
+                    }
+                }
+
+                if available {
+                    if let Some(timer) = timer {
                         timer.cancel();
                     }
-                })?;
-                drop(guard);
-                schedule(SchedMode::SM_NONE);
+                    continue;
+                }
 
-                // 被唤醒后,检查是否有事件可读
-                available = epoll.0.lock_irqsave().ep_events_available();
+                if let Some(ref t) = timer {
+                    t.activate();
+                }
+
+                let wait_res = waiter.wait(true);
+
+                {
+                    let guard = epoll.0.lock_irqsave();
+                    guard.epoll_wq.remove_waker(&waker);
+                    available = guard.ep_events_available();
+                    if guard.shutdown.load(Ordering::SeqCst) {
+                        // epoll 被关闭，直接退出
+                        return Err(SystemError::EINVAL);
+                    }
+                }
+
                 if let Some(timer) = timer {
                     if timer.as_ref().timeout() {
-                        // 超时
                         timeout = true;
                     } else {
-                        // 未超时，则取消计时器
                         timer.cancel();
                     }
                 }
+
+                wait_res?;
             }
         } else {
             panic!("An epoll file does not have the corresponding private information");
@@ -456,14 +478,20 @@ impl EventPoll {
                 push_back.push(epitem);
                 break;
             }
-            let mut ep_events = EPollEventType::from_bits_truncate(epitem.event.read().events);
-            // 再次poll获取事件(为了防止水平触发一直加入队列)
             let revents = epitem.ep_item_poll();
+
+            // 如果没有就绪事件，跳过此项（不报告给用户空间）
+            // 这处理了在fd添加到就绪列表后，触发条件已不再满足的情况
+            // （例如，数据已被另一个线程消费）
+            // 符合Linux 6.6语义：ep_send_events中当revents为0时使用continue
             if revents.is_empty() {
-                // TODO: one-shot event will be lost here
-                // continue;
+                continue;
             }
-            ep_events |= revents;
+
+            // 从用户注册的事件中提取私有位（EPOLLET、EPOLLONESHOT等）
+            let priv_bits = EPollEventType::from_bits_truncate(epitem.event.read().events)
+                .intersection(EPollEventType::EP_PRIVATE_BITS);
+            let ep_events = revents | priv_bits;
             // 构建触发事件结构体
             let event = EPollEvent {
                 events: ep_events.bits,
@@ -524,14 +552,21 @@ impl EventPoll {
         dst_file: Arc<File>,
         epitem: Arc<EPollItem>,
     ) -> Result<(), SystemError> {
+        // TODO：现在的实现先不考虑嵌套其它类型的文件(暂时只针对socket),这里的嵌套指epoll/select/poll
         if Self::is_epoll_file(&dst_file) {
             return Err(SystemError::ENOSYS);
-            // TODO：现在的实现先不考虑嵌套其它类型的文件(暂时只针对socket),这里的嵌套指epoll/select/poll
         }
 
-        let test_poll = dst_file.poll();
-        if test_poll.is_err() && test_poll.unwrap_err() == SystemError::EOPNOTSUPP_OR_ENOTSUP {
-            // 如果目标文件不支持poll
+        // 检查文件是否为"总是就绪"类型（不支持poll的普通文件/目录）
+        let is_always_ready = EPollItem::is_always_ready_file(&dst_file);
+
+        // 不支持poll的非普通文件，返回错误
+        if !dst_file.supports_poll() && !is_always_ready {
+            return Err(SystemError::ENOSYS);
+        }
+
+        // EPOLLWAKEUP 用于电源管理，暂时不支持
+        if epitem.event.read().events & EPollEventType::EPOLLWAKEUP.bits() != 0 {
             return Err(SystemError::ENOSYS);
         }
 
@@ -540,17 +575,13 @@ impl EventPoll {
         // 检查文件是否已经有事件发生
         let event = epitem.ep_item_poll();
         if !event.is_empty() {
-            // 加入到就绪队列
             epoll_guard.ep_add_ready(epitem.clone());
-
             epoll_guard.ep_wake_one();
         }
 
-        // TODO： 嵌套epoll？
-
-        // 这个标志是用与电源管理相关，暂时不支持
-        if epitem.event.read().events & EPollEventType::EPOLLWAKEUP.bits() != 0 {
-            return Err(SystemError::ENOSYS);
+        // 对于"总是就绪"的文件，不需要添加epitem（它们不需要等待事件通知）
+        if is_always_ready {
+            return Ok(());
         }
 
         dst_file.add_epitem(epitem.clone())?;
@@ -620,7 +651,7 @@ impl EventPoll {
 
     /// ### 判断该epoll上是否有进程在等待
     pub fn ep_has_waiter(&self) -> bool {
-        self.epoll_wq.len() != 0
+        !self.epoll_wq.is_empty()
     }
 
     /// ### 唤醒所有在epoll上等待的进程

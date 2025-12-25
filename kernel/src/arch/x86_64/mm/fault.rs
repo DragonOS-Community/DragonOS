@@ -1,8 +1,5 @@
 use alloc::sync::Arc;
-use core::{
-    intrinsics::{likely, unlikely},
-    panic,
-};
+use core::{intrinsics::unlikely, panic};
 use log::error;
 use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
@@ -187,6 +184,7 @@ impl X86_64MMArch {
     /// ## 返回值
     /// - `true`: 成功修复,可以继续执行
     /// - `false`: 无法修复,是真正的内核错误
+    #[inline(never)]
     fn try_fixup_exception(
         regs: &mut TrapFrame,
         _error_code: X86PfErrorCode,
@@ -339,8 +337,8 @@ impl X86_64MMArch {
                 if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
                     if !space_guard.can_extend_stack(region.start() - address) {
                         // exceeds stack limit
-                        log::error!(
-                            "pid {} stack limit exceeded, error_code: {:?}, address: {:#x}",
+                        log::warn!(
+                            "pid {} user stack limit exceeded, error_code: {:?}, address: {:#x}",
                             ProcessManager::current_pid().data(),
                             error_code,
                             address.data(),
@@ -390,11 +388,11 @@ impl X86_64MMArch {
                     return; // 已通过异常表修复
                 }
 
-                log::error!(
-                    "vma access error, error_code: {:?}, address: {:#x}",
-                    error_code,
-                    address.data(),
-                );
+                // log::error!(
+                //     "vma access error, error_code: {:?}, address: {:#x}",
+                //     error_code,
+                //     address.data(),
+                // );
 
                 send_segv();
             }
@@ -421,8 +419,41 @@ impl X86_64MMArch {
             | VmFaultReason::VM_FAULT_HWPOISON_LARGE
             | VmFaultReason::VM_FAULT_FALLBACK;
 
-        if likely(!fault.contains(vm_fault_error)) {
-            panic!("fault error: {:?}", fault)
+        if fault.intersects(vm_fault_error) {
+            // 内核态访问用户地址（如 copy_from_user）应走异常表修复，返回 -EFAULT，而不是发送信号/崩溃
+            if !regs.is_from_user() {
+                if Self::try_fixup_exception(regs, error_code, address) {
+                    return;
+                }
+                panic!(
+                    "kernel access to user addr failed without fixup, fault: {:?}, addr: {:#x}, rip: {:#x}",
+                    fault,
+                    address.data(),
+                    regs.rip
+                );
+            }
+
+            // 用户态 fault：发送对应信号
+            let mut info = if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
+                SigInfo::new(
+                    Signal::SIGSEGV,
+                    0,
+                    SigCode::User,
+                    SigType::Kill(ProcessManager::current_pid()),
+                )
+            } else {
+                // 包括 SIGBUS / OOM / HWPOISON 等统一 SIGBUS
+                SigInfo::new(
+                    Signal::SIGBUS,
+                    0,
+                    SigCode::User,
+                    SigType::Kill(ProcessManager::current_pid()),
+                )
+            };
+            let _ = Signal::SIGBUS.send_signal_info(Some(&mut info), ProcessManager::current_pid());
+            return;
         }
+
+        panic!("fault error: {:?}", fault)
     }
 }

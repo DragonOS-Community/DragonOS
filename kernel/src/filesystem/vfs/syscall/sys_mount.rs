@@ -3,10 +3,19 @@
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
-        fcntl::AtFlags, mount::MountFlags, produce_fs, utils::user_path_at, IndexNode, MountFS,
-        MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        fcntl::AtFlags,
+        mount::{is_mountpoint_root, MountFlags},
+        produce_fs,
+        utils::user_path_at,
+        FileType, IndexNode, InodeId, MountFS, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
-    process::ProcessManager,
+    libs::casting::DowncastArc,
+    process::{
+        namespace::propagation::{
+            change_mnt_propagation_recursive, flags_to_propagation_type, is_propagation_change,
+        },
+        ProcessManager,
+    },
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access,
@@ -45,16 +54,16 @@ impl Syscall for SysMountHandle {
         let filesystemtype = Self::filesystemtype(args);
         let data = Self::raw_data(args);
         let mount_flags = Self::mountflags(args);
-        log::debug!(
-            "sys_mount: source: {:?}, target: {:?}, filesystemtype: {:?}, mount_flags: {:?}, data: {:?}",
-            source, target, filesystemtype, mount_flags, data
-        );
+        // log::debug!(
+        //     "sys_mount: source: {:?}, target: {:?}, filesystemtype: {:?}, mount_flags: {:?}, data: {:?}",
+        //     source, target, filesystemtype, mount_flags, data
+        // );
         let mount_flags = MountFlags::from_bits_truncate(mount_flags);
 
-        let target = copy_mount_string(target).inspect_err(|e| {
+        let target = copy_mount_path_string(target).inspect_err(|e| {
             log::error!("Failed to read mount target: {:?}", e);
         })?;
-        let source = copy_mount_string(source).inspect_err(|e| {
+        let source = copy_mount_path_string(source).inspect_err(|e| {
             log::error!("Failed to read mount source: {:?}", e);
         })?;
 
@@ -233,16 +242,11 @@ fn path_mount(
     }
 
     if flags.contains(MountFlags::BIND) {
-        log::warn!("todo: bind mnt");
-        return Err(SystemError::ENOSYS);
+        return do_bind_mount(source, target_inode, flags);
     }
-    if flags.intersects(
-        MountFlags::SHARED | MountFlags::PRIVATE | MountFlags::SLAVE | MountFlags::UNBINDABLE,
-    ) {
-        log::warn!("todo: change mnt type: {:?}", flags);
-        // 这里暂时返回OK,否则unshare会失败！！！
-        return Ok(());
-        // return Err(SystemError::ENOSYS);
+    // Handle propagation type changes (mount --make-{shared,private,slave,unbindable})
+    if is_propagation_change(flags) {
+        return do_change_type(target_inode, flags);
     }
 
     if flags.contains(MountFlags::MOVE) {
@@ -256,7 +260,7 @@ fn path_mount(
 
 fn do_new_mount(
     source: Option<String>,
-    target_inode: Arc<dyn IndexNode>,
+    mut target_inode: Arc<dyn IndexNode>,
     filesystemtype: Option<String>,
     data: Option<String>,
     mount_flags: MountFlags,
@@ -267,14 +271,17 @@ fn do_new_mount(
         log::error!("Failed to produce filesystem: {:?}", e);
     })?;
 
-    let abs_path = target_inode.absolute_path()?;
-
-    let result = ProcessManager::current_mntns().get_mount_point(&abs_path);
-    if let Some((_, rest, _fs)) = result {
-        if rest.is_empty() {
-            return Err(SystemError::EBUSY);
+    // 若目标是挂载点根，则尝试在其父目录挂载，避免 EBUSY 并与 Linux 叠加语义接近
+    if is_mountpoint_root(&target_inode) {
+        if let Ok(parent) = target_inode.parent() {
+            target_inode = parent;
         }
     }
+
+    let _abs_path = target_inode.absolute_path()?;
+
+    // 允许在已有挂载点上再次挂载（符合 Linux 允许叠加挂载的语义）
+    // MountList::insert 会替换同一路径的记录，无需提前返回 EBUSY。
     return target_inode.mount(fs, mount_flags);
 }
 #[inline(never)]
@@ -290,4 +297,282 @@ fn copy_mount_string(raw: Option<*const u8>) -> Result<Option<String>, SystemErr
     } else {
         Ok(None)
     }
+}
+
+#[inline(never)]
+fn copy_mount_path_string(raw: Option<*const u8>) -> Result<Option<String>, SystemError> {
+    if let Some(raw) = raw {
+        let s = user_access::vfs_check_and_clone_cstr(raw, Some(MAX_PATHLEN))
+            .inspect_err(|e| {
+                log::error!("Failed to read mount path string: {:?}", e);
+            })?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        Ok(Some(s))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Perform a bind mount operation.
+///
+/// Bind mount makes a directory subtree visible at another location.
+/// The source and target will share the same underlying filesystem content.
+///
+/// # Arguments
+/// * `source` - The source path to bind from
+/// * `target_inode` - The target mount point
+/// * `flags` - Mount flags (MS_BIND, optionally MS_REC)
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(SystemError)` on failure
+fn do_bind_mount(
+    source: Option<String>,
+    target_inode: Arc<dyn IndexNode>,
+    flags: MountFlags,
+) -> Result<(), SystemError> {
+    let source_path = source.ok_or(SystemError::EINVAL)?;
+
+    // log::debug!(
+    //     "do_bind_mount: source={}, recursive={}",
+    //     source_path,
+    //     flags.contains(MountFlags::REC)
+    // );
+
+    // Resolve the source path to get the source inode
+    let (current_node, rest_path) = user_path_at(
+        &ProcessManager::current_pcb(),
+        AtFlags::AT_FDCWD.bits(),
+        &source_path,
+    )?;
+    let source_inode =
+        current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
+    // Both source and target must be directories
+    if source_inode.metadata()?.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    if target_inode.metadata()?.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+
+    // Get the source's filesystem
+    let source_fs = source_inode.fs();
+
+    // Check if source is on a MountFS
+    let source_mfs = source_fs.clone().downcast_arc::<MountFS>();
+
+    // Check if source is unbindable - if so, reject the bind mount
+    if let Some(ref mfs) = source_mfs {
+        if mfs.propagation().is_unbindable() {
+            // log::debug!("do_bind_mount: source is unbindable, rejecting bind mount");
+            return Err(SystemError::EINVAL);
+        }
+    }
+
+    // Clone source_mfs for recursive bind mount (need to keep it for later use)
+    let source_mfs_for_recursive = source_mfs.clone();
+
+    // Get the inner filesystem for mounting
+    let inner_fs = source_mfs
+        .map(|mfs| mfs.inner_filesystem())
+        .unwrap_or(source_fs);
+
+    // Use the target_inode.mount() method which handles all the mounting logic
+    // This properly creates a new MountFS and registers it
+    let target_mfs = target_inode.mount(inner_fs, MountFlags::empty())?;
+
+    // If MS_REC is set, recursively bind all submounts from source to target
+    if flags.contains(MountFlags::REC) {
+        if let Some(ref mfs) = source_mfs_for_recursive {
+            let source_path = source_inode.absolute_path()?;
+            let target_path = target_inode.absolute_path()?;
+            do_recursive_bind_mount(mfs, &target_mfs, &source_path, &target_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Change the propagation type of a mount point.
+///
+/// This implements the kernel path for `mount --make-{shared,private,slave,unbindable}`.
+///
+/// # Arguments
+/// * `target_inode` - The mount point to change
+/// * `flags` - Mount flags containing the propagation type
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(SystemError)` on failure
+fn do_change_type(target_inode: Arc<dyn IndexNode>, flags: MountFlags) -> Result<(), SystemError> {
+    // Get the propagation type from flags
+    let prop_type = match flags_to_propagation_type(flags) {
+        Some(t) => t,
+        None => {
+            log::warn!("do_change_type: no propagation flag set");
+            return Err(SystemError::EINVAL);
+        }
+    };
+
+    // Check if recursive flag is set
+    let recursive = flags.contains(MountFlags::REC);
+
+    // Get the MountFS from the inode
+    let fs = target_inode.fs();
+    let mount_fs = fs.downcast_arc::<MountFS>().ok_or_else(|| {
+        log::warn!("do_change_type: target is not a mounted filesystem");
+        SystemError::EINVAL
+    })?;
+
+    // log::debug!(
+    //     "do_change_type: changing propagation to {:?}, recursive={}",
+    //     prop_type,
+    //     recursive
+    // );
+
+    // Change the propagation type
+    change_mnt_propagation_recursive(&mount_fs, prop_type, recursive)?;
+
+    Ok(())
+}
+
+/// Recursively bind mount all submounts from source to target.
+///
+/// This function traverses the source mount tree and creates corresponding
+/// bind mounts at the target location for all submounts.
+///
+/// # Arguments
+/// * `source_mfs` - The source MountFS to copy submounts from
+/// * `target_mfs` - The target MountFS to create submounts in
+/// * `source_base_path` - The absolute path of the source mount point
+/// * `target_base_path` - The absolute path of the target mount point
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(SystemError)` on failure
+fn do_recursive_bind_mount(
+    source_mfs: &Arc<MountFS>,
+    _target_mfs: &Arc<MountFS>,
+    source_base_path: &str,
+    target_base_path: &str,
+) -> Result<(), SystemError> {
+    let mnt_ns = ProcessManager::current_mntns();
+    let mount_list = mnt_ns.mount_list();
+
+    // Queue for BFS traversal: (source_submount, source_mountpoint_ino)
+    struct SubmountInfo {
+        source_mfs: Arc<MountFS>,
+        source_mp_ino: InodeId,
+    }
+
+    let mut queue: Vec<SubmountInfo> = Vec::new();
+
+    // Add all direct submounts of source to the queue
+    for (child_ino, child_mfs) in source_mfs.mountpoints().iter() {
+        queue.push(SubmountInfo {
+            source_mfs: child_mfs.clone(),
+            source_mp_ino: *child_ino,
+        });
+    }
+
+    // Process all submounts
+    while let Some(info) = queue.pop() {
+        // Get the mount path of this submount
+        let child_mount_path = match mount_list.get_mount_path_by_ino(info.source_mp_ino) {
+            Some(path) => path,
+            None => {
+                log::warn!(
+                    "do_recursive_bind_mount: mount path not found for inode {:?}",
+                    info.source_mp_ino
+                );
+                continue;
+            }
+        };
+
+        // Calculate the relative path from source base
+        let relative_path = match child_mount_path.as_str().strip_prefix(source_base_path) {
+            Some(rel) => {
+                if rel.is_empty() {
+                    continue; // Skip if it's the source itself
+                }
+                rel
+            }
+            None => {
+                log::warn!(
+                    "do_recursive_bind_mount: path {} is not under source base {}",
+                    child_mount_path.as_str(),
+                    source_base_path
+                );
+                continue;
+            }
+        };
+
+        // Calculate target path
+        let target_child_path = if target_base_path.ends_with('/') {
+            alloc::format!(
+                "{}{}",
+                target_base_path.trim_end_matches('/'),
+                relative_path
+            )
+        } else {
+            alloc::format!("{}{}", target_base_path, relative_path)
+        };
+
+        // log::debug!(
+        //     "do_recursive_bind_mount: binding submount {} -> {}",
+        //     child_mount_path.as_str(),
+        //     target_child_path
+        // );
+
+        // Look up the target directory inode
+        let root_inode = mnt_ns.root_inode();
+        let target_child_inode = match root_inode
+            .lookup_follow_symlink(&target_child_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        {
+            Ok(inode) => inode,
+            Err(e) => {
+                log::warn!(
+                    "do_recursive_bind_mount: failed to lookup target path {}: {:?}",
+                    target_child_path,
+                    e
+                );
+                continue;
+            }
+        };
+
+        // Skip if not a directory
+        if target_child_inode.metadata()?.file_type != FileType::Dir {
+            log::warn!(
+                "do_recursive_bind_mount: target {} is not a directory",
+                target_child_path
+            );
+            continue;
+        }
+
+        // Get the inner filesystem for mounting
+        // source_mfs is already Arc<MountFS>, so we can directly call inner_filesystem()
+        let child_inner_fs = info.source_mfs.inner_filesystem();
+
+        // Create the bind mount
+        if let Err(e) = target_child_inode.mount(child_inner_fs, MountFlags::empty()) {
+            log::warn!(
+                "do_recursive_bind_mount: failed to mount at {}: {:?}",
+                target_child_path,
+                e
+            );
+            continue;
+        }
+
+        // Add this submount's children to the queue
+        for (grandchild_ino, grandchild_mfs) in info.source_mfs.mountpoints().iter() {
+            queue.push(SubmountInfo {
+                source_mfs: grandchild_mfs.clone(),
+                source_mp_ino: *grandchild_ino,
+            });
+        }
+    }
+
+    Ok(())
 }

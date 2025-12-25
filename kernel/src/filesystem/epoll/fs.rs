@@ -1,7 +1,7 @@
 use alloc::string::String;
 
 use crate::{
-    filesystem::vfs::{file::FileMode, FilePrivateData, IndexNode, Metadata},
+    filesystem::vfs::{file::FileFlags, FilePrivateData, IndexNode, Metadata},
     libs::spinlock::SpinLockGuard,
 };
 
@@ -24,6 +24,11 @@ impl EPollInode {
 }
 
 impl IndexNode for EPollInode {
+    fn is_stream(&self) -> bool {
+        // epollfd 不支持 seek/pread/pwrite，按流式对象处理，统一返回 ESPIPE。
+        true
+    }
+
     fn read_at(
         &self,
         _offset: usize,
@@ -72,7 +77,7 @@ impl IndexNode for EPollInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

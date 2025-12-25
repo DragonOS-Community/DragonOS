@@ -1,7 +1,18 @@
 // #![allow(dead_code)]
-use core::intrinsics::unlikely;
+use core::{
+    intrinsics::unlikely,
+    marker::PhantomData,
+    mem,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+};
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::VecDeque,
+    rc::Rc,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use log::warn;
 use system_error::SystemError;
 
@@ -19,16 +30,28 @@ use super::{
 
 #[derive(Debug)]
 struct InnerWaitQueue {
-    /// 等待队列是否已经死亡, 如果已经死亡, 则不能再添加新的等待进程
     dead: bool,
-    /// 等待队列的链表
-    wait_list: VecDeque<Arc<ProcessControlBlock>>,
+    waiters: VecDeque<Arc<Waker>>,
 }
 
-/// 被自旋锁保护的等待队列
+/// 等待队列：基于一次性 Waiter/Waker，避免唤醒丢失
 #[derive(Debug)]
 pub struct WaitQueue {
     inner: SpinLock<InnerWaitQueue>,
+    num_waiters: AtomicU32,
+}
+
+/// 属于当前线程的等待者，不可跨线程共享
+pub struct Waiter {
+    waker: Arc<Waker>,
+    _nosend: PhantomData<Rc<()>>,
+}
+
+/// 可跨 CPU/线程共享的唤醒器
+#[derive(Debug)]
+pub struct Waker {
+    has_woken: AtomicBool,
+    target: Weak<ProcessControlBlock>,
 }
 
 #[allow(dead_code)]
@@ -36,310 +59,291 @@ impl WaitQueue {
     pub const fn default() -> Self {
         WaitQueue {
             inner: SpinLock::new(InnerWaitQueue::INIT),
+            num_waiters: AtomicU32::new(0),
         }
     }
 
-    fn inner_irqsave(&self) -> SpinLockGuard<'_, InnerWaitQueue> {
-        self.inner.lock_irqsave()
-    }
-
-    fn inner(&self) -> SpinLockGuard<'_, InnerWaitQueue> {
-        self.inner.lock()
-    }
-
-    pub fn prepare_to_wait_event(&self, interruptible: bool) -> Result<(), SystemError> {
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        let pcb = ProcessManager::current_pcb();
-        if !guard.can_sleep() {
+    pub fn register_waker(&self, waker: Arc<Waker>) -> Result<(), SystemError> {
+        let mut guard = self.inner.lock_irqsave();
+        if guard.dead {
             return Err(SystemError::ECHILD);
         }
-        if Signal::signal_pending_state(interruptible, false, &pcb) {
-            return Err(SystemError::ERESTARTSYS);
-        } else {
-            ProcessManager::mark_sleep(interruptible).unwrap_or_else(|e| {
-                panic!("sleep error: {:?}", e);
-            });
-            guard.wait_list.push_back(ProcessManager::current_pcb());
-            drop(guard);
-        }
+        guard.waiters.push_back(waker);
+        self.num_waiters.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
-    pub fn finish_wait(&self) {
-        let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-
-        writer.set_state(ProcessState::Runnable);
-        writer.set_wakeup();
-
-        guard.wait_list.retain(|x| !Arc::ptr_eq(x, &pcb));
-        drop(guard);
-        drop(writer);
-    }
-
-    /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
-    pub fn sleep(&self) -> Result<(), SystemError> {
-        before_sleep_check(0);
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        if !guard.can_sleep() {
-            return Err(SystemError::ESRCH);
+    pub fn remove_waker(&self, target: &Arc<Waker>) {
+        let mut guard = self.inner.lock_irqsave();
+        let before = guard.waiters.len();
+        guard.waiters.retain(|w| !Arc::ptr_eq(w, target));
+        let removed = before - guard.waiters.len();
+        if removed > 0 {
+            self.num_waiters
+                .fetch_sub(removed as u32, Ordering::Release);
         }
-        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        guard.wait_list.push_back(ProcessManager::current_pcb());
-        drop(guard);
-        schedule(SchedMode::SM_NONE);
-        Ok(())
     }
 
-    /// 标记等待队列已经死亡，不能再添加新的等待进程
-    pub fn mark_dead(&self) {
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        guard.dead = true;
-        drop(guard);
+    pub fn is_empty(&self) -> bool {
+        self.num_waiters.fetch_add(0, Ordering::Acquire) == 0
     }
 
-    /// @brief 让当前进程在等待队列上进行等待，并且,在释放waitqueue的锁之前，执行f函数闭包
-    pub fn sleep_with_func<F>(&self, f: F) -> Result<(), SystemError>
+    /// 可中断等待条件成立；`before_sleep` 在入队后、睡眠前执行（用于解锁等操作）
+    pub fn wait_event_interruptible<F, B>(
+        &self,
+        cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
     where
-        F: FnOnce(),
+        F: FnMut() -> bool,
+        B: FnMut(),
     {
-        before_sleep_check(0);
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        if !guard.can_sleep() {
-            return Err(SystemError::ESRCH);
+        self.wait_event_impl(cond, before_sleep, true)
+    }
+
+    /// 不可中断等待条件成立
+    pub fn wait_event_uninterruptible<F, B>(
+        &self,
+        cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.wait_event_impl(cond, before_sleep, false)
+    }
+
+    fn wait_event_impl<F, B>(
+        &self,
+        mut cond: F,
+        mut before_sleep: Option<B>,
+        interruptible: bool,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        loop {
+            if cond() {
+                return Ok(());
+            }
+
+            let (waiter, waker) = Waiter::new_pair();
+            self.register_waker(waker.clone())?;
+
+            // 条件可能在入队后立即满足，直接摘掉
+            if cond() {
+                self.remove_waker(&waker);
+                return Ok(());
+            }
+
+            if interruptible
+                && Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
+            {
+                self.remove_waker(&waker);
+                return Err(SystemError::ERESTARTSYS);
+            }
+
+            if let Some(ref mut hook) = before_sleep {
+                hook();
+            }
+
+            match waiter.wait(interruptible) {
+                Ok(()) => {
+                    // 再次循环检查条件，处理伪唤醒
+                    continue;
+                }
+                Err(e) => {
+                    self.remove_waker(&waker);
+                    return Err(e);
+                }
+            }
         }
-
-        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        guard.wait_list.push_back(ProcessManager::current_pcb());
-        f();
-
-        drop(guard);
-        schedule(SchedMode::SM_NONE);
-
-        Ok(())
     }
 
-    /// @brief 让当前进程在等待队列上进行等待. 但是，在释放waitqueue的锁之后，不会调用调度函数。
-    /// 这样的设计，是为了让调用者可以在执行本函数之后，执行一些操作，然后再【手动调用调度函数】。
-    ///
-    /// 执行本函数前，需要确保处于【中断禁止】状态。
-    ///
-    /// 尽管sleep_with_func和sleep_without_schedule都可以实现这个功能，但是，sleep_with_func会在释放锁之前，执行f函数闭包。
-    ///
-    /// 考虑这样一个场景：
-    /// 等待队列位于某个自旋锁保护的数据结构A中，我们希望在进程睡眠的同时，释放数据结构A的锁。
-    /// 在这种情况下，如果使用sleep_with_func，所有权系统不会允许我们这么做。
-    /// 因此，sleep_without_schedule的设计，正是为了解决这个问题。
-    ///
-    /// 由于sleep_without_schedule不会调用调度函数，因此，如果开发者忘记在执行本函数之后，手动调用调度函数，
-    /// 由于时钟中断到来或者‘其他cpu kick了当前cpu’，可能会导致一些未定义的行为。
-    pub unsafe fn sleep_without_schedule(&self) -> Result<(), SystemError> {
-        before_sleep_check(1);
-        // 安全检查：确保当前处于中断禁止状态
-        assert!(!CurrentIrqArch::is_irq_enabled());
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        if !guard.can_sleep() {
-            return Err(SystemError::ESRCH);
-        }
-        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        guard.wait_list.push_back(ProcessManager::current_pcb());
-        drop(guard);
-        Ok(())
+    /// 唤醒一个等待者
+    pub fn wakeup(&self, _state: Option<ProcessState>) -> bool {
+        // state 参数保留兼容位置（现阶段未再使用）
+        self.wake_one()
     }
 
-    pub unsafe fn sleep_without_schedule_uninterruptible(&self) -> Result<(), SystemError> {
-        before_sleep_check(1);
-        // 安全检查：确保当前处于中断禁止状态
-        assert!(!CurrentIrqArch::is_irq_enabled());
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        if !guard.can_sleep() {
-            return Err(SystemError::ESRCH);
-        }
-        ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        guard.wait_list.push_back(ProcessManager::current_pcb());
-        drop(guard);
-        Ok(())
-    }
-    /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断
-    pub fn sleep_uninterruptible(&self) -> Result<(), SystemError> {
-        before_sleep_check(0);
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        if !guard.can_sleep() {
-            return Err(SystemError::ESRCH);
-        }
-        ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        guard.wait_list.push_back(ProcessManager::current_pcb());
-        drop(guard);
-        schedule(SchedMode::SM_NONE);
-        Ok(())
-    }
-
-    /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
-    /// 在当前进程的pcb加入队列后，解锁指定的自旋锁。
-    pub fn sleep_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) -> Result<(), SystemError> {
-        before_sleep_check(1);
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        if !guard.can_sleep() {
-            return Err(SystemError::ESRCH);
-        }
-        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        guard.wait_list.push_back(ProcessManager::current_pcb());
-        drop(to_unlock);
-        drop(guard);
-        schedule(SchedMode::SM_NONE);
-        Ok(())
-    }
-
-    /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
-    /// 在当前进程的pcb加入队列后，解锁指定的Mutex。
-    pub fn sleep_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) -> Result<(), SystemError> {
-        before_sleep_check(1);
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-
-        if !guard.can_sleep() {
-            return Err(SystemError::ESRCH);
-        }
-        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        guard.wait_list.push_back(ProcessManager::current_pcb());
-        drop(to_unlock);
-        drop(guard);
-        schedule(SchedMode::SM_NONE);
-        Ok(())
-    }
-
-    /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
-    /// 在当前进程的pcb加入队列后，解锁指定的自旋锁。
-    pub fn sleep_uninterruptible_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) {
-        before_sleep_check(1);
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        drop(irq_guard);
-        guard.wait_list.push_back(ProcessManager::current_pcb());
-        drop(to_unlock);
-        drop(guard);
-        schedule(SchedMode::SM_NONE);
-    }
-
-    /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
-    /// 在当前进程的pcb加入队列后，解锁指定的Mutex。
-    pub fn sleep_uninterruptible_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) {
-        before_sleep_check(1);
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        drop(irq_guard);
-
-        guard.wait_list.push_back(ProcessManager::current_pcb());
-
-        drop(to_unlock);
-        drop(guard);
-        schedule(SchedMode::SM_NONE);
-    }
-
-    /// @brief 唤醒在队列中等待的第一个进程。
-    /// 如果这个进程的state与给定的state进行and操作之后，结果不为0,则唤醒它。
-    ///
-    /// @param state 用于判断的state，如果队列第一个进程与这个state相同，或者为None(表示不进行这个判断)，则唤醒这个进程。
-    ///
-    /// @return true 成功唤醒进程
-    /// @return false 没有唤醒进程
-    pub fn wakeup(&self, state: Option<ProcessState>) -> bool {
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        // 如果队列为空，则返回
-        if guard.wait_list.is_empty() {
+    pub fn wake_one(&self) -> bool {
+        if self.is_empty() {
             return false;
         }
-        // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
-        if let Some(state) = state {
-            if guard
-                .wait_list
-                .front()
-                .unwrap()
-                .sched_info()
-                .inner_lock_read_irqsave()
-                .state()
-                != state
-            {
-                return false;
-            }
-        }
-        let to_wakeup = guard.wait_list.pop_front().unwrap();
-        drop(guard);
-        let res = ProcessManager::wakeup(&to_wakeup).is_ok();
-        return res;
-    }
 
-    /// @brief 唤醒在队列中，符合条件的所有进程。
-    ///
-    /// @param state 用于判断的state，如果一个进程与这个state相同，或者为None(表示不进行这个判断)，则唤醒这个进程。
-    pub fn wakeup_all(&self, state: Option<ProcessState>) {
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
-        // 如果队列为空，则返回
-        if guard.wait_list.is_empty() {
-            return;
-        }
-
-        let mut to_push_back: Vec<Arc<ProcessControlBlock>> = Vec::new();
-        // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
-        while let Some(to_wakeup) = guard.wait_list.pop_front() {
-            let mut wake = false;
-            if let Some(state) = state {
-                if to_wakeup.sched_info().inner_lock_read_irqsave().state() == state {
-                    wake = true;
+        loop {
+            let next = {
+                let mut guard = self.inner.lock_irqsave();
+                let waker = guard.waiters.pop_front();
+                if waker.is_some() {
+                    self.num_waiters.fetch_sub(1, Ordering::Release);
                 }
-            } else {
-                wake = true;
-            }
+                waker
+            };
 
-            if wake {
-                ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
-                    log::debug!("wakeup pid: {:?} error: {:?}", to_wakeup.raw_pid(), e);
-                });
-                continue;
-            } else {
-                to_push_back.push(to_wakeup);
+            let Some(waker) = next else { return false };
+            if waker.wake() {
+                return true;
             }
-        }
-
-        for to_wakeup in to_push_back {
-            guard.wait_list.push_back(to_wakeup);
         }
     }
 
-    /// @brief 获得当前等待队列的大小
+    /// 唤醒队列中全部等待者
+    pub fn wakeup_all(&self, _state: Option<ProcessState>) {
+        self.wake_all();
+    }
+
+    pub fn wake_all(&self) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+
+        let mut drained = VecDeque::new();
+        {
+            let mut guard = self.inner.lock_irqsave();
+            mem::swap(&mut guard.waiters, &mut drained);
+            self.num_waiters.store(0, Ordering::Release);
+        }
+
+        let wakers = drained;
+        let mut woken = 0;
+        for w in wakers {
+            if w.wake() {
+                woken += 1;
+            }
+        }
+        woken
+    }
+
+    /// 标记等待队列失效，清空并唤醒剩余等待者
+    pub fn mark_dead(&self) {
+        let mut drained = VecDeque::new();
+        {
+            let mut guard = self.inner.lock_irqsave();
+            guard.dead = true;
+            mem::swap(&mut guard.waiters, &mut drained);
+            self.num_waiters.store(0, Ordering::Release);
+        }
+        for w in drained {
+            w.close();
+            w.wake();
+        }
+    }
+
     pub fn len(&self) -> usize {
-        return self.inner_irqsave().wait_list.len();
+        self.num_waiters.fetch_add(0, Ordering::Acquire) as usize
+    }
+
+    pub fn sleep_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) -> Result<(), SystemError> {
+        before_sleep_check(1);
+        let mut to_unlock = Some(to_unlock);
+        self.wait_event_interruptible(
+            || false,
+            Some(move || {
+                if let Some(lock) = to_unlock.take() {
+                    drop(lock);
+                }
+            }),
+        )
+    }
+
+    pub fn sleep_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) -> Result<(), SystemError> {
+        before_sleep_check(1);
+        let mut to_unlock = Some(to_unlock);
+        self.wait_event_interruptible(
+            || false,
+            Some(move || {
+                if let Some(lock) = to_unlock.take() {
+                    drop(lock);
+                }
+            }),
+        )
+    }
+
+    pub fn sleep_uninterruptible_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) {
+        before_sleep_check(1);
+        let mut to_unlock = Some(to_unlock);
+        let _ = self.wait_event_uninterruptible(
+            || false,
+            Some(move || {
+                if let Some(lock) = to_unlock.take() {
+                    drop(lock);
+                }
+            }),
+        );
+    }
+
+    pub fn sleep_uninterruptible_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) {
+        before_sleep_check(1);
+        let mut to_unlock = Some(to_unlock);
+        let _ = self.wait_event_uninterruptible(
+            || false,
+            Some(move || {
+                if let Some(lock) = to_unlock.take() {
+                    drop(lock);
+                }
+            }),
+        );
     }
 }
 
 impl InnerWaitQueue {
     pub const INIT: InnerWaitQueue = InnerWaitQueue {
-        wait_list: VecDeque::new(),
         dead: false,
+        waiters: VecDeque::new(),
     };
+}
 
-    pub fn can_sleep(&self) -> bool {
-        return !self.dead;
+impl Waiter {
+    pub fn new_pair() -> (Self, Arc<Waker>) {
+        let waker = Arc::new(Waker {
+            has_woken: AtomicBool::new(false),
+            target: Arc::downgrade(&ProcessManager::current_pcb()),
+        });
+        let waiter = Waiter {
+            waker: waker.clone(),
+            _nosend: PhantomData,
+        };
+        (waiter, waker)
+    }
+
+    pub fn wait(&self, interruptible: bool) -> Result<(), SystemError> {
+        block_current(self, interruptible)
+    }
+
+    pub fn waker(&self) -> Arc<Waker> {
+        self.waker.clone()
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        self.waker.close();
+    }
+}
+
+impl Waker {
+    #[inline]
+    pub fn wake(&self) -> bool {
+        if self.has_woken.swap(true, Ordering::Release) {
+            return false;
+        }
+        if let Some(pcb) = self.target.upgrade() {
+            let _ = ProcessManager::wakeup(&pcb);
+        }
+        true
+    }
+
+    #[inline]
+    pub fn close(&self) {
+        let _ = self.has_woken.swap(true, Ordering::Acquire);
+    }
+
+    #[inline]
+    fn consume_wake(&self) -> bool {
+        self.has_woken.swap(false, Ordering::Acquire)
     }
 }
 
@@ -354,10 +358,39 @@ fn before_sleep_check(max_preempt: usize) {
     }
 }
 
-/// 事件等待队列
+/// 统一封装“标记阻塞 + 调度 + 信号检查”，避免各调用点重复逻辑
+fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
+    loop {
+        // 快路径：被提前唤醒
+        if waiter.waker.consume_wake() {
+            return Ok(());
+        }
+
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        // 再次检查“先唤后睡”窗口
+        if waiter.waker.consume_wake() {
+            drop(irq_guard);
+            return Ok(());
+        }
+
+        ProcessManager::mark_sleep(interruptible)?;
+        drop(irq_guard);
+
+        schedule(SchedMode::SM_NONE);
+
+        if interruptible
+            && Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
+        {
+            return Err(SystemError::ERESTARTSYS);
+        }
+    }
+}
+
+/// 事件等待队列：按事件掩码唤醒
 #[derive(Debug)]
 pub struct EventWaitQueue {
-    wait_list: SpinLock<Vec<(u64, Arc<ProcessControlBlock>)>>,
+    wait_list: SpinLock<Vec<(u64, Arc<Waker>)>>,
 }
 
 impl Default for EventWaitQueue {
@@ -374,93 +407,54 @@ impl EventWaitQueue {
         }
     }
 
-    /// ## 让当前进程在该队列上等待感兴趣的事件
-    ///
-    /// ### 参数
-    /// - events: 进程感兴趣的事件，events最好是为位表示，一位表示一个事件
-    ///
-    /// 注意，使用前应该注意有可能其他地方定义了冲突的事件，可能会导致未定义行为
     pub fn sleep(&self, events: u64) {
         before_sleep_check(0);
-        let mut guard = self.wait_list.lock_irqsave();
-        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        guard.push((events, ProcessManager::current_pcb()));
-        drop(guard);
-        schedule(SchedMode::SM_NONE);
-    }
-
-    pub unsafe fn sleep_without_schedule(&self, events: u64) {
-        before_sleep_check(1);
-        let mut guard = self.wait_list.lock_irqsave();
-        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        guard.push((events, ProcessManager::current_pcb()));
-        drop(guard);
+        let (waiter, waker) = Waiter::new_pair();
+        {
+            let mut guard = self.wait_list.lock_irqsave();
+            guard.push((events, waker));
+        }
+        let _ = waiter.wait(true);
     }
 
     pub fn sleep_unlock_spinlock<T>(&self, events: u64, to_unlock: SpinLockGuard<T>) {
         before_sleep_check(1);
-        let mut guard = self.wait_list.lock_irqsave();
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
-            panic!("sleep error: {:?}", e);
-        });
-        drop(irq_guard);
-        guard.push((events, ProcessManager::current_pcb()));
+        let (waiter, waker) = Waiter::new_pair();
+        {
+            let mut guard = self.wait_list.lock_irqsave();
+            guard.push((events, waker));
+        }
         drop(to_unlock);
-        drop(guard);
-        schedule(SchedMode::SM_NONE);
+        let _ = waiter.wait(true);
     }
 
-    /// ### 唤醒该队列上等待events的进程
-    ///
-    ///  ### 参数
-    /// - events: 发生的事件
-    ///
-    /// 需要注意的是，只要触发了events中的任意一件事件，进程都会被唤醒
     pub fn wakeup_any(&self, events: u64) -> usize {
         let mut ret = 0;
-
-        let mut wq_guard = self.wait_list.lock_irqsave();
-        wq_guard.retain(|(es, pcb)| {
+        let mut guard = self.wait_list.lock_irqsave();
+        guard.retain(|(es, waker)| {
             if *es & events > 0 {
-                // 有感兴趣的事件
-                if ProcessManager::wakeup(pcb).is_ok() {
+                if waker.wake() {
                     ret += 1;
-                    return false;
-                } else {
-                    return true;
                 }
+                false
             } else {
-                return true;
+                true
             }
         });
         ret
     }
 
-    /// ### 唤醒该队列上等待events的进程
-    ///
-    ///  ### 参数
-    /// - events: 发生的事件
-    ///
-    /// 需要注意的是，只有满足所有事件的进程才会被唤醒
     pub fn wakeup(&self, events: u64) -> usize {
         let mut ret = 0;
-        let mut wq_guard = self.wait_list.lock_irqsave();
-        wq_guard.retain(|(es, pcb)| {
+        let mut guard = self.wait_list.lock_irqsave();
+        guard.retain(|(es, waker)| {
             if *es == events {
-                // 有感兴趣的事件
-                if ProcessManager::wakeup(pcb).is_ok() {
+                if waker.wake() {
                     ret += 1;
-                    return false;
-                } else {
-                    return true;
                 }
+                false
             } else {
-                return true;
+                true
             }
         });
         ret
@@ -468,5 +462,32 @@ impl EventWaitQueue {
 
     pub fn wakeup_all(&self) {
         self.wakeup_any(u64::MAX);
+    }
+}
+
+/// 通用的超时唤醒辅助结构
+///
+/// 用于定时器超时时唤醒等待队列中的 Waiter。
+/// 相比直接唤醒 PCB，通过 Waker 唤醒可以：
+/// 1. 与 Waiter::wait() 正确配合，避免竞态条件
+/// 2. 使用原子标志 has_woken 标记唤醒状态
+/// 3. 保持与等待队列机制的一致性
+#[derive(Debug)]
+pub struct TimeoutWaker {
+    waker: Arc<Waker>,
+}
+
+impl TimeoutWaker {
+    pub fn new(waker: Arc<Waker>) -> Box<Self> {
+        Box::new(Self { waker })
+    }
+}
+
+impl crate::time::timer::TimerFunction for TimeoutWaker {
+    fn run(&mut self) -> Result<(), SystemError> {
+        // 通过 Waker::wake() 唤醒，这样 Waiter::wait() 可以观察到
+        // 注意：定时器唤醒必须通过 Waker::wake()，仅唤醒 PCB 是不够的
+        self.waker.wake();
+        Ok(())
     }
 }

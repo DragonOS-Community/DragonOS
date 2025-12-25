@@ -7,6 +7,7 @@ use super::{allocator::page_frame::PageFrameCount, MsFlags, VmFlags};
 
 mod mempolice_utils;
 mod sys_brk;
+mod sys_fadvise64;
 mod sys_get_mempolicy;
 mod sys_madvise;
 mod sys_mincore;
@@ -15,6 +16,7 @@ mod sys_mprotect;
 mod sys_mremap;
 mod sys_msync;
 mod sys_munmap;
+mod sys_process_vm;
 pub mod sys_sbrk;
 
 bitflags! {

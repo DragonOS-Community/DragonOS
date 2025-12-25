@@ -3,8 +3,8 @@ use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
 use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch},
     exception::InterruptArch,
-    ipc::kill::kill_process_by_pcb,
-    process::ProcessControlBlock,
+    ipc::kill::send_signal_to_pcb,
+    process::{ProcessControlBlock, ProcessState},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     time::jiffies::TICK_NESC,
 };
@@ -88,21 +88,40 @@ impl CpuTimeFunc {
             return;
         }
 
-        if user_tick {
-            pcb.account_utime(cputime);
-        } else {
-            pcb.account_stime(cputime);
-        }
-        pcb.add_sum_exec_runtime(cputime);
+        let accounted_cputime = cputime - other;
 
-        let cputime_ns = TICK_NESC as u64 * ticks;
-        let accounted_cputime = cputime_ns - other;
+        if user_tick {
+            pcb.account_utime(accounted_cputime);
+        } else {
+            pcb.account_stime(accounted_cputime);
+        }
+        pcb.add_sum_exec_runtime(accounted_cputime);
+
+        // 唤醒可能在等待 CPU-time 时钟的线程（clock_nanosleep: PROCESS/THREAD_CPUTIME）。
+        // 线程 CPU-time：仅在该线程运行时推进，因此唤醒该 PCB 的等待队列即可。
+        if !pcb.cputime_wait_queue().is_empty() {
+            pcb.cputime_wait_queue()
+                .wakeup_all(Some(ProcessState::Blocked(true)));
+        }
+
+        // 进程 CPU-time：需要在任一线程推进时唤醒线程组组长上的等待队列。
+        // 这样“主线程 sleep + 子线程 busy loop”的场景才能正确返回。
+        if !pcb.is_thread_group_leader() {
+            if let Some(leader) = pcb.threads_read_irqsave().group_leader() {
+                if !leader.cputime_wait_queue().is_empty() {
+                    leader
+                        .cputime_wait_queue()
+                        .wakeup_all(Some(ProcessState::Blocked(true)));
+                }
+            }
+        }
+
         // 检查并处理CPU时间定时器
         let mut itimers = pcb.itimers_irqsave();
         // 处理 ITIMER_VIRTUAL (仅在用户态tick时消耗时间)
         if user_tick && itimers.virt.is_active {
             if itimers.virt.value <= accounted_cputime {
-                kill_process_by_pcb(pcb.clone(), Signal::SIGVTALRM).ok();
+                send_signal_to_pcb(pcb.clone(), Signal::SIGVTALRM).ok();
                 if itimers.virt.interval > 0 {
                     // 周期性定时器：在旧的剩余时间上增加间隔时间
                     itimers.virt.value += itimers.virt.interval;
@@ -119,7 +138,7 @@ impl CpuTimeFunc {
         // 处理 ITIMER_PROF (在用户态和内核态tick时都消耗时间)
         if itimers.prof.is_active {
             if itimers.prof.value <= accounted_cputime {
-                kill_process_by_pcb(pcb.clone(), Signal::SIGPROF).ok();
+                send_signal_to_pcb(pcb.clone(), Signal::SIGPROF).ok();
                 if itimers.prof.interval > 0 {
                     itimers.prof.value += itimers.prof.interval;
                 } else {

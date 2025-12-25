@@ -3,30 +3,50 @@ use system_error::SystemError;
 
 use super::{
     fcntl::AtFlags,
-    file::{File, FileMode},
-    syscall::{ModeType, OpenHow, OpenHowResolve},
+    file::{File, FileFlags},
+    permission::PermissionMask,
+    syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, user_path_at},
-    vcore::resolve_parent_inode,
-    FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
-};
-use crate::{
-    driver::base::block::SeekFrom, process::ProcessManager,
-    syscall::user_access::check_and_clone_cstr,
+    vcore::{check_parent_dir_permission, resolve_parent_inode},
+    FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
+    process::cred::CAPFlags,
     process::cred::GroupInfo,
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
+use crate::{process::ProcessManager, syscall::user_access::vfs_check_and_clone_cstr};
 use alloc::string::String;
+
+/// 计算创建文件/目录时使用的最终 mode（应用 umask，并丢弃非法位）。
+///
+/// Linux 语义要点：
+/// - umask 仅作用于 0o777（FsStruct 内保证 umask 只包含 S_IRWXUGO）
+/// - open/creat 的 `mode` 参数可包含 0o7777（含 suid/sgid/sticky），文件类型位无效
+#[inline]
+fn apply_umask_for_create(requested: InodeMode, umask: InodeMode) -> InodeMode {
+    // 仅保留“权限/特殊位”，不允许用户通过 open() 设定文件类型位。
+    let req = InodeMode::from_bits_truncate(requested.bits() & InodeMode::S_IALLUGO.bits());
+    // FsStruct::umask() 已保证只含 S_IRWXUGO，因此 !umask 不会影响 suid/sgid/sticky。
+    req & !umask
+}
+
+/// chmod/fchmod 的核心：保留文件类型位，仅替换权限/特殊位。
+#[inline]
+fn chmod_preserve_type(old: InodeMode, new_mode: InodeMode) -> InodeMode {
+    let old_type = old.bits() & InodeMode::S_IFMT.bits();
+    let new_perm = new_mode.bits() & InodeMode::S_IALLUGO.bits();
+    InodeMode::from_bits_truncate(old_type | new_perm)
+}
 
 pub(super) fn do_faccessat(
     dirfd: i32,
     path: *const u8,
-    mode: ModeType,
+    mode: InodeMode,
     flags: u32,
 ) -> Result<usize, SystemError> {
-    if (mode.bits() & (!ModeType::S_IRWXO.bits())) != 0 {
+    if (mode.bits() & (!InodeMode::S_IRWXO.bits())) != 0 {
         return Err(SystemError::EINVAL);
     }
 
@@ -40,7 +60,7 @@ pub(super) fn do_faccessat(
 
     // let follow_symlink = flags & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0;
 
-    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
     // log::debug!("do_faccessat path: {:?}", path);
 
@@ -53,24 +73,30 @@ pub(super) fn do_faccessat(
     return Ok(0);
 }
 
-pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: ModeType) -> Result<usize, SystemError> {
-    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize, SystemError> {
+    let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
     let target_inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-    let mut metadata = target_inode.metadata()?;
+    do_fchmod(target_inode, mode)
+}
 
-    // 只修改权限位，保留文件类型位
-    let old_file_type_bits = metadata.mode.bits() & ModeType::S_IFMT.bits();
-    let new_permission_bits = mode.bits() & !ModeType::S_IFMT.bits();
-    metadata.mode = ModeType::from_bits_truncate(old_file_type_bits | new_permission_bits);
+/// fchmod：对已解析的 inode 进行 chmod（供 `sys_fchmod` 复用）。
+pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    let mut metadata = inode.metadata()?;
 
-    target_inode.set_metadata(&metadata)?;
+    // Linux 语义：chmod/fchmod 需要是 inode 所有者，或具备 CAP_FOWNER
+    if cred.fsuid.data() != metadata.uid && !cred.has_capability(CAPFlags::CAP_FOWNER) {
+        return Err(SystemError::EPERM);
+    }
 
-    return Ok(0);
+    metadata.mode = chmod_preserve_type(metadata.mode, mode);
+    inode.set_metadata(&metadata)?;
+    Ok(0)
 }
 
 pub fn do_fchownat(
@@ -136,7 +162,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         }
     }
 
-    meta.mode.remove(ModeType::S_ISUID | ModeType::S_ISGID);
+    meta.mode.remove(InodeMode::S_ISUID | InodeMode::S_ISGID);
     inode.set_metadata(&meta)?;
 
     return Ok(0);
@@ -158,45 +184,67 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
 pub fn do_sys_open(
     dfd: i32,
     path: &str,
-    o_flags: FileMode,
-    mode: ModeType,
-    follow_symlink: bool,
+    o_flags: FileFlags,
+    mode: InodeMode,
 ) -> Result<usize, SystemError> {
     let how = OpenHow::new(o_flags, mode, OpenHowResolve::empty());
-    return do_sys_openat2(dfd, path, how, follow_symlink);
+
+    return do_sys_openat2(dfd, path, how);
 }
 
-fn do_sys_openat2(
-    dirfd: i32,
-    path: &str,
-    how: OpenHow,
-    follow_symlink: bool,
-) -> Result<usize, SystemError> {
+fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemError> {
     // log::debug!("openat2: dirfd: {}, path: {}, how: {:?}",dirfd, path, how);
     let path = path.trim();
+    let follow_symlink = !how.o_flags.contains(FileFlags::O_NOFOLLOW);
+    // 检查空字符串路径
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
+    // 检查路径末尾斜杠 - 如果以斜杠结尾，目标必须是目录
+    let path_ends_with_slash = path.ends_with('/');
 
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
     let inode =
         inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_symlink);
-
+    let mut created = false;
     let inode: Arc<dyn IndexNode> = match inode {
         Ok(inode) => inode,
         Err(errno) => {
             // 文件不存在，且需要创建
-            if how.o_flags.contains(FileMode::O_CREAT)
-                && !how.o_flags.contains(FileMode::O_DIRECTORY)
+            if how.o_flags.contains(FileFlags::O_CREAT)
+                && !how.o_flags.contains(FileFlags::O_DIRECTORY)
                 && errno == SystemError::ENOENT
             {
+                // 如果路径以斜杠结尾，不能创建普通文件
+                if path_ends_with_slash {
+                    return Err(SystemError::EISDIR);
+                }
+
                 let (filename, parent_path) = rsplit_path(&path);
+                // 检查文件名长度
+                if filename.len() > crate::filesystem::vfs::NAME_MAX {
+                    return Err(SystemError::ENAMETOOLONG);
+                }
                 // 查找父目录
                 let parent_inode: Arc<dyn IndexNode> =
                     resolve_parent_inode(inode_begin, parent_path)?;
+                let parent_md = parent_inode.metadata()?;
+                // 父节点必须是目录
+                if parent_md.file_type != FileType::Dir {
+                    return Err(SystemError::ENOTDIR);
+                }
+                // Linux 语义：创建文件需要对父目录拥有 W+X（写+搜索）权限
+                check_parent_dir_permission(&parent_md)?;
+
+                // 计算创建 mode：应用 umask，遵循 open/creat 语义
+                let pcb = ProcessManager::current_pcb();
+                let umask = pcb.fs_struct().umask();
+                let create_mode = apply_umask_for_create(how.mode, umask);
                 // 创建文件
-                let inode: Arc<dyn IndexNode> = parent_inode.create(
-                    filename,
-                    FileType::File,
-                    ModeType::from_bits_truncate(0o755),
-                )?;
+                let inode: Arc<dyn IndexNode> =
+                    parent_inode.create(filename, FileType::File, create_mode)?;
+                created = true;
                 inode
             } else {
                 // 不需要创建文件，因此返回错误码
@@ -204,29 +252,74 @@ fn do_sys_openat2(
             }
         }
     };
+    let metadata = inode.metadata()?;
+    let file_type: FileType = metadata.file_type;
+    // 如果路径以斜杠结尾，而目标不是目录，返回 ENOTDIR
+    if path_ends_with_slash && file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    // 已存在的文件且指定了 O_CREAT|O_EXCL
+    if how.o_flags.contains(FileFlags::O_CREAT)
+        && how.o_flags.contains(FileFlags::O_EXCL)
+        && !created
+    {
+        return Err(SystemError::EEXIST);
+    }
+    // 对已存在的目录使用 O_CREAT 视为错误
+    if how.o_flags.contains(FileFlags::O_CREAT) && !created && file_type == FileType::Dir {
+        return Err(SystemError::EISDIR);
+    }
+    // 目录相关检查
+    if file_type == FileType::Dir {
+        // 目录上不支持 O_TRUNC
+        if how.o_flags.contains(FileFlags::O_TRUNC) {
+            return Err(SystemError::EISDIR);
+        }
+        // 目录上不允许写访问
+        let acc_mode = how.o_flags.access_flags();
+        if acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR {
+            return Err(SystemError::EISDIR);
+        }
+        // 目录不支持 O_DIRECT
+        if how.o_flags.contains(FileFlags::O_DIRECT) {
+            return Err(SystemError::EINVAL);
+        }
+    }
+    // 非 O_PATH 需要检查访问权限（read/write/truncate）
+    // Linux 语义：若本次 open() 触发了创建，则不应因“新 inode 的 mode”而拒绝
+    // 当前这次 open() 的访问模式；权限在“后续 reopen()”时生效。
+    if !how.o_flags.contains(FileFlags::O_PATH) && !created {
+        let acc_mode = how.o_flags.access_flags();
+        let mut need = PermissionMask::empty();
+        match acc_mode {
+            FileFlags::O_RDONLY => need.insert(PermissionMask::MAY_READ),
+            FileFlags::O_WRONLY => need.insert(PermissionMask::MAY_WRITE),
+            FileFlags::O_RDWR => need.insert(PermissionMask::MAY_READ | PermissionMask::MAY_WRITE),
+            _ => {}
+        }
+        if how.o_flags.contains(FileFlags::O_TRUNC) {
+            need.insert(PermissionMask::MAY_WRITE);
+        }
+        if !need.is_empty() {
+            let cred = ProcessManager::current_pcb().cred();
+            cred.inode_permission(&metadata, need.bits())?;
+        }
+    }
 
-    let file_type: FileType = inode.metadata()?.file_type;
     // 如果要打开的是文件夹，而目标不是文件夹
-    if how.o_flags.contains(FileMode::O_DIRECTORY) && file_type != FileType::Dir {
+    if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
-    // 创建文件对象
-
+    // 如果O_TRUNC，并且是普通文件，清空文件
+    // 注意：必须在创建 File 对象之前截断
+    // 因为 O_TRUNC 的截断基于文件系统权限，而不是打开模式
+    // 例如：open(file, O_RDONLY | O_TRUNC) 是合法的，只要用户对文件有写权限
+    if how.o_flags.contains(FileFlags::O_TRUNC) && file_type == FileType::File {
+        inode.resize(0)?;
+    }
     let file: File = File::new(inode, how.o_flags)?;
 
-    // 打开模式为“追加”
-    if how.o_flags.contains(FileMode::O_APPEND) {
-        file.lseek(SeekFrom::SeekEnd(0))?;
-    }
-
-    // 如果O_TRUNC，并且，打开模式包含O_RDWR或O_WRONLY，清空文件
-    if how.o_flags.contains(FileMode::O_TRUNC)
-        && (how.o_flags.contains(FileMode::O_RDWR) || how.o_flags.contains(FileMode::O_WRONLY))
-        && file_type == FileType::File
-    {
-        file.ftruncate(0)?;
-    }
     // 把文件对象存入pcb
     let r = ProcessManager::current_pcb()
         .fd_table()
@@ -252,6 +345,15 @@ pub fn do_utimensat(
     const UTIME_NOW: i64 = (1i64 << 30) - 1i64;
     const UTIME_OMIT: i64 = (1i64 << 30) - 2i64;
     // log::debug!("do_utimensat: dirfd:{}, pathname:{:?}, times:{:?}, flags:{:?}", dirfd, pathname, times, flags);
+
+    // Linux semantics: if both timestamps are UTIME_OMIT, the call succeeds
+    // without accessing the file at all (OmitNoop test).
+    if let Some([atime, mtime]) = times {
+        if atime.tv_nsec == UTIME_OMIT && mtime.tv_nsec == UTIME_OMIT {
+            return Ok(0);
+        }
+    }
+
     let inode = match pathname {
         Some(path) => {
             let (inode_begin, path) =
@@ -264,11 +366,27 @@ pub fn do_utimensat(
             inode
         }
         None => {
+            // Linux-specific extension: pathname == NULL means operate on the
+            // file referred to by dirfd (futimens). However, some combinations
+            // are invalid and must return specific errors.
+
+            // When dirfd is AT_FDCWD and pathname is NULL, Linux returns EFAULT.
+            if dirfd == AtFlags::AT_FDCWD.bits() {
+                return Err(SystemError::EFAULT);
+            }
+
             let binding = ProcessManager::current_pcb().fd_table();
             let fd_table_guard = binding.write();
             let file = fd_table_guard
                 .get_file_by_fd(dirfd)
                 .ok_or(SystemError::EBADF)?;
+
+            // If the file descriptor was opened with O_PATH, futimesat must fail
+            // with EBADF instead of operating on it.
+            if file.flags().contains(FileFlags::O_PATH) {
+                return Err(SystemError::EBADF);
+            }
+
             file.inode()
         }
     };

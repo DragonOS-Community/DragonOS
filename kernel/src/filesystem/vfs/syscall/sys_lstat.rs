@@ -1,17 +1,13 @@
-//! System call handler for opening files.
-
 use system_error::SystemError;
-
-use defer::defer;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_LSTAT;
-use crate::filesystem::vfs::file::FileMode;
-use crate::filesystem::vfs::syscall::newfstat::do_newfstat;
-use crate::filesystem::vfs::syscall::sys_close::do_close;
-use crate::filesystem::vfs::ModeType;
+use crate::filesystem::vfs::fcntl::AtFlags;
+use crate::filesystem::vfs::stat::do_newfstatat;
+use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::vec::Vec;
 
 pub struct SysLstatHandle;
@@ -23,22 +19,25 @@ impl Syscall for SysLstatHandle {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let path = Self::path(args);
+        let path_ptr = Self::path(args);
         let usr_kstat = Self::usr_kstat(args);
 
-        let fd = super::open_utils::do_open(
-            path,
-            FileMode::O_RDONLY.bits(),
-            ModeType::empty().bits(),
-            false,
+        if usr_kstat == 0 {
+            return Err(SystemError::EFAULT);
+        }
+
+        let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?;
+        let path_str = path.to_str().map_err(|_| SystemError::EINVAL)?;
+
+        // lstat(2) 等价于 newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW)，
+        // 且 Linux 语义要求：当 path 以 '/' 结尾时必须解析为目录，此时会跟随 symlink。
+        do_newfstatat(
+            AtFlags::AT_FDCWD.bits(),
+            path_str,
+            usr_kstat,
+            AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32,
         )?;
-
-        defer!({
-            do_close(fd as i32).ok();
-        });
-        do_newfstat(fd as i32, usr_kstat)?;
-
-        return Ok(0);
+        Ok(0)
     }
 
     /// Formats the syscall arguments for display/debugging purposes.

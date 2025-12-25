@@ -3,6 +3,7 @@ use smoltcp;
 use system_error::SystemError;
 
 use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::{Socket, PMSG};
@@ -25,9 +26,11 @@ pub struct UdpSocket {
     inner: RwLock<Option<UdpInner>>,
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
+    inode_id: InodeId,
     self_ref: Weak<UdpSocket>,
     netns: Arc<NetNamespace>,
     epoll_items: EPollItems,
+    fasync_items: FAsyncItems,
 }
 
 impl UdpSocket {
@@ -37,9 +40,11 @@ impl UdpSocket {
             inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
+            inode_id: generate_inode_id(),
             self_ref: me.clone(),
             netns,
             epoll_items: EPollItems::default(),
+            fasync_items: FAsyncItems::default(),
         })
     }
 
@@ -123,9 +128,10 @@ impl UdpSocket {
         {
             let mut inner_guard = self.inner.write();
             let inner = match inner_guard.take().expect("Udp Inner is None") {
+                // TODO: 此处会为空，需要DEBUG
                 UdpInner::Bound(bound) => bound,
                 UdpInner::Unbound(unbound) => unbound
-                    .bind_ephemeral(to.ok_or(SystemError::EADDRNOTAVAIL)?.addr, self.netns())?,
+                    .bind_ephemeral(to.ok_or(SystemError::EDESTADDRREQ)?.addr, self.netns())?,
             };
             // size = inner.try_send(buf, to)?;
             inner_guard.replace(UdpInner::Bound(inner));
@@ -210,8 +216,6 @@ impl Socket for UdpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        use crate::sched::SchedMode;
-
         return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer)
         } else {
@@ -233,7 +237,6 @@ impl Socket for UdpSocket {
         flags: PMSG,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        use crate::sched::SchedMode;
         // could block io
         if let Some(endpoint) = address {
             self.connect(endpoint)?;
@@ -261,13 +264,25 @@ impl Socket for UdpSocket {
     }
 
     fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
-        todo!()
+        match self.inner.read().as_ref().unwrap() {
+            UdpInner::Bound(bound) => Ok(Endpoint::Ip(bound.remote_endpoint()?)),
+            // TODO: IPv6 support
+            _ => Err(SystemError::ENOTCONN),
+        }
     }
 
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
+        use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint};
         match self.inner.read().as_ref().unwrap() {
-            UdpInner::Bound(bound) => Ok(Endpoint::Ip(bound.local_endpoint())),
-            _ => Err(SystemError::ENOTCONN),
+            UdpInner::Bound(bound) => {
+                let IpListenEndpoint { addr, port } = bound.endpoint();
+                Ok(Endpoint::Ip(IpEndpoint::new(
+                    addr.unwrap_or(Ipv4([0, 0, 0, 0].into())),
+                    port,
+                )))
+            }
+            // TODO: IPv6 support
+            _ => Ok(Endpoint::Ip(IpEndpoint::new(Ipv4([0, 0, 0, 0].into()), 0))),
         }
     }
 
@@ -291,6 +306,10 @@ impl Socket for UdpSocket {
         &self.epoll_items
     }
 
+    fn fasync_items(&self) -> &FAsyncItems {
+        &self.fasync_items
+    }
+
     fn check_io_event(&self) -> EPollEventType {
         let mut event = EPollEventType::empty();
         match self.inner.read().as_ref().unwrap() {
@@ -311,6 +330,10 @@ impl Socket for UdpSocket {
             }
         }
         return event;
+    }
+
+    fn socket_inode_id(&self) -> InodeId {
+        self.inode_id
     }
 }
 

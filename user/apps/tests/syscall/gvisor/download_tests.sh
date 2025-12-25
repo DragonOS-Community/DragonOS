@@ -7,9 +7,12 @@ set -e
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 TESTS_DIR="$SCRIPT_DIR/tests"
+TEST_VERSION="20251218"
 TEST_ARCHIVE="gvisor-syscalls-tests.tar.xz"
-TEST_URL="https://cnb.cool/DragonOS-Community/test-suites/-/releases/download/release_20250626/$TEST_ARCHIVE"
-MD5SUM_URL="https://cnb.cool/DragonOS-Community/test-suites/-/releases/download/release_20250626/$TEST_ARCHIVE.md5sum"
+BASE_URL="https://cnb.cool/DragonOS-Community/test-suites/-/releases/download"
+TEST_URL="$BASE_URL/release_${TEST_VERSION}/$TEST_ARCHIVE"
+MD5SUM_URL="$BASE_URL/release_${TEST_VERSION}/$TEST_ARCHIVE.md5sum"
+VERSION_FILE="$TESTS_DIR/.version"
 
 # 颜色定义
 GREEN='\033[0;32m'
@@ -47,12 +50,35 @@ check_dependencies() {
 
 # 检查测试套件是否已存在且完整
 check_existing_tests() {
-    if [ -d "$TESTS_DIR" ] && [ "$(find "$TESTS_DIR" -name "*_test" | wc -l)" -gt 0 ]; then
-        print_info "发现已存在的测试套件"
-        return 0
-    else
-        return 1
+    if [ -d "$TESTS_DIR" ]; then
+        local current_version=""
+
+        if [ -f "$VERSION_FILE" ]; then
+            current_version=$(cat "$VERSION_FILE" 2>/dev/null || echo "")
+        fi
+
+        # 没有版本信息，说明是旧脚本下载的测例，视为旧版本，触发升级
+        if [ -z "$current_version" ]; then
+            print_warn "检测到未记录版本的测试套件，将升级到版本 $TEST_VERSION"
+            rm -rf "$TESTS_DIR"
+            return 1
+        fi
+
+        # 版本不一致，也需要升级
+        if [ "$current_version" != "$TEST_VERSION" ]; then
+            print_warn "检测到旧版本测试套件 (当前: $current_version)，将升级到版本 $TEST_VERSION"
+            rm -rf "$TESTS_DIR"
+            return 1
+        fi
+
+        # 版本一致，并且目录下有 *_test 文件，认为是有效的现有套件
+        if [ "$(find "$TESTS_DIR" -name "*_test" | wc -l)" -gt 0 ]; then
+            print_info "发现已存在的测试套件，版本: $current_version"
+            return 0
+        fi
     fi
+
+    return 1
 }
 
 # 下载文件
@@ -135,7 +161,14 @@ extract_tests() {
     
     if tar -xf "$archive" -C "$TESTS_DIR" --strip-components=1; then
         print_info "解压完成"
-        return 0
+        # 记录当前安装的测试版本，方便将来自动升级
+        if echo "$TEST_VERSION" > "$VERSION_FILE"; then
+            print_info "记录测试套件版本: $TEST_VERSION"
+            return 0
+        else
+            print_error "写入版本文件失败: $VERSION_FILE"
+            return 1
+        fi
     else
         print_error "解压失败"
         return 1

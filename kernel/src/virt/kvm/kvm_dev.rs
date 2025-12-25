@@ -3,8 +3,8 @@ use crate::filesystem;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::generate_inode_id,
-    file::{File, FileMode},
-    FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
+    file::{File, FileFlags, FileMode},
+    FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, Metadata,
 };
 use crate::libs::spinlock::SpinLockGuard;
 use crate::process::ProcessManager;
@@ -64,11 +64,12 @@ impl LockedKvmInode {
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
-                mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
+                mode: filesystem::vfs::syscall::InodeMode::S_IALLUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                flags: InodeFlags::empty(),
             },
         };
 
@@ -187,7 +188,7 @@ pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
 
     // 创建vm文件，返回文件描述符
     let vm_inode = LockedVmInode::new();
-    let file: File = File::new(vm_inode, FileMode::O_RDWR)?;
+    let file: File = File::new(vm_inode, FileFlags::O_RDWR)?;
     let r = ProcessManager::current_pcb()
         .fd_table()
         .write()

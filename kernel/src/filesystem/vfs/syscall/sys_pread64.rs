@@ -35,7 +35,15 @@ impl Syscall for SysPread64Handle {
         let len = Self::len(args);
         let offset = Self::offset(args);
 
-        let mut user_buffer_writer = UserBufferWriter::new(buf_vaddr, len, frame.is_from_user())?;
+        // 检查offset + len是否溢出 同时检查offset是否为负数
+
+        let end_pos = offset.checked_add(len).ok_or(SystemError::EINVAL)?;
+        if offset > i64::MAX as usize || end_pos > i64::MAX as usize {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut user_buffer_writer =
+            UserBufferWriter::new_checked(buf_vaddr, len, frame.is_from_user())?;
         let user_buf = user_buffer_writer.buffer(0)?;
 
         let binding = ProcessManager::current_pcb().fd_table();

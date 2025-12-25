@@ -1,6 +1,6 @@
-use crate::{syscall::user_access::check_and_clone_cstr, time::PosixTimeSpec};
+use crate::time::PosixTimeSpec;
 
-use super::{fcntl::AtFlags, file::FileMode, SuperBlock};
+use super::{fcntl::AtFlags, file::FileFlags, InodeMode, SuperBlock};
 mod dup2;
 mod faccessat2;
 mod link_utils;
@@ -9,6 +9,7 @@ mod open_utils;
 mod readlink_at;
 mod rename_utils;
 mod sys_chdir;
+mod sys_chroot;
 mod sys_close;
 mod sys_dup;
 mod sys_dup3;
@@ -31,9 +32,12 @@ mod sys_mkdirat;
 pub mod sys_mknodat;
 mod sys_openat;
 mod sys_pread64;
+mod sys_preadv;
+mod sys_preadv2;
 mod sys_pselect6;
 mod sys_pwrite64;
 mod sys_pwritev;
+mod sys_pwritev2;
 mod sys_read;
 mod sys_readlinkat;
 mod sys_readv;
@@ -55,6 +59,7 @@ mod sys_epoll_ctl;
 mod sys_epoll_pwait;
 
 pub mod symlink_utils;
+mod sys_copy_file_range;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 mod sys_fstat;
 mod sys_fsync;
@@ -76,6 +81,8 @@ mod sys_epoll_create;
 #[cfg(target_arch = "x86_64")]
 mod sys_epoll_wait;
 
+#[cfg(target_arch = "x86_64")]
+mod sys_creat;
 #[cfg(target_arch = "x86_64")]
 mod sys_futimesat;
 #[cfg(target_arch = "x86_64")]
@@ -127,55 +134,6 @@ pub const XATTR_CREATE: i32 = 0x1; // 设置值，如果属性不存在则创建
 pub const XATTR_REPLACE: i32 = 0x2; // 设置值，如果属性已存在则替换，不存在返回则失败
 
 bitflags! {
-    /// 文件类型和权限
-    #[repr(C)]
-    pub struct ModeType: u32 {
-        /// 掩码
-        const S_IFMT = 0o0_170_000;
-        /// 文件类型
-        const S_IFSOCK = 0o140000;
-        const S_IFLNK = 0o120000;
-        const S_IFREG = 0o100000;
-        const S_IFBLK = 0o060000;
-        const S_IFDIR = 0o040000;
-        const S_IFCHR = 0o020000;
-        const S_IFIFO = 0o010000;
-
-        const S_ISUID = 0o004000;
-        const S_ISGID = 0o002000;
-        const S_ISVTX = 0o001000;
-        /// 文件用户权限
-        const S_IRWXU = 0o0700;
-        const S_IRUSR = 0o0400;
-        const S_IWUSR = 0o0200;
-        const S_IXUSR = 0o0100;
-        /// 文件组权限
-        const S_IRWXG = 0o0070;
-        const S_IRGRP = 0o0040;
-        const S_IWGRP = 0o0020;
-        const S_IXGRP = 0o0010;
-        /// 文件其他用户权限
-        const S_IRWXO = 0o0007;
-        const S_IROTH = 0o0004;
-        const S_IWOTH = 0o0002;
-        const S_IXOTH = 0o0001;
-
-        /// 0o777
-        const S_IRWXUGO = Self::S_IRWXU.bits | Self::S_IRWXG.bits | Self::S_IRWXO.bits;
-        /// 0o7777
-        const S_IALLUGO = Self::S_ISUID.bits | Self::S_ISGID.bits | Self::S_ISVTX.bits| Self::S_IRWXUGO.bits;
-        /// 0o444
-        const S_IRUGO = Self::S_IRUSR.bits | Self::S_IRGRP.bits | Self::S_IROTH.bits;
-        /// 0o222
-        const S_IWUGO = Self::S_IWUSR.bits | Self::S_IWGRP.bits | Self::S_IWOTH.bits;
-        /// 0o111
-        const S_IXUGO = Self::S_IXUSR.bits | Self::S_IXGRP.bits | Self::S_IXOTH.bits;
-
-
-    }
-}
-
-bitflags! {
     /// Flags used in the `renameat2` system call.
     ///
     /// Reference: <https://elixir.bootlin.com/linux/v6.16.3/source/include/uapi/linux/fcntl.h#L140-L143>.
@@ -206,7 +164,7 @@ pub struct PosixStatx {
     /// 所有者组ID
     pub stx_gid: u32,
     /// 文件权限
-    pub stx_mode: ModeType,
+    pub stx_mode: InodeMode,
 
     /* 0x20 */
     /// inode号
@@ -254,7 +212,7 @@ impl PosixStatx {
             stx_nlink: 0,
             stx_uid: 0,
             stx_gid: 0,
-            stx_mode: ModeType { bits: 0 },
+            stx_mode: InodeMode { bits: 0 },
             stx_inode: 0,
             stx_size: 0,
             stx_blocks: 0,
@@ -448,19 +406,19 @@ impl PosixOpenHow {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct OpenHow {
-    pub o_flags: FileMode,
-    pub mode: ModeType,
+    pub o_flags: FileFlags,
+    pub mode: InodeMode,
     pub resolve: OpenHowResolve,
 }
 
 impl OpenHow {
-    pub fn new(mut o_flags: FileMode, mut mode: ModeType, resolve: OpenHowResolve) -> Self {
-        if !o_flags.contains(FileMode::O_CREAT) {
-            mode = ModeType::empty();
+    pub fn new(mut o_flags: FileFlags, mut mode: InodeMode, resolve: OpenHowResolve) -> Self {
+        if !o_flags.contains(FileFlags::O_CREAT) {
+            mode = InodeMode::empty();
         }
 
-        if o_flags.contains(FileMode::O_PATH) {
-            o_flags = o_flags.intersection(FileMode::O_PATH_FLAGS);
+        if o_flags.contains(FileFlags::O_PATH) {
+            o_flags = o_flags.intersection(FileFlags::O_PATH_FLAGS);
         }
 
         Self {
@@ -473,8 +431,8 @@ impl OpenHow {
 
 impl From<PosixOpenHow> for OpenHow {
     fn from(posix_open_how: PosixOpenHow) -> Self {
-        let o_flags = FileMode::from_bits_truncate(posix_open_how.flags as u32);
-        let mode = ModeType::from_bits_truncate(posix_open_how.mode as u32);
+        let o_flags = FileFlags::from_bits_truncate(posix_open_how.flags as u32);
+        let mode = InodeMode::from_bits_truncate(posix_open_how.mode as u32);
         let resolve = OpenHowResolve::from_bits_truncate(posix_open_how.resolve);
         return Self::new(o_flags, mode, resolve);
     }

@@ -22,28 +22,15 @@ use system_error::SystemError;
 #[derive(Debug)]
 pub struct ProcFile<F: FileOps> {
     inner: F,
-    self_ref: Weak<ProcFile<F>>,
-    parent: Option<Weak<dyn IndexNode>>,
     common: Common,
 }
 
 impl<F: FileOps> ProcFile<F> {
-    /// 创建一个新的 ProcFile
-    pub(super) fn new(
-        file: F,
-        fs: Weak<dyn FileSystem>,
-        parent: Option<Weak<dyn IndexNode>>,
-        is_volatile: bool,
-        mode: ModeType,
-    ) -> Arc<Self> {
-        Self::new_with_data(file, fs, parent, is_volatile, mode, 0)
-    }
-
     /// 创建一个新的 ProcFile（带额外数据）
     pub(super) fn new_with_data(
         file: F,
         fs: Weak<dyn FileSystem>,
-        parent: Option<Weak<dyn IndexNode>>,
+        _parent: Option<Weak<dyn IndexNode>>,
         is_volatile: bool,
         mode: ModeType,
         data: usize,
@@ -69,24 +56,10 @@ impl<F: FileOps> ProcFile<F> {
             Common::new(metadata, fs, is_volatile)
         };
 
-        Arc::new_cyclic(|weak_self| Self {
+        Arc::new(Self {
             inner: file,
-            self_ref: weak_self.clone(),
-            parent,
             common,
         })
-    }
-
-    pub fn self_ref(&self) -> Option<Arc<ProcFile<F>>> {
-        self.self_ref.upgrade()
-    }
-
-    pub fn self_ref_weak(&self) -> &Weak<ProcFile<F>> {
-        &self.self_ref
-    }
-
-    pub fn parent(&self) -> Option<Arc<dyn IndexNode>> {
-        self.parent.as_ref().and_then(|p| p.upgrade())
     }
 }
 

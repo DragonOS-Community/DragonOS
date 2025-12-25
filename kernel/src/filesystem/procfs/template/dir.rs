@@ -7,10 +7,7 @@ use crate::{
             FilePrivateData, FileSystem, FileType, IndexNode, InodeId, Metadata,
         },
     },
-    libs::{
-        rwlock::{RwLock, RwLockReadGuard},
-        spinlock::SpinLockGuard,
-    },
+    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
     time::PosixTimeSpec,
 };
 use alloc::collections::BTreeMap;
@@ -34,16 +31,6 @@ pub struct ProcDir<Ops: DirOps> {
 }
 
 impl<Ops: DirOps> ProcDir<Ops> {
-    pub(super) fn new(
-        dir: Ops,
-        fs: Weak<dyn FileSystem>,
-        parent: Option<Weak<dyn IndexNode>>,
-        is_volatile: bool,
-        mode: ModeType,
-    ) -> Arc<Self> {
-        Self::new_with_data(dir, fs, parent, is_volatile, mode, 0)
-    }
-
     pub(super) fn new_with_data(
         dir: Ops,
         fs: Weak<dyn FileSystem>,
@@ -133,9 +120,10 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         keys.push(String::from("."));
         keys.push(String::from(".."));
 
-        // 填充所有子节点并立即复制键，然后释放锁
+        // 先填充子节点，然后获取读锁读取keys
+        self.inner.populate_children(self);
         {
-            let cached_children = self.inner.populate_children(self);
+            let cached_children = self.cached_children.read();
             keys.extend(cached_children.keys().cloned());
         }
 
@@ -243,10 +231,9 @@ pub trait DirOps: Sync + Send + Sized + Debug {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError>;
 
-    fn populate_children<'a>(
-        &self,
-        dir: &'a ProcDir<Self>,
-    ) -> RwLockReadGuard<'a, BTreeMap<String, Arc<dyn IndexNode>>>;
+    /// 填充子节点到缓存中
+    /// 该方法内部获取写锁进行填充，完成后释放写锁
+    fn populate_children(&self, dir: &ProcDir<Self>);
 
     #[must_use]
     fn validate_child(&self, _child: &dyn IndexNode) -> bool {

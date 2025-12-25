@@ -5,7 +5,7 @@
 use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::{libs::once::Once, process::ProcessManager, process::RawPid};
+use crate::{libs::once::Once, process::ProcessManager};
 
 use super::vfs::mount::{MountFlags, MountPath};
 use super::vfs::syscall::ModeType;
@@ -35,29 +35,6 @@ pub(super) const PROCFS_BLOCK_SIZE: u64 = 512;
 
 /// 供 template 使用的 Builder trait
 pub(super) use template::Builder;
-
-/// procfs 文件类型
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) enum ProcFileType {
-    /// 默认类型
-    #[default]
-    Default,
-    /// 进程状态文件
-    ProcStatus,
-    /// 进程内存映射文件
-    ProcMaps,
-}
-
-/// procfs inode 信息
-#[derive(Debug, Default)]
-pub struct InodeInfo {
-    /// 进程的 pid
-    pub pid: Option<RawPid>,
-    /// 文件类型
-    pub ftype: ProcFileType,
-    /// 文件描述符
-    pub fd: i32,
-}
 
 /// procfs 文件私有数据
 #[derive(Debug, Clone)]

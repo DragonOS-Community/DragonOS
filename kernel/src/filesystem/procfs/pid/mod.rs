@@ -9,14 +9,9 @@ use crate::{
         },
         vfs::{syscall::ModeType, IndexNode},
     },
-    libs::rwlock::RwLockReadGuard,
     process::{ProcessControlBlock, ProcessManager, RawPid},
 };
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-};
+use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 mod exe;
@@ -78,12 +73,8 @@ impl PidDirOps {
                         Err(SystemError::ENOENT)
                     }
 
-                    fn populate_children<'a>(
-                        &self,
-                        dir: &'a ProcDir<Self>,
-                    ) -> RwLockReadGuard<'a, BTreeMap<String, Arc<dyn IndexNode>>>
-                    {
-                        dir.cached_children().write().downgrade()
+                    fn populate_children(&self, _dir: &ProcDir<Self>) {
+                        // 空目录，无需填充
                     }
                 }
 
@@ -116,17 +107,13 @@ impl DirOps for PidDirOps {
         Err(SystemError::ENOENT)
     }
 
-    fn populate_children<'a>(
-        &self,
-        dir: &'a ProcDir<Self>,
-    ) -> RwLockReadGuard<'a, BTreeMap<String, Arc<dyn IndexNode>>> {
+    fn populate_children(&self, dir: &ProcDir<Self>) {
         let mut cached_children = dir.cached_children().write();
 
         // 填充静态条目（包括 fd）
         populate_children_from_table(&mut cached_children, Self::STATIC_ENTRIES, |f| {
             (f)(self, dir.self_ref_weak().clone())
         });
-
-        cached_children.downgrade()
+        // 写锁在这里自动释放
     }
 }

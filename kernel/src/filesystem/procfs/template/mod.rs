@@ -13,10 +13,7 @@
 //! - Builder 模式：用于灵活构造 inode
 
 use crate::{
-    filesystem::{
-        procfs::InodeInfo,
-        vfs::{utils::DName, FileSystem, Metadata},
-    },
+    filesystem::vfs::{utils::DName, FileSystem, Metadata},
     libs::rwlock::RwLock,
 };
 
@@ -41,24 +38,19 @@ pub use self::{
 /// 包含：
 /// - 元数据（inode 号、权限、所有者、时间戳等）
 /// - 文件系统引用
-/// - volatile 标志
 #[derive(Debug)]
 pub(super) struct Common {
     fs: Weak<dyn FileSystem>,
     metadata: RwLock<Metadata>,
-    is_volatile: bool,
-    fdata: RwLock<InodeInfo>,
-    dname: DName,
+    pub(super) dname: DName,
 }
 
 impl Common {
     /// 创建一个新的 Common 实例
-    pub fn new(metadata: Metadata, fs: Weak<dyn FileSystem>, is_volatile: bool) -> Self {
+    pub fn new(metadata: Metadata, fs: Weak<dyn FileSystem>, _is_volatile: bool) -> Self {
         Self {
             metadata: RwLock::new(metadata),
             fs,
-            is_volatile,
-            fdata: RwLock::new(InodeInfo::default()),
             dname: DName::default(),
         }
     }
@@ -91,12 +83,5 @@ impl Common {
         meta.gid = metadata.gid;
 
         Ok(())
-    }
-
-    /// 检查是否为 volatile
-    ///
-    /// Volatile inode 不会被 VFS 的 dentry cache 缓存
-    pub fn is_volatile(&self) -> bool {
-        self.is_volatile
     }
 }

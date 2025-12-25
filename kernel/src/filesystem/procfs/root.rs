@@ -21,12 +21,10 @@ use crate::{
         },
         vfs::{syscall::ModeType, IndexNode},
     },
-    libs::rwlock::RwLockReadGuard,
     process::{ProcessManager, RawPid},
 };
 use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
+    string::ToString,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -104,10 +102,7 @@ impl DirOps for RootDirOps {
         Err(SystemError::ENOENT)
     }
 
-    fn populate_children<'a>(
-        &self,
-        dir: &'a ProcDir<Self>,
-    ) -> RwLockReadGuard<'a, BTreeMap<String, Arc<dyn IndexNode>>> {
+    fn populate_children(&self, dir: &ProcDir<Self>) {
         // 先收集进程 PID，然后立即释放进程表锁
         let pid_list = {
             let all_processes = crate::process::all_process().lock_irqsave();
@@ -133,8 +128,7 @@ impl DirOps for RootDirOps {
         populate_children_from_table(&mut cached_children, Self::STATIC_ENTRIES, |f| {
             (f)(dir.self_ref_weak().clone())
         });
-
-        cached_children.downgrade()
+        // 写锁在这里自动释放
     }
 }
 

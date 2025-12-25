@@ -22,28 +22,15 @@ use system_error::SystemError;
 #[derive(Debug)]
 pub struct ProcSym<S: SymOps> {
     inner: S,
-    self_ref: Weak<ProcSym<S>>,
-    parent: Option<Weak<dyn IndexNode>>,
     common: Common,
 }
 
 impl<S: SymOps> ProcSym<S> {
-    /// 创建一个新的 ProcSym
-    pub(super) fn new(
-        sym: S,
-        fs: Weak<dyn FileSystem>,
-        parent: Option<Weak<dyn IndexNode>>,
-        is_volatile: bool,
-        mode: ModeType,
-    ) -> Arc<Self> {
-        Self::new_with_data(sym, fs, parent, is_volatile, mode, 0)
-    }
-
     /// 创建一个新的 ProcSym（带额外数据）
     pub(super) fn new_with_data(
         sym: S,
         fs: Weak<dyn FileSystem>,
-        parent: Option<Weak<dyn IndexNode>>,
+        _parent: Option<Weak<dyn IndexNode>>,
         is_volatile: bool,
         mode: ModeType,
         data: usize,
@@ -69,24 +56,7 @@ impl<S: SymOps> ProcSym<S> {
             Common::new(metadata, fs, is_volatile)
         };
 
-        Arc::new_cyclic(|weak_self| Self {
-            inner: sym,
-            self_ref: weak_self.clone(),
-            parent,
-            common,
-        })
-    }
-
-    pub fn self_ref(&self) -> Option<Arc<ProcSym<S>>> {
-        self.self_ref.upgrade()
-    }
-
-    pub fn self_ref_weak(&self) -> &Weak<ProcSym<S>> {
-        &self.self_ref
-    }
-
-    pub fn parent(&self) -> Option<Arc<dyn IndexNode>> {
-        self.parent.as_ref().and_then(|p| p.upgrade())
+        Arc::new(Self { inner: sym, common })
     }
 }
 

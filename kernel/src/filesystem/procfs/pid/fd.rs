@@ -7,13 +7,11 @@ use crate::{
         procfs::template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
         vfs::{syscall::ModeType, IndexNode},
     },
-    libs::rwlock::RwLockReadGuard,
     process::{ProcessControlBlock, ProcessManager, RawPid},
 };
 use alloc::{
-    collections::BTreeMap,
     format,
-    string::{String, ToString},
+    string::ToString,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -81,10 +79,7 @@ impl DirOps for FdDirOps {
         Ok(inode)
     }
 
-    fn populate_children<'a>(
-        &self,
-        dir: &'a ProcDir<Self>,
-    ) -> RwLockReadGuard<'a, BTreeMap<String, Arc<dyn IndexNode>>> {
+    fn populate_children(&self, dir: &ProcDir<Self>) {
         let mut cached_children = dir.cached_children().write();
 
         // 清空现有缓存
@@ -109,8 +104,7 @@ impl DirOps for FdDirOps {
                 });
             }
         }
-
-        cached_children.downgrade()
+        // 写锁在这里自动释放
     }
 }
 

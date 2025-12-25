@@ -11,7 +11,6 @@ struct BuilderCommon {
     fs: Option<Weak<dyn FileSystem>>,
     is_volatile: bool,
     data: usize,
-    ino: Option<u64>,
 }
 
 impl BuilderCommon {
@@ -22,7 +21,6 @@ impl BuilderCommon {
             fs: None,
             is_volatile: false,
             data: 0,
-            ino: None,
         }
     }
 
@@ -36,14 +34,6 @@ impl BuilderCommon {
 
     fn set_volatile(&mut self) {
         self.is_volatile = true;
-    }
-
-    fn set_data(&mut self, data: usize) {
-        self.data = data;
-    }
-
-    fn set_ino(&mut self, ino: u64) {
-        self.ino = Some(ino);
     }
 }
 
@@ -62,26 +52,6 @@ pub struct ProcFileBuilder<F: FileOps> {
 impl<F: FileOps> ProcFileBuilder<F> {
     pub fn parent(mut self, parent: Weak<dyn IndexNode>) -> Self {
         self.common.set_parent(parent);
-        self
-    }
-
-    pub fn fs(mut self, fs: Weak<dyn FileSystem>) -> Self {
-        self.common.set_fs(fs);
-        self
-    }
-
-    pub fn volatile(mut self) -> Self {
-        self.common.set_volatile();
-        self
-    }
-
-    pub fn data(mut self, data: usize) -> Self {
-        self.common.set_data(data);
-        self
-    }
-
-    pub fn ino(mut self, ino: u64) -> Self {
-        self.common.set_ino(ino);
         self
     }
 }
@@ -149,16 +119,6 @@ impl<D: DirOps> ProcDirBuilder<D> {
         self.common.set_volatile();
         self
     }
-
-    pub fn data(mut self, data: usize) -> Self {
-        self.common.set_data(data);
-        self
-    }
-
-    pub fn ino(mut self, ino: u64) -> Self {
-        self.common.set_ino(ino);
-        self
-    }
 }
 
 impl<D> Builder<D> for ProcDirBuilder<D>
@@ -215,23 +175,8 @@ impl<S: SymOps> ProcSymBuilder<S> {
         self
     }
 
-    pub fn fs(mut self, fs: Weak<dyn FileSystem>) -> Self {
-        self.common.set_fs(fs);
-        self
-    }
-
     pub fn volatile(mut self) -> Self {
         self.common.set_volatile();
-        self
-    }
-
-    pub fn data(mut self, data: usize) -> Self {
-        self.common.set_data(data);
-        self
-    }
-
-    pub fn ino(mut self, ino: u64) -> Self {
-        self.common.set_ino(ino);
         self
     }
 }

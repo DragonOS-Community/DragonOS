@@ -11,6 +11,18 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use inherit_methods_macro::inherit_methods;
 
+use super::UCred;
+
+#[derive(Debug, Clone)]
+struct ScmRecord {
+    /// Absolute byte offset (in ring-buffer head/tail counter space) where this
+    /// ancillary data becomes visible, i.e. the first byte of its associated
+    /// data in the stream.
+    offset: Wrapping<usize>,
+    cred: Option<UCred>,
+    rights: Vec<Arc<File>>,
+}
+
 /// unix socket的接收队列
 ///
 /// todo 在unix socket中使用的T是u8,后续应该改成抽象的包，而不是原始的u8数组，
@@ -23,11 +35,13 @@ pub struct RingBuffer<T> {
     recv_shutdown: AtomicBool,
     /// Producer has performed SHUT_WR (consumer reads return EOF once drained).
     send_shutdown: AtomicBool,
-    /// SCM_RIGHTS (file descriptor passing) queue associated with this byte stream.
+    /// SCM (ancillary data) queue associated with this byte stream.
     ///
-    /// For SOCK_STREAM, ancillary data is delivered in the order it was sent and
-    /// is associated with the next bytes read.
-    scm_rights_queue: SpinLock<VecDeque<Vec<Arc<File>>>>,
+    /// Linux semantics (as exercised by gVisor): ancillary data is attached to
+    /// a specific byte position in the stream. It must not be visible before
+    /// that byte is read, and it is discarded if the application consumes the
+    /// associated data via read/recv without recvmsg.
+    scm_queue: SpinLock<VecDeque<ScmRecord>>,
 }
 
 #[derive(Debug)]
@@ -62,7 +76,7 @@ impl<T> RingBuffer<T> {
             tail: AtomicUsize::new(0),
             recv_shutdown: AtomicBool::new(false),
             send_shutdown: AtomicBool::new(false),
-            scm_rights_queue: SpinLock::new(VecDeque::new()),
+            scm_queue: SpinLock::new(VecDeque::new()),
         }
     }
 
@@ -86,15 +100,43 @@ impl<T> RingBuffer<T> {
             .load(core::sync::atomic::Ordering::Acquire)
     }
 
-    pub fn push_scm_rights(&self, files: Vec<Arc<File>>) {
-        if files.is_empty() {
+    pub fn push_scm_at(
+        &self,
+        offset: Wrapping<usize>,
+        cred: Option<UCred>,
+        rights: Vec<Arc<File>>,
+    ) {
+        if cred.is_none() && rights.is_empty() {
             return;
         }
-        self.scm_rights_queue.lock().push_back(files);
+        self.scm_queue.lock().push_back(ScmRecord {
+            offset,
+            cred,
+            rights,
+        });
     }
 
-    pub fn pop_scm_rights(&self) -> Option<Vec<Arc<File>>> {
-        self.scm_rights_queue.lock().pop_front()
+    pub fn peek_scm_at(&self, offset: Wrapping<usize>) -> Option<(Option<UCred>, Vec<Arc<File>>)> {
+        let q = self.scm_queue.lock();
+        q.front()
+            .filter(|r| r.offset == offset)
+            .map(|r| (r.cred, r.rights.clone()))
+    }
+
+    pub fn next_scm_offset_after(&self, offset: Wrapping<usize>) -> Option<Wrapping<usize>> {
+        let q = self.scm_queue.lock();
+        q.iter().find(|r| r.offset > offset).map(|r| r.offset)
+    }
+
+    pub fn advance_scm_to(&self, head: Wrapping<usize>) {
+        let mut q = self.scm_queue.lock();
+        while let Some(front) = q.front() {
+            if front.offset < head {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn split(self) -> (RbProducer<T>, RbConsumer<T>) {
@@ -262,8 +304,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         self.ring_buffer.set_send_shutdown()
     }
 
-    pub fn push_scm_rights(&self, files: Vec<Arc<File>>) {
-        self.ring_buffer.push_scm_rights(files)
+    pub fn push_scm_at(
+        &self,
+        offset: Wrapping<usize>,
+        cred: Option<UCred>,
+        rights: Vec<Arc<File>>,
+    ) {
+        self.ring_buffer.push_scm_at(offset, cred, rights)
     }
 }
 
@@ -294,6 +341,7 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
         // 更新 head 指针
         rb.advance_head(head, 1);
+        rb.advance_scm_to(head + Wrapping(1));
 
         Some(item)
     }
@@ -330,6 +378,7 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
         // 更新 head 指针
         rb.advance_head(head, nitems);
+        rb.advance_scm_to(head + Wrapping(nitems));
         Some(())
     }
 
@@ -368,9 +417,49 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
         Some(())
     }
+
+    /// Peek a slice starting at an absolute offset in the ring buffer.
+    ///
+    /// `offset` is expressed in the same head/tail counter space as `head()` / `tail()`.
+    /// Returns `None` if `offset` is outside the readable range or there isn't enough data.
+    pub fn peek_slice_at(&self, offset: Wrapping<usize>, buf: &mut [T]) -> Option<()> {
+        let rb = &self.ring_buffer;
+        let nitems = buf.len();
+        if nitems == 0 {
+            return Some(());
+        }
+
+        let head = rb.head();
+        let available = rb.len();
+        let dist_from_head = (offset - head).0;
+        if dist_from_head > available || dist_from_head + nitems > available {
+            return None;
+        }
+
+        let capacity = rb.capacity();
+        let start_index = offset.0 & (capacity - 1);
+        let read_guard = rb.buffer.read();
+
+        let mut start = start_index;
+        let mut remaining_len = nitems;
+        let mut buf_start = 0;
+
+        if start + nitems > capacity {
+            let first_part_len = capacity - start;
+            buf[..first_part_len].copy_from_slice(&read_guard[start..start + first_part_len]);
+            start = 0;
+            remaining_len -= first_part_len;
+            buf_start = first_part_len;
+        }
+
+        buf[buf_start..buf_start + remaining_len]
+            .copy_from_slice(&read_guard[start..start + remaining_len]);
+        Some(())
+    }
 }
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+    #[allow(dead_code)]
     pub fn is_recv_shutdown(&self) -> bool {
         self.ring_buffer.is_recv_shutdown()
     }
@@ -383,8 +472,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         self.ring_buffer.set_recv_shutdown()
     }
 
-    pub fn pop_scm_rights(&self) -> Option<Vec<Arc<File>>> {
-        self.ring_buffer.pop_scm_rights()
+    pub fn peek_scm_at(&self, offset: Wrapping<usize>) -> Option<(Option<UCred>, Vec<Arc<File>>)> {
+        self.ring_buffer.peek_scm_at(offset)
+    }
+
+    pub fn next_scm_offset_after(&self, offset: Wrapping<usize>) -> Option<Wrapping<usize>> {
+        self.ring_buffer.next_scm_offset_after(offset)
     }
 }
 

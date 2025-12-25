@@ -489,7 +489,7 @@ impl File {
     ///
     /// @param inode 文件对象对应的inode
     /// @param flags 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mut flags: FileFlags) -> Result<Self, SystemError> {
+    pub fn new(inode: Arc<dyn IndexNode>, flags: FileFlags) -> Result<Self, SystemError> {
         Self::new_with_private_data(inode, flags, FilePrivateData::default())
     }
 

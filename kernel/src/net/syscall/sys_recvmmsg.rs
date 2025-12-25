@@ -45,7 +45,7 @@ impl Syscall for SysRecvmmsgHandle {
     fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let fd = args[0];
         let msgvec = args[1] as *mut MMsgHdr;
-        let vlen = args[2] as usize;
+        let vlen = args[2];
         let flags = args[3] as u32;
         let timeout = args[4] as *mut PosixTimeSpec;
 
@@ -74,7 +74,7 @@ impl Syscall for SysRecvmmsgHandle {
             }
             let us = (ts.tv_sec as u64)
                 .saturating_mul(1_000_000)
-                .saturating_add(((ts.tv_nsec as u64) + 999) / 1000);
+                .saturating_add((ts.tv_nsec as u64).div_ceil(1000));
             (Some(Duration::from_micros(us)), Some(Instant::now()))
         };
 
@@ -89,8 +89,7 @@ impl Syscall for SysRecvmmsgHandle {
         let sock = socket_inode.as_socket().unwrap();
 
         // Wait-for-one semantics: after receiving the first message, don't block for subsequent.
-        let wait_for_one =
-            !timeout.is_null() || (flags & (socket::PMSG::WAITFORONE.bits() as u32)) != 0;
+        let wait_for_one = !timeout.is_null() || (flags & socket::PMSG::WAITFORONE.bits()) != 0;
 
         let total_len = vlen
             .checked_mul(core::mem::size_of::<MMsgHdr>())
@@ -100,17 +99,17 @@ impl Syscall for SysRecvmmsgHandle {
 
         let mut received: usize = 0;
 
-        for i in 0..vlen {
+        for msg in msgs.iter_mut().take(vlen) {
             // For i>0, force nonblocking if we're in WAITFORONE/timeout mode.
             let mut this_flags = flags;
             if received > 0 && wait_for_one {
-                this_flags |= socket::PMSG::DONTWAIT.bits() as u32;
+                this_flags |= socket::PMSG::DONTWAIT.bits();
             }
 
             // First message: if blocking and no data, optionally wait up to timeout.
             if received == 0
                 && !file_nonblock
-                && (this_flags & (socket::PMSG::DONTWAIT.bits() as u32)) == 0
+                && (this_flags & socket::PMSG::DONTWAIT.bits()) == 0
                 && !timeout.is_null()
                 && !sock.check_io_event().contains(EPollEventType::EPOLLIN)
             {
@@ -118,10 +117,9 @@ impl Syscall for SysRecvmmsgHandle {
                 wait_readable_with_timeout(sock, timeout_dur)?;
             }
 
-            match crate::net::syscall::sys_recvmsg::do_recvmsg(fd, &mut msgs[i].msg_hdr, this_flags)
-            {
+            match crate::net::syscall::sys_recvmsg::do_recvmsg(fd, &mut msg.msg_hdr, this_flags) {
                 Ok(n) => {
-                    msgs[i].msg_len = n as u32;
+                    msg.msg_len = n as u32;
                     received += 1;
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
@@ -170,7 +168,7 @@ impl Syscall for SysRecvmmsgHandle {
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("fd", (args.get(0).copied().unwrap_or(0)).to_string()),
+            FormattedSyscallParam::new("fd", (args.first().copied().unwrap_or(0)).to_string()),
             FormattedSyscallParam::new(
                 "msgvec",
                 format!("{:#x}", args.get(1).copied().unwrap_or(0)),

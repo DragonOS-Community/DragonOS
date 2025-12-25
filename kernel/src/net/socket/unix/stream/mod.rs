@@ -1,4 +1,5 @@
 use crate::{
+    filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, FilePrivateData, InodeId},
     libs::rwlock::RwLock,
     net::socket::{self, *},
@@ -19,33 +20,19 @@ use crate::{
     },
 };
 use alloc::sync::{Arc, Weak};
+use core::num::Wrapping;
 use core::sync::atomic::AtomicBool;
 use inner::{Connected, Init, Inner};
 use log::debug;
 use system_error::SystemError;
 
 use crate::filesystem::vfs::iov::IoVecs;
+use crate::net::socket::unix::{current_ucred, nobody_ucred, UCred};
 use crate::process::ProcessManager;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct Cmsghdr {
-    cmsg_len: usize,
-    cmsg_level: i32,
-    cmsg_type: i32,
-}
-
-const SOL_SOCKET: i32 = 1;
-const SCM_RIGHTS: i32 = 1;
-
-// Linux: MSG_CTRUNC is 0x8.
-const MSG_CTRUNC: i32 = 0x8;
-
-fn cmsg_align(len: usize) -> usize {
-    let align = core::mem::size_of::<usize>();
-    (len + align - 1) & !(align - 1)
-}
+// Use common ancillary message types from parent module
+use super::{cmsg_align, CmsgBuffer, Cmsghdr, MSG_CTRUNC, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET};
 
 // Socket ioctls used by gVisor unix socket tests.
 const TIOCOUTQ: u32 = 0x5411; // Get output queue size
@@ -72,6 +59,8 @@ pub struct UnixStreamSocket {
 
     is_nonblocking: AtomicBool,
     is_seqpacket: bool,
+
+    passcred: AtomicBool,
 }
 
 impl UnixStreamSocket {
@@ -91,6 +80,7 @@ impl UnixStreamSocket {
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             peer: SpinLock::new(None),
+            passcred: AtomicBool::new(false),
         })
     }
 
@@ -108,6 +98,7 @@ impl UnixStreamSocket {
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             peer: SpinLock::new(None),
+            passcred: AtomicBool::new(false),
         })
     }
 
@@ -151,7 +142,10 @@ impl UnixStreamSocket {
         }
     }
 
-    fn try_send(&self, buffer: &[u8]) -> Result<usize, SystemError> {
+    fn try_send_with_meta(
+        &self,
+        buffer: &[u8],
+    ) -> Result<(usize, Wrapping<usize>, usize), SystemError> {
         match self.inner.read().as_ref().expect("inner is None") {
             Inner::Connected(connected) => connected.try_send(buffer, self.is_seqpacket),
             _ => {
@@ -196,7 +190,10 @@ impl UnixStreamSocket {
 
     pub fn try_accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
         match self.inner.write().as_mut().expect("inner is None") {
-            Inner::Listener(listener) => listener.try_accept(self.is_seqpacket) as _,
+            Inner::Listener(listener) => listener.try_accept(
+                self.is_seqpacket,
+                self.passcred.load(core::sync::atomic::Ordering::Relaxed),
+            ) as _,
             _ => {
                 log::error!("the socket is not listening");
                 return Err(SystemError::EINVAL);
@@ -207,6 +204,20 @@ impl UnixStreamSocket {
     fn is_nonblocking(&self) -> bool {
         self.is_nonblocking
             .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn can_recv(&self) -> bool {
+        match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("UnixStreamSocket inner is None")
+        {
+            Inner::Connected(connected) => {
+                connected.readable_len(self.is_seqpacket) != 0 || connected.peer_send_shutdown()
+            }
+            _ => false,
+        }
     }
 
     fn is_acceptable(&self) -> bool {
@@ -328,9 +339,27 @@ impl Socket for UnixStreamSocket {
         }
     }
 
-    fn set_option(&self, _level: PSOL, _optname: usize, _optval: &[u8]) -> Result<(), SystemError> {
-        log::warn!("setsockopt is not implemented");
-        Ok(())
+    fn set_option(&self, level: PSOL, optname: usize, optval: &[u8]) -> Result<(), SystemError> {
+        if !matches!(level, PSOL::SOCKET) {
+            return Err(SystemError::ENOPROTOOPT);
+        }
+
+        let opt = crate::net::socket::PSO::try_from(optname as u32)
+            .map_err(|_| SystemError::ENOPROTOOPT)?;
+        match opt {
+            crate::net::socket::PSO::PASSCRED => {
+                if optval.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let mut v = [0u8; 4];
+                v.copy_from_slice(&optval[..4]);
+                let on = i32::from_ne_bytes(v) != 0;
+                self.passcred
+                    .store(on, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
     }
 
     fn wait_queue(&self) -> &WaitQueue {
@@ -369,7 +398,25 @@ impl Socket for UnixStreamSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
-        self.try_recv(buffer)
+        let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
+        loop {
+            let result = if _flags.contains(socket::PMSG::PEEK) {
+                match self.inner.read().as_ref().expect("inner is None") {
+                    Inner::Connected(connected) => connected.try_peek(buffer, self.is_seqpacket),
+                    _ => Err(SystemError::ENOTCONN),
+                }
+            } else {
+                self.try_recv(buffer)
+            };
+
+            match result {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                    wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                    continue;
+                }
+                other => return other,
+            }
+        }
     }
 
     fn recv_from(
@@ -380,7 +427,7 @@ impl Socket for UnixStreamSocket {
     ) -> Result<(usize, Endpoint), SystemError> {
         // 对于流式 Unix Socket，recv_from 与 recv 类似
         // 直接调用 try_recv 并返回对端地址
-        let recv_len = self.try_recv(buffer)?;
+        let recv_len = self.recv(buffer, _flags)?;
 
         // 获取对端地址
         let peer_endpoint = match self
@@ -439,106 +486,206 @@ impl Socket for UnixStreamSocket {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let mut buf = iovs.new_buf(true);
 
-        // Read payload first.
-        let recv_size = match self.recv(&mut buf, _flags) {
-            Ok(n) => n,
-            Err(e) => return Err(e),
-        };
-        if recv_size != 0 {
-            iovs.scatter(&buf[..recv_size])?;
-        }
-
-        // Default: no flags, no control.
-        msg.msg_flags = 0;
-        msg.msg_controllen = 0;
-
-        // Try to deliver SCM_RIGHTS for the next message (if any).
-        let rights = match self
+        // Snapshot SCM state at the current stream head.
+        let snapshot = match self
             .inner
             .read()
             .as_ref()
             .expect("UnixStreamSocket inner is None")
         {
-            Inner::Connected(connected) => connected.pop_scm_rights(),
-            _ => None,
+            Inner::Connected(connected) => connected.scm_snapshot_for_recvmsg(),
+            _ => inner::ScmSnapshot {
+                head: Wrapping(0),
+                scm_data: None,
+                next_scm_offset: None,
+            },
         };
 
-        let Some(rights) = rights else {
-            return Ok(recv_size);
-        };
-
-        // If userspace didn't provide a control buffer, drop rights and report truncation.
-        if control_ptr.is_null() || control_len == 0 {
-            msg.msg_flags |= MSG_CTRUNC;
-            return Ok(recv_size);
-        }
-
-        // Allocate new fds in the receiver. Note: DragonOS models close-on-exec on File,
-        // so we clone file objects and override close_on_exec based on MSG_CMSG_CLOEXEC.
-        let cloexec = _flags.contains(socket::PMSG::CMSG_CLOEXEC);
-        let mut received_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::with_capacity(rights.len());
-        {
-            let fd_table_binding = ProcessManager::current_pcb().fd_table();
-            let mut fd_table = fd_table_binding.write();
-            for file in rights.iter() {
-                let new_file = file.as_ref().try_clone().ok_or(SystemError::EINVAL)?;
-                new_file.set_close_on_exec(cloexec);
-                let new_fd = fd_table.alloc_fd(new_file, None)?;
-                received_fds.push(new_fd);
+        // Do not coalesce across the next SCM boundary. This prevents consuming bytes that have
+        // an SCM record attached (at a future offset) without returning that ancillary.
+        let max_read = if self.is_seqpacket {
+            // SOCK_SEQPACKET recv consumes exactly one record; it cannot cross SCM boundaries.
+            buf.len()
+        } else if let Some(next) = snapshot.next_scm_offset {
+            let dist = (next - snapshot.head).0;
+            if dist == 0 {
+                buf.len()
+            } else {
+                core::cmp::min(buf.len(), dist)
             }
+        } else {
+            buf.len()
+        };
+
+        // Read payload first.
+        let recv_size = self.recv(&mut buf[..max_read], _flags)?;
+        if recv_size != 0 {
+            iovs.scatter(&buf[..recv_size])?;
         }
 
-        // Serialize cmsghdr + int[] into msg_control.
-        let data_len = received_fds.len() * core::mem::size_of::<i32>();
-        let hdr_len = core::mem::size_of::<Cmsghdr>();
-        let cmsg_len = hdr_len + data_len;
-        let needed = cmsg_align(cmsg_len);
-        if control_len < needed {
-            // Not enough space to report fds; indicate truncation.
+        // Default: no flags.
+        msg.msg_flags = 0;
+        // Default: no control returned.
+        msg.msg_controllen = 0;
+
+        // EOF: no ancillary data.
+        if recv_size == 0 {
+            return Ok(0);
+        }
+
+        let want_creds = self.passcred.load(core::sync::atomic::Ordering::Relaxed);
+
+        let (scm_cred, scm_rights) = snapshot.scm_data.unwrap_or((None, alloc::vec::Vec::new()));
+        let has_rights = !scm_rights.is_empty();
+        if !want_creds && !has_rights {
+            // No ancillary to return.
+            return Ok(recv_size);
+        }
+
+        // If userspace didn't provide a control buffer, just report truncation.
+        if control_ptr.is_null() || control_len == 0 {
             msg.msg_flags |= MSG_CTRUNC;
             msg.msg_controllen = 0;
             return Ok(recv_size);
         }
 
-        let hdr = Cmsghdr {
-            cmsg_len,
-            cmsg_level: SOL_SOCKET,
-            cmsg_type: SCM_RIGHTS,
-        };
-        {
-            let mut hdr_writer =
-                UserBufferWriter::new(control_ptr, core::mem::size_of::<Cmsghdr>(), true)?;
-            let mut protected = hdr_writer.buffer_protected(0)?;
-            protected.write_one::<Cmsghdr>(0, &hdr)?;
+        let hdr_len = core::mem::size_of::<Cmsghdr>();
+        let mut write_off = 0usize;
+
+        // 1) SCM_CREDENTIALS (if enabled)
+        if want_creds {
+            let remaining = control_len.saturating_sub(write_off);
+            let data_avail = remaining.saturating_sub(cmsg_align(hdr_len));
+            let full_data_len = core::mem::size_of::<UCred>();
+            let cred_copy_len = core::cmp::min(data_avail, full_data_len);
+
+            let cred_to_send = scm_cred.unwrap_or_else(nobody_ucred);
+            let cred_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    (&cred_to_send as *const UCred) as *const u8,
+                    full_data_len,
+                )
+            };
+            let mut buf = CmsgBuffer {
+                ptr: control_ptr,
+                len: control_len,
+                write_off: &mut write_off,
+            };
+            buf.put(
+                &mut msg.msg_flags,
+                SOL_SOCKET,
+                SCM_CREDENTIALS,
+                full_data_len,
+                &cred_bytes[..cred_copy_len],
+            )?;
         }
 
-        // Write fd array right after header.
-        let fds_off = hdr_len;
-        for (idx, fd) in received_fds.iter().enumerate() {
-            let off = fds_off + idx * core::mem::size_of::<i32>();
-            let ptr = unsafe { control_ptr.add(off) };
-            let mut fd_writer = UserBufferWriter::new(ptr, core::mem::size_of::<i32>(), true)?;
-            let mut protected = fd_writer.buffer_protected(0)?;
-            protected.write_one::<i32>(0, fd)?;
-        }
-        msg.msg_controllen = cmsg_len;
+        // 2) SCM_RIGHTS
+        if has_rights {
+            let remaining = control_len - write_off;
+            let data_avail = remaining.saturating_sub(cmsg_align(hdr_len));
+            let max_fds = data_avail / core::mem::size_of::<i32>();
+            let fit = core::cmp::min(max_fds, scm_rights.len());
+            if fit == 0 {
+                msg.msg_flags |= MSG_CTRUNC;
+                msg.msg_controllen = write_off;
+                return Ok(recv_size);
+            }
 
+            if fit < scm_rights.len() {
+                msg.msg_flags |= MSG_CTRUNC;
+            }
+
+            let cloexec = _flags.contains(socket::PMSG::CMSG_CLOEXEC);
+            let mut received_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::with_capacity(fit);
+            {
+                let fd_table_binding = ProcessManager::current_pcb().fd_table();
+                let mut fd_table = fd_table_binding.write();
+                for file in scm_rights.iter().take(fit) {
+                    let new_file = file.as_ref().try_clone().ok_or(SystemError::EINVAL)?;
+                    new_file.set_close_on_exec(cloexec);
+                    let new_fd = fd_table.alloc_fd(new_file, None)?;
+                    received_fds.push(new_fd);
+                }
+            }
+
+            let data_len = received_fds.len() * core::mem::size_of::<i32>();
+            let fd_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(received_fds.as_ptr() as *const u8, data_len)
+            };
+            let mut buf = CmsgBuffer {
+                ptr: control_ptr,
+                len: control_len,
+                write_off: &mut write_off,
+            };
+            if let Err(e) = buf.put(
+                &mut msg.msg_flags,
+                SOL_SOCKET,
+                SCM_RIGHTS,
+                data_len,
+                fd_bytes,
+            ) {
+                super::rollback_allocated_fds(&received_fds);
+                return Err(e);
+            }
+        }
+
+        msg.msg_controllen = write_off;
         Ok(recv_size)
     }
 
     fn send(&self, buffer: &[u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
-        let result = self.try_send(buffer);
+        let result = self.try_send_with_meta(buffer);
 
-        // If send succeeded, notify peer's fasync_items for SIGIO
-        if result.is_ok() && result.as_ref().unwrap() > &0 {
-            if let Some(peer_weak) = self.peer.lock().as_ref() {
-                if let Some(peer) = peer_weak.upgrade() {
-                    peer.fasync_items.send_sigio();
+        // Auto-attach SCM_CREDENTIALS when SO_PASSCRED is enabled on either endpoint.
+        if let Ok((sent, start, _written_len)) = result {
+            if sent != 0 {
+                let peer_passcred = self
+                    .peer
+                    .lock()
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .map(|p| p.passcred.load(core::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(false);
+                let auto_attach =
+                    self.passcred.load(core::sync::atomic::Ordering::Relaxed) || peer_passcred;
+                if auto_attach {
+                    let cred = current_ucred();
+                    match self
+                        .inner
+                        .read()
+                        .as_ref()
+                        .expect("UnixStreamSocket inner is None")
+                    {
+                        Inner::Connected(connected) => {
+                            connected.push_scm_at(start, Some(cred), alloc::vec::Vec::new())
+                        }
+                        _ => return Err(SystemError::ENOTCONN),
+                    }
                 }
             }
         }
 
-        result
+        // If send succeeded, notify peer's fasync_items for SIGIO
+        if result.is_ok() && result.as_ref().unwrap().0 > 0 {
+            if let Some(peer_weak) = self.peer.lock().as_ref() {
+                if let Some(peer) = peer_weak.upgrade() {
+                    peer.fasync_items.send_sigio();
+
+                    // Wake EPOLLIN waiters on the peer. This is required for EPOLLET semantics
+                    // in gVisor tests (a second write should re-trigger EPOLLIN even if the
+                    // socket remains readable).
+                    peer.wait_queue
+                        .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+                    let _ = EventPoll::wakeup_epoll(
+                        peer.epoll_items().as_ref(),
+                        EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+                    );
+                }
+            }
+        }
+
+        result.map(|(n, _, _)| n)
     }
 
     fn send_msg(&self, _msg: &MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
@@ -553,36 +700,39 @@ impl Socket for UnixStreamSocket {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
         let buf = iovs.gather()?;
 
-        // Parse SCM_RIGHTS from msg_control (if present).
+        // Parse SCM_RIGHTS / SCM_CREDENTIALS from msg_control (if present).
         let mut rights_files: alloc::vec::Vec<
             alloc::sync::Arc<crate::filesystem::vfs::file::File>,
         > = alloc::vec::Vec::new();
+        let mut force_creds = false;
 
-        if !msg.msg_control.is_null() && msg.msg_controllen >= core::mem::size_of::<Cmsghdr>() {
+        if !msg.msg_control.is_null() && msg.msg_controllen != 0 {
+            if msg.msg_controllen < core::mem::size_of::<Cmsghdr>() {
+                return Err(SystemError::EINVAL);
+            }
+
             let reader =
                 UserBufferReader::new(msg.msg_control as *const u8, msg.msg_controllen, true)?;
             let mut off = 0usize;
             while off + core::mem::size_of::<Cmsghdr>() <= msg.msg_controllen {
                 let hdr = *reader.read_one_from_user::<Cmsghdr>(off)?;
                 if hdr.cmsg_len < core::mem::size_of::<Cmsghdr>() {
-                    break;
+                    return Err(SystemError::EINVAL);
                 }
                 if off + hdr.cmsg_len > msg.msg_controllen {
-                    break;
+                    return Err(SystemError::EINVAL);
                 }
 
                 if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_RIGHTS {
                     let data_off = off + core::mem::size_of::<Cmsghdr>();
                     let data_len = hdr.cmsg_len - core::mem::size_of::<Cmsghdr>();
-                    if data_len % core::mem::size_of::<i32>() != 0 {
+                    if !data_len.is_multiple_of(core::mem::size_of::<i32>()) {
                         return Err(SystemError::EINVAL);
                     }
 
                     let fd_count = data_len / core::mem::size_of::<i32>();
                     if fd_count != 0 {
-                        let mut fds: alloc::vec::Vec<i32> =
-                            alloc::vec::Vec::with_capacity(fd_count);
-                        fds.resize(fd_count, 0);
+                        let mut fds: alloc::vec::Vec<i32> = alloc::vec![0; fd_count];
                         reader.copy_from_user::<i32>(&mut fds, data_off)?;
 
                         let fd_table_binding = ProcessManager::current_pcb().fd_table();
@@ -594,22 +744,66 @@ impl Socket for UnixStreamSocket {
                     }
                 }
 
+                if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_CREDENTIALS {
+                    let want = core::mem::size_of::<Cmsghdr>() + core::mem::size_of::<UCred>();
+                    if hdr.cmsg_len != want {
+                        return Err(SystemError::EINVAL);
+                    }
+                    force_creds = true;
+                }
+
                 off += cmsg_align(hdr.cmsg_len);
             }
         }
 
-        // Send payload first; only attach SCM_RIGHTS if the send succeeds.
-        let sent = self.send(&buf, _flags)?;
+        // Send payload first; ancillary data is associated with the bytes sent.
+        let (sent, start, _written_len) = self.try_send_with_meta(&buf)?;
 
-        if !rights_files.is_empty() {
-            match self
-                .inner
-                .read()
+        // Notify peer on successful write.
+        if sent > 0 {
+            if let Some(peer_weak) = self.peer.lock().as_ref() {
+                if let Some(peer) = peer_weak.upgrade() {
+                    peer.fasync_items.send_sigio();
+                    peer.wait_queue
+                        .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+                    let _ = EventPoll::wakeup_epoll(
+                        peer.epoll_items().as_ref(),
+                        EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+                    );
+                }
+            }
+        }
+
+        if sent != 0 {
+            let peer_passcred = self
+                .peer
+                .lock()
                 .as_ref()
-                .expect("UnixStreamSocket inner is None")
-            {
-                Inner::Connected(connected) => connected.push_scm_rights(rights_files),
-                _ => return Err(SystemError::ENOTCONN),
+                .and_then(|w| w.upgrade())
+                .map(|p| p.passcred.load(core::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+            let auto_attach =
+                self.passcred.load(core::sync::atomic::Ordering::Relaxed) || peer_passcred;
+
+            let attach_creds = force_creds || auto_attach;
+            let cred = if attach_creds {
+                Some(current_ucred())
+            } else {
+                None
+            };
+
+            if cred.is_some() || !rights_files.is_empty() {
+                match self
+                    .inner
+                    .read()
+                    .as_ref()
+                    .expect("UnixStreamSocket inner is None")
+                {
+                    Inner::Connected(connected) => {
+                        connected.push_scm_at(start, cred, rights_files);
+                    }
+                    _ => return Err(SystemError::ENOTCONN),
+                }
             }
         }
 
@@ -643,8 +837,28 @@ impl Socket for UnixStreamSocket {
         &self.fasync_items
     }
 
-    fn option(&self, _level: PSOL, _name: usize, _value: &mut [u8]) -> Result<usize, SystemError> {
-        Err(SystemError::ENOPROTOOPT)
+    fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
+        if !matches!(level, PSOL::SOCKET) {
+            return Err(SystemError::ENOPROTOOPT);
+        }
+
+        let opt =
+            crate::net::socket::PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+        match opt {
+            crate::net::socket::PSO::PASSCRED => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let v: i32 = if self.passcred.load(core::sync::atomic::Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                };
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
     }
 
     fn do_close(&self) -> Result<(), SystemError> {

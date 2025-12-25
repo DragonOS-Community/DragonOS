@@ -501,13 +501,15 @@ impl EventPoll {
                 continue;
             }
 
-            // 从用户注册的事件中提取私有位（EPOLLET、EPOLLONESHOT等）
-            let priv_bits = EPollEventType::from_bits_truncate(epitem.event.read().events)
-                .intersection(EPollEventType::EP_PRIVATE_BITS);
-            let ep_events = revents | priv_bits;
+            // Linux semantics: epoll_wait(2) returns only ready bits (e.g. EPOLLIN),
+            // not control flags like EPOLLET/EPOLLONESHOT.
+            let registered = EPollEventType::from_bits_truncate(epitem.event.read().events);
+            let is_oneshot = registered.contains(EPollEventType::EPOLLONESHOT);
+            let is_edge = registered.contains(EPollEventType::EPOLLET);
+
             // 构建触发事件结构体
             let event = EPollEvent {
-                events: ep_events.bits,
+                events: revents.bits,
                 data: epitem.event.read().data,
             };
 
@@ -536,11 +538,11 @@ impl EventPoll {
 
             // crate::debug!("ep send {event:?}");
 
-            if ep_events.contains(EPollEventType::EPOLLONESHOT) {
+            if is_oneshot {
                 let mut event_writer = epitem.event.write();
                 let new_event = event_writer.events & EPollEventType::EP_PRIVATE_BITS.bits;
                 event_writer.set_events(new_event);
-            } else if !ep_events.contains(EPollEventType::EPOLLET) {
+            } else if !is_edge {
                 push_back.push(epitem);
             }
         }

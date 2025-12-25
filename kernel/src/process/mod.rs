@@ -344,10 +344,10 @@ impl ProcessManager {
             let (rq, _guard) = rq.self_lock();
             rq.update_rq_clock();
             // STOP 使任务不可运行：应从 rq 移除，但这不是 CPU 迁移。
-            // 使用 DEQUEUE_SLEEP 让 OnRq 进入 None，避免后续 activate_task() 走 ENQUEUE_MIGRATED 分支。
+            // 使用 DEQUEUE_STOPPED 让 OnRq 进入 None，避免后续 activate_task() 走 ENQUEUE_MIGRATED 分支。
             rq.deactivate_task(
                 pcb.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+                DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
             );
         }
 

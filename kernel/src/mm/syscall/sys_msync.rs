@@ -99,7 +99,8 @@ impl Syscall for SysMsyncHandle {
                     }
                 }
 
-                let fstart = (start - vm_start) + (backing_pgoff.unwrap_or(0) << MMArch::PAGE_SHIFT);
+                let fstart =
+                    (start - vm_start) + (backing_pgoff.unwrap_or(0) << MMArch::PAGE_SHIFT);
                 let fend = fstart + (core::cmp::min(end, vm_end) - start) - 1;
                 let old_start = start;
                 start = vm_end;

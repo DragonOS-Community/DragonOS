@@ -8,6 +8,7 @@ pub mod sys_getsockname;
 pub mod sys_getsockopt;
 pub mod sys_listen;
 pub mod sys_recvfrom;
+pub mod sys_recvmmsg;
 pub mod sys_recvmsg;
 pub mod sys_sendmsg;
 pub mod sys_sendto;

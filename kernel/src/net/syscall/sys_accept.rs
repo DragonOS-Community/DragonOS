@@ -115,7 +115,7 @@ pub(crate) fn do_accept(
     let new_fd = ProcessManager::current_pcb()
         .fd_table()
         .write()
-        .alloc_fd(File::new(new_socket, file_mode)?, None)?;
+        .alloc_fd(File::new_socket(new_socket, file_mode)?, None)?;
 
     if !addr.is_null() {
         // 将对端地址写入用户空间

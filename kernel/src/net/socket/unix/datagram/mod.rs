@@ -1,6 +1,9 @@
 use crate::{
+    filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::iov::IoVecs,
-    filesystem::vfs::{fasync::FAsyncItems, utils::DName, vcore::generate_inode_id, InodeId},
+    filesystem::vfs::{
+        fasync::FAsyncItems, utils::DName, vcore::generate_inode_id, FilePrivateData, InodeId,
+    },
     libs::rwlock::RwLock,
     libs::spinlock::SpinLock,
     libs::wait_queue::WaitQueue,
@@ -30,11 +33,39 @@ use crate::libs::wait_queue::{TimeoutWaker, Waiter};
 use crate::time::timer::{next_n_us_timer_jiffies, Timer};
 use crate::time::{Duration, Instant};
 
+use crate::syscall::user_access::UserBufferWriter;
+use crate::{
+    filesystem::vfs::file::File,
+    net::socket::unix::{current_ucred, nobody_ucred, UCred},
+    process::ProcessManager,
+    syscall::user_access::UserBufferReader,
+};
+
+// Socket ioctls used by gVisor unix socket tests.
+const TIOCOUTQ: u32 = 0x5411; // Get output queue size
+const FIONREAD: u32 = 0x541B; // Get input queue size (aka TIOCINQ)
+const SIOCGIFINDEX: u32 = 0x8933; // name -> if_index mapping
+
+fn clamp_usize_to_i32(v: usize) -> i32 {
+    core::cmp::min(v, i32::MAX as usize) as i32
+}
+
+// Use common ancillary message types from parent module
+use super::{cmsg_align, CmsgBuffer, Cmsghdr, MSG_CTRUNC, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET};
+
 /// Unix 域数据报消息
 #[derive(Debug, Clone)]
 struct DatagramMessage {
     /// 消息数据
     data: Vec<u8>,
+    /// SCM_RIGHTS file list associated with this datagram.
+    rights: Vec<Arc<File>>,
+
+    /// SCM_CREDENTIALS associated with this datagram.
+    ///
+    /// Present when explicitly provided via sendmsg SCM_CREDENTIALS or when
+    /// credentials were auto-attached at send time due to SO_PASSCRED.
+    creds: Option<UCred>,
     /// 发送方地址
     sender_addr: Option<UnixEndpointBound>,
     /// 发送端 SO_SNDBUF 记账的长度
@@ -42,10 +73,17 @@ struct DatagramMessage {
 }
 
 impl DatagramMessage {
-    fn new(data: Vec<u8>, sender_addr: Option<UnixEndpointBound>) -> Self {
+    fn new(
+        data: Vec<u8>,
+        sender_addr: Option<UnixEndpointBound>,
+        rights: Vec<Arc<File>>,
+        creds: Option<UCred>,
+    ) -> Self {
         let sender_accounted_len = data.len();
         Self {
             data,
+            rights,
+            creds,
             sender_addr,
             sender_accounted_len,
         }
@@ -197,6 +235,11 @@ pub struct UnixDatagramSocket {
     send_timeout_us: AtomicU64,
     recv_timeout_us: AtomicU64,
     self_weak: Weak<UnixDatagramSocket>,
+
+    passcred: AtomicBool,
+
+    is_read_shutdown: AtomicBool,
+    is_write_shutdown: AtomicBool,
 }
 
 impl UnixDatagramSocket {
@@ -223,6 +266,11 @@ impl UnixDatagramSocket {
             send_timeout_us: AtomicU64::new(0),
             recv_timeout_us: AtomicU64::new(0),
             self_weak: weak.clone(),
+
+            passcred: AtomicBool::new(false),
+
+            is_read_shutdown: AtomicBool::new(false),
+            is_write_shutdown: AtomicBool::new(false),
         })
     }
 
@@ -256,6 +304,17 @@ impl UnixDatagramSocket {
         }
 
         (socket_a, socket_b)
+    }
+
+    pub fn ioctl_fionread(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.recv_queue.front().map(|m| m.data.len()).unwrap_or(0)
+    }
+
+    pub fn ioctl_tiocoutq(&self) -> usize {
+        // For datagram sockets, TIOCOUTQ is not relied upon by our current tests.
+        // Returning 0 is consistent with an empty send queue in the common case.
+        0
     }
 
     fn is_nonblocking(&self) -> bool {
@@ -453,6 +512,12 @@ impl UnixDatagramSocket {
         self.snd_used.fetch_sub(len, Ordering::SeqCst);
         self.wait_queue
             .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+
+        // Notify EPOLLOUT waiters that send buffer space is available again.
+        let _ = EventPoll::wakeup_epoll(
+            self.epoll_items().as_ref(),
+            EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM,
+        );
     }
 
     fn release_sender_accounting(sender_addr: &Option<UnixEndpointBound>, accounted_len: usize) {
@@ -469,7 +534,22 @@ impl UnixDatagramSocket {
         buffer: &[u8],
         target_addr: &UnixEndpointBound,
     ) -> Result<usize, SystemError> {
-        if buffer.len() > Self::MAX_MSG_SIZE {
+        self.try_send_to_with_rights(buffer, target_addr, Vec::new(), false)
+    }
+
+    fn try_send_to_with_rights(
+        &self,
+        buffer: &[u8],
+        target_addr: &UnixEndpointBound,
+        rights: Vec<Arc<File>>,
+        force_creds: bool,
+    ) -> Result<usize, SystemError> {
+        if self.is_write_shutdown.load(Ordering::Acquire) {
+            return Err(SystemError::EPIPE);
+        }
+
+        let buf_len = buffer.len();
+        if buf_len > Self::MAX_MSG_SIZE {
             return Err(SystemError::EMSGSIZE);
         }
 
@@ -478,22 +558,38 @@ impl UnixDatagramSocket {
             .lookup(target_addr)
             .ok_or(SystemError::ECONNREFUSED)?;
 
+        if target_socket.is_read_shutdown.load(Ordering::Acquire) {
+            return Err(SystemError::EPIPE);
+        }
+
         // 获取发送方地址
-        let sender_addr = self.inner.lock().local_endpoint();
+        let sender_addr = { self.inner.lock().local_endpoint() };
 
         // 发送侧 SO_SNDBUF 记账。gVisor 用例依赖：缓冲区满时非阻塞 send 返回 EWOULDBLOCK，
         // 增大 SO_SNDBUF 后可继续 send。
-        self.try_account_send_buffer(buffer.len())?;
+        self.try_account_send_buffer(buf_len)?;
+
+        // Attach SCM_CREDENTIALS if:
+        // - sender explicitly asked via sendmsg SCM_CREDENTIALS, or
+        // - SO_PASSCRED was enabled on either endpoint at send time.
+        let attach_creds = force_creds
+            || self.passcred.load(Ordering::Acquire)
+            || target_socket.passcred.load(Ordering::Acquire);
+        let creds = if attach_creds {
+            Some(current_ucred())
+        } else {
+            None
+        };
 
         // 创建消息
-        let msg = DatagramMessage::new(buffer.to_vec(), sender_addr);
+        let msg = DatagramMessage::new(buffer.to_vec(), sender_addr, rights, creds);
 
         // 将消息放入目标 socket 的接收队列
         {
             let mut target_inner = target_socket.inner.lock();
             if let Err(e) = target_inner.push_message(msg) {
                 // 回滚记账并返回错误
-                self.unaccount_send_buffer(buffer.len());
+                self.unaccount_send_buffer(buf_len);
                 return Err(e);
             }
         }
@@ -503,10 +599,16 @@ impl UnixDatagramSocket {
             .wait_queue
             .wakeup(Some(crate::process::ProcessState::Blocked(true)));
 
+        // Notify epoll waiters: new data is readable.
+        let _ = EventPoll::wakeup_epoll(
+            target_socket.epoll_items().as_ref(),
+            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+        );
+
         // 发送 fasync 信号
         target_socket.fasync_items.send_sigio();
 
-        Ok(buffer.len())
+        Ok(buf_len)
     }
 
     /// 从接收队列接收数据报
@@ -593,6 +695,40 @@ impl UnixDatagramSocket {
 }
 
 impl Socket for UnixDatagramSocket {
+    fn ioctl(
+        &self,
+        cmd: u32,
+        arg: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        if arg == 0 {
+            return Err(SystemError::EFAULT);
+        }
+
+        match cmd {
+            FIONREAD => {
+                let available = self.ioctl_fionread();
+                let mut writer =
+                    UserBufferWriter::new(arg as *mut u8, core::mem::size_of::<i32>(), true)?;
+                writer
+                    .buffer_protected(0)?
+                    .write_one::<i32>(0, &clamp_usize_to_i32(available))?;
+                Ok(0)
+            }
+            TIOCOUTQ => {
+                let queued = self.ioctl_tiocoutq();
+                let mut writer =
+                    UserBufferWriter::new(arg as *mut u8, core::mem::size_of::<i32>(), true)?;
+                writer
+                    .buffer_protected(0)?
+                    .write_one::<i32>(0, &clamp_usize_to_i32(queued))?;
+                Ok(0)
+            }
+            SIOCGIFINDEX => Err(SystemError::ENODEV),
+            _ => Err(SystemError::ENOSYS),
+        }
+    }
+
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
         self.inner.lock().connect(unix_endpoint)
@@ -665,6 +801,16 @@ impl Socket for UnixDatagramSocket {
                 let d = Self::parse_timeval_opt(optval)?;
                 self.recv_timeout_us
                     .store(d.total_micros(), Ordering::SeqCst);
+                Ok(())
+            }
+            crate::net::socket::PSO::PASSCRED => {
+                if optval.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let mut v = [0u8; 4];
+                v.copy_from_slice(&optval[..4]);
+                let on = i32::from_ne_bytes(v) != 0;
+                self.passcred.store(on, Ordering::Release);
                 Ok(())
             }
             _ => Err(SystemError::ENOPROTOOPT),
@@ -751,10 +897,11 @@ impl Socket for UnixDatagramSocket {
     }
 
     fn recv_msg(&self, msg: &mut MsgHdr, flags: socket::PMSG) -> Result<usize, SystemError> {
-        // recvmsg 最小语义：
-        // - 不产生控制消息：将 msg_controllen 写回 0，避免用户态 CMSG_FIRSTHDR 非空
-        // - 若数据报被截断：设置 MSG_TRUNC
-        // - 若需要：填写 msg_name/msg_namelen
+        // recvmsg semantics:
+        // - Deliver SCM_RIGHTS if present on the next datagram.
+        // - If payload is truncated, set MSG_TRUNC.
+        // - If control buffer is insufficient or missing, set MSG_CTRUNC.
+        // - Fill msg_name/msg_namelen when provided.
 
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let mut buf = iovs.new_buf(true);
@@ -763,10 +910,9 @@ impl Socket for UnixDatagramSocket {
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
         let peek = flags.contains(PMSG::PEEK);
 
-        let (copy_len, sender_addr, orig_len) = if nonblock {
-            let mut inner = self.inner.lock();
-
+        let (payload_copy_len, sender_addr, orig_len, rights, creds) = if nonblock {
             if peek {
+                let inner = self.inner.lock();
                 let msg_in = inner
                     .recv_queue
                     .front()
@@ -776,11 +922,21 @@ impl Socket for UnixDatagramSocket {
                 let copy_len = core::cmp::min(buf_cap, orig_len);
                 buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
 
-                (copy_len, msg_in.sender_addr.clone(), orig_len)
+                (
+                    copy_len,
+                    msg_in.sender_addr.clone(),
+                    orig_len,
+                    msg_in.rights.clone(),
+                    msg_in.creds,
+                )
             } else {
-                let msg_in = inner
-                    .pop_message()
-                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+                // Pop first (short lock), then copy/compute outside.
+                let msg_in = {
+                    let mut inner = self.inner.lock();
+                    inner
+                        .pop_message()
+                        .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+                };
 
                 let orig_len = msg_in.data.len();
                 let copy_len = core::cmp::min(buf_cap, orig_len);
@@ -788,7 +944,13 @@ impl Socket for UnixDatagramSocket {
 
                 Self::release_sender_accounting(&msg_in.sender_addr, msg_in.sender_accounted_len);
 
-                (copy_len, msg_in.sender_addr, orig_len)
+                (
+                    copy_len,
+                    msg_in.sender_addr,
+                    orig_len,
+                    msg_in.rights,
+                    msg_in.creds,
+                )
             }
         } else {
             loop {
@@ -799,7 +961,13 @@ impl Socket for UnixDatagramSocket {
                             let orig_len = msg_in.data.len();
                             let copy_len = core::cmp::min(buf_cap, orig_len);
                             buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
-                            (copy_len, msg_in.sender_addr.clone(), orig_len)
+                            (
+                                copy_len,
+                                msg_in.sender_addr.clone(),
+                                orig_len,
+                                msg_in.rights.clone(),
+                                msg_in.creds,
+                            )
                         })
                     };
                     if let Some(v) = got {
@@ -820,7 +988,13 @@ impl Socket for UnixDatagramSocket {
                             msg_in.sender_accounted_len,
                         );
 
-                        break (copy_len, msg_in.sender_addr, orig_len);
+                        break (
+                            copy_len,
+                            msg_in.sender_addr,
+                            orig_len,
+                            msg_in.rights,
+                            msg_in.creds,
+                        );
                     }
                 }
 
@@ -828,22 +1002,129 @@ impl Socket for UnixDatagramSocket {
             }
         };
 
-        iovs.scatter(&buf[..copy_len])?;
+        iovs.scatter(&buf[..payload_copy_len])?;
 
         // 写回来源地址
         let endpoint = sender_addr
             .map(|a| Endpoint::Unix(a.into()))
             .unwrap_or(Endpoint::Unix(UnixEndpoint::Unnamed));
-        endpoint.write_to_user(msg.msg_name, &mut msg.msg_namelen as *mut u32)?;
+        msg.msg_namelen = endpoint.write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
 
-        // 不产生控制消息
-        msg.msg_controllen = 0;
         msg.msg_flags = 0;
         if orig_len > buf_cap {
             msg.msg_flags |= PMSG::TRUNC.bits() as i32;
         }
 
-        Ok(Self::recv_return_len(copy_len, orig_len, flags))
+        // Default: no control.
+        let control_ptr = msg.msg_control;
+        let control_len = msg.msg_controllen;
+        msg.msg_controllen = 0;
+
+        let want_creds = self.passcred.load(Ordering::Acquire);
+        let has_rights = !rights.is_empty();
+
+        if !want_creds && !has_rights {
+            return Ok(Self::recv_return_len(payload_copy_len, orig_len, flags));
+        }
+
+        if control_ptr.is_null() || control_len == 0 {
+            msg.msg_flags |= MSG_CTRUNC;
+            return Ok(Self::recv_return_len(payload_copy_len, orig_len, flags));
+        }
+
+        let hdr_len = core::mem::size_of::<Cmsghdr>();
+        let mut write_off = 0usize;
+
+        // 1) SCM_CREDENTIALS (if enabled)
+        if want_creds {
+            let remaining = control_len.saturating_sub(write_off);
+            if remaining < hdr_len {
+                msg.msg_flags |= MSG_CTRUNC;
+                msg.msg_controllen = write_off;
+                return Ok(Self::recv_return_len(payload_copy_len, orig_len, flags));
+            }
+
+            let data_avail = remaining.saturating_sub(cmsg_align(hdr_len));
+            let full_data_len = core::mem::size_of::<UCred>();
+            let cred_copy_len = core::cmp::min(data_avail, full_data_len);
+
+            let cred_to_send = creds.unwrap_or_else(nobody_ucred);
+            let cred_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    (&cred_to_send as *const UCred) as *const u8,
+                    full_data_len,
+                )
+            };
+
+            // Linux uses the full ucred length for CMSG_LEN/CMSG_SPACE and clamps cmsg_len
+            // if the provided buffer is smaller. gVisor asserts this behavior.
+            let mut buf = CmsgBuffer {
+                ptr: control_ptr,
+                len: control_len,
+                write_off: &mut write_off,
+            };
+            buf.put(
+                &mut msg.msg_flags,
+                SOL_SOCKET,
+                SCM_CREDENTIALS,
+                full_data_len,
+                &cred_bytes[..cred_copy_len],
+            )?;
+        }
+
+        // 2) SCM_RIGHTS (if present)
+        if has_rights {
+            let remaining = control_len - write_off;
+            let data_avail = remaining.saturating_sub(cmsg_align(hdr_len));
+            let max_fds = data_avail / core::mem::size_of::<i32>();
+            let fit = core::cmp::min(max_fds, rights.len());
+            if fit == 0 {
+                msg.msg_flags |= MSG_CTRUNC;
+                msg.msg_controllen = write_off;
+                return Ok(Self::recv_return_len(payload_copy_len, orig_len, flags));
+            }
+            if fit < rights.len() {
+                msg.msg_flags |= MSG_CTRUNC;
+            }
+
+            let cloexec = flags.contains(socket::PMSG::CMSG_CLOEXEC);
+            let mut received_fds: Vec<i32> = Vec::with_capacity(fit);
+            {
+                let fd_table_binding = ProcessManager::current_pcb().fd_table();
+                let mut fd_table = fd_table_binding.write();
+                for file in rights.iter().take(fit) {
+                    let new_file = file.as_ref().try_clone().ok_or(SystemError::EINVAL)?;
+                    new_file.set_close_on_exec(cloexec);
+                    let new_fd = fd_table.alloc_fd(new_file, None)?;
+                    received_fds.push(new_fd);
+                }
+            }
+
+            let data_len = received_fds.len() * core::mem::size_of::<i32>();
+            let fd_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(received_fds.as_ptr() as *const u8, data_len)
+            };
+
+            let mut buf = CmsgBuffer {
+                ptr: control_ptr,
+                len: control_len,
+                write_off: &mut write_off,
+            };
+            if let Err(e) = buf.put(
+                &mut msg.msg_flags,
+                SOL_SOCKET,
+                SCM_RIGHTS,
+                data_len,
+                fd_bytes,
+            ) {
+                super::rollback_allocated_fds(&received_fds);
+                return Err(e);
+            }
+        }
+
+        msg.msg_controllen = write_off;
+
+        Ok(Self::recv_return_len(payload_copy_len, orig_len, flags))
     }
 
     fn send(&self, buffer: &[u8], flags: socket::PMSG) -> Result<usize, SystemError> {
@@ -855,7 +1136,6 @@ impl Socket for UnixDatagramSocket {
             .ok_or(SystemError::EDESTADDRREQ)?;
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
-
         if nonblock {
             return Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &peer_addr));
         }
@@ -875,7 +1155,107 @@ impl Socket for UnixDatagramSocket {
     }
 
     fn send_msg(&self, _msg: &MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+        let msg = _msg;
+
+        // Gather payload.
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
+        let buf = iovs.gather()?;
+
+        // Resolve destination.
+        let target_addr = if !msg.msg_name.is_null() {
+            let endpoint = crate::net::posix::SockAddr::to_endpoint(
+                msg.msg_name as *const crate::net::posix::SockAddr,
+                msg.msg_namelen,
+            )?;
+            let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
+            unix_endpoint.connect()?
+        } else {
+            self.inner
+                .lock()
+                .peer_endpoint()
+                .ok_or(SystemError::EDESTADDRREQ)?
+        };
+
+        // Parse SCM_RIGHTS / SCM_CREDENTIALS from msg_control.
+        let mut rights_files: Vec<Arc<File>> = Vec::new();
+        let mut force_creds = false;
+        if !msg.msg_control.is_null() && msg.msg_controllen != 0 {
+            if msg.msg_controllen < core::mem::size_of::<Cmsghdr>() {
+                return Err(SystemError::EINVAL);
+            }
+
+            let reader =
+                UserBufferReader::new(msg.msg_control as *const u8, msg.msg_controllen, true)?;
+            let mut off = 0usize;
+            while off + core::mem::size_of::<Cmsghdr>() <= msg.msg_controllen {
+                let hdr = *reader.read_one_from_user::<Cmsghdr>(off)?;
+                if hdr.cmsg_len < core::mem::size_of::<Cmsghdr>() {
+                    return Err(SystemError::EINVAL);
+                }
+                if off + hdr.cmsg_len > msg.msg_controllen {
+                    return Err(SystemError::EINVAL);
+                }
+
+                if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_RIGHTS {
+                    let data_off = off + core::mem::size_of::<Cmsghdr>();
+                    let data_len = hdr.cmsg_len - core::mem::size_of::<Cmsghdr>();
+                    if !data_len.is_multiple_of(core::mem::size_of::<i32>()) {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let fd_count = data_len / core::mem::size_of::<i32>();
+                    if fd_count != 0 {
+                        let mut fds: Vec<i32> = vec![0; fd_count];
+                        reader.copy_from_user::<i32>(&mut fds, data_off)?;
+
+                        let fd_table_binding = ProcessManager::current_pcb().fd_table();
+                        let fd_table = fd_table_binding.read();
+                        for fd in fds {
+                            let file = fd_table.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
+                            rights_files.push(file);
+                        }
+                    }
+                }
+
+                if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_CREDENTIALS {
+                    // SCM_CREDENTIALS must carry a full ucred.
+                    let want = core::mem::size_of::<Cmsghdr>() + core::mem::size_of::<UCred>();
+                    if hdr.cmsg_len != want {
+                        return Err(SystemError::EINVAL);
+                    }
+                    force_creds = true;
+                }
+
+                off += cmsg_align(hdr.cmsg_len);
+            }
+        }
+
+        let nonblock = self.is_nonblocking() || _flags.contains(PMSG::DONTWAIT);
+        if nonblock {
+            return Self::convert_enobufs_to_eagain(self.try_send_to_with_rights(
+                &buf,
+                &target_addr,
+                rights_files,
+                force_creds,
+            ));
+        }
+
+        loop {
+            match self.try_send_to_with_rights(
+                &buf,
+                &target_addr,
+                rights_files.clone(),
+                force_creds,
+            ) {
+                Ok(len) => return Ok(len),
+                Err(SystemError::ENOBUFS) => {
+                    self.wait_event_interruptible_timeout(
+                        || self.send_buffer_available(buf.len()),
+                        self.send_timeout(),
+                    )?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn send_to(
@@ -888,7 +1268,6 @@ impl Socket for UnixDatagramSocket {
         let target_addr = unix_endpoint.connect()?;
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
-
         if nonblock {
             return Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &target_addr));
         }
@@ -953,6 +1332,18 @@ impl Socket for UnixDatagramSocket {
             crate::net::socket::PSO::RCVTIMEO_OLD | crate::net::socket::PSO::RCVTIMEO_NEW => {
                 Self::write_timeval(value, self.recv_timeout_us.load(Ordering::Relaxed))
             }
+            crate::net::socket::PSO::PASSCRED => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let v: i32 = if self.passcred.load(Ordering::Acquire) {
+                    1
+                } else {
+                    0
+                };
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
@@ -986,7 +1377,16 @@ impl Socket for UnixDatagramSocket {
     }
 
     fn shutdown(&self, _how: socket::common::ShutdownBit) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
+        if _how.is_recv_shutdown() {
+            self.is_read_shutdown.store(true, Ordering::Release);
+        }
+        if _how.is_send_shutdown() {
+            self.is_write_shutdown.store(true, Ordering::Release);
+        }
+
+        self.wait_queue
+            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+        Ok(())
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {

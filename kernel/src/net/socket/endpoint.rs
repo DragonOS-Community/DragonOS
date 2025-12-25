@@ -45,6 +45,48 @@ impl From<IpEndpoint> for Endpoint {
 }
 
 impl Endpoint {
+    /// 内部函数：将 sockaddr 写入用户空间缓冲区
+    ///
+    /// # 参数
+    /// - `addr`: 用户空间的 sockaddr 缓冲区指针（调用方需保证非空）
+    /// - `max_len`: 用户提供的缓冲区最大长度
+    ///
+    /// # 返回值
+    /// 返回实际需要的 sockaddr 长度（即使缓冲区较小也返回完整长度，符合 Linux 语义）
+    fn write_sockaddr_to_user(
+        &self,
+        addr: *mut SockAddr,
+        max_len: usize,
+    ) -> Result<u32, system_error::SystemError> {
+        let kernel_addr = SockAddr::from(self.clone());
+        let len = kernel_addr.len()?;
+
+        let to_write = core::cmp::min(len as usize, max_len);
+        if to_write > 0 {
+            let mut addr_writer = UserBufferWriter::new(addr as *mut u8, to_write, true)?;
+            // 只能写入实际 sockaddr 的前 `to_write` 字节。
+            // 注意：不能用 write_one::<SockAddr>()，因为 SockAddr 是 union，
+            // 其大小通常大于某些地址族(如 AF_INET 的 sockaddr_in=16)。
+            let kernel_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&kernel_addr as *const SockAddr) as *const u8,
+                    len as usize,
+                )
+            };
+
+            addr_writer
+                .buffer_protected(0)?
+                .write_to_user(0, &kernel_bytes[..to_write])?;
+        }
+
+        Ok(len)
+    }
+
+    /// 将端点地址写入用户空间（用于 getpeername/getsockname 等系统调用）
+    ///
+    /// # 参数
+    /// - `addr`: 用户空间的 sockaddr 缓冲区指针
+    /// - `addr_len`: 用户空间的长度指针（in/out 参数）
     pub fn write_to_user(
         &self,
         addr: *mut SockAddr,
@@ -58,32 +100,35 @@ impl Endpoint {
         let addr_len_reader = UserBufferReader::new(addr_len, core::mem::size_of::<u32>(), true)?;
         let user_len = addr_len_reader.buffer_protected(0)?.read_one::<u32>(0)? as usize;
 
-        let kernel_addr = SockAddr::from(self.clone());
-        let len = kernel_addr.len()? as usize;
-
-        let to_write = core::cmp::min(len, user_len);
-
-        // 使用 UserBufferWriter 的 buffer_protected 安全写入用户空间
-        if to_write > 0 {
-            let addr_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    &kernel_addr as *const SockAddr as *const u8,
-                    to_write as usize,
-                )
-            };
-            let mut addr_writer = UserBufferWriter::new(addr as *mut u8, to_write, true)?;
-            addr_writer
-                .buffer_protected(0)?
-                .write_to_user(0, addr_bytes)?;
-        }
+        let len = self.write_sockaddr_to_user(addr, user_len)?;
 
         // 写回实际需要的长度
         let mut addr_len_writer =
             UserBufferWriter::new(addr_len, core::mem::size_of::<u32>(), true)?;
         addr_len_writer
             .buffer_protected(0)?
-            .write_one::<u32>(0, &(len as u32))?;
+            .write_one::<u32>(0, &len)?;
 
         Ok(())
+    }
+
+    /// 将端点地址写入用户空间（用于 recvmsg 的 msghdr 风格）
+    ///
+    /// # 参数
+    /// - `addr`: 用户空间的 sockaddr 缓冲区指针
+    /// - `user_len`: 用户提供的缓冲区长度（按值传递）
+    ///
+    /// # 返回值
+    /// 返回实际需要的 sockaddr 长度（即使缓冲区较小也返回完整长度，符合 Linux 语义）
+    pub fn write_to_user_msghdr(
+        &self,
+        addr: *mut SockAddr,
+        user_len: u32,
+    ) -> Result<u32, system_error::SystemError> {
+        if addr.is_null() {
+            return Ok(user_len);
+        }
+
+        self.write_sockaddr_to_user(addr, user_len as usize)
     }
 }

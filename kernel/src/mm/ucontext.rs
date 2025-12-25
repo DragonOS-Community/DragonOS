@@ -730,7 +730,10 @@ impl InnerAddressSpace {
             let vma_start = region.start();
             let off_pages =
                 (old_vaddr.data().saturating_sub(vma_start.data())) >> MMArch::PAGE_SHIFT;
-            let base = g.backing_page_offset().unwrap_or(0).saturating_add(off_pages);
+            let base = g
+                .backing_page_offset()
+                .unwrap_or(0)
+                .saturating_add(off_pages);
             (region, g.vm_file(), g.shared_anon.clone(), base)
         };
 

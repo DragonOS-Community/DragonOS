@@ -65,7 +65,7 @@ impl Syscall for SysSendtoHandle {
 
         // Read data from user space
         let user_buffer_reader = UserBufferReader::new(buf, len, frame.is_from_user())?;
-        let data = user_buffer_reader.read_from_user(0)?;
+        let data = user_buffer_reader.read_from_user_checked(0)?;
 
         do_sendto(fd, data, flags, addr, addrlen as u32)
     }

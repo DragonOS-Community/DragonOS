@@ -2,6 +2,11 @@ pub mod datagram;
 pub mod ns;
 pub mod ring_buffer;
 pub mod stream;
+pub mod utils;
+
+use system_error::SystemError;
+
+use self::utils::*;
 
 use super::PSOCK;
 use crate::{
@@ -19,7 +24,37 @@ use crate::{
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::hash::Hash;
-use system_error::SystemError;
+
+/// Unix domain credential payload for SCM_CREDENTIALS.
+///
+/// Matches Linux `struct ucred { pid_t pid; uid_t uid; gid_t gid; }` layout on 64-bit.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UCred {
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Return current task credentials used for unix-domain SCM_CREDENTIALS.
+pub fn current_ucred() -> UCred {
+    let pcb = ProcessManager::current_pcb();
+    let cred = pcb.cred();
+    UCred {
+        pid: pcb.raw_tgid().data() as i32,
+        uid: cred.uid.data() as u32,
+        gid: cred.gid.data() as u32,
+    }
+}
+
+/// Linux behavior used by gVisor tests when credentials were not attached at send time.
+pub const fn nobody_ucred() -> UCred {
+    UCred {
+        pid: 0,
+        uid: 65534,
+        gid: 65534,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum UnixEndpoint {

@@ -284,6 +284,8 @@ impl ProcessManager {
             let state = writer.state();
             if let ProcessState::Stopped = state {
                 writer.set_state(ProcessState::Runnable);
+                // Stopped -> Runnable：必须清理 sleep 标志，否则调度器可能把该任务当作“睡眠出队”处理。
+                writer.set_wakeup();
                 // avoid deadlock
                 drop(writer);
 
@@ -325,13 +327,33 @@ impl ProcessManager {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         let state = writer.state();
-        if !matches!(state, ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Stopped);
-            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-            drop(writer);
-            return Ok(());
+        if matches!(state, ProcessState::Exited(_)) {
+            return Err(SystemError::EINTR);
         }
-        return Err(SystemError::EINTR);
+
+        // Stopped 的任务不应继续留在 runqueue 中，否则仍可能被选中运行。
+        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+        writer.set_state(ProcessState::Stopped);
+        // stop 后不应再被视为“睡眠任务”，避免后续调度错误地做 DEQUEUE_SLEEP。
+        writer.set_wakeup();
+        pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+        drop(writer);
+
+        if on_rq == OnRq::Queued {
+            let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+            let (rq, _guard) = rq.self_lock();
+            rq.update_rq_clock();
+            // STOP 使任务不可运行：应从 rq 移除，但这不是 CPU 迁移。
+            // 使用 DEQUEUE_SLEEP 让 OnRq 进入 None，避免后续 activate_task() 走 ENQUEUE_MIGRATED 分支。
+            rq.deactivate_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+        }
+
+        // 强制让目标 CPU 尽快进入内核并重新调度，缩短 stop 生效延迟。
+        ProcessManager::kick(pcb);
+        Ok(())
     }
 
     /// 标志当前进程永久睡眠，但是发起调度的工作，应该由调用者完成
@@ -1823,6 +1845,13 @@ impl ThreadInfo {
 
     pub fn group_leader(&self) -> Option<Arc<ProcessControlBlock>> {
         return self.group_leader.upgrade();
+    }
+
+    /// 返回线程组中除组长外的线程列表（由组长维护）。
+    ///
+    /// 说明：该列表存储为 `Weak`，调用者应当在使用前 `upgrade()` 并处理失败场景。
+    pub fn group_tasks_clone(&self) -> Vec<Weak<ProcessControlBlock>> {
+        self.group_tasks.clone()
     }
 
     pub fn thread_group_empty(&self) -> bool {

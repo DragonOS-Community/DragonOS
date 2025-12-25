@@ -87,7 +87,6 @@ impl phy::TxToken for LoopbackTxToken {
         let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
         device.loopback_transmit(buffer);
-        // debug!("lo transmit!");
         result
     }
 }
@@ -114,10 +113,13 @@ impl Loopback {
         let buffer = self.queue.pop_front();
         match buffer {
             Some(buffer) => {
-                // debug!("lo receive:{:?}", buffer);
+                log::debug!("lo receive: {} bytes, remaining_queue_len={}, self_ptr={:p}", buffer.len(), self.queue.len(), self);
                 return buffer;
             }
             None => {
+                if self.queue.len() > 0 {
+                    log::warn!("lo receive: queue not empty but pop_front returned None!");
+                }
                 return Vec::new();
             }
         }
@@ -129,8 +131,12 @@ impl Loopback {
     /// - &mut self：自身可变引用
     /// - buffer：需要发送的数据包
     pub fn loopback_transmit(&mut self, buffer: Vec<u8>) {
-        // debug!("lo transmit:{:?}", buffer);
-        self.queue.push_back(buffer)
+        log::debug!("lo transmit: {} bytes, queue_len={}, self_ptr={:p}", buffer.len(), self.queue.len(), self);
+        self.queue.push_back(buffer);
+
+        // Wake the network polling thread to process the queued packet
+        // Loopback doesn't have hardware interrupts, so we need to explicitly wake the thread
+        INIT_NET_NAMESPACE.wakeup_poll_thread();
     }
 }
 
@@ -222,10 +228,9 @@ impl phy::Device for LoopbackDriver {
         let buffer = self.inner.lock().loopback_receive();
         //receive队列为为空，返回NONE值以通知上层没有可以receive的包
         if buffer.is_empty() {
-            // log::debug!("lo receive none!");
             return Option::None;
         }
-        // log::debug!("lo receive!");
+        log::debug!("LoopbackDriver::receive() -> packet {} bytes", buffer.len());
         let rx = LoopbackRxToken { buffer };
         let tx = LoopbackTxToken {
             driver: self.clone(),
@@ -242,7 +247,6 @@ impl phy::Device for LoopbackDriver {
     /// ## 返回值
     /// - 返回一个 `Some`，其中包含一个发送令牌，该令牌包含一个对自身的克隆引用
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        // log::debug!("lo transmit!");
         Some(LoopbackTxToken {
             driver: self.clone(),
         })

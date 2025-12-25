@@ -34,6 +34,16 @@ impl Syscall for SysReadVHandle {
         // IoVecs 会进行用户态检验(包含 len==0 的 iov_base 校验)。
         let iovecs = unsafe { IoVecs::from_user(iov, count, true) }?;
 
+        // Check if this is a socket - sockets need special handling for datagram protocols
+        use crate::process::ProcessManager;
+        if let Ok(_socket_inode) = ProcessManager::current_pcb().get_socket_inode(fd) {
+            // Socket: read entire message then scatter to iovecs
+            let mut buf = iovecs.new_buf(true);
+            let nread = do_read(fd, &mut buf)?;
+            iovecs.scatter(&buf[..nread])?;
+            return Ok(nread);
+        }
+
         // Linux: limit per readv() to MAX_RW_COUNT = INT_MAX & ~(PAGE_SIZE-1)
         let max_rw_count = (i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1);
 

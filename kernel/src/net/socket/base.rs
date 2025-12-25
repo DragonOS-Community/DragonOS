@@ -44,12 +44,20 @@ pub trait Socket: PollableInode + IndexNode {
 
     fn send_buffer_size(&self) -> usize;
     fn recv_buffer_size(&self) -> usize;
+
+    /// # `recv_bytes_available`
+    /// Get the number of bytes currently available to read from the socket.
+    /// Returns 0 by default for socket types that don't track this.
+    fn recv_bytes_available(&self) -> usize {
+        0
+    }
+
     /// # `accept`
     /// 接受连接，仅用于listening stream socket
     /// ## Block
     /// 如果没有连接到来，会阻塞
     fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
-        Err(SystemError::ENOSYS)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     /// # `bind`
@@ -96,7 +104,7 @@ pub trait Socket: PollableInode + IndexNode {
     /// # `listen`
     /// 监听socket，仅用于stream socket
     fn listen(&self, _backlog: usize) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     // poll

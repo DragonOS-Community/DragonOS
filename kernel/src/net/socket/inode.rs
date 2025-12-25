@@ -17,6 +17,7 @@ use super::Socket;
 
 // Socket ioctl commands
 const SIOCGIFCONF: u32 = 0x8912; // Get interface list
+const FIONREAD: u32 = 0x541B; // Get number of bytes available to read
 
 // Constants for network interface structures
 const IFNAMSIZ: usize = 16;
@@ -269,6 +270,9 @@ impl<T: Socket + 'static> IndexNode for T {
         buf: &[u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        if buf.len() == 0 {
+            log::info!("Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}", buf.len(), _len);
+        }
         drop(data);
         self.write(buf)
     }
@@ -309,7 +313,22 @@ impl<T: Socket + 'static> IndexNode for T {
     ) -> Result<usize, SystemError> {
         match cmd {
             SIOCGIFCONF => handle_siocgifconf(data),
-            _ => Socket::ioctl(self, cmd, data, private_data),
+            FIONREAD => {
+                // Get number of bytes available to read
+                let bytes_available = self.recv_bytes_available();
+                unsafe {
+                    let ptr = data as *mut i32;
+                    if ptr.is_null() {
+                        return Err(SystemError::EINVAL);
+                    }
+                    *ptr = bytes_available as i32;
+                }
+                Ok(0)
+            }
+            _ => {
+                log::warn!("Socket ioctl: unsupported command {:#x}", cmd);
+                Err(SystemError::ENOIOCTLCMD)
+            }
         }
     }
 

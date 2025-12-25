@@ -875,6 +875,10 @@ impl File {
         update_offset: bool,
         force_append: bool,
     ) -> Result<usize, SystemError> {
+        if len == 0 {
+            log::info!("File do_write: ZERO-LENGTH write requested, len={}, buf.len()={}", len, buf.len());
+        }
+
         self.writeable()?;
 
         let inode_flags = self.get_inode_flags()?;

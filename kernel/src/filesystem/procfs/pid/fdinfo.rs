@@ -107,16 +107,23 @@ impl DirOps for FdInfoDirOps {
 #[derive(Debug)]
 pub struct FdInfoFileOps {
     /// 存储 PID，在需要时动态查找进程
-    pid: RawPid,
-    fd: i32,
+    // pid: RawPid,
+    // fd: i32,
+    // 暂时不用参数
+    phantom: core::marker::PhantomData<()>,
 }
 
 impl FdInfoFileOps {
-    pub fn new_inode(pid: RawPid, fd: i32, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { pid, fd }, InodeMode::S_IRUGO)
-            .parent(parent)
-            .build()
-            .unwrap()
+    pub fn new_inode(_pid: RawPid, _fd: i32, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(
+            Self {
+                phantom: core::marker::PhantomData,
+            },
+            InodeMode::S_IRUGO,
+        )
+        .parent(parent)
+        .build()
+        .unwrap()
     }
 }
 

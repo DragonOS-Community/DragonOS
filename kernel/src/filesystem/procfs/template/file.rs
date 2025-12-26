@@ -1,7 +1,7 @@
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
-        procfs::template::Common,
+        procfs::{template::Common, ProcfsFilePrivateData},
         vfs::{
             file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
             IndexNode, InodeFlags, InodeMode, Metadata,
@@ -147,10 +147,12 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        mut data: SpinLockGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        return Ok(());
+        // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
+        *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
+        Ok(())
     }
 
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {

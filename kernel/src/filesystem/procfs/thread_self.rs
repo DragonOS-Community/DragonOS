@@ -6,8 +6,12 @@
 use crate::{
     filesystem::{
         procfs::template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
-        vfs::{IndexNode, InodeMode},
+        vfs::{
+            file::{FilePrivateData, NamespaceFilePrivateData},
+            IndexNode, InodeId, InodeMode,
+        },
     },
+    libs::spinlock::SpinLockGuard,
     process::{
         namespace::{nsproxy::NamespaceId, NamespaceOps},
         ProcessManager,
@@ -235,5 +239,47 @@ impl SymOps for ThreadSelfNsSymOps {
         let len = target.len().min(buf.len());
         buf[..len].copy_from_slice(&target.as_bytes()[..len]);
         Ok(len)
+    }
+
+    fn is_self_reference(&self) -> bool {
+        // 命名空间符号链接是自引用的魔法链接
+        true
+    }
+
+    fn dynamic_inode_id(&self) -> Option<InodeId> {
+        // 命名空间文件的 inode ID 应该是命名空间的 ID
+        // 这样 stat() 返回的 st_ino 就是命名空间 ID
+        Some(InodeId::new(current_thread_self_ns_ino(self.ns_type)))
+    }
+
+    fn open(&self, data: &mut SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+        // 当打开命名空间文件时，设置命名空间私有数据
+        // 这使得 setns() 可以使用这个 fd
+        let pcb = ProcessManager::current_pcb();
+        let nsproxy = pcb.nsproxy();
+
+        let ns_data = match self.ns_type {
+            ThreadSelfNsFileType::Ipc => NamespaceFilePrivateData::Ipc(nsproxy.ipc_ns.clone()),
+            ThreadSelfNsFileType::Uts => NamespaceFilePrivateData::Uts(nsproxy.uts_ns.clone()),
+            ThreadSelfNsFileType::Mnt => NamespaceFilePrivateData::Mnt(nsproxy.mnt_ns.clone()),
+            ThreadSelfNsFileType::Net => NamespaceFilePrivateData::Net(nsproxy.net_ns.clone()),
+            ThreadSelfNsFileType::Pid => NamespaceFilePrivateData::Pid(pcb.active_pid_ns()),
+            ThreadSelfNsFileType::PidForChildren => {
+                NamespaceFilePrivateData::PidForChildren(nsproxy.pid_ns_for_children.clone())
+            }
+            ThreadSelfNsFileType::Time | ThreadSelfNsFileType::TimeForChildren => {
+                // Time namespace 尚未实现
+                return Err(SystemError::ENOSYS);
+            }
+            ThreadSelfNsFileType::User => {
+                NamespaceFilePrivateData::User(pcb.cred().user_ns.clone())
+            }
+            ThreadSelfNsFileType::Cgroup => {
+                NamespaceFilePrivateData::Cgroup(nsproxy.cgroup_ns.clone())
+            }
+        };
+
+        **data = FilePrivateData::Namespace(ns_data);
+        Ok(())
     }
 }

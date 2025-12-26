@@ -55,8 +55,10 @@ impl FileOps for CmdlineFileOps {
             cmdline_bytes
         };
 
-        if !content.ends_with(b"\n") {
-            content.push(b'\n');
+        // Linux 的 /proc/self/cmdline 格式是: arg0\0arg1\0arg2\0
+        // 必须以 \0 结尾（而不是 \n）
+        if !content.ends_with(b"\0") {
+            content.push(0);
         }
 
         proc_read(offset, len, buf, &content)

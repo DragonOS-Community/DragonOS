@@ -183,7 +183,7 @@ impl<S: SymOps> ProcSymBuilder<S> {
 
 impl<S> Builder<S> for ProcSymBuilder<S>
 where
-    S: SymOps,
+    S: SymOps + 'static,
 {
     type Output = ProcSym<S>;
 

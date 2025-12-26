@@ -5,7 +5,7 @@
 use crate::{
     filesystem::{
         procfs::template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
-        vfs::{IndexNode, InodeMode},
+        vfs::{IndexNode, InodeMode, SpecialNodeData},
     },
     process::{ProcessControlBlock, ProcessManager, RawPid},
 };
@@ -142,14 +142,34 @@ impl SymOps for FdSymOps {
                 .ok_or(SystemError::EBADF)?
         }; // fd_table 锁在这里被释放
 
+        // 获取进程的 chroot 根路径
+        let root_prefix = process
+            .fs_struct()
+            .root()
+            .absolute_path()
+            .unwrap_or_default();
+
         // 现在安全地获取文件的路径
-        let path = if let Ok(path) = file.inode().absolute_path() {
-            path
+        let mut path = if let Ok(p) = file.inode().absolute_path() {
+            p
         } else {
             // 匿名文件或无法获取路径
             let inode_id = file.inode().metadata()?.inode_id;
             format!("anon_inode:[{}]", inode_id)
         };
+
+        // 尊重进程的 chroot：去掉根目录前缀
+        if !root_prefix.is_empty() && root_prefix != "/" {
+            if let Some(rest) = path.strip_prefix(&root_prefix) {
+                path = if rest.is_empty() {
+                    "/".to_string()
+                } else if rest.starts_with('/') {
+                    rest.to_string()
+                } else {
+                    format!("/{}", rest)
+                };
+            }
+        }
 
         // 复制路径到缓冲区
         let path_bytes = path.as_bytes();
@@ -157,5 +177,20 @@ impl SymOps for FdSymOps {
         buf[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
 
         Ok(copy_len)
+    }
+
+    fn special_node(&self) -> Option<SpecialNodeData> {
+        // 动态查找进程
+        let process = ProcessManager::find(self.pid)?;
+
+        // 获取文件对象
+        let file = {
+            let fd_table = process.fd_table();
+            let fd_table_guard = fd_table.read();
+            fd_table_guard.get_file_by_fd(self.fd)?
+        };
+
+        // 返回文件的 inode 引用，使得 fstatat 等操作可以通过魔法链接工作
+        Some(SpecialNodeData::Reference(file.inode()))
     }
 }

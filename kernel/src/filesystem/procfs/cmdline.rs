@@ -33,8 +33,6 @@ impl CmdlineFileOps {
     }
 
     fn generate_cmdline_content() -> Vec<u8> {
-        // TODO: 从 bootloader 获取实际的 cmdline
-        // 目前返回一个占位符
         let mut cmdline = boot_params()
             .read()
             .boot_cmdline_str()

@@ -164,12 +164,12 @@ impl Connected {
         Ok(())
     }
 
-    pub(super) fn resize_sendbuf(&self, new_capacity: usize) {
-        self.writer.lock().resize(new_capacity);
+    pub(super) fn resize_sendbuf(&self, new_capacity: usize) -> Result<(), SystemError> {
+        self.writer.lock().resize(new_capacity)
     }
 
-    pub(super) fn resize_recvbuf(&self, new_capacity: usize) {
-        self.reader.lock().resize(new_capacity);
+    pub(super) fn resize_recvbuf(&self, new_capacity: usize) -> Result<(), SystemError> {
+        self.reader.lock().resize(new_capacity)
     }
 
     pub(super) fn send_free_len(&self) -> usize {

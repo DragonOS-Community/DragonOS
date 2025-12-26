@@ -10,6 +10,7 @@ use core::num::Wrapping;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use inherit_methods_macro::inherit_methods;
+use system_error::SystemError;
 
 use super::UCred;
 
@@ -167,25 +168,28 @@ impl<T: Pod> RingBuffer<T> {
     ///
     /// Safety/concurrency: protected by the internal buffer write lock; readers/writers
     /// take the buffer lock for accessing the backing storage.
-    pub fn resize(&self, new_capacity: usize) {
-        assert!(
-            new_capacity.is_power_of_two(),
-            "capacity must be a power of two"
-        );
+    ///
+    /// # Errors
+    ///
+    /// Returns `SystemError::EINVAL` if `new_capacity` is not a power of two.
+    /// Returns `SystemError::ENOBUFS` if `new_capacity` is too small for existing data.
+    pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {
+        if !new_capacity.is_power_of_two() {
+            return Err(SystemError::EINVAL);
+        }
 
         let mut guard = self.buffer.write();
         let old_capacity = guard.len();
         if new_capacity == old_capacity {
-            return;
+            return Ok(());
         }
 
         let head = self.head();
         let tail = self.tail();
         let len = (tail - head).0;
-        assert!(
-            len <= new_capacity,
-            "new capacity too small for existing data"
-        );
+        if len > new_capacity {
+            return Err(SystemError::ENOBUFS);
+        }
 
         let old = core::mem::take(&mut *guard);
         let mut new_buf = Vec::with_capacity(new_capacity);
@@ -199,6 +203,7 @@ impl<T: Pod> RingBuffer<T> {
         }
 
         *guard = new_buf;
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -358,7 +363,7 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         self.ring_buffer.push_scm_at(offset, cred, rights)
     }
 
-    pub fn resize(&self, new_capacity: usize) {
+    pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {
         self.ring_buffer.resize(new_capacity)
     }
 }
@@ -529,7 +534,7 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         self.ring_buffer.next_scm_offset_after(offset)
     }
 
-    pub fn resize(&self, new_capacity: usize) {
+    pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {
         self.ring_buffer.resize(new_capacity)
     }
 }

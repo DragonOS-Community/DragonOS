@@ -548,7 +548,7 @@ impl Socket for UnixStreamSocket {
                 new_cap = core::cmp::max(new_cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
 
                 if let Some(Inner::Connected(connected)) = self.inner.read().as_ref() {
-                    connected.resize_sendbuf(new_cap);
+                    connected.resize_sendbuf(new_cap)?;
                 }
                 Ok(())
             }
@@ -561,7 +561,7 @@ impl Socket for UnixStreamSocket {
                 new_cap = core::cmp::max(new_cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
 
                 if let Some(Inner::Connected(connected)) = self.inner.read().as_ref() {
-                    connected.resize_recvbuf(new_cap);
+                    connected.resize_recvbuf(new_cap)?;
                 }
                 Ok(())
             }

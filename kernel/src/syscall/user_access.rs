@@ -642,7 +642,10 @@ impl<'a> UserBufferWriter<'a> {
         offset: usize,
     ) -> Result<usize, SystemError> {
         let dst = Self::convert_with_offset(self.buffer, offset)?;
-        dst.copy_from_slice(src);
+        if dst.len() < src.len() {
+            return Err(SystemError::EINVAL);
+        }
+        dst[..src.len()].copy_from_slice(src);
         return Ok(src.len());
     }
 
@@ -666,7 +669,10 @@ impl<'a> UserBufferWriter<'a> {
         offset: usize,
     ) -> Result<usize, SystemError> {
         let dst = Self::convert_with_offset_checked(self.buffer, offset)?;
-        dst.copy_from_slice(src);
+        if dst.len() < src.len() {
+            return Err(SystemError::EINVAL);
+        }
+        dst[..src.len()].copy_from_slice(src);
         return Ok(src.len());
     }
 
@@ -774,12 +780,12 @@ impl<'a> UserBufferWriter<'a> {
             return Err(SystemError::EINVAL);
         }
 
-        let chunks = unsafe {
-            from_raw_parts_mut(
-                byte_buffer.as_mut_ptr() as *mut T,
-                byte_buffer.len() / core::mem::size_of::<T>(),
-            )
-        };
+        let len = byte_buffer.len() / core::mem::size_of::<T>();
+        if len == 0 {
+            return Ok(&mut []);
+        }
+
+        let chunks = unsafe { from_raw_parts_mut(byte_buffer.as_mut_ptr() as *mut T, len) };
         return Ok(chunks);
     }
 

@@ -106,3 +106,4 @@ timers_test
 clock_nanosleep_test
 clock_getres_test
 clock_gettime_test
+setgid_test

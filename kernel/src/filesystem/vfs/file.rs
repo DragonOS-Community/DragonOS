@@ -31,7 +31,7 @@ use crate::{
         MemoryManagementArch,
     },
     process::{
-        cred::Cred,
+        cred::{CAPFlags, Cred, Kgid},
         namespace::{
             cgroup_namespace::CgroupNamespace, ipc_namespace::IpcNamespace, mnt::MntNamespace,
             net_namespace::NetNamespace, pid_namespace::PidNamespace,
@@ -41,6 +41,8 @@ use crate::{
         ProcessControlBlock, ProcessManager, RawPid,
     },
 };
+
+use crate::filesystem::vfs::InodeMode;
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
 
@@ -401,6 +403,57 @@ pub struct File {
 }
 
 impl File {
+    fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
+        // 仅对普通文件生效。
+        if self.file_type != FileType::File {
+            return Ok(());
+        }
+
+        // Linux 语义：若调用者具备 CAP_FSETID，则写/截断不会清除 suid/sgid。
+        let cred = ProcessManager::current_pcb().cred();
+        if cred.has_capability(CAPFlags::CAP_FSETID) {
+            return Ok(());
+        }
+
+        let mut md = self.inode.metadata()?;
+        if !md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID) {
+            return Ok(());
+        }
+
+        // suid always must be killed on write/truncate when no CAP_FSETID.
+        md.mode.remove(InodeMode::S_ISUID);
+
+        // setgid 清理规则与 Linux fs/attr.c:setattr_should_drop_sgid 对齐：
+        // - 若 S_IXGRP 置位：无条件清除（这是“真正的”SGID 可执行文件）
+        // - 否则（mandatory locking 语义）：仅当调用者不在文件所属组时清除
+        if md.mode.contains(InodeMode::S_ISGID) {
+            let mut kill_sgid = false;
+            if md.mode.contains(InodeMode::S_IXGRP) {
+                kill_sgid = true;
+            } else {
+                let gid = md.gid;
+                let kgid = Kgid::from(gid);
+                let mut in_group = cred.fsgid.data() == gid
+                    || cred.gid.data() == gid
+                    || cred.egid.data() == gid
+                    || cred.getgroups().contains(&kgid);
+                if let Some(info) = cred.group_info.as_ref() {
+                    in_group |= info.gids.contains(&kgid);
+                }
+                if !in_group {
+                    kill_sgid = true;
+                }
+            }
+
+            if kill_sgid {
+                md.mode.remove(InodeMode::S_ISGID);
+            }
+        }
+
+        self.inode.set_metadata(&md)?;
+        Ok(())
+    }
+
     #[inline(never)]
     fn limit_write_len_by_fsize(
         &self,
@@ -466,6 +519,10 @@ impl File {
         let written_len =
             self.inode
                 .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
+
+        if written_len > 0 {
+            self.maybe_kill_suid_sgid_after_write()?;
+        }
 
         if config.update_offset {
             match config.offset_update {

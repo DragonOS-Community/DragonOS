@@ -33,14 +33,6 @@ nix develop ./tools/nix-dev-shell
 
 ## 编译内核
 
-做一些 dirty 的修复（TODO: 兼容性改进 or 不再使用 Makefile 构建）
-
-```shell
-grep -rlZ '+nightly-2025-08-10' ./build-scripts | xargs -0 sed -i 's/+nightly-2025-08-10//g'
-grep -rlZ '+nightly-2025-08-10' ./kernel | xargs -0 sed -i 's/+nightly-2025-08-10//g'
-sed -i 's/CCPREFIX=x86_64-linux-gnu-/CCPREFIX=/g' kernel/env.mk
-```
-
 执行编译
 
 ```shell
@@ -74,4 +66,4 @@ nix run .#start.x86_64
 - `cd docs && nix run` 构建文档并启动一个 http 服务器
 - 如果存储空间告急，`nix store gc` 清理悬空的历史构建副本
 - 项目根目录下 `nix flake show` 查看可供构建的目标
-- 更多
+- 更多 nix 相关的用户空间构建详见 Userland 部分

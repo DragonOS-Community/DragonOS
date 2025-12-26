@@ -486,6 +486,75 @@ impl UnixStreamSocket {
             _ => false,
         }
     }
+
+    fn send_with_timeout(
+        &self,
+        buffer: &[u8],
+        flags: socket::PMSG,
+    ) -> Result<(usize, Wrapping<usize>, usize), SystemError> {
+        // Linux: zero-length send on stream sockets succeeds immediately.
+        if !self.is_seqpacket && buffer.is_empty() {
+            return Ok((0, Wrapping(0), 0));
+        }
+
+        let nonblock = self.is_nonblocking() || flags.contains(socket::PMSG::DONTWAIT);
+
+        if self.is_seqpacket {
+            // For SOCK_SEQPACKET, reject messages larger than SO_SNDBUF.
+            // Account for our internal 4-byte record header.
+            let needed = buffer.len().saturating_add(core::mem::size_of::<u32>());
+            if needed > self.sndbuf.load(Ordering::Relaxed) {
+                return Err(SystemError::EMSGSIZE);
+            }
+        }
+
+        let deadline = self.send_timeout().map(|t| Instant::now() + t);
+        loop {
+            match self.try_send_with_meta(buffer) {
+                Ok(v) => return Ok(v),
+                Err(SystemError::ENOBUFS) if nonblock => {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                }
+                Err(SystemError::ENOBUFS) => {
+                    let timeout = deadline
+                        .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
+                    self.wait_event_interruptible_timeout(
+                        || match self
+                            .inner
+                            .read()
+                            .as_ref()
+                            .expect("UnixStreamSocket inner is None")
+                        {
+                            Inner::Connected(connected) => {
+                                // Must match Connected::try_send(): it requires the *entire*
+                                // payload (plus seqpacket header) to fit.
+                                let need = if self.is_seqpacket {
+                                    buffer.len() + core::mem::size_of::<u32>()
+                                } else {
+                                    buffer.len()
+                                };
+
+                                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
+                                let queued = connected.outq_len(self.is_seqpacket);
+                                connected.send_free_len() >= need
+                                    && queued.saturating_add(need) <= sndbuf
+                            }
+                            _ => true,
+                        },
+                        timeout,
+                    )?;
+
+                    if let Some(d) = deadline {
+                        if Instant::now() >= d {
+                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                        }
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 impl Socket for UnixStreamSocket {
@@ -1032,62 +1101,7 @@ impl Socket for UnixStreamSocket {
     }
 
     fn send(&self, buffer: &[u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
-        let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
-
-        if self.is_seqpacket {
-            // For SOCK_SEQPACKET, reject messages larger than SO_SNDBUF.
-            // Account for our internal 4-byte record header.
-            let needed = buffer.len().saturating_add(core::mem::size_of::<u32>());
-            if needed > self.sndbuf.load(Ordering::Relaxed) {
-                return Err(SystemError::EMSGSIZE);
-            }
-        }
-
-        let deadline = self.send_timeout().map(|t| Instant::now() + t);
-
-        let result = loop {
-            match self.try_send_with_meta(buffer) {
-                Ok(v) => break Ok(v),
-                Err(SystemError::ENOBUFS) if nonblock => {
-                    break Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                }
-                Err(SystemError::ENOBUFS) => {
-                    let timeout = deadline
-                        .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
-                    self.wait_event_interruptible_timeout(
-                        || match self
-                            .inner
-                            .read()
-                            .as_ref()
-                            .expect("UnixStreamSocket inner is None")
-                        {
-                            Inner::Connected(connected) => {
-                                let need = if self.is_seqpacket {
-                                    buffer.len() + core::mem::size_of::<u32>()
-                                } else {
-                                    buffer.len().max(1)
-                                };
-
-                                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
-                                let queued = connected.outq_len(self.is_seqpacket);
-                                connected.send_free_len() >= need
-                                    && queued.saturating_add(need) <= sndbuf
-                            }
-                            _ => true,
-                        },
-                        timeout,
-                    )?;
-
-                    if let Some(d) = deadline {
-                        if Instant::now() >= d {
-                            break Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                        }
-                    }
-                    continue;
-                }
-                Err(e) => break Err(e),
-            }
-        };
+        let result = self.send_with_timeout(buffer, _flags);
 
         // Auto-attach SCM_CREDENTIALS when SO_PASSCRED is enabled on either endpoint.
         if let Ok((sent, start, _written_len)) = result {
@@ -1152,14 +1166,7 @@ impl Socket for UnixStreamSocket {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
         let buf = iovs.gather()?;
 
-        if self.is_seqpacket {
-            // For SOCK_SEQPACKET, the whole message must fit in SO_SNDBUF.
-            // gVisor expects EMSGSIZE (not ENOBUFS) when the message itself is too large.
-            let needed = buf.len().saturating_add(core::mem::size_of::<u32>());
-            if needed > self.sndbuf.load(Ordering::Relaxed) {
-                return Err(SystemError::EMSGSIZE);
-            }
-        }
+        // Send/timeout semantics must match send(2), including EMSGSIZE checks.
 
         // Parse SCM_RIGHTS / SCM_CREDENTIALS from msg_control (if present).
         let mut rights_files: alloc::vec::Vec<
@@ -1218,7 +1225,7 @@ impl Socket for UnixStreamSocket {
         }
 
         // Send payload first; ancillary data is associated with the bytes sent.
-        let (sent, start, _written_len) = self.try_send_with_meta(&buf)?;
+        let (sent, start, _written_len) = self.send_with_timeout(&buf, _flags)?;
 
         // Notify peer on successful write.
         if sent > 0 {
@@ -1277,10 +1284,35 @@ impl Socket for UnixStreamSocket {
         flags: socket::PMSG,
         _address: Endpoint,
     ) -> Result<usize, SystemError> {
-        // Linux: sendto() on an already-connected stream/seqpacket socket with a
-        // destination address fails with EISCONN (as exercised by gVisor tests).
-        let _ = buffer;
-        let _ = flags;
+        // Linux AF_UNIX semantics (as exercised by gVisor):
+        // - SOCK_STREAM: sendto() with a destination address on a connected socket -> EISCONN.
+        //               sendto() on an unconnected socket -> EOPNOTSUPP (address is ignored).
+        // - SOCK_SEQPACKET: sendto() ignores the destination address entirely.
+        //                  Connected -> behaves like send(2).
+        //                  Unconnected -> ENOTCONN.
+        let connected = matches!(
+            self.inner
+                .read()
+                .as_ref()
+                .expect("UnixStreamSocket inner is None"),
+            Inner::Connected(_)
+        );
+
+        if !connected {
+            return Err(if self.is_seqpacket {
+                SystemError::ENOTCONN
+            } else {
+                SystemError::EOPNOTSUPP_OR_ENOTSUP
+            });
+        }
+
+        if self.is_seqpacket {
+            // Ignore destination address.
+            return self.send(buffer, flags);
+        }
+
+        // Connected stream socket with a destination address.
+        let _ = _address;
         Err(SystemError::EISCONN)
     }
 

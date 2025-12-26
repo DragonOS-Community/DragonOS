@@ -27,7 +27,7 @@ use system_error::SystemError;
 
 /// 命名空间文件类型
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThreadSelfNsFileType {
+pub enum NsFileType {
     Ipc,
     Uts,
     Mnt,
@@ -40,7 +40,7 @@ pub enum ThreadSelfNsFileType {
     Cgroup,
 }
 
-impl ThreadSelfNsFileType {
+impl NsFileType {
     /// 所有命名空间类型名称
     pub const ALL_NAMES: [&'static str; 10] = [
         "ipc",
@@ -58,58 +58,58 @@ impl ThreadSelfNsFileType {
     /// 获取命名空间类型名称
     pub const fn name(&self) -> &'static str {
         match self {
-            ThreadSelfNsFileType::Ipc => "ipc",
-            ThreadSelfNsFileType::Uts => "uts",
-            ThreadSelfNsFileType::Mnt => "mnt",
-            ThreadSelfNsFileType::Net => "net",
-            ThreadSelfNsFileType::Pid => "pid",
-            ThreadSelfNsFileType::PidForChildren => "pid_for_children",
-            ThreadSelfNsFileType::Time => "time",
-            ThreadSelfNsFileType::TimeForChildren => "time_for_children",
-            ThreadSelfNsFileType::User => "user",
-            ThreadSelfNsFileType::Cgroup => "cgroup",
+            NsFileType::Ipc => "ipc",
+            NsFileType::Uts => "uts",
+            NsFileType::Mnt => "mnt",
+            NsFileType::Net => "net",
+            NsFileType::Pid => "pid",
+            NsFileType::PidForChildren => "pid_for_children",
+            NsFileType::Time => "time",
+            NsFileType::TimeForChildren => "time_for_children",
+            NsFileType::User => "user",
+            NsFileType::Cgroup => "cgroup",
         }
     }
 }
 
-impl TryFrom<&str> for ThreadSelfNsFileType {
+impl TryFrom<&str> for NsFileType {
     type Error = SystemError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
-            "ipc" => Ok(ThreadSelfNsFileType::Ipc),
-            "uts" => Ok(ThreadSelfNsFileType::Uts),
-            "mnt" => Ok(ThreadSelfNsFileType::Mnt),
-            "net" => Ok(ThreadSelfNsFileType::Net),
-            "pid" => Ok(ThreadSelfNsFileType::Pid),
-            "pid_for_children" => Ok(ThreadSelfNsFileType::PidForChildren),
-            "time" => Ok(ThreadSelfNsFileType::Time),
-            "time_for_children" => Ok(ThreadSelfNsFileType::TimeForChildren),
-            "user" => Ok(ThreadSelfNsFileType::User),
-            "cgroup" => Ok(ThreadSelfNsFileType::Cgroup),
+            "ipc" => Ok(NsFileType::Ipc),
+            "uts" => Ok(NsFileType::Uts),
+            "mnt" => Ok(NsFileType::Mnt),
+            "net" => Ok(NsFileType::Net),
+            "pid" => Ok(NsFileType::Pid),
+            "pid_for_children" => Ok(NsFileType::PidForChildren),
+            "time" => Ok(NsFileType::Time),
+            "time_for_children" => Ok(NsFileType::TimeForChildren),
+            "user" => Ok(NsFileType::User),
+            "cgroup" => Ok(NsFileType::Cgroup),
             _ => Err(SystemError::ENOENT),
         }
     }
 }
 
 /// 获取当前线程的命名空间 ID
-fn current_thread_self_ns_ino(ns_type: ThreadSelfNsFileType) -> usize {
+fn current_thread_self_ns_ino(ns_type: NsFileType) -> usize {
     let pcb = ProcessManager::current_pcb();
     let nsproxy = pcb.nsproxy();
 
     let ino: NamespaceId = match ns_type {
-        ThreadSelfNsFileType::Ipc => nsproxy.ipc_ns.ns_common().nsid,
-        ThreadSelfNsFileType::Uts => nsproxy.uts_ns.ns_common().nsid,
-        ThreadSelfNsFileType::Mnt => nsproxy.mnt_ns.ns_common().nsid,
-        ThreadSelfNsFileType::Net => nsproxy.net_ns.ns_common().nsid,
-        ThreadSelfNsFileType::Pid => pcb.active_pid_ns().ns_common().nsid,
-        ThreadSelfNsFileType::PidForChildren => nsproxy.pid_ns_for_children.ns_common().nsid,
-        ThreadSelfNsFileType::Time | ThreadSelfNsFileType::TimeForChildren => {
+        NsFileType::Ipc => nsproxy.ipc_ns.ns_common().nsid,
+        NsFileType::Uts => nsproxy.uts_ns.ns_common().nsid,
+        NsFileType::Mnt => nsproxy.mnt_ns.ns_common().nsid,
+        NsFileType::Net => nsproxy.net_ns.ns_common().nsid,
+        NsFileType::Pid => pcb.active_pid_ns().ns_common().nsid,
+        NsFileType::PidForChildren => nsproxy.pid_ns_for_children.ns_common().nsid,
+        NsFileType::Time | NsFileType::TimeForChildren => {
             // Time namespace 尚未实现
             NamespaceId::new(0)
         }
-        ThreadSelfNsFileType::User => pcb.cred().user_ns.ns_common().nsid,
-        ThreadSelfNsFileType::Cgroup => nsproxy.cgroup_ns.ns_common().nsid,
+        NsFileType::User => pcb.cred().user_ns.ns_common().nsid,
+        NsFileType::Cgroup => nsproxy.cgroup_ns.ns_common().nsid,
     };
 
     ino.data()
@@ -184,7 +184,7 @@ impl DirOps for ThreadSelfNsDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 解析命名空间类型
-        let ns_type = ThreadSelfNsFileType::try_from(name)?;
+        let ns_type = NsFileType::try_from(name)?;
 
         let mut cached_children = dir.cached_children().write();
         if let Some(child) = cached_children.get(name) {
@@ -200,8 +200,8 @@ impl DirOps for ThreadSelfNsDirOps {
     fn populate_children(&self, dir: &ProcDir<Self>) {
         let mut cached_children = dir.cached_children().write();
 
-        for name in ThreadSelfNsFileType::ALL_NAMES {
-            if let Ok(ns_type) = ThreadSelfNsFileType::try_from(name) {
+        for name in NsFileType::ALL_NAMES {
+            if let Ok(ns_type) = NsFileType::try_from(name) {
                 cached_children.entry(name.to_string()).or_insert_with(|| {
                     ThreadSelfNsSymOps::new_inode(ns_type, dir.self_ref_weak().clone())
                 });
@@ -217,14 +217,11 @@ impl DirOps for ThreadSelfNsDirOps {
 /// /proc/thread-self/ns/[type] 符号链接的 SymOps 实现
 #[derive(Debug)]
 pub struct ThreadSelfNsSymOps {
-    ns_type: ThreadSelfNsFileType,
+    ns_type: NsFileType,
 }
 
 impl ThreadSelfNsSymOps {
-    pub fn new_inode(
-        ns_type: ThreadSelfNsFileType,
-        parent: Weak<dyn IndexNode>,
-    ) -> Arc<dyn IndexNode> {
+    pub fn new_inode(ns_type: NsFileType, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
         ProcSymBuilder::new(Self { ns_type }, InodeMode::S_IRWXUGO)
             .parent(parent)
             .build()
@@ -259,24 +256,20 @@ impl SymOps for ThreadSelfNsSymOps {
         let nsproxy = pcb.nsproxy();
 
         let ns_data = match self.ns_type {
-            ThreadSelfNsFileType::Ipc => NamespaceFilePrivateData::Ipc(nsproxy.ipc_ns.clone()),
-            ThreadSelfNsFileType::Uts => NamespaceFilePrivateData::Uts(nsproxy.uts_ns.clone()),
-            ThreadSelfNsFileType::Mnt => NamespaceFilePrivateData::Mnt(nsproxy.mnt_ns.clone()),
-            ThreadSelfNsFileType::Net => NamespaceFilePrivateData::Net(nsproxy.net_ns.clone()),
-            ThreadSelfNsFileType::Pid => NamespaceFilePrivateData::Pid(pcb.active_pid_ns()),
-            ThreadSelfNsFileType::PidForChildren => {
+            NsFileType::Ipc => NamespaceFilePrivateData::Ipc(nsproxy.ipc_ns.clone()),
+            NsFileType::Uts => NamespaceFilePrivateData::Uts(nsproxy.uts_ns.clone()),
+            NsFileType::Mnt => NamespaceFilePrivateData::Mnt(nsproxy.mnt_ns.clone()),
+            NsFileType::Net => NamespaceFilePrivateData::Net(nsproxy.net_ns.clone()),
+            NsFileType::Pid => NamespaceFilePrivateData::Pid(pcb.active_pid_ns()),
+            NsFileType::PidForChildren => {
                 NamespaceFilePrivateData::PidForChildren(nsproxy.pid_ns_for_children.clone())
             }
-            ThreadSelfNsFileType::Time | ThreadSelfNsFileType::TimeForChildren => {
+            NsFileType::Time | NsFileType::TimeForChildren => {
                 // Time namespace 尚未实现
                 return Err(SystemError::ENOSYS);
             }
-            ThreadSelfNsFileType::User => {
-                NamespaceFilePrivateData::User(pcb.cred().user_ns.clone())
-            }
-            ThreadSelfNsFileType::Cgroup => {
-                NamespaceFilePrivateData::Cgroup(nsproxy.cgroup_ns.clone())
-            }
+            NsFileType::User => NamespaceFilePrivateData::User(pcb.cred().user_ns.clone()),
+            NsFileType::Cgroup => NamespaceFilePrivateData::Cgroup(nsproxy.cgroup_ns.clone()),
         };
 
         **data = FilePrivateData::Namespace(ns_data);

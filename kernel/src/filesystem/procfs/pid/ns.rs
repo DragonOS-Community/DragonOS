@@ -4,7 +4,10 @@
 
 use crate::{
     filesystem::{
-        procfs::template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
+        procfs::{
+            template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
+            thread_self::NsFileType,
+        },
         vfs::{
             file::{FilePrivateData, NamespaceFilePrivateData},
             IndexNode, InodeId, InodeMode,
@@ -23,73 +26,6 @@ use alloc::{
 };
 use core::convert::TryFrom;
 use system_error::SystemError;
-
-/// 命名空间文件类型
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NsFileType {
-    Ipc,
-    Uts,
-    Mnt,
-    Net,
-    Pid,
-    PidForChildren,
-    Time,
-    TimeForChildren,
-    User,
-    Cgroup,
-}
-
-impl NsFileType {
-    /// 所有命名空间类型名称
-    pub const ALL_NAMES: [&'static str; 10] = [
-        "ipc",
-        "uts",
-        "mnt",
-        "net",
-        "pid",
-        "pid_for_children",
-        "time",
-        "time_for_children",
-        "user",
-        "cgroup",
-    ];
-
-    /// 获取命名空间类型名称
-    pub const fn name(&self) -> &'static str {
-        match self {
-            NsFileType::Ipc => "ipc",
-            NsFileType::Uts => "uts",
-            NsFileType::Mnt => "mnt",
-            NsFileType::Net => "net",
-            NsFileType::Pid => "pid",
-            NsFileType::PidForChildren => "pid_for_children",
-            NsFileType::Time => "time",
-            NsFileType::TimeForChildren => "time_for_children",
-            NsFileType::User => "user",
-            NsFileType::Cgroup => "cgroup",
-        }
-    }
-}
-
-impl TryFrom<&str> for NsFileType {
-    type Error = SystemError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "ipc" => Ok(NsFileType::Ipc),
-            "uts" => Ok(NsFileType::Uts),
-            "mnt" => Ok(NsFileType::Mnt),
-            "net" => Ok(NsFileType::Net),
-            "pid" => Ok(NsFileType::Pid),
-            "pid_for_children" => Ok(NsFileType::PidForChildren),
-            "time" => Ok(NsFileType::Time),
-            "time_for_children" => Ok(NsFileType::TimeForChildren),
-            "user" => Ok(NsFileType::User),
-            "cgroup" => Ok(NsFileType::Cgroup),
-            _ => Err(SystemError::ENOENT),
-        }
-    }
-}
 
 /// 获取指定进程的命名空间 ID
 fn get_pid_ns_ino(pid: RawPid, ns_type: NsFileType) -> Result<usize, SystemError> {

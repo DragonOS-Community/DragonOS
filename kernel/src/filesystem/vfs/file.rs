@@ -8,7 +8,8 @@ use log::error;
 use system_error::SystemError;
 
 use super::{
-    append_lock::with_inode_append_lock, FileType, IndexNode, InodeId, Metadata, SpecialNodeData,
+    append_lock::with_inode_append_lock, utils::should_remove_sgid, FileType, IndexNode, InodeId,
+    Metadata, SpecialNodeData,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -31,7 +32,7 @@ use crate::{
         MemoryManagementArch,
     },
     process::{
-        cred::{CAPFlags, Cred, Kgid},
+        cred::{CAPFlags, Cred},
         namespace::{
             cgroup_namespace::CgroupNamespace, ipc_namespace::IpcNamespace, mnt::MntNamespace,
             net_namespace::NetNamespace, pid_namespace::PidNamespace,
@@ -424,30 +425,10 @@ impl File {
         md.mode.remove(InodeMode::S_ISUID);
 
         // setgid 清理规则与 Linux fs/attr.c:setattr_should_drop_sgid 对齐：
-        // - 若 S_IXGRP 置位：无条件清除（这是“真正的”SGID 可执行文件）
+        // - 若 S_IXGRP 置位：无条件清除（这是"真正的"SGID 可执行文件）
         // - 否则（mandatory locking 语义）：仅当调用者不在文件所属组时清除
-        if md.mode.contains(InodeMode::S_ISGID) {
-            let mut kill_sgid = false;
-            if md.mode.contains(InodeMode::S_IXGRP) {
-                kill_sgid = true;
-            } else {
-                let gid = md.gid;
-                let kgid = Kgid::from(gid);
-                let mut in_group = cred.fsgid.data() == gid
-                    || cred.gid.data() == gid
-                    || cred.egid.data() == gid
-                    || cred.getgroups().contains(&kgid);
-                if let Some(info) = cred.group_info.as_ref() {
-                    in_group |= info.gids.contains(&kgid);
-                }
-                if !in_group {
-                    kill_sgid = true;
-                }
-            }
-
-            if kill_sgid {
-                md.mode.remove(InodeMode::S_ISGID);
-            }
+        if should_remove_sgid(md.mode, md.gid, &cred) {
+            md.mode.remove(InodeMode::S_ISGID);
         }
 
         self.inode.set_metadata(&md)?;

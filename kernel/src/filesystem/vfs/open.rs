@@ -6,7 +6,7 @@ use super::{
     file::{File, FileFlags},
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
-    utils::{rsplit_path, user_path_at},
+    utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
     vcore::{check_parent_dir_permission, resolve_parent_inode},
     FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -185,27 +185,8 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         // suid always must be killed on chown for non-directories
         meta.mode.remove(InodeMode::S_ISUID);
 
-        if meta.mode.contains(InodeMode::S_ISGID) {
-            let mut kill_sgid = false;
-            if meta.mode.contains(InodeMode::S_IXGRP) {
-                kill_sgid = true;
-            } else {
-                // 注意：Linux 这里检查的是“原 inode gid”，在 notify_change 前尚未更新。
-                let kgid = Kgid::from(old_gid);
-                let in_group = cred.fsgid.data() == old_gid
-                    || cred.egid.data() == old_gid
-                    || current_gid == old_gid
-                    || cred.getgroups().contains(&kgid)
-                    || group_info.gids.contains(&kgid)
-                    || cred.has_capability(CAPFlags::CAP_FSETID);
-                if !in_group {
-                    kill_sgid = true;
-                }
-            }
-
-            if kill_sgid {
-                meta.mode.remove(InodeMode::S_ISGID);
-            }
+        if should_remove_sgid_on_chown(meta.mode, old_gid, current_gid, &cred, &group_info) {
+            meta.mode.remove(InodeMode::S_ISGID);
         }
     }
     inode.set_metadata(&meta)?;

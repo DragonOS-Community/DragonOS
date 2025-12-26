@@ -21,16 +21,12 @@ use crate::{
         },
     },
     mm::truncate::truncate_inode_pages,
-    process::{
-        cred::{CAPFlags, Kgid},
-        namespace::mnt::mnt_namespace_init,
-        ProcessManager,
-    },
+    process::{cred::CAPFlags, namespace::mnt::mnt_namespace_init, ProcessManager},
 };
 
 use super::{
     stat::LookUpFlags,
-    utils::{rsplit_path, user_path_at},
+    utils::{rsplit_path, should_remove_sgid, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
@@ -507,28 +503,8 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
             {
                 md2.mode.remove(InodeMode::S_ISUID);
 
-                if md2.mode.contains(InodeMode::S_ISGID) {
-                    let mut kill_sgid = false;
-                    if md2.mode.contains(InodeMode::S_IXGRP) {
-                        kill_sgid = true;
-                    } else {
-                        let gid = md2.gid;
-                        let kgid = Kgid::from(gid);
-                        let mut in_group = cred.fsgid.data() == gid
-                            || cred.gid.data() == gid
-                            || cred.egid.data() == gid
-                            || cred.getgroups().contains(&kgid);
-                        if let Some(info) = cred.group_info.as_ref() {
-                            in_group |= info.gids.contains(&kgid);
-                        }
-                        if !in_group {
-                            kill_sgid = true;
-                        }
-                    }
-
-                    if kill_sgid {
-                        md2.mode.remove(InodeMode::S_ISGID);
-                    }
+                if should_remove_sgid(md2.mode, md2.gid, &cred) {
+                    md2.mode.remove(InodeMode::S_ISGID);
                 }
 
                 inode.set_metadata(&md2)?;

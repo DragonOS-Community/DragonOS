@@ -16,7 +16,6 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
-    filesystem::procfs::procfs_register_pid,
     ipc::signal_types::SignalFlags,
     libs::rwlock::RwLock,
     mm::VirtAddr,
@@ -224,15 +223,6 @@ impl ProcessManager {
         //         pcb.task_session().map_or(0, |s| s.pid_vnr().data())
         //     );
         // }
-
-        // 向procfs注册进程
-        procfs_register_pid(pcb.raw_pid()).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to register pid to procfs, pid: [{:?}]. Error: {:?}",
-                pcb.raw_pid(),
-                e
-            )
-        });
 
         pcb.sched_info().set_on_cpu(Some(smp_get_processor_id()));
 

@@ -4,6 +4,7 @@ use core::{
     hint::spin_loop,
     intrinsics::unlikely,
     mem::ManuallyDrop,
+    str::FromStr,
     sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
@@ -31,7 +32,6 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
-        procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
@@ -103,6 +103,11 @@ pub use cputime::ProcessCpuTime;
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> =
     SpinLock::new(None);
+
+pub(crate) fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>>
+{
+    &ALL_PROCESS
+}
 
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 
@@ -733,6 +738,15 @@ int_like!(RawPid, AtomicRawPid, usize, AtomicUsize);
 impl fmt::Display for RawPid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for RawPid {
+    type Err = core::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let pid = usize::from_str(s)?;
+        Ok(RawPid(pid))
     }
 }
 
@@ -1792,9 +1806,8 @@ impl Drop for ProcessControlBlock {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
         self.__exit_signal();
-        // 在ProcFS中,解除进程的注册
-        // 这里忽略错误，因为进程可能未注册到procfs
-        procfs_unregister_pid(self.raw_pid()).ok();
+        // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
+        // 不再需要显式注册/注销进程
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
             ppcb.children
                 .write_irqsave()

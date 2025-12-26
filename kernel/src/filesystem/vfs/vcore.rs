@@ -21,12 +21,12 @@ use crate::{
         },
     },
     mm::truncate::truncate_inode_pages,
-    process::{namespace::mnt::mnt_namespace_init, ProcessManager},
+    process::{cred::CAPFlags, namespace::mnt::mnt_namespace_init, ProcessManager},
 };
 
 use super::{
     stat::LookUpFlags,
-    utils::{rsplit_path, user_path_at},
+    utils::{rsplit_path, should_remove_sgid, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
@@ -453,6 +453,7 @@ pub(super) fn do_file_lookup_at(
 #[inline(never)]
 pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
     let md = inode.metadata()?;
+    let old_size = md.size;
 
     // 防御性检查：统一拒绝超出 isize::MAX 的长度，避免后续类型转换溢出
     if len > isize::MAX as usize {
@@ -491,6 +492,25 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
     }
 
     let result = inode.resize(len);
+
+    // Linux 语义：对普通文件进行截断（且确实改变 size）后，若无 CAP_FSETID，清理 suid/sgid。
+    if result.is_ok() && old_size != len as i64 {
+        let cred = ProcessManager::current_pcb().cred();
+        if !cred.has_capability(CAPFlags::CAP_FSETID) {
+            let mut md2 = inode.metadata()?;
+            if md2.file_type == FileType::File
+                && md2.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
+            {
+                md2.mode.remove(InodeMode::S_ISUID);
+
+                if should_remove_sgid(md2.mode, md2.gid, &cred) {
+                    md2.mode.remove(InodeMode::S_ISGID);
+                }
+
+                inode.set_metadata(&md2)?;
+            }
+        }
+    }
 
     if result.is_ok() {
         let vm_opt: Option<Arc<crate::mm::ucontext::AddressSpace>> =

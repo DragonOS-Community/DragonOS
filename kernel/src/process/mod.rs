@@ -1026,11 +1026,6 @@ impl ProcessControlBlock {
         } else {
             let ppid = ProcessManager::current_pcb().task_pid_vnr();
             let cred = ProcessManager::current_pcb().cred();
-            if cred.cap_ambient != cred.cap_permitted || cred.cap_ambient != cred.cap_effective {
-                todo!("create a new cred for child.")
-                //     cred.cap_permitted = cred.cap_ambient;
-                // cred.cap_effective = cred.cap_ambient;
-            }
 
             let cwd = ProcessManager::current_pcb().basic().cwd();
             let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();

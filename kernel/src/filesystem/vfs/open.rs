@@ -6,7 +6,7 @@ use super::{
     file::{File, FileFlags},
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
-    utils::{rsplit_path, user_path_at},
+    utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
     vcore::{check_parent_dir_permission, resolve_parent_inode},
     FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -144,25 +144,51 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         group_info = info.clone();
     }
 
+    // Linux 语义：uid/gid 传入 -1 表示“不更改”。在 syscall 入口处参数被提升为 usize，
+    // 因此这里以 usize::MAX 代表 (uid_t/gid_t)-1。
+    let change_uid = uid != usize::MAX;
+    let change_gid = gid != usize::MAX;
+    let old_uid = meta.uid;
+    let old_gid = meta.gid;
+
     // 检查权限
     match current_uid {
         0 => {
-            meta.uid = uid;
-            meta.gid = gid;
+            if change_uid {
+                meta.uid = uid;
+            }
+            if change_gid {
+                meta.gid = gid;
+            }
         }
         _ => {
             // 非文件所有者不能更改信息，且不能更改uid
-            if current_uid != meta.uid || uid != meta.uid {
+            if current_uid != meta.uid || (change_uid && uid != meta.uid) {
                 return Err(SystemError::EPERM);
             }
-            if gid != current_gid && !group_info.gids.contains(&Kgid::from(gid)) {
-                return Err(SystemError::EPERM);
+            if change_gid {
+                if gid != current_gid && !group_info.gids.contains(&Kgid::from(gid)) {
+                    return Err(SystemError::EPERM);
+                }
+                meta.gid = gid;
             }
-            meta.gid = gid;
         }
     }
 
-    meta.mode.remove(InodeMode::S_ISUID | InodeMode::S_ISGID);
+    // Linux 语义：
+    // - chown 目录：不清除 suid/sgid（setgid 目录用于组继承）
+    // - chown 普通文件：总是清除 suid；sgid 按 Linux setattr_should_drop_sgid 规则清理
+    //   - 若 S_IXGRP 置位：无条件清除 sgid
+    //   - 否则（mandatory locking 语义）：仅当调用者不在文件所属组且无 CAP_FSETID 时清除
+    let ownership_changed = meta.uid != old_uid || meta.gid != old_gid;
+    if ownership_changed && meta.file_type != FileType::Dir {
+        // suid always must be killed on chown for non-directories
+        meta.mode.remove(InodeMode::S_ISUID);
+
+        if should_remove_sgid_on_chown(meta.mode, old_gid, current_gid, &cred, &group_info) {
+            meta.mode.remove(InodeMode::S_ISGID);
+        }
+    }
     inode.set_metadata(&meta)?;
 
     return Ok(0);

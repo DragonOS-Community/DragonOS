@@ -21,14 +21,8 @@ compile_commands.json
 /logs/
 *.log
 
-# Nix dev files
-/.envrc
-/.direnv/
-/flake.nix
-flake.lock
-/default.nix
-
 # initram
 *.cpio
 *.cpio.xz
 *.cpio*
+.direnv/

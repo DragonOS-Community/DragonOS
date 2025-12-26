@@ -28,6 +28,7 @@ pub struct TcpSocket {
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
     inode_id: InodeId,
+    open_files: AtomicUsize,
     self_ref: Weak<Self>,
     pollee: AtomicUsize,
     netns: Arc<NetNamespace>,
@@ -44,6 +45,7 @@ impl TcpSocket {
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),
+            open_files: AtomicUsize::new(0),
             self_ref: me.clone(),
             pollee: AtomicUsize::new(0_usize),
             netns,
@@ -63,6 +65,7 @@ impl TcpSocket {
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),
+            open_files: AtomicUsize::new(0),
             self_ref: me.clone(),
             pollee: AtomicUsize::new((EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize),
             netns,
@@ -301,6 +304,10 @@ impl TcpSocket {
 }
 
 impl Socket for TcpSocket {
+    fn open_file_counter(&self) -> &AtomicUsize {
+        &self.open_files
+    }
+
     fn wait_queue(&self) -> &WaitQueue {
         &self.wait_queue
     }

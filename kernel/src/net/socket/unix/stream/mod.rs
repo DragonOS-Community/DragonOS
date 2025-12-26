@@ -56,6 +56,7 @@ pub struct UnixStreamSocket {
     fasync_items: FAsyncItems,
     wait_queue: Arc<WaitQueue>,
     inode_id: InodeId,
+    open_files: AtomicUsize,
     /// Peer socket for socket pairs (used for SIGIO notification)
     peer: SpinLock<Option<Weak<UnixStreamSocket>>>,
 
@@ -81,6 +82,7 @@ impl UnixStreamSocket {
             inner: RwLock::new(Some(Inner::Init(init))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
+            open_files: AtomicUsize::new(0),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
@@ -104,6 +106,7 @@ impl UnixStreamSocket {
             inner: RwLock::new(Some(Inner::Connected(connected))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
+            open_files: AtomicUsize::new(0),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
@@ -418,6 +421,10 @@ impl UnixStreamSocket {
 }
 
 impl Socket for UnixStreamSocket {
+    fn open_file_counter(&self) -> &AtomicUsize {
+        &self.open_files
+    }
+
     fn ioctl(
         &self,
         cmd: u32,

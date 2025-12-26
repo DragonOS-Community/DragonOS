@@ -11,6 +11,7 @@ use crate::{
 };
 // use crate::filesystem::epoll::event_poll::EventPoll;
 use alloc::sync::Arc;
+use core::sync::atomic::AtomicUsize;
 use system_error::SystemError;
 
 use super::{
@@ -22,6 +23,14 @@ use super::{
 /// ## Reference
 /// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
 pub trait Socket: PollableInode + IndexNode {
+    /// Open-file refcount for this socket.
+    ///
+    /// Each `File` that references this socket (including those received via SCM_RIGHTS)
+    /// corresponds to one successful `IndexNode::open()` and must be balanced by one
+    /// `IndexNode::close()`. We use this counter to ensure `do_close()` runs only
+    /// on the final close, matching Linux semantics and avoiding premature teardown.
+    fn open_file_counter(&self) -> &AtomicUsize;
+
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> &WaitQueue;

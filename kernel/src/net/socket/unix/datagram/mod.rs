@@ -228,6 +228,7 @@ pub struct UnixDatagramSocket {
     fasync_items: FAsyncItems,
     wait_queue: Arc<WaitQueue>,
     inode_id: InodeId,
+    open_files: AtomicUsize,
     is_nonblocking: AtomicBool,
     sndbuf: AtomicUsize,
     snd_used: AtomicUsize,
@@ -259,6 +260,7 @@ impl UnixDatagramSocket {
             fasync_items: FAsyncItems::default(),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
+            open_files: AtomicUsize::new(0),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             sndbuf: AtomicUsize::new(Self::DEFAULT_BUF_SIZE),
             snd_used: AtomicUsize::new(0),
@@ -695,6 +697,10 @@ impl UnixDatagramSocket {
 }
 
 impl Socket for UnixDatagramSocket {
+    fn open_file_counter(&self) -> &AtomicUsize {
+        &self.open_files
+    }
+
     fn ioctl(
         &self,
         cmd: u32,

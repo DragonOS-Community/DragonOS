@@ -187,6 +187,17 @@ impl SysFcntlHandle {
                         return Err(SystemError::EPERM);
                     }
                     file.set_flags(new_flags)?;
+
+                    // Keep socket object nonblocking state in sync with file flags.
+                    // Some socket implementations consult an internal AtomicBool rather than
+                    // the FileFlags, so fcntl(F_SETFL,O_NONBLOCK) must be propagated.
+                    if file.file_type() == FileType::Socket {
+                        if let Ok(inode) = ProcessManager::current_pcb().get_socket_inode(fd) {
+                            if let Some(sock) = inode.as_socket() {
+                                sock.set_nonblocking(new_flags.contains(FileFlags::O_NONBLOCK));
+                            }
+                        }
+                    }
                     return Ok(0);
                 }
 

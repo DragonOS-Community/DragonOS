@@ -45,6 +45,35 @@ impl From<IpEndpoint> for Endpoint {
 }
 
 impl Endpoint {
+    fn sockaddr_len(&self) -> Result<u32, system_error::SystemError> {
+        match self {
+            Endpoint::LinkLayer(_) => Ok(SockAddr::from(self.clone()).len()?),
+            Endpoint::Ip(_) => Ok(SockAddr::from(self.clone()).len()?),
+            Endpoint::Netlink(_) => Ok(SockAddr::from(self.clone()).len()?),
+            Endpoint::Unix(unix) => {
+                // Linux AF_UNIX getsockname/getpeername length semantics depend on the
+                // effective address length, not always sizeof(sockaddr_un).
+                //
+                // For abstract namespace: len = offsetof(sun_path) + 1 + name_len.
+                // For unnamed: len = offsetof(sun_path).
+                // For filesystem: include terminating NUL.
+                let base = core::mem::size_of::<u16>() as u32; // offsetof(sockaddr_un, sun_path)
+
+                match unix {
+                    UnixEndpoint::Unnamed => Ok(base),
+                    UnixEndpoint::Abstract(name) => {
+                        let copy_len = core::cmp::min(name.len(), 107);
+                        Ok(base + 1 + (copy_len as u32))
+                    }
+                    UnixEndpoint::File(path) => {
+                        let copy_len = core::cmp::min(path.len(), 107);
+                        Ok(base + (copy_len as u32) + 1)
+                    }
+                }
+            }
+        }
+    }
+
     /// 内部函数：将 sockaddr 写入用户空间缓冲区
     ///
     /// # 参数
@@ -59,7 +88,7 @@ impl Endpoint {
         max_len: usize,
     ) -> Result<u32, system_error::SystemError> {
         let kernel_addr = SockAddr::from(self.clone());
-        let len = kernel_addr.len()?;
+        let len = self.sockaddr_len()?;
 
         let to_write = core::cmp::min(len as usize, max_len);
         if to_write > 0 {

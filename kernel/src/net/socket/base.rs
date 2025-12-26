@@ -64,6 +64,13 @@ pub trait Socket: PollableInode + IndexNode {
     /// 对应于POSIX的connect函数，用于连接到指定的远程服务器端点
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError>;
 
+    /// Update the socket's nonblocking mode.
+    ///
+    /// Linux models O_NONBLOCK as a file status flag. DragonOS keeps some sockets'
+    /// nonblocking state inside the socket object, so we provide this hook to sync
+    /// fcntl(F_SETFL) changes.
+    fn set_nonblocking(&self, _nonblocking: bool) {}
+
     // fnctl
     // freeaddrinfo
     // getaddrinfo

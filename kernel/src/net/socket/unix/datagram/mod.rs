@@ -27,12 +27,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use system_error::SystemError;
 
-use super::ns;
-
 use crate::libs::wait_queue::{TimeoutWaker, Waiter};
 use crate::time::timer::{next_n_us_timer_jiffies, Timer};
 use crate::time::{Duration, Instant};
 
+use crate::process::namespace::net_namespace::NetNamespace;
 use crate::syscall::user_access::UserBufferWriter;
 use crate::{
     filesystem::vfs::file::File,
@@ -115,17 +114,25 @@ impl Inner {
         }
     }
 
-    fn bind(&mut self, endpoint: UnixEndpoint) -> Result<(), SystemError> {
+    fn bind(
+        &mut self,
+        endpoint: UnixEndpoint,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
         if self.local_addr.is_some() {
             return endpoint.bind_unnamed();
         }
-        let bound_addr = endpoint.bind()?;
+        let bound_addr = endpoint.bind_in(netns)?;
         self.local_addr = Some(bound_addr);
         Ok(())
     }
 
-    fn connect(&mut self, endpoint: UnixEndpoint) -> Result<(), SystemError> {
-        let peer_addr = endpoint.connect()?;
+    fn connect(
+        &mut self,
+        endpoint: UnixEndpoint,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        let peer_addr = endpoint.connect_in(netns)?;
         self.peer_addr = Some(peer_addr);
         Ok(())
     }
@@ -155,20 +162,65 @@ impl Inner {
     }
 }
 
+/// 抽象套接字的键：namespace ID + 抽象名称
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AbstractSocketKey {
+    nsid: usize,
+    name: Arc<[u8]>,
+}
+
+impl AbstractSocketKey {
+    fn new(nsid: usize, name: Arc<[u8]>) -> Self {
+        Self { nsid, name }
+    }
+}
+
+/// 抽象名称绑定的 socket 表
+struct AbstractSocketTable {
+    inner: RwLock<HashMap<AbstractSocketKey, Weak<UnixDatagramSocket>>>,
+}
+
+impl AbstractSocketTable {
+    fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&self, nsid: usize, name: Arc<[u8]>, socket: Weak<UnixDatagramSocket>) {
+        self.inner
+            .write()
+            .insert(AbstractSocketKey::new(nsid, name), socket);
+    }
+
+    fn remove(&self, nsid: usize, name: Arc<[u8]>) -> Option<Weak<UnixDatagramSocket>> {
+        self.inner
+            .write()
+            .remove(&AbstractSocketKey::new(nsid, name))
+    }
+
+    fn get(&self, nsid: usize, name: Arc<[u8]>) -> Option<Arc<UnixDatagramSocket>> {
+        self.inner
+            .read()
+            .get(&AbstractSocketKey::new(nsid, name))
+            .and_then(Weak::upgrade)
+    }
+}
+
 /// Unix 域数据报 Socket 的绑定表
 /// 用于根据地址查找对应的 socket
 struct BindTable {
     /// 路径绑定的 socket
     path_sockets: RwLock<HashMap<DName, Weak<UnixDatagramSocket>>>,
     /// 抽象名称绑定的 socket
-    abstract_sockets: RwLock<HashMap<Arc<[u8]>, Weak<UnixDatagramSocket>>>,
+    abstract_sockets: AbstractSocketTable,
 }
 
 impl BindTable {
     fn new() -> Self {
         Self {
             path_sockets: RwLock::new(HashMap::new()),
-            abstract_sockets: RwLock::new(HashMap::new()),
+            abstract_sockets: AbstractSocketTable::new(),
         }
     }
 
@@ -181,8 +233,7 @@ impl BindTable {
             }
             UnixEndpointBound::Abstract(handle) => {
                 self.abstract_sockets
-                    .write()
-                    .insert(handle.name(), Arc::downgrade(socket));
+                    .insert(handle.nsid(), handle.name(), Arc::downgrade(socket));
             }
         }
     }
@@ -193,7 +244,7 @@ impl BindTable {
                 self.path_sockets.write().remove(path);
             }
             UnixEndpointBound::Abstract(handle) => {
-                self.abstract_sockets.write().remove(&handle.name());
+                self.abstract_sockets.remove(handle.nsid(), handle.name());
             }
         }
     }
@@ -203,11 +254,9 @@ impl BindTable {
             UnixEndpointBound::Path(path) => {
                 self.path_sockets.read().get(path).and_then(Weak::upgrade)
             }
-            UnixEndpointBound::Abstract(handle) => self
-                .abstract_sockets
-                .read()
-                .get(&handle.name())
-                .and_then(Weak::upgrade),
+            UnixEndpointBound::Abstract(handle) => {
+                self.abstract_sockets.get(handle.nsid(), handle.name())
+            }
         }
     }
 }
@@ -229,6 +278,7 @@ pub struct UnixDatagramSocket {
     wait_queue: Arc<WaitQueue>,
     inode_id: InodeId,
     open_files: AtomicUsize,
+    netns: Arc<NetNamespace>,
     is_nonblocking: AtomicBool,
     sndbuf: AtomicUsize,
     snd_used: AtomicUsize,
@@ -254,6 +304,7 @@ impl UnixDatagramSocket {
     pub const MAX_MSG_SIZE: usize = 16 * 1024 * 1024;
 
     pub fn new(is_nonblocking: bool) -> Arc<Self> {
+        let netns = ProcessManager::current_netns();
         Arc::new_cyclic(|weak| Self {
             inner: SpinLock::new(Inner::new()),
             epitems: EPollItems::default(),
@@ -261,6 +312,7 @@ impl UnixDatagramSocket {
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
+            netns: netns.clone(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             sndbuf: AtomicUsize::new(Self::DEFAULT_BUF_SIZE),
             snd_used: AtomicUsize::new(0),
@@ -281,9 +333,17 @@ impl UnixDatagramSocket {
         let socket_a = Self::new(is_nonblocking);
         let socket_b = Self::new(is_nonblocking);
 
+        let netns = socket_a.netns.clone();
+
         // 为每个 socket 分配一个临时的抽象地址
-        let addr_a = ns::alloc_ephemeral_abstract_name().ok();
-        let addr_b = ns::alloc_ephemeral_abstract_name().ok();
+        let addr_a = netns
+            .unix_abstract_table()
+            .alloc_ephemeral_abstract_name()
+            .ok();
+        let addr_b = netns
+            .unix_abstract_table()
+            .alloc_ephemeral_abstract_name()
+            .ok();
 
         // 设置本地和对端地址
         {
@@ -735,9 +795,13 @@ impl Socket for UnixDatagramSocket {
         }
     }
 
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
+    }
+
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
-        self.inner.lock().connect(unix_endpoint)
+        self.inner.lock().connect(unix_endpoint, &self.netns)
     }
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
@@ -747,7 +811,7 @@ impl Socket for UnixDatagramSocket {
         let (bound_addr, should_register) = {
             let mut inner = self.inner.lock();
             let was_unbound = inner.local_addr.is_none();
-            inner.bind(unix_endpoint)?;
+            inner.bind(unix_endpoint, &self.netns)?;
             (inner.local_addr.clone(), was_unbound)
         };
 
@@ -1174,7 +1238,7 @@ impl Socket for UnixDatagramSocket {
                 msg.msg_namelen,
             )?;
             let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
-            unix_endpoint.connect()?
+            unix_endpoint.connect_in(&self.netns)?
         } else {
             self.inner
                 .lock()
@@ -1271,7 +1335,7 @@ impl Socket for UnixDatagramSocket {
         address: Endpoint,
     ) -> Result<usize, SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(address)?;
-        let target_addr = unix_endpoint.connect()?;
+        let target_addr = unix_endpoint.connect_in(&self.netns)?;
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
         if nonblock {

@@ -28,6 +28,7 @@ use system_error::SystemError;
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::libs::wait_queue::{TimeoutWaker, Waiter};
 use crate::net::socket::unix::{current_ucred, nobody_ucred, UCred};
+use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use crate::time::timer::{next_n_us_timer_jiffies, Timer};
@@ -93,6 +94,7 @@ pub struct UnixStreamSocket {
     wait_queue: Arc<WaitQueue>,
     inode_id: InodeId,
     open_files: AtomicUsize,
+    netns: Arc<NetNamespace>,
     /// Peer socket for socket pairs (used for SIGIO notification)
     peer: SpinLock<Option<Weak<UnixStreamSocket>>>,
 
@@ -123,12 +125,18 @@ impl UnixStreamSocket {
     /// Must be a power-of-two friendly size to keep ring buffer resizes sane.
     const MAX_EFFECTIVE_SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024;
 
-    pub(super) fn new_init(init: Init, is_nonblocking: bool, is_seqpacket: bool) -> Arc<Self> {
+    pub(super) fn new_init(
+        init: Init,
+        is_nonblocking: bool,
+        is_seqpacket: bool,
+        netns: Arc<NetNamespace>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(Some(Inner::Init(init))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
+            netns,
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
@@ -150,12 +158,14 @@ impl UnixStreamSocket {
         connected: Connected,
         is_nonblocking: bool,
         is_seqpacket: bool,
+        netns: Arc<NetNamespace>,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(Some(Inner::Connected(connected))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
+            netns,
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
@@ -343,13 +353,15 @@ impl UnixStreamSocket {
     }
 
     pub fn new(is_nonblocking: bool, is_seqpacket: bool) -> Arc<Self> {
-        Self::new_init(Init::new(), is_nonblocking, is_seqpacket)
+        let netns = ProcessManager::current_netns();
+        Self::new_init(Init::new(), is_nonblocking, is_seqpacket, netns)
     }
 
     pub fn new_pair(is_nonblocking: bool, is_seqpacket: bool) -> (Arc<Self>, Arc<Self>) {
         let (conn_a, conn_b) = Connected::new_pair(None, None);
-        let socket_a = Self::new_connected(conn_a, is_nonblocking, is_seqpacket);
-        let socket_b = Self::new_connected(conn_b, is_nonblocking, is_seqpacket);
+        let netns = ProcessManager::current_netns();
+        let socket_a = Self::new_connected(conn_a, is_nonblocking, is_seqpacket, netns.clone());
+        let socket_b = Self::new_connected(conn_b, is_nonblocking, is_seqpacket, netns);
 
         // Set up peer references for SIGIO notification
         *socket_a.peer.lock() = Some(Arc::downgrade(&socket_b));
@@ -436,6 +448,7 @@ impl UnixStreamSocket {
             Inner::Listener(listener) => listener.try_accept(
                 self.is_seqpacket,
                 self.passcred.load(core::sync::atomic::Ordering::Relaxed),
+                &self.netns,
             ) as _,
             _ => {
                 log::error!("the socket is not listening");
@@ -599,8 +612,13 @@ impl Socket for UnixStreamSocket {
         }
     }
 
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.is_nonblocking
+            .store(nonblocking, core::sync::atomic::Ordering::Relaxed);
+    }
+
     fn connect(&self, server_endpoint: Endpoint) -> Result<(), SystemError> {
-        let remote_addr = UnixEndpoint::try_from(server_endpoint)?.connect()?;
+        let remote_addr = UnixEndpoint::try_from(server_endpoint)?.connect_in(&self.netns)?;
         let backlog = get_backlog(&remote_addr)?;
 
         if self.is_nonblocking() {
@@ -615,15 +633,15 @@ impl Socket for UnixStreamSocket {
 
         let mut writer = self.inner.write();
         match writer.as_mut().expect("UnixStreamSocket inner is None") {
-            Inner::Init(init) => init.bind(addr),
-            Inner::Connected(connected) => connected.bind(addr),
+            Inner::Init(init) => init.bind(addr, &self.netns),
+            Inner::Connected(connected) => connected.bind(addr, &self.netns),
             Inner::Listener(_listener) => addr.bind_unnamed(),
         }
     }
 
     fn listen(&self, backlog: usize) -> Result<(), SystemError> {
         const SOMAXCONN: usize = 4096;
-        let backlog = backlog.saturating_add(1).min(SOMAXCONN);
+        let backlog = backlog.min(SOMAXCONN);
 
         let mut writer = self.inner.write();
 

@@ -9,6 +9,7 @@ use crate::net::socket::unix::stream::UnixStreamSocket;
 use crate::net::socket::unix::UCred;
 use crate::net::socket::unix::{UnixEndpoint, UnixEndpointBound};
 use crate::net::socket::Socket;
+use crate::process::namespace::net_namespace::NetNamespace;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -65,13 +66,17 @@ impl Init {
         Self { addr: None }
     }
 
-    pub(super) fn bind(&mut self, endpoint_to_bind: UnixEndpoint) -> Result<(), SystemError> {
+    pub(super) fn bind(
+        &mut self,
+        endpoint_to_bind: UnixEndpoint,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
         if self.addr.is_some() {
             log::error!("the socket is already bound");
             return endpoint_to_bind.bind_unnamed();
         }
 
-        let bound_addr = endpoint_to_bind.bind()?;
+        let bound_addr = endpoint_to_bind.bind_in(netns)?;
         self.addr = Some(bound_addr);
 
         Ok(())
@@ -153,12 +158,16 @@ impl Connected {
         self.peer_addr = peer;
     }
 
-    pub(super) fn bind(&mut self, addr_to_bind: UnixEndpoint) -> Result<(), SystemError> {
+    pub(super) fn bind(
+        &mut self,
+        addr_to_bind: UnixEndpoint,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
         if self.addr.is_some() {
             return addr_to_bind.bind_unnamed();
         }
 
-        let bound_addr = addr_to_bind.bind()?;
+        let bound_addr = addr_to_bind.bind_in(netns)?;
         self.set_endpoint(Some(bound_addr));
 
         Ok(())
@@ -493,11 +502,12 @@ impl Listener {
         &self,
         is_seqpacket: bool,
         inherit_passcred: bool,
+        netns: &Arc<NetNamespace>,
     ) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
         let connected = self.backlog.pop_incoming()?;
 
         let peer_addr = connected.peer_endpoint().into();
-        let socket = UnixStreamSocket::new_connected(connected, false, is_seqpacket);
+        let socket = UnixStreamSocket::new_connected(connected, false, is_seqpacket, netns.clone());
 
         socket
             .passcred
@@ -671,7 +681,9 @@ impl Backlog {
             return Err((init, SystemError::EINVAL));
         };
 
-        if incoming_conns.len() >= self.backlog.load(Ordering::Relaxed) {
+        // Linux uses sk_acceptq_is_full(): ack_backlog > max_ack_backlog.
+        // This means backlog==0 still allows one pending connection.
+        if incoming_conns.len() > self.backlog.load(Ordering::Relaxed) {
             debug!("the pending connection queue on the listening socket is full");
             return Err((init, SystemError::EAGAIN_OR_EWOULDBLOCK));
         }

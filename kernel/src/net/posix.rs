@@ -48,7 +48,7 @@ use crate::net::socket::netlink::addr::{multicast::GroupIdSet, NetlinkSocketAddr
 use crate::net::socket::unix::UnixEndpoint;
 use crate::syscall::user_access::UserBufferReader;
 use alloc::string::ToString;
-use core::ffi::CStr;
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
@@ -140,9 +140,8 @@ impl From<UnixEndpoint> for SockAddr {
             UnixEndpoint::Abstract(name) => {
                 // Abstract namespace以null字节开头
                 sun_path[0] = 0;
-                let name_bytes = name.as_bytes();
-                let copy_len = core::cmp::min(name_bytes.len(), 107);
-                sun_path[1..1 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+                let copy_len = core::cmp::min(name.len(), 107);
+                sun_path[1..1 + copy_len].copy_from_slice(&name[..copy_len]);
             }
             UnixEndpoint::Unnamed => {
                 // Unnamed socket，所有字节保持为0
@@ -249,60 +248,46 @@ impl SockAddr {
                 // 至少需要包含 sa_family_t（与 Linux unix_validate_addr 行为一致）
                 // 已在函数开头检查过
 
-                // 读取 sockaddr_un 结构体（注意：len 可能小于完整结构体大小）
-                let addr_un = reader.buffer_protected(0)?.read_one::<SockAddrUn>(0)?;
-
-                // 根据 addrlen 限制 sun_path 可见范围，避免忽略用户传入的长度。
+                // Linux semantics: addrlen may be shorter than sizeof(sockaddr_un).
+                // Only the bytes within addrlen are visible; do not attempt to read a full
+                // SockAddrUn when len is short.
+                let mut sun_path_buf = [0u8; 108];
                 let sun_path_len = (len as usize)
                     .saturating_sub(size_of::<u16>())
-                    .min(addr_un.sun_path.len());
-                let sun_path = &addr_un.sun_path[..sun_path_len];
+                    .min(sun_path_buf.len());
+
+                if sun_path_len != 0 {
+                    let ub = reader.buffer_protected(size_of::<u16>())?;
+                    ub.read_from_user(0, &mut sun_path_buf[..sun_path_len])?;
+                }
+
+                let sun_path = &sun_path_buf[..sun_path_len];
 
                 if sun_path.is_empty() {
-                    // 仅包含 family 的情况目前不支持 Autobind，按参数无效处理。
-                    return Err(SystemError::EINVAL);
+                    // Linux semantics: bind(addrlen == sizeof(sa_family_t)) triggers autobind
+                    // to an abstract address.
+                    return Ok(Endpoint::Unix(UnixEndpoint::Unnamed));
                 }
 
                 if sun_path[0] == 0 {
                     // 抽象地址空间，与文件系统没有关系
-                    // TODO: Autobind feature
-                    //    If a bind(2) call specifies addrlen as sizeof(sa_family_t), or the
-                    //    SO_PASSCRED socket option was specified for a socket that was not
-                    //    explicitly bound to an address, then the socket is autobound to an
-                    //    abstract address.  The address consists of a null byte followed by
-                    //    5 bytes in the character set [0-9a-f].  Thus, there is a limit of
-                    //    2^20 autobind addresses.  (From Linux 2.1.15, when the autobind
-                    //    feature was added, 8 bytes were used, and the limit was thus 2^32
-                    //    autobind addresses.  The change to 5 bytes came in Linux 2.3.15.)
-                    let path = CStr::from_bytes_until_nul(&sun_path[1..])
-                        .map_err(|_| {
-                            log::error!("CStr::from_bytes_until_nul fail");
-                            SystemError::EINVAL
-                        })?
-                        .to_str()
-                        .map_err(|_| {
-                            log::error!("CStr::to_str fail");
-                            SystemError::EINVAL
-                        })?;
+                    // Linux semantics: abstract names are binary and length-delimited (may
+                    // contain embedded NULs). Do not treat them as C strings.
+                    if sun_path_len <= 1 {
+                        // A lone leading NUL (no name bytes) behaves like an unnamed bind.
+                        return Ok(Endpoint::Unix(UnixEndpoint::Unnamed));
+                    }
 
-                    // // 向抽象地址管理器申请或查找抽象地址
-                    // let spath = String::from(path);
-                    // log::info!("abs path: {}", spath);
-                    // let path = create_abstract_name(spath)?;
-
-                    return Ok(Endpoint::Unix(UnixEndpoint::Abstract(path.to_string())));
+                    let name: Vec<u8> = sun_path[1..sun_path_len].to_vec();
+                    return Ok(Endpoint::Unix(UnixEndpoint::Abstract(name)));
                 }
 
-                let path = CStr::from_bytes_until_nul(sun_path)
-                    .map_err(|_| {
-                        log::error!("CStr::from_bytes_until_nul fail");
-                        SystemError::EINVAL
-                    })?
-                    .to_str()
-                    .map_err(|_| {
-                        log::error!("CStr::to_str fail");
-                        SystemError::EINVAL
-                    })?;
+                // Filesystem pathname sockets: respect addrlen and stop at the first NUL if any.
+                let path_bytes = match sun_path.iter().position(|&b| b == 0) {
+                    Some(nul) => &sun_path[..nul],
+                    None => sun_path,
+                };
+                let path = core::str::from_utf8(path_bytes).map_err(|_| SystemError::EINVAL)?;
 
                 // let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(
                 //     &ProcessManager::current_pcb(),

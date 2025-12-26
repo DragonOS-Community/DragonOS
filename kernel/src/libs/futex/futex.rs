@@ -593,7 +593,7 @@ impl Futex {
             let md = file.metadata()?;
             let dev = md.dev_id as u64;
             let ino = md.inode_id.into() as u64;
-            let base_pgoff = vma_guard.file_page_offset().unwrap_or(0) as u64;
+            let base_pgoff = vma_guard.backing_page_offset().unwrap_or(0) as u64;
             let shared = SharedKey {
                 kind: SharedKeyKind::File { dev, ino },
                 page_offset: base_pgoff + page_index,

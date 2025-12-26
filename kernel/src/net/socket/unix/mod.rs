@@ -2,8 +2,14 @@ pub mod datagram;
 pub mod ns;
 pub mod ring_buffer;
 pub mod stream;
+pub mod utils;
+
+use system_error::SystemError;
+
+use self::utils::*;
 
 use super::PSOCK;
+use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     filesystem::vfs::{
         utils::{rsplit_path, DName},
@@ -18,13 +24,47 @@ use crate::{
 };
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::hash::Hash;
-use system_error::SystemError;
+
+/// Unix domain credential payload for SCM_CREDENTIALS.
+///
+/// Matches Linux `struct ucred { pid_t pid; uid_t uid; gid_t gid; }` layout on 64-bit.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UCred {
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Return current task credentials used for unix-domain SCM_CREDENTIALS.
+pub fn current_ucred() -> UCred {
+    let pcb = ProcessManager::current_pcb();
+    let cred = pcb.cred();
+    UCred {
+        pid: pcb.raw_tgid().data() as i32,
+        uid: cred.uid.data() as u32,
+        gid: cred.gid.data() as u32,
+    }
+}
+
+/// Linux behavior used by gVisor tests when credentials were not attached at send time.
+pub const fn nobody_ucred() -> UCred {
+    UCred {
+        pid: 0,
+        uid: 65534,
+        gid: 65534,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum UnixEndpoint {
     File(String),
-    Abstract(String),
+    /// Abstract namespace address payload (sun_path bytes after the leading NUL).
+    ///
+    /// Linux treats it as a length-delimited binary name (may contain embedded NULs).
+    Abstract(Vec<u8>),
     Unnamed,
 }
 
@@ -50,7 +90,7 @@ impl PartialEq for UnixEndpointBound {
         match (self, other) {
             (UnixEndpointBound::Path(path1), UnixEndpointBound::Path(path2)) => path1 == path2,
             (UnixEndpointBound::Abstract(handle1), UnixEndpointBound::Abstract(handle2)) => {
-                handle1.name() == handle2.name()
+                handle1.nsid() == handle2.nsid() && handle1.name() == handle2.name()
             }
             _ => false,
         }
@@ -64,7 +104,7 @@ impl Ord for UnixEndpointBound {
         match (self, other) {
             (UnixEndpointBound::Path(path1), UnixEndpointBound::Path(path2)) => path1.cmp(path2),
             (UnixEndpointBound::Abstract(handle1), UnixEndpointBound::Abstract(handle2)) => {
-                handle1.name().cmp(&handle2.name())
+                (handle1.nsid(), handle1.name()).cmp(&(handle2.nsid(), handle2.name()))
             }
             (UnixEndpointBound::Path(_), UnixEndpointBound::Abstract(_)) => {
                 core::cmp::Ordering::Less
@@ -89,6 +129,7 @@ impl Hash for UnixEndpointBound {
                 path.hash(state);
             }
             UnixEndpointBound::Abstract(handle) => {
+                handle.nsid().hash(state);
                 handle.name().hash(state);
             }
         }
@@ -99,9 +140,7 @@ impl From<UnixEndpointBound> for UnixEndpoint {
     fn from(endpoint: UnixEndpointBound) -> Self {
         match endpoint {
             UnixEndpointBound::Path(path) => UnixEndpoint::File(String::from(path.as_ref())),
-            UnixEndpointBound::Abstract(handle) => {
-                UnixEndpoint::Abstract(String::from_utf8_lossy(&handle.name()).into_owned())
-            }
+            UnixEndpointBound::Abstract(handle) => UnixEndpoint::Abstract(handle.name().to_vec()),
         }
     }
 }
@@ -122,9 +161,16 @@ impl<T: Into<UnixEndpoint>> From<T> for Endpoint {
 }
 
 impl UnixEndpoint {
-    pub(super) fn bind(self) -> Result<UnixEndpointBound, SystemError> {
+    pub(super) fn bind_in(
+        self,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<UnixEndpointBound, SystemError> {
         let bound = match self {
-            Self::Unnamed => UnixEndpointBound::Abstract(ns::alloc_ephemeral_abstract_name()?),
+            Self::Unnamed => UnixEndpointBound::Abstract(
+                netns
+                    .unix_abstract_table()
+                    .alloc_ephemeral_abstract_name()?,
+            ),
             Self::File(path) => {
                 let (filename, parent_path) = rsplit_path(&path);
                 // 查找父目录
@@ -149,7 +195,11 @@ impl UnixEndpoint {
                     })?;
                 UnixEndpointBound::Path(DName::from(inode.absolute_path()?))
             }
-            Self::Abstract(name) => UnixEndpointBound::Abstract(ns::create_abstract_name(name)?),
+            Self::Abstract(name) => UnixEndpointBound::Abstract(
+                netns
+                    .unix_abstract_table()
+                    .create_abstract_name_bytes(&name)?,
+            ),
         };
 
         Ok(bound)
@@ -162,12 +212,17 @@ impl UnixEndpoint {
         Err(SystemError::EINVAL)
     }
 
-    pub(super) fn connect(&self) -> Result<UnixEndpointBound, SystemError> {
+    pub(super) fn connect_in(
+        &self,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<UnixEndpointBound, SystemError> {
         let bound = match self {
             Self::Unnamed => return Err(SystemError::EINVAL),
-            Self::Abstract(name) => {
-                UnixEndpointBound::Abstract(ns::lookup_abstract_name(name.as_bytes())?)
-            }
+            Self::Abstract(name) => UnixEndpointBound::Abstract(
+                netns
+                    .unix_abstract_table()
+                    .lookup_abstract_name_bytes(name)?,
+            ),
             Self::File(path) => {
                 let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(
                     &ProcessManager::current_pcb(),

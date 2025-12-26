@@ -11,7 +11,7 @@ use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 
 use super::InetSocket;
 
@@ -27,6 +27,7 @@ pub struct UdpSocket {
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
     inode_id: InodeId,
+    open_files: AtomicUsize,
     self_ref: Weak<UdpSocket>,
     netns: Arc<NetNamespace>,
     epoll_items: EPollItems,
@@ -41,6 +42,7 @@ impl UdpSocket {
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),
+            open_files: AtomicUsize::new(0),
             self_ref: me.clone(),
             netns,
             epoll_items: EPollItems::default(),
@@ -154,6 +156,10 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    fn open_file_counter(&self) -> &AtomicUsize {
+        &self.open_files
+    }
+
     fn wait_queue(&self) -> &WaitQueue {
         &self.wait_queue
     }

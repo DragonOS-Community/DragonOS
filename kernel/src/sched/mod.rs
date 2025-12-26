@@ -491,11 +491,12 @@ impl CpuRunQueue {
 
     /// 禁用一个任务，将离开队列
     pub fn deactivate_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
-        *pcb.sched_info().on_rq.lock_irqsave() = if flags.contains(DequeueFlag::DEQUEUE_SLEEP) {
-            OnRq::None
-        } else {
-            OnRq::Migrating
-        };
+        *pcb.sched_info().on_rq.lock_irqsave() =
+            if flags.intersects(DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_STOPPED) {
+                OnRq::None
+            } else {
+                OnRq::Migrating
+            };
 
         self.dequeue_task(pcb, flags);
     }
@@ -738,6 +739,11 @@ bitflags! {
         const DEQUEUE_SAVE		= 0x02; /* Matches ENQUEUE_RESTORE */
         const DEQUEUE_MOVE		= 0x04; /* Matches ENQUEUE_MOVE */
         const DEQUEUE_NOCLOCK		= 0x08; /* Matches ENQUEUE_NOCLOCK */
+
+        /// 任务因 job-control stop（如 SIGSTOP/SIGTSTP）不可运行而出队。
+        ///
+        /// 这不是 sleep，也不是 migrate：应当将 OnRq 置为 None。
+        const DEQUEUE_STOPPED		= 0x10;
     }
 
     pub struct WakeupFlags: u8 {

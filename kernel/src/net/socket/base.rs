@@ -1,7 +1,7 @@
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        vfs::{fasync::FAsyncItems, IndexNode, InodeId, PollableInode},
+        vfs::{fasync::FAsyncItems, FilePrivateData, IndexNode, InodeId, PollableInode},
     },
     libs::wait_queue::WaitQueue,
     net::{
@@ -11,6 +11,7 @@ use crate::{
 };
 // use crate::filesystem::epoll::event_poll::EventPoll;
 use alloc::sync::Arc;
+use core::sync::atomic::AtomicUsize;
 use system_error::SystemError;
 
 use super::{
@@ -22,6 +23,14 @@ use super::{
 /// ## Reference
 /// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
 pub trait Socket: PollableInode + IndexNode {
+    /// Open-file refcount for this socket.
+    ///
+    /// Each `File` that references this socket (including those received via SCM_RIGHTS)
+    /// corresponds to one successful `IndexNode::open()` and must be balanced by one
+    /// `IndexNode::close()`. We use this counter to ensure `do_close()` runs only
+    /// on the final close, matching Linux semantics and avoiding premature teardown.
+    fn open_file_counter(&self) -> &AtomicUsize;
+
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> &WaitQueue;
@@ -54,6 +63,13 @@ pub trait Socket: PollableInode + IndexNode {
     /// # `connect`
     /// 对应于POSIX的connect函数，用于连接到指定的远程服务器端点
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError>;
+
+    /// Update the socket's nonblocking mode.
+    ///
+    /// Linux models O_NONBLOCK as a file status flag. DragonOS keeps some sockets'
+    /// nonblocking state inside the socket object, so we provide this hook to sync
+    /// fcntl(F_SETFL) changes.
+    fn set_nonblocking(&self, _nonblocking: bool) {}
 
     // fnctl
     // freeaddrinfo
@@ -131,6 +147,20 @@ pub trait Socket: PollableInode + IndexNode {
     fn shutdown(&self, _how: ShutdownBit) -> Result<(), SystemError> {
         // TODO 构建shutdown系统调用
         // set shutdown bit
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Socket-specific ioctl handler.
+    ///
+    /// By default sockets do not implement any ioctl commands.
+    ///
+    /// Note: caller is responsible for copying data to/from user space.
+    fn ioctl(
+        &self,
+        _cmd: u32,
+        _arg: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 

@@ -41,7 +41,6 @@ use crate::libs::{
 use crate::mm::allocator::page_frame::PhysPageFrame;
 use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 use crate::mm::{MemoryManagementArch, PhysAddr};
-use byte_slice_cast::*;
 use log::{debug, info, warn};
 use system_error::SystemError;
 
@@ -216,7 +215,7 @@ impl MMC {
             info!("CID: {:x?}", cid);
             info!(
                 "Card Name: {}",
-                core::str::from_utf8(cid.name().to_be_bytes().as_byte_slice()).unwrap()
+                core::str::from_utf8(&cid.name().to_be_bytes()).unwrap()
             );
         }
 

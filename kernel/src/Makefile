@@ -39,7 +39,13 @@ LD_LIST := ""
 
 kernel_subdirs := debug
 
-TOOLCHAIN := +nightly-2025-08-10
+# Nix environment doesn't support rustup-style toolchain selection
+# TOOLCHAIN is exported from kernel/Makefile, fallback to default if not set
+ifeq ($(USING_DRAGONOS_NIX_ENV),1)
+TOOLCHAIN ?=
+else
+TOOLCHAIN ?= +nightly-2025-08-10
+endif
 
 kernel_rust:
 	DRAGONOS_ACTUAL_BUILD=1 RUSTFLAGS="$(RUSTFLAGS)" INITRAM_PATH="$(INITRAM_PATH)" cargo $(TOOLCHAIN) $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
@@ -57,7 +63,7 @@ else ifeq ($(ARCH), loongarch64)
 else
 	$(error Unknown ARCH: $(ARCH))
 endif
-	
+
 	@echo "Kernel Build Done."
 
 ECHO:
@@ -101,7 +107,7 @@ __link_x86_64_kernel:
 	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T arch/x86_64/link.lds --no-relax
 # 生成kallsyms
 	current_dir=$(pwd)
-	
+
 	@dbg='debug';for x in $$dbg; do \
 		cd $$x;\
 		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)"||exit 1;\
@@ -127,7 +133,7 @@ __link_loongarch64_kernel:
 	$(LD) -b elf64-loongarch -z muldefs $(LDFLAGS_UNWIND) -o kernel $(shell find . -name "*.o") ../target/loongarch64-unknown-none/release/libdragonos_kernel.a -T arch/loongarch64/link.ld --no-relax
 # 生成kallsyms
 	current_dir=$(pwd)
-	
+
 	@dbg='debug';for x in $$dbg; do \
 		cd $$x;\
 		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)"||exit 1;\
@@ -152,8 +158,8 @@ __dragon_stub:
 	@mkdir -p $(ROOT_PATH)/bin/sysroot
 	PAYLOAD_ELF=$(PAYLOAD_ELF) TARGET_SYSROOT=$(ROOT_PATH)/bin/sysroot $(MAKE) -C $(ROOT_PATH)/kernel/submodules/DragonStub install -j $(NPROCS)
 
-	
-clean: 
+
+clean:
 	@cargo clean
 	rm -rf $(GARBAGE)
 	@list='$(kernel_subdirs)'; for subdir in $$list; do \

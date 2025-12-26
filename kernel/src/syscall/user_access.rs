@@ -319,9 +319,29 @@ impl UserBufferReader<'_> {
         dst: &mut [T],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let data = self.convert_with_offset(self.buffer, offset)?;
-        dst.copy_from_slice(data);
-        return Ok(dst.len());
+        if dst.is_empty() {
+            return Ok(0);
+        }
+
+        let bytes_needed = dst
+            .len()
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(SystemError::EINVAL)?;
+
+        if offset
+            .checked_add(bytes_needed)
+            .filter(|end| *end <= self.buffer.len())
+            .is_none()
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        // Copy exact bytes into dst without relying on a typed view of the entire remaining buffer.
+        let src_bytes = &self.buffer[offset..offset + bytes_needed];
+        let dst_bytes =
+            unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, bytes_needed) };
+        dst_bytes.copy_from_slice(src_bytes);
+        Ok(dst.len())
     }
 
     /// Copy data from user space with page mapping and permission verification
@@ -343,9 +363,37 @@ impl UserBufferReader<'_> {
         dst: &mut [T],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let data = self.convert_with_offset_checked(self.buffer, offset)?;
-        dst.copy_from_slice(data);
-        return Ok(dst.len());
+        if dst.is_empty() {
+            return Ok(0);
+        }
+
+        let bytes_needed = dst
+            .len()
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(SystemError::EINVAL)?;
+
+        if offset
+            .checked_add(bytes_needed)
+            .filter(|end| *end <= self.buffer.len())
+            .is_none()
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let accessible_len = user_accessible_len(
+            VirtAddr::new(self.buffer.as_ptr() as usize + offset),
+            bytes_needed,
+            false,
+        );
+        if accessible_len < bytes_needed {
+            return Err(SystemError::EFAULT);
+        }
+
+        let src_bytes = &self.buffer[offset..offset + bytes_needed];
+        let dst_bytes =
+            unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, bytes_needed) };
+        dst_bytes.copy_from_slice(src_bytes);
+        Ok(dst.len())
     }
 
     /// Copy one data item from user space (to specified address)
@@ -983,14 +1031,14 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         };
 
         // 获取地址所在 VMA 的起始地址 和结束地址，访问权限标志，后备的文件和当前VMA第一页映射到文件的哪一页
-        let (region_start, region_end, vm_flags, vma_size, file, file_page_offset) = {
+        let (region_start, region_end, vm_flags, vma_size, file, backing_page_offset) = {
             let guard = vma.lock_irqsave();
             let region_start = guard.region().start().data();
             let region_end = guard.region().end().data();
             let vm_flags = *guard.vm_flags();
             let vma_size = region_end.saturating_sub(region_start);
             let file = guard.vm_file();
-            let file_page_offset = guard.file_page_offset();
+            let backing_page_offset = guard.backing_page_offset();
 
             drop(guard);
             (
@@ -999,7 +1047,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
                 vm_flags,
                 vma_size,
                 file,
-                file_page_offset,
+                backing_page_offset,
             )
         };
 
@@ -1014,7 +1062,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         }
 
         let file_backed_len = file.and_then(|file| {
-            let file_offset_pages = file_page_offset.unwrap_or(0);
+            let file_offset_pages = backing_page_offset.unwrap_or(0);
             let file_offset_bytes = file_offset_pages.saturating_mul(MMArch::PAGE_SIZE);
             let file_size = match file.metadata() {
                 Ok(md) if md.size > 0 => {

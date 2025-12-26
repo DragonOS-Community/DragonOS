@@ -172,6 +172,22 @@ impl Connected {
         self.reader.lock().resize(new_capacity)
     }
 
+    pub(super) fn send_capacity(&self) -> usize {
+        self.writer.lock().capacity()
+    }
+
+    pub(super) fn recv_capacity(&self) -> usize {
+        self.reader.lock().capacity()
+    }
+
+    pub(super) fn set_connreset_to_peer(&self) {
+        self.writer.lock().set_connreset_pending();
+    }
+
+    pub(super) fn take_connreset_from_peer(&self) -> bool {
+        self.reader.lock().take_connreset_pending()
+    }
+
     pub(super) fn send_free_len(&self) -> usize {
         self.writer.lock().free_len()
     }
@@ -180,6 +196,7 @@ impl Connected {
         &self,
         buf: &[u8],
         is_seqpacket: bool,
+        sndbuf_limit: usize,
     ) -> Result<(usize, Wrapping<usize>, usize), SystemError> {
         let is_empty = buf.is_empty();
         if is_empty {
@@ -210,6 +227,15 @@ impl Connected {
             buf.to_vec()
         };
         let mut guard = self.writer.lock();
+
+        // SO_SNDBUF accounting (Linux-like, approximate): fail with ENOBUFS when
+        // the amount of queued data would exceed the configured send buffer.
+        // This is required by gVisor stream unix socket tests.
+        let queued = guard.len();
+        if queued.saturating_add(buffer.len()) > sndbuf_limit {
+            return Err(SystemError::ENOBUFS);
+        }
+
         let start = guard.tail();
         let can_send = guard.free_len() >= buffer.len();
 

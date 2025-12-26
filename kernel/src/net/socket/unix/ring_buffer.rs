@@ -36,6 +36,11 @@ pub struct RingBuffer<T: Pod> {
     recv_shutdown: AtomicBool,
     /// Producer has performed SHUT_WR (consumer reads return EOF once drained).
     send_shutdown: AtomicBool,
+
+    /// Pending connection reset to be reported on the peer's next read.
+    /// This is used to emulate Linux AF_UNIX stream behavior when one end is
+    /// closed with unread data in its receive queue.
+    connreset_pending: AtomicBool,
     /// SCM (ancillary data) queue associated with this byte stream.
     ///
     /// Linux semantics (as exercised by gVisor): ancillary data is attached to
@@ -77,8 +82,19 @@ impl<T: Pod> RingBuffer<T> {
             tail: AtomicUsize::new(0),
             recv_shutdown: AtomicBool::new(false),
             send_shutdown: AtomicBool::new(false),
+            connreset_pending: AtomicBool::new(false),
             scm_queue: SpinLock::new(VecDeque::new()),
         }
+    }
+
+    pub fn set_connreset_pending(&self) {
+        self.connreset_pending
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn take_connreset_pending(&self) -> bool {
+        self.connreset_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
     }
 
     pub fn set_recv_shutdown(&self) {
@@ -366,6 +382,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {
         self.ring_buffer.resize(new_capacity)
     }
+
+    pub fn set_connreset_pending(&self) {
+        self.ring_buffer.set_connreset_pending()
+    }
 }
 
 #[inherit_methods(from = "self.ring_buffer")]
@@ -380,6 +400,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 }
 
 impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+    pub fn take_connreset_pending(&self) -> bool {
+        self.ring_buffer.take_connreset_pending()
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         let rb = &self.ring_buffer;
         if rb.is_empty() {

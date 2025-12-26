@@ -45,6 +45,42 @@ fn clamp_usize_to_i32(v: usize) -> i32 {
     core::cmp::min(v, i32::MAX as usize) as i32
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Linger {
+    l_onoff: i32,
+    l_linger: i32,
+}
+
+impl Linger {
+    const SIZE: usize = core::mem::size_of::<Linger>();
+
+    fn from_optval(optval: &[u8]) -> Result<Self, SystemError> {
+        if optval.len() < Self::SIZE {
+            return Err(SystemError::EINVAL);
+        }
+        let mut on = [0u8; 4];
+        let mut linger = [0u8; 4];
+        on.copy_from_slice(&optval[..4]);
+        linger.copy_from_slice(&optval[4..8]);
+        let l_onoff = i32::from_ne_bytes(on);
+        let l_linger = i32::from_ne_bytes(linger);
+        if l_linger < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(Self { l_onoff, l_linger })
+    }
+
+    fn write_to(&self, out: &mut [u8]) -> Result<usize, SystemError> {
+        if out.len() < Self::SIZE {
+            return Err(SystemError::EINVAL);
+        }
+        out[..4].copy_from_slice(&self.l_onoff.to_ne_bytes());
+        out[4..8].copy_from_slice(&self.l_linger.to_ne_bytes());
+        Ok(Self::SIZE)
+    }
+}
+
 pub mod inner;
 
 #[cast_to([sync] Socket)]
@@ -65,6 +101,13 @@ pub struct UnixStreamSocket {
 
     passcred: AtomicBool,
 
+    linger: SpinLock<Linger>,
+
+    /// Pending connection-reset to be reported on the next read/recv.
+    /// Linux behavior: when a unix stream socket is closed with unread data in its
+    /// receive queue, the peer observes ECONNRESET (af_unix.c:unix_release_sock).
+    connreset_pending: AtomicBool,
+
     sndbuf: AtomicUsize,
     rcvbuf: AtomicUsize,
     send_timeout_us: AtomicU64,
@@ -76,6 +119,9 @@ impl UnixStreamSocket {
     #[allow(dead_code)]
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     pub const MIN_SOCKET_BUF_SIZE: usize = 1024;
+    /// Upper bound for the *effective* (doubled) SO_SNDBUF/SO_RCVBUF value.
+    /// Must be a power-of-two friendly size to keep ring buffer resizes sane.
+    const MAX_EFFECTIVE_SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024;
 
     pub(super) fn new_init(init: Init, is_nonblocking: bool, is_seqpacket: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -89,6 +135,9 @@ impl UnixStreamSocket {
             fasync_items: FAsyncItems::default(),
             peer: SpinLock::new(None),
             passcred: AtomicBool::new(false),
+
+            linger: SpinLock::new(Linger::default()),
+            connreset_pending: AtomicBool::new(false),
 
             sndbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
             rcvbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
@@ -114,6 +163,9 @@ impl UnixStreamSocket {
             peer: SpinLock::new(None),
             passcred: AtomicBool::new(false),
 
+            linger: SpinLock::new(Linger::default()),
+            connreset_pending: AtomicBool::new(false),
+
             sndbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
             rcvbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
             send_timeout_us: AtomicU64::new(0),
@@ -121,13 +173,13 @@ impl UnixStreamSocket {
         })
     }
 
-    fn parse_u32_opt(optval: &[u8]) -> Result<u32, SystemError> {
+    fn parse_i32_opt(optval: &[u8]) -> Result<i32, SystemError> {
         if optval.len() < 4 {
             return Err(SystemError::EINVAL);
         }
         let mut raw = [0u8; 4];
         raw.copy_from_slice(&optval[..4]);
-        Ok(u32::from_ne_bytes(raw))
+        Ok(i32::from_ne_bytes(raw))
     }
 
     fn parse_timeval_opt(optval: &[u8]) -> Result<Duration, SystemError> {
@@ -180,7 +232,8 @@ impl UnixStreamSocket {
 
     fn effective_sockbuf(requested: usize) -> usize {
         let requested = core::cmp::max(Self::MIN_SOCKET_BUF_SIZE, requested);
-        requested.saturating_mul(2)
+        let effective = requested.saturating_mul(2);
+        core::cmp::min(effective, Self::MAX_EFFECTIVE_SOCKET_BUF_SIZE)
     }
 
     fn send_timeout(&self) -> Option<Duration> {
@@ -334,7 +387,10 @@ impl UnixStreamSocket {
         buffer: &[u8],
     ) -> Result<(usize, Wrapping<usize>, usize), SystemError> {
         match self.inner.read().as_ref().expect("inner is None") {
-            Inner::Connected(connected) => connected.try_send(buffer, self.is_seqpacket),
+            Inner::Connected(connected) => {
+                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
+                connected.try_send(buffer, self.is_seqpacket, sndbuf)
+            }
             _ => {
                 // log::error!("the socket is not connected");
                 return Err(SystemError::ENOTCONN);
@@ -415,6 +471,18 @@ impl UnixStreamSocket {
             .expect("UnixStreamSocket inner is None")
         {
             Inner::Listener(listener) => listener.is_acceptable(),
+            _ => false,
+        }
+    }
+
+    fn take_connreset_from_peer(&self) -> bool {
+        match self
+            .inner
+            .read()
+            .as_ref()
+            .expect("UnixStreamSocket inner is None")
+        {
+            Inner::Connected(connected) => connected.take_connreset_from_peer(),
             _ => false,
         }
     }
@@ -539,30 +607,51 @@ impl Socket for UnixStreamSocket {
             .map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
             crate::net::socket::PSO::SNDBUF | crate::net::socket::PSO::SNDBUFFORCE => {
-                let requested = Self::parse_u32_opt(optval)? as usize;
-                let effective = Self::effective_sockbuf(requested);
+                let requested = Self::parse_i32_opt(optval)?;
+                if requested < 0 {
+                    return Err(SystemError::EINVAL);
+                }
+
+                let effective = Self::effective_sockbuf(requested as usize);
                 self.sndbuf.store(effective, Ordering::SeqCst);
 
                 // Underlying ring buffer requires power-of-two capacity.
                 let mut new_cap = effective.next_power_of_two();
                 new_cap = core::cmp::max(new_cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
+                new_cap = core::cmp::min(new_cap, Self::MAX_EFFECTIVE_SOCKET_BUF_SIZE);
 
                 if let Some(Inner::Connected(connected)) = self.inner.read().as_ref() {
-                    connected.resize_sendbuf(new_cap)?;
+                    let cur = connected.send_capacity();
+                    if new_cap > cur {
+                        connected.resize_sendbuf(new_cap)?;
+                    }
                 }
                 Ok(())
             }
             crate::net::socket::PSO::RCVBUF | crate::net::socket::PSO::RCVBUFFORCE => {
-                let requested = Self::parse_u32_opt(optval)? as usize;
-                let effective = Self::effective_sockbuf(requested);
+                let requested = Self::parse_i32_opt(optval)?;
+                if requested < 0 {
+                    return Err(SystemError::EINVAL);
+                }
+
+                let effective = Self::effective_sockbuf(requested as usize);
                 self.rcvbuf.store(effective, Ordering::SeqCst);
 
                 let mut new_cap = effective.next_power_of_two();
                 new_cap = core::cmp::max(new_cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
+                new_cap = core::cmp::min(new_cap, Self::MAX_EFFECTIVE_SOCKET_BUF_SIZE);
 
                 if let Some(Inner::Connected(connected)) = self.inner.read().as_ref() {
-                    connected.resize_recvbuf(new_cap)?;
+                    let cur = connected.recv_capacity();
+                    if new_cap > cur {
+                        connected.resize_recvbuf(new_cap)?;
+                    }
                 }
+                Ok(())
+            }
+            crate::net::socket::PSO::LINGER => {
+                let linger = Linger::from_optval(optval)?;
+                *self.linger.lock() = linger;
                 Ok(())
             }
             crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
@@ -628,6 +717,10 @@ impl Socket for UnixStreamSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
         let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
         loop {
             let result = if self.is_seqpacket {
@@ -659,6 +752,17 @@ impl Socket for UnixStreamSocket {
                     continue;
                 }
                 Ok(n) => {
+                    if n == 0 && !_flags.contains(socket::PMSG::PEEK) {
+                        // Prefer ring-buffer based reset signaling (works for all connection types).
+                        // Keep the per-socket fallback for socketpair legacy paths.
+                        let ring_reset = self.take_connreset_from_peer();
+                        let sock_reset = self
+                            .connreset_pending
+                            .swap(false, core::sync::atomic::Ordering::SeqCst);
+                        if ring_reset || sock_reset {
+                            return Err(SystemError::ECONNRESET);
+                        }
+                    }
                     if n != 0 && !_flags.contains(socket::PMSG::PEEK) {
                         self.wake_peer_writable();
                     }
@@ -961,9 +1065,13 @@ impl Socket for UnixStreamSocket {
                                 let need = if self.is_seqpacket {
                                     buffer.len() + core::mem::size_of::<u32>()
                                 } else {
-                                    1
+                                    buffer.len().max(1)
                                 };
+
+                                let sndbuf = self.sndbuf.load(Ordering::Relaxed);
+                                let queued = connected.outq_len(self.is_seqpacket);
                                 connected.send_free_len() >= need
+                                    && queued.saturating_add(need) <= sndbuf
                             }
                             _ => true,
                         },
@@ -1169,8 +1277,11 @@ impl Socket for UnixStreamSocket {
         flags: socket::PMSG,
         _address: Endpoint,
     ) -> Result<usize, SystemError> {
-        // Linux accepts sendto() on connected AF_UNIX seqpacket/stream sockets; ignore address.
-        self.send(buffer, flags)
+        // Linux: sendto() on an already-connected stream/seqpacket socket with a
+        // destination address fails with EISCONN (as exercised by gVisor tests).
+        let _ = buffer;
+        let _ = flags;
+        Err(SystemError::EISCONN)
     }
 
     fn send_buffer_size(&self) -> usize {
@@ -1231,6 +1342,25 @@ impl Socket for UnixStreamSocket {
                 value[..4].copy_from_slice(&v.to_ne_bytes());
                 Ok(4)
             }
+            crate::net::socket::PSO::LINGER => {
+                let linger = *self.linger.lock();
+                linger.write_to(value)
+            }
+            crate::net::socket::PSO::ACCEPTCONN => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let is_listening = matches!(
+                    self.inner
+                        .read()
+                        .as_ref()
+                        .expect("UnixStreamSocket inner is None"),
+                    Inner::Listener(_)
+                );
+                let v: i32 = if is_listening { 1 } else { 0 };
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
@@ -1246,6 +1376,22 @@ impl Socket for UnixStreamSocket {
 
         match inner {
             Inner::Connected(connected) => {
+                // Linux behavior: if this socket is closed with unread data in its
+                // receive queue, the peer should observe ECONNRESET on the next read.
+                if connected.readable_len(self.is_seqpacket) != 0 {
+                    // Signal via the shared writer ring buffer so it works even when
+                    // UnixStreamSocket.peer isn't wired up (e.g. filesystem/abstract bind).
+                    connected.set_connreset_to_peer();
+
+                    // Best-effort legacy path when peer Arc is known.
+                    if let Some(peer_weak) = self.peer.lock().as_ref() {
+                        if let Some(peer) = peer_weak.upgrade() {
+                            peer.connreset_pending
+                                .store(true, core::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
+
                 // Inform peer that we will no longer receive or send.
                 connected.shutdown_recv();
                 connected.shutdown_send();

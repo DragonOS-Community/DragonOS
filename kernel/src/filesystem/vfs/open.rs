@@ -254,6 +254,12 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     };
     let metadata = inode.metadata()?;
     let file_type: FileType = metadata.file_type;
+
+    // Linux semantics: socket inodes (S_IFSOCK) cannot be opened via open(2).
+    // Users must use socket(2)/connect(2) instead. Linux returns ENXIO.
+    if file_type == FileType::Socket {
+        return Err(SystemError::ENXIO);
+    }
     // 如果路径以斜杠结尾，而目标不是目录，返回 ENOTDIR
     if path_ends_with_slash && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);

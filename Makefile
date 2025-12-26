@@ -178,8 +178,8 @@ run-vnc: check_arch
 
 run-nographic: check_arch
 	$(MAKE) kernel
-	# SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
-	$(MAKE) rootfs
+	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
+	# $(MAKE) rootfs
 	$(MAKE) qemu-nographic
 
 # 在docker中编译，并启动QEMU

@@ -22,14 +22,17 @@ use system_error::SystemError;
 
 pub(in crate::net) const UNIX_STREAM_DEFAULT_BUF_SIZE: usize = 65536;
 
-/// SCM snapshot for recvmsg containing position and ancillary data
+/// SCM snapshot for recvmsg containing ancillary data
 pub(super) struct ScmSnapshot {
-    /// Head position in the ring buffer
-    pub(super) head: Wrapping<usize>,
     /// SCM data at head (optional credentials and file rights)
     pub(super) scm_data: Option<(Option<UCred>, Vec<Arc<File>>)>,
-    /// Next SCM offset after head
-    pub(super) next_scm_offset: Option<Wrapping<usize>>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct StreamRecvmsgMeta {
+    pub(super) copy_len: usize,
+    pub(super) scm_cred: Option<UCred>,
+    pub(super) scm_rights: Vec<Arc<File>>,
 }
 
 #[derive(Debug)]
@@ -435,10 +438,11 @@ impl Connected {
     pub(super) fn push_scm_at(
         &self,
         offset: Wrapping<usize>,
+        len: usize,
         cred: Option<UCred>,
         rights: Vec<Arc<File>>,
     ) {
-        self.writer.lock().push_scm_at(offset, cred, rights)
+        self.writer.lock().push_scm_at(offset, len, cred, rights)
     }
 
     #[allow(dead_code)]
@@ -462,14 +466,58 @@ impl Connected {
 
     pub(super) fn scm_snapshot_for_recvmsg(&self) -> ScmSnapshot {
         let guard = self.reader.lock();
-        let head = guard.head();
-        let scm_data = guard.peek_scm_at(head);
-        let next_scm_offset = guard.next_scm_offset_after(head);
-        ScmSnapshot {
-            head,
-            scm_data,
-            next_scm_offset,
+        let scm_data = guard.peek_scm_at(guard.head());
+        ScmSnapshot { scm_data }
+    }
+
+    pub(super) fn try_recv_stream_recvmsg_meta(
+        &self,
+        buf: &mut [u8],
+        peek: bool,
+        want_creds: bool,
+    ) -> Result<StreamRecvmsgMeta, SystemError> {
+        let mut guard = self.reader.lock();
+
+        let avail_len = guard.len();
+        if avail_len == 0 {
+            if guard.is_send_shutdown() {
+                return Ok(StreamRecvmsgMeta {
+                    copy_len: 0,
+                    scm_cred: None,
+                    scm_rights: Vec::new(),
+                });
+            }
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
+
+        let max = core::cmp::min(buf.len(), avail_len);
+        let plan = guard.plan_stream_recvmsg(max, want_creds);
+        let n = plan.bytes;
+
+        if n != 0 {
+            if peek {
+                if guard.peek_slice(&mut buf[..n]).is_none() {
+                    return Err(SystemError::EFAULT);
+                }
+            } else {
+                if guard.pop_slice_preserve_records(&mut buf[..n]).is_none() {
+                    return Err(SystemError::EFAULT);
+                }
+
+                // Once any bytes of the rights-carrying record are consumed via
+                // recvmsg, rights are either delivered or discarded, but must not
+                // be visible again.
+                if let Some(start) = plan.rights_start {
+                    guard.clear_rights_at(start);
+                }
+            }
+        }
+
+        Ok(StreamRecvmsgMeta {
+            copy_len: n,
+            scm_cred: plan.cred,
+            scm_rights: plan.rights,
+        })
     }
 
     pub(super) fn check_io_events(&self) -> EPollEventType {

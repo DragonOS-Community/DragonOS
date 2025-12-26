@@ -17,11 +17,27 @@ use super::UCred;
 #[derive(Debug, Clone)]
 struct ScmRecord {
     /// Absolute byte offset (in ring-buffer head/tail counter space) where this
-    /// ancillary data becomes visible, i.e. the first byte of its associated
-    /// data in the stream.
-    offset: Wrapping<usize>,
+    /// record begins.
+    start: Wrapping<usize>,
+    /// Length in bytes of this record's payload in the stream.
+    len: usize,
     cred: Option<UCred>,
     rights: Vec<Arc<File>>,
+}
+
+impl ScmRecord {
+    #[inline]
+    fn end(&self) -> Wrapping<usize> {
+        self.start + Wrapping(self.len)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct StreamRecvmsgPlan {
+    pub(super) bytes: usize,
+    pub(super) cred: Option<UCred>,
+    pub(super) rights: Vec<Arc<File>>,
+    pub(super) rights_start: Option<Wrapping<usize>>,
 }
 
 /// unix socket的接收队列
@@ -41,12 +57,15 @@ pub struct RingBuffer<T: Pod> {
     /// This is used to emulate Linux AF_UNIX stream behavior when one end is
     /// closed with unread data in its receive queue.
     connreset_pending: AtomicBool,
-    /// SCM (ancillary data) queue associated with this byte stream.
+    /// Record (per-write) queue associated with this byte stream.
     ///
-    /// Linux semantics (as exercised by gVisor): ancillary data is attached to
-    /// a specific byte position in the stream. It must not be visible before
-    /// that byte is read, and it is discarded if the application consumes the
-    /// associated data via read/recv without recvmsg.
+    /// Linux semantics (as exercised by gVisor): unix stream control messages
+    /// are associated with the data produced by a single write/sendmsg call.
+    /// recvmsg coalescing must respect record boundaries based on SCM_RIGHTS
+    /// and SCM_CREDENTIALS.
+    ///
+    /// When data is consumed via read/recv (not recvmsg), control messages are
+    /// discarded as soon as any of their associated data is read.
     scm_queue: SpinLock<VecDeque<ScmRecord>>,
 }
 
@@ -120,14 +139,17 @@ impl<T: Pod> RingBuffer<T> {
     pub fn push_scm_at(
         &self,
         offset: Wrapping<usize>,
+        len: usize,
         cred: Option<UCred>,
         rights: Vec<Arc<File>>,
     ) {
-        if cred.is_none() && rights.is_empty() {
+        if len == 0 {
+            // Zero-length messages must not make ancillary data visible.
             return;
         }
         self.scm_queue.lock().push_back(ScmRecord {
-            offset,
+            start: offset,
+            len,
             cred,
             rights,
         });
@@ -136,23 +158,150 @@ impl<T: Pod> RingBuffer<T> {
     pub fn peek_scm_at(&self, offset: Wrapping<usize>) -> Option<(Option<UCred>, Vec<Arc<File>>)> {
         let q = self.scm_queue.lock();
         q.front()
-            .filter(|r| r.offset == offset)
+            .filter(|r| r.start <= offset && r.end() > offset)
             .map(|r| (r.cred, r.rights.clone()))
     }
 
     pub fn next_scm_offset_after(&self, offset: Wrapping<usize>) -> Option<Wrapping<usize>> {
         let q = self.scm_queue.lock();
-        q.iter().find(|r| r.offset > offset).map(|r| r.offset)
+        q.iter().find(|r| r.start > offset).map(|r| r.start)
     }
 
+    /// Discard record metadata for records whose start is strictly before `head`.
+    /// Used by read/recv (not recvmsg).
     pub fn advance_scm_to(&self, head: Wrapping<usize>) {
         let mut q = self.scm_queue.lock();
         while let Some(front) = q.front() {
-            if front.offset < head {
+            if front.start < head {
                 q.pop_front();
             } else {
                 break;
             }
+        }
+    }
+
+    /// Advance record metadata to `head`, keeping the current record if `head`
+    /// lies within it. Used by recvmsg.
+    pub fn advance_records_to(&self, head: Wrapping<usize>) {
+        let mut q = self.scm_queue.lock();
+        while let Some(front) = q.front() {
+            if front.end() <= head {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn clear_rights_at(&self, start: Wrapping<usize>) {
+        let mut q = self.scm_queue.lock();
+        for r in q.iter_mut() {
+            if r.start == start {
+                r.rights.clear();
+                break;
+            }
+        }
+    }
+
+    pub(super) fn plan_stream_recvmsg(&self, max: usize, want_creds: bool) -> StreamRecvmsgPlan {
+        if max == 0 {
+            return StreamRecvmsgPlan {
+                bytes: 0,
+                cred: None,
+                rights: Vec::new(),
+                rights_start: None,
+            };
+        }
+
+        let head = self.head();
+        let q = self.scm_queue.lock();
+        if q.is_empty() {
+            return StreamRecvmsgPlan {
+                bytes: max,
+                cred: None,
+                rights: Vec::new(),
+                rights_start: None,
+            };
+        }
+
+        // Find the first record whose end is after head.
+        let mut idx: Option<usize> = None;
+        for (i, r) in q.iter().enumerate() {
+            if r.end() > head {
+                if r.start > head {
+                    // Missing metadata for current stream bytes.
+                    return StreamRecvmsgPlan {
+                        bytes: max,
+                        cred: None,
+                        rights: Vec::new(),
+                        rights_start: None,
+                    };
+                }
+                idx = Some(i);
+                break;
+            }
+        }
+        let Some(mut i) = idx else {
+            return StreamRecvmsgPlan {
+                bytes: max,
+                cred: None,
+                rights: Vec::new(),
+                rights_start: None,
+            };
+        };
+
+        let base_cred = if want_creds { q[i].cred } else { None };
+        let mut pos = head;
+        let mut remaining = max;
+        let mut bytes = 0usize;
+        let mut rights: Vec<Arc<File>> = Vec::new();
+        let mut rights_start: Option<Wrapping<usize>> = None;
+
+        while remaining != 0 {
+            if i >= q.len() {
+                bytes += remaining;
+                break;
+            }
+
+            let r = &q[i];
+            if want_creds && r.cred != base_cred {
+                break;
+            }
+
+            let end = r.end();
+            let avail_in_rec = (end - pos).0;
+            if avail_in_rec == 0 {
+                i += 1;
+                continue;
+            }
+
+            let take = core::cmp::min(remaining, avail_in_rec);
+            bytes += take;
+            remaining -= take;
+            pos += Wrapping(take);
+
+            if rights_start.is_none() && !r.rights.is_empty() {
+                rights = r.rights.clone();
+                rights_start = Some(r.start);
+                break;
+            }
+
+            if remaining == 0 {
+                break;
+            }
+
+            if pos == end {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+
+        StreamRecvmsgPlan {
+            bytes,
+            cred: base_cred,
+            rights,
+            rights_start,
         }
     }
 
@@ -386,10 +535,11 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn push_scm_at(
         &self,
         offset: Wrapping<usize>,
+        len: usize,
         cred: Option<UCred>,
         rights: Vec<Arc<File>>,
     ) {
-        self.ring_buffer.push_scm_at(offset, cred, rights)
+        self.ring_buffer.push_scm_at(offset, len, cred, rights)
     }
 
     pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {
@@ -484,6 +634,50 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         // 更新 head 指针
         rb.advance_head(head, nitems);
         rb.advance_scm_to(head + Wrapping(nitems));
+        Some(())
+    }
+
+    /// Pop a slice while preserving record metadata for partially-consumed
+    /// records. This is used by recvmsg.
+    pub fn pop_slice_preserve_records(&mut self, buf: &mut [T]) -> Option<()> {
+        let rb = &self.ring_buffer;
+        let nitems = buf.len();
+
+        if nitems == 0 {
+            return Some(());
+        }
+
+        // Synchronize with resize(): capacity/offset must match backing storage.
+        let read_guard = rb.buffer.read();
+        let capacity = read_guard.len();
+
+        let head = rb.head();
+        let tail = rb.tail();
+        let available = (tail - head).0;
+        if available < nitems {
+            return None;
+        }
+
+        let offset = head.0 & (capacity - 1);
+
+        let mut start = offset;
+        let mut remaining_len = nitems;
+        let mut buf_start = 0;
+
+        if start + nitems > capacity {
+            let first_part_len = capacity - start;
+            buf[..first_part_len].copy_from_slice(&read_guard[start..start + first_part_len]);
+
+            start = 0;
+            remaining_len -= first_part_len;
+            buf_start = first_part_len;
+        }
+
+        buf[buf_start..buf_start + remaining_len]
+            .copy_from_slice(&read_guard[start..start + remaining_len]);
+
+        rb.advance_head(head, nitems);
+        rb.advance_records_to(head + Wrapping(nitems));
         Some(())
     }
 
@@ -593,6 +787,14 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     pub fn next_scm_offset_after(&self, offset: Wrapping<usize>) -> Option<Wrapping<usize>> {
         self.ring_buffer.next_scm_offset_after(offset)
+    }
+
+    pub(super) fn plan_stream_recvmsg(&self, max: usize, want_creds: bool) -> StreamRecvmsgPlan {
+        self.ring_buffer.plan_stream_recvmsg(max, want_creds)
+    }
+
+    pub fn clear_rights_at(&self, start: Wrapping<usize>) {
+        self.ring_buffer.clear_rights_at(start)
     }
 
     pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {

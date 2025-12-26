@@ -207,7 +207,7 @@
     "hash": "d94351167179beb0bb1b1f3bb82da2ff"
   },
   "en:userland/appdev/index.rst": {
-    "hash": "78e6747475981b5cc17cd206c135ca4f"
+    "hash": "46a9b9ba2cb7616cb7a819fb53418551"
   },
   "en:userland/appdev/c-cpp-quick-start.md": {
     "hash": "0101f8fa98a0536d43ff897145d4a43d"
@@ -264,7 +264,7 @@
     "hash": "8b840ec6af5782d8f793f746b1061ed9"
   },
   "en:index.rst": {
-    "hash": "139ea63381896ae9f861c37ca13c888d"
+    "hash": "1ae9ba61a4f8b87c982fc7a6357319cb"
   },
   "en:questions/index.rst": {
     "hash": "b1cee9bfde04d6375f24c93a29ce3c71"
@@ -328,5 +328,26 @@
   },
   "en:kernel/device/loop_device.md": {
     "hash": "1d637a7d292c4168b326ba46755b5622"
+  },
+  "en:introduction/devcontainer.md": {
+    "hash": "b7ea769ce2562ccbcb27df019ff98cc1"
+  },
+  "en:userland/rootfs/index.rst": {
+    "hash": "bb1f31a04781ace700c8123bdbf2a36c"
+  },
+  "en:userland/rootfs/add-your-own-app.md": {
+    "hash": "0eafcc92a06fb0bb0bea58617318f1aa"
+  },
+  "en:dev-skills/write-docs.md": {
+    "hash": "898241ba5edc255c7fb035d1d5ff9ad1"
+  },
+  "en:introduction/develop_nix.md": {
+    "hash": "40b5b4ae45872b4f9a746aac9cdc8e62"
+  },
+  "en:userland/rootfs/diskgen.md": {
+    "hash": "cc304450faeead2e99367616ede9327a"
+  },
+  "en:dev-skills/nix-skills.md": {
+    "hash": "ce15afc55be2502588220eef9b39b637"
   }
 }

@@ -10,6 +10,7 @@ use crate::{
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 use super::Socket;
@@ -230,13 +231,21 @@ impl<T: Socket + 'static> IndexNode for T {
         _: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         match &*data {
-            FilePrivateData::SocketCreate => Ok(()),
+            FilePrivateData::SocketCreate => {
+                self.open_file_counter().fetch_add(1, Ordering::Release);
+                Ok(())
+            }
             _ => Err(SystemError::ENXIO),
         }
     }
 
     fn close(&self, _: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        self.do_close()
+        // Only tear down the socket on the final close.
+        if self.open_file_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.do_close()
+        } else {
+            Ok(())
+        }
     }
 
     fn read_at(

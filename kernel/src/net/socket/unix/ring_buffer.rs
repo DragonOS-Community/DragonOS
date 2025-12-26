@@ -10,6 +10,7 @@ use core::num::Wrapping;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use inherit_methods_macro::inherit_methods;
+use system_error::SystemError;
 
 use super::UCred;
 
@@ -35,6 +36,11 @@ pub struct RingBuffer<T: Pod> {
     recv_shutdown: AtomicBool,
     /// Producer has performed SHUT_WR (consumer reads return EOF once drained).
     send_shutdown: AtomicBool,
+
+    /// Pending connection reset to be reported on the peer's next read.
+    /// This is used to emulate Linux AF_UNIX stream behavior when one end is
+    /// closed with unread data in its receive queue.
+    connreset_pending: AtomicBool,
     /// SCM (ancillary data) queue associated with this byte stream.
     ///
     /// Linux semantics (as exercised by gVisor): ancillary data is attached to
@@ -76,8 +82,19 @@ impl<T: Pod> RingBuffer<T> {
             tail: AtomicUsize::new(0),
             recv_shutdown: AtomicBool::new(false),
             send_shutdown: AtomicBool::new(false),
+            connreset_pending: AtomicBool::new(false),
             scm_queue: SpinLock::new(VecDeque::new()),
         }
+    }
+
+    pub fn set_connreset_pending(&self) {
+        self.connreset_pending
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn take_connreset_pending(&self) -> bool {
+        self.connreset_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
     }
 
     pub fn set_recv_shutdown(&self) {
@@ -153,13 +170,63 @@ impl<T: Pod> RingBuffer<T> {
     }
 
     pub fn capacity(&self) -> usize {
-        self.buffer.read().capacity()
+        // Use the vector length as the effective ring capacity.
+        // Vec::capacity() may change independently (realloc/grow), which would break
+        // the ring-buffer modulo/mask arithmetic.
+        self.buffer.read().len()
+    }
+
+    /// Resize the ring buffer to a new power-of-two capacity.
+    ///
+    /// Keeps head/tail counters in the same absolute space and remaps the stored
+    /// data to the new backing buffer. This preserves SCM offsets, which are
+    /// expressed in the same head/tail counter space.
+    ///
+    /// Safety/concurrency: protected by the internal buffer write lock; readers/writers
+    /// take the buffer lock for accessing the backing storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SystemError::EINVAL` if `new_capacity` is not a power of two.
+    /// Returns `SystemError::ENOBUFS` if `new_capacity` is too small for existing data.
+    pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {
+        if !new_capacity.is_power_of_two() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut guard = self.buffer.write();
+        let old_capacity = guard.len();
+        if new_capacity == old_capacity {
+            return Ok(());
+        }
+
+        let head = self.head();
+        let tail = self.tail();
+        let len = (tail - head).0;
+        if len > new_capacity {
+            return Err(SystemError::ENOBUFS);
+        }
+
+        let old = core::mem::take(&mut *guard);
+        let mut new_buf = Vec::with_capacity(new_capacity);
+        new_buf.resize_with(new_capacity, T::new_zeroed);
+
+        for i in 0..len {
+            let pos = head.0.wrapping_add(i);
+            let old_idx = pos & (old_capacity - 1);
+            let new_idx = pos & (new_capacity - 1);
+            new_buf[new_idx] = old[old_idx];
+        }
+
+        *guard = new_buf;
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[allow(unused)]
     pub fn is_full(&self) -> bool {
         self.free_len() == 0
     }
@@ -241,19 +308,21 @@ impl<T: Pod> RingBuffer<T> {
 impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn push(&mut self, item: T) -> Option<()> {
         let rb = &self.ring_buffer;
-        if rb.is_full() {
+
+        // Synchronize with resize(): compute capacity and index under the same lock
+        // so the modulo/mask arithmetic matches the actual backing storage layout.
+        let mut write_guard = rb.buffer.write();
+        let capacity = write_guard.len();
+
+        let head = rb.head();
+        let tail = rb.tail();
+        let len = (tail - head).0;
+        if len >= capacity {
             return None;
         }
 
-        let tail = rb.tail();
-        let index = tail.0 & (rb.capacity() - 1);
-
-        let mut write_guard = rb.buffer.write();
-        if index >= rb.len() {
-            write_guard.push(item);
-        } else {
-            write_guard[index] = item;
-        }
+        let index = tail.0 & (capacity - 1);
+        write_guard[index] = item;
 
         rb.advance_tail(tail, 1);
         Some(())
@@ -262,19 +331,29 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn push_slice(&mut self, items: &[T]) -> Option<()> {
         let rb = &self.ring_buffer;
         let nitems = items.len();
-        if rb.free_len() < nitems {
+
+        if nitems == 0 {
+            return Some(());
+        }
+
+        // Synchronize with resize(): capacity/offset must be derived from the same
+        // backing buffer we are about to write to.
+        let mut write_guard = rb.buffer.write();
+        let capacity = write_guard.len();
+
+        let head = rb.head();
+        let tail = rb.tail();
+        let len = (tail - head).0;
+        if capacity - len < nitems {
             return None;
         }
-        let capacity = rb.capacity();
 
-        let tail = rb.tail();
         let offset = tail.0 & (capacity - 1);
 
         // Write items in two parts if necessary
         let mut start = offset;
         let mut remaining_items = items;
 
-        let mut write_guard = rb.buffer.write();
         if start + nitems > capacity {
             let first_part = &remaining_items[..capacity - start];
             write_guard[start..start + first_part.len()].copy_from_slice(first_part);
@@ -312,6 +391,14 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     ) {
         self.ring_buffer.push_scm_at(offset, cred, rights)
     }
+
+    pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {
+        self.ring_buffer.resize(new_capacity)
+    }
+
+    pub fn set_connreset_pending(&self) {
+        self.ring_buffer.set_connreset_pending()
+    }
 }
 
 #[inherit_methods(from = "self.ring_buffer")]
@@ -326,16 +413,25 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 }
 
 impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+    pub fn take_connreset_pending(&self) -> bool {
+        self.ring_buffer.take_connreset_pending()
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         let rb = &self.ring_buffer;
-        if rb.is_empty() {
+
+        // Synchronize with resize(): compute capacity/index under the same lock.
+        let read_guard = rb.buffer.read();
+        let capacity = read_guard.len();
+
+        let head = rb.head();
+        let tail = rb.tail();
+        let len = (tail - head).0;
+        if len == 0 {
             return None;
         }
 
-        let head = rb.head();
-        let index = head.0 & (rb.capacity() - 1);
-
-        let read_guard = rb.buffer.read();
+        let index = head.0 & (capacity - 1);
         // 因为T是Pod类型，所以可以安全地进行复制
         let item = read_guard[index];
 
@@ -349,22 +445,31 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     pub fn pop_slice(&mut self, buf: &mut [T]) -> Option<()> {
         let rb = &self.ring_buffer;
         let nitems = buf.len();
-        if rb.len() < nitems {
+
+        if nitems == 0 {
+            return Some(());
+        }
+
+        // Synchronize with resize(): capacity/offset must match backing storage.
+        let read_guard = rb.buffer.read();
+        let capacity = read_guard.len();
+
+        let head = rb.head();
+        let tail = rb.tail();
+        let available = (tail - head).0;
+        if available < nitems {
             return None;
         }
 
-        let head = rb.head();
-        let offset = head.0 & (rb.capacity() - 1);
-
-        let read_guard = rb.buffer.read();
+        let offset = head.0 & (capacity - 1);
 
         let mut start = offset;
         let mut remaining_len = nitems;
         let mut buf_start = 0;
 
         // 如果需要读取的数据环绕了缓冲区的末尾
-        if start + nitems > rb.capacity() {
-            let first_part_len = rb.capacity() - start;
+        if start + nitems > capacity {
+            let first_part_len = capacity - start;
             buf[..first_part_len].copy_from_slice(&read_guard[start..start + first_part_len]);
 
             start = 0;
@@ -388,22 +493,31 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     pub fn peek_slice(&self, buf: &mut [T]) -> Option<()> {
         let rb = &self.ring_buffer;
         let nitems = buf.len();
-        if rb.len() < nitems {
+
+        if nitems == 0 {
+            return Some(());
+        }
+
+        // Synchronize with resize(): capacity/offset must match backing storage.
+        let read_guard = rb.buffer.read();
+        let capacity = read_guard.len();
+
+        let head = rb.head();
+        let tail = rb.tail();
+        let available = (tail - head).0;
+        if available < nitems {
             return None;
         }
 
-        let head = rb.head();
-        let offset = head.0 & (rb.capacity() - 1);
-
-        let read_guard = rb.buffer.read();
+        let offset = head.0 & (capacity - 1);
 
         let mut start = offset;
         let mut remaining_len = nitems;
         let mut buf_start = 0;
 
         // If the data wraps around the end of the buffer.
-        if start + nitems > rb.capacity() {
-            let first_part_len = rb.capacity() - start;
+        if start + nitems > capacity {
+            let first_part_len = capacity - start;
             buf[..first_part_len].copy_from_slice(&read_guard[start..start + first_part_len]);
 
             start = 0;
@@ -436,9 +550,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             return None;
         }
 
-        let capacity = rb.capacity();
-        let start_index = offset.0 & (capacity - 1);
+        // Synchronize with resize(): capacity/offset must match backing storage.
         let read_guard = rb.buffer.read();
+        let capacity = read_guard.len();
+        let start_index = offset.0 & (capacity - 1);
 
         let mut start = start_index;
         let mut remaining_len = nitems;
@@ -478,6 +593,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     pub fn next_scm_offset_after(&self, offset: Wrapping<usize>) -> Option<Wrapping<usize>> {
         self.ring_buffer.next_scm_offset_after(offset)
+    }
+
+    pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {
+        self.ring_buffer.resize(new_capacity)
     }
 }
 

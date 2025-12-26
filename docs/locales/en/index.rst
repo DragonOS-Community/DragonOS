@@ -6,7 +6,7 @@ English
 
    - Source document: index.rst
 
-   - Translation time: 2025-11-22 06:50:01
+   - Translation time: 2025-12-26 10:51:48
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -24,6 +24,8 @@ English
 
    introduction/index
    introduction/build_system
+   introduction/develop_nix
+   introduction/devcontainer
    introduction/mirrors
 
 .. toctree::
@@ -54,6 +56,14 @@ English
    :caption: Application Layer
 
    userland/appdev/index
+   userland/rootfs/index
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Development Guide
+
+   dev-skills/nix-skills
+   dev-skills/write-docs
 
 .. toctree::
    :maxdepth: 1

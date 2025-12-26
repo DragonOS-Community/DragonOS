@@ -395,6 +395,7 @@ impl X86_64MMArch {
                 // );
 
                 send_segv();
+                return;
             }
             let mapper = &mut space_guard.user_mapper.utable;
             let message = PageFaultMessage::new(vma.clone(), address, flags, mapper);
@@ -434,23 +435,20 @@ impl X86_64MMArch {
             }
 
             // 用户态 fault：发送对应信号
-            let mut info = if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
-                SigInfo::new(
-                    Signal::SIGSEGV,
-                    0,
-                    SigCode::User,
-                    SigType::Kill(ProcessManager::current_pid()),
-                )
+            let sig = if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
+                Signal::SIGSEGV
             } else {
-                // 包括 SIGBUS / OOM / HWPOISON 等统一 SIGBUS
-                SigInfo::new(
-                    Signal::SIGBUS,
-                    0,
-                    SigCode::User,
-                    SigType::Kill(ProcessManager::current_pid()),
-                )
+                // 包括 SIGBUS / OOM / HWPOISON 等：目前统一 SIGBUS（后续可按 Linux 进一步细分）
+                Signal::SIGBUS
             };
-            let _ = Signal::SIGBUS.send_signal_info(Some(&mut info), ProcessManager::current_pid());
+
+            let mut info = SigInfo::new(
+                sig,
+                0,
+                SigCode::User,
+                SigType::Kill(ProcessManager::current_pid()),
+            );
+            let _ = sig.send_signal_info(Some(&mut info), ProcessManager::current_pid());
             return;
         }
 

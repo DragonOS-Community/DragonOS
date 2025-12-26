@@ -22,6 +22,7 @@ dockerInstall="true"
 DEFAULT_INSTALL="false"
 CI_INSTALL="false"
 APT_FLAG=""
+INSTALL_MODE=""
 
 export RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER:-https://rsproxy.cn}
 export RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}
@@ -47,6 +48,80 @@ congratulations()
 	echo "|          make run-nographic              |"
 	echo "|                                          |"
 	echo "|------------------------------------------|"
+}
+
+congratulations_nix()
+{
+	echo "|-----------Congratulations!---------------|"
+	echo "|                                          |"
+	echo "|   Nix 已成功安装!                        |"
+	echo "|                                          |"
+	echo "|   请[关闭]当前终端, 并[重新打开]一个终端 |"
+	echo "|   然后通过以下命令进入开发环境:          |"
+	echo "|                                          |"
+	echo "|   nix develop ./tools/nix-dev-shell      |"
+	echo "|                                          |"
+	echo "|------------------------------------------|"
+}
+
+####################################################################################
+# 安装 Nix 包管理器
+####################################################################################
+install_nix()
+{
+	if [ -n "$(which nix)" ]; then
+		echo "Nix 已经安装在您的系统上。"
+		return 0
+	fi
+
+	echo "正在安装 Nix 包管理器..."
+	curl -fsSL https://install.determinate.systems/nix | sh -s -- install
+
+	if [ $? -ne 0 ]; then
+		echo "Nix 安装失败！"
+		exit 1
+	fi
+
+	echo "Nix 安装成功！"
+
+	# Source nix environment
+	if [ -f "/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh" ]; then
+		. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+	fi
+}
+
+####################################################################################
+# 询问用户选择安装模式
+####################################################################################
+ask_install_mode()
+{
+	if [ "$CI_INSTALL" = "true" ]; then
+		INSTALL_MODE="legacy"
+		return
+	fi
+
+	if [ -n "$INSTALL_MODE" ]; then
+		return
+	fi
+
+	echo ""
+	echo "请选择安装模式:"
+	echo "  1) nix    - 仅安装 Nix，使用 nix develop 进入开发环境 (推荐)"
+	echo "  2) legacy - 安装 Nix 后继续安装传统依赖 (完整安装)"
+	echo ""
+	printf "请输入选项 (1/2) [默认: 1]: "
+	read mode_choice
+
+	case "$mode_choice" in
+		2|legacy)
+			INSTALL_MODE="legacy"
+			echo "已选择: legacy 模式 (完整安装)"
+			;;
+		*)
+			INSTALL_MODE="nix"
+			echo "已选择: nix 模式 (仅 Nix)"
+			;;
+	esac
 }
 
 ####################################
@@ -330,8 +405,16 @@ while true; do
 			dockerInstall=""
 			APT_FLAG="--no-install-recommends"
 		;;
+		"--nix")
+			INSTALL_MODE="nix"
+		;;
+		"--legacy")
+			INSTALL_MODE="legacy"
+		;;
 		"--help")
 			echo "--no-docker(not install docker): 该参数表示执行该脚本的过程中不单独安装docker."
+			echo "--nix: 仅安装 Nix，使用 nix develop 进入开发环境."
+			echo "--legacy: 安装 Nix 后继续安装传统依赖 (完整安装)."
 			exit 0
 		;;
 		*)
@@ -343,6 +426,21 @@ done
 
 ############ 开始执行 ###############
 banner 			# 开始横幅
+
+# 询问安装模式
+ask_install_mode
+
+# 安装 Nix
+install_nix
+
+# 如果是 nix 模式，直接结束
+if [ "$INSTALL_MODE" = "nix" ]; then
+	congratulations_nix
+	exit 0
+fi
+
+# 以下是 legacy 模式的安装流程
+echo "继续安装传统依赖..."
 
 if [ "Darwin" == "$(uname -s)" ]; then
 	install_osx_pkg "$emulator" || exit 1

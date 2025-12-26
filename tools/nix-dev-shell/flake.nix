@@ -41,7 +41,14 @@
           };
 
           # Shell启动脚本
-          shellHook = '''';
+          shellHook = ''
+            echo "欢迎进入 DragonOS Nix 开发环境!"
+            echo "要运行 DragonOS，请构建内核、rootfs，再QEMU运行"
+            echo "  构建内核:    make kernel"
+            echo "  构建 rootfs: nix run .#rootfs-x86_64"
+            echo "  QEMU 运行:   nix run .#start-x86_64"
+            echo "  文档：       https://docs.dragonos.org.cn/"
+          '';
         };
 
         # 兼容旧版nix-shell命令

@@ -9,16 +9,35 @@
   testOpt,
   rootfsType ? "vfat",
   diskPath,
-  partitionType ? "mbr"
+  partitionType ? "mbr",
 }:
 
 let
-  image = import ./rootfs-tar.nix { inherit lib pkgs nixpkgs system target fenix testOpt; };
+  image = import ./rootfs-tar.nix {
+    inherit
+      lib
+      pkgs
+      nixpkgs
+      system
+      target
+      fenix
+      testOpt
+      ;
+  };
 
   # 构建脚本 - 在bin/目录下构建
   buildScript = pkgs.writeShellApplication {
     name = "dragonos-rootfs";
-    runtimeInputs = [ pkgs.coreutils pkgs.gnutar pkgs.libguestfs-with-appliance pkgs.findutils ];
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.gnutar
+      pkgs.libguestfs-with-appliance
+      pkgs.findutils
+      pkgs.parted
+      pkgs.dosfstools
+      pkgs.e2fsprogs
+      pkgs.util-linux
+    ];
     text = ''
       set -euo pipefail
 
@@ -31,7 +50,8 @@ let
 
       # 创建临时目录
       TEMP_DIR=$(mktemp -d)
-      trap 'chmod +w -R "$TEMP_DIR" && rm -rf "$TEMP_DIR"' EXIT
+      EXTRACT_DIR=""  # 初始化为空，vfat 处理时会赋值
+      trap 'chmod +w -R "$TEMP_DIR" 2>/dev/null && rm -rf "$TEMP_DIR"; [ -n "$EXTRACT_DIR" ] && chmod +w -R "$EXTRACT_DIR" 2>/dev/null && rm -rf "$EXTRACT_DIR"' EXIT
 
       # 提取 layer.tar (rootfs)
       echo "  Extracting rootfs layer..."
@@ -60,9 +80,6 @@ let
         EXTRACT_DIR=$(mktemp -d)
         FILTERED_TAR="${buildDir}/rootfs-filtered.tar"
 
-        # 添加到清理列表
-        trap 'chmod +w -R "$TEMP_DIR" "$EXTRACT_DIR" && rm -rf "$TEMP_DIR" "$EXTRACT_DIR"' EXIT
-
         # 解压原始 tar，排除 /nix/store
         echo "    Extracting and not filtering..."
         # tar --exclude='nix' -xf "$OUTPUT_TAR" -C "$EXTRACT_DIR"
@@ -82,9 +99,6 @@ let
 
       echo "==> Building disk image at ${diskPath}"
 
-      export LIBGUESTFS_CACHEDIR=/tmp
-      export LIBGUESTFS_BACKEND=direct
-
       # 创建磁盘镜像并初始化文件系统
       echo "  Creating disk image..."
       TEMP_IMG="${diskPath}.tmp"
@@ -94,20 +108,109 @@ let
       DISK_SIZE_KB=$(( TAR_SIZE_KB + 1024 * 1024 ))
       truncate -s "''${DISK_SIZE_KB}K" "$TEMP_IMG"
 
-      # 使用 guestfish 创建分区并注入 tar
-      echo "  Initializing disk and copying rootfs..."
-      guestfish -a "$TEMP_IMG" <<EOF
-        run
-        part-init /dev/sda ${partitionType}
-        part-add /dev/sda primary 2048 -2048
-        mkfs ${rootfsType} /dev/sda1
-        mount /dev/sda1 /
-        tar-in $FINAL_TAR /
-        chmod 0755 /
-        umount /
-        sync
-        shutdown
+      # 检查是否使用非特权构建模式（guestfish）
+      # shellcheck disable=SC2050
+      if [ "''${DRAGONOS_UNPRIVILEGED_BUILD:-0}" = "1" ]; then
+        echo "  Using guestfish (unprivileged mode)..."
+        export LIBGUESTFS_CACHEDIR=/tmp
+        export LIBGUESTFS_BACKEND=direct
+
+        # 使用 guestfish 创建分区并注入 tar
+        echo "  Initializing disk and copying rootfs..."
+        guestfish -a "$TEMP_IMG" <<EOF
+          run
+          part-init /dev/sda ${partitionType}
+          part-add /dev/sda primary 2048 -2048
+          mkfs ${rootfsType} /dev/sda1
+          mount /dev/sda1 /
+          tar-in $FINAL_TAR /
+          chmod 0755 /
+          umount /
+          sync
+          shutdown
       EOF
+      else
+        echo "  Using loop device (privileged mode, faster)..."
+
+        # 使用 parted 创建分区表和分区
+        echo "    Creating partition table..."
+        # parted 使用 msdos 而不是 mbr
+        PARTED_LABEL="${partitionType}"
+        if [ "$PARTED_LABEL" = "mbr" ]; then
+          PARTED_LABEL="msdos"
+        fi
+        parted -s "$TEMP_IMG" mklabel "$PARTED_LABEL"
+        parted -s "$TEMP_IMG" mkpart primary ${rootfsType} 1MiB 100%
+
+        # 设置 loop 设备
+        echo "    Setting up loop device..."
+        LOOP_DEV=$(sudo losetup --find --show --partscan "$TEMP_IMG")
+        echo "    Loop device: $LOOP_DEV"
+
+        # 确保清理 loop 设备
+        # shellcheck disable=SC2317,SC2329
+        cleanup_loop() {
+          echo "    Cleaning up loop device..."
+          sudo umount "''${LOOP_DEV}p1" 2>/dev/null || true
+          sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+        }
+        trap 'cleanup_loop; chmod +w -R "$TEMP_DIR" 2>/dev/null && rm -rf "$TEMP_DIR"; [ -n "$EXTRACT_DIR" ] && chmod +w -R "$EXTRACT_DIR" 2>/dev/null && rm -rf "$EXTRACT_DIR"' EXIT
+
+        # 等待分区设备出现
+        echo "    Waiting for partition device..."
+        for _ in $(seq 1 10); do
+          if [ -b "''${LOOP_DEV}p1" ]; then
+            break
+          fi
+          sleep 0.1
+        done
+
+        if [ ! -b "''${LOOP_DEV}p1" ]; then
+          echo "Error: Partition device ''${LOOP_DEV}p1 not found"
+          exit 1
+        fi
+
+        # 格式化分区
+        echo "    Formatting partition as ${rootfsType}..."
+        # shellcheck disable=SC2050
+        if [ "${rootfsType}" = "vfat" ]; then
+          sudo mkfs.vfat "''${LOOP_DEV}p1"
+        elif [ "${rootfsType}" = "ext4" ]; then
+          sudo mkfs.ext4 -F "''${LOOP_DEV}p1"
+        else
+          sudo mkfs -t ${rootfsType} "''${LOOP_DEV}p1"
+        fi
+
+        # 挂载分区
+        MOUNT_DIR=$(mktemp -d)
+        echo "    Mounting partition to $MOUNT_DIR..."
+        sudo mount "''${LOOP_DEV}p1" "$MOUNT_DIR"
+
+        # 更新 trap 以包含 MOUNT_DIR
+        # shellcheck disable=SC2317,SC2329
+        cleanup_loop() {
+          echo "    Cleaning up..."
+          sudo umount "$MOUNT_DIR" 2>/dev/null || true
+          sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+          rm -rf "$MOUNT_DIR" 2>/dev/null || true
+        }
+        trap 'cleanup_loop; chmod +w -R "$TEMP_DIR" 2>/dev/null && rm -rf "$TEMP_DIR"; [ -n "$EXTRACT_DIR" ] && chmod +w -R "$EXTRACT_DIR" 2>/dev/null && rm -rf "$EXTRACT_DIR"' EXIT
+
+        # 解压 tar 到分区
+        echo "    Extracting rootfs to partition..."
+        sudo tar -xf "$FINAL_TAR" -C "$MOUNT_DIR"
+        sudo chmod 0755 "$MOUNT_DIR"
+
+        # 同步并卸载
+        echo "    Syncing and unmounting..."
+        sync
+        sudo umount "$MOUNT_DIR"
+        sudo losetup -d "$LOOP_DEV"
+        rm -rf "$MOUNT_DIR"
+
+        # 重置 trap
+        trap 'chmod +w -R "$TEMP_DIR" 2>/dev/null && rm -rf "$TEMP_DIR"; [ -n "$EXTRACT_DIR" ] && chmod +w -R "$EXTRACT_DIR" 2>/dev/null && rm -rf "$EXTRACT_DIR"' EXIT
+      fi
 
       mv "$TEMP_IMG" "${diskPath}"
 
@@ -120,4 +223,5 @@ let
     '';
   };
 
-in buildScript
+in
+buildScript

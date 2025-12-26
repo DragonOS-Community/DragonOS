@@ -57,7 +57,6 @@ dependencies = [
 [[package]]
 name = "another_ext4"
 version = "0.1.0"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/another_ext4.git?rev=8bc384254c#8bc384254c7b7464afcdc312fb0c0aa622e2467e"
 dependencies = [
  "bitflags 2.9.1",
  "log",

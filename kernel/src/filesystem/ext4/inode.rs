@@ -136,14 +136,16 @@ impl IndexNode for LockedExt4Inode {
             fs.fs
                 .setattr(
                     inode_num,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(time),
-                    None,
-                    None,
-                    None,
+                    another_ext4::SetAttr {
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        size: None,
+                        atime: Some(time),
+                        mtime: None,
+                        ctime: None,
+                        crtime: None,
+                    },
                 )
                 .map_err(SystemError::from)?;
             page_cache.read(offset, buf)
@@ -207,14 +209,16 @@ impl IndexNode for LockedExt4Inode {
             fs.fs
                 .setattr(
                     inode_num,
-                    None,
-                    None,
-                    None,
-                    Some(current_file_size),
-                    None,
-                    Some(time),
-                    None,
-                    None,
+                    another_ext4::SetAttr {
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        size: Some(current_file_size),
+                        atime: None,
+                        mtime: Some(time),
+                        ctime: None,
+                        crtime: None,
+                    },
                 )
                 .map_err(SystemError::from)?;
             Ok(write_len)
@@ -397,16 +401,18 @@ impl IndexNode for LockedExt4Inode {
         let ext4 = &guard.concret_fs().fs;
         ext4.setattr(
             guard.inner_inode_num,
-            Some(another_ext4::InodeMode::from_bits_truncate(
-                mode.bits() as u16
-            )),
-            Some(metadata.uid as u32),
-            Some(metadata.gid as u32),
-            Some(metadata.size as u64),
-            Some(to_ext4_time(&metadata.atime)),
-            Some(to_ext4_time(&metadata.mtime)),
-            Some(to_ext4_time(&metadata.ctime)),
-            Some(to_ext4_time(&metadata.btime)),
+            another_ext4::SetAttr {
+                mode: Some(another_ext4::InodeMode::from_bits_truncate(
+                    mode.bits() as u16
+                )),
+                uid: Some(metadata.uid as u32),
+                gid: Some(metadata.gid as u32),
+                size: Some(metadata.size as u64),
+                atime: Some(to_ext4_time(&metadata.atime)),
+                mtime: Some(to_ext4_time(&metadata.mtime)),
+                ctime: Some(to_ext4_time(&metadata.ctime)),
+                crtime: Some(to_ext4_time(&metadata.btime)),
+            },
         )?;
 
         Ok(())
@@ -418,14 +424,16 @@ impl IndexNode for LockedExt4Inode {
         // 仅调整文件大小，其他属性保持不变
         ext4.setattr(
             guard.inner_inode_num,
-            None,
-            None,
-            None,
-            Some(len as u64),
-            None,
-            None,
-            None,
-            None,
+            another_ext4::SetAttr {
+                mode: None,
+                uid: None,
+                gid: None,
+                size: Some(len as u64),
+                atime: None,
+                mtime: None,
+                ctime: None,
+                crtime: None,
+            },
         )
         .map_err(SystemError::from)?;
         Ok(())

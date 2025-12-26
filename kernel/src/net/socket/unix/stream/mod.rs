@@ -84,6 +84,14 @@ impl Linger {
 
 pub mod inner;
 
+fn ring_cap_for_effective_sockbuf(effective: usize) -> usize {
+    // Underlying ring buffer requires power-of-two capacity.
+    let mut cap = effective.next_power_of_two();
+    cap = core::cmp::max(cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
+    cap = core::cmp::min(cap, UnixStreamSocket::MAX_EFFECTIVE_SOCKET_BUF_SIZE);
+    cap
+}
+
 #[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct UnixStreamSocket {
@@ -95,6 +103,7 @@ pub struct UnixStreamSocket {
     inode_id: InodeId,
     open_files: AtomicUsize,
     netns: Arc<NetNamespace>,
+    self_weak: Weak<UnixStreamSocket>,
     /// Peer socket for socket pairs (used for SIGIO notification)
     peer: SpinLock<Option<Weak<UnixStreamSocket>>>,
 
@@ -131,12 +140,13 @@ impl UnixStreamSocket {
         is_seqpacket: bool,
         netns: Arc<NetNamespace>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|self_weak| Self {
             inner: RwLock::new(Some(Inner::Init(init))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
             netns,
+            self_weak: self_weak.clone(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
@@ -160,12 +170,13 @@ impl UnixStreamSocket {
         is_seqpacket: bool,
         netns: Arc<NetNamespace>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|self_weak| Self {
             inner: RwLock::new(Some(Inner::Connected(connected))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
             netns,
+            self_weak: self_weak.clone(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             is_seqpacket,
             epitems: EPollItems::default(),
@@ -425,10 +436,18 @@ impl UnixStreamSocket {
         let inner = writer.take().expect("inner is None");
 
         let (inner, result) = match inner {
-            Inner::Init(init) => match backlog.push_incoming(init, self.is_seqpacket) {
-                Ok(connected) => (Inner::Connected(connected), Ok(())),
-                Err((init, err)) => (Inner::Init(init), Err(err)),
-            },
+            Inner::Init(init) => {
+                let this = self
+                    .self_weak
+                    .upgrade()
+                    .expect("UnixStreamSocket self_weak upgrade failed");
+                let snd = self.sndbuf.load(Ordering::Relaxed);
+                let rcv = self.rcvbuf.load(Ordering::Relaxed);
+                match backlog.push_incoming(init, this, self.is_seqpacket, snd, rcv) {
+                    Ok(connected) => (Inner::Connected(connected), Ok(())),
+                    Err((init, err)) => (Inner::Init(init), Err(err)),
+                }
+            }
             Inner::Listener(inner) => (Inner::Listener(inner), Err(SystemError::EINVAL)),
             Inner::Connected(connected) => (Inner::Connected(connected), Err(SystemError::EISCONN)),
         };
@@ -445,11 +464,9 @@ impl UnixStreamSocket {
 
     pub fn try_accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
         match self.inner.write().as_mut().expect("inner is None") {
-            Inner::Listener(listener) => listener.try_accept(
-                self.is_seqpacket,
-                self.passcred.load(core::sync::atomic::Ordering::Relaxed),
-                &self.netns,
-            ) as _,
+            Inner::Listener(listener) => {
+                listener.try_accept(self.passcred.load(core::sync::atomic::Ordering::Relaxed)) as _
+            }
             _ => {
                 log::error!("the socket is not listening");
                 return Err(SystemError::EINVAL);
@@ -647,7 +664,16 @@ impl Socket for UnixStreamSocket {
 
         let (inner, err) = match writer.take().expect("UnixStreamSocket inner is None") {
             Inner::Init(init) => {
-                match init.listen(backlog, self.is_seqpacket, self.wait_queue.clone()) {
+                let snd = self.sndbuf.load(Ordering::Relaxed);
+                let rcv = self.rcvbuf.load(Ordering::Relaxed);
+                match init.listen(
+                    backlog,
+                    self.is_seqpacket,
+                    self.wait_queue.clone(),
+                    snd,
+                    rcv,
+                    self.netns.clone(),
+                ) {
                     Ok(listener) => (Inner::Listener(listener), None),
                     Err((err, init)) => (Inner::Init(init), Some(err)),
                 }
@@ -702,15 +728,19 @@ impl Socket for UnixStreamSocket {
                 let effective = Self::effective_sockbuf(requested as usize);
                 self.sndbuf.store(effective, Ordering::SeqCst);
 
-                // Underlying ring buffer requires power-of-two capacity.
-                let mut new_cap = effective.next_power_of_two();
-                new_cap = core::cmp::max(new_cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
-                new_cap = core::cmp::min(new_cap, Self::MAX_EFFECTIVE_SOCKET_BUF_SIZE);
-
-                if let Some(Inner::Connected(connected)) = self.inner.read().as_ref() {
-                    let cur = connected.send_capacity();
-                    if new_cap > cur {
-                        connected.resize_sendbuf(new_cap)?;
+                let new_cap = ring_cap_for_effective_sockbuf(effective);
+                if let Some(inner) = self.inner.read().as_ref() {
+                    match inner {
+                        Inner::Connected(connected) => {
+                            let cur = connected.send_capacity();
+                            if new_cap > cur {
+                                connected.resize_sendbuf(new_cap)?;
+                            }
+                        }
+                        Inner::Listener(listener) => {
+                            listener.set_sndbuf_effective(effective);
+                        }
+                        Inner::Init(_) => {}
                     }
                 }
                 Ok(())
@@ -724,14 +754,19 @@ impl Socket for UnixStreamSocket {
                 let effective = Self::effective_sockbuf(requested as usize);
                 self.rcvbuf.store(effective, Ordering::SeqCst);
 
-                let mut new_cap = effective.next_power_of_two();
-                new_cap = core::cmp::max(new_cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
-                new_cap = core::cmp::min(new_cap, Self::MAX_EFFECTIVE_SOCKET_BUF_SIZE);
-
-                if let Some(Inner::Connected(connected)) = self.inner.read().as_ref() {
-                    let cur = connected.recv_capacity();
-                    if new_cap > cur {
-                        connected.resize_recvbuf(new_cap)?;
+                let new_cap = ring_cap_for_effective_sockbuf(effective);
+                if let Some(inner) = self.inner.read().as_ref() {
+                    match inner {
+                        Inner::Connected(connected) => {
+                            let cur = connected.recv_capacity();
+                            if new_cap > cur {
+                                connected.resize_recvbuf(new_cap)?;
+                            }
+                        }
+                        Inner::Listener(listener) => {
+                            listener.set_rcvbuf_effective(effective);
+                        }
+                        Inner::Init(_) => {}
                     }
                 }
                 Ok(())

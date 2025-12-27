@@ -962,41 +962,14 @@ impl Socket for UnixStreamSocket {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let mut buf = iovs.new_buf(true);
 
-        // Snapshot SCM state at the current stream head.
-        let snapshot = match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("UnixStreamSocket inner is None")
-        {
-            Inner::Connected(connected) => connected.scm_snapshot_for_recvmsg(),
-            _ => inner::ScmSnapshot {
-                head: Wrapping(0),
-                scm_data: None,
-                next_scm_offset: None,
-            },
-        };
-
-        // Do not coalesce across the next SCM boundary. This prevents consuming bytes that have
-        // an SCM record attached (at a future offset) without returning that ancillary.
-        let max_read = if self.is_seqpacket {
-            // SOCK_SEQPACKET recv consumes exactly one record; it cannot cross SCM boundaries.
-            buf.len()
-        } else if let Some(next) = snapshot.next_scm_offset {
-            let dist = (next - snapshot.head).0;
-            if dist == 0 {
-                buf.len()
-            } else {
-                core::cmp::min(buf.len(), dist)
-            }
-        } else {
-            buf.len()
-        };
-
         // Read payload first.
         let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
         let peek = _flags.contains(socket::PMSG::PEEK);
-        let (payload_copy_len, orig_len, truncated, ret_len) = if self.is_seqpacket {
+        let want_creds = self.passcred.load(core::sync::atomic::Ordering::Relaxed);
+
+        let (payload_copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights) = if self
+            .is_seqpacket
+        {
             loop {
                 match self
                     .inner
@@ -1005,14 +978,22 @@ impl Socket for UnixStreamSocket {
                     .expect("UnixStreamSocket inner is None")
                 {
                     Inner::Connected(connected) => {
-                        match connected.try_recv_seqpacket_meta(&mut buf[..max_read], peek) {
+                        // IMPORTANT: snapshot SCM before consuming bytes.
+                        // try_recv_seqpacket_meta() consumes from the ring buffer
+                        // using pop_slice(), which discards record metadata.
+                        let snapshot = connected.scm_snapshot_for_recvmsg();
+                        match connected.try_recv_seqpacket_meta(&mut buf[..], peek) {
                             Ok((copy_len, orig_len, truncated)) => {
                                 let ret_len = if _flags.contains(socket::PMSG::TRUNC) {
                                     orig_len
                                 } else {
                                     copy_len
                                 };
-                                break (copy_len, orig_len, truncated, ret_len);
+                                let (scm_cred, scm_rights) =
+                                    snapshot.scm_data.unwrap_or((None, alloc::vec::Vec::new()));
+                                break (
+                                    copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights,
+                                );
                             }
                             Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
                                 self.wait_event_interruptible_timeout(
@@ -1028,8 +1009,32 @@ impl Socket for UnixStreamSocket {
                 }
             }
         } else {
-            let recv_size = self.recv(&mut buf[..max_read], _flags)?;
-            (recv_size, recv_size, false, recv_size)
+            loop {
+                match self
+                    .inner
+                    .read()
+                    .as_ref()
+                    .expect("UnixStreamSocket inner is None")
+                {
+                    Inner::Connected(connected) => {
+                        match connected.try_recv_stream_recvmsg_meta(&mut buf, peek, want_creds) {
+                            Ok(meta) => {
+                                let n = meta.copy_len;
+                                break (n, n, false, n, meta.scm_cred, meta.scm_rights);
+                            }
+                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                                self.wait_event_interruptible_timeout(
+                                    || self.can_recv(),
+                                    self.recv_timeout(),
+                                )?;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    _ => return Err(SystemError::ENOTCONN),
+                }
+            }
         };
 
         if payload_copy_len != 0 {
@@ -1052,9 +1057,7 @@ impl Socket for UnixStreamSocket {
             return Ok(0);
         }
 
-        let want_creds = self.passcred.load(core::sync::atomic::Ordering::Relaxed);
-
-        let (scm_cred, scm_rights) = snapshot.scm_data.unwrap_or((None, alloc::vec::Vec::new()));
+        let (scm_cred, scm_rights) = (scm_cred, scm_rights);
         let has_rights = !scm_rights.is_empty();
         if !want_creds && !has_rights {
             // No ancillary to return.
@@ -1156,7 +1159,8 @@ impl Socket for UnixStreamSocket {
     fn send(&self, buffer: &[u8], _flags: socket::PMSG) -> Result<usize, SystemError> {
         let result = self.send_with_timeout(buffer, _flags);
 
-        // Auto-attach SCM_CREDENTIALS when SO_PASSCRED is enabled on either endpoint.
+        // Record boundaries + optional creds are needed for Linux-like recvmsg
+        // coalescing semantics.
         if let Ok((sent, start, _written_len)) = result {
             if sent != 0 {
                 let peer_passcred = self
@@ -1168,19 +1172,22 @@ impl Socket for UnixStreamSocket {
                     .unwrap_or(false);
                 let auto_attach =
                     self.passcred.load(core::sync::atomic::Ordering::Relaxed) || peer_passcred;
-                if auto_attach {
-                    let cred = current_ucred();
-                    match self
-                        .inner
-                        .read()
-                        .as_ref()
-                        .expect("UnixStreamSocket inner is None")
-                    {
-                        Inner::Connected(connected) => {
-                            connected.push_scm_at(start, Some(cred), alloc::vec::Vec::new())
-                        }
-                        _ => return Err(SystemError::ENOTCONN),
+                let cred = if auto_attach {
+                    Some(current_ucred())
+                } else {
+                    None
+                };
+
+                match self
+                    .inner
+                    .read()
+                    .as_ref()
+                    .expect("UnixStreamSocket inner is None")
+                {
+                    Inner::Connected(connected) => {
+                        connected.push_scm_at(start, sent, cred, alloc::vec::Vec::new())
                     }
+                    _ => return Err(SystemError::ENOTCONN),
                 }
             }
         }
@@ -1313,18 +1320,16 @@ impl Socket for UnixStreamSocket {
                 None
             };
 
-            if cred.is_some() || !rights_files.is_empty() {
-                match self
-                    .inner
-                    .read()
-                    .as_ref()
-                    .expect("UnixStreamSocket inner is None")
-                {
-                    Inner::Connected(connected) => {
-                        connected.push_scm_at(start, cred, rights_files);
-                    }
-                    _ => return Err(SystemError::ENOTCONN),
+            match self
+                .inner
+                .read()
+                .as_ref()
+                .expect("UnixStreamSocket inner is None")
+            {
+                Inner::Connected(connected) => {
+                    connected.push_scm_at(start, sent, cred, rights_files);
                 }
+                _ => return Err(SystemError::ENOTCONN),
             }
         }
 

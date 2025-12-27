@@ -163,11 +163,17 @@ impl Signal {
                 }
                 None => {
                     // 不需要显示指定siginfo，因此设置为默认值
+                    let current_pcb = ProcessManager::current_pcb();
+                    let sender_pid = current_pcb.raw_pid();
+                    let sender_uid = current_pcb.cred().uid.data() as u32;
                     SigInfo::new(
                         *self,
                         0,
                         SigCode::User,
-                        SigType::Kill(ProcessManager::current_pcb().raw_pid()),
+                        SigType::Kill {
+                            pid: sender_pid,
+                            uid: sender_uid,
+                        },
                     )
                 }
             };

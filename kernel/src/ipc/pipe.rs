@@ -740,7 +740,10 @@ impl IndexNode for LockedPipeInode {
                             sig,
                             0,
                             SigCode::Kernel,
-                            SigType::Kill(ProcessManager::current_pcb().task_pid_vnr()),
+                            SigType::Kill {
+                                pid: ProcessManager::current_pcb().task_pid_vnr(),
+                                uid: ProcessManager::current_pcb().cred().uid.data() as u32,
+                            },
                         );
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -812,7 +815,10 @@ impl IndexNode for LockedPipeInode {
                             sig,
                             0,
                             SigCode::Kernel,
-                            SigType::Kill(ProcessManager::current_pcb().task_pid_vnr()),
+                            SigType::Kill {
+                                pid: ProcessManager::current_pcb().task_pid_vnr(),
+                                uid: ProcessManager::current_pcb().cred().uid.data() as u32,
+                            },
                         );
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 

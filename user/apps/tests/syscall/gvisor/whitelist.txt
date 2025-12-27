@@ -94,6 +94,7 @@ sigprocmask_test
 sigaltstack_test
 sigreturn_test
 sigtimedwait_test
+rtsignal_test
 
 # 其他测试
 itimer_test

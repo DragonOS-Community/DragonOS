@@ -335,8 +335,30 @@ impl X86_64MMArch {
 
             if !region.contains(address) {
                 if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
-                    if !space_guard.can_extend_stack(region.start() - address) {
-                        // exceeds stack limit
+                    let extension_size = region.start() - address;
+
+                    // 首先检查地址是否在栈的合理扩展范围内
+                    // 如果地址距离栈底太远（超过最大栈限制），则这不是一个栈扩展请求，
+                    // 而是一个无关的无效内存访问（例如空指针解引用）
+                    let max_stack_limit = space_guard
+                        .user_stack
+                        .as_ref()
+                        .map(|s| s.max_limit())
+                        .unwrap_or(0);
+
+                    if extension_size > max_stack_limit {
+                        // 地址距离栈太远，这不是栈扩展请求，而是普通的无效内存访问
+                        // 检查是否需要异常表修复
+                        if handle_kernel_access_failed(regs) {
+                            return; // 已通过异常表修复
+                        }
+
+                        send_segv();
+                        return;
+                    }
+
+                    if !space_guard.can_extend_stack(extension_size) {
+                        // 栈扩展超过限制
                         log::warn!(
                             "pid {} user stack limit exceeded, error_code: {:?}, address: {:#x}",
                             ProcessManager::current_pid().data(),
@@ -353,7 +375,7 @@ impl X86_64MMArch {
                         return;
                     }
                     space_guard
-                        .extend_stack(region.start() - address)
+                        .extend_stack(extension_size)
                         .unwrap_or_else(|_| {
                             panic!(
                                 "user stack extend failed, error_code: {:?}, address: {:#x}",

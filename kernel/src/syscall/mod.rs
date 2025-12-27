@@ -163,8 +163,13 @@ impl Syscall {
             }
 
             SYS_RSEQ => {
-                warn!("SYS_RSEQ has not yet been implemented");
-                Err(SystemError::ENOSYS)
+                use crate::mm::VirtAddr;
+                use crate::process::rseq;
+                let rseq_ptr = VirtAddr::new(args[0]);
+                let rseq_len = args[1] as u32;
+                let flags = args[2] as i32;
+                let sig = args[3] as u32;
+                rseq::sys_rseq(rseq_ptr, rseq_len, flags, sig)
             }
 
             #[cfg(target_arch = "x86_64")]

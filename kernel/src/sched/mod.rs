@@ -912,6 +912,13 @@ pub fn __schedule(sched_mod: SchedMode) {
     prev.flags().remove(ProcessFlags::NEED_SCHEDULE);
     fence(Ordering::SeqCst);
     if likely(!Arc::ptr_eq(&prev, &next)) {
+        // 设置 rseq 事件：当 prev 被抢占时，标记 PREEMPT 事件
+        // 当 next 返回用户态时，需要更新 cpu_id
+        crate::process::rseq::Rseq::on_preempt(&prev);
+        if next.rseq_state().is_registered() {
+            next.flags().insert(ProcessFlags::NEED_RSEQ);
+        }
+
         rq.set_current(Arc::downgrade(&next));
         // warn!(
         //     "switch_process prev {:?} next {:?} sched_mode {sched_mod:?}",

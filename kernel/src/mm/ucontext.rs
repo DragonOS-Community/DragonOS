@@ -2362,4 +2362,9 @@ impl UserStack {
     pub fn set_max_limit(&mut self, max_limit: usize) {
         self.max_limit = max_limit;
     }
+
+    /// 获取当前用户栈的最大大小限制
+    pub fn max_limit(&self) -> usize {
+        self.max_limit
+    }
 }

@@ -127,6 +127,9 @@ fn do_execve_internal(
             pcb.flush_signal_handlers(false);
             *pcb.sig_altstack_mut() = crate::arch::SigStackArch::new();
 
+            // 清除 rseq 状态（execve 后需要重新注册）
+            crate::process::rseq::rseq_execve(&pcb);
+
             Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr)
         }
 

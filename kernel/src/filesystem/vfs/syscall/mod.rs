@@ -6,6 +6,7 @@ mod faccessat2;
 mod link_utils;
 mod newfstat;
 mod open_utils;
+mod pread_pwrite_common;
 mod readlink_at;
 mod rename_utils;
 mod sys_chdir;

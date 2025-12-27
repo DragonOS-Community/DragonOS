@@ -7,9 +7,10 @@ use crate::arch::syscall::nr::SYS_PWRITE64;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::UserBufferReader;
 use alloc::string::ToString;
 use alloc::vec::Vec;
+
+use super::pread_pwrite_common::{do_pread_pwrite_at, PreadPwriteDir};
 
 /// System call handler for the `pwrite64` syscall
 ///
@@ -52,11 +53,6 @@ impl Syscall for SysPwrite64Handle {
         let len = Self::len(args);
         let offset = Self::offset(args);
 
-        let offset = validate_pwrite_range(offset, len)?;
-
-        let user_buffer_reader = UserBufferReader::new(buf_vaddr, len, frame.is_from_user())?;
-        let user_buf = user_buffer_reader.read_from_user(0)?;
-
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
@@ -68,7 +64,16 @@ impl Syscall for SysPwrite64Handle {
         drop(fd_table_guard);
         let file = file.unwrap();
 
-        return file.pwrite(offset, len, user_buf);
+        // Linux/POSIX: count==0 must not touch the user buffer, but must still validate fd and flags.
+        let offset = validate_pwrite_range(offset, len)?;
+        do_pread_pwrite_at(
+            file.as_ref(),
+            offset,
+            buf_vaddr as usize,
+            len,
+            frame.is_from_user(),
+            PreadPwriteDir::Write,
+        )
     }
 
     /// Formats the syscall parameters for display/debug purposes

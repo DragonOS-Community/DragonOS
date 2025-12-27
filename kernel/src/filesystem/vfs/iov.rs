@@ -189,9 +189,10 @@ impl IoVecs {
     /// let iovecs = IoVecs::from_user(/* ... */)?;
     /// iovecs.scatter(&[1, 2, 3, 4, 5]);
     /// ```
-    pub fn scatter(&self, data: &[u8]) -> Result<(), SystemError> {
+    pub fn scatter(&self, data: &[u8]) -> Result<usize, SystemError> {
         let mut remaining = data;
         let mut written_any = false;
+        let mut total_written = 0usize;
 
         for iov in self.0.iter() {
             if remaining.is_empty() {
@@ -217,6 +218,7 @@ impl IoVecs {
             user_buf.write_to_user(0, &remaining[..accessible])?;
 
             written_any = true;
+            total_written = total_written.saturating_add(accessible);
             remaining = &remaining[accessible..];
 
             if accessible < want {
@@ -225,7 +227,7 @@ impl IoVecs {
             }
         }
 
-        Ok(())
+        Ok(total_written)
     }
 
     /// Creates a buffer with capacity equal to the total length of all IoVecs.

@@ -45,6 +45,10 @@ pub enum AtType {
     Random,
     /// Extension of AT_HWCAP.
     HwCap2,
+    /// Rseq feature size supported by kernel.
+    RseqFeatureSize = 27,
+    /// Rseq alignment requirement.
+    RseqAlign = 28,
     /// Filename of program.
     ExecFn = 31,
     /// Minimal stack size for signal delivery.
@@ -78,6 +82,8 @@ impl TryFrom<u32> for AtType {
             24 => Ok(AtType::BasePlatform),
             25 => Ok(AtType::Random),
             26 => Ok(AtType::HwCap2),
+            27 => Ok(AtType::RseqFeatureSize),
+            28 => Ok(AtType::RseqAlign),
             31 => Ok(AtType::ExecFn),
             51 => Ok(AtType::MinSigStackSize),
             _ => Err("Invalid value for AtType"),

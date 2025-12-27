@@ -820,6 +820,9 @@ impl ProcessManager {
 
         sched_cgroup_fork(pcb);
 
+        // 处理 rseq 状态
+        crate::process::rseq::rseq_fork(pcb, clone_flags.contains(CloneFlags::CLONE_VM));
+
         Ok(())
     }
 

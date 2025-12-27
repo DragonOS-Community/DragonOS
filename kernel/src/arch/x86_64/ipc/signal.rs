@@ -11,6 +11,7 @@ pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
 pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
 
+use crate::process::rseq::Rseq;
 use crate::{
     arch::{
         fpu::FpState,
@@ -705,6 +706,10 @@ fn setup_frame(
     oldset: &SigSet,
     trap_frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
+    // 在设置信号栈帧之前，先处理 rseq
+    // 参考 Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/signal.c#211
+    Rseq::on_signal(trap_frame);
+
     let ret_code_ptr: *mut c_void;
     let handler_addr: usize;
 

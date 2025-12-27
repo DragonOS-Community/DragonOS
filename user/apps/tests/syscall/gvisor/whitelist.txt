@@ -61,6 +61,8 @@ exit_test
 setns_test
 eventfd_test
 poll_test
+rseq_test
+
 
 # 内存管理测试
 mmap_test

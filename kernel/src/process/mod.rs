@@ -90,6 +90,7 @@ pub mod posix_timer;
 pub mod preempt;
 pub mod process_group;
 pub mod resource;
+pub mod rseq;
 pub mod session;
 pub mod shebang;
 pub mod signal;
@@ -845,12 +846,14 @@ bitflags! {
         const RESTORE_SIG_MASK = 1 << 10;
         /// Forked but didn't exec
         const FORKNOEXEC = 1 << 11;
+        /// 进程需要在返回用户态前处理 rseq
+        const NEED_RSEQ = 1 << 12;
     }
 }
 
 impl ProcessFlags {
     pub const fn exit_to_user_mode_work(&self) -> Self {
-        Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits))
+        Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits))
     }
 
     /// 测试并清除标志位
@@ -968,6 +971,9 @@ pub struct ProcessControlBlock {
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
+
+    /// rseq（Restartable Sequences）状态
+    rseq_state: RwLock<rseq::RseqState>,
 
     /// 进程作为主体的凭证集
     cred: SpinLock<Arc<Cred>>,
@@ -1100,6 +1106,7 @@ impl ProcessControlBlock {
                 posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
                 cpu_time: Arc::new(ProcessCpuTime::default()),
                 robust_list: RwLock::new(None),
+                rseq_state: RwLock::new(rseq::RseqState::new()),
                 cred: SpinLock::new(cred),
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
@@ -1647,6 +1654,18 @@ impl ProcessControlBlock {
 
     pub fn sig_info_mut(&self) -> RwLockWriteGuard<'_, ProcessSignalInfo> {
         self.sig_info.write_irqsave()
+    }
+
+    /// 获取 rseq 状态的只读引用
+    #[inline]
+    pub fn rseq_state(&self) -> RwLockReadGuard<'_, rseq::RseqState> {
+        self.rseq_state.read_irqsave()
+    }
+
+    /// 获取 rseq 状态的可变引用
+    #[inline]
+    pub fn rseq_state_mut(&self) -> RwLockWriteGuard<'_, rseq::RseqState> {
+        self.rseq_state.write_irqsave()
     }
 
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<'_, ProcessSignalInfo>> {

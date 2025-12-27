@@ -576,6 +576,8 @@ impl ElfLoader {
         phdr_vaddr: Option<VirtAddr>,
         ehdr: &elf::file::FileHeader<AnyEndian>,
     ) -> Result<(), ExecError> {
+        use crate::process::rseq::{ORIG_RSEQ_SIZE, RSEQ_ALIGN};
+
         let phdr_vaddr = phdr_vaddr.unwrap_or(VirtAddr::new(0));
 
         let init_info = param.init_info_mut();
@@ -592,6 +594,14 @@ impl ElfLoader {
         init_info
             .auxv
             .insert(AtType::Entry as u8, entrypoint_vaddr.data());
+
+        // 添加 rseq 相关的 auxv
+        init_info
+            .auxv
+            .insert(AtType::RseqFeatureSize as u8, ORIG_RSEQ_SIZE as usize);
+        init_info
+            .auxv
+            .insert(AtType::RseqAlign as u8, RSEQ_ALIGN as usize);
 
         return Ok(());
     }

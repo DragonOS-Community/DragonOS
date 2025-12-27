@@ -20,7 +20,7 @@ use core::{
 };
 
 use alloc::{
-    collections::LinkedList,
+    collections::{BTreeSet, LinkedList},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -38,6 +38,8 @@ pub struct EventPoll {
     ep_items: RBTree<i32, Arc<EPollItem>>,
     /// 接收就绪的描述符列表
     ready_list: LinkedList<Arc<EPollItem>>,
+    /// 监听本 epollfd 的 epitems（用于支持 epoll 嵌套：epollfd 被加入另一个 epoll）
+    pub(super) poll_epitems: LockedEPItemLinkedList,
     /// 是否已经关闭
     shutdown: AtomicBool,
     self_ref: Option<Weak<SpinLock<EventPoll>>>,
@@ -52,6 +54,7 @@ impl EventPoll {
             epoll_wq: WaitQueue::default(),
             ep_items: RBTree::new(),
             ready_list: LinkedList::new(),
+            poll_epitems: LockedEPItemLinkedList::default(),
             shutdown: AtomicBool::new(false),
             self_ref: None,
         }
@@ -182,8 +185,28 @@ impl EventPoll {
             }
         }
 
-        // 从FilePrivateData获取到epoll
-        if let FilePrivateData::EPoll(epoll_data) = &*ep_file.private_data.lock() {
+        // 从 FilePrivateData 获取到 epoll（注意：不能持有 private_data 锁跨越 loop check，
+        // 否则在遍历到自身 epoll 文件时会二次加锁导致自旋死锁）。
+        let epoll_data = {
+            let guard = ep_file.private_data.lock();
+            match &*guard {
+                FilePrivateData::EPoll(d) => d.clone(),
+                _ => return Err(SystemError::EINVAL),
+            }
+        };
+
+        // 支持 epoll 嵌套，但必须进行循环/深度检查（Linux: ELOOP）。
+        // 该检查不应在持有 src epoll 自旋锁时进行。
+        if op == EPollCtlOption::Add && Self::is_epoll_file(&dst_file) {
+            let dst_epoll = match &*dst_file.private_data.lock() {
+                FilePrivateData::EPoll(d) => d.epoll.clone(),
+                _ => return Err(SystemError::EINVAL),
+            };
+            let src_epoll = epoll_data.epoll.clone();
+            Self::ep_loop_check(&src_epoll, &dst_epoll)?;
+        }
+
+        {
             let mut epoll_guard = {
                 if nonblock {
                     // 如果设置非阻塞，则尝试获取一次锁
@@ -196,15 +219,6 @@ impl EventPoll {
                     epoll_data.epoll.0.lock_irqsave()
                 }
             };
-
-            if op == EPollCtlOption::Add {
-                // TODO: 循环检查是否为epoll嵌套epoll的情况，如果是则需要检测其深度
-                // 这里是需要一种检测算法的，但是目前未考虑epoll嵌套epoll的情况，所以暂时未实现
-                // Linux算法：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/eventpoll.c?r=&mo=56953&fi=2057#2133
-                if Self::is_epoll_file(&dst_file) {
-                    todo!();
-                }
-            }
 
             let ep_item = epoll_guard.ep_items.get(&dstfd).cloned();
             match op {
@@ -357,7 +371,18 @@ impl EventPoll {
             loop {
                 if available {
                     // 如果有就绪的事件，则直接返回就绪事件
-                    return Self::ep_send_events(epoll.clone(), epoll_event, max_events);
+                    let sent = Self::ep_send_events(epoll.clone(), epoll_event, max_events)?;
+
+                    // Linux 语义：阻塞等待时，被唤醒但没有可返回事件应继续等待。
+                    // 这会发生在并发读/状态变化导致 ready_list 中项目在 poll 时已不再就绪。
+                    if sent != 0 {
+                        return Ok(sent);
+                    }
+                    if timeout {
+                        return Ok(0);
+                    }
+                    available = false;
+                    continue;
                 }
 
                 if epoll.0.lock_irqsave().shutdown.load(Ordering::SeqCst) {
@@ -567,13 +592,14 @@ impl EventPoll {
         dst_file: Arc<File>,
         epitem: Arc<EPollItem>,
     ) -> Result<(), SystemError> {
-        // TODO：现在的实现先不考虑嵌套其它类型的文件(暂时只针对socket),这里的嵌套指epoll/select/poll
-        if Self::is_epoll_file(&dst_file) {
-            return Err(SystemError::ENOSYS);
-        }
-
         // 检查文件是否为"总是就绪"类型（不支持poll的普通文件/目录）
-        let is_always_ready = EPollItem::is_always_ready_file(&dst_file);
+        let is_always_ready = dst_file.is_always_ready();
+
+        // Linux 语义：epoll 不允许监听普通文件与目录（这些对象的 I/O 不会阻塞且通常不实现 poll），返回 EPERM。
+        // 参考: epoll(7) / gVisor epoll_test::RegularFiles
+        if is_always_ready {
+            return Err(SystemError::EPERM);
+        }
 
         // 不支持poll的非普通文件，返回错误
         if !dst_file.supports_poll() && !is_always_ready {
@@ -592,11 +618,6 @@ impl EventPoll {
         if !event.is_empty() {
             epoll_guard.ep_add_ready(epitem.clone());
             epoll_guard.ep_wake_one();
-        }
-
-        // 对于"总是就绪"的文件，不需要添加epitem（它们不需要等待事件通知）
-        if is_always_ready {
-            return Ok(());
         }
 
         dst_file.add_epitem(epitem.clone())?;
@@ -657,10 +678,18 @@ impl EventPoll {
 
     /// ### 将epitem加入到就绪队列，如果为重复添加则忽略
     pub fn ep_add_ready(&mut self, epitem: Arc<EPollItem>) {
-        let ret = self.ready_list.iter().find(|epi| Arc::ptr_eq(epi, &epitem));
-
-        if ret.is_none() {
+        let was_empty = self.ready_list.is_empty();
+        let exists = self.ready_list.iter().any(|epi| Arc::ptr_eq(epi, &epitem));
+        if !exists {
             self.ready_list.push_back(epitem);
+        }
+
+        // epollfd 在 ready_list 从空 -> 非空时变为可读，需要通知其“父 epoll”。
+        if was_empty && !self.ready_list.is_empty() {
+            let _ = Self::wakeup_epoll(
+                &self.poll_epitems,
+                EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
         }
     }
 
@@ -677,6 +706,52 @@ impl EventPoll {
     /// ### 唤醒所有在epoll上等待的首个进程
     pub fn ep_wake_one(&self) {
         self.epoll_wq.wakeup(None);
+    }
+
+    /// Linux 语义：epoll 嵌套需要进行 loop/depth 检查（失败返回 ELOOP）。
+    ///
+    /// 对齐 Linux 6.6：EP_MAX_NESTS = 4。
+    fn ep_loop_check(src: &LockedEventPoll, to: &LockedEventPoll) -> Result<(), SystemError> {
+        const EP_MAX_NESTS: usize = 4;
+
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
+        let mut stack: Vec<(LockedEventPoll, usize)> = Vec::new();
+        stack.push((to.clone(), 0));
+
+        while let Some((cur, depth)) = stack.pop() {
+            if depth > EP_MAX_NESTS {
+                return Err(SystemError::ELOOP);
+            }
+            if Arc::ptr_eq(&cur.0, &src.0) {
+                return Err(SystemError::ELOOP);
+            }
+
+            let key = Arc::as_ptr(&cur.0) as usize;
+            if !visited.insert(key) {
+                continue;
+            }
+
+            let child_items: Vec<Arc<EPollItem>> = {
+                let guard = cur.0.lock_irqsave();
+                guard.ep_items.values().cloned().collect()
+            };
+
+            for item in child_items {
+                let Some(f) = item.file().upgrade() else {
+                    continue;
+                };
+                if !Self::is_epoll_file(&f) {
+                    continue;
+                }
+                let child = match &*f.private_data.lock() {
+                    FilePrivateData::EPoll(d) => d.epoll.clone(),
+                    _ => continue,
+                };
+                stack.push((child, depth + 1));
+            }
+        }
+
+        Ok(())
     }
 
     /// ### epoll的回调，支持epoll的文件有事件到来时直接调用该方法即可
@@ -697,14 +772,17 @@ impl EventPoll {
             let binding = epitem.clone();
             let event_guard = binding.event().read();
             let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
-            // 检查事件合理性以及是否有感兴趣的事件
-
-            let and_res = pollflags.intersection(ep_events);
-            if !ep_events
-                .difference(EPollEventType::EP_PRIVATE_BITS)
-                .is_empty()
-                || !and_res.is_empty()
-            {
+            // 只在发生“感兴趣”的事件时才入队并唤醒。
+            // 否则会出现：fd 的非关注事件（例如 socket 常驻可写 EPOLLOUT）触发 wakeup，
+            // 导致 epoll_wait 看到 ready_list 非空但实际 poll 结果为空，最终错误返回 0。
+            // Linux 语义：EPOLLERR/EPOLLHUP 会被始终报告，因此也需要触发唤醒。
+            let interested = ep_events.difference(EPollEventType::EP_PRIVATE_BITS);
+            let always_report = EPollEventType::EPOLLERR | EPollEventType::EPOLLHUP;
+            let is_relevant = pollflags.contains(EPollEventType::POLLFREE)
+                || !pollflags
+                    .intersection(interested | always_report)
+                    .is_empty();
+            if is_relevant {
                 // TODO: 未处理pm相关
 
                 // 首先将就绪的epitem加入等待队列

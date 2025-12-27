@@ -75,7 +75,48 @@ impl<'a> PollAdapter<'a> {
             .map(|(&fd, &events)| (fd, events))
             .collect();
 
+        // Linux 语义：poll(2) 允许普通文件/目录参与 poll，并立即返回就绪。
+        // 但 epoll(7) 明确不允许监听普通文件/目录（返回 EPERM）。
+        // 我们的 poll 实现内部复用了 epoll，因此必须在这里对"总是就绪"类型做特判，
+        // 避免把 EPERM 误当成无效 fd(POLLNVAL) 并进一步导致 select 返回 EBADF。
+        //
+        // 注意：即使某些 inode 实现了 PollableInode（supports_poll()=true），
+        // 普通文件/目录在 poll(2) 里仍然应当表现为"不会阻塞且总是就绪"，
+        // 因此这里不能以 supports_poll() 作为排除条件。
+
         for (fd, merged_events) in fds_to_add {
+            // 先判断 fd 是否存在，以及是否属于“总是就绪”类型。
+            let dst_file = {
+                let current_pcb = ProcessManager::current_pcb();
+                let fd_table = current_pcb.fd_table();
+                let fd_table_guard = fd_table.read();
+                fd_table_guard.get_file_by_fd(fd)
+            };
+
+            match dst_file {
+                None => {
+                    // 无效 fd：设置 POLLNVAL
+                    self.added_fds.remove(&fd);
+                    for pollfd in self.poll_fds.iter_mut() {
+                        if pollfd.fd == fd {
+                            pollfd.revents = PollFlags::POLLNVAL.bits();
+                        }
+                    }
+                    continue;
+                }
+                Some(file) if file.is_always_ready() => {
+                    // 普通文件/目录：立即就绪，revents = events & DEFAULT_POLLMASK。
+                    self.added_fds.remove(&fd);
+                    for pollfd in self.poll_fds.iter_mut() {
+                        if pollfd.fd == fd {
+                            pollfd.revents = pollfd.events & PollFlags::DEFAULT_POLLMASK.bits();
+                        }
+                    }
+                    continue;
+                }
+                Some(_) => {}
+            }
+
             let mut epoll_event = EPollEvent::default();
             let mut poll_flags = PollFlags::from_bits_truncate(merged_events);
             poll_flags |= PollFlags::POLLERR | PollFlags::POLLHUP;
@@ -91,18 +132,13 @@ impl<'a> PollAdapter<'a> {
                 false,
             );
 
-            match result {
-                Ok(_) => {}
-                Err(_) => {
-                    // 根据 POSIX 语义，无效的 fd 应该设置 POLLNVAL 并继续处理其他 fd
-                    // 从 added_fds 中移除此 fd，并设置对应的所有 pollfd 条目的 revents
-                    // 注意：同一个 fd 可能在 poll_fds 数组中出现多次，每个条目都应独立处理
-                    self.added_fds.remove(&fd);
-                    for pollfd in self.poll_fds.iter_mut() {
-                        if pollfd.fd == fd {
-                            pollfd.revents = PollFlags::POLLNVAL.bits();
-                            // 不能 break，需要为所有匹配的条目设置 POLLNVAL
-                        }
+            if result.is_err() {
+                // 对于无法加入 epoll 的情况，按“无效/不可监听”处理：设置 POLLNVAL。
+                // “总是就绪”文件已经在上面特判并被移除。
+                self.added_fds.remove(&fd);
+                for pollfd in self.poll_fds.iter_mut() {
+                    if pollfd.fd == fd {
+                        pollfd.revents = PollFlags::POLLNVAL.bits();
                     }
                 }
             }
@@ -523,6 +559,12 @@ bitflags! {
         const POLLRDHUP = 0x2000;
         const POLLFREE = 0x4000;
         const POLL_BUSY_LOOP = 0x8000;
+
+        /// 默认的 poll 掩码，用于不支持 poll 的普通文件/目录
+        ///
+        /// 对应 Linux 内核的 DEFAULT_POLLMASK (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM)
+        const DEFAULT_POLLMASK = Self::POLLIN.bits() | Self::POLLOUT.bits()
+            | Self::POLLRDNORM.bits() | Self::POLLWRNORM.bits();
     }
 }
 

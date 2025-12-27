@@ -214,6 +214,9 @@ impl Signal {
             .insert((*self).into());
         // 根据实际 pending/blocked 关系更新 HAS_PENDING_SIGNAL，避免长时间误置位
         pcb.recalc_sigpending(None);
+
+        // 若目标进程存在 signalfd 监听该信号，需要唤醒其等待者/epoll。
+        crate::ipc::signalfd::notify_signalfd_for_pcb(&pcb, *self);
         // 判断目标进程是否应该被唤醒以立即处理该信号
         let wants_signal = self.wants_signal(pcb.clone());
         if wants_signal {

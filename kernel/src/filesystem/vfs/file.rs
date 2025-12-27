@@ -1155,6 +1155,27 @@ impl File {
         return self.file_type;
     }
 
+    /// 检查文件是否为普通文件或目录
+    ///
+    /// 用于 poll(2)/epoll 的"总是就绪"判断。
+    /// Linux 语义：普通文件和目录的 I/O 操作不会阻塞，因此它们在 poll 中总是可读/可写的。
+    #[inline]
+    pub fn is_regular_file_or_dir(&self) -> bool {
+        matches!(self.file_type, FileType::File | FileType::Dir)
+    }
+
+    /// 检查文件是否为"总是就绪"类型（用于 epoll）
+    ///
+    /// 满足以下条件的文件总是就绪：
+    /// 1. 文件类型为普通文件或目录
+    /// 2. 文件不支持 poll 操作
+    ///
+    /// Linux 语义：普通文件和目录的 I/O 操作不会阻塞，因此它们总是可读/可写的。
+    /// 参考 Linux 内核的 DEFAULT_POLLMASK
+    pub fn is_always_ready(&self) -> bool {
+        !self.supports_poll() && self.is_regular_file_or_dir()
+    }
+
     /// @brief 获取文件的打开模式
     #[inline]
     pub fn flags(&self) -> FileFlags {

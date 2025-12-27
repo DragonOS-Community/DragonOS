@@ -73,7 +73,8 @@ impl Syscall for SysRtSigqueueinfoHandle {
 
         // 从用户空间读取 siginfo_t
         let reader = UserBufferReader::new(uinfo, size_of::<PosixSigInfo>(), true)?;
-        let user_info = reader.read_one_from_user::<PosixSigInfo>(0)?;
+        let buffer = reader.buffer_protected(0)?;
+        let user_info = buffer.read_one::<PosixSigInfo>(0)?;
 
         let target_pid = RawPid::from(pid as usize);
         let current_pcb = ProcessManager::current_pcb();

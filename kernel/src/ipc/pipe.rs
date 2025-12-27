@@ -176,6 +176,22 @@ impl InnerPipeInode {
         Ok(events.bits() as usize)
     }
 
+    #[inline]
+    fn poll_both_ends(&self) -> EPollEventType {
+        // poll() 的返回与 FileFlags 的读/写端有关。
+        // 为了正确唤醒同时监听读端/写端的 epoll，需要合并两侧视角的事件。
+        let read_data = FilePrivateData::Pipefs(PipeFsPrivateData {
+            flags: FileFlags::O_RDONLY,
+        });
+        let write_data = FilePrivateData::Pipefs(PipeFsPrivateData {
+            flags: FileFlags::O_WRONLY,
+        });
+
+        let read_mask = self.poll(&read_data).unwrap_or(0);
+        let write_mask = self.poll(&write_data).unwrap_or(0);
+        EPollEventType::from_bits_truncate((read_mask | write_mask) as u32)
+    }
+
     fn buf_full(&self) -> bool {
         return self.valid_cnt as usize == self.buf_size;
     }
@@ -477,7 +493,7 @@ impl IndexNode for LockedPipeInode {
         //读完后解锁并唤醒等待在写等待队列中的进程
         self.write_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
-        let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&data)? as u32);
+        let pollflag = inner_guard.poll_both_ends();
         drop(inner_guard);
         // 唤醒epoll中等待的进程（忽略错误，因为状态已更新，这是尽力而为的通知）
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
@@ -667,9 +683,22 @@ impl IndexNode for LockedPipeInode {
             guard.reader -= 1;
             // 如果已经没有读端了，则唤醒写端
             if guard.reader == 0 {
+                // 读端耗尽意味着写端应收到 POLLERR，唤醒等待者与 epoll。
+                // 注意：这里需要使用写端的flags来获取EPOLLERR事件
+                // 因为poll()中只在!flags.is_read_only()时才设置EPOLLERR
+                let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData {
+                    flags: FileFlags::O_WRONLY,
+                });
+                let pollflag = guard
+                    .poll(&poll_data)
+                    .map(|v| EPollEventType::from_bits_truncate(v as u32))
+                    .unwrap_or(EPollEventType::EPOLLERR);
+
                 drop(guard); // 先释放 inner 锁，避免死锁
                              // 唤醒所有等待的写端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
                 self.write_wait_queue.wakeup_all(None);
+                // 唤醒所有依赖 epoll 的等待者，确保 ERR 事件可见
+                let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
                 return Ok(());
             }
         }
@@ -870,9 +899,7 @@ impl IndexNode for LockedPipeInode {
         self.read_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
 
-        // 构造用于 poll 的 FilePrivateData
-        let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData::new(flags));
-        let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&poll_data)? as u32);
+        let pollflag = inner_guard.poll_both_ends();
 
         drop(inner_guard);
         // 唤醒epoll中等待的进程（忽略错误，因为数据已写入，这是尽力而为的通知）

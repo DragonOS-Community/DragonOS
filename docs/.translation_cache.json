@@ -126,7 +126,7 @@
     "hash": "72efe542c7854926ac0f33287345b856"
   },
   "en:kernel/ipc/index.rst": {
-    "hash": "e75d2ff6a7b8a4e6f32b2adee7756298"
+    "hash": "4e4a874a6248bd474e36af7a3fb6b146"
   },
   "en:kernel/boot/index.rst": {
     "hash": "8fe854f9c48d4e2e3fee0cf7f3526dfe"
@@ -349,5 +349,8 @@
   },
   "en:userland/rootfs/diskgen.md": {
     "hash": "cc304450faeead2e99367616ede9327a"
+  },
+  "en:kernel/ipc/rseq.md": {
+    "hash": "b0b020398fb048e2c87135e3bb2974b3"
   }
 }

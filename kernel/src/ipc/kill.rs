@@ -17,7 +17,18 @@ pub fn send_signal_to_pid(pid: RawPid, sig: Signal) -> Result<usize, SystemError
     check_signal_permission_pcb_with_sig(&target, Some(sig))?;
 
     // 初始化signal info
-    let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pid));
+    let current_pcb = ProcessManager::current_pcb();
+    let sender_pid = current_pcb.raw_pid();
+    let sender_uid = current_pcb.cred().uid.data() as u32;
+    let mut info = SigInfo::new(
+        sig,
+        0,
+        SigCode::User,
+        SigType::Kill {
+            pid: sender_pid,
+            uid: sender_uid,
+        },
+    );
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     let ret = sig
@@ -36,7 +47,18 @@ pub fn send_signal_to_pcb(
     sig: Signal,
 ) -> Result<usize, SystemError> {
     // 初始化signal info
-    let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pcb.raw_pid()));
+    let current_pcb = ProcessManager::current_pcb();
+    let sender_pid = current_pcb.raw_pid();
+    let sender_uid = current_pcb.cred().uid.data() as u32;
+    let mut info = SigInfo::new(
+        sig,
+        0,
+        SigCode::User,
+        SigType::Kill {
+            pid: sender_pid,
+            uid: sender_uid,
+        },
+    );
 
     return sig
         .send_signal_info_to_pcb(Some(&mut info), pcb)
@@ -69,7 +91,18 @@ pub fn send_signal_to_pgid(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, System
         }
 
         // 初始化signal info
-        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pcb.raw_pid()));
+        let current_pcb = ProcessManager::current_pcb();
+        let sender_pid = current_pcb.raw_pid();
+        let sender_uid = current_pcb.cred().uid.data() as u32;
+        let mut info = SigInfo::new(
+            sig,
+            0,
+            SigCode::User,
+            SigType::Kill {
+                pid: sender_pid,
+                uid: sender_uid,
+            },
+        );
 
         if let Err(e) = sig.send_signal_info_to_pcb(Some(&mut info), pcb) {
             if !success {

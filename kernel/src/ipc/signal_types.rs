@@ -10,7 +10,7 @@ use crate::{
         ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
     },
     mm::VirtAddr,
-    process::{ProcessManager, RawPid},
+    process::RawPid,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -38,19 +38,17 @@ pub enum SigCode {
 }
 
 impl SigCode {
-    /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
-    #[allow(dead_code)]
-    pub fn from_i32(x: i32) -> SigCode {
+    pub fn try_from_i32(x: i32) -> Option<SigCode> {
         match x {
-            0 => Self::User,
-            0x80 => Self::Kernel,
-            -1 => Self::Queue,
-            -2 => Self::Timer,
-            -3 => Self::Mesgq,
-            -4 => Self::AsyncIO,
-            -5 => Self::SigIO,
-            -6 => Self::Tkill,
-            _ => panic!("signal code not valid"),
+            0 => Some(Self::User),
+            0x80 => Some(Self::Kernel),
+            -1 => Some(Self::Queue),
+            -2 => Some(Self::Timer),
+            -3 => Some(Self::Mesgq),
+            -4 => Some(Self::AsyncIO),
+            -5 => Some(Self::SigIO),
+            -6 => Some(Self::Tkill),
+            _ => None,
         }
     }
 }
@@ -436,11 +434,6 @@ impl core::fmt::Debug for PosixSigval {
 // 编译期校验：sigval_t 在 64-bit 架构下应为 8 字节
 const _: [(); 8] = [(); core::mem::size_of::<PosixSigval>()];
 
-/// 获取当前进程的UID
-fn get_current_uid() -> u32 {
-    ProcessManager::current_pcb().cred().uid.data() as u32
-}
-
 impl SigInfo {
     pub fn sig_code(&self) -> SigCode {
         self.sig_code
@@ -503,14 +496,26 @@ impl SigInfo {
     #[inline(never)]
     pub fn convert_to_posix_siginfo(&self) -> PosixSigInfo {
         match self.sig_type {
-            SigType::Kill(pid) => PosixSigInfo {
+            SigType::Kill { pid, uid } => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
                 si_code: self.sig_code as i32,
                 _sifields: PosixSiginfoFields {
                     _kill: PosixSiginfoKill {
                         si_pid: pid.data() as i32,
-                        si_uid: get_current_uid(),
+                        si_uid: uid,
+                    },
+                },
+            },
+            SigType::Rt { pid, uid, sigval } => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: self.sig_code as i32,
+                _sifields: PosixSiginfoFields {
+                    _rt: PosixSiginfoRt {
+                        si_pid: pid.data() as i32,
+                        si_uid: uid,
+                        si_sigval: sigval,
                     },
                 },
             },
@@ -570,7 +575,17 @@ impl SigInfo {
 
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
-    Kill(RawPid),
+    /// kill/tgkill/tkill 等用户态发起的信号：携带发送者 pid/uid。
+    Kill {
+        pid: RawPid,
+        uid: u32,
+    },
+    /// SI_QUEUE 语义（rt_sigqueueinfo/sigqueue）：携带发送者 pid/uid 与 sigval。
+    Rt {
+        pid: RawPid,
+        uid: u32,
+        sigval: PosixSigval,
+    },
     Alarm(RawPid),
     /// POSIX interval timer 发送的信号（SI_TIMER）。
     /// - `timerid`: 对应用户态 `siginfo_t::si_timerid`
@@ -708,8 +723,19 @@ impl SigPending {
             return info;
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(RawPid::from(0)));
-            ret.set_sig_type(SigType::Kill(RawPid::new(0)));
+            let mut ret = SigInfo::new(
+                sig,
+                0,
+                SigCode::User,
+                SigType::Kill {
+                    pid: RawPid::from(0),
+                    uid: 0,
+                },
+            );
+            ret.set_sig_type(SigType::Kill {
+                pid: RawPid::new(0),
+                uid: 0,
+            });
             return ret;
         }
     }

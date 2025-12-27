@@ -278,7 +278,13 @@ impl X86_64MMArch {
 
         let send_segv = || {
             let pid = ProcessManager::current_pid();
-            let mut info = SigInfo::new(Signal::SIGSEGV, 0, SigCode::User, SigType::Kill(pid));
+            let uid = ProcessManager::current_pcb().cred().uid.data() as u32;
+            let mut info = SigInfo::new(
+                Signal::SIGSEGV,
+                0,
+                SigCode::User,
+                SigType::Kill { pid, uid },
+            );
             Signal::SIGSEGV
                 .send_signal_info(Some(&mut info), pid)
                 .expect("failed to send SIGSEGV to process");
@@ -446,7 +452,10 @@ impl X86_64MMArch {
                 sig,
                 0,
                 SigCode::User,
-                SigType::Kill(ProcessManager::current_pid()),
+                SigType::Kill {
+                    pid: ProcessManager::current_pid(),
+                    uid: ProcessManager::current_pcb().cred().uid.data() as u32,
+                },
             );
             let _ = sig.send_signal_info(Some(&mut info), ProcessManager::current_pid());
             return;

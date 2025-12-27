@@ -165,12 +165,16 @@ fn send_signal_to_thread(
     // 构造SigInfo，使用SI_TKILL语义
     let current_pcb = ProcessManager::current_pcb();
     let current_tgid = current_pcb.task_tgid_vnr().unwrap_or(RawPid::from(0));
+    let sender_uid = current_pcb.cred().uid.data() as u32;
 
     let mut info = SigInfo::new(
         sig,
         0,
         SigCode::Tkill, // 使用SI_TKILL语义
-        SigType::Kill(current_tgid),
+        SigType::Kill {
+            pid: current_tgid,
+            uid: sender_uid,
+        },
     );
 
     // 发送信号

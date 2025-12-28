@@ -156,11 +156,13 @@ impl ArchPCBInfo {
     }
 
     pub fn restore_fp_state(&mut self) {
-        if unlikely(self.fp_state.is_none()) {
-            return;
+        // Linux 语义：新建线程/进程在首次运行用户态前必须拥有确定的初始 FPU 状态
+        // （x87 控制字 / MXCSR 等），不能继承上一个任务的寄存器状态。
+        if self.fp_state.is_none() {
+            self.fp_state = Some(FpState::new());
         }
 
-        self.fp_state.as_mut().unwrap().restore();
+        self.fp_state.as_ref().unwrap().restore();
     }
 
     /// 返回浮点寄存器结构体的副本
@@ -522,6 +524,12 @@ unsafe extern "sysv64" fn switch_back() -> ! {
 pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 以下代码不能发生中断
     CurrentIrqArch::interrupt_disable();
+
+    // 确保在返回用户态之前，当前任务的 FPU/SSE 状态已被恢复。
+    // 这对于“第一次进入用户态但还没发生过一次调度切换”的任务尤为关键。
+    ProcessManager::current_pcb()
+        .arch_info_irqsave()
+        .restore_fp_state();
 
     let current_pcb = ProcessManager::current_pcb();
     let trap_frame_vaddr = VirtAddr::new(

@@ -39,7 +39,27 @@ pub const MAX_SIG_NUM: usize = 64;
 
 // ===== Linux 兼容的信号栈帧结构 =====
 
-/// 与 Linux 兼容的 _fpstate_64 结构
+/// XSAVE header 结构（64 字节，位于偏移 512）
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct XStateHeader {
+    /// 表示哪些状态组件已被保存
+    pub xfeatures: u64,
+    /// 压缩格式标志
+    pub xcomp_bv: u64,
+    /// 保留字段
+    pub reserved: [u64; 6],
+}
+
+/// AVX 扩展状态：YMM 寄存器的高 128 位（256 字节）
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct AvxState {
+    /// YMM0-YMM15 的高 128 位，每个 16 字节
+    pub ymmh: [[u8; 16]; 16],
+}
+
+/// 与 Linux 兼容的 _fpstate_64 结构（FXSAVE 兼容部分，512 字节）
 /// 参考: /usr/include/x86_64-linux-gnu/asm/sigcontext.h
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -56,6 +76,22 @@ struct UserFpState64 {
     pub xmm_space: [u32; 64], // 16个 XMM 寄存器，每个16字节
     pub reserved2: [u32; 12],
     pub reserved3: [u32; 12],
+}
+
+/// 完整的 XSAVE 状态结构（包含 AVX 扩展）
+/// 布局：
+/// - 0-511: FXSAVE 兼容区域 (UserFpState64)
+/// - 512-575: XSAVE header (XStateHeader)
+/// - 576-831: AVX 状态 (AvxState)
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+struct UserXState {
+    /// FXSAVE 兼容区域（前 512 字节）
+    pub fpstate: UserFpState64,
+    /// XSAVE header（64 字节）
+    pub header: XStateHeader,
+    /// AVX 扩展状态：YMM 高 128 位（256 字节）
+    pub avx: AvxState,
 }
 
 /// 与 Linux 兼容的 sigcontext 结构 (x86_64)
@@ -128,6 +164,9 @@ impl UserSigSet {
 
 /// 与 Linux 兼容的 ucontext 结构
 /// 参考: /usr/include/bits/types/struct_ucontext.h
+///
+/// 注意：为了支持 AVX，我们扩展了 __fpregs_mem 以包含完整的 XSAVE 状态。
+/// 这与 Linux 的布局略有不同，但对用户态透明（通过 fpstate 指针访问）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct UserUContext {
@@ -136,28 +175,163 @@ struct UserUContext {
     pub uc_stack: StackT,
     pub uc_mcontext: UserSigContext,
     pub uc_sigmask: UserSigSet, // 使用 Linux 兼容的 1024-bit sigset
-    /// 实际的 fpstate 数据（紧跟在 uc_sigmask 后面）
-    pub __fpregs_mem: UserFpState64,
-    /// Shadow stack pointer (用于 CET 等安全特性)
-    pub __ssp: [u64; 4],
+    /// 实际的 fpstate 数据（包含完整的 XSAVE 状态以支持 AVX）
+    pub __fpregs_mem: UserXState,
 }
 
-// 编译期校验字段偏移量与 Linux 的兼容性
+// 编译期校验关键字段偏移量与 Linux 的兼容性
+// 注意：uc_sigmask 之前的字段保持与 Linux 兼容
+// __fpregs_mem 由于 UserXState 需要 64 字节对齐，可能有填充
 const _: () = {
     assert!(core::mem::offset_of!(UserUContext, uc_stack) == 16);
     assert!(core::mem::offset_of!(UserUContext, uc_mcontext) == 40);
     assert!(core::mem::offset_of!(UserUContext, uc_sigmask) == 296);
-    assert!(core::mem::offset_of!(UserUContext, __fpregs_mem) == 424);
-    assert!(core::mem::offset_of!(UserUContext, __ssp) == 936);
-    assert!(core::mem::size_of::<UserUContext>() == 968);
+    // __fpregs_mem 需要 64 字节对齐，所以偏移量会被调整
+    // 424 + padding to 64-byte boundary = 448
+    assert!(core::mem::offset_of!(UserUContext, __fpregs_mem) % 64 == 0);
+    // UserXState = 512 (FXSAVE) + 64 (header) + 256 (AVX) = 832 bytes
+    assert!(core::mem::size_of::<UserXState>() == 832);
 };
+
+impl UserXState {
+    /// 从内核 FpState 转换到用户态完整的 XSAVE 状态
+    ///
+    /// 包含：
+    /// - FXSAVE 兼容区域 (512 字节)
+    /// - XSAVE header (64 字节)
+    /// - AVX 状态 (256 字节)
+    pub fn from_kernel_fpstate(kernel_fp: &FpState) -> Self {
+        let bytes = kernel_fp.as_bytes();
+        let legacy = kernel_fp.legacy_region();
+
+        // 构建 FXSAVE 兼容部分
+        let mut fpstate = UserFpState64 {
+            cwd: u16::from_le_bytes([legacy[0], legacy[1]]),
+            swd: u16::from_le_bytes([legacy[2], legacy[3]]),
+            twd: u16::from_le_bytes([legacy[4], legacy[5]]),
+            fop: u16::from_le_bytes([legacy[6], legacy[7]]),
+            rip: u64::from_le_bytes(legacy[8..16].try_into().unwrap()),
+            rdp: u64::from_le_bytes(legacy[16..24].try_into().unwrap()),
+            mxcsr: u32::from_le_bytes(legacy[24..28].try_into().unwrap()),
+            mxcsr_mask: u32::from_le_bytes(legacy[28..32].try_into().unwrap()),
+            st_space: [0; 32],
+            xmm_space: [0; 64],
+            reserved2: [0; 12],
+            reserved3: [0; 12],
+        };
+
+        // 复制 ST 空间 (32-159: 128字节 = 32个u32)
+        for i in 0..32 {
+            let offset = 32 + i * 4;
+            fpstate.st_space[i] =
+                u32::from_le_bytes(legacy[offset..offset + 4].try_into().unwrap());
+        }
+
+        // 复制 XMM 空间 (160-415: 256字节 = 64个u32)
+        for i in 0..64 {
+            let offset = 160 + i * 4;
+            fpstate.xmm_space[i] =
+                u32::from_le_bytes(legacy[offset..offset + 4].try_into().unwrap());
+        }
+
+        // 构建 XSAVE header（偏移 512-575）
+        let mut header = XStateHeader::default();
+        if let Some(hdr) = bytes.get(512..528) {
+            header.xfeatures = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+            header.xcomp_bv = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        }
+
+        // 构建 AVX 状态（偏移 576-831）
+        let mut avx = AvxState::default();
+        if bytes.len() >= 832 {
+            for i in 0..16 {
+                let offset = 576 + i * 16;
+                avx.ymmh[i].copy_from_slice(&bytes[offset..offset + 16]);
+            }
+        }
+
+        Self {
+            fpstate,
+            header,
+            avx,
+        }
+    }
+
+    /// 从用户态 XSAVE 状态转换回内核 FpState
+    ///
+    /// 恢复完整的 XSAVE 状态，包括 AVX
+    pub fn to_kernel_fpstate(self) -> FpState {
+        let mut result = FpState::new();
+
+        // 写入 FXSAVE 兼容区域（前 512 字节）
+        let legacy = result.legacy_region_mut();
+        legacy[0..2].copy_from_slice(&self.fpstate.cwd.to_le_bytes());
+        legacy[2..4].copy_from_slice(&self.fpstate.swd.to_le_bytes());
+        legacy[4..6].copy_from_slice(&self.fpstate.twd.to_le_bytes());
+        legacy[6..8].copy_from_slice(&self.fpstate.fop.to_le_bytes());
+        legacy[8..16].copy_from_slice(&self.fpstate.rip.to_le_bytes());
+        legacy[16..24].copy_from_slice(&self.fpstate.rdp.to_le_bytes());
+        legacy[24..28].copy_from_slice(&self.fpstate.mxcsr.to_le_bytes());
+        legacy[28..32].copy_from_slice(&self.fpstate.mxcsr_mask.to_le_bytes());
+
+        for i in 0..32 {
+            let offset = 32 + i * 4;
+            legacy[offset..offset + 4].copy_from_slice(&self.fpstate.st_space[i].to_le_bytes());
+        }
+
+        for i in 0..64 {
+            let offset = 160 + i * 4;
+            legacy[offset..offset + 4].copy_from_slice(&self.fpstate.xmm_space[i].to_le_bytes());
+        }
+
+        // 写入 XSAVE header（偏移 512-575）
+        let result_bytes = result.as_bytes_mut();
+        if let Some(hdr) = result_bytes.get_mut(512..528) {
+            hdr[0..8].copy_from_slice(&self.header.xfeatures.to_le_bytes());
+            hdr[8..16].copy_from_slice(&self.header.xcomp_bv.to_le_bytes());
+        }
+
+        // 写入 AVX 状态（偏移 576-831）
+        if result_bytes.len() >= 832 {
+            for i in 0..16 {
+                let offset = 576 + i * 16;
+                result_bytes[offset..offset + 16].copy_from_slice(&self.avx.ymmh[i]);
+            }
+        }
+
+        result
+    }
+}
+
+impl Default for UserXState {
+    fn default() -> Self {
+        Self {
+            fpstate: UserFpState64 {
+                cwd: 0x037F, // 默认 FPU 控制字
+                swd: 0,
+                twd: 0,
+                fop: 0,
+                rip: 0,
+                rdp: 0,
+                mxcsr: 0x1F80, // 默认 MXCSR
+                mxcsr_mask: 0,
+                st_space: [0; 32],
+                xmm_space: [0; 64],
+                reserved2: [0; 12],
+                reserved3: [0; 12],
+            },
+            header: XStateHeader::default(),
+            avx: AvxState::default(),
+        }
+    }
+}
 
 impl UserFpState64 {
     /// 从内核 FpState 转换到用户态可见的 FpState64
     ///
     /// FXSAVE 格式布局:
     /// - 0-1: FCW
-    /// - 2-3: FSW  
+    /// - 2-3: FSW
     /// - 4-5: FTW (abridged)
     /// - 6-7: FOP
     /// - 8-15: FIP (rip)
@@ -166,13 +340,12 @@ impl UserFpState64 {
     /// - 28-31: MXCSR_MASK
     /// - 32-159: ST0-ST7 (128 bytes, 8*16)
     /// - 160-415: XMM0-XMM15 (256 bytes, 16*16)
+    ///
+    /// 注意：此方法仅用于兼容旧代码，新代码应使用 UserXState::from_kernel_fpstate
+    #[allow(dead_code)]
     pub fn from_kernel_fpstate(kernel_fp: &FpState) -> Self {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                kernel_fp as *const FpState as *const u8,
-                core::mem::size_of::<FpState>(),
-            )
-        };
+        // 使用 legacy_region() 获取 FXSAVE 兼容的前 512 字节
+        let bytes = kernel_fp.legacy_region();
 
         let mut result = Self {
             cwd: 0,
@@ -215,14 +388,13 @@ impl UserFpState64 {
     }
 
     /// 从用户态 FpState64 转换回内核 FpState
+    ///
+    /// 注意：此方法仅用于兼容旧代码，新代码应使用 UserXState::to_kernel_fpstate
+    #[allow(dead_code)]
     pub fn to_kernel_fpstate(self) -> FpState {
         let mut result = FpState::new();
-        let result_bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                &mut result as *mut FpState as *mut u8,
-                core::mem::size_of::<FpState>(),
-            )
-        };
+        // 使用 legacy_region_mut() 只修改前 512 字节
+        let result_bytes = result.legacy_region_mut();
 
         // 写入控制字段
         result_bytes[0..2].copy_from_slice(&self.cwd.to_le_bytes());
@@ -293,21 +465,7 @@ impl UserUContext {
                 reserved1: [0; 8],
             },
             uc_sigmask: UserSigSet::from_kernel_sigset(oldset),
-            __fpregs_mem: UserFpState64 {
-                cwd: 0,
-                swd: 0,
-                twd: 0,
-                fop: 0,
-                rip: 0,
-                rdp: 0,
-                mxcsr: 0,
-                mxcsr_mask: 0,
-                st_space: [0; 32],
-                xmm_space: [0; 64],
-                reserved2: [0; 12],
-                reserved3: [0; 12],
-            },
-            __ssp: [0; 4],
+            __fpregs_mem: UserXState::default(),
         }
     }
 
@@ -395,24 +553,27 @@ struct SigFrame {
 }
 
 impl SigFrame {
-    /// 安全地设置 fpstate 指针，指向 ucontext 内的 __fpregs_mem
+    /// 安全地设置 fpstate 指针，指向 ucontext 内的 __fpregs_mem 的 FXSAVE 兼容部分
     pub fn setup_fpstate_pointer(&mut self) {
-        self.ucontext.uc_mcontext.fpstate = &mut self.ucontext.__fpregs_mem as *mut UserFpState64;
+        // fpstate 指针指向 UserXState 的 fpstate 字段（FXSAVE 兼容部分）
+        self.ucontext.uc_mcontext.fpstate =
+            &mut self.ucontext.__fpregs_mem.fpstate as *mut UserFpState64;
     }
 
-    /// 安全地获取 fpstate 的可变引用
-    pub fn fpstate_mut(&mut self) -> &mut UserFpState64 {
+    /// 安全地获取完整 fpstate (包含 AVX) 的可变引用
+    pub fn fpstate_mut(&mut self) -> &mut UserXState {
         &mut self.ucontext.__fpregs_mem
     }
 
     /// 从栈帧恢复 fpstate，包含安全性检查（防止 SROP 攻击）
+    /// 返回包含完整 XSAVE 状态（包括 AVX）的 FpState
     pub fn restore_fpstate(&self) -> Option<FpState> {
         if self.ucontext.uc_mcontext.fpstate.is_null() {
             return None;
         }
 
-        // 验证指针确实指向 ucontext 内的 __fpregs_mem
-        let expected_addr = &self.ucontext.__fpregs_mem as *const UserFpState64;
+        // 验证指针确实指向 ucontext 内的 __fpregs_mem.fpstate
+        let expected_addr = &self.ucontext.__fpregs_mem.fpstate as *const UserFpState64;
         if !core::ptr::eq(self.ucontext.uc_mcontext.fpstate as *const _, expected_addr) {
             // 指针被篡改，这可能是 SROP 攻击
             error!(
@@ -422,6 +583,7 @@ impl SigFrame {
             return None;
         }
 
+        // 使用 UserXState::to_kernel_fpstate 恢复完整的 XSAVE 状态（包括 AVX）
         Some(self.ucontext.__fpregs_mem.to_kernel_fpstate())
     }
 }
@@ -788,9 +950,9 @@ fn setup_frame(
     // 先从硬件保存当前 FP 状态到 PCB
     archinfo_guard.save_fp_state();
 
-    // 将 FP 状态转换并保存到用户栈
+    // 将 FP 状态转换并保存到用户栈（包含完整的 XSAVE 状态，支持 AVX）
     if let Some(kernel_fp) = archinfo_guard.fp_state() {
-        *frame.fpstate_mut() = UserFpState64::from_kernel_fpstate(kernel_fp);
+        *frame.fpstate_mut() = UserXState::from_kernel_fpstate(kernel_fp);
     }
 
     // 设置 fpstate 指针指向栈帧内的 fpstate

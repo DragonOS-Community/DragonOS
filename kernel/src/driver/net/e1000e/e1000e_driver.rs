@@ -38,12 +38,17 @@ use super::e1000e::{E1000EBuffer, E1000EDevice};
 
 const DEVICE_NAME: &str = "e1000e";
 
-pub struct E1000ERxToken(E1000EBuffer);
+pub struct E1000ERxToken {
+    buffer: E1000EBuffer,
+    driver: E1000EDriver,
+}
 pub struct E1000ETxToken {
     driver: E1000EDriver,
 }
 pub struct E1000EDriver {
     pub inner: Arc<SpinLock<E1000EDevice>>,
+    /// 指向所属网络接口的弱引用，用于 packet socket 分发
+    iface: SpinLock<Weak<dyn Iface>>,
 }
 unsafe impl Send for E1000EDriver {}
 unsafe impl Sync for E1000EDriver {}
@@ -102,10 +107,51 @@ impl phy::RxToken for E1000ERxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let result = f(self.0.as_slice());
-        self.0.free_buffer();
+        let packet = self.buffer.as_slice();
+
+        // 向注册的 packet socket 分发数据包
+        if let Some(iface) = self.driver.iface() {
+            let pkt_type = determine_packet_type(packet, &iface);
+            iface.common().deliver_to_packet_sockets(packet, pkt_type);
+        }
+
+        let result = f(packet);
+        self.buffer.free_buffer();
         return result;
     }
+}
+
+/// 根据以太网帧的目的 MAC 地址确定数据包类型
+fn determine_packet_type(
+    frame: &[u8],
+    iface: &Arc<dyn Iface>,
+) -> crate::net::socket::packet::PacketType {
+    use crate::net::socket::packet::PacketType;
+
+    if frame.len() < 14 {
+        return PacketType::Host;
+    }
+
+    let dst_mac = &frame[0..6];
+
+    // 检查是否为广播地址 (FF:FF:FF:FF:FF:FF)
+    if dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
+        return PacketType::Broadcast;
+    }
+
+    // 检查是否为多播地址 (第一个字节的最低位为1)
+    if dst_mac[0] & 0x01 != 0 {
+        return PacketType::Multicast;
+    }
+
+    // 检查是否为发往本机的包
+    let our_mac = iface.mac();
+    if dst_mac == our_mac.as_bytes() {
+        return PacketType::Host;
+    }
+
+    // 其他情况为发往其他主机的包（混杂模式下捕获）
+    PacketType::OtherHost
 }
 
 impl phy::TxToken for E1000ETxToken {
@@ -132,8 +178,21 @@ impl E1000EDriver {
         iface_config.random_seed = rand() as u64;
 
         let inner: Arc<SpinLock<E1000EDevice>> = Arc::new(SpinLock::new(device));
-        let result = E1000EDriver { inner };
+        let result = E1000EDriver {
+            inner,
+            iface: SpinLock::new(Weak::<E1000EInterface>::new()),
+        };
         return result;
+    }
+
+    /// 设置所属网络接口的引用
+    pub fn set_iface(&self, iface: Weak<dyn Iface>) {
+        *self.iface.lock() = iface;
+    }
+
+    /// 获取所属网络接口
+    pub fn iface(&self) -> Option<Arc<dyn Iface>> {
+        self.iface.lock().upgrade()
     }
 }
 
@@ -141,6 +200,7 @@ impl Clone for E1000EDriver {
     fn clone(&self) -> Self {
         return E1000EDriver {
             inner: self.inner.clone(),
+            iface: SpinLock::new(self.iface.lock().clone()),
         };
     }
 }
@@ -155,7 +215,10 @@ impl phy::Device for E1000EDriver {
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         match self.inner.lock().e1000e_receive() {
             Some(buffer) => Some((
-                E1000ERxToken(buffer),
+                E1000ERxToken {
+                    buffer,
+                    driver: self.clone(),
+                },
                 E1000ETxToken {
                     driver: self.clone(),
                 },
@@ -224,6 +287,12 @@ impl E1000EInterface {
             }),
             locked_kobj_state: LockedKObjectState::default(),
         });
+
+        // 设置 driver 对接口的弱引用，用于 packet socket 分发
+        iface
+            .driver
+            .force_get_mut()
+            .set_iface(Arc::downgrade(&iface) as Weak<dyn Iface>);
 
         iface
     }

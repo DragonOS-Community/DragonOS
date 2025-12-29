@@ -226,5 +226,26 @@ pub(super) fn do_getsockopt(
             }
         }
     }
-    Err(SystemError::ENOPROTOOPT)
+
+    // 其它 level（如 SOL_IP/SOL_IPV6/SOL_RAW 等）交给具体 socket 实现。
+    // gVisor raw_socket_test: getsockopt(SOL_IPV6, IPV6_CHECKSUM) 等
+    {
+        let kbuf_len = user_len.clamp(64, MAX_OPTVAL_LEN);
+        let mut kbuf = vec![0u8; kbuf_len];
+        let written = socket.option(level, optname, &mut kbuf)?;
+        let need = written;
+
+        if !optval.is_null() {
+            let to_write = core::cmp::min(user_len, need);
+            let mut optval_writer = UserBufferWriter::new(optval, to_write, from_user)?;
+            optval_writer.copy_to_user_protected(&kbuf[..to_write], 0)?;
+        }
+
+        let mut optlen_writer =
+            UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
+        optlen_writer
+            .buffer_protected(0)?
+            .write_one::<u32>(0, &(need as u32))?;
+        Ok(0)
+    }
 }

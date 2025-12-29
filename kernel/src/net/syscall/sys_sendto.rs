@@ -153,6 +153,12 @@ pub(super) fn do_sendto(
     let endpoint = if addr.is_null() {
         None
     } else {
+        // 通过 Socket trait 方法验证地址，避免 syscall 层与具体 socket 实现耦合
+        {
+            let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+            let socket = socket_inode.as_socket().unwrap();
+            socket.validate_sendto_addr(addr, addrlen)?;
+        }
         Some(SockAddr::to_endpoint(addr, addrlen)?)
     };
 

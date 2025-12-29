@@ -14,12 +14,11 @@ use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 use super::Socket;
+use crate::net::socket::IFNAMSIZ;
 
 // Socket ioctl commands
 const SIOCGIFCONF: u32 = 0x8912; // Get interface list
-
-// Constants for network interface structures
-const IFNAMSIZ: usize = 16;
+const SIOCGIFINDEX: u32 = 0x8933; // name -> if_index mapping
 
 /// ## ifreq - Interface request structure
 /// Used for socket ioctls. Must match C struct layout.
@@ -50,6 +49,63 @@ impl IfReq {
             unsafe { core::slice::from_raw_parts(addr as *const SockAddrIn as *const u8, 16) };
         self.ifr_ifru[..16].copy_from_slice(addr_bytes);
     }
+
+    fn name_str(&self) -> &str {
+        let end = self
+            .ifr_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(IFNAMSIZ);
+        core::str::from_utf8(&self.ifr_name[..end]).unwrap_or("")
+    }
+
+    fn set_ifindex(&mut self, ifindex: i32) {
+        self.ifr_ifru[..4].copy_from_slice(&ifindex.to_ne_bytes());
+    }
+}
+
+fn handle_siocgifindex(data: usize) -> Result<usize, SystemError> {
+    if data == 0 {
+        return Err(SystemError::EFAULT);
+    }
+
+    // Read ifreq from user space.
+    let user_reader =
+        UserBufferReader::new(data as *const IfReq, core::mem::size_of::<IfReq>(), true)?;
+    let mut ifreq: IfReq = user_reader.buffer_protected(0)?.read_one::<IfReq>(0)?;
+
+    let name = ifreq.name_str();
+    if name.is_empty() {
+        return Err(SystemError::ENODEV);
+    }
+
+    let netns = ProcessManager::current_netns();
+
+    // Prefer exact name match.
+    let mut ifindex: Option<i32> = netns.device_list().iter().find_map(|(_, iface)| {
+        if iface.iface_name() == name {
+            Some(iface.nic_id() as i32)
+        } else {
+            None
+        }
+    });
+
+    // Fallback for lo if not present in device_list (early init) but loopback is configured.
+    if ifindex.is_none() && name == "lo" {
+        if let Some(lo) = netns.loopback_iface() {
+            ifindex = Some(lo.nic_id() as i32);
+        }
+    }
+
+    let ifindex = ifindex.ok_or(SystemError::ENODEV)?;
+    ifreq.set_ifindex(ifindex);
+
+    // Write back.
+    let mut user_writer =
+        UserBufferWriter::new(data as *mut IfReq, core::mem::size_of::<IfReq>(), true)?;
+    user_writer.buffer_protected(0)?.write_one(0, &ifreq)?;
+
+    Ok(0)
 }
 
 /// ## ifconf - Interface configuration structure
@@ -309,6 +365,7 @@ impl<T: Socket + 'static> IndexNode for T {
     ) -> Result<usize, SystemError> {
         match cmd {
             SIOCGIFCONF => handle_siocgifconf(data),
+            SIOCGIFINDEX => handle_siocgifindex(data),
             _ => Socket::ioctl(self, cmd, data, private_data),
         }
     }

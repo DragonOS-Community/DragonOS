@@ -177,9 +177,19 @@ impl Veth {
     }
 }
 
-#[derive(Clone)]
 pub struct VethDriver {
     pub inner: Arc<SpinLock<Veth>>,
+    /// 指向所属网络接口的弱引用，用于 packet socket 分发
+    iface: SpinLock<Weak<dyn Iface>>,
+}
+
+impl Clone for VethDriver {
+    fn clone(&self) -> Self {
+        VethDriver {
+            inner: self.inner.clone(),
+            iface: SpinLock::new(self.iface.lock().clone()),
+        }
+    }
 }
 
 impl VethDriver {
@@ -190,19 +200,35 @@ impl VethDriver {
     /// - `name2`: 第二个设备的名称
     /// ## 返回值
     /// 返回一个元组，包含两个 `VethDriver` 实例，分别对应
-    /// 第一个和第二个虚拟以太网设备。   
+    /// 第一个和第二个虚拟以太网设备。
     pub fn new_pair(name1: &str, name2: &str) -> (VethDriver, VethDriver) {
         let dev1 = Arc::new(SpinLock::new(Veth::new(name1.to_string())));
         let dev2 = Arc::new(SpinLock::new(Veth::new(name2.to_string())));
 
-        let driver1 = VethDriver { inner: dev1 };
-        let driver2 = VethDriver { inner: dev2 };
+        let driver1 = VethDriver {
+            inner: dev1,
+            iface: SpinLock::new(Weak::<VethInterface>::new()),
+        };
+        let driver2 = VethDriver {
+            inner: dev2,
+            iface: SpinLock::new(Weak::<VethInterface>::new()),
+        };
 
         (driver1, driver2)
     }
 
     pub fn name(&self) -> String {
         self.inner.lock().name().to_string()
+    }
+
+    /// 设置所属网络接口的引用
+    pub fn set_iface(&self, iface: Weak<dyn Iface>) {
+        *self.iface.lock() = iface;
+    }
+
+    /// 获取所属网络接口
+    pub fn iface(&self) -> Option<Arc<dyn Iface>> {
+        self.iface.lock().upgrade()
     }
 }
 
@@ -224,6 +250,7 @@ impl phy::TxToken for VethTxToken {
 
 pub struct VethRxToken {
     buffer: Vec<u8>,
+    driver: VethDriver,
 }
 
 impl RxToken for VethRxToken {
@@ -231,8 +258,49 @@ impl RxToken for VethRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.buffer)
+        let packet = self.buffer.as_slice();
+
+        // 向注册的 packet socket 分发数据包
+        if let Some(iface) = self.driver.iface() {
+            let pkt_type = determine_packet_type(packet, &iface);
+            iface.common().deliver_to_packet_sockets(packet, pkt_type);
+        }
+
+        f(packet)
     }
+}
+
+/// 根据以太网帧的目的 MAC 地址确定数据包类型
+fn determine_packet_type(
+    frame: &[u8],
+    iface: &Arc<dyn Iface>,
+) -> crate::net::socket::packet::PacketType {
+    use crate::net::socket::packet::PacketType;
+
+    if frame.len() < 14 {
+        return PacketType::Host;
+    }
+
+    let dst_mac = &frame[0..6];
+
+    // 检查是否为广播地址 (FF:FF:FF:FF:FF:FF)
+    if dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
+        return PacketType::Broadcast;
+    }
+
+    // 检查是否为多播地址 (第一个字节的最低位为1)
+    if dst_mac[0] & 0x01 != 0 {
+        return PacketType::Multicast;
+    }
+
+    // 检查是否为发往本机的包
+    let our_mac = iface.mac();
+    if dst_mac == our_mac.as_bytes() {
+        return PacketType::Host;
+    }
+
+    // 其他情况为发往其他主机的包（混杂模式下捕获）
+    PacketType::OtherHost
 }
 
 #[derive(Debug)]
@@ -279,7 +347,10 @@ impl phy::Device for VethDriver {
         guard.recv_from_peer().map(|buf| {
             // log::info!("VethDriver received data: {:?}", buf);
             (
-                VethRxToken { buffer: buf },
+                VethRxToken {
+                    buffer: buf,
+                    driver: self.clone(),
+                },
                 VethTxToken {
                     driver: self.clone(),
                 },
@@ -356,6 +427,12 @@ impl VethInterface {
         });
         let napi_struct = NapiStruct::new(device.clone(), 10);
         *device.common.napi_struct.write() = Some(napi_struct);
+
+        // 设置 driver 对接口的弱引用，用于 packet socket 分发
+        device
+            .driver
+            .force_get_mut()
+            .set_iface(Arc::downgrade(&device) as Weak<dyn Iface>);
 
         driver.inner.lock().self_iface_ref = Arc::downgrade(&device);
 

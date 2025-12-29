@@ -56,28 +56,53 @@ impl UdpSocket {
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let mut inner = self.inner.write();
-        if let Some(UdpInner::Unbound(unbound)) = inner.take() {
-            let bound = unbound.bind(local_endpoint, self.netns())?;
-
-            bound
-                .inner()
-                .iface()
-                .common()
-                .bind_socket(self.self_ref.upgrade().unwrap());
-            *inner = Some(UdpInner::Bound(bound));
-            return Ok(());
+        let prev = inner.take().ok_or(SystemError::EINVAL)?;
+        match prev {
+            UdpInner::Unbound(unbound) => match unbound.bind(local_endpoint, self.netns()) {
+                Ok(bound) => {
+                    bound
+                        .inner()
+                        .iface()
+                        .common()
+                        .bind_socket(self.self_ref.upgrade().unwrap());
+                    *inner = Some(UdpInner::Bound(bound));
+                    Ok(())
+                }
+                Err(e) => {
+                    // bind 消费了 unbound（move）。失败时恢复到一个新的 Unbound 状态，
+                    // 关键是避免 inner 变成 None 导致后续 check_io_event panic。
+                    *inner = Some(UdpInner::Unbound(UnboundUdp::new()));
+                    Err(e)
+                }
+            },
+            other => {
+                // 非 Unbound 情况下保持原状态
+                *inner = Some(other);
+                Err(SystemError::EINVAL)
+            }
         }
-        return Err(SystemError::EINVAL);
     }
 
     pub fn bind_emphemeral(&self, remote: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
         let mut inner_guard = self.inner.write();
-        let bound = match inner_guard.take().expect("Udp inner is None") {
-            UdpInner::Bound(inner) => inner,
-            UdpInner::Unbound(inner) => inner.bind_ephemeral(remote, self.netns())?,
-        };
-        inner_guard.replace(UdpInner::Bound(bound));
-        return Ok(());
+        let prev = inner_guard.take().ok_or(SystemError::EINVAL)?;
+        match prev {
+            UdpInner::Bound(bound) => {
+                inner_guard.replace(UdpInner::Bound(bound));
+                Ok(())
+            }
+            UdpInner::Unbound(unbound) => match unbound.bind_ephemeral(remote, self.netns()) {
+                Ok(bound) => {
+                    inner_guard.replace(UdpInner::Bound(bound));
+                    Ok(())
+                }
+                Err(e) => {
+                    // bind_ephemeral 消费了 unbound（move）。失败则恢复到新的 Unbound 状态。
+                    inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
+                    Err(e)
+                }
+            },
+        }
     }
 
     pub fn is_bound(&self) -> bool {
@@ -101,8 +126,9 @@ impl UdpSocket {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
-        match self.inner.read().as_ref().expect("Udp Inner is None") {
-            UdpInner::Bound(bound) => {
+        let guard = self.inner.read();
+        match guard.as_ref() {
+            Some(UdpInner::Bound(bound)) => {
                 let ret = bound.try_recv(buf);
                 bound.inner().iface().poll();
                 ret
@@ -127,20 +153,36 @@ impl UdpSocket {
         buf: &[u8],
         to: Option<smoltcp::wire::IpEndpoint>,
     ) -> Result<usize, SystemError> {
+        // 先确保 socket 处于 Bound 状态。任何错误路径都必须恢复 inner，避免变成 None。
         {
             let mut inner_guard = self.inner.write();
-            let inner = match inner_guard.take().expect("Udp Inner is None") {
-                // TODO: 此处会为空，需要DEBUG
-                UdpInner::Bound(bound) => bound,
-                UdpInner::Unbound(unbound) => unbound
-                    .bind_ephemeral(to.ok_or(SystemError::EDESTADDRREQ)?.addr, self.netns())?,
-            };
-            // size = inner.try_send(buf, to)?;
-            inner_guard.replace(UdpInner::Bound(inner));
-        };
+            let prev = inner_guard.take().ok_or(SystemError::EINVAL)?;
+            match prev {
+                UdpInner::Bound(bound) => {
+                    inner_guard.replace(UdpInner::Bound(bound));
+                }
+                UdpInner::Unbound(unbound) => {
+                    let Some(dest) = to.map(|ep| ep.addr) else {
+                        // 必须恢复原状态，避免 inner=None。
+                        inner_guard.replace(UdpInner::Unbound(unbound));
+                        return Err(SystemError::EDESTADDRREQ);
+                    };
+                    match unbound.bind_ephemeral(dest, self.netns()) {
+                        Ok(bound) => {
+                            inner_guard.replace(UdpInner::Bound(bound));
+                        }
+                        Err(e) => {
+                            // bind_ephemeral 消费了 unbound（move）。失败则恢复到新的 Unbound 状态。
+                            inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
         // Optimize: 拿两次锁的平均效率是否比一次长时间的读锁效率要高？
-        let result = match self.inner.read().as_ref().expect("Udp Inner is None") {
-            UdpInner::Bound(bound) => {
+        let result = match self.inner.read().as_ref() {
+            Some(UdpInner::Bound(bound)) => {
                 let ret = bound.try_send(buf, to);
                 bound.inner().iface().poll();
                 ret
@@ -172,15 +214,19 @@ impl Socket for UdpSocket {
     }
 
     fn send_buffer_size(&self) -> usize {
-        match self.inner.read().as_ref().unwrap() {
-            UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_send_capacity()),
+        match self.inner.read().as_ref() {
+            Some(UdpInner::Bound(bound)) => {
+                bound.with_socket(|socket| socket.payload_send_capacity())
+            }
             _ => inner::DEFAULT_TX_BUF_SIZE,
         }
     }
 
     fn recv_buffer_size(&self) -> usize {
-        match self.inner.read().as_ref().unwrap() {
-            UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_recv_capacity()),
+        match self.inner.read().as_ref() {
+            Some(UdpInner::Bound(bound)) => {
+                bound.with_socket(|socket| socket.payload_recv_capacity())
+            }
             _ => inner::DEFAULT_RX_BUF_SIZE,
         }
     }
@@ -270,8 +316,8 @@ impl Socket for UdpSocket {
     }
 
     fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
-        match self.inner.read().as_ref().unwrap() {
-            UdpInner::Bound(bound) => Ok(Endpoint::Ip(bound.remote_endpoint()?)),
+        match self.inner.read().as_ref() {
+            Some(UdpInner::Bound(bound)) => Ok(Endpoint::Ip(bound.remote_endpoint()?)),
             // TODO: IPv6 support
             _ => Err(SystemError::ENOTCONN),
         }
@@ -279,8 +325,8 @@ impl Socket for UdpSocket {
 
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
         use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint};
-        match self.inner.read().as_ref().unwrap() {
-            UdpInner::Bound(bound) => {
+        match self.inner.read().as_ref() {
+            Some(UdpInner::Bound(bound)) => {
                 let IpListenEndpoint { addr, port } = bound.endpoint();
                 Ok(Endpoint::Ip(IpEndpoint::new(
                     addr.unwrap_or(Ipv4([0, 0, 0, 0].into())),
@@ -318,11 +364,11 @@ impl Socket for UdpSocket {
 
     fn check_io_event(&self) -> EPollEventType {
         let mut event = EPollEventType::empty();
-        match self.inner.read().as_ref().unwrap() {
-            UdpInner::Unbound(_) => {
+        match self.inner.read().as_ref() {
+            None | Some(UdpInner::Unbound(_)) => {
                 event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
             }
-            UdpInner::Bound(bound) => {
+            Some(UdpInner::Bound(bound)) => {
                 let (can_recv, can_send) =
                     bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
 

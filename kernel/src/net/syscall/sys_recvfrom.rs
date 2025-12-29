@@ -163,23 +163,13 @@ pub(super) fn do_recvfrom(
         pmsg_flags.insert(socket::PMSG::DONTWAIT);
     }
 
-    if addr.is_null() {
-        let (n, _) = socket.recv_from(buf, pmsg_flags, None)?;
-        return Ok(n);
-    }
+    // Receive data from socket
+    let (recv_len, endpoint) = socket.recv_from(buf, pmsg_flags, None)?;
 
-    // address is not null
-    let address = unsafe { addr.as_ref() }.ok_or(SystemError::EINVAL)?;
-
-    if unsafe { address.is_empty() } {
-        let (recv_len, endpoint) = socket.recv_from(buf, pmsg_flags, None)?;
+    // Write source address back to user if addr is not null
+    if !addr.is_null() {
         endpoint.write_to_user(addr, addr_len)?;
-        return Ok(recv_len);
-    } else {
-        // 从socket中读取数据
-        let addr_len_val = *unsafe { addr_len.as_ref() }.ok_or(SystemError::EINVAL)?;
-        let address = SockAddr::to_endpoint(addr, addr_len_val)?;
-        let (recv_len, _) = socket.recv_from(buf, pmsg_flags, Some(address))?;
-        return Ok(recv_len);
     }
+
+    return Ok(recv_len);
 }

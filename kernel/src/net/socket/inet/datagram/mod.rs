@@ -73,9 +73,20 @@ impl UdpSocket {
         }
 
         // Now safe to take - we know it's Unbound
-        let unbound = match inner.take() {
+        let _old_unbound = match inner.take() {
             Some(UdpInner::Unbound(unbound)) => unbound,
             _ => unreachable!(),
+        };
+
+        // Check if custom buffer sizes have been set via setsockopt
+        let rx_size = self.recv_buf_size.load(Ordering::Acquire);
+        let tx_size = self.send_buf_size.load(Ordering::Acquire);
+
+        // Create new UnboundUdp with custom buffer sizes if they've been set
+        let unbound = if rx_size > 0 || tx_size > 0 {
+            UnboundUdp::new_with_buf_size(rx_size, tx_size)
+        } else {
+            UnboundUdp::new()
         };
 
         match unbound.bind(local_endpoint, self.netns()) {
@@ -101,11 +112,24 @@ impl UdpSocket {
         let inner = inner_guard.take().ok_or(SystemError::EBADF)?;
         let bound = match inner {
             UdpInner::Bound(inner) => inner,
-            UdpInner::Unbound(inner) => match inner.bind_ephemeral(remote, self.netns()) {
-                Ok(bound) => bound,
-                Err(e) => {
-                    inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
-                    return Err(e);
+            UdpInner::Unbound(_old_inner) => {
+                // Check if custom buffer sizes have been set via setsockopt
+                let rx_size = self.recv_buf_size.load(Ordering::Acquire);
+                let tx_size = self.send_buf_size.load(Ordering::Acquire);
+
+                // Create new UnboundUdp with custom buffer sizes if they've been set
+                let inner = if rx_size > 0 || tx_size > 0 {
+                    UnboundUdp::new_with_buf_size(rx_size, tx_size)
+                } else {
+                    UnboundUdp::new()
+                };
+
+                match inner.bind_ephemeral(remote, self.netns()) {
+                    Ok(bound) => bound,
+                    Err(e) => {
+                        inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
+                        return Err(e);
+                    }
                 }
             },
         };
@@ -491,31 +515,15 @@ impl Socket for UdpSocket {
         &self,
         buffer: &mut [u8],
         flags: PMSG,
-        address: Option<Endpoint>,
+        _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         // Linux allows reading buffered data even after SHUT_RD
-        // Only return EOF when buffer is empty
-        let shutdown_bits = self.shutdown.load(Ordering::Acquire);
-        let is_recv_shutdown = shutdown_bits & 0x01 != 0;
-
-        // could block io
-        if let Some(endpoint) = address {
-            self.connect(endpoint)?;
-        }
+        // For blocking mode, check shutdown state in the loop
 
         return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             let result = self.try_recv(buffer);
-            // If shutdown and no data available, return EOF
-            if is_recv_shutdown && matches!(result, Err(SystemError::EAGAIN_OR_EWOULDBLOCK)) {
-                // If connected, we can return (0, remote_endpoint)
-                if let Some(UdpInner::Bound(bound)) = self.inner.read().as_ref() {
-                    if let Ok(remote) = bound.remote_endpoint() {
-                        return Ok((0, Endpoint::Ip(remote)));
-                    }
-                }
-                // Not connected, can't provide endpoint, return error
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
+            // For non-blocking sockets, always return EAGAIN when no data
+            // Even after shutdown, don't convert to EOF
             result.map(|(len, endpoint)| (len, Endpoint::Ip(endpoint)))
         } else {
             loop {

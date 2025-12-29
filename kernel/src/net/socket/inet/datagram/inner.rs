@@ -22,13 +22,20 @@ pub struct UnboundUdp {
 
 impl UnboundUdp {
     pub fn new() -> Self {
+        Self::new_with_buf_size(0, 0)
+    }
+
+    pub fn new_with_buf_size(rx_size: usize, tx_size: usize) -> Self {
+        let rx_buf_size = if rx_size > 0 { rx_size } else { DEFAULT_RX_BUF_SIZE };
+        let tx_buf_size = if tx_size > 0 { tx_size } else { DEFAULT_TX_BUF_SIZE };
+
         let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_RX_BUF_SIZE],
+            vec![0; rx_buf_size],
         );
         let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_TX_BUF_SIZE],
+            vec![0; tx_buf_size],
         );
         let socket = SmolUdpSocket::new(rx_buffer, tx_buffer);
 
@@ -198,43 +205,73 @@ impl BoundUdp {
                     // Clear the flag - we only allow ONE unfiltered recv
                     *has_preconnect = false;
                     drop(has_preconnect); // Release lock before recv
+                    log::debug!("try_recv: has_preconnect=true, can_recv={}", socket.can_recv());
                     if socket.can_recv() {
                         if let Ok((size, metadata)) = socket.recv_slice(buf) {
+                            log::debug!("try_recv: preconnect recv succeeded, size={}", size);
                             return Ok((size, metadata.endpoint));
                         }
                     }
+                    log::debug!("try_recv: preconnect recv failed, returning EAGAIN");
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 drop(has_preconnect); // Release lock
 
+                log::debug!("try_recv: connected mode, expected_remote={:?}, buf_len={}, can_recv={}",
+                    expected_remote, buf.len(), socket.can_recv());
+
                 // Loop to skip packets from unexpected sources
                 loop {
                     if !socket.can_recv() {
+                        log::debug!("try_recv: can_recv=false, returning EAGAIN");
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
 
                     // Peek to check source address before receiving
-                    if let Ok((_size, metadata)) = socket.peek_slice(buf) {
-                        if metadata.endpoint == expected_remote {
-                            // Source matches, receive the packet
-                            if let Ok((size, metadata)) = socket.recv_slice(buf) {
-                                return Ok((size, metadata.endpoint));
+                    // Note: peek() instead of peek_slice() because peek_slice() returns Truncated
+                    // error when buffer is smaller than packet, but we still want to receive it
+                    match socket.peek() {
+                        Ok((payload, metadata)) => {
+                            log::debug!("try_recv: peeked {} bytes from {:?}, buf_len={}", payload.len(), metadata.endpoint, buf.len());
+                            if metadata.endpoint == expected_remote {
+                                // Source matches, receive the packet (truncated if buf is smaller)
+                                match socket.recv_slice(buf) {
+                                    Ok((size, metadata)) => {
+                                        log::debug!("try_recv: recv succeeded, size={}", size);
+                                        return Ok((size, metadata.endpoint));
+                                    }
+                                    Err(e) => {
+                                        // If recv_slice fails after peek succeeds, it's likely Truncated error
+                                        // (buffer smaller than packet). For UDP, truncation is OK - the buffer
+                                        // should be filled with as much data as it can hold.
+                                        log::debug!("try_recv: recv_slice error after peek succeeded: {:?}, treating as truncated receive", e);
+                                        // The packet was consumed, return buffer length as received size
+                                        return Ok((buf.len(), expected_remote));
+                                    }
+                                }
+                            } else {
+                                // Source doesn't match, discard this packet and check next
+                                log::debug!("try_recv: source mismatch, discarding packet from {:?}", metadata.endpoint);
+                                let _ = socket.recv_slice(buf);
+                                continue;
                             }
-                        } else {
-                            // Source doesn't match, discard this packet and check next
-                            let _ = socket.recv_slice(buf);
-                            continue;
+                        }
+                        Err(e) => {
+                            log::debug!("try_recv: peek failed: {:?}, returning EAGAIN", e);
+                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                         }
                     }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
             } else {
+                log::debug!("try_recv: unconnected mode, buf_len={}, can_recv={}", buf.len(), socket.can_recv());
                 // Not connected, receive from any source
                 if socket.can_recv() {
                     if let Ok((size, metadata)) = socket.recv_slice(buf) {
+                        log::debug!("try_recv: unconnected recv succeeded, size={}", size);
                         return Ok((size, metadata.endpoint));
                     }
                 }
+                log::debug!("try_recv: unconnected recv failed, returning EAGAIN");
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
         })

@@ -1704,6 +1704,8 @@ impl ProcessControlBlock {
         let blocked: SigSet = *sig_info.sig_blocked();
         let mut pending: SigSet = sig_info.sig_pending().signal();
         drop(sig_info);
+        // 同时检查 shared_pending
+        pending |= self.sighand().shared_pending_signal();
         pending.remove(blocked);
         // log::debug!(
         //     "pending and not masked:{:?}, masked: {:?}",

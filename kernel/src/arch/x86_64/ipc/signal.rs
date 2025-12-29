@@ -437,8 +437,10 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
 
     let siginfo_read_guard = siginfo.unwrap();
 
-    // 检查sigpending是否为0
-    if siginfo_read_guard.sig_pending().signal().bits() == 0 || !frame.is_from_user() {
+    // 检查 sigpending 是否为 0（需要同时检查线程级 pending 和进程级 shared_pending）
+    let thread_pending = siginfo_read_guard.sig_pending().signal().bits();
+    let shared_pending = pcb.sighand().shared_pending_signal().bits();
+    if (thread_pending == 0 && shared_pending == 0) || !frame.is_from_user() {
         // 若没有正在等待处理的信号，或者将要返回到的是内核态，则返回
         return;
     }

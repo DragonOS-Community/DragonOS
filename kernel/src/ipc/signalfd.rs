@@ -244,8 +244,11 @@ impl IndexNode for SignalFdInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data_guard: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        // 释放 FilePrivateData 锁，避免在阻塞时持有锁导致 panic
+        drop(data_guard);
+
         if len < size_of::<SignalFdSigInfo>() {
             return Err(SystemError::EINVAL);
         }

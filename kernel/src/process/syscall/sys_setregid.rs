@@ -1,5 +1,5 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::syscall::nr::SYS_SETRESGID;
+use crate::arch::syscall::nr::SYS_SETREGID;
 use crate::process::cred::Cred;
 use crate::process::syscall::id_utils;
 use crate::process::ProcessManager;
@@ -8,9 +8,9 @@ use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-pub struct SysSetResGid;
+pub struct SysSetReGid;
 
-impl SysSetResGid {
+impl SysSetReGid {
     fn rgid(args: &[usize]) -> usize {
         args[0]
     }
@@ -18,25 +18,25 @@ impl SysSetResGid {
     fn egid(args: &[usize]) -> usize {
         args[1]
     }
-
-    fn sgid(args: &[usize]) -> usize {
-        args[2]
-    }
 }
 
-impl Syscall for SysSetResGid {
+impl Syscall for SysSetReGid {
     fn num_args(&self) -> usize {
-        3
+        2
     }
 
+    /// setregid - set real and/or effective group ID
+    ///
+    /// Linux 语义要点（参考 Linux 6.6 / man2 setregid）:
+    /// - 参数为 -1 表示不修改对应字段
+    /// - 非特权进程只能将 rgid/egid 设置为当前 rgid/egid/sgid 之一
+    /// - 如果设置了 rgid，或者 egid 被设置为与旧 rgid 不同的值，则 sgid = new_egid
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let rgid = Self::rgid(args);
         let egid = Self::egid(args);
-        let sgid = Self::sgid(args);
 
         id_utils::validate_id(rgid)?;
         id_utils::validate_id(egid)?;
-        id_utils::validate_id(sgid)?;
 
         let pcb = ProcessManager::current_pcb();
         let mut guard = pcb.cred.lock();
@@ -47,16 +47,14 @@ impl Syscall for SysSetResGid {
 
         let new_rgid = id_utils::resolve_id(rgid, old_rgid);
         let new_egid = id_utils::resolve_id(egid, old_egid);
-        let new_sgid = id_utils::resolve_id(sgid, old_sgid);
 
         let is_privileged = guard.euid.data() == 0;
-        id_utils::check_setres_permissions(
+        id_utils::check_setre_permissions(
             old_rgid,
             old_egid,
             old_sgid,
             new_rgid,
             new_egid,
-            new_sgid,
             is_privileged,
         )?;
 
@@ -67,15 +65,30 @@ impl Syscall for SysSetResGid {
         }
         if !id_utils::is_no_change(egid) {
             new_cred.setegid(new_egid);
-        }
-        if !id_utils::is_no_change(sgid) {
-            new_cred.setsgid(new_sgid);
-        }
-
-        // fsgid 跟随 egid
-        if !id_utils::is_no_change(egid) {
             new_cred.setfsgid(new_egid);
         }
+
+        // 更新 sgid 的规则
+        // 如果设置了 rgid，或者 egid 被设置为与旧 rgid 不同的值，则 sgid = new_egid
+        if !id_utils::is_no_change(rgid) || (!id_utils::is_no_change(egid) && new_egid != old_rgid)
+        {
+            new_cred.setsgid(new_egid);
+        }
+
+        // 注意：GID 变化不直接影响 capability，但为了代码一致性保留此调用
+        // 目前 handle_gid_capabilities 是空实现
+        let new_rgid = new_cred.gid.data();
+        let new_egid = new_cred.egid.data();
+        let new_sgid = new_cred.sgid.data();
+        id_utils::handle_gid_capabilities(
+            &mut new_cred,
+            old_rgid,
+            old_egid,
+            old_sgid,
+            new_rgid,
+            new_egid,
+            new_sgid,
+        );
 
         *guard = Cred::new_arc(new_cred);
         Ok(0)
@@ -85,9 +98,8 @@ impl Syscall for SysSetResGid {
         vec![
             FormattedSyscallParam::new("rgid", format!("{:#x}", Self::rgid(args))),
             FormattedSyscallParam::new("egid", format!("{:#x}", Self::egid(args))),
-            FormattedSyscallParam::new("sgid", format!("{:#x}", Self::sgid(args))),
         ]
     }
 }
 
-syscall_table_macros::declare_syscall!(SYS_SETRESGID, SysSetResGid);
+syscall_table_macros::declare_syscall!(SYS_SETREGID, SysSetReGid);

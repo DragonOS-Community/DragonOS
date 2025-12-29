@@ -5,7 +5,7 @@ This document was automatically translated by `hunyuan-turbos-latest` model, for
 
 - Source document: introduction/develop_nix.md
 
-- Translation time: 2025-12-26 10:51:53
+- Translation time: 2025-12-29 06:52:03
 
 - Translation model: `hunyuan-turbos-latest`
 
@@ -59,7 +59,7 @@ By default, this will compile the kernel ELF to `./bin/kernel/kernel.elf`
 ## Building the Root Filesystem
 
 ```shell
-nix run .#rootfs.x86_64
+nix run .#rootfs-x86_64
 ```
 
 This will generate `./bin/qemu-system-x86_64.img`
@@ -67,7 +67,7 @@ This will generate `./bin/qemu-system-x86_64.img`
 ## Booting the Kernel
 
 ```shell
-nix run .#start.x86_64
+nix run .#start-x86_64
 ```
 
 Now you can see your terminal loading DragonOS.
@@ -79,6 +79,6 @@ To exit the DragonOS (QEMU) environment, type `ctrl + a`, then `x`
 ## More Nix Command Usage and Nix Script Maintenance
 
 - `cd docs && nix run` Build documentation and start an HTTP server
-- If storage space is limited, `nix store gc` to clean up dangling historical build copies
-- In the project root directory, `nix flake show` to view available build targets
+- If storage space is limited, `nix store gc` Clean up dangling historical build copies
+- In the project root directory, `nix flake show` View available build targets
 - For more user-space builds related to Nix, see the Userland section.

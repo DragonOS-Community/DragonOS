@@ -490,14 +490,20 @@ impl UserBufferReader<'_> {
     }
 
     fn convert_with_offset<T>(&self, src: &[u8], offset: usize) -> Result<&[T], SystemError> {
-        if offset >= src.len() {
+        // offset == src.len is valid, as long as don't try to dereference it in &src[offset..]
+        if offset > src.len() {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &[u8] = &src[offset..];
-        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) || byte_buffer.is_empty() {
+        if byte_buffer.is_empty() {
+            // Empty buffer is valid - return empty slice
+            return Ok(&[]);
+        }
+        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) {
             return Err(SystemError::EINVAL);
         }
 
+        debug_assert!(offset < src.len());
         let chunks = unsafe {
             from_raw_parts(
                 byte_buffer.as_ptr() as *const T,
@@ -776,13 +782,15 @@ impl<'a> UserBufferWriter<'a> {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &mut [u8] = &mut src[offset..];
-        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) {
-            return Err(SystemError::EINVAL);
-        }
 
         let len = byte_buffer.len() / core::mem::size_of::<T>();
         if len == 0 {
+            // Empty buffer is valid - return empty slice
             return Ok(&mut []);
+        }
+
+        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) {
+            return Err(SystemError::EINVAL);
         }
 
         let chunks = unsafe { from_raw_parts_mut(byte_buffer.as_mut_ptr() as *mut T, len) };

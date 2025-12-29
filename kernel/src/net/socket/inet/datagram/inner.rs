@@ -177,15 +177,8 @@ impl BoundUdp {
         buf: &mut [u8],
     ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
         let remote = *self.remote.lock();
-        let endpoint = self.endpoint();
-        log::debug!("BoundUdp::try_recv: endpoint={:?}, buf_len={}, connected={:?}",
-                    endpoint, buf.len(), remote);
 
-        log::debug!("BoundUdp::try_recv: about to call with_mut_socket");
         self.with_mut_socket(|socket| {
-            log::debug!("BoundUdp::try_recv: inside with_mut_socket closure");
-            let can_recv = socket.can_recv();
-            log::debug!("BoundUdp::try_recv: socket.can_recv()={}", can_recv);
 
             // If connected, filter packets by source address (except pre-connect packets)
             if let Some(expected_remote) = remote {
@@ -197,12 +190,9 @@ impl BoundUdp {
                     drop(has_preconnect);  // Release lock before recv
                     if socket.can_recv() {
                         if let Ok((size, metadata)) = socket.recv_slice(buf) {
-                            log::debug!("BoundUdp::try_recv: received pre-connect packet {} bytes from {:?}",
-                                        size, metadata.endpoint);
                             return Ok((size, metadata.endpoint));
                         }
                     }
-                    log::debug!("BoundUdp::try_recv: pre-connect data flag set but no data available");
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 drop(has_preconnect);  // Release lock
@@ -210,41 +200,31 @@ impl BoundUdp {
                 // Loop to skip packets from unexpected sources
                 loop {
                     if !socket.can_recv() {
-                        log::debug!("BoundUdp::try_recv: connected socket, no data -> EAGAIN");
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
 
                     // Peek to check source address before receiving
                     if let Ok((_size, metadata)) = socket.peek_slice(buf) {
-                        log::debug!("BoundUdp::try_recv: peeked packet from {:?}, expecting {:?}",
-                                    metadata.endpoint, expected_remote);
                         if metadata.endpoint == expected_remote {
                             // Source matches, receive the packet
                             if let Ok((size, metadata)) = socket.recv_slice(buf) {
-                                log::debug!("BoundUdp::try_recv: received {} bytes from {:?}",
-                                            size, metadata.endpoint);
                                 return Ok((size, metadata.endpoint));
                             }
                         } else {
                             // Source doesn't match, discard this packet and check next
-                            log::debug!("BoundUdp::try_recv: discarding packet from wrong source");
                             let _ = socket.recv_slice(buf);
                             continue;
                         }
                     }
-                    log::debug!("BoundUdp::try_recv: peek failed -> EAGAIN");
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
             } else {
                 // Not connected, receive from any source
                 if socket.can_recv() {
                     if let Ok((size, metadata)) = socket.recv_slice(buf) {
-                        log::debug!("BoundUdp::try_recv: unconnected socket received {} bytes from {:?}",
-                                    size, metadata.endpoint);
                         return Ok((size, metadata.endpoint));
                     }
                 }
-                log::debug!("BoundUdp::try_recv: unconnected socket, no data -> EAGAIN");
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
         })
@@ -255,10 +235,6 @@ impl BoundUdp {
         buf: &[u8],
         to: Option<smoltcp::wire::IpEndpoint>,
     ) -> Result<usize, SystemError> {
-        if buf.len() == 0 {
-            log::info!("UDP try_send: ZERO-LENGTH packet requested");
-        }
-
         let connected_remote = *self.remote.lock();
         let mut remote = to.or(connected_remote).ok_or(SystemError::ENOTCONN)?;
 
@@ -272,47 +248,18 @@ impl BoundUdp {
         // smoltcp rejects it as "Unaddressable", so we translate it here
         if remote.addr.is_unspecified() {
             remote.addr = smoltcp::wire::IpAddress::v4(127, 0, 0, 1);
-            log::debug!("UDP try_send: translated unspecified address to loopback");
         }
 
-        log::debug!(
-            "UDP try_send: to={:?}, connected={:?}, final_remote={:?}, buf_len={}",
-            to,
-            connected_remote,
-            remote,
-            buf.len()
-        );
-
-        let result = self.with_mut_socket(|socket| {
-            let can_send = socket.can_send();
-            log::debug!("UDP try_send: can_send={}", can_send);
-
-            if can_send {
-                if buf.len() == 0 {
-                    log::info!("UDP try_send: Attempting to send zero-length packet via smoltcp");
-                }
+        self.with_mut_socket(|socket| {
+            if socket.can_send() {
                 match socket.send_slice(buf, remote) {
-                    Ok(_) => {
-                        if buf.len() == 0 {
-                            log::info!("UDP send ZERO-LENGTH packet to {:?} OK", remote);
-                        } else {
-                            log::debug!("UDP send {} bytes to {:?} OK", buf.len(), remote);
-                        }
-                        return Ok(buf.len());
-                    }
-                    Err(e) => {
-                        if buf.len() == 0 {
-                            log::error!("UDP send_slice FAILED for ZERO-LENGTH packet: {:?}", e);
-                        }
-                        log::warn!("UDP send_slice failed: {:?}", e);
-                        return Err(SystemError::ENOBUFS);
-                    }
+                    Ok(_) => Ok(buf.len()),
+                    Err(_) => Err(SystemError::ENOBUFS),
                 }
+            } else {
+                Err(SystemError::ENOBUFS)
             }
-            log::warn!("UDP cannot send (buffer full?)");
-            return Err(SystemError::ENOBUFS);
-        });
-        return result;
+        })
     }
 
     pub fn inner(&self) -> &BoundInner {

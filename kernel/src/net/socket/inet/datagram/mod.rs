@@ -299,6 +299,10 @@ impl Socket for UdpSocket {
         &self.wait_queue
     }
 
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.nonblock.store(nonblocking, core::sync::atomic::Ordering::Relaxed);
+    }
+
     fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(local_endpoint) = local_endpoint {
             return self.do_bind(local_endpoint);
@@ -466,7 +470,7 @@ impl Socket for UdpSocket {
                 let is_recv_shutdown = shutdown_bits & 0x01 != 0;
 
                 match self.try_recv(buffer) {
-                    Ok((len, endpoint)) => {
+                    Ok((len, _endpoint)) => {
                         return Ok(len);
                     }
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
@@ -707,18 +711,63 @@ impl Socket for UdpSocket {
 
     fn recv_msg(
         &self,
-        _msg: &mut crate::net::posix::MsgHdr,
-        _flags: PMSG,
+        msg: &mut crate::net::posix::MsgHdr,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
-        todo!()
+        use crate::filesystem::vfs::iov::IoVecs;
+        use crate::net::posix::SockAddr;
+
+        // Check for MSG_ERRQUEUE - we don't support error queues yet
+        if flags.contains(PMSG::ERRQUEUE) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        // Validate and create iovecs
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        let mut buf = iovs.new_buf(true);
+
+        // Receive data from socket
+        let (recv_size, src_endpoint) = self.recv_from(&mut buf, flags, None)?;
+
+        // Scatter received data to user iovecs
+        iovs.scatter(&buf[..recv_size])?;
+
+        // Write source address if requested
+        if !msg.msg_name.is_null() {
+            let src_addr = msg.msg_name as *mut SockAddr;
+            src_endpoint.write_to_user(src_addr, &mut msg.msg_namelen)?;
+        } else {
+            msg.msg_namelen = 0;
+        }
+
+        // No control messages for now
+        msg.msg_controllen = 0;
+        msg.msg_flags = 0;
+
+        Ok(recv_size)
     }
 
     fn send_msg(
         &self,
-        _msg: &crate::net::posix::MsgHdr,
-        _flags: PMSG,
+        msg: &crate::net::posix::MsgHdr,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
-        todo!()
+        use crate::filesystem::vfs::iov::IoVecs;
+        use crate::net::posix::SockAddr;
+
+        // Validate and gather iovecs
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
+        let data = iovs.gather()?;
+
+        // Check if destination address is provided
+        if !msg.msg_name.is_null() && msg.msg_namelen > 0 {
+            // Send to specific address
+            let endpoint = SockAddr::to_endpoint(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
+            self.send_to(&data, flags, endpoint)
+        } else {
+            // Send using connected endpoint
+            self.send(&data, flags)
+        }
     }
 
     fn epoll_items(&self) -> &crate::net::socket::common::EPollItems {
@@ -737,7 +786,9 @@ impl Socket for UdpSocket {
             }
             Some(UdpInner::Bound(bound)) => {
                 let (can_recv, can_send) =
-                    bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
+                    bound.with_socket(|socket| {
+                        (socket.can_recv(), socket.can_send())
+                    });
 
                 if can_recv {
                     event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);

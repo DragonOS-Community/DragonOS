@@ -270,8 +270,12 @@ impl<T: Socket + 'static> IndexNode for T {
         buf: &[u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if buf.len() == 0 {
-            log::info!("Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}", buf.len(), _len);
+        if buf.is_empty() {
+            log::info!(
+                "Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}",
+                buf.len(),
+                _len
+            );
         }
         drop(data);
         self.write(buf)
@@ -309,7 +313,7 @@ impl<T: Socket + 'static> IndexNode for T {
         &self,
         cmd: u32,
         data: usize,
-        private_data: &FilePrivateData,
+        _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         match cmd {
             SIOCGIFCONF => handle_siocgifconf(data),

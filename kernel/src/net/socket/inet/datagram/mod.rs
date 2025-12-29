@@ -6,7 +6,7 @@ use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::{EPollItems, ShutdownBit};
-use crate::net::socket::{Socket, PSO, PMSG, PSOL};
+use crate::net::socket::{Socket, PMSG, PSO, PSOL};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
@@ -254,7 +254,7 @@ impl UdpSocket {
 
         // For loopback packets, we need to wake up the polling thread to ensure timely delivery
         // The polling thread processes packets from TX -> loopback -> RX
-        if let Ok(_) = &result {
+        if result.is_ok() {
             let is_loopback = if let Some(to_endpoint) = to {
                 // Check if destination is loopback (127.0.0.0/8)
                 matches!(to_endpoint.addr, smoltcp::wire::IpAddress::Ipv4(addr) if addr.octets()[0] == 127)
@@ -300,7 +300,8 @@ impl Socket for UdpSocket {
     }
 
     fn set_nonblocking(&self, nonblocking: bool) {
-        self.nonblock.store(nonblocking, core::sync::atomic::Ordering::Relaxed);
+        self.nonblock
+            .store(nonblocking, core::sync::atomic::Ordering::Relaxed);
     }
 
     fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
@@ -415,7 +416,7 @@ impl Socket for UdpSocket {
     }
 
     fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
-        if buffer.len() == 0 {
+        if buffer.is_empty() {
             log::info!("UDP send() called with ZERO-LENGTH buffer");
         }
 
@@ -683,23 +684,12 @@ impl Socket for UdpSocket {
 
                 // If bound to "any" address (0.0.0.0 or ::), but connected to a specific address,
                 // return the actual local address that would be used for the connection
-                let local_addr = if addr.is_none() {
-                    // Check if socket is connected
-                    if let Ok(remote) = bound.remote_endpoint() {
-                        // Use the same address type as the remote
-                        // For loopback connections, use loopback address
-                        match remote.addr {
-                            Ipv4(ipv4) if ipv4.is_loopback() => Ipv4([127, 0, 0, 1].into()),
-                            Ipv6(ipv6) if ipv6.is_loopback() => Ipv6([0, 0, 0, 0, 0, 0, 0, 1].into()),
-                            Ipv4(_) => Ipv4([0, 0, 0, 0].into()), // Still return "any" for non-loopback
-                            Ipv6(_) => Ipv6([0, 0, 0, 0, 0, 0, 0, 0].into()),
-                        }
-                    } else {
-                        // Not connected, return "any"
-                        Ipv4([0, 0, 0, 0].into())
-                    }
+                let local_addr = if let Some(addr) = addr {
+                    addr
                 } else {
-                    addr.unwrap()
+                    // TODO: Implement IPv6
+                    // Not connected, return "any"
+                    Ipv4([0, 0, 0, 0].into())
                 };
 
                 Ok(Endpoint::Ip(IpEndpoint::new(local_addr, port)))
@@ -715,7 +705,6 @@ impl Socket for UdpSocket {
         flags: PMSG,
     ) -> Result<usize, SystemError> {
         use crate::filesystem::vfs::iov::IoVecs;
-        use crate::net::posix::SockAddr;
 
         // Check for MSG_ERRQUEUE - we don't support error queues yet
         if flags.contains(PMSG::ERRQUEUE) {
@@ -734,7 +723,7 @@ impl Socket for UdpSocket {
 
         // Write source address if requested
         if !msg.msg_name.is_null() {
-            let src_addr = msg.msg_name as *mut SockAddr;
+            let src_addr = msg.msg_name;
             src_endpoint.write_to_user(src_addr, &mut msg.msg_namelen)?;
         } else {
             msg.msg_namelen = 0;
@@ -747,11 +736,7 @@ impl Socket for UdpSocket {
         Ok(recv_size)
     }
 
-    fn send_msg(
-        &self,
-        msg: &crate::net::posix::MsgHdr,
-        flags: PMSG,
-    ) -> Result<usize, SystemError> {
+    fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
         use crate::filesystem::vfs::iov::IoVecs;
         use crate::net::posix::SockAddr;
 
@@ -786,9 +771,7 @@ impl Socket for UdpSocket {
             }
             Some(UdpInner::Bound(bound)) => {
                 let (can_recv, can_send) =
-                    bound.with_socket(|socket| {
-                        (socket.can_recv(), socket.can_send())
-                    });
+                    bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
 
                 if can_recv {
                     event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);

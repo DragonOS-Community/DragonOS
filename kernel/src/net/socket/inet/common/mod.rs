@@ -66,7 +66,11 @@ impl BoundInner {
             });
         } else {
             let iface = get_iface_to_bind(address, netns.clone()).ok_or(SystemError::ENODEV)?;
-            log::debug!("BoundInner::bind: binding to iface {} for address {:?}", iface.iface_name(), address);
+            log::debug!(
+                "BoundInner::bind: binding to iface {} for address {:?}",
+                iface.iface_name(),
+                address
+            );
             let handle = iface.sockets().lock().add(socket);
             return Ok(Self {
                 handle,
@@ -139,12 +143,20 @@ pub fn get_iface_to_bind(
         .iter()
         .find(|(_, iface)| {
             let guard = iface.smol_iface().lock();
-            log::debug!("  checking iface: {}, ip: {:?}, has_addr={}", iface.iface_name(), guard.ip_addrs(), guard.has_ip_addr(*ip_addr));
+            log::debug!(
+                "  checking iface: {}, ip: {:?}, has_addr={}",
+                iface.iface_name(),
+                guard.ip_addrs(),
+                guard.has_ip_addr(*ip_addr)
+            );
             return guard.has_ip_addr(*ip_addr);
         })
         .map(|(_, iface)| iface.clone());
 
-    log::debug!("get_iface_to_bind: returning iface {:?}", result.as_ref().map(|i| i.iface_name()));
+    log::debug!(
+        "get_iface_to_bind: returning iface {:?}",
+        result.as_ref().map(|i| i.iface_name())
+    );
     result
 }
 

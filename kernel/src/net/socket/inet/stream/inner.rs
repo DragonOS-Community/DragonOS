@@ -152,7 +152,7 @@ impl Init {
         } else {
             smoltcp::wire::IpListenEndpoint::from(local)
         };
-        if listen_addr.port == 0 || listen_addr.port > u16::MAX {
+        if listen_addr.port == 0 {
             // Invalid port number
             return Err((Init::Bound((inner, local)), SystemError::EINVAL));
         }

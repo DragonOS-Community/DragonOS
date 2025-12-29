@@ -50,7 +50,10 @@ impl UnboundUdp {
             inner
                 .port_manager()
                 .bind_port(InetTypes::Udp, local_endpoint.port)?;
-            log::debug!("UnboundUdp::bind: explicit bind to port {}", local_endpoint.port);
+            log::debug!(
+                "UnboundUdp::bind: explicit bind to port {}",
+                local_endpoint.port
+            );
             local_endpoint.port
         };
 
@@ -84,7 +87,11 @@ impl UnboundUdp {
     ) -> Result<BoundUdp, SystemError> {
         let (inner, local_addr) = BoundInner::bind_ephemeral(self.socket, remote, netns)?;
         let bound_port = inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?;
-        log::debug!("UnboundUdp::bind_ephemeral: allocated ephemeral port {} for remote {:?}", bound_port, remote);
+        log::debug!(
+            "UnboundUdp::bind_ephemeral: allocated ephemeral port {} for remote {:?}",
+            bound_port,
+            remote
+        );
 
         // Bind the smoltcp socket to the local endpoint
         if local_addr.is_unspecified() {
@@ -152,7 +159,11 @@ impl BoundUdp {
 
     pub fn connect(&self, remote: smoltcp::wire::IpEndpoint) {
         let local = self.endpoint();
-        log::debug!("BoundUdp::connect: local={:?}, connecting to remote={:?}", local, remote);
+        log::debug!(
+            "BoundUdp::connect: local={:?}, connecting to remote={:?}",
+            local,
+            remote
+        );
 
         // Check if there are buffered packets - if so, allow next recv without filtering
         let has_buffered = self.with_socket(|socket| socket.can_recv());
@@ -179,7 +190,6 @@ impl BoundUdp {
         let remote = *self.remote.lock();
 
         self.with_mut_socket(|socket| {
-
             // If connected, filter packets by source address (except pre-connect packets)
             if let Some(expected_remote) = remote {
                 // Check if we should accept pre-connect data without filtering
@@ -187,7 +197,7 @@ impl BoundUdp {
                 if *has_preconnect {
                     // Clear the flag - we only allow ONE unfiltered recv
                     *has_preconnect = false;
-                    drop(has_preconnect);  // Release lock before recv
+                    drop(has_preconnect); // Release lock before recv
                     if socket.can_recv() {
                         if let Ok((size, metadata)) = socket.recv_slice(buf) {
                             return Ok((size, metadata.endpoint));
@@ -195,7 +205,7 @@ impl BoundUdp {
                     }
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
-                drop(has_preconnect);  // Release lock
+                drop(has_preconnect); // Release lock
 
                 // Loop to skip packets from unexpected sources
                 loop {

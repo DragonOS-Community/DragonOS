@@ -44,7 +44,7 @@ make kernel
 ## 构建 rootfs
 
 ```shell
-nix run .#rootfs.x86_64
+nix run .#rootfs-x86_64
 ```
 
 这会生成 `./bin/qemu-system-x86_64.img`
@@ -52,7 +52,7 @@ nix run .#rootfs.x86_64
 ## 启动内核
 
 ```shell
-nix run .#start.x86_64
+nix run .#start-x86_64
 ```
 
 现在你能看到你的终端载入 DragonOS 了

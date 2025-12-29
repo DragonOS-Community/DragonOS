@@ -1581,14 +1581,6 @@ impl<'a> FilldirContext<'a> {
 
         // 获取当前写入位置的偏移量
         let buf_start = self.current_pos;
-        // 清零缓冲区（确保对齐部分为0）
-        // 如果清零失败（例如访问不可写页面），视为缓冲区空间不足
-        if let Err(_e) = self.user_buf.clear_range(buf_start, align_up_reclen) {
-            // 将 EFAULT 或其他写入错误转换为 EINVAL，表示缓冲区空间不足
-            // 这样 read_dir 会正常返回，而不是传播错误
-            self.error = Some(SystemError::EINVAL);
-            return Err(SystemError::EINVAL);
-        }
         // 在内核空间构建完整的 dirent 数据
         let mut dirent_data = vec![0u8; align_up_reclen];
 
@@ -1642,12 +1634,10 @@ impl<'a> FilldirContext<'a> {
             }
         }
         // 使用受保护的方法写入用户缓冲区
-        // 如果写入失败（例如访问不可写页面），视为缓冲区空间不足
+        // 如果写入失败（例如访问不可写页面），应当返回 EFAULT
         if let Err(_e) = self.user_buf.write_to_user(buf_start, &dirent_data) {
-            // 将 EFAULT 或其他写入错误转换为 EINVAL，表示缓冲区空间不足
-            // 这样 read_dir 会正常返回，而不是传播错误
-            self.error = Some(SystemError::EINVAL);
-            return Err(SystemError::EINVAL);
+            self.error = Some(SystemError::EFAULT);
+            return Err(SystemError::EFAULT);
         }
         // 更新位置
         self.current_pos += align_up_reclen;

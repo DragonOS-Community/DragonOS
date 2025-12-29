@@ -5,8 +5,8 @@ pkgs.stdenv.mkDerivation {
   version = "10.1.3+ds-1";
 
   src = pkgs.fetchurl {
-    url = "http://ftp.cn.debian.org/debian/pool/main/q/qemu/qemu-system-data_10.1.3+ds-1_all.deb";
-    sha256 = "0nz3whjiw3qmp27mhidh8fk7gfkcvk2vk7z4pr6w3is9hd2g36sg";
+    url = "http://snapshot.debian.org/archive/debian/20251216T024428Z/pool/main/q/qemu/qemu-system-data_10.1.3+ds-1_all.deb";
+    sha256 = "sha256-T5vxRINJx8FNvuSfucXcbLp3pkOwRViPuBUPHiXk41s";
   };
 
   nativeBuildInputs = with pkgs; [ dpkg ];

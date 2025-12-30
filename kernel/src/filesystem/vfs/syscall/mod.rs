@@ -14,6 +14,9 @@ mod sys_chroot;
 mod sys_close;
 mod sys_dup;
 mod sys_dup3;
+#[cfg(target_arch = "x86_64")]
+mod sys_eventfd;
+mod sys_eventfd2;
 mod sys_faccessat;
 mod sys_faccessat2;
 mod sys_fchdir;
@@ -32,6 +35,9 @@ mod sys_lseek;
 mod sys_mkdirat;
 pub mod sys_mknodat;
 mod sys_openat;
+#[cfg(target_arch = "x86_64")]
+mod sys_poll;
+mod sys_ppoll;
 mod sys_pread64;
 mod sys_preadv;
 mod sys_preadv2;

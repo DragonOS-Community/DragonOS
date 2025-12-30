@@ -172,6 +172,11 @@ pub trait AllocablePage {
     where
         Self: core::marker::Sized;
 
+    /// Returns which list this page currently belongs to inside [`SCAllocator`].
+    fn page_state(&self) -> PageState;
+    /// Updates the state of this page (must be kept consistent with list membership).
+    fn set_page_state(&mut self, state: PageState);
+
     /// Tries to find a free block within `data` that satisfies `alignment` requirement.
     fn first_fit(&self, layout: Layout) -> Option<(usize, usize)> {
         let base_addr = (self as *const Self as *const u8) as usize;
@@ -236,6 +241,15 @@ pub trait AllocablePage {
     }
 }
 
+/// Which list a page currently belongs to inside an [`SCAllocator`].
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PageState {
+    Empty = 0,
+    Partial = 1,
+    Full = 2,
+}
+
 /// Holds allocated data within a 4 KiB page.
 ///
 /// Has a data-section where objects are allocated from
@@ -257,6 +271,11 @@ pub struct ObjectPage<'a> {
     next: Rawlink<ObjectPage<'a>>,
     /// Previous element in  list (used by `PageList`)
     prev: Rawlink<ObjectPage<'a>>,
+
+    /// Page state for O(1) list migration.
+    state: PageState,
+    /// Padding to keep `bitfield` 8-byte aligned.
+    _state_pad: [u8; 7],
 
     /// A bit-field to track free/allocated memory within `data`.
     pub(crate) bitfield: [AtomicU64; 8],
@@ -287,6 +306,14 @@ impl AllocablePage for ObjectPage<'_> {
 
     fn next(&mut self) -> &mut Rawlink<Self> {
         &mut self.next
+    }
+
+    fn page_state(&self) -> PageState {
+        self.state
+    }
+
+    fn set_page_state(&mut self, state: PageState) {
+        self.state = state;
     }
 }
 

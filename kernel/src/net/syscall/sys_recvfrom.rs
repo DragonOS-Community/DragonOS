@@ -163,13 +163,13 @@ pub(super) fn do_recvfrom(
         pmsg_flags.insert(socket::PMSG::DONTWAIT);
     }
 
-    // Receive data from socket
-    let (recv_len, endpoint) = socket.recv_from(buf, pmsg_flags, None)?;
-
-    // Write source address back to user if addr is not null
-    if !addr.is_null() {
-        endpoint.write_to_user(addr, addr_len)?;
+    // Linux 语义：recvfrom 的 addr/addrlen 是纯输出参数，内核不得读取 addr 缓冲区内容。
+    // 用户栈上的 sockaddr 可能是未初始化的；读取它会导致错误解析并返回 EINVAL。
+    if addr_len.is_null() {
+        return Err(SystemError::EFAULT);
     }
 
-    return Ok(recv_len);
+    let (recv_len, endpoint) = socket.recv_from(buf, pmsg_flags, None)?;
+    endpoint.write_to_user(addr, addr_len)?;
+    Ok(recv_len)
 }

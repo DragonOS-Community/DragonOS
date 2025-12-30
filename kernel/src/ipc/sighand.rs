@@ -148,6 +148,19 @@ impl SigHand {
         g.shared_pending.dequeue_signal(sig_mask)
     }
 
+    /// 向 shared_pending 队列添加信号
+    pub fn shared_pending_push(&self, sig: Signal, info: SigInfo) {
+        let mut g = self.inner_mut();
+        g.shared_pending.queue_mut().q.push(info);
+        g.shared_pending.signal_mut().insert(sig.into());
+    }
+
+    /// 向 shared_pending 的 signal 位图中添加信号（不添加 siginfo）
+    pub fn shared_pending_signal_insert(&self, sig: Signal) {
+        let mut g = self.inner_mut();
+        g.shared_pending.signal_mut().insert(sig.into());
+    }
+
     // ===== Signal flags helpers =====
     pub fn flags(&self) -> SignalFlags {
         self.inner().flags

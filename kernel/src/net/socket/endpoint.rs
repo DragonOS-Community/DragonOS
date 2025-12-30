@@ -22,11 +22,21 @@ pub enum Endpoint {
     Netlink(NetlinkSocketAddr),
 }
 
-/// @brief 链路层端点
+/// @brief 链路层端点 (对应 sockaddr_ll)
 #[derive(Debug, Clone)]
 pub struct LinkLayerEndpoint {
-    /// 网卡的接口号
+    /// 网卡的接口号 (sll_ifindex)
     pub interface: usize,
+    /// MAC 地址 (sll_addr, 最多 8 字节，通常只使用 6 字节)
+    pub addr: [u8; 8],
+    /// 协议号 (sll_protocol, 网络字节序)
+    pub protocol: u16,
+    /// 硬件类型 (sll_hatype, 通常为 ARPHRD_ETHER = 1)
+    pub hatype: u16,
+    /// 包类型 (sll_pkttype)
+    pub pkttype: u8,
+    /// 地址长度 (sll_halen, 通常为 6)
+    pub halen: u8,
 }
 
 impl LinkLayerEndpoint {
@@ -36,7 +46,45 @@ impl LinkLayerEndpoint {
     ///
     /// @return 返回创建的链路层端点
     pub fn new(interface: usize) -> Self {
-        Self { interface }
+        Self {
+            interface,
+            addr: [0u8; 8],
+            protocol: 0,
+            hatype: 1, // ARPHRD_ETHER
+            pkttype: 0,
+            halen: 6,
+        }
+    }
+
+    /// 使用接口号和 MAC 地址创建链路层端点
+    pub fn with_addr(interface: usize, addr: [u8; 8]) -> Self {
+        Self {
+            interface,
+            addr,
+            protocol: 0,
+            hatype: 1,
+            pkttype: 0,
+            halen: 6,
+        }
+    }
+
+    /// 创建完整的链路层端点
+    pub fn full(
+        interface: usize,
+        addr: [u8; 8],
+        protocol: u16,
+        hatype: u16,
+        pkttype: u8,
+        halen: u8,
+    ) -> Self {
+        Self {
+            interface,
+            addr,
+            protocol,
+            hatype,
+            pkttype,
+            halen,
+        }
     }
 }
 

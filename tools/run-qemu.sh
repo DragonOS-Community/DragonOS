@@ -149,7 +149,9 @@ fi
 
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     QEMU_MACHINE=" -machine q35,memory-backend=${QEMU_MEMORY_BACKEND} "
-    QEMU_CPU_FEATURES+="-cpu IvyBridge,apic,x2apic,+fpu,check,+vmx,${allflags}"
+    # 根据加速方式选择CPU型号：KVM使用host，TCG使用IvyBridge
+    cpu_model=$([ "${qemu_accel}" == "kvm" ] && echo "host" || echo "IvyBridge")
+    QEMU_CPU_FEATURES+="-cpu ${cpu_model},apic,x2apic,+fpu,check,+vmx,${allflags}"
     QEMU_RTC_CLOCK+=" -rtc clock=host,base=localtime"
     if [ ${VIRTIO_BLK_DEVICE} == false ]; then
       QEMU_DEVICES_DISK+="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 "

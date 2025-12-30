@@ -7,6 +7,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RT_SIGQUEUEINFO;
 use crate::ipc::signal_types::{PosixSigInfo, SigCode, SigInfo, SigType};
 use crate::ipc::syscall::sys_kill::check_signal_permission_pcb_with_sig;
+use crate::process::pid::PidType;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
 use crate::{arch::ipc::signal::Signal, process::ProcessManager, process::RawPid};
@@ -128,8 +129,9 @@ impl Syscall for SysRtSigqueueinfoHandle {
         let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
         check_signal_permission_pcb_with_sig(&target, Some(signal))?;
 
+        // rt_sigqueueinfo 发送进程级信号，使用 PidType::TGID
         signal
-            .send_signal_info_to_pcb(Some(&mut info), target)
+            .send_signal_info_to_pcb(Some(&mut info), target, PidType::TGID)
             .map(|x| x as usize)
     }
 

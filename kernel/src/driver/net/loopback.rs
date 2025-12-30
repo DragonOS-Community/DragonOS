@@ -85,8 +85,21 @@ impl phy::TxToken for LoopbackTxToken {
     {
         let mut buffer = vec![0; len];
         let result = f(buffer.as_mut_slice());
-        let mut device = self.driver.inner.lock();
-        device.loopback_transmit(buffer);
+        {
+            let mut device = self.driver.inner.lock();
+            device.loopback_transmit(buffer);
+        }
+
+        // Linux 语义：lo 发送应尽快在本地“收到”并分发给 socket。
+        // smoltcp 的 poll() 在一次调用内先处理 receive 再处理 transmit，
+        // 因此本次 transmit 入队的数据需要下一次 poll 才会被处理。
+        // 这里唤醒 netns 轮询线程，保证下一次 poll 能及时发生，避免用户态 poll(-1) 卡死。
+        if let Some(iface) = self.driver.iface() {
+            if let Some(netns) = iface.common().net_namespace() {
+                netns.wakeup_poll_thread();
+            }
+        }
+        // debug!("lo transmit!");
         result
     }
 }
@@ -185,13 +198,18 @@ impl LoopbackDriverWapper {
 /// 负责操作Loopback设备实现基本的网卡功能
 pub struct LoopbackDriver {
     pub inner: Arc<SpinLock<Loopback>>,
+    /// 指向所属网络接口的弱引用，用于唤醒 netns 轮询线程
+    iface: SpinLock<Option<Weak<dyn Iface>>>,
 }
 
 impl Default for LoopbackDriver {
     /// ## LoopbackDriver创建函数
     fn default() -> Self {
         let inner = Arc::new(SpinLock::new(Loopback::default()));
-        LoopbackDriver { inner }
+        LoopbackDriver {
+            inner,
+            iface: SpinLock::new(None),
+        }
     }
 }
 
@@ -199,6 +217,7 @@ impl Clone for LoopbackDriver {
     fn clone(&self) -> Self {
         LoopbackDriver {
             inner: self.inner.clone(),
+            iface: SpinLock::new(self.iface.lock().clone()),
         }
     }
 }
@@ -263,6 +282,16 @@ impl phy::Device for LoopbackDriver {
     }
 }
 
+impl LoopbackDriver {
+    pub fn set_iface(&self, iface: Weak<dyn Iface>) {
+        *self.iface.lock() = Some(iface);
+    }
+
+    pub fn iface(&self) -> Option<Arc<dyn Iface>> {
+        self.iface.lock().as_ref().and_then(|w| w.upgrade())
+    }
+}
+
 /// ## LoopbackInterface结构
 /// 封装驱动包裹器和iface，设置接口名称
 #[cast_to([sync] Iface)]
@@ -322,9 +351,14 @@ impl LoopbackInterface {
         let addr = IpAddress::v4(127, 0, 0, 1);
         let cidr = IpCidr::new(addr, 8);
 
+        // IPv6 loopback address ::1/128 (Linux 默认在 lo 上配置)。
+        let addr6 = IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1);
+        let cidr6 = IpCidr::new(addr6, 128);
+
         //设置网卡地址为127.0.0.1
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs.push(cidr).expect("Push ipCidr failed: full");
+            ip_addrs.push(cidr6).expect("Push ipCidr failed: full");
         });
 
         iface.routes_mut().update(|routes_map| {
@@ -336,6 +370,15 @@ impl LoopbackInterface {
                     expires_at: None,
                 })
                 .expect("Add default ipv4 route failed: full");
+
+            routes_map
+                .push(smoltcp::iface::Route {
+                    cidr: cidr6,
+                    via_router: addr6,
+                    preferred_until: None,
+                    expires_at: None,
+                })
+                .expect("Add default ipv6 route failed: full");
         });
 
         let flags = InterfaceFlags::LOOPBACK
@@ -343,7 +386,7 @@ impl LoopbackInterface {
             | InterfaceFlags::RUNNING
             | InterfaceFlags::LOWER_UP;
 
-        Arc::new(LoopbackInterface {
+        let iface = Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
             common: IfaceCommon::new(
                 iface_id,
@@ -357,7 +400,16 @@ impl LoopbackInterface {
                 kobj_common: KObjectCommonData::default(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
-        })
+        });
+
+        // 记录 iface 弱引用，用于 lo 发送时唤醒 netns 轮询线程
+        let iface_dyn = iface.clone() as Arc<dyn Iface>;
+        iface
+            .driver
+            .force_get_mut()
+            .set_iface(Arc::downgrade(&iface_dyn));
+
+        iface
     }
 
     fn inner(&self) -> SpinLockGuard<'_, InnerLoopbackInterface> {

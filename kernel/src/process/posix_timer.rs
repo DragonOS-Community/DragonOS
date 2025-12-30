@@ -15,7 +15,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::Signal,
     ipc::signal_types::{PosixSigval, SigCode, SigInfo, SigType},
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
+    process::{pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
     time::{
         jiffies::NSEC_PER_JIFFY,
         syscall::PosixClockID,
@@ -60,6 +60,9 @@ pub enum PosixTimerNotify {
         signo: Signal,
         sigval: PosixSigval,
         target_tid: RawPid,
+        /// 是否是线程定向信号（SIGEV_THREAD_ID）
+        /// Linux 语义：SIGEV_THREAD_ID 使用 PIDTYPE_PID（线程级），其他使用 PIDTYPE_TGID（进程级）
+        thread_directed: bool,
     },
 }
 
@@ -141,13 +144,14 @@ impl ProcessPosixTimers {
                     signo,
                     sigval: PosixSigval::from_ptr(sev.sigev_value),
                     target_tid: pcb.raw_pid(),
+                    thread_directed: false,
                 }
             }
             SIGEV_THREAD => {
                 // 兼容 gVisor 测试：它通过 TimerCreate() 传入 SIGEV_THREAD 并期望用 signo 打断阻塞 syscall。
                 // Linux 内核并不会在内核态执行用户回调；glibc/musl 通常在用户态把 SIGEV_THREAD
                 // 转换为 SIGEV_THREAD_ID + sigwaitinfo 线程。
-                // DragonOS 这里选择退化为“投递信号到当前线程”，以满足 FIFO/OpenInterrupted 场景。
+                // DragonOS 这里选择退化为"投递信号到当前线程"，以满足 FIFO/OpenInterrupted 场景。
                 let signo = Signal::from(sev.sigev_signo as usize);
                 if !signo.is_valid() {
                     return Err(SystemError::EINVAL);
@@ -156,11 +160,12 @@ impl ProcessPosixTimers {
                     signo,
                     sigval: PosixSigval::from_ptr(sev.sigev_value),
                     target_tid: pcb.raw_pid(),
+                    thread_directed: false,
                 }
             }
             SIGEV_THREAD_ID => {
                 let tid = RawPid::new(sev.sigev_notify_thread_id as usize);
-                // Linux 语义：仅允许向“同一线程组”的某个线程投递信号。
+                // Linux 语义：仅允许向"同一线程组"的某个线程投递信号。
                 // musl 的 SIGEV_THREAD 实现会创建新线程，并通过 SIGEV_THREAD_ID
                 // 将内核 timer 信号定向到该线程，因此这里必须允许非当前 tid。
                 let target = ProcessManager::find_task_by_vpid(tid)
@@ -179,6 +184,7 @@ impl ProcessPosixTimers {
                     signo,
                     sigval: PosixSigval::from_ptr(sev.sigev_value),
                     target_tid: tid,
+                    thread_directed: true, // SIGEV_THREAD_ID 是线程定向信号
                 }
             }
             _ => return Err(SystemError::EINVAL),
@@ -346,37 +352,86 @@ impl TimerFunction for PosixTimerHelper {
                 signo,
                 sigval,
                 target_tid,
+                thread_directed,
             } => {
-                // 注意：DragonOS 当前 signal 发送路径对非 RT 信号的“去重检查”是看 shared_pending，
-                // 但实际入队在 per-thread pending，因此这里必须基于当前线程 pending 来做合并/overrun。
-                let mut siginfo_guard = pcb.sig_info_mut();
-                // 计算“是否未阻塞且 handler=SIG_IGN”，必须使用已持有的 siginfo_guard，
-                // 否则在持有写锁时再次调用 pcb.sig_info_irqsave() 会造成自锁死（PeriodicGroupDirectedSignal 复现）。
+                // 确定信号目标：使用 pcb 的 PID namespace 来查找 target_tid
+                let target = ProcessManager::find_task_by_pid_ns(target_tid, &pcb.active_pid_ns())
+                    .or_else(|| ProcessManager::find(target_tid))
+                    .unwrap_or_else(|| pcb.clone());
+
+                // Linux 语义：SIGEV_THREAD_ID 使用 PIDTYPE_PID（线程级），其他使用 PIDTYPE_TGID（进程级）
+                let pt = if thread_directed {
+                    PidType::PID
+                } else {
+                    PidType::TGID
+                };
+
+                // 根据信号类型选择检查的 pending 队列
+                // - 线程级信号 (PidType::PID)：检查 target 的 sig_pending
+                // - 进程级信号 (PidType::TGID)：检查 shared_pending
+                let is_thread_target = matches!(pt, PidType::PID);
+
+                // 获取 target 的 sig_info 锁
+                let mut siginfo_guard = target.sig_info_mut();
+
+                // 计算"是否未阻塞且 handler=SIG_IGN"
                 let ignored_and_unblocked = {
                     let mut blocked = *siginfo_guard.sig_blocked();
-                    if pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+                    if target.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
                         blocked.insert(*siginfo_guard.saved_sigmask());
                     }
                     let is_blocked = blocked.contains(signo.into_sigset());
                     if is_blocked {
                         false
                     } else {
-                        pcb.sighand()
+                        target
+                            .sighand()
                             .handler(signo)
                             .map(|x| x.is_ignore())
                             .unwrap_or(false)
                     }
                 };
-                let pending = siginfo_guard.sig_pending_mut();
+
+                // 根据信号类型检查对应的 pending 队列
+                let timer_exists = if is_thread_target {
+                    // 线程级信号：检查 target 的 sig_pending
+                    siginfo_guard
+                        .sig_pending_mut()
+                        .posix_timer_exists(signo, self.timerid)
+                } else {
+                    // 进程级信号：检查 shared_pending
+                    target
+                        .sighand()
+                        .shared_pending_posix_timer_exists(signo, self.timerid)
+                };
 
                 // 1) 若已有该 timer 的信号：在队列项上累加 overrun
-                if pending.posix_timer_exists(signo, self.timerid) {
+                if timer_exists {
                     let bump = 1i32.saturating_add(t.pending_overrun_acc);
                     t.pending_overrun_acc = 0;
-                    pending.posix_timer_bump_overrun(signo, self.timerid, bump);
+                    if is_thread_target {
+                        siginfo_guard.sig_pending_mut().posix_timer_bump_overrun(
+                            signo,
+                            self.timerid,
+                            bump,
+                        );
+                    } else {
+                        target.sighand().shared_pending_posix_timer_bump_overrun(
+                            signo,
+                            self.timerid,
+                            bump,
+                        );
+                    }
                 } else {
+                    // 检查是否有其他来源的 pending 信号
+                    let has_other_pending = if is_thread_target {
+                        siginfo_guard.sig_pending().queue().find(signo).0.is_some()
+                    } else {
+                        target.sighand().shared_pending_queue_has(signo)
+                    };
+
                     // 2) 若 signo 已有其他来源的 pending（如 tgkill 提前排队）：本次无法入队，记为 overrun
-                    if pending.queue().find(signo).0.is_some() {
+                    if has_other_pending {
                         t.pending_overrun_acc = t.pending_overrun_acc.saturating_add(1);
                     } else if ignored_and_unblocked {
                         // 3) 未阻塞且 handler=SIG_IGN：Linux 语义下会丢弃；tests 期望这也计入 overrun
@@ -387,9 +442,7 @@ impl TimerFunction for PosixTimerHelper {
                         t.pending_overrun_acc = 0;
                         t.last_overrun = overrun;
 
-                        drop(siginfo_guard); // 避免在 send_signal 路径中再次取 sig_info 锁导致死锁
-
-                        let mut info = SigInfo::new(
+                        let info = SigInfo::new(
                             signo,
                             0,
                             SigCode::Timer,
@@ -400,10 +453,7 @@ impl TimerFunction for PosixTimerHelper {
                             },
                         );
 
-                        // 当前实现：target_tid 必须属于当前进程；否则在 create 时已拒绝
-                        let target = ProcessManager::find_task_by_vpid(target_tid)
-                            .unwrap_or_else(|| pcb.clone());
-                        let _ = signo.send_signal_info_to_pcb(Some(&mut info), target);
+                        signo.enqueue_signal_locked(info, target.clone(), pt, siginfo_guard);
                     }
                 }
             }
@@ -424,6 +474,3 @@ fn timespec_to_duration(ts: &PosixTimeSpec) -> Result<Duration, SystemError> {
     validate_timespec(ts)?;
     Ok(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
 }
-
-// 注意：不要在持有 pcb.sig_info_mut() 写锁时调用任何会再次获取 sig_info_* 锁的函数，
-// 否则会造成自锁死。相关判断请在持锁区内使用已拿到的 guard 直接计算。

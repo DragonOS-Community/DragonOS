@@ -90,6 +90,9 @@ socket_unix_unbound_abstract_test
 socket_unix_unbound_dgram_test
 socket_unix_unbound_filesystem_test
 socket_unix_unbound_stream_test
+raw_socket_test
+raw_socket_icmp_test
+raw_socket_hdrincl_test
 
 # 信号处理测试
 sigaction_test
@@ -98,6 +101,7 @@ sigaltstack_test
 sigreturn_test
 sigtimedwait_test
 rtsignal_test
+signalfd_test
 
 # 其他测试
 itimer_test
@@ -111,5 +115,6 @@ clock_nanosleep_test
 clock_getres_test
 clock_gettime_test
 setgid_test
+uidgid_test
 partitial_bad_buffer_test
 

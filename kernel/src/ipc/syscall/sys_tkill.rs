@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use core::ffi::c_int;
 
 use crate::arch::interrupt::TrapFrame;
+use crate::process::pid::PidType;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
@@ -177,8 +178,8 @@ fn send_signal_to_thread(
         },
     );
 
-    // 发送信号
-    let result = sig.send_signal_info_to_pcb(Some(&mut info), target_pcb);
+    // 发送信号（tgkill 发送线程级信号，使用 PidType::PID）
+    let result = sig.send_signal_info_to_pcb(Some(&mut info), target_pcb, PidType::PID);
 
     // 处理竞态条件：如果目标线程在投递过程中退出，视为成功
     match result {

@@ -80,6 +80,27 @@ impl BoundInner {
         }
     }
 
+    /// Bind a socket to a specific iface without selecting by address.
+    ///
+    /// This is useful for sockets that conceptually listen on all local addresses
+    /// (e.g., unbound raw sockets) but still need to be attached to an iface so
+    /// that packets can be delivered.
+    pub fn bind_on_iface<T>(
+        socket: T,
+        iface: Arc<dyn Iface>,
+        netns: Arc<NetNamespace>,
+    ) -> Result<Self, SystemError>
+    where
+        T: smoltcp::socket::AnySocket<'static>,
+    {
+        let handle = iface.sockets().lock().add(socket);
+        Ok(Self {
+            handle,
+            iface,
+            netns,
+        })
+    }
+
     pub fn bind_ephemeral<T>(
         socket: T,
         // socket_type: Types,

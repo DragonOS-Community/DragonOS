@@ -14,6 +14,7 @@ use crate::{
         SigCode, SigInfo, SigType, SigactionType, SignalFlags, SIG_KERNEL_IGNORE_MASK,
         SIG_KERNEL_ONLY_MASK, SIG_KERNEL_STOP_MASK,
     },
+    libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::{
         pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
@@ -92,14 +93,20 @@ impl Signal {
         }
 
         let pcb = pcb.unwrap();
-        return self.send_signal_info_to_pcb(info, pcb);
+        return self.send_signal_info_to_pcb(info, pcb, PidType::TGID);
     }
 
     /// 直接向指定进程发送信号，绕过PID namespace查找
+    ///
+    /// # 参数
+    /// - `info`: 信号信息
+    /// - `pcb`: 目标进程
+    /// - `pt`: 信号类型，`PidType::PID` 表示线程级信号，`PidType::TGID` 表示进程级信号
     pub fn send_signal_info_to_pcb(
         &self,
         info: Option<&mut SigInfo>,
         pcb: Arc<ProcessControlBlock>,
+        pt: PidType,
     ) -> Result<i32, SystemError> {
         // 检查sig是否符合要求，如果不符合要求，则退出。
         if !self.is_valid() {
@@ -107,7 +114,7 @@ impl Signal {
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 发送信号
-        let retval = self.send_signal(info, pcb, PidType::PID);
+        let retval = self.send_signal(info, pcb, pt);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         return retval;
     }
@@ -139,7 +146,10 @@ impl Signal {
         }
         // debug!("force send={}", force_send);
         let pcb_info = pcb.sig_info_irqsave();
-        let is_shared_target = matches!(pt, PidType::PID);
+        // 根据 Linux 语义：PidType::PID 表示线程级信号，其他类型（TGID/PGID/SID）表示进程级信号
+        // 参考 Linux kernel/signal.c:__send_signal_locked():
+        // pending = (type != PIDTYPE_PID) ? &t->signal->shared_pending : &t->pending;
+        let is_thread_target = matches!(pt, PidType::PID);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 如果是kill或者目标pcb是内核线程，则无需获取sigqueue，直接发送信号即可
         if matches!(self, Signal::SIGKILL) || pcb.flags().contains(ProcessFlags::KTHREAD) {
@@ -149,8 +159,8 @@ impl Signal {
         }
         // 如果不是实时信号的话，同一时刻信号队列里只会有一个待处理的信号，如果重复接收就不做处理
         else if !self.is_rt_signal()
-            && ((is_shared_target && pcb.sighand().shared_pending_queue_has(*self))
-                || (!is_shared_target && pcb_info.sig_pending().queue().find(*self).0.is_some()))
+            && ((!is_thread_target && pcb.sighand().shared_pending_queue_has(*self))
+                || (is_thread_target && pcb_info.sig_pending().queue().find(*self).0.is_some()))
         {
             return Ok(0);
         } else {
@@ -178,17 +188,62 @@ impl Signal {
                 }
             };
             drop(pcb_info);
-            pcb.sig_info_mut()
-                .sig_pending_mut()
-                .queue_mut()
-                .q
-                .push(new_sig_info);
+            // 根据信号类型选择添加到线程级 pending 还是进程级 shared_pending
+            if is_thread_target {
+                // 线程级信号：添加到线程的 sig_pending
+                pcb.sig_info_mut()
+                    .sig_pending_mut()
+                    .queue_mut()
+                    .q
+                    .push(new_sig_info);
+            } else {
+                // 进程级信号：添加到 shared_pending
+                pcb.sighand().shared_pending_push(*self, new_sig_info);
+            }
 
             // if pt == PidType::PGID || pt == PidType::SID {}
             self.complete_signal(pcb.clone(), pt);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         return Ok(0);
+    }
+
+    /// 在已持有 ProcessSignalInfo 锁的情况下，将信号入队
+    ///
+    /// 此方法专为 POSIX timer 等需要原子性检查并入队的场景设计，
+    /// 调用者负责在调用前检查去重条件，此方法只负责入队和后续处理。
+    ///
+    /// ## 参数
+    /// - `info`: 要入队的信号信息
+    /// - `pcb`: 目标进程
+    /// - `pt`: 信号类型，`PidType::PID` 表示线程级信号，`PidType::TGID` 表示进程级信号
+    /// - `siginfo_guard`: 已持有的 ProcessSignalInfo 锁（线程级信号时使用，进程级信号时会被忽略）
+    ///
+    /// ## 注意
+    /// 此方法会消耗 `siginfo_guard`，调用后锁会被释放
+    pub fn enqueue_signal_locked(
+        &self,
+        info: SigInfo,
+        pcb: Arc<ProcessControlBlock>,
+        pt: PidType,
+        siginfo_guard: RwLockWriteGuard<'_, ProcessSignalInfo>,
+    ) {
+        let is_thread_target = matches!(pt, PidType::PID);
+
+        // 根据信号类型选择添加到线程级 pending 还是进程级 shared_pending
+        if is_thread_target {
+            // 线程级信号：添加到线程的 sig_pending
+            let mut guard = siginfo_guard;
+            guard.sig_pending_mut().queue_mut().q.push(info);
+            drop(guard);
+        } else {
+            // 进程级信号：添加到 shared_pending（不需要 siginfo_guard）
+            drop(siginfo_guard);
+            pcb.sighand().shared_pending_push(*self, info);
+        }
+
+        // complete_signal 会统一：设置对应 pending 位图、更新 HAS_PENDING_SIGNAL，并按需唤醒
+        self.complete_signal(pcb, pt);
     }
 
     /// @brief 将信号添加到目标进程的sig_pending。在引入进程组后，本函数还将负责把信号传递给整个进程组。
@@ -207,11 +262,22 @@ impl Signal {
 
         let target_pcb: Option<Arc<ProcessControlBlock>>;
 
-        // 无论目标进程当前是否屏蔽该信号，均应当将其标记为 pending
-        pcb.sig_info_mut()
-            .sig_pending_mut()
-            .signal_mut()
-            .insert((*self).into());
+        // 根据信号类型选择添加到线程级 pending 还是进程级 shared_pending
+        let is_thread_target = matches!(pt, PidType::PID);
+        if is_thread_target {
+            // 线程级信号：添加到线程的 sig_pending
+            pcb.sig_info_mut()
+                .sig_pending_mut()
+                .signal_mut()
+                .insert((*self).into());
+        } else {
+            // 进程级信号：添加到 shared_pending
+            // 注意：正常路径下（send_signal/enqueue_signal_locked）进程级信号会通过
+            // shared_pending_push() 同时完成“入队 + 位图置位”。这里仍然保留位图置位，
+            // 用于 SIGKILL / KTHREAD 等 fast path：这些路径会直接调用 complete_signal，
+            // 不会入队 siginfo，但仍需要让共享 pending 位图反映该信号已到达。
+            pcb.sighand().shared_pending_signal_insert(*self);
+        }
         // 根据实际 pending/blocked 关系更新 HAS_PENDING_SIGNAL，避免长时间误置位
         pcb.recalc_sigpending(None);
 
@@ -677,8 +743,10 @@ fn __set_current_blocked(new_set: &SigSet) {
 }
 
 fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
-    let retarget = pcb.sighand().shared_pending_signal();
-    retarget.intersects(which);
+    // Linux 语义：当线程的 blocked 集发生变化（尤其是“新增屏蔽”）时，
+    // 需要尝试把 shared_pending 中受影响的信号“重定向”给同一线程组内
+    // 其他未屏蔽该信号的线程去处理。
+    let retarget = pcb.sighand().shared_pending_signal().intersection(which);
     if retarget.is_empty() {
         return;
     }
@@ -693,12 +761,12 @@ fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
             return;
         }
 
-        let blocked = pcb.sighand().shared_pending_signal();
+        // 若该线程把 retarget 中的信号全部屏蔽，则它无法处理这些 shared_pending 信号
+        let blocked = *pcb.sig_info_irqsave().sig_blocked();
         if retarget.difference(blocked).is_empty() {
             return;
         }
 
-        retarget.intersects(blocked);
         if !pcb.has_pending_signal() {
             signal_wake_up(pcb.clone(), false);
         }

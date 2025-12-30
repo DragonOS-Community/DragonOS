@@ -110,6 +110,60 @@ fn test_mmap_allocator() {
     }
 }
 
+#[test]
+fn page_list_state_migration_full_partial_empty() {
+    let _ = env_logger::try_init();
+    let mut pager = Pager::new();
+    let mut sa: SCAllocator<ObjectPage> = SCAllocator::new(8);
+    let layout = Layout::from_size_align(8, 1).unwrap();
+
+    // Provide exactly one page to the allocator.
+    let page = pager.allocate_page().expect("Can't allocate a page");
+    unsafe { sa.refill(page) };
+
+    // Allocate until we run out of memory: with a single page, this should end in Full.
+    let mut objs: Vec<NonNull<u8>> = Vec::new();
+    loop {
+        match sa.allocate(layout) {
+            Ok(p) => objs.push(p),
+            Err(AllocationError::OutOfMemory) => break,
+            Err(AllocationError::InvalidLayout) => unreachable!("Unexpected error"),
+        }
+    }
+
+    assert_eq!(
+        sa.full_slabs.elements, 1,
+        "single page should end up in full list"
+    );
+    assert_eq!(sa.slabs.elements, 0);
+    assert_eq!(sa.empty_slabs.elements, 0);
+
+    // Free one object: Full -> Partial.
+    let one = objs.pop().expect("must have at least one allocation");
+    unsafe { sa.deallocate(one, layout).expect("Can't deallocate") };
+    assert_eq!(sa.full_slabs.elements, 0, "full -> partial on first free");
+    assert_eq!(sa.slabs.elements, 1);
+    assert_eq!(sa.empty_slabs.elements, 0);
+
+    // Free all remaining objects: Partial -> Empty.
+    for p in objs.drain(..) {
+        unsafe { sa.deallocate(p, layout).expect("Can't deallocate") };
+    }
+
+    assert_eq!(sa.full_slabs.elements, 0);
+    assert_eq!(sa.slabs.elements, 0);
+    assert_eq!(
+        sa.empty_slabs.elements, 1,
+        "page should become empty after last free"
+    );
+
+    // Reclaim and ensure pager sees it returned.
+    sa.try_reclaim_pages(usize::MAX, &mut |p: *mut ObjectPage| unsafe {
+        pager.release_page(&mut *p)
+    });
+    assert_eq!(pager.currently_allocated(), 0);
+}
+
 macro_rules! test_sc_allocation {
     ($test:ident, $size:expr, $alignment:expr, $allocations:expr, $type:ty) => {
         #[test]

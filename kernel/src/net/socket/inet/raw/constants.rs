@@ -19,3 +19,11 @@ pub const SYSCTL_RMEM_MAX: u32 = 212_992;
 // 参考 Linux 6.6: SOCK_MIN_RCVBUF/TCP_SKB_MIN_TRUESIZE 约为 2048+skb 头部对齐。
 pub const SOCK_MIN_RCVBUF: u32 = 2_304;
 pub const SOCK_MIN_SNDBUF: u32 = 4_608;
+
+// ICMP/ICMPv6 Echo 类型常量
+pub const ICMP_ECHO_REQUEST: u8 = 8;
+pub const ICMP_ECHO_REPLY: u8 = 0;
+pub const ICMPV6_ECHO_REQUEST: u8 = 128;
+pub const ICMPV6_ECHO_REPLY: u8 = 129;
+/// ICMPv6 校验和在 payload 中的偏移（字节）
+pub const ICMPV6_CHECKSUM_OFFSET: i32 = 2;

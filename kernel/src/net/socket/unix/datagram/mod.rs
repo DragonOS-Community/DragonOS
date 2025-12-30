@@ -27,9 +27,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use system_error::SystemError;
 
-use crate::libs::wait_queue::{TimeoutWaker, Waiter};
-use crate::time::timer::{next_n_us_timer_jiffies, Timer};
-use crate::time::{Duration, Instant};
+use crate::time::Duration;
 
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::syscall::user_access::UserBufferWriter;
@@ -465,83 +463,6 @@ impl UnixDatagramSocket {
         requested.saturating_mul(2)
     }
 
-    fn wait_event_interruptible_timeout<F>(
-        &self,
-        mut cond: F,
-        timeout: Option<Duration>,
-    ) -> Result<(), SystemError>
-    where
-        F: FnMut() -> bool,
-    {
-        let deadline = timeout.map(|t| Instant::now() + t);
-        loop {
-            if cond() {
-                return Ok(());
-            }
-
-            // 检查超时
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-            }
-
-            let remain =
-                deadline.map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
-
-            let (waiter, waker) = Waiter::new_pair();
-            self.wait_queue.register_waker(waker.clone())?;
-
-            // 条件可能在入队后立即满足
-            if cond() {
-                self.wait_queue.remove_waker(&waker);
-                return Ok(());
-            }
-
-            // 可中断等待：检查信号
-            if crate::arch::ipc::signal::Signal::signal_pending_state(
-                true,
-                false,
-                &crate::process::ProcessManager::current_pcb(),
-            ) {
-                self.wait_queue.remove_waker(&waker);
-                return Err(SystemError::ERESTARTSYS);
-            }
-
-            // 如果有超时，设置定时器
-            let timer = if let Some(remain) = remain {
-                if remain == Duration::ZERO {
-                    self.wait_queue.remove_waker(&waker);
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                let sleep_us = remain.total_micros();
-                let t: Arc<Timer> = Timer::new(
-                    TimeoutWaker::new(waker.clone()),
-                    next_n_us_timer_jiffies(sleep_us),
-                );
-                t.activate();
-                Some(t)
-            } else {
-                None
-            };
-
-            let wait_res = waiter.wait(true);
-            let was_timeout = timer.as_ref().map(|t| t.timeout()).unwrap_or(false);
-            if !was_timeout {
-                if let Some(t) = timer {
-                    t.cancel();
-                }
-            }
-
-            self.wait_queue.remove_waker(&waker);
-
-            if let Err(SystemError::ERESTARTSYS) = wait_res {
-                return Err(SystemError::ERESTARTSYS);
-            }
-            wait_res?;
-        }
-    }
-
     fn send_buffer_available(&self, len: usize) -> bool {
         let sndbuf = self.sndbuf.load(Ordering::Relaxed);
         let used = self.snd_used.load(Ordering::Relaxed);
@@ -926,7 +847,10 @@ impl Socket for UnixDatagramSocket {
                     return Ok(Self::recv_return_len(copy_len, orig_len, flags));
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    self.wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
+                    self.wait_queue.wait_event_interruptible_timeout(
+                        || self.can_recv(),
+                        self.recv_timeout(),
+                    )?;
                 }
                 Err(e) => return Err(e),
             }
@@ -959,7 +883,10 @@ impl Socket for UnixDatagramSocket {
             match do_recv(buffer) {
                 Ok(result) => return Ok(result),
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    self.wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
+                    self.wait_queue.wait_event_interruptible_timeout(
+                        || self.can_recv(),
+                        self.recv_timeout(),
+                    )?;
                 }
                 Err(e) => return Err(e),
             }
@@ -1068,7 +995,8 @@ impl Socket for UnixDatagramSocket {
                     }
                 }
 
-                self.wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
+                self.wait_queue
+                    .wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
             }
         };
 
@@ -1214,7 +1142,7 @@ impl Socket for UnixDatagramSocket {
             match self.try_send_to(buffer, &peer_addr) {
                 Ok(len) => return Ok(len),
                 Err(SystemError::ENOBUFS) => {
-                    self.wait_event_interruptible_timeout(
+                    self.wait_queue.wait_event_interruptible_timeout(
                         || self.send_buffer_available(buffer.len()),
                         self.send_timeout(),
                     )?;
@@ -1318,7 +1246,7 @@ impl Socket for UnixDatagramSocket {
             ) {
                 Ok(len) => return Ok(len),
                 Err(SystemError::ENOBUFS) => {
-                    self.wait_event_interruptible_timeout(
+                    self.wait_queue.wait_event_interruptible_timeout(
                         || self.send_buffer_available(buf.len()),
                         self.send_timeout(),
                     )?;
@@ -1346,7 +1274,7 @@ impl Socket for UnixDatagramSocket {
             match self.try_send_to(buffer, &target_addr) {
                 Ok(len) => return Ok(len),
                 Err(SystemError::ENOBUFS) => {
-                    self.wait_event_interruptible_timeout(
+                    self.wait_queue.wait_event_interruptible_timeout(
                         || self.send_buffer_available(buffer.len()),
                         self.send_timeout(),
                     )?;

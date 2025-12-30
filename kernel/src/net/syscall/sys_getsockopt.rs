@@ -14,6 +14,16 @@ use alloc::vec::Vec;
 /// getsockopt optval 最大长度限制（一页）
 const MAX_OPTVAL_LEN: usize = MMArch::PAGE_SIZE;
 
+/// 计算实际输出长度：若 optval 为 null 则返回 need，否则返回 min(user_len, need)
+#[inline]
+fn calc_out_len(optval: *mut u8, user_len: usize, need: usize) -> usize {
+    if optval.is_null() {
+        need
+    } else {
+        core::cmp::min(user_len, need)
+    }
+}
+
 /// System call handler for the `getsockopt` syscall
 ///
 /// This handler implements the `Syscall` trait to provide functionality for getting socket options.
@@ -145,12 +155,11 @@ pub(super) fn do_getsockopt(
         match opt {
             PSO::SNDBUF => {
                 let need = core::mem::size_of::<u32>();
+                let out_len = calc_out_len(optval, user_len, need);
 
-                // 使用 UserBufferWriter 写入 optval（小数据）
                 if !optval.is_null() {
-                    let to_write = core::cmp::min(user_len, need);
                     let value = socket.send_buffer_size() as u32;
-                    let mut optval_writer = UserBufferWriter::new(optval, to_write, from_user)?;
+                    let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
                     optval_writer
                         .buffer_protected(0)?
                         .write_one::<u32>(0, &value)?;
@@ -161,17 +170,16 @@ pub(super) fn do_getsockopt(
                     UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
                 optlen_writer
                     .buffer_protected(0)?
-                    .write_one::<u32>(0, &(need as u32))?;
+                    .write_one::<u32>(0, &(out_len as u32))?;
                 return Ok(0);
             }
             PSO::RCVBUF => {
                 let need = core::mem::size_of::<u32>();
-                let value = socket.recv_buffer_size() as u32;
+                let out_len = calc_out_len(optval, user_len, need);
 
-                // 使用 UserBufferWriter 写入 optval（小数据）
                 if !optval.is_null() {
-                    let to_write = core::cmp::min(user_len, need);
-                    let mut optval_writer = UserBufferWriter::new(optval, to_write, from_user)?;
+                    let value = socket.recv_buffer_size() as u32;
+                    let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
                     optval_writer
                         .buffer_protected(0)?
                         .write_one::<u32>(0, &value)?;
@@ -182,7 +190,7 @@ pub(super) fn do_getsockopt(
                     UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
                 optlen_writer
                     .buffer_protected(0)?
-                    .write_one::<u32>(0, &(need as u32))?;
+                    .write_one::<u32>(0, &(out_len as u32))?;
                 return Ok(0);
             }
             _ => {
@@ -190,13 +198,11 @@ pub(super) fn do_getsockopt(
                 // 这里采用"内核缓冲区 -> copy_to_user"的方式，避免假设 optval 是 u32。
                 let mut kbuf = [0u8; 64];
                 let written = socket.option(level, optname, &mut kbuf)?;
-                let need = written;
+                let out_len = calc_out_len(optval, user_len, written);
 
-                // 使用 UserBufferWriter 写入 optval（可能大数据）
                 if !optval.is_null() {
-                    let to_write = core::cmp::min(user_len, need);
-                    let mut optval_writer = UserBufferWriter::new(optval, to_write, from_user)?;
-                    optval_writer.copy_to_user_protected(&kbuf[..to_write], 0)?;
+                    let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
+                    optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
                 }
 
                 // 写回实际需要的长度
@@ -204,7 +210,7 @@ pub(super) fn do_getsockopt(
                     UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
                 optlen_writer
                     .buffer_protected(0)?
-                    .write_one::<u32>(0, &(need as u32))?;
+                    .write_one::<u32>(0, &(out_len as u32))?;
                 return Ok(0);
             }
         }
@@ -233,19 +239,18 @@ pub(super) fn do_getsockopt(
         let kbuf_len = user_len.clamp(64, MAX_OPTVAL_LEN);
         let mut kbuf = vec![0u8; kbuf_len];
         let written = socket.option(level, optname, &mut kbuf)?;
-        let need = written;
+        let out_len = calc_out_len(optval, user_len, written);
 
         if !optval.is_null() {
-            let to_write = core::cmp::min(user_len, need);
-            let mut optval_writer = UserBufferWriter::new(optval, to_write, from_user)?;
-            optval_writer.copy_to_user_protected(&kbuf[..to_write], 0)?;
+            let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
+            optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
         }
 
         let mut optlen_writer =
             UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
         optlen_writer
             .buffer_protected(0)?
-            .write_one::<u32>(0, &(need as u32))?;
+            .write_one::<u32>(0, &(out_len as u32))?;
         Ok(0)
     }
 }

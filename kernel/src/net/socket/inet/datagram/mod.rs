@@ -256,6 +256,7 @@ impl UdpSocket {
     pub fn try_recv(
         &self,
         buf: &mut [u8],
+        peek: bool,
     ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
         match self.inner.read().as_ref().ok_or(SystemError::EBADF)? {
             UdpInner::Bound(bound) => {
@@ -264,7 +265,7 @@ impl UdpSocket {
                 iface.poll();
 
                 // Try to receive
-                let result = bound.try_recv(buf);
+                let result = bound.try_recv(buf, peek);
 
                 // For loopback packets, if we got EAGAIN, poll a few more times
                 // to allow packets to propagate through the loopback interface
@@ -281,7 +282,7 @@ impl UdpSocket {
                         // Poll up to 5 more times for loopback to ensure packet delivery
                         for _ in 0..5 {
                             iface.poll();
-                            let retry = bound.try_recv(buf);
+                            let retry = bound.try_recv(buf, peek);
                             if !matches!(retry, Err(SystemError::EAGAIN_OR_EWOULDBLOCK)) {
                                 return retry;
                             }
@@ -609,8 +610,10 @@ impl Socket for UdpSocket {
         let shutdown_bits = self.shutdown.load(Ordering::Acquire);
         let is_recv_shutdown = shutdown_bits & 0x01 != 0;
 
+        let peek = flags.contains(PMSG::PEEK);
+
         if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
-            let result = self.try_recv(buffer);
+            let result = self.try_recv(buffer, peek);
             // If shutdown and no data available, return EOF instead of EWOULDBLOCK
             if is_recv_shutdown && matches!(result, Err(SystemError::EAGAIN_OR_EWOULDBLOCK)) {
                 return Ok(0);
@@ -622,7 +625,7 @@ impl Socket for UdpSocket {
                 let shutdown_bits = self.shutdown.load(Ordering::Acquire);
                 let is_recv_shutdown = shutdown_bits & 0x01 != 0;
 
-                match self.try_recv(buffer) {
+                match self.try_recv(buffer, peek) {
                     Ok((len, _endpoint)) => {
                         return Ok(len);
                     }
@@ -648,8 +651,10 @@ impl Socket for UdpSocket {
         // Linux allows reading buffered data even after SHUT_RD
         // For blocking mode, check shutdown state in the loop
 
+        let peek = flags.contains(PMSG::PEEK);
+
         return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
-            let result = self.try_recv(buffer);
+            let result = self.try_recv(buffer, peek);
             // For non-blocking sockets, always return EAGAIN when no data
             // Even after shutdown, don't convert to EOF
             result.map(|(len, endpoint)| (len, Endpoint::Ip(endpoint)))
@@ -659,7 +664,7 @@ impl Socket for UdpSocket {
                 let shutdown_bits = self.shutdown.load(Ordering::Acquire);
                 let is_recv_shutdown = shutdown_bits & 0x01 != 0;
 
-                match self.try_recv(buffer) {
+                match self.try_recv(buffer, peek) {
                     Ok((len, endpoint)) => {
                         return Ok((len, Endpoint::Ip(endpoint)));
                     }
@@ -919,6 +924,13 @@ impl Socket for UdpSocket {
     ) -> Result<usize, SystemError> {
         use crate::filesystem::vfs::iov::IoVecs;
 
+        log::debug!(
+            "recv_msg: msg_name={:?}, msg_namelen={}, flags={:?}",
+            msg.msg_name,
+            msg.msg_namelen,
+            flags
+        );
+
         // Check for MSG_ERRQUEUE - we don't support error queues yet
         if flags.contains(PMSG::ERRQUEUE) {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -928,8 +940,16 @@ impl Socket for UdpSocket {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let mut buf = iovs.new_buf(true);
 
+        log::debug!("recv_msg: created buffer of {} bytes", buf.len());
+
         // Receive data from socket
         let (recv_size, src_endpoint) = self.recv_from(&mut buf, flags, None)?;
+
+        log::debug!(
+            "recv_msg: received {} bytes from {:?}",
+            recv_size,
+            src_endpoint
+        );
 
         // Scatter received data to user iovecs
         iovs.scatter(&buf[..recv_size])?;
@@ -937,8 +957,18 @@ impl Socket for UdpSocket {
         // Write source address if requested
         if !msg.msg_name.is_null() {
             let src_addr = msg.msg_name;
-            src_endpoint.write_to_user(src_addr, &mut msg.msg_namelen)?;
+            log::debug!(
+                "recv_msg: writing endpoint to user, msg_namelen={}",
+                msg.msg_namelen
+            );
+            let actual_len = src_endpoint.write_to_user_msghdr(src_addr, msg.msg_namelen)?;
+            msg.msg_namelen = actual_len;
+            log::debug!(
+                "recv_msg: endpoint written, updated msg_namelen={}",
+                msg.msg_namelen
+            );
         } else {
+            log::debug!("recv_msg: msg_name is NULL, skipping endpoint write");
             msg.msg_namelen = 0;
         }
 
@@ -946,6 +976,7 @@ impl Socket for UdpSocket {
         msg.msg_controllen = 0;
         msg.msg_flags = 0;
 
+        log::debug!("recv_msg: returning {} bytes", recv_size);
         Ok(recv_size)
     }
 

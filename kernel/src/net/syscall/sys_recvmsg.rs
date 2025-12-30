@@ -103,6 +103,14 @@ pub(super) fn do_recvmsg(
     let reader = UserBufferReader::new(msg, core::mem::size_of::<MsgHdr>(), from_user)?;
     let mut kmsg = reader.buffer_protected(0)?.read_one::<MsgHdr>(0)?;
 
+    log::debug!(
+        "do_recvmsg: fd={}, msg_iovlen={}, msg_iov={:?}, flags={:#x}",
+        fd,
+        kmsg.msg_iovlen,
+        kmsg.msg_iov,
+        flags
+    );
+
     // 检查每个缓冲区地址是否合法，生成iovecs（fallback path needs this).
     let iovs = unsafe { IoVecs::from_user(kmsg.msg_iov, kmsg.msg_iovlen, true)? };
 

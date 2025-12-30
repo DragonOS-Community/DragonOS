@@ -230,6 +230,7 @@ impl BoundUdp {
     pub fn try_recv(
         &self,
         buf: &mut [u8],
+        peek: bool,
     ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
         let remote = *self.remote.lock();
 
@@ -243,8 +244,29 @@ impl BoundUdp {
                     *has_preconnect = false;
                     drop(has_preconnect); // Release lock before recv
                     log::debug!("try_recv: has_preconnect=true, can_recv={}", socket.can_recv());
+
+                    // Special case: zero-length buffer
+                    if buf.is_empty() {
+                        if socket.can_recv() {
+                            if let Ok((_payload, metadata)) = socket.peek() {
+                                log::debug!("try_recv: preconnect with zero-length buffer, returning 0 bytes");
+                                return Ok((0, metadata.endpoint));
+                            }
+                        }
+                        log::debug!("try_recv: preconnect with zero-length buffer, no data");
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+
                     if socket.can_recv() {
-                        if let Ok((size, metadata)) = socket.recv_slice(buf) {
+                        if peek {
+                            // MSG_PEEK: peek data without consuming
+                            if let Ok((payload, metadata)) = socket.peek() {
+                                let copy_len = core::cmp::min(buf.len(), payload.len());
+                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                                log::debug!("try_recv: preconnect peek succeeded, size={}", copy_len);
+                                return Ok((copy_len, metadata.endpoint));
+                            }
+                        } else if let Ok((size, metadata)) = socket.recv_slice(buf) {
                             log::debug!("try_recv: preconnect recv succeeded, size={}", size);
                             return Ok((size, metadata.endpoint));
                         }
@@ -271,25 +293,40 @@ impl BoundUdp {
                         Ok((payload, metadata)) => {
                             log::debug!("try_recv: peeked {} bytes from {:?}, buf_len={}", payload.len(), metadata.endpoint, buf.len());
                             if metadata.endpoint == expected_remote {
-                                // Source matches, receive the packet (truncated if buf is smaller)
-                                match socket.recv_slice(buf) {
-                                    Ok((size, metadata)) => {
-                                        log::debug!("try_recv: recv succeeded, size={}", size);
-                                        return Ok((size, metadata.endpoint));
-                                    }
-                                    Err(e) => {
-                                        // If recv_slice fails after peek succeeds, it's likely Truncated error
-                                        // (buffer smaller than packet). For UDP, truncation is OK - the buffer
-                                        // should be filled with as much data as it can hold.
-                                        log::debug!("try_recv: recv_slice error after peek succeeded: {:?}, treating as truncated receive", e);
-                                        // The packet was consumed, return buffer length as received size
-                                        return Ok((buf.len(), expected_remote));
+                                // Source matches
+
+                                // Special case: zero-length buffer
+                                if buf.is_empty() {
+                                    log::debug!("try_recv: zero-length buffer in connected mode, returning 0 bytes");
+                                    return Ok((0, expected_remote));
+                                }
+
+                                if peek {
+                                    // MSG_PEEK: just copy the data we peeked
+                                    let copy_len = core::cmp::min(buf.len(), payload.len());
+                                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                                    log::debug!("try_recv: peek succeeded, size={}", copy_len);
+                                    return Ok((copy_len, metadata.endpoint));
+                                } else {
+                                    // Receive the packet (truncated if buf is smaller)
+                                    match socket.recv_slice(buf) {
+                                        Ok((size, metadata)) => {
+                                            log::debug!("try_recv: recv succeeded, size={}", size);
+                                            return Ok((size, metadata.endpoint));
+                                        }
+                                        Err(e) => {
+                                            // If recv_slice fails after peek succeeds, something is wrong
+                                            log::warn!("try_recv: recv_slice unexpectedly failed after peek: {:?}", e);
+                                            return Err(SystemError::EIO);
+                                        }
                                     }
                                 }
                             } else {
                                 // Source doesn't match, discard this packet and check next
                                 log::debug!("try_recv: source mismatch, discarding packet from {:?}", metadata.endpoint);
-                                let _ = socket.recv_slice(buf);
+                                // Use a temp buffer to consume the packet
+                                let mut discard_buf = [0u8; 1];
+                                let _ = socket.recv_slice(&mut discard_buf);
                                 continue;
                             }
                         }
@@ -302,8 +339,30 @@ impl BoundUdp {
             } else {
                 log::debug!("try_recv: unconnected mode, buf_len={}, can_recv={}", buf.len(), socket.can_recv());
                 // Not connected, receive from any source
+
+                // Special case: if buffer length is 0, just peek to check if data exists
+                if buf.is_empty() {
+                    if socket.can_recv() {
+                        // Peek to get the source endpoint without consuming data
+                        if let Ok((_payload, metadata)) = socket.peek() {
+                            log::debug!("try_recv: zero-length buffer with data available, returning 0 bytes from {:?}", metadata.endpoint);
+                            return Ok((0, metadata.endpoint));
+                        }
+                    }
+                    log::debug!("try_recv: zero-length buffer with no data, returning EAGAIN");
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+
                 if socket.can_recv() {
-                    if let Ok((size, metadata)) = socket.recv_slice(buf) {
+                    if peek {
+                        // MSG_PEEK: peek data without consuming
+                        if let Ok((payload, metadata)) = socket.peek() {
+                            let copy_len = core::cmp::min(buf.len(), payload.len());
+                            buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                            log::debug!("try_recv: unconnected peek succeeded, size={}", copy_len);
+                            return Ok((copy_len, metadata.endpoint));
+                        }
+                    } else if let Ok((size, metadata)) = socket.recv_slice(buf) {
                         log::debug!("try_recv: unconnected recv succeeded, size={}", size);
                         return Ok((size, metadata.endpoint));
                     }

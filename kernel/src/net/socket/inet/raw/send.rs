@@ -1,6 +1,7 @@
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion, Ipv4Packet};
 use system_error::SystemError;
 
+use crate::driver::net::Iface;
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::net::posix::SockAddr;
 use crate::net::socket::endpoint::Endpoint;
@@ -34,6 +35,38 @@ fn validate_ipv4_hdrincl_packet(buf: &[u8]) -> Result<(), SystemError> {
 }
 
 impl RawSocket {
+    /// 发送前确保 socket 绑定在合适的 iface 上。
+    ///
+    /// 背景：raw socket 在创建时可能处于 Wildcard 状态并附着到 loopback 以便接收/唤醒。
+    /// 但对非 loopback 目的地址发送时，Linux 语义应根据目的地址选路/选出口网卡，
+    /// 而不是把发送也锁死在 loopback。
+    fn ensure_not_loopback_wildcard_for_send(&self, dest: IpAddress) -> Result<(), SystemError> {
+        // loopback 目的地址仍走 loopback 快速路径，不需要切换 iface
+        if is_loopback_addr(dest) {
+            return Ok(());
+        }
+
+        let needs_rebind = {
+            let guard = self.inner.read();
+            match guard.as_ref() {
+                Some(RawInner::Wildcard(bound)) => {
+                    if let Some(lo) = self.netns.loopback_iface() {
+                        bound.inner().iface().nic_id() == lo.nic_id()
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        };
+
+        if needs_rebind {
+            // 从 Wildcard(lo) 切换为按目的地址选址的 Bound(iface)。
+            self.bind_ephemeral(dest)?;
+        }
+        Ok(())
+    }
+
     fn send_ipv4_hdrincl_on_bound(
         &self,
         bound: &inner::BoundRaw,
@@ -105,6 +138,11 @@ impl RawSocket {
             if !self.addr_matches_ip_version(dest) {
                 return Err(SystemError::EAFNOSUPPORT);
             }
+        }
+
+        // 若当前处于 Wildcard(loopback)，对非 loopback 目的地址发送时需要切到正确出口。
+        if let Some(dest) = to {
+            self.ensure_not_loopback_wildcard_for_send(dest)?;
         }
 
         // 确保已绑定
@@ -366,6 +404,9 @@ impl RawSocket {
             }
         }
         let dest = to_ip.ok_or(SystemError::EDESTADDRREQ)?;
+
+        // 若当前处于 Wildcard(loopback)，对非 loopback 目的地址发送时需要切到正确出口。
+        self.ensure_not_loopback_wildcard_for_send(dest)?;
 
         // Ensure bound.
         if !self.is_bound() {

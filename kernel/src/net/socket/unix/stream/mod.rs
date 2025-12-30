@@ -130,7 +130,7 @@ impl UnixStreamSocket {
     pub const MIN_SOCKET_BUF_SIZE: usize = 1024;
     /// Upper bound for the *effective* (doubled) SO_SNDBUF/SO_RCVBUF value.
     /// Must be a power-of-two friendly size to keep ring buffer resizes sane.
-    const MAX_EFFECTIVE_SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024;
+    const MAX_EFFECTIVE_SOCKET_BUF_SIZE: usize = 8 * 1024 * 1024;
 
     pub(super) fn new_init(
         init: Init,

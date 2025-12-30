@@ -1504,8 +1504,7 @@ checksum = "7fcf8323ef1faaee30a44a340193b1ac6814fd9b7b4e88e9d4519a3e4abe1cfd"
 [[package]]
 name = "smoltcp"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dad095989c1533c1c266d9b1e8d70a1329dd3723c3edac6d03bbd67e7bf6f4bb"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp?rev=861e605#861e605ebadb330fb25efa57222f334b0a6cb8bb"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",

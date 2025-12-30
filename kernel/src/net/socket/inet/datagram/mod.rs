@@ -329,10 +329,16 @@ impl Socket for UdpSocket {
     }
 
     fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
-        if let Endpoint::Ip(local_endpoint) = local_endpoint {
-            return self.do_bind(local_endpoint);
+        match local_endpoint {
+            Endpoint::Ip(local_endpoint) => self.do_bind(local_endpoint),
+            Endpoint::Unspecified => {
+                // AF_UNSPEC on bind() is a no-op for AF_INET sockets (Linux compatibility)
+                // See: https://github.com/torvalds/linux/commit/29c486df6a208432b370bd4be99ae1369ede28d8
+                log::debug!("UDP bind: AF_UNSPEC treated as no-op for compatibility");
+                Ok(())
+            }
+            _ => Err(SystemError::EAFNOSUPPORT),
         }
-        Err(SystemError::EAFNOSUPPORT)
     }
 
     fn send_buffer_size(&self) -> usize {
@@ -695,9 +701,27 @@ impl Socket for UdpSocket {
                 let local_addr = if let Some(addr) = addr {
                     addr
                 } else {
-                    // TODO: Implement IPv6
-                    // Not connected, return "any"
-                    Ipv4([0, 0, 0, 0].into())
+                    // Socket is bound to ANY - check if connected
+                    if let Ok(remote) = bound.remote_endpoint() {
+                        // Connected: return the local address for the interface that can reach the remote
+                        // For loopback, return loopback address; otherwise get from interface
+                        match remote.addr {
+                            Ipv4(addr) if addr.is_loopback() => Ipv4(addr),
+                            Ipv6(addr) if addr.is_loopback() => Ipv6(addr),
+                            _ => {
+                                // Get the first IP address from the interface
+                                let iface_guard = bound.inner().iface().smol_iface().lock();
+                                if let Some(cidr) = iface_guard.ip_addrs().first() {
+                                    cidr.address()
+                                } else {
+                                    Ipv4([0, 0, 0, 0].into())
+                                }
+                            }
+                        }
+                    } else {
+                        // Not connected, return "any"
+                        Ipv4([0, 0, 0, 0].into())
+                    }
                 };
 
                 Ok(Endpoint::Ip(IpEndpoint::new(local_addr, port)))

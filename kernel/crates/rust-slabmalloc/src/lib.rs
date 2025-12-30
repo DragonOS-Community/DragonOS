@@ -44,6 +44,9 @@ extern crate test;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod prop_tests;
+
 use core::alloc::Layout;
 use core::fmt;
 use core::mem;

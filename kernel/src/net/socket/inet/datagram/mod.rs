@@ -100,10 +100,23 @@ impl UdpSocket {
         let rx_size = self.recv_buf_size.load(Ordering::Acquire);
         let tx_size = self.send_buf_size.load(Ordering::Acquire);
 
+        log::debug!(
+            "do_bind: rx_size={}, tx_size={}, will use custom buffers={}",
+            rx_size,
+            tx_size,
+            rx_size > 0 || tx_size > 0
+        );
+
         // Create new UnboundUdp with custom buffer sizes if they've been set
         let unbound = if rx_size > 0 || tx_size > 0 {
+            log::debug!(
+                "do_bind: creating socket with custom buffer sizes rx={}, tx={}",
+                rx_size,
+                tx_size
+            );
             UnboundUdp::new_with_buf_size(rx_size, tx_size)
         } else {
+            log::debug!("do_bind: creating socket with default buffer sizes");
             UnboundUdp::new()
         };
 
@@ -208,7 +221,7 @@ impl UdpSocket {
 
         // Rebind to the same endpoint
         let new_endpoint = smoltcp::wire::IpEndpoint::new(local_addr, port);
-        let mut bound = match unbound.bind(new_endpoint, self.netns()) {
+        let bound = match unbound.bind(new_endpoint, self.netns()) {
             Ok(b) => b,
             Err(e) => {
                 // Restore unbound state on error
@@ -431,21 +444,44 @@ impl Socket for UdpSocket {
     }
 
     fn send_buffer_size(&self) -> usize {
+        // Check if custom buffer size was set via setsockopt
+        let custom_size = self.send_buf_size.load(Ordering::Acquire);
+        if custom_size > 0 {
+            // Linux doubles the value when returning via getsockopt
+            return custom_size * 2;
+        }
+
+        // Otherwise return actual buffer capacity
         match self.inner.read().as_ref() {
             Some(UdpInner::Bound(bound)) => {
                 bound.with_socket(|socket| socket.payload_send_capacity())
             }
-            _ => inner::DEFAULT_TX_BUF_SIZE,
+            _ => inner::DEFAULT_TX_BUF_SIZE * 2,  // Linux doubles default too
         }
     }
 
     fn recv_buffer_size(&self) -> usize {
-        match self.inner.read().as_ref() {
+        // Check if custom buffer size was set via setsockopt
+        let custom_size = self.recv_buf_size.load(Ordering::Acquire);
+        if custom_size > 0 {
+            // Linux doubles the value when returning via getsockopt
+            log::debug!(
+                "recv_buffer_size: custom_size={}, returning={}",
+                custom_size,
+                custom_size * 2
+            );
+            return custom_size * 2;
+        }
+
+        // Otherwise return actual buffer capacity
+        let size = match self.inner.read().as_ref() {
             Some(UdpInner::Bound(bound)) => {
                 bound.with_socket(|socket| socket.payload_recv_capacity())
             }
-            _ => inner::DEFAULT_RX_BUF_SIZE,
-        }
+            _ => inner::DEFAULT_RX_BUF_SIZE * 2,  // Linux doubles default too
+        };
+        log::debug!("recv_buffer_size: no custom size, returning={}", size);
+        size
     }
 
     fn recv_bytes_available(&self) -> usize {
@@ -754,8 +790,15 @@ impl Socket for UdpSocket {
     }
 
     fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
+        log::debug!(
+            "UDP getsockopt called: level={:?}, name={}, value_len={}",
+            level,
+            name,
+            value.len()
+        );
         if level == PSOL::SOCKET {
             let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+            log::debug!("UDP getsockopt: parsed option {:?}", opt);
             match opt {
                 PSO::SNDBUF => {
                     if value.len() < core::mem::size_of::<u32>() {
@@ -785,6 +828,11 @@ impl Socket for UdpSocket {
                     } else {
                         size * 2
                     };
+                    log::debug!(
+                        "UDP getsockopt SO_RCVBUF: size={}, returning={}",
+                        size,
+                        actual_size
+                    );
                     let bytes = (actual_size as u32).to_ne_bytes();
                     value[0..4].copy_from_slice(&bytes);
                     return Ok(core::mem::size_of::<u32>());

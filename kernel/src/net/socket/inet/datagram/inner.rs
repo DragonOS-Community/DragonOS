@@ -30,20 +30,41 @@ impl UnboundUdp {
     }
 
     pub fn new_with_buf_size(rx_size: usize, tx_size: usize) -> Self {
-        // Linux/gVisor allocate double the requested size for packet metadata overhead
-        // When user sets SO_RCVBUF=X, allocate 2*X bytes to match expected behavior
+        // Buffer sizing strategy:
+        // - setsockopt(SO_RCVBUF, X) stores X
+        // - getsockopt(SO_RCVBUF) returns 2*X (Linux convention)
+        // - Actual buffer allocation: 2*X
+        //
+        // This is a straightforward 2x design that matches the getsockopt return value.
+        //
+        // Note: smoltcp's PacketBuffer has separate metadata_ring and payload_ring.
+        // Unlike Linux where sk_buff metadata shares the same buffer space as payload,
+        // smoltcp allocates them independently. This means:
+        // - We allocate 2*X bytes purely for payload (no metadata overhead)
+        // - This may accept more packets than Linux in some edge cases
+        //
+        // Differences from Linux behavior:
+        // - Linux: Buffer space shared between metadata + payload, so effective payload < 2*X
+        // - DragonOS: Full 2*X available for payload (metadata stored separately)
+
         let rx_buf_size = if rx_size > 0 {
-            // Double the requested size to match Linux behavior
-            rx_size * 2
+            rx_size * 2  // Simple 2x allocation
         } else {
             DEFAULT_RX_BUF_SIZE
         };
         let tx_buf_size = if tx_size > 0 {
-            // Double the requested size to match Linux behavior
-            tx_size * 2
+            tx_size * 2  // Simple 2x allocation
         } else {
             DEFAULT_TX_BUF_SIZE
         };
+
+        log::debug!(
+            "new_with_buf_size: requested rx={}, tx={} -> allocating rx={}, tx={} (2x)",
+            rx_size,
+            tx_size,
+            rx_buf_size,
+            tx_buf_size
+        );
 
         let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
@@ -313,13 +334,27 @@ impl BoundUdp {
             remote.addr = smoltcp::wire::IpAddress::v4(127, 0, 0, 1);
         }
 
+        log::debug!(
+            "try_send: sending {} bytes to {:?}, can_send={}",
+            buf.len(),
+            remote,
+            self.with_socket(|socket| socket.can_send())
+        );
+
         self.with_mut_socket(|socket| {
             if socket.can_send() {
                 match socket.send_slice(buf, remote) {
-                    Ok(_) => Ok(buf.len()),
-                    Err(_) => Err(SystemError::ENOBUFS),
+                    Ok(_) => {
+                        log::debug!("try_send: send successful");
+                        Ok(buf.len())
+                    }
+                    Err(e) => {
+                        log::debug!("try_send: send failed: {:?}", e);
+                        Err(SystemError::ENOBUFS)
+                    }
                 }
             } else {
+                log::debug!("try_send: can_send=false, returning ENOBUFS");
                 Err(SystemError::ENOBUFS)
             }
         })

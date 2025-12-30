@@ -1,3 +1,8 @@
 **/1
 **/2
 UdpInet6SocketTest.ConnectInet4Sockaddr
+**SoTimestamp**
+**TimestampIoctl**
+**RecvBufLimits** # Buffer limit not capable with smoltcp
+**UdpSocketControlMessagesTest**
+**SetSocketDetachFilter**

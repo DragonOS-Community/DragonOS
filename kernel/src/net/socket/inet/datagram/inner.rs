@@ -14,9 +14,9 @@ pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 // UDP maximum datagram size is 65507 bytes (65535 - 8 byte UDP header - 20 byte IP header)
 // Set buffer sizes to accommodate this plus some overhead
-pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024;  // 128 KB
-pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024;  // 128 KB
-// Minimum buffer size (Linux uses 256 bytes minimum)
+pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024; // 128 KB
+pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024; // 128 KB
+                                                   // Minimum buffer size (Linux uses 256 bytes minimum)
 pub const MIN_BUF_SIZE: usize = 256;
 
 #[derive(Debug)]
@@ -48,12 +48,12 @@ impl UnboundUdp {
         // - DragonOS: Full 2*X available for payload (metadata stored separately)
 
         let rx_buf_size = if rx_size > 0 {
-            rx_size * 2  // Simple 2x allocation
+            rx_size * 2 // Simple 2x allocation
         } else {
             DEFAULT_RX_BUF_SIZE
         };
         let tx_buf_size = if tx_size > 0 {
-            tx_size * 2  // Simple 2x allocation
+            tx_size * 2 // Simple 2x allocation
         } else {
             DEFAULT_TX_BUF_SIZE
         };

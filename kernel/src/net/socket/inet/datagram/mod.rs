@@ -47,12 +47,9 @@ pub struct UdpSocket {
     /// the Device/Interface level, not per-socket.
     ///
     /// To implement this properly would require either:
-    /// 1. Upgrading to a newer smoltcp version that supports per-socket checksum control
+    /// 1. Smoltcp feature that supports per-socket checksum control
     /// 2. Patching smoltcp to add this feature
     /// 3. Manually parsing/building UDP packets to bypass smoltcp's checksum handling
-    ///
-    /// For now, this field allows SO_NO_CHECK to be set/retrieved for compatibility,
-    /// which is sufficient to pass tests that only check the option value.
     no_check: AtomicBool,
 }
 
@@ -72,7 +69,7 @@ impl UdpSocket {
             fasync_items: FAsyncItems::default(),
             send_buf_size: AtomicUsize::new(0), // 0 means use default
             recv_buf_size: AtomicUsize::new(0), // 0 means use default
-            no_check: AtomicBool::new(false), // checksums enabled by default
+            no_check: AtomicBool::new(false),   // checksums enabled by default
         })
     }
 
@@ -162,7 +159,7 @@ impl UdpSocket {
                         return Err(e);
                     }
                 }
-            },
+            }
         };
         inner_guard.replace(UdpInner::Bound(bound));
         Ok(())
@@ -456,7 +453,7 @@ impl Socket for UdpSocket {
             Some(UdpInner::Bound(bound)) => {
                 bound.with_socket(|socket| socket.payload_send_capacity())
             }
-            _ => inner::DEFAULT_TX_BUF_SIZE * 2,  // Linux doubles default too
+            _ => inner::DEFAULT_TX_BUF_SIZE * 2, // Linux doubles default too
         }
     }
 
@@ -478,7 +475,7 @@ impl Socket for UdpSocket {
             Some(UdpInner::Bound(bound)) => {
                 bound.with_socket(|socket| socket.payload_recv_capacity())
             }
-            _ => inner::DEFAULT_RX_BUF_SIZE * 2,  // Linux doubles default too
+            _ => inner::DEFAULT_RX_BUF_SIZE * 2, // Linux doubles default too
         };
         log::debug!("recv_buffer_size: no custom size, returning={}", size);
         size
@@ -744,7 +741,11 @@ impl Socket for UdpSocket {
                         requested
                     };
                     self.send_buf_size.store(size, Ordering::Release);
-                    log::debug!("UDP setsockopt SO_SNDBUF: requested={}, actual={}", requested, size);
+                    log::debug!(
+                        "UDP setsockopt SO_SNDBUF: requested={}, actual={}",
+                        requested,
+                        size
+                    );
 
                     // If socket is already bound, we need to recreate it with new buffer size
                     self.recreate_socket_if_bound()?;
@@ -763,7 +764,11 @@ impl Socket for UdpSocket {
                         requested
                     };
                     self.recv_buf_size.store(size, Ordering::Release);
-                    log::debug!("UDP setsockopt SO_RCVBUF: requested={}, actual={}", requested, size);
+                    log::debug!(
+                        "UDP setsockopt SO_RCVBUF: requested={}, actual={}",
+                        requested,
+                        size
+                    );
 
                     // If socket is already bound, we need to recreate it with new buffer size
                     self.recreate_socket_if_bound()?;
@@ -778,7 +783,10 @@ impl Socket for UdpSocket {
                     }
                     let value = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
                     self.no_check.store(value != 0, Ordering::Release);
-                    log::debug!("UDP setsockopt SO_NO_CHECK: {} (stub - no actual effect)", value != 0);
+                    log::debug!(
+                        "UDP setsockopt SO_NO_CHECK: {} (stub - no actual effect)",
+                        value != 0
+                    );
                     return Ok(());
                 }
                 _ => {

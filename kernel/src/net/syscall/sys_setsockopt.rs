@@ -4,6 +4,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETSOCKOPT;
 use crate::mm::VirtAddr;
 use crate::net::socket;
+use crate::net::socket::{PIPV6, PSOL};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
@@ -44,16 +45,24 @@ impl Syscall for SysSetsockoptHandle {
         let optval = Self::optval(args);
         let optlen = Self::optlen(args);
 
+        // Linux 6.6 行为：IPV6_CHECKSUM 在 setsockopt 时会无视 optlen，直接按 int 读取。
+        // gVisor raw_socket_test: RawSocketTest.SetIPv6ChecksumError_ReadShort
+        let mut optlen_to_read = optlen;
+        if level == PSOL::IPV6 as usize && optname == PIPV6::CHECKSUM as usize {
+            optlen_to_read = core::mem::size_of::<i32>();
+        }
+
         // Verify optval address validity if from user space
         if frame.is_from_user() {
             let virt_optval = VirtAddr::new(optval as usize);
-            if crate::mm::verify_area(virt_optval, optlen).is_err() {
+            if crate::mm::verify_area(virt_optval, optlen_to_read).is_err() {
                 return Err(SystemError::EFAULT);
             }
         }
 
         // Read optval from user space
-        let user_buffer_reader = UserBufferReader::new(optval, optlen, frame.is_from_user())?;
+        let user_buffer_reader =
+            UserBufferReader::new(optval, optlen_to_read, frame.is_from_user())?;
         let data = user_buffer_reader.read_from_user(0)?;
 
         do_setsockopt(fd, level, optname, data)

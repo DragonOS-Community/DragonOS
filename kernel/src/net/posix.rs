@@ -43,7 +43,10 @@ impl PosixArgsSocketType {
     }
 }
 
-use super::socket::{endpoint::Endpoint, AddressFamily};
+use super::socket::{
+    endpoint::{Endpoint, LinkLayerEndpoint},
+    AddressFamily,
+};
 use crate::net::socket::netlink::addr::{multicast::GroupIdSet, NetlinkSocketAddr};
 use crate::net::socket::unix::UnixEndpoint;
 use crate::syscall::user_access::UserBufferReader;
@@ -61,6 +64,19 @@ pub struct SockAddrIn {
     pub sin_port: u16,     // Port number (network byte order)
     pub sin_addr: u32,     // IPv4 address (network byte order)
     pub sin_zero: [u8; 8], // Padding to match struct sockaddr size (total 16 bytes)
+}
+
+/// struct sockaddr_in6 for IPv6 addresses
+///
+/// Matches Linux userspace layout (x86_64): sizeof(sockaddr_in6) = 28.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SockAddrIn6 {
+    pub sin6_family: u16,    // AF_INET6 = 10
+    pub sin6_port: u16,      // Port number (network byte order)
+    pub sin6_flowinfo: u32,  // IPv6 flow information
+    pub sin6_addr: [u8; 16], // IPv6 address (network byte order)
+    pub sin6_scope_id: u32,  // Scope ID
 }
 
 #[repr(C)]
@@ -103,6 +119,7 @@ pub struct SockAddrPlaceholder {
 pub union SockAddr {
     pub family: u16,
     pub addr_in: SockAddrIn,
+    pub addr_in6: SockAddrIn6,
     pub addr_un: SockAddrUn,
     pub addr_ll: SockAddrLl,
     pub addr_nl: SockAddrNl,
@@ -120,7 +137,18 @@ impl From<smoltcp::wire::IpEndpoint> for SockAddr {
                     sin_zero: Default::default(),
                 },
             },
-            smoltcp::wire::IpAddress::Ipv6(_ipv6_addr) => todo!(),
+            smoltcp::wire::IpAddress::Ipv6(ipv6_addr) => {
+                let addr = ipv6_addr.octets();
+                Self {
+                    addr_in6: SockAddrIn6 {
+                        sin6_family: AddressFamily::INet6 as u16,
+                        sin6_port: value.port.to_be(),
+                        sin6_flowinfo: 0,
+                        sin6_addr: addr,
+                        sin6_scope_id: 0,
+                    },
+                }
+            }
         }
     }
 }
@@ -170,10 +198,26 @@ impl From<NetlinkSocketAddr> for SockAddr {
     }
 }
 
+impl From<LinkLayerEndpoint> for SockAddr {
+    fn from(value: LinkLayerEndpoint) -> Self {
+        SockAddr {
+            addr_ll: SockAddrLl {
+                sll_family: AddressFamily::Packet as u16,
+                sll_protocol: value.protocol.to_be(),
+                sll_ifindex: value.interface as u32,
+                sll_hatype: value.hatype,
+                sll_pkttype: value.pkttype,
+                sll_halen: value.halen,
+                sll_addr: value.addr,
+            },
+        }
+    }
+}
+
 impl From<Endpoint> for SockAddr {
     fn from(value: Endpoint) -> Self {
         match value {
-            Endpoint::LinkLayer(_link_layer_endpoint) => todo!(),
+            Endpoint::LinkLayer(link_layer_endpoint) => Self::from(link_layer_endpoint),
             Endpoint::Ip(endpoint) => Self::from(endpoint),
             Endpoint::Unix(unix_endpoint) => Self::from(unix_endpoint),
             Endpoint::Netlink(netlink_addr) => Self::from(netlink_addr),
@@ -231,9 +275,25 @@ impl SockAddr {
 
                 return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
             }
-            // AddressFamily::INet6 => {
-            //     // IPv6 support to be implemented
-            // }
+            AddressFamily::INet6 => {
+                // 下限检查：至少需要包含完整的 sockaddr_in6 结构体
+                if len < size_of::<SockAddrIn6>() as u32 {
+                    log::error!(
+                        "len {} < sizeof(sockaddr_in6) {}",
+                        len,
+                        size_of::<SockAddrIn6>()
+                    );
+                    return Err(SystemError::EINVAL);
+                }
+
+                let addr_in6 = reader.buffer_protected(0)?.read_one::<SockAddrIn6>(0)?;
+
+                use smoltcp::wire;
+                let ip: wire::IpAddress =
+                    wire::IpAddress::Ipv6(core::net::Ipv6Addr::from(addr_in6.sin6_addr));
+                let port = u16::from_be(addr_in6.sin6_port);
+                return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
+            }
             AddressFamily::Unix => {
                 // 在这里并没有分配抽象地址或者创建文件系统节点，这里只是简单的获取，等到bind时再创建
 
@@ -319,6 +379,28 @@ impl SockAddr {
                     GroupIdSet::new(nl_groups),
                 )))
             }
+            AddressFamily::Packet => {
+                // 下限检查：至少需要包含完整的 sockaddr_ll 结构体
+                if len < size_of::<SockAddrLl>() as u32 {
+                    log::error!(
+                        "len {} < sizeof(sockaddr_ll) {}",
+                        len,
+                        size_of::<SockAddrLl>()
+                    );
+                    return Err(SystemError::EINVAL);
+                }
+
+                let addr_ll = reader.buffer_protected(0)?.read_one::<SockAddrLl>(0)?;
+
+                Ok(Endpoint::LinkLayer(LinkLayerEndpoint {
+                    interface: addr_ll.sll_ifindex as usize,
+                    addr: addr_ll.sll_addr,
+                    protocol: u16::from_be(addr_ll.sll_protocol),
+                    hatype: addr_ll.sll_hatype,
+                    pkttype: addr_ll.sll_pkttype,
+                    halen: addr_ll.sll_halen,
+                }))
+            }
             _ => {
                 log::warn!("not support address family {:?}", family);
                 return Err(SystemError::EINVAL);
@@ -330,6 +412,7 @@ impl SockAddr {
     pub fn len(&self) -> Result<u32, SystemError> {
         match AddressFamily::try_from(unsafe { self.family })? {
             AddressFamily::INet => Ok(core::mem::size_of::<SockAddrIn>()),
+            AddressFamily::INet6 => Ok(core::mem::size_of::<SockAddrIn6>()),
             AddressFamily::Packet => Ok(core::mem::size_of::<SockAddrLl>()),
             AddressFamily::Netlink => Ok(core::mem::size_of::<SockAddrNl>()),
             AddressFamily::Unix => Ok(core::mem::size_of::<SockAddrUn>()),

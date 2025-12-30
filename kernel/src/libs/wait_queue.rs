@@ -21,6 +21,8 @@ use crate::{
     exception::InterruptArch,
     process::{ProcessControlBlock, ProcessManager, ProcessState},
     sched::{schedule, SchedMode},
+    time::timer::{next_n_us_timer_jiffies, Timer},
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -98,7 +100,7 @@ impl WaitQueue {
         F: FnMut() -> bool,
         B: FnMut(),
     {
-        self.wait_event_impl(cond, before_sleep, true)
+        self.wait_event_with_timeout_impl(cond, before_sleep, true, None)
     }
 
     /// 不可中断等待条件成立
@@ -111,22 +113,30 @@ impl WaitQueue {
         F: FnMut() -> bool,
         B: FnMut(),
     {
-        self.wait_event_impl(cond, before_sleep, false)
+        self.wait_event_with_timeout_impl(cond, before_sleep, false, None)
     }
 
-    fn wait_event_impl<F, B>(
+    fn wait_event_with_timeout_impl<F, B>(
         &self,
         mut cond: F,
         mut before_sleep: Option<B>,
         interruptible: bool,
+        timeout: Option<Duration>,
     ) -> Result<(), SystemError>
     where
         F: FnMut() -> bool,
         B: FnMut(),
     {
+        let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             if cond() {
                 return Ok(());
+            }
+
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
             }
 
             let (waiter, waker) = Waiter::new_pair();
@@ -149,17 +159,84 @@ impl WaitQueue {
                 hook();
             }
 
-            match waiter.wait(interruptible) {
+            // If there is a timeout, arm a timer that wakes this waiter.
+            let timer = if let Some(deadline) = deadline {
+                let remain = deadline
+                    .duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO);
+                if remain == Duration::ZERO {
+                    self.remove_waker(&waker);
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                let sleep_us = remain.total_micros();
+                let t: Arc<Timer> = Timer::new(
+                    TimeoutWaker::new(waker.clone()),
+                    next_n_us_timer_jiffies(sleep_us),
+                );
+                t.activate();
+                Some(t)
+            } else {
+                None
+            };
+
+            let wait_res = waiter.wait(interruptible);
+
+            // Timer cleanup: if it did not actually time out, cancel it.
+            // If it already timed out, cancellation may be ineffective and is unnecessary.
+            let was_timeout = timer.as_ref().map(|t| t.timeout()).unwrap_or(false);
+            if !was_timeout {
+                if let Some(t) = timer {
+                    t.cancel();
+                }
+            }
+
+            // Waker cleanup semantics:
+            // - no-timeout OK path: the waker is dequeued by the wakeup path (wake_one/wake_all/mark_dead)
+            // - timeout path: timer wakes via Waker::wake() and does NOT dequeue, so we must remove it
+            // - error path: must remove to avoid leaving stale wakers in the queue
+            if deadline.is_some() || wait_res.is_err() {
+                self.remove_waker(&waker);
+            }
+
+            match wait_res {
                 Ok(()) => {
                     // 再次循环检查条件，处理伪唤醒
                     continue;
                 }
-                Err(e) => {
-                    self.remove_waker(&waker);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
+    }
+
+    /// 可中断等待条件成立，支持可选超时。
+    ///
+    /// - `timeout == None`：无限等待，直到条件成立或收到信号（返回 `ERESTARTSYS`）
+    /// - `timeout == Some(d)`：超时返回 `EAGAIN_OR_EWOULDBLOCK`
+    pub fn wait_event_interruptible_timeout<F>(
+        &self,
+        cond: F,
+        timeout: Option<Duration>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.wait_event_with_timeout_impl(cond, None::<fn()>, true, timeout)
+    }
+
+    /// `wait_event_interruptible_timeout` 的扩展版本：提供 `before_sleep` 钩子。
+    ///
+    /// 典型用途：入队后、睡眠前释放锁（避免持锁睡眠）。
+    pub fn wait_event_interruptible_timeout_with<F, B>(
+        &self,
+        cond: F,
+        timeout: Option<Duration>,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.wait_event_with_timeout_impl(cond, before_sleep, true, timeout)
     }
 
     /// 唤醒一个等待者

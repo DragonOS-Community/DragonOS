@@ -26,12 +26,10 @@ use inner::{Connected, Init, Inner};
 use system_error::SystemError;
 
 use crate::filesystem::vfs::iov::IoVecs;
-use crate::libs::wait_queue::{TimeoutWaker, Waiter};
 use crate::net::socket::unix::{current_ucred, nobody_ucred, UCred};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
-use crate::time::timer::{next_n_us_timer_jiffies, Timer};
 use crate::time::{Duration, Instant};
 
 // Use common ancillary message types from parent module
@@ -275,80 +273,6 @@ impl UnixStreamSocket {
         }
     }
 
-    fn wait_event_interruptible_timeout<F>(
-        &self,
-        mut cond: F,
-        timeout: Option<Duration>,
-    ) -> Result<(), SystemError>
-    where
-        F: FnMut() -> bool,
-    {
-        let deadline = timeout.map(|t| Instant::now() + t);
-        loop {
-            if cond() {
-                return Ok(());
-            }
-
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-            }
-
-            let remain =
-                deadline.map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
-
-            let (waiter, waker) = Waiter::new_pair();
-            self.wait_queue.register_waker(waker.clone())?;
-
-            if cond() {
-                self.wait_queue.remove_waker(&waker);
-                return Ok(());
-            }
-
-            if crate::arch::ipc::signal::Signal::signal_pending_state(
-                true,
-                false,
-                &crate::process::ProcessManager::current_pcb(),
-            ) {
-                self.wait_queue.remove_waker(&waker);
-                return Err(SystemError::ERESTARTSYS);
-            }
-
-            // If there is a timeout, arm a timer that wakes this waiter.
-            let timer = if let Some(remain) = remain {
-                if remain == Duration::ZERO {
-                    self.wait_queue.remove_waker(&waker);
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                let sleep_us = remain.total_micros();
-                let t: Arc<Timer> = Timer::new(
-                    TimeoutWaker::new(waker.clone()),
-                    next_n_us_timer_jiffies(sleep_us),
-                );
-                t.activate();
-                Some(t)
-            } else {
-                None
-            };
-
-            let wait_res = waiter.wait(true);
-            let was_timeout = timer.as_ref().map(|t| t.timeout()).unwrap_or(false);
-            if !was_timeout {
-                if let Some(t) = timer {
-                    t.cancel();
-                }
-            }
-
-            self.wait_queue.remove_waker(&waker);
-
-            if let Err(SystemError::ERESTARTSYS) = wait_res {
-                return Err(SystemError::ERESTARTSYS);
-            }
-            wait_res?;
-        }
-    }
-
     fn wake_peer_writable(&self) {
         if let Some(peer_weak) = self.peer.lock().as_ref() {
             if let Some(peer) = peer_weak.upgrade() {
@@ -548,7 +472,7 @@ impl UnixStreamSocket {
                 Err(SystemError::ENOBUFS) => {
                     let timeout = deadline
                         .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
-                    self.wait_event_interruptible_timeout(
+                    self.wait_queue.wait_event_interruptible_timeout(
                         || match self
                             .inner
                             .read()
@@ -870,7 +794,10 @@ impl Socket for UnixStreamSocket {
 
             match result {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                    self.wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
+                    self.wait_queue.wait_event_interruptible_timeout(
+                        || self.can_recv(),
+                        self.recv_timeout(),
+                    )?;
                     continue;
                 }
                 Ok(n) => {
@@ -996,7 +923,7 @@ impl Socket for UnixStreamSocket {
                                 );
                             }
                             Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                                self.wait_event_interruptible_timeout(
+                                self.wait_queue.wait_event_interruptible_timeout(
                                     || self.can_recv(),
                                     self.recv_timeout(),
                                 )?;
@@ -1023,7 +950,7 @@ impl Socket for UnixStreamSocket {
                                 break (n, n, false, n, meta.scm_cred, meta.scm_rights);
                             }
                             Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
-                                self.wait_event_interruptible_timeout(
+                                self.wait_queue.wait_event_interruptible_timeout(
                                     || self.can_recv(),
                                     self.recv_timeout(),
                                 )?;

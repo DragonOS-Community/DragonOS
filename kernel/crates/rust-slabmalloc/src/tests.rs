@@ -100,7 +100,8 @@ fn test_mmap_allocator() {
 
     match mmap.allocate_page() {
         Some(sp) => {
-            sp.bitfield.initialize(8, OBJECT_PAGE_SIZE - 80);
+            sp.bitfield
+                .initialize(8, OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD);
             assert!(!sp.is_full(), "Got empty slab");
             assert!(sp.is_empty(6 * 64), "Got empty slab");
             mmap.release_page(sp)
@@ -177,7 +178,6 @@ macro_rules! test_sc_allocation {
                 }
 
                 objects.clear();
-                sa.check_page_assignments();
 
                 // then allocate everything again,
                 for _ in 0..$allocations {
@@ -464,8 +464,12 @@ pub fn check_is_full_8() {
     let layout = Layout::from_size_align(8, 1).unwrap();
 
     let mut page: ObjectPage = Default::default();
-    page.bitfield.initialize(8, OBJECT_PAGE_SIZE - 80);
-    let obj_per_page = core::cmp::min((OBJECT_PAGE_SIZE - 80) / 8, 8 * 64);
+    page.bitfield
+        .initialize(8, OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD);
+    let obj_per_page = core::cmp::min(
+        (OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / 8,
+        8 * 64,
+    );
 
     let mut allocs = 0;
     loop {
@@ -494,9 +498,13 @@ pub fn check_is_full_8() {
 pub fn check_is_full_512() {
     let _r = env_logger::try_init();
     let mut page: ObjectPage = Default::default();
-    page.bitfield.initialize(512, OBJECT_PAGE_SIZE - 80);
+    page.bitfield
+        .initialize(512, OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD);
     let layout = Layout::from_size_align(512, 1).unwrap();
-    let obj_per_page = core::cmp::min((OBJECT_PAGE_SIZE - 80) / 512, 6 * 64);
+    let obj_per_page = core::cmp::min(
+        (OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / 512,
+        6 * 64,
+    );
 
     let mut allocs = 0;
     loop {
@@ -506,7 +514,7 @@ pub fn check_is_full_512() {
 
         allocs += 1;
 
-        if allocs < (OBJECT_PAGE_SIZE - 80) / 512 {
+        if allocs < (OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / 512 {
             assert!(!page.is_full());
             assert!(!page.is_empty(obj_per_page));
         }

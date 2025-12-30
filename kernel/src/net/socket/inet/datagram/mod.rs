@@ -1,4 +1,4 @@
-use inner::{UdpInner, UnboundUdp, DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE};
+use inner::{UdpInner, UnboundUdp, DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE, MIN_BUF_SIZE};
 use smoltcp;
 use system_error::SystemError;
 
@@ -143,6 +143,77 @@ impl UdpSocket {
             return true;
         }
         return false;
+    }
+
+    /// Recreates the socket with new buffer sizes if it's already bound.
+    /// This is needed because smoltcp doesn't support resizing socket buffers dynamically.
+    fn recreate_socket_if_bound(&self) -> Result<(), SystemError> {
+        use smoltcp::wire::IpListenEndpoint;
+
+        let mut inner_guard = self.inner.write();
+
+        // Check if socket is bound
+        let bound = match inner_guard.as_ref() {
+            Some(UdpInner::Bound(b)) => b,
+            _ => return Ok(()), // Not bound, nothing to do
+        };
+
+        // Save current state before recreating
+        let local_ep = bound.endpoint();
+        let remote_ep = bound.remote_endpoint().ok(); // May be None if not connected
+        let explicitly_bound = !bound.should_unbind_on_disconnect();
+
+        log::debug!(
+            "Recreating UDP socket: local={:?}, remote={:?}, explicit={}",
+            local_ep,
+            remote_ep,
+            explicitly_bound
+        );
+
+        // Get the local address and port
+        let IpListenEndpoint { addr, port } = local_ep;
+        let local_addr = addr.unwrap_or_else(|| smoltcp::wire::IpAddress::v4(0, 0, 0, 0));
+
+        // Unbind the old socket and drop it
+        if let Some(UdpInner::Bound(b)) = inner_guard.take() {
+            b.close();
+        }
+
+        // Create new UnboundUdp with new buffer sizes
+        let rx_size = self.recv_buf_size.load(Ordering::Acquire);
+        let tx_size = self.send_buf_size.load(Ordering::Acquire);
+        let unbound = if rx_size > 0 || tx_size > 0 {
+            UnboundUdp::new_with_buf_size(rx_size, tx_size)
+        } else {
+            UnboundUdp::new()
+        };
+
+        // Rebind to the same endpoint
+        let new_endpoint = smoltcp::wire::IpEndpoint::new(local_addr, port);
+        let mut bound = match unbound.bind(new_endpoint, self.netns()) {
+            Ok(b) => b,
+            Err(e) => {
+                // Restore unbound state on error
+                *inner_guard = Some(UdpInner::Unbound(UnboundUdp::new()));
+                return Err(e);
+            }
+        };
+
+        // Restore connection if it existed
+        if let Some(remote) = remote_ep {
+            bound.connect(remote);
+        }
+
+        // Restore the binding in the interface
+        bound
+            .inner()
+            .iface()
+            .common()
+            .bind_socket(self.self_ref.upgrade().unwrap());
+
+        *inner_guard = Some(UdpInner::Bound(bound));
+
+        Ok(())
     }
 
     pub fn close(&self) {
@@ -611,11 +682,18 @@ impl Socket for UdpSocket {
                     if val.len() < core::mem::size_of::<u32>() {
                         return Err(SystemError::EINVAL);
                     }
-                    let size = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]) as usize;
-                    // Linux doubles the requested size and enforces a minimum
-                    // We'll store the requested size and let smoltcp use it when creating sockets
+                    let requested = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]) as usize;
+                    // Enforce minimum buffer size
+                    let size = if requested < MIN_BUF_SIZE {
+                        MIN_BUF_SIZE
+                    } else {
+                        requested
+                    };
                     self.send_buf_size.store(size, Ordering::Release);
-                    log::debug!("UDP setsockopt SO_SNDBUF: {}", size);
+                    log::debug!("UDP setsockopt SO_SNDBUF: requested={}, actual={}", requested, size);
+
+                    // If socket is already bound, we need to recreate it with new buffer size
+                    self.recreate_socket_if_bound()?;
                     return Ok(());
                 }
                 PSO::RCVBUF => {
@@ -623,11 +701,18 @@ impl Socket for UdpSocket {
                     if val.len() < core::mem::size_of::<u32>() {
                         return Err(SystemError::EINVAL);
                     }
-                    let size = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]) as usize;
-                    // Linux doubles the requested size and enforces a minimum
-                    // We'll store the requested size and let smoltcp use it when creating sockets
+                    let requested = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]) as usize;
+                    // Enforce minimum buffer size
+                    let size = if requested < MIN_BUF_SIZE {
+                        MIN_BUF_SIZE
+                    } else {
+                        requested
+                    };
                     self.recv_buf_size.store(size, Ordering::Release);
-                    log::debug!("UDP setsockopt SO_RCVBUF: {}", size);
+                    log::debug!("UDP setsockopt SO_RCVBUF: requested={}, actual={}", requested, size);
+
+                    // If socket is already bound, we need to recreate it with new buffer size
+                    self.recreate_socket_if_bound()?;
                     return Ok(());
                 }
                 _ => {

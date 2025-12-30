@@ -12,8 +12,12 @@ use crate::{
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
 pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
-pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
+// UDP maximum datagram size is 65507 bytes (65535 - 8 byte UDP header - 20 byte IP header)
+// Set buffer sizes to accommodate this plus some overhead
+pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024;  // 128 KB
+pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024;  // 128 KB
+// Minimum buffer size (Linux uses 256 bytes minimum)
+pub const MIN_BUF_SIZE: usize = 256;
 
 #[derive(Debug)]
 pub struct UnboundUdp {
@@ -26,8 +30,20 @@ impl UnboundUdp {
     }
 
     pub fn new_with_buf_size(rx_size: usize, tx_size: usize) -> Self {
-        let rx_buf_size = if rx_size > 0 { rx_size } else { DEFAULT_RX_BUF_SIZE };
-        let tx_buf_size = if tx_size > 0 { tx_size } else { DEFAULT_TX_BUF_SIZE };
+        // Linux/gVisor allocate double the requested size for packet metadata overhead
+        // When user sets SO_RCVBUF=X, allocate 2*X bytes to match expected behavior
+        let rx_buf_size = if rx_size > 0 {
+            // Double the requested size to match Linux behavior
+            rx_size * 2
+        } else {
+            DEFAULT_RX_BUF_SIZE
+        };
+        let tx_buf_size = if tx_size > 0 {
+            // Double the requested size to match Linux behavior
+            tx_size * 2
+        } else {
+            DEFAULT_TX_BUF_SIZE
+        };
 
         let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],

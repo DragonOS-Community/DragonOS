@@ -1,9 +1,7 @@
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::iov::IoVecs,
-    filesystem::vfs::{
-        fasync::FAsyncItems, utils::DName, vcore::generate_inode_id, FilePrivateData, InodeId,
-    },
+    filesystem::vfs::{fasync::FAsyncItems, utils::DName, vcore::generate_inode_id, InodeId},
     libs::rwlock::RwLock,
     libs::spinlock::SpinLock,
     libs::wait_queue::WaitQueue,
@@ -30,22 +28,12 @@ use system_error::SystemError;
 use crate::time::Duration;
 
 use crate::process::namespace::net_namespace::NetNamespace;
-use crate::syscall::user_access::UserBufferWriter;
 use crate::{
     filesystem::vfs::file::File,
     net::socket::unix::{current_ucred, nobody_ucred, UCred},
     process::ProcessManager,
     syscall::user_access::UserBufferReader,
 };
-
-// Socket ioctls used by gVisor unix socket tests.
-const TIOCOUTQ: u32 = 0x5411; // Get output queue size
-const FIONREAD: u32 = 0x541B; // Get input queue size (aka TIOCINQ)
-const SIOCGIFINDEX: u32 = 0x8933; // name -> if_index mapping
-
-fn clamp_usize_to_i32(v: usize) -> i32 {
-    core::cmp::min(v, i32::MAX as usize) as i32
-}
 
 // Use common ancillary message types from parent module
 use super::{cmsg_align, CmsgBuffer, Cmsghdr, MSG_CTRUNC, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET};
@@ -682,38 +670,12 @@ impl Socket for UnixDatagramSocket {
         &self.open_files
     }
 
-    fn ioctl(
-        &self,
-        cmd: u32,
-        arg: usize,
-        _private_data: &FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        if arg == 0 {
-            return Err(SystemError::EFAULT);
-        }
+    fn recv_bytes_available(&self) -> usize {
+        self.ioctl_fionread()
+    }
 
-        match cmd {
-            FIONREAD => {
-                let available = self.ioctl_fionread();
-                let mut writer =
-                    UserBufferWriter::new(arg as *mut u8, core::mem::size_of::<i32>(), true)?;
-                writer
-                    .buffer_protected(0)?
-                    .write_one::<i32>(0, &clamp_usize_to_i32(available))?;
-                Ok(0)
-            }
-            TIOCOUTQ => {
-                let queued = self.ioctl_tiocoutq();
-                let mut writer =
-                    UserBufferWriter::new(arg as *mut u8, core::mem::size_of::<i32>(), true)?;
-                writer
-                    .buffer_protected(0)?
-                    .write_one::<i32>(0, &clamp_usize_to_i32(queued))?;
-                Ok(0)
-            }
-            SIOCGIFINDEX => Err(SystemError::ENODEV),
-            _ => Err(SystemError::ENOSYS),
-        }
+    fn send_bytes_available(&self) -> usize {
+        self.ioctl_tiocoutq()
     }
 
     fn set_nonblocking(&self, nonblocking: bool) {

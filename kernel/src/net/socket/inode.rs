@@ -18,9 +18,9 @@ use crate::net::socket::IFNAMSIZ;
 
 // Socket ioctl commands
 const SIOCGIFCONF: u32 = 0x8912; // Get interface list
-const FIONREAD: u32 = 0x541B; // Get number of bytes available to read
-
 const SIOCGIFINDEX: u32 = 0x8933; // name -> if_index mapping
+const FIONREAD: u32 = 0x541B; // Get number of bytes available to read
+const TIOCOUTQ: u32 = 0x5411; // Get output queue size
 
 /// ## ifreq - Interface request structure
 /// Used for socket ioctls. Must match C struct layout.
@@ -384,16 +384,22 @@ impl<T: Socket + 'static> IndexNode for T {
         match cmd {
             SIOCGIFCONF => handle_siocgifconf(data),
             SIOCGIFINDEX => handle_siocgifindex(data),
-            FIONREAD => {
+            FIONREAD /* TIOCINQ */ => {
                 // Get number of bytes available to read
                 let bytes_available = self.recv_bytes_available();
-                unsafe {
-                    let ptr = data as *mut i32;
-                    if ptr.is_null() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    *ptr = bytes_available as i32;
-                }
+                let mut writer =
+                    UserBufferWriter::new(data as *mut u8, core::mem::size_of::<i32>(), true)?;
+                let to_write = core::cmp::min(bytes_available, i32::MAX as usize) as i32;
+                writer.buffer_protected(0)?.write_one::<i32>(0, &to_write)?;
+                Ok(0)
+            }
+            TIOCOUTQ => {
+                // Get number of bytes available to write
+                let bytes_available = self.send_bytes_available();
+                let mut writer =
+                    UserBufferWriter::new(data as *mut u8, core::mem::size_of::<i32>(), true)?;
+                let to_write = core::cmp::min(bytes_available, i32::MAX as usize) as i32;
+                writer.buffer_protected(0)?.write_one::<i32>(0, &to_write)?;
                 Ok(0)
             }
             _ => {

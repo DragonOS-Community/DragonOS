@@ -52,6 +52,13 @@ pub trait Socket: PollableInode + IndexNode {
         0
     }
 
+    /// # `send_bytes_available`
+    /// Get the number of bytes currently available to write to the socket.
+    /// Returns 0 by default for socket types that don't track this.
+    fn send_bytes_available(&self) -> usize {
+        0
+    }
+
     /// # `accept`
     /// 接受连接，仅用于listening stream socket
     /// ## Block

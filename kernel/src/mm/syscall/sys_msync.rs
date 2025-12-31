@@ -5,9 +5,9 @@ use crate::{
 };
 
 use crate::mm::{
-    syscall::{check_aligned, MsFlags, VmFlags},
+    syscall::{MsFlags, VmFlags},
     ucontext::AddressSpace,
-    unlikely, verify_area, MemoryManagementArch, VirtAddr,
+    MemoryManagementArch, VirtAddr,
 };
 
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -26,43 +26,43 @@ impl Syscall for SysMsyncHandle {
     ///
     /// ## 参数
     ///
-    /// - `start`：起始地址(已经对齐到页)
-    /// - `len`：长度(已经对齐到页)
+    /// - `start`：起始地址（必须对齐到页）
+    /// - `len`：长度（会被向上对齐到页边界）
     /// - `flags`：标志
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let start = VirtAddr::new(Self::start_vaddr(args));
-        let len = Self::len(args);
+        let mut len = Self::len(args);
         let flags = MsFlags::from_bits_truncate(Self::flags(args));
 
-        if !start.check_aligned(MMArch::PAGE_SIZE) || !check_aligned(len, MMArch::PAGE_SIZE) {
-            return Err(SystemError::EINVAL);
-        }
-        if unlikely(verify_area(start, len).is_err()) {
-            return Err(SystemError::EINVAL);
-        }
-        if unlikely(len == 0) {
+        // 检查 start 地址是否页对齐
+        if !start.check_aligned(MMArch::PAGE_SIZE) {
             return Err(SystemError::EINVAL);
         }
 
-        let mut start = start.data();
-        let end = start + len;
-        let mut unmapped_error = Ok(0);
-
-        if !flags.intersects(MsFlags::MS_ASYNC | MsFlags::MS_INVALIDATE | MsFlags::MS_SYNC) {
-            return Err(SystemError::EINVAL);
-        }
+        // MS_ASYNC 和 MS_SYNC 不能同时设置
         if flags.contains(MsFlags::MS_ASYNC | MsFlags::MS_SYNC) {
             return Err(SystemError::EINVAL);
         }
+
+        // 将 len 向上对齐到页边界（与 Linux 行为一致）
+        len = (len + MMArch::PAGE_SIZE - 1) & !(MMArch::PAGE_SIZE - 1);
+
+        let mut start = start.data();
+        let end = start + len;
+
+        // 检查溢出
         if end < start {
             return Err(SystemError::ENOMEM);
         }
+
+        // 如果 len=0（对齐后），直接返回成功（与 Linux 行为一致）
         if start == end {
             return Ok(0);
         }
 
         let current_address_space = AddressSpace::current()?;
         let mut err = Err(SystemError::ENOMEM);
+        let mut unmapped_error = Ok(0);
         let mut next_vma = current_address_space
             .read()
             .mappings

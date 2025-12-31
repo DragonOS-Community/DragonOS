@@ -97,23 +97,23 @@ impl UdpSocket {
         let rx_size = self.recv_buf_size.load(Ordering::Acquire);
         let tx_size = self.send_buf_size.load(Ordering::Acquire);
 
-        log::debug!(
-            "do_bind: rx_size={}, tx_size={}, will use custom buffers={}",
-            rx_size,
-            tx_size,
-            rx_size > 0 || tx_size > 0
-        );
+        // log::debug!(
+        //     "do_bind: rx_size={}, tx_size={}, will use custom buffers={}",
+        //     rx_size,
+        //     tx_size,
+        //     rx_size > 0 || tx_size > 0
+        // );
 
         // Create new UnboundUdp with custom buffer sizes if they've been set
         let unbound = if rx_size > 0 || tx_size > 0 {
-            log::debug!(
-                "do_bind: creating socket with custom buffer sizes rx={}, tx={}",
-                rx_size,
-                tx_size
-            );
+            // log::debug!(
+            //     "do_bind: creating socket with custom buffer sizes rx={}, tx={}",
+            //     rx_size,
+            //     tx_size
+            // );
             UnboundUdp::new_with_buf_size(rx_size, tx_size)
         } else {
-            log::debug!("do_bind: creating socket with default buffer sizes");
+            // log::debug!("do_bind: creating socket with default buffer sizes");
             UnboundUdp::new()
         };
 
@@ -189,14 +189,14 @@ impl UdpSocket {
         // Save current state before recreating
         let local_ep = bound.endpoint();
         let remote_ep = bound.remote_endpoint().ok(); // May be None if not connected
-        let explicitly_bound = !bound.should_unbind_on_disconnect();
+        let _explicitly_bound = !bound.should_unbind_on_disconnect();
 
-        log::debug!(
-            "Recreating UDP socket: local={:?}, remote={:?}, explicit={}",
-            local_ep,
-            remote_ep,
-            explicitly_bound
-        );
+        // log::debug!(
+        //     "Recreating UDP socket: local={:?}, remote={:?}, explicit={}",
+        //     local_ep,
+        //     remote_ep,
+        //     explicitly_bound
+        // );
 
         // Get the local address and port
         let IpListenEndpoint { addr, port } = local_ep;
@@ -434,7 +434,7 @@ impl Socket for UdpSocket {
             Endpoint::Unspecified => {
                 // AF_UNSPEC on bind() is a no-op for AF_INET sockets (Linux compatibility)
                 // See: https://github.com/torvalds/linux/commit/29c486df6a208432b370bd4be99ae1369ede28d8
-                log::debug!("UDP bind: AF_UNSPEC treated as no-op for compatibility");
+                // log::debug!("UDP bind: AF_UNSPEC treated as no-op for compatibility");
                 Ok(())
             }
             _ => Err(SystemError::EAFNOSUPPORT),
@@ -463,11 +463,11 @@ impl Socket for UdpSocket {
         let custom_size = self.recv_buf_size.load(Ordering::Acquire);
         if custom_size > 0 {
             // Linux doubles the value when returning via getsockopt
-            log::debug!(
-                "recv_buffer_size: custom_size={}, returning={}",
-                custom_size,
-                custom_size * 2
-            );
+            // log::debug!(
+            //     "recv_buffer_size: custom_size={}, returning={}",
+            //     custom_size,
+            //     custom_size * 2
+            // );
             return custom_size * 2;
         }
 
@@ -478,7 +478,7 @@ impl Socket for UdpSocket {
             }
             _ => inner::DEFAULT_RX_BUF_SIZE * 2, // Linux doubles default too
         };
-        log::debug!("recv_buffer_size: no custom size, returning={}", size);
+        // log::debug!("recv_buffer_size: no custom size, returning={}", size);
         size
     }
 
@@ -504,7 +504,7 @@ impl Socket for UdpSocket {
                 // Port 0 is treated as disconnect (like AF_UNSPEC)
                 // This matches Linux behavior where connect() to port 0 succeeds but disconnects the socket
                 if remote.port == 0 {
-                    log::debug!("UDP connect: port 0 treated as disconnect");
+                    // log::debug!("UDP connect: port 0 treated as disconnect");
                     // Disconnect logic - same as AF_UNSPEC case
                     let should_unbind = {
                         match self.inner.read().as_ref() {
@@ -570,7 +570,7 @@ impl Socket for UdpSocket {
 
     fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
         if buffer.is_empty() {
-            log::info!("UDP send() called with ZERO-LENGTH buffer");
+            log::debug!("UDP send() called with ZERO-LENGTH buffer");
         }
 
         // Check if write is shutdown (0x02 = SEND_SHUTDOWN)
@@ -710,18 +710,18 @@ impl Socket for UdpSocket {
 
         // Set the shutdown bits atomically
         // Use fetch_or to set the bits we want
-        let old = self.shutdown.fetch_or(
+        let _old = self.shutdown.fetch_or(
             (if how.is_recv_shutdown() { 0x01 } else { 0 })
                 | (if how.is_send_shutdown() { 0x02 } else { 0 }),
             Ordering::Release,
         );
 
-        log::debug!(
-            "UDP shutdown: old={:#x}, recv={}, send={}",
-            old,
-            how.is_recv_shutdown(),
-            how.is_send_shutdown()
-        );
+        // log::debug!(
+        //     "UDP shutdown: old={:#x}, recv={}, send={}",
+        //     _old,
+        //     how.is_recv_shutdown(),
+        //     how.is_send_shutdown()
+        // );
 
         // Wake up any threads blocked in recv() or send() so they can check the shutdown state
         self.wait_queue.wakeup_all(None);
@@ -746,11 +746,11 @@ impl Socket for UdpSocket {
                         requested
                     };
                     self.send_buf_size.store(size, Ordering::Release);
-                    log::debug!(
-                        "UDP setsockopt SO_SNDBUF: requested={}, actual={}",
-                        requested,
-                        size
-                    );
+                    // log::debug!(
+                    //     "UDP setsockopt SO_SNDBUF: requested={}, actual={}",
+                    //     requested,
+                    //     size
+                    // );
 
                     // If socket is already bound, we need to recreate it with new buffer size
                     self.recreate_socket_if_bound()?;
@@ -769,11 +769,11 @@ impl Socket for UdpSocket {
                         requested
                     };
                     self.recv_buf_size.store(size, Ordering::Release);
-                    log::debug!(
-                        "UDP setsockopt SO_RCVBUF: requested={}, actual={}",
-                        requested,
-                        size
-                    );
+                    // log::debug!(
+                    //     "UDP setsockopt SO_RCVBUF: requested={}, actual={}",
+                    //     requested,
+                    //     size
+                    // );
 
                     // If socket is already bound, we need to recreate it with new buffer size
                     self.recreate_socket_if_bound()?;
@@ -788,10 +788,10 @@ impl Socket for UdpSocket {
                     }
                     let value = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
                     self.no_check.store(value != 0, Ordering::Release);
-                    log::debug!(
-                        "UDP setsockopt SO_NO_CHECK: {} (stub - no actual effect)",
-                        value != 0
-                    );
+                    // log::debug!(
+                    //     "UDP setsockopt SO_NO_CHECK: {} (stub - no actual effect)",
+                    //     value != 0
+                    // );
                     return Ok(());
                 }
                 _ => {
@@ -803,15 +803,15 @@ impl Socket for UdpSocket {
     }
 
     fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
-        log::debug!(
-            "UDP getsockopt called: level={:?}, name={}, value_len={}",
-            level,
-            name,
-            value.len()
-        );
+        // log::debug!(
+        //     "UDP getsockopt called: level={:?}, name={}, value_len={}",
+        //     level,
+        //     name,
+        //     value.len()
+        // );
         if level == PSOL::SOCKET {
             let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-            log::debug!("UDP getsockopt: parsed option {:?}", opt);
+            // log::debug!("UDP getsockopt: parsed option {:?}", opt);
             match opt {
                 PSO::SNDBUF => {
                     if value.len() < core::mem::size_of::<u32>() {
@@ -841,11 +841,11 @@ impl Socket for UdpSocket {
                     } else {
                         size * 2
                     };
-                    log::debug!(
-                        "UDP getsockopt SO_RCVBUF: size={}, returning={}",
-                        size,
-                        actual_size
-                    );
+                    // log::debug!(
+                    //     "UDP getsockopt SO_RCVBUF: size={}, returning={}",
+                    //     size,
+                    //     actual_size
+                    // );
                     let bytes = (actual_size as u32).to_ne_bytes();
                     value[0..4].copy_from_slice(&bytes);
                     return Ok(core::mem::size_of::<u32>());
@@ -924,12 +924,12 @@ impl Socket for UdpSocket {
     ) -> Result<usize, SystemError> {
         use crate::filesystem::vfs::iov::IoVecs;
 
-        log::debug!(
-            "recv_msg: msg_name={:?}, msg_namelen={}, flags={:?}",
-            msg.msg_name,
-            msg.msg_namelen,
-            flags
-        );
+        // log::debug!(
+        //     "recv_msg: msg_name={:?}, msg_namelen={}, flags={:?}",
+        //     msg.msg_name,
+        //     msg.msg_namelen,
+        //     flags
+        // );
 
         // Check for MSG_ERRQUEUE - we don't support error queues yet
         if flags.contains(PMSG::ERRQUEUE) {
@@ -940,16 +940,16 @@ impl Socket for UdpSocket {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let mut buf = iovs.new_buf(true);
 
-        log::debug!("recv_msg: created buffer of {} bytes", buf.len());
+        // log::debug!("recv_msg: created buffer of {} bytes", buf.len());
 
         // Receive data from socket
         let (recv_size, src_endpoint) = self.recv_from(&mut buf, flags, None)?;
 
-        log::debug!(
-            "recv_msg: received {} bytes from {:?}",
-            recv_size,
-            src_endpoint
-        );
+        // log::debug!(
+        //     "recv_msg: received {} bytes from {:?}",
+        //     recv_size,
+        //     src_endpoint
+        // );
 
         // Scatter received data to user iovecs
         iovs.scatter(&buf[..recv_size])?;
@@ -957,18 +957,18 @@ impl Socket for UdpSocket {
         // Write source address if requested
         if !msg.msg_name.is_null() {
             let src_addr = msg.msg_name;
-            log::debug!(
-                "recv_msg: writing endpoint to user, msg_namelen={}",
-                msg.msg_namelen
-            );
+            // log::debug!(
+            //     "recv_msg: writing endpoint to user, msg_namelen={}",
+            //     msg.msg_namelen
+            // );
             let actual_len = src_endpoint.write_to_user_msghdr(src_addr, msg.msg_namelen)?;
             msg.msg_namelen = actual_len;
-            log::debug!(
-                "recv_msg: endpoint written, updated msg_namelen={}",
-                msg.msg_namelen
-            );
+            // log::debug!(
+            //     "recv_msg: endpoint written, updated msg_namelen={}",
+            //     msg.msg_namelen
+            // );
         } else {
-            log::debug!("recv_msg: msg_name is NULL, skipping endpoint write");
+            // log::debug!("recv_msg: msg_name is NULL, skipping endpoint write");
             msg.msg_namelen = 0;
         }
 
@@ -976,7 +976,7 @@ impl Socket for UdpSocket {
         msg.msg_controllen = 0;
         msg.msg_flags = 0;
 
-        log::debug!("recv_msg: returning {} bytes", recv_size);
+        // log::debug!("recv_msg: returning {} bytes", recv_size);
         Ok(recv_size)
     }
 
@@ -985,6 +985,7 @@ impl Socket for UdpSocket {
         use crate::net::posix::SockAddr;
 
         // Validate and gather iovecs
+        // TODO: Actual iovecs sends
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
         let data = iovs.gather()?;
 

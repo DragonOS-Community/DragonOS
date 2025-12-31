@@ -156,7 +156,7 @@ impl Init {
             // Invalid port number
             return Err((Init::Bound((inner, local)), SystemError::EINVAL));
         }
-        log::debug!("listen at {:?}, backlog {}", listen_addr, backlog);
+        // log::debug!("listen at {:?}, backlog {}", listen_addr, backlog);
         if backlog == 0 || backlog > u16::MAX as usize {
             // Invalid backlog value
             return Err((Init::Bound((inner, local)), SystemError::EINVAL));
@@ -166,7 +166,7 @@ impl Init {
         if let Err(err) = || -> Result<(), SystemError> {
             for _i in 0..(backlog - 1) {
                 // -1 because the first one is already bound
-                log::debug!("loop {:?}", _i);
+                // log::debug!("loop {:?}", _i);
                 let new_listen = socket::inet::BoundInner::bind(
                     new_listen_smoltcp_socket(listen_addr)?,
                     listen_addr
@@ -179,7 +179,7 @@ impl Init {
                 )?;
                 inners.push(new_listen);
             }
-            log::debug!("finished listen");
+            // log::debug!("finished listen");
             Ok(())
         }() {
             return Err((Init::Bound((inner, local)), err));

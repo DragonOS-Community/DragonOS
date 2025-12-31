@@ -328,7 +328,7 @@ impl<T: Socket + 'static> IndexNode for T {
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.is_empty() {
-            log::info!(
+            log::debug!(
                 "Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}",
                 buf.len(),
                 _len

@@ -3,6 +3,13 @@
 UdpInet6SocketTest.ConnectInet4Sockaddr
 **SoTimestamp**
 **TimestampIoctl**
-**RecvBufLimits** # Buffer limit not capable with smoltcp
+**RecvBufLimits**
 **UdpSocketControlMessagesTest**
 **SetSocketDetachFilter**
+# ICMP
+**ConnectWriteToInvalidPort**
+**ConnectAndSendNoReceiver**
+# Message Queue
+**RecvErrorConnRefused**
+# AF Option Isolation
+**RecvErrorRefusedOtherAFSockOpt**

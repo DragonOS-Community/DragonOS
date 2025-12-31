@@ -126,12 +126,12 @@ impl Loopback {
         let buffer = self.queue.pop_front();
         match buffer {
             Some(buffer) => {
-                log::debug!(
-                    "lo receive: {} bytes, remaining_queue_len={}, self_ptr={:p}",
-                    buffer.len(),
-                    self.queue.len(),
-                    self
-                );
+                // log::debug!(
+                //     "lo receive: {} bytes, remaining_queue_len={}, self_ptr={:p}",
+                //     buffer.len(),
+                //     self.queue.len(),
+                //     self
+                // );
                 return buffer;
             }
             None => {
@@ -149,17 +149,13 @@ impl Loopback {
     /// - &mut self：自身可变引用
     /// - buffer：需要发送的数据包
     pub fn loopback_transmit(&mut self, buffer: Vec<u8>) {
-        log::debug!(
-            "lo transmit: {} bytes, queue_len={}, self_ptr={:p}",
-            buffer.len(),
-            self.queue.len(),
-            self
-        );
+        // log::debug!(
+        //     "lo transmit: {} bytes, queue_len={}, self_ptr={:p}",
+        //     buffer.len(),
+        //     self.queue.len(),
+        //     self
+        // );
         self.queue.push_back(buffer);
-
-        // Wake the network polling thread to process the queued packet
-        // Loopback doesn't have hardware interrupts, so we need to explicitly wake the thread
-        INIT_NET_NAMESPACE.wakeup_poll_thread();
     }
 }
 
@@ -259,7 +255,7 @@ impl phy::Device for LoopbackDriver {
         if buffer.is_empty() {
             return Option::None;
         }
-        log::debug!("LoopbackDriver::receive() -> packet {} bytes", buffer.len());
+        // log::debug!("LoopbackDriver::receive() -> packet {} bytes", buffer.len());
         let rx = LoopbackRxToken { buffer };
         let tx = LoopbackTxToken {
             driver: self.clone(),

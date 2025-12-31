@@ -45,16 +45,6 @@ impl Syscall for SysWriteVHandle {
 
         // 将用户态传入的数据结构 `IoVecs` 重新在内核上构造
         let iovecs = unsafe { IoVecs::from_user(iov, count, false) }?;
-
-        // Check if this is a socket - sockets need special handling for datagram protocols
-        use crate::process::ProcessManager;
-        if let Ok(_socket_inode) = ProcessManager::current_pcb().get_socket_inode(fd) {
-            // Socket: gather all iovecs and send as one message to preserve boundaries
-            let data = iovecs.gather()?;
-            return do_write(fd, &data);
-        }
-
-        // Regular file: gather and write
         let data = iovecs.gather()?;
 
         // TODO: 支持零内核拷贝的分散写 （需要文件系统底层支持分散写）

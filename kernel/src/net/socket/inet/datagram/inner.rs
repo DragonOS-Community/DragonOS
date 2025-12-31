@@ -58,13 +58,13 @@ impl UnboundUdp {
             DEFAULT_TX_BUF_SIZE
         };
 
-        log::debug!(
-            "new_with_buf_size: requested rx={}, tx={} -> allocating rx={}, tx={} (2x)",
-            rx_size,
-            tx_size,
-            rx_buf_size,
-            tx_buf_size
-        );
+        // log::debug!(
+        //     "new_with_buf_size: requested rx={}, tx={} -> allocating rx={}, tx={} (2x)",
+        //     rx_size,
+        //     tx_size,
+        //     rx_buf_size,
+        //     tx_buf_size
+        // );
 
         let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
@@ -88,16 +88,16 @@ impl UnboundUdp {
         let bind_addr = local_endpoint.addr;
         let bind_port = if local_endpoint.port == 0 {
             let port = inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?;
-            log::debug!("UnboundUdp::bind: allocated ephemeral port {}", port);
+            // log::debug!("UnboundUdp::bind: allocated ephemeral port {}", port);
             port
         } else {
             inner
                 .port_manager()
                 .bind_port(InetTypes::Udp, local_endpoint.port)?;
-            log::debug!(
-                "UnboundUdp::bind: explicit bind to port {}",
-                local_endpoint.port
-            );
+            // log::debug!(
+            //     "UnboundUdp::bind: explicit bind to port {}",
+            //     local_endpoint.port
+            // );
             local_endpoint.port
         };
 
@@ -131,11 +131,11 @@ impl UnboundUdp {
     ) -> Result<BoundUdp, SystemError> {
         let (inner, local_addr) = BoundInner::bind_ephemeral(self.socket, remote, netns)?;
         let bound_port = inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?;
-        log::debug!(
-            "UnboundUdp::bind_ephemeral: allocated ephemeral port {} for remote {:?}",
-            bound_port,
-            remote
-        );
+        // log::debug!(
+        //     "UnboundUdp::bind_ephemeral: allocated ephemeral port {} for remote {:?}",
+        //     bound_port,
+        //     remote
+        // );
 
         // Bind the smoltcp socket to the local endpoint
         if local_addr.is_unspecified() {
@@ -202,17 +202,17 @@ impl BoundUdp {
     }
 
     pub fn connect(&self, remote: smoltcp::wire::IpEndpoint) {
-        let local = self.endpoint();
-        log::debug!(
-            "BoundUdp::connect: local={:?}, connecting to remote={:?}",
-            local,
-            remote
-        );
+        // let _local = self.endpoint();
+        // log::debug!(
+        //     "BoundUdp::connect: local={:?}, connecting to remote={:?}",
+        //     _local,
+        //     remote
+        // );
 
         // Check if there are buffered packets - if so, allow next recv without filtering
         let has_buffered = self.with_socket(|socket| socket.can_recv());
         *self.has_preconnect_data.lock() = has_buffered;
-        log::debug!("BoundUdp::connect: has pre-connect data = {}", has_buffered);
+        // log::debug!("BoundUdp::connect: has pre-connect data = {}", has_buffered);
 
         self.remote.lock().replace(remote);
     }
@@ -243,17 +243,17 @@ impl BoundUdp {
                     // Clear the flag - we only allow ONE unfiltered recv
                     *has_preconnect = false;
                     drop(has_preconnect); // Release lock before recv
-                    log::debug!("try_recv: has_preconnect=true, can_recv={}", socket.can_recv());
+                    // log::debug!("try_recv: has_preconnect=true, can_recv={}", socket.can_recv());
 
                     // Special case: zero-length buffer
                     if buf.is_empty() {
                         if socket.can_recv() {
                             if let Ok((_payload, metadata)) = socket.peek() {
-                                log::debug!("try_recv: preconnect with zero-length buffer, returning 0 bytes");
+                                // log::debug!("try_recv: preconnect with zero-length buffer, returning 0 bytes");
                                 return Ok((0, metadata.endpoint));
                             }
                         }
-                        log::debug!("try_recv: preconnect with zero-length buffer, no data");
+                        // log::debug!("try_recv: preconnect with zero-length buffer, no data");
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
 
@@ -263,26 +263,41 @@ impl BoundUdp {
                             if let Ok((payload, metadata)) = socket.peek() {
                                 let copy_len = core::cmp::min(buf.len(), payload.len());
                                 buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                log::debug!("try_recv: preconnect peek succeeded, size={}", copy_len);
+                                // log::debug!("try_recv: preconnect peek succeeded, size={}", copy_len);
                                 return Ok((copy_len, metadata.endpoint));
                             }
-                        } else if let Ok((size, metadata)) = socket.recv_slice(buf) {
-                            log::debug!("try_recv: preconnect recv succeeded, size={}", size);
-                            return Ok((size, metadata.endpoint));
+                        } else {
+                            // Receive the packet
+                            match socket.recv_slice(buf) {
+                                Ok((size, metadata)) => {
+                                    // log::debug!("try_recv: preconnect recv succeeded, size={}", size);
+                                    return Ok((size, metadata.endpoint));
+                                }
+                                Err(smoltcp::socket::udp::RecvError::Truncated) => {
+                                    // UDP allows truncation - peek to get the endpoint, then consume
+                                    if let Ok((_payload, metadata)) = socket.peek() {
+                                        let endpoint = metadata.endpoint;
+                                        let _ = socket.recv_slice(&mut [0u8; 1]); // Consume the packet
+                                        // log::debug!("try_recv: preconnect recv truncated, size={}", buf.len());
+                                        return Ok((buf.len(), endpoint));
+                                    }
+                                }
+                                Err(_) => {}
+                            }
                         }
                     }
-                    log::debug!("try_recv: preconnect recv failed, returning EAGAIN");
+                    // log::debug!("try_recv: preconnect recv failed, returning EAGAIN");
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 drop(has_preconnect); // Release lock
 
-                log::debug!("try_recv: connected mode, expected_remote={:?}, buf_len={}, can_recv={}",
-                    expected_remote, buf.len(), socket.can_recv());
+                // log::debug!("try_recv: connected mode, expected_remote={:?}, buf_len={}, can_recv={}",
+                //     expected_remote, buf.len(), socket.can_recv());
 
                 // Loop to skip packets from unexpected sources
                 loop {
                     if !socket.can_recv() {
-                        log::debug!("try_recv: can_recv=false, returning EAGAIN");
+                        // log::debug!("try_recv: can_recv=false, returning EAGAIN");
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
 
@@ -291,8 +306,9 @@ impl BoundUdp {
                     // error when buffer is smaller than packet, but we still want to receive it
                     match socket.peek() {
                         Ok((payload, metadata)) => {
-                            log::debug!("try_recv: peeked {} bytes from {:?}, buf_len={}", payload.len(), metadata.endpoint, buf.len());
-                            if metadata.endpoint == expected_remote {
+                            let endpoint = metadata.endpoint;
+                            // log::debug!("try_recv: peeked {} bytes from {:?}, buf_len={}", payload.len(), endpoint, buf.len());
+                            if endpoint == expected_remote {
                                 // Source matches
 
                                 // Special case: zero-length buffer
@@ -306,16 +322,23 @@ impl BoundUdp {
                                     let copy_len = core::cmp::min(buf.len(), payload.len());
                                     buf[..copy_len].copy_from_slice(&payload[..copy_len]);
                                     log::debug!("try_recv: peek succeeded, size={}", copy_len);
-                                    return Ok((copy_len, metadata.endpoint));
+                                    return Ok((copy_len, endpoint));
                                 } else {
                                     // Receive the packet (truncated if buf is smaller)
+                                    // For UDP, truncation is normal - just consume the packet and return what fits
+                                    let copy_len = core::cmp::min(buf.len(), payload.len());
                                     match socket.recv_slice(buf) {
                                         Ok((size, metadata)) => {
-                                            log::debug!("try_recv: recv succeeded, size={}", size);
+                                            // log::debug!("try_recv: recv succeeded, size={}", size);
                                             return Ok((size, metadata.endpoint));
                                         }
+                                        Err(smoltcp::socket::udp::RecvError::Truncated) => {
+                                            // UDP allows truncation - return the bytes that fit
+                                            // log::debug!("try_recv: packet truncated from {} to {} bytes", payload.len(), copy_len);
+                                            return Ok((copy_len, endpoint));
+                                        }
                                         Err(e) => {
-                                            // If recv_slice fails after peek succeeds, something is wrong
+                                            // Other errors are unexpected
                                             log::warn!("try_recv: recv_slice unexpectedly failed after peek: {:?}", e);
                                             return Err(SystemError::EIO);
                                         }
@@ -323,21 +346,21 @@ impl BoundUdp {
                                 }
                             } else {
                                 // Source doesn't match, discard this packet and check next
-                                log::debug!("try_recv: source mismatch, discarding packet from {:?}", metadata.endpoint);
+                                // log::debug!("try_recv: source mismatch, discarding packet from {:?}", metadata.endpoint);
                                 // Use a temp buffer to consume the packet
                                 let mut discard_buf = [0u8; 1];
                                 let _ = socket.recv_slice(&mut discard_buf);
                                 continue;
                             }
                         }
-                        Err(e) => {
-                            log::debug!("try_recv: peek failed: {:?}, returning EAGAIN", e);
+                        Err(_e) => {
+                            // log::debug!("try_recv: peek failed: {:?}, returning EAGAIN", _e);
                             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                         }
                     }
                 }
             } else {
-                log::debug!("try_recv: unconnected mode, buf_len={}, can_recv={}", buf.len(), socket.can_recv());
+                // log::debug!("try_recv: unconnected mode, buf_len={}, can_recv={}", buf.len(), socket.can_recv());
                 // Not connected, receive from any source
 
                 // Special case: if buffer length is 0, just peek to check if data exists
@@ -345,11 +368,11 @@ impl BoundUdp {
                     if socket.can_recv() {
                         // Peek to get the source endpoint without consuming data
                         if let Ok((_payload, metadata)) = socket.peek() {
-                            log::debug!("try_recv: zero-length buffer with data available, returning 0 bytes from {:?}", metadata.endpoint);
+                            // log::debug!("try_recv: zero-length buffer with data available, returning 0 bytes from {:?}", metadata.endpoint);
                             return Ok((0, metadata.endpoint));
                         }
                     }
-                    log::debug!("try_recv: zero-length buffer with no data, returning EAGAIN");
+                    // log::debug!("try_recv: zero-length buffer with no data, returning EAGAIN");
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
 
@@ -359,15 +382,30 @@ impl BoundUdp {
                         if let Ok((payload, metadata)) = socket.peek() {
                             let copy_len = core::cmp::min(buf.len(), payload.len());
                             buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                            log::debug!("try_recv: unconnected peek succeeded, size={}", copy_len);
+                            // log::debug!("try_recv: unconnected peek succeeded, size={}", copy_len);
                             return Ok((copy_len, metadata.endpoint));
                         }
-                    } else if let Ok((size, metadata)) = socket.recv_slice(buf) {
-                        log::debug!("try_recv: unconnected recv succeeded, size={}", size);
-                        return Ok((size, metadata.endpoint));
+                    } else {
+                        // Receive the packet
+                        match socket.recv_slice(buf) {
+                            Ok((size, metadata)) => {
+                                // log::debug!("try_recv: unconnected recv succeeded, size={}", size);
+                                return Ok((size, metadata.endpoint));
+                            }
+                            Err(smoltcp::socket::udp::RecvError::Truncated) => {
+                                // UDP allows truncation - peek to get the endpoint, then consume
+                                if let Ok((_payload, metadata)) = socket.peek() {
+                                    let endpoint = metadata.endpoint;
+                                    let _ = socket.recv_slice(&mut [0u8; 1]); // Consume the packet
+                                    // log::debug!("try_recv: unconnected recv truncated, size={}", buf.len());
+                                    return Ok((buf.len(), endpoint));
+                                }
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }
-                log::debug!("try_recv: unconnected recv failed, returning EAGAIN");
+                // log::debug!("try_recv: unconnected recv failed, returning EAGAIN");
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
         })
@@ -393,27 +431,27 @@ impl BoundUdp {
             remote.addr = smoltcp::wire::IpAddress::v4(127, 0, 0, 1);
         }
 
-        log::debug!(
-            "try_send: sending {} bytes to {:?}, can_send={}",
-            buf.len(),
-            remote,
-            self.with_socket(|socket| socket.can_send())
-        );
+        // log::debug!(
+        //     "try_send: sending {} bytes to {:?}, can_send={}",
+        //     buf.len(),
+        //     remote,
+        //     self.with_socket(|socket| socket.can_send())
+        // );
 
         self.with_mut_socket(|socket| {
             if socket.can_send() {
                 match socket.send_slice(buf, remote) {
                     Ok(_) => {
-                        log::debug!("try_send: send successful");
+                        // log::debug!("try_send: send successful");
                         Ok(buf.len())
                     }
-                    Err(e) => {
-                        log::debug!("try_send: send failed: {:?}", e);
+                    Err(_e) => {
+                        // log::debug!("try_send: send failed: {:?}", _e);
                         Err(SystemError::ENOBUFS)
                     }
                 }
             } else {
-                log::debug!("try_send: can_send=false, returning ENOBUFS");
+                // log::debug!("try_send: can_send=false, returning ENOBUFS");
                 Err(SystemError::ENOBUFS)
             }
         })

@@ -34,7 +34,7 @@ impl Syscall for SysReadVHandle {
         // IoVecs 会进行用户态检验(包含 len==0 的 iov_base 校验)。
         let iovecs = unsafe { IoVecs::from_user(iov, count, true) }?;
 
-        // Check if this is a socket - sockets need special handling for datagram protocols
+        // TODO: Here work around, not suppose to read entire buf once
         use crate::process::ProcessManager;
         if let Ok(_socket_inode) = ProcessManager::current_pcb().get_socket_inode(fd) {
             // Socket: read entire message then scatter to iovecs

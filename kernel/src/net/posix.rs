@@ -263,11 +263,11 @@ impl SockAddr {
             AddressFamily::INet => {
                 // 下限检查：至少需要包含完整的 sockaddr_in 结构体
                 if len < size_of::<SockAddrIn>() as u32 {
-                    log::error!(
-                        "len {} < sizeof(sockaddr_in) {}",
-                        len,
-                        size_of::<SockAddrIn>()
-                    );
+                    // log::error!(
+                    //     "len {} < sizeof(sockaddr_in) {}",
+                    //     len,
+                    //     size_of::<SockAddrIn>()
+                    // );
                     return Err(SystemError::EINVAL);
                 }
 

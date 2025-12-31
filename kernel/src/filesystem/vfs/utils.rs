@@ -5,9 +5,10 @@ use core::hash::Hash;
 use alloc::{string::String, sync::Arc};
 use system_error::SystemError;
 
+use crate::process::cred::{Cred, Kgid};
 use crate::process::ProcessControlBlock;
 
-use super::{fcntl::AtFlags, FileType, IndexNode};
+use super::{fcntl::AtFlags, FileType, IndexNode, InodeMode};
 
 /// @brief 切分路径字符串，返回最左侧那一级的目录名和剩余的部分。
 ///
@@ -183,4 +184,107 @@ impl AsRef<str> for DName {
     fn as_ref(&self) -> &str {
         self.0.as_str()
     }
+}
+
+/// 检查调用者是否在指定的组内
+///
+/// # 参数
+///
+/// - `cred`: 调用者的凭证
+/// - `gid`: 要检查的组 ID
+///
+/// # 返回值
+///
+/// 如果调用者在指定组内，返回 `true`；否则返回 `false`
+pub fn is_caller_in_group(cred: &Arc<Cred>, gid: usize) -> bool {
+    let kgid = Kgid::from(gid);
+    let mut in_group = cred.fsgid.data() == gid
+        || cred.gid.data() == gid
+        || cred.egid.data() == gid
+        || cred.getgroups().contains(&kgid);
+
+    if let Some(info) = cred.group_info.as_ref() {
+        in_group |= info.gids.contains(&kgid);
+    }
+
+    in_group
+}
+
+/// 判断是否应该清除 sgid 位（遵循 Linux setattr_should_drop_sgid 语义）
+///
+/// # 参数
+///
+/// - `mode`: 文件的权限模式
+/// - `gid`: 要检查的组 ID
+/// - `cred`: 调用者的凭证
+///
+/// # 返回值
+///
+/// 如果应该清除 sgid 位，返回 `true`；否则返回 `false`
+///
+/// # Linux 语义
+///
+/// - 若 S_IXGRP 置位：无条件清除（这是"真正的"SGID 可执行文件）
+/// - 否则（mandatory locking 语义）：仅当调用者不在文件所属组时清除
+pub fn should_remove_sgid(mode: InodeMode, gid: usize, cred: &Arc<Cred>) -> bool {
+    if !mode.contains(InodeMode::S_ISGID) {
+        return false;
+    }
+
+    if mode.contains(InodeMode::S_IXGRP) {
+        // S_IXGRP 置位：无条件清除 sgid
+        return true;
+    }
+
+    // mandatory locking 语义：仅当调用者不在文件所属组时清除
+    !is_caller_in_group(cred, gid)
+}
+
+/// 判断 chown 操作中是否应该清除 sgid 位
+///
+/// # 参数
+///
+/// - `mode`: 文件的权限模式
+/// - `old_gid`: chown 前的原组 ID
+/// - `current_gid`: 当前调用者的 gid
+/// - `cred`: 调用者的凭证
+/// - `group_info`: 调用者的组信息
+///
+/// # 返回值
+///
+/// 如果应该清除 sgid 位，返回 `true`；否则返回 `false`
+///
+/// # Linux 语义
+///
+/// - 若 S_IXGRP 置位：无条件清除 sgid
+/// - 否则（mandatory locking 语义）：仅当调用者不在原文件所属组且无 CAP_FSETID 时清除
+pub fn should_remove_sgid_on_chown(
+    mode: InodeMode,
+    old_gid: usize,
+    current_gid: usize,
+    cred: &Arc<Cred>,
+    group_info: &crate::process::cred::GroupInfo,
+) -> bool {
+    use crate::process::cred::CAPFlags;
+
+    if !mode.contains(InodeMode::S_ISGID) {
+        return false;
+    }
+
+    if mode.contains(InodeMode::S_IXGRP) {
+        // S_IXGRP 置位：无条件清除 sgid
+        return true;
+    }
+
+    // 注意：Linux 这里检查的是"原 inode gid"，在 notify_change 前尚未更新。
+    let kgid = Kgid::from(old_gid);
+    let in_group = cred.fsgid.data() == old_gid
+        || cred.egid.data() == old_gid
+        || current_gid == old_gid
+        || cred.getgroups().contains(&kgid)
+        || group_info.gids.contains(&kgid)
+        || cred.has_capability(CAPFlags::CAP_FSETID);
+
+    // 仅当调用者不在原文件所属组且无 CAP_FSETID 时清除
+    !in_group
 }

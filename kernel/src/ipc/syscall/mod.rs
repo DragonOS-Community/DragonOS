@@ -15,6 +15,7 @@ mod sys_shmdt;
 mod sys_shmget;
 mod sys_sigaction;
 mod sys_sigaltstack;
+pub mod sys_signalfd4;
 mod sys_sigpending;
 pub mod sys_tgkill;
 pub mod sys_tkill;

@@ -18,6 +18,7 @@ use system_error::SystemError;
 use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
+    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
@@ -575,6 +576,8 @@ impl ElfLoader {
         phdr_vaddr: Option<VirtAddr>,
         ehdr: &elf::file::FileHeader<AnyEndian>,
     ) -> Result<(), ExecError> {
+        use crate::process::rseq::{ORIG_RSEQ_SIZE, RSEQ_ALIGN};
+
         let phdr_vaddr = phdr_vaddr.unwrap_or(VirtAddr::new(0));
 
         let init_info = param.init_info_mut();
@@ -591,6 +594,14 @@ impl ElfLoader {
         init_info
             .auxv
             .insert(AtType::Entry as u8, entrypoint_vaddr.data());
+
+        // 添加 rseq 相关的 auxv
+        init_info
+            .auxv
+            .insert(AtType::RseqFeatureSize as u8, ORIG_RSEQ_SIZE as usize);
+        init_info
+            .auxv
+            .insert(AtType::RseqAlign as u8, RSEQ_ALIGN as usize);
 
         return Ok(());
     }
@@ -788,10 +799,17 @@ impl BinaryLoader for ElfLoader {
                 ))
             })?;
             let pwd = ProcessManager::current_pcb().pwd_inode();
-            let inode = pwd.lookup(interpreter_path).map_err(|_| {
-                log::error!("Failed to find interpreter path: {}", interpreter_path);
-                return ExecError::InvalidParemeter;
-            })?;
+            let inode = pwd
+                .lookup_follow_symlink(interpreter_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+                .map_err(|e| {
+                    // Linux 语义：动态链接器（解释器）路径不存在时，execve 需返回 ENOENT。
+                    log::error!(
+                        "Failed to find interpreter path: {} (err={:?})",
+                        interpreter_path,
+                        e
+                    );
+                    ExecError::SystemError(SystemError::ENOENT)
+                })?;
             // log::debug!("opening interpreter at :{}", interpreter_path);
             interpreter = Some(
                 ExecParam::new(inode, param.vm().clone(), ExecParamFlags::EXEC).map_err(|e| {

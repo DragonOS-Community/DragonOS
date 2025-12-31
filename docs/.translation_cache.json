@@ -126,7 +126,7 @@
     "hash": "72efe542c7854926ac0f33287345b856"
   },
   "en:kernel/ipc/index.rst": {
-    "hash": "e75d2ff6a7b8a4e6f32b2adee7756298"
+    "hash": "4e4a874a6248bd474e36af7a3fb6b146"
   },
   "en:kernel/boot/index.rst": {
     "hash": "8fe854f9c48d4e2e3fee0cf7f3526dfe"
@@ -150,7 +150,7 @@
     "hash": "c931f3fcfca7d8d10cd16a8b68e6274a"
   },
   "en:community/ChangeLog/index.rst": {
-    "hash": "dbf244ec28b422b0b7d8b8bcfa72e94d"
+    "hash": "2166fbbfcea1f1ca34fd498cf095fbc3"
   },
   "en:kernel/trace/index.rst": {
     "hash": "3c466a411a5bd71514f8fa4f15d06241"
@@ -207,7 +207,7 @@
     "hash": "d94351167179beb0bb1b1f3bb82da2ff"
   },
   "en:userland/appdev/index.rst": {
-    "hash": "78e6747475981b5cc17cd206c135ca4f"
+    "hash": "46a9b9ba2cb7616cb7a819fb53418551"
   },
   "en:userland/appdev/c-cpp-quick-start.md": {
     "hash": "0101f8fa98a0536d43ff897145d4a43d"
@@ -264,7 +264,7 @@
     "hash": "8b840ec6af5782d8f793f746b1061ed9"
   },
   "en:index.rst": {
-    "hash": "139ea63381896ae9f861c37ca13c888d"
+    "hash": "1ae9ba61a4f8b87c982fc7a6357319cb"
   },
   "en:questions/index.rst": {
     "hash": "b1cee9bfde04d6375f24c93a29ce3c71"
@@ -294,7 +294,7 @@
     "hash": "52df04d6a276b42617f7b79bbbffa61e"
   },
   "en:kernel/ktest/gvisor_syscall_test.rst": {
-    "hash": "60cc96606ccd50bb3e669b378693b742"
+    "hash": "75f85fb98952102269062342cdbc57cd"
   },
   "en:kernel/syscall/sys_capget_capset.md": {
     "hash": "f3b86c00e9f28df5c0e6c15905e53907"
@@ -303,7 +303,7 @@
     "hash": "acbc94b056e1c8f7f07275d80b70a930"
   },
   "en:kernel/device/index.rst": {
-    "hash": "71c15cea87dffe58f5d70da38390a083"
+    "hash": "f27dd3c0d3f33aac7f70f2eb90403d88"
   },
   "en:kernel/memory_management/extable_safe_copy_design.md": {
     "hash": "fabf6a20ce3a3d1974d678f039fa32b5"
@@ -319,5 +319,38 @@
   },
   "en:kernel/sched/wait_queue.md": {
     "hash": "550f38b4386c3755535e99e97bc98243"
+  },
+  "en:agents/release_agent_capability.md": {
+    "hash": "6c10917f7e05f9a0c5d75c7bbed4bc71"
+  },
+  "en:community/ChangeLog/V0.4.x/V0.4.0.md": {
+    "hash": "940c6a8fc47831f75df1dc8810d7c336"
+  },
+  "en:kernel/device/loop_device.md": {
+    "hash": "1d637a7d292c4168b326ba46755b5622"
+  },
+  "en:introduction/devcontainer.md": {
+    "hash": "b7ea769ce2562ccbcb27df019ff98cc1"
+  },
+  "en:userland/rootfs/index.rst": {
+    "hash": "bb1f31a04781ace700c8123bdbf2a36c"
+  },
+  "en:userland/rootfs/add-your-own-app.md": {
+    "hash": "0eafcc92a06fb0bb0bea58617318f1aa"
+  },
+  "en:dev-skills/write-docs.md": {
+    "hash": "898241ba5edc255c7fb035d1d5ff9ad1"
+  },
+  "en:introduction/develop_nix.md": {
+    "hash": "bb11827644ae0b8e835b9fa557465967"
+  },
+  "en:dev-skills/nix-skills.md": {
+    "hash": "ce15afc55be2502588220eef9b39b637"
+  },
+  "en:userland/rootfs/diskgen.md": {
+    "hash": "cc304450faeead2e99367616ede9327a"
+  },
+  "en:kernel/ipc/rseq.md": {
+    "hash": "b0b020398fb048e2c87135e3bb2974b3"
   }
 }

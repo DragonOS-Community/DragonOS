@@ -19,6 +19,8 @@ use core::any::Any;
 use ida::IdAllocator;
 use system_error::SystemError;
 
+const EVENTFD_MAX: u64 = u64::MAX - 1;
+
 lazy_static::lazy_static! {
     static ref EVENTFD_FS: Arc<EventFdFs> = Arc::new(EventFdFs);
 }
@@ -125,7 +127,10 @@ impl EventFdInode {
         if self_guard.count != 0 {
             events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
         }
-        if self_guard.count != u64::MAX {
+        // Linux eventfd counter max is U64_MAX - 1. When count reaches that max,
+        // any further write(8) would block (or EAGAIN for nonblock), so EPOLLOUT
+        // must be cleared.
+        if self_guard.count != EVENTFD_MAX {
             events |= EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
         }
         return Ok(events.bits() as usize);
@@ -273,7 +278,8 @@ impl IndexNode for EventFdInode {
             }
             {
                 let eventfd = self.eventfd.lock();
-                if u64::MAX - eventfd.count > val {
+                // Allow write when count + val <= EVENTFD_MAX.
+                if EVENTFD_MAX.saturating_sub(eventfd.count) >= val {
                     break;
                 }
                 if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
@@ -284,7 +290,7 @@ impl IndexNode for EventFdInode {
             self.wait_queue.wait_event_interruptible(
                 || {
                     let ev = self.eventfd.lock();
-                    u64::MAX - ev.count > val
+                    EVENTFD_MAX.saturating_sub(ev.count) >= val
                 },
                 None::<fn()>,
             )?;

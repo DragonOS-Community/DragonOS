@@ -132,6 +132,11 @@ pub struct InnerPipeInode {
     /// 是否为命名管道（FIFO）
     /// 只有 FIFO 才需要在 open 时阻塞等待另一端
     is_fifo: bool,
+    /// 读端打开计数器（只增不减，用于 FIFO 等待逻辑）
+    /// 采用 Linux 内核的设计：等待计数器变化而非检查 reader > 0
+    r_counter: u32,
+    /// 写端打开计数器（只增不减，用于 FIFO 等待逻辑）
+    w_counter: u32,
 }
 
 impl InnerPipeInode {
@@ -171,6 +176,22 @@ impl InnerPipeInode {
         Ok(events.bits() as usize)
     }
 
+    #[inline]
+    fn poll_both_ends(&self) -> EPollEventType {
+        // poll() 的返回与 FileFlags 的读/写端有关。
+        // 为了正确唤醒同时监听读端/写端的 epoll，需要合并两侧视角的事件。
+        let read_data = FilePrivateData::Pipefs(PipeFsPrivateData {
+            flags: FileFlags::O_RDONLY,
+        });
+        let write_data = FilePrivateData::Pipefs(PipeFsPrivateData {
+            flags: FileFlags::O_WRONLY,
+        });
+
+        let read_mask = self.poll(&read_data).unwrap_or(0);
+        let write_mask = self.poll(&write_data).unwrap_or(0);
+        EPollEventType::from_bits_truncate((read_mask | write_mask) as u32)
+    }
+
     fn buf_full(&self) -> bool {
         return self.valid_cnt as usize == self.buf_size;
     }
@@ -208,6 +229,8 @@ impl LockedPipeInode {
             reader: 0,
             writer: 0,
             is_fifo: false, // 默认为匿名管道
+            r_counter: 0,   // 初始化读端计数器
+            w_counter: 0,   // 初始化写端计数器
         };
         let result = Arc::new(Self {
             inner: SpinLock::new(inner),
@@ -248,14 +271,29 @@ impl LockedPipeInode {
         return !inode.buf_full() || inode.reader == 0;
     }
 
-    /// 检查是否有写端（用于 FIFO O_RDONLY 阻塞等待）
-    fn has_writer(&self) -> bool {
-        self.inner.lock().writer > 0
+    /// 检查写端计数器是否已变化（用于 FIFO O_RDONLY 阻塞等待）
+    /// 采用 Linux 内核的设计：等待计数器变化而非检查 writer > 0
+    ///
+    /// 为了处理计数器溢出回绕的极端情况，采用双重检查：
+    /// 1. 计数器是否变化（主要条件）
+    /// 2. 当前是否有写端存在（兜底条件，处理回绕）
+    fn w_counter_changed(&self, old: u32) -> bool {
+        let guard = self.inner.lock();
+        // 条件 1：计数器变化（正常情况）
+        // 条件 2：当前有写端（处理极端的计数器回绕情况）
+        guard.w_counter != old || guard.writer > 0
     }
 
-    /// 检查是否有读端（用于 FIFO O_WRONLY 阻塞等待）
-    fn has_reader(&self) -> bool {
-        self.inner.lock().reader > 0
+    /// 检查读端计数器是否已变化（用于 FIFO O_WRONLY 阻塞等待）
+    ///
+    /// 为了处理计数器溢出回绕的极端情况，采用双重检查：
+    /// 1. 计数器是否变化（主要条件）
+    /// 2. 当前是否有读端存在（兜底条件，处理回绕）
+    fn r_counter_changed(&self, old: u32) -> bool {
+        let guard = self.inner.lock();
+        // 条件 1：计数器变化（正常情况）
+        // 条件 2：当前有读端（处理极端的计数器回绕情况）
+        guard.r_counter != old || guard.reader > 0
     }
 
     /// 设置管道缓冲区大小
@@ -455,10 +493,10 @@ impl IndexNode for LockedPipeInode {
         //读完后解锁并唤醒等待在写等待队列中的进程
         self.write_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
-        let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&data)? as u32);
+        let pollflag = inner_guard.poll_both_ends();
         drop(inner_guard);
-        // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+        // 唤醒epoll中等待的进程（忽略错误，因为状态已更新，这是尽力而为的通知）
+        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
 
         //返回读取的字节数
         return Ok(num);
@@ -484,9 +522,11 @@ impl IndexNode for LockedPipeInode {
         if accflags == FileFlags::O_RDONLY {
             // 读端打开
             let mut guard = self.inner.lock();
+            guard.r_counter += 1; // 增加读端计数器（永不减少）
             guard.reader += 1;
             guard.had_reader = true;
-            let has_writer = guard.writer > 0;
+            let writers = guard.writer;
+            let cur_w_counter = guard.w_counter; // 记录当前写端计数器
             drop(guard);
 
             // 只有 FIFO 才需要处理阻塞等待
@@ -499,19 +539,21 @@ impl IndexNode for LockedPipeInode {
                     return Ok(());
                 }
 
-                // 阻塞模式：等待写端打开
-                if !has_writer {
+                // 阻塞模式：等待写端计数器变化（采用 Linux 内核的设计）
+                if writers == 0 {
                     // 在睡眠前必须释放 data 锁
                     drop(data);
-                    let r =
-                        wq_wait_event_interruptible!(self.open_wait_queue, self.has_writer(), {});
+                    let r = wq_wait_event_interruptible!(
+                        self.open_wait_queue,
+                        self.w_counter_changed(cur_w_counter),
+                        {}
+                    );
                     if r.is_err() {
                         // 被信号中断，需要回滚 reader 计数
+                        // 注意：不要回滚 r_counter，它只增不减
+                        // 注意：不要重置 had_reader，即使 reader 变为 0
                         let mut guard = self.inner.lock();
                         guard.reader -= 1;
-                        if guard.reader == 0 {
-                            guard.had_reader = false;
-                        }
                         drop(guard);
                         return Err(SystemError::EINTR);
                     }
@@ -527,45 +569,58 @@ impl IndexNode for LockedPipeInode {
                     if guard.reader == 0 {
                         return Err(SystemError::ENXIO);
                     }
+                    guard.w_counter += 1; // 增加写端计数器（永不减少）
                     guard.writer += 1;
                     drop(guard);
                 } else {
-                    // 阻塞模式：等待读端
-                    let guard = self.inner.lock();
-                    let has_reader = guard.reader > 0;
+                    // 阻塞模式：先增加 writer 计数，再等待读端
+                    // 采用 Linux 内核的设计：等待计数器变化
+                    let mut guard = self.inner.lock();
+                    guard.w_counter += 1; // 增加写端计数器（永不减少）
+                    guard.writer += 1;
+                    let readers = guard.reader;
+                    let cur_r_counter = guard.r_counter; // 记录当前读端计数器
                     drop(guard);
 
-                    if !has_reader {
+                    // 唤醒可能在等待写端的读者（在增加 w_counter 之后立即唤醒）
+                    self.open_wait_queue.wakeup_all(None);
+
+                    if readers == 0 {
                         // 在睡眠前必须释放 data 锁
                         drop(data);
-                        // 等待读端打开
+                        // 等待读端计数器变化
                         let r = wq_wait_event_interruptible!(
                             self.open_wait_queue,
-                            self.has_reader(),
+                            self.r_counter_changed(cur_r_counter),
                             {}
                         );
                         if r.is_err() {
+                            // 被信号中断，需要回滚 writer 计数
+                            // 注意：不要回滚 w_counter，它只增不减
+                            let mut guard = self.inner.lock();
+                            guard.writer -= 1;
+                            drop(guard);
                             return Err(SystemError::EINTR);
                         }
                     }
-
-                    // 现在有读端了，增加写端计数
-                    let mut guard = self.inner.lock();
-                    guard.writer += 1;
-                    drop(guard);
                 }
 
-                // 唤醒可能在等待写端的读者
-                self.open_wait_queue.wakeup_all(None);
+                // 非阻塞模式下也需要唤醒可能在等待写端的读者
+                if is_nonblock {
+                    self.open_wait_queue.wakeup_all(None);
+                }
             } else {
                 // 匿名管道：直接增加写端计数
                 let mut guard = self.inner.lock();
+                guard.w_counter += 1;
                 guard.writer += 1;
                 drop(guard);
             }
         } else if accflags == FileFlags::O_RDWR {
             // O_RDWR 模式：同时作为读端和写端，不阻塞
             let mut guard = self.inner.lock();
+            guard.r_counter += 1; // 增加读端计数器
+            guard.w_counter += 1; // 增加写端计数器
             guard.reader += 1;
             guard.writer += 1;
             guard.had_reader = true;
@@ -601,9 +656,23 @@ impl IndexNode for LockedPipeInode {
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
             if guard.writer == 0 {
+                // 写端耗尽意味着读端应收到 POLLHUP，唤醒等待者与 epoll
+                // 注意：这里需要使用读端的flags来获取POLLHUP事件
+                // 因为poll()中只在!flags.is_write_only()时才设置EPOLLHUP
+                let poll_flags = FileFlags::O_RDONLY;
+                let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: poll_flags });
+                // 忽略 poll 错误：状态已更新（writer已减为0），poll失败不应导致close失败
+                // 这与下面对 wakeup_epoll 错误的处理方式一致
+                let pollflag = guard
+                    .poll(&poll_data)
+                    .map(|v| EPollEventType::from_bits_truncate(v as u32))
+                    .unwrap_or(EPollEventType::EPOLLHUP);
                 drop(guard); // 先释放 inner 锁，避免潜在的死锁
-                             // 唤醒所有等待的读端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
-                self.read_wait_queue.wakeup_all(None);
+                self.read_wait_queue
+                    .wakeup_all(Some(ProcessState::Blocked(true)));
+                // 唤醒所有依赖 epoll 的等待者，确保 HUP 事件可见
+                // 忽略错误：状态已更新（writer已减为0），wakeup_epoll失败不影响close操作的语义
+                let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
                 return Ok(());
             }
         }
@@ -614,9 +683,22 @@ impl IndexNode for LockedPipeInode {
             guard.reader -= 1;
             // 如果已经没有读端了，则唤醒写端
             if guard.reader == 0 {
+                // 读端耗尽意味着写端应收到 POLLERR，唤醒等待者与 epoll。
+                // 注意：这里需要使用写端的flags来获取EPOLLERR事件
+                // 因为poll()中只在!flags.is_read_only()时才设置EPOLLERR
+                let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData {
+                    flags: FileFlags::O_WRONLY,
+                });
+                let pollflag = guard
+                    .poll(&poll_data)
+                    .map(|v| EPollEventType::from_bits_truncate(v as u32))
+                    .unwrap_or(EPollEventType::EPOLLERR);
+
                 drop(guard); // 先释放 inner 锁，避免死锁
                              // 唤醒所有等待的写端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
                 self.write_wait_queue.wakeup_all(None);
+                // 唤醒所有依赖 epoll 的等待者，确保 ERR 事件可见
+                let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
                 return Ok(());
             }
         }
@@ -687,7 +769,10 @@ impl IndexNode for LockedPipeInode {
                             sig,
                             0,
                             SigCode::Kernel,
-                            SigType::Kill(ProcessManager::current_pcb().task_pid_vnr()),
+                            SigType::Kill {
+                                pid: ProcessManager::current_pcb().task_pid_vnr(),
+                                uid: ProcessManager::current_pcb().cred().uid.data() as u32,
+                            },
                         );
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -759,7 +844,10 @@ impl IndexNode for LockedPipeInode {
                             sig,
                             0,
                             SigCode::Kernel,
-                            SigType::Kill(ProcessManager::current_pcb().task_pid_vnr()),
+                            SigType::Kill {
+                                pid: ProcessManager::current_pcb().task_pid_vnr(),
+                                uid: ProcessManager::current_pcb().cred().uid.data() as u32,
+                            },
                         );
                         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -811,13 +899,11 @@ impl IndexNode for LockedPipeInode {
         self.read_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
 
-        // 构造用于 poll 的 FilePrivateData
-        let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData::new(flags));
-        let pollflag = EPollEventType::from_bits_truncate(inner_guard.poll(&poll_data)? as u32);
+        let pollflag = inner_guard.poll_both_ends();
 
         drop(inner_guard);
-        // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+        // 唤醒epoll中等待的进程（忽略错误，因为数据已写入，这是尽力而为的通知）
+        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
 
         // 返回写入的字节数
         return Ok(total_written);

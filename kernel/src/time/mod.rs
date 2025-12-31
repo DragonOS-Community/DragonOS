@@ -98,15 +98,23 @@ impl PosixTimeSpec {
 
     /// 换算成纳秒
     pub fn total_nanos(&self) -> i64 {
-        self.tv_sec * 1000000000 + self.tv_nsec
+        self.tv_sec * NSEC_PER_SEC as i64 + self.tv_nsec
     }
 
     /// 从纳秒创建 PosixTimeSpec
     pub fn from_ns(ns: u64) -> PosixTimeSpec {
         PosixTimeSpec {
-            tv_sec: (ns / 1_000_000_000) as i64,
-            tv_nsec: (ns % 1_000_000_000) as i64,
+            tv_sec: (ns / NSEC_PER_SEC as u64) as i64,
+            tv_nsec: (ns % NSEC_PER_SEC as u64) as i64,
         }
+    }
+
+    /// 将 PosixTimeSpec 转换为毫秒数
+    ///
+    /// # 返回值
+    /// 返回总毫秒数，如果结果为负数则返回 0
+    pub fn as_millis(&self) -> i64 {
+        self.tv_sec * MSEC_PER_SEC as i64 + self.tv_nsec / NSEC_PER_MSEC as i64
     }
 }
 

@@ -16,6 +16,7 @@ use smoltcp::wire::{EthernetFrame, IpAddress, IpCidr, Ipv4Packet};
 use system_error::SystemError;
 
 mod nat;
+pub mod uapi;
 
 pub use nat::{DnatRule, SnatRule};
 

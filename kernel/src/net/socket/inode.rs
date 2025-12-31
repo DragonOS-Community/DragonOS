@@ -10,15 +10,15 @@ use crate::{
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 use super::Socket;
+use crate::net::socket::IFNAMSIZ;
 
 // Socket ioctl commands
 const SIOCGIFCONF: u32 = 0x8912; // Get interface list
-
-// Constants for network interface structures
-const IFNAMSIZ: usize = 16;
+const SIOCGIFINDEX: u32 = 0x8933; // name -> if_index mapping
 
 /// ## ifreq - Interface request structure
 /// Used for socket ioctls. Must match C struct layout.
@@ -49,6 +49,63 @@ impl IfReq {
             unsafe { core::slice::from_raw_parts(addr as *const SockAddrIn as *const u8, 16) };
         self.ifr_ifru[..16].copy_from_slice(addr_bytes);
     }
+
+    fn name_str(&self) -> &str {
+        let end = self
+            .ifr_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(IFNAMSIZ);
+        core::str::from_utf8(&self.ifr_name[..end]).unwrap_or("")
+    }
+
+    fn set_ifindex(&mut self, ifindex: i32) {
+        self.ifr_ifru[..4].copy_from_slice(&ifindex.to_ne_bytes());
+    }
+}
+
+fn handle_siocgifindex(data: usize) -> Result<usize, SystemError> {
+    if data == 0 {
+        return Err(SystemError::EFAULT);
+    }
+
+    // Read ifreq from user space.
+    let user_reader =
+        UserBufferReader::new(data as *const IfReq, core::mem::size_of::<IfReq>(), true)?;
+    let mut ifreq: IfReq = user_reader.buffer_protected(0)?.read_one::<IfReq>(0)?;
+
+    let name = ifreq.name_str();
+    if name.is_empty() {
+        return Err(SystemError::ENODEV);
+    }
+
+    let netns = ProcessManager::current_netns();
+
+    // Prefer exact name match.
+    let mut ifindex: Option<i32> = netns.device_list().iter().find_map(|(_, iface)| {
+        if iface.iface_name() == name {
+            Some(iface.nic_id() as i32)
+        } else {
+            None
+        }
+    });
+
+    // Fallback for lo if not present in device_list (early init) but loopback is configured.
+    if ifindex.is_none() && name == "lo" {
+        if let Some(lo) = netns.loopback_iface() {
+            ifindex = Some(lo.nic_id() as i32);
+        }
+    }
+
+    let ifindex = ifindex.ok_or(SystemError::ENODEV)?;
+    ifreq.set_ifindex(ifindex);
+
+    // Write back.
+    let mut user_writer =
+        UserBufferWriter::new(data as *mut IfReq, core::mem::size_of::<IfReq>(), true)?;
+    user_writer.buffer_protected(0)?.write_one(0, &ifreq)?;
+
+    Ok(0)
 }
 
 /// ## ifconf - Interface configuration structure
@@ -111,36 +168,49 @@ fn handle_siocgifconf(data: usize) -> Result<usize, SystemError> {
         }
     }
 
-    // Also check loopback interface explicitly.
-    if let Some(loopback) = netns.loopback_iface() {
-        // Check if loopback already added.
-        let lo_name = "lo";
-        let already_added = ifreqs.iter().any(|req| {
-            let name_str = core::str::from_utf8(&req.ifr_name)
-                .unwrap_or("")
-                .trim_end_matches('\0');
-            name_str == lo_name
-        });
+    // Linux 语义：SIOCGIFCONF 至少应该能看到 lo（loopback）。
+    // 在 DragonOS 的某些启动/配置场景下，loopback 设备可能尚未被注册到 netns，
+    // 但用户态仍期望能通过该 ioctl 观察到 127.0.0.1。
+    let lo_name = "lo";
+    let already_added = ifreqs.iter().any(|req| {
+        // ifr_name 是以 NUL 结尾的 C 字符串。
+        let end = req
+            .ifr_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(IFNAMSIZ);
+        &req.ifr_name[..end] == lo_name.as_bytes()
+    });
 
-        if !already_added {
-            // Try to get loopback's IPv4 address.
-            let lo_iface: &dyn Iface = loopback.as_ref();
-            let ipv4_addr = lo_iface
-                .common()
-                .ipv4_addr()
-                .unwrap_or(core::net::Ipv4Addr::new(127, 0, 0, 1));
+    if !already_added {
+        let ipv4_addr = netns
+            .loopback_iface()
+            .and_then(|lo| lo.as_ref().common().ipv4_addr())
+            .unwrap_or(core::net::Ipv4Addr::new(127, 0, 0, 1));
 
-            let mut ifreq = IfReq::default();
-            ifreq.ifr_name[..2].copy_from_slice(lo_name.as_bytes());
+        let mut ifreq = IfReq::default();
+        ifreq.ifr_name[..2].copy_from_slice(lo_name.as_bytes());
 
-            let addr = SockAddrIn {
-                sin_family: 2, // AF_INET
-                sin_port: 0,
-                sin_addr: u32::from_ne_bytes(ipv4_addr.octets()),
-                sin_zero: [0u8; 8],
-            };
-            ifreq.set_sockaddr_in(&addr);
-            ifreqs.push(ifreq);
+        let addr = SockAddrIn {
+            sin_family: 2, // AF_INET
+            sin_port: 0,
+            sin_addr: u32::from_ne_bytes(ipv4_addr.octets()),
+            sin_zero: [0u8; 8],
+        };
+        ifreq.set_sockaddr_in(&addr);
+        ifreqs.push(ifreq);
+    }
+
+    // Move "lo" to the front if it exists (some tests expect loopback first)
+    if let Some(lo_idx) = ifreqs.iter().position(|req| {
+        let name_str = core::str::from_utf8(&req.ifr_name)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        name_str == "lo"
+    }) {
+        if lo_idx > 0 {
+            let lo_ifreq = ifreqs.remove(lo_idx);
+            ifreqs.insert(0, lo_ifreq);
         }
     }
 
@@ -213,14 +283,25 @@ fn handle_siocgifconf(data: usize) -> Result<usize, SystemError> {
 impl<T: Socket + 'static> IndexNode for T {
     fn open(
         &self,
-        _: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
         _: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
-        Ok(())
+        match &*data {
+            FilePrivateData::SocketCreate => {
+                self.open_file_counter().fetch_add(1, Ordering::Release);
+                Ok(())
+            }
+            _ => Err(SystemError::ENXIO),
+        }
     }
 
     fn close(&self, _: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        self.do_close()
+        // Only tear down the socket on the final close.
+        if self.open_file_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.do_close()
+        } else {
+            Ok(())
+        }
     }
 
     fn read_at(
@@ -280,14 +361,12 @@ impl<T: Socket + 'static> IndexNode for T {
         &self,
         cmd: u32,
         data: usize,
-        _private_data: &FilePrivateData,
+        private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         match cmd {
             SIOCGIFCONF => handle_siocgifconf(data),
-            _ => {
-                log::warn!("Socket ioctl: unsupported command {:#x}", cmd);
-                Err(SystemError::ENOIOCTLCMD)
-            }
+            SIOCGIFINDEX => handle_siocgifindex(data),
+            _ => Socket::ioctl(self, cmd, data, private_data),
         }
     }
 

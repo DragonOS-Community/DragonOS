@@ -133,8 +133,8 @@ pub fn do_preadv2(
 
         let mut data = vec![0; iovecs.total_len()];
         let read_len = file.read(data.len(), &mut data)?;
-        iovecs.scatter(&data[..read_len]);
-        return Ok(read_len);
+        let copied = iovecs.scatter(&data[..read_len])?;
+        return Ok(copied);
     }
 
     // offset 为非负时，直接复用现有的 preadv 实现，保持语义一致

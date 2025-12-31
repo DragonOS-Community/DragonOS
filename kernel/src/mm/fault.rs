@@ -52,8 +52,8 @@ pub struct PageFaultMessage<'a> {
     flags: FaultFlags,
     /// 页表映射器
     mapper: &'a mut PageMapper,
-    /// 缺页的文件页在文件中的偏移页号
-    file_pgoff: Option<usize>,
+    /// 缺页的后备对象页在后备对象中的偏移页号（文件/共享匿名）
+    backing_pgoff: Option<usize>,
     /// 缺页对应PageCache中的文件页
     page: Option<Arc<Page>>,
     /// 写时拷贝需要的页面
@@ -68,14 +68,14 @@ impl<'a> PageFaultMessage<'a> {
         mapper: &'a mut PageMapper,
     ) -> Self {
         let guard = vma.lock_irqsave();
-        let file_pgoff = guard.file_page_offset().map(|file_page_offset| {
-            ((address - guard.region().start()) >> MMArch::PAGE_SHIFT) + file_page_offset
+        let backing_pgoff = guard.backing_page_offset().map(|backing_page_offset| {
+            ((address - guard.region().start()) >> MMArch::PAGE_SHIFT) + backing_page_offset
         });
         Self {
             vma: vma.clone(),
             address: VirtAddr::new(crate::libs::align::page_align_down(address.data())),
             flags,
-            file_pgoff,
+            backing_pgoff,
             page: None,
             mapper,
             cow_page: None,
@@ -245,8 +245,16 @@ impl PageFaultHandler {
             if guard.vm_flags().contains(VmFlags::VM_SHARED) {
                 let shared = guard.shared_anon.clone();
                 if let Some(shared) = shared {
-                    // compute page index within VMA
-                    let pgoff = (address - guard.region().start()) >> MMArch::PAGE_SHIFT;
+                    // Compute page index within the shared-anon backing object.
+                    // Base offset is stored in VMA.backing_pgoff.
+                    let base = guard.backing_page_offset().unwrap_or(0);
+                    let pgoff = base + ((address - guard.region().start()) >> MMArch::PAGE_SHIFT);
+
+                    // Linux semantics: access beyond the backing size should SIGBUS.
+                    if pgoff >= shared.size_pages() {
+                        drop(guard);
+                        return VmFaultReason::VM_FAULT_SIGBUS;
+                    }
                     drop(guard);
 
                     // Atomically get or create the shared page to avoid races
@@ -565,7 +573,7 @@ impl PageFaultHandler {
         let pte_pgoff = (address.data() >> MMArch::PAGE_SHIFT) & (1 << MMArch::PAGE_ENTRY_SHIFT);
 
         // 缺页在文件中的偏移量
-        let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
+        let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
 
         let vma_pages_count = (vma_region.end() - vma_region.start()) >> MMArch::PAGE_SHIFT;
 
@@ -595,11 +603,11 @@ impl PageFaultHandler {
         }
 
         let fs = pfm.vma().lock_irqsave().vm_file().unwrap().inode().fs();
-        // from_pte - pte_pgoff得出预读起始pte相对缺失页的偏移，加上pfm.file_pgoff（缺失页在文件中的偏移）得出起始页在文件中的偏移，结束pte同理
+        // from_pte - pte_pgoff得出预读起始pte相对缺失页的偏移，加上pfm.backing_pgoff（缺失页在文件中的偏移）得出起始页在文件中的偏移，结束pte同理
         fs.map_pages(
             pfm,
-            file_pgoff + (from_pte - pte_pgoff),
-            file_pgoff + (to_pte - pte_pgoff),
+            backing_pgoff + (from_pte - pte_pgoff),
+            backing_pgoff + (to_pte - pte_pgoff),
         );
 
         VmFaultReason::empty()
@@ -639,8 +647,8 @@ impl PageFaultHandler {
         let addr = vma_guard.region().start
             + ((start_pgoff
                 - vma_guard
-                    .file_page_offset()
-                    .expect("file_page_offset is none"))
+                    .backing_page_offset()
+                    .expect("backing_page_offset is none"))
                 << MMArch::PAGE_SHIFT);
 
         for pgoff in start_pgoff..end_pgoff {
@@ -684,10 +692,10 @@ impl PageFaultHandler {
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
         };
-        let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
+        let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
         let mut ret = VmFaultReason::empty();
 
-        let page = page_cache.lock_irqsave().get_page(file_pgoff);
+        let page = page_cache.lock_irqsave().get_page(backing_pgoff);
         if let Some(page) = page {
             // TODO 异步从磁盘中预读页面进PageCache
 
@@ -699,7 +707,7 @@ impl PageFaultHandler {
             ret = VmFaultReason::VM_FAULT_MAJOR;
             let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
             match file.pread(
-                file_pgoff * MMArch::PAGE_SIZE,
+                backing_pgoff * MMArch::PAGE_SIZE,
                 MMArch::PAGE_SIZE,
                 buffer.as_mut_slice(),
             ) {
@@ -712,7 +720,7 @@ impl PageFaultHandler {
                 Err(e) => {
                     log::warn!(
                         "filemap_fault: pread failed at pgoff {}, err {:?}",
-                        file_pgoff,
+                        backing_pgoff,
                         e
                     );
                     return VmFaultReason::VM_FAULT_SIGBUS;
@@ -720,7 +728,7 @@ impl PageFaultHandler {
             }
             drop(buffer);
 
-            let page = page_cache.lock_irqsave().get_page(file_pgoff);
+            let page = page_cache.lock_irqsave().get_page(backing_pgoff);
             if let Some(page) = page {
                 pfm.page = Some(page);
             } else {
@@ -752,19 +760,19 @@ impl PageFaultHandler {
             None => return VmFaultReason::VM_FAULT_SIGBUS,
         };
 
-        let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
+        let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
 
-        // 以“页起始是否越过 EOF”判断 SIGBUS。
+        // 以"页起始是否越过 EOF"判断 SIGBUS。
         // 特别地：size==0 时，任何访问都应 SIGBUS（符合 mmap 语义，且满足 gvisor death tests）。
         if let Ok(md) = inode.metadata() {
             let size = md.size.max(0) as usize;
-            if file_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
+            if backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
         }
 
         // 先尝试直接获取
-        if let Some(page) = page_cache.lock_irqsave().get_page(file_pgoff) {
+        if let Some(page) = page_cache.lock_irqsave().get_page(backing_pgoff) {
             // 标记为 UPTODATE，便于 map_pages / readahead（即便对 tmpfs 通常不会走）。
             page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);
@@ -774,10 +782,10 @@ impl PageFaultHandler {
         {
             let mut pc = page_cache.lock_irqsave();
             // 可能并发创建：create 后再 get（忽略已存在/并发导致的轻微差异）
-            pc.create_zero_pages(file_pgoff, 1).map_err(|_| ()).ok();
+            pc.create_zero_pages(backing_pgoff, 1).map_err(|_| ()).ok();
         }
 
-        let page = page_cache.lock_irqsave().get_page(file_pgoff);
+        let page = page_cache.lock_irqsave().get_page(backing_pgoff);
         if let Some(page) = page {
             page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);
@@ -848,7 +856,7 @@ impl PageFaultHandler {
     ) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock_irqsave();
-        let file_pgoff = match vma_guard.file_page_offset() {
+        let backing_pgoff = match vma_guard.backing_page_offset() {
             Some(off) => off,
             None => return VmFaultReason::VM_FAULT_SIGBUS,
         };
@@ -858,7 +866,7 @@ impl PageFaultHandler {
 
         let mapper = &mut pfm.mapper;
         for pgoff in start_pgoff..end_pgoff {
-            let addr = VirtAddr::new(base.data() + ((pgoff - file_pgoff) << MMArch::PAGE_SHIFT));
+            let addr = VirtAddr::new(base.data() + ((pgoff - backing_pgoff) << MMArch::PAGE_SHIFT));
             if let Some(flush) = mapper.map(addr, flags) {
                 flush.flush();
                 let mut pm = page_manager_lock_irqsave();

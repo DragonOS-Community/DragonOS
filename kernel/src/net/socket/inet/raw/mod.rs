@@ -1,0 +1,79 @@
+//! AF_INET/AF_INET6 SOCK_RAW 实现
+//!
+//! 提供 IP 层原始套接字支持，用于 ping、traceroute 等工具
+
+use alloc::sync::{Arc, Weak};
+use core::sync::atomic::{AtomicBool, AtomicUsize};
+
+use smoltcp::wire::{IpProtocol, IpVersion};
+
+use crate::filesystem::vfs::{fasync::FAsyncItems, InodeId};
+use crate::libs::rwlock::RwLock;
+use crate::libs::spinlock::SpinLock;
+use crate::libs::wait_queue::WaitQueue;
+use crate::net::socket::common::EPollItems;
+use crate::process::namespace::net_namespace::NetNamespace;
+
+use inner::RawInner;
+
+use self::loopback::LoopbackRxQueue;
+
+use super::InetSocket;
+
+mod constants;
+pub mod inner;
+
+mod loopback;
+mod ops;
+mod options;
+mod packet;
+mod recv;
+mod send;
+mod socket;
+mod sockopt;
+
+// 统一导出缓冲区/容量相关常量（Issue 7）。
+#[allow(unused_imports)]
+pub use constants::{SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX};
+
+#[allow(unused_imports)]
+pub use options::{Icmp6Filter, IcmpFilter, RawSocketOptions};
+
+/// InetRawSocket - AF_INET/AF_INET6 SOCK_RAW 实现
+///
+/// 提供 IP 层原始套接字功能，支持：
+/// - ICMP 协议 (ping)
+/// - 自定义协议
+/// - IP_HDRINCL 选项
+/// - ICMP_FILTER 过滤
+#[cast_to([sync] crate::net::socket::Socket)]
+#[derive(Debug)]
+pub struct RawSocket {
+    /// 内部状态
+    inner: RwLock<Option<RawInner>>,
+    /// socket 选项
+    options: RwLock<options::RawSocketOptions>,
+    /// 非阻塞标志
+    nonblock: AtomicBool,
+    /// 等待队列
+    wait_queue: WaitQueue,
+    /// inode id
+    inode_id: InodeId,
+    /// 打开文件计数
+    open_files: AtomicUsize,
+    /// 自引用
+    self_ref: Weak<Self>,
+    /// 网络命名空间
+    netns: Arc<NetNamespace>,
+    /// epoll 项
+    epoll_items: EPollItems,
+    /// fasync 项
+    fasync_items: FAsyncItems,
+    /// IP 版本
+    ip_version: IpVersion,
+    /// 协议号
+    protocol: IpProtocol,
+
+    /// 回环快速路径：用于保留 TOS/TCLASS 等字段且实现 SO_RCVBUF 行为。
+    loopback_rx: SpinLock<LoopbackRxQueue>,
+}

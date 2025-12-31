@@ -8,6 +8,7 @@ use crate::net::routing::Router;
 use crate::net::socket::netlink::table::{
     generate_supported_netlink_kernel_sockets, NetlinkKernelSocket, NetlinkSocketTable,
 };
+use crate::net::socket::unix::ns::UnixAbstractTable;
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
 use crate::process::namespace::{NamespaceOps, NamespaceType};
@@ -80,6 +81,9 @@ pub struct NetNamespace {
     /// # 当前网络命名空间下的 Netlink 内核套接字
     /// 负责接收并处理 Netlink 消息
     netlink_kernel_socket: RwLock<HashMap<u32, Arc<dyn NetlinkKernelSocket>>>,
+
+    /// AF_UNIX abstract namespace table (scoped to this netns).
+    unix_abstract_table: Arc<UnixAbstractTable>,
 }
 
 #[derive(Debug)]
@@ -111,8 +115,11 @@ impl NetNamespace {
             default_iface: None,
         };
 
+        let ns_common = NsCommon::new(0, NamespaceType::Net);
+        let unix_abstract_table = UnixAbstractTable::new(ns_common.nsid.data());
+
         let netns = Arc::new_cyclic(|self_ref| Self {
-            ns_common: NsCommon::new(0, NamespaceType::Net),
+            ns_common: ns_common.clone(),
             self_ref: self_ref.clone(),
             _user_ns: crate::process::namespace::user_namespace::INIT_USER_NAMESPACE.clone(),
             inner: RwLock::new(inner),
@@ -121,6 +128,7 @@ impl NetNamespace {
             bridge_list: RwLock::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
+            unix_abstract_table: unix_abstract_table.clone(),
         });
 
         // Self::create_polling_thread(netns.clone(), "netns_root".to_string());
@@ -138,8 +146,11 @@ impl NetNamespace {
             default_iface: None,
         };
 
+        let ns_common = NsCommon::new(0, NamespaceType::Net);
+        let unix_abstract_table = UnixAbstractTable::new(ns_common.nsid.data());
+
         let netns = Arc::new_cyclic(|self_ref| Self {
-            ns_common: NsCommon::new(0, NamespaceType::Net),
+            ns_common: ns_common.clone(),
             self_ref: self_ref.clone(),
             _user_ns: user_ns,
             inner: RwLock::new(inner),
@@ -148,6 +159,7 @@ impl NetNamespace {
             bridge_list: RwLock::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
+            unix_abstract_table: unix_abstract_table.clone(),
         });
         Self::create_polling_thread(netns.clone(), format!("netns_{}", counter));
         netns.add_device(loopback);
@@ -205,6 +217,10 @@ impl NetNamespace {
 
     pub fn netlink_socket_table(&self) -> &NetlinkSocketTable {
         &self.netlink_socket_table
+    }
+
+    pub fn unix_abstract_table(&self) -> &Arc<UnixAbstractTable> {
+        &self.unix_abstract_table
     }
 
     pub fn get_netlink_kernel_socket_by_protocol(

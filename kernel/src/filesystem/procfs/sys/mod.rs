@@ -1,39 +1,59 @@
+//! /proc/sys - 系统控制目录
+//!
+//! 提供类似 Linux 的 /proc/sys 接口，支持动态配置内核参数
+
+mod kernel;
+
 use crate::filesystem::{
-    procfs::{ProcFS, ProcFileCreationParams, ProcFileType},
-    vfs::{FileSystem, FileType, InodeMode},
+    procfs::template::{DirOps, ProcDir, ProcDirBuilder},
+    vfs::{IndexNode, InodeMode},
 };
+use alloc::{
+    string::ToString,
+    sync::{Arc, Weak},
+};
+use kernel::KernelDirOps;
+use system_error::SystemError;
 
-pub mod sysctl;
+use super::Builder;
 
-impl ProcFS {
-    /// @brief 创建 /proc/sys 目录结构及相关文件
-    #[inline(never)]
-    pub(super) fn create_sysctl_files(&self) {
-        // Create /proc/sys directory
-        let sys_dir = self
-            .root_inode()
-            .create("sys", FileType::Dir, InodeMode::from_bits_truncate(0o555))
-            .unwrap_or_else(|_| panic!("create /proc/sys error"));
+/// /proc/sys 目录的 DirOps 实现
+#[derive(Debug)]
+pub struct SysDirOps;
 
-        // Create /proc/sys/kernel directory
-        let kernel_dir = sys_dir
-            .create(
-                "kernel",
-                FileType::Dir,
-                InodeMode::from_bits_truncate(0o555),
-            )
-            .unwrap_or_else(|_| panic!("create /proc/sys/kernel error"));
-
-        // Create /proc/sys/kernel/printk file
-        let printk_params = ProcFileCreationParams::builder()
-            .parent(kernel_dir)
-            .name("printk")
-            .file_type(FileType::File)
-            .mode(InodeMode::from_bits_truncate(0o644))
-            .ftype(ProcFileType::ProcSysKernelPrintk)
+impl SysDirOps {
+    pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
+            .parent(parent)
             .build()
-            .unwrap();
-        self.create_proc_file(printk_params)
-            .unwrap_or_else(|_| panic!("create /proc/sys/kernel/printk error"));
+            .unwrap()
+    }
+}
+
+impl DirOps for SysDirOps {
+    fn lookup_child(
+        &self,
+        dir: &ProcDir<Self>,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if name == "kernel" {
+            let mut cached_children = dir.cached_children().write();
+            if let Some(child) = cached_children.get(name) {
+                return Ok(child.clone());
+            }
+
+            let inode = KernelDirOps::new_inode(dir.self_ref_weak().clone());
+            cached_children.insert(name.to_string(), inode.clone());
+            return Ok(inode);
+        }
+
+        Err(SystemError::ENOENT)
+    }
+
+    fn populate_children(&self, dir: &ProcDir<Self>) {
+        let mut cached_children = dir.cached_children().write();
+        cached_children
+            .entry("kernel".to_string())
+            .or_insert_with(|| KernelDirOps::new_inode(dir.self_ref_weak().clone()));
     }
 }

@@ -31,6 +31,7 @@ fchdir_test
 pread64_test
 rename_test
 getdents_test
+readv_test
 preadv_test
 pwrite64_test
 pwritev2_test
@@ -39,6 +40,9 @@ truncate_test
 fadvise_test
 open_test
 open_create_test
+select_test
+pselect_test
+epoll_test
 
 # 进程相关测试
 fork_test
@@ -56,19 +60,39 @@ prctl_test
 exit_test
 setns_test
 eventfd_test
+poll_test
+rseq_test
+
 
 # 内存管理测试
 mmap_test
+munmap_test
+mremap_test
 brk_test
 mincore_test
 madvise_test
 
 # 网络相关测试
-#bind_test
+bind_test
 #connect_test
 #listen_test
 socket_test
 udp_socket_test
+
+# unix socket相关的测试
+socket_unix_dgram_local_test
+socket_unix_dgram_non_blocking_test
+socket_unix_pair_test
+socket_unix_seqpacket_local_test
+socket_unix_unbound_seqpacket_test
+socket_unix_stream_test
+socket_unix_unbound_abstract_test
+socket_unix_unbound_dgram_test
+socket_unix_unbound_filesystem_test
+socket_unix_unbound_stream_test
+raw_socket_test
+raw_socket_icmp_test
+raw_socket_hdrincl_test
 
 # 信号处理测试
 sigaction_test
@@ -76,6 +100,8 @@ sigprocmask_test
 sigaltstack_test
 sigreturn_test
 sigtimedwait_test
+rtsignal_test
+signalfd_test
 
 # 其他测试
 itimer_test
@@ -86,3 +112,9 @@ pty_root_test
 time_test
 timers_test
 clock_nanosleep_test
+clock_getres_test
+clock_gettime_test
+setgid_test
+uidgid_test
+partitial_bad_buffer_test
+

@@ -8,7 +8,7 @@ use system_error::SystemError;
 use x86::dtables::DescriptorTablePointer;
 
 use crate::{
-    arch::{interrupt::trap::arch_trap_init, process::table::TSSManager},
+    arch::{fpu::FpState, interrupt::trap::arch_trap_init, process::table::TSSManager},
     driver::clocksource::acpi_pm::init_acpi_pm_clocksource,
     init::init::start_kernel,
     mm::{MemoryManagementArch, PhysAddr},
@@ -79,6 +79,9 @@ unsafe extern "C" fn kernel_main(
 #[inline(never)]
 #[allow(static_mut_refs)]
 pub fn early_setup_arch() -> Result<(), SystemError> {
+    // 初始化 XSAVE 支持（必须在任何 FPU 状态保存/恢复之前）
+    FpState::init_xsave_support();
+
     let stack_start = unsafe { *(head_stack_start as *const u64) } as usize;
     debug!("head_stack_start={:#x}\n", stack_start);
     unsafe {

@@ -11,7 +11,7 @@ pub mod syscall;
 pub mod utils;
 pub mod vcore;
 
-use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
+use ::core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
@@ -51,6 +51,12 @@ pub const NAME_MAX: usize = 255;
 
 // 定义inode号
 int_like!(InodeId, AtomicInodeId, usize, AtomicUsize);
+
+impl Display for InodeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -645,7 +651,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn as_any_ref(&self) -> &dyn Any;
 
     /// @brief 列出当前inode下的所有目录项的名字
-    fn list(&self) -> Result<Vec<String>, SystemError>;
+    fn list(&self) -> Result<Vec<String>, SystemError> {
+        Err(SystemError::ENOTDIR)
+    }
 
     /// # mount - 挂载文件系统
     ///
@@ -1573,14 +1581,6 @@ impl<'a> FilldirContext<'a> {
 
         // 获取当前写入位置的偏移量
         let buf_start = self.current_pos;
-        // 清零缓冲区（确保对齐部分为0）
-        // 如果清零失败（例如访问不可写页面），视为缓冲区空间不足
-        if let Err(_e) = self.user_buf.clear_range(buf_start, align_up_reclen) {
-            // 将 EFAULT 或其他写入错误转换为 EINVAL，表示缓冲区空间不足
-            // 这样 read_dir 会正常返回，而不是传播错误
-            self.error = Some(SystemError::EINVAL);
-            return Err(SystemError::EINVAL);
-        }
         // 在内核空间构建完整的 dirent 数据
         let mut dirent_data = vec![0u8; align_up_reclen];
 
@@ -1634,12 +1634,10 @@ impl<'a> FilldirContext<'a> {
             }
         }
         // 使用受保护的方法写入用户缓冲区
-        // 如果写入失败（例如访问不可写页面），视为缓冲区空间不足
+        // 如果写入失败（例如访问不可写页面），应当返回 EFAULT
         if let Err(_e) = self.user_buf.write_to_user(buf_start, &dirent_data) {
-            // 将 EFAULT 或其他写入错误转换为 EINVAL，表示缓冲区空间不足
-            // 这样 read_dir 会正常返回，而不是传播错误
-            self.error = Some(SystemError::EINVAL);
-            return Err(SystemError::EINVAL);
+            self.error = Some(SystemError::EFAULT);
+            return Err(SystemError::EFAULT);
         }
         // 更新位置
         self.current_pos += align_up_reclen;

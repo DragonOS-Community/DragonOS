@@ -87,7 +87,7 @@ impl LockedVMA {
         } else {
             let guard = self.lock_irqsave();
             let pgoff = ((start_addr - guard.region().start()) >> MMArch::PAGE_SHIFT)
-                + guard.file_page_offset().unwrap();
+                + guard.backing_page_offset().unwrap();
             if guard.vm_file().is_none() {
                 vec[vec_offset..vec_offset + nr].fill(0);
                 return nr;

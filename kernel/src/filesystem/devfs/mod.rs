@@ -207,6 +207,9 @@ impl DevFS {
                 } else if name == "ptmx" {
                     // ptmx设备
                     dev_root_inode.add_dev(name, device.clone())?;
+                } else if name == "loop-control" {
+                    // loop-control设备
+                    dev_root_inode.add_dev(name, device.clone())?;
                 } else {
                     // 在 /dev/char 下创建设备节点
                     dev_char_inode.add_dev(name, device.clone())?;
@@ -242,6 +245,13 @@ impl DevFS {
                     dev_block_inode.add_dev_symlink(&path, &symlink_name)?;
                 } else if name.starts_with("nvme") {
                     // NVMe设备挂载在 /dev 下
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else if name.starts_with("loop")
+                    && name.len() > 4
+                    && name[4..].chars().all(|c| c.is_ascii_digit())
+                {
+                    // loop块设备 (loop0, loop1, ...) 挂载在 /dev 下
+                    // 注意：不能简单用 starts_with("loop")，因为会与网络 loopback 设备冲突
                     dev_root_inode.add_dev(name, device.clone())?;
                 } else {
                     dev_block_inode.add_dev(name, device.clone())?;
@@ -287,17 +297,26 @@ impl DevFS {
                 dev_char_inode.remove(name)?;
             }
             FileType::BlockDevice => {
-                if dev_root_inode.find("block").is_err() {
-                    return Err(SystemError::ENOENT);
+                // 检查是否是 loop 块设备 (loop0, loop1, ...)
+                let is_loop_block_device = name.starts_with("loop")
+                    && name.len() > 4
+                    && name[4..].chars().all(|c| c.is_ascii_digit());
+
+                if is_loop_block_device {
+                    dev_root_inode.remove(name)?;
+                } else {
+                    if dev_root_inode.find("block").is_err() {
+                        return Err(SystemError::ENOENT);
+                    }
+
+                    let any_block_inode = dev_root_inode.find("block")?;
+                    let dev_block_inode = any_block_inode
+                        .as_any_ref()
+                        .downcast_ref::<LockedDevFSInode>()
+                        .unwrap();
+
+                    dev_block_inode.remove(name)?;
                 }
-
-                let any_block_inode = dev_root_inode.find("block")?;
-                let dev_block_inode = any_block_inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedDevFSInode>()
-                    .unwrap();
-
-                dev_block_inode.remove(name)?;
             }
             _ => {
                 return Err(SystemError::ENOSYS);

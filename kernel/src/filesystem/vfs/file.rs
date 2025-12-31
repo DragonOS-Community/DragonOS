@@ -8,13 +8,15 @@ use log::error;
 use system_error::SystemError;
 
 use super::{
-    append_lock::with_inode_append_lock, FileType, IndexNode, InodeId, Metadata, SpecialNodeData,
+    append_lock::with_inode_append_lock, utils::should_remove_sgid, FileType, IndexNode, InodeId,
+    Metadata, SpecialNodeData,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
     arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
+        block::loop_device::LoopPrivateData,
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::{
@@ -30,7 +32,7 @@ use crate::{
         MemoryManagementArch,
     },
     process::{
-        cred::Cred,
+        cred::{CAPFlags, Cred},
         namespace::{
             cgroup_namespace::CgroupNamespace, ipc_namespace::IpcNamespace, mnt::MntNamespace,
             net_namespace::NetNamespace, pid_namespace::PidNamespace,
@@ -40,6 +42,8 @@ use crate::{
         ProcessControlBlock, ProcessManager, RawPid,
     },
 };
+
+use crate::filesystem::vfs::InodeMode;
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
 
@@ -116,8 +120,12 @@ pub enum FilePrivateData {
     EPoll(EPollPrivateData),
     /// pid私有信息
     Pid(PidPrivateData),
+    //loop私有信息
+    Loop(LoopPrivateData),
     /// namespace fd 私有信息（/proc/thread-self/ns/* 打开后得到）
     Namespace(NamespaceFilePrivateData),
+    /// Socket file created by socket syscalls (not by VFS open(2)).
+    SocketCreate,
     /// 不需要文件私有信息
     Unused,
 }
@@ -396,6 +404,37 @@ pub struct File {
 }
 
 impl File {
+    fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
+        // 仅对普通文件生效。
+        if self.file_type != FileType::File {
+            return Ok(());
+        }
+
+        // Linux 语义：若调用者具备 CAP_FSETID，则写/截断不会清除 suid/sgid。
+        let cred = ProcessManager::current_pcb().cred();
+        if cred.has_capability(CAPFlags::CAP_FSETID) {
+            return Ok(());
+        }
+
+        let mut md = self.inode.metadata()?;
+        if !md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID) {
+            return Ok(());
+        }
+
+        // suid always must be killed on write/truncate when no CAP_FSETID.
+        md.mode.remove(InodeMode::S_ISUID);
+
+        // setgid 清理规则与 Linux fs/attr.c:setattr_should_drop_sgid 对齐：
+        // - 若 S_IXGRP 置位：无条件清除（这是"真正的"SGID 可执行文件）
+        // - 否则（mandatory locking 语义）：仅当调用者不在文件所属组时清除
+        if should_remove_sgid(md.mode, md.gid, &cred) {
+            md.mode.remove(InodeMode::S_ISGID);
+        }
+
+        self.inode.set_metadata(&md)?;
+        Ok(())
+    }
+
     #[inline(never)]
     fn limit_write_len_by_fsize(
         &self,
@@ -462,6 +501,10 @@ impl File {
             self.inode
                 .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
 
+        if written_len > 0 {
+            self.maybe_kill_suid_sgid_after_write()?;
+        }
+
         if config.update_offset {
             match config.offset_update {
                 OffsetUpdate::StoreEnd => {
@@ -484,7 +527,19 @@ impl File {
     ///
     /// @param inode 文件对象对应的inode
     /// @param flags 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mut flags: FileFlags) -> Result<Self, SystemError> {
+    pub fn new(inode: Arc<dyn IndexNode>, flags: FileFlags) -> Result<Self, SystemError> {
+        Self::new_with_private_data(inode, flags, FilePrivateData::default())
+    }
+
+    /// Create a new file object with an explicit initial FilePrivateData.
+    ///
+    /// This is primarily used for objects that are not created via VFS open(2)
+    /// semantics (e.g. sockets created by socket syscalls).
+    pub fn new_with_private_data(
+        inode: Arc<dyn IndexNode>,
+        mut flags: FileFlags,
+        private_data_init: FilePrivateData,
+    ) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
         // 检查是否为命名管道（FIFO）
@@ -514,7 +569,7 @@ impl File {
 
         let mut mode = FileMode::open_fmode(flags);
 
-        let private_data = SpinLock::new(FilePrivateData::default());
+        let private_data = SpinLock::new(private_data_init);
         inode.open(private_data.lock(), &flags)?;
 
         // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
@@ -563,6 +618,13 @@ impl File {
         };
 
         return Ok(f);
+    }
+
+    /// Create a file object for sockets created by socket syscalls.
+    ///
+    /// These should not be subject to open(2) pathname semantics.
+    pub fn new_socket(inode: Arc<dyn IndexNode>, flags: FileFlags) -> Result<Self, SystemError> {
+        Self::new_with_private_data(inode, flags, FilePrivateData::SocketCreate)
     }
 
     /// ## 从文件中读取指定的字节数到buffer中
@@ -1093,6 +1155,27 @@ impl File {
         return self.file_type;
     }
 
+    /// 检查文件是否为普通文件或目录
+    ///
+    /// 用于 poll(2)/epoll 的"总是就绪"判断。
+    /// Linux 语义：普通文件和目录的 I/O 操作不会阻塞，因此它们在 poll 中总是可读/可写的。
+    #[inline]
+    pub fn is_regular_file_or_dir(&self) -> bool {
+        matches!(self.file_type, FileType::File | FileType::Dir)
+    }
+
+    /// 检查文件是否为"总是就绪"类型（用于 epoll）
+    ///
+    /// 满足以下条件的文件总是就绪：
+    /// 1. 文件类型为普通文件或目录
+    /// 2. 文件不支持 poll 操作
+    ///
+    /// Linux 语义：普通文件和目录的 I/O 操作不会阻塞，因此它们总是可读/可写的。
+    /// 参考 Linux 内核的 DEFAULT_POLLMASK
+    pub fn is_always_ready(&self) -> bool {
+        !self.supports_poll() && self.is_regular_file_or_dir()
+    }
+
     /// @brief 获取文件的打开模式
     #[inline]
     pub fn flags(&self) -> FileFlags {
@@ -1204,6 +1287,12 @@ impl File {
     pub fn poll(&self) -> Result<usize, SystemError> {
         let private_data = self.private_data.lock();
         self.inode.as_pollable_inode()?.poll(&private_data)
+    }
+
+    /// 检查文件是否支持 poll 操作
+    #[inline]
+    pub fn supports_poll(&self) -> bool {
+        self.inode.as_pollable_inode().is_ok()
     }
 
     pub fn owner(&self) -> Option<RawPid> {

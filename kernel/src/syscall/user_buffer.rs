@@ -3,6 +3,7 @@
 //! 提供对用户空间缓冲区的安全访问接口，所有操作都通过异常表保护
 
 use crate::mm::VirtAddr;
+use num::traits::FromBytes;
 use system_error::SystemError;
 
 /// 用户空间缓冲区的安全包装
@@ -59,7 +60,8 @@ impl<'a> UserBuffer<'a> {
     /// - `Ok(len)`: 成功读取的字节数
     /// - `Err(SystemError)`: 读取失败（如地址不在VMA中）
     pub fn read_from_user(&self, offset: usize, dst: &mut [u8]) -> Result<usize, SystemError> {
-        if offset >= self.len {
+        // offset == src.len is valid, as long as don't try to dereference it in &src[offset..]
+        if offset > self.len {
             return Err(SystemError::EINVAL);
         }
 
@@ -87,7 +89,8 @@ impl<'a> UserBuffer<'a> {
     /// - `Ok(len)`: 成功写入的字节数
     /// - `Err(SystemError)`: 写入失败（如地址不在VMA中）
     pub fn write_to_user(&mut self, offset: usize, src: &[u8]) -> Result<usize, SystemError> {
-        if offset >= self.len {
+        // offset == src.len is valid, as long as don't try to dereference it in &src[offset..]
+        if offset > self.len {
             return Err(SystemError::EINVAL);
         }
 
@@ -182,6 +185,35 @@ impl<'a> UserBuffer<'a> {
     /// - `Err(SystemError)`: 写入失败
     pub fn write_all(&mut self, data: &[u8]) -> Result<usize, SystemError> {
         self.write_to_user(0, data)
+    }
+
+    /// 从用户缓冲区读取一个 Number 类型, Native Endian
+    /// ## Example
+    /// ```
+    /// let buffer = UserBuffer::new(vec![0u8; 4]);
+    /// let value: u32 = buffer.read_ne_byte(0).unwrap();
+    /// assert_eq!(value, 0);
+    /// ```
+    #[inline(always)]
+    pub fn read_ne_byte<T: FromBytes>(&self, offset: usize) -> Result<T, SystemError> {
+        self.read_one(offset)
+    }
+
+    /// 从用户缓冲区写入一个 Number 类型, Native Endian
+    /// ## Example
+    /// ```
+    /// let buffer = UserBuffer::new(vec![0u8; 4]);
+    /// buffer.write_ne_byte(0, 0x12345678).unwrap();
+    /// let value: u32 = buffer.read_ne_byte(0).unwrap();
+    /// assert_eq!(value, 0x12345678);
+    /// ```
+    #[inline(always)]
+    pub fn write_ne_byte<T: FromBytes>(
+        &mut self,
+        offset: usize,
+        value: T,
+    ) -> Result<(), SystemError> {
+        self.write_one(offset, &value)
     }
 
     /// 将用户缓冲区的指定范围清零

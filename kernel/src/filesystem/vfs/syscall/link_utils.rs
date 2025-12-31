@@ -1,3 +1,5 @@
+use crate::filesystem::notify::inotify::uapi::{InotifyCookie, InotifyMask};
+use crate::filesystem::notify::inotify::{report, report_dir_entry, InodeKey};
 use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
@@ -7,6 +9,7 @@ use crate::filesystem::vfs::SystemError;
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::process::ProcessManager;
 use alloc::sync::Arc;
+
 /// **创建硬连接的系统调用**
 ///    
 /// ## 参数
@@ -68,5 +71,23 @@ pub fn do_linkat(
         new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or("/"), symlink_times)?;
 
     // 被调用者利用downcast_ref判断两inode是否为同一文件系统
-    return new_parent.link(new_name, &old_inode).map(|_| 0);
+    let ret = new_parent.link(new_name, &old_inode).map(|_| 0);
+    if ret.is_ok() {
+        if let Ok(old_md) = old_inode.metadata() {
+            report(
+                InodeKey::new(old_md.dev_id, old_md.inode_id.data()),
+                InotifyMask::IN_ATTRIB,
+            );
+        }
+        if let Ok(parent_md) = new_parent.metadata() {
+            report_dir_entry(
+                InodeKey::new(parent_md.dev_id, parent_md.inode_id.data()),
+                InotifyMask::IN_CREATE,
+                InotifyCookie(0),
+                new_name,
+                false,
+            );
+        }
+    }
+    ret
 }

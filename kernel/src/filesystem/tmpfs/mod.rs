@@ -29,6 +29,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use hashbrown::HashMap;
 use system_error::SystemError;
 
 use super::vfs::{
@@ -43,8 +44,8 @@ use super::vfs::{Magic, MountableFileSystem, SuperBlock};
 const TMPFS_MAX_NAMELEN: usize = 255;
 const TMPFS_BLOCK_SIZE: u64 = 4096;
 
-const TMPFS_DEFAULT_MIN_SIZE_BYTES: usize = 16 * 1024 * 1024; // 16MiB
-const TMPFS_DEFAULT_MAX_SIZE_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4GiB
+const TMPFS_DEFAULT_MIN_SIZE_BYTES: usize = 512 * 1024 * 1024; // 512MiB
+const TMPFS_DEFAULT_MAX_SIZE_BYTES: usize = 16 * 1024 * 1024 * 1024; // 16GiB
 
 fn tmpfs_move_entry_between_dirs(
     src_dir: &mut TmpfsInode,
@@ -156,6 +157,7 @@ pub struct TmpfsInode {
     fs: Weak<Tmpfs>,
     special_node: Option<SpecialNodeData>,
     name: DName,
+    xattrs: HashMap<String, Vec<u8>>,
 }
 
 impl TmpfsInode {
@@ -186,6 +188,7 @@ impl TmpfsInode {
             fs: Weak::default(),
             special_node: None,
             name: Default::default(),
+            xattrs: HashMap::new(),
         }
     }
 }
@@ -590,8 +593,10 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let mut items: Vec<WriteItem> = Vec::new();
-        {
+        let alloc_result = {
             let mut page_cache_guard = page_cache.lock_irqsave();
+            let mut result = Ok(());
+
             for page_index in start_page_index..=end_page_index {
                 let page_start = page_index * MMArch::PAGE_SIZE;
                 let page_end = page_start + MMArch::PAGE_SIZE;
@@ -606,10 +611,13 @@ impl IndexNode for LockedTmpfsInode {
                 let page = if let Some(page) = page_cache_guard.get_page(page_index) {
                     page
                 } else {
-                    page_cache_guard.create_zero_pages(page_index, 1)?;
-                    page_cache_guard
-                        .get_page(page_index)
-                        .ok_or(SystemError::EIO)?
+                    match page_cache_guard.create_zero_pages(page_index, 1) {
+                        Ok(()) => page_cache_guard.get_page(page_index).ok_or(SystemError::EIO)?,
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
                 };
 
                 items.push(WriteItem {
@@ -618,7 +626,16 @@ impl IndexNode for LockedTmpfsInode {
                     sub_len: page_write_len,
                 });
             }
+            result
+        };
+
+        // 如果页分配失败，需要回滚 current_size
+        if alloc_result.is_err() && size_diff > 0 {
+            tmpfs.decrease_size(size_diff as usize);
+            return Err(alloc_result.err().unwrap());
         }
+
+        alloc_result?;
 
         let mut src_off = 0usize;
         for it in items {
@@ -692,20 +709,90 @@ impl IndexNode for LockedTmpfsInode {
             }
 
             // 调整页缓存（会释放多余页，并截断最后一页）
-            if let Some(pc) = inode.page_cache.clone() {
-                pc.lock_irqsave().resize(len)?;
+            let resize_result = if let Some(pc) = inode.page_cache.clone() {
+                pc.lock_irqsave().resize(len)
+            } else {
+                Ok(())
+            };
+
+            // 根据调整结果和大小变化，正确处理 current_size
+            match (&resize_result, size_diff) {
+                (Err(e), size_diff_inc) if size_diff_inc > 0 => {
+                    // 扩大失败：需要回滚 current_size
+                    tmpfs.decrease_size(size_diff_inc as usize);
+                    return Err(e.clone());
+                }
+                (Ok(()), size_diff_dec) if size_diff_dec < 0 => {
+                    // 缩小成功：减少 current_size
+                    tmpfs.decrease_size((-size_diff_dec) as usize);
+                }
+                _ => {
+                    // 其他情况（扩大成功、缩小失败、大小不变）：无需额外处理
+                }
             }
 
-            // 如果缩小，减少current_size
-            if size_diff < 0 {
-                tmpfs.decrease_size((-size_diff) as usize);
-            }
-
+            // 只有页缓存调整成功后才更新文件大小
+            resize_result?;
             inode.metadata.size = len as i64;
 
             Ok(())
         } else {
             Err(SystemError::EINVAL)
+        }
+    }
+
+    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let inode = self.0.lock();
+        if let Some(data) = inode.xattrs.get(name) {
+            let len = data.len();
+            if buf.len() < len {
+                return Err(SystemError::ERANGE);
+            }
+            buf[..len].copy_from_slice(data);
+            Ok(len)
+        } else {
+            Err(SystemError::ENODATA)
+        }
+    }
+
+    fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+        let mut inode = self.0.lock();
+        inode.xattrs.insert(String::from(name), value.to_vec());
+        Ok(0)
+    }
+
+    fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let inode = self.0.lock();
+        let mut size = 0;
+        for key in inode.xattrs.keys() {
+            size += key.len() + 1;
+        }
+
+        if buf.is_empty() {
+            return Ok(size);
+        }
+
+        if buf.len() < size {
+            return Err(SystemError::ERANGE);
+        }
+
+        let mut offset = 0;
+        for key in inode.xattrs.keys() {
+            let key_bytes = key.as_bytes();
+            let len = key_bytes.len();
+            buf[offset..offset + len].copy_from_slice(key_bytes);
+            buf[offset + len] = 0;
+            offset += len + 1;
+        }
+        Ok(size)
+    }
+
+    fn removexattr(&self, name: &str) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        if inode.xattrs.remove(name).is_some() {
+            Ok(())
+        } else {
+            Err(SystemError::ENODATA)
         }
     }
 
@@ -751,6 +838,7 @@ impl IndexNode for LockedTmpfsInode {
             fs: inode.fs.clone(),
             special_node: None,
             name: name.clone(),
+            xattrs: HashMap::new(),
         })));
 
         result.0.lock().self_ref = Arc::downgrade(&result);
@@ -1096,6 +1184,7 @@ impl IndexNode for LockedTmpfsInode {
             fs: inode.fs.clone(),
             special_node: None,
             name: filename.clone(),
+            xattrs: HashMap::new(),
         })));
 
         nod.0.lock().self_ref = Arc::downgrade(&nod);

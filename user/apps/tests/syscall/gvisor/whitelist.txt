@@ -43,6 +43,7 @@ open_create_test
 select_test
 pselect_test
 epoll_test
+inotify_test
 
 # 进程相关测试
 fork_test

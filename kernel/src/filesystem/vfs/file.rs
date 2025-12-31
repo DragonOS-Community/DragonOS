@@ -11,6 +11,8 @@ use super::{
     append_lock::with_inode_append_lock, utils::should_remove_sgid, FileType, IndexNode, InodeId,
     Metadata, SpecialNodeData,
 };
+use crate::filesystem::notify::inotify::uapi::{InotifyCookie, InotifyMask};
+use crate::filesystem::notify::inotify::{report, report_dir_entry, InodeKey};
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
     arch::MMArch,
@@ -401,9 +403,55 @@ pub struct File {
     pid: SpinLock<Option<Arc<ProcessControlBlock>>>,
     /// 预读状态
     ra_state: SpinLock<FileReadaheadState>,
+
+    /// inotify 目录 watch 需要 name 字段（basename）。
+    /// 仅通过 fd（read/write/close）无法反查路径，因此在 open() 时缓存。
+    inotify_ctx: SpinLock<Option<Arc<InotifyWrapper>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InotifyFileCtx {
+    pub(crate) inode_key: InodeKey,
+    pub(crate) parent_key: Option<InodeKey>,
+    pub(crate) basename: Option<String>,
+    pub(crate) is_dir: bool,
+    pub(crate) writable: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct InotifyWrapper {
+    pub(crate) ctx: InotifyFileCtx,
+}
+
+impl Drop for InotifyWrapper {
+    fn drop(&mut self) {
+        let ctx = &self.ctx;
+        let mut close_mask = if ctx.writable {
+            InotifyMask::IN_CLOSE_WRITE
+        } else {
+            InotifyMask::IN_CLOSE_NOWRITE
+        };
+
+        if ctx.is_dir {
+            close_mask |= InotifyMask::IN_ISDIR;
+        }
+
+        if let (Some(parent), Some(name)) = (ctx.parent_key, ctx.basename.as_deref()) {
+            report_dir_entry(parent, close_mask, InotifyCookie(0), name, ctx.is_dir);
+        }
+        report(ctx.inode_key, close_mask);
+    }
 }
 
 impl File {
+    pub(crate) fn set_inotify_ctx(&self, ctx: InotifyFileCtx) {
+        *self.inotify_ctx.lock() = Some(Arc::new(InotifyWrapper { ctx }));
+    }
+
+    pub(crate) fn inotify_ctx_snapshot(&self) -> Option<InotifyFileCtx> {
+        self.inotify_ctx.lock().as_ref().map(|w| w.ctx.clone())
+    }
+
     fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
         // 仅对普通文件生效。
         if self.file_type != FileType::File {
@@ -521,8 +569,31 @@ impl File {
         }
 
         self.maybe_sync_after_write(config.flags, config.inode_flags)?;
+
+        if written_len > 0 {
+            // 目录 watch 的 IN_MODIFY 需要 name。
+            if let Some(ctx) = self.inotify_ctx_snapshot() {
+                if let (Some(parent), Some(name)) = (ctx.parent_key, ctx.basename.as_deref()) {
+                    report_dir_entry(
+                        parent,
+                        InotifyMask::IN_MODIFY,
+                        InotifyCookie(0),
+                        name,
+                        ctx.is_dir,
+                    );
+                }
+            }
+
+            if let Ok(md) = self.inode.metadata() {
+                report(
+                    InodeKey::new(md.dev_id, md.inode_id.data()),
+                    InotifyMask::IN_MODIFY,
+                );
+            }
+        }
         Ok(written_len)
     }
+
     /// @brief 创建一个新的文件对象
     ///
     /// @param inode 文件对象对应的inode
@@ -615,6 +686,7 @@ impl File {
             close_on_exec: AtomicBool::new(close_on_exec),
             pid: SpinLock::new(None),
             ra_state: SpinLock::new(FileReadaheadState::new()),
+            inotify_ctx: SpinLock::new(None),
         };
 
         return Ok(f);
@@ -847,7 +919,7 @@ impl File {
             self.file_readahead(offset, len)?;
         }
 
-        let len = if self.flags().contains(FileFlags::O_DIRECT) {
+        let read_len = if self.flags().contains(FileFlags::O_DIRECT) {
             self.inode
                 .read_direct(offset, len, buf, self.private_data.lock())
         } else {
@@ -855,16 +927,34 @@ impl File {
                 .read_at(offset, len, buf, self.private_data.lock())
         }?;
 
-        if len > 0 {
-            let last_page_readed = (offset + len - 1) >> MMArch::PAGE_SHIFT;
+        if read_len > 0 {
+            let last_page_readed = (offset + read_len - 1) >> MMArch::PAGE_SHIFT;
             self.ra_state.lock().prev_index = last_page_readed as i64;
         }
 
         if update_offset {
             self.offset
-                .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
+                .fetch_add(read_len, core::sync::atomic::Ordering::SeqCst);
         }
-        Ok(len)
+
+        // gvisor 语义：只有实际读到数据（read_len > 0）才产生 IN_ACCESS。
+        if read_len > 0 {
+            if let Some(ctx) = self.inotify_ctx_snapshot() {
+                if let (Some(parent), Some(name)) = (ctx.parent_key, ctx.basename.as_deref()) {
+                    report_dir_entry(
+                        parent,
+                        InotifyMask::IN_ACCESS,
+                        InotifyCookie(0),
+                        name,
+                        ctx.is_dir,
+                    );
+                }
+                // 对文件本身的 watch（无 name）也需要投递。
+                report(ctx.inode_key, InotifyMask::IN_ACCESS);
+            }
+        }
+
+        Ok(read_len)
     }
 
     pub fn do_write(
@@ -1079,6 +1169,15 @@ impl File {
         drop(cached_names);
 
         let subdirs_name_len = readdir_subdirs_name.len();
+        if subdirs_name_len > 0 {
+            // Report IN_ACCESS on directory
+            let md = inode.metadata()?;
+            report(
+                InodeKey::new(md.dev_id, md.inode_id.data()),
+                InotifyMask::IN_ACCESS | InotifyMask::IN_ISDIR,
+            );
+        }
+
         while current_pos < subdirs_name_len {
             let name = &readdir_subdirs_name[current_pos];
             let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
@@ -1135,6 +1234,7 @@ impl File {
             close_on_exec: AtomicBool::new(self.close_on_exec.load(Ordering::SeqCst)),
             pid: SpinLock::new(None),
             ra_state: SpinLock::new(self.ra_state.lock().clone()),
+            inotify_ctx: SpinLock::new(self.inotify_ctx.lock().clone()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design
@@ -1263,7 +1363,29 @@ impl File {
         }
 
         // 统一通过 VFS 封装，复用类型/只读检查
-        crate::filesystem::vfs::vcore::vfs_truncate(self.inode(), len)?;
+        let old_size = crate::filesystem::vfs::vcore::vfs_truncate_no_event(self.inode(), len)?;
+
+        if old_size != len as u64 {
+            // Report to parent first (Linux order)
+            if let Some(ctx) = self.inotify_ctx_snapshot() {
+                if let (Some(parent), Some(name)) = (ctx.parent_key, ctx.basename.as_deref()) {
+                    report_dir_entry(
+                        parent,
+                        InotifyMask::IN_MODIFY,
+                        InotifyCookie(0),
+                        name,
+                        ctx.is_dir,
+                    );
+                }
+            }
+
+            let md = self.inode.metadata()?;
+            report(
+                InodeKey::new(md.dev_id, md.inode_id.data()),
+                InotifyMask::IN_MODIFY,
+            );
+        }
+
         return Ok(());
     }
 
@@ -1352,6 +1474,11 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
+        // inotify close 事件：仅当 file description 的最后一个引用释放时触发。
+        // Drop 正好对应最后一个 Arc<File> 被释放。
+        // 这里的 inotify_ctx 被释放时，如果它是最后一个 Arc，则会触发 InotifyWrapper 的 Drop，从而产生事件。
+        // 因此不需要手动调用 report。
+
         let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
         // 打印错误信息
         if r.is_err() {

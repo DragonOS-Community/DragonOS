@@ -17,7 +17,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use crate::filesystem::vfs::vcore::vfs_truncate;
+use crate::filesystem::notify::inotify::uapi::{InotifyCookie, InotifyMask};
+use crate::filesystem::notify::inotify::{report, report_dir_entry, InodeKey};
+use crate::filesystem::vfs::utils::rsplit_path;
+use crate::filesystem::vfs::vcore::{resolve_parent_inode, vfs_truncate_no_event};
 
 /// # truncate(path, length)
 ///
@@ -51,6 +54,17 @@ impl Syscall for SysTruncateHandle {
         let target: Arc<dyn IndexNode> = begin_inode
             .lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
+        // Resolve parent before truncate
+        let (filename, parent_path) = rsplit_path(&remain_path);
+        let parent_key = if !filename.is_empty() {
+            resolve_parent_inode(begin_inode.clone(), parent_path)
+                .ok()
+                .and_then(|p| p.metadata().ok())
+                .map(|m| InodeKey::new(m.dev_id, m.inode_id.data()))
+        } else {
+            None
+        };
+
         let md = target.metadata()?;
         // DAC write permission check
         let cred = ProcessManager::current_pcb().cred();
@@ -66,7 +80,29 @@ impl Syscall for SysTruncateHandle {
             }
         }
 
-        vfs_truncate(target, length)?;
+        let old_size = vfs_truncate_no_event(target.clone(), length)?;
+
+        // Report IN_MODIFY to parent directory
+        if let (Some(parent), false) = (parent_key, filename.is_empty()) {
+            let md = target.metadata()?;
+            let is_dir = md.file_type == FileType::Dir;
+            report_dir_entry(
+                parent,
+                InotifyMask::IN_MODIFY,
+                InotifyCookie(0),
+                filename,
+                is_dir,
+            );
+        }
+
+        if old_size != length as u64 {
+            let md = target.metadata()?;
+            report(
+                InodeKey::new(md.dev_id, md.inode_id.data()),
+                InotifyMask::IN_MODIFY,
+            );
+        }
+
         Ok(0)
     }
 

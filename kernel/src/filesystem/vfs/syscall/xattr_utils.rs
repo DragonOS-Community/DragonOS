@@ -1,6 +1,9 @@
 use super::{XATTR_CREATE, XATTR_REPLACE};
 use crate::{
-    filesystem::vfs::{syscall::AtFlags, utils::user_path_at, IndexNode, MAX_PATHLEN},
+    filesystem::{
+        notify::inotify::{report, uapi::InotifyMask, InodeKey},
+        vfs::{syscall::AtFlags, utils::user_path_at, IndexNode, MAX_PATHLEN},
+    },
     process::ProcessManager,
     syscall::user_access::{
         check_and_clone_cstr, vfs_check_and_clone_cstr, UserBufferReader, UserBufferWriter,
@@ -131,5 +134,60 @@ fn do_setxattr(
     let user_buffer_reader = UserBufferReader::new(value_ptr, size, true)?;
     let value_buf = user_buffer_reader.buffer(0)?;
 
-    inode.setxattr(&name, value_buf)
+    inode.setxattr(&name, value_buf)?;
+
+    if let Ok(md) = inode.metadata() {
+        report(
+            InodeKey::new(md.dev_id, md.inode_id.data()),
+            InotifyMask::IN_ATTRIB,
+        );
+    }
+
+    Ok(0)
+}
+
+/// Extended attribute REMOVE operations
+pub(super) fn path_removexattr(
+    path_ptr: *const u8,
+    name_ptr: *const u8,
+    lookup_flags: usize,
+) -> Result<usize, SystemError> {
+    let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+
+    let pcb = ProcessManager::current_pcb();
+    let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
+    let inode = current_node.lookup_follow_symlink(&rest_path, lookup_flags)?;
+
+    do_removexattr(inode, name_ptr)
+}
+
+pub(super) fn fd_removexattr(fd: i32, name_ptr: *const u8) -> Result<usize, SystemError> {
+    let binding = ProcessManager::current_pcb().fd_table();
+    let fd_table_guard = binding.read();
+
+    let file = fd_table_guard
+        .get_file_by_fd(fd)
+        .ok_or(SystemError::EBADF)?;
+    let inode = file.inode();
+
+    do_removexattr(inode, name_ptr)
+}
+
+fn do_removexattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8) -> Result<usize, SystemError> {
+    let name = check_and_clone_cstr(name_ptr, None)?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+
+    inode.removexattr(&name)?;
+
+    if let Ok(md) = inode.metadata() {
+        report(
+            InodeKey::new(md.dev_id, md.inode_id.data()),
+            InotifyMask::IN_ATTRIB,
+        );
+    }
+
+    Ok(0)
 }

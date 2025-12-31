@@ -899,6 +899,34 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// @brief 列出扩展属性
+    ///
+    /// @param buf 用于存储扩展属性名称列表的缓冲区
+    ///
+    /// @return 成功：Ok(属性名称列表的实际长度)
+    ///         失败：Err(错误码)
+    fn listxattr(&self, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        log::warn!(
+            "listxattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 删除扩展属性
+    ///
+    /// @param name 属性名称
+    ///
+    /// @return 成功：Ok(())
+    ///         失败：Err(错误码)
+    fn removexattr(&self, _name: &str) -> Result<(), SystemError> {
+        log::warn!(
+            "removexattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
+        return Err(SystemError::ENOSYS);
+    }
+
     /// # 将当前Inode转换为 Socket 引用
     ///
     /// # 返回值

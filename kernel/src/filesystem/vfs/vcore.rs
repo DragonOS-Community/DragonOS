@@ -24,6 +24,11 @@ use crate::{
     process::{cred::CAPFlags, namespace::mnt::mnt_namespace_init, ProcessManager},
 };
 
+use crate::filesystem::notify::inotify::uapi::{InotifyCookie, InotifyMask};
+use crate::filesystem::notify::inotify::{
+    report, report_delete_self_and_purge, report_dir_entry, InodeKey,
+};
+
 use super::{
     stat::LookUpFlags,
     utils::{rsplit_path, should_remove_sgid, user_path_at},
@@ -308,7 +313,15 @@ pub fn do_mkdir_at(
     let final_mode = InodeMode::from_bits_truncate(final_mode_bits) & !umask;
 
     // 执行创建
-    return current_inode.mkdir(name, final_mode);
+    let new_inode = current_inode.mkdir(name, final_mode)?;
+    report_dir_entry(
+        InodeKey::new(parent_md.dev_id, parent_md.inode_id.data()),
+        InotifyMask::IN_CREATE,
+        InotifyCookie(0),
+        name,
+        true,
+    );
+    Ok(new_inode)
 }
 
 /// 解析父目录inode
@@ -384,8 +397,21 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::ENOTDIR);
     }
 
+    let parent_key = InodeKey::new(parent_md.dev_id, parent_md.inode_id.data());
+    let target_md = target_inode.metadata()?;
+    let target_key = InodeKey::new(target_md.dev_id, target_md.inode_id.data());
+
     // 删除文件夹
     parent_inode.rmdir(filename)?;
+
+    report_dir_entry(
+        parent_key,
+        InotifyMask::IN_DELETE,
+        InotifyCookie(0),
+        filename,
+        true,
+    );
+    report_delete_self_and_purge(target_key, true);
 
     return Ok(0);
 }
@@ -430,8 +456,31 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         truncate_inode_pages(page_cache, 0);
     }
 
+    let parent_key = InodeKey::new(parent_md.dev_id, parent_md.inode_id.data());
+    let target_md = target_inode.metadata()?;
+    let target_key = InodeKey::new(target_md.dev_id, target_md.inode_id.data());
+
     // 在父目录上执行 unlink 操作
     parent_inode.unlink(filename)?;
+
+    report_dir_entry(
+        parent_key,
+        InotifyMask::IN_DELETE,
+        InotifyCookie(0),
+        filename,
+        false,
+    );
+
+    // 只有当硬链接计数降为0时才 purge watch；否则只投递 IN_ATTRIB
+    if let Ok(md) = target_inode.metadata() {
+        if md.nlinks == 0 {
+            report_delete_self_and_purge(target_key, false);
+        } else {
+            report(target_key, InotifyMask::IN_ATTRIB);
+        }
+    } else {
+        report_delete_self_and_purge(target_key, false);
+    }
 
     return Ok(0);
 }
@@ -450,8 +499,23 @@ pub(super) fn do_file_lookup_at(
 /// - 目录返回 EISDIR
 /// - 非普通文件返回 EINVAL
 /// - 只读挂载返回 EROFS
+#[allow(dead_code)]
 #[inline(never)]
 pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
+    let old_size = vfs_truncate_no_event(inode.clone(), len)?;
+
+    let md = inode.metadata()?;
+    if old_size != len as u64 {
+        report(
+            InodeKey::new(md.dev_id, md.inode_id.data()),
+            InotifyMask::IN_MODIFY,
+        );
+    }
+    Ok(())
+}
+
+#[inline(never)]
+pub fn vfs_truncate_no_event(inode: Arc<dyn IndexNode>, len: usize) -> Result<u64, SystemError> {
     let md = inode.metadata()?;
     let old_size = md.size;
 
@@ -520,5 +584,5 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
         }
     }
 
-    result
+    result.map(|_| old_size as u64)
 }

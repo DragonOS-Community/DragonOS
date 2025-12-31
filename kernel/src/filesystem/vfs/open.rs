@@ -3,13 +3,15 @@ use system_error::SystemError;
 
 use super::{
     fcntl::AtFlags,
-    file::{File, FileFlags},
+    file::{File, FileFlags, InotifyFileCtx},
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
     vcore::{check_parent_dir_permission, resolve_parent_inode},
     FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+use crate::filesystem::notify::inotify::uapi::{InotifyCookie, InotifyMask};
+use crate::filesystem::notify::inotify::{report, report_dir_entry, InodeKey};
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
     process::cred::CAPFlags,
@@ -17,7 +19,7 @@ use crate::{
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 use crate::{process::ProcessManager, syscall::user_access::vfs_check_and_clone_cstr};
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 /// 计算创建文件/目录时使用的最终 mode（应用 umask，并丢弃非法位）。
 ///
@@ -79,13 +81,48 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
-    let target_inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    // 为目录 watch 的 IN_ATTRIB 生成 basename。
+    let (filename, parent_path) = rsplit_path(&path);
+    let parent_key = if !filename.is_empty() {
+        resolve_parent_inode(inode.clone(), parent_path)
+            .ok()
+            .and_then(|p| p.metadata().ok())
+            .map(|m| InodeKey::new(m.dev_id, m.inode_id.data()))
+    } else {
+        None
+    };
 
-    do_fchmod(target_inode, mode)
+    let target_inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let is_dir = target_inode
+        .metadata()
+        .map(|m| m.file_type == FileType::Dir)
+        .unwrap_or(false);
+
+    do_fchmod_no_event(target_inode.clone(), mode)?;
+
+    if let (Some(parent), false) = (parent_key, filename.is_empty()) {
+        report_dir_entry(
+            parent,
+            InotifyMask::IN_ATTRIB,
+            InotifyCookie(0),
+            filename,
+            is_dir,
+        );
+    }
+
+    let metadata = target_inode.metadata()?;
+    report(
+        InodeKey::new(metadata.dev_id, metadata.inode_id.data()),
+        InotifyMask::IN_ATTRIB,
+    );
+
+    Ok(0)
 }
 
-/// fchmod：对已解析的 inode 进行 chmod（供 `sys_fchmod` 复用）。
-pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, SystemError> {
+pub fn do_fchmod_no_event(
+    inode: Arc<dyn IndexNode>,
+    mode: InodeMode,
+) -> Result<usize, SystemError> {
     let cred = ProcessManager::current_pcb().cred();
     let mut metadata = inode.metadata()?;
 
@@ -190,6 +227,10 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         }
     }
     inode.set_metadata(&meta)?;
+    report(
+        InodeKey::new(meta.dev_id, meta.inode_id.data()),
+        InotifyMask::IN_ATTRIB,
+    );
 
     return Ok(0);
 }
@@ -254,7 +295,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 }
                 // 查找父目录
                 let parent_inode: Arc<dyn IndexNode> =
-                    resolve_parent_inode(inode_begin, parent_path)?;
+                    resolve_parent_inode(inode_begin.clone(), parent_path)?;
                 let parent_md = parent_inode.metadata()?;
                 // 父节点必须是目录
                 if parent_md.file_type != FileType::Dir {
@@ -271,6 +312,13 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 let inode: Arc<dyn IndexNode> =
                     parent_inode.create(filename, FileType::File, create_mode)?;
                 created = true;
+                report_dir_entry(
+                    InodeKey::new(parent_md.dev_id, parent_md.inode_id.data()),
+                    InotifyMask::IN_CREATE,
+                    InotifyCookie(0),
+                    filename,
+                    false,
+                );
                 inode
             } else {
                 // 不需要创建文件，因此返回错误码
@@ -280,6 +328,18 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     };
     let metadata = inode.metadata()?;
     let file_type: FileType = metadata.file_type;
+
+    // 为 open/read/write/close 的 inotify 目录项事件缓存 parent+basename。
+    // 注意：这里使用原始解析路径的最后一段作为 basename（gvisor 用例只要求 basename）。
+    let (basename, parent_path) = rsplit_path(&path);
+    let parent_key = if !basename.is_empty() {
+        resolve_parent_inode(inode_begin.clone(), parent_path)
+            .ok()
+            .and_then(|p| p.metadata().ok())
+            .map(|m| InodeKey::new(m.dev_id, m.inode_id.data()))
+    } else {
+        None
+    };
 
     // Linux semantics: socket inodes (S_IFSOCK) cannot be opened via open(2).
     // Users must use socket(2)/connect(2) instead. Linux returns ENXIO.
@@ -352,6 +412,22 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     }
     let file: File = File::new(inode, how.o_flags)?;
 
+    // inotify 上下文：用于后续 read/write/close 的 name 字段以及 close_write 区分。
+    let inode_key = InodeKey::new(metadata.dev_id, metadata.inode_id.data());
+    let acc_mode = how.o_flags.access_flags();
+    let writable = acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR;
+    file.set_inotify_ctx(InotifyFileCtx {
+        inode_key,
+        parent_key,
+        basename: if basename.is_empty() {
+            None
+        } else {
+            Some(basename.into())
+        },
+        is_dir: file_type == FileType::Dir,
+        writable,
+    });
+
     // 把文件对象存入pcb
     let r = ProcessManager::current_pcb()
         .fd_table()
@@ -359,7 +435,28 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         .alloc_fd(file, None)
         .map(|fd| fd as usize);
 
-    return r;
+    // open 事件：对 watch 在 inode 上的 fd，投递无 name 的 IN_OPEN；
+    // 对 watch 在父目录上的 fd，投递带 name 的 IN_OPEN。
+    // 仅在 fd 分配成功时投递，避免 open 失败产生事件。
+    if r.is_ok() && !how.o_flags.contains(FileFlags::O_PATH) {
+        let mask = if file_type == FileType::Dir {
+            InotifyMask::IN_OPEN | InotifyMask::IN_ISDIR
+        } else {
+            InotifyMask::IN_OPEN
+        };
+        report(inode_key, mask);
+        if let (Some(parent), false) = (parent_key, basename.is_empty()) {
+            report_dir_entry(
+                parent,
+                InotifyMask::IN_OPEN,
+                InotifyCookie(0),
+                basename,
+                file_type == FileType::Dir,
+            );
+        }
+    }
+
+    r
 }
 
 /// On Linux, futimens() is a library function implemented on top of
@@ -386,16 +483,35 @@ pub fn do_utimensat(
         }
     }
 
-    let inode = match pathname {
+    let (inode, parent_key, basename) = match pathname {
         Some(path) => {
             let (inode_begin, path) =
                 user_path_at(&ProcessManager::current_pcb(), dirfd, path.as_str())?;
+
+            let (filename, parent_path) = rsplit_path(&path);
+            let parent_key = if !filename.is_empty() {
+                resolve_parent_inode(inode_begin.clone(), parent_path)
+                    .ok()
+                    .and_then(|p| p.metadata().ok())
+                    .map(|m| InodeKey::new(m.dev_id, m.inode_id.data()))
+            } else {
+                None
+            };
+
             let inode = if flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW) {
                 inode_begin.lookup(path.as_str())?
             } else {
                 inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
             };
-            inode
+            (
+                inode,
+                parent_key,
+                if filename.is_empty() {
+                    None
+                } else {
+                    Some(filename.to_string())
+                },
+            )
         }
         None => {
             // Linux-specific extension: pathname == NULL means operate on the
@@ -419,40 +535,94 @@ pub fn do_utimensat(
                 return Err(SystemError::EBADF);
             }
 
-            file.inode()
+            let ctx = file.inotify_ctx_snapshot();
+            let parent_key = ctx.as_ref().and_then(|c| c.parent_key);
+            let basename = ctx.as_ref().and_then(|c| c.basename.clone());
+
+            (file.inode(), parent_key, basename)
         }
     };
     let now = PosixTimeSpec::now();
     let mut meta = inode.metadata()?;
 
+    let mut access_changed = false;
+    let mut attrib_changed = false;
+
     if let Some([atime, mtime]) = times {
         if atime.tv_nsec == UTIME_NOW {
             meta.atime = now;
+            access_changed = true;
         } else if atime.tv_nsec != UTIME_OMIT {
             meta.atime = atime;
+            access_changed = true;
         }
         if mtime.tv_nsec == UTIME_NOW {
             meta.mtime = now;
+            attrib_changed = true;
         } else if mtime.tv_nsec != UTIME_OMIT {
             meta.mtime = mtime;
+            attrib_changed = true;
         }
         inode.set_metadata(&meta).unwrap();
     } else {
         meta.atime = now;
         meta.mtime = now;
+        access_changed = true;
+        attrib_changed = true;
         inode.set_metadata(&meta).unwrap();
     }
+
+    if access_changed {
+        report(
+            InodeKey::new(meta.dev_id, meta.inode_id.data()),
+            crate::filesystem::notify::inotify::uapi::InotifyMask::IN_ACCESS,
+        );
+    }
+
+    if attrib_changed {
+        report(
+            InodeKey::new(meta.dev_id, meta.inode_id.data()),
+            InotifyMask::IN_ATTRIB,
+        );
+    }
+
+    if let (Some(parent), Some(name)) = (parent_key, basename) {
+        let is_dir = meta.file_type == FileType::Dir;
+        if attrib_changed {
+            report_dir_entry(
+                parent,
+                InotifyMask::IN_ATTRIB,
+                InotifyCookie(0),
+                &name,
+                is_dir,
+            );
+        }
+    }
+
     return Ok(0);
 }
 
 pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, SystemError> {
     // log::debug!("do_utimes: path:{:?}, times:{:?}", path, times);
-    let (inode_begin, path) = user_path_at(
+    let (inode_begin, remain_path) = user_path_at(
         &ProcessManager::current_pcb(),
         AtFlags::AT_FDCWD.bits(),
         path,
     )?;
-    let inode = inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
+    // Resolve parent for inotify (similar to sys_truncate)
+    let (filename, parent_path) = rsplit_path(&remain_path);
+    let parent_key = if !filename.is_empty() {
+        resolve_parent_inode(inode_begin.clone(), parent_path)
+            .ok()
+            .and_then(|p| p.metadata().ok())
+            .map(|m| InodeKey::new(m.dev_id, m.inode_id.data()))
+    } else {
+        None
+    };
+
+    let inode =
+        inode_begin.lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     let mut meta = inode.metadata()?;
 
     if let Some([atime, mtime]) = times {
@@ -465,5 +635,21 @@ pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, 
         meta.mtime = now;
         inode.set_metadata(&meta)?;
     }
+
+    if let (Some(parent), false) = (parent_key, filename.is_empty()) {
+        let is_dir = meta.file_type == FileType::Dir;
+        report_dir_entry(
+            parent,
+            InotifyMask::IN_ATTRIB,
+            InotifyCookie(0),
+            filename,
+            is_dir,
+        );
+    }
+    report(
+        InodeKey::new(meta.dev_id, meta.inode_id.data()),
+        InotifyMask::IN_ATTRIB,
+    );
+
     return Ok(0);
 }

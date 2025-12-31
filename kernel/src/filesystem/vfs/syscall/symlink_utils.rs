@@ -10,6 +10,9 @@ use crate::{
     process::ProcessManager,
 };
 
+use crate::filesystem::notify::inotify::uapi::{InotifyCookie, InotifyMask};
+use crate::filesystem::notify::inotify::{report_dir_entry, InodeKey};
+
 use super::InodeMode;
 
 pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, SystemError> {
@@ -54,6 +57,16 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
 
     let new_inode =
         new_parent.create_with_data(new_name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
+
+    if let Ok(parent_md) = new_parent.metadata() {
+        report_dir_entry(
+            InodeKey::new(parent_md.dev_id, parent_md.inode_id.data()),
+            InotifyMask::IN_CREATE,
+            InotifyCookie(0),
+            new_name,
+            false,
+        );
+    }
 
     let buf = from.as_bytes();
     let len = buf.len();

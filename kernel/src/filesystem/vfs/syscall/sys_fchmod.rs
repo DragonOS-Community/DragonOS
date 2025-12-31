@@ -1,10 +1,13 @@
 use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_FCHMOD;
+use crate::filesystem::notify::inotify::uapi::{InotifyCookie, InotifyMask};
+use crate::filesystem::notify::inotify::{report, report_dir_entry, InodeKey};
 use crate::filesystem::vfs::file::FileFlags;
+use crate::filesystem::vfs::open::do_fchmod_no_event;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::{open::do_fchmod, InodeMode},
+    filesystem::vfs::InodeMode,
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
@@ -34,7 +37,28 @@ impl Syscall for SysFchmodHandle {
 
         // 通过 inode 修改元数据（保留文件类型位，仅替换权限/特殊位）
         // 注意：read()/write() 权限只在 open 时检查，chmod 不影响已打开 fd 的读写能力。
-        do_fchmod(file.inode(), mode)
+        do_fchmod_no_event(file.inode(), mode)?;
+
+        // 目录 watch 上的 IN_ATTRIB 需要 name：通过 fd 的 inotify_ctx 补齐。
+        if let Some(ctx) = file.inotify_ctx_snapshot() {
+            if let (Some(parent), Some(name)) = (ctx.parent_key, ctx.basename.as_deref()) {
+                report_dir_entry(
+                    parent,
+                    InotifyMask::IN_ATTRIB,
+                    InotifyCookie(0),
+                    name,
+                    ctx.is_dir,
+                );
+            }
+        }
+
+        let metadata = file.inode().metadata()?;
+        report(
+            InodeKey::new(metadata.dev_id, metadata.inode_id.data()),
+            InotifyMask::IN_ATTRIB,
+        );
+
+        Ok(0)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

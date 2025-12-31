@@ -7,6 +7,7 @@ pub mod fat;
 pub mod fs;
 pub mod kernfs;
 pub mod mbr;
+pub mod notify;
 pub mod overlayfs;
 pub mod page_cache;
 pub mod poll;

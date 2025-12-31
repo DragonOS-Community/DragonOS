@@ -594,6 +594,20 @@ impl UserBufferReader<'_> {
             )
         }
     }
+
+    /// Read bytes from user space buffer into kernel buffer.
+    ///
+    /// This is a convenience wrapper around `copy_from_user` with offset 0.
+    ///
+    /// # Arguments
+    /// * `dst` - Kernel buffer to write to
+    ///
+    /// # Returns
+    /// * `Ok(len)` - Number of bytes read
+    /// * `Err` - SystemError
+    pub fn read_bytes(&self, dst: &mut [u8]) -> Result<usize, SystemError> {
+        self.copy_from_user(dst, 0)
+    }
 }
 
 #[allow(dead_code)]
@@ -775,6 +789,20 @@ impl<'a> UserBufferWriter<'a> {
     /// * `EFAULT` - Pages are not mapped or lack required permissions
     pub fn buffer_checked<T>(&'a mut self, offset: usize) -> Result<&'a mut [T], SystemError> {
         Self::convert_with_offset_checked::<T>(self.buffer, offset).map_err(|_| SystemError::EINVAL)
+    }
+
+    /// Write bytes from kernel buffer to user space buffer.
+    ///
+    /// This is a convenience wrapper around `copy_to_user` with offset 0.
+    ///
+    /// # Arguments
+    /// * `src` - Kernel buffer to read from
+    ///
+    /// # Returns
+    /// * `Ok(len)` - Number of bytes written
+    /// * `Err` - SystemError
+    pub fn write_bytes(&'a mut self, src: &[u8]) -> Result<usize, SystemError> {
+        self.copy_to_user(src, 0)
     }
 
     fn convert_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut [T], SystemError> {

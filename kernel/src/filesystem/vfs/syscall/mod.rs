@@ -44,6 +44,7 @@ mod sys_readlinkat;
 mod sys_readv;
 mod sys_renameat2;
 mod sys_select;
+mod sys_splice;
 mod sys_statfs;
 mod sys_statx;
 mod sys_symlinkat;
@@ -118,10 +119,13 @@ mod sys_unlink;
 mod sys_utimes;
 
 mod sys_fgetxattr;
+mod sys_fremovexattr;
 mod sys_fsetxattr;
 mod sys_getxattr;
 mod sys_lgetxattr;
+mod sys_lremovexattr;
 mod sys_lsetxattr;
+mod sys_removexattr;
 mod sys_setxattr;
 mod xattr_utils;
 

@@ -16,6 +16,9 @@ use system_error::SystemError;
 
 use crate::syscall::user_access::vfs_check_and_clone_cstr;
 
+use crate::filesystem::notify::inotify::uapi::{InotifyCookie, InotifyMask};
+use crate::filesystem::notify::inotify::{report_dir_entry, InodeKey};
+
 pub struct SysMknodatHandle;
 
 impl Syscall for SysMknodatHandle {
@@ -49,8 +52,25 @@ impl Syscall for SysMknodatHandle {
         if name.is_empty() && dirfd != AtFlags::AT_FDCWD.bits() {
             return Err(SystemError::ENOENT);
         }
+
+        // Linux 语义：若目标路径已存在，mknod/mknodat 必须失败（通常 EEXIST）。
+        // 这也避免 "FailedFileCreationGeneratesNoEvents" 用例中对现有目录路径 mknod 意外成功。
+        if !name.is_empty() && current_inode.lookup(name).is_ok() {
+            return Err(SystemError::EEXIST);
+        }
         // 在解析出的起始 inode 上进行 mknod（IndexNode::mknod 应负责对路径的进一步解析/校验）
         current_inode.mknod(name, mode, dev)?;
+
+        if !name.is_empty() {
+            let md = current_inode.metadata()?;
+            report_dir_entry(
+                InodeKey::new(md.dev_id, md.inode_id.data()),
+                InotifyMask::IN_CREATE,
+                InotifyCookie(0),
+                name,
+                false, // mknod creates regular/special files, usually not dirs (mkdir uses sys_mkdir)
+            );
+        }
 
         Ok(0)
     }

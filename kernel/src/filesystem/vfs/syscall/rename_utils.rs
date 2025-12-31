@@ -1,3 +1,5 @@
+use crate::filesystem::notify::inotify::uapi::InotifyMask;
+use crate::filesystem::notify::inotify::{report, report_dir_entry, InodeKey};
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::is_ancestor;
@@ -101,6 +103,35 @@ pub fn do_renameat2(
         (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
     )?;
 
+    let old_parent_key = InodeKey::new(
+        old_parent_metadata.dev_id,
+        old_parent_metadata.inode_id.data(),
+    );
+    let new_parent_key = InodeKey::new(
+        new_parent_metadata.dev_id,
+        new_parent_metadata.inode_id.data(),
+    );
+    let moved_md = old_inode.metadata()?;
+    let is_dir = moved_md.file_type == crate::filesystem::vfs::FileType::Dir;
+    let moved_key = InodeKey::new(moved_md.dev_id, moved_md.inode_id.data());
+    let cookie = crate::filesystem::notify::inotify::registry::next_cookie();
+
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
+
+    report_dir_entry(
+        old_parent_key,
+        InotifyMask::IN_MOVED_FROM,
+        cookie,
+        old_filename,
+        is_dir,
+    );
+    report_dir_entry(
+        new_parent_key,
+        InotifyMask::IN_MOVED_TO,
+        cookie,
+        new_filename,
+        is_dir,
+    );
+    report(moved_key, InotifyMask::IN_MOVE_SELF);
     return Ok(0);
 }

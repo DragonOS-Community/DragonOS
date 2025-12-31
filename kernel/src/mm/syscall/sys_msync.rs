@@ -1,8 +1,6 @@
 //! System call handler for the msync system call.
 
-use crate::{
-    arch::{interrupt::TrapFrame, syscall::nr::SYS_MSYNC, MMArch},
-};
+use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MSYNC, MMArch};
 
 use crate::mm::{
     syscall::{MsFlags, VmFlags},

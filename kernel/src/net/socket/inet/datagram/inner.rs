@@ -247,7 +247,8 @@ impl BoundUdp {
                 *has_preconnect_guard = false;
             }
             drop(has_preconnect_guard);
-            if remote.is_some() && !has_preconnect {
+            let should_filter = remote.is_some() && !has_preconnect;
+            if should_filter {
                 let expected_remote = remote.unwrap();
                 // log::debug!("try_recv: connected mode, expected_remote={:?}, buf_len={}, can_recv={}",
                 //     expected_remote, buf.len(), socket.can_recv());

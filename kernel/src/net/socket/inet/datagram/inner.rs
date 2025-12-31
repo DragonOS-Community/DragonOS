@@ -170,6 +170,9 @@ pub struct BoundUdp {
     /// True if socket was explicitly bound by user, false if implicitly bound by connect
     explicitly_bound: bool,
     /// Whether there were buffered packets at connect time - if true, allow next recv without filtering
+    /// 这是用来模拟 Linux UDP 在应用filter前的行为。在smoltcp下，当有包到来时总是会推送到
+    /// udp socket queue 中，而不是先针对connect进行filter操作。这里做workaround, 当connect是检查是否有包
+    /// 在缓冲区，如果有，第一个包我们走非connect而不是connect的recv方法（即接受第一个非connect对端对应的包）
     has_preconnect_data: SpinLock<bool>,
 }
 
@@ -236,61 +239,16 @@ impl BoundUdp {
 
         self.with_mut_socket(|socket| {
             // If connected, filter packets by source address (except pre-connect packets)
-            if let Some(expected_remote) = remote {
-                // Check if we should accept pre-connect data without filtering
-                let mut has_preconnect = self.has_preconnect_data.lock();
-                if *has_preconnect {
-                    // Clear the flag - we only allow ONE unfiltered recv
-                    *has_preconnect = false;
-                    drop(has_preconnect); // Release lock before recv
-                    // log::debug!("try_recv: has_preconnect=true, can_recv={}", socket.can_recv());
 
-                    // Special case: zero-length buffer
-                    if buf.is_empty() {
-                        if socket.can_recv() {
-                            if let Ok((_payload, metadata)) = socket.peek() {
-                                // log::debug!("try_recv: preconnect with zero-length buffer, returning 0 bytes");
-                                return Ok((0, metadata.endpoint));
-                            }
-                        }
-                        // log::debug!("try_recv: preconnect with zero-length buffer, no data");
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-
-                    if socket.can_recv() {
-                        if peek {
-                            // MSG_PEEK: peek data without consuming
-                            if let Ok((payload, metadata)) = socket.peek() {
-                                let copy_len = core::cmp::min(buf.len(), payload.len());
-                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                // log::debug!("try_recv: preconnect peek succeeded, size={}", copy_len);
-                                return Ok((copy_len, metadata.endpoint));
-                            }
-                        } else {
-                            // Receive the packet
-                            match socket.recv_slice(buf) {
-                                Ok((size, metadata)) => {
-                                    // log::debug!("try_recv: preconnect recv succeeded, size={}", size);
-                                    return Ok((size, metadata.endpoint));
-                                }
-                                Err(smoltcp::socket::udp::RecvError::Truncated) => {
-                                    // UDP allows truncation - peek to get the endpoint, then consume
-                                    if let Ok((_payload, metadata)) = socket.peek() {
-                                        let endpoint = metadata.endpoint;
-                                        let _ = socket.recv_slice(&mut [0u8; 1]); // Consume the packet
-                                        // log::debug!("try_recv: preconnect recv truncated, size={}", buf.len());
-                                        return Ok((buf.len(), endpoint));
-                                    }
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                    }
-                    // log::debug!("try_recv: preconnect recv failed, returning EAGAIN");
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                drop(has_preconnect); // Release lock
-
+            let mut has_preconnect_guard = self.has_preconnect_data.lock();
+            let has_preconnect = *has_preconnect_guard;
+            // let has_preconnect = false;
+            if has_preconnect {
+                *has_preconnect_guard = false;
+            }
+            drop(has_preconnect_guard);
+            if remote.is_some() && !has_preconnect {
+                let expected_remote = remote.unwrap();
                 // log::debug!("try_recv: connected mode, expected_remote={:?}, buf_len={}, can_recv={}",
                 //     expected_remote, buf.len(), socket.can_recv());
 
@@ -306,14 +264,13 @@ impl BoundUdp {
                     // error when buffer is smaller than packet, but we still want to receive it
                     match socket.peek() {
                         Ok((payload, metadata)) => {
-                            let endpoint = metadata.endpoint;
-                            // log::debug!("try_recv: peeked {} bytes from {:?}, buf_len={}", payload.len(), endpoint, buf.len());
-                            if endpoint == expected_remote {
+                            // log::debug!("try_recv: peeked {} bytes from {:?}, buf_len={}", payload.len(), metadata.endpoint, buf.len());
+                            if metadata.endpoint == expected_remote {
                                 // Source matches
 
                                 // Special case: zero-length buffer
                                 if buf.is_empty() {
-                                    log::debug!("try_recv: zero-length buffer in connected mode, returning 0 bytes");
+                                    // log::debug!("try_recv: zero-length buffer in connected mode, returning 0 bytes");
                                     return Ok((0, expected_remote));
                                 }
 
@@ -321,42 +278,27 @@ impl BoundUdp {
                                     // MSG_PEEK: just copy the data we peeked
                                     let copy_len = core::cmp::min(buf.len(), payload.len());
                                     buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                    log::debug!("try_recv: peek succeeded, size={}", copy_len);
-                                    return Ok((copy_len, endpoint));
+                                    // log::debug!("try_recv: peek succeeded, size={}", copy_len);
+                                    return Ok((copy_len, expected_remote));
                                 } else {
-                                    // Receive the packet (truncated if buf is smaller)
-                                    // For UDP, truncation is normal - just consume the packet and return what fits
-                                    let copy_len = core::cmp::min(buf.len(), payload.len());
-                                    match socket.recv_slice(buf) {
-                                        Ok((size, metadata)) => {
-                                            // log::debug!("try_recv: recv succeeded, size={}", size);
-                                            return Ok((size, metadata.endpoint));
-                                        }
-                                        Err(smoltcp::socket::udp::RecvError::Truncated) => {
-                                            // UDP allows truncation - return the bytes that fit
-                                            // log::debug!("try_recv: packet truncated from {} to {} bytes", payload.len(), copy_len);
-                                            return Ok((copy_len, endpoint));
-                                        }
-                                        Err(e) => {
-                                            // Other errors are unexpected
-                                            log::warn!("try_recv: recv_slice unexpectedly failed after peek: {:?}", e);
-                                            return Err(SystemError::EIO);
-                                        }
-                                    }
+                                    // Receive the packet
+                                    let (recv_buf, _metadata) =
+                                        socket.recv().map_err(|_| SystemError::ENOBUFS)?;
+                                    let length = core::cmp::min(buf.len(), recv_buf.len());
+                                    buf[..length].copy_from_slice(&recv_buf[..length]);
+                                    debug_assert_eq!(expected_remote, _metadata.endpoint);
+                                    return Ok((length, expected_remote));
                                 }
                             } else {
-                                // Source doesn't match, discard this packet and check next
-                                // log::debug!("try_recv: source mismatch, discarding packet from {:?}", metadata.endpoint);
-                                // Use a temp buffer to consume the packet
-                                let mut discard_buf = [0u8; 1];
-                                let _ = socket.recv_slice(&mut discard_buf);
+                                // just drop the packet
+                                let _ = socket.recv();
                                 continue;
                             }
                         }
-                        Err(_e) => {
-                            // log::debug!("try_recv: peek failed: {:?}, returning EAGAIN", _e);
-                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                        Err(smoltcp::socket::udp::RecvError::Exhausted) => {
+                            return Err(SystemError::ENOBUFS)
                         }
+                        Err(_e) => return Err(SystemError::EIO),
                     }
                 }
             } else {
@@ -386,23 +328,12 @@ impl BoundUdp {
                             return Ok((copy_len, metadata.endpoint));
                         }
                     } else {
-                        // Receive the packet
-                        match socket.recv_slice(buf) {
-                            Ok((size, metadata)) => {
-                                // log::debug!("try_recv: unconnected recv succeeded, size={}", size);
-                                return Ok((size, metadata.endpoint));
-                            }
-                            Err(smoltcp::socket::udp::RecvError::Truncated) => {
-                                // UDP allows truncation - peek to get the endpoint, then consume
-                                if let Ok((_payload, metadata)) = socket.peek() {
-                                    let endpoint = metadata.endpoint;
-                                    let _ = socket.recv_slice(&mut [0u8; 1]); // Consume the packet
-                                    // log::debug!("try_recv: unconnected recv truncated, size={}", buf.len());
-                                    return Ok((buf.len(), endpoint));
-                                }
-                            }
-                            Err(_) => {}
-                        }
+                        // Receive the packet                       // Receive the packet
+                        let (recv_buf, metadata) =
+                            socket.recv().map_err(|_| SystemError::ENOBUFS)?;
+                        let length = core::cmp::min(buf.len(), recv_buf.len());
+                        buf[..length].copy_from_slice(&recv_buf[..length]);
+                        return Ok((length, metadata.endpoint));
                     }
                 }
                 // log::debug!("try_recv: unconnected recv failed, returning EAGAIN");

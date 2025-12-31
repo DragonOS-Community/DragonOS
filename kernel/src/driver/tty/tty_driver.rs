@@ -438,13 +438,13 @@ impl KObject for TtyDriver {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         todo!()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         todo!()
     }
 

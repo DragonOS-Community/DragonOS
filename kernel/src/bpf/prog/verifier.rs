@@ -5,7 +5,7 @@ use crate::bpf::prog::BpfProg;
 use crate::filesystem::vfs::file::FileDescriptorVec;
 use crate::include::bindings::linux_bpf::*;
 use crate::libs::casting::DowncastArc;
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use alloc::{sync::Arc, vec::Vec};
 use log::{error, info};
 use rbpf::ebpf;
@@ -33,7 +33,7 @@ impl<'a> BpfProgVerifier<'a> {
     /// Relocate the program.
     ///
     /// This function will relocate the program, and update the program's instructions.
-    fn relocation(&mut self, fd_table: &Arc<RwLock<FileDescriptorVec>>) -> Result<()> {
+    fn relocation(&mut self, fd_table: &Arc<RwSem<FileDescriptorVec>>) -> Result<()> {
         let instructions = self.prog.insns_mut();
         let mut fmt_insn = to_insn_vec(instructions);
         let mut index = 0;
@@ -124,7 +124,7 @@ impl<'a> BpfProgVerifier<'a> {
         Ok(())
     }
 
-    pub fn verify(mut self, fd_table: &Arc<RwLock<FileDescriptorVec>>) -> Result<BpfProg> {
+    pub fn verify(mut self, fd_table: &Arc<RwSem<FileDescriptorVec>>) -> Result<BpfProg> {
         self.relocation(fd_table)?;
         Ok(self.prog)
     }

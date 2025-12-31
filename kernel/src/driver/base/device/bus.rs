@@ -16,7 +16,7 @@ use crate::{
         },
         vfs::InodeMode,
     },
-    libs::rwlock::RwLock,
+    libs::rwsem::RwSem,
 };
 use alloc::{
     string::{String, ToString},
@@ -239,13 +239,13 @@ impl dyn Bus {
 #[derive(Debug)]
 pub struct BusManager {
     /// 存储总线bus的kset结构体与bus实例的映射(用于在sysfs callback的时候,根据kset找到bus实例)
-    kset_bus_map: RwLock<HashMap<Arc<KSet>, Arc<dyn Bus>>>,
+    kset_bus_map: RwSem<HashMap<Arc<KSet>, Arc<dyn Bus>>>,
 }
 
 impl BusManager {
     pub fn new() -> Self {
         return Self {
-            kset_bus_map: RwLock::new(HashMap::new()),
+            kset_bus_map: RwSem::new(HashMap::new()),
         };
     }
 

@@ -35,7 +35,8 @@ use crate::filesystem::{
     vfs::{IndexNode, InodeMode, Metadata},
 };
 use crate::libs::{
-    rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    rwlock::RwLock,
+    rwsem::{RwSemReadGuard, RwSemWriteGuard},
     spinlock::{SpinLock, SpinLockGuard},
 };
 use crate::mm::allocator::page_frame::PhysPageFrame;
@@ -914,11 +915,11 @@ impl KObject for MMC {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<KObjectState> {
         self.locked_kobj_state.write()
     }
 

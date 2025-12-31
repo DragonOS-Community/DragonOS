@@ -25,7 +25,8 @@ use crate::{
         vfs::{FilePrivateData, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata},
     },
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::ProcessManager,
@@ -974,11 +975,11 @@ impl KObject for LoopDevice {
         // do nothing, loop 设备名称由 devname 字段决定，不支持外部设置
     }
 
-    fn kobj_state(&'_ self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&'_ self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&'_ self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&'_ self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

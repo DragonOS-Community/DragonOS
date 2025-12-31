@@ -49,7 +49,8 @@ use crate::{
     },
     init::initcall::INITCALL_POSTCORE,
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -557,11 +558,11 @@ impl KObject for VirtIOBlkDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -748,11 +749,11 @@ impl KObject for VirtIOBlkDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

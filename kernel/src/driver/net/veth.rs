@@ -16,7 +16,7 @@ use crate::driver::net::register_netdevice;
 use crate::driver::net::types::InterfaceFlags;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
-use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
+use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::generate_iface_id;
 use crate::net::routing::{DnatRule, RouteEntry, RouterEnableDevice, SnatRule};
@@ -567,11 +567,11 @@ impl KObject for VethInterface {
     }
 
     fn set_name(&self, _name: String) {}
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

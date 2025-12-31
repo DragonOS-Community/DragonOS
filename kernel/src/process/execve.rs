@@ -1,7 +1,7 @@
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::IndexNode;
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use crate::process::exec::{
     load_binary_file_with_context, ExecContext, ExecParam, ExecParamFlags, LoadBinaryResult,
 };
@@ -111,7 +111,7 @@ fn do_execve_internal(
                 if Arc::strong_count(&fd_table) > 1 {
                     // fd_table 被共享，需要创建私有副本
                     let new_fd_table = fd_table.read().clone();
-                    let new_fd_table = Arc::new(RwLock::new(new_fd_table));
+                    let new_fd_table = Arc::new(RwSem::new(new_fd_table));
                     pcb.basic_mut().set_fd_table(Some(new_fd_table));
                 }
             }

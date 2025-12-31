@@ -23,7 +23,8 @@ use crate::{
         },
         vfs::InodeMode,
     },
-    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    libs::rwlock::RwLock,
+    libs::rwsem::{RwSemReadGuard, RwSemWriteGuard},
 };
 #[derive(Debug)]
 #[cast_to([sync] Device)]
@@ -211,11 +212,11 @@ impl KObject for TestDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

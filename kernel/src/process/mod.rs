@@ -48,6 +48,7 @@ use crate::{
         },
         lock_free_flags::LockFreeFlags,
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwsem::RwSem,
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -1434,7 +1435,7 @@ impl ProcessControlBlock {
 
     /// 获取文件描述符表的Arc指针
     #[inline(always)]
-    pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
+    pub fn fd_table(&self) -> Arc<RwSem<FileDescriptorVec>> {
         return self.basic.read().try_fd_table().unwrap();
     }
 
@@ -1912,7 +1913,7 @@ pub struct ProcessBasicInfo {
     user_vm: Option<Arc<AddressSpace>>,
 
     /// 文件描述符表
-    fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
+    fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,
 }
 
 impl ProcessBasicInfo {
@@ -1923,7 +1924,7 @@ impl ProcessBasicInfo {
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
-        let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
+        let fd_table = Arc::new(RwSem::new(FileDescriptorVec::new()));
         return RwLock::new(Self {
             ppid,
             name,
@@ -1960,14 +1961,14 @@ impl ProcessBasicInfo {
         self.user_vm = user_vm;
     }
 
-    pub fn try_fd_table(&self) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+    pub fn try_fd_table(&self) -> Option<Arc<RwSem<FileDescriptorVec>>> {
         return self.fd_table.clone();
     }
 
     pub fn set_fd_table(
         &mut self,
-        fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
-    ) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+        fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,
+    ) -> Option<Arc<RwSem<FileDescriptorVec>>> {
         let old = self.fd_table.take();
         self.fd_table = fd_table;
         return old;

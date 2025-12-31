@@ -14,7 +14,7 @@ use crate::{
         },
     },
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     net::generate_iface_id,
@@ -466,11 +466,11 @@ impl KObject for E1000EInterface {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

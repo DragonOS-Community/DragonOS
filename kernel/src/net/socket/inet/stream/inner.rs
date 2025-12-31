@@ -161,7 +161,10 @@ impl Init {
             // Invalid backlog value
             return Err((Init::Bound((inner, local)), SystemError::EINVAL));
         }
-        let backlog = 8; // for current implementation
+
+        // FIXME: need refactor backlog mechanism for large number of backlog
+        let backlog = if backlog > 8 { 8 } else { backlog };
+
         let mut inners = Vec::new();
         if let Err(err) = || -> Result<(), SystemError> {
             for _i in 0..(backlog - 1) {

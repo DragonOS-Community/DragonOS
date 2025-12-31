@@ -237,6 +237,38 @@ impl crate::net::socket::Socket for RawSocket {
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
+
+    fn recv_bytes_available(&self) -> Result<usize, SystemError> {
+        let guard = self.inner.read();
+        Ok(match *guard {
+            Some(RawInner::Wildcard(ref bound)) => {
+                bound.with_mut_socket(|socket| match socket.peek() {
+                    Ok(payload) => payload.len(),
+                    Err(_) => 0,
+                })
+            }
+            Some(RawInner::Bound(ref bound)) => {
+                bound.with_mut_socket(|socket| match socket.peek() {
+                    Ok(payload) => payload.len(),
+                    Err(_) => 0,
+                })
+            }
+            _ => 0,
+        })
+    }
+
+    fn send_bytes_available(&self) -> Result<usize, SystemError> {
+        let guard = self.inner.read();
+        Ok(match *guard {
+            Some(RawInner::Wildcard(ref bound)) => {
+                bound.with_socket(|socket| socket.payload_send_capacity() - socket.send_queue())
+            }
+            Some(RawInner::Bound(ref bound)) => {
+                bound.with_socket(|socket| socket.payload_send_capacity() - socket.send_queue())
+            }
+            _ => 0,
+        })
+    }
 }
 
 impl InetSocket for RawSocket {

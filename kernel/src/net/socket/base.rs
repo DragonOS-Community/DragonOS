@@ -48,15 +48,15 @@ pub trait Socket: PollableInode + IndexNode {
     /// # `recv_bytes_available`
     /// Get the number of bytes currently available to read from the socket.
     /// Returns 0 by default for socket types that don't track this.
-    fn recv_bytes_available(&self) -> usize {
-        0
+    fn recv_bytes_available(&self) -> Result<usize, SystemError> {
+        Err(SystemError::ENOTTY)
     }
 
     /// # `send_bytes_available`
     /// Get the number of bytes currently available to write to the socket.
     /// Returns 0 by default for socket types that don't track this.
-    fn send_bytes_available(&self) -> usize {
-        0
+    fn send_bytes_available(&self) -> Result<usize, SystemError> {
+        Err(SystemError::ENOTTY)
     }
 
     /// # `accept`

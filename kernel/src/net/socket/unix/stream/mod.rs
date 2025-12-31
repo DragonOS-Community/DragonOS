@@ -507,12 +507,12 @@ impl Socket for UnixStreamSocket {
         &self.open_files
     }
 
-    fn recv_bytes_available(&self) -> usize {
-        self.ioctl_fionread()
+    fn recv_bytes_available(&self) -> Result<usize, SystemError> {
+        Ok(self.ioctl_fionread())
     }
 
-    fn send_bytes_available(&self) -> usize {
-        self.ioctl_tiocoutq()
+    fn send_bytes_available(&self) -> Result<usize, SystemError> {
+        Ok(self.ioctl_tiocoutq())
     }
 
     fn set_nonblocking(&self, nonblocking: bool) {

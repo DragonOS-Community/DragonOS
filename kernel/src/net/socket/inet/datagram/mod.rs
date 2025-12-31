@@ -482,8 +482,8 @@ impl Socket for UdpSocket {
         size
     }
 
-    fn recv_bytes_available(&self) -> usize {
-        match self.inner.read().as_ref() {
+    fn recv_bytes_available(&self) -> Result<usize, SystemError> {
+        Ok(match self.inner.read().as_ref() {
             Some(UdpInner::Bound(bound)) => {
                 // For UDP, FIONREAD should return the size of the first packet,
                 // not the total bytes in the queue
@@ -495,7 +495,7 @@ impl Socket for UdpSocket {
                 })
             }
             _ => 0,
-        }
+        })
     }
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
@@ -1036,6 +1036,15 @@ impl Socket for UdpSocket {
 
     fn socket_inode_id(&self) -> InodeId {
         self.inode_id
+    }
+
+    fn send_bytes_available(&self) -> Result<usize, SystemError> {
+        Ok(match self.inner.read().as_ref() {
+            Some(UdpInner::Bound(bound)) => {
+                bound.with_socket(|socket| socket.payload_send_capacity() - socket.send_queue())
+            }
+            _ => 0,
+        })
     }
 }
 

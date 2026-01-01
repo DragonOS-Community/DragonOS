@@ -2,7 +2,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     arch::syscall::nr::*,
-    libs::rand::GRandFlags,
     process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
@@ -17,6 +16,7 @@ use crate::arch::interrupt::TrapFrame;
 use self::{misc::SysInfo, user_access::UserBufferWriter};
 
 pub mod misc;
+mod sys_getrandom;
 pub mod table;
 pub mod user_access;
 pub mod user_buffer;
@@ -124,22 +124,6 @@ impl Syscall {
                 Ok(0)
             }
 
-            // 目前为了适配musl-libc,以下系统调用先这样写着
-            SYS_GETRANDOM => {
-                let flags = GRandFlags::from_bits(args[2] as u8).ok_or(SystemError::EINVAL)?;
-                Self::get_random(args[0] as *mut u8, args[1], flags)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_POLL => {
-                let fds = args[0];
-                let nfds = args[1] as u32;
-                let timeout = args[2] as i32;
-                Self::poll(fds, nfds, timeout)
-            }
-
-            SYS_PPOLL => Self::ppoll(args[0], args[1] as u32, args[2], args[3]),
-
             SYS_SYSLOG => {
                 let syslog_action_type = args[0];
                 let buf_vaddr = args[1];
@@ -160,42 +144,6 @@ impl Syscall {
             SYS_FSYNC => {
                 warn!("SYS_FSYNC has not yet been implemented");
                 Ok(0)
-            }
-
-            SYS_RSEQ => {
-                use crate::mm::VirtAddr;
-                use crate::process::rseq;
-                let rseq_ptr = VirtAddr::new(args[0]);
-                let rseq_len = args[1] as u32;
-                let flags = args[2] as i32;
-                let sig = args[3] as u32;
-                rseq::sys_rseq(rseq_ptr, rseq_len, flags, sig)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            SYS_EVENTFD => {
-                let initval = args[0] as u32;
-                Self::sys_eventfd(initval, 0)
-            }
-            SYS_EVENTFD2 => {
-                let initval = args[0] as u32;
-                let flags = args[1] as u32;
-                Self::sys_eventfd(initval, flags)
-            }
-
-            SYS_BPF => {
-                let cmd = args[0] as u32;
-                let attr = args[1] as *mut u8;
-                let size = args[2] as u32;
-                Self::sys_bpf(cmd, attr, size)
-            }
-            SYS_PERF_EVENT_OPEN => {
-                let attr = args[0] as *const u8;
-                let pid = args[1] as i32;
-                let cpu = args[2] as i32;
-                let group_fd = args[3] as i32;
-                let flags = args[4] as u32;
-                Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
 
             _ => {

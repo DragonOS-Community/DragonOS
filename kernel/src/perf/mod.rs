@@ -1,5 +1,6 @@
 mod bpf;
 mod kprobe;
+mod sys_perf_event_open;
 mod tracepoint;
 mod util;
 
@@ -26,8 +27,6 @@ use crate::mm::{MemoryManagementArch, VirtAddr, VmFaultReason};
 use crate::perf::bpf::BpfPerfEvent;
 use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs, PerfProbeConfig};
 use crate::process::ProcessManager;
-use crate::syscall::user_access::UserBufferReader;
-use crate::syscall::Syscall;
 use alloc::boxed::Box;
 use alloc::collections::LinkedList;
 use alloc::string::String;
@@ -348,24 +347,6 @@ impl FileSystem for PerfFakeFs {
         end_pgoff: usize,
     ) -> VmFaultReason {
         PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
-    }
-}
-
-impl Syscall {
-    pub fn sys_perf_event_open(
-        attr: *const u8,
-        pid: i32,
-        cpu: i32,
-        group_fd: i32,
-        flags: u32,
-    ) -> Result<usize> {
-        let buf = UserBufferReader::new(
-            attr as *const perf_event_attr,
-            size_of::<perf_event_attr>(),
-            true,
-        )?;
-        let attr = buf.read_one_from_user(0)?;
-        perf_event_open(attr, pid, cpu, group_fd, flags)
     }
 }
 

@@ -1,18 +1,12 @@
 use core::ffi::c_int;
 
 use crate::{
-    arch::ipc::signal::{SigSet, Signal},
+    arch::ipc::signal::Signal,
     filesystem::epoll::{event_poll::EventPoll, EPollCtlOption, EPollEvent, EPollEventType},
-    ipc::signal::{
-        restore_saved_sigmask_unless, set_user_sigmask, RestartBlock, RestartBlockData, RestartFn,
-    },
+    ipc::signal::{restore_saved_sigmask_unless, RestartBlock, RestartBlockData, RestartFn},
     libs::wait_queue::{TimeoutWaker, Waiter},
-    mm::VirtAddr,
     process::ProcessManager,
-    syscall::{
-        user_access::{UserBufferReader, UserBufferWriter},
-        Syscall,
-    },
+    syscall::user_access::UserBufferWriter,
     time::{
         syscall::PosixTimeval,
         timer::{next_n_us_timer_jiffies, Timer},
@@ -21,7 +15,6 @@ use crate::{
 };
 
 use super::vfs::file::{File, FileFlags};
-use crate::process::resource::RLimitID;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -206,133 +199,6 @@ impl<'a> PollAdapter<'a> {
         // 计算有事件的 pollfd 数量
         let count = self.poll_fds.iter().filter(|pfd| pfd.revents != 0).count();
         Ok(count)
-    }
-}
-
-impl Syscall {
-    /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/select.c#1068
-    #[inline(never)]
-    pub fn poll(pollfd_ptr: usize, nfds: u32, timeout_ms: i32) -> Result<usize, SystemError> {
-        // 检查 nfds 是否超过 RLIMIT_NOFILE
-        let rlimit_nofile = ProcessManager::current_pcb()
-            .get_rlimit(RLimitID::Nofile)
-            .rlim_cur as u32;
-        if nfds > rlimit_nofile {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 检查长度溢出
-        let len = (nfds as usize)
-            .checked_mul(core::mem::size_of::<PollFd>())
-            .ok_or(SystemError::EINVAL)?;
-
-        // 当 nfds > 0 但 pollfd_ptr 为空指针时，返回 EFAULT
-        if nfds > 0 && pollfd_ptr == 0 {
-            return Err(SystemError::EFAULT);
-        }
-
-        let pollfd_ptr = VirtAddr::new(pollfd_ptr);
-
-        let mut timeout: Option<Instant> = None;
-        if timeout_ms >= 0 {
-            timeout = poll_select_set_timeout(timeout_ms as u64);
-        }
-
-        // nfds == 0 时，直接进入等待逻辑，不需要用户缓冲区
-        if nfds == 0 {
-            let mut r = do_sys_poll(&mut [], timeout);
-            if let Err(SystemError::ERESTARTNOHAND) = r {
-                let restart_block_data = RestartBlockData::new_poll(pollfd_ptr, nfds, timeout);
-                let restart_block = RestartBlock::new(&RestartFnPoll, restart_block_data);
-                r = ProcessManager::current_pcb().set_restart_fn(Some(restart_block));
-            }
-            return r;
-        }
-
-        let mut poll_fds_writer = UserBufferWriter::new(pollfd_ptr.as_ptr::<PollFd>(), len, true)?;
-        let mut r = do_sys_poll(poll_fds_writer.buffer(0)?, timeout);
-        if let Err(SystemError::ERESTARTNOHAND) = r {
-            let restart_block_data = RestartBlockData::new_poll(pollfd_ptr, nfds, timeout);
-            let restart_block = RestartBlock::new(&RestartFnPoll, restart_block_data);
-            r = ProcessManager::current_pcb().set_restart_fn(Some(restart_block));
-        }
-
-        return r;
-    }
-
-    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/select.c#1101
-    #[inline(never)]
-    pub fn ppoll(
-        pollfd_ptr: usize,
-        nfds: u32,
-        timespec_ptr: usize,
-        sigmask_ptr: usize,
-    ) -> Result<usize, SystemError> {
-        // 检查 nfds 是否超过 RLIMIT_NOFILE
-        let rlimit_nofile = ProcessManager::current_pcb()
-            .get_rlimit(RLimitID::Nofile)
-            .rlim_cur as u32;
-        if nfds > rlimit_nofile {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 检查长度溢出
-        let pollfds_len = (nfds as usize)
-            .checked_mul(core::mem::size_of::<PollFd>())
-            .ok_or(SystemError::EINVAL)?;
-
-        // 当 nfds > 0 但 pollfd_ptr 为空指针时，返回 EFAULT
-        if nfds > 0 && pollfd_ptr == 0 {
-            return Err(SystemError::EFAULT);
-        }
-
-        let mut timeout_ts: Option<Instant> = None;
-        let mut sigmask: Option<SigSet> = None;
-        let pollfd_ptr = VirtAddr::new(pollfd_ptr);
-
-        if sigmask_ptr != 0 {
-            let sigmask_reader =
-                UserBufferReader::new(sigmask_ptr as *const SigSet, size_of::<SigSet>(), true)?;
-            sigmask = Some(*sigmask_reader.read_one_from_user(0)?);
-        }
-
-        if timespec_ptr != 0 {
-            let tsreader = UserBufferReader::new(
-                timespec_ptr as *const PosixTimeSpec,
-                size_of::<PosixTimeSpec>(),
-                true,
-            )?;
-            let ts: PosixTimeSpec = *tsreader.read_one_from_user(0)?;
-            let timeout_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000;
-
-            if timeout_ms >= 0 {
-                timeout_ts =
-                    Some(poll_select_set_timeout(timeout_ms as u64).ok_or(SystemError::EINVAL)?);
-            }
-        }
-
-        if let Some(mut sigmask) = sigmask {
-            set_user_sigmask(&mut sigmask);
-        }
-
-        // nfds == 0 时，直接进入等待逻辑，不需要用户缓冲区
-        let mut r: Result<usize, SystemError> = if nfds == 0 {
-            do_sys_poll(&mut [], timeout_ts)
-        } else {
-            let mut poll_fds_writer =
-                UserBufferWriter::new(pollfd_ptr.as_ptr::<PollFd>(), pollfds_len, true)?;
-            let poll_fds = poll_fds_writer.buffer(0)?;
-            do_sys_poll(poll_fds, timeout_ts)
-        };
-
-        // 处理信号中断，设置restart block使ppoll可重启
-        if let Err(SystemError::ERESTARTNOHAND) = r {
-            let restart_block_data = RestartBlockData::new_poll(pollfd_ptr, nfds, timeout_ts);
-            let restart_block = RestartBlock::new(&RestartFnPoll, restart_block_data);
-            r = ProcessManager::current_pcb().set_restart_fn(Some(restart_block));
-        }
-
-        return poll_select_finish(timeout_ts, timespec_ptr, PollTimeType::TimeSpec, r);
     }
 }
 
@@ -618,7 +484,7 @@ impl From<PollFlags> for EPollEventType {
 
 /// sys_poll的restart fn
 #[derive(Debug)]
-struct RestartFnPoll;
+pub struct RestartFnPoll;
 
 impl RestartFn for RestartFnPoll {
     // 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/select.c#1047

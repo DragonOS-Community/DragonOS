@@ -734,17 +734,3 @@ pub fn rseq_execve(pcb: &ProcessControlBlock) {
     pcb.rseq_state_mut().registration = None;
     pcb.rseq_state_mut().event_mask.store(0, Ordering::SeqCst);
 }
-
-// ============================================================================
-// 系统调用入口
-// ============================================================================
-
-/// sys_rseq 系统调用
-pub fn sys_rseq(
-    rseq_ptr: VirtAddr,
-    rseq_len: u32,
-    flags: i32,
-    sig: u32,
-) -> Result<usize, SystemError> {
-    Rseq::syscall(rseq_ptr, rseq_len, flags, sig)
-}

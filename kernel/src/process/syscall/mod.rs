@@ -24,6 +24,7 @@ mod sys_init_module;
 mod sys_pidfdopen;
 mod sys_prctl;
 pub mod sys_prlimit64;
+mod sys_rseq;
 mod sys_set_tid_address;
 mod sys_setdomainname;
 mod sys_setfsgid;

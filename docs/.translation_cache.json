@@ -352,5 +352,8 @@
   },
   "en:kernel/ipc/rseq.md": {
     "hash": "b0b020398fb048e2c87135e3bb2974b3"
+  },
+  "en:kernel/locking/rwsem.md": {
+    "hash": "f19bd3e7ace9536b7e5c49fb4a6163e1"
   }
 }

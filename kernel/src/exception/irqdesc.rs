@@ -23,7 +23,8 @@ use crate::{
     libs::{
         cpumask::CpuMask,
         mutex::{Mutex, MutexGuard},
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::percpu::PerCpuVar,
@@ -599,11 +600,11 @@ impl KObject for IrqDesc {
 
     fn set_name(&self, _name: String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

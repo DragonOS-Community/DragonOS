@@ -35,7 +35,8 @@ use crate::{
     init::{boot::boot_callbacks, boot_params, initcall::INITCALL_DEVICE},
     libs::{
         once::Once,
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{early_ioremap::EarlyIoRemap, PhysAddr, VirtAddr},
@@ -259,11 +260,11 @@ impl KObject for VesaFb {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -847,11 +848,11 @@ impl KObject for VesaFbDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

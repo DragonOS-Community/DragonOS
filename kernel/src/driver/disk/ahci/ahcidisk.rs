@@ -21,7 +21,7 @@ use crate::driver::disk::ahci::hba::{
     FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT, ATA_DEV_BUSY,
     ATA_DEV_DRQ,
 };
-use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
+use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::{verify_area, MemoryManagementArch, PhysAddr, VirtAddr};
 use log::error;
@@ -431,11 +431,11 @@ impl KObject for LockedAhciDisk {
         todo!()
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         todo!()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         todo!()
     }
 

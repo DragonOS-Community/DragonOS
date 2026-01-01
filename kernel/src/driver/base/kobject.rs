@@ -15,7 +15,7 @@ use crate::{
     },
     libs::{
         casting::DowncastArc,
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
     },
 };
@@ -52,9 +52,9 @@ pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
 
     fn set_name(&self, name: String);
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState>;
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState>;
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState>;
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState>;
 
     fn set_kobj_state(&self, state: KObjectState);
 }
@@ -108,17 +108,17 @@ bitflags! {
     }
 }
 #[derive(Debug)]
-pub struct LockedKObjectState(RwLock<KObjectState>);
+pub struct LockedKObjectState(RwSem<KObjectState>);
 
 impl LockedKObjectState {
     pub fn new(state: Option<KObjectState>) -> LockedKObjectState {
         let state = state.unwrap_or(KObjectState::empty());
-        LockedKObjectState(RwLock::new(state))
+        LockedKObjectState(RwSem::new(state))
     }
 }
 
 impl Deref for LockedKObjectState {
-    type Target = RwLock<KObjectState>;
+    type Target = RwSem<KObjectState>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -339,11 +339,11 @@ impl KObject for CommonKobj {
         // Do nothing
     }
 
-    fn kobj_state(&'_ self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&'_ self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobjstate.read()
     }
 
-    fn kobj_state_mut(&'_ self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&'_ self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobjstate.write()
     }
 

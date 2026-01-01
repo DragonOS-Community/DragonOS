@@ -10,7 +10,7 @@ use crate::{
     },
     filesystem::kernfs::KernFSInode,
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -137,11 +137,11 @@ impl KObject for LoopDeviceDriver {
         // do nothing
     }
 
-    fn kobj_state(&'_ self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&'_ self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&'_ self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&'_ self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

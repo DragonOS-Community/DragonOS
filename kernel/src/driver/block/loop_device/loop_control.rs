@@ -19,7 +19,8 @@ use crate::{
         },
     },
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::ProcessManager,
@@ -342,11 +343,11 @@ impl KObject for LoopControlDevice {
         // do nothing
     }
 
-    fn kobj_state(&'_ self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&'_ self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&'_ self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&'_ self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

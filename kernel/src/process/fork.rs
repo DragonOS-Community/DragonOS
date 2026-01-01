@@ -17,7 +17,7 @@ use system_error::SystemError;
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
     ipc::signal_types::SignalFlags,
-    libs::rwlock::RwLock,
+    libs::rwsem::RwSem,
     mm::VirtAddr,
     process::ProcessFlags,
     sched::{sched_cgroup_fork, sched_fork},
@@ -310,7 +310,7 @@ impl ProcessManager {
         // 如果不共享文件描述符表，则拷贝文件描述符表
         if !clone_flags.contains(CloneFlags::CLONE_FILES) {
             let new_fd_table = current_pcb.basic().try_fd_table().unwrap().read().clone();
-            let new_fd_table = Arc::new(RwLock::new(new_fd_table));
+            let new_fd_table = Arc::new(RwSem::new(new_fd_table));
             new_pcb.basic_mut().set_fd_table(Some(new_fd_table));
         } else {
             // 如果共享文件描述符表，则直接拷贝指针

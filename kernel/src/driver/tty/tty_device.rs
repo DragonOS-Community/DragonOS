@@ -36,10 +36,7 @@ use crate::{
         },
     },
     init::initcall::INITCALL_DEVICE,
-    libs::{
-        rwlock::{RwLock, RwLockWriteGuard},
-        spinlock::SpinLockGuard,
-    },
+    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
     mm::VirtAddr,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
@@ -144,7 +141,7 @@ impl TtyDevice {
         Arc::new(dev)
     }
 
-    pub fn inner_write(&self) -> RwLockWriteGuard<'_, InnerTtyDevice> {
+    pub fn inner_write(&self) -> crate::libs::rwlock::RwLockWriteGuard<'_, InnerTtyDevice> {
         self.inner.write()
     }
 
@@ -601,13 +598,13 @@ impl KObject for TtyDevice {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.read()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.write()
     }
 

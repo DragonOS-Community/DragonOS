@@ -34,7 +34,7 @@ use crate::{
         manage::irq_manager,
         IrqNumber,
     },
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{rwsem::RwSem, spinlock::SpinLock},
 };
 use system_error::SystemError;
 
@@ -104,7 +104,7 @@ pub struct Serial8250PIOPort {
     iobase: Serial8250PortBase,
     baudrate: AtomicBaudRate,
     initialized: AtomicBool,
-    inner: RwLock<Serial8250PIOPortInner>,
+    inner: RwSem<Serial8250PIOPortInner>,
 }
 
 impl Serial8250PIOPort {
@@ -114,7 +114,7 @@ impl Serial8250PIOPort {
             iobase,
             baudrate: AtomicBaudRate::new(baudrate),
             initialized: AtomicBool::new(false),
-            inner: RwLock::new(Serial8250PIOPortInner::new()),
+            inner: RwSem::new(Serial8250PIOPortInner::new()),
         };
 
         r.check_baudrate(&baudrate)?;

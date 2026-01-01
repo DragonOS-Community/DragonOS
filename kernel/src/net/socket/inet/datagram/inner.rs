@@ -12,8 +12,12 @@ use crate::{
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
 pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
-pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
+// UDP maximum datagram size is 65507 bytes (65535 - 8 byte UDP header - 20 byte IP header)
+// Set buffer sizes to accommodate this plus some overhead
+pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024; // 128 KB
+pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024; // 128 KB
+                                                   // Minimum buffer size (Linux uses 256 bytes minimum)
+pub const MIN_BUF_SIZE: usize = 256;
 
 #[derive(Debug)]
 pub struct UnboundUdp {
@@ -22,13 +26,53 @@ pub struct UnboundUdp {
 
 impl UnboundUdp {
     pub fn new() -> Self {
+        Self::new_with_buf_size(0, 0)
+    }
+
+    pub fn new_with_buf_size(rx_size: usize, tx_size: usize) -> Self {
+        // Buffer sizing strategy:
+        // - setsockopt(SO_RCVBUF, X) stores X
+        // - getsockopt(SO_RCVBUF) returns 2*X (Linux convention)
+        // - Actual buffer allocation: 2*X
+        //
+        // This is a straightforward 2x design that matches the getsockopt return value.
+        //
+        // Note: smoltcp's PacketBuffer has separate metadata_ring and payload_ring.
+        // Unlike Linux where sk_buff metadata shares the same buffer space as payload,
+        // smoltcp allocates them independently. This means:
+        // - We allocate 2*X bytes purely for payload (no metadata overhead)
+        // - This may accept more packets than Linux in some edge cases
+        //
+        // Differences from Linux behavior:
+        // - Linux: Buffer space shared between metadata + payload, so effective payload < 2*X
+        // - DragonOS: Full 2*X available for payload (metadata stored separately)
+
+        let rx_buf_size = if rx_size > 0 {
+            rx_size * 2 // Simple 2x allocation
+        } else {
+            DEFAULT_RX_BUF_SIZE
+        };
+        let tx_buf_size = if tx_size > 0 {
+            tx_size * 2 // Simple 2x allocation
+        } else {
+            DEFAULT_TX_BUF_SIZE
+        };
+
+        // log::debug!(
+        //     "new_with_buf_size: requested rx={}, tx={} -> allocating rx={}, tx={} (2x)",
+        //     rx_size,
+        //     tx_size,
+        //     rx_buf_size,
+        //     tx_buf_size
+        // );
+
         let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_RX_BUF_SIZE],
+            vec![0; rx_buf_size],
         );
         let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_TX_BUF_SIZE],
+            vec![0; tx_buf_size],
         );
         let socket = SmolUdpSocket::new(rx_buffer, tx_buffer);
 
@@ -43,11 +87,17 @@ impl UnboundUdp {
         let inner = BoundInner::bind(self.socket, &local_endpoint.addr, netns)?;
         let bind_addr = local_endpoint.addr;
         let bind_port = if local_endpoint.port == 0 {
-            inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?
+            let port = inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?;
+            // log::debug!("UnboundUdp::bind: allocated ephemeral port {}", port);
+            port
         } else {
             inner
                 .port_manager()
                 .bind_port(InetTypes::Udp, local_endpoint.port)?;
+            // log::debug!(
+            //     "UnboundUdp::bind: explicit bind to port {}",
+            //     local_endpoint.port
+            // );
             local_endpoint.port
         };
 
@@ -69,6 +119,8 @@ impl UnboundUdp {
         Ok(BoundUdp {
             inner,
             remote: SpinLock::new(None),
+            explicitly_bound: true,
+            has_preconnect_data: SpinLock::new(false),
         })
     }
 
@@ -77,13 +129,36 @@ impl UnboundUdp {
         remote: smoltcp::wire::IpAddress,
         netns: Arc<NetNamespace>,
     ) -> Result<BoundUdp, SystemError> {
-        // let (addr, port) = (remote.addr, remote.port);
-        let (inner, address) = BoundInner::bind_ephemeral(self.socket, remote, netns)?;
+        let (inner, local_addr) = BoundInner::bind_ephemeral(self.socket, remote, netns)?;
         let bound_port = inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?;
-        let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
+        // log::debug!(
+        //     "UnboundUdp::bind_ephemeral: allocated ephemeral port {} for remote {:?}",
+        //     bound_port,
+        //     remote
+        // );
+
+        // Bind the smoltcp socket to the local endpoint
+        if local_addr.is_unspecified() {
+            if inner
+                .with_mut::<smoltcp::socket::udp::Socket, _, _>(|socket| socket.bind(bound_port))
+                .is_err()
+            {
+                return Err(SystemError::EINVAL);
+            }
+        } else if inner
+            .with_mut::<smoltcp::socket::udp::Socket, _, _>(|socket| {
+                socket.bind(smoltcp::wire::IpEndpoint::new(local_addr, bound_port))
+            })
+            .is_err()
+        {
+            return Err(SystemError::EINVAL);
+        }
+
         Ok(BoundUdp {
             inner,
-            remote: SpinLock::new(Some(endpoint)),
+            remote: SpinLock::new(None),
+            explicitly_bound: false,
+            has_preconnect_data: SpinLock::new(false),
         })
     }
 }
@@ -92,6 +167,13 @@ impl UnboundUdp {
 pub struct BoundUdp {
     inner: BoundInner,
     remote: SpinLock<Option<smoltcp::wire::IpEndpoint>>,
+    /// True if socket was explicitly bound by user, false if implicitly bound by connect
+    explicitly_bound: bool,
+    /// Whether there were buffered packets at connect time - if true, allow next recv without filtering
+    /// 这是用来模拟 Linux UDP 在应用filter前的行为。在smoltcp下，当有包到来时总是会推送到
+    /// udp socket queue 中，而不是先针对connect进行filter操作。这里做workaround, 当connect是检查是否有包
+    /// 在缓冲区，如果有，第一个包我们走非connect而不是connect的recv方法（即接受第一个非connect对端对应的包）
+    has_preconnect_data: SpinLock<bool>,
 }
 
 impl BoundUdp {
@@ -123,21 +205,141 @@ impl BoundUdp {
     }
 
     pub fn connect(&self, remote: smoltcp::wire::IpEndpoint) {
+        // let _local = self.endpoint();
+        // log::debug!(
+        //     "BoundUdp::connect: local={:?}, connecting to remote={:?}",
+        //     _local,
+        //     remote
+        // );
+
+        // Check if there are buffered packets - if so, allow next recv without filtering
+        let has_buffered = self.with_socket(|socket| socket.can_recv());
+        *self.has_preconnect_data.lock() = has_buffered;
+        // log::debug!("BoundUdp::connect: has pre-connect data = {}", has_buffered);
+
         self.remote.lock().replace(remote);
+    }
+
+    pub fn disconnect(&self) {
+        self.remote.lock().take();
+    }
+
+    /// Returns true if this socket should be unbound on disconnect
+    pub fn should_unbind_on_disconnect(&self) -> bool {
+        !self.explicitly_bound
     }
 
     #[inline]
     pub fn try_recv(
         &self,
         buf: &mut [u8],
+        peek: bool,
     ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
+        let remote = *self.remote.lock();
+
         self.with_mut_socket(|socket| {
-            if socket.can_recv() {
-                if let Ok((size, metadata)) = socket.recv_slice(buf) {
-                    return Ok((size, metadata.endpoint));
-                }
+            // If connected, filter packets by source address (except pre-connect packets)
+
+            let mut has_preconnect_guard = self.has_preconnect_data.lock();
+            let has_preconnect = *has_preconnect_guard;
+            // let has_preconnect = false;
+            if has_preconnect {
+                *has_preconnect_guard = false;
             }
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            drop(has_preconnect_guard);
+            let should_filter = remote.is_some() && !has_preconnect;
+            if should_filter {
+                let expected_remote = remote.unwrap();
+                // log::debug!("try_recv: connected mode, expected_remote={:?}, buf_len={}, can_recv={}",
+                //     expected_remote, buf.len(), socket.can_recv());
+
+                // Loop to skip packets from unexpected sources
+                loop {
+                    if !socket.can_recv() {
+                        // log::debug!("try_recv: can_recv=false, returning EAGAIN");
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+
+                    // Peek to check source address before receiving
+                    // Note: peek() instead of peek_slice() because peek_slice() returns Truncated
+                    // error when buffer is smaller than packet, but we still want to receive it
+                    match socket.peek() {
+                        Ok((payload, metadata)) => {
+                            // log::debug!("try_recv: peeked {} bytes from {:?}, buf_len={}", payload.len(), metadata.endpoint, buf.len());
+                            if metadata.endpoint == expected_remote {
+                                // Source matches
+
+                                // Special case: zero-length buffer
+                                if buf.is_empty() {
+                                    // log::debug!("try_recv: zero-length buffer in connected mode, returning 0 bytes");
+                                    return Ok((0, expected_remote));
+                                }
+
+                                if peek {
+                                    // MSG_PEEK: just copy the data we peeked
+                                    let copy_len = core::cmp::min(buf.len(), payload.len());
+                                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                                    // log::debug!("try_recv: peek succeeded, size={}", copy_len);
+                                    return Ok((copy_len, expected_remote));
+                                } else {
+                                    // Receive the packet
+                                    let (recv_buf, _metadata) =
+                                        socket.recv().map_err(|_| SystemError::ENOBUFS)?;
+                                    let length = core::cmp::min(buf.len(), recv_buf.len());
+                                    buf[..length].copy_from_slice(&recv_buf[..length]);
+                                    debug_assert_eq!(expected_remote, _metadata.endpoint);
+                                    return Ok((length, expected_remote));
+                                }
+                            } else {
+                                // just drop the packet
+                                let _ = socket.recv();
+                                continue;
+                            }
+                        }
+                        Err(smoltcp::socket::udp::RecvError::Exhausted) => {
+                            return Err(SystemError::ENOBUFS)
+                        }
+                        Err(_e) => return Err(SystemError::EIO),
+                    }
+                }
+            } else {
+                // log::debug!("try_recv: unconnected mode, buf_len={}, can_recv={}", buf.len(), socket.can_recv());
+                // Not connected, receive from any source
+
+                // Special case: if buffer length is 0, just peek to check if data exists
+                if buf.is_empty() {
+                    if socket.can_recv() {
+                        // Peek to get the source endpoint without consuming data
+                        if let Ok((_payload, metadata)) = socket.peek() {
+                            // log::debug!("try_recv: zero-length buffer with data available, returning 0 bytes from {:?}", metadata.endpoint);
+                            return Ok((0, metadata.endpoint));
+                        }
+                    }
+                    // log::debug!("try_recv: zero-length buffer with no data, returning EAGAIN");
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+
+                if socket.can_recv() {
+                    if peek {
+                        // MSG_PEEK: peek data without consuming
+                        if let Ok((payload, metadata)) = socket.peek() {
+                            let copy_len = core::cmp::min(buf.len(), payload.len());
+                            buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                            // log::debug!("try_recv: unconnected peek succeeded, size={}", copy_len);
+                            return Ok((copy_len, metadata.endpoint));
+                        }
+                    } else {
+                        // Receive the packet                       // Receive the packet
+                        let (recv_buf, metadata) =
+                            socket.recv().map_err(|_| SystemError::ENOBUFS)?;
+                        let length = core::cmp::min(buf.len(), recv_buf.len());
+                        buf[..length].copy_from_slice(&recv_buf[..length]);
+                        return Ok((length, metadata.endpoint));
+                    }
+                }
+                // log::debug!("try_recv: unconnected recv failed, returning EAGAIN");
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
         })
     }
 
@@ -146,15 +348,45 @@ impl BoundUdp {
         buf: &[u8],
         to: Option<smoltcp::wire::IpEndpoint>,
     ) -> Result<usize, SystemError> {
-        let remote = to.or(*self.remote.lock()).ok_or(SystemError::ENOTCONN)?;
-        let result = self.with_mut_socket(|socket| {
-            if socket.can_send() && socket.send_slice(buf, remote).is_ok() {
-                // log::debug!("send {} bytes", buf.len());
-                return Ok(buf.len());
+        let connected_remote = *self.remote.lock();
+        let mut remote = to.or(connected_remote).ok_or(SystemError::ENOTCONN)?;
+
+        // Validate port - sending to port 0 is invalid
+        if remote.port == 0 {
+            log::warn!("UDP try_send: attempted to send to port 0");
+            return Err(SystemError::EINVAL);
+        }
+
+        // Linux treats sending to 0.0.0.0 (INADDR_ANY) as sending to localhost
+        // smoltcp rejects it as "Unaddressable", so we translate it here
+        if remote.addr.is_unspecified() {
+            remote.addr = smoltcp::wire::IpAddress::v4(127, 0, 0, 1);
+        }
+
+        // log::debug!(
+        //     "try_send: sending {} bytes to {:?}, can_send={}",
+        //     buf.len(),
+        //     remote,
+        //     self.with_socket(|socket| socket.can_send())
+        // );
+
+        self.with_mut_socket(|socket| {
+            if socket.can_send() {
+                match socket.send_slice(buf, remote) {
+                    Ok(_) => {
+                        // log::debug!("try_send: send successful");
+                        Ok(buf.len())
+                    }
+                    Err(_e) => {
+                        // log::debug!("try_send: send failed: {:?}", _e);
+                        Err(SystemError::ENOBUFS)
+                    }
+                }
+            } else {
+                // log::debug!("try_send: can_send=false, returning ENOBUFS");
+                Err(SystemError::ENOBUFS)
             }
-            return Err(SystemError::ENOBUFS);
-        });
-        return result;
+        })
     }
 
     pub fn inner(&self) -> &BoundInner {

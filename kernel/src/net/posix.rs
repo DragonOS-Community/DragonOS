@@ -217,6 +217,12 @@ impl From<LinkLayerEndpoint> for SockAddr {
 impl From<Endpoint> for SockAddr {
     fn from(value: Endpoint) -> Self {
         match value {
+            Endpoint::Unspecified => Self {
+                addr_ph: SockAddrPlaceholder {
+                    family: 0, // AF_UNSPEC
+                    data: [0; 14],
+                },
+            },
             Endpoint::LinkLayer(link_layer_endpoint) => Self::from(link_layer_endpoint),
             Endpoint::Ip(endpoint) => Self::from(endpoint),
             Endpoint::Unix(unix_endpoint) => Self::from(unix_endpoint),
@@ -257,11 +263,11 @@ impl SockAddr {
             AddressFamily::INet => {
                 // 下限检查：至少需要包含完整的 sockaddr_in 结构体
                 if len < size_of::<SockAddrIn>() as u32 {
-                    log::error!(
-                        "len {} < sizeof(sockaddr_in) {}",
-                        len,
-                        size_of::<SockAddrIn>()
-                    );
+                    // log::error!(
+                    //     "len {} < sizeof(sockaddr_in) {}",
+                    //     len,
+                    //     size_of::<SockAddrIn>()
+                    // );
                     return Err(SystemError::EINVAL);
                 }
 
@@ -275,6 +281,12 @@ impl SockAddr {
 
                 return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
             }
+
+            AddressFamily::Unspecified => {
+                // AF_UNSPEC is used to disconnect sockets
+                Ok(Endpoint::Unspecified)
+            }
+
             AddressFamily::INet6 => {
                 // 下限检查：至少需要包含完整的 sockaddr_in6 结构体
                 if len < size_of::<SockAddrIn6>() as u32 {

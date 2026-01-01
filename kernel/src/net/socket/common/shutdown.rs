@@ -31,14 +31,9 @@ impl TryFrom<usize> for ShutdownBit {
         // Linux/POSIX shutdown(2):
         //   0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR
         match value {
-            0 => Ok(ShutdownBit {
-                bit: Self::RCV_SHUTDOWN,
-            }),
-            1 => Ok(ShutdownBit {
-                bit: Self::SEND_SHUTDOWN,
-            }),
-            2 => Ok(ShutdownBit {
-                bit: Self::RCV_SHUTDOWN | Self::SEND_SHUTDOWN,
+            // SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2
+            0..=2 => Ok(ShutdownBit {
+                bit: value as u8 + 1,
             }),
             _ => Err(Self::Error::EINVAL),
         }

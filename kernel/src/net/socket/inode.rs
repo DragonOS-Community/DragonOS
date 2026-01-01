@@ -19,6 +19,8 @@ use crate::net::socket::IFNAMSIZ;
 // Socket ioctl commands
 const SIOCGIFCONF: u32 = 0x8912; // Get interface list
 const SIOCGIFINDEX: u32 = 0x8933; // name -> if_index mapping
+const FIONREAD: u32 = 0x541B; // Get number of bytes available to read
+const TIOCOUTQ: u32 = 0x5411; // Get output queue size
 
 /// ## ifreq - Interface request structure
 /// Used for socket ioctls. Must match C struct layout.
@@ -325,6 +327,13 @@ impl<T: Socket + 'static> IndexNode for T {
         buf: &[u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        if buf.is_empty() {
+            log::debug!(
+                "Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}",
+                buf.len(),
+                _len
+            );
+        }
         drop(data);
         self.write(buf)
     }
@@ -356,17 +365,47 @@ impl<T: Socket + 'static> IndexNode for T {
         Ok(md)
     }
 
-    // TODO: implement ioctl for socket
+    /// 这里应该实现 通用 Socket 作为 IndexNode 的 ioctl 选项
+    /// 对于协议特定的 ioctl 选项实现，请在各个 Socket impl trait 内实现
+    ///
+    /// ## 层级结构
+    ///
+    /// `dyn IndexNode::ioctl` -> `impl IndexNode for T: Socket` -> `dyn Socket::ioctl`
+    ///
+    /// Socket trait 的 ioctl 覆盖了 IndexNode 这一层的调用，但由于 `impl IndexNode for T: Socket`，
+    /// 我们先调用在 IndexNode 这一层为 Socket 默认实现的 ioctl，再调用 `Socket` trait 内
+    /// 的 ioctl
     fn ioctl(
         &self,
         cmd: u32,
         data: usize,
-        private_data: &FilePrivateData,
+        _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         match cmd {
             SIOCGIFCONF => handle_siocgifconf(data),
             SIOCGIFINDEX => handle_siocgifindex(data),
-            _ => Socket::ioctl(self, cmd, data, private_data),
+            FIONREAD /* TIOCINQ */ => {
+                // Get number of bytes available to read
+                let bytes_available = self.recv_bytes_available()?;
+                let mut writer =
+                    UserBufferWriter::new(data as *mut u8, core::mem::size_of::<i32>(), true)?;
+                let to_write = core::cmp::min(bytes_available, i32::MAX as usize) as i32;
+                writer.buffer_protected(0)?.write_one::<i32>(0, &to_write)?;
+                Ok(0)
+            }
+            TIOCOUTQ => {
+                // Get number of bytes available to write
+                let bytes_available = self.send_bytes_available()?;
+                let mut writer =
+                    UserBufferWriter::new(data as *mut u8, core::mem::size_of::<i32>(), true)?;
+                let to_write = core::cmp::min(bytes_available, i32::MAX as usize) as i32;
+                writer.buffer_protected(0)?.write_one::<i32>(0, &to_write)?;
+                Ok(0)
+            }
+            _ => {
+                // 透穿调用子协议栈的ioctl
+                Socket::ioctl(self, cmd, data, _private_data)
+            }
         }
     }
 

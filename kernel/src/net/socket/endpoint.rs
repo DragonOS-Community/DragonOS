@@ -10,6 +10,8 @@ pub use smoltcp::wire::IpEndpoint;
 
 #[derive(Debug, Clone)]
 pub enum Endpoint {
+    /// 未指定端点 (AF_UNSPEC) - 用于UDP断开连接
+    Unspecified,
     /// 链路层端点
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
@@ -95,6 +97,7 @@ impl From<IpEndpoint> for Endpoint {
 impl Endpoint {
     fn sockaddr_len(&self) -> Result<u32, system_error::SystemError> {
         match self {
+            Endpoint::Unspecified => Ok(SockAddr::from(self.clone()).len()?),
             Endpoint::LinkLayer(_) => Ok(SockAddr::from(self.clone()).len()?),
             Endpoint::Ip(_) => Ok(SockAddr::from(self.clone()).len()?),
             Endpoint::Netlink(_) => Ok(SockAddr::from(self.clone()).len()?),

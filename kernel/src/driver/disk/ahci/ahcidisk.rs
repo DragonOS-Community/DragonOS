@@ -23,7 +23,7 @@ use crate::driver::disk::ahci::hba::{
 };
 use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::mm::{verify_area, MemoryManagementArch, PhysAddr, VirtAddr};
+use crate::mm::{access_ok, MemoryManagementArch, PhysAddr, VirtAddr};
 use log::error;
 use system_error::SystemError;
 
@@ -114,7 +114,7 @@ impl AhciDisk {
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
 
-        let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
+        let user_buf = access_ok(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
             let x: Vec<u8> = vec![0; buf.len()];
             Some(x)
@@ -276,7 +276,7 @@ impl AhciDisk {
 
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
-        let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
+        let user_buf = access_ok(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
             let mut x: Vec<u8> = vec![0; buf.len()];
             x.resize(buf.len(), 0);

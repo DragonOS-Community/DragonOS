@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use system_error::SystemError;
 
 use crate::{
-    mm::verify_area,
+    mm::access_ok,
     mm::VirtAddr,
     syscall::user_access::{
         copy_from_user_protected, user_accessible_len, UserBufferReader, UserBufferWriter,
@@ -93,7 +93,7 @@ impl IoVecs {
             // This checks that the address range is within user space limits,
             // but does NOT traverse page tables or check actual mappings.
             // Actual page mapping/permission checks happen during copy operations.
-            verify_area(base, one.iov_len)?;
+            access_ok(base, one.iov_len)?;
 
             // Skip zero-length iovecs after validation
             if one.iov_len == 0 {

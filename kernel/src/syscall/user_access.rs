@@ -13,7 +13,7 @@ use defer::defer;
 
 use crate::{
     arch::MMArch,
-    mm::{verify_area, MemoryManagementArch, VirtAddr, VmFlags},
+    mm::{access_ok, MemoryManagementArch, VirtAddr, VmFlags},
     process::ProcessManager,
 };
 
@@ -57,7 +57,7 @@ pub unsafe fn clear_user_protected(dest: VirtAddr, len: usize) -> Result<usize, 
 ///
 /// - `EFAULT`: Destination address is invalid
 pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemError> {
-    verify_area(dest, len).map_err(|_| SystemError::EFAULT)?;
+    access_ok(dest, len).map_err(|_| SystemError::EFAULT)?;
 
     let p = dest.data() as *mut u8;
     // Clear user space data
@@ -67,7 +67,7 @@ pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemErro
 }
 
 pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
-    verify_area(dest, src.len()).map_err(|_| SystemError::EFAULT)?;
+    access_ok(dest, src.len()).map_err(|_| SystemError::EFAULT)?;
     MMArch::disable_kernel_wp();
     defer!({
         MMArch::enable_kernel_wp();
@@ -224,7 +224,7 @@ impl UserBufferReader<'_> {
         if len != 0 && (addr as usize) == 0 {
             return Err(SystemError::EFAULT);
         }
-        if from_user && verify_area(VirtAddr::new(addr as usize), len).is_err() {
+        if from_user && access_ok(VirtAddr::new(addr as usize), len).is_err() {
             return Err(SystemError::EFAULT);
         }
         return Ok(Self {
@@ -612,7 +612,7 @@ impl<'a> UserBufferWriter<'a> {
         if len != 0 && (addr as usize) == 0 {
             return Err(SystemError::EFAULT);
         }
-        if from_user && verify_area(VirtAddr::new(addr as usize), len).is_err() {
+        if from_user && access_ok(VirtAddr::new(addr as usize), len).is_err() {
             return Err(SystemError::EFAULT);
         }
         return Ok(Self {

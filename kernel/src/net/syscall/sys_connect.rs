@@ -43,7 +43,7 @@ impl Syscall for SysConnectHandle {
         // Verify address validity if from user space
         if frame.is_from_user() {
             let virt_addr = VirtAddr::new(addr as usize);
-            if crate::mm::verify_area(virt_addr, addrlen).is_err() {
+            if crate::mm::access_ok(virt_addr, addrlen).is_err() {
                 return Err(SystemError::EFAULT);
             }
         }

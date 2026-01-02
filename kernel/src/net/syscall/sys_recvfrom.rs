@@ -50,20 +50,20 @@ impl Syscall for SysRecvfromHandle {
         // Verify buffer and address validity if from user space
         if frame.is_from_user() {
             let virt_buf = VirtAddr::new(buf as usize);
-            if crate::mm::verify_area(virt_buf, len).is_err() {
+            if crate::mm::access_ok(virt_buf, len).is_err() {
                 return Err(SystemError::EFAULT);
             }
 
             if !addrlen.is_null() {
                 let virt_addrlen = VirtAddr::new(addrlen as usize);
-                if crate::mm::verify_area(virt_addrlen, core::mem::size_of::<u32>()).is_err() {
+                if crate::mm::access_ok(virt_addrlen, core::mem::size_of::<u32>()).is_err() {
                     return Err(SystemError::EFAULT);
                 }
             }
 
             if !addr.is_null() {
                 let virt_addr = VirtAddr::new(addr as usize);
-                if crate::mm::verify_area(virt_addr, core::mem::size_of::<SockAddr>()).is_err() {
+                if crate::mm::access_ok(virt_addr, core::mem::size_of::<SockAddr>()).is_err() {
                     return Err(SystemError::EFAULT);
                 }
             }

@@ -4,7 +4,7 @@ use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MPROTECT, MMArch};
 use crate::mm::{
     syscall::{page_align_up, PageFrameCount, ProtFlags},
     ucontext::AddressSpace,
-    MemoryManagementArch, VirtPageFrame, {verify_area, VirtAddr},
+    MemoryManagementArch, VirtPageFrame, {access_ok, VirtAddr},
 };
 
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -53,7 +53,7 @@ impl Syscall for SysMprotectHandle {
             return Err(SystemError::ENOMEM);
         }
 
-        if verify_area(start_vaddr, len_aligned).is_err() {
+        if access_ok(start_vaddr, len_aligned).is_err() {
             return Err(SystemError::EFAULT);
         }
 

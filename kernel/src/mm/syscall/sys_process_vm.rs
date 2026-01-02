@@ -12,7 +12,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::{SYS_PROCESS_VM_READV, SYS_PROCESS_VM_WRITEV};
 use crate::arch::MMArch;
 use crate::filesystem::vfs::iov::IoVec;
-use crate::mm::{verify_area, KernelWpGuard, MemoryManagementArch, PhysAddr, VirtAddr};
+use crate::mm::{access_ok, KernelWpGuard, MemoryManagementArch, PhysAddr, VirtAddr};
 use crate::process::cred::CAPFlags;
 use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -293,7 +293,7 @@ fn do_process_vm_readv(
         let remote_addr = VirtAddr::new(remote_iov.iov_base as usize + remote_offset);
 
         // Verify local buffer is writable
-        if verify_area(local_addr, chunk_len).is_err() {
+        if access_ok(local_addr, chunk_len).is_err() {
             if bytes_copied > 0 {
                 return Ok(bytes_copied);
             }
@@ -455,7 +455,7 @@ fn do_process_vm_writev(
         let remote_addr = VirtAddr::new(remote_iov.iov_base as usize + remote_offset);
 
         // Verify local buffer is readable
-        if verify_area(local_addr, chunk_len).is_err() {
+        if access_ok(local_addr, chunk_len).is_err() {
             if bytes_copied > 0 {
                 return Ok(bytes_copied);
             }

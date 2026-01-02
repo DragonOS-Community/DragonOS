@@ -7,7 +7,7 @@ use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::file::FilePrivateData;
 use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::InodeMode;
-use crate::mm::verify_area;
+use crate::mm::access_ok;
 use crate::mm::MemoryManagementArch;
 use crate::process::pid::PidPrivateData;
 use alloc::{string::ToString, sync::Arc};
@@ -152,7 +152,7 @@ impl KernelCloneArgs {
 
     pub fn verify(&self) -> Result<(), SystemError> {
         if self.flags.contains(CloneFlags::CLONE_SETTLS) {
-            verify_area(VirtAddr::new(self.tls), MMArch::PAGE_SIZE)
+            access_ok(VirtAddr::new(self.tls), MMArch::PAGE_SIZE)
                 .map_err(|_| SystemError::EPERM)?;
         }
         Ok(())

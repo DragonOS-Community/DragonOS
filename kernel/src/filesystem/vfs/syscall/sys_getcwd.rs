@@ -6,7 +6,7 @@ use crate::alloc::string::ToString;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETCWD;
 use crate::filesystem::vfs::utils::is_ancestor;
-use crate::mm::verify_area;
+use crate::mm::access_ok;
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -36,7 +36,7 @@ impl Syscall for SysGetcwdHandle {
         let size = Self::size(args);
 
         let security_check = || {
-            verify_area(VirtAddr::new(buf_vaddr as usize), size)?;
+            access_ok(VirtAddr::new(buf_vaddr as usize), size)?;
             return Ok(());
         };
         let r = security_check();

@@ -55,7 +55,7 @@ impl Syscall for SysSetsockoptHandle {
         // Verify optval address validity if from user space
         if frame.is_from_user() {
             let virt_optval = VirtAddr::new(optval as usize);
-            if crate::mm::verify_area(virt_optval, optlen_to_read).is_err() {
+            if crate::mm::access_ok(virt_optval, optlen_to_read).is_err() {
                 return Err(SystemError::EFAULT);
             }
         }

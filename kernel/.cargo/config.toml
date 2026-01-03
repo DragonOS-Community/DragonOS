@@ -2,11 +2,27 @@
 build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 
+# 配置默认编译目标
+[build]
+target = "src/arch/x86_64/x86_64-unknown-none.json"
+# 切换target后重启language server
+# target = "src/arch/riscv64/riscv64gc-unknown-none-elf.json"
+# target = "src/arch/loongarch64/loongarch64-unknown-none.json"
+rustflags = ["-Clink-args=-znostart-stop-gc"]
+rustdocflags = ["-Clink-args=-znostart-stop-gc"]
+
 [target.'cfg(target_os = "none")']
 runner = "bootimage runner"
 
-[build]
-target = "src/arch/x86_64/x86_64-unknown-none.json"
+[target."src/arch/x86_64/x86_64-unknown-none.json"]
+rustflags = ["-Clink-args=-znostart-stop-gc"]
+rustdocflags = ["-Clink-args=-znostart-stop-gc"]
+
+[target."src/arch/riscv64/riscv64gc-unknown-none-elf.json"]
+rustflags = ["-Clink-args=-znostart-stop-gc"]
+rustdocflags = ["-Clink-args=-znostart-stop-gc"]
+
+[target."src/arch/loongarch64/loongarch64-unknown-none.json"]
 rustflags = ["-Clink-args=-znostart-stop-gc"]
 rustdocflags = ["-Clink-args=-znostart-stop-gc"]
 

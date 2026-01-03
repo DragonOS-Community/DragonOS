@@ -26,14 +26,14 @@ jobs:
       - name: Build slab_stress (host)
         shell: bash -ileo pipefail {0}
         run: |
-          cd kernel/crates/rust-slabmalloc
+          cd crates/rust-slabmalloc
           cargo build --release --features host --bin slab_stress
 
       - name: Upload slab_stress binary
         uses: actions/upload-artifact@v4
         with:
           name: slab_stress-binary-${{ github.run_id }}-${{ github.run_attempt }}
-          path: kernel/target/release/slab_stress
+          path: crates/target/release/slab_stress
           retention-days: 1
 
   slab-valgrind-stress:
@@ -45,9 +45,9 @@ jobs:
       matrix:
         size: [64, 128, 255, 256]
         seed: [1, 2, 3]
-    container:
-      image: dragonos/dragonos-dev:v1.19
-      options: --privileged -v /dev:/dev
+    # container:
+    #   image: dragonos/dragonos-dev:v1.19
+    #   options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code
         uses: actions/checkout@v4

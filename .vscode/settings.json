@@ -1,13 +1,5 @@
 {
-    "files.associations": {
-        "asm.h": "c",
-    },
-    "C_Cpp.errorSquiggles": "enabled",
-    "rust-analyzer.check.allTargets": false,
-    "esbonio.sphinx.confDir": "",
-    "rust-analyzer.linkedProjects": [
-        "./kernel/Cargo.toml",
-        //"./tools/Cargo.toml",
-    ],
-    "makefile.configureOnOpen": false
+  // "rust-analyzer.cargo.target": "loongarch64-unknown-none",
+  // "rust-analyzer.cargo.target": "riscv64gc-unknown-none-elf",
+  "rust-analyzer.cargo.target": "x86_64-unknown-none",
 }

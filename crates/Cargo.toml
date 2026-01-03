@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = [
+  "another_ext4",
+  "asm_macros",
+  "bitmap",
+  "crc",
+  "driver_base_macros",
+  "ida",
+  "intertrait",
+  "kcmdline_macros",
+  "kdepends",
+  "klog_types",
+  "kprobe",
+  "rust-jhash",
+  "rust-slabmalloc",
+  "syscall_table_macros",
+  "system_error",
+  "unified-init",
+  "wait_queue_macros"
+]

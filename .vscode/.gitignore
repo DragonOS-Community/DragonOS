@@ -1,1 +1,4 @@
 *.log
+# For ide start debugger
+!launch.json
+!task.json

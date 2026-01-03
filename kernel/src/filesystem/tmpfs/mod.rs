@@ -160,6 +160,28 @@ pub struct TmpfsInode {
     xattrs: HashMap<String, Vec<u8>>,
 }
 
+impl Drop for TmpfsInode {
+    fn drop(&mut self) {
+        // tmpfs 的空间占用（current_size）在本实现中以 inode 的最终 size 为准。
+        // 关键语义：unlink 只是移除目录项，inode 可能仍被其它硬链接或打开的 FD 引用。
+        // 因此只有当 inode 真正析构时，才归还剩余 size 对应的空间。
+        if self.metadata.file_type == FileType::Dir {
+            return;
+        }
+
+        let size = self.metadata.size.max(0) as usize;
+        if size == 0 {
+            return;
+        }
+
+        if let Some(fs) = self.fs.upgrade() {
+            if let Some(tmpfs) = fs.as_any_ref().downcast_ref::<Tmpfs>() {
+                tmpfs.decrease_size(size);
+            }
+        }
+    }
+}
+
 impl TmpfsInode {
     pub fn new() -> Self {
         Self {
@@ -947,20 +969,14 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::EPERM);
         }
 
-        // 获取文件大小，用于减少current_size
-        let file_size = deleted_inode.metadata.size as usize;
-        let fs = deleted_inode.fs.upgrade().ok_or(SystemError::EIO)?;
-        let tmpfs = fs
-            .as_any_ref()
-            .downcast_ref::<Tmpfs>()
-            .ok_or(SystemError::EIO)?;
-
         drop(deleted_inode);
         to_delete.0.lock().metadata.nlinks -= 1;
         inode.children.remove(&name);
 
-        // 减少文件系统使用的大小
-        tmpfs.decrease_size(file_size);
+        // 注意：unlink 只移除目录项，不代表 inode 立即释放。
+        // 若此处减少 current_size，会在 inode 仍被打开 FD / 其它硬链接引用时产生
+        // 计数下溢式的“空间逃逸”，最终导致无限制分配并触发 OOM。
+        // 空间归还由 TmpfsInode::drop 统一处理。
 
         Ok(())
     }
@@ -990,21 +1006,13 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::ENOTEMPTY);
         }
 
-        // 目录的大小通常是0（不包含数据），但为了完整性，我们也处理
-        let dir_size = deleted_inode.metadata.size as usize;
-        let fs = deleted_inode.fs.upgrade().ok_or(SystemError::EIO)?;
-        let tmpfs = fs
-            .as_any_ref()
-            .downcast_ref::<Tmpfs>()
-            .ok_or(SystemError::EIO)?;
-
         drop(deleted_inode);
         to_delete.0.lock().metadata.nlinks -= 1;
         inode.children.remove(&name);
         inode.metadata.nlinks -= 1;
 
-        // 减少文件系统使用的大小（目录通常大小为0）
-        tmpfs.decrease_size(dir_size);
+        // 目录不占用数据页；同时其生命周期由引用计数控制。
+        // 不在 rmdir 中直接调整 current_size。
 
         Ok(())
     }

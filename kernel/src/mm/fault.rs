@@ -771,22 +771,20 @@ impl PageFaultHandler {
             }
         }
 
-        // 先尝试直接获取
-        if let Some(page) = page_cache.lock_irqsave().get_page(backing_pgoff) {
-            // 标记为 UPTODATE，便于 map_pages / readahead（即便对 tmpfs 通常不会走）。
+        // 单锁双检：避免“先 get 解锁、再 create 解锁”导致的竞态窗口。
+        // 结合 PageCache::create_zero_pages 的幂等语义，可确保并发缺页时不会发生
+        // 覆盖式插入，从而避免旧页泄露。
+        let mut pc = page_cache.lock_irqsave();
+
+        if let Some(page) = pc.get_page(backing_pgoff) {
             page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);
             return VmFaultReason::empty();
         }
 
-        {
-            let mut pc = page_cache.lock_irqsave();
-            // 可能并发创建：create 后再 get（忽略已存在/并发导致的轻微差异）
-            pc.create_zero_pages(backing_pgoff, 1).map_err(|_| ()).ok();
-        }
+        let _ = pc.create_zero_pages(backing_pgoff, 1);
 
-        let page = page_cache.lock_irqsave().get_page(backing_pgoff);
-        if let Some(page) = page {
+        if let Some(page) = pc.get_page(backing_pgoff) {
             page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);
             VmFaultReason::empty()

@@ -83,6 +83,13 @@ impl InnerPageCache {
             let buf_offset = i * MMArch::PAGE_SIZE;
             let page_index = start_page_index + i;
 
+            // 并发场景下，目标页可能已被其他线程创建（例如并发 read/fault/write）。
+            // 这里必须保证“幂等”：若已存在就跳过，避免覆盖插入导致旧页无法从
+            // page_manager/LRU/reclaimer 解绑（内存泄露风险）。
+            if self.pages.contains_key(&page_index) {
+                continue;
+            }
+
             let page_flags = {
                 let cache = self
                     .page_cache_ref
@@ -138,6 +145,11 @@ impl InnerPageCache {
 
         for i in 0..page_num {
             let page_index = start_page_index + i;
+
+            // 并发建页时保证幂等：避免 insert 覆盖导致旧页泄露。
+            if self.pages.contains_key(&page_index) {
+                continue;
+            }
 
             let page_flags = {
                 let cache = self
@@ -361,9 +373,43 @@ impl InnerPageCache {
     pub fn resize(&mut self, len: usize) -> Result<(), SystemError> {
         let page_num = page_align_up(len) / MMArch::PAGE_SIZE;
 
-        let mut reclaimer = page_reclaimer_lock_irqsave();
-        for (_i, page) in self.pages.drain_filter(|index, _page| *index >= page_num) {
-            let _ = reclaimer.remove_page(&page.phys_address());
+        // 释放超出新文件大小范围的页。
+        // 关键点：必须同时从 page_cache、page_manager、(可能的)LRU 中解绑，
+        // 否则 page_manager/LRU 仍持有 Arc<Page>，导致物理页帧无法释放（OOM）。
+        // 同时，为避免对仍被映射的页执行 drop（InnerPage::drop 会 assert map_count==0），
+        // 对 map_count!=0 的页采取保守策略：不回收，继续保留在 page_cache 中。
+        let mut to_remove: Vec<Arc<Page>> = Vec::new();
+        let victim_indices: Vec<usize> = self
+            .pages
+            .keys()
+            .copied()
+            .filter(|idx| *idx >= page_num)
+            .collect();
+
+        for idx in victim_indices {
+            let Some(page) = self.pages.get(&idx) else {
+                continue;
+            };
+
+            // 仍被映射：避免释放导致崩溃。
+            if page.read_irqsave().map_count() != 0 {
+                continue;
+            }
+
+            if let Some(removed) = self.pages.remove(&idx) {
+                to_remove.push(removed);
+            }
+        }
+
+        if !to_remove.is_empty() {
+            let mut reclaimer = page_reclaimer_lock_irqsave();
+            let mut page_manager = page_manager_lock_irqsave();
+            for page in &to_remove {
+                let paddr = page.phys_address();
+                let _ = reclaimer.remove_page(&paddr);
+                page_manager.remove_page(&paddr);
+            }
+            // `to_remove` 在作用域结束时 drop：若无其它引用，将释放页帧。
         }
 
         if page_num > 0 {
@@ -447,9 +493,18 @@ impl InnerPageCache {
 impl Drop for InnerPageCache {
     fn drop(&mut self) {
         // log::debug!("page cache drop");
+        // PageCache 销毁时必须同时从 page_manager 与 page_reclaimer(LRU) 中解绑。
+        // 否则 LRU 仍持有 Arc<Page>，页面无法 drop，最终导致物理页帧无法释放（OOM）。
+        // 注意：这里不应持有任何 page_cache 锁，避免锁顺序反转。
+        let pages: Vec<Arc<Page>> = self.pages.values().cloned().collect();
+
+        let mut reclaimer = page_reclaimer_lock_irqsave();
         let mut page_manager = page_manager_lock_irqsave();
-        for page in self.pages.values() {
-            page_manager.remove_page(&page.phys_address());
+        for page in pages {
+            let paddr = page.phys_address();
+            let _ = reclaimer.remove_page(&paddr);
+            page_manager.remove_page(&paddr);
+            // `page` 在本作用域结束时 drop：若无其它引用，将触发 InnerPage::drop 释放页帧。
         }
     }
 }

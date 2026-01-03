@@ -193,6 +193,35 @@ impl TmpfsInode {
     }
 }
 
+/// Tmpfs 大小预留管理器，用于 RAII 模式自动回滚未提交的大小变更
+struct SizeReservation<'a> {
+    tmpfs: &'a Tmpfs,
+    bytes: u64,
+    committed: bool,
+}
+
+impl<'a> SizeReservation<'a> {
+    fn new(tmpfs: &'a Tmpfs, bytes: u64) -> Self {
+        Self {
+            tmpfs,
+            bytes,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SizeReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed && self.bytes > 0 {
+            self.tmpfs.decrease_size(self.bytes as usize);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TmpfsMountData {
     mode: InodeMode,
@@ -272,7 +301,20 @@ impl FileSystem for Tmpfs {
     }
 
     fn super_block(&self) -> SuperBlock {
-        self.super_block.read().clone()
+        let mut sb = self.super_block.read().clone();
+        // tmpfs 的容量统计应当来源于 size_limit 与 current_size 的实时值，
+        // 避免通过额外的写锁去“同步更新” superblock 字段，从而产生并发窗口。
+        if let Some(limit) = self.size_limit {
+            let total_blocks = limit / TMPFS_BLOCK_SIZE;
+            let current_bytes = self.current_size.load(Ordering::Acquire);
+            let used_blocks = Self::bytes_to_blocks_ceil(current_bytes);
+            let free_blocks = total_blocks.saturating_sub(used_blocks);
+            sb.blocks = total_blocks;
+            sb.bfree = free_blocks;
+            sb.bavail = free_blocks;
+            sb.frsize = TMPFS_BLOCK_SIZE;
+        }
+        sb
     }
 
     fn support_readahead(&self) -> bool {
@@ -295,20 +337,6 @@ impl Tmpfs {
         bytes.div_ceil(TMPFS_BLOCK_SIZE)
     }
 
-    fn update_superblock_free(&self, current_bytes: u64) {
-        // 只在启用 size_limit 时输出可用容量；否则保持现有行为（0-sized）。
-        let Some(limit) = self.size_limit else {
-            return;
-        };
-        let total_blocks = limit / TMPFS_BLOCK_SIZE;
-        let used_blocks = Self::bytes_to_blocks_ceil(current_bytes);
-        let free_blocks = total_blocks.saturating_sub(used_blocks);
-        let mut sb = self.super_block.write();
-        sb.blocks = total_blocks;
-        sb.bfree = free_blocks;
-        sb.bavail = free_blocks;
-        sb.frsize = TMPFS_BLOCK_SIZE;
-    }
 
     pub fn new(mount_data: &TmpfsMountData) -> Arc<Self> {
         // 若未指定 size=，使用默认容量策略（通常为物理内存的一半）。
@@ -371,11 +399,7 @@ impl Tmpfs {
                     Ordering::Release,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => {
-                        // 同步更新 superblock 的 free 统计，供 statfs/df 使用
-                        self.update_superblock_free(new_total);
-                        break;
-                    } // 更新成功
+                    Ok(_) => break, // 更新成功
                     Err(_) => continue, // 被其他线程修改，重试
                 }
             }
@@ -384,16 +408,27 @@ impl Tmpfs {
     }
 
     /// 原子地减少文件系统当前使用的大小（用于文件删除或缩小）
-    /// 使用fetch_sub确保并发安全
+    /// 使用 compare_exchange_weak 循环，避免 underflow 导致计数回绕。
     fn decrease_size(&self, size: usize) {
-        if self.size_limit.is_some() {
-            let size_to_decrease = size as u64;
-            // 使用fetch_sub原子地减少大小
-            let prev = self
-                .current_size
-                .fetch_sub(size_to_decrease, Ordering::Release);
-            let new = prev.saturating_sub(size_to_decrease);
-            self.update_superblock_free(new);
+        if self.size_limit.is_none() {
+            return;
+        }
+
+        let size_to_decrease = size as u64;
+        loop {
+            let current = self.current_size.load(Ordering::Acquire);
+            let new_total = current.saturating_sub(size_to_decrease);
+            match self.current_size.compare_exchange_weak(
+                current,
+                new_total,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    break;
+                }
+                Err(_) => continue,
+            }
         }
     }
 }
@@ -506,7 +541,11 @@ impl IndexNode for LockedTmpfsInode {
                 let page = if let Some(page) = page_cache_guard.get_page(page_index) {
                     page
                 } else {
-                    page_cache_guard.create_zero_pages(page_index, 1)?;
+                    // 对于 tmpfs，页分配失败（ENOMEM）应视为空间不足（ENOSPC）
+                    page_cache_guard.create_zero_pages(page_index, 1).map_err(|e| match e {
+                        SystemError::ENOMEM => SystemError::ENOSPC,
+                        _ => e,
+                    })?;
                     page_cache_guard
                         .get_page(page_index)
                         .ok_or(SystemError::EIO)?
@@ -576,10 +615,13 @@ impl IndexNode for LockedTmpfsInode {
             .downcast_ref::<Tmpfs>()
             .ok_or(SystemError::EIO)?;
 
-        // 先预留空间，失败直接返回
-        if size_diff > 0 {
+        // 先预留空间，失败直接返回；后续任意错误均应回滚。
+        let reservation = if size_diff > 0 {
             tmpfs.increase_size(size_diff)?;
-        }
+            Some(SizeReservation::new(tmpfs, size_diff))
+        } else {
+            None
+        };
 
         drop(inode);
 
@@ -629,13 +671,15 @@ impl IndexNode for LockedTmpfsInode {
             result
         };
 
-        // 如果页分配失败，需要回滚 current_size
-        if alloc_result.is_err() && size_diff > 0 {
-            tmpfs.decrease_size(size_diff as usize);
-            return Err(alloc_result.err().unwrap());
+        // 如果页分配失败，依赖 reservation 的 Drop 自动回滚。
+        // 对于 tmpfs，页分配失败（ENOMEM）应视为空间不足（ENOSPC）
+        match alloc_result {
+            Ok(_) => {}
+            Err(SystemError::ENOMEM) => {
+                return Err(SystemError::ENOSPC);
+            }
+            Err(e) => return Err(e),
         }
-
-        alloc_result?;
 
         let mut src_off = 0usize;
         for it in items {
@@ -660,6 +704,9 @@ impl IndexNode for LockedTmpfsInode {
         let mut inode = self.0.lock();
         if new_size > old_size {
             inode.metadata.size = new_size as i64;
+        }
+        if let Some(r) = reservation {
+            r.commit();
         }
         Ok(len)
     }
@@ -694,7 +741,8 @@ impl IndexNode for LockedTmpfsInode {
         if inode.metadata.file_type == FileType::File {
             let old_size = inode.metadata.size as usize;
             let new_size = len;
-            let size_diff = new_size.saturating_sub(old_size) as i64;
+            let grow_bytes = new_size.saturating_sub(old_size);
+            let shrink_bytes = old_size.saturating_sub(new_size);
 
             // 获取文件系统引用
             let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
@@ -703,9 +751,9 @@ impl IndexNode for LockedTmpfsInode {
                 .downcast_ref::<Tmpfs>()
                 .ok_or(SystemError::EIO)?;
 
-            // 如果扩大，原子地预留空间
-            if size_diff > 0 {
-                tmpfs.increase_size(size_diff as u64)?;
+            // 扩大：先预留空间；缩小：先调整页缓存，成功后再减少计数。
+            if grow_bytes > 0 {
+                tmpfs.increase_size(grow_bytes as u64)?;
             }
 
             // 调整页缓存（会释放多余页，并截断最后一页）
@@ -715,24 +763,23 @@ impl IndexNode for LockedTmpfsInode {
                 Ok(())
             };
 
-            // 根据调整结果和大小变化，正确处理 current_size
-            match (&resize_result, size_diff) {
-                (Err(e), size_diff_inc) if size_diff_inc > 0 => {
-                    // 扩大失败：需要回滚 current_size
-                    tmpfs.decrease_size(size_diff_inc as usize);
-                    return Err(e.clone());
+            // 失败回滚：扩大时必须撤销预留；缩小失败不应改计数。
+            // 对于 tmpfs，页分配失败（ENOMEM）应视为空间不足（ENOSPC）
+            if let Err(e) = resize_result {
+                if grow_bytes > 0 {
+                    tmpfs.decrease_size(grow_bytes);
                 }
-                (Ok(()), size_diff_dec) if size_diff_dec < 0 => {
-                    // 缩小成功：减少 current_size
-                    tmpfs.decrease_size((-size_diff_dec) as usize);
-                }
-                _ => {
-                    // 其他情况（扩大成功、缩小失败、大小不变）：无需额外处理
-                }
+                return match e {
+                    SystemError::ENOMEM => Err(SystemError::ENOSPC),
+                    _ => Err(e),
+                };
             }
 
-            // 只有页缓存调整成功后才更新文件大小
-            resize_result?;
+            // 缩小成功后再减少计数；扩大成功无需额外处理（预留即为最终占用）。
+            if shrink_bytes > 0 {
+                tmpfs.decrease_size(shrink_bytes);
+            }
+
             inode.metadata.size = len as i64;
 
             Ok(())

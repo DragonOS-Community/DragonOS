@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CLONE;
-use crate::mm::{verify_area, VirtAddr};
+use crate::mm::{access_ok, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs};
 use crate::process::syscall::clone_utils::do_clone;
 use crate::process::Signal;
@@ -41,8 +41,8 @@ impl Syscall for SysClone {
         let child_tid = Self::child_tid(args);
 
         // 地址校验
-        verify_area(parent_tid, core::mem::size_of::<i32>())?;
-        verify_area(child_tid, core::mem::size_of::<i32>())?;
+        access_ok(parent_tid, core::mem::size_of::<i32>())?;
+        access_ok(child_tid, core::mem::size_of::<i32>())?;
 
         let flags = Self::flags(args);
         let stack = Self::stack(args);

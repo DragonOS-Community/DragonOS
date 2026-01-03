@@ -5,7 +5,7 @@ use crate::libs::align::page_align_up;
 use crate::mm::{
     syscall::{MadvFlags, PageFrameCount},
     ucontext::AddressSpace,
-    MemoryManagementArch, VirtPageFrame, {verify_area, VirtAddr},
+    MemoryManagementArch, VirtPageFrame, {access_ok, VirtAddr},
 };
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;
@@ -62,7 +62,7 @@ impl Syscall for SysMadviseHandle {
         }
 
         // 验证地址范围的有效性
-        if verify_area(start_vaddr, aligned_len).is_err() {
+        if access_ok(start_vaddr, aligned_len).is_err() {
             return Err(SystemError::EINVAL);
         }
 

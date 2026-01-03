@@ -4,7 +4,7 @@ use crate::arch::MMArch;
 use crate::libs::align::page_align_up;
 use crate::mm::allocator::page_frame::{PageFrameCount, VirtPageFrame};
 use crate::mm::ucontext::AddressSpace;
-use crate::mm::{verify_area, MemoryManagementArch};
+use crate::mm::{access_ok, MemoryManagementArch};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferWriter;
 use system_error::SystemError;
@@ -35,7 +35,7 @@ impl Syscall for SysMincoreHandle {
             return Err(SystemError::EINVAL);
         }
 
-        if verify_area(start_vaddr, len).is_err() {
+        if access_ok(start_vaddr, len).is_err() {
             return Err(SystemError::ENOMEM);
         }
         if len == 0 {

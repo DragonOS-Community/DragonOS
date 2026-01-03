@@ -51,13 +51,13 @@ impl Syscall for SysSendtoHandle {
         // Verify buffer and address validity if from user space
         if frame.is_from_user() {
             let virt_buf = VirtAddr::new(buf as usize);
-            if crate::mm::verify_area(virt_buf, len).is_err() {
+            if crate::mm::access_ok(virt_buf, len).is_err() {
                 return Err(SystemError::EFAULT);
             }
 
             if !addr.is_null() {
                 let virt_addr = VirtAddr::new(addr as usize);
-                if crate::mm::verify_area(virt_addr, addrlen).is_err() {
+                if crate::mm::access_ok(virt_addr, addrlen).is_err() {
                     return Err(SystemError::EFAULT);
                 }
             }

@@ -7,7 +7,7 @@ use crate::mm::syscall::MapFlags;
 use crate::mm::ucontext::DEFAULT_MMAP_MIN_ADDR;
 use crate::mm::AddressSpace;
 use crate::mm::VirtAddr;
-use crate::mm::{verify_area, MemoryManagementArch};
+use crate::mm::{access_ok, MemoryManagementArch};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use log::error;
 use system_error::SystemError;
@@ -60,7 +60,7 @@ impl Syscall for SysMmapHandle {
         }
         let offset = offset_raw as usize;
         // 基础参数校验
-        if verify_area(start_vaddr, len).is_err() {
+        if access_ok(start_vaddr, len).is_err() {
             return Err(SystemError::EFAULT);
         }
 

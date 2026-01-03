@@ -7,7 +7,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EXECVE;
 use crate::filesystem::vfs::{IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::mm::page::PAGE_4K_SIZE;
-use crate::mm::{verify_area, VirtAddr};
+use crate::mm::{access_ok, VirtAddr};
 use crate::process::execve::do_execve;
 use crate::process::{ProcessControlBlock, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -46,9 +46,9 @@ impl SysExecve {
 
         // 权限校验
         if frame.is_from_user()
-            && (verify_area(virt_path_ptr, MAX_PATHLEN).is_err()
-                || verify_area(virt_argv_ptr, PAGE_4K_SIZE).is_err())
-            || verify_area(virt_env_ptr, PAGE_4K_SIZE).is_err()
+            && (access_ok(virt_path_ptr, MAX_PATHLEN).is_err()
+                || access_ok(virt_argv_ptr, PAGE_4K_SIZE).is_err())
+            || access_ok(virt_env_ptr, PAGE_4K_SIZE).is_err()
         {
             return Err(SystemError::EFAULT);
         }

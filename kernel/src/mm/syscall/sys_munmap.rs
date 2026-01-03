@@ -7,7 +7,7 @@ use crate::mm::syscall::PageFrameCount;
 use crate::mm::ucontext::AddressSpace;
 use crate::mm::unlikely;
 use crate::mm::MemoryManagementArch;
-use crate::mm::{verify_area, MMArch, VirtAddr, VirtPageFrame};
+use crate::mm::{access_ok, MMArch, VirtAddr, VirtPageFrame};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -69,7 +69,7 @@ pub(super) fn do_munmap(start_vaddr: VirtAddr, len: usize) -> Result<usize, Syst
     assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
     assert!(check_aligned(len, MMArch::PAGE_SIZE));
 
-    if unlikely(verify_area(start_vaddr, len).is_err()) {
+    if unlikely(access_ok(start_vaddr, len).is_err()) {
         return Err(SystemError::EINVAL);
     }
     if unlikely(len == 0) {

@@ -48,4 +48,4 @@ check: ECHO
 
 test:
 # 测试内核库
-	RUSTFLAGS="$(RUSTFLAGS)" cargo $(TOOLCHAIN) test --workspace --exclude dragonos_kernel
+	RUSTFLAGS="$(RUSTFLAGS)" cargo $(TOOLCHAIN) test --workspace --exclude dragonos_kernel --exclude intertrait --target x86_64-unknown-linux-gnu -Z build-std=

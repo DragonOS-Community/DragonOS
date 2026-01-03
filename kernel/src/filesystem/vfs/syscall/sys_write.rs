@@ -40,9 +40,11 @@ impl Syscall for SysWriteHandle {
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
 
-        // POSIX: len==0 succeeds and returns 0 without touching the buffer.
+        // Linux/POSIX: count==0 must not touch the user buffer, but it still must validate
+        // the fd and perform the file/socket write semantics.
+        // In particular, datagram sockets must deliver a zero-length datagram (gVisor tests).
         if len == 0 {
-            return Ok(0);
+            return do_write(fd, &[]);
         }
 
         // 用户态：先检查可访问长度，避免直接触碰无效页；内核态直接使用

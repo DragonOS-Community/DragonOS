@@ -1,6 +1,6 @@
 use smoltcp;
 
-// pub mod raw;
+pub mod raw;
 // pub mod icmp;
 pub mod common;
 pub mod datagram;
@@ -9,8 +9,8 @@ pub mod syscall;
 
 pub use common::BoundInner;
 pub use common::Types;
-// pub use raw::RawSocket;
 pub use datagram::UdpSocket;
+pub use raw::RawSocket;
 
 use smoltcp::wire::IpAddress;
 use smoltcp::wire::IpEndpoint;

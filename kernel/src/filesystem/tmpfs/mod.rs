@@ -551,6 +551,12 @@ impl IndexNode for LockedTmpfsInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
+
+        // Linux 语义：写入 0 字节应当成功返回 0，且不改变文件偏移/大小。
+        // 同时避免后续 (offset + len - 1) 的下溢导致超大页范围遍历。
+        if len == 0 {
+            return Ok(0);
+        }
         let inode = self.0.lock();
         if inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);

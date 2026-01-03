@@ -105,6 +105,35 @@ impl IdAllocator {
         return None;
     }
 
+    /// 按指定的id分配（预占）一个id
+    ///
+    /// 主要用于“用户请求指定编号”的场景
+    ///
+    /// ## 返回
+    ///
+    /// - `Some(id)`: 分配成功
+    /// - `None`: id 越界、已被占用或无可用 id
+    pub fn alloc_specific(&mut self, id: usize) -> Option<usize> {
+        if unlikely(self.available() == 0) {
+            return None;
+        }
+
+        if id < self.min_id || id >= self.max_id {
+            return None;
+        }
+
+        if self.exists(id) {
+            return None;
+        }
+
+        self.xarray.store(id as u64, EmptyIdaItem);
+        self.used += 1;
+
+        // 为了让后续的 alloc() 更均匀地分配，尽量从下一个位置开始搜索
+        self.current_id = (id + 1).min(self.max_id.saturating_sub(1));
+        Some(id)
+    }
+
     /// 检查id是否存在
     ///
     /// ## 参数

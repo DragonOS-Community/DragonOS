@@ -9,6 +9,7 @@ use core::sync::atomic::compiler_fence;
 use system_error::SystemError;
 
 /// ### 向一个进程发送信号
+/// kill() 系统调用发送进程级信号，使用 PidType::TGID
 pub fn send_signal_to_pid(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
     // 查找目标进程
     let target = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
@@ -17,11 +18,23 @@ pub fn send_signal_to_pid(pid: RawPid, sig: Signal) -> Result<usize, SystemError
     check_signal_permission_pcb_with_sig(&target, Some(sig))?;
 
     // 初始化signal info
-    let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pid));
+    let current_pcb = ProcessManager::current_pcb();
+    let sender_pid = current_pcb.raw_pid();
+    let sender_uid = current_pcb.cred().uid.data() as u32;
+    let mut info = SigInfo::new(
+        sig,
+        0,
+        SigCode::User,
+        SigType::Kill {
+            pid: sender_pid,
+            uid: sender_uid,
+        },
+    );
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
+    // kill() 发送进程级信号，使用 PidType::TGID
     let ret = sig
-        .send_signal_info_to_pcb(Some(&mut info), target)
+        .send_signal_info_to_pcb(Some(&mut info), target, PidType::TGID)
         .map(|x| x as usize);
 
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -36,10 +49,22 @@ pub fn send_signal_to_pcb(
     sig: Signal,
 ) -> Result<usize, SystemError> {
     // 初始化signal info
-    let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pcb.raw_pid()));
+    let current_pcb = ProcessManager::current_pcb();
+    let sender_pid = current_pcb.raw_pid();
+    let sender_uid = current_pcb.cred().uid.data() as u32;
+    let mut info = SigInfo::new(
+        sig,
+        0,
+        SigCode::User,
+        SigType::Kill {
+            pid: sender_pid,
+            uid: sender_uid,
+        },
+    );
 
+    // 发送进程级信号，使用 PidType::TGID
     return sig
-        .send_signal_info_to_pcb(Some(&mut info), pcb)
+        .send_signal_info_to_pcb(Some(&mut info), pcb, PidType::TGID)
         .map(|x| x as usize);
 }
 
@@ -69,9 +94,21 @@ pub fn send_signal_to_pgid(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, System
         }
 
         // 初始化signal info
-        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(pcb.raw_pid()));
+        let current_pcb = ProcessManager::current_pcb();
+        let sender_pid = current_pcb.raw_pid();
+        let sender_uid = current_pcb.cred().uid.data() as u32;
+        let mut info = SigInfo::new(
+            sig,
+            0,
+            SigCode::User,
+            SigType::Kill {
+                pid: sender_pid,
+                uid: sender_uid,
+            },
+        );
 
-        if let Err(e) = sig.send_signal_info_to_pcb(Some(&mut info), pcb) {
+        // 进程组信号使用 PidType::TGID
+        if let Err(e) = sig.send_signal_info_to_pcb(Some(&mut info), pcb, PidType::TGID) {
             if !success {
                 last_err = Some(e);
             }

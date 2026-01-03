@@ -44,6 +44,9 @@ extern crate test;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod prop_tests;
+
 use core::alloc::Layout;
 use core::fmt;
 use core::mem;
@@ -52,7 +55,12 @@ use core::ptr::{self, NonNull};
 use log::trace;
 
 /// How many bytes in the page are used by allocator meta-data.
-const OBJECT_PAGE_METADATA_OVERHEAD: usize = 80;
+///
+/// Layout (ObjectPage):
+/// - next/prev pointers
+/// - page state + padding
+/// - bitmap
+const OBJECT_PAGE_METADATA_OVERHEAD: usize = 88;
 
 /// How many bytes a [`ObjectPage`] is.
 const OBJECT_PAGE_SIZE: usize = 4096;

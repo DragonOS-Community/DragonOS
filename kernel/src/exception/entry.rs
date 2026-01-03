@@ -1,7 +1,7 @@
 use crate::{
-    arch::{interrupt::TrapFrame, CurrentSignalArch},
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, CurrentSignalArch},
     ipc::signal_types::SignalArch,
-    process::{ProcessFlags, ProcessManager},
+    process::{rseq::Rseq, ProcessFlags, ProcessManager},
 };
 
 #[no_mangle]
@@ -38,6 +38,16 @@ unsafe fn exit_to_user_mode_prepare(frame: &mut TrapFrame) {
 /// 必须保证所有的栈上的Arc/Box指针等，都已经被释放。否则，可能会导致内存泄漏。
 unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: ProcessFlags) {
     while !process_flags_work.exit_to_user_mode_work().is_empty() {
+        // 优先处理 rseq，因为信号递送会保存 trapframe 到 sigframe
+        // rseq 的 IP fixup 必须在信号递送之前完成
+        if process_flags_work.contains(ProcessFlags::NEED_RSEQ)
+            && Rseq::handle_notify_resume(Some(frame)).is_err()
+        {
+            // rseq 处理失败，发送 SIGSEGV
+            let pcb = ProcessManager::current_pcb();
+            let _ = crate::ipc::kill::send_signal_to_pcb(pcb, Signal::SIGSEGV);
+        }
+
         if process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL) {
             unsafe { CurrentSignalArch::do_signal_or_restart(frame) };
         }

@@ -7,9 +7,10 @@ use crate::arch::syscall::nr::SYS_PREAD64;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::UserBufferWriter;
 use alloc::string::ToString;
 use alloc::vec::Vec;
+
+use super::pread_pwrite_common::{do_pread_pwrite_at, PreadPwriteDir};
 
 /// System call handler for the `pread64` syscall
 ///
@@ -42,10 +43,6 @@ impl Syscall for SysPread64Handle {
             return Err(SystemError::EINVAL);
         }
 
-        let mut user_buffer_writer =
-            UserBufferWriter::new_checked(buf_vaddr, len, frame.is_from_user())?;
-        let user_buf = user_buffer_writer.buffer(0)?;
-
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
@@ -56,7 +53,14 @@ impl Syscall for SysPread64Handle {
         // Drop guard to avoid scheduling issues
         drop(fd_table_guard);
 
-        return file.pread(offset, len, user_buf);
+        do_pread_pwrite_at(
+            file.as_ref(),
+            offset,
+            buf_vaddr as usize,
+            len,
+            frame.is_from_user(),
+            PreadPwriteDir::Read,
+        )
     }
 
     /// Formats the syscall parameters for display/debug purposes

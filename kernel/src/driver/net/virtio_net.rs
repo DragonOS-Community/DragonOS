@@ -394,12 +394,15 @@ impl VirtIONicDeviceInnerWrapper {
 /// Virtio网络设备驱动(加锁)
 pub struct VirtIONicDeviceInner {
     pub inner: Arc<SpinLock<VirtIoNetImpl>>,
+    /// 指向所属网络接口的弱引用，用于 packet socket 分发
+    iface: SpinLock<Weak<dyn super::Iface>>,
 }
 
 impl Clone for VirtIONicDeviceInner {
     fn clone(&self) -> Self {
         return VirtIONicDeviceInner {
             inner: self.inner.clone(),
+            iface: SpinLock::new(self.iface.lock().clone()),
         };
     }
 }
@@ -548,6 +551,12 @@ impl VirtioInterface {
             }),
         });
 
+        // 设置 device_inner 对接口的弱引用，用于 packet socket 分发
+        iface
+            .device_inner
+            .force_get_mut()
+            .set_iface(Arc::downgrade(&iface) as Weak<dyn super::Iface>);
+
         // 设置napi struct
         let napi_struct = NapiStruct::new(iface.clone(), 10);
         *iface.common().napi_struct.write() = Some(napi_struct);
@@ -654,8 +663,21 @@ impl VirtIONicDeviceInner {
         iface_config.random_seed = rand() as u64;
 
         let inner = Arc::new(SpinLock::new(VirtIoNetImpl::new(driver_net)));
-        let result = VirtIONicDeviceInner { inner };
+        let result = VirtIONicDeviceInner {
+            inner,
+            iface: SpinLock::new(Weak::<VirtioInterface>::new()),
+        };
         return result;
+    }
+
+    /// 设置所属网络接口的引用
+    pub fn set_iface(&self, iface: Weak<dyn super::Iface>) {
+        *self.iface.lock() = iface;
+    }
+
+    /// 获取所属网络接口
+    pub fn iface(&self) -> Option<Arc<dyn super::Iface>> {
+        self.iface.lock().upgrade()
     }
 }
 
@@ -743,7 +765,15 @@ impl phy::RxToken for VirtioNetToken {
     {
         // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
         let rx_buf = self.rx_buffer.unwrap();
-        let result = f(rx_buf.packet());
+        let packet = rx_buf.packet();
+
+        // 向注册的 packet socket 分发数据包
+        if let Some(iface) = self.driver.iface() {
+            let pkt_type = determine_packet_type(packet, &iface);
+            iface.common().deliver_to_packet_sockets(packet, pkt_type);
+        }
+
+        let result = f(packet);
         self.driver
             .inner
             .lock()
@@ -751,6 +781,39 @@ impl phy::RxToken for VirtioNetToken {
             .expect("virtio_net recv failed");
         result
     }
+}
+
+/// 根据以太网帧的目的 MAC 地址确定数据包类型
+fn determine_packet_type(
+    frame: &[u8],
+    iface: &Arc<dyn super::Iface>,
+) -> crate::net::socket::packet::PacketType {
+    use crate::net::socket::packet::PacketType;
+
+    if frame.len() < 14 {
+        return PacketType::Host;
+    }
+
+    let dst_mac = &frame[0..6];
+
+    // 检查是否为广播地址 (FF:FF:FF:FF:FF:FF)
+    if dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
+        return PacketType::Broadcast;
+    }
+
+    // 检查是否为多播地址 (第一个字节的最低位为1)
+    if dst_mac[0] & 0x01 != 0 {
+        return PacketType::Multicast;
+    }
+
+    // 检查是否为发往本机的包
+    let our_mac = iface.mac();
+    if dst_mac == our_mac.as_bytes() {
+        return PacketType::Host;
+    }
+
+    // 其他情况为发往其他主机的包（混杂模式下捕获）
+    PacketType::OtherHost
 }
 
 /// @brief virtio-net 驱动的初始化与测试

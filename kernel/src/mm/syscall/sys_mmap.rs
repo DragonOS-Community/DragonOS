@@ -84,8 +84,13 @@ impl Syscall for SysMmapHandle {
             }
         }
 
-        // 默认按需分配物理页；仅在显式要求（MAP_POPULATE / MAP_LOCKED）时进行预分配。
-        let allocate_at_once = map_flags.intersects(MapFlags::MAP_POPULATE | MapFlags::MAP_LOCKED);
+        // 默认按需分配物理页。
+        // 重要：文件映射若在 mmap 时直接“预分配匿名页”(VMA::zeroed) 会导致映射内容为全 0，
+        // 从而破坏 mmap 读取到的文件数据（例如 llama.cpp mmap 模型文件时输出乱码）。
+        // 因此：仅对匿名映射支持 MAP_POPULATE/MAP_LOCKED 的“立即分配”。
+        // 文件映射暂将 MAP_POPULATE/MAP_LOCKED 视为 hint：保持按需缺页加载以保证正确语义。
+        let allocate_at_once = map_flags.contains(MapFlags::MAP_ANONYMOUS)
+            && map_flags.intersects(MapFlags::MAP_POPULATE | MapFlags::MAP_LOCKED);
 
         // 仅允许 MAP_PRIVATE 或 MAP_SHARED 之一
         let has_private = map_flags.contains(MapFlags::MAP_PRIVATE);

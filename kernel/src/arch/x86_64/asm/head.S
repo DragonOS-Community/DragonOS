@@ -291,6 +291,50 @@ switch_to_start64:
 
 .code64
 halt:
+
+// Enable FPU/SSE and optionally XSAVE/XCR0.
+// - Always enables CR0.MP and clears CR0.EM
+// - Always enables CR4.OSFXSR/CR4.OSXMMEXCPT
+// - Enables CR4.OSXSAVE and sets XCR0 only if CPUID reports XSAVE support
+//   (and sets XCR0 to 0x7 only if AVX is also supported)
+.macro ENABLE_FPU_SSE_XSAVE_XCR0
+    // Enable legacy x87 + SSE usage
+    movq %cr0, %rax
+    and $0xFFFB, %ax		// clear coprocessor emulation CR0.EM
+    or $0x2, %ax			// set coprocessor monitoring CR0.MP
+    movq %rax, %cr0
+
+    // Always enable OSFXSR/OSXMMEXCPT (x86_64 baseline has SSE/SSE2)
+    movq %cr4, %rax
+    or $(3 << 9), %ax		// set CR4.OSFXSR and CR4.OSXMMEXCPT
+    movq %rax, %cr4
+
+    // Conditionally enable XSAVE and set XCR0.
+    // On CPUs without XSAVE/AVX, unguarded CR4.OSXSAVE/xsetbv would #GP and crash early boot.
+    pushq %rbx
+    mov $0x1, %eax
+    cpuid
+    bt $26, %ecx			// CPUID.01H:ECX.XSAVE[26]
+    jnc .Lno_xsave\@
+
+    // XSAVE is supported: enable CR4.OSXSAVE so XGETBV/XSETBV are usable
+    movq %cr4, %rax
+    or $(1 << 18), %rax		// CR4.OSXSAVE
+    movq %rax, %cr4
+
+    // Default to x87 + SSE state (XCR0=0x3). If AVX is supported, include YMM (XCR0=0x7).
+    mov $0x3, %eax			// x87 + SSE
+    bt $28, %ecx			// CPUID.01H:ECX.AVX[28]
+    jnc .Lxcr0_set\@
+    mov $0x7, %eax			// x87 + SSE + AVX
+.Lxcr0_set\@:
+    xor %ecx, %ecx			// XCR0
+    xor %edx, %edx			// high 32 bits = 0
+    xsetbv					// Set XCR0
+.Lno_xsave\@:
+    popq %rbx
+.endm
+
     cli
     hlt
     jmp halt
@@ -485,15 +529,8 @@ repeat_set_idt:
     dec %rcx
     jne repeat_set_idt
 
-    
-    //now enable SSE and the like
-    movq %cr0, %rax
-    and $0xFFFB, %ax		//clear coprocessor emulation CR0.EM
-    or $0x2, %ax			//set coprocessor monitoring  CR0.MP
-    movq %rax, %cr0
-    movq %cr4, %rax
-    or $(3 << 9), %ax		//set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
-    movq %rax, %cr4
+
+    ENABLE_FPU_SSE_XSAVE_XCR0
 
 
     movq	go_to_kernel(%rip),	%rax		/* movq address */
@@ -516,14 +553,7 @@ go_to_kernel:
 start_smp:
 
 
-    //now enable SSE and the like
-    movq %cr0, %rax
-    and $0xFFFB, %ax		//clear coprocessor emulation CR0.EM
-    or $0x2, %ax			//set coprocessor monitoring  CR0.MP
-    movq %rax, %cr0
-    movq %cr4, %rax
-    or $(3 << 9), %ax		//set CR4.OSFXSR and CR4.OSXMMEXCPT at the same time
-    movq %rax, %cr4
+    ENABLE_FPU_SSE_XSAVE_XCR0
 
 
 	movq	go_to_smp_kernel(%rip),	%rax		/* movq address */

@@ -332,6 +332,15 @@ impl PageReclaimer {
         for page in victims {
             let mut guard = page.write_irqsave();
             if let PageType::File(info) = guard.page_type().clone() {
+                // Never evict a file-backed page that is still mapped into any VMA.
+                // Our eviction path removes the page from page_cache/page_manager; dropping a
+                // still-mapped page will trip InnerPage::drop assertions and can crash userland.
+                if guard.map_count() != 0 {
+                    drop(guard);
+                    page_reclaimer_lock_irqsave().insert_page(page.phys_address(), &page);
+                    continue;
+                }
+
                 let page_index = info.index;
                 let paddr = guard.phys_address();
 

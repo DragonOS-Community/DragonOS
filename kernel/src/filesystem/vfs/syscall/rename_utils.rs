@@ -1,3 +1,4 @@
+use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::is_ancestor;
 use crate::filesystem::vfs::utils::rsplit_path;
@@ -82,6 +83,23 @@ pub fn do_renameat2(
     // 不要在这里检查 new_parent 是否是 old 的祖先：
     // 这会把同目录/向上移动的合法情况误判为 ENOTEMPTY。
     // 非空目录覆盖应由具体文件系统在 move_to/rename 实现中返回 ENOTEMPTY。
+
+    // 权限检查：根据 Linux 语义，rename 需要对源父目录和目标父目录都拥有写+搜索权限
+    let cred = pcb.cred();
+
+    // 检查源父目录的写+搜索权限（需要删除旧目录项）
+    let old_parent_metadata = old_parent_inode.metadata()?;
+    cred.inode_permission(
+        &old_parent_metadata,
+        (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+    )?;
+
+    // 检查目标父目录的写+搜索权限（需要创建新目录项）
+    let new_parent_metadata = new_parent_inode.metadata()?;
+    cred.inode_permission(
+        &new_parent_metadata,
+        (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+    )?;
 
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
     return Ok(0);

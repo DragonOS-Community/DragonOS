@@ -226,12 +226,29 @@ impl IndexNode for KernFSInode {
 
     fn move_to(
         &self,
-        _old_name: &str,
-        _target: &Arc<dyn IndexNode>,
-        _new_name: &str,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
         _flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
+        // 处理重命名到自身的特殊情况
+        // 如果源目录和目标目录是同一个 inode，且文件名相同，则直接返回成功
+        // 这符合 Linux 的 rename 语义：重命名到自身是一个空操作
+        if let Some(target_kernfs) = target.clone().downcast_arc::<KernFSInode>() {
+            // 使用 Arc::ptr_eq 比较两个 Arc 是否指向同一个对象
+            // 通过 self_ref.upgrade() 获取 Arc<KernFSInode>
+            let self_arc = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            let target_arc = target_kernfs
+                .self_ref
+                .upgrade()
+                .ok_or(SystemError::ENOENT)?;
+
+            if Arc::ptr_eq(&self_arc, &target_arc) && old_name == new_name {
+                return Ok(());
+            }
+        }
+
+        // 其他情况返回 ENOSYS（sysfs/kernfs 不支持真正的重命名操作）
         return Err(SystemError::ENOSYS);
     }
 

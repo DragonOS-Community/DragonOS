@@ -5,10 +5,11 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::{SYS_GETDENTS, SYS_GETDENTS64};
 use crate::filesystem::vfs::{DirentFormat, FilldirContext};
+use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::UserBufferWriter;
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -26,17 +27,15 @@ const MAX_GETDENTS_COUNT: usize = i32::MAX as usize;
 
 fn do_getdents(
     args: &[usize],
-    frame: &mut TrapFrame,
+    _frame: &mut TrapFrame,
     format: DirentFormat,
 ) -> Result<usize, SystemError> {
     let fd = args[0] as i32;
     let buf_vaddr = args[1];
     let len = args[2];
 
-    if buf_vaddr == 0 {
-        return Err(SystemError::EFAULT);
-    }
-
+    // Linux 语义：count 的合法性优先于 buf 指针可访问性检查。
+    // 例如 count 太小应返回 EINVAL（即使 buf 指向坏地址）。
     if len == 0 {
         return Err(SystemError::EINVAL);
     }
@@ -45,14 +44,29 @@ fn do_getdents(
         return Err(SystemError::EINVAL);
     }
 
+    // 最小可写入的 dirent 头大小（不含 d_name）
+    let min_dirent_size = match format {
+        // offsetof(struct linux_dirent, d_name)
+        DirentFormat::Getdents => 18,
+        // offsetof(struct linux_dirent64, d_name)
+        DirentFormat::Getdents64 => 19,
+    };
+    if len < min_dirent_size {
+        return Err(SystemError::EINVAL);
+    }
+
+    if buf_vaddr == 0 {
+        return Err(SystemError::EFAULT);
+    }
+
     if fd < 0 {
         return Err(SystemError::EBADF);
     }
 
-    // 使用 UserBufferWriter 和 buffer_protected 创建受保护的用户缓冲区
-    let from_user = frame.is_from_user();
-    let mut writer = UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
-    let user_buf = writer.buffer_protected(0)?;
+    // 注意：这里不能对整个 [buf, buf+count) 做 verify_area，否则无法实现
+    // “部分可访问时先写入一部分再因 EFAULT 停止并返回已写入字节数”的 Linux 行为。
+    // UserBuffer 的实际读写都通过异常表保护的 copy_*_user_protected 完成。
+    let user_buf: UserBuffer<'static> = unsafe { UserBuffer::new(VirtAddr::new(buf_vaddr), len) };
 
     // 获取fd
     let binding = ProcessManager::current_pcb().fd_table();
@@ -67,17 +81,23 @@ fn do_getdents(
     let mut ctx = FilldirContext::new(user_buf, format);
     match file.read_dir(&mut ctx) {
         Ok(_) => {
-            if ctx.error.is_some() {
-                if ctx.error == Some(SystemError::EINVAL) {
+            if let Some(err) = ctx.error {
+                // Linux 语义：如果已经写入了部分 dirent，则返回已写入字节数；
+                // 只有在“一个字节都没写入”的情况下才返回具体错误码。
+                if ctx.current_pos > 0 {
                     return Ok(ctx.current_pos);
-                } else {
-                    return Err(ctx.error.unwrap());
                 }
+                return Err(err);
             }
-            return Ok(ctx.current_pos);
+            Ok(ctx.current_pos)
         }
         Err(e) => {
-            return Err(e);
+            // 很多文件系统会把 filldir 的返回值（例如 -EFAULT）直接向上层传播。
+            // 但 Linux getdents* 的语义是：只要已经写入了至少一个条目，就返回已写入的字节数。
+            if ctx.current_pos > 0 {
+                return Ok(ctx.current_pos);
+            }
+            Err(e)
         }
     }
 }

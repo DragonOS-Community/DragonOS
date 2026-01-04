@@ -13,6 +13,7 @@ mod sys_getitimer;
 mod sys_gettimeofday;
 mod sys_nanosleep;
 mod sys_setitimer;
+#[cfg(target_arch = "x86_64")]
 mod sys_time;
 mod sys_timer_create;
 mod sys_timer_delete;

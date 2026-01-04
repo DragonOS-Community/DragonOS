@@ -70,9 +70,9 @@ impl Syscall for SysMlockHandle {
         let current_locked = addr_space.read().locked_vm();
 
         // 检查是否超过限制
-        // 参考 Linux: 计算 locked 时需要减去已经锁定的重叠区域
-        // 为简化，我们这里只做基本检查
-        if !can_do_mlock() && current_locked + requested_pages > lock_limit_pages {
+        // 参考 Linux: mm/mlock.c:do_mlock() 和 user_lock_limit()
+        // 如果没有 CAP_IPC_LOCK 权限，需要检查 RLIMIT_MEMLOCK 限制
+        if current_locked + requested_pages > lock_limit_pages {
             return Err(SystemError::ENOMEM);
         }
 

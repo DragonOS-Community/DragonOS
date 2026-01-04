@@ -1282,23 +1282,23 @@ impl InnerAddressSpace {
         return Ok(requested);
     }
 
-    /// 检查 VMA 是否可访问（有 VM_READ, VM_WRITE, 或 VM_EXEC 任一标志）
-    fn vma_is_accessible(vm_flags: VmFlags) -> bool {
-        let access_flags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
-        vm_flags.intersects(access_flags)
-    }
-
     /// 锁定地址范围
     ///
     /// # 参数
     /// - `start`: 起始虚拟地址
     /// - `len`: 长度（已页对齐）
     /// - `onfault`: 是否延迟锁定
+    ///
+    /// # Linux 语义
+    /// 参考 Linux mm/mlock.c:do_mlock():
+    /// - 对于不可访问的 VMA（如 PROT_NONE），mlock 会失败并返回 ENOMEM
+    /// - 但是，即使失败，VMA 的 VM_LOCKED 标志仍然会被设置
+    /// - 这是因为 mlock 的主要目的是防止页面被换出，即使无法立即填充页面
     pub fn mlock(&mut self, start: VirtAddr, len: usize, onfault: bool) -> Result<(), SystemError> {
         // 计算结束地址
         let end = start.data().checked_add(len).ok_or(SystemError::ENOMEM)?;
         let end = VirtAddr::new(end);
-
+        let mut has_inaccessible_vma = false;
         // 构造要设置的标志
         let mut new_flags = VmFlags::VM_LOCKED;
         if onfault {
@@ -1309,18 +1309,14 @@ impl InnerAddressSpace {
         let region = VirtRegion::new(start, len);
         let vmas: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region).collect();
 
-        // 首先检查所有 VMA 是否可访问
+        // 遍历所有 VMA
         // 对于不可访问的 VMA（如 PROT_NONE），mlock 应该失败，返回 ENOMEM
+        // 但 VMA 仍然应该被标记为 locked（Linux 语义）
+        // 无论是否成功，都要设置 VM_LOCKED 标志
         for vma in &vmas {
-            let guard = vma.lock_irqsave();
-            let vm_flags = *guard.vm_flags();
-            // 检查 VMA 是否可访问（Linux 语义：mlock 对不可访问的 VMA 会失败）
-            if !Self::vma_is_accessible(vm_flags) {
-                return Err(SystemError::ENOMEM);
+            if !vma.is_accessible() {
+                has_inaccessible_vma = true;
             }
-        }
-
-        for vma in vmas {
             let mut guard = vma.lock_irqsave();
             let current_flags = *guard.vm_flags();
             // 添加锁定标志
@@ -1331,6 +1327,11 @@ impl InnerAddressSpace {
         let page_count = len >> MMArch::PAGE_SHIFT;
         self.locked_vm
             .fetch_add(page_count, Ordering::Relaxed);
+
+        // 如果有不可访问的 VMA，返回 ENOMEM
+        if has_inaccessible_vma {
+            return Err(SystemError::ENOMEM);
+        }
 
         Ok(())
     }

@@ -7,6 +7,7 @@ use crate::mm::syscall::MremapFlags;
 use crate::mm::ucontext::AddressSpace;
 use crate::mm::MemoryManagementArch;
 use crate::mm::{MMArch, VirtAddr, VmFlags};
+use crate::process::{resource::RLimitID, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;
 
@@ -108,6 +109,37 @@ impl Syscall for SysMremapHandle {
         if vm_flags.contains(VmFlags::VM_HUGETLB) {
             log::error!("mmap: not support huge page mapping");
             return Err(SystemError::ENOSYS);
+        }
+
+        // 如果 VMA 被锁定且正在扩展，检查 RLIMIT_MEMLOCK
+        // 参考 Linux: mm/mremap.c:vma_to_resize() 中的检查
+        if vm_flags.contains(VmFlags::VM_LOCKED) && new_len > old_len {
+            use crate::mm::mlock::can_do_mlock;
+
+            if !can_do_mlock() {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            // 计算需要额外锁定的页面数
+            let extra_pages = (new_len - old_len) >> MMArch::PAGE_SHIFT;
+
+            // 获取当前限制
+            let lock_limit = ProcessManager::current_pcb()
+                .get_rlimit(RLimitID::Memlock)
+                .rlim_cur as usize;
+
+            let lock_limit_pages = if lock_limit == usize::MAX {
+                usize::MAX
+            } else {
+                lock_limit >> MMArch::PAGE_SHIFT
+            };
+
+            // 获取当前已锁定的页面数
+            let current_locked = current_address_space.read().locked_vm();
+            // 检查是否超过限制
+            if current_locked + extra_pages > lock_limit_pages {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
         }
 
         // Linux semantics:

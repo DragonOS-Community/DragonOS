@@ -84,6 +84,39 @@ impl Syscall for SysMmapHandle {
             }
         }
 
+        // MAP_LOCKED 需要 RLIMIT_MEMLOCK 检查
+        // 参考 Linux: mm/mmap.c:mm_check_mlock_and_mapping()
+        if map_flags.contains(MapFlags::MAP_LOCKED) {
+            use crate::mm::mlock::can_do_mlock;
+
+            if !can_do_mlock() {
+                return Err(SystemError::EPERM);
+            }
+
+            // 检查 RLIMIT_MEMLOCK 是否足够
+            let lock_limit = ProcessManager::current_pcb()
+                .get_rlimit(RLimitID::Memlock)
+                .rlim_cur as usize;
+
+            // 将限制转换为页面数
+            let lock_limit_pages = if lock_limit == usize::MAX {
+                usize::MAX
+            } else {
+                lock_limit >> MMArch::PAGE_SHIFT
+            };
+
+            let requested_pages = len >> MMArch::PAGE_SHIFT;
+
+            // 获取当前地址空间的锁定计数
+            let vm = AddressSpace::current()?;
+            let current_locked = vm.read().locked_vm();
+
+            // 检查是否超过限制
+            if current_locked + requested_pages > lock_limit_pages {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+        }
+
         // 默认按需分配物理页。
         // 重要：文件映射若在 mmap 时直接“预分配匿名页”(VMA::zeroed) 会导致映射内容为全 0，
         // 从而破坏 mmap 读取到的文件数据（例如 llama.cpp mmap 模型文件时输出乱码）。

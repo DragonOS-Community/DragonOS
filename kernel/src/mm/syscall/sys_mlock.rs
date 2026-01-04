@@ -6,8 +6,9 @@ use crate::mm::{
     mlock::can_do_mlock,
     syscall::page_align_up,
     ucontext::AddressSpace,
-    MemoryManagementArch, VirtAddr,
+    MemoryManagementArch, VirtAddr, VmFlags,
 };
+use crate::process::{resource::RLimitID, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;
 
@@ -49,6 +50,31 @@ impl Syscall for SysMlockHandle {
 
         // 获取当前地址空间
         let addr_space = AddressSpace::current()?;
+
+        // RLIMIT_MEMLOCK 检查
+        // 参考 Linux: mm/mlock.c:do_mlock()
+        let lock_limit = ProcessManager::current_pcb()
+            .get_rlimit(RLimitID::Memlock)
+            .rlim_cur as usize;
+
+        // 将限制转换为页面数
+        let lock_limit_pages = if lock_limit == usize::MAX {
+            usize::MAX
+        } else {
+            lock_limit >> MMArch::PAGE_SHIFT
+        };
+
+        let requested_pages = aligned_len >> MMArch::PAGE_SHIFT;
+
+        // 计算当前已锁定的页面数
+        let current_locked = addr_space.read().locked_vm();
+
+        // 检查是否超过限制
+        // 参考 Linux: 计算 locked 时需要减去已经锁定的重叠区域
+        // 为简化，我们这里只做基本检查
+        if !can_do_mlock() && current_locked + requested_pages > lock_limit_pages {
+            return Err(SystemError::ENOMEM);
+        }
 
         // 执行 mlock
         addr_space.write().mlock(addr, aligned_len, false)?;

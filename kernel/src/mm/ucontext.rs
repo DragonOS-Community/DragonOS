@@ -223,8 +223,12 @@ impl InnerAddressSpace {
         new_guard.end_code = self.end_code;
         new_guard.start_data = self.start_data;
         new_guard.end_data = self.end_data;
-        new_guard.locked_vm = AtomicUsize::new(self.locked_vm.load(Ordering::Relaxed));
-        new_guard.def_flags = self.def_flags;
+        // 注意：locked_vm 在子进程中应该为 0，因为 mlock 不会被 fork 继承
+        // 参考 Linux: 子进程的 mm->locked_vm 从 0 开始
+        new_guard.locked_vm = AtomicUsize::new(0);
+        // 注意：def_flags 也不应该被继承
+        // 参考 Linux: 子进程的 mm->def_flags 从 0 开始
+        new_guard.def_flags = VmFlags::empty();
 
         // 遍历父进程的每个VMA，根据VMA属性进行适当的复制
         // 参考 Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
@@ -658,7 +662,8 @@ impl InnerAddressSpace {
             | VmFlags::from(map_flags)
             | VmFlags::VM_MAYREAD
             | VmFlags::VM_MAYWRITE
-            | VmFlags::VM_MAYEXEC;
+            | VmFlags::VM_MAYEXEC
+            | self.def_flags; // 应用 mlockall(MCL_FUTURE) 设置的默认标志
 
         // debug!("mmap: page: {:?}, region={region:?}", page.virt_address());
 
@@ -1277,6 +1282,12 @@ impl InnerAddressSpace {
         return Ok(requested);
     }
 
+    /// 检查 VMA 是否可访问（有 VM_READ, VM_WRITE, 或 VM_EXEC 任一标志）
+    fn vma_is_accessible(vm_flags: VmFlags) -> bool {
+        let access_flags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
+        vm_flags.intersects(access_flags)
+    }
+
     /// 锁定地址范围
     ///
     /// # 参数
@@ -1297,6 +1308,17 @@ impl InnerAddressSpace {
         // 获取冲突的 VMA 列表
         let region = VirtRegion::new(start, len);
         let vmas: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region).collect();
+
+        // 首先检查所有 VMA 是否可访问
+        // 对于不可访问的 VMA（如 PROT_NONE），mlock 应该失败，返回 ENOMEM
+        for vma in &vmas {
+            let guard = vma.lock_irqsave();
+            let vm_flags = *guard.vm_flags();
+            // 检查 VMA 是否可访问（Linux 语义：mlock 对不可访问的 VMA 会失败）
+            if !Self::vma_is_accessible(vm_flags) {
+                return Err(SystemError::ENOMEM);
+            }
+        }
 
         for vma in vmas {
             let mut guard = vma.lock_irqsave();
@@ -1389,6 +1411,10 @@ impl InnerAddressSpace {
         self.locked_vm.store(0, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    pub fn locked_vm(&self) -> usize {
+        return self.locked_vm.load(core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2142,9 +2168,13 @@ impl VMA {
     }
 
     pub fn clone_info_only(&self) -> Self {
+        // 注意：fork 时不应继承 VM_LOCKED 标志
+        // 参考 Linux: mlock 不会被 fork 的子进程继承
+        let vm_flags = self.vm_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT);
+
         return Self {
             region: self.region,
-            vm_flags: self.vm_flags,
+            vm_flags,
             flags: self.flags,
             mapped: self.mapped,
             user_address_space: None,

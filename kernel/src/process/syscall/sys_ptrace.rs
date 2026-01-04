@@ -216,6 +216,27 @@ impl SysPtrace {
         Self::after_handle_syscall(num, result as isize);
         Ok(result)
     }
+
+    fn ptrace_check_attach(
+        tracee: &Arc<ProcessControlBlock>,
+        request: PtraceRequest,
+    ) -> Result<(), SystemError> {
+        let current = ProcessManager::current_pcb();
+
+        if !tracee.is_traced_by(&current) {
+            return Err(SystemError::EPERM);
+        }
+        // 对于 KILL 请求，不需要目标处于停止状态 (Linux 逻辑)
+        // 这里我们简化逻辑，要求必须 Stopped
+        match tracee.sched_info().inner_lock_read_irqsave().state() {
+            ProcessState::Stopped(_) | ProcessState::TracedStopped => Ok(()),
+            _ => {
+                // 如果请求是 KILL，Linux 允许不停止，但这里我们先严格要求
+                log::debug!("ptrace_check_attach: process not stopped");
+                Err(SystemError::ESRCH)
+            }
+        }
+    }
 }
 
 impl Syscall for SysPtrace {

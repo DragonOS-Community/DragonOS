@@ -94,7 +94,10 @@ pub fn do_notify_parent(child: &ProcessControlBlock, signal: Signal) -> Result<b
                 autoreap = true;
                 // 并且不发送信号
                 effective_signal = None;
-            } else if sa.map(|s| s.flags().contains(SigFlags::SA_NOCLDWAIT)).unwrap_or(true) {
+            } else if sa
+                .map(|s| s.flags().contains(SigFlags::SA_NOCLDWAIT))
+                .unwrap_or(true)
+            {
                 // 父进程不等待子进程，子进程应被自动回收
                 autoreap = true;
                 // 但根据POSIX，信号仍然可以发送
@@ -510,6 +513,9 @@ impl ProcessControlBlock {
         //     signal_wake_up(self.self_ref.upgrade().unwrap(), guard, false);
         // }
         // todo proc_ptrace_connector(self, PTRACE_ATTACH);
+        // 确保目标进程被唤醒以处理 SIGSTOP
+        // 如果目标正在 sleep (INTERRUPTIBLE)，kick 它让它处理信号
+        ProcessManager::kick(&self.self_ref.upgrade().unwrap());
         Ok(0)
     }
 
@@ -521,10 +527,13 @@ impl ProcessControlBlock {
             return Err(SystemError::EPERM);
         }
         self.ptrace_unlink()?;
+        let mut sched_info = self.sched_info.inner_lock_write_irqsave();
         if let Some(sig) = signal {
-            self.exit_signal.store(sig, Ordering::SeqCst);
+            // self.exit_signal.store(sig, Ordering::SeqCst);
+            self.ptrace_state.lock().exit_code = sig as usize;
         } else {
-            return Ok(0);
+            // return Ok(0);
+            self.ptrace_state.lock().exit_code = 0;
         }
         let mut dead = !self.is_thread_group_leader();
         if !dead {

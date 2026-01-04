@@ -12,7 +12,6 @@ use crate::{
     process::{ptrace::handle_ptrace_signal_stop, ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
 };
-use num_traits::FromPrimitive;
 
 /// 信号处理的栈的栈指针的最小对齐
 #[allow(dead_code)]
@@ -435,7 +434,7 @@ fn sig_stop(sig: Signal) {
         pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
         if pcb.flags().contains(ProcessFlags::PTRACED) {
             log::debug!("sig_stop");
-            handle_ptrace_signal_stop(&current_pcb, sig);
+            handle_ptrace_signal_stop(&pcb, sig);
         }
     }
     ProcessManager::mark_stop(sig).unwrap_or_else(|e| {

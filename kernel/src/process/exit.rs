@@ -296,7 +296,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             all_children_exited = false;
                         }
 
-                        if matches!(state, ProcessState::Stopped)
+                        if matches!(state, ProcessState::Stopped(_))
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {
@@ -393,7 +393,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             all_children_exited = false;
                         }
 
-                        if matches!(state, ProcessState::Stopped)
+                        if matches!(state, ProcessState::Stopped(_))
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {

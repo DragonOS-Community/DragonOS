@@ -320,7 +320,7 @@ impl ProcessManager {
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         let state = writer.state();
         if !matches!(state, ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Stopped);
+            writer.set_state(ProcessState::Stopped(0));
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             drop(writer);
             return Ok(());

@@ -537,10 +537,10 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         }
 
         // 对 kernel-only 信号（如 SIGKILL/SIGSTOP）直接使用默认处理，避免任何用户帧构造
-        if sig_number.kernel_only() {
+        if sig.kernel_only() {
             // log::error!(
             //     "do_signal: kernel-only sig={} for pid={:?} -> default handler (no user frame)",
-            //     sig_number as i32,
+            //     sig as i32,
             //     pcb.raw_pid()
             // );
             // 释放锁，按常规路径在本线程上下文执行默认处理
@@ -548,10 +548,10 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             drop(siginfo_mut_guard);
             drop(pcb);
             CurrentIrqArch::interrupt_enable();
-            sig_number.handle_default();
+            sig.handle_default();
             return;
         }
-        let sa = pcb.sighand().handler(sig_number).unwrap();
+        let sa = pcb.sighand().handler(sig).unwrap();
 
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
@@ -618,7 +618,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         if e != SystemError::EFAULT {
             error!(
                 "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
-                sig_number as i32,
+                sig as i32,
                 ProcessManager::current_pcb().raw_pid(),
                 &e
             );

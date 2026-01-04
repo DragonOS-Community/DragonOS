@@ -64,7 +64,7 @@ pub fn do_execve(
 
     // execve 成功后，如果是 vfork 创建的子进程，需要通知父进程继续执行
     // 在通知父进程之前，必须先清除 vfork_done，防止子进程退出时再次通知
-    let pcb = ProcessManager::pcb();
+    let pcb = ProcessManager::current_pcb();
     let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
 
     if let Some(completion) = vfork_done {
@@ -123,7 +123,7 @@ pub fn do_execve(
 fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
     // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let pcb = ProcessManager::pcb();
+    let pcb = ProcessManager::current_pcb();
     // log::debug!(
     //     "pid: {:?}  do_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
     //     pcb.pid(),

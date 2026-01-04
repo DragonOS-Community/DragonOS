@@ -30,6 +30,7 @@ pub mod madvise;
 pub mod memblock;
 pub mod mincore;
 pub mod mmio_buddy;
+pub mod mlock;
 pub mod no_init;
 pub mod page;
 pub mod percpu;

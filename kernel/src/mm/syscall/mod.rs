@@ -12,10 +12,15 @@ mod sys_get_mempolicy;
 mod sys_madvise;
 mod sys_mincore;
 mod sys_mmap;
+mod sys_mlock;
+mod sys_mlock2;
+mod sys_mlockall;
 mod sys_mprotect;
 mod sys_mremap;
 mod sys_msync;
 mod sys_munmap;
+mod sys_munlock;
+mod sys_munlockall;
 mod sys_process_vm;
 pub mod sys_sbrk;
 
@@ -136,6 +141,22 @@ bitflags! {
         /// 同步将页面合并为新的透明大页
         const MADV_COLLAPSE = 25;
 
+    }
+
+    /// mlockall 标志
+    pub struct MlockAllFlags: u32 {
+        /// 锁定当前所有映射
+        const MCL_CURRENT = 1;
+        /// 锁定未来所有映射
+        const MCL_FUTURE = 2;
+        /// 延迟锁定(缺页时锁定)
+        const MCL_ONFAULT = 4;
+    }
+
+    /// mlock2 标志
+    pub struct Mlock2Flags: u32 {
+        /// 延迟锁定(缺页时锁定)
+        const MLOCK_ONFAULT = 1;
     }
 }
 

@@ -4,7 +4,7 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicU32, Ordering},
 };
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -473,6 +473,7 @@ bitflags! {
         const PG_WORKINGSET = 1 << 9;
         const PG_ERROR = 1 << 10;
         const PG_SLAB = 1 << 11;
+        const PG_MLOCKED = 1 << 13;
         const PG_RESERVED = 1 << 14;
         const PG_PRIVATE = 1 << 15;
         const PG_RECLAIM = 1 << 18;
@@ -570,6 +571,8 @@ pub struct InnerPage {
     phys_addr: PhysAddr,
     /// 页面类型
     page_type: PageType,
+    /// mlock 引用计数
+    mlock_count: AtomicU32,
 }
 
 impl InnerPage {
@@ -579,6 +582,7 @@ impl InnerPage {
             flags,
             phys_addr,
             page_type,
+            mlock_count: AtomicU32::new(0),
         }
     }
 
@@ -692,6 +696,21 @@ impl InnerPage {
             )
             .fill(0)
         };
+    }
+
+    /// 获取 mlock 引用计数
+    pub fn mlock_count(&self) -> u32 {
+        self.mlock_count.load(Ordering::Relaxed)
+    }
+
+    /// 增加 mlock 引用计数
+    pub fn inc_mlock_count(&mut self) {
+        self.mlock_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 减少 mlock 引用计数
+    pub fn dec_mlock_count(&mut self) {
+        self.mlock_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

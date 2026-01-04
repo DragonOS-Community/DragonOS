@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicU64, Ordering},
+    sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -19,6 +19,7 @@ use hashbrown::HashSet;
 use ida::IdAllocator;
 use log::warn;
 use system_error::SystemError;
+use x86::current;
 
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
@@ -148,6 +149,12 @@ pub struct InnerAddressSpace {
     pub end_code: VirtAddr,
     pub start_data: VirtAddr,
     pub end_data: VirtAddr,
+
+    /// 被 mlock 锁定的页面数量（页为单位）
+    locked_vm: AtomicUsize,
+
+    /// mlockall 默认标志 (影响未来映射)
+    def_flags: VmFlags,
 }
 
 impl InnerAddressSpace {
@@ -176,6 +183,8 @@ impl InnerAddressSpace {
             end_code: VirtAddr(0),
             start_data: VirtAddr(0),
             end_data: VirtAddr(0),
+            locked_vm: AtomicUsize::new(0),
+            def_flags: VmFlags::empty(),
         };
         if create_stack {
             // debug!("to create user stack.");
@@ -214,6 +223,8 @@ impl InnerAddressSpace {
         new_guard.end_code = self.end_code;
         new_guard.start_data = self.start_data;
         new_guard.end_data = self.end_data;
+        new_guard.locked_vm = AtomicUsize::new(self.locked_vm.load(Ordering::Relaxed));
+        new_guard.def_flags = self.def_flags;
 
         // 遍历父进程的每个VMA，根据VMA属性进行适当的复制
         // 参考 Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
@@ -1264,6 +1275,120 @@ impl InnerAddressSpace {
         }
 
         return Ok(requested);
+    }
+
+    /// 锁定地址范围
+    ///
+    /// # 参数
+    /// - `start`: 起始虚拟地址
+    /// - `len`: 长度（已页对齐）
+    /// - `onfault`: 是否延迟锁定
+    pub fn mlock(&mut self, start: VirtAddr, len: usize, onfault: bool) -> Result<(), SystemError> {
+        // 计算结束地址
+        let end = start.data().checked_add(len).ok_or(SystemError::ENOMEM)?;
+        let end = VirtAddr::new(end);
+
+        // 构造要设置的标志
+        let mut new_flags = VmFlags::VM_LOCKED;
+        if onfault {
+            new_flags |= VmFlags::VM_LOCKONFAULT;
+        }
+
+        // 获取冲突的 VMA 列表
+        let region = VirtRegion::new(start, len);
+        let vmas: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region).collect();
+
+        for vma in vmas {
+            let mut guard = vma.lock_irqsave();
+            let current_flags = *guard.vm_flags();
+            // 添加锁定标志
+            guard.set_vm_flags(current_flags | new_flags);
+        }
+
+        // 更新 locked_vm 计数
+        let page_count = len >> MMArch::PAGE_SHIFT;
+        self.locked_vm
+            .fetch_add(page_count, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// 解锁地址范围
+    pub fn munlock(&mut self, start: VirtAddr, len: usize) -> Result<(), SystemError> {
+        let end = start
+            .data()
+            .checked_add(len)
+            .ok_or(SystemError::ENOMEM)?;
+        let end = VirtAddr::new(end);
+
+        // 获取冲突的 VMA 列表
+        let region = VirtRegion::new(start, len);
+        let vmas: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region).collect();
+
+        for vma in vmas {
+            let mut guard = vma.lock_irqsave();
+            let current_flags = *guard.vm_flags();
+            // 清除锁定标志
+            guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
+        }
+
+        // 更新 locked_vm 计数
+        let page_count = len >> MMArch::PAGE_SHIFT;
+        self.locked_vm.fetch_sub(page_count, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// 锁定所有内存映射
+    pub fn mlockall(&mut self, flags: u32) -> Result<(), SystemError> {
+        use crate::mm::syscall::MlockAllFlags;
+
+        let mlock_flags =
+            MlockAllFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+
+        // 设置 def_flags（影响未来的映射）
+        let mut vm_flags = VmFlags::empty();
+        if mlock_flags.contains(MlockAllFlags::MCL_FUTURE) {
+            vm_flags |= VmFlags::VM_LOCKED;
+            if mlock_flags.contains(MlockAllFlags::MCL_ONFAULT) {
+                vm_flags |= VmFlags::VM_LOCKONFAULT;
+            }
+        }
+        self.def_flags = vm_flags;
+
+        // 如果设置了 MCL_CURRENT，锁定当前所有映射
+        if mlock_flags.contains(MlockAllFlags::MCL_CURRENT) {
+            let mut lock_flags = VmFlags::VM_LOCKED;
+            if mlock_flags.contains(MlockAllFlags::MCL_ONFAULT) {
+                lock_flags |= VmFlags::VM_LOCKONFAULT;
+            }
+
+            for vma in self.mappings.vmas.iter() {
+                let mut guard = vma.lock_irqsave();
+                let current_flags = *guard.vm_flags();
+                guard.set_vm_flags(current_flags | lock_flags);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 解锁所有内存映射
+    pub fn munlockall(&mut self) -> Result<(), SystemError> {
+        // 清除 def_flags
+        self.def_flags = VmFlags::empty();
+
+        // 遍历所有 VMA，清除锁定标志
+        for vma in self.mappings.vmas.iter() {
+            let mut guard = vma.lock_irqsave();
+            let current_flags = *guard.vm_flags();
+            guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
+        }
+
+        // 重置 locked_vm
+        self.locked_vm.store(0, Ordering::Relaxed);
+
+        Ok(())
     }
 }
 

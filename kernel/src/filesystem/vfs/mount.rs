@@ -1,9 +1,4 @@
-use core::{
-    any::Any,
-    fmt::Debug,
-    hash::Hash,
-    sync::atomic::{compiler_fence, Ordering},
-};
+use core::{any::Any, fmt::Debug, hash::Hash};
 
 use alloc::{
     collections::BTreeMap,
@@ -363,26 +358,6 @@ impl MountFS {
         self.self_mountpoint.read().as_ref().cloned()
     }
 
-    /// @brief 用Arc指针包裹MountFS对象。
-    /// 本函数的主要功能为，初始化MountFS对象中的自引用Weak指针
-    /// 本函数只应在构造器中被调用
-    #[allow(dead_code)]
-    #[deprecated]
-    fn wrap(self) -> Arc<Self> {
-        // 创建Arc指针
-        let mount_fs: Arc<MountFS> = Arc::new(self);
-        // 创建weak指针
-        let weak: Weak<MountFS> = Arc::downgrade(&mount_fs);
-
-        // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
-        let ptr: *mut MountFS = mount_fs.as_ref() as *const Self as *mut Self;
-        unsafe {
-            (*ptr).self_ref = weak;
-            // 返回初始化好的MountFS对象
-            return mount_fs;
-        }
-    }
-
     /// @brief 获取挂载点的文件系统的root inode
     pub fn mountpoint_root_inode(&self) -> Arc<MountFSInode> {
         return Arc::new_cyclic(|self_ref| MountFSInode {
@@ -432,29 +407,6 @@ impl Drop for MountFS {
 }
 
 impl MountFSInode {
-    /// @brief 用Arc指针包裹MountFSInode对象。
-    /// 本函数的主要功能为，初始化MountFSInode对象中的自引用Weak指针
-    /// 本函数只应在构造器中被调用
-    #[allow(dead_code)]
-    #[deprecated]
-    fn wrap(self) -> Arc<Self> {
-        // 创建Arc指针
-        let inode: Arc<MountFSInode> = Arc::new(self);
-        // 创建Weak指针
-        let weak: Weak<MountFSInode> = Arc::downgrade(&inode);
-        // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
-        compiler_fence(Ordering::SeqCst);
-        let ptr: *mut MountFSInode = inode.as_ref() as *const Self as *mut Self;
-        compiler_fence(Ordering::SeqCst);
-        unsafe {
-            (*ptr).self_ref = weak;
-            compiler_fence(Ordering::SeqCst);
-
-            // 返回初始化好的MountFSInode对象
-            return inode;
-        }
-    }
-
     /// @brief 判断当前inode是否为它所在的文件系统的root inode
     fn is_mountpoint_root(&self) -> Result<bool, SystemError> {
         return Ok(self.inner_inode.fs().root_inode().metadata()?.inode_id

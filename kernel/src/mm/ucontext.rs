@@ -1333,6 +1333,33 @@ impl InnerAddressSpace {
             return Err(SystemError::ENOMEM);
         }
 
+        // 锁定已映射的页面
+        // 对于 onfault 模式，不在此时锁定页面，而是在缺页中断时锁定
+        if !onfault {
+            unsafe {
+                let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
+
+                for vma in &vmas {
+                    // 只锁定可访问的 VMA
+                    if !vma.is_accessible() {
+                        continue;
+                    }
+
+                    let vma_guard = vma.lock_irqsave();
+                    let vma_start = vma_guard.region().start();
+                    let vma_end = vma_guard.region().end();
+                    drop(vma_guard);
+
+                    // 计算 VMA 与请求范围的交集
+                    let lock_start = core::cmp::max(vma_start, start);
+                    let lock_end = core::cmp::min(vma_end, end);
+
+                    // 锁定该范围内的已映射页面
+                    let _ = vma.mlock_vma_pages_range(&mapper, lock_start, lock_end, true);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1348,11 +1375,28 @@ impl InnerAddressSpace {
         let region = VirtRegion::new(start, len);
         let vmas: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region).collect();
 
-        for vma in vmas {
-            let mut guard = vma.lock_irqsave();
-            let current_flags = *guard.vm_flags();
-            // 清除锁定标志
-            guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
+        unsafe {
+            let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
+
+            for vma in &vmas {
+                // 先解锁页面
+                let vma_guard = vma.lock_irqsave();
+                let vma_start = vma_guard.region().start();
+                let vma_end = vma_guard.region().end();
+                drop(vma_guard);
+
+                // 计算 VMA 与请求范围的交集
+                let unlock_start = core::cmp::max(vma_start, start);
+                let unlock_end = core::cmp::min(vma_end, end);
+
+                // 解锁该范围内的已映射页面
+                let _ = vma.mlock_vma_pages_range(&mapper, unlock_start, unlock_end, false);
+
+                // 清除 VMA 的锁定标志
+                let mut guard = vma.lock_irqsave();
+                let current_flags = *guard.vm_flags();
+                guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
+            }
         }
 
         // 更新 locked_vm 计数
@@ -1386,10 +1430,44 @@ impl InnerAddressSpace {
                 lock_flags |= VmFlags::VM_LOCKONFAULT;
             }
 
-            for vma in self.mappings.vmas.iter() {
+            // 收集所有 VMA 的引用，以便在设置标志后锁定页面
+            let vmas_to_lock: alloc::vec::Vec<(Arc<LockedVMA>, VirtAddr, VirtAddr)> = self
+                .mappings
+                .vmas
+                .iter()
+                .filter_map(|vma| {
+                    if !vma.is_accessible() {
+                        return None;
+                    }
+                    let vma_guard = vma.lock_irqsave();
+                    let vm_flags = *vma_guard.vm_flags();
+                    let region = *vma_guard.region();
+                    drop(vma_guard);
+
+                    // 只处理还未设置 VM_LOCKED 的 VMA
+                    if !vm_flags.contains(VmFlags::VM_LOCKED) {
+                        Some((vma.clone(), region.start(), region.end()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // 先设置所有 VMA 的标志
+            for (vma, _, _) in &vmas_to_lock {
                 let mut guard = vma.lock_irqsave();
                 let current_flags = *guard.vm_flags();
                 guard.set_vm_flags(current_flags | lock_flags);
+            }
+
+            // 然后锁定页面（对于非 onfault 模式）
+            if !mlock_flags.contains(MlockAllFlags::MCL_ONFAULT) {
+                unsafe {
+                    let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
+                    for (vma, start, end) in vmas_to_lock {
+                        let _ = vma.mlock_vma_pages_range(&mapper, start, end, true);
+                    }
+                }
             }
         }
 
@@ -1398,11 +1476,40 @@ impl InnerAddressSpace {
 
     /// 解锁所有内存映射
     pub fn munlockall(&mut self) -> Result<(), SystemError> {
+        // 收集所有需要解锁的 VMA
+        let vmas_to_unlock: alloc::vec::Vec<(Arc<LockedVMA>, VirtAddr, VirtAddr)> = self
+            .mappings
+            .vmas
+            .iter()
+            .filter_map(|vma| {
+                let vma_guard = vma.lock_irqsave();
+                let vm_flags = *vma_guard.vm_flags();
+                let region = *vma_guard.region();
+                drop(vma_guard);
+
+                // 只处理已锁定或 lock on fault 的 VMA
+                if vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT) {
+                    Some((vma.clone(), region.start(), region.end()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        unsafe {
+            let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
+
+            // 先解锁所有页面
+            for (vma, start, end) in &vmas_to_unlock {
+                let _ = vma.mlock_vma_pages_range(&mapper, *start, *end, false);
+            }
+        }
+
         // 清除 def_flags
         self.def_flags = VmFlags::empty();
 
         // 遍历所有 VMA，清除锁定标志
-        for vma in self.mappings.vmas.iter() {
+        for (vma, _, _) in vmas_to_unlock {
             let mut guard = vma.lock_irqsave();
             let current_flags = *guard.vm_flags();
             guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));

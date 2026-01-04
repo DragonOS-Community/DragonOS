@@ -1183,6 +1183,14 @@ impl ProcessControlBlock {
             rlim_max: u64::MAX,
         };
 
+        // 设置 RLIMIT_MEMLOCK 默认值
+        // Linux x86_64 默认值通常是 64KB (0x10000 字节) 或更大 (8MB = 0x800000)
+        // 这里设置为 64KB 以符合大多数 Linux 发行版的默认行为
+        arr[RLimitID::Memlock as usize] = RLimit64 {
+            rlim_cur: 65536,      // 64KB
+            rlim_max: u64::MAX,   // 硬限制为 unlimited
+        };
+
         arr
     }
 

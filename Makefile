@@ -178,6 +178,7 @@ run-vnc: check_arch
 
 run-nographic: check_arch
 	$(MAKE) kernel
+	$(MAKE) user
 	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
 	# $(MAKE) rootfs
 	$(MAKE) qemu-nographic

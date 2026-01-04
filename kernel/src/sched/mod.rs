@@ -2,6 +2,9 @@ pub mod clock;
 pub mod completion;
 pub mod cputime;
 pub mod fair;
+pub mod fifo;
+#[cfg(feature = "fifo_demo")]
+pub mod fifo_demo;
 pub mod idle;
 pub mod pelt;
 pub mod prio;
@@ -41,6 +44,7 @@ use self::{
     clock::{ClockUpdataFlag, SchedClock},
     cputime::{irq_time_read, CpuTimeFunc, IrqTime},
     fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
+    fifo::FifoScheduler,
     prio::PrioUtil,
 };
 
@@ -313,6 +317,8 @@ pub struct CpuRunQueue {
     /// CFS调度器
     cfs: Arc<CfsRunQueue>,
 
+    fifo: fifo::FifoRunQueue,
+
     clock_pelt: u64,
     lost_idle_time: u64,
     clock_idle: u64,
@@ -345,6 +351,7 @@ impl CpuRunQueue {
             cala_load_update: (clock() + (5 * HZ + 1)) as usize,
             cala_load_active: 0,
             cfs: Arc::new(CfsRunQueue::new()),
+            fifo: fifo::FifoRunQueue::new(),
             clock_pelt: 0,
             lost_idle_time: 0,
             clock_idle: 0,
@@ -411,7 +418,7 @@ impl CpuRunQueue {
 
         match pcb.sched_info().policy() {
             SchedPolicy::CFS => CompletelyFairScheduler::enqueue(self, pcb, flags),
-            SchedPolicy::FIFO => todo!(),
+            SchedPolicy::FIFO => FifoScheduler::enqueue(self, pcb, flags),
             SchedPolicy::RT => todo!(),
             SchedPolicy::IDLE => IdleScheduler::enqueue(self, pcb, flags),
         }
@@ -442,7 +449,7 @@ impl CpuRunQueue {
 
         match pcb.sched_info().policy() {
             SchedPolicy::CFS => CompletelyFairScheduler::dequeue(self, pcb, flags),
-            SchedPolicy::FIFO => todo!(),
+            SchedPolicy::FIFO => FifoScheduler::dequeue(self, pcb, flags),
             SchedPolicy::RT => todo!(),
             SchedPolicy::IDLE => IdleScheduler::dequeue(self, pcb, flags),
         }
@@ -472,7 +479,7 @@ impl CpuRunQueue {
                 SchedPolicy::CFS => {
                     CompletelyFairScheduler::check_preempt_currnet(self, pcb, flags)
                 }
-                SchedPolicy::FIFO => todo!(),
+                SchedPolicy::FIFO => FifoScheduler::check_preempt_currnet(self, pcb, flags),
                 SchedPolicy::RT => todo!(),
                 SchedPolicy::IDLE => IdleScheduler::check_preempt_currnet(self, pcb, flags),
             }
@@ -661,34 +668,32 @@ impl CpuRunQueue {
 
     /// 选择下一个task
     pub fn pick_next_task(&mut self, prev: Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
-        if likely(prev.sched_info().policy() >= SchedPolicy::CFS)
-            && self.nr_running == self.cfs.h_nr_running as usize
-        {
-            let p = CompletelyFairScheduler::pick_next_task(self, Some(prev.clone()));
+        let mut next: Option<Arc<ProcessControlBlock>> = None;
 
-            if let Some(pcb) = p.as_ref() {
-                return pcb.clone();
-            } else {
-                // error!(
-                //     "pick idle cfs rq {:?}",
-                //     self.cfs_rq()
-                //         .entities
-                //         .iter()
-                //         .map(|x| x.1.pid)
-                //         .collect::<Vec<_>>()
-                // );
-                match prev.sched_info().policy() {
-                    SchedPolicy::FIFO => todo!(),
-                    SchedPolicy::RT => todo!(),
-                    SchedPolicy::CFS => CompletelyFairScheduler::put_prev_task(self, prev),
-                    SchedPolicy::IDLE => IdleScheduler::put_prev_task(self, prev),
-                }
-                // 选择idle
-                return self.idle.upgrade().unwrap();
+        if self.fifo.nr_running() > 0 {
+            next = FifoScheduler::pick_next_task(self, Some(prev.clone()));
+        }
+
+        if next.is_none() {
+            next = CompletelyFairScheduler::pick_next_task(self, Some(prev.clone()));
+        }
+
+        let next = next.unwrap_or_else(|| self.idle.upgrade().unwrap());
+
+        if !Arc::ptr_eq(&prev, &next) {
+            match prev.sched_info().policy() {
+                SchedPolicy::FIFO => FifoScheduler::put_prev_task(self, prev),
+                SchedPolicy::RT => todo!(),
+                SchedPolicy::CFS => CompletelyFairScheduler::put_prev_task(self, prev),
+                SchedPolicy::IDLE => IdleScheduler::put_prev_task(self, prev),
+            }
+
+            if next.sched_info().policy() == SchedPolicy::CFS {
+                CompletelyFairScheduler::set_next_task(self, next.clone());
             }
         }
 
-        todo!()
+        next
     }
 }
 
@@ -812,7 +817,7 @@ pub fn scheduler_tick() {
 
     match current.sched_info().policy() {
         SchedPolicy::CFS => CompletelyFairScheduler::tick(rq, current, false),
-        SchedPolicy::FIFO => todo!(),
+        SchedPolicy::FIFO => FifoScheduler::tick(rq, current, false),
         SchedPolicy::RT => todo!(),
         SchedPolicy::IDLE => IdleScheduler::tick(rq, current, false),
     }
@@ -976,7 +981,7 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
     __set_task_cpu(pcb, smp_get_processor_id());
     match pcb.sched_info().policy() {
         SchedPolicy::RT => todo!(),
-        SchedPolicy::FIFO => todo!(),
+        SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
         SchedPolicy::CFS => CompletelyFairScheduler::task_fork(pcb.clone()),
         SchedPolicy::IDLE => todo!(),
     }

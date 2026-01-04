@@ -6,8 +6,9 @@ use crate::arch::syscall::nr::SYS_SCHED_YIELD;
 use crate::exception::InterruptArch;
 use crate::process::ProcessManager;
 use crate::sched::fair::CompletelyFairScheduler;
+use crate::sched::fifo::FifoScheduler;
 use crate::sched::CurrentIrqArch;
-use crate::sched::{cpu_rq, schedule, SchedMode, Scheduler};
+use crate::sched::{cpu_rq, schedule, SchedMode, SchedPolicy, Scheduler};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
@@ -45,7 +46,12 @@ impl Syscall for SysSchedYield {
 
         // TODO: schedstat_inc(rq->yld_count);
 
-        CompletelyFairScheduler::yield_task(rq);
+        match pcb.sched_info().policy() {
+            SchedPolicy::CFS => CompletelyFairScheduler::yield_task(rq),
+            SchedPolicy::FIFO => FifoScheduler::yield_task(rq),
+            SchedPolicy::RT => rq.resched_current(),
+            SchedPolicy::IDLE => {}
+        }
 
         pcb.preempt_disable();
 

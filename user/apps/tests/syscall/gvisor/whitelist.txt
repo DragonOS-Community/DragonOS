@@ -10,6 +10,7 @@ uname_test
 syslog_test
 getcpu_test
 getcpu_host_test
+pause_test
 
 # 文件系统相关测试
 chroot_test

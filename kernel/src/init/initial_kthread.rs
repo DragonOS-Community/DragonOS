@@ -108,6 +108,7 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
     smp_init();
+    crate::exception::workqueue::workqueue_init();
     return Ok(());
 }
 

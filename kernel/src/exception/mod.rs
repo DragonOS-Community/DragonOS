@@ -23,6 +23,7 @@ mod resend;
 pub mod softirq;
 pub mod sysfs;
 pub mod tasklet;
+pub mod workqueue;
 
 /// 中断的架构相关的trait
 pub trait InterruptArch: Send + Sync {

@@ -6,6 +6,7 @@ use kdepends::thingbuf::StaticThingBuf;
 use crate::{
     arch::CurrentIrqArch,
     driver::tty::virtual_terminal::vc_manager,
+    exception::tasklet::{tasklet_schedule, Tasklet},
     exception::InterruptArch,
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
@@ -18,6 +19,11 @@ use crate::{
 static KEYBUF: StaticThingBuf<u8, 512> = StaticThingBuf::new();
 
 static mut TTY_REFRESH_THREAD: Option<Arc<ProcessControlBlock>> = None;
+
+lazy_static! {
+    /// TTY RX tasklet，用于在 softirq 上下文中处理 TTY 输入
+    static ref TTY_RX_TASKLET: Arc<Tasklet> = Tasklet::new(tty_rx_tasklet_fn, 0);
+}
 
 pub(super) fn tty_flush_thread_init() {
     let closure =
@@ -60,14 +66,26 @@ fn tty_refresh_thread() -> i32 {
     }
 }
 
-/// 发送数据到tty刷新线程
-pub fn send_to_tty_refresh_thread(data: &[u8]) {
+fn tty_rx_tasklet_fn(_data: usize) {
+    // 在 softirq/tasklet 上下文：不做 drain，只负责唤醒线程去处理输入。
     if unsafe { TTY_REFRESH_THREAD.is_none() } {
         return;
     }
+    if KEYBUF.is_empty() {
+        return;
+    }
+    let _ = ProcessManager::wakeup(unsafe { TTY_REFRESH_THREAD.as_ref().unwrap() });
+}
 
+/// 在 hardirq 上下文投递输入：只入队并调度 tasklet（不直接唤醒线程）。
+///
+/// 这样可以避免在硬中断里触碰调度/唤醒逻辑，符合 Linux bottom-half 语义。
+pub fn enqueue_tty_rx_from_irq(data: &[u8]) {
+    if unsafe { TTY_REFRESH_THREAD.is_none() } {
+        return;
+    }
     for item in data {
         KEYBUF.push(*item).ok();
     }
-    let _ = ProcessManager::wakeup(unsafe { TTY_REFRESH_THREAD.as_ref().unwrap() });
+    tasklet_schedule(&TTY_RX_TASKLET);
 }

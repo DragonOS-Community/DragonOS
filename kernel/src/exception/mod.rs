@@ -4,6 +4,7 @@ use system_error::SystemError;
 
 use crate::arch::CurrentIrqArch;
 
+pub mod bottom_half;
 pub mod debug;
 pub mod dummychip;
 pub mod ebreak;
@@ -21,6 +22,7 @@ pub mod msi;
 mod resend;
 pub mod softirq;
 pub mod sysfs;
+pub mod tasklet;
 
 /// 中断的架构相关的trait
 pub trait InterruptArch: Send + Sync {

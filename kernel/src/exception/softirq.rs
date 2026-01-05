@@ -13,6 +13,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::CurrentIrqArch,
+    exception::bottom_half,
     exception::InterruptArch,
     libs::rwlock::RwLock,
     mm::percpu::{PerCpu, PerCpuVar},
@@ -67,6 +68,7 @@ pub enum SoftirqNumber {
     /// 时钟软中断信号
     TIMER = 0,
     VideoRefresh = 1, //帧缓冲区刷新软中断
+    TASKLET = 2,
 }
 
 impl From<u64> for SoftirqNumber {
@@ -80,6 +82,7 @@ bitflags! {
     pub struct VecStatus: u64 {
         const TIMER = 1 << 0;
         const VIDEO_REFRESH = 1 << 1;
+        const TASKLET = 1 << 2;
     }
 }
 
@@ -282,8 +285,17 @@ impl Drop for RunningCountGuard<'_> {
     }
 }
 
+/// 处理 softirq。
+///
+/// 如果本 CPU BH 被禁用，则直接返回，保留 pending 让 `LocalBhDisableGuard` 的 drop
+/// 或未来某次 IRQ 退出点补跑。
 #[inline(never)]
 pub fn do_softirq() {
+    // BH disabled => 不执行 softirq（避免进程态持锁被打断后在 softirq 再取锁死锁）
+    if bottom_half::is_local_bh_disabled() {
+        return;
+    }
+
     fence(Ordering::SeqCst);
     IrqTime::irqtime_start();
     softirq_vectors().do_softirq();

@@ -31,6 +31,9 @@ kstack_protect = []
 # initram
 initram = []
 
+# fifo_demo: 起一个使用FIFO测例的内核线程，每5秒打印1条消息
+fifo_demo = []
+
 # 运行时依赖项
 [dependencies]
 acpi = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "282df2af7b" }

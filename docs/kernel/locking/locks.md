@@ -16,6 +16,7 @@
 &emsp;&emsp;在DragonOS之中，实现了以下的休眠锁：
 
 - semaphore
+- rwsem
 - mutex_t
 
 ### 自旋锁

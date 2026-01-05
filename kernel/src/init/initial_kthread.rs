@@ -93,6 +93,9 @@ fn kernel_init() -> Result<(), SystemError> {
         error!("Failed to initialize network: {:?}", err);
     });
 
+    #[cfg(feature = "fifo_demo")]
+    crate::sched::fifo_demo::fifo_demo_init();
+
     debug!("initial kernel thread done.");
     set_system_state(SystemState::Running);
 

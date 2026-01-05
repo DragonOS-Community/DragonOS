@@ -1,0 +1,4 @@
+[cargo]
+allTargets = false
+buildScripts.enable = true
+sysroot = "discover"

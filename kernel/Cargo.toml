@@ -5,140 +5,127 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-
 [lib]
 crate-type = ["staticlib"]
-
-[workspace]
-members = ["crates/*"]
-
-[features]
-default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test"]
-# kvm
-kvm = []
-
-fatfs = []
-fatfs-secure = ["fatfs"]
-driver_ps2_mouse = []
-
-# kprobe
-kprobe_test = []
-static_keys_test = []
-
-# kstack_protect 开启该功能后，会开启内核栈保护功能。用于辅助检测栈溢出。(内核栈占用会*2)
-kstack_protect = []
-
-# initram
-initram = []
 
 # 运行时依赖项
 [dependencies]
 acpi = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "282df2af7b" }
-asm_macros = { path = "crates/asm_macros" }
+asm_macros = { path = "../crates/asm_macros" }
 atomic_enum = "=0.2.0"
 bit_field = "=0.10"
 bitfield-struct = "=0.5.3"
 bitflags = "=1.3.2"
-bitmap = { path = "crates/bitmap" }
-driver_base_macros = { "path" = "crates/driver_base_macros" }
+bitmap = { path = "../crates/bitmap" }
+cfg-if = { version = "1.0.0" }
+cpio_reader = "0.1.2"
+defer = "0.2.1"
+derive_builder = { version = "0.20.2", default-features = false, features = [
+  "alloc",
+] }
+driver_base_macros = { "path" = "../crates/driver_base_macros" }
 elf = { version = "=0.7.2", default-features = false }
 fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev = "9862813020" }
 # 一个no_std的hashmap、hashset
 hashbrown = "=0.13.2"
-ida = { path = "crates/ida" }
-jhash = { path = "crates/rust-jhash" }
-intertrait = { path = "crates/intertrait" }
-kcmdline_macros = { path = "crates/kcmdline_macros" }
-kdepends = { path = "crates/kdepends" }
-klog_types = { path = "crates/klog_types" }
+ida = { path = "../crates/ida" }
+inherit-methods-macro = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/inherit-methods-macro", rev = "98f7e3e" }
+intertrait = { path = "../crates/intertrait" }
+jhash = { path = "../crates/rust-jhash" }
+kcmdline_macros = { path = "../crates/kcmdline_macros" }
+kdepends = { path = "../crates/kdepends" }
+klog_types = { path = "../crates/klog_types" }
+kprobe = { path = "../crates/kprobe" }
 linkme = "=0.3.27"
+log = "0.4.21"
+lru = "0.12.3"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev = "1597c1c", default-features = false }
-smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp", rev = "861e605", default-features = false, features = [
-    "alloc",
-    "medium-ethernet",
-    "socket-raw",
-    "socket-udp",
-    "socket-tcp",
-    "socket-icmp",
-    "socket-dhcpv4",
-    "socket-dns",
-    "proto-ipv4",
-    "proto-ipv6",
-    "medium-ip",
-] }
-syscall_table_macros = { path = "crates/syscall_table_macros" }
-system_error = { path = "crates/system_error" }
-unified-init = { path = "crates/unified-init" }
-virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "415ab38ff9" }
-wait_queue_macros = { path = "crates/wait_queue_macros" }
 paste = "=1.0.14"
-slabmalloc = { path = "crates/rust-slabmalloc" }
-log = "0.4.21"
-kprobe = { path = "crates/kprobe" }
-lru = "0.12.3"
-
-rbpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rbpf", rev = "f31e471a29", default-features = false }
 printf-compat = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat", rev = "626801cb5f", default-features = false }
-
+rbpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rbpf", rev = "f31e471a29", default-features = false }
+slabmalloc = { path = "../crates/rust-slabmalloc" }
+smoltcp = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp", rev = "861e605", version = "=0.12.0", default-features = false, features = [
+  "alloc",
+  "medium-ethernet",
+  "medium-ip",
+  "proto-ipv4",
+  "proto-ipv6",
+  "socket-dhcpv4",
+  "socket-dns",
+  "socket-icmp",
+  "socket-raw",
+  "socket-tcp",
+  "socket-udp",
+] }
 static-keys = { version = "=0.7" }
-
-cpio_reader = "0.1.2"
+syscall_table_macros = { path = "../crates/syscall_table_macros" }
+system_error = { path = "../crates/system_error" }
+unified-init = { path = "../crates/unified-init" }
+virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "415ab38ff9" }
+wait_queue_macros = { path = "../crates/wait_queue_macros" }
 xz4rust = { version = "0.2.1", default-features = false, features = ["alloc"] }
-
-defer = "0.2.1"
-cfg-if = { version = "1.0.0" }
-derive_builder = { version = "0.20.2", default-features = false, features = [
-    "alloc",
-] }
-
-inherit-methods-macro = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/inherit-methods-macro", rev = "98f7e3e" }
-
-# target为x86_64时，使用下面的依赖
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-multiboot2 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/multiboot2", rev = "05739aab40" }
-raw-cpuid = "11.0.1"
-x86 = "=0.52.0"
-x86_64 = "=0.15.2"
-uefi = { version = "=0.26.0", features = ["alloc"] }
-uefi-raw = "=0.5.0"
-
-# target为riscv64时，使用下面的依赖
-[target.'cfg(target_arch = "riscv64")'.dependencies]
-riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", rev = "4241a97", features = [
-    "s-mode",
-] }
-sbi-rt = { version = "=0.0.3", features = ["legacy"] }
-uefi = { version = "=0.26.0", features = ["alloc"] }
-uefi-raw = "=0.5.0"
-
-# target为loongarch64时，使用下面的依赖
-[target.'cfg(target_arch = "loongarch64")'.dependencies]
-loongArch64 = "=0.2.5"
-
-# 由于unwinding库不支持loongarch64架构，因此需要排除该依赖项
-[target.'cfg(not(target_arch = "loongarch64"))'.dependencies]
-unwinding = { version = "=0.2.8", default-features = false, features = [
-    "unwinder",
-    "fde-gnu-eh-frame-hdr",
-    "panic",
-    "personality",
-] }
-
-# 构建时依赖项
-[build-dependencies]
-kernel_build = { path = "../build-scripts/kernel_build" }
 
 [dependencies.lazy_static]
 version = "=1.4.0"
 # 由于在no_std环境，而lazy_static依赖了spin库，因此需要指定其使用no_std
 features = ["spin_no_std"]
 
+# 构建时依赖项
+[build-dependencies]
+kernel_build = { path = "../build-scripts/kernel_build" }
+
+# 由于unwinding库不支持loongarch64架构，因此需要排除该依赖项
+[target.'cfg(not(target_arch = "loongarch64"))'.dependencies]
+unwinding = { version = "=0.2.8", default-features = false, features = [
+  "fde-gnu-eh-frame-hdr",
+  "panic",
+  "personality",
+  "unwinder",
+] }
+
+# target为loongarch64时，使用下面的依赖
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+loongArch64 = "=0.2.5"
+
+# target为riscv64时，使用下面的依赖
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", rev = "4241a97", features = [
+  "s-mode",
+] }
+sbi-rt = { version = "=0.0.3", features = ["legacy"] }
+uefi = { version = "=0.26.0", features = ["alloc"] }
+uefi-raw = "=0.5.0"
+
+# target为x86_64时，使用下面的依赖
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+multiboot2 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/multiboot2", rev = "05739aab40" }
+raw-cpuid = "11.0.1"
+uefi = { version = "=0.26.0", features = ["alloc"] }
+uefi-raw = "=0.5.0"
+x86 = "=0.52.0"
+x86_64 = "=0.15.2"
+
+[features]
+default = ["fatfs", "fatfs-secure", "kvm", "static_keys_test"]
+driver_ps2_mouse = []
+fatfs = []
+fatfs-secure = ["fatfs"]
+# initram
+initram = []
+# kprobe
+kprobe_test = []
+# kstack_protect 开启该功能后，会开启内核栈保护功能。用于辅助检测栈溢出。(内核栈占用会*2)
+kstack_protect = []
+# kvm
+kvm = []
+static_keys_test = []
+
 # The development profile, used for `cargo build`
 [profile.dev]
 # opt-level = 0  # Controls the --opt-level the compiler builds with
-debug = true # Controls whether the compiler passes `-g`
+debug = true  # Controls whether the compiler passes `-g`
 
 # The release profile, used for `cargo build --release`
 [profile.release]

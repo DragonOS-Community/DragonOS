@@ -1,4 +1,4 @@
-use crate::driver::tty::kthread::send_to_tty_refresh_thread;
+use crate::driver::tty::kthread::enqueue_tty_rx_from_irq;
 
 #[allow(dead_code)]
 pub const NUM_SCAN_CODES: u8 = 0x80;
@@ -368,7 +368,7 @@ impl TypeOneFSMState {
     #[inline(always)]
     fn emit(ch: u8) {
         // 发送到tty
-        send_to_tty_refresh_thread(&[ch]);
+        enqueue_tty_rx_from_irq(&[ch]);
     }
 
     /// @brief 处理Prtsc按下事件

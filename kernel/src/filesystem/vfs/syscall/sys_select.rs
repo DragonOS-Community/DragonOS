@@ -1,4 +1,3 @@
-//! Reference https://github.com/asterinas/asterinas/blob/main/kernel/src/syscall/select.rs
 use alloc::vec::Vec;
 use system_error::SystemError;
 

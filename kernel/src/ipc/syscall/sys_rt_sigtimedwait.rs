@@ -57,19 +57,12 @@ pub fn do_kernel_rt_sigtimedwait(
     } else {
         let reader = UserBufferReader::new(uthese, size_of::<SigSet>(), from_user)?;
         let sigset = reader.read_one_from_user::<SigSet>(0)?;
-        // 移除不可屏蔽的信号（SIGKILL 和 SIGSTOP）
-        let sigset_val: SigSet = SigSet::from_bits(sigset.bits()).ok_or(SystemError::EINVAL)?;
-        let kill_stop_mask: SigSet =
-            SigSet::from_bits_truncate((Signal::SIGKILL as u64) | (Signal::SIGSTOP as u64));
-        let result = sigset_val & !kill_stop_mask;
-
-        result
+        // 移除不可屏蔽的信号 SIGKILL 和 SIGSTOP
+        let mut sigset_val = SigSet::from_bits(sigset.bits()).ok_or(SystemError::EINVAL)?;
+        sigset_val.remove(SigSet::from(Signal::SIGKILL));
+        sigset_val.remove(SigSet::from(Signal::SIGSTOP));
+        sigset_val
     };
-
-    // 如果信号集合为空，直接返回 EINVAL（根据 POSIX 标准）
-    if these.is_empty() {
-        return Err(SystemError::EINVAL);
-    }
 
     // 构造等待/屏蔽语义：与Linux一致
     // - 等待集合 these
@@ -85,12 +78,14 @@ pub fn do_kernel_rt_sigtimedwait(
         return Ok(sig as usize);
     }
 
-    // 设置新的信号掩码并等待
+    // 设置新的信号掩码以准备睡眠，临时地解除对用户等待信号的阻塞，让信号到达时能正确唤醒睡眠中的进程
     let pcb = ProcessManager::current_pcb();
     let mut new_blocked = *pcb.sig_info_irqsave().sig_blocked();
-    // 按Linux：等待期间屏蔽 these
-    new_blocked.insert(awaited);
+    new_blocked.remove(awaited);
+    // 应用新掩码（内部会自动保存旧掩码到 saved_sigmask ，用于后续恢复）
     set_user_sigmask(&mut new_blocked);
+    // 必须重新计算 pending，因为 blocked 变了，可能某些 pending 信号现在变得可见了
+    pcb.recalc_sigpending(None);
 
     // 计算超时时间
     let deadline = if uts.is_null() {
@@ -134,13 +129,21 @@ pub fn do_kernel_rt_sigtimedwait(
             }
         }
 
-        // 第四步：释放中断，然后真正进入调度睡眠（窗口期内，线程保持可中断阻塞，发送侧会唤醒）
+        // 第四步：检查是否有其他未屏蔽的待处理信号打断，若被其他信号唤醒了，必须返回 EINTR 让内核去处理那个信号
+        pcb.recalc_sigpending(None);
+        if pcb.has_pending_signal_fast() {
+            drop(preempt_guard);
+            restore_saved_sigmask();
+            return Err(SystemError::EINTR);
+        }
 
+        // 第五步：释放中断，然后真正进入调度睡眠（窗口期内，线程保持可中断阻塞，发送侧会唤醒）
         // 计算剩余等待时间
         let remaining_time = if let Some(deadline) = deadline {
             let now = PosixTimeSpec::now();
             let remaining = deadline.total_nanos() - now.total_nanos();
             if remaining <= 0 {
+                drop(preempt_guard);
                 restore_saved_sigmask();
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
@@ -171,6 +174,8 @@ fn try_dequeue_signal(awaited: &SigSet) -> Option<(Signal, SigInfo)> {
     let ignore_mask = !*awaited;
     if let (sig, Some(info)) = pending.dequeue_signal(&ignore_mask) {
         if sig != Signal::INVALID {
+            // 消费信号后及时刷新 HAS_PENDING_SIGNAL 状态，避免后续等待路径误判
+            pcb.recalc_sigpending(Some(&siginfo_guard));
             return Some((sig, info));
         }
     }
@@ -182,6 +187,8 @@ fn try_dequeue_signal(awaited: &SigSet) -> Option<(Signal, SigInfo)> {
 
     if sig != Signal::INVALID {
         if let Some(info) = info {
+            // 同步刷新 pending 标志，确保后续可中断等待依据最新状态
+            pcb.recalc_sigpending(None);
             return Some((sig, info));
         }
     }

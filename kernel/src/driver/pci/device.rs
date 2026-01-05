@@ -14,7 +14,7 @@ use crate::{
     },
     filesystem::kernfs::KernFSInode,
     libs::{
-        rwlock::{RwLock, RwLockWriteGuard},
+        rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -159,11 +159,11 @@ impl KObject for PciBusDevice {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

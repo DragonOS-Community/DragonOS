@@ -1,6 +1,6 @@
 [package]
 name = "dragonos_kernel"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -46,6 +46,7 @@ fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev 
 # 一个no_std的hashmap、hashset
 hashbrown = "=0.13.2"
 ida = { path = "crates/ida" }
+jhash = { path = "crates/rust-jhash" }
 intertrait = { path = "crates/intertrait" }
 kcmdline_macros = { path = "crates/kcmdline_macros" }
 kdepends = { path = "crates/kdepends" }
@@ -54,8 +55,9 @@ linkme = "=0.3.27"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev = "1597c1c", default-features = false }
-smoltcp = { version = "=0.12.0", default-features = false, features = [
+smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp", rev = "861e605", default-features = false, features = [
     "alloc",
+    "medium-ethernet",
     "socket-raw",
     "socket-udp",
     "socket-tcp",
@@ -107,7 +109,6 @@ uefi-raw = "=0.5.0"
 riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", rev = "4241a97", features = [
     "s-mode",
 ] }
-byte-slice-cast = { version = "1.2.2", default-features = false }
 sbi-rt = { version = "=0.0.3", features = ["legacy"] }
 uefi = { version = "=0.26.0", features = ["alloc"] }
 uefi-raw = "=0.5.0"

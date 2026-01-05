@@ -21,13 +21,18 @@ fn new_smoltcp_socket() -> smoltcp::socket::tcp::Socket<'static> {
     smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer)
 }
 
-fn new_listen_smoltcp_socket<T>(local_endpoint: T) -> smoltcp::socket::tcp::Socket<'static>
+fn new_listen_smoltcp_socket<T>(
+    local_endpoint: T,
+) -> Result<smoltcp::socket::tcp::Socket<'static>, SystemError>
 where
     T: Into<smoltcp::wire::IpListenEndpoint>,
 {
     let mut socket = new_smoltcp_socket();
-    socket.listen(local_endpoint).unwrap();
-    socket
+    socket.listen(local_endpoint).map_err(|e| match e {
+        tcp::ListenError::InvalidState => SystemError::EINVAL, // TODO: Check is right impl
+        tcp::ListenError::Unaddressable => SystemError::EADDRINUSE,
+    })?;
+    Ok(socket)
 }
 
 #[derive(Debug)]
@@ -64,11 +69,20 @@ impl Init {
         match self {
             Init::Unbound((socket, _)) => {
                 let bound = socket::inet::BoundInner::bind(*socket, &local_endpoint.addr, netns)?;
-                bound
-                    .port_manager()
-                    .bind_port(Types::Tcp, local_endpoint.port)?;
-                // bound.iface().common().bind_socket()
-                Ok(Init::Bound((bound, local_endpoint)))
+
+                // Handle ephemeral port assignment (port 0)
+                let bind_port = if local_endpoint.port == 0 {
+                    bound.port_manager().bind_ephemeral_port(Types::Tcp)?
+                } else {
+                    bound
+                        .port_manager()
+                        .bind_port(Types::Tcp, local_endpoint.port)?;
+                    local_endpoint.port
+                };
+
+                // Create endpoint with actual assigned port
+                let final_endpoint = smoltcp::wire::IpEndpoint::new(local_endpoint.addr, bind_port);
+                Ok(Init::Bound((bound, final_endpoint)))
             }
             Init::Bound(_) => {
                 log::debug!("Already Bound");
@@ -138,13 +152,26 @@ impl Init {
         } else {
             smoltcp::wire::IpListenEndpoint::from(local)
         };
-        log::debug!("listen at {:?}", listen_addr);
+        if listen_addr.port == 0 {
+            // Invalid port number
+            return Err((Init::Bound((inner, local)), SystemError::EINVAL));
+        }
+        // log::debug!("listen at {:?}, backlog {}", listen_addr, backlog);
+        if backlog == 0 || backlog > u16::MAX as usize {
+            // Invalid backlog value
+            return Err((Init::Bound((inner, local)), SystemError::EINVAL));
+        }
+
+        // FIXME: need refactor backlog mechanism for large number of backlog
+        let backlog = if backlog > 8 { 8 } else { backlog };
+
         let mut inners = Vec::new();
         if let Err(err) = || -> Result<(), SystemError> {
-            for _ in 0..(backlog - 1) {
+            for _i in 0..(backlog - 1) {
                 // -1 because the first one is already bound
+                // log::debug!("loop {:?}", _i);
                 let new_listen = socket::inet::BoundInner::bind(
-                    new_listen_smoltcp_socket(listen_addr),
+                    new_listen_smoltcp_socket(listen_addr)?,
                     listen_addr
                         .addr
                         .as_ref()
@@ -155,6 +182,7 @@ impl Init {
                 )?;
                 inners.push(new_listen);
             }
+            // log::debug!("finished listen");
             Ok(())
         }() {
             return Err((Init::Bound((inner, local)), err));
@@ -320,7 +348,7 @@ impl Listening {
         // log::debug!("local at {:?}", local_endpoint);
 
         let mut new_listen = socket::inet::BoundInner::bind(
-            new_listen_smoltcp_socket(self.listen_addr),
+            new_listen_smoltcp_socket(self.listen_addr)?,
             self.listen_addr
                 .addr
                 .as_ref()
@@ -402,6 +430,10 @@ impl Established {
         self.inner.with_mut(f)
     }
 
+    pub fn iface(&self) -> &Arc<dyn crate::driver::net::Iface> {
+        self.inner.iface()
+    }
+
     pub fn close(&self) {
         self.inner
             .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
@@ -429,14 +461,11 @@ impl Established {
                 if socket.can_recv() {
                     match socket.recv_slice(buf) {
                         Ok(size) => Ok(size),
-                        Err(tcp::RecvError::InvalidState) => {
-                            log::error!("TcpSocket::try_recv: InvalidState");
-                            Err(SystemError::ENOTCONN)
-                        }
+                        Err(tcp::RecvError::InvalidState) => Err(SystemError::ENOTCONN),
                         Err(tcp::RecvError::Finished) => Ok(0),
                     }
                 } else {
-                    Err(SystemError::ENOBUFS)
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                 }
             })
     }
@@ -449,7 +478,7 @@ impl Established {
                         .send_slice(buf)
                         .map_err(|_| SystemError::ECONNABORTED)
                 } else {
-                    Err(SystemError::ENOBUFS)
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                 }
             })
     }

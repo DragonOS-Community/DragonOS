@@ -18,10 +18,10 @@ use crate::{
             file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
             SysFSOpsSupport,
         },
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -576,9 +576,9 @@ impl DeviceManager {
             );
         }
         let kobject_parent = self.get_device_parent(&device, deivce_parent)?;
-        if let Some(ref kobj) = kobject_parent {
-            log::debug!("kobject parent: {:?}", kobj.name());
-        }
+        // if let Some(ref kobj) = kobject_parent {
+        //     // log::debug!("kobject parent: {:?}", kobj.name());
+        // }
         if let Some(kobject_parent) = kobject_parent {
             // debug!(
             //     "device '{}' parent is '{}', strong_count: {}",
@@ -879,7 +879,7 @@ impl DeviceManager {
         attr: &'static dyn Attribute,
     ) -> Result<(), SystemError> {
         if unlikely(
-            attr.mode().contains(ModeType::S_IRUGO)
+            attr.mode().contains(InodeMode::S_IRUGO)
                 && (!attr.support().contains(SysFSOpsSupport::ATTR_SHOW)),
         ) {
             warn!(
@@ -888,7 +888,7 @@ impl DeviceManager {
             );
         }
         if unlikely(
-            attr.mode().contains(ModeType::S_IWUGO)
+            attr.mode().contains(InodeMode::S_IWUGO)
                 && (!attr.support().contains(SysFSOpsSupport::ATTR_STORE)),
         ) {
             warn!(
@@ -1019,9 +1019,9 @@ pub fn device_shutdown() {
 pub struct DeviceAttrDev;
 
 impl Attribute for DeviceAttrDev {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         // 0o444
-        return ModeType::S_IRUGO;
+        return InodeMode::S_IRUGO;
     }
 
     fn name(&self) -> &str {
@@ -1130,7 +1130,7 @@ impl IrqHandlerData for DeviceId {}
 
 lazy_static! {
     /// class_dir列表，通过parent kobject的name和class_dir的name来索引class_dir实例
-    static ref CLASS_DIR_KSET_INSTANCE: RwLock<BTreeMap<String, Arc<ClassDir>>> = RwLock::new(BTreeMap::new());
+    static ref CLASS_DIR_KSET_INSTANCE: RwSem<BTreeMap<String, Arc<ClassDir>>> = RwSem::new(BTreeMap::new());
 }
 
 #[derive(Debug)]
@@ -1205,11 +1205,11 @@ impl KObject for ClassDir {
         self.inner().name = Some(name);
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

@@ -1,8 +1,7 @@
 #![allow(dead_code)]
-use core::{cmp::min, intrinsics::unlikely};
-use log::{debug, warn};
-use system_error::SystemError;
-
+use crate::filesystem::fat::fs::LockedFATInode;
+use crate::filesystem::vfs::IndexNode;
+use crate::mm::truncate::truncate_inode_pages;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},
     libs::vec_cursor::VecCursor,
@@ -12,9 +11,12 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use core::{cmp::min, intrinsics::unlikely};
+use log::{debug, warn};
+use system_error::SystemError;
 
 use super::{
-    fs::{Cluster, FATFileSystem, MAX_FILE_SIZE},
+    fs::{Cluster, FATFileSystem, MAX_FILE_SIZE, ZERO_BUF_SIZE},
     utils::decode_u8_ascii,
 };
 
@@ -195,10 +197,13 @@ impl FATFile {
 
             // 计算本次写入位置在分区上的偏移量
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_bytes_offset;
-            // 写入磁盘
+            // 写入磁盘（防御性检查：若设备返回0字节写入视为IO错误）
             let w = fs
                 .gendisk
                 .write_at_bytes(&buf[start..start + end_len], offset as usize)?;
+            if w == 0 {
+                return Err(SystemError::EIO);
+            }
 
             // 更新偏移量数据
             write_ok += w;
@@ -320,8 +325,22 @@ impl FATFile {
             return Ok(());
         }
 
-        let zeroes: Vec<u8> = vec![0u8; (range_end - range_start) as usize];
-        fs.gendisk.write_at_bytes(&zeroes, range_start as usize)?;
+        // 限制每次写入的缓冲区大小，避免大文件扩展时分配过大内存
+        let zeroes: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
+        let mut offset = range_start;
+        let mut remain = (range_end - range_start) as usize;
+
+        while remain > 0 {
+            let write_size = core::cmp::min(remain, ZERO_BUF_SIZE);
+            let w = fs
+                .gendisk
+                .write_at_bytes(&zeroes[..write_size], offset as usize)?;
+            if w == 0 {
+                return Err(SystemError::EIO);
+            }
+            offset += write_size as u64;
+            remain -= write_size;
+        }
 
         return Ok(());
     }
@@ -789,7 +808,8 @@ impl FATDir {
         let e: FATDirEntry = self.find_entry(name, None, None, fs.clone())?;
 
         // 判断文件夹是否为空，如果空，则不删除，报错。
-        if e.is_dir() && !(e.to_dir().unwrap().is_empty(fs.clone())) {
+        //  remove_clusters 为 false 时（即重命名/移动操作），不再检查目录是否为空，从而允许非空目录被“搬运”到新位置。
+        if e.is_dir() && remove_clusters && !(e.to_dir().unwrap().is_empty(fs.clone())) {
             return Err(SystemError::ENOTEMPTY);
         }
 
@@ -852,6 +872,7 @@ impl FATDir {
         fs: Arc<FATFileSystem>,
         old_name: &str,
         new_name: &str,
+        new_inode: Option<Arc<LockedFATInode>>,
     ) -> Result<FATDirEntry, SystemError> {
         // 判断源目录项是否存在
         let old_dentry = if let FATDirEntryOrShortName::DirEntry(dentry) =
@@ -862,25 +883,26 @@ impl FATDir {
             // 如果目标目录项不存在，则返回错误
             return Err(SystemError::ENOENT);
         };
-
         let short_name = match self.check_existence(new_name, None, fs.clone())? {
             FATDirEntryOrShortName::ShortName(s) => s,
-            // If newpath already exists, it will be atomically replaced, so that
-            // there is no point at which another process attempting to access
-            // newpath will find it missing.
-            // TODO: support other flags like RENAME_EXCHANGE
+            // 目标已存在：根据类型关系决定是否允许覆盖
             FATDirEntryOrShortName::DirEntry(e) => {
-                // remove the existing entry
+                validate_rename_target(&old_dentry, &e, fs.clone())?;
+
+                if let Some(new_inode) = new_inode {
+                    if let Some(page_cache) = new_inode.page_cache().clone() {
+                        truncate_inode_pages(page_cache, 0);
+                    }
+                }
+
+                // 允许覆盖：若为非空目录，remove 会返回 ENOTEMPTY（这里只处理空目录或文件）
                 self.remove(fs.clone(), new_name, true)?;
                 e.short_name_raw()
             }
         };
-
         let old_short_dentry = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
-            // 删除原来的目录项
             self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
-
             // 创建新的目录项
             let new_dentry = self.create_dir_entries(
                 new_name,
@@ -889,7 +911,6 @@ impl FATDir {
                 se.attributes,
                 fs.clone(),
             )?;
-
             return Ok(new_dentry);
         } else {
             // 不允许对根目录项进行重命名
@@ -905,6 +926,7 @@ impl FATDir {
         target: &FATDir,
         old_name: &str,
         new_name: &str,
+        new_inode: Result<Arc<LockedFATInode>, SystemError>,
     ) -> Result<FATDirEntry, SystemError> {
         // 判断源目录项是否存在
         let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
@@ -916,20 +938,24 @@ impl FATDir {
             return Err(SystemError::ENOENT);
         };
 
-        let short_name = if let FATDirEntryOrShortName::ShortName(s) =
-            target.check_existence(new_name, None, fs.clone())?
-        {
-            s
-        } else {
-            // 如果目标目录项存在，那么就返回错误
-            return Err(SystemError::EEXIST);
+        let short_name = match target.check_existence(new_name, None, fs.clone())? {
+            FATDirEntryOrShortName::ShortName(s) => s,
+            // 目标已存在：根据类型关系决定是否允许覆盖
+            FATDirEntryOrShortName::DirEntry(e) => {
+                validate_rename_target(&old_dentry, &e, fs.clone())?;
+
+                if let Some(page_cache) = new_inode.unwrap().page_cache().clone() {
+                    truncate_inode_pages(page_cache, 0);
+                }
+                // 覆盖前删除目标目录项（空目录或文件），不截断源内容
+                target.remove(fs.clone(), new_name, true)?;
+                e.short_name_raw()
+            }
         };
 
         let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
         if let Some(se) = old_short_dentry {
-            // 删除原来的目录项
             self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
-
             // 创建新的目录项
             let new_dentry: FATDirEntry = target.create_dir_entries(
                 new_name,
@@ -1025,7 +1051,6 @@ pub struct LongDirEntry {
     /// 长文件名的12-13个字符，每个字符占2bytes
     name3: [u16; 2],
 }
-
 impl LongDirEntry {
     /// 长目录项的字符串长度（单位：word）
     pub const LONG_NAME_STR_LEN: usize = 13;
@@ -2463,4 +2488,25 @@ pub fn get_raw_dir_entry(
             }
         }
     }
+}
+
+pub fn validate_rename_target(
+    old_entry: &FATDirEntry,
+    new_entry: &FATDirEntry,
+    fs: Arc<FATFileSystem>,
+) -> Result<(), SystemError> {
+    let old_is_dir = old_entry.is_dir();
+    let new_is_dir = new_entry.is_dir();
+
+    if old_is_dir && !new_is_dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    if !old_is_dir && new_is_dir {
+        return Err(SystemError::EISDIR);
+    }
+    // new_entry是目录，直接unwrap
+    if new_entry.is_dir() && !(new_entry.to_dir().unwrap().is_empty(fs)) {
+        return Err(SystemError::ENOTEMPTY);
+    }
+    Ok(())
 }

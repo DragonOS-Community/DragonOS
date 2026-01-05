@@ -14,9 +14,9 @@ use crate::{
             file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
             SysFSOpsSupport, SYSFS_ATTR_MODE_RW, SYSFS_ATTR_MODE_WO,
         },
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
-    libs::rwlock::RwLock,
+    libs::rwsem::RwSem,
 };
 use alloc::{
     string::{String, ToString},
@@ -25,7 +25,7 @@ use alloc::{
 use core::{ffi::CStr, fmt::Debug, intrinsics::unlikely};
 use hashbrown::HashMap;
 use intertrait::cast::CastArc;
-use log::{debug, error, info};
+use log::{debug, error};
 use system_error::SystemError;
 
 /// `/sys/bus`的kset
@@ -239,13 +239,13 @@ impl dyn Bus {
 #[derive(Debug)]
 pub struct BusManager {
     /// 存储总线bus的kset结构体与bus实例的映射(用于在sysfs callback的时候,根据kset找到bus实例)
-    kset_bus_map: RwLock<HashMap<Arc<KSet>, Arc<dyn Bus>>>,
+    kset_bus_map: RwSem<HashMap<Arc<KSet>, Arc<dyn Bus>>>,
 }
 
 impl BusManager {
     pub fn new() -> Self {
         return Self {
-            kset_bus_map: RwLock::new(HashMap::new()),
+            kset_bus_map: RwSem::new(HashMap::new()),
         };
     }
 
@@ -580,7 +580,7 @@ pub fn bus_add_device(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
 ///
 /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_probe_device#478
 pub fn bus_probe_device(dev: &Arc<dyn Device>) {
-    info!("bus_probe_device: dev: {:?}", dev.name());
+    // info!("bus_probe_device: dev: {:?}", dev.name());
     bus_manager().probe_device(dev);
 }
 
@@ -588,8 +588,8 @@ pub fn bus_probe_device(dev: &Arc<dyn Device>) {
 struct BusAttrDriversProbe;
 
 impl Attribute for BusAttrDriversProbe {
-    fn mode(&self) -> ModeType {
-        return ModeType::S_IWUSR;
+    fn mode(&self) -> InodeMode {
+        return InodeMode::S_IWUSR;
     }
 
     fn name(&self) -> &str {
@@ -626,7 +626,7 @@ impl Attribute for BusAttrDriversProbe {
 struct BusAttrDriversAutoprobe;
 
 impl Attribute for BusAttrDriversAutoprobe {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RW
     }
 
@@ -736,7 +736,7 @@ impl SysFSOps for BusDriverSysFSOps {
 struct DriverAttrUnbind;
 
 impl Attribute for DriverAttrUnbind {
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_WO
     }
 
@@ -784,7 +784,7 @@ impl Attribute for DriverAttrBind {
         "bind"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_WO
     }
 

@@ -1,16 +1,16 @@
 use super::vfs::PollableInode;
+use crate::arch::MMArch;
 use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
-use crate::filesystem::vfs::file::{File, FileMode};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::file::FileFlags;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
-    vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
+    vfs::{FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock},
 };
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
+use crate::mm::MemoryManagementArch;
 use crate::process::{ProcessFlags, ProcessManager};
-use crate::sched::SchedMode;
-use crate::syscall::Syscall;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -18,8 +18,55 @@ use core::any::Any;
 use ida::IdAllocator;
 use system_error::SystemError;
 
-static EVENTFD_ID_ALLOCATOR: SpinLock<IdAllocator> =
+const EVENTFD_MAX: u64 = u64::MAX - 1;
+
+lazy_static::lazy_static! {
+    static ref EVENTFD_FS: Arc<EventFdFs> = Arc::new(EventFdFs);
+}
+
+pub static EVENTFD_ID_ALLOCATOR: SpinLock<IdAllocator> =
     SpinLock::new(IdAllocator::new(0, u32::MAX as usize).unwrap());
+
+/// EventFd 文件系统
+///
+/// EventFd 是一个伪文件系统，类似于 PipeFS，用于支持 eventfd 文件描述符
+#[derive(Debug)]
+pub struct EventFdFs;
+
+impl EventFdFs {
+    /// 获取全局 EventFdFs 实例
+    pub fn instance() -> Arc<EventFdFs> {
+        EVENTFD_FS.clone()
+    }
+}
+
+impl FileSystem for EventFdFs {
+    fn root_inode(&self) -> Arc<dyn IndexNode> {
+        // EventFdFs 没有真正的根 inode，但我们需要实现这个方法
+        // 返回一个空的 eventfd inode 作为占位符
+        // 注意：这通常不会被调用，因为 eventfd 不是挂载的文件系统
+        Arc::new(EventFdInode::new(EventFd::new(0, EventFdFlags::empty(), 0)))
+    }
+
+    fn info(&self) -> FsInfo {
+        FsInfo {
+            blk_dev_id: 0,
+            max_name_len: 255,
+        }
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "eventfd"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        SuperBlock::new(Magic::EVENTFD_MAGIC, MMArch::PAGE_SIZE as u64, 255)
+    }
+}
 
 bitflags! {
     pub struct EventFdFlags: u32{
@@ -79,7 +126,10 @@ impl EventFdInode {
         if self_guard.count != 0 {
             events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
         }
-        if self_guard.count != u64::MAX {
+        // Linux eventfd counter max is U64_MAX - 1. When count reaches that max,
+        // any further write(8) would block (or EAGAIN for nonblock), so EPOLLOUT
+        // must be cleared.
+        if self_guard.count != EVENTFD_MAX {
             events |= EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
         }
         return Ok(events.bits() as usize);
@@ -117,10 +167,16 @@ impl PollableInode for EventFdInode {
 }
 
 impl IndexNode for EventFdInode {
+    fn is_stream(&self) -> bool {
+        // eventfd 属于典型的不可 seek 的伪文件描述符：
+        // - lseek/pread/pwrite 应返回 ESPIPE（Linux 语义）
+        true
+    }
+
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -219,18 +275,24 @@ impl IndexNode for EventFdInode {
             if ProcessManager::current_pcb().has_pending_signal() {
                 return Err(SystemError::ERESTARTSYS);
             }
-            let eventfd = self.eventfd.lock();
-            if u64::MAX - eventfd.count > val {
-                break;
+            {
+                let eventfd = self.eventfd.lock();
+                // Allow write when count + val <= EVENTFD_MAX.
+                if EVENTFD_MAX.saturating_sub(eventfd.count) >= val {
+                    break;
+                }
+                if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
             }
-            // block until a read() is performed  on the
-            // file descriptor, or fails with the error EAGAIN if the
-            // file descriptor has been made nonblocking.
-            if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            drop(eventfd);
-            self.wait_queue.sleep().ok();
+            // 等待计数下降（被 read 消费）
+            self.wait_queue.wait_event_interruptible(
+                || {
+                    let ev = self.eventfd.lock();
+                    EVENTFD_MAX.saturating_sub(ev.count) >= val
+                },
+                None::<fn()>,
+            )?;
         }
         let mut eventfd = self.eventfd.lock();
         eventfd.count += val;
@@ -248,7 +310,7 @@ impl IndexNode for EventFdInode {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let meta = Metadata {
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             file_type: FileType::File,
             ..Default::default()
         };
@@ -260,7 +322,7 @@ impl IndexNode for EventFdInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        panic!("EventFd does not have a filesystem")
+        EventFdFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -277,38 +339,5 @@ impl IndexNode for EventFdInode {
 
     fn absolute_path(&self) -> Result<String, SystemError> {
         Ok(String::from("eventfd"))
-    }
-}
-
-impl Syscall {
-    /// # 创建一个 eventfd 文件描述符
-    ///
-    /// ## 参数
-    /// - `init_val`: u32: eventfd 的初始值
-    /// - `flags`: u32: eventfd 的标志
-    ///
-    /// ## 返回值
-    /// - `Ok(usize)`: 成功创建的文件描述符
-    /// - `Err(SystemError)`: 创建失败
-    ///
-    /// See: https://man7.org/linux/man-pages/man2/eventfd2.2.html
-    pub fn sys_eventfd(init_val: u32, flags: u32) -> Result<usize, SystemError> {
-        let flags = EventFdFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
-        let id = EVENTFD_ID_ALLOCATOR
-            .lock()
-            .alloc()
-            .ok_or(SystemError::ENOMEM)? as u32;
-        let eventfd = EventFd::new(init_val as u64, flags, id);
-        let inode = Arc::new(EventFdInode::new(eventfd));
-        let filemode = if flags.contains(EventFdFlags::EFD_CLOEXEC) {
-            FileMode::O_RDWR | FileMode::O_CLOEXEC
-        } else {
-            FileMode::O_RDWR
-        };
-        let file = File::new(inode, filemode)?;
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-        let fd = fd_table_guard.alloc_fd(file, None).map(|x| x as usize);
-        return fd;
     }
 }

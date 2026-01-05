@@ -25,7 +25,7 @@ source = "git"
 # 路径或URL
 source-path = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/DragonReach.git"
 # git标签或分支
-revision = "e945c217b3"
+revision = "cc4e7ea35"
 
 # 构建相关信息
 [build]

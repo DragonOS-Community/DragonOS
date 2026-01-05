@@ -4,10 +4,11 @@ use alloc::boxed::Box;
 use log::debug;
 use slabmalloc::*;
 
+use crate::libs::spinlock::SpinLock;
 use crate::{arch::MMArch, mm::MemoryManagementArch, KERNEL_ALLOCATOR};
 
 // 全局slab分配器
-pub(crate) static mut SLABALLOCATOR: Option<SlabAllocator> = None;
+pub(crate) static SLABALLOCATOR: SpinLock<Option<SlabAllocator>> = SpinLock::new(None);
 
 // slab初始化状态
 pub(crate) static mut SLABINITSTATE: AtomicBool = AtomicBool::new(false);
@@ -72,16 +73,16 @@ impl SlabAllocator {
 /// 初始化slab分配器
 pub unsafe fn slab_init() {
     debug!("trying to init a slab_allocator");
-    SLABALLOCATOR = Some(SlabAllocator::new());
+    *SLABALLOCATOR.lock_irqsave() = Some(SlabAllocator::new());
     SLABINITSTATE = true.into();
 }
 
 pub unsafe fn slab_usage() -> SlabUsage {
-    if let Some(ref mut slab) = SLABALLOCATOR {
-        slab.zone.usage()
-    } else {
-        SlabUsage::new(0, 0)
-    }
+    let mut guard = SLABALLOCATOR.lock_irqsave();
+    guard
+        .as_mut()
+        .map(|slab| slab.zone.usage())
+        .unwrap_or_else(|| SlabUsage::new(0, 0))
 }
 
 /// 归还slab_page给buddy的回调

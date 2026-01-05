@@ -8,8 +8,6 @@ use system_error::SystemError;
 use crate::{
     libs::{spinlock::SpinLock, wait_queue::EventWaitQueue},
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
-    process::ProcessManager,
-    sched::{schedule, SchedMode},
 };
 
 #[derive(Debug, Clone)]
@@ -45,12 +43,7 @@ impl WaitQueue {
     /// # `wait_for`
     /// 等待events事件发生
     pub fn wait_for(&self, events: EPollEventType) {
-        unsafe {
-            ProcessManager::preempt_disable();
-            self.wait_queue.sleep_without_schedule(events.bits() as u64);
-            ProcessManager::preempt_enable();
-        }
-        schedule(SchedMode::SM_NONE);
+        self.wait_queue.sleep(events.bits() as u64);
     }
 
     /// # `busy_wait`

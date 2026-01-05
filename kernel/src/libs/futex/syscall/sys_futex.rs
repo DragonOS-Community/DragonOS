@@ -6,7 +6,7 @@ use crate::libs::futex::{constant::*, futex::Futex};
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_FUTEX},
-    mm::{verify_area, VirtAddr},
+    mm::{access_ok, VirtAddr},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::UserBufferReader,
@@ -165,7 +165,7 @@ pub(super) fn do_futex(
         | FutexArg::FUTEX_WAKE_OP
         | FutexArg::FUTEX_WAIT_REQUEUE_PI
         | FutexArg::FUTEX_CMP_REQUEUE_PI => {
-            verify_area(uaddr2, core::mem::size_of::<u32>())?;
+            access_ok(uaddr2, core::mem::size_of::<u32>())?;
         }
         _ => {}
     }
@@ -193,7 +193,7 @@ pub(super) fn do_futex(
         && uaddr.data() == 0;
 
     if !skip_uaddr_check {
-        verify_area(uaddr, core::mem::size_of::<u32>())?;
+        access_ok(uaddr, core::mem::size_of::<u32>())?;
     }
 
     match cmd {

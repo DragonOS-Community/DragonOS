@@ -9,7 +9,7 @@ use crate::{
     },
     filesystem::{
         sysfs::{Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport, SYSFS_ATTR_MODE_RO},
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
     init::initcall::INITCALL_POSTCORE,
     libs::casting::DowncastArc,
@@ -20,8 +20,7 @@ use crate::driver::base::kobject::KObjectState;
 use crate::driver::base::kobject::LockedKObjectState;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::boot::boot_callbacks;
-use crate::libs::rwlock::RwLockReadGuard;
-use crate::libs::rwlock::RwLockWriteGuard;
+use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::libs::spinlock::SpinLockGuard;
 use alloc::collections::btree_map;
@@ -97,7 +96,7 @@ impl AttributeGroup for MemmapDescAttrGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         Some(attr.mode())
     }
 }
@@ -125,7 +124,7 @@ impl Attribute for AttrStart {
         "start"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -151,7 +150,7 @@ impl Attribute for AttrEnd {
         "end"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -177,7 +176,7 @@ impl Attribute for AttrType {
         "type"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -256,11 +255,11 @@ impl KObject for MemmapDesc {
 
     fn set_name(&self, _name: String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

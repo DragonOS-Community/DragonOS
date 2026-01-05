@@ -8,7 +8,8 @@ use alloc::{
 use crate::{
     driver::acpi::acpi_manager,
     filesystem::kernfs::KernFSInode,
-    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    libs::rwlock::RwLock,
+    libs::rwsem::{RwSemReadGuard, RwSemWriteGuard},
 };
 
 use super::{
@@ -24,7 +25,7 @@ use super::{
 };
 use crate::filesystem::sysfs::file::sysfs_emit_str;
 use crate::filesystem::sysfs::{Attribute, AttributeGroup, SysFSOpsSupport};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::InodeMode;
 use crate::libs::lazy_init::Lazy;
 use system_error::SystemError;
 
@@ -246,11 +247,11 @@ impl KObject for CpuSubSystemFakeRootDevice {
         self.inner.write().name = name;
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -273,7 +274,7 @@ impl AttributeGroup for AttrGroupCpu {
         &self,
         _kobj: Arc<dyn KObject>,
         _attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         None
     }
 }
@@ -286,8 +287,8 @@ impl Attribute for AttrCpuPossible {
         "possible"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -310,8 +311,8 @@ impl Attribute for AttrCpuOnline {
         "online"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO
     }
 
     fn support(&self) -> SysFSOpsSupport {

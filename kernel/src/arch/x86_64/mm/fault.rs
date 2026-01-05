@@ -1,8 +1,5 @@
 use alloc::sync::Arc;
-use core::{
-    intrinsics::{likely, unlikely},
-    panic,
-};
+use core::{intrinsics::unlikely, panic};
 use log::error;
 use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
@@ -66,11 +63,7 @@ impl X86_64MMArch {
         false
     }
 
-    pub fn show_fault_oops(
-        regs: &'static TrapFrame,
-        error_code: X86PfErrorCode,
-        address: VirtAddr,
-    ) {
+    pub fn show_fault_oops(regs: &TrapFrame, error_code: X86PfErrorCode, address: VirtAddr) {
         let mapper =
             unsafe { PageMapper::current(crate::mm::PageTableKind::User, LockedFrameAllocator) };
         if let Some(entry) = mapper.get_entry(address, 0) {
@@ -131,11 +124,7 @@ impl X86_64MMArch {
         );
     }
 
-    pub fn page_fault_oops(
-        regs: &'static TrapFrame,
-        error_code: X86PfErrorCode,
-        address: VirtAddr,
-    ) {
+    pub fn page_fault_oops(regs: &TrapFrame, error_code: X86PfErrorCode, address: VirtAddr) {
         if regs.is_from_user() {
             Self::show_fault_oops(regs, error_code, address);
         }
@@ -149,7 +138,7 @@ impl X86_64MMArch {
     /// - `error_code`: 错误标志
     /// - `address`: 发生缺页异常的虚拟地址
     pub fn do_kern_addr_fault(
-        regs: &'static TrapFrame,
+        regs: &'static mut TrapFrame,
         error_code: X86PfErrorCode,
         address: VirtAddr,
     ) {
@@ -195,8 +184,9 @@ impl X86_64MMArch {
     /// ## 返回值
     /// - `true`: 成功修复,可以继续执行
     /// - `false`: 无法修复,是真正的内核错误
+    #[inline(never)]
     fn try_fixup_exception(
-        regs: &'static TrapFrame,
+        regs: &mut TrapFrame,
         _error_code: X86PfErrorCode,
         address: VirtAddr,
     ) -> bool {
@@ -207,18 +197,15 @@ impl X86_64MMArch {
 
         // 在异常表中查找修复代码
         if let Some(fixup_addr) = ExceptionTableManager::search_exception_table(regs.rip as usize) {
-            log::debug!(
-                "Page fault at {:#x} accessing user address {:#x}, fixed up to {:#x}",
-                regs.rip,
-                address.data(),
-                fixup_addr
-            );
+            // log::debug!(
+            //     "Page fault at {:#x} accessing user address {:#x}, fixed up to {:#x}",
+            //     regs.rip,
+            //     address.data(),
+            //     fixup_addr
+            // );
 
             // 修改trap frame的RIP到修复代码
-            unsafe {
-                let regs_mut = regs as *const TrapFrame as *mut TrapFrame;
-                (*regs_mut).rip = fixup_addr as u64;
-            }
+            regs.rip = fixup_addr as u64;
 
             return true;
         }
@@ -233,7 +220,7 @@ impl X86_64MMArch {
     /// - `error_code`: 错误标志
     /// - `address`: 发生缺页异常的虚拟地址
     pub unsafe fn do_user_addr_fault(
-        regs: &'static TrapFrame,
+        regs: &'static mut TrapFrame,
         error_code: X86PfErrorCode,
         address: VirtAddr,
     ) {
@@ -303,17 +290,17 @@ impl X86_64MMArch {
         };
 
         // 辅助函数：处理内核访问用户地址失败的情况
-        let handle_kernel_access_failed = || {
+        let handle_kernel_access_failed = |r: &mut TrapFrame| {
             // 如果是内核代码访问用户地址，尝试异常表修复
-            if !regs.is_from_user() {
-                if Self::try_fixup_exception(regs, error_code, address) {
+            if !r.is_from_user() {
+                if Self::try_fixup_exception(r, error_code, address) {
                     return true; // 成功修复
                 }
                 // 如果异常表中没有，说明是bug
                 error!(
                     "Kernel code at {:#x} illegally accessed user address {:#x} \
                      without exception table entry",
-                    regs.rip,
+                    r.rip,
                     address.data()
                 );
                 panic!("Illegal user space access from kernel");
@@ -338,7 +325,7 @@ impl X86_64MMArch {
                     );
 
                     // VMA不存在，检查是否需要异常表修复
-                    if handle_kernel_access_failed() {
+                    if handle_kernel_access_failed(regs) {
                         return; // 已通过异常表修复
                     }
 
@@ -353,17 +340,39 @@ impl X86_64MMArch {
 
             if !region.contains(address) {
                 if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
-                    if !space_guard.can_extend_stack(region.start() - address) {
-                        // exceeds stack limit
-                        log::error!(
-                            "pid {} stack limit exceeded, error_code: {:?}, address: {:#x}",
+                    let extension_size = region.start() - address;
+
+                    // 首先检查地址是否在栈的合理扩展范围内
+                    // 如果地址距离栈底太远（超过最大栈限制），则这不是一个栈扩展请求，
+                    // 而是一个无关的无效内存访问（例如空指针解引用）
+                    let max_stack_limit = space_guard
+                        .user_stack
+                        .as_ref()
+                        .map(|s| s.max_limit())
+                        .unwrap_or(0);
+
+                    if extension_size > max_stack_limit {
+                        // 地址距离栈太远，这不是栈扩展请求，而是普通的无效内存访问
+                        // 检查是否需要异常表修复
+                        if handle_kernel_access_failed(regs) {
+                            return; // 已通过异常表修复
+                        }
+
+                        send_segv();
+                        return;
+                    }
+
+                    if !space_guard.can_extend_stack(extension_size) {
+                        // 栈扩展超过限制
+                        log::warn!(
+                            "pid {} user stack limit exceeded, error_code: {:?}, address: {:#x}",
                             ProcessManager::current_pid().data(),
                             error_code,
                             address.data(),
                         );
 
                         // 栈溢出，检查是否需要异常表修复
-                        if handle_kernel_access_failed() {
+                        if handle_kernel_access_failed(regs) {
                             return; // 已通过异常表修复
                         }
 
@@ -371,7 +380,7 @@ impl X86_64MMArch {
                         return;
                     }
                     space_guard
-                        .extend_stack(region.start() - address)
+                        .extend_stack(extension_size)
                         .unwrap_or_else(|_| {
                             panic!(
                                 "user stack extend failed, error_code: {:?}, address: {:#x}",
@@ -391,7 +400,7 @@ impl X86_64MMArch {
                     log::error!("fault rip: {:#x}", regs.rip);
 
                     // 地址不在VMA范围内，检查是否需要异常表修复
-                    if handle_kernel_access_failed() {
+                    if handle_kernel_access_failed(regs) {
                         return; // 已通过异常表修复
                     }
 
@@ -401,18 +410,19 @@ impl X86_64MMArch {
             }
 
             if unlikely(Self::vma_access_error(vma.clone(), error_code)) {
-                log::error!(
-                    "vma access error, error_code: {:?}, address: {:#x}",
-                    error_code,
-                    address.data(),
-                );
-
                 // VMA权限错误，检查是否需要异常表修复
-                if handle_kernel_access_failed() {
+                if handle_kernel_access_failed(regs) {
                     return; // 已通过异常表修复
                 }
 
+                // log::error!(
+                //     "vma access error, error_code: {:?}, address: {:#x}",
+                //     error_code,
+                //     address.data(),
+                // );
+
                 send_segv();
+                return;
             }
             let mapper = &mut space_guard.user_mapper.utable;
             let message = PageFaultMessage::new(vma.clone(), address, flags, mapper);
@@ -437,8 +447,41 @@ impl X86_64MMArch {
             | VmFaultReason::VM_FAULT_HWPOISON_LARGE
             | VmFaultReason::VM_FAULT_FALLBACK;
 
-        if likely(!fault.contains(vm_fault_error)) {
-            panic!("fault error: {:?}", fault)
+        if fault.intersects(vm_fault_error) {
+            // 内核态访问用户地址（如 copy_from_user）应走异常表修复，返回 -EFAULT，而不是发送信号/崩溃
+            if !regs.is_from_user() {
+                if Self::try_fixup_exception(regs, error_code, address) {
+                    return;
+                }
+                panic!(
+                    "kernel access to user addr failed without fixup, fault: {:?}, addr: {:#x}, rip: {:#x}",
+                    fault,
+                    address.data(),
+                    regs.rip
+                );
+            }
+
+            // 用户态 fault：发送对应信号
+            let sig = if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
+                Signal::SIGSEGV
+            } else {
+                // 包括 SIGBUS / OOM / HWPOISON 等：目前统一 SIGBUS（后续可按 Linux 进一步细分）
+                Signal::SIGBUS
+            };
+
+            let mut info = SigInfo::new(
+                sig,
+                0,
+                SigCode::User,
+                SigType::Kill {
+                    pid: ProcessManager::current_pid(),
+                    uid: ProcessManager::current_pcb().cred().uid.data() as u32,
+                },
+            );
+            let _ = sig.send_signal_info(Some(&mut info), ProcessManager::current_pid());
+            return;
         }
+
+        panic!("fault error: {:?}", fault)
     }
 }

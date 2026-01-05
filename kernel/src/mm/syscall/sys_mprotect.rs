@@ -2,9 +2,9 @@
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MPROTECT, MMArch};
 use crate::mm::{
-    syscall::{check_aligned, PageFrameCount, ProtFlags},
+    syscall::{page_align_up, PageFrameCount, ProtFlags},
     ucontext::AddressSpace,
-    MemoryManagementArch, VirtPageFrame, {verify_area, VirtAddr},
+    MemoryManagementArch, VirtPageFrame, {access_ok, VirtAddr},
 };
 
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -34,19 +34,32 @@ impl Syscall for SysMprotectHandle {
         let prot_flags =
             ProtFlags::from_bits(Self::prot_flags(args) as u64).ok_or(SystemError::EINVAL)?;
 
-        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
-        assert!(check_aligned(len, MMArch::PAGE_SIZE));
-
-        if verify_area(start_vaddr, len).is_err() {
+        if !start_vaddr.check_aligned(MMArch::PAGE_SIZE) {
             return Err(SystemError::EINVAL);
         }
         if len == 0 {
             return Err(SystemError::EINVAL);
         }
+        // 将长度向上对齐，同时检测溢出；超大长度视为 ENOMEM
+        let len_aligned = page_align_up(len);
+        if len_aligned == 0 || len_aligned < len {
+            return Err(SystemError::ENOMEM);
+        }
+        let end_addr = start_vaddr
+            .data()
+            .checked_add(len_aligned)
+            .ok_or(SystemError::ENOMEM)?;
+        if end_addr > MMArch::USER_END_VADDR.data() {
+            return Err(SystemError::ENOMEM);
+        }
+
+        if access_ok(start_vaddr, len_aligned).is_err() {
+            return Err(SystemError::EFAULT);
+        }
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current()?;
         let start_frame = VirtPageFrame::new(start_vaddr);
-        let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
+        let page_count = PageFrameCount::from_bytes(len_aligned).unwrap();
 
         current_address_space
             .write()

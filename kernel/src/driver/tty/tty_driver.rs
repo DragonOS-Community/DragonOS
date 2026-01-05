@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+use core::{any::Any, fmt::Debug};
 
 use alloc::{
     string::{String, ToString},
@@ -102,7 +102,9 @@ impl TtyDriverManager {
 
 /// tty 驱动程序的与设备相关的数据
 pub trait TtyDriverPrivateField: Debug + Send + Sync {}
-pub trait TtyCorePrivateField: Debug + Send + Sync {}
+pub trait TtyCorePrivateField: Debug + Send + Sync + Any {
+    fn as_any(&self) -> &dyn Any;
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -315,16 +317,16 @@ impl TtyDriver {
         } else {
             idx = self.ida.lock().alloc().ok_or(SystemError::EBUSY)?;
         }
-        log::debug!("init_tty_device: create TtyCore");
+        // log::debug!("init_tty_device: create TtyCore");
         let tty = TtyCore::new(self.self_ref(), idx);
 
-        log::debug!("init_tty_device: to driver_install_tty");
+        // log::debug!("init_tty_device: to driver_install_tty");
         self.driver_install_tty(tty.clone())?;
-        log::debug!(
-            "init_tty_device: driver_install_tty done, index: {}, dev_name: {:?}",
-            idx,
-            tty.core().name(),
-        );
+        // log::debug!(
+        //     "init_tty_device: driver_install_tty done, index: {}, dev_name: {:?}",
+        //     idx,
+        //     tty.core().name(),
+        // );
 
         let core = tty.core();
 
@@ -333,20 +335,25 @@ impl TtyDriver {
             ports[core.index()].setup_internal_tty(Arc::downgrade(&tty));
             tty.set_port(ports[core.index()].clone());
         }
-        log::debug!("init_tty_device: to ldisc_setup");
+        // log::debug!("init_tty_device: to ldisc_setup");
         TtyLdiscManager::ldisc_setup(tty.clone(), tty.core().link())?;
 
-        // 在devfs创建对应的文件
+        // 对 PTY 来说，用户可见的设备节点由 devpts 挂载点下的动态节点提供，
+        // 不应再向全局 devfs 注册（否则在新实例复用索引时会因已有的 ptm/ptsX 节点返回 EEXIST）。
+        if self.tty_driver_type == TtyDriverType::Pty {
+            return Ok(tty);
+        }
 
-        log::debug!("init_tty_device: to new tty device");
+        // 在devfs创建对应的文件
+        // log::debug!("init_tty_device: to new tty device");
         let device = TtyDevice::new(
             core.name().clone(),
             IdTable::new(self.tty_line_name(idx), Some(*core.device_number())),
             super::tty_device::TtyType::Tty,
         );
-        log::debug!("init_tty_device: to devfs_register");
+        // log::debug!("init_tty_device: to devfs_register");
         devfs_register(device.name_ref(), device.clone())?;
-        log::debug!("init_tty_device: to device_register");
+        // log::debug!("init_tty_device: to device_register");
         device_register(device)?;
         Ok(tty)
     }
@@ -431,13 +438,13 @@ impl KObject for TtyDriver {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         todo!()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         todo!()
     }
 

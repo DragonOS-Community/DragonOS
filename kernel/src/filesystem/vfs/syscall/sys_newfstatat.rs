@@ -6,7 +6,7 @@ use crate::{
     filesystem::vfs::{stat::do_newfstatat, MAX_PATHLEN},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
-        user_access::check_and_clone_cstr,
+        user_access::vfs_check_and_clone_cstr,
     },
 };
 use alloc::vec::Vec;
@@ -67,7 +67,7 @@ impl SysNewFstatatHandle {
             return Err(SystemError::EFAULT);
         }
 
-        let filename = check_and_clone_cstr(filename_ptr as *const u8, Some(MAX_PATHLEN))?;
+        let filename = vfs_check_and_clone_cstr(filename_ptr as *const u8, Some(MAX_PATHLEN))?;
         let filename_str = filename.to_str().map_err(|_| SystemError::EINVAL)?;
 
         do_newfstatat(dfd, filename_str, user_stat_buf_ptr, flags).map(|_| 0)

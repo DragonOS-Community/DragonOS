@@ -1,0 +1,11 @@
+[package]
+name = "another_ext4"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = "2.2.1"
+log = "0.4"
+
+[features]
+fuser_root_inode = []

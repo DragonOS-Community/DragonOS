@@ -19,10 +19,20 @@ const TASK_COMM_LEN: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, FromPrimitive)]
 #[repr(usize)]
 enum PrctlOption {
+    GetDumpable = 3,
+    SetDumpable = 4,
     SetPDeathSig = 1,
     GetPDeathSig = 2,
     SetName = 15,
     GetName = 16,
+
+    SetMm = 35,
+
+    SetChildSubreaper = 36,
+    GetChildSubreaper = 37,
+
+    SetNoNewPrivs = 38,
+    GetNoNewPrivs = 39,
 }
 
 impl TryFrom<usize> for PrctlOption {
@@ -50,7 +60,25 @@ impl Syscall for SysPrctl {
         let from_user = frame.is_from_user();
         let current = ProcessManager::current_pcb();
 
+        // prctl 的部分选项在 Linux 中具有“线程组/进程级”语义。
+        // DragonOS 当前没有显式的 signal_struct / thread_group 抽象，
+        // 这里使用线程组 leader 来承载该类状态。
+        let thread_group_leader = get_thread_group_leader(&current);
+
         match option {
+            PrctlOption::GetDumpable => Ok(current.dumpable().into()),
+            PrctlOption::SetDumpable => {
+                // Linux: PR_SET_DUMPABLE 允许设置为 0/1；2(SUID_DUMP_ROOT) 不允许。
+                // 参考 gVisor: RootDumpability / SetGetDumpability。
+                let val = arg2 as i32;
+                match val {
+                    0 | 1 => {
+                        current.set_dumpable(val as u8);
+                        Ok(0)
+                    }
+                    _ => Err(SystemError::EINVAL),
+                }
+            }
             PrctlOption::SetPDeathSig => {
                 let signal = parse_pdeathsig(arg2)?;
                 current.set_pdeath_signal(signal);
@@ -90,6 +118,48 @@ impl Syscall for SysPrctl {
                 write_comm_buffer(dest, from_user, name.as_bytes())?;
                 Ok(0)
             }
+
+            PrctlOption::SetMm => {
+                // gVisor: PR_SET_MM 在缺少 CAP_SYS_RESOURCE 时必须返回 EPERM。
+                let cred = current.cred();
+                if !cred.has_capability(crate::process::cred::CAPFlags::CAP_SYS_RESOURCE) {
+                    return Err(SystemError::EPERM);
+                }
+
+                // 其余 PR_SET_MM 子操作目前未实现。
+                Err(SystemError::EINVAL)
+            }
+
+            PrctlOption::SetChildSubreaper => {
+                // Linux: 任何非 0 值都表示置 1；0 表示清除。
+                let v = arg2 as isize;
+                let enable = v != 0;
+                thread_group_leader
+                    .sig_info_mut()
+                    .set_is_child_subreaper(enable);
+                Ok(0)
+            }
+            PrctlOption::GetChildSubreaper => {
+                let dest = arg2 as *mut c_int;
+                if dest.is_null() {
+                    return Err(SystemError::EFAULT);
+                }
+                let mut writer = UserBufferWriter::new(dest, mem::size_of::<c_int>(), from_user)?;
+                let is_subreaper = thread_group_leader.sig_info_irqsave().is_child_subreaper();
+                let value: c_int = if is_subreaper { 1 } else { 0 };
+                writer.copy_one_to_user(&value, 0)?;
+                Ok(0)
+            }
+
+            PrctlOption::SetNoNewPrivs => {
+                // Linux: arg2 必须为 1；no_new_privs 一旦置位不可清除。
+                if arg2 != 1 {
+                    return Err(SystemError::EINVAL);
+                }
+                current.set_no_new_privs(true);
+                Ok(0)
+            }
+            PrctlOption::GetNoNewPrivs => Ok(current.no_new_privs()),
         }
     }
 
@@ -156,3 +226,10 @@ fn write_comm_buffer(dest: *mut u8, from_user: bool, name_bytes: &[u8]) -> Resul
 }
 
 syscall_table_macros::declare_syscall!(SYS_PRCTL, SysPrctl);
+
+fn get_thread_group_leader(
+    pcb: &alloc::sync::Arc<crate::process::ProcessControlBlock>,
+) -> alloc::sync::Arc<crate::process::ProcessControlBlock> {
+    let ti = pcb.threads_read_irqsave();
+    ti.group_leader().unwrap_or_else(|| pcb.clone())
+}

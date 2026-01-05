@@ -1,5 +1,6 @@
 mod bpf;
 mod kprobe;
+mod sys_perf_event_open;
 mod tracepoint;
 mod util;
 
@@ -8,8 +9,8 @@ use crate::bpf::prog::BpfProg;
 use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
-use crate::filesystem::vfs::file::{File, FileMode};
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
 };
@@ -26,8 +27,6 @@ use crate::mm::{MemoryManagementArch, VirtAddr, VmFaultReason};
 use crate::perf::bpf::BpfPerfEvent;
 use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs, PerfProbeConfig};
 use crate::process::ProcessManager;
-use crate::syscall::user_access::UserBufferReader;
-use crate::syscall::Syscall;
 use alloc::boxed::Box;
 use alloc::collections::LinkedList;
 use alloc::string::String;
@@ -198,7 +197,7 @@ impl IndexNode for PerfEventInode {
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
         self.event.mmap(start, len, offset)
     }
-    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _mode: &FileMode) -> Result<()> {
+    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
         Ok(())
     }
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<()> {
@@ -226,7 +225,7 @@ impl IndexNode for PerfEventInode {
 
     fn metadata(&self) -> Result<Metadata> {
         let meta = Metadata {
-            mode: ModeType::from_bits_truncate(0o755),
+            mode: InodeMode::from_bits_truncate(0o755),
             file_type: FileType::File,
             ..Default::default()
         };
@@ -351,24 +350,6 @@ impl FileSystem for PerfFakeFs {
     }
 }
 
-impl Syscall {
-    pub fn sys_perf_event_open(
-        attr: *const u8,
-        pid: i32,
-        cpu: i32,
-        group_fd: i32,
-        flags: u32,
-    ) -> Result<usize> {
-        let buf = UserBufferReader::new(
-            attr as *const perf_event_attr,
-            size_of::<perf_event_attr>(),
-            true,
-        )?;
-        let attr = buf.read_one_from_user(0)?;
-        perf_event_open(attr, pid, cpu, group_fd, flags)
-    }
-}
-
 pub fn perf_event_open(
     attr: &perf_event_attr,
     pid: i32,
@@ -382,9 +363,9 @@ pub fn perf_event_open(
         .flags
         .contains(PerfEventOpenFlags::PERF_FLAG_FD_CLOEXEC)
     {
-        FileMode::O_RDWR | FileMode::O_CLOEXEC
+        FileFlags::O_RDWR | FileFlags::O_CLOEXEC
     } else {
-        FileMode::O_RDWR
+        FileFlags::O_RDWR
     };
 
     let event: Box<dyn PerfEventOps> = match args.type_ {

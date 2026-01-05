@@ -1,7 +1,10 @@
 use alloc::string::String;
 
 use crate::{
-    filesystem::vfs::{file::FileMode, FilePrivateData, IndexNode, Metadata},
+    filesystem::{
+        epoll::EPollEventType,
+        vfs::{file::FileFlags, FilePrivateData, IndexNode, Metadata, PollableInode},
+    },
     libs::spinlock::SpinLockGuard,
 };
 
@@ -24,6 +27,11 @@ impl EPollInode {
 }
 
 impl IndexNode for EPollInode {
+    fn is_stream(&self) -> bool {
+        // epollfd 不支持 seek/pread/pwrite，按流式对象处理，统一返回 ESPIPE。
+        true
+    }
+
     fn read_at(
         &self,
         _offset: usize,
@@ -72,12 +80,53 @@ impl IndexNode for EPollInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {
         Ok(String::from("epoll"))
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Ok(self)
+    }
+}
+
+impl PollableInode for EPollInode {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        let ep = self.epoll.0.lock_irqsave();
+        if ep.ep_events_available() {
+            Ok((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn add_epitem(
+        &self,
+        epitem: Arc<super::EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let ep = self.epoll.0.lock_irqsave();
+        ep.poll_epitems.lock_irqsave().push_back(epitem);
+        Ok(())
+    }
+
+    fn remove_epitem(
+        &self,
+        epitem: &Arc<super::EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let ep = self.epoll.0.lock_irqsave();
+        let mut guard = ep.poll_epitems.lock_irqsave();
+        let len = guard.len();
+        guard.retain(|x| !Arc::ptr_eq(x, epitem));
+        if guard.len() != len {
+            Ok(())
+        } else {
+            Err(SystemError::ENOENT)
+        }
     }
 }

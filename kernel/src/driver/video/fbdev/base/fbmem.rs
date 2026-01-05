@@ -29,13 +29,13 @@ use crate::{
         kernfs::KernFSInode,
         sysfs::AttributeGroup,
         vfs::{
-            file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
-            Metadata,
+            file::FileFlags, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata,
         },
     },
     init::initcall::INITCALL_SUBSYS,
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -230,7 +230,7 @@ impl FbDevice {
                 parent: Weak::default(),
                 devfs_metadata: Metadata::new(
                     FileType::FramebufferDevice,
-                    ModeType::from_bits_truncate(0o666),
+                    InodeMode::from_bits_truncate(0o666),
                 ),
             }),
             kobj_state: LockedKObjectState::new(None),
@@ -322,11 +322,11 @@ impl KObject for FbDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -406,7 +406,7 @@ impl IndexNode for FbDevice {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }

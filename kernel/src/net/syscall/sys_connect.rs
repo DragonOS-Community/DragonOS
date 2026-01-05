@@ -1,0 +1,111 @@
+use system_error::SystemError;
+
+use crate::arch::interrupt::TrapFrame;
+use crate::arch::syscall::nr::SYS_CONNECT;
+use crate::mm::VirtAddr;
+use crate::net::posix::SockAddr;
+use crate::net::socket::endpoint::Endpoint;
+use crate::process::ProcessManager;
+use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use alloc::string::ToString;
+use alloc::vec::Vec;
+
+/// System call handler for the `connect` syscall
+///
+/// This handler implements the `Syscall` trait to provide functionality for connecting a socket to an address.
+pub struct SysConnectHandle;
+
+impl Syscall for SysConnectHandle {
+    /// Returns the number of arguments expected by the `connect` syscall
+    fn num_args(&self) -> usize {
+        3
+    }
+
+    /// Handles the `connect` system call
+    ///
+    /// Connects a socket to a remote address.
+    ///
+    /// # Arguments
+    /// * `args` - Array containing:
+    ///   - args[0]: File descriptor (usize)
+    ///   - args[1]: Address pointer (*const SockAddr)
+    ///   - args[2]: Address length (usize)
+    /// * `frame` - Trap frame
+    ///
+    /// # Returns
+    /// * `Ok(usize)` - 0 on success
+    /// * `Err(SystemError)` - Error code if operation fails
+    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        let fd = Self::fd(args);
+        let addr = Self::addr(args);
+        let addrlen = Self::addrlen(args);
+
+        // Verify address validity if from user space
+        if frame.is_from_user() {
+            let virt_addr = VirtAddr::new(addr as usize);
+            if crate::mm::access_ok(virt_addr, addrlen).is_err() {
+                return Err(SystemError::EFAULT);
+            }
+        }
+
+        do_connect(fd, addr, addrlen as u32)
+    }
+
+    /// Formats the syscall parameters for display/debug purposes
+    ///
+    /// # Arguments
+    /// * `args` - The raw syscall arguments
+    ///
+    /// # Returns
+    /// Vector of formatted parameters with descriptive names
+    fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
+        vec![
+            FormattedSyscallParam::new("fd", Self::fd(args).to_string()),
+            FormattedSyscallParam::new("addr", format!("{:#x}", Self::addr(args) as usize)),
+            FormattedSyscallParam::new("addrlen", Self::addrlen(args).to_string()),
+        ]
+    }
+}
+
+impl SysConnectHandle {
+    /// Extracts the file descriptor from syscall arguments
+    fn fd(args: &[usize]) -> usize {
+        args[0]
+    }
+
+    /// Extracts the address pointer from syscall arguments
+    fn addr(args: &[usize]) -> *const SockAddr {
+        args[1] as *const SockAddr
+    }
+
+    /// Extracts the address length from syscall arguments
+    fn addrlen(args: &[usize]) -> usize {
+        args[2]
+    }
+}
+
+syscall_table_macros::declare_syscall!(SYS_CONNECT, SysConnectHandle);
+
+/// Internal implementation of the connect operation
+///
+/// # Arguments
+/// * `fd` - File descriptor
+/// * `addr` - Address pointer
+/// * `addrlen` - Address length
+///
+/// # Returns
+/// * `Ok(usize)` - 0 on success
+/// * `Err(SystemError)` - Error code if operation fails
+pub(super) fn do_connect(
+    fd: usize,
+    addr: *const SockAddr,
+    addrlen: u32,
+) -> Result<usize, SystemError> {
+    let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
+    ProcessManager::current_pcb()
+        .get_socket_inode(fd as i32)?
+        .as_socket()
+        .unwrap()
+        .connect(endpoint)?;
+    Ok(0)
+}

@@ -1,9 +1,11 @@
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::process::{
     fork::CloneFlags,
     namespace::{
+        cgroup_namespace::{CgroupNamespace, INIT_CGROUP_NAMESPACE},
         mnt::{root_mnt_namespace, MntNamespace},
         net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
         uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
@@ -14,6 +16,23 @@ use core::{fmt::Debug, intrinsics::likely};
 
 use super::ipc_namespace::{IpcNamespace, INIT_IPC_NAMESPACE};
 use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
+
+int_like!(NamespaceId, AtomicNamespaceId, usize, AtomicUsize);
+// ============================================================================
+// Namespace ID Allocator
+// ============================================================================
+
+/// Global namespace inode number counter.
+/// Namespace IDs start from 1 (0 means invalid/uninitialized).
+/// This provides a stable, unique identifier for each namespace instance,
+static NEXT_NS_INO: AtomicNamespaceId = AtomicNamespaceId::new(NamespaceId(1));
+
+/// Allocate a new unique namespace id.
+/// This ID remains stable throughout the namespace's lifetime and is used
+/// for /proc/.../ns/ files (e.g., "ipc:[4026531839]").
+pub fn alloc_ns_id() -> NamespaceId {
+    NEXT_NS_INO.fetch_add(NamespaceId(1), Ordering::Relaxed)
+}
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///
@@ -34,10 +53,11 @@ pub struct NsProxy {
     pub ipc_ns: Arc<IpcNamespace>,
     /// 网络命名空间
     pub net_ns: Arc<NetNamespace>,
+    /// cgroup 命名空间
+    pub cgroup_ns: Arc<CgroupNamespace>,
     // 注意，user_ns 存储在cred,不存储在nsproxy
 
     // 其他namespace（为未来扩展预留）
-    // pub cgroup_ns: Option<Arc<CgroupNamespace>>,
     // pub time_ns: Option<Arc<TimeNamespace>>,
 }
 
@@ -55,12 +75,14 @@ impl NsProxy {
         let root_net_ns = INIT_NET_NAMESPACE.clone();
         let root_uts_ns = INIT_UTS_NAMESPACE.clone();
         let root_ipc_ns = INIT_IPC_NAMESPACE.clone();
+        let root_cgroup_ns = INIT_CGROUP_NAMESPACE.clone();
         Arc::new(Self {
             pid_ns_for_children: root_pid_ns,
             mnt_ns: root_mnt_ns,
             net_ns: root_net_ns,
             uts_ns: root_uts_ns,
             ipc_ns: root_ipc_ns,
+            cgroup_ns: root_cgroup_ns,
         })
     }
 
@@ -86,6 +108,7 @@ impl NsProxy {
             net_ns: self.net_ns.clone(),
             uts_ns: self.uts_ns.clone(),
             ipc_ns: self.ipc_ns.clone(),
+            cgroup_ns: self.cgroup_ns.clone(),
         }
     }
 }
@@ -168,12 +191,17 @@ pub(super) fn create_new_namespaces(
 
     let uts_ns = nsproxy.uts_ns.copy_uts_ns(clone_flags, user_ns.clone())?;
     let ipc_ns = nsproxy.ipc_ns.copy_ipc_ns(clone_flags, user_ns.clone());
+    let cgroup_ns = nsproxy
+        .cgroup_ns
+        .copy_cgroup_ns(clone_flags, user_ns.clone())?;
+
     let result = NsProxy {
         pid_ns_for_children,
         mnt_ns,
         net_ns,
         uts_ns,
         ipc_ns,
+        cgroup_ns,
     };
 
     let result = Arc::new(result);
@@ -188,11 +216,21 @@ pub struct NsCommon {
     pub level: u32,
     /// 种类
     ty: NamespaceType,
+    /// Namespace的唯一标识符（inode number），用于/proc/.../ns/文件
+    /// 这个ID在namespace创建时分配，在整个namespace生命周期内保持不变
+    /// 类似于Linux内核中的ns_common.inum字段
+    pub nsid: NamespaceId,
 }
 
 impl NsCommon {
+    /// Create a new NsCommon with an automatically allocated inode number.
+    /// This is the preferred way to create NsCommon for new namespaces.
     pub fn new(level: u32, ty: NamespaceType) -> Self {
-        Self { level, ty }
+        Self {
+            level,
+            ty,
+            nsid: alloc_ns_id(),
+        }
     }
 
     pub fn level(&self) -> u32 {
@@ -206,7 +244,8 @@ impl NsCommon {
 
 impl Default for NsCommon {
     fn default() -> Self {
-        Self::new(0, NamespaceType::Pid) // 默认值，实际使用时应该明确指定
+        // Note: This should rarely be used. Prefer explicit creation with new().
+        Self::new(0, NamespaceType::Pid)
     }
 }
 

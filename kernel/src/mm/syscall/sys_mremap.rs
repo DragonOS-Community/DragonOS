@@ -76,7 +76,33 @@ impl Syscall for SysMremapHandle {
             return Err(SystemError::EINVAL);
         }
         let vma = vma.unwrap();
-        let vm_flags = *vma.lock_irqsave().vm_flags();
+        let (vm_flags, vma_region) = {
+            let g = vma.lock_irqsave();
+            (*g.vm_flags(), *g.region())
+        };
+
+        // Linux vma_to_resize() semantics:
+        // With MREMAP_FIXED, the *source span being remapped* must be within a single VMA.
+        // - For shrinking, Linux unmaps the tail first and then checks the shrunken length.
+        // - For expansion, the check is against old_len (not new_len), otherwise all fixed
+        //   expansions would spuriously fail.
+        if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
+            let span_len = if old_len > new_len { new_len } else { old_len };
+            let span_end = old_vaddr
+                .data()
+                .checked_add(span_len)
+                .ok_or(SystemError::EINVAL)?;
+            if span_end > vma_region.end().data() {
+                // Side effects like Linux mremap_to():
+                // - unmap destination range first
+                // - if shrinking, unmap the tail [old+new_len, old+old_len)
+                do_munmap(new_vaddr, new_len)?;
+                if old_len > new_len {
+                    do_munmap(old_vaddr + new_len, old_len - new_len)?;
+                }
+                return Err(SystemError::EFAULT);
+            }
+        }
 
         // 暂时不支持巨页映射
         if vm_flags.contains(VmFlags::VM_HUGETLB) {
@@ -84,9 +110,19 @@ impl Syscall for SysMremapHandle {
             return Err(SystemError::ENOSYS);
         }
 
-        // 缩小旧内存映射区域
-        if old_len > new_len {
+        // Linux semantics:
+        // - Without MREMAP_FIXED, shrinking is always in-place (just unmap the tail).
+        // - With MREMAP_FIXED, shrinking still needs to move the mapping to the destination.
+        if old_len > new_len && !mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
             do_munmap(old_vaddr + new_len, old_len - new_len)?;
+            return Ok(old_vaddr.data());
+        }
+
+        // No-op when size doesn't change and we are not explicitly moving/duplicating.
+        if old_len == new_len
+            && !mremap_flags.contains(MremapFlags::MREMAP_FIXED)
+            && !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP)
+        {
             return Ok(old_vaddr.data());
         }
 
@@ -100,7 +136,10 @@ impl Syscall for SysMremapHandle {
             vm_flags,
         )?;
 
-        if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) {
+        // Unmap the old mapping only if this was a move (i.e. result differs from old_vaddr).
+        // - old_len==0 is a special duplication request and must never unmap the source.
+        // - DONTUNMAP keeps the source by definition.
+        if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) && old_len != 0 && r != old_vaddr {
             do_munmap(old_vaddr, old_len)?;
         }
 

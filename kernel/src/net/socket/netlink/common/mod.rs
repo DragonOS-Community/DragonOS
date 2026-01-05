@@ -1,5 +1,8 @@
 use crate::{
-    filesystem::epoll::EPollEventType,
+    filesystem::{
+        epoll::EPollEventType,
+        vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
+    },
     libs::{rwlock::RwLock, wait_queue::WaitQueue},
     net::socket::{
         endpoint::Endpoint,
@@ -14,7 +17,7 @@ use crate::{
     process::{namespace::net_namespace::NetNamespace, ProcessManager},
 };
 use alloc::sync::Arc;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError;
 
 pub(super) mod bound;
@@ -27,6 +30,9 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
     is_nonblocking: AtomicBool,
     wait_queue: Arc<WaitQueue>,
     netns: Arc<NetNamespace>,
+    fasync_items: FAsyncItems,
+    inode_id: InodeId,
+    open_files: AtomicUsize,
 }
 
 impl<P: SupportedNetlinkProtocol> NetlinkSocket<P>
@@ -40,6 +46,9 @@ where
             is_nonblocking: AtomicBool::new(is_nonblocking),
             wait_queue: Arc::new(WaitQueue::default()),
             netns: ProcessManager::current_netns(),
+            fasync_items: FAsyncItems::default(),
+            inode_id: generate_inode_id(),
+            open_files: AtomicUsize::new(0),
         })
     }
 
@@ -103,6 +112,10 @@ impl<P: SupportedNetlinkProtocol + 'static> Socket for NetlinkSocket<P>
 where
     BoundNetlink<P::Message>: Bound<Endpoint = NetlinkSocketAddr>,
 {
+    fn open_file_counter(&self) -> &AtomicUsize {
+        &self.open_files
+    }
+
     fn connect(
         &self,
         endpoint: crate::net::socket::endpoint::Endpoint,
@@ -147,8 +160,6 @@ where
         address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), system_error::SystemError> {
         // log::info!("NetlinkSocket recv_from called");
-        use crate::sched::SchedMode;
-
         if let Some(addr) = address {
             self.connect(addr)?;
         }
@@ -218,6 +229,10 @@ where
         todo!("implement epoll_items for netlink socket");
     }
 
+    fn fasync_items(&self) -> &FAsyncItems {
+        &self.fasync_items
+    }
+
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
         if let Some(addr) = self.inner.read().addr() {
             Ok(addr.into())
@@ -232,6 +247,10 @@ where
         } else {
             Err(SystemError::ENOTCONN)
         }
+    }
+
+    fn socket_inode_id(&self) -> InodeId {
+        self.inode_id
     }
 }
 

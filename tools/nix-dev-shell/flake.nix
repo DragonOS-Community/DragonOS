@@ -1,36 +1,53 @@
 {
   description = "dragonos-nix-dev";
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
-    utils.url = "github:numtide/flake-utils";
+    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, fenix, utils, ... } @ inputs:
-    utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      fenix,
+      flake-utils,
+      ...
+    }@inputs:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        rusttoolchain = fenix.packages.${system}.fromToolchainFile{
+        rust-toolchain = fenix.packages.${system}.fromToolchainFile {
           file = ../../kernel/rust-toolchain.toml;
+          sha256 = "sha256-3JA9u08FrvsLdi5dGIsUeQZq3Tpn9RvWdkLus2+5cHs=";
         };
-      in {
+      in
+      {
         devShells.default = pkgs.mkShell {
           # 基础工具链
           buildInputs = with pkgs; [
             git
             llvm
             libclang
-            rusttoolchain
+            rust-toolchain
+            gcc
           ];
 
           env = {
-              LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-            };
-
+            LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+            USING_DRAGONOS_NIX_ENV = 1;
+          };
 
           # Shell启动脚本
           shellHook = ''
+            echo "欢迎进入 DragonOS Nix 开发环境!"
+            echo "要运行 DragonOS，请构建内核、rootfs，再QEMU运行"
+            echo "  构建内核:    make kernel"
+            echo "  构建 rootfs: nix run .#rootfs-x86_64"
+            echo "  QEMU 运行:   nix run .#start-x86_64"
+            echo "  文档：       https://docs.dragonos.org.cn/"
           '';
         };
 

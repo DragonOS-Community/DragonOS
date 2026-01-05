@@ -395,13 +395,10 @@ impl MemoryManagementArch for X86_64MMArch {
     }
 
     /// 带异常表保护的内存拷贝
-    #[inline(always)]
-    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> i32 {
-        let mut result: i32;
+    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        let mut result: usize;
 
         core::arch::asm!(
-            // 保存原始值
-            "xor {result:e}, {result:e}",
 
             // 标记为可能出错的访问点
             "2:",
@@ -411,9 +408,8 @@ impl MemoryManagementArch for X86_64MMArch {
             // 正常完成,跳过错误处理
             "jmp 3f",
 
-            // 错误处理: 设置返回值为-1
+            // 错误处理: 将剩余未拷贝的字节数返回(rcx会输出出去)
             "4:",
-            "mov {result:e}, -1",
 
             "3:",
 
@@ -421,13 +417,12 @@ impl MemoryManagementArch for X86_64MMArch {
             ".pushsection __ex_table, \"a\"",
             ".balign 8",
             ".quad 2b - .",
-            ".quad 4b - .",
+            ".quad 4b - . + 8",
             ".popsection",
 
-            result = out(reg) result,
             inout("rdi") dst => _,
             inout("rsi") src => _,
-            inout("rcx") len => _,
+            inout("rcx") len => result,
             options(att_syntax, nostack)
         );
 
@@ -446,13 +441,10 @@ impl MemoryManagementArch for X86_64MMArch {
     /// ## 返回值
     /// - 0: 成功
     /// - -1: 发生页错误
-    #[inline(always)]
-    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> i32 {
-        let mut result: i32;
+    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
+        let mut result: usize;
 
         core::arch::asm!(
-            // 初始化返回值为0
-            "xor {result:e}, {result:e}",
 
             // 标记为可能出错的访问点
             "2:",
@@ -463,9 +455,8 @@ impl MemoryManagementArch for X86_64MMArch {
             // 正常完成，跳过错误处理
             "jmp 3f",
 
-            // 错误处理: 设置返回值为-1
+            // 错误处理: 将剩余未设置的字节数返回
             "4:",
-            "mov {result:e}, -1",
 
             "3:",
 
@@ -473,12 +464,11 @@ impl MemoryManagementArch for X86_64MMArch {
             ".pushsection __ex_table, \"a\"",
             ".balign 8",
             ".quad 2b - .",
-            ".quad 4b - .",
+            ".quad 4b - . + 8",
             ".popsection",
 
-            result = out(reg) result,
             inout("rdi") dst => _,
-            inout("rcx") len => _,
+            inout("rcx") len => result,
             inout("al") value => _,
             options(att_syntax, nostack)
         );
@@ -534,23 +524,25 @@ const fn protection_map() -> [EntryFlags<MMArch>; 16] {
 
 impl X86_64MMArch {
     fn init_xd_rsvd() {
-        // 读取ia32-EFER寄存器的值
-        let efer: EferFlags = x86_64::registers::model_specific::Efer::read();
+        // 读取并确保开启 NXE，使用户态 PROT_EXEC 正确受 NX 约束
+        let mut efer = x86_64::registers::model_specific::Efer::read();
         if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
-            // NO_EXECUTE_ENABLE是false，那么就设置xd_reserved为true
-            debug!("NO_EXECUTE_ENABLE is false, set XD_RESERVED to true");
-            XD_RESERVED.store(true, Ordering::Relaxed);
+            debug!("Enabling EFER.NXE for NX support");
+            efer.insert(EferFlags::NO_EXECUTE_ENABLE);
+            unsafe { x86_64::registers::model_specific::Efer::write(efer) };
         }
+        // 若硬件仍不支持（写入无效），标记为保留，否则可用
+        let efer_after = x86_64::registers::model_specific::Efer::read();
+        let xd_reserved = !efer_after.contains(EferFlags::NO_EXECUTE_ENABLE);
+        XD_RESERVED.store(xd_reserved, Ordering::Relaxed);
         compiler_fence(Ordering::SeqCst);
     }
 
     /// 判断XD标志位是否被保留
     pub fn is_xd_reserved() -> bool {
-        // return XD_RESERVED.load(Ordering::Relaxed);
-
-        // 由于暂时不支持execute disable，因此直接返回true
-        // 不支持的原因是，目前好像没有能正确的设置page-level的xd位，会触发page fault
-        return true;
+        // 若硬件不支持 NX/XD，则返回 true，表示执行位不可用；否则遵从检测结果
+        // 默认使用启动阶段检测到的 XD_RESERVED 值
+        return XD_RESERVED.load(Ordering::Relaxed);
     }
 
     pub unsafe fn read_array<T>(addr: VirtAddr, count: usize) -> Vec<T> {

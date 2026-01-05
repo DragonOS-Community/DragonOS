@@ -15,7 +15,7 @@ use crate::{
         tty_driver::{TtyDriverFlag, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
-    filesystem::{epoll::EPollEventType, vfs::file::FileMode},
+    filesystem::{epoll::EPollEventType, vfs::file::FileFlags},
     libs::{
         rwlock::RwLockReadGuard,
         spinlock::{SpinLock, SpinLockGuard},
@@ -791,7 +791,7 @@ impl NTtyData {
         let pg = ctrl_info.pgid.clone();
         drop(ctrl_info);
         if let Some(pg) = pg {
-            let _ = crate::ipc::kill::kill_process_group(&pg, signal);
+            let _ = crate::ipc::kill::send_signal_to_pgid(&pg, signal);
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {
@@ -1589,10 +1589,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         len: usize,
         cookie: &mut bool,
         _offset: usize,
-        mode: FileMode,
+        flags: FileFlags,
     ) -> Result<usize, system_error::SystemError> {
         let mut ldata;
-        if mode.contains(FileMode::O_NONBLOCK) {
+        if flags.contains(FileFlags::O_NONBLOCK) {
             let ret = self.disc_data_try_lock();
             if ret.is_err() {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -1673,7 +1673,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             let core = tty.core();
             if !ldata.input_available(core.termios(), false) {
                 if core.flags().contains(TtyFlag::OTHER_CLOSED) {
-                    ret = Err(SystemError::EIO);
+                    // 对端已关闭且无数据可读，返回EOF而不是EIO，符合常规PTY语义
+                    ret = Ok(0);
                     break;
                 }
 
@@ -1682,7 +1683,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     break;
                 }
 
-                if mode.contains(FileMode::O_NONBLOCK)
+                if flags.contains(FileFlags::O_NONBLOCK)
                     || core.flags().contains(TtyFlag::LDISC_CHANGING)
                 {
                     ret = Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -1756,7 +1757,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         tty: Arc<TtyCore>,
         buf: &[u8],
         len: usize,
-        mode: FileMode,
+        _flags: FileFlags,
     ) -> Result<usize, system_error::SystemError> {
         let mut nr = len;
         let mut ldata = self.disc_data();
@@ -1779,7 +1780,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
                 return Err(SystemError::ERESTARTSYS);
             }
-            if core.flags().contains(TtyFlag::HUPPED) {
+            if core.flags().contains(TtyFlag::HUPPED)
+                || core.flags().contains(TtyFlag::OTHER_CLOSED)
+                || core.flags().contains(TtyFlag::HUPPING)
+            {
                 return Err(SystemError::EIO);
             }
             if termios.output_mode.contains(OutputMode::OPOST) {
@@ -1829,7 +1833,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 break;
             }
 
-            if mode.contains(FileMode::O_NONBLOCK) || core.flags().contains(TtyFlag::LDISC_CHANGING)
+            if _flags.contains(FileFlags::O_NONBLOCK)
+                || core.flags().contains(TtyFlag::LDISC_CHANGING)
             {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }

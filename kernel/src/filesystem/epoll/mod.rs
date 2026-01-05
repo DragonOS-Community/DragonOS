@@ -1,4 +1,4 @@
-use super::vfs::file::File;
+use super::{poll::PollFlags, vfs::file::File};
 use crate::libs::{rwlock::RwLock, spinlock::SpinLock};
 use alloc::sync::Weak;
 use core::fmt::Debug;
@@ -94,16 +94,37 @@ impl EPollItem {
     }
 
     /// ## 通过epoll_item来执行绑定文件的poll方法，并获取到感兴趣的事件
-    fn ep_item_poll(&self) -> EPollEventType {
-        let file = self.file.upgrade();
-        if file.is_none() {
+    ///
+    /// 返回与用户注册的事件掩码相交的就绪事件
+    pub(super) fn ep_item_poll(&self) -> EPollEventType {
+        let Some(file) = self.file.upgrade() else {
             return EPollEventType::empty();
+        };
+
+        // 对于不支持poll的普通文件/目录，返回默认掩码（总是就绪）
+        // 需要与用户注册的事件掩码相交，保持与普通文件路径的一致性
+        if file.is_always_ready() {
+            let interested = self.event.read().events;
+            return EPollEventType::from_bits_truncate(
+                Self::default_poll_mask().bits() & interested,
+            );
         }
-        if let Ok(events) = file.unwrap().poll() {
-            let events = events as u32 & self.event.read().events;
-            return EPollEventType::from_bits_truncate(events);
+
+        match file.poll() {
+            Ok(events) => {
+                let interested = self.event.read().events;
+                EPollEventType::from_bits_truncate(events as u32 & interested)
+            }
+            Err(_) => EPollEventType::empty(),
         }
-        return EPollEventType::empty();
+    }
+
+    /// 返回默认的poll掩码，用于不支持poll的普通文件
+    ///
+    /// 对应Linux内核的 DEFAULT_POLLMASK (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM)
+    #[inline]
+    pub(super) fn default_poll_mask() -> EPollEventType {
+        PollFlags::DEFAULT_POLLMASK.into()
     }
 }
 

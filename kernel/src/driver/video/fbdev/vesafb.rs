@@ -30,12 +30,13 @@ use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
     init::{boot::boot_callbacks, boot_params, initcall::INITCALL_DEVICE},
     libs::{
         once::Once,
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{early_ioremap::EarlyIoRemap, PhysAddr, VirtAddr},
@@ -259,11 +260,11 @@ impl KObject for VesaFb {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -847,11 +848,11 @@ impl KObject for VesaFbDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -876,7 +877,7 @@ impl AttributeGroup for VesaFbAnonAttributeGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         Some(attr.mode())
     }
 }
@@ -889,8 +890,8 @@ impl Attribute for AnonAttrPhysAddr {
         "smem_start"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO
     }
 
     fn support(&self) -> SysFSOpsSupport {

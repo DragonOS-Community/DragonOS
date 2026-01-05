@@ -1,6 +1,6 @@
 use core::{
     cmp::min,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -31,6 +31,7 @@ pub struct PageCache {
     id: usize,
     inner: SpinLock<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
+    unevictable: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -39,6 +40,13 @@ pub struct InnerPageCache {
     id: usize,
     pages: HashMap<usize, Arc<Page>>,
     page_cache_ref: Weak<PageCache>,
+}
+
+/// 描述一次从页缓存到目标缓冲区的拷贝
+pub struct CopyItem {
+    page: Arc<Page>,
+    page_offset: usize,
+    sub_len: usize,
 }
 
 impl InnerPageCache {
@@ -62,15 +70,12 @@ impl InnerPageCache {
         self.pages.remove(&offset)
     }
 
-    fn create_pages(&mut self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
-        assert!(buf.len().is_multiple_of(MMArch::PAGE_SIZE));
-
-        let page_num = buf.len() / MMArch::PAGE_SIZE;
-
-        let len = buf.len();
-        if len == 0 {
+    pub fn create_pages(&mut self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
+        if buf.is_empty() {
             return Ok(());
         }
+
+        let page_num = ((buf.len() - 1) >> MMArch::PAGE_SHIFT) + 1;
 
         let mut page_manager_guard = page_manager_lock_irqsave();
 
@@ -78,21 +83,86 @@ impl InnerPageCache {
             let buf_offset = i * MMArch::PAGE_SIZE;
             let page_index = start_page_index + i;
 
+            let page_flags = {
+                let cache = self
+                    .page_cache_ref
+                    .upgrade()
+                    .expect("failed to get self_arc of pagecache");
+                if cache.unevictable.load(Ordering::Relaxed) {
+                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
+                } else {
+                    PageFlags::PG_LRU
+                }
+            };
+
             let page = page_manager_guard.create_one_page(
                 PageType::File(FileMapInfo {
-                    page_cache: self
-                        .page_cache_ref
-                        .upgrade()
-                        .expect("failed to get self_arc of pagecache"),
+                    page_cache: self.page_cache_ref.clone(),
                     index: page_index,
                 }),
-                PageFlags::PG_LRU,
+                page_flags,
+                &mut LockedFrameAllocator,
+            )?;
+
+            let page_len = core::cmp::min(MMArch::PAGE_SIZE, buf.len() - buf_offset);
+
+            let mut page_guard = page.write_irqsave();
+            unsafe {
+                let dst = page_guard.as_slice_mut();
+                dst[..page_len].copy_from_slice(&buf[buf_offset..buf_offset + page_len]);
+            }
+
+            self.add_page(start_page_index + i, &page);
+        }
+
+        Ok(())
+    }
+
+    /// 创建若干个“零页”并加入 PageCache。
+    ///
+    /// 与 `create_pages()` 的区别：
+    /// - 不需要临时分配 `Vec<u8>` 作为填充缓冲区；
+    /// - 直接分配物理页后在页内 `fill(0)`；
+    ///
+    /// 适用场景：tmpfs 等内存文件系统的“空洞读/缺页补零”。
+    pub fn create_zero_pages(
+        &mut self,
+        start_page_index: usize,
+        page_num: usize,
+    ) -> Result<(), SystemError> {
+        if page_num == 0 {
+            return Ok(());
+        }
+
+        let mut page_manager_guard = page_manager_lock_irqsave();
+
+        for i in 0..page_num {
+            let page_index = start_page_index + i;
+
+            let page_flags = {
+                let cache = self
+                    .page_cache_ref
+                    .upgrade()
+                    .expect("failed to get self_arc of pagecache");
+                if cache.unevictable.load(Ordering::Relaxed) {
+                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
+                } else {
+                    PageFlags::PG_LRU
+                }
+            };
+
+            let page = page_manager_guard.create_one_page(
+                PageType::File(FileMapInfo {
+                    page_cache: self.page_cache_ref.clone(),
+                    index: page_index,
+                }),
+                page_flags,
                 &mut LockedFrameAllocator,
             )?;
 
             let mut page_guard = page.write_irqsave();
             unsafe {
-                page_guard.copy_from_slice(&buf[buf_offset..buf_offset + MMArch::PAGE_SIZE]);
+                page_guard.as_slice_mut().fill(0);
             }
 
             self.add_page(page_index, &page);
@@ -112,7 +182,11 @@ impl InnerPageCache {
     ///
     /// - `Ok(usize)` 成功读取的长度
     /// - `Err(SystemError)` 失败返回错误码
-    pub fn read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn prepare_read(
+        &mut self,
+        offset: usize,
+        buf_len: usize,
+    ) -> Result<(Vec<CopyItem>, usize), SystemError> {
         let inode: Arc<dyn IndexNode> = self
             .page_cache_ref
             .upgrade()
@@ -124,21 +198,21 @@ impl InnerPageCache {
         let file_size = inode.metadata().unwrap().size;
 
         let len = if offset < file_size as usize {
-            core::cmp::min(file_size as usize, offset + buf.len()) - offset
+            core::cmp::min(file_size as usize, offset + buf_len) - offset
         } else {
             0
         };
 
         if len == 0 {
-            return Ok(0);
+            return Ok((Vec::new(), 0));
         }
 
         let mut not_exist = Vec::new();
+        let mut copies: Vec<CopyItem> = Vec::new();
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
 
-        let mut buf_offset = 0;
         let mut ret = 0;
         for i in 0..page_num {
             let page_index = start_page_index + i;
@@ -160,12 +234,11 @@ impl InnerPageCache {
             };
 
             if let Some(page) = self.get_page(page_index) {
-                let sub_buf = &mut buf[buf_offset..(buf_offset + sub_len)];
-                unsafe {
-                    sub_buf.copy_from_slice(
-                        &page.read_irqsave().as_slice()[page_offset..page_offset + sub_len],
-                    );
-                }
+                copies.push(CopyItem {
+                    page,
+                    page_offset,
+                    sub_len,
+                });
                 ret += sub_len;
             } else if let Some((index, count)) = not_exist.last_mut() {
                 if *index + *count == page_index {
@@ -176,8 +249,6 @@ impl InnerPageCache {
             } else {
                 not_exist.push((page_index, 1));
             }
-
-            buf_offset += sub_len;
         }
 
         for (page_index, count) in not_exist {
@@ -194,21 +265,28 @@ impl InnerPageCache {
             let copy_len = core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
                 - copy_offset;
 
-            let page_buf_offset = copy_offset.saturating_sub(page_index * MMArch::PAGE_SIZE);
-
-            let buf_offset = copy_offset.saturating_sub(offset);
-
-            buf[buf_offset..buf_offset + copy_len]
-                .copy_from_slice(&page_buf[page_buf_offset..page_buf_offset + copy_len]);
-
-            ret += copy_len;
-
-            // log::debug!("page_offset:{page_offset}, count:{count}");
-            // log::debug!("copy_offset:{copy_offset}, copy_len:{copy_len}");
-            // log::debug!("buf_offset:{buf_offset}, page_buf_offset:{page_buf_offset}");
+            // 为每个新建的页生成拷贝项
+            for i in 0..count {
+                let pg_index = page_index + i;
+                let page = self
+                    .get_page(pg_index)
+                    .expect("page must exist after create_pages");
+                let page_start = pg_index * MMArch::PAGE_SIZE;
+                let sub_start = core::cmp::max(copy_offset, page_start);
+                let sub_end =
+                    core::cmp::min(copy_offset + copy_len, page_start + MMArch::PAGE_SIZE);
+                if sub_end > sub_start {
+                    copies.push(CopyItem {
+                        page,
+                        page_offset: sub_start - page_start,
+                        sub_len: sub_end - sub_start,
+                    });
+                    ret += sub_end - sub_start;
+                }
+            }
         }
 
-        Ok(ret)
+        Ok((copies, ret))
     }
 
     /// 向PageCache中写入数据。
@@ -222,18 +300,20 @@ impl InnerPageCache {
     ///
     /// - `Ok(usize)` 成功读取的长度
     /// - `Err(SystemError)` 失败返回错误码
-    pub fn write(&mut self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+    pub fn write(
+        &mut self,
+        offset: usize,
+        buf: &[u8],
+    ) -> Result<(Vec<CopyItem>, usize), SystemError> {
         let len = buf.len();
         if len == 0 {
-            return Ok(0);
+            return Ok((Vec::new(), 0));
         }
-
-        // log::debug!("offset:{offset}, len:{len}");
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
 
-        let mut buf_offset = 0;
+        let mut copies: Vec<CopyItem> = Vec::new();
         let mut ret = 0;
 
         for i in 0..page_num {
@@ -264,26 +344,18 @@ impl InnerPageCache {
             }
 
             if let Some(page) = page {
-                let sub_buf = &buf[buf_offset..(buf_offset + sub_len)];
-                let mut page_guard = page.write_irqsave();
-                unsafe {
-                    page_guard.as_slice_mut()[page_offset..page_offset + sub_len]
-                        .copy_from_slice(sub_buf);
-                }
-                page_guard.add_flags(PageFlags::PG_DIRTY);
-
+                copies.push(CopyItem {
+                    page,
+                    page_offset,
+                    sub_len,
+                });
                 ret += sub_len;
-
-                // log::debug!(
-                //     "page_offset:{page_offset}, buf_offset:{buf_offset}, sub_len:{sub_len}"
-                // );
             } else {
                 return Err(SystemError::EIO);
             };
-
-            buf_offset += sub_len;
         }
-        Ok(ret)
+
+        Ok((copies, ret))
     }
 
     pub fn resize(&mut self, len: usize) -> Result<(), SystemError> {
@@ -323,6 +395,53 @@ impl InnerPageCache {
         }
         Ok(())
     }
+
+    /// 写回指定范围的脏页
+    pub fn writeback_range(
+        &mut self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<(), SystemError> {
+        for idx in start_index..=end_index {
+            if let Some(page) = self.pages.get(&idx) {
+                let mut guard = page.write_irqsave();
+                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    crate::mm::page::PageReclaimer::page_writeback(&mut guard, false);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 驱逐指定范围的干净页
+    ///
+    /// 只驱逐干净的、无外部引用的页
+    pub fn invalidate_range(&mut self, start_index: usize, end_index: usize) -> usize {
+        let mut evicted = 0;
+        let mut page_reclaimer = page_reclaimer_lock_irqsave();
+
+        for idx in start_index..=end_index {
+            if let Some(page) = self.pages.get(&idx) {
+                let guard = page.read_irqsave();
+                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    continue;
+                }
+                drop(guard);
+
+                // 3处引用：1. page_cache中 2. page_manager中 3. lru中
+                if Arc::strong_count(page) <= 3 {
+                    if let Some(removed) = self.pages.remove(&idx) {
+                        let paddr = removed.phys_address();
+                        page_manager_lock_irqsave().remove_page(&paddr);
+                        let _ = page_reclaimer.remove_page(&paddr);
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+
+        evicted
+    }
 }
 
 impl Drop for InnerPageCache {
@@ -348,6 +467,7 @@ impl PageCache {
                 }
                 v
             },
+            unevictable: AtomicBool::new(false),
         })
     }
 
@@ -379,5 +499,58 @@ impl PageCache {
 
     pub fn is_locked(&self) -> bool {
         self.inner.is_locked()
+    }
+
+    /// Mark this page cache as unevictable (or revert). When enabled, newly created
+    /// pages will carry PG_UNEVICTABLE to keep the reclaimer from reclaiming them.
+    pub fn set_unevictable(&self, unevictable: bool) {
+        self.unevictable.store(unevictable, Ordering::Relaxed);
+    }
+
+    /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁
+    pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let (copies, ret) = {
+            let mut guard = self.inner.lock_irqsave();
+            guard.prepare_read(offset, buf.len())?
+        };
+
+        let mut dst_offset = 0;
+        for item in copies {
+            // 先prefault，避免在持锁后触发缺页
+            let byte = volatile_read!(buf[dst_offset]);
+            volatile_write!(buf[dst_offset], byte);
+            let page_guard = item.page.read_irqsave();
+            unsafe {
+                buf[dst_offset..dst_offset + item.sub_len].copy_from_slice(
+                    &page_guard.as_slice()[item.page_offset..item.page_offset + item.sub_len],
+                );
+            }
+            dst_offset += item.sub_len;
+        }
+
+        Ok(ret)
+    }
+
+    /// 两阶段写入：持锁收集目标页，解锁后按页写入，避免用户缺页时持有page cache锁
+    pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let (copies, ret) = {
+            let mut guard = self.inner.lock_irqsave();
+            guard.write(offset, buf)?
+        };
+
+        let mut src_offset = 0;
+        for item in copies {
+            // 预触发用户缓冲区当前段，避免后续在持页锁时缺页
+            let _ = volatile_read!(buf[src_offset]);
+            let mut page_guard = item.page.write_irqsave();
+            unsafe {
+                page_guard.as_slice_mut()[item.page_offset..item.page_offset + item.sub_len]
+                    .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);
+            }
+            page_guard.add_flags(PageFlags::PG_DIRTY);
+            src_offset += item.sub_len;
+        }
+
+        Ok(ret)
     }
 }

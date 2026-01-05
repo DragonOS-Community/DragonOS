@@ -31,15 +31,12 @@ use crate::{
         epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
-            file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileType, IndexNode,
+            file::FileFlags, utils::DName, FilePrivateData, FileType, IndexNode, InodeMode,
             Metadata, PollableInode,
         },
     },
     init::initcall::INITCALL_DEVICE,
-    libs::{
-        rwlock::{RwLock, RwLockWriteGuard},
-        spinlock::SpinLockGuard,
-    },
+    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
     mm::VirtAddr,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
@@ -79,12 +76,15 @@ impl InnerTtyDevice {
             inode: None,
             driver: None,
             can_match: false,
-            metadata: Metadata::new(FileType::CharDevice, ModeType::from_bits_truncate(0o755)),
+            metadata: {
+                let mut md =
+                    Metadata::new(FileType::CharDevice, InodeMode::from_bits_truncate(0o755));
+                // 对于字符设备，选择与 Linux devpts/devfs 一致的首选 I/O 块大小。
+                // 1024 满足测试期望 (允许 1024 或 4096)。
+                md.blk_size = 1024;
+                md
+            },
         }
-    }
-
-    pub fn metadata_mut(&mut self) -> &mut Metadata {
-        &mut self.metadata
     }
 }
 
@@ -141,7 +141,7 @@ impl TtyDevice {
         Arc::new(dev)
     }
 
-    pub fn inner_write(&self) -> RwLockWriteGuard<'_, InnerTtyDevice> {
+    pub fn inner_write(&self) -> crate::libs::rwlock::RwLockWriteGuard<'_, InnerTtyDevice> {
         self.inner.write()
     }
 
@@ -151,7 +151,7 @@ impl TtyDevice {
 
     fn tty_core(private_data: &FilePrivateData) -> Result<Arc<TtyCore>, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = private_data {
-            (tty_priv.tty.clone(), tty_priv.mode)
+            (tty_priv.tty.clone(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -174,7 +174,7 @@ impl TtyDevice {
         let current_tty = TtyJobCtrlManager::get_current_tty()?;
 
         if let FilePrivateData::Tty(tty_priv) = data {
-            tty_priv.mode.insert(FileMode::O_NONBLOCK);
+            tty_priv.flags.insert(FileFlags::O_NONBLOCK);
         }
 
         current_tty.reopen().ok()?;
@@ -222,18 +222,31 @@ impl IndexNode for TtyDevice {
     fn open(
         &self,
         mut data: SpinLockGuard<FilePrivateData>,
-        mode: &crate::filesystem::vfs::file::FileMode,
+        mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
-            return ptmx_open(data, mode);
+            return ptmx_open(self, data, mode);
         }
         let dev_num = self.metadata()?.raw_dev;
+        // /dev/tty 仅在已有控制终端时才能打开；否则返回 ENXIO
+        let mut tty = if dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 0) {
+            if let Some(current) = self.open_current_tty(dev_num, &mut data) {
+                Some(current)
+            } else {
+                return Err(SystemError::ENXIO);
+            }
+        } else {
+            None
+        };
+
         // log::debug!(
         //     "TtyDevice::open: dev_num: {}, current pid: {}",
         //     dev_num,
         //     ProcessManager::current_pid()
         // );
-        let mut tty = self.open_current_tty(dev_num, &mut data);
+        if tty.is_none() {
+            tty = self.open_current_tty(dev_num, &mut data);
+        }
         if tty.is_none() {
             let (index, driver) =
                 TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
@@ -246,7 +259,7 @@ impl IndexNode for TtyDevice {
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
             tty: tty.clone(),
-            mode: *mode,
+            flags: *mode,
         });
 
         tty.core().contorl_info_irqsave().clear_dead_session();
@@ -260,9 +273,8 @@ impl IndexNode for TtyDevice {
         }
 
         let driver = tty.core().driver();
-        // 考虑noctty（当前tty）
-        if !(mode.contains(FileMode::O_NOCTTY) && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
-            || dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 1)
+        // 考虑 O_NOCTTY：显式指定则不设置控制终端；pty master 也不会成为控制终端。
+        if !(mode.contains(FileFlags::O_NOCTTY)
             || (driver.tty_driver_type() == TtyDriverType::Pty
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
         {
@@ -288,8 +300,8 @@ impl IndexNode for TtyDevice {
         buf: &mut [u8],
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
-        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.mode)
+        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -301,7 +313,7 @@ impl IndexNode for TtyDevice {
         let mut cookie = false;
         loop {
             let mut size = if len > buf.len() { buf.len() } else { len };
-            size = ld.read(tty.clone(), buf, size, &mut cookie, offset, mode)?;
+            size = ld.read(tty.clone(), buf, size, &mut cookie, offset, flags)?;
             // 没有更多数据
             if size == 0 {
                 break;
@@ -331,8 +343,8 @@ impl IndexNode for TtyDevice {
         data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let mut count = len;
-        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.mode)
+        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -353,7 +365,7 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = ld.write(tty.clone(), &buf[written..], size, mode)?;
+            let ret = ld.write(tty.clone(), &buf[written..], size, flags)?;
 
             written += ret;
             count -= ret;
@@ -407,9 +419,14 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
+    fn page_cache(&self) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
+        // TTY设备是字符设备，不需要页面缓存
+        None
+    }
+
     fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        let (tty, _mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.mode)
+        let (tty, _flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -424,7 +441,7 @@ impl IndexNode for TtyDevice {
 
     fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
-            (tty_priv.tty(), tty_priv.mode)
+            (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
@@ -581,13 +598,13 @@ impl KObject for TtyDevice {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.read()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.write()
     }
 
@@ -679,7 +696,7 @@ impl CharDevice for TtyDevice {
 #[derive(Debug, Clone)]
 pub struct TtyFilePrivateData {
     pub tty: Arc<TtyCore>,
-    pub mode: FileMode,
+    pub flags: FileFlags,
 }
 
 impl TtyFilePrivateData {

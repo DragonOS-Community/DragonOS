@@ -1,6 +1,13 @@
 # 导入环境变量
 include ./env.mk
 
+# Nix environment doesn't support rustup-style toolchain selection
+ifeq ($(USING_DRAGONOS_NIX_ENV),1)
+export TOOLCHAIN =
+else
+export TOOLCHAIN := +nightly-2025-08-10
+endif
+
 # export ARCH ?= x86_64
 # 如果是x86_64, 则使用x86_64-unknown-none.json作为target
 ifeq ($(ARCH), x86_64)
@@ -19,10 +26,10 @@ export CARGO_ZBUILD=-Z build-std=core,alloc,compiler_builtins -Z build-std-featu
 ECHO:
 	@echo "$@"
 
-all: 
+all:
 	$(MAKE) -C ../build-scripts all
 	$(MAKE) -C src all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
-	
+
 
 clean:
 	$(MAKE) -C src clean ARCH=$(ARCH)
@@ -31,7 +38,7 @@ clean:
 fmt:
 	RUSTFLAGS="$(RUSTFLAGS)" cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2025-08-10 clippy -Zbuild-std=core,alloc,compiler_builtins --all-features --target x86_64-unknown-none
+	RUSTFLAGS="$(RUSTFLAGS)" cargo $(TOOLCHAIN) clippy -Zbuild-std=core,alloc,compiler_builtins --all-features --target x86_64-unknown-none
 endif
 
 
@@ -41,4 +48,4 @@ check: ECHO
 
 test:
 # 测试内核库
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2025-08-10 test --workspace --exclude dragonos_kernel
+	RUSTFLAGS="$(RUSTFLAGS)" cargo $(TOOLCHAIN) test --workspace --exclude dragonos_kernel

@@ -1,13 +1,15 @@
-use crate::arch::syscall::nr::SYS_TRUNCATE;
+use crate::arch::{ipc::signal::Signal, syscall::nr::SYS_TRUNCATE};
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
-        fcntl::AtFlags, utils::user_path_at, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        fcntl::AtFlags, permission::PermissionMask, utils::user_path_at, FileType, IndexNode,
+        MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
-    process::ProcessManager,
+    ipc::kill::send_signal_to_pid,
+    process::{resource::RLimitID, ProcessManager},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
-        user_access::check_and_clone_cstr,
+        user_access::vfs_check_and_clone_cstr,
     },
 };
 
@@ -33,10 +35,9 @@ impl Syscall for SysTruncateHandle {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let path_ptr = args[0] as *const u8;
-        let length = args[1];
-
+        let length = Self::len(args)?;
         // 复制并校验用户态路径
-        let path = check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?;
+        let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?;
         let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
         // 解析起始 inode 与剩余路径
@@ -50,6 +51,21 @@ impl Syscall for SysTruncateHandle {
         let target: Arc<dyn IndexNode> = begin_inode
             .lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
+        let md = target.metadata()?;
+        // DAC write permission check
+        let cred = ProcessManager::current_pcb().cred();
+        cred.inode_permission(&md, PermissionMask::MAY_WRITE.bits())?;
+
+        // RLIMIT_FSIZE enforcement for regular files
+        if md.file_type == FileType::File {
+            let fsize_limit = ProcessManager::current_pcb().get_rlimit(RLimitID::Fsize);
+            if fsize_limit.rlim_cur != u64::MAX && length as u64 > fsize_limit.rlim_cur {
+                let _ =
+                    send_signal_to_pid(ProcessManager::current_pcb().raw_pid(), Signal::SIGXFSZ);
+                return Err(SystemError::EFBIG);
+            }
+        }
+
         vfs_truncate(target, length)?;
         Ok(0)
     }
@@ -59,6 +75,16 @@ impl Syscall for SysTruncateHandle {
             FormattedSyscallParam::new("path", format!("{:#x}", args[0])),
             FormattedSyscallParam::new("length", format!("{:#x}", args[1])),
         ]
+    }
+}
+
+impl SysTruncateHandle {
+    fn len(args: &[usize]) -> Result<usize, SystemError> {
+        let len = args[1];
+        if len > isize::MAX as usize {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(len)
     }
 }
 

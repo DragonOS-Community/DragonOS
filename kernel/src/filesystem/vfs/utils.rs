@@ -5,9 +5,10 @@ use core::hash::Hash;
 use alloc::{string::String, sync::Arc};
 use system_error::SystemError;
 
-use crate::process::{ProcessControlBlock, ProcessManager};
+use crate::process::cred::{Cred, Kgid};
+use crate::process::ProcessControlBlock;
 
-use super::{fcntl::AtFlags, FileType, IndexNode};
+use super::{fcntl::AtFlags, FileType, IndexNode, InodeMode};
 
 /// @brief 切分路径字符串，返回最左侧那一级的目录名和剩余的部分。
 ///
@@ -42,40 +43,78 @@ pub fn user_path_at(
     dirfd: i32,
     path: &str,
 ) -> Result<(Arc<dyn IndexNode>, String), SystemError> {
-    let current_mntns = ProcessManager::current_mntns();
-    let mut inode = current_mntns.root_inode().clone();
-    let ret_path;
-    // 如果path不是绝对路径，则需要拼接
-    if path.is_empty() || path.as_bytes()[0] != b'/' {
-        // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
-        if dirfd != AtFlags::AT_FDCWD.bits() {
-            let binding = pcb.fd_table();
-            let fd_table_guard = binding.read();
-            let file = fd_table_guard
-                .get_file_by_fd(dirfd)
-                .ok_or(SystemError::EBADF)?;
+    // Linux 语义：
+    // - 绝对路径从进程的 fs root 开始解析（chroot 会改变它）
+    // - 相对路径默认从进程的 cwd(pwd inode) 开始解析
+    // - dirfd != AT_FDCWD 时，从对应目录 fd 开始解析
 
-            // drop guard 以避免无法调度的问题
-            drop(fd_table_guard);
+    let ret_path = String::from(path);
 
-            // 如果dirfd不是目录，则返回错误码ENOTDIR
-            if file.file_type() != FileType::Dir {
-                return Err(SystemError::ENOTDIR);
-            }
-
-            inode = file.inode();
-            ret_path = String::from(path);
-        } else {
-            let mut cwd = pcb.basic().cwd();
-            cwd.push('/');
-            cwd.push_str(path);
-            ret_path = cwd;
-        }
-    } else {
-        ret_path = String::from(path);
+    // 空路径：交由上层 syscall 自己决定（open/chroot 等对空串语义不同）
+    if path.is_empty() {
+        return Ok((pcb.pwd_inode(), ret_path));
     }
 
-    return Ok((inode, ret_path));
+    // 绝对路径：从进程 root 开始
+    if path.as_bytes()[0] == b'/' {
+        return Ok((pcb.fs_struct().root(), ret_path));
+    }
+
+    // 相对路径：dirfd 优先，否则用 cwd
+    if dirfd != AtFlags::AT_FDCWD.bits() {
+        let binding = pcb.fd_table();
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard
+            .get_file_by_fd(dirfd)
+            .ok_or(SystemError::EBADF)?;
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+
+        // 如果dirfd不是目录，则返回错误码ENOTDIR
+        if file.file_type() != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        return Ok((file.inode(), ret_path));
+    }
+
+    Ok((pcb.pwd_inode(), ret_path))
+}
+
+pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> bool {
+    let ancestor_id = match ancestor.metadata() {
+        Ok(m) => m.inode_id,
+        Err(_) => return false,
+    };
+
+    let mut next_node: Option<Arc<dyn IndexNode>> = Some(node.clone());
+    while let Some(current) = next_node {
+        let cur_id = match current.metadata() {
+            Ok(m) => m.inode_id,
+            Err(_) => break,
+        };
+
+        if cur_id == ancestor_id {
+            return true;
+        }
+
+        let parent = match current.parent() {
+            Ok(p) => p,
+            Err(_) => break, // 没有父节点，到达根或错误，停止循环
+        };
+
+        let parent_id = match parent.metadata() {
+            Ok(m) => m.inode_id,
+            Err(_) => break,
+        };
+
+        if parent_id == cur_id {
+            break;
+        }
+        next_node = Some(parent);
+    }
+
+    false
 }
 
 /// Directory Name
@@ -145,4 +184,107 @@ impl AsRef<str> for DName {
     fn as_ref(&self) -> &str {
         self.0.as_str()
     }
+}
+
+/// 检查调用者是否在指定的组内
+///
+/// # 参数
+///
+/// - `cred`: 调用者的凭证
+/// - `gid`: 要检查的组 ID
+///
+/// # 返回值
+///
+/// 如果调用者在指定组内，返回 `true`；否则返回 `false`
+pub fn is_caller_in_group(cred: &Arc<Cred>, gid: usize) -> bool {
+    let kgid = Kgid::from(gid);
+    let mut in_group = cred.fsgid.data() == gid
+        || cred.gid.data() == gid
+        || cred.egid.data() == gid
+        || cred.getgroups().contains(&kgid);
+
+    if let Some(info) = cred.group_info.as_ref() {
+        in_group |= info.gids.contains(&kgid);
+    }
+
+    in_group
+}
+
+/// 判断是否应该清除 sgid 位（遵循 Linux setattr_should_drop_sgid 语义）
+///
+/// # 参数
+///
+/// - `mode`: 文件的权限模式
+/// - `gid`: 要检查的组 ID
+/// - `cred`: 调用者的凭证
+///
+/// # 返回值
+///
+/// 如果应该清除 sgid 位，返回 `true`；否则返回 `false`
+///
+/// # Linux 语义
+///
+/// - 若 S_IXGRP 置位：无条件清除（这是"真正的"SGID 可执行文件）
+/// - 否则（mandatory locking 语义）：仅当调用者不在文件所属组时清除
+pub fn should_remove_sgid(mode: InodeMode, gid: usize, cred: &Arc<Cred>) -> bool {
+    if !mode.contains(InodeMode::S_ISGID) {
+        return false;
+    }
+
+    if mode.contains(InodeMode::S_IXGRP) {
+        // S_IXGRP 置位：无条件清除 sgid
+        return true;
+    }
+
+    // mandatory locking 语义：仅当调用者不在文件所属组时清除
+    !is_caller_in_group(cred, gid)
+}
+
+/// 判断 chown 操作中是否应该清除 sgid 位
+///
+/// # 参数
+///
+/// - `mode`: 文件的权限模式
+/// - `old_gid`: chown 前的原组 ID
+/// - `current_gid`: 当前调用者的 gid
+/// - `cred`: 调用者的凭证
+/// - `group_info`: 调用者的组信息
+///
+/// # 返回值
+///
+/// 如果应该清除 sgid 位，返回 `true`；否则返回 `false`
+///
+/// # Linux 语义
+///
+/// - 若 S_IXGRP 置位：无条件清除 sgid
+/// - 否则（mandatory locking 语义）：仅当调用者不在原文件所属组且无 CAP_FSETID 时清除
+pub fn should_remove_sgid_on_chown(
+    mode: InodeMode,
+    old_gid: usize,
+    current_gid: usize,
+    cred: &Arc<Cred>,
+    group_info: &crate::process::cred::GroupInfo,
+) -> bool {
+    use crate::process::cred::CAPFlags;
+
+    if !mode.contains(InodeMode::S_ISGID) {
+        return false;
+    }
+
+    if mode.contains(InodeMode::S_IXGRP) {
+        // S_IXGRP 置位：无条件清除 sgid
+        return true;
+    }
+
+    // 注意：Linux 这里检查的是"原 inode gid"，在 notify_change 前尚未更新。
+    let kgid = Kgid::from(old_gid);
+    let in_group = cred.fsgid.data() == old_gid
+        || cred.egid.data() == old_gid
+        || current_gid == old_gid
+        || cred.getgroups().contains(&kgid)
+        || group_info.gids.contains(&kgid)
+        || cred.has_capability(CAPFlags::CAP_FSETID);
+
+    // 仅当调用者不在原文件所属组且无 CAP_FSETID 时清除
+    !in_group
 }

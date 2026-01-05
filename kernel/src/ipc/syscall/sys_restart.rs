@@ -29,7 +29,7 @@ pub(super) fn do_kernel_restart_syscall() -> Result<usize, SystemError> {
             sig,
             0,
             SigCode::Origin(OriginCode::Kernel),
-            SigType::Kill(pid),
+            SigType::Kill { pid, uid: 0 },
         );
 
         sig.send_signal_info(Some(&mut info), pid)

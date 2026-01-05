@@ -5,7 +5,7 @@ use core::{
 
 use crate::libs::{
     notifier::AtomicNotifierChain,
-    rwlock::{RwLock, RwLockReadGuard},
+    rwsem::{RwSem, RwSemReadGuard},
     spinlock::SpinLock,
 };
 use alloc::{
@@ -31,16 +31,16 @@ use super::{
 pub struct SubSysPrivate {
     /// 用于定义这个子系统的kset
     subsys: Arc<KSet>,
-    ksets: RwLock<SubSysKSets>,
+    ksets: RwSem<SubSysKSets>,
     /// 指向拥有当前结构体的`dyn bus`对象的弱引用
     bus: SpinLock<Option<Weak<dyn Bus>>>,
     /// 指向拥有当前结构体的`dyn class`对象的弱引用
     class: SpinLock<Option<Weak<dyn Class>>>,
     drivers_autoprobe: AtomicBool,
     /// 当前总线上的所有设备
-    devices: RwLock<Vec<Arc<dyn Device>>>,
+    devices: RwSem<Vec<Arc<dyn Device>>>,
     /// 当前总线上的所有驱动
-    drivers: RwLock<Vec<Arc<dyn Driver>>>,
+    drivers: RwSem<Vec<Arc<dyn Driver>>>,
     interfaces: &'static [&'static dyn SubSysInterface],
     bus_notifier: AtomicNotifierChain<BusNotifyEvent, Arc<dyn Device>>,
 }
@@ -72,12 +72,12 @@ impl SubSysPrivate {
         let subsys = KSet::new(name);
         return Self {
             subsys,
-            ksets: RwLock::new(SubSysKSets::new()),
+            ksets: RwSem::new(SubSysKSets::new()),
             drivers_autoprobe: AtomicBool::new(false),
             bus: SpinLock::new(bus),
             class: SpinLock::new(class),
-            devices: RwLock::new(Vec::new()),
-            drivers: RwLock::new(Vec::new()),
+            devices: RwSem::new(Vec::new()),
+            drivers: RwSem::new(Vec::new()),
             interfaces,
             bus_notifier: AtomicNotifierChain::new(),
         };
@@ -117,11 +117,11 @@ impl SubSysPrivate {
         *self.class.lock() = class;
     }
 
-    pub fn devices(&self) -> RwLockReadGuard<'_, Vec<Arc<dyn Device>>> {
+    pub fn devices(&self) -> RwSemReadGuard<'_, Vec<Arc<dyn Device>>> {
         return self.devices.read();
     }
 
-    pub fn drivers(&self) -> RwLockReadGuard<'_, Vec<Arc<dyn Driver>>> {
+    pub fn drivers(&self) -> RwSemReadGuard<'_, Vec<Arc<dyn Driver>>> {
         return self.drivers.read();
     }
 

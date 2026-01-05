@@ -22,10 +22,10 @@ use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
-        vfs::syscall::ModeType,
+        vfs::InodeMode,
     },
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -168,11 +168,11 @@ impl KObject for FbConsoleDevice {
         warn!("fbcon name can not be changed");
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -264,7 +264,7 @@ impl AttributeGroup for AnonymousAttributeGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         return Some(attr.mode());
     }
 }
@@ -277,8 +277,8 @@ impl Attribute for AttrRotate {
         "rotate"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO | ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO | InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -306,8 +306,8 @@ impl Attribute for AttrRotateAll {
         "rotate_all"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {
@@ -329,8 +329,8 @@ impl Attribute for AttrCursorBlink {
         "cursor_blink"
     }
 
-    fn mode(&self) -> ModeType {
-        ModeType::S_IRUGO | ModeType::S_IWUSR
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO | InodeMode::S_IWUSR
     }
 
     fn support(&self) -> SysFSOpsSupport {

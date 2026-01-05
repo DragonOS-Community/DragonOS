@@ -1,4 +1,4 @@
-use super::ModeType;
+use super::InodeMode;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_MKNODAT;
 use crate::driver::base::device::device_number::DeviceNumber;
@@ -14,7 +14,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 
 pub struct SysMknodatHandle;
 
@@ -30,14 +30,14 @@ impl Syscall for SysMknodatHandle {
         let path = Self::path(args);
         let mode_val = Self::mode(args);
         let dev = DeviceNumber::from(Self::dev(args));
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
 
-        let mode: ModeType = if mode_val == 0 {
-            ModeType::S_IFREG
+        let mode: InodeMode = if mode_val == 0 {
+            InodeMode::S_IFREG
         } else {
-            ModeType::from_bits(mode_val).ok_or(SystemError::EINVAL)?
+            InodeMode::from_bits(mode_val).ok_or(SystemError::EINVAL)?
         };
         let pcb = ProcessManager::current_pcb();
         let (mut current_inode, ret_path) = user_path_at(&pcb, dirfd, &path)?;

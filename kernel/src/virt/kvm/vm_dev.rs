@@ -3,7 +3,7 @@ use crate::filesystem;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,
-    file::{File, FileMode},
+    file::{File, FileFlags, FileMode},
     FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
 use crate::libs::spinlock::SpinLockGuard;
@@ -73,7 +73,7 @@ impl LockedVmInode {
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
-                mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
+                mode: filesystem::vfs::syscall::InodeMode::S_IALLUGO,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -223,7 +223,7 @@ fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError> {
     update_vm(0, current_vm);
 
     let vcpu_inode = LockedVcpuInode::new();
-    let file: File = File::new(vcpu_inode, FileMode::O_RDWR)?;
+    let file: File = File::new(vcpu_inode, FileFlags::O_RDWR)?;
     let r = ProcessManager::current_pcb()
         .fd_table()
         .write()

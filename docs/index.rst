@@ -25,6 +25,8 @@
 
    introduction/index
    introduction/build_system
+   introduction/develop_nix
+   introduction/devcontainer
    introduction/mirrors
 
 .. toctree::
@@ -48,19 +50,28 @@
    kernel/net/index
    kernel/trace/index
    kernel/syscall/index
+   kernel/device/index
 
 
 
 .. toctree::
    :maxdepth: 1
    :caption: 应用层
-   
+
    userland/appdev/index
+   userland/rootfs/index
+
+.. toctree::
+   :maxdepth: 1
+   :caption: 开发指南
+
+   dev-skills/nix-skills
+   dev-skills/write-docs
 
 .. toctree::
    :maxdepth: 1
    :caption: Q&A
-   
+
    questions/index
 
 

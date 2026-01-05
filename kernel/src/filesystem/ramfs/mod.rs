@@ -1,6 +1,7 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
+use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
 use crate::register_mountable_fs;
@@ -23,8 +24,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    file::FilePrivateData, syscall::ModeType, utils::DName, FileSystem, FileSystemMaker, FsInfo,
-    IndexNode, InodeId, Metadata, SpecialNodeData,
+    file::FilePrivateData, utils::DName, FileSystem, FsInfo, IndexNode, InodeFlags, InodeId,
+    InodeMode, Metadata, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -89,11 +90,13 @@ impl RamFSInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
-                mode: ModeType::from_bits_truncate(0o777),
-                nlinks: 1,
+                mode: InodeMode::S_IRWXUGO,
+                // 根目录的链接计数至少为2（. 和 从父挂载的引用）
+                nlinks: 2,
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(),
+                flags: InodeFlags::empty(),
             },
             fs: Weak::default(),
             special_node: None,
@@ -175,6 +178,10 @@ impl MountableFileSystem for RamFS {
 register_mountable_fs!(RamFS, RAMFSMAKER, "ramfs");
 
 impl IndexNode for LockedRamFSInode {
+    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
 
@@ -197,7 +204,7 @@ impl IndexNode for LockedRamFSInode {
     fn open(
         &self,
         _data: SpinLockGuard<FilePrivateData>,
-        _mode: &super::vfs::file::FileMode,
+        _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
@@ -308,7 +315,7 @@ impl IndexNode for LockedRamFSInode {
         &self,
         name: &str,
         file_type: FileType,
-        mode: ModeType,
+        mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let name = DName::from(name);
@@ -341,7 +348,9 @@ impl IndexNode for LockedRamFSInode {
                 btime: PosixTimeSpec::default(),
                 file_type,
                 mode,
-                nlinks: 1,
+                flags: InodeFlags::empty(),
+                // 目录需要包含 "." 自引用，因此初始为2
+                nlinks: if file_type == FileType::Dir { 2 } else { 1 },
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::from(data as u32),
@@ -356,6 +365,10 @@ impl IndexNode for LockedRamFSInode {
 
         // 将子inode插入父inode的B树中
         inode.children.insert(name, result.clone());
+        // 如果新建的是目录，父目录的 nlink 需要增加
+        if file_type == FileType::Dir {
+            inode.metadata.nlinks += 1;
+        }
 
         return Ok(result);
     }
@@ -432,6 +445,8 @@ impl IndexNode for LockedRamFSInode {
         to_delete.0.lock().metadata.nlinks -= 1;
         // 在当前目录中删除这个子目录项
         inode.children.remove(&name);
+        // 父目录链接计数相应减少
+        inode.metadata.nlinks -= 1;
         return Ok(());
     }
 
@@ -440,6 +455,7 @@ impl IndexNode for LockedRamFSInode {
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
+        flags: RenameFlags,
     ) -> Result<(), SystemError> {
         let inode_to_move = self
             .find(old_name)?
@@ -455,6 +471,10 @@ impl IndexNode for LockedRamFSInode {
         let mut self_inode = self.0.lock();
         // 判断是否在同一目录下, 是则进行重命名
         if target_id == self_inode.metadata.inode_id {
+            if flags.contains(RenameFlags::NOREPLACE) && self_inode.children.contains_key(&new_name)
+            {
+                return Err(SystemError::EEXIST);
+            }
             self_inode.children.remove(&DName::from(old_name));
             self_inode.children.insert(new_name, inode_to_move);
             return Ok(());
@@ -580,7 +600,7 @@ impl IndexNode for LockedRamFSInode {
     fn mknod(
         &self,
         filename: &str,
-        mode: ModeType,
+        mode: InodeMode,
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
@@ -589,7 +609,7 @@ impl IndexNode for LockedRamFSInode {
         }
 
         // 判断需要创建的类型
-        if unlikely(mode.contains(ModeType::S_IFREG)) {
+        if unlikely(mode.contains(InodeMode::S_IFREG)) {
             // 普通文件
             return self.create(filename, FileType::File, mode);
         }
@@ -617,6 +637,7 @@ impl IndexNode for LockedRamFSInode {
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::default(),
+                flags: InodeFlags::empty(),
             },
             fs: inode.fs.clone(),
             special_node: None,
@@ -625,16 +646,18 @@ impl IndexNode for LockedRamFSInode {
 
         nod.0.lock().self_ref = Arc::downgrade(&nod);
 
-        if mode.contains(ModeType::S_IFIFO) {
+        if mode.contains(InodeMode::S_IFIFO) {
             nod.0.lock().metadata.file_type = FileType::Pipe;
             // 创建pipe文件
             let pipe_inode = LockedPipeInode::new();
+            // 标记为命名管道（FIFO），这样 open 时才会应用 FIFO 阻塞语义
+            pipe_inode.set_fifo();
             // 设置special_node
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-        } else if mode.contains(ModeType::S_IFBLK) {
+        } else if mode.contains(InodeMode::S_IFBLK) {
             nod.0.lock().metadata.file_type = FileType::BlockDevice;
             unimplemented!()
-        } else if mode.contains(ModeType::S_IFCHR) {
+        } else if mode.contains(InodeMode::S_IFCHR) {
             nod.0.lock().metadata.file_type = FileType::CharDevice;
             unimplemented!()
         }

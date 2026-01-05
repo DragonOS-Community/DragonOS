@@ -1,16 +1,10 @@
 use crate::{
-    arch::{mm::LockedFrameAllocator, rand::rand},
-    libs::rand::GRandFlags,
+    arch::mm::LockedFrameAllocator,
     mm::allocator::{page_frame::FrameAllocator, slab::slab_usage},
 };
-use alloc::vec::Vec;
-use core::cmp;
-use log::warn;
 use system_error::SystemError;
 
 use super::{user_access::UserBufferWriter, Syscall};
-
-static mut UMASK: usize = 0o777;
 
 /// 系统信息
 ///
@@ -58,38 +52,5 @@ impl Syscall {
         writer.copy_one_to_user(&sysinfo, 0)?;
 
         return Ok(0);
-    }
-
-    pub fn umask(mask: u32) -> Result<usize, SystemError> {
-        warn!("SYS_UMASK has not yet been implemented\n");
-        let r = unsafe { UMASK };
-        unsafe { UMASK = mask as usize };
-        return Ok(r);
-    }
-
-    /// ## 将随机字节填入buf
-    /// ### 该系统调用与linux不一致，因为目前没有其他随机源
-    pub fn get_random(buf: *mut u8, len: usize, flags: GRandFlags) -> Result<usize, SystemError> {
-        if flags.bits() == (GRandFlags::GRND_INSECURE.bits() | GRandFlags::GRND_RANDOM.bits()) {
-            return Err(SystemError::EINVAL);
-        }
-
-        let mut writer = UserBufferWriter::new(buf, len, true)?;
-
-        let mut ret = Vec::new();
-        let mut count = 0;
-        while count < len {
-            // 对 len - count 的长度进行判断，remain_len 小于4则循环次数和 remain_len 相等
-            let remain_len = len - count;
-            let step = cmp::min(remain_len, 4);
-            let rand = rand();
-            for offset in 0..step {
-                ret.push((rand >> (offset * 2)) as u8);
-                count += 1;
-            }
-        }
-
-        writer.copy_to_user(&ret, 0)?;
-        Ok(len)
     }
 }

@@ -363,7 +363,7 @@ Segment Selector Index: {:#x}\n
 
 /// 处理页错误 14 #PF
 #[no_mangle]
-unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_page_fault(regs: &'static mut TrapFrame, error_code: u64) {
     // error!(
     //     "do_page_fault(14), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}, \nFault Address: {:#x}",
     //     error_code,
@@ -411,7 +411,17 @@ unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
 
     let address = VirtAddr::new(address);
     let error_code = X86PfErrorCode::from_bits_truncate(error_code as u32);
-    if address.check_user() {
+    // NOTE:
+    // - 是否“用户态缺页”应优先以 TrapFrame/错误码反映的访问发起者(CPL)为准，
+    //   而不是仅以地址落在用户区间来判断。
+    // - 用户态访问高地址（例如 x86_64 的 vsyscall 0xffffffffff600000 区域，或
+    //   用户态误跳转到内核地址空间）应当产生 SIGSEGV，而不是触发内核 panic。
+    // - 内核态访问用户地址（如 copy_from_user/copy_to_user）应当走用户态 fault
+    //   处理路径，以便使用异常表进行修复并返回 -EFAULT。
+    if regs.is_from_user()
+        || error_code.contains(X86PfErrorCode::X86_PF_USER)
+        || address.check_user()
+    {
         MMArch::do_user_addr_fault(regs, error_code, address);
     } else {
         MMArch::do_kern_addr_fault(regs, error_code, address);

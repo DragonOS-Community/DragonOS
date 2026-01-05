@@ -5,4 +5,5 @@ pub mod shm;
 pub mod sighand;
 pub mod signal;
 pub mod signal_types;
+pub mod signalfd;
 pub mod syscall;

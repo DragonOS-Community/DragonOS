@@ -2,11 +2,11 @@ use system_error::SystemError;
 
 use crate::{
     define_event_trace,
-    filesystem::vfs::{fcntl::AtFlags, file::FileMode, open::do_sys_open, MAX_PATHLEN},
+    filesystem::vfs::{fcntl::AtFlags, file::FileFlags, open::do_sys_open, MAX_PATHLEN},
     syscall::user_access::check_and_clone_cstr,
 };
 
-use super::ModeType;
+use super::InodeMode;
 
 /// Performs the actual file opening operation.
 ///
@@ -18,26 +18,15 @@ use super::ModeType;
 ///
 /// # Returns
 /// File descriptor on success, or error code on failure.
-pub(super) fn do_open(
-    path: *const u8,
-    o_flags: u32,
-    mode: u32,
-    follow_symlink: bool,
-) -> Result<usize, SystemError> {
+pub(super) fn do_open(path: *const u8, o_flags: u32, mode: u32) -> Result<usize, SystemError> {
     trace_sys_enter_openat(AtFlags::AT_FDCWD.bits(), path, o_flags, mode);
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 
-    let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-    let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
-    return do_sys_open(
-        AtFlags::AT_FDCWD.bits(),
-        &path,
-        open_flags,
-        mode,
-        follow_symlink,
-    );
+    let open_flags: FileFlags = FileFlags::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+    let mode = InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?;
+    return do_sys_open(AtFlags::AT_FDCWD.bits(), &path, open_flags, mode);
 }
 
 define_event_trace!(

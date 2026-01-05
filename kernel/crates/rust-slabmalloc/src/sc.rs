@@ -83,8 +83,6 @@ macro_rules! new_sc_allocator {
 }
 
 impl<'a, P: AllocablePage> SCAllocator<'a, P> {
-    const REBALANCE_COUNT: usize = 64;
-
     /// Create a new SCAllocator.
     #[cfg(feature = "unstable")]
     pub const fn new(size: usize) -> SCAllocator<'a, P> {
@@ -103,6 +101,7 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
 
     /// Add a new ObjectPage.
     fn insert_partial_slab(&mut self, new_head: &'a mut P) {
+        new_head.set_page_state(PageState::Partial);
         self.slabs.insert_front(new_head);
     }
 
@@ -113,74 +112,40 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
             0,
             "Inserted page is not aligned to page-size."
         );
+        new_head.set_page_state(PageState::Empty);
         self.empty_slabs.insert_front(new_head);
-    }
-
-    /// Since `dealloc` can not reassign pages without requiring a lock
-    /// we check slabs and full slabs periodically as part of `alloc`
-    /// and move them to the empty or partially allocated slab lists.
-    pub(crate) fn check_page_assignments(&mut self) {
-        for slab_page in self.full_slabs.iter_mut() {
-            if !slab_page.is_full() {
-                // We need to move it from self.full_slabs -> self.slabs
-                trace!("move {:p} full -> partial", slab_page);
-                self.move_full_to_partial(slab_page);
-            }
-        }
-
-        for slab_page in self.slabs.iter_mut() {
-            if slab_page.is_empty(self.obj_per_page) {
-                // We need to move it from self.slabs -> self.empty_slabs
-                trace!("move {:p} partial -> empty", slab_page);
-                self.move_to_empty(slab_page);
-            }
-        }
     }
 
     /// Move a page from `slabs` to `empty_slabs`.
     fn move_to_empty(&mut self, page: &'a mut P) {
         let page_ptr = page as *const P;
 
-        debug_assert!(self.slabs.contains(page_ptr));
-        debug_assert!(
-            !self.empty_slabs.contains(page_ptr),
-            "Page {:p} already in emtpy_slabs",
+        debug_assert_eq!(
+            page.page_state(),
+            PageState::Partial,
+            "Page {:p} not Partial",
             page_ptr
         );
 
         self.slabs.remove_from_list(page);
+        page.set_page_state(PageState::Empty);
         self.empty_slabs.insert_front(page);
-
-        debug_assert!(!self.slabs.contains(page_ptr));
-        debug_assert!(self.empty_slabs.contains(page_ptr));
     }
 
     /// Move a page from `full_slabs` to `slab`.
     fn move_partial_to_full(&mut self, page: &'a mut P) {
         let page_ptr = page as *const P;
 
-        debug_assert!(self.slabs.contains(page_ptr));
-        debug_assert!(!self.full_slabs.contains(page_ptr));
+        debug_assert_eq!(
+            page.page_state(),
+            PageState::Partial,
+            "Page {:p} not Partial",
+            page_ptr
+        );
 
         self.slabs.remove_from_list(page);
+        page.set_page_state(PageState::Full);
         self.full_slabs.insert_front(page);
-
-        debug_assert!(!self.slabs.contains(page_ptr));
-        debug_assert!(self.full_slabs.contains(page_ptr));
-    }
-
-    /// Move a page from `full_slabs` to `slab`.
-    fn move_full_to_partial(&mut self, page: &'a mut P) {
-        let page_ptr = page as *const P;
-
-        debug_assert!(!self.slabs.contains(page_ptr));
-        debug_assert!(self.full_slabs.contains(page_ptr));
-
-        self.full_slabs.remove_from_list(page);
-        self.slabs.insert_front(page);
-
-        debug_assert!(self.slabs.contains(page_ptr));
-        debug_assert!(!self.full_slabs.contains(page_ptr));
     }
 
     /// Tries to allocate a block of memory with respect to the `layout`.
@@ -209,12 +174,6 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
             }
         }
 
-        // Periodically rebalance page-lists (since dealloc can't do it for us)
-        if self.allocation_count > SCAllocator::<P>::REBALANCE_COUNT {
-            self.check_page_assignments();
-            self.allocation_count = 0;
-        }
-
         ptr::null_mut()
     }
 
@@ -222,7 +181,6 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
     where
         F: FnMut(*mut P),
     {
-        self.check_page_assignments();
         let mut reclaimed = 0;
         while reclaimed < to_reclaim {
             if let Some(page) = self.empty_slabs.pop() {
@@ -249,6 +207,7 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
             .initialize(self.size, P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD);
         *page.prev() = Rawlink::none();
         *page.next() = Rawlink::none();
+        page.set_page_state(PageState::Empty);
         self.insert_empty(page);
         self.free_obj_count += self.obj_per_page;
     }
@@ -280,7 +239,7 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
                 let empty_page = self.empty_slabs.pop().expect("We checked head.is_some()");
                 debug_assert!(!self.empty_slabs.contains(empty_page));
 
-                let ptr = empty_page.allocate(layout);
+                let ptr = empty_page.allocate(new_layout);
                 debug_assert!(!ptr.is_null(), "Allocation must have succeeded here.");
 
                 trace!(
@@ -288,8 +247,14 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
                     empty_page,
                     self.empty_slabs.elements
                 );
-                // Move empty page to partial pages
-                self.insert_partial_slab(empty_page);
+                // Move empty page to partial/full pages
+                if empty_page.is_full() {
+                    empty_page.set_page_state(PageState::Full);
+                    self.full_slabs.insert_front(empty_page);
+                } else {
+                    self.insert_partial_slab(empty_page);
+                }
+                self.allocation_count += 1;
                 ptr
             } else {
                 ptr
@@ -339,11 +304,37 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
         let slab_page = unsafe { mem::transmute::<VAddr, &'a mut P>(page) };
         let new_layout = unsafe { Layout::from_size_align_unchecked(self.size, layout.align()) };
 
+        let old_state = slab_page.page_state();
         let ret = slab_page.deallocate(ptr, new_layout);
         debug_assert!(ret.is_ok(), "Slab page deallocate won't fail at the moment");
 
         self.free_obj_count += 1;
         let is_empty_after_dealloc = slab_page.is_empty(self.obj_per_page);
+
+        // Maintain page list membership in dealloc (DragonOS holds allocator lock).
+        match old_state {
+            PageState::Full => {
+                self.full_slabs.remove_from_list(slab_page);
+                if is_empty_after_dealloc {
+                    self.insert_empty(slab_page);
+                } else {
+                    self.insert_partial_slab(slab_page);
+                }
+            }
+            PageState::Partial => {
+                if is_empty_after_dealloc {
+                    self.move_to_empty(slab_page);
+                }
+            }
+            PageState::Empty => {
+                // Should never free from an empty page.
+                debug_assert!(
+                    false,
+                    "deallocate from Empty page {:p}",
+                    slab_page as *const P
+                );
+            }
+        }
 
         let mut need_reclaim = false;
         // 如果slab_page是空白的，且空闲块数大于free_limit，将slab_page归还buddy

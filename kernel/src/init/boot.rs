@@ -8,10 +8,8 @@ use alloc::string::String;
 use system_error::SystemError;
 
 use crate::driver::base::kobject::KObjectState;
-use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::InodeMode;
 use crate::init::initcall::INITCALL_POSTCORE;
-use crate::libs::rwlock::RwLockReadGuard;
-use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::{
     arch::init::ArchBootParams,
@@ -28,6 +26,7 @@ use crate::driver::base::{
     kobject::{KObjType, KObject, KObjectManager, KObjectSysFSOps, LockedKObjectState},
     kset::KSet,
 };
+use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 
 /// `/sys/kernel/boot_params`的 kobject, 需要这里加一个引用来保持持久化, 不然会被释放
 static mut SYS_KERNEL_BOOT_PARAMS_INSTANCE: Option<Arc<BootParamsSys>> = None;
@@ -266,7 +265,7 @@ impl AttributeGroup for BootParamsAttrGroup {
         &self,
         _kobj: Arc<dyn KObject>,
         attr: &'static dyn Attribute,
-    ) -> Option<ModeType> {
+    ) -> Option<InodeMode> {
         Some(attr.mode())
     }
 }
@@ -346,11 +345,11 @@ impl KObject for BootParamsSys {
 
     fn set_name(&self, _name: String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -367,7 +366,7 @@ impl Attribute for AttrData {
         "data"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -396,7 +395,7 @@ impl Attribute for AttrVersion {
         "version"
     }
 
-    fn mode(&self) -> ModeType {
+    fn mode(&self) -> InodeMode {
         SYSFS_ATTR_MODE_RO
     }
 

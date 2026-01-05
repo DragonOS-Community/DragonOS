@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use core::ffi::c_int;
 
 use crate::arch::interrupt::TrapFrame;
+use crate::process::pid::PidType;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{
@@ -165,16 +166,20 @@ fn send_signal_to_thread(
     // 构造SigInfo，使用SI_TKILL语义
     let current_pcb = ProcessManager::current_pcb();
     let current_tgid = current_pcb.task_tgid_vnr().unwrap_or(RawPid::from(0));
+    let sender_uid = current_pcb.cred().uid.data() as u32;
 
     let mut info = SigInfo::new(
         sig,
         0,
         SigCode::Origin(OriginCode::Tkill), // 使用SI_TKILL语义
-        SigType::Kill(current_tgid),
+        SigType::Kill {
+            pid: current_tgid,
+            uid: sender_uid,
+        },
     );
 
-    // 发送信号
-    let result = sig.send_signal_info_to_pcb(Some(&mut info), target_pcb);
+    // 发送信号（tgkill 发送线程级信号，使用 PidType::PID）
+    let result = sig.send_signal_info_to_pcb(Some(&mut info), target_pcb, PidType::PID);
 
     // 处理竞态条件：如果目标线程在投递过程中退出，视为成功
     match result {

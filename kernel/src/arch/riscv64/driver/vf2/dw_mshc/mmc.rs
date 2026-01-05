@@ -32,16 +32,16 @@ use crate::filesystem::{
     devfs::{DevFS, DeviceINode},
     kernfs::KernFSInode,
     mbr::MbrDiskPartionTable,
-    vfs::{syscall::ModeType, IndexNode, Metadata},
+    vfs::{IndexNode, InodeMode, Metadata},
 };
 use crate::libs::{
-    rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    rwlock::RwLock,
+    rwsem::{RwSemReadGuard, RwSemWriteGuard},
     spinlock::{SpinLock, SpinLockGuard},
 };
 use crate::mm::allocator::page_frame::PhysPageFrame;
 use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 use crate::mm::{MemoryManagementArch, PhysAddr};
-use byte_slice_cast::*;
 use log::{debug, info, warn};
 use system_error::SystemError;
 
@@ -116,7 +116,7 @@ impl MMC {
             fs: RwLock::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
-                ModeType::from_bits_truncate(0o755),
+                InodeMode::from_bits_truncate(0o755),
             ),
             fifo_offset: UnsafeCell::new(0x600),
             _frames: UnsafeCell::new(Vec::new()),
@@ -216,7 +216,7 @@ impl MMC {
             info!("CID: {:x?}", cid);
             info!(
                 "Card Name: {}",
-                core::str::from_utf8(cid.name().to_be_bytes().as_byte_slice()).unwrap()
+                core::str::from_utf8(&cid.name().to_be_bytes()).unwrap()
             );
         }
 
@@ -915,11 +915,11 @@ impl KObject for MMC {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<KObjectState> {
         self.locked_kobj_state.write()
     }
 

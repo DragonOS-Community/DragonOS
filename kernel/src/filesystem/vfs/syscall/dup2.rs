@@ -1,23 +1,23 @@
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::file::{FileDescriptorVec, FileMode},
-    libs::rwlock::RwLockWriteGuard,
+    filesystem::vfs::file::{FileDescriptorVec, FileFlags},
+    libs::rwsem::RwSemWriteGuard,
 };
 
 pub fn do_dup2(
     oldfd: i32,
     newfd: i32,
-    fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
+    fd_table_guard: &mut RwSemWriteGuard<'_, FileDescriptorVec>,
 ) -> Result<usize, SystemError> {
-    do_dup3(oldfd, newfd, FileMode::empty(), fd_table_guard)
+    do_dup3(oldfd, newfd, FileFlags::empty(), fd_table_guard)
 }
 
 pub fn do_dup3(
     oldfd: i32,
     newfd: i32,
-    flags: FileMode,
-    fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
+    flags: FileFlags,
+    fd_table_guard: &mut RwSemWriteGuard<'_, FileDescriptorVec>,
 ) -> Result<usize, SystemError> {
     // 检查 RLIMIT_NOFILE：newfd 必须小于软限制
     let nofile = crate::process::ProcessManager::current_pcb()
@@ -50,7 +50,7 @@ pub fn do_dup3(
         .ok_or(SystemError::EBADF)?;
     let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
 
-    if flags.contains(FileMode::O_CLOEXEC) {
+    if flags.contains(FileFlags::O_CLOEXEC) {
         new_file.set_close_on_exec(true);
     } else {
         new_file.set_close_on_exec(false);

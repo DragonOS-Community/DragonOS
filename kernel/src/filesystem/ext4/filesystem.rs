@@ -5,8 +5,8 @@ use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::utils::{user_path_at, DName};
 use crate::filesystem::vfs::vcore::{generate_inode_id, try_find_gendisk};
 use crate::filesystem::vfs::{
-    self, FileSystem, FileSystemMaker, FileSystemMakerData, IndexNode, Magic, MountableFileSystem,
-    FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    self, FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem, FSMAKER,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::libs::spinlock::SpinLock;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
@@ -69,18 +69,29 @@ impl FileSystem for Ext4FileSystem {
 }
 
 impl Ext4FileSystem {
+    /// 探测 gendisk 是否包含 ext4 文件系统
+    pub fn probe(gendisk: &Arc<GenDisk>) -> Result<bool, SystemError> {
+        Ok(another_ext4::Ext4::load(gendisk.clone())
+            .map(|_| true)
+            .unwrap_or(false))
+    }
+
     pub fn from_gendisk(mount_data: Arc<GenDisk>) -> Result<Arc<dyn FileSystem>, SystemError> {
         let raw_dev = mount_data.device_num();
         let fs = another_ext4::Ext4::load(mount_data)?;
         let root_inode: Arc<LockedExt4Inode> =
-            Arc::new(LockedExt4Inode(SpinLock::new(Ext4Inode {
-                inner_inode_num: another_ext4::EXT4_ROOT_INO,
-                fs_ptr: Weak::default(),
-                page_cache: None,
-                children: BTreeMap::new(),
-                dname: DName::from("/"),
-                vfs_inode_id: generate_inode_id(),
-            })));
+            Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
+                LockedExt4Inode(SpinLock::new(Ext4Inode {
+                    inner_inode_num: another_ext4::EXT4_ROOT_INO,
+                    fs_ptr: Weak::default(),
+                    page_cache: None,
+                    children: BTreeMap::new(),
+                    dname: DName::from("/"),
+                    vfs_inode_id: generate_inode_id(),
+                    parent: self_ref.clone(),
+                    self_ref: self_ref.clone(),
+                }))
+            });
 
         let fs = Arc::new(Ext4FileSystem {
             fs,

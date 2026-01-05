@@ -119,8 +119,6 @@ pub fn napi_init() -> Result<(), SystemError> {
 }
 
 fn net_rx_action() {
-    use crate::sched::SchedMode;
-
     loop {
         // 这里直接将全局的NAPI管理器的napi_list取出，清空全局的列表，避免占用锁时间过长
         let mut inner = GLOBAL_NAPI_MANAGER.inner();
@@ -213,7 +211,9 @@ impl NapiManager {
     }
 
     pub fn inner(&self) -> SpinLockGuard<'_, NapiManagerInner> {
-        self.inner.lock()
+        // 必须使用 lock_irqsave() 关闭中断，因为 napi_schedule() 可能在中断上下文中被调用
+        // 如果使用普通的 lock()，当内核线程持有锁时发生中断，中断处理程序试图获取同一把锁会死锁
+        self.inner.lock_irqsave()
     }
 
     pub fn wait_queue(&self) -> &WaitQueue {

@@ -62,12 +62,18 @@ impl Syscall for SysPidfdSendSignalHandle {
             return Ok(0);
         }
 
-        // 应该从参数获取
+        let current_pcb = ProcessManager::current_pcb();
+        let sender_pid = current_pcb.raw_pid();
+        let sender_uid = current_pcb.cred().uid.data() as u32;
+
         let mut info = SigInfo::new(
             sig,
             0,
             SigCode::Origin(OriginCode::User),
-            SigType::Kill(RawPid::new(pid as usize)),
+            SigType::Kill {
+                pid: sender_pid,
+                uid: sender_uid,
+            },
         );
 
         let ret = sig

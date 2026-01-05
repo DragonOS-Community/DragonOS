@@ -1,7 +1,16 @@
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
+use crate::{
+    mm::access_ok,
+    mm::VirtAddr,
+    syscall::user_access::{
+        copy_from_user_protected, user_accessible_len, UserBufferReader, UserBufferWriter,
+    },
+};
+
+/// Linux UIO_MAXIOV: maximum number of iovec structures per syscall
+const IOV_MAX: usize = 1024;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IoVec {
@@ -22,7 +31,15 @@ impl IoVecs {
     /// 获取IoVecs中所有缓冲区的总长度
     #[inline(never)]
     pub fn total_len(&self) -> usize {
-        self.0.iter().map(|x| x.iov_len).sum()
+        self.0
+            .iter()
+            .try_fold(0usize, |acc, x| acc.checked_add(x.iov_len))
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Borrow the validated iovec list.
+    pub fn iovs(&self) -> &[IoVec] {
+        &self.0
     }
 
     /// Constructs `IoVecs` from an array of `IoVec` in userspace.
@@ -31,7 +48,7 @@ impl IoVecs {
     ///
     /// * `iov` - Pointer to the array of `IoVec` in userspace
     /// * `iovcnt` - Number of `IoVec` elements in the array
-    /// * `readv` - Whether this is for the `readv` syscall (currently unused)
+    /// * `readv` - Whether this is for the `readv` syscall (true = check write permission)
     ///
     /// # Returns
     ///
@@ -49,23 +66,53 @@ impl IoVecs {
         iovcnt: usize,
         _readv: bool,
     ) -> Result<Self, SystemError> {
-        let iovs_reader = UserBufferReader::new(iov, iovcnt * core::mem::size_of::<IoVec>(), true)?;
+        // Linux: iovcnt must be > 0 and not unreasonably large.
+        if iovcnt == 0 || iovcnt > IOV_MAX {
+            return Err(SystemError::EINVAL);
+        }
 
-        // 将用户空间的IoVec转换为引用（注意：这里的引用是静态的，因为用户空间的IoVec不会被释放）
-        let iovs = iovs_reader.buffer::<IoVec>(0)?;
+        let elem_size = core::mem::size_of::<IoVec>();
+        let total_bytes = iovcnt.checked_mul(elem_size).ok_or(SystemError::EINVAL)?;
 
-        let mut slices: Vec<IoVec> = Vec::with_capacity(iovs.len());
+        // Only does range check (user range) here.
+        let iovs_reader = UserBufferReader::new(iov, total_bytes, true)?;
 
-        for iov in iovs.iter() {
-            if iov.iov_len == 0 {
+        // Use exception-table protected copy to avoid kernel faults when userspace pointer is bad.
+        let iovs_buf = iovs_reader.buffer_protected(0)?;
+
+        let mut slices: Vec<IoVec> = Vec::with_capacity(iovcnt);
+        for idx in 0..iovcnt {
+            let offset = idx * elem_size;
+            let one: IoVec = iovs_buf.read_one(offset)?;
+
+            // Linux behavior: always validate iov_base is a user pointer, even when iov_len==0.
+            // This matches Linux access_ok(addr, 0) behavior and is required by gVisor tests.
+            let base = VirtAddr::new(one.iov_base as usize);
+
+            // Only do lightweight address range check (like Linux's access_ok).
+            // This checks that the address range is within user space limits,
+            // but does NOT traverse page tables or check actual mappings.
+            // Actual page mapping/permission checks happen during copy operations.
+            access_ok(base, one.iov_len)?;
+
+            // Skip zero-length iovecs after validation
+            if one.iov_len == 0 {
                 continue;
             }
 
-            let _ = UserBufferWriter::new(iov.iov_base, iov.iov_len, true)?;
-            slices.push(*iov);
+            // If the first byte isn't writable/readable at all, fail early with EFAULT.
+            // Partial accessibility is handled by the syscall implementation.
+            // Note: user_accessible_len returns 0 for null pointers (addr.is_null() check),
+            // so null pointer detection is covered here.
+            let accessible = user_accessible_len(base, one.iov_len, _readv /* check_write */);
+            if accessible == 0 {
+                return Err(SystemError::EFAULT);
+            }
+
+            slices.push(one);
         }
 
-        return Ok(Self(slices));
+        Ok(Self(slices))
     }
 
     /// Aggregates data from all IoVecs into a single buffer.
@@ -73,24 +120,56 @@ impl IoVecs {
     /// This function reads data from each IoVec in sequence and combines them into
     /// a single contiguous buffer.
     ///
-    /// # Returns
+    /// **Returns:**
     ///
-    /// Returns a [`Vec<u8>`] containing all the data from the IoVecs.
+    /// Returns a [`Vec<u8>`] containing the data copied from the IoVecs.
     ///
-    /// # Examples
+    /// **To Be patient:**
     ///
-    /// ```rust
-    /// let iovecs = IoVecs::from_user(/* ... */)?;
-    /// let buffer = iovecs.gather();
-    /// ```
-    pub fn gather(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for slice in self.0.iter() {
-            let buf_reader = UserBufferReader::new(slice.iov_base, slice.iov_len, true).unwrap();
-            let slice = buf_reader.buffer::<u8>(0).unwrap();
-            buf.extend_from_slice(slice);
+    /// If a buffer is only partially accessible, data is copied up to **the first
+    /// inaccessible byte** and the remaining iovecs are ignored. If no data can be
+    /// read at all, `Err(SystemError::EFAULT)` is returned.
+    pub fn gather(&self) -> Result<Vec<u8>, SystemError> {
+        let mut buf = Vec::with_capacity(self.total_len());
+        let mut read_any = false;
+
+        for iov in self.0.iter() {
+            let base = VirtAddr::new(iov.iov_base as usize);
+            // 检查从 iov_base 开始有多少 bytes 在 vma 内部且实际可以访问
+            let accessible = user_accessible_len(base, iov.iov_len, false /* read */);
+
+            // 如果一个字节都不能访问
+            if accessible == 0 {
+                if !read_any {
+                    return Err(SystemError::EFAULT);
+                }
+                return Ok(buf);
+            }
+
+            // 使用异常保护的拷贝，与 scatter 保持一致
+            let mut chunk = alloc::vec![0u8; accessible];
+            match unsafe { copy_from_user_protected(&mut chunk, base) } {
+                Ok(_) => {
+                    buf.extend_from_slice(&chunk);
+                    read_any = true;
+                }
+                Err(SystemError::EFAULT) => {
+                    // Linux: return partial data if any bytes were copied.
+                    if !read_any {
+                        return Err(SystemError::EFAULT);
+                    }
+                    return Ok(buf);
+                }
+                Err(e) => return Err(e),
+            }
+
+            // 如果没有读取完整个 iov，说明遇到了不可访问的区域
+            if accessible < iov.iov_len {
+                return Ok(buf);
+            }
         }
-        return buf;
+
+        Ok(buf)
     }
 
     /// Scatters the given data into the IoVecs.
@@ -110,21 +189,45 @@ impl IoVecs {
     /// let iovecs = IoVecs::from_user(/* ... */)?;
     /// iovecs.scatter(&[1, 2, 3, 4, 5]);
     /// ```
-    pub fn scatter(&self, data: &[u8]) {
-        let mut data: &[u8] = data;
-        for slice in self.0.iter() {
-            let len = core::cmp::min(slice.iov_len, data.len());
-            if len == 0 {
+    pub fn scatter(&self, data: &[u8]) -> Result<usize, SystemError> {
+        let mut remaining = data;
+        let mut written_any = false;
+        let mut total_written = 0usize;
+
+        for iov in self.0.iter() {
+            if remaining.is_empty() {
+                break;
+            }
+
+            let want = core::cmp::min(iov.iov_len, remaining.len());
+            if want == 0 {
                 continue;
             }
 
-            let mut buf_writer =
-                UserBufferWriter::new(slice.iov_base, slice.iov_len, true).unwrap();
-            let slice = buf_writer.buffer::<u8>(0).unwrap();
+            let base = VirtAddr::new(iov.iov_base as usize);
+            let accessible = user_accessible_len(base, want, true /*write*/);
+            if accessible == 0 {
+                if !written_any {
+                    return Err(SystemError::EFAULT);
+                }
+                break;
+            }
 
-            slice[..len].copy_from_slice(&data[..len]);
-            data = &data[len..];
+            let mut writer = UserBufferWriter::new(iov.iov_base, accessible, true)?;
+            let mut user_buf = writer.buffer_protected(0)?;
+            user_buf.write_to_user(0, &remaining[..accessible])?;
+
+            written_any = true;
+            total_written = total_written.saturating_add(accessible);
+            remaining = &remaining[accessible..];
+
+            if accessible < want {
+                // Hit an unmapped/forbidden region; stop as Linux does.
+                break;
+            }
         }
+
+        Ok(total_written)
     }
 
     /// Creates a buffer with capacity equal to the total length of all IoVecs.

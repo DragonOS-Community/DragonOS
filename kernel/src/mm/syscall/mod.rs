@@ -7,6 +7,7 @@ use super::{allocator::page_frame::PageFrameCount, MsFlags, VmFlags};
 
 mod mempolice_utils;
 mod sys_brk;
+mod sys_fadvise64;
 mod sys_get_mempolicy;
 mod sys_madvise;
 mod sys_mincore;
@@ -15,6 +16,7 @@ mod sys_mprotect;
 mod sys_mremap;
 mod sys_msync;
 mod sys_munmap;
+mod sys_process_vm;
 pub mod sys_sbrk;
 
 bitflags! {
@@ -154,7 +156,8 @@ impl From<MapFlags> for VmFlags {
         }
 
         if map_flags.contains(MapFlags::MAP_SHARED) {
-            vm_flags |= VmFlags::VM_SHARED;
+            // Linux semantics: MAP_SHARED implies both VM_SHARED and VM_MAYSHARE.
+            vm_flags |= VmFlags::VM_SHARED | VmFlags::VM_MAYSHARE;
         }
 
         vm_flags
@@ -219,7 +222,8 @@ impl From<VmFlags> for MapFlags {
             map_flags |= MapFlags::MAP_SYNC;
         }
 
-        if value.contains(VmFlags::VM_MAYSHARE) {
+        // Preserve MAP_SHARED when the VMA is (or may be) shared.
+        if value.contains(VmFlags::VM_SHARED) || value.contains(VmFlags::VM_MAYSHARE) {
             map_flags |= MapFlags::MAP_SHARED;
         }
 

@@ -16,17 +16,14 @@ COPY *.sh ./
 
 # 设置sudo免密码
 RUN apt update && \
-    apt install -y ca-certificates curl gnupg wget sudo apt-utils && \
-    bash bootstrap.sh --default && \
-    sudo cp /tmp/docker-entrypoint.sh /root/entrypoint.sh && \
-    sudo chmod a+rwx /root/entrypoint.sh && \
+    apt install --no-install-recommends -y ca-certificates curl gnupg wget sudo apt-utils && \
+    bash bootstrap.sh --default --ci && \
     git config --global --add safe.directory '*' && \
-    sudo apt autoremove -q -y && \         
+    sudo apt autoremove -q -y && \
     sudo apt clean -q -y && \
     sudo rm -rf /tmp/*
 
 WORKDIR /root
 
-ENTRYPOINT [ "/root/entrypoint.sh" ]
 # 设置容器启动后执行的命令
 CMD ["/bin/bash"]

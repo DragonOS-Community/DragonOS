@@ -2,6 +2,14 @@
 // posix.rs 记录了系统调用时用到的结构
 //
 
+/// 通用地址结构体的最大大小（参考 Linux 的 sockaddr_storage）
+/// 用于限制所有地址家族的 addrlen 上限，防止内核读取越界内存
+///
+/// 参考 Linux kernel net/socket.c:move_addr_to_kernel()
+/// if (ulen < 0 || ulen > sizeof(struct sockaddr_storage))
+///     return -EINVAL;
+pub const MAX_SOCKADDR_LEN: u32 = 128;
+
 bitflags::bitflags! {
     // #[derive(PartialEq, Eq, Debug, Clone, Copy)]
     pub struct PosixArgsSocketType: u32 {
@@ -13,8 +21,8 @@ bitflags::bitflags! {
         const DCCP      = 6;    // 0b0000_0110
         const PACKET    = 10;   // 0b0000_1010
 
-        const NONBLOCK  = crate::filesystem::vfs::file::FileMode::O_NONBLOCK.bits();
-        const CLOEXEC   = crate::filesystem::vfs::file::FileMode::O_CLOEXEC.bits();
+        const NONBLOCK  = crate::filesystem::vfs::file::FileFlags::O_NONBLOCK.bits();
+        const CLOEXEC   = crate::filesystem::vfs::file::FileFlags::O_CLOEXEC.bits();
     }
 }
 
@@ -35,21 +43,40 @@ impl PosixArgsSocketType {
     }
 }
 
-use super::socket::{endpoint::Endpoint, AddressFamily};
+use super::socket::{
+    endpoint::{Endpoint, LinkLayerEndpoint},
+    AddressFamily,
+};
 use crate::net::socket::netlink::addr::{multicast::GroupIdSet, NetlinkSocketAddr};
 use crate::net::socket::unix::UnixEndpoint;
+use crate::syscall::user_access::UserBufferReader;
 use alloc::string::ToString;
-use core::ffi::CStr;
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
+/// struct sockaddr_in for IPv4 addresses
+/// This matches the C structure layout
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SockAddrIn {
-    pub sin_family: u16,
-    pub sin_port: u16,
-    pub sin_addr: u32,
-    pub sin_zero: [u8; 8],
+    pub sin_family: u16,   // AF_INET = 2
+    pub sin_port: u16,     // Port number (network byte order)
+    pub sin_addr: u32,     // IPv4 address (network byte order)
+    pub sin_zero: [u8; 8], // Padding to match struct sockaddr size (total 16 bytes)
+}
+
+/// struct sockaddr_in6 for IPv6 addresses
+///
+/// Matches Linux userspace layout (x86_64): sizeof(sockaddr_in6) = 28.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SockAddrIn6 {
+    pub sin6_family: u16,    // AF_INET6 = 10
+    pub sin6_port: u16,      // Port number (network byte order)
+    pub sin6_flowinfo: u32,  // IPv6 flow information
+    pub sin6_addr: [u8; 16], // IPv6 address (network byte order)
+    pub sin6_scope_id: u32,  // Scope ID
 }
 
 #[repr(C)]
@@ -92,6 +119,7 @@ pub struct SockAddrPlaceholder {
 pub union SockAddr {
     pub family: u16,
     pub addr_in: SockAddrIn,
+    pub addr_in6: SockAddrIn6,
     pub addr_un: SockAddrUn,
     pub addr_ll: SockAddrLl,
     pub addr_nl: SockAddrNl,
@@ -109,7 +137,18 @@ impl From<smoltcp::wire::IpEndpoint> for SockAddr {
                     sin_zero: Default::default(),
                 },
             },
-            smoltcp::wire::IpAddress::Ipv6(_ipv6_addr) => todo!(),
+            smoltcp::wire::IpAddress::Ipv6(ipv6_addr) => {
+                let addr = ipv6_addr.octets();
+                Self {
+                    addr_in6: SockAddrIn6 {
+                        sin6_family: AddressFamily::INet6 as u16,
+                        sin6_port: value.port.to_be(),
+                        sin6_flowinfo: 0,
+                        sin6_addr: addr,
+                        sin6_scope_id: 0,
+                    },
+                }
+            }
         }
     }
 }
@@ -129,9 +168,8 @@ impl From<UnixEndpoint> for SockAddr {
             UnixEndpoint::Abstract(name) => {
                 // Abstract namespace以null字节开头
                 sun_path[0] = 0;
-                let name_bytes = name.as_bytes();
-                let copy_len = core::cmp::min(name_bytes.len(), 107);
-                sun_path[1..1 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+                let copy_len = core::cmp::min(name.len(), 107);
+                sun_path[1..1 + copy_len].copy_from_slice(&name[..copy_len]);
             }
             UnixEndpoint::Unnamed => {
                 // Unnamed socket，所有字节保持为0
@@ -160,10 +198,32 @@ impl From<NetlinkSocketAddr> for SockAddr {
     }
 }
 
+impl From<LinkLayerEndpoint> for SockAddr {
+    fn from(value: LinkLayerEndpoint) -> Self {
+        SockAddr {
+            addr_ll: SockAddrLl {
+                sll_family: AddressFamily::Packet as u16,
+                sll_protocol: value.protocol.to_be(),
+                sll_ifindex: value.interface as u32,
+                sll_hatype: value.hatype,
+                sll_pkttype: value.pkttype,
+                sll_halen: value.halen,
+                sll_addr: value.addr,
+            },
+        }
+    }
+}
+
 impl From<Endpoint> for SockAddr {
     fn from(value: Endpoint) -> Self {
         match value {
-            Endpoint::LinkLayer(_link_layer_endpoint) => todo!(),
+            Endpoint::Unspecified => Self {
+                addr_ph: SockAddrPlaceholder {
+                    family: 0, // AF_UNSPEC
+                    data: [0; 14],
+                },
+            },
+            Endpoint::LinkLayer(link_layer_endpoint) => Self::from(link_layer_endpoint),
             Endpoint::Ip(endpoint) => Self::from(endpoint),
             Endpoint::Unix(unix_endpoint) => Self::from(unix_endpoint),
             Endpoint::Netlink(netlink_addr) => Self::from(netlink_addr),
@@ -174,118 +234,188 @@ impl From<Endpoint> for SockAddr {
 impl SockAddr {
     /// @brief 把用户传入的SockAddr转换为Endpoint结构体
     pub fn to_endpoint(addr: *const SockAddr, len: u32) -> Result<Endpoint, SystemError> {
-        use crate::net::socket::AddressFamily;
+        // 统一的上限检查：防止 addrlen 过大导致内核读取越界内存
+        // 参考 Linux kernel net/socket.c:move_addr_to_kernel()
+        if len > MAX_SOCKADDR_LEN {
+            log::error!(
+                "addr_len {} exceeds MAX_SOCKADDR_LEN {}",
+                len,
+                MAX_SOCKADDR_LEN
+            );
+            return Err(SystemError::EINVAL);
+        }
 
-        let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
-        unsafe {
-            match AddressFamily::try_from(addr.family)? {
-                AddressFamily::INet => {
-                    if len < addr.len()? {
-                        log::error!("len < addr.len()");
-                        return Err(SystemError::EINVAL);
-                    }
+        // 至少需要包含 sa_family
+        if len < size_of::<u16>() as u32 {
+            log::error!("addr_len {} < sizeof(sa_family_t)", len);
+            return Err(SystemError::EINVAL);
+        }
 
-                    let addr_in: SockAddrIn = addr.addr_in;
+        // 使用 UserBufferReader 安全地读取用户空间数据
+        // buffer_protected 会使用异常表保护访问，防止用户地址缺页导致内核崩溃
+        let reader = UserBufferReader::new(addr as *const u8, len as usize, true)?;
 
-                    use smoltcp::wire;
-                    let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bits(
-                        u32::from_be(addr_in.sin_addr),
-                    ));
-                    let port = u16::from_be(addr_in.sin_port);
+        // 先读取 sa_family 确定地址家族
+        let family = reader.buffer_protected(0)?.read_one::<u16>(0)?;
+        let family = AddressFamily::try_from(family)?;
 
-                    return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
-                }
-                // AddressFamily::INet6 => {
-                //     if len < addr.len()? {
-                //         log::error!("len < addr.len()");
-                //         return Err(SystemError::EINVAL);
-                //     }
-                //     log::debug!("INet6");
-                //     let addr_in: SockAddrIn = addr.addr_in;
-
-                //     use smoltcp::wire;
-                //     let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv6Address::from_bits(
-                //         u128::from_be(addr_in.sin_addr),
-                //     ));
-                //     let port = u16::from_be(addr_in.sin_port);
-
-                //     return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
-                // }
-                AddressFamily::Unix => {
-                    // 在这里并没有分配抽象地址或者创建文件系统节点，这里只是简单的获取，等到bind时再创建
-
-                    let addr_un: SockAddrUn = addr.addr_un;
-
-                    if addr_un.sun_path[0] == 0 {
-                        // 抽象地址空间，与文件系统没有关系
-                        // TODO: Autobind feature
-                        //    If a bind(2) call specifies addrlen as sizeof(sa_family_t), or the
-                        //    SO_PASSCRED socket option was specified for a socket that was not
-                        //    explicitly bound to an address, then the socket is autobound to an
-                        //    abstract address.  The address consists of a null byte followed by
-                        //    5 bytes in the character set [0-9a-f].  Thus, there is a limit of
-                        //    2^20 autobind addresses.  (From Linux 2.1.15, when the autobind
-                        //    feature was added, 8 bytes were used, and the limit was thus 2^32
-                        //    autobind addresses.  The change to 5 bytes came in Linux 2.3.15.)
-                        let path = CStr::from_bytes_until_nul(&addr_un.sun_path[1..])
-                            .map_err(|_| {
-                                log::error!("CStr::from_bytes_until_nul fail");
-                                SystemError::EINVAL
-                            })?
-                            .to_str()
-                            .map_err(|_| {
-                                log::error!("CStr::to_str fail");
-                                SystemError::EINVAL
-                            })?;
-
-                        // // 向抽象地址管理器申请或查找抽象地址
-                        // let spath = String::from(path);
-                        // log::info!("abs path: {}", spath);
-                        // let path = create_abstract_name(spath)?;
-
-                        return Ok(Endpoint::Unix(UnixEndpoint::Abstract(path.to_string())));
-                    }
-
-                    let path = CStr::from_bytes_until_nul(&addr_un.sun_path)
-                        .map_err(|_| {
-                            log::error!("CStr::from_bytes_until_nul fail");
-                            SystemError::EINVAL
-                        })?
-                        .to_str()
-                        .map_err(|_| {
-                            log::error!("CStr::to_str fail");
-                            SystemError::EINVAL
-                        })?;
-
-                    // let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(
-                    //     &ProcessManager::current_pcb(),
-                    //     crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
-                    //     path.trim(),
-                    // )?;
-                    // let _inode =
-                    //     inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-
-                    return Ok(Endpoint::Unix(UnixEndpoint::File(path.to_string())));
-                }
-                AddressFamily::Netlink => {
-                    if len < addr.len()? {
-                        log::error!("len < addr.len() for Netlink");
-                        return Err(SystemError::EINVAL);
-                    }
-
-                    let addr_nl: SockAddrNl = addr.addr_nl;
-                    let nl_pid = addr_nl.nl_pid;
-                    let nl_groups = addr_nl.nl_groups;
-
-                    Ok(Endpoint::Netlink(NetlinkSocketAddr::new(
-                        nl_pid,
-                        GroupIdSet::new(nl_groups),
-                    )))
-                }
-                _ => {
-                    log::warn!("not support address family {:?}", addr.family);
+        match family {
+            AddressFamily::INet => {
+                // 下限检查：至少需要包含完整的 sockaddr_in 结构体
+                if len < size_of::<SockAddrIn>() as u32 {
+                    // log::error!(
+                    //     "len {} < sizeof(sockaddr_in) {}",
+                    //     len,
+                    //     size_of::<SockAddrIn>()
+                    // );
                     return Err(SystemError::EINVAL);
                 }
+
+                let addr_in = reader.buffer_protected(0)?.read_one::<SockAddrIn>(0)?;
+
+                use smoltcp::wire;
+                let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bits(
+                    u32::from_be(addr_in.sin_addr),
+                ));
+                let port = u16::from_be(addr_in.sin_port);
+
+                return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
+            }
+
+            AddressFamily::Unspecified => {
+                // AF_UNSPEC is used to disconnect sockets
+                Ok(Endpoint::Unspecified)
+            }
+
+            AddressFamily::INet6 => {
+                // 下限检查：至少需要包含完整的 sockaddr_in6 结构体
+                if len < size_of::<SockAddrIn6>() as u32 {
+                    log::error!(
+                        "len {} < sizeof(sockaddr_in6) {}",
+                        len,
+                        size_of::<SockAddrIn6>()
+                    );
+                    return Err(SystemError::EINVAL);
+                }
+
+                let addr_in6 = reader.buffer_protected(0)?.read_one::<SockAddrIn6>(0)?;
+
+                use smoltcp::wire;
+                let ip: wire::IpAddress =
+                    wire::IpAddress::Ipv6(core::net::Ipv6Addr::from(addr_in6.sin6_addr));
+                let port = u16::from_be(addr_in6.sin6_port);
+                return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
+            }
+            AddressFamily::Unix => {
+                // 在这里并没有分配抽象地址或者创建文件系统节点，这里只是简单的获取，等到bind时再创建
+
+                // Linux 语义：addrlen 过长应返回 EINVAL。
+                // 参考 Linux kernel net/unix/af_unix.c:unix_validate_addr()
+                // 注：虽然统一上限检查 (MAX_SOCKADDR_LEN) 已覆盖此场景，但保留此检查以保持与 Linux
+                // unix_validate_addr() 的语义精确性 (addr_len > sizeof(struct sockaddr_un))
+                if len > size_of::<SockAddrUn>() as u32 {
+                    return Err(SystemError::EINVAL);
+                }
+
+                // 至少需要包含 sa_family_t（与 Linux unix_validate_addr 行为一致）
+                // 已在函数开头检查过
+
+                // Linux semantics: addrlen may be shorter than sizeof(sockaddr_un).
+                // Only the bytes within addrlen are visible; do not attempt to read a full
+                // SockAddrUn when len is short.
+                let mut sun_path_buf = [0u8; 108];
+                let sun_path_len = (len as usize)
+                    .saturating_sub(size_of::<u16>())
+                    .min(sun_path_buf.len());
+
+                if sun_path_len != 0 {
+                    let ub = reader.buffer_protected(size_of::<u16>())?;
+                    ub.read_from_user(0, &mut sun_path_buf[..sun_path_len])?;
+                }
+
+                let sun_path = &sun_path_buf[..sun_path_len];
+
+                if sun_path.is_empty() {
+                    // Linux semantics: bind(addrlen == sizeof(sa_family_t)) triggers autobind
+                    // to an abstract address.
+                    return Ok(Endpoint::Unix(UnixEndpoint::Unnamed));
+                }
+
+                if sun_path[0] == 0 {
+                    // 抽象地址空间，与文件系统没有关系
+                    // Linux semantics: abstract names are binary and length-delimited (may
+                    // contain embedded NULs). Do not treat them as C strings.
+                    if sun_path_len <= 1 {
+                        // A lone leading NUL (no name bytes) behaves like an unnamed bind.
+                        return Ok(Endpoint::Unix(UnixEndpoint::Unnamed));
+                    }
+
+                    let name: Vec<u8> = sun_path[1..sun_path_len].to_vec();
+                    return Ok(Endpoint::Unix(UnixEndpoint::Abstract(name)));
+                }
+
+                // Filesystem pathname sockets: respect addrlen and stop at the first NUL if any.
+                let path_bytes = match sun_path.iter().position(|&b| b == 0) {
+                    Some(nul) => &sun_path[..nul],
+                    None => sun_path,
+                };
+                let path = core::str::from_utf8(path_bytes).map_err(|_| SystemError::EINVAL)?;
+
+                // let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(
+                //     &ProcessManager::current_pcb(),
+                //     crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
+                //     path.trim(),
+                // )?;
+                // let _inode =
+                //     inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
+                return Ok(Endpoint::Unix(UnixEndpoint::File(path.to_string())));
+            }
+            AddressFamily::Netlink => {
+                // 下限检查：至少需要包含完整的 sockaddr_nl 结构体
+                if len < size_of::<SockAddrNl>() as u32 {
+                    log::error!(
+                        "len {} < sizeof(sockaddr_nl) {}",
+                        len,
+                        size_of::<SockAddrNl>()
+                    );
+                    return Err(SystemError::EINVAL);
+                }
+
+                let addr_nl = reader.buffer_protected(0)?.read_one::<SockAddrNl>(0)?;
+                let nl_pid = addr_nl.nl_pid;
+                let nl_groups = addr_nl.nl_groups;
+
+                Ok(Endpoint::Netlink(NetlinkSocketAddr::new(
+                    nl_pid,
+                    GroupIdSet::new(nl_groups),
+                )))
+            }
+            AddressFamily::Packet => {
+                // 下限检查：至少需要包含完整的 sockaddr_ll 结构体
+                if len < size_of::<SockAddrLl>() as u32 {
+                    log::error!(
+                        "len {} < sizeof(sockaddr_ll) {}",
+                        len,
+                        size_of::<SockAddrLl>()
+                    );
+                    return Err(SystemError::EINVAL);
+                }
+
+                let addr_ll = reader.buffer_protected(0)?.read_one::<SockAddrLl>(0)?;
+
+                Ok(Endpoint::LinkLayer(LinkLayerEndpoint {
+                    interface: addr_ll.sll_ifindex as usize,
+                    addr: addr_ll.sll_addr,
+                    protocol: u16::from_be(addr_ll.sll_protocol),
+                    hatype: addr_ll.sll_hatype,
+                    pkttype: addr_ll.sll_pkttype,
+                    halen: addr_ll.sll_halen,
+                }))
+            }
+            _ => {
+                log::warn!("not support address family {:?}", family);
+                return Err(SystemError::EINVAL);
             }
         }
     }
@@ -294,6 +424,7 @@ impl SockAddr {
     pub fn len(&self) -> Result<u32, SystemError> {
         match AddressFamily::try_from(unsafe { self.family })? {
             AddressFamily::INet => Ok(core::mem::size_of::<SockAddrIn>()),
+            AddressFamily::INet6 => Ok(core::mem::size_of::<SockAddrIn6>()),
             AddressFamily::Packet => Ok(core::mem::size_of::<SockAddrLl>()),
             AddressFamily::Netlink => Ok(core::mem::size_of::<SockAddrNl>()),
             AddressFamily::Unix => Ok(core::mem::size_of::<SockAddrUn>()),
@@ -303,7 +434,7 @@ impl SockAddr {
     }
 
     pub unsafe fn is_empty(&self) -> bool {
-        unsafe { self.family == 0 && self.addr_ph.data == [0; 14] }
+        self.family == 0 && self.addr_ph.data == [0; 14]
     }
 }
 
@@ -314,6 +445,9 @@ pub struct MsgHdr {
     pub msg_name: *mut SockAddr,
     /// SockAddr结构体的大小
     pub msg_namelen: u32,
+    /// Padding to keep the same layout as Linux `struct msghdr` on 64-bit.
+    #[cfg(target_pointer_width = "64")]
+    pub _pad0: u32,
     /// scatter/gather array
     pub msg_iov: *mut crate::filesystem::vfs::iov::IoVec,
     /// elements in msg_iov
@@ -321,9 +455,12 @@ pub struct MsgHdr {
     /// 辅助数据
     pub msg_control: *mut u8,
     /// 辅助数据长度
-    pub msg_controllen: u32,
+    pub msg_controllen: usize,
     /// 接收到的消息的标志
-    pub msg_flags: u32,
+    pub msg_flags: i32,
+    /// Padding to keep the same layout as Linux `struct msghdr` on 64-bit.
+    #[cfg(target_pointer_width = "64")]
+    pub _pad1: i32,
 }
 
 // TODO: 从用户态读取MsgHdr，以及写入MsgHdr

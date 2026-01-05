@@ -20,11 +20,13 @@ emulator="qemu"
 defpackman="apt-get"
 dockerInstall="true"
 DEFAULT_INSTALL="false"
+CI_INSTALL="false"
+APT_FLAG=""
+INSTALL_MODE=""
 
 export RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER:-https://rsproxy.cn}
 export RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}
 export RUST_VERSION="${RUST_VERSION:-nightly-2025-08-10}"
-export RUST_VERSION_OLD="${RUST_VERSION_OLD:-nightly-2024-11-05}"
 
 banner()
 {
@@ -48,6 +50,80 @@ congratulations()
 	echo "|------------------------------------------|"
 }
 
+congratulations_nix()
+{
+	echo "|-----------Congratulations!---------------|"
+	echo "|                                          |"
+	echo "|   Nix 已成功安装!                        |"
+	echo "|                                          |"
+	echo "|   请[关闭]当前终端, 并[重新打开]一个终端 |"
+	echo "|   然后通过以下命令进入开发环境:          |"
+	echo "|                                          |"
+	echo "|   nix develop ./tools/nix-dev-shell      |"
+	echo "|                                          |"
+	echo "|------------------------------------------|"
+}
+
+####################################################################################
+# 安装 Nix 包管理器
+####################################################################################
+install_nix()
+{
+	if [ -n "$(which nix)" ]; then
+		echo "Nix 已经安装在您的系统上。"
+		return 0
+	fi
+
+	echo "正在安装 Nix 包管理器..."
+	curl -fsSL https://install.determinate.systems/nix | sh -s -- install
+
+	if [ $? -ne 0 ]; then
+		echo "Nix 安装失败！"
+		exit 1
+	fi
+
+	echo "Nix 安装成功！"
+
+	# Source nix environment
+	if [ -f "/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh" ]; then
+		. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+	fi
+}
+
+####################################################################################
+# 询问用户选择安装模式
+####################################################################################
+ask_install_mode()
+{
+	if [ "$CI_INSTALL" = "true" ]; then
+		INSTALL_MODE="legacy"
+		return
+	fi
+
+	if [ -n "$INSTALL_MODE" ]; then
+		return
+	fi
+
+	echo ""
+	echo "请选择安装模式:"
+	echo "  1) nix    - 仅安装 Nix，使用 nix develop 进入开发环境 (推荐)"
+	echo "  2) legacy - 安装 Nix 后继续安装传统依赖 (完整安装)"
+	echo ""
+	printf "请输入选项 (1/2) [默认: 1]: "
+	read mode_choice
+
+	case "$mode_choice" in
+		2|legacy)
+			INSTALL_MODE="legacy"
+			echo "已选择: legacy 模式 (完整安装)"
+			;;
+		*)
+			INSTALL_MODE="nix"
+			echo "已选择: nix 模式 (仅 Nix)"
+			;;
+	esac
+}
+
 ####################################
 # 当检测到ubuntu或Debian时，执行此函数 #
 # 参数:第一个参数为包管理器            #
@@ -58,7 +134,8 @@ install_ubuntu_debian_pkg()
 	echo "正在更新包管理器的列表..."
 	sudo "$1" update
 	echo "正在安装所需的包..."
-    sudo "$1" install -y \
+
+    sudo "$1" install ${APT_FLAG} -y \
         ca-certificates \
         curl wget \
         unzip \
@@ -68,18 +145,18 @@ install_ubuntu_debian_pkg()
         gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config \
 		python3-sphinx make git
 	# 必须分开安装，否则会出现错误
-	sudo "$1" install -y \
-		gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu gdb-multiarch
-	
+	sudo "$1" install ${APT_FLAG} -y \
+		gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu linux-libc-dev-riscv64-cross gdb-multiarch
+
 	# 如果python3没有安装
 	if [ -z "$(which python3)" ]; then
 		echo "正在安装python3..."
-		sudo apt install -y python3 python3-pip
+		sudo apt install ${APT_FLAG} -y python3 python3-pip
 	fi
 
     if [ -z "$(which docker)" ] && [ "${dockerInstall}" = "true" ]; then
         echo "正在安装docker..."
-        sudo apt install -y docker.io docker-compose
+        sudo apt install ${APT_FLAG} -y docker.io docker-compose
 		sudo groupadd docker
 		sudo usermod -aG docker $USER
 		sudo systemctl restart docker
@@ -91,7 +168,7 @@ install_ubuntu_debian_pkg()
 
     if [ -z "$(which qemu-system-x86_64)" ]; then
         echo "正在安装QEMU虚拟机..."
-        sudo $1 install -y qemu-system qemu-kvm
+        sudo $1 install ${APT_FLAG} -y qemu-system qemu-kvm
     else
         echo "QEMU已经在您的电脑上安装！"
     fi
@@ -174,7 +251,7 @@ install_osx_pkg()
 freebsd()
 {
     echo "Checking QEMU installation on FreeBSD..."
-    
+
     # 检查 QEMU 是否已安装
     if pkg info -q qemu; then
         echo "✓ QEMU is already installed."
@@ -182,25 +259,25 @@ freebsd()
         return 0
     else
         echo "QEMU is not installed. Installing via pkg..."
-        
+
         # 更新包数据库
         if ! sudo pkg update; then
             echo "✗ Failed to update package database" >&2
             return 1
         fi
-        
+
         # 安装 QEMU
         if sudo pkg install -y qemu; then
             echo "✓ QEMU installed successfully."
             echo "QEMU version: $(qemu-system-x86_64 --version | head -n 1)"
-            
+
             # 可选：将当前用户添加到kvm组以获得更好的性能
             if pw groupshow kvm >/dev/null 2>&1; then
                 echo "Adding user to kvm group for better performance..."
                 sudo pw usermod $(whoami) -G kvm
                 echo "You may need to logout and login again for group changes to take effect."
             fi
-            
+
             return 0
         else
             echo "✗ Failed to install QEMU" >&2
@@ -252,19 +329,23 @@ rustInstall() {
 		exit
 	else
 		local change_rust_src=""
-		if [ "$DEFAULT_INSTALL" = "true" ]; then
-			change_rust_src="true"
+		if [ "$CI_INSTALL" = "true" ]; then
+		    echo "In CI, skip source change"
 		else
-			echo "是否为Rust换源为国内镜像源？(Tuna)"
-			echo "如果您在国内，我们推荐您这样做，以提升网络速度。"
-			echo "*WARNING* 这将会替换原有的镜像源设置。"
-			printf "(y/N): "
-			read change_src
-			if echo "$change_src" | grep -iq "^y" ;then
-				change_rust_src="true"
-			else
-				echo "取消换源，您原有的配置不会被改变。"
-			fi
+    		if [ "$DEFAULT_INSTALL" = "true" ]; then
+    			change_rust_src="true"
+    		else
+    			echo "是否为Rust换源为国内镜像源？(Tuna)"
+    			echo "如果您在国内，我们推荐您这样做，以提升网络速度。"
+    			echo "*WARNING* 这将会替换原有的镜像源设置。"
+    			printf "(y/N): "
+    			read change_src
+    			if echo "$change_src" | grep -iq "^y" ;then
+    				change_rust_src="true"
+    			else
+    				echo "取消换源，您原有的配置不会被改变。"
+    			fi
+    		fi
 		fi
 		if [ "$change_rust_src" = "true" ]; then
 			echo "正在为rust换源"
@@ -272,23 +353,15 @@ rustInstall() {
 		fi
 
         echo "正在安装DragonOS所需的rust组件...首次安装需要一些时间来更新索引，请耐心等待..."
-        
+
 		rustup toolchain install $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup toolchain install $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup component add rust-src --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-none --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-none --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-linux-musl --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-linux-musl --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup target add riscv64gc-unknown-linux-musl --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 		rustup target add loongarch64-unknown-none --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup target add loongarch64-unknown-none --toolchain $RUST_VERSION_OLD-x86_64-unknown-linux-gnu
 
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src
@@ -296,7 +369,7 @@ rustInstall() {
 		rustup default $RUST_VERSION
 		cargo install cargo-binutils
 		cargo install bpf-linker
-		
+
 		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 或 . ~/cargo/env 以使rust在当前窗口生效！"
 	fi
 }
@@ -326,8 +399,22 @@ while true; do
 			DEFAULT_INSTALL="true"
 			dockerInstall=""
 		;;
+		"--ci")
+		    CI_INSTALL="true"
+			DEFAULT_INSTALL="true"
+			dockerInstall=""
+			APT_FLAG="--no-install-recommends"
+		;;
+		"--nix")
+			INSTALL_MODE="nix"
+		;;
+		"--legacy")
+			INSTALL_MODE="legacy"
+		;;
 		"--help")
 			echo "--no-docker(not install docker): 该参数表示执行该脚本的过程中不单独安装docker."
+			echo "--nix: 仅安装 Nix，使用 nix develop 进入开发环境."
+			echo "--legacy: 安装 Nix 后继续安装传统依赖 (完整安装)."
 			exit 0
 		;;
 		*)
@@ -339,6 +426,21 @@ done
 
 ############ 开始执行 ###############
 banner 			# 开始横幅
+
+# 询问安装模式
+ask_install_mode
+
+# 安装 Nix
+install_nix
+
+# 如果是 nix 模式，直接结束
+if [ "$INSTALL_MODE" = "nix" ]; then
+	congratulations_nix
+	exit 0
+fi
+
+# 以下是 legacy 模式的安装流程
+echo "继续安装传统依赖..."
 
 if [ "Darwin" == "$(uname -s)" ]; then
 	install_osx_pkg "$emulator" || exit 1
@@ -375,17 +477,23 @@ fi
 # 安装rust
 rustInstall
 
-install_python_pkg
-
 # 安装dadk
-cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.5.0 || exit 1
+cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.5.1 || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 
 # 编译安装musl交叉编译工具链
 $SHELL ${bashpath}/install_cross_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
+
+install_python_pkg
+
+if [ "$CI_INSTALL" = "true" ]; then
+    echo "CI Skip docs, grub deps install"
+else
+
+    $SHELL ${bashpath}/grub_auto_install.sh || (echo "grub安装失败" && exit 1)
+fi
 # 编译安装grub
-$SHELL ${bashpath}/grub_auto_install.sh || (echo "grub安装失败" && exit 1)
 
 # 解决kvm权限问题
 USR=$USER

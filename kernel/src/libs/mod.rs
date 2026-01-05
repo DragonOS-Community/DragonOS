@@ -16,6 +16,7 @@ pub mod printk;
 pub mod rbtree;
 #[macro_use]
 pub mod rwlock;
+pub mod rwsem;
 pub mod semaphore;
 pub mod spinlock;
 pub mod vec_cursor;
@@ -31,3 +32,4 @@ pub mod name;
 pub mod decompress;
 
 pub mod pod;
+pub mod ranges;

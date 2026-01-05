@@ -23,16 +23,18 @@ use system_error::SystemError;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    filesystem::vfs::file::File,
+    filesystem::vfs::{
+        file::{File, FileMode},
+        FileType, InodeId,
+    },
     ipc::shm::{ShmFlags, ShmId},
     libs::{
         align::page_align_up,
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::page::page_manager_lock_irqsave,
-    process::ProcessManager,
-    syscall::user_access::{UserBufferReader, UserBufferWriter},
+    mm::{page::page_manager_lock_irqsave, PhysAddr},
+    process::{resource::RLimitID, ProcessManager},
 };
 
 use super::{
@@ -149,6 +151,17 @@ pub struct InnerAddressSpace {
 }
 
 impl InnerAddressSpace {
+    /// 当前地址空间已占用的虚拟内存字节数（简单求和所有 VMA 尺寸）
+    pub fn vma_usage_bytes(&self) -> usize {
+        self.mappings
+            .iter_vmas()
+            .map(|v| {
+                let g = v.lock_irqsave();
+                g.region().size()
+            })
+            .sum()
+    }
+
     pub fn new(create_stack: bool) -> Result<Self, SystemError> {
         let mut result = Self {
             user_mapper: MMArch::setup_new_usermapper()?,
@@ -397,7 +410,10 @@ impl InnerAddressSpace {
                         VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)?;
                     // 如果是共享匿名映射，则分配稳定身份
                     if vm_flags.contains(VmFlags::VM_SHARED) {
-                        vma.lock_irqsave().shared_anon = Some(AnonSharedMapping::new());
+                        let mut g = vma.lock_irqsave();
+                        g.shared_anon = Some(AnonSharedMapping::new(count.data()));
+                        // Set backing_pgoff to 0 as the base offset for shared-anon mappings.
+                        g.backing_pgoff = Some(0);
                     }
                     Ok(vma)
                 } else {
@@ -410,7 +426,9 @@ impl InnerAddressSpace {
                         false,
                     ));
                     if vm_flags.contains(VmFlags::VM_SHARED) {
-                        vma.lock_irqsave().shared_anon = Some(AnonSharedMapping::new());
+                        let mut g = vma.lock_irqsave();
+                        g.shared_anon = Some(AnonSharedMapping::new(count.data()));
+                        g.backing_pgoff = Some(0);
                     }
                     Ok(vma)
                 }
@@ -484,15 +502,49 @@ impl InnerAddressSpace {
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
+        let file = file.unwrap();
+
+        // 权限检查遵循 Linux 语义：
+        // - O_PATH 直接返回 EBADF
+        // - 除 PROT_NONE 外，映射需要读权限；PROT_WRITE 另外需要写权限（MAP_PRIVATE 也需要读以便 COW）
+        // - PROT_EXEC 视为读检查
+        let file_mode = file.mode();
+        if file_mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        let wants_access = prot_flags != ProtFlags::PROT_NONE;
+        if wants_access && !file_mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EACCES);
+        }
+        if prot_flags.contains(ProtFlags::PROT_EXEC) && !file_mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EACCES);
+        }
+        if prot_flags.contains(ProtFlags::PROT_WRITE) {
+            if map_flags.contains(MapFlags::MAP_SHARED) {
+                if !file_mode.contains(FileMode::FMODE_WRITE) {
+                    return Err(SystemError::EACCES);
+                }
+            } else if !file_mode.contains(FileMode::FMODE_READ) {
+                return Err(SystemError::EACCES);
+            }
+        }
+
+        let meta = file.metadata()?;
+        if matches!(meta.file_type, FileType::Pipe | FileType::Dir) {
+            return Err(SystemError::ENODEV);
+        }
+
         // offset需要4K对齐
         if (offset & (MMArch::PAGE_SIZE - 1)) != 0 {
             return Err(SystemError::EINVAL);
         }
         let pgoff = offset >> MMArch::PAGE_SHIFT;
 
+        let page_count = PageFrameCount::from_bytes(len).unwrap();
         let start_page: VirtPageFrame = self.mmap(
             round_hint_to_min(start_vaddr),
-            PageFrameCount::from_bytes(len).unwrap(),
+            page_count,
             prot_flags,
             map_flags,
             |page, count, vm_flags, flags, mapper, flusher| {
@@ -504,7 +556,7 @@ impl InnerAddressSpace {
                         flags,
                         mapper,
                         flusher,
-                        file.clone(),
+                        Some(file.clone()),
                         Some(pgoff),
                     )
                 } else {
@@ -512,7 +564,7 @@ impl InnerAddressSpace {
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
-                        file.clone(),
+                        Some(file.clone()),
                         Some(pgoff),
                         false,
                     )))
@@ -521,12 +573,22 @@ impl InnerAddressSpace {
         )?;
         // todo!(impl mmap for other file)
         // https://github.com/DragonOS-Community/DragonOS/pull/912#discussion_r1765334272
-        let file = file.unwrap();
         // 传入实际映射后的起始虚拟地址，而非用户传入的 hint
-        let _ = file
+        match file
             .inode()
-            .mmap(start_page.virt_address().data(), len, offset);
-        return Ok(start_page);
+            .mmap(start_page.virt_address().data(), len, offset)
+        {
+            Ok(_) => Ok(start_page),
+            Err(SystemError::ENOSYS) => Ok(start_page), // 文件系统未实现 mmap，视为成功
+            Err(SystemError::ENODEV) => {
+                let _ = self.munmap(start_page, page_count);
+                Err(SystemError::ENODEV)
+            }
+            Err(e) => {
+                let _ = self.munmap(start_page, page_count);
+                Err(e)
+            }
+        }
     }
 
     /// 向进程的地址空间映射页面
@@ -639,22 +701,52 @@ impl InnerAddressSpace {
         new_vaddr: VirtAddr,
         vm_flags: VmFlags,
     ) -> Result<VirtAddr, SystemError> {
-        // 检查新内存地址是否对齐
-        if !new_vaddr.check_aligned(MMArch::PAGE_SIZE) {
-            return Err(SystemError::EINVAL);
+        // 仅在 MREMAP_FIXED 下需要检查 new_vaddr（否则 new_vaddr 参数应被忽略，由内核选择新地址）
+        if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
+            // 检查新内存地址是否对齐
+            if !new_vaddr.check_aligned(MMArch::PAGE_SIZE) {
+                return Err(SystemError::EINVAL);
+            }
+
+            // 检查新、旧内存区域是否冲突
+            let old_region = VirtRegion::new(old_vaddr, old_len);
+            let new_region = VirtRegion::new(new_vaddr, new_len);
+            if old_region.collide(&new_region) {
+                return Err(SystemError::EINVAL);
+            }
         }
 
-        // 检查新、旧内存区域是否冲突
-        let old_region = VirtRegion::new(old_vaddr, old_len);
-        let new_region = VirtRegion::new(new_vaddr, new_len);
-        if old_region.collide(&new_region) {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 初始化映射标志
-        let mut map_flags: MapFlags = vm_flags.into();
         // 初始化内存区域保护标志
         let prot_flags: ProtFlags = vm_flags.into();
+
+        // 读取旧 VMA 的后备信息（file/shared-anon）以及页偏移基址。
+        let old_vma = self
+            .mappings
+            .contains(old_vaddr)
+            .ok_or(SystemError::EINVAL)?;
+        let (old_region, vm_file, shared_anon, base_pgoff) = {
+            let g = old_vma.lock_irqsave();
+            let region = *g.region();
+            let vma_start = region.start();
+            let off_pages =
+                (old_vaddr.data().saturating_sub(vma_start.data())) >> MMArch::PAGE_SHIFT;
+            let base = g
+                .backing_page_offset()
+                .unwrap_or(0)
+                .saturating_add(off_pages);
+            (region, g.vm_file(), g.shared_anon.clone(), base)
+        };
+
+        // 构造目标映射 flags：mremap 需要保留 shared/private 语义，并区分 anon/file。
+        let mut map_flags: MapFlags = vm_flags.into();
+        if map_flags.contains(MapFlags::MAP_SHARED) {
+            // ok
+        } else {
+            map_flags |= MapFlags::MAP_PRIVATE;
+        }
+        if vm_file.is_none() {
+            map_flags |= MapFlags::MAP_ANONYMOUS;
+        }
 
         // 取消新内存区域的原映射
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
@@ -664,21 +756,143 @@ impl InnerAddressSpace {
             self.munmap(start_page, page_count)?;
         }
 
-        // 获取映射后的新内存页面
-        let new_page = self.map_anonymous(new_vaddr, new_len, prot_flags, map_flags, true, true)?;
-        let new_page_vaddr = new_page.virt_address();
+        // 是否允许移动（Linux: 只有 MAYMOVE / FIXED 才能移动）
+        let can_move = mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE)
+            || mremap_flags.contains(MremapFlags::MREMAP_FIXED);
 
-        // 拷贝旧内存区域内容到新内存区域
-        let old_buffer_reader =
-            UserBufferReader::new(old_vaddr.data() as *const u8, old_len, true)?;
-        let old_buf: &[u8] = old_buffer_reader.read_from_user(0)?;
-        let mut new_buffer_writer =
-            UserBufferWriter::new(new_page_vaddr.data() as *mut u8, new_len, true)?;
-        let new_buf: &mut [u8] = new_buffer_writer.buffer(0)?;
-        let len = old_buf.len().min(new_buf.len());
-        new_buf[..len].copy_from_slice(&old_buf[..len]);
+        // Linux: old_len==0 表示“复制/重复映射”共享区域（DOS-emu legacy）。
+        // - 仅允许对共享映射进行
+        // - 没有 MAYMOVE/FIXED 时返回 ENOMEM
+        if old_len == 0 {
+            if !vm_flags.intersects(VmFlags::VM_SHARED | VmFlags::VM_MAYSHARE) {
+                return Err(SystemError::EINVAL);
+            }
+            if !can_move {
+                return Err(SystemError::ENOMEM);
+            }
+        }
 
-        return Ok(new_page_vaddr);
+        // 不允许移动时，只能尝试原地扩展。
+        if !can_move {
+            if new_len <= old_len {
+                return Ok(old_vaddr);
+            }
+
+            // 仅支持从 VMA 起始地址扩展整个 VMA 的常见场景（符合 gVisor 测例）。
+            if old_vaddr != old_region.start() || old_len != old_region.size() {
+                return Err(SystemError::ENOMEM);
+            }
+
+            let grow = new_len - old_len;
+            let grow_region = VirtRegion::new(old_vaddr + old_len, grow);
+            if self.mappings.conflicts(grow_region).next().is_some() {
+                return Err(SystemError::ENOMEM);
+            }
+
+            let removed = self
+                .mappings
+                .remove_vma(&old_region)
+                .ok_or(SystemError::EINVAL)?;
+            removed.lock_irqsave().set_region_size(new_len);
+            self.mappings.insert_vma(removed);
+            return Ok(old_vaddr);
+        }
+
+        // 需要创建一个新映射并迁移（FIXED 或 MAYMOVE）。
+        // 注意：必须避免在持有地址空间写锁时触碰用户地址（会触发缺页递归死锁）。
+        // Linux 的 mremap 通过移动/复制页表项实现，而不是字节拷贝。
+
+        let new_region: VirtRegion = if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
+            VirtRegion::new(new_vaddr, new_len)
+        } else {
+            self.mappings
+                .find_free(self.mmap_min, new_len)
+                .ok_or(SystemError::ENOMEM)?
+        };
+
+        let entry_flags = EntryFlags::from_prot_flags(prot_flags, true);
+
+        // 创建目标 VMA（初始不映射物理页；存在的页表项会在下面被移动/复制）。
+        let new_vma: Arc<LockedVMA> = {
+            let vma = LockedVMA::new(VMA::new(
+                new_region,
+                vm_flags,
+                entry_flags,
+                vm_file.clone(),
+                if vm_file.is_some() || shared_anon.is_some() {
+                    Some(base_pgoff)
+                } else {
+                    None
+                },
+                false,
+            ));
+            if let Some(shared) = shared_anon.clone() {
+                let mut vg = vma.lock_irqsave();
+                vg.shared_anon = Some(shared);
+                vg.backing_pgoff = Some(base_pgoff);
+            }
+            self.mappings.insert_vma(vma.clone());
+            vma
+        };
+
+        if let Some(f) = vm_file.as_ref() {
+            let _ = f.inode().mmap(
+                new_region.start().data(),
+                new_len,
+                base_pgoff * MMArch::PAGE_SIZE,
+            );
+        }
+
+        let move_len = core::cmp::min(old_len, new_len);
+
+        // 选择合适的 flusher（与 mmap/munmap 的策略一致）。
+        let (mut active, mut inactive);
+        let flusher: &mut dyn Flusher<MMArch> = if self.is_current() {
+            active = PageFlushAll::new();
+            &mut active as &mut dyn Flusher<MMArch>
+        } else {
+            inactive = InactiveFlusher::new();
+            &mut inactive as &mut dyn Flusher<MMArch>
+        };
+
+        // 迁移/复制已存在的页表映射。
+        // - DONTUNMAP：复制映射（旧映射仍保留）
+        // - 否则：移动映射（旧地址解除映射）
+        let dontunmap = mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) || old_len == 0;
+        let mapper = &mut self.user_mapper.utable;
+        let old_vma = old_vma.clone();
+
+        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut off = 0usize;
+        while off < move_len {
+            let src = old_vaddr + off;
+            let dst = new_region.start() + off;
+            if let Some((paddr, src_flags)) = mapper.translate(src) {
+                if !dontunmap {
+                    if let Some((_paddr2, _flags2, flush)) = unsafe { mapper.unmap_phys(src, true) }
+                    {
+                        flusher.consume(flush);
+                    }
+                }
+
+                if let Some(flush) = unsafe { mapper.map_phys(dst, paddr, src_flags) } {
+                    flusher.consume(flush);
+                } else {
+                    return Err(SystemError::ENOMEM);
+                }
+
+                // 更新物理页的 vma_set
+                let page = page_manager_guard.get_unwrap(&paddr);
+                let mut pg = page.write_irqsave();
+                if !dontunmap {
+                    pg.remove_vma(old_vma.as_ref());
+                }
+                pg.insert_vma(new_vma.clone());
+            }
+            off += MMArch::PAGE_SIZE;
+        }
+
+        Ok(new_region.start())
     }
 
     /// 取消进程的地址空间中的映射
@@ -878,6 +1092,25 @@ impl InnerAddressSpace {
         Ok(())
     }
 
+    /// 取消与指定 inode 关联的文件映射的页表项，保留 VMA 以便后续访问触发缺页并按最新文件大小处理
+    pub fn zap_file_mappings(&mut self, inode_id: InodeId) -> Result<(), SystemError> {
+        let mut targets: Vec<Arc<LockedVMA>> = Vec::new();
+        for vma in self.mappings.iter_vmas() {
+            let guard = vma.lock_irqsave();
+            if let Some(file) = guard.vm_file() {
+                if file.inode().metadata()?.inode_id == inode_id {
+                    targets.push(vma.clone());
+                }
+            }
+        }
+
+        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+        for vma in targets {
+            vma.unmap(&mut self.user_mapper.utable, &mut flusher);
+        }
+        Ok(())
+    }
+
     /// 创建新的用户栈
     ///
     /// ## 参数
@@ -921,11 +1154,22 @@ impl InnerAddressSpace {
             return Err(SystemError::EFAULT);
         }
 
+        // 软限制：RLIMIT_DATA
+        let rlim = ProcessManager::current_pcb()
+            .get_rlimit(RLimitID::Data)
+            .rlim_cur as usize;
+        if rlim != usize::MAX {
+            let desired = new_brk.data().saturating_sub(self.brk_start.data());
+            if desired > rlim {
+                return Err(SystemError::ENOMEM);
+            }
+        }
+
         let old_brk = self.brk;
 
         if new_brk > self.brk {
             let len = new_brk - self.brk;
-            let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
+            let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
             let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
             self.map_anonymous(old_brk, len, prot_flags, map_flags, true, false)?;
 
@@ -958,6 +1202,16 @@ impl InnerAddressSpace {
         };
 
         let new_brk = VirtAddr::new(page_align_up(new_brk.data()));
+
+        let rlim = ProcessManager::current_pcb()
+            .get_rlimit(RLimitID::Data)
+            .rlim_cur as usize;
+        if rlim != usize::MAX {
+            let desired = new_brk.data().saturating_sub(self.brk_start.data());
+            if desired > rlim {
+                return Err(SystemError::ENOMEM);
+            }
+        }
 
         return self.set_brk(new_brk);
     }
@@ -1137,14 +1391,13 @@ impl UserMappings {
     /// @param size 请求的大小
     ///
     /// @return 如果找到了，返回虚拟内存范围，否则返回None
-    pub fn find_free(&self, min_vaddr: VirtAddr, size: usize) -> Option<VirtRegion> {
-        let _vaddr = min_vaddr;
+    pub fn find_free(&self, min_vaddr: VirtAddr, req_size: usize) -> Option<VirtRegion> {
         let mut iter = self
             .vm_holes
             .iter()
             .skip_while(|(hole_vaddr, hole_size)| hole_vaddr.add(**hole_size) <= min_vaddr);
 
-        let (hole_vaddr, size) = iter.find(|(hole_vaddr, hole_size)| {
+        let (hole_vaddr, _hole_size) = iter.find(|(hole_vaddr, hole_size)| {
             // 计算当前空洞的可用大小
             let available_size: usize =
                 if hole_vaddr <= &&min_vaddr && min_vaddr <= hole_vaddr.add(**hole_size) {
@@ -1153,11 +1406,11 @@ impl UserMappings {
                     **hole_size
                 };
 
-            size <= available_size
+            req_size <= available_size
         })?;
 
-        // 创建一个新的虚拟内存范围。
-        let region = VirtRegion::new(cmp::max(*hole_vaddr, min_vaddr), *size);
+        // 返回恰好等于请求大小的区域，起始地址取空洞与下限的较大值。
+        let region = VirtRegion::new(cmp::max(*hole_vaddr, min_vaddr), req_size);
 
         return Some(region);
     }
@@ -1429,7 +1682,7 @@ impl LockedVMA {
             let mut vma: VMA = unsafe { guard.clone() };
             vma.region = virt_region;
             vma.mapped = false;
-            // file_pgoff 保持不变，before VMA 使用原始的offset
+            // backing_pgoff 保持不变，before VMA 使用原始的offset
             let vma: Arc<LockedVMA> = LockedVMA::new(vma);
             vma
         });
@@ -1438,12 +1691,12 @@ impl LockedVMA {
             let mut vma: VMA = unsafe { guard.clone() };
             vma.region = virt_region;
             vma.mapped = false;
-            // after VMA 需要调整file_pgoff
+            // after VMA 需要调整backing_pgoff
             // after 区域的起始地址相对于原始VMA起始地址的偏移（以页为单位）
-            if let Some(original_pgoff) = vma.file_pgoff {
+            if let Some(original_pgoff) = vma.backing_pgoff {
                 let offset_pages =
                     (virt_region.start() - guard.region.start()) >> MMArch::PAGE_SHIFT;
-                vma.file_pgoff = Some(original_pgoff + offset_pages);
+                vma.backing_pgoff = Some(original_pgoff + offset_pages);
             }
             let vma: Arc<LockedVMA> = LockedVMA::new(vma);
             vma
@@ -1477,14 +1730,14 @@ impl LockedVMA {
             }
         }
 
-        // 调整middle VMA的region和file_pgoff
+        // 调整middle VMA的region和backing_pgoff
         let original_start = guard.region.start();
         guard.region = region;
-        // middle VMA 需要调整file_pgoff
+        // middle VMA 需要调整backing_pgoff
         // middle 区域的起始地址相对于原始VMA起始地址的偏移（以页为单位）
-        if let Some(original_pgoff) = guard.file_pgoff {
+        if let Some(original_pgoff) = guard.backing_pgoff {
             let offset_pages = (region.start() - original_start) >> MMArch::PAGE_SHIFT;
-            guard.file_pgoff = Some(original_pgoff + offset_pages);
+            guard.backing_pgoff = Some(original_pgoff + offset_pages);
         }
 
         return Some(VMASplitResult::new(
@@ -1583,8 +1836,8 @@ pub struct VMA {
     self_ref: Weak<LockedVMA>,
 
     vm_file: Option<Arc<File>>,
-    /// VMA映射的文件部分相对于整个文件的偏移页数
-    file_pgoff: Option<usize>,
+    /// VMA映射的后备对象(文件/共享匿名)相对于整个后备对象的偏移页数
+    backing_pgoff: Option<usize>,
 
     provider: Provider,
     /// 关联的 SysV SHM 标识（当此 VMA 来自 shmat 时设置）
@@ -1611,8 +1864,12 @@ pub enum Provider {
 #[derive(Debug)]
 pub struct AnonSharedMapping {
     pub id: u64,
-    // Per-page cache keyed by page index within the VMA; store weak to avoid leaking pages
-    pages: SpinLock<HashMap<usize, Weak<Page>>>,
+    /// Fixed backing size in pages, established at creation time.
+    /// Linux semantics: mremap() expanding a MAP_SHARED|MAP_ANONYMOUS mapping does not grow the
+    /// underlying shmem object; access beyond this size should SIGBUS.
+    size_pages: usize,
+    // Per-page cache keyed by page index within the backing object; store physical address.
+    pages: SpinLock<HashMap<usize, PhysAddr>>,
 }
 
 impl AnonSharedMapping {
@@ -1621,32 +1878,57 @@ impl AnonSharedMapping {
         return NEXT_ID.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn new() -> Arc<Self> {
+    pub fn new(size_pages: usize) -> Arc<Self> {
         Arc::new(Self {
             id: Self::new_id(),
+            size_pages,
             pages: SpinLock::new(HashMap::new()),
         })
+    }
+
+    #[inline(always)]
+    pub fn size_pages(&self) -> usize {
+        self.size_pages
     }
 
     /// Get or create a shared page for the given offset atomically.
     /// This prevents the double-allocation race when multiple processes fault the same page.
     pub fn get_or_create_page(&self, pgoff: usize) -> Result<Arc<Page>, SystemError> {
-        // Fast path: try upgrade an existing weak
-        {
-            let mut guard = self.pages.lock_irqsave();
-            if let Some(weak) = guard.get(&pgoff) {
-                if let Some(p) = weak.upgrade() {
-                    return Ok(p);
-                } else {
-                    guard.remove(&pgoff);
+        let mut guard = self.pages.lock_irqsave();
+        if let Some(paddr) = guard.get(&pgoff).copied() {
+            let mut pm = page_manager_lock_irqsave();
+            return Ok(pm.get_unwrap(&paddr));
+        }
+
+        // Allocate while holding the map lock to avoid duplicate creations.
+        let mut pm = page_manager_lock_irqsave();
+        let mut allocator = LockedFrameAllocator;
+        let page = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
+        // Mark shared-anon pages as unevictable so shrinking/unmapping doesn't drop their contents.
+        page.write_irqsave().add_flags(PageFlags::PG_UNEVICTABLE);
+        guard.insert(pgoff, page.phys_address());
+        Ok(page)
+    }
+}
+
+impl Drop for AnonSharedMapping {
+    fn drop(&mut self) {
+        // When the backing object is destroyed, allow cached pages to be freed.
+        let pages: alloc::vec::Vec<PhysAddr> = {
+            let guard = self.pages.lock_irqsave();
+            guard.values().copied().collect()
+        };
+
+        let mut pm = page_manager_lock_irqsave();
+        for paddr in pages {
+            if let Some(page) = pm.get(&paddr) {
+                let mut pg = page.write_irqsave();
+                pg.remove_flags(PageFlags::PG_UNEVICTABLE);
+                if pg.can_deallocate() {
+                    drop(pg);
+                    pm.remove_page(&paddr);
                 }
             }
-            // Slow path: allocate while holding the map lock to avoid duplicate creations
-            let mut pm = page_manager_lock_irqsave();
-            let mut allocator = LockedFrameAllocator;
-            let page = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
-            guard.insert(pgoff, Arc::downgrade(&page));
-            return Ok(page);
         }
     }
 }
@@ -1670,7 +1952,7 @@ impl VMA {
             self_ref: Weak::default(),
             provider: Provider::Allocated,
             vm_file: file,
-            file_pgoff: pgoff,
+            backing_pgoff: pgoff,
             shm_id: None,
             shared_anon: None,
         }
@@ -1727,7 +2009,7 @@ impl VMA {
             user_address_space: self.user_address_space.clone(),
             self_ref: self.self_ref.clone(),
             provider: Provider::Allocated,
-            file_pgoff: self.file_pgoff,
+            backing_pgoff: self.backing_pgoff,
             vm_file: self.vm_file.clone(),
             shm_id: self.shm_id,
             shared_anon: self.shared_anon.clone(),
@@ -1743,7 +2025,7 @@ impl VMA {
             user_address_space: None,
             self_ref: Weak::default(),
             provider: Provider::Allocated,
-            file_pgoff: self.file_pgoff,
+            backing_pgoff: self.backing_pgoff,
             vm_file: self.vm_file.clone(),
             shm_id: self.shm_id,
             shared_anon: self.shared_anon.clone(),
@@ -1756,8 +2038,8 @@ impl VMA {
     }
 
     #[inline(always)]
-    pub fn file_page_offset(&self) -> Option<usize> {
-        return self.file_pgoff;
+    pub fn backing_page_offset(&self) -> Option<usize> {
+        return self.backing_pgoff;
     }
 
     pub fn pages(&self) -> VirtPageFrameIter {
@@ -1944,9 +2226,9 @@ impl VMA {
     }
 
     pub fn page_address(&self, index: usize) -> Result<VirtAddr, SystemError> {
-        if index >= self.file_pgoff.unwrap() {
+        if index >= self.backing_pgoff.unwrap() {
             let address =
-                self.region.start + ((index - self.file_pgoff.unwrap()) << MMArch::PAGE_SHIFT);
+                self.region.start + ((index - self.backing_pgoff.unwrap()) << MMArch::PAGE_SHIFT);
             if address <= self.region.end() {
                 return Ok(address);
             }
@@ -2079,5 +2361,10 @@ impl UserStack {
     /// 设置当前用户栈的最大大小
     pub fn set_max_limit(&mut self, max_limit: usize) {
         self.max_limit = max_limit;
+    }
+
+    /// 获取当前用户栈的最大大小限制
+    pub fn max_limit(&self) -> usize {
+        self.max_limit
     }
 }

@@ -66,6 +66,11 @@ impl BoundInner {
             });
         } else {
             let iface = get_iface_to_bind(address, netns.clone()).ok_or(SystemError::ENODEV)?;
+            // log::debug!(
+            //     "BoundInner::bind: binding to iface {} for address {:?}",
+            //     iface.iface_name(),
+            //     address
+            // );
             let handle = iface.sockets().lock().add(socket);
             return Ok(Self {
                 handle,
@@ -73,6 +78,27 @@ impl BoundInner {
                 netns,
             });
         }
+    }
+
+    /// Bind a socket to a specific iface without selecting by address.
+    ///
+    /// This is useful for sockets that conceptually listen on all local addresses
+    /// (e.g., unbound raw sockets) but still need to be attached to an iface so
+    /// that packets can be delivered.
+    pub fn bind_on_iface<T>(
+        socket: T,
+        iface: Arc<dyn Iface>,
+        netns: Arc<NetNamespace>,
+    ) -> Result<Self, SystemError>
+    where
+        T: smoltcp::socket::AnySocket<'static>,
+    {
+        let handle = iface.sockets().lock().add(socket);
+        Ok(Self {
+            handle,
+            iface,
+            netns,
+        })
     }
 
     pub fn bind_ephemeral<T>(
@@ -133,15 +159,26 @@ pub fn get_iface_to_bind(
 ) -> Option<Arc<dyn Iface>> {
     // log::debug!("get_iface_to_bind: {:?}", ip_addr);
     // if ip_addr.is_unspecified()
-    netns
+    let result = netns
         .device_list()
         .iter()
         .find(|(_, iface)| {
             let guard = iface.smol_iface().lock();
-            // log::debug!("iface name: {}, ip: {:?}", iface.iface_name(), guard.ip_addrs());
+            // log::debug!(
+            //     "  checking iface: {}, ip: {:?}, has_addr={}",
+            //     iface.iface_name(),
+            //     guard.ip_addrs(),
+            //     guard.has_ip_addr(*ip_addr)
+            // );
             return guard.has_ip_addr(*ip_addr);
         })
-        .map(|(_, iface)| iface.clone())
+        .map(|(_, iface)| iface.clone());
+
+    // log::debug!(
+    //     "get_iface_to_bind: returning iface {:?}",
+    //     result.as_ref().map(|i| i.iface_name())
+    // );
+    result
 }
 
 /// Get a suitable iface to deal with sendto/connect request if the socket is not bound to an iface.

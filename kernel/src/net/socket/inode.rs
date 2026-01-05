@@ -1,25 +1,309 @@
 use crate::{
+    driver::net::Iface,
     filesystem::vfs::{
-        syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata, PollableInode,
+        fasync::FAsyncItem, file::File, FilePrivateData, FileType, IndexNode, InodeMode, Metadata,
+        PollableInode,
     },
     libs::spinlock::SpinLockGuard,
+    net::posix::SockAddrIn,
+    process::ProcessManager,
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 use super::Socket;
+use crate::net::socket::IFNAMSIZ;
+
+// Socket ioctl commands
+const SIOCGIFCONF: u32 = 0x8912; // Get interface list
+const SIOCGIFINDEX: u32 = 0x8933; // name -> if_index mapping
+const FIONREAD: u32 = 0x541B; // Get number of bytes available to read
+const TIOCOUTQ: u32 = 0x5411; // Get output queue size
+
+/// ## ifreq - Interface request structure
+/// Used for socket ioctls. Must match C struct layout.
+/// On Linux x86_64: sizeof(ifreq) = 40 bytes
+/// - ifr_name: 16 bytes (IFNAMSIZ)
+/// - ifr_ifru: 24 bytes (union, largest member is struct ifmap)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct IfReq {
+    ifr_name: [u8; IFNAMSIZ], // Interface name (16 bytes)
+    ifr_ifru: [u8; 24],       // Union for various data (24 bytes to match Linux)
+}
+
+impl Default for IfReq {
+    fn default() -> Self {
+        Self {
+            ifr_name: [0u8; IFNAMSIZ],
+            ifr_ifru: [0u8; 24],
+        }
+    }
+}
+
+impl IfReq {
+    /// Set the sockaddr_in in ifr_ifru
+    fn set_sockaddr_in(&mut self, addr: &SockAddrIn) {
+        // Copy sockaddr_in into the first 16 bytes of ifr_ifru
+        let addr_bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(addr as *const SockAddrIn as *const u8, 16) };
+        self.ifr_ifru[..16].copy_from_slice(addr_bytes);
+    }
+
+    fn name_str(&self) -> &str {
+        let end = self
+            .ifr_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(IFNAMSIZ);
+        core::str::from_utf8(&self.ifr_name[..end]).unwrap_or("")
+    }
+
+    fn set_ifindex(&mut self, ifindex: i32) {
+        self.ifr_ifru[..4].copy_from_slice(&ifindex.to_ne_bytes());
+    }
+}
+
+fn handle_siocgifindex(data: usize) -> Result<usize, SystemError> {
+    if data == 0 {
+        return Err(SystemError::EFAULT);
+    }
+
+    // Read ifreq from user space.
+    let user_reader =
+        UserBufferReader::new(data as *const IfReq, core::mem::size_of::<IfReq>(), true)?;
+    let mut ifreq: IfReq = user_reader.buffer_protected(0)?.read_one::<IfReq>(0)?;
+
+    let name = ifreq.name_str();
+    if name.is_empty() {
+        return Err(SystemError::ENODEV);
+    }
+
+    let netns = ProcessManager::current_netns();
+
+    // Prefer exact name match.
+    let mut ifindex: Option<i32> = netns.device_list().iter().find_map(|(_, iface)| {
+        if iface.iface_name() == name {
+            Some(iface.nic_id() as i32)
+        } else {
+            None
+        }
+    });
+
+    // Fallback for lo if not present in device_list (early init) but loopback is configured.
+    if ifindex.is_none() && name == "lo" {
+        if let Some(lo) = netns.loopback_iface() {
+            ifindex = Some(lo.nic_id() as i32);
+        }
+    }
+
+    let ifindex = ifindex.ok_or(SystemError::ENODEV)?;
+    ifreq.set_ifindex(ifindex);
+
+    // Write back.
+    let mut user_writer =
+        UserBufferWriter::new(data as *mut IfReq, core::mem::size_of::<IfReq>(), true)?;
+    user_writer.buffer_protected(0)?.write_one(0, &ifreq)?;
+
+    Ok(0)
+}
+
+/// ## ifconf - Interface configuration structure
+/// Used by SIOCGIFCONF. Must match C struct layout.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct IfConf {
+    ifc_len: i32,   // Size of buffer or number of bytes returned
+    ifc_buf: usize, // Pointer to buffer (union with ifc_req)
+}
+
+/// Handle SIOCGIFCONF ioctl
+/// This ioctl returns a list of interface (network layer) addresses.
+fn handle_siocgifconf(data: usize) -> Result<usize, SystemError> {
+    if data == 0 {
+        return Err(SystemError::EFAULT);
+    }
+
+    // Read ifconf structure from user space
+    let user_reader =
+        UserBufferReader::new(data as *const IfConf, core::mem::size_of::<IfConf>(), true)?;
+    let ifconf = user_reader.buffer_protected(0)?.read_one::<IfConf>(0)?;
+
+    let ifc_len = ifconf.ifc_len;
+    let ifc_buf = ifconf.ifc_buf;
+
+    // Get current network namespace and enumerate interfaces
+    let netns = ProcessManager::current_netns();
+    let device_list = netns.device_list();
+
+    // Calculate how many ifreq structures we can fit
+    let ifreq_size = core::mem::size_of::<IfReq>();
+
+    // Collect interface information
+    let mut ifreqs: Vec<IfReq> = Vec::new();
+
+    for (_, iface) in device_list.iter() {
+        // Get interface name
+        let iface_name = iface.iface_name();
+
+        // Get IPv4 address if available
+        if let Some(ipv4_addr) = iface.common().ipv4_addr() {
+            let mut ifreq = IfReq::default();
+
+            // Copy interface name
+            let name_bytes = iface_name.as_bytes();
+            let copy_len = core::cmp::min(name_bytes.len(), IFNAMSIZ - 1);
+            ifreq.ifr_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+            // Set up sockaddr_in for IPv4
+            let addr = SockAddrIn {
+                sin_family: 2, // AF_INET
+                sin_port: 0,
+                sin_addr: u32::from_ne_bytes(ipv4_addr.octets()),
+                sin_zero: [0u8; 8],
+            };
+            ifreq.set_sockaddr_in(&addr);
+
+            ifreqs.push(ifreq);
+        }
+    }
+
+    // Linux 语义：SIOCGIFCONF 至少应该能看到 lo（loopback）。
+    // 在 DragonOS 的某些启动/配置场景下，loopback 设备可能尚未被注册到 netns，
+    // 但用户态仍期望能通过该 ioctl 观察到 127.0.0.1。
+    let lo_name = "lo";
+    let already_added = ifreqs.iter().any(|req| {
+        // ifr_name 是以 NUL 结尾的 C 字符串。
+        let end = req
+            .ifr_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(IFNAMSIZ);
+        &req.ifr_name[..end] == lo_name.as_bytes()
+    });
+
+    if !already_added {
+        let ipv4_addr = netns
+            .loopback_iface()
+            .and_then(|lo| lo.as_ref().common().ipv4_addr())
+            .unwrap_or(core::net::Ipv4Addr::new(127, 0, 0, 1));
+
+        let mut ifreq = IfReq::default();
+        ifreq.ifr_name[..2].copy_from_slice(lo_name.as_bytes());
+
+        let addr = SockAddrIn {
+            sin_family: 2, // AF_INET
+            sin_port: 0,
+            sin_addr: u32::from_ne_bytes(ipv4_addr.octets()),
+            sin_zero: [0u8; 8],
+        };
+        ifreq.set_sockaddr_in(&addr);
+        ifreqs.push(ifreq);
+    }
+
+    // Move "lo" to the front if it exists (some tests expect loopback first)
+    if let Some(lo_idx) = ifreqs.iter().position(|req| {
+        let name_str = core::str::from_utf8(&req.ifr_name)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        name_str == "lo"
+    }) {
+        if lo_idx > 0 {
+            let lo_ifreq = ifreqs.remove(lo_idx);
+            ifreqs.insert(0, lo_ifreq);
+        }
+    }
+
+    // If ifc_buf is NULL (0), just return the total size needed
+    if ifc_buf == 0 {
+        let total_size = ifreqs.len() * ifreq_size;
+        // Write back the required size
+        let mut user_writer =
+            UserBufferWriter::new(data as *mut IfConf, core::mem::size_of::<IfConf>(), true)?;
+        let result_ifconf = IfConf {
+            ifc_len: total_size as i32,
+            ifc_buf: 0,
+        };
+        user_writer
+            .buffer_protected(0)?
+            .write_one(0, &result_ifconf)?;
+        return Ok(0);
+    }
+
+    // Calculate how many complete ifreq structures fit in the buffer
+    let max_ifreqs = if ifc_len >= 0 {
+        (ifc_len as usize) / ifreq_size
+    } else {
+        0
+    };
+
+    // Don't return partial ifreq structures
+    let num_to_copy = core::cmp::min(ifreqs.len(), max_ifreqs);
+    let bytes_to_copy = num_to_copy * ifreq_size;
+
+    // Validate the user buffer pointer before writing
+    // If the buffer pointer is invalid, return EFAULT
+    if num_to_copy > 0 {
+        // Try to create a user buffer writer to validate the pointer
+        let user_buf_writer_result = UserBufferWriter::new(ifc_buf as *mut u8, bytes_to_copy, true);
+        if user_buf_writer_result.is_err() {
+            return Err(SystemError::EFAULT);
+        }
+        let mut user_buf_writer = user_buf_writer_result.unwrap();
+
+        // Build a contiguous buffer with all ifreq structures
+        let mut all_data: Vec<u8> = Vec::with_capacity(bytes_to_copy);
+        for ifreq in ifreqs.iter().take(num_to_copy) {
+            let ifreq_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(ifreq as *const IfReq as *const u8, ifreq_size)
+            };
+            all_data.extend_from_slice(ifreq_bytes);
+        }
+
+        // Write all data at once
+        user_buf_writer
+            .buffer_protected(0)?
+            .write_to_user(0, &all_data)?;
+    }
+
+    // Write back the actual size returned
+    let mut user_writer =
+        UserBufferWriter::new(data as *mut IfConf, core::mem::size_of::<IfConf>(), true)?;
+    let result_ifconf = IfConf {
+        ifc_len: bytes_to_copy as i32,
+        ifc_buf,
+    };
+    user_writer
+        .buffer_protected(0)?
+        .write_one(0, &result_ifconf)?;
+
+    Ok(0)
+}
 
 impl<T: Socket + 'static> IndexNode for T {
     fn open(
         &self,
-        _: SpinLockGuard<FilePrivateData>,
-        _: &crate::filesystem::vfs::file::FileMode,
+        data: SpinLockGuard<FilePrivateData>,
+        _: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
-        Ok(())
+        match &*data {
+            FilePrivateData::SocketCreate => {
+                self.open_file_counter().fetch_add(1, Ordering::Release);
+                Ok(())
+            }
+            _ => Err(SystemError::ENXIO),
+        }
     }
 
     fn close(&self, _: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        self.do_close()
+        // Only tear down the socket on the final close.
+        if self.open_file_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.do_close()
+        } else {
+            Ok(())
+        }
     }
 
     fn read_at(
@@ -27,8 +311,12 @@ impl<T: Socket + 'static> IndexNode for T {
         _: usize,
         _: usize,
         buf: &mut [u8],
-        _: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        // Drop the lock guard before calling self.read() to avoid holding the lock
+        // across a potentially blocking or reentrant operation. This prevents deadlocks
+        // and preemption issues.
+        drop(data);
         self.read(buf)
     }
 
@@ -37,8 +325,16 @@ impl<T: Socket + 'static> IndexNode for T {
         _offset: usize,
         _len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        if buf.is_empty() {
+            log::debug!(
+                "Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}",
+                buf.len(),
+                _len
+            );
+        }
+        drop(data);
         self.write(buf)
     }
 
@@ -63,21 +359,54 @@ impl<T: Socket + 'static> IndexNode for T {
     }
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
-        Ok(Metadata::new(
-            FileType::Socket,
-            ModeType::from_bits_truncate(0o755),
-        ))
+        let mut md = Metadata::new(FileType::Socket, InodeMode::from_bits_truncate(0o755));
+        md.inode_id = self.socket_inode_id();
+        md.mode |= InodeMode::S_IFSOCK;
+        Ok(md)
     }
 
-    // TODO: implement ioctl for socket
+    /// 这里应该实现 通用 Socket 作为 IndexNode 的 ioctl 选项
+    /// 对于协议特定的 ioctl 选项实现，请在各个 Socket impl trait 内实现
+    ///
+    /// ## 层级结构
+    ///
+    /// `dyn IndexNode::ioctl` -> `impl IndexNode for T: Socket` -> `dyn Socket::ioctl`
+    ///
+    /// Socket trait 的 ioctl 覆盖了 IndexNode 这一层的调用，但由于 `impl IndexNode for T: Socket`，
+    /// 我们先调用在 IndexNode 这一层为 Socket 默认实现的 ioctl，再调用 `Socket` trait 内
+    /// 的 ioctl
     fn ioctl(
         &self,
-        _cmd: u32,
-        _data: usize,
+        cmd: u32,
+        data: usize,
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
-        log::warn!("Socket not support ioctl");
-        return Ok(0);
+        match cmd {
+            SIOCGIFCONF => handle_siocgifconf(data),
+            SIOCGIFINDEX => handle_siocgifindex(data),
+            FIONREAD /* TIOCINQ */ => {
+                // Get number of bytes available to read
+                let bytes_available = self.recv_bytes_available()?;
+                let mut writer =
+                    UserBufferWriter::new(data as *mut u8, core::mem::size_of::<i32>(), true)?;
+                let to_write = core::cmp::min(bytes_available, i32::MAX as usize) as i32;
+                writer.buffer_protected(0)?.write_one::<i32>(0, &to_write)?;
+                Ok(0)
+            }
+            TIOCOUTQ => {
+                // Get number of bytes available to write
+                let bytes_available = self.send_bytes_available()?;
+                let mut writer =
+                    UserBufferWriter::new(data as *mut u8, core::mem::size_of::<i32>(), true)?;
+                let to_write = core::cmp::min(bytes_available, i32::MAX as usize) as i32;
+                writer.buffer_protected(0)?.write_one::<i32>(0, &to_write)?;
+                Ok(0)
+            }
+            _ => {
+                // 透穿调用子协议栈的ioctl
+                Socket::ioctl(self, cmd, data, _private_data)
+            }
+        }
     }
 
     fn as_socket(&self) -> Option<&dyn Socket> {
@@ -106,5 +435,23 @@ impl<T: Socket + 'static> PollableInode for T {
     ) -> Result<(), SystemError> {
         let _ = self.epoll_items().remove(&epitm.epoll());
         return Ok(());
+    }
+
+    fn add_fasync(
+        &self,
+        fasync_item: Arc<FAsyncItem>,
+        _: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.fasync_items().add(fasync_item);
+        Ok(())
+    }
+
+    fn remove_fasync(
+        &self,
+        file: &alloc::sync::Weak<File>,
+        _: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        self.fasync_items().remove(file);
+        Ok(())
     }
 }

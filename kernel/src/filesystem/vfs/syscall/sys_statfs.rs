@@ -1,15 +1,15 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STATFS;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::syscall::open_utils;
-use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::syscall::PosixStatfs;
 use crate::filesystem::vfs::utils::user_path_at;
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use crate::syscall::user_access::UserBufferWriter;
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -25,20 +25,14 @@ impl Syscall for SysStatfsHandle {
         let path = Self::path(args);
         let user_statfs = Self::statfs(args);
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
-        let fd = open_utils::do_open(
-            path,
-            FileMode::O_RDONLY.bits(),
-            ModeType::empty().bits(),
-            true,
-        )?;
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))
+        let fd = open_utils::do_open(path, FileFlags::O_RDONLY.bits(), InodeMode::empty().bits())?;
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))
             .unwrap()
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         let pcb = ProcessManager::current_pcb();
-        let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
-        let root_inode = ProcessManager::current_mntns().root_inode();
-        let inode = root_inode.lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
+        let (inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
+        let inode = inode_begin.lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
         let statfs = PosixStatfs::from(inode.fs().super_block());
         writer.copy_one_to_user(&statfs, 0)?;
         return Ok(0);

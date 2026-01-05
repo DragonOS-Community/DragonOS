@@ -45,13 +45,13 @@
     "hash": "9a5c0ec57bae0576c30fbab60407f178"
   },
   "en:kernel/locking/index.rst": {
-    "hash": "299b0ccecf4ef174fffcce4731a98728"
+    "hash": "0e0e7cde9860a5e3b0cba2e026a06b51"
   },
   "en:kernel/sched/index.rst": {
-    "hash": "cb2834d1e7bde7924e059290a1399f62"
+    "hash": "261678cb50d23aa9879632de029f60ba"
   },
   "en:kernel/locking/locks.md": {
-    "hash": "5514ff361db4677d2b4fa522852aaeea"
+    "hash": "041e3ace893dcfcb2ecb85ddcc8b0d31"
   },
   "en:kernel/sched/cfs.md": {
     "hash": "7c89ba1c0416ec346f2982b3139cc819"
@@ -355,5 +355,8 @@
   },
   "en:kernel/locking/rwsem.md": {
     "hash": "f19bd3e7ace9536b7e5c49fb4a6163e1"
+  },
+  "en:kernel/sched/fifo.md": {
+    "hash": "7193f93fd9af38c8b7d2ad0ad9453ce5"
   }
 }

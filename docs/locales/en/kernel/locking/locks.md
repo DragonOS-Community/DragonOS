@@ -1,13 +1,13 @@
 :::{note}
 **AI Translation Notice**
 
-This document was automatically translated by `Qwen/Qwen3-8B` model, for reference only.
+This document was automatically translated by `hunyuan-turbos-latest` model, for reference only.
 
 - Source document: kernel/locking/locks.md
 
-- Translation time: 2025-05-19 01:41:26
+- Translation time: 2026-01-05 12:01:11
 
-- Translation model: `Qwen/Qwen3-8B`
+- Translation model: `hunyuan-turbos-latest`
 
 Please report issues via [Community Channel](https://github.com/DragonOS-Community/DragonOS/issues)
 
@@ -20,43 +20,44 @@ Please report issues via [Community Channel](https://github.com/DragonOS-Communi
 &emsp;&emsp;The DragonOS kernel implements several types of locks, which can be broadly categorized into two types:
 
 - Sleepable locks
-- Spin locks
+- Spinlocks
 
-## Types of Locks
+## Lock Types
 
 ### Sleepable Locks
 
-&emsp;&emsp;Sleepable locks can only be acquired in a context that is preemptible.
+&emsp;&emsp;Sleepable locks can only be acquired in preemptible contexts.
 
 &emsp;&emsp;In DragonOS, the following sleepable locks are implemented:
 
 - semaphore
+- rwsem
 - mutex_t
 
-### Spin Locks
+### Spinlocks
 
 - spinlock_t
 - {ref}`RawSpinLock <_spinlock_doc_rawspinlock>` (Rust version of spinlock_t, but incompatible with spinlock_t)
-- {ref}`SpinLock <_spinlock_doc_spinlock>` —— Built on top of RawSpinLock, it wraps a guard, binding the lock and the data it protects into a single structure. This allows for compile-time checks to prevent accessing data without holding the lock.
+- {ref}`SpinLock <_spinlock_doc_spinlock>` — Built on RawSpinLock, it encapsulates a Guard layer, binding the lock and the data it protects within a single structure, and prevents accessing data without locking at compile time.
 
-&emsp;&emsp;When a process acquires a spin lock, it changes the lock count in the PCB, thereby implicitly disabling preemption. To provide more flexible operations, spinlock also provides the following methods:
+&emsp;&emsp;When a process acquires a spinlock, it modifies the lock variable holding count in the PCB, thereby implicitly disabling preemption. For more flexible operations, spinlocks also provide the following methods:
 
-| Suffix                | Description                                             |
-|----------------------|--------------------------------------------------------|
-| _irq()               | Disable interrupts when acquiring the lock, enable them when releasing |
-| _irqsave()/_irqrestore() | Save the interrupt state when acquiring the lock, and restore it when releasing |
+| Suffix                     | Description                                                |
+| ------------------------ | --------------------------------------------------- |
+| _irq()                   | Disables interrupts when acquiring the lock / Enables interrupts when releasing the lock |
+| _irqsave()/_irqrestore() | Saves interrupt state and disables interrupts when acquiring the lock / Restores interrupt state when releasing the lock |
 
-## Detailed Introduction
+## Detailed Descriptions
 
-### Detailed Introduction to Spin Locks
+### Detailed Description of Spinlocks
 
-&emsp;&emsp;For a detailed introduction to spin locks, please refer to the document: {ref}`自旋锁 <_spinlock_doc>`
+&emsp;&emsp;For detailed information about spinlocks, please refer to the document: {ref}`自旋锁 <_spinlock_doc>`
 
 ### Semaphore
 
-&emsp;&emsp;A semaphore is implemented based on a counter.
+&emsp;&emsp;The semaphore is implemented based on counting.
 
-&emsp;&emsp;When the available resources are insufficient, a process attempting to perform a down operation on the semaphore will be put to sleep until the resources become available.
+&emsp;&emsp;When available resources are insufficient, a process attempting to perform a down operation on the semaphore will be put to sleep until resources become available.
 
 ### Mutex
 

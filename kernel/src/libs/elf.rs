@@ -18,7 +18,7 @@ use system_error::SystemError;
 use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
-    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    filesystem::vfs::{fcntl::AtFlags, open::do_open_execat},
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
@@ -352,11 +352,11 @@ impl ElfLoader {
         // });
         let mut head_buf = [0u8; 512];
         interp_elf_ex
-            .file_mut()
+            .file_ref()
             .lseek(SeekFrom::SeekSet(0))
             .map_err(|_| ExecError::NotSupported)?;
         let _bytes = interp_elf_ex
-            .file_mut()
+            .file_ref()
             .read(512, &mut head_buf)
             .map_err(|_| ExecError::NotSupported)?;
         let interp_hdr =
@@ -495,7 +495,7 @@ impl ElfLoader {
         offset_in_file: usize,
         param: &mut ExecParam,
     ) -> Result<(), SystemError> {
-        let file = param.file_mut();
+        let file = param.file_ref();
         if (file.metadata()?.size as usize) < offset_in_file + size {
             return Err(SystemError::ENOEXEC);
         }
@@ -643,7 +643,7 @@ impl ElfLoader {
         if ehdr.e_phoff == 0 {
             return Ok(None);
         }
-        let file = param.file_mut();
+        let file = param.file_ref();
         // If the number of segments is greater than or equal to PN_XNUM (0xffff),
         // e_phnum is set to PN_XNUM, and the actual number of program header table
         // entries is contained in the sh_info field of the section header at index 0.
@@ -775,7 +775,7 @@ impl BinaryLoader for ElfLoader {
             }
             let mut buffer = vec![0; seg.p_filesz.try_into().unwrap()];
             let r = param
-                .file_mut()
+                .file_ref()
                 .pread(
                     seg.p_offset.try_into().unwrap(),
                     seg.p_filesz.try_into().unwrap(),
@@ -798,25 +798,23 @@ impl BinaryLoader for ElfLoader {
                     e
                 ))
             })?;
-            let pwd = ProcessManager::current_pcb().pwd_inode();
-            let inode = pwd
-                .lookup_follow_symlink(interpreter_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+            // 使用 do_open_execat 打开解释器文件
+            let interpreter_file = do_open_execat(AtFlags::AT_FDCWD.bits(), interpreter_path)
                 .map_err(|e| {
                     // Linux 语义：动态链接器（解释器）路径不存在时，execve 需返回 ENOENT。
                     log::error!(
-                        "Failed to find interpreter path: {} (err={:?})",
+                        "Failed to open interpreter file: {} (err={:?})",
                         interpreter_path,
                         e
                     );
                     ExecError::SystemError(SystemError::ENOENT)
                 })?;
             // log::debug!("opening interpreter at :{}", interpreter_path);
-            interpreter = Some(
-                ExecParam::new(inode, param.vm().clone(), ExecParamFlags::EXEC).map_err(|e| {
-                    log::error!("Failed to load interpreter {interpreter_path}: {:?}", e);
-                    return ExecError::NotSupported;
-                })?,
-            );
+            interpreter = Some(ExecParam::new(
+                interpreter_file,
+                param.vm().clone(),
+                ExecParamFlags::EXEC,
+            ));
         }
         //TODO 缺少一部分逻辑 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#931
 
@@ -1048,12 +1046,6 @@ impl BinaryLoader for ElfLoader {
             _reloc_func_desc = elf_entry.data();
             //参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1269
             //TODO allow_write_access(interpreter);
-            ProcessManager::current_pcb()
-                .fd_table()
-                .write()
-                .alloc_fd(interpreter.file(), None)
-                .map(|fd| fd as usize)
-                .map_err(|_| ExecError::InvalidParemeter)?;
         }
         // debug!("to create auxv");
         let mut user_vm = binding.write();

@@ -48,7 +48,7 @@ impl Syscall for SysExecveAt {
             return Err(SystemError::ENOENT);
         }
 
-        let inode = if flags.contains(OpenFlags::AT_EMPTY_PATH) && path.is_empty() {
+        let resolved_path = if flags.contains(OpenFlags::AT_EMPTY_PATH) && path.is_empty() {
             let binding = ProcessManager::current_pcb().fd_table();
             let fd_table_guard = binding.read();
 
@@ -61,7 +61,10 @@ impl Syscall for SysExecveAt {
                 return Err(SystemError::EACCES);
             }
 
+            // 获取文件的绝对路径
             file.inode()
+                .absolute_path()
+                .map_err(|_| SystemError::ENOENT)?
         } else {
             let (inode_begin, path) =
                 user_path_at(&ProcessManager::current_pcb(), dirfd as _, &path)?;
@@ -85,10 +88,12 @@ impl Syscall for SysExecveAt {
                 // AT_SYMLINK_NOFOLLOW 未设置：跟随所有符号链接
                 inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
             };
-            inode
+
+            // 获取解析后的绝对路径
+            inode.absolute_path().unwrap_or(path)
         };
 
-        SysExecve::execve(inode, path, argv, envp, frame)?;
+        SysExecve::execve(&resolved_path, argv, envp, frame)?;
 
         Ok(0)
     }

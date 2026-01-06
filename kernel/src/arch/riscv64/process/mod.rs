@@ -16,7 +16,6 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
         fork::{CloneFlags, KernelCloneArgs},

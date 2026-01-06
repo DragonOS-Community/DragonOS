@@ -3,6 +3,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     driver::{
         base::device::{
@@ -18,7 +19,7 @@ use crate::{
         mount::{do_mount_mkdir, MountFlags},
         FileSystem, FileType, FsInfo, InodeMode, MountableFileSystem, SuperBlock, FSMAKER,
     },
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::spinlock::SpinLock,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -255,7 +256,7 @@ impl PtsDevInode {
 impl IndexNode for LockedDevPtsFSInode {
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -268,7 +269,7 @@ impl IndexNode for LockedDevPtsFSInode {
         return Ok(metadata);
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // TODO: 回收
         Ok(())
     }
@@ -278,7 +279,7 @@ impl IndexNode for LockedDevPtsFSInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         todo!()
     }
@@ -288,7 +289,7 @@ impl IndexNode for LockedDevPtsFSInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         todo!()
     }

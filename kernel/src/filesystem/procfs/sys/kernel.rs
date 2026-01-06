@@ -2,6 +2,7 @@
 //!
 //! 提供内核参数配置接口
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     debug::klog::loglevel::KERNEL_LOG_LEVEL,
     filesystem::{
@@ -11,7 +12,6 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
 };
 use alloc::{
     format,
@@ -113,7 +113,7 @@ impl FileOps for PrintkFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = Self::read_config();
         proc_read(offset, len, buf, content.as_bytes())
@@ -124,7 +124,7 @@ impl FileOps for PrintkFileOps {
         _offset: usize,
         _len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Self::write_config(buf)
     }

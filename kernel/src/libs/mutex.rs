@@ -9,12 +9,11 @@ use system_error::SystemError;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    libs::spinlock::SpinLockGuard,
     process::{ProcessControlBlock, ProcessManager, RawPid},
     sched::{schedule, SchedMode},
 };
 
-use super::spinlock::SpinLock;
+use super::spinlock::{SpinLock, SpinLockGuard};
 
 #[derive(Debug)]
 struct MutexInner {

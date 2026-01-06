@@ -19,16 +19,16 @@ use system_error::SystemError;
 use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch},
     exception::InterruptArch,
+    libs::mutex::MutexGuard,
     process::{ProcessControlBlock, ProcessManager, ProcessState},
     sched::{schedule, SchedMode},
-    time::timer::{next_n_us_timer_jiffies, Timer},
-    time::{Duration, Instant},
+    time::{
+        timer::{next_n_us_timer_jiffies, Timer},
+        Duration, Instant,
+    },
 };
 
-use super::{
-    mutex::MutexGuard,
-    spinlock::{SpinLock, SpinLockGuard},
-};
+use super::spinlock::{SpinLock, SpinLockGuard};
 
 #[derive(Debug)]
 struct InnerWaitQueue {

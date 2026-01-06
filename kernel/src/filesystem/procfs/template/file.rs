@@ -1,3 +1,4 @@
+use crate::libs::mutex::MutexGuard;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
@@ -7,7 +8,6 @@ use crate::{
             IndexNode, InodeFlags, InodeMode, Metadata,
         },
     },
-    libs::spinlock::SpinLockGuard,
     time::PosixTimeSpec,
 };
 use alloc::fmt::Debug;
@@ -82,7 +82,7 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// 向文件的指定偏移量写入数据（可选，默认返回 EPERM）
@@ -101,7 +101,7 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EPERM)
     }
@@ -121,7 +121,7 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // log::info!("ProcFile read_at called");
         self.inner.read_at(offset, len, buf, data)
@@ -132,7 +132,7 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         self.inner.write_at(offset, len, buf, data)
     }
@@ -147,7 +147,7 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
 
     fn open(
         &self,
-        mut data: SpinLockGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
@@ -155,7 +155,7 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         Ok(())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 }

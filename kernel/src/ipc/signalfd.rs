@@ -15,6 +15,7 @@ use crate::filesystem::vfs::{
     vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, InodeFlags,
     InodeMode, Magic, Metadata, PollableInode, SuperBlock,
 };
+use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::mm::MemoryManagementArch;
@@ -229,13 +230,13 @@ impl IndexNode for SignalFdInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
 
@@ -244,7 +245,7 @@ impl IndexNode for SignalFdInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data_guard: SpinLockGuard<FilePrivateData>,
+        data_guard: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 释放 FilePrivateData 锁，避免在阻塞时持有锁导致 panic
         drop(data_guard);
@@ -279,7 +280,7 @@ impl IndexNode for SignalFdInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EINVAL)
     }

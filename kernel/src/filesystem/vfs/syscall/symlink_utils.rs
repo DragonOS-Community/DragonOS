@@ -6,7 +6,7 @@ use crate::{
         utils::{rsplit_path, user_path_at},
         FilePrivateData, FileType, NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
-    libs::spinlock::SpinLock,
+    libs::mutex::Mutex,
     process::ProcessManager,
 };
 
@@ -57,7 +57,7 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
 
     let buf = from.as_bytes();
     let len = buf.len();
-    new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
+    new_inode.write_at(0, len, buf, Mutex::new(FilePrivateData::Unused).lock())?;
 
     return Ok(0);
 }

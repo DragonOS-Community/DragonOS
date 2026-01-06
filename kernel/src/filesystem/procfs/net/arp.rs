@@ -12,6 +12,7 @@ use crate::filesystem::{
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
 };
+use crate::libs::mutex::MutexGuard;
 use crate::net::neighbor;
 use alloc::string::ToString;
 use alloc::{string::String, sync::Arc, sync::Weak, vec::Vec};
@@ -80,7 +81,7 @@ impl FileOps for ArpFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = Self::generate_arp_content();
         proc_read(offset, len, buf, &content)

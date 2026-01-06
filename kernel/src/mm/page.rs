@@ -20,6 +20,7 @@ use crate::{
     filesystem::{page_cache::PageCache, vfs::FilePrivateData},
     init::initcall::INITCALL_CORE,
     libs::{
+        mutex::Mutex,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -437,7 +438,7 @@ impl PageReclaimer {
                             len,
                         )
                     },
-                    SpinLock::new(FilePrivateData::Unused).lock(),
+                    Mutex::new(FilePrivateData::Unused).lock(),
                 )
                 .unwrap();
         }

@@ -7,7 +7,8 @@ use crate::include::bindings::linux_bpf::{
     perf_event_header, perf_event_mmap_page, perf_event_type,
 };
 use crate::libs::align::page_align_up;
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::libs::mutex::MutexGuard;
+use crate::libs::spinlock::SpinLock;
 use crate::mm::allocator::page_frame::{PageFrameCount, PhysPageFrame};
 use crate::mm::page::{page_manager_lock_irqsave, PageFlags, PageType};
 use crate::mm::{MemoryManagementArch, PhysAddr};
@@ -293,7 +294,7 @@ impl IndexNode for BpfPerfEvent {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("PerfEventInode does not support read")
     }
@@ -303,7 +304,7 @@ impl IndexNode for BpfPerfEvent {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("PerfEventInode does not support write")
     }

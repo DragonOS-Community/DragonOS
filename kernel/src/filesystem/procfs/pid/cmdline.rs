@@ -2,6 +2,7 @@
 //!
 //! 返回进程的完整命令行，各参数之间以 \0 分隔
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
@@ -10,7 +11,6 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
     process::{ProcessManager, RawPid},
 };
 use alloc::sync::{Arc, Weak};
@@ -37,7 +37,7 @@ impl FileOps for CmdlineFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 查找进程
         let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;

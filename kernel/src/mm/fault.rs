@@ -239,13 +239,12 @@ impl PageFaultHandler {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let mapper = &mut pfm.mapper;
-
-        // 检查 VMA 是否有 VM_LOCKONFAULT 标志
-        let should_lock = vma.lock_irqsave().vm_flags().contains(VmFlags::VM_LOCKONFAULT);
-
+        let mut should_lock = false;
         // If this is an anonymous shared mapping, use a shared backing so pages are visible across fork
         {
             let guard = vma.lock_irqsave();
+            // 检查 VMA 是否有 VM_LOCKONFAULT 标志
+            should_lock = guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);
             if guard.vm_flags().contains(VmFlags::VM_SHARED) {
                 let shared = guard.shared_anon.clone();
                 if let Some(shared) = shared {

@@ -11,7 +11,7 @@ use crate::filesystem::vfs::MountFS;
 use crate::init::boot::boot_callbacks;
 use crate::init::initcall::INITCALL_ROOTFS;
 use crate::libs::decompress::xz_decompress;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::mutex::Mutex;
 use crate::process::namespace::propagation::MountPropagation;
 use cpio_reader::Mode;
 use system_error::SystemError;
@@ -177,7 +177,7 @@ pub fn initramfs_init() -> Result<(), SystemError> {
                     0,
                     entry.file.len(),
                     &entry.file,
-                    SpinLock::new(crate::filesystem::vfs::FilePrivateData::Unused).lock(),
+                    Mutex::new(crate::filesystem::vfs::FilePrivateData::Unused).lock(),
                 )?;
             }
             FileType::CharDevice => {
@@ -210,7 +210,7 @@ pub fn initramfs_init() -> Result<(), SystemError> {
             parent_inode.create_with_data(filename, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
         let buf = other_name.as_bytes();
         let len = buf.len();
-        new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
+        new_inode.write_at(0, len, buf, Mutex::new(FilePrivateData::Unused).lock())?;
     }
 
     // 下面的方式是查看外置 initramfs, 例如使用 qemu 的 -initrd 参数加载的

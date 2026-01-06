@@ -34,7 +34,7 @@ impl FileOps for CpuInfoFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mut data: Vec<u8> = vec![];
         let cpu_manager = smp_cpu_manager();

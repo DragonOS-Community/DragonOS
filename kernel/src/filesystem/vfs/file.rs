@@ -25,7 +25,7 @@ use crate::{
         vfs::FilldirContext,
     },
     ipc::{kill::send_signal_to_pid, pipe::PipeFsPrivateData},
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{mutex::Mutex, rwlock::RwLock, spinlock::SpinLock},
     mm::{
         page::PageFlags,
         readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
@@ -392,7 +392,7 @@ pub struct File {
     file_type: FileType,
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
     readdir_subdirs_name: SpinLock<Vec<String>>,
-    pub private_data: SpinLock<FilePrivateData>,
+    pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
     /// 文件描述符标志：是否在execve时关闭
@@ -569,7 +569,7 @@ impl File {
 
         let mut mode = FileMode::open_fmode(flags);
 
-        let private_data = SpinLock::new(private_data_init);
+        let private_data = Mutex::new(private_data_init);
         inode.open(private_data.lock(), &flags)?;
 
         // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
@@ -1130,7 +1130,7 @@ impl File {
             mode: RwLock::new(self.mode()),
             file_type: self.file_type,
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
-            private_data: SpinLock::new(self.private_data.lock().clone()),
+            private_data: Mutex::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
             close_on_exec: AtomicBool::new(self.close_on_exec.load(Ordering::SeqCst)),
             pid: SpinLock::new(None),

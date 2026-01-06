@@ -25,6 +25,7 @@ use crate::{
         vfs::{FilePrivateData, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata},
     },
     libs::{
+        mutex::{Mutex, MutexGuard},
         rwlock::RwLock,
         rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -1013,7 +1014,7 @@ impl IndexNode for LoopDevice {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len > buf.len() {
             return Err(SystemError::ENOBUFS);
@@ -1026,7 +1027,7 @@ impl IndexNode for LoopDevice {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len > buf.len() {
             return Err(SystemError::E2BIG);
@@ -1267,7 +1268,7 @@ impl BlockDevice for LoopDevice {
             return Err(SystemError::ENOSPC);
         }
 
-        let data = SpinLock::new(FilePrivateData::Unused);
+        let data = Mutex::new(FilePrivateData::Unused);
         let data_guard = data.lock();
 
         file_inode.read_at(file_offset, len, &mut buf[..len], data_guard)
@@ -1315,7 +1316,7 @@ impl BlockDevice for LoopDevice {
             return Err(SystemError::ENOSPC);
         }
 
-        let data = SpinLock::new(FilePrivateData::Unused);
+        let data = Mutex::new(FilePrivateData::Unused);
         let data_guard = data.lock();
 
         let written = file_inode.write_at(file_offset, len, &buf[..len], data_guard)?;

@@ -4,8 +4,8 @@ use crate::{
         FilePrivateData,
     },
     libs::{
+        mutex::{Mutex, MutexGuard},
         rbtree::RBTree,
-        spinlock::{SpinLock, SpinLockGuard},
         wait_queue::{TimeoutWaker, WaitQueue, Waiter},
     },
     process::ProcessManager,
@@ -42,7 +42,7 @@ pub struct EventPoll {
     pub(super) poll_epitems: LockedEPItemLinkedList,
     /// 是否已经关闭
     shutdown: AtomicBool,
-    self_ref: Option<Weak<SpinLock<EventPoll>>>,
+    self_ref: Option<Weak<Mutex<EventPoll>>>,
 }
 
 impl EventPoll {
@@ -120,12 +120,12 @@ impl EventPoll {
         )?;
 
         // 设置ep_file的FilePrivateData
-        ep_file.private_data = SpinLock::new(FilePrivateData::EPoll(EPollPrivateData { epoll }));
+        ep_file.private_data = Mutex::new(FilePrivateData::EPoll(EPollPrivateData { epoll }));
         Ok(ep_file)
     }
 
     fn do_create_epoll() -> LockedEventPoll {
-        let epoll = LockedEventPoll(Arc::new(SpinLock::new(EventPoll::new())));
+        let epoll = LockedEventPoll(Arc::new(Mutex::new(EventPoll::new())));
         epoll.0.lock().self_ref = Some(Arc::downgrade(&epoll.0));
         epoll
     }
@@ -210,13 +210,13 @@ impl EventPoll {
             let mut epoll_guard = {
                 if nonblock {
                     // 如果设置非阻塞，则尝试获取一次锁
-                    if let Ok(guard) = epoll_data.epoll.0.try_lock_irqsave() {
+                    if let Ok(guard) = epoll_data.epoll.0.try_lock() {
                         guard
                     } else {
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
                 } else {
-                    epoll_data.epoll.0.lock_irqsave()
+                    epoll_data.epoll.0.lock()
                 }
             };
 
@@ -352,7 +352,7 @@ impl EventPoll {
         if let Some(epoll_data) = epolldata {
             let epoll = epoll_data.epoll.clone();
 
-            let epoll_guard = epoll.0.lock_irqsave();
+            let epoll_guard = epoll.0.lock();
 
             let mut timeout = false;
             if let Some(timespec) = timespec {
@@ -385,7 +385,7 @@ impl EventPoll {
                     continue;
                 }
 
-                if epoll.0.lock_irqsave().shutdown.load(Ordering::SeqCst) {
+                if epoll.0.lock().shutdown.load(Ordering::SeqCst) {
                     // 如果已经关闭
                     return Err(SystemError::EBADF);
                 }
@@ -399,7 +399,7 @@ impl EventPoll {
                 available = {
                     let mut ret = false;
                     for _ in 0..50 {
-                        if let Ok(guard) = epoll.0.try_lock_irqsave() {
+                        if let Ok(guard) = epoll.0.try_lock() {
                             if guard.ep_events_available() {
                                 ret = true;
                                 break;
@@ -408,7 +408,7 @@ impl EventPoll {
                     }
                     // 最后再次不使用try_lock尝试
                     if !ret {
-                        ret = epoll.0.lock_irqsave().ep_events_available();
+                        ret = epoll.0.lock().ep_events_available();
                     }
                     ret
                 };
@@ -440,7 +440,7 @@ impl EventPoll {
                     timer = Some(inner);
                 }
                 {
-                    let guard = epoll.0.lock_irqsave();
+                    let guard = epoll.0.lock();
                     // 注册前再次检查，避免错过事件
                     if guard.ep_events_available() || guard.shutdown.load(Ordering::SeqCst) {
                         available = true;
@@ -467,7 +467,7 @@ impl EventPoll {
                 };
 
                 {
-                    let guard = epoll.0.lock_irqsave();
+                    let guard = epoll.0.lock();
                     guard.epoll_wq.remove_waker(&waker);
                     available = guard.ep_events_available();
                     if guard.shutdown.load(Ordering::SeqCst) {
@@ -505,7 +505,7 @@ impl EventPoll {
         if user_event.len() < max_events as usize {
             return Err(SystemError::EINVAL);
         }
-        let mut ep_guard = epoll.0.lock_irqsave();
+        let mut ep_guard = epoll.0.lock();
         let mut res: usize = 0;
 
         // 在水平触发模式下，需要将epitem再次加入队列，在下次循环再次判断是否还有事件
@@ -588,7 +588,7 @@ impl EventPoll {
     }
 
     fn ep_insert(
-        epoll_guard: &mut SpinLockGuard<EventPoll>,
+        epoll_guard: &mut MutexGuard<EventPoll>,
         dst_file: Arc<File>,
         epitem: Arc<EPollItem>,
     ) -> Result<(), SystemError> {
@@ -625,7 +625,7 @@ impl EventPoll {
     }
 
     pub fn ep_remove(
-        epoll: &mut SpinLockGuard<EventPoll>,
+        epoll: &mut MutexGuard<EventPoll>,
         fd: i32,
         dst_file: Option<Arc<File>>,
         epitem: &Arc<EPollItem>,
@@ -648,7 +648,7 @@ impl EventPoll {
     /// - epitem: 需要修改的描述符对应的epitem
     /// - event: 新的事件
     fn ep_modify(
-        epoll_guard: &mut SpinLockGuard<EventPoll>,
+        epoll_guard: &mut MutexGuard<EventPoll>,
         epitem: Arc<EPollItem>,
         event: &EPollEvent,
     ) -> Result<(), SystemError> {
@@ -732,7 +732,7 @@ impl EventPoll {
             }
 
             let child_items: Vec<Arc<EPollItem>> = {
-                let guard = cur.0.lock_irqsave();
+                let guard = cur.0.lock();
                 guard.ep_items.values().cloned().collect()
             };
 
@@ -759,8 +759,17 @@ impl EventPoll {
         epitems: &LockedEPItemLinkedList,
         pollflags: EPollEventType,
     ) -> Result<(), SystemError> {
-        let epitems_guard = epitems.try_lock_irqsave()?;
-        for epitem in epitems_guard.iter() {
+        // 避免持有 `epitems` 锁时再去获取 `epoll` 锁：
+        // 其他路径（如 epoll_ctl/注册回调）可能会以 `epoll -> epitems` 的顺序加锁，
+        // 若这里反过来会造成 ABBA 死锁。
+        //
+        // 解决方式：在 `epitems` 锁下复制一份快照，然后释放锁，再逐个处理。
+        let epitems_snapshot: Vec<Arc<EPollItem>> = {
+            let epitems_guard = epitems.lock();
+            epitems_guard.iter().cloned().collect()
+        };
+
+        for epitem in epitems_snapshot.iter() {
             // The upgrade is safe because EventPoll always exists when the epitem is in the list
             let epoll = epitem.epoll().upgrade();
             if epoll.is_none() {
@@ -768,7 +777,7 @@ impl EventPoll {
                 continue;
             }
             let epoll = epoll.unwrap();
-            let mut epoll_guard = epoll.try_lock()?;
+            let mut epoll_guard = epoll.lock();
             let binding = epitem.clone();
             let event_guard = binding.event().read();
             let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
@@ -805,16 +814,16 @@ impl EventPoll {
     }
 }
 
-pub type LockedEPItemLinkedList = SpinLock<LinkedList<Arc<EPollItem>>>;
+pub type LockedEPItemLinkedList = Mutex<LinkedList<Arc<EPollItem>>>;
 
 impl Default for LockedEPItemLinkedList {
     fn default() -> Self {
-        SpinLock::new(LinkedList::new())
+        Mutex::new(LinkedList::new())
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct LockedEventPoll(pub(super) Arc<SpinLock<EventPoll>>);
+pub struct LockedEventPoll(pub(super) Arc<Mutex<EventPoll>>);
 
 /// ### Epoll文件的私有信息
 #[derive(Debug, Clone)]

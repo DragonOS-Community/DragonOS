@@ -2,6 +2,7 @@
 //!
 //! 显示进程的详细状态信息
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
@@ -10,7 +11,6 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
     process::{ProcessManager, RawPid},
 };
 use alloc::{
@@ -169,7 +169,7 @@ impl FileOps for StatusFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = self.generate_status_content()?;
         // log::info!("Generated /proc/[pid]/status content");

@@ -2,6 +2,7 @@
 //!
 //! 这个文件展示了内核版本、编译信息等
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
@@ -56,7 +57,7 @@ impl FileOps for VersionFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = Self::generate_version_content();
         proc_read(offset, len, buf, &content)

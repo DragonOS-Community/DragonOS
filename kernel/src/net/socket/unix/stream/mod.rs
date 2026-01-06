@@ -1,11 +1,11 @@
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
+    libs::mutex::Mutex,
     libs::rwlock::RwLock,
     net::socket::{self, *},
 };
 use crate::{
-    libs::spinlock::SpinLock,
     libs::wait_queue::WaitQueue,
     net::{
         posix::MsgHdr,
@@ -94,14 +94,14 @@ pub struct UnixStreamSocket {
     netns: Arc<NetNamespace>,
     self_weak: Weak<UnixStreamSocket>,
     /// Peer socket for socket pairs (used for SIGIO notification)
-    peer: SpinLock<Option<Weak<UnixStreamSocket>>>,
+    peer: Mutex<Option<Weak<UnixStreamSocket>>>,
 
     is_nonblocking: AtomicBool,
     is_seqpacket: bool,
 
     passcred: AtomicBool,
 
-    linger: SpinLock<Linger>,
+    linger: Mutex<Linger>,
 
     /// Pending connection-reset to be reported on the next read/recv.
     /// Linux behavior: when a unix stream socket is closed with unread data in its
@@ -140,10 +140,10 @@ impl UnixStreamSocket {
             is_seqpacket,
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
-            peer: SpinLock::new(None),
+            peer: Mutex::new(None),
             passcred: AtomicBool::new(false),
 
-            linger: SpinLock::new(Linger::default()),
+            linger: Mutex::new(Linger::default()),
             connreset_pending: AtomicBool::new(false),
 
             sndbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
@@ -170,10 +170,10 @@ impl UnixStreamSocket {
             is_seqpacket,
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
-            peer: SpinLock::new(None),
+            peer: Mutex::new(None),
             passcred: AtomicBool::new(false),
 
-            linger: SpinLock::new(Linger::default()),
+            linger: Mutex::new(Linger::default()),
             connreset_pending: AtomicBool::new(false),
 
             sndbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),

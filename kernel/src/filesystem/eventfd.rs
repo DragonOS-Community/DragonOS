@@ -7,6 +7,7 @@ use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
     vfs::{FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock},
 };
+use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::mm::MemoryManagementArch;
@@ -175,13 +176,13 @@ impl IndexNode for EventFdInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
 
@@ -198,7 +199,7 @@ impl IndexNode for EventFdInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data_guard: SpinLockGuard<FilePrivateData>,
+        data_guard: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let data = data_guard.clone();
         drop(data_guard);
@@ -262,7 +263,7 @@ impl IndexNode for EventFdInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len < 8 {
             return Err(SystemError::EINVAL);

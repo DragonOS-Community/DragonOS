@@ -442,26 +442,26 @@ impl InnerAddressSpace {
     ///
     /// ## 参数
     ///
+    /// - `file`：要映射的文件（直接传入 File，而非通过 fd_table 查找）
     /// - `start_vaddr`：映射的起始地址
     /// - `len`：映射的长度
     /// - `prot_flags`：保护标志
     /// - `map_flags`：映射标志
-    /// - `fd`：文件描述符
     /// - `offset`：映射偏移量
     /// - `round_to_min`：是否将`start_vaddr`对齐到`mmap_min`，如果为`true`，则当`start_vaddr`不为0时，会对齐到`mmap_min`，否则仅向下对齐到页边界
-    /// - `allocate_at_once`：是否立即分配物理空间
+    /// - `allocate_at_once`：是否立即分配物理空间（文件映射通常应为按需缺页；此参数仅在禁用缺页机制时被强制为 true）
     ///
     /// ## 返回
     ///
     /// 返回映射的起始虚拟页帧
     #[allow(clippy::too_many_arguments)]
-    pub fn file_mapping(
+    pub fn file_mapping_with_file(
         &mut self,
+        file: Arc<File>,
         start_vaddr: VirtAddr,
         len: usize,
         prot_flags: ProtFlags,
         map_flags: MapFlags,
-        fd: i32,
         offset: usize,
         round_to_min: bool,
         allocate_at_once: bool,
@@ -475,7 +475,6 @@ impl InnerAddressSpace {
         let round_hint_to_min = |hint: VirtAddr| {
             // 先把hint向下对齐到页边界
             let addr = hint.data() & (!MMArch::PAGE_OFFSET_MASK);
-            // debug!("map_anonymous: hint = {:?}, addr = {addr:#x}", hint);
             // 如果hint不是0，且hint小于DEFAULT_MMAP_MIN_ADDR，则对齐到DEFAULT_MMAP_MIN_ADDR
             if (addr != 0) && round_to_min && (addr < DEFAULT_MMAP_MIN_ADDR) {
                 Some(VirtAddr::new(page_align_up(DEFAULT_MMAP_MIN_ADDR)))
@@ -485,24 +484,8 @@ impl InnerAddressSpace {
                 Some(VirtAddr::new(addr))
             }
         };
-        // debug!("map_anonymous: start_vaddr = {:?}", start_vaddr);
-        // debug!("map_anonymous: len(no align) = {}", len);
 
         let len = page_align_up(len);
-
-        // debug!("map_anonymous: len = {}", len);
-
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard.get_file_by_fd(fd);
-        if file.is_none() {
-            return Err(SystemError::EBADF);
-        }
-        // drop guard 以避免无法调度的问题
-        drop(fd_table_guard);
-
-        let file = file.unwrap();
 
         // 权限检查遵循 Linux 语义：
         // - O_PATH 直接返回 EBADF
@@ -571,6 +554,7 @@ impl InnerAddressSpace {
                 }
             },
         )?;
+
         // todo!(impl mmap for other file)
         // https://github.com/DragonOS-Community/DragonOS/pull/912#discussion_r1765334272
         // 传入实际映射后的起始虚拟地址，而非用户传入的 hint
@@ -589,6 +573,57 @@ impl InnerAddressSpace {
                 Err(e)
             }
         }
+    }
+
+    /// 进行文件页映射
+    ///
+    /// ## 参数
+    ///
+    /// - `start_vaddr`：映射的起始地址
+    /// - `len`：映射的长度
+    /// - `prot_flags`：保护标志
+    /// - `map_flags`：映射标志
+    /// - `fd`：文件描述符
+    /// - `offset`：映射偏移量
+    /// - `round_to_min`：是否将`start_vaddr`对齐到`mmap_min`，如果为`true`，则当`start_vaddr`不为0时，会对齐到`mmap_min`，否则仅向下对齐到页边界
+    /// - `allocate_at_once`：是否立即分配物理空间
+    ///
+    /// ## 返回
+    ///
+    /// 返回映射的起始虚拟页帧
+    #[allow(clippy::too_many_arguments)]
+    pub fn file_mapping(
+        &mut self,
+        start_vaddr: VirtAddr,
+        len: usize,
+        prot_flags: ProtFlags,
+        map_flags: MapFlags,
+        fd: i32,
+        offset: usize,
+        round_to_min: bool,
+        allocate_at_once: bool,
+    ) -> Result<VirtPageFrame, SystemError> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let file = fd_table_guard.get_file_by_fd(fd);
+        if file.is_none() {
+            return Err(SystemError::EBADF);
+        }
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+
+        let file = file.unwrap();
+        self.file_mapping_with_file(
+            file,
+            start_vaddr,
+            len,
+            prot_flags,
+            map_flags,
+            offset,
+            round_to_min,
+            allocate_at_once,
+        )
     }
 
     /// 向进程的地址空间映射页面

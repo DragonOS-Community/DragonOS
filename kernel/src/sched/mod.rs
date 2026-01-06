@@ -24,7 +24,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{interrupt::ipi::send_ipi, CurrentIrqArch},
+    arch::{cpu::current_cpu_id, interrupt::ipi::send_ipi, CurrentIrqArch},
     exception::{
         ipi::{IpiKind, IpiTarget},
         InterruptArch,
@@ -34,7 +34,10 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::percpu::{PerCpu, PerCpuVar},
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, SchedInfo},
+    process::{
+        preempt::PreemptGuard, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState,
+        SchedInfo,
+    },
     sched::idle::IdleScheduler,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     time::{clocksource::HZ, timer::clock},
@@ -1018,4 +1021,31 @@ pub fn sched_init() {
 #[inline]
 pub fn send_resched_ipi(cpu: ProcessorId) {
     send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu));
+}
+
+pub fn sched_yield() {
+    // 禁用中断
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+    let pcb = ProcessManager::current_pcb();
+    let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+    let (rq, guard) = rq.self_lock();
+
+    // TODO: schedstat_inc(rq->yld_count);
+
+    match pcb.sched_info().policy() {
+        SchedPolicy::CFS => CompletelyFairScheduler::yield_task(rq),
+        SchedPolicy::FIFO => FifoScheduler::yield_task(rq),
+        SchedPolicy::RT => rq.resched_current(),
+        SchedPolicy::IDLE => {}
+    }
+
+    let preempt_guard = PreemptGuard::new();
+
+    drop(guard);
+    drop(irq_guard);
+
+    drop(preempt_guard);
+
+    schedule(SchedMode::SM_NONE);
 }

@@ -1,18 +1,5 @@
 // Driver for Synopsys DesignWare Mobile Storage Host Controller
 
-use alloc::{
-    string::String,
-    string::ToString,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
-use core::{
-    any::Any,
-    cell::UnsafeCell,
-    fmt::Debug,
-    mem::{self, size_of},
-};
-
 use crate::arch::MMArch;
 use crate::driver::base::block::block_device::{BlockDevice, BlockId, GeneralBlockRange};
 use crate::driver::base::block::disk_info::Partition;
@@ -34,6 +21,7 @@ use crate::filesystem::{
     mbr::MbrDiskPartionTable,
     vfs::{IndexNode, InodeMode, Metadata},
 };
+use crate::libs::mutex::MutexGuard;
 use crate::libs::{
     rwlock::RwLock,
     rwsem::{RwSemReadGuard, RwSemWriteGuard},
@@ -42,6 +30,18 @@ use crate::libs::{
 use crate::mm::allocator::page_frame::PhysPageFrame;
 use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 use crate::mm::{MemoryManagementArch, PhysAddr};
+use alloc::{
+    string::String,
+    string::ToString,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::{
+    any::Any,
+    cell::UnsafeCell,
+    fmt::Debug,
+    mem::{self, size_of},
+};
 use log::{debug, info, warn};
 use system_error::SystemError;
 

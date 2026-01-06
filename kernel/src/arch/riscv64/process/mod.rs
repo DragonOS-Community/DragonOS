@@ -1,3 +1,4 @@
+use crate::libs::spinlock::SpinLockGuard;
 use alloc::sync::{Arc, Weak};
 use core::{
     arch::asm,

@@ -843,7 +843,7 @@ impl IndexNode for LockedPipeInode {
                         let mut info = SigInfo::new(
                             sig,
                             0,
-                            SigCode::Kernel,
+                            SigCode::Origin(OriginCode::Kernel),
                             SigType::Kill {
                                 pid: ProcessManager::current_pcb().task_pid_vnr(),
                                 uid: ProcessManager::current_pcb().cred().uid.data() as u32,

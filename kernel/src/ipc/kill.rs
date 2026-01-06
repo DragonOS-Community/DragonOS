@@ -103,7 +103,7 @@ pub fn send_signal_to_pgid(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, System
         let mut info = SigInfo::new(
             sig,
             0,
-            SigCode::User,
+            SigCode::Origin(OriginCode::User),
             SigType::Kill {
                 pid: sender_pid,
                 uid: sender_uid,

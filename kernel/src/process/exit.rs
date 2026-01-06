@@ -642,12 +642,12 @@ fn do_waitpid(
             // 而不是立即返回0。只有当子进程真正退出时才应该返回。
             return None;
         }
-        ProcessState::Stopped(stop_signal) => {
+        ProcessState::Stopped(stopsig) => {
             // todo: 在stopped里面，添加code字段，表示停止的原因
-            if stop_signal <= 0 || stop_signal >= Signal::SIGRTMAX.into() {
+            if stopsig <= 0 || stopsig >= Signal::SIGRTMAX.into() {
                 return Some(Err(SystemError::EINVAL));
             }
-            let stop_signal = stop_signal as i32;
+            let stopsig = stopsig as i32;
             let ptrace = child_pcb.is_traced();
             // 对于被跟踪的进程，总是报告停止状态，无论 WUNTRACED 是否设置
             // 对于非跟踪进程，只有在设置了 WUNTRACED 时才报告停止状态
@@ -657,12 +657,12 @@ fn do_waitpid(
                 return None;
             }
             if likely(!(kwo.options.contains(WaitOption::WNOWAIT))) {
-                kwo.ret_status = (stop_signal << 8) | 0x7f;
+                kwo.ret_status = (stopsig << 8) | 0x7f;
             }
             // if let Some(infop) = &mut kwo.ret_info {
             //     *infop = WaitIdInfo {
             //         pid: child_pcb.raw_pid(),
-            //         status: stop_signal,
+            //         status: stopsig,
             //         cause: SigChildCode::Stopped.into(),
             //     };
             // }

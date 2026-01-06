@@ -10,8 +10,11 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
-    ipc::signal_types::SigCode,
-    ipc::signal_types::SigactionType,
+    ipc::signal_types::{
+        OriginCode, SigCode, SigInfo, SigType, SigactionType, SignalFlags, SIG_KERNEL_IGNORE_MASK,
+        SIG_KERNEL_ONLY_MASK, SIG_KERNEL_STOP_MASK,
+    },
+    libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::{
         pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
@@ -176,8 +179,11 @@ impl Signal {
                     SigInfo::new(
                         *self,
                         0,
-                        SigCode::User,
-                        SigType::Kill(ProcessManager::current_pcb().raw_pid()),
+                        SigCode::Origin(OriginCode::User),
+                        SigType::Kill {
+                            pid: sender_pid,
+                            uid: sender_uid,
+                        },
                     )
                 }
             };

@@ -48,8 +48,9 @@ fn state_to_linux_char(state: ProcessState) -> char {
                 'D'
             }
         }
-        ProcessState::Stopped => 'T',
+        ProcessState::Stopped(_) => 'T',
         ProcessState::Exited(_) => 'Z',
+        _ => 'X',
     }
 }
 

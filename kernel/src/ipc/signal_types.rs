@@ -69,19 +69,17 @@ pub enum ChldCode {
 }
 
 impl SigCode {
-    /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
-    #[allow(dead_code)]
-    pub fn from_i32(x: i32) -> SigCode {
+    pub fn try_from_i32(x: i32) -> Option<SigCode> {
         match x {
-            0 => Self::User,
-            0x80 => Self::Kernel,
-            -1 => Self::Queue,
-            -2 => Self::Timer,
-            -3 => Self::Mesgq,
-            -4 => Self::AsyncIO,
-            -5 => Self::SigIO,
-            -6 => Self::Tkill,
-            _ => panic!("signal code not valid"),
+            0 => Some(Self::Origin(OriginCode::User)),
+            0x80 => Some(Self::Origin(OriginCode::Kernel)),
+            -1 => Some(Self::Origin(OriginCode::Queue)),
+            -2 => Some(Self::Origin(OriginCode::Timer)),
+            -3 => Some(Self::Origin(OriginCode::Mesgq)),
+            -4 => Some(Self::Origin(OriginCode::AsyncIO)),
+            -5 => Some(Self::Origin(OriginCode::SigIO)),
+            -6 => Some(Self::Origin(OriginCode::Tkill)),
+            _ => None,
         }
     }
 }
@@ -571,7 +569,7 @@ impl SigInfo {
             } => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
-                si_code:  i32::from(self.sig_code),
+                si_code: i32::from(self.sig_code),
                 _sifields: PosixSiginfoFields {
                     _timer: PosixSiginfoTimer {
                         si_tid: timerid,
@@ -622,9 +620,20 @@ pub enum SigType {
         sigval: PosixSigval,
     },
     Alarm(RawPid),
+    /// POSIX interval timer 发送的信号（SI_TIMER）。
+    /// - `timerid`: 对应用户态 `siginfo_t::si_timerid`
+    /// - `overrun`: 对应用户态 `siginfo_t::si_overrun`
+    /// - `sigval`: 对应用户态 `siginfo_t::si_value`
+    PosixTimer {
+        timerid: i32,
+        overrun: i32,
+        sigval: PosixSigval,
+    },
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
+    SigFault(SigFaultInfo),
+    SigChld(SigChldInfo),
     // SigPoll,
     // SigSys,
 }
@@ -685,7 +694,7 @@ impl SigPending {
         for info in self.queue.q.iter_mut() {
             // bump(0) 作为“匹配探测”，不会改变值
             if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
+                && info.sig_code() == SigCode::Origin(OriginCode::Timer)
                 && info.bump_posix_timer_overrun(timerid, 0)
             {
                 return true;
@@ -698,7 +707,7 @@ impl SigPending {
     pub fn posix_timer_bump_overrun(&mut self, sig: Signal, timerid: i32, bump: i32) -> bool {
         for info in self.queue.q.iter_mut() {
             if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
+                && info.sig_code() == SigCode::Origin(OriginCode::Timer)
                 && info.bump_posix_timer_overrun(timerid, bump)
             {
                 return true;
@@ -711,7 +720,7 @@ impl SigPending {
     pub fn posix_timer_reset_overrun(&mut self, sig: Signal, timerid: i32) -> bool {
         for info in self.queue.q.iter_mut() {
             if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
+                && info.sig_code() == SigCode::Origin(OriginCode::Timer)
                 && info.reset_posix_timer_overrun(timerid)
             {
                 return true;
@@ -763,8 +772,19 @@ impl SigPending {
             return info;
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
-            let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(RawPid::from(0)));
-            ret.set_sig_type(SigType::Kill(RawPid::new(0)));
+            let mut ret = SigInfo::new(
+                sig,
+                0,
+                SigCode::Origin(OriginCode::User),
+                SigType::Kill {
+                    pid: RawPid::new(0),
+                    uid: 0,
+                },
+            );
+            ret.set_sig_type(SigType::Kill {
+                pid: RawPid::new(0),
+                uid: 0,
+            });
             return ret;
         }
     }

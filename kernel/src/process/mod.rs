@@ -1,4 +1,5 @@
 use alloc::{
+    ffi::CString,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -7,17 +8,10 @@ use core::{
     fmt,
     hash::Hash,
     hint::spin_loop,
-    intrinsics::{likely, unlikely},
+    intrinsics::unlikely,
     mem::{ManuallyDrop, MaybeUninit},
     str::FromStr,
     sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
-};
-
-use alloc::{
-    ffi::CString,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-    vec::Vec,
 };
 use cred::INIT_CRED;
 use hashbrown::HashMap;

@@ -7,6 +7,7 @@ use crate::ipc::signal_types::{
     ChldCode, OriginCode, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType, Sigaction,
     SigactionType, SignalFlags,
 };
+use crate::process::pid::PidType;
 use crate::process::{
     ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, PtraceEvent, PtraceOptions,
     PtraceRequest, PtraceStopReason, PtraceSyscallInfo, PtraceSyscallInfoData,
@@ -63,7 +64,7 @@ pub fn ptrace_signal(
         .contains(injected_signal.into())
     {
         // 如果被阻塞了，则将信号重新排队，让它在未来被处理。
-        injected_signal.send_signal_info_to_pcb(info.as_mut(), Arc::clone(pcb));
+        injected_signal.send_signal_info_to_pcb(info.as_mut(), Arc::clone(pcb), PidType::PID);
         // 告诉 get_signal，当前没有需要立即处理的信号。
         return None;
     }
@@ -117,7 +118,7 @@ pub fn do_notify_parent(child: &ProcessControlBlock, signal: Signal) -> Result<b
                 stime: 0,  // 可以根据需要填充实际值
             }),
         );
-        sig.send_signal_info_to_pcb(Some(&mut info), parent)?;
+        sig.send_signal_info_to_pcb(Some(&mut info), parent, PidType::PID)?;
     }
     // 因为即使父进程忽略信号，也可能在 wait() 中阻塞，需要被唤醒以返回 -ECHILD
     child.wake_up_parent(None);
@@ -311,7 +312,11 @@ impl ProcessControlBlock {
                 SigCode::Origin(OriginCode::Kernel),
                 SigType::SigFault(SigFaultInfo { addr: 0, trapno: 0 }),
             );
-            let _ = sig.send_signal_info_to_pcb(Some(&mut info), self.self_ref.upgrade().unwrap());
+            let _ = sig.send_signal_info_to_pcb(
+                Some(&mut info),
+                self.self_ref.upgrade().unwrap(),
+                PidType::PID,
+            );
             // }
         }
         let wait_status = ((event as usize) << 8) | (Signal::SIGTRAP as usize);
@@ -383,7 +388,11 @@ impl ProcessControlBlock {
             }
         };
         if should_send {
-            Signal::SIGCHLD.send_signal_info_to_pcb(Some(&mut info), Arc::clone(tracer));
+            Signal::SIGCHLD.send_signal_info_to_pcb(
+                Some(&mut info),
+                Arc::clone(tracer),
+                PidType::PID,
+            );
         }
         tracer.wait_queue.wakeup(None);
     }
@@ -500,9 +509,11 @@ impl ProcessControlBlock {
             SigCode::Origin(OriginCode::Kernel),
             SigType::SigFault(SigFaultInfo { addr: 0, trapno: 0 }),
         );
-        if let Err(e) =
-            sig.send_signal_info_to_pcb(Some(&mut info), self.self_ref.upgrade().unwrap())
-        {
+        if let Err(e) = sig.send_signal_info_to_pcb(
+            Some(&mut info),
+            self.self_ref.upgrade().unwrap(),
+            PidType::PID,
+        ) {
             // 回滚ptrace设置
             self.flags().remove(ProcessFlags::PTRACED);
             let _ = self.ptrace_unlink()?;

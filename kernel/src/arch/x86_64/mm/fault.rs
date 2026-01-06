@@ -282,7 +282,10 @@ impl X86_64MMArch {
                 Signal::SIGSEGV,
                 0,
                 SigCode::Origin(OriginCode::User),
-                SigType::Kill(pid),
+                SigType::Kill {
+                    pid: ProcessManager::current_pid(),
+                    uid: ProcessManager::current_pcb().cred().uid.data() as u32,
+                },
             );
             Signal::SIGSEGV
                 .send_signal_info(Some(&mut info), pid)
@@ -472,7 +475,7 @@ impl X86_64MMArch {
             let mut info = SigInfo::new(
                 sig,
                 0,
-                SigCode::User,
+                SigCode::Origin(OriginCode::User),
                 SigType::Kill {
                     pid: ProcessManager::current_pid(),
                     uid: ProcessManager::current_pcb().cred().uid.data() as u32,

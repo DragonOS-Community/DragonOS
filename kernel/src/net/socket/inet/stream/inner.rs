@@ -806,11 +806,18 @@ impl Established {
                         (EPollEventType::EPOLLHUP | EPollEventType::EPOLLRDHUP).bits() as usize,
                         Ordering::Relaxed,
                     );
-                    // Clear EPOLLERR - closed is not an error condition
-                    pollee.fetch_and(
-                        !(EPollEventType::EPOLLERR).bits() as usize,
-                        Ordering::Relaxed,
-                    );
+
+                    if matches!(state, smoltcp::socket::tcp::State::Closed) {
+                        // Closed state usually implies RST or abnormal termination in this context
+                        pollee
+                            .fetch_or(EPollEventType::EPOLLERR.bits() as usize, Ordering::Relaxed);
+                    } else {
+                        // Clear EPOLLERR - closed is not an error condition (e.g. TimeWait)
+                        pollee.fetch_and(
+                            !(EPollEventType::EPOLLERR).bits() as usize,
+                            Ordering::Relaxed,
+                        );
+                    }
                 }
             })
     }

@@ -53,22 +53,24 @@ impl TcpSocket {
                         if !socket.can_recv() {
                             // Linux 语义：对端已关闭写端(收到 FIN)且本端已读完数据时，recv 返回 0。
                             // 如果状态表明已收到 FIN，即使 buffer 为空也应返回 0 (EOF)。
-                            let state = socket.state();
-                            if matches!(
-                                state,
-                                smoltcp::socket::tcp::State::CloseWait
-                                    | smoltcp::socket::tcp::State::LastAck
-                                    | smoltcp::socket::tcp::State::Closing
-                                    | smoltcp::socket::tcp::State::TimeWait
-                                    | smoltcp::socket::tcp::State::Closed
-                            ) {
-                                return Ok(0);
+                            // 如果是 RST 导致的关闭，则应返回 ECONNRESET。
+                            // 我们尝试调用 recv (不读取数据) 来检查状态。
+                            match socket.peek(0) {
+                                Ok(_) => {
+                                    // 理论上 !can_recv() 且 peek 成功（无错），说明 buffer 为空且连接正常 -> EAGAIN
+                                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                                }
+                                Err(smoltcp::socket::tcp::RecvError::Finished) => {
+                                    return Ok(0);
+                                }
+                                Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                                    if socket.state() == smoltcp::socket::tcp::State::TimeWait {
+                                        return Ok(0);
+                                    }
+                                    // 状态无效且未收到 FIN，通常意味着连接被重置 (RST)
+                                    return Err(SystemError::ECONNRESET);
+                                }
                             }
-
-                            if !socket.may_recv() {
-                                return Ok(0);
-                            }
-                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                         }
 
                         let current_buf = &mut buf[total_read..];
@@ -97,7 +99,10 @@ impl TcpSocket {
                                 }) {
                                     Ok(n) => n,
                                     Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                                        return Err(SystemError::ENOTCONN);
+                                        if socket.state() == smoltcp::socket::tcp::State::TimeWait {
+                                            return Ok(total);
+                                        }
+                                        return Err(SystemError::ECONNRESET);
                                     }
                                     Err(smoltcp::socket::tcp::RecvError::Finished) => {
                                         return Ok(total);
@@ -121,7 +126,7 @@ impl TcpSocket {
                             match socket.peek_slice(current_buf) {
                                 Ok(size) => Ok(size),
                                 Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                                    Err(SystemError::ENOTCONN)
+                                    Err(SystemError::ECONNRESET)
                                 }
                                 Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
                             }
@@ -147,7 +152,10 @@ impl TcpSocket {
                                 }) {
                                     Ok(n) => n,
                                     Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                                        return Err(SystemError::ENOTCONN);
+                                        if socket.state() == smoltcp::socket::tcp::State::TimeWait {
+                                            return Ok(total);
+                                        }
+                                        return Err(SystemError::ECONNRESET);
                                     }
                                     Err(smoltcp::socket::tcp::RecvError::Finished) => {
                                         // FIN 已到达。

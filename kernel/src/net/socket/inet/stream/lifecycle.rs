@@ -430,7 +430,18 @@ impl TcpSocket {
                 let local_port = es.get_name().port;
                 let iface = es.iface().clone();
                 let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                es.close();
+
+                // If there is unread data, we must send RST instead of FIN (RFC 2525).
+                // This prevents the peer from believing it received all data.
+                let has_unread = es.with(|s| s.recv_queue() > 0);
+                if has_unread {
+                    es.with_mut(|s| s.abort());
+                    // abort() changes state to Closed, but we must poll to send the RST packet immediately
+                    iface.poll();
+                } else {
+                    es.close();
+                }
+
                 iface.common().defer_tcp_close(handle, local_port, me);
                 writer.replace(inner::Inner::Established(es));
             }

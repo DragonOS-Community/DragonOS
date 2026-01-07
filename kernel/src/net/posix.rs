@@ -299,8 +299,23 @@ impl SockAddr {
 
                 let addr_in6 = reader.buffer_protected(0)?.read_one::<SockAddrIn6>(0)?;
 
-                let ip: smoltcp::wire::IpAddress =
-                    smoltcp::wire::IpAddress::Ipv6(core::net::Ipv6Addr::from(addr_in6.sin6_addr));
+                // Check for IPv4-mapped IPv6 address (::ffff:a.b.c.d)
+                // If found, convert to IPv4 address to support dual-stack sockets binding/connecting to IPv4 addresses
+                let ip: smoltcp::wire::IpAddress = if addr_in6.sin6_addr[0..10]
+                    .iter()
+                    .all(|&x| x == 0)
+                    && addr_in6.sin6_addr[10] == 0xff
+                    && addr_in6.sin6_addr[11] == 0xff
+                {
+                    smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(
+                        addr_in6.sin6_addr[12],
+                        addr_in6.sin6_addr[13],
+                        addr_in6.sin6_addr[14],
+                        addr_in6.sin6_addr[15],
+                    ))
+                } else {
+                    smoltcp::wire::IpAddress::Ipv6(core::net::Ipv6Addr::from(addr_in6.sin6_addr))
+                };
                 let port = u16::from_be(addr_in6.sin6_port);
                 return Ok(Endpoint::Ip(smoltcp::wire::IpEndpoint::new(ip, port)));
             }

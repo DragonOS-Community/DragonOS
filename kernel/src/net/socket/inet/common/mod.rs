@@ -42,9 +42,10 @@ impl BoundInner {
         T: smoltcp::socket::AnySocket<'static>,
     {
         if address.is_unspecified() {
-            let Some(iface) = netns.default_iface() else {
-                return Err(SystemError::ENODEV);
-            };
+            let iface = netns
+                .default_iface()
+                .or_else(|| netns.loopback_iface().map(|lb| lb as Arc<dyn Iface>))
+                .ok_or(SystemError::ENODEV)?;
             // 强绑VirtualIO
             // let iface = NET_DEVICES
             //     .read_irqsave()

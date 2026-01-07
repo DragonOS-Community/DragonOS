@@ -282,7 +282,7 @@
     "hash": "de9331f8d0bc5fe8c4705ad5807c9e8d"
   },
   "en:kernel/net/index.rst": {
-    "hash": "2b7f07b2896787800e902f9f4bb5d2e4"
+    "hash": "0fc2a21f93566c3d278452d330cb07f6"
   },
   "en:kernel/net/inet.md": {
     "hash": "549622e87eeafbeae8fed7f84aba5db9"
@@ -364,5 +364,8 @@
   },
   "en:kernel/interrupt/workqueue.md": {
     "hash": "930d4d0eefeb4c4f01ec2a93a2a1b9ad"
+  },
+  "en:kernel/net/napi_and_netns_poll.md": {
+    "hash": "04ae3378b43189a4e61226612f66f9ab"
   }
 }

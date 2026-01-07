@@ -1,6 +1,7 @@
 use crate::net::socket::common::ShutdownBit;
 use crate::net::socket::inet::InetSocket;
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 use super::inner;
@@ -248,6 +249,10 @@ impl TcpSocket {
             return Err(SystemError::EINVAL);
         }
 
+        if how.contains(ShutdownBit::SHUT_WR) {
+            let _ = self.flush_cork_buffer();
+        }
+
         let mut post_poll_iface: Option<Arc<dyn crate::net::Iface>> = None;
         let mut post_poll_rounds: usize = 0;
 
@@ -265,6 +270,12 @@ impl TcpSocket {
                 ) {
                     writer.replace(inner::Inner::Established(established));
                     return Err(SystemError::ENOTCONN);
+                }
+
+                if how.contains(ShutdownBit::SHUT_RD) {
+                    let queued = established.with(|socket| socket.recv_queue());
+                    self.recv_shutdown_limit.store(queued, Ordering::Relaxed);
+                    self.recv_shutdown_read.store(0, Ordering::Relaxed);
                 }
 
                 if how.contains(ShutdownBit::SHUT_WR) {
@@ -352,6 +363,11 @@ impl TcpSocket {
                 // - SHUT_WR: subsequent send() returns EPIPE; recv() returns EOF once queue drains.
                 // - SHUT_RD: subsequent recv() returns 0.
                 // No smoltcp close/abort is needed.
+                if how.contains(ShutdownBit::SHUT_RD) {
+                    let queued = sc.recv_queue();
+                    self.recv_shutdown_limit.store(queued, Ordering::Relaxed);
+                    self.recv_shutdown_read.store(0, Ordering::Relaxed);
+                }
                 (inner::Inner::SelfConnected(sc), how)
             }
             other => {

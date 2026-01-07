@@ -879,6 +879,10 @@ impl SelfConnected {
         self.buf.lock().len()
     }
 
+    pub fn discard_all(&self) {
+        self.buf.lock().clear();
+    }
+
     pub fn set_recv_buffer_size(&self, rx_size: usize) {
         self.rx_cap.store(rx_size, Ordering::Relaxed);
     }

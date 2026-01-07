@@ -17,11 +17,13 @@ impl TcpSocket {
         buf: &mut [u8],
         flags: PMSG,
     ) -> Result<usize, SystemError> {
-        if self.is_recv_shutdown() {
-            return Ok(0);
-        }
-
         let mut total_read = 0;
+        let recv_shutdown_limit = self
+            .recv_shutdown_limit
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let mut recv_shutdown_read = self
+            .recv_shutdown_read
+            .load(core::sync::atomic::Ordering::Relaxed);
 
         loop {
             // SelfConnected does not rely on protocol-stack progress; avoid calling iface.poll()
@@ -50,6 +52,25 @@ impl TcpSocket {
             {
                 inner::Inner::Established(established) => {
                     established.with_mut(|socket| {
+                        let mut current_buf = &mut buf[total_read..];
+                        let mut shutdown_remaining = None;
+                        if self.is_recv_shutdown() {
+                            let remaining = recv_shutdown_limit.saturating_sub(recv_shutdown_read);
+                            if remaining == 0 {
+                                while socket.can_recv() {
+                                    match socket.recv(|data| (data.len(), data.len())) {
+                                        Ok(0) => break,
+                                        Ok(_) => {}
+                                        Err(_) => break,
+                                    }
+                                }
+                                return Ok(0);
+                            }
+                            let cap = core::cmp::min(current_buf.len(), remaining);
+                            current_buf = &mut current_buf[..cap];
+                            shutdown_remaining = Some(remaining);
+                        }
+
                         if !socket.can_recv() {
                             // Linux 语义：对端已关闭写端(收到 FIN)且本端已读完数据时，recv 返回 0。
                             // 如果状态表明已收到 FIN，即使 buffer 为空也应返回 0 (EOF)。
@@ -72,8 +93,6 @@ impl TcpSocket {
                                 }
                             }
                         }
-
-                        let current_buf = &mut buf[total_read..];
 
                         // gVisor tcp_socket.cc MsgTrunc* tests: for TCP stream, MSG_TRUNC means
                         // "report the length but don't copy payload into userspace".
@@ -115,11 +134,27 @@ impl TcpSocket {
                                 total += got;
                             }
 
-                            return if total == 0 {
-                                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                            } else {
-                                Ok(total)
-                            };
+                            if total == 0 {
+                                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                            }
+                            if let Some(remaining) = shutdown_remaining {
+                                let new_read = recv_shutdown_read + total;
+                                recv_shutdown_read = core::cmp::min(new_read, recv_shutdown_limit);
+                                self.recv_shutdown_read.store(
+                                    recv_shutdown_read,
+                                    core::sync::atomic::Ordering::Relaxed,
+                                );
+                                if new_read >= remaining {
+                                    while socket.can_recv() {
+                                        match socket.recv(|data| (data.len(), data.len())) {
+                                            Ok(0) => break,
+                                            Ok(_) => {}
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(total);
                         }
 
                         if flags.contains(PMSG::PEEK) {
@@ -173,6 +208,24 @@ impl TcpSocket {
                             if total == 0 {
                                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                             } else {
+                                if let Some(remaining) = shutdown_remaining {
+                                    let new_read = recv_shutdown_read + total;
+                                    recv_shutdown_read =
+                                        core::cmp::min(new_read, recv_shutdown_limit);
+                                    self.recv_shutdown_read.store(
+                                        recv_shutdown_read,
+                                        core::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    if new_read >= remaining {
+                                        while socket.can_recv() {
+                                            match socket.recv(|data| (data.len(), data.len())) {
+                                                Ok(0) => break,
+                                                Ok(_) => {}
+                                                Err(_) => break,
+                                            }
+                                        }
+                                    }
+                                }
                                 Ok(total)
                             }
                         }
@@ -180,11 +233,30 @@ impl TcpSocket {
                 }
                 inner::Inner::SelfConnected(sc) => {
                     // Self-connect: data path is a local queue.
-                    let current_buf = &mut buf[total_read..];
+                    let mut current_buf = &mut buf[total_read..];
+                    if self.is_recv_shutdown() {
+                        let remaining = recv_shutdown_limit.saturating_sub(recv_shutdown_read);
+                        if remaining == 0 {
+                            sc.discard_all();
+                            return Ok(0);
+                        }
+                        let cap = core::cmp::min(current_buf.len(), remaining);
+                        current_buf = &mut current_buf[..cap];
+                    }
                     let peek = flags.contains(PMSG::PEEK);
                     let trunc = flags.contains(PMSG::TRUNC);
                     let send_shutdown = self.is_send_shutdown();
-                    sc.recv_into(current_buf, peek, trunc, send_shutdown)
+                    let n = sc.recv_into(current_buf, peek, trunc, send_shutdown)?;
+                    if self.is_recv_shutdown() && !peek {
+                        let new_read = recv_shutdown_read + n;
+                        recv_shutdown_read = core::cmp::min(new_read, recv_shutdown_limit);
+                        self.recv_shutdown_read
+                            .store(recv_shutdown_read, core::sync::atomic::Ordering::Relaxed);
+                        if new_read >= recv_shutdown_limit {
+                            sc.discard_all();
+                        }
+                    }
+                    Ok(n)
                 }
                 inner::Inner::Connecting(connecting) => {
                     if let Some(err) = connecting.failure_reason() {
@@ -266,6 +338,62 @@ impl TcpSocket {
         if self.is_send_shutdown() {
             return Err(SystemError::EPIPE);
         }
+        if self
+            .options
+            .tcp_cork
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            let mss = self
+                .tcp_max_seg()
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let cap = self
+                .send_buf_size()
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let mut cork_buf = self.cork_buf.lock();
+            let free = cap.saturating_sub(cork_buf.len());
+            if free == 0 {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            let n = core::cmp::min(free, buf.len());
+            cork_buf.extend_from_slice(&buf[..n]);
+            if cork_buf.len() >= mss {
+                drop(cork_buf);
+                if let Err(e) = self.flush_cork_buffer() {
+                    if e != SystemError::EAGAIN_OR_EWOULDBLOCK {
+                        return Err(e);
+                    }
+                }
+            }
+            return Ok(n);
+        }
+        self.try_send_direct(buf)
+    }
+
+    pub(crate) fn flush_cork_buffer(&self) -> Result<(), SystemError> {
+        loop {
+            let cork_buf = self.cork_buf.lock();
+            if cork_buf.is_empty() {
+                return Ok(());
+            }
+            let data = cork_buf.clone();
+            drop(cork_buf);
+
+            let to_send = data.len();
+            let sent = match self.try_send_direct(data.as_slice()) {
+                Ok(n) => n,
+                Err(e) => return Err(e),
+            };
+
+            if sent == 0 {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            let mut cork_buf = self.cork_buf.lock();
+            cork_buf.drain(..core::cmp::min(sent, to_send));
+        }
+    }
+
+    fn try_send_direct(&self, buf: &[u8]) -> Result<usize, SystemError> {
         // Self-connect fast path: avoid smoltcp and iface polling.
         {
             let inner_guard = self.inner.read();

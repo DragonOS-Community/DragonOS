@@ -150,7 +150,12 @@ impl Socket for TcpSocket {
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         if self.is_recv_shutdown() {
-            return Ok(0);
+            let limit = self
+                .recv_shutdown_limit
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if limit == 0 {
+                return Ok(0);
+            }
         }
 
         if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {

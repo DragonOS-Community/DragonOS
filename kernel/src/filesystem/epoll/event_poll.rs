@@ -613,14 +613,29 @@ impl EventPoll {
 
         epoll_guard.ep_items.insert(epitem.fd, epitem.clone());
 
-        // 检查文件是否已经有事件发生
+        // 先将 epitem 添加到目标文件的 epoll_items 中，这样之后的 notify/wakeup_epoll
+        // 才能找到并唤醒这个 epitem。
+        if let Err(e) = dst_file.add_epitem(epitem.clone()) {
+            // 如果添加失败，需要清理 ep_items 中已插入的项
+            epoll_guard.ep_items.remove(&epitem.fd);
+            return Err(e);
+        }
+
+        // 现在检查文件是否已经有事件发生。
+        // 注意：必须在 add_epitem 之后检查，以避免以下竞态条件：
+        // 1. ep_item_poll 检查事件（无事件）
+        // 2. socket 状态变化，notify/wakeup_epoll 被调用
+        // 3. 但此时 epitem 尚未加入 epoll_items，wakeup_epoll 找不到它
+        // 4. add_epitem 完成
+        // 5. poll 线程永远等不到唤醒
+        // 通过先 add_epitem 再 poll，即使 notify 在 poll 之前发生，
+        // 只要 poll 能检测到已发生的事件，就不会丢失。
         let event = epitem.ep_item_poll();
         if !event.is_empty() {
             epoll_guard.ep_add_ready(epitem.clone());
             epoll_guard.ep_wake_one();
         }
 
-        dst_file.add_epitem(epitem.clone())?;
         Ok(())
     }
 
@@ -771,42 +786,47 @@ impl EventPoll {
 
         for epitem in epitems_snapshot.iter() {
             // The upgrade is safe because EventPoll always exists when the epitem is in the list
-            let epoll = epitem.epoll().upgrade();
-            if epoll.is_none() {
+            let Some(epoll) = epitem.epoll().upgrade() else {
                 // 如果epoll已经被释放，则直接跳过
                 continue;
+            };
+
+            // 读取注册事件掩码（不持有 epoll 锁，避免扩大锁粒度）
+            let ep_events = {
+                let event_guard = epitem.event().read();
+                EPollEventType::from_bits_truncate(event_guard.events())
+            };
+
+            // 对齐 Linux 6.6 `ep_poll_callback()`：
+            // 1) 若该 epitem 不包含任何 poll(2) 事件（仅剩 EP_PRIVATE_BITS），视为“被禁用”（常见于 EPOLLONESHOT 被消费），
+            //    直到下一次 EPOLL_CTL_MOD 重新 arm。
+            // 2) 若驱动/文件系统传入了具体的 pollflags（非空），则必须与已注册的事件掩码匹配才入队。
+            //
+            // 参考：linux-6.6.21/fs/eventpoll.c: ep_poll_callback()
+            let enabled_mask = ep_events.difference(EPollEventType::EP_PRIVATE_BITS);
+            if enabled_mask.is_empty() && !pollflags.contains(EPollEventType::POLLFREE) {
+                continue;
             }
-            let epoll = epoll.unwrap();
+
+            if !pollflags.is_empty()
+                && !pollflags.contains(EPollEventType::POLLFREE)
+                && pollflags.intersection(ep_events).is_empty()
+            {
+                continue;
+            }
+
+            // TODO: 未处理pm相关
             let mut epoll_guard = epoll.lock();
-            let binding = epitem.clone();
-            let event_guard = binding.event().read();
-            let ep_events = EPollEventType::from_bits_truncate(event_guard.events());
-            // 只在发生“感兴趣”的事件时才入队并唤醒。
-            // 否则会出现：fd 的非关注事件（例如 socket 常驻可写 EPOLLOUT）触发 wakeup，
-            // 导致 epoll_wait 看到 ready_list 非空但实际 poll 结果为空，最终错误返回 0。
-            // Linux 语义：EPOLLERR/EPOLLHUP 会被始终报告，因此也需要触发唤醒。
-            let interested = ep_events.difference(EPollEventType::EP_PRIVATE_BITS);
-            let always_report = EPollEventType::EPOLLERR | EPollEventType::EPOLLHUP;
-            let is_relevant = pollflags.contains(EPollEventType::POLLFREE)
-                || !pollflags
-                    .intersection(interested | always_report)
-                    .is_empty();
-            if is_relevant {
-                // TODO: 未处理pm相关
+            epoll_guard.ep_add_ready(epitem.clone());
 
-                // 首先将就绪的epitem加入等待队列
-                epoll_guard.ep_add_ready(epitem.clone());
-
-                if epoll_guard.ep_has_waiter() {
-                    // log::info!("wakeup epoll waiters");
-                    if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
-                        && !pollflags.contains(EPollEventType::POLLFREE)
-                    {
-                        // 避免惊群
-                        epoll_guard.ep_wake_one();
-                    } else {
-                        epoll_guard.ep_wake_all();
-                    }
+            if epoll_guard.ep_has_waiter() {
+                if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
+                    && !pollflags.contains(EPollEventType::POLLFREE)
+                {
+                    // 避免惊群
+                    epoll_guard.ep_wake_one();
+                } else {
+                    epoll_guard.ep_wake_all();
                 }
             }
         }

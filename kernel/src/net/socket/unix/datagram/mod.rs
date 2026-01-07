@@ -670,8 +670,8 @@ impl Socket for UnixDatagramSocket {
         &self.open_files
     }
 
-    fn recv_bytes_available(&self) -> Result<usize, SystemError> {
-        Ok(self.ioctl_fionread())
+    fn recv_bytes_available(&self) -> usize {
+        self.ioctl_fionread()
     }
 
     fn send_bytes_available(&self) -> Result<usize, SystemError> {
@@ -1350,7 +1350,6 @@ impl Socket for UnixDatagramSocket {
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {
-        use crate::filesystem::epoll::EPollEventType;
         let mut events = EPollEventType::empty();
 
         let inner = self.inner.lock();

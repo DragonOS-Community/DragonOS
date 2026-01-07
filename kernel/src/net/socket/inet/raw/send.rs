@@ -7,7 +7,7 @@ use crate::net::posix::SockAddr;
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::unix::utils::{cmsg_align, Cmsghdr};
 use crate::net::socket::utils::IPV4_MIN_HEADER_LEN;
-use crate::net::socket::{PIP, PIPV6, PMSG, PSOL};
+use crate::net::socket::{IpOption, PIPV6, PMSG, PSOL};
 use crate::syscall::user_access::UserBufferReader;
 
 use super::inner::{self, RawInner};
@@ -365,12 +365,12 @@ impl RawSocket {
                 };
 
                 match (hdr.cmsg_level, hdr.cmsg_type) {
-                    (level, t) if level == PSOL::IP as i32 && t == PIP::TTL as i32 => {
+                    (level, t) if level == PSOL::IP as i32 && t == IpOption::TTL as i32 => {
                         if let Some(v) = read_i32(data) {
                             options.ip_ttl = v.clamp(0, 255) as u8;
                         }
                     }
-                    (level, t) if level == PSOL::IP as i32 && t == PIP::TOS as i32 => {
+                    (level, t) if level == PSOL::IP as i32 && t == IpOption::TOS as i32 => {
                         // gVisor 的 SendTOS 使用 uint8_t 作为 cmsg value。
                         if let Some(&v) = data.first() {
                             options.ip_tos = v;

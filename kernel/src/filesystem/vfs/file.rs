@@ -839,6 +839,10 @@ impl File {
         update_offset: bool,
     ) -> Result<usize, SystemError> {
         self.readable()?;
+        // Linux/POSIX: count==0 must not touch the buffer and must not block.
+        if len == 0 {
+            return Ok(0);
+        }
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }

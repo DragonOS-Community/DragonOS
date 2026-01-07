@@ -1,9 +1,9 @@
-use crate::arch::CurrentIrqArch;
 use crate::driver::net::bridge::BridgeDriver;
 use crate::driver::net::loopback::{generate_loopback_iface_default, LoopbackInterface};
-use crate::exception::InterruptArch;
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
+use crate::libs::wait_queue::WaitQueue;
 use crate::net::routing::Router;
 use crate::net::socket::netlink::table::{
     generate_supported_netlink_kernel_sockets, NetlinkKernelSocket, NetlinkSocketTable,
@@ -12,18 +12,18 @@ use crate::net::socket::unix::ns::UnixAbstractTable;
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
 use crate::process::namespace::{NamespaceOps, NamespaceType};
-use crate::process::{ProcessControlBlock, ProcessManager};
-use crate::sched::{schedule, SchedMode};
+use crate::process::ProcessManager;
+use crate::time::{Duration, Instant};
 use crate::{
+    driver::net::napi::napi_schedule,
     driver::net::Iface,
-    libs::spinlock::SpinLock,
     process::namespace::{nsproxy::NsCommon, user_namespace::UserNamespace},
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -41,9 +41,7 @@ pub static mut NETNS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 #[unified_init(INITCALL_SUBSYS)]
 pub fn root_net_namespace_init() -> Result<(), SystemError> {
     // 创建root网络命名空间的轮询线程
-    let pcb =
-        NetNamespace::create_polling_thread(INIT_NET_NAMESPACE.clone(), "root_netns".to_string());
-    INIT_NET_NAMESPACE.set_poll_thread(pcb);
+    NetNamespace::create_polling_thread(INIT_NET_NAMESPACE.clone(), "root_netns".to_string());
 
     // 创建 router
     let router = Router::new("root_netns_router".to_string());
@@ -65,12 +63,20 @@ pub struct NetNamespace {
     self_ref: Weak<NetNamespace>,
     _user_ns: Arc<UserNamespace>,
     inner: RwLock<InnerNetNamespace>,
-    /// # 负责当前网络命名空间网卡轮询的线程
-    net_poll_thread: SpinLock<Option<Arc<ProcessControlBlock>>>,
+    /// # 用于唤醒网络轮询线程的等待队列
+    /// 使用 WaitQueue 的 Waiter/Waker 机制避免唤醒丢失
+    poll_wait_queue: WaitQueue,
+    /// # 标记是否有待处理的网络事件
+    /// 用于避免唤醒丢失：当 poll 线程正在 poll 时收到的唤醒请求会设置此标志，
+    /// poll 线程在进入等待前会检查此标志
+    poll_pending: AtomicBool,
     /// # 当前网络命名空间下所有网络接口的列表
-    /// 这个列表在中断上下文会使用到，因此需要irqsave
-    /// 没有放在InnerNetNamespace里面，独立出来，方便管理
-    device_list: RwLock<BTreeMap<usize, Arc<dyn Iface>>>,
+    /// 该列表仅应在 **进程上下文** 使用（可睡眠），避免在 hardirq 上下文遍历/加锁。
+    /// hardirq 应仅做 `napi_schedule()`（见 `driver/net/irq_handle.rs`）。
+    ///
+    /// 注意：该结构会在 bind/connect 等路径被访问，且这些路径可能会获取可睡眠的 Mutex，
+    /// 因此这里使用可睡眠的 `RwSem`，避免自旋锁 + schedule 的组合导致崩溃。
+    device_list: RwSem<BTreeMap<usize, Arc<dyn Iface>>>,
     ///当前网络命名空间下的桥接设备列表
     bridge_list: RwLock<BTreeMap<String, Arc<BridgeDriver>>>,
 
@@ -123,8 +129,9 @@ impl NetNamespace {
             self_ref: self_ref.clone(),
             _user_ns: crate::process::namespace::user_namespace::INIT_USER_NAMESPACE.clone(),
             inner: RwLock::new(inner),
-            net_poll_thread: SpinLock::new(None),
-            device_list: RwLock::new(BTreeMap::new()),
+            poll_wait_queue: WaitQueue::default(),
+            poll_pending: AtomicBool::new(false),
+            device_list: RwSem::new(BTreeMap::new()),
             bridge_list: RwLock::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
@@ -154,13 +161,18 @@ impl NetNamespace {
             self_ref: self_ref.clone(),
             _user_ns: user_ns,
             inner: RwLock::new(inner),
-            net_poll_thread: SpinLock::new(None),
-            device_list: RwLock::new(BTreeMap::new()),
+            poll_wait_queue: WaitQueue::default(),
+            poll_pending: AtomicBool::new(false),
+            device_list: RwSem::new(BTreeMap::new()),
             bridge_list: RwLock::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
         });
+
+        // Linux 语义：每个 netns 都需要一个可被唤醒的轮询线程来推进协议栈。
+        // 否则像 lo 这样的设备在 Tx 后仅通过 wakeup_poll_thread() 触发下一次 poll，
+        // 若此处不记录 pcb，后续将无法唤醒，从而导致 TCP connect/accept 等卡死。
         Self::create_polling_thread(netns.clone(), format!("netns_{}", counter));
         netns.add_device(loopback);
 
@@ -179,11 +191,11 @@ impl NetNamespace {
         Self::new_empty(user_ns)
     }
 
-    pub fn device_list_mut(&self) -> RwLockWriteGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
+    pub fn device_list_mut(&self) -> RwSemWriteGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
         self.device_list.write()
     }
 
-    pub fn device_list(&self) -> RwLockReadGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
+    pub fn device_list(&self) -> RwSemReadGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
         self.device_list.read()
     }
 
@@ -250,54 +262,114 @@ impl NetNamespace {
     }
 
     /// # 拉起网络命名空间的轮询线程
+    /// 设置 poll_pending 标志并唤醒等待队列中的线程
+    /// 使用原子标志确保即使 poll 线程正在执行也不会丢失唤醒请求
     pub fn wakeup_poll_thread(&self) {
-        if self.net_poll_thread.lock().is_none() {
-            return;
+        // 先设置 pending 标志，再唤醒：避免“先唤后睡/睡前漏信号”。
+        let was_pending = self.poll_pending.swap(true, Ordering::AcqRel);
+        let woken = self.poll_wait_queue.wake_all();
+        // 事件驱动：对齐 Linux，尽量在事件发生后立刻 schedule NAPI（由 NAPI 线程 bounded poll 推进）。
+        // 只在从“未 pending -> pending”这一跳触发一次，避免中断风暴下重复 schedule。
+        if !was_pending {
+            for (_, iface) in self.device_list.read().iter() {
+                if let Some(napi) = iface.napi_struct() {
+                    napi_schedule(napi);
+                }
+            }
+            log::trace!("netns: wakeup_poll_thread: woken={}", woken);
         }
-        // log::info!("wakeup net_poll thread for namespace");
-        let _ = ProcessManager::wakeup(self.net_poll_thread.lock().as_ref().unwrap());
     }
 
     /// # 网络命名空间的轮询线程
-    /// 该线程会轮询当前命名空间下的所有网络接口
-    /// 并调用它们的poll方法
+    /// 该线程负责“调度网络推进”，对齐 Linux 的“事件驱动 + 定时器驱动”模型：
+    /// - 事件（IRQ/lo Tx 等）到来：唤醒本线程 -> schedule NAPI
+    /// - smoltcp 定时器到期（poll_at）：超时唤醒 -> schedule NAPI
+    ///
+    /// 注意：实际的协议栈推进工作由 NAPI 线程执行（bounded poll），避免本线程扫描+无界处理导致卡顿。
     /// 注意： 此方法仅可在初始化当前net namespace时创建进程使用
     fn polling(&self) {
-        // log::info!("net_poll thread started for namespace");
         loop {
-            for (_, iface) in self.device_list.read_irqsave().iter() {
-                iface.poll();
+            let now_us = Instant::now().total_micros() as u64;
+
+            // 处理“已到期的定时事件”：到期则 schedule NAPI 推进一次。
+            // 同时计算下一次最早到期时间点，用于设置 sleep 超时。
+            let mut next_us: Option<u64> = None;
+            let mut had_due = false;
+            for (_, iface) in self.device_list.read().iter() {
+                if let Some(us) = iface.common().poll_at_us() {
+                    if us <= now_us {
+                        had_due = true;
+                        if let Some(napi) = iface.napi_struct() {
+                            napi_schedule(napi);
+                        } else {
+                            // 兜底：若未配置 NAPI，则仍调用一次 poll 推进（可能无界）。
+                            let _ = iface.poll();
+                        }
+                        continue;
+                    }
+
+                    next_us = Some(match next_us {
+                        Some(cur) => core::cmp::min(cur, us),
+                        None => us,
+                    });
+                }
             }
 
-            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            ProcessManager::mark_sleep(true).expect("netns_poll_kthread:mark sleep failed");
-            drop(irq_guard);
-            // log::info!("net_poll thread going to sleep");
-            schedule(SchedMode::SM_NONE);
+            // sleep 超时：
+            // - 若刚处理了 due timer：小睡一会儿，避免在 NAPI 尚未推进/更新时间戳前重复 schedule 形成忙等
+            // - 否则按最早 deadline 精确睡眠
+            let timeout = if had_due {
+                Some(Duration::from_micros(200))
+            } else {
+                next_us.map(|us| {
+                    let delta = us.saturating_sub(now_us);
+                    Duration::from_micros(core::cmp::max(1, delta))
+                })
+            };
+
+            log::trace!(
+                "netns scheduler sleep: nsid={} timeout_us={:?}",
+                self.ns_common.nsid.data(),
+                timeout.map(|d| d.total_micros())
+            );
+
+            // 等待事件唤醒（IRQ/lo Tx 等）或 timeout（smoltcp timer deadline）。
+            // cond 使用 swap(false) 原子消费一次 pending，避免丢唤醒。
+            let woke_by_event = match self.poll_wait_queue.wait_event_uninterruptible_timeout(
+                || self.poll_pending.swap(false, Ordering::AcqRel),
+                timeout,
+            ) {
+                Ok(()) => true,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => false,
+                Err(e) => {
+                    log::warn!("netns scheduler sleep error: {:?}", e);
+                    false
+                }
+            };
+
+            if woke_by_event {
+                // 事件驱动：尽量只 schedule 一次即可，由 NAPI 线程以 bounded poll 推进。
+                for (_, iface) in self.device_list.read().iter() {
+                    if let Some(napi) = iface.napi_struct() {
+                        napi_schedule(napi);
+                    } else {
+                        let _ = iface.poll();
+                    }
+                }
+            }
         }
     }
 
-    fn create_polling_thread(netns: Arc<Self>, name: String) -> Arc<ProcessControlBlock> {
-        let pcb = {
-            let closure: Box<dyn Fn() -> i32 + Send + Sync> = Box::new(move || {
-                netns.polling();
-                0
-            });
-            KernelThreadClosure::EmptyClosure((closure, ()))
-        };
+    fn create_polling_thread(netns: Arc<Self>, name: String) {
+        let closure: Box<dyn Fn() -> i32 + Send + Sync> = Box::new(move || {
+            netns.polling();
+            0
+        });
+        let pcb = KernelThreadClosure::EmptyClosure((closure, ()));
 
-        let pcb = KernelThreadMechanism::create_and_run(pcb, name)
-            .ok_or("")
+        KernelThreadMechanism::create_and_run(pcb, name)
             .expect("create net_poll thread for net namespace failed");
         log::info!("net_poll thread created for namespace");
-        pcb
-    }
-
-    /// # 设置网络命名空间的轮询线程
-    /// 这个方法仅可在初始化网络命名空间时调用
-    fn set_poll_thread(&self, pcb: Arc<ProcessControlBlock>) {
-        let mut lock = self.net_poll_thread.lock();
-        *lock = Some(pcb);
     }
 }
 

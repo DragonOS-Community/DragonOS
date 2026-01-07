@@ -12,6 +12,8 @@ pub mod posix;
 pub mod routing;
 pub mod socket;
 pub mod syscall;
+pub mod tcp_close_defer;
+pub mod tcp_listener_backlog;
 
 /// 生成网络接口的id (全局自增)
 pub fn generate_iface_id() -> usize {

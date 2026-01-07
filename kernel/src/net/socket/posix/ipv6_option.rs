@@ -1,3 +1,5 @@
+use num_traits::FromPrimitive;
+
 /// SOL_IPV6 层选项 (include/uapi/linux/in6.h)
 ///
 /// 参考 Linux 6.6.21 `include/uapi/linux/in6.h`。
@@ -80,7 +82,6 @@ impl TryFrom<u32> for Ipv6Option {
     type Error = system_error::SystemError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        use num_traits::FromPrimitive;
         <Self as FromPrimitive>::from_u32(value).ok_or(system_error::SystemError::EINVAL)
     }
 }
@@ -109,7 +110,6 @@ impl TryFrom<u32> for Ipv6PmtuDiscover {
     type Error = system_error::SystemError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        use num_traits::FromPrimitive;
         <Self as FromPrimitive>::from_u32(value).ok_or(system_error::SystemError::EINVAL)
     }
 }

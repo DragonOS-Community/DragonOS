@@ -8,7 +8,7 @@ use super::constants::{
 };
 use super::options::DEFAULT_IP_TTL;
 use super::{Icmp6Filter, RawSocket};
-use crate::net::socket::{IFNAMSIZ, PIP, PIPV6, PRAW, PSO};
+use crate::net::socket::{IpOption, IFNAMSIZ, PIPV6, PRAW, PSO};
 
 fn sock_buf_u32_from_opt(val: &[u8]) -> Result<u32, SystemError> {
     if val.len() < 4 {
@@ -129,8 +129,8 @@ impl RawSocket {
         name: usize,
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
-        match PIP::try_from(name as u32) {
-            Ok(PIP::HDRINCL) => {
+        match IpOption::try_from(name as u32) {
+            Ok(IpOption::HDRINCL) => {
                 let v = if self.options.read().ip_hdrincl {
                     1i32
                 } else {
@@ -140,7 +140,7 @@ impl RawSocket {
                 value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
                 Ok(len)
             }
-            Ok(PIP::TOS) => {
+            Ok(IpOption::TOS) => {
                 if value.len() < 4 {
                     return Err(SystemError::EINVAL);
                 }
@@ -148,7 +148,7 @@ impl RawSocket {
                 value[..4].copy_from_slice(&v.to_ne_bytes());
                 Ok(4)
             }
-            Ok(PIP::TTL) => {
+            Ok(IpOption::TTL) => {
                 if value.len() < 4 {
                     return Err(SystemError::EINVAL);
                 }
@@ -156,7 +156,7 @@ impl RawSocket {
                 value[..4].copy_from_slice(&v.to_ne_bytes());
                 Ok(4)
             }
-            Ok(PIP::PKTINFO) => {
+            Ok(IpOption::PKTINFO) => {
                 let v = if self.options.read().recv_pktinfo_v4 {
                     1i32
                 } else {
@@ -166,7 +166,7 @@ impl RawSocket {
                 value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
                 Ok(len)
             }
-            Ok(PIP::RECVTTL) => {
+            Ok(IpOption::RECVTTL) => {
                 let v = if self.options.read().recv_ttl {
                     1i32
                 } else {
@@ -176,7 +176,7 @@ impl RawSocket {
                 value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
                 Ok(len)
             }
-            Ok(PIP::RECVTOS) => {
+            Ok(IpOption::RECVTOS) => {
                 let v = if self.options.read().recv_tos {
                     1i32
                 } else {
@@ -369,13 +369,13 @@ impl RawSocket {
     }
 
     pub(super) fn set_option_ip_level(&self, name: usize, val: &[u8]) -> Result<(), SystemError> {
-        match PIP::try_from(name as u32) {
-            Ok(PIP::HDRINCL) => {
+        match IpOption::try_from(name as u32) {
+            Ok(IpOption::HDRINCL) => {
                 let enable = val.first().copied().unwrap_or(0) != 0;
                 self.options.write().ip_hdrincl = enable;
                 Ok(())
             }
-            Ok(PIP::TOS) => {
+            Ok(IpOption::TOS) => {
                 let v = read_i32_opt(val).unwrap_or(val.first().copied().unwrap_or(0) as i32);
                 if !(0..=255).contains(&v) {
                     return Err(SystemError::EINVAL);
@@ -383,7 +383,7 @@ impl RawSocket {
                 self.options.write().ip_tos = v as u8;
                 Ok(())
             }
-            Ok(PIP::TTL) => {
+            Ok(IpOption::TTL) => {
                 let v = read_i32_opt(val)
                     .unwrap_or(val.first().copied().unwrap_or(DEFAULT_IP_TTL) as i32);
                 if !(0..=255).contains(&v) {
@@ -392,17 +392,17 @@ impl RawSocket {
                 self.options.write().ip_ttl = v as u8;
                 Ok(())
             }
-            Ok(PIP::PKTINFO) => {
+            Ok(IpOption::PKTINFO) => {
                 let enable = val.first().copied().unwrap_or(0) != 0;
                 self.options.write().recv_pktinfo_v4 = enable;
                 Ok(())
             }
-            Ok(PIP::RECVTTL) => {
+            Ok(IpOption::RECVTTL) => {
                 let enable = val.first().copied().unwrap_or(0) != 0;
                 self.options.write().recv_ttl = enable;
                 Ok(())
             }
-            Ok(PIP::RECVTOS) => {
+            Ok(IpOption::RECVTOS) => {
                 let enable = val.first().copied().unwrap_or(0) != 0;
                 self.options.write().recv_tos = enable;
                 Ok(())

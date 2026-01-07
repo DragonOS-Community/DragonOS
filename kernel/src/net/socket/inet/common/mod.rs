@@ -143,8 +143,17 @@ impl BoundInner {
         &self.iface
     }
 
+    #[inline]
+    pub fn handle(&self) -> smoltcp::iface::SocketHandle {
+        self.handle
+    }
+
     pub fn release(&self) {
         self.iface.sockets().lock().remove(self.handle);
+    }
+
+    pub fn into_socket(self) -> smoltcp::socket::Socket<'static> {
+        self.iface.sockets().lock().remove(self.handle)
     }
 
     pub fn netns(&self) -> Arc<NetNamespace> {
@@ -157,28 +166,11 @@ pub fn get_iface_to_bind(
     ip_addr: &smoltcp::wire::IpAddress,
     netns: Arc<NetNamespace>,
 ) -> Option<Arc<dyn Iface>> {
-    // log::debug!("get_iface_to_bind: {:?}", ip_addr);
-    // if ip_addr.is_unspecified()
-    let result = netns
+    netns
         .device_list()
         .iter()
-        .find(|(_, iface)| {
-            let guard = iface.smol_iface().lock();
-            // log::debug!(
-            //     "  checking iface: {}, ip: {:?}, has_addr={}",
-            //     iface.iface_name(),
-            //     guard.ip_addrs(),
-            //     guard.has_ip_addr(*ip_addr)
-            // );
-            return guard.has_ip_addr(*ip_addr);
-        })
-        .map(|(_, iface)| iface.clone());
-
-    // log::debug!(
-    //     "get_iface_to_bind: returning iface {:?}",
-    //     result.as_ref().map(|i| i.iface_name())
-    // );
-    result
+        .find(|(_, iface)| iface.smol_iface().lock().has_ip_addr(*ip_addr))
+        .map(|(_, iface)| iface.clone())
 }
 
 /// Get a suitable iface to deal with sendto/connect request if the socket is not bound to an iface.

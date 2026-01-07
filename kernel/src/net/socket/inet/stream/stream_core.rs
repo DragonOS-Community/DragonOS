@@ -1,9 +1,11 @@
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
 use system_error::SystemError;
 
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
+use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
@@ -46,6 +48,12 @@ pub struct TcpSocketOptions {
 
     /// SO_ATTACH_FILTER: whether a filter is attached.
     pub(crate) so_filter_attached: AtomicBool,
+    /// TCP_CORK
+    pub(crate) tcp_cork: AtomicBool,
+    /// TCP_QUICKACK
+    pub(crate) tcp_quickack: AtomicBool,
+    /// SO_KEEPALIVE
+    pub(crate) so_keepalive: AtomicBool,
 }
 
 impl TcpSocketOptions {
@@ -67,6 +75,9 @@ impl TcpSocketOptions {
             tcp_window_clamp: AtomicUsize::new(0),
             tcp_user_timeout: AtomicI32::new(0),
             so_filter_attached: AtomicBool::new(false),
+            tcp_cork: AtomicBool::new(false),
+            tcp_quickack: AtomicBool::new(true),
+            so_keepalive: AtomicBool::new(false),
         }
     }
 }
@@ -86,6 +97,9 @@ pub struct TcpSocket {
     pub(crate) epoll_items: EPollItems,
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
+    pub(crate) cork_buf: Mutex<Vec<u8>>,
+    pub(crate) recv_shutdown_limit: AtomicUsize,
+    pub(crate) recv_shutdown_read: AtomicUsize,
 }
 
 impl TcpSocket {
@@ -109,6 +123,9 @@ impl TcpSocket {
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),
+            cork_buf: Mutex::new(Vec::new()),
+            recv_shutdown_limit: AtomicUsize::new(0),
+            recv_shutdown_read: AtomicUsize::new(0),
         }
     }
 
@@ -243,6 +260,16 @@ impl TcpSocket {
     }
 
     #[inline]
+    pub(crate) fn tcp_quickack_enabled(&self) -> &AtomicBool {
+        &self.options.tcp_quickack
+    }
+
+    #[inline]
+    pub(crate) fn so_keepalive_enabled(&self) -> &AtomicBool {
+        &self.options.so_keepalive
+    }
+
+    #[inline]
     pub(crate) fn send_buf_size(&self) -> &AtomicUsize {
         &self.options.send_buf_size
     }
@@ -300,6 +327,14 @@ impl TcpSocket {
         let mut writer = self.inner.write();
         if let Some(inner) = writer.as_mut() {
             inner.for_each_socket_mut(|s| s.set_congestion_control(cc));
+        }
+    }
+
+    /// Applies keepalive setting to all applicable inner states.
+    pub(crate) fn apply_keepalive(&self, interval: Option<smoltcp::time::Duration>) {
+        let mut writer = self.inner.write();
+        if let Some(inner) = writer.as_mut() {
+            inner.for_each_socket_mut(|s| s.set_keep_alive(interval));
         }
     }
 

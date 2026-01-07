@@ -259,6 +259,18 @@ impl super::TcpSocket {
                     Err(SystemError::ENOENT)
                 }
             }
+            PSO::KEEPALIVE => {
+                let on = byte_parser::read_bool_flag(val)?;
+                self.so_keepalive_enabled()
+                    .store(on, core::sync::atomic::Ordering::Relaxed);
+                let interval = if on {
+                    Some(smoltcp::time::Duration::from_secs(7200))
+                } else {
+                    None
+                };
+                self.apply_keepalive(interval);
+                Ok(())
+            }
             _ => Ok(()), // Accept and ignore other SOL_SOCKET options
         }
     }
@@ -302,6 +314,22 @@ impl super::TcpSocket {
                 let on = byte_parser::read_bool_flag(val)?;
                 self.tcp_inq_enabled()
                     .store(on, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::QuickAck => {
+                let on = byte_parser::read_bool_flag(val)?;
+                self.tcp_quickack_enabled()
+                    .store(on, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::Cork => {
+                let on = byte_parser::read_bool_flag(val)?;
+                self.options
+                    .tcp_cork
+                    .store(on, core::sync::atomic::Ordering::Relaxed);
+                if !on {
+                    let _ = self.flush_cork_buffer();
+                }
                 Ok(())
             }
             Options::Congestion => {
@@ -405,6 +433,17 @@ impl super::TcpSocket {
                 };
                 Self::write_i32_opt(value, err)
             }
+            PSO::KEEPALIVE => {
+                let v: i32 = if self
+                    .so_keepalive_enabled()
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    1
+                } else {
+                    0
+                };
+                Self::write_i32_opt(value, v)
+            }
             _ => {
                 // Most SOL_SOCKET options are handled by sys_getsockopt directly.
                 Err(SystemError::ENOPROTOOPT)
@@ -440,6 +479,29 @@ impl super::TcpSocket {
             Options::INQ => {
                 let v: u32 = if self.inq_enabled() { 1 } else { 0 };
                 Self::write_u32_opt(value, v)
+            }
+            Options::QuickAck => {
+                let v: u32 = if self
+                    .tcp_quickack_enabled()
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    1
+                } else {
+                    0
+                };
+                Self::write_u32_opt(value, v)
+            }
+            Options::Cork => {
+                let v: i32 = if self
+                    .options
+                    .tcp_cork
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    1
+                } else {
+                    0
+                };
+                Self::write_i32_opt(value, v)
             }
             Options::Congestion => {
                 let cc_name = self

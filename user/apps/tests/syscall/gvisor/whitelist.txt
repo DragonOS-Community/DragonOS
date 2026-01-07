@@ -105,6 +105,7 @@ sigreturn_test
 sigtimedwait_test
 rtsignal_test
 signalfd_test
+sigstop_test
 
 # 其他测试
 itimer_test

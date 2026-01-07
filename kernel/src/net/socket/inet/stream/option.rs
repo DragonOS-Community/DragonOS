@@ -4,6 +4,7 @@
 //! at SOL_SOCKET, SOL_TCP, and SOL_IP levels.
 
 use num_traits::{FromPrimitive, ToPrimitive};
+use smoltcp;
 use system_error::SystemError;
 
 use super::constants;
@@ -108,6 +109,64 @@ impl PosixTcpInfo {
         let copy_len = core::cmp::min(value.len(), bytes.len());
         value[..copy_len].copy_from_slice(&bytes[..copy_len]);
         Ok(need)
+    }
+
+    /// Create a PosixTcpInfo from the inner socket state.
+    #[inline(never)]
+    fn from_inner(inner: &inner::Inner) -> Self {
+        match inner {
+            inner::Inner::Closed(_) => {
+                let mut info = PosixTcpInfo::default();
+                info.tcpi_state = constants::PosixTcpState::Close.to_u8().unwrap_or(0);
+                info
+            }
+            inner::Inner::SelfConnected(_) => {
+                let mut info = PosixTcpInfo::default();
+                info.tcpi_state = constants::PosixTcpState::Established.to_u8().unwrap_or(1);
+                info.tcpi_ca_state = constants::PosixTcpCaState::Open.to_u8().unwrap_or(0);
+                // Provide some reasonable defaults for self-connected sockets
+                info.tcpi_rto = 200_000;
+                info.tcpi_snd_cwnd = 10;
+                info
+            }
+            _ => inner.with_socket(|socket| {
+                let mut info = PosixTcpInfo::default();
+                // Populate info from socket
+                info.tcpi_state = constants::PosixTcpState::from(socket.state())
+                    .to_u8()
+                    .unwrap_or(0);
+
+                info.tcpi_ca_state = constants::PosixTcpCaState::Open.to_u8().unwrap_or(0);
+
+                info.tcpi_rto = socket.rto().total_micros() as u32;
+                info.tcpi_rtt = socket.rtt() * 1000; // ms to us
+                info.tcpi_rttvar = socket.rtt_var() * 1000; // ms to us
+
+                let mss = socket.remote_mss();
+                info.tcpi_snd_mss = mss as u32;
+                info.tcpi_rcv_mss = constants::DEFAULT_TCP_MSS as u32;
+
+                if mss > 0 {
+                    info.tcpi_snd_cwnd = (socket.cwnd() / mss) as u32;
+                    info.tcpi_snd_ssthresh = (socket.ssthresh() / mss) as u32;
+                } else {
+                    info.tcpi_snd_cwnd = socket.cwnd() as u32;
+                    info.tcpi_snd_ssthresh = socket.ssthresh() as u32;
+                }
+
+                info.tcpi_snd_wnd = socket.remote_win_len() as u32;
+
+                if let Some(last_ack) = socket.remote_last_ack() {
+                    let diff = socket.local_seq_no().0.wrapping_sub(last_ack.0);
+                    info.tcpi_unacked = if diff < 0 { 0 } else { diff as u32 };
+                }
+
+                info.tcpi_retrans = socket.retransmits() as u32;
+                info.tcpi_total_retrans = socket.retransmits() as u32;
+
+                info
+            }),
+        }
     }
 }
 
@@ -569,26 +628,10 @@ impl super::TcpSocket {
             Options::WindowClamp => Self::write_atomic_usize_as_u32(value, self.tcp_window_clamp()),
             Options::UserTimeout => Self::write_atomic_i32(value, self.tcp_user_timeout()),
             Options::Info => {
-                // Linux: getsockopt(SOL_TCP, TCP_INFO) always succeeds for TCP sockets and
-                // copies min(optlen, sizeof(struct tcp_info)) bytes.
-                //
-                // gVisor tests expect at least:
-                // - tcpi_ca_state == TCP_CA_Open (0)
-                // - tcpi_snd_cwnd > 0
-                // - tcpi_rto > 0
-                //
-                // We currently don't expose detailed smoltcp metrics here; provide a
-                // Linux-compatible struct with reasonable non-zero defaults.
-                let mut info = PosixTcpInfo::default();
-                // TCP_ESTABLISHED is 1 on Linux; it's fine to report 0 for non-established
-                // sockets, but most callers expect an established connection here.
-                info.tcpi_state = 1;
-                // TCP_CA_Open is 0 (Linux include/uapi/linux/tcp.h)
-                info.tcpi_ca_state = 0;
-                // RTO is in usec on Linux.
-                info.tcpi_rto = 200_000;
-                // A positive congestion window.
-                info.tcpi_snd_cwnd = 10;
+                let inner_guard = self.inner.read();
+                let inner = inner_guard.as_ref().ok_or(SystemError::ENOTCONN)?;
+
+                let info = PosixTcpInfo::from_inner(inner);
 
                 PosixTcpInfo::write_to_optbuf(&info, value)
             }

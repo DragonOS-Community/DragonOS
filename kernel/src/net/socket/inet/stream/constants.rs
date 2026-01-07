@@ -33,3 +33,50 @@ pub const SOCK_MIN_RCVBUF: usize = SOCK_MIN_BUFFER;
 
 /// 最大socket缓冲区大小（用于SO_SNDBUF/SO_RCVBUF的clamp上限）
 pub const MAX_SOCKET_BUFFER: usize = 10 * 1024 * 1024;
+
+// ========== TCP状态常量 - 参考Linux内核 include/net/tcp_states.h ==========
+use num_derive::ToPrimitive;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToPrimitive)]
+pub enum PosixTcpState {
+    Established = 1,
+    SynSent = 2,
+    SynRecv = 3,
+    FinWait1 = 4,
+    FinWait2 = 5,
+    TimeWait = 6,
+    Close = 7,
+    CloseWait = 8,
+    LastAck = 9,
+    Listen = 10,
+    Closing = 11,
+    NewSynRecv = 12,
+}
+
+impl From<smoltcp::socket::tcp::State> for PosixTcpState {
+    fn from(state: smoltcp::socket::tcp::State) -> Self {
+        match state {
+            smoltcp::socket::tcp::State::Closed => PosixTcpState::Close,
+            smoltcp::socket::tcp::State::Listen => PosixTcpState::Listen,
+            smoltcp::socket::tcp::State::SynSent => PosixTcpState::SynSent,
+            smoltcp::socket::tcp::State::SynReceived => PosixTcpState::SynRecv,
+            smoltcp::socket::tcp::State::Established => PosixTcpState::Established,
+            smoltcp::socket::tcp::State::FinWait1 => PosixTcpState::FinWait1,
+            smoltcp::socket::tcp::State::FinWait2 => PosixTcpState::FinWait2,
+            smoltcp::socket::tcp::State::CloseWait => PosixTcpState::CloseWait,
+            smoltcp::socket::tcp::State::Closing => PosixTcpState::Closing,
+            smoltcp::socket::tcp::State::LastAck => PosixTcpState::LastAck,
+            smoltcp::socket::tcp::State::TimeWait => PosixTcpState::TimeWait,
+        }
+    }
+}
+
+// ========== TCP拥塞控制状态 - 参考Linux内核 include/uapi/linux/tcp.h ==========
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToPrimitive)]
+pub enum PosixTcpCaState {
+    Open = 0,
+    Disorder = 1,
+    Cwr = 2,
+    Recovery = 3,
+    Loss = 4,
+}

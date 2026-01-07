@@ -95,6 +95,7 @@ socket_unix_unbound_stream_test
 raw_socket_test
 raw_socket_icmp_test
 raw_socket_hdrincl_test
+tcp_socket_test
 
 # 信号处理测试
 sigaction_test

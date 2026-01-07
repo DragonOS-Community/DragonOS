@@ -273,13 +273,12 @@ impl SockAddr {
 
                 let addr_in = reader.buffer_protected(0)?.read_one::<SockAddrIn>(0)?;
 
-                use smoltcp::wire;
-                let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bits(
-                    u32::from_be(addr_in.sin_addr),
-                ));
+                let ip: smoltcp::wire::IpAddress = smoltcp::wire::IpAddress::from(
+                    smoltcp::wire::Ipv4Address::from_bits(u32::from_be(addr_in.sin_addr)),
+                );
                 let port = u16::from_be(addr_in.sin_port);
 
-                return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
+                return Ok(Endpoint::Ip(smoltcp::wire::IpEndpoint::new(ip, port)));
             }
 
             AddressFamily::Unspecified => {
@@ -300,11 +299,10 @@ impl SockAddr {
 
                 let addr_in6 = reader.buffer_protected(0)?.read_one::<SockAddrIn6>(0)?;
 
-                use smoltcp::wire;
-                let ip: wire::IpAddress =
-                    wire::IpAddress::Ipv6(core::net::Ipv6Addr::from(addr_in6.sin6_addr));
+                let ip: smoltcp::wire::IpAddress =
+                    smoltcp::wire::IpAddress::Ipv6(core::net::Ipv6Addr::from(addr_in6.sin6_addr));
                 let port = u16::from_be(addr_in6.sin6_port);
-                return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
+                return Ok(Endpoint::Ip(smoltcp::wire::IpEndpoint::new(ip, port)));
             }
             AddressFamily::Unix => {
                 // 在这里并没有分配抽象地址或者创建文件系统节点，这里只是简单的获取，等到bind时再创建

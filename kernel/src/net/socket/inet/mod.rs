@@ -29,9 +29,9 @@ use super::Socket;
 /// According to the Linux man pages and the Linux implementation, `getsockname()` will _not_ fail
 /// even if the socket is unbound. Instead, it will return an unspecified socket address. This
 /// unspecified endpoint helps with that.
-const UNSPECIFIED_LOCAL_ENDPOINT_V4: IpEndpoint =
+pub const UNSPECIFIED_LOCAL_ENDPOINT_V4: IpEndpoint =
     IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0);
-const UNSPECIFIED_LOCAL_ENDPOINT_V6: IpEndpoint =
+pub const UNSPECIFIED_LOCAL_ENDPOINT_V6: IpEndpoint =
     IpEndpoint::new(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0);
 
 pub trait InetSocket: Socket {
@@ -40,8 +40,19 @@ pub trait InetSocket: Socket {
     fn on_iface_events(&self);
 
     fn notify(&self) {
-        // log::info!("InetSocket::notify");
         self.on_iface_events();
-        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
+
+        // Wake threads blocked on this socket (send/recv/connect/accept).
+        // Without this, only epoll waiters are woken and blocking syscalls can hang.
+        let _woken = self.wait_queue().wake_all();
+
+        let events = self.check_io_event();
+        if let Err(e) = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), events) {
+            log::warn!(
+                "InetSocket::notify: wakeup_epoll failed: {:?}, events={:?}",
+                e,
+                events
+            );
+        }
     }
 }

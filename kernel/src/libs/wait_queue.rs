@@ -223,6 +223,21 @@ impl WaitQueue {
         self.wait_event_with_timeout_impl(cond, None::<fn()>, true, timeout)
     }
 
+    /// 不可中断等待条件成立，支持可选超时。
+    ///
+    /// - `timeout == None`：无限等待，直到条件成立。
+    /// - `timeout == Some(d)`：超时返回 `EAGAIN_OR_EWOULDBLOCK`。
+    pub fn wait_event_uninterruptible_timeout<F>(
+        &self,
+        cond: F,
+        timeout: Option<Duration>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.wait_event_with_timeout_impl(cond, None::<fn()>, false, timeout)
+    }
+
     /// `wait_event_interruptible_timeout` 的扩展版本：提供 `before_sleep` 钩子。
     ///
     /// 典型用途：入队后、睡眠前释放锁（避免持锁睡眠）。

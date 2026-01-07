@@ -4,7 +4,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSOCKOPT;
 use crate::arch::MMArch;
 use crate::mm::MemoryManagementArch;
-use crate::net::socket;
+use crate::net::socket::inet::stream::TcpOption;
+use crate::net::socket::{PSO, PSOL};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
@@ -145,8 +146,6 @@ pub(super) fn do_getsockopt(
     let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
     let socket = socket_inode.as_socket().unwrap();
 
-    use socket::{PSO, PSOL};
-
     let level = PSOL::try_from(level as u32)?;
 
     if matches!(level, PSOL::SOCKET) {
@@ -223,14 +222,9 @@ pub(super) fn do_getsockopt(
     // protocol number of TCP.
 
     if matches!(level, PSOL::TCP) {
-        use socket::inet::stream::TcpOption;
-        let optname = TcpOption::try_from(optname as i32).map_err(|_| SystemError::ENOPROTOOPT)?;
-        match optname {
-            TcpOption::Congestion => return Ok(0),
-            _ => {
-                return Err(SystemError::ENOPROTOOPT);
-            }
-        }
+        let _optname = TcpOption::try_from(optname as i32).map_err(|_| SystemError::ENOPROTOOPT)?;
+        // TcpOption::Congestion => return Ok(0),
+        // Other TCP options are delegated to the socket implementation below.
     }
 
     // 其它 level（如 SOL_IP/SOL_IPV6/SOL_RAW 等）交给具体 socket 实现。

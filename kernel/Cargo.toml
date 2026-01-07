@@ -58,18 +58,21 @@ linkme = "=0.3.27"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev = "1597c1c", default-features = false }
-smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp", rev = "861e605", default-features = false, features = [
+smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp", rev = "a6576c0", default-features = false, features = [
     "alloc",
     "medium-ethernet",
     "socket-raw",
     "socket-udp",
     "socket-tcp",
+    "socket-tcp-reno",
+    "socket-tcp-cubic",
     "socket-icmp",
     "socket-dhcpv4",
     "socket-dns",
     "proto-ipv4",
     "proto-ipv6",
     "medium-ip",
+    "log"
 ] }
 syscall_table_macros = { path = "crates/syscall_table_macros" }
 system_error = { path = "crates/system_error" }

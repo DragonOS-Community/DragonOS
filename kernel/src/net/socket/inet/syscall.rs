@@ -17,7 +17,7 @@ pub fn create_inet_socket(
     match socket_type {
         PSOCK::Datagram => match protocol {
             IpProtocol::HopByHop | IpProtocol::Udp => {
-                return Ok(UdpSocket::new(is_nonblock));
+                return Ok(UdpSocket::new(is_nonblock, version));
             }
             _ => {
                 return Err(SystemError::EPROTONOSUPPORT);

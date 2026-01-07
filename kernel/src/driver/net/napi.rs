@@ -47,15 +47,13 @@ impl NapiStruct {
         // log::info!("NAPI instance {} polling", self.napi_id);
         // 获取网卡的强引用
         if let Some(iface) = self.net_device.upgrade() {
-            // 这里的weight原意是此次执行可以处理的包，如果超过了这个数就交给专门的内核线程(ksoftirqd)继续处理
-            // 但目前我们就是在相当于ksoftirqd里面处理，如果在weight之内发现没数据包被处理了，在直接返回
-            // 如果超过weight，返回true，表示还有工作没做完，会在下一次轮询继续处理
-            // 因此语义是相同的
-            for _ in 0..self.weight {
-                if !iface.poll() {
-                    return false;
-                }
-            }
+            // Linux NAPI 语义：每次 poll 处理有限工作量（budget/weight），避免无界处理导致 DoS/长时间关中断。
+            // smoltcp 的 Interface::poll() 会在一次调用内处理 device 队列中所有包，因此这里必须走 bounded poll。
+            //
+            // 返回值语义：
+            // - true：还有工作没做完（例如仍有 ingress 包未处理或需要立即继续 poll），保留在 poll_list 继续处理
+            // - false：本次已处理完，可 complete
+            return iface.poll_napi(self.weight);
         } else {
             log::error!(
                 "NAPI instance {}: associated net device is gone",
@@ -63,7 +61,7 @@ impl NapiStruct {
             );
         }
 
-        true
+        false
     }
 }
 

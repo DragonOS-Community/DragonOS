@@ -11,7 +11,7 @@ use crate::net::routing::RouterEnableDeviceCommon;
 use crate::net::socket::packet::PacketSocket;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{mutex::Mutex, rwlock::RwLock},
     net::socket::inet::{common::PortManager, InetSocket},
     process::ProcessState,
 };
@@ -22,7 +22,6 @@ pub mod bridge;
 pub mod class;
 mod dma;
 pub mod e1000e;
-pub mod irq_handle;
 pub mod loopback;
 pub mod napi;
 pub mod sysfs;
@@ -91,6 +90,31 @@ pub trait Iface: crate::driver::base::device::Device {
     /// - `false`：表示没有网络事件
     fn poll(&self) -> bool;
 
+    /// # `poll_napi`
+    /// NAPI（类似 Linux softirq/ksoftirqd）使用的 bounded poll。
+    ///
+    /// ## 返回值语义（对齐 NAPI）
+    /// - `true`：还有工作没做完（例如 ingress backlog 超过 budget），应继续留在 poll_list
+    /// - `false`：本次已处理完，可 complete
+    ///
+    /// 默认实现退化为一次普通 poll（兼容旧驱动）；具体网卡应覆盖实现以保证 bounded work。
+    #[inline]
+    fn poll_napi(&self, _budget: usize) -> bool {
+        self.poll()
+    }
+
+    /// # `should_drop_rx_packet`
+    /// 驱动收包入口可选调用：询问“上层(协议栈/Socket 语义)”是否需要丢弃该包。
+    ///
+    /// 说明：
+    /// - 默认不丢弃；
+    /// - 驱动层不应理解 TCP/UDP 等协议语义，这个 hook 用于实现 Linux 兼容语义（如 backlog 满丢 SYN）
+    ///   且不修改 smoltcp。
+    #[inline]
+    fn should_drop_rx_packet(&self, _packet: &[u8]) -> bool {
+        false
+    }
+
     /// # `update_ip_addrs`
     /// 用于更新接口的 IP 地址
     /// ## 参数
@@ -103,14 +127,14 @@ pub trait Iface: crate::driver::base::device::Device {
 
     /// @brief 获取smoltcp的网卡接口类型
     #[inline(always)]
-    fn smol_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
+    fn smol_iface(&self) -> &Mutex<smoltcp::iface::Interface> {
         &self.common().smol_iface
     }
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
 
     /// # `sockets`
     /// 获取网卡的套接字集
-    fn sockets(&self) -> &SpinLock<smoltcp::iface::SocketSet<'static>> {
+    fn sockets(&self) -> &Mutex<smoltcp::iface::SocketSet<'static>> {
         &self.common().sockets
     }
 
@@ -201,15 +225,15 @@ pub struct IfaceCommon {
     iface_id: usize,
     flags: InterfaceFlags,
     type_: InterfaceType,
-    smol_iface: SpinLock<smoltcp::iface::Interface>,
+    smol_iface: Mutex<smoltcp::iface::Interface>,
     /// 存smoltcp网卡的套接字集
-    sockets: SpinLock<smoltcp::iface::SocketSet<'static>>,
+    sockets: Mutex<smoltcp::iface::SocketSet<'static>>,
     /// 存 kernel wrap smoltcp socket 的集合
     bounds: RwLock<Vec<Arc<dyn InetSocket>>>,
     /// 端口管理器
     port_manager: PortManager,
-    /// 下次轮询的时间
-    poll_at_ms: core::sync::atomic::AtomicU64,
+    /// 下次需要推进协议栈的时间点（单位：微秒时间戳，0 表示无定时事件）
+    poll_at_us: core::sync::atomic::AtomicU64,
     /// 网络命名空间
     net_namespace: RwLock<Weak<NetNamespace>>,
     /// 路由相关数据
@@ -218,13 +242,17 @@ pub struct IfaceCommon {
     napi_struct: RwLock<Option<Arc<NapiStruct>>>,
     /// Packet sockets registered to receive raw frames
     packet_sockets: RwLock<Vec<Weak<PacketSocket>>>,
+    /// TCP close(2) 语义辅助：延迟回收 smoltcp TCP socket（Linux-like）。
+    tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer,
+    /// TCP listener/backlog 语义辅助（Linux-like 丢 SYN 等）。
+    tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog,
 }
 
 impl fmt::Debug for IfaceCommon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IfaceCommon")
             .field("iface_id", &self.iface_id)
-            .field("poll_at_ms", &self.poll_at_ms)
+            .field("poll_at_us", &self.poll_at_us)
             .finish()
     }
 }
@@ -243,18 +271,49 @@ impl IfaceCommon {
             .extend_from_slice(iface.ip_addrs());
         IfaceCommon {
             iface_id,
-            smol_iface: SpinLock::new(iface),
-            sockets: SpinLock::new(smoltcp::iface::SocketSet::new(Vec::new())),
+            smol_iface: Mutex::new(iface),
+            sockets: Mutex::new(smoltcp::iface::SocketSet::new(Vec::new())),
             bounds: RwLock::new(Vec::new()),
             port_manager: PortManager::default(),
-            poll_at_ms: core::sync::atomic::AtomicU64::new(0),
+            poll_at_us: core::sync::atomic::AtomicU64::new(0),
             net_namespace: RwLock::new(Weak::new()),
             router_common_data,
             flags,
             type_,
             napi_struct: RwLock::new(None),
             packet_sockets: RwLock::new(Vec::new()),
+            tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
+            tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog::new(),
         }
+    }
+
+    /// Register an active TCP listener port on this iface.
+    pub fn register_tcp_listen_port(&self, port: u16, backlog: usize) {
+        self.tcp_listener_backlog
+            .register_tcp_listen_port(port, backlog);
+    }
+
+    /// Unregister an active TCP listener port on this iface.
+    pub fn unregister_tcp_listen_port(&self, port: u16) {
+        self.tcp_listener_backlog.unregister_tcp_listen_port(port);
+    }
+
+    /// 驱动收包入口使用的通用丢包策略（避免驱动理解 L4 语义）。
+    #[inline]
+    pub fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {
+        self.tcp_listener_backlog
+            .should_drop_backlog_full_tcp_syn_ip(packet)
+    }
+
+    /// Defer removing a TCP socket from the SocketSet until it reaches Closed.
+    pub fn defer_tcp_close(
+        &self,
+        handle: smoltcp::iface::SocketHandle,
+        local_port: u16,
+        sock: alloc::sync::Weak<dyn crate::net::socket::inet::InetSocket>,
+    ) {
+        self.tcp_close_defer
+            .defer_tcp_close(handle, local_port, sock);
     }
 
     pub fn poll<D>(&self, device: &mut D) -> bool
@@ -262,25 +321,37 @@ impl IfaceCommon {
         D: smoltcp::phy::Device + ?Sized,
     {
         let timestamp = crate::time::Instant::now().into();
-        let mut sockets = self.sockets.lock_irqsave();
-        let mut interface = self.smol_iface.lock_irqsave();
+        let mut sockets = self.sockets.lock();
+        let mut interface = self.smol_iface.lock();
+
+        // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
+        self.tcp_listener_backlog
+            .refresh_listen_socket_present(&sockets);
 
         let (has_events, poll_at) = {
             let poll_result = interface.poll(timestamp, device, &mut sockets);
 
             (
                 matches!(poll_result, smoltcp::iface::PollResult::SocketStateChanged),
-                loop {
-                    let poll_at = interface.poll_at(timestamp, &sockets);
-                    let Some(instant) = poll_at else {
-                        break poll_at;
-                    };
-                    if instant > timestamp {
-                        break poll_at;
+                {
+                    // `poll_at()` may legally return an instant that is <= `timestamp`
+                    // (e.g. "poll immediately"). The previous implementation retried
+                    // in a tight loop without updating `timestamp`, which can spin
+                    // forever and look like a deadlock.
+                    //
+                    // Clamp to `timestamp` to indicate "poll ASAP" without spinning.
+                    match interface.poll_at(timestamp, &sockets) {
+                        Some(instant) if instant <= timestamp => Some(timestamp),
+                        other => other,
                     }
                 },
             )
         };
+
+        // Reclaim TCP sockets that have fully closed.
+        // Lock order: sockets -> tcp_close_defer (matches close path, which may touch sockets then defer close).
+        self.tcp_close_defer
+            .reap_closed(&mut sockets, &self.port_manager);
 
         // drop sockets here to avoid deadlock
         drop(interface);
@@ -294,27 +365,46 @@ impl IfaceCommon {
 
         use core::sync::atomic::Ordering;
         if let Some(instant) = poll_at {
-            let _old_instant = self.poll_at_ms.load(Ordering::Relaxed);
-            let new_instant = instant.total_millis() as u64;
-            self.poll_at_ms.store(new_instant, Ordering::Relaxed);
+            let _old_instant = self.poll_at_us.load(Ordering::Relaxed);
+            let new_instant = instant.total_micros() as u64;
+            self.poll_at_us.store(new_instant, Ordering::Relaxed);
 
             // TODO: poll at
             // if old_instant == 0 || new_instant < old_instant {
             //     self.polling_wait_queue.wake_all();
             // }
         } else {
-            self.poll_at_ms.store(0, Ordering::Relaxed);
+            self.poll_at_us.store(0, Ordering::Relaxed);
         }
 
-        self.bounds.read_irqsave().iter().for_each(|bound_socket| {
-            // incase our inet socket missed the event, we manually notify it each time we poll
-            if has_events {
-                bound_socket.notify();
-                let _woke = bound_socket
-                    .wait_queue()
-                    .wakeup(Some(ProcessState::Blocked(true)));
+        // 注意：不要在持有 bounds 读锁(且 irqsave)期间调用 socket.notify()。
+        // 否则会形成典型锁顺序反转死锁：
+        // - poll 路径：bounds.read_irqsave() -> socket.notify() -> socket.inner(RwLock)
+        // - connect/bind/close 路径：socket.inner(RwLock) -> bounds.write()
+        // 因此这里先快照一份 bound sockets，再逐个 notify。
+        //
+        // IMPORTANT: 对于 loopback 场景（如 gVisor BlockingLargeWrite 测试），始终需要唤醒所有
+        // 等待的 socket。原因：smoltcp 在处理 ACK 后可能不返回 SocketStateChanged，但发送端的
+        // can_send() 已经变为 true。如果只在 has_events 时唤醒，发送端会永远等待。
+        // 唤醒后 socket 会重新检查条件，如果条件不满足会继续等待，所以不会造成忙等待。
+        {
+            // Avoid allocation here: take one Arc clone at a time, drop the lock, then notify.
+            let mut idx = 0usize;
+            loop {
+                let sock = {
+                    let guard = self.bounds.read_irqsave();
+                    if idx >= guard.len() {
+                        break;
+                    }
+                    let s = guard[idx].clone();
+                    s
+                };
+                // incase our inet socket missed the event, we manually notify it each time we poll
+                sock.notify();
+                let _woke = sock.wait_queue().wakeup(Some(ProcessState::Blocked(true)));
+                idx += 1;
             }
-        });
+        }
 
         // TODO: remove closed sockets
         // let closed_sockets = self
@@ -324,6 +414,92 @@ impl IfaceCommon {
         //     .collect::<Vec<_>>();
         // drop(closed_sockets);
         has_events
+    }
+
+    /// 返回 smoltcp 计算的“下次需要 poll 的时间点”（微秒时间戳）。
+    ///
+    /// - `None` 表示当前没有定时事件需要驱动。
+    /// - `Some(us)` 表示应当在 `us` 到达时再次 poll，以推进 TCP 定时器等。
+    #[inline]
+    pub fn poll_at_us(&self) -> Option<u64> {
+        use core::sync::atomic::Ordering;
+        let v = self.poll_at_us.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// NAPI 使用的 bounded poll：最多处理 `budget` 个 ingress 包，然后推进一次 egress。
+    ///
+    /// 返回值语义：是否仍有 ingress backlog 需要继续 poll（即 budget 用尽且仍在处理包）。
+    pub fn poll_napi<D>(&self, device: &mut D, budget: usize) -> bool
+    where
+        D: smoltcp::phy::Device + ?Sized,
+    {
+        let timestamp = crate::time::Instant::now().into();
+        let mut sockets = self.sockets.lock();
+        let mut interface = self.smol_iface.lock();
+
+        // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
+        self.tcp_listener_backlog
+            .refresh_listen_socket_present(&sockets);
+
+        let mut processed = 0usize;
+        let mut had_packet = false;
+
+        for _ in 0..budget {
+            match interface.poll_ingress_single(timestamp, device, &mut sockets) {
+                smoltcp::iface::PollIngressSingleResult::None => break,
+                smoltcp::iface::PollIngressSingleResult::PacketProcessed => {
+                    had_packet = true;
+                    processed += 1;
+                }
+                smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                    had_packet = true;
+                    processed += 1;
+                }
+            }
+        }
+
+        // 推进发送路径（smoltcp 保证 bounded work）。
+        let _ = interface.poll_egress(timestamp, device, &mut sockets);
+
+        // 更新 poll_at（用于定时驱动 TCP）。
+        use core::sync::atomic::Ordering;
+        let poll_at = match interface.poll_at(timestamp, &sockets) {
+            Some(instant) if instant <= timestamp => Some(timestamp),
+            other => other,
+        };
+        if let Some(instant) = poll_at {
+            self.poll_at_us
+                .store(instant.total_micros() as u64, Ordering::Relaxed);
+        } else {
+            self.poll_at_us.store(0, Ordering::Relaxed);
+        }
+
+        // 解锁后唤醒/通知 socket（沿用原 poll() 的 Linux-like 语义）。
+        drop(interface);
+        drop(sockets);
+        {
+            let mut idx = 0usize;
+            loop {
+                let sock = {
+                    let guard = self.bounds.read_irqsave();
+                    if idx >= guard.len() {
+                        break;
+                    }
+                    guard[idx].clone()
+                };
+                sock.notify();
+                let _ = sock.wait_queue().wakeup(Some(ProcessState::Blocked(true)));
+                idx += 1;
+            }
+        }
+
+        // NAPI 语义：仅当 ingress backlog 超过 budget 才认为“还有工作没做完”。
+        had_packet && processed == budget
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
@@ -352,7 +528,27 @@ impl IfaceCommon {
         let mut bounds = self.bounds.write();
         if let Some(index) = bounds.iter().position(|s| Arc::ptr_eq(s, &socket)) {
             bounds.remove(index);
-            log::debug!("unbind socket success");
+            // log::debug!("unbind socket success");
+        }
+    }
+
+    /// Notify all bound sockets unconditionally.
+    /// This is used after listener shutdown to ensure all client sockets
+    /// are woken up even if the interface poll didn't detect any events.
+    pub fn notify_all_bound_sockets(&self) {
+        // Avoid allocation and avoid holding bounds lock while notifying.
+        let mut idx = 0usize;
+        loop {
+            let sock = {
+                let guard = self.bounds.read_irqsave();
+                if idx >= guard.len() {
+                    break;
+                }
+                guard[idx].clone()
+            };
+            sock.notify();
+            let _woke = sock.wait_queue().wakeup(Some(ProcessState::Blocked(true)));
+            idx += 1;
         }
     }
 

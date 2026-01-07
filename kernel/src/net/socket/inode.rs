@@ -327,13 +327,13 @@ impl<T: Socket + 'static> IndexNode for T {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if buf.is_empty() {
-            log::debug!(
-                "Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}",
-                buf.len(),
-                _len
-            );
-        }
+        // if buf.is_empty() {
+        //     log::debug!(
+        //         "Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}",
+        //         buf.len(),
+        //         _len
+        //     );
+        // }
         drop(data);
         self.write(buf)
     }
@@ -386,7 +386,7 @@ impl<T: Socket + 'static> IndexNode for T {
             SIOCGIFINDEX => handle_siocgifindex(data),
             FIONREAD /* TIOCINQ */ => {
                 // Get number of bytes available to read
-                let bytes_available = self.recv_bytes_available()?;
+                let bytes_available = self.recv_bytes_available();
                 let mut writer =
                     UserBufferWriter::new(data as *mut u8, core::mem::size_of::<i32>(), true)?;
                 let to_write = core::cmp::min(bytes_available, i32::MAX as usize) as i32;

@@ -379,10 +379,7 @@ impl TcpSocket {
             drop(cork_buf);
 
             let to_send = data.len();
-            let sent = match self.try_send_direct(data.as_slice()) {
-                Ok(n) => n,
-                Err(e) => return Err(e),
-            };
+            let sent = self.try_send_direct(data.as_slice())?;
 
             if sent == 0 {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);

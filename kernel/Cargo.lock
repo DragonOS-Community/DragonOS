@@ -1504,7 +1504,7 @@ checksum = "7fcf8323ef1faaee30a44a340193b1ac6814fd9b7b4e88e9d4519a3e4abe1cfd"
 [[package]]
 name = "smoltcp"
 version = "0.12.0"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp?rev=8130f5e42e#8130f5e42e88263156aadea7f313d07694ea893b"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp?rev=e37bbb0#e37bbb0d687322208b6c723af216a8d4dbe55f72"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",

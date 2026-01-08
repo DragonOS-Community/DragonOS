@@ -58,6 +58,7 @@ pub const MAX_SOCKET_BUFFER: usize = 10 * 1024 * 1024;
 // ========== TCP状态常量 - 参考Linux内核 include/net/tcp_states.h ==========
 use num_derive::ToPrimitive;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ToPrimitive)]
 pub enum PosixTcpState {
     Established = 1,
@@ -93,6 +94,7 @@ impl From<smoltcp::socket::tcp::State> for PosixTcpState {
 }
 
 // ========== TCP拥塞控制状态 - 参考Linux内核 include/uapi/linux/tcp.h ==========
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ToPrimitive)]
 pub enum PosixTcpCaState {
     Open = 0,

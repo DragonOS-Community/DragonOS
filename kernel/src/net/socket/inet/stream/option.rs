@@ -115,57 +115,55 @@ impl PosixTcpInfo {
     #[inline(never)]
     fn from_inner(inner: &inner::Inner) -> Self {
         match inner {
-            inner::Inner::Closed(_) => {
-                let mut info = PosixTcpInfo::default();
-                info.tcpi_state = constants::PosixTcpState::Close.to_u8().unwrap_or(0);
-                info
-            }
-            inner::Inner::SelfConnected(_) => {
-                let mut info = PosixTcpInfo::default();
-                info.tcpi_state = constants::PosixTcpState::Established.to_u8().unwrap_or(1);
-                info.tcpi_ca_state = constants::PosixTcpCaState::Open.to_u8().unwrap_or(0);
-                // Provide some reasonable defaults for self-connected sockets
-                info.tcpi_rto = 200_000;
-                info.tcpi_snd_cwnd = 10;
-                info
-            }
+            inner::Inner::Closed(_) => PosixTcpInfo {
+                tcpi_state: constants::PosixTcpState::Close.to_u8().unwrap_or(0),
+                ..Default::default()
+            },
+            inner::Inner::SelfConnected(_) => PosixTcpInfo {
+                tcpi_state: constants::PosixTcpState::Established.to_u8().unwrap_or(1),
+                tcpi_ca_state: constants::PosixTcpCaState::Open.to_u8().unwrap_or(0),
+                tcpi_rto: 200_000,
+                tcpi_snd_cwnd: 10,
+                ..Default::default()
+            },
             _ => inner.with_socket(|socket| {
-                let mut info = PosixTcpInfo::default();
-                // Populate info from socket
-                info.tcpi_state = constants::PosixTcpState::from(socket.state())
-                    .to_u8()
-                    .unwrap_or(0);
-
-                info.tcpi_ca_state = constants::PosixTcpCaState::Open.to_u8().unwrap_or(0);
-
-                info.tcpi_rto = socket.rto().total_micros() as u32;
-                info.tcpi_rtt = socket.rtt() * 1000; // ms to us
-                info.tcpi_rttvar = socket.rtt_var() * 1000; // ms to us
-
                 let mss = socket.remote_mss();
-                info.tcpi_snd_mss = mss as u32;
-                info.tcpi_rcv_mss = constants::DEFAULT_TCP_MSS as u32;
-
-                if mss > 0 {
-                    // Use ceil division to ensure cwnd > 0 if socket.cwnd() > 0
-                    info.tcpi_snd_cwnd = (socket.cwnd().saturating_add(mss - 1) / mss) as u32;
-                    info.tcpi_snd_ssthresh = (socket.ssthresh() / mss) as u32;
-                } else {
-                    info.tcpi_snd_cwnd = socket.cwnd() as u32;
-                    info.tcpi_snd_ssthresh = socket.ssthresh() as u32;
+                PosixTcpInfo {
+                    tcpi_state: constants::PosixTcpState::from(socket.state())
+                        .to_u8()
+                        .unwrap_or(0),
+                    tcpi_ca_state: constants::PosixTcpCaState::Open.to_u8().unwrap_or(0),
+                    tcpi_rto: socket.rto().total_micros() as u32,
+                    tcpi_rtt: socket.rtt() * 1000,        // ms to us
+                    tcpi_rttvar: socket.rtt_var() * 1000, // ms to us
+                    tcpi_snd_mss: mss as u32,
+                    tcpi_rcv_mss: constants::DEFAULT_TCP_MSS as u32,
+                    tcpi_snd_cwnd: if mss > 0 {
+                        (socket.cwnd().saturating_add(mss - 1) / mss) as u32
+                    } else {
+                        socket.cwnd() as u32
+                    },
+                    tcpi_snd_ssthresh: if mss > 0 {
+                        (socket.ssthresh() / mss) as u32
+                    } else {
+                        socket.ssthresh() as u32
+                    },
+                    tcpi_snd_wnd: socket.remote_win_len() as u32,
+                    tcpi_unacked: socket
+                        .remote_last_ack()
+                        .map(|last_ack| {
+                            let diff = socket.local_seq_no().0.wrapping_sub(last_ack.0);
+                            if diff < 0 {
+                                0
+                            } else {
+                                diff as u32
+                            }
+                        })
+                        .unwrap_or(0),
+                    tcpi_retrans: socket.retransmits() as u32,
+                    tcpi_total_retrans: socket.retransmits() as u32,
+                    ..Default::default()
                 }
-
-                info.tcpi_snd_wnd = socket.remote_win_len() as u32;
-
-                if let Some(last_ack) = socket.remote_last_ack() {
-                    let diff = socket.local_seq_no().0.wrapping_sub(last_ack.0);
-                    info.tcpi_unacked = if diff < 0 { 0 } else { diff as u32 };
-                }
-
-                info.tcpi_retrans = socket.retransmits() as u32;
-                info.tcpi_total_retrans = socket.retransmits() as u32;
-
-                info
             }),
         }
     }
@@ -577,12 +575,10 @@ impl super::TcpSocket {
 
                 if v < 0 {
                     v = -1;
-                } else {
-                    if v == 0 {
-                        v = constants::DEFAULT_TCP_LINGER2;
-                    } else if v > constants::MAX_TCP_LINGER2 {
-                        v = constants::MAX_TCP_LINGER2;
-                    }
+                } else if v == 0 {
+                    v = constants::DEFAULT_TCP_LINGER2;
+                } else if v > constants::MAX_TCP_LINGER2 {
+                    v = constants::MAX_TCP_LINGER2;
                 }
                 self.tcp_linger2()
                     .store(v, core::sync::atomic::Ordering::Relaxed);

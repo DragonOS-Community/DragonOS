@@ -9,8 +9,8 @@ use crate::{
     arch::{mm::PageMapper, MMArch},
     mm::{
         page::{page_manager_lock_irqsave, Page, PageFlags},
-        ucontext::{LockedVMA},
-        MemoryManagementArch, PhysAddr, VmFlags, VirtAddr,
+        ucontext::LockedVMA,
+        MemoryManagementArch, PhysAddr, VirtAddr, VmFlags,
     },
     process::{resource::RLimitID, ProcessManager},
 };
@@ -160,20 +160,16 @@ impl LockedVMA {
                         Err(_) => continue,
                     };
                     for i in 0..sub_page_count {
-                        let sub_page_paddr = PhysAddr::new(base_paddr.data() + i * MMArch::PAGE_SIZE);
+                        let sub_page_paddr =
+                            PhysAddr::new(base_paddr.data() + i * MMArch::PAGE_SIZE);
                         if Self::mlock_phys_page(sub_page_paddr, lock)? {
                             page_count += 1;
                         }
                     }
                 } else if level > 0 {
                     // 递归处理下一级页表
-                    let sub_pages = self.mlock_walk_page_range(
-                        mapper,
-                        start,
-                        next,
-                        level - 1,
-                        lock,
-                    )?;
+                    let sub_pages =
+                        self.mlock_walk_page_range(mapper, start, next, level - 1, lock)?;
                     page_count += sub_pages;
                 } else {
                     // 叶子节点（4K页）

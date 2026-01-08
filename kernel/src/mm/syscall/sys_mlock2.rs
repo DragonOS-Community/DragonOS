@@ -1,6 +1,6 @@
 //! mlock2 系统调用实现
 
-use crate::arch::{interrupt::TrapFrame, MMArch,syscall::nr::SYS_MLOCK2};
+use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCK2, MMArch};
 use crate::mm::{
     mlock::can_do_mlock,
     syscall::{page_align_up, Mlock2Flags},
@@ -8,8 +8,8 @@ use crate::mm::{
     MemoryManagementArch, VirtAddr,
 };
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use system_error::SystemError;
 use alloc::vec::Vec;
+use system_error::SystemError;
 pub struct SysMlock2Handle;
 
 impl Syscall for SysMlock2Handle {

@@ -113,8 +113,8 @@ pub(crate) fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<Proc
 
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 /// RLIMIT_MEMLOCK 的默认值 (64KB)
-    /// Linux x86_64 默认值通常是 64KB (0x10000 字节) 或更大 (8MB = 0x800000)
-    /// 这里设置为 64KB 以符合大多数 Linux 发行版的默认行为
+/// Linux x86_64 默认值通常是 64KB (0x10000 字节) 或更大 (8MB = 0x800000)
+/// 这里设置为 64KB 以符合大多数 Linux 发行版的默认行为
 const DEFAULT_RLIMIT_MEMLOCK: u64 = 64 * 1024;
 
 /// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
@@ -1191,7 +1191,7 @@ impl ProcessControlBlock {
         // 使用 DEFAULT_RLIMIT_MEMLOCK 常量定义软限制
         arr[RLimitID::Memlock as usize] = RLimit64 {
             rlim_cur: DEFAULT_RLIMIT_MEMLOCK,
-            rlim_max: u64::MAX,   // 硬限制为 unlimited
+            rlim_max: u64::MAX, // 硬限制为 unlimited
         };
 
         arr

@@ -1,13 +1,9 @@
 //! munlock 系统调用实现
 
-use crate::arch::{interrupt::TrapFrame, MMArch,syscall::nr::SYS_MUNLOCK};
-use alloc::vec::Vec;
-use crate::mm::{
-    syscall::page_align_up,
-    ucontext::AddressSpace,
-    MemoryManagementArch, VirtAddr,
-};
+use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MUNLOCK, MMArch};
+use crate::mm::{syscall::page_align_up, ucontext::AddressSpace, MemoryManagementArch, VirtAddr};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 pub struct SysMunlockHandle;

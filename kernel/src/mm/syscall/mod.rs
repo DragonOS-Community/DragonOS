@@ -11,16 +11,16 @@ mod sys_fadvise64;
 mod sys_get_mempolicy;
 mod sys_madvise;
 mod sys_mincore;
-mod sys_mmap;
 mod sys_mlock;
 mod sys_mlock2;
 mod sys_mlockall;
+mod sys_mmap;
 mod sys_mprotect;
 mod sys_mremap;
 mod sys_msync;
-mod sys_munmap;
 mod sys_munlock;
 mod sys_munlockall;
+mod sys_munmap;
 mod sys_process_vm;
 pub mod sys_sbrk;
 

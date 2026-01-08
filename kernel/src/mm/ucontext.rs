@@ -1325,8 +1325,7 @@ impl InnerAddressSpace {
 
         // 更新 locked_vm 计数
         let page_count = len >> MMArch::PAGE_SHIFT;
-        self.locked_vm
-            .fetch_add(page_count, Ordering::Relaxed);
+        self.locked_vm.fetch_add(page_count, Ordering::Relaxed);
 
         // 如果有不可访问的 VMA，返回 ENOMEM
         if has_inaccessible_vma {
@@ -1365,10 +1364,7 @@ impl InnerAddressSpace {
 
     /// 解锁地址范围
     pub fn munlock(&mut self, start: VirtAddr, len: usize) -> Result<(), SystemError> {
-        let end = start
-            .data()
-            .checked_add(len)
-            .ok_or(SystemError::ENOMEM)?;
+        let end = start.data().checked_add(len).ok_or(SystemError::ENOMEM)?;
         let end = VirtAddr::new(end);
 
         // 获取冲突的 VMA 列表
@@ -1410,8 +1406,7 @@ impl InnerAddressSpace {
     pub fn mlockall(&mut self, flags: u32) -> Result<(), SystemError> {
         use crate::mm::syscall::MlockAllFlags;
 
-        let mlock_flags =
-            MlockAllFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+        let mlock_flags = MlockAllFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
 
         // 设置 def_flags（影响未来的映射）
         let mut vm_flags = VmFlags::empty();
@@ -1488,7 +1483,9 @@ impl InnerAddressSpace {
                 drop(vma_guard);
 
                 // 只处理已锁定或 lock on fault 的 VMA
-                if vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT) {
+                if vm_flags.contains(VmFlags::VM_LOCKED)
+                    || vm_flags.contains(VmFlags::VM_LOCKONFAULT)
+                {
                     Some((vma.clone(), region.start(), region.end()))
                 } else {
                     None

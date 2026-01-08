@@ -1,13 +1,9 @@
 //! mlockall 系统调用实现
 
-use crate::arch::{interrupt::TrapFrame, MMArch,syscall::nr::SYS_MLOCKALL};
-use alloc::vec::Vec;
-use crate::mm::{
-    mlock::can_do_mlock,
-    syscall::MlockAllFlags,
-    ucontext::AddressSpace,
-};
+use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCKALL, MMArch};
+use crate::mm::{mlock::can_do_mlock, syscall::MlockAllFlags, ucontext::AddressSpace};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 pub struct SysMlockallHandle;
@@ -40,7 +36,10 @@ impl Syscall for SysMlockallHandle {
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
-        vec![FormattedSyscallParam::new("flags", format!("{:#x}", args[0]))]
+        vec![FormattedSyscallParam::new(
+            "flags",
+            format!("{:#x}", args[0]),
+        )]
     }
 }
 

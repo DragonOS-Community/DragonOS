@@ -1,15 +1,13 @@
 //! mlock 系统调用实现
 
-use crate::arch::{interrupt::TrapFrame, MMArch,syscall::nr::SYS_MLOCK};
-use alloc::vec::Vec;
+use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCK, MMArch};
 use crate::mm::{
-    mlock::can_do_mlock,
-    syscall::page_align_up,
-    ucontext::AddressSpace,
-    MemoryManagementArch, VirtAddr, VmFlags,
+    mlock::can_do_mlock, syscall::page_align_up, ucontext::AddressSpace, MemoryManagementArch,
+    VirtAddr, VmFlags,
 };
 use crate::process::{resource::RLimitID, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 pub struct SysMlockHandle;

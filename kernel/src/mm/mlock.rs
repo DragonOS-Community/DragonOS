@@ -163,9 +163,13 @@ impl LockedVMA {
                         Ok(paddr) => paddr,
                         Err(_) => continue,
                     };
+                    // 计算 start 在当前条目内的偏移（如果 start 不在大页边界上）
+                    let offset_in_entry = start.data() & (entry_size - 1);
                     for i in 0..sub_page_count {
-                        let sub_page_paddr =
-                            PhysAddr::new(base_paddr.data() + i * MMArch::PAGE_SIZE);
+                        // 计算子页的物理地址：base_paddr + start在条目内的偏移 + 子页索引 * 页面大小
+                        let sub_page_paddr = PhysAddr::new(
+                            base_paddr.data() + offset_in_entry + i * MMArch::PAGE_SIZE,
+                        );
                         if Self::mlock_phys_page(sub_page_paddr, lock)? {
                             page_count += 1;
                         }

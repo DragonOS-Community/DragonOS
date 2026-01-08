@@ -1,6 +1,6 @@
 //! mlockall 系统调用实现
 
-use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCKALL, MMArch};
+use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCKALL,};
 use crate::mm::{mlock::can_do_mlock, syscall::MlockAllFlags, ucontext::AddressSpace};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;

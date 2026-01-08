@@ -19,7 +19,6 @@ use hashbrown::HashSet;
 use ida::IdAllocator;
 use log::warn;
 use system_error::SystemError;
-use x86::current;
 
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},

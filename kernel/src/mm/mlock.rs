@@ -10,7 +10,7 @@ use crate::{
     mm::{
         page::{page_manager_lock_irqsave, Page, PageFlags},
         ucontext::LockedVMA,
-        MemoryManagementArch, PhysAddr, VirtAddr, VmFlags,
+        MemoryManagementArch, PhysAddr, VirtAddr,
     },
     process::{resource::RLimitID, ProcessManager},
 };

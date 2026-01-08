@@ -3,7 +3,7 @@
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCK, MMArch};
 use crate::mm::{
     mlock::can_do_mlock, syscall::page_align_up, ucontext::AddressSpace, MemoryManagementArch,
-    VirtAddr, VmFlags,
+    VirtAddr, 
 };
 use crate::process::{resource::RLimitID, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};

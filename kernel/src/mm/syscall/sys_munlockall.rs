@@ -1,6 +1,6 @@
 //! munlockall 系统调用实现
 
-use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MUNLOCKALL, MMArch};
+use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MUNLOCKALL};
 use crate::mm::ucontext::AddressSpace;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;

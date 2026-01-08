@@ -129,8 +129,8 @@ pub struct PosixTcpInfo {
     pub tcpi_probes: u8,
     pub tcpi_backoff: u8,
     pub tcpi_options: u8,
-    pub tcpi_snd_wscale: u8,
-    pub tcpi_rcv_wscale: u8,
+    pub tcpi_snd_rcv_wscale: u8, // 4-bit snd, 4-bit rcv (Linux bitfield)
+    pub tcpi_delivery_rate_app_limited_fastopen_client_fail: u8,
 
     // Timing and size (16 bytes)
     pub tcpi_rto: u32,
@@ -204,8 +204,8 @@ impl PosixTcpInfo {
             tcpi_probes: 0,
             tcpi_backoff: 0,
             tcpi_options: 0,
-            tcpi_snd_wscale: 0,
-            tcpi_rcv_wscale: 0,
+            tcpi_snd_rcv_wscale: 0,
+            tcpi_delivery_rate_app_limited_fastopen_client_fail: 0,
             tcpi_rto: 0,
             tcpi_ato: 0,
             tcpi_snd_mss: 0,
@@ -247,6 +247,16 @@ impl PosixTcpInfo {
             tcpi_delivered_ce: 0,
             _pad: [0; 8],
         }
+    }
+
+    #[inline]
+    fn pack_wscale(snd_wscale: u8, rcv_wscale: u8) -> u8 {
+        (snd_wscale & 0x0f) | ((rcv_wscale & 0x0f) << 4)
+    }
+
+    #[inline]
+    fn set_wscale(&mut self, snd_wscale: u8, rcv_wscale: u8) {
+        self.tcpi_snd_rcv_wscale = Self::pack_wscale(snd_wscale, rcv_wscale);
     }
 
     /// Get the size of the structure for use with getsockopt.
@@ -294,8 +304,10 @@ impl<'a> TcpInfoCollector<'a> {
         info.tcpi_options = options.bits();
 
         // Window scaling
-        info.tcpi_snd_wscale = self.socket.remote_win_shift();
-        info.tcpi_rcv_wscale = self.socket.remote_win_scale().unwrap_or(0);
+        info.set_wscale(
+            self.socket.remote_win_scale().unwrap_or(0),
+            self.socket.remote_win_shift(),
+        );
 
         // Timing (convert to microseconds like Linux)
         // smoltcp's rto() returns Duration, convert to microseconds

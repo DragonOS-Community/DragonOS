@@ -195,9 +195,129 @@ impl InnerPipeInode {
     fn buf_full(&self) -> bool {
         return self.valid_cnt as usize == self.buf_size;
     }
+
+    /// 从另一个管道复制数据到本管道（不消耗源数据）
+    /// src: 源管道
+    /// count: 要复制的字节数
+    /// skip: 源管道读取偏移量
+    pub fn copy_from_other(&mut self, src: &InnerPipeInode, count: usize, skip: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+
+        // 计算实际可读/可写量
+        let src_avail = src.valid_cnt.max(0) as usize;
+        if skip >= src_avail {
+            return 0;
+        }
+        let src_real_avail = src_avail - skip;
+
+        let dst_space = self.buf_size.saturating_sub(self.valid_cnt.max(0) as usize);
+        let actual_copy = count.min(src_real_avail).min(dst_space);
+
+        if actual_copy == 0 {
+            return 0;
+        }
+
+        // 确保目标缓冲区已分配
+        if self.data.is_empty() {
+            self.data = vec![0u8; self.buf_size];
+        }
+
+        let src_buf_size = src.buf_size;
+        let dst_buf_size = self.buf_size;
+
+        let src_start = (src.read_pos as usize + skip) % src_buf_size;
+        let dst_start = self.write_pos as usize;
+
+        // 由于是环形缓冲区，源和目标都可能分为两段
+        // 最坏情况是 2段 -> 2段，共4次拷贝。
+        // 为简化逻辑，我们可以先获取源数据的切片（1或2个），然后写入目标。
+
+        let mut src_slices = [
+            &src.data[..0], // placeholder
+            &src.data[..0],
+        ];
+        let mut slice_count = 0;
+
+        let src_first_len = actual_copy.min(src_buf_size - src_start);
+        src_slices[0] = &src.data[src_start..src_start + src_first_len];
+        slice_count += 1;
+
+        let src_second_len = actual_copy - src_first_len;
+        if src_second_len > 0 {
+            src_slices[1] = &src.data[0..src_second_len];
+            slice_count += 1;
+        }
+
+        // 现在将这些切片写入目标
+        let mut current_dst_pos = dst_start;
+        for slice in src_slices.iter().take(slice_count) {
+            let slice = *slice;
+            let slice_len = slice.len();
+            if slice_len == 0 {
+                continue;
+            }
+
+            let dst_first_len = slice_len.min(dst_buf_size - current_dst_pos);
+            self.data[current_dst_pos..current_dst_pos + dst_first_len]
+                .copy_from_slice(&slice[0..dst_first_len]);
+
+            let dst_second_len = slice_len - dst_first_len;
+            if dst_second_len > 0 {
+                self.data[0..dst_second_len].copy_from_slice(&slice[dst_first_len..]);
+            }
+
+            current_dst_pos = (current_dst_pos + slice_len) % dst_buf_size;
+        }
+
+        // 更新目标写指针
+        self.write_pos = (self.write_pos + actual_copy as i32) % dst_buf_size as i32;
+        self.valid_cnt += actual_copy as i32;
+
+        actual_copy
+    }
 }
 
 impl LockedPipeInode {
+    /// 安全地锁定两个管道节点（避免死锁）
+    /// 返回两个节点的锁保护对象
+    /// 注意：p1 和 p2 必须不同，否则会发生死锁（如果尝试对同一个锁加锁两次）或返回不安全的别名引用
+    fn lock_two<'a, 'b>(
+        p1: &'a LockedPipeInode,
+        p2: &'b LockedPipeInode,
+    ) -> (
+        crate::libs::spinlock::SpinLockGuard<'a, InnerPipeInode>,
+        crate::libs::spinlock::SpinLockGuard<'b, InnerPipeInode>,
+    ) {
+        let addr1 = p1 as *const _ as usize;
+        let addr2 = p2 as *const _ as usize;
+
+        if addr1 < addr2 {
+            (p1.inner.lock(), p2.inner.lock())
+        } else {
+            let g2 = p2.inner.lock();
+            let g1 = p1.inner.lock();
+            (g1, g2)
+        }
+    }
+
+    fn tee_adjusted_skip(
+        start_read_pos: usize,
+        cur_read_pos: usize,
+        buf_size: usize,
+        snapshot: usize,
+        total: usize,
+    ) -> usize {
+        let consumed_since_start = if cur_read_pos >= start_read_pos {
+            cur_read_pos - start_read_pos
+        } else {
+            buf_size - start_read_pos + cur_read_pos
+        }
+        .min(snapshot);
+        total.saturating_sub(consumed_since_start)
+    }
+
     pub fn new() -> Arc<Self> {
         let inner = InnerPipeInode {
             self_ref: Weak::default(),
@@ -485,6 +605,153 @@ impl LockedPipeInode {
         }
     }
 
+    /// Helper: Wait until the pipe is readable (has data).
+    /// Returns:
+    /// - Ok(true): Data is available.
+    /// - Ok(false): EOF (no writers and no data).
+    /// - Err(e): Interrupted or EAGAIN.
+    fn wait_readable(&self, nonblock: bool) -> Result<bool, SystemError> {
+        loop {
+            let avail = self.readable_len();
+            if avail > 0 {
+                return Ok(true);
+            }
+            if !self.has_writers() {
+                return Ok(false);
+            }
+            if nonblock {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})
+                .map_err(|_| SystemError::ERESTARTSYS)?;
+        }
+    }
+
+    /// Helper: Wait until the pipe is writable (has space).
+    /// Returns:
+    /// - Ok(()): Space is available.
+    /// - Err(e): Interrupted, EAGAIN, or EPIPE (no readers).
+    fn wait_writable(&self, nonblock: bool) -> Result<(), SystemError> {
+        loop {
+            let space = self.writable_len();
+            if space > 0 {
+                return Ok(());
+            }
+            if !self.has_readers() {
+                let _ = send_kernel_signal_to_current(Signal::SIGPIPE);
+                return Err(SystemError::EPIPE);
+            }
+            if nonblock {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {})
+                .map_err(|_| SystemError::ERESTARTSYS)?;
+        }
+    }
+
+    /// Helper: Transfer a chunk of data from `src` to `dst`.
+    /// - `len`: Max bytes to transfer.
+    /// - `consume`: Whether to consume data from `src` (splice) or just peek (tee).
+    /// - `skip_calculator`: Closure to calculate skip amount based on `src` state (used for tee).
+    ///
+    /// Returns actual copied bytes. 0 means retry (buffers full/empty temporarily).
+    fn transfer_chunk<F>(
+        src: &LockedPipeInode,
+        dst: &LockedPipeInode,
+        len: usize,
+        consume: bool,
+        skip_calculator: F,
+    ) -> Result<usize, SystemError>
+    where
+        F: FnOnce(&InnerPipeInode) -> usize,
+    {
+        // Lock both pipes
+        let (mut in_guard, mut out_guard) = Self::lock_two(src, dst);
+
+        // Re-check conditions under lock
+        let in_avail = in_guard.valid_cnt.max(0) as usize;
+        let out_space = out_guard
+            .buf_size
+            .saturating_sub(out_guard.valid_cnt.max(0) as usize);
+
+        if in_avail == 0 || out_space == 0 {
+            return Ok(0);
+        }
+
+        if out_guard.reader == 0 {
+            return Err(SystemError::EPIPE);
+        }
+
+        let skip = skip_calculator(&in_guard);
+        // Ensure skip doesn't exceed available data
+        if skip >= in_avail {
+            // Nothing to copy due to skip
+            return Ok(0);
+        }
+        let real_in_avail = in_avail - skip;
+
+        let want = len.min(4096);
+        let chunk = core::cmp::min(want, core::cmp::min(real_in_avail, out_space));
+
+        if chunk == 0 {
+            return Ok(0);
+        }
+
+        // Copy data directly
+        let copied = out_guard.copy_from_other(&in_guard, chunk, skip);
+
+        if consume {
+            let buf_size = in_guard.buf_size;
+            in_guard.read_pos = (in_guard.read_pos + copied as i32) % buf_size as i32;
+            in_guard.valid_cnt -= copied as i32;
+
+            // Wakeup input writers
+            if in_guard.valid_cnt > 0 { // Wait, valid_cnt decreased, so space increased?
+                 // No, valid_cnt decreased means we read data. So we should wakeup writers who are waiting for space?
+                 // Original code:
+                 // if in_guard.valid_cnt > 0 { self.read_wait_queue.wakeup(...) }
+                 // Wait, read_wait_queue waits for readable. If we consumed, it might NO LONGER be readable (if 0).
+                 // Why did original code wake read_wait_queue?
+                 // Maybe for other readers? "If there is still data, wake other readers".
+            }
+            // Original splice code:
+            /*
+               if in_guard.valid_cnt > 0 {
+                   self.read_wait_queue.wakeup(Some(ProcessState::Blocked(true)));
+               }
+               self.write_wait_queue.wakeup(Some(ProcessState::Blocked(true)));
+            */
+            // Correct.
+        }
+
+        // Wakeups
+        if consume {
+            if in_guard.valid_cnt > 0 {
+                src.read_wait_queue
+                    .wakeup(Some(ProcessState::Blocked(true)));
+            }
+            src.write_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
+        }
+
+        dst.read_wait_queue
+            .wakeup(Some(ProcessState::Blocked(true)));
+        if (out_guard.valid_cnt as usize) < out_guard.buf_size {
+            dst.write_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
+        }
+
+        let in_poll = in_guard.poll_both_ends();
+        let out_poll = out_guard.poll_both_ends();
+        drop(in_guard);
+        drop(out_guard);
+
+        let _ = EventPoll::wakeup_epoll(&src.epitems, in_poll);
+        let _ = EventPoll::wakeup_epoll(&dst.epitems, out_poll);
+
+        Ok(copied)
+    }
+
     /// splice helper: 消耗 pipe 中前 `n` 字节（不复制数据）。
     /// 返回实际消耗的字节数。
     pub(crate) fn consume_front(&self, n: usize) -> usize {
@@ -528,96 +795,25 @@ impl LockedPipeInode {
         if len == 0 {
             return Ok(0);
         }
+        if core::ptr::eq(self, out) {
+            return Err(SystemError::EINVAL);
+        }
         let nonblock = flags.contains(SpliceFlags::SPLICE_F_NONBLOCK);
 
         loop {
-            let in_avail = self.readable_len();
-            if in_avail == 0 {
-                if !self.has_writers() {
-                    return Ok(0);
-                }
-                if nonblock {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
-                if r.is_err() {
-                    return Err(SystemError::ERESTARTSYS);
-                }
-                continue;
+            // Wait for input data
+            if !self.wait_readable(nonblock)? {
+                return Ok(0); // EOF
             }
 
-            let out_space = out.writable_len();
-            if out_space == 0 {
-                if !out.has_readers() {
-                    if let Err(e) = send_kernel_signal_to_current(Signal::SIGPIPE) {
-                        log::error!("Failed to send SIGPIPE for splice_to_pipe: {:?}", e);
-                    }
-                    return Err(SystemError::EPIPE);
-                }
-                if nonblock {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                let r = wq_wait_event_interruptible!(out.write_wait_queue, out.writeable(), {});
-                if r.is_err() {
-                    return Err(SystemError::ERESTARTSYS);
-                }
-                continue;
-            }
+            // Wait for output space
+            out.wait_writable(nonblock)?;
 
-            let want = len.min(4096);
-            let chunk = core::cmp::min(want, core::cmp::min(in_avail, out_space));
-            if chunk == 0 {
-                return Ok(0);
+            // Try transfer
+            let copied = Self::transfer_chunk(self, out, len, true, |_| 0)?;
+            if copied > 0 {
+                return Ok(copied);
             }
-
-            // Copy out under input lock (short critical section).
-            let mut tmp = vec![0u8; chunk];
-            let peeked = self.peek_into_from(0, chunk, &mut tmp);
-            if peeked == 0 {
-                continue;
-            }
-
-            // Write into output under output lock.
-            let mut out_guard = out.inner.lock();
-            if out_guard.reader == 0 {
-                drop(out_guard);
-                return Err(SystemError::EPIPE);
-            }
-            if out_guard.data.is_empty() {
-                let buf_size = out_guard.buf_size;
-                out_guard.data = vec![0u8; buf_size];
-            }
-            let buf_size = out_guard.buf_size;
-            let used = out_guard.valid_cnt.max(0) as usize;
-            let space_now = buf_size.saturating_sub(used);
-            if space_now < peeked {
-                drop(out_guard);
-                continue;
-            }
-
-            let start = out_guard.write_pos as usize;
-            let first = core::cmp::min(peeked, buf_size - start);
-            let second = peeked.saturating_sub(first);
-            out_guard.data[start..start + first].copy_from_slice(&tmp[0..first]);
-            if second > 0 {
-                out_guard.data[0..second].copy_from_slice(&tmp[first..first + second]);
-            }
-            out_guard.write_pos = (out_guard.write_pos + peeked as i32) % buf_size as i32;
-            out_guard.valid_cnt += peeked as i32;
-
-            out.read_wait_queue
-                .wakeup(Some(ProcessState::Blocked(true)));
-            if (out_guard.valid_cnt as usize) < out_guard.buf_size {
-                out.write_wait_queue
-                    .wakeup(Some(ProcessState::Blocked(true)));
-            }
-            let pollflag = out_guard.poll_both_ends();
-            drop(out_guard);
-            let _ = EventPoll::wakeup_epoll(&out.epitems, pollflag);
-
-            // Finally consume from input.
-            let consumed = self.consume_front(peeked);
-            return Ok(consumed);
         }
     }
 
@@ -634,139 +830,81 @@ impl LockedPipeInode {
         if len == 0 {
             return Ok(0);
         }
+        if core::ptr::eq(self, out) {
+            return Err(SystemError::EINVAL);
+        }
         let nonblock =
             flags.contains(crate::filesystem::vfs::syscall::SpliceFlags::SPLICE_F_NONBLOCK);
 
         let mut total: usize = 0;
-        // Linux link_pipe() 语义：从当前 tail/read_pos 起复制现有数据（不会重复从起点复制）。
-        // 为避免在本次调用中“重复复制同一段数据”，在首次观察到“可读”时，
-        // 记录当时的可读数据量作为本次调用的上限（不会等待更多数据凑满 len）。
         let mut in_avail_snapshot: Option<usize> = None;
+        let mut in_read_pos_snapshot: Option<usize> = None;
+        let mut in_buf_size_snapshot: Option<usize> = None;
+
         while total < len {
-            if in_avail_snapshot.is_none() {
-                let avail = self.readable_len();
-                if avail == 0 {
-                    if !self.has_writers() {
-                        return Ok(total);
-                    }
-                    if nonblock {
-                        return if total > 0 {
-                            Ok(total)
-                        } else {
-                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                        };
-                    }
-                    // 阻塞：等待至少 1 字节可读（或 writer 关闭导致 readable() 返回 true）
-                    let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
-                    if r.is_err() {
-                        return if total > 0 {
-                            Ok(total)
-                        } else {
-                            Err(SystemError::ERESTARTSYS)
-                        };
-                    }
-                    continue;
-                }
-                in_avail_snapshot = Some(avail);
-            }
-
-            let snapshot = in_avail_snapshot.unwrap();
-            if total >= snapshot {
-                return Ok(total);
-            }
-
-            let remaining_in = snapshot - total;
-            if remaining_in == 0 {
-                return Ok(total);
-            }
-
-            let out_space = out.writable_len();
-            if out_space == 0 {
-                if !out.has_readers() {
-                    // 与 write(2) 一致：无读端时触发 SIGPIPE 并返回 EPIPE
-                    if let Err(e) = send_kernel_signal_to_current(Signal::SIGPIPE) {
-                        log::error!("Failed to send SIGPIPE for tee_to: {:?}", e);
-                    }
-                    return Err(SystemError::EPIPE);
-                }
-
-                if nonblock {
-                    return if total > 0 {
-                        Ok(total)
-                    } else {
-                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                    };
-                }
-
-                // 仅当尚未复制任何字节时才允许阻塞等待。
-                if total > 0 {
+            if let Some(snapshot) = in_avail_snapshot {
+                if total >= snapshot {
                     return Ok(total);
                 }
-
-                let r = wq_wait_event_interruptible!(out.write_wait_queue, out.writeable(), {});
-                if r.is_err() {
-                    return if total > 0 {
-                        Ok(total)
-                    } else {
-                        Err(SystemError::ERESTARTSYS)
-                    };
+            } else {
+                // Check if readable
+                if !self.wait_readable(nonblock)? {
+                    // EOF
+                    return Ok(total);
                 }
-                continue;
             }
 
-            let want = len - total;
-            let chunk = core::cmp::min(want, core::cmp::min(remaining_in, out_space)).min(4096);
-            if chunk == 0 {
-                return Ok(total);
+            // Check output space
+            // tee has special nonblock handling: return total if > 0
+            if out.writable_len() == 0 {
+                if !out.has_readers() {
+                    let _ = send_kernel_signal_to_current(Signal::SIGPIPE);
+                    return Err(SystemError::EPIPE);
+                }
+                if nonblock || total > 0 {
+                    if total > 0 {
+                        return Ok(total);
+                    }
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                // force blocking wait
+                out.wait_writable(false)?;
             }
 
-            let mut tmp = vec![0u8; chunk];
-            // 从 input 的 read_pos + total 开始复制，避免重复复制同一段数据。
-            let peeked = self.peek_into_from(total, chunk, &mut tmp);
-            if peeked == 0 {
-                // Avoid potential busy-spin if concurrent reads drain data.
-                return Ok(total);
-            }
+            let copied = Self::transfer_chunk(self, out, len - total, false, |in_guard| {
+                if in_avail_snapshot.is_none() {
+                    in_avail_snapshot = Some(in_guard.valid_cnt.max(0) as usize);
+                    in_read_pos_snapshot = Some(in_guard.read_pos.max(0) as usize);
+                    in_buf_size_snapshot = Some(in_guard.buf_size);
+                }
 
-            // 写入输出 pipe：这里不调用 File::write，避免依赖 fd flags；直接更新 pipe 缓冲区。
-            let mut out_guard = out.inner.lock();
-            if out_guard.reader == 0 {
-                drop(out_guard);
-                return Err(SystemError::EPIPE);
-            }
-            if out_guard.data.is_empty() {
-                let buf_size = out_guard.buf_size;
-                out_guard.data = vec![0u8; buf_size];
-            }
-            let buf_size = out_guard.buf_size;
-            let used = out_guard.valid_cnt.max(0) as usize;
-            let space_now = buf_size.saturating_sub(used);
-            if space_now < peeked {
-                drop(out_guard);
-                continue;
-            }
-            let start = out_guard.write_pos as usize;
-            let first = core::cmp::min(peeked, buf_size - start);
-            let second = peeked.saturating_sub(first);
-            out_guard.data[start..start + first].copy_from_slice(&tmp[0..first]);
-            if second > 0 {
-                out_guard.data[0..second].copy_from_slice(&tmp[first..first + second]);
-            }
-            out_guard.write_pos = (out_guard.write_pos + peeked as i32) % buf_size as i32;
-            out_guard.valid_cnt += peeked as i32;
+                let snapshot = in_avail_snapshot.unwrap();
+                if total >= snapshot {
+                    return usize::MAX; // Signal to skip everything
+                }
 
-            // 写入后唤醒读端/epoll
-            out.read_wait_queue
-                .wakeup(Some(ProcessState::Blocked(true)));
-            if (out_guard.valid_cnt as usize) < out_guard.buf_size {
-                out.write_wait_queue
-                    .wakeup(Some(ProcessState::Blocked(true)));
-            }
-            let pollflag = out_guard.poll_both_ends();
-            drop(out_guard);
-            let _ = EventPoll::wakeup_epoll(&out.epitems, pollflag);
+                let mut skip = total;
+                if let (Some(start_read_pos), Some(start_buf_size)) =
+                    (in_read_pos_snapshot, in_buf_size_snapshot)
+                {
+                    if start_buf_size == in_guard.buf_size {
+                        let cur_read_pos = in_guard.read_pos.max(0) as usize;
+                        skip = Self::tee_adjusted_skip(
+                            start_read_pos,
+                            cur_read_pos,
+                            start_buf_size,
+                            snapshot,
+                            total,
+                        );
+                    }
+                }
+                skip
+            })?;
 
-            total += peeked;
+            // Wait, I can't put the logic inside closure easily if I can't write it in one go.
+            // I need to write the full closure content.
+
+            total += copied;
         }
 
         Ok(total)
@@ -780,6 +918,31 @@ impl LockedPipeInode {
     /// 是否存在读端（用于判断满管道时返回 EPIPE 还是 EAGAIN）
     pub fn has_readers(&self) -> bool {
         self.inner.lock().reader > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LockedPipeInode;
+
+    #[test]
+    fn tee_adjusted_skip_no_consumption() {
+        assert_eq!(LockedPipeInode::tee_adjusted_skip(0, 0, 100, 80, 50), 50);
+    }
+
+    #[test]
+    fn tee_adjusted_skip_with_consumption() {
+        assert_eq!(LockedPipeInode::tee_adjusted_skip(0, 30, 100, 80, 50), 20);
+    }
+
+    #[test]
+    fn tee_adjusted_skip_consumption_exceeds_total() {
+        assert_eq!(LockedPipeInode::tee_adjusted_skip(0, 80, 100, 80, 50), 0);
+    }
+
+    #[test]
+    fn tee_adjusted_skip_wraparound() {
+        assert_eq!(LockedPipeInode::tee_adjusted_skip(90, 10, 100, 80, 50), 30);
     }
 }
 

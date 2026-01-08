@@ -20,10 +20,10 @@ impl Syscall for SysMlockallHandle {
         let flags = MlockAllFlags::from_bits(args[0] as u32).ok_or(SystemError::EINVAL)?;
 
         // 检查标志位组合合法性
+        // 参考 Linux: mm/mlock.c:do_mlockall()
+        // 必须至少指定 MCL_CURRENT 或 MCL_FUTURE 之一
         // MCL_ONFAULT 必须与 MCL_CURRENT 或 MCL_FUTURE 一起使用
-        if flags.contains(MlockAllFlags::MCL_ONFAULT)
-            && !flags.intersects(MlockAllFlags::MCL_CURRENT | MlockAllFlags::MCL_FUTURE)
-        {
+        if !flags.intersects(MlockAllFlags::MCL_CURRENT | MlockAllFlags::MCL_FUTURE) {
             return Err(SystemError::EINVAL);
         }
 

@@ -1328,7 +1328,7 @@ impl InnerAddressSpace {
             if !vma.is_accessible() {
                 has_inaccessible_vma = true;
             }
-            let mut guard = vma.lock_irqsave();
+            let guard = vma.lock_irqsave();
             let current_flags = *guard.vm_flags();
             let vma_start = guard.region().start();
             let vma_end = guard.region().end();

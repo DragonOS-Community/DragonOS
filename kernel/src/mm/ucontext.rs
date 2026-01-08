@@ -1308,6 +1308,8 @@ impl InnerAddressSpace {
         let region = VirtRegion::new(start, len);
         let vmas: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region).collect();
 
+        let mut newly_locked_pages = 0;
+
         // 遍历所有 VMA
         // 对于不可访问的 VMA（如 PROT_NONE），mlock 应该失败，返回 ENOMEM
         // 但 VMA 仍然应该被标记为 locked（Linux 语义）
@@ -1318,13 +1320,30 @@ impl InnerAddressSpace {
             }
             let mut guard = vma.lock_irqsave();
             let current_flags = *guard.vm_flags();
+            let vma_start = guard.region().start();
+            let vma_end = guard.region().end();
+            drop(guard);
+
+            // 检查 VMA 是否已经锁定
+            let was_locked = current_flags.contains(VmFlags::VM_LOCKED)
+                || current_flags.contains(VmFlags::VM_LOCKONFAULT);
+
             // 添加锁定标志
+            let mut guard = vma.lock_irqsave();
             guard.set_vm_flags(current_flags | new_flags);
+
+            // 如果之前未锁定，则增加计数
+            if !was_locked {
+                // 计算 VMA 与请求范围的交集
+                let lock_start = core::cmp::max(vma_start, start);
+                let lock_end = core::cmp::min(vma_end, end);
+                let lock_len = lock_end.data() - lock_start.data();
+                newly_locked_pages += lock_len >> MMArch::PAGE_SHIFT;
+            }
         }
 
-        // 更新 locked_vm 计数
-        let page_count = len >> MMArch::PAGE_SHIFT;
-        self.locked_vm.fetch_add(page_count, Ordering::Relaxed);
+        // 只更新新增的锁定页面计数
+        self.locked_vm.fetch_add(newly_locked_pages, Ordering::Relaxed);
 
         // 如果有不可访问的 VMA，返回 ENOMEM
         if has_inaccessible_vma {

@@ -29,6 +29,8 @@ pub struct SysInfo {
 }
 
 impl Syscall {
+    /// ## 将系统信息写入info指向的用户 vma 中的结构体
+    /// ### 目前只实现了内存相关的信息
     pub fn sysinfo(info: *mut SysInfo) -> Result<usize, SystemError> {
         let mut writer = UserBufferWriter::new(info, core::mem::size_of::<SysInfo>(), true)?;
         let mut sysinfo = SysInfo::default();

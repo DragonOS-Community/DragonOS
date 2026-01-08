@@ -1503,9 +1503,8 @@ impl InnerAddressSpace {
                     let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
                     let mut total_locked = 0;
                     for (vma, start, end) in vmas_to_lock {
-                        match vma.mlock_vma_pages_range(&mapper, start, end, true) {
-                            Ok(count) => total_locked += count,
-                            Err(_) => {}
+                        if let Ok(count) = vma.mlock_vma_pages_range(&mapper, start, end, true) {
+                            total_locked += count;
                         }
                     }
                     // 更新 locked_vm 计数，确保 RLIMIT_MEMLOCK 检查正确

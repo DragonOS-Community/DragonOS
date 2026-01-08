@@ -121,7 +121,7 @@ impl LockedVMA {
         end_addr: VirtAddr,
         lock: bool,
     ) -> Result<usize, SystemError> {
-        let page_count = self.mlock_walk_page_range(mapper, start_addr, end_addr, 3, lock)?;
+        let page_count = Self::mlock_walk_page_range(mapper, start_addr, end_addr, 3, lock)?;
         Ok(page_count)
     }
 
@@ -137,7 +137,6 @@ impl LockedVMA {
     /// # 返回
     /// - 返回已处理的页面数
     fn mlock_walk_page_range(
-        &self,
         mapper: &PageMapper,
         start_addr: VirtAddr,
         end_addr: VirtAddr,
@@ -169,7 +168,7 @@ impl LockedVMA {
                 } else if level > 0 {
                     // 递归处理下一级页表
                     let sub_pages =
-                        self.mlock_walk_page_range(mapper, start, next, level - 1, lock)?;
+                        Self::mlock_walk_page_range(mapper, start, next, level - 1, lock)?;
                     page_count += sub_pages;
                 } else {
                     // 叶子节点（4K页）

@@ -689,8 +689,8 @@ impl InnerAddressSpace {
 
         // 更新 locked_vm 计数（如果设置了 VM_LOCKED 或 VM_LOCKONFAULT）
         // 参考 Linux: mm/mmap.c:mmap_region() 中的 accounting
-        let is_locked = vm_flags.contains(VmFlags::VM_LOCKED)
-            || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+        let is_locked =
+            vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
         if is_locked {
             let page_count = page_count.data();
             self.locked_vm.fetch_add(page_count, Ordering::Relaxed);

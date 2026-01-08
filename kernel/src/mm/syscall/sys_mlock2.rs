@@ -7,6 +7,7 @@ use crate::mm::{
     ucontext::AddressSpace,
     MemoryManagementArch, VirtAddr,
 };
+use crate::process::{resource::RLimitID, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -53,6 +54,31 @@ impl Syscall for SysMlock2Handle {
 
         // 获取当前地址空间
         let addr_space = AddressSpace::current()?;
+
+        // RLIMIT_MEMLOCK 检查
+        // 参考 Linux: mm/mlock.c:do_mlock()
+        let lock_limit = ProcessManager::current_pcb()
+            .get_rlimit(RLimitID::Memlock)
+            .rlim_cur as usize;
+
+        // 将限制转换为页面数
+        let lock_limit_pages = if lock_limit == usize::MAX {
+            usize::MAX
+        } else {
+            lock_limit >> MMArch::PAGE_SHIFT
+        };
+
+        let requested_pages = aligned_len >> MMArch::PAGE_SHIFT;
+
+        // 计算当前已锁定的页面数
+        let current_locked = addr_space.read().locked_vm();
+
+        // 检查是否超过限制
+        // 参考 Linux: mm/mlock.c:do_mlock() 和 user_lock_limit()
+        // 如果没有 CAP_IPC_LOCK 权限，需要检查 RLIMIT_MEMLOCK 限制
+        if current_locked + requested_pages > lock_limit_pages {
+            return Err(SystemError::ENOMEM);
+        }
 
         // 执行 mlock2（支持 MLOCK_ONFAULT）
         let onfault = flags.contains(Mlock2Flags::MLOCK_ONFAULT);

@@ -1343,7 +1343,8 @@ impl InnerAddressSpace {
         }
 
         // 只更新新增的锁定页面计数
-        self.locked_vm.fetch_add(newly_locked_pages, Ordering::Relaxed);
+        self.locked_vm
+            .fetch_add(newly_locked_pages, Ordering::Relaxed);
 
         // 如果有不可访问的 VMA，返回 ENOMEM
         if has_inaccessible_vma {

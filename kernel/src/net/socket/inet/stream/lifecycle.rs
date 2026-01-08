@@ -450,7 +450,12 @@ impl TcpSocket {
                 // If there is unread data, we must send RST instead of FIN (RFC 2525).
                 // This prevents the peer from believing it received all data.
                 let has_unread = es.with(|s| s.recv_queue() > 0);
-                if has_unread {
+                
+                // If SO_LINGER is enabled with 0 timeout, we must also abort (send RST).
+                let linger_active = self.options.so_linger_active.load(Ordering::Relaxed);
+                let linger_seconds = self.options.so_linger_seconds.load(Ordering::Relaxed);
+                
+                if has_unread || (linger_active && linger_seconds == 0) {
                     es.with_mut(|s| s.abort());
                     // abort() changes state to Closed, but we must poll to send the RST packet immediately
                     iface.poll();

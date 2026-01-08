@@ -21,6 +21,20 @@ pub const DEFAULT_TCP_MSS: usize = 536;
 /// 默认SYN重传次数
 pub const DEFAULT_TCP_SYNCNT: i32 = 6;
 
+// Keepalive limits
+pub const MAX_TCP_KEEPIDLE: i32 = 32767;
+pub const MAX_TCP_KEEPINTVL: i32 = 32767;
+pub const MAX_TCP_KEEPCNT: i32 = 127;
+
+// Keepalive defaults (aligned with Linux defaults)
+// See Linux kernel: include/net/tcp.h
+/// Default time (in seconds) before keepalive probes start (7200s = 2h)
+pub const DEFAULT_TCP_KEEPIDLE: i32 = 7200;
+/// Default interval (in seconds) between keepalive probes (75s)
+pub const DEFAULT_TCP_KEEPINTVL: i32 = 75;
+/// Default number of keepalive probes before dropping connection (9)
+pub const DEFAULT_TCP_KEEPCNT: i32 = 9;
+
 // ========== Socket缓冲区常量 - 参考Linux内核 include/net/sock.h ==========
 
 /// 最小socket缓冲区基本单位（用于SO_SNDBUF/SO_RCVBUF的clamp下限）

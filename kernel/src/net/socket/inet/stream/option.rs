@@ -147,7 +147,8 @@ impl PosixTcpInfo {
                 info.tcpi_rcv_mss = constants::DEFAULT_TCP_MSS as u32;
 
                 if mss > 0 {
-                    info.tcpi_snd_cwnd = (socket.cwnd() / mss) as u32;
+                    // Use ceil division to ensure cwnd > 0 if socket.cwnd() > 0
+                    info.tcpi_snd_cwnd = (socket.cwnd().saturating_add(mss - 1) / mss) as u32;
                     info.tcpi_snd_ssthresh = (socket.ssthresh() / mss) as u32;
                 } else {
                     info.tcpi_snd_cwnd = socket.cwnd() as u32;
@@ -419,12 +420,30 @@ impl super::TcpSocket {
                 let on = byte_parser::read_bool_flag(val)?;
                 self.so_keepalive_enabled()
                     .store(on, core::sync::atomic::Ordering::Relaxed);
+                
                 let interval = if on {
-                    Some(smoltcp::time::Duration::from_secs(7200))
+                    let keepidle = self.tcp_keepidle().load(core::sync::atomic::Ordering::Relaxed);
+                    // Ensure keepidle is at least 1 second to avoid issues, though smoltcp might handle it.
+                    // Linux default is 7200.
+                    Some(smoltcp::time::Duration::from_secs(keepidle as u64))
                 } else {
                     None
                 };
                 self.apply_keepalive(interval);
+                Ok(())
+            }
+            PSO::LINGER => {
+                // struct linger { int l_onoff; int l_linger; }
+                if val.len() < 8 {
+                    return Err(SystemError::EINVAL);
+                }
+                let l_onoff = byte_parser::read_i32(&val[0..4])?;
+                let l_linger = byte_parser::read_i32(&val[4..8])?;
+
+                self.so_linger_active()
+                    .store(l_onoff != 0, core::sync::atomic::Ordering::Relaxed);
+                self.so_linger_seconds()
+                    .store(l_linger, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             _ => Ok(()), // Accept and ignore other SOL_SOCKET options
@@ -455,17 +474,38 @@ impl super::TcpSocket {
                 Ok(())
             }
             Options::KeepIntvl => {
-                let interval = byte_parser::read_u32(val)?;
-                self.with_inner_established(|est| {
-                    est.with_mut(|socket| {
-                        socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
-                            interval as u64,
-                        )));
-                    });
-                })?;
+                let v = byte_parser::read_i32(val)?;
+                if v <= 0 || v > constants::MAX_TCP_KEEPINTVL {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_keepintvl()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            Options::KeepCnt | Options::KeepIdle => Ok(()), // Stub: silently ignore
+            Options::KeepCnt => {
+                let v = byte_parser::read_i32(val)?;
+                if v <= 0 || v > constants::MAX_TCP_KEEPCNT {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_keepcnt()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::KeepIdle => {
+                let v = byte_parser::read_i32(val)?;
+                if v <= 0 || v > constants::MAX_TCP_KEEPIDLE {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_keepidle()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                
+                // If keepalive is enabled, update the socket with new idle time
+                let is_enabled = self.so_keepalive_enabled().load(core::sync::atomic::Ordering::Relaxed);
+                if is_enabled {
+                    self.apply_keepalive(Some(smoltcp::time::Duration::from_secs(v as u64)));
+                }
+                Ok(())
+            }
             Options::INQ => {
                 let on = byte_parser::read_bool_flag(val)?;
                 self.tcp_inq_enabled()
@@ -600,6 +640,26 @@ impl super::TcpSocket {
                 };
                 Self::write_i32_opt(value, v)
             }
+            PSO::LINGER => {
+                let l_onoff: i32 = if self
+                    .so_linger_active()
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    1
+                } else {
+                    0
+                };
+                let l_linger = self
+                    .so_linger_seconds()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+
+                if value.len() < 8 {
+                    return Err(SystemError::EINVAL);
+                }
+                Self::write_i32_opt(&mut value[0..4], l_onoff)?;
+                Self::write_i32_opt(&mut value[4..8], l_linger)?;
+                Ok(8)
+            }
             _ => {
                 // Most SOL_SOCKET options are handled by sys_getsockopt directly.
                 Err(SystemError::ENOPROTOOPT)
@@ -684,6 +744,9 @@ impl super::TcpSocket {
 
                 Ok(len)
             }
+            Options::KeepIdle => Self::write_atomic_i32(value, self.tcp_keepidle()),
+            Options::KeepIntvl => Self::write_atomic_i32(value, self.tcp_keepintvl()),
+            Options::KeepCnt => Self::write_atomic_i32(value, self.tcp_keepcnt()),
             Options::MaxSegment => Self::write_atomic_usize_as_u32(value, self.tcp_max_seg()),
             Options::DeferAccept => Self::write_atomic_i32(value, self.tcp_defer_accept()),
             Options::Syncnt => Self::write_atomic_i32(value, self.tcp_syncnt()),

@@ -11,7 +11,7 @@ use crate::{
     arch::{mm::PageMapper, MMArch},
     libs::align::align_down,
     mm::{
-        mlock::{mlock_page, munlock_page},
+        mlock::mlock_page,
         page::{page_manager_lock_irqsave, EntryFlags},
         ucontext::LockedVMA,
         VirtAddr, VmFaultReason, VmFlags,
@@ -240,6 +240,7 @@ impl PageFaultHandler {
         let vma = pfm.vma.clone();
         let mapper = &mut pfm.mapper;
         let mut should_lock = false;
+        let _ = should_lock;
         // If this is an anonymous shared mapping, use a shared backing so pages are visible across fork
         {
             let guard = vma.lock_irqsave();

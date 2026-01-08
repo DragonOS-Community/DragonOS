@@ -679,6 +679,7 @@ impl LockedPipeInode {
         }
 
         if out_guard.reader == 0 {
+            let _ = send_kernel_signal_to_current(Signal::SIGPIPE);
             return Err(SystemError::EPIPE);
         }
 
@@ -901,8 +902,16 @@ impl LockedPipeInode {
                 skip
             })?;
 
-            // Wait, I can't put the logic inside closure easily if I can't write it in one go.
-            // I need to write the full closure content.
+            if copied == 0 {
+                // Snapshot may be stale if another reader drained the pipe; refresh on next loop.
+                in_avail_snapshot = None;
+                in_read_pos_snapshot = None;
+                in_buf_size_snapshot = None;
+                if nonblock && total > 0 {
+                    return Ok(total);
+                }
+                continue;
+            }
 
             total += copied;
         }

@@ -1370,15 +1370,25 @@ impl InnerAddressSpace {
         let region = VirtRegion::new(start, len);
         let vmas: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region).collect();
 
+        let mut unlocked_pages = 0;
+
         unsafe {
             let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
 
             for vma in &vmas {
-                // 先解锁页面
                 let vma_guard = vma.lock_irqsave();
+                let vm_flags = *vma_guard.vm_flags();
                 let vma_start = vma_guard.region().start();
                 let vma_end = vma_guard.region().end();
                 drop(vma_guard);
+
+                // 只处理已锁定或 lock on fault 的 VMA
+                let was_locked = vm_flags.contains(VmFlags::VM_LOCKED)
+                    || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+
+                if !was_locked {
+                    continue;
+                }
 
                 // 计算 VMA 与请求范围的交集
                 let unlock_start = core::cmp::max(vma_start, start);
@@ -1391,12 +1401,15 @@ impl InnerAddressSpace {
                 let mut guard = vma.lock_irqsave();
                 let current_flags = *guard.vm_flags();
                 guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
+
+                // 计算实际解锁的页面数
+                let unlock_len = unlock_end.data() - unlock_start.data();
+                unlocked_pages += unlock_len >> MMArch::PAGE_SHIFT;
             }
         }
 
-        // 更新 locked_vm 计数
-        let page_count = len >> MMArch::PAGE_SHIFT;
-        self.locked_vm.fetch_sub(page_count, Ordering::Relaxed);
+        // 更新 locked_vm 计数（只减少实际解锁的页面数）
+        self.locked_vm.fetch_sub(unlocked_pages, Ordering::Relaxed);
 
         Ok(())
     }

@@ -1,3 +1,4 @@
+use crate::filesystem::vfs::syscall::SpliceFlags;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     arch::{ipc::signal::Signal, MMArch},
@@ -11,7 +12,7 @@ use crate::{
             FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata, PollableInode, SuperBlock,
         },
     },
-    ipc::signal_types::SigCode,
+    ipc::signal::send_kernel_signal_to_current,
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     mm::MemoryManagementArch,
     process::{ProcessFlags, ProcessManager, ProcessState},
@@ -22,18 +23,19 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::compiler_fence;
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
-
-use super::signal_types::{SigInfo, SigType};
 
 /// 管道缓冲区默认大小（Linux 默认 65536 字节）
 pub const PIPE_BUFF_SIZE: usize = 65536;
 
 /// 管道缓冲区最小大小（一页大小，Linux 保证原子写入的最小单位）
 pub const PIPE_MIN_SIZE: usize = 4096;
+
+/// PIPE_BUF: writes of <= PIPE_BUF must be atomic.
+/// Linux guarantees PIPE_BUF is at least a page (4096).
+pub const PIPE_BUF: usize = PIPE_MIN_SIZE;
 
 /// 管道缓冲区最大大小（Linux 默认为 1MB）
 pub const PIPE_MAX_SIZE: usize = 1024 * 1024;
@@ -269,6 +271,17 @@ impl LockedPipeInode {
         return !inode.buf_full() || inode.reader == 0;
     }
 
+    /// Whether the pipe has at least `need` bytes of free space.
+    /// Used to implement PIPE_BUF atomic write semantics.
+    fn writeable_len_at_least(&self, need: usize) -> bool {
+        let inode = self.inner.lock();
+        if inode.reader == 0 {
+            return true;
+        }
+        let used = inode.valid_cnt.max(0) as usize;
+        inode.buf_size.saturating_sub(used) >= need
+    }
+
     /// 检查写端计数器是否已变化（用于 FIFO O_RDONLY 阻塞等待）
     /// 采用 Linux 内核的设计：等待计数器变化而非检查 writer > 0
     ///
@@ -374,6 +387,399 @@ impl LockedPipeInode {
     /// 获取管道缓冲区大小
     pub fn get_pipe_size(&self) -> usize {
         self.inner.lock().buf_size
+    }
+
+    /// 当前管道中可读的字节数（不阻塞、不睡眠）
+    pub fn readable_len(&self) -> usize {
+        let guard = self.inner.lock();
+        guard.valid_cnt.max(0) as usize
+    }
+
+    /// 当前管道中可写的空闲字节数（不阻塞、不睡眠）
+    pub fn writable_len(&self) -> usize {
+        let guard = self.inner.lock();
+        let used = guard.valid_cnt.max(0) as usize;
+        guard.buf_size.saturating_sub(used)
+    }
+
+    /// 从管道中“窥视”最多 `len` 字节数据到 `buf`，但不消耗管道数据。
+    ///
+    /// 返回实际拷贝的字节数（可能小于 `len`）。不会睡眠。
+    pub fn peek_into(&self, len: usize, buf: &mut [u8]) -> usize {
+        self.peek_into_from(0, len, buf)
+    }
+
+    /// 从管道中“窥视”从当前 read_pos 起偏移 `skip` 字节后的内容（不消耗）。
+    ///
+    /// `skip` 必须小于等于当前可读字节数（否则返回 0）。不会睡眠。
+    pub fn peek_into_from(&self, skip: usize, len: usize, buf: &mut [u8]) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let guard = self.inner.lock();
+        if guard.valid_cnt <= 0 {
+            return 0;
+        }
+        if guard.data.is_empty() {
+            return 0;
+        }
+
+        let available = guard.valid_cnt as usize;
+        if skip > available {
+            return 0;
+        }
+        if skip == available {
+            return 0;
+        }
+
+        let available = available - skip;
+        let num = core::cmp::min(len, available).min(buf.len());
+        let buf_size = guard.buf_size;
+        let start = (guard.read_pos as usize + skip) % buf_size;
+
+        let first = core::cmp::min(num, buf_size - start);
+        let second = num.saturating_sub(first);
+        buf[0..first].copy_from_slice(&guard.data[start..start + first]);
+        if second > 0 {
+            buf[first..num].copy_from_slice(&guard.data[0..second]);
+        }
+        num
+    }
+
+    /// splice/tee helper: 在不消耗数据的前提下，按需阻塞等待并窥视 pipe 中的数据。
+    ///
+    /// - 若 pipe 为空且无 writers：返回 0 (EOF)
+    /// - 若 pipe 为空且有 writers：nonblock 返回 EAGAIN，否则阻塞直到可读或被信号打断
+    pub(crate) fn peek_into_from_blocking(
+        &self,
+        skip: usize,
+        len: usize,
+        buf: &mut [u8],
+        nonblock: bool,
+    ) -> Result<usize, SystemError> {
+        loop {
+            let (available, has_writers) = {
+                let guard = self.inner.lock();
+                (guard.valid_cnt.max(0) as usize, guard.writer > 0)
+            };
+
+            if available == 0 {
+                if !has_writers {
+                    return Ok(0);
+                }
+                if nonblock {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+
+                let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
+                if r.is_err() {
+                    ProcessManager::current_pcb()
+                        .flags()
+                        .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+                    return Err(SystemError::ERESTARTSYS);
+                }
+                continue;
+            }
+
+            return Ok(self.peek_into_from(skip, len, buf));
+        }
+    }
+
+    /// splice helper: 消耗 pipe 中前 `n` 字节（不复制数据）。
+    /// 返回实际消耗的字节数。
+    pub(crate) fn consume_front(&self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+
+        let mut inner_guard = self.inner.lock();
+        let available = inner_guard.valid_cnt.max(0) as usize;
+        let num = core::cmp::min(n, available);
+        if num == 0 {
+            return 0;
+        }
+
+        let buf_size = inner_guard.buf_size;
+        inner_guard.read_pos = (inner_guard.read_pos + num as i32) % buf_size as i32;
+        inner_guard.valid_cnt -= num as i32;
+
+        if inner_guard.valid_cnt > 0 {
+            self.read_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
+        }
+
+        self.write_wait_queue
+            .wakeup(Some(ProcessState::Blocked(true)));
+        let pollflag = inner_guard.poll_both_ends();
+        drop(inner_guard);
+        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        num
+    }
+
+    /// splice(2): 将本管道中的数据移动到目标管道（消耗输入数据）。
+    ///
+    /// 语义对齐 Linux fs/splice.c: splice_pipe_to_pipe()/wait_for_space()/ipipe_prep/opipe_prep。
+    pub fn splice_to_pipe(
+        &self,
+        out: &LockedPipeInode,
+        len: usize,
+        flags: SpliceFlags,
+    ) -> Result<usize, SystemError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let nonblock = flags.contains(SpliceFlags::SPLICE_F_NONBLOCK);
+
+        loop {
+            let in_avail = self.readable_len();
+            if in_avail == 0 {
+                if !self.has_writers() {
+                    return Ok(0);
+                }
+                if nonblock {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
+                if r.is_err() {
+                    return Err(SystemError::ERESTARTSYS);
+                }
+                continue;
+            }
+
+            let out_space = out.writable_len();
+            if out_space == 0 {
+                if !out.has_readers() {
+                    if let Err(e) = send_kernel_signal_to_current(Signal::SIGPIPE) {
+                        log::error!("Failed to send SIGPIPE for splice_to_pipe: {:?}", e);
+                    }
+                    return Err(SystemError::EPIPE);
+                }
+                if nonblock {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                let r = wq_wait_event_interruptible!(out.write_wait_queue, out.writeable(), {});
+                if r.is_err() {
+                    return Err(SystemError::ERESTARTSYS);
+                }
+                continue;
+            }
+
+            let want = len.min(4096);
+            let chunk = core::cmp::min(want, core::cmp::min(in_avail, out_space));
+            if chunk == 0 {
+                return Ok(0);
+            }
+
+            // Copy out under input lock (short critical section).
+            let mut tmp = vec![0u8; chunk];
+            let peeked = self.peek_into_from(0, chunk, &mut tmp);
+            if peeked == 0 {
+                continue;
+            }
+
+            // Write into output under output lock.
+            let mut out_guard = out.inner.lock();
+            if out_guard.reader == 0 {
+                drop(out_guard);
+                return Err(SystemError::EPIPE);
+            }
+            if out_guard.data.is_empty() {
+                let buf_size = out_guard.buf_size;
+                out_guard.data = vec![0u8; buf_size];
+            }
+            let buf_size = out_guard.buf_size;
+            let used = out_guard.valid_cnt.max(0) as usize;
+            let space_now = buf_size.saturating_sub(used);
+            if space_now < peeked {
+                drop(out_guard);
+                continue;
+            }
+
+            let start = out_guard.write_pos as usize;
+            let first = core::cmp::min(peeked, buf_size - start);
+            let second = peeked.saturating_sub(first);
+            out_guard.data[start..start + first].copy_from_slice(&tmp[0..first]);
+            if second > 0 {
+                out_guard.data[0..second].copy_from_slice(&tmp[first..first + second]);
+            }
+            out_guard.write_pos = (out_guard.write_pos + peeked as i32) % buf_size as i32;
+            out_guard.valid_cnt += peeked as i32;
+
+            out.read_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
+            if (out_guard.valid_cnt as usize) < out_guard.buf_size {
+                out.write_wait_queue
+                    .wakeup(Some(ProcessState::Blocked(true)));
+            }
+            let pollflag = out_guard.poll_both_ends();
+            drop(out_guard);
+            let _ = EventPoll::wakeup_epoll(&out.epitems, pollflag);
+
+            // Finally consume from input.
+            let consumed = self.consume_front(peeked);
+            return Ok(consumed);
+        }
+    }
+
+    /// tee(2): 将本管道中的数据复制到目标管道，但不消耗本管道数据。
+    ///
+    /// 参考 Linux 语义：当 input 为空且仍有 writer 时，阻塞或返回 EAGAIN；
+    /// 当 output 满且仍有 reader 时，阻塞或返回 EAGAIN。
+    pub fn tee_to(
+        &self,
+        out: &LockedPipeInode,
+        len: usize,
+        flags: crate::filesystem::vfs::syscall::SpliceFlags,
+    ) -> Result<usize, SystemError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let nonblock =
+            flags.contains(crate::filesystem::vfs::syscall::SpliceFlags::SPLICE_F_NONBLOCK);
+
+        let mut total: usize = 0;
+        // Linux link_pipe() 语义：从当前 tail/read_pos 起复制现有数据（不会重复从起点复制）。
+        // 为避免在本次调用中“重复复制同一段数据”，在首次观察到“可读”时，
+        // 记录当时的可读数据量作为本次调用的上限（不会等待更多数据凑满 len）。
+        let mut in_avail_snapshot: Option<usize> = None;
+        while total < len {
+            if in_avail_snapshot.is_none() {
+                let avail = self.readable_len();
+                if avail == 0 {
+                    if !self.has_writers() {
+                        return Ok(total);
+                    }
+                    if nonblock {
+                        return if total > 0 {
+                            Ok(total)
+                        } else {
+                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                        };
+                    }
+                    // 阻塞：等待至少 1 字节可读（或 writer 关闭导致 readable() 返回 true）
+                    let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
+                    if r.is_err() {
+                        return if total > 0 {
+                            Ok(total)
+                        } else {
+                            Err(SystemError::ERESTARTSYS)
+                        };
+                    }
+                    continue;
+                }
+                in_avail_snapshot = Some(avail);
+            }
+
+            let snapshot = in_avail_snapshot.unwrap();
+            if total >= snapshot {
+                return Ok(total);
+            }
+
+            let remaining_in = snapshot - total;
+            if remaining_in == 0 {
+                return Ok(total);
+            }
+
+            let out_space = out.writable_len();
+            if out_space == 0 {
+                if !out.has_readers() {
+                    // 与 write(2) 一致：无读端时触发 SIGPIPE 并返回 EPIPE
+                    if let Err(e) = send_kernel_signal_to_current(Signal::SIGPIPE) {
+                        log::error!("Failed to send SIGPIPE for tee_to: {:?}", e);
+                    }
+                    return Err(SystemError::EPIPE);
+                }
+
+                if nonblock {
+                    return if total > 0 {
+                        Ok(total)
+                    } else {
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    };
+                }
+
+                // 仅当尚未复制任何字节时才允许阻塞等待。
+                if total > 0 {
+                    return Ok(total);
+                }
+
+                let r = wq_wait_event_interruptible!(out.write_wait_queue, out.writeable(), {});
+                if r.is_err() {
+                    return if total > 0 {
+                        Ok(total)
+                    } else {
+                        Err(SystemError::ERESTARTSYS)
+                    };
+                }
+                continue;
+            }
+
+            let want = len - total;
+            let chunk = core::cmp::min(want, core::cmp::min(remaining_in, out_space)).min(4096);
+            if chunk == 0 {
+                return Ok(total);
+            }
+
+            let mut tmp = vec![0u8; chunk];
+            // 从 input 的 read_pos + total 开始复制，避免重复复制同一段数据。
+            let peeked = self.peek_into_from(total, chunk, &mut tmp);
+            if peeked == 0 {
+                // Avoid potential busy-spin if concurrent reads drain data.
+                return Ok(total);
+            }
+
+            // 写入输出 pipe：这里不调用 File::write，避免依赖 fd flags；直接更新 pipe 缓冲区。
+            let mut out_guard = out.inner.lock();
+            if out_guard.reader == 0 {
+                drop(out_guard);
+                return Err(SystemError::EPIPE);
+            }
+            if out_guard.data.is_empty() {
+                let buf_size = out_guard.buf_size;
+                out_guard.data = vec![0u8; buf_size];
+            }
+            let buf_size = out_guard.buf_size;
+            let used = out_guard.valid_cnt.max(0) as usize;
+            let space_now = buf_size.saturating_sub(used);
+            if space_now < peeked {
+                drop(out_guard);
+                continue;
+            }
+            let start = out_guard.write_pos as usize;
+            let first = core::cmp::min(peeked, buf_size - start);
+            let second = peeked.saturating_sub(first);
+            out_guard.data[start..start + first].copy_from_slice(&tmp[0..first]);
+            if second > 0 {
+                out_guard.data[0..second].copy_from_slice(&tmp[first..first + second]);
+            }
+            out_guard.write_pos = (out_guard.write_pos + peeked as i32) % buf_size as i32;
+            out_guard.valid_cnt += peeked as i32;
+
+            // 写入后唤醒读端/epoll
+            out.read_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
+            if (out_guard.valid_cnt as usize) < out_guard.buf_size {
+                out.write_wait_queue
+                    .wakeup(Some(ProcessState::Blocked(true)));
+            }
+            let pollflag = out_guard.poll_both_ends();
+            drop(out_guard);
+            let _ = EventPoll::wakeup_epoll(&out.epitems, pollflag);
+
+            total += peeked;
+        }
+
+        Ok(total)
+    }
+
+    /// 是否存在写端（用于判断空管道时返回 EOF 还是 EAGAIN）
+    pub fn has_writers(&self) -> bool {
+        self.inner.lock().writer > 0
+    }
+
+    /// 是否存在读端（用于判断满管道时返回 EPIPE 还是 EAGAIN）
+    pub fn has_readers(&self) -> bool {
+        self.inner.lock().reader > 0
     }
 }
 
@@ -750,6 +1156,10 @@ impl IndexNode for LockedPipeInode {
         // 加锁
         let mut inner_guard = self.inner.lock();
 
+        // PIPE_BUF atomicity: if len <= PIPE_BUF, writes must be all-or-nothing.
+        // We implement this by waiting for enough room before writing the first byte.
+        let atomic_write = len <= PIPE_BUF;
+
         if inner_guard.reader == 0 {
             if !inner_guard.had_reader {
                 // 如果从未有读端，直接返回 ENXIO，无论是否阻塞模式
@@ -762,26 +1172,9 @@ impl IndexNode for LockedPipeInode {
                         return Err(SystemError::EPIPE);
                     }
                     false => {
-                        let sig = Signal::SIGPIPE;
-                        let mut info = SigInfo::new(
-                            sig,
-                            0,
-                            SigCode::Kernel,
-                            SigType::Kill {
-                                pid: ProcessManager::current_pcb().task_pid_vnr(),
-                                uid: ProcessManager::current_pcb().cred().uid.data() as u32,
-                            },
-                        );
-                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-                        let _retval = sig
-                            .send_signal_info(
-                                Some(&mut info),
-                                ProcessManager::current_pcb().task_pid_vnr(),
-                            )
-                            .map(|x| x as usize);
-
-                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                        if let Err(e) = send_kernel_signal_to_current(Signal::SIGPIPE) {
+                            log::error!("Failed to send SIGPIPE for pipe write: {:?}", e);
+                        }
                         return Err(SystemError::EPIPE);
                     }
                 }
@@ -804,8 +1197,16 @@ impl IndexNode for LockedPipeInode {
             let buf_size = inner_guard.buf_size;
             let available_space = buf_size - inner_guard.valid_cnt as usize;
 
-            // 如果没有可用空间，需要等待
-            if available_space == 0 {
+            // 如果没有足够空间需要等待
+            // - non-atomic writes: only wait when pipe is full
+            // - atomic writes (<= PIPE_BUF): wait until we have room for the entire write
+            let need_wait = if atomic_write && total_written == 0 {
+                available_space < len
+            } else {
+                available_space == 0
+            };
+
+            if need_wait {
                 // 唤醒读端
                 self.read_wait_queue
                     .wakeup(Some(ProcessState::Blocked(true)));
@@ -821,7 +1222,16 @@ impl IndexNode for LockedPipeInode {
 
                 // 解锁并睡眠
                 drop(inner_guard);
-                let r = wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {});
+
+                let r = if atomic_write && total_written == 0 {
+                    wq_wait_event_interruptible!(
+                        self.write_wait_queue,
+                        self.writeable_len_at_least(len),
+                        {}
+                    )
+                } else {
+                    wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {})
+                };
 
                 if r.is_err() {
                     if total_written > 0 {
@@ -837,24 +1247,9 @@ impl IndexNode for LockedPipeInode {
 
                     // 发送 SIGPIPE 信号（阻塞模式下）
                     if !flags.contains(FileFlags::O_NONBLOCK) {
-                        let sig = Signal::SIGPIPE;
-                        let mut info = SigInfo::new(
-                            sig,
-                            0,
-                            SigCode::Kernel,
-                            SigType::Kill {
-                                pid: ProcessManager::current_pcb().task_pid_vnr(),
-                                uid: ProcessManager::current_pcb().cred().uid.data() as u32,
-                            },
-                        );
-                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-                        let _ = sig.send_signal_info(
-                            Some(&mut info),
-                            ProcessManager::current_pcb().task_pid_vnr(),
-                        );
-
-                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                        if let Err(e) = send_kernel_signal_to_current(Signal::SIGPIPE) {
+                            log::error!("Failed to send SIGPIPE for pipe write: {:?}", e);
+                        }
                     }
 
                     if total_written > 0 {

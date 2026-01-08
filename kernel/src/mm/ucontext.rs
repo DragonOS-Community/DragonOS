@@ -1328,19 +1328,19 @@ impl InnerAddressSpace {
             if !vma.is_accessible() {
                 has_inaccessible_vma = true;
             }
-            let guard = vma.lock_irqsave();
+
+            let mut guard = vma.lock_irqsave();
             let current_flags = *guard.vm_flags();
             let vma_start = guard.region().start();
             let vma_end = guard.region().end();
-            drop(guard);
 
             // 检查 VMA 是否已经锁定
             let was_locked = current_flags.contains(VmFlags::VM_LOCKED)
                 || current_flags.contains(VmFlags::VM_LOCKONFAULT);
 
             // 添加锁定标志
-            let mut guard = vma.lock_irqsave();
             guard.set_vm_flags(current_flags | new_flags);
+            drop(guard);
 
             // 如果之前未锁定，则增加计数
             if !was_locked {

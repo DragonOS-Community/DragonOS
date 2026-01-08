@@ -677,14 +677,24 @@ impl InnerAddressSpace {
         };
         compiler_fence(Ordering::SeqCst);
         // 映射页面，并将VMA插入到地址空间的VMA列表中
-        self.mappings.insert_vma(map_func(
+        let vma = map_func(
             page,
             page_count,
             vm_flags,
             EntryFlags::from_prot_flags(prot_flags, true),
             &mut self.user_mapper.utable,
             flusher,
-        )?);
+        )?;
+        self.mappings.insert_vma(vma.clone());
+
+        // 更新 locked_vm 计数（如果设置了 VM_LOCKED 或 VM_LOCKONFAULT）
+        // 参考 Linux: mm/mmap.c:mmap_region() 中的 accounting
+        let is_locked = vm_flags.contains(VmFlags::VM_LOCKED)
+            || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+        if is_locked {
+            let page_count = page_count.data();
+            self.locked_vm.fetch_add(page_count, Ordering::Relaxed);
+        }
 
         return Ok(page);
     }

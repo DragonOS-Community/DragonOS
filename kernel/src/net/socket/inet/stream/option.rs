@@ -420,9 +420,11 @@ impl super::TcpSocket {
                 let on = byte_parser::read_bool_flag(val)?;
                 self.so_keepalive_enabled()
                     .store(on, core::sync::atomic::Ordering::Relaxed);
-                
+
                 let interval = if on {
-                    let keepidle = self.tcp_keepidle().load(core::sync::atomic::Ordering::Relaxed);
+                    let keepidle = self
+                        .tcp_keepidle()
+                        .load(core::sync::atomic::Ordering::Relaxed);
                     // Ensure keepidle is at least 1 second to avoid issues, though smoltcp might handle it.
                     // Linux default is 7200.
                     Some(smoltcp::time::Duration::from_secs(keepidle as u64))
@@ -444,6 +446,12 @@ impl super::TcpSocket {
                     .store(l_onoff != 0, core::sync::atomic::Ordering::Relaxed);
                 self.so_linger_seconds()
                     .store(l_linger, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            PSO::OOBINLINE => {
+                let on = byte_parser::read_bool_flag(val)?;
+                self.so_oobinline()
+                    .store(on, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             _ => Ok(()), // Accept and ignore other SOL_SOCKET options
@@ -498,9 +506,11 @@ impl super::TcpSocket {
                 }
                 self.tcp_keepidle()
                     .store(v, core::sync::atomic::Ordering::Relaxed);
-                
+
                 // If keepalive is enabled, update the socket with new idle time
-                let is_enabled = self.so_keepalive_enabled().load(core::sync::atomic::Ordering::Relaxed);
+                let is_enabled = self
+                    .so_keepalive_enabled()
+                    .load(core::sync::atomic::Ordering::Relaxed);
                 if is_enabled {
                     self.apply_keepalive(Some(smoltcp::time::Duration::from_secs(v as u64)));
                 }
@@ -559,6 +569,22 @@ impl super::TcpSocket {
                     return Err(SystemError::EINVAL);
                 }
                 self.tcp_syncnt()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::Linger2 => {
+                let mut v = byte_parser::read_i32(val)?;
+
+                if v < 0 {
+                    v = -1;
+                } else {
+                    if v == 0 {
+                        v = constants::DEFAULT_TCP_LINGER2;
+                    } else if v > constants::MAX_TCP_LINGER2 {
+                        v = constants::MAX_TCP_LINGER2;
+                    }
+                }
+                self.tcp_linger2()
                     .store(v, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
@@ -660,6 +686,17 @@ impl super::TcpSocket {
                 Self::write_i32_opt(&mut value[4..8], l_linger)?;
                 Ok(8)
             }
+            PSO::OOBINLINE => {
+                let v: i32 = if self
+                    .so_oobinline()
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    1
+                } else {
+                    0
+                };
+                Self::write_i32_opt(value, v)
+            }
             _ => {
                 // Most SOL_SOCKET options are handled by sys_getsockopt directly.
                 Err(SystemError::ENOPROTOOPT)
@@ -750,6 +787,7 @@ impl super::TcpSocket {
             Options::MaxSegment => Self::write_atomic_usize_as_u32(value, self.tcp_max_seg()),
             Options::DeferAccept => Self::write_atomic_i32(value, self.tcp_defer_accept()),
             Options::Syncnt => Self::write_atomic_i32(value, self.tcp_syncnt()),
+            Options::Linger2 => Self::write_atomic_i32(value, self.tcp_linger2()),
             Options::WindowClamp => Self::write_atomic_usize_as_u32(value, self.tcp_window_clamp()),
             Options::UserTimeout => Self::write_atomic_i32(value, self.tcp_user_timeout()),
             Options::Info => {

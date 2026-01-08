@@ -35,6 +35,13 @@ pub const DEFAULT_TCP_KEEPINTVL: i32 = 75;
 /// Default number of keepalive probes before dropping connection (9)
 pub const DEFAULT_TCP_KEEPCNT: i32 = 9;
 
+// Linger2 defaults (aligned with Linux)
+// See Linux kernel: include/net/tcp.h
+/// Default lifetime (in seconds) for orphaned FIN-WAIT-2 state (60s)
+pub const DEFAULT_TCP_LINGER2: i32 = 60;
+/// Max lifetime (in seconds) for orphaned FIN-WAIT-2 state (120s)
+pub const MAX_TCP_LINGER2: i32 = 120;
+
 // ========== Socket缓冲区常量 - 参考Linux内核 include/net/sock.h ==========
 
 /// 最小socket缓冲区基本单位（用于SO_SNDBUF/SO_RCVBUF的clamp下限）

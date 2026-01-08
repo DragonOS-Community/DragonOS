@@ -65,6 +65,12 @@ pub struct TcpSocketOptions {
     /// SO_LINGER
     pub(crate) so_linger_active: AtomicBool,
     pub(crate) so_linger_seconds: AtomicI32,
+
+    /// SO_OOBINLINE
+    pub(crate) so_oobinline: AtomicBool,
+
+    /// TCP_LINGER2
+    pub(crate) tcp_linger2: AtomicI32,
 }
 
 impl TcpSocketOptions {
@@ -96,6 +102,9 @@ impl TcpSocketOptions {
             
             so_linger_active: AtomicBool::new(false),
             so_linger_seconds: AtomicI32::new(0),
+
+            so_oobinline: AtomicBool::new(false),
+            tcp_linger2: AtomicI32::new(constants::DEFAULT_TCP_LINGER2),
         }
     }
 }
@@ -320,6 +329,16 @@ impl TcpSocket {
     #[inline]
     pub(crate) fn so_linger_seconds(&self) -> &AtomicI32 {
         &self.options.so_linger_seconds
+    }
+
+    #[inline]
+    pub(crate) fn so_oobinline(&self) -> &AtomicBool {
+        &self.options.so_oobinline
+    }
+
+    #[inline]
+    pub(crate) fn tcp_linger2(&self) -> &AtomicI32 {
+        &self.options.tcp_linger2
     }
 
     #[inline]

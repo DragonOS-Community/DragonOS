@@ -12,22 +12,27 @@ use crate::{
         ucontext::LockedVMA,
         MemoryManagementArch, PhysAddr, VirtAddr,
     },
-    process::{resource::RLimitID, ProcessManager},
+    process::{cred::CAPFlags, resource::RLimitID, ProcessManager},
 };
 
 /// 检查进程是否有权限执行 mlock
+///
+/// 根据 Linux 语义:
+/// - 如果进程有 CAP_IPC_LOCK 权限，则允许 mlock
+/// - 否则，检查 RLIMIT_MEMLOCK 限制
 pub fn can_do_mlock() -> bool {
+    // 首先检查 CAP_IPC_LOCK 权限
+    let cred = ProcessManager::current_pcb().cred();
+    if cred.has_capability(CAPFlags::CAP_IPC_LOCK) {
+        return true;
+    }
+
+    // 没有 CAP_IPC_LOCK 权限，则受 RLIMIT_MEMLOCK 限制
     let rlim = ProcessManager::current_pcb()
         .get_rlimit(RLimitID::Memlock)
         .rlim_cur;
 
-    if rlim != 0 {
-        return true;
-    }
-
-    // TODO: 检查 CAP_IPC_LOCK 权限
-    // 目前暂时返回 false，后续需要实现权限检查
-    false
+    rlim != 0
 }
 
 /// 锁定单个页面

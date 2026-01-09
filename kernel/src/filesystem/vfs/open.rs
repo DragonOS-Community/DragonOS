@@ -285,7 +285,10 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     let metadata = inode.metadata()?;
     let file_type: FileType = metadata.file_type;
 
-    if how.o_flags.contains(FileFlags::O_NOFOLLOW) && file_type == FileType::SymLink {
+    if how.o_flags.contains(FileFlags::O_NOFOLLOW)
+        && !how.o_flags.contains(FileFlags::O_PATH)
+        && file_type == FileType::SymLink
+    {
         return Err(SystemError::ELOOP);
     }
 

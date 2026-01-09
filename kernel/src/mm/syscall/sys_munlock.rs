@@ -21,7 +21,13 @@ impl Syscall for SysMunlockHandle {
             return Ok(0);
         }
 
-        let aligned_len = page_align_up(len);
+        // 页面对齐：起始地址向下对齐，长度调整
+        // 参考 Linux mm/mlock.c: 用户传入的地址需要向下对齐到页边界
+        // 长度需要加上页内偏移后再向上对齐
+        let page_offset = addr.data() & (MMArch::PAGE_SIZE - 1);
+        let aligned_addr = VirtAddr::new(addr.data() - page_offset);
+        let adjusted_len = len.saturating_add(page_offset);
+        let aligned_len = page_align_up(adjusted_len);
         if aligned_len == 0 || aligned_len < len {
             return Err(SystemError::ENOMEM);
         }
@@ -35,7 +41,7 @@ impl Syscall for SysMunlockHandle {
         }
 
         let addr_space = AddressSpace::current()?;
-        addr_space.write().munlock(addr, aligned_len)?;
+        addr_space.write().munlock(aligned_addr, aligned_len)?;
 
         Ok(0)
     }

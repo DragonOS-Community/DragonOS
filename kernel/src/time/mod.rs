@@ -6,6 +6,7 @@ use core::{
 
 use crate::arch::CurrentTimeArch;
 use crate::time::syscall::PosixTimeval;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use self::timekeeping::getnstimeofday;
 
@@ -47,6 +48,9 @@ pub const FSEC_PER_SEC: u64 = 1000000000000000;
 
 /// The clock frequency of the i8253/i8254 PIT
 pub const PIT_TICK_RATE: u64 = 1193182;
+
+/// 系统启动时间（以 jiffies 或纳秒为单位）
+static BOOT_TIME: AtomicU64 = AtomicU64::new(0);
 
 /// 表示时间的结构体，符合POSIX标准。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -577,4 +581,16 @@ pub trait TimeArch {
 
     /// 将CPU的时钟周期数转换为纳秒
     fn cycles2ns(cycles: usize) -> usize;
+}
+
+/// 设置系统启动时间
+pub fn set_boot_time(time: u64) {
+    BOOT_TIME.store(time, Ordering::Release);
+}
+
+/// 获取系统运行时间（秒）
+pub fn uptime_secs() -> u64 {
+    // 使用 jiffies 计算 uptime，不依赖 RTC
+    // HZ = 250，表示每秒 250 个 jiffies
+    crate::time::timer::clock() / crate::time::clocksource::HZ
 }

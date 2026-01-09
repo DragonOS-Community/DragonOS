@@ -4,6 +4,7 @@ use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use log::{debug, info, warn};
 use system_error::SystemError;
 
+use crate::time::set_boot_time;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
@@ -381,6 +382,9 @@ pub fn timekeeping_init() {
     drop(irq_guard);
     drop(timekeeper);
     jiffies_init();
+
+    set_boot_time((ktime_get_real_ns() / 1_000_000_000) as u64);
+
     info!("timekeeping_init successfully");
 }
 

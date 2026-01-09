@@ -276,7 +276,10 @@ impl PageFaultHandler {
                         // 如果设置了 VM_LOCKONFAULT，锁定页面
                         if should_lock {
                             if let Err(e) = mlock_page(&page) {
-                                log::warn!("mlock_page failed in do_anonymous_page (shared anon): {:?}", e);
+                                log::warn!(
+                                    "mlock_page failed in do_anonymous_page (shared anon): {:?}",
+                                    e
+                                );
                                 return VmFaultReason::VM_FAULT_SIGBUS;
                             }
                         }
@@ -309,7 +312,10 @@ impl PageFaultHandler {
             // 如果设置了 VM_LOCKONFAULT，锁定页面
             if should_lock {
                 if let Err(e) = mlock_page(&page) {
-                    log::warn!("mlock_page failed in do_anonymous_page (private anon): {:?}", e);
+                    log::warn!(
+                        "mlock_page failed in do_anonymous_page (private anon): {:?}",
+                        e
+                    );
                     return VmFaultReason::VM_FAULT_SIGBUS;
                 }
             }

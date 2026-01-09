@@ -72,7 +72,9 @@ mod sys_fstat;
 mod sys_fsync;
 pub mod sys_mount;
 mod sys_sendfile;
+mod sys_splice;
 mod sys_sync;
+mod sys_tee;
 pub mod sys_umount2;
 
 #[cfg(target_arch = "x86_64")]
@@ -470,5 +472,20 @@ bitflags! {
         // 			return -EAGAIN if that's not
         // 			possible.
         const RESOLVE_CACHED = 0x20;
+    }
+}
+
+bitflags! {
+    /// splice 系统调用的标志位
+    /// 参考: linux/include/uapi/linux/splice.h
+    pub struct SpliceFlags: u32 {
+        /// 尝试移动页面而非复制（当前阶段忽略，为未来零拷贝预留）
+        const SPLICE_F_MOVE = 0x01;
+        /// 非阻塞模式：不要在管道拼接时阻塞
+        const SPLICE_F_NONBLOCK = 0x02;
+        /// 预期更多数据（当前阶段忽略）
+        const SPLICE_F_MORE = 0x04;
+        /// 传递页面无需释放（当前阶段忽略）
+        const SPLICE_F_GIFT = 0x08;
     }
 }

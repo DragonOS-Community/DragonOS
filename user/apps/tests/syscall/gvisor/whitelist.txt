@@ -44,6 +44,7 @@ open_create_test
 select_test
 pselect_test
 epoll_test
+splice_test
 
 # 进程相关测试
 fork_test
@@ -105,6 +106,7 @@ sigreturn_test
 sigtimedwait_test
 rtsignal_test
 signalfd_test
+sigstop_test
 
 # 其他测试
 itimer_test

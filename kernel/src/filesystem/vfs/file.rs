@@ -1159,6 +1159,21 @@ impl File {
         return self.file_type;
     }
 
+    /// 获取当前文件偏移（等价于用户态的 file position）。
+    #[inline]
+    pub fn pos(&self) -> usize {
+        self.offset.load(Ordering::SeqCst)
+    }
+
+    /// 推进当前文件偏移。
+    #[inline]
+    pub fn advance_pos(&self, delta: usize) {
+        if delta == 0 {
+            return;
+        }
+        self.offset.fetch_add(delta, Ordering::SeqCst);
+    }
+
     /// 检查文件是否为普通文件或目录
     ///
     /// 用于 poll(2)/epoll 的"总是就绪"判断。

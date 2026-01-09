@@ -428,6 +428,11 @@ pub trait BlockDevice: Device {
     fn callback_gendisk_registered(&self, _gendisk: &Arc<GenDisk>) -> Result<(), SystemError> {
         Ok(())
     }
+
+    /// 提交异步BIO请求（默认不支持，由驱动选择性实现）
+    fn submit_bio(&self, _bio: Arc<super::bio::BioRequest>) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 }
 
 /// @brief 块设备框架函数集

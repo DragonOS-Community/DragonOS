@@ -1,3 +1,5 @@
+pub mod bio;
+pub mod bio_queue;
 pub mod block_device;
 pub mod disk_info;
 pub mod gendisk;

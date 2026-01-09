@@ -41,7 +41,6 @@ use crate::{
             kset::KSet,
         },
         virtio::{
-            irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
             transport::VirtIOTransport,
             virtio_impl::HalImpl,
@@ -50,9 +49,7 @@ use crate::{
         },
     },
     exception::{
-        irqdesc::IrqReturn,
-        tasklet::{tasklet_schedule, Tasklet},
-        InterruptArch, IrqNumber,
+        irqdesc::IrqReturn, tasklet::{tasklet_schedule, Tasklet}, InterruptArch, IrqNumber
     },
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
@@ -119,9 +116,17 @@ struct BioCompletionTasklet {
 
 impl BioCompletionTasklet {
     fn new(device: Weak<VirtIOBlkDevice>, token_map: Arc<BioTokenMap>) -> Arc<Self> {
-        Arc::new_cyclic(|weak| {
-            let data = weak.as_ptr() as usize;
-            let tasklet = Tasklet::new(bio_completion_tasklet_entry, data);
+        Arc::new_cyclic(|weak: &alloc::sync::Weak<Self>| {
+            let weak_for_cb = weak.clone();
+            let tasklet = Tasklet::new(
+                move |_, _| {
+                    if let Some(tasklet) = weak_for_cb.upgrade() {
+                        tasklet.run();
+                    }
+                },
+                0,
+                None,
+            );
             BioCompletionTasklet {
                 token_map,
                 device,
@@ -150,6 +155,7 @@ impl BioCompletionTasklet {
                 Some(ctx) => ctx,
                 None => {
                     error!("VirtIOBlk: token {} not found in token_map", token);
+                    self.schedule();
                     break;
                 }
             };
@@ -207,11 +213,6 @@ impl BioCompletionTasklet {
             bio.complete(result);
         }
     }
-}
-
-fn bio_completion_tasklet_entry(data: usize) {
-    let tasklet = unsafe { &*(data as *const BioCompletionTasklet) };
-    tasklet.run();
 }
 
 #[inline(always)]
@@ -1044,40 +1045,44 @@ fn submit_bio_to_virtio(
     let mut resp = Box::new(BlkResp::default());
 
     // 获取buffer指针（在整个异步操作期间，bio会被BioContext持有，保证buffer有效）
-    let buf_ptr = match bio_type {
-        BioType::Read => bio.buffer_mut(),
-        BioType::Write => bio.buffer() as *mut [u8],
-    };
-    let buf = unsafe { &mut *buf_ptr };
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     // 提交异步请求，获取token
     let token = {
         let mut inner = device.inner();
         match bio_type {
-            BioType::Read => unsafe {
-                inner.device_inner.read_blocks_nb(
-                    lba_start,
-                    &mut req,
-                    &mut buf[..count * LBA_SIZE],
-                    &mut resp,
-                )
+            BioType::Read => {
+                let buf_ptr = bio.buffer_mut();
+                let buf = unsafe { &mut *buf_ptr };
+                unsafe {
+                    inner.device_inner.read_blocks_nb(
+                        lba_start,
+                        &mut req,
+                        &mut buf[..count * LBA_SIZE],
+                        &mut resp,
+                    )
+                }
+                .map_err(|e| {
+                    error!("VirtIOBlk async read_blocks_nb failed: {:?}", e);
+                    SystemError::EIO
+                })?
             }
-            .map_err(|e| {
-                error!("VirtIOBlk async read_blocks_nb failed: {:?}", e);
-                SystemError::EIO
-            })?,
-            BioType::Write => unsafe {
-                inner.device_inner.write_blocks_nb(
-                    lba_start,
-                    &mut req,
-                    &buf[..count * LBA_SIZE],
-                    &mut resp,
-                )
+            BioType::Write => {
+                let buf_ptr = bio.buffer();
+                let buf = unsafe { &*buf_ptr };
+                unsafe {
+                    inner.device_inner.write_blocks_nb(
+                        lba_start,
+                        &mut req,
+                        &buf[..count * LBA_SIZE],
+                        &mut resp,
+                    )
+                }
+                .map_err(|e| {
+                    error!("VirtIOBlk async write_blocks_nb failed: {:?}", e);
+                    SystemError::EIO
+                })?
             }
-            .map_err(|e| {
-                error!("VirtIOBlk async write_blocks_nb failed: {:?}", e);
-                SystemError::EIO
-            })?,
         }
     };
 
@@ -1091,6 +1096,8 @@ fn submit_bio_to_virtio(
         resp,
     };
     token_map.insert(token, ctx);
+
+    drop(irq_guard);
 
     Ok(())
 }

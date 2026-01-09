@@ -11,6 +11,7 @@ use crate::{
     arch::{mm::PageMapper, MMArch},
     libs::align::align_down,
     mm::{
+        mlock::mlock_page,
         page::{page_manager_lock_irqsave, EntryFlags},
         ucontext::LockedVMA,
         VirtAddr, VmFaultReason, VmFlags,
@@ -238,10 +239,13 @@ impl PageFaultHandler {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let mapper = &mut pfm.mapper;
-
+        let mut should_lock = false;
+        let _ = should_lock;
         // If this is an anonymous shared mapping, use a shared backing so pages are visible across fork
         {
             let guard = vma.lock_irqsave();
+            // 检查 VMA 是否有 VM_LOCKONFAULT 标志
+            should_lock = guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);
             if guard.vm_flags().contains(VmFlags::VM_SHARED) {
                 let shared = guard.shared_anon.clone();
                 if let Some(shared) = shared {
@@ -268,6 +272,18 @@ impl PageFaultHandler {
                     if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
                         flush.flush();
                         page.write_irqsave().insert_vma(vma.clone());
+
+                        // 如果设置了 VM_LOCKONFAULT，锁定页面
+                        if should_lock {
+                            if let Err(e) = mlock_page(&page) {
+                                log::warn!(
+                                    "mlock_page failed in do_anonymous_page (shared anon): {:?}",
+                                    e
+                                );
+                                return VmFaultReason::VM_FAULT_SIGBUS;
+                            }
+                        }
+
                         return VmFaultReason::VM_FAULT_COMPLETED;
                     } else {
                         return VmFaultReason::VM_FAULT_OOM;
@@ -292,6 +308,18 @@ impl PageFaultHandler {
             let mut page_manager_guard = page_manager_lock_irqsave();
             let page = page_manager_guard.get_unwrap(&paddr);
             page.write_irqsave().insert_vma(vma.clone());
+
+            // 如果设置了 VM_LOCKONFAULT，锁定页面
+            if should_lock {
+                if let Err(e) = mlock_page(&page) {
+                    log::warn!(
+                        "mlock_page failed in do_anonymous_page (private anon): {:?}",
+                        e
+                    );
+                    return VmFaultReason::VM_FAULT_SIGBUS;
+                }
+            }
+
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             VmFaultReason::VM_FAULT_OOM

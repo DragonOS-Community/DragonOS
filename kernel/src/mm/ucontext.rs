@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicU64, Ordering},
+    sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -148,6 +148,12 @@ pub struct InnerAddressSpace {
     pub end_code: VirtAddr,
     pub start_data: VirtAddr,
     pub end_data: VirtAddr,
+
+    /// 被 mlock 锁定的页面数量（页为单位）
+    locked_vm: AtomicUsize,
+
+    /// mlockall 默认标志 (影响未来映射)
+    def_flags: VmFlags,
 }
 
 impl InnerAddressSpace {
@@ -176,6 +182,8 @@ impl InnerAddressSpace {
             end_code: VirtAddr(0),
             start_data: VirtAddr(0),
             end_data: VirtAddr(0),
+            locked_vm: AtomicUsize::new(0),
+            def_flags: VmFlags::empty(),
         };
         if create_stack {
             // debug!("to create user stack.");
@@ -214,6 +222,12 @@ impl InnerAddressSpace {
         new_guard.end_code = self.end_code;
         new_guard.start_data = self.start_data;
         new_guard.end_data = self.end_data;
+        // 注意：locked_vm 在子进程中应该为 0，因为 mlock 不会被 fork 继承
+        // 参考 Linux: 子进程的 mm->locked_vm 从 0 开始
+        new_guard.locked_vm = AtomicUsize::new(0);
+        // 注意：def_flags 也不应该被继承
+        // 参考 Linux: 子进程的 mm->def_flags 从 0 开始
+        new_guard.def_flags = VmFlags::empty();
 
         // 遍历父进程的每个VMA，根据VMA属性进行适当的复制
         // 参考 Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
@@ -682,7 +696,8 @@ impl InnerAddressSpace {
             | VmFlags::from(map_flags)
             | VmFlags::VM_MAYREAD
             | VmFlags::VM_MAYWRITE
-            | VmFlags::VM_MAYEXEC;
+            | VmFlags::VM_MAYEXEC
+            | self.def_flags; // 应用 mlockall(MCL_FUTURE) 设置的默认标志
 
         // debug!("mmap: page: {:?}, region={region:?}", page.virt_address());
 
@@ -697,14 +712,24 @@ impl InnerAddressSpace {
         };
         compiler_fence(Ordering::SeqCst);
         // 映射页面，并将VMA插入到地址空间的VMA列表中
-        self.mappings.insert_vma(map_func(
+        let vma = map_func(
             page,
             page_count,
             vm_flags,
             EntryFlags::from_prot_flags(prot_flags, true),
             &mut self.user_mapper.utable,
             flusher,
-        )?);
+        )?;
+        self.mappings.insert_vma(vma.clone());
+
+        // 更新 locked_vm 计数（如果设置了 VM_LOCKED 或 VM_LOCKONFAULT）
+        // 参考 Linux: mm/mmap.c:mmap_region() 中的 accounting
+        let is_locked =
+            vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+        if is_locked {
+            let page_count = page_count.data();
+            self.locked_vm.fetch_add(page_count, Ordering::Relaxed);
+        }
 
         return Ok(page);
     }
@@ -1299,6 +1324,293 @@ impl InnerAddressSpace {
         }
 
         return Ok(requested);
+    }
+
+    /// 锁定地址范围
+    ///
+    /// # 参数
+    /// - `start`: 起始虚拟地址
+    /// - `len`: 长度（已页对齐）
+    /// - `onfault`: 是否延迟锁定
+    ///
+    /// # Linux 语义
+    /// 参考 Linux mm/mlock.c:do_mlock():
+    /// - 对于不可访问的 VMA（如 PROT_NONE），mlock 会失败并返回 ENOMEM
+    /// - 但是，即使失败，VMA 的 VM_LOCKED 标志仍然会被设置
+    /// - 这是因为 mlock 的主要目的是防止页面被换出，即使无法立即填充页面
+    pub fn mlock(&mut self, start: VirtAddr, len: usize, onfault: bool) -> Result<(), SystemError> {
+        // 计算结束地址
+        let end = start.data().checked_add(len).ok_or(SystemError::ENOMEM)?;
+        let end = VirtAddr::new(end);
+        let mut has_inaccessible_vma = false;
+        // 构造要设置的标志
+        let mut new_flags = VmFlags::VM_LOCKED;
+        if onfault {
+            new_flags |= VmFlags::VM_LOCKONFAULT;
+        }
+
+        // 获取冲突的 VMA 列表
+        let region = VirtRegion::new(start, len);
+        let vmas: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region).collect();
+
+        let mut newly_locked_pages = 0;
+
+        // 遍历所有 VMA
+        // 对于不可访问的 VMA（如 PROT_NONE），mlock 应该失败，返回 ENOMEM
+        // 但 VMA 仍然应该被标记为 locked（Linux 语义）
+        // 无论是否成功，都要设置 VM_LOCKED 标志
+        for vma in &vmas {
+            if !vma.is_accessible() {
+                has_inaccessible_vma = true;
+            }
+
+            let mut guard = vma.lock_irqsave();
+            let current_flags = *guard.vm_flags();
+            let vma_start = guard.region().start();
+            let vma_end = guard.region().end();
+
+            // 检查 VMA 是否已经锁定
+            let was_locked = current_flags.contains(VmFlags::VM_LOCKED)
+                || current_flags.contains(VmFlags::VM_LOCKONFAULT);
+
+            // 添加锁定标志
+            guard.set_vm_flags(current_flags | new_flags);
+            drop(guard);
+
+            // 如果之前未锁定，则增加计数
+            if !was_locked {
+                // 计算 VMA 与请求范围的交集
+                let lock_start = core::cmp::max(vma_start, start);
+                let lock_end = core::cmp::min(vma_end, end);
+                let lock_len = lock_end.data() - lock_start.data();
+                newly_locked_pages += lock_len >> MMArch::PAGE_SHIFT;
+            }
+        }
+
+        // 只更新新增的锁定页面计数
+        self.locked_vm
+            .fetch_add(newly_locked_pages, Ordering::Relaxed);
+
+        // 如果有不可访问的 VMA，返回 ENOMEM
+        if has_inaccessible_vma {
+            return Err(SystemError::ENOMEM);
+        }
+
+        // 锁定已映射的页面
+        // 对于 onfault 模式，不在此时锁定页面，而是在缺页中断时锁定
+        if !onfault {
+            unsafe {
+                let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
+
+                for vma in &vmas {
+                    // 只锁定可访问的 VMA
+                    if !vma.is_accessible() {
+                        continue;
+                    }
+
+                    let vma_guard = vma.lock_irqsave();
+                    let vma_start = vma_guard.region().start();
+                    let vma_end = vma_guard.region().end();
+                    drop(vma_guard);
+
+                    // 计算 VMA 与请求范围的交集
+                    let lock_start = core::cmp::max(vma_start, start);
+                    let lock_end = core::cmp::min(vma_end, end);
+
+                    // 锁定该范围内的已映射页面
+                    let _ = vma.mlock_vma_pages_range(&mapper, lock_start, lock_end, true);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 解锁地址范围
+    pub fn munlock(&mut self, start: VirtAddr, len: usize) -> Result<(), SystemError> {
+        let end = start.data().checked_add(len).ok_or(SystemError::ENOMEM)?;
+        let end = VirtAddr::new(end);
+
+        // 获取冲突的 VMA 列表
+        let region = VirtRegion::new(start, len);
+        let vmas: Vec<Arc<LockedVMA>> = self.mappings.conflicts(region).collect();
+
+        let mut unlocked_pages = 0;
+
+        unsafe {
+            let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
+
+            for vma in &vmas {
+                let vma_guard = vma.lock_irqsave();
+                let vm_flags = *vma_guard.vm_flags();
+                let vma_start = vma_guard.region().start();
+                let vma_end = vma_guard.region().end();
+                drop(vma_guard);
+
+                // 只处理已锁定或 lock on fault 的 VMA
+                let was_locked = vm_flags.contains(VmFlags::VM_LOCKED)
+                    || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+
+                if !was_locked {
+                    continue;
+                }
+
+                // 计算 VMA 与请求范围的交集
+                let unlock_start = core::cmp::max(vma_start, start);
+                let unlock_end = core::cmp::min(vma_end, end);
+
+                // 解锁该范围内的已映射页面
+                let _ = vma.mlock_vma_pages_range(&mapper, unlock_start, unlock_end, false);
+
+                // 清除 VMA 的锁定标志
+                let mut guard = vma.lock_irqsave();
+                let current_flags = *guard.vm_flags();
+                guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
+
+                // 计算实际解锁的页面数
+                let unlock_len = unlock_end.data() - unlock_start.data();
+                unlocked_pages += unlock_len >> MMArch::PAGE_SHIFT;
+            }
+        }
+
+        // 更新 locked_vm 计数（只减少实际解锁的页面数）
+        self.locked_vm.fetch_sub(unlocked_pages, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// 锁定所有内存映射
+    pub fn mlockall(&mut self, flags: u32) -> Result<(), SystemError> {
+        use crate::mm::syscall::MlockAllFlags;
+
+        let mlock_flags = MlockAllFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+
+        // 设置 def_flags（影响未来的映射）
+        let mut vm_flags = VmFlags::empty();
+        if mlock_flags.contains(MlockAllFlags::MCL_FUTURE) {
+            vm_flags |= VmFlags::VM_LOCKED;
+            if mlock_flags.contains(MlockAllFlags::MCL_ONFAULT) {
+                vm_flags |= VmFlags::VM_LOCKONFAULT;
+            }
+        }
+        self.def_flags = vm_flags;
+
+        // 如果设置了 MCL_CURRENT，锁定当前所有映射
+        if mlock_flags.contains(MlockAllFlags::MCL_CURRENT) {
+            let mut lock_flags = VmFlags::VM_LOCKED;
+            if mlock_flags.contains(MlockAllFlags::MCL_ONFAULT) {
+                lock_flags |= VmFlags::VM_LOCKONFAULT;
+            }
+
+            // 收集所有 VMA 的引用，以便在设置标志后锁定页面
+            let vmas_to_lock: alloc::vec::Vec<(Arc<LockedVMA>, VirtAddr, VirtAddr)> = self
+                .mappings
+                .vmas
+                .iter()
+                .filter_map(|vma| {
+                    if !vma.is_accessible() {
+                        return None;
+                    }
+                    let vma_guard = vma.lock_irqsave();
+                    let vm_flags = *vma_guard.vm_flags();
+                    let region = *vma_guard.region();
+                    drop(vma_guard);
+
+                    // 只处理还未设置 VM_LOCKED 的 VMA
+                    if !vm_flags.contains(VmFlags::VM_LOCKED) {
+                        Some((vma.clone(), region.start(), region.end()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // 先设置所有 VMA 的标志
+            for (vma, _, _) in &vmas_to_lock {
+                let mut guard = vma.lock_irqsave();
+                let current_flags = *guard.vm_flags();
+                guard.set_vm_flags(current_flags | lock_flags);
+            }
+
+            // 然后锁定页面（对于非 onfault 模式）
+            if !mlock_flags.contains(MlockAllFlags::MCL_ONFAULT) {
+                unsafe {
+                    let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
+                    let mut total_locked = 0;
+                    for (vma, start, end) in vmas_to_lock {
+                        if let Ok(count) = vma.mlock_vma_pages_range(&mapper, start, end, true) {
+                            total_locked += count;
+                        }
+                    }
+                    // 更新 locked_vm 计数，确保 RLIMIT_MEMLOCK 检查正确
+                    self.locked_vm.fetch_add(total_locked, Ordering::Relaxed);
+                }
+            } else {
+                // 对于 onfault 模式，也需要更新计数（基于 VMA 大小）
+                // 因为页面会在缺页时被锁定
+                let mut total_pages = 0;
+                for (_, start, end) in vmas_to_lock {
+                    let len = end.data() - start.data();
+                    total_pages += len >> MMArch::PAGE_SHIFT;
+                }
+                self.locked_vm.fetch_add(total_pages, Ordering::Relaxed);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 解锁所有内存映射
+    pub fn munlockall(&mut self) -> Result<(), SystemError> {
+        // 收集所有需要解锁的 VMA
+        let vmas_to_unlock: alloc::vec::Vec<(Arc<LockedVMA>, VirtAddr, VirtAddr)> = self
+            .mappings
+            .vmas
+            .iter()
+            .filter_map(|vma| {
+                let vma_guard = vma.lock_irqsave();
+                let vm_flags = *vma_guard.vm_flags();
+                let region = *vma_guard.region();
+                drop(vma_guard);
+
+                // 只处理已锁定或 lock on fault 的 VMA
+                if vm_flags.contains(VmFlags::VM_LOCKED)
+                    || vm_flags.contains(VmFlags::VM_LOCKONFAULT)
+                {
+                    Some((vma.clone(), region.start(), region.end()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        unsafe {
+            let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
+
+            // 先解锁所有页面
+            for (vma, start, end) in &vmas_to_unlock {
+                let _ = vma.mlock_vma_pages_range(&mapper, *start, *end, false);
+            }
+        }
+
+        // 清除 def_flags
+        self.def_flags = VmFlags::empty();
+
+        // 遍历所有 VMA，清除锁定标志
+        for (vma, _, _) in vmas_to_unlock {
+            let mut guard = vma.lock_irqsave();
+            let current_flags = *guard.vm_flags();
+            guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
+        }
+
+        // 重置 locked_vm
+        self.locked_vm.store(0, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    pub fn locked_vm(&self) -> usize {
+        return self.locked_vm.load(core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2052,9 +2364,13 @@ impl VMA {
     }
 
     pub fn clone_info_only(&self) -> Self {
+        // 注意：fork 时不应继承 VM_LOCKED 标志
+        // 参考 Linux: mlock 不会被 fork 的子进程继承
+        let vm_flags = self.vm_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT);
+
         return Self {
             region: self.region,
-            vm_flags: self.vm_flags,
+            vm_flags,
             flags: self.flags,
             mapped: self.mapped,
             user_address_space: None,

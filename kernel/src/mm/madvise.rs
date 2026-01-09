@@ -19,8 +19,18 @@ impl LockedVMA {
         match behavior {
             MadvFlags::MADV_DONTNEED | MadvFlags::MADV_DONTNEED_LOCKED => {
                 // MADV_DONTNEED: 释放指定范围内的页面
-                // 这是glibc在pthread_create时用来管理线程栈的关键操作
                 // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c#madvise_dontneed_single_vma
+                //
+                // Linux 语义：对 VM_LOCKED 的 VMA 调用 MADV_DONTNEED 返回 EINVAL
+                // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c#madvise_dontneed_single_vma
+                // "Dontneed pages that are locked" 检查
+
+                let vm_flags = *vma.vm_flags();
+
+                // 检查 VMA 是否被锁定
+                if vm_flags.contains(VmFlags::VM_LOCKED) {
+                    return Err(SystemError::EINVAL);
+                }
 
                 let region = *vma.region();
                 drop(vma);

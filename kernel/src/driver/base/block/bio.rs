@@ -95,6 +95,13 @@ impl BioRequest {
         inner.buffer.as_slice() as *const [u8]
     }
 
+    /// 将数据写入BIO缓冲区（用于同步回退路径）
+    pub fn write_buffer(&self, data: &[u8]) {
+        let mut inner = self.inner.lock_irqsave();
+        let copy_len = data.len().min(inner.buffer.len());
+        inner.buffer[..copy_len].copy_from_slice(&data[..copy_len]);
+    }
+
     /// 获取BIO类型
     pub fn bio_type(&self) -> BioType {
         self.inner.lock_irqsave().bio_type

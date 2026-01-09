@@ -433,6 +433,46 @@ pub trait BlockDevice: Device {
     fn submit_bio(&self, _bio: Arc<super::bio::BioRequest>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
+
+    /// 提交异步读BIO（优先 submit_bio，不支持则同步回退）
+    fn submit_bio_read(
+        &self,
+        lba_start: BlockId,
+        count: usize,
+    ) -> Result<Arc<super::bio::BioRequest>, SystemError> {
+        let bio = super::bio::BioRequest::new_read(lba_start, count);
+        match self.submit_bio(bio.clone()) {
+            Ok(()) => Ok(bio),
+            Err(SystemError::ENOSYS) => {
+                log::debug!("BlockDevice submit_bio_read ENOSYS, falling back to sync read");
+                let mut buf = vec![0; count * LBA_SIZE];
+                self.read_at_sync(lba_start, count, &mut buf)?;
+                bio.write_buffer(&buf);
+                bio.complete(Ok(count * LBA_SIZE));
+                Ok(bio)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 提交异步写BIO（优先 submit_bio，不支持则同步回退）
+    fn submit_bio_write(
+        &self,
+        lba_start: BlockId,
+        count: usize,
+        data: &[u8],
+    ) -> Result<Arc<super::bio::BioRequest>, SystemError> {
+        let bio = super::bio::BioRequest::new_write(lba_start, count, data);
+        match self.submit_bio(bio.clone()) {
+            Ok(()) => Ok(bio),
+            Err(SystemError::ENOSYS) => {
+                self.write_at_sync(lba_start, count, data)?;
+                bio.complete(Ok(count * LBA_SIZE));
+                Ok(bio)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// @brief 块设备框架函数集

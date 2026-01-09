@@ -32,8 +32,9 @@ impl BioQueue {
     pub fn submit(&self, bio: Arc<BioRequest>) {
         let should_wakeup = {
             let mut inner = self.inner.lock_irqsave();
+            let was_empty = inner.queue.is_empty();
             inner.queue.push_back(bio);
-            inner.queue.len() >= self.batch_size
+            was_empty
         };
 
         if should_wakeup {

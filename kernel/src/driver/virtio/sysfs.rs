@@ -196,14 +196,13 @@ impl VirtIODeviceManager {
         dev.set_virtio_device_index(virtio_index);
         dev.set_device_name(format!("virtio{}", virtio_index.data()));
 
-        log::debug!("virtio_device_add: dev: {:?}", dev.name());
+        self.setup_irq(&dev).ok();
         // 添加设备到设备管理器
-        device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
+        device_manager().add_device(dev.clone() as Arc<dyn Device>).inspect_err(|e| {
+            error!("virtio_device_add: add device failed: {:?}", e);
+        })?;
         let r = device_manager()
             .add_groups(&(dev.clone() as Arc<dyn Device>), &[&VirtIODeviceAttrGroup]);
-        log::debug!("virtio_device_add: to setup irq");
-        self.setup_irq(&dev).ok();
-        log::debug!("virtio_device_add: setup irq done");
 
         return r;
     }

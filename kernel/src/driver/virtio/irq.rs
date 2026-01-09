@@ -119,7 +119,6 @@ impl IrqHandler for DefaultVirtioIrqHandler {
             return dev.handle_irq(irq);
         } else {
             // 未绑定具体设备，因此无法处理中断
-            // warn!("No device found for IRQ: {:?}", irq);
             return Ok(IrqReturn::NotHandled);
         }
     }

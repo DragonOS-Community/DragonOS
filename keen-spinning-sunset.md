@@ -353,148 +353,86 @@ fn submit_bio_to_virtio(&self, bio: Arc<BioRequest>) -> Result<(), SystemError> 
 
 ### 阶段3：中断处理增强（1-2天）
 
-**目标**: 实现中断上下半部分离，避免在中断上下文中做过多工作
+**目标**: 将完成处理从 IO 线程中的轮询移动到中断上下半部，减少 CPU 占用；并明确与 block io 层的对接入口，优先走 `submit_bio`。
 
-#### 3.1 实现 BioCompletionTasklet (~80行)
+#### 3.1 Block IO 层对接点（优先 submit_bio）
 
-**新增文件：`kernel/src/driver/block/bio_completion_tasklet.rs`**
+**新增/完善建议（在 `kernel/src/driver/base/block/block_device.rs`）**
 
+- 增加一个轻量封装接口，优先调用 `submit_bio`，不支持则退回同步路径。
+- 该接口是 block io 层的统一入口，后续 cache 或文件系统要做异步时只调用这个入口。
+
+示例接口（方案描述，不一定要与最终命名一致）：
 ```rust
-use alloc::{sync::Arc, vec::Vec};
-use system_error::SystemError;
-use crate::{
-    libs::spinlock::SpinLock,
-    driver::base::block::bio::BioRequest,
-    exception::softirq::{Tasklet, TaskletFunction},
-};
-
-/// 中断下半部：批量完成BIO请求
-pub struct BioCompletionTasklet {
-    /// 待完成的(token, len)列表
-    pending: SpinLock<Vec<(u16, usize)>>,
-    /// 共享token映射表
-    token_map: Arc<BioTokenMap>,
-    /// Tasklet实例
-    tasklet: Tasklet,
-}
-
-impl BioCompletionTasklet {
-    pub fn new(token_map: Arc<BioTokenMap>) -> Arc<Self> {
-        let tasklet_data = Arc::new(Self {
-            pending: SpinLock::new(Vec::new()),
-            token_map,
-            tasklet: Tasklet::new(),
-        });
-
-        // 设置tasklet回调函数
-        tasklet_data.tasklet.set_function(
-            Box::new(BioCompletionTaskletFunc {
-                tasklet: Arc::downgrade(&tasklet_data),
-            })
-        );
-
-        tasklet_data
-    }
-
-    /// 由中断上半部调用：添加待完成的token并调度tasklet
-    pub fn schedule(&self, tokens: Vec<(u16, usize)>) {
-        if tokens.is_empty() {
-            return;
+/// 优先走 submit_bio 的异步入口；不支持则同步执行并立即 complete。
+fn submit_or_sync_read(
+    &self,
+    lba_start: BlockId,
+    count: usize,
+) -> Result<Arc<BioRequest>, SystemError> {
+    let bio = BioRequest::new_read(lba_start, count);
+    match self.submit_bio(bio.clone()) {
+        Ok(()) => Ok(bio),
+        Err(SystemError::ENOSYS) => {
+            let mut buf = vec![0; count * LBA_SIZE];
+            self.read_at_sync(lba_start, count, &mut buf)?;
+            // 将同步结果写回 bio 的内部 buffer（具体写入方式由实现决定）
+            bio.complete(Ok(count * LBA_SIZE));
+            Ok(bio)
         }
-
-        {
-            let mut pending = self.pending.lock_irqsave();
-            pending.extend(tokens);
-        }
-
-        // 调度tasklet执行
-        self.tasklet.schedule();
-    }
-
-    /// Tasklet执行函数：批量完成BIO
-    fn run(&self) {
-        // 1. 取出所有待完成的token（短锁）
-        let to_complete = {
-            let mut pending = self.pending.lock_irqsave();
-            core::mem::take(&mut *pending)
-        };
-
-        // 2. 批量查找BIO（短锁）
-        let bios: Vec<(Arc<BioRequest>, usize)> = to_complete
-            .into_iter()
-            .filter_map(|(token, len)| {
-                self.token_map.remove(token).map(|bio| (bio, len))
-            })
-            .collect();
-
-        // 3. 在锁外批量完成（避免持锁调用complete）
-        for (bio, len) in bios {
-            bio.complete(Ok(len));
-        }
-    }
-}
-
-/// Tasklet回调函数实现
-struct BioCompletionTaskletFunc {
-    tasklet: Weak<BioCompletionTasklet>,
-}
-
-impl TaskletFunction for BioCompletionTaskletFunc {
-    fn run(&mut self) {
-        if let Some(tasklet) = self.tasklet.upgrade() {
-            tasklet.run();
-        }
+        Err(e) => Err(e),
     }
 }
 ```
 
-#### 3.2 修改 `handle_irq()` - 中断上半部 (在 `virtio_blk.rs:411`, ~20行)
+**落点**：
+- 上层想用异步时，只创建 `BioRequest` 并调用 `BlockDevice::submit_bio`。
+- 同步 read/write 维持原语义，不破坏缓存系统。
 
+#### 3.2 中断上半部 + Tasklet 下半部
+
+DragonOS 已有 tasklet 框架（`kernel/src/exception/tasklet.rs`），阶段3直接接入即可。
+
+**新增文件：`kernel/src/driver/block/bio_completion_tasklet.rs`**
+- 复用现有的 `BioTokenMap` 与 `BioContext`（见 `kernel/src/driver/block/virtio_blk.rs`）。
+- Tasklet 中调用 `complete_read_blocks/complete_write_blocks` 完成真正的 virtio 请求，并最终 `bio.complete(...)`。
+
+**handle_irq() 修改方向（`kernel/src/driver/block/virtio_blk.rs`）**
 ```rust
 fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-    let mut completed_tokens = Vec::new();
-
-    // 快速收集已完成的token（尽量短的持锁时间）
+    let mut tokens = Vec::new();
     {
         let mut inner = self.inner();
-
-        // 从 virtqueue 弹出所有已完成的请求
-        while let Some((token, len)) = inner.device_inner.pop_used() {
-            completed_tokens.push((token, len));
+        while let Some(token) = inner.device_inner.peek_used() {
+            tokens.push(token);
         }
-    } // 立即释放锁
-
-    // 调度tasklet处理完成逻辑（下半部）
-    if !completed_tokens.is_empty() {
-        self.inner().completion_tasklet.schedule(completed_tokens);
     }
-
+    if !tokens.is_empty() {
+        self.inner().completion_tasklet.schedule(tokens);
+    }
     Ok(IrqReturn::Handled)
 }
 ```
 
-**设计要点**：
-1. **上半部（handle_irq）**：
-   - 仅收集token，不查找BIO，不调用complete
-   - 持锁时间极短（只读virtqueue）
-   - 快速返回，降低中断延迟
+**Tasklet 处理方向（`bio_completion_tasklet.rs`）**
+- 只做“查 token -> 完成 -> bio.complete”的逻辑。
+- 依赖 `BioTokenMap` 获取 `BioContext { bio, req, resp }`。
+- 必须锁外完成，避免持锁调用 `complete_*` 和 `bio.complete()`。
 
-2. **下半部（tasklet）**：
-   - 批量查找BIO（从token_map）
-   - 批量完成BIO（调用completion）
-   - 可被抢占，不影响中断响应
+#### 3.3 IO 线程职责收敛
 
-**注意**：`pop_used()` 接口取决于 virtio-drivers 库的 API，可能需要适配。
+当前 `virtio_blk.rs` 的 `complete_pending_bios()` 是轮询路径，阶段3完成后应当：
+- IO 线程只负责**提交**（`submit_bio_to_virtio`），不再主动轮询完成。
+- 完成路径全部由 IRQ + tasklet 处理。
 
-#### 3.2 验证异步功能
+#### 3.4 验证建议
 
-创建测试代码：
 ```rust
-// 异步读取测试
-let bio = BioRequest::new_read(0, 8); // 读8个扇区
+// 异步读取测试（block io 层优先 submit_bio）
+let bio = BioRequest::new_read(0, 8);
 device.submit_bio(bio.clone())?;
-// 这里可以做其他工作...
-let data = bio.wait()?; // 等待完成
+let data = bio.wait()?;
+assert_eq!(data.len(), 8 * LBA_SIZE);
 ```
 
 ---

@@ -58,7 +58,7 @@ linkme = "=0.3.27"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev = "1597c1c", default-features = false }
-smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp", rev = "a6576c0", default-features = false, features = [
+smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp", rev = "5a73cad", default-features = false, features = [
     "alloc",
     "medium-ethernet",
     "socket-raw",

@@ -337,23 +337,22 @@ fn splice_pipe_to_file(
     let buf_size = allowed_len.min(4096);
     let mut buffer = vec![0u8; buf_size];
 
-    // Peek first, then only consume what we successfully wrote to the file.
-    let peeked = pipe_inode.peek_into_from_blocking(0, buf_size, &mut buffer, nonblock)?;
-    if peeked == 0 {
+    // Read (consume) from pipe to avoid TOCTOU with concurrent readers.
+    let read = pipe_inode.read_into_from_blocking(buf_size, &mut buffer, nonblock)?;
+    if read == 0 {
         return Ok(0);
     }
 
     let written = if let Some(off) = offset {
-        file.pwrite(off, peeked, &buffer[..peeked])
+        file.pwrite(off, read, &buffer[..read])
     } else {
-        file.write(peeked, &buffer[..peeked])
+        file.write(read, &buffer[..read])
     }?;
 
     if written == 0 {
         return Ok(0);
     }
 
-    let _ = pipe_inode.consume_front(written);
     Ok(written)
 }
 

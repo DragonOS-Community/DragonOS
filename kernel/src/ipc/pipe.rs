@@ -566,31 +566,27 @@ impl LockedPipeInode {
         num
     }
 
-    /// splice/tee helper: 在不消耗数据的前提下，按需阻塞等待并窥视 pipe 中的数据。
+    /// splice helper: 在需要时阻塞等待并读取 pipe 数据，同时消耗数据。
     ///
     /// - 若 pipe 为空且无 writers：返回 0 (EOF)
     /// - 若 pipe 为空且有 writers：nonblock 返回 EAGAIN，否则阻塞直到可读或被信号打断
-    pub(crate) fn peek_into_from_blocking(
+    pub(crate) fn read_into_from_blocking(
         &self,
-        skip: usize,
         len: usize,
         buf: &mut [u8],
         nonblock: bool,
     ) -> Result<usize, SystemError> {
         loop {
-            let (available, has_writers) = {
-                let guard = self.inner.lock();
-                (guard.valid_cnt.max(0) as usize, guard.writer > 0)
-            };
-
-            if available == 0 {
-                if !has_writers {
+            let mut guard = self.inner.lock();
+            if guard.valid_cnt == 0 {
+                if guard.writer == 0 {
                     return Ok(0);
                 }
                 if nonblock {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
 
+                drop(guard);
                 let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
                 if r.is_err() {
                     ProcessManager::current_pcb()
@@ -601,7 +597,36 @@ impl LockedPipeInode {
                 continue;
             }
 
-            return Ok(self.peek_into_from(skip, len, buf));
+            let mut num = guard.valid_cnt as usize;
+            if len < num {
+                num = len;
+            }
+            if buf.len() < num {
+                return Err(SystemError::EINVAL);
+            }
+
+            let start = guard.read_pos as usize;
+            let buf_size = guard.buf_size;
+            let first = core::cmp::min(num, buf_size - start);
+            let second = num.saturating_sub(first);
+            buf[0..first].copy_from_slice(&guard.data[start..start + first]);
+            if second > 0 {
+                buf[first..num].copy_from_slice(&guard.data[0..second]);
+            }
+
+            guard.read_pos = (guard.read_pos + num as i32) % buf_size as i32;
+            guard.valid_cnt -= num as i32;
+
+            if guard.valid_cnt > 0 {
+                self.read_wait_queue
+                    .wakeup(Some(ProcessState::Blocked(true)));
+            }
+            self.write_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
+            let pollflag = guard.poll_both_ends();
+            drop(guard);
+            let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+            return Ok(num);
         }
     }
 
@@ -705,24 +730,6 @@ impl LockedPipeInode {
             let buf_size = in_guard.buf_size;
             in_guard.read_pos = (in_guard.read_pos + copied as i32) % buf_size as i32;
             in_guard.valid_cnt -= copied as i32;
-
-            // Wakeup input writers
-            if in_guard.valid_cnt > 0 { // Wait, valid_cnt decreased, so space increased?
-                 // No, valid_cnt decreased means we read data. So we should wakeup writers who are waiting for space?
-                 // Original code:
-                 // if in_guard.valid_cnt > 0 { self.read_wait_queue.wakeup(...) }
-                 // Wait, read_wait_queue waits for readable. If we consumed, it might NO LONGER be readable (if 0).
-                 // Why did original code wake read_wait_queue?
-                 // Maybe for other readers? "If there is still data, wake other readers".
-            }
-            // Original splice code:
-            /*
-               if in_guard.valid_cnt > 0 {
-                   self.read_wait_queue.wakeup(Some(ProcessState::Blocked(true)));
-               }
-               self.write_wait_queue.wakeup(Some(ProcessState::Blocked(true)));
-            */
-            // Correct.
         }
 
         // Wakeups
@@ -751,37 +758,6 @@ impl LockedPipeInode {
         let _ = EventPoll::wakeup_epoll(&dst.epitems, out_poll);
 
         Ok(copied)
-    }
-
-    /// splice helper: 消耗 pipe 中前 `n` 字节（不复制数据）。
-    /// 返回实际消耗的字节数。
-    pub(crate) fn consume_front(&self, n: usize) -> usize {
-        if n == 0 {
-            return 0;
-        }
-
-        let mut inner_guard = self.inner.lock();
-        let available = inner_guard.valid_cnt.max(0) as usize;
-        let num = core::cmp::min(n, available);
-        if num == 0 {
-            return 0;
-        }
-
-        let buf_size = inner_guard.buf_size;
-        inner_guard.read_pos = (inner_guard.read_pos + num as i32) % buf_size as i32;
-        inner_guard.valid_cnt -= num as i32;
-
-        if inner_guard.valid_cnt > 0 {
-            self.read_wait_queue
-                .wakeup(Some(ProcessState::Blocked(true)));
-        }
-
-        self.write_wait_queue
-            .wakeup(Some(ProcessState::Blocked(true)));
-        let pollflag = inner_guard.poll_both_ends();
-        drop(inner_guard);
-        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
-        num
     }
 
     /// splice(2): 将本管道中的数据移动到目标管道（消耗输入数据）。

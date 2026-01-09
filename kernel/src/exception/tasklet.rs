@@ -5,6 +5,7 @@
 //! - 同一个 tasklet 在同一时间不会并发执行（自串行）。
 //! - 重复 schedule 不会导致无限入队（使用 `is_scheduled` 去重）。
 //! - tasklet 在 softirq 上下文执行：不允许睡眠。
+//! - 回调参数包含 `usize` 与可选的 `Arc<dyn TaskletData>`。
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -17,22 +18,43 @@ use crate::{
     mm::percpu::{PerCpu, PerCpuVar},
 };
 
-#[derive(Debug)]
 pub struct Tasklet {
     is_scheduled: AtomicBool,
     is_running: AtomicBool,
-    callback: fn(usize),
+    callback: Arc<dyn TaskletFunc>,
     data: usize,
+    data_obj: Option<Arc<dyn TaskletData>>,
 }
 
 impl Tasklet {
-    pub fn new(callback: fn(usize), data: usize) -> Arc<Self> {
+    pub fn new<F>(callback: F, data: usize, data_obj: Option<Arc<dyn TaskletData>>) -> Arc<Self>
+    where
+        F: TaskletFunc + 'static,
+    {
         Arc::new(Self {
             is_scheduled: AtomicBool::new(false),
             is_running: AtomicBool::new(false),
-            callback,
+            callback: Arc::new(callback),
             data,
+            data_obj,
         })
+    }
+}
+
+pub trait TaskletData: Send + Sync {}
+
+impl<T: Send + Sync> TaskletData for T {}
+
+pub trait TaskletFunc: Send + Sync {
+    fn call(&self, data: usize, data_obj: Option<Arc<dyn TaskletData>>);
+}
+
+impl<F> TaskletFunc for F
+where
+    F: Fn(usize, Option<Arc<dyn TaskletData>>) + Send + Sync,
+{
+    fn call(&self, data: usize, data_obj: Option<Arc<dyn TaskletData>>) {
+        (self)(data, data_obj);
     }
 }
 
@@ -93,7 +115,7 @@ impl SoftirqVec for TaskletSoftirq {
             // （符合 Linux 语义：disable 只阻止新的 schedule，不阻止已入队的执行）。
             t.is_scheduled.store(false, Ordering::Release);
 
-            (t.callback)(t.data);
+            t.callback.call(t.data, t.data_obj.clone());
 
             t.is_running.store(false, Ordering::Release);
         }

@@ -7,4 +7,5 @@
 .. toctree::
    :maxdepth: 1
 
+   tasklet
    workqueue

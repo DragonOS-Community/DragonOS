@@ -360,12 +360,15 @@
     "hash": "7193f93fd9af38c8b7d2ad0ad9453ce5"
   },
   "en:kernel/interrupt/index.rst": {
-    "hash": "13d79d4b53fd664cf72b95b279efcb75"
+    "hash": "5a42df4211e7c59aba311c9523bd529d"
   },
   "en:kernel/interrupt/workqueue.md": {
     "hash": "930d4d0eefeb4c4f01ec2a93a2a1b9ad"
   },
   "en:kernel/net/napi_and_netns_poll.md": {
     "hash": "04ae3378b43189a4e61226612f66f9ab"
+  },
+  "en:kernel/interrupt/tasklet.md": {
+    "hash": "254da75179ebb9f39cd9b562486fb122"
   }
 }

@@ -4,7 +4,7 @@
 
    - Source document: kernel/interrupt/index.rst
 
-   - Translation time: 2026-01-05 16:07:55
+   - Translation time: 2026-01-09 06:34:03
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -20,4 +20,5 @@ This is the design document related to interrupt handling and bottom half mechan
 .. toctree::
    :maxdepth: 1
 
+   tasklet
    workqueue

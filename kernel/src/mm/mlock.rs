@@ -186,13 +186,18 @@ impl LockedVMA {
         let mut page_count = 0;
         let mut start = start_addr;
 
+        log::info!("mlock_walk_page_range: {:?} - {:?}, level={}", start_addr, end_addr, level);
+
         while start < end_addr {
             let entry_size = MMArch::PAGE_SIZE << (level * MMArch::PAGE_ENTRY_SHIFT);
             let next = core::cmp::min(end_addr, start + entry_size);
 
+            log::info!("  walking: start={:?}, next={:?}, level={}", start, next, level);
+
             if let Some(entry) = mapper.get_entry(start, level) {
                 // 大页处理：遍历大页内的每个 4K 子页
                 if level > 0 && entry.flags().has_flag(MMArch::ENTRY_FLAG_HUGE_PAGE) {
+                    log::info!("  found huge page");
                     let sub_page_count = (next - start) >> MMArch::PAGE_SHIFT;
 
                     // 获取大页的基地址
@@ -215,6 +220,7 @@ impl LockedVMA {
                     }
                 } else if level > 0 {
                     // 递归处理下一级页表
+                    log::info!("  recursing to level {}", level - 1);
                     let sub_pages =
                         Self::mlock_walk_page_range(mapper, start, next, level - 1, lock)?;
                     page_count += sub_pages;
@@ -222,19 +228,24 @@ impl LockedVMA {
                     // 叶子节点（4K 页）
                     match entry.address() {
                         Ok(paddr) => {
+                            log::info!("  found page at {:?}", paddr);
                             if Self::mlock_phys_page(paddr, lock)? {
                                 page_count += 1;
                             }
                         }
                         Err(_) => {
                             // 页表项不存在，跳过（Linux 语义）
+                            log::info!("  page not present at {:?}", start);
                         }
                     }
                 }
+            } else {
+                log::info!("  no entry at {:?}, level={}", start, level);
             }
 
             start = next;
         }
+        log::info!("mlock_walk_page_range: done, count={}", page_count);
         Ok(page_count)
     }
 

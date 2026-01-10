@@ -1416,8 +1416,18 @@ impl InnerAddressSpace {
                     let lock_start = core::cmp::max(vma_start, start);
                     let lock_end = core::cmp::min(vma_end, end);
 
+                    log::info!("mlock: locking VMA range {:?} - {:?}", lock_start, lock_end);
+
                     // 锁定该范围内的已映射页面
-                    let _ = vma.mlock_vma_pages_range(&mapper, lock_start, lock_end, true);
+                    match vma.mlock_vma_pages_range(&mapper, lock_start, lock_end, true) {
+                        Ok(count) => {
+                            log::info!("mlock: locked {} pages in VMA", count);
+                        }
+                        Err(e) => {
+                            log::error!("mlock: failed to lock VMA pages: {:?}", e);
+                            // 继续处理其他 VMA，不要因为一个失败而中断
+                        }
+                    }
                 }
             }
         }

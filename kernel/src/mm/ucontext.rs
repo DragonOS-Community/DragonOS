@@ -664,6 +664,42 @@ impl InnerAddressSpace {
             | VmFlags::VM_MAYEXEC
             | self.def_flags; // 应用 mlockall(MCL_FUTURE) 设置的默认标志
 
+        // RLIMIT_MEMLOCK 检查（针对 VM_LOCKED/VM_LOCKONFAULT）
+        // 无论 VM_LOCKED 来自 MAP_LOCKED 标志还是 MCL_FUTURE 的 def_flags，都需要检查限制
+        // 参考 Linux: mm/mmap.c:mmap_region() 中的 security check
+        let has_locked_flag = vm_flags.contains(VmFlags::VM_LOCKED)
+            || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+        if has_locked_flag {
+            use crate::mm::mlock::can_do_mlock;
+
+            // 权限检查
+            if !can_do_mlock() {
+                return Err(SystemError::EPERM);
+            }
+
+            // 检查 RLIMIT_MEMLOCK 是否足够
+            let lock_limit = ProcessManager::current_pcb()
+                .get_rlimit(RLimitID::Memlock)
+                .rlim_cur as usize;
+
+            // 将限制转换为页面数
+            let lock_limit_pages = if lock_limit == usize::MAX {
+                usize::MAX
+            } else {
+                lock_limit >> MMArch::PAGE_SHIFT
+            };
+
+            let requested_pages = page_count.data();
+
+            // 获取当前地址空间的锁定计数
+            let current_locked = self.locked_vm();
+
+            // 检查是否超过限制
+            if current_locked + requested_pages > lock_limit_pages {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+        }
+
         // debug!("mmap: page: {:?}, region={region:?}", page.virt_address());
 
         compiler_fence(Ordering::SeqCst);
@@ -689,9 +725,7 @@ impl InnerAddressSpace {
 
         // 更新 locked_vm 计数（如果设置了 VM_LOCKED 或 VM_LOCKONFAULT）
         // 参考 Linux: mm/mmap.c:mmap_region() 中的 accounting
-        let is_locked =
-            vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
-        if is_locked {
+        if vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT) {
             let page_count = page_count.data();
             self.locked_vm.fetch_add(page_count, Ordering::Relaxed);
         }

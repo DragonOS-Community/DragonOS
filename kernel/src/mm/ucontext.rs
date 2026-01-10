@@ -1532,27 +1532,21 @@ impl InnerAddressSpace {
             }
 
             // 然后锁定页面（对于非 onfault 模式）
+            // 基于 VMA 大小计算 locked_vm，保持与 mlock() 一致
+            let mut total_pages = 0;
+            for (_, start, end) in &vmas_to_lock {
+                let len = end.data() - start.data();
+                total_pages += len >> MMArch::PAGE_SHIFT;
+            }
+            self.locked_vm.fetch_add(total_pages, Ordering::Relaxed);
+
             if !mlock_flags.contains(MlockAllFlags::MCL_ONFAULT) {
                 unsafe {
                     let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
-                    let mut total_locked = 0;
                     for (vma, start, end) in vmas_to_lock {
-                        if let Ok(count) = vma.mlock_vma_pages_range(&mapper, start, end, true) {
-                            total_locked += count;
-                        }
+                        let _ = vma.mlock_vma_pages_range(&mapper, start, end, true);
                     }
-                    // 更新 locked_vm 计数，确保 RLIMIT_MEMLOCK 检查正确
-                    self.locked_vm.fetch_add(total_locked, Ordering::Relaxed);
                 }
-            } else {
-                // 对于 onfault 模式，也需要更新计数（基于 VMA 大小）
-                // 因为页面会在缺页时被锁定
-                let mut total_pages = 0;
-                for (_, start, end) in vmas_to_lock {
-                    let len = end.data() - start.data();
-                    total_pages += len >> MMArch::PAGE_SHIFT;
-                }
-                self.locked_vm.fetch_add(total_pages, Ordering::Relaxed);
             }
         }
 

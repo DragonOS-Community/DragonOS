@@ -1,16 +1,11 @@
-use crate::arch::ipc::signal::Signal;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::IndexNode;
-use crate::ipc::signal_types::{
-    ChldCode, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType, SignalFlags,
-};
 use crate::libs::rwsem::RwSem;
 use crate::process::exec::{
     load_binary_file_with_context, ExecContext, ExecParam, ExecParamFlags, LoadBinaryResult,
 };
-use crate::process::PtraceEvent;
-use crate::process::{ProcessFlags, ProcessManager};
+use crate::process::ProcessManager;
 use crate::syscall::Syscall;
 use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
 

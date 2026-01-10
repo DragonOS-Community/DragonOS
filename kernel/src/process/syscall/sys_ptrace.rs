@@ -97,17 +97,18 @@ impl TryFrom<usize> for PtraceRequest {
     fn try_from(value: usize) -> Result<Self, SystemError> {
         match value {
             0 => Ok(PtraceRequest::PtraceTraceme),
+            2 => Ok(PtraceRequest::PtracePeekdata),
+            5 => Ok(PtraceRequest::PtracePokedata),
+            7 => Ok(PtraceRequest::PtraceCont),
+            9 => Ok(PtraceRequest::PtraceSinglestep),
+            12 => Ok(PtraceRequest::PtraceGetregs),
+            13 => Ok(PtraceRequest::PtraceSetregs),
             16 => Ok(PtraceRequest::PtraceAttach),
             17 => Ok(PtraceRequest::PtraceDetach),
             24 => Ok(PtraceRequest::PtraceSyscall),
-            9 => Ok(PtraceRequest::PtraceSinglestep),
-            7 => Ok(PtraceRequest::PtraceCont),
-            12 => Ok(PtraceRequest::PtraceGetregs),
-            13 => Ok(PtraceRequest::PtraceSetregs),
-            2 => Ok(PtraceRequest::PtracePeekdata),
-            5 => Ok(PtraceRequest::PtracePokedata),
-            0x4202 => Ok(PtraceRequest::PtraceGetsiginfo),
             0x4200 => Ok(PtraceRequest::PtraceSetoptions),
+            0x4202 => Ok(PtraceRequest::PtraceGetsiginfo),
+            0x4206 => Ok(PtraceRequest::PtraceSeize),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -145,6 +146,23 @@ impl SysPtrace {
     ) -> Result<isize, SystemError> {
         let tracee = ProcessManager::find(tracee_pid).ok_or(SystemError::ESRCH)?;
         tracee.attach(tracer)
+    }
+
+    /// 处理 PTRACE_SEIZE 请求（现代附加 API）
+    ///
+    /// 按照 Linux 6.6.21 实现：
+    /// - 不发送 SIGSTOP 给 tracee
+    /// - addr 参数包含 ptrace 选项
+    /// - data 参数通常为 0
+    fn handle_seize(
+        tracer: &Arc<ProcessControlBlock>,
+        tracee_pid: RawPid,
+        addr: usize,
+    ) -> Result<isize, SystemError> {
+        let tracee = ProcessManager::find(tracee_pid).ok_or(SystemError::ESRCH)?;
+        // addr 参数包含 ptrace 选项
+        let options = PtraceOptions::from_bits_truncate(addr);
+        tracee.seize(tracer, options)
     }
 
     /// 处理 PTRACE_DETACH 请求（分离目标进程）
@@ -196,7 +214,7 @@ impl SysPtrace {
         addr: usize,
     ) -> Result<isize, SystemError> {
         let value = tracee.peek_user(addr)?;
-        Ok(value as isize)
+        Ok(value)
     }
 
     /// 处理 PTRACE_PEEKDATA 请求（读取进程内存）
@@ -337,13 +355,11 @@ impl SysPtrace {
         // 获取 tracee 的 TrapFrame
         // TrapFrame 位于内核栈顶部：kernel_stack.max_address - size_of::<TrapFrame>()
         let kstack = tracee.kernel_stack();
-        let trap_frame_vaddr = VirtAddr::new(
-            kstack.stack_max_address().data() - core::mem::size_of::<TrapFrame>(),
-        );
+        let trap_frame_vaddr =
+            VirtAddr::new(kstack.stack_max_address().data() - core::mem::size_of::<TrapFrame>());
 
         // 从 tracee 的内核栈读取 TrapFrame
-        let trap_frame =
-            unsafe { &*(trap_frame_vaddr.data() as *const TrapFrame) };
+        let trap_frame = unsafe { &*(trap_frame_vaddr.data() as *const TrapFrame) };
 
         // 获取 fs_base 和 gs_base
         let arch_info = tracee.arch_info_irqsave();
@@ -462,15 +478,9 @@ impl SysPtrace {
         if !tracee.is_traced_by(&current) {
             return Err(SystemError::EPERM);
         }
-        // 对于 KILL 请求，不需要目标处于停止状态 (Linux 逻辑)
-        // 这里我们简化逻辑，要求必须 Stopped
         match tracee.sched_info().inner_lock_read_irqsave().state() {
             ProcessState::Stopped(_) | ProcessState::TracedStopped(_) => Ok(()),
-            _ => {
-                // 如果请求是 KILL，Linux 允许不停止，但这里我们先严格要求
-                log::debug!("ptrace_check_attach: process not stopped");
-                Err(SystemError::ESRCH)
-            }
+            _ => Err(SystemError::ESRCH),
         }
     }
 }
@@ -499,12 +509,14 @@ impl Syscall for SysPtrace {
         let signal: Option<Signal> = if data == 0 {
             None // 表示无信号
         } else {
-            Some(Signal::try_from(data as i32).map_err(|_| SystemError::EINVAL)?)
+            Some(Signal::from(data as i32))
         };
 
         let result: isize = match request {
             // 附加到目标进程
             PtraceRequest::PtraceAttach => Self::handle_attach(&tracer, pid)?,
+            // PTRACE_SEIZE：现代 API，不发送 SIGSTOP
+            PtraceRequest::PtraceSeize => Self::handle_seize(&tracer, pid, addr)?,
             // 分离目标进程
             PtraceRequest::PtraceDetach => Self::handle_detach(&tracee, signal)?,
             // 继续执行目标进程

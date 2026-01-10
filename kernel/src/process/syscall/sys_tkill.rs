@@ -14,7 +14,7 @@ impl SysTkill {
     }
 
     fn signal(args: &[usize]) -> usize {
-        args[1] as usize
+        args[1]
     }
 }
 

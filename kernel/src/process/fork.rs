@@ -696,17 +696,7 @@ impl ProcessManager {
 
             // 验证设置
             let verify_parent = pcb.parent_pcb.read_irqsave();
-            let verify_pid = verify_parent
-                .upgrade()
-                .map(|p| p.raw_pid());
-
-            log::debug!(
-                "[FORK] Set parent: child={}, parent={}, verified parent={:?}",
-                child_pid,
-                current_pid,
-                verify_pid
-            );
-
+            let verify_pid = verify_parent.upgrade().map(|p| p.raw_pid());
             pcb.exit_signal
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }

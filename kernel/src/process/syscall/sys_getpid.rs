@@ -15,16 +15,7 @@ impl Syscall for SysGetPid {
     /// 获取当前进程的tpid
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        log::debug!(
-            "[SYS_GETPID] PID {} calling getpid",
-            current_pcb.raw_pid()
-        );
         let tgid = current_pcb.task_tgid_vnr().ok_or(SystemError::ESRCH)?;
-        log::debug!(
-            "[SYS_GETPID] PID {} getpid returning {}",
-            current_pcb.raw_pid(),
-            tgid.data()
-        );
         Ok(tgid.into())
     }
 

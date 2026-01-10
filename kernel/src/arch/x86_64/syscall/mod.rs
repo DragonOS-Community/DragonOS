@@ -5,7 +5,9 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    ipc::signal_types::{OriginCode, SigCode, SigInfo, SigType, SignalArch},
+    ipc::signal_types::{
+        OriginCode, SigCode, SigFaultInfo, SigInfo, SigType, SignalArch, TrapCode,
+    },
     libs::align::SafeForZero,
     mm::VirtAddr,
     process::{ProcessFlags, ProcessManager},
@@ -141,7 +143,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
             pcb.on_syscall_entry(syscall_num, &args);
 
             // 设置重启条件：使用 ERESTARTNOHAND 让 try_restart_syscall 稍后重启
-            frame.rax = system_error::SystemError::ERESTARTNOHAND.to_posix_errno() as u64;
+            frame.rax = SystemError::ERESTARTNOHAND.to_posix_errno() as u64;
             // errcode 已经保存了原始系统调用号（line 69）
 
             // 标记已经完成入口停止，下次通过时将执行系统调用
@@ -151,13 +153,20 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
             pcb.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
 
             // 发送 SIGTRAP 给自己，触发 ptrace 停止 (syscall entry)
+            // 使用 TRAP_TRACE (2) 表示系统调用跟踪
             let mut info = SigInfo::new(
                 Signal::SIGTRAP,
-                0, // PTRACE_EVENTMSG_SYSCALL_ENTRY
-                SigCode::Origin(OriginCode::Kernel),
-                SigType::SigFault(crate::ipc::signal_types::SigFaultInfo { addr: 0, trapno: 0 }),
+                TrapCode::TrapTrace as i32,
+                SigCode::SigFault(SigFaultInfo {
+                    addr: 0,
+                    trapno: crate::ipc::signal_types::TrapCode::TrapTrace as i32,
+                }),
+                SigType::SigFault(SigFaultInfo {
+                    addr: 0,
+                    trapno: crate::ipc::signal_types::TrapCode::TrapTrace as i32,
+                }),
             );
-            Signal::SIGTRAP.send_signal_info_to_pcb(
+            let _ = Signal::SIGTRAP.send_signal_info_to_pcb(
                 Some(&mut info),
                 pcb.clone(),
                 crate::process::pid::PidType::PID,
@@ -215,7 +224,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
                 SigCode::Origin(OriginCode::Kernel),
                 SigType::SigFault(crate::ipc::signal_types::SigFaultInfo { addr: 0, trapno: 0 }),
             );
-            Signal::SIGTRAP.send_signal_info_to_pcb(
+            let _ = Signal::SIGTRAP.send_signal_info_to_pcb(
                 Some(&mut info),
                 pcb.clone(),
                 crate::process::pid::PidType::PID,

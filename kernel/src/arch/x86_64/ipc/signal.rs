@@ -11,7 +11,6 @@ pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
 pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
 
-// 调用一个 ptrace_signal 辅助函数
 use crate::process::{ptrace::ptrace_signal, rseq::Rseq, ProcessFlags};
 use crate::{
     arch::{
@@ -494,77 +493,6 @@ impl UserUContext {
     }
 }
 
-// /// siginfo中的si_code的可选值
-// /// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
-// #[derive(Copy, Debug, Clone, PartialEq, Eq)]
-// pub enum SigCode {
-//     /// 描述通用来源
-//     Origin(OriginCode),
-//     /// 描述 SIGCHLD 的具体原因
-//     SigChld(ChldCode),
-// }
-
-// /// 信号的通用来源码 (SI_*)
-// #[derive(Copy, Debug, Clone, PartialEq, Eq)]
-// #[repr(i32)]
-// pub enum OriginCode {
-//     /// sent by kill, sigsend, raise
-//     User = 0,
-//     /// sent by kernel from somewhere
-//     Kernel = 0x80,
-//     /// 通过sigqueue发送
-//     Queue = -1,
-//     /// 定时器过期时发送
-//     Timer = -2,
-//     /// 当实时消息队列的状态发生改变时发送
-//     Mesgq = -3,
-//     /// 当异步IO完成时发送
-//     AsyncIO = -4,
-//     /// sent by queued SIGIO
-//     SigIO = -5,
-// }
-
-// /// SIGCHLD 专用原因码 (CLD_*)
-// #[derive(Copy, Debug, Clone, PartialEq, Eq)]
-// #[repr(i32)]
-// pub enum ChldCode {
-//     Exited = 1,
-//     Killed = 2,
-//     Dumped = 3,
-//     Trapped = 4,
-//     Stopped = 5,
-//     Continued = 6,
-// }
-
-// impl SigCode {
-//     /// 为SigCode这个枚举类型实现从i32转换到枚举类型的转换函数
-//     #[allow(dead_code)]
-//     pub fn from_i32(signal: Signal, code: i32) -> SigCode {
-//         match signal {
-//             Signal::SIGCHLD => match code {
-//                 1 => SigCode::SigChld(ChldCode::Exited),
-//                 2 => SigCode::SigChld(ChldCode::Killed),
-//                 3 => SigCode::SigChld(ChldCode::Dumped),
-//                 4 => SigCode::SigChld(ChldCode::Trapped),
-//                 5 => SigCode::SigChld(ChldCode::Stopped),
-//                 6 => SigCode::SigChld(ChldCode::Continued),
-//                 _ => panic!("signal code not valid in {:?}", signal),
-//             },
-//             // 对于其他信号，尝试匹配通用码
-//             _ => match code {
-//                 0 => SigCode::Origin(OriginCode::User),
-//                 0x80 => SigCode::Origin(OriginCode::Kernel),
-//                 -1 => SigCode::Origin(OriginCode::Queue),
-//                 -2 => SigCode::Origin(OriginCode::Timer),
-//                 -3 => SigCode::Origin(OriginCode::Mesgq),
-//                 -4 => SigCode::Origin(OriginCode::AsyncIO),
-//                 -5 => SigCode::Origin(OriginCode::SigIO),
-//                 _ => panic!("signal code not valid in {:?}", signal),
-//             },
-//         }
-//     }
-// }
-
 bitflags! {
     #[repr(C,align(8))]
     #[derive(Default)]
@@ -692,88 +620,64 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     }
 
     let mut siginfo_mut_guard = siginfo_mut.unwrap();
+
+    // 按照 Linux 6.6.21 kernel/signal.c::get_signal 的语义：
+    //
+    // 1. 先检查 ptrace 拦截（所有信号，包括 kernel_only）
+    // 2. ptrace_signal 可以修改、取消或注入信号
+    // 3. 处理 ptrace 返回的信号（可能已被修改）
+    // 4. 最后查找 sigaction 并根据 disposition 处理
+    //
+    // 关键：ptrace 处理必须在 sigaction 查找之前完成！
     loop {
         (sig, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
 
         // 如果信号非法，则直接返回
         if sig == Signal::INVALID {
-            log::debug!("[DO_SIGNAL] PID {} no more signals, returning", pcb.raw_pid());
             return;
         }
 
-        log::debug!(
-            "[DO_SIGNAL] PID {} dequeued signal {:?}, PTRACED={}",
-            pcb.raw_pid(),
-            sig,
-            pcb.flags().contains(ProcessFlags::PTRACED)
-        );
-
-        // 按照 Linux 6.6.21 的实现：
-        // 在处理信号之前，如果进程被 ptrace，先调用 ptrace_signal
-        // ptrace_signal 会让进程停止并等待 tracer 的指令
-        //
-        // 重要：在调用 ptrace_signal 之前必须释放 siginfo_mut_guard 锁
-        // 因为 ptrace_stop 内部会调用 schedule()，要求 preempt_count = 0
-        // 而 siginfo_mut_guard 持有锁时 preempt_count = 1
-        // 按照 Linux 的做法，ptrace_stop 会在内部释放 sighand->siglock，
-        // 然后在返回前重新获取它（__releases/__acquires 标注）
-        if pcb.flags().contains(ProcessFlags::PTRACED) {
-            log::debug!(
-                "[DO_SIGNAL] PID {} is PTRACED, calling ptrace_signal for {:?}",
-                pcb.raw_pid(),
-                sig
-            );
-
-            // 保存当前需要的信息
-            let _sig_blocked_cache = *siginfo_mut_guard.sig_blocked();
-
-            // 在调用 ptrace_signal 前释放锁
+        // ===== 第一步：ptrace 拦截（所有信号统一处理） =====
+        // 按照 Linux 6.6.21：不管是 kernel_only 还是普通信号，
+        // 都先通过 ptrace_signal 让 tracer 决定如何处理
+        let is_ptraced = pcb.flags().contains(ProcessFlags::PTRACED);
+        if is_ptraced {
+            // 保存 oldset，因为需要释放锁
+            let _oldset = *siginfo_mut_guard.sig_blocked();
+            // 释放锁，因为 ptrace_stop 内部会调用 schedule()
             drop(siginfo_mut_guard);
+            CurrentIrqArch::interrupt_enable();
 
-            // ptrace_signal 会调用 ptrace_stop 让进程停止
-            // 返回需要继续处理的信号（可能被 tracer 修改或取消）
-            let handled_sig = ptrace_signal(&pcb, sig, &mut info);
+            // ptrace_signal 会：
+            // 1. 调用 ptrace_stop 停止进程
+            // 2. 等待 tracer 的指令
+            // 3. 返回 Some(新信号) 或 None(取消)
+            let result = ptrace_signal(&pcb, sig, &mut info);
 
-            // 重新获取锁
-            siginfo_mut_guard = pcb.try_siginfo_mut(5).unwrap();
+            // 重新获取锁以继续处理
+            let siginfo_mut = pcb.try_siginfo_mut(5);
+            if siginfo_mut.is_none() {
+                return;
+            }
+            siginfo_mut_guard = siginfo_mut.unwrap();
 
-            if let Some(handled_sig) = handled_sig {
-                // tracer 可能注入了新的信号或修改了原信号
-                log::debug!(
-                    "[DO_SIGNAL] PID {} ptrace_signal returned {:?}",
-                    pcb.raw_pid(),
-                    handled_sig
-                );
-                sig = handled_sig;
-            } else {
-                // 信号被 ptrace 取消或重新排队，继续处理下一个信号
-                log::debug!(
-                    "[DO_SIGNAL] PID {} signal was cancelled by ptrace, continuing loop",
-                    pcb.raw_pid()
-                );
-                continue;
+            match result {
+                Some(new_sig) => {
+                    // tracer 注入了新信号，继续处理
+                    sig = new_sig;
+                    // 注意：不 continue，需要对新信号查找 sigaction
+                }
+                None => {
+                    // tracer 取消了信号，继续下一个信号
+                    continue;
+                }
             }
         }
 
-        log::debug!(
-            "[DO_SIGNAL] PID {} processing signal {:?}, checking if kernel_only",
-            pcb.raw_pid(),
-            sig
-        );
-
-        // 对 kernel-only 信号（如 SIGKILL/SIGSTOP）直接使用默认处理，避免任何用户帧构造
+        // ===== 第二步：处理 kernel_only 信号（SIGKILL/SIGSTOP） =====
+        // 只有在非 ptrace 或 ptrace 返回了信号时才到这里
         if sig.kernel_only() {
-            log::debug!(
-                "[DO_SIGNAL] PID {} signal {:?} is kernel_only, calling handle_default",
-                pcb.raw_pid(),
-                sig
-            );
-            // log::error!(
-            //     "do_signal: kernel-only sig={} for pid={:?} -> default handler (no user frame)",
-            //     sig as i32,
-            //     pcb.raw_pid()
-            // );
-            // 释放锁，按常规路径在本线程上下文执行默认处理
+            // kernel_only 信号使用默认处理
             let _oldset = *siginfo_mut_guard.sig_blocked();
             drop(siginfo_mut_guard);
             drop(pcb);
@@ -782,19 +686,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             return;
         }
 
-        log::debug!(
-            "[DO_SIGNAL] PID {} getting sigaction for signal {:?}",
-            pcb.raw_pid(),
-            sig
-        );
+        // ===== 第三步：查找 sigaction（普通信号） =====
         let sa = pcb.sighand().handler(sig).unwrap();
-
-        log::debug!(
-            "[DO_SIGNAL] PID {} signal {:?} sigaction: {:?}",
-            pcb.raw_pid(),
-            sig,
-            sa.action()
-        );
 
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
@@ -838,17 +731,11 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     }
 
     let oldset = *siginfo_mut_guard.sig_blocked();
-    //避免死锁
     drop(siginfo_mut_guard);
-    // no sig_struct guard to drop
     drop(pcb);
-    // 做完上面的检查后，开中断
-    CurrentIrqArch::interrupt_enable();
 
-    log::debug!("[DO_SIGNAL] No signal action to handle, returning without setting up frame");
-    if sigaction.is_none() {
-        return;
-    }
+    // 开中断（如果有 ptrace，已经在中断开启状态下从 ptrace_stop 返回）
+    CurrentIrqArch::interrupt_enable();
 
     let mut sigaction = sigaction.unwrap();
 
@@ -870,7 +757,6 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             }
             _ => {
                 // Default 或 Ignore 动作不设置用户信号帧，got_signal 保持 false
-                log::debug!("[DO_SIGNAL] Default/Ignore action, got_signal remains false");
             }
         }
     }
@@ -894,38 +780,15 @@ fn try_restart_syscall(frame: &mut TrapFrame) {
         restore_saved_sigmask();
     });
 
-    let pcb = ProcessManager::current_pcb();
-    let pid = pcb.raw_pid();
-    // 关键修复：如果进程已经退出（例如处理了 SIGKILL 等致命信号），不重启系统调用
-    let is_exited = pcb.sched_info().inner_lock_read_irqsave().state().is_exited();
-    drop(pcb);
-
-    if is_exited {
-        log::debug!("[TRY_RESTART] PID {}: already exited, not restarting syscall", pid);
-        return;
-    }
-
     if unsafe { frame.syscall_nr() }.is_none() {
-        log::debug!("[TRY_RESTART] PID {}: no syscall, returning", pid);
         return;
     }
 
-    let syscall_nr = unsafe { frame.syscall_nr() };
-    let rax_value = frame.rax;
     let syscall_err = unsafe { frame.syscall_error() };
     if syscall_err.is_none() {
-        log::debug!("[TRY_RESTART] PID {}: no error, rax={:#x}, returning", pid, rax_value);
         return;
     }
     let syscall_err = syscall_err.unwrap();
-
-    log::debug!(
-        "[TRY_RESTART] PID {}: syscall_nr={:?}, rax={:#x}, syscall_err={:?}",
-        pid,
-        syscall_nr,
-        rax_value,
-        syscall_err
-    );
 
     let mut restart = false;
     match syscall_err {
@@ -941,13 +804,6 @@ fn try_restart_syscall(frame: &mut TrapFrame) {
         }
         _ => {}
     }
-    log::debug!(
-        "[TRY_RESTART] PID {}: restart={}, rip={:#x}, rax={:#x}",
-        pid,
-        restart,
-        frame.rip,
-        frame.rax
-    );
 }
 
 pub struct X86_64SignalArch;
@@ -957,27 +813,12 @@ impl SignalArch for X86_64SignalArch {
     ///
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#865
     unsafe fn do_signal_or_restart(frame: &mut TrapFrame) {
-        let pcb = ProcessManager::current_pcb();
-        log::debug!("[DO_SIGNAL_OR_RESTART] PID {} entry, rip={:#x}, rsp={:#x}, state={:?}",
-                   pcb.raw_pid(), frame.rip, frame.rsp,
-                   pcb.sched_info().inner_lock_read_irqsave().state());
-        drop(pcb);
-
         let mut got_signal = false;
         do_signal(frame, &mut got_signal);
 
-        let pcb = ProcessManager::current_pcb();
-        log::debug!("[DO_SIGNAL_OR_RESTART] PID {} after do_signal, got_signal={}, will_return_to_user={}",
-                   pcb.raw_pid(), got_signal, frame.is_from_user());
-        drop(pcb);
-
         if got_signal {
-            log::debug!("[DO_SIGNAL_OR_RESTART] PID {} got_signal=true, NOT calling try_restart_syscall",
-                       ProcessManager::current_pcb().raw_pid());
             return;
         }
-        log::debug!("[DO_SIGNAL_OR_RESTART] PID {} got_signal=false, calling try_restart_syscall",
-                   ProcessManager::current_pcb().raw_pid());
         try_restart_syscall(frame);
     }
 
@@ -1040,18 +881,7 @@ fn handle_signal(
     oldset: &SigSet,
     frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
-    log::debug!("handle_signal {:?}", sig);
-
-    // 只在真正设置信号帧时（即自定义处理器）才修改系统调用错误码
-    // 对于 Default 动作的信号，setup_frame 不会设置信号帧，而是调用 handle_default() 直接返回
-    // 此时应该保留原始错误码，让 try_restart_syscan 正确处理系统调用重启
-    let is_custom_handler = matches!(
-        sigaction.action(),
-        SigactionType::SaHandler(SaHandlerType::Customized(_))
-            | SigactionType::SaSigaction(_)
-    );
-
-    if is_custom_handler && unsafe { frame.syscall_nr() }.is_some() {
+    if unsafe { frame.syscall_nr() }.is_some() {
         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
             match syscall_err {
                 SystemError::ERESTARTNOHAND => {

@@ -1,10 +1,11 @@
-use crate::ipc::signal_types::{SigInfo, SigType};
-use crate::ipc::syscall::sys_kill::check_signal_permission_pcb_with_sig;
 use crate::process::pid::{Pid, PidType};
 use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
 use crate::{
     arch::ipc::signal::Signal,
-    ipc::signal_types::{OriginCode, SigCode},
+    ipc::{
+        signal_types::{OriginCode, SigCode, SigInfo, SigType},
+        syscall::sys_kill::check_signal_permission_pcb_with_sig,
+    },
 };
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -14,26 +15,14 @@ use system_error::SystemError;
 /// ### 向一个进程发送信号
 /// kill() 系统调用发送进程级信号，使用 PidType::TGID
 pub fn send_signal_to_pid(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
-    log::debug!(
-        "[SEND_SIGNAL_TO_PID] ===== ENTRY: Sending signal {:?} to PID {}",
-        sig,
-        pid
-    );
-
     // 查找目标进程
     let target = ProcessManager::find_task_by_vpid(pid);
 
     if target.is_none() {
-        log::debug!("[SEND_SIGNAL_TO_PID] ===== ERROR: Target PID {} not found!", pid);
         return Err(SystemError::ESRCH);
     }
 
     let target = target.unwrap();
-
-    log::debug!(
-        "[SEND_SIGNAL_TO_PID] Found target PID {}, calling send_signal_info_to_pcb",
-        pid
-    );
 
     // 检查权限（传入信号以处理 SIGCONT 特殊情况）
     check_signal_permission_pcb_with_sig(&target, Some(sig))?;
@@ -54,18 +43,11 @@ pub fn send_signal_to_pid(pid: RawPid, sig: Signal) -> Result<usize, SystemError
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     // kill() 发送进程级信号，使用 PidType::TGID
-    log::debug!(
-        "[SEND_SIGNAL_TO_PID] About to call send_signal_info_to_pcb with PidType::TGID"
-    );
     let ret = sig
         .send_signal_info_to_pcb(Some(&mut info), target, PidType::TGID)
         .map(|x| x as usize);
 
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    log::debug!(
-        "[SEND_SIGNAL_TO_PID] ===== EXIT: send_signal_info_to_pcb returned: {:?}",
-        ret
-    );
     ret
 }
 

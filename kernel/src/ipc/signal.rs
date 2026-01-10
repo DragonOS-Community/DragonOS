@@ -10,6 +10,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
+    ipc::kill::send_signal_to_pcb,
     ipc::signal_types::{
         OriginCode, SigCode, SigInfo, SigType, SigactionType, SignalFlags, SIG_KERNEL_IGNORE_MASK,
         SIG_KERNEL_ONLY_MASK, SIG_KERNEL_STOP_MASK,
@@ -254,13 +255,6 @@ impl Signal {
     /// @param pt siginfo结构体中，pid字段代表的含义
     #[allow(clippy::if_same_then_else)]
     fn complete_signal(&self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
-        log::debug!(
-            "[COMPLETE_SIGNAL] Sending signal {:?} to PID {}, pt={:?}",
-            self,
-            pcb.raw_pid(),
-            pt
-        );
-
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // ===== 寻找需要wakeup的目标进程 =====
         // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。
@@ -270,22 +264,12 @@ impl Signal {
         // 根据信号类型选择添加到线程级 pending 还是进程级 shared_pending
         let is_thread_target = matches!(pt, PidType::PID);
         if is_thread_target {
-            log::debug!(
-                "[COMPLETE_SIGNAL] Adding signal {:?} to PID {} thread pending",
-                self,
-                pcb.raw_pid()
-            );
             // 线程级信号：添加到线程的 sig_pending
             pcb.sig_info_mut()
                 .sig_pending_mut()
                 .signal_mut()
                 .insert((*self).into());
         } else {
-            log::debug!(
-                "[COMPLETE_SIGNAL] Adding signal {:?} to PID {} shared pending",
-                self,
-                pcb.raw_pid()
-            );
             // 进程级信号：添加到 shared_pending
             // 注意：正常路径下（send_signal/enqueue_signal_locked）进程级信号会通过
             // shared_pending_push() 同时完成“入队 + 位图置位”。这里仍然保留位图置位，
@@ -299,23 +283,13 @@ impl Signal {
         // 若目标进程存在 signalfd 监听该信号，需要唤醒其等待者/epoll。
         crate::ipc::signalfd::notify_signalfd_for_pcb(&pcb, *self);
         // 判断目标进程是否应该被唤醒以立即处理该信号
-        log::debug!(
-            "[COMPLETE_SIGNAL] Checking if PID {} wants signal {:?}",
-            pcb.raw_pid(),
-            self
-        );
         let wants_signal = self.wants_signal(pcb.clone());
 
-        // 按照 Linux 6.6.21 语义：
-        // 对于被 ptrace 的进程，如果收到 SIGSTOP 信号，需要特殊处理：
-        // 1. 如果进程处于 Blocked 状态（如在 pause(), sleep() 等），需要唤醒它来处理信号
-        // 2. 如果进程处于 Runnable 状态，不需要唤醒（它会自动处理）
-        // 3. 这样可以避免竞态条件：tracer 在 waitpid 之前 tracee 就被唤醒并继续执行
+        // 按照 Linux 6.6.21 语义：对于被 ptrace 的进程，如果收到 SIGSTOP 信号，需要特殊处理
         let is_ptrace_sigstop =
             pcb.flags().contains(ProcessFlags::PTRACED) && *self == Signal::SIGSTOP;
 
         let should_wake = if is_ptrace_sigstop {
-            // 对于 ptrace SIGSTOP，只有进程处于 Blocked 状态时才唤醒
             matches!(
                 pcb.sched_info().inner_lock_read_irqsave().state(),
                 ProcessState::Blocked(_)
@@ -325,28 +299,13 @@ impl Signal {
         };
 
         if should_wake {
-            log::debug!(
-                "[COMPLETE_SIGNAL] PID {} wants signal {:?} (or blocked+ptrace SIGSTOP), will call signal_wake_up",
-                pcb.raw_pid(),
-                self
-            );
             target_pcb = Some(pcb.clone());
         } else if pt == PidType::PID {
-            log::debug!(
-                "[COMPLETE_SIGNAL] PID {} doesn't want signal {:?} (or runnable+ptrace SIGSTOP), pt=PID, returning without wake_up",
-                pcb.raw_pid(),
-                self
-            );
             /*
              * 单线程场景且不需要唤醒：信号已入队，等待合适时机被取走
              */
             return;
         } else {
-            log::debug!(
-                "[COMPLETE_SIGNAL] PID {} doesn't want signal {:?} (or runnable+ptrace SIGSTOP), returning without wake_up",
-                pcb.raw_pid(),
-                self
-            );
             /*
              * Otherwise try to find a suitable thread.
              * 由于目前每个进程只有1个线程，因此当前情况可以返回。信号队列的dequeue操作不需要考虑同步阻塞的问题。
@@ -359,11 +318,6 @@ impl Signal {
         // 统一按既有规则唤醒：STOP 信号需要把阻塞的系统调用唤醒到信号处理路径，
         // 由目标进程在自身上下文中执行默认处理（sig_stop），从而原地进入 Stopped，避免返回到用户态。
         if let Some(target_pcb) = target_pcb {
-            log::debug!(
-                "[COMPLETE_SIGNAL] Calling signal_wake_up for PID {} with signal {:?}",
-                target_pcb.raw_pid(),
-                self
-            );
             signal_wake_up(target_pcb.clone(), *self == Signal::SIGKILL);
         }
     }
@@ -374,27 +328,13 @@ impl Signal {
     /// 这么做是为了防止我们把信号发送给了一个正在或已经退出的进程，或者是不响应该信号的进程。
     #[inline]
     fn wants_signal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
-        log::debug!(
-            "[WANTS_SIGNAL] Checking if PID {} wants signal {:?}",
-            pcb.raw_pid(),
-            self
-        );
-
         // 若进程正在退出，则不能接收
         if pcb.flags().contains(ProcessFlags::EXITING) {
-            log::debug!(
-                "[WANTS_SIGNAL] PID {} is exiting, returning false",
-                pcb.raw_pid()
-            );
             return false;
         }
 
         // SIGKILL 总是唤醒
         if *self == Signal::SIGKILL {
-            log::debug!(
-                "[WANTS_SIGNAL] SIGKILL for PID {}, returning true",
-                pcb.raw_pid()
-            );
             return true;
         }
 
@@ -402,31 +342,14 @@ impl Signal {
         // 则无论该信号是否在常规 blocked 集内，都应唤醒，由具体系统调用在返回路径上判定。
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
 
-        log::debug!("[WANTS_SIGNAL] PID {} state: {:?}", pcb.raw_pid(), state);
-
         // SIGCONT：即便被屏蔽或默认忽略，也应唤醒处于 Stopped 的任务，让其继续运行。
         if *self == Signal::SIGCONT && state.is_stopped() {
-            log::debug!(
-                "[WANTS_SIGNAL] SIGCONT for stopped PID {}, returning true",
-                pcb.raw_pid()
-            );
             return true;
         }
         let is_blocked_interruptable = state.is_blocked_interruptable();
         let has_restore_sig_mask = pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK);
 
-        log::debug!(
-            "[WANTS_SIGNAL] PID {} is_blocked_interruptable={}, has_restore_sig_mask={}",
-            pcb.raw_pid(),
-            is_blocked_interruptable,
-            has_restore_sig_mask
-        );
-
         if is_blocked_interruptable && has_restore_sig_mask {
-            log::debug!(
-                "[WANTS_SIGNAL] PID {} blocked_interruptable + RESTORE_SIG_MASK, returning true",
-                pcb.raw_pid()
-            );
             return true;
         }
 
@@ -434,45 +357,17 @@ impl Signal {
         let blocked = *pcb.sig_info_irqsave().sig_blocked();
         let is_blocked = blocked.contains((*self).into());
 
-        log::debug!(
-            "[WANTS_SIGNAL] PID {} signal {:?} blocked={}, sig_blocked_set={:?}",
-            pcb.raw_pid(),
-            self,
-            is_blocked,
-            blocked
-        );
-
         if is_blocked {
-            log::debug!(
-                "[WANTS_SIGNAL] PID {} signal {:?} is blocked, returning false",
-                pcb.raw_pid(),
-                self
-            );
             return false;
         }
 
         let is_blocked_non_interruptable =
             state.is_blocked() && (!state.is_blocked_interruptable());
 
-        log::debug!(
-            "[WANTS_SIGNAL] PID {} is_blocked_non_interruptable={}",
-            pcb.raw_pid(),
-            is_blocked_non_interruptable
-        );
-
         if is_blocked_non_interruptable {
-            log::debug!(
-                "[WANTS_SIGNAL] PID {} is in non-interruptible blocked state, returning false",
-                pcb.raw_pid()
-            );
             return false;
         }
 
-        log::debug!(
-            "[WANTS_SIGNAL] PID {} wants signal {:?}, returning true",
-            pcb.raw_pid(),
-            self
-        );
         return true;
     }
 
@@ -587,14 +482,8 @@ impl Signal {
             flush = Signal::SIGCONT.into_sigset();
 
             // 对于 ptrace 进程，SIGSTOP 应该在 do_signal 中由 ptrace_signal 处理
-            // 但是，我们仍然需要清理 SIGCONT，保持信号状态的一致性
             if pcb.flags().contains(ProcessFlags::PTRACED) {
-                log::debug!(
-                    "[PREPARE_SIGNAL] PID {} is ptraced, flushing SIGCONT but skipping stop handling",
-                    pcb.raw_pid()
-                );
                 // 只清理 SIGCONT，不执行停止操作
-                // 让信号正常入队，由 ptrace_signal 在 do_signal 中处理
                 thread_group_leader
                     .sighand()
                     .shared_pending_flush_by_mask(&flush);
@@ -627,28 +516,11 @@ impl Signal {
             });
 
             if let Some(parent) = pcb.parent_pcb() {
-                log::debug!(
-                    "[SIGSTOP] PID {} sending SIGCHLD to parent={} via parent_pcb",
-                    pcb.raw_pid(),
-                    parent.raw_pid()
-                );
-                let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+                let _ = send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
                 parent.wake_all_waiters();
-            } else {
-                log::debug!(
-                    "[SIGSTOP] PID {} has no parent_pcb, trying real_parent",
-                    pcb.raw_pid()
-                );
-                if let Some(real_parent) = pcb.real_parent_pcb() {
-                    log::debug!(
-                        "[SIGSTOP] PID {} sending SIGCHLD to real_parent={}",
-                        pcb.raw_pid(),
-                        real_parent.raw_pid()
-                    );
-                    let _ =
-                        crate::ipc::kill::send_signal_to_pcb(real_parent.clone(), Signal::SIGCHLD);
-                    real_parent.wake_all_waiters();
-                }
+            } else if let Some(real_parent) = pcb.real_parent_pcb() {
+                let _ = send_signal_to_pcb(real_parent.clone(), Signal::SIGCHLD);
+                real_parent.wake_all_waiters();
             }
             // 唤醒等待在该子进程/线程上的等待者
             thread_group_leader.wake_all_waiters();
@@ -657,7 +529,7 @@ impl Signal {
             });
 
             // SIGSTOP 是 kernel-only stop 信号：其效果是把线程组置为 stopped 并通知父进程，
-            // 不应作为“可传递到用户态”的 pending 信号继续入队。
+            // 不应作为"可传递到用户态"的 pending 信号继续入队。
             // 否则在 SIGCONT 后可能错误地以 EINTR/ERESTART* 形式打断正在执行的系统调用（gVisor sigstop_test 即依赖这一点）。
             if *self == Signal::SIGSTOP {
                 return false;
@@ -701,18 +573,11 @@ impl Signal {
                     .sighand()
                     .flags_remove(SignalFlags::STOP_STOPPED);
                 if let Some(parent) = pcb.parent_pcb() {
-                    log::debug!(
-                        "[SIGCONT] PID {} sending SIGCHLD to parent={} via parent_pcb",
-                        pcb.raw_pid(),
-                        parent.raw_pid()
-                    );
-                    let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+                    let _ = send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
                     parent.wake_all_waiters();
-                } else {
-                    log::debug!(
-                        "[SIGCONT] PID {} has no parent_pcb, trying real_parent",
-                        pcb.raw_pid()
-                    );
+                } else if let Some(real_parent) = pcb.real_parent_pcb() {
+                    let _ = send_signal_to_pcb(real_parent.clone(), Signal::SIGCHLD);
+                    real_parent.wake_all_waiters();
                 }
                 // 唤醒等待在该子进程上的等待者
                 thread_group_leader.wake_all_waiters();
@@ -742,12 +607,7 @@ impl Signal {
 pub fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
-    log::debug!(
-        "[signal_wake_up] PID {} state={:?}, fatal={}",
-        pcb.raw_pid(),
-        pcb.sched_info().inner_lock_read_irqsave().state(),
-        fatal
-    );
+    // debug!("signal_wake_up");
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
     let state = pcb.sched_info().inner_lock_read_irqsave().state();
     let mut wakeup_ok = true;
@@ -771,14 +631,21 @@ pub fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
 
     // 强制让目标CPU陷入内核，尽快处理 pending 的信号（包括作业控制停止/继续）
     // 即使目标任务当前处于 Runnable，也需要 kick 以触发内核路径的 do_signal。
-    // 对于非致命信号（如 SIGSTOP），如果进程在 Runnable 状态，仍然需要 kick
-    // 以便它在返回用户空间前处理信号
-    if !wakeup_ok && !fatal {
-        // 当Runnable状态的进程从系统调用返回时，会看到 pending 信号并处理它
-        ProcessManager::kick(&pcb);
-    } else if wakeup_ok {
+    if wakeup_ok {
+        // log::debug!(
+        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick",
+        //     pcb.raw_pid(),
+        //     state,
+        //     fatal
+        // );
         ProcessManager::kick(&pcb);
     } else if fatal {
+        // log::debug!(
+        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> wakeup+kick",
+        //     pcb.raw_pid(),
+        //     state,
+        //     fatal
+        // );
         let _r = ProcessManager::wakeup(&pcb).map(|_| {
             ProcessManager::kick(&pcb);
         });

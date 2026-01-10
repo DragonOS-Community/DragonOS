@@ -1,7 +1,7 @@
 use crate::{
-    arch::{CurrentSignalArch, interrupt::TrapFrame, ipc::signal::Signal},
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, CurrentSignalArch},
     ipc::signal_types::SignalArch,
-    process::{ProcessFlags, ProcessManager, rseq::Rseq},
+    process::{rseq::Rseq, ProcessFlags, ProcessManager},
 };
 
 #[no_mangle]
@@ -60,10 +60,6 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
         }
 
         if process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL) {
-            log::debug!(
-                "[EXIT_TO_USERMODE] PID {} calling do_signal_or_restart",
-                pcb.raw_pid()
-            );
             unsafe { CurrentSignalArch::do_signal_or_restart(frame) };
         }
         process_flags_work = *ProcessManager::current_pcb().flags();

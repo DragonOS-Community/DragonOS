@@ -3,14 +3,14 @@ use crate::arch::ipc::signal::{SigFlags, Signal};
 use crate::arch::kprobe;
 use crate::ipc::signal_types::{
     ChldCode, OriginCode, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType, Sigaction,
-    SigactionType, SignalFlags,
+    SigactionType, SignalFlags, TrapCode,
 };
 use crate::process::{
     pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, PtraceEvent,
     PtraceOptions, PtraceRequest, PtraceStopReason, PtraceSyscallInfo, PtraceSyscallInfoData,
     PtraceSyscallInfoEntry, PtraceSyscallInfoExit, PtraceSyscallInfoOp, RawPid,
 };
-use crate::sched::{schedule, DequeueFlag, EnqueueFlag, SchedMode, WakeupFlags};
+use crate::sched::{schedule, EnqueueFlag, SchedMode, WakeupFlags};
 use alloc::{sync::Arc, vec::Vec};
 use core::{intrinsics::unlikely, mem::MaybeUninit};
 use system_error::SystemError;
@@ -25,57 +25,21 @@ pub fn ptrace_signal(
     original_signal: Signal,
     info: &mut Option<SigInfo>,
 ) -> Option<Signal> {
-    log::debug!(
-        "[PTRACE_SIGNAL] PID {} processing signal {:?}",
-        pcb.raw_pid(),
-        original_signal
-    );
-
     // todo pcb.jobctl_set(JobControlFlags::STOP_DEQUEUED);
-    // 核心：调用 ptrace_stop 使进程停止并等待追踪者。
-    // ptrace_stop 会返回追踪者注入的信号。
     // 注意：ptrace_stop 内部会处理锁的释放和重新获取。
     let mut signr = pcb.ptrace_stop(original_signal as usize, ChldCode::Trapped, info.as_mut());
 
-    log::debug!(
-        "[PTRACE_SIGNAL] PID {} tracer returned signal {}",
-        pcb.raw_pid(),
-        signr
-    );
-
-    // 按照 Linux 6.6.21 的 get_signal 语义：
-    // 如果 signr == 0，表示没有注入信号，应该丢弃原始信号，继续执行
-    // 如果 signr != 0，表示注入了新信号，应该处理该信号
     if signr == 0 {
-        log::debug!(
-            "[PTRACE_SIGNAL] PID {} no injected signal, discarding original signal {:?}",
-            pcb.raw_pid(),
-            original_signal
-        );
         return None; // 丢弃原始信号，继续处理下一个信号（如果没有，则继续执行）
     }
     // 将注入的信号转换为 Signal 类型
     let mut injected_signal = Signal::from(signr);
     if injected_signal == Signal::INVALID {
-        // 这不应该发生，因为 signr != 0
-        log::error!(
-            "[PTRACE_SIGNAL] PID {} invalid signal {}",
-            pcb.raw_pid(),
-            signr
-        );
         return None;
     }
 
-    // 如果追踪者注入了不同于原始信号的新信号，更新 siginfo。
-    // 注意：按照 Linux 6.6.21 的 ptrace 语义，注入的信号应该使用 SI_USER 代码
-    // 而不是 SigChld 类型，因为这不是真正的子进程状态变化
+    // 如果追踪者注入了不同于原始信号的新信号，更新 siginfo
     if injected_signal != original_signal {
-        log::debug!(
-            "[PTRACE_SIGNAL] PID {} tracer injected new signal {:?} (was {:?})",
-            pcb.raw_pid(),
-            injected_signal,
-            original_signal
-        );
         if let Some(info_ref) = info {
             let tracer = pcb.parent_pcb().unwrap();
             // 使用 Kill 类型（SI_USER）而不是 SigChld
@@ -92,17 +56,11 @@ pub fn ptrace_signal(
         }
     }
 
-    // 特殊处理 SIGCONT：需要清除挂起的停止信号，但仍然要传递给用户
-    // 按照 Linux 6.6.21 的语义，SIGCONT 应该唤醒进程并传递给用户空间处理
+    // 特殊处理 SIGCONT：需要清除挂起的停止信号，但仍然要唤醒进程并传递给用户空间处理
     if injected_signal == Signal::SIGCONT {
-        log::debug!(
-            "[PTRACE_SIGNAL] PID {} injected SIGCONT, clearing any pending stop signals",
-            pcb.raw_pid()
-        );
         // 清除任何挂起的停止信号（如 SIGSTOP, SIGTSTP 等）
         let mut sig_info = pcb.sig_info.write();
         let pending = sig_info.sig_pending_mut().signal_mut();
-        // 清除停止信号
         for stop_sig in [
             Signal::SIGSTOP,
             Signal::SIGTSTP,
@@ -112,8 +70,6 @@ pub fn ptrace_signal(
             pending.remove(stop_sig.into());
         }
         drop(sig_info);
-        // 返回 Some(injected_signal) 让 SIGCONT 被正常处理
-        // 这样用户的信号处理函数（如 sigcont_handler）会被调用
         return Some(injected_signal);
     }
 
@@ -123,23 +79,12 @@ pub fn ptrace_signal(
         .sig_blocked()
         .contains(injected_signal.into())
     {
-        log::debug!(
-            "[PTRACE_SIGNAL] PID {} signal {:?} is blocked, requeuing",
-            pcb.raw_pid(),
-            injected_signal
-        );
         // 如果被阻塞了，则将信号重新排队，让它在未来被处理。
         let _ =
             injected_signal.send_signal_info_to_pcb(info.as_mut(), Arc::clone(pcb), PidType::PID);
-        // 告诉 get_signal，当前没有需要立即处理的信号。
         return None;
     }
     // 如果没有被阻塞，则返回这个新信号，让 get_signal 继续分发和处理它。
-    log::debug!(
-        "[PTRACE_SIGNAL] PID {} returning signal {:?} to handle",
-        pcb.raw_pid(),
-        injected_signal
-    );
     Some(injected_signal)
 }
 
@@ -200,15 +145,8 @@ pub fn handle_ptrace_signal_stop(current_pcb: &Arc<ProcessControlBlock>, sig: Si
     let mut ptrace_state = current_pcb.ptrace_state.lock();
     ptrace_state.stop_reason = PtraceStopReason::Signal(sig);
     ptrace_state.exit_code = sig as usize;
-    log::debug!(
-        "PID {} stopping due to ptrace on signal {:?}",
-        current_pcb.raw_pid(),
-        sig
-    );
     drop(ptrace_state);
 
-    // 调用 ptrace_stop 让进程真正停止并等待跟踪器
-    // 这会设置状态、通知跟踪器、并调用 schedule() 让出 CPU
     let mut info = SigInfo::new(
         sig,
         0,
@@ -242,7 +180,7 @@ impl ProcessControlBlock {
 
     /// 获取ptrace跟踪器
     pub fn tracer(&self) -> Option<RawPid> {
-        self.ptrace_state.lock().tracer.clone()
+        self.ptrace_state.lock().tracer
     }
 
     pub fn is_traced(&self) -> bool {
@@ -287,30 +225,13 @@ impl ProcessControlBlock {
 
     pub fn set_parent(&self, new_parent: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         if new_parent.raw_pid() == self.raw_pid() {
-            return Err(SystemError::EINVAL); // 不能将自己设为父进程
+            return Err(SystemError::EINVAL);
         }
         if new_parent.is_exited() {
-            return Err(SystemError::ESRCH); // 父进程不能是退出状态或僵尸状态
+            return Err(SystemError::ESRCH);
         }
 
-        let old_parent = self.parent_pcb().map(|p| p.raw_pid());
-        log::debug!(
-            "[SET_PARENT] PID {} changing parent from {:?} to {}",
-            self.raw_pid(),
-            old_parent,
-            new_parent.raw_pid()
-        );
-
         *(self.parent_pcb.write()) = Arc::downgrade(new_parent);
-
-        // 验证设置是否成功
-        let verify_parent = self.parent_pcb().map(|p| p.raw_pid());
-        log::debug!(
-            "[SET_PARENT] PID {} verified parent_pcb={:?}",
-            self.raw_pid(),
-            verify_parent
-        );
-
         Ok(())
     }
 
@@ -324,11 +245,6 @@ impl ProcessControlBlock {
         let mut info = self.sig_info.write();
         info.sig_pending.signal_mut().insert(signal.into());
     }
-    /// 从队列获取信号
-    // pub fn dequeue_signal(&self) -> Option<Signal> {
-    //     let mut info = self.sig_info.write();
-    //     info.dequeue_signal(signal, self)
-    // }
 
     /// 唤醒父进程的等待队列
     fn wake_up_parent(&self, state: Option<ProcessState>) {
@@ -374,196 +290,130 @@ impl ProcessControlBlock {
         Ok(())
     }
 
-    pub fn ptrace_event_enabled(&self, event: PtraceEvent) -> bool {
-        let event_flag = 1 << (event as u32 + 3);
-        self.ptrace_state.lock().event_message == event_flag && event_flag != 0;
-        true
-    }
-
+    /// ptrace 事件通知
+    ///
+    /// 按照 Linux 6.6.21 的 ptrace_event 实现：
+    /// - 如果事件被启用（通过 PTRACE_O_TRACEEXEC 等选项），调用 ptrace_stop 阻塞进程
+    /// - 进程保持 TracedStopped 状态，直到 tracer 唤醒它
+    /// - 不应该手动设置 Runnable 状态，这由 ptrace_resume 处理
+    ///
+    /// Legacy Exec 行为（PTRACE_SEIZE）：
+    /// - 如果进程是通过 PTRACE_SEIZE 附加的（PT_SEIZED 标志已设置），
+    ///   且没有设置 PTRACE_O_TRACEEXEC，则不发送 Legacy SIGTRAP
+    /// - 这避免了现代调试器（如 rr、新版 GDB）收到意料之外的信号
     pub fn ptrace_event(&self, event: PtraceEvent, message: usize) {
+        // 检查是否启用了该事件的追踪
         if unlikely(self.ptrace_event_enabled(event)) {
             self.ptrace_state.lock().event_message = message;
-            let _ = Self::ptrace_notify((event as usize) << 8 | Signal::SIGTRAP as usize);
+            // ptrace_notify 会调用 ptrace_stop，阻塞进程直到 tracer 唤醒
+            let exit_code = (event as usize) << 8 | Signal::SIGTRAP as usize;
+            let _ = Self::ptrace_notify(exit_code);
+            // 注意：这里不设置 Runnable！
+            // ptrace_stop 内部会调用 schedule() 阻塞
+            // 当 tracer 调用 PTRACE_CONT 时，ptrace_resume 会设置 Runnable
         } else if event == PtraceEvent::Exec {
-            // if (ptrace_flags & (PT_PTRACED | PT_SEIZED)) == PT_PTRACED {
-            log::debug!("ProcessFlags::PTRACED");
-            let sig = Signal::SIGTRAP;
-            let mut info = SigInfo::new(
-                sig,
-                0,
-                SigCode::Origin(OriginCode::Kernel),
-                SigType::SigFault(SigFaultInfo { addr: 0, trapno: 0 }),
-            );
-            let _ = sig.send_signal_info_to_pcb(
-                Some(&mut info),
-                self.self_ref.upgrade().unwrap(),
-                PidType::PID,
-            );
-            // }
+            // Legacy Exec 行为：只有在非 PTRACE_SEIZE 时才发送自动 SIGTRAP
+            // 这符合 Linux 6.6.21 的逻辑：
+            // - PTRACE_ATTACH：发送 Legacy SIGTRAP
+            // - PTRACE_SEIZE：不发送 Legacy SIGTRAP（除非显式设置 PTRACE_O_TRACEEXEC）
+            let is_seized = self.flags().contains(ProcessFlags::PT_SEIZED);
+
+            if !is_seized {
+                // 非 PTRACE_SEIZE：发送 Legacy SIGTRAP
+                let sig = Signal::SIGTRAP;
+                let mut info = SigInfo::new(
+                    sig,
+                    0,
+                    SigCode::Origin(OriginCode::Kernel),
+                    SigType::SigFault(SigFaultInfo { addr: 0, trapno: 0 }),
+                );
+                let _ = sig.send_signal_info_to_pcb(
+                    Some(&mut info),
+                    self.self_ref.upgrade().unwrap(),
+                    PidType::PID,
+                );
+            }
+            // PTRACE_SEIZE：不发送信号，静默返回
         }
-        let wait_status = ((event as usize) << 8) | (Signal::SIGTRAP as usize);
-        self.set_state(ProcessState::Runnable);
+        // 移除了错误的 set_state(Runnable) 调用
+        // ptrace_stop 已经正确处理了状态管理
     }
+
+    /// 检查是否启用了指定的 ptrace 事件选项
+    ///
+    /// 按照 Linux 6.6.21 的 ptrace_event_enabled 实现：
+    /// - 检查 PTRACE_O_TRACEEXEC 等选项是否被设置
+    /// - 返回 true 表示 tracer 想要接收该事件的通知
+    pub fn ptrace_event_enabled(&self, event: PtraceEvent) -> bool {
+        // 将 PtraceEvent 转换为对应的 PtraceOptions 标志
+        let event_flag = match event {
+            PtraceEvent::Fork => PtraceOptions::TRACEFORK,
+            PtraceEvent::VFork => PtraceOptions::TRACEVFORK,
+            PtraceEvent::Clone => PtraceOptions::TRACECLONE,
+            PtraceEvent::Exec => PtraceOptions::TRACEEXEC,
+            PtraceEvent::VForkDone => PtraceOptions::TRACEVFORKDONE,
+            PtraceEvent::Exit => PtraceOptions::TRACEEXIT,
+            PtraceEvent::Seccomp => PtraceOptions::TRACESECCOMP,
+            _ => return false,
+        };
+
+        // 检查该选项是否在 ptrace_state.options 中被设置
+        self.ptrace_state.lock().options.contains(event_flag)
+    }
+
     /// 设置进程为停止状态
+    ///
+    /// 按照 Linux 6.6.21 的 ptrace_stop 实现：
+    /// - 设置状态为 TracedStopped (类似 TASK_TRACED)
+    /// - 调用 schedule() 让出 CPU，调度器会自动将任务从运行队列移除
+    /// - 不需要手动 deactivate_task，这会引入竞态条件
     pub fn ptrace_stop(
         &self,
         exit_code: usize,
         why: ChldCode,
-        info: Option<&mut SigInfo>,
+        _info: Option<&mut SigInfo>,
     ) -> usize {
-        log::debug!(
-            "[PTRACE_STOP] PID {} stopping: exit_code={}, why={:?}",
-            self.raw_pid(),
-            exit_code,
-            why
-        );
-
-        // 按照 Linux 6.6.21 的 ptrace_stop 语义：
-        // 1. 设置 TRAPPING 标志，表示 tracee 正在停止
-        // 2. 设置进程状态为 Stopped
-        // 3. 唤醒 tracer 的等待队列
-        // 4. 进入 schedule() 让出 CPU
-        // 5. 当 tracer 唤醒 tracee 后，schedule() 返回
-        // 6. 清除 TRAPPING 标志
-
         // 设置 TRAPPING 标志，表示正在停止
         self.flags().insert(ProcessFlags::TRAPPING);
 
-        // self.last_siginfo = info.cloned();
-        // 按照 Linux 6.6.21 的 ptrace_stop 语义：
         // 使用 TracedStopped 状态（类似于 Linux 的 TASK_TRACED）
-        // 而不是 Stopped 状态（类似于 Linux 的 TASK_STOPPED）
-        // 这确保 tracee 只能被 tracer 通过 ptrace_resume 唤醒
-
-        // 获取 sched_info 锁并设置状态
         let mut sched_info = self.sched_info.inner_lock_write_irqsave();
         sched_info.set_state(ProcessState::TracedStopped(exit_code));
-        // 关键：必须设置 sleep 标志，否则调度器不会把进程从运行队列移除
         sched_info.set_sleep();
         drop(sched_info);
 
-        self.flags().insert(ProcessFlags::PTRACED);
+        // 注意：不再设置 PTRACED 标志，因为：
+        // 1. PTRACE_TRACEME/ATTACH 时已经设置
+        // 2. 在 ptrace_stop 中设置会导致语义偏差
 
-        log::debug!(
-            "[PTRACE_STOP] PID {} state set to TracedStopped({}), will call schedule",
-            self.raw_pid(),
-            exit_code
-        );
-
-        // 为下次stop恢复
+        // 清除 ptrace_state 中的 event_message
         self.ptrace_state.lock().event_message = 0;
-
-        // 按照 Linux 6.6.21 的 ptrace_stop 语义：
-        // 1. 先通知 tracer (do_notify_parent_cldstop) - 在 schedule() 之前
-        // 2. 清除 TRAPPING 标志
-        // 3. 确保任务从运行队列移除
-        // 4. 调用 schedule() 让出 CPU
-        //
-        // 这样 tracer 会被唤醒并可以 wait()，tracee 会进入睡眠状态
 
         // 通知跟踪器 - 必须在 schedule() 之前调用！
         if let Some(tracer) = self.parent_pcb() {
-            log::debug!(
-                "[PTRACE_STOP] PID {} notifying tracer={}",
-                self.raw_pid(),
-                tracer.raw_pid()
-            );
             self.notify_tracer(&tracer, why);
-        } else {
-            log::error!("PID {} is traced but has no parent tracer!", self.raw_pid());
         }
 
         // 清除 TRAPPING 标志，表示已经完成停止准备工作
         self.flags().remove(ProcessFlags::TRAPPING);
 
-        // 关键修复：确保任务从运行队列中移除
-        // 由于任务可能之前被 signal_wake_up 唤醒并加入运行队列
-        // 我们需要确保它现在被移除，否则 schedule() 会立即返回
-        {
-            let rq = crate::sched::cpu_rq(crate::smp::core::smp_get_processor_id().data() as usize);
-            let (rq, _guard) = rq.self_lock();
-            rq.deactivate_task(
-                self.self_ref.upgrade().unwrap(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-            log::debug!(
-                "[PTRACE_STOP] PID {} manually deactivated from run queue",
-                self.raw_pid()
-            );
-        }
-
-        let preempt_count_before = ProcessManager::current_pcb().preempt_count();
-        log::debug!(
-            "[PTRACE_STOP] PID {} before schedule: preempt_count={}",
-            self.raw_pid(),
-            preempt_count_before
-        );
-
-        log::debug!(
-            "[PTRACE_STOP] PID {} scheduling out, waiting for tracer",
-            self.raw_pid()
-        );
-
-        // 调度出去，让出CPU等待跟踪器恢复
-        // set_state 已经释放了 sched_info 锁，现在可以安全调用 schedule
-        let state_before = self.sched_info().inner_lock_read_irqsave().state();
-        log::debug!(
-            "[PTRACE_STOP] PID {} before schedule: state={:?}",
-            self.raw_pid(),
-            state_before
-        );
-        drop(state_before);
+        // 按照 Linux 6.6.21 语义：
+        // 不需要手动从运行队列中移除任务
+        // schedule() 内部会检查 state，如果不是 Runnable，调度器会自动处理
+        // 手动 deactivate_task 会引入竞态条件（如果在 deactivate 后、schedule 前有唤醒请求）
 
         schedule(SchedMode::SM_NONE);
 
         // 从 schedule() 返回后，tracer 已经通过 ptrace_resume 唤醒了我们
-        // 状态已经被 ptrace_resume 设置为 Runnable
-        // 不要在这里手动修改状态！否则会导致竞态条件
-        let state_after = self.sched_info().inner_lock_read_irqsave().state();
-        log::debug!(
-            "[PTRACE_STOP] PID {} after schedule: state={:?}",
-            self.raw_pid(),
-            state_after
-        );
-        drop(state_after);
-
-        log::debug!(
-            "[PTRACE_STOP] PID {} resumed by tracer, checking ptrace flag",
-            self.raw_pid()
-        );
-
-        // 按照 Linux 6.6.21 的 ptrace_stop 语义：
         // 进程恢复后，应该返回 tracer 注入的信号（data 参数）
-        // 而不是原始的 exit_code
-        // 从 ptrace_state.injected_signal 读取 tracer 注入的信号
         let mut ptrace_state = self.ptrace_state.lock();
         let injected_signal = ptrace_state.injected_signal;
 
-        log::debug!(
-            "[PTRACE_STOP] PID {} injected_signal={:?} (original exit_code={})",
-            self.raw_pid(),
-            injected_signal,
-            exit_code
-        );
-
         // 按照 Linux 6.6.21 的 get_signal/ptrace_stop 语义：
-        // 1. 如果注入的信号是 INVALID，返回 0，表示没有注入信号
-        // 2. get_signal 会检查该信号，如果是 0，会丢弃原始信号并继续执行
-        //    如果是非 0 信号，会处理该信号
+        // 如果注入的信号是 INVALID，返回 0，表示没有注入信号
         let result = if injected_signal == Signal::INVALID {
-            log::debug!(
-                "[PTRACE_STOP] PID {} no injected signal, continuing execution",
-                self.raw_pid()
-            );
-            // 返回 0 表示没有注入信号，get_signal 会继续处理
             0
         } else {
-            log::debug!(
-                "[PTRACE_STOP] PID {} returning injected signal {:?}",
-                self.raw_pid(),
-                injected_signal
-            );
-            // 清除注入的信号，因为已经被处理了
             ptrace_state.injected_signal = Signal::INVALID;
             injected_signal as usize
         };
@@ -573,18 +423,31 @@ impl ProcessControlBlock {
     }
 
     fn notify_tracer(&self, tracer: &Arc<ProcessControlBlock>, why: ChldCode) {
-        log::debug!(
-            "[NOTIFY_TRACER] Notifying tracer={} about tracee={}, why={:?}",
-            tracer.raw_pid(),
-            self.raw_pid(),
-            why
-        );
         let status = match why {
             ChldCode::Stopped => self.exit_code().unwrap_or(0) as i32 & 0x7f,
             ChldCode::Trapped => self.exit_code().unwrap_or(0) as i32 & 0x7f,
             _ => Signal::SIGCONT as i32,
         };
-        let mut info = SigInfo::new(
+
+        // 按照 Linux 6.6.21 语义：
+        // 对于 ptrace_stop，构建的 SigInfo 应该是 SIGTRAP 类型
+        // 使用 TRAP_BRKPT (1) 作为默认 trapno，表示 ptrace 触发的停止
+        let _sigtrap_info = SigFaultInfo {
+            addr: 0,
+            trapno: TrapCode::TrapBrkpt as i32,
+        };
+
+        // 构造 SIGTRAP siginfo 供调试器通过 PTRACE_GETSIGINFO 读取
+        let _info = SigInfo::new(
+            Signal::SIGTRAP,
+            TrapCode::TrapBrkpt as i32,
+            SigCode::SigFault(_sigtrap_info),
+            SigType::SigFault(_sigtrap_info),
+        );
+
+        // 发送 SIGCHLD 通知父进程（tracer）
+        // 这与 tracee 内部的 SIGTRAP siginfo 是分离的
+        let mut chld_info = SigInfo::new(
             Signal::SIGCHLD,
             0,
             SigCode::SigChld(why),
@@ -592,32 +455,28 @@ impl ProcessControlBlock {
                 pid: self.raw_pid(),
                 uid: self.cred().uid.data(),
                 status,
-                utime: 0, // todo: 填充时间
+                utime: 0,
                 stime: 0,
             }),
         );
+
         let should_send = {
             let tracer_sighand = tracer.sighand();
             let sa = tracer_sighand.handler(Signal::SIGCHLD);
             if let Some(sa) = sa {
                 !sa.action().is_ignore() && !sa.flags().contains(SigFlags::SA_NOCLDSTOP)
             } else {
-                // 当 sa 为 None 时，使用默认行为忽略
                 false
             }
         };
         if should_send {
-            Signal::SIGCHLD.send_signal_info_to_pcb(
-                Some(&mut info),
+            let _ = Signal::SIGCHLD.send_signal_info_to_pcb(
+                Some(&mut chld_info),
                 Arc::clone(tracer),
                 PidType::TGID,
             );
         }
-        // 按照 Linux 6.6.21 的 do_notify_parent_cldstop 语义：
-        // __wake_up_parent 唤醒的是 parent 的 wait_chldexit 队列
-        // 而不是 child 的队列
-        // 这样 do_wait 中的 wait_event_interruptible 才能被唤醒
-        log::debug!("[NOTIFY_TRACER] Waking up tracer's wait_queue");
+        // 唤醒 tracer 的 wait_queue
         tracer
             .wait_queue
             .wakeup(Some(ProcessState::TracedStopped(status as usize)));
@@ -642,49 +501,13 @@ impl ProcessControlBlock {
     }
 
     pub fn ptrace_link(&self, tracer: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        log::debug!(
-            "[PTRACE_LINK] Linking tracer={} to tracee={}",
-            tracer.raw_pid(),
-            self.raw_pid()
-        );
-
         if !tracer.has_permission_to_trace(self) {
-            log::debug!(
-                "[PTRACE_LINK] Permission denied: tracer={} cannot trace tracee={}",
-                tracer.raw_pid(),
-                self.raw_pid()
-            );
             return Err(SystemError::EPERM);
         }
 
-        log::debug!("[PTRACE_LINK] Setting tracer for tracee={}", self.raw_pid());
-        // 将子进程添加到父进程的跟踪列表
-        // let mut ptrace_list = tracer.ptraced_list.write();
-        // let child_pid = self.raw_pid();
-        // if ptrace_list.iter().any(|&pid| pid == child_pid) {
-        //     return Err(SystemError::EALREADY);
-        // }
-        // ptrace_list.push(child_pid);
         self.set_tracer(tracer.raw_pid())?;
-
-        log::debug!(
-            "[PTRACE_LINK] Reparenting tracee={} to tracer={}",
-            self.raw_pid(),
-            tracer.raw_pid()
-        );
         self.set_parent(tracer)?;
-
-        log::debug!(
-            "[PTRACE_LINK] Updating credentials for tracee={}",
-            self.raw_pid()
-        );
         *self.cred.lock() = tracer.cred().clone();
-
-        log::debug!(
-            "[PTRACE_LINK] Link completed: tracer={} -> tracee={}",
-            tracer.raw_pid(),
-            self.raw_pid()
-        );
 
         Ok(())
     }
@@ -754,62 +577,21 @@ impl ProcessControlBlock {
 
     /// 处理PTRACE_ATTACH请求
     pub fn attach(&self, tracer: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
-        log::debug!(
-            "[PTRACE_ATTACH] Starting attach: tracer={}, target={}",
-            tracer.raw_pid(),
-            self.raw_pid()
-        );
-
-        // 验证权限（简化版）
-        // 按照 Linux 6.6.21 的 ptrace_attach 语义：
-        // 1. 不能 attach 自己
-        // 2. 不能 attach 同一个线程组的其他线程
-        let is_same_process = tracer.raw_pid() == self.raw_pid();
+        // 验证权限
+        let _is_same_process = tracer.raw_pid() == self.raw_pid();
         let is_same_thread_group = tracer.raw_tgid() == self.raw_tgid();
-
-        log::debug!(
-            "[PTRACE_ATTACH] Permission check: tracer_pid={}, tracer_tgid={}, target_pid={}, target_tgid={}, same_process={}, same_thread_group={}",
-            tracer.raw_pid(),
-            tracer.raw_tgid(),
-            self.raw_pid(),
-            self.raw_tgid(),
-            is_same_process,
-            is_same_thread_group
-        );
 
         if !tracer.has_permission_to_trace(self)
             || self.flags().contains(ProcessFlags::KTHREAD)
             || is_same_thread_group
         {
-            log::debug!(
-                "[PTRACE_ATTACH] Permission check failed for target={}",
-                self.raw_pid()
-            );
             return Err(SystemError::EPERM);
         }
 
-        log::debug!(
-            "[PTRACE_ATTACH] Setting PTRACED flag for target={}",
-            self.raw_pid()
-        );
         self.flags().insert(ProcessFlags::PTRACED);
-
-        log::debug!(
-            "[PTRACE_ATTACH] Calling ptrace_link: tracer={}, target={}",
-            tracer.raw_pid(),
-            self.raw_pid()
-        );
         self.ptrace_link(tracer)?;
 
-        // 注意：不要修改 exit_signal！
-        // exit_signal 是用来表示进程退出时发送给父进程的信号（通常是 SIGCHLD）
-        // ptrace 注入的信号应该存储在 ptrace_state.injected_signal 中
-
         let sig = Signal::SIGSTOP;
-        log::debug!(
-            "[PTRACE_ATTACH] Sending SIGSTOP to target={}",
-            self.raw_pid()
-        );
         let mut info = SigInfo::new(
             sig,
             0,
@@ -821,71 +603,69 @@ impl ProcessControlBlock {
             self.self_ref.upgrade().unwrap(),
             PidType::PID,
         ) {
-            log::debug!(
-                "[PTRACE_ATTACH] Failed to send SIGSTOP to target={}, error={:?}",
-                self.raw_pid(),
-                e
-            );
             // 回滚ptrace设置
             self.flags().remove(ProcessFlags::PTRACED);
-            let _ = self.ptrace_unlink()?;
+            self.ptrace_unlink()?;
             return Err(e);
         }
 
-        // 按照 Linux 6.6.21 的 ptrace_attach 语义：
-        // 发送 SIGSTOP 信号后，不需要手动 kick tracee
-        // tracee 会在下一次返回用户态时自动调用 do_signal 处理
-        // 然后调用 ptrace_stop 并进入 TracedStopped 状态
-        //
-        // 关键：不要调用 kick()！如果调用 kick()，会导致 tracee 被 wake up
-        // 然后 tracee 调用 schedule() 后可能立即被调度，无法正确进入 TracedStopped 状态
-        log::debug!(
-            "[PTRACE_ATTACH] Sent SIGSTOP to target={}, waiting for it to process signal",
-            self.raw_pid()
-        );
-
         // 等待 tracee 进入 TracedStopped 状态
-        // 按照 Linux 6.6.21 语义：notify_tracer 调用 __wake_up_parent 唤醒 tracer 的 wait_queue
-        // 所以这里应该等待在 tracer 的 wait_queue 上，而不是 tracee 的 wait_queue
         let tracee_ref = self.self_ref.upgrade().unwrap();
         let tracer_clone = tracer.clone();
-        log::debug!(
-            "[PTRACE_ATTACH] Tracer {} entering wait_event_interruptible for tracee {}",
-            tracer.raw_pid(),
-            tracee_ref.raw_pid()
-        );
         let _wait_result = tracer_clone.wait_queue.wait_event_interruptible(
             || {
                 let state = tracee_ref.sched_info().inner_lock_read_irqsave().state();
-                let is_stopped = matches!(state, ProcessState::TracedStopped(_));
-                log::debug!(
-                    "[PTRACE_ATTACH] Wait check: tracee {} state={:?}, is_stopped={}",
-                    tracee_ref.raw_pid(),
-                    state,
-                    is_stopped
-                );
-                is_stopped
+                matches!(state, ProcessState::TracedStopped(_))
             },
             None::<fn()>,
-        );
-
-        log::debug!(
-            "[PTRACE_ATTACH] Attach completed: tracer={}, target={}",
-            tracer.raw_pid(),
-            self.raw_pid()
         );
 
         Ok(0)
     }
 
+    /// 处理PTRACE_SEIZE请求
+    ///
+    /// 按照 Linux 6.6.21 的实现：
+    /// - PTRACE_SEIZE 是 PTRACE_ATTACH 的现代替代品
+    /// - 不会发送 SIGSTOP 给 tracee
+    /// - 设置 PT_SEIZED 标志，影响后续行为（如 Legacy Exec SIGTRAP）
+    /// - 如果指定了 PTRACE_O_TRACEEXEC 等选项，这些选项会生效
+    pub fn seize(
+        &self,
+        tracer: &Arc<ProcessControlBlock>,
+        options: PtraceOptions,
+    ) -> Result<isize, SystemError> {
+        // 验证权限
+        let _is_same_process = tracer.raw_pid() == self.raw_pid();
+        let is_same_thread_group = tracer.raw_tgid() == self.raw_tgid();
+
+        if !tracer.has_permission_to_trace(self)
+            || self.flags().contains(ProcessFlags::KTHREAD)
+            || is_same_thread_group
+        {
+            return Err(SystemError::EPERM);
+        }
+
+        // 设置 PTRACED 标志
+        self.flags().insert(ProcessFlags::PTRACED);
+
+        // 设置 PT_SEIZED 标志，表示使用现代 API 附加
+        self.flags().insert(ProcessFlags::PT_SEIZED);
+
+        // 建立 ptrace 关系
+        self.ptrace_link(tracer)?;
+
+        // 设置 ptrace 选项
+        let mut ptrace_state = self.ptrace_state.lock();
+        ptrace_state.options = options;
+        drop(ptrace_state);
+
+        // PTRACE_SEIZE 不发送 SIGSTOP，直接返回
+        Ok(0)
+    }
+
     /// 处理PTRACE_DETACH请求
     pub fn detach(&self, signal: Option<Signal>) -> Result<isize, SystemError> {
-        log::debug!(
-            "[PTRACE_DETACH] Detaching from PID {}, signal={:?}",
-            self.raw_pid(),
-            signal
-        );
-
         // 验证调用者是跟踪器
         let current_pcb = ProcessManager::current_pcb();
         if !self.is_traced_by(&current_pcb) {
@@ -893,63 +673,54 @@ impl ProcessControlBlock {
         }
 
         // 按照 Linux 6.6.21 的 ptrace_detach 实现：
-        // 1. 将 data 参数存储到 ptrace_state.injected_signal
-        // 2. 调用 __ptrace_detach (ptrace_unlink)
-        // 3. 恢复进程执行（使用与 ptrace_resume 相同的唤醒逻辑）
-        //
-        // 关键：data 参数会被传递给 ptrace_stop，作为恢复后要处理的信号
-        // 如果 data 是 0，表示不发送任何信号，继续执行
-        let data_signal = signal.unwrap_or(Signal::SIGCONT);
+        // 1. 先解除 ptrace 关系，这样后续的信号不会被 ptrace 拦截
+        self.ptrace_unlink()?;
 
-        // 将注入的信号存储到 ptrace_state.injected_signal
-        // 而不是 exit_signal！exit_signal 是用来表示进程退出时发送给父进程的信号
+        // 2. 如果指定了信号，发送该信号到 tracee
+        // 此时 tracee 已不再被 ptrace，信号会正常入队并被处理
+        let data_signal = signal.unwrap_or(Signal::SIGCONT);
+        if let Some(sig) = signal {
+            // 将信号入队到 tracee 的 pending 队列
+            let mut info = SigInfo::new(
+                sig,
+                0,
+                SigCode::Origin(OriginCode::User),
+                SigType::Kill {
+                    pid: current_pcb.raw_pid(),
+                    uid: current_pcb.cred().uid.data() as u32,
+                },
+            );
+            // 发送信号（此时已经 ptrace_unlink，所以信号会正常处理）
+            let _ = sig.send_signal_info_to_pcb(
+                Some(&mut info),
+                self.self_ref.upgrade().unwrap(),
+                crate::process::pid::PidType::PID,
+            );
+        }
+
+        // 3. 同时将信号存储到 ptrace_state.injected_signal
+        // 这样如果 tracee 正在 ptrace_stop 中，它也能获取到这个信号
         let mut ptrace_state = self.ptrace_state.lock();
         ptrace_state.injected_signal = data_signal;
         drop(ptrace_state);
 
-        log::debug!(
-            "[PTRACE_DETACH] Set ptrace_state.injected_signal={:?} for PID {}",
-            data_signal,
-            self.raw_pid()
-        );
-
-        // 解除跟踪关系
-        // ptrace_unlink 会自动恢复父进程为 real_parent
-        // 并清除 ProcessFlags::PTRACED 和 TRACE_SYSCALL
-        self.ptrace_unlink()?;
-
-        // 按照 Linux 6.6.21 的 ptrace_detach 实现：
-        // 使用与 ptrace_resume/wakeup_stop 相同的唤醒逻辑
-        // Linux: child->jobctl &= ~JOBCTL_TRACED; wake_up_state(child, __TASK_TRACED);
-        //
-        // 关键：需要手动将 TracedStopped 状态改为 Runnable 并加入运行队列
-        // signal_wake_up 不会唤醒 TracedStopped 状态的任务（它只唤醒 Blocked 状态）
+        // 4. 恢复进程执行
         let mut sched_info = self.sched_info.inner_lock_write_irqsave();
 
-        // 检查当前状态
         match sched_info.state() {
             ProcessState::TracedStopped(_) | ProcessState::Stopped(_) => {
                 // 将状态设置为 Runnable，让进程可以被调度
                 sched_info.set_state(ProcessState::Runnable);
                 sched_info.set_wakeup();
-                log::debug!(
-                    "[PTRACE_DETACH] Set PID {} to Runnable and wakeup",
-                    self.raw_pid()
-                );
             }
             _ => {
                 // 进程可能已经由于其他原因被唤醒，仍然需要确保 sleep 标志被清除
                 sched_info.set_wakeup();
-                log::debug!(
-                    "[PTRACE_DETACH] PID {} already runnable, just wakeup",
-                    self.raw_pid()
-                );
             }
         }
         drop(sched_info);
 
-        // 按照 wakeup_stop 的模式，使用 activate_task + check_preempt_currnet
-        // 确保 on_rq 被正确设置为 Queued
+        // 加入调度队列
         let rq = crate::sched::cpu_rq(
             self.sched_info()
                 .on_cpu()
@@ -967,12 +738,6 @@ impl ProcessControlBlock {
 
         rq.check_preempt_currnet(&strong_ref, WakeupFlags::empty());
 
-        log::debug!(
-            "[PTRACE_DETACH] Detached from PID {}, injected {:?}, activated and preempt-checked",
-            self.raw_pid(),
-            data_signal
-        );
-
         Ok(0)
     }
 
@@ -987,63 +752,36 @@ impl ProcessControlBlock {
             PtraceRequest::PtraceSyscall => self.flags().insert(ProcessFlags::TRACE_SYSCALL),
             PtraceRequest::PtraceSinglestep => {
                 self.flags().insert(ProcessFlags::TRACE_SINGLESTEP);
-                kprobe::setup_single_step(frame, frame.rip as usize); // 架构相关的操作，设置 TF 标志
+                kprobe::setup_single_step(frame, frame.rip as usize); // 设置 TF 标志
             }
             _ => {} // PTRACE_CONT 不需要特殊标志
         }
 
-        // 按照 Linux 6.6.21 的 ptrace_resume 语义：
-        // data 参数应该存储到 ptrace_state.injected_signal
-        // 如果 data=0（signal 为 None），表示不注入任何信号，tracee 继续执行
-        // 如果 data != 0，表示注入指定的信号
         let resume_signal = signal.unwrap_or(Signal::INVALID);
-        log::info!("signal: {:?} to process {}", resume_signal, self.raw_pid());
 
         // 清除停止/阻塞标志
         self.flags().remove(ProcessFlags::STOPPED);
 
         // 将注入的信号存储到 ptrace_state.injected_signal
-        // 而不是 exit_signal！exit_signal 是用来表示进程退出时发送给父进程的信号
         let mut ptrace_state = self.ptrace_state.lock();
         ptrace_state.injected_signal = resume_signal;
         drop(ptrace_state);
 
-        log::debug!(
-            "[PTRACE_RESUME] Set ptrace_state.injected_signal={:?} for PID {}",
-            resume_signal,
-            self.raw_pid()
-        );
-
-        // 按照 Linux 6.6.21 的 ptrace_resume 语义：
-        // 需要将 TracedStopped 状态的进程设置为 Runnable 并加入运行队列
-        //
-        // 注意：必须在唤醒之前设置状态，否则 tracee 可能继续睡眠
+        // 将 TracedStopped 状态的进程设置为 Runnable 并加入运行队列
         let mut sched_info = self.sched_info.inner_lock_write_irqsave();
 
-        // 检查当前状态
         match sched_info.state() {
             ProcessState::TracedStopped(_) | ProcessState::Stopped(_) => {
-                // 将状态设置为 Runnable，让进程可以被调度
                 sched_info.set_state(ProcessState::Runnable);
                 sched_info.set_wakeup();
-                log::debug!(
-                    "[PTRACE_RESUME] Set PID {} to Runnable and wakeup",
-                    self.raw_pid()
-                );
             }
             _ => {
-                // 进程可能已经由于其他原因被唤醒，仍然需要确保 sleep 标志被清除
                 sched_info.set_wakeup();
-                log::debug!(
-                    "[PTRACE_RESUME] PID {} already runnable, just wakeup",
-                    self.raw_pid()
-                );
             }
         }
         drop(sched_info);
 
         // 加入调度队列（如果不在队列中的话）
-        // enqueue_task 会检查是否已在队列中，避免重复加入
         if let Some(strong_ref) = self.self_ref.upgrade() {
             let rq = self.sched_info.sched_entity().cfs_rq().rq();
             let (rq, _guard) = rq.self_lock();
@@ -1051,8 +789,6 @@ impl ProcessControlBlock {
                 strong_ref.clone(),
                 EnqueueFlag::ENQUEUE_RESTORE | EnqueueFlag::ENQUEUE_WAKEUP,
             );
-        } else {
-            log::warn!("ptrace_resume: pid={} self_ref is dead", self.raw_pid());
         }
 
         Ok(0)
@@ -1063,6 +799,10 @@ impl ProcessControlBlock {
         // 设置系统调用跟踪标志
         self.flags().insert(ProcessFlags::TRACE_SYSCALL);
         self.flags().remove(ProcessFlags::TRACE_SINGLESTEP);
+
+        // 重置入口停止标志，确保下一个系统调用会在入口停止
+        self.set_needs_syscall_entry_stop(true);
+
         // 恢复进程运行
         let mut sched_info = self.sched_info.inner_lock_write_irqsave();
         match sched_info.state() {

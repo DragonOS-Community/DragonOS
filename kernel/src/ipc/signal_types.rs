@@ -23,6 +23,10 @@ pub enum SigCode {
     Origin(OriginCode),
     /// 描述 SIGCHLD 的具体原因
     SigChld(ChldCode),
+    /// 描述 SIGTRAP 的具体原因 (TRAP_*)
+    SigFault(SigFaultInfo),
+    /// 描述 SIGILL/SIGFPE/SIGSEGV/SIGBUS 的原因
+    Ill(IllCode),
 }
 
 impl From<SigCode> for i32 {
@@ -30,6 +34,8 @@ impl From<SigCode> for i32 {
         match code {
             SigCode::Origin(origin) => origin as i32,
             SigCode::SigChld(chld) => chld as i32,
+            SigCode::SigFault(fault) => fault.trapno,
+            SigCode::Ill(ill) => ill as i32,
         }
     }
 }
@@ -66,6 +72,52 @@ pub enum ChldCode {
     Trapped = 4,
     Stopped = 5,
     Continued = 6,
+}
+
+/// SIGTRAP si_codes (TRAP_*)
+/// 用于区分不同类型的陷阱/断点
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+#[allow(dead_code)]
+pub enum TrapCode {
+    /// process breakpoint - 断点触发
+    TrapBrkpt = 1,
+    /// process trace trap - ptrace 单步执行
+    TrapTrace = 2,
+    /// process taken branch trap - 分支跟踪
+    TrapBranch = 3,
+    /// hardware breakpoint/watchpoint - 硬件断点
+    TrapHwbkpt = 4,
+    /// undiagnosed trap - 未诊断的陷阱
+    TrapUnk = 5,
+    /// perf event with sigtrap=1 - 性能事件
+    TrapPerf = 6,
+}
+
+/// SIGILL/SIGFPE/SIGSEGV/SIGBUS 的原因码 (ILL_*, FPE_*, SEGV_*, BUS_*)
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum IllCode {
+    /// 求编代码错误
+    IllIll = 1,
+    /// 汇编指令的 operand 不存在
+    IllIlladr = 2,
+}
+
+/// SIGFPE si_codes
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+#[allow(dead_code)]
+pub enum FpeCode {
+    IntDiv = 1,  /* integer divide by zero */
+    IntoOvf = 2, /* integer overflow */
+    FltDiv = 3,  /* floating point divide by zero */
+    FltOvf = 4,  /* floating point overflow */
+    FltUnd = 5,  /* floating point underflow */
+    FltInv = 6,  /* floating point invalid operation */
+    FltSub = 7,  /* subscript out of range */
+    FltDive = 8, /* floating point division by zero */
+    Isock = 9,   /* Invalid socket operation */
 }
 
 impl SigCode {
@@ -638,7 +690,7 @@ pub enum SigType {
     // SigSys,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SigFaultInfo {
     pub addr: usize,
     pub trapno: i32,

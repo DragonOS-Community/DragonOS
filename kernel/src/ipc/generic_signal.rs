@@ -137,13 +137,6 @@ impl GenericSignal {
 
     /// 调用信号的默认处理函数
     pub fn handle_default(&self) {
-        let current_pcb = ProcessManager::current_pcb();
-        log::debug!(
-            "[HANDLE_DEFAULT] PID {} handling signal {:?} with default action",
-            current_pcb.raw_pid(),
-            self
-        );
-
         match self {
             Self::INVALID => {
                 log::error!("attempting to handler an Invalid");
@@ -431,37 +424,29 @@ fn sig_terminate_dump(sig: Signal) {
 }
 
 /// 信号默认处理函数——暂停进程
+///
+/// 按照 Linux 6.6.21 kernel/signal.c::get_signal -> do_signal_stop 的语义：
+/// - 对于 ptrace 进程：ptrace 拦截发生在 signal 分发之前（ptrace_signal）
+/// - 如果执行到这里，说明 tracer 已经允许信号传递给 tracee
+/// - 但对于 ptrace 进程，"停止"不进入 TASK_STOPPED，而是由 tracer 控制状态
+/// - 因此这里绝不能再调用 ptrace_stop，否则会造成无限循环
 fn sig_stop(sig: Signal) {
-    // 在接收者上下文设置停止标志，并让当前任务进入 Stopped
     let pcb = ProcessManager::current_pcb();
 
+    // ===== Ptrace 进程的特殊处理 =====
+    // 按照 Linux 6.6.21：被 ptrace 的进程不会进入标准的 TASK_STOPPED 状态
+    // 如果执行到这里，说明 ptrace_signal 已经在 do_signal 中处理过该信号
+    // tracer 决定将信号注入给 tracee，但这不意味着 tracee 要再次停止
+    // 直接返回，不做任何操作
+    if pcb.flags().contains(ProcessFlags::PTRACED) {
+        return;
+    }
+
+    // ===== 非 ptrace 进程的 Group Stop 逻辑 =====
     // 标记停止事件，供 waitid(WSTOPPED) 可见
     pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
     pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
 
-    // 按照 Linux 6.6.21 的实现：
-    // 如果进程被 ptrace，需要调用 ptrace_stop 来停止进程并通知 tracer
-    // ptrace_stop 会让进程进入停止状态并等待 tracer 的恢复
-    if pcb.flags().contains(ProcessFlags::PTRACED) {
-        log::debug!("sig_stop: process is ptraced, calling ptrace_stop");
-        // 对于 ptrace 进程，SIGSTOP 的默认处理需要真正停止进程
-        // 调用 ptrace_stop 使进程停止并等待 tracer
-        use crate::ipc::signal_types::ChldCode;
-        let mut info = crate::ipc::signal_types::SigInfo::new(
-            sig,
-            0,
-            crate::ipc::signal_types::SigCode::Origin(crate::ipc::signal_types::OriginCode::User),
-            crate::ipc::signal_types::SigType::SigFault(crate::ipc::signal_types::SigFaultInfo {
-                addr: 0,
-                trapno: 0,
-            }),
-        );
-        pcb.ptrace_stop(sig as usize, ChldCode::Stopped, Some(&mut info));
-        log::debug!("sig_stop: ptrace_stop returned, process resumed");
-        return;
-    }
-
-    // 非 ptrace 进程的停止逻辑
     let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     ProcessManager::mark_stop(sig).unwrap_or_else(|e| {
         log::error!(
@@ -472,10 +457,7 @@ fn sig_stop(sig: Signal) {
         );
     });
     drop(guard);
-    log::debug!(
-        "sig_stop: pid={:?} entered Stopped; notifying parent and scheduler",
-        ProcessManager::current_pcb().raw_pid()
-    );
+
     // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
     let pcb = ProcessManager::current_pcb();
     if let Some(parent) = pcb.parent_pcb() {

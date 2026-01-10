@@ -207,13 +207,6 @@ impl Syscall for SysKillHandle {
 
         let current_pcb = ProcessManager::current_pcb();
 
-        log::debug!(
-            "[SYS_KILL] PID {} sending signal {} to PID {}",
-            current_pcb.raw_pid(),
-            sig_c_int,
-            id
-        );
-
         let converter = PidConverter::from_id(id).ok_or(SystemError::ESRCH)?;
 
         // Handle null signal (signal 0) - used for existence and permission checks
@@ -229,13 +222,6 @@ impl Syscall for SysKillHandle {
             );
             return Err(SystemError::EINVAL);
         }
-
-        log::debug!(
-            "[SYS_KILL] Signal {:?} to PID {}, converter={:?}",
-            sig,
-            id,
-            converter
-        );
 
         match converter {
             PidConverter::Pid(pid) => send_signal_to_pid(pid.pid_vnr(), sig),

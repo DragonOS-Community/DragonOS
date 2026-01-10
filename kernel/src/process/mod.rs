@@ -430,13 +430,6 @@ impl ProcessManager {
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
 
-        log::debug!(
-            "[EXIT_NOTIFY] PID {} exiting, parent_pcb={:?}, real_parent_pcb={:?}",
-            current.raw_pid(),
-            current.parent_pcb().map(|p| p.raw_pid()),
-            current.real_parent_pcb().map(|p| p.raw_pid())
-        );
-
         // 让INIT进程收养所有子进程
         if current.raw_pid() != RawPid(1) {
             unsafe {
@@ -445,43 +438,16 @@ impl ProcessManager {
                     .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
             };
 
-            // 重新读取parent_pcb，因为adopt_children可能修改了它
-            log::debug!(
-                "[EXIT_NOTIFY] After adopt_children, PID {} parent_pcb={:?}",
-                current.raw_pid(),
-                current.parent_pcb().map(|p| p.raw_pid())
-            );
-
             let r = current.parent_pcb.read_irqsave().upgrade();
             if r.is_none() {
-                log::debug!(
-                    "[EXIT_NOTIFY] PID {} parent_pcb is None, cannot send SIGCHLD",
-                    current.raw_pid()
-                );
                 return;
             }
             let parent_pcb = r.unwrap();
 
-            log::debug!(
-                "[EXIT_NOTIFY] PID {} sending exit_signal={:?} to parent={}",
-                current.raw_pid(),
-                current.exit_signal.load(Ordering::SeqCst),
-                parent_pcb.raw_pid()
-            );
-
             // 按照 Linux 6.6.21 的语义：
-            // 1. 对于被 ptrace 的进程，应该发送 SIGCHLD 给父进程（tracer）
-            //    即使 exit_signal 被 ptrace 注入覆盖了
-            // 2. 对于普通进程，使用 exit_signal 字段决定发送什么信号
-            //
-            // 参考 Linux kernel/exit.c:do_notify_parent()
             // 如果进程被 ptrace，忽略 exit_signal，总是发送 SIGCHLD
             let is_ptraced = current.flags().contains(ProcessFlags::PTRACED);
             let signal_to_send = if is_ptraced {
-                log::debug!(
-                    "[EXIT_NOTIFY] PID {} is ptraced, sending SIGCHLD regardless of exit_signal",
-                    current.raw_pid()
-                );
                 Signal::SIGCHLD
             } else {
                 let exit_signal = current.exit_signal.load(Ordering::SeqCst);
@@ -503,19 +469,15 @@ impl ProcessManager {
                 );
             }
 
-            // 无论exit_signal是什么值，都要唤醒父进程的wait_queue
-            // 因为父进程可能使用__WALL选项等待任何类型的子进程（包括exit_signal=0的clone子进程）
-            // 根据Linux语义，exit_signal只决定发送什么信号，不决定是否唤醒父进程
+            // 要唤醒父进程的wait_queue，因为父进程可能使用__WALL选项等待任何类型的子进程
             parent_pcb
                 .wait_queue
                 .wakeup_all(Some(ProcessState::Blocked(true)));
 
-            // 当子进程退出时，需要唤醒父进程，即使父进程不在 wait() 中睡眠
+            // 唤醒父进程
             parent_pcb.wake_up_process();
 
-            // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
-            // 由于子进程被添加到线程组 leader 的 children 列表中，
-            // 因此还需要唤醒线程组 leader 的 wait_queue（如果 leader 不是 parent_pcb 本身）。
+            // 唤醒线程组 leader 的 wait_queue
             let parent_group_leader = {
                 let ti = parent_pcb.thread.read_irqsave();
                 ti.group_leader()
@@ -736,32 +698,15 @@ impl ProcessManager {
     ///
     /// 调用此函数前，调用者**不能持有**父进程的 children 锁，否则会死锁。
     pub(super) unsafe fn release(pid: RawPid) {
-        log::debug!("[RELEASE] Releasing PID {}", pid);
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
-                log::debug!(
-                    "[RELEASE] Removing PID {} from parent {}'s children list",
-                    pid,
-                    parent.raw_pid()
-                );
                 let mut children = parent.children.write();
-                let before_count = children.len();
                 children.retain(|&p| p != pid);
-                let after_count = children.len();
-                log::debug!(
-                    "[RELEASE] Parent {} children count: {} -> {}",
-                    parent.raw_pid(),
-                    before_count,
-                    after_count
-                );
             }
 
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
-            log::debug!("[RELEASE] PID {} removed from ALL_PROCESS", pid);
-        } else {
-            log::warn!("[RELEASE] PID {} not found in ALL_PROCESS", pid);
         }
     }
 
@@ -926,18 +871,19 @@ impl ProcessState {
 #[repr(i32)]
 pub enum PtraceRequest {
     PtraceTraceme = 0,
+    PtracePeekdata = 2,
+    PtracePeekuser = 3,
+    PtracePokedata = 5,
+    PtraceCont = 7,
+    PtraceSinglestep = 9,
+    PtraceGetregs = 12,
+    PtraceSetregs = 13,
     PtraceAttach = 16,
     PtraceDetach = 17,
     PtraceSyscall = 24,
-    PtraceSinglestep = 9,
-    PtraceCont = 7,
-    PtraceGetregs = 12,
-    PtraceSetregs = 13,
-    PtracePeekuser = 3,
-    PtracePeekdata = 2,
-    PtracePokedata = 5,
-    PtraceGetsiginfo = 0x4202,
     PtraceSetoptions = 0x4200,
+    PtraceGetsiginfo = 0x4202,
+    PtraceSeize = 0x4206, // 现代 API，不发送 SIGSTOP
 }
 
 bitflags! {
@@ -990,6 +936,9 @@ bitflags! {
         const TRACE_EXEC = 1 << 21;
         /// 系统调用正在中断点（入口或出口）
         const SYSCALL_INTERRUPT = 1 << 22;
+        /// 进程通过 PTRACE_SEIZE 被附加（而非 PTRACE_ATTACH）
+        /// 按照 Linux 6.6.21 语义：SEIZED 进程不会收到 Legacy SIGTRAP
+        const PT_SEIZED = 1 << 23;
     }
 }
 
@@ -1113,8 +1062,6 @@ struct PtraceState {
     tracer: Option<RawPid>,
     /// 挂起的信号（等待调试器处理）
     pending_signals: Vec<Signal>,
-    /// 系统调用信息 (用于 PTRACE_SYSCALL)
-    syscall_info: Option<SyscallInfo>,
     stop_reason: PtraceStopReason,
     /// ptrace选项位
     options: PtraceOptions,
@@ -1135,7 +1082,6 @@ impl Default for PtraceState {
         Self {
             tracer: None,
             pending_signals: Vec::new(),
-            syscall_info: None,
             stop_reason: PtraceStopReason::None,
             options: PtraceOptions::empty(),
             exit_code: 0,
@@ -1150,7 +1096,6 @@ impl PtraceState {
         Self {
             tracer: None,
             pending_signals: Vec::new(),
-            syscall_info: None,
             stop_reason: PtraceStopReason::None,
             options: PtraceOptions::empty(),
             exit_code: 0,
@@ -1878,16 +1823,10 @@ impl ProcessControlBlock {
         for pid in all_child_pids.iter().copied() {
             if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
                 // 检查子进程是否被当前进程 ptrace
-                // 通过检查子进程的 parent_pcb 是否指向当前进程
                 if let Some(child_parent) = child.parent_pcb() {
                     if Arc::ptr_eq(&child_parent, &self.self_ref.upgrade().unwrap()) {
                         // 子进程的 parent_pcb 指向当前进程，说明是被 ptrace 的
                         // 不转移这个子进程
-                        log::debug!(
-                            "[ADOPT_CHILDREN] PID {} is being traced by current process {}, keeping in children list",
-                            child.raw_pid(),
-                            self.raw_pid()
-                        );
                         ptraced_children.push(pid);
                         continue;
                     }
@@ -1898,15 +1837,9 @@ impl ProcessControlBlock {
 
         // 只清空并转移非 ptraced 的子进程
         if !children_to_adopt.is_empty() {
-            // 从当前进程的 children 列表中移除被收养的子进程
-            // 保留 ptraced children（不在 children_to_adopt 中）
             let mut children_guard = self.children.write();
             children_guard.retain(|pid| !children_to_adopt.contains(pid));
         } else {
-            log::debug!(
-                "[ADOPT_CHILDREN] PID {} all children are ptraced, nothing to adopt",
-                self.raw_pid()
-            );
             // 所有子进程都是 ptraced 的，不需要转移任何子进程
             return Ok(());
         }

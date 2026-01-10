@@ -1,6 +1,31 @@
 //! mlock 系列系统调用的核心实现
 //!
-//! 参考 Linux 6.6.21 mm/mlock.c
+//! # 概述
+//!
+//! 本模块实现了 mlock 系列系统调用的核心功能，包括：
+//! - 单页面的锁定/解锁 (mlock_page, munlock_page)
+//! - VMA 范围内的页面遍历和锁定/解锁
+//! - 权限检查 (can_do_mlock)
+//!
+//! # Linux 参考实现
+//!
+//! 基于 Linux 6.6.21 mm/mlock.c
+//!
+//! # 关键设计
+//!
+//! ## 引用计数
+//! - 每个物理页面维护 mlock_count 引用计数
+//! - 支持多个 VMA 锁定同一页面
+//! - 计数从 0→1 时设置 PG_MLOCKED 和 PG_UNEVICTABLE 标志
+//! - 计数从 1→0 时清除 PG_MLOCKED 标志
+//!
+//! ## 页面标志
+//! - PG_MLOCKED: 页面已被锁定
+//! - PG_UNEVICTABLE: 页面不可被换出（即使不在 LRU 中也会被检查）
+//!
+//! # TODO
+//!
+//! - LRU 链表管理：将锁定的页面移到不可换出 LRU
 
 use alloc::sync::Arc;
 use system_error::SystemError;
@@ -15,11 +40,14 @@ use crate::{
     process::{cred::CAPFlags, resource::RLimitID, ProcessManager},
 };
 
-/// 检查进程是否有权限执行 mlock
+/// 检查进程是否有权限执行 mlock 操作
 ///
-/// 根据 Linux 语义:
-/// - 如果进程有 CAP_IPC_LOCK 权限，则允许 mlock
-/// - 否则，检查 RLIMIT_MEMLOCK 限制
+/// # Linux 语义
+///
+/// - 如果进程具有 CAP_IPC_LOCK 权限，允许执行 mlock
+/// - 否则，检查 RLIMIT_MEMLOCK 是否为 0
+///   - 为 0 表示完全禁止 mlock
+///   - 非 0 表示可以在限制范围内执行 mlock
 pub fn can_do_mlock() -> bool {
     // 首先检查 CAP_IPC_LOCK 权限
     let cred = ProcessManager::current_pcb().cred();
@@ -35,14 +63,16 @@ pub fn can_do_mlock() -> bool {
     rlim != 0
 }
 
-/// 锁定单个页面
+/// 锁定单个物理页面
 ///
-/// # 参数
-/// - `page`: 要锁定的页面
+/// 对指定物理页面增加 mlock 引用计数，并在首次锁定时设置相应标志。
 ///
-/// # 返回
-/// - `Ok(())`: 成功
-/// - `Err(SystemError)`: 失败
+/// # 行为
+///
+/// - 增加 mlock_count 引用计数
+/// - 当计数从 0 → 1 时：
+///   - 设置 PG_MLOCKED 标志（标记页面已锁定）
+///   - 设置 PG_UNEVICTABLE 标志（防止页面被换出）
 pub fn mlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
     let mut page_guard = page.write_irqsave();
 
@@ -67,14 +97,16 @@ pub fn mlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
     Ok(())
 }
 
-/// 解锁单个页面
+/// 解锁单个物理页面
 ///
-/// # 参数
-/// - `page`: 要解锁的页面
+/// 对指定物理页面减少 mlock 引用计数，并在计数归零时清除相应标志。
 ///
-/// # 返回
-/// - `Ok(())`: 成功
-/// - `Err(SystemError)`: 失败
+/// # 行为
+///
+/// - 减少 mlock_count 引用计数
+/// - 当计数从 1 → 0 时：
+///   - 清除 PG_MLOCKED 标志
+///   - 如果页面未被映射（map_count == 0），清除 PG_UNEVICTABLE 标志
 pub fn munlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
     let mut page_guard = page.write_irqsave();
 
@@ -103,22 +135,21 @@ pub fn munlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
 }
 
 impl LockedVMA {
-    /// 对 VMA 范围内的页面应用锁定/解锁
+    /// 对 VMA 范围内的已映射页面应用锁定或解锁操作
+    ///
+    /// 遍历指定地址范围内的所有已映射页面，对每个页面调用相应的锁定/解锁函数。
+    /// 未映射的页面将被跳过（与 Linux 语义一致）。
     ///
     /// # 参数
+    ///
     /// - `mapper`: 页表映射器
     /// - `start_addr`: 起始虚拟地址
     /// - `end_addr`: 结束虚拟地址
-    /// - `lock`: true 表示锁定，false 表示解锁
+    /// - `lock`: true=锁定, false=解锁
     ///
     /// # 返回
-    /// - `Ok(locked_pages)`: 成功，返回已处理的页面数
-    /// - `Err(SystemError)`: 失败
     ///
-    /// # 说明
-    /// 参考 mincore.rs 的遍历逻辑，支持多级页表和大页处理。
-    /// 遍历指定地址范围内的所有已映射页面，对每个页面调用 mlock_page 或 munlock_page。
-    /// 对于未映射的页面，跳过处理（按 Linux 语义）。
+    /// 返回已处理的页面数
     pub fn mlock_vma_pages_range(
         &self,
         mapper: &PageMapper,
@@ -130,17 +161,21 @@ impl LockedVMA {
         Ok(page_count)
     }
 
-    /// 递归遍历页表，对范围内的页面应用锁定/解锁
+    /// 递归遍历页表，对范围内的页面应用锁定/解锁操作
+    ///
+    /// 支持多级页表和大页处理。对于大页（huge page），会遍历其中的每个 4K 子页。
     ///
     /// # 参数
+    ///
     /// - `mapper`: 页表映射器
     /// - `start_addr`: 起始虚拟地址
     /// - `end_addr`: 结束虚拟地址
-    /// - `level`: 当前页表层级
-    /// - `lock`: true 表示锁定，false 表示解锁
+    /// - `level`: 当前页表层级（0=叶子页表）
+    /// - `lock`: true=锁定, false=解锁
     ///
     /// # 返回
-    /// - 返回已处理的页面数
+    ///
+    /// 返回已处理的页面数
     fn mlock_walk_page_range(
         mapper: &PageMapper,
         start_addr: VirtAddr,
@@ -150,23 +185,27 @@ impl LockedVMA {
     ) -> Result<usize, SystemError> {
         let mut page_count = 0;
         let mut start = start_addr;
+
         while start < end_addr {
             let entry_size = MMArch::PAGE_SIZE << (level * MMArch::PAGE_ENTRY_SHIFT);
             let next = core::cmp::min(end_addr, start + entry_size);
+
             if let Some(entry) = mapper.get_entry(start, level) {
-                // 大页处理：当上层条目标记为大页时，遍历大页内的每个4K子页
+                // 大页处理：遍历大页内的每个 4K 子页
                 if level > 0 && entry.flags().has_flag(MMArch::ENTRY_FLAG_HUGE_PAGE) {
-                    // 对于大页，需要遍历其中的每个4K子页
                     let sub_page_count = (next - start) >> MMArch::PAGE_SHIFT;
-                    // 大页的物理地址是连续的，可以通过偏移计算每个子页的物理地址
+
+                    // 获取大页的基地址
                     let base_paddr = match entry.address() {
                         Ok(paddr) => paddr,
                         Err(_) => continue,
                     };
-                    // 计算 start 在当前条目内的偏移（如果 start 不在大页边界上）
+
+                    // 计算 start 在当前条目内的偏移
                     let offset_in_entry = start.data() & (entry_size - 1);
+
+                    // 遍历大页中的每个子页
                     for i in 0..sub_page_count {
-                        // 计算子页的物理地址：base_paddr + start在条目内的偏移 + 子页索引 * 页面大小
                         let sub_page_paddr = PhysAddr::new(
                             base_paddr.data() + offset_in_entry + i * MMArch::PAGE_SIZE,
                         );
@@ -180,7 +219,7 @@ impl LockedVMA {
                         Self::mlock_walk_page_range(mapper, start, next, level - 1, lock)?;
                     page_count += sub_pages;
                 } else {
-                    // 叶子节点（4K页）
+                    // 叶子节点（4K 页）
                     match entry.address() {
                         Ok(paddr) => {
                             if Self::mlock_phys_page(paddr, lock)? {
@@ -188,28 +227,29 @@ impl LockedVMA {
                             }
                         }
                         Err(_) => {
-                            // 页表项不存在，跳过
+                            // 页表项不存在，跳过（Linux 语义）
                         }
                     }
                 }
             }
-            // 如果页表项不存在，跳过（按 Linux 语义，不对未映射的页面做任何处理）
 
             start = next;
         }
         Ok(page_count)
     }
 
-    /// 对物理页面应用锁定/解锁
+    /// 对物理页面应用锁定/解锁操作
     ///
     /// # 参数
+    ///
     /// - `paddr`: 物理地址
-    /// - `lock`: true 表示锁定，false 表示解锁
+    /// - `lock`: true=锁定, false=解锁
     ///
     /// # 返回
+    ///
     /// - `Ok(true)`: 成功处理了页面
-    /// - `Ok(false)`: 页面不存在或无法处理
-    /// - `Err(SystemError)`: 失败
+    /// - `Ok(false)`: 页面不存在于页面管理器中
+    /// - `Err(SystemError)`: 操作失败
     fn mlock_phys_page(paddr: PhysAddr, lock: bool) -> Result<bool, SystemError> {
         let mut page_manager_guard = page_manager_lock_irqsave();
         if let Some(page) = page_manager_guard.get(&paddr) {

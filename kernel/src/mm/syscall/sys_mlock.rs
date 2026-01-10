@@ -1,4 +1,36 @@
 //! mlock 系统调用实现
+//!
+//! # 系统调用原型
+//!
+//! ```c
+//! int mlock(const void *addr, size_t len);
+//! ```
+//!
+//! # 功能
+//!
+//! 锁定指定地址范围的内存页，防止其被换出到交换空间。
+//! 被锁定的页面驻留在物理内存中，不会被换出。
+//!
+//! # 参数
+//!
+//! - `addr`: 起始地址（会自动向下对齐到页边界）
+//! - `len`: 长度（会自动向上对齐到页边界）
+//!
+//! # 返回值
+//!
+//! - 0: 成功
+//! - -1: 失败，设置 errno
+//!
+//! # 错误码
+//!
+//! - `ENOMEM`: 超过 RLIMIT_MEMLOCK 限制
+//! - `EPERM`: RLIMIT_MEMLOCK 为 0 且没有 CAP_IPC_LOCK 权限
+//! - `EINVAL`: 地址或长度无效
+//!
+//! # 注意
+//!
+//! - 多次锁定同一页面会增加引用计数，需要对应次数的 munlock
+//! - fork 后子进程不继承锁定的页面（locked_vm 重置为 0）
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCK, MMArch};
 use crate::mm::{
@@ -21,24 +53,23 @@ impl Syscall for SysMlockHandle {
         let addr = VirtAddr::new(args[0]);
         let len = args[1];
 
-        // 基本参数校验
+        // ========== 参数基本校验 ==========
         if len == 0 {
             return Ok(0);
         }
 
-        // 页面对齐：起始地址向下对齐，长度调整
-        // 参考 Linux mm/mlock.c: 用户传入的地址需要向下对齐到页边界
-        // 长度需要加上页内偏移后再向上对齐
+        // ========== 地址对齐 ==========
         let page_offset = addr.data() & (MMArch::PAGE_SIZE - 1);
         let aligned_addr = VirtAddr::new(addr.data() - page_offset);
         let adjusted_len = len.saturating_add(page_offset);
         let aligned_len = page_align_up(adjusted_len);
+
         if aligned_len == 0 || aligned_len < len {
             return Err(SystemError::ENOMEM);
         }
 
-        // 检查地址范围
-        let end = addr
+        // ========== 地址范围检查 ==========
+        let end = aligned_addr
             .data()
             .checked_add(aligned_len)
             .ok_or(SystemError::ENOMEM)?;
@@ -46,21 +77,18 @@ impl Syscall for SysMlockHandle {
             return Err(SystemError::ENOMEM);
         }
 
-        // 权限检查
+        // ========== 权限检查 ==========
         if !can_do_mlock() {
             return Err(SystemError::EPERM);
         }
 
-        // 获取当前地址空间
         let addr_space = AddressSpace::current()?;
 
-        // RLIMIT_MEMLOCK 检查
-        // 参考 Linux: mm/mlock.c:do_mlock()
+        // ========== RLIMIT_MEMLOCK 检查 ==========
         let lock_limit = ProcessManager::current_pcb()
             .get_rlimit(RLimitID::Memlock)
             .rlim_cur as usize;
 
-        // 将限制转换为页面数
         let lock_limit_pages = if lock_limit == usize::MAX {
             usize::MAX
         } else {
@@ -68,30 +96,22 @@ impl Syscall for SysMlockHandle {
         };
 
         let requested_pages = aligned_len >> MMArch::PAGE_SHIFT;
+        let addr_space_read = addr_space.read();
+        let current_locked = addr_space_read.locked_vm();
 
-        // 计算当前已锁定的页面数
-        let current_locked = addr_space.read().locked_vm();
-
-        // 检查是否超过限制
-        // 参考 Linux: mm/mlock.c:do_mlock()
-        // 如果没有 CAP_IPC_LOCK 权限，需要检查 RLIMIT_MEMLOCK 限制
-        // 如果可能超过限制，需要计算请求范围内已锁定的页面数，并扣除
         let mut locked = current_locked + requested_pages;
         if locked > lock_limit_pages {
-            // 参考 Linux: mm/mlock.c:count_mm_mlocked_page_nr()
-            // 计算请求范围内已锁定的页面数，从请求的页面数中扣除
-            let addr_space_read = addr_space.read();
-            let already_locked_in_range = addr_space_read.count_mm_mlocked_page_nr(aligned_addr, aligned_len);
+            let already_locked_in_range =
+                addr_space_read.count_mm_mlocked_page_nr(aligned_addr, aligned_len);
             drop(addr_space_read);
             locked = current_locked + requested_pages - already_locked_in_range;
         }
 
-        // 再次检查是否超过限制
         if locked > lock_limit_pages {
             return Err(SystemError::ENOMEM);
         }
 
-        // 执行 mlock
+        // ========== 执行锁定操作 ==========
         addr_space.write().mlock(aligned_addr, aligned_len, false)?;
 
         Ok(0)

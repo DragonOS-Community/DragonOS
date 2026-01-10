@@ -1,4 +1,27 @@
 //! munlockall 系统调用实现
+//!
+//! # 系统调用原型
+//!
+//! ```c
+//! int munlockall(void);
+//! ```
+//!
+//! # 功能
+//!
+//! 解锁进程地址空间的所有内存页，包括：
+//! - 通过 mlockall 锁定的所有页面
+//! - 通过 MCL_FUTURE 标志设置的默认锁定行为
+//!
+//! # 返回值
+//!
+//! - 0: 成功
+//! - -1: 失败，设置 errno
+//!
+//! # 注意
+//!
+//! - 执行后，def_flags 被清除，后续 mmap 不会自动锁定
+//! - 已锁定的页面会被解锁
+//! - 如果页面被多次锁定（引用计数 > 1），需要对应次数的 munlock
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MUNLOCKALL};
 use crate::mm::ucontext::AddressSpace;

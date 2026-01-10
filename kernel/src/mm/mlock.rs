@@ -93,7 +93,7 @@ pub fn munlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
 
         // 如果页面可换出，移回正常 LRU
         // 注意：需要检查页面是否真的可以换出（map_count == 0）
-        if page_guard.can_deallocate() {
+        if page_guard.map_count() == 0 {
             page_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
             // TODO: 从不可换出 LRU 移回可换出 LRU
         }

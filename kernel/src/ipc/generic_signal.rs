@@ -9,7 +9,7 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    process::{ptrace::handle_ptrace_signal_stop, ProcessFlags, ProcessManager},
+    process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
 };
 
@@ -137,6 +137,13 @@ impl GenericSignal {
 
     /// 调用信号的默认处理函数
     pub fn handle_default(&self) {
+        let current_pcb = ProcessManager::current_pcb();
+        log::debug!(
+            "[HANDLE_DEFAULT] PID {} handling signal {:?} with default action",
+            current_pcb.raw_pid(),
+            self
+        );
+
         match self {
             Self::INVALID => {
                 log::error!("attempting to handler an Invalid");
@@ -426,22 +433,41 @@ fn sig_terminate_dump(sig: Signal) {
 /// 信号默认处理函数——暂停进程
 fn sig_stop(sig: Signal) {
     // 在接收者上下文设置停止标志，并让当前任务进入 Stopped
-    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    {
-        let pcb = ProcessManager::current_pcb();
-        // 标记停止事件，供 waitid(WSTOPPED) 可见
-        pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
-        pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
-        if pcb.flags().contains(ProcessFlags::PTRACED) {
-            log::debug!("sig_stop");
-            handle_ptrace_signal_stop(&pcb, sig);
-        }
+    let pcb = ProcessManager::current_pcb();
+
+    // 标记停止事件，供 waitid(WSTOPPED) 可见
+    pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
+    pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
+
+    // 按照 Linux 6.6.21 的实现：
+    // 如果进程被 ptrace，需要调用 ptrace_stop 来停止进程并通知 tracer
+    // ptrace_stop 会让进程进入停止状态并等待 tracer 的恢复
+    if pcb.flags().contains(ProcessFlags::PTRACED) {
+        log::debug!("sig_stop: process is ptraced, calling ptrace_stop");
+        // 对于 ptrace 进程，SIGSTOP 的默认处理需要真正停止进程
+        // 调用 ptrace_stop 使进程停止并等待 tracer
+        use crate::ipc::signal_types::ChldCode;
+        let mut info = crate::ipc::signal_types::SigInfo::new(
+            sig,
+            0,
+            crate::ipc::signal_types::SigCode::Origin(crate::ipc::signal_types::OriginCode::User),
+            crate::ipc::signal_types::SigType::SigFault(crate::ipc::signal_types::SigFaultInfo {
+                addr: 0,
+                trapno: 0,
+            }),
+        );
+        pcb.ptrace_stop(sig as usize, ChldCode::Stopped, Some(&mut info));
+        log::debug!("sig_stop: ptrace_stop returned, process resumed");
+        return;
     }
+
+    // 非 ptrace 进程的停止逻辑
+    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     ProcessManager::mark_stop(sig).unwrap_or_else(|e| {
         log::error!(
             "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
             e,
-            ProcessManager::current_pcb().pid(),
+            pcb.pid(),
             sig
         );
     });

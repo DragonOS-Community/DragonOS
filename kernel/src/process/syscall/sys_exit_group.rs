@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EXIT_GROUP;
-use crate::process::ProcessManager;
+use crate::process::{ProcessFlags, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -20,6 +20,16 @@ impl Syscall for SysExitGroup {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let exit_code = Self::exit_code(args);
+        let pcb = ProcessManager::current_pcb();
+        let has_pending = pcb.flags().contains(ProcessFlags::HAS_PENDING_SIGNAL);
+        let ptraced = pcb.flags().contains(ProcessFlags::PTRACED);
+        log::debug!(
+            "[EXIT_GROUP] PID {} exiting with code {}, has_pending={}, ptraced={}",
+            pcb.raw_pid(),
+            exit_code,
+            has_pending,
+            ptraced
+        );
         // 仿照 Linux sys_exit_group：只取低 8 位并左移 8 位，形成 wstatus 编码，
         // 然后触发线程组整体退出。
         ProcessManager::group_exit((exit_code & 0xff) << 8);

@@ -1,3 +1,30 @@
+/*
+# test_ptrace.c测试在Linux下的行为
+=== Testing PTRACE_TRACEME ===
+Child ready for tracing
+Child stopped by signal 19 (Stopped (signal))
+Child exited with status 0
+=== Testing PTRACE_ATTACH/DETACH ===
+target process 100 waiting...
+Tracer attaching to target 100
+target stopped by signal 19 (Stopped (signal))
+Tracer detaching from target
+target received 18 (Continued)
+target exited with status 0
+=== Testing PTRACE_SYSCALL ===
+Child initial stop by signal 19 (Stopped (signal))
+Syscall entry detected: nr=39
+Syscall exit detected: nr=39
+Child called getpid()
+Child exited normally
+=== Testing PTRACE_PEEKDATA ===
+Child:  msg_addr=0x49b643, heap_addr=0x23339c80, heap_val=0x66ccff
+Parent: msg_addr=0x49b643, heap_addr=0x23339c80
+Read message: PTRACE_PEEKDATA_testing
+Original heap value: 0x66ccff
+Modified heap value: 0xee0000
+*/
+
 #include <stdint.h>
 #include <errno.h>
 #include <signal.h>

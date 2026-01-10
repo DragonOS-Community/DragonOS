@@ -1,11 +1,11 @@
 use crate::{
-    arch::{interrupt::TrapFrame, ipc::signal::Signal, CurrentSignalArch},
+    arch::{CurrentSignalArch, interrupt::TrapFrame, ipc::signal::Signal},
     ipc::signal_types::SignalArch,
-    process::{rseq::Rseq, ProcessFlags, ProcessManager},
+    process::{ProcessFlags, ProcessManager, rseq::Rseq},
 };
 
 #[no_mangle]
-unsafe extern "C" fn irqentry_exit(frame: &mut TrapFrame) {
+pub unsafe extern "C" fn irqentry_exit(frame: &mut TrapFrame) {
     if frame.is_from_user() {
         irqentry_exit_to_user_mode(frame);
     }
@@ -37,6 +37,17 @@ unsafe fn exit_to_user_mode_prepare(frame: &mut TrapFrame) {
 /// 由于这个函数内可能会直接退出进程，因此，在进入函数之前，
 /// 必须保证所有的栈上的Arc/Box指针等，都已经被释放。否则，可能会导致内存泄漏。
 unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: ProcessFlags) {
+    let pcb = ProcessManager::current_pcb();
+    // if pcb.raw_pid() > RawPid::from(11) {
+    //     log::debug!(
+    //         "[EXIT_TO_USERMODE] PID {} flags={:?}, HAS_PENDING_SIGNAL={}, NEED_RSEQ={}",
+    //         pcb.raw_pid(),
+    //         process_flags_work,
+    //         process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL),
+    //         process_flags_work.contains(ProcessFlags::NEED_RSEQ)
+    //     );
+    // }
+
     while !process_flags_work.exit_to_user_mode_work().is_empty() {
         // 优先处理 rseq，因为信号递送会保存 trapframe 到 sigframe
         // rseq 的 IP fixup 必须在信号递送之前完成
@@ -49,6 +60,10 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
         }
 
         if process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL) {
+            log::debug!(
+                "[EXIT_TO_USERMODE] PID {} calling do_signal_or_restart",
+                pcb.raw_pid()
+            );
             unsafe { CurrentSignalArch::do_signal_or_restart(frame) };
         }
         process_flags_work = *ProcessManager::current_pcb().flags();

@@ -697,11 +697,77 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
 
         // 如果信号非法，则直接返回
         if sig == Signal::INVALID {
+            log::debug!("[DO_SIGNAL] PID {} no more signals, returning", pcb.raw_pid());
             return;
         }
 
+        log::debug!(
+            "[DO_SIGNAL] PID {} dequeued signal {:?}, PTRACED={}",
+            pcb.raw_pid(),
+            sig,
+            pcb.flags().contains(ProcessFlags::PTRACED)
+        );
+
+        // 按照 Linux 6.6.21 的实现：
+        // 在处理信号之前，如果进程被 ptrace，先调用 ptrace_signal
+        // ptrace_signal 会让进程停止并等待 tracer 的指令
+        //
+        // 重要：在调用 ptrace_signal 之前必须释放 siginfo_mut_guard 锁
+        // 因为 ptrace_stop 内部会调用 schedule()，要求 preempt_count = 0
+        // 而 siginfo_mut_guard 持有锁时 preempt_count = 1
+        // 按照 Linux 的做法，ptrace_stop 会在内部释放 sighand->siglock，
+        // 然后在返回前重新获取它（__releases/__acquires 标注）
+        if pcb.flags().contains(ProcessFlags::PTRACED) {
+            log::debug!(
+                "[DO_SIGNAL] PID {} is PTRACED, calling ptrace_signal for {:?}",
+                pcb.raw_pid(),
+                sig
+            );
+
+            // 保存当前需要的信息
+            let _sig_blocked_cache = *siginfo_mut_guard.sig_blocked();
+
+            // 在调用 ptrace_signal 前释放锁
+            drop(siginfo_mut_guard);
+
+            // ptrace_signal 会调用 ptrace_stop 让进程停止
+            // 返回需要继续处理的信号（可能被 tracer 修改或取消）
+            let handled_sig = ptrace_signal(&pcb, sig, &mut info);
+
+            // 重新获取锁
+            siginfo_mut_guard = pcb.try_siginfo_mut(5).unwrap();
+
+            if let Some(handled_sig) = handled_sig {
+                // tracer 可能注入了新的信号或修改了原信号
+                log::debug!(
+                    "[DO_SIGNAL] PID {} ptrace_signal returned {:?}",
+                    pcb.raw_pid(),
+                    handled_sig
+                );
+                sig = handled_sig;
+            } else {
+                // 信号被 ptrace 取消或重新排队，继续处理下一个信号
+                log::debug!(
+                    "[DO_SIGNAL] PID {} signal was cancelled by ptrace, continuing loop",
+                    pcb.raw_pid()
+                );
+                continue;
+            }
+        }
+
+        log::debug!(
+            "[DO_SIGNAL] PID {} processing signal {:?}, checking if kernel_only",
+            pcb.raw_pid(),
+            sig
+        );
+
         // 对 kernel-only 信号（如 SIGKILL/SIGSTOP）直接使用默认处理，避免任何用户帧构造
         if sig.kernel_only() {
+            log::debug!(
+                "[DO_SIGNAL] PID {} signal {:?} is kernel_only, calling handle_default",
+                pcb.raw_pid(),
+                sig
+            );
             // log::error!(
             //     "do_signal: kernel-only sig={} for pid={:?} -> default handler (no user frame)",
             //     sig as i32,
@@ -715,7 +781,20 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             sig.handle_default();
             return;
         }
+
+        log::debug!(
+            "[DO_SIGNAL] PID {} getting sigaction for signal {:?}",
+            pcb.raw_pid(),
+            sig
+        );
         let sa = pcb.sighand().handler(sig).unwrap();
+
+        log::debug!(
+            "[DO_SIGNAL] PID {} signal {:?} sigaction: {:?}",
+            pcb.raw_pid(),
+            sig,
+            sa.action()
+        );
 
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
@@ -766,10 +845,10 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     // 做完上面的检查后，开中断
     CurrentIrqArch::interrupt_enable();
 
+    log::debug!("[DO_SIGNAL] No signal action to handle, returning without setting up frame");
     if sigaction.is_none() {
         return;
     }
-    *got_signal = true;
 
     let mut sigaction = sigaction.unwrap();
 
@@ -777,6 +856,25 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
     let res: Result<i32, SystemError> =
         handle_signal(sig, &mut sigaction, &info.unwrap(), &oldset, frame);
+
+    // 只有当信号帧真正被设置时（即自定义处理器），才设置 got_signal = true
+    // 对于默认动作的信号（如 SIGCONT），handle_signal 会调用 handle_default() 并返回 Ok(0)，
+    // 不会设置信号帧。在这种情况下，应该允许系统调用重启。
+    if res.is_ok() {
+        match sigaction.action() {
+            SigactionType::SaHandler(SaHandlerType::Customized(_)) => {
+                *got_signal = true;
+            }
+            SigactionType::SaSigaction(_) => {
+                *got_signal = true;
+            }
+            _ => {
+                // Default 或 Ignore 动作不设置用户信号帧，got_signal 保持 false
+                log::debug!("[DO_SIGNAL] Default/Ignore action, got_signal remains false");
+            }
+        }
+    }
+
     compiler_fence(Ordering::SeqCst);
     if let Err(e) = res {
         if e != SystemError::EFAULT {
@@ -796,15 +894,38 @@ fn try_restart_syscall(frame: &mut TrapFrame) {
         restore_saved_sigmask();
     });
 
-    if unsafe { frame.syscall_nr() }.is_none() {
+    let pcb = ProcessManager::current_pcb();
+    let pid = pcb.raw_pid();
+    // 关键修复：如果进程已经退出（例如处理了 SIGKILL 等致命信号），不重启系统调用
+    let is_exited = pcb.sched_info().inner_lock_read_irqsave().state().is_exited();
+    drop(pcb);
+
+    if is_exited {
+        log::debug!("[TRY_RESTART] PID {}: already exited, not restarting syscall", pid);
         return;
     }
 
+    if unsafe { frame.syscall_nr() }.is_none() {
+        log::debug!("[TRY_RESTART] PID {}: no syscall, returning", pid);
+        return;
+    }
+
+    let syscall_nr = unsafe { frame.syscall_nr() };
+    let rax_value = frame.rax;
     let syscall_err = unsafe { frame.syscall_error() };
     if syscall_err.is_none() {
+        log::debug!("[TRY_RESTART] PID {}: no error, rax={:#x}, returning", pid, rax_value);
         return;
     }
     let syscall_err = syscall_err.unwrap();
+
+    log::debug!(
+        "[TRY_RESTART] PID {}: syscall_nr={:?}, rax={:#x}, syscall_err={:?}",
+        pid,
+        syscall_nr,
+        rax_value,
+        syscall_err
+    );
 
     let mut restart = false;
     match syscall_err {
@@ -820,7 +941,13 @@ fn try_restart_syscall(frame: &mut TrapFrame) {
         }
         _ => {}
     }
-    log::debug!("try restart syscall: {:?}", restart);
+    log::debug!(
+        "[TRY_RESTART] PID {}: restart={}, rip={:#x}, rax={:#x}",
+        pid,
+        restart,
+        frame.rip,
+        frame.rax
+    );
 }
 
 pub struct X86_64SignalArch;
@@ -830,12 +957,27 @@ impl SignalArch for X86_64SignalArch {
     ///
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#865
     unsafe fn do_signal_or_restart(frame: &mut TrapFrame) {
+        let pcb = ProcessManager::current_pcb();
+        log::debug!("[DO_SIGNAL_OR_RESTART] PID {} entry, rip={:#x}, rsp={:#x}, state={:?}",
+                   pcb.raw_pid(), frame.rip, frame.rsp,
+                   pcb.sched_info().inner_lock_read_irqsave().state());
+        drop(pcb);
+
         let mut got_signal = false;
         do_signal(frame, &mut got_signal);
 
+        let pcb = ProcessManager::current_pcb();
+        log::debug!("[DO_SIGNAL_OR_RESTART] PID {} after do_signal, got_signal={}, will_return_to_user={}",
+                   pcb.raw_pid(), got_signal, frame.is_from_user());
+        drop(pcb);
+
         if got_signal {
+            log::debug!("[DO_SIGNAL_OR_RESTART] PID {} got_signal=true, NOT calling try_restart_syscall",
+                       ProcessManager::current_pcb().raw_pid());
             return;
         }
+        log::debug!("[DO_SIGNAL_OR_RESTART] PID {} got_signal=false, calling try_restart_syscall",
+                   ProcessManager::current_pcb().raw_pid());
         try_restart_syscall(frame);
     }
 
@@ -899,7 +1041,17 @@ fn handle_signal(
     frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
     log::debug!("handle_signal {:?}", sig);
-    if unsafe { frame.syscall_nr() }.is_some() {
+
+    // 只在真正设置信号帧时（即自定义处理器）才修改系统调用错误码
+    // 对于 Default 动作的信号，setup_frame 不会设置信号帧，而是调用 handle_default() 直接返回
+    // 此时应该保留原始错误码，让 try_restart_syscan 正确处理系统调用重启
+    let is_custom_handler = matches!(
+        sigaction.action(),
+        SigactionType::SaHandler(SaHandlerType::Customized(_))
+            | SigactionType::SaSigaction(_)
+    );
+
+    if is_custom_handler && unsafe { frame.syscall_nr() }.is_some() {
         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
             match syscall_err {
                 SystemError::ERESTARTNOHAND => {

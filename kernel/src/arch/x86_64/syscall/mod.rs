@@ -1,14 +1,14 @@
 use crate::{
     arch::{
-        ipc::signal::X86_64SignalArch,
+        ipc::signal::{Signal, X86_64SignalArch},
         syscall::nr::{SYS_ARCH_PRCTL, SYS_RT_SIGRETURN},
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    ipc::signal_types::SignalArch,
+    ipc::signal_types::{OriginCode, SigCode, SigInfo, SigType, SignalArch},
     libs::align::SafeForZero,
     mm::VirtAddr,
-    process::ProcessManager,
+    process::{ProcessFlags, ProcessManager},
     syscall::{Syscall, SYS_SCHED},
 };
 use log::debug;
@@ -56,6 +56,20 @@ macro_rules! syscall_return {
             debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
         }
 
+        // 系统调用返回前检查并处理信号
+        // 这是 ptrace 和普通信号处理的关键入口
+        // 如果 HAS_PENDING_SIGNAL 标志被设置，需要调用 do_signal_or_restart
+        let pcb = ProcessManager::current_pcb();
+        if pcb.flags().contains(ProcessFlags::HAS_PENDING_SIGNAL) {
+            drop(pcb);
+            // 调用退出到用户态的处理流程，会检查并处理信号
+            // irqentry_exit 会检查 is_from_user() 并调用 exit_to_user_mode_prepare
+            unsafe { crate::exception::entry::irqentry_exit($regs) };
+            // irqentry_exit 已经处理了退出流程，直接返回
+            return;
+        }
+        drop(pcb);
+
         unsafe {
             CurrentIrqArch::interrupt_disable();
         }
@@ -100,6 +114,62 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         debug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
     }
 
+    // 检查是否需要 ptrace syscall trace (系统调用入口)
+    let pcb = ProcessManager::current_pcb();
+    let needs_syscall_trace = pcb
+        .flags()
+        .contains(ProcessFlags::PTRACED | ProcessFlags::TRACE_SYSCALL);
+
+    if needs_syscall_trace {
+        // 按照 Linux 6.6.21 的 ptrace_report_syscall_entry 语义：
+        // 在系统调用入口停止，而不是在系统调用执行后停止
+        //
+        // 实现方式：
+        // 1. 设置 ERESTARTNOHAND 错误码，让 try_restart_syscall 稍后重启
+        // 2. 发送 SIGTRAP 给自己，触发 ptrace 停止
+        // 3. 直接返回，不执行系统调用
+        // 4. 当 ptrace_stop 返回后，try_restart_syscall 会将 rip -= 2 重新执行系统调用
+        // 5. 第二次执行时，由于 needs_syscall_entry_stop 已被设置为 false，执行系统调用并在出口停止
+
+        let needs_entry_stop = pcb.needs_syscall_entry_stop();
+        drop(pcb);
+
+        if needs_entry_stop {
+            let pcb = ProcessManager::current_pcb();
+            // 第一次进入：需要在系统调用入口停止
+            // 保存系统调用信息
+            pcb.on_syscall_entry(syscall_num, &args);
+
+            // 设置重启条件：使用 ERESTARTNOHAND 让 try_restart_syscall 稍后重启
+            frame.rax = system_error::SystemError::ERESTARTNOHAND.to_posix_errno() as u64;
+            // errcode 已经保存了原始系统调用号（line 69）
+
+            // 标记已经完成入口停止，下次通过时将执行系统调用
+            pcb.set_needs_syscall_entry_stop(false);
+
+            // 设置 HAS_PENDING_SIGNAL 标志，确保在返回用户态前处理信号
+            pcb.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
+
+            // 发送 SIGTRAP 给自己，触发 ptrace 停止 (syscall entry)
+            let mut info = SigInfo::new(
+                Signal::SIGTRAP,
+                0, // PTRACE_EVENTMSG_SYSCALL_ENTRY
+                SigCode::Origin(OriginCode::Kernel),
+                SigType::SigFault(crate::ipc::signal_types::SigFaultInfo { addr: 0, trapno: 0 }),
+            );
+            Signal::SIGTRAP.send_signal_info_to_pcb(
+                Some(&mut info),
+                pcb.clone(),
+                crate::process::pid::PidType::PID,
+            );
+
+            // 直接返回，不执行系统调用
+            // try_restart_syscall 稍后会在信号处理后重启系统调用
+            syscall_return!(frame.rax, frame, show);
+        }
+        // needs_entry_stop == false 表示已经完成入口停止，这次应该执行系统调用
+    }
+
     // Arch specific syscall
     match syscall_num {
         SYS_RT_SIGRETURN => {
@@ -120,8 +190,39 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         _ => {}
     }
     let mut syscall_handle = || -> u64 {
-        Syscall::catch_handle(syscall_num, &args, frame)
-            .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
+        let result = Syscall::catch_handle(syscall_num, &args, frame)
+            .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64;
+
+        // 系统调用出口 ptrace trace
+        let pcb = ProcessManager::current_pcb();
+        if pcb
+            .flags()
+            .contains(ProcessFlags::PTRACED | ProcessFlags::TRACE_SYSCALL)
+        {
+            // 保存系统调用结果
+            pcb.on_syscall_exit(result as isize);
+
+            // 重置入口停止标志，以便下一个系统调用也在入口停止
+            pcb.set_needs_syscall_entry_stop(true);
+
+            // 设置 HAS_PENDING_SIGNAL 标志，确保在返回用户态前处理信号
+            pcb.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
+
+            // 发送 SIGTRAP 给自己，触发 ptrace 停止 (syscall exit)
+            let mut info = SigInfo::new(
+                Signal::SIGTRAP,
+                1, // PTRACE_EVENTMSG_SYSCALL_EXIT
+                SigCode::Origin(OriginCode::Kernel),
+                SigType::SigFault(crate::ipc::signal_types::SigFaultInfo { addr: 0, trapno: 0 }),
+            );
+            Signal::SIGTRAP.send_signal_info_to_pcb(
+                Some(&mut info),
+                pcb.clone(),
+                crate::process::pid::PidType::PID,
+            );
+        }
+
+        result
     };
     syscall_return!(syscall_handle(), frame, show);
 }

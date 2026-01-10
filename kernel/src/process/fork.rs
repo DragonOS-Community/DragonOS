@@ -686,7 +686,27 @@ impl ProcessManager {
             }
         } else {
             // 新创建的进程，设置其父进程为当前进程
+            let current_pid = current_pcb.raw_pid();
+            let child_pid = pcb.raw_pid();
+
             *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+
+            // 同时设置parent_pcb（按照Linux语义，默认parent=real_parent）
+            *pcb.parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+
+            // 验证设置
+            let verify_parent = pcb.parent_pcb.read_irqsave();
+            let verify_pid = verify_parent
+                .upgrade()
+                .map(|p| p.raw_pid());
+
+            log::debug!(
+                "[FORK] Set parent: child={}, parent={}, verified parent={:?}",
+                child_pid,
+                current_pid,
+                verify_pid
+            );
+
             pcb.exit_signal
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }

@@ -28,12 +28,18 @@ impl Syscall for SysMlock2Handle {
             return Ok(0);
         }
 
+        // 页面对齐：起始地址向下对齐，长度调整
+        // 参考 Linux mm/mlock.c: 用户传入的地址需要向下对齐到页边界
+        // 长度需要加上页内偏移后再向上对齐
+        let page_offset = addr.data() & (MMArch::PAGE_SIZE - 1);
+        let aligned_addr = VirtAddr::new(addr.data() - page_offset);
+        let adjusted_len = len.saturating_add(page_offset);
+        let aligned_len = page_align_up(adjusted_len);
+
         // 检查标志位合法性
         if !flags.is_empty() && !flags.contains(Mlock2Flags::MLOCK_ONFAULT) {
             return Err(SystemError::EINVAL);
         }
-
-        let aligned_len = page_align_up(len);
         if aligned_len == 0 || aligned_len < len {
             return Err(SystemError::ENOMEM);
         }
@@ -82,7 +88,7 @@ impl Syscall for SysMlock2Handle {
 
         // 执行 mlock2（支持 MLOCK_ONFAULT）
         let onfault = flags.contains(Mlock2Flags::MLOCK_ONFAULT);
-        addr_space.write().mlock(addr, aligned_len, onfault)?;
+        addr_space.write().mlock(aligned_addr, aligned_len, onfault)?;
 
         Ok(0)
     }

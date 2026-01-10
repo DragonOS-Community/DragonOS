@@ -80,9 +80,21 @@ impl Syscall for SysMlock2Handle {
         let current_locked = addr_space.read().locked_vm();
 
         // 检查是否超过限制
-        // 参考 Linux: mm/mlock.c:do_mlock() 和 user_lock_limit()
+        // 参考 Linux: mm/mlock.c:do_mlock()
         // 如果没有 CAP_IPC_LOCK 权限，需要检查 RLIMIT_MEMLOCK 限制
-        if current_locked + requested_pages > lock_limit_pages {
+        // 如果可能超过限制，需要计算请求范围内已锁定的页面数，并扣除
+        let mut locked = current_locked + requested_pages;
+        if locked > lock_limit_pages {
+            // 参考 Linux: mm/mlock.c:count_mm_mlocked_page_nr()
+            // 计算请求范围内已锁定的页面数，从请求的页面数中扣除
+            let addr_space_read = addr_space.read();
+            let already_locked_in_range = addr_space_read.count_mm_mlocked_page_nr(aligned_addr, aligned_len);
+            drop(addr_space_read);
+            locked = current_locked + requested_pages - already_locked_in_range;
+        }
+
+        // 再次检查是否超过限制
+        if locked > lock_limit_pages {
             return Err(SystemError::ENOMEM);
         }
 

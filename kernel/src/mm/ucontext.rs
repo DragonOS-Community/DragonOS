@@ -1605,6 +1605,55 @@ impl InnerAddressSpace {
     pub fn locked_vm(&self) -> usize {
         return self.locked_vm.load(core::sync::atomic::Ordering::Relaxed);
     }
+
+    /// 计算指定范围内已锁定的页面数
+    ///
+    /// # 参数
+    /// - `start`: 起始虚拟地址
+    /// - `len`: 长度
+    ///
+    /// # 返回
+    /// 返回指定范围内已锁定的页面数
+    ///
+    /// # 说明
+    /// 参考 Linux: mm/mlock.c:count_mm_mlocked_page_nr()
+    /// 用于处理 mlock/mlock2 时，如果请求范围内有部分已经锁定，
+    /// 需要从请求的页面数中扣除已锁定的部分。
+    pub fn count_mm_mlocked_page_nr(&self, start: VirtAddr, len: usize) -> usize {
+        let end = start
+            .data()
+            .checked_add(len)
+            .unwrap_or_else(|| usize::MAX);
+        let end = VirtAddr::new(core::cmp::min(end, MMArch::USER_END_VADDR.data()));
+
+        let region = VirtRegion::new(start, len);
+        let mut count = 0;
+
+        for vma in self.mappings.conflicts(region) {
+            let vma_guard = vma.lock_irqsave();
+            let vm_flags = *vma_guard.vm_flags();
+            let vma_region = *vma_guard.region();
+            drop(vma_guard);
+
+            // 只计算已锁定的 VMA
+            if !vm_flags.contains(VmFlags::VM_LOCKED)
+                && !vm_flags.contains(VmFlags::VM_LOCKONFAULT)
+            {
+                continue;
+            }
+
+            // 计算 VMA 与请求范围的交集
+            let intersection_start = core::cmp::max(vma_region.start(), start);
+            let intersection_end = core::cmp::min(vma_region.end(), end);
+
+            if intersection_end > intersection_start {
+                let intersect_len = intersection_end.data() - intersection_start.data();
+                count += intersect_len >> MMArch::PAGE_SHIFT;
+            }
+        }
+
+        count
+    }
 }
 
 impl Drop for InnerAddressSpace {

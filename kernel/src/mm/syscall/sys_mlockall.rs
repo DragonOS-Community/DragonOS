@@ -26,6 +26,10 @@ impl Syscall for SysMlockallHandle {
         if !flags.intersects(MlockAllFlags::MCL_CURRENT | MlockAllFlags::MCL_FUTURE) {
             return Err(SystemError::EINVAL);
         }
+        // 检查 MCL_ONFAULT 是否单独使用（Linux 语义）
+        if flags == MlockAllFlags::MCL_ONFAULT {
+            return Err(SystemError::EINVAL);
+        }
 
         // 权限检查
         if !can_do_mlock() {

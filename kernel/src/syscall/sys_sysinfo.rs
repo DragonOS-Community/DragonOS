@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::syscall::nr::SYS_SYSINFO;
 use crate::arch::mm::LockedFrameAllocator;
+use crate::arch::syscall::nr::SYS_SYSINFO;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::allocator::slab::slab_usage;
 use crate::process::ProcessManager;

@@ -588,9 +588,13 @@ pub fn set_boot_time(time: u64) {
     BOOT_TIME.store(time, Ordering::Release);
 }
 
+/// 获取系统启动时间
+pub fn get_boot_time() -> u64 {
+    BOOT_TIME.load(Ordering::Acquire)
+}
+
 /// 获取系统运行时间（秒）
 pub fn uptime_secs() -> u64 {
-    // 使用 jiffies 计算 uptime，不依赖 RTC
-    // HZ = 250，表示每秒 250 个 jiffies
+    // todo：以后需要改成高精度时钟源
     crate::time::timer::clock() / crate::time::clocksource::HZ
 }

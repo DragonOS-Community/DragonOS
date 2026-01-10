@@ -53,19 +53,16 @@ impl Syscall for SysMlockallHandle {
                 lock_limit >> MMArch::PAGE_SHIFT
             };
 
+            let addr_space_read = addr_space.read();
             // 计算当前已锁定的页面数
-            let current_locked = addr_space.read().locked_vm();
+            let current_locked = addr_space_read.locked_vm();
 
             // 计算要锁定的页面数（只计算尚未锁定的可访问 VMA）
-            let addr_space_read = addr_space.read();
             let mut pages_to_lock = 0;
             for vma in addr_space_read.mappings.iter_vmas() {
-                //for vma in addr_space_read.mappings.vmas.iter() {
                 let vma_guard = vma.lock_irqsave();
                 let vm_flags = *vma_guard.vm_flags();
                 let region = *vma_guard.region();
-                drop(vma_guard);
-
                 // 只计算可访问且尚未锁定的 VMA
                 if !vma.is_accessible() {
                     continue;
@@ -79,8 +76,6 @@ impl Syscall for SysMlockallHandle {
                     pages_to_lock += len >> MMArch::PAGE_SHIFT;
                 }
             }
-            drop(addr_space_read);
-
             // 检查是否超过限制
             if current_locked + pages_to_lock > lock_limit_pages {
                 return Err(SystemError::ENOMEM);

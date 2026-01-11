@@ -36,7 +36,7 @@ use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCKALL, MMArch};
 use crate::mm::MemoryManagementArch;
 use crate::mm::VmFlags;
 use crate::mm::{mlock::can_do_mlock, syscall::MlockAllFlags, ucontext::AddressSpace};
-use crate::process::{resource::RLimitID, ProcessManager};
+use crate::process::{cred::CAPFlags, resource::RLimitID, ProcessManager};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -69,50 +69,55 @@ impl Syscall for SysMlockallHandle {
         let addr_space = AddressSpace::current()?;
 
         // ========== MCL_CURRENT: RLIMIT_MEMLOCK 检查 ==========
+        // Linux 6.6.21 语义：
+        // - 如果没有 CAP_IPC_LOCK 权限，需要检查 total_vm <= lock_limit
+        // - total_vm 是进程地址空间中所有可访问 VMA 的总页面数
+        // - 参考：mm/mlock.c:724
         if flags.contains(MlockAllFlags::MCL_CURRENT) {
-            let lock_limit = ProcessManager::current_pcb()
-                .get_rlimit(RLimitID::Memlock)
-                .rlim_cur as usize;
+            let has_cap_ipc_lock = ProcessManager::current_pcb()
+                .cred()
+                .has_capability(CAPFlags::CAP_IPC_LOCK);
 
-            let lock_limit_pages = if lock_limit == usize::MAX {
-                usize::MAX
-            } else {
-                lock_limit >> MMArch::PAGE_SHIFT
-            };
+            if !has_cap_ipc_lock {
+                let lock_limit = ProcessManager::current_pcb()
+                    .get_rlimit(RLimitID::Memlock)
+                    .rlim_cur as usize;
 
-            let addr_space_read = addr_space.read();
-            let current_locked = addr_space_read.locked_vm();
+                let lock_limit_pages = if lock_limit == usize::MAX {
+                    usize::MAX
+                } else {
+                    lock_limit >> MMArch::PAGE_SHIFT
+                };
 
-            // 计算需要锁定的页面数（未锁定的可访问 VMA）
-            let mut pages_to_lock = 0;
-            for vma in addr_space_read.mappings.iter_vmas() {
-                let vma_guard = vma.lock_irqsave();
-                let vm_flags = *vma_guard.vm_flags();
-                let region = *vma_guard.region();
+                let addr_space_read = addr_space.read();
 
-                // 判断是否可访问（使用已读取的 vm_flags，避免锁释放后状态变化）
-                let vm_access_flags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
-                let is_accessible = vm_flags.intersects(vm_access_flags);
+                // 计算 total_vm：所有可访问 VMA 的总页面数
+                // 这与 Linux 的 total_vm 语义一致，表示进程地址空间的总大小
+                let mut total_vm = 0;
+                for vma in addr_space_read.mappings.iter_vmas() {
+                    let vma_guard = vma.lock_irqsave();
+                    let vm_flags = *vma_guard.vm_flags();
+                    let region = *vma_guard.region();
 
-                let already_locked = vm_flags.contains(VmFlags::VM_LOCKED)
-                    || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+                    // 判断是否可访问
+                    let vm_access_flags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
+                    let is_accessible = vm_flags.intersects(vm_access_flags);
 
-                drop(vma_guard);  // 完成所有判断后释放锁
+                    drop(vma_guard);
 
-                if !is_accessible {
-                    continue;
+                    if is_accessible {
+                        let len = region.end().data() - region.start().data();
+                        total_vm += len >> MMArch::PAGE_SHIFT;
+                    }
                 }
 
-                if !already_locked {
-                    let len = region.end().data() - region.start().data();
-                    pages_to_lock += len >> MMArch::PAGE_SHIFT;
+                drop(addr_space_read);
+
+                // 检查是否超过限制
+                if total_vm > lock_limit_pages {
+                    return Err(SystemError::ENOMEM);
                 }
             }
-
-            if current_locked + pages_to_lock > lock_limit_pages {
-                return Err(SystemError::ENOMEM);
-            }
-            drop(addr_space_read);
         }
 
         // ========== 执行锁定操作 ==========

@@ -272,14 +272,9 @@ impl PageFaultHandler {
                         page.write_irqsave().insert_vma(vma.clone());
 
                         // 如果设置了 VM_LOCKONFAULT，锁定页面
+                        // mlock_page 不会失败（与 Linux 一致）
                         if should_lock {
-                            if let Err(e) = mlock_page(&page) {
-                                log::warn!(
-                                    "mlock_page failed in do_anonymous_page (shared anon): {:?}",
-                                    e
-                                );
-                                return VmFaultReason::VM_FAULT_SIGBUS;
-                            }
+                            mlock_page(&page);
                         }
 
                         return VmFaultReason::VM_FAULT_COMPLETED;
@@ -309,14 +304,9 @@ impl PageFaultHandler {
             page.write_irqsave().insert_vma(vma.clone());
 
             // 如果设置了 VM_LOCKONFAULT，锁定页面
+            // mlock_page 不会失败（与 Linux 一致）
             if should_lock {
-                if let Err(e) = mlock_page(&page) {
-                    log::warn!(
-                        "mlock_page failed in do_anonymous_page (private anon): {:?}",
-                        e
-                    );
-                    return VmFaultReason::VM_FAULT_SIGBUS;
-                }
+                mlock_page(&page);
             }
 
             VmFaultReason::VM_FAULT_COMPLETED

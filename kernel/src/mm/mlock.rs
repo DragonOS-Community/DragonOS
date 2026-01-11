@@ -73,7 +73,12 @@ pub fn can_do_mlock() -> bool {
 /// - 当计数从 0 → 1 时：
 ///   - 设置 PG_MLOCKED 标志（标记页面已锁定）
 ///   - 设置 PG_UNEVICTABLE 标志（防止页面被换出）
-pub fn mlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
+///
+/// # Linux 参考实现
+///
+/// 基于 Linux 6.6.21 mm/mlock.c:mlock_folio()
+/// 该函数在 Linux 中为 void 函数，不会失败
+pub fn mlock_page(page: &Arc<Page>) {
     let mut page_guard = page.write_irqsave();
 
     // 增加 mlock 计数
@@ -93,8 +98,6 @@ pub fn mlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
         // 注意：由于页面已设置 PG_UNEVICTABLE 标志，即使没有 LRU 管理，
         // 页面回收机制也会检查该标志，不会被回收
     }
-
-    Ok(())
 }
 
 /// 解锁单个物理页面
@@ -107,13 +110,18 @@ pub fn mlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
 /// - 当计数从 1 → 0 时：
 ///   - 清除 PG_MLOCKED 标志
 ///   - 如果页面未被映射（map_count == 0），清除 PG_UNEVICTABLE 标志
-pub fn munlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
+///
+/// # Linux 参考实现
+///
+/// 基于 Linux 6.6.21 mm/mlock.c:munlock_folio()
+/// 该函数在 Linux 中为 void 函数，不会失败
+pub fn munlock_page(page: &Arc<Page>) {
     let mut page_guard = page.write_irqsave();
 
     // 减少 mlock 计数
     let old_count = page_guard.mlock_count();
     if old_count == 0 {
-        return Ok(()); // 已经解锁，直接返回
+        return; // 已经解锁，直接返回
     }
 
     page_guard.dec_mlock_count();
@@ -130,8 +138,6 @@ pub fn munlock_page(page: &Arc<Page>) -> Result<(), SystemError> {
             // TODO: 从不可换出 LRU 移回可换出 LRU
         }
     }
-
-    Ok(())
 }
 
 impl LockedVMA {
@@ -249,17 +255,16 @@ impl LockedVMA {
     ///
     /// - `Ok(true)`: 成功处理了页面
     /// - `Ok(false)`: 页面不存在于页面管理器中
-    /// - `Err(SystemError)`: 操作失败
     fn mlock_phys_page(paddr: PhysAddr, lock: bool) -> Result<bool, SystemError> {
         let mut page_manager_guard = page_manager_lock_irqsave();
         if let Some(page) = page_manager_guard.get(&paddr) {
             drop(page_manager_guard);
 
-            // 对页面应用锁定/解锁
+            // 对页面应用锁定/解锁（不会失败，与 Linux 一致）
             if lock {
-                mlock_page(&page)?;
+                mlock_page(&page);
             } else {
-                munlock_page(&page)?;
+                munlock_page(&page);
             }
 
             return Ok(true);

@@ -149,7 +149,7 @@ pub struct InnerAddressSpace {
     pub start_data: VirtAddr,
     pub end_data: VirtAddr,
 
-    /// 被 mlock 锁定的页面数量（页为单位）
+    /// 有 VM_LOCKED 标志的 VMA 页面数
     locked_vm: AtomicUsize,
 
     /// mlockall 默认标志 (影响未来映射)
@@ -1647,15 +1647,23 @@ impl InnerAddressSpace {
         // 清除 def_flags
         self.def_flags = VmFlags::empty();
 
-        // 遍历所有 VMA，清除锁定标志
-        for (vma, _, _) in vmas_to_unlock {
+        // 遍历所有 VMA，清除锁定标志，并计算要减少的 locked_vm
+        // 参考 Linux 语义：locked_vm 统计的是带 VM_LOCKED 标志的 VMA 页面数
+        let mut pages_to_subtract = 0;
+        for (vma, start, end) in &vmas_to_unlock {
             let mut guard = vma.lock_irqsave();
             let current_flags = *guard.vm_flags();
+            // 只有当前确实有 VM_LOCKED 标志的 VMA 才需要减少计数
+            if current_flags.contains(VmFlags::VM_LOCKED) {
+                let len = end.data() - start.data();
+                pages_to_subtract += len >> MMArch::PAGE_SHIFT;
+            }
             guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
         }
 
-        // 重置 locked_vm
-        self.locked_vm.store(0, Ordering::Relaxed);
+        // 根据解锁的 VMA 页面数减少 locked_vm（而不是直接设为 0）
+        let current = self.locked_vm.load(Ordering::Relaxed);
+        self.locked_vm.store(current.saturating_sub(pages_to_subtract), Ordering::Relaxed);
 
         Ok(())
     }

@@ -212,11 +212,9 @@ fn get_pipe_inode(file: &File) -> Result<Arc<LockedPipeInode>, SystemError> {
         .ok_or(SystemError::EBADF)
 }
 
-/// Linux 语义（fs/splice.c: ipipe_prep/opipe_prep）：
+/// Linux 语义（fs/splice.c: ipipe_prep）：
 /// - 输入 pipe 为空且仍有 writer：SPLICE_F_NONBLOCK -> EAGAIN
 /// - 输入 pipe 为空且无 writer：返回 0 (EOF)
-/// - 输出 pipe 满且仍有 reader：SPLICE_F_NONBLOCK -> EAGAIN
-/// - 输出 pipe 满且无 reader：写入端应触发 EPIPE（交由后续 write 路径处理）
 fn nonblock_prep_pipe_read(pipe_in: &File, flags: SpliceFlags) -> Result<(), SystemError> {
     if !flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
         return Ok(());
@@ -227,23 +225,6 @@ fn nonblock_prep_pipe_read(pipe_in: &File, flags: SpliceFlags) -> Result<(), Sys
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
     // no writers => EOF; allow read path to return 0
-
-    Ok(())
-}
-
-fn nonblock_prep_pipe_write(pipe_out: &File, flags: SpliceFlags) -> Result<(), SystemError> {
-    if !flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
-        return Ok(());
-    }
-
-    let pipe_inode = get_pipe_inode(pipe_out)?;
-    if pipe_inode.writable_len() == 0 {
-        // If there are no readers, Linux returns EPIPE (and SIGPIPE) rather than EAGAIN.
-        // Let the write path handle that case.
-        if pipe_inode.has_readers() {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-    }
 
     Ok(())
 }
@@ -271,8 +252,7 @@ fn splice_file_to_pipe(
     len: usize,
     flags: SpliceFlags,
 ) -> Result<usize, SystemError> {
-    // Non-blocking semantics: if the output pipe is full, return EAGAIN instead of sleeping.
-    nonblock_prep_pipe_write(pipe, flags)?;
+    let pipe_inode = get_pipe_inode(pipe)?;
 
     let buf_size = len.min(4096);
     let mut buffer = vec![0u8; buf_size];
@@ -291,18 +271,35 @@ fn splice_file_to_pipe(
         return Ok(0);
     }
 
+    buffer.truncate(read_len);
+
+    // Linux-like nonblocking semantics for file->pipe splice:
+    // - SPLICE_F_NONBLOCK makes the splice nonblocking regardless of the pipe fd's O_NONBLOCK.
+    // - When "atomic" (<= PIPE_BUF), lack of space yields EAGAIN (no partial write).
+    // - When non-atomic, write as much as fits and return partial.
+    if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
+        let space = pipe_inode.writable_len();
+        if space == 0 && pipe_inode.has_readers() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        if buffer.len() <= crate::ipc::pipe::PIPE_BUF && space < buffer.len() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        let to_write = if space == 0 {
+            buffer.len()
+        } else {
+            buffer.len().min(space)
+        };
+        buffer.truncate(to_write);
+    }
+
     // 写入 pipe
-    match pipe.write(read_len, &buffer[..read_len]) {
+    match pipe.write(buffer.len(), &buffer) {
         Ok(write_len) => {
             if advance_file_pos {
                 file.advance_pos(write_len);
             }
             Ok(write_len)
-        }
-        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-            if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) =>
-        {
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
         }
         Err(e) => Err(e),
     }

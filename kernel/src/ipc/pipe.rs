@@ -151,7 +151,7 @@ impl InnerPipeInode {
         };
 
         if !flags.is_write_only() {
-            if self.valid_cnt != 0 {
+            if self.valid_cnt != 0 && self.splice_hold == 0 {
                 // 有数据可读
                 events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
             }

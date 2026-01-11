@@ -197,26 +197,30 @@ impl LockedVMA {
             let next = core::cmp::min(end_addr, start + entry_size);
 
             if let Some(entry) = mapper.get_entry(start, level) {
-                // 大页处理：遍历大页内的每个 4K 子页
+                // 大页处理：先检查 present，再处理
                 if level > 0 && entry.flags().has_flag(MMArch::ENTRY_FLAG_HUGE_PAGE) {
-                    let sub_page_count = (next - start) >> MMArch::PAGE_SHIFT;
-
-                    // 获取大页的基地址
-                    let base_paddr = match entry.address() {
-                        Ok(paddr) => paddr,
-                        Err(_) => continue,
-                    };
-
-                    // 计算 start 在当前条目内的偏移
-                    let offset_in_entry = start.data() & (entry_size - 1);
-
-                    // 遍历大页中的每个子页
-                    for i in 0..sub_page_count {
-                        let sub_page_paddr = PhysAddr::new(
-                            base_paddr.data() + offset_in_entry + i * MMArch::PAGE_SIZE,
+                    // 显式检查 present 位（符合 Linux 语义）
+                    if !entry.present() {
+                        log::debug!(
+                            "mlock: huge page at {:#x} not present, skipping",
+                            start.data()
                         );
-                        if Self::mlock_phys_page(sub_page_paddr, lock)? {
-                            page_count += 1;
+                    } else {
+                        let sub_page_count = (next - start) >> MMArch::PAGE_SHIFT;
+                        // 安全 unwrap（因为已检查 present）
+                        let base_paddr = entry.address().unwrap();
+
+                        // 计算 start 在当前条目内的偏移
+                        let offset_in_entry = start.data() & (entry_size - 1);
+
+                        // 遍历大页中的每个子页
+                        for i in 0..sub_page_count {
+                            let sub_page_paddr = PhysAddr::new(
+                                base_paddr.data() + offset_in_entry + i * MMArch::PAGE_SIZE,
+                            );
+                            if Self::mlock_phys_page(sub_page_paddr, lock)? {
+                                page_count += 1;
+                            }
                         }
                     }
                 } else if level > 0 {
@@ -225,17 +229,14 @@ impl LockedVMA {
                         Self::mlock_walk_page_range(mapper, start, next, level - 1, lock)?;
                     page_count += sub_pages;
                 } else {
-                    // 叶子节点（4K 页）
-                    match entry.address() {
-                        Ok(paddr) => {
-                            if Self::mlock_phys_page(paddr, lock)? {
-                                page_count += 1;
-                            }
-                        }
-                        Err(_) => {
-                            // 页表项不存在，跳过（Linux 语义）
+                    // 叶子节点（4K 页）：显式检查 present
+                    if entry.present() {
+                        let paddr = entry.address().unwrap(); // 安全 unwrap
+                        if Self::mlock_phys_page(paddr, lock)? {
+                            page_count += 1;
                         }
                     }
+                    // 非 present 的 4K 页，跳过（Linux 语义）
                 }
             }
 

@@ -41,7 +41,7 @@ lazy_static! {
     pub static ref WATCHDOG_LIST: SpinLock<LinkedList<Arc<dyn Clocksource>>> =
         SpinLock::new(LinkedList::new());
 
-    pub static ref CLOCKSOURCE_WATCHDOG:SpinLock<ClocksouceWatchdog>  = SpinLock::new(ClocksouceWatchdog::new());
+    pub static ref CLOCKSOURCE_WATCHDOG:SpinLock<ClocksourceWatchdog>  = SpinLock::new(ClocksourceWatchdog::new());
 
     pub static ref OVERRIDE_NAME: SpinLock<String> = SpinLock::new(String::from(""));
 
@@ -133,7 +133,7 @@ impl ClocksourceFlags {
 }
 
 #[derive(Debug)]
-pub struct ClocksouceWatchdog {
+pub struct ClocksourceWatchdog {
     /// 监视器
     watchdog: Option<Arc<dyn Clocksource>>,
     /// 检查器是否在工作的标志
@@ -141,7 +141,7 @@ pub struct ClocksouceWatchdog {
     /// 定时监视器的过期时间
     timer_expires: u64,
 }
-impl ClocksouceWatchdog {
+impl ClocksourceWatchdog {
     pub fn new() -> Self {
         Self {
             watchdog: None,

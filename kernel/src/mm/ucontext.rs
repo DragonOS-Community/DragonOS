@@ -1334,14 +1334,15 @@ impl InnerAddressSpace {
     ///
     /// # Linux 语义
     /// 参考 Linux mm/mlock.c:do_mlock():
-    /// - 对于不可访问的 VMA（如 PROT_NONE），mlock 会失败并返回 ENOMEM
-    /// - 但是，即使失败，VMA 的 VM_LOCKED 标志仍然会被设置
-    /// - 这是因为 mlock 的主要目的是防止页面被换出，即使无法立即填充页面
+    /// - VMA 标志设置是破坏性操作，一旦设置就不会回滚
+    /// - 对于不可访问的 VMA（如 PROT_NONE），仍然设置 VM_LOCKED 标志
+    /// - 但在页面锁定步骤中，不可访问的 VMA 会被跳过
+    /// - 这样可以保持状态一致性，避免 TOCTOU 竞态条件
     pub fn mlock(&mut self, start: VirtAddr, len: usize, onfault: bool) -> Result<(), SystemError> {
         // 计算结束地址
         let end = start.data().checked_add(len).ok_or(SystemError::ENOMEM)?;
         let end = VirtAddr::new(end);
-        let mut has_inaccessible_vma = false;
+
         // 构造要设置的标志
         let mut new_flags = VmFlags::VM_LOCKED;
         if onfault {
@@ -1354,15 +1355,10 @@ impl InnerAddressSpace {
 
         let mut newly_locked_pages = 0;
 
-        // 遍历所有 VMA
-        // 对于不可访问的 VMA（如 PROT_NONE），mlock 应该失败，返回 ENOMEM
-        // 但 VMA 仍然应该被标记为 locked（Linux 语义）
-        // 无论是否成功，都要设置 VM_LOCKED 标志
+        // 遍历所有 VMA，设置 VM_LOCKED 标志
+        // 参考 Linux 语义：VMA 标志设置是破坏性操作，即使后续失败也不回滚
+        // 对于不可访问的 VMA（如 PROT_NONE），仍然设置标志，但在后续步骤中跳过页面锁定
         for vma in &vmas {
-            if !vma.is_accessible() {
-                has_inaccessible_vma = true;
-            }
-
             let mut guard = vma.lock_irqsave();
             let current_flags = *guard.vm_flags();
             let vma_start = guard.region().start();
@@ -1372,7 +1368,7 @@ impl InnerAddressSpace {
             let was_locked = current_flags.contains(VmFlags::VM_LOCKED)
                 || current_flags.contains(VmFlags::VM_LOCKONFAULT);
 
-            // 添加锁定标志
+            // 添加锁定标志（总是设置，遵循 Linux 语义）
             guard.set_vm_flags(current_flags | new_flags);
             drop(guard);
 
@@ -1386,14 +1382,9 @@ impl InnerAddressSpace {
             }
         }
 
-        // 只更新新增的锁定页面计数
+        // 更新 locked_vm
         self.locked_vm
             .fetch_add(newly_locked_pages, Ordering::Relaxed);
-
-        // 如果有不可访问的 VMA，返回 ENOMEM
-        if has_inaccessible_vma {
-            return Err(SystemError::ENOMEM);
-        }
 
         // 锁定已映射的页面
         // 对于 onfault 模式，不在此时锁定页面，而是在缺页中断时锁定

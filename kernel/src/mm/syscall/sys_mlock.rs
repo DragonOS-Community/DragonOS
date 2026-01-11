@@ -53,6 +53,12 @@ impl Syscall for SysMlockHandle {
         let addr = VirtAddr::new(args[0]);
         let len = args[1];
 
+        // ========== 地址有效性检查 ==========
+        // 拒绝 NULL 指针（除非 len = 0，这是合法的空操作）
+        if args[0] == 0 && len > 0 {
+            return Err(SystemError::EINVAL);
+        }
+
         // ========== 参数基本校验 ==========
         if len == 0 {
             return Ok(0);

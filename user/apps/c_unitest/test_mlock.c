@@ -10,6 +10,8 @@
  * Author: DragonOS Test Suite
  */
 
+#define _GNU_SOURCE  // 启用 GNU 扩展，包括 MLOCK_ONFAULT
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

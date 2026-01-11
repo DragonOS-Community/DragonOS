@@ -1431,7 +1431,8 @@ impl InnerAddressSpace {
                     let lock_end = core::cmp::min(vma_end, end);
 
                     // 锁定该范围内的已映射页面，不返回真正的错误，当页表项未映射时跳过
-                    vma.mlock_vma_pages_range(&mapper, lock_start, lock_end, true)?;
+                    // 与 Linux 语义一致：mlock_vma_pages_range 不会失败（void 函数）
+                    let _ = vma.mlock_vma_pages_range(&mapper, lock_start, lock_end, true);
                 }
             }
         }
@@ -1473,28 +1474,7 @@ impl InnerAddressSpace {
                 let unlock_end = core::cmp::min(vma_end, end);
 
                 // 解锁该范围内的已映射页面
-                match vma.mlock_vma_pages_range(&mapper, unlock_start, unlock_end, false) {
-                    Ok(unlocked_count) => {
-                        // if unlocked_count > 0 {
-                        //     log::debug!(
-                        //         "munlock: unlocked {} pages in VMA [{:#x}:{:#x}]",
-                        //         unlocked_count,
-                        //         unlock_start.data(),
-                        //         unlock_end.data()
-                        //     );
-                        // }
-                    }
-                    Err(e) => {
-                        // 解锁失败通常不会导致严重问题，记录警告即可
-                        // log::warn!(
-                        //     "munlock: partial failure when unlocking pages in VMA [{:#x}:{:#x}]: {:?}",
-                        //     unlock_start.data(),
-                        //     unlock_end.data(),
-                        //     e
-                        // );
-                    }
-                }
-
+                vma.mlock_vma_pages_range(&mapper, unlock_start, unlock_end, false);
                 // 清除 VMA 的锁定标志
                 let mut guard = vma.lock_irqsave();
                 let current_flags = *guard.vm_flags();
@@ -1578,26 +1558,7 @@ impl InnerAddressSpace {
                 unsafe {
                     let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
                     for (vma, start, end) in vmas_to_lock {
-                        match vma.mlock_vma_pages_range(&mapper, start, end, true) {
-                            Ok(locked_count) => {
-                                // if locked_count > 0 {
-                                //     log::debug!(
-                                //         "mlockall: locked {} pages in VMA [{:#x}:{:#x}]",
-                                //         locked_count,
-                                //         start.data(),
-                                //         end.data()
-                                //     );
-                                // }
-                            }
-                            Err(e) => {
-                                // log::warn!(
-                                //     "mlockall: partial failure when locking pages in VMA [{:#x}:{:#x}]: {:?}",
-                                //     start.data(),
-                                //     end.data(),
-                                //     e
-                                // );
-                            }
-                        }
+                        vma.mlock_vma_pages_range(&mapper, start, end, true);      
                     }
                 }
             }
@@ -1635,26 +1596,28 @@ impl InnerAddressSpace {
 
             // 先解锁所有页面
             for (vma, start, end) in &vmas_to_unlock {
-                match vma.mlock_vma_pages_range(&mapper, *start, *end, false) {
-                    Ok(unlocked_count) => {
-                        // if unlocked_count > 0 {
-                        //     log::debug!(
-                        //         "munlockall: unlocked {} pages in VMA [{:#x}:{:#x}]",
-                        //         unlocked_count,
-                        //         start.data(),
-                        //         end.data()
-                        //     );
-                        // }
-                    }
-                    Err(e) => {
-                        // log::warn!(
-                        //     "munlockall: partial failure when unlocking pages in VMA [{:#x}:{:#x}]: {:?}",
-                        //     start.data(),
-                        //     end.data(),
-                        //     e
-                        // );
-                    }
-                }
+                // match vma.mlock_vma_pages_range(&mapper, *start, *end, false) {
+                //     Ok(unlocked_count) => {
+                //         if unlocked_count > 0 {
+                //             log::debug!(
+                //                 "munlockall: unlocked {} pages in VMA [{:#x}:{:#x}]",
+                //                 unlocked_count,
+                //                 start.data(),
+                //                 end.data()
+                //             );
+                //         }
+                //     }
+                //     Err(e) => {
+                //         log::warn!(
+                //             "munlockall: partial failure when unlocking pages in VMA [{:#x}:{:#x}]: {:?}",
+                //             start.data(),
+                //             end.data(),
+                //             e
+                //         );
+                //     }
+                // }
+                // 与 Linux 语义一致：mlock_vma_pages_range 不会失败（void 函数）
+                let _ = vma.mlock_vma_pages_range(&mapper, *start, *end, false);
             }
         }
 

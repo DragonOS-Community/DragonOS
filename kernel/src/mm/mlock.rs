@@ -28,12 +28,11 @@
 //! - LRU 链表管理：将锁定的页面移到不可换出 LRU
 
 use alloc::sync::Arc;
-use system_error::SystemError;
 
 use crate::{
     arch::{mm::PageMapper, MMArch},
     mm::{
-        page::{page_manager_lock_irqsave, Page, PageFlags},
+        page::{page_manager_lock_irqsave, Page},
         ucontext::LockedVMA,
         MemoryManagementArch, PhysAddr, VirtAddr,
     },
@@ -124,6 +123,11 @@ impl LockedVMA {
     /// 遍历指定地址范围内的所有已映射页面，对每个页面调用相应的锁定/解锁函数。
     /// 未映射的页面将被跳过（与 Linux 语义一致）。
     ///
+    /// # Linux 参考实现
+    ///
+    /// 基于 Linux 6.6.21 mm/mlock.c:mlock_vma_pages_range()
+    /// 该函数为 void 函数，不返回错误。walk_page_range 的返回值被忽略。
+    ///
     /// # 参数
     ///
     /// - `mapper`: 页表映射器
@@ -133,21 +137,25 @@ impl LockedVMA {
     ///
     /// # 返回
     ///
-    /// 返回已处理的页面数
+    /// 返回已处理的页面数（不会失败，与 Linux 语义一致）
     pub fn mlock_vma_pages_range(
         &self,
         mapper: &PageMapper,
         start_addr: VirtAddr,
         end_addr: VirtAddr,
         lock: bool,
-    ) -> Result<usize, SystemError> {
-        let page_count = Self::mlock_walk_page_range(mapper, start_addr, end_addr, 3, lock)?;
-        Ok(page_count)
+    ) -> usize {
+        Self::mlock_walk_page_range(mapper, start_addr, end_addr, 3, lock)
     }
 
     /// 递归遍历页表，对范围内的页面应用锁定/解锁操作
     ///
     /// 支持多级页表和大页处理。对于大页（huge page），会遍历其中的每个 4K 子页。
+    ///
+    /// # Linux 参考实现
+    ///
+    /// 基于 Linux 6.6.21 mm/mlock.c:mlock_pte_range()
+    /// 该函数总是返回 0，不返回错误。
     ///
     /// # 参数
     ///
@@ -159,14 +167,14 @@ impl LockedVMA {
     ///
     /// # 返回
     ///
-    /// 返回已处理的页面数
+    /// 返回已处理的页面数（不会失败，与 Linux 语义一致）
     fn mlock_walk_page_range(
         mapper: &PageMapper,
         start_addr: VirtAddr,
         end_addr: VirtAddr,
         level: usize,
         lock: bool,
-    ) -> Result<usize, SystemError> {
+    ) -> usize {
         let mut page_count = 0;
         let mut start = start_addr;
 
@@ -196,7 +204,7 @@ impl LockedVMA {
                             let sub_page_paddr = PhysAddr::new(
                                 base_paddr.data() + offset_in_entry + i * MMArch::PAGE_SIZE,
                             );
-                            if Self::mlock_phys_page(sub_page_paddr, lock)? {
+                            if Self::mlock_phys_page(sub_page_paddr, lock) {
                                 page_count += 1;
                             }
                         }
@@ -204,13 +212,13 @@ impl LockedVMA {
                 } else if level > 0 {
                     // 递归处理下一级页表
                     let sub_pages =
-                        Self::mlock_walk_page_range(mapper, start, next, level - 1, lock)?;
+                        Self::mlock_walk_page_range(mapper, start, next, level - 1, lock);
                     page_count += sub_pages;
                 } else {
                     // 叶子节点（4K 页）：显式检查 present
                     if entry.present() {
                         let paddr = entry.address().unwrap(); // 安全 unwrap
-                        if Self::mlock_phys_page(paddr, lock)? {
+                        if Self::mlock_phys_page(paddr, lock) {
                             page_count += 1;
                         }
                     }
@@ -220,10 +228,15 @@ impl LockedVMA {
 
             start = next;
         }
-        Ok(page_count)
+        page_count
     }
 
     /// 对物理页面应用锁定/解锁操作
+    ///
+    /// # Linux 参考实现
+    ///
+    /// 基于 Linux 6.6.21 mm/mlock.c:mlock_folio()/munlock_folio()
+    /// 这些函数为 void 函数，不会失败。
     ///
     /// # 参数
     ///
@@ -232,9 +245,9 @@ impl LockedVMA {
     ///
     /// # 返回
     ///
-    /// - `Ok(true)`: 成功处理了页面
-    /// - `Ok(false)`: 页面不存在于页面管理器中
-    fn mlock_phys_page(paddr: PhysAddr, lock: bool) -> Result<bool, SystemError> {
+    /// - `true`: 成功处理了页面
+    /// - `false`: 页面不存在于页面管理器中
+    fn mlock_phys_page(paddr: PhysAddr, lock: bool) -> bool {
         let mut page_manager_guard = page_manager_lock_irqsave();
         if let Some(page) = page_manager_guard.get(&paddr) {
             drop(page_manager_guard);
@@ -246,8 +259,8 @@ impl LockedVMA {
                 munlock_page(&page);
             }
 
-            return Ok(true);
+            return true;
         }
-        Ok(false)
+        false
     }
 }

@@ -1,9 +1,7 @@
 use crate::filesystem::epoll::EPollEventType;
+use crate::libs::rwsem::RwSem;
 use crate::process::namespace::net_namespace::NetNamespace;
-use crate::{
-    libs::{rwlock::RwLock, wait_queue::WaitQueue},
-    net::socket::PMSG,
-};
+use crate::{libs::wait_queue::WaitQueue, net::socket::PMSG};
 use alloc::fmt::Debug;
 use alloc::sync::Arc;
 use core::panic;
@@ -162,7 +160,7 @@ where
 }
 
 pub fn select_remote_and_bind<UnboundSocket, BoundSocket, B, F, R>(
-    inner_lock: &RwLock<Inner<UnboundSocket, BoundSocket>>,
+    inner_lock: &RwSem<Inner<UnboundSocket, BoundSocket>>,
     remote: Option<UnboundSocket::Endpoint>,
     bind_ephemeral: B,
     op: F,

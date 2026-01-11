@@ -795,12 +795,7 @@ impl File {
 
             for index in start_page..=end_page {
                 match page_cache_guard.get_page(index) {
-                    Some(page)
-                        if page
-                            .read()
-                            .flags()
-                            .contains(PageFlags::PG_READAHEAD) =>
-                    {
+                    Some(page) if page.read().flags().contains(PageFlags::PG_READAHEAD) => {
                         async_trigger_page = Some((index, page.clone()));
                         break;
                     }

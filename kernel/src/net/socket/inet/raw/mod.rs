@@ -8,8 +8,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize};
 use smoltcp::wire::{IpProtocol, IpVersion};
 
 use crate::filesystem::vfs::{fasync::FAsyncItems, InodeId};
-use crate::libs::rwlock::RwLock;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::mutex::Mutex;
+use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -50,9 +50,9 @@ pub use options::{Icmp6Filter, IcmpFilter, RawSocketOptions};
 #[derive(Debug)]
 pub struct RawSocket {
     /// 内部状态
-    inner: RwLock<Option<RawInner>>,
+    inner: RwSem<Option<RawInner>>,
     /// socket 选项
-    options: RwLock<options::RawSocketOptions>,
+    options: RwSem<options::RawSocketOptions>,
     /// 非阻塞标志
     nonblock: AtomicBool,
     /// 等待队列
@@ -75,5 +75,5 @@ pub struct RawSocket {
     protocol: IpProtocol,
 
     /// 回环快速路径：用于保留 TOS/TCLASS 等字段且实现 SO_RCVBUF 行为。
-    loopback_rx: SpinLock<LoopbackRxQueue>,
+    loopback_rx: Mutex<LoopbackRxQueue>,
 }

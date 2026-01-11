@@ -2,7 +2,7 @@ use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
     libs::mutex::Mutex,
-    libs::rwlock::RwLock,
+    libs::rwsem::RwSem,
     net::socket::{self, *},
 };
 use crate::{
@@ -84,7 +84,7 @@ fn ring_cap_for_effective_sockbuf(effective: usize) -> usize {
 #[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct UnixStreamSocket {
-    inner: RwLock<Option<Inner>>,
+    inner: RwSem<Option<Inner>>,
     //todo options
     epitems: EPollItems,
     fasync_items: FAsyncItems,
@@ -130,7 +130,7 @@ impl UnixStreamSocket {
         netns: Arc<NetNamespace>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|self_weak| Self {
-            inner: RwLock::new(Some(Inner::Init(init))),
+            inner: RwSem::new(Some(Inner::Init(init))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
@@ -160,7 +160,7 @@ impl UnixStreamSocket {
         netns: Arc<NetNamespace>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|self_weak| Self {
-            inner: RwLock::new(Some(Inner::Connected(connected))),
+            inner: RwSem::new(Some(Inner::Connected(connected))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),

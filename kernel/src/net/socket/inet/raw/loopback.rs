@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::namespace::NamespaceOps;
 use crate::process::ProcessState;
@@ -35,8 +35,8 @@ pub(super) struct LoopbackRxQueue {
 
 lazy_static! {
     /// 同一 netns 下的 raw socket 列表（用于 loopback 快速路径广播投递）。
-    static ref RAW_SOCKET_REGISTRY: RwLock<BTreeMap<usize, Vec<Weak<RawSocket>>>> =
-        RwLock::new(BTreeMap::new());
+    static ref RAW_SOCKET_REGISTRY: RwSem<BTreeMap<usize, Vec<Weak<RawSocket>>>> =
+        RwSem::new(BTreeMap::new());
 }
 
 pub(super) fn register_raw_socket(sock: &Arc<RawSocket>) {
@@ -187,7 +187,7 @@ pub(super) fn deliver_loopback_packet(ctx: &LoopbackDeliverContext) {
         // SO_RCVBUF：投递/丢弃语义
         let rcvbuf = s.options.read().sock_rcvbuf as usize;
         let enqueued = {
-            let mut q = s.loopback_rx.lock_irqsave();
+            let mut q = s.loopback_rx.lock();
             let can_enqueue = if q.bytes == 0 {
                 // Linux/Netstack：当接收队列为空时，允许接收一个超过 rcvbuf 的 dgram
                 true

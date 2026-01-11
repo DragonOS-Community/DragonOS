@@ -4,6 +4,8 @@ use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
 use crate::filesystem::vfs::vcore::generate_inode_id;
+use crate::libs::mutex::Mutex;
+use crate::libs::rwsem::RwSem;
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::Socket;
 use crate::process::cred::CAPFlags;
@@ -69,8 +71,8 @@ impl RawSocket {
         };
 
         let sock = Arc::new_cyclic(|me| Self {
-            inner: crate::libs::rwlock::RwLock::new(Some(initial_inner)),
-            options: crate::libs::rwlock::RwLock::new(options),
+            inner: RwSem::new(Some(initial_inner)),
+            options: RwSem::new(options),
             nonblock: core::sync::atomic::AtomicBool::new(nonblock),
             wait_queue: crate::libs::wait_queue::WaitQueue::default(),
             inode_id: generate_inode_id(),
@@ -81,9 +83,7 @@ impl RawSocket {
             fasync_items: crate::filesystem::vfs::fasync::FAsyncItems::default(),
             ip_version,
             protocol,
-            loopback_rx: crate::libs::spinlock::SpinLock::new(
-                super::loopback::LoopbackRxQueue::default(),
-            ),
+            loopback_rx: Mutex::new(super::loopback::LoopbackRxQueue::default()),
         });
 
         // Linux 语义：raw socket 未 bind 也应能被 poll/epoll 正确唤醒。

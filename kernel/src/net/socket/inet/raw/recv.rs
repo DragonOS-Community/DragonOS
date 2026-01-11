@@ -55,7 +55,7 @@ impl RawSocket {
     ) -> Result<(usize, smoltcp::wire::IpAddress), SystemError> {
         // 先消费回环注入队列（保留原始头字段，并实现 SO_RCVBUF 语义）。
         if let Some(pkt) = {
-            let mut q = self.loopback_rx.lock_irqsave();
+            let mut q = self.loopback_rx.lock();
             let pkt = q.pkts.pop_front();
             if let Some(ref p) = pkt {
                 q.bytes = q.bytes.saturating_sub(loopback_rx_mem_cost(p.len()));

@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_TEE;
+use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::{file::File, syscall::SpliceFlags, FileType};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::libs::casting::DowncastArc;
@@ -50,6 +51,13 @@ impl Syscall for SysTeeHandle {
 
         if !is_pipe(&file_in) || !is_pipe(&file_out) {
             return Err(SystemError::EINVAL);
+        }
+
+        if !file_in.mode().contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EBADF);
+        }
+        if !file_out.mode().contains(FileMode::FMODE_WRITE) {
+            return Err(SystemError::EBADF);
         }
 
         // Linux: inherit O_NONBLOCK from file descriptors.

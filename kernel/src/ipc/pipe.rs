@@ -120,6 +120,7 @@ pub struct InnerPipeInode {
     valid_cnt: i32,
     read_pos: i32,
     write_pos: i32,
+    splice_hold: usize,
     /// 管道缓冲区数据（使用 Vec 支持动态大小）
     data: Vec<u8>,
     /// 当前缓冲区大小
@@ -324,6 +325,7 @@ impl LockedPipeInode {
             valid_cnt: 0,
             read_pos: 0,
             write_pos: 0,
+            splice_hold: 0,
             had_reader: false,
             data: Vec::new(), // 延迟分配：初始为空，第一次写入时分配
             buf_size: PIPE_BUFF_SIZE,
@@ -383,7 +385,10 @@ impl LockedPipeInode {
 
     fn readable(&self) -> bool {
         let inode = self.inner.lock();
-        return inode.valid_cnt > 0 || inode.writer == 0;
+        if inode.valid_cnt == 0 {
+            return inode.writer == 0;
+        }
+        inode.splice_hold == 0
     }
 
     fn writeable(&self) -> bool {
@@ -512,6 +517,9 @@ impl LockedPipeInode {
     /// 当前管道中可读的字节数（不阻塞、不睡眠）
     pub fn readable_len(&self) -> usize {
         let guard = self.inner.lock();
+        if guard.splice_hold > 0 {
+            return 0;
+        }
         guard.valid_cnt.max(0) as usize
     }
 
@@ -566,11 +574,7 @@ impl LockedPipeInode {
         num
     }
 
-    /// splice helper: 在需要时阻塞等待并读取 pipe 数据，同时消耗数据。
-    ///
-    /// - 若 pipe 为空且无 writers：返回 0 (EOF)
-    /// - 若 pipe 为空且有 writers：nonblock 返回 EAGAIN，否则阻塞直到可读或被信号打断
-    pub(crate) fn read_into_from_blocking(
+    pub(crate) fn splice_peek_hold_from_blocking(
         &self,
         len: usize,
         buf: &mut [u8],
@@ -585,7 +589,21 @@ impl LockedPipeInode {
                 if nonblock {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
+                drop(guard);
+                let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
+                if r.is_err() {
+                    ProcessManager::current_pcb()
+                        .flags()
+                        .insert(ProcessFlags::HAS_PENDING_SIGNAL);
+                    return Err(SystemError::ERESTARTSYS);
+                }
+                continue;
+            }
 
+            if guard.splice_hold > 0 {
+                if nonblock {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
                 drop(guard);
                 let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
                 if r.is_err() {
@@ -614,20 +632,35 @@ impl LockedPipeInode {
                 buf[first..num].copy_from_slice(&guard.data[0..second]);
             }
 
-            guard.read_pos = (guard.read_pos + num as i32) % buf_size as i32;
-            guard.valid_cnt -= num as i32;
-
-            if guard.valid_cnt > 0 {
-                self.read_wait_queue
-                    .wakeup(Some(ProcessState::Blocked(true)));
-            }
-            self.write_wait_queue
-                .wakeup(Some(ProcessState::Blocked(true)));
-            let pollflag = guard.poll_both_ends();
-            drop(guard);
-            let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+            guard.splice_hold = num;
             return Ok(num);
         }
+    }
+
+    pub(crate) fn splice_finish_hold(&self, consumed: usize) {
+        let mut guard = self.inner.lock();
+        let held = guard.splice_hold;
+        if held == 0 {
+            return;
+        }
+
+        let consume = consumed.min(held);
+        if consume > 0 {
+            let buf_size = guard.buf_size;
+            guard.read_pos = (guard.read_pos + consume as i32) % buf_size as i32;
+            guard.valid_cnt -= consume as i32;
+        }
+        guard.splice_hold = 0;
+
+        if guard.valid_cnt > 0 || guard.writer == 0 {
+            self.read_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
+        }
+        self.write_wait_queue
+            .wakeup(Some(ProcessState::Blocked(true)));
+        let pollflag = guard.poll_both_ends();
+        drop(guard);
+        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
     }
 
     /// Helper: Wait until the pipe is readable (has data).
@@ -637,11 +670,19 @@ impl LockedPipeInode {
     /// - Err(e): Interrupted or EAGAIN.
     fn wait_readable(&self, nonblock: bool) -> Result<bool, SystemError> {
         loop {
-            let avail = self.readable_len();
-            if avail > 0 {
+            let (avail, has_writer, held) = {
+                let guard = self.inner.lock();
+                (
+                    guard.valid_cnt.max(0) as usize,
+                    guard.writer > 0,
+                    guard.splice_hold > 0,
+                )
+            };
+
+            if avail > 0 && !held {
                 return Ok(true);
             }
-            if !self.has_writers() {
+            if avail == 0 && !has_writer {
                 return Ok(false);
             }
             if nonblock {
@@ -985,23 +1026,21 @@ impl IndexNode for LockedPipeInode {
         // 加锁
         let mut inner_guard = self.inner.lock();
 
-        // 如果管道里面没有数据，则唤醒写端，
-        while inner_guard.valid_cnt == 0 {
-            // 如果当前管道写者数为0，则返回EOF
-            if inner_guard.writer == 0 {
+        while inner_guard.valid_cnt == 0 || inner_guard.splice_hold > 0 {
+            if inner_guard.valid_cnt == 0 && inner_guard.writer == 0 {
                 return Ok(0);
             }
 
-            self.write_wait_queue
-                .wakeup(Some(ProcessState::Blocked(true)));
+            if inner_guard.valid_cnt == 0 {
+                self.write_wait_queue
+                    .wakeup(Some(ProcessState::Blocked(true)));
+            }
 
-            // 如果为非阻塞管道，直接返回错误
             if flags.contains(FileFlags::O_NONBLOCK) {
                 drop(inner_guard);
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
 
-            // 否则在读等待队列中睡眠，并释放锁
             drop(inner_guard);
             let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
             if r.is_err() {

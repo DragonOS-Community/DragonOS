@@ -1,4 +1,5 @@
 use crate::arch::syscall::nr::SYS_SPLICE;
+use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::FileFlags;
 use crate::filesystem::vfs::{file::File, syscall::SpliceFlags, FileType};
 use crate::ipc::kill::send_signal_to_pid;
@@ -68,6 +69,13 @@ impl Syscall for SysSpliceHandle {
                 .ok_or(SystemError::EBADF)?;
             (file_in.clone(), file_out.clone())
         };
+
+        if !file_in.mode().contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EBADF);
+        }
+        if !file_out.mode().contains(FileMode::FMODE_WRITE) {
+            return Err(SystemError::EBADF);
+        }
 
         // 判断文件类型
         let in_is_pipe = is_pipe(&file_in);
@@ -334,26 +342,33 @@ fn splice_pipe_to_file(
         }
     }
 
+    if allowed_len == 0 {
+        return Ok(0);
+    }
+
     let buf_size = allowed_len.min(4096);
     let mut buffer = vec![0u8; buf_size];
 
-    // Read (consume) from pipe to avoid TOCTOU with concurrent readers.
-    let read = pipe_inode.read_into_from_blocking(buf_size, &mut buffer, nonblock)?;
+    let read = pipe_inode.splice_peek_hold_from_blocking(buf_size, &mut buffer, nonblock)?;
     if read == 0 {
         return Ok(0);
     }
 
-    let written = if let Some(off) = offset {
-        file.pwrite(off, read, &buffer[..read])
-    } else {
-        file.write(read, &buffer[..read])
-    }?;
+    let written = match (offset, file.file_type()) {
+        (Some(off), _) => file.pwrite(off, read, &buffer[..read]),
+        (None, _) => file.write(read, &buffer[..read]),
+    };
 
-    if written == 0 {
-        return Ok(0);
+    match written {
+        Ok(written) => {
+            pipe_inode.splice_finish_hold(written);
+            Ok(written)
+        }
+        Err(e) => {
+            pipe_inode.splice_finish_hold(0);
+            Err(e)
+        }
     }
-
-    Ok(written)
 }
 
 syscall_table_macros::declare_syscall!(SYS_SPLICE, SysSpliceHandle);

@@ -1558,7 +1558,7 @@ impl InnerAddressSpace {
                 unsafe {
                     let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
                     for (vma, start, end) in vmas_to_lock {
-                        vma.mlock_vma_pages_range(&mapper, start, end, true);      
+                        vma.mlock_vma_pages_range(&mapper, start, end, true);
                     }
                 }
             }

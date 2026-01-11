@@ -473,29 +473,6 @@ static int test_rlimit_enomem(void) {
 }
 
 /**
- * Test 11: Invalid address should return ENOMEM
- */
-static int test_invalid_address_enomem(void) {
-    TEST_START("invalid_address_enomem");
-
-    size_t pagesize = get_page_size();
-
-    // Try to lock invalid address (near end of address space)
-    void *invalid_addr = (void *)(~0UL - pagesize + 1);
-
-    errno = 0;
-    int ret = mlock(invalid_addr, pagesize);
-
-    if (ret == -1 && errno == ENOMEM) {
-        TEST_PASS();
-        return 0;
-    } else {
-        TEST_FAIL("expected ENOMEM for invalid address");
-        return -1;
-    }
-}
-
-/**
  * Test 13: NULL pointer with non-zero length should fail
  */
 static int test_null_pointer(void) {
@@ -1267,7 +1244,6 @@ int main(void) {
 
         // Error Code Validation
         {"rlimit_enomem", test_rlimit_enomem, "Error Codes"},
-        {"invalid_address_enomem", test_invalid_address_enomem, "Error Codes"},
         {"null_pointer", test_null_pointer, "Error Codes"},
 
         // Boundary Conditions

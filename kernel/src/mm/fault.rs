@@ -288,8 +288,7 @@ impl PageFaultHandler {
         // Fallback: private anonymous page (MAP_PRIVATE or non-shared anon)
         let guard = vma.lock_irqsave();
         let flags = guard.flags();
-        let should_lock = guard.vm_flags()
-            .contains(VmFlags::VM_LOCKONFAULT);
+        let should_lock = guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);
         drop(guard);
         if let Some(flush) = mapper.map(address, flags) {
             flush.flush();

@@ -205,8 +205,6 @@ impl Syscall for SysKillHandle {
         let id = Self::pid(args);
         let sig_c_int = Self::sig(args);
 
-        let current_pcb = ProcessManager::current_pcb();
-
         let converter = PidConverter::from_id(id).ok_or(SystemError::ESRCH)?;
 
         // Handle null signal (signal 0) - used for existence and permission checks

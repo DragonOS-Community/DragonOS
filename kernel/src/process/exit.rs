@@ -732,7 +732,7 @@ fn do_waitpid(
             // 这是 ptrace 专用的停止状态，总是报告给 tracer
             // 提取实际的信号编号 (低 8 位 & 0x7f)
             let actual_sig = stopsig & 0x7f;
-            if actual_sig <= 0 || actual_sig >= Signal::SIGRTMAX.into() {
+            if actual_sig >= Signal::SIGRTMAX.into() {
                 return Some(Err(SystemError::EINVAL));
             }
             // TracedStopped 状态总是被 ptrace，所以总是报告停止状态

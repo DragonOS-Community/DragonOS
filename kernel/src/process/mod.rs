@@ -870,20 +870,20 @@ impl ProcessState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum PtraceRequest {
-    PtraceTraceme = 0,
-    PtracePeekdata = 2,
-    PtracePeekuser = 3,
-    PtracePokedata = 5,
-    PtraceCont = 7,
-    PtraceSinglestep = 9,
-    PtraceGetregs = 12,
-    PtraceSetregs = 13,
-    PtraceAttach = 16,
-    PtraceDetach = 17,
-    PtraceSyscall = 24,
-    PtraceSetoptions = 0x4200,
-    PtraceGetsiginfo = 0x4202,
-    PtraceSeize = 0x4206, // 现代 API，不发送 SIGSTOP
+    Traceme = 0,
+    Peekdata = 2,
+    Peekuser = 3,
+    Pokedata = 5,
+    Cont = 7,
+    Singlestep = 9,
+    Getregs = 12,
+    Setregs = 13,
+    Attach = 16,
+    Detach = 17,
+    Syscall = 24,
+    Setoptions = 0x4200,
+    Getsiginfo = 0x4202,
+    Seize = 0x4206, // 现代 API，不发送 SIGSTOP
 }
 
 bitflags! {
@@ -943,7 +943,24 @@ bitflags! {
 }
 
 impl ProcessFlags {
+    /// 获取需要在系统调用返回到用户态前处理的工作标志
+    ///
+    /// 按照 Linux 6.6.21 的 _TIF_WORK_MASK 语义：
+    /// - TIF_SIGPENDING (HAS_PENDING_SIGNAL): 有待处理的信号
+    /// - TIF_NEED_RESCHED (NEED_SCHEDULE): 需要调度
+    /// - TIF_NOTIFY_RESUME (NEED_RSEQ): 需要处理 rseq
     pub const fn exit_to_user_mode_work(&self) -> Self {
+        Self::from_bits_truncate(
+            self.bits
+                & (Self::HAS_PENDING_SIGNAL.bits | Self::NEED_SCHEDULE.bits | Self::NEED_RSEQ.bits),
+        )
+    }
+
+    /// 获取需要在中断返回到用户态前处理的工作标志
+    ///
+    /// 中断返回路径不需要检查 NEED_SCHEDULE，因为调度在其他地方处理
+    #[allow(dead_code)]
+    pub const fn exit_to_user_mode_work_irq(&self) -> Self {
         Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits))
     }
 
@@ -1057,12 +1074,13 @@ pub enum PtraceEvent {
 
 /// 进程被跟踪的状态信息
 #[derive(Debug)]
-struct PtraceState {
+pub struct PtraceState {
     /// 跟踪此进程的进程PID
     tracer: Option<RawPid>,
     /// 挂起的信号（等待调试器处理）
     pending_signals: Vec<Signal>,
-    stop_reason: PtraceStopReason,
+    /// 停止原因（公开，以便在 syscall_handler 中设置）
+    pub stop_reason: PtraceStopReason,
     /// ptrace选项位
     options: PtraceOptions,
     /// 停止状态的状态字
@@ -1071,10 +1089,6 @@ struct PtraceState {
     event_message: usize,
     /// tracer 注入的信号（在 ptrace_stop 返回后要处理的信号）
     injected_signal: Signal,
-    /// 是否需要在系统调用入口停止（用于 PTRACE_SYSCALL）
-    /// true: 需要在系统调用入口停止
-    /// false: 已经完成入口停止，应该执行系统调用
-    needs_syscall_entry_stop: bool,
 }
 
 impl Default for PtraceState {
@@ -1087,7 +1101,6 @@ impl Default for PtraceState {
             exit_code: 0,
             event_message: 0,
             injected_signal: Signal::INVALID,
-            needs_syscall_entry_stop: true, // 默认需要在入口停止
         }
     }
 }
@@ -1101,7 +1114,6 @@ impl PtraceState {
             exit_code: 0,
             event_message: 0,
             injected_signal: Signal::INVALID,
-            needs_syscall_entry_stop: true, // 默认需要在入口停止
         }
     }
 
@@ -1974,12 +1986,6 @@ impl ProcessControlBlock {
         self.ptrace_state.lock()
     }
 
-    /// 设置是否需要在系统调用入口停止
-    #[inline]
-    pub fn set_needs_syscall_entry_stop(&self, value: bool) {
-        self.ptrace_state.lock().needs_syscall_entry_stop = value;
-    }
-
     /// 唤醒进程（用于子进程退出时唤醒父进程）
     ///
     /// 当子进程退出时，需要唤醒父进程，即使父进程不在 wait() 中睡眠
@@ -1987,12 +1993,6 @@ impl ProcessControlBlock {
     #[inline]
     pub fn wake_up_process(&self) {
         signal_wake_up(self.self_ref.upgrade().unwrap(), false);
-    }
-
-    /// 获取是否需要在系统调用入口停止
-    #[inline]
-    pub fn needs_syscall_entry_stop(&self) -> bool {
-        self.ptrace_state.lock().needs_syscall_entry_stop
     }
 
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<'_, ProcessSignalInfo>> {

@@ -592,7 +592,6 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let pcb = ProcessManager::current_pcb();
 
     let siginfo = pcb.try_siginfo_irqsave(5);
-
     if unlikely(siginfo.is_none()) {
         return;
     }
@@ -621,14 +620,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
 
     let mut siginfo_mut_guard = siginfo_mut.unwrap();
 
-    // 按照 Linux 6.6.21 kernel/signal.c::get_signal 的语义：
-    //
-    // 1. 先检查 ptrace 拦截（所有信号，包括 kernel_only）
-    // 2. ptrace_signal 可以修改、取消或注入信号
-    // 3. 处理 ptrace 返回的信号（可能已被修改）
-    // 4. 最后查找 sigaction 并根据 disposition 处理
-    //
-    // 关键：ptrace 处理必须在 sigaction 查找之前完成！
+    // 循环直到取出一个有效的、需要处理的信号，或者队列为空
     loop {
         (sig, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
 
@@ -637,21 +629,14 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             return;
         }
 
-        // ===== 第一步：ptrace 拦截（所有信号统一处理） =====
-        // 按照 Linux 6.6.21：不管是 kernel_only 还是普通信号，
-        // 都先通过 ptrace_signal 让 tracer 决定如何处理
+        // 只要进程处于 PTRACED 状态，都必须先通知 Tracer
         let is_ptraced = pcb.flags().contains(ProcessFlags::PTRACED);
         if is_ptraced {
-            // 保存 oldset，因为需要释放锁
+            // 保存 oldset，因为需要释放锁， ptrace_signal 内部会调用 schedule()
             let _oldset = *siginfo_mut_guard.sig_blocked();
-            // 释放锁，因为 ptrace_stop 内部会调用 schedule()
             drop(siginfo_mut_guard);
             CurrentIrqArch::interrupt_enable();
 
-            // ptrace_signal 会：
-            // 1. 调用 ptrace_stop 停止进程
-            // 2. 等待 tracer 的指令
-            // 3. 返回 Some(新信号) 或 None(取消)
             let result = ptrace_signal(&pcb, sig, &mut info);
 
             // 重新获取锁以继续处理
@@ -665,30 +650,29 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
                 Some(new_sig) => {
                     // tracer 注入了新信号，继续处理
                     sig = new_sig;
-                    // 注意：不 continue，需要对新信号查找 sigaction
                 }
                 None => {
-                    // tracer 取消了信号，继续下一个信号
+                    // tracer 忽略了信号，继续下一个信号
                     continue;
                 }
             }
         }
 
-        // ===== 第二步：处理 kernel_only 信号（SIGKILL/SIGSTOP） =====
-        // 只有在非 ptrace 或 ptrace 返回了信号时才到这里
+        // 只有在非 ptrace 状态，或 ptrace 返回了信号且该信号是 kernel_only 时才进入。
         if sig.kernel_only() {
-            // kernel_only 信号使用默认处理
             let _oldset = *siginfo_mut_guard.sig_blocked();
             drop(siginfo_mut_guard);
             drop(pcb);
             CurrentIrqArch::interrupt_enable();
+            // kernel_only 信号使用默认处理
             sig.handle_default();
+            // 注意：如果是 SIGSTOP，进程被唤醒后在 Linux 中通常会跳转回循环开头重新检查 pending 信号。
+            // 这里直接 return，依靠下一次中断返回路径再次进入 do_signal 来处理后续信号。
             return;
         }
 
-        // ===== 第三步：查找 sigaction（普通信号） =====
+        // 查找普通信号的 sigaction
         let sa = pcb.sighand().handler(sig).unwrap();
-
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
                 SaHandlerType::Error => {
@@ -706,6 +690,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             SigactionType::SaSigaction(_) => todo!(),
         }
 
+        // Init 进程保护机制
         /*
          * Global init gets no signals it doesn't want.
          * Container-init gets no signals it doesn't want from same
@@ -744,9 +729,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let res: Result<i32, SystemError> =
         handle_signal(sig, &mut sigaction, &info.unwrap(), &oldset, frame);
 
-    // 只有当信号帧真正被设置时（即自定义处理器），才设置 got_signal = true
-    // 对于默认动作的信号（如 SIGCONT），handle_signal 会调用 handle_default() 并返回 Ok(0)，
-    // 不会设置信号帧。在这种情况下，应该允许系统调用重启。
+    // 更新 got_signal 状态
+    // 只有当信号帧真正被设置时（即自定义处理器），才设置 got_signal = true ，系统调用被中断且被处理，不自动重启
     if res.is_ok() {
         match sigaction.action() {
             SigactionType::SaHandler(SaHandlerType::Customized(_)) => {
@@ -804,6 +788,7 @@ fn try_restart_syscall(frame: &mut TrapFrame) {
         }
         _ => {}
     }
+    log::debug!("try restart syscall: {:?}", restart);
 }
 
 pub struct X86_64SignalArch;

@@ -17,9 +17,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use system_error::SystemError;
 
 use crate::{
-    arch::cpu::current_cpu_id,
-    mm::VirtAddr,
+    arch::{cpu::current_cpu_id, ipc::signal::Signal, MMArch},
+    ipc::kill::send_signal_to_pcb,
+    mm::{MemoryManagementArch, VirtAddr},
     process::{ProcessControlBlock, ProcessFlags, ProcessManager},
+    syscall::user_access::{copy_from_user_protected, copy_to_user_protected},
 };
 
 // ============================================================================
@@ -205,7 +207,7 @@ impl UserRseqAccess {
     /// 读取 u32 值
     unsafe fn read_u32(&self, offset: usize) -> Result<u32, RseqError> {
         let mut bytes = [0u8; 4];
-        crate::syscall::user_access::copy_from_user_protected(&mut bytes, self.base + offset)
+        copy_from_user_protected(&mut bytes, self.base + offset)
             .map_err(|_| RseqError::UserAccessFault)?;
         Ok(u32::from_ne_bytes(bytes))
     }
@@ -213,28 +215,22 @@ impl UserRseqAccess {
     /// 读取 u64 值
     unsafe fn read_u64(&self, offset: usize) -> Result<u64, RseqError> {
         let mut bytes = [0u8; 8];
-        crate::syscall::user_access::copy_from_user_protected(&mut bytes, self.base + offset)
+        copy_from_user_protected(&mut bytes, self.base + offset)
             .map_err(|_| RseqError::UserAccessFault)?;
         Ok(u64::from_ne_bytes(bytes))
     }
 
     /// 写入 u32 值
     unsafe fn write_u32(&self, offset: usize, value: u32) -> Result<(), RseqError> {
-        crate::syscall::user_access::copy_to_user_protected(
-            self.base + offset,
-            &value.to_ne_bytes(),
-        )
-        .map_err(|_| RseqError::UserAccessFault)?;
+        copy_to_user_protected(self.base + offset, &value.to_ne_bytes())
+            .map_err(|_| RseqError::UserAccessFault)?;
         Ok(())
     }
 
     /// 写入 u64 值
     unsafe fn write_u64(&self, offset: usize, value: u64) -> Result<(), RseqError> {
-        crate::syscall::user_access::copy_to_user_protected(
-            self.base + offset,
-            &value.to_ne_bytes(),
-        )
-        .map_err(|_| RseqError::UserAccessFault)?;
+        copy_to_user_protected(self.base + offset, &value.to_ne_bytes())
+            .map_err(|_| RseqError::UserAccessFault)?;
         Ok(())
     }
 
@@ -271,7 +267,7 @@ impl UserRseqAccess {
         }
         let sig_addr = VirtAddr::new((rseq_cs.abort_ip - 4) as usize);
         let mut sig_bytes = [0u8; 4];
-        crate::syscall::user_access::copy_from_user_protected(&mut sig_bytes, sig_addr)
+        copy_from_user_protected(&mut sig_bytes, sig_addr)
             .map_err(|_| RseqError::UserAccessFault)?;
         let read_sig = u32::from_ne_bytes(sig_bytes);
 
@@ -385,6 +381,24 @@ impl RseqState {
         self.registration.as_ref()
     }
 
+    /// 获取当前 rseq_cs（从用户内存读取）
+    /// 用于 rseq_syscall_check：检查是否在 rseq 临界区内发起了系统调用
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须确保用户内存有效
+    pub unsafe fn get_rseq_cs(&self) -> Option<(RseqCs, u32)> {
+        let reg = self.registration.as_ref()?;
+        let access = UserRseqAccess::new(reg.ptr);
+        let user_end = MMArch::USER_END_VADDR.data();
+
+        // 读取 rseq_cs，忽略签名验证（因为在 syscall 路径中我们已经注册过）
+        match access.read_rseq_cs(reg.sig, user_end) {
+            Ok(Some(cs)) => Some((cs, reg.sig)),
+            _ => None,
+        }
+    }
+
     /// 设置事件掩码（原子操作）
     #[inline]
     pub fn set_event(&self, event: RseqEventMask) {
@@ -451,8 +465,6 @@ impl Rseq {
         rseq_len: u32,
         sig: u32,
     ) -> Result<usize, SystemError> {
-        use crate::{arch::MMArch, mm::MemoryManagementArch};
-
         let mut rseq_state = pcb.rseq_state_mut();
 
         // 检查是否已注册
@@ -546,8 +558,6 @@ impl Rseq {
     ///
     /// 在返回用户态前调用，执行 IP 修正和 cpu_id 更新
     pub fn handle_notify_resume<F: RseqTrapFrame>(frame: Option<&mut F>) -> Result<(), ()> {
-        use crate::{arch::MMArch, mm::MemoryManagementArch};
-
         let pcb = ProcessManager::current_pcb();
 
         // 如果进程正在退出，直接返回
@@ -685,12 +695,11 @@ impl Rseq {
 
     /// 在信号递送时调用
     pub fn on_signal<F: RseqTrapFrame>(frame: &mut F) {
-        use crate::arch::ipc::signal::Signal;
         let pcb = ProcessManager::current_pcb();
         if pcb.rseq_state().is_registered() {
             pcb.rseq_state().set_event(RseqEventMask::SIGNAL);
             if Self::handle_notify_resume(Some(frame)).is_err() {
-                let _ = crate::ipc::kill::send_signal_to_pcb(pcb.clone(), Signal::SIGSEGV);
+                let _ = send_signal_to_pcb(pcb.clone(), Signal::SIGSEGV);
             }
         }
     }
@@ -703,6 +712,22 @@ impl Rseq {
             pcb.rseq_state().set_event(RseqEventMask::MIGRATE);
             pcb.flags().insert(ProcessFlags::NEED_RSEQ);
         }
+    }
+
+    /// 系统调用退出时的 rseq 检查
+    /// **注意**: Linux 的 rseq_syscall 仅在 CONFIG_DEBUG_RSEQ 启用时编译，
+    /// 用于调试目的，检测在 rseq 临界区内发起系统调用的违规行为。
+    ///
+    /// 在生产环境中，此函数应为空操作。rseq 的正确性依赖于：
+    /// 此函数目前为空操作，与 Linux 生产内核行为一致。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证 frame 指向有效的 TrapFrame
+    #[inline]
+    pub unsafe fn rseq_syscall_check<F: RseqTrapFrame>(_frame: &F) {
+        // 生产环境：空操作，与 Linux 生产内核一致
+        // 若需启用调试检查，应编译时启用 DEBUG_RSEQ 特性标志
     }
 }
 

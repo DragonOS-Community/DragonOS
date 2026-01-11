@@ -1,25 +1,18 @@
-use alloc::vec::Vec;
+use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
-
-use crate::arch::MMArch;
-use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::FileType;
-use crate::filesystem::vfs::InodeMode;
-use crate::mm::access_ok;
-use crate::mm::MemoryManagementArch;
-use crate::process::pid::PidPrivateData;
-use alloc::{string::ToString, sync::Arc};
 use log::error;
 use system_error::SystemError;
 
 use crate::{
-    arch::{interrupt::TrapFrame, ipc::signal::Signal},
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, MMArch},
+    filesystem::vfs::{
+        file::{File, FileFlags, FilePrivateData},
+        FileType, InodeMode,
+    },
     ipc::signal_types::SignalFlags,
     libs::rwsem::RwSem,
-    mm::VirtAddr,
-    process::ProcessFlags,
+    mm::{access_ok, MemoryManagementArch, VirtAddr},
+    process::{pid::PidPrivateData, ProcessFlags},
     sched::{sched_cgroup_fork, sched_fork},
     smp::core::smp_get_processor_id,
     syscall::user_access::UserBufferWriter,
@@ -686,17 +679,11 @@ impl ProcessManager {
             }
         } else {
             // 新创建的进程，设置其父进程为当前进程
-            let current_pid = current_pcb.raw_pid();
-            let child_pid = pcb.raw_pid();
-
             *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
 
             // 同时设置parent_pcb（按照Linux语义，默认parent=real_parent）
             *pcb.parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
 
-            // 验证设置
-            let verify_parent = pcb.parent_pcb.read_irqsave();
-            let verify_pid = verify_parent.upgrade().map(|p| p.raw_pid());
             pcb.exit_signal
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }

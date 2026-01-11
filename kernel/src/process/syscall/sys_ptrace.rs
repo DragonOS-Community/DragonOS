@@ -1,14 +1,21 @@
-use crate::arch::interrupt::TrapFrame;
-use crate::arch::ipc::signal::Signal;
-use crate::arch::syscall::nr::{SYS_EXIT, SYS_PTRACE};
-use crate::mm::{MemoryManagementArch, PageTableKind, VirtAddr};
-use crate::process::syscall::sys_exit::SysExit;
-use crate::process::{
-    ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, PtraceOptions, PtraceRequest,
-    RawPid,
+use crate::{
+    arch::{
+        interrupt::TrapFrame,
+        ipc::signal::Signal,
+        syscall::nr::{SYS_EXIT, SYS_PTRACE},
+        CurrentIrqArch, MMArch,
+    },
+    exception::{InterruptArch, IrqFlagsGuard},
+    mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr},
+    process::{
+        syscall::sys_exit::SysExit, ProcessControlBlock, ProcessFlags, ProcessManager,
+        ProcessState, PtraceOptions, PtraceRequest, RawPid,
+    },
+    syscall::{
+        table::{FormattedSyscallParam, Syscall},
+        user_access::{copy_from_user_protected, copy_to_user_protected, UserBufferWriter},
+    },
 };
-use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::UserBufferWriter;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -96,22 +103,108 @@ impl TryFrom<usize> for PtraceRequest {
 
     fn try_from(value: usize) -> Result<Self, SystemError> {
         match value {
-            0 => Ok(PtraceRequest::PtraceTraceme),
-            2 => Ok(PtraceRequest::PtracePeekdata),
-            5 => Ok(PtraceRequest::PtracePokedata),
-            7 => Ok(PtraceRequest::PtraceCont),
-            9 => Ok(PtraceRequest::PtraceSinglestep),
-            12 => Ok(PtraceRequest::PtraceGetregs),
-            13 => Ok(PtraceRequest::PtraceSetregs),
-            16 => Ok(PtraceRequest::PtraceAttach),
-            17 => Ok(PtraceRequest::PtraceDetach),
-            24 => Ok(PtraceRequest::PtraceSyscall),
-            0x4200 => Ok(PtraceRequest::PtraceSetoptions),
-            0x4202 => Ok(PtraceRequest::PtraceGetsiginfo),
-            0x4206 => Ok(PtraceRequest::PtraceSeize),
+            0 => Ok(PtraceRequest::Traceme),
+            2 => Ok(PtraceRequest::Peekdata),
+            5 => Ok(PtraceRequest::Pokedata),
+            7 => Ok(PtraceRequest::Cont),
+            9 => Ok(PtraceRequest::Singlestep),
+            12 => Ok(PtraceRequest::Getregs),
+            13 => Ok(PtraceRequest::Setregs),
+            16 => Ok(PtraceRequest::Attach),
+            17 => Ok(PtraceRequest::Detach),
+            24 => Ok(PtraceRequest::Syscall),
+            0x4200 => Ok(PtraceRequest::Setoptions),
+            0x4202 => Ok(PtraceRequest::Getsiginfo),
+            0x4206 => Ok(PtraceRequest::Seize),
             _ => Err(SystemError::EINVAL),
         }
     }
+}
+
+/// 页表切换守卫，用于在作用域结束时自动恢复页表
+///
+/// 按照 Linux 6.6 ptrace_access_vm 的模式：
+/// 1. 禁用中断，防止在切换期间发生中断处理
+/// 2. 切换到目标进程的页表
+/// 3. 在作用域结束时恢复原始页表并重新启用中断
+struct PageTableGuard {
+    original_paddr: PhysAddr,
+    kind: PageTableKind,
+    _irq_guard: IrqFlagsGuard,
+}
+
+impl PageTableGuard {
+    /// 切换到目标进程的页表
+    ///
+    /// # Safety
+    /// 调用者必须确保：
+    /// 1. target_paddr 是有效的页表物理地址
+    /// 2. 在此守卫存在期间不会发生调度
+    fn new(target_paddr: PhysAddr, kind: PageTableKind) -> Self {
+        // 1. 首先禁用中断（关键！）
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        // 2. 获取当前页表物理地址用于恢复
+        let current_pcb = ProcessManager::current_pcb();
+        let original_paddr = current_pcb
+            .basic()
+            .user_vm()
+            .map(|vm| {
+                let inner = vm.read_irqsave();
+                inner.user_mapper.utable.table().phys()
+            })
+            .expect("current process must have user VM");
+
+        // 3. 切换到目标进程的页表
+        unsafe {
+            <MMArch as MemoryManagementArch>::set_table(kind, target_paddr);
+        }
+
+        Self {
+            original_paddr,
+            kind,
+            _irq_guard: irq_guard,
+        }
+    }
+}
+
+impl Drop for PageTableGuard {
+    fn drop(&mut self) {
+        // 恢复原始页表
+        unsafe {
+            <MMArch as MemoryManagementArch>::set_table(self.kind, self.original_paddr);
+        }
+        // 中断会在 _irq_guard drop 时自动恢复
+    }
+}
+
+/// ptrace 内存访问辅助函数
+///
+/// 按照 Linux 6.6 的 ptrace_access_vm 模式实现：
+/// - 使用临时页表切换访问目标进程的地址空间
+/// - 在中断禁用状态下进行页表切换
+/// - 使用守卫模式确保页表一定会被恢复
+///
+/// # Safety
+/// 调用者必须确保 tracee 在访问期间不会被销毁
+fn ptrace_access_vm<F, R>(tracee: &Arc<ProcessControlBlock>, f: F) -> Result<R, SystemError>
+where
+    F: FnOnce() -> Result<R, SystemError>,
+{
+    // 获取目标进程的地址空间
+    let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
+
+    // 获取目标进程的用户页表物理地址
+    let tracee_mapper_paddr = {
+        let inner = tracee_vm.read_irqsave();
+        inner.user_mapper.utable.table().phys()
+    };
+
+    // 使用守卫切换页表，确保一定会恢复
+    let _guard = PageTableGuard::new(tracee_mapper_paddr, PageTableKind::User);
+
+    // 在目标进程的地址空间中执行操作
+    f()
 }
 
 /// ptrace 系统调用实现
@@ -171,7 +264,9 @@ impl SysPtrace {
         signal: Option<Signal>,
     ) -> Result<isize, SystemError> {
         // 验证调用者是跟踪器
-        if ProcessManager::current_pcb().raw_pid() != tracee.tracer().unwrap() {
+        let tracer_pid = ProcessManager::current_pcb().raw_pid();
+        let tracee_tracer = tracee.tracer().ok_or(SystemError::ESRCH)?;
+        if tracer_pid != tracee_tracer {
             return Err(SystemError::EPERM);
         }
         tracee.detach(signal)
@@ -180,8 +275,9 @@ impl SysPtrace {
     /// 处理 PTRACE_SYSCALL 请求（在系统调用入口和出口暂停）
     fn handle_syscall(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
         // 检查调用者是否是该进程的跟踪器
-        if ProcessManager::current_pcb().raw_pid() != tracee.tracer().unwrap() {
-            // TODO
+        let tracer_pid = ProcessManager::current_pcb().raw_pid();
+        let tracee_tracer = tracee.tracer().ok_or(SystemError::ESRCH)?;
+        if tracer_pid != tracee_tracer {
             return Err(SystemError::ESRCH);
         }
         // 设置系统调用跟踪标志
@@ -219,122 +315,59 @@ impl SysPtrace {
 
     /// 处理 PTRACE_PEEKDATA 请求（读取进程内存）
     ///
-    /// 按照 Linux 6.6.21 的 ptrace 语义，PTRACE_PEEKDATA 需要从目标进程的地址空间读取数据
+    /// 按照 Linux 6.6.21 的 ptrace 语义：
+    /// - 使用 ptrace_access_vm 模式访问目标进程地址空间
+    /// - 在中断禁用状态下进行页表切换
+    /// - 使用守卫模式确保页表恢复
     fn handle_peek_data(
         tracee: &Arc<ProcessControlBlock>,
         addr: usize,
     ) -> Result<isize, SystemError> {
-        // 获取目标进程的地址空间
-        let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
-
-        // 获取目标进程的用户页表物理地址
-        let tracee_mapper_paddr = {
-            let inner = tracee_vm.read_irqsave();
-            inner.user_mapper.utable.table().phys()
-        };
-
-        // 获取当前进程的用户页表物理地址（用于恢复）
-        let current_pcb = ProcessManager::current_pcb();
-        let current_vm = current_pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
-        let current_mapper_paddr = {
-            let inner = current_vm.read_irqsave();
-            inner.user_mapper.utable.table().phys()
-        };
-
-        // 切换到目标进程的页表
-        unsafe {
-            <crate::arch::MMArch as MemoryManagementArch>::set_table(
-                PageTableKind::User,
-                tracee_mapper_paddr,
-            );
-        }
-
-        // 读取数据
-        let mut value: u64 = 0;
-        let result = unsafe {
-            crate::syscall::user_access::copy_from_user_protected(
-                core::slice::from_raw_parts_mut(&mut value as *mut u64 as *mut u8, 8),
-                VirtAddr::new(addr),
-            )
-        };
-
-        // 恢复当前进程的页表
-        unsafe {
-            <crate::arch::MMArch as MemoryManagementArch>::set_table(
-                PageTableKind::User,
-                current_mapper_paddr,
-            );
-        }
-
-        if result.is_err() {
-            return Err(SystemError::EIO);
-        }
-
-        Ok(value as isize)
+        // 使用安全的 ptrace_access_vm 辅助函数
+        ptrace_access_vm(tracee, || {
+            let mut value: u64 = 0;
+            unsafe {
+                copy_from_user_protected(
+                    core::slice::from_raw_parts_mut(&mut value as *mut u64 as *mut u8, 8),
+                    VirtAddr::new(addr),
+                )
+            }?;
+            Ok(value as isize)
+        })
+        .map_err(|_| SystemError::EIO)
     }
 
     /// 处理 PTRACE_POKEDATA 请求（写入进程内存）
     ///
-    /// 按照 Linux 6.6.21 的 ptrace 语义，PTRACE_POKEDATA 需要向目标进程的地址空间写入数据
+    /// 按照 Linux 6.6.21 的 ptrace 语义：
+    /// - 使用 ptrace_access_vm 模式访问目标进程地址空间
+    /// - 在中断禁用状态下进行页表切换
+    /// - 使用守卫模式确保页表恢复
     fn handle_poke_data(
         tracee: &Arc<ProcessControlBlock>,
         addr: usize,
         data: usize,
     ) -> Result<isize, SystemError> {
-        // 获取目标进程的地址空间
-        let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
-
-        // 获取目标进程的用户页表物理地址
-        let tracee_mapper_paddr = {
-            let inner = tracee_vm.read_irqsave();
-            inner.user_mapper.utable.table().phys()
-        };
-
-        // 获取当前进程的用户页表物理地址（用于恢复）
-        let current_pcb = ProcessManager::current_pcb();
-        let current_vm = current_pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
-        let current_mapper_paddr = {
-            let inner = current_vm.read_irqsave();
-            inner.user_mapper.utable.table().phys()
-        };
-
-        // 切换到目标进程的页表
-        unsafe {
-            <crate::arch::MMArch as MemoryManagementArch>::set_table(
-                PageTableKind::User,
-                tracee_mapper_paddr,
-            );
-        }
-
-        // 写入数据
-        let value: u64 = data as u64;
-        let result = unsafe {
-            crate::syscall::user_access::copy_to_user_protected(
-                VirtAddr::new(addr),
-                core::slice::from_raw_parts(&value as *const u64 as *const u8, 8),
-            )
-        };
-
-        // 恢复当前进程的页表
-        unsafe {
-            <crate::arch::MMArch as MemoryManagementArch>::set_table(
-                PageTableKind::User,
-                current_mapper_paddr,
-            );
-        }
-
-        if result.is_err() {
-            return Err(SystemError::EIO);
-        }
-
-        Ok(0)
+        // 使用安全的 ptrace_access_vm 辅助函数
+        ptrace_access_vm(tracee, || {
+            let value: u64 = data as u64;
+            unsafe {
+                copy_to_user_protected(
+                    VirtAddr::new(addr),
+                    core::slice::from_raw_parts(&value as *const u64 as *const u8, 8),
+                )
+            }?;
+            Ok(0)
+        })
+        .map_err(|_| SystemError::EIO)
     }
 
     /// 处理 PTRACE_SINGLESTEP 请求 (单步执行)
     fn handle_single_step(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
         // 检查调用者是否是该进程的跟踪器
-        if ProcessManager::current_pcb().raw_pid() != tracee.tracer().unwrap() {
-            // TODO
+        let tracer_pid = ProcessManager::current_pcb().raw_pid();
+        let tracee_tracer = tracee.tracer().ok_or(SystemError::ESRCH)?;
+        if tracer_pid != tracee_tracer {
             return Err(SystemError::ESRCH);
         }
         // 设置 EFLAGS 的 TF 标志
@@ -501,7 +534,7 @@ impl Syscall for SysPtrace {
         let data = Self::data(args);
 
         let tracer = ProcessManager::current_pcb();
-        if request == PtraceRequest::PtraceTraceme {
+        if request == PtraceRequest::Traceme {
             return Self::handle_traceme(&tracer).map(|r| r as usize);
         }
         let tracee: Arc<ProcessControlBlock> =
@@ -513,30 +546,30 @@ impl Syscall for SysPtrace {
         };
 
         let result: isize = match request {
-            // 附加到目标进程
-            PtraceRequest::PtraceAttach => Self::handle_attach(&tracer, pid)?,
-            // PTRACE_SEIZE：现代 API，不发送 SIGSTOP
-            PtraceRequest::PtraceSeize => Self::handle_seize(&tracer, pid, addr)?,
-            // 分离目标进程
-            PtraceRequest::PtraceDetach => Self::handle_detach(&tracee, signal)?,
-            // 继续执行目标进程
-            PtraceRequest::PtraceCont
-            | PtraceRequest::PtraceSinglestep
-            | PtraceRequest::PtraceSyscall => tracee.ptrace_resume(request, signal, frame)?,
-            // 设置跟踪选项
-            PtraceRequest::PtraceSetoptions => Self::handle_set_options(&tracee, data)?,
-            // 获取信号信息
-            PtraceRequest::PtraceGetsiginfo => Self::handle_get_siginfo(&tracee)?,
-            // 获取寄存器值
-            PtraceRequest::PtraceGetregs => Self::handle_get_regs(&tracee, data)?,
-            // 设置寄存器值
-            PtraceRequest::PtraceSetregs => Self::handle_set_regs(&tracee, data)?,
-            // 读取用户寄存器
-            PtraceRequest::PtracePeekuser => Self::handle_peek_user(&tracee, addr)?,
             // 读取进程内存
-            PtraceRequest::PtracePeekdata => Self::handle_peek_data(&tracee, addr)?,
+            PtraceRequest::Peekdata => Self::handle_peek_data(&tracee, addr)?,
+            // 读取用户寄存器
+            PtraceRequest::Peekuser => Self::handle_peek_user(&tracee, addr)?,
             // 写入进程内存
-            PtraceRequest::PtracePokedata => Self::handle_poke_data(&tracee, addr, data)?,
+            PtraceRequest::Pokedata => Self::handle_poke_data(&tracee, addr, data)?,
+            // 继续执行目标进程
+            PtraceRequest::Cont | PtraceRequest::Singlestep | PtraceRequest::Syscall => {
+                tracee.ptrace_resume(request, signal, frame)?
+            }
+            // 获取寄存器值
+            PtraceRequest::Getregs => Self::handle_get_regs(&tracee, data)?,
+            // 设置寄存器值
+            PtraceRequest::Setregs => Self::handle_set_regs(&tracee, data)?,
+            // 附加到目标进程
+            PtraceRequest::Attach => Self::handle_attach(&tracer, pid)?,
+            // 分离目标进程
+            PtraceRequest::Detach => Self::handle_detach(&tracee, signal)?,
+            // 设置跟踪选项
+            PtraceRequest::Setoptions => Self::handle_set_options(&tracee, data)?,
+            // 获取信号信息
+            PtraceRequest::Getsiginfo => Self::handle_get_siginfo(&tracee)?,
+            // PTRACE_SEIZE：现代 API，不发送 SIGSTOP
+            PtraceRequest::Seize => Self::handle_seize(&tracer, pid, addr)?,
             // 其他请求类型
             _ => {
                 log::warn!("Unimplemented ptrace request: {:?}", request);

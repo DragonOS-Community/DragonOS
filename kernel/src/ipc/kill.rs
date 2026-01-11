@@ -16,13 +16,7 @@ use system_error::SystemError;
 /// kill() 系统调用发送进程级信号，使用 PidType::TGID
 pub fn send_signal_to_pid(pid: RawPid, sig: Signal) -> Result<usize, SystemError> {
     // 查找目标进程
-    let target = ProcessManager::find_task_by_vpid(pid);
-
-    if target.is_none() {
-        return Err(SystemError::ESRCH);
-    }
-
-    let target = target.unwrap();
+    let target = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
 
     // 检查权限（传入信号以处理 SIGCONT 特殊情况）
     check_signal_permission_pcb_with_sig(&target, Some(sig))?;

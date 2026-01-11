@@ -81,17 +81,17 @@ pub enum ChldCode {
 #[allow(dead_code)]
 pub enum TrapCode {
     /// process breakpoint - 断点触发
-    TrapBrkpt = 1,
+    Brkpt = 1,
     /// process trace trap - ptrace 单步执行
-    TrapTrace = 2,
+    Trace = 2,
     /// process taken branch trap - 分支跟踪
-    TrapBranch = 3,
+    Branch = 3,
     /// hardware breakpoint/watchpoint - 硬件断点
-    TrapHwbkpt = 4,
+    Hwbkpt = 4,
     /// undiagnosed trap - 未诊断的陷阱
-    TrapUnk = 5,
+    Unk = 5,
     /// perf event with sigtrap=1 - 性能事件
-    TrapPerf = 6,
+    Perf = 6,
 }
 
 /// SIGILL/SIGFPE/SIGSEGV/SIGBUS 的原因码 (ILL_*, FPE_*, SEGV_*, BUS_*)
@@ -630,8 +630,33 @@ impl SigInfo {
                     },
                 },
             },
-            SigType::SigFault(sig_fault_info) => todo!(),
-            SigType::SigChld(sig_chld_info) => todo!(),
+            SigType::SigFault(sig_fault_info) => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: i32::from(self.sig_code),
+                _sifields: PosixSiginfoFields {
+                    _sigfault: PosixSiginfoSigfault {
+                        si_addr: sig_fault_info.addr as u64,
+                        si_addr_lsb: 0,
+                        si_band: 0,
+                        si_fd: 0,
+                    },
+                },
+            },
+            SigType::SigChld(sig_chld_info) => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: i32::from(self.sig_code),
+                _sifields: PosixSiginfoFields {
+                    _sigchld: PosixSiginfoSigchld {
+                        si_pid: sig_chld_info.pid.data() as i32,
+                        si_uid: sig_chld_info.uid as u32,
+                        si_status: sig_chld_info.status,
+                        si_utime: sig_chld_info.utime as i64,
+                        si_stime: sig_chld_info.stime as i64,
+                    },
+                },
+            },
         }
     }
 

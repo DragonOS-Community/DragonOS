@@ -5,7 +5,7 @@ use num_traits::FromPrimitive;
 use crate::ipc::signal_types::SignalFlags;
 use crate::{
     arch::{
-        ipc::signal::{SigSet, Signal, MAX_SIG_NUM},
+        ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
         CurrentIrqArch,
     },
     exception::InterruptArch,
@@ -461,13 +461,25 @@ fn sig_stop(sig: Signal) {
     // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
     let pcb = ProcessManager::current_pcb();
     if let Some(parent) = pcb.parent_pcb() {
-        let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+        let should_notify = {
+            let sighand = parent.sighand();
+            sighand
+                .handler(Signal::SIGCHLD)
+                .map(|sa| !sa.flags().contains(SigFlags::SA_NOCLDSTOP))
+                .unwrap_or(false)
+        };
+
+        if should_notify {
+            let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+        }
+        // 无论是否发送 SIGCHLD，都需要唤醒父进程的 wait 队列，因为 waitpid(WUNTRACED) 可能需要返回
         parent.wake_all_waiters();
     }
     // 唤醒等待在该子进程等待队列上的等待者
     pcb.wake_all_waiters();
     schedule(SchedMode::SM_NONE);
 }
+
 /// 信号默认处理函数——继续进程
 fn sig_continue(_sig: Signal) {
     // 默认处理改为最小化：仅在已处于 Stopped 时唤醒停止，让进程继续运行。

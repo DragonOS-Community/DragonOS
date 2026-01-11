@@ -18,8 +18,7 @@ use crate::{
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
     process::{
-        pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo,
-        ProcessState, RawPid,
+        pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
     time::{syscall::PosixClockID, timekeeping::getnstimeofday, Instant, PosixTimeSpec},
 };
@@ -285,15 +284,13 @@ impl Signal {
         // 判断目标进程是否应该被唤醒以立即处理该信号
         let wants_signal = self.wants_signal(pcb.clone());
 
-        // 按照 Linux 6.6.21 语义：对于被 ptrace 的进程，如果收到 SIGSTOP 信号，需要特殊处理
+        // 对于被 ptrace 的进程，如果收到 SIGSTOP 信号，需要特殊处理
         let is_ptrace_sigstop =
             pcb.flags().contains(ProcessFlags::PTRACED) && *self == Signal::SIGSTOP;
 
         let should_wake = if is_ptrace_sigstop {
-            matches!(
-                pcb.sched_info().inner_lock_read_irqsave().state(),
-                ProcessState::Blocked(_)
-            )
+            // 对于 ptrace 进程的 SIGSTOP，总是需要唤醒
+            true
         } else {
             wants_signal
         };

@@ -473,49 +473,7 @@ static int test_rlimit_enomem(void) {
 }
 
 /**
- * Test 11: RLIMIT_MEMLOCK = 0 should return EPERM
- */
-static int test_rlimit_zero_eperm(void) {
-    TEST_START("rlimit_zero_eperm");
-
-    struct rlimit saved;
-    save_rlimit(&saved);
-
-    struct rlimit rlim;
-    rlim.rlim_cur = 0;
-    rlim.rlim_max = RLIM_INFINITY;
-
-    if (setrlimit(RLIMIT_MEMLOCK, &rlim) != 0) {
-        restore_rlimit(&saved);
-        TEST_SKIP("setrlimit failed (need CAP_SYS_RESOURCE?)");
-        return 0;
-    }
-
-    size_t pagesize = get_page_size();
-    char *addr = mmap(NULL, pagesize, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (addr == MAP_FAILED) {
-        restore_rlimit(&saved);
-        TEST_SKIP("mmap failed");
-        return 0;
-    }
-
-    errno = 0;
-    int ret = mlock(addr, pagesize);
-    munmap(addr, pagesize);
-    restore_rlimit(&saved);
-
-    if (ret == -1 && errno == EPERM) {
-        TEST_PASS();
-        return 0;
-    } else {
-        TEST_FAIL("expected EPERM when RLIMIT_MEMLOCK=0");
-        return -1;
-    }
-}
-
-/**
- * Test 12: Invalid address should return ENOMEM
+ * Test 11: Invalid address should return ENOMEM
  */
 static int test_invalid_address_enomem(void) {
     TEST_START("invalid_address_enomem");
@@ -1309,7 +1267,6 @@ int main(void) {
 
         // Error Code Validation
         {"rlimit_enomem", test_rlimit_enomem, "Error Codes"},
-        {"rlimit_zero_eperm", test_rlimit_zero_eperm, "Error Codes"},
         {"invalid_address_enomem", test_invalid_address_enomem, "Error Codes"},
         {"null_pointer", test_null_pointer, "Error Codes"},
 

@@ -673,10 +673,6 @@ impl ElfLoader {
         offset_in_file: usize,
         param: &mut ExecParam,
     ) -> Result<(), SystemError> {
-        log::debug!(
-            "do_load_file: preempt={}",
-            ProcessManager::current_pcb().preempt_count()
-        );
         let file = param.file_ref();
         if (file.metadata()?.size as usize) < offset_in_file + size {
             return Err(SystemError::ENOEXEC);

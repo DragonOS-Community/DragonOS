@@ -31,13 +31,6 @@ pub fn do_execve(
     envp: Vec<CString>,
     regs: &mut TrapFrame,
 ) -> Result<(), SystemError> {
-    log::info!(
-        "execve: start loading program: path='{}', argc={}, envc={}",
-        path,
-        argv.len(),
-        envp.len()
-    );
-
     // 创建初始执行上下文
     let mut ctx = ExecContext::new();
 
@@ -138,11 +131,6 @@ fn do_execve_internal(
             // 清除 rseq 状态（execve 后需要重新注册）
             crate::process::rseq::rseq_execve(&pcb);
 
-            log::info!(
-                "execve: program loaded successfully, entry_point={:#x}, user_sp={:#x}",
-                result.entry_point().data(),
-                user_sp.data()
-            );
             Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr)
         }
 

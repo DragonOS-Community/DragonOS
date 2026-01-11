@@ -1771,7 +1771,7 @@ impl IndexNode for LockedFATInode {
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         let r = self.read_sync(offset, &mut buf[0..len]);
-        // self.0.lock_irqsave().update_metadata();
+        // self.0.lock().update_metadata();
         return r;
     }
 
@@ -1784,7 +1784,7 @@ impl IndexNode for LockedFATInode {
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         let r = self.write_sync(offset, &buf[0..len]);
-        // self.0.lock_irqsave().update_metadata();
+        // self.0.lock().update_metadata();
         return r;
     }
 
@@ -1902,7 +1902,7 @@ impl IndexNode for LockedFATInode {
         if let Some(page_cache) = self.page_cache() {
             let start_page = (len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
             truncate_inode_pages(page_cache.clone(), start_page);
-            page_cache.lock_irqsave().resize(len)?;
+            page_cache.lock().resize(len)?;
         }
 
         let mut guard: MutexGuard<FATInode> = self.0.lock();

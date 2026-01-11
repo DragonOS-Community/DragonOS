@@ -488,7 +488,7 @@ impl IndexNode for LockedTmpfsInode {
 
         let mut items: Vec<ReadItem> = Vec::new();
         {
-            let mut page_cache_guard = page_cache.lock_irqsave();
+            let mut page_cache_guard = page_cache.lock();
             for page_index in start_page_index..=end_page_index {
                 let page_start = page_index * MMArch::PAGE_SIZE;
                 let page_end = page_start + MMArch::PAGE_SIZE;
@@ -530,7 +530,7 @@ impl IndexNode for LockedTmpfsInode {
             let v = volatile_read!(buf[dst_off + it.sub_len - 1]);
             volatile_write!(buf[dst_off + it.sub_len - 1], v);
 
-            let page_guard = it.page.read_irqsave();
+            let page_guard = it.page.read();
             unsafe {
                 buf[dst_off..dst_off + it.sub_len].copy_from_slice(
                     &page_guard.as_slice()[it.page_offset..it.page_offset + it.sub_len],
@@ -592,7 +592,7 @@ impl IndexNode for LockedTmpfsInode {
 
         let mut items: Vec<WriteItem> = Vec::new();
         {
-            let mut page_cache_guard = page_cache.lock_irqsave();
+            let mut page_cache_guard = page_cache.lock();
             for page_index in start_page_index..=end_page_index {
                 let page_start = page_index * MMArch::PAGE_SIZE;
                 let page_end = page_start + MMArch::PAGE_SIZE;
@@ -631,7 +631,7 @@ impl IndexNode for LockedTmpfsInode {
             volatile_read!(buf[src_off]);
             volatile_read!(buf[src_off + it.sub_len - 1]);
 
-            let mut page_guard = it.page.write_irqsave();
+            let mut page_guard = it.page.write();
             unsafe {
                 page_guard.as_slice_mut()[it.page_offset..it.page_offset + it.sub_len]
                     .copy_from_slice(&buf[src_off..src_off + it.sub_len]);
@@ -694,7 +694,7 @@ impl IndexNode for LockedTmpfsInode {
 
             // 调整页缓存（会释放多余页，并截断最后一页）
             if let Some(pc) = inode.page_cache.clone() {
-                pc.lock_irqsave().resize(len)?;
+                pc.lock().resize(len)?;
             }
 
             // 如果缩小，减少current_size

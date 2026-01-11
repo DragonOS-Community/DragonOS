@@ -391,14 +391,14 @@ pub struct File {
     /// 文件类型
     file_type: FileType,
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
-    readdir_subdirs_name: SpinLock<Vec<String>>,
+    readdir_subdirs_name: Mutex<Vec<String>>,
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
     /// 文件描述符标志：是否在execve时关闭
     close_on_exec: AtomicBool,
     /// owner
-    pid: SpinLock<Option<Arc<ProcessControlBlock>>>,
+    pid: Mutex<Option<Arc<ProcessControlBlock>>>,
     /// 预读状态
     ra_state: SpinLock<FileReadaheadState>,
 }
@@ -609,11 +609,11 @@ impl File {
             flags: RwLock::new(flags),
             mode: RwLock::new(mode),
             file_type,
-            readdir_subdirs_name: SpinLock::new(Vec::default()),
+            readdir_subdirs_name: Mutex::new(Vec::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
             close_on_exec: AtomicBool::new(close_on_exec),
-            pid: SpinLock::new(None),
+            pid: Mutex::new(None),
             ra_state: SpinLock::new(FileReadaheadState::new()),
         };
 
@@ -789,7 +789,7 @@ impl File {
         let end_page = (offset + len - 1) >> MMArch::PAGE_SHIFT;
 
         let (async_trigger_page, missing_page) = {
-            let page_cache_guard = page_cache.lock_irqsave();
+            let page_cache_guard = page_cache.lock();
             let mut async_trigger_page = None;
             let mut missing_page = None;
 
@@ -797,7 +797,7 @@ impl File {
                 match page_cache_guard.get_page(index) {
                     Some(page)
                         if page
-                            .read_irqsave()
+                            .read()
                             .flags()
                             .contains(PageFlags::PG_READAHEAD) =>
                     {
@@ -817,7 +817,7 @@ impl File {
         if let Some((index, page)) = async_trigger_page {
             let mut ra_state = self.ra_state.lock().clone();
             let req_pages = end_page - index + 1;
-            page.write_irqsave().remove_flags(PageFlags::PG_READAHEAD);
+            page.write().remove_flags(PageFlags::PG_READAHEAD);
 
             page_cache_async_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
             *self.ra_state.lock() = ra_state;
@@ -1133,11 +1133,11 @@ impl File {
             flags: RwLock::new(self.flags()),
             mode: RwLock::new(self.mode()),
             file_type: self.file_type,
-            readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
+            readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
             private_data: Mutex::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
             close_on_exec: AtomicBool::new(self.close_on_exec.load(Ordering::SeqCst)),
-            pid: SpinLock::new(None),
+            pid: Mutex::new(None),
             ra_state: SpinLock::new(self.ra_state.lock().clone()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode

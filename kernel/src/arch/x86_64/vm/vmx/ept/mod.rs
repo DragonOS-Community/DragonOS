@@ -3,10 +3,10 @@ use crate::arch::vm::asm::VmxAsm;
 use crate::arch::vm::mmu::kvm_mmu::PageLevel;
 use crate::arch::vm::mmu::mmu_internal::KvmPageFault;
 use crate::arch::MMArch;
-use crate::libs::spinlock::SpinLockGuard;
+use crate::libs::rwsem::RwSemWriteGuard;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::page::{
-    page_manager_lock_irqsave, EntryFlags, PageEntry, PageFlags, PageFlush, PageManager, PageType,
+    page_manager_lock, EntryFlags, PageEntry, PageFlags, PageFlush, PageManager, PageType,
 };
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
@@ -56,7 +56,7 @@ bitflags! {
 //     kinfo!("page_manager_init done");
 // }
 
-// pub fn ept_page_manager_lock_irqsave() -> SpinLockGuard<'static, EptPageManager> {
+// pub fn ept_page_manager_lock() -> SpinLockGuard<'static, EptPageManager> {
 //     unsafe { EPT_PAGE_MANAGER.as_ref().unwrap().lock_irqsave() }
 // }
 // EPT 页表数据结构
@@ -364,8 +364,8 @@ impl EptPageMapper {
                 // let hpa: PhysAddr = unsafe { self.frame_allocator.allocate_one() }?;
                 // debug!("Allocate hpa: {:?}", hpa);
                 // 修改全局页管理器
-                let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
-                    page_manager_lock_irqsave();
+                let mut page_manager_guard: RwSemWriteGuard<'static, PageManager> =
+                    page_manager_lock();
                 let page = page_manager_guard
                     .create_one_page(
                         PageType::Normal,

@@ -21,8 +21,7 @@ use crate::{
     init::initcall::INITCALL_CORE,
     libs::{
         mutex::Mutex,
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-        spinlock::{SpinLock, SpinLockGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
     },
     process::{ProcessControlBlock, ProcessManager},
     time::{sleep::nanosleep, PosixTimeSpec},
@@ -45,13 +44,13 @@ pub const PAGE_1G_SHIFT: usize = 30;
 pub const PAGE_4K_SIZE: usize = 1 << PAGE_4K_SHIFT;
 pub const PAGE_2M_SIZE: usize = 1 << PAGE_2M_SHIFT;
 
-/// 全局物理页信息管理器
-pub static mut PAGE_MANAGER: Option<SpinLock<PageManager>> = None;
+/// 全局物理页信息管理器（使用 RwSem，可睡眠）
+pub static mut PAGE_MANAGER: Option<RwSem<PageManager>> = None;
 
 /// 初始化PAGE_MANAGER
 pub fn page_manager_init() {
     info!("page_manager_init");
-    let page_manager = SpinLock::new(PageManager::new());
+    let page_manager = RwSem::new(PageManager::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_MANAGER = Some(page_manager) };
@@ -60,8 +59,8 @@ pub fn page_manager_init() {
     info!("page_manager_init done");
 }
 
-pub fn page_manager_lock_irqsave() -> SpinLockGuard<'static, PageManager> {
-    unsafe { PAGE_MANAGER.as_ref().unwrap().lock_irqsave() }
+pub fn page_manager_lock() -> RwSemWriteGuard<'static, PageManager> {
+    unsafe { PAGE_MANAGER.as_ref().unwrap().write() }
 }
 
 // 物理页管理器
@@ -82,14 +81,14 @@ impl PageManager {
     }
 
     pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
-        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+        if let Some(p) = page_reclaimer_lock().get(paddr) {
             return Some(p);
         }
         self.phys2page.get(paddr).cloned()
     }
 
     pub fn get_unwrap(&mut self, paddr: &PhysAddr) -> Arc<Page> {
-        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+        if let Some(p) = page_reclaimer_lock().get(paddr) {
             return p;
         }
         self.phys2page
@@ -175,7 +174,7 @@ impl PageManager {
             let page = Page::new(cur_phys.phys_address(), page_type.clone(), flags);
             if let Err(e) = self.insert(&page) {
                 for insert_page in ret {
-                    self.remove_page(&insert_page.read_irqsave().phys_addr);
+                    self.remove_page(&insert_page.read().phys_addr);
                 }
                 return Err(e);
             }
@@ -206,7 +205,7 @@ impl PageManager {
 
         assert!(!self.contains(&paddr), "phys page: {paddr:?} already exist");
 
-        let page = Page::copy(old_page.read_irqsave(), paddr)
+        let page = Page::copy(old_page.read(), paddr)
             .inspect_err(|_| unsafe { allocator.free_one(paddr) })?;
 
         self.insert(&page)?;
@@ -215,11 +214,11 @@ impl PageManager {
     }
 }
 
-pub static mut PAGE_RECLAIMER: Option<SpinLock<PageReclaimer>> = None;
+pub static mut PAGE_RECLAIMER: Option<RwSem<PageReclaimer>> = None;
 
 pub fn page_reclaimer_init() {
     info!("page_reclaimer_init");
-    let page_reclaimer = SpinLock::new(PageReclaimer::new());
+    let page_reclaimer = RwSem::new(PageReclaimer::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_RECLAIMER = Some(page_reclaimer) };
@@ -264,7 +263,7 @@ fn page_reclaim_thread() -> i32 {
             PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
         } else {
             //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
-            page_reclaimer_lock_irqsave().flush_dirty_pages();
+            page_reclaimer_lock().flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
             let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
@@ -272,9 +271,9 @@ fn page_reclaim_thread() -> i32 {
     }
 }
 
-/// 获取页面回收器
-pub fn page_reclaimer_lock_irqsave() -> SpinLockGuard<'static, PageReclaimer> {
-    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock_irqsave() }
+/// 获取页面回收器（使用 RwSem，可睡眠）
+pub fn page_reclaimer_lock() -> RwSemWriteGuard<'static, PageReclaimer> {
+    unsafe { PAGE_RECLAIMER.as_ref().unwrap().write() }
 }
 
 /// 页面回收器
@@ -308,7 +307,7 @@ impl PageReclaimer {
     pub fn shrink_list(count: PageFrameCount) {
         // 阶段1：仅持有回收器锁，摘取受害者
         let victims = {
-            let mut reclaimer = page_reclaimer_lock_irqsave();
+            let mut reclaimer = page_reclaimer_lock();
             reclaimer.drain_lru(count)
         };
 
@@ -331,14 +330,14 @@ impl PageReclaimer {
     /// 在不持有回收器锁的情况下，完成页面写回与回收。
     fn evict_pages(victims: Vec<Arc<Page>>) {
         for page in victims {
-            let mut guard = page.write_irqsave();
+            let mut guard = page.write();
             if let PageType::File(info) = guard.page_type().clone() {
                 // Never evict a file-backed page that is still mapped into any VMA.
                 // Our eviction path removes the page from page_cache/page_manager; dropping a
                 // still-mapped page will trip InnerPage::drop assertions and can crash userland.
                 if guard.map_count() != 0 {
                     drop(guard);
-                    page_reclaimer_lock_irqsave().insert_page(page.phys_address(), &page);
+                    page_reclaimer_lock().insert_page(page.phys_address(), &page);
                     continue;
                 }
 
@@ -355,9 +354,9 @@ impl PageReclaimer {
                 // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
                 // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
                 if let Some(page_cache) = info.page_cache.upgrade() {
-                    page_cache.lock_irqsave().remove_page(page_index);
+                    page_cache.lock().remove_page(page_index);
                 }
-                page_manager_lock_irqsave().remove_page(&paddr);
+                page_manager_lock().remove_page(&paddr);
             }
         }
     }
@@ -376,7 +375,7 @@ impl PageReclaimer {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(guard: &mut RwLockWriteGuard<InnerPage>, unmap: bool) {
+    pub fn page_writeback(guard: &mut RwSemWriteGuard<InnerPage>, unmap: bool) {
         // log::debug!("page writeback: {:?}", guard.phys_addr);
 
         let (page_cache, page_index) = match guard.page_type() {
@@ -452,7 +451,7 @@ impl PageReclaimer {
         // log::info!("flush_dirty_pages");
         let iter = self.lru.iter();
         for (_paddr, page) in iter {
-            let mut guard = page.write_irqsave();
+            let mut guard = page.write();
             if guard.flags().contains(PageFlags::PG_DIRTY) {
                 Self::page_writeback(&mut guard, false);
             }
@@ -485,7 +484,8 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct Page {
-    inner: RwLock<InnerPage>,
+    /// 使用 RwSem 而非 RwLock，因为 writeback 等操作可能需要进行 I/O（可睡眠）
+    inner: RwSem<InnerPage>,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
 }
@@ -506,11 +506,11 @@ impl Page {
     fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Arc<Page> {
         let inner = InnerPage::new(phys_addr, page_type, flags);
         let page = Arc::new(Self {
-            inner: RwLock::new(inner),
+            inner: RwSem::new(inner),
             phys_addr,
         });
-        if page.read_irqsave().flags == PageFlags::PG_LRU {
-            page_reclaimer_lock_irqsave().insert_page(phys_addr, &page);
+        if page.read().flags == PageFlags::PG_LRU {
+            page_reclaimer_lock().insert_page(phys_addr, &page);
         };
         page
     }
@@ -527,7 +527,7 @@ impl Page {
     /// - `Ok(Arc<Page>)`: 新页面
     /// - `Err(SystemError)`: 错误码
     fn copy(
-        old_guard: RwLockReadGuard<InnerPage>,
+        old_guard: RwSemReadGuard<InnerPage>,
         new_phys: PhysAddr,
     ) -> Result<Arc<Page>, SystemError> {
         let page_type = old_guard.page_type().clone();
@@ -541,7 +541,7 @@ impl Page {
                 .copy_from_nonoverlapping(old_vaddr.data() as *mut u8, MMArch::PAGE_SIZE);
         }
         Ok(Arc::new(Self {
-            inner: RwLock::new(inner),
+            inner: RwSem::new(inner),
             phys_addr: new_phys,
         }))
     }
@@ -551,12 +551,12 @@ impl Page {
         self.phys_addr
     }
 
-    pub fn read_irqsave(&self) -> RwLockReadGuard<'_, InnerPage> {
-        self.inner.read_irqsave()
+    pub fn read(&self) -> RwSemReadGuard<'_, InnerPage> {
+        self.inner.read()
     }
 
-    pub fn write_irqsave(&self) -> RwLockWriteGuard<'_, InnerPage> {
-        self.inner.write_irqsave()
+    pub fn write(&self) -> RwSemWriteGuard<'_, InnerPage> {
+        self.inner.write()
     }
 }
 
@@ -901,7 +901,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
                             new_table.set_entry(i, entry);
                         } else {
                             let phys = allocator.allocate_one()?;
-                            let mut page_manager_guard = page_manager_lock_irqsave();
+                            let mut page_manager_guard = page_manager_lock();
                             let old_phys = entry.address().unwrap();
                             page_manager_guard.copy_page(&old_phys, allocator).ok()?;
                             new_table.set_entry(i, PageEntry::new(phys, entry.flags()));
@@ -1459,8 +1459,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         flags: EntryFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
-        let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
-            page_manager_lock_irqsave();
+        let mut page_manager_guard: RwSemWriteGuard<'static, PageManager> = page_manager_lock();
         let page = page_manager_guard
             .create_one_page(
                 PageType::Normal,

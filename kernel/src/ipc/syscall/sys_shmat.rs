@@ -8,7 +8,7 @@ use crate::{
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
-        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
+        page::{page_manager_lock, EntryFlags, PageFlushAll},
         syscall::ProtFlags,
         ucontext::{AddressSpace, PhysmapParams, VMA},
         VirtAddr, VmFlags,
@@ -103,7 +103,7 @@ pub(super) fn do_kernel_shmat(
             vma.unmap(&mut address_write_guard.user_mapper.utable, flusher);
 
             // 将该虚拟内存区域映射到共享内存区域
-            let mut page_manager_guard = page_manager_lock_irqsave();
+            let mut page_manager_guard = page_manager_lock();
             let mut virt = VirtPageFrame::new(vaddr);
             for _ in 0..count.data() {
                 let r = unsafe {
@@ -119,7 +119,7 @@ pub(super) fn do_kernel_shmat(
                 // 将vma加入到对应Page的anon_vma
                 page_manager_guard
                     .get_unwrap(&phys.phys_address())
-                    .write_irqsave()
+                    .write()
                     .insert_vma(vma.clone());
 
                 phys = phys.next();

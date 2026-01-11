@@ -771,7 +771,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn datasync(&self) -> Result<(), SystemError> {
         let page_cache = self.page_cache();
         if let Some(page_cache) = page_cache {
-            return page_cache.lock_irqsave().sync();
+            return page_cache.lock().sync();
         }
         Ok(())
     }

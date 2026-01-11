@@ -8,7 +8,7 @@ use crate::arch::KexecArch;
 use crate::arch::MMArch;
 use crate::exception::InterruptArch;
 use crate::libs::spinlock::SpinLock;
-use crate::mm::page::{page_manager_lock_irqsave, Page, PageFlags, PageType};
+use crate::mm::page::{page_manager_lock, Page, PageFlags, PageType};
 use crate::mm::MemoryManagementArch;
 use crate::syscall::user_access::UserBufferReader;
 use alloc::rc::Rc;
@@ -105,7 +105,7 @@ pub fn kimage_alloc_pages(
 ) -> Result<Option<Arc<Page>>, SystemError> {
     let mut _page = None;
     let mut extra_pages: Vec<Arc<Page>> = Vec::new();
-    let mut alloc = page_manager_lock_irqsave();
+    let mut alloc = page_manager_lock();
 
     let _count = 1 << order;
 

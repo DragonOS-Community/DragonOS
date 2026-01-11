@@ -239,13 +239,11 @@ impl PageFaultHandler {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let mapper = &mut pfm.mapper;
-        let mut should_lock = false;
-        let _ = should_lock;
         // If this is an anonymous shared mapping, use a shared backing so pages are visible across fork
         {
             let guard = vma.lock_irqsave();
             // 检查 VMA 是否有 VM_LOCKONFAULT 标志
-            should_lock = guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);
+            let should_lock = guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);
             if guard.vm_flags().contains(VmFlags::VM_SHARED) {
                 let shared = guard.shared_anon.clone();
                 if let Some(shared) = shared {
@@ -294,6 +292,7 @@ impl PageFaultHandler {
 
         // Fallback: private anonymous page (MAP_PRIVATE or non-shared anon)
         let flags = vma.lock_irqsave().flags();
+        let should_lock = vma.lock_irqsave().vm_flags().contains(VmFlags::VM_LOCKONFAULT);
         if let Some(flush) = mapper.map(address, flags) {
             flush.flush();
             crate::debug::klog::mm::mm_debug_log(

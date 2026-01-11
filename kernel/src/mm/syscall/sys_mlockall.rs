@@ -90,12 +90,18 @@ impl Syscall for SysMlockallHandle {
                 let vm_flags = *vma_guard.vm_flags();
                 let region = *vma_guard.region();
 
-                if !vma.is_accessible() {
-                    continue;
-                }
+                // 判断是否可访问（使用已读取的 vm_flags，避免锁释放后状态变化）
+                let vm_access_flags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
+                let is_accessible = vm_flags.intersects(vm_access_flags);
 
                 let already_locked = vm_flags.contains(VmFlags::VM_LOCKED)
                     || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+
+                drop(vma_guard);  // 完成所有判断后释放锁
+
+                if !is_accessible {
+                    continue;
+                }
 
                 if !already_locked {
                     let len = region.end().data() - region.start().data();

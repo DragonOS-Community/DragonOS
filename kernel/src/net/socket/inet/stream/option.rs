@@ -105,6 +105,43 @@ impl From<Options> for i32 {
 
 /// TCP socket option setters.
 impl super::TcpSocket {
+    #[inline]
+    fn set_bool_option(
+        atomic: &core::sync::atomic::AtomicBool,
+        val: &[u8],
+        on_set: impl FnOnce(bool) -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        let on = byte_parser::read_bool_flag(val)?;
+        atomic.store(on, core::sync::atomic::Ordering::Relaxed);
+        on_set(on)
+    }
+
+    #[inline]
+    fn write_bool_opt_u32(
+        value: &mut [u8],
+        atomic: &core::sync::atomic::AtomicBool,
+    ) -> Result<usize, SystemError> {
+        let v = if atomic.load(core::sync::atomic::Ordering::Relaxed) {
+            1
+        } else {
+            0
+        };
+        Self::write_u32_opt(value, v)
+    }
+
+    #[inline]
+    fn write_bool_opt_i32(
+        value: &mut [u8],
+        atomic: &core::sync::atomic::AtomicBool,
+    ) -> Result<usize, SystemError> {
+        let v = if atomic.load(core::sync::atomic::Ordering::Relaxed) {
+            1
+        } else {
+            0
+        };
+        Self::write_i32_opt(value, v)
+    }
+
     /// Helper to write a u32 value to an option buffer.
     #[inline]
     fn write_u32_opt(value: &mut [u8], v: u32) -> Result<usize, SystemError> {
@@ -217,10 +254,7 @@ impl super::TcpSocket {
                 Ok(())
             }
             PSO::TIMESTAMP_OLD | PSO::TIMESTAMP_NEW => {
-                let on = byte_parser::read_bool_flag(val)?;
-                self.so_timestamp_enabled()
-                    .store(on, core::sync::atomic::Ordering::Relaxed);
-                Ok(())
+                Self::set_bool_option(self.so_timestamp_enabled(), val, |_| Ok(()))
             }
             PSO::SNDBUF | PSO::SNDBUFFORCE => {
                 let requested = byte_parser::read_u32(val)? as usize;
@@ -259,10 +293,7 @@ impl super::TcpSocket {
                     Err(SystemError::ENOENT)
                 }
             }
-            PSO::KEEPALIVE => {
-                let on = byte_parser::read_bool_flag(val)?;
-                self.so_keepalive_enabled()
-                    .store(on, core::sync::atomic::Ordering::Relaxed);
+            PSO::KEEPALIVE => Self::set_bool_option(self.so_keepalive_enabled(), val, |on| {
                 let interval = if on {
                     Some(smoltcp::time::Duration::from_secs(7200))
                 } else {
@@ -270,7 +301,7 @@ impl super::TcpSocket {
                 };
                 self.apply_keepalive(interval);
                 Ok(())
-            }
+            }),
             _ => Ok(()), // Accept and ignore other SOL_SOCKET options
         }
     }
@@ -310,28 +341,16 @@ impl super::TcpSocket {
                 Ok(())
             }
             Options::KeepCnt | Options::KeepIdle => Ok(()), // Stub: silently ignore
-            Options::INQ => {
-                let on = byte_parser::read_bool_flag(val)?;
-                self.tcp_inq_enabled()
-                    .store(on, core::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
+            Options::INQ => Self::set_bool_option(self.tcp_inq_enabled(), val, |_| Ok(())),
             Options::QuickAck => {
-                let on = byte_parser::read_bool_flag(val)?;
-                self.tcp_quickack_enabled()
-                    .store(on, core::sync::atomic::Ordering::Relaxed);
-                Ok(())
+                Self::set_bool_option(self.tcp_quickack_enabled(), val, |_| Ok(()))
             }
-            Options::Cork => {
-                let on = byte_parser::read_bool_flag(val)?;
-                self.options
-                    .tcp_cork
-                    .store(on, core::sync::atomic::Ordering::Relaxed);
+            Options::Cork => Self::set_bool_option(&self.options.tcp_cork, val, |on| {
                 if !on {
                     let _ = self.flush_cork_buffer();
                 }
                 Ok(())
-            }
+            }),
             Options::Congestion => {
                 let s = byte_parser::read_string(val)?;
                 let cc = match s {
@@ -433,17 +452,7 @@ impl super::TcpSocket {
                 };
                 Self::write_i32_opt(value, err)
             }
-            PSO::KEEPALIVE => {
-                let v: i32 = if self
-                    .so_keepalive_enabled()
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                {
-                    1
-                } else {
-                    0
-                };
-                Self::write_i32_opt(value, v)
-            }
+            PSO::KEEPALIVE => Self::write_bool_opt_i32(value, self.so_keepalive_enabled()),
             _ => {
                 // Most SOL_SOCKET options are handled by sys_getsockopt directly.
                 Err(SystemError::ENOPROTOOPT)
@@ -476,33 +485,9 @@ impl super::TcpSocket {
                 let nodelay: u32 = if nagle_enabled { 0 } else { 1 };
                 Self::write_u32_opt(value, nodelay)
             }
-            Options::INQ => {
-                let v: u32 = if self.inq_enabled() { 1 } else { 0 };
-                Self::write_u32_opt(value, v)
-            }
-            Options::QuickAck => {
-                let v: u32 = if self
-                    .tcp_quickack_enabled()
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                {
-                    1
-                } else {
-                    0
-                };
-                Self::write_u32_opt(value, v)
-            }
-            Options::Cork => {
-                let v: i32 = if self
-                    .options
-                    .tcp_cork
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                {
-                    1
-                } else {
-                    0
-                };
-                Self::write_i32_opt(value, v)
-            }
+            Options::INQ => Self::write_bool_opt_u32(value, self.tcp_inq_enabled()),
+            Options::QuickAck => Self::write_bool_opt_u32(value, self.tcp_quickack_enabled()),
+            Options::Cork => Self::write_bool_opt_i32(value, &self.options.tcp_cork),
             Options::Congestion => {
                 let cc_name = self
                     .with_socket_property(smoltcp::socket::tcp::CongestionControl::Reno, |inner| {

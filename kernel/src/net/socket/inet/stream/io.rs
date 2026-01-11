@@ -6,24 +6,160 @@ use crate::net::socket::PMSG;
 use super::inner;
 use super::TcpSocket;
 
+#[inline]
+fn discard_recv_queue(socket: &mut smoltcp::socket::tcp::Socket) {
+    while socket.can_recv() {
+        match socket.recv(|data| (data.len(), data.len())) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
 impl TcpSocket {
-    #[allow(dead_code)]
-    pub fn try_recv(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.try_recv_with_flags(buf, PMSG::empty())
+    fn recv_established(
+        &self,
+        socket: &mut smoltcp::socket::tcp::Socket,
+        buf: &mut [u8],
+        flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        let mut current_buf = buf;
+        let is_recv_shutdown = self.is_recv_shutdown();
+        if is_recv_shutdown {
+            let remaining = self.recv_shutdown.remaining_limit();
+            if remaining == 0 {
+                discard_recv_queue(socket);
+                return Ok(0);
+            }
+            let cap = core::cmp::min(current_buf.len(), remaining);
+            current_buf = &mut current_buf[..cap];
+        }
+
+        if !socket.can_recv() {
+            // Linux 语义：对端已关闭写端(收到 FIN)且本端已读完数据时，recv 返回 0。
+            // 如果状态表明已收到 FIN，即使 buffer 为空也应返回 0 (EOF)。
+            let state = socket.state();
+            if matches!(
+                state,
+                smoltcp::socket::tcp::State::CloseWait
+                    | smoltcp::socket::tcp::State::LastAck
+                    | smoltcp::socket::tcp::State::Closing
+                    | smoltcp::socket::tcp::State::TimeWait
+                    | smoltcp::socket::tcp::State::Closed
+            ) {
+                return Ok(0);
+            }
+
+            if !socket.may_recv() {
+                return Ok(0);
+            }
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        // gVisor tcp_socket.cc MsgTrunc* tests: for TCP stream, MSG_TRUNC means
+        // "report the length but don't copy payload into userspace".
+        // - Without MSG_PEEK: also consume (discard) the bytes.
+        // - With MSG_PEEK: do not consume.
+        if flags.contains(PMSG::TRUNC) {
+            if flags.contains(PMSG::PEEK) {
+                let queued = socket.recv_queue();
+                return Ok(core::cmp::min(current_buf.len(), queued));
+            }
+
+            let mut total = 0usize;
+            while total < current_buf.len() {
+                if !socket.can_recv() {
+                    break;
+                }
+
+                let want = current_buf.len() - total;
+                let got = match socket.recv(|data| {
+                    let take = core::cmp::min(want, data.len());
+                    // Discard without copying.
+                    (take, take)
+                }) {
+                    Ok(n) => n,
+                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                        return Err(SystemError::ENOTCONN);
+                    }
+                    Err(smoltcp::socket::tcp::RecvError::Finished) => {
+                        return Ok(total);
+                    }
+                };
+
+                if got == 0 {
+                    break;
+                }
+                total += got;
+            }
+
+            if total == 0 {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            if is_recv_shutdown && self.recv_shutdown.record_read(total) {
+                discard_recv_queue(socket);
+            }
+            return Ok(total);
+        }
+
+        if flags.contains(PMSG::PEEK) {
+            return match socket.peek_slice(current_buf) {
+                Ok(size) => Ok(size),
+                Err(smoltcp::socket::tcp::RecvError::InvalidState) => Err(SystemError::ENOTCONN),
+                Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
+            };
+        }
+
+        // smoltcp::tcp::Socket::recv_slice() 只会出队一段“连续”的 rx buffer。
+        // 对于环形缓冲区发生 wrap 的情况，即使队列里有更多数据也可能只读到一部分。
+        // Linux 的 stream socket 行为：一次 recv 尽量返回当前已到达的所有数据(直到用户缓冲区满)。
+        let mut total = 0usize;
+        while total < current_buf.len() {
+            if !socket.can_recv() {
+                break;
+            }
+
+            let want = current_buf.len() - total;
+            let got = match socket.recv(|data| {
+                let take = core::cmp::min(want, data.len());
+                if take > 0 {
+                    current_buf[total..total + take].copy_from_slice(&data[..take]);
+                }
+                (take, take)
+            }) {
+                Ok(n) => n,
+                Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                    return Err(SystemError::ENOTCONN);
+                }
+                Err(smoltcp::socket::tcp::RecvError::Finished) => {
+                    // FIN 已到达。
+                    // 如果这次已读到部分数据，先把数据返回；否则返回 0 表示 EOF。
+                    return Ok(total);
+                }
+            };
+
+            if got == 0 {
+                break;
+            }
+            total += got;
+        }
+
+        if total == 0 {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        if is_recv_shutdown && self.recv_shutdown.record_read(total) {
+            discard_recv_queue(socket);
+        }
+        Ok(total)
     }
 
-    pub(crate) fn try_recv_with_flags(
+    pub(super) fn try_recv_with_flags(
         &self,
         buf: &mut [u8],
         flags: PMSG,
     ) -> Result<usize, SystemError> {
         let mut total_read = 0;
-        let recv_shutdown_limit = self
-            .recv_shutdown_limit
-            .load(core::sync::atomic::Ordering::Relaxed);
-        let mut recv_shutdown_read = self
-            .recv_shutdown_read
-            .load(core::sync::atomic::Ordering::Relaxed);
 
         loop {
             // SelfConnected does not rely on protocol-stack progress; avoid calling iface.poll()
@@ -50,184 +186,14 @@ impl TcpSocket {
                 .as_ref()
                 .expect("Tcp inner::Inner is None")
             {
-                inner::Inner::Established(established) => {
-                    established.with_mut(|socket| {
-                        let mut current_buf = &mut buf[total_read..];
-                        let mut shutdown_remaining = None;
-                        if self.is_recv_shutdown() {
-                            let remaining = recv_shutdown_limit.saturating_sub(recv_shutdown_read);
-                            if remaining == 0 {
-                                while socket.can_recv() {
-                                    match socket.recv(|data| (data.len(), data.len())) {
-                                        Ok(0) => break,
-                                        Ok(_) => {}
-                                        Err(_) => break,
-                                    }
-                                }
-                                return Ok(0);
-                            }
-                            let cap = core::cmp::min(current_buf.len(), remaining);
-                            current_buf = &mut current_buf[..cap];
-                            shutdown_remaining = Some(remaining);
-                        }
-
-                        if !socket.can_recv() {
-                            // Linux 语义：对端已关闭写端(收到 FIN)且本端已读完数据时，recv 返回 0。
-                            // 如果状态表明已收到 FIN，即使 buffer 为空也应返回 0 (EOF)。
-                            let state = socket.state();
-                            if matches!(
-                                state,
-                                smoltcp::socket::tcp::State::CloseWait
-                                    | smoltcp::socket::tcp::State::LastAck
-                                    | smoltcp::socket::tcp::State::Closing
-                                    | smoltcp::socket::tcp::State::TimeWait
-                                    | smoltcp::socket::tcp::State::Closed
-                            ) {
-                                return Ok(0);
-                            }
-
-                            if !socket.may_recv() {
-                                return Ok(0);
-                            }
-                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                        }
-
-                        // gVisor tcp_socket.cc MsgTrunc* tests: for TCP stream, MSG_TRUNC means
-                        // "report the length but don't copy payload into userspace".
-                        // - Without MSG_PEEK: also consume (discard) the bytes.
-                        // - With MSG_PEEK: do not consume.
-                        if flags.contains(PMSG::TRUNC) {
-                            if flags.contains(PMSG::PEEK) {
-                                let queued = socket.recv_queue();
-                                return Ok(core::cmp::min(current_buf.len(), queued));
-                            }
-
-                            let mut total = 0usize;
-                            while total < current_buf.len() {
-                                if !socket.can_recv() {
-                                    break;
-                                }
-
-                                let want = current_buf.len() - total;
-                                let got = match socket.recv(|data| {
-                                    let take = core::cmp::min(want, data.len());
-                                    // Discard without copying.
-                                    (take, take)
-                                }) {
-                                    Ok(n) => n,
-                                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                                        return Err(SystemError::ENOTCONN);
-                                    }
-                                    Err(smoltcp::socket::tcp::RecvError::Finished) => {
-                                        return Ok(total);
-                                    }
-                                };
-
-                                if got == 0 {
-                                    break;
-                                }
-                                total += got;
-                            }
-
-                            if total == 0 {
-                                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                            }
-                            if let Some(remaining) = shutdown_remaining {
-                                let new_read = recv_shutdown_read + total;
-                                recv_shutdown_read = core::cmp::min(new_read, recv_shutdown_limit);
-                                self.recv_shutdown_read.store(
-                                    recv_shutdown_read,
-                                    core::sync::atomic::Ordering::Relaxed,
-                                );
-                                if new_read >= remaining {
-                                    while socket.can_recv() {
-                                        match socket.recv(|data| (data.len(), data.len())) {
-                                            Ok(0) => break,
-                                            Ok(_) => {}
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-                            }
-                            return Ok(total);
-                        }
-
-                        if flags.contains(PMSG::PEEK) {
-                            match socket.peek_slice(current_buf) {
-                                Ok(size) => Ok(size),
-                                Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                                    Err(SystemError::ENOTCONN)
-                                }
-                                Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
-                            }
-                        } else {
-                            // smoltcp::tcp::Socket::recv_slice() 只会出队一段“连续”的 rx buffer。
-                            // 对于环形缓冲区发生 wrap 的情况，即使队列里有更多数据也可能只读到一部分。
-                            // Linux 的 stream socket 行为：一次 recv 尽量返回当前已到达的所有数据(直到用户缓冲区满)。
-                            let mut total = 0usize;
-
-                            while total < current_buf.len() {
-                                if !socket.can_recv() {
-                                    break;
-                                }
-
-                                let want = current_buf.len() - total;
-                                let got = match socket.recv(|data| {
-                                    let take = core::cmp::min(want, data.len());
-                                    if take > 0 {
-                                        current_buf[total..total + take]
-                                            .copy_from_slice(&data[..take]);
-                                    }
-                                    (take, take)
-                                }) {
-                                    Ok(n) => n,
-                                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                                        return Err(SystemError::ENOTCONN);
-                                    }
-                                    Err(smoltcp::socket::tcp::RecvError::Finished) => {
-                                        // FIN 已到达。
-                                        // 如果这次已读到部分数据，先把数据返回；否则返回 0 表示 EOF。
-                                        return Ok(total);
-                                    }
-                                };
-
-                                if got == 0 {
-                                    break;
-                                }
-                                total += got;
-                            }
-
-                            if total == 0 {
-                                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                            } else {
-                                if let Some(remaining) = shutdown_remaining {
-                                    let new_read = recv_shutdown_read + total;
-                                    recv_shutdown_read =
-                                        core::cmp::min(new_read, recv_shutdown_limit);
-                                    self.recv_shutdown_read.store(
-                                        recv_shutdown_read,
-                                        core::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    if new_read >= remaining {
-                                        while socket.can_recv() {
-                                            match socket.recv(|data| (data.len(), data.len())) {
-                                                Ok(0) => break,
-                                                Ok(_) => {}
-                                                Err(_) => break,
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(total)
-                            }
-                        }
-                    })
-                }
+                inner::Inner::Established(established) => established.with_mut(|socket| {
+                    self.recv_established(socket, &mut buf[total_read..], flags)
+                }),
                 inner::Inner::SelfConnected(sc) => {
                     // Self-connect: data path is a local queue.
                     let mut current_buf = &mut buf[total_read..];
                     if self.is_recv_shutdown() {
-                        let remaining = recv_shutdown_limit.saturating_sub(recv_shutdown_read);
+                        let remaining = self.recv_shutdown.remaining_limit();
                         if remaining == 0 {
                             sc.discard_all();
                             return Ok(0);
@@ -239,14 +205,8 @@ impl TcpSocket {
                     let trunc = flags.contains(PMSG::TRUNC);
                     let send_shutdown = self.is_send_shutdown();
                     let n = sc.recv_into(current_buf, peek, trunc, send_shutdown)?;
-                    if self.is_recv_shutdown() && !peek {
-                        let new_read = recv_shutdown_read + n;
-                        recv_shutdown_read = core::cmp::min(new_read, recv_shutdown_limit);
-                        self.recv_shutdown_read
-                            .store(recv_shutdown_read, core::sync::atomic::Ordering::Relaxed);
-                        if new_read >= recv_shutdown_limit {
-                            sc.discard_all();
-                        }
+                    if self.is_recv_shutdown() && !peek && self.recv_shutdown.record_read(n) {
+                        sc.discard_all();
                     }
                     Ok(n)
                 }

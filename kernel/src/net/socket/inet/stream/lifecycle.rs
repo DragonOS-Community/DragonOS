@@ -1,7 +1,6 @@
 use crate::net::socket::common::ShutdownBit;
 use crate::net::socket::inet::InetSocket;
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 use super::inner;
@@ -118,8 +117,9 @@ impl TcpSocket {
                 match init {
                     inner::Init::Bound((bound, local)) if local == remote_endpoint => {
                         // Capture an effective queue capacity from the underlying socket's recv buffer.
-                        let rx_cap =
-                            bound.with::<smoltcp::socket::tcp::Socket, _, _>(|s| s.recv_capacity());
+                        let rx_cap = bound
+                            .with::<smoltcp::socket::tcp::Socket, _, _>(|s| s.recv_capacity())
+                            .clamp(1 << 20, super::constants::MAX_SOCKET_BUFFER);
                         (
                             inner::Inner::SelfConnected(inner::SelfConnected::new(
                                 bound, local, rx_cap,
@@ -274,8 +274,7 @@ impl TcpSocket {
 
                 if how.contains(ShutdownBit::SHUT_RD) {
                     let queued = established.with(|socket| socket.recv_queue());
-                    self.recv_shutdown_limit.store(queued, Ordering::Relaxed);
-                    self.recv_shutdown_read.store(0, Ordering::Relaxed);
+                    self.recv_shutdown.init(queued);
                 }
 
                 if how.contains(ShutdownBit::SHUT_WR) {
@@ -365,8 +364,7 @@ impl TcpSocket {
                 // No smoltcp close/abort is needed.
                 if how.contains(ShutdownBit::SHUT_RD) {
                     let queued = sc.recv_queue();
-                    self.recv_shutdown_limit.store(queued, Ordering::Relaxed);
-                    self.recv_shutdown_read.store(0, Ordering::Relaxed);
+                    self.recv_shutdown.init(queued);
                 }
                 (inner::Inner::SelfConnected(sc), how)
             }

@@ -15,6 +15,7 @@ use crate::process::ProcessManager;
 
 use super::constants;
 use super::inner;
+use super::shutdown::ShutdownRecvTracker;
 
 type EP = crate::filesystem::epoll::EPollEventType;
 
@@ -98,8 +99,7 @@ pub struct TcpSocket {
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
     pub(crate) cork_buf: Mutex<Vec<u8>>,
-    pub(crate) recv_shutdown_limit: AtomicUsize,
-    pub(crate) recv_shutdown_read: AtomicUsize,
+    pub(crate) recv_shutdown: ShutdownRecvTracker,
 }
 
 impl TcpSocket {
@@ -124,8 +124,7 @@ impl TcpSocket {
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),
             cork_buf: Mutex::new(Vec::new()),
-            recv_shutdown_limit: AtomicUsize::new(0),
-            recv_shutdown_read: AtomicUsize::new(0),
+            recv_shutdown: ShutdownRecvTracker::new(),
         }
     }
 

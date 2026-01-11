@@ -250,7 +250,15 @@ impl TcpSocket {
         }
 
         if how.contains(ShutdownBit::SHUT_WR) {
-            let _ = self.flush_cork_buffer();
+            if let Err(e) = self.flush_cork_buffer() {
+                if e == SystemError::EAGAIN_OR_EWOULDBLOCK {
+                    // Defer FIN until cork-buffered bytes are flushed into the TCP stack.
+                    self.send_fin_deferred
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
+                } else {
+                    return Err(e);
+                }
+            }
         }
 
         let mut post_poll_iface: Option<Arc<dyn crate::net::Iface>> = None;
@@ -278,7 +286,14 @@ impl TcpSocket {
                 }
 
                 if how.contains(ShutdownBit::SHUT_WR) {
-                    established.with_mut(|socket| socket.close());
+                    if self
+                        .send_fin_deferred
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                    {
+                        // FIN will be sent once cork-buffered bytes are flushed.
+                    } else {
+                        established.with_mut(|socket| socket.close());
+                    }
                     post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
                     post_poll_iface = Some(established.iface().clone());
                 }

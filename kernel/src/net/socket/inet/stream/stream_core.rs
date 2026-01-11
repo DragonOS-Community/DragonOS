@@ -88,6 +88,9 @@ impl TcpSocketOptions {
 pub struct TcpSocket {
     pub(crate) inner: RwSem<Option<inner::Inner>>,
     pub(crate) shutdown: AtomicUsize,
+    /// If SHUT_WR is requested while `cork_buf` still contains bytes that have not been
+    /// handed to the underlying TCP stack, defer sending FIN until those bytes are flushed.
+    pub(crate) send_fin_deferred: AtomicBool,
     pub(crate) nonblock: AtomicBool,
     pub(crate) wait_queue: WaitQueue,
     pub(crate) inode_id: InodeId,
@@ -113,6 +116,7 @@ impl TcpSocket {
         Self {
             inner: RwSem::new(Some(inner)),
             shutdown: AtomicUsize::new(0),
+            send_fin_deferred: AtomicBool::new(false),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),

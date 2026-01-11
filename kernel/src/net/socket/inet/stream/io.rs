@@ -18,6 +18,33 @@ fn discard_recv_queue(socket: &mut smoltcp::socket::tcp::Socket) {
 }
 
 impl TcpSocket {
+    fn maybe_complete_shutdown_wr_fin(&self) {
+        if !self.is_send_shutdown() {
+            return;
+        }
+        if !self
+            .send_fin_deferred
+            .swap(false, core::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+
+        let mut writer = self.inner.write();
+        let inner = match writer.take() {
+            Some(inner) => inner,
+            None => return,
+        };
+        match inner {
+            inner::Inner::Established(established) => {
+                established.with_mut(|socket| socket.close());
+                writer.replace(inner::Inner::Established(established));
+            }
+            other => {
+                writer.replace(other);
+            }
+        }
+    }
+
     fn recv_established(
         &self,
         socket: &mut smoltcp::socket::tcp::Socket,
@@ -290,6 +317,38 @@ impl TcpSocket {
         if self.is_send_shutdown() {
             return Err(SystemError::EPIPE);
         }
+
+        // If there are pending cork-buffered bytes (e.g., uncork flush hit EAGAIN),
+        // keep ordering by enqueueing new bytes behind them, and opportunistically flush.
+        {
+            let mut cork_buf = self.cork_buf.lock();
+            if !cork_buf.is_empty() {
+                let cap = self
+                    .send_buf_size()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let free = cap.saturating_sub(cork_buf.len());
+                if free == 0 {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                let n = core::cmp::min(free, buf.len());
+                cork_buf.extend_from_slice(&buf[..n]);
+                drop(cork_buf);
+
+                if !self
+                    .options
+                    .tcp_cork
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Err(e) = self.flush_cork_buffer() {
+                        if e != SystemError::EAGAIN_OR_EWOULDBLOCK {
+                            return Err(e);
+                        }
+                    }
+                }
+                return Ok(n);
+            }
+        }
+
         if self
             .options
             .tcp_cork
@@ -325,6 +384,7 @@ impl TcpSocket {
         loop {
             let cork_buf = self.cork_buf.lock();
             if cork_buf.is_empty() {
+                self.maybe_complete_shutdown_wr_fin();
                 return Ok(());
             }
             let data = cork_buf.clone();

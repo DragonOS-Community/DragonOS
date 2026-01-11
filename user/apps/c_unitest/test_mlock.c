@@ -265,6 +265,16 @@ static int test_mlock2_invalid_flags(void) {
 static int test_mlockall_current(void) {
     TEST_START("mlockall_current");
 
+    // 增加 RLIMIT_MEMLOCK 以锁定所有当前映射
+    // mlockall(MCL_CURRENT) 会锁定进程的所有可访问 VMA（代码段、数据段、堆、栈等）
+    struct rlimit rlim;
+    rlim.rlim_cur = RLIM_INFINITY;
+    rlim.rlim_max = RLIM_INFINITY;
+    if (setrlimit(RLIMIT_MEMLOCK, &rlim) != 0) {
+        TEST_SKIP("setrlimit failed");
+        return 0;
+    }
+
     size_t pagesize = get_page_size();
     size_t length = pagesize * 2;
 
@@ -335,6 +345,16 @@ static int test_mlockall_future(void) {
  */
 static int test_mlockall_combined(void) {
     TEST_START("mlockall_combined");
+
+    // 增加 RLIMIT_MEMLOCK 以锁定所有当前映射
+    // mlockall(MCL_CURRENT) 会锁定进程的所有可访问 VMA（代码段、数据段、堆、栈等）
+    struct rlimit rlim;
+    rlim.rlim_cur = RLIM_INFINITY;
+    rlim.rlim_max = RLIM_INFINITY;
+    if (setrlimit(RLIMIT_MEMLOCK, &rlim) != 0) {
+        TEST_SKIP("setrlimit failed");
+        return 0;
+    }
 
     size_t pagesize = get_page_size();
 

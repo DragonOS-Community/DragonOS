@@ -721,7 +721,7 @@ impl InnerPage {
             // PG_MLOCKED: 页面已被锁定
             // PG_UNEVICTABLE: 页面不可被换出
             self.add_flags(PageFlags::PG_MLOCKED | PageFlags::PG_UNEVICTABLE);
-        } 
+        }
     }
 
     /// 减少 mlock 引用计数，并在计数归零时清除标志
@@ -735,7 +735,7 @@ impl InnerPage {
     ///
     /// 基于 Linux 6.6.21 mm/mlock.c:__munlock_folio()
     /// 该函数集中管理计数和标志，确保不变量一致性
-    pub fn dec_mlock_count(&mut self)  {
+    pub fn dec_mlock_count(&mut self) {
         let old = self.mlock_count.fetch_sub(1, Ordering::Relaxed);
         if old == 1 {
             // 计数归零，清除 PG_mlocked
@@ -746,7 +746,7 @@ impl InnerPage {
             if self.map_count() == 0 {
                 self.remove_flags(PageFlags::PG_UNEVICTABLE);
             }
-        } 
+        }
     }
 }
 

@@ -132,8 +132,10 @@ impl Syscall for SysMlock2Handle {
         // - 当 onfault=false 时，对 PROT_NONE 映射会返回 true（应返回 ENOMEM）
         // - 当 onfault=true 时，不会检测不可访问的 VMA（延迟锁定模式）
         let onfault = flags.contains(Mlock2Flags::MLOCK_ONFAULT);
-        let has_inaccessible_vma = addr_space.write().mlock(aligned_addr, aligned_len, onfault)?;
-        
+        let has_inaccessible_vma = addr_space
+            .write()
+            .mlock(aligned_addr, aligned_len, onfault)?;
+
         // 如果包含不可访问的 VMA 且非 onfault 模式，返回 ENOMEM
         // 这模拟了 Linux 中 __mm_populate() 在 PROT_NONE 映射上失败的行为
         if has_inaccessible_vma {

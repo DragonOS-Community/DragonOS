@@ -667,8 +667,8 @@ impl InnerAddressSpace {
         // RLIMIT_MEMLOCK 检查（针对 VM_LOCKED/VM_LOCKONFAULT）
         // 无论 VM_LOCKED 来自 MAP_LOCKED 标志还是 MCL_FUTURE 的 def_flags，都需要检查限制
         // 参考 Linux: mm/mmap.c:mmap_region() 中的 security check
-        let has_locked_flag = vm_flags.contains(VmFlags::VM_LOCKED)
-            || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+        let has_locked_flag =
+            vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
         if has_locked_flag {
             use crate::mm::mlock::can_do_mlock;
 
@@ -1345,7 +1345,12 @@ impl InnerAddressSpace {
     /// - `Ok(true)`: 包含不可访问的 VMA（如 PROT_NONE），VMA 标志已设置，但调用方应返回 ENOMEM
     /// - `Ok(false)`: 所有 VMA 均可访问，操作完全成功
     /// - `Err(e)`: 发生错误
-    pub fn mlock(&mut self, start: VirtAddr, len: usize, onfault: bool) -> Result<bool, SystemError> {
+    pub fn mlock(
+        &mut self,
+        start: VirtAddr,
+        len: usize,
+        onfault: bool,
+    ) -> Result<bool, SystemError> {
         // 计算结束地址
         let end = start.data().checked_add(len).ok_or(SystemError::ENOMEM)?;
         let end = VirtAddr::new(end);
@@ -1672,7 +1677,8 @@ impl InnerAddressSpace {
 
         // 根据解锁的 VMA 页面数减少 locked_vm（而不是直接设为 0）
         let current = self.locked_vm.load(Ordering::Relaxed);
-        self.locked_vm.store(current.saturating_sub(pages_to_subtract), Ordering::Relaxed);
+        self.locked_vm
+            .store(current.saturating_sub(pages_to_subtract), Ordering::Relaxed);
 
         Ok(())
     }
@@ -1695,10 +1701,7 @@ impl InnerAddressSpace {
     /// 用于处理 mlock/mlock2 时，如果请求范围内有部分已经锁定，
     /// 需要从请求的页面数中扣除已锁定的部分。
     pub fn count_mm_mlocked_page_nr(&self, start: VirtAddr, len: usize) -> usize {
-        let end = start
-            .data()
-            .checked_add(len)
-            .unwrap_or_else(|| usize::MAX);
+        let end = start.data().checked_add(len).unwrap_or_else(|| usize::MAX);
         let end = VirtAddr::new(core::cmp::min(end, MMArch::USER_END_VADDR.data()));
 
         let region = VirtRegion::new(start, len);
@@ -1711,8 +1714,7 @@ impl InnerAddressSpace {
             drop(vma_guard);
 
             // 只计算已锁定的 VMA
-            if !vm_flags.contains(VmFlags::VM_LOCKED)
-                && !vm_flags.contains(VmFlags::VM_LOCKONFAULT)
+            if !vm_flags.contains(VmFlags::VM_LOCKED) && !vm_flags.contains(VmFlags::VM_LOCKONFAULT)
             {
                 continue;
             }

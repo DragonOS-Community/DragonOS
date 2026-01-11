@@ -1,6 +1,6 @@
 use crate::{
     ipc::shm::ShmFlags,
-    libs::align::{check_aligned, page_align_down, page_align_up},
+    libs::align::{check_aligned, page_align_up},
 };
 
 use super::{allocator::page_frame::PageFrameCount, MsFlags, VmFlags};

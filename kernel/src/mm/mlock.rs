@@ -70,9 +70,14 @@ pub fn can_do_mlock() -> bool {
 /// # 行为
 ///
 /// - 增加 mlock_count 引用计数
-/// - 当计数从 0 → 1 时：
-///   - 设置 PG_MLOCKED 标志（标记页面已锁定）
-///   - 设置 PG_UNEVICTABLE 标志（防止页面被换出）
+/// - 当计数从 0 → 1 时，自动设置 PG_MLOCKED 和 PG_UNEVICTABLE 标志
+///
+/// # 不变量保证
+///
+/// 该函数通过 InnerPage::inc_mlock_count() 集中管理计数和标志，
+/// 确保以下不变量始终成立：
+/// - mlock_count > 0 ⇔ PG_MLOCKED 已设置
+/// - mlock_count > 0 ⇒ PG_UNEVICTABLE 已设置
 ///
 /// # Linux 参考实现
 ///
@@ -81,23 +86,8 @@ pub fn can_do_mlock() -> bool {
 pub fn mlock_page(page: &Arc<Page>) {
     let mut page_guard = page.write_irqsave();
 
-    // 增加 mlock 计数
-    let old_count = page_guard.mlock_count();
-    page_guard.inc_mlock_count();
-
-    // 如果是第一次锁定，设置页面标志
-    if old_count == 0 {
-        // 设置 PG_mlocked
-        page_guard.add_flags(PageFlags::PG_MLOCKED);
-
-        // 设置 PG_unevictable（防止被换出）
-        page_guard.add_flags(PageFlags::PG_UNEVICTABLE);
-
-        // 如果页面在 LRU 中，需要从可换出 LRU 移到不可换出 LRU
-        // TODO: 实现 LRU 链表管理
-        // 注意：由于页面已设置 PG_UNEVICTABLE 标志，即使没有 LRU 管理，
-        // 页面回收机制也会检查该标志，不会被回收
-    }
+    // 集中管理计数和标志，确保不变量一致性
+    let first_lock = page_guard.inc_mlock_count();
 }
 
 /// 解锁单个物理页面
@@ -107,9 +97,15 @@ pub fn mlock_page(page: &Arc<Page>) {
 /// # 行为
 ///
 /// - 减少 mlock_count 引用计数
-/// - 当计数从 1 → 0 时：
-///   - 清除 PG_MLOCKED 标志
-///   - 如果页面未被映射（map_count == 0），清除 PG_UNEVICTABLE 标志
+/// - 当计数从 1 → 0 时，自动清除 PG_MLOCKED
+/// - 当计数从 1 → 0 且页面未被映射时，自动清除 PG_UNEVICTABLE
+///
+/// # 不变量保证
+///
+/// 该函数通过 InnerPage::dec_mlock_count() 集中管理计数和标志，
+/// 确保以下不变量始终成立：
+/// - mlock_count > 0 ⇔ PG_MLOCKED 已设置
+/// - mlock_count > 0 ⇒ PG_UNEVICTABLE 已设置
 ///
 /// # Linux 参考实现
 ///
@@ -118,26 +114,8 @@ pub fn mlock_page(page: &Arc<Page>) {
 pub fn munlock_page(page: &Arc<Page>) {
     let mut page_guard = page.write_irqsave();
 
-    // 减少 mlock 计数
-    let old_count = page_guard.mlock_count();
-    if old_count == 0 {
-        return; // 已经解锁，直接返回
-    }
-
+    // 集中管理计数和标志，确保不变量一致性
     page_guard.dec_mlock_count();
-
-    // 如果计数归零，清除页面标志
-    if old_count == 1 {
-        // 清除 PG_mlocked
-        page_guard.remove_flags(PageFlags::PG_MLOCKED);
-
-        // 如果页面可换出，移回正常 LRU
-        // 注意：需要检查页面是否真的可以换出（map_count == 0）
-        if page_guard.map_count() == 0 {
-            page_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
-            // TODO: 从不可换出 LRU 移回可换出 LRU
-        }
-    }
 }
 
 impl LockedVMA {

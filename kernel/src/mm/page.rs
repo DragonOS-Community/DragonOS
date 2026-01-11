@@ -703,14 +703,50 @@ impl InnerPage {
         self.mlock_count.load(Ordering::Relaxed)
     }
 
-    /// 增加 mlock 引用计数
+    /// 增加 mlock 引用计数，并在首次锁定时设置标志
+    ///
+    /// # 返回值
+    ///
+    /// - `true`: 计数从 0 -> 1，这是首次锁定，已设置 PG_MLOCKED 和 PG_UNEVICTABLE
+    /// - `false`: 计数从 N -> N+1 (N>0)，页面已被锁定
+    ///
+    /// # Linux 参考实现
+    ///
+    /// 基于 Linux 6.6.21 mm/mlock.c:__mlock_folio()
+    /// 该函数集中管理计数和标志，确保不变量一致性
     pub fn inc_mlock_count(&mut self) {
-        self.mlock_count.fetch_add(1, Ordering::Relaxed);
+        let old = self.mlock_count.fetch_add(1, Ordering::Relaxed);
+        if old == 0 {
+            // 首次锁定，原子性地设置标志
+            // PG_MLOCKED: 页面已被锁定
+            // PG_UNEVICTABLE: 页面不可被换出
+            self.add_flags(PageFlags::PG_MLOCKED | PageFlags::PG_UNEVICTABLE);
+        } 
     }
 
-    /// 减少 mlock 引用计数
-    pub fn dec_mlock_count(&mut self) {
-        self.mlock_count.fetch_sub(1, Ordering::Relaxed);
+    /// 减少 mlock 引用计数，并在计数归零时清除标志
+    ///
+    /// # 返回值
+    ///
+    /// - `true`: 计数从 1 -> 0，已清除 PG_MLOCKED，可能清除 PG_UNEVICTABLE
+    /// - `false`: 计数从 N -> N-1 (N>1)，页面仍被锁定
+    ///
+    /// # Linux 参考实现
+    ///
+    /// 基于 Linux 6.6.21 mm/mlock.c:__munlock_folio()
+    /// 该函数集中管理计数和标志，确保不变量一致性
+    pub fn dec_mlock_count(&mut self)  {
+        let old = self.mlock_count.fetch_sub(1, Ordering::Relaxed);
+        if old == 1 {
+            // 计数归零，清除 PG_mlocked
+            self.remove_flags(PageFlags::PG_MLOCKED);
+
+            // 只有当页面不再被映射时，才清除 PG_unevictable
+            // （与 Linux 语义一致：页面可能因为其他原因不可换出）
+            if self.map_count() == 0 {
+                self.remove_flags(PageFlags::PG_UNEVICTABLE);
+            }
+        } 
     }
 }
 

@@ -117,14 +117,14 @@ impl Syscall for SysMlock2Handle {
             // 计算范围内已锁定的页面（避免重复计数）
             let already_locked_in_range =
                 addr_space_read.count_mm_mlocked_page_nr(aligned_addr, aligned_len);
-            drop(addr_space_read);
             locked = current_locked + requested_pages - already_locked_in_range;
         }
 
         if locked > lock_limit_pages {
             return Err(SystemError::ENOMEM);
         }
-
+        
+        drop(addr_space_read);
         // ========== 执行锁定操作 ==========
         let onfault = flags.contains(Mlock2Flags::MLOCK_ONFAULT);
         addr_space.write().mlock(aligned_addr, aligned_len, onfault)?;

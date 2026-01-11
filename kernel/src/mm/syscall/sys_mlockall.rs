@@ -106,6 +106,7 @@ impl Syscall for SysMlockallHandle {
             if current_locked + pages_to_lock > lock_limit_pages {
                 return Err(SystemError::ENOMEM);
             }
+            drop(addr_space_read);
         }
 
         // ========== 执行锁定操作 ==========

@@ -296,10 +296,20 @@ pub fn do_mkdir_at(
     }
     let pcb = ProcessManager::current_pcb();
     let cred = pcb.cred();
+
+    // Linux 语义：目录执行权限控制能否遍历（查找子项）
+    // 先检查执行权限，再检查文件是否存在，最后检查写权限
+    // 顺序很重要：无执行权限 → EACCES；有执行权限且已存在 → EEXIST；有执行权限无写权限 → EACCES
     cred.inode_permission(&parent_md, PermissionMask::MAY_EXEC.bits())?;
+
+    // 已确认有执行权限，可以查找子项
     if current_inode.find(name).is_ok() {
         return Err(SystemError::EEXIST);
     }
+
+    // 创建目录还需要对父目录拥有写权限
+    cred.inode_permission(&parent_md, PermissionMask::MAY_WRITE.bits())?;
+
     let mut final_mode_bits = mode.bits() & InodeMode::S_IRWXUGO.bits();
     if (parent_md.mode.bits() & InodeMode::S_ISGID.bits()) != 0 {
         final_mode_bits |= InodeMode::S_ISGID.bits();

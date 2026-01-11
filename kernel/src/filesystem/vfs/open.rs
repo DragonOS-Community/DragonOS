@@ -77,6 +77,10 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize
     let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
     let target_inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
@@ -280,6 +284,13 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     };
     let metadata = inode.metadata()?;
     let file_type: FileType = metadata.file_type;
+
+    if how.o_flags.contains(FileFlags::O_NOFOLLOW)
+        && !how.o_flags.contains(FileFlags::O_PATH)
+        && file_type == FileType::SymLink
+    {
+        return Err(SystemError::ELOOP);
+    }
 
     // Linux semantics: socket inodes (S_IFSOCK) cannot be opened via open(2).
     // Users must use socket(2)/connect(2) instead. Linux returns ENXIO.

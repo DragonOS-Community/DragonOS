@@ -778,6 +778,14 @@ impl ProcessManager {
 
         ProcessManager::current_pcb().preempt_enable();
     }
+
+    pub fn process_count() -> usize {
+        ALL_PROCESS
+            .lock_irqsave()
+            .as_ref()
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
 }
 
 /// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换

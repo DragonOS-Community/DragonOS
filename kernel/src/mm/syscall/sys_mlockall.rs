@@ -51,13 +51,12 @@ impl Syscall for SysMlockallHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let flags = MlockAllFlags::from_bits(args[0] as u32).ok_or(SystemError::EINVAL)?;
 
-        // ========== 标志位验证 ==========
-        // 必须至少指定 MCL_CURRENT 或 MCL_FUTURE 之一
-        if !flags.intersects(MlockAllFlags::MCL_CURRENT | MlockAllFlags::MCL_FUTURE) {
-            return Err(SystemError::EINVAL);
-        }
-        // MCL_ONFAULT 不能单独使用
-        if flags == MlockAllFlags::MCL_ONFAULT {
+        // 标志位验证（与 Linux 6.6.21 mm/mlock.c:710-711 一致）
+        // 1. 必须至少指定 MCL_CURRENT 或 MCL_FUTURE 之一
+        // 2. MCL_ONFAULT 不能单独使用
+        if !flags.intersects(MlockAllFlags::MCL_CURRENT | MlockAllFlags::MCL_FUTURE)
+            || flags == MlockAllFlags::MCL_ONFAULT
+        {
             return Err(SystemError::EINVAL);
         }
 

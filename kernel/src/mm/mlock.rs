@@ -87,7 +87,7 @@ pub fn mlock_page(page: &Arc<Page>) {
     let mut page_guard = page.write_irqsave();
 
     // 集中管理计数和标志，确保不变量一致性
-    let first_lock = page_guard.inc_mlock_count();
+    page_guard.inc_mlock_count();
 }
 
 /// 解锁单个物理页面
@@ -179,10 +179,10 @@ impl LockedVMA {
                 if level > 0 && entry.flags().has_flag(MMArch::ENTRY_FLAG_HUGE_PAGE) {
                     // 显式检查 present 位（符合 Linux 语义）
                     if !entry.present() {
-                        log::debug!(
-                            "mlock: huge page at {:#x} not present, skipping",
-                            start.data()
-                        );
+                        // log::debug!(
+                        //     "mlock: huge page at {:#x} not present, skipping",
+                        //     start.data()
+                        // );
                     } else {
                         let sub_page_count = (next - start) >> MMArch::PAGE_SHIFT;
                         // 安全 unwrap（因为已检查 present）

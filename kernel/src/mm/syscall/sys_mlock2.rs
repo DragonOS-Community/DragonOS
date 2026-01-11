@@ -123,11 +123,22 @@ impl Syscall for SysMlock2Handle {
         if locked > lock_limit_pages {
             return Err(SystemError::ENOMEM);
         }
-        
+
         drop(addr_space_read);
+
         // ========== 执行锁定操作 ==========
+        // mlock() 返回 Result<bool>，其中 bool 表示是否包含不可访问的 VMA
+        // 参考 Linux 行为：
+        // - 当 onfault=false 时，对 PROT_NONE 映射会返回 true（应返回 ENOMEM）
+        // - 当 onfault=true 时，不会检测不可访问的 VMA（延迟锁定模式）
         let onfault = flags.contains(Mlock2Flags::MLOCK_ONFAULT);
-        addr_space.write().mlock(aligned_addr, aligned_len, onfault)?;
+        let has_inaccessible_vma = addr_space.write().mlock(aligned_addr, aligned_len, onfault)?;
+        
+        // 如果包含不可访问的 VMA 且非 onfault 模式，返回 ENOMEM
+        // 这模拟了 Linux 中 __mm_populate() 在 PROT_NONE 映射上失败的行为
+        if has_inaccessible_vma {
+            return Err(SystemError::ENOMEM);
+        }
 
         Ok(0)
     }

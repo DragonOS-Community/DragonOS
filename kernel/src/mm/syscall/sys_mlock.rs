@@ -101,6 +101,7 @@ impl Syscall for SysMlockHandle {
             lock_limit >> MMArch::PAGE_SHIFT
         };
 
+        //资源限制
         let requested_pages = aligned_len >> MMArch::PAGE_SHIFT;
         let addr_space_read = addr_space.read();
         let current_locked = addr_space_read.locked_vm();
@@ -116,8 +117,27 @@ impl Syscall for SysMlockHandle {
             return Err(SystemError::ENOMEM);
         }
         drop(addr_space_read);
+
+        // ========== 检查是否包含不可访问的 VMA (如 PROT_NONE) ==========
+        // 参考 Linux 行为：mlock() 会先设置 VMA 标志，然后调用 __mm_populate()
+        // 对于 PROT_NONE 映射，__mm_populate() 会失败返回 ENOMEM
+        // 但 VMA 标志已经设置，不会回滚（这是破坏性操作）
+        //
+        // 因此我们需要：
+        // 1. 检查是否有不可访问的 VMA
+        // 2. 如果有，仍然设置 VM_LOCKED 标志（保持一致性）
+        // 3. 但返回 ENOMEM（模拟 __mm_populate() 失败）
+
         // ========== 执行锁定操作 ==========
-        addr_space.write().mlock(aligned_addr, aligned_len, false)?;
+        // 无论是否包含不可访问的 VMA，都设置 VM_LOCKED 标志
+        // 这是破坏性操作，即使返回错误也不回滚（遵循 Linux 语义）
+        let has_inaccessible_vma = addr_space.write().mlock(aligned_addr, aligned_len, false)?;
+
+        // 如果包含不可访问的 VMA，返回 ENOMEM
+        // 这模拟了 Linux 中 __mm_populate() 在 PROT_NONE 映射上失败的行为
+        if has_inaccessible_vma {
+            return Err(SystemError::ENOMEM);
+        }
 
         Ok(0)
     }

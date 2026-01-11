@@ -7,6 +7,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 use system_error::SystemError;
 
 use super::constants;
+use super::info;
 use super::inner;
 
 use crate::libs::byte_parser;
@@ -470,7 +471,33 @@ impl super::TcpSocket {
             Options::Syncnt => Self::write_atomic_i32(value, self.tcp_syncnt()),
             Options::WindowClamp => Self::write_atomic_usize_as_u32(value, self.tcp_window_clamp()),
             Options::UserTimeout => Self::write_atomic_i32(value, self.tcp_user_timeout()),
+            Options::Info => self.get_tcp_info(value),
             _ => Err(SystemError::ENOPROTOOPT),
         }
+    }
+
+    /// Get TCP_INFO for this socket.
+    fn get_tcp_info(&self, value: &mut [u8]) -> Result<usize, SystemError> {
+        use info::TcpInfoCollector;
+
+        // For closed/unconnected sockets, return default info
+        let info = self.with_socket_property(info::PosixTcpInfo::default(), |inner| {
+            inner.with_socket(|socket| TcpInfoCollector::new(socket).collect())
+        });
+
+        // Copy the info struct to the output buffer
+        let info_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &info as *const info::PosixTcpInfo as *const u8,
+                core::mem::size_of::<info::PosixTcpInfo>(),
+            )
+        };
+
+        let len = core::cmp::min(value.len(), info_bytes.len());
+        if len > 0 {
+            value[..len].copy_from_slice(&info_bytes[..len]);
+        }
+
+        Ok(len)
     }
 }

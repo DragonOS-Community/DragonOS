@@ -12,6 +12,7 @@ use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, 
 use crate::time::syscall::PosixTimeval;
 
 mod constants;
+mod info;
 mod inner;
 mod option;
 pub use option::Options as TcpOption;

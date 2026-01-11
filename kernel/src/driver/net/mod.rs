@@ -6,7 +6,7 @@ use sysfs::netdev_register_kobject;
 
 use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};
-use crate::libs::rwlock::RwLockReadGuard;
+use crate::libs::mutex::MutexGuard;
 use crate::net::routing::RouterEnableDeviceCommon;
 use crate::net::socket::packet::PacketSocket;
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -267,7 +267,7 @@ impl IfaceCommon {
         let router_common_data = RouterEnableDeviceCommon::default();
         router_common_data
             .ip_addrs
-            .write()
+            .lock()
             .extend_from_slice(iface.ip_addrs());
         IfaceCommon {
             iface_id,
@@ -556,8 +556,8 @@ impl IfaceCommon {
         self.smol_iface.lock().ipv4_addr()
     }
 
-    pub fn ip_addrs(&self) -> RwLockReadGuard<'_, Vec<smoltcp::wire::IpCidr>> {
-        self.router_common_data.ip_addrs.read()
+    pub fn ip_addrs(&self) -> MutexGuard<'_, Vec<smoltcp::wire::IpCidr>> {
+        self.router_common_data.ip_addrs.lock()
     }
 
     pub fn prefix_len(&self) -> Option<u8> {

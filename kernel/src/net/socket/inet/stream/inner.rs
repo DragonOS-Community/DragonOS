@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::filesystem::epoll::EPollEventType;
 use crate::libs::mutex::Mutex;
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use crate::net::socket::{self, inet::Types};
 use crate::process::namespace::net_namespace::NetNamespace;
 use alloc::boxed::Box;
@@ -280,7 +280,7 @@ enum ConnectResult {
 #[derive(Debug)]
 pub struct Connecting {
     inner: socket::inet::BoundInner,
-    result: RwLock<ConnectResult>,
+    result: RwSem<ConnectResult>,
     /// Track if the connection was ever in ESTABLISHED state.
     /// This is needed because for loopback, SYN+ACK and RST can be processed in the same poll,
     /// so we might miss the ESTABLISHED state. If we were ever established, receiving RST
@@ -298,7 +298,7 @@ impl Connecting {
     ) -> Self {
         Connecting {
             inner,
-            result: RwLock::new(ConnectResult::Connecting),
+            result: RwSem::new(ConnectResult::Connecting),
             was_established: AtomicBool::new(false),
             local,
             remote,

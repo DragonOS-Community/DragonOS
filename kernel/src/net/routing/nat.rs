@@ -1,6 +1,6 @@
 use core::marker::PhantomData;
 
-use crate::libs::spinlock::SpinLock;
+use crate::libs::rwsem::RwSem;
 use crate::time::Duration;
 use crate::time::Instant;
 use alloc::fmt::Debug;
@@ -277,30 +277,30 @@ impl NatPolicy for DnatPolicy {
 
 #[derive(Debug)]
 pub struct ConnTracker {
-    pub(super) snat: SpinLock<NatTracker<SnatPolicy>>,
-    pub(super) dnat: SpinLock<NatTracker<DnatPolicy>>,
+    pub(super) snat: RwSem<NatTracker<SnatPolicy>>,
+    pub(super) dnat: RwSem<NatTracker<DnatPolicy>>,
 }
 
 impl ConnTracker {
     pub fn cleanup_expired(&self, now: Instant) {
-        self.snat.lock().cleanup_expired(now);
-        self.dnat.lock().cleanup_expired(now);
+        self.snat.write().cleanup_expired(now);
+        self.dnat.write().cleanup_expired(now);
     }
 
     pub fn update_snat_rules(&self, rules: Vec<SnatRule>) {
-        self.snat.lock().update_rules(rules);
+        self.snat.write().update_rules(rules);
     }
 
     pub fn update_dnat_rules(&self, rules: Vec<DnatRule>) {
-        self.dnat.lock().update_rules(rules);
+        self.dnat.write().update_rules(rules);
     }
 }
 
 impl Default for ConnTracker {
     fn default() -> Self {
         Self {
-            snat: SpinLock::new(NatTracker::<SnatPolicy>::default()),
-            dnat: SpinLock::new(NatTracker::<DnatPolicy>::default()),
+            snat: RwSem::new(NatTracker::<SnatPolicy>::default()),
+            dnat: RwSem::new(NatTracker::<DnatPolicy>::default()),
         }
     }
 }

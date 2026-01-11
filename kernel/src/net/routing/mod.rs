@@ -1,5 +1,6 @@
 use crate::driver::net::Iface;
-use crate::libs::rwlock::RwLock;
+use crate::libs::mutex::Mutex;
+use crate::libs::rwsem::RwSem;
 use crate::net::routing::nat::ConnTracker;
 use crate::net::routing::nat::DnatPolicy;
 use crate::net::routing::nat::FiveTuple;
@@ -8,7 +9,7 @@ use crate::net::routing::nat::NatPolicy;
 use crate::net::routing::nat::SnatPolicy;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
@@ -99,18 +100,18 @@ pub struct RouteDecision {
 pub struct Router {
     name: String,
     /// 路由表 //todo 后面再优化LC-trie，现在先简单用一个Vec
-    route_table: RwLock<RouteTable>,
+    route_table: RwSem<RouteTable>,
     pub(self) nat_tracker: Arc<ConnTracker>,
-    pub ns: RwLock<Weak<NetNamespace>>,
+    pub ns: RwSem<Weak<NetNamespace>>,
 }
 
 impl Router {
     pub fn new(name: String) -> Arc<Self> {
         Arc::new(Self {
             name: name.clone(),
-            route_table: RwLock::new(RouteTable::default()),
+            route_table: RwSem::new(RouteTable::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
-            ns: RwLock::new(Weak::default()),
+            ns: RwSem::new(Weak::default()),
         })
     }
 
@@ -118,10 +119,10 @@ impl Router {
     /// 注意： 这个Router实例不会启动轮询线程
     pub fn new_empty() -> Arc<Self> {
         Arc::new(Self {
-            name: "empty_router".to_string(),
-            route_table: RwLock::new(RouteTable::default()),
-            ns: RwLock::new(Weak::default()),
+            name: String::new(),
+            route_table: RwSem::new(RouteTable::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
+            ns: RwSem::new(Weak::default()),
         })
     }
 
@@ -319,7 +320,7 @@ pub trait RouterEnableDevice: Iface {
 
         let tracker = self.netns_router().nat_tracker();
 
-        if let Some((new_dst_ip, new_dst_port)) = tracker.snat.lock().process_return_traffic(tuple)
+        if let Some((new_dst_ip, new_dst_port)) = tracker.snat.write().process_return_traffic(tuple)
         {
             // log::info!(
             //     "Reverse SNAT: Translating {}:{} to {}:{}",
@@ -348,7 +349,7 @@ pub trait RouterEnableDevice: Iface {
             return NatPktStatus::ReverseSnat(new_tuple);
         }
 
-        let mut dnat_guard = tracker.dnat.lock();
+        let mut dnat_guard = tracker.dnat.write();
         if let Some((new_dst_ip, new_dst_port)) = dnat_guard.process_new_connection(tuple) {
             // log::info!(
             //     "DNAT: Translating {}:{} to {}:{}",
@@ -400,7 +401,7 @@ pub trait RouterEnableDevice: Iface {
 
         let tracker = self.netns_router().nat_tracker();
 
-        if let Some((new_src_ip, new_src_port)) = tracker.dnat.lock().process_return_traffic(tuple)
+        if let Some((new_src_ip, new_src_port)) = tracker.dnat.write().process_return_traffic(tuple)
         {
             // log::info!(
             //     "Reverse DNAT: Translating src {}:{} -> {}:{}",
@@ -421,7 +422,7 @@ pub trait RouterEnableDevice: Iface {
             return;
         }
 
-        let mut snat_guard = tracker.snat.lock();
+        let mut snat_guard = tracker.snat.write();
         if let Some((new_src_ip, new_src_port)) = snat_guard.process_new_connection(tuple) {
             // log::info!(
             //     "SNAT: Translating {}:{} -> {}:{}",
@@ -480,14 +481,14 @@ pub struct RouterEnableDeviceCommon {
     /// 当前接口的邻居缓存
     // pub arp_table: RwLock<BTreeMap<IpAddress, EthernetAddress>>,
     /// 当前接口的IP地址列表（因为如果直接通过smoltcp获取ip的话可能导致死锁，因此则这里维护一份）
-    pub ip_addrs: RwLock<Vec<IpCidr>>,
+    pub ip_addrs: Mutex<Vec<IpCidr>>,
 }
 
 impl Default for RouterEnableDeviceCommon {
     fn default() -> Self {
         Self {
             // arp_table: RwLock::new(BTreeMap::new()),
-            ip_addrs: RwLock::new(Vec::new()),
+            ip_addrs: Mutex::new(Vec::new()),
         }
     }
 }

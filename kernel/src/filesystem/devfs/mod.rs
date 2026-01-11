@@ -47,7 +47,7 @@ pub struct DevFS {
 
 fn is_zero_inode(pfm: &PageFaultMessage) -> bool {
     let vma = pfm.vma();
-    let vma_guard = vma.lock_irqsave();
+    let vma_guard = vma.read();
     match vma_guard.vm_file() {
         Some(file) => {
             let inode = file.inode();

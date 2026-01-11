@@ -59,9 +59,8 @@ impl BioQueue {
 
     /// Worker等待新请求
     pub fn wait_for_work(&self) {
-        let _ = self.wait_queue.wait_event_interruptible(
-            || !self.is_empty(),
-            None::<fn()>,
-        );
+        let _ = self
+            .wait_queue
+            .wait_event_interruptible(|| !self.is_empty(), None::<fn()>);
     }
 }

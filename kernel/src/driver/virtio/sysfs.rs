@@ -198,9 +198,11 @@ impl VirtIODeviceManager {
 
         self.setup_irq(&dev).ok();
         // 添加设备到设备管理器
-        device_manager().add_device(dev.clone() as Arc<dyn Device>).inspect_err(|e| {
-            error!("virtio_device_add: add device failed: {:?}", e);
-        })?;
+        device_manager()
+            .add_device(dev.clone() as Arc<dyn Device>)
+            .inspect_err(|e| {
+                error!("virtio_device_add: add device failed: {:?}", e);
+            })?;
         let r = device_manager()
             .add_groups(&(dev.clone() as Arc<dyn Device>), &[&VirtIODeviceAttrGroup]);
 

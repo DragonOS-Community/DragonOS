@@ -52,7 +52,7 @@ impl Syscall for SysShmdtHandle {
             .ok_or(SystemError::EINVAL)?;
 
         // 判断vaddr是否为起始地址
-        if vma.lock_irqsave().region().start() != vaddr {
+        if vma.read().region().start() != vaddr {
             return Err(SystemError::EINVAL);
         }
 

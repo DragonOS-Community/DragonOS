@@ -49,6 +49,22 @@ pub struct CopyItem {
     sub_len: usize,
 }
 
+/// 描述prepare_read阶段的结果
+pub struct PrepareReadResult {
+    /// 已缓存的页面复制项
+    pub copies: Vec<CopyItem>,
+    /// 需要从磁盘加载的页面范围 (page_index, count, page_offset, sub_len)
+    pub not_exist: Vec<NotExistItem>,
+    /// 总读取长度
+    pub len: usize,
+}
+
+/// 描述需要从磁盘加载的页面信息
+pub struct NotExistItem {
+    pub page_index: usize,
+    pub count: usize,
+}
+
 impl InnerPageCache {
     pub fn new(page_cache_ref: Weak<PageCache>, id: usize) -> InnerPageCache {
         Self {
@@ -171,32 +187,25 @@ impl InnerPageCache {
         Ok(())
     }
 
-    /// 从PageCache中读取数据。
+    /// 准备读取（不做I/O）- 仅收集已缓存的页面和需要加载的页面信息。
+    ///
+    /// 此函数不进行磁盘I/O，以便在调用者释放锁后再进行I/O操作。
     ///
     /// ## 参数
     ///
     /// - `offset` 偏移量
-    /// - `buf` 缓冲区
+    /// - `buf_len` 缓冲区长度
+    /// - `file_size` 文件大小
     ///
     /// ## 返回值
     ///
-    /// - `Ok(usize)` 成功读取的长度
-    /// - `Err(SystemError)` 失败返回错误码
-    fn prepare_read(
-        &mut self,
+    /// - `Ok(PrepareReadResult)` 包含已缓存页面的复制项和需要加载的页面信息
+    fn prepare_read_no_io(
+        &self,
         offset: usize,
         buf_len: usize,
-    ) -> Result<(Vec<CopyItem>, usize), SystemError> {
-        let inode: Arc<dyn IndexNode> = self
-            .page_cache_ref
-            .upgrade()
-            .unwrap()
-            .inode
-            .upgrade()
-            .unwrap();
-
-        let file_size = inode.metadata().unwrap().size;
-
+        file_size: i64,
+    ) -> Result<PrepareReadResult, SystemError> {
         let len = if offset < file_size as usize {
             core::cmp::min(file_size as usize, offset + buf_len) - offset
         } else {
@@ -204,16 +213,19 @@ impl InnerPageCache {
         };
 
         if len == 0 {
-            return Ok((Vec::new(), 0));
+            return Ok(PrepareReadResult {
+                copies: Vec::new(),
+                not_exist: Vec::new(),
+                len: 0,
+            });
         }
 
-        let mut not_exist = Vec::new();
+        let mut not_exist_ranges: Vec<(usize, usize)> = Vec::new();
         let mut copies: Vec<CopyItem> = Vec::new();
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
 
-        let mut ret = 0;
         for i in 0..page_num {
             let page_index = start_page_index + i;
 
@@ -239,38 +251,47 @@ impl InnerPageCache {
                     page_offset,
                     sub_len,
                 });
-                ret += sub_len;
-            } else if let Some((index, count)) = not_exist.last_mut() {
+            } else if let Some((index, count)) = not_exist_ranges.last_mut() {
                 if *index + *count == page_index {
                     *count += 1;
                 } else {
-                    not_exist.push((page_index, 1));
+                    not_exist_ranges.push((page_index, 1));
                 }
             } else {
-                not_exist.push((page_index, 1));
+                not_exist_ranges.push((page_index, 1));
             }
         }
 
-        for (page_index, count) in not_exist {
-            // TODO 这里使用buffer避免多次读取磁盘，将来引入异步IO直接写入页面，减少内存开销和拷贝
-            let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
+        // 将缺失的页面范围转换为NotExistItem
+        let not_exist: Vec<NotExistItem> = not_exist_ranges
+            .into_iter()
+            .map(|(page_index, count)| NotExistItem { page_index, count })
+            .collect();
 
-            inode.read_sync(page_index * MMArch::PAGE_SIZE, page_buf.as_mut())?;
+        Ok(PrepareReadResult {
+            copies,
+            not_exist,
+            len,
+        })
+    }
 
-            self.create_pages(page_index, page_buf.as_mut())?;
+    /// 为新加载的页面生成复制项
+    fn generate_copies_for_loaded_pages(
+        &self,
+        item: &NotExistItem,
+        offset: usize,
+        len: usize,
+    ) -> Vec<CopyItem> {
+        let mut copies = Vec::new();
+        let copy_offset = core::cmp::max(item.page_index * MMArch::PAGE_SIZE, offset);
+        let copy_len = core::cmp::min(
+            (item.page_index + item.count) * MMArch::PAGE_SIZE,
+            offset + len,
+        ) - copy_offset;
 
-            // 实际要拷贝的内容在文件中的偏移量
-            let copy_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
-            // 实际要拷贝的内容的长度
-            let copy_len = core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
-                - copy_offset;
-
-            // 为每个新建的页生成拷贝项
-            for i in 0..count {
-                let pg_index = page_index + i;
-                let page = self
-                    .get_page(pg_index)
-                    .expect("page must exist after create_pages");
+        for i in 0..item.count {
+            let pg_index = item.page_index + i;
+            if let Some(page) = self.get_page(pg_index) {
                 let page_start = pg_index * MMArch::PAGE_SIZE;
                 let sub_start = core::cmp::max(copy_offset, page_start);
                 let sub_end =
@@ -281,12 +302,10 @@ impl InnerPageCache {
                         page_offset: sub_start - page_start,
                         sub_len: sub_end - sub_start,
                     });
-                    ret += sub_end - sub_start;
                 }
             }
         }
-
-        Ok((copies, ret))
+        copies
     }
 
     /// 向PageCache中写入数据。
@@ -507,18 +526,61 @@ impl PageCache {
         self.unevictable.store(unevictable, Ordering::Relaxed);
     }
 
-    /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁
+    /// 三阶段读取：
+    /// 1. 持锁收集已缓存页面和需要加载的页面信息
+    /// 2. 释放锁后进行磁盘I/O（关键改动：避免持锁时进行I/O导致死锁）
+    /// 3. 无锁拷贝到目标缓冲区
+    ///
+    /// 此设计解决了以下问题：
+    /// - 原来在持有SpinLock+lock_irqsave时调用inode.read_sync()会导致死锁，
+    ///   因为BIO完成需要中断，但lock_irqsave禁用了中断
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let (copies, ret) = {
-            let mut guard = self.inner.lock_irqsave();
-            guard.prepare_read(offset, buf.len())?
-        };
+        // 获取inode引用（无锁操作）
+        let inode: Arc<dyn IndexNode> = self
+            .inode
+            .try_get()
+            .ok_or(SystemError::EINVAL)?
+            .upgrade()
+            .ok_or(SystemError::EINVAL)?;
 
+        let file_size = inode.metadata()?.size;
+
+        // 阶段1: 持锁检查缓存，收集已缓存页面和缺失页面信息
+        let (mut all_copies, not_exist, len) = {
+            let guard = self.inner.lock_irqsave();
+            let result = guard.prepare_read_no_io(offset, buf.len(), file_size)?;
+            (result.copies, result.not_exist, result.len)
+        }; // 锁在此释放!
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        // 阶段2: 无锁加载缺失页面（关键改动：I/O在锁外进行）
+        for item in &not_exist {
+            // 从磁盘读取数据（无锁，可以安全等待BIO完成）
+            let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * item.count];
+            inode.read_sync(item.page_index * MMArch::PAGE_SIZE, page_buf.as_mut())?;
+
+            // 重新获取锁，将页面添加到缓存
+            {
+                let mut guard = self.inner.lock_irqsave();
+                guard.create_pages(item.page_index, page_buf.as_ref())?;
+
+                // 为新加载的页面生成复制项
+                let new_copies = guard.generate_copies_for_loaded_pages(item, offset, len);
+                all_copies.extend(new_copies);
+            } // 锁在此释放!
+        }
+
+        // 阶段3: 无锁拷贝到目标缓冲区
         let mut dst_offset = 0;
-        for item in copies {
-            // 先prefault，避免在持锁后触发缺页
-            let byte = volatile_read!(buf[dst_offset]);
-            volatile_write!(buf[dst_offset], byte);
+        for item in all_copies {
+            // 先prefault，避免在持页锁后触发用户空间缺页
+            if dst_offset < buf.len() {
+                let byte = volatile_read!(buf[dst_offset]);
+                volatile_write!(buf[dst_offset], byte);
+            }
             let page_guard = item.page.read_irqsave();
             unsafe {
                 buf[dst_offset..dst_offset + item.sub_len].copy_from_slice(
@@ -528,7 +590,7 @@ impl PageCache {
             dst_offset += item.sub_len;
         }
 
-        Ok(ret)
+        Ok(len)
     }
 
     /// 两阶段写入：持锁收集目标页，解锁后按页写入，避免用户缺页时持有page cache锁

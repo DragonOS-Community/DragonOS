@@ -49,7 +49,9 @@ use crate::{
         },
     },
     exception::{
-        irqdesc::IrqReturn, tasklet::{tasklet_schedule, Tasklet}, InterruptArch, IrqNumber
+        irqdesc::IrqReturn,
+        tasklet::{tasklet_schedule, Tasklet},
+        InterruptArch, IrqNumber,
     },
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
@@ -170,9 +172,9 @@ impl BioCompletionTasklet {
                     match unsafe {
                         inner.device_inner.complete_read_blocks(
                             token,
-                            &*ctx.req,
+                            &ctx.req,
                             &mut buf[..count * LBA_SIZE],
-                            &mut *ctx.resp,
+                            &mut ctx.resp,
                         )
                     } {
                         Ok(_) => Ok(count * LBA_SIZE),
@@ -192,9 +194,9 @@ impl BioCompletionTasklet {
                     match unsafe {
                         inner.device_inner.complete_write_blocks(
                             token,
-                            &*ctx.req,
+                            &ctx.req,
                             &buf[..count * LBA_SIZE],
-                            &mut *ctx.resp,
+                            &mut ctx.resp,
                         )
                     } {
                         Ok(_) => Ok(count * LBA_SIZE),

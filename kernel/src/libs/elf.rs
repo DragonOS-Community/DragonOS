@@ -36,7 +36,7 @@ use crate::{
     syscall::user_access::{clear_user, copy_to_user},
 };
 
-use super::rwlock::RwLockWriteGuard;
+use super::rwsem::RwSemWriteGuard;
 
 // 存放跟架构相关的Elf属性，
 pub trait ElfArch: Clone + Copy + Debug {
@@ -48,6 +48,26 @@ pub trait ElfArch: Clone + Copy + Debug {
 pub struct ElfLoader;
 
 pub const ELF_LOADER: ElfLoader = ElfLoader::new();
+
+/// 延迟加载的段信息
+/// 用于在释放地址空间锁后执行文件加载，避免持锁时进行I/O导致死锁
+#[derive(Debug)]
+struct PendingSegmentLoad {
+    /// 加载到的虚拟地址
+    vaddr: VirtAddr,
+    /// 要加载的大小
+    size: usize,
+    /// 文件内偏移
+    file_offset: usize,
+    /// 最终权限
+    prot: ProtFlags,
+    /// 是否需要 mprotect
+    needs_mprotect: bool,
+    /// 映射的起始地址
+    map_addr: VirtAddr,
+    /// 映射的大小
+    map_size: usize,
+}
 
 impl ElfLoader {
     /// 读取文件的缓冲区大小
@@ -131,7 +151,7 @@ impl ElfLoader {
     /// - `prot_flags` - 本次映射的权限
     fn set_elf_brk(
         &self,
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
         start: VirtAddr,
         end: VirtAddr,
         prot_flags: ProtFlags,
@@ -198,9 +218,38 @@ impl ElfLoader {
     ///
     /// 返回映射的虚拟地址和成功标志
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn map_readonly_segment(
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
         param: &ExecParam,
+        addr_to_map: VirtAddr,
+        prot: ProtFlags,
+        map_flags: MapFlags,
+        file_offset: usize,
+        beginning_page_offset: usize,
+        map_size: usize,
+        total_size: usize,
+        map_err_handler: impl FnOnce(SystemError) -> SystemError,
+    ) -> Result<(VirtAddr, bool), SystemError> {
+        Self::map_readonly_segment_with_file(
+            user_vm_guard,
+            param.file(),
+            addr_to_map,
+            prot,
+            map_flags,
+            file_offset,
+            beginning_page_offset,
+            map_size,
+            total_size,
+            map_err_handler,
+        )
+    }
+
+    /// 映射只读段（接收 file 参数的版本）
+    #[allow(clippy::too_many_arguments)]
+    fn map_readonly_segment_with_file(
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+        file: alloc::sync::Arc<crate::filesystem::vfs::file::File>,
         addr_to_map: VirtAddr,
         prot: ProtFlags,
         map_flags: MapFlags,
@@ -230,7 +279,6 @@ impl ElfLoader {
             return Err(SystemError::EINVAL);
         }
 
-        let file = param.file();
         let start_page = user_vm_guard
             .file_mapping_with_file(
                 file,
@@ -285,7 +333,7 @@ impl ElfLoader {
     /// ## 参数
     ///
     /// - `user_vm_guard`：用户空间地址空间
-    /// - `param`：执行参数
+    /// - `file`：ELF文件
     /// - `phent`：ELF文件的ProgramHeader
     /// - `addr_to_map`：当前段应该被加载到的内存地址
     /// - `prot`：保护标志
@@ -294,17 +342,20 @@ impl ElfLoader {
     ///
     /// ## 返回值
     ///
-    /// - `Ok((VirtAddr, bool))`：如果成功加载，则bool值为true，否则为false. VirtAddr为加载的地址
+    /// - `Ok((VirtAddr, bool, Option<PendingSegmentLoad>))`：
+    ///   - VirtAddr：加载的地址
+    ///   - bool：如果成功加载则为true
+    ///   - Option<PendingSegmentLoad>：需要延迟加载的段信息（用于在释放锁后执行文件加载）
     #[allow(clippy::too_many_arguments)]
     fn load_elf_segment(
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
-        param: &mut ExecParam,
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+        file: alloc::sync::Arc<crate::filesystem::vfs::file::File>,
         phent: &ProgramHeader,
         mut addr_to_map: VirtAddr,
         prot: &ProtFlags,
         map_flags: &MapFlags,
         total_size: usize,
-    ) -> Result<(VirtAddr, bool), SystemError> {
+    ) -> Result<(VirtAddr, bool, Option<PendingSegmentLoad>), SystemError> {
         // log::debug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
         // defer!({
         //     log::debug!("load_elf_segment done");
@@ -325,7 +376,7 @@ impl ElfLoader {
         // 如果当前段的大小为0，则直接返回.
         // 段在文件中的大小为0,是合法的，但是段在内存中的大小不能为0
         if map_size == 0 {
-            return Ok((addr_to_map, true));
+            return Ok((addr_to_map, true, None));
         }
 
         let map_err_handler = |err: SystemError| {
@@ -345,9 +396,10 @@ impl ElfLoader {
         // 解释器(PT_INTERP 对应 ld.so)也同样适用：其只读段可安全走 filemap
         let is_readonly_load = (phent.p_flags & elf::abi::PF_W) == 0;
         if is_readonly_load {
-            return Self::map_readonly_segment(
+            // 只读段不需要延迟加载（通过文件映射按需加载）
+            let result = Self::map_readonly_segment_with_file(
                 user_vm_guard,
-                param,
+                file,
                 addr_to_map,
                 *prot,
                 *map_flags,
@@ -356,7 +408,8 @@ impl ElfLoader {
                 map_size,
                 total_size,
                 map_err_handler,
-            );
+            )?;
+            return Ok((result.0, result.1, None));
         }
 
         // 由于后面需要把ELF文件的内容加载到内存，因此暂时把当前段的权限设置为可写
@@ -392,50 +445,27 @@ impl ElfLoader {
                 VirtPageFrame::new(to_unmap),
                 PageFrameCount::from_bytes(to_unmap_size).unwrap(),
             )?;
-
-            // 加载文件到内存
-            Self::do_load_file(
-                map_addr + beginning_page_offset,
-                seg_in_file_size,
-                file_offset,
-                param,
-            )?;
-            if tmp_prot != *prot {
-                user_vm_guard.mprotect(
-                    VirtPageFrame::new(map_addr),
-                    PageFrameCount::from_bytes(page_align_up(map_size)).unwrap(),
-                    *prot,
-                )?;
-            }
         } else {
             // debug!("total size = 0");
 
             map_addr = user_vm_guard
                 .map_anonymous(addr_to_map, map_size, tmp_prot, *map_flags, false, true)?
                 .virt_address();
-            // debug!(
-            //     "map ok: addr_to_map={:?}, map_addr={map_addr:?},beginning_page_offset={beginning_page_offset:?}",
-            //     addr_to_map
-            // );
-
-            // 加载文件到内存
-            Self::do_load_file(
-                map_addr + beginning_page_offset,
-                seg_in_file_size,
-                file_offset,
-                param,
-            )?;
-
-            if tmp_prot != *prot {
-                user_vm_guard.mprotect(
-                    VirtPageFrame::new(map_addr),
-                    PageFrameCount::from_bytes(page_align_up(map_size)).unwrap(),
-                    *prot,
-                )?;
-            }
         }
+
+        // 返回需要延迟加载的信息，而不是直接执行文件加载
+        let pending = PendingSegmentLoad {
+            vaddr: map_addr + beginning_page_offset,
+            size: seg_in_file_size,
+            file_offset,
+            prot: *prot,
+            needs_mprotect: tmp_prot != *prot,
+            map_addr,
+            map_size,
+        };
+
         // debug!("load_elf_segment OK: map_addr={:?}", map_addr);
-        return Ok((map_addr, true));
+        return Ok((map_addr, true, Some(pending)));
     }
 
     /// 加载elf动态链接器
@@ -486,6 +516,11 @@ impl ElfLoader {
         let mut elf_bss: VirtAddr = VirtAddr::new(0);
         let mut last_bss: VirtAddr = VirtAddr::new(0);
         let mut bss_prot: Option<ProtFlags> = None;
+
+        // 收集需要延迟加载的段
+        let mut pending_loads: Vec<PendingSegmentLoad> = Vec::new();
+        let binding = interp_elf_ex.vm().clone();
+
         for section in phdr_table {
             if section.p_type == PT_LOAD {
                 // log::debug!("loading {:?}", section);
@@ -498,9 +533,11 @@ impl ElfLoader {
                 } else if load_bias != 0 && interp_hdr.e_type == ET_DYN {
                     addr_to_map = VirtAddr::new(0);
                 }
+
+                let mut user_vm_guard = binding.write();
                 let map_addr = Self::load_elf_segment(
-                    &mut interp_elf_ex.vm().clone().write(),
-                    interp_elf_ex,
+                    &mut user_vm_guard,
+                    interp_elf_ex.file(),
                     &section,
                     addr_to_map,
                     &elf_prot,
@@ -511,6 +548,13 @@ impl ElfLoader {
                     log::error!("Failed to load elf interpreter :{:?}", e);
                     return ExecError::InvalidParemeter;
                 })?;
+                drop(user_vm_guard);
+
+                // 收集需要延迟加载的段
+                if let Some(pending) = map_addr.2 {
+                    pending_loads.push(pending);
+                }
+
                 if !map_addr.1 {
                     return Err(ExecError::BadAddress(Some(map_addr.0)));
                 }
@@ -546,6 +590,34 @@ impl ElfLoader {
                 }
             }
         }
+
+        // 执行延迟加载（在释放锁后进行I/O，避免持锁时进行BIO导致死锁）
+        for pending in &pending_loads {
+            Self::do_load_file(
+                pending.vaddr,
+                pending.size,
+                pending.file_offset,
+                interp_elf_ex,
+            )
+            .map_err(|_| ExecError::BadAddress(Some(pending.vaddr)))?;
+        }
+
+        // 重新获取锁，执行需要的 mprotect 操作
+        {
+            let mut user_vm_guard = binding.write();
+            for pending in pending_loads {
+                if pending.needs_mprotect {
+                    user_vm_guard
+                        .mprotect(
+                            VirtPageFrame::new(pending.map_addr),
+                            PageFrameCount::from_bytes(page_align_up(pending.map_size)).unwrap(),
+                            pending.prot,
+                        )
+                        .map_err(|_| ExecError::BadAddress(Some(pending.map_addr)))?;
+                }
+            }
+        }
+
         Self::pad_zero(elf_bss).map_err(|_| return ExecError::BadAddress(Some(elf_bss)))?;
         elf_bss = Self::elf_page_align_up(elf_bss);
         last_bss = Self::elf_page_align_up(last_bss);
@@ -601,6 +673,10 @@ impl ElfLoader {
         offset_in_file: usize,
         param: &mut ExecParam,
     ) -> Result<(), SystemError> {
+        log::debug!(
+            "do_load_file: preempt={}",
+            ProcessManager::current_pcb().preempt_count()
+        );
         let file = param.file_ref();
         if (file.metadata()?.size as usize) < offset_in_file + size {
             return Err(SystemError::ENOEXEC);
@@ -962,6 +1038,9 @@ impl BinaryLoader for ElfLoader {
             .into_iter()
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
 
+        // 收集需要延迟加载的段（在释放锁后执行文件加载）
+        let mut pending_loads: Vec<PendingSegmentLoad> = Vec::new();
+
         for seg_to_load in loadable_sections {
             // log::debug!("seg_to_load = {:?}", seg_to_load);
             if unlikely(elf_brk > elf_bss) {
@@ -1041,7 +1120,7 @@ impl BinaryLoader for ElfLoader {
             // log::debug!("bias: {load_bias}");
             let e = Self::load_elf_segment(
                 &mut user_vm,
-                param,
+                param.file(),
                 &seg_to_load,
                 vaddr + load_bias,
                 &elf_prot_flags,
@@ -1053,6 +1132,12 @@ impl BinaryLoader for ElfLoader {
                 SystemError::ENOMEM => ExecError::OutOfMemory,
                 _ => ExecError::Other(format!("load_elf_segment failed: {:?}", e)),
             })?;
+
+            // 收集需要延迟加载的段
+            if let Some(pending) = e.2 {
+                pending_loads.push(pending);
+            }
+
             // log::debug!("e.0={:?}", e.0);
             // 如果地址不对，那么就报错
             if !e.1 {
@@ -1154,6 +1239,31 @@ impl BinaryLoader for ElfLoader {
         //     elf_brk,
         //     bss_prot_flags
         // );
+
+        // 重要：在释放锁后执行延迟加载的段（文件加载需要 I/O，不能在持锁时进行）
+        // 这解决了持有 RwLock 写锁时进行 BIO I/O 导致的死锁问题
+        drop(user_vm);
+
+        // 执行延迟加载
+        for pending in &pending_loads {
+            Self::do_load_file(pending.vaddr, pending.size, pending.file_offset, param)
+                .map_err(|_| ExecError::BadAddress(Some(pending.vaddr)))?;
+        }
+
+        // 重新获取锁，执行需要的 mprotect 操作
+        let mut user_vm = binding.write();
+        for pending in pending_loads {
+            if pending.needs_mprotect {
+                user_vm
+                    .mprotect(
+                        VirtPageFrame::new(pending.map_addr),
+                        PageFrameCount::from_bytes(page_align_up(pending.map_size)).unwrap(),
+                        pending.prot,
+                    )
+                    .map_err(|_| ExecError::BadAddress(Some(pending.map_addr)))?;
+            }
+        }
+
         // 先释放 AddressSpace 写锁，再对最后一个文件页做 padzero（padzero 会写用户地址，可能触发缺页）
         drop(user_vm);
         if likely(elf_bss != elf_brk) && unlikely(Self::pad_zero(elf_bss).is_err()) {

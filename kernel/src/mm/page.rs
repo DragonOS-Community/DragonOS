@@ -396,14 +396,14 @@ impl PageReclaimer {
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
 
         for vma in guard.vma_set() {
-            let address_space = vma.lock_irqsave().address_space().and_then(|x| x.upgrade());
+            let address_space = vma.read().address_space().and_then(|x| x.upgrade());
             if address_space.is_none() {
                 continue;
             }
             let address_space = address_space.unwrap();
             let mut guard = address_space.write();
             let mapper = &mut guard.user_mapper.utable;
-            let virt = vma.lock_irqsave().page_address(page_index).unwrap();
+            let virt = vma.read().page_address(page_index).unwrap();
             if unmap {
                 unsafe {
                     // 取消页表映射

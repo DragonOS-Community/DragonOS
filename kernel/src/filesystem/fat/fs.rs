@@ -32,9 +32,7 @@ use crate::{
         vcore::generate_inode_id,
         FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
     },
-    libs::{
-        vec_cursor::VecCursor,
-    },
+    libs::vec_cursor::VecCursor,
     time::PosixTimeSpec,
 };
 

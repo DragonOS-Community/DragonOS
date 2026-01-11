@@ -404,8 +404,8 @@ pub fn timekeeping_init_later() -> Result<(), SystemError> {
 
     // 更新 timekeeper 的 xtime 为 RTC 时间
     let mut timekeeper = timekeeper().inner.write_irqsave();
-    timekeeper.xtime.tv_nsec = rtc_ns;
     timekeeper.xtime.tv_sec = rtc_ns / 1_000_000_000;
+    timekeeper.xtime.tv_nsec = rtc_ns % 1_000_000_000;
     (
         timekeeper.wall_to_monotonic.tv_nsec,
         timekeeper.wall_to_monotonic.tv_sec,

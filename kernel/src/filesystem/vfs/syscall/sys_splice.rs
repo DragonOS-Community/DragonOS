@@ -81,9 +81,10 @@ impl Syscall for SysSpliceHandle {
         let in_is_pipe = is_pipe(&file_in);
         let out_is_pipe = is_pipe(&file_out);
 
-        // Linux: inherit O_NONBLOCK from file descriptors.
-        if file_in.flags().contains(FileFlags::O_NONBLOCK)
-            || file_out.flags().contains(FileFlags::O_NONBLOCK)
+        // Linux: inherit O_NONBLOCK from pipe endpoints only.
+        // Regular files may have O_NONBLOCK but it does not affect splice behavior.
+        if (in_is_pipe && file_in.flags().contains(FileFlags::O_NONBLOCK))
+            || (out_is_pipe && file_out.flags().contains(FileFlags::O_NONBLOCK))
         {
             splice_flags.insert(SpliceFlags::SPLICE_F_NONBLOCK);
         }

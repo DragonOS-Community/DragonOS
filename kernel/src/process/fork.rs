@@ -11,7 +11,7 @@ use crate::mm::access_ok;
 use crate::mm::MemoryManagementArch;
 use crate::process::pid::PidPrivateData;
 use alloc::{string::ToString, sync::Arc};
-use log::error;
+use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -795,7 +795,25 @@ impl ProcessManager {
                 ti.group_leader().unwrap_or_else(|| current_pcb.clone())
             };
             let mut children = thread_group_leader.children.write_irqsave();
-            children.push(pcb.raw_pid());
+            let parent_ns = thread_group_leader.active_pid_ns();
+            let child_vpid = pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns));
+            if let Some(vpid) = child_vpid {
+                if vpid.data() != 0 {
+                    children.push(vpid);
+                } else {
+                    warn!(
+                        "fork: child pid is 0 in parent pidns, parent pid={:?}, child pid={:?}",
+                        thread_group_leader.raw_pid(),
+                        pcb.raw_pid()
+                    );
+                }
+            } else {
+                warn!(
+                    "fork: failed to resolve child pid in parent pidns, parent pid={:?}, child pid={:?}",
+                    thread_group_leader.raw_pid(),
+                    pcb.raw_pid()
+                );
+            }
         }
 
         if pcb.raw_pid() > RawPid(0) {

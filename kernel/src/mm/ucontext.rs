@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicU64, Ordering},
 };
 
 use alloc::{
@@ -150,7 +150,7 @@ pub struct InnerAddressSpace {
     pub end_data: VirtAddr,
 
     /// 有 VM_LOCKED 标志的 VMA 页面数
-    locked_vm: AtomicUsize,
+    locked_vm: usize,
 
     /// mlockall 默认标志 (影响未来映射)
     def_flags: VmFlags,
@@ -182,7 +182,7 @@ impl InnerAddressSpace {
             end_code: VirtAddr(0),
             start_data: VirtAddr(0),
             end_data: VirtAddr(0),
-            locked_vm: AtomicUsize::new(0),
+            locked_vm: 0,
             def_flags: VmFlags::empty(),
         };
         if create_stack {
@@ -224,7 +224,7 @@ impl InnerAddressSpace {
         new_guard.end_data = self.end_data;
         // 注意：locked_vm 在子进程中应该为 0，因为 mlock 不会被 fork 继承
         // 参考 Linux: 子进程的 mm->locked_vm 从 0 开始
-        new_guard.locked_vm = AtomicUsize::new(0);
+        new_guard.locked_vm = 0;
         // 注意：def_flags 也不应该被继承
         // 参考 Linux: 子进程的 mm->def_flags 从 0 开始
         new_guard.def_flags = VmFlags::empty();
@@ -727,7 +727,7 @@ impl InnerAddressSpace {
         // 参考 Linux: mm/mmap.c:mmap_region() 中的 accounting
         if vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT) {
             let page_count = page_count.data();
-            self.locked_vm.fetch_add(page_count, Ordering::Relaxed);
+            self.locked_vm += page_count;
         }
 
         return Ok(page);
@@ -1018,7 +1018,7 @@ impl InnerAddressSpace {
         // 参考 Linux 内核 mm/mmap.c:2560
         // Point of no return 之后减少 locked_vm
         if locked_vm > 0 {
-            self.locked_vm.fetch_sub(locked_vm, Ordering::Relaxed);
+            self.locked_vm -= locked_vm;
         }
 
         // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
@@ -1427,8 +1427,7 @@ impl InnerAddressSpace {
         }
 
         // 更新 locked_vm
-        self.locked_vm
-            .fetch_add(newly_locked_pages, Ordering::Relaxed);
+        self.locked_vm += newly_locked_pages;
 
         // 锁定已映射的页面
         // 对于 onfault 模式，不在此时锁定页面，而是在缺页中断时锁定
@@ -1508,7 +1507,7 @@ impl InnerAddressSpace {
         }
 
         // 更新 locked_vm 计数（只减少实际解锁的页面数）
-        self.locked_vm.fetch_sub(unlocked_pages, Ordering::Relaxed);
+        self.locked_vm -= unlocked_pages;
 
         Ok(())
     }
@@ -1573,7 +1572,7 @@ impl InnerAddressSpace {
                 let len = end.data() - start.data();
                 total_pages += len >> MMArch::PAGE_SHIFT;
             }
-            self.locked_vm.fetch_add(total_pages, Ordering::Relaxed);
+            self.locked_vm += total_pages;
 
             if !mlock_flags.contains(MlockAllFlags::MCL_ONFAULT) {
                 unsafe {
@@ -1660,15 +1659,13 @@ impl InnerAddressSpace {
         }
 
         // 根据解锁的 VMA 页面数减少 locked_vm（而不是直接设为 0）
-        let current = self.locked_vm.load(Ordering::Relaxed);
-        self.locked_vm
-            .store(current.saturating_sub(pages_to_subtract), Ordering::Relaxed);
+        self.locked_vm = self.locked_vm.saturating_sub(pages_to_subtract);
 
         Ok(())
     }
 
     pub fn locked_vm(&self) -> usize {
-        return self.locked_vm.load(core::sync::atomic::Ordering::Relaxed);
+        self.locked_vm
     }
 
     /// 计算指定范围内已锁定的页面数

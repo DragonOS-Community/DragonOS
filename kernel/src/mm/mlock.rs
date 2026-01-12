@@ -134,18 +134,14 @@ impl LockedVMA {
     /// - `start_addr`: 起始虚拟地址
     /// - `end_addr`: 结束虚拟地址
     /// - `lock`: true=锁定, false=解锁
-    ///
-    /// # 返回
-    ///
-    /// 返回已处理的页面数（不会失败，与 Linux 语义一致）
     pub fn mlock_vma_pages_range(
         &self,
         mapper: &PageMapper,
         start_addr: VirtAddr,
         end_addr: VirtAddr,
         lock: bool,
-    ) -> usize {
-        Self::mlock_walk_page_range(mapper, start_addr, end_addr, 3, lock)
+    ) {
+        Self::mlock_walk_page_range(mapper, start_addr, end_addr, 3, lock);
     }
 
     /// 递归遍历页表，对范围内的页面应用锁定/解锁操作
@@ -164,18 +160,13 @@ impl LockedVMA {
     /// - `end_addr`: 结束虚拟地址
     /// - `level`: 当前页表层级（0=叶子页表）
     /// - `lock`: true=锁定, false=解锁
-    ///
-    /// # 返回
-    ///
-    /// 返回已处理的页面数（不会失败，与 Linux 语义一致）
     fn mlock_walk_page_range(
         mapper: &PageMapper,
         start_addr: VirtAddr,
         end_addr: VirtAddr,
         level: usize,
         lock: bool,
-    ) -> usize {
-        let mut page_count = 0;
+    ) {
         let mut start = start_addr;
 
         while start < end_addr {
@@ -186,12 +177,7 @@ impl LockedVMA {
                 // 大页处理：先检查 present，再处理
                 if level > 0 && entry.flags().has_flag(MMArch::ENTRY_FLAG_HUGE_PAGE) {
                     // 显式检查 present 位（符合 Linux 语义）
-                    if !entry.present() {
-                        // log::debug!(
-                        //     "mlock: huge page at {:#x} not present, skipping",
-                        //     start.data()
-                        // );
-                    } else {
+                    if entry.present() {
                         let sub_page_count = (next - start) >> MMArch::PAGE_SHIFT;
                         // 安全 unwrap（因为已检查 present）
                         let base_paddr = entry.address().unwrap();
@@ -204,23 +190,17 @@ impl LockedVMA {
                             let sub_page_paddr = PhysAddr::new(
                                 base_paddr.data() + offset_in_entry + i * MMArch::PAGE_SIZE,
                             );
-                            if Self::mlock_phys_page(sub_page_paddr, lock) {
-                                page_count += 1;
-                            }
+                            Self::mlock_phys_page(sub_page_paddr, lock);
                         }
                     }
                 } else if level > 0 {
                     // 递归处理下一级页表
-                    let sub_pages =
-                        Self::mlock_walk_page_range(mapper, start, next, level - 1, lock);
-                    page_count += sub_pages;
+                    Self::mlock_walk_page_range(mapper, start, next, level - 1, lock);
                 } else {
                     // 叶子节点（4K 页）：显式检查 present
                     if entry.present() {
                         let paddr = entry.address().unwrap(); // 安全 unwrap
-                        if Self::mlock_phys_page(paddr, lock) {
-                            page_count += 1;
-                        }
+                        Self::mlock_phys_page(paddr, lock);
                     }
                     // 非 present 的 4K 页，跳过（Linux 语义）
                 }
@@ -228,7 +208,6 @@ impl LockedVMA {
 
             start = next;
         }
-        page_count
     }
 
     /// 对物理页面应用锁定/解锁操作
@@ -242,12 +221,7 @@ impl LockedVMA {
     ///
     /// - `paddr`: 物理地址
     /// - `lock`: true=锁定, false=解锁
-    ///
-    /// # 返回
-    ///
-    /// - `true`: 成功处理了页面
-    /// - `false`: 页面不存在于页面管理器中
-    fn mlock_phys_page(paddr: PhysAddr, lock: bool) -> bool {
+    fn mlock_phys_page(paddr: PhysAddr, lock: bool) {
         let mut page_manager_guard = page_manager_lock_irqsave();
         if let Some(page) = page_manager_guard.get(&paddr) {
             drop(page_manager_guard);
@@ -258,9 +232,6 @@ impl LockedVMA {
             } else {
                 munlock_page(&page);
             }
-
-            return true;
         }
-        false
     }
 }

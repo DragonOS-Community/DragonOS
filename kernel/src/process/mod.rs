@@ -779,12 +779,9 @@ impl ProcessManager {
         ProcessManager::current_pcb().preempt_enable();
     }
 
-    pub fn process_count() -> usize {
-        ALL_PROCESS
-            .lock_irqsave()
-            .as_ref()
-            .map(|m| m.len())
-            .unwrap_or(0)
+    /// 获取当前 PID namespace 中的进程数量
+    pub fn ns_process_count() -> usize {
+        Self::current_pcb().active_pid_ns().pid_allocated()
     }
 }
 

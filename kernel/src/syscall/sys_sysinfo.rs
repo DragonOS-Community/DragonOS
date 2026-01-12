@@ -16,7 +16,7 @@ use system_error::SystemError;
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/uapi/linux/sysinfo.h#8
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(C)]
-pub struct SysInfo {
+struct SysInfo {
     uptime: u64,
     loads: [u64; 3],
     totalram: u64,
@@ -92,7 +92,7 @@ syscall_table_macros::declare_syscall!(SYS_SYSINFO, SysInfoHandle);
 /// # Returns
 /// * `Ok(0)` - Success
 /// * `Err(SystemError)` - Error code if operation fails
-pub fn do_sysinfo(info: *mut SysInfo) -> Result<usize, SystemError> {
+fn do_sysinfo(info: *mut SysInfo) -> Result<usize, SystemError> {
     let mut writer = UserBufferWriter::new(info, core::mem::size_of::<SysInfo>(), true)?;
     let mut sysinfo = SysInfo::default();
 
@@ -107,13 +107,13 @@ pub fn do_sysinfo(info: *mut SysInfo) -> Result<usize, SystemError> {
     sysinfo.bufferram = 0;
     sysinfo.totalswap = 0;
     sysinfo.freeswap = 0;
-    sysinfo.procs = ProcessManager::process_count().min(u16::MAX as usize) as u16;
+    sysinfo.procs = ProcessManager::ns_process_count().min(u16::MAX as usize) as u16;
     sysinfo.pad = 0;
     sysinfo.totalhigh = 0;
     sysinfo.freehigh = 0;
     sysinfo.mem_unit = 1;
 
-    writer.copy_one_to_user(&sysinfo, 0)?;
+    writer.buffer_protected(0)?.write_one(0, &sysinfo)?;
 
     Ok(0)
 }

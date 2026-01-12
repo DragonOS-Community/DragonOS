@@ -1,6 +1,7 @@
 use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::mem::swap;
+use core::ops::Deref;
 use core::sync::atomic::fence;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -139,9 +140,10 @@ impl FairSchedEntity {
             }
             return pcb_arc;
         } else {
+            let snapshot_raw_pid = self.raw_pid.lock_irqsave().deref().clone();
             panic!(
                 "FairSchedEntity::pcb: pcb is None, snapshoted raw_pid: {:?}",
-                self.raw_pid
+                snapshot_raw_pid
             );
         }
     }

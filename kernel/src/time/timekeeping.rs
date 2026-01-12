@@ -398,11 +398,8 @@ pub fn timekeeping_init_later() -> Result<(), SystemError> {
     let mut timekeeper = timekeeper().inner.write_irqsave();
 
     let rtc_ns = ktime_get_real_ns();
-    info!(
-        "ktime_get_real_ns() = {} ns",
-        rtc_ns,
-    );
-    
+    info!("ktime_get_real_ns() = {} ns", rtc_ns,);
+
     timekeeper.xtime.tv_sec = rtc_ns / 1_000_000_000;
     timekeeper.xtime.tv_nsec = rtc_ns % 1_000_000_000;
     (

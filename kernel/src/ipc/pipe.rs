@@ -1166,6 +1166,15 @@ impl IndexNode for LockedPipeInode {
         mut data: MutexGuard<FilePrivateData>,
         flags: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
+        // O_PATH: 只获取文件描述符，不实际打开文件进行读写操作
+        // 参考 Linux fs/open.c: do_dentry_open() 对 O_PATH 的处理
+        // O_PATH 打开不应触发 FIFO 的阻塞等待语义
+        if flags.contains(FileFlags::O_PATH) {
+            log::debug!("pipe.rs: O_PATH detected, returning early");
+            *data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: *flags });
+            return Ok(());
+        }
+
         let accflags = flags.access_flags();
         let is_nonblock = flags.contains(FileFlags::O_NONBLOCK);
         let flags_copy = *flags;

@@ -263,8 +263,7 @@ fn splice_file_to_pipe(
     let (read_len, advance_file_pos) = if let Some(off) = offset {
         (file.pread(off, buf_size, &mut buffer)?, false)
     } else {
-        let off = file.pos();
-        (file.pread(off, buf_size, &mut buffer)?, true)
+        (file.read_noadv(buf_size, &mut buffer)?, true)
     };
 
     if read_len == 0 {
@@ -294,7 +293,13 @@ fn splice_file_to_pipe(
     }
 
     // 写入 pipe
-    match pipe.write(buffer.len(), &buffer) {
+    let written = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
+        pipe_inode.write_from_splice_nonblock(&buffer)
+    } else {
+        pipe.write(buffer.len(), &buffer)
+    };
+
+    match written {
         Ok(write_len) => {
             if advance_file_pos {
                 file.advance_pos(write_len);

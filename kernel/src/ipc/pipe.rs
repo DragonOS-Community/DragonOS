@@ -530,6 +530,74 @@ impl LockedPipeInode {
         guard.buf_size.saturating_sub(used)
     }
 
+    fn write_bytes(inner_guard: &mut InnerPipeInode, buf: &[u8], to_write: usize) {
+        let buf_size = inner_guard.buf_size;
+        let start = inner_guard.write_pos as usize;
+        let first = core::cmp::min(to_write, buf_size - start);
+        let second = to_write - first;
+        inner_guard.data[start..start + first].copy_from_slice(&buf[..first]);
+        if second > 0 {
+            inner_guard.data[0..second].copy_from_slice(&buf[first..to_write]);
+        }
+        inner_guard.write_pos = (inner_guard.write_pos + to_write as i32) % buf_size as i32;
+        inner_guard.valid_cnt += to_write as i32;
+    }
+
+    /// Nonblocking write helper for splice(2) paths that must ignore the pipe FD's O_NONBLOCK flag.
+    /// This never sleeps; it returns EAGAIN when no space is available.
+    pub fn write_from_splice_nonblock(&self, buf: &[u8]) -> Result<usize, SystemError> {
+        let len = buf.len();
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let mut inner_guard = self.inner.lock();
+
+        if inner_guard.reader == 0 {
+            if !inner_guard.had_reader {
+                return Err(SystemError::ENXIO);
+            }
+            return Err(SystemError::EPIPE);
+        }
+
+        if inner_guard.data.is_empty() {
+            let buf_size = inner_guard.buf_size;
+            inner_guard.data = vec![0u8; buf_size];
+        }
+
+        let buf_size = inner_guard.buf_size;
+        let available = buf_size.saturating_sub(inner_guard.valid_cnt.max(0) as usize);
+        let atomic_write = len <= PIPE_BUF;
+
+        if atomic_write && available < len {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        if available == 0 {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let to_write = if atomic_write {
+            len
+        } else {
+            len.min(available)
+        };
+
+        Self::write_bytes(&mut inner_guard, buf, to_write);
+
+        if (inner_guard.valid_cnt as usize) < inner_guard.buf_size {
+            self.write_wait_queue
+                .wakeup(Some(ProcessState::Blocked(true)));
+        }
+        self.read_wait_queue
+            .wakeup(Some(ProcessState::Blocked(true)));
+
+        let pollflag = inner_guard.poll_both_ends();
+        drop(inner_guard);
+        let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+
+        Ok(to_write)
+    }
+
     /// 从管道中“窥视”最多 `len` 字节数据到 `buf`，但不消耗管道数据。
     ///
     /// 返回实际拷贝的字节数（可能小于 `len`）。不会睡眠。
@@ -1451,21 +1519,11 @@ impl IndexNode for LockedPipeInode {
             // 计算本次写入的字节数
             let to_write = core::cmp::min(remaining, available_space);
 
-            // 决定要输入的字节（两段复制处理 wrap 与 end==start 情况）
-            let start = inner_guard.write_pos as usize;
-            let first = core::cmp::min(to_write, buf_size - start);
-            let second = to_write as isize - first as isize;
-            // 第1段：写到缓冲尾部或写完
-            inner_guard.data[start..start + first]
-                .copy_from_slice(&buf[total_written..total_written + first]);
-            // 第2段：如需要，从缓冲头部继续
-            if second > 0 {
-                inner_guard.data[0..second as usize]
-                    .copy_from_slice(&buf[total_written + first..total_written + to_write]);
-            }
-            // 更新写位置以及valid_cnt
-            inner_guard.write_pos = (inner_guard.write_pos + to_write as i32) % buf_size as i32;
-            inner_guard.valid_cnt += to_write as i32;
+            Self::write_bytes(
+                &mut inner_guard,
+                &buf[total_written..total_written + to_write],
+                to_write,
+            );
             total_written += to_write;
         }
 

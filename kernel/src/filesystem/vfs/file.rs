@@ -646,6 +646,16 @@ impl File {
         )
     }
 
+    /// Read from the current file position without advancing it.
+    pub fn read_noadv(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.do_read(
+            self.offset.load(core::sync::atomic::Ordering::SeqCst),
+            len,
+            buf,
+            false,
+        )
+    }
+
     /// ## 从buffer向文件写入指定的字节数的数据
     ///
     /// ### 参数

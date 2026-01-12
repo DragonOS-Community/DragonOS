@@ -224,8 +224,6 @@ impl LockedVMA {
     fn mlock_phys_page(paddr: PhysAddr, lock: bool) {
         let mut page_manager_guard = page_manager_lock_irqsave();
         if let Some(page) = page_manager_guard.get(&paddr) {
-            drop(page_manager_guard);
-
             // 对页面应用锁定/解锁（不会失败，与 Linux 一致）
             if lock {
                 mlock_page(&page);

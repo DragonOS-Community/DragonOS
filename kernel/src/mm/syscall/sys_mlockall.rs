@@ -67,7 +67,9 @@ impl Syscall for SysMlockallHandle {
 
         let addr_space = AddressSpace::current()?;
 
-        // ========== MCL_CURRENT: RLIMIT_MEMLOCK 检查 ==========
+        // ========== MCL_CURRENT: RLIMIT_MEMLOCK 检查 + 执行锁定操作 ==========
+        // 参考 Linux 内核 mm/mlock.c:720-726：
+        // 持有写锁贯穿整个操作以防止 TOCTOU 竞态
         // Linux 6.6.21 语义：
         // - 如果没有 CAP_IPC_LOCK 权限，需要检查 total_vm <= lock_limit
         // - total_vm 是进程地址空间中所有可访问 VMA 的总页面数
@@ -88,12 +90,13 @@ impl Syscall for SysMlockallHandle {
                     lock_limit >> MMArch::PAGE_SHIFT
                 };
 
-                let addr_space_read = addr_space.read();
+                // 获取地址空间写锁，保持到 mlockall 完成
+                let mut addr_space_write = addr_space.write();
 
                 // 计算 total_vm：所有可访问 VMA 的总页面数
                 // 这与 Linux 的 total_vm 语义一致，表示进程地址空间的总大小
                 let mut total_vm = 0;
-                for vma in addr_space_read.mappings.iter_vmas() {
+                for vma in addr_space_write.mappings.iter_vmas() {
                     let vma_guard = vma.lock_irqsave();
                     let vm_flags = *vma_guard.vm_flags();
                     let region = *vma_guard.region();
@@ -110,17 +113,24 @@ impl Syscall for SysMlockallHandle {
                     }
                 }
 
-                drop(addr_space_read);
-
-                // 检查是否超过限制
+                // 检查是否超过限制（在写锁保护下）
                 if total_vm > lock_limit_pages {
                     return Err(SystemError::ENOMEM);
                 }
-            }
-        }
 
-        // ========== 执行锁定操作 ==========
-        addr_space.write().mlockall(args[0] as u32)?;
+                // ========== 执行锁定操作 ==========
+                addr_space_write.mlockall(args[0] as u32)?;
+
+                // 释放写锁
+                drop(addr_space_write);
+            } else {
+                // 有 CAP_IPC_LOCK 权限，直接执行锁定操作
+                addr_space.write().mlockall(args[0] as u32)?;
+            }
+        } else {
+            // 仅 MCL_FUTURE 标志，直接执行
+            addr_space.write().mlockall(args[0] as u32)?;
+        }
 
         Ok(0)
     }

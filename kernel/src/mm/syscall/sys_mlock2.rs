@@ -96,7 +96,9 @@ impl Syscall for SysMlock2Handle {
 
         let addr_space = AddressSpace::current()?;
 
-        // ========== RLIMIT_MEMLOCK 检查 ==========
+        // ========== RLIMIT_MEMLOCK 检查 + 执行锁定操作 ==========
+        // 参考 Linux 内核 mm/mlock.c:593-612：
+        // 持有写锁贯穿整个操作以防止 TOCTOU 竞态
         let lock_limit = ProcessManager::current_pcb()
             .get_rlimit(RLimitID::Memlock)
             .rlim_cur as usize;
@@ -107,16 +109,18 @@ impl Syscall for SysMlock2Handle {
             lock_limit >> MMArch::PAGE_SHIFT
         };
 
-        let requested_pages = aligned_len >> MMArch::PAGE_SHIFT;
-        let addr_space_read = addr_space.read();
-        let current_locked = addr_space_read.locked_vm();
+        // 获取地址空间写锁，保持到 mlock 完成
+        let mut addr_space_write = addr_space.write();
 
-        // 检查是否超过资源限制
+        let requested_pages = aligned_len >> MMArch::PAGE_SHIFT;
+        let current_locked = addr_space_write.locked_vm();
+
+        // 检查是否超过资源限制（在写锁保护下）
         let mut locked = current_locked + requested_pages;
         if locked > lock_limit_pages {
             // 计算范围内已锁定的页面（避免重复计数）
             let already_locked_in_range =
-                addr_space_read.count_mm_mlocked_page_nr(aligned_addr, aligned_len);
+                addr_space_write.count_mm_mlocked_page_nr(aligned_addr, aligned_len);
             locked = current_locked + requested_pages - already_locked_in_range;
         }
 
@@ -124,17 +128,16 @@ impl Syscall for SysMlock2Handle {
             return Err(SystemError::ENOMEM);
         }
 
-        drop(addr_space_read);
-
         // ========== 执行锁定操作 ==========
         // mlock() 返回 Result<bool>，其中 bool 表示是否包含不可访问的 VMA
         // 参考 Linux 行为：
         // - 当 onfault=false 时，对 PROT_NONE 映射会返回 true（应返回 ENOMEM）
         // - 当 onfault=true 时，不会检测不可访问的 VMA（延迟锁定模式）
         let onfault = flags.contains(Mlock2Flags::MLOCK_ONFAULT);
-        let has_inaccessible_vma = addr_space
-            .write()
-            .mlock(aligned_addr, aligned_len, onfault)?;
+        let has_inaccessible_vma = addr_space_write.mlock(aligned_addr, aligned_len, onfault)?;
+
+        // 释放写锁
+        drop(addr_space_write);
 
         // 如果包含不可访问的 VMA 且非 onfault 模式，返回 ENOMEM
         // 这模拟了 Linux 中 __mm_populate() 在 PROT_NONE 映射上失败的行为

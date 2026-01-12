@@ -90,7 +90,15 @@ impl Syscall for SysMlockHandle {
 
         let addr_space = AddressSpace::current()?;
 
-        // ========== RLIMIT_MEMLOCK 检查 ==========
+        // ========== RLIMIT_MEMLOCK 检查 + 执行锁定操作 ==========
+        // 参考 Linux 内核 mm/mlock.c:593-612：
+        // - 先获取 mmap_write_lock（写锁）
+        // - 在锁保护下检查 RLIMIT_MEMLOCK
+        // - 在锁保护下执行 mlock 操作
+        // - 最后释放锁
+        // 这样可以防止 TOCTOU 竞态：在检查和操作之间，并发的 munlock/munmap
+        // 不会修改 locked_vm，避免计账不一致或下溢
+
         let lock_limit = ProcessManager::current_pcb()
             .get_rlimit(RLimitID::Memlock)
             .rlim_cur as usize;
@@ -101,37 +109,31 @@ impl Syscall for SysMlockHandle {
             lock_limit >> MMArch::PAGE_SHIFT
         };
 
-        //资源限制
+        // 获取地址空间写锁，保持到 mlock 完成
+        let mut addr_space_write = addr_space.write();
+
+        // 资源限制检查（在写锁保护下）
         let requested_pages = aligned_len >> MMArch::PAGE_SHIFT;
-        let addr_space_read = addr_space.read();
-        let current_locked = addr_space_read.locked_vm();
+        let current_locked = addr_space_write.locked_vm();
 
         let mut locked = current_locked + requested_pages;
         if locked > lock_limit_pages {
             let already_locked_in_range =
-                addr_space_read.count_mm_mlocked_page_nr(aligned_addr, aligned_len);
+                addr_space_write.count_mm_mlocked_page_nr(aligned_addr, aligned_len);
             locked = current_locked + requested_pages - already_locked_in_range;
         }
 
         if locked > lock_limit_pages {
             return Err(SystemError::ENOMEM);
         }
-        drop(addr_space_read);
-
-        // ========== 检查是否包含不可访问的 VMA (如 PROT_NONE) ==========
-        // 参考 Linux 行为：mlock() 会先设置 VMA 标志，然后调用 __mm_populate()
-        // 对于 PROT_NONE 映射，__mm_populate() 会失败返回 ENOMEM
-        // 但 VMA 标志已经设置，不会回滚（这是破坏性操作）
-        //
-        // 因此我们需要：
-        // 1. 检查是否有不可访问的 VMA
-        // 2. 如果有，仍然设置 VM_LOCKED 标志（保持一致性）
-        // 3. 但返回 ENOMEM（模拟 __mm_populate() 失败）
 
         // ========== 执行锁定操作 ==========
         // 无论是否包含不可访问的 VMA，都设置 VM_LOCKED 标志
         // 这是破坏性操作，即使返回错误也不回滚（遵循 Linux 语义）
-        let has_inaccessible_vma = addr_space.write().mlock(aligned_addr, aligned_len, false)?;
+        let has_inaccessible_vma = addr_space_write.mlock(aligned_addr, aligned_len, false)?;
+
+        // 释放写锁（通过 drop 显式释放，或让 Rust 在作用域结束时自动释放）
+        drop(addr_space_write);
 
         // 如果包含不可访问的 VMA，返回 ENOMEM
         // 这模拟了 Linux 中 __mm_populate() 在 PROT_NONE 映射上失败的行为

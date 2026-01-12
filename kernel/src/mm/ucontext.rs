@@ -978,10 +978,18 @@ impl InnerAddressSpace {
         let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
 
         let regions: Vec<Arc<LockedVMA>> = self.mappings.conflicts(to_unmap).collect::<Vec<_>>();
+        // 参考 Linux 内核 mm/mmap.c:2460, 2507-2508, 2560
+        // do_vmi_align_munmap() 会累加被移除的 VM_LOCKED 页面数，然后在最后减少 mm->locked_vm
+        let mut locked_vm = 0;
 
         for r in regions {
-            let r = r.lock_irqsave().region;
-            let r = self.mappings.remove_vma(&r).unwrap();
+            let r_guard = r.lock_irqsave();
+            let was_locked = r_guard.vm_flags().contains(VmFlags::VM_LOCKED)
+                || r_guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);
+            let r_region = *r_guard.region();
+            drop(r_guard);
+
+            let r = self.mappings.remove_vma(&r_region).unwrap();
             let intersection = r.lock_irqsave().region().intersect(&to_unmap).unwrap();
             let split_result = r.extract(intersection, &self.user_mapper.utable).unwrap();
 
@@ -997,7 +1005,20 @@ impl InnerAddressSpace {
                 self.mappings.insert_vma(after);
             }
 
+            // 参考 Linux 内核 mm/mmap.c:2507-2508
+            // 累加被解除映射的锁定页面数
+            if was_locked {
+                let unmap_len = intersection.end().data() - intersection.start().data();
+                locked_vm += unmap_len >> MMArch::PAGE_SHIFT;
+            }
+
             r.unmap(&mut self.user_mapper.utable, &mut flusher);
+        }
+
+        // 参考 Linux 内核 mm/mmap.c:2560
+        // Point of no return 之后减少 locked_vm
+        if locked_vm > 0 {
+            self.locked_vm.fetch_sub(locked_vm, Ordering::Relaxed);
         }
 
         // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑

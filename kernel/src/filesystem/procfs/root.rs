@@ -13,6 +13,7 @@ use crate::{
             net::NetDirOps,
             pid::PidDirOps,
             self_::SelfSymOps,
+            stat::StatFileOps,
             sys::SysDirOps,
             template::{
                 lookup_child_from_table, populate_children_from_table, DirOps, ProcDir,
@@ -63,6 +64,7 @@ impl RootDirOps {
         ("mounts", MountsFileOps::new_inode),
         ("net", NetDirOps::new_inode),
         ("self", SelfSymOps::new_inode),
+        ("stat", StatFileOps::new_inode),
         ("sys", SysDirOps::new_inode),
         ("thread-self", ThreadSelfDirOps::new_inode),
         ("version", VersionFileOps::new_inode),

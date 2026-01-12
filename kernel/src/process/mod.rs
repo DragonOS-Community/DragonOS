@@ -569,9 +569,16 @@ impl ProcessManager {
             drop(guard);
 
             // 进行进程退出后的工作
-            let thread = pcb.thread.write_irqsave();
+            // 注意：需要在调用 exit_robust_list 之前释放 thread 锁，
+            // 因为 exit_robust_list 会访问用户空间，可能触发 page fault，
+            // 而 page fault 处理可能需要调度，不能持有 RwLock。
+            let (clear_child_tid, vfork_done) = {
+                let thread = pcb.thread.write_irqsave();
+                (thread.clear_child_tid, thread.vfork_done.clone())
+            };
+            // 释放锁后继续执行
 
-            if let Some(addr) = thread.clear_child_tid {
+            if let Some(addr) = clear_child_tid {
                 // 按 Linux 语义：先清零 userland 的 *clear_child_tid，再 futex_wake(addr)
                 let cleared_ok = unsafe {
                     match clear_user_protected(addr, core::mem::size_of::<i32>()) {
@@ -597,10 +604,9 @@ impl ProcessManager {
 
             RobustListHead::exit_robust_list(pcb.clone());
             // 如果是vfork出来的进程，则需要处理completion
-            if thread.vfork_done.is_some() {
-                thread.vfork_done.as_ref().unwrap().complete_all();
+            if let Some(vfork_done) = vfork_done {
+                vfork_done.complete_all();
             }
-            drop(thread);
 
             unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();

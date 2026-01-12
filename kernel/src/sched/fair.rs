@@ -8,6 +8,7 @@ use crate::libs::rbtree::RBTree;
 use crate::libs::spinlock::SpinLock;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
+use crate::process::RawPid;
 use crate::sched::clock::ClockUpdataFlag;
 use crate::sched::{cpu_rq, SchedFeature, SCHED_FEATURES};
 use crate::smp::core::smp_get_processor_id;
@@ -81,6 +82,7 @@ pub struct FairSchedEntity {
     runnable_weight: u64,
 
     pcb: Weak<ProcessControlBlock>,
+    raw_pid: Option<RawPid>,
 }
 
 impl FairSchedEntity {
@@ -105,6 +107,7 @@ impl FairSchedEntity {
             avg: Default::default(),
             depth: Default::default(),
             runnable_weight: Default::default(),
+            raw_pid: None,
         });
 
         ret.force_mut().self_ref = Arc::downgrade(&ret);
@@ -129,10 +132,22 @@ impl FairSchedEntity {
     }
 
     pub fn pcb(&self) -> Arc<ProcessControlBlock> {
-        self.pcb.upgrade().unwrap()
+        if let Some(pcb_arc) = self.pcb.upgrade() {
+            return pcb_arc;
+        } else {
+            panic!(
+                "FairSchedEntity::pcb: pcb is None, snapshoted raw_pid: {:?}",
+                self.raw_pid
+            );
+        }
     }
 
     pub fn set_pcb(&mut self, pcb: Weak<ProcessControlBlock>) {
+        if let Some(pcb_arc) = pcb.upgrade() {
+            self.raw_pid = Some(pcb_arc.raw_pid());
+        } else {
+            log::warn!("set_pcb: pcb is None");
+        }
         self.pcb = pcb
     }
 

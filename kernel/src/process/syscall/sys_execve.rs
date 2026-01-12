@@ -102,6 +102,13 @@ impl SysExecve {
         do_execve(path, argv, envp, frame)?;
 
         let pcb = ProcessManager::current_pcb();
+        // exec成功日志：打印pid、文件名和参数
+        log::info!(
+            "execve success: pid={}, path={}, argv={:?}",
+            pcb.raw_pid().data(),
+            path,
+            argv_for_cmdline
+        );
         // 关闭设置了O_CLOEXEC的文件描述符
         let fd_table = pcb.fd_table();
         fd_table.write().close_on_exec();

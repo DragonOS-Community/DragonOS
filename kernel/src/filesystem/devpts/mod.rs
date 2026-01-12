@@ -19,7 +19,7 @@ use crate::{
         mount::{do_mount_mkdir, MountFlags},
         FileSystem, FileType, FsInfo, InodeMode, MountableFileSystem, SuperBlock, FSMAKER,
     },
-    libs::spinlock::SpinLock,
+    libs::mutex::Mutex,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -73,7 +73,7 @@ impl FileSystemMakerData for DevPtsOptions {
 pub struct DevPtsFs {
     /// 根节点
     root_inode: Arc<LockedDevPtsFSInode>,
-    pts_ida: SpinLock<IdAllocator>,
+    pts_ida: Mutex<IdAllocator>,
     pts_count: AtomicU32,
     opts: DevPtsOptions,
 }
@@ -91,7 +91,7 @@ impl DevPtsFs {
         }
         let ret = Arc::new(Self {
             root_inode,
-            pts_ida: SpinLock::new(IdAllocator::new(0, NR_UNIX98_PTY_MAX as usize).unwrap()),
+            pts_ida: Mutex::new(IdAllocator::new(0, NR_UNIX98_PTY_MAX as usize).unwrap()),
             pts_count: AtomicU32::new(0),
             opts,
         });
@@ -196,13 +196,13 @@ register_mountable_fs!(DevPtsFs, DEVPTS_MAKER, "devpts");
 
 #[derive(Debug)]
 pub struct LockedDevPtsFSInode {
-    inner: SpinLock<PtsDevInode>,
+    inner: Mutex<PtsDevInode>,
 }
 
 impl LockedDevPtsFSInode {
     pub fn new() -> Self {
         Self {
-            inner: SpinLock::new(PtsDevInode {
+            inner: Mutex::new(PtsDevInode {
                 fs: Weak::new(),
                 children: Some(BTreeMap::new()),
                 parent: Weak::new(),

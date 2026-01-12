@@ -6,7 +6,7 @@ use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::mutex::MutexGuard;
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::fault::PageFaultHandler;
 use crate::mm::page::Page;
@@ -18,7 +18,7 @@ use crate::{
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::mutex::Mutex,
     mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
@@ -137,12 +137,12 @@ fn tmpfs_move_entry_between_dirs(
 }
 
 #[derive(Debug)]
-pub struct LockedTmpfsInode(pub SpinLock<TmpfsInode>);
+pub struct LockedTmpfsInode(pub Mutex<TmpfsInode>);
 
 #[derive(Debug)]
 pub struct Tmpfs {
     root_inode: Arc<LockedTmpfsInode>,
-    super_block: RwLock<SuperBlock>,
+    super_block: RwSem<SuperBlock>,
     size_limit: Option<u64>,
     current_size: AtomicU64,
 }
@@ -328,17 +328,16 @@ impl Tmpfs {
             sb.bavail = blocks;
         }
 
-        let root: Arc<LockedTmpfsInode> =
-            Arc::new(LockedTmpfsInode(SpinLock::new(TmpfsInode::new())));
+        let root: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode::new())));
 
         let result: Arc<Tmpfs> = Arc::new(Tmpfs {
             root_inode: root,
-            super_block: RwLock::new(sb),
+            super_block: RwSem::new(sb),
             size_limit,
             current_size: AtomicU64::new(0),
         });
 
-        let mut root_guard: SpinLockGuard<TmpfsInode> = result.root_inode.0.lock();
+        let mut root_guard: MutexGuard<TmpfsInode> = result.root_inode.0.lock();
         root_guard.parent = Arc::downgrade(&result.root_inode);
         root_guard.self_ref = Arc::downgrade(&result.root_inode);
         root_guard.fs = Arc::downgrade(&result);
@@ -726,7 +725,7 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::EEXIST);
         }
 
-        let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode(SpinLock::new(TmpfsInode {
+        let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode {
             parent: inode.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
@@ -777,8 +776,8 @@ impl IndexNode for LockedTmpfsInode {
             .downcast_ref::<LockedTmpfsInode>()
             .ok_or(SystemError::EPERM)?;
         let name = DName::from(name);
-        let mut inode: SpinLockGuard<TmpfsInode> = self.0.lock();
-        let mut other_locked: SpinLockGuard<TmpfsInode> = other.0.lock();
+        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
+        let mut other_locked: MutexGuard<TmpfsInode> = other.0.lock();
 
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -798,7 +797,7 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
-        let mut inode: SpinLockGuard<TmpfsInode> = self.0.lock();
+        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -841,7 +840,7 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let name = DName::from(name);
-        let mut inode: SpinLockGuard<TmpfsInode> = self.0.lock();
+        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -999,7 +998,7 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
-        let inode: SpinLockGuard<TmpfsInode> = self.0.lock();
+        let inode: MutexGuard<TmpfsInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -1071,7 +1070,7 @@ impl IndexNode for LockedTmpfsInode {
 
         let filename = DName::from(filename);
 
-        let nod = Arc::new(LockedTmpfsInode(SpinLock::new(TmpfsInode {
+        let nod = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode {
             parent: inode.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),

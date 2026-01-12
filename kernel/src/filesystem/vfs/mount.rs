@@ -22,12 +22,7 @@ use crate::{
         page_cache::PageCache,
         vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
     },
-    libs::{
-        casting::DowncastArc,
-        lazy_init::Lazy,
-        rwlock::RwLock,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
+    libs::{casting::DowncastArc, lazy_init::Lazy, mutex::Mutex, rwsem::RwSem},
     mm::{fault::PageFaultMessage, VmFaultReason},
     process::{
         namespace::{
@@ -210,8 +205,8 @@ impl MountFlags {
 // MountId类型
 int_like!(MountId, usize);
 
-static MOUNT_ID_ALLOCATOR: SpinLock<IdAllocator> =
-    SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap());
+static MOUNT_ID_ALLOCATOR: Mutex<IdAllocator> =
+    Mutex::new(IdAllocator::new(0, usize::MAX).unwrap());
 
 impl MountId {
     fn alloc() -> Self {
@@ -231,9 +226,9 @@ pub struct MountFS {
     // MountFS内部的文件系统
     inner_filesystem: Arc<dyn FileSystem>,
     /// 用来存储InodeID->挂载点的MountFS的B树
-    mountpoints: SpinLock<BTreeMap<InodeId, Arc<MountFS>>>,
+    mountpoints: Mutex<BTreeMap<InodeId, Arc<MountFS>>>,
     /// 当前文件系统挂载到的那个挂载点的Inode
-    self_mountpoint: RwLock<Option<Arc<MountFSInode>>>,
+    self_mountpoint: RwSem<Option<Arc<MountFSInode>>>,
     /// 指向当前MountFS的弱引用
     self_ref: Weak<MountFS>,
 
@@ -288,8 +283,8 @@ impl MountFS {
     ) -> Arc<Self> {
         let result = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
-            mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint: RwLock::new(self_mountpoint),
+            mountpoints: Mutex::new(BTreeMap::new()),
+            self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: Lazy::new(),
             propagation,
@@ -310,8 +305,8 @@ impl MountFS {
 
         let mountfs = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem: self.inner_filesystem.clone(),
-            mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint: RwLock::new(self_mountpoint),
+            mountpoints: Mutex::new(BTreeMap::new()),
+            self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: Lazy::new(),
             propagation: new_propagation,
@@ -338,7 +333,7 @@ impl MountFS {
         Ok(())
     }
 
-    pub fn mountpoints(&self) -> SpinLockGuard<'_, BTreeMap<InodeId, Arc<MountFS>>> {
+    pub fn mountpoints(&self) -> MutexGuard<'_, BTreeMap<InodeId, Arc<MountFS>>> {
         self.mountpoints.lock()
     }
 
@@ -1162,7 +1157,7 @@ impl MountPath {
 
 // 维护一个挂载点的记录，以支持特定于文件系统的索引
 pub struct MountList {
-    inner: RwLock<InnerMountList>,
+    inner: RwSem<InnerMountList>,
 }
 
 #[derive(Clone, Debug)]
@@ -1190,7 +1185,7 @@ impl MountList {
     /// - `MountList`: 新的挂载点列表实例
     pub fn new() -> Arc<Self> {
         Arc::new(MountList {
-            inner: RwLock::new(InnerMountList {
+            inner: RwSem::new(InnerMountList {
                 mounts: HashMap::new(),
                 ino2mp: HashMap::new(),
                 mfs2ino: HashMap::new(),
@@ -1245,7 +1240,7 @@ impl MountList {
         path: T,
     ) -> Option<(Arc<MountPath>, String, Arc<MountFS>)> {
         self.inner
-            .upgradeable_read()
+            .read()
             .mounts
             .iter()
             .filter_map(|(key, stack)| {

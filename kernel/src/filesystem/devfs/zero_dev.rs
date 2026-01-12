@@ -7,7 +7,7 @@ use crate::filesystem::vfs::{
     Metadata,
 };
 use crate::libs::mutex::MutexGuard;
-use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
+use crate::{libs::mutex::Mutex, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -31,7 +31,7 @@ pub struct ZeroInode {
 }
 
 #[derive(Debug)]
-pub struct LockedZeroInode(SpinLock<ZeroInode>);
+pub struct LockedZeroInode(Mutex<ZeroInode>);
 
 impl LockedZeroInode {
     pub fn new() -> Arc<Self> {
@@ -60,7 +60,7 @@ impl LockedZeroInode {
             },
         };
 
-        let result = Arc::new(LockedZeroInode(SpinLock::new(inode)));
+        let result = Arc::new(LockedZeroInode(Mutex::new(inode)));
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         return result;

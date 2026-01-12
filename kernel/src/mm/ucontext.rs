@@ -1451,8 +1451,7 @@ impl InnerAddressSpace {
                     let lock_end = core::cmp::min(vma_end, end);
 
                     // 锁定该范围内的已映射页面，不返回真正的错误，当页表项未映射时跳过
-                    // 与 Linux 语义一致：mlock_vma_pages_range 不会失败（void 函数）
-                    let _ = vma.mlock_vma_pages_range(&mapper, lock_start, lock_end, true);
+                    vma.mlock_vma_pages_range(&mapper, lock_start, lock_end, true);
                 }
             }
         }
@@ -1616,28 +1615,7 @@ impl InnerAddressSpace {
 
             // 先解锁所有页面
             for (vma, start, end) in &vmas_to_unlock {
-                // match vma.mlock_vma_pages_range(&mapper, *start, *end, false) {
-                //     Ok(unlocked_count) => {
-                //         if unlocked_count > 0 {
-                //             log::debug!(
-                //                 "munlockall: unlocked {} pages in VMA [{:#x}:{:#x}]",
-                //                 unlocked_count,
-                //                 start.data(),
-                //                 end.data()
-                //             );
-                //         }
-                //     }
-                //     Err(e) => {
-                //         log::warn!(
-                //             "munlockall: partial failure when unlocking pages in VMA [{:#x}:{:#x}]: {:?}",
-                //             start.data(),
-                //             end.data(),
-                //             e
-                //         );
-                //     }
-                // }
-                // 与 Linux 语义一致：mlock_vma_pages_range 不会失败（void 函数）
-                let _ = vma.mlock_vma_pages_range(&mapper, *start, *end, false);
+                vma.mlock_vma_pages_range(&mapper, *start, *end, false);
             }
         }
 
@@ -1682,7 +1660,7 @@ impl InnerAddressSpace {
     /// 用于处理 mlock/mlock2 时，如果请求范围内有部分已经锁定，
     /// 需要从请求的页面数中扣除已锁定的部分。
     pub fn count_mm_mlocked_page_nr(&self, start: VirtAddr, len: usize) -> usize {
-        let end = start.data().checked_add(len).unwrap_or_else(|| usize::MAX);
+        let end = start.data().checked_add(len).unwrap_or(usize::MAX);
         let end = VirtAddr::new(core::cmp::min(end, MMArch::USER_END_VADDR.data()));
 
         let region = VirtRegion::new(start, len);

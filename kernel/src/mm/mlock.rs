@@ -70,9 +70,7 @@ pub fn can_do_mlock() -> bool {
 ///
 /// - 增加 mlock_count 引用计数
 /// - 当计数从 0 → 1 时，自动设置 PG_MLOCKED 和 PG_UNEVICTABLE 标志
-///
-/// # 不变量保证
-///
+/// 
 /// 该函数通过 InnerPage::inc_mlock_count() 集中管理计数和标志，
 /// 确保以下不变量始终成立：
 /// - mlock_count > 0 ⇔ PG_MLOCKED 已设置
@@ -81,7 +79,6 @@ pub fn can_do_mlock() -> bool {
 /// # Linux 参考实现
 ///
 /// 基于 Linux 6.6.21 mm/mlock.c:mlock_folio()
-/// 该函数在 Linux 中为 void 函数，不会失败
 pub fn mlock_page(page: &Arc<Page>) {
     let mut page_guard = page.write_irqsave();
 
@@ -109,7 +106,6 @@ pub fn mlock_page(page: &Arc<Page>) {
 /// # Linux 参考实现
 ///
 /// 基于 Linux 6.6.21 mm/mlock.c:munlock_folio()
-/// 该函数在 Linux 中为 void 函数，不会失败
 pub fn munlock_page(page: &Arc<Page>) {
     let mut page_guard = page.write_irqsave();
 
@@ -147,12 +143,6 @@ impl LockedVMA {
     /// 递归遍历页表，对范围内的页面应用锁定/解锁操作
     ///
     /// 支持多级页表和大页处理。对于大页（huge page），会遍历其中的每个 4K 子页。
-    ///
-    /// # Linux 参考实现
-    ///
-    /// 基于 Linux 6.6.21 mm/mlock.c:mlock_pte_range()
-    /// 该函数总是返回 0，不返回错误。
-    ///
     /// # 参数
     ///
     /// - `mapper`: 页表映射器
@@ -215,7 +205,6 @@ impl LockedVMA {
     /// # Linux 参考实现
     ///
     /// 基于 Linux 6.6.21 mm/mlock.c:mlock_folio()/munlock_folio()
-    /// 这些函数为 void 函数，不会失败。
     ///
     /// # 参数
     ///

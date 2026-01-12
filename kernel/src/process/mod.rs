@@ -1089,6 +1089,8 @@ pub struct PtraceState {
     event_message: usize,
     /// tracer 注入的信号（在 ptrace_stop 返回后要处理的信号）
     injected_signal: Signal,
+    /// 最后一次 ptrace 停止时的 siginfo（供 PTRACE_GETSIGINFO 读取）
+    last_siginfo: Option<crate::ipc::signal_types::SigInfo>,
 }
 
 impl Default for PtraceState {
@@ -1101,6 +1103,7 @@ impl Default for PtraceState {
             exit_code: 0,
             event_message: 0,
             injected_signal: Signal::INVALID,
+            last_siginfo: None,
         }
     }
 }
@@ -1114,6 +1117,7 @@ impl PtraceState {
             exit_code: 0,
             event_message: 0,
             injected_signal: Signal::INVALID,
+            last_siginfo: None,
         }
     }
 
@@ -1141,6 +1145,21 @@ impl PtraceState {
         } else {
             Some(self.pending_signals.remove(0))
         }
+    }
+
+    /// 获取 last_siginfo（供 PTRACE_GETSIGINFO 使用）
+    pub fn last_siginfo(&self) -> Option<crate::ipc::signal_types::SigInfo> {
+        self.last_siginfo
+    }
+
+    /// 设置 last_siginfo
+    pub fn set_last_siginfo(&mut self, info: crate::ipc::signal_types::SigInfo) {
+        self.last_siginfo = Some(info);
+    }
+
+    /// 清除 last_siginfo
+    pub fn clear_last_siginfo(&mut self) {
+        self.last_siginfo = None;
     }
 }
 

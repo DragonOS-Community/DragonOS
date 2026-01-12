@@ -67,9 +67,9 @@ macro_rules! syscall_return {
 #[no_mangle]
 pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     // 系统调用进入时，把系统调用号存入 orig_rax 字段
-    // 对应 Linux 6.6.21 的 pt_regs.orig_rax 字段
     // 用于恢复被 ptrace 修改的系统调用号
     // frame.orig_rax = frame.rax;
+
     // 系统调用进入时，始终开中断
     unsafe {
         CurrentIrqArch::interrupt_enable();
@@ -78,33 +78,17 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     mfence();
     let pid = ProcessManager::current_pcb().raw_pid();
     let show = false;
-
     if show {
         debug!("syscall: pid: {:?}, num={:?}\n", pid, frame.rax as usize);
     }
 
     let pcb = ProcessManager::current_pcb();
 
-    // 按照 Linux 6.6.21 的同步 ptrace 模型处理系统调用入口
-    // 在 syscall_trace_enter() 中调用 ptrace_report_syscall_entry()
-    // ptrace_report_syscall() -> ptrace_notify() -> ptrace_stop() [同步阻塞]
-    //
-    // 参考 Linux 6.6.21 kernel/entry/common.c:
-    // - 第 50 行：ptrace_report_syscall_entry(regs) -> 同步阻塞
-    // - 第 78 行：/* Either of the above might have changed the syscall number */
-    //            syscall = syscall_get_nr(current, regs);  // 重新读取！
-    //
     // 注意：必须同时检查 PTRACED 和 TRACE_SYSCALL 标志
-    // - PTRACED: 进程正在被跟踪
-    // - TRACE_SYSCALL: tracer 已调用 PTRACE_SYSCALL 请求系统调用跟踪
-    let needs_syscall_trace = pcb
-        .flags()
-        .contains(ProcessFlags::TRACE_SYSCALL);
-
+    let needs_syscall_trace = pcb.flags().contains(ProcessFlags::TRACE_SYSCALL);
     if needs_syscall_trace {
         // 设置停止原因
         pcb.ptrace_state_mut().stop_reason = PtraceStopReason::SyscallEntry;
-
         // 构造 syscall entry 的 exit_code: 0x80 | SIGTRAP
         // 0x80 表示 PTRACE_SYSCALL_TRACE (PT_TRACESYSGOOD)
         let exit_code = 0x80 | Signal::SIGTRAP as usize;

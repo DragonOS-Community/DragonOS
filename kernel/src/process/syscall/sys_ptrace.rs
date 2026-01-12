@@ -3,17 +3,16 @@ use crate::{
         interrupt::TrapFrame,
         ipc::signal::Signal,
         syscall::nr::{SYS_EXIT, SYS_PTRACE},
-        CurrentIrqArch, MMArch,
+        MMArch,
     },
-    exception::{InterruptArch, IrqFlagsGuard},
-    mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr},
+    mm::{MemoryManagementArch, PhysAddr, VirtAddr},
     process::{
         syscall::sys_exit::SysExit, ProcessControlBlock, ProcessFlags, ProcessManager,
         ProcessState, PtraceOptions, PtraceRequest, RawPid,
     },
     syscall::{
         table::{FormattedSyscallParam, Syscall},
-        user_access::{copy_from_user_protected, copy_to_user_protected, UserBufferWriter},
+        user_access::UserBufferWriter,
     },
 };
 use alloc::sync::Arc;
@@ -121,69 +120,13 @@ impl TryFrom<usize> for PtraceRequest {
     }
 }
 
-/// 页表切换守卫，用于在作用域结束时自动恢复页表
-///
-/// 按照 Linux 6.6 ptrace_access_vm 的模式：
-/// 1. 禁用中断，防止在切换期间发生中断处理
-/// 2. 切换到目标进程的页表
-/// 3. 在作用域结束时恢复原始页表并重新启用中断
-struct PageTableGuard {
-    original_paddr: PhysAddr,
-    kind: PageTableKind,
-    _irq_guard: IrqFlagsGuard,
-}
-
-impl PageTableGuard {
-    /// 切换到目标进程的页表
-    ///
-    /// # Safety
-    /// 调用者必须确保：
-    /// 1. target_paddr 是有效的页表物理地址
-    /// 2. 在此守卫存在期间不会发生调度
-    fn new(target_paddr: PhysAddr, kind: PageTableKind) -> Self {
-        // 1. 首先禁用中断（关键！）
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
-        // 2. 获取当前页表物理地址用于恢复
-        let current_pcb = ProcessManager::current_pcb();
-        let original_paddr = current_pcb
-            .basic()
-            .user_vm()
-            .map(|vm| {
-                let inner = vm.read_irqsave();
-                inner.user_mapper.utable.table().phys()
-            })
-            .expect("current process must have user VM");
-
-        // 3. 切换到目标进程的页表
-        unsafe {
-            <MMArch as MemoryManagementArch>::set_table(kind, target_paddr);
-        }
-
-        Self {
-            original_paddr,
-            kind,
-            _irq_guard: irq_guard,
-        }
-    }
-}
-
-impl Drop for PageTableGuard {
-    fn drop(&mut self) {
-        // 恢复原始页表
-        unsafe {
-            <MMArch as MemoryManagementArch>::set_table(self.kind, self.original_paddr);
-        }
-        // 中断会在 _irq_guard drop 时自动恢复
-    }
-}
-
 /// ptrace 内存访问辅助函数
 ///
-/// 按照 Linux 6.6 的 ptrace_access_vm 模式实现：
-/// - 使用临时页表切换访问目标进程的地址空间
-/// - 在中断禁用状态下进行页表切换
-/// - 使用守卫模式确保页表一定会被恢复
+/// 按照 Linux 6.6 的 ptrace_access_vm 模式实现，但不使用页表切换：
+/// - 直接将 tracee 的虚拟地址翻译为物理地址
+/// - 通过 phys_2_virt 映射到内核虚拟地址空间
+/// - 使用异常表保护的拷贝函数，安全处理缺页异常
+/// - **不关闭中断**，避免中断禁用期间缺页导致的死锁
 ///
 /// # Safety
 /// 调用者必须确保 tracee 在访问期间不会被销毁
@@ -194,17 +137,100 @@ where
     // 获取目标进程的地址空间
     let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
 
-    // 获取目标进程的用户页表物理地址
-    let tracee_mapper_paddr = {
-        let inner = tracee_vm.read_irqsave();
-        inner.user_mapper.utable.table().phys()
-    };
+    // 获取目标进程的地址空间锁，但不切换页表
+    // 只需要在地址空间读锁保护下执行操作
+    let _tracee_vm_guard = tracee_vm.read_irqsave();
 
-    // 使用守卫切换页表，确保一定会恢复
-    let _guard = PageTableGuard::new(tracee_mapper_paddr, PageTableKind::User);
-
-    // 在目标进程的地址空间中执行操作
+    // 在目标进程的地址空间读锁保护中执行操作
     f()
+}
+
+/// 从 tracee 的用户空间读取数据（安全版本）
+///
+/// 使用物理地址翻译避免页表切换，不关闭中断。
+/// 参考 process_vm_readv 的实现方式。
+fn ptrace_peek_data(tracee: &Arc<ProcessControlBlock>, addr: usize) -> Result<isize, SystemError> {
+    let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
+    let tracee_vm_guard = tracee_vm.read_irqsave();
+
+    let tracee_addr = VirtAddr::new(addr);
+
+    // 检查地址是否在 tracee 的地址空间中
+    if tracee_vm_guard.mappings.contains(tracee_addr).is_none() {
+        return Err(SystemError::EIO);
+    }
+
+    // 计算页内偏移
+    let page_offset = addr & (MMArch::PAGE_SIZE - 1);
+
+    // 翻译 tracee 的虚拟地址为物理地址
+    let tracee_phys = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr) {
+        Some((phys_frame, _)) => PhysAddr::new(phys_frame.data() + page_offset),
+        None => return Err(SystemError::EIO),
+    };
+    drop(tracee_vm_guard);
+
+    // 使用异常表保护的拷贝
+    let mut value: u64 = 0;
+    unsafe {
+        // 将物理地址映射为内核虚拟地址
+        let kernel_virt = MMArch::phys_2_virt(tracee_phys).ok_or(SystemError::EIO)?;
+
+        let src_ptr = kernel_virt.data() as *const u8;
+        let dst_ptr = &mut value as *mut u64 as *mut u8;
+        let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, 8);
+        if result != 0 {
+            return Err(SystemError::EIO);
+        }
+    }
+
+    Ok(value as isize)
+}
+
+/// 向 tracee 的用户空间写入数据（安全版本）
+///
+/// 使用物理地址翻译避免页表切换，不关闭中断。
+/// 参考 process_vm_writev 的实现方式。
+fn ptrace_poke_data(
+    tracee: &Arc<ProcessControlBlock>,
+    addr: usize,
+    data: usize,
+) -> Result<isize, SystemError> {
+    let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
+    let tracee_vm_guard = tracee_vm.read_irqsave();
+
+    let tracee_addr = VirtAddr::new(addr);
+
+    // 检查地址是否在 tracee 的地址空间中
+    if tracee_vm_guard.mappings.contains(tracee_addr).is_none() {
+        return Err(SystemError::EIO);
+    }
+
+    // 计算页内偏移
+    let page_offset = addr & (MMArch::PAGE_SIZE - 1);
+
+    // 翻译 tracee 的虚拟地址为物理地址
+    let tracee_phys = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr) {
+        Some((phys_frame, _)) => PhysAddr::new(phys_frame.data() + page_offset),
+        None => return Err(SystemError::EIO),
+    };
+    drop(tracee_vm_guard);
+
+    // 使用异常表保护的拷贝
+    let value: u64 = data as u64;
+    unsafe {
+        // 将物理地址映射为内核虚拟地址
+        let kernel_virt = MMArch::phys_2_virt(tracee_phys).ok_or(SystemError::EIO)?;
+
+        let src_ptr = &value as *const u64 as *const u8;
+        let dst_ptr = kernel_virt.data() as *mut u8;
+        let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, 8);
+        if result != 0 {
+            return Err(SystemError::EIO);
+        }
+    }
+
+    Ok(0)
 }
 
 /// ptrace 系统调用实现
@@ -298,9 +324,18 @@ impl SysPtrace {
     }
 
     /// 处理 PTRACE_GETSIGINFO 请求（获取信号信息）
-    fn handle_get_siginfo(_tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
-        // 在实际实现中，你需要获取并返回信号信息
-        // 这里仅返回占位值
+    fn handle_get_siginfo(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
+        // 读取 last_siginfo 并拷贝到用户空间
+        let siginfo = tracee
+            .ptrace_state
+            .lock()
+            .last_siginfo()
+            .ok_or(SystemError::EINVAL)?;
+
+        // TODO: 将 siginfo 拷贝到用户空间的 data 参数指向的地址
+        // 目前返回成功，表示 siginfo 存在
+        // 完整实现需要：将 siginfo 转换为 PosixSigInfo 格式并拷贝到用户空间
+        log::debug!("PTRACE_GETSIGINFO: siginfo={:?}", siginfo);
         Ok(0)
     }
 
@@ -315,51 +350,29 @@ impl SysPtrace {
 
     /// 处理 PTRACE_PEEKDATA 请求（读取进程内存）
     ///
-    /// 按照 Linux 6.6.21 的 ptrace 语义：
-    /// - 使用 ptrace_access_vm 模式访问目标进程地址空间
-    /// - 在中断禁用状态下进行页表切换
-    /// - 使用守卫模式确保页表恢复
+    /// 使用安全的物理地址翻译方式访问目标进程地址空间：
+    /// - 不进行页表切换
+    /// - 不关闭中断
+    /// - 使用异常表保护安全处理缺页
     fn handle_peek_data(
         tracee: &Arc<ProcessControlBlock>,
         addr: usize,
     ) -> Result<isize, SystemError> {
-        // 使用安全的 ptrace_access_vm 辅助函数
-        ptrace_access_vm(tracee, || {
-            let mut value: u64 = 0;
-            unsafe {
-                copy_from_user_protected(
-                    core::slice::from_raw_parts_mut(&mut value as *mut u64 as *mut u8, 8),
-                    VirtAddr::new(addr),
-                )
-            }?;
-            Ok(value as isize)
-        })
-        .map_err(|_| SystemError::EIO)
+        ptrace_peek_data(tracee, addr)
     }
 
     /// 处理 PTRACE_POKEDATA 请求（写入进程内存）
     ///
-    /// 按照 Linux 6.6.21 的 ptrace 语义：
-    /// - 使用 ptrace_access_vm 模式访问目标进程地址空间
-    /// - 在中断禁用状态下进行页表切换
-    /// - 使用守卫模式确保页表恢复
+    /// 使用安全的物理地址翻译方式访问目标进程地址空间：
+    /// - 不进行页表切换
+    /// - 不关闭中断
+    /// - 使用异常表保护安全处理缺页
     fn handle_poke_data(
         tracee: &Arc<ProcessControlBlock>,
         addr: usize,
         data: usize,
     ) -> Result<isize, SystemError> {
-        // 使用安全的 ptrace_access_vm 辅助函数
-        ptrace_access_vm(tracee, || {
-            let value: u64 = data as u64;
-            unsafe {
-                copy_to_user_protected(
-                    VirtAddr::new(addr),
-                    core::slice::from_raw_parts(&value as *const u64 as *const u8, 8),
-                )
-            }?;
-            Ok(0)
-        })
-        .map_err(|_| SystemError::EIO)
+        ptrace_poke_data(tracee, addr, data)
     }
 
     /// 处理 PTRACE_SINGLESTEP 请求 (单步执行)
@@ -394,11 +407,20 @@ impl SysPtrace {
         // 从 tracee 的内核栈读取 TrapFrame
         let trap_frame = unsafe { &*(trap_frame_vaddr.data() as *const TrapFrame) };
 
-        // 获取 fs_base 和 gs_base
+        // 获取 fs_base、gs_base 和段选择器
+        // - fs_base/gs_base: task->thread.fsbase/gsbase
+        // - fs/gs: task->thread.fsindex/gsindex
+        // - ds/es: task->thread.ds/es 或 pt_regs->ds/es
         let arch_info = tracee.arch_info_irqsave();
         let fs_base = arch_info.fsbase() as u64;
         let gs_base = arch_info.gsbase() as u64;
+        let fs = arch_info.fs() as u64;
+        let gs = arch_info.gs() as u64;
         drop(arch_info);
+
+        // TrapFrame 包含 ds 和 es（对应 pt_regs->ds/es）
+        let ds = trap_frame.ds as u64;
+        let es = trap_frame.es as u64;
 
         // 构造用户态寄存器结构体
         let user_regs = user_regs_struct {
@@ -425,10 +447,10 @@ impl SysPtrace {
             ss: trap_frame.ss,
             fs_base,
             gs_base,
-            ds: 0,
-            es: 0,
-            fs: 0,
-            gs: 0,
+            ds,
+            es,
+            fs,
+            gs,
         };
 
         // 拷贝到用户空间

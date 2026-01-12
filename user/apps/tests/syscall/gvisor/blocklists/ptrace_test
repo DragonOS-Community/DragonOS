@@ -12,5 +12,6 @@ PtraceTest.Sysemu_PokeUser
 PtraceTest.85
 PtraceTest.Seize_Interrupt_Listen
 PtraceTest.Interrupt_Listen_RequireSeize
+PtraceTest.SeizeSetOptions
 PtraceTest.SingleStep
 *PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit*

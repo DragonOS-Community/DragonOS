@@ -423,18 +423,13 @@ fn sig_terminate_dump(sig: Signal) {
     // TODO 生成 coredump 文件
 }
 
-/// 信号默认处理函数——暂停进程
+/// 信号默认处理函数——暂停进程 (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU)
 ///
-/// 按照 Linux 6.6.21 kernel/signal.c::get_signal -> do_signal_stop 的语义：
-/// - 对于 ptrace 进程：ptrace 拦截发生在 signal 分发之前（ptrace_signal）
-/// - 如果执行到这里，说明 tracer 已经允许信号传递给 tracee
-/// - 但对于 ptrace 进程，"停止"不进入 TASK_STOPPED，而是由 tracer 控制状态
-/// - 因此这里绝不能再调用 ptrace_stop，否则会造成无限循环
 fn sig_stop(sig: Signal) {
     let pcb = ProcessManager::current_pcb();
 
     // ===== Ptrace 进程的特殊处理 =====
-    // 按照 Linux 6.6.21：被 ptrace 的进程不会进入标准的 TASK_STOPPED 状态
+    // 被 ptrace 的进程由 tracer 控制其状态(TASK_TRACED)，不进入标准的 TASK_STOPPED
     // 如果执行到这里，说明 ptrace_signal 已经在 do_signal 中处理过该信号
     // tracer 决定将信号注入给 tracee，但这不意味着 tracee 要再次停止
     // 直接返回，不做任何操作
@@ -447,6 +442,7 @@ fn sig_stop(sig: Signal) {
     pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
     pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
 
+    // 切换进程状态为 Stopped 并调度
     let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     ProcessManager::mark_stop(sig).unwrap_or_else(|e| {
         log::error!(
@@ -461,6 +457,7 @@ fn sig_stop(sig: Signal) {
     // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
     let pcb = ProcessManager::current_pcb();
     if let Some(parent) = pcb.parent_pcb() {
+        // 检查父进程是否设置了 SA_NOCLDSTOP
         let should_notify = {
             let sighand = parent.sighand();
             sighand
@@ -477,6 +474,7 @@ fn sig_stop(sig: Signal) {
     }
     // 唤醒等待在该子进程等待队列上的等待者
     pcb.wake_all_waiters();
+    // 让出 CPU 进入睡眠
     schedule(SchedMode::SM_NONE);
 }
 

@@ -1,10 +1,12 @@
-use crate::process::pid::{Pid, PidType};
-use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
 use crate::{
     arch::ipc::signal::Signal,
     ipc::{
         signal_types::{OriginCode, SigCode, SigInfo, SigType},
         syscall::sys_kill::check_signal_permission_pcb_with_sig,
+    },
+    process::{
+        pid::{Pid, PidType},
+        ProcessControlBlock, ProcessManager, RawPid,
     },
 };
 use alloc::sync::Arc;

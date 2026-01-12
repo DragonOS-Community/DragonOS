@@ -375,7 +375,6 @@ pub fn timekeeping_init() {
     // 暂时用 0 初始化，RTC 时间将在晚期初始化时设置
     let mut timekeeper = timekeeper().inner.write_irqsave();
 
-    debug!("ktime_get_real_ns() = {}", ktime_get_real_ns());
     timekeeper.xtime.tv_nsec = 0;
     timekeeper.xtime.tv_sec = 0;
     (
@@ -395,15 +394,15 @@ pub fn timekeeping_init() {
 pub fn timekeeping_init_later() -> Result<(), SystemError> {
     info!("Setting boot time from RTC...");
 
-    let rtc_ns = ktime_get_real_ns();
-    info!(
-        "ktime_get_real_ns() = {} ns ({} seconds)",
-        rtc_ns,
-        rtc_ns / 1_000_000_000
-    );
-
     // 更新 timekeeper 的 xtime 为 RTC 时间
     let mut timekeeper = timekeeper().inner.write_irqsave();
+
+    let rtc_ns = ktime_get_real_ns();
+    info!(
+        "ktime_get_real_ns() = {} ns",
+        rtc_ns,
+    );
+    
     timekeeper.xtime.tv_sec = rtc_ns / 1_000_000_000;
     timekeeper.xtime.tv_nsec = rtc_ns % 1_000_000_000;
     (

@@ -107,7 +107,7 @@ fn do_sysinfo(info: *mut SysInfo) -> Result<usize, SystemError> {
     sysinfo.bufferram = 0;
     sysinfo.totalswap = 0;
     sysinfo.freeswap = 0;
-    sysinfo.procs = ProcessManager::ns_process_count().min(u16::MAX as usize) as u16;
+    sysinfo.procs = ProcessManager::ns_process_count() as u16;
     sysinfo.pad = 0;
     sysinfo.totalhigh = 0;
     sysinfo.freehigh = 0;

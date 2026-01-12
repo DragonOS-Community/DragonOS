@@ -589,6 +589,7 @@ pub fn set_boot_time(time: u64) {
 }
 
 /// 获取系统启动时间
+#[allow(dead_code)]
 pub fn get_boot_time() -> u64 {
     BOOT_TIME.load(Ordering::Acquire)
 }

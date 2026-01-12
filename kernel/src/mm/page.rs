@@ -4,7 +4,7 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicU32, Ordering},
+    sync::atomic::{compiler_fence, Ordering},
 };
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -572,7 +572,7 @@ pub struct InnerPage {
     /// 页面类型
     page_type: PageType,
     /// mlock 引用计数
-    mlock_count: AtomicU32,
+    mlock_count: u32,
 }
 
 impl InnerPage {
@@ -582,7 +582,7 @@ impl InnerPage {
             flags,
             phys_addr,
             page_type,
-            mlock_count: AtomicU32::new(0),
+            mlock_count: 0,
         }
     }
 
@@ -700,7 +700,7 @@ impl InnerPage {
 
     /// 获取 mlock 引用计数
     pub fn mlock_count(&self) -> u32 {
-        self.mlock_count.load(Ordering::Relaxed)
+        self.mlock_count
     }
 
     /// 增加 mlock 引用计数，并在首次锁定时设置标志
@@ -715,9 +715,9 @@ impl InnerPage {
     /// 基于 Linux 6.6.21 mm/mlock.c:__mlock_folio()
     /// 该函数集中管理计数和标志，确保不变量一致性
     pub fn inc_mlock_count(&mut self) {
-        let old = self.mlock_count.fetch_add(1, Ordering::Relaxed);
-        if old == 0 {
-            // 首次锁定，原子性地设置标志
+        self.mlock_count += 1;
+        if self.mlock_count == 1 {
+            // 首次锁定，设置标志
             // PG_MLOCKED: 页面已被锁定
             // PG_UNEVICTABLE: 页面不可被换出
             self.add_flags(PageFlags::PG_MLOCKED | PageFlags::PG_UNEVICTABLE);
@@ -736,9 +736,8 @@ impl InnerPage {
     /// 基于 Linux 6.6.21 mm/mlock.c:__munlock_folio()
     /// 该函数集中管理计数和标志，确保不变量一致性
     pub fn dec_mlock_count(&mut self) {
-        let old = self.mlock_count.fetch_sub(1, Ordering::Relaxed);
-        if old == 1 {
-            // 计数归零，清除 PG_mlocked
+        if self.mlock_count == 1 {
+            // 计数将归零，清除 PG_mlocked
             self.remove_flags(PageFlags::PG_MLOCKED);
 
             // 只有当页面不再被映射时，才清除 PG_unevictable
@@ -747,6 +746,7 @@ impl InnerPage {
                 self.remove_flags(PageFlags::PG_UNEVICTABLE);
             }
         }
+        self.mlock_count -= 1;
     }
 }
 

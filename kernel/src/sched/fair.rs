@@ -82,7 +82,7 @@ pub struct FairSchedEntity {
     runnable_weight: u64,
 
     pcb: Weak<ProcessControlBlock>,
-    raw_pid: Option<RawPid>,
+    raw_pid: SpinLock<Option<RawPid>>,
 }
 
 impl FairSchedEntity {
@@ -107,7 +107,7 @@ impl FairSchedEntity {
             avg: Default::default(),
             depth: Default::default(),
             runnable_weight: Default::default(),
-            raw_pid: None,
+            raw_pid: SpinLock::new(None),
         });
 
         ret.force_mut().self_ref = Arc::downgrade(&ret);
@@ -133,6 +133,10 @@ impl FairSchedEntity {
 
     pub fn pcb(&self) -> Arc<ProcessControlBlock> {
         if let Some(pcb_arc) = self.pcb.upgrade() {
+            let mut raw_pid_guard = self.raw_pid.lock_irqsave();
+            if raw_pid_guard.is_none() {
+                *raw_pid_guard = Some(pcb_arc.raw_pid());
+            }
             return pcb_arc;
         } else {
             panic!(
@@ -143,11 +147,6 @@ impl FairSchedEntity {
     }
 
     pub fn set_pcb(&mut self, pcb: Weak<ProcessControlBlock>) {
-        if let Some(pcb_arc) = pcb.upgrade() {
-            self.raw_pid = Some(pcb_arc.raw_pid());
-        } else {
-            log::warn!("set_pcb: pcb is None");
-        }
         self.pcb = pcb
     }
 

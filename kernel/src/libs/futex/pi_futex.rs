@@ -65,11 +65,16 @@ impl Futex {
             let uval = atomic_futex.load(Ordering::SeqCst);
             let owner_tid = uval & FUTEX_TID_MASK;
 
-            // 情况1: futex为0，尝试直接获取锁
-            if uval == 0 {
+            // 情况1: futex未被持有（owner_tid==0），允许直接获取锁，即使WAITERS已置位
+            if owner_tid == 0 {
+                let new_val = if (uval & FUTEX_WAITERS) != 0 {
+                    current_tid | FUTEX_WAITERS
+                } else {
+                    current_tid
+                };
                 match atomic_futex.compare_exchange(
-                    0,
-                    current_tid,
+                    uval,
+                    new_val,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 ) {
@@ -355,10 +360,24 @@ impl Futex {
             return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
 
-        // 尝试获取锁（非阻塞）
-        match atomic_futex.compare_exchange(0, current_tid, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => Ok(0),
-            Err(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+        // 尝试获取锁（非阻塞），即使WAITERS置位也允许
+        if owner_tid == 0 {
+            let new_val = if (uval & FUTEX_WAITERS) != 0 {
+                current_tid | FUTEX_WAITERS
+            } else {
+                current_tid
+            };
+            match atomic_futex.compare_exchange(
+                uval,
+                new_val,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => Ok(0),
+                Err(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            }
+        } else {
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
         }
     }
 }

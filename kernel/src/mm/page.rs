@@ -736,17 +736,28 @@ impl InnerPage {
     /// 基于 Linux 6.6.21 mm/mlock.c:__munlock_folio()
     /// 该函数集中管理计数和标志，确保不变量一致性
     pub fn dec_mlock_count(&mut self) {
-        if self.mlock_count == 1 {
-            // 计数将归零，清除 PG_mlocked
-            self.remove_flags(PageFlags::PG_MLOCKED);
+        // 参考 Linux mm/mlock.c:135-138 的两次检查模式：
+        // if (folio->mlock_count) folio->mlock_count--;
+        // if (folio->mlock_count) goto out;
+        //
+        // 第一次检查：防止整数下溢
+        if self.mlock_count > 0 {
+            self.mlock_count -= 1;
 
-            // 只有当页面不再被映射时，才清除 PG_unevictable
-            // （与 Linux 语义一致：页面可能因为其他原因不可换出）
-            if self.map_count() == 0 {
-                self.remove_flags(PageFlags::PG_UNEVICTABLE);
+            // 第二次检查：递减后判断是否归零，决定是否清除标志
+            if self.mlock_count == 0 {
+                // 计数归零，清除 PG_mlocked
+                self.remove_flags(PageFlags::PG_MLOCKED);
+
+                // 只有当页面不再被映射时，才清除 PG_unevictable
+                // （与 Linux 语义一致：页面可能因为其他原因不可换出）
+                if self.map_count() == 0 {
+                    self.remove_flags(PageFlags::PG_UNEVICTABLE);
+                }
             }
+            // 如果递减后 mlock_count > 0，不清除标志（页面仍被其他 mlock 引用）
         }
-        self.mlock_count -= 1;
+        // 如果 mlock_count == 0，不做任何操作（防御性编程，防止竞态导致的下溢）
     }
 }
 

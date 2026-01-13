@@ -168,10 +168,9 @@ impl LockedVMA {
                 if level > 0 && entry.flags().has_flag(MMArch::ENTRY_FLAG_HUGE_PAGE) {
                     // 显式检查 present 位（符合 Linux 语义）
                     if entry.present() {
-                        let sub_page_count = (next - start) >> MMArch::PAGE_SHIFT;
                         // 安全 unwrap（因为已检查 present）
                         let base_paddr = entry.address().unwrap();
-
+                        let sub_page_count = (next - start) >> MMArch::PAGE_SHIFT;
                         // 计算 start 在当前条目内的偏移
                         let offset_in_entry = start.data() & (entry_size - 1);
 

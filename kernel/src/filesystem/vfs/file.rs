@@ -799,7 +799,7 @@ impl File {
         let end_page = (offset + len - 1) >> MMArch::PAGE_SHIFT;
 
         let (async_trigger_page, missing_page) = {
-            let page_cache_guard = page_cache.lock_irqsave();
+            let page_cache_guard = page_cache.lock();
             let mut async_trigger_page = None;
             let mut missing_page = None;
 

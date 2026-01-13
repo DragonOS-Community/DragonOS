@@ -14,7 +14,7 @@ use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::RenameFlags,
-    libs::{casting::DowncastArc, rwlock::RwLock},
+    libs::{casting::DowncastArc, rwsem::RwSem},
     time::PosixTimeSpec,
 };
 
@@ -100,14 +100,14 @@ impl KernFS {
         };
         let root_inode = Arc::new_cyclic(|self_ref| KernFSInode {
             name: String::from(""),
-            inner: RwLock::new(InnerKernFSInode {
+            inner: RwSem::new(InnerKernFSInode {
                 parent: Weak::new(),
                 metadata,
                 symlink_target: None,
                 symlink_target_absolute_path: None,
             }),
             self_ref: self_ref.clone(),
-            fs: RwLock::new(Weak::new()),
+            fs: RwSem::new(Weak::new()),
             private_data: Mutex::new(None),
             callback: None,
             children: Mutex::new(HashMap::new()),
@@ -121,9 +121,9 @@ impl KernFS {
 
 #[derive(Debug)]
 pub struct KernFSInode {
-    inner: RwLock<InnerKernFSInode>,
+    inner: RwSem<InnerKernFSInode>,
     /// 指向当前Inode所属的文件系统的弱引用
-    fs: RwLock<Weak<KernFS>>,
+    fs: RwSem<Weak<KernFS>>,
     /// 指向自身的弱引用
     self_ref: Weak<KernFSInode>,
     /// 私有数据
@@ -443,14 +443,14 @@ impl KernFSInode {
 
         let inode = Arc::new(KernFSInode {
             name,
-            inner: RwLock::new(InnerKernFSInode {
+            inner: RwSem::new(InnerKernFSInode {
                 parent: parent.clone(),
                 metadata,
                 symlink_target: None,
                 symlink_target_absolute_path: None,
             }),
             self_ref: Weak::new(),
-            fs: RwLock::new(Weak::new()),
+            fs: RwSem::new(Weak::new()),
             private_data: Mutex::new(private_data),
             callback,
             children: Mutex::new(HashMap::new()),

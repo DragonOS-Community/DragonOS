@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 /// - page_cache: 与文件inode关联的页缓存
 /// - start: 偏移量
 pub fn truncate_inode_pages(page_cache: Arc<PageCache>, start: usize) {
-    let guard = page_cache.lock_irqsave();
+    let guard = page_cache.lock();
     let pages_count = guard.pages_count();
 
     for i in start..pages_count {

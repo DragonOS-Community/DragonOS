@@ -651,7 +651,7 @@ impl PageFaultHandler {
                 << MMArch::PAGE_SHIFT);
 
         for pgoff in start_pgoff..end_pgoff {
-            if let Some(page) = page_cache.lock_irqsave().get_page(pgoff) {
+            if let Some(page) = page_cache.lock().get_page(pgoff) {
                 let page_guard = page.read_irqsave();
                 if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
                     let phys = page.phys_address();
@@ -694,7 +694,7 @@ impl PageFaultHandler {
         let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
         let mut ret = VmFaultReason::empty();
 
-        let page = page_cache.lock_irqsave().get_page(backing_pgoff);
+        let page = page_cache.lock().get_page(backing_pgoff);
         if let Some(page) = page {
             // TODO 异步从磁盘中预读页面进PageCache
 
@@ -727,7 +727,7 @@ impl PageFaultHandler {
             }
             drop(buffer);
 
-            let page = page_cache.lock_irqsave().get_page(backing_pgoff);
+            let page = page_cache.lock().get_page(backing_pgoff);
             if let Some(page) = page {
                 pfm.page = Some(page);
             } else {
@@ -771,7 +771,7 @@ impl PageFaultHandler {
         }
 
         // 先尝试直接获取
-        if let Some(page) = page_cache.lock_irqsave().get_page(backing_pgoff) {
+        if let Some(page) = page_cache.lock().get_page(backing_pgoff) {
             // 标记为 UPTODATE，便于 map_pages / readahead（即便对 tmpfs 通常不会走）。
             page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);
@@ -779,12 +779,12 @@ impl PageFaultHandler {
         }
 
         {
-            let mut pc = page_cache.lock_irqsave();
+            let mut pc = page_cache.lock();
             // 可能并发创建：create 后再 get（忽略已存在/并发导致的轻微差异）
             pc.create_zero_pages(backing_pgoff, 1).map_err(|_| ()).ok();
         }
 
-        let page = page_cache.lock_irqsave().get_page(backing_pgoff);
+        let page = page_cache.lock().get_page(backing_pgoff);
         if let Some(page) = page {
             page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);

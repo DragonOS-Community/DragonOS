@@ -99,26 +99,57 @@ QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
 QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
 QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
 QEMU_MEMORY="1024M"
-QEMU_MEMORY_BACKEND="dragonos-qemu-shm.ram"
-QEMU_MEMORY_BACKEND_PATH_PREFIX="/dev/shm"
-QEMU_SHM_OBJECT="-object memory-backend-file,size=${QEMU_MEMORY},id=${QEMU_MEMORY_BACKEND},mem-path=${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND},share=on "
+
+# 检查必要的环境变量
+if [ -z "${ROOT_PATH}" ]; then
+    echo "[错误] ROOT_PATH 环境变量未设置"
+    echo "[错误] 请通过 Makefile 运行本脚本 (make qemu, make run 等)"
+    exit 1
+fi
+
+# 状态文件目录（优先使用环境变量，否则使用默认值）
+VMSTATE_DIR="${VMSTATE_DIR:-${ROOT_PATH}/bin/vmstate}"
+mkdir -p "${VMSTATE_DIR}"
+
+# 分配可用端口的函数
+find_free_port() {
+    local start_port=$1
+    local port=$start_port
+    while netstat -tuln 2>/dev/null | grep -q ":${port} " || \
+          ss -tuln 2>/dev/null | grep -q ":${port} "; do
+        port=$((port + 1))
+    done
+    echo $port
+}
+
+# 先分配网络端口
+HOST_PORT=$(find_free_port 12580)
+# GDB端口从网络端口的下一位开始搜索，确保不重复
+GDB_PORT=$(find_free_port $((HOST_PORT + 1)))
+
+# 写入状态文件
+echo "${HOST_PORT}" > "${VMSTATE_DIR}/port"
+echo "${GDB_PORT}" > "${VMSTATE_DIR}/gdb"
+
 QEMU_SMP="2,cores=2,threads=1,sockets=1"
-QEMU_MONITOR="-monitor stdio"
+QEMU_MONITOR_ARGS=(-monitor stdio)
 QEMU_TRACE="${qemu_trace_std}"
 QEMU_CPU_FEATURES=""
 QEMU_RTC_CLOCK=""
 QEMU_SERIAL_LOG_FILE="../serial_opt.txt"
-QEMU_SERIAL="-serial file:${QEMU_SERIAL_LOG_FILE}"
-QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
-QEMU_ACCELARATE=""
-QEMU_DEVICES=""
+QEMU_SERIAL_ARGS=(-serial "file:${QEMU_SERIAL_LOG_FILE}")
+QEMU_DRIVE_ARGS=(-drive "id=disk,file=${QEMU_DISK_IMAGE},if=none,format=raw")
+QEMU_ACCEL_ARGS=()
+QEMU_DEVICE_ARGS=()
+QEMU_DISPLAY_ARGS=()
+QEMU_ARGS=()
 # QEMU_ARGUMENT+=" -S "
 
 if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
-  QEMU_DRIVE+=" -drive id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw"
+  QEMU_DRIVE_ARGS+=(-drive "id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw")
 fi
 if [ -f "${QEMU_FAT_DISK_IMAGE}" ]; then
-  QEMU_DRIVE+=" -drive id=fatdisk,file=${QEMU_FAT_DISK_IMAGE},if=none,format=raw"
+  QEMU_DRIVE_ARGS+=(-drive "id=fatdisk,file=${QEMU_FAT_DISK_IMAGE},if=none,format=raw")
 fi
 
 check_dependencies
@@ -141,36 +172,44 @@ VIRTIO_BLK_DEVICE=true
 
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
-    QEMU_ACCELARATE=" -machine accel=${qemu_accel} "
+    QEMU_ACCEL_ARGS=(-machine "accel=${qemu_accel}")
   if [ "${qemu_accel}" == "kvm" ]; then
-    QEMU_ACCELARATE+=" -enable-kvm "
+    QEMU_ACCEL_ARGS+=(-enable-kvm)
   fi
 fi
 
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
-    QEMU_MACHINE=" -machine q35,memory-backend=${QEMU_MEMORY_BACKEND} "
+    QEMU_MACHINE_ARGS=(-machine q35)
     # 根据加速方式选择CPU型号：KVM使用host，TCG使用IvyBridge
     cpu_model=$([ "${qemu_accel}" == "kvm" ] && echo "host" || echo "IvyBridge")
-    QEMU_CPU_FEATURES+="-cpu ${cpu_model},apic,x2apic,+fpu,check,+vmx,${allflags}"
-    QEMU_RTC_CLOCK+=" -rtc clock=host,base=localtime"
-    if [ ${VIRTIO_BLK_DEVICE} == false ]; then
-      QEMU_DEVICES_DISK+="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 "
+    if [ -n "${allflags}" ]; then
+      QEMU_CPU_ARGS=(-cpu "${cpu_model},apic,x2apic,+fpu,check,+vmx,${allflags}")
     else
-      QEMU_DEVICES_DISK="-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
+      QEMU_CPU_ARGS=(-cpu "${cpu_model},apic,x2apic,+fpu,check,+vmx")
+    fi
+    QEMU_RTC_ARGS=(-rtc clock=host,base=localtime)
+    if [ ${VIRTIO_BLK_DEVICE} == false ]; then
+      QEMU_DEVICE_DISK_ARGS=(-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0)
+    else
+      QEMU_DEVICE_DISK_ARGS=(-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port)
     fi
     if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
-      QEMU_DEVICES_DISK+=" -device virtio-blk-pci,drive=ext4disk"
+      QEMU_DEVICE_DISK_ARGS+=(-device virtio-blk-pci,drive=ext4disk)
     fi
     if [ -f "${QEMU_FAT_DISK_IMAGE}" ]; then
-      QEMU_DEVICES_DISK+=" -device virtio-blk-pci,drive=fatdisk"
+      QEMU_DEVICE_DISK_ARGS+=(-device virtio-blk-pci,drive=fatdisk)
     fi
 
 elif [ ${ARCH} == "riscv64" ]; then
-    QEMU_MACHINE=" -machine virt,memory-backend=${QEMU_MEMORY_BACKEND} -cpu sifive-u54 "
-    QEMU_DEVICES_DISK="-device virtio-blk-device,drive=disk "
+    QEMU_MACHINE_ARGS=(-machine virt)
+    QEMU_CPU_ARGS=(-cpu sifive-u54)
+    QEMU_RTC_ARGS=()
+    QEMU_DEVICE_DISK_ARGS=(-device virtio-blk-device,drive=disk)
 elif [ ${ARCH} == "loongarch64" ]; then
-    QEMU_MACHINE=" -machine virt"
-    QEMU_DEVICES_DISK="-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
+    QEMU_MACHINE_ARGS=(-machine virt)
+    QEMU_CPU_ARGS=()
+    QEMU_RTC_ARGS=()
+    QEMU_DEVICE_DISK_ARGS=(-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port)
 else
     echo "Unsupported architecture: ${ARCH}"
     exit 1
@@ -195,7 +234,7 @@ while true;do
         --display)
         case "$2" in
               vnc)
-              QEMU_ARGUMENT+=" -display vnc=:00 "
+              QEMU_DISPLAY_ARGS=(-display vnc=:00)
               ;;
               window)
               ;;
@@ -243,48 +282,72 @@ setup_kernel_cmdline_from_env
 
 
 if [ ${QEMU_NOGRAPHIC} == true ]; then
-    QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
+    QEMU_SERIAL_ARGS=(-serial chardev:mux -monitor chardev:mux -chardev "stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE}")
 
     # 添加 virtio console 设备
     if [ ${ARCH} == "x86_64" ]; then
-      QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
+      QEMU_DEVICE_ARGS+=(-device virtio-serial -device virtconsole,chardev=mux)
     elif [ ${ARCH} == "loongarch64" ]; then
-      QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
+      QEMU_DEVICE_ARGS+=(-device virtio-serial -device virtconsole,chardev=mux)
     elif [ ${ARCH} == "riscv64" ]; then
-      QEMU_DEVICES+=" -device virtio-serial-device -device virtconsole,chardev=mux "
+      QEMU_DEVICE_ARGS+=(-device virtio-serial-device -device virtconsole,chardev=mux)
     fi
 
     KERNEL_CMDLINE=" console=/dev/hvc0 ${KERNEL_CMDLINE}"
-    QEMU_MONITOR=""
-    QEMU_ARGUMENT+=" --nographic "
+    QEMU_MONITOR_ARGS=()
+    QEMU_ARGS+=(--nographic)
 
     KERNEL_CMDLINE=$(echo "${KERNEL_CMDLINE}" | sed 's/^[ \t]*//;s/[ \t]*$//')
 
     if [ ${ARCH} == "x86_64" ]; then
-      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf -append \"${KERNEL_CMDLINE}\" "
+      QEMU_ARGS+=(-kernel ../bin/kernel/kernel.elf -append "${KERNEL_CMDLINE}")
     elif [ ${ARCH} == "loongarch64" ]; then
-      QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf -append \"${KERNEL_CMDLINE}\" "
+      QEMU_ARGS+=(-kernel ../bin/kernel/kernel.elf -append "${KERNEL_CMDLINE}")
     elif [ ${ARCH} == "riscv64" ]; then
-      QEMU_ARGUMENT+=" -append \"${KERNEL_CMDLINE}\" "
+      QEMU_ARGS+=(-append "${KERNEL_CMDLINE}")
     fi
 fi
 
 
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 "
-QEMU_DEVICES+="${QEMU_DEVICES_DISK} "
-QEMU_DEVICES+=" -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virtio-net-pci,vectors=5,netdev=hostnet0,id=net0 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
+QEMU_DEVICE_ARGS+=("${QEMU_DEVICE_DISK_ARGS[@]}")
+QEMU_DEVICE_ARGS+=(
+  -netdev "user,id=hostnet0,hostfwd=tcp::${HOST_PORT}-:12580"
+  -device "virtio-net-pci,vectors=5,netdev=hostnet0,id=net0"
+  -usb
+  -device "qemu-xhci,id=xhci,p2=8,p3=4"
+) 
 # E1000E
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 
 
-QEMU_ARGUMENT+="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d ${QEMU_MONITOR} -d ${qemu_trace_std} "
+QEMU_ARGS+=(
+  -m "${QEMU_MEMORY}"
+  -smp "${QEMU_SMP}"
+  -boot order=d
+)
+QEMU_ARGS+=("${QEMU_MONITOR_ARGS[@]}")
+QEMU_ARGS+=("${QEMU_DISPLAY_ARGS[@]}")
+QEMU_ARGS+=(-d "${qemu_trace_std}")
 
-QEMU_ARGUMENT+="-s ${QEMU_MACHINE} ${QEMU_CPU_FEATURES} ${QEMU_RTC_CLOCK} ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES} "
-QEMU_ARGUMENT+=" ${QEMU_SHM_OBJECT} "
-QEMU_ARGUMENT+=" ${QEMU_ACCELARATE} "
+QEMU_ARGS+=(
+  "${QEMU_MACHINE_ARGS[@]}"
+  "${QEMU_CPU_ARGS[@]}"
+  "${QEMU_RTC_ARGS[@]}"
+  "${QEMU_SERIAL_ARGS[@]}"
+  "${QEMU_DRIVE_ARGS[@]}"
+  "${QEMU_DEVICE_ARGS[@]}"
+)
+QEMU_ARGS+=("${QEMU_ACCEL_ARGS[@]}")
 
-QEMU_ARGUMENT+=" -D ../qemu.log "
+QEMU_ARGS+=(-D ../qemu.log)
+
+# GDB调试支持（默认不暂停CPU；需要暂停请显式设置 QEMU_GDB_WAIT=1）
+QEMU_ARGS+=(-gdb "tcp::${GDB_PORT}")
+if [ "${QEMU_GDB_WAIT}" == "1" ]; then
+  QEMU_ARGS+=(-S)
+fi
 
 
 # 安装riscv64的uboot
@@ -312,39 +375,52 @@ install_riscv_uboot()
 
 
 if [ $flag_can_run -eq 1 ]; then
-   
 
-# 删除共享内存
-sudo rm -rf ${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND}
+  # 清理旧的PID文件
+  rm -f "${VMSTATE_DIR}/pid"
 
-if [ ${BIOS_TYPE} == uefi ] ;then
-  if [ ${ARCH} == x86_64 ] ;then
-    sh -c "sudo ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}"
-  elif [ ${ARCH} == i386 ] ;then
-    sh -c "sudo ${QEMU} -bios arch/i386/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}"
-  elif [ ${ARCH} == riscv64 ] ;then
-    install_riscv_uboot
-    sh -c "sudo ${QEMU} -kernel ${RISCV64_UBOOT_PATH}/u-boot.bin ${QEMU_ARGUMENT}"
+  # 启动QEMU的函数
+  launch_qemu() {
+    local -a bios_args=()
+    if [ $# -gt 0 ]; then
+      bios_args=("$@")
+    fi
+    echo "[QEMU] 启动中... (网络端口: ${HOST_PORT}, GDB端口: ${GDB_PORT})"
+    if [ "${QEMU_GDB_WAIT}" == "1" ]; then
+      echo "[QEMU] 等待GDB连接... (使用 'make gdb' 连接)"
+    fi
+    local -a cmd=("${QEMU}" "${bios_args[@]}" "${QEMU_ARGS[@]}")
+    printf '[QEMU] 执行: sudo ' >&2
+    printf '%q ' "${cmd[@]}" >&2
+    printf '\n' >&2
+    sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "${VMSTATE_DIR}/pid" "${cmd[@]}"
+  }
+
+  if [ ${BIOS_TYPE} == uefi ] ;then
+    if [ ${ARCH} == x86_64 ] ;then
+      launch_qemu -bios arch/x86_64/efi/OVMF-pure-efi.fd
+    elif [ ${ARCH} == i386 ] ;then
+      launch_qemu -bios arch/i386/efi/OVMF-pure-efi.fd
+    elif [ ${ARCH} == riscv64 ] ;then
+      install_riscv_uboot
+      launch_qemu -kernel "${RISCV64_UBOOT_PATH}/u-boot.bin"
+    else
+      echo "不支持的架构: ${ARCH}"
+    fi
   else
-    echo "不支持的架构: ${ARCH}"
+    # 如果是i386架构或者x86_64架构，就直接启动
+    if [ ${ARCH} == x86_64 ] || [ ${ARCH} == i386 ] ;then
+      launch_qemu
+    elif [ ${ARCH} == riscv64 ] ;then
+      # 如果是riscv64架构，就与efi启动一样
+      install_riscv_uboot
+      launch_qemu -kernel "${RISCV64_UBOOT_PATH}/u-boot.bin"
+    elif [ ${ARCH} == loongarch64 ] ;then
+      launch_qemu
+    else
+      echo "不支持的架构: ${ARCH}"
+    fi
   fi
-else
-  # 如果是i386架构或者x86_64架构，就直接启动
-  if [ ${ARCH} == x86_64 ] || [ ${ARCH} == i386 ] ;then
-    sh -c "sudo ${QEMU} ${QEMU_ARGUMENT}"
-  elif [ ${ARCH} == riscv64 ] ;then
-    # 如果是riscv64架构，就与efi启动一样
-    install_riscv_uboot
-    sh -c "sudo ${QEMU} -kernel ${RISCV64_UBOOT_PATH}/u-boot.bin ${QEMU_ARGUMENT}"
-  elif [ ${ARCH} == loongarch64 ] ;then
-    sh -c "sudo ${QEMU} ${QEMU_ARGUMENT}"
-  else
-    echo "不支持的架构: ${ARCH}"
-  fi
-fi
-
-# 删除共享内存
-sudo rm -rf ${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND}
 else
   echo "不满足运行条件"
 fi

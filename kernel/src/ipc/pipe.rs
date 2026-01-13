@@ -1316,6 +1316,13 @@ impl IndexNode for LockedPipeInode {
             return Err(SystemError::EBADF);
         }
         let accflags = flags.access_flags();
+
+        // O_PATH: 只获取文件描述符，不需要reader/writer计数
+        // 参考 Linux 对 O_PATH 的处理，close() 不应影响管道的读写端计数
+        if flags.contains(FileFlags::O_PATH) {
+            return Ok(());
+        }
+
         let mut guard = self.inner.lock();
 
         // 写端关闭

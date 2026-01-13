@@ -26,7 +26,7 @@ pub struct Waiter {
 }
 
 pub struct Waker {
-    has_woken: AtomicBool,    // 唤醒标志
+    state: AtomicU8,          // 唤醒状态机
     target: Weak<PCB>,        // 目标进程
 }
 ```
@@ -35,6 +35,7 @@ pub struct Waker {
 - **Waiter**：线程本地持有（`!Send`/`!Sync`），只能在创建它的线程上等待
 - **Waker**：通过 `Arc` 共享，可以跨 CPU/线程传递和唤醒
 - **一次性设计**：每次等待创建新的 Waiter/Waker 对，避免状态污染
+- **状态机握手**：`Idle/Sleeping/Notified/Closed` 四态，保证并发唤醒不丢失
 
 ### 2.2 等待队列结构
 
@@ -118,6 +119,10 @@ pub fn wait_until_timeout<F, R>(&self, cond: F, timeout: Duration)
 - `Ok(R)`：条件满足，返回获取的资源
 - `Err(ERESTARTSYS)`：被信号中断
 - `Err(EAGAIN_OR_EWOULDBLOCK)`：超时
+  
+**取消语义**：
+- 超时或信号中断返回前会 `close` 对应的 `Waker` 并再次检查条件
+- 这样可避免“取消与并发唤醒”交错导致的唤醒丢失
 
 ### 3.3 为什么 wait_until 优于 wait_event
 
@@ -214,9 +219,9 @@ let guard = wait_until(|| lock.try_acquire());  // ✅ 原子获取
    - 因此需要重新入队并检查
 
 3. **一次性 Waker 的优势**：
-   - 避免了复杂的状态管理
-   - 被唤醒后不会再次被唤醒（`has_woken` 标志）
-   - 循环中会重新注册新的 waker，但使用同一个 `Arc<Waker>`
+   - 避免了复杂的生命周期管理
+   - 使用状态机消费通知（`Notified -> Idle`），不会重复交付
+   - 循环中会重新注册 waker，但使用同一个 `Arc<Waker>`
 
 ### 4.2 唤醒流程
 
@@ -295,32 +300,25 @@ pub fn wake_all(&self) -> usize {
 ```rust
 impl Waker {
     pub fn wake(&self) -> bool {
-        // 原子设置唤醒标志
-        if self.has_woken.swap(true, Ordering::Release) {
-            return false;  // 已被唤醒过
-        }
-
-        // 唤醒目标进程
-        if let Some(pcb) = self.target.upgrade() {
-            ProcessManager::wakeup(&pcb);
-        }
-        true
+        // 原子状态机：Sleep 时真正唤醒；Idle 时只记账通知
+        // Sleeping -> Notified: 触发 ProcessManager::wakeup
+        // Idle -> Notified: 记录提前唤醒
     }
 
     pub fn close(&self) {
         // 关闭 waker，防止后续唤醒
-        self.has_woken.store(true, Ordering::Acquire);
+        self.state.store(STATE_CLOSED, Ordering::Release);
     }
 
-    fn consume_wake(&self) -> bool {
-        // 消费唤醒标志（用于 block_current）
-        self.has_woken.swap(false, Ordering::Acquire)
+    fn consume_notification(&self) -> bool {
+        // 消费通知（用于 block_current），Notified -> Idle
+        ...
     }
 }
 ```
 
 **关键特性**：
-- **原子唤醒标志**：`has_woken` 使用 `AtomicBool` 确保只唤醒一次
+- **原子状态机**：`state` 管理 `Idle/Sleeping/Notified/Closed`
 - **弱引用目标进程**：使用 `Weak<PCB>` 避免循环引用，进程退出时自动清理
 - **内存序保证**：Release/Acquire 语义确保唤醒前的修改对被唤醒进程可见
 
@@ -330,21 +328,29 @@ impl Waker {
 fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
     loop {
         // 快速路径：已被唤醒
-        if waiter.waker.consume_wake() {
+        if waiter.waker.consume_notification() {
             return Ok(());
         }
 
         // 禁用中断，进入临界区
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-        // 再次检查唤醒标志（处理"先唤后睡"竞态）
-        if waiter.waker.consume_wake() {
-            drop(irq_guard);
-            return Ok(());
+        // 进入睡眠握手（处理"先唤后睡"竞态）
+        match waiter.waker.prepare_sleep() {
+            WakerSleepState::Notified | WakerSleepState::Closed => {
+                drop(irq_guard);
+                return Ok(());
+            }
+            WakerSleepState::Sleeping => {}
         }
 
         // 标记进程为睡眠状态
         ProcessManager::mark_sleep(interruptible)?;
+        // 再次消费通知，避免 prepare_sleep 与 mark_sleep 的竞态
+        if waiter.waker.consume_notification() {
+            drop(irq_guard);
+            return Ok(());
+        }
         drop(irq_guard);  // 恢复中断
 
         // 调度到其他进程
@@ -359,7 +365,7 @@ fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError
 ```
 
 **关键设计**：
-- **双重检查**：在禁用中断前后都检查唤醒标志，防止"先唤后睡"
+- **握手机制**：`prepare_sleep()` 先把状态转入 `Sleeping`，并在 `mark_sleep` 后再消费通知
 - **中断保护**：`mark_sleep` 必须在禁用中断的情况下执行
 - **信号检查**：被调度回来后检查是否有信号需要处理
 
@@ -824,7 +830,7 @@ let result = wait_queue.wait_event_interruptible(|| cond(), None)?;
 ### 13.3 调试建议
 
 - 使用 `wait_queue.len()` 检查等待者数量
-- 注意 `has_woken` 标志的状态（通过日志）
+- 注意 `state` 状态机的变化（通过日志）
 - 检查是否有进程长期阻塞（可能是唤醒逻辑错误）
 
 ## 14. 实现原理总结
@@ -847,7 +853,7 @@ let result = wait_queue.wait_event_interruptible(|| cond(), None)?;
             ┌────────────────────┐  ┌────────────────────┐
             │      Waiter        │  │       Waker        │
             │  ┌──────────────┐  │  │  ┌──────────────┐  │
-            │  │ waker: Arc   │──┼──┼─→│ has_woken:   │  │
+            │  │ waker: Arc   │──┼──┼─→│ state:      │  │
             │  │              │  │  │  │  AtomicBool  │  │
             │  └──────────────┘  │  │  └──────────────┘  │
             │  ┌──────────────┐  │  │  ┌──────────────┐  │

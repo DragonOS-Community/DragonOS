@@ -10,7 +10,7 @@ use crate::libs::align::page_align_up;
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::SpinLock;
 use crate::mm::allocator::page_frame::{PageFrameCount, PhysPageFrame};
-use crate::mm::page::{page_manager_lock_irqsave, PageFlags, PageType};
+use crate::mm::page::{page_manager_lock, PageFlags, PageType};
 use crate::mm::{MemoryManagementArch, PhysAddr};
 use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
 use alloc::string::String;
@@ -242,7 +242,7 @@ impl BpfPerfEvent {
     }
     pub fn do_mmap(&self, _start: usize, len: usize, offset: usize) -> Result<()> {
         let mut data = self.data.lock();
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock();
         let (phy_addr, pages) = page_manager_guard.create_pages(
             PageType::Normal,
             PageFlags::PG_UNEVICTABLE,
@@ -271,7 +271,7 @@ impl BpfPerfEvent {
 
 impl Drop for BpfPerfEvent {
     fn drop(&mut self) {
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock();
         let data = self.data.lock();
         let phy_addr = data.mmap_page.phys_addr;
         let len = data.mmap_page.size;

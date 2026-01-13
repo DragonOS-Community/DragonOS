@@ -582,7 +582,7 @@ impl Futex {
             .mappings
             .contains(uaddr)
             .ok_or(SystemError::EINVAL)?;
-        let vma_guard = vma.lock_irqsave();
+        let vma_guard = vma.lock();
 
         // 页内索引（相对VMA起始地址）
         let page_index =

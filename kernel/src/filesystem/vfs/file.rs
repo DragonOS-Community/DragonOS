@@ -25,7 +25,7 @@ use crate::{
         vfs::FilldirContext,
     },
     ipc::{kill::send_signal_to_pid, pipe::PipeFsPrivateData},
-    libs::{mutex::Mutex, rwlock::RwLock, spinlock::SpinLock},
+    libs::{mutex::Mutex, rwsem::RwSem},
     mm::{
         page::PageFlags,
         readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
@@ -385,22 +385,22 @@ pub struct File {
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
     offset: AtomicUsize,
     /// 文件的打开模式
-    flags: RwLock<FileFlags>,
+    flags: RwSem<FileFlags>,
     /// 文件的访问模式
-    mode: RwLock<FileMode>,
+    mode: RwSem<FileMode>,
     /// 文件类型
     file_type: FileType,
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
-    readdir_subdirs_name: SpinLock<Vec<String>>,
+    readdir_subdirs_name: Mutex<Vec<String>>,
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
     /// 文件描述符标志：是否在execve时关闭
     close_on_exec: AtomicBool,
     /// owner
-    pid: SpinLock<Option<Arc<ProcessControlBlock>>>,
+    pid: Mutex<Option<Arc<ProcessControlBlock>>>,
     /// 预读状态
-    ra_state: SpinLock<FileReadaheadState>,
+    ra_state: Mutex<FileReadaheadState>,
 }
 
 impl File {
@@ -606,15 +606,15 @@ impl File {
         let f = File {
             inode,
             offset: AtomicUsize::new(0),
-            flags: RwLock::new(flags),
-            mode: RwLock::new(mode),
+            flags: RwSem::new(flags),
+            mode: RwSem::new(mode),
             file_type,
-            readdir_subdirs_name: SpinLock::new(Vec::default()),
+            readdir_subdirs_name: Mutex::new(Vec::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
             close_on_exec: AtomicBool::new(close_on_exec),
-            pid: SpinLock::new(None),
-            ra_state: SpinLock::new(FileReadaheadState::new()),
+            pid: Mutex::new(None),
+            ra_state: Mutex::new(FileReadaheadState::new()),
         };
 
         return Ok(f);
@@ -1140,15 +1140,15 @@ impl File {
         let res = Self {
             inode: self.inode.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
-            flags: RwLock::new(self.flags()),
-            mode: RwLock::new(self.mode()),
+            flags: RwSem::new(self.flags()),
+            mode: RwSem::new(self.mode()),
             file_type: self.file_type,
-            readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
+            readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
             private_data: Mutex::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
             close_on_exec: AtomicBool::new(self.close_on_exec.load(Ordering::SeqCst)),
-            pid: SpinLock::new(None),
-            ra_state: SpinLock::new(self.ra_state.lock().clone()),
+            pid: Mutex::new(None),
+            ra_state: Mutex::new(self.ra_state.lock().clone()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design

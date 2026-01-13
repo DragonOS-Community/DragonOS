@@ -108,8 +108,6 @@ show_diagnostic_info() {
     fi
 
     echo "[监控] 串口文件大小: $(du -h "$SERIAL_FILE" 2>/dev/null | cut -f1 || echo "未知")"
-    echo "[监控] 最近100行输出:"
-    tail -n 100 "$SERIAL_FILE" 2>/dev/null | sed 's/^/  /'
     echo "[监控] ================================"
 }
 

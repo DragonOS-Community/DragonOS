@@ -165,13 +165,13 @@ impl Syscall for SysMremapHandle {
             new_len,
             mremap_flags,
             new_vaddr,
-            vm_flags,
         )?;
 
         // Unmap the old mapping only if this was a move (i.e. result differs from old_vaddr).
         // - old_len==0 is a special duplication request and must never unmap the source.
         // - DONTUNMAP keeps the source by definition.
-        if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) && old_len != 0 && r != old_vaddr {
+        let is_move = r != old_vaddr;
+        if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) && old_len != 0 && is_move {
             do_munmap(old_vaddr, old_len)?;
         }
 

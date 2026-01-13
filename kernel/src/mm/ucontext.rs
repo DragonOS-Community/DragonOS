@@ -758,7 +758,6 @@ impl InnerAddressSpace {
         new_len: usize,
         mremap_flags: MremapFlags,
         new_vaddr: VirtAddr,
-        vm_flags: VmFlags,
     ) -> Result<VirtAddr, SystemError> {
         // 仅在 MREMAP_FIXED 下需要检查 new_vaddr（否则 new_vaddr 参数应被忽略，由内核选择新地址）
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
@@ -775,17 +774,15 @@ impl InnerAddressSpace {
             }
         }
 
-        // 初始化内存区域保护标志
-        let prot_flags: ProtFlags = vm_flags.into();
-
-        // 读取旧 VMA 的后备信息（file/shared-anon）以及页偏移基址。
+        // 读取旧 VMA 的信息（包括 vm_flags、后备信息、页偏移基址）
         let old_vma = self
             .mappings
             .contains(old_vaddr)
             .ok_or(SystemError::EINVAL)?;
-        let (old_region, vm_file, shared_anon, base_pgoff) = {
+        let (old_region, vm_flags, vm_file, shared_anon, base_pgoff) = {
             let g = old_vma.lock_irqsave();
             let region = *g.region();
+            let flags = *g.vm_flags();
             let vma_start = region.start();
             let off_pages =
                 (old_vaddr.data().saturating_sub(vma_start.data())) >> MMArch::PAGE_SHIFT;
@@ -793,8 +790,11 @@ impl InnerAddressSpace {
                 .backing_page_offset()
                 .unwrap_or(0)
                 .saturating_add(off_pages);
-            (region, g.vm_file(), g.shared_anon.clone(), base)
+            (region, flags, g.vm_file(), g.shared_anon.clone(), base)
         };
+
+        // 初始化内存区域保护标志
+        let prot_flags: ProtFlags = vm_flags.into();
 
         // 构造目标映射 flags：mremap 需要保留 shared/private 语义，并区分 anon/file。
         let mut map_flags: MapFlags = vm_flags.into();
@@ -949,6 +949,41 @@ impl InnerAddressSpace {
                 pg.insert_vma(new_vma.clone());
             }
             off += MMArch::PAGE_SIZE;
+        }
+
+        // 修复：按照 Linux 语义更新 locked_vm 计数
+        // 参考 Linux kernel mm/mremap.c:move_vma() 第714-715行
+        // if (vm_flags & VM_LOCKED) {
+        //     mm->locked_vm += new_len >> PAGE_SHIFT;
+        // }
+        //
+        // 关键语义：
+        // - 移动操作（is_move=true）：调用方会调用 do_munmap 减少 old_len，这里增加 new_len
+        // - 原地扩展（is_move=false, new_len > old_len）：调用方不会调用 do_munmap，只增加 delta
+        // - MREMAP_DONTUNMAP：调用方不会调用 do_munmap，但新映射需要被计数
+        let is_move = new_region.start() != old_vaddr;
+          let was_locked =
+            vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+        if was_locked {
+            let new_pages = new_len >> MMArch::PAGE_SHIFT;
+            let dontunmap = mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) || old_len == 0;
+
+            if dontunmap {
+                // MREMAP_DONTUNMAP：保留旧映射，增加新映射的计数
+                self.locked_vm += new_pages;
+                // 清除旧 VMA 的 VM_LOCKED 标志（因为页表已移到新映射）
+                let mut old_vma_guard = old_vma.lock_irqsave();
+                let current_flags = *old_vma_guard.vm_flags();
+                old_vma_guard
+                    .set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
+            } else if is_move {
+                // 移动：do_munmap 会减少 old_len，这里增加 new_len
+                self.locked_vm += new_pages;
+            } else if new_len > old_len {
+                // 原地扩展：do_munmap 未被调用，只增加扩展部分
+                let old_pages = old_len >> MMArch::PAGE_SHIFT;
+                self.locked_vm += new_pages - old_pages;
+            }
         }
 
         Ok(new_region.start())
@@ -1660,7 +1695,7 @@ impl InnerAddressSpace {
     /// 用于处理 mlock/mlock2 时，如果请求范围内有部分已经锁定，
     /// 需要从请求的页面数中扣除已锁定的部分。
     pub fn count_mm_mlocked_page_nr(&self, start: VirtAddr, len: usize) -> usize {
-        let end = start.data().checked_add(len).unwrap_or(usize::MAX);
+        let end = start.data().saturating_add(len);
         let end = VirtAddr::new(core::cmp::min(end, MMArch::USER_END_VADDR.data()));
 
         let region = VirtRegion::new(start, len);

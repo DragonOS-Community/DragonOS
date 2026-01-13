@@ -707,9 +707,6 @@ impl InnerPage {
     ///
     /// # 返回值
     ///
-    /// - `true`: 计数从 0 -> 1，这是首次锁定，已设置 PG_MLOCKED 和 PG_UNEVICTABLE
-    /// - `false`: 计数从 N -> N+1 (N>0)，页面已被锁定
-    ///
     /// # Linux 参考实现
     ///
     /// 基于 Linux 6.6.21 mm/mlock.c:__mlock_folio()

@@ -310,7 +310,7 @@ impl X86_64MMArch {
         };
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
-        let mut space_guard = current_address_space.write_irqsave();
+        let mut space_guard = current_address_space.write();
         let mut fault;
         loop {
             let vma = space_guard.mappings.find_nearest(address);

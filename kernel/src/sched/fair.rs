@@ -1,7 +1,6 @@
 use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::mem::swap;
-use core::ops::Deref;
 use core::sync::atomic::fence;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,7 +8,6 @@ use crate::libs::rbtree::RBTree;
 use crate::libs::spinlock::SpinLock;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
-use crate::process::RawPid;
 use crate::sched::clock::ClockUpdataFlag;
 use crate::sched::{cpu_rq, SchedFeature, SCHED_FEATURES};
 use crate::smp::core::smp_get_processor_id;
@@ -49,8 +47,6 @@ pub struct FairSchedEntity {
 
     /// 是否在运行队列中
     pub on_rq: OnRq,
-    /// 是否在红黑树中
-    pub on_rbtree: bool,
     /// 当前调度实体的开始执行时间
     pub exec_start: u64,
     /// 总运行时长
@@ -83,7 +79,6 @@ pub struct FairSchedEntity {
     runnable_weight: u64,
 
     pcb: Weak<ProcessControlBlock>,
-    raw_pid: SpinLock<Option<RawPid>>,
 }
 
 impl FairSchedEntity {
@@ -95,7 +90,6 @@ impl FairSchedEntity {
             cfs_rq: Weak::new(),
             my_cfs_rq: None,
             on_rq: OnRq::None,
-            on_rbtree: false,
             slice: SYSCTL_SHCED_BASE_SLICE.load(Ordering::SeqCst),
             load: Default::default(),
             deadline: Default::default(),
@@ -108,7 +102,6 @@ impl FairSchedEntity {
             avg: Default::default(),
             depth: Default::default(),
             runnable_weight: Default::default(),
-            raw_pid: SpinLock::new(None),
         });
 
         ret.force_mut().self_ref = Arc::downgrade(&ret);
@@ -127,25 +120,8 @@ impl FairSchedEntity {
         self.on_rq != OnRq::None
     }
 
-    #[inline]
-    pub fn on_rbtree(&self) -> bool {
-        self.on_rbtree
-    }
-
     pub fn pcb(&self) -> Arc<ProcessControlBlock> {
-        if let Some(pcb_arc) = self.pcb.upgrade() {
-            let mut raw_pid_guard = self.raw_pid.lock_irqsave();
-            if raw_pid_guard.is_none() {
-                *raw_pid_guard = Some(pcb_arc.raw_pid());
-            }
-            return pcb_arc;
-        } else {
-            let snapshot_raw_pid = self.raw_pid.lock_irqsave().deref().clone();
-            panic!(
-                "FairSchedEntity::pcb: pcb is None, snapshoted raw_pid: {:?}",
-                snapshot_raw_pid
-            );
-        }
+        self.pcb.upgrade().unwrap()
     }
 
     pub fn set_pcb(&mut self, pcb: Weak<ProcessControlBlock>) {
@@ -722,7 +698,7 @@ impl CfsRunQueue {
             // 如果是当前任务
             if is_curr {
                 self.update_current();
-            } else if se.on_rbtree() {
+            } else {
                 // 否则，出队
                 self.inner_dequeue_entity(&se);
             }
@@ -1045,7 +1021,11 @@ impl CfsRunQueue {
 
         self.update_entity_lag(se);
 
-        if se.on_rbtree() {
+        if let Some(curr) = self.current() {
+            if !Arc::ptr_eq(&curr, se) {
+                self.inner_dequeue_entity(se);
+            }
+        } else {
             self.inner_dequeue_entity(se);
         }
 
@@ -1085,7 +1065,7 @@ impl CfsRunQueue {
     pub fn set_next_entity(&mut self, se: &Arc<FairSchedEntity>) {
         self.clear_buddies(se);
 
-        if se.on_rbtree() {
+        if se.on_rq() {
             self.inner_dequeue_entity(se);
             self.update_load_avg(se, UpdateAvgFlags::UPDATE_TG);
             se.force_mut().vlag = se.deadline as i64;
@@ -1156,7 +1136,6 @@ impl CfsRunQueue {
         self.avg_vruntime_add(se);
         se.force_mut().min_deadline = se.deadline;
         self.entities.insert(se.vruntime, se.clone());
-        se.force_mut().on_rbtree = true;
         // warn!(
         //     "enqueue pcb {:?} cfsrq {:?}",
         //     se.pcb().pid(),
@@ -1203,7 +1182,6 @@ impl CfsRunQueue {
         let mut i = 1;
         while let Some(rm) = self.entities.remove(&se.vruntime) {
             if Arc::ptr_eq(&rm, se) {
-                se.force_mut().on_rbtree = false;
                 break;
             }
             rm.force_mut().vruntime += i;

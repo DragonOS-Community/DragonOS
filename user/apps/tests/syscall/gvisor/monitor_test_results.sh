@@ -48,7 +48,7 @@ if [ -z "$QEMU_PID" ]; then
     exit 1
 fi
 
-if ! kill -0 $QEMU_PID 2>/dev/null; then
+if ! sudo kill -0 $QEMU_PID 2>/dev/null; then
     echo "[监控] 错误: QEMU进程 (PID: $QEMU_PID) 不存在"
     exit 1
 fi
@@ -70,13 +70,13 @@ clean_up() {
     # 从PID文件读取QEMU进程
     if [ -f "${VMSTATE_DIR}/pid" ]; then
         QEMU_PID=$(cat "${VMSTATE_DIR}/pid")
-        if [ -n "$QEMU_PID" ] && kill -0 $QEMU_PID 2>/dev/null; then
+        if [ -n "$QEMU_PID" ] && sudo kill -0 $QEMU_PID 2>/dev/null; then
             echo "[监控] 终止QEMU进程 (PID: $QEMU_PID)"
-            kill -TERM $QEMU_PID 2>/dev/null
+            sudo kill -TERM $QEMU_PID 2>/dev/null
             sleep 3
-            if kill -0 $QEMU_PID 2>/dev/null; then
+            if sudo kill -0 $QEMU_PID 2>/dev/null; then
                 echo "[监控] 强制终止QEMU进程 (PID: $QEMU_PID)"
-                kill -9 $QEMU_PID 2>/dev/null
+                sudo kill -9 $QEMU_PID 2>/dev/null
             fi
         else
             echo "[监控] QEMU进程 (PID: $QEMU_PID) 已不存在"
@@ -117,7 +117,7 @@ show_diagnostic_info() {
 check_qemu_alive() {
     local current_pid=$(get_qemu_pid)
     if [ -n "$current_pid" ]; then
-        kill -0 "$current_pid" 2>/dev/null
+        sudo kill -0 "$current_pid" 2>/dev/null
     else
         false
     fi

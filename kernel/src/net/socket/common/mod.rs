@@ -1,4 +1,3 @@
-// pub mod poll_unit;
 mod epoll_items;
 mod shutdown;
 

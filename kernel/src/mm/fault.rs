@@ -125,9 +125,10 @@ impl PageFaultHandler {
         let flags = pfm.flags();
         let vma = pfm.vma();
         let current_pcb = ProcessManager::current_pcb();
-        let mut guard = current_pcb.sched_info().inner_lock_write_irqsave();
-        guard.set_state(ProcessState::Runnable);
-        drop(guard); // 必须在进入后续处理前释放锁，避免在持锁时进行I/O导致死锁
+        {
+            let mut guard = current_pcb.sched_info().inner_lock_write_irqsave();
+            guard.set_state(ProcessState::Runnable);
+        }
 
         if !MMArch::vma_access_permitted(
             vma.clone(),

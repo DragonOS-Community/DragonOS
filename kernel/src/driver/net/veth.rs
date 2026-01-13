@@ -473,7 +473,7 @@ impl VethInterface {
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs.push(cidr).expect("Push ipCidr failed: full");
         });
-        self.common.router_common_data.ip_addrs.lock().push(cidr);
+        self.common.router_common_data.ip_addrs.write().push(cidr);
 
         // // 直接更新对端的arp_table
         // self.inner.lock().peer_veth.upgrade().map(|peer| {

@@ -1,5 +1,4 @@
 use crate::driver::net::Iface;
-use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::net::routing::nat::ConnTracker;
 use crate::net::routing::nat::DnatPolicy;
@@ -320,7 +319,7 @@ pub trait RouterEnableDevice: Iface {
 
         let tracker = self.netns_router().nat_tracker();
 
-        if let Some((new_dst_ip, new_dst_port)) = tracker.snat.write().process_return_traffic(tuple)
+        if let Some((new_dst_ip, new_dst_port)) = tracker.snat.lock().process_return_traffic(tuple)
         {
             // log::info!(
             //     "Reverse SNAT: Translating {}:{} to {}:{}",
@@ -349,7 +348,7 @@ pub trait RouterEnableDevice: Iface {
             return NatPktStatus::ReverseSnat(new_tuple);
         }
 
-        let mut dnat_guard = tracker.dnat.write();
+        let mut dnat_guard = tracker.dnat.lock();
         if let Some((new_dst_ip, new_dst_port)) = dnat_guard.process_new_connection(tuple) {
             // log::info!(
             //     "DNAT: Translating {}:{} to {}:{}",
@@ -401,7 +400,7 @@ pub trait RouterEnableDevice: Iface {
 
         let tracker = self.netns_router().nat_tracker();
 
-        if let Some((new_src_ip, new_src_port)) = tracker.dnat.write().process_return_traffic(tuple)
+        if let Some((new_src_ip, new_src_port)) = tracker.dnat.lock().process_return_traffic(tuple)
         {
             // log::info!(
             //     "Reverse DNAT: Translating src {}:{} -> {}:{}",
@@ -422,7 +421,7 @@ pub trait RouterEnableDevice: Iface {
             return;
         }
 
-        let mut snat_guard = tracker.snat.write();
+        let mut snat_guard = tracker.snat.lock();
         if let Some((new_src_ip, new_src_port)) = snat_guard.process_new_connection(tuple) {
             // log::info!(
             //     "SNAT: Translating {}:{} -> {}:{}",
@@ -481,14 +480,14 @@ pub struct RouterEnableDeviceCommon {
     /// 当前接口的邻居缓存
     // pub arp_table: RwLock<BTreeMap<IpAddress, EthernetAddress>>,
     /// 当前接口的IP地址列表（因为如果直接通过smoltcp获取ip的话可能导致死锁，因此则这里维护一份）
-    pub ip_addrs: Mutex<Vec<IpCidr>>,
+    pub ip_addrs: RwSem<Vec<IpCidr>>,
 }
 
 impl Default for RouterEnableDeviceCommon {
     fn default() -> Self {
         Self {
             // arp_table: RwLock::new(BTreeMap::new()),
-            ip_addrs: Mutex::new(Vec::new()),
+            ip_addrs: RwSem::new(Vec::new()),
         }
     }
 }

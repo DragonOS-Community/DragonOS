@@ -5,7 +5,6 @@ use system_error::SystemError;
 
 use crate::filesystem::vfs::vcore::generate_inode_id;
 use crate::libs::mutex::Mutex;
-use crate::libs::rwsem::RwSem;
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::Socket;
 use crate::process::cred::CAPFlags;
@@ -71,8 +70,8 @@ impl RawSocket {
         };
 
         let sock = Arc::new_cyclic(|me| Self {
-            inner: RwSem::new(Some(initial_inner)),
-            options: RwSem::new(options),
+            inner: crate::libs::rwsem::RwSem::new(Some(initial_inner)),
+            options: crate::libs::rwsem::RwSem::new(options),
             nonblock: core::sync::atomic::AtomicBool::new(nonblock),
             wait_queue: crate::libs::wait_queue::WaitQueue::default(),
             inode_id: generate_inode_id(),

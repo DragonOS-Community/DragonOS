@@ -245,6 +245,9 @@ impl ProcessManager {
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        if pcb.flags().contains(ProcessFlags::EXITING) {
+            return Err(SystemError::EINVAL);
+        }
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
         if state.is_blocked() {
             let mut writer = pcb.sched_info().inner_lock_write_irqsave();
@@ -342,6 +345,9 @@ impl ProcessManager {
     /// 唤醒暂停的进程
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        if pcb.flags().contains(ProcessFlags::EXITING) {
+            return Err(SystemError::EINVAL);
+        }
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
         if let ProcessState::Stopped = state {
             let mut writer = pcb.sched_info().inner_lock_write_irqsave();
@@ -557,6 +563,7 @@ impl ProcessManager {
         // log::debug!("[exit: {}]", raw_pid.data());
         {
             let pcb = ProcessManager::current_pcb();
+            pcb.flags().insert(ProcessFlags::EXITING);
             pid = pcb.pid();
             pcb.wait_queue.mark_dead();
 
@@ -661,6 +668,7 @@ impl ProcessManager {
                     spin_loop();
                 }
             }
+            current_pcb.flags().insert(ProcessFlags::EXITING);
 
             // 1. 在共享的 sighand 上原子性地设置 GROUP_EXIT 标志与 group_exit_code
             //    若已有线程抢先设置，则复用已存在的退出码。

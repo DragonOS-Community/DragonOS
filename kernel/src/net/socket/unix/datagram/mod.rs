@@ -2,8 +2,8 @@ use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::iov::IoVecs,
     filesystem::vfs::{fasync::FAsyncItems, utils::DName, vcore::generate_inode_id, InodeId},
-    libs::rwlock::RwLock,
-    libs::spinlock::SpinLock,
+    libs::mutex::Mutex,
+    libs::rwsem::RwSem,
     libs::wait_queue::WaitQueue,
     net::{
         posix::MsgHdr,
@@ -163,13 +163,13 @@ impl AbstractSocketKey {
 
 /// 抽象名称绑定的 socket 表
 struct AbstractSocketTable {
-    inner: RwLock<HashMap<AbstractSocketKey, Weak<UnixDatagramSocket>>>,
+    inner: RwSem<HashMap<AbstractSocketKey, Weak<UnixDatagramSocket>>>,
 }
 
 impl AbstractSocketTable {
     fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwSem::new(HashMap::new()),
         }
     }
 
@@ -197,7 +197,7 @@ impl AbstractSocketTable {
 /// 用于根据地址查找对应的 socket
 struct BindTable {
     /// 路径绑定的 socket
-    path_sockets: RwLock<HashMap<DName, Weak<UnixDatagramSocket>>>,
+    path_sockets: RwSem<HashMap<DName, Weak<UnixDatagramSocket>>>,
     /// 抽象名称绑定的 socket
     abstract_sockets: AbstractSocketTable,
 }
@@ -205,7 +205,7 @@ struct BindTable {
 impl BindTable {
     fn new() -> Self {
         Self {
-            path_sockets: RwLock::new(HashMap::new()),
+            path_sockets: RwSem::new(HashMap::new()),
             abstract_sockets: AbstractSocketTable::new(),
         }
     }
@@ -258,7 +258,7 @@ lazy_static! {
 #[derive(Debug)]
 #[cast_to([sync] Socket)]
 pub struct UnixDatagramSocket {
-    inner: SpinLock<Inner>,
+    inner: Mutex<Inner>,
     epitems: EPollItems,
     fasync_items: FAsyncItems,
     wait_queue: Arc<WaitQueue>,
@@ -292,7 +292,7 @@ impl UnixDatagramSocket {
     pub fn new(is_nonblocking: bool) -> Arc<Self> {
         let netns = ProcessManager::current_netns();
         Arc::new_cyclic(|weak| Self {
-            inner: SpinLock::new(Inner::new()),
+            inner: Mutex::new(Inner::new()),
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             wait_queue: Arc::new(WaitQueue::default()),

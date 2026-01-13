@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::rand::rand,
-    libs::spinlock::SpinLock,
+    libs::mutex::Mutex,
     process::{ProcessManager, RawPid},
 };
 
@@ -14,16 +14,16 @@ use super::Types::{self, *};
 #[derive(Debug)]
 pub struct PortManager {
     // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, RawPid>>,
+    tcp_port_table: Mutex<HashMap<u16, RawPid>>,
     // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, RawPid>>,
+    udp_port_table: Mutex<HashMap<u16, RawPid>>,
 }
 
 impl Default for PortManager {
     fn default() -> Self {
         Self {
-            tcp_port_table: SpinLock::new(HashMap::new()),
-            udp_port_table: SpinLock::new(HashMap::new()),
+            tcp_port_table: Mutex::new(HashMap::new()),
+            udp_port_table: Mutex::new(HashMap::new()),
         }
     }
 }

@@ -12,7 +12,7 @@ use crate::net::socket::common::{EPollItems, ShutdownBit};
 use crate::net::socket::{Socket, PMSG, PSO, PSOL};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
-use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
+use crate::{libs::rwsem::RwSem, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion};
@@ -27,7 +27,7 @@ type EP = crate::filesystem::epoll::EPollEventType;
 #[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct UdpSocket {
-    inner: RwLock<Option<UdpInner>>,
+    inner: RwSem<Option<UdpInner>>,
     nonblock: AtomicBool,
     shutdown: AtomicU8,
     wait_queue: WaitQueue,
@@ -62,7 +62,7 @@ impl UdpSocket {
     pub fn new(nonblock: bool, version: IpVersion) -> Arc<Self> {
         let netns = ProcessManager::current_netns();
         Arc::new_cyclic(|me| Self {
-            inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
+            inner: RwSem::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
             nonblock: AtomicBool::new(nonblock),
             shutdown: AtomicU8::new(0),
             wait_queue: WaitQueue::default(),

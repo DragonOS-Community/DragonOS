@@ -4,7 +4,7 @@ use smoltcp;
 use system_error::SystemError;
 
 use crate::{
-    libs::spinlock::SpinLock,
+    libs::mutex::Mutex,
     net::socket::inet::common::{BoundInner, Types as InetTypes},
     process::namespace::net_namespace::NetNamespace,
 };
@@ -118,9 +118,9 @@ impl UnboundUdp {
         }
         Ok(BoundUdp {
             inner,
-            remote: SpinLock::new(None),
+            remote: Mutex::new(None),
             explicitly_bound: true,
-            has_preconnect_data: SpinLock::new(false),
+            has_preconnect_data: Mutex::new(false),
         })
     }
 
@@ -156,9 +156,9 @@ impl UnboundUdp {
 
         Ok(BoundUdp {
             inner,
-            remote: SpinLock::new(None),
+            remote: Mutex::new(None),
             explicitly_bound: false,
-            has_preconnect_data: SpinLock::new(false),
+            has_preconnect_data: Mutex::new(false),
         })
     }
 }
@@ -166,14 +166,14 @@ impl UnboundUdp {
 #[derive(Debug)]
 pub struct BoundUdp {
     inner: BoundInner,
-    remote: SpinLock<Option<smoltcp::wire::IpEndpoint>>,
+    remote: Mutex<Option<smoltcp::wire::IpEndpoint>>,
     /// True if socket was explicitly bound by user, false if implicitly bound by connect
     explicitly_bound: bool,
     /// Whether there were buffered packets at connect time - if true, allow next recv without filtering
     /// 这是用来模拟 Linux UDP 在应用filter前的行为。在smoltcp下，当有包到来时总是会推送到
     /// udp socket queue 中，而不是先针对connect进行filter操作。这里做workaround, 当connect是检查是否有包
     /// 在缓冲区，如果有，第一个包我们走非connect而不是connect的recv方法（即接受第一个非connect对端对应的包）
-    has_preconnect_data: SpinLock<bool>,
+    has_preconnect_data: Mutex<bool>,
 }
 
 impl BoundUdp {

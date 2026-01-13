@@ -5,7 +5,7 @@ use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
 use crate::{
-    libs::spinlock::SpinLock,
+    libs::mutex::Mutex,
     net::socket::{inet::common::BoundInner, utils::extract_src_addr_from_ip_header},
     process::namespace::net_namespace::NetNamespace,
 };
@@ -55,7 +55,7 @@ impl UnboundRaw {
         Ok(BoundRaw {
             inner,
             local_addr: Some(local_addr),
-            remote_addr: SpinLock::new(None),
+            remote_addr: Mutex::new(None),
             ip_version: self.ip_version,
             protocol: self.protocol,
         })
@@ -82,7 +82,7 @@ impl UnboundRaw {
         Ok(BoundRaw {
             inner,
             local_addr: None,
-            remote_addr: SpinLock::new(None),
+            remote_addr: Mutex::new(None),
             ip_version: self.ip_version,
             protocol: self.protocol,
         })
@@ -98,7 +98,7 @@ impl UnboundRaw {
         Ok(BoundRaw {
             inner,
             local_addr: Some(address),
-            remote_addr: SpinLock::new(None),
+            remote_addr: Mutex::new(None),
             ip_version: self.ip_version,
             protocol: self.protocol,
         })
@@ -120,7 +120,7 @@ impl UnboundRaw {
 pub struct BoundRaw {
     inner: BoundInner,
     local_addr: Option<IpAddress>,
-    remote_addr: SpinLock<Option<IpAddress>>,
+    remote_addr: Mutex<Option<IpAddress>>,
     ip_version: IpVersion,
     protocol: IpProtocol,
 }

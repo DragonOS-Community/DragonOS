@@ -3,7 +3,8 @@ use alloc::{sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 use jhash::jhash2;
 
-use crate::libs::{lazy_init::Lazy, mutex::Mutex};
+use crate::libs::lazy_init::Lazy;
+use crate::libs::mutex::Mutex;
 
 use super::InodeId;
 

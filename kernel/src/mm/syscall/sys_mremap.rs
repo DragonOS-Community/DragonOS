@@ -77,7 +77,7 @@ impl Syscall for SysMremapHandle {
         }
         let vma = vma.unwrap();
         let (vm_flags, vma_region) = {
-            let g = vma.read();
+            let g = vma.lock();
             (*g.vm_flags(), *g.region())
         };
 

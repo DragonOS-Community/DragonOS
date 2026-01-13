@@ -15,14 +15,14 @@ use hashbrown::HashMap;
 use ida::IdAllocator;
 use system_error::SystemError;
 
-use crate::libs::mutex::MutexGuard;
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
     filesystem::{
         page_cache::PageCache,
         vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
     },
-    libs::{casting::DowncastArc, lazy_init::Lazy, mutex::Mutex, rwsem::RwSem},
+    libs::{casting::DowncastArc, lazy_init::Lazy, rwsem::RwSem},
     mm::{fault::PageFaultMessage, VmFaultReason},
     process::{
         namespace::{
@@ -1199,7 +1199,7 @@ impl MountList {
     /// already exists at the specified path, it will be updated with the new filesystem.
     ///
     /// # Thread Safety
-    /// This function is thread-safe as it uses a RwLock to ensure safe concurrent access.
+    /// This function is thread-safe as it uses a RwSem to ensure safe concurrent access.
     ///
     /// # Arguments
     /// * `ino` - An optional InodeId representing the inode of the `fs` mounted at.

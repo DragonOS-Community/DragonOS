@@ -70,7 +70,7 @@ impl Syscall for SysMsyncHandle {
                 // 读取VMA信息，确保在调用find_nearest前释放锁
                 let (vm_start, vm_end, vm_flags, file);
                 {
-                    let guard = vma.read();
+                    let guard = vma.lock();
                     vm_start = guard.region().start().data();
                     vm_end = guard.region().end().data();
                     vm_flags = *guard.vm_flags();

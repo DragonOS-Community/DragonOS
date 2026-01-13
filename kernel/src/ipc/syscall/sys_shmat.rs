@@ -83,7 +83,7 @@ pub(super) fn do_kernel_shmat(
                 .mappings
                 .contains(vaddr)
                 .ok_or(SystemError::EINVAL)?;
-            if vma.read().region().start() != vaddr {
+            if vma.lock().region().start() != vaddr {
                 return Err(SystemError::EINVAL);
             }
 
@@ -127,7 +127,7 @@ pub(super) fn do_kernel_shmat(
             }
 
             // 更新vma的映射状态
-            let mut vma_guard = vma.write();
+            let mut vma_guard = vma.lock();
             vma_guard.set_mapped(true);
             vma_guard.set_shm_id(Some(id));
             drop(vma_guard);

@@ -20,7 +20,7 @@ use crate::{
     filesystem::{page_cache::PageCache, vfs::FilePrivateData},
     init::initcall::INITCALL_CORE,
     libs::{
-        mutex::Mutex,
+        mutex::{Mutex, MutexGuard},
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
     },
     process::{ProcessControlBlock, ProcessManager},
@@ -44,13 +44,13 @@ pub const PAGE_1G_SHIFT: usize = 30;
 pub const PAGE_4K_SIZE: usize = 1 << PAGE_4K_SHIFT;
 pub const PAGE_2M_SIZE: usize = 1 << PAGE_2M_SHIFT;
 
-/// 全局物理页信息管理器（使用 RwSem，可睡眠）
-pub static mut PAGE_MANAGER: Option<RwSem<PageManager>> = None;
+/// 全局物理页信息管理器
+pub static mut PAGE_MANAGER: Option<Mutex<PageManager>> = None;
 
 /// 初始化PAGE_MANAGER
 pub fn page_manager_init() {
     info!("page_manager_init");
-    let page_manager = RwSem::new(PageManager::new());
+    let page_manager = Mutex::new(PageManager::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_MANAGER = Some(page_manager) };
@@ -59,8 +59,8 @@ pub fn page_manager_init() {
     info!("page_manager_init done");
 }
 
-pub fn page_manager_lock() -> RwSemWriteGuard<'static, PageManager> {
-    unsafe { PAGE_MANAGER.as_ref().unwrap().write() }
+pub fn page_manager_lock() -> MutexGuard<'static, PageManager> {
+    unsafe { PAGE_MANAGER.as_ref().unwrap().lock() }
 }
 
 // 物理页管理器
@@ -395,14 +395,14 @@ impl PageReclaimer {
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
 
         for vma in guard.vma_set() {
-            let address_space = vma.read().address_space().and_then(|x| x.upgrade());
+            let address_space = vma.lock().address_space().and_then(|x| x.upgrade());
             if address_space.is_none() {
                 continue;
             }
             let address_space = address_space.unwrap();
             let mut guard = address_space.write();
             let mapper = &mut guard.user_mapper.utable;
-            let virt = vma.read().page_address(page_index).unwrap();
+            let virt = vma.lock().page_address(page_index).unwrap();
             if unmap {
                 unsafe {
                     // 取消页表映射
@@ -1459,7 +1459,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         flags: EntryFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
-        let mut page_manager_guard: RwSemWriteGuard<'static, PageManager> = page_manager_lock();
+        let mut page_manager_guard = page_manager_lock();
         let page = page_manager_guard
             .create_one_page(
                 PageType::Normal,

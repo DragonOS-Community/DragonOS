@@ -11,7 +11,7 @@ use crate::{
     arch::{mm::PageMapper, MMArch},
     libs::align::align_down,
     mm::{
-        page::{page_manager_lock_irqsave, EntryFlags},
+        page::{page_manager_lock, EntryFlags},
         ucontext::LockedVMA,
         VirtAddr, VmFaultReason, VmFlags,
     },
@@ -67,9 +67,10 @@ impl<'a> PageFaultMessage<'a> {
         flags: FaultFlags,
         mapper: &'a mut PageMapper,
     ) -> Self {
-        let guard = vma.lock_irqsave();
+        let guard = vma.lock();
         let backing_pgoff = guard.backing_page_offset().map(|backing_page_offset| {
-            ((address - guard.region().start()) >> MMArch::PAGE_SHIFT) + backing_page_offset
+            ((address.data() - guard.region().start().data()) >> MMArch::PAGE_SHIFT)
+                + backing_page_offset
         });
         Self {
             vma: vma.clone(),
@@ -136,7 +137,7 @@ impl PageFaultHandler {
             return VmFaultReason::VM_FAULT_SIGSEGV;
         }
 
-        let guard = vma.lock_irqsave();
+        let guard = vma.lock();
         let vm_flags = *guard.vm_flags();
         drop(guard);
         if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
@@ -165,7 +166,7 @@ impl PageFaultHandler {
                 .allocate_table(address, 2)
                 .expect("failed to allocate PUD table");
         }
-        let page_flags = vma.lock_irqsave().flags();
+        let page_flags = vma.lock().flags();
 
         for level in 2..=3 {
             let level = MMArch::PAGE_LEVELS - level;
@@ -221,7 +222,7 @@ impl PageFaultHandler {
             ret = Self::do_fault(pfm);
         }
 
-        vma.lock_irqsave().set_mapped(true);
+        vma.lock().set_mapped(true);
 
         return ret;
     }
@@ -241,14 +242,15 @@ impl PageFaultHandler {
 
         // If this is an anonymous shared mapping, use a shared backing so pages are visible across fork
         {
-            let guard = vma.lock_irqsave();
+            let guard = vma.lock();
             if guard.vm_flags().contains(VmFlags::VM_SHARED) {
                 let shared = guard.shared_anon.clone();
                 if let Some(shared) = shared {
                     // Compute page index within the shared-anon backing object.
                     // Base offset is stored in VMA.backing_pgoff.
                     let base = guard.backing_page_offset().unwrap_or(0);
-                    let pgoff = base + ((address - guard.region().start()) >> MMArch::PAGE_SHIFT);
+                    let pgoff = base
+                        + ((address.data() - guard.region().start().data()) >> MMArch::PAGE_SHIFT);
 
                     // Linux semantics: access beyond the backing size should SIGBUS.
                     if pgoff >= shared.size_pages() {
@@ -264,7 +266,7 @@ impl PageFaultHandler {
                     };
 
                     // Map the shared page into current process
-                    let flags = vma.lock_irqsave().flags();
+                    let flags = vma.lock().flags();
                     if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
                         flush.flush();
                         page.write_irqsave().insert_vma(vma.clone());
@@ -277,7 +279,7 @@ impl PageFaultHandler {
         }
 
         // Fallback: private anonymous page (MAP_PRIVATE or non-shared anon)
-        let flags = vma.lock_irqsave().flags();
+        let flags = vma.lock().flags();
         if let Some(flush) = mapper.map(address, flags) {
             flush.flush();
             crate::debug::klog::mm::mm_debug_log(
@@ -289,7 +291,7 @@ impl PageFaultHandler {
                 klog_types::LogSource::Buddy,
             );
             let paddr = mapper.translate(address).unwrap().0;
-            let mut page_manager_guard = page_manager_lock_irqsave();
+            let mut page_manager_guard = page_manager_lock();
             let page = page_manager_guard.get_unwrap(&paddr);
             page.write_irqsave().insert_vma(vma.clone());
             VmFaultReason::VM_FAULT_COMPLETED
@@ -310,12 +312,7 @@ impl PageFaultHandler {
     pub unsafe fn do_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         if !pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE) {
             Self::do_read_fault(pfm)
-        } else if !pfm
-            .vma()
-            .lock_irqsave()
-            .vm_flags()
-            .contains(VmFlags::VM_SHARED)
-        {
+        } else if !pfm.vma().lock().vm_flags().contains(VmFlags::VM_SHARED) {
             Self::do_cow_fault(pfm)
         } else {
             Self::do_shared_fault(pfm)
@@ -346,7 +343,7 @@ impl PageFaultHandler {
         let cache_page = pfm.page.clone().unwrap();
         let mapper = &mut pfm.mapper;
 
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock();
         if let Ok(page) =
             page_manager_guard.copy_page(&cache_page.phys_address(), mapper.allocator_mut())
         {
@@ -368,7 +365,7 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_read_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let fs = pfm.vma().lock_irqsave().vm_file().unwrap().inode().fs();
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
 
         let mut ret = Self::do_fault_around(pfm);
         if !ret.is_empty() {
@@ -471,7 +468,7 @@ impl PageFaultHandler {
         let mapper = &mut pfm.mapper;
 
         let old_paddr = mapper.translate(address).unwrap().0;
-        let mut page_manager = page_manager_lock_irqsave();
+        let mut page_manager = page_manager_lock();
         let old_page = page_manager.get_unwrap(&old_paddr);
         let map_count = old_page.read_irqsave().map_count();
         drop(page_manager);
@@ -498,14 +495,14 @@ impl PageFaultHandler {
                 table.set_entry(i, entry);
                 VmFaultReason::VM_FAULT_COMPLETED
             } else if let Some(flush) = mapper.map(address, new_flags) {
-                let mut page_manager_guard = page_manager_lock_irqsave();
+                let mut page_manager_guard = page_manager_lock();
                 let old_page = page_manager_guard.get_unwrap(&old_paddr);
                 old_page.write_irqsave().remove_vma(&vma);
                 // drop(page_manager_guard);
 
                 flush.flush();
                 let paddr = mapper.translate(address).unwrap().0;
-                // let mut page_manager_guard = page_manager_lock_irqsave();
+                // let mut page_manager_guard = page_manager_lock();
                 let page = page_manager_guard.get_unwrap(&paddr);
                 page.write_irqsave().insert_vma(vma.clone());
 
@@ -521,14 +518,14 @@ impl PageFaultHandler {
         } else {
             // 私有文件映射，必须拷贝页面
             if let Some(flush) = mapper.map(address, new_flags) {
-                let mut page_manager_guard = page_manager_lock_irqsave();
+                let mut page_manager_guard = page_manager_lock();
                 let old_page = page_manager_guard.get_unwrap(&old_paddr);
                 old_page.write_irqsave().remove_vma(&vma);
                 // drop(page_manager_guard);
 
                 flush.flush();
                 let paddr = mapper.translate(address).unwrap().0;
-                // let mut page_manager_guard = page_manager_lock_irqsave();
+                // let mut page_manager_guard = page_manager_lock();
                 let page = page_manager_guard.get_unwrap(&paddr);
                 page.write_irqsave().insert_vma(vma.clone());
 
@@ -562,12 +559,12 @@ impl PageFaultHandler {
                 .allocate_table(address, 0)
                 .expect("failed to allocate pte table");
         }
-        let vma_guard = vma.lock_irqsave();
+        let vma_guard = vma.lock();
         let vma_region = *vma_guard.region();
         drop(vma_guard);
 
         // 缺页在VMA中的偏移量
-        let vm_pgoff = (address - vma_region.start()) >> MMArch::PAGE_SHIFT;
+        let vm_pgoff = (address.data() - vma_region.start().data()) >> MMArch::PAGE_SHIFT;
 
         // 缺页在PTE中的偏移量
         let pte_pgoff = (address.data() >> MMArch::PAGE_SHIFT) & (1 << MMArch::PAGE_ENTRY_SHIFT);
@@ -602,7 +599,7 @@ impl PageFaultHandler {
             return VmFaultReason::VM_FAULT_OOM;
         }
 
-        let fs = pfm.vma().lock_irqsave().vm_file().unwrap().inode().fs();
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
         // from_pte - pte_pgoff得出预读起始pte相对缺失页的偏移，加上pfm.backing_pgoff（缺失页在文件中的偏移）得出起始页在文件中的偏移，结束pte同理
         fs.map_pages(
             pfm,
@@ -628,7 +625,7 @@ impl PageFaultHandler {
         end_pgoff: usize,
     ) -> VmFaultReason {
         let vma = pfm.vma();
-        let vma_guard = vma.lock_irqsave();
+        let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
         let page_cache = match file.inode().page_cache() {
             Some(cache) => cache,
@@ -679,7 +676,7 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn filemap_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let vma = pfm.vma();
-        let vma_guard = vma.lock_irqsave();
+        let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
         let page_cache = match file.inode().page_cache() {
             Some(cache) => cache,
@@ -750,7 +747,7 @@ impl PageFaultHandler {
     /// - 若页不存在，则创建一个零页并插入 page_cache
     pub unsafe fn pagecache_fault_zero(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let vma = pfm.vma();
-        let vma_guard = vma.lock_irqsave();
+        let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
         drop(vma_guard);
 
@@ -805,7 +802,7 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn finish_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let vma = pfm.vma();
-        let vma_guard = vma.lock_irqsave();
+        let vma_guard = vma.lock();
         let flags = pfm.flags();
         let cache_page = pfm.page.clone();
         let cow_page = pfm.cow_page.clone();
@@ -833,12 +830,12 @@ impl PageFaultHandler {
     pub unsafe fn zero_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma();
-        let flags = vma.lock_irqsave().flags();
+        let flags = vma.lock().flags();
         let mapper = &mut pfm.mapper;
 
         if let Some(flush) = mapper.map(address, flags) {
             flush.flush();
-            let mut pm = page_manager_lock_irqsave();
+            let mut pm = page_manager_lock();
             let paddr = mapper.translate(address).unwrap().0;
             let page = pm.get_unwrap(&paddr);
             page.write_irqsave().insert_vma(vma);
@@ -855,7 +852,7 @@ impl PageFaultHandler {
         end_pgoff: usize,
     ) -> VmFaultReason {
         let vma = pfm.vma();
-        let vma_guard = vma.lock_irqsave();
+        let vma_guard = vma.lock();
         let backing_pgoff = match vma_guard.backing_page_offset() {
             Some(off) => off,
             None => return VmFaultReason::VM_FAULT_SIGBUS,
@@ -869,7 +866,7 @@ impl PageFaultHandler {
             let addr = VirtAddr::new(base.data() + ((pgoff - backing_pgoff) << MMArch::PAGE_SHIFT));
             if let Some(flush) = mapper.map(addr, flags) {
                 flush.flush();
-                let mut pm = page_manager_lock_irqsave();
+                let mut pm = page_manager_lock();
                 let paddr = mapper.translate(addr).unwrap().0;
                 let page = pm.get_unwrap(&paddr);
                 page.write_irqsave().insert_vma(vma.clone());

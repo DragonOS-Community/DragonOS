@@ -18,7 +18,7 @@ use crate::{
     arch::MMArch,
     libs::spinlock::SpinLock,
     mm::{
-        page::{page_manager_lock_irqsave, page_reclaimer_lock_irqsave, Page, PageFlags},
+        page::{page_manager_lock, page_reclaimer_lock_irqsave, Page, PageFlags},
         MemoryManagementArch,
     },
 };
@@ -77,7 +77,7 @@ impl InnerPageCache {
 
         let page_num = ((buf.len() - 1) >> MMArch::PAGE_SHIFT) + 1;
 
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock();
 
         for i in 0..page_num {
             let buf_offset = i * MMArch::PAGE_SIZE;
@@ -134,7 +134,7 @@ impl InnerPageCache {
             return Ok(());
         }
 
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock();
 
         for i in 0..page_num {
             let page_index = start_page_index + i;
@@ -432,7 +432,7 @@ impl InnerPageCache {
                 if Arc::strong_count(page) <= 3 {
                     if let Some(removed) = self.pages.remove(&idx) {
                         let paddr = removed.phys_address();
-                        page_manager_lock_irqsave().remove_page(&paddr);
+                        page_manager_lock().remove_page(&paddr);
                         let _ = page_reclaimer.remove_page(&paddr);
                         evicted += 1;
                     }
@@ -447,7 +447,7 @@ impl InnerPageCache {
 impl Drop for InnerPageCache {
     fn drop(&mut self) {
         // log::debug!("page cache drop");
-        let mut page_manager = page_manager_lock_irqsave();
+        let mut page_manager = page_manager_lock();
         for page in self.pages.values() {
             page_manager.remove_page(&page.phys_address());
         }

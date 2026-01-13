@@ -962,7 +962,7 @@ impl InnerAddressSpace {
         // - 原地扩展（is_move=false, new_len > old_len）：调用方不会调用 do_munmap，只增加 delta
         // - MREMAP_DONTUNMAP：调用方不会调用 do_munmap，但新映射需要被计数
         let is_move = new_region.start() != old_vaddr;
-          let was_locked =
+        let was_locked =
             vm_flags.contains(VmFlags::VM_LOCKED) || vm_flags.contains(VmFlags::VM_LOCKONFAULT);
         if was_locked {
             let new_pages = new_len >> MMArch::PAGE_SHIFT;

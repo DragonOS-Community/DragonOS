@@ -1240,7 +1240,7 @@ impl MountList {
         path: T,
     ) -> Option<(Arc<MountPath>, String, Arc<MountFS>)> {
         self.inner
-            .upread()
+            .read()
             .mounts
             .iter()
             .filter_map(|(key, stack)| {

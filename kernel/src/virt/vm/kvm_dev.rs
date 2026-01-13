@@ -107,7 +107,7 @@ impl DeviceINode for LockedKvmInode {
 impl IndexNode for LockedKvmInode {
     fn open(
         &self,
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -117,7 +117,7 @@ impl IndexNode for LockedKvmInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -127,7 +127,7 @@ impl IndexNode for LockedKvmInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -181,7 +181,7 @@ impl IndexNode for LockedKvmInode {
 
     fn close(
         &self,
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -233,7 +233,7 @@ impl KvmInstance {
 impl IndexNode for KvmInstance {
     fn open(
         &self,
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -284,7 +284,7 @@ impl IndexNode for KvmInstance {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()
     }
@@ -294,7 +294,7 @@ impl IndexNode for KvmInstance {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()
     }
@@ -317,7 +317,7 @@ impl IndexNode for KvmInstance {
 
     fn close(
         &self,
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -365,7 +365,7 @@ impl KvmVcpuDev {
 impl IndexNode for KvmVcpuDev {
     fn open(
         &self,
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -373,7 +373,7 @@ impl IndexNode for KvmVcpuDev {
 
     fn close(
         &self,
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -473,7 +473,7 @@ impl IndexNode for KvmVcpuDev {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()
     }
@@ -483,7 +483,7 @@ impl IndexNode for KvmVcpuDev {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()
     }

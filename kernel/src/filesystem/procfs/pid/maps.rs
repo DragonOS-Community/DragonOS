@@ -2,6 +2,7 @@
 //!
 //! 返回进程的内存映射信息，格式兼容 Linux procfs
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     arch::MMArch,
     filesystem::{
@@ -11,7 +12,6 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
     mm::{ucontext::LockedVMA, MemoryManagementArch, VmFlags},
     process::{ProcessManager, RawPid},
 };
@@ -168,7 +168,7 @@ impl FileOps for MapsFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = generate_maps_content(self.pid)?;
         proc_read(offset, len, buf, &content)

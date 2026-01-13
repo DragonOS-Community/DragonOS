@@ -1,3 +1,4 @@
+use crate::libs::mutex::MutexGuard;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
@@ -7,7 +8,7 @@ use crate::{
             FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
         },
     },
-    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
+    libs::rwlock::RwLock,
     time::PosixTimeSpec,
 };
 use alloc::collections::BTreeMap;
@@ -101,7 +102,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EISDIR)
     }
@@ -111,7 +112,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EISDIR)
     }
@@ -210,13 +211,13 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 

@@ -5,7 +5,7 @@ use crate::{
         epoll::EPollEventType,
         vfs::{file::FileFlags, FilePrivateData, IndexNode, Metadata, PollableInode},
     },
-    libs::spinlock::SpinLockGuard,
+    libs::mutex::MutexGuard,
 };
 
 use alloc::sync::Arc;
@@ -37,7 +37,7 @@ impl IndexNode for EPollInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -47,7 +47,7 @@ impl IndexNode for EPollInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -68,9 +68,9 @@ impl IndexNode for EPollInode {
         Ok(Metadata::default())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 释放资源
-        let mut epoll = self.epoll.0.lock_irqsave();
+        let mut epoll = self.epoll.0.lock();
 
         epoll.close()?;
 
@@ -79,7 +79,7 @@ impl IndexNode for EPollInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -96,7 +96,7 @@ impl IndexNode for EPollInode {
 
 impl PollableInode for EPollInode {
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let ep = self.epoll.0.lock_irqsave();
+        let ep = self.epoll.0.lock();
         if ep.ep_events_available() {
             Ok((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as usize)
         } else {
@@ -109,8 +109,8 @@ impl PollableInode for EPollInode {
         epitem: Arc<super::EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let ep = self.epoll.0.lock_irqsave();
-        ep.poll_epitems.lock_irqsave().push_back(epitem);
+        let poll_epitems = &self.epoll.0.lock().poll_epitems;
+        poll_epitems.lock().push_back(epitem);
         Ok(())
     }
 
@@ -119,8 +119,8 @@ impl PollableInode for EPollInode {
         epitem: &Arc<super::EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let ep = self.epoll.0.lock_irqsave();
-        let mut guard = ep.poll_epitems.lock_irqsave();
+        let ep = self.epoll.0.lock();
+        let mut guard = ep.poll_epitems.lock();
         let len = guard.len();
         guard.retain(|x| !Arc::ptr_eq(x, epitem));
         if guard.len() != len {

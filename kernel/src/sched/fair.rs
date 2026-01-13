@@ -16,7 +16,6 @@ use crate::time::timer::clock;
 use crate::time::NSEC_PER_MSEC;
 use alloc::sync::{Arc, Weak};
 
-use super::idle::IdleScheduler;
 use super::pelt::{add_positive, sub_positive, SchedulerAvg, UpdateAvgFlags, PELT_MIN_DIVIDER};
 use super::{
     CpuRunQueue, DequeueFlag, EnqueueFlag, LoadWeight, OnRq, SchedPolicy, Scheduler, TaskGroup,
@@ -1380,6 +1379,15 @@ impl Default for CfsRunQueue {
 pub struct CompletelyFairScheduler;
 
 impl CompletelyFairScheduler {
+    pub fn set_next_task(_rq: &mut CpuRunQueue, next: Arc<ProcessControlBlock>) {
+        let mut se = next.sched_info().sched_entity();
+        FairSchedEntity::for_each_in_group(&mut se, |se| {
+            let cfs = se.cfs_rq();
+            cfs.force_mut().set_next_entity(&se);
+            (true, true)
+        });
+    }
+
     /// 寻找到最近公共组长
     fn find_matching_se(se: &mut Arc<FairSchedEntity>, pse: &mut Arc<FairSchedEntity>) {
         let mut se_depth = se.depth;
@@ -1712,90 +1720,65 @@ impl Scheduler for CompletelyFairScheduler {
             return None;
         }
 
-        if prev.is_none()
-            || (prev.is_some() && prev.as_ref().unwrap().sched_info().policy() != SchedPolicy::CFS)
-        {
-            if let Some(prev) = prev {
-                match prev.sched_info().policy() {
-                    SchedPolicy::RT => todo!(),
-                    SchedPolicy::FIFO => todo!(),
-                    SchedPolicy::CFS => todo!(),
-                    SchedPolicy::IDLE => IdleScheduler::put_prev_task(rq, prev),
-                }
+        let prev_cfs_valid = if let Some(p) = &prev {
+            if p.sched_info().policy() == SchedPolicy::CFS {
+                // Check if prev is still running (not blocked)
+                let state = p.sched_info().inner_lock_read_irqsave().state();
+                state.is_runnable()
+            } else {
+                false
             }
-            let mut se;
-            loop {
-                match cfs_rq.pick_next_entity() {
-                    Some(s) => se = s,
-                    None => return None,
-                }
-
-                cfs_rq.force_mut().set_next_entity(&se);
-
-                match &se.my_cfs_rq {
-                    Some(q) => cfs_rq = q.clone(),
-                    None => break,
-                }
-            }
-
-            return Some(se.pcb());
-        }
-
-        let prev = prev.unwrap();
-        let se = cfs_rq.pick_next_entity();
-
-        if let Some(mut se) = se {
-            loop {
-                let curr = cfs_rq.current();
-                if let Some(current) = curr {
-                    if current.on_rq() {
-                        cfs_rq.force_mut().update_current()
-                    } else {
-                        cfs_rq.force_mut().set_current(Weak::default());
-                    }
-                }
-
-                match cfs_rq.pick_next_entity() {
-                    Some(e) => se = e,
-                    None => break,
-                }
-
-                if let Some(q) = se.my_cfs_rq.clone() {
-                    cfs_rq = q;
-                } else {
-                    break;
-                }
-            }
-
-            let p = se.pcb();
-
-            if !Arc::ptr_eq(&prev, &p) {
-                let mut pse = prev.sched_info().sched_entity();
-
-                while !(Arc::ptr_eq(&se.cfs_rq(), &pse.cfs_rq())
-                    && Arc::ptr_eq(&se.cfs_rq(), &cfs_rq))
-                {
-                    let se_depth = se.depth;
-                    let pse_depth = pse.depth;
-
-                    if se_depth <= pse_depth {
-                        pse.cfs_rq().force_mut().put_prev_entity(pse.clone());
-                        pse = pse.parent().unwrap();
-                    }
-
-                    if se_depth >= pse_depth {
-                        se.cfs_rq().force_mut().set_next_entity(&se);
-                        se = se.parent().unwrap();
-                    }
-                }
-
-                cfs_rq.force_mut().put_prev_entity(pse);
-                cfs_rq.force_mut().set_next_entity(&se);
-            }
-
-            return Some(p);
         } else {
-            return None;
+            false
+        };
+
+        loop {
+            let curr = cfs_rq.current();
+            let next = cfs_rq.pick_next_entity();
+
+            // Determine winner between curr (if valid) and next (from tree)
+            let winner = if let Some(c) = curr.clone() {
+                // If curr is valid (prev is running CFS), we compare.
+                // Note: c is an ancestor of prev.
+                if prev_cfs_valid {
+                    if let Some(n) = &next {
+                        // Simple vruntime comparison
+                        if n.vruntime < c.vruntime {
+                            n.clone()
+                        } else {
+                            c
+                        }
+                    } else {
+                        c
+                    }
+                } else {
+                    // curr is invalid (blocked or not CFS), must pick next
+                    next?
+                }
+            } else {
+                next?
+            };
+
+            // If winner is curr, descend into curr's group
+            if let Some(c) = curr {
+                if Arc::ptr_eq(&c, &winner) {
+                    if winner.is_task() {
+                        return Some(winner.pcb());
+                    }
+                    cfs_rq = winner.my_cfs_rq.clone().unwrap();
+                    continue;
+                }
+            }
+
+            // Winner is next, descend into next's group
+            let mut s = winner;
+            loop {
+                if s.is_task() {
+                    return Some(s.pcb());
+                }
+                cfs_rq = s.my_cfs_rq.clone().unwrap();
+                s = cfs_rq.pick_next_entity().unwrap();
+            }
         }
     }
 

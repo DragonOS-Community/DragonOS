@@ -1,3 +1,5 @@
+use num_traits::FromPrimitive;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[allow(non_camel_case_types)]
 pub enum Options {
@@ -86,7 +88,6 @@ pub enum Options {
 impl TryFrom<u32> for Options {
     type Error = system_error::SystemError;
     fn try_from(x: u32) -> Result<Self, Self::Error> {
-        use num_traits::FromPrimitive;
         return <Self as FromPrimitive>::from_u32(x).ok_or(system_error::SystemError::EINVAL);
     }
 }

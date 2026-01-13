@@ -295,6 +295,63 @@ impl ProcessManager {
         return Ok(());
     }
 
+    #[allow(dead_code)]
+    pub fn set_fifo_policy(pcb: &Arc<ProcessControlBlock>, prio: i32) -> Result<(), SystemError> {
+        if !pcb.flags().contains(ProcessFlags::KTHREAD) {
+            return Err(SystemError::EPERM);
+        }
+
+        if !(0..crate::sched::prio::MAX_RT_PRIO).contains(&prio) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+        if on_rq == crate::sched::OnRq::Queued {
+            let rq = crate::sched::cpu_rq(
+                pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize,
+            );
+            let (rq, _guard) = rq.self_lock();
+            rq.update_rq_clock();
+
+            let old_policy = pcb.sched_info().policy();
+            if old_policy != crate::sched::SchedPolicy::FIFO {
+                rq.dequeue_task(
+                    pcb.clone(),
+                    crate::sched::DequeueFlag::DEQUEUE_NOCLOCK
+                        | crate::sched::DequeueFlag::DEQUEUE_SAVE,
+                );
+            }
+
+            {
+                *pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::FIFO;
+                let mut prio_data = pcb.sched_info().prio_data.write_irqsave();
+                prio_data.prio = prio;
+                prio_data.static_prio = prio;
+                prio_data.normal_prio = prio;
+            }
+
+            if old_policy != crate::sched::SchedPolicy::FIFO {
+                rq.enqueue_task(
+                    pcb.clone(),
+                    crate::sched::EnqueueFlag::ENQUEUE_NOCLOCK
+                        | crate::sched::EnqueueFlag::ENQUEUE_RESTORE,
+                );
+            }
+
+            rq.check_preempt_currnet(pcb, crate::sched::WakeupFlags::empty());
+        } else {
+            *pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::FIFO;
+            let mut prio_data = pcb.sched_info().prio_data.write_irqsave();
+            prio_data.prio = prio;
+            prio_data.static_prio = prio;
+            prio_data.normal_prio = prio;
+        }
+
+        Ok(())
+    }
+
     /// 唤醒暂停的进程
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };

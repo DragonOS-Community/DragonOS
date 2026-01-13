@@ -2,9 +2,9 @@
 // Refernce: PCIe* GbE Controllers Open Source Software Developer’s Manual
 
 use super::e1000e_driver::e1000e_driver_init;
+use super::irq::DefaultE1000EIrqHandler;
 use crate::driver::base::device::DeviceId;
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
-use crate::driver::net::irq_handle::DefaultNetIrqHandler;
 use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PCI_DEVICE_LINKEDLIST,
@@ -231,7 +231,7 @@ impl E1000EDevice {
             irq_common_message: IrqCommonMsg::init_from(
                 0,
                 "E1000E_RECV_IRQ".to_string(),
-                &DefaultNetIrqHandler,
+                &DefaultE1000EIrqHandler,
                 device_id,
             ),
             irq_specific_message: IrqSpecificMsg::msi_default(),
@@ -616,18 +616,17 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
                 );
 
                 // todo: 根据pci的path来生成device id
-                let e1000e = E1000EDevice::new(
-                    standard_device.clone(),
-                    DeviceId::new(
-                        None,
-                        Some(format!(
-                            "e1000e_{}",
-                            standard_device.common_header.device_id
-                        )),
-                    )
-                    .unwrap(),
-                )?;
-                e1000e_driver_init(e1000e);
+                let dev_id = DeviceId::new(
+                    None,
+                    Some(format!(
+                        "e1000e_{}",
+                        standard_device.common_header.device_id
+                    )),
+                )
+                .unwrap();
+
+                let e1000e = E1000EDevice::new(standard_device.clone(), dev_id.clone())?;
+                e1000e_driver_init(e1000e, dev_id);
                 initialized = true;
             }
         }

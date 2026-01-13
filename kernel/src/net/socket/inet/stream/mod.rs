@@ -1,309 +1,48 @@
-use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicUsize};
+use alloc::sync::Arc;
+use core::sync::atomic::AtomicUsize;
 use system_error::SystemError;
 
-use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
-use crate::libs::rwlock::RwLock;
+use crate::filesystem::vfs::iov::IoVecs;
+use crate::filesystem::vfs::{fasync::FAsyncItems, InodeId};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
-use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSOL};
-use crate::process::namespace::net_namespace::NetNamespace;
-use crate::process::ProcessManager;
-use smoltcp;
+use crate::net::socket::posix::IpOption;
+use crate::net::socket::unix::utils::{CmsgBuffer, SOL_SOCKET};
+use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSO, PSOL};
+use crate::time::syscall::PosixTimeval;
 
+mod constants;
+mod info;
 mod inner;
-
 mod option;
 pub use option::Options as TcpOption;
+use option::Options;
 
-use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
+use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4};
 
 type EP = crate::filesystem::epoll::EPollEventType;
 
-#[cast_to([sync] Socket)]
-#[derive(Debug)]
-pub struct TcpSocket {
-    inner: RwLock<Option<inner::Inner>>,
-    // shutdown: Shutdown, // TODO set shutdown status
-    nonblock: AtomicBool,
-    wait_queue: WaitQueue,
-    inode_id: InodeId,
-    open_files: AtomicUsize,
-    self_ref: Weak<Self>,
-    pollee: AtomicUsize,
-    netns: Arc<NetNamespace>,
-    epoll_items: EPollItems,
-    fasync_items: FAsyncItems,
-}
+mod events;
+mod io;
+mod lifecycle;
+mod poll_util;
+mod shutdown;
+mod stream_core;
 
-impl TcpSocket {
-    pub fn new(nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
-        let netns = ProcessManager::current_netns();
-        Arc::new_cyclic(|me| Self {
-            inner: RwLock::new(Some(inner::Inner::Init(inner::Init::new(ver)))),
-            // shutdown: Shutdown::new(),
-            nonblock: AtomicBool::new(nonblock),
-            wait_queue: WaitQueue::default(),
-            inode_id: generate_inode_id(),
-            open_files: AtomicUsize::new(0),
-            self_ref: me.clone(),
-            pollee: AtomicUsize::new(0_usize),
-            netns,
-            epoll_items: EPollItems::default(),
-            fasync_items: FAsyncItems::default(),
-        })
-    }
-
-    pub fn new_established(
-        inner: inner::Established,
-        nonblock: bool,
-        netns: Arc<NetNamespace>,
-    ) -> Arc<Self> {
-        Arc::new_cyclic(|me| Self {
-            inner: RwLock::new(Some(inner::Inner::Established(inner))),
-            // shutdown: Shutdown::new(),
-            nonblock: AtomicBool::new(nonblock),
-            wait_queue: WaitQueue::default(),
-            inode_id: generate_inode_id(),
-            open_files: AtomicUsize::new(0),
-            self_ref: me.clone(),
-            pollee: AtomicUsize::new((EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize),
-            netns,
-            epoll_items: EPollItems::default(),
-            fasync_items: FAsyncItems::default(),
-        })
-    }
-
-    pub fn is_nonblock(&self) -> bool {
-        self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
-        let mut writer = self.inner.write();
-        match writer.take().expect("Tcp inner::Inner is None") {
-            inner::Inner::Init(inner) => {
-                let bound = inner.bind(local_endpoint, self.netns())?;
-                if let inner::Init::Bound((ref bound, _)) = bound {
-                    bound
-                        .iface()
-                        .common()
-                        .bind_socket(self.self_ref.upgrade().unwrap());
-                }
-                writer.replace(inner::Inner::Init(bound));
-                Ok(())
-            }
-            any => {
-                writer.replace(any);
-                log::error!("TcpSocket::do_bind: not Init");
-                Err(SystemError::EINVAL)
-            }
-        }
-    }
-
-    pub fn do_listen(&self, backlog: usize) -> Result<(), SystemError> {
-        let mut writer = self.inner.write();
-        let inner = writer.take().expect("Tcp inner::Inner is None");
-        let (listening, err) = match inner {
-            inner::Inner::Init(init) => {
-                let listen_result = init.listen(backlog);
-                match listen_result {
-                    Ok(listening) => (inner::Inner::Listening(listening), None),
-                    Err((init, err)) => (inner::Inner::Init(init), Some(err)),
-                }
-            }
-            _ => (inner, Some(SystemError::EINVAL)),
-        };
-        writer.replace(listening);
-        drop(writer);
-
-        if let Some(err) = err {
-            return Err(err);
-        }
-        return Ok(());
-    }
-
-    pub fn try_accept(&self) -> Result<(Arc<TcpSocket>, smoltcp::wire::IpEndpoint), SystemError> {
-        match self
-            .inner
-            .write()
-            .as_mut()
-            .expect("Tcp inner::Inner is None")
-        {
-            inner::Inner::Listening(listening) => {
-                let (socket, point) = listening.accept().map(|(stream, remote)| {
-                    (
-                        TcpSocket::new_established(stream, self.is_nonblock(), self.netns()),
-                        remote,
-                    )
-                })?;
-                {
-                    let mut inner_guard = socket.inner.write();
-                    if let Some(inner::Inner::Established(established)) = inner_guard.as_mut() {
-                        established.iface().common().bind_socket(socket.clone());
-                    }
-                }
-
-                Ok((socket, point))
-            }
-            _ => Err(SystemError::EINVAL),
-        }
-    }
-
-    // SHOULD refactor
-    pub fn start_connect(
-        &self,
-        remote_endpoint: smoltcp::wire::IpEndpoint,
-    ) -> Result<(), SystemError> {
-        let mut writer = self.inner.write();
-        let inner = writer.take().expect("Tcp inner::Inner is None");
-        let (init, result) = match inner {
-            inner::Inner::Init(init) => {
-                let conn_result = init.connect(remote_endpoint, self.netns());
-                match conn_result {
-                    Ok(connecting) => (
-                        inner::Inner::Connecting(connecting),
-                        if !self.is_nonblock() {
-                            Ok(())
-                        } else {
-                            Err(SystemError::EINPROGRESS)
-                        },
-                    ),
-                    Err((init, err)) => (inner::Inner::Init(init), Err(err)),
-                }
-            }
-            inner::Inner::Connecting(connecting) if self.is_nonblock() => (
-                inner::Inner::Connecting(connecting),
-                Err(SystemError::EALREADY),
-            ),
-            inner::Inner::Connecting(connecting) => (inner::Inner::Connecting(connecting), Ok(())),
-            inner::Inner::Listening(inner) => {
-                (inner::Inner::Listening(inner), Err(SystemError::EISCONN))
-            }
-            inner::Inner::Established(inner) => {
-                (inner::Inner::Established(inner), Err(SystemError::EISCONN))
-            }
-        };
-
-        match result {
-            Ok(()) | Err(SystemError::EINPROGRESS) => {
-                init.iface().unwrap().poll();
-            }
-            _ => {}
-        }
-
-        writer.replace(init);
-        return result;
-    }
-
-    // for irq use
-    pub fn finish_connect(&self) -> Result<(), SystemError> {
-        let mut writer = self.inner.write();
-        let inner::Inner::Connecting(conn) = writer.take().expect("Tcp inner::Inner is None")
-        else {
-            log::error!("TcpSocket::finish_connect: not Connecting");
-            return Err(SystemError::EINVAL);
-        };
-
-        let (inner, result) = conn.into_result();
-        writer.replace(inner);
-        drop(writer);
-
-        // log::info!("TcpSocket::finish_connect: {:?}", result);
-        result
-    }
-
-    pub fn check_connect(&self) -> Result<(), SystemError> {
-        self.update_events();
-        let mut write_state = self.inner.write();
-        let inner = write_state.take().expect("Tcp inner::Inner is None");
-        let (replace, result) = match inner {
-            inner::Inner::Connecting(conn) => conn.into_result(),
-            inner::Inner::Established(es) => {
-                log::warn!("TODO: check new established");
-                (inner::Inner::Established(es), Ok(()))
-            } // TODO check established
-            _ => {
-                log::warn!("TODO: connecting socket error options");
-                (inner, Err(SystemError::EINVAL))
-            } // TODO socket error options
-        };
-        write_state.replace(replace);
-        result
-    }
-
-    pub fn try_recv(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.inner
-            .read()
-            .as_ref()
-            .map(|inner| {
-                inner.iface().unwrap().poll();
-                let result = match inner {
-                    inner::Inner::Established(inner) => inner.recv_slice(buf),
-                    _ => Err(SystemError::EINVAL),
-                };
-                inner.iface().unwrap().poll();
-                result
-            })
-            .unwrap()
-    }
-
-    pub fn try_send(&self, buf: &[u8]) -> Result<usize, SystemError> {
-        // TODO: add nonblock check of connecting socket
-        self.inner.read().as_ref().unwrap().iface().unwrap().poll();
-        let sent = match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-        {
-            inner::Inner::Established(inner) => inner.send_slice(buf),
-            _ => Err(SystemError::EINVAL),
-        };
-        self.inner.read().as_ref().unwrap().iface().unwrap().poll();
-        sent
-    }
-
-    fn update_events(&self) -> bool {
-        match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-        {
-            inner::Inner::Init(_) => false,
-            inner::Inner::Connecting(connecting) => connecting.update_io_events(),
-            inner::Inner::Established(established) => {
-                established.update_io_events(&self.pollee);
-                false
-            }
-            inner::Inner::Listening(listening) => {
-                listening.update_io_events(&self.pollee);
-                false
-            }
-        }
-    }
-
-    #[inline]
-    fn incoming(&self) -> bool {
-        EP::from_bits_truncate(self.do_poll() as u32).contains(EP::EPOLLIN)
-    }
-
-    #[inline]
-    fn do_poll(&self) -> usize {
-        self.pollee.load(core::sync::atomic::Ordering::SeqCst)
-    }
-
-    #[inline]
-    pub fn can_recv(&self) -> bool {
-        self.check_io_event().contains(EP::EPOLLIN)
-    }
-
-    pub fn netns(&self) -> Arc<NetNamespace> {
-        self.netns.clone()
-    }
-}
+pub use stream_core::TcpSocket;
 
 impl Socket for TcpSocket {
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.nonblock
+            .store(nonblocking, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn recvfrom_addr_behavior(&self) -> crate::net::socket::RecvFromAddrBehavior {
+        // Linux/gVisor: for TCP (SOCK_STREAM), recvfrom(2) ignores the source
+        // address output parameters. If addrlen is provided, kernel writes back 0.
+        crate::net::socket::RecvFromAddrBehavior::Ignore
+    }
+
     fn open_file_counter(&self) -> &AtomicUsize {
         &self.open_files
     }
@@ -313,34 +52,36 @@ impl Socket for TcpSocket {
     }
 
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
-        match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-        {
-            inner::Inner::Init(inner::Init::Unbound((_, ver))) => Ok(Endpoint::Ip(match ver {
-                smoltcp::wire::IpVersion::Ipv4 => UNSPECIFIED_LOCAL_ENDPOINT_V4,
-                smoltcp::wire::IpVersion::Ipv6 => UNSPECIFIED_LOCAL_ENDPOINT_V6,
-            })),
-            inner::Inner::Init(inner::Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
-            inner::Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
-            inner::Inner::Established(established) => Ok(Endpoint::Ip(established.get_name())),
-            inner::Inner::Listening(listening) => Ok(Endpoint::Ip(listening.get_name())),
-        }
+        let inner = self.inner.read();
+        let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
+        Ok(Endpoint::Ip(inner.local_endpoint()))
     }
 
     fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
-        match self
-            .inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-        {
-            inner::Inner::Init(_) => Err(SystemError::ENOTCONN),
-            inner::Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_peer_name())),
-            inner::Inner::Established(established) => Ok(Endpoint::Ip(established.get_peer_name())),
-            inner::Inner::Listening(_) => Err(SystemError::ENOTCONN),
+        let inner = self.inner.read();
+        let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
+        inner
+            .remote_endpoint()
+            .map(Endpoint::Ip)
+            .ok_or(SystemError::ENOTCONN)
+    }
+
+    fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
+        match level {
+            PSOL::IP => {
+                let optname =
+                    IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.get_ip_option(optname, value)
+            }
+            PSOL::TCP => {
+                let opt = Options::try_from(name as i32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.get_tcp_option(opt, value)
+            }
+            PSOL::SOCKET => {
+                let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.get_socket_option(opt, value)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 
@@ -348,13 +89,13 @@ impl Socket for TcpSocket {
         if let Endpoint::Ip(addr) = endpoint {
             return self.do_bind(addr);
         }
-        log::debug!("TcpSocket::bind: invalid endpoint");
+        // log::debug!("TcpSocket::bind: invalid endpoint");
         return Err(SystemError::EINVAL);
     }
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let Endpoint::Ip(endpoint) = endpoint else {
-            log::debug!("TcpSocket::connect: invalid endpoint");
+            // log::debug!("TcpSocket::connect: invalid endpoint");
             return Err(SystemError::EINVAL);
         };
         self.start_connect(endpoint)?; // Only Nonblock or error will return error.
@@ -362,20 +103,27 @@ impl Socket for TcpSocket {
         return loop {
             match self.check_connect() {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    // log::info!("TcpSocket::connect: wait");
+                    // log::debug!("TcpSocket::connect: wait for Established");
                     wq_wait_event_interruptible!(
                         self.wait_queue(),
                         {
-                            matches!(
-                                self.inner.read().as_ref(),
-                                Some(inner::Inner::Established(_))
+                            // 关键：不要等待 `self.inner` 变成 Established。
+                            // `self.inner` 的状态转换是由 check_connect() 完成的；
+                            // 如果 iface.poll() 在入睡前已经推进到 Established 并触发过 notify/wakeup，
+                            // 再等 “inner 已 Established” 会陷入先唤后睡的丢唤醒。
+                            // 这里把 check_connect() 本身作为条件的一部分：
+                            // - 入队 waker 后再次检查时会主动 poll 并完成状态转换
+                            // - 即使错过了一次 wake，也不会永远睡下去
+                            !matches!(
+                                self.check_connect(),
+                                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
                             )
                         },
                         {}
                     )?;
                 }
                 result => {
-                    // log::info!("TcpSocket::connect: done");
+                    // log::debug!("TcpSocket::connect: done -> {:?}", result);
                     break result;
                 }
             }
@@ -403,22 +151,94 @@ impl Socket for TcpSocket {
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
-            self.try_recv(buffer)
-        } else {
-            loop {
-                match self.try_recv(buffer) {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
-                    }
-                    result => break result,
-                }
+        if self.is_recv_shutdown() {
+            let limit = self.recv_shutdown.limit();
+            if limit == 0 {
+                return Ok(0);
             }
-        };
+        }
+
+        if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
+            return self.try_recv_with_flags(buffer, flags);
+        }
+
+        loop {
+            match self.try_recv_with_flags(buffer, flags) {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    // Poll in a loop until no more events. This is critical for loopback:
+                    // - Poll 1: TX sends data to loopback queue, RX processes existing packets
+                    // - Poll 2: RX processes the data we just transmitted (loopback roundtrip)
+                    // Without this loop, we'd wait for the poll thread to complete the roundtrip.
+                    if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned()
+                    {
+                        poll_util::poll_iface_until_quiescent(iface.as_ref());
+                    }
+                    // After polling, check if EPOLLIN is now set before waiting.
+                    // update_events() was called by poll() -> notify(), so pollee is fresh.
+                    if EP::from_bits_truncate(
+                        self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
+                    )
+                    .contains(EP::EPOLLIN)
+                    {
+                        continue; // Data available now, retry recv
+                    }
+                    // Wait for EPOLLIN. The poll thread's notify() updates pollee after polling.
+                    self.wait_queue.wait_event_interruptible_timeout(
+                        || {
+                            EP::from_bits_truncate(
+                                self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
+                            )
+                            .contains(EP::EPOLLIN)
+                        },
+                        self.recv_timeout(),
+                    )?;
+                }
+                result => break result,
+            }
+        }
     }
 
     fn send(&self, buffer: &[u8], _flags: PMSG) -> Result<usize, SystemError> {
-        self.try_send(buffer)
+        if buffer.is_empty() {
+            // Linux 语义：write(fd, "", 0) / send(fd, ..., 0) 直接返回 0。
+            return Ok(0);
+        }
+
+        if self.is_nonblock() || _flags.contains(PMSG::DONTWAIT) {
+            return self.try_send(buffer);
+        }
+
+        // 先尝试写一次：写到多少就返回多少（允许短写）。
+        match self.try_send(buffer) {
+            Ok(n) => return Ok(n),
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => { /* fallthrough: block */ }
+            Err(e) => return Err(e),
+        }
+
+        loop {
+            // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
+            if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned() {
+                poll_util::poll_iface_until_quiescent(iface.as_ref());
+            }
+
+            // 若已经可写，重试一次并直接返回（允许短写）。
+            if EP::from_bits_truncate(self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32)
+                .contains(EP::EPOLLOUT)
+            {
+                return self.try_send(buffer);
+            }
+
+            // 等待可写或超时/信号。
+            self.wait_queue.wait_event_interruptible_timeout(
+                || {
+                    EP::from_bits_truncate(
+                        self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32
+                    )
+                    .contains(EP::EPOLLOUT)
+                },
+                self.send_timeout(),
+            )?;
+        }
     }
 
     fn send_buffer_size(&self) -> usize {
@@ -437,23 +257,14 @@ impl Socket for TcpSocket {
             .recv_buffer_size()
     }
 
-    fn shutdown(&self, _how: ShutdownBit) -> Result<(), SystemError> {
-        // let self_shutdown = self.shutdown.get().bits();
-        // let diff = how.bits().difference(self_shutdown);
-        // match diff.is_empty() {
-        //     true => return Ok(()),
-        //     false => {
-        //         if diff.contains(ShutdownBit::SHUT_RD) {
-        //             self.shutdown.recv_shutdown();
-        //             // TODO 协议栈处理
-        //         }
-        //         if diff.contains(ShutdownBit::SHUT_WR) {
-        //             self.shutdown.send_shutdown();
-        //             // TODO 协议栈处理
-        //         }
-        //     }
-        // }
-        Ok(())
+    fn recv_bytes_available(&self) -> usize {
+        // Linux ioctl(FIONREAD/TIOCINQ) on TCP sockets reports the number of bytes
+        // currently in the receive queue. For non-established sockets, report 0.
+        self.recv_queue_len()
+    }
+
+    fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
+        self.do_shutdown(how)
     }
 
     fn socket_inode_id(&self) -> InodeId {
@@ -461,151 +272,122 @@ impl Socket for TcpSocket {
     }
 
     fn do_close(&self) -> Result<(), SystemError> {
-        let Some(inner) = self.inner.write().take() else {
-            log::warn!("TcpSocket::close: already closed, unexpected");
-            return Ok(());
-        };
-        if let Some(iface) = inner.iface() {
-            iface
-                .common()
-                .unbind_socket(self.self_ref.upgrade().unwrap());
-        }
-
-        match inner {
-            // complete connecting socket close logic
-            inner::Inner::Connecting(conn) => {
-                let conn = unsafe { conn.into_established() };
-                conn.close();
-                conn.release();
-            }
-            inner::Inner::Established(es) => {
-                es.close();
-                es.release();
-            }
-            inner::Inner::Listening(ls) => {
-                ls.close();
-                ls.release();
-            }
-            inner::Inner::Init(init) => {
-                init.close();
-            }
-        };
-
-        Ok(())
+        self.close_socket()
     }
 
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
-        if level != PSOL::TCP {
-            // return Err(SystemError::EINVAL);
-            log::debug!("TcpSocket::set_option: not TCP");
-            return Ok(());
+        match level {
+            PSOL::IP => {
+                let opt = crate::net::socket::IpOption::try_from(name as u32)
+                    .map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.set_ip_option(opt, val)
+            }
+            PSOL::SOCKET => {
+                let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.set_socket_option(opt, val)
+            }
+            PSOL::TCP => {
+                let opt = option::Options::try_from(name as i32)?;
+                // log::debug!("TCP Option: {:?}, value = {:?}", opt, val);
+                self.set_tcp_option(opt, val)
+            }
+            _ => Ok(()),
         }
-        use option::Options::{self, *};
-        let option_name = Options::try_from(name as i32)?;
-        log::debug!("TCP Option: {:?}, value = {:?}", option_name, val);
-        match option_name {
-            NoDelay => {
-                let nagle_enabled = val[0] != 0;
-                let mut writer = self.inner.write();
-                let inner = writer.take().expect("Tcp inner::Inner is None");
-                match inner {
-                    inner::Inner::Established(established) => {
-                        established.with_mut(|socket| {
-                            socket.set_nagle_enabled(nagle_enabled);
-                        });
-                        writer.replace(inner::Inner::Established(established));
-                    }
-                    _ => {
-                        writer.replace(inner);
-                        return Err(SystemError::EINVAL);
-                    }
-                }
-            }
-            KeepIntvl => {
-                if val.len() == 4 {
-                    let mut writer = self.inner.write();
-                    let inner = writer.take().expect("Tcp inner::Inner is None");
-                    match inner {
-                        inner::Inner::Established(established) => {
-                            let interval = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
-                            established.with_mut(|socket| {
-                                socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
-                                    interval as u64,
-                                )));
-                            });
-                            writer.replace(inner::Inner::Established(established));
-                        }
-                        _ => {
-                            writer.replace(inner);
-                            return Err(SystemError::EINVAL);
-                        }
-                    }
-                } else {
-                    return Err(SystemError::EINVAL);
-                }
-            }
-            KeepCnt => {
-                // if val.len() == 4 {
-                //     let mut writer = self.inner.write();
-                //     let inner = writer.take().expect("Tcp inner::Inner is None");
-                //     match inner {
-                //         inner::Inner::Established(established) => {
-                //             let count = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
-                //             established.with_mut(|socket| {
-                //                 socket.set_keep_alive_count(count);
-                //             });
-                //             writer.replace(inner::Inner::Established(established));
-                //         }
-                //         _ => {
-                //             writer.replace(inner);
-                //             return Err(SystemError::EINVAL);
-                //         }
-                //     }
-                // } else {
-                //     return Err(SystemError::EINVAL);
-                // }
-            }
-            KeepIdle => {}
-            _ => {
-                log::debug!("TcpSocket::set_option: not supported");
-                // return Err(ENOPROTOOPT);
-            }
-        }
-        Ok(())
     }
 
     fn recv_from(
         &self,
-        _buffer: &mut [u8],
-        _flags: PMSG,
+        buffer: &mut [u8],
+        flags: PMSG,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        todo!()
+        // Linux 语义：对 SOCK_STREAM(TCP) 的 recvfrom(2)，addr 参数被忽略。
+        // “不写回 sockaddr” 的行为在 syscall 层做特殊处理，避免修改用户缓冲区。
+        let n = self.recv(buffer, flags)?;
+        // 返回值仅用于统一接口；不会被写回给用户。
+        let ep = self.remote_endpoint().unwrap_or_else(|_| {
+            self.local_endpoint()
+                .unwrap_or(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
+        });
+        Ok((n, ep))
     }
 
     fn recv_msg(
         &self,
-        _msg: &mut crate::net::posix::MsgHdr,
-        _flags: PMSG,
+        msg: &mut crate::net::posix::MsgHdr,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
-        todo!()
+        // TCP: 不返回 peer 地址。
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        let total = iovs.total_len();
+        let mut tmp = vec![0u8; total];
+        let n = self.recv(&mut tmp, flags)?;
+        let written = iovs.scatter(&tmp[..n])?;
+
+        msg.msg_flags = 0;
+        msg.msg_namelen = 0;
+
+        // Ancillary data: SO_TIMESTAMP and TCP_INQ.
+        let mut cmsg_write_off = 0usize;
+        if !msg.msg_control.is_null() && msg.msg_controllen != 0 {
+            let mut cbuf = CmsgBuffer {
+                ptr: msg.msg_control,
+                len: msg.msg_controllen,
+                write_off: &mut cmsg_write_off,
+            };
+
+            if self.timestamp_enabled() {
+                let now_ns = crate::time::timekeeping::do_gettimeofday().to_ns();
+                let tv = PosixTimeval::from_ns(now_ns);
+                let tv_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        (&tv as *const PosixTimeval) as *const u8,
+                        core::mem::size_of::<PosixTimeval>(),
+                    )
+                };
+                // SCM_TIMESTAMP uses the same numeric value as SO_TIMESTAMP (29).
+                let cmsg_type = PSO::TIMESTAMP_OLD as i32;
+                cbuf.put(
+                    &mut msg.msg_flags,
+                    SOL_SOCKET,
+                    cmsg_type,
+                    core::mem::size_of::<PosixTimeval>(),
+                    tv_bytes,
+                )?;
+            }
+
+            if self.inq_enabled() {
+                let inq = TcpSocket::clamp_usize_to_i32(self.recv_queue_len());
+                let inq_bytes = inq.to_ne_bytes();
+                cbuf.put(
+                    &mut msg.msg_flags,
+                    PSOL::TCP as i32,
+                    option::Options::INQ as i32,
+                    core::mem::size_of::<i32>(),
+                    &inq_bytes,
+                )?;
+            }
+        }
+
+        msg.msg_controllen = cmsg_write_off;
+        Ok(written)
     }
 
-    fn send_msg(
-        &self,
-        _msg: &crate::net::posix::MsgHdr,
-        _flags: PMSG,
-    ) -> Result<usize, SystemError> {
-        todo!()
+    fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
+        // TCP: msg_name 作为目的地址被忽略，等价于 send(2)。
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
+        let data = iovs.gather()?;
+        self.send(&data, flags)
     }
 
     fn send_to(
         &self,
-        _buffer: &[u8],
-        _flags: PMSG,
+        buffer: &[u8],
+        flags: PMSG,
         _address: Endpoint,
     ) -> Result<usize, SystemError> {
-        todo!()
+        // Linux 语义：对已连接 SOCK_STREAM(TCP)，sendto(2) 的地址参数被忽略。
+        self.send(buffer, flags)
     }
 
     fn epoll_items(&self) -> &EPollItems {
@@ -620,16 +402,25 @@ impl Socket for TcpSocket {
         self.update_events();
         EP::from_bits_truncate(self.do_poll() as u32)
     }
+
+    fn ioctl(
+        &self,
+        _cmd: u32,
+        _arg: usize,
+        _private_data: &crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 }
 
 impl InetSocket for TcpSocket {
     fn on_iface_events(&self) {
-        if self.update_events() {
-            let _result = self.finish_connect();
-            // set error
-        }
-        let pollflag = self.check_io_event();
-        use crate::filesystem::epoll::event_poll::EventPoll;
-        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), pollflag);
+        // Iface::poll() 在网络轮询线程/中断上下文中推进 smoltcp socket 状态。
+        // 这里负责把 smoltcp 的状态变化同步到 TcpSocket 的 pollee/Connecting 结果中，
+        // 以便 connect/accept/epoll 等等待者能被正确唤醒并观察到状态前进。
+        //
+        // 重要：driver/net/mod.rs 已保证 notify() 调用时不再持有 bounds 读锁，
+        // 因此这里可以安全地获取 self.inner 的 RwLock 并更新事件。
+        let _ = self.update_events();
     }
 }

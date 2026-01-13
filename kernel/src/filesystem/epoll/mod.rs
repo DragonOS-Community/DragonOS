@@ -1,5 +1,5 @@
 use super::{poll::PollFlags, vfs::file::File};
-use crate::libs::{rwlock::RwLock, spinlock::SpinLock};
+use crate::libs::{mutex::Mutex, rwsem::RwSem};
 use alloc::sync::Weak;
 use core::fmt::Debug;
 use event_poll::EventPoll;
@@ -53,9 +53,9 @@ impl EPollEvent {
 #[derive(Debug)]
 pub struct EPollItem {
     /// 对应的Epoll
-    epoll: Weak<SpinLock<EventPoll>>,
+    epoll: Weak<Mutex<EventPoll>>,
     /// 用户注册的事件
-    event: RwLock<EPollEvent>,
+    event: RwSem<EPollEvent>,
     /// 监听的描述符
     fd: i32,
     /// 对应的文件
@@ -64,24 +64,24 @@ pub struct EPollItem {
 
 impl EPollItem {
     pub fn new(
-        epoll: Weak<SpinLock<EventPoll>>,
+        epoll: Weak<Mutex<EventPoll>>,
         events: EPollEvent,
         fd: i32,
         file: Weak<File>,
     ) -> Self {
         Self {
             epoll,
-            event: RwLock::new(events),
+            event: RwSem::new(events),
             fd,
             file,
         }
     }
 
-    pub fn epoll(&self) -> Weak<SpinLock<EventPoll>> {
+    pub fn epoll(&self) -> Weak<Mutex<EventPoll>> {
         self.epoll.clone()
     }
 
-    pub fn event(&self) -> &RwLock<EPollEvent> {
+    pub fn event(&self) -> &RwSem<EPollEvent> {
         &self.event
     }
 

@@ -37,7 +37,7 @@ fn dhcp_query() -> Result<(), SystemError> {
     // IMPORTANT: This should be removed in production.
     dhcp_socket.set_max_lease_duration(Some(smoltcp::time::Duration::from_secs(10)));
 
-    let sockets = || net_face.sockets().lock_irqsave();
+    let sockets = || net_face.sockets().lock();
 
     let dhcp_handle = sockets().add(dhcp_socket);
     defer::defer!({

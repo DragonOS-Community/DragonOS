@@ -120,13 +120,15 @@ impl Cred {
     fn try_capability_override(&self, metadata: &Metadata, mask: u32) -> bool {
         // CAP_DAC_OVERRIDE: 绕过所有文件读、写和执行权限检查
         if self.has_capability(CAPFlags::CAP_DAC_OVERRIDE) {
-            // 对于目录或文件，只要满足下列条件之一就允许
-            if metadata.file_type == super::FileType::Dir
-                || mask & PermissionMask::MAY_EXEC.bits() == 0
-                || metadata.mode.bits() & PermissionMask::MAY_RWX.bits() != 0
+            // Linux: CAP_DAC_OVERRIDE does not bypass execute checks for regular files
+            // when no execute bit is set.
+            if mask & PermissionMask::MAY_EXEC.bits() != 0
+                && metadata.file_type != super::FileType::Dir
+                && (metadata.mode.bits() & InodeMode::S_IXUGO.bits()) == 0
             {
-                return true;
+                return false;
             }
+            return true;
         }
 
         // CAP_DAC_READ_SEARCH: 绕过读和搜索（目录上的执行）检查

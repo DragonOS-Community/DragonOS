@@ -10,6 +10,7 @@ uname_test
 syslog_test
 getcpu_test
 getcpu_host_test
+pause_test
 
 # 文件系统相关测试
 chroot_test
@@ -43,6 +44,7 @@ open_create_test
 select_test
 pselect_test
 epoll_test
+splice_test
 
 # 进程相关测试
 fork_test
@@ -95,6 +97,7 @@ socket_unix_unbound_stream_test
 raw_socket_test
 raw_socket_icmp_test
 raw_socket_hdrincl_test
+tcp_socket_test
 
 # 信号处理测试
 sigaction_test
@@ -104,6 +107,7 @@ sigreturn_test
 sigtimedwait_test
 rtsignal_test
 signalfd_test
+sigstop_test
 
 # 其他测试
 itimer_test

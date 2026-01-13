@@ -1,9 +1,7 @@
 use super::KernFSInode;
+use crate::filesystem::{sysfs::SysFSKernPrivateData, vfs::PollStatus};
+use crate::libs::mutex::MutexGuard;
 use crate::tracepoint::{TraceCmdLineCacheSnapshot, TracePipeSnapshot, TracePointInfo};
-use crate::{
-    filesystem::{sysfs::SysFSKernPrivateData, vfs::PollStatus},
-    libs::spinlock::SpinLockGuard,
-};
 use alloc::sync::Arc;
 use core::fmt::Debug;
 use system_error::SystemError;
@@ -35,14 +33,14 @@ pub trait KernFSCallback: Send + Sync + Debug {
 #[derive(Debug)]
 pub struct KernCallbackData<'a> {
     kern_inode: Arc<KernFSInode>,
-    private_data: SpinLockGuard<'a, Option<KernInodePrivateData>>,
+    private_data: MutexGuard<'a, Option<KernInodePrivateData>>,
 }
 
 #[allow(dead_code)]
 impl<'a> KernCallbackData<'a> {
     pub fn new(
         kern_inode: Arc<KernFSInode>,
-        private_data: SpinLockGuard<'a, Option<KernInodePrivateData>>,
+        private_data: MutexGuard<'a, Option<KernInodePrivateData>>,
     ) -> Self {
         Self {
             kern_inode,

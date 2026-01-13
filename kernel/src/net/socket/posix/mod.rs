@@ -10,7 +10,7 @@ mod raw_option;
 mod types;
 mod uapi;
 
-pub use ip_option::IpOption as PIP; // Socket options (SOL_IP)
+pub use ip_option::IpOption; // Socket options (SOL_IP)
 pub use ipv6_option::Ipv6Option as PIPV6; // Socket options (SOL_IPV6)
 pub use msg_flag::MessageFlag as PMSG; // Socket message flags MSG_*
 pub use option::Options as PSO; // Socket options SO_*

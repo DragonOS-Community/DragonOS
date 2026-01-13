@@ -1,3 +1,4 @@
+use crate::libs::mutex::MutexGuard;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
@@ -7,7 +8,6 @@ use crate::{
             IndexNode, InodeFlags, InodeId, InodeMode, Metadata, SpecialNodeData,
         },
     },
-    libs::spinlock::SpinLockGuard,
     time::PosixTimeSpec,
 };
 use alloc::fmt::Debug;
@@ -104,7 +104,7 @@ pub trait SymOps: Sync + Send + Sized + Debug {
     /// 打开符号链接时调用，可用于设置命名空间文件私有数据
     ///
     /// 用于 /proc/*/ns/* 这类可以直接打开的"魔法链接"
-    fn open(&self, _data: &mut SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(&self, _data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 默认实现：不做任何操作
         Ok(())
     }
@@ -144,7 +144,7 @@ impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
         _offset: usize,
         _len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         //todo 符号链接不能直接读取，但是由于目前系统中对于 readlink 的支持有限
         //暂时通过 read_at 来模拟 readlink 的行为
@@ -157,7 +157,7 @@ impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 符号链接不能写入
         Err(SystemError::EINVAL)
@@ -173,13 +173,13 @@ impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
 
     fn open(
         &self,
-        mut data: SpinLockGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         self.inner.open(&mut data)
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 

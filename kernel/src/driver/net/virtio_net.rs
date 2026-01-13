@@ -855,6 +855,11 @@ impl Iface for VirtioInterface {
         self.iface_common.poll(self.device_inner.force_get_mut())
     }
 
+    fn poll_napi(&self, budget: usize) -> bool {
+        self.iface_common
+            .poll_napi(self.device_inner.force_get_mut(), budget)
+    }
+
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
     //     return self;
     // }

@@ -1,4 +1,6 @@
+use crate::libs::mutex::MutexGuard;
 use crate::arch::kvm::vmx::vcpu::VcpuContextFrame;
+use crate::libs::mutex::MutexGuard;
 use crate::arch::KVMArch;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem;
@@ -100,14 +102,14 @@ impl IndexNode for LockedVcpuInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
         debug!("file private data:{:?}", _data);
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -200,7 +202,7 @@ impl IndexNode for LockedVcpuInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -211,7 +213,7 @@ impl IndexNode for LockedVcpuInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }

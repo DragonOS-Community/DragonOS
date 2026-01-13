@@ -4,9 +4,10 @@ use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
 use crate::filesystem::vfs::iov::IoVecs;
+use crate::net::posix::{SockAddrIn, SockAddrIn6};
 use crate::net::socket::unix::utils::CmsgBuffer;
 use crate::net::socket::utils::{IPV4_MIN_HEADER_LEN, IPV6_HEADER_LEN};
-use crate::net::socket::{PIP, PIPV6, PSOL};
+use crate::net::socket::{IpOption, PIPV6, PSOL};
 use crate::syscall::user_access::UserBufferWriter;
 
 use super::inner;
@@ -231,18 +232,10 @@ impl RawSocket {
 
         match (self.ip_version, src_addr) {
             (IpVersion::Ipv4, IpAddress::Ipv4(v4)) => {
-                #[repr(C)]
-                #[derive(Clone, Copy)]
-                struct SockAddrIn {
-                    sin_family: u16,
-                    sin_port: u16,
-                    sin_addr: u32,
-                    sin_zero: [u8; 8],
-                }
                 let sa = SockAddrIn {
                     sin_family: crate::net::socket::AddressFamily::INet as u16,
                     sin_port: port_be,
-                    sin_addr: u32::from_ne_bytes(v4.octets()),
+                    sin_addr: v4.to_bits().to_be(),
                     sin_zero: [0; 8],
                 };
                 let want = core::mem::size_of::<SockAddrIn>().min(msg.msg_namelen as usize);
@@ -254,15 +247,6 @@ impl RawSocket {
                 msg.msg_namelen = want as u32;
             }
             (IpVersion::Ipv6, IpAddress::Ipv6(v6)) => {
-                #[repr(C)]
-                #[derive(Clone, Copy)]
-                struct SockAddrIn6 {
-                    sin6_family: u16,
-                    sin6_port: u16,
-                    sin6_flowinfo: u32,
-                    sin6_addr: [u8; 16],
-                    sin6_scope_id: u32,
-                }
                 let sa = SockAddrIn6 {
                     sin6_family: crate::net::socket::AddressFamily::INet6 as u16,
                     sin6_port: port_be,
@@ -329,7 +313,7 @@ impl RawSocket {
             cmsg_buf.put(
                 msg_flags,
                 PSOL::IP as i32,
-                PIP::PKTINFO as i32,
+                IpOption::PKTINFO as i32,
                 core::mem::size_of::<InPktInfo>(),
                 bytes,
             )?;
@@ -337,7 +321,7 @@ impl RawSocket {
 
         // IP_RECVTOS
         if options.recv_tos {
-            cmsg_buf.put(msg_flags, PSOL::IP as i32, PIP::TOS as i32, 1, &[tos])?;
+            cmsg_buf.put(msg_flags, PSOL::IP as i32, IpOption::TOS as i32, 1, &[tos])?;
         }
 
         // IP_RECVTTL
@@ -346,7 +330,7 @@ impl RawSocket {
             cmsg_buf.put(
                 msg_flags,
                 PSOL::IP as i32,
-                PIP::TTL as i32,
+                IpOption::TTL as i32,
                 core::mem::size_of::<i32>(),
                 &v,
             )?;

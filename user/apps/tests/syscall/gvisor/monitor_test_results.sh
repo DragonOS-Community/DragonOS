@@ -1,9 +1,20 @@
 #!/bin/busybox sh
 
+# 检查必要的环境变量
+if [ -z "${ROOT_PATH}" ]; then
+    echo "[监控] 错误: ROOT_PATH 环境变量未设置"
+    echo "[监控] 请通过 Makefile 运行本脚本"
+    exit 1
+fi
+
+if [ -z "${VMSTATE_DIR}" ]; then
+    echo "[监控] 错误: VMSTATE_DIR 环境变量未设置"
+    echo "[监控] 请通过 Makefile 运行本脚本"
+    exit 1
+fi
+
 # 串口文件路径
 SERIAL_FILE="serial_opt.txt"
-# qemu进程PID
-QEMU_PID=${QEMU_PID}
 # 超时配置（秒）
 BOOT_TIMEOUT=300        # DragonOS开机超时（5分钟）
 TEST_START_TIMEOUT=600  # 测试程序启动超时（10分钟）
@@ -11,28 +22,38 @@ TEST_TIMEOUT=1800       # 整个测试超时（30分钟）
 IDLE_TIMEOUT=120        # 无输出超时（5分钟）
 SINGLE_TEST_TIMEOUT=60 # 单个测试用例超时（1分钟）
 
-# QEMU进程查找条件
-QEMU_SEARCH_PATTERN=${QEMU_SEARCH_PATTERN:-"qemu-system-x86_64.*AUTO_TEST=syscall"}
-
-# 如果QEMU_PID未设置，尝试查找QEMU进程
-if [ -z "$QEMU_PID" ]; then
-    echo "[监控] QEMU_PID未设置，正在查找QEMU进程..."
-    echo "[监控] 查找模式: $QEMU_SEARCH_PATTERN"
-    # 等待一下确保QEMU已经启动
-    sleep 2
-    # 查找真正的qemu进程，排除shell包装器和pgrep自身
-    # 使用ps和grep来精确匹配qemu可执行文件名
-    QEMU_PID=$(ps aux | grep -E "$QEMU_SEARCH_PATTERN" | grep -v "sh -c" | grep -v "grep" | awk '{print $2}' | head -n 1)
-
-    if [ -n "$QEMU_PID" ]; then
-        echo "[监控] 找到QEMU进程 (PID: $QEMU_PID)"
+# 从PID文件读取QEMU进程
+get_qemu_pid() {
+    if [ -f "${VMSTATE_DIR}/pid" ]; then
+        cat "${VMSTATE_DIR}/pid"
     else
-        echo "[监控] 警告: 未找到匹配的QEMU进程"
-        exit 1
+        echo ""
     fi
-else
-    echo "[监控] 使用指定的QEMU进程PID: $QEMU_PID"
+}
+
+# 初始化：等待QEMU进程写入PID文件
+echo "[监控] 等待QEMU进程启动并写入PID文件..."
+WAIT_PID_TIMEOUT=30
+WAIT_PID_ELAPSED=0
+QEMU_PID=$(get_qemu_pid)
+while [ -z "$QEMU_PID" ] && [ $WAIT_PID_ELAPSED -lt $WAIT_PID_TIMEOUT ]; do
+    sleep 1
+    WAIT_PID_ELAPSED=$((WAIT_PID_ELAPSED + 1))
+    QEMU_PID=$(get_qemu_pid)
+done
+
+if [ -z "$QEMU_PID" ]; then
+    echo "[监控] 错误: 超时未找到PID文件"
+    echo "[监控] 请确保VM通过Makefile启动"
+    exit 1
 fi
+
+if ! sudo kill -0 $QEMU_PID 2>/dev/null; then
+    echo "[监控] 错误: QEMU进程 (PID: $QEMU_PID) 不存在"
+    exit 1
+fi
+
+echo "[监控] 找到QEMU进程 (PID: $QEMU_PID)"
 
 # 记录开始时间
 START_TIME=$(date +%s)
@@ -45,64 +66,26 @@ CURRENT_TEST_NAME=""
 # 资源清理函数
 clean_up() {
     echo "[监控] 正在清理资源..."
-    if [ -n "$QEMU_PID" ]; then
-        if kill -0 $QEMU_PID 2>/dev/null; then
+
+    # 从PID文件读取QEMU进程
+    if [ -f "${VMSTATE_DIR}/pid" ]; then
+        QEMU_PID=$(cat "${VMSTATE_DIR}/pid")
+        if [ -n "$QEMU_PID" ] && sudo kill -0 $QEMU_PID 2>/dev/null; then
             echo "[监控] 终止QEMU进程 (PID: $QEMU_PID)"
-            # 首先尝试优雅终止
-            kill -TERM $QEMU_PID 2>/dev/null
+            sudo kill -TERM $QEMU_PID 2>/dev/null
             sleep 3
-
-            # 如果进程还在，检查是否有子进程需要一起杀死
-            if kill -0 $QEMU_PID 2>/dev/null; then
-                # 查找并杀死所有相关子进程
-                CHILD_PIDS=$(pstree -p $QEMU_PID | grep -o '([0-9]\+)' | grep -o '[0-9]\+' | tr '\n' ' ')
-                for child_pid in $CHILD_PIDS; do
-                    if [ "$child_pid" != "$QEMU_PID" ] && kill -0 $child_pid 2>/dev/null; then
-                        echo "[监控] 终止子进程 (PID: $child_pid)"
-                        kill -TERM $child_pid 2>/dev/null
-                    fi
-                done
-                sleep 2
-
-                # 强制杀死主进程
-                kill -0 $QEMU_PID 2>/dev/null && kill -9 $QEMU_PID 2>/dev/null
-                # 再次强制杀死所有子进程
-                for child_pid in $CHILD_PIDS; do
-                    if [ "$child_pid" != "$QEMU_PID" ] && kill -0 $child_pid 2>/dev/null; then
-                        kill -9 $child_pid 2>/dev/null
-                    fi
-                done
+            if sudo kill -0 $QEMU_PID 2>/dev/null; then
+                echo "[监控] 强制终止QEMU进程 (PID: $QEMU_PID)"
+                sudo kill -9 $QEMU_PID 2>/dev/null
             fi
         else
-            echo "[监控] QEMU进程 (PID: $QEMU_PID) 已经退出"
+            echo "[监控] QEMU进程 (PID: $QEMU_PID) 已不存在"
         fi
+        rm -f "${VMSTATE_DIR}/pid"
     else
-        # 如果没有特定的PID，尝试终止所有匹配的QEMU进程
-        echo "[监控] 查找并终止匹配的QEMU进程..."
-        echo "[监控] 查找模式: $QEMU_SEARCH_PATTERN"
-        # 使用pkill先杀主进程
-        pkill -f "$QEMU_SEARCH_PATTERN" 2>/dev/null
-        sleep 2
-        # 再次查找并强制杀死任何残留的进程
-        pkill -9 -f "$QEMU_SEARCH_PATTERN" 2>/dev/null
+        echo "[监控] 错误: 未找到PID文件，无法确定要终止的进程"
+        echo "[监控] 请确保VM通过Makefile启动"
     fi
-
-    # 额外清理：查找并杀死所有相关的qemu进程
-    echo "[监控] 清理所有残留的QEMU相关进程..."
-    # 查找所有匹配的qemu进程
-    REMAINING_PIDS=$(ps aux | grep -E "$QEMU_SEARCH_PATTERN" | grep -v "grep" | awk '{print $2}')
-    for pid in $REMAINING_PIDS; do
-        echo "[监控] 终止残留QEMU进程 (PID: $pid)"
-        kill -TERM $pid 2>/dev/null
-    done
-    sleep 2
-    # 强制杀死残留进程
-    for pid in $REMAINING_PIDS; do
-        if kill -0 $pid 2>/dev/null; then
-            echo "[监控] 强制终止残留QEMU进程 (PID: $pid)"
-            kill -9 $pid 2>/dev/null
-        fi
-    done
 
     # 清理所有可能的子进程
     pkill -P $$ 2>/dev/null
@@ -132,12 +115,11 @@ show_diagnostic_info() {
 
 # 检查QEMU进程是否还在运行
 check_qemu_alive() {
-    if [ -n "$QEMU_PID" ]; then
-        # 使用ps检查进程是否存在，避免PID重用问题
-        ps aux | grep -E "[q]emu-system-x86_64" | awk '{print $2}' | grep -q "^$QEMU_PID$"
+    local current_pid=$(get_qemu_pid)
+    if [ -n "$current_pid" ]; then
+        sudo kill -0 "$current_pid" 2>/dev/null
     else
-        # 如果没有特定的PID，检查是否有匹配的QEMU进程在运行
-        ps aux | grep -E "$QEMU_SEARCH_PATTERN" | grep -v "sh -c" | grep -v "grep" | grep -q .
+        false
     fi
 }
 

@@ -19,6 +19,7 @@ use crate::{
         },
     },
     libs::{
+        mutex::MutexGuard,
         rwlock::RwLock,
         rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -102,13 +103,13 @@ impl Debug for LoopControlDevice {
 impl IndexNode for LoopControlDevice {
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
 
@@ -211,7 +212,7 @@ impl IndexNode for LoopControlDevice {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -221,7 +222,7 @@ impl IndexNode for LoopControlDevice {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }

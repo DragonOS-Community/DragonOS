@@ -3,13 +3,13 @@ use crate::bpf::helper::BPF_HELPER_FUN_SET;
 use crate::bpf::prog::BpfProg;
 use crate::filesystem::page_cache::PageCache;
 use crate::libs::casting::DowncastArc;
+use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::SpinLock;
 use crate::perf::util::PerfProbeConfig;
 use crate::perf::{BasicPerfEbpfCallBack, JITMem};
 use crate::tracepoint::{TracePoint, TracePointCallBackFunc};
 use crate::{
     filesystem::vfs::{file::File, FilePrivateData, FileSystem, IndexNode},
-    libs::spinlock::SpinLockGuard,
     perf::{util::PerfProbeArgs, PerfEventOps},
 };
 use alloc::boxed::Box;
@@ -43,7 +43,7 @@ impl IndexNode for TracepointPerfEvent {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("read_at not implemented for TracepointPerfEvent");
     }
@@ -53,7 +53,7 @@ impl IndexNode for TracepointPerfEvent {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("write_at not implemented for TracepointPerfEvent");
     }

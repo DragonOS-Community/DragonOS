@@ -1,11 +1,9 @@
-use alloc::string::String;
 #[allow(unused_imports)]
 use alloc::string::ToString;
-use alloc::sync::Arc;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EXECVE;
-use crate::filesystem::vfs::{IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
+use crate::filesystem::vfs::{MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::mm::page::PAGE_4K_SIZE;
 use crate::mm::{access_ok, VirtAddr};
 use crate::process::execve::do_execve;
@@ -90,26 +88,25 @@ impl SysExecve {
     }
 
     pub fn execve(
-        inode: Arc<dyn IndexNode>,
-        path: String,
+        path: &str,
         argv: Vec<CString>,
         envp: Vec<CString>,
         frame: &mut TrapFrame,
     ) -> Result<(), SystemError> {
         ProcessManager::current_pcb()
             .basic_mut()
-            .set_name(ProcessControlBlock::generate_name(&path));
+            .set_name(ProcessControlBlock::generate_name(path));
 
         // 仅在 execve 成功后再写入 cmdline，避免失败时污染当前进程信息
         let argv_for_cmdline = argv.clone();
-        do_execve(inode, argv, envp, frame)?;
+        do_execve(path, argv, envp, frame)?;
 
         let pcb = ProcessManager::current_pcb();
         // 关闭设置了O_CLOEXEC的文件描述符
         let fd_table = pcb.fd_table();
         fd_table.write().close_on_exec();
 
-        pcb.set_execute_path(path);
+        pcb.set_execute_path(path.to_string());
         pcb.set_cmdline_from_argv(&argv_for_cmdline);
         Ok(())
     }
@@ -143,14 +140,12 @@ impl Syscall for SysExecve {
             return Err(SystemError::ENOENT);
         }
 
+        // 获取解析符号链接后的绝对路径（用于set_execute_path）
         let pwd = ProcessManager::current_pcb().pwd_inode();
         let inode = pwd.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-
-        // 获取inode的绝对路径，而不是使用用户传入的原始路径
-        // 这样可以正确处理符号链接（如/proc/self/exe）
         let resolved_path = inode.absolute_path().unwrap_or(path.clone());
 
-        Self::execve(inode, resolved_path, argv, envp, frame)?;
+        Self::execve(&resolved_path, argv, envp, frame)?;
         return Ok(0);
     }
 

@@ -23,6 +23,31 @@ use crate::{
     time::{syscall::PosixClockID, timekeeping::getnstimeofday, Instant, PosixTimeSpec},
 };
 
+/// Send a kernel-originated signal to the current task.
+///
+/// This is a small convenience wrapper to avoid duplicating SigInfo construction
+/// (and pid/uid filling) in subsystems like pipe.
+pub fn send_kernel_signal_to_current(sig: Signal) -> Result<(), SystemError> {
+    let pid = ProcessManager::current_pcb().task_pid_vnr();
+
+    // For kernel-originated signals, use SigCode::Kernel and a zeroed sender.
+    // This keeps the responsibility of siginfo formatting inside the signal subsystem.
+    let mut info = SigInfo::new(
+        sig,
+        0,
+        SigCode::Kernel,
+        SigType::Kill {
+            pid: RawPid::new(0),
+            uid: 0,
+        },
+    );
+
+    compiler_fence(Ordering::SeqCst);
+    let ret = sig.send_signal_info(Some(&mut info), pid);
+    compiler_fence(Ordering::SeqCst);
+    ret.map(|_| ())
+}
+
 impl Signal {
     pub fn signal_pending_state(
         interruptible: bool,

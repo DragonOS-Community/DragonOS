@@ -20,7 +20,7 @@ use crate::{
         serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
         tty::{
             console::ConsoleSwitch,
-            kthread::send_to_tty_refresh_thread,
+            kthread::enqueue_tty_rx_from_irq,
             termios::WindowSize,
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyOperation},
@@ -280,7 +280,7 @@ impl UartPort for Serial8250PIOPort {
             }
         }
 
-        send_to_tty_refresh_thread(&buf[0..index]);
+        enqueue_tty_rx_from_irq(&buf[0..index]);
         Ok(())
     }
 

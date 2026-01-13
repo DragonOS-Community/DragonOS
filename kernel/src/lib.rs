@@ -13,6 +13,7 @@
 #![feature(linked_list_retain)]
 #![feature(ptr_internals)]
 #![feature(slice_ptr_get)]
+#![feature(negative_impls)]
 #![feature(sync_unsafe_cell)]
 #![feature(vec_into_raw_parts)]
 #![feature(linkage)]

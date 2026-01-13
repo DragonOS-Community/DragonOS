@@ -15,6 +15,7 @@ use hashbrown::HashMap;
 use ida::IdAllocator;
 use system_error::SystemError;
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
     filesystem::{
@@ -644,7 +645,7 @@ impl MountFSInode {
 impl IndexNode for MountFSInode {
     fn open(
         &self,
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return self.inner_inode.open(data, flags);
@@ -668,7 +669,7 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.fadvise(file, offset, len, advise);
     }
 
-    fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         self.inner_inode.close(data)
     }
 
@@ -698,7 +699,7 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.read_at(offset, len, buf, data);
     }
@@ -708,7 +709,7 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.write_at(offset, len, buf, data);
     }
@@ -718,7 +719,7 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         self.inner_inode.read_direct(offset, len, buf, data)
     }
@@ -728,7 +729,7 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         self.inner_inode.write_direct(offset, len, buf, data)
     }

@@ -2,9 +2,12 @@ use inner::{UdpInner, UnboundUdp, DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE, MIN_
 use smoltcp;
 use system_error::SystemError;
 
+use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::iov::IoVecs;
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::posix::SockAddr;
 use crate::net::socket::common::{EPollItems, ShutdownBit};
 use crate::net::socket::{Socket, PMSG, PSO, PSOL};
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -12,8 +15,9 @@ use crate::process::ProcessManager;
 use crate::{libs::rwlock::RwLock, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion};
 
-use super::InetSocket;
+use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
 
 pub mod inner;
 
@@ -51,10 +55,11 @@ pub struct UdpSocket {
     /// 2. Patching smoltcp to add this feature
     /// 3. Manually parsing/building UDP packets to bypass smoltcp's checksum handling
     no_check: AtomicBool,
+    ip_version: IpVersion,
 }
 
 impl UdpSocket {
-    pub fn new(nonblock: bool) -> Arc<Self> {
+    pub fn new(nonblock: bool, version: IpVersion) -> Arc<Self> {
         let netns = ProcessManager::current_netns();
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
@@ -70,6 +75,7 @@ impl UdpSocket {
             send_buf_size: AtomicUsize::new(0), // 0 means use default
             recv_buf_size: AtomicUsize::new(0), // 0 means use default
             no_check: AtomicBool::new(false),   // checksums enabled by default
+            ip_version: version,
         })
     }
 
@@ -138,6 +144,7 @@ impl UdpSocket {
     pub fn bind_ephemeral(&self, remote: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
         let mut inner_guard = self.inner.write();
         let inner = inner_guard.take().ok_or(SystemError::EBADF)?;
+        let mut newly_bound_iface = None;
         let bound = match inner {
             UdpInner::Bound(inner) => inner,
             UdpInner::Unbound(_old_inner) => {
@@ -153,7 +160,10 @@ impl UdpSocket {
                 };
 
                 match inner.bind_ephemeral(remote, self.netns()) {
-                    Ok(bound) => bound,
+                    Ok(bound) => {
+                        newly_bound_iface = Some(bound.inner().iface().clone());
+                        bound
+                    }
                     Err(e) => {
                         inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
                         return Err(e);
@@ -161,6 +171,12 @@ impl UdpSocket {
                 }
             }
         };
+        // IMPORTANT: register this socket for iface notifications when it becomes bound implicitly.
+        // Without this, incoming packets may not wake recv()/poll waiters, causing hangs in
+        // gVisor tests such as UdpSocketTest.ReceiveAfterDisconnect.
+        if let Some(iface) = newly_bound_iface {
+            iface.common().bind_socket(self.self_ref.upgrade().unwrap());
+        }
         inner_guard.replace(UdpInner::Bound(bound));
         Ok(())
     }
@@ -176,8 +192,6 @@ impl UdpSocket {
     /// Recreates the socket with new buffer sizes if it's already bound.
     /// This is needed because smoltcp doesn't support resizing socket buffers dynamically.
     fn recreate_socket_if_bound(&self) -> Result<(), SystemError> {
-        use smoltcp::wire::IpListenEndpoint;
-
         let mut inner_guard = self.inner.write();
 
         // Check if socket is bound
@@ -247,6 +261,11 @@ impl UdpSocket {
     pub fn close(&self) {
         let mut inner = self.inner.write();
         if let Some(UdpInner::Bound(bound)) = &mut *inner {
+            bound
+                .inner()
+                .iface()
+                .common()
+                .unbind_socket(self.self_ref.upgrade().unwrap());
             bound.close();
             inner.take();
         }
@@ -307,6 +326,12 @@ impl UdpSocket {
                 };
                 match unbound.bind_ephemeral(to_addr, self.netns()) {
                     Ok(bound) => {
+                        // Register for iface notifications on implicit bind via sendto().
+                        bound
+                            .inner()
+                            .iface()
+                            .common()
+                            .bind_socket(self.self_ref.upgrade().unwrap());
                         inner_guard.replace(UdpInner::Bound(bound));
                     }
                     Err(e) => {
@@ -408,8 +433,8 @@ impl Socket for UdpSocket {
         size
     }
 
-    fn recv_bytes_available(&self) -> Result<usize, SystemError> {
-        Ok(match self.inner.read().as_ref() {
+    fn recv_bytes_available(&self) -> usize {
+        match self.inner.read().as_ref() {
             Some(UdpInner::Bound(bound)) => {
                 // For UDP, FIONREAD should return the size of the first packet,
                 // not the total bytes in the queue
@@ -421,7 +446,7 @@ impl Socket for UdpSocket {
                 })
             }
             _ => 0,
-        })
+        }
     }
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
@@ -447,6 +472,11 @@ impl Socket for UdpSocket {
                         // Socket was implicitly bound by connect, unbind it
                         let mut inner_guard = self.inner.write();
                         if let Some(UdpInner::Bound(bound)) = inner_guard.take() {
+                            bound
+                                .inner()
+                                .iface()
+                                .common()
+                                .unbind_socket(self.self_ref.upgrade().unwrap());
                             bound.close();
                             inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
                         }
@@ -484,6 +514,11 @@ impl Socket for UdpSocket {
                     // Socket was implicitly bound by connect, unbind it
                     let mut inner_guard = self.inner.write();
                     if let Some(UdpInner::Bound(bound)) = inner_guard.take() {
+                        bound
+                            .inner()
+                            .iface()
+                            .common()
+                            .unbind_socket(self.self_ref.upgrade().unwrap());
                         bound.close();
                         inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
                     }
@@ -803,7 +838,11 @@ impl Socket for UdpSocket {
     }
 
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
-        use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint};
+        let unspecified_addr = match self.ip_version {
+            IpVersion::Ipv4 => UNSPECIFIED_LOCAL_ENDPOINT_V4.addr,
+            IpVersion::Ipv6 => UNSPECIFIED_LOCAL_ENDPOINT_V6.addr,
+        };
+
         match self.inner.read().as_ref() {
             Some(UdpInner::Bound(bound)) => {
                 let IpListenEndpoint { addr, port } = bound.endpoint();
@@ -826,19 +865,22 @@ impl Socket for UdpSocket {
                                 if let Some(cidr) = iface_guard.ip_addrs().first() {
                                     cidr.address()
                                 } else {
-                                    Ipv4([0, 0, 0, 0].into())
+                                    unspecified_addr
                                 }
                             }
                         }
                     } else {
                         // Not connected, return "any"
-                        Ipv4([0, 0, 0, 0].into())
+                        unspecified_addr
                     }
                 };
 
                 Ok(Endpoint::Ip(IpEndpoint::new(local_addr, port)))
             }
-            Some(_) => Ok(Endpoint::Ip(IpEndpoint::new(Ipv4([0, 0, 0, 0].into()), 0))),
+            Some(_) => match self.ip_version {
+                IpVersion::Ipv4 => Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4)),
+                IpVersion::Ipv6 => Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V6)),
+            },
             None => Err(SystemError::EBADF),
         }
     }
@@ -848,8 +890,6 @@ impl Socket for UdpSocket {
         msg: &mut crate::net::posix::MsgHdr,
         flags: PMSG,
     ) -> Result<usize, SystemError> {
-        use crate::filesystem::vfs::iov::IoVecs;
-
         // log::debug!(
         //     "recv_msg: msg_name={:?}, msg_namelen={}, flags={:?}",
         //     msg.msg_name,
@@ -907,9 +947,6 @@ impl Socket for UdpSocket {
     }
 
     fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
-        use crate::filesystem::vfs::iov::IoVecs;
-        use crate::net::posix::SockAddr;
-
         // Validate and gather iovecs
         // TODO: Actual iovecs sends
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
@@ -981,7 +1018,6 @@ impl InetSocket for UdpSocket {
 
         // Notify epoll/poll watchers about socket state changes
         let pollflag = self.check_io_event();
-        use crate::filesystem::epoll::event_poll::EventPoll;
         let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), pollflag);
     }
 }

@@ -3,6 +3,7 @@ use core::intrinsics::unlikely;
 
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
+use crate::libs::mutex::MutexGuard;
 use crate::libs::rwlock::RwLock;
 use crate::register_mountable_fs;
 use crate::{
@@ -197,13 +198,13 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
@@ -214,7 +215,7 @@ impl IndexNode for LockedRamFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -246,7 +247,7 @@ impl IndexNode for LockedRamFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);

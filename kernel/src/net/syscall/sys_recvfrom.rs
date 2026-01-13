@@ -6,8 +6,10 @@ use crate::filesystem::vfs::file::FileFlags;
 use crate::mm::VirtAddr;
 use crate::net::posix::SockAddr;
 use crate::net::socket;
+use crate::net::socket::RecvFromAddrBehavior;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use crate::syscall::user_access::UserBufferWriter;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -166,6 +168,19 @@ pub(super) fn do_recvfrom(
     // Linux 语义：recvfrom 的 addr/addrlen 是纯输出参数，内核不得读取 addr 缓冲区内容。
     // 用户栈上的 sockaddr 可能是未初始化的；读取它会导致错误解析并返回 EINVAL。
     // recv() passes NULL for both addr and addr_len, which is valid.
+
+    // Linux/gVisor 语义：某些 socket（如 TCP/SOCK_STREAM）会忽略源地址输出参数。
+    // 具体行为由 socket 自身决定，避免在 syscall 层做类型特判。
+    if socket.recvfrom_addr_behavior() == RecvFromAddrBehavior::Ignore {
+        let n = socket.recv(buf, pmsg_flags)?;
+        // 若用户提供了 addrlen，则写回 0；不得写 addr（gVisor 会检查 sockaddr_storage 保持全 0）。
+        if !addr_len.is_null() {
+            let mut writer = UserBufferWriter::new(addr_len, core::mem::size_of::<u32>(), true)?;
+            let mut addrlen_buf = writer.buffer_protected(0)?;
+            addrlen_buf.write_one::<u32>(0, &0u32)?;
+        }
+        return Ok(n);
+    }
 
     let (recv_len, endpoint) = socket.recv_from(buf, pmsg_flags, None)?;
 

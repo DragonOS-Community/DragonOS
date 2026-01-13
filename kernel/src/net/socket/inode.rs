@@ -4,7 +4,7 @@ use crate::{
         fasync::FAsyncItem, file::File, FilePrivateData, FileType, IndexNode, InodeMode, Metadata,
         PollableInode,
     },
-    libs::spinlock::SpinLockGuard,
+    libs::mutex::MutexGuard,
     net::posix::SockAddrIn,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
@@ -285,7 +285,7 @@ fn handle_siocgifconf(data: usize) -> Result<usize, SystemError> {
 impl<T: Socket + 'static> IndexNode for T {
     fn open(
         &self,
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
         _: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         match &*data {
@@ -297,7 +297,7 @@ impl<T: Socket + 'static> IndexNode for T {
         }
     }
 
-    fn close(&self, _: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // Only tear down the socket on the final close.
         if self.open_file_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
             self.do_close()
@@ -311,7 +311,7 @@ impl<T: Socket + 'static> IndexNode for T {
         _: usize,
         _: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // Drop the lock guard before calling self.read() to avoid holding the lock
         // across a potentially blocking or reentrant operation. This prevents deadlocks
@@ -325,15 +325,15 @@ impl<T: Socket + 'static> IndexNode for T {
         _offset: usize,
         _len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if buf.is_empty() {
-            log::debug!(
-                "Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}",
-                buf.len(),
-                _len
-            );
-        }
+        // if buf.is_empty() {
+        //     log::debug!(
+        //         "Socket write_at: ZERO-LENGTH write, buf.len()={}, _len={}",
+        //         buf.len(),
+        //         _len
+        //     );
+        // }
         drop(data);
         self.write(buf)
     }
@@ -386,7 +386,7 @@ impl<T: Socket + 'static> IndexNode for T {
             SIOCGIFINDEX => handle_siocgifindex(data),
             FIONREAD /* TIOCINQ */ => {
                 // Get number of bytes available to read
-                let bytes_available = self.recv_bytes_available()?;
+                let bytes_available = self.recv_bytes_available();
                 let mut writer =
                     UserBufferWriter::new(data as *mut u8, core::mem::size_of::<i32>(), true)?;
                 let to_write = core::cmp::min(bytes_available, i32::MAX as usize) as i32;

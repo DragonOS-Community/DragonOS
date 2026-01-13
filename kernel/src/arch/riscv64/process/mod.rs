@@ -1,3 +1,4 @@
+use crate::libs::spinlock::SpinLockGuard;
 use alloc::sync::{Arc, Weak};
 use core::{
     arch::asm,
@@ -16,7 +17,6 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
         fork::{CloneFlags, KernelCloneArgs},

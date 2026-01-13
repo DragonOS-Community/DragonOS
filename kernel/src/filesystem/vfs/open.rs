@@ -362,6 +362,48 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     return r;
 }
 
+/// 为exec打开可执行文件
+///
+/// 这个函数复用do_sys_openat2的路径解析和权限检查逻辑，
+/// 返回Arc<File>和文件描述符，并将文件加入fd table。
+///
+/// ## 参数
+/// - `dirfd`: 目录文件描述符
+/// - `path`: 文件路径
+///
+/// ## 返回值
+/// - `Ok((Arc<File>, i32))`: 成功打开的文件和分配的文件描述符
+/// - `Err(SystemError)`: 错误
+pub fn do_open_execat(dirfd: i32, path: &str) -> Result<Arc<File>, SystemError> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
+    let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+    let inode = inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
+    let metadata = inode.metadata()?;
+    let file_type = metadata.file_type;
+
+    // 必须是普通文件
+    if file_type != FileType::File {
+        return Err(SystemError::EACCES);
+    }
+
+    // 检查执行权限
+    let cred = ProcessManager::current_pcb().cred();
+    cred.inode_permission(&metadata, PermissionMask::MAY_EXEC.bits())?;
+
+    // 同时需要读权限（用于读取ELF内容）
+    cred.inode_permission(&metadata, PermissionMask::MAY_READ.bits())?;
+
+    // 创建File对象，使用O_RDONLY | O_CLOEXEC
+    let file = File::new(inode, FileFlags::O_RDONLY | FileFlags::O_CLOEXEC)?;
+
+    Ok(Arc::new(file))
+}
+
 /// On Linux, futimens() is a library function implemented on top of
 /// the utimensat() system call.  To support this, the Linux
 /// utimensat() system call implements a nonstandard feature: if

@@ -1,4 +1,5 @@
 pub mod align;
+pub mod byte_parser;
 pub mod casting;
 pub mod cpumask;
 pub mod elf;

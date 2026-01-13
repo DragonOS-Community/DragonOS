@@ -36,7 +36,7 @@ use crate::{
         },
     },
     init::initcall::INITCALL_DEVICE,
-    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
+    libs::{mutex::MutexGuard, rwlock::RwLock},
     mm::VirtAddr,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
@@ -221,7 +221,7 @@ impl PollableInode for TtyDevice {
 impl IndexNode for TtyDevice {
     fn open(
         &self,
-        mut data: SpinLockGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
@@ -298,7 +298,7 @@ impl IndexNode for TtyDevice {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.flags)
@@ -340,7 +340,7 @@ impl IndexNode for TtyDevice {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let mut count = len;
         let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
@@ -424,7 +424,7 @@ impl IndexNode for TtyDevice {
         None
     }
 
-    fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         let (tty, _flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.flags)
         } else {

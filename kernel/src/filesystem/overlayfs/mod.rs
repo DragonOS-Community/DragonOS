@@ -269,7 +269,7 @@ impl IndexNode for OvlInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             return upper_inode.read_at(offset, len, buf, data);
@@ -287,7 +287,7 @@ impl IndexNode for OvlInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if (*self.upper_inode.lock()).is_none() {
             self.copy_up()?;

@@ -13,13 +13,12 @@ use system_error::SystemError;
 
 use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 use crate::{
-    driver::base::device::device_number::DeviceNumber,
-    driver::block::loop_device::LoopDevice,
+    driver::{base::device::device_number::DeviceNumber, block::loop_device::LoopDevice},
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         vfs::{utils::DName, IndexNode, InodeMode, Metadata},
     },
-    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
+    libs::{mutex::MutexGuard, rwlock::RwLock},
 };
 
 const MINORS_PER_DISK: u32 = 256;
@@ -225,7 +224,7 @@ impl IndexNode for GenDisk {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len == 0 {
             return Ok(0);
@@ -241,7 +240,7 @@ impl IndexNode for GenDisk {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len == 0 {
             return Ok(0);
@@ -286,14 +285,14 @@ impl IndexNode for GenDisk {
 
     fn close(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
     fn open(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())

@@ -11,6 +11,7 @@ use super::{
     },
 };
 use crate::filesystem::devfs::zero_dev::LockedZeroInode;
+use crate::libs::mutex::MutexGuard;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::{
@@ -18,6 +19,7 @@ use crate::{
     filesystem::vfs::{mount::MountFlags, produce_fs},
     libs::{
         casting::DowncastArc,
+        mutex::Mutex,
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -439,7 +441,7 @@ impl LockedDevFSInode {
         new_inode
             .downcast_ref::<LockedDevFSInode>()
             .unwrap()
-            .write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
+            .write_at(0, len, buf, Mutex::new(FilePrivateData::Unused).lock())?;
         Ok(())
     }
 
@@ -516,13 +518,13 @@ impl IndexNode for LockedDevFSInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -668,7 +670,7 @@ impl IndexNode for LockedDevFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let meta = self.metadata()?;
         match meta.file_type {
@@ -710,7 +712,7 @@ impl IndexNode for LockedDevFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let meta = self.metadata()?;
         match meta.file_type {

@@ -238,9 +238,9 @@ impl crate::net::socket::Socket for RawSocket {
         }
     }
 
-    fn recv_bytes_available(&self) -> Result<usize, SystemError> {
+    fn recv_bytes_available(&self) -> usize {
         let guard = self.inner.read();
-        Ok(match *guard {
+        match *guard {
             Some(RawInner::Wildcard(ref bound)) => {
                 bound.with_mut_socket(|socket| match socket.peek() {
                     Ok(payload) => payload.len(),
@@ -254,7 +254,7 @@ impl crate::net::socket::Socket for RawSocket {
                 })
             }
             _ => 0,
-        })
+        }
     }
 
     fn send_bytes_available(&self) -> Result<usize, SystemError> {

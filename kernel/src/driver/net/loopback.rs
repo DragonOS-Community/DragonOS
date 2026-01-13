@@ -8,6 +8,7 @@ use crate::driver::base::kobject::{
 };
 use crate::driver::base::kset::KSet;
 use crate::driver::net::types::InterfaceFlags;
+use crate::driver::net::{napi::napi_schedule, napi::NapiStruct};
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
@@ -91,11 +92,12 @@ impl phy::TxToken for LoopbackTxToken {
         }
 
         // Linux 语义：lo 发送应尽快在本地“收到”并分发给 socket。
-        // smoltcp 的 poll() 在一次调用内先处理 receive 再处理 transmit，
-        // 因此本次 transmit 入队的数据需要下一次 poll 才会被处理。
-        // 这里唤醒 netns 轮询线程，保证下一次 poll 能及时发生，避免用户态 poll(-1) 卡死。
+        // 优先走 NAPI schedule（bounded work），避免唤醒 netns 线程去做全量扫描。
         if let Some(iface) = self.driver.iface() {
-            if let Some(netns) = iface.common().net_namespace() {
+            if let Some(napi) = iface.napi_struct() {
+                napi_schedule(napi);
+            } else if let Some(netns) = iface.common().net_namespace() {
+                // 兼容兜底：若未配置 NAPI，则仍唤醒 netns 线程推进一次 poll。
                 netns.wakeup_poll_thread();
             }
         }
@@ -250,17 +252,26 @@ impl phy::Device for LoopbackDriver {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let buffer = self.inner.lock().loopback_receive();
-        //receive队列为为空，返回NONE值以通知上层没有可以receive的包
-        if buffer.is_empty() {
-            return Option::None;
+        loop {
+            let buffer = self.inner.lock().loopback_receive();
+            // receive 队列为空，返回 None 以通知上层没有可以 receive 的包
+            if buffer.is_empty() {
+                return None;
+            }
+
+            if let Some(iface) = self.iface() {
+                if iface.should_drop_rx_packet(&buffer) {
+                    // Drop this packet and try the next one in the queue.
+                    continue;
+                }
+            }
+
+            let rx = LoopbackRxToken { buffer };
+            let tx = LoopbackTxToken {
+                driver: self.clone(),
+            };
+            return Some((rx, tx));
         }
-        // log::debug!("LoopbackDriver::receive() -> packet {} bytes", buffer.len());
-        let rx = LoopbackRxToken { buffer };
-        let tx = LoopbackTxToken {
-            driver: self.clone(),
-        };
-        return Option::Some((rx, tx));
     }
     /// ## Loopback驱动处理发送数据包事件
     /// Loopback驱动在需要发送数据时会调用这个函数来获取一个发送令牌。
@@ -404,6 +415,10 @@ impl LoopbackInterface {
             .driver
             .force_get_mut()
             .set_iface(Arc::downgrade(&iface_dyn));
+
+        // 设置 NAPI：让 loopback 也走 bounded poll（对齐 Linux）。
+        let napi_struct = NapiStruct::new(iface.clone(), 10);
+        *iface.common.napi_struct.write() = Some(napi_struct);
 
         iface
     }
@@ -558,6 +573,14 @@ impl Iface for LoopbackInterface {
 
     fn poll(&self) -> bool {
         self.common.poll(self.driver.force_get_mut())
+    }
+
+    fn poll_napi(&self, budget: usize) -> bool {
+        self.common.poll_napi(self.driver.force_get_mut(), budget)
+    }
+
+    fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {
+        self.common.should_drop_rx_packet(packet)
     }
 
     fn addr_assign_type(&self) -> u8 {

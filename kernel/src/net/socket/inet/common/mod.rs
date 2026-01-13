@@ -42,22 +42,7 @@ impl BoundInner {
         T: smoltcp::socket::AnySocket<'static>,
     {
         if address.is_unspecified() {
-            let Some(iface) = netns.default_iface() else {
-                return Err(SystemError::ENODEV);
-            };
-            // 强绑VirtualIO
-            // let iface = NET_DEVICES
-            //     .read_irqsave()
-            //     .iter()
-            //     .find_map(|(_, v)| {
-            //         if v.common().is_default_iface() {
-            //             Some(v.clone())
-            //         } else {
-            //             None
-            //         }
-            //     })
-            //     .expect("No default interface");
-
+            let iface = select_iface_for_unspecified(address, &netns)?;
             let handle = iface.sockets().lock().add(socket);
             return Ok(Self {
                 handle,
@@ -143,8 +128,17 @@ impl BoundInner {
         &self.iface
     }
 
+    #[inline]
+    pub fn handle(&self) -> smoltcp::iface::SocketHandle {
+        self.handle
+    }
+
     pub fn release(&self) {
         self.iface.sockets().lock().remove(self.handle);
+    }
+
+    pub fn into_socket(self) -> smoltcp::socket::Socket<'static> {
+        self.iface.sockets().lock().remove(self.handle)
     }
 
     pub fn netns(&self) -> Arc<NetNamespace> {
@@ -157,28 +151,11 @@ pub fn get_iface_to_bind(
     ip_addr: &smoltcp::wire::IpAddress,
     netns: Arc<NetNamespace>,
 ) -> Option<Arc<dyn Iface>> {
-    // log::debug!("get_iface_to_bind: {:?}", ip_addr);
-    // if ip_addr.is_unspecified()
-    let result = netns
+    netns
         .device_list()
         .iter()
-        .find(|(_, iface)| {
-            let guard = iface.smol_iface().lock();
-            // log::debug!(
-            //     "  checking iface: {}, ip: {:?}, has_addr={}",
-            //     iface.iface_name(),
-            //     guard.ip_addrs(),
-            //     guard.has_ip_addr(*ip_addr)
-            // );
-            return guard.has_ip_addr(*ip_addr);
-        })
-        .map(|(_, iface)| iface.clone());
-
-    // log::debug!(
-    //     "get_iface_to_bind: returning iface {:?}",
-    //     result.as_ref().map(|i| i.iface_name())
-    // );
-    result
+        .find(|(_, iface)| iface.smol_iface().lock().has_ip_addr(*ip_addr))
+        .map(|(_, iface)| iface.clone())
 }
 
 /// Get a suitable iface to deal with sendto/connect request if the socket is not bound to an iface.
@@ -211,4 +188,48 @@ fn get_ephemeral_iface(
             })
         })
         .expect("No network interface")
+}
+
+/// Select a suitable network interface for binding to an unspecified address.
+///
+/// Selection logic (in priority order):
+/// 1. Use the explicitly set default interface
+/// 2. Find an interface with a matching address family (IPv6 socket -> interface with IPv6 address)
+/// 3. Fall back to the first available interface
+fn select_iface_for_unspecified(
+    address: &smoltcp::wire::IpAddress,
+    netns: &Arc<NetNamespace>,
+) -> Result<Arc<dyn Iface>, SystemError> {
+    // 1. Prefer explicitly configured default interface
+    if let Some(iface) = netns.default_iface() {
+        return Ok(iface);
+    }
+
+    // 2. Find interface with matching address family
+    let device_list = netns.device_list();
+    for (_nic_id, iface) in device_list.iter() {
+        let smol_iface = iface.smol_iface().lock();
+        let has_matching_family = smol_iface.ip_addrs().iter().any(|cidr| {
+            matches!(
+                (address, cidr.address()),
+                (
+                    smoltcp::wire::IpAddress::Ipv6(_),
+                    smoltcp::wire::IpAddress::Ipv6(_)
+                ) | (
+                    smoltcp::wire::IpAddress::Ipv4(_),
+                    smoltcp::wire::IpAddress::Ipv4(_)
+                )
+            )
+        });
+        if has_matching_family {
+            return Ok(iface.clone());
+        }
+    }
+
+    // 3. Fall back to first available interface
+    device_list
+        .values()
+        .next()
+        .cloned()
+        .ok_or(SystemError::ENODEV)
 }

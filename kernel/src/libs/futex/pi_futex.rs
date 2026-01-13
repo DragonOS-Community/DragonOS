@@ -367,12 +367,7 @@ impl Futex {
             } else {
                 current_tid
             };
-            match atomic_futex.compare_exchange(
-                uval,
-                new_val,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match atomic_futex.compare_exchange(uval, new_val, Ordering::SeqCst, Ordering::SeqCst) {
                 Ok(_) => Ok(0),
                 Err(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             }

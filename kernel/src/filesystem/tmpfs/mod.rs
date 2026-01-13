@@ -203,19 +203,22 @@ impl TmpfsMountData {
         let mut size_bytes = None;
 
         if let Some(raw) = raw {
-            for opt in raw.split(',').filter(|s| !s.is_empty()) {
-                if let Some(v) = opt.strip_prefix("mode=") {
+            for opt in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if let Some(v) = opt.strip_prefix("mode=").map(|s| s.trim()) {
+                    // mode 参数按八进制解析（mount 的习惯用法，如 755 = rwxr-xr-x）
                     let parsed = u32::from_str_radix(v, 8).map_err(|_| SystemError::EINVAL)?;
                     mode = InodeMode::from_bits_truncate(parsed);
-                } else if let Some(v) = opt.strip_prefix("size=") {
-                    let (num_str, mul) = if let Some(s) = v.strip_suffix('G') {
+                } else if let Some(v) = opt.strip_prefix("size=").map(|s| s.trim()) {
+                    // 支持大小写后缀：g/G, m/M, k/K
+                    let v_lower = v.to_lowercase();
+                    let (num_str, mul) = if let Some(s) = v_lower.strip_suffix('g') {
                         (s, 1u64 << 30)
-                    } else if let Some(s) = v.strip_suffix('M') {
+                    } else if let Some(s) = v_lower.strip_suffix('m') {
                         (s, 1u64 << 20)
-                    } else if let Some(s) = v.strip_suffix('K') {
+                    } else if let Some(s) = v_lower.strip_suffix('k') {
                         (s, 1u64 << 10)
                     } else {
-                        (v, 1u64)
+                        (&v_lower[..], 1u64)
                     };
                     let base = num_str.parse::<u64>().map_err(|_| SystemError::EINVAL)?;
                     size_bytes = Some(base.saturating_mul(mul));

@@ -77,7 +77,6 @@ pub struct AddressSpace {
     /// 用于在调度器上下文中快速切换页表，无需获取RwSem锁
     table_paddr: PhysAddr,
     /// 使用RwSem而非RwLock，因为地址空间操作可能需要进行I/O（如页缺失时的文件读取）
-    /// RwSem支持睡眠等待，不会禁用抢占，从而避免在持锁时进行BIO导致死锁
     inner: RwSem<InnerAddressSpace>,
 }
 
@@ -100,13 +99,11 @@ impl AddressSpace {
         self.id
     }
 
-    /// 将此地址空间的页表设置为当前页表（无锁）
-    ///
-    /// 此方法用于调度器上下文中的快速页表切换，无需获取RwSem锁。
-    /// 安全性由调用者保证：只在进程切换时使用。
+    /// 获取页表物理地址（无锁访问）
+    /// 用于在调度器上下文中快速切换页表
     #[inline(always)]
-    pub unsafe fn make_current(&self) {
-        MMArch::set_table(PageTableKind::User, self.table_paddr);
+    pub fn table_paddr(&self) -> PhysAddr {
+        self.table_paddr
     }
 
     /// 从pcb中获取当前进程的地址空间结构体的Arc指针
@@ -126,6 +123,15 @@ impl AddressSpace {
             return Arc::ptr_eq(&current, self);
         }
         return false;
+    }
+
+    /// 将此地址空间的页表设置为当前页表（无锁）
+    ///
+    /// 此方法用于调度器上下文中的快速页表切换，无需获取RwSem锁。
+    /// 安全性由调用者保证：只在进程切换时使用。
+    #[inline(always)]
+    pub unsafe fn make_current(&self) {
+        MMArch::set_table(PageTableKind::User, self.table_paddr);
     }
 }
 
@@ -1635,8 +1641,7 @@ impl LockedVMA {
         let mut guard = self.write();
 
         // 获取物理页的anon_vma的守卫
-        let mut page_manager_guard: RwSemWriteGuard<'_, crate::mm::page::PageManager> =
-            page_manager_lock();
+        let mut page_manager_guard = page_manager_lock();
 
         // 获取映射的物理地址
         if let Some((paddr, _flags)) = mapper.translate(guard.region().start()) {

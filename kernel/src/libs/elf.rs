@@ -36,7 +36,7 @@ use crate::{
     syscall::user_access::{clear_user, copy_to_user},
 };
 
-use super::rwsem::RwSemWriteGuard;
+use crate::libs::rwsem::RwSemWriteGuard;
 
 // 存放跟架构相关的Elf属性，
 pub trait ElfArch: Clone + Copy + Debug {

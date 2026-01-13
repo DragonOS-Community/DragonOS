@@ -6,7 +6,7 @@ use kdepends::thingbuf::StaticThingBuf;
 use crate::{
     arch::CurrentIrqArch,
     driver::tty::virtual_terminal::vc_manager,
-    exception::tasklet::{tasklet_schedule, Tasklet},
+    exception::tasklet::{tasklet_schedule, Tasklet, TaskletData},
     exception::InterruptArch,
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
@@ -22,7 +22,7 @@ static mut TTY_REFRESH_THREAD: Option<Arc<ProcessControlBlock>> = None;
 
 lazy_static! {
     /// TTY RX tasklet，用于在 softirq 上下文中处理 TTY 输入
-    static ref TTY_RX_TASKLET: Arc<Tasklet> = Tasklet::new(tty_rx_tasklet_fn, 0);
+    static ref TTY_RX_TASKLET: Arc<Tasklet> = Tasklet::new(tty_rx_tasklet_fn, 0, None);
 }
 
 pub(super) fn tty_flush_thread_init() {
@@ -66,7 +66,7 @@ fn tty_refresh_thread() -> i32 {
     }
 }
 
-fn tty_rx_tasklet_fn(_data: usize) {
+fn tty_rx_tasklet_fn(_data: usize, _data_obj: Option<Arc<dyn TaskletData>>) {
     // 在 softirq/tasklet 上下文：不做 drain，只负责唤醒线程去处理输入。
     if unsafe { TTY_REFRESH_THREAD.is_none() } {
         return;

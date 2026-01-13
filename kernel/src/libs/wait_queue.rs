@@ -1,9 +1,15 @@
-// #![allow(dead_code)]
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Wait Queue implementation with wait_until as the core primitive.
+//
+// The wait_until family returns Option<R>, allowing direct return of acquired resources.
+// The wait_event family (returning bool) is implemented on top of wait_until for compatibility.
+
 use core::{
     intrinsics::unlikely,
     marker::PhantomData,
     mem,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU8, Ordering},
 };
 
 use alloc::{
@@ -20,7 +26,7 @@ use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch},
     exception::InterruptArch,
     libs::mutex::MutexGuard,
-    process::{ProcessControlBlock, ProcessManager, ProcessState},
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     sched::{schedule, SchedMode},
     time::{
         timer::{next_n_us_timer_jiffies, Timer},
@@ -52,7 +58,7 @@ pub struct Waiter {
 /// 可跨 CPU/线程共享的唤醒器
 #[derive(Debug)]
 pub struct Waker {
-    has_woken: AtomicBool,
+    state: AtomicU8,
     target: Weak<ProcessControlBlock>,
 }
 
@@ -90,76 +96,144 @@ impl WaitQueue {
         self.num_waiters.fetch_add(0, Ordering::Acquire) == 0
     }
 
-    /// 可中断等待条件成立；`before_sleep` 在入队后、睡眠前执行（用于解锁等操作）
-    pub fn wait_event_interruptible<F, B>(
-        &self,
-        cond: F,
-        before_sleep: Option<B>,
-    ) -> Result<(), SystemError>
+    // ==================== Core API: wait_until family ====================
+
+    /// Waits until condition returns `Some(R)` (signals are ignored; use
+    /// `wait_until_interruptible` for signal-aware waits).
+    ///
+    /// This is the core waiting primitive. The condition closure is called repeatedly
+    /// until it returns `Some(_)`. The waker is registered BEFORE checking the condition
+    /// to avoid missed wakeups.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Directly acquire a lock guard without race condition
+    /// let guard = queue.wait_until(|| mutex.try_lock());
+    /// ```
+    #[track_caller]
+    pub fn wait_until<F, R>(&self, cond: F) -> R
     where
-        F: FnMut() -> bool,
-        B: FnMut(),
+        F: FnMut() -> Option<R>,
     {
-        self.wait_event_with_timeout_impl(cond, before_sleep, true, None)
+        self.wait_until_impl(cond, false, None, None::<fn()>)
+            .unwrap()
     }
 
-    /// 不可中断等待条件成立
-    pub fn wait_event_uninterruptible<F, B>(
-        &self,
-        cond: F,
-        before_sleep: Option<B>,
-    ) -> Result<(), SystemError>
+    /// Waits until condition returns `Some(R)` (interruptible by signals).
+    ///
+    /// Returns `Err(ERESTARTSYS)` if interrupted by a signal.
+    #[track_caller]
+    pub fn wait_until_interruptible<F, R>(&self, cond: F) -> Result<R, SystemError>
     where
-        F: FnMut() -> bool,
-        B: FnMut(),
+        F: FnMut() -> Option<R>,
     {
-        self.wait_event_with_timeout_impl(cond, before_sleep, false, None)
+        self.wait_until_impl(cond, true, None, None::<fn()>)
     }
 
-    fn wait_event_with_timeout_impl<F, B>(
+    /// Waits until condition returns `Some(R)` with timeout (interruptible).
+    ///
+    /// Returns:
+    /// - `Ok(R)` if condition satisfied
+    /// - `Err(ERESTARTSYS)` if interrupted by signal
+    /// - `Err(EAGAIN_OR_EWOULDBLOCK)` if timeout
+    #[track_caller]
+    pub fn wait_until_timeout<F, R>(&self, cond: F, timeout: Duration) -> Result<R, SystemError>
+    where
+        F: FnMut() -> Option<R>,
+    {
+        self.wait_until_impl(cond, true, Some(timeout), None::<fn()>)
+    }
+
+    /// Core implementation for all wait_until variants.
+    ///
+    /// Key design:
+    /// - Create only ONE waiter/waker pair
+    /// - Enqueue the waker BEFORE each condition check
+    /// - This ensures no wakeup is lost between check and sleep
+    fn wait_until_impl<F, R, B>(
         &self,
         mut cond: F,
-        mut before_sleep: Option<B>,
         interruptible: bool,
         timeout: Option<Duration>,
-    ) -> Result<(), SystemError>
+        mut before_sleep: Option<B>,
+    ) -> Result<R, SystemError>
     where
-        F: FnMut() -> bool,
+        F: FnMut() -> Option<R>,
         B: FnMut(),
     {
-        let deadline = timeout.map(|t| Instant::now() + t);
-        loop {
-            if cond() {
-                return Ok(());
-            }
+        // Fast path: check condition first
+        if let Some(res) = cond() {
+            return Ok(res);
+        }
 
+        let deadline = timeout.map(|t| Instant::now() + t);
+
+        // Create only ONE waiter/waker pair (key difference from old implementation)
+        let (waiter, waker) = Waiter::new_pair();
+
+        fn cancel_or_timeout<F, R>(
+            cond: &mut F,
+            waker: &Arc<Waker>,
+            err: SystemError,
+        ) -> Result<R, SystemError>
+        where
+            F: FnMut() -> Option<R>,
+        {
+            // Close to prevent a concurrent wake from being lost.
+            waker.close();
+            if let Some(res) = cond() {
+                return Ok(res);
+            }
+            Err(err)
+        }
+
+        loop {
+            // Check timeout
             if let Some(deadline) = deadline {
                 if Instant::now() >= deadline {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    self.remove_waker(&waker);
+                    return cancel_or_timeout(
+                        &mut cond,
+                        &waker,
+                        SystemError::EAGAIN_OR_EWOULDBLOCK,
+                    );
                 }
             }
 
-            let (waiter, waker) = Waiter::new_pair();
-            self.register_waker(waker.clone())?;
-
-            // 条件可能在入队后立即满足，直接摘掉
-            if cond() {
-                self.remove_waker(&waker);
-                return Ok(());
+            // Enqueue waker BEFORE checking condition (critical for correctness!)
+            // This ensures that if condition becomes true after our check,
+            // the subsequent wake_one() will find our waker in the queue.
+            if self.register_waker(waker.clone()).is_err() {
+                // Queue is dead, spin until condition is met
+                loop {
+                    if let Some(res) = cond() {
+                        return Ok(res);
+                    }
+                    core::hint::spin_loop();
+                }
             }
 
+            // Check condition AFTER enqueuing
+            if let Some(res) = cond() {
+                // Condition satisfied, remove waker and return
+                self.remove_waker(&waker);
+                return Ok(res);
+            }
+
+            // Check for pending signals (interruptible mode)
             if interruptible
                 && Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
             {
                 self.remove_waker(&waker);
-                return Err(SystemError::ERESTARTSYS);
+                return cancel_or_timeout(&mut cond, &waker, SystemError::ERESTARTSYS);
             }
 
+            // Execute before_sleep hook (e.g., release a lock)
             if let Some(ref mut hook) = before_sleep {
                 hook();
             }
 
-            // If there is a timeout, arm a timer that wakes this waiter.
+            // Setup timeout timer if needed
             let timer = if let Some(deadline) = deadline {
                 let remain = deadline
                     .duration_since(Instant::now())
@@ -179,10 +253,10 @@ impl WaitQueue {
                 None
             };
 
-            let wait_res = waiter.wait(interruptible);
+            // Wait to be woken
+            let wait_result = waiter.wait(interruptible);
 
-            // Timer cleanup: if it did not actually time out, cancel it.
-            // If it already timed out, cancellation may be ineffective and is unnecessary.
+            // Timer cleanup
             let was_timeout = timer.as_ref().map(|t| t.timeout()).unwrap_or(false);
             if !was_timeout {
                 if let Some(t) = timer {
@@ -190,22 +264,57 @@ impl WaitQueue {
                 }
             }
 
-            // Waker cleanup semantics:
-            // - no-timeout OK path: the waker is dequeued by the wakeup path (wake_one/wake_all/mark_dead)
-            // - timeout path: timer wakes via Waker::wake() and does NOT dequeue, so we must remove it
-            // - error path: must remove to avoid leaving stale wakers in the queue
-            if deadline.is_some() || wait_res.is_err() {
+            // Handle wait error (signal interruption)
+            if let Err(e) = wait_result {
                 self.remove_waker(&waker);
+                return cancel_or_timeout(&mut cond, &waker, e);
             }
 
-            match wait_res {
-                Ok(()) => {
-                    // 再次循环检查条件，处理伪唤醒
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
+            // Note: We do NOT check condition here without re-enqueuing!
+            // The loop will re-enqueue the waker and check condition again.
+            // This is critical: if we checked condition here and it returned None,
+            // and then someone called wake_one(), the wakeup would be lost because
+            // our waker was already popped by the previous wake.
         }
+    }
+
+    // ==================== Compatibility API: wait_event family ====================
+    // These are implemented on top of wait_until for backward compatibility.
+
+    /// 可中断等待条件成立；`before_sleep` 在入队后、睡眠前执行（用于解锁等操作）
+    pub fn wait_event_interruptible<F, B>(
+        &self,
+        mut cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.wait_until_impl(
+            || if cond() { Some(()) } else { None },
+            true,
+            None,
+            before_sleep,
+        )
+    }
+
+    /// 不可中断等待条件成立
+    pub fn wait_event_uninterruptible<F, B>(
+        &self,
+        mut cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.wait_until_impl(
+            || if cond() { Some(()) } else { None },
+            false,
+            None,
+            before_sleep,
+        )
     }
 
     /// 可中断等待条件成立，支持可选超时。
@@ -214,13 +323,18 @@ impl WaitQueue {
     /// - `timeout == Some(d)`：超时返回 `EAGAIN_OR_EWOULDBLOCK`
     pub fn wait_event_interruptible_timeout<F>(
         &self,
-        cond: F,
+        mut cond: F,
         timeout: Option<Duration>,
     ) -> Result<(), SystemError>
     where
         F: FnMut() -> bool,
     {
-        self.wait_event_with_timeout_impl(cond, None::<fn()>, true, timeout)
+        self.wait_until_impl(
+            || if cond() { Some(()) } else { None },
+            true,
+            timeout,
+            None::<fn()>,
+        )
     }
 
     /// 不可中断等待条件成立，支持可选超时。
@@ -229,13 +343,18 @@ impl WaitQueue {
     /// - `timeout == Some(d)`：超时返回 `EAGAIN_OR_EWOULDBLOCK`。
     pub fn wait_event_uninterruptible_timeout<F>(
         &self,
-        cond: F,
+        mut cond: F,
         timeout: Option<Duration>,
     ) -> Result<(), SystemError>
     where
         F: FnMut() -> bool,
     {
-        self.wait_event_with_timeout_impl(cond, None::<fn()>, false, timeout)
+        self.wait_until_impl(
+            || if cond() { Some(()) } else { None },
+            false,
+            timeout,
+            None::<fn()>,
+        )
     }
 
     /// `wait_event_interruptible_timeout` 的扩展版本：提供 `before_sleep` 钩子。
@@ -243,7 +362,7 @@ impl WaitQueue {
     /// 典型用途：入队后、睡眠前释放锁（避免持锁睡眠）。
     pub fn wait_event_interruptible_timeout_with<F, B>(
         &self,
-        cond: F,
+        mut cond: F,
         timeout: Option<Duration>,
         before_sleep: Option<B>,
     ) -> Result<(), SystemError>
@@ -251,12 +370,18 @@ impl WaitQueue {
         F: FnMut() -> bool,
         B: FnMut(),
     {
-        self.wait_event_with_timeout_impl(cond, before_sleep, true, timeout)
+        self.wait_until_impl(
+            || if cond() { Some(()) } else { None },
+            true,
+            timeout,
+            before_sleep,
+        )
     }
+
+    // ==================== Wakeup API ====================
 
     /// 唤醒一个等待者
     pub fn wakeup(&self, _state: Option<ProcessState>) -> bool {
-        // state 参数保留兼容位置（现阶段未再使用）
         self.wake_one()
     }
 
@@ -319,14 +444,16 @@ impl WaitQueue {
             self.num_waiters.store(0, Ordering::Release);
         }
         for w in drained {
-            w.close();
             w.wake();
+            w.close();
         }
     }
 
     pub fn len(&self) -> usize {
         self.num_waiters.fetch_add(0, Ordering::Acquire) as usize
     }
+
+    // ==================== Sleep with lock release ====================
 
     pub fn sleep_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) -> Result<(), SystemError> {
         before_sleep_check(1);
@@ -391,7 +518,7 @@ impl InnerWaitQueue {
 impl Waiter {
     pub fn new_pair() -> (Self, Arc<Waker>) {
         let waker = Arc::new(Waker {
-            has_woken: AtomicBool::new(false),
+            state: AtomicU8::new(Waker::STATE_IDLE),
             target: Arc::downgrade(&ProcessManager::current_pcb()),
         });
         let waiter = Waiter {
@@ -417,26 +544,113 @@ impl Drop for Waiter {
 }
 
 impl Waker {
-    #[inline]
+    const STATE_IDLE: u8 = 0;
+    const STATE_SLEEPING: u8 = 1;
+    const STATE_NOTIFIED: u8 = 2;
+    const STATE_CLOSED: u8 = 3;
+
     pub fn wake(&self) -> bool {
-        if self.has_woken.swap(true, Ordering::Release) {
-            return false;
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            match state {
+                Self::STATE_CLOSED | Self::STATE_NOTIFIED => return false,
+                Self::STATE_IDLE => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            Self::STATE_IDLE,
+                            Self::STATE_NOTIFIED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                Self::STATE_SLEEPING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            Self::STATE_SLEEPING,
+                            Self::STATE_NOTIFIED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        if let Some(pcb) = self.target.upgrade() {
+                            let _ = ProcessManager::wakeup(&pcb);
+                        }
+                        return true;
+                    }
+                }
+                _ => core::hint::spin_loop(),
+            }
         }
-        if let Some(pcb) = self.target.upgrade() {
-            let _ = ProcessManager::wakeup(&pcb);
-        }
-        true
     }
 
     #[inline]
     pub fn close(&self) {
-        let _ = self.has_woken.swap(true, Ordering::Acquire);
+        self.state.store(Self::STATE_CLOSED, Ordering::Release);
     }
 
-    #[inline]
-    fn consume_wake(&self) -> bool {
-        self.has_woken.swap(false, Ordering::Acquire)
+    fn consume_notification(&self) -> bool {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            match state {
+                Self::STATE_NOTIFIED => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            Self::STATE_NOTIFIED,
+                            Self::STATE_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                Self::STATE_CLOSED => return true,
+                _ => return false,
+            }
+        }
     }
+
+    fn prepare_sleep(&self) -> WakerSleepState {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            match state {
+                Self::STATE_IDLE => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            Self::STATE_IDLE,
+                            Self::STATE_SLEEPING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return WakerSleepState::Sleeping;
+                    }
+                }
+                Self::STATE_SLEEPING => return WakerSleepState::Sleeping,
+                Self::STATE_NOTIFIED => return WakerSleepState::Notified,
+                Self::STATE_CLOSED => return WakerSleepState::Closed,
+                _ => core::hint::spin_loop(),
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WakerSleepState {
+    Sleeping,
+    Notified,
+    Closed,
 }
 
 fn before_sleep_check(max_preempt: usize) {
@@ -450,23 +664,40 @@ fn before_sleep_check(max_preempt: usize) {
     }
 }
 
-/// 统一封装“标记阻塞 + 调度 + 信号检查”，避免各调用点重复逻辑
+/// 统一封装"标记阻塞 + 调度 + 信号检查"，避免各调用点重复逻辑
 fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
     loop {
         // 快路径：被提前唤醒
-        if waiter.waker.consume_wake() {
+        if waiter.waker.consume_notification() {
             return Ok(());
         }
 
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-        // 再次检查“先唤后睡”窗口
-        if waiter.waker.consume_wake() {
-            drop(irq_guard);
-            return Ok(());
+        // Build a waiter/waker handshake to avoid lost wakeups.
+        match waiter.waker.prepare_sleep() {
+            WakerSleepState::Notified | WakerSleepState::Closed => {
+                drop(irq_guard);
+                return Ok(());
+            }
+            WakerSleepState::Sleeping => {}
         }
 
         ProcessManager::mark_sleep(interruptible)?;
+
+        // Handle a wake racing between prepare_sleep and mark_sleep.
+        if waiter.waker.consume_notification() {
+            let pcb = ProcessManager::current_pcb();
+            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+            if matches!(writer.state(), ProcessState::Blocked(_)) {
+                writer.set_state(ProcessState::Runnable);
+                writer.set_wakeup();
+            }
+            pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
+            drop(writer);
+            drop(irq_guard);
+            return Ok(());
+        }
         drop(irq_guard);
 
         schedule(SchedMode::SM_NONE);
@@ -562,7 +793,7 @@ impl EventWaitQueue {
 /// 用于定时器超时时唤醒等待队列中的 Waiter。
 /// 相比直接唤醒 PCB，通过 Waker 唤醒可以：
 /// 1. 与 Waiter::wait() 正确配合，避免竞态条件
-/// 2. 使用原子标志 has_woken 标记唤醒状态
+/// 2. 使用原子状态机标记唤醒/睡眠状态
 /// 3. 保持与等待队列机制的一致性
 #[derive(Debug)]
 pub struct TimeoutWaker {

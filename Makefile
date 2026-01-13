@@ -3,6 +3,7 @@ include env.mk
 
 
 export ROOT_PATH=$(shell pwd)
+export VMSTATE_DIR=$(ROOT_PATH)/bin/vmstate
 
 SUBDIRS = kernel user tools build-scripts
 
@@ -100,14 +101,43 @@ docs: ECHO
 clean-docs:
 	bash -c "cd docs && make clean && cd .."
 
-gdb:
-ifeq ($(ARCH), x86_64)
-	rust-gdb -n -x tools/.gdbinit
-else ifeq ($(ARCH), loongarch64)
-	loongarch64-unknown-linux-gnu-gdb -n -x tools/.gdbinit
-else
-	gdb-multiarch -n -x tools/.gdbinit
-endif
+gdb: check_arch
+	@if [ -f "$(VMSTATE_DIR)/gdb" ]; then \
+		GDB_PORT=$$(cat $(VMSTATE_DIR)/gdb); \
+		GDB_INIT_TMP=$$(mktemp); \
+		trap "rm -f $$GDB_INIT_TMP" EXIT; \
+		echo "连接到GDB端口: $$GDB_PORT"; \
+		sed "s/{{GDB_PORT}}/$$GDB_PORT/" tools/.gdbinit > "$$GDB_INIT_TMP"; \
+		if [ "$(ARCH)" = "x86_64" ]; then \
+			rust-gdb -n -x "$$GDB_INIT_TMP"; \
+		elif [ "$(ARCH)" = "loongarch64" ]; then \
+			loongarch64-unknown-linux-gnu-gdb -n -x "$$GDB_INIT_TMP"; \
+		else \
+			gdb-multiarch -n -x "$$GDB_INIT_TMP"; \
+		fi \
+	else \
+		echo "错误: VM未运行或GDB端口未分配"; \
+		echo "请先启动VM: make qemu"; \
+	fi
+
+# 获取VM状态信息
+get-vmstate:
+	@if [ -f "$(VMSTATE_DIR)/port" ]; then \
+		echo "网络端口: $$(cat $(VMSTATE_DIR)/port)"; \
+	else \
+		echo "网络端口: VM未运行"; \
+	fi
+	@if [ -f "$(VMSTATE_DIR)/pid" ]; then \
+		echo "进程PID: $$(cat $(VMSTATE_DIR)/pid)"; \
+	else \
+		echo "进程PID: VM未运行"; \
+	fi
+	@if [ -f "$(VMSTATE_DIR)/gdb" ]; then \
+		echo "GDB端口: $$(cat $(VMSTATE_DIR)/gdb)"; \
+	else \
+		echo "GDB端口: VM未运行"; \
+	fi
+
 
 # （nix）构建用户程序并生成磁盘镜像
 rootfs: check_nix
@@ -246,6 +276,12 @@ help:
 	@echo ""
 	@echo ""
 	@echo "注: 对于上述的run, run-uefi, qemu, qemu-uefi命令可以在命令后加上-vnc后缀,来通过vnc连接到DragonOS, 默认会在5900端口运行vnc服务器。如：make run-vnc "
+	@echo ""
+	@echo "VM状态管理:"
+	@echo "  make get-vmstate       - 获取VM状态（端口、PID、GDB端口）"
+	@echo ""
+	@echo "调试:"
+	@echo "  make gdb              - 启动GDB调试"
 	@echo ""
 	@echo "其他:"
 	@echo "  make clean            - 清理编译产生的文件"

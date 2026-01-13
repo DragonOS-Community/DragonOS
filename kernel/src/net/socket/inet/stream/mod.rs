@@ -12,6 +12,7 @@ use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, 
 use crate::time::syscall::PosixTimeval;
 
 mod constants;
+mod info;
 mod inner;
 mod option;
 pub use option::Options as TcpOption;
@@ -25,6 +26,7 @@ mod events;
 mod io;
 mod lifecycle;
 mod poll_util;
+mod shutdown;
 mod stream_core;
 
 pub use stream_core::TcpSocket;
@@ -150,7 +152,10 @@ impl Socket for TcpSocket {
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         if self.is_recv_shutdown() {
-            return Ok(0);
+            let limit = self.recv_shutdown.limit();
+            if limit == 0 {
+                return Ok(0);
+            }
         }
 
         if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {

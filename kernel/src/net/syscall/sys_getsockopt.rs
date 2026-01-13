@@ -156,12 +156,11 @@ pub(super) fn do_getsockopt(
                 let need = core::mem::size_of::<u32>();
                 let out_len = calc_out_len(optval, user_len, need);
 
-                if !optval.is_null() {
+                if !optval.is_null() && out_len != 0 {
                     let value = socket.send_buffer_size() as u32;
+                    let bytes = value.to_ne_bytes();
                     let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
-                    optval_writer
-                        .buffer_protected(0)?
-                        .write_one::<u32>(0, &value)?;
+                    optval_writer.copy_to_user_protected(&bytes[..out_len], 0)?;
                 }
 
                 // 写回实际需要的长度
@@ -176,12 +175,11 @@ pub(super) fn do_getsockopt(
                 let need = core::mem::size_of::<u32>();
                 let out_len = calc_out_len(optval, user_len, need);
 
-                if !optval.is_null() {
+                if !optval.is_null() && out_len != 0 {
                     let value = socket.recv_buffer_size() as u32;
+                    let bytes = value.to_ne_bytes();
                     let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
-                    optval_writer
-                        .buffer_protected(0)?
-                        .write_one::<u32>(0, &value)?;
+                    optval_writer.copy_to_user_protected(&bytes[..out_len], 0)?;
                 }
 
                 // 写回实际需要的长度
@@ -199,7 +197,7 @@ pub(super) fn do_getsockopt(
                 let written = socket.option(level, optname, &mut kbuf)?;
                 let out_len = calc_out_len(optval, user_len, written);
 
-                if !optval.is_null() {
+                if !optval.is_null() && out_len != 0 {
                     let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
                     optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
                 }
@@ -235,7 +233,7 @@ pub(super) fn do_getsockopt(
         let written = socket.option(level, optname, &mut kbuf)?;
         let out_len = calc_out_len(optval, user_len, written);
 
-        if !optval.is_null() {
+        if !optval.is_null() && out_len != 0 {
             let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
             optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
         }

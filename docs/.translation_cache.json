@@ -318,7 +318,7 @@
     "hash": "11140afc1e5daa1667d40cae29a80b9a"
   },
   "en:kernel/sched/wait_queue.md": {
-    "hash": "550f38b4386c3755535e99e97bc98243"
+    "hash": "7f2cbdebf5531ed7c641986f909a084e"
   },
   "en:agents/release_agent_capability.md": {
     "hash": "6c10917f7e05f9a0c5d75c7bbed4bc71"
@@ -354,18 +354,21 @@
     "hash": "b0b020398fb048e2c87135e3bb2974b3"
   },
   "en:kernel/locking/rwsem.md": {
-    "hash": "f19bd3e7ace9536b7e5c49fb4a6163e1"
+    "hash": "8728e5478056362db9deca9b27089be1"
   },
   "en:kernel/sched/fifo.md": {
     "hash": "7193f93fd9af38c8b7d2ad0ad9453ce5"
   },
   "en:kernel/interrupt/index.rst": {
-    "hash": "13d79d4b53fd664cf72b95b279efcb75"
+    "hash": "5a42df4211e7c59aba311c9523bd529d"
   },
   "en:kernel/interrupt/workqueue.md": {
     "hash": "930d4d0eefeb4c4f01ec2a93a2a1b9ad"
   },
   "en:kernel/net/napi_and_netns_poll.md": {
     "hash": "04ae3378b43189a4e61226612f66f9ab"
+  },
+  "en:kernel/interrupt/tasklet.md": {
+    "hash": "254da75179ebb9f39cd9b562486fb122"
   }
 }

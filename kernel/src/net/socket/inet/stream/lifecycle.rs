@@ -117,8 +117,9 @@ impl TcpSocket {
                 match init {
                     inner::Init::Bound((bound, local)) if local == remote_endpoint => {
                         // Capture an effective queue capacity from the underlying socket's recv buffer.
-                        let rx_cap =
-                            bound.with::<smoltcp::socket::tcp::Socket, _, _>(|s| s.recv_capacity());
+                        let rx_cap = bound
+                            .with::<smoltcp::socket::tcp::Socket, _, _>(|s| s.recv_capacity())
+                            .clamp(1 << 20, super::constants::MAX_SOCKET_BUFFER);
                         (
                             inner::Inner::SelfConnected(inner::SelfConnected::new(
                                 bound, local, rx_cap,
@@ -248,6 +249,18 @@ impl TcpSocket {
             return Err(SystemError::EINVAL);
         }
 
+        if how.contains(ShutdownBit::SHUT_WR) {
+            if let Err(e) = self.flush_cork_buffer() {
+                if e == SystemError::EAGAIN_OR_EWOULDBLOCK {
+                    // Defer FIN until cork-buffered bytes are flushed into the TCP stack.
+                    self.send_fin_deferred
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+
         let mut post_poll_iface: Option<Arc<dyn crate::net::Iface>> = None;
         let mut post_poll_rounds: usize = 0;
 
@@ -267,8 +280,20 @@ impl TcpSocket {
                     return Err(SystemError::ENOTCONN);
                 }
 
+                if how.contains(ShutdownBit::SHUT_RD) {
+                    let queued = established.with(|socket| socket.recv_queue());
+                    self.recv_shutdown.init(queued);
+                }
+
                 if how.contains(ShutdownBit::SHUT_WR) {
-                    established.with_mut(|socket| socket.close());
+                    if self
+                        .send_fin_deferred
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                    {
+                        // FIN will be sent once cork-buffered bytes are flushed.
+                    } else {
+                        established.with_mut(|socket| socket.close());
+                    }
                     post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
                     post_poll_iface = Some(established.iface().clone());
                 }
@@ -352,6 +377,10 @@ impl TcpSocket {
                 // - SHUT_WR: subsequent send() returns EPIPE; recv() returns EOF once queue drains.
                 // - SHUT_RD: subsequent recv() returns 0.
                 // No smoltcp close/abort is needed.
+                if how.contains(ShutdownBit::SHUT_RD) {
+                    let queued = sc.recv_queue();
+                    self.recv_shutdown.init(queued);
+                }
                 (inner::Inner::SelfConnected(sc), how)
             }
             other => {

@@ -14,7 +14,7 @@
 
 use alloc::vec::Vec;
 
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket,
 };
@@ -30,16 +30,16 @@ struct TcpListenPortInfo {
     listen_socket_present: bool,
 }
 
-/// 每个 Iface 维护一份 listener/backlog 状态，用于收包入口的“是否丢 SYN”决策。
+/// 每个 Iface 维护一份 listener/backlog 状态，用于收包入口的"是否丢 SYN"决策。
 #[derive(Debug)]
 pub struct TcpListenerBacklog {
-    ports: RwLock<Vec<TcpListenPortInfo>>,
+    ports: RwSem<Vec<TcpListenPortInfo>>,
 }
 
 impl TcpListenerBacklog {
     pub fn new() -> Self {
         Self {
-            ports: RwLock::new(Vec::new()),
+            ports: RwSem::new(Vec::new()),
         }
     }
 

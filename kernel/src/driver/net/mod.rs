@@ -6,7 +6,7 @@ use sysfs::netdev_register_kobject;
 
 use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};
-use crate::libs::rwlock::RwLockReadGuard;
+use crate::libs::rwsem::RwSemReadGuard;
 use crate::net::routing::RouterEnableDeviceCommon;
 use crate::net::socket::packet::PacketSocket;
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -556,7 +556,7 @@ impl IfaceCommon {
         self.smol_iface.lock().ipv4_addr()
     }
 
-    pub fn ip_addrs(&self) -> RwLockReadGuard<'_, Vec<smoltcp::wire::IpCidr>> {
+    pub fn ip_addrs(&self) -> RwSemReadGuard<'_, Vec<smoltcp::wire::IpCidr>> {
         self.router_common_data.ip_addrs.read()
     }
 

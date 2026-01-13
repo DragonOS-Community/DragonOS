@@ -12,7 +12,7 @@
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 
-use crate::libs::spinlock::SpinLock;
+use crate::libs::mutex::Mutex;
 use crate::net::socket::inet::common::PortManager;
 use crate::net::socket::inet::InetSocket;
 use crate::net::socket::inet::Types;
@@ -33,13 +33,13 @@ struct ClosingTcpSocket {
 /// 延迟回收 TCP sockets：close(fd) 后不立刻从 SocketSet 移除，等状态机 Closed 再回收。
 #[derive(Debug)]
 pub struct TcpCloseDefer {
-    closing: SpinLock<Vec<ClosingTcpSocket>>,
+    closing: Mutex<Vec<ClosingTcpSocket>>,
 }
 
 impl TcpCloseDefer {
     pub fn new() -> Self {
         Self {
-            closing: SpinLock::new(Vec::new()),
+            closing: Mutex::new(Vec::new()),
         }
     }
 
@@ -50,7 +50,7 @@ impl TcpCloseDefer {
         local_port: u16,
         sock: Weak<dyn InetSocket>,
     ) {
-        let mut guard = self.closing.lock_irqsave();
+        let mut guard = self.closing.lock();
         guard.push(ClosingTcpSocket {
             handle,
             local_port,
@@ -67,7 +67,7 @@ impl TcpCloseDefer {
         sockets: &mut smoltcp::iface::SocketSet<'static>,
         port_manager: &PortManager,
     ) {
-        let mut closing = self.closing.lock_irqsave();
+        let mut closing = self.closing.lock();
         if closing.is_empty() {
             return;
         }

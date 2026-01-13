@@ -176,7 +176,7 @@ impl crate::net::socket::Socket for RawSocket {
     fn check_io_event(&self) -> EPollEventType {
         let mut event = EPollEventType::empty();
 
-        if !self.loopback_rx.lock_irqsave().pkts.is_empty() {
+        if !self.loopback_rx.lock().pkts.is_empty() {
             event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
         }
 

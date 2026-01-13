@@ -11,8 +11,8 @@ use system_error::SystemError;
 use crate::driver::net::Iface;
 use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
-use crate::libs::rwlock::RwLock;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::mutex::Mutex;
+use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::endpoint::Endpoint;
@@ -138,14 +138,14 @@ pub struct PacketSocket {
     /// 绑定的协议号 (ETH_P_ALL = 0x0003 表示接收所有协议)
     protocol: u16,
     /// 绑定的网络接口
-    bound_iface: RwLock<Option<Arc<dyn Iface>>>,
+    bound_iface: RwSem<Option<Arc<dyn Iface>>>,
     /// 接收缓冲区
-    rx_buffer: SpinLock<VecDeque<ReceivedPacket>>,
+    rx_buffer: Mutex<VecDeque<ReceivedPacket>>,
     /// 接收缓冲区最大包数
     rx_buffer_max_packets: AtomicUsize,
     /// 选项 (为将来的功能预留)
     #[allow(dead_code)]
-    options: RwLock<PacketSocketOptions>,
+    options: RwSem<PacketSocketOptions>,
     /// 非阻塞标志
     nonblock: AtomicBool,
     /// 等待队列
@@ -188,10 +188,10 @@ impl PacketSocket {
         Ok(Arc::new_cyclic(|me| Self {
             sock_type: socket_type,
             protocol,
-            bound_iface: RwLock::new(None),
-            rx_buffer: SpinLock::new(VecDeque::with_capacity(DEFAULT_RX_BUFFER_PACKETS)),
+            bound_iface: RwSem::new(None),
+            rx_buffer: Mutex::new(VecDeque::with_capacity(DEFAULT_RX_BUFFER_PACKETS)),
             rx_buffer_max_packets: AtomicUsize::new(DEFAULT_RX_BUFFER_PACKETS),
-            options: RwLock::new(PacketSocketOptions::default()),
+            options: RwSem::new(PacketSocketOptions::default()),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),

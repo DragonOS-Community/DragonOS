@@ -705,8 +705,6 @@ impl InnerPage {
 
     /// 增加 mlock 引用计数，并在首次锁定时设置标志
     ///
-    /// # 返回值
-    ///
     /// # Linux 参考实现
     ///
     /// 基于 Linux 6.6.21 mm/mlock.c:__mlock_folio()
@@ -722,11 +720,6 @@ impl InnerPage {
     }
 
     /// 减少 mlock 引用计数，并在计数归零时清除标志
-    ///
-    /// # 返回值
-    ///
-    /// - `true`: 计数从 1 -> 0，已清除 PG_MLOCKED，可能清除 PG_UNEVICTABLE
-    /// - `false`: 计数从 N -> N-1 (N>1)，页面仍被锁定
     ///
     /// # Linux 参考实现
     ///

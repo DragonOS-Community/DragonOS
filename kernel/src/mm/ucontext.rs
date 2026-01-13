@@ -983,6 +983,10 @@ impl InnerAddressSpace {
                 // 原地扩展：do_munmap 未被调用，只增加扩展部分
                 let old_pages = old_len >> MMArch::PAGE_SHIFT;
                 self.locked_vm += new_pages - old_pages;
+            } else if new_len < old_len {
+                // 原地收缩：do_munmap 未被调用，需要减少收缩部分
+                let old_pages = old_len >> MMArch::PAGE_SHIFT;
+                self.locked_vm -= old_pages - new_pages;
             }
         }
 

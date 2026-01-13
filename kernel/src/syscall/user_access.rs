@@ -913,7 +913,7 @@ fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: boo
     // Calculate number of pages to check (rounded up)
     let pages = aligned_size / MMArch::PAGE_SIZE;
 
-    let guard = vm.read_irqsave();
+    let guard = vm.read();
     for i in 0..pages {
         let page_addr = aligned_addr + i * MMArch::PAGE_SIZE;
         let flags = match guard.user_mapper.utable.translate(VirtAddr::new(page_addr)) {
@@ -1032,7 +1032,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         None => return 0,
     };
 
-    let vma_read_guard = vm.read_irqsave();
+    let vma_read_guard = vm.read();
     let mappings = &vma_read_guard.mappings;
 
     let mut checked = 0usize;

@@ -207,10 +207,7 @@ impl SMPArch for X86_64SMPArch {
         // AP核心启动完毕，取消低地址映射
         unsafe {
             LowAddressRemapping::unmap_at_low_address(
-                &mut IDLE_PROCESS_ADDRESS_SPACE()
-                    .write_irqsave()
-                    .user_mapper
-                    .utable,
+                &mut IDLE_PROCESS_ADDRESS_SPACE().write().user_mapper.utable,
                 true,
             )
         }
@@ -266,12 +263,8 @@ impl SmpCpuManager {
     pub fn arch_init(_boot_cpu: ProcessorId) {
         assert!(smp_get_processor_id().data() == 0);
         // 写入APU_START_CR3，这个值会在AP处理器启动时设置到CR3寄存器
-        let addr = IDLE_PROCESS_ADDRESS_SPACE()
-            .read_irqsave()
-            .user_mapper
-            .utable
-            .table()
-            .phys();
+        // 直接使用 table_paddr() 方法，无需获取锁
+        let addr = IDLE_PROCESS_ADDRESS_SPACE().table_paddr();
         let vaddr = unsafe {
             MMArch::phys_2_virt(PhysAddr::new(&mut __APU_START_CR3 as *mut u64 as usize)).unwrap()
         };
@@ -281,10 +274,7 @@ impl SmpCpuManager {
         // 添加低地址映射
         unsafe {
             LowAddressRemapping::remap_at_low_address(
-                &mut IDLE_PROCESS_ADDRESS_SPACE()
-                    .write_irqsave()
-                    .user_mapper
-                    .utable,
+                &mut IDLE_PROCESS_ADDRESS_SPACE().write().user_mapper.utable,
             )
         };
     }

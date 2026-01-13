@@ -30,7 +30,7 @@ use crate::{
     ipc::shm::{ShmFlags, ShmId},
     libs::{
         align::page_align_up,
-        rwlock::RwLock,
+        rwsem::RwSem,
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{page::page_manager_lock_irqsave, PhysAddr},
@@ -73,16 +73,22 @@ pub struct AddressSpace {
     /// 全局唯一的地址空间ID，用于标识不同的地址空间
     /// 该ID在地址空间的整个生命周期内保持不变，且永不重复
     id: u64,
-    inner: RwLock<InnerAddressSpace>,
+    /// 页表物理地址（创建后不变，可无锁访问）
+    /// 用于在调度器上下文中快速切换页表，无需获取RwSem锁
+    table_paddr: PhysAddr,
+    /// 使用RwSem而非RwLock，因为地址空间操作可能需要进行I/O（如页缺失时的文件读取）
+    inner: RwSem<InnerAddressSpace>,
 }
 
 impl AddressSpace {
     pub fn new(create_stack: bool) -> Result<Arc<Self>, SystemError> {
         let inner = InnerAddressSpace::new(create_stack)?;
+        let table_paddr = inner.user_mapper.utable.table().phys();
         let id = ADDRESS_SPACE_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
         let result = Self {
             id,
-            inner: RwLock::new(inner),
+            table_paddr,
+            inner: RwSem::new(inner),
         };
         return Ok(Arc::new(result));
     }
@@ -91,6 +97,13 @@ impl AddressSpace {
     #[inline(always)]
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// 获取页表物理地址（无锁访问）
+    /// 用于在调度器上下文中快速切换页表
+    #[inline(always)]
+    pub fn table_paddr(&self) -> PhysAddr {
+        self.table_paddr
     }
 
     /// 从pcb中获取当前进程的地址空间结构体的Arc指针
@@ -111,10 +124,19 @@ impl AddressSpace {
         }
         return false;
     }
+
+    /// 将此地址空间的页表设置为当前页表（无锁）
+    ///
+    /// 此方法用于调度器上下文中的快速页表切换，无需获取RwSem锁。
+    /// 安全性由调用者保证：只在进程切换时使用。
+    #[inline(always)]
+    pub unsafe fn make_current(&self) {
+        MMArch::set_table(PageTableKind::User, self.table_paddr);
+    }
 }
 
 impl core::ops::Deref for AddressSpace {
-    type Target = RwLock<InnerAddressSpace>;
+    type Target = RwSem<InnerAddressSpace>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner

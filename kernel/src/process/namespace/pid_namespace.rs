@@ -1,6 +1,7 @@
 use alloc::sync::Weak;
 
 use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 use hashbrown::HashMap;
 use ida::IdAllocator;
 use system_error::SystemError;
@@ -27,6 +28,7 @@ pub struct PidNamespace {
     /// 父namespace的弱引用
     parent: Option<Weak<PidNamespace>>,
     user_ns: Arc<UserNamespace>,
+    processes_created: AtomicU64,
 
     inner: SpinLock<InnerPidNamespace>,
 }
@@ -68,6 +70,7 @@ impl PidNamespace {
             ns_common: NsCommon::new(0, NamespaceType::Pid),
             parent: None,
             user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
+            processes_created: AtomicU64::new(0),
             inner: SpinLock::new(InnerPidNamespace {
                 dead: false,
                 child_reaper: None,
@@ -86,12 +89,17 @@ impl PidNamespace {
     pub fn alloc_pid_in_ns(&self, pid: Arc<Pid>) -> Result<RawPid, SystemError> {
         let mut inner = self.inner();
         let raw_pid = inner.do_alloc_pid_in_ns(pid)?;
+        self.processes_created.fetch_add(1, Ordering::Relaxed);
         Ok(raw_pid)
     }
 
     pub fn pid_allocated(&self) -> usize {
         let inner = self.inner();
         inner.do_pid_allocated()
+    }
+
+    pub fn processes_created(&self) -> u64 {
+        self.processes_created.load(Ordering::Relaxed)
     }
 
     pub fn release_pid_in_ns(&self, raw_pid: RawPid) {
@@ -102,6 +110,11 @@ impl PidNamespace {
     pub fn find_pid_in_ns(&self, raw_pid: RawPid) -> Option<Arc<Pid>> {
         let inner = self.inner();
         inner.pid_map.get(&raw_pid).cloned()
+    }
+
+    pub fn collect_pids(&self) -> Vec<Arc<Pid>> {
+        let inner = self.inner();
+        inner.pid_map.values().cloned().collect()
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/pid_namespace.c#145
@@ -144,6 +157,7 @@ impl PidNamespace {
             ns_common: NsCommon::new(level, NamespaceType::Pid),
             parent: Some(self.self_ref.clone()),
             user_ns,
+            processes_created: AtomicU64::new(0),
             inner: SpinLock::new(InnerPidNamespace {
                 child_reaper: None,
                 dead: false,

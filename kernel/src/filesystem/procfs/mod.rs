@@ -21,6 +21,7 @@ mod net;
 mod pid;
 pub mod root;
 mod self_;
+mod stat;
 mod sys;
 mod syscall;
 pub(super) mod template;

@@ -5,6 +5,18 @@ type EP = crate::filesystem::epoll::EPollEventType;
 
 impl TcpSocket {
     pub(crate) fn update_events(&self) -> bool {
+        // If cork was disabled or SHUT_WR was requested while there are still cork-buffered bytes,
+        // opportunistically flush them so the data does not become unreachable and FIN can be sent.
+        if (!self
+            .options
+            .tcp_cork
+            .load(core::sync::atomic::Ordering::Relaxed)
+            || self.is_send_shutdown())
+            && !self.cork_buf.lock().is_empty()
+        {
+            let _ = self.flush_cork_buffer();
+        }
+
         let inner_guard = self.inner.read();
         match inner_guard.as_ref() {
             None => false,

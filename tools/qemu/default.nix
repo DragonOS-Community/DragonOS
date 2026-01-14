@@ -4,7 +4,8 @@
   diskPath,
   kernel,
   testOpt,
-  debug ? false
+  debug ? false,
+  vmstateDir ? null
 }:
 
 let
@@ -24,14 +25,13 @@ let
   };
 
   # 3. 参数生成器 (Nix List -> Nix List)
+  # 注意：网络配置中的端口现在使用 $HOST_PORT 变量，在运行时动态替换
   mkQemuArgs = { arch, isNographic }:
     let
       baseArgs = [
         "-m" baseConfig.memory
         "-smp" "${baseConfig.cores},cores=${baseConfig.cores},threads=1,sockets=1"
         "-object" "memory-backend-file,size=${baseConfig.memory},id=${baseConfig.shmId},mem-path=/dev/shm/${baseConfig.shmId},share=on"
-        "-netdev" "user,id=hostnet0,hostfwd=tcp::12580-:12580"
-        "-device" "virtio-net-pci,vectors=5,netdev=hostnet0,id=net0"
         "-usb"
         "-device" "qemu-xhci,id=xhci,p2=8,p3=4"
         "-D" "qemu.log"
@@ -102,15 +102,45 @@ let
         ARCH_FLAGS+=( "-machine" "virt,accel=$ACCEL,memory-backend=${baseConfig.shmId}" )
       '';
 
+      # VM 状态目录配置
+      vmstateDirStr = if vmstateDir != null then vmstateDir else "";
+      hasVmstateDir = vmstateDir != null;
+
     in pkgs.writeScriptBin name ''
       #!${pkgs.runtimeShell}
 
       if [ ! -d "bin" ]; then echo "Error: Please run from project root (bin/ missing)."; exit 1; fi
 
+      # 端口查找函数：从指定端口开始查找可用端口
+      find_available_port() {
+        local start_port=$1
+        local port=$start_port
+        while [ $port -lt 65535 ]; do
+          if ! ${pkgs.iproute2}/bin/ss -tuln | grep -q ":$port "; then
+            echo $port
+            return 0
+          fi
+          port=$((port + 1))
+        done
+        echo $start_port
+      }
+
+      # 动态分配端口
+      HOST_PORT=$(find_available_port 12580)
+
       ACCEL="tcg"
       if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then ACCEL="kvm"; fi
 
-      cleanup() { sudo rm -f /dev/shm/${baseConfig.shmId}; }
+      ${if hasVmstateDir then ''
+      VMSTATE_DIR="${vmstateDirStr}"
+      mkdir -p "$VMSTATE_DIR"
+      echo "$HOST_PORT" > "$VMSTATE_DIR/port"
+      '' else ""}
+
+      cleanup() {
+        sudo rm -f /dev/shm/${baseConfig.shmId}
+        ${if hasVmstateDir then ''rm -f "$VMSTATE_DIR/pid"'' else ""}
+      }
       trap cleanup EXIT
       # FIXED: 既然用了 sudo 运行 qemu，这里创建 shm 也需要权限，
       # 但实际上 qemu 会自己创建，这里只需要保证清理。
@@ -128,18 +158,30 @@ let
 
       DISK_ARGS=( ${lib.escapeShellArgs diskArgs} )
 
+      # 动态网络配置（使用动态分配的端口）
+      NET_ARGS=( "-netdev" "user,id=hostnet0,hostfwd=tcp::$HOST_PORT-:12580" "-device" "virtio-net-pci,vectors=5,netdev=hostnet0,id=net0" )
+
       echo -e "================== DragonOS QEMU Command Preview =================="
       echo -e "Binary: sudo ${qemuBin}"
       echo -e "Base Flags: ${qemuFlagsStr}"
       echo -e "Arch Flags: ''${ARCH_FLAGS[*]}"
       echo -e "Boot Args: ''${BOOT_ARGS[*]}"
       echo -e "Disk Args: ''${DISK_ARGS[*]}"
+      echo -e "Net Args: ''${NET_ARGS[*]}"
+      echo -e "Host Port: $HOST_PORT"
       echo -e "=================================================================="
       echo ""
 
       # --- 3. 执行 ---
       ${qemuBin} --version
-      sudo ${qemuBin} ${qemuFlagsStr} -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+      
+      # 使用 exec 方式启动 QEMU，保持交互能力并记录 PID
+      # 参考 tools/run-qemu.sh 的 launch_qemu 函数实现
+      ${if hasVmstateDir then ''
+      sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+      '' else ''
+      sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+      ''}
     '';
 
   script = lib.genAttrs [ "x86_64" "riscv64" ] (arch: mkRunScript {

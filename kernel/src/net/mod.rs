@@ -17,6 +17,6 @@ pub mod tcp_listener_backlog;
 
 /// 生成网络接口的id (全局自增)
 pub fn generate_iface_id() -> usize {
-    static IFACE_ID: AtomicUsize = AtomicUsize::new(0);
+    static IFACE_ID: AtomicUsize = AtomicUsize::new(1);
     return IFACE_ID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 }

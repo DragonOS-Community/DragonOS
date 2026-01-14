@@ -3,6 +3,7 @@
 // 2022/01/20
 
 #include "common/asm.h"
+#include "elfnote.h"
 
 // 以下是来自 multiboot2 规范的定义
 //  How many bytes from the start of the file we search for the header.
@@ -92,17 +93,43 @@
 // 声明这一段代码以 32 位模式编译
 .code32
 
-/* PVH Header with pvh_start_addr = __linux32_pvh_boot */
+/* PVH Header for Cloud Hypervisor and other VMMs that support PVH boot
+ *
+ * This uses the standard Xen ELF note format that Cloud Hypervisor expects.
+ * The entry point address is calculated relative to the kernel load base.
+ */
 
-	.pushsection .note.dragonos, "a", @note
-	.align 4
-	.long 2f - 1f
-	.long 4f - 3f
-	.long 18
-	1:.asciz "Xen"
-	2:.align 4
-	3:.long __linux32_pvh_boot
-	4:.align 4
+	/*
+	 * Define PVH entry point note
+	 * The address must be the physical address where the VMM should jump to
+	 * For DragonOS, __linux32_pvh_boot is in the .boot.text section at 0x100000+
+	 */
+	.pushsection .note.Xen, "a", @note
+	.balign 4
+	.long 2f - 1f		/* namesz = length of "Xen" */
+	.long 4f - 3f		/* descsz = length of data */
+	.long 18			/* type = XEN_ELFNOTE_PHYS32_ENTRY */
+1:	.asciz "Xen"
+2:	.balign 4
+3:	.long __linux32_pvh_boot	/* Physical entry point address */
+4:	.balign 4
+	.popsection
+
+	/*
+	 * Define PVH relocation constraints note
+	 * This tells the VMM about alignment and address constraints
+	 */
+	.pushsection .note.Xen, "a", @note
+	.balign 4
+	.long 2f - 1f		/* namesz */
+	.long 4f - 3f		/* descsz */
+	.long 19			/* type = XEN_ELFNOTE_PHYS32_RELOC */
+1:	.asciz "Xen"
+2:	.balign 4
+3:	.long 0x200000		/* Alignment: 2MB */
+	.long 0x00100000		/* Minimum load address: 1MB */
+	.long 0xffffffff		/* Maximum end address */
+4:	.balign 4
 	.popsection
 
 .section ".multiboot_header", "a"

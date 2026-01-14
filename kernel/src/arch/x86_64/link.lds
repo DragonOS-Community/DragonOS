@@ -3,6 +3,14 @@ OUTPUT_FORMAT("elf64-x86-64","elf64-x86-64","elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
+PHDRS
+{
+	boot PT_LOAD FLAGS(5);      /* R_E */
+	text PT_LOAD FLAGS(5);      /* R_E */
+	data PT_LOAD FLAGS(6);      /* RW_ */
+	note PT_NOTE FLAGS(0);      /* ___ */
+}
+
 SECTIONS
 {
 	KERNEL_VMA = 0xffff800000000000;
@@ -10,18 +18,31 @@ SECTIONS
 	. = 0;
 	. = 0x100000;
 	_default_kernel_load_base = .;
-	.boot.text :
+	.boot.text : AT(0x100000)
 	{
 		KEEP(*(.multiboot_header))
 		KEEP(*(.multiboot2_header))
-		
+
 		*(.bootstrap)
 		*(.bootstrap.code64)
 		*(.bootstrap.data)
-		
-		. = ALIGN(4096);
-	}
 
+		. = ALIGN(4096);
+	} : boot
+
+	/*
+	 * Notes segment for PVH and other ELF notes
+	 * This must be in low memory (before KERNEL_VMA) for Cloud Hypervisor
+	 * to find it. Place it right after .boot.text.
+	 */
+	. = ALIGN(4);
+	.notes : AT(.)
+	{
+		*(.note.Xen)
+		*(.note.dragonos)
+		*(.note.gnu.build-id)
+		*(.note.gnu.property)
+	} : note
 
 	. = ALIGN(32768);
 	. += KERNEL_VMA;
@@ -45,7 +66,7 @@ SECTIONS
 		__start___ex_table = .;
 		*(__ex_table)
 		__stop___ex_table = .;
-	}
+	} : text
 	. = ALIGN(4096);
 	data_start_pa = .;
 	.data (data_start_pa): AT(data_start_pa - KERNEL_VMA)
@@ -59,9 +80,9 @@ SECTIONS
 		*(.relocate_kernel_text)
     	*(.relocate_kernel_data)
 		__relocate_kernel_end = .;
-		
+
 		_edata = .;
-	}
+	} : data
 
 	. = ALIGN(4096);
 

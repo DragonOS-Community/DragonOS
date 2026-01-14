@@ -563,14 +563,6 @@ impl ProcessManager {
             pid = pcb.pid();
             pcb.wait_queue.mark_dead();
 
-            let rq = cpu_rq(smp_get_processor_id().data() as usize);
-            let (rq, guard) = rq.self_lock();
-            rq.deactivate_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-            drop(guard);
-
             // 进行进程退出后的工作
             let thread = pcb.thread.write_irqsave();
 
@@ -604,6 +596,15 @@ impl ProcessManager {
                 thread.vfork_done.as_ref().unwrap().complete_all();
             }
             drop(thread);
+
+            // clear_child_tid/robust_list 可能触发用户态缺页，必须在调度实体 deactive 前完成
+            let rq = cpu_rq(smp_get_processor_id().data() as usize);
+            let (rq, guard) = rq.self_lock();
+            rq.deactivate_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+            drop(guard);
 
             unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();

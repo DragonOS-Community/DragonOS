@@ -75,7 +75,7 @@ impl Syscall for SysFallocateHandle {
 
             let new_size = offset.saturating_add(len);
 
-            let current_size = file.inode().metadata()?.size;
+            let current_size = file.inode().metadata()?.size as usize;
             if new_size > current_size {
                 let current_pcb = ProcessManager::current_pcb();
                 let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);

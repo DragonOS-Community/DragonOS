@@ -48,7 +48,7 @@ impl RootDirOps {
         ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
             .fs(fs)
             .build()
-            .unwrap()
+            .expect("Failed to create RootDirOps")
     }
 
     /// 静态条目表
@@ -198,6 +198,11 @@ impl FileSystem for ProcFS {
 }
 
 impl MountableFileSystem for ProcFS {
+    /// 创建 procfs 挂载数据
+    ///
+    /// procfs 是一个虚拟文件系统，不需要任何挂载数据。
+    /// 与需要挂载选项的文件系统（如带有大小限制的 tmpfs）不同，
+    /// procfs 的行为完全由内核状态决定，不需要额外的配置参数。
     fn make_mount_data(
         _raw_data: Option<&str>,
         _source: &str,

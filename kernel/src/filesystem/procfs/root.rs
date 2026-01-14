@@ -24,9 +24,10 @@ use crate::{
             version_signature::VersionSignatureFileOps,
             Builder, PROCFS_BLOCK_SIZE, PROCFS_MAX_NAMELEN,
         },
-        vfs::{IndexNode, InodeMode},
+        vfs::{FileSystemMakerData, IndexNode, InodeMode, FSMAKER},
     },
     process::{ProcessManager, RawPid},
+    register_mountable_fs,
 };
 use alloc::{
     string::ToString,
@@ -47,7 +48,7 @@ impl RootDirOps {
         ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
             .fs(fs)
             .build()
-            .unwrap()
+            .expect("Failed to create RootDirOps")
     }
 
     /// 静态条目表
@@ -142,8 +143,9 @@ impl DirOps for RootDirOps {
     }
 }
 
-use crate::filesystem::vfs::{FileSystem, FsInfo, Magic, SuperBlock};
+use crate::filesystem::vfs::{FileSystem, FsInfo, Magic, MountableFileSystem, SuperBlock};
 use crate::libs::rwsem::RwSem;
+use linkme::distributed_slice;
 
 /// ProcFS 文件系统
 #[derive(Debug)]
@@ -194,3 +196,29 @@ impl FileSystem for ProcFS {
         self.super_block.read().clone()
     }
 }
+
+impl MountableFileSystem for ProcFS {
+    /// 创建 procfs 挂载数据
+    ///
+    /// procfs 是一个虚拟文件系统，不需要任何挂载数据。
+    /// 与需要挂载选项的文件系统（如带有大小限制的 tmpfs）不同，
+    /// procfs 的行为完全由内核状态决定，不需要额外的配置参数。
+    fn make_mount_data(
+        _raw_data: Option<&str>,
+        _source: &str,
+    ) -> Result<Option<Arc<dyn crate::filesystem::vfs::FileSystemMakerData + 'static>>, SystemError>
+    {
+        // procfs 不需要任何额外的挂载数据
+        Ok(None)
+    }
+
+    fn make_fs(
+        _data: Option<&dyn crate::filesystem::vfs::FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let fs = ProcFS::new();
+        Ok(fs)
+    }
+}
+
+// 注册 procfs 为可挂载文件系统
+register_mountable_fs!(ProcFS, PROCFSMAKER, "proc");

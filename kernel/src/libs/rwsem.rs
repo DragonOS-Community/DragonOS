@@ -1,349 +1,335 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Sleepable Read-Write Semaphore (RwSem)
+
 use core::{
     cell::UnsafeCell,
-    mem::ManuallyDrop,
+    marker::PhantomData,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{
+        AtomicUsize,
+        Ordering::{AcqRel, Acquire, Relaxed, Release},
+    },
 };
 
+use alloc::rc::Rc;
 use system_error::SystemError;
 
 use super::wait_queue::WaitQueue;
 
-/// Sleepable read-write semaphore (rwsem): a blocking read/write lock.
+/// A mutex that provides data access to either one writer or many readers.
 ///
-/// - Intended for **process context** (may sleep).
-/// - DO NOT use in interrupt context.
+/// # Overview
 ///
-/// Fairness (v2): writer-preference.
+/// This mutex allows for multiple readers, or at most one writer to access
+/// at any point in time. The writer of this mutex has exclusive access to
+/// modify the underlying data, while the readers are allowed shared and
+/// read-only access.
+///
+/// The writing and reading portions cannot be active simultaneously, when
+/// one portion is in progress, the other portion will sleep. This is
+/// suitable for scenarios where the mutex is expected to be held for a
+/// period of time, which can avoid wasting CPU resources.
 ///
 /// # Implementation Details
 ///
-/// - **State**: Managed by a single `AtomicU64` (`count`).
-///   - Bits 0..32: Reader count (u32).
-///   - Bit 32: Writer active flag.
-///   - Bits 33..63: Writer waiters count (31 bits).
-/// - **Fast Path**: Uses atomic CAS/fetch operations to acquire lock without spinlocks.
-/// - **Slow Path**: Uses `WaitQueue` to block threads.
+/// The internal representation of the mutex state is as follows:
+/// - **Bit 63:** Writer mutex.
+/// - **Bit 62:** Upgradeable reader mutex.
+/// - **Bit 61:** Indicates if an upgradeable reader is being upgraded.
+/// - **Bit 60:** Reader overflow detection (set when count reaches 2^60).
+/// - **Bits 59-0:** Reader mutex count.
+///
+/// # Safety
+///
+/// Avoid using `RwSem` in an interrupt context, as it may result in sleeping
+/// and never being awakened.
 #[derive(Debug)]
-pub struct RwSem<T> {
-    data: UnsafeCell<T>,
-    count: AtomicU64,
-    wq_read: WaitQueue,
-    wq_write: WaitQueue,
+pub struct RwSem<T: ?Sized> {
+    lock: AtomicUsize,
+    queue: WaitQueue,
+    val: UnsafeCell<T>,
 }
 
-// Constants for bit manipulation
-const READER_MASK: u64 = 0x0000_0000_FFFF_FFFF;
-const WRITER_BIT: u64 = 1 << 32;
-const WRITER_WAITER_SHIFT: u32 = 33;
-const WRITER_WAITER_UNIT: u64 = 1 << WRITER_WAITER_SHIFT;
-const WRITER_WAITER_MASK: u64 = 0xFFFF_FFFE_0000_0000;
+const READER: usize = 1;
+const WRITER: usize = 1 << (usize::BITS - 1);
+const UPGRADEABLE_READER: usize = 1 << (usize::BITS - 2);
+const BEING_UPGRADED: usize = 1 << (usize::BITS - 3);
+const MAX_READER: usize = 1 << (usize::BITS - 4);
 
 /// Read guard for [`RwSem`].
 #[derive(Debug)]
-pub struct RwSemReadGuard<'a, T: 'a> {
-    lock: &'a RwSem<T>,
+pub struct RwSemReadGuard<'a, T: ?Sized + 'a> {
+    inner: &'a RwSem<T>,
+    // Mark as !Send
+    _nosend: PhantomData<Rc<()>>,
 }
 
 /// Write guard for [`RwSem`].
 #[derive(Debug)]
-pub struct RwSemWriteGuard<'a, T: 'a> {
-    lock: &'a RwSem<T>,
+pub struct RwSemWriteGuard<'a, T: ?Sized + 'a> {
+    inner: &'a RwSem<T>,
+    // Mark as !Send
+    _nosend: PhantomData<Rc<()>>,
+}
+
+/// Upgradeable read guard for [`RwSem`].
+#[derive(Debug)]
+pub struct RwSemUpgradeableGuard<'a, T: ?Sized + 'a> {
+    inner: &'a RwSem<T>,
+    // Mark as !Send
+    _nosend: PhantomData<Rc<()>>,
 }
 
 // SAFETY: T must be Sync because multiple readers can access &T concurrently.
-unsafe impl<T> Sync for RwSem<T> where T: Send + Sync {}
-unsafe impl<T> Send for RwSem<T> where T: Send {}
+unsafe impl<T: ?Sized + Send> Send for RwSem<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for RwSem<T> {}
+
+unsafe impl<T: ?Sized + Sync> Sync for RwSemWriteGuard<'_, T> {}
+unsafe impl<T: ?Sized + Sync> Sync for RwSemReadGuard<'_, T> {}
+unsafe impl<T: ?Sized + Sync> Sync for RwSemUpgradeableGuard<'_, T> {}
 
 impl<T> RwSem<T> {
-    pub const fn new(value: T) -> Self {
+    /// Creates a new read-write semaphore with an initial value.
+    pub const fn new(val: T) -> Self {
         Self {
-            data: UnsafeCell::new(value),
-            count: AtomicU64::new(0),
-            wq_read: WaitQueue::default(),
-            wq_write: WaitQueue::default(),
+            val: UnsafeCell::new(val),
+            lock: AtomicUsize::new(0),
+            queue: WaitQueue::default(),
         }
     }
+}
 
-    fn try_acquire_read(&self) -> bool {
-        let mut current = self.count.load(Ordering::Relaxed);
-        loop {
-            // Fail if writer active or writer waiting (Writer Preference)
-            if (current & (WRITER_BIT | WRITER_WAITER_MASK)) != 0 {
-                return false;
-            }
-            // Try to increment reader count
-            let new = current + 1;
-            match self.count.compare_exchange_weak(
-                current,
-                new,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(x) => current = x,
-            }
-        }
-    }
-
-    fn try_acquire_write(&self) -> bool {
-        let mut current = self.count.load(Ordering::Relaxed);
-        loop {
-            // Fail if any readers or writer active
-            if (current & (READER_MASK | WRITER_BIT)) != 0 {
-                return false;
-            }
-            // Try to set writer bit
-            let new = current | WRITER_BIT;
-            match self.count.compare_exchange_weak(
-                current,
-                new,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(x) => current = x,
-            }
-        }
-    }
-
-    /// Like `try_acquire_write()`, but also consumes one pending-writer reservation.
-    fn try_acquire_write_from_waiter(&self) -> bool {
-        let mut current = self.count.load(Ordering::Relaxed);
-        loop {
-            // Fail if any readers or writer active
-            if (current & (READER_MASK | WRITER_BIT)) != 0 {
-                return false;
-            }
-
-            // We assume caller has already incremented writer_waiters, so we decrement it here.
-            // Note: In rare race conditions (e.g. wakeup rollback), we might need to handle
-            // the case where WRITER_WAITER_MASK is 0, but logical flow should prevent this
-            // in the happy path. However, safely, we should just assume we consume one unit.
-
-            let new = (current.saturating_sub(WRITER_WAITER_UNIT)) | WRITER_BIT;
-
-            match self.count.compare_exchange_weak(
-                current,
-                new,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(x) => current = x,
-            }
-        }
-    }
-
-    /// Non-blocking read acquire.
-    pub fn try_read(&self) -> Option<RwSemReadGuard<'_, T>> {
-        if self.try_acquire_read() {
-            Some(RwSemReadGuard { lock: self })
-        } else {
-            None
-        }
-    }
-
-    /// Non-blocking write acquire.
-    pub fn try_write(&self) -> Option<RwSemWriteGuard<'_, T>> {
-        if self.try_acquire_write() {
-            Some(RwSemWriteGuard { lock: self })
-        } else {
-            None
-        }
-    }
-
-    /// Blocking read acquire (uninterruptible).
+impl<T: ?Sized> RwSem<T> {
+    /// Acquires a read mutex and sleep until it can be acquired.
+    ///
+    /// The calling thread will sleep until there are no writers or upgrading
+    /// upreaders present.
+    #[track_caller]
     pub fn read(&self) -> RwSemReadGuard<'_, T> {
-        if self.try_acquire_read() {
-            return RwSemReadGuard { lock: self };
-        }
-
-        loop {
-            match self
-                .wq_read
-                .wait_event_uninterruptible(|| self.try_acquire_read(), None::<fn()>)
-            {
-                Ok(()) => return RwSemReadGuard { lock: self },
-                Err(_) => continue,
-            }
-        }
+        self.queue.wait_until(|| self.try_read())
     }
 
-    /// Blocking write acquire (uninterruptible).
+    /// Acquires a write mutex and sleep until it can be acquired.
+    ///
+    /// The calling thread will sleep until there are no writers, upreaders,
+    /// or readers present.
+    #[track_caller]
     pub fn write(&self) -> RwSemWriteGuard<'_, T> {
-        if self.try_acquire_write() {
-            return RwSemWriteGuard { lock: self };
-        }
+        self.queue.wait_until(|| self.try_write())
+    }
 
-        // Reserve a writer slot (blocks new readers)
-        self.count.fetch_add(WRITER_WAITER_UNIT, Ordering::Acquire);
-
-        loop {
-            let res = self
-                .wq_write
-                .wait_event_uninterruptible(|| self.try_acquire_write_from_waiter(), None::<fn()>);
-
-            match res {
-                Ok(()) => return RwSemWriteGuard { lock: self },
-                Err(_) => {
-                    // This branch usually shouldn't happen for uninterruptible wait unless queue is dead.
-                    // But if it does, we must rollback.
-                    let prev = self.count.fetch_sub(WRITER_WAITER_UNIT, Ordering::Release);
-                    let current = prev - WRITER_WAITER_UNIT;
-
-                    // If we were the last waiter and no writer is active, wake readers
-                    if (current & WRITER_WAITER_MASK) == 0 && (current & WRITER_BIT) == 0 {
-                        self.wq_read.wakeup_all(None);
-                    }
-                    continue; // Or return error? The original code retries?
-                              // Original code for `wait_event_uninterruptible` loops on Err?
-                              // No, original code:
-                              /*
-                              match res {
-                                  Ok(()) => return ...,
-                                  Err(_) => {
-                                      // rollback...
-                                  }
-                              }
-                              */
-                    // Actually, wait_event_uninterruptible returning Err is weird.
-                    // But let's assume we should retry or just return (but we can't return error here).
-                    // The original code looped on `wq_read` failure, but for `wq_write` failure it rolled back and... looped?
-                    // Wait, original `write`:
-                    /*
-                    match res {
-                        Ok(()) => return ...,
-                        Err(_) => {
-                             // rollback
-                             // wake readers
-                        }
-                    }
-                    */
-                    // And the loop continues. So it retries.
-                    // But we just decremented waiter count. We need to increment it again if we retry?
-                    // Yes, the loop starts with `if self.try_acquire_write()`.
-                    // Then reserves slot.
-                    // So rollback is correct.
-                }
-            }
-        }
+    /// Acquires a upread mutex and sleep until it can be acquired.
+    ///
+    /// The calling thread will sleep until there are no writers or upreaders present.
+    #[track_caller]
+    pub fn upread(&self) -> RwSemUpgradeableGuard<'_, T> {
+        self.queue.wait_until(|| self.try_upread())
     }
 
     /// Blocking read acquire (interruptible).
     pub fn read_interruptible(&self) -> Result<RwSemReadGuard<'_, T>, SystemError> {
-        if self.try_acquire_read() {
-            return Ok(RwSemReadGuard { lock: self });
-        }
-
-        self.wq_read
-            .wait_event_interruptible(|| self.try_acquire_read(), None::<fn()>)?;
-
-        Ok(RwSemReadGuard { lock: self })
+        self.queue.wait_until_interruptible(|| self.try_read())
     }
 
     /// Blocking write acquire (interruptible).
     pub fn write_interruptible(&self) -> Result<RwSemWriteGuard<'_, T>, SystemError> {
-        if self.try_acquire_write() {
-            return Ok(RwSemWriteGuard { lock: self });
-        }
-
-        self.count.fetch_add(WRITER_WAITER_UNIT, Ordering::Acquire);
-
-        let res = self
-            .wq_write
-            .wait_event_interruptible(|| self.try_acquire_write_from_waiter(), None::<fn()>);
-
-        match res {
-            Ok(()) => Ok(RwSemWriteGuard { lock: self }),
-            Err(e) => {
-                // Rollback reservation
-                let prev = self.count.fetch_sub(WRITER_WAITER_UNIT, Ordering::Release);
-                let current = prev - WRITER_WAITER_UNIT;
-
-                if (current & WRITER_WAITER_MASK) == 0 && (current & WRITER_BIT) == 0 {
-                    self.wq_read.wakeup_all(None);
-                }
-                Err(e)
-            }
-        }
+        self.queue.wait_until_interruptible(|| self.try_write())
     }
 
-    fn read_unlock(&self) {
-        let prev = self.count.fetch_sub(1, Ordering::Release);
-        let current = prev - 1;
-
-        // If last reader and writers are waiting, wake one writer
-        if (current & READER_MASK) == 0 && (current & WRITER_WAITER_MASK) > 0 {
-            self.wq_write.wakeup(None);
-        }
-    }
-
-    fn write_unlock(&self) {
-        let prev = self.count.fetch_and(!WRITER_BIT, Ordering::Release);
-        let current = prev & !WRITER_BIT;
-
-        if (current & WRITER_WAITER_MASK) > 0 {
-            // Wake one writer
-            self.wq_write.wakeup(None);
+    /// Attempts to acquire a read lock.
+    ///
+    /// This function will never sleep and will return immediately.
+    pub fn try_read(&self) -> Option<RwSemReadGuard<'_, T>> {
+        let lock = self.lock.fetch_add(READER, Acquire);
+        if lock & (WRITER | BEING_UPGRADED | MAX_READER) == 0 {
+            Some(RwSemReadGuard {
+                inner: self,
+                _nosend: PhantomData,
+            })
         } else {
-            // Wake all readers
-            self.wq_read.wakeup_all(None);
+            self.lock.fetch_sub(READER, Release);
+            None
+        }
+    }
+
+    /// Attempts to acquire a write lock.
+    ///
+    /// This function will never sleep and will return immediately.
+    pub fn try_write(&self) -> Option<RwSemWriteGuard<'_, T>> {
+        if self
+            .lock
+            .compare_exchange(0, WRITER, Acquire, Relaxed)
+            .is_ok()
+        {
+            Some(RwSemWriteGuard {
+                inner: self,
+                _nosend: PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Attempts to acquire a upread mutex.
+    ///
+    /// This function will never sleep and will return immediately.
+    pub fn try_upread(&self) -> Option<RwSemUpgradeableGuard<'_, T>> {
+        let lock = self.lock.fetch_or(UPGRADEABLE_READER, Acquire) & (WRITER | UPGRADEABLE_READER);
+        if lock == 0 {
+            return Some(RwSemUpgradeableGuard {
+                inner: self,
+                _nosend: PhantomData,
+            });
+        } else if lock == WRITER {
+            self.lock.fetch_sub(UPGRADEABLE_READER, Release);
+        }
+        None
+    }
+
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// This method is zero-cost: By holding a mutable reference to the lock, the compiler has
+    /// already statically guaranteed that access to the data is exclusive.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.val.get_mut()
+    }
+}
+
+impl<T: ?Sized> Deref for RwSemReadGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*self.inner.val.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for RwSemReadGuard<'_, T> {
+    fn drop(&mut self) {
+        // When there are no readers, wake up a waiting writer.
+        if self.inner.lock.fetch_sub(READER, Release) == READER {
+            self.inner.queue.wake_one();
         }
     }
 }
 
-impl<T> Deref for RwSemReadGuard<'_, T> {
+impl<T: ?Sized> Deref for RwSemWriteGuard<'_, T> {
     type Target = T;
 
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.lock.data.get() }
+    fn deref(&self) -> &T {
+        unsafe { &*self.inner.val.get() }
     }
 }
 
-impl<T> Deref for RwSemWriteGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.lock.data.get() }
-    }
-}
-
-impl<T> DerefMut for RwSemWriteGuard<'_, T> {
+impl<T: ?Sized> DerefMut for RwSemWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.lock.data.get() }
+        unsafe { &mut *self.inner.val.get() }
     }
 }
 
 impl<'a, T> RwSemWriteGuard<'a, T> {
-    /// Downgrade a write guard into a read guard without releasing the lock.
-    pub fn downgrade(self) -> RwSemReadGuard<'a, T> {
-        let this = ManuallyDrop::new(self);
-        let sem = this.lock;
-
-        // Atomically transition from Writer to 1 Reader.
-        // writer bit is 1<<32. reader is +1.
-        // We want to subtract (WRITER_BIT - 1).
-        let prev = sem.count.fetch_sub(WRITER_BIT - 1, Ordering::Release);
-        let current = prev - (WRITER_BIT - 1);
-
-        // If no writer waiters, wake other readers
-        if (current & WRITER_WAITER_MASK) == 0 {
-            sem.wq_read.wakeup_all(None);
+    /// Atomically downgrades a write guard to an upgradeable reader guard.
+    ///
+    /// This method always succeeds because the lock is exclusively held by the writer.
+    pub fn downgrade(mut self) -> RwSemUpgradeableGuard<'a, T> {
+        loop {
+            self = match self.try_downgrade() {
+                Ok(guard) => return guard,
+                Err(e) => e,
+            };
         }
+    }
 
-        RwSemReadGuard { lock: sem }
+    /// This is not exposed as a public method to prevent intermediate lock states from affecting the
+    /// downgrade process.
+    fn try_downgrade(self) -> Result<RwSemUpgradeableGuard<'a, T>, Self> {
+        let inner = self.inner;
+        let res = self
+            .inner
+            .lock
+            .compare_exchange(WRITER, UPGRADEABLE_READER, AcqRel, Relaxed);
+        if res.is_ok() {
+            core::mem::forget(self);
+            // A writer->upread transition makes readers runnable again.
+            inner.queue.wake_all();
+            Ok(RwSemUpgradeableGuard {
+                inner,
+                _nosend: PhantomData,
+            })
+        } else {
+            Err(self)
+        }
     }
 }
 
-impl<T> Drop for RwSemReadGuard<'_, T> {
+impl<T: ?Sized> Drop for RwSemWriteGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.read_unlock();
+        self.inner.lock.fetch_and(!WRITER, Release);
+
+        // When the current writer releases, wake up all the sleeping threads.
+        // All awakened threads may include readers and writers.
+        // Thanks to the `wait_until` method, either all readers
+        // continue to execute or one writer continues to execute.
+        self.inner.queue.wake_all();
     }
 }
 
-impl<T> Drop for RwSemWriteGuard<'_, T> {
+impl<T: ?Sized> Deref for RwSemUpgradeableGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*self.inner.val.get() }
+    }
+}
+
+impl<'a, T> RwSemUpgradeableGuard<'a, T> {
+    /// Upgrades this upread guard to a write guard atomically.
+    ///
+    /// After calling this method, subsequent readers will be blocked
+    /// while previous readers remain unaffected.
+    ///
+    /// The calling thread will not sleep, but spin to wait for the existing
+    /// reader to be released.
+    pub fn upgrade(mut self) -> RwSemWriteGuard<'a, T> {
+        self.inner.lock.fetch_or(BEING_UPGRADED, Acquire);
+        loop {
+            self = match self.try_upgrade() {
+                Ok(guard) => return guard,
+                Err(e) => e,
+            };
+        }
+    }
+
+    /// Attempts to upgrade this upread guard to a write guard atomically.
+    ///
+    /// This function will return immediately.
+    pub fn try_upgrade(self) -> Result<RwSemWriteGuard<'a, T>, Self> {
+        let res = self.inner.lock.compare_exchange(
+            UPGRADEABLE_READER | BEING_UPGRADED,
+            WRITER | UPGRADEABLE_READER,
+            AcqRel,
+            Relaxed,
+        );
+        if res.is_ok() {
+            let inner = self.inner;
+            // Drop the upgradeable guard to clear the UPGRADEABLE_READER bit,
+            // matching the asterinas semantics and avoiding a phantom upreader.
+            core::mem::drop(self);
+            Ok(RwSemWriteGuard {
+                inner,
+                _nosend: PhantomData,
+            })
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl<T: ?Sized> Drop for RwSemUpgradeableGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.write_unlock();
+        let res = self.inner.lock.fetch_sub(UPGRADEABLE_READER, Release);
+        if res == UPGRADEABLE_READER {
+            self.inner.queue.wake_all();
+        }
     }
 }

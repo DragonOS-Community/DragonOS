@@ -8,7 +8,7 @@ use crate::filesystem::vfs::{
     self, FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem, FSMAKER,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-use crate::libs::spinlock::SpinLock;
+use crate::libs::mutex::Mutex;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::process::ProcessManager;
@@ -81,7 +81,7 @@ impl Ext4FileSystem {
         let fs = another_ext4::Ext4::load(mount_data)?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
-                LockedExt4Inode(SpinLock::new(Ext4Inode {
+                LockedExt4Inode(Mutex::new(Ext4Inode {
                     inner_inode_num: another_ext4::EXT4_ROOT_INO,
                     fs_ptr: Weak::default(),
                     page_cache: None,

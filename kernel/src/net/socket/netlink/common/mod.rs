@@ -3,7 +3,7 @@ use crate::{
         epoll::EPollEventType,
         vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
     },
-    libs::{rwlock::RwLock, wait_queue::WaitQueue},
+    libs::{rwsem::RwSem, wait_queue::WaitQueue},
     net::socket::{
         endpoint::Endpoint,
         netlink::{
@@ -25,7 +25,7 @@ mod unbound;
 
 #[derive(Debug)]
 pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
-    inner: RwLock<Inner<UnboundNetlink<P>, BoundNetlink<P::Message>>>,
+    inner: RwSem<Inner<UnboundNetlink<P>, BoundNetlink<P::Message>>>,
 
     is_nonblocking: AtomicBool,
     wait_queue: Arc<WaitQueue>,
@@ -42,7 +42,7 @@ where
     pub fn new(is_nonblocking: bool) -> Arc<Self> {
         let unbound = UnboundNetlink::new();
         Arc::new(Self {
-            inner: RwLock::new(Inner::Unbound(unbound)),
+            inner: RwSem::new(Inner::Unbound(unbound)),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             wait_queue: Arc::new(WaitQueue::default()),
             netns: ProcessManager::current_netns(),

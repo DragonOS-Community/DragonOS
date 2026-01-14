@@ -8,7 +8,7 @@ use crate::{
             FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
         },
     },
-    libs::rwlock::RwLock,
+    libs::rwsem::RwSem,
     time::PosixTimeSpec,
 };
 use alloc::collections::BTreeMap;
@@ -25,7 +25,7 @@ pub struct ProcDir<Ops: DirOps> {
     inner: Ops,
     self_ref: Weak<ProcDir<Ops>>,
     parent: Option<Weak<dyn IndexNode>>,
-    cached_children: RwLock<BTreeMap<String, Arc<dyn IndexNode>>>,
+    cached_children: RwSem<BTreeMap<String, Arc<dyn IndexNode>>>,
     common: Common,
     // 没用到？
     // fdata: InodeInfo,
@@ -68,7 +68,7 @@ impl<Ops: DirOps> ProcDir<Ops> {
             inner: dir,
             self_ref: weak_self.clone(),
             parent,
-            cached_children: RwLock::new(BTreeMap::new()),
+            cached_children: RwSem::new(BTreeMap::new()),
             common,
         })
     }
@@ -85,7 +85,7 @@ impl<Ops: DirOps> ProcDir<Ops> {
         self.parent.as_ref().and_then(|p| p.upgrade())
     }
 
-    pub fn cached_children(&self) -> &RwLock<BTreeMap<String, Arc<dyn IndexNode>>> {
+    pub fn cached_children(&self) -> &RwSem<BTreeMap<String, Arc<dyn IndexNode>>> {
         &self.cached_children
     }
 }

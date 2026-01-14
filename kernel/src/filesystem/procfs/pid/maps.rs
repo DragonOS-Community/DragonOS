@@ -117,12 +117,12 @@ fn generate_maps_content(pid: RawPid) -> Result<Vec<u8>, SystemError> {
 
     // 收集并按地址排序
     let mut vmas: Vec<Arc<LockedVMA>> = as_guard.mappings.iter_vmas().cloned().collect();
-    vmas.sort_by_key(|v| v.lock_irqsave().region().start().data());
+    vmas.sort_by_key(|v| v.lock().region().start().data());
 
     let mut out: Vec<u8> = Vec::new();
 
     for vma in vmas {
-        let g = vma.lock_irqsave();
+        let g = vma.lock();
         let region = *g.region();
         let vm_flags = *g.vm_flags();
 

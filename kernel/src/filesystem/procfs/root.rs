@@ -144,7 +144,7 @@ impl DirOps for RootDirOps {
 }
 
 use crate::filesystem::vfs::{FileSystem, FsInfo, Magic, MountableFileSystem, SuperBlock};
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use linkme::distributed_slice;
 
 /// ProcFS 文件系统
@@ -152,7 +152,7 @@ use linkme::distributed_slice;
 pub struct ProcFS {
     /// procfs 的 root inode
     root_inode: Arc<dyn IndexNode>,
-    super_block: RwLock<SuperBlock>,
+    super_block: RwSem<SuperBlock>,
 }
 
 impl ProcFS {
@@ -164,7 +164,7 @@ impl ProcFS {
         );
 
         let fs: Arc<ProcFS> = Arc::new_cyclic(|weak_fs| ProcFS {
-            super_block: RwLock::new(super_block),
+            super_block: RwSem::new(super_block),
             root_inode: RootDirOps::new_inode(weak_fs.clone()),
         });
 

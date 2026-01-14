@@ -14,7 +14,7 @@
 
 use alloc::vec::Vec;
 
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket,
 };
@@ -22,7 +22,7 @@ use smoltcp::wire::{
 #[derive(Debug, Clone, Copy)]
 struct TcpListenPortInfo {
     port: u16,
-    /// backlog==0 时启用：当“本轮 poll 里 LISTEN socket 被消耗完”后，后续纯 SYN 直接丢弃（不让 smoltcp 回 RST）。
+    /// backlog==0 时启用：当"本轮 poll 里 LISTEN socket 被消耗完"后，后续纯 SYN 直接丢弃（不让 smoltcp 回 RST）。
     drop_syn_when_full: bool,
     /// 缓存：当前是否存在至少一个处于 LISTEN 状态的 smoltcp socket（同端口）。
     ///
@@ -30,16 +30,16 @@ struct TcpListenPortInfo {
     listen_socket_present: bool,
 }
 
-/// 每个 Iface 维护一份 listener/backlog 状态，用于收包入口的“是否丢 SYN”决策。
+/// 每个 Iface 维护一份 listener/backlog 状态，用于收包入口的"是否丢 SYN"决策。
 #[derive(Debug)]
 pub struct TcpListenerBacklog {
-    ports: RwLock<Vec<TcpListenPortInfo>>,
+    ports: RwSem<Vec<TcpListenPortInfo>>,
 }
 
 impl TcpListenerBacklog {
     pub fn new() -> Self {
         Self {
-            ports: RwLock::new(Vec::new()),
+            ports: RwSem::new(Vec::new()),
         }
     }
 

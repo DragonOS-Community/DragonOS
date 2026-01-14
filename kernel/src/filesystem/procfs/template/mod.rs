@@ -14,7 +14,7 @@
 
 use crate::{
     filesystem::vfs::{utils::DName, FileSystem, Metadata},
-    libs::rwlock::RwLock,
+    libs::rwsem::RwSem,
 };
 
 use alloc::sync::{Arc, Weak};
@@ -41,7 +41,7 @@ pub use self::{
 #[derive(Debug)]
 pub(super) struct Common {
     fs: Weak<dyn FileSystem>,
-    metadata: RwLock<Metadata>,
+    metadata: RwSem<Metadata>,
     pub(super) dname: DName,
 }
 
@@ -49,7 +49,7 @@ impl Common {
     /// 创建一个新的 Common 实例
     pub fn new(metadata: Metadata, fs: Weak<dyn FileSystem>, _is_volatile: bool) -> Self {
         Self {
-            metadata: RwLock::new(metadata),
+            metadata: RwSem::new(metadata),
             fs,
             dname: DName::default(),
         }

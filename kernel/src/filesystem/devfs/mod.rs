@@ -11,7 +11,6 @@ use super::{
     },
 };
 use crate::filesystem::devfs::zero_dev::LockedZeroInode;
-use crate::libs::mutex::MutexGuard;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::{
@@ -19,9 +18,8 @@ use crate::{
     filesystem::vfs::{mount::MountFlags, produce_fs},
     libs::{
         casting::DowncastArc,
-        mutex::Mutex,
+        mutex::{Mutex, MutexGuard},
         once::Once,
-        spinlock::{SpinLock, SpinLockGuard},
     },
     process::ProcessManager,
     time::PosixTimeSpec,
@@ -47,7 +45,7 @@ pub struct DevFS {
 
 fn is_zero_inode(pfm: &PageFaultMessage) -> bool {
     let vma = pfm.vma();
-    let vma_guard = vma.lock_irqsave();
+    let vma_guard = vma.lock();
     match vma_guard.vm_file() {
         Some(file) => {
             let inode = file.inode();
@@ -112,7 +110,7 @@ impl DevFS {
             DEVFS_MAX_NAMELEN as u64,
         );
         // 初始化root inode
-        let root: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(
+        let root: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(Mutex::new(
             // /dev 的权限设置为 读+执行，root 可以读写
             // root 的 parent 是空指针
             DevFSInode::new(FileType::Dir, InodeMode::from_bits_truncate(0o755), 0),
@@ -126,7 +124,7 @@ impl DevFS {
         });
 
         // 对root inode加锁，并继续完成初始化工作
-        let mut root_guard: SpinLockGuard<DevFSInode> = devfs.root_inode.0.lock();
+        let mut root_guard: MutexGuard<DevFSInode> = devfs.root_inode.0.lock();
         root_guard.parent = Arc::downgrade(&devfs.root_inode);
         root_guard.self_ref = Arc::downgrade(&devfs.root_inode);
         root_guard.fs = Arc::downgrade(&devfs);
@@ -331,7 +329,7 @@ impl DevFS {
 
 /// @brief dev文件i节点(锁)
 #[derive(Debug)]
-pub struct LockedDevFSInode(SpinLock<DevFSInode>);
+pub struct LockedDevFSInode(Mutex<DevFSInode>);
 
 /// @brief dev文件i节点(无锁)
 #[derive(Debug)]
@@ -394,7 +392,7 @@ impl DevFSInode {
 
 impl LockedDevFSInode {
     pub fn add_dir(&self, name: &str) -> Result<(), SystemError> {
-        let guard: SpinLockGuard<DevFSInode> = self.0.lock();
+        let guard: MutexGuard<DevFSInode> = self.0.lock();
 
         if guard.children.contains_key(&DName::from(name)) {
             return Err(SystemError::EEXIST);
@@ -459,7 +457,7 @@ impl LockedDevFSInode {
 
     fn do_create_with_data(
         &self,
-        mut guard: SpinLockGuard<DevFSInode>,
+        mut guard: MutexGuard<DevFSInode>,
         name: &str,
         file_type: FileType,
         mode: InodeMode,
@@ -475,7 +473,7 @@ impl LockedDevFSInode {
         }
 
         // 创建inode
-        let result: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(DevFSInode {
+        let result: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(Mutex::new(DevFSInode {
             parent: guard.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
@@ -536,7 +534,7 @@ impl IndexNode for LockedDevFSInode {
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
-        let guard: SpinLockGuard<DevFSInode> = self.0.lock();
+        let guard: MutexGuard<DevFSInode> = self.0.lock();
         // 如果当前inode不是文件夹，则返回
         return self.do_create_with_data(guard, name, file_type, mode, data);
     }
@@ -571,7 +569,7 @@ impl IndexNode for LockedDevFSInode {
     }
 
     fn get_entry_name(&self, ino: super::vfs::InodeId) -> Result<String, SystemError> {
-        let inode: SpinLockGuard<DevFSInode> = self.0.lock();
+        let inode: MutexGuard<DevFSInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }

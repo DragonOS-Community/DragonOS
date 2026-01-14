@@ -199,7 +199,7 @@ fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpac
     );
 
     // 切换到新的用户地址空间
-    unsafe { new_vm.read().user_mapper.utable.make_current() };
+    unsafe { new_vm.make_current() };
 
     drop(irq_guard);
 

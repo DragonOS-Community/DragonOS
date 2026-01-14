@@ -1,4 +1,4 @@
-use crate::libs::spinlock::SpinLock;
+use crate::libs::mutex::Mutex;
 use crate::libs::wait_queue::WaitQueue;
 use crate::process::ProcessState;
 use alloc::collections::VecDeque;
@@ -7,7 +7,7 @@ use system_error::SystemError;
 
 /// Netlink Socket 的消息队列
 #[derive(Debug)]
-pub struct MessageQueue<Message>(pub Arc<SpinLock<VecDeque<Message>>>);
+pub struct MessageQueue<Message>(pub Arc<Mutex<VecDeque<Message>>>);
 
 impl<Message> Clone for MessageQueue<Message> {
     fn clone(&self) -> Self {
@@ -17,7 +17,7 @@ impl<Message> Clone for MessageQueue<Message> {
 
 impl<Message> MessageQueue<Message> {
     pub fn new() -> Self {
-        Self(Arc::new(SpinLock::new(VecDeque::new())))
+        Self(Arc::new(Mutex::new(VecDeque::new())))
     }
 
     fn enqueue(&self, message: Message) -> Result<(), SystemError> {

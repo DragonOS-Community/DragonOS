@@ -171,7 +171,7 @@
     "hash": "abe911dac525b44fe083752a1e6bbdc7"
   },
   "en:kernel/locking/mutex.md": {
-    "hash": "a82fa540acd44a93f5cb3c069d5584da"
+    "hash": "db7dc3202e78810c3a90bcf9808557f5"
   },
   "en:kernel/boot/cmdline.md": {
     "hash": "3d17446c60b72e9cadf82002520ebbf9"
@@ -318,7 +318,7 @@
     "hash": "11140afc1e5daa1667d40cae29a80b9a"
   },
   "en:kernel/sched/wait_queue.md": {
-    "hash": "550f38b4386c3755535e99e97bc98243"
+    "hash": "31c47608306f88bc8fec9527905ba5b8"
   },
   "en:agents/release_agent_capability.md": {
     "hash": "6c10917f7e05f9a0c5d75c7bbed4bc71"
@@ -354,7 +354,7 @@
     "hash": "b0b020398fb048e2c87135e3bb2974b3"
   },
   "en:kernel/locking/rwsem.md": {
-    "hash": "f19bd3e7ace9536b7e5c49fb4a6163e1"
+    "hash": "8728e5478056362db9deca9b27089be1"
   },
   "en:kernel/sched/fifo.md": {
     "hash": "7193f93fd9af38c8b7d2ad0ad9453ce5"

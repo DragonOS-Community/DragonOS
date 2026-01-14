@@ -12,11 +12,11 @@ use alloc::vec::Vec;
 use system_error::SystemError;
 
 /// 系统信息结构体
-///
+/// 这里的Posix的意思指的是对齐Linux的面向用户态的结构体。避免内核态把他混淆使用。
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/uapi/linux/sysinfo.h#8
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(C)]
-struct SysInfo {
+struct PosixSysInfo {
     uptime: u64,
     loads: [u64; 3],
     totalram: u64,
@@ -39,8 +39,8 @@ pub struct SysInfoHandle;
 
 impl SysInfoHandle {
     /// Extracts the info pointer from syscall arguments
-    fn info(args: &[usize]) -> *mut SysInfo {
-        args[0] as *mut SysInfo
+    fn info(args: &[usize]) -> *mut PosixSysInfo {
+        args[0] as *mut PosixSysInfo
     }
 }
 
@@ -92,9 +92,9 @@ syscall_table_macros::declare_syscall!(SYS_SYSINFO, SysInfoHandle);
 /// # Returns
 /// * `Ok(0)` - Success
 /// * `Err(SystemError)` - Error code if operation fails
-fn do_sysinfo(info: *mut SysInfo) -> Result<usize, SystemError> {
-    let mut writer = UserBufferWriter::new(info, core::mem::size_of::<SysInfo>(), true)?;
-    let mut sysinfo = SysInfo::default();
+fn do_sysinfo(info: *mut PosixSysInfo) -> Result<usize, SystemError> {
+    let mut writer = UserBufferWriter::new(info, core::mem::size_of::<PosixSysInfo>(), true)?;
+    let mut sysinfo = PosixSysInfo::default();
 
     let mem = unsafe { LockedFrameAllocator.usage() };
     let slab_usage = unsafe { slab_usage() };
@@ -107,7 +107,7 @@ fn do_sysinfo(info: *mut SysInfo) -> Result<usize, SystemError> {
     sysinfo.bufferram = 0;
     sysinfo.totalswap = 0;
     sysinfo.freeswap = 0;
-    sysinfo.procs = ProcessManager::ns_process_count() as u16;
+    sysinfo.procs = ProcessManager::current_pidns().pid_allocated() as u16;
     sysinfo.pad = 0;
     sysinfo.totalhigh = 0;
     sysinfo.freehigh = 0;

@@ -58,7 +58,10 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    process::resource::{RLimit64, RLimitID},
+    process::{
+        namespace::pid_namespace::PidNamespace,
+        resource::{RLimit64, RLimitID},
+    },
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
         cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
@@ -777,11 +780,6 @@ impl ProcessManager {
         }
 
         ProcessManager::current_pcb().preempt_enable();
-    }
-
-    /// 获取当前 PID namespace 中的进程数量
-    pub fn ns_process_count() -> usize {
-        Self::current_pcb().active_pid_ns().pid_allocated()
     }
 }
 

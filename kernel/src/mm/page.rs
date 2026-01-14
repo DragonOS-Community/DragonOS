@@ -274,7 +274,7 @@ fn page_reclaim_thread() -> i32 {
 
 /// 获取页面回收器
 pub fn page_reclaimer_lock_irqsave() -> SpinLockGuard<'static, PageReclaimer> {
-    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock_irqsave() }
+    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock() }
 }
 
 /// 页面回收器
@@ -355,7 +355,7 @@ impl PageReclaimer {
                 // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
                 // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
                 if let Some(page_cache) = info.page_cache.upgrade() {
-                    page_cache.lock_irqsave().remove_page(page_index);
+                    page_cache.lock().remove_page(page_index);
                 }
                 page_manager_lock().remove_page(&paddr);
             }

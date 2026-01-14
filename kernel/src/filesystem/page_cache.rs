@@ -11,12 +11,12 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use super::vfs::IndexNode;
-use crate::libs::spinlock::SpinLockGuard;
+use crate::libs::mutex::MutexGuard;
 use crate::mm::page::FileMapInfo;
 use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
     arch::MMArch,
-    libs::spinlock::SpinLock,
+    libs::mutex::Mutex,
     mm::{
         page::{page_manager_lock, page_reclaimer_lock_irqsave, Page, PageFlags},
         MemoryManagementArch,
@@ -29,7 +29,7 @@ static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug)]
 pub struct PageCache {
     id: usize,
-    inner: SpinLock<InnerPageCache>,
+    inner: Mutex<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
     unevictable: AtomicBool,
 }
@@ -459,7 +459,7 @@ impl PageCache {
         let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
         Arc::new_cyclic(|weak| Self {
             id,
-            inner: SpinLock::new(InnerPageCache::new(weak.clone(), id)),
+            inner: Mutex::new(InnerPageCache::new(weak.clone(), id)),
             inode: {
                 let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
                 if let Some(inode) = inode {
@@ -490,15 +490,8 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn lock_irqsave(&self) -> SpinLockGuard<'_, InnerPageCache> {
-        if self.inner.is_locked() {
-            log::error!("page cache already locked");
-        }
-        self.inner.lock_irqsave()
-    }
-
-    pub fn is_locked(&self) -> bool {
-        self.inner.is_locked()
+    pub fn lock(&self) -> MutexGuard<'_, InnerPageCache> {
+        self.inner.lock()
     }
 
     /// Mark this page cache as unevictable (or revert). When enabled, newly created
@@ -510,7 +503,7 @@ impl PageCache {
     /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let (copies, ret) = {
-            let mut guard = self.inner.lock_irqsave();
+            let mut guard = self.inner.lock();
             guard.prepare_read(offset, buf.len())?
         };
 
@@ -534,7 +527,7 @@ impl PageCache {
     /// 两阶段写入：持锁收集目标页，解锁后按页写入，避免用户缺页时持有page cache锁
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let (copies, ret) = {
-            let mut guard = self.inner.lock_irqsave();
+            let mut guard = self.inner.lock();
             guard.write(offset, buf)?
         };
 

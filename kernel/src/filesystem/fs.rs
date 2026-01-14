@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 
 use crate::filesystem::vfs::IndexNode;
 use crate::filesystem::vfs::InodeMode;
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use crate::process::ProcessManager;
 #[derive(Debug, Clone)]
 struct PathContext {
@@ -24,7 +24,7 @@ impl PathContext {
 #[derive(Debug)]
 pub struct FsStruct {
     umask: AtomicU32, // 文件权限掩码
-    path_context: RwLock<PathContext>,
+    path_context: RwSem<PathContext>,
 }
 
 impl Clone for FsStruct {
@@ -32,7 +32,7 @@ impl Clone for FsStruct {
         let current_umask = self.umask.load(Ordering::Relaxed);
         Self {
             umask: AtomicU32::new(current_umask),
-            path_context: RwLock::new(self.path_context.read().clone()),
+            path_context: RwSem::new(self.path_context.read().clone()),
         }
     }
 }
@@ -49,7 +49,7 @@ impl FsStruct {
             // Linux 常见默认 umask：0022（屏蔽 group/other 的写权限）。
             // 这能保证新建文件默认不对组/其他可写，同时不把所有写权限都屏蔽掉。
             umask: AtomicU32::new((InodeMode::S_IWGRP | InodeMode::S_IWOTH).bits()),
-            path_context: RwLock::new(PathContext::new()),
+            path_context: RwSem::new(PathContext::new()),
         }
     }
 

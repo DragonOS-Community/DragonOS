@@ -273,7 +273,7 @@ impl PageFaultHandler {
                     let flags = vma.lock().flags();
                     if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
                         flush.flush();
-                        page.write_irqsave().insert_vma(vma.clone());
+                        page.write().insert_vma(vma.clone());
 
                         // 如果设置了 VM_LOCKONFAULT，锁定页面
                         // mlock_page 不会失败（与 Linux 一致）
@@ -307,7 +307,7 @@ impl PageFaultHandler {
             let paddr = mapper.translate(address).unwrap().0;
             let mut page_manager_guard = page_manager_lock();
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write_irqsave().insert_vma(vma.clone());
+            page.write().insert_vma(vma.clone());
 
             // 如果设置了 VM_LOCKONFAULT，锁定页面
             // mlock_page 不会失败（与 Linux 一致）
@@ -428,7 +428,7 @@ impl PageFaultHandler {
         let cache_page = pfm.page.clone().expect("no cache_page in PageFaultMessage");
 
         // 将pagecache页设为脏页，以便回收时能够回写
-        cache_page.write_irqsave().add_flags(PageFlags::PG_DIRTY);
+        cache_page.write().add_flags(PageFlags::PG_DIRTY);
         ret = ret.union(Self::finish_fault(pfm));
 
         ret
@@ -491,7 +491,7 @@ impl PageFaultHandler {
         let old_paddr = mapper.translate(address).unwrap().0;
         let mut page_manager = page_manager_lock();
         let old_page = page_manager.get_unwrap(&old_paddr);
-        let map_count = old_page.read_irqsave().map_count();
+        let map_count = old_page.read().map_count();
         drop(page_manager);
 
         let mut entry = mapper.get_entry(address, 0).unwrap();
@@ -504,7 +504,7 @@ impl PageFaultHandler {
             entry.set_flags(new_flags);
             table.set_entry(i, entry);
 
-            old_page.write_irqsave().add_flags(PageFlags::PG_DIRTY);
+            old_page.write().add_flags(PageFlags::PG_DIRTY);
 
             VmFaultReason::VM_FAULT_COMPLETED
         } else if vma.is_anonymous() {
@@ -518,14 +518,14 @@ impl PageFaultHandler {
             } else if let Some(flush) = mapper.map(address, new_flags) {
                 let mut page_manager_guard = page_manager_lock();
                 let old_page = page_manager_guard.get_unwrap(&old_paddr);
-                old_page.write_irqsave().remove_vma(&vma);
+                old_page.write().remove_vma(&vma);
                 // drop(page_manager_guard);
 
                 flush.flush();
                 let paddr = mapper.translate(address).unwrap().0;
                 // let mut page_manager_guard = page_manager_lock();
                 let page = page_manager_guard.get_unwrap(&paddr);
-                page.write_irqsave().insert_vma(vma.clone());
+                page.write().insert_vma(vma.clone());
 
                 (MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8).copy_from_nonoverlapping(
                     MMArch::phys_2_virt(old_paddr).unwrap().data() as *mut u8,
@@ -541,14 +541,14 @@ impl PageFaultHandler {
             if let Some(flush) = mapper.map(address, new_flags) {
                 let mut page_manager_guard = page_manager_lock();
                 let old_page = page_manager_guard.get_unwrap(&old_paddr);
-                old_page.write_irqsave().remove_vma(&vma);
+                old_page.write().remove_vma(&vma);
                 // drop(page_manager_guard);
 
                 flush.flush();
                 let paddr = mapper.translate(address).unwrap().0;
                 // let mut page_manager_guard = page_manager_lock();
                 let page = page_manager_guard.get_unwrap(&paddr);
-                page.write_irqsave().insert_vma(vma.clone());
+                page.write().insert_vma(vma.clone());
 
                 (MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8).copy_from_nonoverlapping(
                     MMArch::phys_2_virt(old_paddr).unwrap().data() as *mut u8,
@@ -671,7 +671,7 @@ impl PageFaultHandler {
 
         for pgoff in start_pgoff..end_pgoff {
             if let Some(page) = page_cache.lock().get_page(pgoff) {
-                let page_guard = page.read_irqsave();
+                let page_guard = page.read();
                 if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
                     let phys = page.phys_address();
 
@@ -792,7 +792,7 @@ impl PageFaultHandler {
         // 先尝试直接获取
         if let Some(page) = page_cache.lock().get_page(backing_pgoff) {
             // 标记为 UPTODATE，便于 map_pages / readahead（即便对 tmpfs 通常不会走）。
-            page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
+            page.write().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);
             return VmFaultReason::empty();
         }
@@ -805,7 +805,7 @@ impl PageFaultHandler {
 
         let page = page_cache.lock().get_page(backing_pgoff);
         if let Some(page) = page {
-            page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
+            page.write().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);
             VmFaultReason::empty()
         } else {
@@ -843,7 +843,7 @@ impl PageFaultHandler {
         let page_phys = page_to_map.phys_address();
 
         mapper.map_phys(address, page_phys, vma_guard.flags());
-        page_to_map.write_irqsave().insert_vma(pfm.vma());
+        page_to_map.write().insert_vma(pfm.vma());
         VmFaultReason::VM_FAULT_COMPLETED
     }
 
@@ -859,7 +859,7 @@ impl PageFaultHandler {
             let mut pm = page_manager_lock();
             let paddr = mapper.translate(address).unwrap().0;
             let page = pm.get_unwrap(&paddr);
-            page.write_irqsave().insert_vma(vma);
+            page.write().insert_vma(vma);
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             VmFaultReason::VM_FAULT_OOM
@@ -890,7 +890,7 @@ impl PageFaultHandler {
                 let mut pm = page_manager_lock();
                 let paddr = mapper.translate(addr).unwrap().0;
                 let page = pm.get_unwrap(&paddr);
-                page.write_irqsave().insert_vma(vma.clone());
+                page.write().insert_vma(vma.clone());
             } else {
                 return VmFaultReason::VM_FAULT_OOM;
             }

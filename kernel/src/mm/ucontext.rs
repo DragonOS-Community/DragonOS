@@ -317,7 +317,7 @@ impl InnerAddressSpace {
                         }
                         // 为新进程的VMA添加反向映射
                         if let Some(page) = page_manager_guard.get(&phys_addr) {
-                            page.write_irqsave().insert_vma(new_vma.clone());
+                            page.write().insert_vma(new_vma.clone());
                         }
                     }
                 }
@@ -1000,7 +1000,7 @@ impl InnerAddressSpace {
 
                 // 更新物理页的 vma_set
                 let page = page_manager_guard.get_unwrap(&paddr);
-                let mut pg = page.write_irqsave();
+                let mut pg = page.write();
                 if !dontunmap {
                     pg.remove_vma(old_vma.as_ref());
                 }
@@ -2106,7 +2106,7 @@ impl LockedVMA {
         if let Some((paddr, _flags)) = mapper.translate(guard.region().start()) {
             // 如果是共享页，执行释放操作
             let page = page_manager_guard.get(&paddr).unwrap();
-            let _page_guard = page.read_irqsave();
+            let _page_guard = page.read();
             if let Some(shm_id) = guard.shm_id {
                 let ipcns = ProcessManager::current_ipcns();
                 let mut shm_manager_guard = ipcns.shm.lock();
@@ -2135,7 +2135,7 @@ impl LockedVMA {
 
             // 从anon_vma中删除当前VMA
             let page = page_manager_guard.get_unwrap(&paddr);
-            let mut page_guard = page.write_irqsave();
+            let mut page_guard = page.write();
             page_guard.remove_vma(self);
 
             // 如果物理页的vma链表长度为0并且未标记为不可回收，则释放物理页.
@@ -2226,7 +2226,7 @@ impl LockedVMA {
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
                     let page = page_manager_guard.get_unwrap(&paddr);
-                    let mut page_guard = page.write_irqsave();
+                    let mut page_guard = page.write();
                     page_guard.insert_vma(before.clone());
                     page_guard.remove_vma(self);
                     before.lock().mapped = true;
@@ -2239,7 +2239,7 @@ impl LockedVMA {
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
                     let page = page_manager_guard.get_unwrap(&paddr);
-                    let mut page_guard = page.write_irqsave();
+                    let mut page_guard = page.write();
                     page_guard.insert_vma(after.clone());
                     page_guard.remove_vma(self);
                     after.lock().mapped = true;
@@ -2422,7 +2422,7 @@ impl AnonSharedMapping {
         let mut allocator = LockedFrameAllocator;
         let page = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
         // Mark shared-anon pages as unevictable so shrinking/unmapping doesn't drop their contents.
-        page.write_irqsave().add_flags(PageFlags::PG_UNEVICTABLE);
+        page.write().add_flags(PageFlags::PG_UNEVICTABLE);
         guard.insert(pgoff, page.phys_address());
         Ok(page)
     }
@@ -2439,7 +2439,7 @@ impl Drop for AnonSharedMapping {
         let mut pm = page_manager_lock();
         for paddr in pages {
             if let Some(page) = pm.get(&paddr) {
-                let mut pg = page.write_irqsave();
+                let mut pg = page.write();
                 pg.remove_flags(PageFlags::PG_UNEVICTABLE);
                 if pg.can_deallocate() {
                     drop(pg);
@@ -2667,7 +2667,7 @@ impl VMA {
         for _ in 0..params.count.data() {
             let paddr = cur_phy.phys_address();
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write_irqsave().insert_vma(r.clone());
+            page.write().insert_vma(r.clone());
             cur_phy = cur_phy.next();
         }
 
@@ -2740,7 +2740,7 @@ impl VMA {
 
             // 将VMA加入到anon_vma
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write_irqsave().insert_vma(r.clone());
+            page.write().insert_vma(r.clone());
         }
         // debug!("VMA::zeroed: done");
         return Ok(r);

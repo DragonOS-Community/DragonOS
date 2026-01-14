@@ -27,6 +27,7 @@ mod sys_fchownat;
 mod sys_fcntl;
 mod sys_fstatfs;
 mod sys_ftruncate;
+mod sys_fallocate;
 mod sys_getcwd;
 mod sys_getdents;
 mod sys_ioctl;

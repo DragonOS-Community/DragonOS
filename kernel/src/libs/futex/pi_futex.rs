@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, collections::LinkedList, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use system_error::SystemError;
@@ -6,7 +6,9 @@ use system_error::SystemError;
 use crate::{
     libs::{
         futex::{
-            constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY, FUTEX_TID_MASK, FUTEX_WAITERS},
+            constant::{
+                FutexFlag, FUTEX_BITSET_MATCH_ANY, FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS,
+            },
             futex::{Futex, FutexAccess, FutexData, FutexHashBucket, FutexObj},
         },
         wait_queue::{Waiter, Waker},
@@ -58,78 +60,56 @@ impl Futex {
             FutexAccess::FutexWrite,
         )?;
 
-        // 使用原子操作尝试获取锁
         let atomic_futex = unsafe { AtomicU32::from_ptr(uaddr.as_ptr::<u32>()) };
 
         loop {
             let uval = atomic_futex.load(Ordering::SeqCst);
             let owner_tid = uval & FUTEX_TID_MASK;
+            let owner_died = uval & FUTEX_OWNER_DIED;
 
-            // 情况1: futex为0，尝试直接获取锁
-            if uval == 0 {
+            // 快路径：锁空闲且无WAITERS
+            if owner_tid == 0 && (uval & FUTEX_WAITERS) == 0 {
+                let desired = current_tid | owner_died;
                 match atomic_futex.compare_exchange(
-                    0,
-                    current_tid,
+                    uval,
+                    desired,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 ) {
-                    Ok(_) => return Ok(0),
-                    Err(_) => continue, // CAS失败，重试
+                    Ok(_) => {
+                        let mut futex_map_guard = FutexData::futex_map();
+                        if let Some(bucket) = futex_map_guard.get_mut(&key) {
+                            bucket.pi_owner = current_tid;
+                        }
+                        if owner_died != 0 {
+                            return Err(SystemError::EOWNERDEAD);
+                        }
+                        return Ok(0);
+                    }
+                    Err(_) => continue,
                 }
             }
 
-            // 情况2: 当前线程已经持有锁，返回EDEADLK_OR_EDEADLOCK
             if owner_tid == current_tid {
                 return Err(SystemError::EDEADLK_OR_EDEADLOCK);
             }
-
-            // 情况3: 锁被其他线程持有，需要等待
-            // 设置WAITERS位通知持有者有线程在等待
-            let new_val = uval | FUTEX_WAITERS;
-            if uval != new_val {
-                match atomic_futex.compare_exchange(
-                    uval,
-                    new_val,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => {}
-                    Err(_) => continue, // CAS失败，重试
-                }
-            }
-
-            // 将当前进程加入等待队列
-            let mut futex_map_guard = FutexData::futex_map();
-            let bucket = futex_map_guard.get_mut(&key);
-            let bucket_mut = match bucket {
-                Some(bucket) => bucket,
-                None => {
-                    let bucket = FutexHashBucket {
-                        chain: LinkedList::new(),
-                    };
-                    futex_map_guard.insert(key.clone(), bucket);
-                    futex_map_guard.get_mut(&key).unwrap()
-                }
-            };
 
             let (waiter, waker) = Waiter::new_pair();
             let futex_q = Arc::new(FutexObj {
                 waker: waker.clone(),
                 key: key.clone(),
                 bitset: FUTEX_BITSET_MATCH_ANY,
+                tid: current_tid,
             });
 
-            // 创建超时定时器
             let mut timer = None;
             if let Some(time) = timeout {
                 let sec = time.tv_sec;
                 let nsec = time.tv_nsec;
                 let total_us = (nsec / 1000 + sec * 1_000_000) as u64;
-
                 if total_us == 0 {
                     return Err(SystemError::ETIMEDOUT);
                 }
-
                 let jiffies = next_n_us_timer_jiffies(total_us);
                 let wake_up = Timer::new(
                     Box::new(WakerTimer {
@@ -140,7 +120,55 @@ impl Futex {
                 timer = Some(wake_up);
             }
 
-            bucket_mut.enqueue(futex_q.clone());
+            let mut futex_map_guard = FutexData::futex_map();
+            let bucket_mut = futex_map_guard
+                .entry(key.clone())
+                .or_insert(FutexHashBucket::new());
+
+            // Re-check owner under futex map lock.
+            let cur_val = atomic_futex.load(Ordering::SeqCst);
+            let cur_owner = cur_val & FUTEX_TID_MASK;
+            if cur_owner == 0 {
+                let desired = current_tid
+                    | if bucket_mut.pi_waiters.is_empty() {
+                        0
+                    } else {
+                        FUTEX_WAITERS
+                    }
+                    | (cur_val & FUTEX_OWNER_DIED);
+                if atomic_futex
+                    .compare_exchange(cur_val, desired, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    bucket_mut.pi_owner = current_tid;
+                    drop(futex_map_guard);
+                    if (cur_val & FUTEX_OWNER_DIED) != 0 {
+                        return Err(SystemError::EOWNERDEAD);
+                    }
+                    return Ok(0);
+                }
+                drop(futex_map_guard);
+                continue;
+            }
+
+            if bucket_mut.pi_owner == 0 {
+                bucket_mut.pi_owner = cur_owner;
+            }
+
+            bucket_mut.pi_waiters.push_back(futex_q.clone());
+
+            loop {
+                let val = atomic_futex.load(Ordering::SeqCst);
+                if (val & FUTEX_WAITERS) != 0 {
+                    break;
+                }
+                if atomic_futex
+                    .compare_exchange(val, val | FUTEX_WAITERS, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
 
             if let Some(ref t) = timer {
                 t.activate();
@@ -149,75 +177,74 @@ impl Futex {
             drop(futex_map_guard);
             let wait_res = waiter.wait(true);
 
-            // 被唤醒后检查是否成功获取锁
-            let current_val = atomic_futex.load(Ordering::SeqCst);
-            let current_owner = current_val & FUTEX_TID_MASK;
+            let is_timeout = timer.as_ref().is_some_and(|t| t.timeout());
 
-            // 如果当前线程已持有锁，说明被正常唤醒并获取了锁
-            if current_owner == current_tid {
-                if let Some(timer) = timer {
-                    timer.cancel();
-                }
-                return Ok(0);
-            }
-
-            // 检查是否超时
-            if let Some(ref timer) = timer {
-                if timer.timeout() {
-                    // 从等待队列移除
-                    let mut futex_map_guard = FutexData::futex_map();
-                    if let Some(bucket) = futex_map_guard.get_mut(&key) {
-                        bucket.remove_by_waker(&waker);
-                    }
-                    return Err(SystemError::ETIMEDOUT);
-                }
-            }
-
-            if let Err(e) = wait_res {
-                // 信号等导致的错误，移除并返回
-                let mut futex_map_guard = FutexData::futex_map();
-                if let Some(bucket) = futex_map_guard.get_mut(&key) {
-                    bucket.remove_by_waker(&waker);
-                }
-                return Err(e);
-            }
-
-            // 重新尝试获取锁
-            // 被唤醒后，futex值可能是：
-            // 1. 0 - 没有等待者，直接获取
-            // 2. FUTEX_WAITERS (0x80000000) - 还有其他等待者，需要保留WAITERS位
-            // 3. 其他TID - 已被另一个线程获取，需要重新进入等待
-
-            if current_owner == 0 {
-                // 锁空闲，尝试获取
-                let new_val = if (current_val & FUTEX_WAITERS) != 0 {
-                    // 还有其他等待者，保留WAITERS位
-                    current_tid | FUTEX_WAITERS
-                } else {
-                    // 没有其他等待者
-                    current_tid
-                };
-
-                match atomic_futex.compare_exchange(
-                    current_val,
-                    new_val,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => {
-                        if let Some(timer) = timer {
-                            timer.cancel();
+            let mut futex_map_guard = FutexData::futex_map();
+            if let Some(bucket) = futex_map_guard.get_mut(&key) {
+                let mut in_queue = false;
+                bucket
+                    .pi_waiters
+                    .extract_if(|x| {
+                        if Arc::ptr_eq(&x.waker, &waker) {
+                            in_queue = true;
+                            true
+                        } else {
+                            false
                         }
-                        return Ok(0);
-                    }
-                    Err(_) => {
-                        // 继续循环等待
-                        continue;
+                    })
+                    .for_each(drop);
+
+                if bucket.pi_waiters.is_empty() {
+                    loop {
+                        let val = atomic_futex.load(Ordering::SeqCst);
+                        if (val & FUTEX_WAITERS) == 0 {
+                            break;
+                        }
+                        let desired = val & !FUTEX_WAITERS;
+                        if atomic_futex
+                            .compare_exchange(val, desired, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            break;
+                        }
                     }
                 }
-            } else {
-                // 锁被其他线程持有，继续等待
-                continue;
+
+                if bucket.pi_owner == current_tid {
+                    drop(futex_map_guard);
+                    if let Some(timer) = timer {
+                        timer.cancel();
+                    }
+                    let post_val = atomic_futex.load(Ordering::SeqCst);
+                    if (post_val & FUTEX_OWNER_DIED) != 0 {
+                        return Err(SystemError::EOWNERDEAD);
+                    }
+                    return Ok(0);
+                }
+
+                if in_queue && (is_timeout || wait_res.is_err()) {
+                    drop(futex_map_guard);
+                    if let Some(timer) = timer {
+                        timer.cancel();
+                    }
+                    return if is_timeout {
+                        Err(SystemError::ETIMEDOUT)
+                    } else {
+                        Err(SystemError::EINTR)
+                    };
+                }
+            }
+
+            drop(futex_map_guard);
+            if let Some(timer) = timer {
+                timer.cancel();
+            }
+
+            if is_timeout {
+                return Err(SystemError::ETIMEDOUT);
+            }
+            if wait_res.is_err() || ProcessManager::current_pcb().has_pending_signal() {
+                return Err(SystemError::EINTR);
             }
         }
     }
@@ -248,77 +275,67 @@ impl Futex {
         loop {
             let uval = atomic_futex.load(Ordering::SeqCst);
             let owner_tid = uval & FUTEX_TID_MASK;
+            let owner_died = uval & FUTEX_OWNER_DIED;
 
             // 检查当前线程是否持有锁
             if owner_tid != current_tid {
                 return Err(SystemError::EPERM);
             }
 
-            // 检查是否有等待者
-            let has_waiters = (uval & FUTEX_WAITERS) != 0;
-
-            if !has_waiters {
-                // 没有等待者，直接释放锁
-                match atomic_futex.compare_exchange(uval, 0, Ordering::SeqCst, Ordering::SeqCst) {
-                    Ok(_) => return Ok(0),
-                    Err(_) => continue, // CAS失败，重试
-                }
-            } else {
-                // 有等待者，需要唤醒一个等待线程
-                let mut futex_map_guard = FutexData::futex_map();
-                let bucket = futex_map_guard.get_mut(&key);
-
-                match bucket {
-                    Some(bucket_mut) => {
-                        // 唤醒一个等待者
-                        let woken = bucket_mut.wake_up(key.clone(), None, 1)?;
-
-                        if woken > 0 {
-                            // 成功唤醒一个线程，清除当前线程的TID但保留WAITERS位
-                            // 被唤醒的线程会尝试获取锁
-                            match atomic_futex.compare_exchange(
-                                uval,
-                                FUTEX_WAITERS,
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                            ) {
-                                Ok(_) => {
-                                    drop(futex_map_guard);
-                                    FutexData::try_remove(&key);
-                                    return Ok(0);
-                                }
-                                Err(_) => continue, // CAS失败，重试
-                            }
-                        } else {
-                            // 没有成功唤醒任何线程，直接清除锁
-                            match atomic_futex.compare_exchange(
-                                uval,
-                                0,
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                            ) {
-                                Ok(_) => {
-                                    drop(futex_map_guard);
-                                    FutexData::try_remove(&key);
-                                    return Ok(0);
-                                }
-                                Err(_) => continue,
-                            }
-                        }
+            let mut futex_map_guard = FutexData::futex_map();
+            let bucket_opt = futex_map_guard.get_mut(&key);
+            let bucket = match bucket_opt {
+                None => {
+                    if atomic_futex
+                        .compare_exchange(uval, owner_died, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        drop(futex_map_guard);
+                        return Ok(0);
                     }
-                    None => {
-                        // 没有等待队列，直接清除锁
-                        match atomic_futex.compare_exchange(
-                            uval,
-                            0,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        ) {
-                            Ok(_) => return Ok(0),
-                            Err(_) => continue,
-                        }
-                    }
+                    continue;
                 }
+                Some(bucket) => bucket,
+            };
+
+            if bucket.pi_waiters.is_empty() {
+                if atomic_futex
+                    .compare_exchange(uval, owner_died, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    bucket.pi_owner = 0;
+                    drop(futex_map_guard);
+                    FutexData::try_remove(&key);
+                    return Ok(0);
+                }
+                continue;
+            }
+            let next_waiter = bucket.pi_waiters.pop_front();
+            if let Some(next_waiter) = next_waiter {
+                let has_more = !bucket.pi_waiters.is_empty();
+                let new_val =
+                    next_waiter.tid | if has_more { FUTEX_WAITERS } else { 0 } | owner_died;
+                if atomic_futex
+                    .compare_exchange(uval, new_val, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    bucket.pi_owner = next_waiter.tid;
+                    drop(futex_map_guard);
+                    next_waiter.waker.wake();
+                    return Ok(0);
+                }
+                bucket.pi_waiters.push_front(next_waiter);
+                continue;
+            }
+
+            if atomic_futex
+                .compare_exchange(uval, owner_died, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                bucket.pi_owner = 0;
+                drop(futex_map_guard);
+                FutexData::try_remove(&key);
+                return Ok(0);
             }
         }
     }
@@ -339,7 +356,7 @@ impl Futex {
         let current_tid = ProcessManager::current_pcb().task_pid_vnr().data() as u32;
 
         // 获取futex key（虽然trylock不会阻塞，但还是需要验证地址）
-        let _key = Self::get_futex_key(
+        let key = Self::get_futex_key(
             uaddr,
             flags.contains(FutexFlag::FLAGS_SHARED),
             FutexAccess::FutexWrite,
@@ -355,10 +372,25 @@ impl Futex {
             return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
 
-        // 尝试获取锁（非阻塞）
-        match atomic_futex.compare_exchange(0, current_tid, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => Ok(0),
-            Err(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+        let owner_died = uval & FUTEX_OWNER_DIED;
+
+        if owner_tid == 0 && (uval & FUTEX_WAITERS) == 0 {
+            let desired = current_tid | owner_died;
+            if atomic_futex
+                .compare_exchange(uval, desired, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let mut futex_map_guard = FutexData::futex_map();
+                if let Some(bucket) = futex_map_guard.get_mut(&key) {
+                    bucket.pi_owner = current_tid;
+                }
+                if owner_died != 0 {
+                    return Err(SystemError::EOWNERDEAD);
+                }
+                return Ok(0);
+            }
         }
+
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 }

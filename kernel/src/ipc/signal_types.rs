@@ -24,9 +24,17 @@ pub enum SigCode {
     /// 描述 SIGCHLD 的具体原因
     SigChld(ChldCode),
     /// 描述 SIGTRAP 的具体原因 (TRAP_*)
-    SigFault(SigFaultInfo),
-    /// 描述 SIGILL/SIGFPE/SIGSEGV/SIGBUS 的原因
+    Trap(TrapCode),
+    /// 描述 SIGILL 的原因
     Ill(IllCode),
+    /// 描述 SIGFPE 的原因
+    Fpe(FpeCode),
+    /// 描述 SIGSEGV 的原因
+    Segv(SegvCode),
+    /// 描述 SIGBUS 的原因
+    Bus(BusCode),
+    /// 其他未分类的 si_code (如 ptrace event 生成的 (event<<8)|SIGTRAP)
+    Raw(i32),
 }
 
 impl From<SigCode> for i32 {
@@ -34,8 +42,12 @@ impl From<SigCode> for i32 {
         match code {
             SigCode::Origin(origin) => origin as i32,
             SigCode::SigChld(chld) => chld as i32,
-            SigCode::SigFault(fault) => fault.trapno,
+            SigCode::Trap(trap) => trap as i32,
             SigCode::Ill(ill) => ill as i32,
+            SigCode::Fpe(fpe) => fpe as i32,
+            SigCode::Segv(segv) => segv as i32,
+            SigCode::Bus(bus) => bus as i32,
+            SigCode::Raw(raw) => raw,
         }
     }
 }
@@ -98,10 +110,22 @@ pub enum TrapCode {
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
 #[repr(i32)]
 pub enum IllCode {
-    /// 非法代码错误
-    IllIll = 1,
-    /// 汇编指令的 operand 不存在
-    IllIlladr = 2,
+    /// 非法操作码 (Illegal Opcode)
+    IllOpC = 1,
+    /// 非法操作数 (Illegal Operand)
+    IllOpN = 2,
+    /// 非法寻址模式 (Illegal Addressing Mode)
+    IllAdr = 3,
+    /// 非法陷阱 (Illegal Trap)
+    IllTrp = 4,
+    /// 特权操作码 (Privileged Opcode)
+    PrvOpC = 5,
+    /// 特权寄存器 (Privileged Register)
+    PrvReg = 6,
+    /// 协处理器错误 (Coprocessor Error)
+    CoProc = 7,
+    /// 内部堆栈错误 (Internal Stack Error)
+    BadStk = 8,
 }
 
 /// SIGFPE si_codes
@@ -109,15 +133,38 @@ pub enum IllCode {
 #[repr(i32)]
 #[allow(dead_code)]
 pub enum FpeCode {
-    IntDiv = 1,  /* integer divide by zero */
-    IntoOvf = 2, /* integer overflow */
-    FltDiv = 3,  /* floating point divide by zero */
-    FltOvf = 4,  /* floating point overflow */
-    FltUnd = 5,  /* floating point underflow */
-    FltInv = 6,  /* floating point invalid operation */
-    FltSub = 7,  /* subscript out of range */
-    FltDive = 8, /* floating point division by zero */
-    Isock = 9,   /* Invalid socket operation */
+    IntDiv = 1, /* integer divide by zero */
+    IntOvf = 2, /* integer overflow */
+    FltDiv = 3, /* floating point divide by zero */
+    FltOvf = 4, /* floating point overflow */
+    FltUnd = 5, /* floating point underflow */
+    FltRes = 6, /* floating point inexact result */
+    FltInv = 7, /* floating point invalid operation */
+    FltSub = 8, /* subscript out of range */
+}
+
+/// SIGSEGV si_codes
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+#[allow(clippy::enum_variant_names)]
+#[allow(dead_code)]
+pub enum SegvCode {
+    MapErr = 1, /* address not mapped to object */
+    AccErr = 2, /* invalid permissions for mapped object */
+    BndErr = 3, /* failed address bound checks */
+    PkuErr = 4, /* access was denied by memory protection keys */
+}
+
+/// SIGBUS si_codes
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+#[allow(dead_code)]
+pub enum BusCode {
+    AdrAln = 1,   /* invalid address alignment */
+    AdrErr = 2,   /* non-existent physical address */
+    ObjErr = 3,   /* object specific hardware error */
+    MceErrAr = 4, /* hardware memory error consumed on a machine check: action required */
+    MceErrAo = 5, /* hardware memory error detected in process but not consumed: action optional */
 }
 
 impl SigCode {

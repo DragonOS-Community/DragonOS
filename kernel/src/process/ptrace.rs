@@ -2,7 +2,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::ipc::signal::{SigFlags, Signal};
 use crate::arch::kprobe;
 use crate::ipc::signal_types::{
-    ChldCode, OriginCode, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType,
+    ChldCode, OriginCode, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType, TrapCode,
 };
 use crate::process::cred;
 use crate::process::{
@@ -190,19 +190,30 @@ impl ProcessControlBlock {
     ) -> Result<(), SystemError> {
         let current_pcb = ProcessManager::current_pcb();
 
-        let fault_info = SigFaultInfo {
-            addr: 0,
-            trapno: exit_code as i32, // si_code = exit_code (通过 trapno)
+        // 构造 Raw code (si_code = exit_code & 0xff)
+        // Linux 中 ptrace_notify 使用 (exit_code & 0xff) 作为 si_code
+        // 通常是 SIGTRAP | (PTRACE_EVENT_xxx << 8)
+        let si_code = (exit_code >> 8) as i32;
+
+        // 如果是标准的 TRAP_* 代码，使用 TrapCode
+        let code = match si_code {
+            1 => SigCode::Trap(TrapCode::Brkpt),
+            2 => SigCode::Trap(TrapCode::Trace),
+            3 => SigCode::Trap(TrapCode::Branch),
+            4 => SigCode::Trap(TrapCode::Hwbkpt),
+            5 => SigCode::Trap(TrapCode::Unk),
+            6 => SigCode::Trap(TrapCode::Perf),
+            _ => SigCode::Raw(si_code),
         };
 
         let mut info = SigInfo::new(
             signal, // si_signo = SIGTRAP
             0,      // si_errno = 0
-            SigCode::SigFault(fault_info),
-            SigType::Kill {
-                pid: current_pcb.raw_pid(),
-                uid: current_pcb.cred().uid.data() as u32,
-            },
+            code,
+            SigType::SigFault(SigFaultInfo {
+                addr: 0,
+                trapno: exit_code as i32, // trapno 暂时用来存完整 exit_code
+            }),
         );
         current_pcb.ptrace_stop(exit_code, ChldCode::Trapped, Some(&mut info));
         Ok(())

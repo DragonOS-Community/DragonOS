@@ -11,7 +11,7 @@ use crate::{
         CurrentIrqArch, MMArch,
     },
     exception::{extable::ExceptionTableManager, InterruptArch},
-    ipc::signal_types::{OriginCode, SigCode, SigInfo, SigType},
+    ipc::signal_types::{BusCode, SegvCode, SigCode, SigFaultInfo, SigInfo, SigType},
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
@@ -278,12 +278,14 @@ impl X86_64MMArch {
 
         let send_segv = || {
             let pid = ProcessManager::current_pid();
-            let uid = ProcessManager::current_pcb().cred().uid.data() as u32;
             let mut info = SigInfo::new(
                 Signal::SIGSEGV,
                 0,
-                SigCode::Origin(OriginCode::User),
-                SigType::Kill { pid, uid },
+                SigCode::Segv(SegvCode::MapErr),
+                SigType::SigFault(SigFaultInfo {
+                    addr: address.data(),
+                    trapno: 14, // X86_TRAP_PF
+                }),
             );
             Signal::SIGSEGV
                 .send_signal_info(Some(&mut info), pid)
@@ -463,21 +465,21 @@ impl X86_64MMArch {
             }
 
             // 用户态 fault：发送对应信号
-            let sig = if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
-                Signal::SIGSEGV
+            let (sig, code) = if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
+                (Signal::SIGSEGV, SigCode::Segv(SegvCode::MapErr))
             } else {
                 // 包括 SIGBUS / OOM / HWPOISON 等：目前统一 SIGBUS（后续可按 Linux 进一步细分）
-                Signal::SIGBUS
+                (Signal::SIGBUS, SigCode::Bus(BusCode::AdrErr))
             };
 
             let mut info = SigInfo::new(
                 sig,
                 0,
-                SigCode::Origin(OriginCode::User),
-                SigType::Kill {
-                    pid: ProcessManager::current_pid(),
-                    uid: ProcessManager::current_pcb().cred().uid.data() as u32,
-                },
+                code,
+                SigType::SigFault(SigFaultInfo {
+                    addr: address.data(),
+                    trapno: 14, // X86_TRAP_PF
+                }),
             );
             let _ = sig.send_signal_info(Some(&mut info), ProcessManager::current_pid());
             return;

@@ -142,7 +142,7 @@ where
 
     // 获取目标进程的地址空间锁，但不切换页表
     // 只需要在地址空间读锁保护下执行操作
-    let _tracee_vm_guard = tracee_vm.read_irqsave();
+    let _tracee_vm_guard = tracee_vm.read();
 
     // 在目标进程的地址空间读锁保护中执行操作
     f()
@@ -154,7 +154,7 @@ where
 /// 参考 process_vm_readv 的实现方式。
 fn ptrace_peek_data(tracee: &Arc<ProcessControlBlock>, addr: usize) -> Result<isize, SystemError> {
     let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
-    let tracee_vm_guard = tracee_vm.read_irqsave();
+    let tracee_vm_guard = tracee_vm.read();
 
     let tracee_addr = VirtAddr::new(addr);
 
@@ -200,7 +200,7 @@ fn ptrace_poke_data(
     data: usize,
 ) -> Result<isize, SystemError> {
     let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
-    let tracee_vm_guard = tracee_vm.read_irqsave();
+    let tracee_vm_guard = tracee_vm.read();
 
     let tracee_addr = VirtAddr::new(addr);
 

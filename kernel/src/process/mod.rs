@@ -504,7 +504,6 @@ impl ProcessManager {
             }
             let parent_pcb = r.unwrap();
 
-            // 按照 Linux 6.6.21 的语义：
             // 如果进程被 ptrace，忽略 exit_signal，总是发送 SIGCHLD
             let is_ptraced = current.flags().contains(ProcessFlags::PTRACED);
             let signal_to_send = if is_ptraced {
@@ -1307,7 +1306,6 @@ pub struct ProcessControlBlock {
     sig_altstack: RwLock<SigStackArch>,
     /// 退出状态（Running/Zombie/Dead）
     exit_state: AtomicU8,
-
     /// 退出信号S
     exit_signal: AtomicSignal,
     /// 父进程退出时要发送给当前进程的信号（PR_SET_PDEATHSIG）

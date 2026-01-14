@@ -563,18 +563,12 @@ impl ProcessManager {
             pid = pcb.pid();
             pcb.wait_queue.mark_dead();
 
-            let rq = cpu_rq(smp_get_processor_id().data() as usize);
-            let (rq, guard) = rq.self_lock();
-            rq.deactivate_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-            drop(guard);
-
             // 进行进程退出后的工作
             let thread = pcb.thread.write_irqsave();
-
-            if let Some(addr) = thread.clear_child_tid {
+            let clear_child_tid = thread.clear_child_tid;
+            let vfork_done = thread.vfork_done.clone();
+            drop(thread);
+            if let Some(addr) = clear_child_tid {
                 // 按 Linux 语义：先清零 userland 的 *clear_child_tid，再 futex_wake(addr)
                 let cleared_ok = unsafe {
                     match clear_user_protected(addr, core::mem::size_of::<i32>()) {
@@ -600,10 +594,18 @@ impl ProcessManager {
 
             RobustListHead::exit_robust_list(pcb.clone());
             // 如果是vfork出来的进程，则需要处理completion
-            if thread.vfork_done.is_some() {
-                thread.vfork_done.as_ref().unwrap().complete_all();
+            if let Some(vd) = vfork_done {
+                vd.complete_all();
             }
-            drop(thread);
+
+            // clear_child_tid/robust_list 可能触发用户态缺页，必须在调度实体 deactive 前完成
+            let rq = cpu_rq(smp_get_processor_id().data() as usize);
+            let (rq, guard) = rq.self_lock();
+            rq.deactivate_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+            drop(guard);
 
             unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();

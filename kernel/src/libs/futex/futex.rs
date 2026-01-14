@@ -19,7 +19,7 @@ use crate::{
     arch::{CurrentIrqArch, MMArch},
     exception::InterruptArch,
     libs::{
-        spinlock::{SpinLock, SpinLockGuard},
+        mutex::{Mutex, MutexGuard},
         wait_queue::{Waiter, Waker},
     },
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
@@ -36,11 +36,11 @@ use super::constant::*;
 static mut FUTEX_DATA: Option<FutexData> = None;
 
 pub struct FutexData {
-    data: SpinLock<HashMap<FutexKey, FutexHashBucket>>,
+    data: Mutex<HashMap<FutexKey, FutexHashBucket>>,
 }
 
 impl FutexData {
-    pub fn futex_map() -> SpinLockGuard<'static, HashMap<FutexKey, FutexHashBucket>> {
+    pub fn futex_map() -> MutexGuard<'static, HashMap<FutexKey, FutexHashBucket>> {
         unsafe { FUTEX_DATA.as_ref().unwrap().data.lock() }
     }
 
@@ -250,7 +250,7 @@ impl Futex {
     pub fn init() {
         unsafe {
             FUTEX_DATA = Some(FutexData {
-                data: SpinLock::new(HashMap::new()),
+                data: Mutex::new(HashMap::new()),
             })
         };
     }

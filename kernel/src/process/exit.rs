@@ -371,8 +371,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 scan_result = Some(Ok((*pid).into()));
                                 drop(sched_guard);
                                 break;
-                            } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED)
-                            {
+                            } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
                                 let Some(code) = state.exit_code() else {
                                     drop(sched_guard);
                                     continue;
@@ -524,8 +523,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 scan_result = Some(Ok(pcb.task_pid_vnr().into()));
                                 drop(sched_guard);
                                 break;
-                            } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED)
-                            {
+                            } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
                                 let Some(code) = state.exit_code() else {
                                     drop(sched_guard);
                                     continue;

@@ -12,6 +12,7 @@
 #![feature(fn_align)]
 #![feature(linked_list_retain)]
 #![feature(ptr_internals)]
+#![feature(slice_pattern)]
 #![feature(slice_ptr_get)]
 #![feature(negative_impls)]
 #![feature(sync_unsafe_cell)]

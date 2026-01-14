@@ -49,9 +49,30 @@
             rootfsPkg = pkgs.callPackage ./user/default.nix {
               inherit lib pkgs nixpkgs fenix system target testOpt rootfsType buildDir diskPath;
             };
+
+            # 一键化构建启动脚本
+            runApp = pkgs.writeScriptBin "dragonos-run-${target}" ''
+              #!${pkgs.runtimeShell}
+              set -e
+
+              echo "==> Step 1: Building kernel with make kernel..."
+              ${pkgs.gnumake}/bin/make kernel
+
+              echo "==> Step 2: Building rootfs..."
+              ${rootfsPkg}/bin/dragonos-rootfs
+
+              echo "==> Step 3: Starting DragonOS..."
+              exec ${startPkg}/bin/dragonos-run "$@"
+            '';
           in
           {
             apps = {
+              # run-${target}: 一键化构建启动命令 (make kernel + rootfs + start)
+              "run-${target}" = {
+                type = "app";
+                program = "${runApp}/bin/dragonos-run-${target}";
+                meta.description = "一键化构建并启动DragonOS (${target})";
+              };
               # start-${target} 的产物只是一个shell脚本，因此启动相关的参数，直接在上面修改即可，
               # 脚本不占什么空间所以重复eval也没关系，并且最终产出的脚本可读性更好.
               "start-${target}" = {

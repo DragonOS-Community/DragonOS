@@ -347,6 +347,11 @@ impl PageReclaimer {
                 if guard.flags().contains(PageFlags::PG_DIRTY) {
                     // 先回写脏页
                     Self::page_writeback(&mut guard, true);
+                    if guard.flags().contains(PageFlags::PG_DIRTY) {
+                        drop(guard);
+                        page_reclaimer_lock().insert_page(paddr, &page);
+                        continue;
+                    }
                 }
 
                 // 删除页面：顺序为 page_cache -> page_manager，避免原有的 reclaimer 锁参与死锁

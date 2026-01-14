@@ -1,6 +1,5 @@
 use crate::arch::MMArch;
 use crate::filesystem::vfs::syscall::RenameFlags;
-use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::mm::truncate::truncate_inode_pages;
 use crate::mm::MemoryManagementArch;
 use alloc::string::ToString;
@@ -32,7 +31,10 @@ use crate::{
         vcore::generate_inode_id,
         FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
     },
-    libs::vec_cursor::VecCursor,
+    libs::{
+        mutex::{Mutex, MutexGuard},
+        vec_cursor::VecCursor,
+    },
     time::PosixTimeSpec,
 };
 

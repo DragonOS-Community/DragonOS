@@ -7,8 +7,7 @@ use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
     vfs::{FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock},
 };
-use crate::libs::mutex::Mutex;
-use crate::libs::mutex::MutexGuard;
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::mm::MemoryManagementArch;
 use crate::process::{ProcessFlags, ProcessManager};

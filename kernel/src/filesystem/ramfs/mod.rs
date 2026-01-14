@@ -3,7 +3,6 @@ use core::intrinsics::unlikely;
 
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
-use crate::libs::mutex::MutexGuard;
 use crate::libs::rwsem::RwSem;
 use crate::register_mountable_fs;
 use crate::{
@@ -11,7 +10,7 @@ use crate::{
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
-    libs::mutex::Mutex,
+    libs::mutex::{Mutex, MutexGuard},
     time::PosixTimeSpec,
 };
 

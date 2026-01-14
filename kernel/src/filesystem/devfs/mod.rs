@@ -11,13 +11,16 @@ use super::{
     },
 };
 use crate::filesystem::devfs::zero_dev::LockedZeroInode;
-use crate::libs::mutex::MutexGuard;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
     filesystem::vfs::{mount::MountFlags, produce_fs},
-    libs::{casting::DowncastArc, mutex::Mutex, once::Once},
+    libs::{
+        casting::DowncastArc,
+        mutex::{Mutex, MutexGuard},
+        once::Once,
+    },
     process::ProcessManager,
     time::PosixTimeSpec,
 };

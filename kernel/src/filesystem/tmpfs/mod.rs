@@ -5,7 +5,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
-use crate::libs::mutex::MutexGuard;
 use crate::libs::rwsem::RwSem;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::fault::PageFaultHandler;
@@ -18,7 +17,7 @@ use crate::{
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
-    libs::mutex::Mutex,
+    libs::mutex::{Mutex, MutexGuard},
     mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
@@ -1066,7 +1065,7 @@ impl IndexNode for LockedTmpfsInode {
 
         if unlikely(mode.contains(InodeMode::S_IFREG)) {
             // Regular file creation must not recurse while holding the directory lock,
-            // otherwise self.create() will try to lock the same SpinLock and deadlock.
+            // otherwise self.create() will try to lock the same Mutex and deadlock.
             drop(inode);
             return self.create(filename, FileType::File, mode);
         }

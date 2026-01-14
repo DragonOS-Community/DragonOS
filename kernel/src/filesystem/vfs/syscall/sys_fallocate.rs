@@ -74,15 +74,22 @@ impl Syscall for SysFallocateHandle {
             }
 
             let new_size = offset.saturating_add(len);
-            let current_pcb = ProcessManager::current_pcb();
-            let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
-            if fsize_limit.rlim_cur != u64::MAX && new_size as u64 > fsize_limit.rlim_cur {
-                let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
-                return Err(SystemError::EFBIG);
+
+            let current_size = file.inode().metadata()?.size;
+            if new_size > current_size {
+                let current_pcb = ProcessManager::current_pcb();
+                let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+                if fsize_limit.rlim_cur != u64::MAX && new_size as u64 > fsize_limit.rlim_cur {
+                    let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+                    return Err(SystemError::EFBIG);
+                }
+
+                let r =
+                    crate::filesystem::vfs::vcore::vfs_truncate(file.inode(), new_size).map(|_| 0);
+                return r;
             }
 
-            let r = crate::filesystem::vfs::vcore::vfs_truncate(file.inode(), new_size).map(|_| 0);
-            return r;
+            return Ok(0);
         }
 
         return Err(SystemError::EBADF);

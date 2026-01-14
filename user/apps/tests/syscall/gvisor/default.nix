@@ -1,11 +1,21 @@
-{ lib, pkgs, fenix, system, installDir, version ? "20251218" }:
+{
+  lib,
+  pkgs,
+  fenix,
+  system,
+  installDir,
+  version ? "20251218",
+}:
 
 let
   fenixPkgs = fenix.packages.${system};
-  toolchain = fenixPkgs.combine (with fenixPkgs; [
-    minimal.rustc
-    minimal.cargo
-  ]);
+  toolchain = fenixPkgs.combine (
+    with fenixPkgs;
+    [
+      minimal.rustc
+      minimal.cargo
+    ]
+  );
   rustPlatform = pkgs.makeRustPlatform {
     cargo = toolchain;
     rustc = toolchain;
@@ -74,9 +84,13 @@ let
     '';
   };
 
-in pkgs.symlinkJoin {
+in
+pkgs.symlinkJoin {
   name = "gvisor-tests";
-  paths = [ runner tests ];
+  paths = [
+    runner
+    tests
+  ];
   meta = with lib; {
     description = "gVisor syscall test runner and scripts";
     platforms = platforms.linux;

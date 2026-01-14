@@ -6,8 +6,14 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
         lib = pkgs.lib;
@@ -16,16 +22,18 @@
         # 1. 定义精确的 Python 环境
         # ----------------------------------------------------------------
         # 这里显式列出依赖，确保无论在哪台机器，Sphinx 版本一致
-        pythonEnv = pkgs.python3.withPackages (ps: with ps; [
-          sphinx
-          sphinx-multiversion
-          sphinx-autobuild
-          # 在这里添加你的 theme 或 extension，例如:
-          sphinx-rtd-theme
-          myst-parser
-          sphinxcontrib-mermaid
-          linkify-it-py
-        ]);
+        pythonEnv = pkgs.python3.withPackages (
+          ps: with ps; [
+            sphinx
+            sphinx-multiversion
+            sphinx-autobuild
+            # 在这里添加你的 theme 或 extension，例如:
+            sphinx-rtd-theme
+            myst-parser
+            sphinxcontrib-mermaid
+            linkify-it-py
+          ]
+        );
 
         # ----------------------------------------------------------------
         # 2. 从 Flake 输入中提取 Git 信息 (Pure 方式)
@@ -79,8 +87,11 @@
         # ----------------------------------------------------------------
         # 提供一个脚本来预览构建结果
         apps.release = flake-utils.lib.mkApp {
-          drv = let targetDir = self.packages.${system}.default;
-            in pkgs.writeShellApplication {
+          drv =
+            let
+              targetDir = self.packages.${system}.default;
+            in
+            pkgs.writeShellApplication {
               name = "preview-docs";
               runtimeInputs = [ pythonEnv ];
               text = ''
@@ -106,7 +117,11 @@
         # ----------------------------------------------------------------
         # 用于开发和需要访问 .git 的操作（如 sphinx-multiversion）
         devShells.default = pkgs.mkShell {
-          packages = [ pythonEnv pkgs.git pkgs.gnumake ];
+          packages = [
+            pythonEnv
+            pkgs.git
+            pkgs.gnumake
+          ];
 
           shellHook = ''
             export LANGUAGE="zh_CN"

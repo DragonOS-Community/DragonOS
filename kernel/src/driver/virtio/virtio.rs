@@ -102,7 +102,7 @@ fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
         let standard_device = device.as_standard_device().unwrap();
         let header = &standard_device.common_header;
         // log::info!("header: {:?}", header);
-        if header.device_id >= 0x1000 && header.device_id <= 0x103F {
+        if header.device_id >= 0x1000 && header.device_id <= 0x10FF {
             virtio_list.push(standard_device);
         }
     }

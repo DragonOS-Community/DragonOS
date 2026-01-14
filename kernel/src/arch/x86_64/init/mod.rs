@@ -3,13 +3,15 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
+use log::warn;
+
 use log::debug;
 use system_error::SystemError;
 use x86::dtables::DescriptorTablePointer;
 
 use crate::{
     arch::{fpu::FpState, interrupt::trap::arch_trap_init, process::table::TSSManager},
-    driver::clocksource::acpi_pm::init_acpi_pm_clocksource,
+    driver::clocksource::{acpi_pm::init_acpi_pm_clocksource, kvm_clock::init_kvm_clocksource},
     init::init::start_kernel,
     mm::{MemoryManagementArch, PhysAddr},
 };
@@ -109,13 +111,43 @@ pub fn setup_arch() -> Result<(), SystemError> {
 /// 架构相关的初始化（在IDLE的最后一个阶段）
 #[inline(never)]
 pub fn setup_arch_post() -> Result<(), SystemError> {
-    let ret = hpet_init();
-    if ret.is_ok() {
-        hpet_instance().hpet_enable().expect("hpet enable failed");
+    // First, try to initialize KVM clock if running on KVM
+    // KVM clock has priority as it's the most accurate for virtualized environments
+    if init_kvm_clocksource().is_ok() {
+        debug!("KVM clock initialized successfully");
     } else {
-        init_acpi_pm_clocksource().expect("acpi_pm_timer inits failed");
+        debug!("KVM clock not available, falling back to hardware timers");
+
+        // Try to initialize HPET
+        match hpet_init() {
+            Ok(_) => {
+                debug!("HPET initialized successfully");
+                if let Err(e) = hpet_instance().hpet_enable() {
+                    warn!("HPET enable failed: {:?}, trying ACPI PM Timer", e);
+                    // Try ACPI PM Timer as fallback
+                    if let Err(e) = init_acpi_pm_clocksource() {
+                        warn!("ACPI PM Timer init failed: {:?}, will rely on TSC/jiffies", e);
+                    } else {
+                        debug!("ACPI PM Timer initialized successfully");
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("HPET init failed: {:?}, trying ACPI PM Timer", e);
+                // Try ACPI PM Timer as fallback
+                if let Err(e) = init_acpi_pm_clocksource() {
+                    warn!("ACPI PM Timer init failed: {:?}, will rely on TSC/jiffies", e);
+                } else {
+                    debug!("ACPI PM Timer initialized successfully");
+                }
+            }
+        }
     }
-    TSCManager::init().expect("tsc init failed");
+
+    // TSC initialization is critical for x86_64
+    if let Err(e) = TSCManager::init() {
+        warn!("TSC init failed: {:?}, system may have timing issues", e);
+    }
 
     return Ok(());
 }

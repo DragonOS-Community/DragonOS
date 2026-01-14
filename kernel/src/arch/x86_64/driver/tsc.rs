@@ -1,6 +1,7 @@
 use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch, CurrentTimeArch},
     driver::acpi::pmtmr::{acpi_pm_read_early, ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC},
+    driver::clocksource::kvm_clock::kvm_clock,
     exception::InterruptArch,
     time::{TimeArch, PIT_TICK_RATE},
 };
@@ -64,7 +65,23 @@ impl TSCManager {
             // todo: 先根据cpuid或者读取msr或者pit来测量TSC和CPU总线的频率
             todo!("detect TSC and CPU frequency by cpuid or msr or pit");
         } else {
-            // 使用pit来测量TSC和CPU总线的频率
+            // 优先尝试使用 KVM clock 来校准 TSC
+            if let Some(kvm_clk) = kvm_clock() {
+                info!("Calibrating TSC with KVM clock");
+                match Self::calibrate_tsc_with_kvm_clock(&kvm_clk) {
+                    Ok(khz) => {
+                        Self::set_cpu_khz(khz);
+                        Self::set_tsc_khz(khz);
+                        info!("Successfully calibrated TSC using KVM clock: {} MHz", khz / 1000);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("Failed to calibrate TSC with KVM clock: {:?}, falling back to hardware timers", e);
+                    }
+                }
+            }
+
+            // 回退到使用 PIT/HPET/PMTIMER 来校准
             Self::set_cpu_khz(Self::calibrate_cpu_by_pit_hpet_ptimer()?);
         }
 
@@ -226,6 +243,91 @@ impl TSCManager {
 
         info!("Using PIT calibration value");
         return Ok(tsc_pit_min);
+    }
+
+    /// 使用 KVM clock 来校准 TSC
+    ///
+    /// ## 参数
+    ///
+    /// - `_kvm_clk`: KVM clock 实例的引用
+    ///
+    /// ## 返回值
+    ///
+    /// - Ok(u64): TSC 的频率（kHz）
+    /// - Err(SystemError): 校准失败
+    ///
+    /// ## 原理
+    ///
+    /// 1. 读取 TSC 的起始值
+    /// 2. 等待一段时间（使用 KVM clock 测量）
+    /// 3. 读取 TSC 的结束值
+    /// 4. 计算 TSC 频率 = (TSC 差值 * 1000000000) / (时间差，纳秒) / 1000 = kHz
+    fn calibrate_tsc_with_kvm_clock(_kvm_clk: &crate::driver::clocksource::kvm_clock::KvmClock) -> Result<u64, SystemError> {
+        use crate::time::clocksource::Clocksource;
+
+        // 测量时间：5 毫秒（5000000 纳秒）
+        const MEASURE_NS: u64 = 5_000_000;
+        const MAX_LOOPS: u32 = 10_000_000; // 最大循环次数防止死循环
+
+        // 读取起始 TSC 和 KVM clock 时间
+        let tsc_start = unsafe { core::arch::x86_64::_rdtsc() };
+        let kvm_start_ns = _kvm_clk.read().data();
+
+        debug!("KVM clock calibration start: kvm_start_ns={}", kvm_start_ns);
+
+        // 等待测量时间
+        let mut elapsed = 0u64;
+        let mut loops = 0u32;
+
+        while elapsed < MEASURE_NS && loops < MAX_LOOPS {
+            let kvm_current_ns = _kvm_clk.read().data();
+            elapsed = kvm_current_ns.saturating_sub(kvm_start_ns);
+            loops += 1;
+
+            // 每 1000000 次循环打印一次调试信息
+            if loops % 1_000_000 == 0 {
+                debug!("KVM clock calibration: loops={}, elapsed={}ns", loops, elapsed);
+            }
+        }
+
+        // 检查是否超时
+        if loops >= MAX_LOOPS {
+            warn!("KVM clock calibration: max loops reached, elapsed={}ns", elapsed);
+            return Err(SystemError::ETIMEDOUT);
+        }
+
+        // 读取结束 TSC 值
+        let tsc_end = unsafe { core::arch::x86_64::_rdtsc() };
+
+        // 计算 TSC 增量和时间差
+        let tsc_delta = tsc_end.saturating_sub(tsc_start);
+        let time_delta_ns = elapsed;
+
+        debug!("KVM clock calibration: tsc_start={}, tsc_end={}, tsc_delta={}, time_delta_ns={}ns, loops={}",
+               tsc_start, tsc_end, tsc_delta, time_delta_ns, loops);
+
+        // 避免除零
+        if time_delta_ns == 0 || tsc_delta == 0 {
+            warn!("Invalid calibration data: tsc_delta={}, time_delta_ns={}", tsc_delta, time_delta_ns);
+            return Err(SystemError::EINVAL);
+        }
+
+        // 计算 TSC 频率（kHz）
+        // TSC 频率 = (TSC 差值 * 1000000000) / (时间差，纳秒) / 1000
+        //          = (TSC 差值 * 1000000) / (时间差，纳秒)
+        let tsc_khz = (tsc_delta.saturating_mul(1_000_000) / time_delta_ns) as u64;
+
+        // 检查结果是否合理（通常 CPU 频率在 100 MHz 到 10 GHz 之间）
+        if tsc_khz < 100_000 || tsc_khz > 10_000_000 {
+            warn!(
+                "Unreasonable TSC frequency detected: {} kHz, measurement may be inaccurate",
+                tsc_khz
+            );
+        }
+
+        info!("KVM clock calibration result: tsc_khz={}kHz ({}MHz)", tsc_khz, tsc_khz / 1000);
+
+        return Ok(tsc_khz);
     }
 
     /// 尝试使用PIT来校准tsc时间，并且返回tsc的频率（khz）。

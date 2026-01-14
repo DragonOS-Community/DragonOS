@@ -250,6 +250,8 @@ impl<'a, T> RwSemWriteGuard<'a, T> {
             .compare_exchange(WRITER, UPGRADEABLE_READER, AcqRel, Relaxed);
         if res.is_ok() {
             core::mem::forget(self);
+            // A writer->upread transition makes readers runnable again.
+            inner.queue.wake_all();
             Ok(RwSemUpgradeableGuard {
                 inner,
                 _nosend: PhantomData,
@@ -310,7 +312,9 @@ impl<'a, T> RwSemUpgradeableGuard<'a, T> {
         );
         if res.is_ok() {
             let inner = self.inner;
-            core::mem::forget(self);
+            // Drop the upgradeable guard to clear the UPGRADEABLE_READER bit,
+            // matching the asterinas semantics and avoiding a phantom upreader.
+            core::mem::drop(self);
             Ok(RwSemWriteGuard {
                 inner,
                 _nosend: PhantomData,

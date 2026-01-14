@@ -6,7 +6,7 @@ use crate::{
             InodeId, InodeMode,
         },
     },
-    libs::{casting::DowncastArc, mutex::MutexGuard, spinlock::SpinLock},
+    libs::{casting::DowncastArc, mutex::Mutex, mutex::MutexGuard},
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -43,7 +43,7 @@ pub struct Ext4Inode {
 }
 
 #[derive(Debug)]
-pub struct LockedExt4Inode(pub(super) SpinLock<Ext4Inode>);
+pub struct LockedExt4Inode(pub(super) Mutex<Ext4Inode>);
 
 impl IndexNode for LockedExt4Inode {
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
@@ -516,9 +516,7 @@ impl LockedExt4Inode {
         parent: Option<Weak<LockedExt4Inode>>,
     ) -> Arc<Self> {
         let inode = Arc::new({
-            LockedExt4Inode(SpinLock::new(Ext4Inode::new(
-                inode_num, fs_ptr, dname, parent,
-            )))
+            LockedExt4Inode(Mutex::new(Ext4Inode::new(inode_num, fs_ptr, dname, parent)))
         });
         let mut guard = inode.0.lock();
 

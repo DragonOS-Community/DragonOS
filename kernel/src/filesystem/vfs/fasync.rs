@@ -10,7 +10,7 @@ use alloc::{sync::Weak, vec::Vec};
 use core::sync::atomic::compiler_fence;
 
 use crate::{
-    arch::ipc::signal::Signal, ipc::kill::send_signal_to_pcb, libs::spinlock::SpinLock,
+    arch::ipc::signal::Signal, ipc::kill::send_signal_to_pcb, libs::mutex::Mutex,
     process::ProcessControlBlock,
 };
 use alloc::sync::Arc;
@@ -48,7 +48,7 @@ impl FAsyncItem {
 }
 
 /// List of FAsyncItems for an inode
-pub type LockedFAsyncItemList = SpinLock<Vec<Arc<FAsyncItem>>>;
+pub type LockedFAsyncItemList = Mutex<Vec<Arc<FAsyncItem>>>;
 
 /// FAsyncItems manages the list of files that want SIGIO notifications
 #[derive(Debug)]
@@ -66,31 +66,31 @@ impl FAsyncItems {
     /// Create a new FAsyncItems
     pub fn new() -> Self {
         Self {
-            items: SpinLock::new(Vec::new()),
+            items: Mutex::new(Vec::new()),
         }
     }
 
     /// Add a FAsyncItem
     pub fn add(&self, item: Arc<FAsyncItem>) {
-        self.items.lock_irqsave().push(item);
+        self.items.lock().push(item);
     }
 
     /// Remove a FAsyncItem by file reference
     pub fn remove(&self, file: &Weak<File>) {
-        let mut guard = self.items.lock_irqsave();
+        let mut guard = self.items.lock();
         guard.retain(|item| !Weak::ptr_eq(item.file_weak(), file));
     }
 
     /// Clear all items
     #[allow(dead_code)]
     pub fn clear(&self) {
-        self.items.lock_irqsave().clear();
+        self.items.lock().clear();
     }
 
     /// Send SIGIO to all registered file owners
     /// This should be called when IO events occur (e.g., data becomes readable)
     pub fn send_sigio(&self) {
-        let guard = self.items.lock_irqsave();
+        let guard = self.items.lock();
         for item in guard.iter() {
             if let Some(file) = item.file() {
                 // Check if FASYNC is set

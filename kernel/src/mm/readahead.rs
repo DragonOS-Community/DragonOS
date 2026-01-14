@@ -98,7 +98,7 @@ impl<'a> ReadaheadControl<'a> {
         let page_cache = self.page_cache;
         let start_index = self.index;
 
-        let page_cache_guard = page_cache.lock_irqsave();
+        let page_cache_guard = page_cache.lock();
 
         if set_flag {
             set_flag = page_cache_guard
@@ -132,7 +132,7 @@ impl<'a> ReadaheadControl<'a> {
             page_buf.truncate(read_len);
             let actual_page_count = (read_len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
 
-            let mut page_cache_guard = page_cache.lock_irqsave();
+            let mut page_cache_guard = page_cache.lock();
             page_cache_guard.create_pages(page_index, &page_buf)?;
             drop(page_cache_guard);
 
@@ -140,7 +140,7 @@ impl<'a> ReadaheadControl<'a> {
         }
 
         if set_flag {
-            let page_cache_guard = page_cache.lock_irqsave();
+            let page_cache_guard = page_cache.lock();
             if let Some(page) = page_cache_guard
                 .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
             {
@@ -148,7 +148,7 @@ impl<'a> ReadaheadControl<'a> {
                 //     "set ra flag at {}",
                 //     self.ra_state.start + self.ra_state.size - self.ra_state.async_size
                 // );
-                page.write_irqsave().add_flags(PageFlags::PG_READAHEAD);
+                page.write().add_flags(PageFlags::PG_READAHEAD);
             }
         }
 
@@ -181,7 +181,7 @@ impl<'a> ReadaheadControl<'a> {
 
         if is_async {
             // 第二次及以后的连续读
-            let page_cache_gaurd = self.page_cache.lock_irqsave();
+            let page_cache_gaurd = self.page_cache.lock();
             let next_missing_page = {
                 (start_index..start_index + max_pages)
                     .find(|idx| page_cache_gaurd.get_page(*idx).is_none())

@@ -1,6 +1,5 @@
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
-use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -199,7 +198,7 @@ impl ProcessManager {
         args.verify()?;
         let pcb = ProcessControlBlock::new(name, new_kstack);
         Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
-            error!(
+            log::error!(
                 "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(),
                 pcb.raw_pid(),
@@ -284,7 +283,7 @@ impl ProcessManager {
             unsafe { new_pcb.basic_mut().set_user_vm(Some(old_address_space)) };
             return Ok(());
         }
-        let new_address_space = old_address_space.write_irqsave().try_clone().unwrap_or_else(|e| {
+        let new_address_space = old_address_space.write().try_clone().unwrap_or_else(|e| {
             panic!(
                 "copy_mm: Failed to clone address space of current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), new_pcb.raw_pid(), e
@@ -792,7 +791,25 @@ impl ProcessManager {
                 ti.group_leader().unwrap_or_else(|| current_pcb.clone())
             };
             let mut children = thread_group_leader.children.write_irqsave();
-            children.push(pcb.raw_pid());
+            let parent_ns = thread_group_leader.active_pid_ns();
+            let child_vpid = pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns));
+            if let Some(vpid) = child_vpid {
+                if vpid.data() != 0 {
+                    children.push(vpid);
+                } else {
+                    log::warn!(
+                        "fork: child pid is 0 in parent pidns, parent pid={:?}, child pid={:?}",
+                        thread_group_leader.raw_pid(),
+                        pcb.raw_pid()
+                    );
+                }
+            } else {
+                log::warn!(
+                    "fork: failed to resolve child pid in parent pidns, parent pid={:?}, child pid={:?}",
+                    thread_group_leader.raw_pid(),
+                    pcb.raw_pid()
+                );
+            }
         }
 
         if pcb.raw_pid() > RawPid(0) {

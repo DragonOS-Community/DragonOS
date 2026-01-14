@@ -1,6 +1,5 @@
 use crate::arch::MMArch;
 use crate::filesystem::vfs::syscall::RenameFlags;
-use crate::libs::mutex::MutexGuard;
 use crate::mm::truncate::truncate_inode_pages;
 use crate::mm::MemoryManagementArch;
 use alloc::string::ToString;
@@ -33,7 +32,7 @@ use crate::{
         FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
     },
     libs::{
-        spinlock::{SpinLock, SpinLockGuard},
+        mutex::{Mutex, MutexGuard},
         vec_cursor::VecCursor,
     },
     time::PosixTimeSpec,
@@ -96,15 +95,15 @@ pub struct FATFileSystem {
 
 /// FAT文件系统的Inode
 #[derive(Debug)]
-pub struct LockedFATInode(SpinLock<FATInode>);
+pub struct LockedFATInode(Mutex<FATInode>);
 
 #[derive(Debug)]
-pub struct LockedFATFsInfo(SpinLock<FATFsInfo>);
+pub struct LockedFATFsInfo(Mutex<FATFsInfo>);
 
 impl LockedFATFsInfo {
     #[inline]
     pub fn new(fs_info: FATFsInfo) -> Self {
-        return Self(SpinLock::new(fs_info));
+        return Self(Mutex::new(fs_info));
     }
 }
 
@@ -222,7 +221,7 @@ impl LockedFATInode {
             FileType::File
         };
 
-        let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
+        let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(Mutex::new(FATInode {
             parent,
             self_ref: Weak::default(),
             children: HashMap::new(),
@@ -344,7 +343,7 @@ impl LockedFATInode {
         }
 
         // 对目标inode上锁，以防更改
-        let mut old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
+        let mut old_inode_guard: MutexGuard<FATInode> = old_inode.0.lock();
         // let new_inode_guard = new_inode.0.lock();
         let fs = old_inode_guard.fs.upgrade().unwrap();
         let old_dir = match &old_guard.inode_type {
@@ -625,7 +624,7 @@ impl FATFileSystem {
             bpb.rsvd_sec_cnt as u64 + (bpb.num_fats as u64 * fat_size) + root_dir_sectors;
 
         // 创建文件系统的根节点
-        let root_inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
+        let root_inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(Mutex::new(FATInode {
             parent: Weak::default(),
             self_ref: Weak::default(),
             children: HashMap::new(),
@@ -667,7 +666,7 @@ impl FATFileSystem {
         });
 
         // 对root inode加锁，并继续完成初始化工作
-        let mut root_guard: SpinLockGuard<FATInode> = result.root_inode.0.lock();
+        let mut root_guard: MutexGuard<FATInode> = result.root_inode.0.lock();
         root_guard.inode_type = FATDirEntry::Dir(result.root_dir());
         root_guard.parent = Arc::downgrade(&result.root_inode);
         root_guard.self_ref = Arc::downgrade(&result.root_inode);
@@ -1703,7 +1702,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let guard: SpinLockGuard<FATInode> = self.0.lock();
+        let guard: MutexGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
                 let r = f.read(&guard.fs.upgrade().unwrap(), buf, offset as u64);
@@ -1721,7 +1720,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let mut guard: MutexGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 
         match &mut guard.inode_type {
@@ -1798,7 +1797,7 @@ impl IndexNode for LockedFATInode {
         _mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 由于FAT32不支持文件权限的功能，因此忽略mode参数
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let mut guard: MutexGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 
         match &mut guard.inode_type {
@@ -1905,10 +1904,10 @@ impl IndexNode for LockedFATInode {
         if let Some(page_cache) = self.page_cache() {
             let start_page = (len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
             truncate_inode_pages(page_cache.clone(), start_page);
-            page_cache.lock_irqsave().resize(len)?;
+            page_cache.lock().resize(len)?;
         }
 
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let mut guard: MutexGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
         let old_size = guard.metadata.size as usize;
 
@@ -1950,7 +1949,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
-        let guard: SpinLockGuard<FATInode> = self.0.lock();
+        let guard: MutexGuard<FATInode> = self.0.lock();
         let old_size = guard.metadata.size as usize;
         if len < old_size {
             drop(guard);
@@ -1961,7 +1960,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let mut guard: MutexGuard<FATInode> = self.0.lock();
         let fatent: &FATDirEntry = &guard.inode_type;
         match fatent {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
@@ -2004,7 +2003,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let mut guard: MutexGuard<FATInode> = self.0.lock();
         let target = guard.find(name)?;
         return Ok(target);
     }
@@ -2022,10 +2021,10 @@ impl IndexNode for LockedFATInode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let mut guard: MutexGuard<FATInode> = self.0.lock();
         let target: Arc<LockedFATInode> = guard.find(name)?;
         // 对目标inode上锁，以防更改
-        let target_guard: SpinLockGuard<FATInode> = target.0.lock();
+        let target_guard: MutexGuard<FATInode> = target.0.lock();
         // 先从缓存删除
         let nod = guard.children.remove(&to_search_name(name));
 
@@ -2057,10 +2056,10 @@ impl IndexNode for LockedFATInode {
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let mut guard: MutexGuard<FATInode> = self.0.lock();
         let target: Arc<LockedFATInode> = guard.find(name)?;
         // 对目标inode上锁，以防更改
-        let target_guard: SpinLockGuard<FATInode> = target.0.lock();
+        let target_guard: MutexGuard<FATInode> = target.0.lock();
         // 先从缓存删除
         guard.children.remove(&to_search_name(name));
 
@@ -2119,7 +2118,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
-        let guard: SpinLockGuard<FATInode> = self.0.lock();
+        let guard: MutexGuard<FATInode> = self.0.lock();
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }

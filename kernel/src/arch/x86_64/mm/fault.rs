@@ -27,7 +27,7 @@ pub type PageMapper =
 
 impl X86_64MMArch {
     pub fn vma_access_error(vma: Arc<LockedVMA>, error_code: X86PfErrorCode) -> bool {
-        let vm_flags = *vma.lock_irqsave().vm_flags();
+        let vm_flags = *vma.lock().vm_flags();
         let foreign = false;
         if error_code.contains(X86PfErrorCode::X86_PF_PK) {
             return true;
@@ -312,7 +312,7 @@ impl X86_64MMArch {
         };
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
-        let mut space_guard = current_address_space.write_irqsave();
+        let mut space_guard = current_address_space.write();
         let mut fault;
         loop {
             let vma = space_guard.mappings.find_nearest(address);
@@ -336,7 +336,7 @@ impl X86_64MMArch {
                     return;
                 }
             };
-            let guard = vma.lock_irqsave();
+            let guard = vma.lock();
             let region = *guard.region();
             let vm_flags = *guard.vm_flags();
             drop(guard);

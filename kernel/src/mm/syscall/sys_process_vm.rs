@@ -301,7 +301,7 @@ fn do_process_vm_readv(
         }
 
         // Read from remote process's address space
-        let target_vm_guard = target_vm.read_irqsave();
+        let target_vm_guard = target_vm.read();
 
         // Check if remote address is valid in target's address space
         if target_vm_guard.mappings.contains(remote_addr).is_none() {
@@ -463,7 +463,7 @@ fn do_process_vm_writev(
         }
 
         // Write to remote process's address space
-        let target_vm_guard = target_vm.read_irqsave();
+        let target_vm_guard = target_vm.read();
 
         // Check if remote address is valid in target's address space
         if target_vm_guard.mappings.contains(remote_addr).is_none() {

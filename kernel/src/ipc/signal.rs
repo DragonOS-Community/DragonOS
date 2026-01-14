@@ -354,6 +354,9 @@ impl Signal {
         if pcb.flags().contains(ProcessFlags::EXITING) {
             return false;
         }
+        if pcb.is_zombie() || pcb.is_dead() {
+            return false;
+        }
 
         // SIGKILL 总是唤醒
         if *self == Signal::SIGKILL {

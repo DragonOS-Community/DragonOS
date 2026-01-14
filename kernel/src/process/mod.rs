@@ -496,7 +496,8 @@ impl ProcessManager {
                     log::error!("adopt_children failed during exit: {:?}. Children will be inherited by init.", e);
                 }
             };
-
+            // 在通知父进程之前，先标记为 Zombie，保证 wait 可见
+            current.set_exit_state_zombie();
             let r = current.parent_pcb.read_irqsave().upgrade();
             if r.is_none() {
                 return;
@@ -598,21 +599,16 @@ impl ProcessManager {
         // log::debug!("[exit: {}]", raw_pid.data());
         {
             let pcb = ProcessManager::current_pcb();
+            pcb.mark_exiting();
             pid = pcb.pid();
             pcb.wait_queue.mark_dead();
 
-            let rq = cpu_rq(smp_get_processor_id().data() as usize);
-            let (rq, guard) = rq.self_lock();
-            rq.deactivate_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-            drop(guard);
-
             // 进行进程退出后的工作
             let thread = pcb.thread.write_irqsave();
-
-            if let Some(addr) = thread.clear_child_tid {
+            let clear_child_tid = thread.clear_child_tid;
+            let vfork_done = thread.vfork_done.clone();
+            drop(thread);
+            if let Some(addr) = clear_child_tid {
                 // 按 Linux 语义：先清零 userland 的 *clear_child_tid，再 futex_wake(addr)
                 let cleared_ok = unsafe {
                     match clear_user_protected(addr, core::mem::size_of::<i32>()) {
@@ -638,10 +634,18 @@ impl ProcessManager {
 
             RobustListHead::exit_robust_list(pcb.clone());
             // 如果是vfork出来的进程，则需要处理completion
-            if thread.vfork_done.is_some() {
-                thread.vfork_done.as_ref().unwrap().complete_all();
+            if let Some(vd) = vfork_done {
+                vd.complete_all();
             }
-            drop(thread);
+
+            // clear_child_tid/robust_list 可能触发用户态缺页，必须在调度实体 deactive 前完成
+            let rq = cpu_rq(smp_get_processor_id().data() as usize);
+            let (rq, guard) = rq.self_lock();
+            rq.deactivate_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+            drop(guard);
 
             unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();
@@ -656,7 +660,7 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
 
-            // 在最后，调用 exit_notify 之前，设置状态为 Exited
+            // 在最后，调用 exit_notify 之前，设置调度状态为 Exited
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
@@ -700,6 +704,7 @@ impl ProcessManager {
             // 1. 在共享的 sighand 上原子性地设置 GROUP_EXIT 标志与 group_exit_code
             //    若已有线程抢先设置，则复用已存在的退出码。
             let sighand = current_pcb.sighand();
+            current_pcb.mark_exiting();
             final_exit_code = sighand.start_group_exit(exit_code);
 
             // 2. 向同一线程组内的其他线程发送 SIGKILL，唤醒并强制终止它们
@@ -765,8 +770,12 @@ impl ProcessManager {
 
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
+                let parent_ns = parent.active_pid_ns();
+                let vpid = pcb
+                    .task_pid_nr_ns(PidType::PID, Some(parent_ns))
+                    .unwrap_or(RawPid::new(0));
                 let mut children = parent.children.write();
-                children.retain(|&p| p != pid);
+                children.retain(|&p| p != vpid);
             }
 
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
@@ -875,11 +884,28 @@ pub enum ProcessState {
     Blocked(bool),
     /// 进程被信号终止
     Stopped(usize),
-    /// 用于ptrace跟踪停止的状态，携带退出码
-    /// 按照 Linux 6.6.21 的 TASK_TRACED 语义实现
+    /// 用于ptrace跟踪停止的状态 (TASK_TRACED)，携带退出码
     TracedStopped(usize),
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitState {
+    Running = 0,
+    Zombie = 1,
+    Dead = 2,
+}
+
+impl ExitState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ExitState::Zombie,
+            2 => ExitState::Dead,
+            _ => ExitState::Running,
+        }
+    }
 }
 
 impl ProcessState {
@@ -1279,6 +1305,8 @@ pub struct ProcessControlBlock {
     sighand: RwLock<Arc<SigHand>>,
     /// 备用信号栈
     sig_altstack: RwLock<SigStackArch>,
+    /// 退出状态（Running/Zombie/Dead）
+    exit_state: AtomicU8,
 
     /// 退出信号S
     exit_signal: AtomicSignal,
@@ -1446,6 +1474,7 @@ impl ProcessControlBlock {
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RwLock::new(SigHand::new()),
                 sig_altstack: RwLock::new(SigStackArch::new()),
+                exit_state: AtomicU8::new(ExitState::Running as u8),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
 
@@ -1953,9 +1982,18 @@ impl ProcessControlBlock {
                         if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
                             *child.parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
                             *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
-                            child.basic.write_irqsave().ppid = parent_init.task_pid_vnr();
+                            let parent_pid_in_child_ns = parent_init
+                                .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
+                                .unwrap_or(RawPid::new(0));
+                            child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+
+                            let child_vpid_in_parent_ns = child
+                                .task_pid_nr_ns(PidType::PID, Some(parent_init.active_pid_ns()))
+                                .unwrap_or(RawPid::new(0));
+                            if child_vpid_in_parent_ns.data() != 0 {
+                                parent_init.children.write().push(child_vpid_in_parent_ns);
+                            }
                         }
-                        parent_init.children.write().push(pid);
                     }
                 }
             }
@@ -1988,11 +2026,19 @@ impl ProcessControlBlock {
             if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
                 *child.parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
                 *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
-                child.basic.write_irqsave().ppid = reaper.task_pid_vnr();
-            }
+                let parent_pid_in_child_ns = reaper
+                    .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
+                    .unwrap_or(RawPid::new(0));
+                child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
 
-            // 按 wait 语义，将被收养子进程挂到收养者（线程组 leader）的 children 列表中。
-            reaper.children.write().push(pid);
+                // 按 wait 语义，将被收养子进程挂到收养者（线程组 leader）的 children 列表中。
+                let child_vpid_in_reaper_ns = child
+                    .task_pid_nr_ns(PidType::PID, Some(reaper.active_pid_ns()))
+                    .unwrap_or(RawPid::new(0));
+                if child_vpid_in_reaper_ns.data() != 0 {
+                    reaper.children.write().push(child_vpid_in_reaper_ns);
+                }
+            }
         }
 
         Ok(())
@@ -2195,6 +2241,39 @@ impl ProcessControlBlock {
             .inner_lock_read_irqsave()
             .state()
             .exit_code()
+    }
+
+    pub fn exit_state(&self) -> ExitState {
+        ExitState::from_u8(self.exit_state.load(Ordering::Acquire))
+    }
+
+    pub fn is_zombie(&self) -> bool {
+        self.exit_state() == ExitState::Zombie
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.exit_state() == ExitState::Dead
+    }
+
+    pub fn set_exit_state_zombie(&self) {
+        self.exit_state
+            .store(ExitState::Zombie as u8, Ordering::Release);
+    }
+
+    pub fn try_mark_dead_from_zombie(&self) -> bool {
+        self.exit_state
+            .compare_exchange(
+                ExitState::Zombie as u8,
+                ExitState::Dead as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn mark_exiting(&self) {
+        self.flags().insert(ProcessFlags::EXITING);
+        fence(Ordering::SeqCst);
     }
 
     /// 获取进程的namespace代理

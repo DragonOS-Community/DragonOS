@@ -43,6 +43,8 @@
               kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
               # -s -S
               debug = false;
+              # 启用 VM 状态管理，与 make qemu 行为保持一致
+              vmstateDir = "${buildDir}/vmstate";
             };
 
             startPkg = qemuScripts.${target};

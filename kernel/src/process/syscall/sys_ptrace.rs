@@ -5,6 +5,7 @@ use crate::{
         syscall::nr::{SYS_EXIT, SYS_PTRACE},
         MMArch,
     },
+    ipc::signal_types::PosixSigInfo,
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
     process::{
         syscall::sys_exit::SysExit, ProcessControlBlock, ProcessFlags, ProcessManager,
@@ -60,6 +61,7 @@ impl user_regs_struct {
     /// # Safety
     ///
     /// 调用者必须确保 trap_frame 指向的内存有效
+    #[allow(dead_code)]
     pub unsafe fn from_trap_frame_extra(
         trap_frame: &TrapFrame,
         fs_base: u64,
@@ -130,6 +132,7 @@ impl TryFrom<usize> for PtraceRequest {
 ///
 /// # Safety
 /// 调用者必须确保 tracee 在访问期间不会被销毁
+#[allow(dead_code)]
 fn ptrace_access_vm<F, R>(tracee: &Arc<ProcessControlBlock>, f: F) -> Result<R, SystemError>
 where
     F: FnOnce() -> Result<R, SystemError>,
@@ -299,6 +302,7 @@ impl SysPtrace {
     }
 
     /// 处理 PTRACE_SYSCALL 请求（在系统调用入口和出口暂停）
+    #[allow(dead_code)]
     fn handle_syscall(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
         // 检查调用者是否是该进程的跟踪器
         let tracer_pid = ProcessManager::current_pcb().raw_pid();
@@ -312,6 +316,7 @@ impl SysPtrace {
     }
 
     /// 处理 PTRACE_SETOPTIONS 请求（设置跟踪选项）
+    #[allow(dead_code)]
     fn handle_set_options(
         tracee: &Arc<ProcessControlBlock>,
         data: usize,
@@ -324,7 +329,11 @@ impl SysPtrace {
     }
 
     /// 处理 PTRACE_GETSIGINFO 请求（获取信号信息）
-    fn handle_get_siginfo(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
+    #[allow(dead_code)]
+    fn handle_get_siginfo(
+        tracee: &Arc<ProcessControlBlock>,
+        data: usize,
+    ) -> Result<isize, SystemError> {
         // 读取 last_siginfo 并拷贝到用户空间
         let siginfo = tracee
             .ptrace_state
@@ -332,9 +341,9 @@ impl SysPtrace {
             .last_siginfo()
             .ok_or(SystemError::EINVAL)?;
 
-        // TODO: 将 siginfo 拷贝到用户空间的 data 参数指向的地址
-        // 目前返回成功，表示 siginfo 存在
-        // 完整实现需要：将 siginfo 转换为 PosixSigInfo 格式并拷贝到用户空间
+        // 将 siginfo 转换为 PosixSigInfo 格式并拷贝到用户空间
+        let uinfo = data as *mut PosixSigInfo;
+        siginfo.copy_posix_siginfo_to_user(uinfo)?;
         log::debug!("PTRACE_GETSIGINFO: siginfo={:?}", siginfo);
         Ok(0)
     }
@@ -376,6 +385,7 @@ impl SysPtrace {
     }
 
     /// 处理 PTRACE_SINGLESTEP 请求 (单步执行)
+    #[allow(dead_code)]
     fn handle_single_step(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
         // 检查调用者是否是该进程的跟踪器
         let tracer_pid = ProcessManager::current_pcb().raw_pid();
@@ -474,6 +484,7 @@ impl SysPtrace {
     }
 
     // 在系统调用处理之前
+    #[allow(dead_code)]
     fn before_handle_syscall(num: usize, args: &[usize]) {
         let current = ProcessManager::current_pcb();
         // 检查进程是否被跟踪并且启用了系统调用跟踪
@@ -490,7 +501,8 @@ impl SysPtrace {
     }
 
     // 在系统调用处理之后
-    fn after_handle_syscall(num: usize, result: isize) {
+    #[allow(dead_code)]
+    fn after_handle_syscall(_num: usize, result: isize) {
         let current = ProcessManager::current_pcb();
         // 检查进程是否被跟踪并且启用了系统调用跟踪
         if current
@@ -506,6 +518,7 @@ impl SysPtrace {
     }
 
     // 在系统调用分发函数中
+    #[allow(dead_code)]
     fn dispatch_syscall(
         num: usize,
         args: &[usize],
@@ -524,6 +537,7 @@ impl SysPtrace {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     fn ptrace_check_attach(
         tracee: &Arc<ProcessControlBlock>,
         _request: PtraceRequest,
@@ -589,7 +603,7 @@ impl Syscall for SysPtrace {
             // 设置跟踪选项
             PtraceRequest::Setoptions => Self::handle_set_options(&tracee, data)?,
             // 获取信号信息
-            PtraceRequest::Getsiginfo => Self::handle_get_siginfo(&tracee)?,
+            PtraceRequest::Getsiginfo => Self::handle_get_siginfo(&tracee, data)?,
             // PTRACE_SEIZE：现代 API，不发送 SIGSTOP
             PtraceRequest::Seize => Self::handle_seize(&tracer, pid, addr)?,
             // 其他请求类型

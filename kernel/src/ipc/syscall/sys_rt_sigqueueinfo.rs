@@ -6,7 +6,7 @@ use core::mem::size_of;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RT_SIGQUEUEINFO;
 use crate::ipc::signal_types::{OriginCode, PosixSigInfo, SigCode, SigInfo, SigType};
-use crate::ipc::syscall::sys_kill::check_signal_permission_pcb_with_sig;
+use crate::ipc::syscall::sys_kill::check_kill_permission;
 use crate::process::pid::PidType;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
@@ -63,7 +63,7 @@ impl Syscall for SysRtSigqueueinfoHandle {
             let target_pid = RawPid::from(pid as usize);
             let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
             // 传入 Signal::INVALID/0 在权限检查里无特殊含义，这里用 None 即可
-            check_signal_permission_pcb_with_sig(&target, None)?;
+            check_kill_permission(&target, None)?;
             return Ok(0);
         }
 
@@ -129,7 +129,7 @@ impl Syscall for SysRtSigqueueinfoHandle {
 
         // 查找目标进程并检查权限
         let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
-        check_signal_permission_pcb_with_sig(&target, Some(signal))?;
+        check_kill_permission(&target, Some(signal))?;
 
         // rt_sigqueueinfo 发送进程级信号，使用 PidType::TGID
         signal

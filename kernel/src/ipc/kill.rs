@@ -2,7 +2,7 @@ use crate::{
     arch::ipc::signal::Signal,
     ipc::{
         signal_types::{OriginCode, SigCode, SigInfo, SigType},
-        syscall::sys_kill::check_signal_permission_pcb_with_sig,
+        syscall::sys_kill::check_kill_permission,
     },
     process::{
         pid::{Pid, PidType},
@@ -21,7 +21,7 @@ pub fn send_signal_to_pid(pid: RawPid, sig: Signal) -> Result<usize, SystemError
     let target = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
 
     // 检查权限（传入信号以处理 SIGCONT 特殊情况）
-    check_signal_permission_pcb_with_sig(&target, Some(sig))?;
+    check_kill_permission(&target, Some(sig))?;
 
     // 初始化signal info
     let current_pcb = ProcessManager::current_pcb();
@@ -92,7 +92,7 @@ pub fn send_signal_to_pgid(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, System
 
     for pcb in tasks {
         // 检查权限（传入信号以处理 SIGCONT 特殊情况）
-        if let Err(e) = check_signal_permission_pcb_with_sig(&pcb, Some(sig)) {
+        if let Err(e) = check_kill_permission(&pcb, Some(sig)) {
             if !success {
                 last_err = Some(e);
             }

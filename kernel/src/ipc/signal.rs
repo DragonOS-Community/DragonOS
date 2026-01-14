@@ -35,7 +35,7 @@ pub fn send_kernel_signal_to_current(sig: Signal) -> Result<(), SystemError> {
     let mut info = SigInfo::new(
         sig,
         0,
-        SigCode::Kernel,
+        SigCode::Origin(OriginCode::Kernel),
         SigType::Kill {
             pid: RawPid::new(0),
             uid: 0,
@@ -166,7 +166,7 @@ impl Signal {
             //详见 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226
         }
 
-        let prepare_result = self.prepare_sianal(pcb.clone(), force_send);
+        let prepare_result = self.prepare_signal(pcb.clone(), force_send);
         if !prepare_result {
             return Ok(0);
         }
@@ -472,7 +472,7 @@ impl Signal {
     /// - `true` 能够发送信号
     ///
     /// - `false` 不能发送信号
-    fn prepare_sianal(&self, pcb: Arc<ProcessControlBlock>, _force: bool) -> bool {
+    fn prepare_signal(&self, pcb: Arc<ProcessControlBlock>, _force: bool) -> bool {
         // 统一从线程组组长的 ThreadInfo 中获取完整线程列表。
         // 注意：当前 sighand 共享在 CLONE_THREAD 线程组内，因此标志位操作仍然只需要对共享 sighand 做一次。
         let thread_group_leader = {
@@ -534,7 +534,7 @@ impl Signal {
 
             // 线程组 stop：对组内所有线程置为 Stopped，保证 SIGSTOP 对整个线程组生效。
             for_each_thread_in_group(&mut |t| {
-                let _ = ProcessManager::stop_task(t);
+                let _ = ProcessManager::stop_task(t, *self);
             });
 
             if let Some(parent) = pcb.parent_pcb() {

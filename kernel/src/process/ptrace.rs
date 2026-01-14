@@ -2,7 +2,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::ipc::signal::{SigFlags, Signal};
 use crate::arch::kprobe;
 use crate::ipc::signal_types::{
-    ChldCode, OriginCode, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType, TrapCode,
+    ChldCode, OriginCode, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType,
 };
 use crate::process::cred;
 use crate::process::{
@@ -25,9 +25,11 @@ pub fn ptrace_signal(
     original_signal: Signal,
     info: &mut Option<SigInfo>,
 ) -> Option<Signal> {
+    // Clone the Arc before calling ptrace_stop to prevent use-after-free.
+    let pcb_clone = Arc::clone(pcb);
     // todo pcb.jobctl_set(JobControlFlags::STOP_DEQUEUED);
     // 注意：ptrace_stop 内部会处理锁的释放和重新获取。
-    let signr = pcb.ptrace_stop(original_signal as usize, ChldCode::Trapped, info.as_mut());
+    let signr = pcb_clone.ptrace_stop(original_signal as usize, ChldCode::Trapped, info.as_mut());
 
     if signr == 0 {
         return None; // 丢弃原始信号，继续处理下一个信号（如果没有，则继续执行）
@@ -43,7 +45,7 @@ pub fn ptrace_signal(
     if injected_signal != original_signal {
         if let Some(info_ref) = info {
             // 如果获取失败，保持原有的 siginfo
-            if let Some(tracer) = pcb.tracer().and_then(ProcessManager::find) {
+            if let Some(tracer) = pcb_clone.tracer().and_then(ProcessManager::find) {
                 *info_ref = SigInfo::new(
                     injected_signal,
                     0,
@@ -61,7 +63,7 @@ pub fn ptrace_signal(
     // 特殊处理 SIGCONT：需要清除挂起的停止信号，但仍然要唤醒进程并传递给用户空间处理
     if injected_signal == Signal::SIGCONT {
         // 清除任何挂起的停止信号（如 SIGSTOP, SIGTSTP 等）
-        let mut sig_info = pcb.sig_info.write();
+        let mut sig_info = pcb_clone.sig_info.write();
         let pending = sig_info.sig_pending_mut().signal_mut();
         for stop_sig in [
             Signal::SIGSTOP,
@@ -76,15 +78,25 @@ pub fn ptrace_signal(
     }
 
     // 检查新信号是否被当前进程的信号掩码阻塞
-    let sig_info_guard = pcb.sig_info_irqsave();
-    if sig_info_guard
-        .sig_blocked()
-        .contains(injected_signal.into())
-    {
-        // 如果被阻塞了，则将信号重新排队，让它在未来被处理。
-        let _ =
-            injected_signal.send_signal_info_to_pcb(info.as_mut(), Arc::clone(pcb), PidType::PID);
-        return None;
+    let sig_set = {
+        let guard = pcb_clone.sig_info_irqsave();
+        *guard.sig_blocked()
+    };
+
+    if sig_set.contains(injected_signal.into()) {
+        // 如果信号被阻塞了，则尝试重新入队
+        match injected_signal.send_signal_info_to_pcb(info.as_mut(), pcb_clone, PidType::PID) {
+            Ok(_) => return None, // 成功入队
+            Err(e) => {
+                // 严重错误：无法保留被阻塞的信号。
+                log::error!(
+                    "ptrace_signal lost signal {:?} due to re-queue failure: {:?}",
+                    injected_signal,
+                    e
+                );
+                return None;
+            }
+        }
     }
     // 如果没有被阻塞，则返回这个新信号，让 get_signal 继续分发和处理它。
     Some(injected_signal)
@@ -122,8 +134,9 @@ impl ProcessControlBlock {
     }
 
     pub fn is_traced_by(&self, tracer: &Arc<ProcessControlBlock>) -> bool {
-        match self.tracer() {
-            Some(tracer_pid) => tracer_pid == tracer.raw_pid(),
+        let state = self.ptrace_state.lock();
+        match state.tracer {
+            Some(pid) => pid == tracer.raw_pid(),
             None => false,
         }
     }
@@ -210,7 +223,13 @@ impl ProcessControlBlock {
             self.ptrace_state.lock().event_message = message;
             // ptrace_notify 会调用 ptrace_stop，阻塞进程直到 tracer 唤醒
             let exit_code = (event as usize) << 8 | Signal::SIGTRAP as usize;
-            let _ = Self::ptrace_notify(exit_code);
+            if let Err(e) = Self::ptrace_notify(exit_code) {
+                log::error!(
+                    "ptrace_event: failed to notify tracer of event {:?}: {:?}",
+                    event,
+                    e
+                );
+            }
             // ptrace_stop 内部会调用 schedule() 阻塞
             // 当 tracer 调用 PTRACE_CONT 时，ptrace_resume 会设置 Runnable
         } else if event == PtraceEvent::Exec {
@@ -229,7 +248,14 @@ impl ProcessControlBlock {
                 );
                 // 如果 self_ref 升级失败，说明进程正在销毁，此时发送信号没有意义，安全地跳过
                 if let Some(strong_ref) = self.self_ref.upgrade() {
-                    let _ = sig.send_signal_info_to_pcb(Some(&mut info), strong_ref, PidType::PID);
+                    if let Err(e) =
+                        sig.send_signal_info_to_pcb(Some(&mut info), strong_ref, PidType::PID)
+                    {
+                        log::error!(
+                            "ptrace_event: failed to send legacy SIGTRAP for exec: {:?}",
+                            e
+                        );
+                    }
                 }
             }
             // 未PTRACED或PTRACE_SEIZE：不发送信号，静默返回
@@ -368,7 +394,7 @@ impl ProcessControlBlock {
             return true;
         }
 
-        // 3. 检查UID、GID是否完全匹配 (euid/suid/uid、gid 都要相同) 
+        // 3. 检查UID、GID是否完全匹配 (euid/suid/uid、gid 都要相同)
         let caller_cred = self.cred();
         let tracee_cred = tracee.cred();
         let uid_match = caller_cred.uid == tracee_cred.euid
@@ -422,8 +448,6 @@ impl ProcessControlBlock {
             .ok_or(SystemError::ESRCH)?;
         self.set_parent(&new_parent)?;
 
-        // 获取信号锁
-        let _sighand_lock = self.sighand();
         // 3. 清除 ptrace 标志和 tracer
         self.clear_tracer();
 
@@ -513,7 +537,7 @@ impl ProcessControlBlock {
         );
         if let Some(strong_ref) = self.self_ref.upgrade() {
             if let Err(e) = sig.send_signal_info_to_pcb(Some(&mut info), strong_ref, PidType::PID) {
-                // 回滚ptrace设置
+                // 回滚 ptrace 设置
                 self.flags().remove(ProcessFlags::PTRACED);
                 self.ptrace_unlink()?;
                 return Err(e);
@@ -725,12 +749,18 @@ impl ProcessControlBlock {
         Ok(0)
     }
 
+    /// 处理 PTRACE_GETSIGINFO 请求，获取系统调用信息
+    ///
+    /// # 注意
+    /// **此函数当前未完全实现** - 返回的数据可能不正确
+    #[allow(dead_code)]
     pub fn ptrace_get_syscall_info(
         &self,
         user_size: usize,
         _datavp: usize, // Use a raw byte pointer for flexibility
     ) -> Result<isize, SystemError> {
-        // todo let trap_frame = self.task_context();
+        // TODO: 获取实际的trapframe，而不是创建空的
+        // let trap_frame = self.task_context();
         let trap_frame = TrapFrame::new();
         let ctx = kprobe::KProbeContext::from(&trap_frame);
         let mut info = PtraceSyscallInfo {
@@ -776,23 +806,30 @@ impl ProcessControlBlock {
         // 将数据拷贝到用户空间
         let write_size = core::cmp::min(actual_size, user_size);
         if write_size > 0 {
-            // 将结构体视为字节切片进行拷贝
+            // TODO: 实现用户空间数据拷贝
+            // 需要使用 UserBufferWriter 将 info 结构体拷贝到 _datavp
             let _info_bytes =
                 unsafe { core::slice::from_raw_parts(&info as *const _ as *const u8, write_size) };
             // datavp.write_bytes(info_bytes)?;
         }
 
         // 无论拷贝多少，都返回内核准备好的完整数据大小
+        // 注意：当前返回的大小是正确的，但数据内容是空的（因为使用TrapFrame::new()）
         Ok(actual_size as isize)
     }
 
     /// 处理PTRACE_SINGLESTEP请求
+    /// # 未实现
+    /// - CPU层面的单步执行标志设置（x86_64的EFLAGS.TF位）
+    #[allow(dead_code)]
     pub fn single_step(&self) -> Result<isize, SystemError> {
         // 设置单步执行标志
         self.flags().insert(ProcessFlags::TRACE_SINGLESTEP);
         self.flags().remove(ProcessFlags::TRACE_SYSCALL);
 
-        // 在CPU层面启用单步执行
+        // TODO: 在CPU层面启用单步执行
+        // 需要设置x86_64的EFLAGS.TF (Trap Flag) 位
+        // 参考: Linux arch/x86/kernel/ptrace.c::user_enable_single_step()
         // if let Some(context) = self.context_mut() {
         //     context.enable_single_step();
         // }
@@ -823,9 +860,18 @@ impl ProcessControlBlock {
         Ok(0)
     }
 
-    /// 启用单步执行
+    /// 启用单步执行功能
+    /// # TODO
+    /// 需要实现架构特定的CPU标志设置：
+    /// - **x86_64**: 设置 EFLAGS.TF (Trap Flag, bit 8)
+    /// - **RISC-V**: 设置 sstatus.SSTEP
+    /// - **ARM64**: 设置 MDSCR_EL1.SS
+    ///
+    /// 参考:
+    /// - https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/step.c#217
+    #[allow(dead_code)]
     pub fn enable_single_step(&self) {
-        // 实际实现中需要设置CPU标志
+        unimplemented!()
     }
 
     /// 启用系统调用跟踪
@@ -833,18 +879,25 @@ impl ProcessControlBlock {
         self.flags().insert(ProcessFlags::TRACE_SYSCALL);
     }
 
-    /// 在系统调用入口处理
+    /// 在系统调用入口处调用
+    #[allow(dead_code)]
     pub fn on_syscall_entry(&self, _num: usize, _args: &[usize]) {
-        // 实际实现中需要记录系统调用信息
+        // TODO: 记录系统调用入口信息
     }
 
-    /// 在系统调用出口处理
+    /// 在系统调用出口处调用
+    #[allow(dead_code)]
     pub fn on_syscall_exit(&self, _result: isize) {
-        // 实际实现中需要记录系统调用结果
+        // TODO: 记录系统调用出口信息
     }
 
     /// 处理 PTRACE_PEEKUSER 请求
+    /// 在Linux中，此函数读取 tracee 的 "USER" 区域数据，主要包含：
+    /// - 寄存器值（通过偏移量访问）
+    /// - 特殊值如调试寄存器
+    #[allow(dead_code)]
     pub fn peek_user(&self, _addr: usize) -> Result<isize, SystemError> {
+        // 未实现注释掉的代码：
         // // 验证地址是否在用户空间范围内
         // if !self.memory.is_user_address(addr) {
         //     return Err(SystemError::EFAULT);
@@ -872,6 +925,7 @@ impl ProcessControlBlock {
     }
 
     /// 清空待处理信号
+    #[allow(dead_code)]
     pub fn clear_ptrace(&self) {
         let mut ptrace_state = self.ptrace_state.lock();
 

@@ -5,8 +5,11 @@ use core::ffi::c_int;
 
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal, syscall::nr::SYS_TKILL},
-    ipc::signal_types::{OriginCode, SigCode, SigInfo, SigType},
-    process::{cred::CAPFlags, pid::PidType, ProcessControlBlock, ProcessManager, RawPid},
+    ipc::{
+        signal_types::{OriginCode, SigCode, SigInfo, SigType},
+        syscall::sys_kill::check_kill_permission,
+    },
+    process::{pid::PidType, ProcessControlBlock, ProcessManager, RawPid},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use system_error::SystemError;
@@ -94,7 +97,7 @@ pub fn do_tkill(tgid: i32, tid: i32, sig: c_int) -> Result<usize, SystemError> {
     };
 
     // 4. 权限检查 (sig=0 时也必须检查权限)
-    check_kill_permission(signal, &target_pcb)?;
+    check_kill_permission(&target_pcb, Some(signal))?;
 
     // 5. 如果是探测模式，权限检查通过后直接返回
     if sig == 0 {
@@ -103,55 +106,6 @@ pub fn do_tkill(tgid: i32, tid: i32, sig: c_int) -> Result<usize, SystemError> {
 
     // 6. 发送信号
     send_signal_tkill(signal, target_pcb)
-}
-
-/// 检查发送信号的权限
-///
-/// 根据Linux的权限检查规则：
-/// 1. 发送者和接收者同用户，或者发送者具有 CAP_KILL 权限
-/// 2. 对于 SIGCONT，规则更宽松：只要是同一 session 即可
-///
-/// # 参数
-/// - `sig`: 要发送的信号
-/// - `target_pcb`: 目标进程控制块
-///
-/// # 返回值
-/// - `Ok(())`: 权限检查通过
-/// - `Err(SystemError::EPERM)`: 权限不足
-fn check_kill_permission(
-    sig: Signal,
-    target_pcb: &Arc<ProcessControlBlock>,
-) -> Result<(), SystemError> {
-    let current_pcb = ProcessManager::current_pcb();
-    let current_cred = current_pcb.cred();
-    let target_cred = target_pcb.cred();
-
-    // 检查 CAP_KILL 权限
-    if current_cred.has_capability(CAPFlags::CAP_KILL) {
-        return Ok(());
-    }
-
-    // 凭证检查 (kill_ok_by_cred)
-    // 规则：发送者的 euid/uid 必须匹配目标线程的 suid/uid
-    if current_cred.euid == target_cred.suid
-        || current_cred.euid == target_cred.uid
-        || current_cred.uid == target_cred.suid
-        || current_cred.uid == target_cred.uid
-    {
-        return Ok(());
-    }
-
-    // 3. SIGCONT 的特殊规则：同一 Session 即可
-    if sig == Signal::SIGCONT {
-        let current_session = current_pcb.task_session();
-        let target_session = target_pcb.task_session();
-        // 确保双方都在 session 中且 session ID 相同
-        if current_session.is_some() && current_session == target_session {
-            return Ok(());
-        }
-    }
-
-    Err(SystemError::EPERM)
 }
 
 /// 发送 tkill 语义的信号

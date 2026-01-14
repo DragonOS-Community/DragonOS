@@ -400,7 +400,7 @@ impl ProcessManager {
     ///
     /// 注意：该函数用于对“目标进程”进行停止标记，不要求在目标进程上下文调用。
     /// 与 `mark_stop`（仅当前进程）相对应。
-    pub fn stop_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+    pub fn stop_task(pcb: &Arc<ProcessControlBlock>, sig: Signal) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         let state = writer.state();
@@ -410,7 +410,7 @@ impl ProcessManager {
 
         // Stopped 的任务不应继续留在 runqueue 中，否则仍可能被选中运行。
         let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
-        writer.set_state(ProcessState::Stopped(0));
+        writer.set_state(ProcessState::Stopped(sig.into()));
         // stop 后不应再被视为“睡眠任务”，避免后续调度错误地做 DEQUEUE_SLEEP。
         writer.set_wakeup();
         pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
@@ -490,9 +490,11 @@ impl ProcessManager {
         // 让INIT进程收养所有子进程
         if current.raw_pid() != RawPid(1) {
             unsafe {
-                current
-                    .adopt_childen()
-                    .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
+                if let Err(e) = current.adopt_childen() {
+                    // Log error but don't panic - allow exit to continue
+                    // Init will inherit orphaned children
+                    log::error!("adopt_children failed during exit: {:?}. Children will be inherited by init.", e);
+                }
             };
 
             let r = current.parent_pcb.read_irqsave().upgrade();
@@ -757,6 +759,10 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
+            // 立即执行 exit_signal，清理 PID 等资源
+            // 确保 waitid 之后的调用能立即感知到进程已彻底消失（特别是 PID namespace 清理）
+            pcb.__exit_signal();
+
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
                 let mut children = parent.children.write();
@@ -800,7 +806,6 @@ impl ProcessManager {
     /// ## 参数
     ///
     /// - `pcb` : 进程的pcb
-    #[allow(dead_code)]
     pub fn kick(pcb: &Arc<ProcessControlBlock>) {
         ProcessManager::current_pcb().preempt_disable();
         let cpu_id = pcb.sched_info().on_cpu();
@@ -877,7 +882,6 @@ pub enum ProcessState {
     Exited(usize),
 }
 
-#[allow(dead_code)]
 impl ProcessState {
     #[inline(always)]
     pub fn is_runnable(&self) -> bool {
@@ -1063,6 +1067,7 @@ pub enum PtraceSyscallInfoOp {
     None = 0,
     Entry = 1,
     Exit = 2,
+    #[allow(dead_code)]
     Seccomp = 3,
 }
 
@@ -1140,8 +1145,6 @@ pub struct PtraceState {
     pub stop_reason: PtraceStopReason,
     /// ptrace选项位
     options: PtraceOptions,
-    /// 停止状态的状态字
-    exit_code: usize,
     /// 用于存储事件消息
     event_message: usize,
     /// tracer 注入的信号（在 ptrace_stop 返回后要处理的信号）
@@ -1157,7 +1160,6 @@ impl Default for PtraceState {
             pending_signals: Vec::new(),
             stop_reason: PtraceStopReason::None,
             options: PtraceOptions::empty(),
-            exit_code: 0,
             event_message: 0,
             injected_signal: Signal::INVALID,
             last_siginfo: None,
@@ -1171,7 +1173,6 @@ impl PtraceState {
             pending_signals: Vec::new(),
             stop_reason: PtraceStopReason::None,
             options: PtraceOptions::empty(),
-            exit_code: 0,
             event_message: 0,
             injected_signal: Signal::INVALID,
             last_siginfo: None,
@@ -1221,6 +1222,7 @@ impl PtraceState {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct SyscallInfo {
     /// 系统调用入口信息（系统调用号、参数、返回值）
     syscall_num: usize,

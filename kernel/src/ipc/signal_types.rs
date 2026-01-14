@@ -98,7 +98,7 @@ pub enum TrapCode {
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
 #[repr(i32)]
 pub enum IllCode {
-    /// 求编代码错误
+    /// 非法代码错误
     IllIll = 1,
     /// 汇编指令的 operand 不存在
     IllIlladr = 2,

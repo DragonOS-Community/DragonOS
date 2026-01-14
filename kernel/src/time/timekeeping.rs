@@ -6,7 +6,7 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::init::initcall::INITCALL_LATE;
-use crate::time::{set_boot_time, Instant};
+use crate::time::set_boot_time;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,

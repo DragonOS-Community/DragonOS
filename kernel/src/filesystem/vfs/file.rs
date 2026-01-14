@@ -805,12 +805,7 @@ impl File {
 
             for index in start_page..=end_page {
                 match page_cache_guard.get_page(index) {
-                    Some(page)
-                        if page
-                            .read_irqsave()
-                            .flags()
-                            .contains(PageFlags::PG_READAHEAD) =>
-                    {
+                    Some(page) if page.read().flags().contains(PageFlags::PG_READAHEAD) => {
                         async_trigger_page = Some((index, page.clone()));
                         break;
                     }
@@ -827,7 +822,7 @@ impl File {
         if let Some((index, page)) = async_trigger_page {
             let mut ra_state = self.ra_state.lock().clone();
             let req_pages = end_page - index + 1;
-            page.write_irqsave().remove_flags(PageFlags::PG_READAHEAD);
+            page.write().remove_flags(PageFlags::PG_READAHEAD);
 
             page_cache_async_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
             *self.ra_state.lock() = ra_state;

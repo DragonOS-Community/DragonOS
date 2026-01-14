@@ -119,7 +119,7 @@ pub(super) fn do_kernel_shmat(
                 // 将vma加入到对应Page的anon_vma
                 page_manager_guard
                     .get_unwrap(&phys.phys_address())
-                    .write_irqsave()
+                    .write()
                     .insert_vma(vma.clone());
 
                 phys = phys.next();

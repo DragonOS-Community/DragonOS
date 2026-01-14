@@ -244,8 +244,9 @@ impl PageFaultHandler {
         let mapper = &mut pfm.mapper;
         // If this is an anonymous shared mapping, use a shared backing so pages are visible across fork
         {
-            let guard = vma.lock_irqsave();
-            if guard.vm_flags().contains(VmFlags::VM_SHARED) {
+            let guard = vma.lock();
+            // 检查 VMA 是否有 VM_LOCKONFAULT 标志
+            let should_lock = guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);            if guard.vm_flags().contains(VmFlags::VM_SHARED) {
                 let shared = guard.shared_anon.clone();
                 if let Some(shared) = shared {
                     // Compute page index within the shared-anon backing object.

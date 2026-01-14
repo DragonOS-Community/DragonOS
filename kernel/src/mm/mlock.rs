@@ -32,7 +32,7 @@ use alloc::sync::Arc;
 use crate::{
     arch::{mm::PageMapper, MMArch},
     mm::{
-        page::{page_manager_lock_irqsave, Page},
+        page::{page_manager_lock, Page},
         ucontext::LockedVMA,
         MemoryManagementArch, PhysAddr, VirtAddr,
     },
@@ -210,7 +210,7 @@ impl LockedVMA {
     /// - `paddr`: 物理地址
     /// - `lock`: true=锁定, false=解锁
     fn mlock_phys_page(paddr: PhysAddr, lock: bool) {
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock();
         if let Some(page) = page_manager_guard.get(&paddr) {
             // 对页面应用锁定/解锁（不会失败，与 Linux 一致）
             if lock {

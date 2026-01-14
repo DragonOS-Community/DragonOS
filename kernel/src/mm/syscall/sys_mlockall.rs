@@ -97,7 +97,7 @@ impl Syscall for SysMlockallHandle {
                 // 这与 Linux 的 total_vm 语义一致，表示进程地址空间的总大小
                 let mut total_vm = 0;
                 for vma in addr_space_write.mappings.iter_vmas() {
-                    let vma_guard = vma.lock_irqsave();
+                    let vma_guard = vma.lock();
                     let vm_flags = *vma_guard.vm_flags();
                     let region = *vma_guard.region();
 

@@ -837,7 +837,7 @@ impl InnerAddressSpace {
             .mappings
             .contains(old_vaddr)
             .ok_or(SystemError::EINVAL)?;
-        let (old_region, vm_file, shared_anon, base_pgoff) = {
+        let (old_region, vm_flags,vm_file, shared_anon, base_pgoff) = {
             let g = old_vma.lock();
             let region = *g.region();
             let flags = *g.vm_flags();
@@ -1030,7 +1030,7 @@ impl InnerAddressSpace {
                 // MREMAP_DONTUNMAP：保留旧映射，增加新映射的计数
                 self.locked_vm += new_pages;
                 // 清除旧 VMA 的 VM_LOCKED 标志（因为页表已移到新映射）
-                let mut old_vma_guard = old_vma.lock_irqsave();
+                let mut old_vma_guard = old_vma.lock();
                 let current_flags = *old_vma_guard.vm_flags();
                 old_vma_guard
                     .set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
@@ -1080,8 +1080,13 @@ impl InnerAddressSpace {
         let mut locked_vm = 0;
 
         for r in regions {
-            let r = r.lock().region;
-            let r = self.mappings.remove_vma(&r).unwrap();
+            let r_guard = r.lock();
+            let was_locked = r_guard.vm_flags().contains(VmFlags::VM_LOCKED)
+                || r_guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);
+            let r_region = *r_guard.region();
+            drop(r_guard);
+            
+            let r = self.mappings.remove_vma(&r_region).unwrap();
             let intersection = r.lock().region().intersect(&to_unmap).unwrap();
             let split_result = r.extract(intersection, &self.user_mapper.utable).unwrap();
 
@@ -1484,7 +1489,7 @@ impl InnerAddressSpace {
         // 参考 Linux 语义：VMA 标志设置是破坏性操作，即使后续失败也不回滚
         // 对于不可访问的 VMA（如 PROT_NONE），仍然设置标志，但在后续步骤中跳过页面锁定
         for vma in &vmas {
-            let mut guard = vma.lock_irqsave();
+            let mut guard = vma.lock();
             let current_flags = *guard.vm_flags();
             let vma_start = guard.region().start();
             let vma_end = guard.region().end();
@@ -1533,7 +1538,7 @@ impl InnerAddressSpace {
                         continue;
                     }
 
-                    let vma_guard = vma.lock_irqsave();
+                    let vma_guard = vma.lock();
                     let vma_start = vma_guard.region().start();
                     let vma_end = vma_guard.region().end();
                     drop(vma_guard);
@@ -1566,7 +1571,7 @@ impl InnerAddressSpace {
             let mapper = PageMapper::current(PageTableKind::User, LockedFrameAllocator);
 
             for vma in &vmas {
-                let vma_guard = vma.lock_irqsave();
+                let vma_guard = vma.lock();
                 let vm_flags = *vma_guard.vm_flags();
                 let vma_start = vma_guard.region().start();
                 let vma_end = vma_guard.region().end();
@@ -1587,7 +1592,7 @@ impl InnerAddressSpace {
                 // 解锁该范围内的已映射页面
                 vma.mlock_vma_pages_range(&mapper, unlock_start, unlock_end, false);
                 // 清除 VMA 的锁定标志
-                let mut guard = vma.lock_irqsave();
+                let mut guard = vma.lock();
                 let current_flags = *guard.vm_flags();
                 guard.set_vm_flags(current_flags & !(VmFlags::VM_LOCKED | VmFlags::VM_LOCKONFAULT));
 
@@ -1635,7 +1640,7 @@ impl InnerAddressSpace {
                     if !vma.is_accessible() {
                         return None;
                     }
-                    let vma_guard = vma.lock_irqsave();
+                    let vma_guard = vma.lock();
                     let vm_flags = *vma_guard.vm_flags();
                     let region = *vma_guard.region();
                     drop(vma_guard);
@@ -1651,7 +1656,7 @@ impl InnerAddressSpace {
 
             // 先设置所有 VMA 的标志
             for (vma, _, _) in &vmas_to_lock {
-                let mut guard = vma.lock_irqsave();
+                let mut guard = vma.lock();
                 let current_flags = *guard.vm_flags();
                 guard.set_vm_flags(current_flags | lock_flags);
             }
@@ -1686,7 +1691,7 @@ impl InnerAddressSpace {
             .vmas
             .iter()
             .filter_map(|vma| {
-                let vma_guard = vma.lock_irqsave();
+                let vma_guard = vma.lock();
                 let vm_flags = *vma_guard.vm_flags();
                 let region = *vma_guard.region();
                 drop(vma_guard);
@@ -1718,7 +1723,7 @@ impl InnerAddressSpace {
         // 参考 Linux 语义：locked_vm 统计的是带 VM_LOCKED 标志的 VMA 页面数
         let mut pages_to_subtract = 0;
         for (vma, start, end) in &vmas_to_unlock {
-            let mut guard = vma.lock_irqsave();
+            let mut guard = vma.lock();
             let current_flags = *guard.vm_flags();
             // 只有当前确实有 VM_LOCKED 标志的 VMA 才需要减少计数
             if current_flags.contains(VmFlags::VM_LOCKED) {
@@ -1759,7 +1764,7 @@ impl InnerAddressSpace {
         let mut count = 0;
 
         for vma in self.mappings.conflicts(region) {
-            let vma_guard = vma.lock_irqsave();
+            let vma_guard = vma.lock();
             let vm_flags = *vma_guard.vm_flags();
             let vma_region = *vma_guard.region();
             drop(vma_guard);

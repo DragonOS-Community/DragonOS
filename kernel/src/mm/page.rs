@@ -214,11 +214,11 @@ impl PageManager {
     }
 }
 
-pub static mut PAGE_RECLAIMER: Option<RwSem<PageReclaimer>> = None;
+pub static mut PAGE_RECLAIMER: Option<Mutex<PageReclaimer>> = None;
 
 pub fn page_reclaimer_init() {
     info!("page_reclaimer_init");
-    let page_reclaimer = RwSem::new(PageReclaimer::new());
+    let page_reclaimer = Mutex::new(PageReclaimer::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_RECLAIMER = Some(page_reclaimer) };
@@ -271,9 +271,9 @@ fn page_reclaim_thread() -> i32 {
     }
 }
 
-/// 获取页面回收器（使用 RwSem，可睡眠）
-pub fn page_reclaimer_lock() -> RwSemWriteGuard<'static, PageReclaimer> {
-    unsafe { PAGE_RECLAIMER.as_ref().unwrap().write() }
+/// 获取页面回收器
+pub fn page_reclaimer_lock() -> MutexGuard<'static, PageReclaimer> {
+    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock() }
 }
 
 /// 页面回收器
@@ -375,7 +375,7 @@ impl PageReclaimer {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(guard: &mut RwSemWriteGuard<InnerPage>, unmap: bool) {
+    pub fn page_writeback(guard: &mut InnerPage, unmap: bool) {
         // log::debug!("page writeback: {:?}", guard.phys_addr);
 
         let (page_cache, page_index) = match guard.page_type() {
@@ -484,7 +484,6 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct Page {
-    /// 使用 RwSem 而非 RwLock，因为 writeback 等操作可能需要进行 I/O（可睡眠）
     inner: RwSem<InnerPage>,
     /// 页面所在物理地址
     phys_addr: PhysAddr,

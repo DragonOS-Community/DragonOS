@@ -27,6 +27,6 @@ pub fn truncate_inode_pages(page_cache: Arc<PageCache>, start: usize) {
 }
 
 fn truncate_complete_page(_page_cache: Arc<PageCache>, page: Arc<Page>) {
-    let mut guard = page.write_irqsave();
+    let mut guard = page.write();
     guard.remove_flags(PageFlags::PG_DIRTY);
 }

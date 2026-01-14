@@ -18,7 +18,7 @@ use crate::{
     arch::MMArch,
     libs::mutex::Mutex,
     mm::{
-        page::{page_manager_lock, page_reclaimer_lock_irqsave, Page, PageFlags},
+        page::{page_manager_lock, page_reclaimer_lock, Page, PageFlags},
         MemoryManagementArch,
     },
 };
@@ -106,7 +106,7 @@ impl InnerPageCache {
 
             let page_len = core::cmp::min(MMArch::PAGE_SIZE, buf.len() - buf_offset);
 
-            let mut page_guard = page.write_irqsave();
+            let mut page_guard = page.write();
             unsafe {
                 let dst = page_guard.as_slice_mut();
                 dst[..page_len].copy_from_slice(&buf[buf_offset..buf_offset + page_len]);
@@ -160,7 +160,7 @@ impl InnerPageCache {
                 &mut LockedFrameAllocator,
             )?;
 
-            let mut page_guard = page.write_irqsave();
+            let mut page_guard = page.write();
             unsafe {
                 page_guard.as_slice_mut().fill(0);
             }
@@ -361,7 +361,7 @@ impl InnerPageCache {
     pub fn resize(&mut self, len: usize) -> Result<(), SystemError> {
         let page_num = page_align_up(len) / MMArch::PAGE_SIZE;
 
-        let mut reclaimer = page_reclaimer_lock_irqsave();
+        let mut reclaimer = page_reclaimer_lock();
         for (_i, page) in self.pages.drain_filter(|index, _page| *index >= page_num) {
             let _ = reclaimer.remove_page(&page.phys_address());
         }
@@ -371,7 +371,7 @@ impl InnerPageCache {
             let last_len = len - last_page_index * MMArch::PAGE_SIZE;
             if let Some(page) = self.get_page(last_page_index) {
                 unsafe {
-                    page.write_irqsave().truncate(last_len);
+                    page.write().truncate(last_len);
                 };
             }
             // 对于新文件，最后一页不存在是正常的，不需要返回错误
@@ -388,7 +388,7 @@ impl InnerPageCache {
     /// Synchronize the page cache with the storage device.
     pub fn sync(&mut self) -> Result<(), SystemError> {
         for page in self.pages.values() {
-            let mut guard = page.write_irqsave();
+            let mut guard = page.write();
             if guard.flags().contains(PageFlags::PG_DIRTY) {
                 crate::mm::page::PageReclaimer::page_writeback(&mut guard, false);
             }
@@ -404,7 +404,7 @@ impl InnerPageCache {
     ) -> Result<(), SystemError> {
         for idx in start_index..=end_index {
             if let Some(page) = self.pages.get(&idx) {
-                let mut guard = page.write_irqsave();
+                let mut guard = page.write();
                 if guard.flags().contains(PageFlags::PG_DIRTY) {
                     crate::mm::page::PageReclaimer::page_writeback(&mut guard, false);
                 }
@@ -418,11 +418,11 @@ impl InnerPageCache {
     /// 只驱逐干净的、无外部引用的页
     pub fn invalidate_range(&mut self, start_index: usize, end_index: usize) -> usize {
         let mut evicted = 0;
-        let mut page_reclaimer = page_reclaimer_lock_irqsave();
+        let mut page_reclaimer = page_reclaimer_lock();
 
         for idx in start_index..=end_index {
             if let Some(page) = self.pages.get(&idx) {
-                let guard = page.read_irqsave();
+                let guard = page.read();
                 if guard.flags().contains(PageFlags::PG_DIRTY) {
                     continue;
                 }
@@ -512,7 +512,7 @@ impl PageCache {
             // 先prefault，避免在持锁后触发缺页
             let byte = volatile_read!(buf[dst_offset]);
             volatile_write!(buf[dst_offset], byte);
-            let page_guard = item.page.read_irqsave();
+            let page_guard = item.page.read();
             unsafe {
                 buf[dst_offset..dst_offset + item.sub_len].copy_from_slice(
                     &page_guard.as_slice()[item.page_offset..item.page_offset + item.sub_len],
@@ -535,7 +535,7 @@ impl PageCache {
         for item in copies {
             // 预触发用户缓冲区当前段，避免后续在持页锁时缺页
             let _ = volatile_read!(buf[src_offset]);
-            let mut page_guard = item.page.write_irqsave();
+            let mut page_guard = item.page.write();
             unsafe {
                 page_guard.as_slice_mut()[item.page_offset..item.page_offset + item.sub_len]
                     .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);

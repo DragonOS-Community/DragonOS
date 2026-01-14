@@ -531,7 +531,7 @@ impl IndexNode for LockedTmpfsInode {
             let v = volatile_read!(buf[dst_off + it.sub_len - 1]);
             volatile_write!(buf[dst_off + it.sub_len - 1], v);
 
-            let page_guard = it.page.read_irqsave();
+            let page_guard = it.page.read();
             unsafe {
                 buf[dst_off..dst_off + it.sub_len].copy_from_slice(
                     &page_guard.as_slice()[it.page_offset..it.page_offset + it.sub_len],
@@ -632,7 +632,7 @@ impl IndexNode for LockedTmpfsInode {
             volatile_read!(buf[src_off]);
             volatile_read!(buf[src_off + it.sub_len - 1]);
 
-            let mut page_guard = it.page.write_irqsave();
+            let mut page_guard = it.page.write();
             unsafe {
                 page_guard.as_slice_mut()[it.page_offset..it.page_offset + it.sub_len]
                     .copy_from_slice(&buf[src_off..src_off + it.sub_len]);

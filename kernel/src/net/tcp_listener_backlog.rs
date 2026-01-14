@@ -22,7 +22,7 @@ use smoltcp::wire::{
 #[derive(Debug, Clone, Copy)]
 struct TcpListenPortInfo {
     port: u16,
-    /// backlog==0 时启用：当“本轮 poll 里 LISTEN socket 被消耗完”后，后续纯 SYN 直接丢弃（不让 smoltcp 回 RST）。
+    /// backlog==0 时启用：当"本轮 poll 里 LISTEN socket 被消耗完"后，后续纯 SYN 直接丢弃（不让 smoltcp 回 RST）。
     drop_syn_when_full: bool,
     /// 缓存：当前是否存在至少一个处于 LISTEN 状态的 smoltcp socket（同端口）。
     ///

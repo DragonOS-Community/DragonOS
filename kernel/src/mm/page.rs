@@ -419,31 +419,43 @@ impl PageReclaimer {
             }
         }
 
+        let page_start = page_index * MMArch::PAGE_SIZE;
         let len = if let Ok(metadata) = inode.metadata() {
-            let size = metadata.size as usize;
-            size.saturating_sub(page_index * MMArch::PAGE_SIZE)
+            let file_size = metadata.size.max(0) as usize;
+            if file_size <= page_start {
+                0
+            } else {
+                core::cmp::min(MMArch::PAGE_SIZE, file_size - page_start)
+            }
         } else {
             MMArch::PAGE_SIZE
         };
 
         if len > 0 {
-            inode
-                .write_direct(
-                    page_index * MMArch::PAGE_SIZE,
+            let r = inode.write_direct(
+                page_start,
+                len,
+                unsafe {
+                    core::slice::from_raw_parts(
+                        MMArch::phys_2_virt(paddr).unwrap().data() as *const u8,
+                        len,
+                    )
+                },
+                Mutex::new(FilePrivateData::Unused).lock(),
+            );
+            if let Err(e) = r {
+                log::error!(
+                    "page writeback failed: offset={}, len={}, err={:?}",
+                    page_start,
                     len,
-                    unsafe {
-                        core::slice::from_raw_parts(
-                            MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8,
-                            len,
-                        )
-                    },
-                    Mutex::new(FilePrivateData::Unused).lock(),
-                )
-                .unwrap();
+                    e
+                );
+                guard.add_flags(PageFlags::PG_ERROR);
+                return;
+            }
         }
 
-        // 清除标记
-        guard.remove_flags(PageFlags::PG_DIRTY);
+        guard.remove_flags(PageFlags::PG_DIRTY | PageFlags::PG_ERROR);
     }
 
     /// lru脏页刷新

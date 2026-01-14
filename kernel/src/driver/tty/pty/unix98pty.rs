@@ -17,7 +17,7 @@ use crate::{
         epoll::{event_poll::EventPoll, EPollEventType},
         vfs::{file::FileFlags, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode},
     },
-    libs::{casting::DowncastArc, spinlock::SpinLockGuard},
+    libs::{casting::DowncastArc, mutex::MutexGuard},
     mm::VirtAddr,
     syscall::user_access::UserBufferWriter,
 };
@@ -356,7 +356,7 @@ impl TtyOperation for Unix98PtyDriverInner {
 
 pub fn ptmx_open(
     this: &TtyDevice,
-    mut data: SpinLockGuard<FilePrivateData>,
+    mut data: MutexGuard<FilePrivateData>,
     flags: &FileFlags,
 ) -> Result<(), SystemError> {
     if let FilePrivateData::Tty(data) = &*data {

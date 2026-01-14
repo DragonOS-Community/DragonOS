@@ -3,7 +3,8 @@ use alloc::{sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 use jhash::jhash2;
 
-use crate::libs::{lazy_init::Lazy, mutex::Mutex, spinlock::SpinLock};
+use crate::libs::lazy_init::Lazy;
+use crate::libs::mutex::Mutex;
 
 use super::InodeId;
 
@@ -21,7 +22,7 @@ struct AppendLockKey {
 const APPEND_LOCK_SHARDS: usize = 51;
 
 struct AppendLockShard {
-    map: SpinLock<HashMap<AppendLockKey, Arc<Mutex<()>>>>,
+    map: Mutex<HashMap<AppendLockKey, Arc<Mutex<()>>>>,
 }
 
 pub struct AppendLockManager {
@@ -34,7 +35,7 @@ impl AppendLockManager {
         let mut shards = Vec::with_capacity(APPEND_LOCK_SHARDS);
         for _ in 0..APPEND_LOCK_SHARDS {
             shards.push(AppendLockShard {
-                map: SpinLock::new(HashMap::new()),
+                map: Mutex::new(HashMap::new()),
             });
         }
         Self { shards }

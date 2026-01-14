@@ -6,8 +6,8 @@ use crate::filesystem::vfs::{
     vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags,
     Metadata,
 };
-use crate::libs::spinlock::SpinLockGuard;
-use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
+use crate::libs::mutex::MutexGuard;
+use crate::{libs::mutex::Mutex, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -31,7 +31,7 @@ pub struct ZeroInode {
 }
 
 #[derive(Debug)]
-pub struct LockedZeroInode(SpinLock<ZeroInode>);
+pub struct LockedZeroInode(Mutex<ZeroInode>);
 
 impl LockedZeroInode {
     pub fn new() -> Arc<Self> {
@@ -60,7 +60,7 @@ impl LockedZeroInode {
             },
         };
 
-        let result = Arc::new(LockedZeroInode(SpinLock::new(inode)));
+        let result = Arc::new(LockedZeroInode(Mutex::new(inode)));
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         return result;
@@ -84,13 +84,13 @@ impl IndexNode for LockedZeroInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -125,7 +125,7 @@ impl IndexNode for LockedZeroInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -144,7 +144,7 @@ impl IndexNode for LockedZeroInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);

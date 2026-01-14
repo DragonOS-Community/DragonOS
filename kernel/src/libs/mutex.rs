@@ -1,28 +1,12 @@
 use core::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
-use alloc::{collections::LinkedList, sync::Arc};
 use system_error::SystemError;
 
-use crate::{
-    arch::CurrentIrqArch,
-    exception::InterruptArch,
-    libs::spinlock::SpinLockGuard,
-    process::{ProcessControlBlock, ProcessManager, RawPid},
-    sched::{schedule, SchedMode},
-};
-
-use super::spinlock::SpinLock;
-
-#[derive(Debug)]
-struct MutexInner {
-    /// 当前Mutex是否已经被上锁(上锁时，为true)
-    is_locked: bool,
-    /// 等待获得这个锁的进程的链表
-    wait_list: LinkedList<Arc<ProcessControlBlock>>,
-}
+use crate::libs::wait_queue::WaitQueue;
 
 /// @brief Mutex互斥量结构体
 /// 请注意！由于Mutex属于休眠锁，因此，如果您的代码可能在中断上下文内执行，请勿采用Mutex！
@@ -30,17 +14,21 @@ struct MutexInner {
 pub struct Mutex<T> {
     /// 该Mutex保护的数据
     data: UnsafeCell<T>,
-    /// Mutex内部的信息
-    inner: SpinLock<MutexInner>,
+    /// Mutex锁状态
+    lock: AtomicBool,
+    /// 等待队列（Waiter/Waker 机制避免唤醒丢失）
+    wait_queue: WaitQueue,
 }
+unsafe impl<T> Sync for Mutex<T> where T: Send {}
 
 /// @brief Mutex的守卫
+#[must_use]
 #[derive(Debug)]
 pub struct MutexGuard<'a, T: 'a> {
     lock: &'a Mutex<T>,
 }
-
-unsafe impl<T> Sync for Mutex<T> where T: Send {}
+impl<T: ?Sized> !Send for MutexGuard<'_, T> {}
+unsafe impl<T: Sync> Sync for MutexGuard<'_, T> {}
 
 impl<T> Mutex<T> {
     /// @brief 初始化一个新的Mutex对象
@@ -48,10 +36,8 @@ impl<T> Mutex<T> {
     pub const fn new(value: T) -> Self {
         return Self {
             data: UnsafeCell::new(value),
-            inner: SpinLock::new(MutexInner {
-                is_locked: false,
-                wait_list: LinkedList::new(),
-            }),
+            lock: AtomicBool::new(false),
+            wait_queue: WaitQueue::default(),
         };
     }
 
@@ -60,28 +46,7 @@ impl<T> Mutex<T> {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        loop {
-            let mut inner: SpinLockGuard<MutexInner> = self.inner.lock();
-            // 当前mutex已经上锁
-            if inner.is_locked {
-                // 检查当前进程是否处于等待队列中,如果不在，就加到等待队列内
-                if !self.check_pid_in_wait_list(&inner, ProcessManager::current_pcb().raw_pid()) {
-                    inner.wait_list.push_back(ProcessManager::current_pcb());
-                }
-
-                // 加到等待唤醒的队列，然后睡眠
-                drop(inner);
-                self.__sleep();
-            } else {
-                // 加锁成功
-                inner.is_locked = true;
-                drop(inner);
-                break;
-            }
-        }
-
-        // 加锁成功，返回一个守卫
-        return MutexGuard { lock: self };
+        self.wait_queue.wait_until(|| self.try_lock().ok())
     }
 
     /// @brief 尝试对Mutex加锁。如果加锁失败，不会将当前进程加入等待队列。
@@ -90,58 +55,28 @@ impl<T> Mutex<T> {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn try_lock(&self) -> Result<MutexGuard<'_, T>, SystemError> {
-        let mut inner = self.inner.lock();
-
-        // 如果当前mutex已经上锁，则失败
-        if inner.is_locked {
-            return Err(SystemError::EBUSY);
-        } else {
-            // 加锁成功
-            inner.is_locked = true;
+        if self.acquire_lock() {
             return Ok(MutexGuard { lock: self });
         }
-    }
-
-    /// @brief Mutex内部的睡眠函数
-    fn __sleep(&self) {
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        ProcessManager::mark_sleep(true).ok();
-        drop(irq_guard);
-        schedule(SchedMode::SM_NONE);
+        Err(SystemError::EBUSY)
     }
 
     /// @brief 放锁。
     ///
     /// 本函数只能是私有的，且只能被守卫的drop方法调用，否则将无法保证并发安全。
     fn unlock(&self) {
-        let mut inner: SpinLockGuard<MutexInner> = self.inner.lock();
-        // 当前mutex一定是已经加锁的状态
-        assert!(inner.is_locked);
-        // 标记mutex已经解锁
-        inner.is_locked = false;
-        if inner.wait_list.is_empty() {
-            return;
-        }
-
-        // wait_list不为空，则获取下一个要被唤醒的进程的pcb
-        let to_wakeup: Arc<ProcessControlBlock> = inner.wait_list.pop_front().unwrap();
-        drop(inner);
-
-        ProcessManager::wakeup(&to_wakeup).ok();
+        self.release_lock();
+        self.wait_queue.wake_one();
     }
 
-    /// @brief 检查进程是否在该mutex的等待队列内
-    #[inline]
-    fn check_pid_in_wait_list(&self, inner: &MutexInner, pid: RawPid) -> bool {
-        for p in inner.wait_list.iter() {
-            if p.raw_pid() == pid {
-                // 在等待队列内
-                return true;
-            }
-        }
+    fn acquire_lock(&self) -> bool {
+        self.lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
 
-        // 不在等待队列内
-        return false;
+    fn release_lock(&self) {
+        self.lock.store(false, Ordering::Release);
     }
 }
 

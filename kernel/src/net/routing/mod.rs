@@ -1,5 +1,5 @@
 use crate::driver::net::Iface;
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use crate::net::routing::nat::ConnTracker;
 use crate::net::routing::nat::DnatPolicy;
 use crate::net::routing::nat::FiveTuple;
@@ -99,18 +99,18 @@ pub struct RouteDecision {
 pub struct Router {
     name: String,
     /// 路由表 //todo 后面再优化LC-trie，现在先简单用一个Vec
-    route_table: RwLock<RouteTable>,
+    route_table: RwSem<RouteTable>,
     pub(self) nat_tracker: Arc<ConnTracker>,
-    pub ns: RwLock<Weak<NetNamespace>>,
+    pub ns: RwSem<Weak<NetNamespace>>,
 }
 
 impl Router {
     pub fn new(name: String) -> Arc<Self> {
         Arc::new(Self {
             name: name.clone(),
-            route_table: RwLock::new(RouteTable::default()),
+            route_table: RwSem::new(RouteTable::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
-            ns: RwLock::new(Weak::default()),
+            ns: RwSem::new(Weak::default()),
         })
     }
 
@@ -119,8 +119,8 @@ impl Router {
     pub fn new_empty() -> Arc<Self> {
         Arc::new(Self {
             name: "empty_router".to_string(),
-            route_table: RwLock::new(RouteTable::default()),
-            ns: RwLock::new(Weak::default()),
+            route_table: RwSem::new(RouteTable::default()),
+            ns: RwSem::new(Weak::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
         })
     }
@@ -480,14 +480,14 @@ pub struct RouterEnableDeviceCommon {
     /// 当前接口的邻居缓存
     // pub arp_table: RwLock<BTreeMap<IpAddress, EthernetAddress>>,
     /// 当前接口的IP地址列表（因为如果直接通过smoltcp获取ip的话可能导致死锁，因此则这里维护一份）
-    pub ip_addrs: RwLock<Vec<IpCidr>>,
+    pub ip_addrs: RwSem<Vec<IpCidr>>,
 }
 
 impl Default for RouterEnableDeviceCommon {
     fn default() -> Self {
         Self {
             // arp_table: RwLock::new(BTreeMap::new()),
-            ip_addrs: RwLock::new(Vec::new()),
+            ip_addrs: RwSem::new(Vec::new()),
         }
     }
 }

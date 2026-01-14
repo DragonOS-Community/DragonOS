@@ -286,6 +286,63 @@ impl ProcessManager {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn set_fifo_policy(pcb: &Arc<ProcessControlBlock>, prio: i32) -> Result<(), SystemError> {
+        if !pcb.flags().contains(ProcessFlags::KTHREAD) {
+            return Err(SystemError::EPERM);
+        }
+
+        if !(0..crate::sched::prio::MAX_RT_PRIO).contains(&prio) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+        if on_rq == crate::sched::OnRq::Queued {
+            let rq = crate::sched::cpu_rq(
+                pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize,
+            );
+            let (rq, _guard) = rq.self_lock();
+            rq.update_rq_clock();
+
+            let old_policy = pcb.sched_info().policy();
+            if old_policy != crate::sched::SchedPolicy::FIFO {
+                rq.dequeue_task(
+                    pcb.clone(),
+                    crate::sched::DequeueFlag::DEQUEUE_NOCLOCK
+                        | crate::sched::DequeueFlag::DEQUEUE_SAVE,
+                );
+            }
+
+            {
+                *pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::FIFO;
+                let mut prio_data = pcb.sched_info().prio_data.write_irqsave();
+                prio_data.prio = prio;
+                prio_data.static_prio = prio;
+                prio_data.normal_prio = prio;
+            }
+
+            if old_policy != crate::sched::SchedPolicy::FIFO {
+                rq.enqueue_task(
+                    pcb.clone(),
+                    crate::sched::EnqueueFlag::ENQUEUE_NOCLOCK
+                        | crate::sched::EnqueueFlag::ENQUEUE_RESTORE,
+                );
+            }
+
+            rq.check_preempt_currnet(pcb, crate::sched::WakeupFlags::empty());
+        } else {
+            *pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::FIFO;
+            let mut prio_data = pcb.sched_info().prio_data.write_irqsave();
+            prio_data.prio = prio;
+            prio_data.static_prio = prio;
+            prio_data.normal_prio = prio;
+        }
+
+        Ok(())
+    }
+
     /// 唤醒暂停的进程
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -667,8 +724,12 @@ impl ProcessManager {
         if let Some(ref pcb) = pcb {
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
+                let parent_ns = parent.active_pid_ns();
+                let vpid = pcb
+                    .task_pid_nr_ns(PidType::PID, Some(parent_ns))
+                    .unwrap_or(RawPid::new(0));
                 let mut children = parent.children.write();
-                children.retain(|&p| p != pid);
+                children.retain(|&p| p != vpid);
             }
 
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
@@ -1575,9 +1636,18 @@ impl ProcessControlBlock {
                         if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
                             *child.parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
                             *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
-                            child.basic.write_irqsave().ppid = parent_init.task_pid_vnr();
+                            let parent_pid_in_child_ns = parent_init
+                                .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
+                                .unwrap_or(RawPid::new(0));
+                            child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+
+                            let child_vpid_in_parent_ns = child
+                                .task_pid_nr_ns(PidType::PID, Some(parent_init.active_pid_ns()))
+                                .unwrap_or(RawPid::new(0));
+                            if child_vpid_in_parent_ns.data() != 0 {
+                                parent_init.children.write().push(child_vpid_in_parent_ns);
+                            }
                         }
-                        parent_init.children.write().push(pid);
                     }
                 }
             }
@@ -1610,11 +1680,19 @@ impl ProcessControlBlock {
             if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
                 *child.parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
                 *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
-                child.basic.write_irqsave().ppid = reaper.task_pid_vnr();
-            }
+                let parent_pid_in_child_ns = reaper
+                    .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
+                    .unwrap_or(RawPid::new(0));
+                child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
 
-            // 按 wait 语义，将被收养子进程挂到收养者（线程组 leader）的 children 列表中。
-            reaper.children.write().push(pid);
+                // 按 wait 语义，将被收养子进程挂到收养者（线程组 leader）的 children 列表中。
+                let child_vpid_in_reaper_ns = child
+                    .task_pid_nr_ns(PidType::PID, Some(reaper.active_pid_ns()))
+                    .unwrap_or(RawPid::new(0));
+                if child_vpid_in_reaper_ns.data() != 0 {
+                    reaper.children.write().push(child_vpid_in_reaper_ns);
+                }
+            }
         }
 
         Ok(())

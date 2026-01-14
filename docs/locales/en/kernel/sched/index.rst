@@ -4,7 +4,7 @@
 
    - Source document: kernel/sched/index.rst
 
-   - Translation time: 2025-12-10 06:04:46
+   - Translation time: 2026-01-05 12:00:59
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -22,6 +22,7 @@ DragonOS Scheduling
 
    core
    cfs
+   fifo
    rt
    kernel_timer
    wait_queue

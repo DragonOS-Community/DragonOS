@@ -2,12 +2,12 @@
 //!
 //! 这个目录包含了进程打开的所有文件描述符的详细信息
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
     process::{ProcessControlBlock, ProcessManager, RawPid},
 };
 use alloc::{
@@ -133,7 +133,7 @@ impl FileOps for FdInfoFileOps {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // // 动态查找进程
         // let process = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;

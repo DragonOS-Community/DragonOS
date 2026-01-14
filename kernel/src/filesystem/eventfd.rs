@@ -7,7 +7,7 @@ use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
     vfs::{FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock},
 };
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::mm::MemoryManagementArch;
 use crate::process::{ProcessFlags, ProcessManager};
@@ -24,8 +24,8 @@ lazy_static::lazy_static! {
     static ref EVENTFD_FS: Arc<EventFdFs> = Arc::new(EventFdFs);
 }
 
-pub static EVENTFD_ID_ALLOCATOR: SpinLock<IdAllocator> =
-    SpinLock::new(IdAllocator::new(0, u32::MAX as usize).unwrap());
+pub static EVENTFD_ID_ALLOCATOR: Mutex<IdAllocator> =
+    Mutex::new(IdAllocator::new(0, u32::MAX as usize).unwrap());
 
 /// EventFd 文件系统
 ///
@@ -99,7 +99,7 @@ impl EventFd {
 
 #[derive(Debug)]
 pub struct EventFdInode {
-    eventfd: SpinLock<EventFd>,
+    eventfd: Mutex<EventFd>,
     wait_queue: WaitQueue,
     epitems: LockedEPItemLinkedList,
 }
@@ -107,7 +107,7 @@ pub struct EventFdInode {
 impl EventFdInode {
     pub fn new(eventfd: EventFd) -> Self {
         EventFdInode {
-            eventfd: SpinLock::new(eventfd),
+            eventfd: Mutex::new(eventfd),
             wait_queue: WaitQueue::default(),
             epitems: LockedEPItemLinkedList::default(),
         }
@@ -120,7 +120,7 @@ impl EventFdInode {
     fn do_poll(
         &self,
         _private_data: &FilePrivateData,
-        self_guard: &SpinLockGuard<'_, EventFd>,
+        self_guard: &MutexGuard<'_, EventFd>,
     ) -> Result<usize, SystemError> {
         let mut events = EPollEventType::empty();
         if self_guard.count != 0 {
@@ -175,13 +175,13 @@ impl IndexNode for EventFdInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
 
@@ -198,7 +198,7 @@ impl IndexNode for EventFdInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data_guard: SpinLockGuard<FilePrivateData>,
+        data_guard: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let data = data_guard.clone();
         drop(data_guard);
@@ -262,7 +262,7 @@ impl IndexNode for EventFdInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len < 8 {
             return Err(SystemError::EINVAL);

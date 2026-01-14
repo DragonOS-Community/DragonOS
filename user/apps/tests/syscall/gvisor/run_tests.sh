@@ -54,4 +54,4 @@ adjust_readv_blocklist() {
 adjust_readv_blocklist
 
 cd "$SYSCALL_TEST_DIR" || exit 1
-./gvisor-test-runner --stdout
+./gvisor-test-runner

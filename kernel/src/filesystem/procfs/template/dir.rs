@@ -1,3 +1,4 @@
+use crate::libs::mutex::MutexGuard;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
@@ -7,7 +8,7 @@ use crate::{
             FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
         },
     },
-    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
+    libs::rwsem::RwSem,
     time::PosixTimeSpec,
 };
 use alloc::collections::BTreeMap;
@@ -24,7 +25,7 @@ pub struct ProcDir<Ops: DirOps> {
     inner: Ops,
     self_ref: Weak<ProcDir<Ops>>,
     parent: Option<Weak<dyn IndexNode>>,
-    cached_children: RwLock<BTreeMap<String, Arc<dyn IndexNode>>>,
+    cached_children: RwSem<BTreeMap<String, Arc<dyn IndexNode>>>,
     common: Common,
     // 没用到？
     // fdata: InodeInfo,
@@ -67,7 +68,7 @@ impl<Ops: DirOps> ProcDir<Ops> {
             inner: dir,
             self_ref: weak_self.clone(),
             parent,
-            cached_children: RwLock::new(BTreeMap::new()),
+            cached_children: RwSem::new(BTreeMap::new()),
             common,
         })
     }
@@ -84,7 +85,7 @@ impl<Ops: DirOps> ProcDir<Ops> {
         self.parent.as_ref().and_then(|p| p.upgrade())
     }
 
-    pub fn cached_children(&self) -> &RwLock<BTreeMap<String, Arc<dyn IndexNode>>> {
+    pub fn cached_children(&self) -> &RwSem<BTreeMap<String, Arc<dyn IndexNode>>> {
         &self.cached_children
     }
 }
@@ -101,7 +102,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EISDIR)
     }
@@ -111,7 +112,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EISDIR)
     }
@@ -210,13 +211,13 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 

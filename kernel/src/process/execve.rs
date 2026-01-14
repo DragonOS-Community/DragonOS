@@ -1,6 +1,8 @@
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
-use crate::filesystem::vfs::IndexNode;
+use crate::filesystem::vfs::fcntl::AtFlags;
+use crate::filesystem::vfs::file::File;
+use crate::filesystem::vfs::open::do_open_execat;
 use crate::libs::rwsem::RwSem;
 use crate::process::exec::{
     load_binary_file_with_context, ExecContext, ExecParam, ExecParamFlags, LoadBinaryResult,
@@ -16,7 +18,7 @@ use system_error::SystemError;
 /// 执行execve系统调用
 ///
 /// ## 参数
-/// - `file_inode`: 要执行的文件的inode
+/// - `path`: 要执行的文件路径
 /// - `argv`: 参数列表
 /// - `envp`: 环境变量列表
 /// - `regs`: 陷入帧
@@ -24,7 +26,7 @@ use system_error::SystemError;
 /// ## 返回值
 /// 成功时不返回（跳转到新程序），失败时返回错误
 pub fn do_execve(
-    file_inode: Arc<dyn IndexNode>,
+    path: &str,
     argv: Vec<CString>,
     envp: Vec<CString>,
     regs: &mut TrapFrame,
@@ -33,22 +35,25 @@ pub fn do_execve(
     let mut ctx = ExecContext::new();
 
     // 保存原始脚本路径（用于shebang场景）
-    ctx.original_path = file_inode.absolute_path().ok();
+    ctx.original_path = Some(path.into());
 
-    do_execve_internal(file_inode, argv, envp, regs, ctx)
+    // 通过正常的open流程打开文件
+    let file = do_open_execat(AtFlags::AT_FDCWD.bits(), path)?;
+
+    do_execve_internal(file, argv, envp, regs, ctx)
 }
 
 /// execve的内部实现，支持递归执行（用于shebang）
 ///
 /// ## 参数
-/// - `file_inode`: 要执行的文件的inode
+/// - `file`: 已打开的可执行文件
 /// - `argv`: 参数列表
 /// - `envp`: 环境变量列表
 /// - `regs`: 陷入帧
 /// - `ctx`: 执行上下文，用于跟踪递归深度
 #[inline(never)]
 fn do_execve_internal(
-    file_inode: Arc<dyn IndexNode>,
+    file: Arc<File>,
     argv: Vec<CString>,
     envp: Vec<CString>,
     regs: &mut TrapFrame,
@@ -56,11 +61,7 @@ fn do_execve_internal(
 ) -> Result<(), SystemError> {
     let address_space = AddressSpace::new(true).expect("Failed to create new address space");
 
-    let mut param = ExecParam::new(
-        file_inode.clone(),
-        address_space.clone(),
-        ExecParamFlags::EXEC,
-    )?;
+    let mut param = ExecParam::new(file, address_space.clone(), ExecParamFlags::EXEC);
 
     // 预先设置args，以便shebang处理时可以访问原始参数
     param.init_info_mut().args = argv.clone();
@@ -134,7 +135,7 @@ fn do_execve_internal(
         }
 
         Ok(LoadBinaryResult::NeedReexec {
-            interpreter_inode,
+            interpreter_file,
             new_argv,
         }) => {
             // Shebang场景：需要递归执行解释器
@@ -146,7 +147,7 @@ fn do_execve_internal(
             // 增加递归深度并递归调用
             let new_ctx = ctx.increment_depth();
 
-            do_execve_internal(interpreter_inode, new_argv, envp, regs, new_ctx)
+            do_execve_internal(interpreter_file, new_argv, envp, regs, new_ctx)
         }
 
         Err(e) => {
@@ -198,7 +199,7 @@ fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpac
     );
 
     // 切换到新的用户地址空间
-    unsafe { new_vm.read().user_mapper.utable.make_current() };
+    unsafe { new_vm.make_current() };
 
     drop(irq_guard);
 

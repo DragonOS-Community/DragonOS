@@ -7,10 +7,7 @@ use crate::process::Signal;
 
 use crate::{
     driver::base::block::SeekFrom,
-    filesystem::vfs::{
-        file::{File, FileFlags},
-        FileType, IndexNode, InodeMode,
-    },
+    filesystem::vfs::{fcntl::AtFlags, file::File, open::do_open_execat},
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -64,8 +61,8 @@ pub enum LoadBinaryResult {
     Loaded(BinaryLoaderResult),
     /// 需要重新执行解释器 (shebang场景)
     NeedReexec {
-        /// 解释器inode
-        interpreter_inode: Arc<dyn IndexNode>,
+        /// 解释器文件（通过do_open_execat打开）
+        interpreter_file: Arc<File>,
         /// 新的argv (解释器路径 + [可选参数] + 脚本路径 + 原始参数)
         new_argv: Vec<CString>,
     },
@@ -157,7 +154,7 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct ExecParam {
-    file: File,
+    file: Arc<File>,
     vm: Arc<AddressSpace>,
     /// 一些标志位
     flags: ExecParamFlags,
@@ -175,38 +172,19 @@ pub enum ExecLoadMode {
 
 #[allow(dead_code)]
 impl ExecParam {
-    pub fn new(
-        file_inode: Arc<dyn IndexNode>,
-        vm: Arc<AddressSpace>,
-        flags: ExecParamFlags,
-    ) -> Result<Self, SystemError> {
-        let metadata = file_inode.metadata()?;
-
-        // 必须是普通文件
-        if metadata.file_type != FileType::File {
-            return Err(SystemError::EACCES);
-        }
-
-        // 检查执行权限
-        // 注意：这是简化版本，完整实现应该根据当前进程的 uid/gid 检查对应的权限位
-        // TODO: 实现基于 uid/gid 的权限检查
-        let mode = metadata.mode;
-        if !mode.contains(InodeMode::S_IXUSR)
-            && !mode.contains(InodeMode::S_IXGRP)
-            && !mode.contains(InodeMode::S_IXOTH)
-        {
-            return Err(SystemError::EACCES);
-        }
-
-        // 读取文件头部，用于判断文件类型
-        let file = File::new(file_inode, FileFlags::O_RDONLY)?;
-
-        Ok(Self {
+    /// 使用已打开的文件创建ExecParam
+    ///
+    /// ## 参数
+    /// - `file`: 通过do_open_execat打开的可执行文件
+    /// - `vm`: 地址空间
+    /// - `flags`: 执行标志
+    pub fn new(file: Arc<File>, vm: Arc<AddressSpace>, flags: ExecParamFlags) -> Self {
+        Self {
             file,
             vm,
             flags,
             init_info: ProcInitInfo::new(ProcessManager::current_pcb().basic().name()),
-        })
+        }
     }
 
     pub fn vm(&self) -> &Arc<AddressSpace> {
@@ -234,13 +212,20 @@ impl ExecParam {
         }
     }
 
-    pub fn file_mut(&mut self) -> &mut File {
-        &mut self.file
+    pub fn file_ref(&self) -> &File {
+        &self.file
     }
 
-    /// 获取File的所有权，用于将动态链接器加入文件描述符表中
-    pub fn file(self) -> File {
-        self.file
+    /// 获取File的Arc引用
+    pub fn file(&self) -> Arc<File> {
+        self.file.clone()
+    }
+
+    /// 消费ExecParam并获取File的所有权（用于将文件加入文件描述符表）
+    ///
+    /// 如果Arc有多个引用，会panic
+    pub fn into_file(self) -> File {
+        Arc::try_unwrap(self.file).expect("Cannot unwrap Arc<File>: multiple references exist")
     }
 
     /// Calling this is the point of no return. None of the failures will be
@@ -292,15 +277,13 @@ pub fn load_binary_file_with_context(
     param: &mut ExecParam,
     ctx: &ExecContext,
 ) -> Result<LoadBinaryResult, SystemError> {
-    use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
-
     // 检查递归深度
     ctx.check_recursion_limit()?;
 
     // 读取文件头部，用于判断文件类型
     let mut head_buf = [0u8; 512];
-    param.file_mut().lseek(SeekFrom::SeekSet(0))?;
-    let _bytes = param.file_mut().read(512, &mut head_buf)?;
+    param.file_ref().lseek(SeekFrom::SeekSet(0))?;
+    let _bytes = param.file_ref().read(512, &mut head_buf)?;
 
     // 首先检查是否为shebang脚本
     if SHEBANG_LOADER.probe(param, &head_buf).is_ok() {
@@ -308,21 +291,21 @@ pub fn load_binary_file_with_context(
         let shebang_info =
             ShebangLoader::parse_shebang_line(&head_buf).map_err(|_| SystemError::ENOEXEC)?;
 
-        // 查找解释器
-        let pwd = ProcessManager::current_pcb().pwd_inode();
-        let interpreter_inode = pwd
-            .lookup_follow_symlink(&shebang_info.interpreter_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
-            .inspect_err(|e| {
-                log::warn!(
-                    "Shebang interpreter not found: {}, error: {:?}",
-                    shebang_info.interpreter_path,
-                    e
-                );
-            })?;
+        // 通过正常的open流程打开解释器文件
+        let interpreter_file =
+            do_open_execat(AtFlags::AT_FDCWD.bits(), &shebang_info.interpreter_path).inspect_err(
+                |e| {
+                    log::warn!(
+                        "Shebang interpreter not found: {}, error: {:?}",
+                        shebang_info.interpreter_path,
+                        e
+                    );
+                },
+            )?;
 
         // 获取脚本路径
         let script_path = param
-            .file_mut()
+            .file_ref()
             .inode()
             .absolute_path()
             .unwrap_or_else(|_| ctx.original_path.clone().unwrap_or_default());
@@ -351,7 +334,7 @@ pub fn load_binary_file_with_context(
         }
 
         return Ok(LoadBinaryResult::NeedReexec {
-            interpreter_inode,
+            interpreter_file,
             new_argv,
         });
     }

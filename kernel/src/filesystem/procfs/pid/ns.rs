@@ -2,6 +2,7 @@
 //!
 //! 提供进程的命名空间符号链接，每个链接指向对应的命名空间标识符
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
@@ -13,7 +14,6 @@ use crate::{
             IndexNode, InodeId, InodeMode,
         },
     },
-    libs::spinlock::SpinLockGuard,
     process::{
         namespace::{nsproxy::NamespaceId, NamespaceOps},
         ProcessManager, RawPid,
@@ -151,7 +151,7 @@ impl SymOps for NsSymOps {
             .map(InodeId::new)
     }
 
-    fn open(&self, data: &mut SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 当打开命名空间文件时，设置命名空间私有数据
         // 这使得 setns() 可以使用这个 fd
         let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;

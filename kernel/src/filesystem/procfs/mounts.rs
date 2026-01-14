@@ -2,6 +2,7 @@
 //!
 //! 这个文件展示了系统当前的所有挂载点
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
@@ -138,7 +139,7 @@ impl FileOps for MountsFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mounts_content = generate_mounts_like_content(MountsFormat::Mounts);
         let bytes = mounts_content.as_bytes();

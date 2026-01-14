@@ -12,7 +12,7 @@ use crate::filesystem::vfs::vcore::change_root_fs;
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::net::e1000e::e1000e::e1000e_init,
-    filesystem::vfs::{vcore::mount_root_fs, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    filesystem::vfs::vcore::mount_root_fs,
     net::net_core::net_init,
     process::{
         exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
@@ -93,6 +93,9 @@ fn kernel_init() -> Result<(), SystemError> {
         error!("Failed to initialize network: {:?}", err);
     });
 
+    #[cfg(feature = "fifo_demo")]
+    crate::sched::fifo_demo::fifo_demo_init();
+
     debug!("initial kernel thread done.");
     set_system_state(SystemState::Running);
 
@@ -105,6 +108,7 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
     smp_init();
+    crate::exception::workqueue::workqueue_init();
     return Ok(());
 }
 
@@ -211,11 +215,8 @@ fn run_init_process(
     compiler_fence(Ordering::SeqCst);
     let path = proc_init_info.proc_name.to_str().unwrap();
 
-    let pwd = ProcessManager::current_pcb().pwd_inode();
-    let inode = pwd.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-
     do_execve(
-        inode,
+        path,
         proc_init_info.args.clone(),
         proc_init_info.envs.clone(),
         trap_frame,

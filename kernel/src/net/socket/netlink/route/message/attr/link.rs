@@ -3,6 +3,7 @@ use crate::net::socket::netlink::message::attr::CAttrHeader;
 use crate::net::socket::netlink::route::message::attr::convert_one_from_raw_buf;
 use crate::net::socket::netlink::route::message::attr::IFNAME_SIZE;
 use alloc::ffi::CString;
+use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 #[derive(Debug, Clone, Copy, FromPrimitive, ToPrimitive)]
@@ -81,7 +82,6 @@ impl TryFrom<u16> for LinkAttrClass {
     type Error = SystemError;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        use num_traits::FromPrimitive;
         return <Self as FromPrimitive>::from_u16(value).ok_or(Self::Error::EINVAL);
     }
 }

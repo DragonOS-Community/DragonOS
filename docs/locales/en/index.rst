@@ -6,7 +6,7 @@ English
 
    - Source document: index.rst
 
-   - Translation time: 2025-12-26 10:51:48
+   - Translation time: 2026-01-05 16:08:05
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -35,6 +35,7 @@ English
    kernel/configuration/index
    kernel/boot/index
    kernel/core_api/index
+   kernel/interrupt/index
    kernel/locking/index
    kernel/process_management/index
    kernel/sched/index

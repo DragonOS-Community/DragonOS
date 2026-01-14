@@ -14,7 +14,7 @@ impl LockedVMA {
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
         //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c?fi=madvise#do_madvise
-        let mut vma = self.lock_irqsave();
+        let mut vma = self.lock();
         let mut new_flags = *vma.vm_flags();
         match behavior {
             MadvFlags::MADV_DONTNEED | MadvFlags::MADV_DONTNEED_LOCKED => {

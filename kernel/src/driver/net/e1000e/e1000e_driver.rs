@@ -9,8 +9,8 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         },
         net::{
-            register_netdevice, types::InterfaceFlags, Iface, IfaceCommon, NetDeivceState,
-            NetDeviceCommonData, Operstate,
+            napi::NapiStruct, register_netdevice, types::InterfaceFlags, Iface, IfaceCommon,
+            NetDeivceState, NetDeviceCommonData, Operstate,
         },
     },
     libs::{
@@ -35,6 +35,8 @@ use smoltcp::{phy, wire::HardwareAddress};
 // use system_error::SystemError;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};
+use super::irq::e1000e_irq_manager;
+use crate::driver::base::device::DeviceId;
 
 const DEVICE_NAME: &str = "e1000e";
 
@@ -288,6 +290,10 @@ impl E1000EInterface {
             locked_kobj_state: LockedKObjectState::default(),
         });
 
+        // 设置 NAPI：让收包处理走 bounded poll（对齐 Linux NAPI/ksoftirqd）。
+        let napi_struct = NapiStruct::new(iface.clone(), 10);
+        *iface.common.napi_struct.write() = Some(napi_struct);
+
         // 设置 driver 对接口的弱引用，用于 packet socket 分发
         iface
             .driver
@@ -390,6 +396,10 @@ impl Iface for E1000EInterface {
         self.common.poll(self.driver.force_get_mut())
     }
 
+    fn poll_napi(&self, budget: usize) -> bool {
+        self.common.poll_napi(self.driver.force_get_mut(), budget)
+    }
+
     fn addr_assign_type(&self) -> u8 {
         return self.inner().netdevice_common.addr_assign_type;
     }
@@ -483,7 +493,7 @@ impl KObject for E1000EInterface {
     }
 }
 
-pub fn e1000e_driver_init(device: E1000EDevice) {
+pub fn e1000e_driver_init(device: E1000EDevice, dev_id: Arc<DeviceId>) {
     let mac = smoltcp::wire::EthernetAddress::from_bytes(&device.mac_address());
     let driver = E1000EDriver::new(device);
     let iface = E1000EInterface::new(driver);
@@ -500,4 +510,14 @@ pub fn e1000e_driver_init(device: E1000EDevice) {
     info!("e1000e driver init successfully!\tMAC: [{}]", mac);
 
     register_netdevice(iface.clone()).expect("register lo device failed");
+
+    // 注册 IRQ -> NAPI 映射：使 e1000e IRQ handler 在 hardirq 内直接 napi_schedule，
+    // 避免唤醒 netns 线程扫描 device_list（对齐 Linux NAPI 语义）。
+    if let Some(napi) = iface.napi_struct() {
+        e1000e_irq_manager()
+            .register_napi(dev_id, napi)
+            .expect("register e1000e napi irq mapping failed");
+    } else {
+        log::warn!("e1000e iface has no napi_struct; irq mapping not registered");
+    }
 }

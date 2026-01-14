@@ -1,11 +1,11 @@
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
-    libs::rwlock::RwLock,
+    libs::mutex::Mutex,
+    libs::rwsem::RwSem,
     net::socket::{self, *},
 };
 use crate::{
-    libs::spinlock::SpinLock,
     libs::wait_queue::WaitQueue,
     net::{
         posix::MsgHdr,
@@ -84,7 +84,7 @@ fn ring_cap_for_effective_sockbuf(effective: usize) -> usize {
 #[cast_to([sync] Socket)]
 #[derive(Debug)]
 pub struct UnixStreamSocket {
-    inner: RwLock<Option<Inner>>,
+    inner: RwSem<Option<Inner>>,
     //todo options
     epitems: EPollItems,
     fasync_items: FAsyncItems,
@@ -94,14 +94,14 @@ pub struct UnixStreamSocket {
     netns: Arc<NetNamespace>,
     self_weak: Weak<UnixStreamSocket>,
     /// Peer socket for socket pairs (used for SIGIO notification)
-    peer: SpinLock<Option<Weak<UnixStreamSocket>>>,
+    peer: Mutex<Option<Weak<UnixStreamSocket>>>,
 
     is_nonblocking: AtomicBool,
     is_seqpacket: bool,
 
     passcred: AtomicBool,
 
-    linger: SpinLock<Linger>,
+    linger: Mutex<Linger>,
 
     /// Pending connection-reset to be reported on the next read/recv.
     /// Linux behavior: when a unix stream socket is closed with unread data in its
@@ -130,7 +130,7 @@ impl UnixStreamSocket {
         netns: Arc<NetNamespace>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|self_weak| Self {
-            inner: RwLock::new(Some(Inner::Init(init))),
+            inner: RwSem::new(Some(Inner::Init(init))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
@@ -140,10 +140,10 @@ impl UnixStreamSocket {
             is_seqpacket,
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
-            peer: SpinLock::new(None),
+            peer: Mutex::new(None),
             passcred: AtomicBool::new(false),
 
-            linger: SpinLock::new(Linger::default()),
+            linger: Mutex::new(Linger::default()),
             connreset_pending: AtomicBool::new(false),
 
             sndbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
@@ -160,7 +160,7 @@ impl UnixStreamSocket {
         netns: Arc<NetNamespace>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|self_weak| Self {
-            inner: RwLock::new(Some(Inner::Connected(connected))),
+            inner: RwSem::new(Some(Inner::Connected(connected))),
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
@@ -170,10 +170,10 @@ impl UnixStreamSocket {
             is_seqpacket,
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
-            peer: SpinLock::new(None),
+            peer: Mutex::new(None),
             passcred: AtomicBool::new(false),
 
-            linger: SpinLock::new(Linger::default()),
+            linger: Mutex::new(Linger::default()),
             connreset_pending: AtomicBool::new(false),
 
             sndbuf: AtomicUsize::new(inner::UNIX_STREAM_DEFAULT_BUF_SIZE),
@@ -507,8 +507,8 @@ impl Socket for UnixStreamSocket {
         &self.open_files
     }
 
-    fn recv_bytes_available(&self) -> Result<usize, SystemError> {
-        Ok(self.ioctl_fionread())
+    fn recv_bytes_available(&self) -> usize {
+        self.ioctl_fionread()
     }
 
     fn send_bytes_available(&self) -> Result<usize, SystemError> {

@@ -2,16 +2,14 @@
 //!
 //! 这个文件提供对内核日志消息的访问
 
-use crate::{
-    filesystem::{
-        procfs::{
-            kmsg::KMSG,
-            template::{Builder, FileOps, ProcFileBuilder},
-        },
-        vfs::{FilePrivateData, IndexNode, InodeMode},
+use crate::filesystem::{
+    procfs::{
+        kmsg::KMSG,
+        template::{Builder, FileOps, ProcFileBuilder},
     },
-    libs::spinlock::SpinLockGuard,
+    vfs::{FilePrivateData, IndexNode, InodeMode},
 };
+use crate::libs::mutex::MutexGuard;
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
@@ -34,7 +32,7 @@ impl FileOps for KmsgFileOps {
         _offset: usize,
         _len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 访问全局 KMSG 缓冲区
         let kmsg = unsafe { KMSG.as_ref().ok_or(SystemError::ENODEV)? };

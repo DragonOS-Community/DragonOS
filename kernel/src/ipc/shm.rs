@@ -4,7 +4,7 @@ use crate::{
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
-        page::{page_manager_lock_irqsave, PageFlags, PageType},
+        page::{page_manager_lock, PageFlags, PageType},
         PhysAddr,
     },
     process::{ProcessManager, RawPid},
@@ -160,7 +160,7 @@ impl ShmManager {
         // 分配共享内存页面
         let page_count = PageFrameCount::from_bytes(page_align_up(size)).unwrap();
         // 创建共享内存page，并添加到PAGE_MANAGER中
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock();
         let (paddr, _page) = page_manager_guard.create_pages(
             PageType::Shm,
             PageFlags::PG_UNEVICTABLE,
@@ -315,7 +315,7 @@ impl ShmManager {
         let id = kernel_shm.kern_ipc_perm.id;
         let map_count = kernel_shm.map_count();
 
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock();
         if map_count > 0 {
             // 设置共享内存物理页当映射计数等于0时可被回收
             // TODO 后续需要加入到lru中

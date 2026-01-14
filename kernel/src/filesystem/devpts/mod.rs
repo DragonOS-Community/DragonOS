@@ -3,6 +3,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     driver::{
         base::device::{
@@ -18,7 +19,7 @@ use crate::{
         mount::{do_mount_mkdir, MountFlags},
         FileSystem, FileType, FsInfo, InodeMode, MountableFileSystem, SuperBlock, FSMAKER,
     },
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::mutex::Mutex,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -72,7 +73,7 @@ impl FileSystemMakerData for DevPtsOptions {
 pub struct DevPtsFs {
     /// 根节点
     root_inode: Arc<LockedDevPtsFSInode>,
-    pts_ida: SpinLock<IdAllocator>,
+    pts_ida: Mutex<IdAllocator>,
     pts_count: AtomicU32,
     opts: DevPtsOptions,
 }
@@ -90,7 +91,7 @@ impl DevPtsFs {
         }
         let ret = Arc::new(Self {
             root_inode,
-            pts_ida: SpinLock::new(IdAllocator::new(0, NR_UNIX98_PTY_MAX as usize).unwrap()),
+            pts_ida: Mutex::new(IdAllocator::new(0, NR_UNIX98_PTY_MAX as usize).unwrap()),
             pts_count: AtomicU32::new(0),
             opts,
         });
@@ -195,13 +196,13 @@ register_mountable_fs!(DevPtsFs, DEVPTS_MAKER, "devpts");
 
 #[derive(Debug)]
 pub struct LockedDevPtsFSInode {
-    inner: SpinLock<PtsDevInode>,
+    inner: Mutex<PtsDevInode>,
 }
 
 impl LockedDevPtsFSInode {
     pub fn new() -> Self {
         Self {
-            inner: SpinLock::new(PtsDevInode {
+            inner: Mutex::new(PtsDevInode {
                 fs: Weak::new(),
                 children: Some(BTreeMap::new()),
                 parent: Weak::new(),
@@ -255,7 +256,7 @@ impl PtsDevInode {
 impl IndexNode for LockedDevPtsFSInode {
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -268,7 +269,7 @@ impl IndexNode for LockedDevPtsFSInode {
         return Ok(metadata);
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // TODO: 回收
         Ok(())
     }
@@ -278,7 +279,7 @@ impl IndexNode for LockedDevPtsFSInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         todo!()
     }
@@ -288,7 +289,7 @@ impl IndexNode for LockedDevPtsFSInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         todo!()
     }

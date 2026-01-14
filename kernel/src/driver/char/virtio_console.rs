@@ -13,7 +13,7 @@ use crate::{
         },
         tty::{
             console::ConsoleSwitch,
-            kthread::send_to_tty_refresh_thread,
+            kthread::enqueue_tty_rx_from_irq,
             termios::{WindowSize, TTY_STD_TERMIOS},
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
@@ -326,7 +326,7 @@ impl VirtIODevice for VirtIOConsoleDevice {
             }
         }
 
-        send_to_tty_refresh_thread(&buf[0..index]);
+        enqueue_tty_rx_from_irq(&buf[0..index]);
         Ok(IrqReturn::Handled)
     }
 

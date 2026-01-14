@@ -6,10 +6,7 @@ use crate::{
             InodeId, InodeMode,
         },
     },
-    libs::{
-        casting::DowncastArc,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
+    libs::{casting::DowncastArc, mutex::Mutex, mutex::MutexGuard},
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -25,7 +22,7 @@ use system_error::SystemError;
 
 use super::filesystem::Ext4FileSystem;
 
-type PrivateData<'a> = crate::libs::spinlock::SpinLockGuard<'a, vfs::FilePrivateData>;
+type PrivateData<'a> = crate::libs::mutex::MutexGuard<'a, vfs::FilePrivateData>;
 
 pub struct Ext4Inode {
     // 对应another_ext4里面的inode号，用于在ext4文件系统中查找相应的inode
@@ -46,7 +43,7 @@ pub struct Ext4Inode {
 }
 
 #[derive(Debug)]
-pub struct LockedExt4Inode(pub(super) SpinLock<Ext4Inode>);
+pub struct LockedExt4Inode(pub(super) Mutex<Ext4Inode>);
 
 impl IndexNode for LockedExt4Inode {
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
@@ -55,7 +52,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn open(
         &self,
-        _data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
         _mode: &vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -173,7 +170,7 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         self.read_sync(offset, &mut buf[0..len])
@@ -245,7 +242,7 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         self.write_sync(offset, &buf[0..len])
@@ -519,9 +516,7 @@ impl LockedExt4Inode {
         parent: Option<Weak<LockedExt4Inode>>,
     ) -> Arc<Self> {
         let inode = Arc::new({
-            LockedExt4Inode(SpinLock::new(Ext4Inode::new(
-                inode_num, fs_ptr, dname, parent,
-            )))
+            LockedExt4Inode(Mutex::new(Ext4Inode::new(inode_num, fs_ptr, dname, parent)))
         });
         let mut guard = inode.0.lock();
 

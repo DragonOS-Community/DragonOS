@@ -36,6 +36,7 @@
    kernel/configuration/index
    kernel/boot/index
    kernel/core_api/index
+   kernel/interrupt/index
    kernel/locking/index
    kernel/process_management/index
    kernel/sched/index

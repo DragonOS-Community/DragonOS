@@ -4,7 +4,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSOCKOPT;
 use crate::arch::MMArch;
 use crate::mm::MemoryManagementArch;
-use crate::net::socket;
+use crate::net::socket::inet::stream::TcpOption;
+use crate::net::socket::{PSO, PSOL};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
@@ -145,8 +146,6 @@ pub(super) fn do_getsockopt(
     let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
     let socket = socket_inode.as_socket().unwrap();
 
-    use socket::{PSO, PSOL};
-
     let level = PSOL::try_from(level as u32)?;
 
     if matches!(level, PSOL::SOCKET) {
@@ -157,12 +156,11 @@ pub(super) fn do_getsockopt(
                 let need = core::mem::size_of::<u32>();
                 let out_len = calc_out_len(optval, user_len, need);
 
-                if !optval.is_null() {
+                if !optval.is_null() && out_len != 0 {
                     let value = socket.send_buffer_size() as u32;
+                    let bytes = value.to_ne_bytes();
                     let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
-                    optval_writer
-                        .buffer_protected(0)?
-                        .write_one::<u32>(0, &value)?;
+                    optval_writer.copy_to_user_protected(&bytes[..out_len], 0)?;
                 }
 
                 // 写回实际需要的长度
@@ -177,12 +175,11 @@ pub(super) fn do_getsockopt(
                 let need = core::mem::size_of::<u32>();
                 let out_len = calc_out_len(optval, user_len, need);
 
-                if !optval.is_null() {
+                if !optval.is_null() && out_len != 0 {
                     let value = socket.recv_buffer_size() as u32;
+                    let bytes = value.to_ne_bytes();
                     let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
-                    optval_writer
-                        .buffer_protected(0)?
-                        .write_one::<u32>(0, &value)?;
+                    optval_writer.copy_to_user_protected(&bytes[..out_len], 0)?;
                 }
 
                 // 写回实际需要的长度
@@ -200,7 +197,7 @@ pub(super) fn do_getsockopt(
                 let written = socket.option(level, optname, &mut kbuf)?;
                 let out_len = calc_out_len(optval, user_len, written);
 
-                if !optval.is_null() {
+                if !optval.is_null() && out_len != 0 {
                     let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
                     optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
                 }
@@ -223,14 +220,9 @@ pub(super) fn do_getsockopt(
     // protocol number of TCP.
 
     if matches!(level, PSOL::TCP) {
-        use socket::inet::stream::TcpOption;
-        let optname = TcpOption::try_from(optname as i32).map_err(|_| SystemError::ENOPROTOOPT)?;
-        match optname {
-            TcpOption::Congestion => return Ok(0),
-            _ => {
-                return Err(SystemError::ENOPROTOOPT);
-            }
-        }
+        let _optname = TcpOption::try_from(optname as i32).map_err(|_| SystemError::ENOPROTOOPT)?;
+        // TcpOption::Congestion => return Ok(0),
+        // Other TCP options are delegated to the socket implementation below.
     }
 
     // 其它 level（如 SOL_IP/SOL_IPV6/SOL_RAW 等）交给具体 socket 实现。
@@ -241,7 +233,7 @@ pub(super) fn do_getsockopt(
         let written = socket.option(level, optname, &mut kbuf)?;
         let out_len = calc_out_len(optval, user_len, written);
 
-        if !optval.is_null() {
+        if !optval.is_null() && out_len != 0 {
             let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
             optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
         }

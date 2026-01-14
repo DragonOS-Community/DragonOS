@@ -6,6 +6,7 @@ use alloc::{string::String, vec::Vec};
 use smoltcp::wire::{HardwareAddress, IpAddress};
 
 use crate::net::routing::uapi::arp::{ArpFlags, ArpHrd};
+use crate::process::ProcessManager;
 
 /// ARP条目信息
 #[derive(Debug, Clone)]
@@ -27,7 +28,6 @@ pub struct ArpEntry {
 /// # Returns
 /// 返回所有网络设备的有效ARP缓存条目
 pub fn get_arp_entries() -> Vec<ArpEntry> {
-    use crate::process::ProcessManager;
     let mut entries = Vec::new();
 
     // 获取当前网络命名空间

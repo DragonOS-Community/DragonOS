@@ -1,7 +1,7 @@
 use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::file::File;
-use crate::libs::rwlock::RwLock;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::mutex::Mutex;
+use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::unix::ring_buffer::{RbConsumer, RbProducer, RingBuffer};
@@ -127,8 +127,8 @@ impl Init {
 pub struct Connected {
     addr: Option<UnixEndpointBound>,
     peer_addr: Option<UnixEndpointBound>,
-    reader: SpinLock<RbConsumer<u8>>,
-    writer: SpinLock<RbProducer<u8>>,
+    reader: Mutex<RbConsumer<u8>>,
+    writer: Mutex<RbProducer<u8>>,
 }
 
 impl Connected {
@@ -142,14 +142,14 @@ impl Connected {
         let this = Connected {
             addr: addr.clone(),
             peer_addr: peer_addr.clone(),
-            reader: SpinLock::new(this_reader),
-            writer: SpinLock::new(this_writer),
+            reader: Mutex::new(this_reader),
+            writer: Mutex::new(this_writer),
         };
         let peer = Connected {
             addr: peer_addr,
             peer_addr: addr,
-            reader: SpinLock::new(peer_reader),
-            writer: SpinLock::new(peer_writer),
+            reader: Mutex::new(peer_reader),
+            writer: Mutex::new(peer_writer),
         };
 
         return (this, peer);
@@ -618,13 +618,13 @@ impl Drop for Listener {
 }
 
 struct BacklogTable {
-    backlog_sockets: RwLock<BTreeMap<UnixEndpointBound, Arc<Backlog>>>,
+    backlog_sockets: RwSem<BTreeMap<UnixEndpointBound, Arc<Backlog>>>,
 }
 
 impl BacklogTable {
     const fn new() -> Self {
         Self {
-            backlog_sockets: RwLock::new(BTreeMap::new()),
+            backlog_sockets: RwSem::new(BTreeMap::new()),
         }
     }
 
@@ -671,7 +671,7 @@ pub(super) struct Backlog {
     backlog: AtomicUsize,
     sndbuf_effective: AtomicUsize,
     rcvbuf_effective: AtomicUsize,
-    incoming_conns: SpinLock<Option<VecDeque<Arc<UnixStreamSocket>>>>,
+    incoming_conns: Mutex<Option<VecDeque<Arc<UnixStreamSocket>>>>,
     wait_queue: Arc<WaitQueue>,
     is_seqpacket: bool,
     netns: Arc<NetNamespace>,
@@ -691,7 +691,7 @@ impl Backlog {
             backlog: AtomicUsize::new(params.backlog),
             sndbuf_effective: AtomicUsize::new(params.sndbuf_effective),
             rcvbuf_effective: AtomicUsize::new(params.rcvbuf_effective),
-            incoming_conns: SpinLock::new(incoming_sockets),
+            incoming_conns: Mutex::new(incoming_sockets),
             wait_queue: params.wait_queue,
             is_seqpacket: params.is_seqpacket,
             netns: params.netns,

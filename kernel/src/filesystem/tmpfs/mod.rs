@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::fault::PageFaultHandler;
 use crate::mm::page::Page;
@@ -17,7 +17,7 @@ use crate::{
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::mutex::{Mutex, MutexGuard},
     mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
@@ -136,12 +136,12 @@ fn tmpfs_move_entry_between_dirs(
 }
 
 #[derive(Debug)]
-pub struct LockedTmpfsInode(pub SpinLock<TmpfsInode>);
+pub struct LockedTmpfsInode(pub Mutex<TmpfsInode>);
 
 #[derive(Debug)]
 pub struct Tmpfs {
     root_inode: Arc<LockedTmpfsInode>,
-    super_block: RwLock<SuperBlock>,
+    super_block: RwSem<SuperBlock>,
     size_limit: Option<u64>,
     current_size: AtomicU64,
 }
@@ -202,19 +202,22 @@ impl TmpfsMountData {
         let mut size_bytes = None;
 
         if let Some(raw) = raw {
-            for opt in raw.split(',').filter(|s| !s.is_empty()) {
-                if let Some(v) = opt.strip_prefix("mode=") {
+            for opt in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if let Some(v) = opt.strip_prefix("mode=").map(|s| s.trim()) {
+                    // mode 参数按八进制解析（mount 的习惯用法，如 755 = rwxr-xr-x）
                     let parsed = u32::from_str_radix(v, 8).map_err(|_| SystemError::EINVAL)?;
                     mode = InodeMode::from_bits_truncate(parsed);
-                } else if let Some(v) = opt.strip_prefix("size=") {
-                    let (num_str, mul) = if let Some(s) = v.strip_suffix('G') {
+                } else if let Some(v) = opt.strip_prefix("size=").map(|s| s.trim()) {
+                    // 支持大小写后缀：g/G, m/M, k/K
+                    let v_lower = v.to_lowercase();
+                    let (num_str, mul) = if let Some(s) = v_lower.strip_suffix('g') {
                         (s, 1u64 << 30)
-                    } else if let Some(s) = v.strip_suffix('M') {
+                    } else if let Some(s) = v_lower.strip_suffix('m') {
                         (s, 1u64 << 20)
-                    } else if let Some(s) = v.strip_suffix('K') {
+                    } else if let Some(s) = v_lower.strip_suffix('k') {
                         (s, 1u64 << 10)
                     } else {
-                        (v, 1u64)
+                        (&v_lower[..], 1u64)
                     };
                     let base = num_str.parse::<u64>().map_err(|_| SystemError::EINVAL)?;
                     size_bytes = Some(base.saturating_mul(mul));
@@ -327,17 +330,16 @@ impl Tmpfs {
             sb.bavail = blocks;
         }
 
-        let root: Arc<LockedTmpfsInode> =
-            Arc::new(LockedTmpfsInode(SpinLock::new(TmpfsInode::new())));
+        let root: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode::new())));
 
         let result: Arc<Tmpfs> = Arc::new(Tmpfs {
             root_inode: root,
-            super_block: RwLock::new(sb),
+            super_block: RwSem::new(sb),
             size_limit,
             current_size: AtomicU64::new(0),
         });
 
-        let mut root_guard: SpinLockGuard<TmpfsInode> = result.root_inode.0.lock();
+        let mut root_guard: MutexGuard<TmpfsInode> = result.root_inode.0.lock();
         root_guard.parent = Arc::downgrade(&result.root_inode);
         root_guard.self_ref = Arc::downgrade(&result.root_inode);
         root_guard.fs = Arc::downgrade(&result);
@@ -433,13 +435,13 @@ impl IndexNode for LockedTmpfsInode {
         self.resize(len)
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -450,7 +452,7 @@ impl IndexNode for LockedTmpfsInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -487,7 +489,7 @@ impl IndexNode for LockedTmpfsInode {
 
         let mut items: Vec<ReadItem> = Vec::new();
         {
-            let mut page_cache_guard = page_cache.lock_irqsave();
+            let mut page_cache_guard = page_cache.lock();
             for page_index in start_page_index..=end_page_index {
                 let page_start = page_index * MMArch::PAGE_SIZE;
                 let page_end = page_start + MMArch::PAGE_SIZE;
@@ -546,7 +548,7 @@ impl IndexNode for LockedTmpfsInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -591,7 +593,7 @@ impl IndexNode for LockedTmpfsInode {
 
         let mut items: Vec<WriteItem> = Vec::new();
         {
-            let mut page_cache_guard = page_cache.lock_irqsave();
+            let mut page_cache_guard = page_cache.lock();
             for page_index in start_page_index..=end_page_index {
                 let page_start = page_index * MMArch::PAGE_SIZE;
                 let page_end = page_start + MMArch::PAGE_SIZE;
@@ -693,7 +695,7 @@ impl IndexNode for LockedTmpfsInode {
 
             // 调整页缓存（会释放多余页，并截断最后一页）
             if let Some(pc) = inode.page_cache.clone() {
-                pc.lock_irqsave().resize(len)?;
+                pc.lock().resize(len)?;
             }
 
             // 如果缩小，减少current_size
@@ -725,7 +727,7 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::EEXIST);
         }
 
-        let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode(SpinLock::new(TmpfsInode {
+        let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode {
             parent: inode.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
@@ -776,8 +778,8 @@ impl IndexNode for LockedTmpfsInode {
             .downcast_ref::<LockedTmpfsInode>()
             .ok_or(SystemError::EPERM)?;
         let name = DName::from(name);
-        let mut inode: SpinLockGuard<TmpfsInode> = self.0.lock();
-        let mut other_locked: SpinLockGuard<TmpfsInode> = other.0.lock();
+        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
+        let mut other_locked: MutexGuard<TmpfsInode> = other.0.lock();
 
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -797,7 +799,7 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
-        let mut inode: SpinLockGuard<TmpfsInode> = self.0.lock();
+        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -840,7 +842,7 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let name = DName::from(name);
-        let mut inode: SpinLockGuard<TmpfsInode> = self.0.lock();
+        let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -998,7 +1000,7 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {
-        let inode: SpinLockGuard<TmpfsInode> = self.0.lock();
+        let inode: MutexGuard<TmpfsInode> = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -1063,14 +1065,14 @@ impl IndexNode for LockedTmpfsInode {
 
         if unlikely(mode.contains(InodeMode::S_IFREG)) {
             // Regular file creation must not recurse while holding the directory lock,
-            // otherwise self.create() will try to lock the same SpinLock and deadlock.
+            // otherwise self.create() will try to lock the same Mutex and deadlock.
             drop(inode);
             return self.create(filename, FileType::File, mode);
         }
 
         let filename = DName::from(filename);
 
-        let nod = Arc::new(LockedTmpfsInode(SpinLock::new(TmpfsInode {
+        let nod = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode {
             parent: inode.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),

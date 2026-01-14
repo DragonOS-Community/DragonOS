@@ -18,7 +18,7 @@ use crate::include::bindings::linux_bpf::{
     perf_event_attr, perf_event_sample_format, perf_sw_ids, perf_type_id,
 };
 use crate::libs::casting::DowncastArc;
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::mm::allocator::page_frame::{
     allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
 };
@@ -168,7 +168,7 @@ impl PerfEventInode {
     pub fn new(event: Box<dyn PerfEventOps>) -> Self {
         Self {
             event,
-            epitems: SpinLock::new(LinkedList::new()),
+            epitems: Mutex::new(LinkedList::new()),
         }
     }
     fn do_poll(&self) -> Result<usize> {
@@ -197,10 +197,10 @@ impl IndexNode for PerfEventInode {
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
         self.event.mmap(start, len, offset)
     }
-    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
+    fn open(&self, _data: MutexGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
         Ok(())
     }
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<()> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
         Ok(())
     }
     fn read_at(
@@ -208,7 +208,7 @@ impl IndexNode for PerfEventInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("read_at not implemented for PerfEvent");
     }
@@ -218,7 +218,7 @@ impl IndexNode for PerfEventInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("write_at not implemented for PerfEvent");
     }

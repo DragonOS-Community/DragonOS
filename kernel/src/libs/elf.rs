@@ -18,7 +18,7 @@ use system_error::SystemError;
 use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
-    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    filesystem::vfs::{fcntl::AtFlags, open::do_open_execat},
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
@@ -36,7 +36,7 @@ use crate::{
     syscall::user_access::{clear_user, copy_to_user},
 };
 
-use super::rwlock::RwLockWriteGuard;
+use crate::libs::rwsem::RwSemWriteGuard;
 
 // 存放跟架构相关的Elf属性，
 pub trait ElfArch: Clone + Copy + Debug {
@@ -131,7 +131,7 @@ impl ElfLoader {
     /// - `prot_flags` - 本次映射的权限
     fn set_elf_brk(
         &self,
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
         start: VirtAddr,
         end: VirtAddr,
         prot_flags: ProtFlags,
@@ -175,6 +175,90 @@ impl ElfLoader {
         )
     }
 
+    /// 映射只读ELF段（文件映射）
+    ///
+    /// 对"非写段"(PF_W=0，包括代码段与只读段)改为文件映射：
+    /// - 通过 pagecache + 用户态缺页同步读盘实现按需加载
+    /// - 最终用户态权限严格按 make_prot() 生成（无 PF_W -> 不含 PROT_WRITE）
+    ///
+    /// ## 参数
+    ///
+    /// - `user_vm_guard`：用户空间地址空间
+    /// - `param`：执行参数
+    /// - `addr_to_map`：映射的虚拟地址
+    /// - `prot`：保护标志
+    /// - `map_flags`：映射标志
+    /// - `file_offset`：段在文件中的偏移
+    /// - `beginning_page_offset`：页内偏移
+    /// - `map_size`：映射大小
+    /// - `total_size`：ELF文件总大小
+    /// - `map_err_handler`：错误处理函数
+    ///
+    /// ## 返回值
+    ///
+    /// 返回映射的虚拟地址和成功标志
+    #[allow(clippy::too_many_arguments)]
+    fn map_readonly_segment(
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+        param: &ExecParam,
+        addr_to_map: VirtAddr,
+        prot: ProtFlags,
+        map_flags: MapFlags,
+        file_offset: usize,
+        beginning_page_offset: usize,
+        map_size: usize,
+        total_size: usize,
+        map_err_handler: impl FnOnce(SystemError) -> SystemError,
+    ) -> Result<(VirtAddr, bool), SystemError> {
+        // Linux: off = p_offset - ELF_PAGEOFFSET(p_vaddr)
+        let file_page_offset = file_offset
+            .checked_sub(beginning_page_offset)
+            .ok_or(SystemError::ENOEXEC)?;
+
+        // ELF 约束：p_offset % PAGE == p_vaddr % PAGE，保证 off 页对齐
+        if (file_page_offset & (CurrentElfArch::ELF_PAGE_SIZE - 1)) != 0 {
+            return Err(SystemError::ENOEXEC);
+        }
+
+        // total_size 逻辑保持与原实现一致：首段先映射 total_size 再 munmap 空洞尾部
+        let map_len = if total_size != 0 {
+            Self::elf_page_align_up(VirtAddr::new(total_size)).data()
+        } else {
+            map_size
+        };
+        if map_len < map_size {
+            return Err(SystemError::EINVAL);
+        }
+
+        let file = param.file();
+        let start_page = user_vm_guard
+            .file_mapping_with_file(
+                file,
+                addr_to_map,
+                map_len,
+                prot,
+                map_flags,
+                file_page_offset,
+                false,
+                false,
+            )
+            .map_err(map_err_handler)?;
+        let mapped = start_page.virt_address();
+
+        if total_size != 0 {
+            let to_unmap = mapped + map_size;
+            let to_unmap_size = map_len - map_size;
+            if to_unmap_size > 0 {
+                user_vm_guard.munmap(
+                    VirtPageFrame::new(to_unmap),
+                    PageFrameCount::from_bytes(to_unmap_size).unwrap(),
+                )?;
+            }
+        }
+
+        Ok((mapped, true))
+    }
+
     /// 根据ELF的p_flags生成对应的ProtFlags
     fn make_prot(p_flags: u32, _has_interpreter: bool, _is_interpreter: bool) -> ProtFlags {
         let mut prot = ProtFlags::empty();
@@ -213,7 +297,7 @@ impl ElfLoader {
     /// - `Ok((VirtAddr, bool))`：如果成功加载，则bool值为true，否则为false. VirtAddr为加载的地址
     #[allow(clippy::too_many_arguments)]
     fn load_elf_segment(
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
         param: &mut ExecParam,
         phent: &ProgramHeader,
         mut addr_to_map: VirtAddr,
@@ -227,7 +311,8 @@ impl ElfLoader {
         // });
 
         // 映射位置的偏移量（页内偏移）
-        let beginning_page_offset = Self::elf_page_offset(addr_to_map);
+        // 按 Linux 语义：使用 p_vaddr 的页内偏移（ELF_PAGEOFFSET(p_vaddr)）
+        let beginning_page_offset = (phent.p_vaddr as usize) & (CurrentElfArch::ELF_PAGE_SIZE - 1);
         addr_to_map = Self::elf_page_start(addr_to_map);
         // 计算要映射的内存的大小
         let map_size = phent.p_filesz as usize + beginning_page_offset;
@@ -253,6 +338,27 @@ impl ElfLoader {
             }
             err
         };
+
+        // 对"非写段"(PF_W=0，包括代码段与只读段)改为文件映射
+        // - 通过 pagecache + 用户态缺页同步读盘实现按需加载
+        // - 最终用户态权限严格按 make_prot() 生成（无 PF_W -> 不含 PROT_WRITE）
+        // 解释器(PT_INTERP 对应 ld.so)也同样适用：其只读段可安全走 filemap
+        let is_readonly_load = (phent.p_flags & elf::abi::PF_W) == 0;
+        if is_readonly_load {
+            return Self::map_readonly_segment(
+                user_vm_guard,
+                param,
+                addr_to_map,
+                *prot,
+                *map_flags,
+                file_offset,
+                beginning_page_offset,
+                map_size,
+                total_size,
+                map_err_handler,
+            );
+        }
+
         // 由于后面需要把ELF文件的内容加载到内存，因此暂时把当前段的权限设置为可写
         let tmp_prot = if !prot.contains(ProtFlags::PROT_WRITE) {
             *prot | ProtFlags::PROT_WRITE
@@ -352,11 +458,11 @@ impl ElfLoader {
         // });
         let mut head_buf = [0u8; 512];
         interp_elf_ex
-            .file_mut()
+            .file_ref()
             .lseek(SeekFrom::SeekSet(0))
             .map_err(|_| ExecError::NotSupported)?;
         let _bytes = interp_elf_ex
-            .file_mut()
+            .file_ref()
             .read(512, &mut head_buf)
             .map_err(|_| ExecError::NotSupported)?;
         let interp_hdr =
@@ -495,7 +601,7 @@ impl ElfLoader {
         offset_in_file: usize,
         param: &mut ExecParam,
     ) -> Result<(), SystemError> {
-        let file = param.file_mut();
+        let file = param.file_ref();
         if (file.metadata()?.size as usize) < offset_in_file + size {
             return Err(SystemError::ENOEXEC);
         }
@@ -643,7 +749,7 @@ impl ElfLoader {
         if ehdr.e_phoff == 0 {
             return Ok(None);
         }
-        let file = param.file_mut();
+        let file = param.file_ref();
         // If the number of segments is greater than or equal to PN_XNUM (0xffff),
         // e_phnum is set to PN_XNUM, and the actual number of program header table
         // entries is contained in the sh_info field of the section header at index 0.
@@ -775,7 +881,7 @@ impl BinaryLoader for ElfLoader {
             }
             let mut buffer = vec![0; seg.p_filesz.try_into().unwrap()];
             let r = param
-                .file_mut()
+                .file_ref()
                 .pread(
                     seg.p_offset.try_into().unwrap(),
                     seg.p_filesz.try_into().unwrap(),
@@ -798,25 +904,23 @@ impl BinaryLoader for ElfLoader {
                     e
                 ))
             })?;
-            let pwd = ProcessManager::current_pcb().pwd_inode();
-            let inode = pwd
-                .lookup_follow_symlink(interpreter_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+            // 使用 do_open_execat 打开解释器文件
+            let interpreter_file = do_open_execat(AtFlags::AT_FDCWD.bits(), interpreter_path)
                 .map_err(|e| {
                     // Linux 语义：动态链接器（解释器）路径不存在时，execve 需返回 ENOENT。
                     log::error!(
-                        "Failed to find interpreter path: {} (err={:?})",
+                        "Failed to open interpreter file: {} (err={:?})",
                         interpreter_path,
                         e
                     );
                     ExecError::SystemError(SystemError::ENOENT)
                 })?;
             // log::debug!("opening interpreter at :{}", interpreter_path);
-            interpreter = Some(
-                ExecParam::new(inode, param.vm().clone(), ExecParamFlags::EXEC).map_err(|e| {
-                    log::error!("Failed to load interpreter {interpreter_path}: {:?}", e);
-                    return ExecError::NotSupported;
-                })?,
-            );
+            interpreter = Some(ExecParam::new(
+                interpreter_file,
+                param.vm().clone(),
+                ExecParamFlags::EXEC,
+            ));
         }
         //TODO 缺少一部分逻辑 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#931
 
@@ -831,6 +935,12 @@ impl BinaryLoader for ElfLoader {
         // todo: 补充逻辑：https://code.dragonos.org.cn/xref/linux-6.6.21/fs/binfmt_elf.c#1007
         param.setup_new_exec();
 
+        // Linux 语义：elf_bss/elf_brk 以“字节端点”记录：
+        // - elf_bss: max(p_vaddr + p_filesz)
+        // - elf_brk: max(p_vaddr + p_memsz)
+        // 之后再做：
+        // 1) pad_zero(elf_bss) 清零最后一个文件页的尾部
+        // 2) page-align 后，为 [align_up(elf_bss), align_up(elf_brk)) 建立匿名 BSS 映射
         let mut elf_brk = VirtAddr::new(0);
         let mut elf_bss = VirtAddr::new(0);
         let mut start_code: Option<VirtAddr> = None;
@@ -860,20 +970,30 @@ impl BinaryLoader for ElfLoader {
                 //     elf_brk,
                 //     elf_bss
                 // );
-                self.set_elf_brk(
-                    &mut user_vm,
-                    elf_bss + load_bias,
-                    elf_brk + load_bias,
-                    bss_prot_flags,
-                )?;
+                // 仅在页粒度上需要扩展 BSS 时才去映射，避免覆盖段的最后一页
+                let bss_start_page = Self::elf_page_align_up(elf_bss);
+                let brk_end_page = Self::elf_page_align_up(elf_brk);
+                if brk_end_page > bss_start_page {
+                    self.set_elf_brk(
+                        &mut user_vm,
+                        bss_start_page + load_bias,
+                        brk_end_page + load_bias,
+                        bss_prot_flags,
+                    )?;
+                }
+
+                // 处理“BSS 落在最后一个文件页内”的尾部清零（Linux: padzero）
                 let nbyte = Self::elf_page_offset(elf_bss);
                 if nbyte > 0 {
                     let nbyte = min(CurrentElfArch::ELF_PAGE_SIZE - nbyte, elf_brk - elf_bss);
+                    // 重要：clear_user 会触发用户态缺页，缺页路径会获取 AddressSpace 写锁。
+                    // 因此必须在释放 user_vm 写锁后再清零，避免死锁。
+                    drop(user_vm);
                     unsafe {
-                        // This bss-zeroing can fail if the ELF file specifies odd protections.
-                        // So we don't check the return value.
+                        // 这里清零理论上不应失败：BSS 所属段应为可写；失败时忽略以兼容 Linux 行为
                         clear_user(elf_bss + load_bias, nbyte).ok();
                     }
+                    user_vm = binding.write();
                 }
             }
 
@@ -988,14 +1108,14 @@ impl BinaryLoader for ElfLoader {
                 return Err(ExecError::InvalidParemeter);
             }
 
-            // end vaddr of this segment(code+data+bss)
-            let seg_end_vaddr_f = Self::elf_page_align_up(VirtAddr::new(
-                (seg_to_load.p_vaddr + seg_to_load.p_filesz) as usize,
-            ));
-
-            if seg_end_vaddr_f > elf_bss {
-                elf_bss = seg_end_vaddr_f;
+            // 文件部分结束的“字节端点”（用于 BSS/padzero 语义）
+            let seg_file_end = VirtAddr::new((seg_to_load.p_vaddr + seg_to_load.p_filesz) as usize);
+            if seg_file_end > elf_bss {
+                elf_bss = seg_file_end;
             }
+
+            // 统计 end_code/end_data 使用页对齐后的文件端点（更贴近 /proc/maps 的 VMA 粒度）
+            let seg_end_vaddr_f = Self::elf_page_align_up(seg_file_end);
 
             if ((seg_to_load.p_flags & elf::abi::PF_X) != 0)
                 && (end_code.is_none()
@@ -1034,11 +1154,18 @@ impl BinaryLoader for ElfLoader {
         //     elf_brk,
         //     bss_prot_flags
         // );
-        self.set_elf_brk(&mut user_vm, elf_bss, elf_brk, bss_prot_flags)?;
-
+        // 先释放 AddressSpace 写锁，再对最后一个文件页做 padzero（padzero 会写用户地址，可能触发缺页）
+        drop(user_vm);
         if likely(elf_bss != elf_brk) && unlikely(Self::pad_zero(elf_bss).is_err()) {
-            // debug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
             return Err(ExecError::BadAddress(Some(elf_bss)));
+        }
+
+        // 再重新获取写锁，对齐后映射剩余的 BSS 页（避免覆盖最后一页）
+        let mut user_vm = binding.write();
+        let bss_start_page = Self::elf_page_align_up(elf_bss);
+        let brk_end_page = Self::elf_page_align_up(elf_brk);
+        if brk_end_page > bss_start_page {
+            self.set_elf_brk(&mut user_vm, bss_start_page, brk_end_page, bss_prot_flags)?;
         }
         drop(user_vm);
         if let Some(mut interpreter) = interpreter {
@@ -1048,12 +1175,6 @@ impl BinaryLoader for ElfLoader {
             _reloc_func_desc = elf_entry.data();
             //参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1269
             //TODO allow_write_access(interpreter);
-            ProcessManager::current_pcb()
-                .fd_table()
-                .write()
-                .alloc_fd(interpreter.file(), None)
-                .map(|fd| fd as usize)
-                .map_err(|_| ExecError::InvalidParemeter)?;
         }
         // debug!("to create auxv");
         let mut user_vm = binding.write();

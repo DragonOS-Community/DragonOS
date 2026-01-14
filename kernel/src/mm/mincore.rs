@@ -85,8 +85,8 @@ impl LockedVMA {
         if self.is_anonymous() {
             vec[vec_offset..vec_offset + nr].fill(0);
         } else {
-            let guard = self.lock_irqsave();
-            let pgoff = ((start_addr - guard.region().start()) >> MMArch::PAGE_SHIFT)
+            let guard = self.lock();
+            let pgoff = ((start_addr.data() - guard.region().start().data()) >> MMArch::PAGE_SHIFT)
                 + guard.backing_page_offset().unwrap();
             if guard.vm_file().is_none() {
                 vec[vec_offset..vec_offset + nr].fill(0);
@@ -95,7 +95,7 @@ impl LockedVMA {
             let page_cache = guard.vm_file().unwrap().inode().page_cache();
             match page_cache {
                 Some(page_cache) => {
-                    let cache_guard = page_cache.lock_irqsave();
+                    let cache_guard = page_cache.lock();
                     for i in 0..nr {
                         if cache_guard.get_page(pgoff + i).is_some() {
                             vec[vec_offset + i] = 1;

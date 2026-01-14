@@ -1,7 +1,7 @@
 use super::OvlInode;
 use crate::{
     filesystem::vfs::{IndexNode, Metadata},
-    libs::spinlock::SpinLock,
+    libs::mutex::Mutex,
 };
 use alloc::sync::Arc;
 use system_error::SystemError;
@@ -19,7 +19,7 @@ impl OvlInode {
         let new_upper_inode = self.create_upper_inode(metadata.clone())?;
 
         let mut buffer = vec![0u8; metadata.size as usize];
-        let lock = SpinLock::new(crate::filesystem::vfs::FilePrivateData::Unused);
+        let lock = Mutex::new(crate::filesystem::vfs::FilePrivateData::Unused);
         lower_inode.read_at(0, metadata.size as usize, &mut buffer, lock.lock())?;
 
         new_upper_inode.write_at(0, metadata.size as usize, &buffer, lock.lock())?;

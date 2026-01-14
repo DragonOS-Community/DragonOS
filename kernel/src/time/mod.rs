@@ -540,7 +540,9 @@ impl From<smoltcp::time::Instant> for Instant {
 
 impl From<Instant> for smoltcp::time::Instant {
     fn from(val: Instant) -> Self {
-        smoltcp::time::Instant::from_millis(val.millis())
+        // smoltcp 的 Instant 单位是微秒，且要求单调递增。
+        // 这里必须使用 total_micros（而不是 millis() 这种“秒内小数部分”），否则会每秒回绕，导致 poll_at/定时器异常。
+        smoltcp::time::Instant::from_micros(val.total_micros())
     }
 }
 
@@ -553,7 +555,8 @@ impl From<smoltcp::time::Duration> for Duration {
 
 impl From<Duration> for smoltcp::time::Duration {
     fn from(val: Duration) -> Self {
-        smoltcp::time::Duration::from_millis(val.millis())
+        // smoltcp 的 Duration 单位是微秒；同样不能使用 millis() 这种“秒内小数部分”，否则会严重截断。
+        smoltcp::time::Duration::from_micros(val.total_micros())
     }
 }
 

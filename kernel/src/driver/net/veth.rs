@@ -469,7 +469,7 @@ impl VethInterface {
     /// 该方法会将指定的 IP 地址添加到虚拟以太网设备的 IP 地址列表中。
     /// 如果添加失败（例如列表已满），则会触发 panic。
     pub fn update_ip_addrs(&self, cidr: IpCidr) {
-        let iface = &mut self.common.smol_iface.lock_irqsave();
+        let iface = &mut self.common.smol_iface.lock();
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs.push(cidr).expect("Push ipCidr failed: full");
         });
@@ -498,7 +498,7 @@ impl VethInterface {
     /// 如果添加失败，则会触发 panic。
     ///
     pub fn add_default_route_to_peer(&self, peer_ip: IpAddress) {
-        let iface = &mut self.common.smol_iface.lock_irqsave();
+        let iface = &mut self.common.smol_iface.lock();
         // iface.update_ip_addrs(|ip_addrs| {
         //     ip_addrs.push(self_cidr).expect("Push ipCidr failed: full");
         // });
@@ -661,9 +661,7 @@ impl Iface for VethInterface {
     }
 
     fn mac(&self) -> EthernetAddress {
-        if let HardwareAddress::Ethernet(mac) =
-            self.common.smol_iface.lock_irqsave().hardware_addr()
-        {
+        if let HardwareAddress::Ethernet(mac) = self.common.smol_iface.lock().hardware_addr() {
             mac
         } else {
             EthernetAddress([0, 0, 0, 0, 0, 0])
@@ -674,6 +672,10 @@ impl Iface for VethInterface {
         // log::info!("VethInterface {} polling normal", self.name);
         self.common.poll(self.driver.force_get_mut())
         // self.clear_recv_buffer();
+    }
+
+    fn poll_napi(&self, budget: usize) -> bool {
+        self.common.poll_napi(self.driver.force_get_mut(), budget)
     }
 
     fn addr_assign_type(&self) -> u8 {

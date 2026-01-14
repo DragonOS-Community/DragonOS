@@ -2,6 +2,7 @@
 //!
 //! 显示进程的挂载点详细信息
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
@@ -11,7 +12,6 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
     process::RawPid,
 };
 use alloc::sync::{Arc, Weak};
@@ -39,7 +39,7 @@ impl FileOps for MountInfoFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = generate_mountinfo_content();
         proc_read(offset, len, buf, content.as_bytes())

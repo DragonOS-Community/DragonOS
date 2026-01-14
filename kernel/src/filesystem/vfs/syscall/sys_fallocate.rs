@@ -1,4 +1,8 @@
+use crate::arch::ipc::signal::Signal;
 use crate::arch::syscall::nr::SYS_FALLOCATE;
+use crate::filesystem::vfs::file::FileMode;
+use crate::ipc::kill::send_signal_to_pid;
+use crate::process::resource::RLimitID;
 use crate::{
     arch::interrupt::TrapFrame,
     process::ProcessManager,
@@ -47,7 +51,7 @@ impl Syscall for SysFallocateHandle {
 
         // 暂时只支持 mode = 0
         if mode != 0 {
-            return Err(SystemError::ENOSYS);
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
         if len == 0 {
@@ -60,11 +64,22 @@ impl Syscall for SysFallocateHandle {
             drop(fd_table_guard);
 
             let mode_flags = file.mode();
-            if !mode_flags.is_writeable() || !mode_flags.can_write() {
+
+            if mode_flags.contains(FileMode::FMODE_PATH) {
                 return Err(SystemError::EBADF);
             }
 
+            if !mode_flags.contains(FileMode::FMODE_WRITE) || !mode_flags.can_write() {
+                return Err(SystemError::EINVAL);
+            }
+
             let new_size = offset.saturating_add(len);
+            let current_pcb = ProcessManager::current_pcb();
+            let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+            if fsize_limit.rlim_cur != u64::MAX && new_size as u64 > fsize_limit.rlim_cur {
+                let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+                return Err(SystemError::EFBIG);
+            }
 
             let r = crate::filesystem::vfs::vcore::vfs_truncate(file.inode(), new_size).map(|_| 0);
             return r;

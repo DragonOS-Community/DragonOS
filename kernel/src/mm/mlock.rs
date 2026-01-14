@@ -80,7 +80,7 @@ pub fn can_do_mlock() -> bool {
 ///
 /// 基于 Linux 6.6.21 mm/mlock.c:mlock_folio()
 pub fn mlock_page(page: &Arc<Page>) {
-    let mut page_guard = page.write_irqsave();
+    let mut page_guard = page.write();
 
     // 集中管理计数和标志，确保不变量一致性
     page_guard.inc_mlock_count();
@@ -107,7 +107,7 @@ pub fn mlock_page(page: &Arc<Page>) {
 ///
 /// 基于 Linux 6.6.21 mm/mlock.c:munlock_folio()
 pub fn munlock_page(page: &Arc<Page>) {
-    let mut page_guard = page.write_irqsave();
+    let mut page_guard = page.write();
 
     // 集中管理计数和标志，确保不变量一致性
     page_guard.dec_mlock_count();

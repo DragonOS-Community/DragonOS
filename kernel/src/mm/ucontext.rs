@@ -837,7 +837,7 @@ impl InnerAddressSpace {
             .mappings
             .contains(old_vaddr)
             .ok_or(SystemError::EINVAL)?;
-        let (old_region, vm_flags,vm_file, shared_anon, base_pgoff) = {
+        let (old_region, vm_flags, vm_file, shared_anon, base_pgoff) = {
             let g = old_vma.lock();
             let region = *g.region();
             let flags = *g.vm_flags();
@@ -1085,7 +1085,7 @@ impl InnerAddressSpace {
                 || r_guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);
             let r_region = *r_guard.region();
             drop(r_guard);
-            
+
             let r = self.mappings.remove_vma(&r_region).unwrap();
             let intersection = r.lock().region().intersect(&to_unmap).unwrap();
             let split_result = r.extract(intersection, &self.user_mapper.utable).unwrap();

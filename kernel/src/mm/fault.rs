@@ -246,7 +246,8 @@ impl PageFaultHandler {
         {
             let guard = vma.lock();
             // 检查 VMA 是否有 VM_LOCKONFAULT 标志
-            let should_lock = guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);            if guard.vm_flags().contains(VmFlags::VM_SHARED) {
+            let should_lock = guard.vm_flags().contains(VmFlags::VM_LOCKONFAULT);
+            if guard.vm_flags().contains(VmFlags::VM_SHARED) {
                 let shared = guard.shared_anon.clone();
                 if let Some(shared) = shared {
                     // Compute page index within the shared-anon backing object.

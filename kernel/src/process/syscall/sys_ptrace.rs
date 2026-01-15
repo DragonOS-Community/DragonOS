@@ -338,18 +338,20 @@ impl SysPtrace {
         // 从 tracee 的内核栈读取 TrapFrame
         let trap_frame = unsafe { &*(trap_frame_vaddr.data() as *const TrapFrame) };
 
-        // 获取 fs_base、gs_base 和段选择器
-        // - fs_base/gs_base: task->thread.fsbase/gsbase
-        // - fs/gs: task->thread.fsindex/gsindex
-        let arch_info = tracee.arch_info_irqsave();
-        let fs_base = arch_info.fsbase() as u64;
-        let gs_base = arch_info.gsbase() as u64;
-        let fs = arch_info.fs() as u64;
-        let gs = arch_info.gs() as u64;
-        drop(arch_info);
-
-        // 使用 UserRegsStruct::from_trap_frame 构造用户态寄存器结构体
-        let user_regs = UserRegsStruct::from_trap_frame(trap_frame, fs_base, gs_base, fs, gs);
+        #[cfg(target_arch = "x86_64")]
+        let user_regs = {
+            // 获取 fs_base、gs_base 和段选择器
+            let arch_info = tracee.arch_info_irqsave();
+            let fs_base = arch_info.fsbase() as u64;
+            let gs_base = arch_info.gsbase() as u64;
+            let fs = arch_info.fs() as u64;
+            let gs = arch_info.gs() as u64;
+            drop(arch_info);
+            // 使用 UserRegsStruct::from_trap_frame 构造用户态寄存器结构体
+            UserRegsStruct::from_trap_frame(trap_frame, fs_base, gs_base, fs, gs)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let user_regs = { UserRegsStruct::from_trap_frame(trap_frame) };
 
         // 拷贝到用户空间
         let mut writer = UserBufferWriter::new(

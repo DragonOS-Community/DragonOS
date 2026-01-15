@@ -98,7 +98,7 @@ QEMU=$(which qemu-system-${ARCH})
 QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
 QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
 QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
-QEMU_MEMORY="1024M"
+QEMU_MEMORY="2G"
 
 # 检查必要的环境变量
 if [ -z "${ROOT_PATH}" ]; then

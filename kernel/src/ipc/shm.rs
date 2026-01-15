@@ -1,6 +1,5 @@
 use crate::{
     arch::mm::LockedFrameAllocator,
-    filesystem::vfs::InodeMode,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
@@ -25,6 +24,7 @@ int_like!(ShmKey, usize);
 
 bitflags! {
     pub struct ShmFlags:u32{
+        const PERM_MASK = 0o777;
         const SHM_RDONLY = 0o10000;
         const SHM_RND = 0o20000;
         const SHM_REMAP = 0o40000;
@@ -169,14 +169,15 @@ impl ShmManager {
         )?;
 
         // 创建共享内存信息结构体
+        let current_cred = ProcessManager::current_pcb().cred();
         let kern_ipc_perm = KernIpcPerm {
             id: shm_id,
             key,
-            uid: 0,
-            gid: 0,
-            _cuid: 0,
-            _cgid: 0,
-            mode: shmflg & ShmFlags::from_bits_truncate(InodeMode::S_IRWXUGO.bits()),
+            uid: current_cred.uid.data(),
+            gid: current_cred.gid.data(),
+            cuid: current_cred.uid.data(),
+            cgid: current_cred.gid.data(),
+            mode: shmflg & ShmFlags::PERM_MASK,
             _seq: 0,
         };
         let shm_kernel = KernelShm::new(kern_ipc_perm, paddr, size);
@@ -247,14 +248,22 @@ impl ShmManager {
         from_user: bool,
     ) -> Result<usize, SystemError> {
         let kernel_shm = self.id2shm.get(&id).ok_or(SystemError::EINVAL)?;
-        let key = kernel_shm.kern_ipc_perm.key.data().to_i32().unwrap();
-        let mode = kernel_shm.kern_ipc_perm.mode.bits();
+        let kern_ipc_perm = &kernel_shm.kern_ipc_perm;
+        let key = kern_ipc_perm.key.data().to_i32().unwrap();
+        let mode = kern_ipc_perm.mode.bits();
 
-        let shm_perm = PosixIpcPerm::new(key, 0, 0, 0, 0, mode);
+        let shm_perm = PosixIpcPerm::new(
+            key,
+            kern_ipc_perm.uid as u32,
+            kern_ipc_perm.gid as u32,
+            kern_ipc_perm.cuid as u32,
+            kern_ipc_perm.cgid as u32,
+            mode,
+        );
         let shm_segsz = kernel_shm.shm_size;
-        let shm_atime = kernel_shm.shm_atim.total_nanos();
-        let shm_dtime = kernel_shm.shm_dtim.total_nanos();
-        let shm_ctime = kernel_shm.shm_ctim.total_nanos();
+        let shm_atime = kernel_shm.shm_atim.tv_sec;
+        let shm_dtime = kernel_shm.shm_dtim.tv_sec;
+        let shm_ctime = kernel_shm.shm_ctim.tv_sec;
         let shm_cpid = kernel_shm.shm_cprid.data().to_u32().unwrap();
         let shm_lpid = kernel_shm.shm_lprid.data().to_u32().unwrap();
         let shm_map_count = kernel_shm.map_count();
@@ -397,7 +406,7 @@ impl KernelShm {
             shm_dtim: PosixTimeSpec::new(0, 0),
             shm_ctim: PosixTimeSpec::now(),
             shm_cprid,
-            shm_lprid: shm_cprid,
+            shm_lprid: RawPid::new(0),
         }
     }
 
@@ -441,7 +450,9 @@ impl KernelShm {
     pub fn copy_from(&mut self, shm_id_ds: PosixShmIdDs) {
         self.kern_ipc_perm.uid = shm_id_ds.uid() as usize;
         self.kern_ipc_perm.gid = shm_id_ds.gid() as usize;
-        self.kern_ipc_perm.mode = ShmFlags::from_bits_truncate(shm_id_ds.mode());
+        let perm_bits = ShmFlags::from_bits_truncate(shm_id_ds.mode()) & ShmFlags::PERM_MASK;
+        self.kern_ipc_perm.mode.remove(ShmFlags::PERM_MASK);
+        self.kern_ipc_perm.mode.insert(perm_bits);
         self.update_ctim();
     }
 
@@ -481,9 +492,9 @@ pub struct KernIpcPerm {
     /// 共享内存拥有者所在组id
     gid: usize,
     /// 共享内存创建者用户id
-    _cuid: usize,
+    cuid: usize,
     /// 共享内存创建者所在组id
-    _cgid: usize,
+    cgid: usize,
     /// 共享内存区权限模式
     mode: ShmFlags,
     _seq: usize,

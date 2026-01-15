@@ -162,7 +162,7 @@
     "hash": "f449acec9b9ad36c4a75e8594d38e44d"
   },
   "en:kernel/filesystem/overview.md": {
-    "hash": "44499f7673a0c68c53b12882258b9f5c"
+    "hash": "296d560c67fbc0e14c695efe46a415f7"
   },
   "en:kernel/boot/bootloader.md": {
     "hash": "e6f65060560663ca2ce4d56d750332d8"
@@ -171,7 +171,7 @@
     "hash": "abe911dac525b44fe083752a1e6bbdc7"
   },
   "en:kernel/locking/mutex.md": {
-    "hash": "a82fa540acd44a93f5cb3c069d5584da"
+    "hash": "db7dc3202e78810c3a90bcf9808557f5"
   },
   "en:kernel/boot/cmdline.md": {
     "hash": "3d17446c60b72e9cadf82002520ebbf9"
@@ -318,7 +318,7 @@
     "hash": "11140afc1e5daa1667d40cae29a80b9a"
   },
   "en:kernel/sched/wait_queue.md": {
-    "hash": "7f2cbdebf5531ed7c641986f909a084e"
+    "hash": "31c47608306f88bc8fec9527905ba5b8"
   },
   "en:agents/release_agent_capability.md": {
     "hash": "6c10917f7e05f9a0c5d75c7bbed4bc71"

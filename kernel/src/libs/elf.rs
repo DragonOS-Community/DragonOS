@@ -36,7 +36,7 @@ use crate::{
     syscall::user_access::{clear_user, copy_to_user},
 };
 
-use super::rwlock::RwLockWriteGuard;
+use crate::libs::rwsem::RwSemWriteGuard;
 
 // 存放跟架构相关的Elf属性，
 pub trait ElfArch: Clone + Copy + Debug {
@@ -131,7 +131,7 @@ impl ElfLoader {
     /// - `prot_flags` - 本次映射的权限
     fn set_elf_brk(
         &self,
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
         start: VirtAddr,
         end: VirtAddr,
         prot_flags: ProtFlags,
@@ -199,7 +199,7 @@ impl ElfLoader {
     /// 返回映射的虚拟地址和成功标志
     #[allow(clippy::too_many_arguments)]
     fn map_readonly_segment(
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
         param: &ExecParam,
         addr_to_map: VirtAddr,
         prot: ProtFlags,
@@ -297,7 +297,7 @@ impl ElfLoader {
     /// - `Ok((VirtAddr, bool))`：如果成功加载，则bool值为true，否则为false. VirtAddr为加载的地址
     #[allow(clippy::too_many_arguments)]
     fn load_elf_segment(
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
+        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
         param: &mut ExecParam,
         phent: &ProgramHeader,
         mut addr_to_map: VirtAddr,

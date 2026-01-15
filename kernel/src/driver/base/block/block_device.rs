@@ -1,16 +1,13 @@
 /// 引入Module
-use crate::driver::{
-    base::{
-        device::{
-            device_number::{DeviceNumber, Major},
-            DevName, Device, DeviceError, IdTable, BLOCKDEVS,
-        },
-        map::{
-            DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
-            DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
-        },
+use crate::driver::base::{
+    device::{
+        device_number::{DeviceNumber, Major},
+        DevName, Device, DeviceError, IdTable, BLOCKDEVS,
     },
-    block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
+    map::{
+        DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
+        DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
+    },
 };
 
 use alloc::{sync::Arc, vec::Vec};
@@ -293,7 +290,7 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        self.cache_read(lba_id_start, count, buf)
+        self.read_at_sync(lba_id_start, count, buf)
     }
 
     /// # 函数的功能
@@ -304,49 +301,6 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        self.cache_write(lba_id_start, count, buf)
-    }
-
-    /// # 函数的功能
-    /// 其功能对外而言和read_at函数完全一致，但是加入blockcache的功能
-    fn cache_read(
-        &self,
-        lba_id_start: BlockId,
-        count: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        let cache_response = BlockCache::read(lba_id_start, count, buf);
-        if let Err(e) = cache_response {
-            match e {
-                BlockCacheError::StaticParameterError => {
-                    BlockCache::init();
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-                BlockCacheError::BlockFaultError(fail_vec) => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    let _ = BlockCache::insert(fail_vec, buf);
-                    return Ok(ans);
-                }
-                _ => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-            }
-        } else {
-            return Ok(count * BLOCK_SIZE);
-        }
-    }
-
-    /// # 函数功能
-    /// 其功能对外而言和write_at函数完全一致，但是加入blockcache的功能
-    fn cache_write(
-        &self,
-        lba_id_start: BlockId,
-        count: usize,
-        buf: &[u8],
-    ) -> Result<usize, SystemError> {
-        let _cache_response = BlockCache::immediate_write(lba_id_start, count, buf);
         self.write_at_sync(lba_id_start, count, buf)
     }
 
@@ -427,6 +381,51 @@ pub trait BlockDevice: Device {
     /// # gendisk注册成功的回调函数
     fn callback_gendisk_registered(&self, _gendisk: &Arc<GenDisk>) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    /// 提交异步BIO请求（默认不支持，由驱动选择性实现）
+    fn submit_bio(&self, _bio: Arc<super::bio::BioRequest>) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    /// 提交异步读BIO（优先 submit_bio，不支持则同步回退）
+    fn submit_bio_read(
+        &self,
+        lba_start: BlockId,
+        count: usize,
+    ) -> Result<Arc<super::bio::BioRequest>, SystemError> {
+        let bio = super::bio::BioRequest::new_read(lba_start, count);
+        match self.submit_bio(bio.clone()) {
+            Ok(()) => Ok(bio),
+            Err(SystemError::ENOSYS) => {
+                log::debug!("BlockDevice submit_bio_read ENOSYS, falling back to sync read");
+                let mut buf = vec![0; count * LBA_SIZE];
+                self.read_at_sync(lba_start, count, &mut buf)?;
+                bio.write_buffer(&buf);
+                bio.complete(Ok(count * LBA_SIZE));
+                Ok(bio)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 提交异步写BIO（优先 submit_bio，不支持则同步回退）
+    fn submit_bio_write(
+        &self,
+        lba_start: BlockId,
+        count: usize,
+        data: &[u8],
+    ) -> Result<Arc<super::bio::BioRequest>, SystemError> {
+        let bio = super::bio::BioRequest::new_write(lba_start, count, data);
+        match self.submit_bio(bio.clone()) {
+            Ok(()) => Ok(bio),
+            Err(SystemError::ENOSYS) => {
+                self.write_at_sync(lba_start, count, data)?;
+                bio.complete(Ok(count * LBA_SIZE));
+                Ok(bio)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

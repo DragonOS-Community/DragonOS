@@ -5,7 +5,7 @@ This document was automatically translated by `hunyuan-turbos-latest` model, for
 
 - Source document: kernel/sched/wait_queue.md
 
-- Translation time: 2026-01-13 06:32:49
+- Translation time: 2026-01-13 12:52:37
 
 - Translation model: `hunyuan-turbos-latest`
 
@@ -17,14 +17,14 @@ Please report issues via [Community Channel](https://github.com/DragonOS-Communi
 
 ## 1. Overview
 
-The DragonOS WaitQueue is a process synchronization primitive based on the Waiter/Waker pattern, designed for process blocking and waking. Through atomic operations and a carefully designed wait-wake protocol, it completely solves the "wake loss" problem.
+The DragonOS WaitQueue is a process synchronization primitive based on the Waiter/Waker pattern, used for process blocking and waking. Through atomic operations and a carefully designed wait-wake protocol, it completely solves the "wake loss" problem.
 
 ### 1.1 Core Features
 
 - **Zero wake loss**: Ensures no wake signals are missed through the "register before check" mechanism
 - **Single-use Waiter/Waker**: Creates a pair of objects for each wait to avoid state reuse issues
-- **wait_until as core**: Builds on the `wait_until` API that returns resources as the foundation, with other APIs implemented upon it
-- **Atomic wait and acquire**: Supports atomically "waiting for condition and acquiring resource" (e.g., lock Guards)
+- **wait_until as core**: Uses the `wait_until` API that returns resources as the foundation, with other APIs built upon it
+- **Atomic wait and acquire**: Supports atomically "waiting for condition and acquiring resource" (e.g., lock Guard)
 - **Multi-core friendly**: Wakers can be shared across CPUs, supporting concurrent wakeups
 - **Signal awareness**: Supports both interruptible and uninterruptible wait modes
 
@@ -32,7 +32,7 @@ The DragonOS WaitQueue is a process synchronization primitive based on the Waite
 
 ### 2.1 Waiter/Waker Pattern
 
-The wait queue adopts a producer-consumer model, separating waiters and wakers:
+The wait queue adopts a producer-consumer pattern, separating waiters and wakers:
 
 ```rust
 pub struct Waiter {
@@ -41,15 +41,16 @@ pub struct Waiter {
 }
 
 pub struct Waker {
-    has_woken: AtomicBool,    // 唤醒标志
+    state: AtomicU8,          // 唤醒状态机
     target: Weak<PCB>,        // 目标进程
 }
 ```
 
 **Key Features**:
 - **Waiter**: Thread-local held (`!Send`/`!Sync`), can only wait on the thread that created it
-- **Waker**: Shared through `Arc`, can be passed and used to wake across CPUs/threads
-- **Single-use design**: Creates new Waiter/Waker pairs for each wait to prevent state pollution
+- **Waker**: Shared through `Arc`, can be passed and woken across CPUs/threads
+- **Single-use design**: Creates new Waiter/Waker pairs for each wait to avoid state pollution
+- **State machine handshake**: `Idle/Sleeping/Notified/Closed` four states ensure no wake loss during concurrent wakeups
 
 ### 2.2 Wait Queue Structure
 
@@ -66,16 +67,16 @@ struct InnerWaitQueue {
 ```
 
 **Design Highlights**:
-- **Fast path optimization**: The atomic counter `num_waiters` allows lock-free checking of whether the queue is empty
+- **Fast path optimization**: `num_waiters` atomic counter allows lock-free checking if queue is empty
 - **FIFO order**: Uses `VecDeque` to ensure fairness
-- **Death marker**: The `dead` flag is used for cleanup during resource destruction
-- **Spinlock protection**: Uses `SpinLock` rather than `Mutex` to avoid recursive dependencies
+- **Death marker**: `dead` flag for cleanup during resource destruction
+- **Spinlock protection**: Uses `SpinLock` instead of `Mutex`, avoiding recursive dependencies
 
 ## 3. Core API: wait_until Family
 
 ### 3.1 wait_until: Core Wait Primitive
 
-`wait_until` is the core of the entire wait queue mechanism, with all other wait methods built upon it:
+`wait_until` is the core of the wait queue mechanism, with all other wait methods built upon it:
 
 ```rust
 pub fn wait_until<F, R>(&self, cond: F) -> R
@@ -110,9 +111,9 @@ where
 
 **Key Design Concepts**:
 1. **Enqueue before check**: Ensures any wake between condition check and sleep is properly handled
-2. **Returns resource rather than boolean**: Returns `Option<R>` rather than `bool`, allowing direct return of acquired resources (e.g., lock Guards)
-3. **Loop retry**: May fail competition after being woken, requiring re-enqueueing and rechecking
-4. **Single Waiter/Waker pair**: Creates only one pair throughout the wait process, simplifying lifecycle management
+2. **Returns resource rather than boolean**: `Option<R>` rather than `bool`, allowing direct return of acquired resources (e.g., lock Guard)
+3. **Loop retry**: May fail competition after wakeup, requiring re-enqueue and recheck
+4. **Single Waiter/Waker pair**: Only creates one pair for entire wait process, simplifying lifecycle management
 
 ### 3.2 wait_until Variants
 
@@ -134,7 +135,11 @@ pub fn wait_until_timeout<F, R>(&self, cond: F, timeout: Duration)
 - `Err(ERESTARTSYS)`: Interrupted by signal
 - `Err(EAGAIN_OR_EWOULDBLOCK)`: Timeout
 
-### 3.3 Why wait_until is Superior to wait_event
+**Cancellation Semantics**:
+- Before returning due to timeout or signal interruption, `close` the corresponding `Waker` and recheck condition
+- This prevents wake loss due to interleaving of cancellation and concurrent wakeup
+
+### 3.3 Why wait_until is Better than wait_event
 
 Traditional `wait_event` series APIs only return a boolean:
 
@@ -152,7 +157,7 @@ let guard = wait_until(|| lock.try_acquire());  // ✅ 原子获取
 ```
 
 **Key Advantages**:
-- Eliminates the race window between "check and acquire"
+- Eliminates race window between "check and acquire"
 - More concise code with clearer semantics
 - Better performance (reduces one atomic operation)
 
@@ -219,19 +224,18 @@ let guard = wait_until(|| lock.try_acquire());  // ✅ 原子获取
 **Key Points Explained**:
 
 1. **Enqueue before check**:
-   - If checking before enqueuing, a wake could occur after the check returns false but before enqueueing
-   - The wake signal would be lost as the waker isn't yet enqueued
-   - Enqueuing first ensures any subsequent wake can find our waker
+   - If check before enqueue, wake signal may be lost if condition becomes true and wakeup occurs between false check return and enqueue
+   - Enqueue first ensures any subsequent wake can find our waker
 
 2. **Necessity of loop retry**:
-   - Being woken doesn't guarantee the condition is met (could be spurious wakeup)
-   - Even if the condition was met, competition might make it unmet again
-   - Thus requires re-enqueueing and rechecking
+   - Wakeup doesn't guarantee condition is met (could be spurious wakeup)
+   - Even if condition was met, it may become unmet again due to competition
+   - Thus need to re-enqueue and recheck
 
 3. **Advantages of single-use Waker**:
-   - Avoids complex state management
-   - Won't be woken again after being woken (`has_woken` flag)
-   - Will re-register new waker in loops but using the same `Arc<Waker>`
+   - Avoids complex lifecycle management
+   - Uses state machine to consume notifications (`Notified -> Idle`), preventing duplicate delivery
+   - Waker is re-registered in loop but uses same `Arc<Waker>`
 
 ### 4.2 Wake Flow
 
@@ -268,8 +272,8 @@ pub fn wake_one(&self) -> bool {
 
 **Design Points**:
 - **FIFO order**: Takes from queue head to ensure fairness
-- **Wake outside lock**: Calls `waker.wake()` after releasing lock to reduce lock contention
-- **Automatically skips invalid wakers**: If target process has exited, automatically tries next
+- **Wake outside lock**: Releases lock before calling `waker.wake()`, reducing lock contention
+- **Auto skip invalid waker**: If target process exited, automatically tries next
 
 #### wake_all: Wake All Waiters
 
@@ -301,7 +305,7 @@ pub fn wake_all(&self) -> usize {
 ```
 
 **Design Points**:
-- **Batch removal**: Clears queue at once to minimize lock holding time
+- **Batch take**: Clears queue at once, minimizing lock hold time
 - **Wake outside lock**: Wakes individually after releasing lock, allowing immediate competition
 - **Returns actual wake count**: Distinguishes between "wake request" and "actual wake"
 
@@ -310,33 +314,26 @@ pub fn wake_all(&self) -> usize {
 ```rust
 impl Waker {
     pub fn wake(&self) -> bool {
-        // 原子设置唤醒标志
-        if self.has_woken.swap(true, Ordering::Release) {
-            return false;  // 已被唤醒过
-        }
-
-        // 唤醒目标进程
-        if let Some(pcb) = self.target.upgrade() {
-            ProcessManager::wakeup(&pcb);
-        }
-        true
+        // 原子状态机：Sleep 时真正唤醒；Idle 时只记账通知
+        // Sleeping -> Notified: 触发 ProcessManager::wakeup
+        // Idle -> Notified: 记录提前唤醒
     }
 
     pub fn close(&self) {
         // 关闭 waker，防止后续唤醒
-        self.has_woken.store(true, Ordering::Acquire);
+        self.state.store(STATE_CLOSED, Ordering::Release);
     }
 
-    fn consume_wake(&self) -> bool {
-        // 消费唤醒标志（用于 block_current）
-        self.has_woken.swap(false, Ordering::Acquire)
+    fn consume_notification(&self) -> bool {
+        // 消费通知（用于 block_current），Notified -> Idle
+        ...
     }
 }
 ```
 
 **Key Features**:
-- **Atomic wake flag**: `has_woken` uses `AtomicBool` to ensure single wake
-- **Weak reference to target process**: Uses `Weak<PCB>` to avoid circular references, auto-cleaning when process exits
+- **Atomic state machine**: `state` manages `Idle/Sleeping/Notified/Closed`
+- **Weak reference to target process**: Uses `Weak<PCB>` to avoid circular references, auto-cleanup when process exits
 - **Memory ordering guarantees**: Release/Acquire semantics ensure modifications before wake are visible to woken process
 
 ### 4.4 Blocking Current Process
@@ -345,21 +342,29 @@ impl Waker {
 fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
     loop {
         // 快速路径：已被唤醒
-        if waiter.waker.consume_wake() {
+        if waiter.waker.consume_notification() {
             return Ok(());
         }
 
         // 禁用中断，进入临界区
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-        // 再次检查唤醒标志（处理"先唤后睡"竞态）
-        if waiter.waker.consume_wake() {
-            drop(irq_guard);
-            return Ok(());
+        // 进入睡眠握手（处理"先唤后睡"竞态）
+        match waiter.waker.prepare_sleep() {
+            WakerSleepState::Notified | WakerSleepState::Closed => {
+                drop(irq_guard);
+                return Ok(());
+            }
+            WakerSleepState::Sleeping => {}
         }
 
         // 标记进程为睡眠状态
         ProcessManager::mark_sleep(interruptible)?;
+        // 再次消费通知，避免 prepare_sleep 与 mark_sleep 的竞态
+        if waiter.waker.consume_notification() {
+            drop(irq_guard);
+            return Ok(());
+        }
         drop(irq_guard);  // 恢复中断
 
         // 调度到其他进程
@@ -374,21 +379,21 @@ fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError
 ```
 
 **Key Design**:
-- **Double check**: Checks wake flag before and after interrupt disable to prevent "wake then sleep"
+- **Handshake mechanism**: `prepare_sleep()` first transitions state to `Sleeping`, then consumes notification after `mark_sleep`
 - **Interrupt protection**: `mark_sleep` must be executed with interrupts disabled
-- **Signal check**: Checks for signals needing handling after being scheduled back
+- **Signal check**: After being scheduled back, checks for pending signals
 
 ## 5. Memory Ordering and Correctness
 
 ### 5.1 Memory Ordering Guarantees
 
-The wait queue uses the following memory ordering to ensure correctness:
+The wait queue uses following memory orderings to ensure correctness:
 
-| Operation | Memory Order | Purpose |
-|-----------|--------------|---------|
+| Operation | Memory Ordering | Purpose |
+|-----------|-----------------|---------|
 | `waker.wake()` | Release | Ensures modifications before wake are visible to woken |
 | `waiter.wait()` | Acquire | Ensures visibility of all modifications before wake |
-| `register_waker` | Release | Ensures visibility of enqueue operation |
+| `register_waker` | Release | Ensures visibility of enqueue operations |
 | `num_waiters` | Acquire/Release | Synchronizes counter modifications |
 
 ### 5.2 Happens-Before Relationships
@@ -411,12 +416,12 @@ wake() (Release)          register_waker()
 ```
 
 **Guarantees**:
-- All modifications by the waker before calling `wake()` are visible to the waiter
-- This is the foundation for correct synchronization
+- All modifications by waker before calling `wake()` are visible to waiter
+- This forms the basis for correct synchronization
 
 ### 5.3 Race-Free Proof
 
-**Case 1: Enqueue then wake (normal flow)**
+**Case 1: Enqueue before wake (normal flow)**
 ```
 时间轴：
 T1: 等待方 register_waker()
@@ -426,7 +431,7 @@ T4: 唤醒方 wake_one()          ← waker 在队列中，正常唤醒
 T5: 等待方被唤醒
 ```
 
-**Case 2: Wake then enqueue (race to handle)**
+**Case 2: Wake before enqueue (race to handle)**
 ```
 时间轴：
 T1: 等待方检查条件，返回 false
@@ -436,9 +441,9 @@ T4: 等待方 register_waker()
 T5: 等待方再次检查条件         ← 检测到 true，不会睡眠！
 ```
 
-**Key Point**: Through "check after enqueue", even if wake occurs before enqueue, the second check can detect the condition is already met.
+**Key Point**: Through "check after enqueue", even if wake occurs before enqueue, second check can detect condition is already met.
 
-## 6. Compatible APIs: wait_event Family
+## 6. Compatible API: wait_event Family
 
 For backward compatibility, provides `wait_event` series APIs implemented based on `wait_until`:
 
@@ -498,7 +503,7 @@ where
 ```
 
 **before_sleep Hook**:
-- Executed after enqueueing and before sleeping
+- Executed after enqueue and before sleep
 - Typical use: release locks to avoid sleeping while holding them
 - Example: `wait_event_interruptible(|| cond(), Some(|| drop(guard)))`
 
@@ -562,9 +567,9 @@ pub fn len(&self) -> usize {
 }
 ```
 
-## 8. Event Wait Queues
+## 8. Event Wait Queue
 
-In addition to regular wait queues, provides event mask-based wait queues:
+Besides regular wait queues, also provides event mask-based wait queues:
 
 ```rust
 pub struct EventWaitQueue {
@@ -610,8 +615,8 @@ where
 
 **Implementation Principle**:
 1. Calculate deadline: `deadline = now + timeout`
-2. Create timer to wake waiter upon expiration
-3. After wake, check for timeout:
+2. Create timer that wakes waiter upon expiration
+3. After wakeup, check if timeout occurred:
    - If timer triggered, return `EAGAIN_OR_EWOULDBLOCK`
    - If condition met, cancel timer and return result
 
@@ -633,7 +638,7 @@ impl TimerFunction for TimeoutWaker {
 
 **Key Design**:
 - Timer wakes through `Waker::wake()` rather than directly waking PCB
-- Allows `Waiter::wait()` to correctly observe wake status
+- This allows `Waiter::wait()` to correctly observe wake state
 - Uses same mechanism as normal wake for consistency
 
 ## 10. Usage Examples
@@ -674,7 +679,7 @@ impl Semaphore {
 **Advantages**:
 - Uses `wait_until` to ensure atomic "wait and acquire"
 - Avoids race window between "check and acquire"
-- Clean and clear code
+- Clean and concise code
 
 ### 10.2 Condition Variable Implementation
 
@@ -733,7 +738,7 @@ impl<T: ?Sized> RwSem<T> {
 
 **Why this design**:
 - `try_read()` returns `Option<Guard>`, perfectly matching `wait_until` requirements
-- One line implements complete "wait and acquire" logic
+- One line of code implements complete "wait and acquire" logic
 - Compiler ensures type safety, preventing forgotten checks
 
 ### 10.4 Timed Wait
@@ -753,14 +758,14 @@ fn wait_with_timeout(queue: &WaitQueue, timeout_ms: u64) -> Result<(), SystemErr
 ### 11.1 Fast Path Optimization
 
 - **No waiters**: `is_empty()` requires only one atomic read, no lock contention
-- **Quick check**: `wait_until` first checks condition to avoid unnecessary enqueueing
-- **Wake outside lock**: Wake operations occur after releasing queue lock to reduce lock holding time
+- **Quick check**: `wait_until` first checks condition to avoid unnecessary enqueue
+- **Wake outside lock**: Wake operations occur after releasing queue lock, reducing lock hold time
 
 ### 11.2 Scalability
 
 - **FIFO queue**: Ensures fairness, prevents starvation
-- **Batch wake**: `wake_all()` removes all wakers at once to minimize lock contention
-- **Cross-CPU wake**: Wakers can wake across CPUs without lock synchronization
+- **Batch wake**: `wake_all()` takes all wakers at once, minimizing lock contention
+- **Cross-CPU wake**: Wakers can wake across different CPUs without lock synchronization
 
 ### 11.3 Memory Overhead
 
@@ -775,11 +780,11 @@ fn wait_with_timeout(queue: &WaitQueue, timeout_ms: u64) -> Result<(), SystemErr
 | Feature | Traditional wait_event | DragonOS wait_until |
 |---------|------------------------|---------------------|
 | API Return | `bool` | `Option<R>` |
-| Atomic Acquire | Not supported (manual) | **Natively supported** |
+| Atomic Acquire | Not supported (manual) | **Native support** |
 | Wake Loss | Requires careful handling | **Design guarantees none** |
-| Race Window | Check-acquire window | **No window** |
+| Race Window | Check-acquire has window | **No window** |
 | Code Complexity | High (manual state management) | **Low (compiler guaranteed)** |
-| Performance | May require multiple atomic ops | **Minimizes atomic ops** |
+| Performance | May require multiple atomics | **Minimizes atomics** |
 
 ### 12.2 Design Evolution
 
@@ -839,8 +844,8 @@ let result = wait_queue.wait_event_interruptible(|| cond(), None)?;
 ### 13.3 Debugging Suggestions
 
 - Use `wait_queue.len()` to check waiter count
-- Monitor `has_woken` flag status (via logs)
-- Check for processes blocked long-term (possible wake logic errors)
+- Monitor `state` state machine changes (via logs)
+- Check for processes blocked for extended periods (possible wake logic errors)
 
 ## 14. Implementation Principle Summary
 
@@ -862,7 +867,7 @@ let result = wait_queue.wait_event_interruptible(|| cond(), None)?;
             ┌────────────────────┐  ┌────────────────────┐
             │      Waiter        │  │       Waker        │
             │  ┌──────────────┐  │  │  ┌──────────────┐  │
-            │  │ waker: Arc   │──┼──┼─→│ has_woken:   │  │
+            │  │ waker: Arc   │──┼──┼─→│ state:      │  │
             │  │              │  │  │  │  AtomicBool  │  │
             │  └──────────────┘  │  │  └──────────────┘  │
             │  ┌──────────────┐  │  │  ┌──────────────┐  │

@@ -1,7 +1,7 @@
 use crate::filesystem::vfs::file::File;
+use crate::libs::mutex::Mutex;
 use crate::libs::pod::Pod;
-use crate::libs::rwlock::RwLock;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::rwsem::RwSem;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -45,7 +45,7 @@ pub(super) struct StreamRecvmsgPlan {
 /// todo 在unix socket中使用的T是u8,后续应该改成抽象的包，而不是原始的u8数组，
 #[derive(Debug)]
 pub struct RingBuffer<T: Pod> {
-    buffer: RwLock<Vec<T>>,
+    buffer: RwSem<Vec<T>>,
     head: AtomicUsize,
     tail: AtomicUsize,
     /// Consumer has performed SHUT_RD (peer writes must fail with EPIPE).
@@ -66,7 +66,7 @@ pub struct RingBuffer<T: Pod> {
     ///
     /// When data is consumed via read/recv (not recvmsg), control messages are
     /// discarded as soon as any of their associated data is read.
-    scm_queue: SpinLock<VecDeque<ScmRecord>>,
+    scm_queue: Mutex<VecDeque<ScmRecord>>,
 }
 
 #[derive(Debug)]
@@ -96,13 +96,13 @@ impl<T: Pod> RingBuffer<T> {
         buffer.resize_with(capacity, T::new_zeroed);
 
         Self {
-            buffer: RwLock::new(buffer),
+            buffer: RwSem::new(buffer),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             recv_shutdown: AtomicBool::new(false),
             send_shutdown: AtomicBool::new(false),
             connreset_pending: AtomicBool::new(false),
-            scm_queue: SpinLock::new(VecDeque::new()),
+            scm_queue: Mutex::new(VecDeque::new()),
         }
     }
 

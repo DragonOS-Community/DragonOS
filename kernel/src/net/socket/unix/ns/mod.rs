@@ -1,4 +1,4 @@
-use crate::libs::rwlock::RwLock;
+use crate::libs::rwsem::RwSem;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::{collections::btree_map::Entry, format};
@@ -9,7 +9,7 @@ use system_error::SystemError;
 /// Linux scopes AF_UNIX abstract namespace addresses to the network namespace.
 #[derive(Debug)]
 pub struct UnixAbstractTable {
-    handles: RwLock<BTreeMap<Arc<[u8]>, Weak<AbstractHandle>>>,
+    handles: RwSem<BTreeMap<Arc<[u8]>, Weak<AbstractHandle>>>,
     nsid: usize,
 }
 
@@ -66,7 +66,7 @@ impl Ord for AbstractHandle {
 impl UnixAbstractTable {
     pub fn new(nsid: usize) -> Arc<Self> {
         Arc::new(Self {
-            handles: RwLock::new(BTreeMap::new()),
+            handles: RwSem::new(BTreeMap::new()),
             nsid,
         })
     }

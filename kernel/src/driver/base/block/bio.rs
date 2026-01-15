@@ -1,0 +1,165 @@
+use core::slice::SlicePattern;
+
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use system_error::SystemError;
+
+use crate::{libs::spinlock::SpinLock, sched::completion::Completion};
+
+use super::block_device::{BlockId, LBA_SIZE};
+
+/// BIO操作类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BioType {
+    Read,
+    Write,
+}
+
+/// BIO请求状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BioState {
+    Init,
+    Submitted,
+    Completed,
+    Failed,
+}
+
+/// 单个BIO请求
+pub struct BioRequest {
+    inner: SpinLock<InnerBioRequest>,
+}
+
+struct InnerBioRequest {
+    bio_type: BioType,
+    lba_start: BlockId,
+    count: usize,
+    buffer: Box<[u8]>, // 预分配缓冲区，todo: 引入页面整理之后，要加Pin来固定地址
+    state: BioState,
+    completion: Arc<Completion>,
+    result: Option<Result<usize, SystemError>>,
+    /// virtio-drivers返回的token，用于中断时匹配
+    token: Option<u16>,
+}
+
+impl BioRequest {
+    /// 创建一个读请求
+    pub fn new_read(lba_start: BlockId, count: usize) -> Arc<Self> {
+        let buffer = vec![0u8; count * LBA_SIZE].into_boxed_slice();
+        Arc::new(Self {
+            inner: SpinLock::new(InnerBioRequest {
+                bio_type: BioType::Read,
+                lba_start,
+                count,
+                buffer,
+                state: BioState::Init,
+                completion: Arc::new(Completion::new()),
+                result: None,
+                token: None,
+            }),
+        })
+    }
+
+    /// 创建一个写请求
+    pub fn new_write(lba_start: BlockId, count: usize, data: &[u8]) -> Arc<Self> {
+        let mut buffer = vec![0u8; count * LBA_SIZE].into_boxed_slice();
+        let copy_len = data.len().min(buffer.len());
+        buffer[..copy_len].copy_from_slice(&data[..copy_len]);
+
+        Arc::new(Self {
+            inner: SpinLock::new(InnerBioRequest {
+                bio_type: BioType::Write,
+                lba_start,
+                count,
+                buffer,
+                state: BioState::Init,
+                completion: Arc::new(Completion::new()),
+                result: None,
+                token: None,
+            }),
+        })
+    }
+
+    /// 标记为已提交，设置token
+    pub fn mark_submitted(&self, token: u16) -> Result<(), SystemError> {
+        let mut inner = self.inner.lock_irqsave();
+        if inner.state != BioState::Init {
+            return Err(SystemError::EINVAL);
+        }
+        inner.state = BioState::Submitted;
+        inner.token = Some(token);
+        Ok(())
+    }
+
+    /// 获取缓冲区的可变引用（仅用于提交时）
+    pub fn buffer_mut(&self) -> *mut [u8] {
+        let mut inner = self.inner.lock_irqsave();
+        inner.buffer.as_mut() as *mut [u8]
+    }
+
+    /// 获取缓冲区的不可变引用
+    pub fn buffer(&self) -> *const [u8] {
+        let inner = self.inner.lock_irqsave();
+        inner.buffer.as_slice() as *const [u8]
+    }
+
+    /// 将数据写入BIO缓冲区（用于同步回退路径）
+    pub fn write_buffer(&self, data: &[u8]) {
+        let mut inner = self.inner.lock_irqsave();
+        let copy_len = data.len().min(inner.buffer.len());
+        inner.buffer[..copy_len].copy_from_slice(&data[..copy_len]);
+    }
+
+    /// 获取BIO类型
+    pub fn bio_type(&self) -> BioType {
+        self.inner.lock_irqsave().bio_type
+    }
+
+    /// 获取起始LBA
+    pub fn lba_start(&self) -> BlockId {
+        self.inner.lock_irqsave().lba_start
+    }
+
+    /// 获取扇区数
+    pub fn count(&self) -> usize {
+        self.inner.lock_irqsave().count
+    }
+
+    /// 获取token
+    #[allow(dead_code)]
+    pub fn token(&self) -> Option<u16> {
+        self.inner.lock_irqsave().token
+    }
+
+    /// 完成BIO请求
+    pub fn complete(&self, result: Result<usize, SystemError>) {
+        let completion = {
+            let mut inner = self.inner.lock_irqsave();
+            if matches!(inner.state, BioState::Completed | BioState::Failed) {
+                return;
+            }
+            inner.state = if result.is_ok() {
+                BioState::Completed
+            } else {
+                BioState::Failed
+            };
+            inner.result = Some(result);
+            inner.completion.clone()
+        };
+        completion.complete();
+    }
+
+    /// 等待BIO完成并返回结果
+    pub fn wait(&self) -> Result<Vec<u8>, SystemError> {
+        let completion = self.inner.lock_irqsave().completion.clone();
+
+        // 等待完成
+        completion.wait_for_completion()?;
+
+        // 获取结果
+        let inner = self.inner.lock_irqsave();
+        match inner.result.as_ref() {
+            Some(Ok(_)) => Ok(inner.buffer.to_vec()),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err(SystemError::EIO),
+        }
+    }
+}

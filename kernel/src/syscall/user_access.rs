@@ -913,7 +913,7 @@ fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: boo
     // Calculate number of pages to check (rounded up)
     let pages = aligned_size / MMArch::PAGE_SIZE;
 
-    let guard = vm.read_irqsave();
+    let guard = vm.read();
     for i in 0..pages {
         let page_addr = aligned_addr + i * MMArch::PAGE_SIZE;
         let flags = match guard.user_mapper.utable.translate(VirtAddr::new(page_addr)) {
@@ -1032,7 +1032,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         None => return 0,
     };
 
-    let vma_read_guard = vm.read_irqsave();
+    let vma_read_guard = vm.read();
     let mappings = &vma_read_guard.mappings;
 
     let mut checked = 0usize;
@@ -1046,7 +1046,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
 
         // 获取地址所在 VMA 的起始地址 和结束地址，访问权限标志，后备的文件和当前VMA第一页映射到文件的哪一页
         let (region_start, region_end, vm_flags, vma_size, file, backing_page_offset) = {
-            let guard = vma.lock_irqsave();
+            let guard = vma.lock();
             let region_start = guard.region().start().data();
             let region_end = guard.region().end().data();
             let vm_flags = *guard.vm_flags();

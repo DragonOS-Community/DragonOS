@@ -172,12 +172,11 @@ impl ProcessManager {
         Self::switch_process_fpu(&prev, &next);
         Self::switch_local_context(&prev, &next);
 
-        // 切换地址空间
-        let next_addr_space = next.basic().user_vm().as_ref().unwrap().clone();
+        // 切换地址空间（无锁快速路径）
+        let next_addr_space = next.basic().user_vm().unwrap();
         compiler_fence(Ordering::SeqCst);
 
-        next_addr_space.read().user_mapper.utable.make_current();
-        drop(next_addr_space);
+        next_addr_space.make_current();
         compiler_fence(Ordering::SeqCst);
 
         // debug!("current sum={}, prev sum={}, next_sum={}", riscv::register::sstatus::read().sum(), prev.arch_info_irqsave().sstatus.sum(), next.arch_info_irqsave().sstatus.sum());

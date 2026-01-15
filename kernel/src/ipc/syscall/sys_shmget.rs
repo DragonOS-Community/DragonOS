@@ -45,9 +45,16 @@ pub(super) fn do_kernel_shmget(
             // 查找key对应的共享内存段是否存在
             let id = shm_manager_guard.contains_key(&key);
             if let Some(id) = id {
+                let id = *id;
                 // 不能重复创建
                 if shmflg.contains(ShmFlags::IPC_CREAT | ShmFlags::IPC_EXCL) {
                     return Err(SystemError::EEXIST);
+                }
+
+                if let Some(kernel_shm) = shm_manager_guard.get_mut(&id) {
+                    if size > kernel_shm.size() {
+                        return Err(SystemError::EINVAL);
+                    }
                 }
 
                 // key值存在，说明有对应共享内存，返回该共享内存id

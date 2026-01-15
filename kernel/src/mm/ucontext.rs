@@ -249,14 +249,16 @@ impl InnerAddressSpace {
                 continue;
             }
 
-            let vm_flags = vma_guard.vm_flags();
+            let vm_flags = *vma_guard.vm_flags();
             let is_shared = vm_flags.contains(VmFlags::VM_SHARED);
             let region = *vma_guard.region();
             let page_flags = vma_guard.flags();
+            let shm_id = vma_guard.shm_id;
 
             // 创建新的VMA
             let new_vma = LockedVMA::new(vma_guard.clone_info_only());
             new_guard.mappings.vmas.insert(new_vma.clone());
+            drop(vma_guard);
 
             // 根据VMA类型进行不同的页面复制策略
             let start_page = region.start();
@@ -311,7 +313,15 @@ impl InnerAddressSpace {
             }
             drop(page_manager_guard);
 
-            drop(vma_guard);
+            if let Some(shm_id) = shm_id {
+                let ipcns = ProcessManager::current_ipcns();
+                let mut shm_manager_guard = ipcns.shm.lock();
+                if let Some(kernel_shm) = shm_manager_guard.get_mut(&shm_id) {
+                    // Forked SHM mappings count as new attachments.
+                    kernel_shm.increase_count();
+                }
+            }
+
         }
 
         drop(new_guard);

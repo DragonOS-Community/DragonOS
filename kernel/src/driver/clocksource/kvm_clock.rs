@@ -297,6 +297,10 @@ impl KvmClock {
         let mut tsc_to_system_mul: u64;
         let mut tsc_shift: i32;
 
+        // Add a timeout to prevent infinite loops
+        let max_retries = 100000;
+        let mut retries = 0;
+
         loop {
             // Read the version
             unsafe {
@@ -323,12 +327,25 @@ impl KvmClock {
             }
 
             // Check if the version is odd (being updated) or changed
-            if version == last_version && version % 2 == 0 {
+            // Also check that version is non-zero (host has initialized the data)
+            if version == last_version && version % 2 == 0 && version != 0 {
                 break;
             }
 
             // If the version is odd or changed, the data was being updated
             // Try again
+            retries += 1;
+            if retries >= max_retries {
+                // Give up after too many retries
+                warn!("KVM clock: timeout waiting for stable version (version={})", version);
+                return 0;
+            }
+        }
+
+        // Version is still 0 - host hasn't initialized the clock yet
+        if version == 0 {
+            warn!("KVM clock: host not initialized (version=0)");
+            return 0;
         }
 
         // If tsc_to_system_mul is 0, the host hasn't initialized the clock yet

@@ -258,34 +258,59 @@ impl TSCManager {
     ///
     /// ## 原理
     ///
-    /// 1. 读取 TSC 的起始值
+    /// 1. 读取 TSC 的起始值和 KVM clock 时间
     /// 2. 等待一段时间（使用 KVM clock 测量）
     /// 3. 读取 TSC 的结束值
     /// 4. 计算 TSC 频率 = (TSC 差值 * 1000000000) / (时间差，纳秒) / 1000 = kHz
     fn calibrate_tsc_with_kvm_clock(_kvm_clk: &crate::driver::clocksource::kvm_clock::KvmClock) -> Result<u64, SystemError> {
         use crate::time::clocksource::Clocksource;
 
-        // 测量时间：5 毫秒（5000000 纳秒）
-        const MEASURE_NS: u64 = 5_000_000;
-        const MAX_LOOPS: u32 = 10_000_000; // 最大循环次数防止死循环
+        // 测量时间：50 毫秒（50000000 纳秒）
+        // 使用更长的测量时间以获得更准确的结果
+        const MEASURE_NS: u64 = 50_000_000;
+        const MAX_LOOPS: u32 = 100_000_000; // 最大循环次数防止死循环
+        const MAX_WAIT_NS: u64 = 500_000_000; // 最多等待 500ms
+
+        // 简单等待让 host 完成初始化（约 1ms）
+        debug!("KVM clock calibration: waiting for host to initialize...");
+        let wait_start = unsafe { core::arch::x86_64::_rdtsc() };
+        let wait_tsc_cycles = 2_400_000; // 约 1ms @ 2.4GHz
+        loop {
+            let current = unsafe { core::arch::x86_64::_rdtsc() };
+            if current.wrapping_sub(wait_start) > wait_tsc_cycles {
+                break;
+            }
+        }
 
         // 读取起始 TSC 和 KVM clock 时间
         let tsc_start = unsafe { core::arch::x86_64::_rdtsc() };
         let kvm_start_ns = _kvm_clk.read().data();
 
-        debug!("KVM clock calibration start: kvm_start_ns={}", kvm_start_ns);
+        debug!("KVM clock calibration start: kvm_start_ns={}, tsc_start={}", kvm_start_ns, tsc_start);
 
         // 等待测量时间
         let mut elapsed = 0u64;
         let mut loops = 0u32;
+        let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
 
         while elapsed < MEASURE_NS && loops < MAX_LOOPS {
             let kvm_current_ns = _kvm_clk.read().data();
             elapsed = kvm_current_ns.saturating_sub(kvm_start_ns);
             loops += 1;
 
-            // 每 1000000 次循环打印一次调试信息
-            if loops % 1_000_000 == 0 {
+            // 防止无限循环：如果 TSC 已经跑了很久但 KVM clock 没更新，报错
+            if loops % 100_000 == 0 {
+                let current_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+                let tsc_elapsed_ns = ((current_tsc.wrapping_sub(start_tsc) as u128) * 1000 / 2400) as u64;
+                if tsc_elapsed_ns > MAX_WAIT_NS && elapsed < MEASURE_NS / 10 {
+                    warn!("KVM clock calibration: TSC elapsed ~{}ns but KVM clock only advanced {}ns",
+                          tsc_elapsed_ns, elapsed);
+                    return Err(SystemError::ETIMEDOUT);
+                }
+            }
+
+            // 每 5000000 次循环打印一次调试信息
+            if loops % 5_000_000 == 0 {
                 debug!("KVM clock calibration: loops={}, elapsed={}ns", loops, elapsed);
             }
         }
@@ -306,6 +331,13 @@ impl TSCManager {
         debug!("KVM clock calibration: tsc_start={}, tsc_end={}, tsc_delta={}, time_delta_ns={}ns, loops={}",
                tsc_start, tsc_end, tsc_delta, time_delta_ns, loops);
 
+        // 检查测量时间的合理性
+        if time_delta_ns < MEASURE_NS / 10 {
+            warn!("KVM clock calibration: measurement time too short ({}ns vs expected {}ns), clock may not be updating properly",
+                  time_delta_ns, MEASURE_NS);
+            return Err(SystemError::EINVAL);
+        }
+
         // 避免除零
         if time_delta_ns == 0 || tsc_delta == 0 {
             warn!("Invalid calibration data: tsc_delta={}, time_delta_ns={}", tsc_delta, time_delta_ns);
@@ -315,14 +347,17 @@ impl TSCManager {
         // 计算 TSC 频率（kHz）
         // TSC 频率 = (TSC 差值 * 1000000000) / (时间差，纳秒) / 1000
         //          = (TSC 差值 * 1000000) / (时间差，纳秒)
-        let tsc_khz = (tsc_delta.saturating_mul(1_000_000) / time_delta_ns) as u64;
+        // 使用 u128 避免中间结果溢出
+        let tsc_khz = ((tsc_delta as u128) * 1_000_000 / (time_delta_ns as u128)) as u64;
 
-        // 检查结果是否合理（通常 CPU 频率在 100 MHz 到 10 GHz 之间）
-        if tsc_khz < 100_000 || tsc_khz > 10_000_000 {
+        // 检查结果是否合理（通常 CPU 频率在 100 MHz 到 15 GHz 之间）
+        if tsc_khz < 100_000 || tsc_khz > 15_000_000 {
             warn!(
-                "Unreasonable TSC frequency detected: {} kHz, measurement may be inaccurate",
-                tsc_khz
+                "Unreasonable TSC frequency detected: {} kHz ({} MHz), measurement may be inaccurate",
+                tsc_khz, tsc_khz / 1000
             );
+            warn!("  tsc_delta={}, time_delta_ns={}ns", tsc_delta, time_delta_ns);
+            return Err(SystemError::EINVAL);
         }
 
         info!("KVM clock calibration result: tsc_khz={}kHz ({}MHz)", tsc_khz, tsc_khz / 1000);

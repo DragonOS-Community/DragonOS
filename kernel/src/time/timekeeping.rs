@@ -1,12 +1,11 @@
 use alloc::sync::Arc;
 use core::intrinsics::{likely, unlikely};
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, info, warn};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::init::initcall::INITCALL_LATE;
-use crate::time::set_boot_time;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
@@ -407,10 +406,6 @@ pub fn timekeeping_init_later() -> Result<(), SystemError> {
     ) = (-timekeeper.xtime.tv_nsec, -timekeeper.xtime.tv_sec);
     drop(timekeeper);
 
-    let boot_sec = (rtc_ns / 1_000_000_000) as u64;
-    info!("Setting boot_time = {} seconds", boot_sec);
-    set_boot_time(boot_sec);
-
     info!("boot time set successfully");
     Ok(())
 }
@@ -419,7 +414,6 @@ pub fn timekeeping_init_later() -> Result<(), SystemError> {
 /// 参考：https://code.dragonos.org.cn/xref/linux-3.4.99/kernel/time/timekeeping.c#1041
 pub fn update_wall_time() {
     // debug!("enter update_wall_time, stack_use = {:}",stack_use);
-    compiler_fence(Ordering::SeqCst);
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     // 如果在休眠那就不更新
     if TIMEKEEPING_SUSPENDED.load(Ordering::SeqCst) {
@@ -474,9 +468,7 @@ pub fn update_wall_time() {
     // 更新时间的相关信息
     timekeeping_update(&mut tk);
 
-    compiler_fence(Ordering::SeqCst);
     drop(irq_guard);
-    compiler_fence(Ordering::SeqCst);
 }
 // TODO wall_to_monotic
 

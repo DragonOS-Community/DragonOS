@@ -2,10 +2,9 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::ipc::signal::SigSet;
 use crate::arch::syscall::nr::SYS_PPOLL;
 use crate::filesystem::poll::{
-    do_sys_poll, poll_select_finish, poll_select_set_timeout, PollFd, PollTimeType, RestartFnPoll,
+    do_sys_poll, poll_select_finish, poll_select_set_timeout, PollFd, PollTimeType,
 };
 use crate::ipc::signal::set_user_sigmask;
-use crate::ipc::signal::{RestartBlock, RestartBlockData};
 use crate::mm::VirtAddr;
 use crate::process::resource::RLimitID;
 use crate::process::ProcessManager;

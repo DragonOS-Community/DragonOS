@@ -1,6 +1,6 @@
 use crate::arch::ipc::signal::Signal;
 use crate::arch::syscall::nr::SYS_FALLOCATE;
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::{file::FileMode, FileType};
 use crate::ipc::kill::send_signal_to_pid;
 use crate::process::resource::RLimitID;
 use crate::{
@@ -35,7 +35,7 @@ use system_error::SystemError;
 /// 则会扩展文件大小。这与 posix_fallocate() 的行为类似。
 ///
 /// 当前仅支持 mode=0 的默认操作，其他模式 (如 FALLOC_FL_KEEP_SIZE,
-/// FALLOC_FL_PUNCH_HOLE 等) 暂不支持，会返回 EOPNOTSUPP。
+/// FALLOC_FL_PUNCH_HOLE 等) 暂不支持，会返回 EOPNOTSUPP_OR_ENOTSUP。
 pub struct SysFallocateHandle;
 
 impl Syscall for SysFallocateHandle {
@@ -73,9 +73,14 @@ impl Syscall for SysFallocateHandle {
                 return Err(SystemError::EINVAL);
             }
 
-            let new_size = offset.saturating_add(len);
+            let md = file.inode().metadata()?;
+            if md.file_type != FileType::File {
+                return Err(SystemError::EINVAL);
+            }
 
-            let current_size = file.inode().metadata()?.size as usize;
+            let new_size = offset.checked_add(len).ok_or(SystemError::EINVAL)?;
+
+            let current_size = md.size as usize;
             if new_size > current_size {
                 let current_pcb = ProcessManager::current_pcb();
                 let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);

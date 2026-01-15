@@ -321,17 +321,9 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 get_thread_group_leader(&current)
             };
             loop {
-                if kwo.options.contains(WaitOption::WNOHANG) {
-                    let rd_children = parent.children.read();
-                    if rd_children.is_empty() {
-                        break Err(SystemError::ECHILD);
-                    } else {
-                        break Ok(0);
-                    }
-                }
-
                 let mut scan_result: Option<Result<usize, SystemError>> = None;
                 let mut echild = false;
+                let mut has_eligible_child = false;
 
                 let wait_res = parent.wait_queue.wait_event_interruptible(
                     || {
@@ -358,6 +350,9 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             if !child_matches_wait_options(&pcb, kwo.options) {
                                 continue;
                             }
+
+                            // 找到了符合条件的子进程，标记为有可等待的子进程
+                            has_eligible_child = true;
 
                             let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                             let state = sched_guard.state();
@@ -473,6 +468,9 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     continue;
                                 }
 
+                                // 找到了符合条件的ptrace子进程，标记为有可等待的子进程
+                                has_eligible_child = true;
+
                                 let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                                 let state = sched_guard.state();
                                 if !state.is_exited() {
@@ -532,6 +530,11 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             echild = true;
                             return true;
                         }
+                        // 如果没有找到任何符合条件的子进程，返回ECHILD
+                        if !has_eligible_child {
+                            echild = true;
+                            return true;
+                        }
                         false
                     },
                     None::<fn()>,
@@ -544,6 +547,11 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         }
                         if echild {
                             break Err(SystemError::ECHILD);
+                        }
+                        // 如果设置了WNOHANG，且没有符合条件的子进程准备好，
+                        // 返回0表示"没有子进程准备好但存在可等待的子进程"
+                        if kwo.options.contains(WaitOption::WNOHANG) {
+                            break Ok(0);
                         }
                         if ProcessManager::current_pcb().has_pending_signal_fast() {
                             break Err(SystemError::ERESTARTSYS);

@@ -11,6 +11,7 @@ use crate::process::{
     PtraceSyscallInfoEntry, PtraceSyscallInfoExit, PtraceSyscallInfoOp, RawPid,
 };
 use crate::sched::{schedule, EnqueueFlag, SchedMode, WakeupFlags};
+use ::kprobe::ProbeArgs;
 use alloc::{sync::Arc, vec::Vec};
 use core::{intrinsics::unlikely, mem::MaybeUninit};
 use system_error::SystemError;
@@ -684,7 +685,9 @@ impl ProcessControlBlock {
             PtraceRequest::Syscall => self.flags().insert(ProcessFlags::TRACE_SYSCALL),
             PtraceRequest::Singlestep => {
                 self.flags().insert(ProcessFlags::TRACE_SINGLESTEP);
-                kprobe::setup_single_step(frame, frame.rip as usize); // 设置 TF 标志
+                // 使用架构无关的方式获取指令指针
+                let step_addr = frame.break_address();
+                kprobe::setup_single_step(frame, step_addr);
             }
             _ => {} // PTRACE_CONT 不需要特殊标志
         }

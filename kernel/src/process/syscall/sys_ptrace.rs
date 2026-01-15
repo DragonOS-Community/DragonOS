@@ -1,6 +1,6 @@
 use crate::{
     arch::{
-        interrupt::TrapFrame,
+        interrupt::{TrapFrame, UserRegsStruct},
         ipc::signal::Signal,
         syscall::nr::{SYS_EXIT, SYS_PTRACE},
         MMArch,
@@ -19,85 +19,6 @@ use crate::{
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
-/// Linux 兼容的用户寄存器结构体 (x86_64)
-/// 参考 /usr/include/x86_64-linux-gnu/sys/user.h
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct user_regs_struct {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub rbp: u64,
-    pub rbx: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub rax: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub orig_rax: u64,
-    pub rip: u64,
-    pub cs: u64,
-    pub eflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-    pub fs_base: u64,
-    pub gs_base: u64,
-    pub ds: u64,
-    pub es: u64,
-    pub fs: u64,
-    pub gs: u64,
-}
-
-/// 从 TrapFrame 和额外的寄存器信息构建 user_regs_struct
-impl user_regs_struct {
-    /// 从 TrapFrame 转换，需要提供 fs_base 和 gs_base
-    ///
-    /// # Safety
-    ///
-    /// 调用者必须确保 trap_frame 指向的内存有效
-    #[allow(dead_code)]
-    pub unsafe fn from_trap_frame_extra(
-        trap_frame: &TrapFrame,
-        fs_base: u64,
-        gs_base: u64,
-    ) -> Self {
-        Self {
-            r15: trap_frame.r15,
-            r14: trap_frame.r14,
-            r13: trap_frame.r13,
-            r12: trap_frame.r12,
-            rbp: trap_frame.rbp,
-            rbx: trap_frame.rbx,
-            r11: trap_frame.r11,
-            r10: trap_frame.r10,
-            r9: trap_frame.r9,
-            r8: trap_frame.r8,
-            rax: trap_frame.rax,
-            rcx: trap_frame.rcx,
-            rdx: trap_frame.rdx,
-            rsi: trap_frame.rsi,
-            rdi: trap_frame.rdi,
-            orig_rax: trap_frame.errcode, // syscall number
-            rip: trap_frame.rip,
-            cs: trap_frame.cs,
-            eflags: trap_frame.rflags,
-            rsp: trap_frame.rsp,
-            ss: trap_frame.ss,
-            fs_base,
-            gs_base,
-            ds: 0,
-            es: 0,
-            fs: 0,
-            gs: 0,
-        }
-    }
-}
 
 impl TryFrom<usize> for PtraceRequest {
     type Error = SystemError;
@@ -420,7 +341,6 @@ impl SysPtrace {
         // 获取 fs_base、gs_base 和段选择器
         // - fs_base/gs_base: task->thread.fsbase/gsbase
         // - fs/gs: task->thread.fsindex/gsindex
-        // - ds/es: task->thread.ds/es 或 pt_regs->ds/es
         let arch_info = tracee.arch_info_irqsave();
         let fs_base = arch_info.fsbase() as u64;
         let gs_base = arch_info.gsbase() as u64;
@@ -428,45 +348,13 @@ impl SysPtrace {
         let gs = arch_info.gs() as u64;
         drop(arch_info);
 
-        // TrapFrame 包含 ds 和 es（对应 pt_regs->ds/es）
-        let ds = trap_frame.ds as u64;
-        let es = trap_frame.es as u64;
-
-        // 构造用户态寄存器结构体
-        let user_regs = user_regs_struct {
-            r15: trap_frame.r15,
-            r14: trap_frame.r14,
-            r13: trap_frame.r13,
-            r12: trap_frame.r12,
-            rbp: trap_frame.rbp,
-            rbx: trap_frame.rbx,
-            r11: trap_frame.r11,
-            r10: trap_frame.r10,
-            r9: trap_frame.r9,
-            r8: trap_frame.r8,
-            rax: trap_frame.rax,
-            rcx: trap_frame.rcx,
-            rdx: trap_frame.rdx,
-            rsi: trap_frame.rsi,
-            rdi: trap_frame.rdi,
-            orig_rax: trap_frame.errcode, // syscall number
-            rip: trap_frame.rip,
-            cs: trap_frame.cs,
-            eflags: trap_frame.rflags,
-            rsp: trap_frame.rsp,
-            ss: trap_frame.ss,
-            fs_base,
-            gs_base,
-            ds,
-            es,
-            fs,
-            gs,
-        };
+        // 使用 UserRegsStruct::from_trap_frame 构造用户态寄存器结构体
+        let user_regs = UserRegsStruct::from_trap_frame(trap_frame, fs_base, gs_base, fs, gs);
 
         // 拷贝到用户空间
         let mut writer = UserBufferWriter::new(
             data as *mut u8,
-            core::mem::size_of::<user_regs_struct>(),
+            core::mem::size_of::<UserRegsStruct>(),
             true,
         )?;
         writer.copy_one_to_user(&user_regs, 0)?;

@@ -110,7 +110,11 @@ impl InnerPageCache {
             unsafe {
                 let dst = page_guard.as_slice_mut();
                 dst[..page_len].copy_from_slice(&buf[buf_offset..buf_offset + page_len]);
+                if page_len < MMArch::PAGE_SIZE {
+                    dst[page_len..].fill(0);
+                }
             }
+            page_guard.add_flags(PageFlags::PG_UPTODATE);
 
             self.add_page(start_page_index + i, &page);
         }
@@ -164,6 +168,7 @@ impl InnerPageCache {
             unsafe {
                 page_guard.as_slice_mut().fill(0);
             }
+            page_guard.add_flags(PageFlags::PG_UPTODATE);
 
             self.add_page(page_index, &page);
         }

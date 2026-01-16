@@ -21,7 +21,7 @@ use crate::{
     init::initcall::INITCALL_CORE,
     libs::{
         mutex::{Mutex, MutexGuard},
-        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemUpgradeableGuard, RwSemWriteGuard},
     },
     process::{ProcessControlBlock, ProcessManager},
     time::{sleep::nanosleep, PosixTimeSpec},
@@ -569,6 +569,10 @@ impl Page {
 
     pub fn read(&self) -> RwSemReadGuard<'_, InnerPage> {
         self.inner.read()
+    }
+
+    pub fn upread(&self) -> RwSemUpgradeableGuard<'_, InnerPage> {
+        self.inner.upread()
     }
 
     pub fn write(&self) -> RwSemWriteGuard<'_, InnerPage> {

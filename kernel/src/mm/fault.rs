@@ -569,7 +569,7 @@ impl PageFaultHandler {
         let vm_pgoff = (address.data() - vma_region.start().data()) >> MMArch::PAGE_SHIFT;
 
         // 缺页在PTE中的偏移量
-        let pte_pgoff = (address.data() >> MMArch::PAGE_SHIFT) & (1 << MMArch::PAGE_ENTRY_SHIFT);
+        let pte_pgoff = (address.data() >> MMArch::PAGE_SHIFT) & MMArch::PAGE_ENTRY_MASK;
 
         // 缺页在文件中的偏移量
         let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
@@ -602,12 +602,9 @@ impl PageFaultHandler {
         }
 
         let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
-        // from_pte - pte_pgoff得出预读起始pte相对缺失页的偏移，加上pfm.backing_pgoff（缺失页在文件中的偏移）得出起始页在文件中的偏移，结束pte同理
-        fs.map_pages(
-            pfm,
-            backing_pgoff + (from_pte - pte_pgoff),
-            backing_pgoff + (to_pte - pte_pgoff),
-        );
+        let start_pgoff = backing_pgoff - (pte_pgoff - from_pte);
+        let end_pgoff = backing_pgoff + (to_pte - pte_pgoff);
+        fs.map_pages(pfm, start_pgoff, end_pgoff);
 
         VmFaultReason::empty()
     }

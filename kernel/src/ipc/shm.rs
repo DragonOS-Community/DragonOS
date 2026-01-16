@@ -170,16 +170,15 @@ impl ShmManager {
 
         // 创建共享内存信息结构体
         let current_cred = ProcessManager::current_pcb().cred();
-        let kern_ipc_perm = KernIpcPerm {
-            id: shm_id,
+        let kern_ipc_perm = KernIpcPerm::new(
+            shm_id,
             key,
-            uid: current_cred.uid.data(),
-            gid: current_cred.gid.data(),
-            cuid: current_cred.uid.data(),
-            cgid: current_cred.gid.data(),
-            mode: shmflg & ShmFlags::PERM_MASK,
-            _seq: 0,
-        };
+            current_cred.uid.data(),
+            current_cred.gid.data(),
+            current_cred.uid.data(),
+            current_cred.gid.data(),
+            shmflg & ShmFlags::PERM_MASK,
+        );
         let shm_kernel = KernelShm::new(kern_ipc_perm, paddr, size);
 
         // 将key、id及其对应KernelShm添加到表中
@@ -497,7 +496,30 @@ pub struct KernIpcPerm {
     cgid: usize,
     /// 共享内存区权限模式
     mode: ShmFlags,
-    _seq: usize,
+    seq: usize,
+}
+
+impl KernIpcPerm {
+    pub fn new(
+        id: ShmId,
+        key: ShmKey,
+        uid: usize,
+        gid: usize,
+        cuid: usize,
+        cgid: usize,
+        mode: ShmFlags,
+    ) -> Self {
+        KernIpcPerm {
+            id,
+            key,
+            uid,
+            gid,
+            cuid,
+            cgid,
+            mode,
+            seq: 0,
+        }
+    }
 }
 
 /// 共享内存元信息，符合POSIX标准

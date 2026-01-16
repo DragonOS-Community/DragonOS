@@ -42,7 +42,7 @@ bitflags! {
 /// 管理共享内存段信息的操作码
 #[derive(Eq, Clone, Copy)]
 pub enum ShmCtlCmd {
-    /// 删除共享内存段
+    /// 标记删除共享内存段（只有在映射计数为0时才真正删除）
     IpcRmid = 0,
     /// 设置KernIpcPerm选项
     IpcSet = 1,
@@ -155,6 +155,13 @@ impl ShmManager {
         }
 
         let id = self.id_allocator.alloc().expect("No more id to allocate.");
+        // TODO: 实现 IPC 序列号机制以防止 ID 重用攻击
+        // 参考 Linux ipc_idr_alloc():
+        // - 跟踪 last_idx，检测 idx 回绕时递增 seq
+        // - 构建最终 ID: (seq << SEQ_SHIFT) | idx
+        // - 在获取对象时验证 seq (ipc_checkid)
+        //
+        // 具体实现方式见 (https://github.com/DragonOS-Community/DragonOS/issues/1678)
         let shm_id = ShmId::new(id);
 
         // 分配共享内存页面
@@ -168,7 +175,7 @@ impl ShmManager {
             page_count,
         )?;
 
-        // 创建共享内存信息结构体
+        // 创建共享内存段信息结构体
         let current_cred = ProcessManager::current_pcb().cred();
         let kern_ipc_perm = KernIpcPerm::new(
             shm_id,
@@ -181,9 +188,9 @@ impl ShmManager {
         );
         let shm_kernel = KernelShm::new(kern_ipc_perm, paddr, size);
 
-        // 将key、id及其对应KernelShm添加到表中
-        self.id2shm.insert(shm_id, shm_kernel);
+        // 更新共享内存管理器相关映射表
         self.key2id.insert(key, shm_id);
+        self.id2shm.insert(shm_id, shm_kernel);
 
         return Ok(shm_id.data());
     }
@@ -370,20 +377,20 @@ impl ShmManager {
         return Ok(0);
     }
 }
-/// 共享内存信息
+/// 共享内存段信息
 #[derive(Debug)]
 pub struct KernelShm {
     /// 权限信息
     kern_ipc_perm: KernIpcPerm,
-    /// 共享内存起始物理地址
+    /// 共享内存段起始物理地址
     shm_start_paddr: PhysAddr,
-    /// 共享内存大小(bytes)，注意是用户指定的大小（未经过页面对齐）
+    /// 共享内存段大小(bytes)，注意是用户指定的大小（未经过页面对齐）
     shm_size: usize,
     /// 映射计数
     map_count: usize,
-    /// 最后一次连接的时间
+    /// 最后一次 attach 的时间
     shm_atim: PosixTimeSpec,
-    /// 最后一次断开连接的时间
+    /// 最后一次 detach 的时间
     shm_dtim: PosixTimeSpec,
     /// 最后一次更改信息的时间
     shm_ctim: PosixTimeSpec,
@@ -417,18 +424,18 @@ impl KernelShm {
         self.shm_size
     }
 
-    /// 更新最后连接时间
+    /// 更新最后 attach 时间
     pub fn update_atim(&mut self) {
-        // 更新最后一次连接时间
+        // 更新最后一次 attach 时间
         self.shm_atim = PosixTimeSpec::now();
 
         // 更新最后操作当前共享内存的进程ID
         self.shm_lprid = ProcessManager::current_pid();
     }
 
-    /// 更新最后断开连接时间
+    /// 更新最后 detach 时间
     pub fn update_dtim(&mut self) {
-        // 更新最后一次断开连接时间
+        // 更新最后一次 detach 时间
         self.shm_dtim = PosixTimeSpec::now();
 
         // 更新最后操作当前共享内存的进程ID
@@ -479,23 +486,25 @@ impl KernelShm {
     }
 }
 
-/// 共享内存权限信息
+/// 共享内存段权限信息
 #[derive(Debug)]
 pub struct KernIpcPerm {
-    /// 共享内存id
+    /// 共享内存段id
     id: ShmId,
-    /// 共享内存键值，由创建共享内存用户指定
+    /// 共享内存段键值，由创建共享内存用户指定
     key: ShmKey,
-    /// 共享内存拥有者用户id
+    /// 共享内存段拥有者用户id
     uid: usize,
-    /// 共享内存拥有者所在组id
+    /// 共享内存段拥有者所在组id
     gid: usize,
-    /// 共享内存创建者用户id
+    /// 共享内存段创建者用户id
     cuid: usize,
-    /// 共享内存创建者所在组id
+    /// 共享内存段创建者所在组id
     cgid: usize,
-    /// 共享内存区权限模式
+    /// 共享内存段权限模式
     mode: ShmFlags,
+    /// 序列号：用于在 ShmId 被重用的时候进行区分
+    /// TODO: 目前尚未实现该机制，默认为0，具体实现方式见 (https://github.com/DragonOS-Community/DragonOS/issues/1678)
     seq: usize,
 }
 
@@ -613,11 +622,11 @@ impl PosixShmInfo {
 pub struct PosixShmIdDs {
     /// 共享内存段权限
     shm_perm: PosixIpcPerm,
-    /// 共享内存大小(bytes)
+    /// 共享内存段大小(bytes)
     shm_segsz: usize,
-    /// 最后一次连接的时间
+    /// 最后一次 attach 的时间
     shm_atime: i64,
-    /// 最后一次断开连接的时间
+    /// 最后一次 detach 的时间
     shm_dtime: i64,
     /// 最后一次更改信息的时间
     shm_ctime: i64,

@@ -161,7 +161,7 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn handle_normal_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let address = pfm.address_aligned_down();
-        let vma = pfm.vma.clone();
+        let vma = pfm.vma();
         let mapper = &mut pfm.mapper;
         if mapper.get_entry(address, 3).is_none() {
             mapper
@@ -199,10 +199,8 @@ impl PageFaultHandler {
         let flags = pfm.flags;
         let vma = pfm.vma.clone();
         let mut ret = VmFaultReason::VM_FAULT_COMPLETED;
-        let mapper = &pfm.mapper;
-
         // pte存在
-        if let Some(mut entry) = mapper.get_entry(address, 0) {
+        if let Some(mut entry) = pfm.mapper.get_entry(address, 0) {
             if !entry.present() {
                 ret = Self::do_swap_page(pfm);
             }
@@ -649,16 +647,19 @@ impl PageFaultHandler {
 
         for pgoff in start_pgoff..end_pgoff {
             if let Some(page) = page_cache.lock().get_page(pgoff) {
-                let page_guard = page.read();
+                let page_guard = page.upread();
                 if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
                     let phys = page.phys_address();
 
                     let address =
                         VirtAddr::new(addr.data() + ((pgoff - start_pgoff) << MMArch::PAGE_SHIFT));
-                    mapper
-                        .map_phys(address, phys, vma_guard.flags())
-                        .unwrap()
-                        .flush();
+                    if mapper.get_entry(address, 0).is_none() {
+                        mapper
+                            .map_phys(address, phys, vma_guard.flags())
+                            .unwrap()
+                            .flush();
+                    }
+                    page_guard.upgrade().insert_vma(vma.clone());
                 }
             }
         }

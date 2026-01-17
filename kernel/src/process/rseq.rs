@@ -381,24 +381,6 @@ impl RseqState {
         self.registration.as_ref()
     }
 
-    /// 获取当前 rseq_cs（从用户内存读取）
-    /// 用于 rseq_syscall_check：检查是否在 rseq 临界区内发起了系统调用
-    ///
-    /// # Safety
-    ///
-    /// 调用者必须确保用户内存有效
-    pub unsafe fn get_rseq_cs(&self) -> Option<(RseqCs, u32)> {
-        let reg = self.registration.as_ref()?;
-        let access = UserRseqAccess::new(reg.ptr);
-        let user_end = MMArch::USER_END_VADDR.data();
-
-        // 读取 rseq_cs，忽略签名验证（因为在 syscall 路径中我们已经注册过）
-        match access.read_rseq_cs(reg.sig, user_end) {
-            Ok(Some(cs)) => Some((cs, reg.sig)),
-            _ => None,
-        }
-    }
-
     /// 设置事件掩码（原子操作）
     #[inline]
     pub fn set_event(&self, event: RseqEventMask) {
@@ -712,22 +694,6 @@ impl Rseq {
             pcb.rseq_state().set_event(RseqEventMask::MIGRATE);
             pcb.flags().insert(ProcessFlags::NEED_RSEQ);
         }
-    }
-
-    /// 系统调用退出时的 rseq 检查
-    /// **注意**: Linux 的 rseq_syscall 仅在 CONFIG_DEBUG_RSEQ 启用时编译，
-    /// 用于调试目的，检测在 rseq 临界区内发起系统调用的违规行为。
-    ///
-    /// 在生产环境中，此函数应为空操作。rseq 的正确性依赖于：
-    /// 此函数目前为空操作，与 Linux 生产内核行为一致。
-    ///
-    /// # Safety
-    ///
-    /// 调用者必须保证 frame 指向有效的 TrapFrame
-    #[inline]
-    pub unsafe fn rseq_syscall_check<F: RseqTrapFrame>(_frame: &F) {
-        // 生产环境：空操作，与 Linux 生产内核一致
-        // 若需启用调试检查，应编译时启用 DEBUG_RSEQ 特性标志
     }
 }
 

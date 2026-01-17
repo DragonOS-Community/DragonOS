@@ -5,7 +5,10 @@ use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
 use crate::{
     arch::{
-        interrupt::{trap::X86PfErrorCode, TrapFrame},
+        interrupt::{
+            trap::{TrapNr, X86PfErrorCode},
+            TrapFrame,
+        },
         ipc::signal::Signal,
         mm::{MemoryManagementArch, X86_64MMArch},
         CurrentIrqArch, MMArch,
@@ -284,7 +287,7 @@ impl X86_64MMArch {
                 SigCode::Segv(SegvCode::MapErr),
                 SigType::SigFault(SigFaultInfo {
                     addr: address.data(),
-                    trapno: 14, // X86_TRAP_PF
+                    trapno: TrapNr::X86_TRAP_PF.bits() as i32,
                 }),
             );
             Signal::SIGSEGV
@@ -478,7 +481,7 @@ impl X86_64MMArch {
                 code,
                 SigType::SigFault(SigFaultInfo {
                     addr: address.data(),
-                    trapno: 14, // X86_TRAP_PF
+                    trapno: TrapNr::X86_TRAP_PF.bits() as i32,
                 }),
             );
             let _ = sig.send_signal_info(Some(&mut info), ProcessManager::current_pid());

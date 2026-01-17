@@ -65,8 +65,6 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame) {
 /// 由于此函数内可能会直接退出进程，在进入之前必须保证所有栈上的 Arc/Box 指针已被释放
 #[no_mangle]
 pub unsafe extern "C" fn syscall_exit_to_user_mode(frame: &mut TrapFrame) {
-    // 这一步必须在 flags 检查之外进行，因为它是一个独立的安全检查
-    Rseq::rseq_syscall_check(frame);
     // 系统调用直接调用统一循环
     exit_to_user_mode_loop(frame);
 }

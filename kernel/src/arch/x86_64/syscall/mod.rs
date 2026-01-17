@@ -8,7 +8,7 @@ use crate::{
     ipc::signal_types::{ChldCode, SignalArch},
     libs::align::SafeForZero,
     mm::VirtAddr,
-    process::{ProcessFlags, ProcessManager, PtraceStopReason},
+    process::{ptrace::PtraceStopReason, ProcessFlags, ProcessManager},
     syscall::Syscall,
 };
 use log::debug;
@@ -152,7 +152,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         // 在 syscall_exit_work() 中调用 ptrace_report_syscall_exit()
         if pcb.flags().contains(ProcessFlags::TRACE_SYSCALL) {
             // 设置停止原因
-            pcb.ptrace_state_mut().stop_reason = crate::process::PtraceStopReason::SyscallExit;
+            pcb.ptrace_state_mut().stop_reason = PtraceStopReason::SyscallExit;
 
             // 构造 syscall exit 的 exit_code: 0x80 | SIGTRAP
             let exit_code = 0x80 | Signal::SIGTRAP as usize;

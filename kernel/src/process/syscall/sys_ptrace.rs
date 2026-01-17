@@ -8,8 +8,9 @@ use crate::{
     ipc::signal_types::PosixSigInfo,
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
     process::{
-        syscall::sys_exit::SysExit, ProcessControlBlock, ProcessFlags, ProcessManager,
-        ProcessState, PtraceOptions, PtraceRequest, RawPid,
+        ptrace::{PtraceOptions, PtraceRequest},
+        syscall::sys_exit::SysExit,
+        ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
     },
     syscall::{
         table::{FormattedSyscallParam, Syscall},

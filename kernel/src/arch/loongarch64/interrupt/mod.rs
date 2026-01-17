@@ -1,6 +1,7 @@
 pub mod entry;
 mod handle;
 pub mod ipi;
+pub mod ptrace;
 
 use core::any::Any;
 
@@ -142,115 +143,4 @@ impl crate::process::rseq::RseqTrapFrame for TrapFrame {
     }
 }
 
-/// Linux 兼容的用户寄存器结构体 (LoongArch64)
-///
-/// 严格按照 Linux 6.6.21 的 `arch/loongarch/include/uapi/asm/ptrace.h` 中的
-///
-/// 该结构体用于 ptrace 系统调用向用户空间暴露寄存器信息。
-///
-/// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/loongarch/include/uapi/asm/ptrace.h#30
-#[repr(C, align(8))]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UserRegsStruct {
-    /// 主处理器寄存器 (r0-r31)
-    pub regs: [u64; 32],
-    /// 原始系统调用参数 a0
-    pub orig_a0: u64,
-    /// CSR ERA (Exception Return Address)
-    pub csr_era: u64,
-    /// CSR BADV (Bad Virtual Address)
-    pub csr_badv: u64,
-    /// 保留字段
-    pub reserved: [u64; 10],
-}
-
-impl UserRegsStruct {
-    /// 从 TrapFrame 创建 UserRegsStruct
-    ///
-    /// 这对应 Linux 中从 pt_regs 构建 user_pt_regs 的过程。
-    pub fn from_trap_frame(trap_frame: &TrapFrame) -> Self {
-        let mut regs = [0u64; 32];
-        // 按照 LoongArch 寄存器编号映射
-        regs[0] = trap_frame.r0 as u64;
-        regs[1] = trap_frame.ra as u64;
-        regs[2] = trap_frame.tp as u64;
-        regs[3] = trap_frame.usp as u64;
-        regs[4] = trap_frame.a0 as u64;
-        regs[5] = trap_frame.a1 as u64;
-        regs[6] = trap_frame.a2 as u64;
-        regs[7] = trap_frame.a3 as u64;
-        regs[8] = trap_frame.a4 as u64;
-        regs[9] = trap_frame.a5 as u64;
-        regs[10] = trap_frame.a6 as u64;
-        regs[11] = trap_frame.a7 as u64;
-        regs[12] = trap_frame.t0 as u64;
-        regs[13] = trap_frame.t1 as u64;
-        regs[14] = trap_frame.t2 as u64;
-        regs[15] = trap_frame.t3 as u64;
-        regs[16] = trap_frame.t4 as u64;
-        regs[17] = trap_frame.t5 as u64;
-        regs[18] = trap_frame.t6 as u64;
-        regs[19] = trap_frame.t7 as u64;
-        regs[20] = trap_frame.t8 as u64;
-        regs[21] = trap_frame.r21 as u64;
-        regs[22] = trap_frame.fp as u64;
-        regs[23] = trap_frame.s0 as u64;
-        regs[24] = trap_frame.s1 as u64;
-        regs[25] = trap_frame.s2 as u64;
-        regs[26] = trap_frame.s3 as u64;
-        regs[27] = trap_frame.s4 as u64;
-        regs[28] = trap_frame.s5 as u64;
-        regs[29] = trap_frame.s6 as u64;
-        regs[30] = trap_frame.s7 as u64;
-        regs[31] = trap_frame.s8 as u64;
-
-        Self {
-            regs,
-            orig_a0: trap_frame.orig_a0 as u64,
-            csr_era: trap_frame.csr_era as u64,
-            csr_badv: trap_frame.csr_badvaddr as u64,
-            reserved: [0; 10],
-        }
-    }
-
-    /// 将 UserRegsStruct 的值写回 TrapFrame
-    ///
-    /// 用于 PTRACE_SETREGS 操作，允许调试器修改被跟踪进程的寄存器。
-    pub fn write_to_trap_frame(&self, trap_frame: &mut TrapFrame) {
-        trap_frame.r0 = self.regs[0] as usize;
-        trap_frame.ra = self.regs[1] as usize;
-        trap_frame.tp = self.regs[2] as usize;
-        trap_frame.usp = self.regs[3] as usize;
-        trap_frame.a0 = self.regs[4] as usize;
-        trap_frame.a1 = self.regs[5] as usize;
-        trap_frame.a2 = self.regs[6] as usize;
-        trap_frame.a3 = self.regs[7] as usize;
-        trap_frame.a4 = self.regs[8] as usize;
-        trap_frame.a5 = self.regs[9] as usize;
-        trap_frame.a6 = self.regs[10] as usize;
-        trap_frame.a7 = self.regs[11] as usize;
-        trap_frame.t0 = self.regs[12] as usize;
-        trap_frame.t1 = self.regs[13] as usize;
-        trap_frame.t2 = self.regs[14] as usize;
-        trap_frame.t3 = self.regs[15] as usize;
-        trap_frame.t4 = self.regs[16] as usize;
-        trap_frame.t5 = self.regs[17] as usize;
-        trap_frame.t6 = self.regs[18] as usize;
-        trap_frame.t7 = self.regs[19] as usize;
-        trap_frame.t8 = self.regs[20] as usize;
-        trap_frame.r21 = self.regs[21] as usize;
-        trap_frame.fp = self.regs[22] as usize;
-        trap_frame.s0 = self.regs[23] as usize;
-        trap_frame.s1 = self.regs[24] as usize;
-        trap_frame.s2 = self.regs[25] as usize;
-        trap_frame.s3 = self.regs[26] as usize;
-        trap_frame.s4 = self.regs[27] as usize;
-        trap_frame.s5 = self.regs[28] as usize;
-        trap_frame.s6 = self.regs[29] as usize;
-        trap_frame.s7 = self.regs[30] as usize;
-        trap_frame.s8 = self.regs[31] as usize;
-        trap_frame.orig_a0 = self.orig_a0 as usize;
-        trap_frame.csr_era = self.csr_era as usize;
-        trap_frame.csr_badvaddr = self.csr_badv as usize;
-    }
-}
+pub use ptrace::UserRegsStruct;

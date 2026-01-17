@@ -9,7 +9,7 @@ use core::{
     hash::Hash,
     hint::spin_loop,
     intrinsics::unlikely,
-    mem::{ManuallyDrop, MaybeUninit},
+    mem::ManuallyDrop,
     str::FromStr,
     sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
@@ -57,7 +57,10 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    process::resource::{RLimit64, RLimitID},
+    process::{
+        ptrace::PtraceState,
+        resource::{RLimit64, RLimitID},
+    },
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
         cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
@@ -952,26 +955,6 @@ impl ProcessState {
     }
 }
 
-/// ptrace 系统调用的请求类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum PtraceRequest {
-    Traceme = 0,
-    Peekdata = 2,
-    Peekuser = 3,
-    Pokedata = 5,
-    Cont = 7,
-    Singlestep = 9,
-    Getregs = 12,
-    Setregs = 13,
-    Attach = 16,
-    Detach = 17,
-    Syscall = 24,
-    Setoptions = 0x4200,
-    Getsiginfo = 0x4202,
-    Seize = 0x4206, // 现代 API，不发送 SIGSTOP
-}
-
 bitflags! {
     /// pcb的标志位
     pub struct ProcessFlags: usize {
@@ -1086,166 +1069,6 @@ pub struct ProcessItimers {
     pub prof: CpuItimer,             // 用于 ITIMER_PROF
 }
 
-#[repr(u8)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum PtraceSyscallInfoOp {
-    None = 0,
-    Entry = 1,
-    Exit = 2,
-    #[allow(dead_code)]
-    Seccomp = 3,
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct PtraceSyscallInfoEntry {
-    pub nr: u64,
-    pub args: [u64; 6],
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct PtraceSyscallInfoExit {
-    pub rval: i64,
-    pub is_error: u8,
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct PtraceSyscallInfoSeccomp {
-    pub nr: u64,
-    pub args: [u64; 6],
-    pub ret_data: u32,
-}
-
-#[repr(C)]
-pub union PtraceSyscallInfoData {
-    pub entry: PtraceSyscallInfoEntry,
-    pub exit: PtraceSyscallInfoExit,
-    pub seccomp: PtraceSyscallInfoSeccomp,
-    _uninit: MaybeUninit<[u8; 64]>,
-}
-
-#[repr(C)]
-pub struct PtraceSyscallInfo {
-    /// PTRACE_SYSCALL_INFO_*
-    pub op: PtraceSyscallInfoOp,
-    pub pad: [u8; 3],
-    pub arch: u32,
-    pub instruction_pointer: u64,
-    pub stack_pointer: u64,
-    /// The union containing event-specific data.
-    pub data: PtraceSyscallInfoData,
-}
-
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
-pub enum PtraceStopReason {
-    #[default]
-    None,
-    SyscallEntry,
-    SyscallExit,
-    Signal(Signal),
-    Event(PtraceEvent),
-}
-
-/// ptrace 系统调用的事件类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PtraceEvent {
-    Fork = 1,
-    VFork,
-    Clone,
-    Exec,
-    VForkDone,
-    Exit,
-    Seccomp,
-    Stop = 128, // 信号或单步执行导致的停止
-}
-
-/// 进程被跟踪的状态信息
-#[derive(Debug)]
-pub struct PtraceState {
-    /// 跟踪此进程的进程PID
-    tracer: Option<RawPid>,
-    /// 挂起的信号（等待调试器处理）
-    pending_signals: Vec<Signal>,
-    /// 停止原因（公开，以便在 syscall_handler 中设置）
-    pub stop_reason: PtraceStopReason,
-    /// ptrace选项位
-    options: PtraceOptions,
-    /// 用于存储事件消息
-    event_message: usize,
-    /// tracer 注入的信号（在 ptrace_stop 返回后要处理的信号）
-    injected_signal: Signal,
-    /// 最后一次 ptrace 停止时的 siginfo（供 PTRACE_GETSIGINFO 读取）
-    last_siginfo: Option<crate::ipc::signal_types::SigInfo>,
-}
-
-impl Default for PtraceState {
-    fn default() -> Self {
-        Self {
-            tracer: None,
-            pending_signals: Vec::new(),
-            stop_reason: PtraceStopReason::None,
-            options: PtraceOptions::empty(),
-            event_message: 0,
-            injected_signal: Signal::INVALID,
-            last_siginfo: None,
-        }
-    }
-}
-impl PtraceState {
-    pub fn new() -> Self {
-        Self {
-            tracer: None,
-            pending_signals: Vec::new(),
-            stop_reason: PtraceStopReason::None,
-            options: PtraceOptions::empty(),
-            event_message: 0,
-            injected_signal: Signal::INVALID,
-            last_siginfo: None,
-        }
-    }
-
-    /// 获取停止状态的状态字
-    pub fn status_code(&self) -> usize {
-        // 根据信号和状态生成状态码
-        if let Some(signal) = self.pending_signals.first() {
-            (*signal as usize) << 8
-        } else {
-            0
-        }
-    }
-    /// 检查是否有挂起的信号
-    pub fn has_pending_signals(&self) -> bool {
-        !self.pending_signals.is_empty()
-    }
-    /// 添加挂起信号
-    pub fn add_pending_signal(&mut self, signal: Signal) {
-        self.pending_signals.push(signal);
-    }
-    /// 获取下一个挂起信号
-    pub fn next_pending_signal(&mut self) -> Option<Signal> {
-        if self.pending_signals.is_empty() {
-            None
-        } else {
-            Some(self.pending_signals.remove(0))
-        }
-    }
-
-    /// 获取 last_siginfo（供 PTRACE_GETSIGINFO 使用）
-    pub fn last_siginfo(&self) -> Option<crate::ipc::signal_types::SigInfo> {
-        self.last_siginfo
-    }
-
-    /// 设置 last_siginfo
-    pub fn set_last_siginfo(&mut self, info: crate::ipc::signal_types::SigInfo) {
-        self.last_siginfo = Some(info);
-    }
-
-    /// 清除 last_siginfo
-    pub fn clear_last_siginfo(&mut self) {
-        self.last_siginfo = None;
-    }
-}
-
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub struct SyscallInfo {
@@ -1253,20 +1076,6 @@ pub struct SyscallInfo {
     syscall_num: usize,
     args: [usize; 6],
     result: isize,
-}
-bitflags::bitflags! {
-    /// Ptrace选项（PTRACE_O_*）
-    #[derive(Default)]
-    pub struct PtraceOptions: usize {
-        const TRACESYSGOOD   = 1 << 0;
-        const TRACEFORK      = 1 << 1;
-        const TRACEVFORK     = 1 << 2;
-        const TRACECLONE     = 1 << 3;
-        const TRACEEXEC      = 1 << 4;
-        const TRACEVFORKDONE = 1 << 5;
-        const TRACEEXIT      = 1 << 6;
-        const TRACESECCOMP   = 1 << 7;
-    }
 }
 
 #[derive(Debug)]

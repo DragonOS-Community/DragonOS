@@ -3,9 +3,7 @@ use core::intrinsics::{likely, unlikely};
 use core::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, info, warn};
 use system_error::SystemError;
-use unified_init::macros::unified_init;
 
-use crate::init::initcall::INITCALL_LATE;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
@@ -375,8 +373,6 @@ pub fn timekeeping_init() {
     timekeeper.xtime.tv_nsec = ktime_get_real_ns();
 
     //参考https://elixir.bootlin.com/linux/v4.4/source/kernel/time/timekeeping.c#L1251 对wtm进行初始化
-    timekeeper.xtime.tv_nsec = 0;
-    timekeeper.xtime.tv_sec = 0;
     (
         timekeeper.wall_to_monotonic.tv_nsec,
         timekeeper.wall_to_monotonic.tv_sec,

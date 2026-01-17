@@ -578,3 +578,9 @@ pub trait TimeArch {
     /// 将CPU的时钟周期数转换为纳秒
     fn cycles2ns(cycles: usize) -> usize;
 }
+
+/// 获取系统运行时间（秒）
+pub fn uptime_secs() -> u64 {
+    // todo：以后需要改成高精度时钟源
+    crate::time::timer::clock() / crate::time::clocksource::HZ
+}

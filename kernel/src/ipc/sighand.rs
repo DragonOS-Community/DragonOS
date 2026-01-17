@@ -1,6 +1,6 @@
 use core::{fmt::Debug, sync::atomic::compiler_fence};
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -35,6 +35,8 @@ pub struct InnerSigHand {
     /// 线程组退出码（仿照 Linux 的 signal_struct::group_exit_code）
     /// 仅当 flags 中包含 GROUP_EXIT 时才有效
     pub group_exit_code: usize,
+    /// 线程组 exec（de-thread）当前执行者
+    pub group_exec_task: Option<Weak<ProcessControlBlock>>,
     pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
     /// 在 sighand 上维护的引用计数（与 Linux 一致的布局位置）
     pub cnt: i64,
@@ -180,6 +182,37 @@ impl SigHand {
         g.flags.remove(flag);
     }
 
+    /// 尝试开始线程组 exec（去线程化）流程。
+    ///
+    /// - 若已经有 GROUP_EXIT 或 GROUP_EXEC 在进行中，则返回 EAGAIN。
+    /// - 否则设置 GROUP_EXEC 并返回 Ok。
+    pub fn try_start_group_exec(&self) -> Result<(), SystemError> {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        g.flags.insert(SignalFlags::GROUP_EXEC);
+        Ok(())
+    }
+
+    /// 结束线程组 exec 状态。
+    pub fn finish_group_exec(&self) {
+        let mut g = self.inner_mut();
+        g.flags.remove(SignalFlags::GROUP_EXEC);
+        g.group_exec_task = None;
+    }
+
+    /// 记录当前 exec 线程（去线程化执行者）。
+    pub fn set_group_exec_task(&self, task: &Arc<ProcessControlBlock>) {
+        let mut g = self.inner_mut();
+        g.group_exec_task = Some(Arc::downgrade(task));
+    }
+
+    /// 获取当前 exec 线程（去线程化执行者）。
+    pub fn group_exec_task(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.inner().group_exec_task.as_ref()?.upgrade()
+    }
+
     /// 若当前线程组已经处于 group-exit 状态，则返回统一的退出码；否则返回 None
     pub fn group_exit_code_if_set(&self) -> Option<usize> {
         let g = self.inner();
@@ -232,6 +265,7 @@ impl Default for InnerSigHand {
             shared_pending: SigPending::default(),
             flags: SignalFlags::empty(),
             group_exit_code: 0,
+            group_exec_task: None,
             cnt: 0,
         }
     }

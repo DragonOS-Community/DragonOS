@@ -233,6 +233,31 @@ impl ProcessManager {
             .insert(pcb.raw_pid(), pcb.clone());
     }
 
+    pub(crate) fn exchange_raw_pids(
+        left: &Arc<ProcessControlBlock>,
+        right: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        let left_pid = left.raw_pid();
+        let right_pid = right.raw_pid();
+        if left_pid == right_pid {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut all_proc = all_process().lock_irqsave();
+        let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
+        let left_entry = map.remove(&left_pid).ok_or(SystemError::ESRCH)?;
+        let right_entry = map.remove(&right_pid).ok_or(SystemError::ESRCH)?;
+
+        unsafe {
+            left.force_set_raw_pid(right_pid);
+            right.force_set_raw_pid(left_pid);
+        }
+
+        map.insert(right_pid, left_entry);
+        map.insert(left_pid, right_entry);
+        Ok(())
+    }
+
     /// ### 获取所有进程的pid
     pub fn get_all_processes() -> Vec<RawPid> {
         let mut pids = Vec::new();
@@ -981,7 +1006,7 @@ pub struct ProcessItimers {
 #[derive(Debug)]
 pub struct ProcessControlBlock {
     /// 当前进程的pid
-    pid: RawPid,
+    pid: AtomicRawPid,
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
     tgid: RawPid,
 
@@ -1029,9 +1054,9 @@ pub struct ProcessControlBlock {
     dumpable: AtomicU8,
 
     /// 父进程指针
-    parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    pub(crate) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// 真实父进程指针
-    real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    pub(crate) real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
     children: RwLock<Vec<RawPid>>,
@@ -1160,7 +1185,7 @@ impl ProcessControlBlock {
             let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
             let pcb = Self {
-                pid: raw_pid,
+                pid: AtomicRawPid::new(raw_pid),
                 tgid: raw_pid,
                 thread_pid: RwLock::new(None),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
@@ -1500,7 +1525,7 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn raw_pid(&self) -> RawPid {
-        return self.pid;
+        return self.pid.load(Ordering::Acquire);
     }
 
     #[inline(always)]
@@ -2026,7 +2051,21 @@ impl ThreadInfo {
         let group_leader = self.group_leader();
         if let Some(leader) = group_leader {
             if Arc::ptr_eq(&leader, &ProcessManager::current_pcb()) {
-                return self.group_tasks.is_empty();
+                if self.group_tasks.is_empty() {
+                    return true;
+                }
+                // 仅当组内存在“存活线程”时才返回 false
+                for weak in &self.group_tasks {
+                    if let Some(task) = weak.upgrade() {
+                        if Arc::ptr_eq(&task, &ProcessManager::current_pcb()) {
+                            continue;
+                        }
+                        if !task.is_exited() && !task.is_dead() && !task.is_zombie() {
+                            return false;
+                        }
+                    }
+                }
+                return true;
             }
             return false;
         }

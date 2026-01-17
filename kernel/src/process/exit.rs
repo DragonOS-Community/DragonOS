@@ -187,7 +187,13 @@ fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) 
     // 获取子进程的 real_parent
     let child_parent = match child_pcb.real_parent_pcb() {
         Some(p) => p,
-        None => return false,
+        None => {
+            log::warn!(
+                "is_eligible_child: child {:?} has no real parent",
+                child_pcb.raw_pid()
+            );
+            return false;
+        }
     };
 
     if options.contains(WaitOption::WNOTHREAD) {
@@ -197,7 +203,18 @@ fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) 
     } else {
         // 默认情况：线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程
         // 检查子进程的 real_parent 的 tgid 是否与当前线程的 tgid 相同
-        child_parent.tgid == current_tgid
+        let res = child_parent.tgid == current_tgid;
+        if !res {
+            log::warn!(
+                "is_eligible_child failed: child={:?} child_parent={:?} (tgid={:?}) current={:?} (tgid={:?})",
+                child_pcb.raw_pid(),
+                child_parent.raw_pid(),
+                child_parent.tgid,
+                current.raw_pid(),
+                current_tgid
+            );
+        }
+        res
     }
 }
 

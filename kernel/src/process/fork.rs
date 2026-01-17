@@ -452,6 +452,18 @@ impl ProcessManager {
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
+        // exec 去线程化期间不允许创建新线程
+        if clone_flags.contains(CloneFlags::CLONE_THREAD)
+            && (current_pcb
+                .sighand()
+                .flags_contains(SignalFlags::GROUP_EXEC)
+                || current_pcb
+                    .sighand()
+                    .flags_contains(SignalFlags::GROUP_EXIT))
+        {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
         if (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS)
             == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
             || (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
@@ -659,7 +671,7 @@ impl ProcessManager {
             let ptr: *mut ProcessControlBlock =
                 pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
             unsafe {
-                (*ptr).tgid = pcb.pid;
+                (*ptr).tgid = pcb.raw_pid();
             }
         }
 
@@ -788,7 +800,7 @@ impl ProcessManager {
         // 注意：根据 Linux 语义，子进程应该被添加到 **线程组 leader** 的 children 列表中
         // 而不是创建它的线程的 children 列表中。这样线程组中的任何线程都可以 wait 这个子进程。
         // real_parent_pcb 存储实际创建子进程的线程，用于 __WNOTHREAD 选项的判断。
-        if pcb.raw_pid() > RawPid(1) {
+        if pcb.raw_pid() > RawPid(1) && !clone_flags.contains(CloneFlags::CLONE_THREAD) {
             // 获取线程组 leader
             let thread_group_leader = {
                 let ti = current_pcb.thread.read_irqsave();

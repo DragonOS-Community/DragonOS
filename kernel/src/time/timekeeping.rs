@@ -370,44 +370,22 @@ pub fn timekeeping_init() {
         .enable()
         .expect("clocksource_default_clock enable failed");
     timekeeper().timekeeper_setup_internals(clock);
-
-    // 暂时用 0 初始化，RTC 时间将在晚期初始化时设置
+    // 暂时不支持其他架构平台对时间的设置 所以使用x86平台对应值初始化
     let mut timekeeper = timekeeper().inner.write_irqsave();
+    timekeeper.xtime.tv_nsec = ktime_get_real_ns();
 
+    //参考https://elixir.bootlin.com/linux/v4.4/source/kernel/time/timekeeping.c#L1251 对wtm进行初始化
     timekeeper.xtime.tv_nsec = 0;
     timekeeper.xtime.tv_sec = 0;
     (
         timekeeper.wall_to_monotonic.tv_nsec,
         timekeeper.wall_to_monotonic.tv_sec,
-    ) = (0, 0);
+    ) = (-timekeeper.xtime.tv_nsec, -timekeeper.xtime.tv_sec);
 
     drop(irq_guard);
     drop(timekeeper);
     jiffies_init();
     info!("timekeeping_init successfully");
-}
-
-/// # timekeeping 晚期初始化（在 RTC driver 之后设置 boot_time）
-#[inline(never)]
-#[unified_init(INITCALL_LATE)]
-pub fn timekeeping_init_later() -> Result<(), SystemError> {
-    info!("Setting boot time from RTC...");
-
-    // 更新 timekeeper 的 xtime 为 RTC 时间
-    let mut timekeeper = timekeeper().inner.write_irqsave();
-
-    let rtc_ns = ktime_get_real_ns();
-
-    timekeeper.xtime.tv_sec = rtc_ns / 1_000_000_000;
-    timekeeper.xtime.tv_nsec = rtc_ns % 1_000_000_000;
-    (
-        timekeeper.wall_to_monotonic.tv_nsec,
-        timekeeper.wall_to_monotonic.tv_sec,
-    ) = (-timekeeper.xtime.tv_nsec, -timekeeper.xtime.tv_sec);
-    drop(timekeeper);
-
-    info!("boot time set successfully");
-    Ok(())
 }
 
 /// # 使用当前时钟源增加wall time

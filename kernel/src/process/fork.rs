@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::{intrinsics::unlikely, sync::atomic::Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::arch::MMArch;
 use crate::filesystem::vfs::file::File;
@@ -675,32 +675,36 @@ impl ProcessManager {
             }
         }
 
-        // CLONE_PARENT re-uses the old parent
-        if !((clone_flags & (CloneFlags::CLONE_PARENT | CloneFlags::CLONE_THREAD)).is_empty()) {
+        let current_leader = {
+            let ti = current_pcb.thread.read_irqsave();
+            ti.group_leader().unwrap_or_else(|| current_pcb.clone())
+        };
+
+        *pcb.fork_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+
+        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+            *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
             *pcb.real_parent_pcb.write_irqsave() =
                 current_pcb.real_parent_pcb.read_irqsave().clone();
-
-            if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-                pcb.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
-            } else {
-                let leader = current_pcb.thread.read_irqsave().group_leader();
-                if unlikely(leader.is_none()) {
-                    panic!(
-                        "fork: Failed to get leader of current process, current pid: [{:?}]",
-                        current_pcb.raw_pid()
-                    );
-                }
-
-                pcb.exit_signal.store(
-                    leader.unwrap().exit_signal.load(Ordering::SeqCst),
-                    Ordering::SeqCst,
-                );
-            }
+            pcb.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
         } else {
-            // 新创建的进程，设置其父进程为当前进程
-            *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+            if clone_flags.contains(CloneFlags::CLONE_PARENT) {
+                *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
+                *pcb.real_parent_pcb.write_irqsave() =
+                    current_pcb.real_parent_pcb.read_irqsave().clone();
+            } else {
+                *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+                *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+            }
             pcb.exit_signal
                 .store(clone_args.exit_signal, Ordering::SeqCst);
+
+            if let Some(parent) = pcb.parent_pcb() {
+                let ppid_in_child_ns = parent
+                    .task_pid_nr_ns(PidType::PID, Some(pcb.active_pid_ns()))
+                    .unwrap_or(RawPid::new(0));
+                pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
+            }
         }
 
         // 拷贝 pidfd
@@ -777,6 +781,12 @@ impl ProcessManager {
             pcb.attach_pid(PidType::PGID);
             pcb.attach_pid(PidType::SID);
         } else {
+            if current_pcb
+                .sighand()
+                .flags_contains(SignalFlags::GROUP_EXEC | SignalFlags::GROUP_EXIT)
+            {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
             pcb.task_join_group_stop();
             let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
             group_leader
@@ -799,15 +809,14 @@ impl ProcessManager {
         // 将当前pcb加入父进程的子进程哈希表中
         // 注意：根据 Linux 语义，子进程应该被添加到 **线程组 leader** 的 children 列表中
         // 而不是创建它的线程的 children 列表中。这样线程组中的任何线程都可以 wait 这个子进程。
-        // real_parent_pcb 存储实际创建子进程的线程，用于 __WNOTHREAD 选项的判断。
         if pcb.raw_pid() > RawPid(1) && !clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            // 获取线程组 leader
-            let thread_group_leader = {
-                let ti = current_pcb.thread.read_irqsave();
-                ti.group_leader().unwrap_or_else(|| current_pcb.clone())
+            let parent = pcb.parent_pcb().unwrap_or_else(|| current_leader.clone());
+            let parent_leader = {
+                let ti = parent.thread.read_irqsave();
+                ti.group_leader().unwrap_or_else(|| parent.clone())
             };
-            let mut children = thread_group_leader.children.write_irqsave();
-            let parent_ns = thread_group_leader.active_pid_ns();
+            let mut children = parent_leader.children.write_irqsave();
+            let parent_ns = parent_leader.active_pid_ns();
             let child_vpid = pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns));
             if let Some(vpid) = child_vpid {
                 if vpid.data() != 0 {
@@ -815,14 +824,14 @@ impl ProcessManager {
                 } else {
                     warn!(
                         "fork: child pid is 0 in parent pidns, parent pid={:?}, child pid={:?}",
-                        thread_group_leader.raw_pid(),
+                        parent_leader.raw_pid(),
                         pcb.raw_pid()
                     );
                 }
             } else {
                 warn!(
                     "fork: failed to resolve child pid in parent pidns, parent pid={:?}, child pid={:?}",
-                    thread_group_leader.raw_pid(),
+                    parent_leader.raw_pid(),
                     pcb.raw_pid()
                 );
             }

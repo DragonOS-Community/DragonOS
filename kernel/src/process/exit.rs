@@ -199,23 +199,25 @@ fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) 
     let current = ProcessManager::current_pcb();
     let current_tgid = current.tgid;
 
-    // 获取子进程的 real_parent
-    let child_parent = match child_pcb.real_parent_pcb() {
-        Some(p) => p,
-        None => {
-            log::warn!(
-                "is_eligible_child: child {:?} has no real parent",
-                child_pcb.raw_pid()
-            );
-            return false;
-        }
-    };
-
     if options.contains(WaitOption::WNOTHREAD) {
         // 带 __WNOTHREAD：只能等待当前线程自己创建的子进程
-        // 检查子进程的 real_parent 是否就是当前线程
-        Arc::ptr_eq(&child_parent, &current)
+        let fork_parent = match child_pcb.fork_parent_pcb() {
+            Some(p) => p,
+            None => return false,
+        };
+        Arc::ptr_eq(&fork_parent, &current)
     } else {
+        // 获取子进程的 real_parent
+        let child_parent = match child_pcb.real_parent_pcb() {
+            Some(p) => p,
+            None => {
+                log::warn!(
+                    "is_eligible_child: child {:?} has no real parent",
+                    child_pcb.raw_pid()
+                );
+                return false;
+            }
+        };
         // 默认情况：线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程
         // 检查子进程的 real_parent 的 tgid 是否与当前线程的 tgid 相同
         let res = child_parent.tgid == current_tgid;
@@ -772,6 +774,19 @@ fn do_waitpid(
 impl ProcessControlBlock {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#143
     pub(super) fn __exit_signal(&mut self) {
+        let sighand = self.sighand();
+        if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
+            let this = self.self_ref.upgrade();
+            let exec_task = sighand.group_exec_task();
+            let should_clear = exec_task
+                .as_ref()
+                .and_then(|t| this.as_ref().map(|me| Arc::ptr_eq(t, me)))
+                .unwrap_or(true);
+            if should_clear {
+                sighand.finish_group_exec();
+            }
+        }
+
         let group_dead = self.is_thread_group_leader();
         let mut sig_guard = self.sig_info_mut();
         let mut tty: Option<Arc<TtyCore>> = None;

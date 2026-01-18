@@ -38,7 +38,7 @@ use crate::{
         kill::send_signal_to_pcb,
         sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending},
+        signal_types::{SigInfo, SigPending, SignalFlags},
     },
     libs::{
         align::AlignedBox,
@@ -498,6 +498,23 @@ impl ProcessManager {
     #[inline(never)]
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
+        let sighand = current.sighand();
+        if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
+            let exec_task = sighand.group_exec_task();
+            if let Some(exec_task) = exec_task.as_ref() {
+                if !Arc::ptr_eq(exec_task, &current) {
+                    sighand.dec_group_exec_notify_count_and_wake();
+                    sighand.wake_group_exec_waiters();
+                }
+            }
+            let should_clear = exec_task
+                .as_ref()
+                .map(|t| Arc::ptr_eq(t, &current))
+                .unwrap_or(true);
+            if should_clear {
+                sighand.finish_group_exec();
+            }
+        }
         // 让INIT进程收养所有子进程
         if current.raw_pid() != RawPid(1) {
             unsafe {
@@ -1057,6 +1074,7 @@ pub struct ProcessControlBlock {
     pub(crate) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// 真实父进程指针
     pub(crate) real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    pub(crate) fork_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
     children: RwLock<Vec<RawPid>>,
@@ -1209,7 +1227,8 @@ impl ProcessControlBlock {
                 // 默认设置为 SUID_DUMP_USER(=1)，满足 gVisor 的 SetGetDumpability 预期。
                 dumpable: AtomicU8::new(1),
                 parent_pcb: RwLock::new(ppcb.clone()),
-                real_parent_pcb: RwLock::new(ppcb),
+                real_parent_pcb: RwLock::new(ppcb.clone()),
+                fork_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
                 wait_queue: WaitQueue::default(),
                 cputime_wait_queue: WaitQueue::default(),
@@ -1599,6 +1618,10 @@ impl ProcessControlBlock {
 
     pub fn real_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         return self.real_parent_pcb.read_irqsave().upgrade();
+    }
+
+    pub fn fork_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.fork_parent_pcb.read_irqsave().upgrade()
     }
 
     /// 判断当前进程是否是全局的init进程

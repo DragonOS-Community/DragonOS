@@ -5,7 +5,6 @@ use system_error::SystemError;
 
 use crate::process::Signal;
 
-use crate::sched::sched_yield;
 use crate::{
     driver::base::block::SeekFrom,
     filesystem::vfs::{fcntl::AtFlags, file::File, open::do_open_execat},
@@ -291,64 +290,69 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             Arc::ptr_eq(&leader, &current)
         );
 
-        // 先给除当前线程之外的所有线程发送 SIGKILL
-        if !Arc::ptr_eq(&leader, &current) && !leader.flags().contains(ProcessFlags::EXITING) {
-            let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, leader.clone(), PidType::PID);
+        let mut kill_list: Vec<Arc<ProcessControlBlock>> = Vec::new();
+        if !Arc::ptr_eq(&leader, &current)
+            && !leader.flags().contains(ProcessFlags::EXITING)
+            && !leader.is_exited()
+            && !leader.is_zombie()
+            && !leader.is_dead()
+        {
+            kill_list.push(leader.clone());
         }
-
-        let group_tasks = {
+        {
             let ti = leader.threads_read_irqsave();
-            ti.group_tasks.clone()
-        };
-        for weak in group_tasks {
-            if let Some(task) = weak.upgrade() {
-                if Arc::ptr_eq(&task, &current) {
-                    continue;
-                }
-                if task.flags().contains(ProcessFlags::EXITING) {
-                    continue;
-                }
-                let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
-            }
-        }
-
-        // 等待其他线程全部退出（且非 leader 线程需等待 leader 进入 zombie/不可运行态）
-        let mut spin = 0usize;
-        loop {
-            if Signal::fatal_signal_pending(&current) {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-
-            let mut siblings_alive = false;
-            let tasks_snapshot = {
-                let ti = leader.threads_read_irqsave();
-                ti.group_tasks.clone()
-            };
-            for weak in tasks_snapshot {
+            for weak in &ti.group_tasks {
                 if let Some(task) = weak.upgrade() {
                     if Arc::ptr_eq(&task, &current) {
                         continue;
                     }
-                    if !task.is_exited() && !task.is_dead() && !task.is_zombie() {
-                        siblings_alive = true;
-                        break;
+                    if task.flags().contains(ProcessFlags::EXITING)
+                        || task.is_exited()
+                        || task.is_zombie()
+                        || task.is_dead()
+                    {
+                        continue;
                     }
+                    kill_list.push(task);
                 }
             }
+        }
 
-            let leader_ready =
-                Arc::ptr_eq(&leader, &current) || leader.is_zombie() || leader.is_dead();
+        sighand.set_group_exec_notify_count(kill_list.len() as isize);
 
-            if !siblings_alive && leader_ready {
-                log::info!("de_thread: threads exited after {} spins", spin);
-                break;
-            }
+        for task in kill_list {
+            let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
+        }
 
-            if spin.is_multiple_of(1000) {
-                log::info!("de_thread: waiting... spin={}", spin);
-            }
-            spin = spin.saturating_add(1);
-            sched_yield();
+        let wait_res = sighand.wait_group_exec_event_killable(
+            || {
+                if Signal::fatal_signal_pending(&current) {
+                    return true;
+                }
+                let mut siblings_alive = false;
+                {
+                    let ti = leader.threads_read_irqsave();
+                    for weak in &ti.group_tasks {
+                        if let Some(task) = weak.upgrade() {
+                            if Arc::ptr_eq(&task, &current) {
+                                continue;
+                            }
+                            if !task.is_exited() && !task.is_dead() && !task.is_zombie() {
+                                siblings_alive = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let leader_ready =
+                    Arc::ptr_eq(&leader, &current) || leader.is_zombie() || leader.is_dead();
+                !siblings_alive && leader_ready
+            },
+            None::<fn()>,
+        );
+        if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
         // 非 leader exec：等待 leader 进入 zombie 后再交换 tid/raw_pid
@@ -396,6 +400,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             let leader_parent = leader.real_parent_pcb.read().clone();
             *current.parent_pcb.write() = leader_parent.clone();
             *current.real_parent_pcb.write() = leader_parent;
+            *current.fork_parent_pcb.write() = current.self_ref.clone();
 
             log::info!("de_thread: reparented current to old leader's parent");
 

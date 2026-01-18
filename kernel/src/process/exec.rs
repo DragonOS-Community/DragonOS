@@ -398,6 +398,15 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             *current.real_parent_pcb.write() = leader_parent;
 
             log::info!("de_thread: reparented current to old leader's parent");
+
+            // 旧 leader 应由 exec 线程回收，避免父进程在交换前/后提前回收
+            if leader.is_zombie() {
+                if leader.try_mark_dead_from_zombie() {
+                    unsafe { ProcessManager::release(leader.raw_pid()) };
+                }
+            } else if leader.is_dead() {
+                unsafe { ProcessManager::release(leader.raw_pid()) };
+            }
         } else {
             current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
         }

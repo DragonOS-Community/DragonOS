@@ -22,6 +22,21 @@ fn wstatus_to_waitid_status(raw_wstatus: i32) -> i32 {
     (raw_wstatus >> 8) & 0xff
 }
 
+/// mt-exec: de_thread 正在等待旧 leader 完成 PID/TID 交换时，禁止提前回收
+fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
+    if !child_pcb.is_thread_group_leader() {
+        return false;
+    }
+    if !child_pcb.sighand().flags_contains(SignalFlags::GROUP_EXEC) {
+        return false;
+    }
+    let exec_task = child_pcb.sighand().group_exec_task();
+    exec_task
+        .as_ref()
+        .map(|t| !Arc::ptr_eq(t, child_pcb))
+        .unwrap_or(true)
+}
+
 /// 检查子进程的 exit_signal 是否与等待选项匹配
 ///
 /// 根据 Linux wait 语义：
@@ -389,6 +404,10 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 drop(sched_guard);
                                 break;
                             } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
+                                if reap_blocked_by_group_exec(&pcb) {
+                                    drop(sched_guard);
+                                    continue;
+                                }
                                 let Some(code) = state.exit_code() else {
                                     drop(sched_guard);
                                     continue;
@@ -541,6 +560,10 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 drop(sched_guard);
                                 break;
                             } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
+                                if reap_blocked_by_group_exec(&pcb) {
+                                    drop(sched_guard);
+                                    continue;
+                                }
                                 let Some(code) = state.exit_code() else {
                                     drop(sched_guard);
                                     continue;
@@ -706,6 +729,9 @@ fn do_waitpid(
         }
         ProcessState::Exited(status) => {
             if !child_pcb.is_zombie() {
+                return None;
+            }
+            if reap_blocked_by_group_exec(&child_pcb) {
                 return None;
             }
             let pid = child_pcb.task_pid_vnr();

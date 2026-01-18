@@ -11,9 +11,9 @@
 本目录可被其他 Agent 工具的配置目录通过软链接引用，以达到共享资源的目的。
 例如将 `.agents/skills` 链接到外部 Agent 工具的技能目录中（示例命令，按实际路径调整）：
 ```
-ln -s /path/to/DragonOS-feat-agent/.agents/skills /path/to/other-agent/skills
+ln -s /path/to/DragonOS/.agents/skills /path/to/other-agent/skills
 ```
-
+    
 ## 目录结构示例
 ```
 .agents/

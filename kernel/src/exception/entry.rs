@@ -19,7 +19,7 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame) {
         let pcb = ProcessManager::current_pcb();
         let flags = *pcb.flags();
 
-        // 筛选出需要处理的标志位（信号、调度、RSEQ 等）
+        // 筛选出需要处理的标志位（调度、信号、RSEQ 等）
         let work = flags.exit_to_user_mode_work();
         if work.is_empty() {
             // 无工作，保持关中断返回

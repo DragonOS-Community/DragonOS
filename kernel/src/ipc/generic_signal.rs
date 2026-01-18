@@ -210,7 +210,22 @@ impl GenericSignal {
     }
 
     pub fn kernel_only(&self) -> bool {
-        matches!(self, Self::SIGKILL | Self::SIGSTOP)
+        crate::ipc::signal_types::SIG_KERNEL_ONLY_MASK.contains(self.into_sigset())
+    }
+
+    /// 判断信号的默认行为是否为忽略
+    pub fn kernel_ignore(&self) -> bool {
+        crate::ipc::signal_types::SIG_KERNEL_IGNORE_MASK.contains(self.into_sigset())
+    }
+
+    /// 判断信号的默认行为是否为停止进程
+    pub fn kernel_stop(&self) -> bool {
+        crate::ipc::signal_types::SIG_KERNEL_STOP_MASK.contains(self.into_sigset())
+    }
+
+    /// 判断信号的默认行为是否为 coredump
+    pub fn kernel_coredump(&self) -> bool {
+        crate::ipc::signal_types::SIG_KERNEL_COREDUMP_MASK.contains(self.into_sigset())
     }
 }
 

@@ -1,12 +1,12 @@
 .. note:: AI Translation Notice
 
-   This document was automatically translated by `Qwen/Qwen3-8B` model, for reference only.
+   This document was automatically translated by `hunyuan-turbos-latest` model, for reference only.
 
    - Source document: kernel/process_management/index.rst
 
-   - Translation time: 2025-05-19 01:41:09
+   - Translation time: 2026-01-19 06:01:03
 
-   - Translation model: `Qwen/Qwen3-8B`
+   - Translation model: `hunyuan-turbos-latest`
 
 
    Please report issues via `Community Channel <https://github.com/DragonOS-Community/DragonOS/issues>`_
@@ -19,3 +19,4 @@ Process Management Module
 
    kthread
    load_binary
+   de_thread

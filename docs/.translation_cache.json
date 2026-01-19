@@ -9,7 +9,7 @@
     "hash": "d8667f36cbfe9d9f532737a3fbe39f2d"
   },
   "en:kernel/process_management/index.rst": {
-    "hash": "b200476562e580ee97d8a3ffe19d5605"
+    "hash": "cbea45a3be872849398ff07a02fe3d57"
   },
   "en:kernel/libs/unified-init.md": {
     "hash": "28374260f0134386d53392156d749733"
@@ -370,5 +370,8 @@
   },
   "en:kernel/interrupt/tasklet.md": {
     "hash": "254da75179ebb9f39cd9b562486fb122"
+  },
+  "en:kernel/process_management/de_thread.md": {
+    "hash": "d5d9c9a4d491398ecc0a45118e4e92da"
   }
 }

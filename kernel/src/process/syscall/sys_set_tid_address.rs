@@ -26,7 +26,7 @@ impl Syscall for SysSetTidAddress {
 
         let pcb = ProcessManager::current_pcb();
         pcb.thread.write_irqsave().clear_child_tid = Some(VirtAddr::new(ptr));
-        Ok(pcb.pid.0)
+        Ok(pcb.task_pid_vnr().0)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

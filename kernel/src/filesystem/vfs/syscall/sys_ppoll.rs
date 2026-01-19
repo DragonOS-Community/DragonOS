@@ -175,9 +175,8 @@ pub fn do_ppoll(
             return Err(SystemError::EINVAL);
         }
 
-        // 计算超时时间（毫秒）
-        let timeout_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000;
-        timeout_ts = Some(poll_select_set_timeout(timeout_ms as u64).ok_or(SystemError::EINVAL)?);
+        let timeout_ms = ts.as_millis_saturating_u64();
+        timeout_ts = Some(poll_select_set_timeout(timeout_ms).ok_or(SystemError::EINVAL)?);
     }
 
     if let Some(mut sigmask) = sigmask {

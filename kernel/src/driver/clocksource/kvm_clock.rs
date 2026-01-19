@@ -26,6 +26,7 @@ use crate::{
 };
 
 use crate::arch::driver::tsc::TSCManager;
+use crate::process::preempt::PreemptGuard;
 use alloc::sync::Weak;
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +191,7 @@ fn write_system_time_msr(phys: PhysAddr) {
 }
 
 fn kvm_clock_read() -> Option<u64> {
+    let _guard = PreemptGuard::new();
     let pvti = this_cpu_pvti()?;
     Some(pvclock::pvclock_clocksource_read_nowd(pvti))
 }

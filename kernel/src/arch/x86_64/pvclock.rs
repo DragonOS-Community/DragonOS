@@ -1,5 +1,4 @@
 use core::sync::atomic::{fence, AtomicU64, AtomicU8, Ordering};
-
 use x86::time::rdtsc;
 
 pub const PVCLOCK_TSC_STABLE_BIT: u8 = 1 << 0;
@@ -90,13 +89,18 @@ pub fn pvclock_read_cycles(src: &PvclockVcpuTimeInfo, tsc: u64) -> u64 {
     system_time.wrapping_add(offset)
 }
 
+fn rdtsc_ordered() -> u64 {
+    fence(Ordering::SeqCst);
+    unsafe { rdtsc() }
+}
+
 pub fn pvclock_clocksource_read_nowd(src: &PvclockVcpuTimeInfo) -> u64 {
     let mut ret;
     let mut flags;
 
     loop {
         let version = pvclock_read_begin(src);
-        ret = pvclock_read_cycles(src, unsafe { rdtsc() });
+        ret = pvclock_read_cycles(src, rdtsc_ordered());
         flags = unsafe { core::ptr::read_volatile(&src.flags as *const u8) };
         if !pvclock_read_retry(src, version) {
             break;

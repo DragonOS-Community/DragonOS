@@ -19,7 +19,10 @@ use crate::{
     process::{
         pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
-    time::{syscall::PosixClockID, timekeeping::getnstimeofday, Instant, PosixTimeSpec},
+    time::{
+        sleep::nanosleep, syscall::PosixClockID, timekeeping::getnstimeofday, Instant,
+        PosixTimeSpec,
+    },
 };
 
 /// Send a kernel-originated signal to the current task.
@@ -929,29 +932,101 @@ pub struct PollRestartBlockData {
     pub timeout_instant: Option<Instant>,
 }
 
+fn ktime_now(clockid: PosixClockID) -> PosixTimeSpec {
+    match clockid {
+        PosixClockID::Realtime => getnstimeofday(),
+        PosixClockID::Monotonic | PosixClockID::Boottime => getnstimeofday(),
+        PosixClockID::ProcessCPUTimeID => {
+            let pcb = ProcessManager::current_pcb();
+            PosixTimeSpec::from_ns(pcb.process_cputime_ns())
+        }
+        PosixClockID::ThreadCPUTimeID => {
+            let pcb = ProcessManager::current_pcb();
+            PosixTimeSpec::from_ns(pcb.thread_cputime_ns())
+        }
+        _ => getnstimeofday(),
+    }
+}
+
+fn calc_remaining(deadline: &PosixTimeSpec, now: &PosixTimeSpec) -> PosixTimeSpec {
+    let mut sec = deadline.tv_sec - now.tv_sec;
+    let mut nsec = deadline.tv_nsec - now.tv_nsec;
+    if nsec < 0 {
+        sec -= 1;
+        nsec += 1_000_000_000;
+    }
+    if sec < 0 {
+        return PosixTimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+    }
+    PosixTimeSpec {
+        tv_sec: sec,
+        tv_nsec: nsec,
+    }
+}
+
 /// Nanosleep 的重启函数：根据保存的 deadline/clockid 继续等待或重启
 #[derive(Debug)]
 pub struct RestartFnNanosleep;
 
 impl RestartFn for RestartFnNanosleep {
     fn call(&self, data: &mut RestartBlockData) -> Result<usize, SystemError> {
-        fn ktime_now(_clockid: PosixClockID) -> PosixTimeSpec {
-            // 暂时使用 realtime 近似；后续区分 monotonic/boottime
-            getnstimeofday()
-        }
-
         if let RestartBlockData::Nanosleep { deadline, clockid } = data {
-            let now = ktime_now(*clockid);
-            let mut sec = deadline.tv_sec - now.tv_sec;
-            let mut nsec = deadline.tv_nsec - now.tv_nsec;
-            if nsec < 0 {
-                sec -= 1;
-                nsec += 1_000_000_000;
+            if deadline.tv_sec < 0 {
+                return Err(SystemError::EINVAL);
             }
-            if sec < 0 || (sec == 0 && nsec == 0) {
-                return Ok(0);
+            let deadline_ns = (deadline.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(deadline.tv_nsec as u64);
+            let wait_res = match *clockid {
+                PosixClockID::ProcessCPUTimeID => {
+                    let current = ProcessManager::current_pcb();
+                    let leader = if current.is_thread_group_leader() {
+                        current
+                    } else {
+                        current
+                            .threads_read_irqsave()
+                            .group_leader()
+                            .unwrap_or_else(ProcessManager::current_pcb)
+                    };
+                    if leader.process_cputime_ns() >= deadline_ns {
+                        Ok(())
+                    } else {
+                        leader.cputime_wait_queue().wait_event_interruptible(
+                            || leader.process_cputime_ns() >= deadline_ns,
+                            None::<fn()>,
+                        )
+                    }
+                }
+                PosixClockID::ThreadCPUTimeID => {
+                    let pcb = ProcessManager::current_pcb();
+                    if pcb.thread_cputime_ns() >= deadline_ns {
+                        Ok(())
+                    } else {
+                        pcb.cputime_wait_queue().wait_event_interruptible(
+                            || pcb.thread_cputime_ns() >= deadline_ns,
+                            None::<fn()>,
+                        )
+                    }
+                }
+                _ => {
+                    let now = ktime_now(*clockid);
+                    let remain = calc_remaining(deadline, &now);
+                    if remain.tv_sec == 0 && remain.tv_nsec == 0 {
+                        Ok(())
+                    } else {
+                        nanosleep(remain).map(|_| ())
+                    }
+                }
+            };
+
+            match wait_res {
+                Ok(()) => return Ok(0),
+                Err(SystemError::ERESTARTSYS) => {}
+                Err(e) => return Err(e),
             }
-            // 仍未到期：设置重启块并返回 -ERESTART_RESTARTBLOCK
             let rb = RestartBlock::new(&RestartFnNanosleep, data.clone());
             return crate::process::ProcessManager::current_pcb().set_restart_fn(Some(rb));
         }

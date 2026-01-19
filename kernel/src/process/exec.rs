@@ -319,6 +319,10 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
         sighand.set_group_exec_notify_count(kill_list.len() as isize);
 
+        for task in kill_list.iter() {
+            task.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
+        }
+
         for task in kill_list {
             let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
         }

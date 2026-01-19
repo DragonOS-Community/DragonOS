@@ -119,23 +119,20 @@ impl<'a> ReadaheadControl<'a> {
 
         let ranges = merge_ranges(&missing_pages);
         let mut total_read = 0;
+        let file_size = self.inode.metadata()?.size.max(0) as usize;
+        if file_size == 0 {
+            return Ok(0);
+        }
 
         for (page_index, count) in ranges {
-            let mut page_buf = alloc::vec![0u8; MMArch::PAGE_SIZE * count];
-            let offset = page_index << MMArch::PAGE_SHIFT;
-            let read_len = self.inode.read_sync(offset, &mut page_buf)?;
-
-            if read_len == 0 {
+            let start_offset = page_index * MMArch::PAGE_SIZE;
+            let end_offset = core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, file_size);
+            if end_offset <= start_offset {
                 continue;
             }
-
-            page_buf.truncate(read_len);
-            let actual_page_count = (read_len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
-
-            let mut page_cache_guard = page_cache.lock();
-            page_cache_guard.create_pages(page_index, &page_buf)?;
-            drop(page_cache_guard);
-
+            let actual_page_count =
+                (end_offset - start_offset + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
+            page_cache.read_pages(page_index, actual_page_count)?;
             total_read += actual_page_count;
         }
 

@@ -25,12 +25,61 @@ use crate::{
 use crate::{libs::align::page_align_up, mm::page::PageType};
 
 static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
+
+pub trait PageCacheBackend: Send + Sync + core::fmt::Debug {
+    fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError>;
+    fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError>;
+    fn npages(&self) -> usize;
+}
+
+#[derive(Debug)]
+pub struct SyncPageCacheBackend {
+    inode: Weak<dyn IndexNode>,
+}
+
+impl SyncPageCacheBackend {
+    pub fn new(inode: Weak<dyn IndexNode>) -> Self {
+        Self { inode }
+    }
+}
+
+impl PageCacheBackend for SyncPageCacheBackend {
+    fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let inode = self.inode.upgrade().ok_or(SystemError::EIO)?;
+        inode.read_sync(index * MMArch::PAGE_SIZE, buf)
+    }
+
+    fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let inode = self.inode.upgrade().ok_or(SystemError::EIO)?;
+        inode.write_sync(index * MMArch::PAGE_SIZE, buf)
+    }
+
+    fn npages(&self) -> usize {
+        let inode = match self.inode.upgrade() {
+            Some(inode) => inode,
+            None => return 0,
+        };
+        match inode.metadata() {
+            Ok(metadata) => {
+                let size = metadata.size.max(0) as usize;
+                if size == 0 {
+                    0
+                } else {
+                    (size + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+}
+
 /// 页面缓存
 #[derive(Debug)]
 pub struct PageCache {
     id: usize,
     inner: Mutex<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
+    backend: Lazy<Arc<dyn PageCacheBackend>>,
     unevictable: AtomicBool,
 }
 
@@ -119,6 +168,48 @@ impl InnerPageCache {
             self.add_page(start_page_index + i, &page);
         }
 
+        Ok(())
+    }
+
+    fn read_pages_from_backend(
+        &mut self,
+        start_page_index: usize,
+        page_num: usize,
+    ) -> Result<(), SystemError> {
+        if page_num == 0 {
+            return Ok(());
+        }
+
+        let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * page_num];
+
+        let backend = self
+            .page_cache_ref
+            .upgrade()
+            .and_then(|page_cache| page_cache.backend());
+
+        if let Some(backend) = backend {
+            for i in 0..page_num {
+                let buf_offset = i * MMArch::PAGE_SIZE;
+                let read_len = backend.read_page(
+                    start_page_index + i,
+                    &mut page_buf[buf_offset..buf_offset + MMArch::PAGE_SIZE],
+                )?;
+                if read_len < MMArch::PAGE_SIZE {
+                    page_buf[buf_offset + read_len..buf_offset + MMArch::PAGE_SIZE].fill(0);
+                }
+            }
+        } else {
+            let inode: Arc<dyn IndexNode> = self
+                .page_cache_ref
+                .upgrade()
+                .unwrap()
+                .inode
+                .upgrade()
+                .unwrap();
+            inode.read_sync(start_page_index * MMArch::PAGE_SIZE, page_buf.as_mut())?;
+        }
+
+        self.create_pages(start_page_index, page_buf.as_mut())?;
         Ok(())
     }
 
@@ -257,12 +348,7 @@ impl InnerPageCache {
         }
 
         for (page_index, count) in not_exist {
-            // TODO 这里使用buffer避免多次读取磁盘，将来引入异步IO直接写入页面，减少内存开销和拷贝
-            let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
-
-            inode.read_sync(page_index * MMArch::PAGE_SIZE, page_buf.as_mut())?;
-
-            self.create_pages(page_index, page_buf.as_mut())?;
+            self.read_pages_from_backend(page_index, count)?;
 
             // 实际要拷贝的内容在文件中的偏移量
             let copy_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
@@ -460,7 +546,10 @@ impl Drop for InnerPageCache {
 }
 
 impl PageCache {
-    pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
+    pub fn new(
+        inode: Option<Weak<dyn IndexNode>>,
+        backend: Option<Arc<dyn PageCacheBackend>>,
+    ) -> Arc<PageCache> {
         let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
         Arc::new_cyclic(|weak| Self {
             id,
@@ -469,6 +558,13 @@ impl PageCache {
                 let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
                 if let Some(inode) = inode {
                     v.init(inode);
+                }
+                v
+            },
+            backend: {
+                let v: Lazy<Arc<dyn PageCacheBackend>> = Lazy::new();
+                if let Some(backend) = backend {
+                    v.init(backend);
                 }
                 v
             },
@@ -495,6 +591,18 @@ impl PageCache {
         Ok(())
     }
 
+    pub fn set_backend(&self, backend: Arc<dyn PageCacheBackend>) -> Result<(), SystemError> {
+        if self.backend.initialized() {
+            return Err(SystemError::EINVAL);
+        }
+        self.backend.init(backend);
+        Ok(())
+    }
+
+    pub fn backend(&self) -> Option<Arc<dyn PageCacheBackend>> {
+        self.backend.try_get().cloned()
+    }
+
     pub fn lock(&self) -> MutexGuard<'_, InnerPageCache> {
         self.inner.lock()
     }
@@ -503,6 +611,11 @@ impl PageCache {
     /// pages will carry PG_UNEVICTABLE to keep the reclaimer from reclaiming them.
     pub fn set_unevictable(&self, unevictable: bool) {
         self.unevictable.store(unevictable, Ordering::Relaxed);
+    }
+
+    pub fn read_pages(&self, start_page_index: usize, page_num: usize) -> Result<(), SystemError> {
+        let mut guard = self.inner.lock();
+        guard.read_pages_from_backend(start_page_index, page_num)
     }
 
     /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁

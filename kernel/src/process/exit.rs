@@ -781,7 +781,7 @@ impl ProcessControlBlock {
             let should_clear = exec_task
                 .as_ref()
                 .and_then(|t| this.as_ref().map(|me| Arc::ptr_eq(t, me)))
-                .unwrap_or(true);
+                .unwrap_or(false);
             if should_clear {
                 sighand.finish_group_exec();
             }

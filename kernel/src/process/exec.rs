@@ -260,8 +260,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
     let sighand = current.sighand();
     // 与 group-exit/并发 exec 互斥
-    sighand.try_start_group_exec()?;
-    sighand.set_group_exec_task(&current);
+    sighand.start_group_exec(&current)?;
 
     let result = (|| {
         // log::info!(
@@ -357,8 +356,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
         // 非 leader exec：等待 leader 进入 zombie 后再交换 tid/raw_pid
         if !Arc::ptr_eq(&leader, &current) {
-            current.exchange_tid_with(&leader)?;
-            ProcessManager::exchange_raw_pids(&current, &leader)?;
+            ProcessManager::exchange_tid_and_raw_pids(&current, &leader)?;
 
             current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
             leader.exit_signal.store(Signal::INVALID, Ordering::SeqCst);

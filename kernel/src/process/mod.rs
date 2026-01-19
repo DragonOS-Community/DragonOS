@@ -111,6 +111,29 @@ pub(crate) fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<Proc
     &ALL_PROCESS
 }
 
+fn exchange_raw_pids_locked(
+    map: &mut HashMap<RawPid, Arc<ProcessControlBlock>>,
+    left: &Arc<ProcessControlBlock>,
+    right: &Arc<ProcessControlBlock>,
+) -> Result<(), SystemError> {
+    let left_pid = left.raw_pid();
+    let right_pid = right.raw_pid();
+    if left_pid == right_pid {
+        return Err(SystemError::EINVAL);
+    }
+    let left_entry = map.remove(&left_pid).ok_or(SystemError::ESRCH)?;
+    let right_entry = map.remove(&right_pid).ok_or(SystemError::ESRCH)?;
+
+    unsafe {
+        left.force_set_raw_pid(right_pid);
+        right.force_set_raw_pid(left_pid);
+    }
+
+    map.insert(right_pid, left_entry);
+    map.insert(left_pid, right_entry);
+    Ok(())
+}
+
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 
 /// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
@@ -233,29 +256,22 @@ impl ProcessManager {
             .insert(pcb.raw_pid(), pcb.clone());
     }
 
-    pub(crate) fn exchange_raw_pids(
+    pub(crate) fn exchange_tid_and_raw_pids(
         left: &Arc<ProcessControlBlock>,
         right: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
+        let mut all_proc = all_process().lock_irqsave();
+        let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
         let left_pid = left.raw_pid();
         let right_pid = right.raw_pid();
         if left_pid == right_pid {
             return Err(SystemError::EINVAL);
         }
-
-        let mut all_proc = all_process().lock_irqsave();
-        let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
-        let left_entry = map.remove(&left_pid).ok_or(SystemError::ESRCH)?;
-        let right_entry = map.remove(&right_pid).ok_or(SystemError::ESRCH)?;
-
-        unsafe {
-            left.force_set_raw_pid(right_pid);
-            right.force_set_raw_pid(left_pid);
+        if !map.contains_key(&left_pid) || !map.contains_key(&right_pid) {
+            return Err(SystemError::ESRCH);
         }
-
-        map.insert(right_pid, left_entry);
-        map.insert(left_pid, right_entry);
-        Ok(())
+        left.exchange_tid_with(right)?;
+        exchange_raw_pids_locked(map, left, right)
     }
 
     /// ### 获取所有进程的pid
@@ -510,7 +526,7 @@ impl ProcessManager {
             let should_clear = exec_task
                 .as_ref()
                 .map(|t| Arc::ptr_eq(t, &current))
-                .unwrap_or(true);
+                .unwrap_or(false);
             if should_clear {
                 sighand.finish_group_exec();
             }

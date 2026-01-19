@@ -35,42 +35,47 @@ DragonOS 参考了 Linux 内核的设计，但在具体实现上结合了 Rust �
 -   `SignalFlags::GROUP_EXEC`：标志位。表示当前线程组正在进行去线程化操作。
 -   `group_exec_task`: `Weak<ProcessControlBlock>`。指向正在执行 `exec` 的那个线程。
 -   `group_exec_wait_queue`: `WaitQueue`。用于等待组内其他线程退出。
--   `group_exec_notify_count`: `isize`。需要等待退出的线程计数。
+-   `group_exec_notify_count`: `isize`。需要等待退出的线程计数（用于唤醒等待队列）。
 
 ### 3.2 核心流程 (`de_thread`)
 
 `de_thread` 函数位于 `kernel/src/process/exec.rs`，是实现该逻辑的核心。
 
 #### 阶段一：发起与互斥
-1.  **尝试加锁**：调用 `sighand.try_start_group_exec()`。如果 `GROUP_EXEC` 或 `GROUP_EXIT` 已被设置，则返回 `EAGAIN`，保证互斥。
-2.  **设置执行者**：将当前线程记录为 `group_exec_task`。
+1.  **加锁并互斥**：调用 `sighand.start_group_exec()`。若 `GROUP_EXEC` 或 `GROUP_EXIT` 已被设置，则返回 `EAGAIN`，保证与并发 `exec`/`exit_group` 互斥。
+2.  **设置执行者**：记录当前线程到 `group_exec_task`，并清空 `group_exec_notify_count`。
+3.  **单线程快路径**：若线程组为空（仅自己），直接设置 `exit_signal = SIGCHLD` 并结束去线程化流程。
 
 #### 阶段二：终止兄弟线程
-1.  **发送信号**：遍历线程组，向除了自己以外的所有线程（包括旧 Leader）发送 `SIGKILL`。
-2.  **设置计数**：计算需要等待的线程数量，设置 `notify_count`。
+1.  **构建清理列表**：遍历线程组，收集所有仍存活且未处于退出路径的线程（包括旧 Leader）。
+2.  **发送信号**：向清理列表中的线程逐个发送 `SIGKILL`。
+3.  **设置计数**：将清理列表长度写入 `group_exec_notify_count`，用于线程退出时唤醒等待队列。
 
 #### 阶段三：等待同步
-1.  **进入等待**：在 `group_exec_wait_queue` 上睡眠。
+1.  **进入等待**：在 `group_exec_wait_queue` 上以 killable 方式睡眠。
 2.  **唤醒条件**：
-    -   如果当前是 Leader：等待线程组为空（所有子线程已退出）。
-    -   如果当前是 **非 Leader**：等待线程组为空 **且** 旧 Leader 已经变成 `Zombie` 或 `Dead` 状态。
-    -   *注：其他线程在退出路径（`exit_notify`）中会递减计数并唤醒等待队列。*
+    -   遍历 `group_tasks`，确认除当前线程以外已无存活线程；
+    -   若当前不是 Leader，还需确保旧 Leader 已经进入 `Zombie` 或 `Dead` 状态；
+    -   若收到 fatal signal 或等待被打断，则返回 `EAGAIN`。
+    -   *注：其他线程在退出路径（`exit_notify`）中会递减计数并唤醒等待队列；若执行者异常退出，也会在该路径中清理 `GROUP_EXEC` 标志。*
 
 #### 阶段四：身份交换 (Identity Theft)
 *仅当 Exec-Thread 不是 Leader 时执行*
 
-1.  **PID 交换**：调用 `ProcessManager::exchange_raw_pids`。
-    -   这是一个全局原子操作。它在全局进程表（Map）中交换了 Exec-Thread 和 Old-Leader 的 PID 映射关系，并修改了 PCB 内部的 PID 字段。
-    -   **结果**：Exec-Thread 获得了原 TGID，Old-Leader 获得了一个临时 PID。
-2.  **TID 交换**：在线程组内部元数据中交换 TID 记录。
-3.  **关系继承**：
-    -   **父进程**：Exec-Thread 将自己的 `parent` 指针指向 Old-Leader 的父进程。
-    -   **子进程**：将 Old-Leader 的 `children` 列表移动到 Exec-Thread 下。
-4.  **结构调整**：将 Exec-Thread 设为新的 `group_leader`，清空 `group_tasks`（因为它现在是单线程了）。
+1.  **PID/TID 交换**：调用 `ProcessManager::exchange_tid_and_raw_pids`。
+    -   在全局进程表中交换两者的 PID 映射关系，并交换 PCB 内部的 TID/PID 字段。
+    -   **结果**：Exec-Thread 获得原 TGID，Old-Leader 获得临时 PID。
+2.  **信号语义调整**：
+    -   新 Leader（Exec-Thread）的 `exit_signal` 设为 `SIGCHLD`；
+    -   Old-Leader 的 `exit_signal` 设为 `INVALID`，避免被当作普通子进程处理。
+3.  **结构调整**：将 Exec-Thread 设为新的 `group_leader`，并清空两侧 `group_tasks`（去线程化后仅剩一个线程）。
+4.  **关系继承**：
+    -   **子进程**：将 Old-Leader 的 `children` 列表整体迁移到 Exec-Thread 下；
+    -   **父进程**：Exec-Thread 继承 Old-Leader 的 `parent`/`real_parent`，并更新 `fork_parent` 为自身。
 
 #### 阶段五：资源清理
-1.  **回收旧 Leader**：由于 PID 已交换，Old-Leader 现在的状态是 Zombie，且不再被其原本的父进程可见（父进程看到的是持有原 PID 的 Exec-Thread）。因此，**Exec-Thread 必须显式回收 Old-Leader**。
-2.  **完成**：清除 `GROUP_EXEC` 标志，唤醒可能在等待该标志清除的并发路径。
+1.  **回收旧 Leader**：若 Old-Leader 已是 Zombie 或 Dead，Exec-Thread 直接将其标记为 Dead 并释放 PID 资源。
+2.  **完成**：无论成功/失败，最终都会清除 `GROUP_EXEC` 标志并唤醒等待者。
 
 ### 3.3 并发保护：防止父进程误回收
 
@@ -85,21 +90,23 @@ DragonOS 参考了 Linux 内核的设计，但在具体实现上结合了 Rust �
 
 ```rust
 fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
-    // 如果子进程是 Leader，且标记了 GROUP_EXEC，且执行 exec 的不是它自己
-    // 那么说明它正在等待被“篡位”，父进程不能回收它。
-    if child_pcb.is_thread_group_leader() 
-       && sighand.flags_contains(SignalFlags::GROUP_EXEC) 
-    {
-         let exec_task = sighand.group_exec_task();
-         if exec_task != child_pcb {
-             return true; // 阻止回收
-         }
+    // 如果子进程是 Leader，且标记了 GROUP_EXEC，
+    // 且执行 exec 的不是它自己，那么说明它正在等待被“篡位”，父进程不能回收它。
+    if !child_pcb.is_thread_group_leader() {
+        return false;
     }
-    return false;
+    if !child_pcb.sighand().flags_contains(SignalFlags::GROUP_EXEC) {
+        return false;
+    }
+    let exec_task = child_pcb.sighand().group_exec_task();
+    exec_task
+        .as_ref()
+        .map(|t| !Arc::ptr_eq(t, child_pcb))
+        .unwrap_or(true)
 }
 ```
 
-这个检查确保了即使 Old-Leader 变成了 Zombie，只要 `GROUP_EXEC` 标志还在且 `exec_task` 不是它，父进程就无法回收它。这为 Exec-Thread 安全地进行 PID 交换提供了保护伞。
+这个检查确保了即使 Old-Leader 变成 Zombie，只要 `GROUP_EXEC` 标志还在且 `exec_task` 不是它，父进程就无法回收它。这为 Exec-Thread 安全地进行 PID/TID 交换提供了保护伞。
 
 ## 4. 流程图
 
@@ -112,7 +119,7 @@ sequenceDiagram
 
     Note over P, S: 初始状态：TGID=100. Exec Thread 想要执行 exec
 
-    ET->>ET: try_start_group_exec()<br/>Set GROUP_EXEC flag
+    ET->>ET: start_group_exec()<br/>Set GROUP_EXEC flag
     ET->>S: Send SIGKILL
     ET->>OL: Send SIGKILL
     ET->>ET: Wait for siblings & leader death
@@ -131,7 +138,7 @@ sequenceDiagram
     ET->>ET: Woken up (All dead)
     
     Note over ET, OL: 开始身份交换 (Identity Theft)
-    ET->>OL: exchange_raw_pids()
+    ET->>OL: exchange_tid_and_raw_pids()
     Note over ET, OL: ET 变成 PID=100<br/>OL 变成 PID=101
 
     ET->>ET: Inherit Parent/Children

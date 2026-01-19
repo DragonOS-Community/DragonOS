@@ -230,6 +230,18 @@ impl SigHand {
         Ok(())
     }
 
+    /// 在与 GROUP_EXEC/GROUP_EXIT 相同的锁下，设置 exec 标志并记录执行者。
+    pub fn start_group_exec(&self, task: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        g.flags.insert(SignalFlags::GROUP_EXEC);
+        g.group_exec_task = Some(Arc::downgrade(task));
+        g.group_exec_notify_count = 0;
+        Ok(())
+    }
+
     /// 结束线程组 exec 状态。
     pub fn finish_group_exec(&self) {
         let mut g = self.inner_mut();

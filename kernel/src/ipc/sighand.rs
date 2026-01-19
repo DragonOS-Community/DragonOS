@@ -246,6 +246,20 @@ impl SigHand {
         g.group_exec_task = Some(Arc::downgrade(task));
     }
 
+    /// 在与 GROUP_EXEC/GROUP_EXIT 相同的锁下执行关键区，避免并发插入线程组。
+    pub fn with_group_exec_check<F, R>(&self, f: F) -> Result<R, SystemError>
+    where
+        F: FnOnce() -> R,
+    {
+        let g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        let ret = f();
+        drop(g);
+        Ok(ret)
+    }
+
     /// 获取当前 exec 线程（去线程化执行者）。
     pub fn group_exec_task(&self) -> Option<Arc<ProcessControlBlock>> {
         self.inner().group_exec_task.as_ref()?.upgrade()

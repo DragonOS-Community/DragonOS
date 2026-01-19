@@ -781,18 +781,14 @@ impl ProcessManager {
             pcb.attach_pid(PidType::PGID);
             pcb.attach_pid(PidType::SID);
         } else {
-            if current_pcb
-                .sighand()
-                .flags_contains(SignalFlags::GROUP_EXEC | SignalFlags::GROUP_EXIT)
-            {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            pcb.task_join_group_stop();
             let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
-            group_leader
-                .threads_write_irqsave()
-                .group_tasks
-                .push(Arc::downgrade(pcb));
+            current_pcb.sighand().with_group_exec_check(|| {
+                pcb.task_join_group_stop();
+                group_leader
+                    .threads_write_irqsave()
+                    .group_tasks
+                    .push(Arc::downgrade(pcb));
+            })?;
 
             // 确保非组长线程的 TGID 与组长一致
             let leader_tgid_pid = group_leader.pid();

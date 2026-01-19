@@ -983,30 +983,48 @@ impl InnerAddressSpace {
             compiler_fence(Ordering::SeqCst);
         });
 
-        let to_unmap = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+        // 获取取消映射操作关联的 VMAS （用户传入的区域可能横跨多个 VMA）
+        let region_to_unmap = VirtRegion::new(start_page.virt_address(), page_count.bytes());
+        let vmas_related: Vec<Arc<LockedVMA>> =
+            self.mappings.conflicts(region_to_unmap).collect::<Vec<_>>();
         let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
 
-        let regions: Vec<Arc<LockedVMA>> = self.mappings.conflicts(to_unmap).collect::<Vec<_>>();
-
-        for r in regions {
-            let r = r.lock().region;
-            let r = self.mappings.remove_vma(&r).unwrap();
-            let intersection = r.lock().region().intersect(&to_unmap).unwrap();
-            let split_result = r.extract(intersection, &self.user_mapper.utable).unwrap();
+        // 遍历每个相关的 VMA，将当前的 VMA 拆分为可能的三块 VMA，然后删除与需要删除的区域相交的部分。
+        // 示意图：对每个与 region_to_unmap 相交的 VMA，按交集拆分成三段（before / intersection / after），
+        // 然后仅对 intersection 段执行解除映射；before/after 重新插回 mappings。
+        //
+        //          cur_vma.region (原 VMA)
+        //      [------------------------------]
+        //                region_to_unmap
+        //            [----------]
+        //                 ||
+        //                 \/
+        //      before         intersection          after
+        //   [--------]      [----------]         [--------]
+        //      keep            unmap                keep
+        //
+        // 注意：用户传入的 region_to_unmap 可能跨多个 VMA，因此需要对每个相关 VMA 分别处理。
+        for cur_vma in vmas_related {
+            let r = cur_vma.lock().region;
+            let cur_vma = self.mappings.remove_vma(&r).unwrap();
+            let intersection = cur_vma.lock().region().intersect(&region_to_unmap).unwrap();
+            let split_result = cur_vma
+                .extract(intersection, &self.user_mapper.utable)
+                .unwrap();
 
             // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
 
+            // 如果前面有VMA，则需要将前面的VMA重新插入到地址空间的VMA列表中
             if let Some(before) = split_result.prev {
-                // 如果前面有VMA，则需要将前面的VMA重新插入到地址空间的VMA列表中
                 self.mappings.insert_vma(before);
             }
 
+            // 如果后面有VMA，则需要将后面的VMA重新插入到地址空间的VMA列表中
             if let Some(after) = split_result.after {
-                // 如果后面有VMA，则需要将后面的VMA重新插入到地址空间的VMA列表中
                 self.mappings.insert_vma(after);
             }
 
-            r.unmap(&mut self.user_mapper.utable, &mut flusher);
+            cur_vma.unmap(&mut self.user_mapper.utable, &mut flusher);
         }
 
         // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
@@ -1708,31 +1726,64 @@ impl LockedVMA {
         return self.vma.lock().mapped;
     }
 
-    /// 将当前VMA进行切分，切分成3个VMA，分别是：
+    /// 将当前 VMA 切分为最多三段（before / middle / after）。
     ///
-    /// 1. 前面的VMA，如果没有则为None
-    /// 2. 中间的VMA，也就是传入的Region
-    /// 3. 后面的VMA，如果没有则为None
+    /// ### 参数
+    /// - `region`：目标切分区域，必须页对齐，且**必须完全落在**当前 VMA 的范围内。
+    /// - `utable`：用于查询虚拟页到物理页的映射，以便更新页的反向映射（anon_vma）。
+    ///
+    /// ### 返回值
+    /// - `Some(VMASplitResult)`：切分成功。
+    ///   - `prev`：位于 `region` 之前的 VMA（可能为 `None`）。
+    ///   - `middle`：与 `region` 对应的 VMA（原 VMA 本体被收缩为此段）。
+    ///   - `after`：位于 `region` 之后的 VMA（可能为 `None`）。
+    /// - `None`：`region` 不合法（未完全包含于当前 VMA，或无法形成交集）。
+    ///
+    /// ### ⚠️ 关键副作用
+    /// - **`self` 会被原地修改为 `middle`**：当前 VMA（即 `self`）的 `region` 会被修改为传入的 `region` 参数，
+    ///   同时其 `backing_pgoff` 也会相应调整。**返回的 `middle` 与 `self` 是同一个 VMA**（通过 `Arc` 指向同一实例），
+    ///   修改后 `self` 就是 `middle`。这是原地修改，不是创建新 VMA。
+    /// - 可能创建新的 VMA（`before`/`after`），但它们初始为未映射状态。
+    /// - 会更新 `before`/`after` 所覆盖页的反向映射（anon_vma），并从原 VMA 中移除。
+    ///
+    /// ### 复杂/隐式逻辑说明
+    /// - `before/after` 的 `backing_pgoff` 调整：
+    ///   `after` 需要偏移到原 VMA 中相应的页偏移；`before` 保持原始偏移。
+    /// - 反向映射更新的原因：
+    ///   VMA 切分后，物理页应归属到新的 VMA（`before`/`after`），否则页回收/共享判断会错误。
+    /// - 当 `region` 与 VMA 完全一致时，直接返回当前 VMA，避免无意义切分。
     pub fn extract(&self, region: VirtRegion, utable: &PageMapper) -> Option<VMASplitResult> {
         assert!(region.start().check_aligned(MMArch::PAGE_SIZE));
         assert!(region.end().check_aligned(MMArch::PAGE_SIZE));
 
         let mut guard = self.lock();
+
+        // ============================================================
+        // 提前检查：处理三种无需切分的边界情况
+        // ============================================================
+        // 这个代码块用于处理三种特殊情况，在这些情况下无需进行 VMA 切分操作：
+        // 1. region 跨越 VMA 的下边界或上边界 → 返回 None
+        // 2. region 与当前 VMA 完全不相交 → 返回 None
+        // 3. region 与当前 VMA 完全相等 → 直接返回当前 VMA，无需切分
         {
-            // 如果传入的region不在当前VMA的范围内，则直接返回None
+            // 如果传入的 region 跨越 VMA 的下边界或上边界，则返回 None，表示无法切分。
+            // 因此使用 `region.start() < vma.start || region.end() > vma.end` 判错是刻意的，
+            // 不是常见的“不相交判断”(region.end <= vma.start || region.start >= vma.end)。
+            // 这样可以保证 `before/after/middle` 三段始终是原 VMA 的严格切分。
             if unlikely(region.start() < guard.region.start() || region.end() > guard.region.end())
             {
                 return None;
             }
-
             let intersect: Option<VirtRegion> = guard.region.intersect(&region);
-            // 如果当前VMA不包含region，则直接返回None
+
+            // 如果当前 VMA.region 与 region 不相交，则直接返回None
             if unlikely(intersect.is_none()) {
                 return None;
             }
             let intersect: VirtRegion = intersect.unwrap();
+
+            // 如果当前 VMA.region 完全等于传入的 region，则无需切分，直接返回当前 VMA。
             if unlikely(intersect == guard.region) {
-                // 如果当前VMA完全包含region，则直接返回当前VMA
                 return Some(VMASplitResult::new(
                     None,
                     guard.self_ref.upgrade().unwrap(),
@@ -1779,7 +1830,6 @@ impl LockedVMA {
                 }
             }
         }
-
         if let Some(after) = after.clone() {
             let virt_iter = after.lock().region.iter_pages();
             for frame in virt_iter {
@@ -1793,11 +1843,9 @@ impl LockedVMA {
             }
         }
 
-        // 调整middle VMA的region和backing_pgoff
+        // 调整 middleVMA 的 region 和 backing_pgoff
         let original_start = guard.region.start();
         guard.region = region;
-        // middle VMA 需要调整backing_pgoff
-        // middle 区域的起始地址相对于原始VMA起始地址的偏移（以页为单位）
         if let Some(original_pgoff) = guard.backing_pgoff {
             let offset_pages = (region.start() - original_start) >> MMArch::PAGE_SHIFT;
             guard.backing_pgoff = Some(original_pgoff + offset_pages);

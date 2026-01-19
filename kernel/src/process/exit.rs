@@ -211,10 +211,10 @@ fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) 
         let child_parent = match child_pcb.real_parent_pcb() {
             Some(p) => p,
             None => {
-                log::warn!(
-                    "is_eligible_child: child {:?} has no real parent",
-                    child_pcb.raw_pid()
-                );
+                // log::warn!(
+                //     "is_eligible_child: child {:?} has no real parent",
+                //     child_pcb.raw_pid()
+                // );
                 return false;
             }
         };
@@ -222,14 +222,14 @@ fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) 
         // 检查子进程的 real_parent 的 tgid 是否与当前线程的 tgid 相同
         let res = child_parent.tgid == current_tgid;
         if !res {
-            log::warn!(
-                "is_eligible_child failed: child={:?} child_parent={:?} (tgid={:?}) current={:?} (tgid={:?})",
-                child_pcb.raw_pid(),
-                child_parent.raw_pid(),
-                child_parent.tgid,
-                current.raw_pid(),
-                current_tgid
-            );
+            // log::warn!(
+            //     "is_eligible_child failed: child={:?} child_parent={:?} (tgid={:?}) current={:?} (tgid={:?})",
+            //     child_pcb.raw_pid(),
+            //     child_parent.raw_pid(),
+            //     child_parent.tgid,
+            //     current.raw_pid(),
+            //     current_tgid
+            // );
         }
         res
     }

@@ -20,7 +20,7 @@ use crate::{
 
 use crate::mm::MemoryManagementArch;
 
-use super::page::{Page, PageFlags};
+use super::page::Page;
 
 bitflags! {
     pub struct FaultFlags: u64{
@@ -329,7 +329,12 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[inline(never)]
     pub unsafe fn do_cow_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let mut ret = Self::filemap_fault(pfm);
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
+        let mut ret = fs.fault(pfm);
+
+        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            return ret;
+        }
 
         if unlikely(ret.intersects(
             VmFaultReason::VM_FAULT_ERROR
@@ -398,7 +403,12 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[inline(never)]
     pub unsafe fn do_shared_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let mut ret = Self::filemap_fault(pfm);
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
+        let mut ret = fs.fault(pfm);
+
+        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            return ret;
+        }
 
         if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
             return ret;
@@ -406,8 +416,8 @@ impl PageFaultHandler {
 
         let cache_page = pfm.page.clone().expect("no cache_page in PageFaultMessage");
 
-        // 将pagecache页设为脏页，以便回收时能够回写
-        cache_page.write().add_flags(PageFlags::PG_DIRTY);
+        // 将pagecache页设为脏页，以便回收时能够回写（原子操作）
+        cache_page.mark_dirty();
         ret = ret.union(Self::finish_fault(pfm));
 
         ret
@@ -483,7 +493,8 @@ impl PageFaultHandler {
             entry.set_flags(new_flags);
             table.set_entry(i, entry);
 
-            old_page.write().add_flags(PageFlags::PG_DIRTY);
+            // 标记为脏页（原子操作）
+            old_page.mark_dirty();
 
             VmFaultReason::VM_FAULT_COMPLETED
         } else if vma.is_anonymous() {
@@ -647,8 +658,9 @@ impl PageFaultHandler {
 
         for pgoff in start_pgoff..end_pgoff {
             if let Some(page) = page_cache.lock().get_page(pgoff) {
-                let page_guard = page.upread();
-                if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
+                // 只映射已就绪且未锁定的页面
+                // 正在加载的页面（is_locked）会在稍后的 filemap_fault 中处理
+                if page.is_uptodate() && !page.is_locked() {
                     let phys = page.phys_address();
 
                     let address =
@@ -659,7 +671,7 @@ impl PageFaultHandler {
                             .unwrap()
                             .flush();
                     }
-                    page_guard.upgrade().insert_vma(vma.clone());
+                    page.write().insert_vma(vma.clone());
                 }
             }
         }
@@ -674,6 +686,12 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
+    ///
+    /// ## 并发安全
+    ///
+    /// 使用 `get_or_load_page` 接口确保：
+    /// - 当多个线程同时访问同一不存在的页面时，只有一个线程执行I/O
+    /// - 其他线程等待加载完成，避免重复I/O
     pub unsafe fn filemap_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
@@ -690,50 +708,30 @@ impl PageFaultHandler {
             }
         };
         let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
-        let mut ret = VmFaultReason::empty();
+        let inode = file.inode();
+        drop(vma_guard);
 
-        let page = page_cache.lock().get_page(backing_pgoff);
-        if let Some(page) = page {
-            // TODO 异步从磁盘中预读页面进PageCache
+        // 使用新接口：获取或加载页面
+        // 这确保了并发访问时只有一个线程执行I/O
+        let result = page_cache.get_or_load_page(backing_pgoff, |buf| {
+            inode.read_sync(backing_pgoff * MMArch::PAGE_SIZE, buf)
+        });
 
-            // 直接将PageCache中的页面作为要映射的页面
-            pfm.page = Some(page.clone());
-        } else {
-            // TODO 同步预读
-            // 涉及磁盘IO，返回标志为VM_FAULT_MAJOR
-            ret = VmFaultReason::VM_FAULT_MAJOR;
-            let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
-            match file.pread(
-                backing_pgoff * MMArch::PAGE_SIZE,
-                MMArch::PAGE_SIZE,
-                buffer.as_mut_slice(),
-            ) {
-                Ok(read_len) => {
-                    // 超出文件末尾，返回SIGBUS而不是panic
-                    if read_len == 0 {
-                        return VmFaultReason::VM_FAULT_SIGBUS;
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "filemap_fault: pread failed at pgoff {}, err {:?}",
-                        backing_pgoff,
-                        e
-                    );
-                    return VmFaultReason::VM_FAULT_SIGBUS;
-                }
-            }
-            drop(buffer);
-
-            let page = page_cache.lock().get_page(backing_pgoff);
-            if let Some(page) = page {
+        match result {
+            Ok(page) => {
                 pfm.page = Some(page);
-            } else {
-                // 读取后仍未获取到页面，视为错误
-                return VmFaultReason::VM_FAULT_SIGBUS;
+                // 涉及磁盘I/O，返回 VM_FAULT_MAJOR
+                VmFaultReason::VM_FAULT_MAJOR
+            }
+            Err(e) => {
+                log::warn!(
+                    "filemap_fault: failed to load page at pgoff {}, err {:?}",
+                    backing_pgoff,
+                    e
+                );
+                VmFaultReason::VM_FAULT_SIGBUS
             }
         }
-        ret
     }
 
     /// 纯 page-cache 后端的缺页处理（不走 pread/磁盘 IO）。
@@ -745,6 +743,12 @@ impl PageFaultHandler {
     /// - 若缺页落在文件末尾之后（以页粒度判断），返回 SIGBUS
     /// - 若页已存在，直接使用该页
     /// - 若页不存在，则创建一个零页并插入 page_cache
+    ///
+    /// ## 并发安全
+    ///
+    /// 使用 `get_or_load_page` 接口确保：
+    /// - 当多个线程同时访问同一不存在的页面时，只有一个线程创建零页
+    /// - 其他线程等待创建完成，避免重复创建
     pub unsafe fn pagecache_fault_zero(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
@@ -768,27 +772,18 @@ impl PageFaultHandler {
             }
         }
 
-        // 先尝试直接获取
-        if let Some(page) = page_cache.lock().get_page(backing_pgoff) {
-            // 标记为 UPTODATE，便于 map_pages / readahead（即便对 tmpfs 通常不会走）。
-            page.write().add_flags(PageFlags::PG_UPTODATE);
-            pfm.page = Some(page);
-            return VmFaultReason::empty();
-        }
+        // 使用新接口获取或创建零页
+        let result = page_cache.get_or_load_page(backing_pgoff, |buf| {
+            buf.fill(0);
+            Ok(buf.len())
+        });
 
-        {
-            let mut pc = page_cache.lock();
-            // 可能并发创建：create 后再 get（忽略已存在/并发导致的轻微差异）
-            pc.create_zero_pages(backing_pgoff, 1).map_err(|_| ()).ok();
-        }
-
-        let page = page_cache.lock().get_page(backing_pgoff);
-        if let Some(page) = page {
-            page.write().add_flags(PageFlags::PG_UPTODATE);
-            pfm.page = Some(page);
-            VmFaultReason::empty()
-        } else {
-            VmFaultReason::VM_FAULT_SIGBUS
+        match result {
+            Ok(page) => {
+                pfm.page = Some(page);
+                VmFaultReason::empty()
+            }
+            Err(_) => VmFaultReason::VM_FAULT_SIGBUS,
         }
     }
 

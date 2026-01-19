@@ -148,7 +148,7 @@ impl<'a> ReadaheadControl<'a> {
                 //     "set ra flag at {}",
                 //     self.ra_state.start + self.ra_state.size - self.ra_state.async_size
                 // );
-                page.write().add_flags(PageFlags::PG_READAHEAD);
+                page.set_flags(PageFlags::PG_READAHEAD);
             }
         }
 

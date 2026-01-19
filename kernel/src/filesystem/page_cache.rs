@@ -70,6 +70,47 @@ impl InnerPageCache {
         self.pages.remove(&offset)
     }
 
+    /// 创建一个已锁定的新页面
+    ///
+    /// 创建时页面即带有 `PG_LOCKED` 标志，调用者获得页面锁后负责：
+    /// 1. 向页面加载数据
+    /// 2. 调用 `page.mark_uptodate_and_unlock()` 完成
+    ///
+    /// ## 参数
+    ///
+    /// - `page_index` 页面索引
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(Arc<Page>)`: 已锁定的新页面
+    /// - `Err(SystemError)`: 错误码
+    pub fn create_locked_page(&mut self, page_index: usize) -> Result<Arc<Page>, SystemError> {
+        let page_flags = {
+            let cache = self
+                .page_cache_ref
+                .upgrade()
+                .expect("failed to get self_arc of pagecache");
+            let mut flags = PageFlags::PG_LRU | PageFlags::PG_LOCKED; // 创建时即锁定
+            if cache.unevictable.load(Ordering::Relaxed) {
+                flags |= PageFlags::PG_UNEVICTABLE;
+            }
+            flags
+        };
+
+        let mut page_manager_guard = page_manager_lock();
+        let page = page_manager_guard.create_one_page(
+            PageType::File(FileMapInfo {
+                page_cache: self.page_cache_ref.clone(),
+                index: page_index,
+            }),
+            page_flags,
+            &mut LockedFrameAllocator,
+        )?;
+
+        self.add_page(page_index, &page);
+        Ok(page)
+    }
+
     pub fn create_pages(&mut self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
         if buf.is_empty() {
             return Ok(());
@@ -114,7 +155,9 @@ impl InnerPageCache {
                     dst[page_len..].fill(0);
                 }
             }
-            page_guard.add_flags(PageFlags::PG_UPTODATE);
+            // 标记页面为最新
+            page.mark_uptodate();
+            drop(page_guard);
 
             self.add_page(start_page_index + i, &page);
         }
@@ -168,7 +211,9 @@ impl InnerPageCache {
             unsafe {
                 page_guard.as_slice_mut().fill(0);
             }
-            page_guard.add_flags(PageFlags::PG_UPTODATE);
+            // 标记页面为最新
+            page.mark_uptodate();
+            drop(page_guard);
 
             self.add_page(page_index, &page);
         }
@@ -393,9 +438,10 @@ impl InnerPageCache {
     /// Synchronize the page cache with the storage device.
     pub fn sync(&mut self) -> Result<(), SystemError> {
         for page in self.pages.values() {
-            let mut guard = page.write();
-            if guard.flags().contains(PageFlags::PG_DIRTY) {
-                crate::mm::page::PageReclaimer::page_writeback(&mut guard, false);
+            // 检查脏页标志（原子操作，无需获取锁）
+            if page.test_flags(PageFlags::PG_DIRTY) {
+                let mut guard = page.write();
+                crate::mm::page::PageReclaimer::page_writeback(page, &mut guard, false);
             }
         }
         Ok(())
@@ -409,9 +455,10 @@ impl InnerPageCache {
     ) -> Result<(), SystemError> {
         for idx in start_index..=end_index {
             if let Some(page) = self.pages.get(&idx) {
-                let mut guard = page.write();
-                if guard.flags().contains(PageFlags::PG_DIRTY) {
-                    crate::mm::page::PageReclaimer::page_writeback(&mut guard, false);
+                // 检查脏页标志（原子操作，无需获取锁）
+                if page.test_flags(PageFlags::PG_DIRTY) {
+                    let mut guard = page.write();
+                    crate::mm::page::PageReclaimer::page_writeback(page, &mut guard, false);
                 }
             }
         }
@@ -427,11 +474,10 @@ impl InnerPageCache {
 
         for idx in start_index..=end_index {
             if let Some(page) = self.pages.get(&idx) {
-                let guard = page.read();
-                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                // 检查脏页标志（原子操作，无需获取锁）
+                if page.test_flags(PageFlags::PG_DIRTY) {
                     continue;
                 }
-                drop(guard);
 
                 // 3处引用：1. page_cache中 2. page_manager中 3. lru中
                 if Arc::strong_count(page) <= 3 {
@@ -505,6 +551,123 @@ impl PageCache {
         self.unevictable.store(unevictable, Ordering::Relaxed);
     }
 
+    /// 获取页面，如果正在加载则等待
+    ///
+    /// 这是推荐的获取已存在页面的方式：
+    /// 1. 如果页面存在且已就绪，直接返回
+    /// 2. 如果页面正在加载，等待完成后返回
+    /// 3. 如果页面不存在，返回 None
+    ///
+    /// ## 参数
+    ///
+    /// - `page_index` 页面索引
+    ///
+    /// ## 返回值
+    ///
+    /// - `Some(Arc<Page>)`: 已就绪的页面
+    /// - `None`: 页面不存在或等待被中断
+    pub fn get_page_wait(&self, page_index: usize) -> Option<Arc<Page>> {
+        let page = {
+            let guard = self.inner.lock();
+            guard.get_page(page_index)
+        };
+
+        // 等待页面就绪（解锁且 uptodate）
+        page.filter(|page| page.wait_uptodate().is_ok())
+    }
+
+    /// 获取或创建页面，并加载数据
+    ///
+    /// 完整的页面获取流程：
+    /// 1. 尝试获取现有页面
+    /// 2. 如果页面正在加载，等待完成
+    /// 3. 如果页面不存在，创建并加载数据
+    ///
+    /// ## 参数
+    ///
+    /// - `page_index` 页面索引
+    /// - `loader` 数据加载函数，接收页面缓冲区，返回读取的字节数
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(Arc<Page>)`: 已就绪的页面
+    /// - `Err(SystemError)`: 错误码
+    ///
+    /// ## 并发安全
+    ///
+    /// 当多个线程同时请求同一个不存在的页面时：
+    /// - 只有一个线程会成功创建并加载页面（获得 PG_LOCKED）
+    /// - 其他线程会等待该页面加载完成
+    /// - 这避免了重复I/O
+    pub fn get_or_load_page<F>(
+        &self,
+        page_index: usize,
+        loader: F,
+    ) -> Result<Arc<Page>, SystemError>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, SystemError>,
+    {
+        // 获取或创建页面
+        let (page, should_load) = {
+            let mut guard = self.inner.lock();
+            match guard.get_page(page_index) {
+                Some(page) => {
+                    if page.is_uptodate() {
+                        // 页面已就绪，直接返回
+                        return Ok(page);
+                    }
+                    if page.is_locked() {
+                        // 页面正在加载，释放锁后等待
+                        drop(guard);
+                        page.wait_uptodate()?;
+                        return Ok(page);
+                    }
+                    // 页面存在但未就绪也未锁定（异常状态），尝试获取锁加载
+                    if page.trylock() {
+                        (page, true)
+                    } else {
+                        // 其他线程刚刚获得了锁，等待它完成
+                        drop(guard);
+                        page.wait_uptodate()?;
+                        return Ok(page);
+                    }
+                }
+                None => {
+                    // 创建新页面（已锁定）
+                    let page = guard.create_locked_page(page_index)?;
+                    (page, true)
+                }
+            }
+        };
+
+        if should_load {
+            // 我们持有页面锁，需要加载数据
+            let result = {
+                let mut inner_guard = page.write();
+                unsafe {
+                    let buf = inner_guard.as_slice_mut();
+                    loader(buf)
+                }
+            };
+
+            match result {
+                Ok(_) => {
+                    // 加载成功，标记为最新并解锁
+                    page.mark_uptodate_and_unlock();
+                    return Ok(page);
+                }
+                Err(e) => {
+                    // 加载失败，解锁并移除页面
+                    page.unlock();
+                    self.inner.lock().remove_page(page_index);
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(page)
+    }
+
     /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let (copies, ret) = {
@@ -545,7 +708,10 @@ impl PageCache {
                 page_guard.as_slice_mut()[item.page_offset..item.page_offset + item.sub_len]
                     .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);
             }
-            page_guard.add_flags(PageFlags::PG_DIRTY);
+            // 在持有页锁时标记为脏，避免与 reclaim/invalidate 竞争
+            // 如果在释放锁后才标记，invalidate_range 可能在 mark_dirty() 前将页面视为干净而驱逐
+            item.page.mark_dirty();
+            drop(page_guard);
             src_offset += item.sub_len;
         }
 

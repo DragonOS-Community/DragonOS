@@ -321,7 +321,8 @@ impl ShmManager {
             // TODO 后续需要加入到lru中
             for _ in 0..count.data() {
                 let page = page_manager_guard.get_unwrap(&cur_phys.phys_address());
-                page.write().remove_flags(PageFlags::PG_UNEVICTABLE);
+                // 清除不可驱逐标志（原子操作）
+                page.clear_flags(PageFlags::PG_UNEVICTABLE);
 
                 cur_phys = cur_phys.next();
             }

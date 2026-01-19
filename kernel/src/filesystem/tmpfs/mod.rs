@@ -637,7 +637,9 @@ impl IndexNode for LockedTmpfsInode {
                 page_guard.as_slice_mut()[it.page_offset..it.page_offset + it.sub_len]
                     .copy_from_slice(&buf[src_off..src_off + it.sub_len]);
             }
-            page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
+            // 标记页面为脏（原子操作）
+            it.page.mark_dirty();
+            drop(page_guard);
             src_off += it.sub_len;
         }
 

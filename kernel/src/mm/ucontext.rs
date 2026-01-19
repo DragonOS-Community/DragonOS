@@ -1676,7 +1676,8 @@ impl LockedVMA {
 
             // 如果物理页的vma链表长度为0并且未标记为不可回收，则释放物理页.
             // TODO 后续由lru释放物理页面
-            if page_guard.can_deallocate() {
+            if page_guard.can_deallocate() && !page.test_flags(PageFlags::PG_UNEVICTABLE) {
+                drop(page_guard);
                 page_manager_guard.remove_page(&paddr);
             }
 
@@ -1958,7 +1959,7 @@ impl AnonSharedMapping {
         let mut allocator = LockedFrameAllocator;
         let page = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
         // Mark shared-anon pages as unevictable so shrinking/unmapping doesn't drop their contents.
-        page.write().add_flags(PageFlags::PG_UNEVICTABLE);
+        page.set_flags(PageFlags::PG_UNEVICTABLE);
         guard.insert(pgoff, page.phys_address());
         Ok(page)
     }
@@ -1975,8 +1976,9 @@ impl Drop for AnonSharedMapping {
         let mut pm = page_manager_lock();
         for paddr in pages {
             if let Some(page) = pm.get(&paddr) {
-                let mut pg = page.write();
-                pg.remove_flags(PageFlags::PG_UNEVICTABLE);
+                // 清除不可驱逐标志（原子操作）
+                page.clear_flags(PageFlags::PG_UNEVICTABLE);
+                let pg = page.read();
                 if pg.can_deallocate() {
                     drop(pg);
                     pm.remove_page(&paddr);

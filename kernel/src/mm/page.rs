@@ -22,9 +22,10 @@ use crate::{
     libs::{
         mutex::{Mutex, MutexGuard},
         rwsem::{RwSem, RwSemReadGuard, RwSemUpgradeableGuard, RwSemWriteGuard},
+        wait_queue::WaitQueue,
     },
     process::{ProcessControlBlock, ProcessManager},
-    time::{sleep::nanosleep, PosixTimeSpec},
+    time::{sleep::nanosleep, Duration, PosixTimeSpec},
 };
 
 use super::{
@@ -205,8 +206,8 @@ impl PageManager {
 
         assert!(!self.contains(&paddr), "phys page: {paddr:?} already exist");
 
-        let page = Page::copy(old_page.read(), paddr)
-            .inspect_err(|_| unsafe { allocator.free_one(paddr) })?;
+        let page =
+            Page::copy(&old_page, paddr).inspect_err(|_| unsafe { allocator.free_one(paddr) })?;
 
         self.insert(&page)?;
 
@@ -344,10 +345,12 @@ impl PageReclaimer {
                 let page_index = info.index;
                 let paddr = guard.phys_address();
 
-                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                // 检查脏页标志（原子操作）
+                if page.test_flags(PageFlags::PG_DIRTY) {
                     // 先回写脏页
-                    Self::page_writeback(&mut guard, true);
-                    if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    Self::page_writeback(&page, &mut guard, true);
+                    // 再次检查，如果仍为脏页（写回失败），放回 LRU
+                    if page.test_flags(PageFlags::PG_DIRTY) {
                         drop(guard);
                         page_reclaimer_lock().insert_page(paddr, &page);
                         continue;
@@ -380,7 +383,7 @@ impl PageReclaimer {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(guard: &mut InnerPage, unmap: bool) {
+    pub fn page_writeback(page: &Page, guard: &mut InnerPage, unmap: bool) {
         // log::debug!("page writeback: {:?}", guard.phys_addr);
 
         let (page_cache, page_index) = match guard.page_type() {
@@ -455,12 +458,12 @@ impl PageReclaimer {
                     len,
                     e
                 );
-                guard.add_flags(PageFlags::PG_ERROR);
+                page.set_flags(PageFlags::PG_ERROR);
                 return;
             }
         }
 
-        guard.remove_flags(PageFlags::PG_DIRTY | PageFlags::PG_ERROR);
+        page.clear_flags(PageFlags::PG_DIRTY | PageFlags::PG_ERROR);
     }
 
     /// lru脏页刷新
@@ -468,9 +471,10 @@ impl PageReclaimer {
         // log::info!("flush_dirty_pages");
         let iter = self.lru.iter();
         for (_paddr, page) in iter {
-            let mut guard = page.write();
-            if guard.flags().contains(PageFlags::PG_DIRTY) {
-                Self::page_writeback(&mut guard, false);
+            // 检查脏页标志（原子操作）
+            if page.test_flags(PageFlags::PG_DIRTY) {
+                let mut guard = page.write();
+                Self::page_writeback(page, &mut guard, false);
             }
         }
     }
@@ -499,11 +503,103 @@ bitflags! {
     }
 }
 
+use core::sync::atomic::AtomicU64;
+
+/// Atomic page flags for lock-free access
+///
+/// This allows checking/modifying page state without acquiring the RwSem lock.
+/// Used primarily for page locking (PG_LOCKED) and status checks (PG_UPTODATE).
+#[derive(Debug)]
+pub struct AtomicPageFlags {
+    bits: AtomicU64,
+}
+
+impl AtomicPageFlags {
+    /// Create new atomic page flags
+    pub const fn new(flags: PageFlags) -> Self {
+        Self {
+            bits: AtomicU64::new(flags.bits()),
+        }
+    }
+
+    /// Atomically load flags
+    #[inline]
+    pub fn load(&self, order: Ordering) -> PageFlags {
+        PageFlags::from_bits_truncate(self.bits.load(order))
+    }
+
+    /// Atomically test if flags are set
+    #[inline]
+    pub fn test(&self, flags: PageFlags) -> bool {
+        self.bits.load(Ordering::Acquire) & flags.bits() == flags.bits()
+    }
+
+    /// Atomically set flags (returns old value)
+    #[inline]
+    pub fn set(&self, flags: PageFlags) -> PageFlags {
+        let old = self.bits.fetch_or(flags.bits(), Ordering::AcqRel);
+        PageFlags::from_bits_truncate(old)
+    }
+
+    /// Atomically clear flags (returns old value)
+    #[inline]
+    pub fn clear(&self, flags: PageFlags) -> PageFlags {
+        let old = self.bits.fetch_and(!flags.bits(), Ordering::AcqRel);
+        PageFlags::from_bits_truncate(old)
+    }
+
+    /// Atomically test and set a flag (for acquiring lock)
+    ///
+    /// Returns true if the flag was NOT previously set (lock acquired).
+    #[inline]
+    pub fn test_and_set(&self, flag: PageFlags) -> bool {
+        let old = self.bits.fetch_or(flag.bits(), Ordering::AcqRel);
+        old & flag.bits() == 0
+    }
+
+    /// Atomically test and clear a flag
+    ///
+    /// Returns true if the flag WAS previously set.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn test_and_clear(&self, flag: PageFlags) -> bool {
+        let old = self.bits.fetch_and(!flag.bits(), Ordering::AcqRel);
+        old & flag.bits() != 0
+    }
+}
+
+// ==================== Global Page Wait Queue (Phase 2) ====================
+
+/// Page wait queue hash table size (must be power of 2)
+const PAGE_WAIT_TABLE_BITS: usize = 8;
+const PAGE_WAIT_TABLE_SIZE: usize = 1 << PAGE_WAIT_TABLE_BITS;
+
+/// Global page wait queue array
+///
+/// Uses a hash table of wait queues (like Linux) to avoid per-page overhead.
+/// Pages are hashed to a specific wait queue based on their physical address.
+static PAGE_WAIT_TABLE: [WaitQueue; PAGE_WAIT_TABLE_SIZE] =
+    [const { WaitQueue::default() }; PAGE_WAIT_TABLE_SIZE];
+
+/// Get the wait queue for a given page based on its physical address
+#[inline]
+fn page_waitqueue(page: &Page) -> &'static WaitQueue {
+    // Use page frame number as hash key
+    let hash = page.phys_addr.data() >> 12;
+    let index: usize = hash & (PAGE_WAIT_TABLE_SIZE - 1);
+    &PAGE_WAIT_TABLE[index]
+}
+
 #[derive(Debug)]
 pub struct Page {
     inner: RwSem<InnerPage>,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
+    /// 原子页面标志（可无锁访问）
+    ///
+    /// 用于页面锁定（PG_LOCKED）和状态检查（PG_UPTODATE）等操作，
+    /// 无需获取 RwSem 即可访问。
+    atomic_flags: AtomicPageFlags,
 }
 
 impl Page {
@@ -511,7 +607,6 @@ impl Page {
     ///
     /// ## 参数
     ///
-    /// - `shared`: 是否共享
     /// - `phys_addr`: 物理地址
     /// - `page_type`: 页面类型
     /// - `flags`: 页面标志
@@ -520,12 +615,13 @@ impl Page {
     ///
     /// - `Arc<Page>`: 新页面
     fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Arc<Page> {
-        let inner = InnerPage::new(phys_addr, page_type, flags);
+        let inner = InnerPage::new(phys_addr, page_type);
         let page = Arc::new(Self {
             inner: RwSem::new(inner),
             phys_addr,
+            atomic_flags: AtomicPageFlags::new(flags),
         });
-        if page.read().flags == PageFlags::PG_LRU {
+        if flags.contains(PageFlags::PG_LRU) {
             page_reclaimer_lock().insert_page(phys_addr, &page);
         };
         page
@@ -535,20 +631,19 @@ impl Page {
     ///
     /// ## 参数
     ///
-    /// - `old_guard`: 源页面的读守卫
+    /// - `old_page`: 源页面
     /// - `new_phys`: 新页面的物理地址
     ///
     /// ## 返回值
     ///
     /// - `Ok(Arc<Page>)`: 新页面
     /// - `Err(SystemError)`: 错误码
-    fn copy(
-        old_guard: RwSemReadGuard<InnerPage>,
-        new_phys: PhysAddr,
-    ) -> Result<Arc<Page>, SystemError> {
+    fn copy(old_page: &Page, new_phys: PhysAddr) -> Result<Arc<Page>, SystemError> {
+        let old_guard = old_page.read();
         let page_type = old_guard.page_type().clone();
-        let flags = *old_guard.flags();
-        let inner = InnerPage::new(new_phys, page_type, flags);
+        // 获取旧页面的标志（从原子标志获取）
+        let flags = old_page.atomic_flags.load(Ordering::Acquire);
+        let inner = InnerPage::new(new_phys, page_type);
         unsafe {
             let old_vaddr =
                 MMArch::phys_2_virt(old_guard.phys_address()).ok_or(SystemError::EFAULT)?;
@@ -559,6 +654,7 @@ impl Page {
         Ok(Arc::new(Self {
             inner: RwSem::new(inner),
             phys_addr: new_phys,
+            atomic_flags: AtomicPageFlags::new(flags),
         }))
     }
 
@@ -578,6 +674,207 @@ impl Page {
     pub fn write(&self) -> RwSemWriteGuard<'_, InnerPage> {
         self.inner.write()
     }
+
+    // ==================== Atomic Flag Operations (Lock-Free) ====================
+
+    /// Test page flags atomically (without acquiring RwSem)
+    #[inline]
+    pub fn test_flags(&self, flags: PageFlags) -> bool {
+        self.atomic_flags.test(flags)
+    }
+
+    /// Set page flags atomically (without acquiring RwSem)
+    #[inline]
+    pub fn set_flags(&self, flags: PageFlags) {
+        self.atomic_flags.set(flags);
+    }
+
+    /// Clear page flags atomically (without acquiring RwSem)
+    #[inline]
+    pub fn clear_flags(&self, flags: PageFlags) {
+        self.atomic_flags.clear(flags);
+    }
+
+    /// Check if the page is locked
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.atomic_flags.test(PageFlags::PG_LOCKED)
+    }
+
+    /// Check if the page data is up-to-date
+    #[inline]
+    pub fn is_uptodate(&self) -> bool {
+        self.atomic_flags.test(PageFlags::PG_UPTODATE)
+    }
+
+    // ==================== Page Lock Primitives ====================
+
+    /// Try to lock the page (non-blocking)
+    ///
+    /// Returns true if the lock was successfully acquired.
+    #[inline]
+    pub fn trylock(&self) -> bool {
+        self.atomic_flags.test_and_set(PageFlags::PG_LOCKED)
+    }
+
+    /// Unlock the page
+    ///
+    /// Clears the PG_LOCKED flag. If there are waiters (PG_WAITERS),
+    /// this will trigger a wakeup (implemented in Phase 2).
+    pub fn unlock(&self) {
+        let old = self.atomic_flags.clear(PageFlags::PG_LOCKED);
+        // If there are waiters, wake them up (Phase 2 will implement this)
+        if old.contains(PageFlags::PG_WAITERS) {
+            // Clear PG_WAITERS flag
+            self.atomic_flags.clear(PageFlags::PG_WAITERS);
+            // Wake up waiters - implemented in Phase 2
+            let wq = page_waitqueue(self);
+            wq.wake_all();
+        }
+    }
+
+    /// Mark page data as up-to-date
+    pub fn mark_uptodate(&self) {
+        self.atomic_flags.set(PageFlags::PG_UPTODATE);
+    }
+
+    /// Mark page as dirty
+    pub fn mark_dirty(&self) {
+        self.atomic_flags.set(PageFlags::PG_DIRTY);
+    }
+
+    /// Mark page as up-to-date and unlock
+    ///
+    /// This is the standard operation after completing page I/O:
+    /// 1. Set PG_UPTODATE
+    /// 2. Clear PG_LOCKED
+    /// 3. Wake up all waiters
+    pub fn mark_uptodate_and_unlock(&self) {
+        self.atomic_flags.set(PageFlags::PG_UPTODATE);
+        self.unlock();
+    }
+
+    // ==================== Page Wait Functions (Phase 2) ====================
+
+    /// Lock the page (blocking)
+    ///
+    /// If the page is already locked, the current thread will sleep until
+    /// the lock is released.
+    pub fn lock(&self) {
+        // Fast path: try to acquire lock immediately
+        if self.trylock() {
+            return;
+        }
+
+        // Slow path: wait for lock
+        self.lock_slow();
+    }
+
+    fn lock_slow(&self) {
+        let wq = page_waitqueue(self);
+
+        wq.wait_until(|| {
+            // Set PG_WAITERS to indicate there are waiters
+            self.atomic_flags.set(PageFlags::PG_WAITERS);
+
+            // Try to acquire the lock
+            if self.trylock() {
+                Some(())
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Lock the page (blocking, interruptible)
+    ///
+    /// If the page is already locked, the current thread will sleep until
+    /// the lock is released or interrupted by a signal.
+    pub fn lock_interruptible(&self) -> Result<(), SystemError> {
+        // Fast path: try to acquire lock immediately
+        if self.trylock() {
+            return Ok(());
+        }
+
+        // Slow path: wait for lock
+        let wq = page_waitqueue(self);
+
+        wq.wait_until_interruptible(|| {
+            self.atomic_flags.set(PageFlags::PG_WAITERS);
+
+            if self.trylock() {
+                Some(())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Wait for the page to be unlocked (without acquiring the lock)
+    ///
+    /// Used to wait for another thread to complete I/O on the page.
+    pub fn wait_locked(&self) {
+        if !self.is_locked() {
+            return;
+        }
+
+        let wq = page_waitqueue(self);
+
+        wq.wait_until(|| {
+            self.atomic_flags.set(PageFlags::PG_WAITERS);
+
+            if !self.is_locked() {
+                Some(())
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Wait for page data to be ready
+    ///
+    /// Waits until PG_LOCKED is cleared AND PG_UPTODATE is set.
+    pub fn wait_uptodate(&self) -> Result<(), SystemError> {
+        // Fast path
+        if self.is_uptodate() && !self.is_locked() {
+            return Ok(());
+        }
+
+        let wq = page_waitqueue(self);
+
+        wq.wait_until_interruptible(|| {
+            self.atomic_flags.set(PageFlags::PG_WAITERS);
+
+            if self.is_uptodate() && !self.is_locked() {
+                Some(())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Wait for page data to be ready (with timeout)
+    pub fn wait_uptodate_timeout(&self, timeout: Duration) -> Result<(), SystemError> {
+        // Fast path
+        if self.is_uptodate() && !self.is_locked() {
+            return Ok(());
+        }
+
+        let wq = page_waitqueue(self);
+
+        wq.wait_until_timeout(
+            || {
+                self.atomic_flags.set(PageFlags::PG_WAITERS);
+
+                if self.is_uptodate() && !self.is_locked() {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            timeout,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -585,8 +882,6 @@ impl Page {
 pub struct InnerPage {
     /// 映射到当前page的VMA
     vma_set: HashSet<Arc<LockedVMA>>,
-    /// 标志
-    flags: PageFlags,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
     /// 页面类型
@@ -594,10 +889,9 @@ pub struct InnerPage {
 }
 
 impl InnerPage {
-    pub fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Self {
+    pub fn new(phys_addr: PhysAddr, page_type: PageType) -> Self {
         Self {
             vma_set: HashSet::new(),
-            flags,
             phys_addr,
             page_type,
         }
@@ -613,9 +907,11 @@ impl InnerPage {
         self.vma_set.remove(vma);
     }
 
-    /// 判断当前物理页是否能被回
+    /// 判断当前物理页是否能被回收（仅检查 map_count）
+    ///
+    /// 注意：调用者还需通过 `Page::test_flags(PG_UNEVICTABLE)` 检查是否可驱逐
     pub fn can_deallocate(&self) -> bool {
-        self.map_count() == 0 && !self.flags.contains(PageFlags::PG_UNEVICTABLE)
+        self.map_count() == 0
     }
 
     pub fn shared(&self) -> bool {
@@ -645,26 +941,6 @@ impl InnerPage {
     #[inline(always)]
     pub fn map_count(&self) -> usize {
         self.vma_set.len()
-    }
-
-    #[inline(always)]
-    pub fn flags(&self) -> &PageFlags {
-        &self.flags
-    }
-
-    #[inline(always)]
-    pub fn set_flags(&mut self, flags: PageFlags) {
-        self.flags = flags
-    }
-
-    #[inline(always)]
-    pub fn add_flags(&mut self, flags: PageFlags) {
-        self.flags = self.flags.union(flags);
-    }
-
-    #[inline(always)]
-    pub fn remove_flags(&mut self, flags: PageFlags) {
-        self.flags = self.flags.difference(flags);
     }
 
     #[inline(always)]

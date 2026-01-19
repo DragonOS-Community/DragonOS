@@ -108,7 +108,10 @@ impl<'a> ReadaheadControl<'a> {
 
         let missing_pages: Vec<_> = (0..number_to_read)
             .map(|i| start_index + i)
-            .filter(|&idx| page_cache_guard.get_page(idx).is_none())
+            .filter(|&idx| match page_cache_guard.get_page(idx) {
+                Some(page) => !page.is_uptodate() && !page.is_locked(),
+                None => true,
+            })
             .collect();
 
         drop(page_cache_guard);
@@ -121,22 +124,7 @@ impl<'a> ReadaheadControl<'a> {
         let mut total_read = 0;
 
         for (page_index, count) in ranges {
-            let mut page_buf = alloc::vec![0u8; MMArch::PAGE_SIZE * count];
-            let offset = page_index << MMArch::PAGE_SHIFT;
-            let read_len = self.inode.read_sync(offset, &mut page_buf)?;
-
-            if read_len == 0 {
-                continue;
-            }
-
-            page_buf.truncate(read_len);
-            let actual_page_count = (read_len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
-
-            let mut page_cache_guard = page_cache.lock();
-            page_cache_guard.create_pages(page_index, &page_buf)?;
-            drop(page_cache_guard);
-
-            total_read += actual_page_count;
+            total_read += page_cache.load_pages_range(self.inode, page_index, count)?;
         }
 
         if set_flag {

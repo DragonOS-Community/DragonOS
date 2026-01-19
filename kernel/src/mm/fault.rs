@@ -416,8 +416,11 @@ impl PageFaultHandler {
 
         let cache_page = pfm.page.clone().expect("no cache_page in PageFaultMessage");
 
-        // 将pagecache页设为脏页，以便回收时能够回写（原子操作）
-        cache_page.mark_dirty();
+        // 将pagecache页设为脏页，以便回收时能够回写（与回写路径互斥）
+        {
+            let _page_guard = cache_page.write();
+            cache_page.mark_dirty();
+        }
         ret = ret.union(Self::finish_fault(pfm));
 
         ret
@@ -493,8 +496,11 @@ impl PageFaultHandler {
             entry.set_flags(new_flags);
             table.set_entry(i, entry);
 
-            // 标记为脏页（原子操作）
-            old_page.mark_dirty();
+            // 标记为脏页（与回写路径互斥）
+            {
+                let _page_guard = old_page.write();
+                old_page.mark_dirty();
+            }
 
             VmFaultReason::VM_FAULT_COMPLETED
         } else if vma.is_anonymous() {

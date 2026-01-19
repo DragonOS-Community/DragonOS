@@ -707,6 +707,12 @@ impl Page {
         self.atomic_flags.test(PageFlags::PG_UPTODATE)
     }
 
+    /// Check if the page has an error
+    #[inline]
+    pub fn is_error(&self) -> bool {
+        self.atomic_flags.test(PageFlags::PG_ERROR)
+    }
+
     // ==================== Page Lock Primitives ====================
 
     /// Try to lock the page (non-blocking)
@@ -750,6 +756,7 @@ impl Page {
     /// 2. Clear PG_LOCKED
     /// 3. Wake up all waiters
     pub fn mark_uptodate_and_unlock(&self) {
+        self.atomic_flags.clear(PageFlags::PG_ERROR);
         self.atomic_flags.set(PageFlags::PG_UPTODATE);
         self.unlock();
     }
@@ -836,6 +843,9 @@ impl Page {
     /// Waits until PG_LOCKED is cleared AND PG_UPTODATE is set.
     pub fn wait_uptodate(&self) -> Result<(), SystemError> {
         // Fast path
+        if !self.is_locked() && self.is_error() {
+            return Err(SystemError::EIO);
+        }
         if self.is_uptodate() && !self.is_locked() {
             return Ok(());
         }
@@ -845,17 +855,26 @@ impl Page {
         wq.wait_until_interruptible(|| {
             self.atomic_flags.set(PageFlags::PG_WAITERS);
 
-            if self.is_uptodate() && !self.is_locked() {
+            if !self.is_locked() && (self.is_uptodate() || self.is_error()) {
                 Some(())
             } else {
                 None
             }
-        })
+        })?;
+
+        if self.is_error() {
+            return Err(SystemError::EIO);
+        }
+
+        Ok(())
     }
 
     /// Wait for page data to be ready (with timeout)
     pub fn wait_uptodate_timeout(&self, timeout: Duration) -> Result<(), SystemError> {
         // Fast path
+        if !self.is_locked() && self.is_error() {
+            return Err(SystemError::EIO);
+        }
         if self.is_uptodate() && !self.is_locked() {
             return Ok(());
         }
@@ -866,14 +885,20 @@ impl Page {
             || {
                 self.atomic_flags.set(PageFlags::PG_WAITERS);
 
-                if self.is_uptodate() && !self.is_locked() {
+                if !self.is_locked() && (self.is_uptodate() || self.is_error()) {
                     Some(())
                 } else {
                     None
                 }
             },
             timeout,
-        )
+        )?;
+
+        if self.is_error() {
+            return Err(SystemError::EIO);
+        }
+
+        Ok(())
     }
 }
 

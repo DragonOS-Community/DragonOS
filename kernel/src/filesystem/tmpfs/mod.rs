@@ -2,7 +2,7 @@ use core::any::Any;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::page_cache::{PageCache, PageCacheBackend};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwsem::RwSem;
@@ -45,6 +45,45 @@ const TMPFS_BLOCK_SIZE: u64 = 4096;
 
 const TMPFS_DEFAULT_MIN_SIZE_BYTES: usize = 16 * 1024 * 1024; // 16MiB
 const TMPFS_DEFAULT_MAX_SIZE_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4GiB
+
+#[derive(Debug)]
+struct TmpfsPageCacheBackend {
+    inode: Weak<dyn IndexNode>,
+}
+
+impl TmpfsPageCacheBackend {
+    fn new(inode: Weak<dyn IndexNode>) -> Self {
+        Self { inode }
+    }
+}
+
+impl PageCacheBackend for TmpfsPageCacheBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+
+    fn npages(&self) -> usize {
+        let inode = match self.inode.upgrade() {
+            Some(inode) => inode,
+            None => return 0,
+        };
+        match inode.metadata() {
+            Ok(metadata) => {
+                let size = metadata.size.max(0) as usize;
+                if size == 0 {
+                    0
+                } else {
+                    (size + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+}
 
 fn tmpfs_move_entry_between_dirs(
     src_dir: &mut TmpfsInode,
@@ -761,7 +800,13 @@ impl IndexNode for LockedTmpfsInode {
         // 目前 VFS 使用 read_at/write_at 来读写 symlink 内容（readlink/symlink 语义），
         // 因此 symlink 也必须有 page_cache 后端，否则会在 write_at/read_at 返回 EIO。
         if file_type == FileType::File || file_type == FileType::SymLink {
-            let pc = PageCache::new(Some(Arc::downgrade(&result) as Weak<dyn IndexNode>));
+            let backend = Arc::new(TmpfsPageCacheBackend::new(
+                Arc::downgrade(&result) as Weak<dyn IndexNode>
+            ));
+            let pc = PageCache::new(
+                Some(Arc::downgrade(&result) as Weak<dyn IndexNode>),
+                Some(backend),
+            );
             pc.set_unevictable(true);
             result.0.lock().page_cache = Some(pc);
         }

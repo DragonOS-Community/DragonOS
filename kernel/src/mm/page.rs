@@ -398,6 +398,7 @@ impl PageReclaimer {
         };
         let paddr = guard.phys_address();
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
+        let backend = page_cache.backend();
 
         for vma in guard.vma_set() {
             let address_space = vma.lock().address_space().and_then(|x| x.upgrade());
@@ -437,17 +438,22 @@ impl PageReclaimer {
         };
 
         if len > 0 {
-            let r = inode.write_direct(
-                page_start,
-                len,
-                unsafe {
-                    core::slice::from_raw_parts(
-                        MMArch::phys_2_virt(paddr).unwrap().data() as *const u8,
-                        len,
-                    )
-                },
-                Mutex::new(FilePrivateData::Unused).lock(),
-            );
+            let data = unsafe {
+                core::slice::from_raw_parts(
+                    MMArch::phys_2_virt(paddr).unwrap().data() as *const u8,
+                    len,
+                )
+            };
+            let r = if let Some(backend) = backend {
+                backend.write_page(page_index, data)
+            } else {
+                inode.write_direct(
+                    page_start,
+                    len,
+                    data,
+                    Mutex::new(FilePrivateData::Unused).lock(),
+                )
+            };
             if let Err(e) = r {
                 log::error!(
                     "page writeback failed: offset={}, len={}, err={:?}",

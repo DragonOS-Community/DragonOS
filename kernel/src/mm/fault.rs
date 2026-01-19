@@ -699,31 +699,17 @@ impl PageFaultHandler {
             // 直接将PageCache中的页面作为要映射的页面
             pfm.page = Some(page.clone());
         } else {
-            // TODO 同步预读
-            // 涉及磁盘IO，返回标志为VM_FAULT_MAJOR
-            ret = VmFaultReason::VM_FAULT_MAJOR;
-            let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
-            match file.pread(
-                backing_pgoff * MMArch::PAGE_SIZE,
-                MMArch::PAGE_SIZE,
-                buffer.as_mut_slice(),
-            ) {
-                Ok(read_len) => {
-                    // 超出文件末尾，返回SIGBUS而不是panic
-                    if read_len == 0 {
-                        return VmFaultReason::VM_FAULT_SIGBUS;
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "filemap_fault: pread failed at pgoff {}, err {:?}",
-                        backing_pgoff,
-                        e
-                    );
+            if let Ok(md) = file.inode().metadata() {
+                let size = md.size.max(0) as usize;
+                if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
                     return VmFaultReason::VM_FAULT_SIGBUS;
                 }
             }
-            drop(buffer);
+
+            ret = VmFaultReason::VM_FAULT_MAJOR;
+            if page_cache.read_pages(backing_pgoff, 1).is_err() {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
 
             let page = page_cache.lock().get_page(backing_pgoff);
             if let Some(page) = page {

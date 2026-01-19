@@ -38,7 +38,7 @@ use crate::{
         kill::send_signal_to_pcb,
         sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending},
+        signal_types::{SigInfo, SigPending, SignalFlags},
     },
     libs::{
         align::AlignedBox,
@@ -109,6 +109,29 @@ static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> 
 pub(crate) fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>>
 {
     &ALL_PROCESS
+}
+
+fn exchange_raw_pids_locked(
+    map: &mut HashMap<RawPid, Arc<ProcessControlBlock>>,
+    left: &Arc<ProcessControlBlock>,
+    right: &Arc<ProcessControlBlock>,
+) -> Result<(), SystemError> {
+    let left_pid = left.raw_pid();
+    let right_pid = right.raw_pid();
+    if left_pid == right_pid {
+        return Err(SystemError::EINVAL);
+    }
+    let left_entry = map.remove(&left_pid).ok_or(SystemError::ESRCH)?;
+    let right_entry = map.remove(&right_pid).ok_or(SystemError::ESRCH)?;
+
+    unsafe {
+        left.force_set_raw_pid(right_pid);
+        right.force_set_raw_pid(left_pid);
+    }
+
+    map.insert(right_pid, left_entry);
+    map.insert(left_pid, right_entry);
+    Ok(())
 }
 
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
@@ -231,6 +254,24 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.raw_pid(), pcb.clone());
+    }
+
+    pub(crate) fn exchange_tid_and_raw_pids(
+        left: &Arc<ProcessControlBlock>,
+        right: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        let mut all_proc = all_process().lock_irqsave();
+        let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
+        let left_pid = left.raw_pid();
+        let right_pid = right.raw_pid();
+        if left_pid == right_pid {
+            return Err(SystemError::EINVAL);
+        }
+        if !map.contains_key(&left_pid) || !map.contains_key(&right_pid) {
+            return Err(SystemError::ESRCH);
+        }
+        left.exchange_tid_with(right)?;
+        exchange_raw_pids_locked(map, left, right)
     }
 
     /// ### 获取所有进程的pid
@@ -473,6 +514,23 @@ impl ProcessManager {
     #[inline(never)]
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
+        let sighand = current.sighand();
+        if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
+            let exec_task = sighand.group_exec_task();
+            if let Some(exec_task) = exec_task.as_ref() {
+                if !Arc::ptr_eq(exec_task, &current) {
+                    sighand.dec_group_exec_notify_count_and_wake();
+                    sighand.wake_group_exec_waiters();
+                }
+            }
+            let should_clear = exec_task
+                .as_ref()
+                .map(|t| Arc::ptr_eq(t, &current))
+                .unwrap_or(false);
+            if should_clear {
+                sighand.finish_group_exec();
+            }
+        }
         // 让INIT进程收养所有子进程
         if current.raw_pid() != RawPid(1) {
             unsafe {
@@ -981,7 +1039,7 @@ pub struct ProcessItimers {
 #[derive(Debug)]
 pub struct ProcessControlBlock {
     /// 当前进程的pid
-    pid: RawPid,
+    pid: AtomicRawPid,
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
     tgid: RawPid,
 
@@ -1029,9 +1087,10 @@ pub struct ProcessControlBlock {
     dumpable: AtomicU8,
 
     /// 父进程指针
-    parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    pub(crate) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// 真实父进程指针
-    real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    pub(crate) real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    pub(crate) fork_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
     children: RwLock<Vec<RawPid>>,
@@ -1160,7 +1219,7 @@ impl ProcessControlBlock {
             let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
             let pcb = Self {
-                pid: raw_pid,
+                pid: AtomicRawPid::new(raw_pid),
                 tgid: raw_pid,
                 thread_pid: RwLock::new(None),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
@@ -1184,7 +1243,8 @@ impl ProcessControlBlock {
                 // 默认设置为 SUID_DUMP_USER(=1)，满足 gVisor 的 SetGetDumpability 预期。
                 dumpable: AtomicU8::new(1),
                 parent_pcb: RwLock::new(ppcb.clone()),
-                real_parent_pcb: RwLock::new(ppcb),
+                real_parent_pcb: RwLock::new(ppcb.clone()),
+                fork_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
                 wait_queue: WaitQueue::default(),
                 cputime_wait_queue: WaitQueue::default(),
@@ -1500,7 +1560,7 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn raw_pid(&self) -> RawPid {
-        return self.pid;
+        return self.pid.load(Ordering::Acquire);
     }
 
     #[inline(always)]
@@ -1574,6 +1634,10 @@ impl ProcessControlBlock {
 
     pub fn real_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         return self.real_parent_pcb.read_irqsave().upgrade();
+    }
+
+    pub fn fork_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.fork_parent_pcb.read_irqsave().upgrade()
     }
 
     /// 判断当前进程是否是全局的init进程
@@ -2026,7 +2090,21 @@ impl ThreadInfo {
         let group_leader = self.group_leader();
         if let Some(leader) = group_leader {
             if Arc::ptr_eq(&leader, &ProcessManager::current_pcb()) {
-                return self.group_tasks.is_empty();
+                if self.group_tasks.is_empty() {
+                    return true;
+                }
+                // 仅当组内存在“存活线程”时才返回 false
+                for weak in &self.group_tasks {
+                    if let Some(task) = weak.upgrade() {
+                        if Arc::ptr_eq(&task, &ProcessManager::current_pcb()) {
+                            continue;
+                        }
+                        if !task.is_exited() && !task.is_dead() && !task.is_zombie() {
+                            return false;
+                        }
+                    }
+                }
+                return true;
             }
             return false;
         }

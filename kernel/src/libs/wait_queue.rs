@@ -36,6 +36,13 @@ use crate::{
 
 use super::spinlock::{SpinLock, SpinLockGuard};
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WaitSignalMode {
+    Uninterruptible,
+    Interruptible,
+    Killable,
+}
+
 #[derive(Debug)]
 struct InnerWaitQueue {
     dead: bool,
@@ -115,7 +122,7 @@ impl WaitQueue {
     where
         F: FnMut() -> Option<R>,
     {
-        self.wait_until_impl(cond, false, None, None::<fn()>)
+        self.wait_until_impl(cond, WaitSignalMode::Uninterruptible, None, None::<fn()>)
             .unwrap()
     }
 
@@ -127,7 +134,15 @@ impl WaitQueue {
     where
         F: FnMut() -> Option<R>,
     {
-        self.wait_until_impl(cond, true, None, None::<fn()>)
+        self.wait_until_impl(cond, WaitSignalMode::Interruptible, None, None::<fn()>)
+    }
+
+    #[track_caller]
+    pub fn wait_until_killable<F, R>(&self, cond: F) -> Result<R, SystemError>
+    where
+        F: FnMut() -> Option<R>,
+    {
+        self.wait_until_impl(cond, WaitSignalMode::Killable, None, None::<fn()>)
     }
 
     /// Waits until condition returns `Some(R)` with timeout (interruptible).
@@ -141,7 +156,12 @@ impl WaitQueue {
     where
         F: FnMut() -> Option<R>,
     {
-        self.wait_until_impl(cond, true, Some(timeout), None::<fn()>)
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Interruptible,
+            Some(timeout),
+            None::<fn()>,
+        )
     }
 
     /// Core implementation for all wait_until variants.
@@ -153,7 +173,7 @@ impl WaitQueue {
     fn wait_until_impl<F, R, B>(
         &self,
         mut cond: F,
-        interruptible: bool,
+        mode: WaitSignalMode,
         timeout: Option<Duration>,
         mut before_sleep: Option<B>,
     ) -> Result<R, SystemError>
@@ -220,10 +240,16 @@ impl WaitQueue {
                 return Ok(res);
             }
 
-            // Check for pending signals (interruptible mode)
-            if interruptible
-                && Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
-            {
+            let has_pending = match mode {
+                WaitSignalMode::Uninterruptible => false,
+                WaitSignalMode::Interruptible => {
+                    Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
+                }
+                WaitSignalMode::Killable => {
+                    Signal::signal_pending_state(false, true, &ProcessManager::current_pcb())
+                }
+            };
+            if has_pending {
                 self.remove_waker(&waker);
                 return cancel_or_timeout(&mut cond, &waker, SystemError::ERESTARTSYS);
             }
@@ -254,7 +280,11 @@ impl WaitQueue {
             };
 
             // Wait to be woken
-            let wait_result = waiter.wait(interruptible);
+            let wait_result = match mode {
+                WaitSignalMode::Uninterruptible => waiter.wait(false),
+                WaitSignalMode::Interruptible => waiter.wait(true),
+                WaitSignalMode::Killable => waiter.wait_killable(),
+            };
 
             // Timer cleanup
             let was_timeout = timer.as_ref().map(|t| t.timeout()).unwrap_or(false);
@@ -293,7 +323,24 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            true,
+            WaitSignalMode::Interruptible,
+            None,
+            before_sleep,
+        )
+    }
+
+    pub fn wait_event_killable<F, B>(
+        &self,
+        mut cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.wait_until_impl(
+            || if cond() { Some(()) } else { None },
+            WaitSignalMode::Killable,
             None,
             before_sleep,
         )
@@ -311,7 +358,7 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            false,
+            WaitSignalMode::Uninterruptible,
             None,
             before_sleep,
         )
@@ -331,7 +378,7 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            true,
+            WaitSignalMode::Interruptible,
             timeout,
             None::<fn()>,
         )
@@ -351,7 +398,7 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            false,
+            WaitSignalMode::Uninterruptible,
             timeout,
             None::<fn()>,
         )
@@ -372,7 +419,7 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            true,
+            WaitSignalMode::Interruptible,
             timeout,
             before_sleep,
         )
@@ -530,6 +577,10 @@ impl Waiter {
 
     pub fn wait(&self, interruptible: bool) -> Result<(), SystemError> {
         block_current(self, interruptible)
+    }
+
+    pub fn wait_killable(&self) -> Result<(), SystemError> {
+        block_current_killable(self)
     }
 
     pub fn waker(&self) -> Arc<Waker> {
@@ -705,6 +756,46 @@ fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError
         if interruptible
             && Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
         {
+            return Err(SystemError::ERESTARTSYS);
+        }
+    }
+}
+
+fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
+    loop {
+        if waiter.waker.consume_notification() {
+            return Ok(());
+        }
+
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        match waiter.waker.prepare_sleep() {
+            WakerSleepState::Notified | WakerSleepState::Closed => {
+                drop(irq_guard);
+                return Ok(());
+            }
+            WakerSleepState::Sleeping => {}
+        }
+
+        ProcessManager::mark_sleep(true)?;
+
+        if waiter.waker.consume_notification() {
+            let pcb = ProcessManager::current_pcb();
+            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+            if matches!(writer.state(), ProcessState::Blocked(_)) {
+                writer.set_state(ProcessState::Runnable);
+                writer.set_wakeup();
+            }
+            pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
+            drop(writer);
+            drop(irq_guard);
+            return Ok(());
+        }
+        drop(irq_guard);
+
+        schedule(SchedMode::SM_NONE);
+
+        if Signal::signal_pending_state(false, true, &ProcessManager::current_pcb()) {
             return Err(SystemError::ERESTARTSYS);
         }
     }

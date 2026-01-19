@@ -17,6 +17,7 @@ use crate::{
 
 use super::{
     namespace::nsproxy::exec_task_namespaces,
+    pid::PidType,
     shebang::{ShebangLoader, SHEBANG_LOADER, SHEBANG_MAX_RECURSION_DEPTH},
     ProcessControlBlock, ProcessFlags, ProcessManager,
 };
@@ -252,15 +253,173 @@ impl ExecParam {
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
 fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-    // todo: 该函数未正确实现
-    let tg_empty = pcb.threads_read_irqsave().thread_group_empty();
-    if tg_empty {
-        pcb.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
-        return Ok(());
+    let current = ProcessManager::current_pcb();
+    if !Arc::ptr_eq(&current, pcb) {
+        return Err(SystemError::EINVAL);
     }
-    log::warn!("de_thread: todo impl thread group logic");
 
-    return Ok(());
+    let sighand = current.sighand();
+    // 与 group-exit/并发 exec 互斥
+    sighand.start_group_exec(&current)?;
+
+    let result = (|| {
+        // log::info!(
+        //     "de_thread: start pid={:?} tgid={:?}",
+        //     current.raw_pid(),
+        //     current.raw_tgid()
+        // );
+
+        if current.threads_read_irqsave().thread_group_empty() {
+            // log::info!(
+            //     "de_thread: single-thread fast path pid={:?}",
+            //     current.raw_pid()
+            // );
+            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        let leader = {
+            let ti = current.threads_read_irqsave();
+            ti.group_leader().unwrap_or_else(|| current.clone())
+        };
+
+        // log::info!(
+        //     "de_thread: leader pid={:?}, current_is_leader={}",
+        //     leader.raw_pid(),
+        //     Arc::ptr_eq(&leader, &current)
+        // );
+
+        let mut kill_list: Vec<Arc<ProcessControlBlock>> = Vec::new();
+        if !Arc::ptr_eq(&leader, &current)
+            && !leader.flags().contains(ProcessFlags::EXITING)
+            && !leader.is_exited()
+            && !leader.is_zombie()
+            && !leader.is_dead()
+        {
+            kill_list.push(leader.clone());
+        }
+        {
+            let ti = leader.threads_read_irqsave();
+            for weak in &ti.group_tasks {
+                if let Some(task) = weak.upgrade() {
+                    if Arc::ptr_eq(&task, &current) {
+                        continue;
+                    }
+                    if task.flags().contains(ProcessFlags::EXITING)
+                        || task.is_exited()
+                        || task.is_zombie()
+                        || task.is_dead()
+                    {
+                        continue;
+                    }
+                    kill_list.push(task);
+                }
+            }
+        }
+
+        sighand.set_group_exec_notify_count(kill_list.len() as isize);
+
+        for task in kill_list {
+            let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
+        }
+
+        let wait_res = sighand.wait_group_exec_event_killable(
+            || {
+                if Signal::fatal_signal_pending(&current) {
+                    return true;
+                }
+                let mut siblings_alive = false;
+                {
+                    let ti = leader.threads_read_irqsave();
+                    for weak in &ti.group_tasks {
+                        if let Some(task) = weak.upgrade() {
+                            if Arc::ptr_eq(&task, &current) {
+                                continue;
+                            }
+                            if !task.is_exited() && !task.is_dead() && !task.is_zombie() {
+                                siblings_alive = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let leader_ready =
+                    Arc::ptr_eq(&leader, &current) || leader.is_zombie() || leader.is_dead();
+                !siblings_alive && leader_ready
+            },
+            None::<fn()>,
+        );
+        if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        // 非 leader exec：等待 leader 进入 zombie 后再交换 tid/raw_pid
+        if !Arc::ptr_eq(&leader, &current) {
+            ProcessManager::exchange_tid_and_raw_pids(&current, &leader)?;
+
+            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+            leader.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
+
+            // 将当前线程提升为线程组 leader，并清空 group_tasks（已无其他线程）
+            {
+                let mut cur_ti = current.threads_write_irqsave();
+                cur_ti.group_leader = Arc::downgrade(&current);
+                cur_ti.group_tasks.clear();
+            }
+            {
+                let mut leader_ti = leader.threads_write_irqsave();
+                leader_ti.group_leader = Arc::downgrade(&current);
+                leader_ti.group_tasks.clear();
+            }
+
+            // 将旧 leader 的 children 列表转移给新 leader
+            {
+                let (first, second) =
+                    if (Arc::as_ptr(&current) as usize) <= (Arc::as_ptr(&leader) as usize) {
+                        (current.clone(), leader.clone())
+                    } else {
+                        (leader.clone(), current.clone())
+                    };
+
+                let mut first_children = first.children.write_irqsave();
+                let mut second_children = second.children.write_irqsave();
+
+                if Arc::ptr_eq(&leader, &first) {
+                    let moved = core::mem::take(&mut *first_children);
+                    second_children.extend(moved);
+                } else {
+                    let moved = core::mem::take(&mut *second_children);
+                    first_children.extend(moved);
+                }
+            }
+
+            // 继承 old leader 的父进程关系
+            let leader_parent = leader.real_parent_pcb.read().clone();
+            *current.parent_pcb.write() = leader_parent.clone();
+            *current.real_parent_pcb.write() = leader_parent;
+            *current.fork_parent_pcb.write() = current.self_ref.clone();
+
+            // log::info!("de_thread: reparented current to old leader's parent");
+
+            // 旧 leader 应由 exec 线程回收，避免父进程在交换前/后提前回收
+            if leader.is_zombie() {
+                if leader.try_mark_dead_from_zombie() {
+                    unsafe { ProcessManager::release(leader.raw_pid()) };
+                }
+            } else if leader.is_dead() {
+                unsafe { ProcessManager::release(leader.raw_pid()) };
+            }
+        } else {
+            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+        }
+
+        // log::info!("de_thread: done pid={:?}", current.raw_pid());
+        Ok(())
+    })();
+
+    sighand.finish_group_exec();
+    result
 }
 
 /// ## 加载二进制文件
@@ -294,12 +453,12 @@ pub fn load_binary_file_with_context(
         // 通过正常的open流程打开解释器文件
         let interpreter_file =
             do_open_execat(AtFlags::AT_FDCWD.bits(), &shebang_info.interpreter_path).inspect_err(
-                |e| {
-                    log::warn!(
-                        "Shebang interpreter not found: {}, error: {:?}",
-                        shebang_info.interpreter_path,
-                        e
-                    );
+                |_e| {
+                    // log::warn!(
+                    //     "Shebang interpreter not found: {}, error: {:?}",
+                    //     shebang_info.interpreter_path,
+                    //     e
+                    // );
                 },
             )?;
 

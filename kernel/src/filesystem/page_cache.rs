@@ -385,25 +385,46 @@ impl PageCacheManager {
         entry: Arc<PageEntry>,
     ) -> Result<(), SystemError> {
         let page = entry.page.clone();
-        match entry.state() {
-            PageState::Loading => {
-                let _ = entry.wait_ready()?;
-            }
-            PageState::Writeback => {
-                entry.wait_queue.wait_until(|| match entry.state() {
-                    PageState::Writeback => None,
-                    PageState::Error => Some(Err(SystemError::EIO)),
-                    _ => Some(Ok(())),
-                })?;
-                let guard = page.read();
-                if !guard.flags().contains(PageFlags::PG_DIRTY) {
-                    return Ok(());
+        loop {
+            match entry.state() {
+                PageState::Loading => {
+                    let _ = entry.wait_ready()?;
+                    continue;
+                }
+                PageState::Writeback => {
+                    entry.wait_queue.wait_until(|| match entry.state() {
+                        PageState::Writeback => None,
+                        PageState::Error => Some(Err(SystemError::EIO)),
+                        _ => Some(Ok(())),
+                    })?;
+                    continue;
+                }
+                PageState::Error => return Err(SystemError::EIO),
+                PageState::UpToDate => {
+                    let guard = page.read();
+                    if !guard.flags().contains(PageFlags::PG_DIRTY) {
+                        return Ok(());
+                    }
+                    drop(guard);
+                    entry.set_state(PageState::Dirty);
+                    let mut inner = cache.inner.lock();
+                    inner.dirty_pages.insert(page_index);
+                    continue;
+                }
+                PageState::Dirty => {
+                    let guard = page.read();
+                    if !guard.flags().contains(PageFlags::PG_DIRTY) {
+                        return Ok(());
+                    }
                 }
             }
-            PageState::Error => return Err(SystemError::EIO),
-            _ => {}
+            if entry
+                .compare_exchange_state(PageState::Dirty, PageState::Writeback)
+                .is_ok()
+            {
+                break;
+            }
         }
-        entry.set_state(PageState::Writeback);
         {
             let mut inner = cache.inner.lock();
             inner.dirty_pages.remove(&page_index);
@@ -490,18 +511,27 @@ impl PageEntry {
     }
 
     fn state(&self) -> PageState {
-        match self.state.load(Ordering::Acquire) {
-            0 => PageState::Loading,
-            1 => PageState::UpToDate,
-            2 => PageState::Dirty,
-            3 => PageState::Writeback,
-            4 => PageState::Error,
-            _ => PageState::Error,
-        }
+        Self::decode_state(self.state.load(Ordering::Acquire))
     }
 
     fn set_state(&self, state: PageState) {
         self.state.store(state as u8, Ordering::Release);
+    }
+
+    fn compare_exchange_state(
+        &self,
+        current: PageState,
+        new: PageState,
+    ) -> Result<PageState, PageState> {
+        self.state
+            .compare_exchange(
+                current as u8,
+                new as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(Self::decode_state)
+            .map_err(Self::decode_state)
     }
 
     fn wait_ready(&self) -> Result<Arc<Page>, SystemError> {
@@ -510,6 +540,17 @@ impl PageEntry {
             PageState::Error => Some(Err(SystemError::EIO)),
             _ => Some(Ok(self.page.clone())),
         })
+    }
+
+    fn decode_state(value: u8) -> PageState {
+        match value {
+            0 => PageState::Loading,
+            1 => PageState::UpToDate,
+            2 => PageState::Dirty,
+            3 => PageState::Writeback,
+            4 => PageState::Error,
+            _ => PageState::Error,
+        }
     }
 }
 

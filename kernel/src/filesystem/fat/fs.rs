@@ -19,7 +19,7 @@ use system_error::SystemError;
 
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::page_cache::{PageCache, SyncPageCacheBackend};
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
@@ -267,7 +267,13 @@ impl LockedFATInode {
         })));
 
         if !inode.0.lock().inode_type.is_dir() {
-            let page_cache = PageCache::new(Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>));
+            let backend = Arc::new(SyncPageCacheBackend::new(
+                Arc::downgrade(&inode) as Weak<dyn IndexNode>
+            ));
+            let page_cache = PageCache::new(
+                Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>),
+                Some(backend),
+            );
             inode.0.lock().page_cache = Some(page_cache);
         }
 

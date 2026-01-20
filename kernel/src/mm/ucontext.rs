@@ -1668,17 +1668,17 @@ impl LockedVMA {
 
     pub fn unmap(&self, mapper: &mut PageMapper, mut flusher: impl Flusher<MMArch>) {
         // todo: 如果当前vma与文件相关，完善文件相关的逻辑
-        let mut guard = self.lock();
+        let mut self_guard = self.lock();
 
         // 获取物理页的anon_vma的守卫
         let mut page_manager_guard = page_manager_lock();
 
         // 获取映射的物理地址
-        if let Some((paddr, _flags)) = mapper.translate(guard.region().start()) {
+        if let Some((paddr, _flags)) = mapper.translate(self_guard.region().start()) {
             // 如果是共享页，执行释放操作
             let page = page_manager_guard.get(&paddr).unwrap();
             let _page_guard = page.read();
-            if let Some(shm_id) = guard.shm_id {
+            if let Some(shm_id) = self_guard.shm_id {
                 let ipcns = ProcessManager::current_ipcns();
                 let mut shm_manager_guard = ipcns.shm.lock();
                 if let Some(kernel_shm) = shm_manager_guard.get_mut(&shm_id) {
@@ -1697,7 +1697,7 @@ impl LockedVMA {
             }
         }
 
-        for page in guard.region.pages() {
+        for page in self_guard.region.pages() {
             if mapper.translate(page.virt_address()).is_none() {
                 continue;
             }
@@ -1717,11 +1717,11 @@ impl LockedVMA {
 
             flusher.consume(flush);
         }
-        guard.mapped = false;
+        self_guard.mapped = false;
 
         // 当vma对应共享文件的写映射时，唤醒脏页回写线程
-        if guard.vm_file().is_some()
-            && guard
+        if self_guard.vm_file().is_some()
+            && self_guard
                 .vm_flags()
                 .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
         {

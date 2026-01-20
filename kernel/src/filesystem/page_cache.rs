@@ -998,8 +998,11 @@ impl PageCache {
     pub fn mark_page_dirty(&self, page_index: usize) {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
-            entry.set_state(PageState::Dirty);
             guard.dirty_pages.insert(page_index);
+            if entry.state() == PageState::Writeback {
+                return;
+            }
+            entry.set_state(PageState::Dirty);
         }
     }
 

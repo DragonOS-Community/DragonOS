@@ -1556,14 +1556,21 @@ impl UserMappings {
         self.vmas.insert(vma);
     }
 
-    /// @brief 删除一个VMA，并把对应的地址空间加入空洞中。
+    
+    /// 将一个 VMA 从当前Mapping中移除，并把对应的地址空间加入空洞中。
     ///
-    /// 这里不会取消VMA对应的地址的映射
+    /// 这里不会取消VMA对应的地址的映射，即不会修改进程页表
     ///
-    /// @param region 要删除的VMA所在的地址范围
+    /// ### 参数
+    ///  region 要删除的VMA所在的地址范围
     ///
-    /// @return 如果成功删除了VMA，则返回被删除的VMA，否则返回None
-    /// 如果没有可以删除的VMA，则不会执行删除操作，并报告失败。
+    /// ### 返回值
+    /// - 如果成功删除了VMA，则返回被删除的VMA，否则返回None
+    /// - 如果没有可以删除的VMA，则不会执行删除操作，并报告失败。
+    /// 
+    /// ### 副作用
+    /// - 会修改vm_holes中的空洞信息
+    /// 
     pub fn remove_vma(&mut self, region: &VirtRegion) -> Option<Arc<LockedVMA>> {
         // 请注意，由于这里会对每个VMA加锁，因此性能很低
         let vma: Arc<LockedVMA> = self

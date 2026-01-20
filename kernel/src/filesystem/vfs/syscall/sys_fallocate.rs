@@ -81,20 +81,21 @@ impl Syscall for SysFallocateHandle {
             let new_size = offset.checked_add(len).ok_or(SystemError::EINVAL)?;
 
             let current_size = md.size as usize;
-            if new_size > current_size {
-                let current_pcb = ProcessManager::current_pcb();
-                let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
-                if fsize_limit.rlim_cur != u64::MAX && new_size as u64 > fsize_limit.rlim_cur {
-                    let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
-                    return Err(SystemError::EFBIG);
-                }
-
-                let r =
-                    crate::filesystem::vfs::vcore::vfs_truncate(file.inode(), new_size).map(|_| 0);
-                return r;
+            // 暂不支持预分配能力，当 new_size <= current_size 时返回 EOPNOTSUPP
+            // 避免 Linux 应用误以为空间已预留，导致后续写入 ENOSPC 的隐蔽问题
+            if new_size <= current_size {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
 
-            return Ok(0);
+            let current_pcb = ProcessManager::current_pcb();
+            let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+            if fsize_limit.rlim_cur != u64::MAX && new_size as u64 > fsize_limit.rlim_cur {
+                let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+                return Err(SystemError::EFBIG);
+            }
+
+            let r = crate::filesystem::vfs::vcore::vfs_truncate(file.inode(), new_size).map(|_| 0);
+            return r;
         }
 
         return Err(SystemError::EBADF);

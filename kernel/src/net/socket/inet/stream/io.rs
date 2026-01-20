@@ -64,22 +64,14 @@ impl TcpSocket {
         }
 
         if !socket.can_recv() {
-            // Linux 语义：对端已关闭写端(收到 FIN)且本端已读完数据时，recv 返回 0。
-            // 如果状态表明已收到 FIN，即使 buffer 为空也应返回 0 (EOF)。
-            let state = socket.state();
-            if matches!(
-                state,
-                smoltcp::socket::tcp::State::CloseWait
-                    | smoltcp::socket::tcp::State::LastAck
-                    | smoltcp::socket::tcp::State::Closing
-                    | smoltcp::socket::tcp::State::TimeWait
-                    | smoltcp::socket::tcp::State::Closed
-            ) {
-                return Ok(0);
-            }
-
             if !socket.may_recv() {
-                return Ok(0);
+                return match socket.recv(|_data| (0usize, ())) {
+                    Ok(()) => Ok(0),
+                    Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
+                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                        Err(SystemError::ECONNRESET)
+                    }
+                };
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
@@ -133,7 +125,7 @@ impl TcpSocket {
         if flags.contains(PMSG::PEEK) {
             return match socket.peek_slice(current_buf) {
                 Ok(size) => Ok(size),
-                Err(smoltcp::socket::tcp::RecvError::InvalidState) => Err(SystemError::ENOTCONN),
+                Err(smoltcp::socket::tcp::RecvError::InvalidState) => Err(SystemError::ECONNRESET),
                 Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
             };
         }
@@ -381,6 +373,20 @@ impl TcpSocket {
     }
 
     pub(crate) fn flush_cork_buffer(&self) -> Result<(), SystemError> {
+        if self
+            .cork_flush_in_progress
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _guard = CorkFlushGuard(self);
+
         loop {
             let cork_buf = self.cork_buf.lock();
             if cork_buf.is_empty() {
@@ -502,5 +508,14 @@ impl TcpSocket {
         }
 
         Err(SystemError::ENOTCONN)
+    }
+}
+
+struct CorkFlushGuard<'a>(&'a TcpSocket);
+impl Drop for CorkFlushGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .cork_flush_in_progress
+            .store(false, core::sync::atomic::Ordering::Release);
     }
 }

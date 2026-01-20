@@ -102,6 +102,7 @@ pub struct TcpSocket {
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
     pub(crate) cork_buf: Mutex<Vec<u8>>,
+    pub(crate) cork_flush_in_progress: AtomicBool,
     pub(crate) recv_shutdown: ShutdownRecvTracker,
 }
 
@@ -128,6 +129,7 @@ impl TcpSocket {
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),
             cork_buf: Mutex::new(Vec::new()),
+            cork_flush_in_progress: AtomicBool::new(false),
             recv_shutdown: ShutdownRecvTracker::new(),
         }
     }

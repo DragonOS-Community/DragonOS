@@ -1,4 +1,0 @@
-# FAT 不支持文件权限导致的报错
-MkdirTest.HonorsUmask
-MkdirTest.HonorsUmask2
-MkdirTest.FailsOnDirWithoutWritePerms

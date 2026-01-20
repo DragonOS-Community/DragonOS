@@ -3,7 +3,6 @@ pub mod ahcidisk;
 pub mod hba;
 use crate::arch::MMArch;
 use crate::driver::base::block::manager::block_dev_manager;
-use crate::driver::block::cache::cached_block_device::BlockCache;
 use crate::driver::disk::ahci::ahcidisk::LockedAhciDisk;
 use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceLinkedList, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
@@ -129,7 +128,6 @@ pub fn ahci_init() -> Result<(), SystemError> {
                 }
             }
         }
-        BlockCache::init();
     }
 
     compiler_fence(core::sync::atomic::Ordering::SeqCst);

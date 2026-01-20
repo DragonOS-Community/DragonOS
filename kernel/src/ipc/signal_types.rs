@@ -862,6 +862,7 @@ bitflags! {
         const STOP_STOPPED = 0x00000001; /* job control stop in effect */
         const STOP_CONTINUED = 0x00000002; /* SIGCONT since WCONTINUED reap */
         const GROUP_EXIT = 0x00000004; /* group exit in progress */
+        const GROUP_EXEC = 0x00000008; /* exec in progress (de-threading) */
         const CLD_STOPPED = 0x00000010; /* Pending notifications to parent */
         const CLD_CONTINUED = 0x00000020;
         const UNKILLABLE = 0x00000040; /* for init: ignore fatal signals */

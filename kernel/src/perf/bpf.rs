@@ -235,7 +235,7 @@ impl BpfPerfEvent {
             data: SpinLock::new(BpfPerfEventData {
                 enabled: false,
                 mmap_page: RingPage::empty(),
-                page_cache: PageCache::new(None),
+                page_cache: PageCache::new(None, None),
                 offset: 0,
             }),
         }

@@ -235,3 +235,9 @@ impl ProcessControlBlock {
         self.pid().ns_of_pid()
     }
 }
+
+impl ProcessManager {
+    pub fn current_pidns() -> Arc<PidNamespace> {
+        Self::current_pcb().active_pid_ns()
+    }
+}

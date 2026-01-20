@@ -6,3 +6,4 @@
 
    kthread
    load_binary
+   de_thread

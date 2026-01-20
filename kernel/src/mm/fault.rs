@@ -161,7 +161,7 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn handle_normal_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let address = pfm.address_aligned_down();
-        let vma = pfm.vma.clone();
+        let vma = pfm.vma();
         let mapper = &mut pfm.mapper;
         if mapper.get_entry(address, 3).is_none() {
             mapper
@@ -199,10 +199,8 @@ impl PageFaultHandler {
         let flags = pfm.flags;
         let vma = pfm.vma.clone();
         let mut ret = VmFaultReason::VM_FAULT_COMPLETED;
-        let mapper = &pfm.mapper;
-
         // pte存在
-        if let Some(mut entry) = mapper.get_entry(address, 0) {
+        if let Some(mut entry) = pfm.mapper.get_entry(address, 0) {
             if !entry.present() {
                 ret = Self::do_swap_page(pfm);
             }
@@ -569,7 +567,7 @@ impl PageFaultHandler {
         let vm_pgoff = (address.data() - vma_region.start().data()) >> MMArch::PAGE_SHIFT;
 
         // 缺页在PTE中的偏移量
-        let pte_pgoff = (address.data() >> MMArch::PAGE_SHIFT) & (1 << MMArch::PAGE_ENTRY_SHIFT);
+        let pte_pgoff = (address.data() >> MMArch::PAGE_SHIFT) & MMArch::PAGE_ENTRY_MASK;
 
         // 缺页在文件中的偏移量
         let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
@@ -602,12 +600,9 @@ impl PageFaultHandler {
         }
 
         let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
-        // from_pte - pte_pgoff得出预读起始pte相对缺失页的偏移，加上pfm.backing_pgoff（缺失页在文件中的偏移）得出起始页在文件中的偏移，结束pte同理
-        fs.map_pages(
-            pfm,
-            backing_pgoff + (from_pte - pte_pgoff),
-            backing_pgoff + (to_pte - pte_pgoff),
-        );
+        let start_pgoff = backing_pgoff - (pte_pgoff - from_pte);
+        let end_pgoff = backing_pgoff + (to_pte - pte_pgoff);
+        fs.map_pages(pfm, start_pgoff, end_pgoff);
 
         VmFaultReason::empty()
     }
@@ -652,16 +647,19 @@ impl PageFaultHandler {
 
         for pgoff in start_pgoff..end_pgoff {
             if let Some(page) = page_cache.lock().get_page(pgoff) {
-                let page_guard = page.read();
+                let page_guard = page.upread();
                 if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
                     let phys = page.phys_address();
 
                     let address =
                         VirtAddr::new(addr.data() + ((pgoff - start_pgoff) << MMArch::PAGE_SHIFT));
-                    mapper
-                        .map_phys(address, phys, vma_guard.flags())
-                        .unwrap()
-                        .flush();
+                    if mapper.get_entry(address, 0).is_none() {
+                        mapper
+                            .map_phys(address, phys, vma_guard.flags())
+                            .unwrap()
+                            .flush();
+                    }
+                    page_guard.upgrade().insert_vma(vma.clone());
                 }
             }
         }
@@ -701,31 +699,17 @@ impl PageFaultHandler {
             // 直接将PageCache中的页面作为要映射的页面
             pfm.page = Some(page.clone());
         } else {
-            // TODO 同步预读
-            // 涉及磁盘IO，返回标志为VM_FAULT_MAJOR
-            ret = VmFaultReason::VM_FAULT_MAJOR;
-            let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
-            match file.pread(
-                backing_pgoff * MMArch::PAGE_SIZE,
-                MMArch::PAGE_SIZE,
-                buffer.as_mut_slice(),
-            ) {
-                Ok(read_len) => {
-                    // 超出文件末尾，返回SIGBUS而不是panic
-                    if read_len == 0 {
-                        return VmFaultReason::VM_FAULT_SIGBUS;
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "filemap_fault: pread failed at pgoff {}, err {:?}",
-                        backing_pgoff,
-                        e
-                    );
+            if let Ok(md) = file.inode().metadata() {
+                let size = md.size.max(0) as usize;
+                if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
                     return VmFaultReason::VM_FAULT_SIGBUS;
                 }
             }
-            drop(buffer);
+
+            ret = VmFaultReason::VM_FAULT_MAJOR;
+            if page_cache.read_pages(backing_pgoff, 1).is_err() {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
 
             let page = page_cache.lock().get_page(backing_pgoff);
             if let Some(page) = page {

@@ -70,15 +70,18 @@ impl Syscall for SysFallocateHandle {
             }
 
             if !mode_flags.contains(FileMode::FMODE_WRITE) || !mode_flags.can_write() {
-                return Err(SystemError::EINVAL);
+                return Err(SystemError::EBADF);
             }
 
             let md = file.inode().metadata()?;
-            if md.file_type != FileType::File {
-                return Err(SystemError::EINVAL);
+            match md.file_type {
+                FileType::File => { /* 普通文件，继续处理 */ }
+                FileType::Dir => return Err(SystemError::EISDIR),
+                FileType::Pipe => return Err(SystemError::ESPIPE),
+                _ => return Err(SystemError::ENODEV),
             }
 
-            let new_size = offset.checked_add(len).ok_or(SystemError::EINVAL)?;
+            let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
 
             let current_size = md.size as usize;
             // 暂不支持预分配能力，当 new_size <= current_size 时返回 EOPNOTSUPP

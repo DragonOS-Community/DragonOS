@@ -95,9 +95,8 @@ impl LockedVMA {
             let page_cache = guard.vm_file().unwrap().inode().page_cache();
             match page_cache {
                 Some(page_cache) => {
-                    let cache_guard = page_cache.lock();
                     for i in 0..nr {
-                        if cache_guard.get_page(pgoff + i).is_some() {
+                        if page_cache.is_page_ready(pgoff + i) {
                             vec[vec_offset + i] = 1;
                         } else {
                             vec[vec_offset + i] = 0;

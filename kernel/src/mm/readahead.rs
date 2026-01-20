@@ -98,20 +98,17 @@ impl<'a> ReadaheadControl<'a> {
         let page_cache = self.page_cache;
         let start_index = self.index;
 
-        let page_cache_guard = page_cache.lock();
-
         if set_flag {
-            set_flag = page_cache_guard
-                .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+            set_flag = page_cache
+                .manager()
+                .peek_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
                 .is_none();
         }
 
         let missing_pages: Vec<_> = (0..number_to_read)
             .map(|i| start_index + i)
-            .filter(|&idx| page_cache_guard.get_page(idx).is_none())
+            .filter(|&idx| !page_cache.is_page_ready(idx))
             .collect();
-
-        drop(page_cache_guard);
 
         if missing_pages.is_empty() {
             return Ok(0);
@@ -137,9 +134,9 @@ impl<'a> ReadaheadControl<'a> {
         }
 
         if set_flag {
-            let page_cache_guard = page_cache.lock();
-            if let Some(page) = page_cache_guard
-                .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+            if let Some(page) = page_cache
+                .manager()
+                .peek_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
             {
                 // log::debug!(
                 //     "set ra flag at {}",
@@ -178,10 +175,9 @@ impl<'a> ReadaheadControl<'a> {
 
         if is_async {
             // 第二次及以后的连续读
-            let page_cache_gaurd = self.page_cache.lock();
             let next_missing_page = {
                 (start_index..start_index + max_pages)
-                    .find(|idx| page_cache_gaurd.get_page(*idx).is_none())
+                    .find(|idx| !self.page_cache.is_page_ready(*idx))
             };
 
             if let Some(next_missing_page) = next_missing_page {

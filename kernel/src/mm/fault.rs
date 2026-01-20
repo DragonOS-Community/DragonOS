@@ -20,7 +20,7 @@ use crate::{
 
 use crate::mm::MemoryManagementArch;
 
-use super::page::{Page, PageFlags};
+use super::page::{Page, PageFlags, PageType};
 
 bitflags! {
     pub struct FaultFlags: u64{
@@ -408,6 +408,11 @@ impl PageFaultHandler {
 
         // 将pagecache页设为脏页，以便回收时能够回写
         cache_page.write().add_flags(PageFlags::PG_DIRTY);
+        if let PageType::File(info) = cache_page.read().page_type().clone() {
+            if let Some(page_cache) = info.page_cache.upgrade() {
+                page_cache.mark_page_dirty(info.index);
+            }
+        }
         ret = ret.union(Self::finish_fault(pfm));
 
         ret
@@ -484,6 +489,11 @@ impl PageFaultHandler {
             table.set_entry(i, entry);
 
             old_page.write().add_flags(PageFlags::PG_DIRTY);
+            if let PageType::File(info) = old_page.read().page_type().clone() {
+                if let Some(page_cache) = info.page_cache.upgrade() {
+                    page_cache.mark_page_dirty(info.index);
+                }
+            }
 
             VmFaultReason::VM_FAULT_COMPLETED
         } else if vma.is_anonymous() {
@@ -646,7 +656,7 @@ impl PageFaultHandler {
                 << MMArch::PAGE_SHIFT);
 
         for pgoff in start_pgoff..end_pgoff {
-            if let Some(page) = page_cache.lock().get_page(pgoff) {
+            if let Some(page) = page_cache.manager().peek_page(pgoff) {
                 let page_guard = page.upread();
                 if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
                     let phys = page.phys_address();
@@ -692,30 +702,22 @@ impl PageFaultHandler {
         let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
         let mut ret = VmFaultReason::empty();
 
-        let page = page_cache.lock().get_page(backing_pgoff);
-        if let Some(page) = page {
-            // TODO 异步从磁盘中预读页面进PageCache
-
-            // 直接将PageCache中的页面作为要映射的页面
-            pfm.page = Some(page.clone());
-        } else {
-            if let Ok(md) = file.inode().metadata() {
-                let size = md.size.max(0) as usize;
-                if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
-                    return VmFaultReason::VM_FAULT_SIGBUS;
-                }
-            }
-
-            ret = VmFaultReason::VM_FAULT_MAJOR;
-            if page_cache.read_pages(backing_pgoff, 1).is_err() {
+        if let Ok(md) = file.inode().metadata() {
+            let size = md.size.max(0) as usize;
+            if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
+        }
 
-            let page = page_cache.lock().get_page(backing_pgoff);
-            if let Some(page) = page {
+        if !page_cache.is_page_ready(backing_pgoff) {
+            ret = VmFaultReason::VM_FAULT_MAJOR;
+        }
+
+        match page_cache.manager().commit_page(backing_pgoff) {
+            Ok(page) => {
                 pfm.page = Some(page);
-            } else {
-                // 读取后仍未获取到页面，视为错误
+            }
+            Err(_) => {
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
         }
@@ -754,27 +756,12 @@ impl PageFaultHandler {
             }
         }
 
-        // 先尝试直接获取
-        if let Some(page) = page_cache.lock().get_page(backing_pgoff) {
-            // 标记为 UPTODATE，便于 map_pages / readahead（即便对 tmpfs 通常不会走）。
-            page.write().add_flags(PageFlags::PG_UPTODATE);
-            pfm.page = Some(page);
-            return VmFaultReason::empty();
-        }
-
-        {
-            let mut pc = page_cache.lock();
-            // 可能并发创建：create 后再 get（忽略已存在/并发导致的轻微差异）
-            pc.create_zero_pages(backing_pgoff, 1).map_err(|_| ()).ok();
-        }
-
-        let page = page_cache.lock().get_page(backing_pgoff);
-        if let Some(page) = page {
-            page.write().add_flags(PageFlags::PG_UPTODATE);
-            pfm.page = Some(page);
-            VmFaultReason::empty()
-        } else {
-            VmFaultReason::VM_FAULT_SIGBUS
+        match page_cache.manager().commit_overwrite(backing_pgoff) {
+            Ok(page) => {
+                pfm.page = Some(page);
+                VmFaultReason::empty()
+            }
+            Err(_) => VmFaultReason::VM_FAULT_SIGBUS,
         }
     }
 

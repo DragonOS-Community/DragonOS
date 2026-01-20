@@ -55,6 +55,17 @@ pub struct TcpSocketOptions {
     pub(crate) tcp_quickack: AtomicBool,
     /// SO_KEEPALIVE
     pub(crate) so_keepalive: AtomicBool,
+
+    /// TCP_KEEPIDLE (seconds)
+    pub(crate) tcp_keepidle_secs: AtomicI32,
+    /// TCP_KEEPINTVL (seconds)
+    pub(crate) tcp_keepintvl_secs: AtomicI32,
+    /// TCP_KEEPCNT
+    pub(crate) tcp_keepcnt: AtomicI32,
+
+    /// SO_LINGER
+    pub(crate) linger_onoff: AtomicI32,
+    pub(crate) linger_linger: AtomicI32,
 }
 
 impl TcpSocketOptions {
@@ -79,6 +90,13 @@ impl TcpSocketOptions {
             tcp_cork: AtomicBool::new(false),
             tcp_quickack: AtomicBool::new(true),
             so_keepalive: AtomicBool::new(false),
+
+            tcp_keepidle_secs: AtomicI32::new(2 * 60 * 60),
+            tcp_keepintvl_secs: AtomicI32::new(75),
+            tcp_keepcnt: AtomicI32::new(9),
+
+            linger_onoff: AtomicI32::new(0),
+            linger_linger: AtomicI32::new(0),
         }
     }
 }
@@ -272,6 +290,31 @@ impl TcpSocket {
     #[inline]
     pub(crate) fn so_keepalive_enabled(&self) -> &AtomicBool {
         &self.options.so_keepalive
+    }
+
+    #[inline]
+    pub(crate) fn tcp_keepidle_secs(&self) -> &AtomicI32 {
+        &self.options.tcp_keepidle_secs
+    }
+
+    #[inline]
+    pub(crate) fn tcp_keepintvl_secs(&self) -> &AtomicI32 {
+        &self.options.tcp_keepintvl_secs
+    }
+
+    #[inline]
+    pub(crate) fn tcp_keepcnt(&self) -> &AtomicI32 {
+        &self.options.tcp_keepcnt
+    }
+
+    #[inline]
+    pub(crate) fn linger_onoff(&self) -> &AtomicI32 {
+        &self.options.linger_onoff
+    }
+
+    #[inline]
+    pub(crate) fn linger_linger(&self) -> &AtomicI32 {
+        &self.options.linger_linger
     }
 
     #[inline]

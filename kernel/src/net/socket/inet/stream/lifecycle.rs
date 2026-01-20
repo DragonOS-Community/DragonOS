@@ -456,8 +456,16 @@ impl TcpSocket {
                 let local_port = es.get_name().port;
                 let iface = es.iface().clone();
                 let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
+                let linger_abort = self
+                    .linger_onoff()
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    != 0
+                    && self
+                        .linger_linger()
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        == 0;
                 let unread = es.with(|socket| socket.recv_queue());
-                if unread > 0 {
+                if linger_abort || unread > 0 {
                     es.with_mut(|socket| socket.abort());
                     es.iface().poll();
                 } else {

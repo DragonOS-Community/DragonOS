@@ -105,6 +105,10 @@ impl From<Options> for i32 {
 
 /// TCP socket option setters.
 impl super::TcpSocket {
+    const MAX_TCP_KEEPIDLE: i32 = 32767;
+    const MAX_TCP_KEEPINTVL: i32 = 32767;
+    const MAX_TCP_KEEPCNT: i32 = 127;
+
     #[inline]
     fn set_bool_option(
         atomic: &core::sync::atomic::AtomicBool,
@@ -295,13 +299,33 @@ impl super::TcpSocket {
             }
             PSO::KEEPALIVE => Self::set_bool_option(self.so_keepalive_enabled(), val, |on| {
                 let interval = if on {
-                    Some(smoltcp::time::Duration::from_secs(7200))
+                    let idle = self
+                        .tcp_keepidle_secs()
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    Some(smoltcp::time::Duration::from_secs(idle.max(1) as u64))
                 } else {
                     None
                 };
                 self.apply_keepalive(interval);
                 Ok(())
             }),
+            PSO::LINGER => {
+                if val.len() < 8 {
+                    return Err(SystemError::EINVAL);
+                }
+                let l_onoff = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
+                let l_linger = i32::from_ne_bytes([val[4], val[5], val[6], val[7]]);
+                if l_linger < 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                self.linger_onoff().store(
+                    if l_onoff != 0 { 1 } else { 0 },
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                self.linger_linger()
+                    .store(l_linger, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
             _ => Ok(()), // Accept and ignore other SOL_SOCKET options
         }
     }
@@ -329,18 +353,39 @@ impl super::TcpSocket {
                 })?;
                 Ok(())
             }
-            Options::KeepIntvl => {
-                let interval = byte_parser::read_u32(val)?;
-                self.with_inner_established(|est| {
-                    est.with_mut(|socket| {
-                        socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
-                            interval as u64,
-                        )));
-                    });
-                })?;
+            Options::KeepIdle => {
+                let v = byte_parser::read_i32(val)?;
+                if !(1..=Self::MAX_TCP_KEEPIDLE).contains(&v) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_keepidle_secs()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                if self
+                    .so_keepalive_enabled()
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    self.apply_keepalive(Some(smoltcp::time::Duration::from_secs(v as u64)));
+                }
                 Ok(())
             }
-            Options::KeepCnt | Options::KeepIdle => Ok(()), // Stub: silently ignore
+            Options::KeepIntvl => {
+                let v = byte_parser::read_i32(val)?;
+                if !(1..=Self::MAX_TCP_KEEPINTVL).contains(&v) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_keepintvl_secs()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::KeepCnt => {
+                let v = byte_parser::read_i32(val)?;
+                if !(1..=Self::MAX_TCP_KEEPCNT).contains(&v) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_keepcnt()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
             Options::INQ => Self::set_bool_option(self.tcp_inq_enabled(), val, |_| Ok(())),
             Options::QuickAck => {
                 Self::set_bool_option(self.tcp_quickack_enabled(), val, |_| Ok(()))
@@ -516,6 +561,9 @@ impl super::TcpSocket {
             Options::MaxSegment => Self::write_atomic_usize_as_u32(value, self.tcp_max_seg()),
             Options::DeferAccept => Self::write_atomic_i32(value, self.tcp_defer_accept()),
             Options::Syncnt => Self::write_atomic_i32(value, self.tcp_syncnt()),
+            Options::KeepIdle => Self::write_atomic_i32(value, self.tcp_keepidle_secs()),
+            Options::KeepIntvl => Self::write_atomic_i32(value, self.tcp_keepintvl_secs()),
+            Options::KeepCnt => Self::write_atomic_i32(value, self.tcp_keepcnt()),
             Options::WindowClamp => Self::write_atomic_usize_as_u32(value, self.tcp_window_clamp()),
             Options::UserTimeout => Self::write_atomic_i32(value, self.tcp_user_timeout()),
             Options::Info => self.get_tcp_info(value),

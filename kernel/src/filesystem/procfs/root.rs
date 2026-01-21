@@ -22,6 +22,7 @@ use crate::{
             thread_self::ThreadSelfDirOps,
             version::VersionFileOps,
             version_signature::VersionSignatureFileOps,
+            vmstat::VmstatFileOps,
             Builder, PROCFS_BLOCK_SIZE, PROCFS_MAX_NAMELEN,
         },
         vfs::{FileSystemMakerData, IndexNode, InodeMode, FSMAKER},
@@ -70,6 +71,7 @@ impl RootDirOps {
         ("thread-self", ThreadSelfDirOps::new_inode),
         ("version", VersionFileOps::new_inode),
         ("version_signature", VersionSignatureFileOps::new_inode),
+        ("vmstat", VmstatFileOps::new_inode),
     ];
 }
 

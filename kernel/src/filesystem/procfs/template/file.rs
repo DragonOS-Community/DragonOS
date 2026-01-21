@@ -158,4 +158,9 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
+
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+        // Linux procfs allows O_TRUNC; treat it as a no-op for pseudo files.
+        Ok(())
+    }
 }

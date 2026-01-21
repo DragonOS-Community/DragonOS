@@ -712,8 +712,8 @@ impl Established {
                         .map_err(|_| SystemError::ECONNABORTED)
                 } else {
                     match socket.state() {
-                        smoltcp::socket::tcp::State::Closed
-                        | smoltcp::socket::tcp::State::TimeWait
+                        smoltcp::socket::tcp::State::Closed => Err(SystemError::ECONNRESET),
+                        smoltcp::socket::tcp::State::TimeWait
                         | smoltcp::socket::tcp::State::Closing
                         | smoltcp::socket::tcp::State::LastAck => Err(SystemError::EPIPE),
                         _ => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),

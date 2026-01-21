@@ -359,7 +359,12 @@ impl PageReclaimer {
                 // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
                 // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
                 if let Some(page_cache) = info.page_cache.upgrade() {
-                    page_cache.lock().remove_page(page_index);
+                    if !page_cache.is_page_ready(page_index) {
+                        drop(guard);
+                        page_reclaimer_lock().insert_page(paddr, &page);
+                        continue;
+                    }
+                    let _ = page_cache.manager().remove_page(page_index);
                 }
                 page_manager_lock().remove_page(&paddr);
             }
@@ -438,6 +443,8 @@ impl PageReclaimer {
         };
 
         if len > 0 {
+            page_cache.mark_page_writeback(page_index);
+            guard.remove_flags(PageFlags::PG_DIRTY);
             let data = unsafe {
                 core::slice::from_raw_parts(
                     MMArch::phys_2_virt(paddr).unwrap().data() as *const u8,
@@ -462,11 +469,17 @@ impl PageReclaimer {
                     e
                 );
                 guard.add_flags(PageFlags::PG_ERROR);
+                page_cache.mark_page_error(page_index);
                 return;
             }
         }
 
-        guard.remove_flags(PageFlags::PG_DIRTY | PageFlags::PG_ERROR);
+        guard.remove_flags(PageFlags::PG_ERROR);
+        if guard.flags().contains(PageFlags::PG_DIRTY) {
+            page_cache.mark_page_dirty(page_index);
+        } else {
+            page_cache.mark_page_uptodate(page_index);
+        }
     }
 
     /// lru脏页刷新

@@ -287,6 +287,7 @@ impl ProcessManager {
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
+        let was_uninterruptible = matches!(state, ProcessState::Blocked(false));
         if state.is_blocked() {
             let mut writer = pcb.sched_info().inner_lock_write_irqsave();
             let state = writer.state();
@@ -302,6 +303,9 @@ impl ProcessManager {
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();
+                if was_uninterruptible {
+                    rq.dec_nr_uninterruptible();
+                }
                 rq.activate_task(
                     pcb,
                     EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,

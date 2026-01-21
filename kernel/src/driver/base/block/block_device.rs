@@ -290,7 +290,11 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        self.read_at_sync(lba_id_start, count, buf)
+        let bio = self.submit_bio_read(lba_id_start, count)?;
+        let data = bio.wait()?;
+        let copy_len = core::cmp::min(buf.len(), data.len());
+        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+        Ok(copy_len)
     }
 
     /// # 函数的功能
@@ -301,7 +305,9 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        self.write_at_sync(lba_id_start, count, buf)
+        let bio = self.submit_bio_write(lba_id_start, count, buf)?;
+        let _ = bio.wait()?;
+        Ok(core::cmp::min(buf.len(), count * LBA_SIZE))
     }
 
     fn write_at_bytes(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {

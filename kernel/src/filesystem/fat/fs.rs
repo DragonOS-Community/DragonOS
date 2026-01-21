@@ -19,7 +19,7 @@ use system_error::SystemError;
 
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::page_cache::{PageCache, SyncPageCacheBackend};
+use crate::filesystem::page_cache::{AsyncPageCacheBackend, PageCache};
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
@@ -267,7 +267,7 @@ impl LockedFATInode {
         })));
 
         if !inode.0.lock().inode_type.is_dir() {
-            let backend = Arc::new(SyncPageCacheBackend::new(
+            let backend = Arc::new(AsyncPageCacheBackend::new(
                 Arc::downgrade(&inode) as Weak<dyn IndexNode>
             ));
             let page_cache = PageCache::new(
@@ -1967,7 +1967,7 @@ impl IndexNode for LockedFATInode {
         if let Some(page_cache) = self.page_cache() {
             let start_page = (len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
             truncate_inode_pages(page_cache.clone(), start_page);
-            page_cache.lock().resize(len)?;
+            page_cache.manager().resize(len)?;
         }
 
         let mut guard: MutexGuard<FATInode> = self.0.lock();

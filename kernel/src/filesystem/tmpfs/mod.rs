@@ -527,35 +527,25 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let mut items: Vec<ReadItem> = Vec::new();
-        {
-            let mut page_cache_guard = page_cache.lock();
-            for page_index in start_page_index..=end_page_index {
-                let page_start = page_index * MMArch::PAGE_SIZE;
-                let page_end = page_start + MMArch::PAGE_SIZE;
+        for page_index in start_page_index..=end_page_index {
+            let page_start = page_index * MMArch::PAGE_SIZE;
+            let page_end = page_start + MMArch::PAGE_SIZE;
 
-                let read_start = core::cmp::max(offset, page_start);
-                let read_end = core::cmp::min(offset + read_len, page_end);
-                let page_read_len = read_end.saturating_sub(read_start);
-                if page_read_len == 0 {
-                    continue;
-                }
-
-                // tmpfs: 缺页即创建零页
-                let page = if let Some(page) = page_cache_guard.get_page(page_index) {
-                    page
-                } else {
-                    page_cache_guard.create_zero_pages(page_index, 1)?;
-                    page_cache_guard
-                        .get_page(page_index)
-                        .ok_or(SystemError::EIO)?
-                };
-
-                items.push(ReadItem {
-                    page,
-                    page_offset: read_start - page_start,
-                    sub_len: page_read_len,
-                });
+            let read_start = core::cmp::max(offset, page_start);
+            let read_end = core::cmp::min(offset + read_len, page_end);
+            let page_read_len = read_end.saturating_sub(read_start);
+            if page_read_len == 0 {
+                continue;
             }
+
+            // tmpfs: 缺页即创建零页
+            let page = page_cache.manager().commit_overwrite(page_index)?;
+
+            items.push(ReadItem {
+                page,
+                page_offset: read_start - page_start,
+                sub_len: page_read_len,
+            });
         }
 
         let mut dst_off = 0usize;
@@ -626,39 +616,31 @@ impl IndexNode for LockedTmpfsInode {
         // 两阶段写入：同样避免在持有 page_cache 锁时触碰用户缓冲区（SelfRead）。
         struct WriteItem {
             page: Arc<Page>,
+            page_index: usize,
             page_offset: usize,
             sub_len: usize,
         }
 
         let mut items: Vec<WriteItem> = Vec::new();
-        {
-            let mut page_cache_guard = page_cache.lock();
-            for page_index in start_page_index..=end_page_index {
-                let page_start = page_index * MMArch::PAGE_SIZE;
-                let page_end = page_start + MMArch::PAGE_SIZE;
+        for page_index in start_page_index..=end_page_index {
+            let page_start = page_index * MMArch::PAGE_SIZE;
+            let page_end = page_start + MMArch::PAGE_SIZE;
 
-                let write_start = core::cmp::max(offset, page_start);
-                let write_end = core::cmp::min(offset + len, page_end);
-                let page_write_len = write_end.saturating_sub(write_start);
-                if page_write_len == 0 {
-                    continue;
-                }
-
-                let page = if let Some(page) = page_cache_guard.get_page(page_index) {
-                    page
-                } else {
-                    page_cache_guard.create_zero_pages(page_index, 1)?;
-                    page_cache_guard
-                        .get_page(page_index)
-                        .ok_or(SystemError::EIO)?
-                };
-
-                items.push(WriteItem {
-                    page,
-                    page_offset: write_start - page_start,
-                    sub_len: page_write_len,
-                });
+            let write_start = core::cmp::max(offset, page_start);
+            let write_end = core::cmp::min(offset + len, page_end);
+            let page_write_len = write_end.saturating_sub(write_start);
+            if page_write_len == 0 {
+                continue;
             }
+
+            let page = page_cache.manager().commit_overwrite(page_index)?;
+
+            items.push(WriteItem {
+                page,
+                page_index,
+                page_offset: write_start - page_start,
+                sub_len: page_write_len,
+            });
         }
 
         let mut src_off = 0usize;
@@ -677,6 +659,7 @@ impl IndexNode for LockedTmpfsInode {
                     .copy_from_slice(&buf[src_off..src_off + it.sub_len]);
             }
             page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
+            page_cache.manager().update_page(it.page_index)?;
             src_off += it.sub_len;
         }
 

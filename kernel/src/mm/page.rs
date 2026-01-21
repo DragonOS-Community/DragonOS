@@ -17,12 +17,16 @@ use lru::LruCache;
 use crate::{
     arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
-    filesystem::{page_cache::PageCache, vfs::FilePrivateData},
+    filesystem::{
+        page_cache::{list_page_caches, PageCache},
+        vfs::FilePrivateData,
+    },
     init::initcall::INITCALL_CORE,
     libs::{
         mutex::{Mutex, MutexGuard},
         rwsem::{RwSem, RwSemReadGuard, RwSemUpgradeableGuard, RwSemWriteGuard},
     },
+    mm::page_cache_stats as pc_stats,
     process::{ProcessControlBlock, ProcessManager},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -371,6 +375,20 @@ impl PageReclaimer {
         }
     }
 
+    /// Drop clean pagecache pages only, matching Linux drop_caches semantics.
+    pub fn drop_pagecache(clean_only: bool) -> usize {
+        if !clean_only {
+            return 0;
+        }
+
+        let mut dropped = 0;
+        for cache in list_page_caches() {
+            dropped += cache.drop_clean_pages();
+        }
+
+        dropped
+    }
+
     /// 唤醒页面回收线程
     pub fn wakeup_claim_thread() {
         // log::info!("wakeup_claim_thread");
@@ -624,12 +642,24 @@ impl InnerPage {
 
     /// 将vma加入anon_vma
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
+        let was_mapped = self.map_count() > 0;
         self.vma_set.insert(vma);
+        if !was_mapped && matches!(self.page_type, PageType::File(_)) {
+            pc_stats::inc_file_mapped();
+        }
     }
 
     /// 将vma从anon_vma中删去
     pub fn remove_vma(&mut self, vma: &LockedVMA) {
-        self.vma_set.remove(vma);
+        let was_mapped = self.map_count() > 0;
+        let removed = self.vma_set.remove(vma);
+        if removed
+            && was_mapped
+            && self.map_count() == 0
+            && matches!(self.page_type, PageType::File(_))
+        {
+            pc_stats::dec_file_mapped();
+        }
     }
 
     /// 判断当前物理页是否能被回

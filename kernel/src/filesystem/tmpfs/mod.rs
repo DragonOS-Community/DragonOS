@@ -791,6 +791,7 @@ impl IndexNode for LockedTmpfsInode {
                 Some(backend),
             );
             pc.set_unevictable(true);
+            pc.set_shmem(true);
             result.0.lock().page_cache = Some(pc);
         }
 

@@ -1,18 +1,24 @@
 use alloc::{string::ToString, sync::Arc};
 use unified_init::macros::unified_init;
 
+use crate::arch::MMArch;
 use crate::{
-    driver::base::firmware::sys_firmware_kobj,
     driver::base::{
-        kobject::{KObjType, KObject, KObjectManager, KObjectSysFSOps},
+        firmware::sys_firmware_kobj,
+        kobject::{DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectSysFSOps},
         kset::KSet,
     },
     filesystem::{
-        sysfs::{Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport, SYSFS_ATTR_MODE_RO},
+        sysfs::{
+            file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport,
+            SYSFS_ATTR_MODE_RO,
+        },
         vfs::InodeMode,
     },
     init::initcall::INITCALL_POSTCORE,
     libs::casting::DowncastArc,
+    misc::ksysfs::sys_kernel_kobj,
+    mm::{page_cache_stats, MemoryManagementArch},
 };
 
 use crate::driver::base::kobject::CommonKobj;
@@ -344,4 +350,182 @@ fn memmap_sysfs_add(index: &usize, desc: &Arc<MemmapDesc>) {
     KObjectManager::add_kobj(desc.clone() as Arc<dyn KObject>).unwrap_or_else(|e| {
         log::warn!("Failed to add memmap({index:?}) kobject to sysfs: {:?}", e);
     });
+}
+
+#[derive(Debug)]
+struct PagecacheAttrGroup;
+
+impl AttributeGroup for PagecacheAttrGroup {
+    fn name(&self) -> Option<&str> {
+        None
+    }
+
+    fn attrs(&self) -> &[&'static dyn Attribute] {
+        &[
+            &AttrCachedKb,
+            &AttrDirtyKb,
+            &AttrWritebackKb,
+            &AttrMappedKb,
+            &AttrShmemKb,
+        ]
+    }
+
+    fn is_visible(
+        &self,
+        _kobj: Arc<dyn KObject>,
+        attr: &'static dyn Attribute,
+    ) -> Option<InodeMode> {
+        Some(attr.mode())
+    }
+}
+
+#[derive(Debug)]
+struct AttrCachedKb;
+
+impl Attribute for AttrCachedKb {
+    fn name(&self) -> &str {
+        "cached_kb"
+    }
+
+    fn mode(&self) -> InodeMode {
+        SYSFS_ATTR_MODE_RO
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+
+    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let stats = page_cache_stats::snapshot();
+        let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
+        let cached = stats.file_pages.saturating_sub(stats.shmem_pages) * page_kb;
+        sysfs_emit_str(buf, &format!("{cached}\n"))
+    }
+}
+
+#[derive(Debug)]
+struct AttrDirtyKb;
+
+impl Attribute for AttrDirtyKb {
+    fn name(&self) -> &str {
+        "dirty_kb"
+    }
+
+    fn mode(&self) -> InodeMode {
+        SYSFS_ATTR_MODE_RO
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+
+    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let stats = page_cache_stats::snapshot();
+        let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
+        let dirty = stats.file_dirty * page_kb;
+        sysfs_emit_str(buf, &format!("{dirty}\n"))
+    }
+}
+
+#[derive(Debug)]
+struct AttrWritebackKb;
+
+impl Attribute for AttrWritebackKb {
+    fn name(&self) -> &str {
+        "writeback_kb"
+    }
+
+    fn mode(&self) -> InodeMode {
+        SYSFS_ATTR_MODE_RO
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+
+    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let stats = page_cache_stats::snapshot();
+        let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
+        let writeback = stats.file_writeback * page_kb;
+        sysfs_emit_str(buf, &format!("{writeback}\n"))
+    }
+}
+
+#[derive(Debug)]
+struct AttrMappedKb;
+
+impl Attribute for AttrMappedKb {
+    fn name(&self) -> &str {
+        "mapped_kb"
+    }
+
+    fn mode(&self) -> InodeMode {
+        SYSFS_ATTR_MODE_RO
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+
+    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let stats = page_cache_stats::snapshot();
+        let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
+        let mapped = stats.file_mapped * page_kb;
+        sysfs_emit_str(buf, &format!("{mapped}\n"))
+    }
+}
+
+#[derive(Debug)]
+struct AttrShmemKb;
+
+impl Attribute for AttrShmemKb {
+    fn name(&self) -> &str {
+        "shmem_kb"
+    }
+
+    fn mode(&self) -> InodeMode {
+        SYSFS_ATTR_MODE_RO
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+
+    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let stats = page_cache_stats::snapshot();
+        let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
+        let shmem = stats.shmem_pages * page_kb;
+        sysfs_emit_str(buf, &format!("{shmem}\n"))
+    }
+}
+
+#[unified_init(INITCALL_POSTCORE)]
+fn pagecache_sysfs_init() -> Result<(), SystemError> {
+    let kernel_kobj = sys_kernel_kobj();
+    let mm_kobj = CommonKobj::new("mm".to_string());
+    mm_kobj.set_parent(Some(Arc::downgrade(&(kernel_kobj as Arc<dyn KObject>))));
+    KObjectManager::init_and_add_kobj(mm_kobj.clone(), Some(&DynamicKObjKType)).unwrap_or_else(
+        |e| {
+            log::warn!("Failed to add mm kobject to sysfs: {:?}", e);
+        },
+    );
+
+    let pagecache_kobj = CommonKobj::new("pagecache".to_string());
+    pagecache_kobj.set_parent(Some(Arc::downgrade(&(mm_kobj as Arc<dyn KObject>))));
+    KObjectManager::init_and_add_kobj(pagecache_kobj.clone(), Some(&DynamicKObjKType))
+        .unwrap_or_else(|e| {
+            log::warn!("Failed to add pagecache kobject to sysfs: {:?}", e);
+        });
+
+    crate::filesystem::sysfs::sysfs_instance()
+        .create_groups(
+            &(pagecache_kobj as Arc<dyn KObject>),
+            &[&PagecacheAttrGroup],
+        )
+        .map_err(|e| {
+            log::warn!("Failed to create pagecache sysfs groups: {:?}", e);
+            SystemError::ENOMEM
+        })?;
+
+    Ok(())
 }

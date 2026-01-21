@@ -514,7 +514,8 @@ impl TcpSocket {
                 writer.replace(inner::Inner::Closed(closed));
             }
         };
-
+        drop(writer);
+        self.notify();
         Ok(())
     }
 }

@@ -1,105 +1,98 @@
 ---
 name: dragonos-gvisor-test-analysis
-description: Analyzes DragonOS gVisor test failures by comparing with Linux/gvisor reference implementations. Outputs structured fix documents in table format (3+ failures) or detailed format (1-2 failures) with code snippets. Use when user mentions gVisor test failures, specific test cases, or asks for bug analysis/fix plans.
-version: 0.1.0
+description: 通过对比 Linux/gvisor 参考实现来分析 DragonOS gVisor 测试失败。输出结构化的修复文档，采用表格格式（3+个失败）或详细格式（1-2个失败）并提供代码片段。当用户提及 gVisor 测试失败、特定测试用例或询问 bug 分析/修复方案时使用。
+version: 0.1.1
 allowed-tools: Read, Grep, Glob, Bash
 ---
 
-# DragonOS gVisor Test Failure Analyzer
+# DragonOS gVisor 测试失败分析器
 
-## Purpose
+## 目的
 
-Analyzes DragonOS test failures from gVisor test suite by referencing Linux kernel and gVisor implementations. Outputs fix documents that identify root causes and provide actionable fix plans.
+通过参考 Linux 内核和 gVisor 实现来分析 DragonOS 在 gVisor 测试套件中的失败。输出识别根本原因并提供可执行修复计划的文档。
 
-## Output Format Selection
+## 输出格式选择
 
-- **1-2 test failures** → Detailed format with code snippets and line-by-line comparison
-- **3+ test failures** → Table format with root cause grouping for quick overview
+- **1-2 个测试失败** → 详细格式，包含代码片段和逐行对比
+- **3+ 个测试失败** → 表格格式，按根本原因分组以便快速概览
 
-## Reference Paths
+## 参考路径
 
 ```
-gVisor tests:  ../gvisor/test/syscalls/linux/
-Linux kernel:  ../linux/kernel/
-DragonOS:      kernel/src/
+gVisor 测试:  ../gvisor/test/syscalls/linux/
+Linux 内核:   ../linux/kernel/
+DragonOS:     kernel/src/
 ```
 
-## Workflow
+## 工作流程
 
-### Step 1: Parse Test Failures
+### 步骤 1: 解析测试失败
 
-Extract from user input:
-- All failed test names (format: `TestSuite.TestCase`)
-- GTEST output messages like:
+从用户输入中提取：
+- 所有失败的测试名称（格式：`TestSuite.TestCase`）
+- GTEST 输出消息，例如：
   ```
   [  RUN     ] WaitTest.Wait4Rusage
   [  FAILED  ] WaitTest.Wait4Rusage (0 ms)
   ```
-- Error patterns or panic messages
-- Stack traces if present
+- 错误模式或 panic 消息
+- 堆栈跟踪（如果存在）
 
-### Step 2: Choose Format
+### 步骤 2: 选择格式
 
-Count unique test failures:
-- ≤ 2: Use **Single Test Format** (see FORMAT.md)
-- ≥ 3: Use **Batch Format** (see FORMAT.md)
+统计唯一的测试失败数量：
+- ≤ 2: 使用**单测试格式**（参见 FORMAT.md）
+- ≥ 3: 使用**批量格式**（参见 FORMAT.md）
 
-### Step 3: Locate Test Code
+### 步骤 3: 定位测试代码
 
-Find gVisor test implementation:
+查找 gVisor 测试实现：
 ```
-Use Glob to find: ../gvisor/test/syscalls/linux/*<syscall>*.cc
-Use Grep to find: TEST.*<test_name>
-```
-
-### Step 4: Trace System Call Path
-
-Map the call chain:
-```
-Test → Syscall → DragonOS Implementation → Bug
+使用 Glob 查找: ../gvisor/test/syscalls/linux/*<syscall>*.cc
+使用 Grep 查找: TEST.*<test_name>
 ```
 
-Find DragonOS implementation:
-```
-Grep for: fn sys_<syscall_name> or syscall!(<syscall_name>)
-```
+### 步骤 4: 追踪系统调用路径
 
-### Step 5: Compare with Linux Reference
-
-Find Linux reference implementation:
+映射调用链：
 ```
-Grep in ../linux: SYSCALL_DEFINE.*<syscall_name>
+测试 → 系统调用 → DragonOS 实现 → Bug
 ```
 
-### Step 6: Generate Fix Document
-
-Follow the appropriate format in `references/FORMAT.md`:
-- **Single Test Format** (1-2 failures): Detailed analysis with code snippets
-- **Batch Format** (3+ failures): Table format grouped by root cause
-
-## Examples
-
-**Input (single test)**:
+查找 DragonOS 实现：
 ```
-分析一下 WaitTest.Wait4Rusage 为什么失败
+使用 Grep 查找: fn sys_<syscall_name> 或 syscall!(<syscall_name>)
 ```
 
-**Output**: Detailed format with code from `exit.c:wait4` and `process/exit.rs` (see FORMAT.md for structure)
+### 步骤 5: 对比 Linux 参考
 
----
-
-**Input (multiple tests)**:
+查找 Linux 参考实现：
 ```
-wait_test 失败了20个测试用例，包括 Wait4Rusage, WaitidRusage, WaitAnyChildTest.*,请对比 Linux 和 gvisor 的实现，分析失败原因并给出修复方案
+在 ../linux 中使用 Grep: SYSCALL_DEFINE.*<syscall_name>
 ```
 
-**Output**: Table format with ~20 rows grouped by 4-5 root causes (see FORMAT.md for structure)
+### 步骤 6: 生成修复文档
 
-## Notes
+遵循 `references/FORMAT.md` 中的相应格式：
+- **单测试格式**（1-2个失败）：包含代码片段的详细分析
+- **批量格式**（3+个失败）：按根本原因分组的表格格式
 
-- Always cite `file:line` for code references
-- Code snippets should be minimal (5-10 lines max)
-- For batch format, group tests by root cause first, not by test suite
-- Cascading failures: note which test is the root cause
-- If Linux/gvisor differ, explain your choice and rationale
-- Consider DragonOS architecture constraints when proposing fixes
+## 示例
+
+完整的输入输出示例和详细使用场景，请参见 [EXAMPLES.md](references/EXAMPLES.md)。
+
+该文件包含：
+- 单个测试失败分析示例
+- 多个测试失败批量分析示例
+- 测试失败输出模式识别
+- 系统调用路径追踪示例
+- 根本原因分组示例
+
+## 注意事项
+
+- 始终引用 `file:line` 作为代码参考
+- 代码片段应最小化（最多 5-10 行）
+- 对于批量格式，先按根本原因分组测试，而不是按测试套件
+- 级联失败：注明哪个测试是根本原因
+- 如果 Linux/gvisor 存在差异，说明你的选择和理由
+- 提出修复方案时考虑 DragonOS 架构约束

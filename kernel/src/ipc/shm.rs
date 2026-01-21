@@ -387,7 +387,7 @@ pub struct KernelShm {
     shm_ctim: PosixTimeSpec,
     /// 创建者进程id
     shm_cprid: RawPid,
-    /// 最后操作者进程id
+    /// 最后操作者进程id (这里的操作者是指最后一次 attach 或 detach 操作的进程，创建共享内存段的进程不算操作者)
     shm_lprid: RawPid,
 }
 

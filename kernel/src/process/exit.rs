@@ -95,6 +95,9 @@ pub fn kernel_wait4(
     options: WaitOption,
     rusage_buf: Option<&mut RUsage>,
 ) -> Result<usize, SystemError> {
+    if pid == i32::MIN {
+        return Err(SystemError::ESRCH);
+    }
     let converter = PidConverter::from_id(pid).ok_or(SystemError::ECHILD)?;
 
     // 构造参数
@@ -273,11 +276,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             }
 
             // 获取用于等待的 PCB（线程组 leader 或当前线程，取决于 WNOTHREAD）
-            let parent = if kwo.options.contains(WaitOption::WNOTHREAD) {
-                current.clone()
-            } else {
-                get_thread_group_leader(&current)
-            };
+            let parent = get_thread_group_leader(&current);
 
             // 等待指定子进程：睡眠在父进程自己的 wait_queue 上
             // 子进程退出时会发送信号并唤醒父进程的 wait_queue
@@ -322,21 +321,117 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             // 等待任意子进程：使用线程组 leader 的 wait_queue 和 children 列表
             // 这样线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
             let current = ProcessManager::current_pcb();
-            let parent = if kwo.options.contains(WaitOption::WNOTHREAD) {
-                // 带 __WNOTHREAD：只使用当前线程的 children
-                current.clone()
-            } else {
-                // 默认：使用线程组 leader 的 children
-                get_thread_group_leader(&current)
-            };
+            let parent = get_thread_group_leader(&current);
             loop {
                 if kwo.options.contains(WaitOption::WNOHANG) {
                     let rd_children = parent.children.read();
                     if rd_children.is_empty() {
                         break Err(SystemError::ECHILD);
-                    } else {
-                        break Ok(0);
                     }
+                    let mut scan_result: Option<Result<usize, SystemError>> = None;
+                    let mut has_waitable_child = false;
+                    let mut all_waitable_children_exited = true;
+                    let mut pid_to_release: Option<RawPid> = None;
+
+                    for pid in rd_children.iter() {
+                        let pcb = match ProcessManager::find_task_by_vpid(*pid) {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        if !is_eligible_child(&pcb, kwo.options) {
+                            continue;
+                        }
+                        if !child_matches_wait_options(&pcb, kwo.options) {
+                            continue;
+                        }
+                        has_waitable_child = true;
+
+                        let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
+                        let state = sched_guard.state();
+                        if !pcb.is_zombie() {
+                            all_waitable_children_exited = false;
+                        }
+
+                        if matches!(state, ProcessState::Stopped)
+                            && kwo.options.contains(WaitOption::WSTOPPED)
+                            && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
+                        {
+                            let stopsig = Signal::SIGSTOP as i32;
+                            kwo.no_task_error = None;
+                            kwo.ret_info = Some(WaitIdInfo {
+                                pid: pcb.task_pid_vnr(),
+                                status: stopsig,
+                                cause: SigChildCode::Stopped.into(),
+                            });
+                            kwo.ret_status = (stopsig << 8) | 0x7f;
+                            if !kwo.options.contains(WaitOption::WNOWAIT) {
+                                pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
+                            }
+                            scan_result = Some(Ok((*pid).into()));
+                            drop(sched_guard);
+                            break;
+                        } else if kwo.options.contains(WaitOption::WCONTINUED)
+                            && pcb.sighand().flags_contains(SignalFlags::CLD_CONTINUED)
+                        {
+                            kwo.no_task_error = None;
+                            kwo.ret_info = Some(WaitIdInfo {
+                                pid: pcb.task_pid_vnr(),
+                                status: Signal::SIGCONT as i32,
+                                cause: SigChildCode::Continued.into(),
+                            });
+                            kwo.ret_status = 0xffff;
+                            if !kwo.options.contains(WaitOption::WNOWAIT) {
+                                pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
+                            }
+                            scan_result = Some(Ok((*pid).into()));
+                            drop(sched_guard);
+                            break;
+                        } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
+                            if reap_blocked_by_group_exec(&pcb) {
+                                drop(sched_guard);
+                                continue;
+                            }
+                            let Some(code) = state.exit_code() else {
+                                drop(sched_guard);
+                                continue;
+                            };
+                            let raw = code as i32;
+                            kwo.ret_status = raw;
+                            let status8 = wstatus_to_waitid_status(raw);
+                            kwo.no_task_error = None;
+                            kwo.ret_info = Some(WaitIdInfo {
+                                pid: pcb.task_pid_vnr(),
+                                status: status8,
+                                cause: SigChildCode::Exited.into(),
+                            });
+                            tmp_child_pcb = Some(pcb.clone());
+                            if !kwo.options.contains(WaitOption::WNOWAIT) {
+                                if !pcb.try_mark_dead_from_zombie() {
+                                    drop(sched_guard);
+                                    continue;
+                                }
+                                pid_to_release = Some(pcb.raw_pid());
+                            }
+                            scan_result = Some(Ok((*pid).into()));
+                            drop(sched_guard);
+                            break;
+                        }
+                        drop(sched_guard);
+                    }
+                    drop(rd_children);
+                    if let Some(pid) = pid_to_release {
+                        unsafe { ProcessManager::release(pid) };
+                    }
+                    if let Some(r) = scan_result.take() {
+                        break r;
+                    }
+                    if !has_waitable_child {
+                        break Err(SystemError::ECHILD);
+                    }
+                    if all_waitable_children_exited && !kwo.options.contains(WaitOption::WEXITED) {
+                        break Err(SystemError::ECHILD);
+                    }
+                    break Ok(0);
                 }
 
                 let mut scan_result: Option<Result<usize, SystemError>> = None;
@@ -349,7 +444,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             echild = true;
                             return true;
                         }
-                        let mut all_children_exited = true;
+                        let mut has_waitable_child = false;
+                        let mut all_waitable_children_exited = true;
                         let mut pid_to_release: Option<RawPid> = None;
 
                         for pid in rd_childen.iter() {
@@ -364,11 +460,12 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             if !child_matches_wait_options(&pcb, kwo.options) {
                                 continue;
                             }
+                            has_waitable_child = true;
 
                             let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                             let state = sched_guard.state();
                             if !pcb.is_zombie() {
-                                all_children_exited = false;
+                                all_waitable_children_exited = false;
                             }
 
                             if matches!(state, ProcessState::Stopped)
@@ -444,7 +541,13 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         if scan_result.is_some() {
                             return true;
                         }
-                        if all_children_exited && !kwo.options.contains(WaitOption::WEXITED) {
+                        if !has_waitable_child {
+                            echild = true;
+                            return true;
+                        }
+                        if all_waitable_children_exited
+                            && !kwo.options.contains(WaitOption::WEXITED)
+                        {
                             echild = true;
                             return true;
                         }
@@ -475,12 +578,131 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             // **子进程**中属于指定进程组的进程，而不是进程组中的所有进程。
             // 因此，这里遍历线程组 leader 的 children 列表，检查每个子进程是否属于目标进程组。
             let current = ProcessManager::current_pcb();
-            let parent = if kwo.options.contains(WaitOption::WNOTHREAD) {
-                current.clone()
-            } else {
-                get_thread_group_leader(&current)
-            };
+            let parent = get_thread_group_leader(&current);
             loop {
+                if kwo.options.contains(WaitOption::WNOHANG) {
+                    let rd_children = parent.children.read();
+                    if rd_children.is_empty() {
+                        break Err(SystemError::ECHILD);
+                    }
+
+                    let mut has_matching_child = false;
+                    let mut scan_result: Option<Result<usize, SystemError>> = None;
+                    let mut all_matching_children_exited = true;
+                    let mut pid_to_release: Option<RawPid> = None;
+                    for child_pid in rd_children.iter() {
+                        let pcb = match ProcessManager::find_task_by_vpid(*child_pid) {
+                            Some(p) => p,
+                            None => continue,
+                        };
+
+                        if !is_eligible_child(&pcb, kwo.options) {
+                            continue;
+                        }
+
+                        let child_pgrp = pcb.task_pgrp();
+                        let in_target_pgrp = match &child_pgrp {
+                            Some(cp) => Arc::ptr_eq(cp, pgid),
+                            None => false,
+                        };
+                        if !in_target_pgrp {
+                            continue;
+                        }
+
+                        if !child_matches_wait_options(&pcb, kwo.options) {
+                            continue;
+                        }
+                        has_matching_child = true;
+
+                        let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
+                        let state = sched_guard.state();
+                        if !pcb.is_zombie() {
+                            all_matching_children_exited = false;
+                        }
+
+                        if matches!(state, ProcessState::Stopped)
+                            && kwo.options.contains(WaitOption::WSTOPPED)
+                            && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
+                        {
+                            let stopsig = Signal::SIGSTOP as i32;
+                            kwo.no_task_error = None;
+                            kwo.ret_info = Some(WaitIdInfo {
+                                pid: pcb.task_pid_vnr(),
+                                status: stopsig,
+                                cause: SigChildCode::Stopped.into(),
+                            });
+                            kwo.ret_status = (stopsig << 8) | 0x7f;
+                            if !kwo.options.contains(WaitOption::WNOWAIT) {
+                                pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
+                            }
+                            drop(sched_guard);
+                            scan_result = Some(Ok(pcb.task_pid_vnr().into()));
+                            break;
+                        } else if kwo.options.contains(WaitOption::WCONTINUED)
+                            && pcb.sighand().flags_contains(SignalFlags::CLD_CONTINUED)
+                        {
+                            kwo.no_task_error = None;
+                            kwo.ret_info = Some(WaitIdInfo {
+                                pid: pcb.task_pid_vnr(),
+                                status: Signal::SIGCONT as i32,
+                                cause: SigChildCode::Continued.into(),
+                            });
+                            kwo.ret_status = 0xffff;
+                            if !kwo.options.contains(WaitOption::WNOWAIT) {
+                                pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
+                            }
+                            drop(sched_guard);
+                            scan_result = Some(Ok(pcb.task_pid_vnr().into()));
+                            break;
+                        } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
+                            if reap_blocked_by_group_exec(&pcb) {
+                                drop(sched_guard);
+                                continue;
+                            }
+                            let Some(code) = state.exit_code() else {
+                                drop(sched_guard);
+                                continue;
+                            };
+                            let raw = code as i32;
+                            kwo.ret_status = raw;
+                            let status8 = wstatus_to_waitid_status(raw);
+                            kwo.no_task_error = None;
+                            kwo.ret_info = Some(WaitIdInfo {
+                                pid: pcb.task_pid_vnr(),
+                                status: status8,
+                                cause: SigChildCode::Exited.into(),
+                            });
+                            tmp_child_pcb = Some(pcb.clone());
+                            if !kwo.options.contains(WaitOption::WNOWAIT) {
+                                if !pcb.try_mark_dead_from_zombie() {
+                                    drop(sched_guard);
+                                    continue;
+                                }
+                                pid_to_release = Some(pcb.raw_pid());
+                            }
+                            drop(sched_guard);
+                            scan_result = Some(Ok(pcb.task_pid_vnr().into()));
+                            break;
+                        }
+                        drop(sched_guard);
+                    }
+                    drop(rd_children);
+                    if let Some(pid) = pid_to_release {
+                        unsafe { ProcessManager::release(pid) };
+                    }
+
+                    if let Some(r) = scan_result.take() {
+                        break r;
+                    }
+                    if !has_matching_child {
+                        break Err(SystemError::ECHILD);
+                    }
+                    if all_matching_children_exited && !kwo.options.contains(WaitOption::WEXITED) {
+                        break Err(SystemError::ECHILD);
+                    }
+                    break Ok(0);
+                }
+
                 let mut scan_result: Option<Result<usize, SystemError>> = None;
                 let mut echild = false;
                 let wait_res = parent.wait_queue.wait_event_interruptible(
@@ -514,11 +736,10 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 continue;
                             }
 
-                            has_matching_child = true;
-
                             if !child_matches_wait_options(&pcb, kwo.options) {
                                 continue;
                             }
+                            has_matching_child = true;
 
                             let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                             let state = sched_guard.state();
@@ -622,9 +843,6 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         }
                         if echild {
                             break Err(SystemError::ECHILD);
-                        }
-                        if kwo.options.contains(WaitOption::WNOHANG) {
-                            break Ok(0);
                         }
                         if ProcessManager::current_pcb().has_pending_signal_fast() {
                             break Err(SystemError::ERESTARTSYS);

@@ -11,7 +11,9 @@ use super::info;
 use super::inner;
 
 use crate::libs::byte_parser;
-use crate::net::socket::{common::ShutdownBit, IpOption, PSO};
+use crate::net::socket::{common::ShutdownBit, AddressFamily, IpOption, PSO, PSOCK, PSOL};
+use crate::process::cred::CAPFlags;
+use crate::process::ProcessManager;
 use crate::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
@@ -173,6 +175,19 @@ impl super::TcpSocket {
         Ok(8)
     }
 
+    /// Helper to write a timeval (two i64 fields) to an option buffer.
+    #[inline]
+    fn write_timeval_opt(value: &mut [u8], micros: u64) -> Result<usize, SystemError> {
+        if value.len() < 16 {
+            return Err(SystemError::EINVAL);
+        }
+        let sec = (micros / 1_000_000) as i64;
+        let usec = (micros % 1_000_000) as i64;
+        value[..8].copy_from_slice(&sec.to_ne_bytes());
+        value[8..16].copy_from_slice(&usec.to_ne_bytes());
+        Ok(16)
+    }
+
     /// Helper to read an atomic usize value and write as u32 to an option buffer.
     #[inline]
     fn write_atomic_usize_as_u32(
@@ -209,14 +224,19 @@ impl super::TcpSocket {
     }
 
     #[inline]
-    fn effective_sockbuf_bytes(requested: usize) -> usize {
-        requested
-            .saturating_mul(2)
-            .clamp(constants::SOCK_MIN_BUFFER, constants::MAX_SOCKET_BUFFER)
+    fn effective_sockbuf_bytes(requested: usize, min: usize, max: usize) -> usize {
+        requested.saturating_mul(2).clamp(min, max)
+    }
+
+    #[inline]
+    fn effective_sockbuf_bytes_force(requested: usize, min: usize) -> usize {
+        let max_val = (i32::MAX as usize) / 2;
+        let requested = requested.min(max_val);
+        requested.saturating_mul(2).max(min)
     }
 
     /// Parses a timeval value for socket timeout options.
-    pub(super) fn parse_timeval_opt(optval: &[u8]) -> Result<Duration, SystemError> {
+    pub(super) fn parse_timeval_opt(optval: &[u8]) -> Result<Option<Duration>, SystemError> {
         // Accept both 64-bit and 32-bit timeval layouts.
         if optval.len() >= 16 {
             let mut sec_raw = [0u8; 8];
@@ -225,13 +245,19 @@ impl super::TcpSocket {
             usec_raw.copy_from_slice(&optval[8..16]);
             let sec = i64::from_ne_bytes(sec_raw);
             let usec = i64::from_ne_bytes(usec_raw);
-            if sec < 0 || !(0..1_000_000).contains(&usec) {
-                return Err(SystemError::EINVAL);
+            if !(0..1_000_000).contains(&usec) {
+                return Err(SystemError::EDOM);
+            }
+            if sec < 0 {
+                return Ok(Some(Duration::from_micros(0)));
+            }
+            if sec == 0 && usec == 0 {
+                return Ok(None);
             }
             let total_us = (sec as u64)
                 .saturating_mul(1_000_000)
                 .saturating_add(usec as u64);
-            return Ok(Duration::from_micros(total_us));
+            return Ok(Some(Duration::from_micros(total_us)));
         }
 
         if optval.len() >= 12 {
@@ -241,13 +267,19 @@ impl super::TcpSocket {
             usec_raw.copy_from_slice(&optval[8..12]);
             let sec = i64::from_ne_bytes(sec_raw);
             let usec = i32::from_ne_bytes(usec_raw) as i64;
-            if sec < 0 || !(0..1_000_000).contains(&usec) {
-                return Err(SystemError::EINVAL);
+            if !(0..1_000_000).contains(&usec) {
+                return Err(SystemError::EDOM);
+            }
+            if sec < 0 {
+                return Ok(Some(Duration::from_micros(0)));
+            }
+            if sec == 0 && usec == 0 {
+                return Ok(None);
             }
             let total_us = (sec as u64)
                 .saturating_mul(1_000_000)
                 .saturating_add(usec as u64);
-            return Ok(Duration::from_micros(total_us));
+            return Ok(Some(Duration::from_micros(total_us)));
         }
 
         Err(SystemError::EINVAL)
@@ -258,14 +290,16 @@ impl super::TcpSocket {
         match opt {
             PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
                 let d = Self::parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
                 self.send_timeout_us()
-                    .store(d.total_micros(), core::sync::atomic::Ordering::Relaxed);
+                    .store(us, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
                 let d = Self::parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
                 self.recv_timeout_us()
-                    .store(d.total_micros(), core::sync::atomic::Ordering::Relaxed);
+                    .store(us, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             PSO::TIMESTAMP_OLD | PSO::TIMESTAMP_NEW => {
@@ -273,9 +307,22 @@ impl super::TcpSocket {
             }
             PSO::SNDBUF | PSO::SNDBUFFORCE => {
                 let requested = byte_parser::read_u32(val)? as usize;
-                let requested =
-                    requested.clamp(constants::SOCK_MIN_BUFFER, constants::MAX_SOCKET_BUFFER);
-                let size = Self::effective_sockbuf_bytes(requested);
+                if matches!(opt, PSO::SNDBUFFORCE) {
+                    let cred = ProcessManager::current_pcb().cred();
+                    if !cred.has_capability(CAPFlags::CAP_NET_ADMIN) {
+                        return Err(SystemError::EPERM);
+                    }
+                }
+                let size = if matches!(opt, PSO::SNDBUFFORCE) {
+                    Self::effective_sockbuf_bytes_force(requested, constants::SOCK_MIN_SNDBUF)
+                } else {
+                    let requested = requested.min(constants::MAX_SOCKET_BUFFER);
+                    Self::effective_sockbuf_bytes(
+                        requested,
+                        constants::SOCK_MIN_SNDBUF,
+                        constants::MAX_SOCKET_BUFFER,
+                    )
+                };
                 self.send_buf_size()
                     .store(size, core::sync::atomic::Ordering::Relaxed);
                 self.update_inner_buffers(size, self.recv_buf_size_loaded());
@@ -284,9 +331,22 @@ impl super::TcpSocket {
             }
             PSO::RCVBUF | PSO::RCVBUFFORCE => {
                 let requested = byte_parser::read_u32(val)? as usize;
-                let requested =
-                    requested.clamp(constants::SOCK_MIN_BUFFER, constants::MAX_SOCKET_BUFFER);
-                let size = Self::effective_sockbuf_bytes(requested);
+                if matches!(opt, PSO::RCVBUFFORCE) {
+                    let cred = ProcessManager::current_pcb().cred();
+                    if !cred.has_capability(CAPFlags::CAP_NET_ADMIN) {
+                        return Err(SystemError::EPERM);
+                    }
+                }
+                let size = if matches!(opt, PSO::RCVBUFFORCE) {
+                    Self::effective_sockbuf_bytes_force(requested, constants::SOCK_MIN_RCVBUF)
+                } else {
+                    let requested = requested.min(constants::MAX_SOCKET_BUFFER);
+                    Self::effective_sockbuf_bytes(
+                        requested,
+                        constants::SOCK_MIN_RCVBUF,
+                        constants::MAX_SOCKET_BUFFER,
+                    )
+                };
                 self.recv_buf_size()
                     .store(size, core::sync::atomic::Ordering::Relaxed);
                 self.update_inner_buffers(self.send_buf_size_loaded(), size);
@@ -320,6 +380,10 @@ impl super::TcpSocket {
                 self.apply_keepalive(interval);
                 Ok(())
             }),
+            PSO::REUSEADDR => Self::set_bool_option(self.so_reuseaddr(), val, |_| Ok(())),
+            PSO::BROADCAST => Self::set_bool_option(self.so_broadcast(), val, |_| Ok(())),
+            PSO::PASSCRED => Self::set_bool_option(self.so_passcred(), val, |_| Ok(())),
+            PSO::NO_CHECK => Self::set_bool_option(self.so_no_check(), val, |_| Ok(())),
             PSO::LINGER => {
                 if val.len() < 8 {
                     return Err(SystemError::EINVAL);
@@ -334,6 +398,18 @@ impl super::TcpSocket {
                     self.linger_linger()
                         .store(v, core::sync::atomic::Ordering::Relaxed);
                 }
+                Ok(())
+            }
+            PSO::RCVLOWAT => {
+                let mut v = byte_parser::read_i32(val)?;
+                if v < 0 {
+                    v = i32::MAX;
+                } else if v == 0 {
+                    v = 1;
+                }
+                self.options
+                    .rcvlowat
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             PSO::OOBINLINE => Self::set_bool_option(self.so_oobinline_enabled(), val, |_| Ok(())),
@@ -371,9 +447,10 @@ impl super::TcpSocket {
         match opt {
             Options::NoDelay => {
                 let nagle_enabled = !byte_parser::read_bool_flag(val)?;
-                self.with_inner_established(|est| {
-                    est.with_mut(|s| s.set_nagle_enabled(nagle_enabled));
-                })?;
+                let mut inner = self.inner.write();
+                if let Some(inner) = inner.as_mut() {
+                    inner.for_each_socket_mut(|s| s.set_nagle_enabled(nagle_enabled));
+                }
                 Ok(())
             }
             Options::KeepIdle => {
@@ -467,10 +544,10 @@ impl super::TcpSocket {
                 } else {
                     // 当 TCP_WINDOW_CLAMP < (min SO_RCVBUF)/2 时，应当被提升到 (min SO_RCVBUF)/2。
                     //
-                    // 在 Linux 上 SO_RCVBUF 的 getsockopt 返回的是“有效值”(通常为用户请求的 2 倍)，
-                    // 最小有效 SO_RCVBUF 对应 4096，因此 (min SO_RCVBUF)/2 == 2048。
-                    // DragonOS 这里用 SOCK_MIN_RCVBUF（与 TCP_SKB_MIN_TRUESIZE 对齐）表达该下限。
-                    v.max(constants::SOCK_MIN_RCVBUF as u32)
+                    // Linux 中 TCP_WINDOW_CLAMP 最小值由 SOCK_MIN_RCVBUF/2 决定，
+                    // DragonOS 同样用 SOCK_MIN_RCVBUF/2（与 TCP_SKB_MIN_TRUESIZE 保持一致）表达该下限。
+                    let min_window_clamp = (constants::SOCK_MIN_RCVBUF / 2) as u32;
+                    v.max(min_window_clamp)
                 };
                 self.tcp_window_clamp()
                     .store(v as usize, core::sync::atomic::Ordering::Relaxed);
@@ -531,7 +608,41 @@ impl super::TcpSocket {
                 };
                 Self::write_i32_opt(value, err)
             }
+            PSO::TYPE => Self::write_i32_opt(value, PSOCK::Stream as i32),
+            PSO::DOMAIN => {
+                let domain = match self.ip_version {
+                    smoltcp::wire::IpVersion::Ipv6 => AddressFamily::INet6,
+                    smoltcp::wire::IpVersion::Ipv4 => AddressFamily::INet,
+                };
+                Self::write_i32_opt(value, domain as i32)
+            }
+            PSO::PROTOCOL => Self::write_i32_opt(value, PSOL::TCP as i32),
+            PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
+                let us = self
+                    .send_timeout_us()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                Self::write_timeval_opt(value, us)
+            }
+            PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
+                let us = self
+                    .recv_timeout_us()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                Self::write_timeval_opt(value, us)
+            }
+            PSO::RCVLOWAT => {
+                let v = self
+                    .options
+                    .rcvlowat
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                Self::write_i32_opt(value, v)
+            }
             PSO::KEEPALIVE => Self::write_bool_opt_i32(value, self.so_keepalive_enabled()),
+            PSO::REUSEADDR => Self::write_bool_opt_i32(value, self.so_reuseaddr()),
+            PSO::BROADCAST => Self::write_bool_opt_i32(value, self.so_broadcast()),
+            PSO::PASSCRED => Self::write_bool_opt_i32(value, self.so_passcred()),
+            PSO::NO_CHECK => Self::write_bool_opt_i32(value, self.so_no_check()),
             PSO::OOBINLINE => Self::write_bool_opt_i32(value, self.so_oobinline_enabled()),
             PSO::LINGER => {
                 let on = self

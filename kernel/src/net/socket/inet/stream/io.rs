@@ -1,8 +1,15 @@
+use alloc::boxed::Box;
+
 use system_error::SystemError;
 
+use crate::exception::workqueue::{schedule_work, Work};
 use crate::net::socket::inet::InetSocket;
 use crate::net::socket::PMSG;
+use crate::time::timer::{next_n_us_timer_jiffies, Timer, TimerFunction};
 
+use alloc::sync::Weak;
+
+use super::constants;
 use super::inner;
 use super::TcpSocket;
 
@@ -18,6 +25,56 @@ fn discard_recv_queue(socket: &mut smoltcp::socket::tcp::Socket) {
 }
 
 impl TcpSocket {
+    fn maybe_schedule_cork_timeout(&self) {
+        if !self
+            .options
+            .tcp_cork
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+
+        if self.cork_buf.lock().is_empty() {
+            return;
+        }
+
+        if self
+            .cork_timer_active
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let timer = Timer::new(
+            Box::new(CorkFlushTimer {
+                socket: self.self_ref.clone(),
+            }),
+            next_n_us_timer_jiffies(constants::TCP_CORK_FLUSH_TIMEOUT_US),
+        );
+        timer.activate();
+    }
+
+    fn handle_cork_timeout(&self) {
+        self.cork_timer_active
+            .store(false, core::sync::atomic::Ordering::Release);
+
+        if self.cork_buf.lock().is_empty() {
+            return;
+        }
+
+        if let Err(e) = self.flush_cork_buffer() {
+            if e == SystemError::EAGAIN_OR_EWOULDBLOCK {
+                self.maybe_schedule_cork_timeout();
+            }
+        }
+    }
+
     fn maybe_complete_shutdown_wr_fin(&self) {
         if !self.is_send_shutdown() {
             return;
@@ -335,7 +392,10 @@ impl TcpSocket {
                         if e != SystemError::EAGAIN_OR_EWOULDBLOCK {
                             return Err(e);
                         }
+                        self.maybe_schedule_cork_timeout();
                     }
+                } else {
+                    self.maybe_schedule_cork_timeout();
                 }
                 return Ok(n);
             }
@@ -365,7 +425,11 @@ impl TcpSocket {
                     if e != SystemError::EAGAIN_OR_EWOULDBLOCK {
                         return Err(e);
                     }
+                    self.maybe_schedule_cork_timeout();
                 }
+            } else {
+                drop(cork_buf);
+                self.maybe_schedule_cork_timeout();
             }
             return Ok(n);
         }
@@ -517,5 +581,22 @@ impl Drop for CorkFlushGuard<'_> {
         self.0
             .cork_flush_in_progress
             .store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct CorkFlushTimer {
+    socket: Weak<TcpSocket>,
+}
+
+impl TimerFunction for CorkFlushTimer {
+    fn run(&mut self) -> Result<(), SystemError> {
+        if let Some(socket) = self.socket.upgrade() {
+            let socket = socket.clone();
+            schedule_work(Work::new(move || {
+                socket.handle_cork_timeout();
+            }));
+        }
+        Ok(())
     }
 }

@@ -66,6 +66,16 @@ pub struct TcpSocketOptions {
     /// SO_LINGER
     pub(crate) linger_onoff: AtomicI32,
     pub(crate) linger_linger: AtomicI32,
+
+    /// IP_MULTICAST_TTL
+    pub(crate) ip_multicast_ttl: AtomicI32,
+    /// IP_MULTICAST_LOOP
+    pub(crate) ip_multicast_loop: AtomicBool,
+
+    /// SO_OOBINLINE
+    pub(crate) so_oobinline: AtomicBool,
+    /// TCP_LINGER2 (seconds; 0 means default)
+    pub(crate) tcp_linger2_secs: AtomicI32,
 }
 
 impl TcpSocketOptions {
@@ -97,6 +107,12 @@ impl TcpSocketOptions {
 
             linger_onoff: AtomicI32::new(0),
             linger_linger: AtomicI32::new(0),
+
+            so_oobinline: AtomicBool::new(false),
+            tcp_linger2_secs: AtomicI32::new(0),
+
+            ip_multicast_ttl: AtomicI32::new(constants::IP_MULTICAST_TTL_DEFAULT),
+            ip_multicast_loop: AtomicBool::new(constants::IP_MULTICAST_LOOP_DEFAULT),
         }
     }
 }
@@ -121,6 +137,7 @@ pub struct TcpSocket {
     pub(crate) options: TcpSocketOptions,
     pub(crate) cork_buf: Mutex<Vec<u8>>,
     pub(crate) cork_flush_in_progress: AtomicBool,
+    pub(crate) cork_timer_active: AtomicBool,
     pub(crate) recv_shutdown: ShutdownRecvTracker,
 }
 
@@ -148,6 +165,7 @@ impl TcpSocket {
             options: TcpSocketOptions::new(),
             cork_buf: Mutex::new(Vec::new()),
             cork_flush_in_progress: AtomicBool::new(false),
+            cork_timer_active: AtomicBool::new(false),
             recv_shutdown: ShutdownRecvTracker::new(),
         }
     }
@@ -315,6 +333,26 @@ impl TcpSocket {
     #[inline]
     pub(crate) fn linger_linger(&self) -> &AtomicI32 {
         &self.options.linger_linger
+    }
+
+    #[inline]
+    pub(crate) fn ip_multicast_ttl(&self) -> &AtomicI32 {
+        &self.options.ip_multicast_ttl
+    }
+
+    #[inline]
+    pub(crate) fn ip_multicast_loop(&self) -> &AtomicBool {
+        &self.options.ip_multicast_loop
+    }
+
+    #[inline]
+    pub(crate) fn so_oobinline_enabled(&self) -> &AtomicBool {
+        &self.options.so_oobinline
+    }
+
+    #[inline]
+    pub(crate) fn tcp_linger2_secs(&self) -> &AtomicI32 {
+        &self.options.tcp_linger2_secs
     }
 
     #[inline]

@@ -21,6 +21,23 @@ pub const DEFAULT_TCP_MSS: usize = 536;
 /// 默认SYN重传次数
 pub const DEFAULT_TCP_SYNCNT: i32 = 6;
 
+/// TCP_FIN_TIMEOUT 默认值（秒）
+/// 来自Linux内核: include/net/tcp.h (TCP_TIMEWAIT_LEN)
+pub const TCP_FIN_TIMEOUT_DEFAULT: i32 = 60;
+
+/// TCP_LINGER2 最大值（秒）
+/// 来自Linux内核: include/net/tcp.h (TCP_FIN_TIMEOUT_MAX)
+pub const TCP_FIN_TIMEOUT_MAX: i32 = 120;
+
+/// TCP_CORK flush timeout (microseconds). Linux uses ~200ms.
+pub const TCP_CORK_FLUSH_TIMEOUT_US: u64 = 200_000;
+
+/// Default IPv4 multicast TTL for sockets.
+pub const IP_MULTICAST_TTL_DEFAULT: i32 = 1;
+
+/// Default IPv4 multicast loopback behavior (enabled).
+pub const IP_MULTICAST_LOOP_DEFAULT: bool = true;
+
 // ========== Socket缓冲区常量 - 参考Linux内核 include/net/sock.h ==========
 
 /// 最小socket缓冲区基本单位（用于SO_SNDBUF/SO_RCVBUF的clamp下限）

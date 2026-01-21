@@ -62,6 +62,10 @@ impl SigHand {
         self.inner.write_irqsave()
     }
 
+    pub fn inner_read(&self) -> RwLockReadGuard<'_, InnerSigHand> {
+        self.inner()
+    }
+
     fn group_exec_wait_queue(&self) -> &WaitQueue {
         &self.group_exec_wait_queue
     }

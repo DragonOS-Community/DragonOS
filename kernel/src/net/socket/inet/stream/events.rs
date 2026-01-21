@@ -93,7 +93,10 @@ impl TcpSocket {
 
     #[inline]
     pub fn incoming(&self) -> bool {
-        EP::from_bits_truncate(self.do_poll() as u32).contains(EP::EPOLLIN)
+        let events = EP::from_bits_truncate(self.do_poll() as u32);
+        events.contains(EP::EPOLLIN)
+            || events.contains(EP::EPOLLHUP)
+            || events.contains(EP::EPOLLERR)
     }
 
     #[inline]

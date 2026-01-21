@@ -307,7 +307,7 @@ impl Signal {
             pcb.sighand().shared_pending_signal_insert(*self);
         }
         // 根据实际 pending/blocked 关系更新 HAS_PENDING_SIGNAL，避免长时间误置位
-        pcb.recalc_sigpending(None);
+        pcb.recalc_sigpending();
 
         // 若目标进程存在 signalfd 监听该信号，需要唤醒其等待者/epoll。
         crate::ipc::signalfd::notify_signalfd_for_pcb(&pcb, *self);
@@ -663,32 +663,44 @@ fn has_pending_signals(sigset: &SigSet, blocked: &SigSet) -> bool {
 }
 
 impl ProcessControlBlock {
+    // Lock order rule: sighand -> sig_info. Never take sighand after sig_info.
+    /// 按“线程 pending -> 进程 shared pending”的顺序取出一个可见信号。
+    /// 该实现避免在持有 sig_info 锁时进入 sighand 锁，降低锁交叉风险。
+    pub fn dequeue_pending_signal(&self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+        let res = {
+            let mut siginfo = self.sig_info_mut();
+            let res = siginfo.sig_pending_mut().dequeue_signal(sig_mask);
+            if res.0 != Signal::INVALID {
+                res
+            } else {
+                drop(siginfo);
+                self.sighand().shared_pending_dequeue(sig_mask)
+            }
+        };
+        self.recalc_sigpending();
+        res
+    }
+
     /// 重新计算线程的flag中的TIF_SIGPENDING位
     /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=4806&fi=182#182
-    pub fn recalc_sigpending(&self, siginfo_guard: Option<&ProcessSignalInfo>) {
-        if !self.recalc_sigpending_tsk(siginfo_guard) {
+    pub fn recalc_sigpending(&self) {
+        if !self.recalc_sigpending_tsk() {
             self.flags().remove(ProcessFlags::HAS_PENDING_SIGNAL);
         }
     }
 
-    fn recalc_sigpending_tsk(&self, siginfo_guard: Option<&ProcessSignalInfo>) -> bool {
-        let mut _siginfo_tmp_guard = None;
-        let siginfo = if let Some(siginfo_guard) = siginfo_guard {
-            siginfo_guard
-        } else {
-            _siginfo_tmp_guard = Some(self.sig_info_irqsave());
-            _siginfo_tmp_guard.as_ref().unwrap()
-        };
-        return siginfo.do_recalc_sigpending_tsk(self);
-    }
-}
-
-impl ProcessSignalInfo {
-    fn do_recalc_sigpending_tsk(&self, pcb: &ProcessControlBlock) -> bool {
-        if has_pending_signals(&self.sig_pending().signal(), self.sig_blocked())
-            || has_pending_signals(&pcb.sighand().shared_pending_signal(), self.sig_blocked())
-        {
-            pcb.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
+    fn recalc_sigpending_tsk(&self) -> bool {
+        let sighand = self.sighand();
+        let sighand_guard = sighand.inner_read();
+        let siginfo_guard = self.sig_info_irqsave();
+        if has_pending_signals(
+            &siginfo_guard.sig_pending().signal(),
+            siginfo_guard.sig_blocked(),
+        ) || has_pending_signals(
+            &sighand_guard.shared_pending.signal(),
+            siginfo_guard.sig_blocked(),
+        ) {
+            self.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
             return true;
         }
         /*
@@ -758,7 +770,7 @@ fn __set_task_blocked(pcb: &Arc<ProcessControlBlock>, new_set: &SigSet) {
         }
     }
     *pcb.sig_info_mut().sig_block_mut() = *new_set;
-    pcb.recalc_sigpending(None);
+    pcb.recalc_sigpending();
 }
 
 fn __set_current_blocked(new_set: &SigSet) {

@@ -166,11 +166,14 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
 
             if end_index >= start_index {
                 let page_cache = inode.page_cache().unwrap();
-                let mut page_cache_guard = page_cache.lock();
                 // 先写回脏页
-                page_cache_guard.writeback_range(start_index, end_index)?;
+                page_cache
+                    .manager()
+                    .writeback_range(start_index, end_index)?;
                 // 再驱逐干净页
-                page_cache_guard.invalidate_range(start_index, end_index);
+                page_cache
+                    .manager()
+                    .invalidate_range(start_index, end_index)?;
             }
         }
     }

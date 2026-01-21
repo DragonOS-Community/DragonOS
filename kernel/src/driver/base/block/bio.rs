@@ -36,9 +36,12 @@ struct InnerBioRequest {
     state: BioState,
     completion: Arc<Completion>,
     result: Option<Result<usize, SystemError>>,
+    complete_callbacks: Vec<BioCompleteCallback>,
     /// virtio-drivers返回的token，用于中断时匹配
     token: Option<u16>,
 }
+
+type BioCompleteCallback = Box<dyn Fn(Result<usize, SystemError>) + Send + Sync>;
 
 impl BioRequest {
     /// 创建一个读请求
@@ -53,6 +56,7 @@ impl BioRequest {
                 state: BioState::Init,
                 completion: Arc::new(Completion::new()),
                 result: None,
+                complete_callbacks: Vec::new(),
                 token: None,
             }),
         })
@@ -73,6 +77,7 @@ impl BioRequest {
                 state: BioState::Init,
                 completion: Arc::new(Completion::new()),
                 result: None,
+                complete_callbacks: Vec::new(),
                 token: None,
             }),
         })
@@ -131,7 +136,7 @@ impl BioRequest {
 
     /// 完成BIO请求
     pub fn complete(&self, result: Result<usize, SystemError>) {
-        let completion = {
+        let (completion, callbacks) = {
             let mut inner = self.inner.lock_irqsave();
             if matches!(inner.state, BioState::Completed | BioState::Failed) {
                 return;
@@ -141,10 +146,26 @@ impl BioRequest {
             } else {
                 BioState::Failed
             };
-            inner.result = Some(result);
-            inner.completion.clone()
+            inner.result = Some(result.clone());
+            let callbacks = core::mem::take(&mut inner.complete_callbacks);
+            (inner.completion.clone(), callbacks)
         };
+        for cb in callbacks {
+            cb(result.clone());
+        }
         completion.complete();
+    }
+
+    pub fn on_complete<F>(&self, callback: F)
+    where
+        F: Fn(Result<usize, SystemError>) + Send + Sync + 'static,
+    {
+        let mut inner = self.inner.lock_irqsave();
+        if let Some(result) = inner.result.clone() {
+            callback(result);
+            return;
+        }
+        inner.complete_callbacks.push(Box::new(callback));
     }
 
     /// 等待BIO完成并返回结果

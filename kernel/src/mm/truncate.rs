@@ -11,22 +11,23 @@ use alloc::sync::Arc;
 /// - page_cache: 与文件inode关联的页缓存
 /// - start: 偏移量
 pub fn truncate_inode_pages(page_cache: Arc<PageCache>, start: usize) {
-    let guard = page_cache.lock();
-    let pages_count = guard.pages_count();
+    let pages_count = page_cache.manager().pages_count().unwrap_or(0);
 
     for i in start..pages_count {
-        let page = guard.get_page(i);
+        let page = page_cache.manager().get_page_any(i);
         let page = if let Some(page) = page {
             page
         } else {
             log::warn!("try to truncate page from different page cache");
             return;
         };
-        truncate_complete_page(page_cache.clone(), page.clone());
+        truncate_complete_page(page_cache.clone(), i, page.clone());
     }
 }
 
-fn truncate_complete_page(_page_cache: Arc<PageCache>, page: Arc<Page>) {
+fn truncate_complete_page(page_cache: Arc<PageCache>, page_index: usize, page: Arc<Page>) {
     let mut guard = page.write();
     guard.remove_flags(PageFlags::PG_DIRTY);
+    drop(guard);
+    page_cache.mark_page_uptodate(page_index);
 }

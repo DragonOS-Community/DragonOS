@@ -1,6 +1,6 @@
 use crate::{
     filesystem::{
-        page_cache::{PageCache, SyncPageCacheBackend},
+        page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
             self, utils::DName, vcore::generate_inode_id, FilePrivateData, IndexNode, InodeFlags,
             InodeId, InodeMode,
@@ -523,7 +523,7 @@ impl LockedExt4Inode {
         // 设置self_ref
         guard.self_ref = Arc::downgrade(&inode);
 
-        let backend = Arc::new(SyncPageCacheBackend::new(
+        let backend = Arc::new(AsyncPageCacheBackend::new(
             Arc::downgrade(&inode) as Weak<dyn IndexNode>
         ));
         let page_cache = PageCache::new(

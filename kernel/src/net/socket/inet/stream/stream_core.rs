@@ -2,7 +2,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
-use system_error::SystemError;
 
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::mutex::Mutex;
@@ -21,9 +20,9 @@ type EP = crate::filesystem::epoll::EPollEventType;
 
 #[derive(Debug)]
 pub struct TcpSocketOptions {
-    /// SO_SNDTIMEO (microseconds). 0 means "no timeout".
+    /// SO_SNDTIMEO (microseconds). u64::MAX means "no timeout".
     pub(crate) send_timeout_us: AtomicU64,
-    /// SO_RCVTIMEO (microseconds). 0 means "no timeout".
+    /// SO_RCVTIMEO (microseconds). u64::MAX means "no timeout".
     pub(crate) recv_timeout_us: AtomicU64,
 
     /// TCP_INQ: whether to report inq bytes via recvmsg cmsg.
@@ -35,6 +34,8 @@ pub struct TcpSocketOptions {
 
     pub(crate) send_buf_size: AtomicUsize,
     pub(crate) recv_buf_size: AtomicUsize,
+    /// SO_RCVLOWAT
+    pub(crate) rcvlowat: AtomicI32,
 
     /// TCP_MAXSEG
     pub(crate) tcp_max_seg: AtomicUsize,
@@ -49,6 +50,14 @@ pub struct TcpSocketOptions {
 
     /// SO_ATTACH_FILTER: whether a filter is attached.
     pub(crate) so_filter_attached: AtomicBool,
+    /// SO_REUSEADDR
+    pub(crate) so_reuseaddr: AtomicBool,
+    /// SO_BROADCAST
+    pub(crate) so_broadcast: AtomicBool,
+    /// SO_PASSCRED
+    pub(crate) so_passcred: AtomicBool,
+    /// SO_NO_CHECK
+    pub(crate) so_no_check: AtomicBool,
     /// TCP_CORK
     pub(crate) tcp_cork: AtomicBool,
     /// TCP_QUICKACK
@@ -81,8 +90,8 @@ pub struct TcpSocketOptions {
 impl TcpSocketOptions {
     fn new() -> Self {
         Self {
-            send_timeout_us: AtomicU64::new(0),
-            recv_timeout_us: AtomicU64::new(0),
+            send_timeout_us: AtomicU64::new(u64::MAX),
+            recv_timeout_us: AtomicU64::new(u64::MAX),
 
             tcp_inq_enabled: AtomicBool::new(false),
             so_timestamp_enabled: AtomicBool::new(false),
@@ -90,6 +99,7 @@ impl TcpSocketOptions {
             ip_mtu_discover: core::sync::atomic::AtomicI32::new(1),
             send_buf_size: AtomicUsize::new(inner::DEFAULT_TX_BUF_SIZE),
             recv_buf_size: AtomicUsize::new(inner::DEFAULT_RX_BUF_SIZE),
+            rcvlowat: AtomicI32::new(1),
 
             tcp_max_seg: AtomicUsize::new(constants::DEFAULT_TCP_MSS), // Default MSS
             tcp_defer_accept: AtomicI32::new(0),
@@ -97,6 +107,10 @@ impl TcpSocketOptions {
             tcp_window_clamp: AtomicUsize::new(0),
             tcp_user_timeout: AtomicI32::new(0),
             so_filter_attached: AtomicBool::new(false),
+            so_reuseaddr: AtomicBool::new(false),
+            so_broadcast: AtomicBool::new(false),
+            so_passcred: AtomicBool::new(false),
+            so_no_check: AtomicBool::new(false),
             tcp_cork: AtomicBool::new(false),
             tcp_quickack: AtomicBool::new(true),
             so_keepalive: AtomicBool::new(false),
@@ -139,6 +153,7 @@ pub struct TcpSocket {
     pub(crate) cork_flush_in_progress: AtomicBool,
     pub(crate) cork_timer_active: AtomicBool,
     pub(crate) recv_shutdown: ShutdownRecvTracker,
+    pub(crate) ip_version: smoltcp::wire::IpVersion,
 }
 
 impl TcpSocket {
@@ -147,6 +162,7 @@ impl TcpSocket {
         nonblock: bool,
         netns: Arc<NetNamespace>,
         pollee_bits: usize,
+        ip_version: smoltcp::wire::IpVersion,
         me: &Weak<Self>,
     ) -> Self {
         Self {
@@ -167,6 +183,7 @@ impl TcpSocket {
             cork_flush_in_progress: AtomicBool::new(false),
             cork_timer_active: AtomicBool::new(false),
             recv_shutdown: ShutdownRecvTracker::new(),
+            ip_version,
         }
     }
 
@@ -178,6 +195,7 @@ impl TcpSocket {
                 nonblock,
                 netns,
                 0,
+                ver,
                 me,
             )
         })
@@ -187,6 +205,7 @@ impl TcpSocket {
         inner: inner::Established,
         nonblock: bool,
         netns: Arc<NetNamespace>,
+        ip_version: smoltcp::wire::IpVersion,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| {
             Self::new_common(
@@ -194,6 +213,7 @@ impl TcpSocket {
                 nonblock,
                 netns,
                 (EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize,
+                ip_version,
                 me,
             )
         })
@@ -298,6 +318,26 @@ impl TcpSocket {
     #[inline]
     pub(crate) fn so_filter_attached(&self) -> &AtomicBool {
         &self.options.so_filter_attached
+    }
+
+    #[inline]
+    pub(crate) fn so_reuseaddr(&self) -> &AtomicBool {
+        &self.options.so_reuseaddr
+    }
+
+    #[inline]
+    pub(crate) fn so_broadcast(&self) -> &AtomicBool {
+        &self.options.so_broadcast
+    }
+
+    #[inline]
+    pub(crate) fn so_passcred(&self) -> &AtomicBool {
+        &self.options.so_passcred
+    }
+
+    #[inline]
+    pub(crate) fn so_no_check(&self) -> &AtomicBool {
+        &self.options.so_no_check
     }
 
     #[inline]
@@ -424,27 +464,6 @@ impl TcpSocket {
         }
     }
 
-    /// Runs a function with mutable access to the Established inner socket.
-    /// Returns EINVAL if the socket is not in Established state.
-    pub(crate) fn with_inner_established<R>(
-        &self,
-        f: impl FnOnce(&inner::Established) -> R,
-    ) -> Result<R, SystemError> {
-        let mut writer = self.inner.write();
-        let inner = writer.take().expect("Tcp inner::Inner is None");
-        match inner {
-            inner::Inner::Established(established) => {
-                let result = f(&established);
-                writer.replace(inner::Inner::Established(established));
-                Ok(result)
-            }
-            other => {
-                writer.replace(other);
-                Err(SystemError::EINVAL)
-            }
-        }
-    }
-
     #[inline]
     fn shutdown_bits(&self) -> crate::net::socket::common::ShutdownBit {
         crate::net::socket::common::ShutdownBit::from_bits_truncate(
@@ -468,7 +487,7 @@ impl TcpSocket {
         let us = self
             .send_timeout_us()
             .load(core::sync::atomic::Ordering::Relaxed);
-        if us == 0 {
+        if us == u64::MAX {
             None
         } else {
             Some(crate::time::Duration::from_micros(us))
@@ -479,7 +498,7 @@ impl TcpSocket {
         let us = self
             .recv_timeout_us()
             .load(core::sync::atomic::Ordering::Relaxed);
-        if us == 0 {
+        if us == u64::MAX {
             None
         } else {
             Some(crate::time::Duration::from_micros(us))

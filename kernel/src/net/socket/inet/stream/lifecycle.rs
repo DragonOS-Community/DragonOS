@@ -83,7 +83,12 @@ impl TcpSocket {
             inner::Inner::Listening(listening) => {
                 let (socket, point) = listening.accept().map(|(stream, remote)| {
                     (
-                        TcpSocket::new_established(stream, self.is_nonblock(), self.netns()),
+                        TcpSocket::new_established(
+                            stream,
+                            self.is_nonblock(),
+                            self.netns(),
+                            self.ip_version,
+                        ),
                         remote,
                     )
                 })?;

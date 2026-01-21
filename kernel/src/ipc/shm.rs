@@ -2,15 +2,14 @@ use crate::{
     arch::mm::LockedFrameAllocator,
     libs::align::page_align_up,
     mm::{
-        allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
-        page::{page_manager_lock, PageFlags, PageType},
-        PhysAddr,
+        PhysAddr, allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame}, page::{PageFlags, PageType, page_manager_lock}
     },
-    process::{ProcessManager, RawPid},
+    process::{ProcessManager, RawPid, cred::Cred},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
 use core::fmt;
+use alloc::sync::Arc;
 use hashbrown::HashMap;
 use ida::IdAllocator;
 use num::ToPrimitive;
@@ -177,15 +176,7 @@ impl ShmManager {
 
         // 创建共享内存段信息结构体
         let current_cred = ProcessManager::current_pcb().cred();
-        let kern_ipc_perm = KernIpcPerm::new(
-            shm_id,
-            key,
-            current_cred.uid.data(),
-            current_cred.gid.data(),
-            current_cred.uid.data(),
-            current_cred.gid.data(),
-            shmflg & ShmFlags::PERM_MASK,
-        );
+        let kern_ipc_perm = KernIpcPerm::new_with_cred(shm_id, key, current_cred, shmflg & ShmFlags::PERM_MASK);
         let shm_kernel = KernelShm::new(kern_ipc_perm, paddr, size);
 
         // 更新共享内存管理器相关映射表
@@ -509,22 +500,14 @@ pub struct KernIpcPerm {
 }
 
 impl KernIpcPerm {
-    pub fn new(
-        id: ShmId,
-        key: ShmKey,
-        uid: usize,
-        gid: usize,
-        cuid: usize,
-        cgid: usize,
-        mode: ShmFlags,
-    ) -> Self {
+    pub fn new_with_cred(id: ShmId, key: ShmKey, cred: Arc<Cred>, mode: ShmFlags) -> Self {
         KernIpcPerm {
             id,
             key,
-            uid,
-            gid,
-            cuid,
-            cgid,
+            uid: cred.uid.data(),
+            gid: cred.gid.data(),
+            cuid: cred.uid.data(),
+            cgid: cred.gid.data(),
             mode,
             seq: 0,
         }
@@ -675,6 +658,23 @@ pub struct PosixIpcPerm {
     _pad1: i32,
     _unused1: usize,
     _unused2: usize,
+}
+
+impl From<&KernIpcPerm> for PosixIpcPerm {
+    fn from(kern_ipc_perm: &KernIpcPerm) -> Self {
+        PosixIpcPerm {
+            key: kern_ipc_perm.key.data().to_i32().unwrap(),
+            uid: kern_ipc_perm.uid as u32,
+            gid: kern_ipc_perm.gid as u32,
+            cuid: kern_ipc_perm.cuid as u32,
+            cgid: kern_ipc_perm.cgid as u32,
+            mode: kern_ipc_perm.mode.bits(),
+            seq: kern_ipc_perm.seq as i32,
+            _pad1: 0,
+            _unused1: 0,
+            _unused2: 0,
+        }
+    }
 }
 
 impl PosixIpcPerm {

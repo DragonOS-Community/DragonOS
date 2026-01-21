@@ -2732,27 +2732,13 @@ impl ProcessSignalInfo {
         self.tty = tty;
     }
 
-    /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号
+    /// 从当前线程的 pending 中取出下一个要处理的信号
     ///
     /// ## 参数
     ///
     /// - `sig_mask` 被忽略掉的信号
-    ///
-    pub fn dequeue_signal(
-        &mut self,
-        sig_mask: &SigSet,
-        pcb: &Arc<ProcessControlBlock>,
-    ) -> (Signal, Option<SigInfo>) {
-        let res = self.sig_pending.dequeue_signal(sig_mask);
-        pcb.recalc_sigpending(Some(self));
-        if res.0 != Signal::INVALID {
-            return res;
-        } else {
-            let sighand = pcb.sighand();
-            let res = sighand.shared_pending_dequeue(sig_mask);
-            pcb.recalc_sigpending(Some(self));
-            return res;
-        }
+    pub fn dequeue_thread_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+        self.sig_pending.dequeue_signal(sig_mask)
     }
 
     pub fn has_child_subreaper(&self) -> bool {

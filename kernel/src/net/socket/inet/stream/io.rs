@@ -1,8 +1,15 @@
+use alloc::boxed::Box;
+
 use system_error::SystemError;
 
+use crate::exception::workqueue::{schedule_work, Work};
 use crate::net::socket::inet::InetSocket;
 use crate::net::socket::PMSG;
+use crate::time::timer::{next_n_us_timer_jiffies, Timer, TimerFunction};
 
+use alloc::sync::Weak;
+
+use super::constants;
 use super::inner;
 use super::TcpSocket;
 
@@ -18,6 +25,56 @@ fn discard_recv_queue(socket: &mut smoltcp::socket::tcp::Socket) {
 }
 
 impl TcpSocket {
+    fn maybe_schedule_cork_timeout(&self) {
+        if !self
+            .options
+            .tcp_cork
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+
+        if self.cork_buf.lock().is_empty() {
+            return;
+        }
+
+        if self
+            .cork_timer_active
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let timer = Timer::new(
+            Box::new(CorkFlushTimer {
+                socket: self.self_ref.clone(),
+            }),
+            next_n_us_timer_jiffies(constants::TCP_CORK_FLUSH_TIMEOUT_US),
+        );
+        timer.activate();
+    }
+
+    fn handle_cork_timeout(&self) {
+        self.cork_timer_active
+            .store(false, core::sync::atomic::Ordering::Release);
+
+        if self.cork_buf.lock().is_empty() {
+            return;
+        }
+
+        if let Err(e) = self.flush_cork_buffer() {
+            if e == SystemError::EAGAIN_OR_EWOULDBLOCK {
+                self.maybe_schedule_cork_timeout();
+            }
+        }
+    }
+
     fn maybe_complete_shutdown_wr_fin(&self) {
         if !self.is_send_shutdown() {
             return;
@@ -64,22 +121,14 @@ impl TcpSocket {
         }
 
         if !socket.can_recv() {
-            // Linux 语义：对端已关闭写端(收到 FIN)且本端已读完数据时，recv 返回 0。
-            // 如果状态表明已收到 FIN，即使 buffer 为空也应返回 0 (EOF)。
-            let state = socket.state();
-            if matches!(
-                state,
-                smoltcp::socket::tcp::State::CloseWait
-                    | smoltcp::socket::tcp::State::LastAck
-                    | smoltcp::socket::tcp::State::Closing
-                    | smoltcp::socket::tcp::State::TimeWait
-                    | smoltcp::socket::tcp::State::Closed
-            ) {
-                return Ok(0);
-            }
-
             if !socket.may_recv() {
-                return Ok(0);
+                return match socket.recv(|_data| (0usize, ())) {
+                    Ok(()) => Ok(0),
+                    Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
+                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                        Err(SystemError::ECONNRESET)
+                    }
+                };
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
@@ -133,7 +182,7 @@ impl TcpSocket {
         if flags.contains(PMSG::PEEK) {
             return match socket.peek_slice(current_buf) {
                 Ok(size) => Ok(size),
-                Err(smoltcp::socket::tcp::RecvError::InvalidState) => Err(SystemError::ENOTCONN),
+                Err(smoltcp::socket::tcp::RecvError::InvalidState) => Err(SystemError::ECONNRESET),
                 Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
             };
         }
@@ -343,7 +392,10 @@ impl TcpSocket {
                         if e != SystemError::EAGAIN_OR_EWOULDBLOCK {
                             return Err(e);
                         }
+                        self.maybe_schedule_cork_timeout();
                     }
+                } else {
+                    self.maybe_schedule_cork_timeout();
                 }
                 return Ok(n);
             }
@@ -373,7 +425,11 @@ impl TcpSocket {
                     if e != SystemError::EAGAIN_OR_EWOULDBLOCK {
                         return Err(e);
                     }
+                    self.maybe_schedule_cork_timeout();
                 }
+            } else {
+                drop(cork_buf);
+                self.maybe_schedule_cork_timeout();
             }
             return Ok(n);
         }
@@ -381,6 +437,20 @@ impl TcpSocket {
     }
 
     pub(crate) fn flush_cork_buffer(&self) -> Result<(), SystemError> {
+        if self
+            .cork_flush_in_progress
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _guard = CorkFlushGuard(self);
+
         loop {
             let cork_buf = self.cork_buf.lock();
             if cork_buf.is_empty() {
@@ -502,5 +572,31 @@ impl TcpSocket {
         }
 
         Err(SystemError::ENOTCONN)
+    }
+}
+
+struct CorkFlushGuard<'a>(&'a TcpSocket);
+impl Drop for CorkFlushGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .cork_flush_in_progress
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct CorkFlushTimer {
+    socket: Weak<TcpSocket>,
+}
+
+impl TimerFunction for CorkFlushTimer {
+    fn run(&mut self) -> Result<(), SystemError> {
+        if let Some(socket) = self.socket.upgrade() {
+            let socket = socket.clone();
+            schedule_work(Work::new(move || {
+                socket.handle_cork_timeout();
+            }));
+        }
+        Ok(())
     }
 }

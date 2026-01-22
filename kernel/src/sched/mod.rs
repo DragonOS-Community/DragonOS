@@ -6,6 +6,7 @@ pub mod fifo;
 #[cfg(feature = "fifo_demo")]
 pub mod fifo_demo;
 pub mod idle;
+pub mod loadavg;
 pub mod pelt;
 pub mod prio;
 pub mod syscall;
@@ -55,11 +56,6 @@ static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
 
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
 static CPU_RUNQUEUE: Lazy<PerCpuVar<Arc<CpuRunQueue>>> = PerCpuVar::define_lazy();
-
-/// 用于记录系统中所有 CPU 的可执行进程数量的总和。
-static CALCULATE_LOAD_TASKS: AtomicUsize = AtomicUsize::new(0);
-
-const LOAD_FREQ: usize = HZ as usize * 5 + 1;
 
 pub const SCHED_FIXEDPOINT_SHIFT: u64 = 10;
 #[allow(dead_code)]
@@ -314,8 +310,8 @@ pub struct CpuRunQueue {
     nr_uninterruptible: usize,
 
     /// 记录上次更新负载时间
-    cala_load_update: usize,
-    cala_load_active: usize,
+    calc_load_update: u64,
+    calc_load_active: isize,
 
     /// CFS调度器
     cfs: Arc<CfsRunQueue>,
@@ -351,8 +347,8 @@ impl CpuRunQueue {
             next_balance: 0,
             nr_running: 0,
             nr_uninterruptible: 0,
-            cala_load_update: (clock() + (5 * HZ + 1)) as usize,
-            cala_load_active: 0,
+            calc_load_update: clock() + (5 * HZ + 1),
+            calc_load_active: 0,
             cfs: Arc::new(CfsRunQueue::new()),
             fifo: fifo::FifoRunQueue::new(),
             clock_pelt: 0,
@@ -501,6 +497,16 @@ impl CpuRunQueue {
 
     /// 禁用一个任务，将离开队列
     pub fn deactivate_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
+        if flags.contains(DequeueFlag::DEQUEUE_SLEEP)
+            && matches!(
+                pcb.sched_info().inner_lock_read_irqsave().state(),
+                ProcessState::Blocked(false)
+            )
+        {
+            self.nr_uninterruptible += 1;
+            loadavg::inc_nr_uninterruptible(1);
+        }
+
         *pcb.sched_info().on_rq.lock_irqsave() =
             if flags.intersects(DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_STOPPED) {
                 OnRq::None
@@ -570,40 +576,15 @@ impl CpuRunQueue {
         // todo: pelt?
     }
 
-    /// 计算当前进程中的可执行数量
-    fn calculate_load_fold_active(&mut self, adjust: usize) -> usize {
-        let mut nr_active = self.nr_running - adjust;
-        nr_active += self.nr_uninterruptible;
-        let mut delta = 0;
-
-        if nr_active != self.cala_load_active {
-            delta = nr_active - self.cala_load_active;
-            self.cala_load_active = nr_active;
-        }
-
-        delta
-    }
-
-    /// ## tick计算全局负载
     pub fn calculate_global_load_tick(&mut self) {
-        if clock() < self.cala_load_update as u64 {
-            // 如果当前时间在上次更新时间之前，则直接返回
-            return;
-        }
-
-        let delta = self.calculate_load_fold_active(0);
-
-        if delta != 0 {
-            CALCULATE_LOAD_TASKS.fetch_add(delta, Ordering::SeqCst);
-        }
-
-        self.cala_load_update += LOAD_FREQ;
+        loadavg::calc_global_load_tick(self);
     }
 
     pub fn add_nr_running(&mut self, nr_running: usize) {
         let prev = self.nr_running;
 
         self.nr_running = prev + nr_running;
+        loadavg::inc_nr_running(nr_running);
         if prev < 2 && self.nr_running >= 2 && !self.overload {
             self.overload = true;
         }
@@ -611,6 +592,14 @@ impl CpuRunQueue {
 
     pub fn sub_nr_running(&mut self, count: usize) {
         self.nr_running -= count;
+        loadavg::dec_nr_running(count);
+    }
+
+    pub fn dec_nr_uninterruptible(&mut self) {
+        if self.nr_uninterruptible > 0 {
+            self.nr_uninterruptible -= 1;
+            loadavg::dec_nr_uninterruptible(1);
+        }
     }
 
     /// 在运行idle？

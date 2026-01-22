@@ -14,6 +14,7 @@ use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::mm::page::FileMapInfo;
+use crate::mm::page_cache_stats as pc_stats;
 use crate::sched::completion::Completion;
 use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
@@ -40,11 +41,32 @@ lazy_static! {
         }
         wqs
     };
+    static ref PAGECACHE_REGISTRY: SpinLock<Vec<Weak<PageCache>>> = SpinLock::new(Vec::new());
 }
 
 fn schedule_pagecache_io(work: Arc<Work>) {
     let idx = PAGECACHE_IO_RR.fetch_add(1, Ordering::Relaxed) % PAGECACHE_IO_WQS.len();
     PAGECACHE_IO_WQS[idx].enqueue(work);
+}
+
+fn register_page_cache(cache: &Arc<PageCache>) {
+    PAGECACHE_REGISTRY
+        .lock_irqsave()
+        .push(Arc::downgrade(cache));
+}
+
+pub fn list_page_caches() -> Vec<Arc<PageCache>> {
+    let mut guard = PAGECACHE_REGISTRY.lock_irqsave();
+    let mut caches = Vec::new();
+    guard.retain(|weak| {
+        if let Some(cache) = weak.upgrade() {
+            caches.push(cache);
+            true
+        } else {
+            false
+        }
+    });
+    caches
 }
 
 pub trait PageCacheBackend: Send + Sync + core::fmt::Debug {
@@ -173,6 +195,7 @@ pub struct PageCache {
     inode: Lazy<Weak<dyn IndexNode>>,
     backend: Lazy<Arc<dyn PageCacheBackend>>,
     unevictable: AtomicBool,
+    is_shmem: AtomicBool,
     manager: PageCacheManager,
 }
 
@@ -183,6 +206,46 @@ pub struct InnerPageCache {
     pages: HashMap<usize, Arc<PageEntry>>,
     dirty_pages: BTreeSet<usize>,
     page_cache_ref: Weak<PageCache>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvictPolicy {
+    allow_dirty: bool,
+    allow_mapped: bool,
+    allow_writeback: bool,
+}
+
+impl EvictPolicy {
+    const fn clean_only() -> Self {
+        Self {
+            allow_dirty: false,
+            allow_mapped: false,
+            allow_writeback: false,
+        }
+    }
+
+    fn can_evict(self, entry: &PageEntry) -> bool {
+        let state = entry.state();
+        if matches!(state, PageState::Loading) {
+            return false;
+        }
+        if !self.allow_writeback && state == PageState::Writeback {
+            return false;
+        }
+
+        let guard = entry.page.read();
+        let dirty = guard.flags().contains(PageFlags::PG_DIRTY);
+        let mapped = guard.map_count() != 0;
+        drop(guard);
+
+        if dirty && !self.allow_dirty {
+            return false;
+        }
+        if mapped && !self.allow_mapped {
+            return false;
+        }
+        true
+    }
 }
 
 /// 描述一次从页缓存到目标缓冲区的拷贝
@@ -422,6 +485,7 @@ impl PageCacheManager {
                 .compare_exchange_state(PageState::Dirty, PageState::Writeback)
                 .is_ok()
             {
+                cache.account_state_transition(PageState::Dirty, PageState::Writeback);
                 break;
             }
         }
@@ -471,6 +535,7 @@ impl PageCacheManager {
             };
             if let Err(e) = result {
                 page.write().add_flags(PageFlags::PG_ERROR);
+                cache.account_state_transition(PageState::Writeback, PageState::Error);
                 entry.set_state(PageState::Error);
                 entry.wait_queue.wake_all();
                 return Err(e);
@@ -481,10 +546,12 @@ impl PageCacheManager {
             let mut guard = page.write();
             guard.remove_flags(PageFlags::PG_ERROR);
             if guard.flags().contains(PageFlags::PG_DIRTY) {
+                cache.account_state_transition(PageState::Writeback, PageState::Dirty);
                 entry.set_state(PageState::Dirty);
                 let mut inner = cache.inner.lock();
                 inner.dirty_pages.insert(page_index);
             } else {
+                cache.account_state_transition(PageState::Writeback, PageState::UpToDate);
                 entry.set_state(PageState::UpToDate);
                 let mut inner = cache.inner.lock();
                 inner.dirty_pages.remove(&page_index);
@@ -569,8 +636,12 @@ impl InnerPageCache {
     }
 
     pub fn remove_page(&mut self, offset: usize) -> Option<Arc<Page>> {
+        let entry = self.pages.remove(&offset)?;
         self.dirty_pages.remove(&offset);
-        self.pages.remove(&offset).map(|entry| entry.page.clone())
+        if let Some(cache) = self.page_cache_ref.upgrade() {
+            cache.account_entry_remove(entry.state());
+        }
+        Some(entry.page.clone())
     }
 
     fn get_entry(&self, offset: usize) -> Option<Arc<PageEntry>> {
@@ -579,6 +650,9 @@ impl InnerPageCache {
 
     fn insert_entry(&mut self, offset: usize, entry: Arc<PageEntry>) {
         self.pages.insert(offset, entry);
+        if let Some(cache) = self.page_cache_ref.upgrade() {
+            cache.account_entry_insert();
+        }
     }
 
     fn is_page_ready(&self, offset: usize) -> bool {
@@ -597,6 +671,9 @@ impl InnerPageCache {
         }) {
             self.dirty_pages.remove(&i);
             let _ = reclaimer.remove_page(&entry.page.phys_address());
+            if let Some(cache) = self.page_cache_ref.upgrade() {
+                cache.account_entry_remove(entry.state());
+            }
         }
 
         if page_num > 0 {
@@ -618,38 +695,43 @@ impl InnerPageCache {
         return self.pages.len();
     }
 
-    /// 驱逐指定范围的干净页
-    ///
-    /// 只驱逐干净的、无外部引用的页
-    pub fn invalidate_range(&mut self, start_index: usize, end_index: usize) -> usize {
+    fn evict_pages_inner(&mut self, range: Option<(usize, usize)>, policy: EvictPolicy) -> usize {
         let mut evicted = 0;
         let mut page_reclaimer = page_reclaimer_lock();
+        let indices: Vec<usize> = match range {
+            Some((start, end)) => (start..=end).collect(),
+            None => self.pages.keys().cloned().collect(),
+        };
 
-        for idx in start_index..=end_index {
+        for idx in indices {
             if let Some(entry) = self.pages.get(&idx) {
-                if matches!(entry.state(), PageState::Loading | PageState::Writeback) {
+                if !policy.can_evict(entry) {
                     continue;
                 }
-                let guard = entry.page.read();
-                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                if Arc::strong_count(&entry.page) > 3 {
                     continue;
                 }
-                drop(guard);
-
-                // 3处引用：1. page_cache中 2. page_manager中 3. lru中
-                if Arc::strong_count(&entry.page) <= 3 {
-                    if let Some(removed) = self.pages.remove(&idx) {
-                        self.dirty_pages.remove(&idx);
-                        let paddr = removed.page.phys_address();
-                        page_manager_lock().remove_page(&paddr);
-                        let _ = page_reclaimer.remove_page(&paddr);
-                        evicted += 1;
-                    }
+                if let Some(removed_page) = self.remove_page(idx) {
+                    let paddr = removed_page.phys_address();
+                    page_manager_lock().remove_page(&paddr);
+                    let _ = page_reclaimer.remove_page(&paddr);
+                    evicted += 1;
                 }
             }
         }
 
         evicted
+    }
+
+    /// 驱逐指定范围的干净页
+    ///
+    /// 只驱逐干净的、无外部引用的页
+    pub fn invalidate_range(&mut self, start_index: usize, end_index: usize) -> usize {
+        self.evict_pages_inner(Some((start_index, end_index)), EvictPolicy::clean_only())
+    }
+
+    fn evict_clean_pages(&mut self) -> usize {
+        self.evict_pages_inner(None, EvictPolicy::clean_only())
     }
 }
 
@@ -658,6 +740,9 @@ impl Drop for InnerPageCache {
         // log::debug!("page cache drop");
         let mut page_manager = page_manager_lock();
         for entry in self.pages.values() {
+            if let Some(cache) = self.page_cache_ref.upgrade() {
+                cache.account_entry_remove(entry.state());
+            }
             page_manager.remove_page(&entry.page.phys_address());
         }
     }
@@ -671,7 +756,7 @@ impl PageCache {
         backend: Option<Arc<dyn PageCacheBackend>>,
     ) -> Arc<PageCache> {
         let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
-        Arc::new_cyclic(|weak| Self {
+        let cache = Arc::new_cyclic(|weak| Self {
             id,
             inner: Mutex::new(InnerPageCache::new(weak.clone(), id)),
             inode: {
@@ -689,8 +774,11 @@ impl PageCache {
                 v
             },
             unevictable: AtomicBool::new(false),
+            is_shmem: AtomicBool::new(false),
             manager: PageCacheManager::new(weak.clone()),
-        })
+        });
+        register_page_cache(&cache);
+        cache
     }
 
     /// # 获取页缓存的ID
@@ -732,10 +820,22 @@ impl PageCache {
         &self.manager
     }
 
+    pub fn drop_clean_pages(&self) -> usize {
+        self.inner.lock().evict_clean_pages()
+    }
+
     /// Mark this page cache as unevictable (or revert). When enabled, newly created
     /// pages will carry PG_UNEVICTABLE to keep the reclaimer from reclaiming them.
     pub fn set_unevictable(&self, unevictable: bool) {
         self.unevictable.store(unevictable, Ordering::Relaxed);
+    }
+
+    pub fn set_shmem(&self, shmem: bool) {
+        self.is_shmem.store(shmem, Ordering::Relaxed);
+    }
+
+    fn is_shmem(&self) -> bool {
+        self.is_shmem.load(Ordering::Relaxed)
     }
 
     fn page_flags(&self) -> PageFlags {
@@ -743,6 +843,47 @@ impl PageCache {
             PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
         } else {
             PageFlags::PG_LRU
+        }
+    }
+
+    fn account_entry_insert(&self) {
+        pc_stats::inc_file_pages();
+        if self.is_shmem() {
+            pc_stats::inc_shmem_pages();
+        }
+        if self.unevictable.load(Ordering::Relaxed) {
+            pc_stats::inc_unevictable();
+        }
+    }
+
+    fn account_entry_remove(&self, state: PageState) {
+        pc_stats::dec_file_pages();
+        if self.is_shmem() {
+            pc_stats::dec_shmem_pages();
+        }
+        if self.unevictable.load(Ordering::Relaxed) {
+            pc_stats::dec_unevictable();
+        }
+        match state {
+            PageState::Dirty => pc_stats::dec_file_dirty(),
+            PageState::Writeback => pc_stats::dec_file_writeback(),
+            _ => {}
+        }
+    }
+
+    fn account_state_transition(&self, old: PageState, new: PageState) {
+        if old == new {
+            return;
+        }
+        match old {
+            PageState::Dirty => pc_stats::dec_file_dirty(),
+            PageState::Writeback => pc_stats::dec_file_writeback(),
+            _ => {}
+        }
+        match new {
+            PageState::Dirty => pc_stats::inc_file_dirty(),
+            PageState::Writeback => pc_stats::inc_file_writeback(),
+            _ => {}
         }
     }
 
@@ -888,6 +1029,9 @@ impl PageCache {
         if let Some(current) = guard.get_entry(page_index) {
             if Arc::ptr_eq(&current, entry) {
                 guard.pages.remove(&page_index);
+                if let Some(cache) = guard.page_cache_ref.upgrade() {
+                    cache.account_entry_remove(entry.state());
+                }
             }
         }
         self.discard_unlinked_page(&entry.page);
@@ -998,10 +1142,12 @@ impl PageCache {
     pub fn mark_page_dirty(&self, page_index: usize) {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
+            let old_state = entry.state();
             guard.dirty_pages.insert(page_index);
-            if entry.state() == PageState::Writeback {
+            if old_state == PageState::Writeback {
                 return;
             }
+            self.account_state_transition(old_state, PageState::Dirty);
             entry.set_state(PageState::Dirty);
         }
     }
@@ -1009,6 +1155,8 @@ impl PageCache {
     pub fn mark_page_writeback(&self, page_index: usize) {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
+            let old_state = entry.state();
+            self.account_state_transition(old_state, PageState::Writeback);
             entry.set_state(PageState::Writeback);
             guard.dirty_pages.remove(&page_index);
         }
@@ -1017,6 +1165,8 @@ impl PageCache {
     pub fn mark_page_uptodate(&self, page_index: usize) {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
+            let old_state = entry.state();
+            self.account_state_transition(old_state, PageState::UpToDate);
             entry.set_state(PageState::UpToDate);
             guard.dirty_pages.remove(&page_index);
         }
@@ -1025,6 +1175,8 @@ impl PageCache {
     pub fn mark_page_error(&self, page_index: usize) {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
+            let old_state = entry.state();
+            self.account_state_transition(old_state, PageState::Error);
             entry.set_state(PageState::Error);
             entry.wait_queue.wake_all();
             guard.dirty_pages.remove(&page_index);
@@ -1147,7 +1299,6 @@ impl PageCache {
         }
 
         let mut src_offset = 0;
-        let mut dirty_page_indices: Vec<usize> = Vec::new();
         for item in copies {
             // 预触发用户缓冲区当前段，避免后续在持页锁时缺页
             let _ = volatile_read!(buf[src_offset]);
@@ -1157,16 +1308,9 @@ impl PageCache {
                     .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);
             }
             page_guard.add_flags(PageFlags::PG_DIRTY);
-            item.entry.set_state(PageState::Dirty);
-            dirty_page_indices.push(item.page_index);
             src_offset += item.sub_len;
-        }
-
-        if !dirty_page_indices.is_empty() {
-            let mut guard = self.inner.lock();
-            for page_index in dirty_page_indices {
-                guard.dirty_pages.insert(page_index);
-            }
+            drop(page_guard);
+            self.mark_page_dirty(item.page_index);
         }
 
         Ok(ret)

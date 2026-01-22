@@ -106,7 +106,7 @@ impl Syscall for SysPselect6 {
             set_user_sigmask(&mut sigmask);
             // 重新计算pending信号状态，因为信号掩码改变了
             // 这样has_pending_not_masked_signal才能正确工作
-            ProcessManager::current_pcb().recalc_sigpending(None);
+            ProcessManager::current_pcb().recalc_sigpending();
         }
 
         // 执行select操作

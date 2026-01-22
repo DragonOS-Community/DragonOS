@@ -29,43 +29,40 @@ pub(super) fn do_kernel_shmget(
     size: usize,
     shmflg: ShmFlags,
 ) -> Result<usize, SystemError> {
-    // 暂不支持巨页
     if shmflg.contains(ShmFlags::SHM_HUGETLB) {
         error!("shmget: not support huge page");
         return Err(SystemError::ENOSYS);
     }
 
-    // 从当前进程的 IPC 命名空间获取 per-ns SHM 管理器
     let ipcns = ProcessManager::current_ipcns();
     let mut shm_manager_guard = ipcns.shm.lock();
+
     match key {
-        // 创建共享内存段
         IPC_PRIVATE => shm_manager_guard.add(key, size, shmflg),
         _ => {
-            // 查找key对应的共享内存段是否存在
             let id = shm_manager_guard.contains_key(&key);
+
             if let Some(id) = id {
                 let id = *id;
-                // 不能重复创建
                 if shmflg.contains(ShmFlags::IPC_CREAT | ShmFlags::IPC_EXCL) {
+                    // IPC_CREAT | IPC_EXCL with existing segment -> EEXIST (Linux semantics)
                     return Err(SystemError::EEXIST);
                 }
 
-                if let Some(kernel_shm) = shm_manager_guard.get_mut(&id) {
-                    if size > kernel_shm.size() {
-                        return Err(SystemError::EINVAL);
-                    }
+                let kernel_shm = shm_manager_guard.get_mut(&id).ok_or(SystemError::EINVAL)?;
+
+                if size > kernel_shm.size() {
+                    // request_size > existing segment size -> EINVAL (Linux semantics)
+                    return Err(SystemError::EINVAL);
                 }
 
-                // key值存在，说明有对应共享内存，返回该共享内存id
                 return Ok(id.data());
             } else {
-                // key不存在且shm_flags不包含IPC_CREAT创建IPC对象标志，则返回错误码
                 if !shmflg.contains(ShmFlags::IPC_CREAT) {
+                    // no existing segment and no IPC_CREAT -> ENOENT (Linux semantics)
                     return Err(SystemError::ENOENT);
                 }
 
-                // 存在创建IPC对象标志
                 return shm_manager_guard.add(key, size, shmflg);
             }
         }
@@ -75,29 +72,23 @@ pub(super) fn do_kernel_shmget(
 impl SysShmgetHandle {
     #[inline(always)]
     fn key(args: &[usize]) -> ShmKey {
-        // 第一个参数是共享内存的key
-        // In the old code: ShmKey::new(args[0])
-        // ShmKey is likely a type alias for i32 or similar, args[0] is usize
-        ShmKey::new(args[0]) // Assuming ShmKey::new takes i32
+        ShmKey::new(args[0])
     }
 
     #[inline(always)]
     fn size(args: &[usize]) -> usize {
-        // 第二个参数是共享内存的大小
         args[1]
     }
 
     #[inline(always)]
     fn shmflg(args: &[usize]) -> ShmFlags {
-        // 第三个参数是共享内存的标志
-        // In the old code: ShmFlags::from_bits_truncate(args[2] as u32)
         ShmFlags::from_bits_truncate(args[2] as u32)
     }
 }
 
 impl Syscall for SysShmgetHandle {
     fn num_args(&self) -> usize {
-        3 // key, size, shmflg
+        3
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
@@ -110,7 +101,6 @@ impl Syscall for SysShmgetHandle {
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
             FormattedSyscallParam::new("key", format!("{}", Self::key(args).data())),
-            // 使用 format! 宏将 usize 类型的 size 转换为 String
             FormattedSyscallParam::new("size", format!("{}", Self::size(args))),
             FormattedSyscallParam::new("shmflg", format!("{:#x}", Self::shmflg(args).bits())),
         ]

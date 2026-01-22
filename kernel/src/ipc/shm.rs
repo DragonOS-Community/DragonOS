@@ -406,7 +406,7 @@ impl KernelShm {
             shm_dtim: PosixTimeSpec::new(0, 0),
             shm_ctim: PosixTimeSpec::now(),
             shm_cprid,
-            shm_lprid: RawPid::new(0),
+            shm_lprid: RawPid::new(0), // 初始值为0，表示尚未有进程对这个共享内存段执行 attach 或 detach 操作，对齐 Linux 行为
         }
     }
 

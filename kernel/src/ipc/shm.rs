@@ -695,20 +695,3 @@ impl TryFrom<&KernIpcPerm> for PosixIpcPerm {
         })
     }
 }
-
-impl PosixIpcPerm {
-    pub fn new(key: i32, uid: u32, gid: u32, cuid: u32, cgid: u32, mode: u32) -> Self {
-        PosixIpcPerm {
-            key,
-            uid,
-            gid,
-            cuid,
-            cgid,
-            mode,
-            seq: 0,
-            _pad1: 0,
-            _unused1: 0,
-            _unused2: 0,
-        }
-    }
-}

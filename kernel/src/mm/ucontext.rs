@@ -241,6 +241,7 @@ impl InnerAddressSpace {
         // 遍历父进程的每个VMA，根据VMA属性进行适当的复制
         // 参考 Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
         for vma in self.mappings.vmas.iter() {
+            // 锁顺序：VMA 锁 -> page_manager -> shm_manager，避免交叉获取导致死锁。
             let vma_guard = vma.lock();
 
             // VM_DONTCOPY: 跳过不复制的VMA (例如 MADV_DONTFORK 标记的)

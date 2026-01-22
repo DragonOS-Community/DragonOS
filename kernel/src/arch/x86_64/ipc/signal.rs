@@ -613,15 +613,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
     drop(siginfo_read_guard);
 
-    // x86_64 上不再需要 sig_struct 自旋锁
-    let siginfo_mut = pcb.try_siginfo_mut(5);
-    if unlikely(siginfo_mut.is_none()) {
-        return;
-    }
-
-    let mut siginfo_mut_guard = siginfo_mut.unwrap();
     loop {
-        (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
+        (sig_number, info) = pcb.dequeue_pending_signal(&sig_block);
 
         // 如果信号非法，则直接返回
         if sig_number == Signal::INVALID {
@@ -636,8 +629,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             //     pcb.raw_pid()
             // );
             // 释放锁，按常规路径在本线程上下文执行默认处理
-            let _oldset = *siginfo_mut_guard.sig_blocked();
-            drop(siginfo_mut_guard);
+            let _oldset = sig_block;
             drop(pcb);
             CurrentIrqArch::interrupt_enable();
             sig_number.handle_default();
@@ -686,9 +678,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         }
     }
 
-    let oldset = *siginfo_mut_guard.sig_blocked();
-    //避免死锁
-    drop(siginfo_mut_guard);
+    let oldset = sig_block;
     // no sig_struct guard to drop
     drop(pcb);
     // 做完上面的检查后，开中断

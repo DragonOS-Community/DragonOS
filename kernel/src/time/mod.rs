@@ -116,6 +116,14 @@ impl PosixTimeSpec {
     pub fn as_millis(&self) -> i64 {
         self.tv_sec * MSEC_PER_SEC as i64 + self.tv_nsec / NSEC_PER_MSEC as i64
     }
+
+    pub fn as_millis_saturating_u64(&self) -> u64 {
+        let sec_ms = (self.tv_sec as u64).saturating_mul(MSEC_PER_SEC as u64);
+        let nsec_ms = (self.tv_nsec as u64) / NSEC_PER_MSEC as u64;
+        let ms = sec_ms.saturating_add(nsec_ms);
+        let max_ms = (i64::MAX as u64) / 1000;
+        ms.min(max_ms)
+    }
 }
 
 impl Sub for PosixTimeSpec {
@@ -577,4 +585,10 @@ pub trait TimeArch {
 
     /// 将CPU的时钟周期数转换为纳秒
     fn cycles2ns(cycles: usize) -> usize;
+}
+
+/// 获取系统运行时间（秒）
+pub fn uptime_secs() -> u64 {
+    // todo：以后需要改成高精度时钟源
+    crate::time::timer::clock() / crate::time::clocksource::HZ
 }

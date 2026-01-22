@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use core::intrinsics::{likely, unlikely};
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, info, warn};
 use system_error::SystemError;
 
@@ -388,7 +388,6 @@ pub fn timekeeping_init() {
 /// 参考：https://code.dragonos.org.cn/xref/linux-3.4.99/kernel/time/timekeeping.c#1041
 pub fn update_wall_time() {
     // debug!("enter update_wall_time, stack_use = {:}",stack_use);
-    compiler_fence(Ordering::SeqCst);
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     // 如果在休眠那就不更新
     if TIMEKEEPING_SUSPENDED.load(Ordering::SeqCst) {
@@ -441,25 +440,22 @@ pub fn update_wall_time() {
     }
 
     // 更新时间的相关信息
-    timekeeping_update();
+    timekeeping_update(&mut tk);
 
-    compiler_fence(Ordering::SeqCst);
     drop(irq_guard);
-    compiler_fence(Ordering::SeqCst);
 }
 // TODO wall_to_monotic
 
 /// 参考：https://code.dragonos.org.cn/xref/linux-3.4.99/kernel/time/timekeeping.c#190
-pub fn timekeeping_update() {
+pub fn timekeeping_update(timekeeper: &mut TimekeeperData) {
     // TODO：如果clearntp为true，则会清除NTP错误并调用ntp_clear()
 
     // 更新实时时钟偏移量，用于跟踪硬件时钟与系统时间的差异，以便进行时间校正
-    update_rt_offset();
+    update_rt_offset(timekeeper);
 }
 
 /// # 更新实时偏移量(墙上之间与单调时间的差值)
-pub fn update_rt_offset() {
-    let mut timekeeper = timekeeper().inner.write_irqsave();
+pub fn update_rt_offset(timekeeper: &mut TimekeeperData) {
     let ts = PosixTimeSpec::new(
         -timekeeper.wall_to_monotonic.tv_sec,
         -timekeeper.wall_to_monotonic.tv_nsec,

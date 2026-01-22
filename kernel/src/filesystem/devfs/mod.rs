@@ -753,6 +753,32 @@ impl IndexNode for LockedDevFSInode {
     fn dname(&self) -> Result<DName, SystemError> {
         Ok(self.0.lock().dname.clone())
     }
+
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inode = self.0.lock();
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // 判断需要创建的类型
+        let file_type = if mode.contains(InodeMode::S_IFCHR) {
+            FileType::CharDevice
+        } else if mode.contains(InodeMode::S_IFBLK) {
+            FileType::BlockDevice
+        } else if mode.contains(InodeMode::S_IFIFO) {
+            FileType::Pipe
+        } else {
+            return Err(SystemError::EINVAL);
+        };
+
+        drop(inode);
+        self.create_with_data(filename, file_type, mode, dev_t.data() as usize)
+    }
 }
 
 /// @brief 所有的设备INode都需要额外实现这个trait

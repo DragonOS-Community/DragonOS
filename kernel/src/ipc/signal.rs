@@ -19,7 +19,10 @@ use crate::{
     process::{
         pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
-    time::{syscall::PosixClockID, timekeeping::getnstimeofday, Instant, PosixTimeSpec},
+    time::{
+        sleep::nanosleep, syscall::PosixClockID, timekeeping::getnstimeofday, Instant,
+        PosixTimeSpec,
+    },
 };
 
 /// Send a kernel-originated signal to the current task.
@@ -304,7 +307,7 @@ impl Signal {
             pcb.sighand().shared_pending_signal_insert(*self);
         }
         // 根据实际 pending/blocked 关系更新 HAS_PENDING_SIGNAL，避免长时间误置位
-        pcb.recalc_sigpending(None);
+        pcb.recalc_sigpending();
 
         // 若目标进程存在 signalfd 监听该信号，需要唤醒其等待者/epoll。
         crate::ipc::signalfd::notify_signalfd_for_pcb(&pcb, *self);
@@ -660,32 +663,44 @@ fn has_pending_signals(sigset: &SigSet, blocked: &SigSet) -> bool {
 }
 
 impl ProcessControlBlock {
+    // Lock order rule: sighand -> sig_info. Never take sighand after sig_info.
+    /// 按“线程 pending -> 进程 shared pending”的顺序取出一个可见信号。
+    /// 该实现避免在持有 sig_info 锁时进入 sighand 锁，降低锁交叉风险。
+    pub fn dequeue_pending_signal(&self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+        let res = {
+            let mut siginfo = self.sig_info_mut();
+            let res = siginfo.sig_pending_mut().dequeue_signal(sig_mask);
+            if res.0 != Signal::INVALID {
+                res
+            } else {
+                drop(siginfo);
+                self.sighand().shared_pending_dequeue(sig_mask)
+            }
+        };
+        self.recalc_sigpending();
+        res
+    }
+
     /// 重新计算线程的flag中的TIF_SIGPENDING位
     /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=4806&fi=182#182
-    pub fn recalc_sigpending(&self, siginfo_guard: Option<&ProcessSignalInfo>) {
-        if !self.recalc_sigpending_tsk(siginfo_guard) {
+    pub fn recalc_sigpending(&self) {
+        if !self.recalc_sigpending_tsk() {
             self.flags().remove(ProcessFlags::HAS_PENDING_SIGNAL);
         }
     }
 
-    fn recalc_sigpending_tsk(&self, siginfo_guard: Option<&ProcessSignalInfo>) -> bool {
-        let mut _siginfo_tmp_guard = None;
-        let siginfo = if let Some(siginfo_guard) = siginfo_guard {
-            siginfo_guard
-        } else {
-            _siginfo_tmp_guard = Some(self.sig_info_irqsave());
-            _siginfo_tmp_guard.as_ref().unwrap()
-        };
-        return siginfo.do_recalc_sigpending_tsk(self);
-    }
-}
-
-impl ProcessSignalInfo {
-    fn do_recalc_sigpending_tsk(&self, pcb: &ProcessControlBlock) -> bool {
-        if has_pending_signals(&self.sig_pending().signal(), self.sig_blocked())
-            || has_pending_signals(&pcb.sighand().shared_pending_signal(), self.sig_blocked())
-        {
-            pcb.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
+    fn recalc_sigpending_tsk(&self) -> bool {
+        let sighand = self.sighand();
+        let sighand_guard = sighand.inner_read();
+        let siginfo_guard = self.sig_info_irqsave();
+        if has_pending_signals(
+            &siginfo_guard.sig_pending().signal(),
+            siginfo_guard.sig_blocked(),
+        ) || has_pending_signals(
+            &sighand_guard.shared_pending.signal(),
+            siginfo_guard.sig_blocked(),
+        ) {
+            self.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
             return true;
         }
         /*
@@ -755,7 +770,7 @@ fn __set_task_blocked(pcb: &Arc<ProcessControlBlock>, new_set: &SigSet) {
         }
     }
     *pcb.sig_info_mut().sig_block_mut() = *new_set;
-    pcb.recalc_sigpending(None);
+    pcb.recalc_sigpending();
 }
 
 fn __set_current_blocked(new_set: &SigSet) {
@@ -929,29 +944,101 @@ pub struct PollRestartBlockData {
     pub timeout_instant: Option<Instant>,
 }
 
+fn ktime_now(clockid: PosixClockID) -> PosixTimeSpec {
+    match clockid {
+        PosixClockID::Realtime => getnstimeofday(),
+        PosixClockID::Monotonic | PosixClockID::Boottime => getnstimeofday(),
+        PosixClockID::ProcessCPUTimeID => {
+            let pcb = ProcessManager::current_pcb();
+            PosixTimeSpec::from_ns(pcb.process_cputime_ns())
+        }
+        PosixClockID::ThreadCPUTimeID => {
+            let pcb = ProcessManager::current_pcb();
+            PosixTimeSpec::from_ns(pcb.thread_cputime_ns())
+        }
+        _ => getnstimeofday(),
+    }
+}
+
+fn calc_remaining(deadline: &PosixTimeSpec, now: &PosixTimeSpec) -> PosixTimeSpec {
+    let mut sec = deadline.tv_sec - now.tv_sec;
+    let mut nsec = deadline.tv_nsec - now.tv_nsec;
+    if nsec < 0 {
+        sec -= 1;
+        nsec += 1_000_000_000;
+    }
+    if sec < 0 {
+        return PosixTimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+    }
+    PosixTimeSpec {
+        tv_sec: sec,
+        tv_nsec: nsec,
+    }
+}
+
 /// Nanosleep 的重启函数：根据保存的 deadline/clockid 继续等待或重启
 #[derive(Debug)]
 pub struct RestartFnNanosleep;
 
 impl RestartFn for RestartFnNanosleep {
     fn call(&self, data: &mut RestartBlockData) -> Result<usize, SystemError> {
-        fn ktime_now(_clockid: PosixClockID) -> PosixTimeSpec {
-            // 暂时使用 realtime 近似；后续区分 monotonic/boottime
-            getnstimeofday()
-        }
-
         if let RestartBlockData::Nanosleep { deadline, clockid } = data {
-            let now = ktime_now(*clockid);
-            let mut sec = deadline.tv_sec - now.tv_sec;
-            let mut nsec = deadline.tv_nsec - now.tv_nsec;
-            if nsec < 0 {
-                sec -= 1;
-                nsec += 1_000_000_000;
+            if deadline.tv_sec < 0 {
+                return Err(SystemError::EINVAL);
             }
-            if sec < 0 || (sec == 0 && nsec == 0) {
-                return Ok(0);
+            let deadline_ns = (deadline.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(deadline.tv_nsec as u64);
+            let wait_res = match *clockid {
+                PosixClockID::ProcessCPUTimeID => {
+                    let current = ProcessManager::current_pcb();
+                    let leader = if current.is_thread_group_leader() {
+                        current
+                    } else {
+                        current
+                            .threads_read_irqsave()
+                            .group_leader()
+                            .unwrap_or_else(ProcessManager::current_pcb)
+                    };
+                    if leader.process_cputime_ns() >= deadline_ns {
+                        Ok(())
+                    } else {
+                        leader.cputime_wait_queue().wait_event_interruptible(
+                            || leader.process_cputime_ns() >= deadline_ns,
+                            None::<fn()>,
+                        )
+                    }
+                }
+                PosixClockID::ThreadCPUTimeID => {
+                    let pcb = ProcessManager::current_pcb();
+                    if pcb.thread_cputime_ns() >= deadline_ns {
+                        Ok(())
+                    } else {
+                        pcb.cputime_wait_queue().wait_event_interruptible(
+                            || pcb.thread_cputime_ns() >= deadline_ns,
+                            None::<fn()>,
+                        )
+                    }
+                }
+                _ => {
+                    let now = ktime_now(*clockid);
+                    let remain = calc_remaining(deadline, &now);
+                    if remain.tv_sec == 0 && remain.tv_nsec == 0 {
+                        Ok(())
+                    } else {
+                        nanosleep(remain).map(|_| ())
+                    }
+                }
+            };
+
+            match wait_res {
+                Ok(()) => return Ok(0),
+                Err(SystemError::ERESTARTSYS) => {}
+                Err(e) => return Err(e),
             }
-            // 仍未到期：设置重启块并返回 -ERESTART_RESTARTBLOCK
             let rb = RestartBlock::new(&RestartFnNanosleep, data.clone());
             return crate::process::ProcessManager::current_pcb().set_restart_fn(Some(rb));
         }

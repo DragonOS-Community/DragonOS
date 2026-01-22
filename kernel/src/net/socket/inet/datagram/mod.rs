@@ -6,15 +6,16 @@ use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
+use crate::libs::byte_parser;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::posix::SockAddr;
 use crate::net::socket::common::{EPollItems, ShutdownBit};
-use crate::net::socket::{Socket, PMSG, PSO, PSOL};
+use crate::net::socket::{AddressFamily, Socket, PMSG, PSO, PSOCK, PSOL};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::{libs::rwsem::RwSem, net::socket::endpoint::Endpoint};
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion};
 
 use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
@@ -41,6 +42,8 @@ pub struct UdpSocket {
     send_buf_size: AtomicUsize,
     /// Custom receive buffer size (SO_RCVBUF), 0 means use default
     recv_buf_size: AtomicUsize,
+    /// SO_RCVLOWAT
+    rcvlowat: AtomicI32,
     /// SO_NO_CHECK: disable UDP checksum (0=off, 1=on)
     ///
     /// NOTE: This is currently a stub implementation. The value can be set/get via
@@ -74,7 +77,8 @@ impl UdpSocket {
             fasync_items: FAsyncItems::default(),
             send_buf_size: AtomicUsize::new(0), // 0 means use default
             recv_buf_size: AtomicUsize::new(0), // 0 means use default
-            no_check: AtomicBool::new(false),   // checksums enabled by default
+            rcvlowat: AtomicI32::new(1),
+            no_check: AtomicBool::new(false), // checksums enabled by default
             ip_version: version,
         })
     }
@@ -740,6 +744,16 @@ impl Socket for UdpSocket {
                     self.recreate_socket_if_bound()?;
                     return Ok(());
                 }
+                PSO::RCVLOWAT => {
+                    let mut v = byte_parser::read_i32(val)?;
+                    if v < 0 {
+                        v = i32::MAX;
+                    } else if v == 0 {
+                        v = 1;
+                    }
+                    self.rcvlowat.store(v, Ordering::Relaxed);
+                    return Ok(());
+                }
                 PSO::NO_CHECK => {
                     // Set SO_NO_CHECK: disable/enable UDP checksum verification
                     // NOTE: This is a stub implementation - see field comment for details.
@@ -774,6 +788,34 @@ impl Socket for UdpSocket {
             let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
             // log::debug!("UDP getsockopt: parsed option {:?}", opt);
             match opt {
+                PSO::TYPE => {
+                    if value.len() < core::mem::size_of::<i32>() {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let v = PSOCK::Datagram as i32;
+                    value[..4].copy_from_slice(&v.to_ne_bytes());
+                    return Ok(core::mem::size_of::<i32>());
+                }
+                PSO::DOMAIN => {
+                    if value.len() < core::mem::size_of::<i32>() {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let domain = match self.ip_version {
+                        IpVersion::Ipv6 => AddressFamily::INet6,
+                        IpVersion::Ipv4 => AddressFamily::INet,
+                    };
+                    let v = domain as i32;
+                    value[..4].copy_from_slice(&v.to_ne_bytes());
+                    return Ok(core::mem::size_of::<i32>());
+                }
+                PSO::PROTOCOL => {
+                    if value.len() < core::mem::size_of::<i32>() {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let v = PSOL::UDP as i32;
+                    value[..4].copy_from_slice(&v.to_ne_bytes());
+                    return Ok(core::mem::size_of::<i32>());
+                }
                 PSO::SNDBUF => {
                     if value.len() < core::mem::size_of::<u32>() {
                         return Err(SystemError::EINVAL);
@@ -810,6 +852,14 @@ impl Socket for UdpSocket {
                     let bytes = (actual_size as u32).to_ne_bytes();
                     value[0..4].copy_from_slice(&bytes);
                     return Ok(core::mem::size_of::<u32>());
+                }
+                PSO::RCVLOWAT => {
+                    if value.len() < core::mem::size_of::<i32>() {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let v = self.rcvlowat.load(Ordering::Relaxed);
+                    value[..4].copy_from_slice(&v.to_ne_bytes());
+                    return Ok(core::mem::size_of::<i32>());
                 }
                 PSO::NO_CHECK => {
                     if value.len() < core::mem::size_of::<i32>() {

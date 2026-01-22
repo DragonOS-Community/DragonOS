@@ -29,6 +29,7 @@ mod thread_self;
 mod utils;
 mod version;
 mod version_signature;
+mod vmstat;
 
 // 重新导出 ProcFS
 pub use root::ProcFS;

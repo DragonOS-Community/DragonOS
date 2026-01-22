@@ -10,14 +10,16 @@ use alloc::{
 };
 use core::cmp::Ordering;
 use core::intrinsics::unlikely;
+use core::num::NonZeroUsize;
 use core::{any::Any, fmt::Debug};
 use hashbrown::HashMap;
 use log::error;
+use lru::LruCache;
 use system_error::SystemError;
 
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::page_cache::{AsyncPageCacheBackend, PageCache};
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
@@ -47,6 +49,7 @@ use super::{
 };
 
 const FAT_MAX_NAMELEN: u64 = 255;
+const FAT_LRU_CACHE_SIZE: usize = 4096;
 
 /// FAT32文件系统的最大的文件大小
 pub const MAX_FILE_SIZE: u64 = 0xffff_ffff;
@@ -62,6 +65,13 @@ pub struct Cluster {
     pub cluster_num: u64,
     pub parent_cluster: u64,
 }
+
+pub type ClusterID = u64;
+
+// Cache sentinels: 0/1 are reserved clusters in FAT, MAX marks end-of-chain.
+const FAT_CACHE_UNUSED: ClusterID = 0;
+const FAT_CACHE_BAD: ClusterID = 1;
+const FAT_CACHE_EOC: ClusterID = ClusterID::MAX;
 
 impl PartialOrd for Cluster {
     /// @brief 根据当前簇号比较大小
@@ -91,6 +101,8 @@ pub struct FATFileSystem {
     pub fs_info: Arc<LockedFATFsInfo>,
     /// 文件系统的根inode
     root_inode: Arc<LockedFATInode>,
+    /// FAT表查询缓存（LRU）
+    fat_cache: Mutex<LruCache<ClusterID, ClusterID>>,
 }
 
 /// FAT文件系统的Inode
@@ -255,7 +267,13 @@ impl LockedFATInode {
         })));
 
         if !inode.0.lock().inode_type.is_dir() {
-            let page_cache = PageCache::new(Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>));
+            let backend = Arc::new(AsyncPageCacheBackend::new(
+                Arc::downgrade(&inode) as Weak<dyn IndexNode>
+            ));
+            let page_cache = PageCache::new(
+                Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>),
+                Some(backend),
+            );
             inode.0.lock().page_cache = Some(page_cache);
         }
 
@@ -663,6 +681,9 @@ impl FATFileSystem {
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
             root_inode,
+            fat_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(FAT_LRU_CACHE_SIZE).unwrap(),
+            )),
         });
 
         // 对root inode加锁，并继续完成初始化工作
@@ -683,6 +704,39 @@ impl FATFileSystem {
         return (self.bpb.bytes_per_sector as u64) * (self.bpb.sector_per_cluster as u64);
     }
 
+    #[inline]
+    fn fat_cache_lookup(&self, cluster: ClusterID) -> Option<ClusterID> {
+        self.fat_cache.lock().get(&cluster).cloned()
+    }
+
+    #[inline]
+    fn fat_cache_store(&self, cluster: ClusterID, value: ClusterID) {
+        self.fat_cache.lock().put(cluster, value);
+    }
+
+    #[inline]
+    fn fat_cache_encode(entry: &FATEntry) -> ClusterID {
+        match entry {
+            FATEntry::Unused => FAT_CACHE_UNUSED,
+            FATEntry::Bad => FAT_CACHE_BAD,
+            FATEntry::EndOfChain => FAT_CACHE_EOC,
+            FATEntry::Next(c) => c.cluster_num,
+        }
+    }
+
+    #[inline]
+    fn fat_cache_decode(current_cluster: ClusterID, value: ClusterID) -> FATEntry {
+        match value {
+            FAT_CACHE_UNUSED => FATEntry::Unused,
+            FAT_CACHE_BAD => FATEntry::Bad,
+            FAT_CACHE_EOC => FATEntry::EndOfChain,
+            _ => FATEntry::Next(Cluster {
+                cluster_num: value,
+                parent_cluster: current_cluster,
+            }),
+        }
+    }
+
     /// @brief 读取当前簇在FAT表中存储的信息
     ///
     /// @param cluster 当前簇
@@ -694,6 +748,10 @@ impl FATFileSystem {
         if current_cluster < 2 {
             // 0号簇和1号簇是保留簇，不允许用户使用
             return Err(SystemError::EINVAL);
+        }
+
+        if let Some(cached) = self.fat_cache_lookup(current_cluster) {
+            return Ok(Self::fat_cache_decode(current_cluster, cached));
         }
 
         let fat_type: FATType = self.bpb.fat_type;
@@ -778,6 +836,7 @@ impl FATFileSystem {
                 }
             }
         };
+        self.fat_cache_store(current_cluster, Self::fat_cache_encode(&res));
         return Ok(res);
     }
 
@@ -1359,6 +1418,7 @@ impl FATFileSystem {
     /// @param cluster 目标簇
     /// @param fat_entry 这个簇在FAT表中，存储的信息（下一个簇的簇号）
     pub fn set_entry(&self, cluster: Cluster, fat_entry: FATEntry) -> Result<(), SystemError> {
+        let cache_val = Self::fat_cache_encode(&fat_entry);
         // fat表项在分区上的字节偏移量
         let fat_part_bytes_offset: u64 = self.bpb.fat_type.get_fat_bytes_offset(
             cluster,
@@ -1397,6 +1457,7 @@ impl FATFileSystem {
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                 cursor.write_u16(new_val)?;
                 self.gendisk.write_at(cursor.as_slice(), lba)?;
+                self.fat_cache_store(cluster.cluster_num, cache_val);
                 return Ok(());
             }
             FATType::FAT16(_) => {
@@ -1421,6 +1482,7 @@ impl FATFileSystem {
                 cursor.write_u16(raw_val)?;
                 self.gendisk.write_at(cursor.as_slice(), lba)?;
 
+                self.fat_cache_store(cluster.cluster_num, cache_val);
                 return Ok(());
             }
             FATType::FAT32(_) => {
@@ -1477,6 +1539,7 @@ impl FATFileSystem {
                     self.gendisk.write_at(cursor.as_slice(), lba)?;
                 }
 
+                self.fat_cache_store(cluster.cluster_num, cache_val);
                 return Ok(());
             }
         }
@@ -1904,7 +1967,7 @@ impl IndexNode for LockedFATInode {
         if let Some(page_cache) = self.page_cache() {
             let start_page = (len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
             truncate_inode_pages(page_cache.clone(), start_page);
-            page_cache.lock().resize(len)?;
+            page_cache.manager().resize(len)?;
         }
 
         let mut guard: MutexGuard<FATInode> = self.0.lock();

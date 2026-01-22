@@ -24,7 +24,7 @@ use system_error::SystemError;
 use crate::{
     arch::{
         cpu::current_cpu_id,
-        ipc::signal::{AtomicSignal, SigSet, Signal},
+        ipc::signal::{AtomicSignal, SigSet, Signal, MAX_SIG_NUM},
         process::ArchPCBInfo,
         CurrentIrqArch, SigStackArch,
     },
@@ -37,7 +37,9 @@ use crate::{
     ipc::{
         sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigCode, SigInfo, SigPending, SigType, SignalFlags},
+        signal_types::{
+            SigCode, SigInfo, SigPending, SigType, SignalFlags, SIG_KERNEL_IGNORE_MASK,
+        },
     },
     libs::{
         align::AlignedBox,
@@ -1900,13 +1902,31 @@ impl ProcessControlBlock {
         // 同时检查 shared_pending
         pending |= self.sighand().shared_pending_signal();
         pending.remove(blocked);
-        // log::debug!(
-        //     "pending and not masked:{:?}, masked: {:?}",
-        //     pending,
-        //     blocked
-        // );
-        let has_not_masked = !pending.is_empty();
-        return has_not_masked;
+        if pending.is_empty() {
+            return false;
+        }
+
+        // Ignore signals that are effectively ignored by the current handler.
+        let sighand = self.sighand();
+        let mut effective = pending;
+        for sig_num in 1..=MAX_SIG_NUM {
+            let sig = Signal::from(sig_num as i32);
+            if sig == Signal::INVALID {
+                continue;
+            }
+            if !effective.contains(sig.into()) {
+                continue;
+            }
+            if let Some(sa) = sighand.handler(sig) {
+                if sa.is_ignore()
+                    || (sa.is_default() && SIG_KERNEL_IGNORE_MASK.contains(sig.into_sigset()))
+                {
+                    effective.remove(sig.into());
+                }
+            }
+        }
+
+        !effective.is_empty()
     }
 
     #[inline(always)]

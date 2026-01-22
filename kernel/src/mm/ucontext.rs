@@ -260,6 +260,30 @@ impl InnerAddressSpace {
             new_guard.mappings.vmas.insert(new_vma.clone());
             drop(vma_guard);
 
+            let mut skip_mapping = false;
+            if let Some(shm_id) = shm_id {
+                let ipcns = ProcessManager::current_ipcns();
+                let mut shm_manager_guard = ipcns.shm.lock();
+                match shm_manager_guard.get_mut(&shm_id) {
+                    Some(kernel_shm) => {
+                        // Forked SHM mappings count as new attachments.
+                        kernel_shm.increase_count();
+                    }
+                    None => {
+                        warn!(
+                            "Fork: SHM segment {:?} no longer exists, skipping VMA clone",
+                            shm_id
+                        );
+                        skip_mapping = true;
+                    }
+                }
+            }
+
+            if skip_mapping {
+                let _ = new_guard.mappings.remove_vma(&region);
+                continue;
+            }
+
             // 根据VMA类型进行不同的页面复制策略
             let start_page = region.start();
             let end_page = region.end();
@@ -312,15 +336,6 @@ impl InnerAddressSpace {
                 current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
             }
             drop(page_manager_guard);
-
-            if let Some(shm_id) = shm_id {
-                let ipcns = ProcessManager::current_ipcns();
-                let mut shm_manager_guard = ipcns.shm.lock();
-                if let Some(kernel_shm) = shm_manager_guard.get_mut(&shm_id) {
-                    // Forked SHM mappings count as new attachments.
-                    kernel_shm.increase_count();
-                }
-            }
         }
 
         drop(new_guard);

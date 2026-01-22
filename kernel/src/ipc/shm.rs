@@ -155,7 +155,7 @@ impl ShmManager {
             return Err(SystemError::EINVAL);
         }
 
-        let id = self.id_allocator.alloc().expect("No more id to allocate.");
+        let id = self.id_allocator.alloc().ok_or(SystemError::ENOSPC)?;
         // TODO: 实现 IPC 序列号机制以防止 ID 重用攻击
         // 参考 Linux ipc_idr_alloc():
         // - 跟踪 last_idx，检测 idx 回绕时递增 seq
@@ -166,7 +166,8 @@ impl ShmManager {
         let shm_id = ShmId::new(id);
 
         // 分配共享内存页面
-        let page_count = PageFrameCount::from_bytes(page_align_up(size)).unwrap();
+        let page_count =
+            PageFrameCount::from_bytes(page_align_up(size)).ok_or(SystemError::EINVAL)?;
         // 创建共享内存page，并添加到PAGE_MANAGER中
         let mut page_manager_guard = page_manager_lock();
         let (paddr, _page) = page_manager_guard.create_pages(
@@ -319,7 +320,8 @@ impl ShmManager {
         kernel_shm.set_mode(ShmFlags::SHM_DEST, true);
 
         let mut cur_phys = PhysPageFrame::new(kernel_shm.shm_start_paddr);
-        let count = PageFrameCount::from_bytes(page_align_up(kernel_shm.shm_size)).unwrap();
+        let count = PageFrameCount::from_bytes(page_align_up(kernel_shm.shm_size))
+            .ok_or(SystemError::EINVAL)?;
         let key = kernel_shm.kern_ipc_perm.key;
         let id = kernel_shm.kern_ipc_perm.id;
         let map_count = kernel_shm.map_count();
@@ -329,7 +331,8 @@ impl ShmManager {
             // 设置共享内存物理页当映射计数等于0时可被回收
             // TODO 后续需要加入到lru中
             for _ in 0..count.data() {
-                let page = page_manager_guard.get_unwrap(&cur_phys.phys_address());
+                let paddr = cur_phys.phys_address();
+                let page = page_manager_guard.get(&paddr).ok_or(SystemError::EFAULT)?;
                 page.write().remove_flags(PageFlags::PG_UNEVICTABLE);
 
                 cur_phys = cur_phys.next();

@@ -973,6 +973,7 @@ impl InnerAddressSpace {
     ///
     /// - `EINVAL`：参数错误
     /// - `ENOMEM`：内存不足
+    /// - `EFAULT`：VMA 状态异常
     pub fn munmap(
         &mut self,
         start_page: VirtPageFrame,
@@ -1005,11 +1006,15 @@ impl InnerAddressSpace {
         // 注意：用户传入的 region_to_unmap 可能跨多个 VMA，因此需要对每个相关 VMA 分别处理。
         for cur_vma in vmas_related {
             let r = cur_vma.lock().region;
-            let cur_vma = self.mappings.remove_vma(&r).unwrap();
-            let intersection = cur_vma.lock().region().intersect(&region_to_unmap).unwrap();
+            let cur_vma = self.mappings.remove_vma(&r).ok_or(SystemError::EFAULT)?;
+            let intersection = cur_vma
+                .lock()
+                .region()
+                .intersect(&region_to_unmap)
+                .ok_or(SystemError::EFAULT)?;
             let split_result = cur_vma
                 .extract(intersection, &self.user_mapper.utable)
-                .unwrap();
+                .ok_or(SystemError::EFAULT)?;
 
             // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
 

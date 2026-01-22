@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -21,6 +22,9 @@
 #endif
 #ifndef FALLOC_FL_PUNCH_HOLE
 #define FALLOC_FL_PUNCH_HOLE 0x02
+#endif
+#ifndef FALLOC_FL_ZERO_RANGE
+#define FALLOC_FL_ZERO_RANGE 0x10
 #endif
 
 // 测试文件路径
@@ -40,6 +44,11 @@
 #define TEST_PASS(msg) do { \
     printf("PASS: %s\n", msg); \
     return 0; \
+} while(0)
+
+#define TEST_SKIP(msg) do { \
+    printf("SKIP: %s\n", msg); \
+    return 77; \
 } while(0)
 
 // 使用 syscall 包装调用 fallocate
@@ -70,6 +79,58 @@ static void cleanup_test_file(const char *path) {
     unlink(path);
 }
 
+static int write_pattern_fd(int fd, off_t offset, size_t len, unsigned char pattern) {
+    unsigned char buf[512];
+    size_t remaining = len;
+
+    memset(buf, pattern, sizeof(buf));
+    while (remaining > 0) {
+        size_t chunk = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        ssize_t written = pwrite(fd, buf, chunk, offset);
+
+        if (written < 0)
+            return -1;
+        if ((size_t)written != chunk)
+            return -1;
+        offset += written;
+        remaining -= written;
+    }
+    return 0;
+}
+
+static int read_full_fd(int fd, off_t offset, unsigned char *buf, size_t len) {
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        ssize_t readn = pread(fd, buf, remaining, offset);
+
+        if (readn < 0)
+            return -1;
+        if (readn == 0)
+            return -1;
+        offset += readn;
+        buf += readn;
+        remaining -= readn;
+    }
+    return 0;
+}
+
+// 检查当前文件系统是否支持 fallocate
+static int check_fallocate_supported(int fd) {
+    int ret;
+
+    errno = 0;
+    ret = fallocate_wrapper(fd, 0, 0, 1);
+    if (ret == 0) {
+        if (ftruncate(fd, 0) != 0)
+            return -1;
+        return 1;
+    }
+    if (errno == EOPNOTSUPP)
+        return 0;
+    return -1;
+}
+
 // ==================== 基本功能测试 ====================
 
 // 测试默认模式 (mode=0) 的基本空间分配
@@ -79,6 +140,13 @@ static int test_basic_fallocate(void) {
     // 创建测试文件并写入初始数据
     int fd = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
     TEST_ASSERT(fd >= 0, "打开测试文件");
+    int support = check_fallocate_supported(fd);
+    if (support == 0) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
+    TEST_ASSERT(support > 0, "fallocate 探测失败");
 
     const char *initial_data = "Hello, World! This is initial data.";
     size_t initial_len = strlen(initial_data);
@@ -137,10 +205,18 @@ static int test_append_to_existing_data(void) {
 
     int fd = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
     TEST_ASSERT(fd >= 0, "打开测试文件");
+    int support = check_fallocate_supported(fd);
+    if (support == 0) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
+    TEST_ASSERT(support > 0, "fallocate 探测失败");
 
     // 写入初始数据
     const char *data1 = "Initial data block - ";
-    write(fd, data1, strlen(data1));
+    ssize_t written = write(fd, data1, strlen(data1));
+    TEST_ASSERT(written == (ssize_t)strlen(data1), "写入初始数据");
 
     off_t size1 = get_fd_size(fd);
     printf("第一次写入后大小: %ld bytes\n", size1);
@@ -158,7 +234,8 @@ static int test_append_to_existing_data(void) {
     // 验证原数据未受影响
     lseek(fd, 0, SEEK_SET);
     char buffer[128];
-    read(fd, buffer, strlen(data1));
+    ssize_t nread = read(fd, buffer, strlen(data1));
+    TEST_ASSERT(nread == (ssize_t)strlen(data1), "读取原数据");
     buffer[strlen(data1)] = '\0';
     TEST_ASSERT(strcmp(buffer, data1) == 0, "原数据未受影响");
 
@@ -174,6 +251,13 @@ static int test_multiple_allocations(void) {
 
     int fd = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
     TEST_ASSERT(fd >= 0, "打开测试文件");
+    int support = check_fallocate_supported(fd);
+    if (support == 0) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
+    TEST_ASSERT(support > 0, "fallocate 探测失败");
 
     off_t current_size = 0;
 
@@ -232,7 +316,8 @@ static int test_readonly_fd(void) {
     // 创建文件
     int fd_wr = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
     TEST_ASSERT(fd_wr >= 0, "创建测试文件");
-    write(fd_wr, "test", 4);
+    ssize_t written = write(fd_wr, "test", 4);
+    TEST_ASSERT(written == 4, "写入测试数据");
     close(fd_wr);
 
     // 以只读方式打开
@@ -264,12 +349,12 @@ static int test_directory(void) {
     int fd = open(TEST_DIR, O_RDONLY);
     TEST_ASSERT(fd >= 0, "打开目录");
 
+    errno = 0;
     result = fallocate_wrapper(fd, 0, 0, 1000);
     TEST_ASSERT(result == -1, "目录 fallocate 应失败");
-    // Linux 可能返回 EBADF 或 EISDIR
-    TEST_ASSERT(errno == EBADF || errno == EISDIR, "目录应返回 EBADF 或 EISDIR");
-    printf("目录 fallocate 返回: %d, errno: %d (EISDIR=%d, EBADF=%d)\n",
-           result, errno, EISDIR, EBADF);
+    TEST_ASSERT(errno == EBADF, "目录应返回 EBADF（只读 fd）");
+    printf("目录 fallocate 返回: %d, errno: %d (EBADF=%d)\n",
+           result, errno, EBADF);
 
     close(fd);
     rmdir(TEST_DIR);
@@ -331,7 +416,7 @@ static int test_offset_overflow(void) {
 
     // 设置 offset 和 len 使得相加溢出
     // 使用接近 SIZE_MAX 的值
-    off_t huge_offset = SIZE_MAX - 1000;
+    off_t huge_offset = (off_t)LLONG_MAX - 1000;
     off_t len = 2000;  // offset + len 会溢出
 
     int result = fallocate_wrapper(fd, 0, huge_offset, len);
@@ -352,34 +437,115 @@ static int test_keep_size_mode(void) {
 
     int fd = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
     TEST_ASSERT(fd >= 0, "打开测试文件");
+    int support = check_fallocate_supported(fd);
+    if (support == 0) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
+    TEST_ASSERT(support > 0, "fallocate 探测失败");
 
     // 写入一些初始数据
     const char *data = "Hello";
-    write(fd, data, strlen(data));
+    ssize_t written = write(fd, data, strlen(data));
+    TEST_ASSERT(written == (ssize_t)strlen(data), "写入初始数据");
 
     off_t initial_size = get_fd_size(fd);
     printf("初始文件大小: %ld bytes\n", initial_size);
 
     // FALLOC_FL_KEEP_SIZE: 分配空间但不改变文件大小
     int result = fallocate_wrapper(fd, FALLOC_FL_KEEP_SIZE, 0, 10000);
-    // Linux 支持这个模式
-    if (result == 0) {
-        off_t size_after = get_fd_size(fd);
-        printf("FALLOC_FL_KEEP_SIZE 后大小: %ld bytes\n", size_after);
-        TEST_ASSERT(size_after == initial_size, "文件大小应保持不变");
-        printf("FALLOC_FL_KEEP_SIZE 返回: %d (支持)\n", result);
-        TEST_PASS("FALLOC_FL_KEEP_SIZE 测试");
-    } else {
-        // 某些系统可能不支持
-        printf("FALLOC_FL_KEEP_SIZE 返回: %d, errno: %d (不支持)\n", result, errno);
+    if (result == -1 && errno == EOPNOTSUPP) {
         close(fd);
         cleanup_test_file(TEST_FILE);
-        TEST_PASS("FALLOC_FL_KEEP_SIZE 测试（不支持）");
+        TEST_SKIP("FALLOC_FL_KEEP_SIZE 不支持");
     }
+    TEST_ASSERT(result == 0, "FALLOC_FL_KEEP_SIZE 调用成功");
+    off_t size_after = get_fd_size(fd);
+    printf("FALLOC_FL_KEEP_SIZE 后大小: %ld bytes\n", size_after);
+    TEST_ASSERT(size_after == initial_size, "文件大小应保持不变");
 
     close(fd);
     cleanup_test_file(TEST_FILE);
     return 0;
+}
+
+// 测试 FALLOC_FL_PUNCH_HOLE
+static int test_punch_hole_mode(void) {
+    printf("\n--- test_punch_hole_mode ---\n");
+
+    int fd = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    TEST_ASSERT(fd >= 0, "打开测试文件");
+    int support = check_fallocate_supported(fd);
+    if (support == 0) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
+    TEST_ASSERT(support > 0, "fallocate 探测失败");
+
+    TEST_ASSERT(write_pattern_fd(fd, 0, 8192, 0x5a) == 0, "写入初始数据");
+
+    int result = fallocate_wrapper(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 4096, 4096);
+    if (result == -1 && errno == EOPNOTSUPP) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("FALLOC_FL_PUNCH_HOLE 不支持");
+    }
+    TEST_ASSERT(result == 0, "punch hole 成功");
+
+    unsigned char buf[8192];
+    TEST_ASSERT(read_full_fd(fd, 0, buf, sizeof(buf)) == 0, "读取数据");
+
+    for (size_t i = 0; i < 4096; i++) {
+        TEST_ASSERT(buf[i] == 0x5a, "punch hole 前半段保持不变");
+    }
+    for (size_t i = 4096; i < 8192; i++) {
+        TEST_ASSERT(buf[i] == 0, "punch hole 区域应为 0");
+    }
+
+    close(fd);
+    cleanup_test_file(TEST_FILE);
+    TEST_PASS("FALLOC_FL_PUNCH_HOLE 测试");
+}
+
+// 测试 FALLOC_FL_ZERO_RANGE
+static int test_zero_range_mode(void) {
+    printf("\n--- test_zero_range_mode ---\n");
+
+    int fd = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    TEST_ASSERT(fd >= 0, "打开测试文件");
+    int support = check_fallocate_supported(fd);
+    if (support == 0) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
+    TEST_ASSERT(support > 0, "fallocate 探测失败");
+
+    TEST_ASSERT(write_pattern_fd(fd, 0, 8192, 0xa5) == 0, "写入初始数据");
+
+    int result = fallocate_wrapper(fd, FALLOC_FL_ZERO_RANGE, 4096, 4096);
+    if (result == -1 && errno == EOPNOTSUPP) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("FALLOC_FL_ZERO_RANGE 不支持");
+    }
+    TEST_ASSERT(result == 0, "zero range 成功");
+
+    unsigned char buf[8192];
+    TEST_ASSERT(read_full_fd(fd, 0, buf, sizeof(buf)) == 0, "读取数据");
+
+    for (size_t i = 0; i < 4096; i++) {
+        TEST_ASSERT(buf[i] == 0xa5, "zero range 前半段保持不变");
+    }
+    for (size_t i = 4096; i < 8192; i++) {
+        TEST_ASSERT(buf[i] == 0, "zero range 区域应为 0");
+    }
+
+    close(fd);
+    cleanup_test_file(TEST_FILE);
+    TEST_PASS("FALLOC_FL_ZERO_RANGE 测试");
 }
 
 // 测试收缩操作
@@ -388,6 +554,13 @@ static int test_shrink_file(void) {
 
     int fd = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
     TEST_ASSERT(fd >= 0, "打开测试文件");
+    int support = check_fallocate_supported(fd);
+    if (support == 0) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
+    TEST_ASSERT(support > 0, "fallocate 探测失败");
 
     // 创建一个有数据的文件
     off_t initial_size = 5000;
@@ -428,6 +601,13 @@ static int test_large_allocation(void) {
 
     int fd = open(TEST_LARGE_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
     TEST_ASSERT(fd >= 0, "打开测试文件");
+    int support = check_fallocate_supported(fd);
+    if (support == 0) {
+        close(fd);
+        cleanup_test_file(TEST_LARGE_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
+    TEST_ASSERT(support > 0, "fallocate 探测失败");
 
     // 测试较大但不极端的分配
     off_t large_size = 10 * 1024 * 1024;  // 10 MB
@@ -439,14 +619,17 @@ static int test_large_allocation(void) {
         printf("大块分配后文件大小: %ld bytes\n", allocated_size);
         TEST_ASSERT(allocated_size == large_size, "大块分配大小正确");
         TEST_PASS("大块分配测试");
-    } else {
-        // 可能因为磁盘空间不足等原因失败
-        printf("WARN: 大块分配失败 (errno=%d)，可能是空间不足\n", errno);
-        // 不视为测试失败
+    }
+    if (errno == ENOSPC || errno == EOPNOTSUPP) {
+        printf("SKIP: 大块分配失败 (errno=%d)\n", errno);
         close(fd);
         cleanup_test_file(TEST_LARGE_FILE);
-        TEST_PASS("大块分配测试（跳过，空间不足）");
+        TEST_SKIP("大块分配测试");
     }
+    printf("FAIL: 大块分配失败 (errno=%d)\n", errno);
+    close(fd);
+    cleanup_test_file(TEST_LARGE_FILE);
+    return -1;
 
     close(fd);
     cleanup_test_file(TEST_LARGE_FILE);
@@ -463,12 +646,12 @@ static int test_pipe(void) {
     int result = pipe(pipefd);
     TEST_ASSERT(result == 0, "创建管道");
 
-    result = fallocate_wrapper(pipefd[0], 0, 0, 1000);
+    errno = 0;
+    result = fallocate_wrapper(pipefd[1], 0, 0, 1000);
     TEST_ASSERT(result == -1, "管道 fallocate 应失败");
-    // Linux 可能返回 EBADF 或 ESPIPE
-    TEST_ASSERT(errno == EBADF || errno == ESPIPE, "管道应返回 EBADF 或 ESPIPE");
-    printf("管道 fallocate 返回: %d, errno: %d (ESPIPE=%d, EBADF=%d)\n",
-           result, errno, ESPIPE, EBADF);
+    TEST_ASSERT(errno == ESPIPE, "管道应返回 ESPIPE");
+    printf("管道 fallocate 返回: %d, errno: %d (ESPIPE=%d)\n",
+           result, errno, ESPIPE);
 
     close(pipefd[0]);
     close(pipefd[1]);
@@ -483,7 +666,8 @@ static int test_symlink(void) {
     // 创建目标文件
     int fd = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
     TEST_ASSERT(fd >= 0, "创建目标文件");
-    write(fd, "target content", 13);
+    ssize_t written = write(fd, "target content", 13);
+    TEST_ASSERT(written == 13, "写入目标文件内容");
     close(fd);
 
     // 创建符号链接
@@ -497,23 +681,19 @@ static int test_symlink(void) {
 
     // fallocate 应该作用在目标文件上
     result = fallocate_wrapper(fd_link, 0, 0, 5000);
-    if (result == 0) {
-        off_t link_size = get_fd_size(fd_link);
-        off_t target_size = get_file_size(TEST_FILE);
-        printf("符号链接 fd 大小: %ld, 目标文件大小: %ld\n",
-               link_size, target_size);
-        TEST_ASSERT(link_size == 5000, "符号链接操作成功");
-        TEST_ASSERT(target_size == 5000, "目标文件被正确修改");
-        TEST_PASS("符号链接测试");
-    } else {
-        // 如果符号链接操作不支持，也算通过
-        printf("INFO: 符号链接 fallocate 返回: %d, errno: %d\n",
-               result, errno);
+    if (result == -1 && errno == EOPNOTSUPP) {
         close(fd_link);
         cleanup_test_file(TEST_FILE);
         cleanup_test_file(TEST_SYMLINK);
-        TEST_PASS("符号链接测试（不支持）");
+        TEST_SKIP("fallocate 不支持");
     }
+    TEST_ASSERT(result == 0, "符号链接目标 fallocate 成功");
+    off_t link_size = get_fd_size(fd_link);
+    off_t target_size = get_file_size(TEST_FILE);
+    printf("符号链接 fd 大小: %ld, 目标文件大小: %ld\n",
+           link_size, target_size);
+    TEST_ASSERT(link_size == 5000, "符号链接操作成功");
+    TEST_ASSERT(target_size == 5000, "目标文件被正确修改");
 
     close(fd_link);
     cleanup_test_file(TEST_FILE);
@@ -531,6 +711,11 @@ static int test_consistency_with_ftruncate(void) {
     int fd1 = open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
     TEST_ASSERT(fd1 >= 0, "打开文件1");
     int result = fallocate_wrapper(fd1, 0, 0, 10000);
+    if (result == -1 && errno == EOPNOTSUPP) {
+        close(fd1);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
     TEST_ASSERT(result == 0, "fallocate 成功");
     off_t size1 = get_fd_size(fd1);
     close(fd1);
@@ -561,6 +746,11 @@ static int test_consistency_with_write(void) {
     // fallocate 分配空间
     off_t alloc_size = 10000;
     int result = fallocate_wrapper(fd, 0, 0, alloc_size);
+    if (result == -1 && errno == EOPNOTSUPP) {
+        close(fd);
+        cleanup_test_file(TEST_FILE);
+        TEST_SKIP("fallocate 不支持");
+    }
     TEST_ASSERT(result == 0, "fallocate 成功");
 
     // 在分配的区域写入数据
@@ -571,12 +761,14 @@ static int test_consistency_with_write(void) {
     for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
         off_t offset = offsets[i];
         lseek(fd, offset, SEEK_SET);
-        write(fd, test_pattern, strlen(test_pattern));
+        ssize_t written = write(fd, test_pattern, strlen(test_pattern));
+        TEST_ASSERT(written == (ssize_t)strlen(test_pattern), "写入测试数据");
 
         // 读取验证
         lseek(fd, offset, SEEK_SET);
         memset(read_buffer, 0, sizeof(read_buffer));
-        read(fd, read_buffer, strlen(test_pattern));
+        ssize_t nread = read(fd, read_buffer, strlen(test_pattern));
+        TEST_ASSERT(nread == (ssize_t)strlen(test_pattern), "读取测试数据");
         TEST_ASSERT(memcmp(read_buffer, test_pattern, strlen(test_pattern)) == 0,
                     "写入数据验证成功");
         printf("偏移 %ld 处写入/读取验证成功\n", offset);
@@ -585,7 +777,8 @@ static int test_consistency_with_write(void) {
     // 验证未写入区域应为零
     lseek(fd, 200, SEEK_SET);
     memset(read_buffer, 0, sizeof(read_buffer));
-    read(fd, read_buffer, 100);
+    ssize_t nread = read(fd, read_buffer, 100);
+    TEST_ASSERT(nread == 100, "读取未写入区域");
     int all_zero = 1;
     for (int i = 0; i < 100; i++) {
         if (read_buffer[i] != 0) {
@@ -593,9 +786,7 @@ static int test_consistency_with_write(void) {
             break;
         }
     }
-    if (all_zero) {
-        printf("未写入区域全为零\n");
-    }
+    TEST_ASSERT(all_zero, "未写入区域应为零");
 
     close(fd);
     cleanup_test_file(TEST_FILE);
@@ -612,37 +803,41 @@ int main(void) {
 
     int passed = 0;
     int failed = 0;
+    int skipped = 0;
+    int r;
 
     // 基本功能测试
     printf("\n========== 基本功能测试 ==========\n");
-    if (test_basic_fallocate() == 0) passed++; else failed++;
-    if (test_append_to_existing_data() == 0) passed++; else failed++;
-    if (test_multiple_allocations() == 0) passed++; else failed++;
+    r = test_basic_fallocate(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_append_to_existing_data(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_multiple_allocations(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
 
     // 错误条件测试
     printf("\n========== 错误条件测试 ==========\n");
-    if (test_invalid_fd() == 0) passed++; else failed++;
-    if (test_readonly_fd() == 0) passed++; else failed++;
-    if (test_directory() == 0) passed++; else failed++;
-    if (test_zero_length() == 0) passed++; else failed++;
-    if (test_invalid_offset_length() == 0) passed++; else failed++;
-    if (test_offset_overflow() == 0) passed++; else failed++;
-    if (test_keep_size_mode() == 0) passed++; else failed++;
-    if (test_shrink_file() == 0) passed++; else failed++;
+    r = test_invalid_fd(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_readonly_fd(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_directory(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_zero_length(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_invalid_offset_length(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_offset_overflow(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_keep_size_mode(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_punch_hole_mode(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_zero_range_mode(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_shrink_file(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
 
     // 边界条件测试
     printf("\n========== 边界条件测试 ==========\n");
-    if (test_large_allocation() == 0) passed++; else failed++;
+    r = test_large_allocation(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
 
     // 特殊文件类型测试
     printf("\n========== 特殊文件类型测试 ==========\n");
-    if (test_pipe() == 0) passed++; else failed++;
-    if (test_symlink() == 0) passed++; else failed++;
+    r = test_pipe(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_symlink(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
 
     // 一致性测试
     printf("\n========== 一致性测试 ==========\n");
-    if (test_consistency_with_ftruncate() == 0) passed++; else failed++;
-    if (test_consistency_with_write() == 0) passed++; else failed++;
+    r = test_consistency_with_ftruncate(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
+    r = test_consistency_with_write(); if (r == 0) passed++; else if (r == 77) skipped++; else failed++;
 
     // 最终统计
     printf("\n========================================\n");
@@ -650,7 +845,8 @@ int main(void) {
     printf("========================================\n");
     printf("通过: %d\n", passed);
     printf("失败: %d\n", failed);
-    printf("总计: %d\n", passed + failed);
+    printf("跳过: %d\n", skipped);
+    printf("总计: %d\n", passed + failed + skipped);
     printf("========================================\n");
 
     return (failed > 0) ? 1 : 0;
